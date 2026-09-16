@@ -1,0 +1,3964 @@
+[
+  {
+    "test": "config::agent_error_signatures_tests::defaults_load_and_empty_list_disables_matching",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.035,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__agent_error_signatures_tests__defaults_load_and_empty_list_disables_matching.log"
+  },
+  {
+    "test": "config::agent_error_signatures_tests::validation_rejects_an_excessive_signature_count",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.027,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__agent_error_signatures_tests__validation_rejects_an_excessive_signature_count.log"
+  },
+  {
+    "test": "config::agent_error_signatures_tests::validation_rejects_empty_and_overlong_entries",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.046,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__agent_error_signatures_tests__validation_rejects_empty_and_overlong_entries.log"
+  },
+  {
+    "test": "config::recording_config_tests::resolved_dir_uses_override_or_the_profile_default",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.015,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__recording_config_tests__resolved_dir_uses_override_or_the_profile_default.log"
+  },
+  {
+    "test": "config::tests::accent_and_log_dir_helpers",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__accent_and_log_dir_helpers.log"
+  },
+  {
+    "test": "config::tests::accent_helpers_fall_back_to_teal_on_bad_hex",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__accent_helpers_fall_back_to_teal_on_bad_hex.log"
+  },
+  {
+    "test": "config::tests::activity_dot_colors_resolve_and_honor_overrides",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.01,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__activity_dot_colors_resolve_and_honor_overrides.log"
+  },
+  {
+    "test": "config::tests::agent_and_tool_command_lookup_by_name",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.012,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__agent_and_tool_command_lookup_by_name.log"
+  },
+  {
+    "test": "config::tests::agent_attention_inbox_defaults_off_and_env_flips_it",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.041,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__agent_attention_inbox_defaults_off_and_env_flips_it.log"
+  },
+  {
+    "test": "config::tests::agent_command",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.01,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__agent_command.log"
+  },
+  {
+    "test": "config::tests::an_unparseable_ladder_entry_does_not_fail_config_load",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__an_unparseable_ladder_entry_does_not_fail_config_load.log"
+  },
+  {
+    "test": "config::tests::app_tab_config_defaults_to_work_first_and_default",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__app_tab_config_defaults_to_work_first_and_default.log"
+  },
+  {
+    "test": "config::tests::app_tab_config_honors_file_env_and_cli_order",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.03,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__app_tab_config_honors_file_env_and_cli_order.log"
+  },
+  {
+    "test": "config::tests::apply_override_str_rejects_typod_leaf_key",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.037,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__apply_override_str_rejects_typod_leaf_key.log"
+  },
+  {
+    "test": "config::tests::bad_enum_warns_and_defaults",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.028,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__bad_enum_warns_and_defaults.log"
+  },
+  {
+    "test": "config::tests::clamp_to_channel_is_a_noop_in_dev",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__clamp_to_channel_is_a_noop_in_dev.log"
+  },
+  {
+    "test": "config::tests::clamp_to_channel_neutralises_experimental_in_stable",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.01,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__clamp_to_channel_neutralises_experimental_in_stable.log"
+  },
+  {
+    "test": "config::tests::clipboard_defaults_are_on_with_a_10mib_cap",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__clipboard_defaults_are_on_with_a_10mib_cap.log"
+  },
+  {
+    "test": "config::tests::clipboard_post_process_clamps_zero_values",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.013,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__clipboard_post_process_clamps_zero_values.log"
+  },
+  {
+    "test": "config::tests::command_collector_target_parses_and_exposes_argv",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.012,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__command_collector_target_parses_and_exposes_argv.log"
+  },
+  {
+    "test": "config::tests::config_enum_reserved_marker_emits_kind_and_lenient_default",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.011,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__config_enum_reserved_marker_emits_kind_and_lenient_default.log"
+  },
+  {
+    "test": "config::tests::config_parses_all_mode_specific_keybind_tables",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.012,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__config_parses_all_mode_specific_keybind_tables.log"
+  },
+  {
+    "test": "config::tests::config_parses_mode_specific_keybinds",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.012,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__config_parses_mode_specific_keybinds.log"
+  },
+  {
+    "test": "config::tests::config_parses_profiles_and_active_profile",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.012,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__config_parses_profiles_and_active_profile.log"
+  },
+  {
+    "test": "config::tests::config_validate_checks_templates_in_the_per_repo_layer_too",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.031,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__config_validate_checks_templates_in_the_per_repo_layer_too.log"
+  },
+  {
+    "test": "config::tests::config_validate_rejects_a_bad_prompt_or_command_template",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.033,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__config_validate_rejects_a_bad_prompt_or_command_template.log"
+  },
+  {
+    "test": "config::tests::config_without_drawer_section_uses_defaults",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.01,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__config_without_drawer_section_uses_defaults.log"
+  },
+  {
+    "test": "config::tests::coverage::active_providers_back_compat_single",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__coverage__active_providers_back_compat_single.log"
+  },
+  {
+    "test": "config::tests::coverage::active_providers_multi_wins_and_dedups",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__coverage__active_providers_multi_wins_and_dedups.log"
+  },
+  {
+    "test": "config::tests::coverage::apply_override_str_apps_tab_order_splits_csv",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.01,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__coverage__apply_override_str_apps_tab_order_splits_csv.log"
+  },
+  {
+    "test": "config::tests::coverage::bars_config_defaults",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__coverage__bars_config_defaults.log"
+  },
+  {
+    "test": "config::tests::coverage::color_and_glyph_modes_parse_with_aliases",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__coverage__color_and_glyph_modes_parse_with_aliases.log"
+  },
+  {
+    "test": "config::tests::coverage::composite_action_with_params_parses",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.011,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__coverage__composite_action_with_params_parses.log"
+  },
+  {
+    "test": "config::tests::coverage::config_enum_defaults_and_displays",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__coverage__config_enum_defaults_and_displays.log"
+  },
+  {
+    "test": "config::tests::coverage::config_enum_every_variant_roundtrips_canon_and_aliases",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__coverage__config_enum_every_variant_roundtrips_canon_and_aliases.log"
+  },
+  {
+    "test": "config::tests::coverage::config_enum_parsing_is_case_and_whitespace_insensitive",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__coverage__config_enum_parsing_is_case_and_whitespace_insensitive.log"
+  },
+  {
+    "test": "config::tests::coverage::config_overlay_apply_sets_every_field",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__coverage__config_overlay_apply_sets_every_field.log"
+  },
+  {
+    "test": "config::tests::coverage::config_overlay_empty_leaves_base_untouched",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.01,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__coverage__config_overlay_empty_leaves_base_untouched.log"
+  },
+  {
+    "test": "config::tests::coverage::config_path_uses_xdg_config_home",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__coverage__config_path_uses_xdg_config_home.log"
+  },
+  {
+    "test": "config::tests::coverage::effective_notifications_no_profile_is_identity",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__coverage__effective_notifications_no_profile_is_identity.log"
+  },
+  {
+    "test": "config::tests::coverage::effective_tab_order_dedups_and_appends_missing",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__coverage__effective_tab_order_dedups_and_appends_missing.log"
+  },
+  {
+    "test": "config::tests::coverage::effective_tab_order_empty_falls_back_to_builtins",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__coverage__effective_tab_order_empty_falls_back_to_builtins.log"
+  },
+  {
+    "test": "config::tests::coverage::env_failover_resolves_override_then_global",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__coverage__env_failover_resolves_override_then_global.log"
+  },
+  {
+    "test": "config::tests::coverage::env_notify_ready_is_opt_in_per_env",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.016,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__coverage__env_notify_ready_is_opt_in_per_env.log"
+  },
+  {
+    "test": "config::tests::coverage::env_overlay_apps_tab_order_parses_csv",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__coverage__env_overlay_apps_tab_order_parses_csv.log"
+  },
+  {
+    "test": "config::tests::coverage::env_overlay_bad_enum_values_yield_none",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__coverage__env_overlay_bad_enum_values_yield_none.log"
+  },
+  {
+    "test": "config::tests::coverage::env_overlay_log_and_metrics_bad_numbers_skip",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__coverage__env_overlay_log_and_metrics_bad_numbers_skip.log"
+  },
+  {
+    "test": "config::tests::coverage::env_overlay_metrics_rejects_non_finite_floats",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__coverage__env_overlay_metrics_rejects_non_finite_floats.log"
+  },
+  {
+    "test": "config::tests::coverage::expand_env_ref_reads_file_prefix",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__coverage__expand_env_ref_reads_file_prefix.log"
+  },
+  {
+    "test": "config::tests::coverage::expand_env_ref_returns_none_for_empty",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__coverage__expand_env_ref_returns_none_for_empty.log"
+  },
+  {
+    "test": "config::tests::coverage::failover_parses_legacy_bool_and_modern_string",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.01,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__coverage__failover_parses_legacy_bool_and_modern_string.log"
+  },
+  {
+    "test": "config::tests::coverage::file_access_default_and_serde",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__coverage__file_access_default_and_serde.log"
+  },
+  {
+    "test": "config::tests::coverage::get_dotted_theme_preset_padding_undercurl_and_hues",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__coverage__get_dotted_theme_preset_padding_undercurl_and_hues.log"
+  },
+  {
+    "test": "config::tests::coverage::issue_provider_kind_infallible_deserialize",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__coverage__issue_provider_kind_infallible_deserialize.log"
+  },
+  {
+    "test": "config::tests::coverage::issue_provider_subconfig_defaults",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__coverage__issue_provider_subconfig_defaults.log"
+  },
+  {
+    "test": "config::tests::coverage::issues_config_defaults",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__coverage__issues_config_defaults.log"
+  },
+  {
+    "test": "config::tests::coverage::issues_full_table_parses",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__coverage__issues_full_table_parses.log"
+  },
+  {
+    "test": "config::tests::coverage::issues_multi_provider_table_parses",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__coverage__issues_multi_provider_table_parses.log"
+  },
+  {
+    "test": "config::tests::coverage::keybind_config_iter_and_into_iter_and_get",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__coverage__keybind_config_iter_and_into_iter_and_get.log"
+  },
+  {
+    "test": "config::tests::coverage::lenient_env_selector_reads_toml_and_yaml_not_tables",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__coverage__lenient_env_selector_reads_toml_and_yaml_not_tables.log"
+  },
+  {
+    "test": "config::tests::coverage::limits_config_defaults",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__coverage__limits_config_defaults.log"
+  },
+  {
+    "test": "config::tests::coverage::load_layered_recovers_on_parse_error_and_still_applies_layers",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.033,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__coverage__load_layered_recovers_on_parse_error_and_still_applies_layers.log"
+  },
+  {
+    "test": "config::tests::coverage::log_config_default_and_theme_config_default",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__coverage__log_config_default_and_theme_config_default.log"
+  },
+  {
+    "test": "config::tests::coverage::lsp_servers_and_actions_and_custom_actions_parse",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__coverage__lsp_servers_and_actions_and_custom_actions_parse.log"
+  },
+  {
+    "test": "config::tests::coverage::managed_key_basename_scopes_per_account",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__coverage__managed_key_basename_scopes_per_account.log"
+  },
+  {
+    "test": "config::tests::coverage::media_config_defaults_and_enums",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__coverage__media_config_defaults_and_enums.log"
+  },
+  {
+    "test": "config::tests::coverage::metrics_interval_secs_alias_parses",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__coverage__metrics_interval_secs_alias_parses.log"
+  },
+  {
+    "test": "config::tests::coverage::named_command_drawer_metadata_parses_and_defaults",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__coverage__named_command_drawer_metadata_parses_and_defaults.log"
+  },
+  {
+    "test": "config::tests::coverage::named_command_with_hints_parses",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__coverage__named_command_with_hints_parses.log"
+  },
+  {
+    "test": "config::tests::coverage::normalized_default_tab_present_and_falls_back_to_first",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__coverage__normalized_default_tab_present_and_falls_back_to_first.log"
+  },
+  {
+    "test": "config::tests::coverage::notification_bad_sound_mode_warns_and_defaults",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__coverage__notification_bad_sound_mode_warns_and_defaults.log"
+  },
+  {
+    "test": "config::tests::coverage::notification_priority_defaults_and_overrides",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__coverage__notification_priority_defaults_and_overrides.log"
+  },
+  {
+    "test": "config::tests::coverage::notification_routing_config_parses",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__coverage__notification_routing_config_parses.log"
+  },
+  {
+    "test": "config::tests::coverage::notifications_overlay_apply_covers_every_field",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__coverage__notifications_overlay_apply_covers_every_field.log"
+  },
+  {
+    "test": "config::tests::coverage::passthrough_env_remote_drops_host_local_socket_vars",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__coverage__passthrough_env_remote_drops_host_local_socket_vars.log"
+  },
+  {
+    "test": "config::tests::coverage::passthrough_env_remote_injects_devshell_selector",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__coverage__passthrough_env_remote_injects_devshell_selector.log"
+  },
+  {
+    "test": "config::tests::coverage::passthrough_env_remote_normalizes_term",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__coverage__passthrough_env_remote_normalizes_term.log"
+  },
+  {
+    "test": "config::tests::coverage::pin_location_aliases_parse",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__coverage__pin_location_aliases_parse.log"
+  },
+  {
+    "test": "config::tests::coverage::pin_scope_aliases_parse",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__coverage__pin_scope_aliases_parse.log"
+  },
+  {
+    "test": "config::tests::coverage::pin_start_and_restart_enums_parse",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__coverage__pin_start_and_restart_enums_parse.log"
+  },
+  {
+    "test": "config::tests::coverage::post_process_expands_pin_cwd_tilde",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.025,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__coverage__post_process_expands_pin_cwd_tilde.log"
+  },
+  {
+    "test": "config::tests::coverage::post_process_populates_default_agents_and_tools",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.025,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__coverage__post_process_populates_default_agents_and_tools.log"
+  },
+  {
+    "test": "config::tests::coverage::profile_notifications_overlay_layers",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.01,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__coverage__profile_notifications_overlay_layers.log"
+  },
+  {
+    "test": "config::tests::coverage::program_keybinds_and_remap_and_workspace_tables_parse",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__coverage__program_keybinds_and_remap_and_workspace_tables_parse.log"
+  },
+  {
+    "test": "config::tests::coverage::remote_config_default_and_is_remote",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__coverage__remote_config_default_and_is_remote.log"
+  },
+  {
+    "test": "config::tests::coverage::remote_overlay_apply_sets_each_field",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__coverage__remote_overlay_apply_sets_each_field.log"
+  },
+  {
+    "test": "config::tests::coverage::remote_safe_term_downgrades_exotic_terminals",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__coverage__remote_safe_term_downgrades_exotic_terminals.log"
+  },
+  {
+    "test": "config::tests::coverage::repo_overlay_json_format_loads",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.01,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__coverage__repo_overlay_json_format_loads.log"
+  },
+  {
+    "test": "config::tests::coverage::repo_overlay_malformed_file_is_ignored",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__coverage__repo_overlay_malformed_file_is_ignored.log"
+  },
+  {
+    "test": "config::tests::coverage::repo_overlay_parse_error_surfaces_dropped_env_selection",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__coverage__repo_overlay_parse_error_surfaces_dropped_env_selection.log"
+  },
+  {
+    "test": "config::tests::coverage::sandbox_config_default_collections",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__coverage__sandbox_config_default_collections.log"
+  },
+  {
+    "test": "config::tests::coverage::sandbox_limits_default_and_parse",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__coverage__sandbox_limits_default_and_parse.log"
+  },
+  {
+    "test": "config::tests::coverage::sandbox_overlay_apply_covers_remaining_fields",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__coverage__sandbox_overlay_apply_covers_remaining_fields.log"
+  },
+  {
+    "test": "config::tests::coverage::sandbox_overlay_is_empty_detects_any_set_field",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__coverage__sandbox_overlay_is_empty_detects_any_set_field.log"
+  },
+  {
+    "test": "config::tests::coverage::sandbox_overlay_replaces_vpn_wholesale",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__coverage__sandbox_overlay_replaces_vpn_wholesale.log"
+  },
+  {
+    "test": "config::tests::coverage::sandbox_profile_parses_sealed_tunnel",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__coverage__sandbox_profile_parses_sealed_tunnel.log"
+  },
+  {
+    "test": "config::tests::coverage::sandbox_warm_direnv_and_prepare_parse",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__coverage__sandbox_warm_direnv_and_prepare_parse.log"
+  },
+  {
+    "test": "config::tests::coverage::sealed_tiers_seal_the_agent_socket",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__coverage__sealed_tiers_seal_the_agent_socket.log"
+  },
+  {
+    "test": "config::tests::coverage::sealed_tunnel_profile_floors_match_sealed_but_permits_vpn",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.006,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__coverage__sealed_tunnel_profile_floors_match_sealed_but_permits_vpn.log"
+  },
+  {
+    "test": "config::tests::coverage::section_defaults_match_documented_values",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__coverage__section_defaults_match_documented_values.log"
+  },
+  {
+    "test": "config::tests::coverage::task_kind_default_and_parse",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__coverage__task_kind_default_and_parse.log"
+  },
+  {
+    "test": "config::tests::coverage::theme_color_glyph_env_overrides_apply",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__coverage__theme_color_glyph_env_overrides_apply.log"
+  },
+  {
+    "test": "config::tests::coverage::validate_str_non_table_top_level_is_tolerated",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.026,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__coverage__validate_str_non_table_top_level_is_tolerated.log"
+  },
+  {
+    "test": "config::tests::coverage::vpn_config_defaults_to_disabled",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__coverage__vpn_config_defaults_to_disabled.log"
+  },
+  {
+    "test": "config::tests::coverage::vpn_config_parses_from_toml_subtables",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__coverage__vpn_config_parses_from_toml_subtables.log"
+  },
+  {
+    "test": "config::tests::coverage::vpn_config_round_trips_through_serialization",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__coverage__vpn_config_round_trips_through_serialization.log"
+  },
+  {
+    "test": "config::tests::coverage::vpn_mode_and_dns_aliases",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__coverage__vpn_mode_and_dns_aliases.log"
+  },
+  {
+    "test": "config::tests::coverage::vpn_provider_kind_aliases_and_default",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__coverage__vpn_provider_kind_aliases_and_default.log"
+  },
+  {
+    "test": "config::tests::coverage::worktree_template_default_is_all_empty",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__coverage__worktree_template_default_is_all_empty.log"
+  },
+  {
+    "test": "config::tests::default_agent_name_skips_the_shell_fallback",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__default_agent_name_skips_the_shell_fallback.log"
+  },
+  {
+    "test": "config::tests::default_env_reproduces_legacy_behavior",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__default_env_reproduces_legacy_behavior.log"
+  },
+  {
+    "test": "config::tests::deprecated_tg_pr_ttl_still_read",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__deprecated_tg_pr_ttl_still_read.log"
+  },
+  {
+    "test": "config::tests::derived_tokens_follow_overridden_bases_and_hue_overrides_apply",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__derived_tokens_follow_overridden_bases_and_hue_overrides_apply.log"
+  },
+  {
+    "test": "config::tests::devcontainer_mode_round_trips_and_repo_can_only_opt_out",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__devcontainer_mode_round_trips_and_repo_can_only_opt_out.log"
+  },
+  {
+    "test": "config::tests::disk_config_defaults_and_env_override",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.026,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__disk_config_defaults_and_env_override.log"
+  },
+  {
+    "test": "config::tests::drawer_defaults",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.006,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__drawer_defaults.log"
+  },
+  {
+    "test": "config::tests::drawer_partial_section_keeps_other_defaults",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__drawer_partial_section_keeps_other_defaults.log"
+  },
+  {
+    "test": "config::tests::drawer_section_overrides_parse",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__drawer_section_overrides_parse.log"
+  },
+  {
+    "test": "config::tests::eager_scope_and_nix_installer_parse",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.006,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__eager_scope_and_nix_installer_parse.log"
+  },
+  {
+    "test": "config::tests::effective_alerts_inherits_the_widget_thresholds_when_unset",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__effective_alerts_inherits_the_widget_thresholds_when_unset.log"
+  },
+  {
+    "test": "config::tests::effective_alerts_lets_an_explicit_rule_win_over_inheritance",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__effective_alerts_lets_an_explicit_rule_win_over_inheritance.log"
+  },
+  {
+    "test": "config::tests::effective_config_serializes_to_toml",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.028,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__effective_config_serializes_to_toml.log"
+  },
+  {
+    "test": "config::tests::effective_keybinds_adds_central_workspace_layer_for_slug",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__effective_keybinds_adds_central_workspace_layer_for_slug.log"
+  },
+  {
+    "test": "config::tests::effective_keybinds_layers_profile_then_global",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__effective_keybinds_layers_profile_then_global.log"
+  },
+  {
+    "test": "config::tests::enum_roundtrip",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__enum_roundtrip.log"
+  },
+  {
+    "test": "config::tests::env_bad_values_warn_and_skip",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__env_bad_values_warn_and_skip.log"
+  },
+  {
+    "test": "config::tests::env_overlay_covers_every_knob",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.025,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__env_overlay_covers_every_knob.log"
+  },
+  {
+    "test": "config::tests::env_sandbox_overlay_survives_override_roundtrip",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.029,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__env_sandbox_overlay_survives_override_roundtrip.log"
+  },
+  {
+    "test": "config::tests::env_selection_precedence_repo_over_global_default",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__env_selection_precedence_repo_over_global_default.log"
+  },
+  {
+    "test": "config::tests::expand_env_ref_resolves_env_prefix",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.006,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__expand_env_ref_resolves_env_prefix.log"
+  },
+  {
+    "test": "config::tests::expand_env_ref_returns_literal_for_plain_value",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.006,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__expand_env_ref_returns_literal_for_plain_value.log"
+  },
+  {
+    "test": "config::tests::full_repo_overlay_applies_every_field",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.01,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__full_repo_overlay_applies_every_field.log"
+  },
+  {
+    "test": "config::tests::get_dotted_covers_all_keys",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__get_dotted_covers_all_keys.log"
+  },
+  {
+    "test": "config::tests::get_dotted_reads_values",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.011,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__get_dotted_reads_values.log"
+  },
+  {
+    "test": "config::tests::git_auto_fetch_defaults_on_and_is_overridable",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__git_auto_fetch_defaults_on_and_is_overridable.log"
+  },
+  {
+    "test": "config::tests::git_section_and_custom_commands_parse",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__git_section_and_custom_commands_parse.log"
+  },
+  {
+    "test": "config::tests::home_config_default_is_portable_and_safe",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__home_config_default_is_portable_and_safe.log"
+  },
+  {
+    "test": "config::tests::home_overlay_apply_field_merges_present_only",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__home_overlay_apply_field_merges_present_only.log"
+  },
+  {
+    "test": "config::tests::home_overlay_merges_atuin_and_is_enabled_counts_it",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__home_overlay_merges_atuin_and_is_enabled_counts_it.log"
+  },
+  {
+    "test": "config::tests::k8s_env_builds_kubectl_placement",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.01,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__k8s_env_builds_kubectl_placement.log"
+  },
+  {
+    "test": "config::tests::keybind_config_serializes_nested_mode_tables",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.013,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__keybind_config_serializes_nested_mode_tables.log"
+  },
+  {
+    "test": "config::tests::legacy_presets_come_back_fully_extended",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__legacy_presets_come_back_fully_extended.log"
+  },
+  {
+    "test": "config::tests::legacy_projects_env_alias_is_still_accepted",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.025,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__legacy_projects_env_alias_is_still_accepted.log"
+  },
+  {
+    "test": "config::tests::lifecycle_defaults_are_budget_safe",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__lifecycle_defaults_are_budget_safe.log"
+  },
+  {
+    "test": "config::tests::log_config_from_env_applies_the_rotation_knobs",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__log_config_from_env_applies_the_rotation_knobs.log"
+  },
+  {
+    "test": "config::tests::malformed_toml_falls_back_to_defaults",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__malformed_toml_falls_back_to_defaults.log"
+  },
+  {
+    "test": "config::tests::merge_queue_agent_handoff_defaults_are_inert",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__merge_queue_agent_handoff_defaults_are_inert.log"
+  },
+  {
+    "test": "config::tests::merge_queue_overlay_applies_present_fields_and_inherits_absent_ones",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__merge_queue_overlay_applies_present_fields_and_inherits_absent_ones.log"
+  },
+  {
+    "test": "config::tests::merge_queue_overlay_carries_the_agent_and_prompt_keys",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__merge_queue_overlay_carries_the_agent_and_prompt_keys.log"
+  },
+  {
+    "test": "config::tests::merge_queue_overlay_is_empty_only_when_nothing_is_set",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__merge_queue_overlay_is_empty_only_when_nothing_is_set.log"
+  },
+  {
+    "test": "config::tests::merge_queue_prompts_overlay_merges_field_wise",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__merge_queue_prompts_overlay_merges_field_wise.log"
+  },
+  {
+    "test": "config::tests::metrics_config_defaults_and_toml_parse",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__metrics_config_defaults_and_toml_parse.log"
+  },
+  {
+    "test": "config::tests::metrics_env_overlay_clamps_runtime_bounds",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.025,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__metrics_env_overlay_clamps_runtime_bounds.log"
+  },
+  {
+    "test": "config::tests::missing_monitor_table_uses_defaults",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__missing_monitor_table_uses_defaults.log"
+  },
+  {
+    "test": "config::tests::monitor_command_honors_overrides",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__monitor_command_honors_overrides.log"
+  },
+  {
+    "test": "config::tests::monitor_command_maps_kinds",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__monitor_command_maps_kinds.log"
+  },
+  {
+    "test": "config::tests::monitor_defaults",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__monitor_defaults.log"
+  },
+  {
+    "test": "config::tests::named_env_overlays_isolation_and_local_placement",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__named_env_overlays_isolation_and_local_placement.log"
+  },
+  {
+    "test": "config::tests::nix_parallel_clamps_and_gates_on_zero",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__nix_parallel_clamps_and_gates_on_zero.log"
+  },
+  {
+    "test": "config::tests::no_repo_file_yields_global",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__no_repo_file_yields_global.log"
+  },
+  {
+    "test": "config::tests::non_default_enums_roundtrip",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.027,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__non_default_enums_roundtrip.log"
+  },
+  {
+    "test": "config::tests::old_default_accent_still_reads_as_uncustomized",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__old_default_accent_still_reads_as_uncustomized.log"
+  },
+  {
+    "test": "config::tests::override_str_parses_types_correctly_and_handles_bad_paths",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.126,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__override_str_parses_types_correctly_and_handles_bad_paths.log"
+  },
+  {
+    "test": "config::tests::palette_applies_overrides_and_skips_bad_hex",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__palette_applies_overrides_and_skips_bad_hex.log"
+  },
+  {
+    "test": "config::tests::palette_defaults_match_builtins",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__palette_defaults_match_builtins.log"
+  },
+  {
+    "test": "config::tests::panel_collapse_on_escape_defaults_true_and_parses",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__panel_collapse_on_escape_defaults_true_and_parses.log"
+  },
+  {
+    "test": "config::tests::panel_sections_parse_and_default_empty",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__panel_sections_parse_and_default_empty.log"
+  },
+  {
+    "test": "config::tests::parse_hex_rgb_accepts_3_and_6_digit_and_rejects_junk",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__parse_hex_rgb_accepts_3_and_6_digit_and_rejects_junk.log"
+  },
+  {
+    "test": "config::tests::parses_clipboard_table",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__parses_clipboard_table.log"
+  },
+  {
+    "test": "config::tests::parses_monitor_table",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__parses_monitor_table.log"
+  },
+  {
+    "test": "config::tests::partial_clipboard_table_keeps_serde_defaults",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__partial_clipboard_table_keeps_serde_defaults.log"
+  },
+  {
+    "test": "config::tests::partial_monitor_table_keeps_serde_defaults",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__partial_monitor_table_keeps_serde_defaults.log"
+  },
+  {
+    "test": "config::tests::path_is_under_xdg_config",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__path_is_under_xdg_config.log"
+  },
+  {
+    "test": "config::tests::pin_and_pin_by_index",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__pin_and_pin_by_index.log"
+  },
+  {
+    "test": "config::tests::pin_extended_fields_parse",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__pin_extended_fields_parse.log"
+  },
+  {
+    "test": "config::tests::pin_helpers_fall_back_sensibly",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__pin_helpers_fall_back_sensibly.log"
+  },
+  {
+    "test": "config::tests::pin_location_bad_value_defaults_but_validate_flags_it",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.023,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__pin_location_bad_value_defaults_but_validate_flags_it.log"
+  },
+  {
+    "test": "config::tests::pin_location_defaults_to_tab",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__pin_location_defaults_to_tab.log"
+  },
+  {
+    "test": "config::tests::pin_location_parses_layout",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__pin_location_parses_layout.log"
+  },
+  {
+    "test": "config::tests::pin_location_parses_strip_and_float_with_aliases",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__pin_location_parses_strip_and_float_with_aliases.log"
+  },
+  {
+    "test": "config::tests::pin_lookup_by_name_and_index_and_workspace_scope",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__pin_lookup_by_name_and_index_and_workspace_scope.log"
+  },
+  {
+    "test": "config::tests::pins_for_workspace",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__pins_for_workspace.log"
+  },
+  {
+    "test": "config::tests::pins_for_workspace_filters_by_scope",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__pins_for_workspace_filters_by_scope.log"
+  },
+  {
+    "test": "config::tests::plugin_manifest_config_projection_parses",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__plugin_manifest_config_projection_parses.log"
+  },
+  {
+    "test": "config::tests::post_process_resets_an_invalid_clock_format_to_the_default",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__post_process_resets_an_invalid_clock_format_to_the_default.log"
+  },
+  {
+    "test": "config::tests::precedence_default_file_env_flag",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.057,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__precedence_default_file_env_flag.log"
+  },
+  {
+    "test": "config::tests::preview_config_layering_and_cli_array_override",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.108,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__preview_config_layering_and_cli_array_override.log"
+  },
+  {
+    "test": "config::tests::process_env_reads_real_vars",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__process_env_reads_real_vars.log"
+  },
+  {
+    "test": "config::tests::profile_overlay_path_none_for_default_some_for_named",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__profile_overlay_path_none_for_default_some_for_named.log"
+  },
+  {
+    "test": "config::tests::profile_sandbox_overlay_applies_network_block",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__profile_sandbox_overlay_applies_network_block.log"
+  },
+  {
+    "test": "config::tests::profile_sandbox_overlay_does_not_apply_when_inactive",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__profile_sandbox_overlay_does_not_apply_when_inactive.log"
+  },
+  {
+    "test": "config::tests::profile_selectable_via_env",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.023,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__profile_selectable_via_env.log"
+  },
+  {
+    "test": "config::tests::profile_toml_overlay_merges_over_base_and_preserves_untouched",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.026,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__profile_toml_overlay_merges_over_base_and_preserves_untouched.log"
+  },
+  {
+    "test": "config::tests::provider_connect_parse_and_default",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__provider_connect_parse_and_default.log"
+  },
+  {
+    "test": "config::tests::provider_env_lifecycle_commands_substitute_id",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.01,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__provider_env_lifecycle_commands_substitute_id.log"
+  },
+  {
+    "test": "config::tests::provider_env_substitutes_id_into_exec_template",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__provider_env_substitutes_id_into_exec_template.log"
+  },
+  {
+    "test": "config::tests::provider_exec_mode_parses_and_defaults_to_auto",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__provider_exec_mode_parses_and_defaults_to_auto.log"
+  },
+  {
+    "test": "config::tests::repo_ci_uses_only_the_trusted_workspace_overlay",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.011,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__repo_ci_uses_only_the_trusted_workspace_overlay.log"
+  },
+  {
+    "test": "config::tests::repo_git_applies_the_workspace_git_overlay_for_that_repo_only",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.012,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__repo_git_applies_the_workspace_git_overlay_for_that_repo_only.log"
+  },
+  {
+    "test": "config::tests::repo_merge_queue_applies_the_workspace_layer_for_that_repo_only",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.012,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__repo_merge_queue_applies_the_workspace_layer_for_that_repo_only.log"
+  },
+  {
+    "test": "config::tests::repo_notification_overlay_cannot_supply_rule_sound_commands",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__repo_notification_overlay_cannot_supply_rule_sound_commands.log"
+  },
+  {
+    "test": "config::tests::repo_notification_overlay_cannot_supply_sound_paths_or_commands",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__repo_notification_overlay_cannot_supply_sound_paths_or_commands.log"
+  },
+  {
+    "test": "config::tests::repo_overlay_all_three_formats_agree",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__repo_overlay_all_three_formats_agree.log"
+  },
+  {
+    "test": "config::tests::repo_overlay_command_collectors_are_rejected_by_name",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.006,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__repo_overlay_command_collectors_are_rejected_by_name.log"
+  },
+  {
+    "test": "config::tests::repo_overlay_keybinds_are_the_most_specific_layer",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__repo_overlay_keybinds_are_the_most_specific_layer.log"
+  },
+  {
+    "test": "config::tests::repo_sandbox_expands_mount_tildes",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__repo_sandbox_expands_mount_tildes.log"
+  },
+  {
+    "test": "config::tests::require_enqueue_defaults_on_and_a_repo_can_opt_out",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__require_enqueue_defaults_on_and_a_repo_can_opt_out.log"
+  },
+  {
+    "test": "config::tests::sandbox_compiler_cache_is_off_by_default_and_env_authoritative",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.041,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__sandbox_compiler_cache_is_off_by_default_and_env_authoritative.log"
+  },
+  {
+    "test": "config::tests::sandbox_overlay_is_empty_accounts_for_home",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__sandbox_overlay_is_empty_accounts_for_home.log"
+  },
+  {
+    "test": "config::tests::sandbox_overlay_is_empty_covers_every_field",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__sandbox_overlay_is_empty_covers_every_field.log"
+  },
+  {
+    "test": "config::tests::sandbox_overlay_merges_home_strategy_per_env",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.01,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__sandbox_overlay_merges_home_strategy_per_env.log"
+  },
+  {
+    "test": "config::tests::sandbox_profile_defaults_and_env_overlay",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__sandbox_profile_defaults_and_env_overlay.log"
+  },
+  {
+    "test": "config::tests::semantic_defaults_and_round_trip",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__semantic_defaults_and_round_trip.log"
+  },
+  {
+    "test": "config::tests::semantic_unknown_key_is_a_validation_error",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.021,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__semantic_unknown_key_is_a_validation_error.log"
+  },
+  {
+    "test": "config::tests::short_hash_is_stable_and_distinct",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.006,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__short_hash_is_stable_and_distinct.log"
+  },
+  {
+    "test": "config::tests::skills_config_defaults_parse_overlay_and_validate_syntax",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.024,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__skills_config_defaults_parse_overlay_and_validate_syntax.log"
+  },
+  {
+    "test": "config::tests::sound_config_defaults_and_new_fields_round_trip",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__sound_config_defaults_and_new_fields_round_trip.log"
+  },
+  {
+    "test": "config::tests::sound_config_validation_rejects_bad_bounds_and_kind_names",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.024,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__sound_config_validation_rejects_bad_bounds_and_kind_names.log"
+  },
+  {
+    "test": "config::tests::ssh_env_falls_back_to_global_remote_host",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__ssh_env_falls_back_to_global_remote_host.log"
+  },
+  {
+    "test": "config::tests::stats_alerts_parses_from_a_nested_table",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__stats_alerts_parses_from_a_nested_table.log"
+  },
+  {
+    "test": "config::tests::stats_defaults",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__stats_defaults.log"
+  },
+  {
+    "test": "config::tests::strftime_needs_seconds_distinguishes_minute_from_second_clocks",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__strftime_needs_seconds_distinguishes_minute_from_second_clocks.log"
+  },
+  {
+    "test": "config::tests::strict_validation_checks_profile_sound_maps",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.026,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__strict_validation_checks_profile_sound_maps.log"
+  },
+  {
+    "test": "config::tests::strip_config_defaults_and_clamps",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.006,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__strip_config_defaults_and_clamps.log"
+  },
+  {
+    "test": "config::tests::surface_self_log_errors_defaults_off_and_overlay_applies",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__surface_self_log_errors_defaults_off_and_overlay_applies.log"
+  },
+  {
+    "test": "config::tests::tasks_parse_and_filter_tests",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__tasks_parse_and_filter_tests.log"
+  },
+  {
+    "test": "config::tests::theme_keys_via_get_set_and_env",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.047,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__theme_keys_via_get_set_and_env.log"
+  },
+  {
+    "test": "config::tests::tool_command",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__tool_command.log"
+  },
+  {
+    "test": "config::tests::try_load_layered_handles_overrides_and_invalid_overrides",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.078,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__try_load_layered_handles_overrides_and_invalid_overrides.log"
+  },
+  {
+    "test": "config::tests::unknown_env_name_falls_back_to_local_but_is_flagged",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__unknown_env_name_falls_back_to_local_but_is_flagged.log"
+  },
+  {
+    "test": "config::tests::unknown_profile_has_no_active_profile",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__unknown_profile_has_no_active_profile.log"
+  },
+  {
+    "test": "config::tests::unreadable_config_file_is_not_treated_as_absent",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__unreadable_config_file_is_not_treated_as_absent.log"
+  },
+  {
+    "test": "config::tests::unset_prompts_resolve_to_the_builtin_templates",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__unset_prompts_resolve_to_the_builtin_templates.log"
+  },
+  {
+    "test": "config::tests::validate_str_catches_wholesale_type_error",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.023,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__validate_str_catches_wholesale_type_error.log"
+  },
+  {
+    "test": "config::tests::validate_str_flags_every_section",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.025,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__validate_str_flags_every_section.log"
+  },
+  {
+    "test": "config::tests::validate_strftime_accepts_the_shipped_defaults",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__validate_strftime_accepts_the_shipped_defaults.log"
+  },
+  {
+    "test": "config::tests::validate_strftime_rejects_a_bad_specifier",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__validate_strftime_rejects_a_bad_specifier.log"
+  },
+  {
+    "test": "config::tests::workspace_sandbox_mounts_extend_global",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.013,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__workspace_sandbox_mounts_extend_global.log"
+  },
+  {
+    "test": "config::tests::workspace_slug_is_the_repo_directory_name_slugified",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__workspace_slug_is_the_repo_directory_name_slugified.log"
+  },
+  {
+    "test": "config::tests::worktree_templates_parse_with_defaults",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config__tests__worktree_templates_parse_with_defaults.log"
+  },
+  {
+    "test": "config_activity::tests::agent_programs_match_case_insensitively_and_reject_empty",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_activity__tests__agent_programs_match_case_insensitively_and_reject_empty.log"
+  },
+  {
+    "test": "config_activity::tests::defaults_match_the_documented_behaviour",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_activity__tests__defaults_match_the_documented_behaviour.log"
+  },
+  {
+    "test": "config_activity::tests::graces_clamp_away_zero_and_negative_windows",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_activity__tests__graces_clamp_away_zero_and_negative_windows.log"
+  },
+  {
+    "test": "config_activity::tests::zero_is_honoured_for_the_suppression_windows",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_activity__tests__zero_is_honoured_for_the_suppression_windows.log"
+  },
+  {
+    "test": "config_automations::tests::active_profile_is_trusted_but_repo_automation_is_only_warned",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.01,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_automations__tests__active_profile_is_trusted_but_repo_automation_is_only_warned.log"
+  },
+  {
+    "test": "config_automations::tests::named_actions_reject_templates_and_generic_escape_hatches",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_automations__tests__named_actions_reject_templates_and_generic_escape_hatches.log"
+  },
+  {
+    "test": "config_automations::tests::profile_overlay_inherits_settings_and_replaces_rules_only_when_present",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_automations__tests__profile_overlay_inherits_settings_and_replaces_rules_only_when_present.log"
+  },
+  {
+    "test": "config_automations::tests::rejects_duplicate_empty_unknown_and_out_of_bounds",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.01,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_automations__tests__rejects_duplicate_empty_unknown_and_out_of_bounds.log"
+  },
+  {
+    "test": "config_automations::tests::rejects_globs_regex_templates_limits_and_ambiguous_params",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.01,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_automations__tests__rejects_globs_regex_templates_limits_and_ambiguous_params.log"
+  },
+  {
+    "test": "config_automations::tests::rejects_oversized_message_regex",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_automations__tests__rejects_oversized_message_regex.log"
+  },
+  {
+    "test": "config_automations::tests::requested_nested_toml_shape_parses_and_strict_validates",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.026,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_automations__tests__requested_nested_toml_shape_parses_and_strict_validates.log"
+  },
+  {
+    "test": "config_automations::tests::valid_config_compiles",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_automations__tests__valid_config_compiles.log"
+  },
+  {
+    "test": "config_autopilot::tests::defaults_are_off_and_safe",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_autopilot__tests__defaults_are_off_and_safe.log"
+  },
+  {
+    "test": "config_autopilot::tests::unknown_assignee_is_rejected",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_autopilot__tests__unknown_assignee_is_rejected.log"
+  },
+  {
+    "test": "config_calendar::tests::a_disabled_clock_is_skipped",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_calendar__tests__a_disabled_clock_is_skipped.log"
+  },
+  {
+    "test": "config_calendar::tests::a_miscased_zone_is_accepted_rather_than_reported",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_calendar__tests__a_miscased_zone_is_accepted_rather_than_reported.log"
+  },
+  {
+    "test": "config_calendar::tests::a_misconfigured_refresh_interval_can_never_spin",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_calendar__tests__a_misconfigured_refresh_interval_can_never_spin.log"
+  },
+  {
+    "test": "config_calendar::tests::account_identity_and_color_resolution",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_calendar__tests__account_identity_and_color_resolution.log"
+  },
+  {
+    "test": "config_calendar::tests::an_entry_that_omits_enabled_still_counts",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_calendar__tests__an_entry_that_omits_enabled_still_counts.log"
+  },
+  {
+    "test": "config_calendar::tests::an_unknown_clock_zone_is_dropped_not_fatal",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_calendar__tests__an_unknown_clock_zone_is_dropped_not_fatal.log"
+  },
+  {
+    "test": "config_calendar::tests::an_unknown_home_zone_falls_back_to_local",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_calendar__tests__an_unknown_home_zone_falls_back_to_local.log"
+  },
+  {
+    "test": "config_calendar::tests::calendar_display_labels_warn_without_rejecting_legacy_config",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.027,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_calendar__tests__calendar_display_labels_warn_without_rejecting_legacy_config.log"
+  },
+  {
+    "test": "config_calendar::tests::calendar_display_warns_for_trimmed_control_only_labels",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_calendar__tests__calendar_display_warns_for_trimmed_control_only_labels.log"
+  },
+  {
+    "test": "config_calendar::tests::default_reminders_come_from_the_table",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_calendar__tests__default_reminders_come_from_the_table.log"
+  },
+  {
+    "test": "config_calendar::tests::defaults_are_inert_but_useful",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_calendar__tests__defaults_are_inert_but_useful.log"
+  },
+  {
+    "test": "config_calendar::tests::disabled_accounts_and_the_master_switch_both_silence_the_ticker",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_calendar__tests__disabled_accounts_and_the_master_switch_both_silence_the_ticker.log"
+  },
+  {
+    "test": "config_calendar::tests::display_prefs_translate_to_the_pure_domain_types",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_calendar__tests__display_prefs_translate_to_the_pure_domain_types.log"
+  },
+  {
+    "test": "config_calendar::tests::only_url_backed_providers_are_gated_offline",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_calendar__tests__only_url_backed_providers_are_gated_offline.log"
+  },
+  {
+    "test": "config_calendar::tests::poll_secs_takes_the_shortest_configured_interval",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_calendar__tests__poll_secs_takes_the_shortest_configured_interval.log"
+  },
+  {
+    "test": "config_calendar::tests::provider_and_display_enums_round_trip_their_canonical_strings",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_calendar__tests__provider_and_display_enums_round_trip_their_canonical_strings.log"
+  },
+  {
+    "test": "config_calendar::tests::the_whole_family_round_trips_through_toml",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_calendar__tests__the_whole_family_round_trips_through_toml.log"
+  },
+  {
+    "test": "config_calendar::tests::validation_rejects_a_clock_format_that_would_panic_at_render_time",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_calendar__tests__validation_rejects_a_clock_format_that_would_panic_at_render_time.log"
+  },
+  {
+    "test": "config_calendar::tests::validation_rejects_a_malformed_capability_grant",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_calendar__tests__validation_rejects_a_malformed_capability_grant.log"
+  },
+  {
+    "test": "config_calendar::tests::validation_rejects_duplicate_and_missing_account_names",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_calendar__tests__validation_rejects_duplicate_and_missing_account_names.log"
+  },
+  {
+    "test": "config_calendar::tests::validation_reports_an_unknown_zone_with_a_did_you_mean",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.011,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_calendar__tests__validation_reports_an_unknown_zone_with_a_did_you_mean.log"
+  },
+  {
+    "test": "config_calendar::tests::validation_requires_the_field_each_provider_actually_needs",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_calendar__tests__validation_requires_the_field_each_provider_actually_needs.log"
+  },
+  {
+    "test": "config_compat::tests::canonical_key_accepts_legacy_dotted_names",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_compat__tests__canonical_key_accepts_legacy_dotted_names.log"
+  },
+  {
+    "test": "config_compat::tests::canonical_values_win_and_diagnose_exact_paths",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.015,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_compat__tests__canonical_values_win_and_diagnose_exact_paths.log"
+  },
+  {
+    "test": "config_daemon::tests::advertised_host_is_host_only_and_ipv6_safe",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_daemon__tests__advertised_host_is_host_only_and_ipv6_safe.log"
+  },
+  {
+    "test": "config_daemon::tests::bind_override_alone_cannot_widen_plaintext_exposure",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_daemon__tests__bind_override_alone_cannot_widen_plaintext_exposure.log"
+  },
+  {
+    "test": "config_daemon::tests::daemon_defaults_are_on_never_reap_and_idle_bounded",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.006,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_daemon__tests__daemon_defaults_are_on_never_reap_and_idle_bounded.log"
+  },
+  {
+    "test": "config_daemon::tests::declared_secure_topology_must_be_complete_and_non_contradictory",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_daemon__tests__declared_secure_topology_must_be_complete_and_non_contradictory.log"
+  },
+  {
+    "test": "config_daemon::tests::non_loopback_plaintext_requires_the_named_unsafe_opt_in",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_daemon__tests__non_loopback_plaintext_requires_the_named_unsafe_opt_in.log"
+  },
+  {
+    "test": "config_daemon::tests::over_long_paths_fall_back_to_a_short_dir_and_keep_their_isolation",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_daemon__tests__over_long_paths_fall_back_to_a_short_dir_and_keep_their_isolation.log"
+  },
+  {
+    "test": "config_daemon::tests::resolved_socket_paths_are_measured_end_to_end",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_daemon__tests__resolved_socket_paths_are_measured_end_to_end.log"
+  },
+  {
+    "test": "config_daemon::tests::safe_direct_cannot_advertise_an_unverified_remote_endpoint",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_daemon__tests__safe_direct_cannot_advertise_an_unverified_remote_endpoint.log"
+  },
+  {
+    "test": "config_daemon::tests::serve_defaults",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_daemon__tests__serve_defaults.log"
+  },
+  {
+    "test": "config_daemon::tests::socket_path_limit_is_per_platform_and_boundary_exact",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_daemon__tests__socket_path_limit_is_per_platform_and_boundary_exact.log"
+  },
+  {
+    "test": "config_daemon::tests::socket_path_resolution_order",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_daemon__tests__socket_path_resolution_order.log"
+  },
+  {
+    "test": "config_daemon::tests::tls_termination_requires_loopback_boundary_and_advertises_secure_schemes",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.01,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_daemon__tests__tls_termination_requires_loopback_boundary_and_advertises_secure_schemes.log"
+  },
+  {
+    "test": "config_diagnostics::tests::content_and_source_determine_deduplication",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_diagnostics__tests__content_and_source_determine_deduplication.log"
+  },
+  {
+    "test": "config_diagnostics::tests::fixing_then_reintroducing_a_warning_emits_again",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_diagnostics__tests__fixing_then_reintroducing_a_warning_emits_again.log"
+  },
+  {
+    "test": "config_diagnostics::tests::memory_is_bounded_and_evicted_diagnostics_can_recur",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_diagnostics__tests__memory_is_bounded_and_evicted_diagnostics_can_recur.log"
+  },
+  {
+    "test": "config_diagnostics::tests::source_context_is_nested_and_thread_local",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_diagnostics__tests__source_context_is_nested_and_thread_local.log"
+  },
+  {
+    "test": "config_drawer::tests::duplicate_empty_and_blank_commands_are_omitted_with_warnings",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_drawer__tests__duplicate_empty_and_blank_commands_are_omitted_with_warnings.log"
+  },
+  {
+    "test": "config_drawer::tests::files_first_and_tools_keep_config_order",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_drawer__tests__files_first_and_tools_keep_config_order.log"
+  },
+  {
+    "test": "config_drawer::tests::metadata_defaults_and_invalid_scope_degrade",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.01,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_drawer__tests__metadata_defaults_and_invalid_scope_degrade.log"
+  },
+  {
+    "test": "config_drawer::tests::scope_and_cwd_policy_is_pure",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_drawer__tests__scope_and_cwd_policy_is_pure.log"
+  },
+  {
+    "test": "config_drawer::tests::scope_keys_are_slugged_or_global_without_io",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_drawer__tests__scope_keys_are_slugged_or_global_without_io.log"
+  },
+  {
+    "test": "config_drawer::tests::strict_toml_validation_reports_invalid_scope_and_agent_metadata",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.025,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_drawer__tests__strict_toml_validation_reports_invalid_scope_and_agent_metadata.log"
+  },
+  {
+    "test": "config_drawer::tests::strict_validation_reports_agent_and_tool_metadata_errors",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_drawer__tests__strict_validation_reports_agent_and_tool_metadata_errors.log"
+  },
+  {
+    "test": "config_duration::tests::cached_base_diagnostics_follow_source_changes",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.028,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_duration__tests__cached_base_diagnostics_follow_source_changes.log"
+  },
+  {
+    "test": "config_duration::tests::defaults_and_zero_inheritance_have_no_duration_errors",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.085,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_duration__tests__defaults_and_zero_inheritance_have_no_duration_errors.log"
+  },
+  {
+    "test": "config_duration::tests::direct_environment_checks_match_complete_schema_policy",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.024,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_duration__tests__direct_environment_checks_match_complete_schema_policy.log"
+  },
+  {
+    "test": "config_duration::tests::duration_write_rejection_happens_before_existing_or_missing_file_changes",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.086,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_duration__tests__duration_write_rejection_happens_before_existing_or_missing_file_changes.log"
+  },
+  {
+    "test": "config_duration::tests::every_shared_cadence_range_matches_schema_and_strict_validation",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.624,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_duration__tests__every_shared_cadence_range_matches_schema_and_strict_validation.log"
+  },
+  {
+    "test": "config_duration::tests::floating_duration_is_finite_and_millisecond_bounds_use_milliseconds",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.048,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_duration__tests__floating_duration_is_finite_and_millisecond_bounds_use_milliseconds.log"
+  },
+  {
+    "test": "config_duration::tests::invalid_env_duration_cannot_discard_base_security_settings",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.025,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_duration__tests__invalid_env_duration_cannot_discard_base_security_settings.log"
+  },
+  {
+    "test": "config_duration::tests::invalid_env_duration_retains_valid_explicit_security_overrides",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.026,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_duration__tests__invalid_env_duration_retains_valid_explicit_security_overrides.log"
+  },
+  {
+    "test": "config_duration::tests::invalid_explicit_overlay_is_atomic_and_unrelated_repair_is_allowed",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.08,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_duration__tests__invalid_explicit_overlay_is_atomic_and_unrelated_repair_is_allowed.log"
+  },
+  {
+    "test": "config_duration::tests::permissive_base_duration_error_retains_security_policy",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.026,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_duration__tests__permissive_base_duration_error_retains_security_policy.log"
+  },
+  {
+    "test": "config_duration::tests::strict_duration_aliases_cannot_bypass_numeric_admission",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.141,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_duration__tests__strict_duration_aliases_cannot_bypass_numeric_admission.log"
+  },
+  {
+    "test": "config_duration::tests::unsigned_programmatic_extremes_are_diagnosed_without_narrowing",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.026,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_duration__tests__unsigned_programmatic_extremes_are_diagnosed_without_narrowing.log"
+  },
+  {
+    "test": "config_env_tables::tests::hibernate_and_backend_enums_parse_their_aliases",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_env_tables__tests__hibernate_and_backend_enums_parse_their_aliases.log"
+  },
+  {
+    "test": "config_env_tables::tests::hibernate_auto_resolves_on_for_vps_off_for_scale_to_zero",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_env_tables__tests__hibernate_auto_resolves_on_for_vps_off_for_scale_to_zero.log"
+  },
+  {
+    "test": "config_env_tables::tests::hibernate_explicit_mode_wins_over_auto",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_env_tables__tests__hibernate_explicit_mode_wins_over_auto.log"
+  },
+  {
+    "test": "config_env_tables::tests::hibernate_fields_participate_in_is_default",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_env_tables__tests__hibernate_fields_participate_in_is_default.log"
+  },
+  {
+    "test": "config_env_tables::tests::hibernate_idle_prefers_the_per_env_override",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_env_tables__tests__hibernate_idle_prefers_the_per_env_override.log"
+  },
+  {
+    "test": "config_env_tables::tests::lifecycle_defaults_include_hibernation",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_env_tables__tests__lifecycle_defaults_include_hibernation.log"
+  },
+  {
+    "test": "config_env_tables::tests::machine0_classification_and_provision_flake",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_env_tables__tests__machine0_classification_and_provision_flake.log"
+  },
+  {
+    "test": "config_env_tables::tests::snapshot_store_defaults_are_local_and_clamped",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_env_tables__tests__snapshot_store_defaults_are_local_and_clamped.log"
+  },
+  {
+    "test": "config_forge::tests::forge_config_defaults_to_github",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_forge__tests__forge_config_defaults_to_github.log"
+  },
+  {
+    "test": "config_forge::tests::forge_kind_parses_canon_and_alias",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_forge__tests__forge_kind_parses_canon_and_alias.log"
+  },
+  {
+    "test": "config_forge::tests::forge_kind_round_trips_as_str_and_default",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_forge__tests__forge_kind_round_trips_as_str_and_default.log"
+  },
+  {
+    "test": "config_git::tests::submodule_mode_defaults_to_auto_and_round_trips",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_git__tests__submodule_mode_defaults_to_auto_and_round_trips.log"
+  },
+  {
+    "test": "config_host_discovery::tests::defaults_are_zero_config_and_read_only",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_host_discovery__tests__defaults_are_zero_config_and_read_only.log"
+  },
+  {
+    "test": "config_host_discovery::tests::headscale_is_the_same_kind",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_host_discovery__tests__headscale_is_the_same_kind.log"
+  },
+  {
+    "test": "config_host_discovery::tests::parses_a_full_tailnet_table",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_host_discovery__tests__parses_a_full_tailnet_table.log"
+  },
+  {
+    "test": "config_host_discovery::tests::reserved_kinds_are_rejected_with_the_standard_message",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_host_discovery__tests__reserved_kinds_are_rejected_with_the_standard_message.log"
+  },
+  {
+    "test": "config_host_discovery::tests::unknown_kind_reports_the_valid_set",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_host_discovery__tests__unknown_kind_reports_the_valid_set.log"
+  },
+  {
+    "test": "config_issues::tests::active_accounts_empty_by_default",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_issues__tests__active_accounts_empty_by_default.log"
+  },
+  {
+    "test": "config_issues::tests::active_accounts_synthesizes_from_legacy_providers_list",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_issues__tests__active_accounts_synthesizes_from_legacy_providers_list.log"
+  },
+  {
+    "test": "config_issues::tests::active_accounts_synthesizes_from_legacy_single_provider",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_issues__tests__active_accounts_synthesizes_from_legacy_single_provider.log"
+  },
+  {
+    "test": "config_issues::tests::active_accounts_synthesizes_kaneo_from_legacy_sub_table",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_issues__tests__active_accounts_synthesizes_kaneo_from_legacy_sub_table.log"
+  },
+  {
+    "test": "config_issues::tests::explicit_accounts_win_and_filter_disabled",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_issues__tests__explicit_accounts_win_and_filter_disabled.log"
+  },
+  {
+    "test": "config_issues::tests::kaneo_overlay_pins_workspace_and_project",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_issues__tests__kaneo_overlay_pins_workspace_and_project.log"
+  },
+  {
+    "test": "config_issues::tests::kaneo_provider_parses_and_round_trips",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.006,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_issues__tests__kaneo_provider_parses_and_round_trips.log"
+  },
+  {
+    "test": "config_issues::tests::overlay_empty_accounts_means_none_not_legacy_synthesis",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_issues__tests__overlay_empty_accounts_means_none_not_legacy_synthesis.log"
+  },
+  {
+    "test": "config_issues::tests::overlay_empty_providers_means_none_not_legacy",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_issues__tests__overlay_empty_providers_means_none_not_legacy.log"
+  },
+  {
+    "test": "config_issues::tests::overlay_restricts_explicit_accounts_by_name",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_issues__tests__overlay_restricts_explicit_accounts_by_name.log"
+  },
+  {
+    "test": "config_issues::tests::overlay_typod_account_name_restricts_to_none",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_issues__tests__overlay_typod_account_name_restricts_to_none.log"
+  },
+  {
+    "test": "config_loc::tests::defaults_are_enabled_and_bounded",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_loc__tests__defaults_are_enabled_and_bounded.log"
+  },
+  {
+    "test": "config_loc::tests::partial_toml_keeps_the_other_defaults",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_loc__tests__partial_toml_keeps_the_other_defaults.log"
+  },
+  {
+    "test": "config_loc::tests::round_trips_through_toml",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_loc__tests__round_trips_through_toml.log"
+  },
+  {
+    "test": "config_model_proxy::tests::bad_listen_is_an_error",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_model_proxy__tests__bad_listen_is_an_error.log"
+  },
+  {
+    "test": "config_model_proxy::tests::defaults_are_disabled_loopback",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_model_proxy__tests__defaults_are_disabled_loopback.log"
+  },
+  {
+    "test": "config_model_proxy::tests::disabled_section_skips_validation",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_model_proxy__tests__disabled_section_skips_validation.log"
+  },
+  {
+    "test": "config_model_proxy::tests::kinds_and_strategies_parse",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_model_proxy__tests__kinds_and_strategies_parse.log"
+  },
+  {
+    "test": "config_model_proxy::tests::non_loopback_listen_warns_not_errors",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_model_proxy__tests__non_loopback_listen_warns_not_errors.log"
+  },
+  {
+    "test": "config_model_proxy::tests::parses_full_section_from_toml",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_model_proxy__tests__parses_full_section_from_toml.log"
+  },
+  {
+    "test": "config_model_proxy::tests::raw_literal_key_is_rejected",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_model_proxy__tests__raw_literal_key_is_rejected.log"
+  },
+  {
+    "test": "config_model_proxy::tests::secret_ref_forms_pass",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_model_proxy__tests__secret_ref_forms_pass.log"
+  },
+  {
+    "test": "config_model_proxy::tests::unknown_provider_and_alias_are_errors",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_model_proxy__tests__unknown_provider_and_alias_are_errors.log"
+  },
+  {
+    "test": "config_network::tests::defaults_mirror_holder_constants",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_network__tests__defaults_mirror_holder_constants.log"
+  },
+  {
+    "test": "config_network::tests::install_applies_without_panicking",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_network__tests__install_applies_without_panicking.log"
+  },
+  {
+    "test": "config_network::tests::mode_maps_to_forced_state",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_network__tests__mode_maps_to_forced_state.log"
+  },
+  {
+    "test": "config_network::tests::mode_parse_default_alias",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_network__tests__mode_parse_default_alias.log"
+  },
+  {
+    "test": "config_network::tests::toml_roundtrip",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_network__tests__toml_roundtrip.log"
+  },
+  {
+    "test": "config_observe::tests::observe_absent_uses_defaults",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_observe__tests__observe_absent_uses_defaults.log"
+  },
+  {
+    "test": "config_observe::tests::observe_defaults_are_disabled",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.006,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_observe__tests__observe_defaults_are_disabled.log"
+  },
+  {
+    "test": "config_observe::tests::observe_full_table_parses",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_observe__tests__observe_full_table_parses.log"
+  },
+  {
+    "test": "config_pipeline::tests::a_compliant_prompt_has_no_contract_gaps",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_pipeline__tests__a_compliant_prompt_has_no_contract_gaps.log"
+  },
+  {
+    "test": "config_pipeline::tests::a_stage_pointing_at_itself_is_not_counted_as_reaching_itself",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_pipeline__tests__a_stage_pointing_at_itself_is_not_counted_as_reaching_itself.log"
+  },
+  {
+    "test": "config_pipeline::tests::a_stage_with_no_permissions_is_valid_and_seeds_nothing",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_pipeline__tests__a_stage_with_no_permissions_is_valid_and_seeds_nothing.log"
+  },
+  {
+    "test": "config_pipeline::tests::an_absent_section_is_an_empty_inert_pipeline",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_pipeline__tests__an_absent_section_is_an_empty_inert_pipeline.log"
+  },
+  {
+    "test": "config_pipeline::tests::contract_gap_reports_only_the_half_that_is_missing",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_pipeline__tests__contract_gap_reports_only_the_half_that_is_missing.log"
+  },
+  {
+    "test": "config_pipeline::tests::contract_gaps_are_placeholder_aware_not_substring_matching",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.006,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_pipeline__tests__contract_gaps_are_placeholder_aware_not_substring_matching.log"
+  },
+  {
+    "test": "config_pipeline::tests::contract_gaps_flag_a_prompt_that_cannot_close_its_row",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_pipeline__tests__contract_gaps_flag_a_prompt_that_cannot_close_its_row.log"
+  },
+  {
+    "test": "config_pipeline::tests::defaults_are_one_worker_and_an_hour_parked",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_pipeline__tests__defaults_are_one_worker_and_an_hour_parked.log"
+  },
+  {
+    "test": "config_pipeline::tests::on_blocked_parses_canon_and_aliases_defaults_park",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_pipeline__tests__on_blocked_parses_canon_and_aliases_defaults_park.log"
+  },
+  {
+    "test": "config_pipeline::tests::stage_agent_resolves_registry_names_and_bare_harness_ids",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_pipeline__tests__stage_agent_resolves_registry_names_and_bare_harness_ids.log"
+  },
+  {
+    "test": "config_pipeline::tests::toml_round_trips_with_defaults_for_every_omitted_key",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_pipeline__tests__toml_round_trips_with_defaults_for_every_omitted_key.log"
+  },
+  {
+    "test": "config_pipeline::tests::transport_retry_defaults_are_enabled_bounded_and_load_the_core_signature_lists",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_pipeline__tests__transport_retry_defaults_are_enabled_bounded_and_load_the_core_signature_lists.log"
+  },
+  {
+    "test": "config_pipeline::tests::transport_retry_overrides_parse_and_replace_the_default_lists",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_pipeline__tests__transport_retry_overrides_parse_and_replace_the_default_lists.log"
+  },
+  {
+    "test": "config_pipeline::tests::transport_retry_rejects_an_empty_signature_and_a_zero_attempt_budget",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_pipeline__tests__transport_retry_rejects_an_empty_signature_and_a_zero_attempt_budget.log"
+  },
+  {
+    "test": "config_pipeline::tests::validate_accepts_a_well_formed_chain",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_pipeline__tests__validate_accepts_a_well_formed_chain.log"
+  },
+  {
+    "test": "config_pipeline::tests::validate_rejects_a_duplicate_name",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_pipeline__tests__validate_rejects_a_duplicate_name.log"
+  },
+  {
+    "test": "config_pipeline::tests::validate_rejects_a_duplicate_permission",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_pipeline__tests__validate_rejects_a_duplicate_permission.log"
+  },
+  {
+    "test": "config_pipeline::tests::validate_rejects_a_missing_name",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_pipeline__tests__validate_rejects_a_missing_name.log"
+  },
+  {
+    "test": "config_pipeline::tests::validate_rejects_an_empty_agent",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_pipeline__tests__validate_rejects_an_empty_agent.log"
+  },
+  {
+    "test": "config_pipeline::tests::validate_rejects_an_empty_or_control_char_permission",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_pipeline__tests__validate_rejects_an_empty_or_control_char_permission.log"
+  },
+  {
+    "test": "config_pipeline::tests::validate_rejects_an_unknown_next",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_pipeline__tests__validate_rejects_an_unknown_next.log"
+  },
+  {
+    "test": "config_pipeline::tests::validate_rejects_an_unresolvable_agent",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_pipeline__tests__validate_rejects_an_unresolvable_agent.log"
+  },
+  {
+    "test": "config_pipeline::tests::validate_rejects_zero_concurrency",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_pipeline__tests__validate_rejects_zero_concurrency.log"
+  },
+  {
+    "test": "config_pipeline::tests::validate_reports_a_self_loop_and_a_downstream_loop",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_pipeline__tests__validate_reports_a_self_loop_and_a_downstream_loop.log"
+  },
+  {
+    "test": "config_pipeline::tests::validate_reports_each_cycle_exactly_once",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_pipeline__tests__validate_reports_each_cycle_exactly_once.log"
+  },
+  {
+    "test": "config_pipeline::tests::warnings_flag_an_unreachable_stage_only",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_pipeline__tests__warnings_flag_an_unreachable_stage_only.log"
+  },
+  {
+    "test": "config_placement::tests::defaults_are_off_and_safe",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.006,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_placement__tests__defaults_are_off_and_safe.log"
+  },
+  {
+    "test": "config_placement::tests::junk_quantities_warn_and_fall_back",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_placement__tests__junk_quantities_warn_and_fall_back.log"
+  },
+  {
+    "test": "config_placement::tests::mode_floor_lattice",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.006,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_placement__tests__mode_floor_lattice.log"
+  },
+  {
+    "test": "config_placement::tests::overcommit_lowered_to_pct",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_placement__tests__overcommit_lowered_to_pct.log"
+  },
+  {
+    "test": "config_placement::tests::partial_env_resources_fall_back_per_field",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_placement__tests__partial_env_resources_fall_back_per_field.log"
+  },
+  {
+    "test": "config_placement::tests::resolve_applies_env_pref_and_the_stricter_floor",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_placement__tests__resolve_applies_env_pref_and_the_stricter_floor.log"
+  },
+  {
+    "test": "config_placement::tests::resolve_resources_env_over_default_over_builtin",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_placement__tests__resolve_resources_env_over_default_over_builtin.log"
+  },
+  {
+    "test": "config_placement::tests::resources_decl_is_empty",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_placement__tests__resources_decl_is_empty.log"
+  },
+  {
+    "test": "config_placement::tests::template_without_spec_is_none_and_zero_max_is_one",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_placement__tests__template_without_spec_is_none_and_zero_max_is_one.log"
+  },
+  {
+    "test": "config_placement::tests::toml_round_trip_and_aliases",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_placement__tests__toml_round_trip_and_aliases.log"
+  },
+  {
+    "test": "config_placement::tests::zone_placement_floor_parses",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_placement__tests__zone_placement_floor_parses.log"
+  },
+  {
+    "test": "config_pr_queue::tests::defaults_are_safe_for_a_shared_repo",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.006,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_pr_queue__tests__defaults_are_safe_for_a_shared_repo.log"
+  },
+  {
+    "test": "config_pr_queue::tests::merge_mode_aliases_round_trip",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_pr_queue__tests__merge_mode_aliases_round_trip.log"
+  },
+  {
+    "test": "config_pr_queue::tests::overlay_applies_present_fields_and_inherits_absent_ones",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_pr_queue__tests__overlay_applies_present_fields_and_inherits_absent_ones.log"
+  },
+  {
+    "test": "config_pr_queue::tests::overlay_is_empty_only_when_nothing_is_set",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.006,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_pr_queue__tests__overlay_is_empty_only_when_nothing_is_set.log"
+  },
+  {
+    "test": "config_pr_queue::tests::poll_interval_is_floored_against_rate_limits",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_pr_queue__tests__poll_interval_is_floored_against_rate_limits.log"
+  },
+  {
+    "test": "config_pr_queue::tests::prompts_fall_back_to_builtins_and_ignore_merge_kinds",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_pr_queue__tests__prompts_fall_back_to_builtins_and_ignore_merge_kinds.log"
+  },
+  {
+    "test": "config_pr_queue::tests::prompts_overlay_merges_field_wise",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_pr_queue__tests__prompts_overlay_merges_field_wise.log"
+  },
+  {
+    "test": "config_pr_queue::tests::watch_list_gates_each_blocker_class",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_pr_queue__tests__watch_list_gates_each_blocker_class.log"
+  },
+  {
+    "test": "config_presets::tests::classify_prefers_registry_then_shell_then_raw",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_presets__tests__classify_prefers_registry_then_shell_then_raw.log"
+  },
+  {
+    "test": "config_presets::tests::pane_cwd_joins_relative_and_defaults_to_root",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_presets__tests__pane_cwd_joins_relative_and_defaults_to_root.log"
+  },
+  {
+    "test": "config_presets::tests::preset_mode_parses_canon_and_aliases_defaults_split",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_presets__tests__preset_mode_parses_canon_and_aliases_defaults_split.log"
+  },
+  {
+    "test": "config_presets::tests::resolve_env_expands_indirection_and_drops_missing",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_presets__tests__resolve_env_expands_indirection_and_drops_missing.log"
+  },
+  {
+    "test": "config_presets::tests::resolved_commands_maps_in_order",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_presets__tests__resolved_commands_maps_in_order.log"
+  },
+  {
+    "test": "config_presets::tests::uses_layout_and_layout_name",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_presets__tests__uses_layout_and_layout_name.log"
+  },
+  {
+    "test": "config_presets::tests::validate_accepts_layout_only_preset",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_presets__tests__validate_accepts_layout_only_preset.log"
+  },
+  {
+    "test": "config_presets::tests::validate_rejects_empty_preset_and_missing_name",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_presets__tests__validate_rejects_empty_preset_and_missing_name.log"
+  },
+  {
+    "test": "config_presets::tests::validate_rejects_template_preset_combined_with_layout_or_commands",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_presets__tests__validate_rejects_template_preset_combined_with_layout_or_commands.log"
+  },
+  {
+    "test": "config_presets::tests::warnings_flag_duplicates_and_unknown_template_ref",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_presets__tests__warnings_flag_duplicates_and_unknown_template_ref.log"
+  },
+  {
+    "test": "config_preview::tests::preview_defaults_are_bounded_and_local_only",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_preview__tests__preview_defaults_are_bounded_and_local_only.log"
+  },
+  {
+    "test": "config_preview::tests::preview_overlay_changes_only_present_values",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.006,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_preview__tests__preview_overlay_changes_only_present_values.log"
+  },
+  {
+    "test": "config_preview::tests::preview_policy_clamps_and_canonicalizes",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_preview__tests__preview_policy_clamps_and_canonicalizes.log"
+  },
+  {
+    "test": "config_preview::tests::preview_port_env_is_atomic_and_deduplicated",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_preview__tests__preview_port_env_is_atomic_and_deduplicated.log"
+  },
+  {
+    "test": "config_preview::tests::preview_toml_schema_round_trips",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_preview__tests__preview_toml_schema_round_trips.log"
+  },
+  {
+    "test": "config_push::tests::allow_rejects_unknown_and_admin_caps",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_push__tests__allow_rejects_unknown_and_admin_caps.log"
+  },
+  {
+    "test": "config_push::tests::bad_scope_word_is_an_error",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_push__tests__bad_scope_word_is_an_error.log"
+  },
+  {
+    "test": "config_push::tests::ceiling_and_allow_set",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_push__tests__ceiling_and_allow_set.log"
+  },
+  {
+    "test": "config_push::tests::disabled_inbox_has_no_errors",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_push__tests__disabled_inbox_has_no_errors.log"
+  },
+  {
+    "test": "config_push::tests::enabled_inbox_rejects_raw_secret",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_push__tests__enabled_inbox_rejects_raw_secret.log"
+  },
+  {
+    "test": "config_push::tests::enabled_inbox_requires_secret_and_allow",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_push__tests__enabled_inbox_requires_secret_and_allow.log"
+  },
+  {
+    "test": "config_push::tests::explicit_sinks_materialize_and_validate_without_echoing_urls",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_push__tests__explicit_sinks_materialize_and_validate_without_echoing_urls.log"
+  },
+  {
+    "test": "config_push::tests::is_configured_requires_impl_kind_server_topic",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_push__tests__is_configured_requires_impl_kind_server_topic.log"
+  },
+  {
+    "test": "config_push::tests::min_priority_parses_with_fallback",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_push__tests__min_priority_parses_with_fallback.log"
+  },
+  {
+    "test": "config_push::tests::named_sink_secret_refs_and_floors_are_accepted",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_push__tests__named_sink_secret_refs_and_floors_are_accepted.log"
+  },
+  {
+    "test": "config_push::tests::push_kind_parses_and_reserves",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_push__tests__push_kind_parses_and_reserves.log"
+  },
+  {
+    "test": "config_push::tests::resolved_secret_reads_a_file_ref",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_push__tests__resolved_secret_reads_a_file_ref.log"
+  },
+  {
+    "test": "config_push::tests::sink_names_cannot_inject_output_or_break_selectors",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_push__tests__sink_names_cannot_inject_output_or_break_selectors.log"
+  },
+  {
+    "test": "config_push::tests::token_resolves_as_secret_ref",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_push__tests__token_resolves_as_secret_ref.log"
+  },
+  {
+    "test": "config_push::tests::well_formed_inbox_shape_is_valid_but_secret_may_not_resolve",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_push__tests__well_formed_inbox_shape_is_valid_but_secret_may_not_resolve.log"
+  },
+  {
+    "test": "config_remote::tests::defaults_mirror_the_builtin_tuning",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_remote__tests__defaults_mirror_the_builtin_tuning.log"
+  },
+  {
+    "test": "config_remote::tests::merge_remote_mode_parse_default_alias",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_remote__tests__merge_remote_mode_parse_default_alias.log"
+  },
+  {
+    "test": "config_remote::tests::resolution_clamps_pathological_values",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_remote__tests__resolution_clamps_pathological_values.log"
+  },
+  {
+    "test": "config_remote::tests::toml_roundtrip",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_remote__tests__toml_roundtrip.log"
+  },
+  {
+    "test": "config_repo::tests::command_collector_refusal_uses_an_already_read_overlay_body",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_repo__tests__command_collector_refusal_uses_an_already_read_overlay_body.log"
+  },
+  {
+    "test": "config_repo::tests::discovery_rejects_symlinked_candidates_even_when_target_is_readable",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_repo__tests__discovery_rejects_symlinked_candidates_even_when_target_is_readable.log"
+  },
+  {
+    "test": "config_repo::tests::discovery_reports_shadowed_candidates_in_precedence_order",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_repo__tests__discovery_reports_shadowed_candidates_in_precedence_order.log"
+  },
+  {
+    "test": "config_repo::tests::discovery_retains_broken_symlink_candidates",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_repo__tests__discovery_retains_broken_symlink_candidates.log"
+  },
+  {
+    "test": "config_repo::tests::discovery_retains_unreadable_candidates_and_selects_lower_readable_file",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_repo__tests__discovery_retains_unreadable_candidates_and_selects_lower_readable_file.log"
+  },
+  {
+    "test": "config_repo::tests::explicit_null_is_accepted_for_optional_overlay_fields",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.012,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_repo__tests__explicit_null_is_accepted_for_optional_overlay_fields.log"
+  },
+  {
+    "test": "config_repo::tests::nested_typos_include_a_nearest_key_hint",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.015,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_repo__tests__nested_typos_include_a_nearest_key_hint.log"
+  },
+  {
+    "test": "config_repo::tests::syntax_errors_name_the_source_format",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_repo__tests__syntax_errors_name_the_source_format.log"
+  },
+  {
+    "test": "config_repo::tests::type_errors_name_path_expected_and_actual_types",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.014,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_repo__tests__type_errors_name_path_expected_and_actual_types.log"
+  },
+  {
+    "test": "config_repo::tests::unknown_top_level_keys_are_reported",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.014,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_repo__tests__unknown_top_level_keys_are_reported.log"
+  },
+  {
+    "test": "config_repo::tests::valid_repo_documents_are_accepted_in_all_formats",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.013,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_repo__tests__valid_repo_documents_are_accepted_in_all_formats.log"
+  },
+  {
+    "test": "config_resolve::tests::approved_mount_is_applied",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_resolve__tests__approved_mount_is_applied.log"
+  },
+  {
+    "test": "config_resolve::tests::byte_and_cpu_parsers_accept_documented_units_and_reject_bad_input",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_resolve__tests__byte_and_cpu_parsers_accept_documented_units_and_reject_bad_input.log"
+  },
+  {
+    "test": "config_resolve::tests::canonical_is_stable",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_resolve__tests__canonical_is_stable.log"
+  },
+  {
+    "test": "config_resolve::tests::dotted_pointer_conversion",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.006,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_resolve__tests__dotted_pointer_conversion.log"
+  },
+  {
+    "test": "config_resolve::tests::empty_overlay_is_noop",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_resolve__tests__empty_overlay_is_noop.log"
+  },
+  {
+    "test": "config_resolve::tests::event_summaries_distinguish_denial_from_narrowing_and_label_all_layers",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_resolve__tests__event_summaries_distinguish_denial_from_narrowing_and_label_all_layers.log"
+  },
+  {
+    "test": "config_resolve::tests::every_gated_repo_resource_requires_exact_approval",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_resolve__tests__every_gated_repo_resource_requires_exact_approval.log"
+  },
+  {
+    "test": "config_resolve::tests::explain_default_key_origin_is_builtin",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.013,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_resolve__tests__explain_default_key_origin_is_builtin.log"
+  },
+  {
+    "test": "config_resolve::tests::explain_file_key_origin_is_global",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.014,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_resolve__tests__explain_file_key_origin_is_global.log"
+  },
+  {
+    "test": "config_resolve::tests::explain_flag_overrides_origin_is_runtime",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.034,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_resolve__tests__explain_flag_overrides_origin_is_runtime.log"
+  },
+  {
+    "test": "config_resolve::tests::host_pinned_ssh_env_pane_follows_host_transport_and_proxycommand",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_resolve__tests__host_pinned_ssh_env_pane_follows_host_transport_and_proxycommand.log"
+  },
+  {
+    "test": "config_resolve::tests::hostile_repo_cannot_attach_vpn_or_remote_or_home",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_resolve__tests__hostile_repo_cannot_attach_vpn_or_remote_or_home.log"
+  },
+  {
+    "test": "config_resolve::tests::hostile_repo_cannot_choose_backend",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_resolve__tests__hostile_repo_cannot_choose_backend.log"
+  },
+  {
+    "test": "config_resolve::tests::hostile_repo_cannot_disable_sandbox",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.006,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_resolve__tests__hostile_repo_cannot_disable_sandbox.log"
+  },
+  {
+    "test": "config_resolve::tests::hostile_repo_cannot_passthrough_host_env",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_resolve__tests__hostile_repo_cannot_passthrough_host_env.log"
+  },
+  {
+    "test": "config_resolve::tests::hostile_repo_cannot_weaken_aggregate_cpu_ceiling",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_resolve__tests__hostile_repo_cannot_weaken_aggregate_cpu_ceiling.log"
+  },
+  {
+    "test": "config_resolve::tests::hostile_repo_cannot_widen_network_to_host",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_resolve__tests__hostile_repo_cannot_widen_network_to_host.log"
+  },
+  {
+    "test": "config_resolve::tests::hostile_repo_file_access_host_denied",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_resolve__tests__hostile_repo_file_access_host_denied.log"
+  },
+  {
+    "test": "config_resolve::tests::hostile_repo_init_script_gated",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_resolve__tests__hostile_repo_init_script_gated.log"
+  },
+  {
+    "test": "config_resolve::tests::hostile_repo_mounts_are_gated_not_applied",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_resolve__tests__hostile_repo_mounts_are_gated_not_applied.log"
+  },
+  {
+    "test": "config_resolve::tests::limit_clamping_covers_unbounded_invalid_and_total_memory_cases",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_resolve__tests__limit_clamping_covers_unbounded_invalid_and_total_memory_cases.log"
+  },
+  {
+    "test": "config_resolve::tests::limits_cannot_exceed_ceiling",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_resolve__tests__limits_cannot_exceed_ceiling.log"
+  },
+  {
+    "test": "config_resolve::tests::managed_placements_default_to_no_backend_unless_env_opts_in",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_resolve__tests__managed_placements_default_to_no_backend_unless_env_opts_in.log"
+  },
+  {
+    "test": "config_resolve::tests::network_allow_all_denied_becomes_deny_all_not_allow_all",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_resolve__tests__network_allow_all_denied_becomes_deny_all_not_allow_all.log"
+  },
+  {
+    "test": "config_resolve::tests::network_allow_empty_means_deny_all",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_resolve__tests__network_allow_empty_means_deny_all.log"
+  },
+  {
+    "test": "config_resolve::tests::network_allow_narrows_within_ceiling",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_resolve__tests__network_allow_narrows_within_ceiling.log"
+  },
+  {
+    "test": "config_resolve::tests::network_allow_universe_base_grants_narrowing",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_resolve__tests__network_allow_universe_base_grants_narrowing.log"
+  },
+  {
+    "test": "config_resolve::tests::network_allow_unset_inherits",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_resolve__tests__network_allow_unset_inherits.log"
+  },
+  {
+    "test": "config_resolve::tests::network_block_accumulates_and_is_ungated",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_resolve__tests__network_block_accumulates_and_is_ungated.log"
+  },
+  {
+    "test": "config_resolve::tests::pick_default_env_honors_branch_and_main_env",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_resolve__tests__pick_default_env_honors_branch_and_main_env.log"
+  },
+  {
+    "test": "config_resolve::tests::repo_can_disable_but_not_authorize_sandbox_compiler_cache",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_resolve__tests__repo_can_disable_but_not_authorize_sandbox_compiler_cache.log"
+  },
+  {
+    "test": "config_resolve::tests::repo_can_harden_the_miss_policy_but_not_soften_it",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_resolve__tests__repo_can_harden_the_miss_policy_but_not_soften_it.log"
+  },
+  {
+    "test": "config_resolve::tests::repo_can_raise_the_isolation_floor_but_not_lower_it",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_resolve__tests__repo_can_raise_the_isolation_floor_but_not_lower_it.log"
+  },
+  {
+    "test": "config_resolve::tests::repo_can_tighten_file_access",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_resolve__tests__repo_can_tighten_file_access.log"
+  },
+  {
+    "test": "config_resolve::tests::repo_can_tighten_network_to_none",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_resolve__tests__repo_can_tighten_network_to_none.log"
+  },
+  {
+    "test": "config_resolve::tests::repo_overlay_field_matrix_enforces_forbidden_and_floor_rules",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_resolve__tests__repo_overlay_field_matrix_enforces_forbidden_and_floor_rules.log"
+  },
+  {
+    "test": "config_resolve::tests::repo_preferences_pass_through",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_resolve__tests__repo_preferences_pass_through.log"
+  },
+  {
+    "test": "config_resolve::tests::restrictiveness_lattices_cover_every_policy_variant",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_resolve__tests__restrictiveness_lattices_cover_every_policy_variant.log"
+  },
+  {
+    "test": "config_resolve::tests::root_checkout_takes_main_env_regardless_of_branch",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_resolve__tests__root_checkout_takes_main_env_regardless_of_branch.log"
+  },
+  {
+    "test": "config_resolve::tests::selected_env_without_a_table_is_flagged_not_silently_dropped",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_resolve__tests__selected_env_without_a_table_is_flagged_not_silently_dropped.log"
+  },
+  {
+    "test": "config_skills::tests::defaults_preserve_existing_skill_seeding",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_skills__tests__defaults_preserve_existing_skill_seeding.log"
+  },
+  {
+    "test": "config_skills::tests::validates_skill_names_and_directory_syntax_only",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_skills__tests__validates_skill_names_and_directory_syntax_only.log"
+  },
+  {
+    "test": "config_theme::tests::agent_glyphs_canonical_string_and_display_round_trip",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_theme__tests__agent_glyphs_canonical_string_and_display_round_trip.log"
+  },
+  {
+    "test": "config_theme::tests::agent_glyphs_parse_aliases_default_and_error",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_theme__tests__agent_glyphs_parse_aliases_default_and_error.log"
+  },
+  {
+    "test": "config_theme::tests::agent_glyphs_serde_round_trips_via_toml",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_theme__tests__agent_glyphs_serde_round_trips_via_toml.log"
+  },
+  {
+    "test": "config_theme::tests::mascot_enums_canonical_string_round_trip",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.006,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_theme__tests__mascot_enums_canonical_string_round_trip.log"
+  },
+  {
+    "test": "config_theme::tests::mascot_kind_parse_aliases_default_and_error",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.006,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_theme__tests__mascot_kind_parse_aliases_default_and_error.log"
+  },
+  {
+    "test": "config_theme::tests::mascot_motion_parse_aliases_default_and_error",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_theme__tests__mascot_motion_parse_aliases_default_and_error.log"
+  },
+  {
+    "test": "config_ui::tests::focus_detail_parses_and_defaults_to_cursor",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_ui__tests__focus_detail_parses_and_defaults_to_cursor.log"
+  },
+  {
+    "test": "config_ui::tests::fullscreen_bar_keys_default_on_and_parse",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_ui__tests__fullscreen_bar_keys_default_on_and_parse.log"
+  },
+  {
+    "test": "config_ui::tests::nav_skips_collapsed_defaults_on_and_toggles",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_ui__tests__nav_skips_collapsed_defaults_on_and_toggles.log"
+  },
+  {
+    "test": "config_ui::tests::sidebar_dividers_defaults_on_and_toggles",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_ui__tests__sidebar_dividers_defaults_on_and_toggles.log"
+  },
+  {
+    "test": "config_ui::tests::sidebar_freeze_sort_defaults_on_and_toggles",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_ui__tests__sidebar_freeze_sort_defaults_on_and_toggles.log"
+  },
+  {
+    "test": "config_ui::tests::sidebar_row_display_defaults_on_and_toggle",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_ui__tests__sidebar_row_display_defaults_on_and_toggle.log"
+  },
+  {
+    "test": "config_ui::tests::sidebar_width_keys_default_to_unset_and_parse",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_ui__tests__sidebar_width_keys_default_to_unset_and_parse.log"
+  },
+  {
+    "test": "config_ui::tests::terminals_section_parses_and_defaults_always",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_ui__tests__terminals_section_parses_and_defaults_always.log"
+  },
+  {
+    "test": "config_ui::tests::ui_config_toml_roundtrip_with_new_key",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_ui__tests__ui_config_toml_roundtrip_with_new_key.log"
+  },
+  {
+    "test": "config_ui::tests::workspace_sort_parses_and_defaults_manual",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_ui__tests__workspace_sort_parses_and_defaults_manual.log"
+  },
+  {
+    "test": "config_validate::tests::aliases_and_bool_failover_stay_clean",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.024,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_validate__tests__aliases_and_bool_failover_stay_clean.log"
+  },
+  {
+    "test": "config_validate::tests::canonical_values_and_aliases_are_normalization_stable",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.021,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_validate__tests__canonical_values_and_aliases_are_normalization_stable.log"
+  },
+  {
+    "test": "config_validate::tests::compatibility_warning_does_not_hide_real_errors_or_change_collision_policy",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.024,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_validate__tests__compatibility_warning_does_not_hide_real_errors_or_change_collision_policy.log"
+  },
+  {
+    "test": "config_validate::tests::every_marked_definition_is_reachable",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.024,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_validate__tests__every_marked_definition_is_reachable.log"
+  },
+  {
+    "test": "config_validate::tests::example_config_validates_clean",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.066,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_validate__tests__example_config_validates_clean.log"
+  },
+  {
+    "test": "config_validate::tests::hooks_list_entries_accept_both_union_shapes",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.025,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_validate__tests__hooks_list_entries_accept_both_union_shapes.log"
+  },
+  {
+    "test": "config_validate::tests::legacy_project_config_keys_are_known_compatibility_diagnostics",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.024,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_validate__tests__legacy_project_config_keys_are_known_compatibility_diagnostics.log"
+  },
+  {
+    "test": "config_validate::tests::marked_definition_count_is_pinned",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.02,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_validate__tests__marked_definition_count_is_pinned.log"
+  },
+  {
+    "test": "config_validate::tests::newly_covered_keys_error_with_dotted_path_and_valid_set",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.026,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_validate__tests__newly_covered_keys_error_with_dotted_path_and_valid_set.log"
+  },
+  {
+    "test": "config_validate::tests::non_union_types_remain_strict",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_validate__tests__non_union_types_remain_strict.log"
+  },
+  {
+    "test": "config_validate::tests::pipeline_stages_are_validated_through_every_channel",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.033,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_validate__tests__pipeline_stages_are_validated_through_every_channel.log"
+  },
+  {
+    "test": "config_validate::tests::published_schema_advertises_canonical_strings",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_validate__tests__published_schema_advertises_canonical_strings.log"
+  },
+  {
+    "test": "config_validate::tests::reserved_kinds_fail_strict_validation_by_name",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.031,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_validate__tests__reserved_kinds_fail_strict_validation_by_name.log"
+  },
+  {
+    "test": "config_validate::tests::schema_marker_lists_reserved_spellings",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.022,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_validate__tests__schema_marker_lists_reserved_spellings.log"
+  },
+  {
+    "test": "config_validate::tests::serve_cors_wildcard_is_rejected_but_explicit_origins_pass",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.023,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_validate__tests__serve_cors_wildcard_is_rejected_but_explicit_origins_pass.log"
+  },
+  {
+    "test": "config_validate::tests::serve_transport_rejects_accidental_plaintext_widening",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.022,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_validate__tests__serve_transport_rejects_accidental_plaintext_widening.log"
+  },
+  {
+    "test": "config_validate::tests::serve_transport_validates_strict_termination_boundary",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.024,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_validate__tests__serve_transport_validates_strict_termination_boundary.log"
+  },
+  {
+    "test": "config_validate::tests::union_accepts_each_shape_and_reports_only_the_union_on_a_miss",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_validate__tests__union_accepts_each_shape_and_reports_only_the_union_on_a_miss.log"
+  },
+  {
+    "test": "config_validate::tests::unknown_keys_fail_strict_validation_with_a_hint",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.027,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_validate__tests__unknown_keys_fail_strict_validation_with_a_hint.log"
+  },
+  {
+    "test": "config_validate::tests::walker_reaches_legacy_and_previously_uncovered_paths",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.022,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_validate__tests__walker_reaches_legacy_and_previously_uncovered_paths.log"
+  },
+  {
+    "test": "config_voice::tests::command_contract_round_trips",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_voice__tests__command_contract_round_trips.log"
+  },
+  {
+    "test": "config_voice::tests::defaults_are_disabled_and_unconfigured",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_voice__tests__defaults_are_disabled_and_unconfigured.log"
+  },
+  {
+    "test": "config_voice::tests::max_seconds_is_bounded",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_voice__tests__max_seconds_is_bounded.log"
+  },
+  {
+    "test": "config_weather::tests::a_missing_provider_key_defaults_to_wttr_in_but_a_reserved_one_disables",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_weather__tests__a_missing_provider_key_defaults_to_wttr_in_but_a_reserved_one_disables.log"
+  },
+  {
+    "test": "config_weather::tests::an_empty_config_gives_an_inert_weather_table",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_weather__tests__an_empty_config_gives_an_inert_weather_table.log"
+  },
+  {
+    "test": "config_weather::tests::an_unknown_provider_or_unit_warns_and_falls_back",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_weather__tests__an_unknown_provider_or_unit_warns_and_falls_back.log"
+  },
+  {
+    "test": "config_weather::tests::defaults_are_inert",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_weather__tests__defaults_are_inert.log"
+  },
+  {
+    "test": "config_weather::tests::poll_secs_is_none_unless_everything_is_on",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_weather__tests__poll_secs_is_none_unless_everything_is_on.log"
+  },
+  {
+    "test": "config_weather::tests::refresh_is_floored_in_the_accessor",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_weather__tests__refresh_is_floored_in_the_accessor.log"
+  },
+  {
+    "test": "config_weather::tests::timeout_is_clamped",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_weather__tests__timeout_is_clamped.log"
+  },
+  {
+    "test": "config_weather::tests::units_resolve_through_the_core_helper",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_weather__tests__units_resolve_through_the_core_helper.log"
+  },
+  {
+    "test": "config_weather::tests::validate_flags_each_problem_once",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_weather__tests__validate_flags_each_problem_once.log"
+  },
+  {
+    "test": "config_write::tests::read_doc_does_not_treat_an_unreadable_file_as_empty",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_write__tests__read_doc_does_not_treat_an_unreadable_file_as_empty.log"
+  },
+  {
+    "test": "config_write::tests::repo_select_writes_only_a_string",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.035,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_write__tests__repo_select_writes_only_a_string.log"
+  },
+  {
+    "test": "config_write::tests::set_key_creates_nested_tables",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.034,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_write__tests__set_key_creates_nested_tables.log"
+  },
+  {
+    "test": "config_write::tests::set_key_infers_scalar_types_and_config_stays_parseable",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.091,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_write__tests__set_key_infers_scalar_types_and_config_stays_parseable.log"
+  },
+  {
+    "test": "config_write::tests::set_key_keeps_bracketed_prose_as_a_string",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.036,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_write__tests__set_key_keeps_bracketed_prose_as_a_string.log"
+  },
+  {
+    "test": "config_write::tests::set_key_writes_arrays_and_inline_tables",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.035,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_write__tests__set_key_writes_arrays_and_inline_tables.log"
+  },
+  {
+    "test": "config_write::tests::set_key_writes_canonical_names_for_legacy_keys",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.034,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_write__tests__set_key_writes_canonical_names_for_legacy_keys.log"
+  },
+  {
+    "test": "config_write::tests::set_string_array_round_trips_and_preserves_comments",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.061,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_write__tests__set_string_array_round_trips_and_preserves_comments.log"
+  },
+  {
+    "test": "config_write::tests::upsert_forge_writes_kind_and_host",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.036,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_write__tests__upsert_forge_writes_kind_and_host.log"
+  },
+  {
+    "test": "config_write::tests::upsert_host_rejects_empty_inputs",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_write__tests__upsert_host_rejects_empty_inputs.log"
+  },
+  {
+    "test": "config_write::tests::upsert_host_writes_reach_and_ssh_and_keeps_siblings",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.062,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_write__tests__upsert_host_writes_reach_and_ssh_and_keeps_siblings.log"
+  },
+  {
+    "test": "config_write::tests::upsert_issue_account_appends_updates_and_removes",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.115,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_write__tests__upsert_issue_account_appends_updates_and_removes.log"
+  },
+  {
+    "test": "config_write::tests::upsert_issue_account_rejects_empty_name",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_write__tests__upsert_issue_account_rejects_empty_name.log"
+  },
+  {
+    "test": "config_write::tests::upsert_provider_env_round_trips_and_preserves_comments",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.092,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_write__tests__upsert_provider_env_round_trips_and_preserves_comments.log"
+  },
+  {
+    "test": "config_write::tests::write_doc_is_atomic_and_leaves_no_tmp",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.035,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/config_write__tests__write_doc_is_atomic_and_leaves_no_tmp.log"
+  },
+  {
+    "test": "forge::authorship::tests::actual_cli_model_authors_organization_pr_and_never_guesses_namespace",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/forge__authorship__tests__actual_cli_model_authors_organization_pr_and_never_guesses_namespace.log"
+  },
+  {
+    "test": "forge::authorship::tests::enterprise_host_is_explicit_and_ambiguous_origins_are_refused",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/forge__authorship__tests__enterprise_host_is_explicit_and_ambiguous_origins_are_refused.log"
+  },
+  {
+    "test": "forge::authorship::tests::legacy_cache_deleted_bot_empty_and_partial_authority_fail_closed",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/forge__authorship__tests__legacy_cache_deleted_bot_empty_and_partial_authority_fail_closed.log"
+  },
+  {
+    "test": "forge::authorship::tests::stable_ids_bind_account_author_head_pr_and_repository_generations",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/forge__authorship__tests__stable_ids_bind_account_author_head_pr_and_repository_generations.log"
+  },
+  {
+    "test": "time_policy::tests::cache_rollback_and_large_ttl_do_not_force_repolling",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/time_policy__tests__cache_rollback_and_large_ttl_do_not_force_repolling.log"
+  },
+  {
+    "test": "time_policy::tests::cadence_floors_caps_and_units_never_produce_zero",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.006,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/time_policy__tests__cadence_floors_caps_and_units_never_produce_zero.log"
+  },
+  {
+    "test": "time_policy::tests::generated_cadences_are_monotone_and_nonzero",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/time_policy__tests__generated_cadences_are_monotone_and_nonzero.log"
+  },
+  {
+    "test": "time_policy::tests::milliseconds_never_narrow_to_negative_or_disable_a_window",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.006,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/time_policy__tests__milliseconds_never_narrow_to_negative_or_disable_a_window.log"
+  },
+  {
+    "test": "time_policy::tests::provider_deadlines_reject_overflow_and_unsupported_delays",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/time_policy__tests__provider_deadlines_reject_overflow_and_unsupported_delays.log"
+  },
+  {
+    "test": "time_policy::tests::unknown_or_invalid_age_never_authorizes_destruction",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.006,
+    "log": "/tmp/thegn-batch02-core-checkpoint2-results/time_policy__tests__unknown_or_invalid_age_never_authorizes_destruction.log"
+  }
+]

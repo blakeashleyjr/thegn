@@ -1,0 +1,8 @@
+{
+  "previous_main": "1ef8228f917c5cffb2e1993a8843b960aa396372",
+  "landed_main": "0e726cb70e35f643126215aa982947a08942387e",
+  "preservation_checks": "all saved user files match byte hashes",
+  "merge": "fast-forward",
+  "push": false,
+  "live_restart": false
+}

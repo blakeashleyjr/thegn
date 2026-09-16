@@ -20,13 +20,12 @@ ignore = [
   # signing in a local CLI; not a network-facing service). No fixed rsa
   # release exists yet; drop this when rsa ships the fix.
   "RUSTSEC-2023-0071",
-  # tokei 12.1.2 (code-stats) is the latest release and pins a legacy tree:
-  # clap 2 → ansi_term/atty, parking_lot 0.11 → instant, term_size. All
-  # "unmaintained" notices, no vulnerabilities. Drop when tokei 13 releases
-  # or the stats backend is replaced.
-  "RUSTSEC-2021-0139", # ansi_term unmaintained (via tokei)
-  "RUSTSEC-2024-0375", # atty unmaintained (via tokei)
-  "RUSTSEC-2024-0384", # instant unmaintained (via tokei)
+  # tokei 15.0.0 (code-stats) dropped the clap 2 / parking_lot 0.11 legacy
+  # tree that used to bring ansi_term, atty, instant, vec_map and num_cpus
+  # here; those four ignores are retired (2026-09-15). term_size is still a
+  # direct tokei dependency, and is an unmaintained notice, not a
+  # vulnerability. Drop when tokei moves off it or the stats backend is
+  # replaced.
   "RUSTSEC-2020-0163", # term_size unmaintained (via tokei)
   # syntect 5 (syntax highlighting) still serializes its dumps with
   # bincode 1; unmaintained-notice only. Drop when syntect moves off it.

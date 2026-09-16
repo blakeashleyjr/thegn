@@ -98,6 +98,19 @@ pub(crate) fn is_remote_ref_path(p: &std::path::Path) -> bool {
     comps.windows(2).any(|w| w == ["refs", "remotes"]) && !comps.contains(&"logs")
 }
 
+/// Whether a diff-watcher event path is a `HEAD` rewrite — a checkout or
+/// branch switch (`.git/HEAD`, or `.git/worktrees/<name>/HEAD` for a linked
+/// worktree). The PR cache is keyed by worktree, so the new branch's PR must be
+/// looked up now rather than showing the old branch's until the 20s ticker.
+/// Commits on a branch move `refs/heads/…`, not `HEAD`, so this stays rare;
+/// detached-HEAD churn (a rebase) resolves to `NoPr` without a network call.
+pub(crate) fn is_head_move_path(p: &std::path::Path) -> bool {
+    let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+    name == "HEAD"
+        && p.components().any(|c| c.as_os_str() == ".git")
+        && !p.components().any(|c| c.as_os_str() == "logs")
+}
+
 /// A path in the form the fs-watcher will report it in.
 ///
 /// macOS's FSEvents backend canonicalizes the watched root and always delivers
@@ -361,6 +374,20 @@ mod tests {
         assert!(!yes("/repo/src/main.rs"));
         assert!(!yes("/repo/.git/index"));
         assert!(!yes("/repo/.git/HEAD"));
+    }
+
+    #[test]
+    fn head_move_paths_signal_a_checkout() {
+        let yes = |p: &str| is_head_move_path(std::path::Path::new(p));
+        assert!(yes("/repo/.git/HEAD"));
+        assert!(yes("/repo/.git/worktrees/feat/HEAD"));
+        // Reflog, lock churn, pseudo-refs and branch refs are not checkouts.
+        assert!(!yes("/repo/.git/logs/HEAD"));
+        assert!(!yes("/repo/.git/HEAD.lock"));
+        assert!(!yes("/repo/.git/ORIG_HEAD"));
+        assert!(!yes("/repo/.git/refs/heads/main"));
+        assert!(!yes("/repo/src/HEAD"));
+        assert!(!yes("/repo/src/HEAD.rs"));
     }
 
     #[test]

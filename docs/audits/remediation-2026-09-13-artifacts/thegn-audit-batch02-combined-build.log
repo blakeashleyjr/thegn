@@ -1,0 +1,219 @@
+   Compiling thegn-host v0.1.0-alpha.2 (/tmp/thegn-audit-remediation-20260913/crates/thegn-host)
+warning: hiding a lifetime that's elided elsewhere is confusing
+   --> vendor/termwiz/src/hyperlink.rs:247:18
+    |
+247 |     fn highlight(&self) -> Option<fancy_regex::Match> {
+    |                  ^^^^^            ^^^^^^^^^^^^^^^^^^ the same lifetime is hidden here
+    |                  |
+    |                  the lifetime is elided here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+    = note: `#[warn(mismatched_lifetime_syntaxes)]` on by default
+help: use `'_` for type paths
+    |
+247 |     fn highlight(&self) -> Option<fancy_regex::Match<'_>> {
+    |                                                     ++++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+   --> vendor/termwiz/src/image.rs:567:17
+    |
+567 |     pub fn data(&self) -> MutexGuard<ImageDataType> {
+    |                 ^^^^^     ^^^^^^^^^^^^^^^^^^^^^^^^^ the same lifetime is hidden here
+    |                 |
+    |                 the lifetime is elided here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+    |
+567 |     pub fn data(&self) -> MutexGuard<'_, ImageDataType> {
+    |                                      +++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+  --> vendor/termwiz/src/lineedit/history.rs:12:12
+   |
+12 |     fn get(&self, idx: HistoryIndex) -> Option<Cow<str>>;
+   |            ^^^^^ the lifetime is elided here   ^^^^^^^^ the same lifetime is hidden here
+   |
+   = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+   |
+12 |     fn get(&self, idx: HistoryIndex) -> Option<Cow<'_, str>>;
+   |                                                    +++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+  --> vendor/termwiz/src/lineedit/history.rs:22:9
+   |
+22 |         &self,
+   |         ^^^^^ the lifetime is elided here
+...
+27 |     ) -> Option<SearchResult>;
+   |                 ^^^^^^^^^^^^ the same lifetime is hidden here
+   |
+   = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+   |
+27 |     ) -> Option<SearchResult<'_>>;
+   |                             ++++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+  --> vendor/termwiz/src/lineedit/history.rs:88:12
+   |
+88 |     fn get(&self, idx: HistoryIndex) -> Option<Cow<str>> {
+   |            ^^^^^ the lifetime is elided here   ^^^^^^^^ the same lifetime is hidden here
+   |
+   = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+   |
+88 |     fn get(&self, idx: HistoryIndex) -> Option<Cow<'_, str>> {
+   |                                                    +++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+   --> vendor/termwiz/src/lineedit/history.rs:109:9
+    |
+109 |         &self,
+    |         ^^^^^ the lifetime is elided here
+...
+114 |     ) -> Option<SearchResult> {
+    |                 ^^^^^^^^^^^^ the same lifetime is hidden here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+    |
+114 |     ) -> Option<SearchResult<'_>> {
+    |                             ++++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+   --> vendor/termwiz/src/surface/mod.rs:511:25
+    |
+511 |     pub fn screen_lines(&self) -> Vec<Cow<Line>> {
+    |                         ^^^^^         ^^^^^^^^^ the same lifetime is hidden here
+    |                         |
+    |                         the lifetime is elided here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+    |
+511 |     pub fn screen_lines(&self) -> Vec<Cow<'_, Line>> {
+    |                                           +++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+   --> vendor/termwiz/src/surface/mod.rs:526:24
+    |
+526 |     pub fn get_changes(&self, seq: SequenceNo) -> (SequenceNo, Cow<[Change]>) {
+    |                        ^^^^^ the lifetime is elided here       ^^^^^^^^^^^^^ the same lifetime is hidden here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+    |
+526 |     pub fn get_changes(&self, seq: SequenceNo) -> (SequenceNo, Cow<'_, [Change]>) {
+    |                                                                    +++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+   --> vendor/termwiz/src/surface/line/clusterline.rs:165:17
+    |
+165 |     pub fn iter(&self) -> ClusterLineCellIter {
+    |                 ^^^^^     ^^^^^^^^^^^^^^^^^^^ the same lifetime is hidden here
+    |                 |
+    |                 the lifetime is elided here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+    |
+165 |     pub fn iter(&self) -> ClusterLineCellIter<'_> {
+    |                                              ++++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+   --> vendor/termwiz/src/surface/line/line.rs:609:19
+    |
+609 |     pub fn as_str(&self) -> Cow<str> {
+    |                   ^^^^^     ^^^^^^^^ the same lifetime is hidden here
+    |                   |
+    |                   the lifetime is elided here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+    |
+609 |     pub fn as_str(&self) -> Cow<'_, str> {
+    |                                 +++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+    --> vendor/termwiz/src/surface/line/line.rs:1014:21
+     |
+1014 |     pub fn get_cell(&self, cell_index: usize) -> Option<CellRef> {
+     |                     ^^^^^ the lifetime is elided here   ^^^^^^^ the same lifetime is hidden here
+     |
+     = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+     |
+1014 |     pub fn get_cell(&self, cell_index: usize) -> Option<CellRef<'_>> {
+     |                                                                ++++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+  --> vendor/termwiz/src/terminal/mod.rs:74:27
+   |
+74 |     fn probe_capabilities(&mut self) -> Option<ProbeCapabilities> {
+   |                           ^^^^^^^^^            ^^^^^^^^^^^^^^^^^ the same lifetime is hidden here
+   |                           |
+   |                           the lifetime is elided here
+   |
+   = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+   |
+74 |     fn probe_capabilities(&mut self) -> Option<ProbeCapabilities<'_>> {
+   |                                                                 ++++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+   --> vendor/termwiz/src/terminal/unix.rs:389:27
+    |
+389 |     fn probe_capabilities(&mut self) -> Option<ProbeCapabilities> {
+    |                           ^^^^^^^^^            ^^^^^^^^^^^^^^^^^ the same lifetime is hidden here
+    |                           |
+    |                           the lifetime is elided here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+    |
+389 |     fn probe_capabilities(&mut self) -> Option<ProbeCapabilities<'_>> {
+    |                                                                 ++++
+
+warning: `termwiz` (lib) generated 13 warnings (run `cargo fix --lib -p termwiz` to apply 13 suggestions)
+   Compiling thegn-svc v0.1.0-alpha.2 (/tmp/thegn-audit-remediation-20260913/crates/thegn-svc)
+   Compiling thegn-core v0.1.0-alpha.2 (/tmp/thegn-audit-remediation-20260913/crates/thegn-core)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3m 36s
+  Executable unittests src/lib.rs (/tmp/thegn-audit-build-cache-20260913/debug/deps/thegn_core-3ad4f2693639c9ce)
+  Executable tests/config_example.rs (/tmp/thegn-audit-build-cache-20260913/debug/deps/config_example-9942ace987ec2241)
+  Executable tests/crate_boundaries.rs (/tmp/thegn-audit-build-cache-20260913/debug/deps/crate_boundaries-5d5fe30f5fc55573)
+  Executable tests/devcontainer_e2e.rs (/tmp/thegn-audit-build-cache-20260913/debug/deps/devcontainer_e2e-51cd3a94e9d2da3e)
+  Executable tests/env_overlay_coverage.rs (/tmp/thegn-audit-build-cache-20260913/debug/deps/env_overlay_coverage-6c3ca4cf1c5c8b5c)
+  Executable tests/hm_module_drift.rs (/tmp/thegn-audit-build-cache-20260913/debug/deps/hm_module_drift-64b313be2041063e)
+  Executable tests/merge_guard_hook.rs (/tmp/thegn-audit-build-cache-20260913/debug/deps/merge_guard_hook-1d285cce1e61f0ea)
+  Executable tests/my_work_cache_scope.rs (/tmp/thegn-audit-build-cache-20260913/debug/deps/my_work_cache_scope-951aec2b7fa522cd)
+  Executable tests/plugin_api.rs (/tmp/thegn-audit-build-cache-20260913/debug/deps/plugin_api-e2bb9d092514b70a)
+  Executable tests/plugin_api_wire.rs (/tmp/thegn-audit-build-cache-20260913/debug/deps/plugin_api_wire-f158ac11958077bb)
+  Executable tests/repo_issues_overlay.rs (/tmp/thegn-audit-build-cache-20260913/debug/deps/repo_issues_overlay-b4284814689b0672)
+  Executable tests/sandbox_audit.rs (/tmp/thegn-audit-build-cache-20260913/debug/deps/sandbox_audit-8dc8f8987fbd1d9a)
+  Executable tests/sandbox_credentials.rs (/tmp/thegn-audit-build-cache-20260913/debug/deps/sandbox_credentials-4d764ba2ffdc65ca)
+  Executable tests/sandbox_dns_e2e.rs (/tmp/thegn-audit-build-cache-20260913/debug/deps/sandbox_dns_e2e-7cc824872620da92)
+  Executable tests/sandbox_health.rs (/tmp/thegn-audit-build-cache-20260913/debug/deps/sandbox_health-9575043bed3c8d88)
+  Executable tests/sandbox_lifecycle.rs (/tmp/thegn-audit-build-cache-20260913/debug/deps/sandbox_lifecycle-3d6b65f6cc63ca34)
+  Executable tests/sandbox_network_policy.rs (/tmp/thegn-audit-build-cache-20260913/debug/deps/sandbox_network_policy-6d3cdaa49686502e)
+  Executable tests/sandbox_profile.rs (/tmp/thegn-audit-build-cache-20260913/debug/deps/sandbox_profile-28f129c8aebf514f)
+  Executable tests/sandbox_readonly_home.rs (/tmp/thegn-audit-build-cache-20260913/debug/deps/sandbox_readonly_home-30cc526cb3c1920f)
+  Executable tests/sandbox_smol.rs (/tmp/thegn-audit-build-cache-20260913/debug/deps/sandbox_smol-a8b57eb0e52de5d9)
+  Executable unittests src/main.rs (/tmp/thegn-audit-build-cache-20260913/debug/deps/thegn-a8ddadf662d7fd0d)
+  Executable tests/automation_process.rs (/tmp/thegn-audit-build-cache-20260913/debug/deps/automation_process-31ad88cb31da3539)
+  Executable tests/bridge_subprocess.rs (/tmp/thegn-audit-build-cache-20260913/debug/deps/bridge_subprocess-c8e625d298590a23)
+  Executable unittests src/lib.rs (/tmp/thegn-audit-build-cache-20260913/debug/deps/thegn_svc-d67b35a4932365e6)
+  Executable unittests src/bin/fake_lsp.rs (/tmp/thegn-audit-build-cache-20260913/debug/deps/fake_lsp-f6a1e19f0283c063)
+  Executable tests/control_schema.rs (/tmp/thegn-audit-build-cache-20260913/debug/deps/control_schema-d8703133b4cdb1c6)
+  Executable tests/fly_live.rs (/tmp/thegn-audit-build-cache-20260913/debug/deps/fly_live-22e86e979219706a)
+  Executable tests/fly_mock.rs (/tmp/thegn-audit-build-cache-20260913/debug/deps/fly_mock-32b106d5e6f94490)
+  Executable tests/iroh_fly_live.rs (/tmp/thegn-audit-build-cache-20260913/debug/deps/iroh_fly_live-9b0fcd162bb9995c)
+  Executable tests/lsp_client.rs (/tmp/thegn-audit-build-cache-20260913/debug/deps/lsp_client-b9d5f95a3ce50270)
+  Executable tests/machine0_live.rs (/tmp/thegn-audit-build-cache-20260913/debug/deps/machine0_live-953877c29a8260c8)
+  Executable tests/plugin_example.rs (/tmp/thegn-audit-build-cache-20260913/debug/deps/plugin_example-f0bf3ef5033f7670)
+  Executable tests/sprites_live.rs (/tmp/thegn-audit-build-cache-20260913/debug/deps/sprites_live-91c8d656124be229)
+  Executable tests/sprites_mock.rs (/tmp/thegn-audit-build-cache-20260913/debug/deps/sprites_mock-cc9e08a8d11e67b4)
+  Executable tests/vps_do_mock.rs (/tmp/thegn-audit-build-cache-20260913/debug/deps/vps_do_mock-82f95fa0ebb64558)
+  Executable tests/vps_live.rs (/tmp/thegn-audit-build-cache-20260913/debug/deps/vps_live-3a9481ef1ea0b5e4)
+  Executable tests/vps_mock.rs (/tmp/thegn-audit-build-cache-20260913/debug/deps/vps_mock-f32c3e0e0dbed68c)

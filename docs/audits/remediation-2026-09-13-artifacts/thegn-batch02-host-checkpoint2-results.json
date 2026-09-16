@@ -1,0 +1,1451 @@
+[
+  {
+    "test": "ci_refresh::ci_autofix::authorship_tests::foreign_author_never_claims_or_spends_a_ci_attempt",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.47,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/ci_refresh__ci_autofix__authorship_tests__foreign_author_never_claims_or_spends_a_ci_attempt.log"
+  },
+  {
+    "test": "ci_refresh::tests::ci_cache_freshness_guard",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.013,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/ci_refresh__tests__ci_cache_freshness_guard.log"
+  },
+  {
+    "test": "ci_refresh::tests::ci_cadence_honors_config_and_clamps",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.032,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/ci_refresh__tests__ci_cadence_honors_config_and_clamps.log"
+  },
+  {
+    "test": "ci_refresh::tests::failure_backoff_doubles_and_caps",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.032,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/ci_refresh__tests__failure_backoff_doubles_and_caps.log"
+  },
+  {
+    "test": "ci_refresh::tests::health_notes_lifecycle",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.044,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/ci_refresh__tests__health_notes_lifecycle.log"
+  },
+  {
+    "test": "detail::calendar::display_tests::calendar_display_sites_keep_the_safe_projection",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.015,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/detail__calendar__display_tests__calendar_display_sites_keep_the_safe_projection.log"
+  },
+  {
+    "test": "detail::calendar::display_tests::calendar_width_and_clock_readings_share_whitespace_fallback",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.031,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/detail__calendar__display_tests__calendar_width_and_clock_readings_share_whitespace_fallback.log"
+  },
+  {
+    "test": "detail::calendar::display_tests::calendar_width_uses_the_same_sanitized_clock_label_as_drawing",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.016,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/detail__calendar__display_tests__calendar_width_uses_the_same_sanitized_clock_label_as_drawing.log"
+  },
+  {
+    "test": "detail::calendar::display_tests::hostile_calendar_provider_values_stay_inside_popup_and_raw_values_survive",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.074,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/detail__calendar__display_tests__hostile_calendar_provider_values_stay_inside_popup_and_raw_values_survive.log"
+  },
+  {
+    "test": "detail::calendar::layout::tests::densities_step_down_and_then_give_up",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.019,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/detail__calendar__layout__tests__densities_step_down_and_then_give_up.log"
+  },
+  {
+    "test": "detail::calendar::layout::tests::the_today_chip_threshold_is_actually_reachable",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.012,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/detail__calendar__layout__tests__the_today_chip_threshold_is_actually_reachable.log"
+  },
+  {
+    "test": "frame_writer::tests::clipboard_admission_is_bounded_fifo_and_capacity_is_returned_on_pop",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.017,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/frame_writer__tests__clipboard_admission_is_bounded_fifo_and_capacity_is_returned_on_pop.log"
+  },
+  {
+    "test": "frame_writer::tests::clipboard_lock_contention_with_empty_queue_pulses_retry_and_retains_bytes",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.014,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/frame_writer__tests__clipboard_lock_contention_with_empty_queue_pulses_retry_and_retains_bytes.log"
+  },
+  {
+    "test": "frame_writer::tests::completion_is_recorded_after_sink_returns_and_oob_is_excluded",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.013,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/frame_writer__tests__completion_is_recorded_after_sink_returns_and_oob_is_excluded.log"
+  },
+  {
+    "test": "frame_writer::tests::failed_frame_never_becomes_a_successful_completion",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.012,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/frame_writer__tests__failed_frame_never_becomes_a_successful_completion.log"
+  },
+  {
+    "test": "frame_writer::tests::metrics_drain_never_waits_on_queue_contention_and_keeps_samples",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.012,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/frame_writer__tests__metrics_drain_never_waits_on_queue_contention_and_keeps_samples.log"
+  },
+  {
+    "test": "frame_writer::tests::non_transient_error_is_immediately_fatal_and_sticky",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.011,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/frame_writer__tests__non_transient_error_is_immediately_fatal_and_sticky.log"
+  },
+  {
+    "test": "frame_writer::tests::success_resets_the_consecutive_counter",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.013,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/frame_writer__tests__success_resets_the_consecutive_counter.log"
+  },
+  {
+    "test": "frame_writer::tests::timing_metadata_keeps_the_existing_frame_queue_bound",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.011,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/frame_writer__tests__timing_metadata_keeps_the_existing_frame_queue_bound.log"
+  },
+  {
+    "test": "frame_writer::tests::transient_errors_escalate_to_fatal_after_retry_max",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.014,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/frame_writer__tests__transient_errors_escalate_to_fatal_after_retry_max.log"
+  },
+  {
+    "test": "handlers::calendar::tests::a_join_link_wins_over_a_room_name",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.014,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/handlers__calendar__tests__a_join_link_wins_over_a_room_name.log"
+  },
+  {
+    "test": "handlers::calendar::tests::hostile_reminders_are_bounded_single_row_and_keep_semantic_values",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.013,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/handlers__calendar__tests__hostile_reminders_are_bounded_single_row_and_keep_semantic_values.log"
+  },
+  {
+    "test": "handlers::calendar::tests::the_message_is_ascii_on_an_ascii_terminal",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.012,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/handlers__calendar__tests__the_message_is_ascii_on_an_ascii_terminal.log"
+  },
+  {
+    "test": "handlers::calendar::tests::the_message_reads_naturally_at_every_lead_time",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.013,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/handlers__calendar__tests__the_message_reads_naturally_at_every_lead_time.log"
+  },
+  {
+    "test": "kitty_relay::tests::buffers_apc_split_across_feeds",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.015,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/kitty_relay__tests__buffers_apc_split_across_feeds.log"
+  },
+  {
+    "test": "kitty_relay::tests::cup_offsets_origin_plus_cursor_one_based",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.013,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/kitty_relay__tests__cup_offsets_origin_plus_cursor_one_based.log"
+  },
+  {
+    "test": "kitty_relay::tests::escape_pair_at_text_boundary_does_not_grow_output_past_limit",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.012,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/kitty_relay__tests__escape_pair_at_text_boundary_does_not_grow_output_past_limit.log"
+  },
+  {
+    "test": "kitty_relay::tests::every_byte_split_preserves_st_and_non_graphics_text",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.013,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/kitty_relay__tests__every_byte_split_preserves_st_and_non_graphics_text.log"
+  },
+  {
+    "test": "kitty_relay::tests::huge_single_feed_emits_bounded_text_pieces_without_retained_output",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.12,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/kitty_relay__tests__huge_single_feed_emits_bounded_text_pieces_without_retained_output.log"
+  },
+  {
+    "test": "kitty_relay::tests::key_value_extracts_fields",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.012,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/kitty_relay__tests__key_value_extracts_fields.log"
+  },
+  {
+    "test": "kitty_relay::tests::kitty_graphics_detection",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.012,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/kitty_relay__tests__kitty_graphics_detection.log"
+  },
+  {
+    "test": "kitty_relay::tests::near_cap_bytewise_input_has_linear_scan_work_and_no_prefix_copy",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.598,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/kitty_relay__tests__near_cap_bytewise_input_has_linear_scan_work_and_no_prefix_copy.log"
+  },
+  {
+    "test": "kitty_relay::tests::non_graphics_apc_passes_to_emulator",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.012,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/kitty_relay__tests__non_graphics_apc_passes_to_emulator.log"
+  },
+  {
+    "test": "kitty_relay::tests::oversized_apc_discards_through_split_st_then_recovers",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.151,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/kitty_relay__tests__oversized_apc_discards_through_split_st_then_recovers.log"
+  },
+  {
+    "test": "kitty_relay::tests::query_is_answered_not_forwarded",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.011,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/kitty_relay__tests__query_is_answered_not_forwarded.log"
+  },
+  {
+    "test": "kitty_relay::tests::reset_drops_partial_and_discard_state",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.089,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/kitty_relay__tests__reset_drops_partial_and_discard_state.log"
+  },
+  {
+    "test": "kitty_relay::tests::splits_text_and_graphics_in_order",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.011,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/kitty_relay__tests__splits_text_and_graphics_in_order.log"
+  },
+  {
+    "test": "kitty_relay::tests::trailing_lone_esc_is_buffered_then_completed",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.012,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/kitty_relay__tests__trailing_lone_esc_is_buffered_then_completed.log"
+  },
+  {
+    "test": "model_eq::tests::hydration_eq_detects_folder_and_terminal_changes",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.014,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/model_eq__tests__hydration_eq_detects_folder_and_terminal_changes.log"
+  },
+  {
+    "test": "model_eq::tests::hydration_eq_detects_real_changes",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.013,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/model_eq__tests__hydration_eq_detects_real_changes.log"
+  },
+  {
+    "test": "model_eq::tests::hydration_eq_ignores_non_hydration_fields",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.015,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/model_eq__tests__hydration_eq_ignores_non_hydration_fields.log"
+  },
+  {
+    "test": "monitor::procs_view::tests::a_cyclic_parent_chain_terminates",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.014,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/monitor__procs_view__tests__a_cyclic_parent_chain_terminates.log"
+  },
+  {
+    "test": "monitor::procs_view::tests::flat_filter_matches_name_pid_and_owner",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.013,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/monitor__procs_view__tests__flat_filter_matches_name_pid_and_owner.log"
+  },
+  {
+    "test": "monitor::procs_view::tests::tied_flat_and_tree_rows_have_stable_pid_order",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.017,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/monitor__procs_view__tests__tied_flat_and_tree_rows_have_stable_pid_order.log"
+  },
+  {
+    "test": "monitor::procs_view::tests::tree_filter_keeps_ancestry_of_a_match",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.012,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/monitor__procs_view__tests__tree_filter_keeps_ancestry_of_a_match.log"
+  },
+  {
+    "test": "monitor::procs_view::tests::tree_nests_children_and_flags_elided_roots",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.013,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/monitor__procs_view__tests__tree_nests_children_and_flags_elided_roots.log"
+  },
+  {
+    "test": "monitor::state::tests::a_configured_default_off_the_ladder_snaps_onto_it",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.014,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/monitor__state__tests__a_configured_default_off_the_ladder_snaps_onto_it.log"
+  },
+  {
+    "test": "monitor::state::tests::a_junk_ladder_falls_back_rather_than_disabling_the_keys",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.012,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/monitor__state__tests__a_junk_ladder_falls_back_rather_than_disabling_the_keys.log"
+  },
+  {
+    "test": "monitor::state::tests::a_toggle_is_scoped_to_its_own_tab",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.012,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/monitor__state__tests__a_toggle_is_scoped_to_its_own_tab.log"
+  },
+  {
+    "test": "monitor::state::tests::an_off_ladder_saved_window_is_kept_not_discarded",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.013,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/monitor__state__tests__an_off_ladder_saved_window_is_kept_not_discarded.log"
+  },
+  {
+    "test": "monitor::state::tests::config_defaults_seed_every_tab",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.012,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/monitor__state__tests__config_defaults_seed_every_tab.log"
+  },
+  {
+    "test": "monitor::state::tests::prefs_round_trip_through_their_entries",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.013,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/monitor__state__tests__prefs_round_trip_through_their_entries.log"
+  },
+  {
+    "test": "monitor::state::tests::the_ladder_is_not_persisted_so_config_edits_still_win",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.013,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/monitor__state__tests__the_ladder_is_not_persisted_so_config_edits_still_win.log"
+  },
+  {
+    "test": "monitor::state::tests::the_shipped_default_reaches_twelve_hours",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.013,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/monitor__state__tests__the_shipped_default_reaches_twelve_hours.log"
+  },
+  {
+    "test": "monitor::state::tests::the_window_ladder_comes_from_config",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.013,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/monitor__state__tests__the_window_ladder_comes_from_config.log"
+  },
+  {
+    "test": "monitor::state::tests::unknown_and_malformed_keys_are_ignored",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.013,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/monitor__state__tests__unknown_and_malformed_keys_are_ignored.log"
+  },
+  {
+    "test": "monitor::tabbar::tests::a_bar_that_fits_is_shown_whole",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.011,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/monitor__tabbar__tests__a_bar_that_fits_is_shown_whole.log"
+  },
+  {
+    "test": "monitor::tabbar::tests::an_empty_bar_is_an_empty_window",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.011,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/monitor__tabbar__tests__an_empty_bar_is_an_empty_window.log"
+  },
+  {
+    "test": "monitor::tabbar::tests::an_oversized_active_tab_still_yields_a_window",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.011,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/monitor__tabbar__tests__an_oversized_active_tab_still_yields_a_window.log"
+  },
+  {
+    "test": "monitor::tabbar::tests::digits_cover_ten_tabs_and_stop",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.012,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/monitor__tabbar__tests__digits_cover_ten_tabs_and_stop.log"
+  },
+  {
+    "test": "monitor::tabbar::tests::the_window_anchors_to_whichever_end_the_cursor_is_on",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.012,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/monitor__tabbar__tests__the_window_anchors_to_whichever_end_the_cursor_is_on.log"
+  },
+  {
+    "test": "monitor::tests::a_short_window_over_thin_history_admits_how_much_it_has",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.052,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/monitor__tests__a_short_window_over_thin_history_admits_how_much_it_has.log"
+  },
+  {
+    "test": "monitor::tests::a_tab_vanishing_under_the_user_re_homes_the_cursor",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.015,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/monitor__tests__a_tab_vanishing_under_the_user_re_homes_the_cursor.log"
+  },
+  {
+    "test": "monitor::tests::a_tab_with_no_data_on_this_machine_is_hidden",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.011,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/monitor__tests__a_tab_with_no_data_on_this_machine_is_hidden.log"
+  },
+  {
+    "test": "monitor::tests::a_wheel_scroll_stops_the_viewport_chasing_until_the_next_key",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.015,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/monitor__tests__a_wheel_scroll_stops_the_viewport_chasing_until_the_next_key.log"
+  },
+  {
+    "test": "monitor::tests::a_wide_window_does_not_ask_for_fast_sampling",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.014,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/monitor__tests__a_wide_window_does_not_ask_for_fast_sampling.log"
+  },
+  {
+    "test": "monitor::tests::an_unsampled_processes_tab_says_sampling_not_disabled",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.013,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/monitor__tests__an_unsampled_processes_tab_says_sampling_not_disabled.log"
+  },
+  {
+    "test": "monitor::tests::close_keys_close_and_modified_keys_pass_through",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.013,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/monitor__tests__close_keys_close_and_modified_keys_pass_through.log"
+  },
+  {
+    "test": "monitor::tests::digits_index_the_visible_tabs_not_the_full_list",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.014,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/monitor__tests__digits_index_the_visible_tabs_not_the_full_list.log"
+  },
+  {
+    "test": "monitor::tests::disk_clean_confirms_and_queues_an_off_loop_action",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.014,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/monitor__tests__disk_clean_confirms_and_queues_an_off_loop_action.log"
+  },
+  {
+    "test": "monitor::tests::every_stat_widget_maps_to_a_tab_that_claims_it_back",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.011,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/monitor__tests__every_stat_widget_maps_to_a_tab_that_claims_it_back.log"
+  },
+  {
+    "test": "monitor::tests::every_tab_advertises_pause",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.013,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/monitor__tests__every_tab_advertises_pause.log"
+  },
+  {
+    "test": "monitor::tests::every_tab_builds_and_scrolls_without_panicking",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.015,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/monitor__tests__every_tab_builds_and_scrolls_without_panicking.log"
+  },
+  {
+    "test": "monitor::tests::every_thermal_sensor_is_listed_not_just_the_hottest",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.051,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/monitor__tests__every_thermal_sensor_is_listed_not_just_the_hottest.log"
+  },
+  {
+    "test": "monitor::tests::filter_narrows_the_displayed_rows",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.014,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/monitor__tests__filter_narrows_the_displayed_rows.log"
+  },
+  {
+    "test": "monitor::tests::global_keys_stay_global_on_the_processes_tab",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.014,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/monitor__tests__global_keys_stay_global_on_the_processes_tab.log"
+  },
+  {
+    "test": "monitor::tests::graph_style_cycles_and_is_scoped_to_the_active_tab",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.013,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/monitor__tests__graph_style_cycles_and_is_scoped_to_the_active_tab.log"
+  },
+  {
+    "test": "monitor::tests::has_graphs_matches_what_the_builders_emit",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.015,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/monitor__tests__has_graphs_matches_what_the_builders_emit.log"
+  },
+  {
+    "test": "monitor::tests::home_and_end_move_the_cursor_on_a_list_tab",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.014,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/monitor__tests__home_and_end_move_the_cursor_on_a_list_tab.log"
+  },
+  {
+    "test": "monitor::tests::opening_at_a_hidden_tab_falls_back_to_a_real_one",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.014,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/monitor__tests__opening_at_a_hidden_tab_falls_back_to_a_real_one.log"
+  },
+  {
+    "test": "monitor::tests::passive_process_refresh_follows_identity_after_rank_changes",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.014,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/monitor__tests__passive_process_refresh_follows_identity_after_rank_changes.log"
+  },
+  {
+    "test": "monitor::tests::pause_freezes_the_view_and_refresh_becomes_a_no_op",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.09,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/monitor__tests__pause_freezes_the_view_and_refresh_becomes_a_no_op.log"
+  },
+  {
+    "test": "monitor::tests::paused_process_refresh_does_not_change_the_displayed_snapshot",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.014,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/monitor__tests__paused_process_refresh_does_not_change_the_displayed_snapshot.log"
+  },
+  {
+    "test": "monitor::tests::pausing_is_visible_in_the_chrome",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.051,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/monitor__tests__pausing_is_visible_in_the_chrome.log"
+  },
+  {
+    "test": "monitor::tests::pausing_reduces_the_sampling_gate_and_closing_clears_it",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.016,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/monitor__tests__pausing_reduces_the_sampling_gate_and_closing_clears_it.log"
+  },
+  {
+    "test": "monitor::tests::per_core_utilization_is_shown",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.051,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/monitor__tests__per_core_utilization_is_shown.log"
+  },
+  {
+    "test": "monitor::tests::process_confirmation_keeps_its_identity_while_ranks_change",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.013,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/monitor__tests__process_confirmation_keeps_its_identity_while_ranks_change.log"
+  },
+  {
+    "test": "monitor::tests::process_confirmation_refuses_a_reused_or_disappeared_sampled_identity",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.014,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/monitor__tests__process_confirmation_refuses_a_reused_or_disappeared_sampled_identity.log"
+  },
+  {
+    "test": "monitor::tests::process_exit_clamps_and_explicit_sort_still_resets_selection",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.015,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/monitor__tests__process_exit_clamps_and_explicit_sort_still_resets_selection.log"
+  },
+  {
+    "test": "monitor::tests::process_refresh_does_not_yank_a_manually_scrolled_viewport",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.017,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/monitor__tests__process_refresh_does_not_yank_a_manually_scrolled_viewport.log"
+  },
+  {
+    "test": "monitor::tests::process_scanning_is_gated_on_the_tab_the_pause_and_the_config",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.015,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/monitor__tests__process_scanning_is_gated_on_the_tab_the_pause_and_the_config.log"
+  },
+  {
+    "test": "monitor::tests::process_table_survives_interleaved_hydration_and_samples",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.015,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/monitor__tests__process_table_survives_interleaved_hydration_and_samples.log"
+  },
+  {
+    "test": "monitor::tests::processes_sort_keys_work_and_only_there",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.014,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/monitor__tests__processes_sort_keys_work_and_only_there.log"
+  },
+  {
+    "test": "monitor::tests::question_mark_and_f1_ask_for_help",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.014,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/monitor__tests__question_mark_and_f1_ask_for_help.log"
+  },
+  {
+    "test": "monitor::tests::reused_process_does_not_inherit_selection_or_signal_escalation",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.015,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/monitor__tests__reused_process_does_not_inherit_selection_or_signal_escalation.log"
+  },
+  {
+    "test": "monitor::tests::scale_cycles_per_tab",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.017,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/monitor__tests__scale_cycles_per_tab.log"
+  },
+  {
+    "test": "monitor::tests::scrolling_never_retargets_the_destructive_key",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.02,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/monitor__tests__scrolling_never_retargets_the_destructive_key.log"
+  },
+  {
+    "test": "monitor::tests::scrolling_reaches_the_last_row_and_stops_there",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.017,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/monitor__tests__scrolling_reaches_the_last_row_and_stops_there.log"
+  },
+  {
+    "test": "monitor::tests::selecting_a_container_row_keeps_its_ownership_tint",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.015,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/monitor__tests__selecting_a_container_row_keeps_its_ownership_tint.log"
+  },
+  {
+    "test": "monitor::tests::signal_confirms_then_surfaces_failure_never_swallows_it",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.014,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/monitor__tests__signal_confirms_then_surfaces_failure_never_swallows_it.log"
+  },
+  {
+    "test": "monitor::tests::slash_opens_the_filter_and_esc_clears_it_without_closing",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.015,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/monitor__tests__slash_opens_the_filter_and_esc_clears_it_without_closing.log"
+  },
+  {
+    "test": "monitor::tests::spark_style_shrinks_the_body_and_clamps_the_viewport",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.014,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/monitor__tests__spark_style_shrinks_the_body_and_clamps_the_viewport.log"
+  },
+  {
+    "test": "monitor::tests::switching_tabs_records_where_to_reopen",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.015,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/monitor__tests__switching_tabs_records_where_to_reopen.log"
+  },
+  {
+    "test": "monitor::tests::t_toggles_tree_grouping",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.014,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/monitor__tests__t_toggles_tree_grouping.log"
+  },
+  {
+    "test": "monitor::tests::tab_cycles_the_visible_list_and_wraps",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.016,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/monitor__tests__tab_cycles_the_visible_list_and_wraps.log"
+  },
+  {
+    "test": "monitor::tests::tab_indices_match_declaration_order",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.013,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/monitor__tests__tab_indices_match_declaration_order.log"
+  },
+  {
+    "test": "monitor::tests::the_active_tab_is_never_clipped_out_of_the_bar",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.015,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/monitor__tests__the_active_tab_is_never_clipped_out_of_the_bar.log"
+  },
+  {
+    "test": "monitor::tests::the_box_rect_encloses_what_was_drawn",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.016,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/monitor__tests__the_box_rect_encloses_what_was_drawn.log"
+  },
+  {
+    "test": "monitor::tests::the_box_reserves_exactly_the_chrome_rows",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.017,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/monitor__tests__the_box_reserves_exactly_the_chrome_rows.log"
+  },
+  {
+    "test": "monitor::tests::the_containers_heading_does_not_claim_foreign_rows",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.014,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/monitor__tests__the_containers_heading_does_not_claim_foreign_rows.log"
+  },
+  {
+    "test": "monitor::tests::the_footer_advertises_help_on_every_tab",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.014,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/monitor__tests__the_footer_advertises_help_on_every_tab.log"
+  },
+  {
+    "test": "monitor::tests::the_footer_only_advertises_keys_the_tab_has",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.014,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/monitor__tests__the_footer_only_advertises_keys_the_tab_has.log"
+  },
+  {
+    "test": "monitor::tests::the_footer_reflects_the_live_toggles",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.053,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/monitor__tests__the_footer_reflects_the_live_toggles.log"
+  },
+  {
+    "test": "monitor::tests::the_last_tab_is_reachable_by_its_digit",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.016,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/monitor__tests__the_last_tab_is_reachable_by_its_digit.log"
+  },
+  {
+    "test": "monitor::tests::the_processes_tab_explains_itself_before_the_first_sample",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.046,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/monitor__tests__the_processes_tab_explains_itself_before_the_first_sample.log"
+  },
+  {
+    "test": "monitor::tests::the_selected_row_is_the_only_one_with_a_selection_background",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.015,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/monitor__tests__the_selected_row_is_the_only_one_with_a_selection_background.log"
+  },
+  {
+    "test": "monitor::tests::the_tab_bar_and_footer_are_drawn",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.059,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/monitor__tests__the_tab_bar_and_footer_are_drawn.log"
+  },
+  {
+    "test": "monitor::tests::the_viewport_follows_the_row_cursor_down_a_long_list",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.018,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/monitor__tests__the_viewport_follows_the_row_cursor_down_a_long_list.log"
+  },
+  {
+    "test": "monitor::tests::window_keys_saturate_rather_than_wrap",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.013,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/monitor__tests__window_keys_saturate_rather_than_wrap.log"
+  },
+  {
+    "test": "monitor::tests::zero_beyond_the_visible_tabs_is_a_no_op",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.016,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/monitor__tests__zero_beyond_the_visible_tabs_is_a_no_op.log"
+  },
+  {
+    "test": "pr_authorship::tests::account_change_and_origin_change_after_preparation_hold",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.149,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/pr_authorship__tests__account_change_and_origin_change_after_preparation_hold.log"
+  },
+  {
+    "test": "pr_authorship::tests::fresh_organization_authorship_is_admitted_and_disabled_policy_needs_no_proof",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.142,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/pr_authorship__tests__fresh_organization_authorship_is_admitted_and_disabled_policy_needs_no_proof.log"
+  },
+  {
+    "test": "pr_authorship::tests::only_verified_review_completion_can_advance_the_permitted_head",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.157,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/pr_authorship__tests__only_verified_review_completion_can_advance_the_permitted_head.log"
+  },
+  {
+    "test": "pr_authorship::tests::persisted_remote_malformed_and_changed_execution_locations_hold_before_proof",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.317,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/pr_authorship__tests__persisted_remote_malformed_and_changed_execution_locations_hold_before_proof.log"
+  },
+  {
+    "test": "pr_authorship::tests::unknown_cached_author_local_head_and_selected_provider_are_not_authority",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.16,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/pr_authorship__tests__unknown_cached_author_local_head_and_selected_provider_are_not_authority.log"
+  },
+  {
+    "test": "pr_driver::tests::a_broken_template_refuses_to_dispatch",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.013,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/pr_driver__tests__a_broken_template_refuses_to_dispatch.log"
+  },
+  {
+    "test": "pr_driver::tests::a_custom_template_replaces_the_builtin",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.012,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/pr_driver__tests__a_custom_template_replaces_the_builtin.log"
+  },
+  {
+    "test": "pr_driver::tests::a_failing_row_backs_off_and_a_success_clears_it",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.021,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/pr_driver__tests__a_failing_row_backs_off_and_a_success_clears_it.log"
+  },
+  {
+    "test": "pr_driver::tests::a_review_with_nothing_unresolved_says_so_rather_than_going_blank",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.019,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/pr_driver__tests__a_review_with_nothing_unresolved_says_so_rather_than_going_blank.log"
+  },
+  {
+    "test": "pr_driver::tests::blocker_details_are_human_readable",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.015,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/pr_driver__tests__blocker_details_are_human_readable.log"
+  },
+  {
+    "test": "pr_driver::tests::by_number_review_task_keeps_missing_worktree_human_only",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.148,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/pr_driver__tests__by_number_review_task_keeps_missing_worktree_human_only.log"
+  },
+  {
+    "test": "pr_driver::tests::check_urls_are_bounded_and_prefer_details_links",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.011,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/pr_driver__tests__check_urls_are_bounded_and_prefer_details_links.log"
+  },
+  {
+    "test": "pr_driver::tests::empty_or_stale_aggregate_review_never_launches_a_generic_agent",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.01,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/pr_driver__tests__empty_or_stale_aggregate_review_never_launches_a_generic_agent.log"
+  },
+  {
+    "test": "pr_driver::tests::explicit_review_watch_is_required_for_deep_fetch",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.121,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/pr_driver__tests__explicit_review_watch_is_required_for_deep_fetch.log"
+  },
+  {
+    "test": "pr_driver::tests::fake_forge_direct_mode_merges_now",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.133,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/pr_driver__tests__fake_forge_direct_mode_merges_now.log"
+  },
+  {
+    "test": "pr_driver::tests::fake_forge_drives_a_green_pr_to_auto_merge",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.136,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/pr_driver__tests__fake_forge_drives_a_green_pr_to_auto_merge.log"
+  },
+  {
+    "test": "pr_driver::tests::fake_forge_fetch_failure_is_a_warning_not_a_verdict",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.137,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/pr_driver__tests__fake_forge_fetch_failure_is_a_warning_not_a_verdict.log"
+  },
+  {
+    "test": "pr_driver::tests::merge_methods_map_across",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.011,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/pr_driver__tests__merge_methods_map_across.log"
+  },
+  {
+    "test": "pr_driver::tests::own_pr_denial_never_reruns_ci_spends_budget_or_launches_an_agent",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.449,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/pr_driver__tests__own_pr_denial_never_reruns_ci_spends_budget_or_launches_an_agent.log"
+  },
+  {
+    "test": "pr_driver::tests::per_thread_task_suppresses_the_generic_review_agent",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.13,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/pr_driver__tests__per_thread_task_suppresses_the_generic_review_agent.log"
+  },
+  {
+    "test": "pr_driver::tests::the_ci_prompt_accepts_bounded_log_evidence",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.012,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/pr_driver__tests__the_ci_prompt_accepts_bounded_log_evidence.log"
+  },
+  {
+    "test": "pr_driver::tests::the_ci_prompt_lists_the_failing_checks",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.012,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/pr_driver__tests__the_ci_prompt_lists_the_failing_checks.log"
+  },
+  {
+    "test": "pr_driver::tests::the_conflict_prompt_names_the_pr_and_its_base",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.011,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/pr_driver__tests__the_conflict_prompt_names_the_pr_and_its_base.log"
+  },
+  {
+    "test": "pr_driver::tests::the_review_prompt_lists_only_unresolved_threads",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.012,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/pr_driver__tests__the_review_prompt_lists_only_unresolved_threads.log"
+  },
+  {
+    "test": "pr_driver::tests::transient_review_failure_keeps_the_durable_task_stale",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.135,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/pr_driver__tests__transient_review_failure_keeps_the_durable_task_stale.log"
+  },
+  {
+    "test": "pty_drain::tests::backlog_clipboard_retry_order_is_unique_and_barriers_retire_old_work",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.012,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/pty_drain__tests__backlog_clipboard_retry_order_is_unique_and_barriers_retire_old_work.log"
+  },
+  {
+    "test": "pty_drain::tests::backlog_drain_pane_returns_everything_for_exit",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.011,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/pty_drain__tests__backlog_drain_pane_returns_everything_for_exit.log"
+  },
+  {
+    "test": "pty_drain::tests::backlog_generation_barriers_preserve_bytes_without_crossing_clipboard_state",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.012,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/pty_drain__tests__backlog_generation_barriers_preserve_bytes_without_crossing_clipboard_state.log"
+  },
+  {
+    "test": "pty_drain::tests::backlog_retry_stale_prefix_cannot_strand_a_later_valid_set",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.012,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/pty_drain__tests__backlog_retry_stale_prefix_cannot_strand_a_later_valid_set.log"
+  },
+  {
+    "test": "pty_drain::tests::backlog_retry_successful_budget_yields_wake_for_unvisited_work",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.011,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/pty_drain__tests__backlog_retry_successful_budget_yields_wake_for_unvisited_work.log"
+  },
+  {
+    "test": "pty_drain::tests::backlog_round_robin_rotates_across_panes",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.012,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/pty_drain__tests__backlog_round_robin_rotates_across_panes.log"
+  },
+  {
+    "test": "pty_drain::tests::backlog_splits_an_oversized_chunk_at_the_cap",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.011,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/pty_drain__tests__backlog_splits_an_oversized_chunk_at_the_cap.log"
+  },
+  {
+    "test": "pty_drain::tests::backlog_take_fills_the_slice_exactly_and_carries_the_rest",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.012,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/pty_drain__tests__backlog_take_fills_the_slice_exactly_and_carries_the_rest.log"
+  },
+  {
+    "test": "pty_drain::tests::daemon_agent_exit_classifies_attached_agent_panes",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.013,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/pty_drain__tests__daemon_agent_exit_classifies_attached_agent_panes.log"
+  },
+  {
+    "test": "pty_drain::tests::detach_exited_terminal_keep_case_drops_group_but_retains_registry_row",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.011,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/pty_drain__tests__detach_exited_terminal_keep_case_drops_group_but_retains_registry_row.log"
+  },
+  {
+    "test": "pty_drain::tests::detach_exited_terminal_keeps_focus_on_the_prior_active_group",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.011,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/pty_drain__tests__detach_exited_terminal_keeps_focus_on_the_prior_active_group.log"
+  },
+  {
+    "test": "pty_drain::tests::detach_exited_terminal_last_tab_removes_group_and_returns_db_id",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.012,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/pty_drain__tests__detach_exited_terminal_last_tab_removes_group_and_returns_db_id.log"
+  },
+  {
+    "test": "pty_drain::tests::detach_exited_terminal_multi_tab_closes_only_the_dead_tab",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.012,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/pty_drain__tests__detach_exited_terminal_multi_tab_closes_only_the_dead_tab.log"
+  },
+  {
+    "test": "pty_drain::tests::pane_exit_cannot_auto_complete_a_pipeline_row",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.012,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/pty_drain__tests__pane_exit_cannot_auto_complete_a_pipeline_row.log"
+  },
+  {
+    "test": "queries::clipboard::tests::all_selectors_and_terminators_survive_every_split",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.011,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/queries__clipboard__tests__all_selectors_and_terminators_survive_every_split.log"
+  },
+  {
+    "test": "queries::clipboard::tests::barrier_discards_both_partial_and_refused_pending",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.013,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/queries__clipboard__tests__barrier_discards_both_partial_and_refused_pending.log"
+  },
+  {
+    "test": "queries::clipboard::tests::clipboard_sequences_inside_other_control_strings_are_not_admitted",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.013,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/queries__clipboard__tests__clipboard_sequences_inside_other_control_strings_are_not_admitted.log"
+  },
+  {
+    "test": "queries::clipboard::tests::maximum_decoded_size_and_oversize_discard_are_bounded_linear",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.018,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/queries__clipboard__tests__maximum_decoded_size_and_oversize_discard_are_bounded_linear.log"
+  },
+  {
+    "test": "queries::clipboard::tests::reads_clears_ambiguous_fields_and_noncanonical_data_never_replace_a_set",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.011,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/queries__clipboard__tests__reads_clears_ambiguous_fields_and_noncanonical_data_never_replace_a_set.log"
+  },
+  {
+    "test": "queries::clipboard::tests::valid_replacement_is_latest_and_panes_are_isolated",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.012,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/queries__clipboard__tests__valid_replacement_is_latest_and_panes_are_isolated.log"
+  },
+  {
+    "test": "queries::tests::da_and_dsr_queries_get_answers",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.013,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/queries__tests__da_and_dsr_queries_get_answers.log"
+  },
+  {
+    "test": "queries::tests::kitty_graphics_probe_gets_an_error_reply",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.012,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/queries__tests__kitty_graphics_probe_gets_an_error_reply.log"
+  },
+  {
+    "test": "queries::tests::ordinary_output_produces_no_responses",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.011,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/queries__tests__ordinary_output_produces_no_responses.log"
+  },
+  {
+    "test": "queries::tests::osc52_clipboard_sets_forward_verbatim",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.012,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/queries__tests__osc52_clipboard_sets_forward_verbatim.log"
+  },
+  {
+    "test": "queries::tests::osc_color_queries_follow_a_recoloured_palette",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.012,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/queries__tests__osc_color_queries_follow_a_recoloured_palette.log"
+  },
+  {
+    "test": "queries::tests::osc_color_queries_report_the_callers_pane_colors",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.011,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/queries__tests__osc_color_queries_report_the_callers_pane_colors.log"
+  },
+  {
+    "test": "queries::tests::window_size_reports_cells_and_pixels",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.012,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/queries__tests__window_size_reports_cells_and_pixels.log"
+  },
+  {
+    "test": "refresh_schedule::tests::coincident_work_is_one_pr_refresh_and_idle_tick_is_none",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.013,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/refresh_schedule__tests__coincident_work_is_one_pr_refresh_and_idle_tick_is_none.log"
+  },
+  {
+    "test": "refresh_schedule::tests::model_cadence_cannot_starve_normal_pr_schedule",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.013,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/refresh_schedule__tests__model_cadence_cannot_starve_normal_pr_schedule.log"
+  },
+  {
+    "test": "remote_poll::tests::behind_message_reads_as_a_call_to_action",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.012,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/remote_poll__tests__behind_message_reads_as_a_call_to_action.log"
+  },
+  {
+    "test": "remote_poll::tests::cadence_honors_config_and_clamps",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.011,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/remote_poll__tests__cadence_honors_config_and_clamps.log"
+  },
+  {
+    "test": "remote_poll::tests::claim_is_exclusive_and_release_arms_backoff",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.011,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/remote_poll__tests__claim_is_exclusive_and_release_arms_backoff.log"
+  },
+  {
+    "test": "remote_poll::tests::failure_backoff_doubles_and_caps",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.011,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/remote_poll__tests__failure_backoff_doubles_and_caps.log"
+  },
+  {
+    "test": "remote_poll::tests::fetch_moves_the_behind_count_a_stale_clone_could_not_see",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.226,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/remote_poll__tests__fetch_moves_the_behind_count_a_stale_clone_could_not_see.log"
+  },
+  {
+    "test": "remote_poll::tests::min_interval_floor_coalesces_bursts",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.01,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/remote_poll__tests__min_interval_floor_coalesces_bursts.log"
+  },
+  {
+    "test": "remote_poll::tests::notify_on_first_sighting_and_on_growth_only",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.011,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/remote_poll__tests__notify_on_first_sighting_and_on_growth_only.log"
+  },
+  {
+    "test": "remote_poll::tests::transport_errors_are_told_apart_from_repo_errors",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.011,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/remote_poll__tests__transport_errors_are_told_apart_from_repo_errors.log"
+  },
+  {
+    "test": "render_plan::tests::a_clock_tick_that_changed_nothing_still_skips",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.011,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/render_plan__tests__a_clock_tick_that_changed_nothing_still_skips.log"
+  },
+  {
+    "test": "render_plan::tests::a_layer_forces_full_for_every_content_channel",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.011,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/render_plan__tests__a_layer_forces_full_for_every_content_channel.log"
+  },
+  {
+    "test": "render_plan::tests::a_roster_update_is_a_bounded_diff_never_a_full_recompose",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.012,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/render_plan__tests__a_roster_update_is_a_bounded_diff_never_a_full_recompose.log"
+  },
+  {
+    "test": "render_plan::tests::a_weather_delivery_is_bars_only",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.012,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/render_plan__tests__a_weather_delivery_is_bars_only.log"
+  },
+  {
+    "test": "render_plan::tests::an_open_board_takes_the_overlay_rule_like_every_other_modal",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.011,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/render_plan__tests__an_open_board_takes_the_overlay_rule_like_every_other_modal.log"
+  },
+  {
+    "test": "render_plan::tests::any_overlay_forces_full_over_pane_output",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.011,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/render_plan__tests__any_overlay_forces_full_over_pane_output.log"
+  },
+  {
+    "test": "render_plan::tests::bars_only_tick_is_incremental_not_full",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.012,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/render_plan__tests__bars_only_tick_is_incremental_not_full.log"
+  },
+  {
+    "test": "render_plan::tests::bars_tick_under_an_open_detail_popup_is_full",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.011,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/render_plan__tests__bars_tick_under_an_open_detail_popup_is_full.log"
+  },
+  {
+    "test": "render_plan::tests::chrome_change_forces_full_even_with_pane_or_bars",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.012,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/render_plan__tests__chrome_change_forces_full_even_with_pane_or_bars.log"
+  },
+  {
+    "test": "render_plan::tests::daemon_attach_status_chrome_is_full",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.011,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/render_plan__tests__daemon_attach_status_chrome_is_full.log"
+  },
+  {
+    "test": "render_plan::tests::daemon_reattach_snapshot_is_panes_only",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.012,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/render_plan__tests__daemon_reattach_snapshot_is_panes_only.log"
+  },
+  {
+    "test": "render_plan::tests::empty_and_clear",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.012,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/render_plan__tests__empty_and_clear.log"
+  },
+  {
+    "test": "render_plan::tests::geometry_change_forces_full",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.012,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/render_plan__tests__geometry_change_forces_full.log"
+  },
+  {
+    "test": "render_plan::tests::idle_attached_daemon_wake_skips",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.011,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/render_plan__tests__idle_attached_daemon_wake_skips.log"
+  },
+  {
+    "test": "render_plan::tests::idle_wake_skips",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.012,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/render_plan__tests__idle_wake_skips.log"
+  },
+  {
+    "test": "render_plan::tests::pane_output_and_bars_tick_combine",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.012,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/render_plan__tests__pane_output_and_bars_tick_combine.log"
+  },
+  {
+    "test": "render_plan::tests::pure_pane_output_is_panes_only_never_chrome",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.011,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/render_plan__tests__pure_pane_output_is_panes_only_never_chrome.log"
+  },
+  {
+    "test": "render_plan::tests::sidebar_only_change_is_incremental_not_full",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.012,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/render_plan__tests__sidebar_only_change_is_incremental_not_full.log"
+  },
+  {
+    "test": "render_plan::tests::switch_forces_full_frame",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.011,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/render_plan__tests__switch_forces_full_frame.log"
+  },
+  {
+    "test": "render_plan::tests::switch_with_pane_damage_still_full",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.011,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/render_plan__tests__switch_with_pane_damage_still_full.log"
+  },
+  {
+    "test": "review_task_handoff::tests::exact_expected_head_verification_rejects_foreign_pushes",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.012,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/review_task_handoff__tests__exact_expected_head_verification_rejects_foreign_pushes.log"
+  },
+  {
+    "test": "review_task_handoff::tests::handle_without_configured_agent_leaves_unclaimed_revision_unchanged",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.124,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/review_task_handoff__tests__handle_without_configured_agent_leaves_unclaimed_revision_unchanged.log"
+  },
+  {
+    "test": "review_task_handoff::tests::rate_limits_back_off_but_unsupported_never_auto_retries",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.012,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/review_task_handoff__tests__rate_limits_back_off_but_unsupported_never_auto_retries.log"
+  },
+  {
+    "test": "review_task_handoff::tests::unknown_author_holds_review_before_claim_without_reparking_the_row",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.427,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/review_task_handoff__tests__unknown_author_holds_review_before_claim_without_reparking_the_row.log"
+  },
+  {
+    "test": "review_task_handoff::tests::unsupported_and_rate_limited_resolve_attempts_remain_auditable",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.13,
+    "log": "/tmp/thegn-batch02-host-checkpoint2-results/review_task_handoff__tests__unsupported_and_rate_limited_resolve_attempts_remain_auditable.log"
+  }
+]

@@ -50,6 +50,10 @@ pub(crate) mod state_db_capture;
 /// Physical identity and nonblocking ownership checks for local gate state.
 pub(crate) mod gate_path;
 
+/// Private custody of the merge queue's temp bundle (per-OS exclusive creation
+/// and identity-verified cleanup); `merge_remote.rs` stays platform-free.
+pub(crate) mod bundle_custody;
+
 #[cfg(all(test, unix))]
 #[path = "../../../../test/support/owned_test_child.rs"]
 pub(crate) mod owned_test_child;

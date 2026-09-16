@@ -14,17 +14,17 @@ I read `/tmp/thegn-THE603-source-checkpoint-20260915.json`, `/tmp/thegn-THE603-i
 
 The requested coverage is present and uniquely passing:
 
-| Area | Evidence |
-| --- | --- |
-| THE603 core capture | 5/5 `host_db_capture::tests::` fixtures passed |
-| THE603 Linux host | 16/16 `platform::state_db_capture::linux::tests::` fixtures passed |
-| THE602 compatibility | 17 `host_db_snapshot::tests::`, 6 `host_definition_snapshot::tests::`, and 22 `host_config_checked::tests::` passes |
+| Area                      | Evidence                                                                                                                                                         |
+| ------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| THE603 core capture       | 5/5 `host_db_capture::tests::` fixtures passed                                                                                                                   |
+| THE603 Linux host         | 16/16 `platform::state_db_capture::linux::tests::` fixtures passed                                                                                               |
+| THE602 compatibility      | 17 `host_db_snapshot::tests::`, 6 `host_definition_snapshot::tests::`, and 22 `host_config_checked::tests::` passes                                              |
 | Existing host integration | 7 `thegn-host::static_commands_process` passes, including the unchanged `static_cli_support::child_observation_error_revokes_later_signals_and_waits` regression |
-| THE622 ordinary parent | Exactly 1 `forge::native::global_connectivity_tests::sdk_results_preserve_global_connectivity_and_fallback` pass |
-| THE622 ignored helper | 0 independently passing `isolated_sdk_connectivity_child` entries; the helper is only invoked by the ordinary parent |
-| Existing SDK controls | 4 native regression tests: GraphQL envelopes, typed HTTP answers, timeout/transport, and SDK error classification |
-| Existing Ladder controls | 7 `forge::tests` passes, including native-over-CLI, not-configured fallback, auth finality, authorship fallback, and routing |
-| Core connectivity | 13 `connectivity::tests` passes, including global wrapper, threshold/offline, success recovery, reload, and cadence behavior |
+| THE622 ordinary parent    | Exactly 1 `forge::native::global_connectivity_tests::sdk_results_preserve_global_connectivity_and_fallback` pass                                                 |
+| THE622 ignored helper     | 0 independently passing `isolated_sdk_connectivity_child` entries; the helper is only invoked by the ordinary parent                                             |
+| Existing SDK controls     | 4 native regression tests: GraphQL envelopes, typed HTTP answers, timeout/transport, and SDK error classification                                                |
+| Existing Ladder controls  | 7 `forge::tests` passes, including native-over-CLI, not-configured fallback, auth finality, authorship fallback, and routing                                     |
+| Core connectivity         | 13 `connectivity::tests` passes, including global wrapper, threshold/offline, success recovery, reload, and cadence behavior                                     |
 
 The five core names are `busy_and_diagnostics_do_not_echo_sql_or_paths`, `missing_and_invalid_sources_are_not_absent_or_fabricated_snapshots`, `malformed_and_version_errors_remain_typed`, `query_like_literal_filenames_are_explicitly_unsupported`, and `wal_capture_sees_uncheckpointed_rows_without_changing_logical_state`. The 16 Linux names are all present in the log and in `state_db_capture_tests.rs`, from actual filesystem classification through permission restoration, orphan sidecars, replacement guards, rooted WAL, and production writable-ancestor refusal. The log has no failure, timeout, overflow, or child-helper success line.
 
@@ -32,9 +32,9 @@ The five core names are `busy_and_diagnostics_do_not_echo_sql_or_paths`, `missin
 
 The log's compile lines name `/tmp/thegn-maintenance-06-combined-20260915` for thegn-core, thegn-host, and thegn-svc, then records a completed test profile. Relevant target depfiles exist in `/tmp/thegn-batch03-native-cache-f_3lx_t_/debug/deps`: `thegn_core-a2be291269a2abb4.d` (19:40:55), `thegn_svc-110c0ffa2122774a.d` (19:48:14), and `static_commands_process-dc51a88e1ec77026.d` (19:46:39). Their source lists include the affected current modules. The corresponding artifacts contain `/tmp/thegn-maintenance-06-combined-20260915` debug paths and the expected test symbols. Recorded artifact SHA-256 values are:
 
-* `thegn_core-a2be291269a2abb4`: `3ebd9618838ac427f2e1be5bf7b405575f87a7a1114916df3d8f401e1050625d`
-* `thegn_svc-110c0ffa2122774a`: `b473720166b2eefcefe3e9d99250ee943a060c55349c990064f69d628da1b9a3`
-* `static_commands_process-dc51a88e1ec77026`: `f06cd0ee8075d119555aa6c969d4babce81aba681160d8b85c75a925572e39c2`
+- `thegn_core-a2be291269a2abb4`: `3ebd9618838ac427f2e1be5bf7b405575f87a7a1114916df3d8f401e1050625d`
+- `thegn_svc-110c0ffa2122774a`: `b473720166b2eefcefe3e9d99250ee943a060c55349c990064f69d628da1b9a3`
+- `static_commands_process-dc51a88e1ec77026`: `f06cd0ee8075d119555aa6c969d4babce81aba681160d8b85c75a925572e39c2`
 
 The target directory contains older artifacts and depfiles from other checkouts, so artifact names alone are not treated as compilation proof. The current-06 absolute paths in the successful compile log and relevant DWARF/source strings provide supporting identity evidence; a fresh rebuild or exact artifact receipt remains the stronger identity gate.
 

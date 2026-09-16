@@ -661,6 +661,82 @@ fn pr_state_definitive_gates_cache_writes() {
 }
 
 #[test]
+fn cached_pr_applies_only_to_the_same_worktree_branch_and_repo() {
+    use thegn_core::forge::{
+        checkout::ForgeCheckoutScope,
+        model::{ForgeRepoIdentity, PrPanel, PrStatus},
+    };
+    let repo = |path: &str| ForgeRepoIdentity {
+        host: "github.com".into(),
+        path: path.into(),
+    };
+    let scope = ForgeCheckoutScope {
+        origin: repo("user/fork"),
+        base: repo("acme/sage"),
+        head: repo("user/fork"),
+        branch: "feat".into(),
+    };
+    let mut row = PrPanel::from_result(
+        Ok(PrStatus {
+            number: 12,
+            url: "https://github.com/acme/sage/pull/12".into(),
+            head_ref_name: "feat".into(),
+            ..Default::default()
+        }),
+        "/wt/a".into(),
+        "feat".into(),
+    );
+    row.source_scope = Some(scope.clone());
+    let applies = |row: &PrPanel, scope: Option<&ForgeCheckoutScope>| {
+        cached_pr_applies(row, "/wt/a", "/wt/a", "feat", scope)
+    };
+    assert!(
+        applies(&row, Some(&scope)),
+        "a fork PR is hosted in the base repository"
+    );
+    assert!(!applies(&row, None));
+    for changed in [
+        ForgeCheckoutScope {
+            origin: repo("other/fork"),
+            ..scope.clone()
+        },
+        ForgeCheckoutScope {
+            base: repo("acme/other"),
+            ..scope.clone()
+        },
+        ForgeCheckoutScope {
+            head: repo("other/fork"),
+            ..scope.clone()
+        },
+        ForgeCheckoutScope {
+            branch: "main".into(),
+            ..scope.clone()
+        },
+    ] {
+        assert!(!applies(&row, Some(&changed)));
+    }
+    row.worktree = "/wt/b".into();
+    assert!(!applies(&row, Some(&scope)));
+    row.worktree = "/wt/a".into();
+    row.source_scope = None;
+    assert!(
+        !applies(&row, Some(&scope)),
+        "legacy rows carry no checkout scope"
+    );
+    row.source_scope = Some(scope.clone());
+    row.state = thegn_core::forge::model::PanelState::NoPr;
+    assert!(applies(&row, Some(&scope)));
+    let changed = ForgeCheckoutScope {
+        origin: repo("other/fork"),
+        ..scope.clone()
+    };
+    assert!(
+        !applies(&row, Some(&changed)),
+        "negative cache entries also have scope"
+    );
+}
+
+#[test]
 fn plan_log_scan_covers_rotation_append_and_idle() {
     // First scan of the process (prev_len == 0): read everything.
     assert_eq!(plan_log_scan(0, 500), LogScanPlan::FromStart);
@@ -1623,5 +1699,166 @@ fn automation_pr_edges_come_from_typed_old_and_new_forge_facts() {
     assert_eq!(
         crate::hydrate::pr_automation_edges(&new, &new),
         (None, false)
+    );
+}
+
+#[test]
+fn repo_badges_require_a_stamped_cache_and_the_current_root_origin() {
+    use thegn_core::forge::model::{PrBranchCache, PrHeader, repo_identity_from_remote_url};
+    let dir = tempfile::tempdir().unwrap();
+    let (root, _) =
+        git_repo_with_linked_worktree(&dir.path().join("repo"), &dir.path().join("feat"));
+    let root_path = std::path::Path::new(&root);
+    assert!(thegn_core::util::git_ok(
+        root_path,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/acme/repo.git"
+        ]
+    ));
+    let db = thegn_core::db::Db::open_memory().unwrap();
+    assert!(scoped_open_pr_maps(&db, &root).is_none());
+    let row = PrHeader {
+        number: 7,
+        head_ref: "feat".into(),
+        state: "OPEN".into(),
+        url: "https://github.com/acme/repo/pull/7".into(),
+        is_draft: false,
+    };
+    let feed = PrBranchCache {
+        rows: vec![row.clone()],
+        source_repo: repo_identity_from_remote_url("https://github.com/acme/repo").unwrap(),
+    };
+    db.put_pr_branch_cache(&root, &serde_json::to_string(&feed).unwrap())
+        .unwrap();
+    let (counts, numbers) = scoped_open_pr_maps(&db, &root).unwrap();
+    assert_eq!(counts.get("feat"), Some(&1));
+    assert_eq!(numbers.get("feat"), Some(&7));
+    assert!(thegn_core::util::git_ok(
+        root_path,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "https://other.example/acme/repo.git"
+        ]
+    ));
+    assert!(scoped_open_pr_maps(&db, &root).is_none());
+    assert!(thegn_core::util::git_ok(
+        root_path,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "https://github.com/acme/repo.git"
+        ]
+    ));
+    db.put_pr_branch_cache(&root, &serde_json::to_string(&vec![row]).unwrap())
+        .unwrap();
+    assert!(
+        scoped_open_pr_maps(&db, &root).is_none(),
+        "legacy arrays have no producer scope"
+    );
+}
+
+#[test]
+fn auto_clean_refuses_a_target_origin_change_before_and_during_state_lookup() {
+    use thegn_core::forge::model::{PrBranchCache, PrHeader, repo_identity_from_remote_url};
+    let dir = tempfile::tempdir().unwrap();
+    let (root, target) =
+        git_repo_with_linked_worktree(&dir.path().join("repo"), &dir.path().join("feat"));
+    let root_path = std::path::Path::new(&root);
+    let target_path = std::path::Path::new(&target);
+    for args in [
+        vec![
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/acme/repo.git",
+        ],
+        vec!["config", "extensions.worktreeConfig", "true"],
+        // Remote URLs are multi-valued: a worktree-local URL does not replace
+        // the first shared URL. Give each checkout its own effective origin.
+        vec![
+            "config",
+            "--worktree",
+            "remote.origin.url",
+            "https://github.com/acme/repo.git",
+        ],
+        vec!["config", "--local", "--unset-all", "remote.origin.url"],
+    ] {
+        assert!(thegn_core::util::git_ok(root_path, &args));
+    }
+    let set_target_origin = |url: &str| {
+        assert!(thegn_core::util::git_ok(
+            target_path,
+            &["config", "--worktree", "remote.origin.url", url]
+        ));
+        assert_eq!(
+            thegn_core::util::git_out(target_path, &["remote", "get-url", "origin"]).as_deref(),
+            Some(url)
+        );
+        assert_eq!(
+            thegn_core::util::git_out(root_path, &["remote", "get-url", "origin"]).as_deref(),
+            Some("https://github.com/acme/repo.git")
+        );
+    };
+    let db = thegn_core::db::Db::open_memory().unwrap();
+    db.put_worktree("repo/feat", &root, &target, "feat", None, None)
+        .unwrap();
+    let source = repo_identity_from_remote_url("https://github.com/acme/repo").unwrap();
+    let feed = PrBranchCache {
+        source_repo: source.clone(),
+        rows: vec![PrHeader {
+            number: 7,
+            head_ref: "feat".into(),
+            state: "OPEN".into(),
+            url: "https://github.com/acme/repo/pull/7".into(),
+            is_draft: false,
+        }],
+    };
+    db.put_pr_branch_cache(&root, &serde_json::to_string(&feed).unwrap())
+        .unwrap();
+    let artifacts = target_path.join("target");
+    std::fs::create_dir(&artifacts).unwrap();
+    let sentinel = artifacts.join("keep-me");
+    std::fs::write(&sentinel, "build artifacts").unwrap();
+    let cfg = thegn_core::config::DiskConfig {
+        auto_clean_on_merge: true,
+        clean_on_pr_closed: true,
+        ..Default::default()
+    };
+    set_target_origin("https://github.com/other/repo.git");
+    let mut lookups = 0;
+    maybe_clean_merged_worktrees_with_state(&db, root_path, &root, &[], &source, &cfg, |_, _| {
+        lookups += 1;
+        Some("MERGED".into())
+    });
+    assert_eq!(
+        lookups, 0,
+        "a foreign origin must not be queried as this PR"
+    );
+    assert!(sentinel.exists());
+    set_target_origin("https://github.com/acme/repo.git");
+    maybe_clean_merged_worktrees_with_state(
+        &db,
+        root_path,
+        &root,
+        &[],
+        &source,
+        &cfg,
+        |_, branch| {
+            lookups += 1;
+            assert_eq!(branch, "feat");
+            set_target_origin("https://github.com/other/repo.git");
+            Some("MERGED".into())
+        },
+    );
+    assert_eq!(lookups, 1);
+    assert!(
+        sentinel.exists(),
+        "a scope change during the provider request must prevent cleanup"
     );
 }

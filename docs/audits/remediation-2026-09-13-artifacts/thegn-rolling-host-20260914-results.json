@@ -1,0 +1,2095 @@
+[
+  {
+    "test": "ci_refresh::ci_autofix::authorship_tests::foreign_author_never_claims_or_spends_a_ci_attempt",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.624,
+    "log": "/tmp/thegn-rolling-host-20260914-results/ci_refresh__ci_autofix__authorship_tests__foreign_author_never_claims_or_spends_a_ci_attempt.log"
+  },
+  {
+    "test": "ci_refresh::tests::ci_cache_freshness_guard",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.037,
+    "log": "/tmp/thegn-rolling-host-20260914-results/ci_refresh__tests__ci_cache_freshness_guard.log"
+  },
+  {
+    "test": "ci_refresh::tests::ci_cadence_honors_config_and_clamps",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.042,
+    "log": "/tmp/thegn-rolling-host-20260914-results/ci_refresh__tests__ci_cadence_honors_config_and_clamps.log"
+  },
+  {
+    "test": "ci_refresh::tests::enormous_ttl_and_clock_rollback_keep_cached_ci_quiet",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.04,
+    "log": "/tmp/thegn-rolling-host-20260914-results/ci_refresh__tests__enormous_ttl_and_clock_rollback_keep_cached_ci_quiet.log"
+  },
+  {
+    "test": "ci_refresh::tests::failure_backoff_doubles_and_caps",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.037,
+    "log": "/tmp/thegn-rolling-host-20260914-results/ci_refresh__tests__failure_backoff_doubles_and_caps.log"
+  },
+  {
+    "test": "ci_refresh::tests::health_notes_lifecycle",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.057,
+    "log": "/tmp/thegn-rolling-host-20260914-results/ci_refresh__tests__health_notes_lifecycle.log"
+  },
+  {
+    "test": "handlers::merge_queue::tests::apply_step_materializes_a_missing_row",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.059,
+    "log": "/tmp/thegn-rolling-host-20260914-results/handlers__merge_queue__tests__apply_step_materializes_a_missing_row.log"
+  },
+  {
+    "test": "handlers::merge_queue::tests::apply_step_patches_row_in_place",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.026,
+    "log": "/tmp/thegn-rolling-host-20260914-results/handlers__merge_queue__tests__apply_step_patches_row_in_place.log"
+  },
+  {
+    "test": "handlers::merge_queue::tests::failed_fold_summary_never_claims_integration_completed",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.03,
+    "log": "/tmp/thegn-rolling-host-20260914-results/handlers__merge_queue__tests__failed_fold_summary_never_claims_integration_completed.log"
+  },
+  {
+    "test": "handlers::merge_queue::tests::gate_error_only_and_mixed_drains_are_not_successful_or_empty",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.026,
+    "log": "/tmp/thegn-rolling-host-20260914-results/handlers__merge_queue__tests__gate_error_only_and_mixed_drains_are_not_successful_or_empty.log"
+  },
+  {
+    "test": "handlers::merge_queue::tests::held_steps_replace_stale_result_conflict_and_error_independently",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.018,
+    "log": "/tmp/thegn-rolling-host-20260914-results/handlers__merge_queue__tests__held_steps_replace_stale_result_conflict_and_error_independently.log"
+  },
+  {
+    "test": "handlers::merge_queue::tests::key_matrix_resolves_by_row_status",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.016,
+    "log": "/tmp/thegn-rolling-host-20260914-results/handlers__merge_queue__tests__key_matrix_resolves_by_row_status.log"
+  },
+  {
+    "test": "hydrate::refresh_ticker::tests::adversarial_cadences_keep_the_running_shared_ticker_delivering_unrelated_work",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.077,
+    "log": "/tmp/thegn-rolling-host-20260914-results/hydrate__refresh_ticker__tests__adversarial_cadences_keep_the_running_shared_ticker_delivering_unrelated_work.log"
+  },
+  {
+    "test": "hydrate::refresh_ticker::tests::disabled_optional_cadences_remain_silent_in_the_running_shared_ticker",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.049,
+    "log": "/tmp/thegn-rolling-host-20260914-results/hydrate__refresh_ticker__tests__disabled_optional_cadences_remain_silent_in_the_running_shared_ticker.log"
+  },
+  {
+    "test": "hydrate::refresh_ticker::tests::startup_and_periodic_requests_coalesce_in_the_running_shared_ticker",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.042,
+    "log": "/tmp/thegn-rolling-host-20260914-results/hydrate__refresh_ticker__tests__startup_and_periodic_requests_coalesce_in_the_running_shared_ticker.log"
+  },
+  {
+    "test": "hydrate::tests::a_stray_zero_interval_is_floored",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.02,
+    "log": "/tmp/thegn-rolling-host-20260914-results/hydrate__tests__a_stray_zero_interval_is_floored.log"
+  },
+  {
+    "test": "hydrate::tests::automation_pr_edges_come_from_typed_old_and_new_forge_facts",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.02,
+    "log": "/tmp/thegn-rolling-host-20260914-results/hydrate__tests__automation_pr_edges_come_from_typed_old_and_new_forge_facts.log"
+  },
+  {
+    "test": "hydrate::tests::bootstrap_workspace_survives_switch_in_workspace_list",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.175,
+    "log": "/tmp/thegn-rolling-host-20260914-results/hydrate__tests__bootstrap_workspace_survives_switch_in_workspace_list.log"
+  },
+  {
+    "test": "hydrate::tests::branch_fetch_needed_open_follows_ttl_warm_only_cold_miss",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.017,
+    "log": "/tmp/thegn-rolling-host-20260914-results/hydrate__tests__branch_fetch_needed_open_follows_ttl_warm_only_cold_miss.log"
+  },
+  {
+    "test": "hydrate::tests::commit_load_needed_open_follows_ttl_warm_only_cold_miss",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.022,
+    "log": "/tmp/thegn-rolling-host-20260914-results/hydrate__tests__commit_load_needed_open_follows_ttl_warm_only_cold_miss.log"
+  },
+  {
+    "test": "hydrate::tests::count_error_lines_counts_only_errors",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.021,
+    "log": "/tmp/thegn-rolling-host-20260914-results/hydrate__tests__count_error_lines_counts_only_errors.log"
+  },
+  {
+    "test": "hydrate::tests::devcontainer_status_resolves_the_repo_selected_host_environment",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.026,
+    "log": "/tmp/thegn-rolling-host-20260914-results/hydrate__tests__devcontainer_status_resolves_the_repo_selected_host_environment.log"
+  },
+  {
+    "test": "hydrate::tests::glyph_keep_set_distrusts_failed_db_reads",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.016,
+    "log": "/tmp/thegn-rolling-host-20260914-results/hydrate__tests__glyph_keep_set_distrusts_failed_db_reads.log"
+  },
+  {
+    "test": "hydrate::tests::glyph_keep_set_unions_registry_and_repo_roots",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.015,
+    "log": "/tmp/thegn-rolling-host-20260914-results/hydrate__tests__glyph_keep_set_unions_registry_and_repo_roots.log"
+  },
+  {
+    "test": "hydrate::tests::glyph_persist_entry_serializes_only_the_row",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.02,
+    "log": "/tmp/thegn-rolling-host-20260914-results/hydrate__tests__glyph_persist_entry_serializes_only_the_row.log"
+  },
+  {
+    "test": "hydrate::tests::glyph_rescan_tiering",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.018,
+    "log": "/tmp/thegn-rolling-host-20260914-results/hydrate__tests__glyph_rescan_tiering.log"
+  },
+  {
+    "test": "hydrate::tests::glyph_scan_clean_read_updates",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.017,
+    "log": "/tmp/thegn-rolling-host-20260914-results/hydrate__tests__glyph_scan_clean_read_updates.log"
+  },
+  {
+    "test": "hydrate::tests::glyph_scan_error_without_prior_falls_back_to_defaults",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.019,
+    "log": "/tmp/thegn-rolling-host-20260914-results/hydrate__tests__glyph_scan_error_without_prior_falls_back_to_defaults.log"
+  },
+  {
+    "test": "hydrate::tests::glyph_scan_no_upstream_is_zero_not_error",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.017,
+    "log": "/tmp/thegn-rolling-host-20260914-results/hydrate__tests__glyph_scan_no_upstream_is_zero_not_error.log"
+  },
+  {
+    "test": "hydrate::tests::glyph_scan_partial_error_keeps_only_failed_field",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.019,
+    "log": "/tmp/thegn-rolling-host-20260914-results/hydrate__tests__glyph_scan_partial_error_keeps_only_failed_field.log"
+  },
+  {
+    "test": "hydrate::tests::glyph_scan_transient_error_reuses_prior",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.017,
+    "log": "/tmp/thegn-rolling-host-20260914-results/hydrate__tests__glyph_scan_transient_error_reuses_prior.log"
+  },
+  {
+    "test": "hydrate::tests::heal_does_nothing_when_the_registry_is_empty",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.02,
+    "log": "/tmp/thegn-rolling-host-20260914-results/hydrate__tests__heal_does_nothing_when_the_registry_is_empty.log"
+  },
+  {
+    "test": "hydrate::tests::heal_fills_a_lost_repo_path_from_the_registry",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.022,
+    "log": "/tmp/thegn-rolling-host-20260914-results/hydrate__tests__heal_fills_a_lost_repo_path_from_the_registry.log"
+  },
+  {
+    "test": "hydrate::tests::heal_is_idempotent",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.02,
+    "log": "/tmp/thegn-rolling-host-20260914-results/hydrate__tests__heal_is_idempotent.log"
+  },
+  {
+    "test": "hydrate::tests::heal_leaves_db_backed_entries_alone",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.021,
+    "log": "/tmp/thegn-rolling-host-20260914-results/hydrate__tests__heal_leaves_db_backed_entries_alone.log"
+  },
+  {
+    "test": "hydrate::tests::heal_requires_live_identity_and_keeps_same_basename_repos_separate",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.02,
+    "log": "/tmp/thegn-rolling-host-20260914-results/hydrate__tests__heal_requires_live_identity_and_keeps_same_basename_repos_separate.log"
+  },
+  {
+    "test": "hydrate::tests::healed_live_fallback_renders_its_registered_worktrees",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.022,
+    "log": "/tmp/thegn-rolling-host-20260914-results/hydrate__tests__healed_live_fallback_renders_its_registered_worktrees.log"
+  },
+  {
+    "test": "hydrate::tests::inherited_remote_ambient_env_survives_missing_local_dir",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.182,
+    "log": "/tmp/thegn-rolling-host-20260914-results/hydrate__tests__inherited_remote_ambient_env_survives_missing_local_dir.log"
+  },
+  {
+    "test": "hydrate::tests::initial_model_is_cheap_and_marks_hydration_pending",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.018,
+    "log": "/tmp/thegn-rolling-host-20260914-results/hydrate__tests__initial_model_is_cheap_and_marks_hydration_pending.log"
+  },
+  {
+    "test": "hydrate::tests::load_or_seed_session_does_not_resurrect_tombstoned_workspace",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.19,
+    "log": "/tmp/thegn-rolling-host-20260914-results/hydrate__tests__load_or_seed_session_does_not_resurrect_tombstoned_workspace.log"
+  },
+  {
+    "test": "hydrate::tests::load_or_seed_session_registers_bootstrap_workspace",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.218,
+    "log": "/tmp/thegn-rolling-host-20260914-results/hydrate__tests__load_or_seed_session_registers_bootstrap_workspace.log"
+  },
+  {
+    "test": "hydrate::tests::merge_drops_stale_live_fallback_entries",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.017,
+    "log": "/tmp/thegn-rolling-host-20260914-results/hydrate__tests__merge_drops_stale_live_fallback_entries.log"
+  },
+  {
+    "test": "hydrate::tests::merge_is_idempotent_and_never_duplicates_by_slug",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.015,
+    "log": "/tmp/thegn-rolling-host-20260914-results/hydrate__tests__merge_is_idempotent_and_never_duplicates_by_slug.log"
+  },
+  {
+    "test": "hydrate::tests::merge_keeps_db_order_and_appends_unknown_live_at_end",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.017,
+    "log": "/tmp/thegn-rolling-host-20260914-results/hydrate__tests__merge_keeps_db_order_and_appends_unknown_live_at_end.log"
+  },
+  {
+    "test": "hydrate::tests::needs_fallback_send_only_on_non_normal_exit",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.015,
+    "log": "/tmp/thegn-rolling-host-20260914-results/hydrate__tests__needs_fallback_send_only_on_non_normal_exit.log"
+  },
+  {
+    "test": "hydrate::tests::neighbor_paths_fall_back_to_session_order_when_active_hidden",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.02,
+    "log": "/tmp/thegn-rolling-host-20260914-results/hydrate__tests__neighbor_paths_fall_back_to_session_order_when_active_hidden.log"
+  },
+  {
+    "test": "hydrate::tests::neighbor_paths_follow_sidebar_display_order_not_session_order",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.02,
+    "log": "/tmp/thegn-rolling-host-20260914-results/hydrate__tests__neighbor_paths_follow_sidebar_display_order_not_session_order.log"
+  },
+  {
+    "test": "hydrate::tests::neighbor_paths_single_visible_worktree_warms_nothing",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.02,
+    "log": "/tmp/thegn-rolling-host-20260914-results/hydrate__tests__neighbor_paths_single_visible_worktree_warms_nothing.log"
+  },
+  {
+    "test": "hydrate::tests::neighbor_paths_wrap_at_the_ends",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.022,
+    "log": "/tmp/thegn-rolling-host-20260914-results/hydrate__tests__neighbor_paths_wrap_at_the_ends.log"
+  },
+  {
+    "test": "hydrate::tests::plan_log_scan_covers_rotation_append_and_idle",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.02,
+    "log": "/tmp/thegn-rolling-host-20260914-results/hydrate__tests__plan_log_scan_covers_rotation_append_and_idle.log"
+  },
+  {
+    "test": "hydrate::tests::pr_clean_decision_only_acts_on_definitive_states",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.02,
+    "log": "/tmp/thegn-rolling-host-20260914-results/hydrate__tests__pr_clean_decision_only_acts_on_definitive_states.log"
+  },
+  {
+    "test": "hydrate::tests::pr_linked_diff_emits_once_for_new_prs_only",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.022,
+    "log": "/tmp/thegn-rolling-host-20260914-results/hydrate__tests__pr_linked_diff_emits_once_for_new_prs_only.log"
+  },
+  {
+    "test": "hydrate::tests::pr_state_definitive_gates_cache_writes",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.02,
+    "log": "/tmp/thegn-rolling-host-20260914-results/hydrate__tests__pr_state_definitive_gates_cache_writes.log"
+  },
+  {
+    "test": "hydrate::tests::prune_keeps_a_git_listed_group_whose_dir_is_gone",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.199,
+    "log": "/tmp/thegn-rolling-host-20260914-results/hydrate__tests__prune_keeps_a_git_listed_group_whose_dir_is_gone.log"
+  },
+  {
+    "test": "hydrate::tests::prune_reaps_a_removed_group_whose_registry_row_is_already_gone",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.199,
+    "log": "/tmp/thegn-rolling-host-20260914-results/hydrate__tests__prune_reaps_a_removed_group_whose_registry_row_is_already_gone.log"
+  },
+  {
+    "test": "hydrate::tests::read_log_tail_lines_is_bounded_and_snaps_to_line",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.021,
+    "log": "/tmp/thegn-rolling-host-20260914-results/hydrate__tests__read_log_tail_lines_is_bounded_and_snaps_to_line.log"
+  },
+  {
+    "test": "hydrate::tests::remote_placement_worktrees_survive_missing_local_dir",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.015,
+    "log": "/tmp/thegn-rolling-host-20260914-results/hydrate__tests__remote_placement_worktrees_survive_missing_local_dir.log"
+  },
+  {
+    "test": "hydrate::tests::row_is_git_listed_fails_safe_when_the_repo_root_is_unreadable",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.017,
+    "log": "/tmp/thegn-rolling-host-20260914-results/hydrate__tests__row_is_git_listed_fails_safe_when_the_repo_root_is_unreadable.log"
+  },
+  {
+    "test": "hydrate::tests::row_is_git_listed_is_false_for_a_path_git_never_knew",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.056,
+    "log": "/tmp/thegn-rolling-host-20260914-results/hydrate__tests__row_is_git_listed_is_false_for_a_path_git_never_knew.log"
+  },
+  {
+    "test": "hydrate::tests::row_is_git_listed_is_not_a_worktrees_dir_prefix_test",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.061,
+    "log": "/tmp/thegn-rolling-host-20260914-results/hydrate__tests__row_is_git_listed_is_not_a_worktrees_dir_prefix_test.log"
+  },
+  {
+    "test": "hydrate::tests::row_is_git_listed_probes_each_repo_root_once",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.065,
+    "log": "/tmp/thegn-rolling-host-20260914-results/hydrate__tests__row_is_git_listed_probes_each_repo_root_once.log"
+  },
+  {
+    "test": "hydrate::tests::ticker_pr_cadence_is_a_multiple_of_the_model_cadence",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.018,
+    "log": "/tmp/thegn-rolling-host-20260914-results/hydrate__tests__ticker_pr_cadence_is_a_multiple_of_the_model_cadence.log"
+  },
+  {
+    "test": "hydrate::tests::tracker_diff_emits_status_changes_and_blocker_resolved_once",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.02,
+    "log": "/tmp/thegn-rolling-host-20260914-results/hydrate__tests__tracker_diff_emits_status_changes_and_blocker_resolved_once.log"
+  },
+  {
+    "test": "hydrate::tests::update_log_error_total_is_incremental_and_resets_on_rotation",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.02,
+    "log": "/tmp/thegn-rolling-host-20260914-results/hydrate__tests__update_log_error_total_is_incremental_and_resets_on_rotation.log"
+  },
+  {
+    "test": "hydrate::tests::weather_emits_no_slot_when_disabled",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.02,
+    "log": "/tmp/thegn-rolling-host-20260914-results/hydrate__tests__weather_emits_no_slot_when_disabled.log"
+  },
+  {
+    "test": "hydrate::tests::workspace_list_with_db_lists_current_workspace_once",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.173,
+    "log": "/tmp/thegn-rolling-host-20260914-results/hydrate__tests__workspace_list_with_db_lists_current_workspace_once.log"
+  },
+  {
+    "test": "integrate::candidates::tests::all_selected_candidates_are_preflighted_before_the_first_snapshot",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.581,
+    "log": "/tmp/thegn-rolling-host-20260914-results/integrate__candidates__tests__all_selected_candidates_are_preflighted_before_the_first_snapshot.log"
+  },
+  {
+    "test": "integrate::candidates::tests::backlink_reader_requires_bounded_regular_registration",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.02,
+    "log": "/tmp/thegn-rolling-host-20260914-results/integrate__candidates__tests__backlink_reader_requires_bounded_regular_registration.log"
+  },
+  {
+    "test": "integrate::candidates::tests::changed_common_directory_never_snapshots_the_replacement_repository",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.517,
+    "log": "/tmp/thegn-rolling-host-20260914-results/integrate__candidates__tests__changed_common_directory_never_snapshots_the_replacement_repository.log"
+  },
+  {
+    "test": "integrate::candidates::tests::changed_head_or_branch_refuses_before_any_selected_snapshot",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 1.027,
+    "log": "/tmp/thegn-rolling-host-20260914-results/integrate__candidates__tests__changed_head_or_branch_refuses_before_any_selected_snapshot.log"
+  },
+  {
+    "test": "integrate::candidates::tests::dirty_lookup_failure_is_not_clean_or_snapshot_permission",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.304,
+    "log": "/tmp/thegn-rolling-host-20260914-results/integrate__candidates__tests__dirty_lookup_failure_is_not_clean_or_snapshot_permission.log"
+  },
+  {
+    "test": "integrate::candidates::tests::discovery_never_snapshots_even_when_dirty_snapshots_are_enabled",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.442,
+    "log": "/tmp/thegn-rolling-host-20260914-results/integrate__candidates__tests__discovery_never_snapshots_even_when_dirty_snapshots_are_enabled.log"
+  },
+  {
+    "test": "integrate::candidates::tests::first_snapshot_hook_cannot_replace_later_git_identity_and_readmit_it",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 1.107,
+    "log": "/tmp/thegn-rolling-host-20260914-results/integrate__candidates__tests__first_snapshot_hook_cannot_replace_later_git_identity_and_readmit_it.log"
+  },
+  {
+    "test": "integrate::candidates::tests::later_snapshot_failure_reports_partial_authorized_snapshots_without_rollback",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 1.136,
+    "log": "/tmp/thegn-rolling-host-20260914-results/integrate__candidates__tests__later_snapshot_failure_reports_partial_authorized_snapshots_without_rollback.log"
+  },
+  {
+    "test": "integrate::candidates::tests::missing_observation_prevents_snapshots",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.604,
+    "log": "/tmp/thegn-rolling-host-20260914-results/integrate__candidates__tests__missing_observation_prevents_snapshots.log"
+  },
+  {
+    "test": "integrate::candidates::tests::noncanonical_candidate_paths_are_refused_before_mutation",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.654,
+    "log": "/tmp/thegn-rolling-host-20260914-results/integrate__candidates__tests__noncanonical_candidate_paths_are_refused_before_mutation.log"
+  },
+  {
+    "test": "integrate::candidates::tests::remote_or_reassigned_registry_never_retargets_snapshot",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 1.09,
+    "log": "/tmp/thegn-rolling-host-20260914-results/integrate__candidates__tests__remote_or_reassigned_registry_never_retargets_snapshot.log"
+  },
+  {
+    "test": "integrate::candidates::tests::snapshot_disabled_keeps_pinned_tips_without_mutating_dirty_work",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.496,
+    "log": "/tmp/thegn-rolling-host-20260914-results/integrate__candidates__tests__snapshot_disabled_keeps_pinned_tips_without_mutating_dirty_work.log"
+  },
+  {
+    "test": "integrate::candidates::tests::ui_fold_snapshots_only_the_selected_queued_worktree",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 1.242,
+    "log": "/tmp/thegn-rolling-host-20260914-results/integrate__candidates__tests__ui_fold_snapshots_only_the_selected_queued_worktree.log"
+  },
+  {
+    "test": "integrate::enqueue_guard_tests::a_candidate_without_a_worktree_is_held",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.026,
+    "log": "/tmp/thegn-rolling-host-20260914-results/integrate__enqueue_guard_tests__a_candidate_without_a_worktree_is_held.log"
+  },
+  {
+    "test": "integrate::enqueue_guard_tests::an_empty_queue_folds_nothing",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.017,
+    "log": "/tmp/thegn-rolling-host-20260914-results/integrate__enqueue_guard_tests__an_empty_queue_folds_nothing.log"
+  },
+  {
+    "test": "integrate::enqueue_guard_tests::holding_preserves_candidate_order",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.022,
+    "log": "/tmp/thegn-rolling-host-20260914-results/integrate__enqueue_guard_tests__holding_preserves_candidate_order.log"
+  },
+  {
+    "test": "integrate::enqueue_guard_tests::membership_follows_the_worktree_not_the_branch_name",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.02,
+    "log": "/tmp/thegn-rolling-host-20260914-results/integrate__enqueue_guard_tests__membership_follows_the_worktree_not_the_branch_name.log"
+  },
+  {
+    "test": "integrate::enqueue_guard_tests::only_enqueued_branches_survive",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.023,
+    "log": "/tmp/thegn-rolling-host-20260914-results/integrate__enqueue_guard_tests__only_enqueued_branches_survive.log"
+  },
+  {
+    "test": "integrate::gate_runner::tests::changed_backlink_or_common_directory_holds_without_checkout",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.357,
+    "log": "/tmp/thegn-rolling-host-20260914-results/integrate__gate_runner__tests__changed_backlink_or_common_directory_holds_without_checkout.log"
+  },
+  {
+    "test": "integrate::gate_runner::tests::checkout_failure_preserves_existing_gate_and_index_lock",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.336,
+    "log": "/tmp/thegn-rolling-host-20260914-results/integrate__gate_runner__tests__checkout_failure_preserves_existing_gate_and_index_lock.log"
+  },
+  {
+    "test": "integrate::gate_runner::tests::concurrent_distinct_oid_gate_refuses_instead_of_rechecking_out_active_tree",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.41,
+    "log": "/tmp/thegn-rolling-host-20260914-results/integrate__gate_runner__tests__concurrent_distinct_oid_gate_refuses_instead_of_rechecking_out_active_tree.log"
+  },
+  {
+    "test": "integrate::gate_runner::tests::forged_symlink_parent_gitfile_refuses_before_any_checkout_mutation",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.388,
+    "log": "/tmp/thegn-rolling-host-20260914-results/integrate__gate_runner__tests__forged_symlink_parent_gitfile_refuses_before_any_checkout_mutation.log"
+  },
+  {
+    "test": "integrate::gate_runner::tests::fresh_indexes_restore_stale_stat_monitor_modes_links_and_missing_files",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 2.924,
+    "log": "/tmp/thegn-rolling-host-20260914-results/integrate__gate_runner__tests__fresh_indexes_restore_stale_stat_monitor_modes_links_and_missing_files.log"
+  },
+  {
+    "test": "integrate::gate_runner::tests::gate_identity_error_never_advances_or_blames_candidate",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 1.019,
+    "log": "/tmp/thegn-rolling-host-20260914-results/integrate__gate_runner__tests__gate_identity_error_never_advances_or_blames_candidate.log"
+  },
+  {
+    "test": "integrate::gate_runner::tests::linked_root_gitfile_reassignment_is_not_a_new_repository",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.111,
+    "log": "/tmp/thegn-rolling-host-20260914-results/integrate__gate_runner__tests__linked_root_gitfile_reassignment_is_not_a_new_repository.log"
+  },
+  {
+    "test": "integrate::gate_runner::tests::materialization_record_parser_is_conservative_and_nul_framed",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.021,
+    "log": "/tmp/thegn-rolling-host-20260914-results/integrate__gate_runner__tests__materialization_record_parser_is_conservative_and_nul_framed.log"
+  },
+  {
+    "test": "integrate::gate_runner::tests::oversized_configuration_probe_holds_without_echoing_values_or_mutating_checkout",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.982,
+    "log": "/tmp/thegn-rolling-host-20260914-results/integrate__gate_runner__tests__oversized_configuration_probe_holds_without_echoing_values_or_mutating_checkout.log"
+  },
+  {
+    "test": "integrate::gate_runner::tests::private_index_cleanup_refuses_replacement_and_never_recurses",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.352,
+    "log": "/tmp/thegn-rolling-host-20260914-results/integrate__gate_runner__tests__private_index_cleanup_refuses_replacement_and_never_recurses.log"
+  },
+  {
+    "test": "integrate::gate_runner::tests::replaced_lock_during_success_is_infrastructure_not_green",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.348,
+    "log": "/tmp/thegn-rolling-host-20260914-results/integrate__gate_runner__tests__replaced_lock_during_success_is_infrastructure_not_green.log"
+  },
+  {
+    "test": "integrate::gate_runner::tests::replacement_refs_never_change_gate_materialization_or_inherited_git_view",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 1.405,
+    "log": "/tmp/thegn-rolling-host-20260914-results/integrate__gate_runner__tests__replacement_refs_never_change_gate_materialization_or_inherited_git_view.log"
+  },
+  {
+    "test": "integrate::gate_runner::tests::required_filter_failure_is_static_infrastructure_and_retains_private_index",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.416,
+    "log": "/tmp/thegn-rolling-host-20260914-results/integrate__gate_runner__tests__required_filter_failure_is_static_infrastructure_and_retains_private_index.log"
+  },
+  {
+    "test": "integrate::gate_runner::tests::reused_gate_requires_lock_and_preserves_ignored_artifacts",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.569,
+    "log": "/tmp/thegn-rolling-host-20260914-results/integrate__gate_runner__tests__reused_gate_requires_lock_and_preserves_ignored_artifacts.log"
+  },
+  {
+    "test": "integrate::gate_runner::tests::root_git_mapping_is_revalidated_before_reporting_success",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.257,
+    "log": "/tmp/thegn-rolling-host-20260914-results/integrate__gate_runner__tests__root_git_mapping_is_revalidated_before_reporting_success.log"
+  },
+  {
+    "test": "integrate::gate_runner::tests::same_oid_stale_skip_worktree_and_assume_unchanged_are_held_without_repair",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.631,
+    "log": "/tmp/thegn-rolling-host-20260914-results/integrate__gate_runner__tests__same_oid_stale_skip_worktree_and_assume_unchanged_are_held_without_repair.log"
+  },
+  {
+    "test": "integrate::gate_runner::tests::setup_failure_keeps_exit_code_and_does_not_run_gate",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.337,
+    "log": "/tmp/thegn-rolling-host-20260914-results/integrate__gate_runner__tests__setup_failure_keeps_exit_code_and_does_not_run_gate.log"
+  },
+  {
+    "test": "integrate::gate_runner::tests::setup_or_successful_gate_cannot_change_the_commit_under_test",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.527,
+    "log": "/tmp/thegn-rolling-host-20260914-results/integrate__gate_runner__tests__setup_or_successful_gate_cannot_change_the_commit_under_test.log"
+  },
+  {
+    "test": "integrate::gate_runner::tests::sparse_worktree_configuration_is_held_without_index_or_content_mutation",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.885,
+    "log": "/tmp/thegn-rolling-host-20260914-results/integrate__gate_runner__tests__sparse_worktree_configuration_is_held_without_index_or_content_mutation.log"
+  },
+  {
+    "test": "integrate::gate_runner::tests::stale_registration_is_not_pruned_or_force_recreated",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.303,
+    "log": "/tmp/thegn-rolling-host-20260914-results/integrate__gate_runner__tests__stale_registration_is_not_pruned_or_force_recreated.log"
+  },
+  {
+    "test": "integrate::gate_runner::tests::supplied_parent_grammar_preserves_only_pinned_ancestor_traversal",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.288,
+    "log": "/tmp/thegn-rolling-host-20260914-results/integrate__gate_runner__tests__supplied_parent_grammar_preserves_only_pinned_ancestor_traversal.log"
+  },
+  {
+    "test": "integrate::gate_runner::tests::symlink_gate_path_is_not_followed_or_removed",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.108,
+    "log": "/tmp/thegn-rolling-host-20260914-results/integrate__gate_runner__tests__symlink_gate_path_is_not_followed_or_removed.log"
+  },
+  {
+    "test": "integrate::gate_runner::tests::throwaway_has_owned_unique_parent_and_exact_scoped_cleanup",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.295,
+    "log": "/tmp/thegn-rolling-host-20260914-results/integrate__gate_runner__tests__throwaway_has_owned_unique_parent_and_exact_scoped_cleanup.log"
+  },
+  {
+    "test": "integrate::gate_runner::tests::unknown_directory_and_foreign_repository_are_never_deleted",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.131,
+    "log": "/tmp/thegn-rolling-host-20260914-results/integrate__gate_runner__tests__unknown_directory_and_foreign_repository_are_never_deleted.log"
+  },
+  {
+    "test": "integrate::gate_runner::tests::unknown_wait_retains_whole_lease_and_poison_refuses_reuse_and_throwaway",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.318,
+    "log": "/tmp/thegn-rolling-host-20260914-results/integrate__gate_runner__tests__unknown_wait_retains_whole_lease_and_poison_refuses_reuse_and_throwaway.log"
+  },
+  {
+    "test": "integrate::gate_runner::tests::unused_configured_filters_are_preserved_without_execution",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.357,
+    "log": "/tmp/thegn-rolling-host-20260914-results/integrate__gate_runner__tests__unused_configured_filters_are_preserved_without_execution.log"
+  },
+  {
+    "test": "integrate::gate_runner::tests::used_filter_runs_only_during_materialization_and_preserves_real_index",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.91,
+    "log": "/tmp/thegn-rolling-host-20260914-results/integrate__gate_runner__tests__used_filter_runs_only_during_materialization_and_preserves_real_index.log"
+  },
+  {
+    "test": "integrate::persistence::tests::contradictory_projection_is_rejected_before_any_row_or_lifecycle_write",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.156,
+    "log": "/tmp/thegn-rolling-host-20260914-results/integrate__persistence__tests__contradictory_projection_is_rejected_before_any_row_or_lifecycle_write.log"
+  },
+  {
+    "test": "integrate::persistence::tests::failed_final_write_never_runs_lifecycle_and_retains_existing_row",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.205,
+    "log": "/tmp/thegn-rolling-host-20260914-results/integrate__persistence__tests__failed_final_write_never_runs_lifecycle_and_retains_existing_row.log"
+  },
+  {
+    "test": "integrate::persistence::tests::failed_pre_fold_observation_skips_later_persistence_without_fresh_guard",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.206,
+    "log": "/tmp/thegn-rolling-host-20260914-results/integrate__persistence__tests__failed_pre_fold_observation_skips_later_persistence_without_fresh_guard.log"
+  },
+  {
+    "test": "integrate::persistence::tests::final_projection_never_enqueues_and_lifecycle_observes_committed_status",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.726,
+    "log": "/tmp/thegn-rolling-host-20260914-results/integrate__persistence__tests__final_projection_never_enqueues_and_lifecycle_observes_committed_status.log"
+  },
+  {
+    "test": "integrate::persistence::tests::missing_observation_and_bystander_report_are_not_permission_to_write",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.152,
+    "log": "/tmp/thegn-rolling-host-20260914-results/integrate__persistence__tests__missing_observation_and_bystander_report_are_not_permission_to_write.log"
+  },
+  {
+    "test": "integrate::persistence::tests::observation_is_captured_before_fold_and_never_refreshed_afterwards",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.209,
+    "log": "/tmp/thegn-rolling-host-20260914-results/integrate__persistence__tests__observation_is_captured_before_fold_and_never_refreshed_afterwards.log"
+  },
+  {
+    "test": "integrate::persistence::tests::registry_reassignment_refuses_final_state_without_lifecycle",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.2,
+    "log": "/tmp/thegn-rolling-host-20260914-results/integrate__persistence__tests__registry_reassignment_refuses_final_state_without_lifecycle.log"
+  },
+  {
+    "test": "integrate::persistence::tests::stale_queue_observation_does_not_move_folders_or_overwrite_new_owner",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.163,
+    "log": "/tmp/thegn-rolling-host-20260914-results/integrate__persistence__tests__stale_queue_observation_does_not_move_folders_or_overwrite_new_owner.log"
+  },
+  {
+    "test": "integrate::tests::advancing_main_fast_forwards_the_main_checkout_working_tree",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.796,
+    "log": "/tmp/thegn-rolling-host-20260914-results/integrate__tests__advancing_main_fast_forwards_the_main_checkout_working_tree.log"
+  },
+  {
+    "test": "integrate::tests::attempt_land_holds_at_ready_when_auto_land_is_off",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 1.29,
+    "log": "/tmp/thegn-rolling-host-20260914-results/integrate__tests__attempt_land_holds_at_ready_when_auto_land_is_off.log"
+  },
+  {
+    "test": "integrate::tests::attempt_land_is_uptodate_for_an_already_merged_branch",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 1.261,
+    "log": "/tmp/thegn-rolling-host-20260914-results/integrate__tests__attempt_land_is_uptodate_for_an_already_merged_branch.log"
+  },
+  {
+    "test": "integrate::tests::attempt_land_lands_a_clean_branch",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.962,
+    "log": "/tmp/thegn-rolling-host-20260914-results/integrate__tests__attempt_land_lands_a_clean_branch.log"
+  },
+  {
+    "test": "integrate::tests::attempt_land_reports_a_textual_conflict_without_moving_main",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.853,
+    "log": "/tmp/thegn-rolling-host-20260914-results/integrate__tests__attempt_land_reports_a_textual_conflict_without_moving_main.log"
+  },
+  {
+    "test": "integrate::tests::attempt_land_reports_gate_failure_and_holds_main",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 1.281,
+    "log": "/tmp/thegn-rolling-host-20260914-results/integrate__tests__attempt_land_reports_gate_failure_and_holds_main.log"
+  },
+  {
+    "test": "integrate::tests::bisect_tests_original_candidate_when_live_ref_moves_during_union_gate",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 1.982,
+    "log": "/tmp/thegn-rolling-host-20260914-results/integrate__tests__bisect_tests_original_candidate_when_live_ref_moves_during_union_gate.log"
+  },
+  {
+    "test": "integrate::tests::cas_exhaustion_is_an_unadvanced_report_and_preserves_candidates",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 3.597,
+    "log": "/tmp/thegn-rolling-host-20260914-results/integrate__tests__cas_exhaustion_is_an_unadvanced_report_and_preserves_candidates.log"
+  },
+  {
+    "test": "integrate::tests::cas_io_error_keeps_prepared_candidate_and_gate_diagnostics",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 1.266,
+    "log": "/tmp/thegn-rolling-host-20260914-results/integrate__tests__cas_io_error_keeps_prepared_candidate_and_gate_diagnostics.log"
+  },
+  {
+    "test": "integrate::tests::clean_disjoint_branches_all_land_and_advance_main",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.902,
+    "log": "/tmp/thegn-rolling-host-20260914-results/integrate__tests__clean_disjoint_branches_all_land_and_advance_main.log"
+  },
+  {
+    "test": "integrate::tests::conflicting_branch_is_deferred_clean_one_still_lands",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.734,
+    "log": "/tmp/thegn-rolling-host-20260914-results/integrate__tests__conflicting_branch_is_deferred_clean_one_still_lands.log"
+  },
+  {
+    "test": "integrate::tests::custom_merge_driver_resolves_a_conflict_through_a_worktree_merge",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.671,
+    "log": "/tmp/thegn-rolling-host-20260914-results/integrate__tests__custom_merge_driver_resolves_a_conflict_through_a_worktree_merge.log"
+  },
+  {
+    "test": "integrate::tests::diagnostic_marker_reservation_holds_at_exact_byte_boundaries",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.026,
+    "log": "/tmp/thegn-rolling-host-20260914-results/integrate__tests__diagnostic_marker_reservation_holds_at_exact_byte_boundaries.log"
+  },
+  {
+    "test": "integrate::tests::diagnostics_are_aggregate_bounded_and_keep_early_failure_context",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.019,
+    "log": "/tmp/thegn-rolling-host-20260914-results/integrate__tests__diagnostics_are_aggregate_bounded_and_keep_early_failure_context.log"
+  },
+  {
+    "test": "integrate::tests::explicit_manual_fold_can_land_with_auto_land_disabled_and_noop_succeeds",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 1.085,
+    "log": "/tmp/thegn-rolling-host-20260914-results/integrate__tests__explicit_manual_fold_can_land_with_auto_land_disabled_and_noop_succeeds.log"
+  },
+  {
+    "test": "integrate::tests::failed_union_cannot_persist_a_land_or_run_landed_lifecycle",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 1.135,
+    "log": "/tmp/thegn-rolling-host-20260914-results/integrate__tests__failed_union_cannot_persist_a_land_or_run_landed_lifecycle.log"
+  },
+  {
+    "test": "integrate::tests::fold_report_keeps_typed_submodule_conflict_and_formats_both_shas",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.021,
+    "log": "/tmp/thegn-rolling-host-20260914-results/integrate__tests__fold_report_keeps_typed_submodule_conflict_and_formats_both_shas.log"
+  },
+  {
+    "test": "integrate::tests::gate_diagnostics_drop_bidi_formatting_and_preserve_readable_unicode",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.021,
+    "log": "/tmp/thegn-rolling-host-20260914-results/integrate__tests__gate_diagnostics_drop_bidi_formatting_and_preserve_readable_unicode.log"
+  },
+  {
+    "test": "integrate::tests::green_gate_advances_red_gate_holds_back",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 2.123,
+    "log": "/tmp/thegn-rolling-host-20260914-results/integrate__tests__green_gate_advances_red_gate_holds_back.log"
+  },
+  {
+    "test": "integrate::tests::infrastructure_gate_holds_without_branch_blame_and_keeps_output",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 1.086,
+    "log": "/tmp/thegn-rolling-host-20260914-results/integrate__tests__infrastructure_gate_holds_without_branch_blame_and_keeps_output.log"
+  },
+  {
+    "test": "integrate::tests::persist_defensively_refuses_legacy_speculative_landed_entries",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 1.049,
+    "log": "/tmp/thegn-rolling-host-20260914-results/integrate__tests__persist_defensively_refuses_legacy_speculative_landed_entries.log"
+  },
+  {
+    "test": "integrate::tests::prefix_infrastructure_error_keeps_union_base_and_prefix_diagnostics",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 2.13,
+    "log": "/tmp/thegn-rolling-host-20260914-results/integrate__tests__prefix_infrastructure_error_keeps_union_base_and_prefix_diagnostics.log"
+  },
+  {
+    "test": "integrate::tests::prefix_signing_error_keeps_phase_diagnostics_instead_of_blame",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.785,
+    "log": "/tmp/thegn-rolling-host-20260914-results/integrate__tests__prefix_signing_error_keeps_phase_diagnostics_instead_of_blame.log"
+  },
+  {
+    "test": "integrate::tests::rebase_strategy_replays_commits_linearly_preserving_author",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.971,
+    "log": "/tmp/thegn-rolling-host-20260914-results/integrate__tests__rebase_strategy_replays_commits_linearly_preserving_author.log"
+  },
+  {
+    "test": "integrate::tests::red_base_is_not_a_candidate_failure_and_keeps_both_gate_phases",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 1.483,
+    "log": "/tmp/thegn-rolling-host-20260914-results/integrate__tests__red_base_is_not_a_candidate_failure_and_keeps_both_gate_phases.log"
+  },
+  {
+    "test": "integrate::tests::regenerable_conflict_defers_without_a_regenerate_command",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.562,
+    "log": "/tmp/thegn-rolling-host-20260914-results/integrate__tests__regenerable_conflict_defers_without_a_regenerate_command.log"
+  },
+  {
+    "test": "integrate::tests::regenerable_lockfile_conflict_auto_lands_with_regenerate_command",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.82,
+    "log": "/tmp/thegn-rolling-host-20260914-results/integrate__tests__regenerable_lockfile_conflict_auto_lands_with_regenerate_command.log"
+  },
+  {
+    "test": "integrate::tests::resync_never_clobbers_uncommitted_work_in_the_main_checkout",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.627,
+    "log": "/tmp/thegn-rolling-host-20260914-results/integrate__tests__resync_never_clobbers_uncommitted_work_in_the_main_checkout.log"
+  },
+  {
+    "test": "integrate::tests::signed_fold_has_gpgsig_and_verifies_with_loopback_pinentry",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 1.14,
+    "log": "/tmp/thegn-rolling-host-20260914-results/integrate__tests__signed_fold_has_gpgsig_and_verifies_with_loopback_pinentry.log"
+  },
+  {
+    "test": "integrate::tests::signing_failure_is_infrastructure_not_a_branch_verdict",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.778,
+    "log": "/tmp/thegn-rolling-host-20260914-results/integrate__tests__signing_failure_is_infrastructure_not_a_branch_verdict.log"
+  },
+  {
+    "test": "integrate::tests::signing_failure_preserves_unprepared_candidates_without_inventing_commits",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.786,
+    "log": "/tmp/thegn-rolling-host-20260914-results/integrate__tests__signing_failure_preserves_unprepared_candidates_without_inventing_commits.log"
+  },
+  {
+    "test": "integrate::tests::squash_strategy_lands_one_single_parent_commit",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.83,
+    "log": "/tmp/thegn-rolling-host-20260914-results/integrate__tests__squash_strategy_lands_one_single_parent_commit.log"
+  },
+  {
+    "test": "merge_lifecycle::cleanup::tests::actual_no_force_removal_preserves_source_and_target_refs",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.904,
+    "log": "/tmp/thegn-rolling-host-20260914-results/merge_lifecycle__cleanup__tests__actual_no_force_removal_preserves_source_and_target_refs.log"
+  },
+  {
+    "test": "merge_lifecycle::cleanup::tests::branch_advanced_after_landing_or_during_cleanup_is_preserved",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.887,
+    "log": "/tmp/thegn-rolling-host-20260914-results/merge_lifecycle__cleanup__tests__branch_advanced_after_landing_or_during_cleanup_is_preserved.log"
+  },
+  {
+    "test": "merge_lifecycle::cleanup::tests::branch_recheckout_after_removal_is_kept",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.837,
+    "log": "/tmp/thegn-rolling-host-20260914-results/merge_lifecycle__cleanup__tests__branch_recheckout_after_removal_is_kept.log"
+  },
+  {
+    "test": "merge_lifecycle::cleanup::tests::dirty_ignored_untracked_and_unknown_status_never_mean_clean",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 1.213,
+    "log": "/tmp/thegn-rolling-host-20260914-results/merge_lifecycle__cleanup__tests__dirty_ignored_untracked_and_unknown_status_never_mean_clean.log"
+  },
+  {
+    "test": "merge_lifecycle::cleanup::tests::final_validation_preserves_new_ignored_files_and_replaced_directory",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 1.263,
+    "log": "/tmp/thegn-rolling-host-20260914-results/merge_lifecycle__cleanup__tests__final_validation_preserves_new_ignored_files_and_replaced_directory.log"
+  },
+  {
+    "test": "merge_lifecycle::cleanup::tests::hidden_index_modifications_and_filters_refuse_without_running_driver",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.883,
+    "log": "/tmp/thegn-rolling-host-20260914-results/merge_lifecycle__cleanup__tests__hidden_index_modifications_and_filters_refuse_without_running_driver.log"
+  },
+  {
+    "test": "merge_lifecycle::cleanup::tests::identity_open_rejects_wrong_types_and_symlinks",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.021,
+    "log": "/tmp/thegn-rolling-host-20260914-results/merge_lifecycle__cleanup__tests__identity_open_rejects_wrong_types_and_symlinks.log"
+  },
+  {
+    "test": "merge_lifecycle::cleanup::tests::local_runtime_admission_pins_workspace_selection_and_refuses_persisted_session",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.158,
+    "log": "/tmp/thegn-rolling-host-20260914-results/merge_lifecycle__cleanup__tests__local_runtime_admission_pins_workspace_selection_and_refuses_persisted_session.log"
+  },
+  {
+    "test": "merge_lifecycle::cleanup::tests::local_runtime_admission_refuses_auto_and_unknown_environment",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.224,
+    "log": "/tmp/thegn-rolling-host-20260914-results/merge_lifecycle__cleanup__tests__local_runtime_admission_refuses_auto_and_unknown_environment.log"
+  },
+  {
+    "test": "merge_lifecycle::cleanup::tests::locked_worktree_busy_repository_and_symlink_alias_are_refused",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.611,
+    "log": "/tmp/thegn-rolling-host-20260914-results/merge_lifecycle__cleanup__tests__locked_worktree_busy_repository_and_symlink_alias_are_refused.log"
+  },
+  {
+    "test": "merge_lifecycle::cleanup::tests::named_pipe_identity_open_is_nonblocking_and_refused",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.053,
+    "log": "/tmp/thegn-rolling-host-20260914-results/merge_lifecycle__cleanup__tests__named_pipe_identity_open_is_nonblocking_and_refused.log"
+  },
+  {
+    "test": "merge_lifecycle::cleanup::tests::oci_discovery_is_bounded_conservative_and_never_executes_candidates",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.041,
+    "log": "/tmp/thegn-rolling-host-20260914-results/merge_lifecycle__cleanup__tests__oci_discovery_is_bounded_conservative_and_never_executes_candidates.log"
+  },
+  {
+    "test": "merge_lifecycle::cleanup::tests::private_git_transaction_rejects_a_changed_target_oid",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.878,
+    "log": "/tmp/thegn-rolling-host-20260914-results/merge_lifecycle__cleanup__tests__private_git_transaction_rejects_a_changed_target_oid.log"
+  },
+  {
+    "test": "merge_lifecycle::cleanup::tests::rejects_foreign_main_target_mismatched_and_unregistered_paths",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.8,
+    "log": "/tmp/thegn-rolling-host-20260914-results/merge_lifecycle__cleanup__tests__rejects_foreign_main_target_mismatched_and_unregistered_paths.log"
+  },
+  {
+    "test": "merge_lifecycle::cleanup::tests::symlinked_mutation_lock_and_revoked_final_guard_preserve_files",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 1.126,
+    "log": "/tmp/thegn-rolling-host-20260914-results/merge_lifecycle__cleanup__tests__symlinked_mutation_lock_and_revoked_final_guard_preserve_files.log"
+  },
+  {
+    "test": "merge_lifecycle::tests::checked_land_lifecycle_surfaces_an_unavailable_write",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.213,
+    "log": "/tmp/thegn-rolling-host-20260914-results/merge_lifecycle__tests__checked_land_lifecycle_surfaces_an_unavailable_write.log"
+  },
+  {
+    "test": "merge_lifecycle::tests::dequeue_leaves_user_filed_folder_alone",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.127,
+    "log": "/tmp/thegn-rolling-host-20260914-results/merge_lifecycle__tests__dequeue_leaves_user_filed_folder_alone.log"
+  },
+  {
+    "test": "merge_lifecycle::tests::dequeue_unfiles_from_lifecycle_folder",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.151,
+    "log": "/tmp/thegn-rolling-host-20260914-results/merge_lifecycle__tests__dequeue_unfiles_from_lifecycle_folder.log"
+  },
+  {
+    "test": "merge_lifecycle::tests::enqueue_files_into_merging_folder",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.143,
+    "log": "/tmp/thegn-rolling-host-20260914-results/merge_lifecycle__tests__enqueue_files_into_merging_folder.log"
+  },
+  {
+    "test": "merge_lifecycle::tests::enqueue_registers_unpersisted_worktree_and_files_it",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.183,
+    "log": "/tmp/thegn-rolling-host-20260914-results/merge_lifecycle__tests__enqueue_registers_unpersisted_worktree_and_files_it.log"
+  },
+  {
+    "test": "merge_lifecycle::tests::failure_files_into_needs_attention",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.179,
+    "log": "/tmp/thegn-rolling-host-20260914-results/merge_lifecycle__tests__failure_files_into_needs_attention.log"
+  },
+  {
+    "test": "merge_lifecycle::tests::generic_landed_or_mismatched_commit_cannot_remove_a_worktree",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.182,
+    "log": "/tmp/thegn-rolling-host-20260914-results/merge_lifecycle__tests__generic_landed_or_mismatched_commit_cannot_remove_a_worktree.log"
+  },
+  {
+    "test": "merge_lifecycle::tests::home_worktree_is_never_touched",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.158,
+    "log": "/tmp/thegn-rolling-host-20260914-results/merge_lifecycle__tests__home_worktree_is_never_touched.log"
+  },
+  {
+    "test": "merge_lifecycle::tests::land_in_place_files_into_merged_and_keeps_worktree",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.157,
+    "log": "/tmp/thegn-rolling-host-20260914-results/merge_lifecycle__tests__land_in_place_files_into_merged_and_keeps_worktree.log"
+  },
+  {
+    "test": "merge_lifecycle::tests::land_in_place_off_unfiles_lifecycle_but_not_user_folder",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.171,
+    "log": "/tmp/thegn-rolling-host-20260914-results/merge_lifecycle__tests__land_in_place_off_unfiles_lifecycle_but_not_user_folder.log"
+  },
+  {
+    "test": "merge_lifecycle::tests::landed_detach_removes_worktree_but_keeps_branch",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 2.603,
+    "log": "/tmp/thegn-rolling-host-20260914-results/merge_lifecycle__tests__landed_detach_removes_worktree_but_keeps_branch.log"
+  },
+  {
+    "test": "merge_lifecycle::tests::landed_move_refiles_and_keeps_row",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.171,
+    "log": "/tmp/thegn-rolling-host-20260914-results/merge_lifecycle__tests__landed_move_refiles_and_keeps_row.log"
+  },
+  {
+    "test": "merge_lifecycle::tests::landed_remove_does_not_overlap_an_existing_destroy",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.21,
+    "log": "/tmp/thegn-rolling-host-20260914-results/merge_lifecycle__tests__landed_remove_does_not_overlap_an_existing_destroy.log"
+  },
+  {
+    "test": "merge_lifecycle::tests::landed_remove_keeps_branch_and_explicit_queue_hold",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 2.616,
+    "log": "/tmp/thegn-rolling-host-20260914-results/merge_lifecycle__tests__landed_remove_keeps_branch_and_explicit_queue_hold.log"
+  },
+  {
+    "test": "merge_lifecycle::tests::landed_remove_keeps_git_unregistered_directory",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.354,
+    "log": "/tmp/thegn-rolling-host-20260914-results/merge_lifecycle__tests__landed_remove_keeps_git_unregistered_directory.log"
+  },
+  {
+    "test": "merge_lifecycle::tests::toggle_off_is_inert",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.195,
+    "log": "/tmp/thegn-rolling-host-20260914-results/merge_lifecycle__tests__toggle_off_is_inert.log"
+  },
+  {
+    "test": "merge_lifecycle::tests::vanished_indices_use_only_worker_reported_paths",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.027,
+    "log": "/tmp/thegn-rolling-host-20260914-results/merge_lifecycle__tests__vanished_indices_use_only_worker_reported_paths.log"
+  },
+  {
+    "test": "merge_lifecycle::tests::workspace_repo_path_falls_back_when_no_workspace_row",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.131,
+    "log": "/tmp/thegn-rolling-host-20260914-results/merge_lifecycle__tests__workspace_repo_path_falls_back_when_no_workspace_row.log"
+  },
+  {
+    "test": "merge_lifecycle::tests::workspace_repo_path_prefers_registered_workspace_string",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.15,
+    "log": "/tmp/thegn-rolling-host-20260914-results/merge_lifecycle__tests__workspace_repo_path_prefers_registered_workspace_string.log"
+  },
+  {
+    "test": "merge_sweep::tests::an_empty_report_is_empty_only_with_neither_list",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.031,
+    "log": "/tmp/thegn-rolling-host-20260914-results/merge_sweep__tests__an_empty_report_is_empty_only_with_neither_list.log"
+  },
+  {
+    "test": "merge_sweep::tests::diagnostics_never_emit_terminal_controls_and_are_bounded",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.027,
+    "log": "/tmp/thegn-rolling-host-20260914-results/merge_sweep__tests__diagnostics_never_emit_terminal_controls_and_are_bounded.log"
+  },
+  {
+    "test": "merge_sweep::tests::dirty_conflicted_claim_and_wrong_target_rows_keep_retry_metadata",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.557,
+    "log": "/tmp/thegn-rolling-host-20260914-results/merge_sweep__tests__dirty_conflicted_claim_and_wrong_target_rows_keep_retry_metadata.log"
+  },
+  {
+    "test": "merge_sweep::tests::foreign_cached_repository_is_refused_before_teardown",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.645,
+    "log": "/tmp/thegn-rolling-host-20260914-results/merge_sweep__tests__foreign_cached_repository_is_refused_before_teardown.log"
+  },
+  {
+    "test": "merge_sweep::tests::held_cleanup_survives_refresh_without_repeating_missing_worktree_errors_or_touching_refs",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 2.574,
+    "log": "/tmp/thegn-rolling-host-20260914-results/merge_sweep__tests__held_cleanup_survives_refresh_without_repeating_missing_worktree_errors_or_touching_refs.log"
+  },
+  {
+    "test": "merge_sweep::tests::malformed_remote_cache_refuses_before_hooks_and_preserves_worktree_refs_queue",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.575,
+    "log": "/tmp/thegn-rolling-host-20260914-results/merge_sweep__tests__malformed_remote_cache_refuses_before_hooks_and_preserves_worktree_refs_queue.log"
+  },
+  {
+    "test": "merge_sweep::tests::manual_clear_only_deletes_exact_selected_landed_rows",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.122,
+    "log": "/tmp/thegn-rolling-host-20260914-results/merge_sweep__tests__manual_clear_only_deletes_exact_selected_landed_rows.log"
+  },
+  {
+    "test": "merge_sweep::tests::only_expire_mode_sweeps",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.022,
+    "log": "/tmp/thegn-rolling-host-20260914-results/merge_sweep__tests__only_expire_mode_sweeps.log"
+  },
+  {
+    "test": "merge_sweep::tests::post_admission_unknown_dispatch_stops_removal_after_the_pre_destroy_hook",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 1.304,
+    "log": "/tmp/thegn-rolling-host-20260914-results/merge_sweep__tests__post_admission_unknown_dispatch_stops_removal_after_the_pre_destroy_hook.log"
+  },
+  {
+    "test": "merge_sweep::tests::selected_landed_row_cannot_authorize_requeued_or_revoked_cleanup",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.923,
+    "log": "/tmp/thegn-rolling-host-20260914-results/merge_sweep__tests__selected_landed_row_cannot_authorize_requeued_or_revoked_cleanup.log"
+  },
+  {
+    "test": "merge_sweep::tests::shared_database_collects_only_verified_repository_and_reports_actual_removal",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 2.563,
+    "log": "/tmp/thegn-rolling-host-20260914-results/merge_sweep__tests__shared_database_collects_only_verified_repository_and_reports_actual_removal.log"
+  },
+  {
+    "test": "merge_sweep::tests::unknown_resource_metadata_refuses_before_hooks_and_preserves_worktree_refs_queue",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 2.404,
+    "log": "/tmp/thegn-rolling-host-20260914-results/merge_sweep__tests__unknown_resource_metadata_refuses_before_hooks_and_preserves_worktree_refs_queue.log"
+  },
+  {
+    "test": "monitor::procs_view::tests::a_cyclic_parent_chain_terminates",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.028,
+    "log": "/tmp/thegn-rolling-host-20260914-results/monitor__procs_view__tests__a_cyclic_parent_chain_terminates.log"
+  },
+  {
+    "test": "monitor::procs_view::tests::flat_filter_matches_name_pid_and_owner",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.027,
+    "log": "/tmp/thegn-rolling-host-20260914-results/monitor__procs_view__tests__flat_filter_matches_name_pid_and_owner.log"
+  },
+  {
+    "test": "monitor::procs_view::tests::tied_flat_and_tree_rows_have_stable_pid_order",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.024,
+    "log": "/tmp/thegn-rolling-host-20260914-results/monitor__procs_view__tests__tied_flat_and_tree_rows_have_stable_pid_order.log"
+  },
+  {
+    "test": "monitor::procs_view::tests::tree_filter_keeps_ancestry_of_a_match",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.032,
+    "log": "/tmp/thegn-rolling-host-20260914-results/monitor__procs_view__tests__tree_filter_keeps_ancestry_of_a_match.log"
+  },
+  {
+    "test": "monitor::procs_view::tests::tree_nests_children_and_flags_elided_roots",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.027,
+    "log": "/tmp/thegn-rolling-host-20260914-results/monitor__procs_view__tests__tree_nests_children_and_flags_elided_roots.log"
+  },
+  {
+    "test": "monitor::state::tests::a_configured_default_off_the_ladder_snaps_onto_it",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.029,
+    "log": "/tmp/thegn-rolling-host-20260914-results/monitor__state__tests__a_configured_default_off_the_ladder_snaps_onto_it.log"
+  },
+  {
+    "test": "monitor::state::tests::a_junk_ladder_falls_back_rather_than_disabling_the_keys",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.027,
+    "log": "/tmp/thegn-rolling-host-20260914-results/monitor__state__tests__a_junk_ladder_falls_back_rather_than_disabling_the_keys.log"
+  },
+  {
+    "test": "monitor::state::tests::a_toggle_is_scoped_to_its_own_tab",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.024,
+    "log": "/tmp/thegn-rolling-host-20260914-results/monitor__state__tests__a_toggle_is_scoped_to_its_own_tab.log"
+  },
+  {
+    "test": "monitor::state::tests::an_off_ladder_saved_window_is_kept_not_discarded",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.022,
+    "log": "/tmp/thegn-rolling-host-20260914-results/monitor__state__tests__an_off_ladder_saved_window_is_kept_not_discarded.log"
+  },
+  {
+    "test": "monitor::state::tests::config_defaults_seed_every_tab",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.026,
+    "log": "/tmp/thegn-rolling-host-20260914-results/monitor__state__tests__config_defaults_seed_every_tab.log"
+  },
+  {
+    "test": "monitor::state::tests::prefs_round_trip_through_their_entries",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.034,
+    "log": "/tmp/thegn-rolling-host-20260914-results/monitor__state__tests__prefs_round_trip_through_their_entries.log"
+  },
+  {
+    "test": "monitor::state::tests::the_ladder_is_not_persisted_so_config_edits_still_win",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.019,
+    "log": "/tmp/thegn-rolling-host-20260914-results/monitor__state__tests__the_ladder_is_not_persisted_so_config_edits_still_win.log"
+  },
+  {
+    "test": "monitor::state::tests::the_shipped_default_reaches_twelve_hours",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.022,
+    "log": "/tmp/thegn-rolling-host-20260914-results/monitor__state__tests__the_shipped_default_reaches_twelve_hours.log"
+  },
+  {
+    "test": "monitor::state::tests::the_window_ladder_comes_from_config",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.025,
+    "log": "/tmp/thegn-rolling-host-20260914-results/monitor__state__tests__the_window_ladder_comes_from_config.log"
+  },
+  {
+    "test": "monitor::state::tests::unknown_and_malformed_keys_are_ignored",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.018,
+    "log": "/tmp/thegn-rolling-host-20260914-results/monitor__state__tests__unknown_and_malformed_keys_are_ignored.log"
+  },
+  {
+    "test": "monitor::tabbar::tests::a_bar_that_fits_is_shown_whole",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.015,
+    "log": "/tmp/thegn-rolling-host-20260914-results/monitor__tabbar__tests__a_bar_that_fits_is_shown_whole.log"
+  },
+  {
+    "test": "monitor::tabbar::tests::an_empty_bar_is_an_empty_window",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.016,
+    "log": "/tmp/thegn-rolling-host-20260914-results/monitor__tabbar__tests__an_empty_bar_is_an_empty_window.log"
+  },
+  {
+    "test": "monitor::tabbar::tests::an_oversized_active_tab_still_yields_a_window",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.015,
+    "log": "/tmp/thegn-rolling-host-20260914-results/monitor__tabbar__tests__an_oversized_active_tab_still_yields_a_window.log"
+  },
+  {
+    "test": "monitor::tabbar::tests::digits_cover_ten_tabs_and_stop",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.021,
+    "log": "/tmp/thegn-rolling-host-20260914-results/monitor__tabbar__tests__digits_cover_ten_tabs_and_stop.log"
+  },
+  {
+    "test": "monitor::tabbar::tests::the_window_anchors_to_whichever_end_the_cursor_is_on",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.024,
+    "log": "/tmp/thegn-rolling-host-20260914-results/monitor__tabbar__tests__the_window_anchors_to_whichever_end_the_cursor_is_on.log"
+  },
+  {
+    "test": "monitor::tests::a_short_window_over_thin_history_admits_how_much_it_has",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.116,
+    "log": "/tmp/thegn-rolling-host-20260914-results/monitor__tests__a_short_window_over_thin_history_admits_how_much_it_has.log"
+  },
+  {
+    "test": "monitor::tests::a_tab_vanishing_under_the_user_re_homes_the_cursor",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.027,
+    "log": "/tmp/thegn-rolling-host-20260914-results/monitor__tests__a_tab_vanishing_under_the_user_re_homes_the_cursor.log"
+  },
+  {
+    "test": "monitor::tests::a_tab_with_no_data_on_this_machine_is_hidden",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.032,
+    "log": "/tmp/thegn-rolling-host-20260914-results/monitor__tests__a_tab_with_no_data_on_this_machine_is_hidden.log"
+  },
+  {
+    "test": "monitor::tests::a_wheel_scroll_stops_the_viewport_chasing_until_the_next_key",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.024,
+    "log": "/tmp/thegn-rolling-host-20260914-results/monitor__tests__a_wheel_scroll_stops_the_viewport_chasing_until_the_next_key.log"
+  },
+  {
+    "test": "monitor::tests::a_wide_window_does_not_ask_for_fast_sampling",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.023,
+    "log": "/tmp/thegn-rolling-host-20260914-results/monitor__tests__a_wide_window_does_not_ask_for_fast_sampling.log"
+  },
+  {
+    "test": "monitor::tests::an_unsampled_processes_tab_says_sampling_not_disabled",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.03,
+    "log": "/tmp/thegn-rolling-host-20260914-results/monitor__tests__an_unsampled_processes_tab_says_sampling_not_disabled.log"
+  },
+  {
+    "test": "monitor::tests::close_keys_close_and_modified_keys_pass_through",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.024,
+    "log": "/tmp/thegn-rolling-host-20260914-results/monitor__tests__close_keys_close_and_modified_keys_pass_through.log"
+  },
+  {
+    "test": "monitor::tests::digits_index_the_visible_tabs_not_the_full_list",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.03,
+    "log": "/tmp/thegn-rolling-host-20260914-results/monitor__tests__digits_index_the_visible_tabs_not_the_full_list.log"
+  },
+  {
+    "test": "monitor::tests::disk_clean_confirms_and_queues_an_off_loop_action",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.03,
+    "log": "/tmp/thegn-rolling-host-20260914-results/monitor__tests__disk_clean_confirms_and_queues_an_off_loop_action.log"
+  },
+  {
+    "test": "monitor::tests::every_stat_widget_maps_to_a_tab_that_claims_it_back",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.027,
+    "log": "/tmp/thegn-rolling-host-20260914-results/monitor__tests__every_stat_widget_maps_to_a_tab_that_claims_it_back.log"
+  },
+  {
+    "test": "monitor::tests::every_tab_advertises_pause",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.029,
+    "log": "/tmp/thegn-rolling-host-20260914-results/monitor__tests__every_tab_advertises_pause.log"
+  },
+  {
+    "test": "monitor::tests::every_tab_builds_and_scrolls_without_panicking",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.032,
+    "log": "/tmp/thegn-rolling-host-20260914-results/monitor__tests__every_tab_builds_and_scrolls_without_panicking.log"
+  },
+  {
+    "test": "monitor::tests::every_thermal_sensor_is_listed_not_just_the_hottest",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.111,
+    "log": "/tmp/thegn-rolling-host-20260914-results/monitor__tests__every_thermal_sensor_is_listed_not_just_the_hottest.log"
+  },
+  {
+    "test": "monitor::tests::filter_narrows_the_displayed_rows",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.028,
+    "log": "/tmp/thegn-rolling-host-20260914-results/monitor__tests__filter_narrows_the_displayed_rows.log"
+  },
+  {
+    "test": "monitor::tests::global_keys_stay_global_on_the_processes_tab",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.029,
+    "log": "/tmp/thegn-rolling-host-20260914-results/monitor__tests__global_keys_stay_global_on_the_processes_tab.log"
+  },
+  {
+    "test": "monitor::tests::graph_style_cycles_and_is_scoped_to_the_active_tab",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.026,
+    "log": "/tmp/thegn-rolling-host-20260914-results/monitor__tests__graph_style_cycles_and_is_scoped_to_the_active_tab.log"
+  },
+  {
+    "test": "monitor::tests::has_graphs_matches_what_the_builders_emit",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.038,
+    "log": "/tmp/thegn-rolling-host-20260914-results/monitor__tests__has_graphs_matches_what_the_builders_emit.log"
+  },
+  {
+    "test": "monitor::tests::home_and_end_move_the_cursor_on_a_list_tab",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.024,
+    "log": "/tmp/thegn-rolling-host-20260914-results/monitor__tests__home_and_end_move_the_cursor_on_a_list_tab.log"
+  },
+  {
+    "test": "monitor::tests::opening_at_a_hidden_tab_falls_back_to_a_real_one",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.025,
+    "log": "/tmp/thegn-rolling-host-20260914-results/monitor__tests__opening_at_a_hidden_tab_falls_back_to_a_real_one.log"
+  },
+  {
+    "test": "monitor::tests::passive_process_refresh_follows_identity_after_rank_changes",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.028,
+    "log": "/tmp/thegn-rolling-host-20260914-results/monitor__tests__passive_process_refresh_follows_identity_after_rank_changes.log"
+  },
+  {
+    "test": "monitor::tests::pause_freezes_the_view_and_refresh_becomes_a_no_op",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.172,
+    "log": "/tmp/thegn-rolling-host-20260914-results/monitor__tests__pause_freezes_the_view_and_refresh_becomes_a_no_op.log"
+  },
+  {
+    "test": "monitor::tests::paused_process_refresh_does_not_change_the_displayed_snapshot",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.024,
+    "log": "/tmp/thegn-rolling-host-20260914-results/monitor__tests__paused_process_refresh_does_not_change_the_displayed_snapshot.log"
+  },
+  {
+    "test": "monitor::tests::pausing_is_visible_in_the_chrome",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.095,
+    "log": "/tmp/thegn-rolling-host-20260914-results/monitor__tests__pausing_is_visible_in_the_chrome.log"
+  },
+  {
+    "test": "monitor::tests::pausing_reduces_the_sampling_gate_and_closing_clears_it",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.027,
+    "log": "/tmp/thegn-rolling-host-20260914-results/monitor__tests__pausing_reduces_the_sampling_gate_and_closing_clears_it.log"
+  },
+  {
+    "test": "monitor::tests::per_core_utilization_is_shown",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.111,
+    "log": "/tmp/thegn-rolling-host-20260914-results/monitor__tests__per_core_utilization_is_shown.log"
+  },
+  {
+    "test": "monitor::tests::process_confirmation_keeps_its_identity_while_ranks_change",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.019,
+    "log": "/tmp/thegn-rolling-host-20260914-results/monitor__tests__process_confirmation_keeps_its_identity_while_ranks_change.log"
+  },
+  {
+    "test": "monitor::tests::process_confirmation_refuses_a_reused_or_disappeared_sampled_identity",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.034,
+    "log": "/tmp/thegn-rolling-host-20260914-results/monitor__tests__process_confirmation_refuses_a_reused_or_disappeared_sampled_identity.log"
+  },
+  {
+    "test": "monitor::tests::process_exit_clamps_and_explicit_sort_still_resets_selection",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.027,
+    "log": "/tmp/thegn-rolling-host-20260914-results/monitor__tests__process_exit_clamps_and_explicit_sort_still_resets_selection.log"
+  },
+  {
+    "test": "monitor::tests::process_refresh_does_not_yank_a_manually_scrolled_viewport",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.03,
+    "log": "/tmp/thegn-rolling-host-20260914-results/monitor__tests__process_refresh_does_not_yank_a_manually_scrolled_viewport.log"
+  },
+  {
+    "test": "monitor::tests::process_scanning_is_gated_on_the_tab_the_pause_and_the_config",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.029,
+    "log": "/tmp/thegn-rolling-host-20260914-results/monitor__tests__process_scanning_is_gated_on_the_tab_the_pause_and_the_config.log"
+  },
+  {
+    "test": "monitor::tests::process_table_survives_interleaved_hydration_and_samples",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.026,
+    "log": "/tmp/thegn-rolling-host-20260914-results/monitor__tests__process_table_survives_interleaved_hydration_and_samples.log"
+  },
+  {
+    "test": "monitor::tests::processes_sort_keys_work_and_only_there",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.028,
+    "log": "/tmp/thegn-rolling-host-20260914-results/monitor__tests__processes_sort_keys_work_and_only_there.log"
+  },
+  {
+    "test": "monitor::tests::question_mark_and_f1_ask_for_help",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.028,
+    "log": "/tmp/thegn-rolling-host-20260914-results/monitor__tests__question_mark_and_f1_ask_for_help.log"
+  },
+  {
+    "test": "monitor::tests::reused_process_does_not_inherit_selection_or_signal_escalation",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.025,
+    "log": "/tmp/thegn-rolling-host-20260914-results/monitor__tests__reused_process_does_not_inherit_selection_or_signal_escalation.log"
+  },
+  {
+    "test": "monitor::tests::scale_cycles_per_tab",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.026,
+    "log": "/tmp/thegn-rolling-host-20260914-results/monitor__tests__scale_cycles_per_tab.log"
+  },
+  {
+    "test": "monitor::tests::scrolling_never_retargets_the_destructive_key",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.032,
+    "log": "/tmp/thegn-rolling-host-20260914-results/monitor__tests__scrolling_never_retargets_the_destructive_key.log"
+  },
+  {
+    "test": "monitor::tests::scrolling_reaches_the_last_row_and_stops_there",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.023,
+    "log": "/tmp/thegn-rolling-host-20260914-results/monitor__tests__scrolling_reaches_the_last_row_and_stops_there.log"
+  },
+  {
+    "test": "monitor::tests::selecting_a_container_row_keeps_its_ownership_tint",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.026,
+    "log": "/tmp/thegn-rolling-host-20260914-results/monitor__tests__selecting_a_container_row_keeps_its_ownership_tint.log"
+  },
+  {
+    "test": "monitor::tests::signal_confirms_then_surfaces_failure_never_swallows_it",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.024,
+    "log": "/tmp/thegn-rolling-host-20260914-results/monitor__tests__signal_confirms_then_surfaces_failure_never_swallows_it.log"
+  },
+  {
+    "test": "monitor::tests::slash_opens_the_filter_and_esc_clears_it_without_closing",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.028,
+    "log": "/tmp/thegn-rolling-host-20260914-results/monitor__tests__slash_opens_the_filter_and_esc_clears_it_without_closing.log"
+  },
+  {
+    "test": "monitor::tests::spark_style_shrinks_the_body_and_clamps_the_viewport",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.026,
+    "log": "/tmp/thegn-rolling-host-20260914-results/monitor__tests__spark_style_shrinks_the_body_and_clamps_the_viewport.log"
+  },
+  {
+    "test": "monitor::tests::switching_tabs_records_where_to_reopen",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.028,
+    "log": "/tmp/thegn-rolling-host-20260914-results/monitor__tests__switching_tabs_records_where_to_reopen.log"
+  },
+  {
+    "test": "monitor::tests::t_toggles_tree_grouping",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.029,
+    "log": "/tmp/thegn-rolling-host-20260914-results/monitor__tests__t_toggles_tree_grouping.log"
+  },
+  {
+    "test": "monitor::tests::tab_cycles_the_visible_list_and_wraps",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.026,
+    "log": "/tmp/thegn-rolling-host-20260914-results/monitor__tests__tab_cycles_the_visible_list_and_wraps.log"
+  },
+  {
+    "test": "monitor::tests::tab_indices_match_declaration_order",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.024,
+    "log": "/tmp/thegn-rolling-host-20260914-results/monitor__tests__tab_indices_match_declaration_order.log"
+  },
+  {
+    "test": "monitor::tests::the_active_tab_is_never_clipped_out_of_the_bar",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.026,
+    "log": "/tmp/thegn-rolling-host-20260914-results/monitor__tests__the_active_tab_is_never_clipped_out_of_the_bar.log"
+  },
+  {
+    "test": "monitor::tests::the_box_rect_encloses_what_was_drawn",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.025,
+    "log": "/tmp/thegn-rolling-host-20260914-results/monitor__tests__the_box_rect_encloses_what_was_drawn.log"
+  },
+  {
+    "test": "monitor::tests::the_box_reserves_exactly_the_chrome_rows",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.026,
+    "log": "/tmp/thegn-rolling-host-20260914-results/monitor__tests__the_box_reserves_exactly_the_chrome_rows.log"
+  },
+  {
+    "test": "monitor::tests::the_containers_heading_does_not_claim_foreign_rows",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.022,
+    "log": "/tmp/thegn-rolling-host-20260914-results/monitor__tests__the_containers_heading_does_not_claim_foreign_rows.log"
+  },
+  {
+    "test": "monitor::tests::the_footer_advertises_help_on_every_tab",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.019,
+    "log": "/tmp/thegn-rolling-host-20260914-results/monitor__tests__the_footer_advertises_help_on_every_tab.log"
+  },
+  {
+    "test": "monitor::tests::the_footer_only_advertises_keys_the_tab_has",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.023,
+    "log": "/tmp/thegn-rolling-host-20260914-results/monitor__tests__the_footer_only_advertises_keys_the_tab_has.log"
+  },
+  {
+    "test": "monitor::tests::the_footer_reflects_the_live_toggles",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.092,
+    "log": "/tmp/thegn-rolling-host-20260914-results/monitor__tests__the_footer_reflects_the_live_toggles.log"
+  },
+  {
+    "test": "monitor::tests::the_last_tab_is_reachable_by_its_digit",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.027,
+    "log": "/tmp/thegn-rolling-host-20260914-results/monitor__tests__the_last_tab_is_reachable_by_its_digit.log"
+  },
+  {
+    "test": "monitor::tests::the_processes_tab_explains_itself_before_the_first_sample",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.088,
+    "log": "/tmp/thegn-rolling-host-20260914-results/monitor__tests__the_processes_tab_explains_itself_before_the_first_sample.log"
+  },
+  {
+    "test": "monitor::tests::the_selected_row_is_the_only_one_with_a_selection_background",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.032,
+    "log": "/tmp/thegn-rolling-host-20260914-results/monitor__tests__the_selected_row_is_the_only_one_with_a_selection_background.log"
+  },
+  {
+    "test": "monitor::tests::the_tab_bar_and_footer_are_drawn",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.112,
+    "log": "/tmp/thegn-rolling-host-20260914-results/monitor__tests__the_tab_bar_and_footer_are_drawn.log"
+  },
+  {
+    "test": "monitor::tests::the_viewport_follows_the_row_cursor_down_a_long_list",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.038,
+    "log": "/tmp/thegn-rolling-host-20260914-results/monitor__tests__the_viewport_follows_the_row_cursor_down_a_long_list.log"
+  },
+  {
+    "test": "monitor::tests::window_keys_saturate_rather_than_wrap",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.028,
+    "log": "/tmp/thegn-rolling-host-20260914-results/monitor__tests__window_keys_saturate_rather_than_wrap.log"
+  },
+  {
+    "test": "monitor::tests::zero_beyond_the_visible_tabs_is_a_no_op",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.022,
+    "log": "/tmp/thegn-rolling-host-20260914-results/monitor__tests__zero_beyond_the_visible_tabs_is_a_no_op.log"
+  },
+  {
+    "test": "platform_ratchet_tests::color_literals_stay_in_the_chokepoints",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.765,
+    "log": "/tmp/thegn-rolling-host-20260914-results/platform_ratchet_tests__color_literals_stay_in_the_chokepoints.log"
+  },
+  {
+    "test": "platform_ratchet_tests::glyph_literals_go_through_active_glyphs",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.966,
+    "log": "/tmp/thegn-rolling-host-20260914-results/platform_ratchet_tests__glyph_literals_go_through_active_glyphs.log"
+  },
+  {
+    "test": "platform_ratchet_tests::host_key_literals_stay_in_the_chokepoint",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.692,
+    "log": "/tmp/thegn-rolling-host-20260914-results/platform_ratchet_tests__host_key_literals_stay_in_the_chokepoint.log"
+  },
+  {
+    "test": "platform_ratchet_tests::long_lived_threads_declare_a_qos_class",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.466,
+    "log": "/tmp/thegn-rolling-host-20260914-results/platform_ratchet_tests__long_lived_threads_declare_a_qos_class.log"
+  },
+  {
+    "test": "platform_ratchet_tests::platform_cfgs_live_in_platform_modules",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.403,
+    "log": "/tmp/thegn-rolling-host-20260914-results/platform_ratchet_tests__platform_cfgs_live_in_platform_modules.log"
+  },
+  {
+    "test": "pr_authorship::tests::account_change_and_origin_change_after_preparation_hold",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.281,
+    "log": "/tmp/thegn-rolling-host-20260914-results/pr_authorship__tests__account_change_and_origin_change_after_preparation_hold.log"
+  },
+  {
+    "test": "pr_authorship::tests::fresh_organization_authorship_is_admitted_and_disabled_policy_needs_no_proof",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.242,
+    "log": "/tmp/thegn-rolling-host-20260914-results/pr_authorship__tests__fresh_organization_authorship_is_admitted_and_disabled_policy_needs_no_proof.log"
+  },
+  {
+    "test": "pr_authorship::tests::only_verified_review_completion_can_advance_the_permitted_head",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.293,
+    "log": "/tmp/thegn-rolling-host-20260914-results/pr_authorship__tests__only_verified_review_completion_can_advance_the_permitted_head.log"
+  },
+  {
+    "test": "pr_authorship::tests::persisted_remote_malformed_and_changed_execution_locations_hold_before_proof",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.479,
+    "log": "/tmp/thegn-rolling-host-20260914-results/pr_authorship__tests__persisted_remote_malformed_and_changed_execution_locations_hold_before_proof.log"
+  },
+  {
+    "test": "pr_authorship::tests::unknown_cached_author_local_head_and_selected_provider_are_not_authority",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.259,
+    "log": "/tmp/thegn-rolling-host-20260914-results/pr_authorship__tests__unknown_cached_author_local_head_and_selected_provider_are_not_authority.log"
+  },
+  {
+    "test": "refresh_schedule::tests::coincident_work_is_one_pr_refresh_and_idle_tick_is_none",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.04,
+    "log": "/tmp/thegn-rolling-host-20260914-results/refresh_schedule__tests__coincident_work_is_one_pr_refresh_and_idle_tick_is_none.log"
+  },
+  {
+    "test": "refresh_schedule::tests::model_cadence_cannot_starve_normal_pr_schedule",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.027,
+    "log": "/tmp/thegn-rolling-host-20260914-results/refresh_schedule__tests__model_cadence_cannot_starve_normal_pr_schedule.log"
+  },
+  {
+    "test": "review_handoff::headless::tests::explicit_broader_policy_runs_without_database_or_authorship_prerequisites",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.246,
+    "log": "/tmp/thegn-rolling-host-20260914-results/review_handoff__headless__tests__explicit_broader_policy_runs_without_database_or_authorship_prerequisites.log"
+  },
+  {
+    "test": "review_handoff::headless::tests::foreign_unknown_mixed_pr_and_stale_selected_identity_never_prepare_or_launch",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 1.207,
+    "log": "/tmp/thegn-rolling-host-20260914-results/review_handoff__headless__tests__foreign_unknown_mixed_pr_and_stale_selected_identity_never_prepare_or_launch.log"
+  },
+  {
+    "test": "review_handoff::headless::tests::late_viewer_origin_head_and_worktree_changes_hold_without_touching_owned_rows",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.93,
+    "log": "/tmp/thegn-rolling-host-20260914-results/review_handoff__headless__tests__late_viewer_origin_head_and_worktree_changes_hold_without_touching_owned_rows.log"
+  },
+  {
+    "test": "review_handoff::headless::tests::non_utf8_worktree_cannot_authorize_its_lossy_sibling",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.167,
+    "log": "/tmp/thegn-rolling-host-20260914-results/review_handoff__headless__tests__non_utf8_worktree_cannot_authorize_its_lossy_sibling.log"
+  },
+  {
+    "test": "review_handoff::headless::tests::owned_organization_review_proves_before_preparation_and_launches_once",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.263,
+    "log": "/tmp/thegn-rolling-host-20260914-results/review_handoff__headless__tests__owned_organization_review_proves_before_preparation_and_launches_once.log"
+  },
+  {
+    "test": "review_handoff::headless::tests::persisted_remote_malformed_and_failed_db_never_query_a_provider",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.299,
+    "log": "/tmp/thegn-rolling-host-20260914-results/review_handoff__headless__tests__persisted_remote_malformed_and_failed_db_never_query_a_provider.log"
+  },
+  {
+    "test": "review_handoff::headless::tests::preparation_failure_never_reaches_launch_even_with_valid_authority",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.283,
+    "log": "/tmp/thegn-rolling-host-20260914-results/review_handoff__headless__tests__preparation_failure_never_reaches_launch_even_with_valid_authority.log"
+  },
+  {
+    "test": "review_handoff::headless::tests::selected_url_cannot_normalize_a_foreign_authority_into_the_proof",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.287,
+    "log": "/tmp/thegn-rolling-host-20260914-results/review_handoff__headless__tests__selected_url_cannot_normalize_a_foreign_authority_into_the_proof.log"
+  },
+  {
+    "test": "review_handoff::tests::headless_target_uses_the_resolved_repo_queue_command",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.025,
+    "log": "/tmp/thegn-rolling-host-20260914-results/review_handoff__tests__headless_target_uses_the_resolved_repo_queue_command.log"
+  },
+  {
+    "test": "review_handoff::tests::review_queue_uses_the_active_groups_workspace_overlay",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.027,
+    "log": "/tmp/thegn-rolling-host-20260914-results/review_handoff__tests__review_queue_uses_the_active_groups_workspace_overlay.log"
+  },
+  {
+    "test": "review_handoff::tests::selected_feedback_contains_only_the_selected_thread",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.033,
+    "log": "/tmp/thegn-rolling-host-20260914-results/review_handoff__tests__selected_feedback_contains_only_the_selected_thread.log"
+  }
+]

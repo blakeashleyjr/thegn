@@ -263,6 +263,68 @@ class LiveTests(unittest.TestCase):
         with patch.object(live, "read_small", side_effect=PermissionError), self.assertRaisesRegex(live.Refusal, "Cannot inspect"):
             live.quiescent(self.paths, proc)
 
+    def _namespaced(self, proc, pid, name):
+        """A process whose `status` reads but whose `exe`/`fd` are root-owned.
+
+        This is what a rootless podman/docker container looks like from the
+        host: the real uid is still ours, so the uid filter does not skip it,
+        but the kernel hides `exe` and `fd` behind the user namespace.
+        """
+        process = proc / str(pid)
+        process.mkdir(parents=True)
+        (process / "status").write_text(
+            f"Name:\t{name}\nUid:\t" + "\t".join([str(os.getuid())] * 4) + "\n"
+        )
+        return process
+
+    def test_namespaced_container_does_not_veto_the_upgrade(self):
+        """A rootless container must not refuse an unrelated upgrade.
+
+        Regression: `buildkitd` and `garage` made every `just live` fail with
+        "Cannot inspect process ownership/files", undiagnosably and forever.
+        """
+        proc = self.root / "proc"
+        self._namespaced(proc, 99999991, "buildkitd")
+        self._namespaced(proc, 99999992, "garage")
+
+        def hidden(path, *args, **kwargs):
+            if str(path).endswith("/exe"):
+                raise PermissionError(13, "Permission denied", str(path))
+            return os.readlink(path, *args, **kwargs)
+
+        with patch.object(live.os, "readlink", side_effect=hidden):
+            live.quiescent(self.paths, proc)  # Must not raise.
+
+    def test_namespaced_thegn_is_still_refused_by_name(self):
+        """Hiding `exe` must not smuggle a controller past the check."""
+        proc = self.root / "proc"
+        self._namespaced(proc, 99999993, "thegn")
+
+        def hidden(path, *args, **kwargs):
+            if str(path).endswith("/exe"):
+                raise PermissionError(13, "Permission denied", str(path))
+            return os.readlink(path, *args, **kwargs)
+
+        with patch.object(live.os, "readlink", side_effect=hidden):
+            with self.assertRaisesRegex(live.Refusal, "still running"):
+                live.quiescent(self.paths, proc)
+
+    def test_namespaced_status_without_a_name_is_refused(self):
+        """A hidden process we cannot even name is not waved through."""
+        proc = self.root / "proc"
+        process = proc / "99999994"
+        process.mkdir(parents=True)
+        (process / "status").write_text("Uid:\t" + "\t".join([str(os.getuid())] * 4) + "\n")
+
+        def hidden(path, *args, **kwargs):
+            if str(path).endswith("/exe"):
+                raise PermissionError(13, "Permission denied", str(path))
+            return os.readlink(path, *args, **kwargs)
+
+        with patch.object(live.os, "readlink", side_effect=hidden):
+            with self.assertRaisesRegex(live.Refusal, "no name"):
+                live.quiescent(self.paths, proc)
+
     def test_source_hidden_flags_dirty_and_root_refused(self):
         def answer(argv, **_kwargs):
             if "--show-toplevel" in argv:

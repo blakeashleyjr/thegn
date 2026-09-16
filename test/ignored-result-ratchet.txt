@@ -17,6 +17,11 @@
 # 2026-08: the files added by the recent feature sweep were pinned wholesale to
 # get this gate green again (they landed while `just lint` was red). Their
 # ignores have NOT been reviewed one by one - they are the next burn-down batch.
+#
+# 2026-09-15: net-zero relocation, not new debt - merge_remote.rs's bundle
+# custody moved behind platform/bundle_custody.rs (the platform-cfg ratchet),
+# taking its `Drop`-time best-effort cleanup with it. merge_remote.rs left the
+# list in the same change that platform/bundle_custody.rs joined it.
 
 crates/gtui-app/src/app.rs
 crates/gtui-app/src/engine.rs
@@ -239,7 +244,6 @@ crates/thegn-host/src/media_watch.rs
 crates/thegn-host/src/menu.rs
 crates/thegn-host/src/merge_driver.rs
 crates/thegn-host/src/merge_lifecycle.rs
-crates/thegn-host/src/merge_remote.rs
 crates/thegn-host/src/metrics.rs
 crates/thegn-host/src/model_proxy_daemon.rs
 crates/thegn-host/src/monitor_action.rs
@@ -258,6 +262,7 @@ crates/thegn-host/src/pane_writer.rs
 crates/thegn-host/src/parity.rs
 crates/thegn-host/src/perf.rs
 crates/thegn-host/src/placement_flow.rs
+crates/thegn-host/src/platform/bundle_custody.rs
 crates/thegn-host/src/platform/proc.rs
 crates/thegn-host/src/platform/unix.rs
 crates/thegn-host/src/platform/windows.rs

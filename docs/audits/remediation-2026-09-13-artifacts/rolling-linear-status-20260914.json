@@ -1,0 +1,102 @@
+{
+  "main": "7014a49696a8baa3d2ef36e4186e6bce853a9e4d",
+  "closed": 13,
+  "issues": [
+    {
+      "id": "THE-377",
+      "status": "Done",
+      "url": "https://linear.app/blakeashley/issue/THE-377/make-custom-git-command-templates-safe-against-repository-controlled",
+      "updatedAt": "2026-09-14T17:16:29.883Z"
+    },
+    {
+      "id": "THE-483",
+      "status": "Done",
+      "url": "https://linear.app/blakeashley/issue/THE-483/make-shared-refresh-cadence-conversion-overflow-safe",
+      "updatedAt": "2026-09-14T17:16:31.240Z"
+    },
+    {
+      "id": "THE-591",
+      "status": "Done",
+      "url": "https://linear.app/blakeashley/issue/THE-591/persist-final-merge-outcomes-atomically-without-transiently-requeueing",
+      "updatedAt": "2026-09-14T17:16:32.741Z"
+    },
+    {
+      "id": "THE-593",
+      "status": "Done",
+      "url": "https://linear.app/blakeashley/issue/THE-593/preserve-exact-merge-queue-eligibility-across-sweep-selection-and",
+      "updatedAt": "2026-09-14T17:16:34.557Z"
+    },
+    {
+      "id": "THE-594",
+      "status": "Done",
+      "url": "https://linear.app/blakeashley/issue/THE-594/prevent-automatic-local-worktree-cleanup-from-re-resolving-remote",
+      "updatedAt": "2026-09-14T17:16:35.807Z"
+    },
+    {
+      "id": "THE-595",
+      "status": "Done",
+      "url": "https://linear.app/blakeashley/issue/THE-595/make-fold-discovery-read-only-until-queued-candidates-are-selected-and",
+      "updatedAt": "2026-09-14T17:16:38.040Z"
+    },
+    {
+      "id": "THE-597",
+      "status": "Done",
+      "url": "https://linear.app/blakeashley/issue/THE-597/fail-closed-when-reusable-gate-worktree-locking-or-identity-checks",
+      "updatedAt": "2026-09-14T17:16:39.084Z"
+    },
+    {
+      "id": "THE-600",
+      "status": "Done",
+      "url": "https://linear.app/blakeashley/issue/THE-600/fail-closed-on-malformed-worktree-tenancy-and-dispatch-metadata-during",
+      "updatedAt": "2026-09-14T17:16:40.985Z"
+    },
+    {
+      "id": "THE-606",
+      "status": "Done",
+      "url": "https://linear.app/blakeashley/issue/THE-606/require-canonical-git-history-before-fold-results-and-destructive",
+      "updatedAt": "2026-09-14T17:16:42.109Z"
+    },
+    {
+      "id": "THE-634",
+      "status": "Done",
+      "url": "https://linear.app/blakeashley/issue/THE-634/apply-own-pr-authorization-to-headless-review-feedback-handoffs",
+      "updatedAt": "2026-09-14T17:16:43.469Z"
+    },
+    {
+      "id": "THE-635",
+      "status": "Done",
+      "url": "https://linear.app/blakeashley/issue/THE-635/prevent-ansi-field-styling-in-plain-log-output",
+      "updatedAt": "2026-09-14T17:16:44.972Z"
+    },
+    {
+      "id": "THE-636",
+      "status": "Done",
+      "url": "https://linear.app/blakeashley/issue/THE-636/keep-startup-watchdog-regression-fixtures-off-real-container-backends",
+      "updatedAt": "2026-09-14T17:16:47.113Z"
+    },
+    {
+      "id": "THE-637",
+      "status": "Done",
+      "url": "https://linear.app/blakeashley/issue/THE-637/make-service-git-fixtures-independent-of-user-branch-and-identity",
+      "updatedAt": "2026-09-14T17:16:48.793Z"
+    },
+    {
+      "id": "THE-154",
+      "status": "In Progress",
+      "url": "https://linear.app/blakeashley/issue/THE-154/remove-blocking-resident-plugin-stdin-io-from-the-compositor-and",
+      "updatedAt": "2026-09-14T17:17:10.586Z"
+    },
+    {
+      "id": "THE-545",
+      "status": "In Progress",
+      "url": "https://linear.app/blakeashley/issue/THE-545/authorize-own-pr-automation-by-actual-author-identity-not-repository",
+      "updatedAt": "2026-09-14T17:17:12.150Z"
+    },
+    {
+      "id": "THE-630",
+      "status": "In Progress",
+      "url": "https://linear.app/blakeashley/issue/THE-630/park-and-own-the-process-sampler-while-task-manager-is-hidden-or",
+      "updatedAt": "2026-09-14T16:40:48.652Z"
+    }
+  ]
+}

@@ -33,15 +33,15 @@ passed. Their raw results and the final independent evidence review are included
 
 ## Work held outside main
 
-| Issue | Disposition |
-|---|---|
-| THE-220 | Claim APIs, host/process custody and schema integration remain unfinished. Clock correction has no standalone production caller. |
-| THE-324 | Authority owner, writer/recovery, consumers and schema upgrade/verifier integration remain unfinished. |
-| THE-327 | Lease/manifest substrate remains unwired; generation retirement needs positive settlement, selected runtime and conditional DB reservation. |
-| THE-328 | Protected credential materialization remains dependent on unfinished custody/lifecycle integration. |
-| THE-325 remainder | Credential transport, environment admission and selected-runtime/custody integration remain open. The full candidate would disable configured authentication and was not merged. |
-| THE-319, THE-330 | Admitted before the freeze; no implementation entered this delivery. Further investigation stopped for the drain. |
-| THE-630, THE-631, THE-632 | Performance evidence remains HOLD; the candidate regressed measured timings. No repeat-to-green or new performance build. |
+| Issue                     | Disposition                                                                                                                                                                      |
+| ------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| THE-220                   | Claim APIs, host/process custody and schema integration remain unfinished. Clock correction has no standalone production caller.                                                 |
+| THE-324                   | Authority owner, writer/recovery, consumers and schema upgrade/verifier integration remain unfinished.                                                                           |
+| THE-327                   | Lease/manifest substrate remains unwired; generation retirement needs positive settlement, selected runtime and conditional DB reservation.                                      |
+| THE-328                   | Protected credential materialization remains dependent on unfinished custody/lifecycle integration.                                                                              |
+| THE-325 remainder         | Credential transport, environment admission and selected-runtime/custody integration remain open. The full candidate would disable configured authentication and was not merged. |
+| THE-319, THE-330          | Admitted before the freeze; no implementation entered this delivery. Further investigation stopped for the drain.                                                                |
+| THE-630, THE-631, THE-632 | Performance evidence remains HOLD; the candidate regressed measured timings. No repeat-to-green or new performance build.                                                        |
 
 THE-220, THE-324, THE-325 and THE-327 private candidates are preserved in local
 `maintenance-held-20260915-the-*` branches, with exact refs/commits in the held

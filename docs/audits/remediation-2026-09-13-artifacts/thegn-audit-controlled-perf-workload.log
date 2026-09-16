@@ -1,0 +1,65 @@
+
+running 1 test
+test perf_workloads::controlled_perf_workload ... [
+  {
+    "config_median_us": 3771,
+    "environment_median_us": 215,
+    "rows": 1,
+    "samples": 9,
+    "scope": "synthetic empty-state candidate phases, not full model hydration",
+    "workload": "hydration_config_and_effective_environment"
+  },
+  {
+    "config_median_us": 3507,
+    "environment_median_us": 461,
+    "rows": 8,
+    "samples": 9,
+    "scope": "synthetic empty-state candidate phases, not full model hydration",
+    "workload": "hydration_config_and_effective_environment"
+  },
+  {
+    "config_median_us": 3443,
+    "environment_median_us": 1482,
+    "rows": 32,
+    "samples": 9,
+    "scope": "synthetic empty-state candidate phases, not full model hydration",
+    "workload": "hydration_config_and_effective_environment"
+  },
+  {
+    "bounded_diff_median_us": 46,
+    "cols": 80,
+    "equivalent_cells": true,
+    "resync_changes": 72,
+    "resync_median_us": 310,
+    "rows": 24,
+    "samples": 15,
+    "scope": "actual surface functions; excludes pane compose, writer, terminal and system load",
+    "workload": "bounded_diff_vs_full_resync"
+  },
+  {
+    "bounded_diff_median_us": 101,
+    "cols": 160,
+    "equivalent_cells": true,
+    "resync_changes": 144,
+    "resync_median_us": 1204,
+    "rows": 48,
+    "samples": 15,
+    "scope": "actual surface functions; excludes pane compose, writer, terminal and system load",
+    "workload": "bounded_diff_vs_full_resync"
+  },
+  {
+    "bounded_diff_median_us": 149,
+    "cols": 240,
+    "equivalent_cells": true,
+    "resync_changes": 216,
+    "resync_median_us": 2657,
+    "rows": 72,
+    "samples": 15,
+    "scope": "actual surface functions; excludes pane compose, writer, terminal and system load",
+    "workload": "bounded_diff_vs_full_resync"
+  }
+]
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3252 filtered out; finished in 1.64s
+

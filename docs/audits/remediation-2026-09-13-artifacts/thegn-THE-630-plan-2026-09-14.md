@@ -1,0 +1,121 @@
+# THE-630: owned process sampler and parked idle state
+
+Revised after primary review, September 14, 2026. Scheduling, publication and generation fencing are accepted in principle. Investigation is **In Progress**, not fixed; implementation remains deferred until the current batch lands. No implementation, benchmark, Cargo command or live process action was performed. Source inspected in `/tmp/thegn-audit-remediation-20260913` at `d6a97795af5438ce31b959bb059471b5543dad76`. The scope is the existing process sampler's scheduling, publication and lifecycle; collector families, the process UI, row selection, layout and refresh invalidation remain unchanged.
+
+Issue: https://linear.app/blakeashley/issue/THE-630/park-and-own-the-process-sampler-while-task-manager-is-hidden-or
+
+## Verified current behavior
+
+- `hydrate.rs::spawn_proc_sampler` sleeps 500 ms on every loop, even with the live gate false. It resets the process table on the first observed close, but continues scheduling two timer wakes per second. Its comment claiming no work while closed is inaccurate.
+- The only receiver-closure check is a failed `tx.send` following an enabled scan. A permanently hidden worker never reaches that check. `std::thread::spawn` is infallible at its call site and its `JoinHandle` is discarded.
+- `run.rs` creates an unbounded snapshot channel, passes the receiver into `event_loop`, and changes only an `AtomicBool`. A slow/stalled consumer can accumulate snapshots. A scan that began while visible may publish after a hide/pause request.
+- `monitor::wants_process_scan` already expresses the intended policy: monitor present, Processes tab selected, unpaused, and configuration enabled. Preserve this policy rather than adding another visibility definition.
+- `ProcSampler::sample` is blocking OS collection on the worker. It records a monotonic start time; `MIN_INTERVAL` is two seconds. `reset` clears that time as well as CPU priming and process storage. A new scheduling owner must retain its own minimum-spacing timestamp across reset, or rapid reopen can defeat the two-second bound.
+- THE-628's retained `model.procs` snapshot and stable row identity must survive this change. The absence of a new sample must not become an empty process list.
+- `run` already has a post-`event_loop` shutdown phase for residents. That is the appropriate location for asynchronous process-worker settlement, including early/error returns. It is not permission to join an unfinished thread on the compositor.
+
+The earlier BTOP source comparison is in `docs/audits/btop-parity-and-performance-2026-09-13.md`. No new upstream claims or measured BTOP comparison are needed for this fix. The repository's `test/perf/cpu-sample.sh` supplies an isolated PTY and per-thread Linux CPU measurement, but currently offers idle/steady-workload scenarios, not process-tab visibility or scheduled-wake attribution. Whole-application idle CPU is not proof about this worker.
+
+## Proposed implementation boundary
+
+Extract the worker from `hydrate.rs` into a small `proc_worker.rs` module. Introduce a fallible, session-owned `ProcessWorker` with its `JoinHandle`, a narrow control/consumer handle used by the event loop, and one shared state protected by a short-held mutex and condition variable. Name the worker thread for benchmark attribution. Keep background QoS and the existing collector, pane PID input and daemon PID input.
+
+Use `thread::Builder::spawn -> Result`, with injection at the actual spawn seam for deterministic failure tests. Report failure through the existing status/notification and tracing paths; do not silently fall back to a detached poller or change the user's persisted monitor setting. Start disabled and acknowledge parked initialization. Construct/reset the collector on the worker, never on the UI.
+
+Shared state contains only bounded control and publication data: desired enabled state, stop flag, transition generation, last reset generation acknowledged, worker outcome, and `Option<StampedSnapshot>`. There is no command backlog and no snapshot queue. Transition generation advances only on actual state changes, not every render. Checked generation exhaustion stops/refuses the worker instead of wrapping and accepting an old result.
+
+Suggested API responsibilities (names can change):
+
+- `set_enabled(bool) -> Ticket`: cheap state update, clear obsolete pending snapshot, notify only on an actual transition. It never waits for a collector, joins a thread, or performs OS enumeration.
+- `take_latest() -> Option<ProcSnapshot>`: take at most one sample belonging to the current enabled generation. Hidden/paused or stale generations return none. Taking clears the publication slot under the same lock used for publication.
+- `status()/acknowledgement(ticket)`: report requested versus acknowledged state. Hide/pause acknowledgement means the worker has completed any earlier scan, discarded obsolete results, reset its baseline, finished prior sample-wake delivery, and entered the indefinite-wait state. A request alone is not an acknowledgement.
+- `request_stop()` and async `shutdown_until(deadline)`: terminal cancellation, immediately revoke publication rights and clear pending data, wake the parked worker, then await completion without a blocking UI join. Joining happens only after `JoinHandle::is_finished` proves completion.
+
+Do not hold the shared mutex across collection, sampler reset/drop, PID attribution copying beyond its existing bounded lock, tracing, terminal wake, or a thread join. No worker wait may depend on the consumer draining a full queue.
+
+## Worker state and race rules
+
+1. **Parked:** use `Condvar::wait` in a predicate loop, with no timeout. Repeated unchanged disabled requests perform no notify and allocate no timer. Spurious wakes may recheck the predicate; they never scan, publish or create a periodic wake source. This is a zero _scheduled timer wake_ guarantee, not a claim that the OS cannot spuriously wake a thread.
+2. **Enabled:** compute one deadline from the previous actual scan start plus `MIN_INTERVAL`. Wait interruptibly until that deadline or a control transition. Do not wake every 500 ms to ask whether it is due. Advance from actual starts, with no catch-up burst after a slow scan.
+3. **Collecting:** capture the current generation and collect outside the control lock. Hide, pause, disable and shutdown remain responsive, but cannot interrupt an arbitrary OS collector call. On return, reacquire the lock and publish only if the same generation is still enabled and stop is false.
+4. **Close/reopen during collection:** a false-to-true coalesced state is insufficient. A retained transition/reset generation must force baseline reset even if the worker never observed the intermediate false boolean. Discard the old-generation result, reset on the worker, and use a fresh unprimed sample for the reopened view. Keep the separate last-scan-start timestamp so reopening cannot trigger scans less than two seconds apart. A close already superseded by reopen is reported as superseded, not as a falsely stable parked acknowledgement.
+5. **Publication:** replace the single pending snapshot with the newest value. Pulse the existing terminal waker only when the slot changes from empty to nonempty; replacements are already covered by that outstanding wake. Serialize slot take and replacement, and test both drain-before-publish and publish-before-drain races. Carry the generation into final consumption. There can be one unpublished snapshot plus the bounded in-flight collection; do not describe this as one total allocated snapshot.
+6. **Pause acknowledgement:** complete reset and any prior publication-wake attempt before acknowledging. After acknowledgement, no sample, publish, or scheduled timer work occurs unless a later explicit enable request supersedes it. One explicit transition/completion notification is allowed; no ongoing acknowledgement polling is added.
+7. **Shutdown:** stop is terminal and cannot be undone by a late enable. Once cancellation is stored, results from an in-flight sample are discarded. Shutdown acknowledgement is terminal only after worker cleanup and wake delivery have finished; no publication is possible afterward. Completion/panic state is observable and waiters are notified on every exit path.
+
+The installed locked dependency `termwiz` 0.23.3 uses a nonblocking Unix wake pipe (WouldBlock is coalesced as success) and a Windows event. Its Unix `wake()` also takes a mutex and can panic if poisoned. Keep wake outside the worker-state lock and include its failure/panic in the worker completion guard. Do not promise arbitrary wake/OS calls can always be interrupted.
+
+## Ownership and shutdown deadline
+
+Retain the owner outside `event_loop` and pass only its narrow control/consumer handle into the loop. All ordinary and error exits request stop. Dropping the consumer requests stop even while hidden; worker termination no longer depends on a successful future scan or send.
+
+Reuse the resident lifecycle's existing notification pattern: `tokio::sync::watch` retains the latest outcome, and `timeout_at` applies the application cleanup deadline. Its registry types own resident processes and Tokio task handles, so they cannot directly adopt an OS sampler thread without unrelated generalization. Reuse the pattern and existing host shutdown/error-reporting phase; do not create a new generic supervisor or completion bus. At normal application shutdown, compute one deadline, request both sampler and resident cancellation before waiting, and use that deadline for both receipts rather than adding a sequential three-second delay.
+
+A worker's terminal outcome notification precedes the OS thread's actual return; it is not proof that `join` cannot block. Join only after `is_finished`, with a bounded asynchronous completion-tail check under the same shutdown deadline if necessary. Any such check exists only during shutdown, never while hidden/paused in steady state. A completed thread is joined and classified `Settled`, or `Failed` if it exited through a panic/error. A deadline while collection, wake or final thread return remains blocked returns `HeldCollecting`/`HeldWorker`, never `Settled`.
+
+The need for custody is narrow: `event_loop` error returns normally reach post-loop cleanup, but cancellation/drop of the enclosing `run` future, unwind in startup after the sampler starts, or unwind/cancellation while awaiting cleanup bypass that async phase. A local `JoinHandle` would then detach on Drop. A blocked OS collection has no safe force-stop operation. The existing `bounded_git_probe` reaper owns child processes and intentionally detached pipe tasks, so routing a thread handle there does not provide the required ownership contract. Resident custody likewise accepts a different resource type.
+
+Proposed bounded fallback, still requiring final primary agreement before code: reserve one process-wide sampler ownership slot **before spawning**, then install the exact handle/control state in that reserved slot immediately after a successful spawn, before other fallible startup work. The session owner holds the slot's generation token; Drop only requests stop and marks that generation held. It does not allocate storage or attempt a late transfer into a potentially occupied slot. Normal settlement joins the exact handle and clears the reservation. Spawn failure rolls back its reservation with no worker. The implementation must use an RAII reservation/handle guard so setup panic cannot lose ownership between spawn return and installation.
+
+New-owner admission under the same slot lock refuses `Reserved`, active or unfinished held state. It may retire an already-finished prior generation and then reserve a new one; a completion receipt alone cannot release admission. Generation/token checks prevent an old owner's Drop from cancelling a replacement. Mutex poisoning fails closed for new admission; cancellation/receipt recovery never fabricates settlement. A bounded slot with a retained handle has no timer or reaper thread. This justifies a narrow global only if no existing application-lifetime owner can survive all the listed drop paths. It is not permission to introduce a generic worker registry or detach/forget a handle on an occupied-slot error.
+
+Add exact-path fixtures for enclosing future cancellation before event-loop entry, error return from the event loop, panic after successful spawn, cancellation during shutdown, failed spawn, and attempted second owner while the first collector is held. Require at most one live sampler, retained exact handle on every unfinished path, refusal of new ownership until completion, and harmless Drop of a superseded token. These are final design-review gates, not implemented guarantees.
+
+An RAII completion guard covers initialization, collector/reset panic, wake panic and ordinary return. Poisoned control state transitions conservatively to stopped/failed; recovering a lock must never resume publication under uncertain state. Failure receipts use fixed diagnostics, not panic payloads containing process data. No automatic infinite restart loop is part of this fix.
+
+## Event-loop changes
+
+Replace `proc_rx` and `procs_live` with the narrow worker handle. Continue calculating desired enabled state from `monitor::wants_process_scan`; unchanged per-frame calls are no-ops. Preserve existing pane attribution publication while desired state is enabled.
+
+Reconcile the desired gate before draining a process snapshot, as well as after handling visibility/pause changes, so a just-hidden view cannot consume an old-generation sample. There should be one small shared helper rather than separate inconsistent visibility conditions. Handle generation revocation in the worker API, not by relying on UI call order alone.
+
+Take one latest snapshot per pass. Update `model.procs` only with an admitted current-generation sample, retain prior valid data across hydration and pause, and request repaint only for a surface that consumes the sample. Resuming after a long pause first reports the collector's existing unprimed/warming state and then a meaningful delta after another eligible scan. Preserve paused navigation semantics and the THE-628 row-identity checks.
+
+## Meaningful regression gates
+
+Use a private injected collector, monotonic clock/wait adapter, spawn adapter, and wake recorder around the **same production worker loop**. Pure state-machine tests supplement actual owned-thread tests; they do not replace them. Deterministic collectors expose start/release barriers and sample/reset counts. Test threads have owned teardown/watchdogs so an assertion cannot leave fixtures blocked indefinitely.
+
+| Case                                         | Required observations                                                                                                                                                                                                                                                         |
+| -------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Initial hidden and unchanged hidden requests | Actual worker acknowledges parked; zero collector calls, zero timed-wait registrations and zero sample wakes; repeated setters do not notify. One real native parked window independently measures zero scheduled timer wakes.                                                |
+| Enabled timing and spurious notifications    | First eligible scan starts promptly; next starts at least two seconds later; early/spurious notifications do not start it; a slow scan cannot cause a catch-up burst.                                                                                                         |
+| Pause/hide after a sample                    | Acknowledgement occurs after exactly one baseline reset; advancing synthetic time by hours schedules no timed wait/scan/publish; model retains the frozen valid snapshot.                                                                                                     |
+| Reopen and rapid hide/reopen                 | Long-pause first sample is unprimed, second is primed; start-to-start minimum remains two seconds across reset. Close/reopen while collector is blocked discards its old-generation result and cannot skip baseline reset.                                                    |
+| Slow consumer                                | Repeated admitted samples replace one slot; only empty-to-nonempty pulses wake; final take returns the newest sample. Track live unpublished values and assert maximum one.                                                                                                   |
+| Publish/drain/control races                  | Barrier-test both consumer/publication orderings; stale generation is never consumed; no lost pending sample wake, stale post-pause repaint, or publish after terminal acknowledgement.                                                                                       |
+| Hidden receiver/consumer close               | Parked worker wakes from cancellation and terminates without a scan. Its handle is joined and worker count returns to zero.                                                                                                                                                   |
+| Shutdown during collection                   | Deadline returns Held within the bound; no UI wait/join; owner/handle remains in bounded custody; release the private collector and prove discarded output, terminal acknowledgement and eventual exact join. Repeated stop/enable cannot revive it or create another worker. |
+| Initialization and failure                   | Actual spawn failure produces no worker; initialization/collector/reset/wake panic yields an observable failure and joinable completion; control poison stops safely. No path silently advertises active sampling.                                                            |
+| Integration with monitor/model               | Actual gate helper covers closed/other tab/paused/config-disabled/visible; retained snapshot survives unrelated hydration; pause navigation does not adopt a late sample; reopen receives current generation and preserved selection behavior.                                |
+
+Proposed latency gates: already-parked shutdown acknowledgement below 100 ms in a native test with generous watchdog separate from the assertion; blocked-collector shutdown returns by its supplied deadline plus a small scheduler tolerance; reopen after cooldown starts collection within 100 ms of worker scheduling in the controlled fixture. Do not enforce wall-clock latency in the virtual-clock tests or confuse a fixture deadline with an OS collector termination guarantee.
+
+## Release measurement and acceptance
+
+Before landing, use the same release profile, terminal dimensions, machine and isolated repository for before/after runs. After a documented warm-up and state acknowledgement, record one controlled 120-second window per required steady state (hidden, visible and paused) on each binary. Exercise reopen as a transition within that sequence and in deterministic fixtures; do not add another 120-second steady state or mandatory repetitions. Repeat only the noisy/regressed measurement needed to resolve uncertainty. This is approximately 12 minutes of steady-state observations across before/after, not a default 24-plus-minute repetition requirement. Record the exact source/binary identity, process count, process-worker TID/name, sample-start times, scan duration, per-thread CPU, scheduled timer wake counts, publication/replacement counts and pending high-water mark. No live user's session is controlled by the benchmark.
+
+Measure worker events through an opt-in bounded counters/receipt seam and cross-check Linux thread scheduling/CPU where available. The recorder must not poll the worker or create the wakeups being measured. Existing `cpu-sample.sh` can supply PTY/private-environment setup, but its whole-process ceiling or `/proc` CPU ticks alone cannot prove zero scheduled wakes. Keep production default instrumentation dormant; no new dashboard feature is needed.
+
+- Hidden and paused after acknowledgement: **zero scans, zero scheduled worker timer wakes, zero sample publications** in each observation window. Show worker CPU within measurement resolution; do not round an active poller to “0%” and call it passed.
+- Visible: every start separated by at least two seconds, pending high-water mark at most one; report median/p95 collection CPU and duration. Proposed no-regression gate is at most 10% increase in median worker CPU per scan against the same process fixture, investigated rather than waived if exceeded.
+- Reopened: no stale-generation publication, no across-pause CPU delta, no faster scan burst, and fresh-data delay explained by the remaining two-second cooldown plus measured collection time.
+- Shutdown: zero post-ack publications; ordinary parked shutdown meets the native bound; injected blocked collection yields a truthful held result and retains exact ownership.
+
+Native Windows/macOS scheduling measurements and tests must be identified explicitly as run or pending. Cross-compilation is useful for the std synchronization surface, not evidence of native parking/shutdown latency. Independent primary and adversarial review should inspect the stable implementation and actual receipts before landing or closing THE-630. The current In Progress status records investigation only.
+
+## Remaining decisions before implementation
+
+1. Confirm the narrow reserved custody slot versus an existing application-lifetime owner that demonstrably survives future cancellation and unwind; review reservation installation and second-owner refusal paths before code approval.
+2. Select the existing status/notification call site for startup failure and held cleanup. A fixed failure receipt must not require changing the user's policy or adding a new feature surface.
+3. Agree the test-only clock/wait barriers and dormant release counters sufficient to attribute scheduled wakes without the measurement creating them. Use targeted native repetitions only when a result is noisy or regressed.
+4. Wait for the current batch to land, then create the isolated implementation lane and obtain a stable-code adversarial review. No performance result or completion status is implied by this plan approval.
+
+## Independent plan review conditions
+
+The independent reviewer accepted the plan direction with the following concrete conditions, all accepted by the author. They remain implementation/review obligations, not completed behavior:
+
+- The successful-spawn-to-handle-install guard must retain an already-created handle in its pre-reserved slot even during unwind and slot-mutex poisoning. No allocation, fallible callback or logging may intervene between successful spawn and guarded installation. New admission must still fail closed on poison; recovery for custody is not permission to resume work.
+- Wake failure (`Err`) is terminal and revokes/clears pending publication rights, as does a wake panic. Otherwise an undelivered empty-to-nonempty wake could leave replacements permanently silent. Test both failure forms.
+- Retiring an already-finished prior thread must hold an intermediate reservation/token while joining outside both slot and control mutexes. Another caller cannot acquire the slot during retirement, and an old owner/consumer Drop cannot affect the replacement generation.
+- Deterministic tests inject a private instance of the same slot mechanism. Parallel tests must neither acquire the production global slot nor weaken the real admission invariant.
+- Preserve the snapshot generation through final take. A barrier test must cover wake-in-flight, hide, then reopen: parked acknowledgement waits for that earlier wake attempt and reset, and the older ticket becomes superseded rather than falsely acknowledged parked.

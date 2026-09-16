@@ -1,0 +1,772 @@
+[
+  {
+    "test": "fly::machines::reaper_time_tests::only_exact_single_owned_machine_provides_creation_evidence",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.026,
+    "log": "/tmp/thegn-batch02-svc-final-results/fly__machines__reaper_time_tests__only_exact_single_owned_machine_provides_creation_evidence.log"
+  },
+  {
+    "test": "fly::tests::absent_or_mismatched_reaper_custody_never_reads_inventory_or_admits_cleanup",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.027,
+    "log": "/tmp/thegn-batch02-svc-final-results/fly__tests__absent_or_mismatched_reaper_custody_never_reads_inventory_or_admits_cleanup.log"
+  },
+  {
+    "test": "fly::tests::exact_reaper_custody_reads_once_and_preserves_transient_failure",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.028,
+    "log": "/tmp/thegn-batch02-svc-final-results/fly__tests__exact_reaper_custody_reads_once_and_preserves_transient_failure.log"
+  },
+  {
+    "test": "forge::native::regression_tests::cancelling_token_future_terminates_owned_group",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.231,
+    "log": "/tmp/thegn-batch02-svc-final-results/forge__native__regression_tests__cancelling_token_future_terminates_owned_group.log"
+  },
+  {
+    "test": "forge::native::regression_tests::helper_capacity_stays_reserved_until_ownership_is_released",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-svc-final-results/forge__native__regression_tests__helper_capacity_stays_reserved_until_ownership_is_released.log"
+  },
+  {
+    "test": "forge::native::regression_tests::public_host_validation_precedes_credentials",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.019,
+    "log": "/tmp/thegn-batch02-svc-final-results/forge__native__regression_tests__public_host_validation_precedes_credentials.log"
+  },
+  {
+    "test": "forge::native::regression_tests::reaper_spawn_failure_retains_child_and_capacity",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.01,
+    "log": "/tmp/thegn-batch02-svc-final-results/forge__native__regression_tests__reaper_spawn_failure_retains_child_and_capacity.log"
+  },
+  {
+    "test": "forge::native::regression_tests::sdk_error_classification_drives_the_real_ladder",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.021,
+    "log": "/tmp/thegn-batch02-svc-final-results/forge__native__regression_tests__sdk_error_classification_drives_the_real_ladder.log"
+  },
+  {
+    "test": "forge::native::regression_tests::sdk_graphql_envelopes_fall_through_without_offline_evidence",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.017,
+    "log": "/tmp/thegn-batch02-svc-final-results/forge__native__regression_tests__sdk_graphql_envelopes_fall_through_without_offline_evidence.log"
+  },
+  {
+    "test": "forge::native::regression_tests::timeout_and_transport_failure_feed_native_circuit",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.049,
+    "log": "/tmp/thegn-batch02-svc-final-results/forge__native__regression_tests__timeout_and_transport_failure_feed_native_circuit.log"
+  },
+  {
+    "test": "forge::native::regression_tests::token_helper_success_failure_and_output_bound",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.033,
+    "log": "/tmp/thegn-batch02-svc-final-results/forge__native__regression_tests__token_helper_success_failure_and_output_bound.log"
+  },
+  {
+    "test": "forge::native::regression_tests::token_timeout_kills_descendants_even_after_parent_exit",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.461,
+    "log": "/tmp/thegn-batch02-svc-final-results/forge__native__regression_tests__token_timeout_kills_descendants_even_after_parent_exit.log"
+  },
+  {
+    "test": "forge::native::regression_tests::typed_http_answers_are_not_global_network_failures",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.012,
+    "log": "/tmp/thegn-batch02-svc-final-results/forge__native__regression_tests__typed_http_answers_are_not_global_network_failures.log"
+  },
+  {
+    "test": "forge::native::regression_tests::unknown_wait_ownership_is_reaped_without_group_signal",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.12,
+    "log": "/tmp/thegn-batch02-svc-final-results/forge__native__regression_tests__unknown_wait_ownership_is_reaped_without_group_signal.log"
+  },
+  {
+    "test": "forge::native::tests::graphql_no_pr_node_maps_to_no_pr",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-batch02-svc-final-results/forge__native__tests__graphql_no_pr_node_maps_to_no_pr.log"
+  },
+  {
+    "test": "forge::native::tests::graphql_pr_list_parses_headers",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-svc-final-results/forge__native__tests__graphql_pr_list_parses_headers.log"
+  },
+  {
+    "test": "forge::native::tests::graphql_pr_maps_fields_and_rolls_up_checks",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-svc-final-results/forge__native__tests__graphql_pr_maps_fields_and_rolls_up_checks.log"
+  },
+  {
+    "test": "forge::native::tests::native_branch_resolution_is_local_rev_parse",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.028,
+    "log": "/tmp/thegn-batch02-svc-final-results/forge__native__tests__native_branch_resolution_is_local_rev_parse.log"
+  },
+  {
+    "test": "forge::native::tests::owner_repo_parses_ssh_and_https_forms",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.01,
+    "log": "/tmp/thegn-batch02-svc-final-results/forge__native__tests__owner_repo_parses_ssh_and_https_forms.log"
+  },
+  {
+    "test": "forge::native::tests::token_is_trimmed",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-svc-final-results/forge__native__tests__token_is_trimmed.log"
+  },
+  {
+    "test": "forge::native::tests::token_precedence_prefers_gh_token_then_github_token_then_cli",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-batch02-svc-final-results/forge__native__tests__token_precedence_prefers_gh_token_then_github_token_then_cli.log"
+  },
+  {
+    "test": "forge::tests::auth_failure_is_final",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-svc-final-results/forge__tests__auth_failure_is_final.log"
+  },
+  {
+    "test": "forge::tests::authorship_falls_back_as_one_operation_and_auth_errors_remain_final",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-batch02-svc-final-results/forge__tests__authorship_falls_back_as_one_operation_and_auth_errors_remain_final.log"
+  },
+  {
+    "test": "forge::tests::forge_set_routes_by_host",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.01,
+    "log": "/tmp/thegn-batch02-svc-final-results/forge__tests__forge_set_routes_by_host.log"
+  },
+  {
+    "test": "forge::tests::github_ladder_is_native_over_cli_and_kinds_agree_with_reserved",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-svc-final-results/forge__tests__github_ladder_is_native_over_cli_and_kinds_agree_with_reserved.log"
+  },
+  {
+    "test": "forge::tests::native_answer_wins",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-batch02-svc-final-results/forge__tests__native_answer_wins.log"
+  },
+  {
+    "test": "forge::tests::not_configured_falls_through_to_cli",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-batch02-svc-final-results/forge__tests__not_configured_falls_through_to_cli.log"
+  },
+  {
+    "test": "forge::tests::remote_host_parses_every_url_shape",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-svc-final-results/forge__tests__remote_host_parses_every_url_shape.log"
+  },
+  {
+    "test": "lsp::framing::tests::body_and_buffer_bounds_are_checked_before_append",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.438,
+    "log": "/tmp/thegn-batch02-svc-final-results/lsp__framing__tests__body_and_buffer_bounds_are_checked_before_append.log"
+  },
+  {
+    "test": "lsp::framing::tests::bytewise_header_has_linear_work_and_exact_limit",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.01,
+    "log": "/tmp/thegn-batch02-svc-final-results/lsp__framing__tests__bytewise_header_has_linear_work_and_exact_limit.log"
+  },
+  {
+    "test": "lsp::framing::tests::encode_and_arbitrary_splits",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-batch02-svc-final-results/lsp__framing__tests__encode_and_arbitrary_splits.log"
+  },
+  {
+    "test": "lsp::framing::tests::hostile_full_buffer_sliding_window_cannot_force_repeated_suffix_moves",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.186,
+    "log": "/tmp/thegn-batch02-svc-final-results/lsp__framing__tests__hostile_full_buffer_sliding_window_cannot_force_repeated_suffix_moves.log"
+  },
+  {
+    "test": "lsp::framing::tests::malformed_lengths_and_utf8_are_sticky",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-batch02-svc-final-results/lsp__framing__tests__malformed_lengths_and_utf8_are_sticky.log"
+  },
+  {
+    "test": "lsp::framing::tests::many_tiny_frames_have_linear_moves_and_no_read_after_budget_yield",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.025,
+    "log": "/tmp/thegn-batch02-svc-final-results/lsp__framing__tests__many_tiny_frames_have_linear_moves_and_no_read_after_budget_yield.log"
+  },
+  {
+    "test": "lsp::framing::tests::reader_closes_on_invalid_or_truncated_stream_without_resync",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.01,
+    "log": "/tmp/thegn-batch02-svc-final-results/lsp__framing__tests__reader_closes_on_invalid_or_truncated_stream_without_resync.log"
+  },
+  {
+    "test": "lsp::framing::tests::unterminated_header_fails_at_cap_and_releases_allocation",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.011,
+    "log": "/tmp/thegn-batch02-svc-final-results/lsp__framing__tests__unterminated_header_fails_at_cap_and_releases_allocation.log"
+  },
+  {
+    "test": "lsp::registry::tests::builtins_present_by_default",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-svc-final-results/lsp__registry__tests__builtins_present_by_default.log"
+  },
+  {
+    "test": "lsp::registry::tests::describe_reports_ready_and_missing",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-svc-final-results/lsp__registry__tests__describe_reports_ready_and_missing.log"
+  },
+  {
+    "test": "lsp::registry::tests::empty_command_disables",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-svc-final-results/lsp__registry__tests__empty_command_disables.log"
+  },
+  {
+    "test": "lsp::registry::tests::first_declared_wins_on_collision",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-batch02-svc-final-results/lsp__registry__tests__first_declared_wins_on_collision.log"
+  },
+  {
+    "test": "lsp::registry::tests::language_id_override_and_extension_override",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.011,
+    "log": "/tmp/thegn-batch02-svc-final-results/lsp__registry__tests__language_id_override_and_extension_override.log"
+  },
+  {
+    "test": "lsp::registry::tests::non_builtin_entry_registers_and_resolves",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-svc-final-results/lsp__registry__tests__non_builtin_entry_registers_and_resolves.log"
+  },
+  {
+    "test": "lsp::registry::tests::override_entry_keeps_builtin_extensions_and_language_id",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.037,
+    "log": "/tmp/thegn-batch02-svc-final-results/lsp__registry__tests__override_entry_keeps_builtin_extensions_and_language_id.log"
+  },
+  {
+    "test": "lsp::registry::tests::resolve_key_by_extension",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.01,
+    "log": "/tmp/thegn-batch02-svc-final-results/lsp__registry__tests__resolve_key_by_extension.log"
+  },
+  {
+    "test": "lsp::tests::absent_or_false_provider_is_not_supported",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.006,
+    "log": "/tmp/thegn-batch02-svc-final-results/lsp__tests__absent_or_false_provider_is_not_supported.log"
+  },
+  {
+    "test": "lsp::tests::capabilities_parse_the_bool_or_object_union",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-svc-final-results/lsp__tests__capabilities_parse_the_bool_or_object_union.log"
+  },
+  {
+    "test": "lsp::tests::invalid_framing_closes_lsp_and_fails_pending_without_dispatch",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-batch02-svc-final-results/lsp__tests__invalid_framing_closes_lsp_and_fails_pending_without_dispatch.log"
+  },
+  {
+    "test": "lsp::tests::invalid_framing_rejects_late_concurrent_requests_without_writing",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.016,
+    "log": "/tmp/thegn-batch02-svc-final-results/lsp__tests__invalid_framing_rejects_late_concurrent_requests_without_writing.log"
+  },
+  {
+    "test": "lsp::tests::parse_diagnostics_notification",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-batch02-svc-final-results/lsp__tests__parse_diagnostics_notification.log"
+  },
+  {
+    "test": "lsp::tests::parse_document_symbols_hierarchical",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-svc-final-results/lsp__tests__parse_document_symbols_hierarchical.log"
+  },
+  {
+    "test": "lsp::tests::parse_hover_markup_and_marked_string",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-batch02-svc-final-results/lsp__tests__parse_hover_markup_and_marked_string.log"
+  },
+  {
+    "test": "lsp::tests::parse_location_array_and_link",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-svc-final-results/lsp__tests__parse_location_array_and_link.log"
+  },
+  {
+    "test": "lsp::tests::parse_plain_location",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-svc-final-results/lsp__tests__parse_plain_location.log"
+  },
+  {
+    "test": "lsp::tests::parse_signatures_and_code_actions",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-svc-final-results/lsp__tests__parse_signatures_and_code_actions.log"
+  },
+  {
+    "test": "lsp::tests::parse_symbol_information_flat",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-batch02-svc-final-results/lsp__tests__parse_symbol_information_flat.log"
+  },
+  {
+    "test": "lsp::tests::server_spec_argv_is_command_then_args",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-svc-final-results/lsp__tests__server_spec_argv_is_command_then_args.log"
+  },
+  {
+    "test": "lsp::tests::severity_maps_lsp_scale",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-batch02-svc-final-results/lsp__tests__severity_maps_lsp_scale.log"
+  },
+  {
+    "test": "lsp::tests::symbol_kind_maps_known_and_unknown",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-svc-final-results/lsp__tests__symbol_kind_maps_known_and_unknown.log"
+  },
+  {
+    "test": "lsp::tests::uri_round_trips_path_with_spaces",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-svc-final-results/lsp__tests__uri_round_trips_path_with_spaces.log"
+  },
+  {
+    "test": "lsp::tests::uri_round_trips_plain_path",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-svc-final-results/lsp__tests__uri_round_trips_plain_path.log"
+  },
+  {
+    "test": "plugin::loader::tests::broken_manifest_is_a_check_failure_but_not_a_discovery_failure",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-batch02-svc-final-results/plugin__loader__tests__broken_manifest_is_a_check_failure_but_not_a_discovery_failure.log"
+  },
+  {
+    "test": "plugin::loader::tests::canonical_support_table_drives_the_loader_and_public_docs",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.01,
+    "log": "/tmp/thegn-batch02-svc-final-results/plugin__loader__tests__canonical_support_table_drives_the_loader_and_public_docs.log"
+  },
+  {
+    "test": "plugin::loader::tests::check_flags_missing_command_bad_api_and_duplicates",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.01,
+    "log": "/tmp/thegn-batch02-svc-final-results/plugin__loader__tests__check_flags_missing_command_bad_api_and_duplicates.log"
+  },
+  {
+    "test": "plugin::loader::tests::disabled_specs_are_listed_but_not_check_failures",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.011,
+    "log": "/tmp/thegn-batch02-svc-final-results/plugin__loader__tests__disabled_specs_are_listed_but_not_check_failures.log"
+  },
+  {
+    "test": "plugin::loader::tests::discovers_config_then_directory_plugins",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.011,
+    "log": "/tmp/thegn-batch02-svc-final-results/plugin__loader__tests__discovers_config_then_directory_plugins.log"
+  },
+  {
+    "test": "plugin::loader::tests::unsupported_extension_point_is_reported",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.011,
+    "log": "/tmp/thegn-batch02-svc-final-results/plugin__loader__tests__unsupported_extension_point_is_reported.log"
+  },
+  {
+    "test": "plugin::platform::unix::tests::resident_linux_exit_notice_has_no_idle_wakes_and_retains_identity",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.072,
+    "log": "/tmp/thegn-batch02-svc-final-results/plugin__platform__unix__tests__resident_linux_exit_notice_has_no_idle_wakes_and_retains_identity.log"
+  },
+  {
+    "test": "plugin::platform::unix::tests::resident_unix_consuming_wait_identity_loss_forbids_later_signals",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.011,
+    "log": "/tmp/thegn-batch02-svc-final-results/plugin__platform__unix__tests__resident_unix_consuming_wait_identity_loss_forbids_later_signals.log"
+  },
+  {
+    "test": "plugin::platform::unix::tests::resident_unix_final_process_drop_terminates_owned_fixture_without_blocking",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-batch02-svc-final-results/plugin__platform__unix__tests__resident_unix_final_process_drop_terminates_owned_fixture_without_blocking.log"
+  },
+  {
+    "test": "plugin::platform::unix::tests::resident_unix_group_result_always_terminates_exact_owned_leader",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-batch02-svc-final-results/plugin__platform__unix__tests__resident_unix_group_result_always_terminates_exact_owned_leader.log"
+  },
+  {
+    "test": "plugin::proc::tests::a_hung_plugin_is_killed_at_its_timeout",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.309,
+    "log": "/tmp/thegn-batch02-svc-final-results/plugin__proc__tests__a_hung_plugin_is_killed_at_its_timeout.log"
+  },
+  {
+    "test": "plugin::proc::tests::a_missing_program_is_a_spawn_error",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.01,
+    "log": "/tmp/thegn-batch02-svc-final-results/plugin__proc__tests__a_missing_program_is_a_spawn_error.log"
+  },
+  {
+    "test": "plugin::proc::tests::a_nonzero_exit_carries_the_stderr_tail",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.058,
+    "log": "/tmp/thegn-batch02-svc-final-results/plugin__proc__tests__a_nonzero_exit_carries_the_stderr_tail.log"
+  },
+  {
+    "test": "plugin::proc::tests::a_plugin_that_writes_a_lot_of_stderr_does_not_deadlock",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.05,
+    "log": "/tmp/thegn-batch02-svc-final-results/plugin__proc__tests__a_plugin_that_writes_a_lot_of_stderr_does_not_deadlock.log"
+  },
+  {
+    "test": "plugin::proc::tests::a_verb_with_no_params_is_accepted",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.032,
+    "log": "/tmp/thegn-batch02-svc-final-results/plugin__proc__tests__a_verb_with_no_params_is_accepted.log"
+  },
+  {
+    "test": "plugin::proc::tests::an_empty_command_is_rejected",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-svc-final-results/plugin__proc__tests__an_empty_command_is_rejected.log"
+  },
+  {
+    "test": "plugin::proc::tests::blank_lines_are_ignored",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.046,
+    "log": "/tmp/thegn-batch02-svc-final-results/plugin__proc__tests__blank_lines_are_ignored.log"
+  },
+  {
+    "test": "plugin::proc::tests::errors_render_readably",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-svc-final-results/plugin__proc__tests__errors_render_readably.log"
+  },
+  {
+    "test": "plugin::proc::tests::inherited_git_state_is_scrubbed",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.037,
+    "log": "/tmp/thegn-batch02-svc-final-results/plugin__proc__tests__inherited_git_state_is_scrubbed.log"
+  },
+  {
+    "test": "plugin::proc::tests::output_is_capped_rather_than_buffered_without_limit",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.238,
+    "log": "/tmp/thegn-batch02-svc-final-results/plugin__proc__tests__output_is_capped_rather_than_buffered_without_limit.log"
+  },
+  {
+    "test": "plugin::proc::tests::reads_newline_delimited_messages_in_order",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.028,
+    "log": "/tmp/thegn-batch02-svc-final-results/plugin__proc__tests__reads_newline_delimited_messages_in_order.log"
+  },
+  {
+    "test": "plugin::proc::tests::stdin_is_closed_so_a_reading_plugin_gets_eof",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.03,
+    "log": "/tmp/thegn-batch02-svc-final-results/plugin__proc__tests__stdin_is_closed_so_a_reading_plugin_gets_eof.log"
+  },
+  {
+    "test": "plugin::proc::tests::stray_non_json_output_is_kept_as_junk_not_silently_dropped",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.028,
+    "log": "/tmp/thegn-batch02-svc-final-results/plugin__proc__tests__stray_non_json_output_is_kept_as_junk_not_silently_dropped.log"
+  },
+  {
+    "test": "plugin::proc::tests::the_environment_is_passed_through",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.029,
+    "log": "/tmp/thegn-batch02-svc-final-results/plugin__proc__tests__the_environment_is_passed_through.log"
+  },
+  {
+    "test": "plugin::provider::tests::issue_ops_round_trip_through_a_scripted_plugin",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.044,
+    "log": "/tmp/thegn-batch02-svc-final-results/plugin__provider__tests__issue_ops_round_trip_through_a_scripted_plugin.log"
+  },
+  {
+    "test": "plugin::provider::tests::late_and_unknown_responses_are_reported_unroutable",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.036,
+    "log": "/tmp/thegn-batch02-svc-final-results/plugin__provider__tests__late_and_unknown_responses_are_reported_unroutable.log"
+  },
+  {
+    "test": "plugin::provider::tests::omitted_caps_refuse_optional_ops_without_a_bridge_round_trip",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.012,
+    "log": "/tmp/thegn-batch02-svc-final-results/plugin__provider__tests__omitted_caps_refuse_optional_ops_without_a_bridge_round_trip.log"
+  },
+  {
+    "test": "plugin::provider::tests::resident_eof_fails_pending_calls_without_waiting_for_rpc_deadline",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.036,
+    "log": "/tmp/thegn-batch02-svc-final-results/plugin__provider__tests__resident_eof_fails_pending_calls_without_waiting_for_rpc_deadline.log"
+  },
+  {
+    "test": "plugin::provider::tests::resident_final_reply_before_exit_is_delivered_and_late_call_is_closed",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.014,
+    "log": "/tmp/thegn-batch02-svc-final-results/plugin__provider__tests__resident_final_reply_before_exit_is_delivered_and_late_call_is_closed.log"
+  },
+  {
+    "test": "plugin::provider::tests::resident_old_session_cannot_route_into_replacement_bridge",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-svc-final-results/plugin__provider__tests__resident_old_session_cannot_route_into_replacement_bridge.log"
+  },
+  {
+    "test": "plugin::provider::tests::timeout_and_dead_session_degrade_to_errors",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.31,
+    "log": "/tmp/thegn-batch02-svc-final-results/plugin__provider__tests__timeout_and_dead_session_degrade_to_errors.log"
+  },
+  {
+    "test": "plugin::session::admission::lifecycle_tests::resident_natural_close_escalation_drains_pending_hooks_once",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-svc-final-results/plugin__session__admission__lifecycle_tests__resident_natural_close_escalation_drains_pending_hooks_once.log"
+  },
+  {
+    "test": "plugin::session::admission::lifecycle_tests::resident_subscriber_panic_cannot_abort_closure_or_other_subscribers",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.01,
+    "log": "/tmp/thegn-batch02-svc-final-results/plugin__session__admission__lifecycle_tests__resident_subscriber_panic_cannot_abort_closure_or_other_subscribers.log"
+  },
+  {
+    "test": "plugin::session::admission::tests::resident_admission_is_fifo_count_and_byte_bounded",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.051,
+    "log": "/tmp/thegn-batch02-svc-final-results/plugin__session__admission__tests__resident_admission_is_fifo_count_and_byte_bounded.log"
+  },
+  {
+    "test": "plugin::session::admission::tests::resident_final_newline_does_not_double_large_json_allocation",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.097,
+    "log": "/tmp/thegn-batch02-svc-final-results/plugin__session__admission__tests__resident_final_newline_does_not_double_large_json_allocation.log"
+  },
+  {
+    "test": "plugin::session::admission::tests::resident_nearly_full_queue_caps_json_work_before_serialization",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.054,
+    "log": "/tmp/thegn-batch02-svc-final-results/plugin__session__admission__tests__resident_nearly_full_queue_caps_json_work_before_serialization.log"
+  },
+  {
+    "test": "plugin::session::admission::tests::resident_serialization_bounds_before_growth_and_preserves_json",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.139,
+    "log": "/tmp/thegn-batch02-svc-final-results/plugin__session__admission__tests__resident_serialization_bounds_before_growth_and_preserves_json.log"
+  },
+  {
+    "test": "plugin::session::tests::resident_callback_panic_keeps_custody_and_closes_transport",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.013,
+    "log": "/tmp/thegn-batch02-svc-final-results/plugin__session__tests__resident_callback_panic_keeps_custody_and_closes_transport.log"
+  },
+  {
+    "test": "plugin::session::tests::resident_cancelled_join_waiter_retains_handle_and_global_deadline",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.101,
+    "log": "/tmp/thegn-batch02-svc-final-results/plugin__session__tests__resident_cancelled_join_waiter_retains_handle_and_global_deadline.log"
+  },
+  {
+    "test": "plugin::session::tests::resident_failed_spawn_releases_admission_and_settled_identity_restarts",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.016,
+    "log": "/tmp/thegn-batch02-svc-final-results/plugin__session__tests__resident_failed_spawn_releases_admission_and_settled_identity_restarts.log"
+  },
+  {
+    "test": "plugin::session::tests::resident_nonreading_stdin_never_blocks_admission_or_shutdown",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.03,
+    "log": "/tmp/thegn-batch02-svc-final-results/plugin__session__tests__resident_nonreading_stdin_never_blocks_admission_or_shutdown.log"
+  },
+  {
+    "test": "plugin::session::tests::resident_owner_abort_before_first_poll_retains_custody_for_cleanup",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.013,
+    "log": "/tmp/thegn-batch02-svc-final-results/plugin__session__tests__resident_owner_abort_before_first_poll_retains_custody_for_cleanup.log"
+  },
+  {
+    "test": "plugin::session::tests::resident_shutdown_during_spawn_registration_does_not_panic_or_lose_child",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.051,
+    "log": "/tmp/thegn-batch02-svc-final-results/plugin__session__tests__resident_shutdown_during_spawn_registration_does_not_panic_or_lose_child.log"
+  },
+  {
+    "test": "plugin::session::tests::resident_shutdown_is_concurrent_idempotent_and_cancellation_safe",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.039,
+    "log": "/tmp/thegn-batch02-svc-final-results/plugin__session__tests__resident_shutdown_is_concurrent_idempotent_and_cancellation_safe.log"
+  },
+  {
+    "test": "plugin::session::tests::resident_stdout_eof_while_alive_closes_and_reaps",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.061,
+    "log": "/tmp/thegn-batch02-svc-final-results/plugin__session__tests__resident_stdout_eof_while_alive_closes_and_reaps.log"
+  },
+  {
+    "test": "plugin::session::tests::responses_are_classified_and_kill_delivers_exit",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.018,
+    "log": "/tmp/thegn-batch02-svc-final-results/plugin__session__tests__responses_are_classified_and_kill_delivers_exit.log"
+  },
+  {
+    "test": "plugin::session::tests::round_trips_a_callback_and_classifies_lines",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.015,
+    "log": "/tmp/thegn-batch02-svc-final-results/plugin__session__tests__round_trips_a_callback_and_classifies_lines.log"
+  },
+  {
+    "test": "plugin::session::tests::writes_to_a_dead_session_error",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.013,
+    "log": "/tmp/thegn-batch02-svc-final-results/plugin__session__tests__writes_to_a_dead_session_error.log"
+  },
+  {
+    "test": "vps::digitalocean::tests::unknown_and_future_provider_creation_times_never_authorize_reaping",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-svc-final-results/vps__digitalocean__tests__unknown_and_future_provider_creation_times_never_authorize_reaping.log"
+  },
+  {
+    "test": "vps::hetzner::tests::unknown_and_future_provider_creation_times_never_authorize_reaping",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-svc-final-results/vps__hetzner__tests__unknown_and_future_provider_creation_times_never_authorize_reaping.log"
+  }
+]

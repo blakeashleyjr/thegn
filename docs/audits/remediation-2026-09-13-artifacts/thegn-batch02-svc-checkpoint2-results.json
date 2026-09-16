@@ -1,0 +1,275 @@
+[
+  {
+    "test": "forge::tests::auth_failure_is_final",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.019,
+    "log": "/tmp/thegn-batch02-svc-checkpoint2-results/forge__tests__auth_failure_is_final.log"
+  },
+  {
+    "test": "forge::tests::authorship_falls_back_as_one_operation_and_auth_errors_remain_final",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.019,
+    "log": "/tmp/thegn-batch02-svc-checkpoint2-results/forge__tests__authorship_falls_back_as_one_operation_and_auth_errors_remain_final.log"
+  },
+  {
+    "test": "forge::tests::forge_set_routes_by_host",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.029,
+    "log": "/tmp/thegn-batch02-svc-checkpoint2-results/forge__tests__forge_set_routes_by_host.log"
+  },
+  {
+    "test": "forge::tests::github_ladder_is_native_over_cli_and_kinds_agree_with_reserved",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.017,
+    "log": "/tmp/thegn-batch02-svc-checkpoint2-results/forge__tests__github_ladder_is_native_over_cli_and_kinds_agree_with_reserved.log"
+  },
+  {
+    "test": "forge::tests::native_answer_wins",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-batch02-svc-checkpoint2-results/forge__tests__native_answer_wins.log"
+  },
+  {
+    "test": "forge::tests::not_configured_falls_through_to_cli",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-batch02-svc-checkpoint2-results/forge__tests__not_configured_falls_through_to_cli.log"
+  },
+  {
+    "test": "forge::tests::remote_host_parses_every_url_shape",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.012,
+    "log": "/tmp/thegn-batch02-svc-checkpoint2-results/forge__tests__remote_host_parses_every_url_shape.log"
+  },
+  {
+    "test": "lsp::framing::tests::body_and_buffer_bounds_are_checked_before_append",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.289,
+    "log": "/tmp/thegn-batch02-svc-checkpoint2-results/lsp__framing__tests__body_and_buffer_bounds_are_checked_before_append.log"
+  },
+  {
+    "test": "lsp::framing::tests::bytewise_header_has_linear_work_and_exact_limit",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.016,
+    "log": "/tmp/thegn-batch02-svc-checkpoint2-results/lsp__framing__tests__bytewise_header_has_linear_work_and_exact_limit.log"
+  },
+  {
+    "test": "lsp::framing::tests::encode_and_arbitrary_splits",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.014,
+    "log": "/tmp/thegn-batch02-svc-checkpoint2-results/lsp__framing__tests__encode_and_arbitrary_splits.log"
+  },
+  {
+    "test": "lsp::framing::tests::hostile_full_buffer_sliding_window_cannot_force_repeated_suffix_moves",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.113,
+    "log": "/tmp/thegn-batch02-svc-checkpoint2-results/lsp__framing__tests__hostile_full_buffer_sliding_window_cannot_force_repeated_suffix_moves.log"
+  },
+  {
+    "test": "lsp::framing::tests::malformed_lengths_and_utf8_are_sticky",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-svc-checkpoint2-results/lsp__framing__tests__malformed_lengths_and_utf8_are_sticky.log"
+  },
+  {
+    "test": "lsp::framing::tests::many_tiny_frames_have_linear_moves_and_no_read_after_budget_yield",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.029,
+    "log": "/tmp/thegn-batch02-svc-checkpoint2-results/lsp__framing__tests__many_tiny_frames_have_linear_moves_and_no_read_after_budget_yield.log"
+  },
+  {
+    "test": "lsp::framing::tests::reader_closes_on_invalid_or_truncated_stream_without_resync",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-batch02-svc-checkpoint2-results/lsp__framing__tests__reader_closes_on_invalid_or_truncated_stream_without_resync.log"
+  },
+  {
+    "test": "lsp::framing::tests::unterminated_header_fails_at_cap_and_releases_allocation",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.01,
+    "log": "/tmp/thegn-batch02-svc-checkpoint2-results/lsp__framing__tests__unterminated_header_fails_at_cap_and_releases_allocation.log"
+  },
+  {
+    "test": "lsp::registry::tests::builtins_present_by_default",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-svc-checkpoint2-results/lsp__registry__tests__builtins_present_by_default.log"
+  },
+  {
+    "test": "lsp::registry::tests::describe_reports_ready_and_missing",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-svc-checkpoint2-results/lsp__registry__tests__describe_reports_ready_and_missing.log"
+  },
+  {
+    "test": "lsp::registry::tests::empty_command_disables",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.01,
+    "log": "/tmp/thegn-batch02-svc-checkpoint2-results/lsp__registry__tests__empty_command_disables.log"
+  },
+  {
+    "test": "lsp::registry::tests::first_declared_wins_on_collision",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.011,
+    "log": "/tmp/thegn-batch02-svc-checkpoint2-results/lsp__registry__tests__first_declared_wins_on_collision.log"
+  },
+  {
+    "test": "lsp::registry::tests::language_id_override_and_extension_override",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-batch02-svc-checkpoint2-results/lsp__registry__tests__language_id_override_and_extension_override.log"
+  },
+  {
+    "test": "lsp::registry::tests::non_builtin_entry_registers_and_resolves",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-batch02-svc-checkpoint2-results/lsp__registry__tests__non_builtin_entry_registers_and_resolves.log"
+  },
+  {
+    "test": "lsp::registry::tests::override_entry_keeps_builtin_extensions_and_language_id",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-svc-checkpoint2-results/lsp__registry__tests__override_entry_keeps_builtin_extensions_and_language_id.log"
+  },
+  {
+    "test": "lsp::registry::tests::resolve_key_by_extension",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-batch02-svc-checkpoint2-results/lsp__registry__tests__resolve_key_by_extension.log"
+  },
+  {
+    "test": "lsp::tests::absent_or_false_provider_is_not_supported",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-svc-checkpoint2-results/lsp__tests__absent_or_false_provider_is_not_supported.log"
+  },
+  {
+    "test": "lsp::tests::capabilities_parse_the_bool_or_object_union",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-batch02-svc-checkpoint2-results/lsp__tests__capabilities_parse_the_bool_or_object_union.log"
+  },
+  {
+    "test": "lsp::tests::invalid_framing_closes_lsp_and_fails_pending_without_dispatch",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.013,
+    "log": "/tmp/thegn-batch02-svc-checkpoint2-results/lsp__tests__invalid_framing_closes_lsp_and_fails_pending_without_dispatch.log"
+  },
+  {
+    "test": "lsp::tests::invalid_framing_rejects_late_concurrent_requests_without_writing",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-batch02-svc-checkpoint2-results/lsp__tests__invalid_framing_rejects_late_concurrent_requests_without_writing.log"
+  },
+  {
+    "test": "lsp::tests::parse_diagnostics_notification",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-svc-checkpoint2-results/lsp__tests__parse_diagnostics_notification.log"
+  },
+  {
+    "test": "lsp::tests::parse_document_symbols_hierarchical",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-svc-checkpoint2-results/lsp__tests__parse_document_symbols_hierarchical.log"
+  },
+  {
+    "test": "lsp::tests::parse_hover_markup_and_marked_string",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-svc-checkpoint2-results/lsp__tests__parse_hover_markup_and_marked_string.log"
+  },
+  {
+    "test": "lsp::tests::parse_location_array_and_link",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-svc-checkpoint2-results/lsp__tests__parse_location_array_and_link.log"
+  },
+  {
+    "test": "lsp::tests::parse_plain_location",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-svc-checkpoint2-results/lsp__tests__parse_plain_location.log"
+  },
+  {
+    "test": "lsp::tests::parse_signatures_and_code_actions",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-svc-checkpoint2-results/lsp__tests__parse_signatures_and_code_actions.log"
+  },
+  {
+    "test": "lsp::tests::parse_symbol_information_flat",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-batch02-svc-checkpoint2-results/lsp__tests__parse_symbol_information_flat.log"
+  },
+  {
+    "test": "lsp::tests::server_spec_argv_is_command_then_args",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-svc-checkpoint2-results/lsp__tests__server_spec_argv_is_command_then_args.log"
+  },
+  {
+    "test": "lsp::tests::severity_maps_lsp_scale",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-svc-checkpoint2-results/lsp__tests__severity_maps_lsp_scale.log"
+  },
+  {
+    "test": "lsp::tests::symbol_kind_maps_known_and_unknown",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-svc-checkpoint2-results/lsp__tests__symbol_kind_maps_known_and_unknown.log"
+  },
+  {
+    "test": "lsp::tests::uri_round_trips_path_with_spaces",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-svc-checkpoint2-results/lsp__tests__uri_round_trips_path_with_spaces.log"
+  },
+  {
+    "test": "lsp::tests::uri_round_trips_plain_path",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-batch02-svc-checkpoint2-results/lsp__tests__uri_round_trips_plain_path.log"
+  }
+]

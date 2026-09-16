@@ -10,6 +10,7 @@
 //! host) so `gh` auto-detects the repo from its remote.
 
 pub use crate::forge::ForgeError as GhError;
+use crate::forge::checkout::{ForgeCheckoutScope, checkout_scope, checkout_scope_for_branch};
 use crate::forge::model::*;
 use crate::remote::GitLoc;
 use serde::Deserialize;
@@ -121,13 +122,27 @@ fn pr_status_of(loc: &GitLoc, number: Option<u64>) -> PrPanel {
 
 /// `gh pr view [<n>] --json …` as a `Result` — the forge-trait shape.
 pub fn pr_status_raw(loc: &GitLoc, number: Option<u64>) -> Result<PrStatus, GhError> {
-    let num = number.map(|n| n.to_string());
-    let mut args: Vec<&str> = vec!["pr", "view"];
-    if let Some(n) = num.as_deref() {
-        args.push(n);
+    // Name the PR explicitly. A bare `gh pr view` resolves it through the
+    // branch's push/upstream config, which can land on ANOTHER branch's PR
+    // (e.g. a worktree branch auto-tracking `origin/main`).
+    let (selector, scope) = match number {
+        // The PR queue can ask about a number from a location with no
+        // checked-out branch. Keep that established path rooted at origin;
+        // branch-scoped calls below carry the complete captured scope.
+        Some(n) => (n.to_string(), Some(gh_repo_scope_origin(loc)?)),
+        None => {
+            let checkout = checkout_scope(loc)?;
+            let number = branch_pr_number(loc, &checkout)?;
+            (number.to_string(), Some(scope_for_checkout(&checkout)?))
+        }
+    };
+    let mut args: Vec<String> = vec!["pr".into(), "view".into(), selector];
+    if let Some(scope) = &scope {
+        args.extend(["--repo".into(), scope.clone()]);
     }
-    args.extend_from_slice(&["--json", PR_FIELDS]);
-    let json = gh_out(loc, &args)?;
+    args.extend(["--json".into(), PR_FIELDS.into()]);
+    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    let json = gh_out(loc, &argv)?;
     serde_json::from_str::<PrStatus>(&json).map_err(|e| GhError::Other(format!("parse error: {e}")))
 }
 
@@ -161,19 +176,36 @@ pub fn pr_status_with_threads(loc: &GitLoc, number: u64) -> PrPanel {
 /// The repo's open PRs, one header per branch
 /// (`gh pr list --json … --limit <n>`).
 pub fn pr_list(loc: &GitLoc, limit: usize) -> Result<Vec<PrHeader>, GhError> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
     let limit = limit.to_string();
-    let json = gh_out(
-        loc,
-        &[
-            "pr",
-            "list",
-            "--json",
-            "number,headRefName,state,url,isDraft",
-            "--limit",
-            &limit,
-        ],
-    )?;
-    Ok(parse_pr_headers(&json))
+    let origin = origin_identity(loc)?;
+    let mut args = vec![
+        "pr".to_string(),
+        "list".to_string(),
+        "--json".to_string(),
+        "number,headRefName,state,url,isDraft".to_string(),
+        "--limit".to_string(),
+        limit,
+    ];
+    let scope =
+        scope_for_identity(&origin).ok_or(GhError::NotConfigured("origin repository scope"))?;
+    args.extend(["--repo".to_string(), scope]);
+    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    let json = gh_out(loc, &argv)?;
+    let rows: Vec<PrHeader> = serde_json::from_str(&json)
+        .map_err(|_| GhError::NotConfigured("malformed gh PR list response"))?;
+    if rows.iter().any(|row| {
+        row.number == 0
+            || row.head_ref.is_empty()
+            || repo_identity_from_pr_url(&row.url).is_none_or(|identity| !identity.matches(&origin))
+    }) {
+        return Err(GhError::NotConfigured(
+            "PR list response identity is malformed",
+        ));
+    }
+    Ok(rows)
 }
 
 /// The state (`OPEN`/`MERGED`/`CLOSED`) of the PR for `branch`, via
@@ -181,7 +213,14 @@ pub fn pr_list(loc: &GitLoc, limit: usize) -> Result<Vec<PrHeader>, GhError> {
 /// fails. Used by the on-merge auto-clean to resolve the precise outcome when a
 /// branch drops out of the open-PR set (merged vs closed-without-merge).
 pub fn pr_state_for_branch(loc: &GitLoc, branch: &str) -> Option<String> {
-    let json = gh_out(loc, &["pr", "view", branch, "--json", "state"]).ok()?;
+    let checkout = checkout_scope_for_branch(loc, branch).ok()?;
+    let number = branch_pr_number(loc, &checkout).ok()?;
+    let number = number.to_string();
+    let mut args = vec!["pr", "view", number.as_str()];
+    let scope = scope_for_checkout(&checkout).ok()?;
+    args.extend(["--repo", scope.as_str()]);
+    args.extend(["--json", "state"]);
+    let json = gh_out(loc, &args).ok()?;
     let v: serde_json::Value = serde_json::from_str(&json).ok()?;
     v.get("state")?.as_str().map(str::to_string)
 }
@@ -232,10 +271,195 @@ pub fn origin_nwo(loc: &GitLoc) -> Option<String> {
     nwo_from_remote_url(&url)
 }
 
-/// Open the PR belonging to `branch` in the browser
-/// (`gh pr view <branch> --web`) — the fallback when no cached URL exists.
+fn scope_for_identity(identity: &ForgeRepoIdentity) -> Option<String> {
+    let path = identity.path.clone();
+    (path.matches('/').count() == 1).then(|| {
+        if identity.host.eq_ignore_ascii_case("github.com") {
+            path
+        } else {
+            format!("{}/{}", identity.host, path)
+        }
+    })
+}
+
+fn gh_repo_scope_origin(loc: &GitLoc) -> Result<String, GhError> {
+    let identity = origin_identity(loc)?;
+    scope_for_identity(&identity).ok_or(GhError::NotConfigured("origin repository scope"))
+}
+
+fn origin_identity(loc: &GitLoc) -> Result<ForgeRepoIdentity, GhError> {
+    repo_identity_from_remote_url(
+        &loc.git_out(&["remote", "get-url", "origin"])
+            .ok_or(GhError::NotConfigured("origin repository"))?,
+    )
+    .ok_or(GhError::NotConfigured("origin repository identity"))
+}
+
+/// Resolve a branch through `gh pr list --head`, then use its number for all
+/// subsequent operations. This removes the numeric-branch ambiguity of the
+/// positional `gh pr view <selector>` grammar and scopes the lookup to the
+/// origin repository.
+fn scope_for_checkout(checkout: &ForgeCheckoutScope) -> Result<String, GhError> {
+    scope_for_identity(&checkout.base)
+        .ok_or(GhError::NotConfigured("repository scope is not owner/repo"))
+}
+
+fn branch_pr_number(loc: &GitLoc, checkout: &ForgeCheckoutScope) -> Result<u64, GhError> {
+    let branch = checkout.branch.as_str();
+    let scope = scope_for_checkout(checkout)?;
+    let json = gh_out(
+        loc,
+        &[
+            "pr",
+            "list",
+            "--head",
+            branch,
+            "--state",
+            "all",
+            "--json",
+            "number,state,headRefName,headRepository,headRepositoryOwner",
+            "--limit",
+            "20",
+            "--repo",
+            &scope,
+        ],
+    )?;
+    let rows: Vec<serde_json::Value> = serde_json::from_str(&json)
+        .map_err(|_| GhError::Other("malformed gh PR list response".into()))?;
+    let expected = &checkout.head;
+    let complete_window = rows.len() < 20;
+    let matched = rows
+        .into_iter()
+        .filter(|row| {
+            row.get("headRefName").and_then(|v| v.as_str()) == Some(branch)
+                && cli_head_repo_path(row)
+                    .is_some_and(|repo| repo.eq_ignore_ascii_case(&expected.path))
+        })
+        .min_by_key(|row| row.get("state").and_then(|v| v.as_str()) != Some("OPEN"));
+    match matched {
+        Some(row) => row
+            .get("number")
+            .and_then(|number| number.as_u64())
+            .filter(|number| *number > 0)
+            .ok_or(GhError::NotConfigured("matched PR omitted its number")),
+        None if complete_window => Err(GhError::NoPr),
+        None => Err(GhError::NotConfigured(
+            "PR response window did not prove branch absence",
+        )),
+    }
+}
+
+fn cli_head_repo_path(row: &serde_json::Value) -> Option<String> {
+    row.pointer("/headRepository/nameWithOwner")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned)
+        .or_else(|| {
+            Some(format!(
+                "{}/{}",
+                row.pointer("/headRepositoryOwner/login")?.as_str()?,
+                row.pointer("/headRepository/name")?.as_str()?
+            ))
+        })
+}
+
+/// Open the PR belonging to `branch` in the browser. Resolve the branch via a
+/// scoped `--head` list first, then pass the verified number to `gh pr view`.
 pub fn open_pr_for_branch(loc: &GitLoc, branch: &str) -> Result<(), GhError> {
-    gh_run(loc, &["pr", "view", branch, "--web"])
+    let checkout = checkout_scope_for_branch(loc, branch)?;
+    let number = branch_pr_number(loc, &checkout)?;
+    let number = number.to_string();
+    let scope = scope_for_checkout(&checkout)?;
+    let mut args = vec!["pr", "view", number.as_str()];
+    args.extend(["--repo", scope.as_str()]);
+    args.push("--web");
+    gh_run(loc, &args)
+}
+
+#[cfg(test)]
+mod branch_resolution_tests {
+    use super::{cli_head_repo_path, pr_status_raw};
+    use crate::remote::GitLoc;
+    use std::path::Path;
+
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "private git fixture subprocess, never on the event loop"
+    )]
+    fn git(dir: &Path, args: &[&str]) {
+        let status = crate::util::git_cmd(dir).args(args).status().unwrap();
+        assert!(status.success(), "git {args:?} failed: {status}");
+    }
+
+    #[test]
+    fn cli_head_identity_accepts_both_documented_json_shapes() {
+        let compact = serde_json::json!({
+            "headRepository": {"nameWithOwner": "user/fork"}
+        });
+        assert_eq!(cli_head_repo_path(&compact).as_deref(), Some("user/fork"));
+        let expanded = serde_json::json!({
+            "headRepository": {"name": "fork"},
+            "headRepositoryOwner": {"login": "user"}
+        });
+        assert_eq!(cli_head_repo_path(&expanded).as_deref(), Some("user/fork"));
+        assert_eq!(cli_head_repo_path(&serde_json::json!({})), None);
+    }
+
+    #[test]
+    fn fake_gh_resolves_numeric_branch_in_scoped_fork() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let gh = bin.path().join("gh");
+        std::fs::write(
+            &gh,
+            r#"#!/bin/sh
+case "$1 $2" in
+  "pr list") printf '%s\n' "$@" >> "$FAKE_GH_LOG"; printf '%s\n' '[{"number":42,"state":"OPEN","headRefName":"123","headRepository":{"nameWithOwner":"user/fork"}}]' ;;
+  "pr view") printf '%s\n' "$@" >> "$FAKE_GH_LOG"; printf '%s\n' '{"number":42,"title":"scope","state":"OPEN","url":"https://github.com/org/base/pull/42","headRefName":"123","baseRefName":"main"}' ;;
+esac
+"#,
+        )
+        .unwrap();
+        if crate::fsperm::make_executable_for_test(&gh).is_err() {
+            return;
+        }
+        git(dir.path(), &["init", "-q"]);
+        git(dir.path(), &["config", "user.name", "scope-test"]);
+        git(
+            dir.path(),
+            &["config", "user.email", "scope@example.invalid"],
+        );
+        std::fs::write(dir.path().join("README"), "scope\n").unwrap();
+        git(dir.path(), &["add", "README"]);
+        git(dir.path(), &["commit", "-qm", "scope"]);
+        git(dir.path(), &["branch", "-M", "123"]);
+        git(
+            dir.path(),
+            &["remote", "add", "origin", "git@github.com:user/fork.git"],
+        );
+        git(
+            dir.path(),
+            &[
+                "remote",
+                "add",
+                "upstream",
+                "https://github.com/org/base.git",
+            ],
+        );
+        git(dir.path(), &["config", "branch.123.remote", "upstream"]);
+        git(dir.path(), &["config", "branch.123.pushRemote", "origin"]);
+
+        let old_path = std::env::var_os("PATH").unwrap_or_default();
+        let path = format!("{}:{}", bin.path().display(), old_path.to_string_lossy());
+        let log = bin.path().join("args");
+        let log = log.to_string_lossy().into_owned();
+        let _env = crate::testenv::EnvGuard::set(&[("PATH", &path), ("FAKE_GH_LOG", &log)]);
+        let result = pr_status_raw(&GitLoc::Local(dir.path().to_path_buf()), None);
+        let status = result.unwrap();
+        assert_eq!(status.number, 42);
+        assert_eq!(status.head_ref_name, "123");
+        let args = std::fs::read_to_string(&log).unwrap();
+        assert!(args.contains("--repo\norg/base\n"));
+    }
 }
 
 const THREADS_QUERY: &str = "query($owner:String!,$name:String!,$number:Int!){\
@@ -629,14 +853,7 @@ impl Forge for GithubCli {
         pr_list(loc, limit)
     }
     fn pr_state_for_branch(&self, loc: &GitLoc, branch: &str) -> Result<Option<String>, GhError> {
-        let json = match gh_out(loc, &["pr", "view", branch, "--json", "state"]) {
-            Ok(j) => j,
-            Err(GhError::NoPr) => return Ok(None),
-            Err(e) => return Err(e),
-        };
-        let v: serde_json::Value =
-            serde_json::from_str(&json).map_err(|e| GhError::Other(e.to_string()))?;
-        Ok(v.get("state").and_then(|s| s.as_str()).map(str::to_string))
+        Ok(crate::github::pr_state_for_branch(loc, branch))
     }
     fn search_prs(
         &self,

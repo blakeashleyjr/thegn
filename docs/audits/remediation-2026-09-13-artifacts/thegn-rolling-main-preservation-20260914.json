@@ -1,0 +1,13 @@
+{
+  "head": "1ef8228f917c5cffb2e1993a8843b960aa396372",
+  "files": {
+    "justfile": "75a61923b8db84f1115dd291159c65a63712eab27cbe3f3230b9b87129caf9b2",
+    "docs/audits/live-build-2026-09-13-build-review.md": "ba8079d57847dadca0f5ebf8654d5c652679d7306384c02e0cd16f0b8f3d78a0",
+    "docs/audits/live-build-2026-09-13-logging-review.md": "1f77c4eb041361131eaa1f530b5680681dfe036d92f6d87cde2f38dc4baea5f1",
+    "docs/audits/live-build-2026-09-13-performance-review.md": "7c5dfe1b5e27900b49c6e842722e16396e0247ea901272e311dfae446799dbd2",
+    "docs/audits/live-build-2026-09-13-review.md": "82ee5b183615436f3d49afdc5bf2ef0e35b19d300bda5f5cec17395e136dcb52",
+    "docs/audits/live-build-2026-09-13-session-remediation.md": "7f9522cf00a9bf7279b4caa7b5a0337bc6f3f8500c34d674bf1a0aa0e0e82e0a",
+    "docs/audits/live-build-2026-09-13-session-review.md": "18f51319aaa06a6c77bd1be837b03233f2bea242c2914694691c961e20e35cba",
+    "docs/audits/live-build-2026-09-13.md": "45791f48ed3615599e9416783572b1e1fc1939246bf906a5014043319a9eadc0"
+  }
+}

@@ -342,6 +342,8 @@ perf: bench bench-idle bench-micro
 # feature). SIGUSR2 toggles a flamegraph capture written to
 # $XDG_STATE_HOME/thegn/profiles/. Profiles the live process (sidesteps
 # ptrace_scope=1, which blocks external perf/gdb attach).
+# An empty override disables wrappers from both the dev shell and Cargo
+# config, so launching the live build cannot depend on an sccache daemon.
 release-profiling:
     RUSTC_WRAPPER='' cargo build --release --features profiling -p thegn-host
 

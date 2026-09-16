@@ -1,0 +1,16 @@
+[
+  {
+    "test": "control::client::tests::attach_refuses_an_incompatible_daemon_proto",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.014,
+    "log": "/tmp/thegn-native-unblocked-svc-results/control__client__tests__attach_refuses_an_incompatible_daemon_proto.log"
+  },
+  {
+    "test": "control::client::tests::http_origin_merge_add_crosses_a_real_tcp_listener_with_bearer",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.018,
+    "log": "/tmp/thegn-native-unblocked-svc-results/control__client__tests__http_origin_merge_add_crosses_a_real_tcp_listener_with_bearer.log"
+  }
+]

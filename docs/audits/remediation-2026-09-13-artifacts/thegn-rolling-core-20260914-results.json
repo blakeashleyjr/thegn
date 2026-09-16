@@ -1,0 +1,310 @@
+[
+  {
+    "test": "config_calendar::tests::a_disabled_clock_is_skipped",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.037,
+    "log": "/tmp/thegn-rolling-core-20260914-results/config_calendar__tests__a_disabled_clock_is_skipped.log"
+  },
+  {
+    "test": "config_calendar::tests::a_miscased_zone_is_accepted_rather_than_reported",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.043,
+    "log": "/tmp/thegn-rolling-core-20260914-results/config_calendar__tests__a_miscased_zone_is_accepted_rather_than_reported.log"
+  },
+  {
+    "test": "config_calendar::tests::a_misconfigured_refresh_interval_can_never_spin",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.034,
+    "log": "/tmp/thegn-rolling-core-20260914-results/config_calendar__tests__a_misconfigured_refresh_interval_can_never_spin.log"
+  },
+  {
+    "test": "config_calendar::tests::account_identity_and_color_resolution",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.038,
+    "log": "/tmp/thegn-rolling-core-20260914-results/config_calendar__tests__account_identity_and_color_resolution.log"
+  },
+  {
+    "test": "config_calendar::tests::an_entry_that_omits_enabled_still_counts",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.017,
+    "log": "/tmp/thegn-rolling-core-20260914-results/config_calendar__tests__an_entry_that_omits_enabled_still_counts.log"
+  },
+  {
+    "test": "config_calendar::tests::an_unknown_clock_zone_is_dropped_not_fatal",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.022,
+    "log": "/tmp/thegn-rolling-core-20260914-results/config_calendar__tests__an_unknown_clock_zone_is_dropped_not_fatal.log"
+  },
+  {
+    "test": "config_calendar::tests::an_unknown_home_zone_falls_back_to_local",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.021,
+    "log": "/tmp/thegn-rolling-core-20260914-results/config_calendar__tests__an_unknown_home_zone_falls_back_to_local.log"
+  },
+  {
+    "test": "config_calendar::tests::calendar_display_labels_warn_without_rejecting_legacy_config",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.052,
+    "log": "/tmp/thegn-rolling-core-20260914-results/config_calendar__tests__calendar_display_labels_warn_without_rejecting_legacy_config.log"
+  },
+  {
+    "test": "config_calendar::tests::calendar_display_warns_for_trimmed_control_only_labels",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.012,
+    "log": "/tmp/thegn-rolling-core-20260914-results/config_calendar__tests__calendar_display_warns_for_trimmed_control_only_labels.log"
+  },
+  {
+    "test": "config_calendar::tests::default_reminders_come_from_the_table",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.012,
+    "log": "/tmp/thegn-rolling-core-20260914-results/config_calendar__tests__default_reminders_come_from_the_table.log"
+  },
+  {
+    "test": "config_calendar::tests::defaults_are_inert_but_useful",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.012,
+    "log": "/tmp/thegn-rolling-core-20260914-results/config_calendar__tests__defaults_are_inert_but_useful.log"
+  },
+  {
+    "test": "config_calendar::tests::disabled_accounts_and_the_master_switch_both_silence_the_ticker",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.011,
+    "log": "/tmp/thegn-rolling-core-20260914-results/config_calendar__tests__disabled_accounts_and_the_master_switch_both_silence_the_ticker.log"
+  },
+  {
+    "test": "config_calendar::tests::display_prefs_translate_to_the_pure_domain_types",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.01,
+    "log": "/tmp/thegn-rolling-core-20260914-results/config_calendar__tests__display_prefs_translate_to_the_pure_domain_types.log"
+  },
+  {
+    "test": "config_calendar::tests::only_url_backed_providers_are_gated_offline",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.011,
+    "log": "/tmp/thegn-rolling-core-20260914-results/config_calendar__tests__only_url_backed_providers_are_gated_offline.log"
+  },
+  {
+    "test": "config_calendar::tests::poll_secs_takes_the_shortest_configured_interval",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.01,
+    "log": "/tmp/thegn-rolling-core-20260914-results/config_calendar__tests__poll_secs_takes_the_shortest_configured_interval.log"
+  },
+  {
+    "test": "config_calendar::tests::provider_and_display_enums_round_trip_their_canonical_strings",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.011,
+    "log": "/tmp/thegn-rolling-core-20260914-results/config_calendar__tests__provider_and_display_enums_round_trip_their_canonical_strings.log"
+  },
+  {
+    "test": "config_calendar::tests::the_whole_family_round_trips_through_toml",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.014,
+    "log": "/tmp/thegn-rolling-core-20260914-results/config_calendar__tests__the_whole_family_round_trips_through_toml.log"
+  },
+  {
+    "test": "config_calendar::tests::validation_rejects_a_clock_format_that_would_panic_at_render_time",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.01,
+    "log": "/tmp/thegn-rolling-core-20260914-results/config_calendar__tests__validation_rejects_a_clock_format_that_would_panic_at_render_time.log"
+  },
+  {
+    "test": "config_calendar::tests::validation_rejects_a_malformed_capability_grant",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.011,
+    "log": "/tmp/thegn-rolling-core-20260914-results/config_calendar__tests__validation_rejects_a_malformed_capability_grant.log"
+  },
+  {
+    "test": "config_calendar::tests::validation_rejects_duplicate_and_missing_account_names",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-rolling-core-20260914-results/config_calendar__tests__validation_rejects_duplicate_and_missing_account_names.log"
+  },
+  {
+    "test": "config_calendar::tests::validation_reports_an_unknown_zone_with_a_did_you_mean",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.014,
+    "log": "/tmp/thegn-rolling-core-20260914-results/config_calendar__tests__validation_reports_an_unknown_zone_with_a_did_you_mean.log"
+  },
+  {
+    "test": "config_calendar::tests::validation_requires_the_field_each_provider_actually_needs",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-rolling-core-20260914-results/config_calendar__tests__validation_requires_the_field_each_provider_actually_needs.log"
+  },
+  {
+    "test": "db_aux::merge_outcome_tests::concurrent_distinct_finalizers_do_not_overwrite_the_winner",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.153,
+    "log": "/tmp/thegn-rolling-core-20260914-results/db_aux__merge_outcome_tests__concurrent_distinct_finalizers_do_not_overwrite_the_winner.log"
+  },
+  {
+    "test": "db_aux::merge_outcome_tests::final_outcome_rejects_mismatched_observed_context",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.075,
+    "log": "/tmp/thegn-rolling-core-20260914-results/db_aux__merge_outcome_tests__final_outcome_rejects_mismatched_observed_context.log"
+  },
+  {
+    "test": "db_aux::merge_outcome_tests::final_outcomes_never_insert_or_update_queued",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.299,
+    "log": "/tmp/thegn-rolling-core-20260914-results/db_aux__merge_outcome_tests__final_outcomes_never_insert_or_update_queued.log"
+  },
+  {
+    "test": "db_aux::merge_outcome_tests::final_update_clears_nullable_fields_preserves_nomination_and_attempts",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.08,
+    "log": "/tmp/thegn-rolling-core-20260914-results/db_aux__merge_outcome_tests__final_update_clears_nullable_fields_preserves_nomination_and_attempts.log"
+  },
+  {
+    "test": "db_aux::merge_outcome_tests::final_write_error_rolls_back_without_leaving_a_transaction",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.154,
+    "log": "/tmp/thegn-rolling-core-20260914-results/db_aux__merge_outcome_tests__final_write_error_rolls_back_without_leaving_a_transaction.log"
+  },
+  {
+    "test": "db_aux::merge_outcome_tests::incomplete_registry_and_unobserved_remote_location_are_refused",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.088,
+    "log": "/tmp/thegn-rolling-core-20260914-results/db_aux__merge_outcome_tests__incomplete_registry_and_unobserved_remote_location_are_refused.log"
+  },
+  {
+    "test": "db_aux::merge_outcome_tests::independent_connection_queue_reassignments_win",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 2.543,
+    "log": "/tmp/thegn-rolling-core-20260914-results/db_aux__merge_outcome_tests__independent_connection_queue_reassignments_win.log"
+  },
+  {
+    "test": "db_aux::merge_outcome_tests::independent_connection_registry_reassignments_win",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 1.294,
+    "log": "/tmp/thegn-rolling-core-20260914-results/db_aux__merge_outcome_tests__independent_connection_registry_reassignments_win.log"
+  },
+  {
+    "test": "db_aux::merge_outcome_tests::independent_reader_snapshot_sees_old_or_final_never_synthetic_queued",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.25,
+    "log": "/tmp/thegn-rolling-core-20260914-results/db_aux__merge_outcome_tests__independent_reader_snapshot_sees_old_or_final_never_synthetic_queued.log"
+  },
+  {
+    "test": "db_aux::merge_outcome_tests::local_aliases_and_remote_locations_keep_verified_representation",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.381,
+    "log": "/tmp/thegn-rolling-core-20260914-results/db_aux__merge_outcome_tests__local_aliases_and_remote_locations_keep_verified_representation.log"
+  },
+  {
+    "test": "db_aux::merge_outcome_tests::observed_absence_does_not_authorize_overwriting_a_new_owner",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.809,
+    "log": "/tmp/thegn-rolling-core-20260914-results/db_aux__merge_outcome_tests__observed_absence_does_not_authorize_overwriting_a_new_owner.log"
+  },
+  {
+    "test": "db_aux::merge_outcome_tests::queue_branch_and_location_are_checked_even_without_registry",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.243,
+    "log": "/tmp/thegn-rolling-core-20260914-results/db_aux__merge_outcome_tests__queue_branch_and_location_are_checked_even_without_registry.log"
+  },
+  {
+    "test": "db_aux::merge_outcome_tests::registry_identity_accessor_borrows_the_captured_observation",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.12,
+    "log": "/tmp/thegn-rolling-core-20260914-results/db_aux__merge_outcome_tests__registry_identity_accessor_borrows_the_captured_observation.log"
+  },
+  {
+    "test": "db_aux::merge_outcome_tests::result_oid_requires_landed_and_landed_requires_a_result",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.127,
+    "log": "/tmp/thegn-rolling-core-20260914-results/db_aux__merge_outcome_tests__result_oid_requires_landed_and_landed_requires_a_result.log"
+  },
+  {
+    "test": "time_policy::tests::cache_rollback_and_large_ttl_do_not_force_repolling",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.011,
+    "log": "/tmp/thegn-rolling-core-20260914-results/time_policy__tests__cache_rollback_and_large_ttl_do_not_force_repolling.log"
+  },
+  {
+    "test": "time_policy::tests::cadence_floors_caps_and_units_never_produce_zero",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.018,
+    "log": "/tmp/thegn-rolling-core-20260914-results/time_policy__tests__cadence_floors_caps_and_units_never_produce_zero.log"
+  },
+  {
+    "test": "time_policy::tests::expiry_quarantines_unknown_provider_time_and_bad_policy",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.014,
+    "log": "/tmp/thegn-rolling-core-20260914-results/time_policy__tests__expiry_quarantines_unknown_provider_time_and_bad_policy.log"
+  },
+  {
+    "test": "time_policy::tests::fractional_provider_delays_and_elapsed_extremes_are_checked",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.013,
+    "log": "/tmp/thegn-rolling-core-20260914-results/time_policy__tests__fractional_provider_delays_and_elapsed_extremes_are_checked.log"
+  },
+  {
+    "test": "time_policy::tests::generated_cadences_are_monotone_and_nonzero",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.016,
+    "log": "/tmp/thegn-rolling-core-20260914-results/time_policy__tests__generated_cadences_are_monotone_and_nonzero.log"
+  },
+  {
+    "test": "time_policy::tests::milliseconds_never_narrow_to_negative_or_disable_a_window",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.012,
+    "log": "/tmp/thegn-rolling-core-20260914-results/time_policy__tests__milliseconds_never_narrow_to_negative_or_disable_a_window.log"
+  },
+  {
+    "test": "time_policy::tests::provider_deadlines_reject_overflow_and_unsupported_delays",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.01,
+    "log": "/tmp/thegn-rolling-core-20260914-results/time_policy__tests__provider_deadlines_reject_overflow_and_unsupported_delays.log"
+  },
+  {
+    "test": "time_policy::tests::unknown_or_invalid_age_never_authorizes_destruction",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.01,
+    "log": "/tmp/thegn-rolling-core-20260914-results/time_policy__tests__unknown_or_invalid_age_never_authorizes_destruction.log"
+  }
+]

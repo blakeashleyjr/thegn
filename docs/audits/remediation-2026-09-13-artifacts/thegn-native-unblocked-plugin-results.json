@@ -1,0 +1,338 @@
+[
+  {
+    "test": "plugin::loader::tests::broken_manifest_is_a_check_failure_but_not_a_discovery_failure",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-native-unblocked-plugin-results/plugin__loader__tests__broken_manifest_is_a_check_failure_but_not_a_discovery_failure.log"
+  },
+  {
+    "test": "plugin::loader::tests::canonical_support_table_drives_the_loader_and_public_docs",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.01,
+    "log": "/tmp/thegn-native-unblocked-plugin-results/plugin__loader__tests__canonical_support_table_drives_the_loader_and_public_docs.log"
+  },
+  {
+    "test": "plugin::loader::tests::check_flags_missing_command_bad_api_and_duplicates",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-native-unblocked-plugin-results/plugin__loader__tests__check_flags_missing_command_bad_api_and_duplicates.log"
+  },
+  {
+    "test": "plugin::loader::tests::disabled_specs_are_listed_but_not_check_failures",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-native-unblocked-plugin-results/plugin__loader__tests__disabled_specs_are_listed_but_not_check_failures.log"
+  },
+  {
+    "test": "plugin::loader::tests::discovers_config_then_directory_plugins",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-native-unblocked-plugin-results/plugin__loader__tests__discovers_config_then_directory_plugins.log"
+  },
+  {
+    "test": "plugin::loader::tests::unsupported_extension_point_is_reported",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-native-unblocked-plugin-results/plugin__loader__tests__unsupported_extension_point_is_reported.log"
+  },
+  {
+    "test": "plugin::platform::unix::tests::resident_linux_exit_notice_has_no_idle_wakes_and_retains_identity",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.069,
+    "log": "/tmp/thegn-native-unblocked-plugin-results/plugin__platform__unix__tests__resident_linux_exit_notice_has_no_idle_wakes_and_retains_identity.log"
+  },
+  {
+    "test": "plugin::platform::unix::tests::resident_unix_consuming_wait_identity_loss_forbids_later_signals",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.01,
+    "log": "/tmp/thegn-native-unblocked-plugin-results/plugin__platform__unix__tests__resident_unix_consuming_wait_identity_loss_forbids_later_signals.log"
+  },
+  {
+    "test": "plugin::platform::unix::tests::resident_unix_final_process_drop_terminates_owned_fixture_without_blocking",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-native-unblocked-plugin-results/plugin__platform__unix__tests__resident_unix_final_process_drop_terminates_owned_fixture_without_blocking.log"
+  },
+  {
+    "test": "plugin::platform::unix::tests::resident_unix_group_result_always_terminates_exact_owned_leader",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-native-unblocked-plugin-results/plugin__platform__unix__tests__resident_unix_group_result_always_terminates_exact_owned_leader.log"
+  },
+  {
+    "test": "plugin::proc::tests::a_hung_plugin_is_killed_at_its_timeout",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.309,
+    "log": "/tmp/thegn-native-unblocked-plugin-results/plugin__proc__tests__a_hung_plugin_is_killed_at_its_timeout.log"
+  },
+  {
+    "test": "plugin::proc::tests::a_missing_program_is_a_spawn_error",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-native-unblocked-plugin-results/plugin__proc__tests__a_missing_program_is_a_spawn_error.log"
+  },
+  {
+    "test": "plugin::proc::tests::a_nonzero_exit_carries_the_stderr_tail",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.027,
+    "log": "/tmp/thegn-native-unblocked-plugin-results/plugin__proc__tests__a_nonzero_exit_carries_the_stderr_tail.log"
+  },
+  {
+    "test": "plugin::proc::tests::a_plugin_that_writes_a_lot_of_stderr_does_not_deadlock",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.047,
+    "log": "/tmp/thegn-native-unblocked-plugin-results/plugin__proc__tests__a_plugin_that_writes_a_lot_of_stderr_does_not_deadlock.log"
+  },
+  {
+    "test": "plugin::proc::tests::a_verb_with_no_params_is_accepted",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.027,
+    "log": "/tmp/thegn-native-unblocked-plugin-results/plugin__proc__tests__a_verb_with_no_params_is_accepted.log"
+  },
+  {
+    "test": "plugin::proc::tests::an_empty_command_is_rejected",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-native-unblocked-plugin-results/plugin__proc__tests__an_empty_command_is_rejected.log"
+  },
+  {
+    "test": "plugin::proc::tests::blank_lines_are_ignored",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.028,
+    "log": "/tmp/thegn-native-unblocked-plugin-results/plugin__proc__tests__blank_lines_are_ignored.log"
+  },
+  {
+    "test": "plugin::proc::tests::errors_render_readably",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.006,
+    "log": "/tmp/thegn-native-unblocked-plugin-results/plugin__proc__tests__errors_render_readably.log"
+  },
+  {
+    "test": "plugin::proc::tests::inherited_git_state_is_scrubbed",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.027,
+    "log": "/tmp/thegn-native-unblocked-plugin-results/plugin__proc__tests__inherited_git_state_is_scrubbed.log"
+  },
+  {
+    "test": "plugin::proc::tests::output_is_capped_rather_than_buffered_without_limit",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.149,
+    "log": "/tmp/thegn-native-unblocked-plugin-results/plugin__proc__tests__output_is_capped_rather_than_buffered_without_limit.log"
+  },
+  {
+    "test": "plugin::proc::tests::reads_newline_delimited_messages_in_order",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.028,
+    "log": "/tmp/thegn-native-unblocked-plugin-results/plugin__proc__tests__reads_newline_delimited_messages_in_order.log"
+  },
+  {
+    "test": "plugin::proc::tests::stdin_is_closed_so_a_reading_plugin_gets_eof",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.029,
+    "log": "/tmp/thegn-native-unblocked-plugin-results/plugin__proc__tests__stdin_is_closed_so_a_reading_plugin_gets_eof.log"
+  },
+  {
+    "test": "plugin::proc::tests::stray_non_json_output_is_kept_as_junk_not_silently_dropped",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.028,
+    "log": "/tmp/thegn-native-unblocked-plugin-results/plugin__proc__tests__stray_non_json_output_is_kept_as_junk_not_silently_dropped.log"
+  },
+  {
+    "test": "plugin::proc::tests::the_environment_is_passed_through",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.028,
+    "log": "/tmp/thegn-native-unblocked-plugin-results/plugin__proc__tests__the_environment_is_passed_through.log"
+  },
+  {
+    "test": "plugin::provider::tests::issue_ops_round_trip_through_a_scripted_plugin",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.013,
+    "log": "/tmp/thegn-native-unblocked-plugin-results/plugin__provider__tests__issue_ops_round_trip_through_a_scripted_plugin.log"
+  },
+  {
+    "test": "plugin::provider::tests::late_and_unknown_responses_are_reported_unroutable",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-native-unblocked-plugin-results/plugin__provider__tests__late_and_unknown_responses_are_reported_unroutable.log"
+  },
+  {
+    "test": "plugin::provider::tests::omitted_caps_refuse_optional_ops_without_a_bridge_round_trip",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-native-unblocked-plugin-results/plugin__provider__tests__omitted_caps_refuse_optional_ops_without_a_bridge_round_trip.log"
+  },
+  {
+    "test": "plugin::provider::tests::resident_eof_fails_pending_calls_without_waiting_for_rpc_deadline",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.033,
+    "log": "/tmp/thegn-native-unblocked-plugin-results/plugin__provider__tests__resident_eof_fails_pending_calls_without_waiting_for_rpc_deadline.log"
+  },
+  {
+    "test": "plugin::provider::tests::resident_final_reply_before_exit_is_delivered_and_late_call_is_closed",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.012,
+    "log": "/tmp/thegn-native-unblocked-plugin-results/plugin__provider__tests__resident_final_reply_before_exit_is_delivered_and_late_call_is_closed.log"
+  },
+  {
+    "test": "plugin::provider::tests::resident_old_session_cannot_route_into_replacement_bridge",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-native-unblocked-plugin-results/plugin__provider__tests__resident_old_session_cannot_route_into_replacement_bridge.log"
+  },
+  {
+    "test": "plugin::provider::tests::timeout_and_dead_session_degrade_to_errors",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.312,
+    "log": "/tmp/thegn-native-unblocked-plugin-results/plugin__provider__tests__timeout_and_dead_session_degrade_to_errors.log"
+  },
+  {
+    "test": "plugin::session::admission::lifecycle_tests::resident_natural_close_escalation_drains_pending_hooks_once",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-native-unblocked-plugin-results/plugin__session__admission__lifecycle_tests__resident_natural_close_escalation_drains_pending_hooks_once.log"
+  },
+  {
+    "test": "plugin::session::admission::lifecycle_tests::resident_subscriber_panic_cannot_abort_closure_or_other_subscribers",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-native-unblocked-plugin-results/plugin__session__admission__lifecycle_tests__resident_subscriber_panic_cannot_abort_closure_or_other_subscribers.log"
+  },
+  {
+    "test": "plugin::session::admission::tests::resident_admission_is_fifo_count_and_byte_bounded",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.018,
+    "log": "/tmp/thegn-native-unblocked-plugin-results/plugin__session__admission__tests__resident_admission_is_fifo_count_and_byte_bounded.log"
+  },
+  {
+    "test": "plugin::session::admission::tests::resident_final_newline_does_not_double_large_json_allocation",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.046,
+    "log": "/tmp/thegn-native-unblocked-plugin-results/plugin__session__admission__tests__resident_final_newline_does_not_double_large_json_allocation.log"
+  },
+  {
+    "test": "plugin::session::admission::tests::resident_nearly_full_queue_caps_json_work_before_serialization",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.048,
+    "log": "/tmp/thegn-native-unblocked-plugin-results/plugin__session__admission__tests__resident_nearly_full_queue_caps_json_work_before_serialization.log"
+  },
+  {
+    "test": "plugin::session::admission::tests::resident_serialization_bounds_before_growth_and_preserves_json",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.096,
+    "log": "/tmp/thegn-native-unblocked-plugin-results/plugin__session__admission__tests__resident_serialization_bounds_before_growth_and_preserves_json.log"
+  },
+  {
+    "test": "plugin::session::tests::resident_callback_panic_keeps_custody_and_closes_transport",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.012,
+    "log": "/tmp/thegn-native-unblocked-plugin-results/plugin__session__tests__resident_callback_panic_keeps_custody_and_closes_transport.log"
+  },
+  {
+    "test": "plugin::session::tests::resident_cancelled_join_waiter_retains_handle_and_global_deadline",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.069,
+    "log": "/tmp/thegn-native-unblocked-plugin-results/plugin__session__tests__resident_cancelled_join_waiter_retains_handle_and_global_deadline.log"
+  },
+  {
+    "test": "plugin::session::tests::resident_failed_spawn_releases_admission_and_settled_identity_restarts",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.013,
+    "log": "/tmp/thegn-native-unblocked-plugin-results/plugin__session__tests__resident_failed_spawn_releases_admission_and_settled_identity_restarts.log"
+  },
+  {
+    "test": "plugin::session::tests::resident_nonreading_stdin_never_blocks_admission_or_shutdown",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.024,
+    "log": "/tmp/thegn-native-unblocked-plugin-results/plugin__session__tests__resident_nonreading_stdin_never_blocks_admission_or_shutdown.log"
+  },
+  {
+    "test": "plugin::session::tests::resident_owner_abort_before_first_poll_retains_custody_for_cleanup",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-native-unblocked-plugin-results/plugin__session__tests__resident_owner_abort_before_first_poll_retains_custody_for_cleanup.log"
+  },
+  {
+    "test": "plugin::session::tests::resident_shutdown_during_spawn_registration_does_not_panic_or_lose_child",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.04,
+    "log": "/tmp/thegn-native-unblocked-plugin-results/plugin__session__tests__resident_shutdown_during_spawn_registration_does_not_panic_or_lose_child.log"
+  },
+  {
+    "test": "plugin::session::tests::resident_shutdown_is_concurrent_idempotent_and_cancellation_safe",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.011,
+    "log": "/tmp/thegn-native-unblocked-plugin-results/plugin__session__tests__resident_shutdown_is_concurrent_idempotent_and_cancellation_safe.log"
+  },
+  {
+    "test": "plugin::session::tests::resident_stdout_eof_while_alive_closes_and_reaps",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.032,
+    "log": "/tmp/thegn-native-unblocked-plugin-results/plugin__session__tests__resident_stdout_eof_while_alive_closes_and_reaps.log"
+  },
+  {
+    "test": "plugin::session::tests::responses_are_classified_and_kill_delivers_exit",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.011,
+    "log": "/tmp/thegn-native-unblocked-plugin-results/plugin__session__tests__responses_are_classified_and_kill_delivers_exit.log"
+  },
+  {
+    "test": "plugin::session::tests::round_trips_a_callback_and_classifies_lines",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.011,
+    "log": "/tmp/thegn-native-unblocked-plugin-results/plugin__session__tests__round_trips_a_callback_and_classifies_lines.log"
+  },
+  {
+    "test": "plugin::session::tests::writes_to_a_dead_session_error",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.011,
+    "log": "/tmp/thegn-native-unblocked-plugin-results/plugin__session__tests__writes_to_a_dead_session_error.log"
+  }
+]

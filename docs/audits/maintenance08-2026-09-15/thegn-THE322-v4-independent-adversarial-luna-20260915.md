@@ -36,4 +36,3 @@ THE-321 owns shared HTTP transport limits and diagnostics; THE-314 owns `gh` sub
 - Approved plan SHA-256: `549382ff3b90df0e789bf8c86b0fa3c94e3c6b96276b774099da33f77e90ae6c`
 
 Final integrated relevant-file SHA-256 values are in the accompanying JSON.
-

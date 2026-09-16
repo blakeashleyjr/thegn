@@ -1,0 +1,105 @@
+{
+  "baseline": "f4c1355bf2dce35b78502e1fe2023ab6054e19ac",
+  "parent": "THE-614",
+  "issues": [
+    {
+      "key": "session_restore",
+      "id": "THE-615",
+      "title": "Restore missing daemon and provider pane sessions using authoritative absence",
+      "url": "https://linear.app/blakeashley/issue/THE-615/restore-missing-daemon-and-provider-pane-sessions-using-authoritative"
+    },
+    {
+      "key": "reconnect",
+      "id": "THE-616",
+      "title": "Retry transient pane reattachment failures within the configured reconnect budget",
+      "url": "https://linear.app/blakeashley/issue/THE-616/retry-transient-pane-reattachment-failures-within-the-configured"
+    },
+    {
+      "key": "sandbox_floor",
+      "id": "THE-617",
+      "title": "Enforce isolation floor against the final resolved sandbox or host outcome",
+      "url": "https://linear.app/blakeashley/issue/THE-617/enforce-isolation-floor-against-the-final-resolved-sandbox-or-host"
+    },
+    {
+      "key": "terminal_drop",
+      "id": "THE-618",
+      "title": "Avoid terminal teardown panic when the controlling PTY closes",
+      "url": "https://linear.app/blakeashley/issue/THE-618/avoid-terminal-teardown-panic-when-the-controlling-pty-closes"
+    },
+    {
+      "key": "input_logs",
+      "id": "THE-619",
+      "title": "Keep typed characters and action payloads out of debug and trace input diagnostics",
+      "url": "https://linear.app/blakeashley/issue/THE-619/keep-typed-characters-and-action-payloads-out-of-debug-and-trace-input"
+    },
+    {
+      "key": "connectivity",
+      "id": "THE-620",
+      "title": "Preserve connectivity state and recovery probes across config installation",
+      "url": "https://linear.app/blakeashley/issue/THE-620/preserve-connectivity-state-and-recovery-probes-across-config"
+    },
+    {
+      "key": "forge_hosts",
+      "id": "THE-621",
+      "title": "Prevent native GitHub requests from ignoring enterprise and foreign origin hosts",
+      "url": "https://linear.app/blakeashley/issue/THE-621/prevent-native-github-requests-from-ignoring-enterprise-and-foreign"
+    },
+    {
+      "key": "forge_errors",
+      "id": "THE-622",
+      "title": "Handle typed native GraphQL failures and preserve forge fallback semantics",
+      "url": "https://linear.app/blakeashley/issue/THE-622/handle-typed-native-graphql-failures-and-preserve-forge-fallback"
+    },
+    {
+      "key": "forge_credentials",
+      "id": "THE-623",
+      "title": "Bound native forge credential helper execution and output",
+      "url": "https://linear.app/blakeashley/issue/THE-623/bound-native-forge-credential-helper-execution-and-output"
+    },
+    {
+      "key": "log_noise",
+      "id": "THE-624",
+      "title": "Preserve logging suppression and deduplicate unchanged configuration warnings",
+      "url": "https://linear.app/blakeashley/issue/THE-624/preserve-logging-suppression-and-deduplicate-unchanged-configuration"
+    },
+    {
+      "key": "log_tail",
+      "id": "THE-625",
+      "title": "Follow live log files through rotation, replacement and truncation",
+      "url": "https://linear.app/blakeashley/issue/THE-625/follow-live-log-files-through-rotation-replacement-and-truncation"
+    },
+    {
+      "key": "telemetry",
+      "id": "THE-626",
+      "title": "Correct frame, input and idle telemetry boundaries and expose sample counts",
+      "url": "https://linear.app/blakeashley/issue/THE-626/correct-frame-input-and-idle-telemetry-boundaries-and-expose-sample"
+    },
+    {
+      "key": "perf_investigation",
+      "id": "THE-627",
+      "title": "Measure hydration and incremental-render costs with a controlled audit workload",
+      "url": "https://linear.app/blakeashley/issue/THE-627/measure-hydration-and-incremental-render-costs-with-a-controlled-audit"
+    }
+  ],
+  "existing": [
+    "THE-589",
+    "THE-588",
+    "THE-613",
+    "THE-575",
+    "THE-586"
+  ],
+  "canonicalMerge": "blocked: original .git is read-only",
+  "reviewState": "adversarial source revisions approved; native execution gates remain failed",
+  "hostResults": {
+    "passed": 179,
+    "failed": 97,
+    "ignored": 1
+  },
+  "nextBatch": "THE-629",
+  "processView": "THE-628",
+  "btopFollowups": [
+    "THE-630",
+    "THE-631",
+    "THE-632"
+  ]
+}

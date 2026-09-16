@@ -1,0 +1,4 @@
+   Compiling thegn-core v0.1.0-alpha.2 (/tmp/thegn-audit-remediation-20260913/crates/thegn-core)
+   Compiling thegn-svc v0.1.0-alpha.2 (/tmp/thegn-audit-remediation-20260913/crates/thegn-svc)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 20s
+  Executable unittests src/lib.rs (/tmp/thegn-audit-build-cache-20260913/debug/deps/thegn_svc-9e40491fa19fc238)
