@@ -2017,6 +2017,7 @@ fn set_worktree_folder_round_trips() {
 #[test]
 fn creation_folder_identity_update_refuses_deleted_folder_without_recreation() {
     let db = db();
+    db.put_workspace("/x/app", "app", "repo").unwrap();
     db.put_worktree("app/feat", "/x/app", "/wt/feat", "tg/feat", None, None)
         .unwrap();
     let folder = db.ensure_folder("/x/app", "Waiting").unwrap();
@@ -2033,6 +2034,7 @@ fn creation_folder_identity_update_refuses_deleted_folder_without_recreation() {
 #[test]
 fn creation_folder_identity_update_accepts_current_name() {
     let db = db();
+    db.put_workspace("/x/app", "app", "repo").unwrap();
     db.put_worktree("app/feat", "/x/app", "/wt/feat", "tg/feat", None, None)
         .unwrap();
     let folder = db.ensure_folder("/x/app", "Waiting").unwrap();
@@ -2052,6 +2054,7 @@ fn creation_folder_identity_update_accepts_current_name() {
 #[test]
 fn creation_folder_identity_update_refuses_worktree_from_another_repo() {
     let db = db();
+    db.put_workspace("/x/app", "app", "repo").unwrap();
     db.put_worktree("other/feat", "/x/other", "/wt/feat", "tg/feat", None, None)
         .unwrap();
     let folder = db.ensure_folder("/x/app", "Waiting").unwrap();
@@ -4766,6 +4769,7 @@ fn scoped_clear_with_no_repo_paths_still_marks_untagged_and_unknown() {
 #[test]
 fn creation_folder_update_rejects_reused_id_with_a_different_name() {
     let db = db();
+    db.put_workspace("/x/app", "app", "repo").unwrap();
     db.put_worktree("app/feat", "/x/app", "/wt/feat", "tg/feat", None, None)
         .unwrap();
     let folder = db.ensure_folder("/x/app", "Waiting").unwrap();
@@ -4783,6 +4787,7 @@ fn creation_folder_update_rejects_reused_id_with_a_different_name() {
 #[test]
 fn creation_folder_update_refuses_rename_after_dispatch() {
     let db = db();
+    db.put_workspace("/x/app", "app", "repo").unwrap();
     db.put_worktree("app/feat", "/x/app", "/wt/feat", "tg/feat", None, None)
         .unwrap();
     let folder = db.ensure_folder("/x/app", "Waiting").unwrap();
