@@ -2657,9 +2657,6 @@ pub(crate) fn build_panel(
         &loc.git_out(&["remote", "get-url", "origin"])
             .unwrap_or_default(),
     );
-    let origin_nwo = origin_repo
-        .as_ref()
-        .and_then(|repo| (repo.path.matches('/').count() == 1).then(|| repo.path.clone()));
 
     let checkout_scope = thegn_core::forge::checkout::checkout_scope(&loc).ok();
     // The typed PR cache: summary + checks + review threads + issues.
@@ -3667,7 +3664,9 @@ pub(crate) fn spawn_pr_cache_refresh(
         }
         // This cache is keyed by the root checkout, so fetch that repository's
         // origin rather than an active worktree's possibly overridden remote.
-        let loc = thegn_core::remote::GitLoc::Local(std::path::PathBuf::from(&repo_root));
+        let root_path = thegn_core::repo::main_worktree(&cwd).unwrap_or_else(|| cwd.clone());
+        let repo_root = root_path.to_string_lossy().into_owned();
+        let loc = thegn_core::remote::GitLoc::Local(root_path);
         let forges = crate::forge_handle::get();
         let forge = forges.for_loc(&loc);
         let origin_before = thegn_core::forge::model::repo_identity_from_remote_url(
@@ -3687,13 +3686,6 @@ pub(crate) fn spawn_pr_cache_refresh(
             && let Ok(json) = serde_json::to_string(&prs)
             && let Ok(db) = thegn_core::db::Db::open()
         {
-            // `pr_list` returns the repo's open PRs (branch-independent), so key
-            // the cache by repo root — every worktree of the repo reads the same
-            // entry to resolve its own branch's badge (item 28).
-            let repo_root = thegn_core::repo::main_worktree(&cwd)
-                .map(|r| r.to_string_lossy().into_owned())
-                .unwrap_or_else(|| loc.path());
-
             // On-merge auto-clean (background worktrees only): a branch that had
             // an open PR last round but is gone from the open set now has
             // transitioned (merged or closed). Resolve the precise state and, if
