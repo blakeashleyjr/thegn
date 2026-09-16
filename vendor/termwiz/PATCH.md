@@ -14,9 +14,21 @@ observed Unix `write.flush().unwrap()` EIO panic and the equivalent unchecked
 Windows destructor operations. Windows runtime behavior requires Windows CI;
 Linux PTY evidence is not a Windows compatibility claim.
 
-Upstream source, manifests, examples, benches, README, changelog and license are
-otherwise unchanged. Cargo registry bookkeeping, the package's independent
-lockfile, original unnormalized manifest and release tooling are omitted.
+`Cargo.toml` additionally carries a `[lints.rust]` table allowing
+`mismatched_lifetime_syntaxes`. Cargo applies `--cap-lints allow` to registry
+and git dependencies but not to path dependencies, so vendoring this crate at
+`vendor/termwiz` makes rustc lint upstream's sources as if they were
+first-party. That lint became warn-by-default after 0.23.3 was published and
+fires 13 times, all on `Foo` versus `Foo<'_>` in return position — no behavior
+is involved. The allow is at the manifest so every `.rs` file stays
+byte-identical to the published package; applying the compiler's `cargo fix`
+suggestion would edit 13 source sites instead. Drop the table if a later
+upstream release fixes the signatures.
+
+Upstream source, examples, benches, README, changelog and license are otherwise
+unchanged, and the manifest differs only by that table. Cargo registry
+bookkeeping, the package's independent lockfile, original unnormalized manifest
+and release tooling are omitted.
 
 Remove the patch when an upstream release provides non-panicking destructor
 cleanup and passes the hangup/unwind regression tests. Do not replace it with
