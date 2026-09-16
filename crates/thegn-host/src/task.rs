@@ -1671,9 +1671,10 @@ mod tests {
         )
         .unwrap();
 
+        // Both intentional outcomes must run, even with one nextest worker.
         let task = TestTask::new(
             "cargo nextest",
-            "NEXTEST_EXPERIMENTAL_LIBTEST_JSON=1 cargo nextest run --message-format libtest-json",
+            "NEXTEST_EXPERIMENTAL_LIBTEST_JSON=1 cargo nextest run --no-fail-fast --message-format libtest-json",
             "nextest",
         )
         .with_ingestion(crate::panel::Ingestion::Json);

@@ -216,7 +216,10 @@ fn isolated_sdk_connectivity_child() {
     );
     connectivity::install_forced(None);
     connectivity::install_thresholds(1, 30_000);
-    let data = serde_json::json!({"repository":{"pullRequests":{"nodes":[header(7)]}}});
+    let data = serde_json::json!({"repository":{"pullRequests":{
+        "nodes":[header(7)],
+        "pageInfo":{"hasNextPage":false,"endCursor":null}
+    }}});
     let cases = [
         (
             "errors-only",
