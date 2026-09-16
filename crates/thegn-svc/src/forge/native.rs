@@ -15,6 +15,7 @@
 //! runtime handle.
 
 use serde_json::Value;
+use std::collections::HashSet;
 use thegn_core::forge::model::*;
 use thegn_core::forge::{Forge, ForgeCaps, ForgeError, PrRef, RepoRef};
 use thegn_core::remote::GitLoc;
@@ -71,16 +72,93 @@ pub fn parse_graphql_pr_list_next(resp: &Value) -> Option<String> {
 
 /// Parse a `PR_LIST_QUERY` response into headers. Pure, fixture-tested.
 pub fn parse_graphql_pr_list(resp: &Value) -> Vec<PrHeader> {
-    let data = resp.get("data").unwrap_or(resp);
-    data.pointer("/repository/pullRequests/nodes")
-        .and_then(Value::as_array)
-        .map(|nodes| {
-            nodes
-                .iter()
-                .filter_map(|n| serde_json::from_value(n.clone()).ok())
-                .collect()
-        })
+    parse_graphql_pr_list_page(resp)
+        .map(|(rows, _)| rows)
         .unwrap_or_default()
+}
+
+fn parse_graphql_pr_list_page(resp: &Value) -> Result<(Vec<PrHeader>, Option<String>), ForgeError> {
+    if resp
+        .get("errors")
+        .and_then(Value::as_array)
+        .is_some_and(|errors| !errors.is_empty())
+    {
+        return Err(ForgeError::NotConfigured("GraphQL PR list response errors"));
+    }
+    let data = resp.get("data").unwrap_or(resp);
+    let nodes = data
+        .pointer("/repository/pullRequests/nodes")
+        .and_then(Value::as_array)
+        .ok_or(ForgeError::NotConfigured("malformed GraphQL PR list nodes"))?;
+    let rows = nodes
+        .iter()
+        .map(|node| {
+            serde_json::from_value(node.clone())
+                .map_err(|_| ForgeError::NotConfigured("malformed GraphQL PR list node"))
+        })
+        .collect::<Result<Vec<PrHeader>, _>>()?;
+    let info = data
+        .pointer("/repository/pullRequests/pageInfo")
+        .and_then(Value::as_object)
+        .ok_or(ForgeError::NotConfigured(
+            "malformed GraphQL PR list pageInfo",
+        ))?;
+    let has_next =
+        info.get("hasNextPage")
+            .and_then(Value::as_bool)
+            .ok_or(ForgeError::NotConfigured(
+                "malformed GraphQL PR list hasNextPage",
+            ))?;
+    let next = if has_next {
+        Some(
+            info.get("endCursor")
+                .and_then(Value::as_str)
+                .filter(|cursor| !cursor.is_empty())
+                .ok_or(ForgeError::NotConfigured(
+                    "GraphQL PR list hasNextPage without cursor",
+                ))?
+                .to_string(),
+        )
+    } else {
+        None
+    };
+    Ok((rows, next))
+}
+
+fn collect_pr_pages<F>(limit: usize, mut fetch: F) -> Result<Vec<PrHeader>, ForgeError>
+where
+    F: FnMut(Option<&str>) -> Result<Value, ForgeError>,
+{
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    const MAX_ROWS: usize = 300;
+    const PAGE_SIZE: usize = 100;
+    let wanted = limit.min(MAX_ROWS);
+    let max_pages = wanted.div_ceil(PAGE_SIZE);
+    let mut rows = Vec::with_capacity(wanted);
+    let mut cursor = None;
+    let mut seen = HashSet::new();
+    for _ in 0..max_pages {
+        let response = fetch(cursor.as_deref())?;
+        let (mut page, next) = parse_graphql_pr_list_page(&response)?;
+        rows.append(&mut page);
+        if rows.len() >= wanted || next.is_none() {
+            rows.truncate(wanted);
+            return Ok(rows);
+        }
+        let next = next.expect("checked above");
+        if !seen.insert(next.clone()) {
+            return Err(ForgeError::NotConfigured(
+                "repeating GraphQL PR list cursor",
+            ));
+        }
+        cursor = Some(next);
+    }
+    // The three-page bound is an intentional partial open-set limit. A short
+    // page with a valid continuation is not evidence that no later PR exists.
+    rows.truncate(wanted);
+    Ok(rows)
 }
 
 /// The single GraphQL query that replaces the CLI's separate `gh pr view` +
@@ -93,6 +171,7 @@ query($owner:String!,$repo:String!,$head:String!){
       nodes{
         number title state url author{login ... on User{id}} isDraft headRefName headRefOid baseRefName
         headRepositoryOwner{login}
+        headRepository{nameWithOwner}
         mergeable mergeStateStatus reviewDecision
         commits(last:1){ nodes{ commit{ statusCheckRollup{
           contexts(first:100){ nodes{
@@ -146,47 +225,106 @@ pub fn parse_graphql_pr(resp: &Value, worktree: &str, branch: &str, now: i64) ->
     panel
 }
 
-/// Pick THIS branch's PR from every PR whose head ref shares its name.
-///
-/// `headRefName` is only a name: a fork's `main`/`patch-1`, or an old PR from a
-/// reused branch name, match too. Prefer a head in the base repo's own owner
-/// (the base owner is the PR URL's), then OPEN over MERGED/CLOSED; within a
-/// class the reply is already newest-first (`orderBy UPDATED_AT DESC`). A
-/// fork-only match is still returned — a PR opened from a fork is legitimately
-/// "this branch's" when the worktree tracks that fork.
-fn pick_pr_node(nodes: &[Value]) -> Option<&Value> {
-    let rank = |n: &Value| {
-        let base_owner = n
-            .get("url")
-            .and_then(Value::as_str)
-            .and_then(owner_repo_from_url)
-            .map(|(owner, _)| owner);
-        let head_owner = n
-            .pointer("/headRepositoryOwner/login")
-            .and_then(Value::as_str);
-        let same_repo = match (base_owner, head_owner) {
-            (Some(base), Some(head)) => base.eq_ignore_ascii_case(head),
-            // Old fixtures / a deleted head repo: no evidence of a fork.
-            _ => true,
+/// Pick THIS branch's PR from every PR whose head ref shares its name, after
+/// checking the full expected head repository identity. A fork is admitted
+/// only when the local branch's upstream names that fork; a missing head
+/// repository is not authority.
+fn pick_pr_node<'a>(
+    nodes: &'a [Value],
+    expected_head: &str,
+    expected_branch: &str,
+) -> Result<&'a Value, ForgeError> {
+    let mut missing_identity = false;
+    let candidates: Vec<&Value> = nodes
+        .iter()
+        .filter(|node| {
+            if node.get("headRefName").and_then(Value::as_str) != Some(expected_branch) {
+                return false;
+            }
+            let Some(actual) = node
+                .pointer("/headRepository/nameWithOwner")
+                .and_then(Value::as_str)
+            else {
+                missing_identity = true;
+                return false;
+            };
+            actual.eq_ignore_ascii_case(expected_head)
+        })
+        .collect();
+    if candidates.is_empty() {
+        return if missing_identity {
+            Err(ForgeError::NotConfigured(
+                "PR response omitted head repository identity",
+            ))
+        } else {
+            Err(ForgeError::NoPr)
         };
-        let open = n.get("state").and_then(Value::as_str) == Some("OPEN");
-        (!same_repo, !open)
-    };
-    // `min_by_key` keeps the FIRST of equal keys, preserving recency order.
-    nodes.iter().min_by_key(|n| rank(n))
+    }
+    // The API reply is newest-first. Prefer OPEN, retaining that order within
+    // each state class after exact repository filtering.
+    candidates
+        .into_iter()
+        .min_by_key(|node| node.get("state").and_then(Value::as_str) != Some("OPEN"))
+        .ok_or(ForgeError::NoPr)
 }
 
 /// The GraphQL `pullRequests(headRefName:)` reply as a `Result` — the forge
-/// trait's shape. No node ⇒ `NoPr`.
+/// trait's shape. No matching node ⇒ `NoPr`; malformed or unauthenticated
+/// identity data remains `NotConfigured` so the CLI ladder can retry.
 pub fn parse_graphql_pr_status(resp: &Value) -> Result<PrStatus, ForgeError> {
+    if resp
+        .get("errors")
+        .and_then(Value::as_array)
+        .is_some_and(|errors| !errors.is_empty())
+    {
+        return Err(ForgeError::NotConfigured(
+            "GraphQL PR status response errors",
+        ));
+    }
+    let data = resp.get("data").unwrap_or(resp);
+    let nodes = data
+        .pointer("/repository/pullRequests/nodes")
+        .and_then(Value::as_array)
+        .ok_or(ForgeError::NotConfigured(
+            "malformed GraphQL PR status nodes",
+        ))?;
+    if nodes.is_empty() {
+        return Err(ForgeError::NoPr);
+    }
+    let expected = nodes
+        .first()
+        .and_then(|node| node.get("url"))
+        .and_then(Value::as_str)
+        .and_then(owner_repo_from_url)
+        .map(|(owner, repo)| format!("{owner}/{repo}"))
+        .ok_or(ForgeError::NotConfigured(
+            "PR response omitted base identity",
+        ))?;
+    let expected_branch = nodes
+        .first()
+        .and_then(|node| node.get("headRefName"))
+        .and_then(Value::as_str)
+        .filter(|branch| !branch.is_empty())
+        .ok_or(ForgeError::NotConfigured("PR response omitted head branch"))?;
+    parse_graphql_pr_status_for(resp, &expected, expected_branch)
+}
+
+fn parse_graphql_pr_status_for(
+    resp: &Value,
+    expected_head: &str,
+    expected_branch: &str,
+) -> Result<PrStatus, ForgeError> {
     let data = resp.get("data").unwrap_or(resp);
     let nodes = data
         .pointer("/repository/pullRequests/nodes")
         .and_then(Value::as_array);
 
-    match nodes.and_then(|n| pick_pr_node(n)) {
-        None => Err(ForgeError::NoPr),
-        Some(node) => {
+    let nodes = nodes.ok_or(ForgeError::NotConfigured(
+        "malformed GraphQL PR status nodes",
+    ))?;
+    match pick_pr_node(nodes, expected_head, expected_branch) {
+        Err(error) => Err(error),
+        Ok(node) => {
             let s = |k: &str| {
                 node.get(k)
                     .and_then(Value::as_str)
@@ -359,6 +497,70 @@ impl GithubNative {
         Ok((token, owner, repo))
     }
 
+    /// Resolve the repository that owns the checked-out branch's push head.
+    /// Tracking `origin/main` does not change the local branch name: the
+    /// branch remains the query head, while this identity admits a configured
+    /// fork and rejects an unrelated same-name fork PR.
+    fn expected_head_repo(&self, loc: &GitLoc, base: &str) -> Result<String, ForgeError> {
+        let branch = loc
+            .git_out(&["rev-parse", "--abbrev-ref", "HEAD"])
+            .unwrap_or_default();
+        let remote = [
+            format!("branch.{branch}.pushRemote"),
+            "remote.pushDefault".to_string(),
+            format!("branch.{branch}.remote"),
+        ]
+        .into_iter()
+        .find_map(|key| {
+            loc.git_out(&["config", "--get", &key])
+                .filter(|v| !v.is_empty())
+        })
+        .or_else(|| {
+            let spec = format!("{branch}@{{upstream}}");
+            let upstream = loc.git_out(&["rev-parse", "--abbrev-ref", &spec])?;
+            upstream
+                .split_once('/')
+                .map(|(remote, _)| remote.to_string())
+        });
+        let Some(remote) = remote else {
+            return Ok(base.to_string());
+        };
+        let Some(url) = loc.git_out(&["remote", "get-url", &remote]) else {
+            return Ok(base.to_string());
+        };
+        let Some(identity) = thegn_core::forge::model::repo_identity_from_remote_url(&url) else {
+            return Ok(base.to_string());
+        };
+        if !identity.host.eq_ignore_ascii_case("github.com") {
+            return Err(ForgeError::NotConfigured(
+                "branch push remote is not public GitHub",
+            ));
+        }
+        Ok(parse_owner_repo(&url)
+            .map(|(owner, repo)| format!("{owner}/{repo}"))
+            .unwrap_or_else(|| base.to_string()))
+    }
+
+    fn base_owner_repo(
+        &self,
+        loc: &GitLoc,
+        branch: &str,
+        fallback: (String, String),
+    ) -> Result<(String, String), ForgeError> {
+        let Some(remote) = loc
+            .git_out(&["config", "--get", &format!("branch.{branch}.remote")])
+            .filter(|remote| !remote.is_empty())
+        else {
+            return Ok(fallback);
+        };
+        let url = loc
+            .git_out(&["remote", "get-url", &remote])
+            .ok_or(ForgeError::NotConfigured("branch base repository URL"))?;
+        parse_owner_repo(&url).ok_or(ForgeError::NotConfigured(
+            "branch base repository is not public GitHub",
+        ))
+    }
+
     /// One GraphQL round trip under the request timeout, classified.
     fn graphql(&self, token: String, body: Value, what: &'static str) -> Result<Value, ForgeError> {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -479,7 +681,7 @@ impl Forge for GithubNative {
         if pr != PrRef::Current {
             return Err(ForgeError::Unsupported("pr_status by number"));
         }
-        let (token, owner, repo) = self.gate(loc)?;
+        let (token, origin_owner, origin_repo) = self.gate(loc)?;
         // Just the branch — a local `git rev-parse`, never a network fetch.
         let branch = loc
             .git_out(&["rev-parse", "--abbrev-ref", "HEAD"])
@@ -489,19 +691,21 @@ impl Forge for GithubNative {
         if branch.is_empty() || branch == "HEAD" {
             return Err(ForgeError::NoPr);
         }
+        let (owner, repo) = self.base_owner_repo(loc, &branch, (origin_owner, origin_repo))?;
+        let expected_head = self.expected_head_repo(loc, &format!("{owner}/{repo}"))?;
         let body = serde_json::json!({
             "query": PR_QUERY,
             "variables": { "owner": owner, "repo": repo, "head": branch },
         });
         let resp = self.graphql(token, body, "pr_status")?;
-        parse_graphql_pr_status(&resp)
+        parse_graphql_pr_status_for(&resp, &expected_head, &branch)
     }
     fn pr_list(&self, loc: &GitLoc, limit: usize) -> Result<Vec<PrHeader>, ForgeError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
         let (token, owner, repo) = self.gate(loc)?;
-        let limit = limit.max(1);
-        let mut prs = Vec::new();
-        let mut after: Option<String> = None;
-        loop {
+        collect_pr_pages(limit, |after| {
             let body = serde_json::json!({
                 "query": PR_LIST_QUERY,
                 "variables": { "owner": owner, "repo": repo, "after": after },
@@ -509,15 +713,8 @@ impl Forge for GithubNative {
             // A failed later page fails the whole list: a partial open set
             // would read as PRs having left it (merge notifications, the
             // on-merge auto-clean) and overwrite the good cached row.
-            let resp = self.graphql(token.clone(), body, "pr_list")?;
-            prs.extend(parse_graphql_pr_list(&resp));
-            after = parse_graphql_pr_list_next(&resp);
-            if after.is_none() || prs.len() >= limit {
-                break;
-            }
-        }
-        prs.truncate(limit);
-        Ok(prs)
+            self.graphql(token.clone(), body, "pr_list")
+        })
     }
 }
 
@@ -800,7 +997,7 @@ mod tests {
              "url": "https://github.com/o/r/pull/7", "isDraft": true},
             {"number": 9, "headRefName": "fix/y", "state": "OPEN",
              "url": "https://github.com/o/r/pull/9", "isDraft": false}
-          ]}}}
+            ], "pageInfo": {"hasNextPage": false, "endCursor": null}}}}
         });
         let prs = parse_graphql_pr_list(&resp);
         assert_eq!(prs.len(), 2);
@@ -870,6 +1067,7 @@ mod tests {
             "number": 42, "title": "Add native host", "state": "OPEN",
             "url": "https://github.com/x/y/pull/42", "isDraft": false,
             "headRefName": "feat", "baseRefName": "main",
+            "headRepository": {"nameWithOwner": "x/y"},
             "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN",
             "reviewDecision": "APPROVED",
             "commits": { "nodes": [{ "commit": { "statusCheckRollup": {
@@ -921,6 +1119,33 @@ mod tests {
         assert_eq!(parse_graphql_pr_list_next(&serde_json::json!({})), None);
     }
 
+    #[test]
+    fn bounded_pr_pages_reject_malformed_or_repeating_cursors() {
+        let page = |cursor: &str| {
+            serde_json::json!({
+                "data": {"repository": {"pullRequests": {
+                    "nodes": [],
+                    "pageInfo": {"hasNextPage": true, "endCursor": cursor}
+                }}}
+            })
+        };
+        let mut calls = 0;
+        let result = collect_pr_pages(300, |after| {
+            calls += 1;
+            Ok(page(after.unwrap_or("first")))
+        });
+        assert!(matches!(result, Err(ForgeError::NotConfigured(_))));
+        assert_eq!(calls, 2);
+
+        let mut calls = 0;
+        let result = collect_pr_pages(0, |_| {
+            calls += 1;
+            Err(ForgeError::Other("I/O must not happen".into()))
+        });
+        assert_eq!(result.unwrap(), Vec::<PrHeader>::new());
+        assert_eq!(calls, 0);
+    }
+
     fn pr_node(number: u64, state: &str, head_owner: Option<&str>) -> Value {
         let mut node = serde_json::json!({
             "number": number, "title": "t", "state": state,
@@ -929,6 +1154,9 @@ mod tests {
         });
         if let Some(owner) = head_owner {
             node["headRepositoryOwner"] = serde_json::json!({ "login": owner });
+            node["headRepository"] = serde_json::json!({
+                "nameWithOwner": format!("{owner}/sage")
+            });
         }
         node
     }
@@ -969,15 +1197,24 @@ mod tests {
             ]),
             5
         );
-        // A fork-only match is still this branch's PR; no owner = no evidence.
-        assert_eq!(picked(vec![pr_node(7, "OPEN", Some("contributor"))]), 7);
+        // A fork-only match needs an explicit upstream head identity; a
+        // missing/deleted head repository is not authority.
+        let fork = pr_node(7, "OPEN", Some("contributor"));
+        let resp = serde_json::json!({
+            "data": {"repository": {"pullRequests": {"nodes": [fork]}}}
+        });
         assert_eq!(
-            picked(vec![
-                pr_node(8, "OPEN", None),
-                pr_node(9, "OPEN", Some("x"))
-            ]),
-            8
+            parse_graphql_pr_status_for(&resp, "contributor/sage", "main")
+                .expect("configured fork")
+                .number,
+            7
         );
+        let missing = serde_json::json!({
+            "data": {"repository": {"pullRequests": {"nodes": [
+                pr_node(8, "OPEN", None)
+            ]}}}
+        });
+        assert!(parse_graphql_pr_status_for(&missing, "acme/sage", "main").is_err());
     }
 }
 

@@ -100,6 +100,10 @@ pub struct MyWorkFeed {
     pub rows: Vec<WorkRow>,
     #[serde(default)]
     pub note: String,
+    /// Origin identity captured by the producer. Legacy feeds have no
+    /// identity and are safe to display only as non-PR descriptive rows.
+    #[serde(default)]
+    pub source_repo: Option<crate::forge::model::ForgeRepoIdentity>,
 }
 
 impl MyWorkFeed {
@@ -114,6 +118,7 @@ impl MyWorkFeed {
             .map(|rows| MyWorkFeed {
                 rows,
                 note: String::new(),
+                source_repo: None,
             })
     }
 }
@@ -207,6 +212,7 @@ mod spec {
                 ..Default::default()
             }],
             note: "repo scope unavailable".into(),
+            source_repo: None,
         };
         let json = serde_json::to_string(&feed).unwrap();
         assert_eq!(MyWorkFeed::from_cache_json(&json), Some(feed));

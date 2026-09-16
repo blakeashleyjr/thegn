@@ -106,7 +106,9 @@ pub(crate) fn is_remote_ref_path(p: &std::path::Path) -> bool {
 /// detached-HEAD churn (a rebase) resolves to `NoPr` without a network call.
 pub(crate) fn is_head_move_path(p: &std::path::Path) -> bool {
     let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
-    name == "HEAD" && !p.components().any(|c| c.as_os_str() == "logs")
+    name == "HEAD"
+        && p.components().any(|c| c.as_os_str() == ".git")
+        && !p.components().any(|c| c.as_os_str() == "logs")
 }
 
 /// A path in the form the fs-watcher will report it in.
@@ -384,6 +386,7 @@ mod tests {
         assert!(!yes("/repo/.git/HEAD.lock"));
         assert!(!yes("/repo/.git/ORIG_HEAD"));
         assert!(!yes("/repo/.git/refs/heads/main"));
+        assert!(!yes("/repo/src/HEAD"));
         assert!(!yes("/repo/src/HEAD.rs"));
     }
 
