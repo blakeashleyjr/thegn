@@ -1709,18 +1709,15 @@ fn repo_badges_require_a_stamped_cache_and_the_current_root_origin() {
     let (root, _) =
         git_repo_with_linked_worktree(&dir.path().join("repo"), &dir.path().join("feat"));
     let root_path = std::path::Path::new(&root);
-    assert!(
-        thegn_core::util::git_out(
-            root_path,
-            &[
-                "remote",
-                "add",
-                "origin",
-                "https://github.com/acme/repo.git"
-            ]
-        )
-        .is_some()
-    );
+    assert!(thegn_core::util::git_ok(
+        root_path,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/acme/repo.git"
+        ]
+    ));
     let db = thegn_core::db::Db::open_memory().unwrap();
     assert!(scoped_open_pr_maps(&db, &root).is_none());
     let row = PrHeader {
@@ -1739,31 +1736,25 @@ fn repo_badges_require_a_stamped_cache_and_the_current_root_origin() {
     let (counts, numbers) = scoped_open_pr_maps(&db, &root).unwrap();
     assert_eq!(counts.get("feat"), Some(&1));
     assert_eq!(numbers.get("feat"), Some(&7));
-    assert!(
-        thegn_core::util::git_out(
-            root_path,
-            &[
-                "remote",
-                "set-url",
-                "origin",
-                "https://other.example/acme/repo.git"
-            ]
-        )
-        .is_some()
-    );
+    assert!(thegn_core::util::git_ok(
+        root_path,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "https://other.example/acme/repo.git"
+        ]
+    ));
     assert!(scoped_open_pr_maps(&db, &root).is_none());
-    assert!(
-        thegn_core::util::git_out(
-            root_path,
-            &[
-                "remote",
-                "set-url",
-                "origin",
-                "https://github.com/acme/repo.git"
-            ]
-        )
-        .is_some()
-    );
+    assert!(thegn_core::util::git_ok(
+        root_path,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "https://github.com/acme/repo.git"
+        ]
+    ));
     db.put_pr_branch_cache(&root, &serde_json::to_string(&vec![row]).unwrap())
         .unwrap();
     assert!(
@@ -1789,16 +1780,13 @@ fn auto_clean_refuses_a_target_origin_change_before_and_during_state_lookup() {
         ],
         vec!["config", "extensions.worktreeConfig", "true"],
     ] {
-        assert!(thegn_core::util::git_out(root_path, &args).is_some());
+        assert!(thegn_core::util::git_ok(root_path, &args));
     }
     let set_target_origin = |url: &str| {
-        assert!(
-            thegn_core::util::git_out(
-                target_path,
-                &["config", "--worktree", "remote.origin.url", url]
-            )
-            .is_some()
-        )
+        assert!(thegn_core::util::git_ok(
+            target_path,
+            &["config", "--worktree", "remote.origin.url", url]
+        ))
     };
     let db = thegn_core::db::Db::open_memory().unwrap();
     db.put_worktree("repo/feat", &root, &target, "feat", None, None)
