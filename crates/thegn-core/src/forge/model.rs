@@ -1184,6 +1184,7 @@ mod tests {
             worktree: "/wt".into(),
             branch: "main".into(),
             fetched_at: 1,
+            source_scope: None,
             threads: vec![ReviewThreadRow {
                 author: "mira".into(),
                 path: "a.rs".into(),
