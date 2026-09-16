@@ -40,6 +40,17 @@ rustdoc-args = [
     'feature="docs"',
 ]
 
+# LOCAL DEVIATION (see PATCH.md). Cargo caps lints for registry and git
+# dependencies but not for path dependencies, and this crate is wired in as
+# `termwiz = { path = "vendor/termwiz" }`, so upstream's 0.23.3 sources are
+# linted as if they were first-party. `mismatched_lifetime_syntaxes` became
+# warn-by-default after this release was published and fires 13 times here,
+# purely on `Foo` vs `Foo<'_>` in return position. Allowing it at the manifest
+# keeps every `.rs` file byte-identical to the published crate; `cargo fix`
+# would instead edit 13 source sites and grow the delta this patch minimizes.
+[lints.rust]
+mismatched_lifetime_syntaxes = "allow"
+
 [features]
 docs = [
     "widgets",
