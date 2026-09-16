@@ -451,7 +451,6 @@ esac
         let old_path = std::env::var_os("PATH").unwrap_or_default();
         let path = format!("{}:{}", bin.path().display(), old_path.to_string_lossy());
         let log = bin.path().join("args");
-        let path = path;
         let log = log.to_string_lossy().into_owned();
         let _env = crate::testenv::EnvGuard::set(&[("PATH", &path), ("FAKE_GH_LOG", &log)]);
         let result = pr_status_raw(&GitLoc::Local(dir.path().to_path_buf()), None);

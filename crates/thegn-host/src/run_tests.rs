@@ -3531,3 +3531,231 @@ fn worktree_disk_inspection_never_falls_back_to_process_cwd() {
     );
     assert_eq!(worktree_disk_cwd(&missing), None);
 }
+
+#[test]
+fn pending_folder_intent_is_generation_scoped_and_identity_checked() {
+    let folders = vec![thegn_core::models::FolderRow {
+        folder_id: 7,
+        repo_path: "/repo".into(),
+        name: "Waiting".into(),
+        position: 0,
+        created_at: 0,
+    }];
+    let mut pending = PendingFolder::from([
+        (
+            11,
+            (
+                "/repo".into(),
+                crate::handlers::sidebar_keys::SidebarFolderIntent {
+                    folder_id: 7,
+                    name: "Waiting".into(),
+                },
+            ),
+        ),
+        (
+            12,
+            (
+                "/repo".into(),
+                crate::handlers::sidebar_keys::SidebarFolderIntent {
+                    folder_id: 8,
+                    name: "Review".into(),
+                },
+            ),
+        ),
+    ]);
+
+    // Two in-flight creations consume only their own generation and retain
+    // the captured folder ID and name.
+    assert_eq!(
+        take_pending_folder_for_path(&mut pending, 11, "/wt/11", &folders),
+        Some(("/wt/11".into(), "/repo".into(), 7))
+    );
+    assert!(take_pending_folder_for_path(&mut pending, 11, "/wt/11", &folders).is_none());
+
+    // A deleted folder consumes the intent without recreating or selecting a
+    // same-named replacement.
+    assert!(take_pending_folder_for_path(&mut pending, 12, "/wt/12", &folders).is_none());
+    assert!(pending.is_empty());
+
+    pending.insert(
+        13,
+        (
+            "/repo".into(),
+            crate::handlers::sidebar_keys::SidebarFolderIntent {
+                folder_id: 7,
+                name: "Waiting".into(),
+            },
+        ),
+    );
+    discard_pending_folder(&mut pending, 13);
+    assert!(
+        pending.is_empty(),
+        "failed/cancel cleanup is generation-local"
+    );
+}
+
+#[test]
+fn halted_folder_intent_uses_the_generation_owned_group_path() {
+    let session = Session {
+        id: "session".into(),
+        worktrees: vec![WorktreeGroup::new(
+            "repo/feature",
+            GroupKind::Branch,
+            "/wt/feature",
+        )],
+        active: 0,
+    };
+    let folders = vec![thegn_core::models::FolderRow {
+        folder_id: 7,
+        repo_path: "/repo".into(),
+        name: "Waiting".into(),
+        position: 0,
+        created_at: 0,
+    }];
+    let mut pending = PendingFolder::from([(
+        21,
+        (
+            "/repo".into(),
+            crate::handlers::sidebar_keys::SidebarFolderIntent {
+                folder_id: 7,
+                name: "Waiting".into(),
+            },
+        ),
+    )]);
+    assert_eq!(
+        take_pending_folder_for_group(
+            &mut pending,
+            21,
+            &session,
+            &("repo/feature".into(), 0),
+            &folders,
+        ),
+        Some(("/wt/feature".into(), "/repo".into(), 7))
+    );
+    assert!(pending.is_empty());
+}
+
+#[test]
+fn halted_creation_routes_folder_intent_without_consuming_another_generation() {
+    use crate::handlers::creating::{InFlight, on_halted};
+    let mut session = Session {
+        id: "/repo".into(),
+        worktrees: vec![
+            WorktreeGroup::new("repo/first", GroupKind::Branch, "/wt/first"),
+            WorktreeGroup::new("repo/second", GroupKind::Branch, "/wt/second"),
+        ],
+        active: 1,
+    };
+    let first_key = ("repo/first".into(), 0);
+    let second_key = ("repo/second".into(), 0);
+    let mut inflight = InFlight {
+        progress: std::collections::HashMap::from([
+            (41, crate::wizard::CreationProgress::new("first".into())),
+            (42, crate::wizard::CreationProgress::new("second".into())),
+        ]),
+        gen_tab: std::collections::HashMap::from([
+            (41, first_key.clone()),
+            (42, second_key.clone()),
+        ]),
+        wizard_gen: Some(42),
+    };
+    let mut model = FrameModel::default();
+    let mut sidebar = SidebarState::default();
+    let mut loading = crate::loading::track::LoadingTracker::default();
+    let mut creating = std::collections::HashSet::from([first_key.clone(), second_key.clone()]);
+    let mut wizard = None;
+    let mut wizard_tx = None;
+    let folder = thegn_core::models::FolderRow {
+        folder_id: 7,
+        repo_path: "/repo".into(),
+        name: "Waiting".into(),
+        position: 0,
+        created_at: 0,
+    };
+    let mut pending = PendingFolder::from([41, 42].map(|generation| {
+        (
+            generation,
+            (
+                "/repo".into(),
+                crate::handlers::sidebar_keys::SidebarFolderIntent {
+                    folder_id: 7,
+                    name: "Waiting".into(),
+                },
+            ),
+        )
+    }));
+    let kept = on_halted(
+        &mut session,
+        &mut model,
+        &mut sidebar,
+        &mut loading,
+        &mut creating,
+        &mut inflight,
+        &mut wizard,
+        &mut wizard_tx,
+        41,
+    )
+    .unwrap();
+    assert_eq!(kept, first_key);
+    assert_eq!(session.active, 0);
+    assert_eq!(
+        session.worktrees.len(),
+        2,
+        "Halted retains the registered worktree"
+    );
+    assert_eq!(
+        take_pending_folder_for_group(&mut pending, 41, &session, &kept, &[folder]),
+        Some(("/wt/first".into(), "/repo".into(), 7))
+    );
+    assert!(!pending.contains_key(&41));
+    assert!(pending.contains_key(&42));
+    assert!(inflight.progress.contains_key(&42));
+    assert_eq!(inflight.gen_tab.get(&42), Some(&second_key));
+    assert_eq!(inflight.wizard_gen, Some(42));
+    assert!(creating.contains(&second_key));
+    assert!(!creating.contains(&first_key));
+    assert!(
+        on_halted(
+            &mut session,
+            &mut model,
+            &mut sidebar,
+            &mut loading,
+            &mut creating,
+            &mut inflight,
+            &mut wizard,
+            &mut wizard_tx,
+            41
+        )
+        .is_none()
+    );
+    assert!(
+        pending.contains_key(&42),
+        "a duplicate terminal event leaves the other intent alone"
+    );
+}
+
+#[test]
+fn pending_folder_intent_refuses_a_changed_name_before_completion() {
+    let mut pending = PendingFolder::from([(
+        51,
+        (
+            "/repo".into(),
+            crate::handlers::sidebar_keys::SidebarFolderIntent {
+                folder_id: 7,
+                name: "Waiting".into(),
+            },
+        ),
+    )]);
+    let folder = thegn_core::models::FolderRow {
+        folder_id: 7,
+        repo_path: "/repo".into(),
+        name: "Other work".into(),
+        position: 0,
+        created_at: 0,
+    };
+    assert!(take_pending_folder_for_path(&mut pending, 51, "/wt/first", &[folder]).is_none());
+    assert!(
+        pending.is_empty(),
+        "do not resurrect stale intent on a later event"
+    );
+}

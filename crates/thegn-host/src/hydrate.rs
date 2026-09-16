@@ -1470,6 +1470,7 @@ fn collect_sidebar_status(
         Default::default()
     };
 
+    let mut pr_maps: std::collections::HashMap<String, Option<OpenPrMaps>> = Default::default();
     // Populate agent and PR badges for ALL registered worktrees from the DB.
     // This ensures non-session workspaces still show their agent/PR status
     // when they are rendered as collapsed/switchable sidebar rows.
@@ -1483,8 +1484,10 @@ fn collect_sidebar_status(
         }
         if !wt.branch.is_empty()
             && !wt.repo_root.is_empty()
-            && let Some((counts, numbers)) =
-                scoped_open_pr_maps(db, &wt.repo_root, std::path::Path::new(&wt.worktree))
+            && let Some((counts, numbers)) = pr_maps
+                .entry(wt.repo_root.clone())
+                .or_insert_with(|| scoped_open_pr_maps(db, &wt.repo_root))
+                .as_ref()
             && let Some(&n) = counts.get(&wt.branch)
             && n > 0
         {
@@ -1722,8 +1725,10 @@ fn collect_sidebar_status(
         status.pr_counts.remove(&path);
         status.pr_numbers.remove(&path);
         if let Some(branch) = branch
-            && let Some((counts, numbers)) =
-                scoped_open_pr_maps(db, &repo_root, std::path::Path::new(&path))
+            && let Some((counts, numbers)) = pr_maps
+                .entry(repo_root.clone())
+                .or_insert_with(|| scoped_open_pr_maps(db, &repo_root))
+                .as_ref()
             && let Some(&n) = counts.get(&branch)
             && n > 0
         {
@@ -2027,31 +2032,23 @@ fn cached_pr_applies(
     cache_key: &str,
     loc_path: &str,
     branch: &str,
-    origin_repo: Option<&thegn_core::forge::model::ForgeRepoIdentity>,
+    current: Option<&thegn_core::forge::checkout::ForgeCheckoutScope>,
 ) -> bool {
-    use thegn_core::forge::model::{
-        PanelState, pr_url_in_repo_identity, repo_identity_from_pr_url,
+    let Some(current) = current else {
+        return false;
     };
-    let same_worktree =
-        cached.worktree.is_empty() || cached.worktree == cache_key || cached.worktree == loc_path;
-    let same_branch = !cached.branch.is_empty() && !branch.is_empty() && cached.branch == branch;
-    let same_repo = origin_repo.is_some_and(|expected| {
-        cached
-            .source_repo
-            .as_ref()
-            .is_some_and(|source| source.matches(expected))
-            && match &cached.state {
-                PanelState::Pr(pr) => {
-                    repo_identity_from_pr_url(&pr.url)
-                        .is_some_and(|actual| actual.matches(expected))
-                        && pr_url_in_repo_identity(&pr.url, expected)
-                }
-                // A stamped NoPr/error is still scoped evidence; it must not
-                // leak across origins, but it has no PR URL to recheck.
-                _ => true,
+    let same_worktree = cached.worktree == cache_key || cached.worktree == loc_path;
+    same_worktree
+        && cached.branch == branch
+        && branch == current.branch
+        && cached.source_scope.as_ref() == Some(current)
+        && match &cached.state {
+            thegn_core::forge::model::PanelState::Pr(pr) => {
+                pr.head_ref_name == branch
+                    && thegn_core::forge::model::pr_url_in_repo_identity(&pr.url, &current.base)
             }
-    });
-    same_worktree && same_branch && same_repo
+            _ => true,
+        }
 }
 
 /// Map the typed PR cache into the panel's pr/checks/threads/issues fields.
@@ -2664,6 +2661,7 @@ pub(crate) fn build_panel(
         .as_ref()
         .and_then(|repo| (repo.path.matches('/').count() == 1).then(|| repo.path.clone()));
 
+    let checkout_scope = thegn_core::forge::checkout::checkout_scope(&loc).ok();
     // The typed PR cache: summary + checks + review threads + issues.
     if let Ok(Some((json, _))) = db.get_pr_cache(&cache_key)
         && let Ok(cached) = serde_json::from_str::<thegn_core::forge::model::PrPanel>(&json)
@@ -2672,7 +2670,7 @@ pub(crate) fn build_panel(
             &cache_key,
             &loc.path(),
             &panel.branch,
-            origin_repo.as_ref(),
+            checkout_scope.as_ref(),
         )
     {
         apply_pr_cache(&mut panel, cached);
@@ -2941,29 +2939,9 @@ pub(crate) fn build_panel(
     if let Ok(Some((json, _))) = db.get_my_work_cache(&my_work_scope)
         && let Some(feed) = thegn_core::work::MyWorkFeed::from_cache_json(&json)
     {
-        let feed_repo = feed.source_repo.clone();
+        let feed = feed.for_scope(origin_repo.as_ref(), crate::panel::scope::mine_all());
         panel.my_work = feed.rows;
         panel.my_work_note = feed.note;
-        // The repo-scoped row is keyed by repo root, not repo identity: after
-        // `origin` changes it still holds the old repo's PRs until a refresh.
-        if !crate::panel::scope::mine_all() {
-            let feed_valid = origin_repo.as_ref().is_some_and(|expected| {
-                feed_repo
-                    .as_ref()
-                    .is_some_and(|cached| cached.matches(expected))
-            });
-            if !feed_valid {
-                // The envelope covers issue and notification rows too: a
-                // repo-root key alone cannot prove those rows survived an
-                // origin swap.
-                panel.my_work.clear();
-            } else if let Some(expected) = origin_repo.as_ref() {
-                panel.my_work.retain(|r| {
-                    r.kind != thegn_core::work::WorkKind::Pr
-                        || thegn_core::forge::model::pr_url_in_repo_identity(&r.url, expected)
-                });
-            }
-        }
     }
     crate::hydrate_feed::populate_notifications(db, &repo_root, app_cfg, &mut panel);
     populate_review_tasks(db, &mut panel);
@@ -3455,13 +3433,9 @@ pub(crate) fn spawn_pr_cache_refresh(
         // Per-worktree cache key: the HOST path, never `loc.path()` (which
         // collides across sandboxed worktrees — see `worktree_cache_key`).
         let cache_key = thegn_core::remote::GitLoc::worktree_cache_key(&cwd);
-        let origin_before = thegn_core::forge::model::repo_identity_from_remote_url(
-            &loc.git_out(&["remote", "get-url", "origin"])
-                .unwrap_or_default(),
-        );
-        let branch_before = loc
-            .git_out(&["rev-parse", "--abbrev-ref", "HEAD"])
-            .filter(|branch| !branch.is_empty() && branch != "HEAD");
+        let Ok(scope_before) = thegn_core::forge::checkout::checkout_scope(&loc) else {
+            return;
+        };
 
         // Snapshot the old PR state BEFORE overwriting the cache.
         let old_pr: Option<Box<thegn_core::forge::model::PrStatus>> = db
@@ -3472,16 +3446,19 @@ pub(crate) fn spawn_pr_cache_refresh(
                 serde_json::from_str::<thegn_core::forge::model::PrPanel>(&json).ok()
             })
             .and_then(|p| {
-                (p.source_repo
-                    .as_ref()
-                    .zip(origin_before.as_ref())
-                    .is_some_and(|(cached, current)| cached.matches(current))
-                    && branch_before.as_deref() == Some(p.branch.as_str()))
-                .then(|| match p.state {
+                if !cached_pr_applies(
+                    &p,
+                    &cache_key,
+                    &loc.path(),
+                    &scope_before.branch,
+                    Some(&scope_before),
+                ) {
+                    return None;
+                }
+                match p.state {
                     thegn_core::forge::model::PanelState::Pr(pr) => Some(pr),
                     _ => None,
-                })
-                .flatten()
+                }
             });
         let old_pr_state = old_pr.as_ref().map(|pr| pr.state.clone());
 
@@ -3493,14 +3470,20 @@ pub(crate) fn spawn_pr_cache_refresh(
             thegn_core::forge::PrRef::Current,
             thegn_core::forge::PrDepth::Full,
         );
-        let origin_after = thegn_core::forge::model::repo_identity_from_remote_url(
-            &loc.git_out(&["remote", "get-url", "origin"])
-                .unwrap_or_default(),
-        );
-        let branch_after = loc
-            .git_out(&["rev-parse", "--abbrev-ref", "HEAD"])
-            .filter(|branch| !branch.is_empty() && branch != "HEAD");
-        panel.source_repo = origin_after.clone();
+        let scope_after = thegn_core::forge::checkout::checkout_scope(&loc).ok();
+        if scope_after.as_ref() != Some(&scope_before) {
+            return;
+        }
+        panel.source_scope = scope_after;
+        if !cached_pr_applies(
+            &panel,
+            &cache_key,
+            &loc.path(),
+            &scope_before.branch,
+            Some(&scope_before),
+        ) {
+            return;
+        }
         // Feed the app-wide connectivity holder (this CLI path is the 20s PR
         // backstop + the offline recovery probe).
         crate::connectivity_gate::report_pr_panel(&panel.state);
@@ -3516,12 +3499,7 @@ pub(crate) fn spawn_pr_cache_refresh(
         // preserves both the displayed data and the transition diff. See
         // `pr_state_is_definitive` and `github.rs`'s Offline doc ("Stale cached
         // data may still be shown").
-        if pr_state_is_definitive(&panel.state)
-            && origin_before.is_some()
-            && origin_before == origin_after
-            && branch_before.as_deref() == Some(panel.branch.as_str())
-            && branch_before == branch_after
-        {
+        if pr_state_is_definitive(&panel.state) {
             let _ = db.put_pr_cache(&cache_key, &panel.branch, &json); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
         }
 
@@ -3540,6 +3518,13 @@ pub(crate) fn spawn_pr_cache_refresh(
                 ),
                 deep_forge.pr_diff(&loc, thegn_core::forge::PrRef::Current),
             ) {
+                if thegn_core::forge::checkout::checkout_scope(&loc)
+                    .ok()
+                    .as_ref()
+                    != Some(&scope_before)
+                {
+                    return;
+                }
                 let snapshot = thegn_core::review::PrReviewSnapshot {
                     worktree_key: cache_key.clone(),
                     // Review-cache identity follows the checked-out local
@@ -3680,7 +3665,9 @@ pub(crate) fn spawn_pr_cache_refresh(
         if !cwd.is_dir() {
             return;
         }
-        let loc = thegn_core::remote::GitLoc::for_worktree(&cwd);
+        // This cache is keyed by the root checkout, so fetch that repository's
+        // origin rather than an active worktree's possibly overridden remote.
+        let loc = thegn_core::remote::GitLoc::Local(std::path::PathBuf::from(&repo_root));
         let forges = crate::forge_handle::get();
         let forge = forges.for_loc(&loc);
         let origin_before = thegn_core::forge::model::repo_identity_from_remote_url(
@@ -3735,17 +3722,18 @@ pub(crate) fn spawn_pr_cache_refresh(
                 .get_pr_branch_cache(&repo_root)
                 .ok()
                 .flatten()
-                .map(|(old_json, _)| {
-                    let (cached_repo, rows) =
-                        thegn_core::forge::model::parse_pr_branch_cache(&old_json);
-                    cached_repo
-                        .as_ref()
-                        .zip(origin_before.as_ref())
-                        .is_some_and(|(cached, current)| cached.matches(current))
-                        .then(|| rows)
+                .and_then(|(old_json, _)| {
+                    thegn_core::forge::model::pr_headers_for_repo(
+                        &old_json,
+                        origin_before.as_ref()?,
+                    )
                 })
-                .flatten()
-                .map(|rows| rows.into_iter().map(|p| p.head_ref).collect());
+                .map(|rows| {
+                    rows.into_iter()
+                        .filter(|p| p.state.eq_ignore_ascii_case("OPEN"))
+                        .map(|p| p.head_ref)
+                        .collect()
+                });
             if let Some(old_open) = old_open {
                 use thegn_core::store::WorkspaceStore;
                 let wts: Vec<(String, String, Vec<String>)> = db
@@ -3912,28 +3900,23 @@ pub(crate) fn pr_linked_notifications(
     out
 }
 
-/// Read the repo-rooted PR badge cache only when its stamped forge identity
-/// agrees with this worktree's current origin. Sidebar consumers cannot use
-/// the unqualified DB count helpers because a repo root can be repointed.
-fn scoped_open_pr_maps(
-    db: &thegn_core::db::Db,
-    repo_root: &str,
-    worktree: &std::path::Path,
-) -> Option<(
+type OpenPrMaps = (
     std::collections::BTreeMap<String, usize>,
     std::collections::BTreeMap<String, u64>,
-)> {
-    use thegn_core::store::CacheStore;
-    let loc = thegn_core::remote::GitLoc::for_worktree(worktree);
+);
+
+/// Read a repo-rooted cache against the root checkout's origin. Callers memoize
+/// it per repository per hydration. No remote worktree is contacted to paint
+/// a background badge, and a missing/legacy cache performs no git operation.
+fn scoped_open_pr_maps(db: &thegn_core::db::Db, repo_root: &str) -> Option<OpenPrMaps> {
+    let json = db.get_pr_branch_cache(repo_root).ok().flatten()?.0;
+    let (cached, rows) = thegn_core::forge::model::parse_pr_branch_cache(&json);
+    let cached = cached?;
+    let loc = thegn_core::remote::GitLoc::Local(std::path::PathBuf::from(repo_root));
     let expected = thegn_core::forge::model::repo_identity_from_remote_url(
         &loc.git_out(&["remote", "get-url", "origin"])?,
     )?;
-    let json = db.get_pr_branch_cache(repo_root).ok().flatten()?.0;
-    let (cached, rows) = thegn_core::forge::model::parse_pr_branch_cache(&json);
-    if !cached
-        .as_ref()
-        .is_some_and(|source| source.matches(&expected))
-    {
+    if !cached.matches(&expected) {
         return None;
     }
     let mut counts = std::collections::BTreeMap::new();
@@ -3984,6 +3967,32 @@ fn maybe_clean_merged_worktrees(
     source_repo: &thegn_core::forge::model::ForgeRepoIdentity,
     cfg: &thegn_core::config::DiskConfig,
 ) {
+    maybe_clean_merged_worktrees_with_state(
+        db,
+        active,
+        repo_root,
+        open_now,
+        source_repo,
+        cfg,
+        |loc, branch| {
+            crate::forge_handle::get()
+                .for_loc(loc)
+                .pr_state_for_branch(loc, branch)
+                .ok()
+                .flatten()
+        },
+    );
+}
+
+fn maybe_clean_merged_worktrees_with_state(
+    db: &thegn_core::db::Db,
+    active: &std::path::Path,
+    repo_root: &str,
+    open_now: &[thegn_core::forge::model::PrHeader],
+    source_repo: &thegn_core::forge::model::ForgeRepoIdentity,
+    cfg: &thegn_core::config::DiskConfig,
+    mut resolve_state: impl FnMut(&thegn_core::remote::GitLoc, &str) -> Option<String>,
+) {
     use std::collections::HashSet;
 
     // Branches with an open PR in the prior cache.
@@ -3991,13 +4000,7 @@ fn maybe_clean_merged_worktrees(
         .get_pr_branch_cache(repo_root)
         .ok()
         .flatten()
-        .and_then(|(json, _)| {
-            let (cached_repo, rows) = thegn_core::forge::model::parse_pr_branch_cache(&json);
-            cached_repo
-                .as_ref()
-                .is_some_and(|cached| cached.matches(source_repo))
-                .then_some(rows)
-        })
+        .and_then(|(json, _)| thegn_core::forge::model::pr_headers_for_repo(&json, source_repo))
         .into_iter()
         .flatten()
         .filter(|p| p.state == "OPEN")
@@ -4036,13 +4039,20 @@ fn maybe_clean_merged_worktrees(
         // branch did) deletes the worktree's build artifacts on a transient error
         // or a still-open PR — unrecoverable. When unsure, do nothing.
         let target_loc = thegn_core::remote::GitLoc::for_worktree(&path);
-        let state = crate::forge_handle::get()
-            .for_loc(&target_loc)
-            .pr_state_for_branch(&target_loc, &row.branch)
-            .ok()
-            .flatten();
+        let Ok(target_scope) = thegn_core::forge::checkout::checkout_scope(&target_loc) else {
+            continue;
+        };
+        if !target_scope.origin.matches(source_repo) || target_scope.branch != row.branch {
+            continue;
+        }
+        let state = resolve_state(&target_loc, &row.branch);
         let (merged, should) = pr_clean_decision(state.as_deref(), cfg);
-        if !should {
+        if !should
+            || thegn_core::forge::checkout::checkout_scope(&target_loc)
+                .ok()
+                .as_ref()
+                != Some(&target_scope)
+        {
             continue;
         }
         if let Ok(reclaimed) = thegn_core::worktree::clean_target(&path)
@@ -4306,6 +4316,7 @@ pub(crate) fn spawn_my_work_refresh(
                 rows,
                 note,
                 source_repo: source_repo_after,
+                cache_version: 1,
             };
             if let Ok(db) = thegn_core::db::Db::open()
                 && let Ok(json) = serde_json::to_string(&feed)

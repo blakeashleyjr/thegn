@@ -62,10 +62,10 @@ pub struct PrPanel {
     /// Open repo issues (a small page), best-effort.
     #[serde(default)]
     pub issues: Vec<IssueRow>,
-    /// Repository identity used to fetch this row. Old cache rows have no
-    /// identity and cannot authorize a changed origin.
+    /// Checkout scope checked around this fetch. An unstamped legacy row is
+    /// not evidence for the current origin, PR base, push head, or branch.
     #[serde(default)]
-    pub source_repo: Option<ForgeRepoIdentity>,
+    pub source_scope: Option<super::checkout::ForgeCheckoutScope>,
 }
 
 /// Lossless forge repository identity for cache provenance and authority
@@ -292,6 +292,21 @@ pub fn parse_pr_branch_cache(json: &str) -> (Option<ForgeRepoIdentity>, Vec<PrHe
     (None, serde_json::from_str(json).unwrap_or_default())
 }
 
+/// A repo-root cache is usable only with matching producer provenance. Unknown
+/// legacy arrays are cache misses; malformed or foreign PR URLs never become
+/// badge or transition evidence.
+pub fn pr_headers_for_repo(json: &str, expected: &ForgeRepoIdentity) -> Option<Vec<PrHeader>> {
+    let (source, mut rows) = parse_pr_branch_cache(json);
+    if !source
+        .as_ref()
+        .is_some_and(|source| source.matches(expected))
+    {
+        return None;
+    }
+    rows.retain(|row| pr_url_in_repo_identity(&row.url, expected));
+    Some(rows)
+}
+
 impl PrPanel {
     /// Fold a forge answer into the panel feed — the one place a transport
     /// error becomes a `PanelState`. `threads`/`issues` start empty; the
@@ -325,7 +340,7 @@ impl PrPanel {
             fetched_at: crate::util::now(),
             threads: Vec::new(),
             issues: Vec::new(),
-            source_repo: None,
+            source_scope: None,
         }
     }
 }
@@ -432,7 +447,7 @@ fn identity_from_host_path(host: &str, path: &str) -> Option<ForgeRepoIdentity> 
 /// Parse a lossless host + repository path from supported git remote forms.
 pub fn repo_identity_from_remote_url(url: &str) -> Option<ForgeRepoIdentity> {
     let trimmed = url.trim();
-    if trimmed != url || !url.is_ascii() {
+    if url.len() > 4096 || trimmed != url || !url.is_ascii() {
         return None;
     }
     if let Some(rest) = trimmed.strip_prefix("https://") {
@@ -450,24 +465,25 @@ pub fn repo_identity_from_remote_url(url: &str) -> Option<ForgeRepoIdentity> {
 
 /// Parse a lossless host + repository path from an HTTP(S) PR/issue URL.
 pub fn repo_identity_from_pr_url(url: &str) -> Option<ForgeRepoIdentity> {
+    if url.len() > 4096 || !url.is_ascii() {
+        return None;
+    }
     let rest = url
         .strip_prefix("https://")
         .or_else(|| url.strip_prefix("http://"))?;
     let (host, path) = rest.split_once('/')?;
-    let mut parts: Vec<&str> = path.trim_matches('/').split('/').collect();
-    let marker = parts.iter().enumerate().position(|(index, part)| {
-        if index < 2 {
-            return false;
-        }
-        match *part {
-            "pull" | "pulls" | "issues" | "merge_requests" => parts
-                .get(index + 1)
-                .is_some_and(|number| number.parse::<u64>().is_ok()),
-            "-" => parts.get(index + 1) == Some(&"merge_requests"),
-            _ => false,
-        }
-    })?;
-    parts.truncate(marker);
+    let mut parts: Vec<&str> = path.trim_end_matches('/').split('/').collect();
+    let number = parts.pop()?.parse::<u64>().ok()?;
+    if number == 0 {
+        return None;
+    }
+    let marker = parts.pop()?;
+    if !matches!(marker, "pull" | "pulls" | "issues" | "merge_requests") {
+        return None;
+    }
+    if parts.last() == Some(&"-") {
+        parts.pop();
+    }
     identity_from_host_path(host, &parts.join("/"))
 }
 
@@ -1479,7 +1495,7 @@ mod tests {
             fetched_at: 0,
             threads: Vec::new(),
             issues: Vec::new(),
-            source_repo: None,
+            source_scope: None,
         };
         let v: serde_json::Value = serde_json::to_value(&panel).unwrap();
         assert_eq!(v["kind"], "no_pr");
@@ -1501,7 +1517,7 @@ mod tests {
             fetched_at: 0,
             threads: Vec::new(),
             issues: Vec::new(),
-            source_repo: None,
+            source_scope: None,
         };
         let v: serde_json::Value = serde_json::to_value(&panel).unwrap();
         // The plugin reads these flattened keys.
@@ -1551,5 +1567,36 @@ mod tests {
         assert!(matches!(ok.state, PanelState::Pr(p) if p.number == 1));
         assert_eq!(ok.worktree, "/w");
         assert_eq!(ok.branch, "b");
+    }
+}
+
+#[cfg(test)]
+mod cache_scope_regression_tests {
+    use super::*;
+
+    #[test]
+    fn pr_url_suffix_does_not_truncate_numeric_namespace_components() {
+        let expected =
+            repo_identity_from_remote_url("https://gitlab.example/group/sub/pull/42/repo.git")
+                .unwrap();
+        assert!(pr_url_in_repo_identity(
+            "https://gitlab.example/group/sub/pull/42/repo/-/merge_requests/7",
+            &expected
+        ));
+        assert!(pr_url_in_repo_identity(
+            "https://gitlab.example/group/sub/pull/42/repo/-/issues/8",
+            &expected
+        ));
+        assert!(!pr_url_in_repo_identity(
+            "https://other.example/group/sub/pull/42/repo/-/merge_requests/7",
+            &expected
+        ));
+        for invalid in [
+            "https://gitlab.example/group/repo/-/merge_requests/0",
+            "https://gitlab.example/group/repo/-/merge_requests/no",
+            "https://github.com/a/b/pull/1/files",
+        ] {
+            assert!(repo_identity_from_pr_url(invalid).is_none());
+        }
     }
 }

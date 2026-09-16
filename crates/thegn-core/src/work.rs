@@ -100,13 +100,41 @@ pub struct MyWorkFeed {
     pub rows: Vec<WorkRow>,
     #[serde(default)]
     pub note: String,
-    /// Origin identity captured by the producer. Legacy feeds have no
-    /// identity and are safe to display only as non-PR descriptive rows.
+    /// Origin identity captured by the producer. `cache_version` distinguishes
+    /// a sampled absent origin from an unstamped legacy feed.
     #[serde(default)]
     pub source_repo: Option<crate::forge::model::ForgeRepoIdentity>,
+    /// Version 1 distinguishes a freshly sampled absent origin from legacy
+    /// rows that never recorded repository provenance.
+    #[serde(default)]
+    pub cache_version: u8,
 }
 
 impl MyWorkFeed {
+    /// Scope cached rows without hiding local tracker work in a repository
+    /// that has no origin. The global feed deliberately retains mixed origins.
+    pub fn for_scope(
+        mut self,
+        origin: Option<&crate::forge::model::ForgeRepoIdentity>,
+        all: bool,
+    ) -> Self {
+        if all {
+            return self;
+        }
+        if self.cache_version != 1 || self.source_repo.as_ref() != origin {
+            self.rows.clear();
+            self.note.clear();
+        } else {
+            self.rows.retain(|row| {
+                row.kind != WorkKind::Pr
+                    || origin.is_some_and(|expected| {
+                        crate::forge::model::pr_url_in_repo_identity(&row.url, expected)
+                    })
+            });
+        }
+        self
+    }
+
     /// Parse a cache row, accepting both the current wrapper shape and the
     /// legacy bare-`Vec<WorkRow>` shape (pre-note caches keep working).
     pub fn from_cache_json(json: &str) -> Option<MyWorkFeed> {
@@ -119,6 +147,7 @@ impl MyWorkFeed {
                 rows,
                 note: String::new(),
                 source_repo: None,
+                cache_version: 0,
             })
     }
 }
@@ -213,6 +242,7 @@ mod spec {
             }],
             note: "repo scope unavailable".into(),
             source_repo: None,
+            cache_version: 0,
         };
         let json = serde_json::to_string(&feed).unwrap();
         assert_eq!(MyWorkFeed::from_cache_json(&json), Some(feed));
