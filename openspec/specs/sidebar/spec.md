@@ -686,6 +686,17 @@ than blind-cycling.
   presses `n`
 - **THEN** the new-worktree wizard opens rooted at that workspace's repo
 
+#### Scenario: Creation retains its folder context
+
+- **WHEN** the user starts a worktree from a folder row or a worktree filed in
+  that folder
+- **THEN** completion files the registered worktree into the captured folder
+  only while its repository, ID and name still match; a recoverable Halted
+  creation retains this filing behavior, and terminal events consume only
+  their own creation generation
+- **AND** a changed or deleted destination leaves the worktree unfiled without
+  creating a folder; a deferred write rechecks the destination and repository
+
 #### Scenario: F2 renames like an explorer
 
 - **WHEN** the user presses F2 on a non-home worktree row
@@ -705,6 +716,10 @@ lead with a curated handful of essential hints.
 
 ### Requirement: Full mouse support with keyboard parity
 
+Selecting a resident worktree by mouse SHALL invalidate the center contents
+in the same frame as the sidebar selection. Switching to another workspace
+SHALL retain the existing workspace switch behavior.
+
 The sidebar SHALL support: left-click select+activate (caret cell folds,
 Ctrl-click marks), double-click that commits keyboard focus to the center
 (or folds a header), right-click opening the row's context menu (which then
@@ -720,6 +735,13 @@ MUST reuse the keyboard reorder/file machinery (persisted positions,
 computed-sort→Manual flip, home anchoring; cross-workspace drops are
 invalid). Mouse reporting MUST be enabled only when the outer terminal
 supports it, and every mouse gesture MUST have a keyboard equivalent.
+
+#### Scenario: Mouse selection repaints a quiet terminal
+
+- **WHEN** two resident worktrees have different terminal contents and the user
+  clicks the inactive worktree while both terminals are quiet
+- **THEN** the first frame displaying the new selection also displays that
+  worktree's terminal contents, without requiring further input or output
 
 #### Scenario: Right-click opens the menu at the row
 

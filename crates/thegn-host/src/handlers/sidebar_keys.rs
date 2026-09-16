@@ -71,8 +71,13 @@ pub(crate) enum SidebarOutcome {
     /// loop's action dispatcher handles it exactly as if the palette fired it.
     Synthetic(crate::keymap::Action),
     /// Open the new-worktree wizard rooted at this repo (the cursor row's
-    /// workspace, which need not be the active one).
-    NewWorktreeIn { repo_root: String },
+    /// workspace, which need not be the active one). `folder` is the sidebar
+    /// folder the cursor row sits in (a folder header, or a filed worktree):
+    /// the finished worktree is filed there.
+    NewWorktreeIn {
+        repo_root: String,
+        folder: Option<SidebarFolderIntent>,
+    },
     /// Open the move-to-folder picker targeting this worktree row (`f`).
     MoveToFolder {
         worktree_path: String,
@@ -102,6 +107,15 @@ pub(crate) enum SidebarOutcome {
         action: crate::handlers::merge_queue::SidebarMq,
         path: String,
     },
+}
+
+/// The durable identity captured for a folder-scoped worktree creation. The
+/// name is only the display/fallback value; the id lets completion follow a
+/// rename while refusing a deleted or replacement folder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SidebarFolderIntent {
+    pub(crate) folder_id: i64,
+    pub(crate) name: String,
 }
 
 /// The merge-queue context-menu entries (`(id, label)`, in render order) for a
@@ -199,6 +213,38 @@ impl SidebarState {
         }
     }
 
+    /// The sidebar folder the cursor row belongs to, with its stable DB id: a
+    /// folder header itself, or the folder a worktree row is filed into.
+    /// `None` for loose worktrees and every other row kind. Pure over the
+    /// hydrated model.
+    fn cursor_folder_intent(&self, model: &FrameModel) -> Option<SidebarFolderIntent> {
+        use crate::sidebar::RowKind;
+        let row = self.selected_row(model)?;
+        let folder_id = match row.kind {
+            RowKind::Folder => row.folder_id,
+            RowKind::Worktree => {
+                let path = row.worktree_path.as_deref()?;
+                model
+                    .sidebar_db_worktrees
+                    .iter()
+                    .find(|w| w.path == path)?
+                    .folder_id
+            }
+            _ => return None,
+        };
+        let repo_root = self.cursor_repo_root(model)?;
+        folder_id.and_then(|fid| {
+            model
+                .sidebar_db_folders
+                .iter()
+                .find(|f| f.folder_id == fid && f.repo_path == repo_root)
+                .map(|f| SidebarFolderIntent {
+                    folder_id: fid,
+                    name: f.name.clone(),
+                })
+        })
+    }
+
     /// Whether the cursor row lives in the TERMINALS region (the banner, a host
     /// group, a terminal leaf, or the empty hint).
     pub(crate) fn cursor_in_terminals(&self, model: &FrameModel) -> bool {
@@ -232,7 +278,10 @@ impl SidebarState {
             return SidebarOutcome::Synthetic(crate::keymap::Action::NewTerminal);
         }
         match self.cursor_repo_root(model) {
-            Some(repo_root) => SidebarOutcome::NewWorktreeIn { repo_root },
+            Some(repo_root) => SidebarOutcome::NewWorktreeIn {
+                repo_root,
+                folder: self.cursor_folder_intent(model),
+            },
             None => {
                 model.status = NEW_WORKTREE_REFUSAL.into();
                 self.sync(model);
@@ -1475,6 +1524,67 @@ mod tests {
             SidebarOutcome::Redraw => {}
             _ => panic!("expected Redraw from new_worktree_outcome on unresolvable row"),
         }
+    }
+
+    /// "New worktree here…" carries the cursor row's folder so the created
+    /// worktree is filed there: a folder header names itself, a filed worktree
+    /// names its folder, and a loose worktree carries none.
+    #[test]
+    fn new_worktree_outcome_carries_the_cursor_rows_folder() {
+        use crate::sidebar::{DbWorktree, RowKind, SidebarRow};
+        let mut model = FrameModel {
+            sidebar_workspaces: vec![(
+                "myrepo".to_string(),
+                "myrepo".to_string(),
+                "git".to_string(),
+                "/repo".to_string(),
+            )],
+            sidebar_db_folders: vec![thegn_core::models::FolderRow {
+                folder_id: 10,
+                repo_path: "/repo".into(),
+                name: "Waiting".into(),
+                position: 0,
+                created_at: 0,
+            }],
+            sidebar_db_worktrees: ["filed", "loose"]
+                .iter()
+                .map(|label| DbWorktree {
+                    slug: "myrepo".into(),
+                    branch: (*label).into(),
+                    repo_path: "/repo".into(),
+                    tab_name: format!("myrepo/{label}"),
+                    path: format!("/wt/{label}"),
+                    folder_id: (*label == "filed").then_some(10),
+                    sandbox_backend: None,
+                    env_name: None,
+                    env_degraded: false,
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let sb = SidebarState::default();
+        let folder_of = |model: &mut FrameModel, row: SidebarRow| {
+            model.sidebar_rows = vec![row];
+            match sb.new_worktree_outcome(model) {
+                SidebarOutcome::NewWorktreeIn { repo_root, folder } => {
+                    assert_eq!(repo_root, "/repo");
+                    folder.map(|intent| intent.name)
+                }
+                _ => panic!("expected NewWorktreeIn"),
+            }
+        };
+
+        let mut header = SidebarRow::base(RowKind::Folder, 1, "Waiting", "myrepo");
+        header.folder_id = Some(10);
+        assert_eq!(folder_of(&mut model, header), Some("Waiting".into()));
+
+        let mut filed = SidebarRow::base(RowKind::Worktree, 2, "filed", "myrepo");
+        filed.worktree_path = Some("/wt/filed".into());
+        assert_eq!(folder_of(&mut model, filed), Some("Waiting".into()));
+
+        let mut loose = SidebarRow::base(RowKind::Worktree, 1, "loose", "myrepo");
+        loose.worktree_path = Some("/wt/loose".into());
+        assert_eq!(folder_of(&mut model, loose), None);
     }
 
     /// `NewWorktreeTarget` mapping: focus/selection semantics, and defensive

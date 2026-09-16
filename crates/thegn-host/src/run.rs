@@ -1590,6 +1590,21 @@ fn restore_failed_region_switch(
     *region_last_t = prior_last_t;
 }
 
+fn is_project_activation_target(target: &crate::sidebar::RowTarget) -> bool {
+    matches!(
+        target,
+        crate::sidebar::RowTarget::Workspace { repo_path, .. } if repo_path != "terminal"
+    )
+}
+
+fn should_restore_failed_activation(
+    project_target: bool,
+    landed: bool,
+    same_session: bool,
+) -> bool {
+    project_target && !landed && same_session
+}
+
 /// Worktree group indices in the order the sidebar DISPLAYS them (home-first
 /// name sort, pins, filter). Alt+↑/↓ steps through this, not the session's
 /// internal order — otherwise switching "skips around" relative to the tree.
@@ -5966,6 +5981,52 @@ use crate::media_ctl::{
     spawn_media_pick, spawn_media_sources,
 };
 
+type PendingFolder =
+    std::collections::HashMap<u64, (String, crate::handlers::sidebar_keys::SidebarFolderIntent)>;
+
+/// Consume a folder intent only when the current model still contains that
+/// folder ID and captured name. A changed name or missing folder consumes the
+/// intent without filing; the deferred SQL write checks the name again.
+fn take_pending_folder_for_path(
+    pending: &mut PendingFolder,
+    generation: u64,
+    worktree_path: &str,
+    folders: &[thegn_core::models::FolderRow],
+) -> Option<(String, String, i64)> {
+    let (repo_path, intent) = pending.remove(&generation)?;
+    folders.iter().find(|folder| {
+        folder.folder_id == intent.folder_id
+            && folder.repo_path == repo_path
+            && folder.name == intent.name
+    })?;
+    if worktree_path.is_empty() {
+        return None;
+    }
+    Some((worktree_path.to_string(), repo_path, intent.folder_id))
+}
+
+/// Resolve a retained Halted creation through its generation-owned session
+/// group before consuming its folder intent. The group name is checked against
+/// the generation key; the path is then captured from that actual group.
+fn take_pending_folder_for_group(
+    pending: &mut PendingFolder,
+    generation: u64,
+    session: &crate::session::Session,
+    key: &(String, usize),
+    folders: &[thegn_core::models::FolderRow],
+) -> Option<(String, String, i64)> {
+    let worktree_path = session
+        .worktrees
+        .iter()
+        .find(|group| group.name == key.0)
+        .map(|group| group.path.clone())?;
+    take_pending_folder_for_path(pending, generation, &worktree_path, folders)
+}
+
+fn discard_pending_folder(pending: &mut PendingFolder, generation: u64) {
+    pending.remove(&generation);
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn event_loop<T: Terminal>(
     resident_supervisor: thegn_svc::plugin::ResidentSupervisor,
@@ -6280,6 +6341,10 @@ async fn event_loop<T: Terminal>(
     let mut env_wizard_ui: Option<crate::env_wizard::EnvWizard> = None;
     let mut wizard_cmd_tx: Option<std::sync::mpsc::Sender<wizard::WizardCmd>> = None;
     let mut inflight = crate::handlers::creating::InFlight::default();
+    // Creation generation → (repo path, sidebar folder) for a worktree
+    // started from a folder; consumed by that generation's `Done` or retained
+    // `Halted` result.
+    let mut pending_folder = PendingFolder::new();
     // When a worktree is created from a template (item 54), the template is held
     // here (keyed by creation generation) until that worktree's `Done` applies
     // its layout + starts its pins.
@@ -7220,6 +7285,7 @@ async fn event_loop<T: Terminal>(
         ($target:expr) => {{
             let target = $target;
             let was_terminal = active_is_terminal(&session);
+            let project_target = is_project_activation_target(&target);
             let prior_session = session.id.clone();
             let prior_active = session.active;
             let prior_last_w = region_last_w.clone();
@@ -7231,10 +7297,7 @@ async fn event_loop<T: Terminal>(
             // A row that switches PROJECT leaves the terminals region first, so
             // this workspace parks on a worktree (see `leave_terminal_region!`).
             // The `"terminal"` sentinel is not such a row — it stays in-region.
-            if matches!(
-                &target,
-                crate::sidebar::RowTarget::Workspace { repo_path, .. } if repo_path != "terminal"
-            ) {
+            if project_target {
                 leave_terminal_region!();
             }
             let landed = activate_row_target(
@@ -7251,7 +7314,8 @@ async fn event_loop<T: Terminal>(
                 &mut clear_on_next_frame,
                 Some((&terminal_restore_tx, &waker)),
             );
-            if !landed && session.id == prior_session {
+            if should_restore_failed_activation(project_target, landed, session.id == prior_session)
+            {
                 // Project activation sanitizes a terminal focus before the
                 // cold switch so a successfully parked workspace resumes on a
                 // worktree. That mutation is provisional: if DB open/resurrect
@@ -7435,17 +7499,7 @@ async fn event_loop<T: Terminal>(
                     continue;
                 }
                 SidebarOutcome::Activate(target) => {
-                    // A Workspace row that targets the already-active workspace
-                    // still lands as a worktree hop, but stamping it Workspace
-                    // is fine: the histogram measures what the user asked for.
-                    let kind = match &target {
-                        crate::sidebar::RowTarget::Workspace { repo_path, .. }
-                            if repo_path.as_str() != "terminal" && *repo_path != session.id =>
-                        {
-                            crate::perf::SwitchKind::Workspace
-                        }
-                        _ => crate::perf::SwitchKind::Worktree,
-                    };
+                    let kind = crate::handlers::sidebar_activate::switch_kind(&target, &session.id);
                     switch_at = Some((std::time::Instant::now(), kind));
                     if activate_row!(target) {
                         kick_model_hydration!();
@@ -7620,9 +7674,10 @@ async fn event_loop<T: Terminal>(
                     // mouse-reachable actions inline).
                     *$synth = Some(action);
                 }
-                SidebarOutcome::NewWorktreeIn { repo_root } => {
+                SidebarOutcome::NewWorktreeIn { repo_root, folder } => {
+                    let gen_before = create_gen;
                     begin_worktree_wizard(
-                        std::path::PathBuf::from(repo_root),
+                        std::path::PathBuf::from(&repo_root),
                         None,
                         None,
                         keymap.config(),
@@ -7634,6 +7689,14 @@ async fn event_loop<T: Terminal>(
                         &mut wizard_ui,
                         &mut model,
                     );
+                    // A second wizard is refused without advancing the
+                    // generation; never attach its folder to that existing
+                    // creation.
+                    if let Some(folder) = folder
+                        && create_gen != gen_before
+                    {
+                        pending_folder.insert(create_gen, (repo_root, folder));
+                    }
                     dirty = true;
                     continue;
                 }
@@ -10680,6 +10743,7 @@ async fn event_loop<T: Terminal>(
                     step,
                     error,
                 } => {
+                    discard_pending_folder(&mut pending_folder, generation);
                     // Worker cleaned up + exited; surface it, drop only THIS
                     // creation's tab. Clears the modal only if it owns this gen.
                     if crate::handlers::creating::on_failed(
@@ -10725,10 +10789,39 @@ async fn event_loop<T: Terminal>(
                             active_menu = Some(sandbox_halt_overlay(&halt));
                             center_dormant = true;
                         }
-                        materialize_failed.insert(key);
+                        materialize_failed.insert(key.clone());
                         model.status = format!("{} unavailable: {}", halt.placement, halt.reason);
+                        let halted_folder = take_pending_folder_for_group(
+                            &mut pending_folder,
+                            generation,
+                            &session,
+                            &key,
+                            &model.sidebar_db_folders,
+                        );
+                        if let Some((wt_path, repo, folder_id)) = halted_folder {
+                            if let Err(e) =
+                                crate::handlers::sidebar_folder::file_created_worktree_path(
+                                    &session,
+                                    &mut sb,
+                                    &mut model,
+                                    &wt_path,
+                                    &repo,
+                                    folder_id,
+                                    &refresh_tx,
+                                    &waker,
+                                )
+                            {
+                                model.status = e;
+                            }
+                        } else {
+                            // Also clear an intent when the retained group has
+                            // already disappeared before the halt is handled.
+                            discard_pending_folder(&mut pending_folder, generation);
+                        }
                         need_relayout = true;
                         dirty = true;
+                    } else {
+                        discard_pending_folder(&mut pending_folder, generation);
                     }
                 }
                 wizard::CreateEvent::Done {
@@ -10872,6 +10965,25 @@ async fn event_loop<T: Terminal>(
                         wizard_ui = None;
                         wizard_cmd_tx = None;
                         inflight.wizard_gen = None;
+                    }
+                    // Register completed before this event, so file only the
+                    // exact creation generation that carried the folder intent.
+                    if let Some((wt_path, repo, folder_id)) = take_pending_folder_for_path(
+                        &mut pending_folder,
+                        generation,
+                        &payload.path,
+                        &model.sidebar_db_folders,
+                    ) && let Err(e) = crate::handlers::sidebar_folder::file_created_worktree_path(
+                        &session,
+                        &mut sb,
+                        &mut model,
+                        &wt_path,
+                        &repo,
+                        folder_id,
+                        &refresh_tx,
+                        &waker,
+                    ) {
+                        model.status = e;
                     }
                     // Worktree template (item 54): apply the initial layout
                     // (named snapshot, else `commands` even-split) and start the
@@ -14409,6 +14521,20 @@ async fn event_loop<T: Terminal>(
                                 target,
                                 force_center,
                             } => {
+                                // Stamp the switch like the keyboard `Activate`
+                                // arm: it is the render plan's `switch` damage
+                                // bit. An in-workspace hop is a pure focus move
+                                // that dirties nothing else, so without it this
+                                // arm's sidebar-only damage repainted the
+                                // highlight but left the center on the previous
+                                // worktree's panes.
+                                switch_at = Some((
+                                    std::time::Instant::now(),
+                                    crate::handlers::sidebar_activate::switch_kind(
+                                        &target,
+                                        &session.id,
+                                    ),
+                                ));
                                 let hydrate = activate_row!(target);
                                 // A switch from the sidebar keeps the user in
                                 // the center terminal if that's where they were
@@ -15593,6 +15719,7 @@ async fn event_loop<T: Terminal>(
                             // committed background creation keeps running.
                             if let Some(g) = inflight.wizard_gen.take() {
                                 inflight.progress.remove(&g);
+                                discard_pending_folder(&mut pending_folder, g);
                             }
                             model.status = "worktree creation cancelled".into();
                         }
@@ -15603,6 +15730,9 @@ async fn event_loop<T: Terminal>(
                         }
                         outcome @ (wizard::WizardOutcome::AddHost
                         | wizard::WizardOutcome::SetupEnv(_)) => {
+                            if let Some(g) = inflight.wizard_gen {
+                                discard_pending_folder(&mut pending_folder, g);
+                            }
                             crate::handlers::wizard::leave_for_setup(
                                 outcome,
                                 keymap.config(),

@@ -157,6 +157,20 @@ def identity(path):
     return info.st_dev, info.st_ino
 
 
+def comm(status_text):
+    """The `Name:` field of /proc/<pid>/status.
+
+    Readable even when `exe` and `fd` are namespace-hidden, so it is the only
+    identification left for a process in a user namespace. Truncated to 15
+    characters by the kernel, which both names we match against fit inside.
+    """
+    for line in status_text.splitlines():
+        if line.startswith("Name:"):
+            fields = line.split(maxsplit=1)
+            return fields[1].strip() if len(fields) == 2 else ""
+    raise Refusal("Process status has no name")
+
+
 def quiescent(paths, proc=Path("/proc")):
     """Bounded observation, never atomic quiescence or future-startup exclusion."""
     watched = {identity(paths["target"]), identity(paths["database"])}
@@ -183,19 +197,40 @@ def quiescent(paths, proc=Path("/proc")):
                     raise Refusal("Ambiguous process UID")
                 if os.getuid() not in map(int, uids):
                     continue
-                executable = base / "exe"
-                name = Path(os.readlink(executable).removesuffix(" (deleted)")).name
-                if identity(executable) in watched or name in ("thegn", "tg"):
-                    raise Refusal("A controller/daemon or database user is still running; stop it manually")
-                with os.scandir(base / "fd") as handles:
-                    for index, handle in enumerate(handles):
-                        if index >= 4096:
-                            raise Refusal("Process descriptor inspection bound exceeded")
-                        try:
-                            if identity(Path(handle.path)) in watched:
-                                raise Refusal("A process still has database/install files open; stop it manually")
-                        except FileNotFoundError:
-                            continue  # Descriptor closed during observation.
+                try:
+                    executable = base / "exe"
+                    name = Path(os.readlink(executable).removesuffix(" (deleted)")).name
+                    if identity(executable) in watched or name in ("thegn", "tg"):
+                        raise Refusal("A controller/daemon or database user is still running; stop it manually")
+                    with os.scandir(base / "fd") as handles:
+                        for index, handle in enumerate(handles):
+                            if index >= 4096:
+                                raise Refusal("Process descriptor inspection bound exceeded")
+                            try:
+                                if identity(Path(handle.path)) in watched:
+                                    raise Refusal("A process still has database/install files open; stop it manually")
+                            except FileNotFoundError:
+                                continue  # Descriptor closed during observation.
+                except PermissionError:
+                    # A process in a user namespace keeps its real uid but gets a
+                    # root-owned `exe`/`fd` (rootless podman/docker: a container
+                    # shows `Uid: 1000 1000 1000 1000` and a subuid `Groups:`
+                    # range). Neither check above can run on it. Refusing here
+                    # instead made every upgrade impossible on a host running any
+                    # rootless container -- an unrelated `buildkitd` or `garage`
+                    # would veto the install, repeatedly and undiagnosably.
+                    #
+                    # `status` is still readable, so fall back to the `Name:`
+                    # comm, which is what the exe-basename check wants anyway.
+                    # The narrowing is deliberate and worth stating: a namespaced
+                    # process NOT named thegn that holds the database open is no
+                    # longer caught. Reaching that state takes a bind-mount of
+                    # the state directory into a container -- a deliberate act,
+                    # not an accident -- and the alternative is a tool that can
+                    # never run here at all.
+                    if comm(status_text) in ("thegn", "tg"):
+                        raise Refusal("A controller/daemon is still running; stop it manually") from None
+                    continue
             except FileNotFoundError:
                 if base.exists():
                     raise Refusal("Cannot inspect a remaining process (including zombies)") from None

@@ -2015,6 +2015,58 @@ fn set_worktree_folder_round_trips() {
 }
 
 #[test]
+fn creation_folder_identity_update_refuses_deleted_folder_without_recreation() {
+    let db = db();
+    db.put_workspace("/x/app", "app", "repo").unwrap();
+    db.put_worktree("app/feat", "/x/app", "/wt/feat", "tg/feat", None, None)
+        .unwrap();
+    let folder = db.ensure_folder("/x/app", "Waiting").unwrap();
+    db.del_folder(folder).unwrap();
+
+    assert!(
+        !db.set_worktree_folder_if_identity("/wt/feat", "/x/app", folder, "Waiting")
+            .unwrap()
+    );
+    assert!(db.folders_for_workspace("/x/app").unwrap().is_empty());
+    assert_eq!(db.worktrees().unwrap()[0].folder_id, None);
+}
+
+#[test]
+fn creation_folder_identity_update_accepts_current_name() {
+    let db = db();
+    db.put_workspace("/x/app", "app", "repo").unwrap();
+    db.put_worktree("app/feat", "/x/app", "/wt/feat", "tg/feat", None, None)
+        .unwrap();
+    let folder = db.ensure_folder("/x/app", "Waiting").unwrap();
+    db.rename_folder(folder, "In progress").unwrap();
+
+    assert!(
+        db.set_worktree_folder_if_identity("/wt/feat", "/x/app", folder, "In progress")
+            .unwrap()
+    );
+    assert_eq!(db.worktrees().unwrap()[0].folder_id, Some(folder));
+    assert_eq!(
+        db.folders_for_workspace("/x/app").unwrap()[0].name,
+        "In progress"
+    );
+}
+
+#[test]
+fn creation_folder_identity_update_refuses_worktree_from_another_repo() {
+    let db = db();
+    db.put_workspace("/x/app", "app", "repo").unwrap();
+    db.put_worktree("other/feat", "/x/other", "/wt/feat", "tg/feat", None, None)
+        .unwrap();
+    let folder = db.ensure_folder("/x/app", "Waiting").unwrap();
+
+    assert!(
+        !db.set_worktree_folder_if_identity("/wt/feat", "/x/app", folder, "Waiting")
+            .unwrap()
+    );
+    assert_eq!(db.worktrees().unwrap()[0].folder_id, None);
+}
+
+#[test]
 fn intent_and_observed_containment_are_separate_columns() {
     // The pick and what a launch achieved are different facts, and conflating
     // them is what let a bare host shell display as rootless podman. Writing one
@@ -4712,4 +4764,117 @@ fn scoped_clear_with_no_repo_paths_still_marks_untagged_and_unknown() {
         left,
         vec!["/wt/a".to_string(), "/wt/other-repo".to_string()]
     );
+}
+
+#[test]
+fn creation_folder_update_rejects_reused_id_with_a_different_name() {
+    let db = db();
+    db.put_workspace("/x/app", "app", "repo").unwrap();
+    db.put_worktree("app/feat", "/x/app", "/wt/feat", "tg/feat", None, None)
+        .unwrap();
+    let folder = db.ensure_folder("/x/app", "Waiting").unwrap();
+    db.del_folder(folder).unwrap();
+    let replacement = db.ensure_folder("/x/app", "Other work").unwrap();
+    assert_eq!(replacement, folder, "exercise SQLite row ID reuse");
+    assert!(
+        !db.set_worktree_folder_if_identity("/wt/feat", "/x/app", folder, "Waiting")
+            .unwrap()
+    );
+    assert_eq!(db.worktrees().unwrap()[0].folder_id, None);
+    assert_eq!(db.folders_for_workspace("/x/app").unwrap().len(), 1);
+}
+
+#[test]
+fn creation_folder_update_refuses_rename_after_dispatch() {
+    let db = db();
+    db.put_workspace("/x/app", "app", "repo").unwrap();
+    db.put_worktree("app/feat", "/x/app", "/wt/feat", "tg/feat", None, None)
+        .unwrap();
+    let folder = db.ensure_folder("/x/app", "Waiting").unwrap();
+    db.rename_folder(folder, "Renamed").unwrap();
+    assert!(
+        !db.set_worktree_folder_if_identity("/wt/feat", "/x/app", folder, "Waiting")
+            .unwrap()
+    );
+    assert_eq!(db.worktrees().unwrap()[0].folder_id, None);
+}
+
+#[test]
+fn scoped_pr_cache_roundtrip_rejects_legacy_foreign_and_changed_origins() {
+    use crate::forge::model::{
+        PrBranchCache, PrHeader, pr_headers_for_repo, repo_identity_from_remote_url,
+    };
+    let db = db();
+    let origin = repo_identity_from_remote_url("https://github.com/acme/repo.git").unwrap();
+    let row = PrHeader {
+        number: 4,
+        head_ref: "feat".into(),
+        state: "OPEN".into(),
+        url: "https://github.com/acme/repo/pull/4".into(),
+        is_draft: false,
+    };
+    let foreign = PrHeader {
+        url: "https://other.example/acme/repo/pull/4".into(),
+        ..row.clone()
+    };
+    let feed = PrBranchCache {
+        source_repo: origin.clone(),
+        rows: vec![row.clone(), foreign],
+    };
+    db.put_pr_branch_cache("/repo", &serde_json::to_string(&feed).unwrap())
+        .unwrap();
+    let (json, _) = db.get_pr_branch_cache("/repo").unwrap().unwrap();
+    assert_eq!(
+        pr_headers_for_repo(&json, &origin).unwrap(),
+        vec![row.clone()]
+    );
+    let changed = repo_identity_from_remote_url("https://other.example/acme/repo.git").unwrap();
+    assert!(pr_headers_for_repo(&json, &changed).is_none());
+    db.put_pr_branch_cache("/repo", &serde_json::to_string(&vec![row]).unwrap())
+        .unwrap();
+    let (legacy, _) = db.get_pr_branch_cache("/repo").unwrap().unwrap();
+    assert!(pr_headers_for_repo(&legacy, &origin).is_none());
+}
+
+#[test]
+fn my_work_cache_scope_transition_keeps_global_and_originless_tracker_work() {
+    use crate::forge::model::repo_identity_from_remote_url;
+    use crate::work::{MyWorkFeed, WorkKind, WorkRow};
+    let db = db();
+    let origin = repo_identity_from_remote_url("https://github.com/acme/repo").unwrap();
+    let changed = repo_identity_from_remote_url("https://github.com/acme/other").unwrap();
+    let rows = [WorkKind::Issue, WorkKind::Pr, WorkKind::Notification]
+        .map(|kind| WorkRow {
+            kind,
+            url: "https://github.com/acme/repo/pull/4".into(),
+            ..Default::default()
+        })
+        .to_vec();
+    let feed = MyWorkFeed {
+        rows,
+        note: "source note".into(),
+        source_repo: Some(origin.clone()),
+        cache_version: 1,
+    };
+    db.put_my_work_cache("/repo", &serde_json::to_string(&feed).unwrap())
+        .unwrap();
+    let (json, _) = db.get_my_work_cache("/repo").unwrap().unwrap();
+    let parsed = MyWorkFeed::from_cache_json(&json).unwrap();
+    assert_eq!(parsed.clone().for_scope(Some(&origin), false).rows.len(), 3);
+    let stale = parsed.clone().for_scope(Some(&changed), false);
+    assert!(stale.rows.is_empty());
+    assert!(stale.note.is_empty());
+    assert_eq!(parsed.clone().for_scope(Some(&changed), true).rows.len(), 3);
+    let local = MyWorkFeed {
+        source_repo: None,
+        ..parsed
+    };
+    let local = local.for_scope(None, false);
+    assert_eq!(local.rows.len(), 2);
+    assert!(local.rows.iter().all(|r| r.kind != WorkKind::Pr));
+    let legacy = MyWorkFeed {
+        cache_version: 0,
+        ..local
+    };
+    assert!(legacy.for_scope(None, false).rows.is_empty());
 }

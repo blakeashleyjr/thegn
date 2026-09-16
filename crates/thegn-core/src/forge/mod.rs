@@ -25,6 +25,7 @@
 //! `just lint` pins it.
 
 pub mod model;
+pub mod checkout;
 
 use crate::remote::GitLoc;
 use crate::seam::{ErrorClass, Probe, SeamError};
