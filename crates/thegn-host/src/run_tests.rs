@@ -2466,6 +2466,27 @@ fn failed_project_switch_restores_terminal_focus_and_region_bookmarks() {
     assert_eq!(last_t.as_deref(), Some("prod"));
 }
 
+#[test]
+fn sidebar_activation_rollback_only_covers_failed_project_targets() {
+    use crate::sidebar::RowTarget;
+
+    // Same-workspace tab activation returns `landed == false` because the
+    // activation helper's bool means `workspace_switched`; it must not undo
+    // the active pointer that the helper just moved.
+    assert!(!is_project_activation_target(&RowTarget::Tab(1, 0)));
+    assert!(!should_restore_failed_activation(false, false, true));
+
+    // The rollback remains available for the one provisional mutation that
+    // needs it: leaving a terminal region before a failed project switch.
+    assert!(is_project_activation_target(&RowTarget::Workspace {
+        repo_path: "/other".into(),
+        group: None,
+    }));
+    assert!(should_restore_failed_activation(true, false, true));
+    assert!(!should_restore_failed_activation(true, true, true));
+    assert!(!should_restore_failed_activation(true, false, false));
+}
+
 /// Build a one-tab workspace whose single leaf pane has id `pane_id`, and
 /// register a live `PtyPane` for it in `panes` so eviction has something to reap.
 #[cfg(test)]
