@@ -17,7 +17,7 @@
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use std::io::{BufRead, BufReader};
+use std::io::Read;
 use std::net::IpAddr;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
@@ -33,7 +33,7 @@ use crate::vpn::{OciRuntime, exec_in};
 mod tests;
 
 /// How to derive the public URL/address from a started share.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum UrlRule {
     /// Find `marker` in an output line, take the whitespace-delimited token after
     /// it as a `host:port`, and format it into `scheme://host:port`. Used by
@@ -47,6 +47,27 @@ pub enum UrlRule {
     /// (no host:port shape required), substituting it into `template`'s `{}`.
     /// Used for opaque addresses like a dumbpipe ticket.
     AfterMarkerRaw { marker: String, template: String },
+}
+
+impl fmt::Debug for UrlRule {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::AfterMarker { .. } => f
+                .debug_struct("UrlRule::AfterMarker")
+                .field("marker", &"<redacted>")
+                .field("scheme", &"<redacted>")
+                .finish(),
+            Self::Fixed(_) => f
+                .debug_tuple("UrlRule::Fixed")
+                .field(&"<redacted>")
+                .finish(),
+            Self::AfterMarkerRaw { .. } => f
+                .debug_struct("UrlRule::AfterMarkerRaw")
+                .field("marker", &"<redacted>")
+                .field("template", &"<redacted>")
+                .finish(),
+        }
+    }
 }
 
 impl UrlRule {
@@ -105,7 +126,7 @@ impl fmt::Debug for SharePlanFile {
 
 /// A pure, fully-resolved plan for the tunnel-client child. Built from a
 /// [`ShareSpec`] (with secrets already dereferenced); executed by [`start`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct SharePlan {
     /// The tunnel-client binary (e.g. `bore`, `frpc`, `dumbpipe`).
     pub program: String,
@@ -118,6 +139,18 @@ pub struct SharePlan {
     pub files: Vec<SharePlanFile>,
     /// How to recognise/derive the public URL.
     pub url_rule: UrlRule,
+}
+
+impl fmt::Debug for SharePlan {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SharePlan")
+            .field("program", &self.program)
+            .field("args", &"<redacted>")
+            .field("env", &"<redacted>")
+            .field("files", &self.files)
+            .field("url_rule", &self.url_rule)
+            .finish()
+    }
 }
 
 impl SharePlan {
@@ -611,10 +644,18 @@ fn serve_dns_name(rt: &OciRuntime, sidecar: &str) -> Result<String> {
 // ── subprocess seam (smoke-tested) ───────────────────────────────────────────
 
 /// A live share: the running tunnel-client child and its public URL.
-#[derive(Debug)]
 pub struct RunningShare {
     pub child: Child,
     pub public_url: String,
+}
+
+impl fmt::Debug for RunningShare {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RunningShare")
+            .field("child", &self.child)
+            .field("public_url", &"<redacted>")
+            .finish()
+    }
 }
 
 impl RunningShare {
@@ -676,7 +717,10 @@ pub fn start(
         .spawn()
         .with_context(|| format!("share: failed to spawn '{}'", plan.program))?;
 
-    let (tx, rx) = mpsc::channel::<String>();
+    let (tx, rx) = mpsc::sync_channel::<String>(64);
+    // URL discovery has a separate bounded signal so noisy diagnostics cannot
+    // consume the only startup result.
+    let (url_tx, url_rx) = mpsc::sync_channel::<String>(1);
     for stream in [
         child.stdout.take().map(Streamable::Out),
         child.stderr.take().map(Streamable::Err),
@@ -685,26 +729,14 @@ pub fn start(
     .flatten()
     {
         let tx = tx.clone();
+        let url_tx = url_tx.clone();
+        let url_rule = plan.url_rule.clone();
         std::thread::spawn(move || {
-            let reader: Box<dyn BufRead> = match stream {
-                Streamable::Out(s) => Box::new(BufReader::new(s)),
-                Streamable::Err(s) => Box::new(BufReader::new(s)),
-            };
-            // Drain to EOF for the child's whole lifetime — do NOT stop when the
-            // receiver is gone (it is: `rx` is dropped the moment `start`
-            // returns). Closing the child's stdout/stderr read ends here would
-            // make the next log write SIGPIPE the child — std::process resets
-            // SIGPIPE to SIG_DFL in children, and a Go tunnel client (frpc) dies
-            // on EPIPE to fd 1/2 on its next heartbeat/reconnect line, flipping a
-            // healthy share to Down for no visible reason. Keep reading and
-            // discarding until the pipe closes (the thread then exits naturally
-            // when the child dies).
-            for line in reader.lines().map_while(std::result::Result::ok) {
-                let _ = tx.send(line); // best-effort: receiver drops once URL is resolved
-            }
+            drain_stream(stream, tx, url_tx, url_rule);
         });
     }
     drop(tx);
+    drop(url_tx);
 
     // Config-derived URL: the client never prints it. Confirm it doesn't exit
     // immediately (auth failure, bad config), then return the known address.
@@ -712,13 +744,9 @@ pub fn start(
         let grace = Duration::from_millis(1500).min(timeout);
         let deadline = Instant::now() + grace;
         while Instant::now() < deadline {
-            if let Some(status) = child.try_wait()? {
-                let tail: Vec<String> = rx.try_iter().collect();
-                anyhow::bail!(
-                    "share: '{}' exited early ({status}): {}",
-                    plan.program,
-                    tail.join("; ")
-                );
+            if child.try_wait()?.is_some() {
+                abort_child(child);
+                anyhow::bail!("share: '{}' exited early", plan.program);
             }
             std::thread::sleep(Duration::from_millis(100));
         }
@@ -732,15 +760,20 @@ pub fn start(
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            let _ = child.kill(); // best-effort: child may already have exited
-            let _ = child.wait(); // best-effort: reap-or-not is terminal here
+            abort_child(child);
             anyhow::bail!(
                 "share: '{}' did not report a URL within {}s",
                 plan.program,
                 timeout.as_secs()
             );
         }
-        match rx.recv_timeout(remaining) {
+        if let Ok(url) = url_rx.try_recv() {
+            return Ok(RunningShare {
+                child,
+                public_url: url,
+            });
+        }
+        match rx.recv_timeout(remaining.min(Duration::from_millis(50))) {
             Ok(line) => {
                 if let Some(url) = plan.match_url(&line) {
                     return Ok(RunningShare {
@@ -751,11 +784,27 @@ pub fn start(
             }
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                let _ = child.wait(); // best-effort: reap the child; error reported below
+                // The priority check may have run before a reader published
+                // its URL. If the diagnostic channel then disconnects, give
+                // the already-published priority signal one final check.
+                if let Ok(url) = url_rx.try_recv() {
+                    return Ok(RunningShare {
+                        child,
+                        public_url: url,
+                    });
+                }
+                abort_child(child);
                 anyhow::bail!("share: '{}' exited before reporting a URL", plan.program);
             }
         }
     }
+}
+
+/// Perform best-effort terminal startup cleanup. Process-tree settlement is
+/// owned by THE-331; this helper provides no such guarantee.
+fn abort_child(mut child: Child) {
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// Write each plan file into `statedir` with 0600 perms (dir 0700).
@@ -778,4 +827,87 @@ fn materialize_files(plan: &SharePlan, statedir: &std::path::Path) -> Result<()>
 enum Streamable {
     Out(std::process::ChildStdout),
     Err(std::process::ChildStderr),
+}
+
+const MAX_PROVIDER_LINE: usize = 4096;
+
+/// Drain a provider stream for the child's full lifetime without retaining an
+/// unbounded line or queue. Oversized lines are discarded through newline;
+/// diagnostics use a bounded best-effort queue while URL matches use a
+/// separate bounded priority signal.
+fn drain_stream(
+    stream: Streamable,
+    tx: mpsc::SyncSender<String>,
+    url_tx: mpsc::SyncSender<String>,
+    url_rule: UrlRule,
+) {
+    match stream {
+        Streamable::Out(reader) => drain_reader(reader, tx, url_tx, url_rule),
+        Streamable::Err(reader) => drain_reader(reader, tx, url_tx, url_rule),
+    }
+}
+
+fn drain_reader<R: Read>(
+    mut reader: R,
+    tx: mpsc::SyncSender<String>,
+    url_tx: mpsc::SyncSender<String>,
+    url_rule: UrlRule,
+) {
+    let mut bytes = [0_u8; 1024];
+    let mut line = Vec::with_capacity(MAX_PROVIDER_LINE);
+    let mut oversized = false;
+    loop {
+        let count = match reader.read(&mut bytes) {
+            Ok(0) => {
+                emit_line(&mut line, &mut oversized, &tx, &url_tx, &url_rule);
+                return;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return,
+            Ok(count) => count,
+        };
+        for byte in &bytes[..count] {
+            if *byte == b'\n' {
+                emit_line(&mut line, &mut oversized, &tx, &url_tx, &url_rule);
+            } else if !oversized {
+                if line.len() == MAX_PROVIDER_LINE {
+                    oversized = true;
+                    line.clear();
+                } else {
+                    line.push(*byte);
+                }
+            }
+        }
+    }
+}
+
+/// Keep both input and lossy UTF-8 output within the same byte bound.
+fn bounded_lossy(bytes: &[u8]) -> String {
+    let lossy = String::from_utf8_lossy(bytes);
+    let mut result = String::with_capacity(lossy.len().min(MAX_PROVIDER_LINE));
+    for ch in lossy.chars() {
+        if result.len() + ch.len_utf8() > MAX_PROVIDER_LINE {
+            break;
+        }
+        result.push(ch);
+    }
+    result
+}
+
+fn emit_line(
+    line: &mut Vec<u8>,
+    oversized: &mut bool,
+    tx: &mpsc::SyncSender<String>,
+    url_tx: &mpsc::SyncSender<String>,
+    url_rule: &UrlRule,
+) {
+    if !*oversized && !line.is_empty() {
+        let text = bounded_lossy(line);
+        if let Some(url) = url_rule.apply(&text) {
+            let _ = url_tx.try_send(url);
+        }
+        let _ = tx.try_send(text);
+    }
+    line.clear();
+    *oversized = false;
 }

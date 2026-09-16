@@ -570,6 +570,18 @@
       "delivered_at": "2026-09-14"
     },
     {
+      "change": "bound-public-share-output",
+      "lifecycle": "active",
+      "disposition": "residual-split",
+      "owners": [
+        {
+          "issue": "THE-325",
+          "project": "Client API & Remote Access"
+        }
+      ],
+      "summary": "Bound and redact existing public-share output; full credential transport, environment admission and custody remain incomplete under THE-325 and its dependencies."
+    },
+    {
       "change": "bound-shared-framed-protocols",
       "lifecycle": "active",
       "disposition": "alpha-delivery",
