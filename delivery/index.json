@@ -571,7 +571,7 @@
     },
     {
       "change": "bound-public-share-output",
-      "lifecycle": "active",
+      "lifecycle": "delivered-awaiting-archive",
       "disposition": "residual-split",
       "owners": [
         {
@@ -579,7 +579,8 @@
           "project": "Client API & Remote Access"
         }
       ],
-      "summary": "Bound and redact existing public-share output; full credential transport, environment admission and custody remain incomplete under THE-325 and its dependencies."
+      "summary": "Bounded public-share output and redacted diagnostics passed scoped strict lint and 35 isolated share tests. This subtask is delivered; full THE-325 credential isolation remains open.",
+      "delivered_at": "2026-09-15"
     },
     {
       "change": "bound-shared-framed-protocols",
