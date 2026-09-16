@@ -124,22 +124,29 @@ pub fn pr_status_raw(loc: &GitLoc, number: Option<u64>) -> Result<PrStatus, GhEr
     // Name the PR explicitly. A bare `gh pr view` resolves it through the
     // branch's push/upstream config, which can land on ANOTHER branch's PR
     // (e.g. a worktree branch auto-tracking `origin/main`).
-    let selector = match number {
-        Some(n) => n.to_string(),
+    let (selector, scope) = match number {
+        Some(n) => (n.to_string(), gh_repo_scope(loc)),
         None => {
             let branch = loc
                 .git_out(&["rev-parse", "--abbrev-ref", "HEAD"])
                 .unwrap_or_default();
-            // Detached HEAD has no branch, so no PR.
             if branch.is_empty() || branch == "HEAD" {
                 return Err(GhError::NoPr);
             }
-            branch
+            let number = branch_pr_number(loc, &branch)?;
+            let scope = gh_repo_scope_for_branch(loc, &branch)
+                .ok()
+                .map(|(scope, _)| scope);
+            (number.to_string(), scope)
         }
     };
-    let mut args: Vec<&str> = vec!["pr", "view", &selector];
-    args.extend_from_slice(&["--json", PR_FIELDS]);
-    let json = gh_out(loc, &args)?;
+    let mut args: Vec<String> = vec!["pr".into(), "view".into(), selector];
+    if let Some(scope) = &scope {
+        args.extend(["--repo".into(), scope.clone()]);
+    }
+    args.extend(["--json".into(), PR_FIELDS.into()]);
+    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    let json = gh_out(loc, &argv)?;
     serde_json::from_str::<PrStatus>(&json).map_err(|e| GhError::Other(format!("parse error: {e}")))
 }
 
@@ -193,7 +200,17 @@ pub fn pr_list(loc: &GitLoc, limit: usize) -> Result<Vec<PrHeader>, GhError> {
 /// fails. Used by the on-merge auto-clean to resolve the precise outcome when a
 /// branch drops out of the open-PR set (merged vs closed-without-merge).
 pub fn pr_state_for_branch(loc: &GitLoc, branch: &str) -> Option<String> {
-    let json = gh_out(loc, &["pr", "view", branch, "--json", "state"]).ok()?;
+    let number = branch_pr_number(loc, branch).ok()?;
+    let number = number.to_string();
+    let mut args = vec!["pr", "view", number.as_str()];
+    let scope = gh_repo_scope_for_branch(loc, branch)
+        .ok()
+        .map(|(scope, _)| scope);
+    if let Some(scope) = scope.as_deref() {
+        args.extend(["--repo", scope]);
+    }
+    args.extend(["--json", "state"]);
+    let json = gh_out(loc, &args).ok()?;
     let v: serde_json::Value = serde_json::from_str(&json).ok()?;
     v.get("state")?.as_str().map(str::to_string)
 }
@@ -244,10 +261,162 @@ pub fn origin_nwo(loc: &GitLoc) -> Option<String> {
     nwo_from_remote_url(&url)
 }
 
-/// Open the PR belonging to `branch` in the browser
-/// (`gh pr view <branch> --web`) — the fallback when no cached URL exists.
+fn gh_repo_scope(loc: &GitLoc) -> Option<String> {
+    let identity = repo_identity_from_remote_url(&loc.git_out(&["remote", "get-url", "origin"])?)?;
+    scope_for_identity(&identity)
+}
+
+fn scope_for_identity(identity: &ForgeRepoIdentity) -> Option<String> {
+    let path = identity.path.clone();
+    (path.matches('/').count() == 1).then(|| {
+        if identity.host.eq_ignore_ascii_case("github.com") {
+            path
+        } else {
+            format!("{}/{}", identity.host, path)
+        }
+    })
+}
+
+/// Resolve a branch through `gh pr list --head`, then use its number for all
+/// subsequent operations. This removes the numeric-branch ambiguity of the
+/// positional `gh pr view <selector>` grammar and scopes the lookup to the
+/// origin repository.
+fn branch_pr_number(loc: &GitLoc, branch: &str) -> Result<u64, GhError> {
+    if branch.is_empty() || branch == "HEAD" || branch.bytes().any(|b| b.is_ascii_control()) {
+        return Err(GhError::NoPr);
+    }
+    let (scope, base_identity) = gh_repo_scope_for_branch(loc, branch)?;
+    let json = gh_out(
+        loc,
+        &[
+            "pr",
+            "list",
+            "--head",
+            branch,
+            "--state",
+            "all",
+            "--json",
+            "number,state,headRefName,headRepository,headRepositoryOwner",
+            "--limit",
+            "20",
+            "--repo",
+            &scope,
+        ],
+    )?;
+    let rows: Vec<serde_json::Value> = serde_json::from_str(&json)
+        .map_err(|_| GhError::Other("malformed gh PR list response".into()))?;
+    let expected = branch_head_repo(loc, branch)?.unwrap_or_else(|| base_identity.clone());
+    if !expected.host.eq_ignore_ascii_case(&base_identity.host) {
+        return Err(GhError::NotConfigured("branch push remote host differs"));
+    }
+    rows.into_iter()
+        .filter(|row| {
+            row.get("headRefName").and_then(|v| v.as_str()) == Some(branch)
+                && cli_head_repo_path(row)
+                    .is_some_and(|repo| repo.eq_ignore_ascii_case(&expected.path))
+        })
+        .min_by_key(|row| row.get("state").and_then(|v| v.as_str()) != Some("OPEN"))
+        .and_then(|row| row.get("number").and_then(|n| n.as_u64()))
+        .ok_or(GhError::NoPr)
+}
+
+fn cli_head_repo_path(row: &serde_json::Value) -> Option<String> {
+    row.pointer("/headRepository/nameWithOwner")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned)
+        .or_else(|| {
+            Some(format!(
+                "{}/{}",
+                row.pointer("/headRepositoryOwner/login")?.as_str()?,
+                row.pointer("/headRepository/name")?.as_str()?
+            ))
+        })
+}
+
+fn branch_head_repo(loc: &GitLoc, branch: &str) -> Result<Option<ForgeRepoIdentity>, GhError> {
+    let configured_remote = [
+        format!("branch.{branch}.pushRemote"),
+        "remote.pushDefault".to_string(),
+        format!("branch.{branch}.remote"),
+    ]
+    .into_iter()
+    .find_map(|key| {
+        loc.git_out(&["config", "--get", &key])
+            .filter(|v| !v.is_empty())
+    });
+    let remote = configured_remote.or_else(|| {
+        let spec = format!("{branch}@{{upstream}}");
+        let upstream = loc.git_out(&["rev-parse", "--abbrev-ref", &spec])?;
+        upstream
+            .split_once('/')
+            .map(|(remote, _)| remote.to_string())
+    });
+    let Some(remote) = remote else {
+        return Ok(None);
+    };
+    let remote_url = loc
+        .git_out(&["remote", "get-url", &remote])
+        .ok_or(GhError::NotConfigured("configured branch push remote URL"))?;
+    let identity = repo_identity_from_remote_url(&remote_url).ok_or(GhError::NotConfigured(
+        "configured branch push remote identity",
+    ))?;
+    Ok(Some(identity))
+}
+
+fn gh_repo_scope_for_branch(
+    loc: &GitLoc,
+    branch: &str,
+) -> Result<(String, ForgeRepoIdentity), GhError> {
+    // The merge remote is the PR base repository. A conventional fork clone
+    // has origin=user/fork and upstream=org/base; pushRemote is handled by
+    // branch_head_repo independently.
+    let remote = loc
+        .git_out(&["config", "--get", &format!("branch.{branch}.remote")])
+        .filter(|remote| !remote.is_empty())
+        .unwrap_or_else(|| "origin".to_string());
+    let remote_url = loc
+        .git_out(&["remote", "get-url", &remote])
+        .ok_or(GhError::NotConfigured("branch base repository"))?;
+    let identity = repo_identity_from_remote_url(&remote_url)
+        .ok_or(GhError::NotConfigured("branch base repository identity"))?;
+    let scope = scope_for_identity(&identity)
+        .ok_or(GhError::NotConfigured("branch base repository scope"))?;
+    Ok((scope, identity))
+}
+
+/// Open the PR belonging to `branch` in the browser. Resolve the branch via a
+/// scoped `--head` list first, then pass the verified number to `gh pr view`.
 pub fn open_pr_for_branch(loc: &GitLoc, branch: &str) -> Result<(), GhError> {
-    gh_run(loc, &["pr", "view", branch, "--web"])
+    let number = branch_pr_number(loc, branch)?;
+    let number = number.to_string();
+    let scope = gh_repo_scope_for_branch(loc, branch)
+        .ok()
+        .map(|(scope, _)| scope);
+    let mut args = vec!["pr", "view", number.as_str()];
+    if let Some(scope) = scope.as_deref() {
+        args.extend(["--repo", scope]);
+    }
+    args.push("--web");
+    gh_run(loc, &args)
+}
+
+#[cfg(test)]
+mod branch_resolution_tests {
+    use super::cli_head_repo_path;
+
+    #[test]
+    fn cli_head_identity_accepts_both_documented_json_shapes() {
+        let compact = serde_json::json!({
+            "headRepository": {"nameWithOwner": "user/fork"}
+        });
+        assert_eq!(cli_head_repo_path(&compact).as_deref(), Some("user/fork"));
+        let expanded = serde_json::json!({
+            "headRepository": {"name": "fork"},
+            "headRepositoryOwner": {"login": "user"}
+        });
+        assert_eq!(cli_head_repo_path(&expanded).as_deref(), Some("user/fork"));
+        assert_eq!(cli_head_repo_path(&serde_json::json!({})), None);
+    }
 }
 
 const THREADS_QUERY: &str = "query($owner:String!,$name:String!,$number:Int!){\
