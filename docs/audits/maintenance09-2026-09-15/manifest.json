@@ -1,0 +1,270 @@
+{
+  "source": "e72d7fcec31224dd9aa463743bc0f370d09770ba",
+  "at_utc": "2026-09-16T00:46:51.162336+00:00",
+  "scope": "THE-325 bounded output and redaction only; full issue remains open",
+  "native_passed": 35,
+  "source_hashes": {
+    "crates/thegn-svc/src/share/mod.rs": "f491a7e2cf7624bd055d58fd488fba0dcbb23ff4a9956924a22bc33c8d181757",
+    "crates/thegn-svc/src/share/tests.rs": "6084e15209495abe617f3e6b5e5cdfcba4954a2942cc4fe15817ac76178f209e"
+  },
+  "artifacts": [
+    {
+      "file": "thegn-THE220-drain-independent-luna-20260915.json.gz",
+      "sha256": "5bab3c3a97bbcf16819ac61a42a28222286ca969e1be0f2df7c560d29f726796",
+      "payload_sha256": "b102850a806de18f5d934a98ae19dab7a556524906e5613e792fbeb01ef016dd",
+      "encoding": "gzip"
+    },
+    {
+      "file": "thegn-THE220-drain-independent-luna-20260915.md.gz",
+      "sha256": "c78f45ebdd519ea19790c6851b747d58da5d1ec3e56695a5febe82ecc3cea9ad",
+      "payload_sha256": "8a1b74e0956fad57073c5f8ac0fd305b858443d6c1660b855c8371f251a305eb",
+      "encoding": "gzip"
+    },
+    {
+      "file": "thegn-THE324-drain-independent-luna-20260915.json.gz",
+      "sha256": "44c70fa588d958ba995e6df4dbca337482cf736e7a350454d7be3ce3bfd4fde1",
+      "payload_sha256": "c2d89bbbd606e8eee8007130701caba99fe33f23e5f685acad2fbf77d43c4bc6",
+      "encoding": "gzip"
+    },
+    {
+      "file": "thegn-THE324-drain-independent-luna-20260915.md.gz",
+      "sha256": "562db9c0b92e7e5ffb95b9815a8c30fb48b297c64c05c374bf8eff32e18c6c10",
+      "payload_sha256": "374c46196511a41f064f5d92ce4fbf0b545557dbcec817ef538a9aa0cec1ff36",
+      "encoding": "gzip"
+    },
+    {
+      "file": "thegn-THE325-drain-implementation-luna-20260915.json.gz",
+      "sha256": "d4b48a9f515288a2d815f083412468d3056632a3e42e43fcd36a7551fbe6a425",
+      "payload_sha256": "1e48d0ee11b804fafb8eba13e64d4e89807bfaa62c1f482c08ba15121f5ba27a",
+      "encoding": "gzip"
+    },
+    {
+      "file": "thegn-THE325-drain-implementation-luna-20260915.md.gz",
+      "sha256": "a3ef03314762e695ac501d79b14f3c9bb75a559afcde3633f740d68e052a5ef7",
+      "payload_sha256": "83a90fb6b0e62c1e00b42f61011999faa0498a74a8d42fb269b8b87fe226bfdd",
+      "encoding": "gzip"
+    },
+    {
+      "file": "thegn-THE325-drain-independent-luna-20260915.md.gz",
+      "sha256": "2f98f6f8ef631607bf64db198b3d9d01e5b29a95d7d426ba951090c429c30bf5",
+      "payload_sha256": "a1df3696dda4ecee0c48d193d05a4c4232db7076669a33c89f429cd0394b26b8",
+      "encoding": "gzip"
+    },
+    {
+      "file": "thegn-maintenance09-bounded-runtime-log-check-20260915.json.gz",
+      "sha256": "54bea424eb9bcc9e12c38993abbecacb5f22babbc784380b918d1a3dd3ded2a4",
+      "payload_sha256": "55f2b9389f3868510405031c24ee9fbe929b9f4023ffd6a0f00bf6060ea1bb39",
+      "encoding": "gzip"
+    },
+    {
+      "file": "thegn-maintenance09-build-driver-drain-20260915.py.gz",
+      "sha256": "32a7df6aae68294065c1e3d895f10348142aa26d659f98fd081062634f5d5641",
+      "payload_sha256": "d3ac6dac6611eed5f383311f942d4d0e4c0da1a10a64fc64d3cd3d734150001e",
+      "encoding": "gzip"
+    },
+    {
+      "file": "thegn-maintenance09-clippy-drain-20260915.json.gz",
+      "sha256": "1eca0ec7ef248e9fddb754f0c2c43f8ec3b1644ba518923c72fd085fa9b5f51c",
+      "payload_sha256": "28008e0cb2936db12121a73e9054ff051bcbe5c50d82204ec680f4bbaa1814cc",
+      "encoding": "gzip"
+    },
+    {
+      "file": "thegn-maintenance09-clippy-drain-20260915.jsonl.gz",
+      "sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64",
+      "payload_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "encoding": "gzip"
+    },
+    {
+      "file": "thegn-maintenance09-clippy-drain-20260915.log.gz",
+      "sha256": "2df37e8b8f57e432aa7b2e63d7a1e9847af4a9d2970b8c0f0fea7ee3e8392b70",
+      "payload_sha256": "f287452bb66f0b2a3724e5b5c47c4e558c0a20d90b0a5bc05d23355f01b7aad9",
+      "encoding": "gzip"
+    },
+    {
+      "file": "thegn-maintenance09-delivery-final-20260915.json.gz",
+      "sha256": "430ad03dbc893b71a98c6c31b8f98bacde27f14d724f992959eef2f5060019de",
+      "payload_sha256": "057c6a52659752eb14c1803292d9ac952de59d922b32d7ffa5880980ada32f29",
+      "encoding": "gzip"
+    },
+    {
+      "file": "thegn-maintenance09-delivery-final-diff-20260915.log.gz",
+      "sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64",
+      "payload_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "encoding": "gzip"
+    },
+    {
+      "file": "thegn-maintenance09-delivery-final-format-20260915.log.gz",
+      "sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64",
+      "payload_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "encoding": "gzip"
+    },
+    {
+      "file": "thegn-maintenance09-delivery-final-ratchets-20260915.log.gz",
+      "sha256": "18796842eab3b6274b0c8df478dab98d8292cd2d0c2377aebcf35012b5348f88",
+      "payload_sha256": "df39603e698d21f156e2c62fae1c5c938c09561cb01296c01abca358b9422935",
+      "encoding": "gzip"
+    },
+    {
+      "file": "thegn-maintenance09-delivery-final-spec-20260915.log.gz",
+      "sha256": "f3d69066b5782065c8b5dd875768b40a6a412710c5864c34e0a1a5f3bc7fc29c",
+      "payload_sha256": "4966d59702175d1984158bf9c409f213df12be7ca91b6898429e00b3baf4cf65",
+      "encoding": "gzip"
+    },
+    {
+      "file": "thegn-maintenance09-final-delta-independent-luna-20260915.json.gz",
+      "sha256": "2c4cd22d1331a17efdfa112e44bf0604a3441a405ea60e9c6accd74355840573",
+      "payload_sha256": "fe9df34e37b1dee4383df6ff40d173e213b66c2190d9459e49aab5df9bf86f34",
+      "encoding": "gzip"
+    },
+    {
+      "file": "thegn-maintenance09-final-delta-independent-luna-20260915.md.gz",
+      "sha256": "a73f610b2c1ffd4ada53920a511afcd214714ef5eee389dfc593ad95dcfd7cbb",
+      "payload_sha256": "db6d906a4b83ff1f4221072dc41a786a9bd7c5a689443ff2d492b355c6f066c8",
+      "encoding": "gzip"
+    },
+    {
+      "file": "thegn-maintenance09-final-evidence-independent-luna-20260915.json.gz",
+      "sha256": "ed45e9ddf5c0ac0f9b065ffe3b0495a10e01b11dfa2afc5a7199cb3668475aca",
+      "payload_sha256": "2b74c79a8ca98fd18bbdd6b72b5263f5f692fd58a5c1fa1facd554a97f32cffc",
+      "encoding": "gzip"
+    },
+    {
+      "file": "thegn-maintenance09-final-evidence-independent-luna-20260915.md.gz",
+      "sha256": "0fcbaf0f0229b69edb1a34ee888e80f57488b9cb20ab6ea7e326646361ff37dc",
+      "payload_sha256": "4de663bc7d425a241e4d250fde2234b79932d40d424ee78ae39ce9e4f334456b",
+      "encoding": "gzip"
+    },
+    {
+      "file": "thegn-maintenance09-final-source-gates-driver-20260915.py.gz",
+      "sha256": "47e57cab9a83d9f2bb6304ac7304f2f8075e209df1a57a746eb0cbd4835ec928",
+      "payload_sha256": "6dec322d46f4fec0306ef96f01d18a52b5d17adfc69cb91fb3eedb33618431f1",
+      "encoding": "gzip"
+    },
+    {
+      "file": "thegn-maintenance09-focused-native-drain-20260915.log.gz",
+      "sha256": "c9a9f5d30ddbc14e73f78d7f89a2123ed64500a4e61f6cb72b00b147f249cd4f",
+      "payload_sha256": "194c29cd39eabe4645c8d78d63f0f26c1fbf938383e882b3de08e21296e82b4c",
+      "encoding": "gzip"
+    },
+    {
+      "file": "thegn-maintenance09-focused-native-drain-receipt-20260915.json.gz",
+      "sha256": "354eb70a08dfa7fdbe9539298cf721c4140be0c0c20a383af8e2de2548da00b8",
+      "payload_sha256": "7a1833b56f1261b06f95b6ca60df6eba11b8fc31b2c19e1e39964e55ec68933e",
+      "encoding": "gzip"
+    },
+    {
+      "file": "thegn-maintenance09-held-branches-20260915.json.gz",
+      "sha256": "0941eb79509a6a70be7f47f64974e67336b994afd612cd9e83175b5e34fa5df2",
+      "payload_sha256": "600caf3f1d072ca1433bb80daafc54445e90b365db1e804fe1d5da675489a856",
+      "encoding": "gzip"
+    },
+    {
+      "file": "thegn-maintenance09-land-local-main-20260915.py.gz",
+      "sha256": "2a070572498e3d525fafd0cd8c097e323b7e235cd717205f4d148ba0225a325d",
+      "payload_sha256": "2f4dcac53ba13cfcd63cdba21edd6da541ced9d9862906a4f7f3d0497594b301",
+      "encoding": "gzip"
+    },
+    {
+      "file": "thegn-maintenance09-native-drain-20260915.json.gz",
+      "sha256": "b1e6ee5698c94f9a4384821aec5065c6245254744d2a19c7477e2e4ecbb0fc25",
+      "payload_sha256": "28a1964e337fffe4890f2cfd0568aa0de3db263aa15fb3c96f2ed057e240f75b",
+      "encoding": "gzip"
+    },
+    {
+      "file": "thegn-maintenance09-native-drain-20260915.jsonl.gz",
+      "sha256": "f5f345f6f05e01ec5539bf2e352c4e8e36a2a789e6557b26b09cdb558c00cdc5",
+      "payload_sha256": "1479c6246b21edf61d7eab3d1c775fc17733580b63aee2ed04fe1d3fb26e575c",
+      "encoding": "gzip"
+    },
+    {
+      "file": "thegn-maintenance09-native-drain-20260915.log.gz",
+      "sha256": "af9ce1769239394c4d2d68bd5944fa220ef6d59e6159ab6fd30a44877622162c",
+      "payload_sha256": "589c9f8fcd81fa35af4b45139a2719e0f1a86469e33071bf5eda66d8963da70e",
+      "encoding": "gzip"
+    },
+    {
+      "file": "thegn-maintenance09-native-drain-artifact-admission-20260915.json.gz",
+      "sha256": "14bd0f4db445b362f21ede0ff9624abf4a7d67cf5a2c73125829424c5f60c8c5",
+      "payload_sha256": "721d457a0ea6e24d2707115e0b3acdf3c4d0148368af76de35aa040bdba2373a",
+      "encoding": "gzip"
+    },
+    {
+      "file": "thegn-maintenance09-native-drain-matrix-driver-20260915.py.gz",
+      "sha256": "7d0bf9030d5d9b4b76f53dccdec3088b5fc0cafd160c743d1f8ded7a2516b831",
+      "payload_sha256": "b29c8c492b92df32747483f78406a2f969333da58a11d8a7de1de51d67c60c93",
+      "encoding": "gzip"
+    },
+    {
+      "file": "thegn-maintenance09-native-drain-selected-20260915.json.gz",
+      "sha256": "5b6ddf701c6e9f4dd0418b4df31edbaafc07d685bc666b67e73c2af70b5a737d",
+      "payload_sha256": "1723fcc98421a7c5f9ffb767dae61546f014729dbbdc51515604f280621aae33",
+      "encoding": "gzip"
+    },
+    {
+      "file": "thegn-maintenance09-native-drain-selection-plan-20260915.json.gz",
+      "sha256": "c99621d27c2d2b540ce0c8019faba2613d3563a194ee5074a104f5af280c75f7",
+      "payload_sha256": "e7efbdc379879c932ecc9598729aecd7d64427a6f60cf8dbf02d54945e72e471",
+      "encoding": "gzip"
+    },
+    {
+      "file": "thegn-maintenance09-package-evidence-20260915.py.gz",
+      "sha256": "c5a9588db49b6988fe9cc814f122c5426b884a1d7348dc682c07ce4240c02067",
+      "payload_sha256": "ea9dc677c003f40486a929328149a69b4dc80b513c1205ecd1ddb67dd26d1d75",
+      "encoding": "gzip"
+    },
+    {
+      "file": "thegn-maintenance09-pin-native-artifacts-drain-20260915.py.gz",
+      "sha256": "8662d365cfd99ab17d7e23d122fa589795705ab792035e905cc2d446d73c0e2d",
+      "payload_sha256": "a8909bd11a2a2569b7ac58142ca384e6a31e32b488629007ee5857eb6328854b",
+      "encoding": "gzip"
+    },
+    {
+      "file": "thegn-maintenance09-primary-drain-compile-approval-20260915.json.gz",
+      "sha256": "7e398e27eaf674b2a61f84da8c0b8abe95031e84b797eb1062129c26e2053899",
+      "payload_sha256": "b34c5a243c5a58a18e0e9c83001330fa3325c6eb926468432e17548180154682",
+      "encoding": "gzip"
+    },
+    {
+      "file": "thegn-maintenance09-primary-final-approval-20260915.json.gz",
+      "sha256": "bff390647a5b2561361cac259a7b222db36b31c41de611f870ba436c99ad7a59",
+      "payload_sha256": "6d775970772a605010eaa5539f2bc77d72910a732efcb54995680b8c7e972079",
+      "encoding": "gzip"
+    },
+    {
+      "file": "thegn-maintenance09-primary-source-review-20260915.json.gz",
+      "sha256": "f6a17cf27fcb3d48d98279d6b9608a284b3115f85ba07af4470d5a744ea31951",
+      "payload_sha256": "a41a0408279bd64389d28ebc3686472efce9f9b16459fe0e4fa824be10ea8b68",
+      "encoding": "gzip"
+    },
+    {
+      "file": "thegn-maintenance09-source-independent-luna-20260915.json.gz",
+      "sha256": "8a3fe148852a2b03692f1e83a4d62e4a79952070802e189aa22413f722ea5914",
+      "payload_sha256": "303c97db69426aa9414e0882e965a57418bdef8818b71b3ba1fcdbd0d6b9cccb",
+      "encoding": "gzip"
+    },
+    {
+      "file": "thegn-maintenance09-source-independent-luna-20260915.md.gz",
+      "sha256": "8abd350809882865bb0df34dd3ef230bc571a6d39074cc67abf93eb6915a5ae0",
+      "payload_sha256": "5fb9b5bee3a82209ac529086f0467c77f835755bfa964113f79bd6cfaa7d0642",
+      "encoding": "gzip"
+    },
+    {
+      "file": "thegn-maintenance09-validation-independent-luna-20260915.json.gz",
+      "sha256": "1b5a78da16e8973eea17d4cf99247d31c4c1bdd8036587b40aaa696b7d11469b",
+      "payload_sha256": "7a18a1c03bc85fe3927bd92a54be432a05e4c247a214bec658ec66322356986d",
+      "encoding": "gzip"
+    },
+    {
+      "file": "thegn-maintenance09-validation-independent-luna-20260915.md.gz",
+      "sha256": "0d7ab8f447791a4f05f0a213d431e0fffc5fe9ccd6773492382ad078fdd96036",
+      "payload_sha256": "89f1d3021d0ff476779dc7e95992fc8411ec6d728fca5283c8f67a855ae210e9",
+      "encoding": "gzip"
+    }
+  ],
+  "final_gates": {
+    "format": "PASS",
+    "ratchets": "PASS",
+    "openspec_passed": 170,
+    "diff": "PASS"
+  }
+}
