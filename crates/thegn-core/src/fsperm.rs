@@ -22,6 +22,28 @@ pub fn restrict_dir_to_owner(path: &Path) -> std::io::Result<()> {
     restrict(path, 0o700)
 }
 
+/// Make a test-only helper executable without leaking platform-specific
+/// permission code into a provider fixture. Non-Unix test runners skip shell
+/// fixtures because their command format is intentionally Unix-only.
+#[cfg(any(test, feature = "test-utils"))]
+pub fn make_executable_for_test(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(path)?.permissions();
+        permissions.set_mode(0o700);
+        return std::fs::set_permissions(path, permissions);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "Unix shell fixture is unavailable",
+        ))
+    }
+}
+
 /// Create a new file without replacement, restrict it to the owning user, and
 /// durably write `bytes`. Unix supplies mode 0600 at creation; other platforms
 /// apply their owner-only permission mechanism before content is written.
