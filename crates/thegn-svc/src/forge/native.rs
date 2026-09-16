@@ -16,10 +16,22 @@
 
 use serde_json::Value;
 use std::collections::HashSet;
+use thegn_core::forge::checkout::{ForgeCheckoutScope, checkout_scope};
 use thegn_core::forge::model::*;
 use thegn_core::forge::{Forge, ForgeCaps, ForgeError, PrRef, RepoRef};
 use thegn_core::remote::GitLoc;
 use thegn_core::seam::{Availability, Probe, ProbeReport};
+
+fn github_parts(identity: &ForgeRepoIdentity) -> Option<(String, String)> {
+    if !identity.host.eq_ignore_ascii_case("github.com") {
+        return None;
+    }
+    let (owner, repo) = identity.path.split_once('/')?;
+    if owner.is_empty() || repo.is_empty() || repo.contains('/') {
+        return None;
+    }
+    Some((owner.to_string(), repo.to_string()))
+}
 
 /// Source a GitHub token for the octocrab native impl. Precedence:
 /// `GH_TOKEN` → `GITHUB_TOKEN` → `gh auth token` (reuses the user's existing
@@ -323,8 +335,16 @@ fn parse_graphql_pr_status_for(
         "malformed GraphQL PR status nodes",
     ))?;
     match pick_pr_node(nodes, expected_head, expected_branch) {
+        Err(ForgeError::NoPr) if nodes.len() >= 20 => Err(ForgeError::NotConfigured(
+            "PR response window did not prove branch absence",
+        )),
         Err(error) => Err(error),
         Ok(node) => {
+            let number = node
+                .get("number")
+                .and_then(Value::as_u64)
+                .filter(|number| *number > 0)
+                .ok_or(ForgeError::NotConfigured("matched PR omitted its number"))?;
             let s = |k: &str| {
                 node.get(k)
                     .and_then(Value::as_str)
@@ -337,7 +357,7 @@ fn parse_graphql_pr_status_for(
                 .map(|arr| arr.iter().map(check_from_ctx).collect::<Vec<_>>())
                 .unwrap_or_default();
             let mut pr = PrStatus {
-                number: node.get("number").and_then(Value::as_u64).unwrap_or(0),
+                number,
                 title: s("title"),
                 state: s("state"),
                 url: s("url"),
@@ -469,8 +489,8 @@ impl GithubNative {
 
     /// The gate every native op runs first: local loc, closed circuit, token,
     /// origin. Any miss is `NotConfigured` — the ladder falls through.
-    fn gate(&self, loc: &GitLoc) -> Result<(String, String, String), ForgeError> {
-        self.gate_with_token(loc, resolve_token)
+    fn gate(&self, loc: &GitLoc) -> Result<(String, ForgeCheckoutScope), ForgeError> {
+        self.gate_scope_with_token(loc, resolve_token)
     }
 
     fn gate_with_token(
@@ -478,6 +498,9 @@ impl GithubNative {
         loc: &GitLoc,
         token: impl FnOnce() -> Option<String>,
     ) -> Result<(String, String, String), ForgeError> {
+        // Kept as the small credential-admission seam used by the regression
+        // fixtures. Production PR operations use `gate`, which captures the
+        // complete checkout scope before issuing a request.
         if loc.is_remote() {
             return Err(ForgeError::NotConfigured("native layer is local-only"));
         }
@@ -497,68 +520,56 @@ impl GithubNative {
         Ok((token, owner, repo))
     }
 
-    /// Resolve the repository that owns the checked-out branch's push head.
-    /// Tracking `origin/main` does not change the local branch name: the
-    /// branch remains the query head, while this identity admits a configured
-    /// fork and rejects an unrelated same-name fork PR.
-    fn expected_head_repo(&self, loc: &GitLoc, base: &str) -> Result<String, ForgeError> {
-        let branch = loc
-            .git_out(&["rev-parse", "--abbrev-ref", "HEAD"])
-            .unwrap_or_default();
-        let remote = [
-            format!("branch.{branch}.pushRemote"),
-            "remote.pushDefault".to_string(),
-            format!("branch.{branch}.remote"),
-        ]
-        .into_iter()
-        .find_map(|key| {
-            loc.git_out(&["config", "--get", &key])
-                .filter(|v| !v.is_empty())
-        })
-        .or_else(|| {
-            let spec = format!("{branch}@{{upstream}}");
-            let upstream = loc.git_out(&["rev-parse", "--abbrev-ref", &spec])?;
-            upstream
-                .split_once('/')
-                .map(|(remote, _)| remote.to_string())
-        });
-        let Some(remote) = remote else {
-            return Ok(base.to_string());
-        };
-        let Some(url) = loc.git_out(&["remote", "get-url", &remote]) else {
-            return Ok(base.to_string());
-        };
-        let Some(identity) = thegn_core::forge::model::repo_identity_from_remote_url(&url) else {
-            return Ok(base.to_string());
-        };
-        if !identity.host.eq_ignore_ascii_case("github.com") {
-            return Err(ForgeError::NotConfigured(
-                "branch push remote is not public GitHub",
-            ));
-        }
-        Ok(parse_owner_repo(&url)
-            .map(|(owner, repo)| format!("{owner}/{repo}"))
-            .unwrap_or_else(|| base.to_string()))
-    }
-
-    fn base_owner_repo(
+    fn gate_scope_with_token(
         &self,
         loc: &GitLoc,
-        branch: &str,
-        fallback: (String, String),
-    ) -> Result<(String, String), ForgeError> {
-        let Some(remote) = loc
-            .git_out(&["config", "--get", &format!("branch.{branch}.remote")])
-            .filter(|remote| !remote.is_empty())
-        else {
-            return Ok(fallback);
+        token: impl FnOnce() -> Option<String>,
+    ) -> Result<(String, ForgeCheckoutScope), ForgeError> {
+        if loc.is_remote() {
+            return Err(ForgeError::NotConfigured("native layer is local-only"));
+        }
+        if circuit().is_open() {
+            return Err(ForgeError::NotConfigured(
+                "circuit open after repeated failures",
+            ));
+        }
+        let Some((origin_owner, origin_repo)) = self.owner_repo(loc) else {
+            return Err(ForgeError::NotConfigured(
+                "origin is not a public GitHub remote",
+            ));
         };
-        let url = loc
-            .git_out(&["remote", "get-url", &remote])
-            .ok_or(ForgeError::NotConfigured("branch base repository URL"))?;
-        parse_owner_repo(&url).ok_or(ForgeError::NotConfigured(
-            "branch base repository is not public GitHub",
-        ))
+        let Some(token) = token() else {
+            return Err(ForgeError::NotConfigured("no GitHub token"));
+        };
+        let scope = checkout_scope(loc)?;
+        let Some((scope_origin_owner, scope_origin_repo)) = github_parts(&scope.origin) else {
+            return Err(ForgeError::NotConfigured(
+                "origin is not a public GitHub remote",
+            ));
+        };
+        if !origin_owner.eq_ignore_ascii_case(&scope_origin_owner)
+            || !origin_repo.eq_ignore_ascii_case(&scope_origin_repo)
+        {
+            return Err(ForgeError::NotConfigured("origin identity changed"));
+        }
+        if github_parts(&scope.base).is_none() {
+            return Err(ForgeError::NotConfigured(
+                "base is not a public GitHub remote",
+            ));
+        };
+        if github_parts(&scope.head).is_none() {
+            return Err(ForgeError::NotConfigured(
+                "head is not a public GitHub remote",
+            ));
+        }
+        if !scope.origin.host.eq_ignore_ascii_case(&scope.base.host)
+            || !scope.origin.host.eq_ignore_ascii_case(&scope.head.host)
+        {
+            return Err(ForgeError::NotConfigured(
+                "checkout repositories use different hosts",
+            ));
+        }
+        Ok((token, scope))
     }
 
     /// One GraphQL round trip under the request timeout, classified.
@@ -681,30 +692,27 @@ impl Forge for GithubNative {
         if pr != PrRef::Current {
             return Err(ForgeError::Unsupported("pr_status by number"));
         }
-        let (token, origin_owner, origin_repo) = self.gate(loc)?;
-        // Just the branch — a local `git rev-parse`, never a network fetch.
-        let branch = loc
-            .git_out(&["rev-parse", "--abbrev-ref", "HEAD"])
-            .unwrap_or_default();
-        // Detached HEAD (mid-rebase, a checked-out tag/SHA) has no branch, so
-        // no PR — querying `headRefName:"HEAD"` would only invite a false match.
-        if branch.is_empty() || branch == "HEAD" {
-            return Err(ForgeError::NoPr);
-        }
-        let (owner, repo) = self.base_owner_repo(loc, &branch, (origin_owner, origin_repo))?;
-        let expected_head = self.expected_head_repo(loc, &format!("{owner}/{repo}"))?;
+        let (token, scope) = self.gate(loc)?;
+        let (owner, repo) = github_parts(&scope.base).ok_or(ForgeError::NotConfigured(
+            "base is not a public GitHub repository",
+        ))?;
+        let branch = scope.branch.clone();
         let body = serde_json::json!({
             "query": PR_QUERY,
             "variables": { "owner": owner, "repo": repo, "head": branch },
         });
         let resp = self.graphql(token, body, "pr_status")?;
+        let (head_owner, head_repo) = github_parts(&scope.head).ok_or(
+            ForgeError::NotConfigured("head is not a public GitHub repository"),
+        )?;
+        let expected_head = format!("{head_owner}/{head_repo}");
         parse_graphql_pr_status_for(&resp, &expected_head, &branch)
     }
     fn pr_list(&self, loc: &GitLoc, limit: usize) -> Result<Vec<PrHeader>, ForgeError> {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let (token, owner, repo) = self.gate(loc)?;
+        let (token, owner, repo) = self.gate_with_token(loc, resolve_token)?;
         collect_pr_pages(limit, |after| {
             let body = serde_json::json!({
                 "query": PR_LIST_QUERY,
