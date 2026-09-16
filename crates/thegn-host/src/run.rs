@@ -1002,12 +1002,6 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     // Set while the telemetry overlay is open: the ticker samples stats at
     // its 500ms half-tick instead of the user-cycled rate.
     let stats_live = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    // Per-process sampling: its own channel, gate and thread. Kept off
-    // `StatsSnapshot` because the loop compares that snapshot for equality every
-    // tick to decide whether the bars need repainting — a list of processes in
-    // there would be near-always unequal and would pin the repaint on.
-    let (proc_tx, proc_rx) = tokio_mpsc::unbounded_channel::<thegn_metrics::ProcSnapshot>();
-    let procs_live = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     // Set while a per-container-stats surface is visible (the monitor's
     // Containers tab, or the Sandbox panel section). Gates the expensive
     // `stats --no-stream` + `system df` enrichment in the container tick, so a
@@ -1042,14 +1036,19 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     } else {
         std::path::PathBuf::from(thegn_core::util::expand_tilde(&cfg.stats.disk_path))
     };
-    crate::hydrate::spawn_proc_sampler(
-        proc_tx,
-        procs_live.clone(),
+    let process_worker = match crate::proc_worker::ProcessWorker::spawn(
         pane_pids.clone(),
         daemon_pid_atomic.clone(),
         cfg.monitor.proc_rows,
         waker.clone(),
-    );
+    ) {
+        Ok(worker) => Some(worker),
+        Err(reason) => {
+            tracing::error!(target: "thegn::procs", reason, "process sampling unavailable");
+            model.status = reason.into();
+            None
+        }
+    };
     // Supervise the model proxy off the UI loop when `[model_proxy]` is enabled
     // (a no-op otherwise). The listen socket is its lock; crashes restart on a
     // backoff schedule. Never touches the render decision.
@@ -1167,8 +1166,9 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         sandbox_event_rx,
         stats_interval_ms,
         stats_live,
-        proc_rx,
-        procs_live,
+        process_worker
+            .as_ref()
+            .map(crate::proc_worker::ProcessWorker::control),
         containers_live,
         pane_pids,
         daemon_pid_atomic,
@@ -1183,9 +1183,28 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     .await;
     // Outside the UI loop, including every early/error return. All sessions
     // close together under one application deadline; reloads share this owner.
-    let resident_report = resident_supervisor
-        .shutdown_until(tokio::time::Instant::now() + std::time::Duration::from_secs(3))
-        .await;
+    let cleanup_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+    resident_supervisor.request_shutdown(cleanup_deadline);
+    if let Some(worker) = &process_worker {
+        worker.request_stop();
+    }
+    let (resident_report, process_settlement) = tokio::join!(
+        resident_supervisor.shutdown_until(cleanup_deadline),
+        async {
+            match &process_worker {
+                Some(worker) => worker.shutdown_until(cleanup_deadline).await,
+                None => crate::proc_worker::Settlement::Settled,
+            }
+        }
+    );
+    let result = if process_settlement == crate::proc_worker::Settlement::Settled {
+        result
+    } else {
+        tracing::error!(target: "thegn::procs", ?process_settlement, "process sampler cleanup did not settle successfully");
+        result.and(Err(anyhow::anyhow!(
+            "process sampler cleanup did not settle successfully"
+        )))
+    };
     for (plugin, outcome) in &resident_report.outcomes {
         tracing::debug!(target: "thegn::plugin", plugin = %plugin, ?outcome, "resident lifecycle receipt; descendant containment remains unproven");
     }
@@ -6056,8 +6075,7 @@ async fn event_loop<T: Terminal>(
     mut sandbox_event_rx: tokio_mpsc::UnboundedReceiver<crate::sandbox_events::SandboxEventBatch>,
     stats_interval_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
     stats_live: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    mut proc_rx: tokio_mpsc::UnboundedReceiver<thegn_metrics::ProcSnapshot>,
-    procs_live: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    process_control: Option<crate::proc_worker::Control>,
     containers_live: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pane_pids: crate::hydrate::PanePids,
     daemon_pid_atomic: std::sync::Arc<std::sync::atomic::AtomicU32>,
@@ -6072,6 +6090,7 @@ async fn event_loop<T: Terminal>(
     host_cache_port: Option<u16>,
 ) -> Result<()> {
     crate::worktree_lifecycle::install_refresh(refresh_tx.clone());
+    let mut process_failure_reported = false;
     let mut recorder: Option<Recorder> = None;
     let mut scratch = Surface::new(cols, rows);
     // What the terminal currently shows; the render path diffs scratch
@@ -8030,6 +8049,14 @@ async fn event_loop<T: Terminal>(
     loop_perf.take(); // loop metrics start here; startup has its own waterfall
     let mut active_clock = crate::perf_timing::ActiveClock::default();
     loop {
+        // Input handlers may continue early after closing/pausing the view.
+        // Revoke first, before unrelated hydration work; positive admission
+        // below happens only after publishing the latest attribution inputs.
+        if !crate::monitor::wants_process_scan(monitor.as_ref(), current_config.monitor.processes)
+            && let Some(control) = &process_control
+        {
+            control.set_enabled(false);
+        }
         // Charge the previous dispatch too, including early-continue handlers.
         if crate::perf::enabled() {
             loop_perf.add_busy(active_clock.checkpoint(std::time::Instant::now()));
@@ -10023,7 +10050,7 @@ async fn event_loop<T: Terminal>(
             // hydration must not replace it with its empty default.
             let notification_delivery = model.notification_delivery.clone();
             let notification_delivery_configured = model.notification_delivery_configured;
-            next_model.carry_live_processes_from(&mut model);
+            next_model.carry_monitor_state_from(&mut model);
             model = next_model;
             model.ctrl_digits_reportable = ctrl_digits_reportable;
             model.notification_delivery = notification_delivery;
@@ -10454,17 +10481,44 @@ async fn event_loop<T: Terminal>(
             }
         }
 
-        // Per-process readings for the monitor's Processes tab. Only arrives
-        // while that tab is open (the sampler thread is gated), so an absent
-        // snapshot means "not sampling", not "no processes".
-        while let Ok(snap) = proc_rx.try_recv() {
-            loop_perf.tick(crate::perf::WakeSource::Stats);
-            model.procs = snap;
-            // The list only exists inside the monitor, so nothing else needs a
-            // repaint — and when the monitor is shut this is dead data.
-            if monitor.is_some() {
+        // Revoke old publication rights before the final take. One latest
+        // snapshot replaces the former unbounded channel; hydration preserves it.
+        let processes_live =
+            crate::monitor::wants_process_scan(monitor.as_ref(), current_config.monitor.processes);
+        daemon_pid_atomic.store(
+            panel_ui.docs.daemon.pid.unwrap_or(0),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        // Publish the pane PID set for process attribution: cheap (no I/O), and
+        // before enabling an immediate first sample.
+        if processes_live && let Ok(mut g) = pane_pids.lock() {
+            // Every live pane, not just the active tab's: a background build
+            // is exactly the process you want attributed.
+            let mut live: Vec<(u32, u32)> = panes
+                .table
+                .iter()
+                .filter_map(|(id, p)| p.live_pid().map(|pid| (pid, *id)))
+                .collect();
+            live.sort_unstable();
+            if g.as_ref() != live.as_slice() {
+                *g = std::sync::Arc::from(live);
+            }
+        }
+        if let Some(control) = &process_control {
+            if model.take_process_publication(control, processes_live) {
+                loop_perf.tick(crate::perf::WakeSource::Stats);
+                if monitor.is_some() {
+                    dirty = true;
+                    status_data_moved = true;
+                }
+            }
+            if !process_failure_reported
+                && let crate::proc_worker::Phase::Failed(reason) = control.status().phase
+            {
+                process_failure_reported = true;
+                tracing::error!(target: "thegn::procs", reason, "process sampling stopped");
+                model.status = reason.into();
                 dirty = true;
-                status_data_moved = true;
             }
         }
 
@@ -12195,13 +12249,6 @@ async fn event_loop<T: Terminal>(
             crate::monitor::wants_live_stats(telemetry_now, monitor.as_ref()),
             std::sync::atomic::Ordering::Relaxed,
         );
-        // The expensive full process enumeration runs ONLY while the monitor's
-        // Processes tab is the live view. One write site, so the gate cannot be
-        // left on by a path that forgot to clear it.
-        procs_live.store(
-            crate::monitor::wants_process_scan(monitor.as_ref(), current_config.monitor.processes),
-            std::sync::atomic::Ordering::Relaxed,
-        );
         // The expensive `stats --no-stream` + `system df` container enrichment
         // runs ONLY while a per-container-stats surface is visible: the monitor's
         // Containers tab, or the Sandbox panel section (its expanded stats). One
@@ -12212,27 +12259,6 @@ async fn event_loop<T: Terminal>(
             crate::monitor::wants_container_stats(monitor.as_ref(), sandbox_section_now),
             std::sync::atomic::Ordering::Relaxed,
         );
-        daemon_pid_atomic.store(
-            panel_ui.docs.daemon.pid.unwrap_or(0),
-            std::sync::atomic::Ordering::Relaxed,
-        );
-        // Publish the pane PID set for process attribution: cheap (no I/O), and
-        // only while the sampler is actually running.
-        if procs_live.load(std::sync::atomic::Ordering::Relaxed)
-            && let Ok(mut g) = pane_pids.lock()
-        {
-            // Every live pane, not just the active tab's: a background build
-            // is exactly the process you want attributed.
-            let mut live: Vec<(u32, u32)> = panes
-                .table
-                .iter()
-                .filter_map(|(id, p)| p.live_pid().map(|pid| (pid, *id)))
-                .collect();
-            live.sort_unstable();
-            if g.as_ref() != live.as_slice() {
-                *g = std::sync::Arc::from(live);
-            }
-        }
         // On open, force perf accounting on (saving the prior state) so the
         // "Loop" sub-block has data; on close, restore — a `THEGN_PERF=1`
         // user keeps accounting, a default user goes back to free.
@@ -23341,6 +23367,11 @@ async fn event_loop<T: Terminal>(
                 } else {
                     rows = r;
                     cols = c;
+                    if let Some(m) = monitor.as_mut() {
+                        // Resize is independent of live refresh: paused content
+                        // must fit the new viewport without consuming new data.
+                        m.reflow_geometry(Rect::full(cols, rows));
+                    }
                     // A Wide sidebar tracks the new window width, and the
                     // nudge/drag ceiling (~half the window) moves with it.
                     layout::set_window_cols(cols);
