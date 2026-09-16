@@ -748,6 +748,25 @@ impl WorkspaceStore for Db {
         Ok(())
     }
 
+    fn set_worktree_folder_if_identity(
+        &self,
+        worktree: &str,
+        repo_path: &str,
+        folder_id: i64,
+        expected_name: &str,
+    ) -> Result<bool> {
+        let changed = self.conn().execute(
+            "UPDATE worktrees SET folder_id = ?1
+             WHERE worktree = ?2 AND repo_path = ?3
+               AND EXISTS (
+                   SELECT 1 FROM folders
+                   WHERE folder_id = ?1 AND repo_path = ?3 AND name = ?4
+               )",
+            params![folder_id, worktree, repo_path, expected_name],
+        )?;
+        Ok(changed != 0)
+    }
+
     /// Select the named execution environment for a worktree (`[env.<name>]`).
     /// `""` clears it (inherit the workspace/repo/global layer).
     fn set_worktree_env(&self, wt: &str, env: &str) -> Result<()> {

@@ -113,6 +113,87 @@ pub(crate) fn file_worktree_path(
     Ok(format!("Filed worktree into \"{folder}\""))
 }
 
+/// File a worktree created from a captured sidebar folder identity. Unlike the
+/// ordinary name-based action above, this path never creates a folder and
+/// carries the stable folder id into the deferred write. The database update
+/// also requires the registered worktree and folder to share `repo_path`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn file_created_worktree_path(
+    session: &crate::session::Session,
+    sb: &mut SidebarState,
+    model: &mut FrameModel,
+    wt_path: &str,
+    repo_path: &str,
+    folder_id: i64,
+    refresh_tx: &UnboundedSender<RefreshKind>,
+    waker: &termwiz::terminal::TerminalWaker,
+) -> Result<String, String> {
+    let folder = model
+        .sidebar_db_folders
+        .iter()
+        .find(|f| f.folder_id == folder_id && f.repo_path == repo_path)
+        .ok_or_else(|| "The destination folder no longer exists".to_string())?;
+    let folder_name = folder.name.clone();
+    if folder_name.trim().is_empty() {
+        return Err("The destination folder has no name".into());
+    }
+    if model
+        .sidebar_db_worktrees
+        .iter()
+        .find(|w| w.path == wt_path)
+        .is_some_and(|w| w.repo_path != repo_path)
+    {
+        return Err("The created worktree belongs to another workspace".into());
+    }
+
+    if let Some(w) = model
+        .sidebar_db_worktrees
+        .iter_mut()
+        .find(|w| w.path == wt_path && w.repo_path == repo_path)
+    {
+        w.folder_id = Some(folder_id);
+    }
+    sb.optimistic_db_edit_at = Some(std::time::Instant::now());
+    sb.rebuild(model, session);
+
+    let wt_path = wt_path.to_string();
+    let repo_path = repo_path.to_string();
+    let refresh_tx = refresh_tx.clone();
+    let waker = waker.clone();
+    let expected_name = folder_name.clone();
+    tokio::task::spawn_blocking(move || {
+        match thegn_core::db::Db::open() {
+            Ok(db) => match db.set_worktree_folder_if_identity(
+                &wt_path,
+                &repo_path,
+                folder_id,
+                &expected_name,
+            ) {
+                Ok(true) => {}
+                Ok(false) => tracing::warn!(
+                    target: "thegn::sidebar",
+                    "created worktree folder identity changed; filing not persisted"
+                ),
+                Err(e) => tracing::warn!(
+                    target: "thegn::sidebar",
+                    error = %e,
+                    "created worktree filing not persisted"
+                ),
+            },
+            Err(e) => tracing::warn!(
+                target: "thegn::sidebar",
+                error = %e,
+                "created worktree filing not persisted: DB unavailable"
+            ),
+        }
+        if refresh_tx.send(RefreshKind::Model).is_ok() {
+            let _ = waker.wake();
+        }
+    });
+
+    Ok(format!("Filed worktree into \"{folder_name}\""))
+}
+
 /// Un-file the worktree at `wt_path` back to its workspace root, optimistically
 /// (same pattern as [`file_worktree_path`]): the model regroups this frame, the
 /// DB write is deferred. Used by drag-to-workspace-header filing.

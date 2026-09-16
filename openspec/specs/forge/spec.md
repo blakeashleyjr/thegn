@@ -74,3 +74,57 @@ Caller identity (`whoami`) SHALL be a forge operation; onboarding's forge probe,
 
 - **WHEN** `drive_queue` runs against a fake whose PR is green and approved
 - **THEN** the fake records a merge (or auto-merge) call and the outcome is `Merged`
+
+### Requirement: Current-branch PR lookup has explicit checkout scope
+
+Current-branch lookup SHALL distinguish the origin repository, configured PR
+base repository, push-head repository and local branch. Native and CLI paths
+MUST verify the returned branch and full head repository. The CLI MUST retain
+the resolved repository scope when using a discovered PR number. Explicit
+number lookups SHALL remain available without a checked-out branch.
+
+#### Scenario: A numeric branch is not a PR number
+
+- **WHEN** the current branch is named `42`
+- **THEN** lookup uses it as a head-ref filter, verifies the returned head
+  repository, and uses only the resulting verified PR number for detail lookup
+
+#### Scenario: A fork uses separate base and push repositories
+
+- **WHEN** a branch tracks a base repository and explicitly pushes to a fork
+- **THEN** current-branch status searches the base for that fork's head while
+  repository-wide lists remain scoped to the root checkout's origin
+
+### Requirement: Cached forge rows retain repository provenance
+
+PR panels SHALL carry the checked checkout scope. Publication and subsequent
+display MUST reject changed scope or an unproven legacy row. Repository-wide
+PR lists SHALL carry their root origin identity, including host and full
+namespace. Badge reads MUST reuse the root cache per hydration and MUST NOT
+wake remote worktrees merely to display a badge. Scoped My Work feeds MUST
+reject an obsolete origin while retaining local tracker rows in freshly
+sampled repositories without an origin.
+
+#### Scenario: Origin changes while a provider request is running
+
+- **WHEN** the checkout scope changes during a PR refresh
+- **THEN** its result is not published as the new checkout's PR and does not
+  emit the old checkout's transition effects
+
+#### Scenario: A partial open-PR list does not authorize cleanup
+
+- **WHEN** a PR is absent from a bounded open list
+- **THEN** cleanup still requires a definitive targeted state lookup and
+  matching target checkout scope before and after that lookup
+
+### Requirement: Native open-PR pagination is bounded
+
+Native open-PR collection SHALL fetch at most three pages and 300 rows, reject
+malformed pages or repeating cursors, and perform no lookup for a zero limit.
+A failed page MUST NOT replace a good cache with an apparently empty result.
+
+#### Scenario: A provider repeats its continuation cursor
+
+- **WHEN** consecutive pages repeat a continuation cursor before the requested
+  bounded result is complete
+- **THEN** collection returns an error instead of continuing indefinitely

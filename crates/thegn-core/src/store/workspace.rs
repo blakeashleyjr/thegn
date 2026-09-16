@@ -233,6 +233,18 @@ pub trait WorkspaceStore {
     /// File (or unfile, with `None`) a single worktree into a folder.
     fn set_worktree_folder(&self, worktree: &str, folder_id: Option<i64>) -> Result<()>;
 
+    /// File a worktree only when both records still belong to `repo_path` and
+    /// `folder_id` still exists there under `expected_name`. The name check
+    /// also rejects a reused SQLite row ID belonging to a differently named
+    /// folder. Returns `false` on mismatch; never creates a folder.
+    fn set_worktree_folder_if_identity(
+        &self,
+        worktree: &str,
+        repo_path: &str,
+        folder_id: i64,
+        expected_name: &str,
+    ) -> Result<bool>;
+
     /// Select the named execution environment for a worktree (`[env.<name>]`).
     /// `""` clears it (inherit the workspace/repo/global layer).
     fn set_worktree_env(&self, wt: &str, env: &str) -> Result<()>;
