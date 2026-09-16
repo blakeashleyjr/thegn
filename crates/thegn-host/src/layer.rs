@@ -124,9 +124,6 @@ fn repaint_rect(
             while x < end {
                 let Some(cell) = row.get(x) else { break };
                 let (fg, bg) = remap(cell.attrs().foreground(), cell.attrs().background());
-                let mut attrs = CellAttributes::default();
-                attrs.set_foreground(fg);
-                attrs.set_background(bg);
                 // Advance by the glyph's display width, not one column, so a wide
                 // glyph's blank continuation cell isn't re-emitted as an extra
                 // space — that would shove the rest of the row one column right.
@@ -144,11 +141,19 @@ fn repaint_rect(
                     Cow::Borrowed(raw)
                 };
                 match &mut current {
-                    Some(run) if run.attrs == attrs => run.text.push_str(&glyph),
+                    // Run attributes are always default plus the two remapped
+                    // colors below; compare those colors before allocating the
+                    // truecolor spill box for a new CellAttributes value.
+                    Some(run) if run.attrs.foreground() == fg && run.attrs.background() == bg => {
+                        run.text.push_str(&glyph)
+                    }
                     _ => {
                         if let Some(done) = current.take() {
                             runs.push(done);
                         }
+                        let mut attrs = CellAttributes::default();
+                        attrs.set_foreground(fg);
+                        attrs.set_background(bg);
                         current = Some(Run {
                             x,
                             y,
@@ -385,6 +390,7 @@ pub fn open_layer(surface: &mut Surface, screen: Rect, spec: &LayerSpec) -> Opti
 mod tests {
     use super::*;
     use crate::seg::{Line, seg};
+    use termwiz::cell::Intensity;
 
     fn surface_with_text(cols: usize, rows: usize, text: &str) -> Surface {
         let mut s = Surface::new(cols, rows);
@@ -411,6 +417,22 @@ mod tests {
 
     fn bg_at(s: &mut Surface, x: usize, y: usize) -> ColorAttribute {
         s.screen_cells()[y][x].attrs().background()
+    }
+
+    fn seed_cell(surface: &mut Surface, x: usize, y: usize, text: &str, attrs: &CellAttributes) {
+        surface.add_change(Change::CursorPosition {
+            x: Position::Absolute(x),
+            y: Position::Absolute(y),
+        });
+        surface.add_change(Change::AllAttributes(attrs.clone()));
+        surface.add_change(Change::Text(text.to_owned()));
+    }
+
+    fn changes_since(surface: &Surface, seq: usize) -> Vec<Change> {
+        match surface.get_changes(seq).1 {
+            Cow::Borrowed(changes) => changes.to_vec(),
+            Cow::Owned(_) => panic!("change stream unexpectedly synthesized a full repaint"),
+        }
     }
 
     #[test]
@@ -501,6 +523,218 @@ mod tests {
         );
         assert_ne!(fg_at(&mut s, 0, 0), ColorAttribute::Default);
         assert_ne!(bg_at(&mut s, 0, 0), ColorAttribute::Default);
+    }
+
+    #[test]
+    fn repaint_strips_source_styles_before_emitting_flat_colors() {
+        let mut s = Surface::new(80, 8);
+        let mut source = CellAttributes::default();
+        source
+            .set_foreground(ColorAttribute::PaletteIndex(4))
+            .set_background(ColorAttribute::PaletteIndex(5))
+            .set_intensity(Intensity::Bold)
+            .set_italic(true);
+        seed_cell(&mut s, 0, 0, "styled", &source);
+
+        repaint_rect(
+            &mut s,
+            Rect {
+                x: 0,
+                y: 0,
+                cols: 6,
+                rows: 1,
+            },
+            |_, _| {
+                (
+                    ColorAttribute::PaletteIndex(10),
+                    ColorAttribute::PaletteIndex(11),
+                )
+            },
+        );
+
+        let cells = s.screen_cells();
+        for cell in &cells[0][..6] {
+            assert_eq!(cell.attrs().foreground(), ColorAttribute::PaletteIndex(10));
+            assert_eq!(cell.attrs().background(), ColorAttribute::PaletteIndex(11));
+            assert_eq!(cell.attrs().intensity(), Intensity::Normal);
+            assert!(!cell.attrs().italic());
+        }
+    }
+
+    #[test]
+    fn repaint_groups_collapsed_sources_and_splits_foreground_and_background() {
+        let mut s = Surface::new(80, 8);
+        let source = [
+            (
+                ColorAttribute::PaletteIndex(1),
+                ColorAttribute::PaletteIndex(4),
+            ),
+            (
+                ColorAttribute::PaletteIndex(2),
+                ColorAttribute::PaletteIndex(5),
+            ),
+            (
+                ColorAttribute::PaletteIndex(3),
+                ColorAttribute::PaletteIndex(5),
+            ),
+            (
+                ColorAttribute::PaletteIndex(3),
+                ColorAttribute::PaletteIndex(6),
+            ),
+        ];
+        for (x, (fg, bg)) in source.into_iter().enumerate() {
+            let mut attrs = CellAttributes::default();
+            attrs.set_foreground(fg).set_background(bg);
+            let text = ((b'a' + x as u8) as char).to_string();
+            seed_cell(&mut s, x, 0, &text, &attrs);
+        }
+        let seq = s.current_seqno();
+        let fg_a = ColorAttribute::PaletteIndex(10);
+        let fg_b = ColorAttribute::PaletteIndex(11);
+        let bg_a = ColorAttribute::PaletteIndex(12);
+        let bg_b = ColorAttribute::PaletteIndex(13);
+        repaint_rect(
+            &mut s,
+            Rect {
+                x: 0,
+                y: 0,
+                cols: 4,
+                rows: 1,
+            },
+            move |fg, bg| {
+                (
+                    if fg == ColorAttribute::PaletteIndex(3) {
+                        fg_b
+                    } else {
+                        fg_a
+                    },
+                    if bg == ColorAttribute::PaletteIndex(6) {
+                        bg_b
+                    } else {
+                        bg_a
+                    },
+                )
+            },
+        );
+
+        let changes = changes_since(&s, seq);
+        let texts: Vec<&str> = changes
+            .iter()
+            .filter_map(|change| match change {
+                Change::Text(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, ["ab", "c", "d"]);
+        let attrs: Vec<&CellAttributes> = changes
+            .iter()
+            .filter_map(|change| match change {
+                Change::AllAttributes(attrs) => Some(attrs),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(attrs.len(), 4, "three runs plus the final reset");
+        assert_eq!((attrs[0].foreground(), attrs[0].background()), (fg_a, bg_a));
+        assert_eq!((attrs[1].foreground(), attrs[1].background()), (fg_b, bg_a));
+        assert_eq!((attrs[2].foreground(), attrs[2].background()), (fg_b, bg_b));
+        assert_eq!(attrs[3], &CellAttributes::default());
+    }
+
+    #[test]
+    fn repaint_resets_runs_per_row_and_preserves_clipped_unicode_on_repeat() {
+        let mut s = Surface::new(80, 8);
+        let source = CellAttributes::default();
+        seed_cell(&mut s, 0, 0, "\u{1f4bb} \u{6f22} x", &source);
+        seed_cell(&mut s, 0, 1, "\u{1f4bb} \u{6f22} x", &source);
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            cols: 12,
+            rows: 2,
+        };
+        let remap = |_, _| {
+            (
+                ColorAttribute::TrueColorWithDefaultFallback(SrgbaTuple(0.2, 0.3, 0.4, 1.0)),
+                ColorAttribute::TrueColorWithDefaultFallback(SrgbaTuple(0.1, 0.2, 0.3, 1.0)),
+            )
+        };
+        repaint_rect(&mut s, rect, remap);
+        let first = row_text(&mut s, 0);
+        assert_eq!(first.chars().next(), Some(' '), "color emoji is blanked");
+        assert!(first.contains('\u{6f22}'), "CJK glyph remains visible");
+        let seq = s.current_seqno();
+        repaint_rect(&mut s, rect, remap);
+        assert_eq!(row_text(&mut s, 0), first);
+        let changes = changes_since(&s, seq);
+        assert_eq!(
+            changes
+                .iter()
+                .filter(|change| matches!(change, Change::CursorPosition { .. }))
+                .count(),
+            2,
+            "the same colors still start one run per row"
+        );
+
+        let mut clipped = Surface::new(80, 8);
+        seed_cell(&mut clipped, 0, 0, "a\u{6f22}z", &source);
+        repaint_rect(
+            &mut clipped,
+            Rect {
+                x: 1,
+                y: 0,
+                cols: 1,
+                rows: 1,
+            },
+            remap,
+        );
+        let cells = clipped.screen_cells();
+        assert_eq!(
+            cells[0][1].str(),
+            " ",
+            "a wide glyph clipped at the edge is blanked"
+        );
+        assert_eq!(
+            cells[0][3].str(),
+            "z",
+            "the following glyph remains aligned"
+        );
+    }
+
+    #[test]
+    fn repaint_uniform_attribute_allocations_stay_below_per_cell_budget() {
+        let cols = 240;
+        let rows = 72;
+        let mut s = Surface::new(cols, rows);
+        let (_, counts) = crate::proc_workload_alloc::measure(|| {
+            repaint_rect(
+                &mut s,
+                Rect {
+                    x: 0,
+                    y: 0,
+                    cols,
+                    rows,
+                },
+                |_, _| {
+                    (
+                        ColorAttribute::TrueColorWithDefaultFallback(SrgbaTuple(
+                            0.2, 0.3, 0.4, 1.0,
+                        )),
+                        ColorAttribute::TrueColorWithDefaultFallback(SrgbaTuple(
+                            0.1, 0.2, 0.3, 1.0,
+                        )),
+                    )
+                },
+            );
+        });
+        let cells = cols * rows;
+        // Allow per-cell Surface storage plus bounded run/Change overhead;
+        // an extra temporary attributes box per cell would exceed this budget.
+        let budget = u64::try_from(cells + rows * 16 + 32).expect("bounded fixture budget");
+        assert!(
+            counts.allocation_calls < budget,
+            "uniform repaint allocated {} times for {cells} cells; budget={budget}",
+            counts.allocation_calls
+        );
     }
 
     #[test]

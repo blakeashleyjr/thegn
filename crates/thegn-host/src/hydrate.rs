@@ -458,68 +458,6 @@ impl StatsTick {
 /// thread's read is one pointer clone under a lock held for nanoseconds.
 pub(crate) type PanePids = std::sync::Arc<std::sync::Mutex<std::sync::Arc<[(u32, u32)]>>>;
 
-/// Per-process sampling, on its **own** OS thread.
-///
-/// Deliberately not folded into the refresh ticker: that thread is also the
-/// model/PR/CI/auto-fetch scheduler, and a full process enumeration on a
-/// thousand-process box (tens of milliseconds) would delay every one of those
-/// cadences. Here it delays only itself.
-///
-/// The whole thread is gated on `live`: when the Processes tab is closed it
-/// parks on a half-tick sleep, holds no process table, and does no work at all.
-pub(crate) fn spawn_proc_sampler(
-    tx: tokio_mpsc::UnboundedSender<thegn_metrics::ProcSnapshot>,
-    live: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    pane_pids: PanePids,
-    daemon_pid: std::sync::Arc<std::sync::atomic::AtomicU32>,
-    rows: usize,
-    waker: TerminalWaker,
-) {
-    use std::sync::atomic::Ordering;
-    std::thread::spawn(move || {
-        // Pure housekeeping on a fixed cadence — nobody is waiting on a process
-        // sample, and on Apple silicon this is exactly the work that belongs on
-        // an efficiency core rather than competing with the render loop.
-        crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
-        let mut sampler = thegn_metrics::ProcSampler::new(rows);
-        // True while the gate was open on the previous pass, so closing it can
-        // release the process table exactly once.
-        let mut was_live = false;
-        loop {
-            std::thread::sleep(Duration::from_millis(500));
-            if !live.load(Ordering::Relaxed) {
-                if was_live {
-                    // Drop the table and the CPU baseline: a closed tab must
-                    // cost nothing, and a delta across a long gap is meaningless.
-                    sampler.reset();
-                    was_live = false;
-                }
-                continue;
-            }
-            was_live = true;
-            let now = Instant::now();
-            if !sampler.due(now) {
-                continue;
-            }
-            let pids = pane_pids.lock().map(|g| g.to_vec()).unwrap_or_default();
-            sampler.set_pane_pids(pids);
-            sampler.set_daemon_pid(match daemon_pid.load(Ordering::Relaxed) {
-                0 => None,
-                p => Some(p),
-            });
-            let snap = {
-                let _g = crate::perf::measure(crate::perf::Subsys::Stats);
-                sampler.sample()
-            };
-            if tx.send(snap).is_err() {
-                break;
-            }
-            // best-effort: a gone terminal means we're shutting down anyway.
-            let _ = waker.wake();
-        }
-    });
-}
-
 #[path = "hydrate_refresh_ticker.rs"]
 mod refresh_ticker;
 pub(crate) use refresh_ticker::spawn_refresh_ticker;

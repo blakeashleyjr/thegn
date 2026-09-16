@@ -633,6 +633,10 @@ pub struct FrameModel {
     /// unless that tab is open — enumerating processes is gated, so this is
     /// deliberately absent the rest of the time rather than stale.
     pub procs: thegn_metrics::ProcSnapshot,
+    /// Monotonic accepted process publication; preserved across hydration.
+    pub process_revision: u64,
+    /// Semantic hydrated disk-row inputs; unrelated status fields do not advance it.
+    pub monitor_disk_revision: crate::model_eq::ContentRevision,
     /// Latest Prometheus scrape state for the sidebar metrics section.
     pub metrics: crate::metrics::MetricsState,
     /// Latest AI-account usage gather (`[usage]`) — one row per tracked account,

@@ -736,6 +736,27 @@
       ]
     },
     {
+      "issue": "THE-630",
+      "project": "Workspace Product & Observability",
+      "changes": [
+        "reduce-process-monitor-idle-work"
+      ]
+    },
+    {
+      "issue": "THE-631",
+      "project": "Workspace Product & Observability",
+      "changes": [
+        "reduce-process-monitor-idle-work"
+      ]
+    },
+    {
+      "issue": "THE-632",
+      "project": "Workspace Product & Observability",
+      "changes": [
+        "reduce-process-monitor-idle-work"
+      ]
+    },
+    {
       "issue": "THE-633",
       "project": "Workspace Product & Observability",
       "changes": [
