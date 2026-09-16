@@ -1,0 +1,17 @@
+    Checking hyper-util v0.1.20
+    Checking tower v0.5.3
+    Checking hyper-rustls v0.27.9
+    Checking tower-http v0.6.11
+    Checking igd-next v0.17.1
+    Checking reqwest v0.13.4
+    Checking noq v1.1.1
+    Checking hyper-timeout v0.5.2
+    Checking axum v0.8.9
+    Checking iroh-relay v1.0.3
+   Compiling thegn-svc v0.1.0-alpha.2 (/tmp/thegn-maintenance-07-combined-20260915/crates/thegn-svc)
+    Checking portmapper v0.19.1
+    Checking octocrab v0.54.1
+    Checking tonic v0.13.1
+    Checking iroh v1.0.3
+    Checking reqwest v0.12.28
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1m 13s

@@ -1,0 +1,36 @@
+{
+  "issue": "THE-322",
+  "scope": "Linear-only delta, with readback of root cf978191 identity follow-up",
+  "date": "2026-09-15",
+  "candidate_path": "/tmp/thegn-THE322-linear-revision-luna-20260915",
+  "base_commit": "d96c91faabafed34a5fe4d4e3222ee3c1d981e7a",
+  "candidate_commit": "0ddde12c83b165ed03f775e9419b229c56a423db",
+  "candidate_tree": "fcbff499b1becade78d4c8d7277f93a37580ddca",
+  "verdict": "SOURCE_APPROVED_FOR_OWNER_COMPILE_TEST_GATES",
+  "blockers": [],
+  "reviewed": [
+    "Fallible linear_issue_to_domain and propagation through list/search/get/create/update.",
+    "Workflow-state response admission, GraphQL escaping, and hostile state fixture.",
+    "Malformed identifier and non-public URL response rejection.",
+    "Production constructor compatibility and exact one-file delta scope.",
+    "Root cf978191 five-line GitHub identity follow-up readback; no Linear regression."
+  ],
+  "source_evidence": {
+    "linear_source_sha256": "d6cac08c96a29ad6d1c378be70a55291d0b553c1074829f6cc4b869f05c4455b",
+    "candidate_patch_sha256": "821800d59c7a1a1b88df73870522f2765fb039ae863ce74d65c741c696f5f23a",
+    "git_diff_check": "pass",
+    "candidate_rustfmt_check": "pass",
+    "delta_files": ["crates/thegn-svc/src/issue/linear.rs"],
+    "unrelated_delta_check": "clean"
+  },
+  "limits": [
+    "No Cargo/build/test/native/provider/authenticated Linear operation was run.",
+    "Hostile Axum fixture is source-only and does not establish external provider behavior.",
+    "Combined-tree compile/test gates and unrelated provider review remain owner work."
+  ],
+  "integrated_identity_followup": {
+    "commit": "cf978191",
+    "scope": "crates/thegn-svc/src/issue/identity.rs and control test source only",
+    "readback": "No regression to the reviewed Linear source; rejects option-like GitHub repo operands and fixes lifetime elision in identity helpers."
+  }
+}

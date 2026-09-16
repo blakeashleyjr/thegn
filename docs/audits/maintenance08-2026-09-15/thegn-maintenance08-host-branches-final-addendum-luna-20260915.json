@@ -1,0 +1,41 @@
+{
+  "date": "2026-09-15",
+  "candidate": "f46e043d649a639759333d76faeb6abb6749f2a5",
+  "scope": "independent source assessment of the two previously recorded host selection gaps for THE321/322",
+  "verdict": "scoped_acceptance_supported_with_untested_branch_qualification",
+  "native_status": {
+    "corrected_source": "f46e043d649a639759333d76faeb6abb6749f2a5",
+    "corrected_fixture_build": "/tmp/thegn-maintenance08-native-fixture-20260915.json",
+    "status_at_review": "running; no new test or build operation was started by this review",
+    "historical_receipt": "/tmp/thegn-maintenance08-focused-native-receipt-20260915.json",
+    "historical_result": "106 pass / 1 fail before updated_at_ms fixture correction"
+  },
+  "assessments": [
+    {
+      "id": "HOST-PLUGIN-WRAPPER",
+      "source": "crates/thegn-host/src/plugin_providers.rs:32-58",
+      "finding": "No material unsafe behavior found. issue_backends calls PluginIssueBackend::new, which validates plugin_namespace before leaking the provider id. extend_issue_router then calls IssueRouter::push_backend, which applies the same namespace validation and rejects invalid provider ids before insertion.",
+      "reachability": "For the concrete PluginIssueBackend returned by issue_backends, the push_backend Err arm is currently unreachable unless the shared validator or provider construction contract diverges. The arm remains useful defense in depth for future adapter changes.",
+      "evidence": "svc plugin/provider tests validate malformed response identity and namespace; svc issue spec tests validate plugin routing, complete prefixes, foreign namespace refusal, and registration rejection. The host wrapper valid registry test does not execute either drop arm.",
+      "qualification": "Host wrapper invalid-row and registration-conflict branches remain unexecuted; this is a coverage qualification, not a correctness blocker."
+    },
+    {
+      "id": "HOST-REFRESH-OLD-CACHE",
+      "source": "crates/thegn-host/src/hydrate_tracker.rs:99-107",
+      "finding": "The filter validates each decoded old-cache Issue before tracker_diff_notifications. Malformed JSON becomes an empty old set; invalid individual identities are omitted. A provider failure returns before this block and leaves the old cache intact, so stale invalid rows do not create notifications through this path.",
+      "evidence": "The selected panel hydration test proves invalid cached identities are omitted from panel state without rewriting the cache; the selected diff test proves status/blocker event semantics. Neither drives spawn_issue_cache_refresh with an invalid old-cache row.",
+      "residual": "The filter validates the Issue identity but does not additionally compare Issue.provider with the DB provider-key column. That storage-key binding is outside this change and no current acceptance receipt claims it; it is a possible future cache-integrity hardening seam, not evidence of unsafe host behavior here.",
+      "qualification": "Refresh-worker malformed-old-cache branch remains unexecuted; document this instead of claiming exhaustive host cache coverage."
+    }
+  ],
+  "acceptance": "The two gaps do not justify a host rebuild or block scoped THE321/322 acceptance when explicitly qualified. Corrected f46 svc evidence still requires the planned receipt; the historical 4256 receipt remains unchanged.",
+  "fs_custody_pointer": {
+    "commit": "b191cce5c6fd00a305132748d51bd3a5d81b0735",
+    "api": "thegn_core::fs_custody::LosslessPath::from_path",
+    "hashes": {
+      "fs_custody.rs": "a56e2708626f3484e8e8104b2054e79dfd14a364a699015f4f8ab8141ca949fe",
+      "share_state.rs": "8af7ef3d0522b2ad397b13780260f77c22c1f6cd2951f5624dc49c72fb4d3214"
+    }
+  },
+  "execution": "Source and receipt readback only; no tests, builds, native/provider calls, DB operations, or edits to candidate source."
+}

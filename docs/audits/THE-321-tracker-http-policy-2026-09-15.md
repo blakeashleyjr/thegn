@@ -1,33 +1,35 @@
 # THE-321 tracker HTTP policy audit
 
-Date: 2026-09-15
-Candidate: private Luna implementation from canonical `f293594d4a8516f940540b4eda60a9a98ac1d7a1`
+The authenticated Linear, Jira, and Kaneo providers now share
+`thegn_svc::issue::http`. A process-wide semaphore permits eight concurrent
+logical operations. Each operation starts one 20-second deadline before
+queueing and serialization and retains its permit across follow-up requests,
+response streaming and decode. Account origin and authorization remain local
+to each configured client.
 
-The candidate centralizes authenticated Linear, Jira, and Kaneo HTTP calls in
-`thegn_svc::issue::http`. `TrackerHttpBudget::process` provides one process-wide
-`Arc<Semaphore>` with eight permits. Each public provider operation starts one
-20-second deadline before serialization/queueing and passes one operation through
-all internal requests, response streaming, decode, and cleanup. The account
-origin and authorization remain account-local.
+The HTTP client refuses redirects and disables gzip, Brotli, deflate and zstd
+decoding. Connect/read limits are five seconds. Responses are capped at 1 MiB,
+serialized mutation bodies at 512 KiB, and dynamic inputs at 64 KiB. Status,
+identity encoding and JSON content type are checked before bounded streaming.
+Errors use bounded policy descriptions and redact underlying network details.
 
-The reqwest client pins `Policy::none`, `no_gzip`, `no_brotli`, `no_deflate`, and
-`no_zstd`, plus five-second connect/read limits and a defensive 20-second
-request ceiling. Origins accept explicitly configured HTTP or HTTPS hosts,
-including LAN hosts, while refusing credentials, path/query/fragment state, and
-request-origin escapes. Response status, identity-only encoding, JSON MIME, and
-content length are checked before a cap-checked `bytes_stream`; JSON mutation
-bodies use a 512 KiB serde writer. Errors avoid copying response bodies and use
-static provider/phase policy messages.
+Explicit HTTP and HTTPS endpoints, LAN hosts and self-hosted base paths remain
+supported. Origins reject credentials, query and fragment state; request paths
+cannot escape the configured origin/base path. Jira and Kaneo construct dynamic
+paths and queries through URL encoding. Linear status lookup and mutation,
+Jira create and follow-up retrieval, and Kaneo workspace/project expansion each
+share a single operation budget.
 
-Source fixtures cover explicit LAN HTTP admission, valid JSON, redirect refusal,
-non-identity encoding refusal, wrong MIME, auth status, oversized streamed
-response, and oversized request serialization using an in-process Axum server.
-The source-only candidate was formatted and passed `git diff --check`. Cargo,
-compiler, lint, tests, native/provider calls, authenticated requests, and
-canonical/Linear mutations were intentionally not run; root and independent
-review must perform the compiled gates.
+Native fixtures use local fake HTTP servers with synthetic credentials. They
+cover 301/302/307/308 redirects to the same origin, another origin, and a loop,
+for GET and POST; all 24 cases require one authenticated source request and zero
+target requests. Other fixtures cover byte/encoding/MIME/status limits, queued
+serialization, cancellation while queued or streaming, permit recovery and
+provider-specific multi-request deadlines. The final source, gate results,
+artifact hashes and qualifications are recorded in
+[Maintenance 08](maintenance08-2026-09-15.md).
 
-The OpenSpec change is `openspec/changes/centralize-tracker-http-policy/` and
-its reciprocal delivery metadata is sorted in `delivery/issues.json` and
-`delivery/index.json`. Pagination, account authority, identifier grammar,
-plugin HTTP clients, and host refresh lifecycle remain outside THE-321.
+The OpenSpec change is `centralize-tracker-http-policy`. Account-generation
+authority, pagination, GitHub CLI process limits and provider-specific business
+semantics remain separate issues. No live provider operation or live process
+restart is claimed by this verification.

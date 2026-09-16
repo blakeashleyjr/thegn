@@ -1,0 +1,53 @@
+{
+  "date": "2026-09-15",
+  "candidate": "759cd1ad252cb131c87cf9078923c31203cdfeb5",
+  "parent": "f46e043d649a639759333d76faeb6abb6749f2a5",
+  "source_file": "crates/thegn-svc/src/issue/http.rs",
+  "source_sha256": "927a24b747eecc6a96a4cd696e720a2694824488dd11fddf3542e0ae06f2670d",
+  "diff_scope": "test-only; 85-line diff changes redirect_target_receives_no_request_or_credentials and no production code",
+  "verdict": "approved_for_narrow_rerun",
+  "matrix": {
+    "statuses": [
+      301,
+      302,
+      307,
+      308
+    ],
+    "destinations": [
+      "same",
+      "cross",
+      "loop"
+    ],
+    "methods": [
+      "GET",
+      "POST"
+    ],
+    "cases": 24,
+    "post_body": "mutation replay-sentinel",
+    "assertions": [
+      "typed tracker redirect refusal for every case",
+      "exactly one source request per case",
+      "source Authorization equals Bearer redirect-secret for every case",
+      "zero combined source /target and cross-origin target hits",
+      "both owned servers aborted and joined"
+    ]
+  },
+  "corrected_receipt": {
+    "path": "/tmp/thegn-maintenance08-focused-native-fixture-receipt-20260915.json",
+    "sha256": "4ee9b7f52373a5e3533b1ab3ea709291354b4a7d639a9b09c290931735927378",
+    "source": "f46e043d649a639759333d76faeb6abb6749f2a5",
+    "result": "104/104 pass",
+    "scope_note": "receipt predates 759cd1ad and therefore does not evidence the expanded 24-case fixture"
+  },
+  "assessment": [
+    "Client production pins reqwest redirect Policy::none, so each 301/302/307/308 response is classified before any follow-up request.",
+    "The fixture uses two owned loopback listeners. Same-origin, cross-origin, and self-loop Location values are all served by the source listener or separate target listener; zero target hits detects either kind of replay.",
+    "The POST branch serializes a mutation sentinel and uses the same operation path, so the matrix covers mutation redirect handling as well as GET.",
+    "The source and target tasks are explicitly aborted and awaited after all cases; no detached fixture server remains."
+  ],
+  "remaining_gaps": [
+    "No literal THE321 redirect acceptance gap remains in source after this expansion.",
+    "A fresh narrow native rerun is still required because the 104/104 receipt was built from f46, not 759."
+  ],
+  "execution": "Read-only source, diff, and receipt review; no builds/tests/native/provider calls or edits."
+}

@@ -1,0 +1,64 @@
+{
+  "review": "independent source review of maintenance08 native selection and f46e043d fixture correction",
+  "date": "2026-09-15",
+  "candidate_checkout": "/tmp/thegn-maintenance08-combined-20260915",
+  "candidate_commit": "f46e043d649a639759333d76faeb6abb6749f2a5",
+  "candidate_parent": "4256d2372057a02a1f6fea96cdc4ce8388911178",
+  "fixture_delta": {
+    "verdict": "approved_for_rerun",
+    "file": "crates/thegn-svc/src/issue/mod.rs",
+    "source_sha256": "6297d9524882c61e90b01693f36b836c15fd9adbbe6f54f655a3f008d8f7da96",
+    "change": "adds updated_at_ms: 0 to the cache_boundary_rejects_cross_provider_and_malformed_ids JSON fixture",
+    "reason": "Issue.updated_at_ms is a required i64 serde field; the prior fixture failed during deserialization before exercising identity validation. The addition is syntactically valid and production behavior is unchanged."
+  },
+  "historical_receipt": {
+    "path": "/tmp/thegn-maintenance08-focused-native-receipt-20260915.json",
+    "sha256": "192bc429717b733b9d174705ae17bdf5391e8c094d9249df067ed3b63d5fa713",
+    "source": "4256d2372057a02a1f6fea96cdc4ce8388911178",
+    "passed": 106,
+    "failed": 1,
+    "failed_selector": "issue::spec::cache_boundary_rejects_cross_provider_and_malformed_ids",
+    "status": "historical_only; corrected source has no replacement receipt yet"
+  },
+  "selection": {
+    "plan": "/tmp/thegn-maintenance08-native-selection-plan-20260915.json",
+    "plan_sha256": "40904cd74a106ab79fe437edbe751abf0424e8f8254291467d4b3b5a8239b11d",
+    "selected_manifest": "/tmp/thegn-maintenance08-native-selected-20260915.json",
+    "selected_manifest_sha256": "c051be094304b07f0451d3a1daf0ef2d8961310a3b893c5d385c54f2aa16f155",
+    "historical_count": 107,
+    "coverage": "The svc prefixes enumerate all selected issue HTTP, identity, provider, router spec, plugin bridge, capability, and Linear schema tests. The two real control-router tests cover all GET/update/comment malformed and opaque identity paths. The selected host tests cover panel cache filtering and pure diff behavior."
+  },
+  "findings": [
+    {
+      "id": "HOST-PLUGIN-WRAPPER",
+      "severity": "coverage_gap",
+      "path": "crates/thegn-host/src/plugin_providers.rs:32-58",
+      "basis": "The changed host wrapper now drops PluginIssueBackend::new failures and drops IssueRouter::push_backend failures. The selected plugin::provider::tests prefix exercises the svc bridge/backend, not this host registry wrapper. The only existing host registry_round_trips_and_replaces fixture uses a valid demo namespace and asserts one backend.",
+      "required_evidence": "Add/select a host fixture that publishes an invalid namespace and a router-conflicting registration, then asserts the invalid row is omitted/refused without panic or provider dispatch. Preserve the existing valid replacement assertion."
+    },
+    {
+      "id": "HOST-REFRESH-OLD-CACHE",
+      "severity": "coverage_gap",
+      "path": "crates/thegn-host/src/hydrate_tracker.rs:99-107",
+      "basis": "The changed spawn_issue_cache_refresh path filters the prior per-account cache before tracker_diff_notifications. tracker_cache_hydration_discards_malformed_identities_before_panel_use exercises populate_tracker at lines 245-255, while tracker_diff_emits_status_changes_and_blocker_resolved_once calls the pure diff helper directly. Neither drives the refresh worker with malformed old-cache rows.",
+      "required_evidence": "Add/select an owned DB/config fake for the refresh path with one malformed cached identity and one valid row, then assert malformed data cannot produce a diff/automation event while valid data remains eligible. If this worker fixture is intentionally out of scope, record this branch as untested rather than claiming complete host cache coverage."
+    }
+  ],
+  "no_gap_found": [
+    "control client encoded_issue_path and control HTTP validation are covered by direct malformed-path tests plus the real Axum router roundtrip; the malformed test exercises GET, update, and comment with zero fake provider calls.",
+    "issue::http tests include redirect refusal/no credential request, content-encoding refusal, MIME/status checks, bounded chunked body, queued serialization, permit release, and one-operation multi-request expiry.",
+    "provider-specific selected tests cover Jira create follow-up refusal, Kaneo list expansion refusal, and Linear multi-request update budget; identity and schema contract prefixes are complete."
+  ],
+  "fs_custody_pointer": {
+    "reviewed_commit": "b191cce5c6fd00a305132748d51bd3a5d81b0735",
+    "checkout": "/tmp/thegn-THE327-impl-luna-20260915-v1",
+    "api": "Use thegn_core::fs_custody::LosslessPath::from_path for lossless platform-native path capture. Serialize the tagged LosslessPath value through its reviewed serde representation; keep platform cfg and raw Unix/UTF-16 conversion in fs_custody. secure_random is the reviewed crate-internal entropy seam. Do not duplicate OsStr conversion in share_state or host consumers.",
+    "hashes": {
+      "crates/thegn-core/src/fs_custody.rs": "a56e2708626f3484e8e8104b2054e79dfd14a364a699015f4f8ab8141ca949fe",
+      "crates/thegn-core/src/share_state.rs": "8af7ef3d0522b2ad397b13780260f77c22c1f6cd2951f5624dc49c72fb4d3214",
+      "crates/thegn-core/src/lib.rs": "2525b5e97d0f33a4cd310781c419d9b0a2a9cc32bfb247de82e16514b9a3fa66"
+    },
+    "visibility_note": "LosslessPath::from_path is public; validate and append_wire are crate-private in this reviewed slice, and secure_random is crate-private. Cross-crate consumers should use a deliberately reviewed public custody API rather than reaching through or reimplementing the private wire helpers."
+  },
+  "execution": "No tests, builds, native/provider calls, database operations, or mutable target operations were run for this review."
+}

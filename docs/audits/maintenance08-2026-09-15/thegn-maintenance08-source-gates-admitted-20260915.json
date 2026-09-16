@@ -1,0 +1,58 @@
+{
+  "source": "cf9781913033a3f149b01c32ada6f0c7d9759766",
+  "cpu_max": "100000 100000",
+  "at_utc": "2026-09-15T23:09:35.914352+00:00",
+  "checks": [
+    {
+      "name": "format",
+      "command": [
+        "rustfmt",
+        "--edition",
+        "2024",
+        "--check",
+        "crates/thegn-host/src/daemon/service.rs",
+        "crates/thegn-host/src/hydrate_tests.rs",
+        "crates/thegn-host/src/hydrate_tracker.rs",
+        "crates/thegn-host/src/plugin_providers.rs",
+        "crates/thegn-svc/src/conformance.rs",
+        "crates/thegn-svc/src/control/client.rs",
+        "crates/thegn-svc/src/control/http.rs",
+        "crates/thegn-svc/src/control/tests.rs",
+        "crates/thegn-svc/src/issue/github.rs",
+        "crates/thegn-svc/src/issue/http.rs",
+        "crates/thegn-svc/src/issue/identity.rs",
+        "crates/thegn-svc/src/issue/jira.rs",
+        "crates/thegn-svc/src/issue/kaneo.rs",
+        "crates/thegn-svc/src/issue/linear.rs",
+        "crates/thegn-svc/src/issue/mod.rs",
+        "crates/thegn-svc/src/plugin/provider.rs"
+      ],
+      "exit_code": 0,
+      "log": "/tmp/thegn-maintenance08-source-admitted-format-20260915.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "name": "ratchets",
+      "command": [
+        "just",
+        "ratchets"
+      ],
+      "exit_code": 0,
+      "log": "/tmp/thegn-maintenance08-source-admitted-ratchets-20260915.log",
+      "sha256": "df39603e698d21f156e2c62fae1c5c938c09561cb01296c01abca358b9422935"
+    },
+    {
+      "name": "diff",
+      "command": [
+        "git",
+        "diff",
+        "--check",
+        "fadd7164",
+        "cf9781913033a3f149b01c32ada6f0c7d9759766"
+      ],
+      "exit_code": 0,
+      "log": "/tmp/thegn-maintenance08-source-admitted-diff-20260915.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  ]
+}

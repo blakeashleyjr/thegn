@@ -1,0 +1,30 @@
+{
+  "decision": "approved for compiled gates",
+  "at_utc": "2026-09-15T23:21:16.515744+00:00",
+  "source": "4256d2372057a02a1f6fea96cdc4ce8388911178",
+  "tree": "c1a6072fd999de24f921bbc2c3737f8bcb7d9e14",
+  "reviewer": "root",
+  "issues": [
+    "THE-321",
+    "THE-322"
+  ],
+  "review_hashes": {
+    "/tmp/thegn-maintenance08-http-adversarial-luna-20260915.json": "3635f09c1f18fe419116a7411c9079f46305469d7bd123cc58a1131ac0fde1ac",
+    "/tmp/thegn-THE322-linear-independent-adversarial-luna-20260915.json": "c2a1bc6fa4ba023ccc9dfc8e0625bce5740a34fcc49e050e65e1a26d8c8ff2f3",
+    "/tmp/thegn-THE322-v4-independent-adversarial-luna-20260915.json": "43801a679a9a7cd330c0b9df8df0f6ceaaea7d4e339facf5d1134f165209e3c0",
+    "/tmp/thegn-maintenance08-primary-adversarial-disposition-20260915.json": "c83cf753b8f654903c821548ea0e2d515dfc4ad30f853e840793b65d83c0bf2d",
+    "/tmp/thegn-maintenance08-source-gates-admitted-20260915.json": "0654138fbb1d3a8681c4deeab5d2ca33b70a9d5a99463863030774cf3fea7d48",
+    "/tmp/thegn-maintenance08-source-gates-20260915.json": "da42ff01c89228cf6f1ee158c8e242c25707e9174d4d0ed1267bf022ec8d0f41",
+    "/tmp/thegn-maintenance08-compile-corrections-independent-review-luna-20260915.json": "af984445d6e67ff21cf9cb18c82442b62134d0af4924414bbcf333c947b476c2",
+    "/tmp/thegn-maintenance08-source-gates-lintready-20260915.json": "1d14fc6411408455b02c88a7a6ec7d3f1d59f70383bea88b820cbc1047bc725e"
+  },
+  "scope": "Original322 integrated review plus independent321 HTTP review and independent finalLinear+rootoperanddelta; root verified integration conversions, malformed cache boundary and actual control router fixtures.",
+  "qualifications": [
+    "THE315 repository precedence remains separate open issue; THE324 account-generation authority remains separate.",
+    "Internal unpublished svc fallible plugin constructor/registration change intentional, all in-tree callers migrated; strict workspace all-target lint will check.",
+    "No native/runtime/performance claim until tests pass; no release build.",
+    "One shared warm-cache build checkout, one CPU quota, one job, no concurrent owned Cargo writer."
+  ],
+  "prior_failed_build": "/tmp/thegn-maintenance08-clippy-corrected-20260915.json",
+  "correction": "Root reviewed3 mechanical lint repairs preserving timestamp0 fallback, fallible task conversion and test error expectation. Prior independent full source and compile delta reviews stand. Tiny lint delta independent review pending and required before landing; compilation may proceed concurrently."
+}

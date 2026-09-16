@@ -1,0 +1,22 @@
+{
+  "source": "759cd1ad252cb131c87cf9078923c31203cdfeb5",
+  "started_at_utc": "2026-09-16T00:00:41.658303+00:00",
+  "tests": [
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-redirect-binaries-20260915/svc-tests",
+      "selector": "issue::http::tests::redirect_target_receives_no_request_or_credentials",
+      "exit_code": 0,
+      "seconds": 0.103,
+      "exact_one_pass": true,
+      "output_sha256": "3ed45366fdbb255e680920d5ba3ee32d5958bb172840d3d51bc1d90a0df0fc8c"
+    }
+  ],
+  "log": "/tmp/thegn-maintenance08-focused-native-redirect-20260915.log",
+  "runner": "/tmp/thegn-private-test-runner-20260914.py",
+  "runner_sha256": "6809313d9ce8fea04dcc7ad81d88e7b3ab09a41ec130155eff8514078ed3ea07",
+  "finished_at_utc": "2026-09-16T00:00:41.762183+00:00",
+  "passed": 1,
+  "failed": 0,
+  "log_sha256": "2578259c56d96b5afcc349590fa8636aaf84b6eeb936e144638124bcb02befa5"
+}

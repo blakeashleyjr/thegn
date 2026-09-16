@@ -1,0 +1,15 @@
+{
+  "decision": "approved for compiled gates",
+  "source": "f46e043d649a639759333d76faeb6abb6749f2a5",
+  "at_utc": "2026-09-15T23:48:54.282403+00:00",
+  "reviewer": "root",
+  "review_hashes": {
+    "/tmp/thegn-maintenance08-primary-compile-approval-final-20260915.json": "d9d635aa72c5eca42e1970e2e27dcd638da29c0d90846300e7340d01c74de0a1",
+    "/tmp/thegn-maintenance08-lint-delta-independent-review-luna-20260915.json": "4f67830f6700bee42c0914c2e754d64d78ef8d893dfac5ac8aa8f364dbe1e67a",
+    "/tmp/thegn-maintenance08-focused-native-receipt-20260915.json": "192bc429717b733b9d174705ae17bdf5391e8c094d9249df067ed3b63d5fa713"
+  },
+  "scope": "Test-only JSON timestamp correction; no production source changes. Independent tiny-delta review requested and required before landing.",
+  "prior_clippy": "/tmp/thegn-maintenance08-clippy-final-20260915.json",
+  "prior_native": "/tmp/thegn-maintenance08-focused-native-receipt-20260915.json",
+  "build_policy": "Only svc lib/tests lint and svc lib harness rebuild, oneCPU onejob. Reuse host4256 artifact unchanged."
+}

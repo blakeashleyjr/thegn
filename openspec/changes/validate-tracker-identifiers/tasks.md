@@ -12,5 +12,5 @@
 - [x] Exercise bounded zero-effect fake-provider routing, server-decoded control
   identity round-trip, strict response-field admission, GitHub flag/URL forms,
   and structured Kaneo path/query construction.
-- [ ] Run the existing bounded fake process/request selectors, strict
+- [x] Run the existing bounded fake process/request selectors, strict
   OpenSpec/delivery checks, and native provider matrix after source review.

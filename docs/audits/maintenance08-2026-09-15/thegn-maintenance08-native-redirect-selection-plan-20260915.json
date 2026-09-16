@@ -1,0 +1,25 @@
+{
+  "scope": "Only changed redirect fixture: 24 native GET/POST status/origin/loop cases. Unchanged103svc cases use f46 receipt and3hostcases use4256.",
+  "runner": "/tmp/thegn-private-test-runner-20260914.py",
+  "execution_policy": {
+    "jobs": 1,
+    "cpu_quota": "100%",
+    "timeout_per_exact_test_seconds": 30,
+    "private_XDG": true,
+    "provider_authentication": false,
+    "real_DB_access": false
+  },
+  "svc": {
+    "prefixes": [],
+    "exact_suffixes": [
+      "redirect_target_receives_no_request_or_credentials"
+    ],
+    "exclusions": []
+  },
+  "host": {
+    "prefixes": [],
+    "exact_suffixes": [],
+    "exclusions": []
+  },
+  "note": "No production change since4256; preserve prior104svcPASS and3hostPASS. Final native supplement isolates changed fixture."
+}

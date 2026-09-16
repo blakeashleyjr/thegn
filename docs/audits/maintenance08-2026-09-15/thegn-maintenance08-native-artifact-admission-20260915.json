@@ -1,0 +1,24 @@
+{
+  "source": "4256d2372057a02a1f6fea96cdc4ce8388911178",
+  "exit_code": 0,
+  "at_utc": "2026-09-15T23:43:03.030639+00:00",
+  "build_receipt": "/tmp/thegn-maintenance08-native-20260915.json",
+  "artifacts": {
+    "host": {
+      "path": "/tmp/thegn-maintenance08-native-binaries-20260915/host-tests",
+      "binary_sha256": "fee2ada0b9c20455b8c93c9efa71c389ac6fd771af6eef1444b72911afcb524a",
+      "depfile_sha256": "2b0c4aadf3d01b832102c2fd3058a5eca96966d5e293de223f5049135efd1f66",
+      "compiler_artifact_fresh": false,
+      "manifest_dir": "/tmp/thegn-maintenance-07-combined-20260915/crates/thegn-host",
+      "package_id": "path+file:///tmp/thegn-maintenance-07-combined-20260915/crates/thegn-host#0.1.0-alpha.2"
+    },
+    "svc": {
+      "path": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "binary_sha256": "ea21c5aa08e9936decbca7003a8529d09d4e64c10bdf3e7d34bb40a3420e983d",
+      "depfile_sha256": "1945cace8eef415aaec243cfe67817709e9c7f73690e9f1f7442bb7c9bfb11c9",
+      "compiler_artifact_fresh": false,
+      "manifest_dir": "/tmp/thegn-maintenance-07-combined-20260915/crates/thegn-svc",
+      "package_id": "path+file:///tmp/thegn-maintenance-07-combined-20260915/crates/thegn-svc#0.1.0-alpha.2"
+    }
+  }
+}

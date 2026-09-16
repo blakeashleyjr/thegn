@@ -1,0 +1,976 @@
+{
+  "source": "4256d2372057a02a1f6fea96cdc4ce8388911178",
+  "started_at_utc": "2026-09-15T23:43:38.739793+00:00",
+  "tests": [
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "conformance::tests::issue_capability_ledger_covers_every_provider_offline",
+      "exit_code": 0,
+      "seconds": 0.078,
+      "exact_one_pass": true,
+      "output_sha256": "01db1b30615ecd3c252259bb612eae144f8050ba36ed6ec8e85a30c3408bfe95"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "conformance::tests::issue_capability_ledger_rejects_over_and_underclaims",
+      "exit_code": 0,
+      "seconds": 0.072,
+      "exact_one_pass": true,
+      "output_sha256": "8e7326e84b916703ef9f851b1cc50830d9535a702c3f71d9bbaf74286a5cc0e8"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "conformance::tests::issue_error_classification_covers_seam_contract",
+      "exit_code": 0,
+      "seconds": 0.07,
+      "exact_one_pass": true,
+      "output_sha256": "854aa8d5bf76e37334e520193264086303a7e0d72ea6330092e24baeb34aad58"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "control::client::tests::issue_path_encodes_complete_identity_once_for_server_decode",
+      "exit_code": 0,
+      "seconds": 0.073,
+      "exact_one_pass": true,
+      "output_sha256": "394c356d8e26c95b94bc9cbf6d66a638c7922c245498dc94ee2d15865377963c"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "control::client::tests::issue_path_rejects_malformed_identity_before_encoding",
+      "exit_code": 0,
+      "seconds": 0.07,
+      "exact_one_pass": true,
+      "output_sha256": "20dae66b3ff28328ecf9fe4c9a43630d50ff4218271cd55c659d96b33bbb4aa7"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "control::tests::issue_identity_roundtrips_client_encoding_through_real_router",
+      "exit_code": 0,
+      "seconds": 0.351,
+      "exact_one_pass": true,
+      "output_sha256": "a00b248f5e898455cea369fa3de1202b7b3a5817c733aa17537b7571d0c7dc47"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "control::tests::malformed_issue_identity_reaches_no_control_api_operation",
+      "exit_code": 0,
+      "seconds": 0.754,
+      "exact_one_pass": true,
+      "output_sha256": "0612318e4e3f79f04d9cbd7f57605d4bd2c56c401d184897c34e51f1f4910efc"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "issue::capabilities::tests::omitted_and_null_caps_are_least_privilege",
+      "exit_code": 0,
+      "seconds": 0.069,
+      "exact_one_pass": true,
+      "output_sha256": "8beffaa14029cc9198cb19d0418ee76165a6f644e0b7682c6f39467c1a7c4b38"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "issue::capabilities::tests::unknown_caps_are_rejected",
+      "exit_code": 0,
+      "seconds": 0.071,
+      "exact_one_pass": true,
+      "output_sha256": "470bf131259a03196ab34c8f39296e3d5a7c5e548fdf75f9c752de805733a02a"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "issue::github::tests::explicit_enterprise_scope_admits_response_without_ambient_gh_host",
+      "exit_code": 0,
+      "seconds": 0.068,
+      "exact_one_pass": true,
+      "output_sha256": "6956187d9701d1bf181b2d34aa4f7854f7ef286502ed0336956920debbb1652c"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "issue::github::tests::extra_repo_flag_forms_are_checked",
+      "exit_code": 0,
+      "seconds": 0.068,
+      "exact_one_pass": true,
+      "output_sha256": "636c61ef5e9a31fff263e0a9ce74e413ed79c35623585df7d58696ecbdad2787"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "issue::github::tests::issue_to_domain_closed_maps_to_done",
+      "exit_code": 0,
+      "seconds": 0.071,
+      "exact_one_pass": true,
+      "output_sha256": "5eb844b10e1c401ea91f65f12278ffaafb83865bcd443fe59a86c9fe2e89af2b"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "issue::github::tests::issue_to_domain_open_maps_to_todo",
+      "exit_code": 0,
+      "seconds": 0.069,
+      "exact_one_pass": true,
+      "output_sha256": "6e633e4a23b2cd175d496dd14344024e1da8708d524f2c4cd7841573485a1626"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "issue::github::tests::malformed_response_url_does_not_downgrade_to_bare_id",
+      "exit_code": 0,
+      "seconds": 0.071,
+      "exact_one_pass": true,
+      "output_sha256": "bbd4d852da34097fa4eb8baec2d2b45cc9c571d48c181285201503eb9438a519"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "issue::github::tests::parse_ms_valid_and_invalid",
+      "exit_code": 0,
+      "seconds": 0.07,
+      "exact_one_pass": true,
+      "output_sha256": "71ddfee4eb6b1e84fabce83ce8e7afe37e3c2e33ba686481158317f3d5a9202a"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "issue::github::tests::repo_from_url_extracts_owner_repo",
+      "exit_code": 0,
+      "seconds": 0.071,
+      "exact_one_pass": true,
+      "output_sha256": "3b09bc651377320637a9d2253e336c192f9957808c3b78f18e8dcb60005d8484"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "issue::github::tests::split_id_round_trips_scoped_and_bare_ids",
+      "exit_code": 0,
+      "seconds": 0.071,
+      "exact_one_pass": true,
+      "output_sha256": "506ec6d8bc856f64247bd75380114ff25abca3753599067399e4e505ac784300"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "issue::http::tests::bounded_serializer_refuses_before_a_request_can_be_built",
+      "exit_code": 0,
+      "seconds": 0.088,
+      "exact_one_pass": true,
+      "output_sha256": "77e7bba567c0b97980575d150622fb6ed350293529b2863da847e97ebdf50cff"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "issue::http::tests::constructors_admit_linear_and_preserve_self_hosted_base_paths",
+      "exit_code": 0,
+      "seconds": 0.072,
+      "exact_one_pass": true,
+      "output_sha256": "61d651853996774f87c0c268aafc33f9ad3387fb0882d4177abe513b40bb384a"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "issue::http::tests::fake_http_enforces_redirect_encoding_and_stream_caps",
+      "exit_code": 0,
+      "seconds": 0.099,
+      "exact_one_pass": true,
+      "output_sha256": "5ff42be695135749d3cb8329cde76d729902ff1f2e7c7de23aa792a85a0181cc"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "issue::http::tests::issue_error_debug_redacts_reqwest_network_details",
+      "exit_code": 0,
+      "seconds": 0.071,
+      "exact_one_pass": true,
+      "output_sha256": "71879c5d9f0694b31e7c5c9018de3499a16df8ca63269bd52c62d8b068eb4d9e"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "issue::http::tests::origin_policy_preserves_explicit_lan_http_and_rejects_authority_state",
+      "exit_code": 0,
+      "seconds": 0.07,
+      "exact_one_pass": true,
+      "output_sha256": "24add1fce94ccc2f063998077ff4635692271d3985a1c8a6afacac2b64edd662"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "issue::http::tests::pending_stream_future_drop_releases_permit",
+      "exit_code": 0,
+      "seconds": 0.073,
+      "exact_one_pass": true,
+      "output_sha256": "736a532201fd76022eed2529a2f032769ca38c51bebd1534de648e30efd7d9f0"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "issue::http::tests::process_budget_is_shared_across_client_construction",
+      "exit_code": 0,
+      "seconds": 0.07,
+      "exact_one_pass": true,
+      "output_sha256": "22d7b43dfb31e297d0c5bf1cc9ac046bcd808e8dd81176c3471993675f740857"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "issue::http::tests::queued_request_does_not_serialize_body_before_capacity",
+      "exit_code": 0,
+      "seconds": 0.072,
+      "exact_one_pass": true,
+      "output_sha256": "9da72472430dda43e5fbf7c781a08153bae3586a9f8ef18d4e9f66c648176d69"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "issue::http::tests::redirect_target_receives_no_request_or_credentials",
+      "exit_code": 0,
+      "seconds": 0.077,
+      "exact_one_pass": true,
+      "output_sha256": "96e74b03f1e4b8a566b77e84d3ab6b1e39d1f75a93123b2e417dd9bcc0043455"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "issue::http::tests::repeated_provider_requests_share_one_explicit_budget",
+      "exit_code": 0,
+      "seconds": 0.075,
+      "exact_one_pass": true,
+      "output_sha256": "aa190d9e1c911da7c9b78beaa18bb0b8ce65fc2012e8184213f62ee356d0b541"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "issue::http::tests::shared_budget_queue_future_drop_releases_capacity",
+      "exit_code": 0,
+      "seconds": 0.073,
+      "exact_one_pass": true,
+      "output_sha256": "b21b463d5c17ed6fc5a9bf9b0c4c23b2bcfa1a1c06a22eca982286e499f1e2d3"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "issue::identity::tests::builtin_grammar_keeps_ascii_repository_and_jira_rules_bounded",
+      "exit_code": 0,
+      "seconds": 0.068,
+      "exact_one_pass": true,
+      "output_sha256": "5b72f5b4371f6ad04e9a6d5a5b605efd8f2dc4519d5ac03f4c5555f6a6f08aba"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "issue::identity::tests::builtins_reject_path_and_option_injection",
+      "exit_code": 0,
+      "seconds": 0.069,
+      "exact_one_pass": true,
+      "output_sha256": "3a2ca5d6c85a3ac2a242af0aaae72a6189a560a73a8ebdc693410f5f68bea41d"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "issue::identity::tests::complete_control_identity_bounds_the_whole_envelope",
+      "exit_code": 0,
+      "seconds": 0.068,
+      "exact_one_pass": true,
+      "output_sha256": "0e1cf4075b1af7d4e94f7f10e6b80fcc01f23a1f2b0bb0c0fad733158d1889e0"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "issue::identity::tests::native_jira_and_kaneo_compatibility_examples",
+      "exit_code": 0,
+      "seconds": 0.069,
+      "exact_one_pass": true,
+      "output_sha256": "89880c86e7b12ac6b1161b37a94494c560a4f357f5af8fd02a847bd35c833252"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "issue::identity::tests::plugin_keys_keep_opaque_utf8_but_reject_controls",
+      "exit_code": 0,
+      "seconds": 0.075,
+      "exact_one_pass": true,
+      "output_sha256": "c53ad58827400a65ad0bb24823444344e31d391a4c7308aad4cb42a879e1a1b4"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "issue::jira::tests::constructor_admits_self_hosted_base_path",
+      "exit_code": 0,
+      "seconds": 0.076,
+      "exact_one_pass": true,
+      "output_sha256": "19cb334e56cae4c660916466b28bc40cb8b86f7e9883bb35c68fa503dcb04022"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "issue::jira::tests::create_issue_returns_budget_error_before_jira_followup",
+      "exit_code": 0,
+      "seconds": 0.076,
+      "exact_one_pass": true,
+      "output_sha256": "0891be729450732561822c2e731836ffa41fec46d06623d7ce18a7ad387579e9"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "issue::jira::tests::escape_jql_str_neutralizes_quote_backslash_newline",
+      "exit_code": 0,
+      "seconds": 0.069,
+      "exact_one_pass": true,
+      "output_sha256": "98f5fda3c4569e2fe7dec7a9b3c7a517cf32aea96f33ee03862555c6fd803ff6"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "issue::jira::tests::extract_text_walks_adf_and_handles_edges",
+      "exit_code": 0,
+      "seconds": 0.07,
+      "exact_one_pass": true,
+      "output_sha256": "61b05f1a14e1e727af478b4b6d31759574369e63f28774679b7dbc76ad26e37d"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "issue::jira::tests::issue_to_domain_maps_all_fields_and_derives_browse_url",
+      "exit_code": 0,
+      "seconds": 0.07,
+      "exact_one_pass": true,
+      "output_sha256": "43ad2f6c19f20573dcca975b1331073381255799a0a26ae33b3db703edc3c562"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "issue::jira::tests::issue_to_domain_tolerates_missing_optionals",
+      "exit_code": 0,
+      "seconds": 0.071,
+      "exact_one_pass": true,
+      "output_sha256": "d02545ebae643ecd391ed6060aee6b04cf45c0c399c3c12890c8e871abe8a299"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "issue::jira::tests::map_priority_by_name_and_fallback",
+      "exit_code": 0,
+      "seconds": 0.096,
+      "exact_one_pass": true,
+      "output_sha256": "c7e36cf4c13eb145bdfd1afba619d5837929d685e5a747885610cec1c2c456a2"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "issue::jira::tests::map_status_by_category_and_fallback",
+      "exit_code": 0,
+      "seconds": 0.088,
+      "exact_one_pass": true,
+      "output_sha256": "64addcda173e660a58bb378e3c5f784fb27092746783d25ba3a8140594a768d7"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "issue::jira::tests::parse_ms_valid_and_invalid",
+      "exit_code": 0,
+      "seconds": 0.082,
+      "exact_one_pass": true,
+      "output_sha256": "964c9e72693a0cdcf12b64ab764f5983c7e86779c2d1bfa40007d3c6af3af72d"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "issue::jira::tests::project_filter_accepts_configured_project_without_issue_number",
+      "exit_code": 0,
+      "seconds": 0.074,
+      "exact_one_pass": true,
+      "output_sha256": "70430c17e48823f5d1a7dc6dd4b39d18481bef1d447433046cbc9d932bb74bce"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "issue::jira::tests::status_filter_uses_statuscategory_not_display_names",
+      "exit_code": 0,
+      "seconds": 0.069,
+      "exact_one_pass": true,
+      "output_sha256": "493f8e47f50e666db9b50405a2784d2b6b0df77677c90cb2d22c920dd6fa9516"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "issue::jira::tests::urlencoding_percent_encodes_plus_and_equals",
+      "exit_code": 0,
+      "seconds": 0.074,
+      "exact_one_pass": true,
+      "output_sha256": "7abaaea3178ca44c109705912527e4fdbeb8fc3cd2ca7a756bdc0a96ee103a98"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "issue::kaneo::tests::api_url_encodes_structured_query_and_rejects_traversal",
+      "exit_code": 0,
+      "seconds": 0.07,
+      "exact_one_pass": true,
+      "output_sha256": "f6601100f381d133088f58f91c1f0e361335e475451b5638bcb6232593d699f6"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "issue::kaneo::tests::board_response_flattens_to_issues",
+      "exit_code": 0,
+      "seconds": 0.073,
+      "exact_one_pass": true,
+      "output_sha256": "dff362ff345ca9efc54d59b2a315449f037555e85c416a0fca4bf58c6b3eb7f8"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "issue::kaneo::tests::column_status_uses_is_final_then_name_heuristic",
+      "exit_code": 0,
+      "seconds": 0.069,
+      "exact_one_pass": true,
+      "output_sha256": "7d068bce328c30a4c5096077c378efca5b607f1acbdac942b9e81f1656804c84"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "issue::kaneo::tests::label_row_deserializes",
+      "exit_code": 0,
+      "seconds": 0.071,
+      "exact_one_pass": true,
+      "output_sha256": "6d7f4bdf65df56dd9d1a36dc3afa487e427deec7898ace58ba146be91f47b6a9"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "issue::kaneo::tests::list_expansion_returns_budget_error_before_kaneo_project_fetch",
+      "exit_code": 0,
+      "seconds": 0.077,
+      "exact_one_pass": true,
+      "output_sha256": "fac51d25646a3f88b3d4ad7f7b9efbfec9320c4355bdd024a310fab156c1f557"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "issue::kaneo::tests::parse_ms_valid_and_invalid",
+      "exit_code": 0,
+      "seconds": 0.069,
+      "exact_one_pass": true,
+      "output_sha256": "b38a7c5d0ddee9c0008b1389fbbabd83ddae41acc88a9c1d3e7a4f722b9a45d9"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "issue::kaneo::tests::priority_maps_and_reverses",
+      "exit_code": 0,
+      "seconds": 0.068,
+      "exact_one_pass": true,
+      "output_sha256": "9587ea09252f44d7ee75b26e8a897fee0732431199373daaa0c6f99f5619815a"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "issue::kaneo::tests::project_deserializes_name_and_slug",
+      "exit_code": 0,
+      "seconds": 0.071,
+      "exact_one_pass": true,
+      "output_sha256": "eb935674c4c280aba85e1d3e7236c14c9dbc1d3d53a89b552b376acc229f56e9"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "issue::kaneo::tests::task_link_uses_url_segments_and_query_encoding",
+      "exit_code": 0,
+      "seconds": 0.07,
+      "exact_one_pass": true,
+      "output_sha256": "21846e50c4d0d332b173ecb6263113d31042f2173a64575964b334fc3c7b603f"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "issue::kaneo::tests::task_missing_optionals_tolerated",
+      "exit_code": 0,
+      "seconds": 0.07,
+      "exact_one_pass": true,
+      "output_sha256": "397ed69562a1188a4ba4e0b2e803ceae5d34ed599e3e41580dd99a25904f62fa"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "issue::kaneo::tests::url_falls_back_without_workspace",
+      "exit_code": 0,
+      "seconds": 0.071,
+      "exact_one_pass": true,
+      "output_sha256": "ba04e05c5528c3997c847cc12f47feb34c4c94e078b11c4e881489b5c27e9443"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "issue::linear::schema_contract::backlog_filter_requests_both_backlog_and_triage",
+      "exit_code": 0,
+      "seconds": 0.07,
+      "exact_one_pass": true,
+      "output_sha256": "25c8dd2c1fd962a37c11933d0d7b71ff5f56be05aa4aa67d426cb333b4b787b2"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "issue::linear::schema_contract::create_mutation_selects_the_same_fields_as_issue_fields",
+      "exit_code": 0,
+      "seconds": 0.071,
+      "exact_one_pass": true,
+      "output_sha256": "6e7c8345f8f8482e9d4731de09df86d998cdcdaf307c8e56626c30294948212a"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "issue::linear::schema_contract::every_recorded_state_type_maps_deliberately",
+      "exit_code": 0,
+      "seconds": 0.07,
+      "exact_one_pass": true,
+      "output_sha256": "181f78f931beb37b297cbac36945b83af9b5f45f322931bef6a944b6e7a5897c"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "issue::linear::schema_contract::get_issue_comments_selection_matches_recorded_schema",
+      "exit_code": 0,
+      "seconds": 0.075,
+      "exact_one_pass": true,
+      "output_sha256": "6faa1f93a7e6df3a94356df219f5e3d84ee4e28ffbb424c176c9f4d98288d63e"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "issue::linear::schema_contract::issue_fields_selection_matches_recorded_schema",
+      "exit_code": 0,
+      "seconds": 0.069,
+      "exact_one_pass": true,
+      "output_sha256": "792f71d0bfebf3f68c9a5b2d5db2ba0a705174659f0a9de3bc3e0dccdd7ab33d"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "issue::linear::schema_contract::limit_clamps_to_the_page_maximum",
+      "exit_code": 0,
+      "seconds": 0.069,
+      "exact_one_pass": true,
+      "output_sha256": "5802540d6020863e2f5ad543450017df6591f9db8e0cc9a3d7d8d6616a823bba"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "issue::linear::schema_contract::overlapping_statuses_deduplicate_in_order",
+      "exit_code": 0,
+      "seconds": 0.069,
+      "exact_one_pass": true,
+      "output_sha256": "e40be6135587eddba637b0edfec8d8611d2942baf39a3dedbf12a80bb815bdc2"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "issue::linear::schema_contract::parse_selection_handles_nesting_and_reports_unknown_fields",
+      "exit_code": 0,
+      "seconds": 0.069,
+      "exact_one_pass": true,
+      "output_sha256": "86a5a0773af605a4f1201b375d3851688765c1df2d2f016f8db810759996b9ec"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "issue::linear::schema_contract::recorded_issue_type_has_no_assignees_field",
+      "exit_code": 0,
+      "seconds": 0.07,
+      "exact_one_pass": true,
+      "output_sha256": "74dd662ca07ca972a14295bb9155903ed4895af1543dfb70c4adde72c48053e2"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "issue::linear::schema_contract::state_type_strings_are_recorded_linear_types",
+      "exit_code": 0,
+      "seconds": 0.069,
+      "exact_one_pass": true,
+      "output_sha256": "863701acc85b6226cabe8b97496edf773f4034441f30b59029447f58e2d5961f"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "issue::linear::schema_contract::team_scope_and_assignee_me_join_as_arguments",
+      "exit_code": 0,
+      "seconds": 0.072,
+      "exact_one_pass": true,
+      "output_sha256": "687de2436cf169512734b8849bfc4be251aa786158afa138e1e704babf6923ec"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "issue::linear::schema_contract::unfiltered_list_query_is_well_formed",
+      "exit_code": 0,
+      "seconds": 0.076,
+      "exact_one_pass": true,
+      "output_sha256": "2e5074598b8e14f82e4c9e158931762e9f4bcb7a01d5a238d92f943b53892496"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "issue::linear::schema_contract::user_controlled_identifiers_cannot_break_out_of_the_literal",
+      "exit_code": 0,
+      "seconds": 0.076,
+      "exact_one_pass": true,
+      "output_sha256": "a33a50e40f23d6c51a072461dfcdd850661bd98e1b192be53070da0288b6bbe3"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "issue::linear::tests::constructor_admits_official_linear_endpoint",
+      "exit_code": 0,
+      "seconds": 0.079,
+      "exact_one_pass": true,
+      "output_sha256": "0b5ebad82db3898269098ff7e6a5eabfedb8018063fb6831606040ada3bc5aeb"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "issue::linear::tests::escape_graphql_str_neutralizes_quote_backslash_newline_tab",
+      "exit_code": 0,
+      "seconds": 0.069,
+      "exact_one_pass": true,
+      "output_sha256": "fefe8c2c97992b8420ee361c48e677382343ee1a3cf967e83c94471993b9a386"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "issue::linear::tests::issue_to_domain_maps_all_fields",
+      "exit_code": 0,
+      "seconds": 0.07,
+      "exact_one_pass": true,
+      "output_sha256": "4ecc8498a22ddc6007d5e9f95d1b2d3797905d043491139bfc16ae28fa97d690"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "issue::linear::tests::issue_to_domain_rejects_provider_identity_or_url_before_returning",
+      "exit_code": 0,
+      "seconds": 0.073,
+      "exact_one_pass": true,
+      "output_sha256": "73cc1fad19674d8a142e90ac7506a5f580a4a4546735c69fee542398b8920904"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "issue::linear::tests::issue_to_domain_tolerates_missing_optionals",
+      "exit_code": 0,
+      "seconds": 0.072,
+      "exact_one_pass": true,
+      "output_sha256": "8185a53720b4bc029e93df06181997ad6778103e7b06faed3a748949a6f0117f"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "issue::linear::tests::map_state_covers_all_types_and_fallback",
+      "exit_code": 0,
+      "seconds": 0.069,
+      "exact_one_pass": true,
+      "output_sha256": "04347aaedbf2daacca0a35cf73556878ad4dad7702c0bd4ed2df486deee491c8"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "issue::linear::tests::parse_updated_at_valid_and_invalid",
+      "exit_code": 0,
+      "seconds": 0.069,
+      "exact_one_pass": true,
+      "output_sha256": "c9a8f91e7eef26593c8ebbfa5ca8cdf3c11f6000bc276a821bb805e2dd84b827"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "issue::linear::tests::priority_maps_and_round_trips",
+      "exit_code": 0,
+      "seconds": 0.07,
+      "exact_one_pass": true,
+      "output_sha256": "6ac814cc08a4d4bf5edbe95c4cabd96cb716dcf3307b3e47f341589a60848657"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "issue::linear::tests::update_status_escapes_provider_state_id_before_write",
+      "exit_code": 0,
+      "seconds": 0.075,
+      "exact_one_pass": true,
+      "output_sha256": "0cdb5d8c453bdd3adfe784115170e89887bb41147039ffea1ae4e05fb3fa2768"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "issue::linear::tests::update_status_uses_one_budget_across_linear_requests",
+      "exit_code": 0,
+      "seconds": 0.075,
+      "exact_one_pass": true,
+      "output_sha256": "a0a5ab9fcdc70da1d699565843fdbe0c5c9beea8f68cf1b9e8c45d12148b8500"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "issue::linear::tests::workflow_state_id_is_admitted_and_escaped_before_mutation",
+      "exit_code": 0,
+      "seconds": 0.072,
+      "exact_one_pass": true,
+      "output_sha256": "c63653f4757287483c0af378c0c8a9d3d7fa9e5b0958bcbfe84b5dc1cf1479fd"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "issue::spec::bare_id_routes_to_the_only_backend",
+      "exit_code": 0,
+      "seconds": 0.07,
+      "exact_one_pass": true,
+      "output_sha256": "921a32e936482094e84aa9f8f280bcf8398ce29a36e7910cd38b09fc847e6500"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "issue::spec::bare_id_with_two_backends_routes_nowhere",
+      "exit_code": 0,
+      "seconds": 0.073,
+      "exact_one_pass": true,
+      "output_sha256": "8681e9a1288ab643c687e58bd9da86da4e2cccfb4605be8742d70b54a0f75f9e"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "issue::spec::builds_one_backend_per_active_provider",
+      "exit_code": 0,
+      "seconds": 0.168,
+      "exact_one_pass": true,
+      "output_sha256": "87343cda75bfbe9b0d3b9f2e9d9225f2292853cd0438476c8aef8c3927f14aec"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "issue::spec::cache_boundary_rejects_cross_provider_and_malformed_ids",
+      "exit_code": 101,
+      "seconds": 0.069,
+      "exact_one_pass": false,
+      "output_sha256": "5b5ab66c2857b5f1f4a2652b4c680d316a610ff3690124e8922fbffd79ce30b1"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "issue::spec::dispatch_by_id_prefix",
+      "exit_code": 0,
+      "seconds": 0.17,
+      "exact_one_pass": true,
+      "output_sha256": "b5279f8ff640e175b6a677961a01cf94b7d2de8f8516091511be506475398126"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "issue::spec::duplicate_provider_ids_keep_the_first_account_for_mutations",
+      "exit_code": 0,
+      "seconds": 0.07,
+      "exact_one_pass": true,
+      "output_sha256": "d84dd67dd0f3fc25f0d74265c500f79a807ad010e7fee1cdc3fdb1968f4dcd9d"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "issue::spec::id_miss_dedupes_repeated_providers",
+      "exit_code": 0,
+      "seconds": 0.073,
+      "exact_one_pass": true,
+      "output_sha256": "4df5bee4654df481ba5b3d02fdc766e095a883a7be5958c2382e620ba5c37f5d"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "issue::spec::id_miss_message_names_the_form_and_the_providers",
+      "exit_code": 0,
+      "seconds": 0.072,
+      "exact_one_pass": true,
+      "output_sha256": "30e6db834e751058296941121659712172a306122e02cd53b5b4bc8afd4771f5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "issue::spec::malformed_control_id_reaches_no_fake_provider_effect",
+      "exit_code": 0,
+      "seconds": 0.07,
+      "exact_one_pass": true,
+      "output_sha256": "c7b8d6b98946e8b0651ae2f6d8372706bc23702d8d16de8b912370d0f20cf493"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "issue::spec::multiple_accounts_of_one_provider_each_build_a_backend",
+      "exit_code": 0,
+      "seconds": 0.072,
+      "exact_one_pass": true,
+      "output_sha256": "36359052f21a396dd3bde8e12e976de553d03d8c9e50f9d111a0e4140e9e3cbe"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "issue::spec::parse_due_date_ms_handles_date_only_and_rfc3339",
+      "exit_code": 0,
+      "seconds": 0.071,
+      "exact_one_pass": true,
+      "output_sha256": "2ddbbb18e65ba920eea8d0e83eb518e93df3e5295308e24dd43cc8fc599c24a4"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "issue::spec::plugin_identity_envelope_is_bounded_before_routing",
+      "exit_code": 0,
+      "seconds": 0.07,
+      "exact_one_pass": true,
+      "output_sha256": "04b05f3dfeefbc6b1ddf21e2401befebb2e22650bd942013d511b72cc685f311"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "issue::spec::plugin_namespace_routes_by_complete_registered_prefix",
+      "exit_code": 0,
+      "seconds": 0.072,
+      "exact_one_pass": true,
+      "output_sha256": "cda1bc879547ef10592f371076142b7b62a06df2d054b570d2e8a19c03f32491"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "issue::spec::single_backend_does_not_fallback_foreign_namespace",
+      "exit_code": 0,
+      "seconds": 0.07,
+      "exact_one_pass": true,
+      "output_sha256": "736d0ad39cb888889de3dad41c47408a50428a5f92328532c2470205c5b0db5e"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "issue::spec::single_provider_back_compat",
+      "exit_code": 0,
+      "seconds": 0.07,
+      "exact_one_pass": true,
+      "output_sha256": "e068913e3ef0dc0f8f6dac1a0353e021386f3e3ed124d7c73a2c40ace7937c8c"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "issue::spec::unconfigured_router_is_empty",
+      "exit_code": 0,
+      "seconds": 0.071,
+      "exact_one_pass": true,
+      "output_sha256": "99d2b67e171f06093ce7ea4009f68005a2577855ed95a22677c0dd053109bd6a"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "plugin::provider::tests::issue_ops_round_trip_through_a_scripted_plugin",
+      "exit_code": 0,
+      "seconds": 0.077,
+      "exact_one_pass": true,
+      "output_sha256": "c7734461b4c800181a3c9c0208bc2c7b06995cb34157566a4c2c66884007d837"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "plugin::provider::tests::late_and_unknown_responses_are_reported_unroutable",
+      "exit_code": 0,
+      "seconds": 0.078,
+      "exact_one_pass": true,
+      "output_sha256": "931e1095a86e70843cee9d7077642615c8c1eeb22f985d126032ef80e7db71e4"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "plugin::provider::tests::omitted_caps_refuse_optional_ops_without_a_bridge_round_trip",
+      "exit_code": 0,
+      "seconds": 0.072,
+      "exact_one_pass": true,
+      "output_sha256": "37447ee1d0727080aed5ecc89284cb8b9888f36ff9a15eba503cec139df1e2e6"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "plugin::provider::tests::plugin_response_identity_must_match_namespace_and_opaque_fields",
+      "exit_code": 0,
+      "seconds": 0.079,
+      "exact_one_pass": true,
+      "output_sha256": "3341b92020441f05b3ff4e57ce66f9ae1e313db2572e575b96cfa00c213ebca4"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "plugin::provider::tests::resident_eof_fails_pending_calls_without_waiting_for_rpc_deadline",
+      "exit_code": 0,
+      "seconds": 0.097,
+      "exact_one_pass": true,
+      "output_sha256": "db9006ac143ae24eaa255e55425856ed7aa9d2a0b3509b27febac749ce07e75c"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "plugin::provider::tests::resident_final_reply_before_exit_is_delivered_and_late_call_is_closed",
+      "exit_code": 0,
+      "seconds": 0.078,
+      "exact_one_pass": true,
+      "output_sha256": "340850532e4db05e1c9b8ebe836ddccb9d4f3b760add4ae3b1fc35278f402c2f"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "plugin::provider::tests::resident_old_session_cannot_route_into_replacement_bridge",
+      "exit_code": 0,
+      "seconds": 0.07,
+      "exact_one_pass": true,
+      "output_sha256": "6d38df5d2b3b832cafd8c8095cc14971106bb135fc2cce7b3c41dbd1aee50f21"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/svc-tests",
+      "selector": "plugin::provider::tests::timeout_and_dead_session_degrade_to_errors",
+      "exit_code": 0,
+      "seconds": 0.38,
+      "exact_one_pass": true,
+      "output_sha256": "b2325c522887b4eeddb8de133980d825eb249fefe103225381952a20b5e9c92b"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/host-tests",
+      "selector": "daemon::service::tests::issue_verbs_are_unimplemented_without_a_configured_tracker",
+      "exit_code": 0,
+      "seconds": 0.129,
+      "exact_one_pass": true,
+      "output_sha256": "f494c1e4e43783211de36dacc802eb4a06782127e6307b85af8cc5e59d7ecc72"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/host-tests",
+      "selector": "hydrate::tests::tracker_cache_hydration_discards_malformed_identities_before_panel_use",
+      "exit_code": 0,
+      "seconds": 0.124,
+      "exact_one_pass": true,
+      "output_sha256": "cec5b2dd9cf60be3fe62ec19c7ca97ae7c9252454b7a4d5266d8262ee78241a5"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/host-tests",
+      "selector": "hydrate::tests::tracker_diff_emits_status_changes_and_blocker_resolved_once",
+      "exit_code": 0,
+      "seconds": 0.074,
+      "exact_one_pass": true,
+      "output_sha256": "efb011864f8a0c18299eae4d83c190caf22a408f7fb8d7d8bbd3ec40a4c92559"
+    }
+  ],
+  "log": "/tmp/thegn-maintenance08-focused-native-20260915.log",
+  "runner": "/tmp/thegn-private-test-runner-20260914.py",
+  "runner_sha256": "6809313d9ce8fea04dcc7ad81d88e7b3ab09a41ec130155eff8514078ed3ea07",
+  "finished_at_utc": "2026-09-15T23:43:48.175097+00:00",
+  "passed": 106,
+  "failed": 1,
+  "log_sha256": "d2d3a06f5346be4ae2fef5c9f5796b882413415a87f0e6296f144e2680f0d18a"
+}

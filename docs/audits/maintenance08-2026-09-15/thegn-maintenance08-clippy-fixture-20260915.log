@@ -1,0 +1,4 @@
+   Compiling thegn-svc v0.1.0-alpha.2 (/tmp/thegn-maintenance-07-combined-20260915/crates/thegn-svc)
+    Checking thegn-media v0.1.0-alpha.2 (/tmp/thegn-maintenance-07-combined-20260915/crates/thegn-media)
+    Checking thegn-core v0.1.0-alpha.2 (/tmp/thegn-maintenance-07-combined-20260915/crates/thegn-core)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1m 15s

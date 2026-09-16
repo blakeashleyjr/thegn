@@ -1,0 +1,46 @@
+{
+  "scope": "THE321/322 combined provider/control/plugin and actual host cache regressions",
+  "runner": "/tmp/thegn-private-test-runner-20260914.py",
+  "execution_policy": {
+    "jobs": 1,
+    "cpu_quota": "100%",
+    "timeout_per_exact_test_seconds": 30,
+    "private_XDG": true,
+    "provider_authentication": false,
+    "real_DB_access": false
+  },
+  "svc": {
+    "prefixes": [
+      "issue::http::tests::",
+      "issue::identity::tests::",
+      "issue::github::tests::",
+      "issue::jira::tests::",
+      "issue::kaneo::tests::",
+      "issue::linear::tests::",
+      "issue::capabilities::tests::",
+      "plugin::provider::tests::",
+      "issue::spec::",
+      "issue::linear::schema_contract::"
+    ],
+    "exact_suffixes": [
+      "issue_identity_roundtrips_client_encoding_through_real_router",
+      "malformed_issue_identity_reaches_no_control_api_operation",
+      "issue_capability_ledger_covers_every_provider_offline",
+      "issue_error_classification_covers_seam_contract",
+      "issue_capability_ledger_rejects_over_and_underclaims",
+      "issue_path_encodes_complete_identity_once_for_server_decode",
+      "issue_path_rejects_malformed_identity_before_encoding"
+    ],
+    "exclusions": []
+  },
+  "host": {
+    "prefixes": [],
+    "exact_suffixes": [
+      "tracker_cache_hydration_discards_malformed_identities_before_panel_use",
+      "tracker_diff_emits_status_changes_and_blocker_resolved_once",
+      "issue_verbs_are_unimplemented_without_a_configured_tracker"
+    ],
+    "exclusions": []
+  },
+  "note": "Selection corrected against fresh harness --list: router tests are issue::spec; include Linear schema and client encoders. No initial tests executed before selector correction."
+}

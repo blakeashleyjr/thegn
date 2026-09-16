@@ -1,0 +1,15 @@
+{
+  "decision": "approved for compiled gates",
+  "source": "759cd1ad252cb131c87cf9078923c31203cdfeb5",
+  "at_utc": "2026-09-15T23:57:25.639031+00:00",
+  "reviewer": "root",
+  "review_hashes": {
+    "/tmp/thegn-maintenance08-native-selection-independent-review-luna-20260915.json": "9e816a7c194262b1e9adc91d52638f607c3b55f5b3131e220c11d4f8145c02f0",
+    "/tmp/thegn-maintenance08-host-branches-final-addendum-luna-20260915.json": "e72410b0cc2c94f20d4e51bce60b8839da9d966cb736b7dca5b9a1fa29d2e7cd",
+    "/tmp/thegn-maintenance08-focused-native-fixture-receipt-20260915.json": "4ee9b7f52373a5e3533b1ab3ea709291354b4a7d639a9b09c290931735927378"
+  },
+  "scope": "Only existing HTTP test expanded into explicit24-case acceptance matrix. Production unchanged from4256. Independent fixture review required before landing.",
+  "prior_verified": "104 svc tests atf46,3 host at4256",
+  "build_policy": "Matching control-grpc feature svc lib/tests lint then svc lib harness; oneCPU onejob; finalchangedfixture only rerun.",
+  "correction": "Fresh Linear321 acceptance requires301/302/307/308 same/crossorigin andloop GET/POST; prior302 test insufficient."
+}

@@ -1,0 +1,19 @@
+   Compiling hyper-util v0.1.20
+   Compiling tower v0.5.3
+   Compiling hyper-rustls v0.27.9
+   Compiling tower-http v0.6.11
+   Compiling igd-next v0.17.1
+   Compiling reqwest v0.13.4
+   Compiling noq v1.1.1
+   Compiling hyper-timeout v0.5.2
+   Compiling axum v0.8.9
+   Compiling iroh-relay v1.0.3
+   Compiling thegn-svc v0.1.0-alpha.2 (/tmp/thegn-maintenance-07-combined-20260915/crates/thegn-svc)
+   Compiling portmapper v0.19.1
+   Compiling thegn-media v0.1.0-alpha.2 (/tmp/thegn-maintenance-07-combined-20260915/crates/thegn-media)
+   Compiling octocrab v0.54.1
+   Compiling thegn-core v0.1.0-alpha.2 (/tmp/thegn-maintenance-07-combined-20260915/crates/thegn-core)
+   Compiling tonic v0.13.1
+   Compiling iroh v1.0.3
+   Compiling reqwest v0.12.28
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3m 15s

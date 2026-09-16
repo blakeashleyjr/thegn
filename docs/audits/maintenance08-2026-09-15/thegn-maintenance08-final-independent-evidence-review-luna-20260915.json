@@ -1,0 +1,79 @@
+{
+  "date": "2026-09-15",
+  "issue_scope": [
+    "THE-321",
+    "THE-322"
+  ],
+  "candidate": "759cd1ad252cb131c87cf9078923c31203cdfeb5",
+  "verdict": "approved_scoped_final_evidence",
+  "test_composition": {
+    "distinct_tests": 107,
+    "unchanged_svc_from_f46": 103,
+    "expanded_redirect_fixture": 1,
+    "unchanged_host_from_4256": 3,
+    "accounting": "103 + 1 + 3 = 107; the redirect selector replaces the older 302-only version rather than adding a duplicate test."
+  },
+  "receipts": {
+    "prior_f46_svc": {
+      "path": "/tmp/thegn-maintenance08-focused-native-fixture-receipt-20260915.json",
+      "sha256": "4ee9b7f52373a5e3533b1ab3ea709291354b4a7d639a9b09c290931735927378",
+      "source": "f46e043d649a639759333d76faeb6abb6749f2a5",
+      "result": "104/104 pass"
+    },
+    "prior_4256_historical": {
+      "path": "/tmp/thegn-maintenance08-focused-native-receipt-20260915.json",
+      "sha256": "192bc429717b733b9d174705ae17bdf5391e8c094d9249df067ed3b63d5fa713",
+      "source": "4256d2372057a02a1f6fea96cdc4ce8388911178",
+      "result": "106 pass / 1 fixture fail; preserved historical"
+    },
+    "redirect_supplement": {
+      "path": "/tmp/thegn-maintenance08-focused-native-redirect-receipt-20260915.json",
+      "sha256": "0c31ae72e563be55a24087b0c49785dd824904c5ac2e75a70475232550e9fddd",
+      "log": "/tmp/thegn-maintenance08-focused-native-redirect-20260915.log",
+      "log_sha256": "2578259c56d96b5afcc349590fa8636aaf84b6eeb936e144638124bcb02befa5",
+      "source": "759cd1ad252cb131c87cf9078923c31203cdfeb5",
+      "result": "1/1 exact pass; fixture executes 24 matrix cases"
+    }
+  },
+  "redirect_fixture_review": {
+    "matrix": "301/302/307/308 \u00d7 same/cross/loop \u00d7 GET/POST",
+    "cases": 24,
+    "properties": "typed refusal, one authenticated source request per case, zero target/follow-up requests, both servers joined"
+  },
+  "gates": {
+    "clippy": {
+      "path": "/tmp/thegn-maintenance08-clippy-redirect-20260915.json",
+      "sha256": "8f9bfe28e29454537c2caf8cbb9092a08ebc0120984d4ad32c07e99395a85e57",
+      "exit_code": 0,
+      "log_sha256": "a38934091f5ed58da89540861f82eeadd69521f7e1d59f0e7c877d0a01ab3880"
+    },
+    "native_artifact": {
+      "path": "/tmp/thegn-maintenance08-native-redirect-artifact-admission-20260915.json",
+      "sha256": "46a23a7a9c69bcb1a074704424474920f743424d41a0567f7215d4718b940fbe",
+      "build_receipt": "/tmp/thegn-maintenance08-native-redirect-20260915.json",
+      "build_receipt_sha256": "f77564a74aef973cddd5cb75dfc70c832f96fab66d6a73793d1c34eef2b06e02",
+      "exit_code": 0,
+      "binary_sha256": "a6ebfea72e7435f1b4ee9c2e02cc1c57cda347401ff291907e7f550e2717e2e3",
+      "depfile_sha256": "5a311535638d7ed26a27111a183bea1f4d0ab55f486fb7b97b41d792150772cc",
+      "compiler_artifact_fresh": false,
+      "build_checkout": "/tmp/thegn-maintenance-07-combined-20260915",
+      "build_checkout_head": "759cd1ad252cb131c87cf9078923c31203cdfeb5",
+      "review_http_sha256": "927a24b747eecc6a96a4cd696e720a2694824488dd11fddf3542e0ae06f2670d",
+      "build_http_sha256": "927a24b747eecc6a96a4cd696e720a2694824488dd11fddf3542e0ae06f2670d",
+      "qualification": "fresh=false is a cache status; exact source commit, checkout HEAD, source hash, binary, depfile, and manifest path are recorded. It is not treated as a stale-artifact blocker."
+    },
+    "production_equivalence": {
+      "path": "/tmp/thegn-maintenance08-production-source-equivalence-20260915.json",
+      "sha256": "cb408e39cc48e307488d2e703df235a46ff4d899e143f430b5681805f076ca6f",
+      "validated_production": "4256d2372057a02a1f6fea96cdc4ce8388911178",
+      "result": "only issue/http.rs and issue/mod.rs changed; production prefixes unchanged"
+    }
+  },
+  "qualifications": [
+    "Previously identified host plugin-wrapper and refresh-worker selectors remain explicitly untested; source review found no material unsafe behavior and root disposition is scoped qualification.",
+    "No claim is made for hostile same-UID atomic custody or unrelated host branches.",
+    "Historical 4256 failure and corrected f46 receipt remain preserved rather than rewritten."
+  ],
+  "final_assessment": "No remaining THE321/322 evidence gap blocks the scoped closure/landing review. The final native supplement directly covers the changed redirect fixture; the other 106 distinct tests are backed by the preserved f46 and 4256 receipts.",
+  "execution": "Read-only review of source, receipts, artifact metadata, depfile/source hashes, and gate records; no builds/tests/native/provider/database operations were run."
+}

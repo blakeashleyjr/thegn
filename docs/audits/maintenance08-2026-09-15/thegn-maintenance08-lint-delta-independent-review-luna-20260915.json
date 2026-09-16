@@ -1,0 +1,42 @@
+{
+  "scope": "root-only lint delta",
+  "candidate": "/tmp/thegn-maintenance08-combined-20260915",
+  "base": "7a36ab03",
+  "head": "4256d2372057a02a1f6fea96cdc4ce8388911178",
+  "decision": "approved for stated source scope",
+  "changed_files": [
+    "crates/thegn-svc/src/issue/github.rs",
+    "crates/thegn-svc/src/issue/kaneo.rs",
+    "crates/thegn-svc/src/issue/http.rs"
+  ],
+  "checks": [
+    {
+      "file": "crates/thegn-svc/src/issue/github.rs",
+      "lint": "manual_ok_err",
+      "finding": "parse_ms map_or rewrite preserves None, invalid, and valid timestamp results"
+    },
+    {
+      "file": "crates/thegn-svc/src/issue/kaneo.rs",
+      "lint": "needless_question_mark",
+      "finding": "create path directly returns existing task_to_domain Result"
+    },
+    {
+      "file": "crates/thegn-svc/src/issue/http.rs",
+      "lint": "test expect_err",
+      "finding": "fixture assertion is equivalent and production code is unchanged"
+    }
+  ],
+  "not_run": [
+    "Cargo",
+    "tests",
+    "builds",
+    "native providers",
+    "authenticated services",
+    "Linear operations"
+  ],
+  "source_hashes": {
+    "crates/thegn-svc/src/issue/github.rs": "6fabcac898846480bd8279c050c67e44c55aebd640752f08ac82f0541579e34b",
+    "crates/thegn-svc/src/issue/kaneo.rs": "397a3d97a8d3fb6bc43a02d9f02f74e7c1633207fa1dd5dab094af6ded69f8fd",
+    "crates/thegn-svc/src/issue/http.rs": "d62a4c5e75d338a66e9ebb653bb70213f16ab2e0c22845856841228a48ace8c1"
+  }
+}

@@ -1,0 +1,1737 @@
+{
+  "issues": [
+    "THE-321",
+    "THE-322"
+  ],
+  "source": "759cd1ad252cb131c87cf9078923c31203cdfeb5",
+  "base": "fadd7164ce46b684e1e23ee2174aa876fc619d42",
+  "at_utc": "2026-09-16T00:02:21.797106+00:00",
+  "status": "Root and independent evidence approved. Final format, ratchets, OpenSpec and authored-content whitespace checks passed; local-main landing receipt and fresh Linear closure follow separately.",
+  "production_validated_at": "4256d2372057a02a1f6fea96cdc4ce8388911178",
+  "source_equivalence": "thegn-maintenance08-production-source-equivalence-20260915.json",
+  "native_distinct_tests": 107,
+  "native_tests": [
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "conformance::tests::issue_capability_ledger_covers_every_provider_offline",
+      "exit_code": 0,
+      "seconds": 0.071,
+      "exact_one_pass": true,
+      "output_sha256": "01db1b30615ecd3c252259bb612eae144f8050ba36ed6ec8e85a30c3408bfe95",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "conformance::tests::issue_capability_ledger_rejects_over_and_underclaims",
+      "exit_code": 0,
+      "seconds": 0.078,
+      "exact_one_pass": true,
+      "output_sha256": "4a5ab645437eface4db5d45e098958b3dc6d12269db28bdbd63ddc0521ff0009",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "conformance::tests::issue_error_classification_covers_seam_contract",
+      "exit_code": 0,
+      "seconds": 0.071,
+      "exact_one_pass": true,
+      "output_sha256": "854aa8d5bf76e37334e520193264086303a7e0d72ea6330092e24baeb34aad58",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "control::client::tests::issue_path_encodes_complete_identity_once_for_server_decode",
+      "exit_code": 0,
+      "seconds": 0.071,
+      "exact_one_pass": true,
+      "output_sha256": "394c356d8e26c95b94bc9cbf6d66a638c7922c245498dc94ee2d15865377963c",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "control::client::tests::issue_path_rejects_malformed_identity_before_encoding",
+      "exit_code": 0,
+      "seconds": 0.072,
+      "exact_one_pass": true,
+      "output_sha256": "20dae66b3ff28328ecf9fe4c9a43630d50ff4218271cd55c659d96b33bbb4aa7",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "control::tests::issue_identity_roundtrips_client_encoding_through_real_router",
+      "exit_code": 0,
+      "seconds": 0.358,
+      "exact_one_pass": true,
+      "output_sha256": "6a9df009cb276def8303001a197947c37973b7d68a4dd6ce5de3b3e87fa43e1b",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "control::tests::malformed_issue_identity_reaches_no_control_api_operation",
+      "exit_code": 0,
+      "seconds": 0.755,
+      "exact_one_pass": true,
+      "output_sha256": "e2a161a0fe9dce1f65e7c4a70d0cd2b850060b6bab4f8697c3fb593299a41603",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::capabilities::tests::omitted_and_null_caps_are_least_privilege",
+      "exit_code": 0,
+      "seconds": 0.07,
+      "exact_one_pass": true,
+      "output_sha256": "8beffaa14029cc9198cb19d0418ee76165a6f644e0b7682c6f39467c1a7c4b38",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::capabilities::tests::unknown_caps_are_rejected",
+      "exit_code": 0,
+      "seconds": 0.072,
+      "exact_one_pass": true,
+      "output_sha256": "470bf131259a03196ab34c8f39296e3d5a7c5e548fdf75f9c752de805733a02a",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::github::tests::explicit_enterprise_scope_admits_response_without_ambient_gh_host",
+      "exit_code": 0,
+      "seconds": 0.071,
+      "exact_one_pass": true,
+      "output_sha256": "6956187d9701d1bf181b2d34aa4f7854f7ef286502ed0336956920debbb1652c",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::github::tests::extra_repo_flag_forms_are_checked",
+      "exit_code": 0,
+      "seconds": 0.069,
+      "exact_one_pass": true,
+      "output_sha256": "636c61ef5e9a31fff263e0a9ce74e413ed79c35623585df7d58696ecbdad2787",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::github::tests::issue_to_domain_closed_maps_to_done",
+      "exit_code": 0,
+      "seconds": 0.07,
+      "exact_one_pass": true,
+      "output_sha256": "5eb844b10e1c401ea91f65f12278ffaafb83865bcd443fe59a86c9fe2e89af2b",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::github::tests::issue_to_domain_open_maps_to_todo",
+      "exit_code": 0,
+      "seconds": 0.07,
+      "exact_one_pass": true,
+      "output_sha256": "6e633e4a23b2cd175d496dd14344024e1da8708d524f2c4cd7841573485a1626",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::github::tests::malformed_response_url_does_not_downgrade_to_bare_id",
+      "exit_code": 0,
+      "seconds": 0.069,
+      "exact_one_pass": true,
+      "output_sha256": "bbd4d852da34097fa4eb8baec2d2b45cc9c571d48c181285201503eb9438a519",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::github::tests::parse_ms_valid_and_invalid",
+      "exit_code": 0,
+      "seconds": 0.07,
+      "exact_one_pass": true,
+      "output_sha256": "71ddfee4eb6b1e84fabce83ce8e7afe37e3c2e33ba686481158317f3d5a9202a",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::github::tests::repo_from_url_extracts_owner_repo",
+      "exit_code": 0,
+      "seconds": 0.07,
+      "exact_one_pass": true,
+      "output_sha256": "3b09bc651377320637a9d2253e336c192f9957808c3b78f18e8dcb60005d8484",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::github::tests::split_id_round_trips_scoped_and_bare_ids",
+      "exit_code": 0,
+      "seconds": 0.067,
+      "exact_one_pass": true,
+      "output_sha256": "506ec6d8bc856f64247bd75380114ff25abca3753599067399e4e505ac784300",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::http::tests::bounded_serializer_refuses_before_a_request_can_be_built",
+      "exit_code": 0,
+      "seconds": 0.084,
+      "exact_one_pass": true,
+      "output_sha256": "77e7bba567c0b97980575d150622fb6ed350293529b2863da847e97ebdf50cff",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::http::tests::constructors_admit_linear_and_preserve_self_hosted_base_paths",
+      "exit_code": 0,
+      "seconds": 0.07,
+      "exact_one_pass": true,
+      "output_sha256": "61d651853996774f87c0c268aafc33f9ad3387fb0882d4177abe513b40bb384a",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::http::tests::fake_http_enforces_redirect_encoding_and_stream_caps",
+      "exit_code": 0,
+      "seconds": 0.096,
+      "exact_one_pass": true,
+      "output_sha256": "5ff42be695135749d3cb8329cde76d729902ff1f2e7c7de23aa792a85a0181cc",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::http::tests::issue_error_debug_redacts_reqwest_network_details",
+      "exit_code": 0,
+      "seconds": 0.072,
+      "exact_one_pass": true,
+      "output_sha256": "71879c5d9f0694b31e7c5c9018de3499a16df8ca63269bd52c62d8b068eb4d9e",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::http::tests::origin_policy_preserves_explicit_lan_http_and_rejects_authority_state",
+      "exit_code": 0,
+      "seconds": 0.069,
+      "exact_one_pass": true,
+      "output_sha256": "24add1fce94ccc2f063998077ff4635692271d3985a1c8a6afacac2b64edd662",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::http::tests::pending_stream_future_drop_releases_permit",
+      "exit_code": 0,
+      "seconds": 0.071,
+      "exact_one_pass": true,
+      "output_sha256": "736a532201fd76022eed2529a2f032769ca38c51bebd1534de648e30efd7d9f0",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::http::tests::process_budget_is_shared_across_client_construction",
+      "exit_code": 0,
+      "seconds": 0.072,
+      "exact_one_pass": true,
+      "output_sha256": "22d7b43dfb31e297d0c5bf1cc9ac046bcd808e8dd81176c3471993675f740857",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::http::tests::queued_request_does_not_serialize_body_before_capacity",
+      "exit_code": 0,
+      "seconds": 0.07,
+      "exact_one_pass": true,
+      "output_sha256": "9da72472430dda43e5fbf7c781a08153bae3586a9f8ef18d4e9f66c648176d69",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::http::tests::repeated_provider_requests_share_one_explicit_budget",
+      "exit_code": 0,
+      "seconds": 0.07,
+      "exact_one_pass": true,
+      "output_sha256": "aa190d9e1c911da7c9b78beaa18bb0b8ce65fc2012e8184213f62ee356d0b541",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::http::tests::shared_budget_queue_future_drop_releases_capacity",
+      "exit_code": 0,
+      "seconds": 0.07,
+      "exact_one_pass": true,
+      "output_sha256": "b21b463d5c17ed6fc5a9bf9b0c4c23b2bcfa1a1c06a22eca982286e499f1e2d3",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::identity::tests::builtin_grammar_keeps_ascii_repository_and_jira_rules_bounded",
+      "exit_code": 0,
+      "seconds": 0.07,
+      "exact_one_pass": true,
+      "output_sha256": "5b72f5b4371f6ad04e9a6d5a5b605efd8f2dc4519d5ac03f4c5555f6a6f08aba",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::identity::tests::builtins_reject_path_and_option_injection",
+      "exit_code": 0,
+      "seconds": 0.071,
+      "exact_one_pass": true,
+      "output_sha256": "3a2ca5d6c85a3ac2a242af0aaae72a6189a560a73a8ebdc693410f5f68bea41d",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::identity::tests::complete_control_identity_bounds_the_whole_envelope",
+      "exit_code": 0,
+      "seconds": 0.07,
+      "exact_one_pass": true,
+      "output_sha256": "0e1cf4075b1af7d4e94f7f10e6b80fcc01f23a1f2b0bb0c0fad733158d1889e0",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::identity::tests::native_jira_and_kaneo_compatibility_examples",
+      "exit_code": 0,
+      "seconds": 0.069,
+      "exact_one_pass": true,
+      "output_sha256": "89880c86e7b12ac6b1161b37a94494c560a4f357f5af8fd02a847bd35c833252",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::identity::tests::plugin_keys_keep_opaque_utf8_but_reject_controls",
+      "exit_code": 0,
+      "seconds": 0.07,
+      "exact_one_pass": true,
+      "output_sha256": "c53ad58827400a65ad0bb24823444344e31d391a4c7308aad4cb42a879e1a1b4",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::jira::tests::constructor_admits_self_hosted_base_path",
+      "exit_code": 0,
+      "seconds": 0.07,
+      "exact_one_pass": true,
+      "output_sha256": "19cb334e56cae4c660916466b28bc40cb8b86f7e9883bb35c68fa503dcb04022",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::jira::tests::create_issue_returns_budget_error_before_jira_followup",
+      "exit_code": 0,
+      "seconds": 0.073,
+      "exact_one_pass": true,
+      "output_sha256": "0891be729450732561822c2e731836ffa41fec46d06623d7ce18a7ad387579e9",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::jira::tests::escape_jql_str_neutralizes_quote_backslash_newline",
+      "exit_code": 0,
+      "seconds": 0.07,
+      "exact_one_pass": true,
+      "output_sha256": "98f5fda3c4569e2fe7dec7a9b3c7a517cf32aea96f33ee03862555c6fd803ff6",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::jira::tests::extract_text_walks_adf_and_handles_edges",
+      "exit_code": 0,
+      "seconds": 0.07,
+      "exact_one_pass": true,
+      "output_sha256": "61b05f1a14e1e727af478b4b6d31759574369e63f28774679b7dbc76ad26e37d",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::jira::tests::issue_to_domain_maps_all_fields_and_derives_browse_url",
+      "exit_code": 0,
+      "seconds": 0.071,
+      "exact_one_pass": true,
+      "output_sha256": "43ad2f6c19f20573dcca975b1331073381255799a0a26ae33b3db703edc3c562",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::jira::tests::issue_to_domain_tolerates_missing_optionals",
+      "exit_code": 0,
+      "seconds": 0.072,
+      "exact_one_pass": true,
+      "output_sha256": "d02545ebae643ecd391ed6060aee6b04cf45c0c399c3c12890c8e871abe8a299",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::jira::tests::map_priority_by_name_and_fallback",
+      "exit_code": 0,
+      "seconds": 0.067,
+      "exact_one_pass": true,
+      "output_sha256": "c7e36cf4c13eb145bdfd1afba619d5837929d685e5a747885610cec1c2c456a2",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::jira::tests::map_status_by_category_and_fallback",
+      "exit_code": 0,
+      "seconds": 0.07,
+      "exact_one_pass": true,
+      "output_sha256": "64addcda173e660a58bb378e3c5f784fb27092746783d25ba3a8140594a768d7",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::jira::tests::parse_ms_valid_and_invalid",
+      "exit_code": 0,
+      "seconds": 0.069,
+      "exact_one_pass": true,
+      "output_sha256": "964c9e72693a0cdcf12b64ab764f5983c7e86779c2d1bfa40007d3c6af3af72d",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::jira::tests::project_filter_accepts_configured_project_without_issue_number",
+      "exit_code": 0,
+      "seconds": 0.071,
+      "exact_one_pass": true,
+      "output_sha256": "70430c17e48823f5d1a7dc6dd4b39d18481bef1d447433046cbc9d932bb74bce",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::jira::tests::status_filter_uses_statuscategory_not_display_names",
+      "exit_code": 0,
+      "seconds": 0.071,
+      "exact_one_pass": true,
+      "output_sha256": "493f8e47f50e666db9b50405a2784d2b6b0df77677c90cb2d22c920dd6fa9516",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::jira::tests::urlencoding_percent_encodes_plus_and_equals",
+      "exit_code": 0,
+      "seconds": 0.07,
+      "exact_one_pass": true,
+      "output_sha256": "7abaaea3178ca44c109705912527e4fdbeb8fc3cd2ca7a756bdc0a96ee103a98",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::kaneo::tests::api_url_encodes_structured_query_and_rejects_traversal",
+      "exit_code": 0,
+      "seconds": 0.077,
+      "exact_one_pass": true,
+      "output_sha256": "f6601100f381d133088f58f91c1f0e361335e475451b5638bcb6232593d699f6",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::kaneo::tests::board_response_flattens_to_issues",
+      "exit_code": 0,
+      "seconds": 0.073,
+      "exact_one_pass": true,
+      "output_sha256": "dff362ff345ca9efc54d59b2a315449f037555e85c416a0fca4bf58c6b3eb7f8",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::kaneo::tests::column_status_uses_is_final_then_name_heuristic",
+      "exit_code": 0,
+      "seconds": 0.069,
+      "exact_one_pass": true,
+      "output_sha256": "7d068bce328c30a4c5096077c378efca5b607f1acbdac942b9e81f1656804c84",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::kaneo::tests::label_row_deserializes",
+      "exit_code": 0,
+      "seconds": 0.07,
+      "exact_one_pass": true,
+      "output_sha256": "6d7f4bdf65df56dd9d1a36dc3afa487e427deec7898ace58ba146be91f47b6a9",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::kaneo::tests::list_expansion_returns_budget_error_before_kaneo_project_fetch",
+      "exit_code": 0,
+      "seconds": 0.075,
+      "exact_one_pass": true,
+      "output_sha256": "fac51d25646a3f88b3d4ad7f7b9efbfec9320c4355bdd024a310fab156c1f557",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::kaneo::tests::parse_ms_valid_and_invalid",
+      "exit_code": 0,
+      "seconds": 0.07,
+      "exact_one_pass": true,
+      "output_sha256": "b38a7c5d0ddee9c0008b1389fbbabd83ddae41acc88a9c1d3e7a4f722b9a45d9",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::kaneo::tests::priority_maps_and_reverses",
+      "exit_code": 0,
+      "seconds": 0.07,
+      "exact_one_pass": true,
+      "output_sha256": "9587ea09252f44d7ee75b26e8a897fee0732431199373daaa0c6f99f5619815a",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::kaneo::tests::project_deserializes_name_and_slug",
+      "exit_code": 0,
+      "seconds": 0.08,
+      "exact_one_pass": true,
+      "output_sha256": "eb935674c4c280aba85e1d3e7236c14c9dbc1d3d53a89b552b376acc229f56e9",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::kaneo::tests::task_link_uses_url_segments_and_query_encoding",
+      "exit_code": 0,
+      "seconds": 0.106,
+      "exact_one_pass": true,
+      "output_sha256": "21846e50c4d0d332b173ecb6263113d31042f2173a64575964b334fc3c7b603f",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::kaneo::tests::task_missing_optionals_tolerated",
+      "exit_code": 0,
+      "seconds": 0.087,
+      "exact_one_pass": true,
+      "output_sha256": "397ed69562a1188a4ba4e0b2e803ceae5d34ed599e3e41580dd99a25904f62fa",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::kaneo::tests::url_falls_back_without_workspace",
+      "exit_code": 0,
+      "seconds": 0.074,
+      "exact_one_pass": true,
+      "output_sha256": "ba04e05c5528c3997c847cc12f47feb34c4c94e078b11c4e881489b5c27e9443",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::linear::schema_contract::backlog_filter_requests_both_backlog_and_triage",
+      "exit_code": 0,
+      "seconds": 0.074,
+      "exact_one_pass": true,
+      "output_sha256": "25c8dd2c1fd962a37c11933d0d7b71ff5f56be05aa4aa67d426cb333b4b787b2",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::linear::schema_contract::create_mutation_selects_the_same_fields_as_issue_fields",
+      "exit_code": 0,
+      "seconds": 0.07,
+      "exact_one_pass": true,
+      "output_sha256": "6e7c8345f8f8482e9d4731de09df86d998cdcdaf307c8e56626c30294948212a",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::linear::schema_contract::every_recorded_state_type_maps_deliberately",
+      "exit_code": 0,
+      "seconds": 0.07,
+      "exact_one_pass": true,
+      "output_sha256": "181f78f931beb37b297cbac36945b83af9b5f45f322931bef6a944b6e7a5897c",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::linear::schema_contract::get_issue_comments_selection_matches_recorded_schema",
+      "exit_code": 0,
+      "seconds": 0.071,
+      "exact_one_pass": true,
+      "output_sha256": "6faa1f93a7e6df3a94356df219f5e3d84ee4e28ffbb424c176c9f4d98288d63e",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::linear::schema_contract::issue_fields_selection_matches_recorded_schema",
+      "exit_code": 0,
+      "seconds": 0.068,
+      "exact_one_pass": true,
+      "output_sha256": "792f71d0bfebf3f68c9a5b2d5db2ba0a705174659f0a9de3bc3e0dccdd7ab33d",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::linear::schema_contract::limit_clamps_to_the_page_maximum",
+      "exit_code": 0,
+      "seconds": 0.071,
+      "exact_one_pass": true,
+      "output_sha256": "5802540d6020863e2f5ad543450017df6591f9db8e0cc9a3d7d8d6616a823bba",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::linear::schema_contract::overlapping_statuses_deduplicate_in_order",
+      "exit_code": 0,
+      "seconds": 0.071,
+      "exact_one_pass": true,
+      "output_sha256": "e40be6135587eddba637b0edfec8d8611d2942baf39a3dedbf12a80bb815bdc2",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::linear::schema_contract::parse_selection_handles_nesting_and_reports_unknown_fields",
+      "exit_code": 0,
+      "seconds": 0.068,
+      "exact_one_pass": true,
+      "output_sha256": "86a5a0773af605a4f1201b375d3851688765c1df2d2f016f8db810759996b9ec",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::linear::schema_contract::recorded_issue_type_has_no_assignees_field",
+      "exit_code": 0,
+      "seconds": 0.07,
+      "exact_one_pass": true,
+      "output_sha256": "74dd662ca07ca972a14295bb9155903ed4895af1543dfb70c4adde72c48053e2",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::linear::schema_contract::state_type_strings_are_recorded_linear_types",
+      "exit_code": 0,
+      "seconds": 0.072,
+      "exact_one_pass": true,
+      "output_sha256": "863701acc85b6226cabe8b97496edf773f4034441f30b59029447f58e2d5961f",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::linear::schema_contract::team_scope_and_assignee_me_join_as_arguments",
+      "exit_code": 0,
+      "seconds": 0.073,
+      "exact_one_pass": true,
+      "output_sha256": "687de2436cf169512734b8849bfc4be251aa786158afa138e1e704babf6923ec",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::linear::schema_contract::unfiltered_list_query_is_well_formed",
+      "exit_code": 0,
+      "seconds": 0.068,
+      "exact_one_pass": true,
+      "output_sha256": "2e5074598b8e14f82e4c9e158931762e9f4bcb7a01d5a238d92f943b53892496",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::linear::schema_contract::user_controlled_identifiers_cannot_break_out_of_the_literal",
+      "exit_code": 0,
+      "seconds": 0.07,
+      "exact_one_pass": true,
+      "output_sha256": "a33a50e40f23d6c51a072461dfcdd850661bd98e1b192be53070da0288b6bbe3",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::linear::tests::constructor_admits_official_linear_endpoint",
+      "exit_code": 0,
+      "seconds": 0.07,
+      "exact_one_pass": true,
+      "output_sha256": "0b5ebad82db3898269098ff7e6a5eabfedb8018063fb6831606040ada3bc5aeb",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::linear::tests::escape_graphql_str_neutralizes_quote_backslash_newline_tab",
+      "exit_code": 0,
+      "seconds": 0.07,
+      "exact_one_pass": true,
+      "output_sha256": "fefe8c2c97992b8420ee361c48e677382343ee1a3cf967e83c94471993b9a386",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::linear::tests::issue_to_domain_maps_all_fields",
+      "exit_code": 0,
+      "seconds": 0.07,
+      "exact_one_pass": true,
+      "output_sha256": "4ecc8498a22ddc6007d5e9f95d1b2d3797905d043491139bfc16ae28fa97d690",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::linear::tests::issue_to_domain_rejects_provider_identity_or_url_before_returning",
+      "exit_code": 0,
+      "seconds": 0.07,
+      "exact_one_pass": true,
+      "output_sha256": "73cc1fad19674d8a142e90ac7506a5f580a4a4546735c69fee542398b8920904",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::linear::tests::issue_to_domain_tolerates_missing_optionals",
+      "exit_code": 0,
+      "seconds": 0.072,
+      "exact_one_pass": true,
+      "output_sha256": "8185a53720b4bc029e93df06181997ad6778103e7b06faed3a748949a6f0117f",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::linear::tests::map_state_covers_all_types_and_fallback",
+      "exit_code": 0,
+      "seconds": 0.07,
+      "exact_one_pass": true,
+      "output_sha256": "04347aaedbf2daacca0a35cf73556878ad4dad7702c0bd4ed2df486deee491c8",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::linear::tests::parse_updated_at_valid_and_invalid",
+      "exit_code": 0,
+      "seconds": 0.067,
+      "exact_one_pass": true,
+      "output_sha256": "c9a8f91e7eef26593c8ebbfa5ca8cdf3c11f6000bc276a821bb805e2dd84b827",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::linear::tests::priority_maps_and_round_trips",
+      "exit_code": 0,
+      "seconds": 0.07,
+      "exact_one_pass": true,
+      "output_sha256": "6ac814cc08a4d4bf5edbe95c4cabd96cb716dcf3307b3e47f341589a60848657",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::linear::tests::update_status_escapes_provider_state_id_before_write",
+      "exit_code": 0,
+      "seconds": 0.076,
+      "exact_one_pass": true,
+      "output_sha256": "0cdb5d8c453bdd3adfe784115170e89887bb41147039ffea1ae4e05fb3fa2768",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::linear::tests::update_status_uses_one_budget_across_linear_requests",
+      "exit_code": 0,
+      "seconds": 0.076,
+      "exact_one_pass": true,
+      "output_sha256": "a0a5ab9fcdc70da1d699565843fdbe0c5c9beea8f68cf1b9e8c45d12148b8500",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::linear::tests::workflow_state_id_is_admitted_and_escaped_before_mutation",
+      "exit_code": 0,
+      "seconds": 0.071,
+      "exact_one_pass": true,
+      "output_sha256": "c63653f4757287483c0af378c0c8a9d3d7fa9e5b0958bcbfe84b5dc1cf1479fd",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::spec::bare_id_routes_to_the_only_backend",
+      "exit_code": 0,
+      "seconds": 0.071,
+      "exact_one_pass": true,
+      "output_sha256": "921a32e936482094e84aa9f8f280bcf8398ce29a36e7910cd38b09fc847e6500",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::spec::bare_id_with_two_backends_routes_nowhere",
+      "exit_code": 0,
+      "seconds": 0.07,
+      "exact_one_pass": true,
+      "output_sha256": "8681e9a1288ab643c687e58bd9da86da4e2cccfb4605be8742d70b54a0f75f9e",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::spec::builds_one_backend_per_active_provider",
+      "exit_code": 0,
+      "seconds": 0.178,
+      "exact_one_pass": true,
+      "output_sha256": "87343cda75bfbe9b0d3b9f2e9d9225f2292853cd0438476c8aef8c3927f14aec",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::spec::cache_boundary_rejects_cross_provider_and_malformed_ids",
+      "exit_code": 0,
+      "seconds": 0.071,
+      "exact_one_pass": true,
+      "output_sha256": "e1f2508bcb3db4dcff286d2c0becef282cd5be7f8098da854d09ec5432ec0072",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::spec::dispatch_by_id_prefix",
+      "exit_code": 0,
+      "seconds": 0.164,
+      "exact_one_pass": true,
+      "output_sha256": "564593c849bda8fc0dff13916f0f98f944df82bc4cbff68088e66469694a5bbb",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::spec::duplicate_provider_ids_keep_the_first_account_for_mutations",
+      "exit_code": 0,
+      "seconds": 0.07,
+      "exact_one_pass": true,
+      "output_sha256": "d84dd67dd0f3fc25f0d74265c500f79a807ad010e7fee1cdc3fdb1968f4dcd9d",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::spec::id_miss_dedupes_repeated_providers",
+      "exit_code": 0,
+      "seconds": 0.07,
+      "exact_one_pass": true,
+      "output_sha256": "4df5bee4654df481ba5b3d02fdc766e095a883a7be5958c2382e620ba5c37f5d",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::spec::id_miss_message_names_the_form_and_the_providers",
+      "exit_code": 0,
+      "seconds": 0.072,
+      "exact_one_pass": true,
+      "output_sha256": "30e6db834e751058296941121659712172a306122e02cd53b5b4bc8afd4771f5",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::spec::malformed_control_id_reaches_no_fake_provider_effect",
+      "exit_code": 0,
+      "seconds": 0.073,
+      "exact_one_pass": true,
+      "output_sha256": "c7b8d6b98946e8b0651ae2f6d8372706bc23702d8d16de8b912370d0f20cf493",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::spec::multiple_accounts_of_one_provider_each_build_a_backend",
+      "exit_code": 0,
+      "seconds": 0.073,
+      "exact_one_pass": true,
+      "output_sha256": "36359052f21a396dd3bde8e12e976de553d03d8c9e50f9d111a0e4140e9e3cbe",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::spec::parse_due_date_ms_handles_date_only_and_rfc3339",
+      "exit_code": 0,
+      "seconds": 0.071,
+      "exact_one_pass": true,
+      "output_sha256": "2ddbbb18e65ba920eea8d0e83eb518e93df3e5295308e24dd43cc8fc599c24a4",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::spec::plugin_identity_envelope_is_bounded_before_routing",
+      "exit_code": 0,
+      "seconds": 0.071,
+      "exact_one_pass": true,
+      "output_sha256": "04b05f3dfeefbc6b1ddf21e2401befebb2e22650bd942013d511b72cc685f311",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::spec::plugin_namespace_routes_by_complete_registered_prefix",
+      "exit_code": 0,
+      "seconds": 0.078,
+      "exact_one_pass": true,
+      "output_sha256": "cda1bc879547ef10592f371076142b7b62a06df2d054b570d2e8a19c03f32491",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::spec::single_backend_does_not_fallback_foreign_namespace",
+      "exit_code": 0,
+      "seconds": 0.073,
+      "exact_one_pass": true,
+      "output_sha256": "736d0ad39cb888889de3dad41c47408a50428a5f92328532c2470205c5b0db5e",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::spec::single_provider_back_compat",
+      "exit_code": 0,
+      "seconds": 0.07,
+      "exact_one_pass": true,
+      "output_sha256": "e068913e3ef0dc0f8f6dac1a0353e021386f3e3ed124d7c73a2c40ace7937c8c",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::spec::unconfigured_router_is_empty",
+      "exit_code": 0,
+      "seconds": 0.07,
+      "exact_one_pass": true,
+      "output_sha256": "99d2b67e171f06093ce7ea4009f68005a2577855ed95a22677c0dd053109bd6a",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "plugin::provider::tests::issue_ops_round_trip_through_a_scripted_plugin",
+      "exit_code": 0,
+      "seconds": 0.074,
+      "exact_one_pass": true,
+      "output_sha256": "c7734461b4c800181a3c9c0208bc2c7b06995cb34157566a4c2c66884007d837",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "plugin::provider::tests::late_and_unknown_responses_are_reported_unroutable",
+      "exit_code": 0,
+      "seconds": 0.072,
+      "exact_one_pass": true,
+      "output_sha256": "931e1095a86e70843cee9d7077642615c8c1eeb22f985d126032ef80e7db71e4",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "plugin::provider::tests::omitted_caps_refuse_optional_ops_without_a_bridge_round_trip",
+      "exit_code": 0,
+      "seconds": 0.07,
+      "exact_one_pass": true,
+      "output_sha256": "37447ee1d0727080aed5ecc89284cb8b9888f36ff9a15eba503cec139df1e2e6",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "plugin::provider::tests::plugin_response_identity_must_match_namespace_and_opaque_fields",
+      "exit_code": 0,
+      "seconds": 0.072,
+      "exact_one_pass": true,
+      "output_sha256": "3341b92020441f05b3ff4e57ce66f9ae1e313db2572e575b96cfa00c213ebca4",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "plugin::provider::tests::resident_eof_fails_pending_calls_without_waiting_for_rpc_deadline",
+      "exit_code": 0,
+      "seconds": 0.096,
+      "exact_one_pass": true,
+      "output_sha256": "db9006ac143ae24eaa255e55425856ed7aa9d2a0b3509b27febac749ce07e75c",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "plugin::provider::tests::resident_final_reply_before_exit_is_delivered_and_late_call_is_closed",
+      "exit_code": 0,
+      "seconds": 0.076,
+      "exact_one_pass": true,
+      "output_sha256": "5530d5575061d08ae64ad187b58aeb74c874666e785f4c5dd038de4b2700d6b5",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "plugin::provider::tests::resident_old_session_cannot_route_into_replacement_bridge",
+      "exit_code": 0,
+      "seconds": 0.067,
+      "exact_one_pass": true,
+      "output_sha256": "6d38df5d2b3b832cafd8c8095cc14971106bb135fc2cce7b3c41dbd1aee50f21",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "plugin::provider::tests::timeout_and_dead_session_degrade_to_errors",
+      "exit_code": 0,
+      "seconds": 0.374,
+      "exact_one_pass": true,
+      "output_sha256": "b2325c522887b4eeddb8de133980d825eb249fefe103225381952a20b5e9c92b",
+      "tested_source": "f46e043d649a639759333d76faeb6abb6749f2a5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-redirect-binaries-20260915/svc-tests",
+      "selector": "issue::http::tests::redirect_target_receives_no_request_or_credentials",
+      "exit_code": 0,
+      "seconds": 0.103,
+      "exact_one_pass": true,
+      "output_sha256": "3ed45366fdbb255e680920d5ba3ee32d5958bb172840d3d51bc1d90a0df0fc8c",
+      "tested_source": "759cd1ad252cb131c87cf9078923c31203cdfeb5"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/host-tests",
+      "selector": "daemon::service::tests::issue_verbs_are_unimplemented_without_a_configured_tracker",
+      "exit_code": 0,
+      "seconds": 0.129,
+      "exact_one_pass": true,
+      "output_sha256": "f494c1e4e43783211de36dacc802eb4a06782127e6307b85af8cc5e59d7ecc72",
+      "tested_source": "4256d2372057a02a1f6fea96cdc4ce8388911178"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/host-tests",
+      "selector": "hydrate::tests::tracker_cache_hydration_discards_malformed_identities_before_panel_use",
+      "exit_code": 0,
+      "seconds": 0.124,
+      "exact_one_pass": true,
+      "output_sha256": "cec5b2dd9cf60be3fe62ec19c7ca97ae7c9252454b7a4d5266d8262ee78241a5",
+      "tested_source": "4256d2372057a02a1f6fea96cdc4ce8388911178"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance08-native-binaries-20260915/host-tests",
+      "selector": "hydrate::tests::tracker_diff_emits_status_changes_and_blocker_resolved_once",
+      "exit_code": 0,
+      "seconds": 0.074,
+      "exact_one_pass": true,
+      "output_sha256": "efb011864f8a0c18299eae4d83c190caf22a408f7fb8d7d8bbd3ec40a4c92559",
+      "tested_source": "4256d2372057a02a1f6fea96cdc4ce8388911178"
+    }
+  ],
+  "source_hashes": {
+    "crates/thegn-host/src/daemon/service.rs": "a379b51c388b550abf62ea2cf625acd2044c17559e8c4bef1afe8a4e88ab3a2b",
+    "crates/thegn-host/src/hydrate_tests.rs": "708a409c20f9b80cabef440ed0c49baa4d6455e9af0d7577648f85aa65691b45",
+    "crates/thegn-host/src/hydrate_tracker.rs": "83d69ac900d8c2deadf3fc0b002b4c761efe267b32753accfbf09d76980e8278",
+    "crates/thegn-host/src/plugin_providers.rs": "154bed712590d6e694e7a28f24502b03928c5df0c6f987e0e3c78ba986c3b445",
+    "crates/thegn-svc/src/conformance.rs": "c875717a074e0b222cc02710125c984a6f4fa23717f32d25d68bffb0f5e249c4",
+    "crates/thegn-svc/src/control/client.rs": "a7b4cebacef91529af4fa6ecb7e3193855df0c424b28c7f8101a9348eb204542",
+    "crates/thegn-svc/src/control/http.rs": "ce2ccccad83a2f1a218e776ddf1f6cb9c57300223156bf90a2241a0f41506370",
+    "crates/thegn-svc/src/control/tests.rs": "9e742a0f0bc9e0a0c115eaf288fa7b6aa290eef96576c85189d6481aa7df8d90",
+    "crates/thegn-svc/src/issue/github.rs": "6fabcac898846480bd8279c050c67e44c55aebd640752f08ac82f0541579e34b",
+    "crates/thegn-svc/src/issue/http.rs": "927a24b747eecc6a96a4cd696e720a2694824488dd11fddf3542e0ae06f2670d",
+    "crates/thegn-svc/src/issue/identity.rs": "867c67a9d64356b5f76f048d410fac20e44da47f86d0e90d4a78fe08ed65b01a",
+    "crates/thegn-svc/src/issue/jira.rs": "69abd007d02ab850415c6a82fe59bc8b71b30479646bbc017caeea147df12fcf",
+    "crates/thegn-svc/src/issue/kaneo.rs": "397a3d97a8d3fb6bc43a02d9f02f74e7c1633207fa1dd5dab094af6ded69f8fd",
+    "crates/thegn-svc/src/issue/linear.rs": "d6cac08c96a29ad6d1c378be70a55291d0b553c1074829f6cc4b869f05c4455b",
+    "crates/thegn-svc/src/issue/mod.rs": "6297d9524882c61e90b01693f36b836c15fd9adbbe6f54f655a3f008d8f7da96",
+    "crates/thegn-svc/src/plugin/provider.rs": "01b5edf3e86055084e32d6f1b3b7a4742bb7c1a7b39731c8028fb9d9ed7d4628"
+  },
+  "artifacts": [
+    {
+      "file": "thegn-THE322-linear-independent-adversarial-luna-20260915.json",
+      "sha256": "c2a1bc6fa4ba023ccc9dfc8e0625bce5740a34fcc49e050e65e1a26d8c8ff2f3",
+      "bytes": 1882,
+      "original_path": "/tmp/thegn-THE322-linear-independent-adversarial-luna-20260915.json"
+    },
+    {
+      "file": "thegn-THE322-linear-independent-adversarial-luna-20260915.md",
+      "sha256": "0b4e22a5466ddf03946aed606b51b7810899aa2576cdecf0ca75fdd12137f54a",
+      "bytes": 2588,
+      "original_path": "/tmp/thegn-THE322-linear-independent-adversarial-luna-20260915.md"
+    },
+    {
+      "file": "thegn-THE322-v4-independent-adversarial-luna-20260915.json",
+      "sha256": "43801a679a9a7cd330c0b9df8df0f6ceaaea7d4e339facf5d1134f165209e3c0",
+      "bytes": 3287,
+      "original_path": "/tmp/thegn-THE322-v4-independent-adversarial-luna-20260915.json"
+    },
+    {
+      "file": "thegn-THE322-v4-independent-adversarial-luna-20260915.md",
+      "sha256": "92c7a14976dee245c9a253e5d9e0f082616eb4f171f99108cd6c50d5e927bb73",
+      "bytes": 4424,
+      "original_path": "/tmp/thegn-THE322-v4-independent-adversarial-luna-20260915.md"
+    },
+    {
+      "file": "thegn-maintenance08-build-driver-final-20260915.py",
+      "sha256": "59ff08a5ada4e2a08a227925b628c4683aee4e7c240b3e461d90c31fdbc870a3",
+      "bytes": 4153,
+      "original_path": "/tmp/thegn-maintenance08-build-driver-final-20260915.py"
+    },
+    {
+      "file": "thegn-maintenance08-build-driver-fixture-20260915.py",
+      "sha256": "6415eaa6561161e3803323597b5983dc185dd21302f9ccdb9e0dc8e3b7f81db9",
+      "bytes": 4111,
+      "original_path": "/tmp/thegn-maintenance08-build-driver-fixture-20260915.py"
+    },
+    {
+      "file": "thegn-maintenance08-build-driver-redirect-20260915.py",
+      "sha256": "6c4f9dcdac6b62cbc95bb5e4c8f1bb963f496934e92732b7511406eef4a9c91b",
+      "bytes": 4142,
+      "original_path": "/tmp/thegn-maintenance08-build-driver-redirect-20260915.py"
+    },
+    {
+      "file": "thegn-maintenance08-clippy-20260915.json",
+      "sha256": "82b733fc0fb2e3b4af9865c87dd643e4284c14b33f97f7a203e7103c4b79c1a1",
+      "bytes": 1474,
+      "original_path": "/tmp/thegn-maintenance08-clippy-20260915.json"
+    },
+    {
+      "file": "thegn-maintenance08-clippy-20260915.jsonl",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0,
+      "original_path": "/tmp/thegn-maintenance08-clippy-20260915.jsonl"
+    },
+    {
+      "file": "thegn-maintenance08-clippy-20260915.log",
+      "sha256": "7ae67373510909388456236b6a6e646c0828104431ed4f50626458adae65f573",
+      "bytes": 12607,
+      "original_path": "/tmp/thegn-maintenance08-clippy-20260915.log"
+    },
+    {
+      "file": "thegn-maintenance08-clippy-corrected-20260915.json",
+      "sha256": "2ea73a4d749d669d824d27e513ff3a4ddfa656b1bba426769ad7f3d3d49ba5e0",
+      "bytes": 1524,
+      "original_path": "/tmp/thegn-maintenance08-clippy-corrected-20260915.json"
+    },
+    {
+      "file": "thegn-maintenance08-clippy-corrected-20260915.jsonl",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0,
+      "original_path": "/tmp/thegn-maintenance08-clippy-corrected-20260915.jsonl"
+    },
+    {
+      "file": "thegn-maintenance08-clippy-corrected-20260915.log",
+      "sha256": "960b72fcff0e1a19b918703e8961bf5b632f61adcf4ab2666514920f998cfbbd",
+      "bytes": 10255,
+      "original_path": "/tmp/thegn-maintenance08-clippy-corrected-20260915.log"
+    },
+    {
+      "file": "thegn-maintenance08-clippy-final-20260915.json",
+      "sha256": "836203f908e8502b654c9bc86bce859bca056367bdcea9cfe421d0d04d75b078",
+      "bytes": 1482,
+      "original_path": "/tmp/thegn-maintenance08-clippy-final-20260915.json"
+    },
+    {
+      "file": "thegn-maintenance08-clippy-final-20260915.jsonl",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0,
+      "original_path": "/tmp/thegn-maintenance08-clippy-final-20260915.jsonl"
+    },
+    {
+      "file": "thegn-maintenance08-clippy-final-20260915.log",
+      "sha256": "68b816a5fe83d19a84728df31773b436e44c5a7ef2d659c7869319ccb56c9e1e",
+      "bytes": 8145,
+      "original_path": "/tmp/thegn-maintenance08-clippy-final-20260915.log"
+    },
+    {
+      "file": "thegn-maintenance08-clippy-fixture-20260915.json",
+      "sha256": "1fb8fe59d84240587480bb2408d1e8c0ef251a89a9efde35d1d3ff97415fb355",
+      "bytes": 1487,
+      "original_path": "/tmp/thegn-maintenance08-clippy-fixture-20260915.json"
+    },
+    {
+      "file": "thegn-maintenance08-clippy-fixture-20260915.jsonl",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0,
+      "original_path": "/tmp/thegn-maintenance08-clippy-fixture-20260915.jsonl"
+    },
+    {
+      "file": "thegn-maintenance08-clippy-fixture-20260915.log",
+      "sha256": "7da836e034e5130742a00c8cc21c1589f22a6a1d9bdaef3ceecb31b013893d7c",
+      "bytes": 382,
+      "original_path": "/tmp/thegn-maintenance08-clippy-fixture-20260915.log"
+    },
+    {
+      "file": "thegn-maintenance08-clippy-redirect-20260915.json",
+      "sha256": "8f9bfe28e29454537c2caf8cbb9092a08ebc0120984d4ad32c07e99395a85e57",
+      "bytes": 1530,
+      "original_path": "/tmp/thegn-maintenance08-clippy-redirect-20260915.json"
+    },
+    {
+      "file": "thegn-maintenance08-clippy-redirect-20260915.jsonl",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0,
+      "original_path": "/tmp/thegn-maintenance08-clippy-redirect-20260915.jsonl"
+    },
+    {
+      "file": "thegn-maintenance08-clippy-redirect-20260915.log",
+      "sha256": "a38934091f5ed58da89540861f82eeadd69521f7e1d59f0e7c877d0a01ab3880",
+      "bytes": 615,
+      "original_path": "/tmp/thegn-maintenance08-clippy-redirect-20260915.log"
+    },
+    {
+      "file": "thegn-maintenance08-combined-adversarial-luna-20260915.json",
+      "sha256": "94e6ebc418e5be92ae09f8955af0aecea530e8b39afe7ca4280fa0abd970a5f2",
+      "bytes": 7607,
+      "original_path": "/tmp/thegn-maintenance08-combined-adversarial-luna-20260915.json"
+    },
+    {
+      "file": "thegn-maintenance08-combined-adversarial-luna-20260915.md",
+      "sha256": "86ed007412485bc169761f826fb256a532457676ef8b1cb594d13250f083cc42",
+      "bytes": 3552,
+      "original_path": "/tmp/thegn-maintenance08-combined-adversarial-luna-20260915.md"
+    },
+    {
+      "file": "thegn-maintenance08-compile-corrections-independent-review-luna-20260915.json",
+      "sha256": "af984445d6e67ff21cf9cb18c82442b62134d0af4924414bbcf333c947b476c2",
+      "bytes": 1857,
+      "original_path": "/tmp/thegn-maintenance08-compile-corrections-independent-review-luna-20260915.json"
+    },
+    {
+      "file": "thegn-maintenance08-compile-corrections-independent-review-luna-20260915.md",
+      "sha256": "b3d2abcc5975711388b659f129fbff8dec3e691f9bb64dd9ff96b16cfccae52e",
+      "bytes": 2039,
+      "original_path": "/tmp/thegn-maintenance08-compile-corrections-independent-review-luna-20260915.md"
+    },
+    {
+      "file": "thegn-maintenance08-focused-native-20260915.log",
+      "sha256": "d2d3a06f5346be4ae2fef5c9f5796b882413415a87f0e6296f144e2680f0d18a",
+      "bytes": 30565,
+      "original_path": "/tmp/thegn-maintenance08-focused-native-20260915.log"
+    },
+    {
+      "file": "thegn-maintenance08-focused-native-fixture-20260915.log",
+      "sha256": "d8a36e7438c1a64f759c65aea0995cdf5eb96e101a3e6b6e5c3102c36fd13d80",
+      "bytes": 29222,
+      "original_path": "/tmp/thegn-maintenance08-focused-native-fixture-20260915.log"
+    },
+    {
+      "file": "thegn-maintenance08-focused-native-fixture-receipt-20260915.json",
+      "sha256": "4ee9b7f52373a5e3533b1ab3ea709291354b4a7d639a9b09c290931735927378",
+      "bytes": 39759,
+      "original_path": "/tmp/thegn-maintenance08-focused-native-fixture-receipt-20260915.json"
+    },
+    {
+      "file": "thegn-maintenance08-focused-native-receipt-20260915.json",
+      "sha256": "192bc429717b733b9d174705ae17bdf5391e8c094d9249df067ed3b63d5fa713",
+      "bytes": 40090,
+      "original_path": "/tmp/thegn-maintenance08-focused-native-receipt-20260915.json"
+    },
+    {
+      "file": "thegn-maintenance08-focused-native-redirect-20260915.log",
+      "sha256": "2578259c56d96b5afcc349590fa8636aaf84b6eeb936e144638124bcb02befa5",
+      "bytes": 281,
+      "original_path": "/tmp/thegn-maintenance08-focused-native-redirect-20260915.log"
+    },
+    {
+      "file": "thegn-maintenance08-focused-native-redirect-receipt-20260915.json",
+      "sha256": "0c31ae72e563be55a24087b0c49785dd824904c5ac2e75a70475232550e9fddd",
+      "bytes": 903,
+      "original_path": "/tmp/thegn-maintenance08-focused-native-redirect-receipt-20260915.json"
+    },
+    {
+      "file": "thegn-maintenance08-host-branches-final-addendum-luna-20260915.json",
+      "sha256": "e72410b0cc2c94f20d4e51bce60b8839da9d966cb736b7dca5b9a1fa29d2e7cd",
+      "bytes": 3870,
+      "original_path": "/tmp/thegn-maintenance08-host-branches-final-addendum-luna-20260915.json"
+    },
+    {
+      "file": "thegn-maintenance08-host-branches-final-addendum-luna-20260915.md",
+      "sha256": "0f86b909105df69369f8bbf652105439f02fe067dd9627b8b95a92cd7af72579",
+      "bytes": 2161,
+      "original_path": "/tmp/thegn-maintenance08-host-branches-final-addendum-luna-20260915.md"
+    },
+    {
+      "file": "thegn-maintenance08-http-adversarial-luna-20260915.json",
+      "sha256": "3635f09c1f18fe419116a7411c9079f46305469d7bd123cc58a1131ac0fde1ac",
+      "bytes": 2283,
+      "original_path": "/tmp/thegn-maintenance08-http-adversarial-luna-20260915.json"
+    },
+    {
+      "file": "thegn-maintenance08-http-adversarial-luna-20260915.md",
+      "sha256": "e868bdacc6d20402e8c50d757be819046dfaebcd9b571ca05deda0e7cbd59ff5",
+      "bytes": 5633,
+      "original_path": "/tmp/thegn-maintenance08-http-adversarial-luna-20260915.md"
+    },
+    {
+      "file": "thegn-maintenance08-lint-delta-independent-review-luna-20260915.json",
+      "sha256": "4f67830f6700bee42c0914c2e754d64d78ef8d893dfac5ac8aa8f364dbe1e67a",
+      "bytes": 1454,
+      "original_path": "/tmp/thegn-maintenance08-lint-delta-independent-review-luna-20260915.json"
+    },
+    {
+      "file": "thegn-maintenance08-lint-delta-independent-review-luna-20260915.md",
+      "sha256": "f67162ca2de327f10a5e34685ce7dfac1e163e25a961337f3c3867b19832384c",
+      "bytes": 1777,
+      "original_path": "/tmp/thegn-maintenance08-lint-delta-independent-review-luna-20260915.md"
+    },
+    {
+      "file": "thegn-maintenance08-native-20260915.json",
+      "sha256": "993a087f1448ab47aab958b2f21de50df86ac0feae82fff4114c0eb14fcfcdea",
+      "bytes": 1512,
+      "original_path": "/tmp/thegn-maintenance08-native-20260915.json"
+    },
+    {
+      "file": "thegn-maintenance08-native-20260915.jsonl",
+      "sha256": "56304553b406ecdb581bcb4fc7b65dee3535249286de1f0907ff81aecb5c951b",
+      "bytes": 748792,
+      "original_path": "/tmp/thegn-maintenance08-native-20260915.jsonl"
+    },
+    {
+      "file": "thegn-maintenance08-native-20260915.log",
+      "sha256": "3525e34ed9bdc377549eee4501d7d8c031261388add2e33539d57d0a4f89a911",
+      "bytes": 8122,
+      "original_path": "/tmp/thegn-maintenance08-native-20260915.log"
+    },
+    {
+      "file": "thegn-maintenance08-native-artifact-admission-20260915.json",
+      "sha256": "633bca339c9adf4e3543dba30bc268f8d99d7c9a53a98e4b4bf221ae9c9aab54",
+      "bytes": 1248,
+      "original_path": "/tmp/thegn-maintenance08-native-artifact-admission-20260915.json"
+    },
+    {
+      "file": "thegn-maintenance08-native-fixture-20260915.json",
+      "sha256": "77d06c8a458a94bb7b085feb0672b3da238d37823ac8a9adf591185a084cfabb",
+      "bytes": 1536,
+      "original_path": "/tmp/thegn-maintenance08-native-fixture-20260915.json"
+    },
+    {
+      "file": "thegn-maintenance08-native-fixture-20260915.jsonl",
+      "sha256": "b46d5352c48d36014d614bc0239d2a3d71ff43a82a8a5a0d9dd411646c80eba7",
+      "bytes": 585834,
+      "original_path": "/tmp/thegn-maintenance08-native-fixture-20260915.jsonl"
+    },
+    {
+      "file": "thegn-maintenance08-native-fixture-20260915.log",
+      "sha256": "c424fdd386422dd32900ad474255ed194174291fcbae8d0a9d28fb80e910d4a8",
+      "bytes": 824,
+      "original_path": "/tmp/thegn-maintenance08-native-fixture-20260915.log"
+    },
+    {
+      "file": "thegn-maintenance08-native-fixture-artifact-admission-20260915.json",
+      "sha256": "2ec08d7210df650b0bec62d5fd854660f21708441d5f9cae3f49668f1b18e039",
+      "bytes": 745,
+      "original_path": "/tmp/thegn-maintenance08-native-fixture-artifact-admission-20260915.json"
+    },
+    {
+      "file": "thegn-maintenance08-native-fixture-matrix-driver-20260915.py",
+      "sha256": "e3934ad420ba5767d74fd2f5800afc0c3621e202b91e58b1c6ba2e0400dc5e83",
+      "bytes": 3904,
+      "original_path": "/tmp/thegn-maintenance08-native-fixture-matrix-driver-20260915.py"
+    },
+    {
+      "file": "thegn-maintenance08-native-fixture-selected-20260915.json",
+      "sha256": "823488561b791b288fbeec0cfea2f8a1132c5fac815e2aecefa302ea52c0df0a",
+      "bytes": 21985,
+      "original_path": "/tmp/thegn-maintenance08-native-fixture-selected-20260915.json"
+    },
+    {
+      "file": "thegn-maintenance08-native-matrix-driver-20260915.py",
+      "sha256": "fd98dd21e182cdd8b09902b5a96a8ad8e0ad5864c1ac90803cda897f93c9154e",
+      "bytes": 3884,
+      "original_path": "/tmp/thegn-maintenance08-native-matrix-driver-20260915.py"
+    },
+    {
+      "file": "thegn-maintenance08-native-redirect-20260915.json",
+      "sha256": "f77564a74aef973cddd5cb75dfc70c832f96fab66d6a73793d1c34eef2b06e02",
+      "bytes": 1541,
+      "original_path": "/tmp/thegn-maintenance08-native-redirect-20260915.json"
+    },
+    {
+      "file": "thegn-maintenance08-native-redirect-20260915.jsonl",
+      "sha256": "894eda887a98cb85778b287895df6a136022566be359de31f009a88c4399ce62",
+      "bytes": 585816,
+      "original_path": "/tmp/thegn-maintenance08-native-redirect-20260915.jsonl"
+    },
+    {
+      "file": "thegn-maintenance08-native-redirect-20260915.log",
+      "sha256": "1d83eaa6d7154f6cc5980420cf73fc3d6199f81de8a246bc03cab13eea9da615",
+      "bytes": 175,
+      "original_path": "/tmp/thegn-maintenance08-native-redirect-20260915.log"
+    },
+    {
+      "file": "thegn-maintenance08-native-redirect-artifact-admission-20260915.json",
+      "sha256": "46a23a7a9c69bcb1a074704424474920f743424d41a0567f7215d4718b940fbe",
+      "bytes": 747,
+      "original_path": "/tmp/thegn-maintenance08-native-redirect-artifact-admission-20260915.json"
+    },
+    {
+      "file": "thegn-maintenance08-native-redirect-matrix-driver-20260915.py",
+      "sha256": "b705a1c6fca7de108ce2314cdd442c2ecbe5eaa288d1249238a747cc423d17bf",
+      "bytes": 3918,
+      "original_path": "/tmp/thegn-maintenance08-native-redirect-matrix-driver-20260915.py"
+    },
+    {
+      "file": "thegn-maintenance08-native-redirect-selected-20260915.json",
+      "sha256": "daa4029514e7ed048853e1b1fba7dc69c35a329e217174251b664f01e95527dc",
+      "bytes": 294,
+      "original_path": "/tmp/thegn-maintenance08-native-redirect-selected-20260915.json"
+    },
+    {
+      "file": "thegn-maintenance08-native-redirect-selection-plan-20260915.json",
+      "sha256": "494f2a734cbdff3f390bbb9bbe6e5fbd49a1cb5f75e1647d3bc0c0e84673882b",
+      "bytes": 779,
+      "original_path": "/tmp/thegn-maintenance08-native-redirect-selection-plan-20260915.json"
+    },
+    {
+      "file": "thegn-maintenance08-native-selected-20260915.json",
+      "sha256": "c051be094304b07f0451d3a1daf0ef2d8961310a3b893c5d385c54f2aa16f155",
+      "bytes": 21807,
+      "original_path": "/tmp/thegn-maintenance08-native-selected-20260915.json"
+    },
+    {
+      "file": "thegn-maintenance08-native-selection-independent-review-luna-20260915.json",
+      "sha256": "9e816a7c194262b1e9adc91d52638f607c3b55f5b3131e220c11d4f8145c02f0",
+      "bytes": 5820,
+      "original_path": "/tmp/thegn-maintenance08-native-selection-independent-review-luna-20260915.json"
+    },
+    {
+      "file": "thegn-maintenance08-native-selection-independent-review-luna-20260915.md",
+      "sha256": "977fe498943045f716a12298c5ffcb7d150f66a782376961dd199ca7172c8ccc",
+      "bytes": 3047,
+      "original_path": "/tmp/thegn-maintenance08-native-selection-independent-review-luna-20260915.md"
+    },
+    {
+      "file": "thegn-maintenance08-native-selection-plan-20260915.json",
+      "sha256": "40904cd74a106ab79fe437edbe751abf0424e8f8254291467d4b3b5a8239b11d",
+      "bytes": 1720,
+      "original_path": "/tmp/thegn-maintenance08-native-selection-plan-20260915.json"
+    },
+    {
+      "file": "thegn-maintenance08-primary-adversarial-disposition-20260915.json",
+      "sha256": "c83cf753b8f654903c821548ea0e2d515dfc4ad30f853e840793b65d83c0bf2d",
+      "bytes": 1490,
+      "original_path": "/tmp/thegn-maintenance08-primary-adversarial-disposition-20260915.json"
+    },
+    {
+      "file": "thegn-maintenance08-primary-compile-approval-final-20260915.json",
+      "sha256": "d9d635aa72c5eca42e1970e2e27dcd638da29c0d90846300e7340d01c74de0a1",
+      "bytes": 2539,
+      "original_path": "/tmp/thegn-maintenance08-primary-compile-approval-final-20260915.json"
+    },
+    {
+      "file": "thegn-maintenance08-primary-fixture-compile-approval-20260915.json",
+      "sha256": "5119b03e6b7896db131c3c7ebb4491ee722d229780d925134ea7cd95525cf18f",
+      "bytes": 1060,
+      "original_path": "/tmp/thegn-maintenance08-primary-fixture-compile-approval-20260915.json"
+    },
+    {
+      "file": "thegn-maintenance08-primary-redirect-compile-approval-20260915.json",
+      "sha256": "a5e7c5e1980fc3b20a3c9b2d8355de4c78edfdaf7e90dac354bcbf938f03d89d",
+      "bytes": 1146,
+      "original_path": "/tmp/thegn-maintenance08-primary-redirect-compile-approval-20260915.json"
+    },
+    {
+      "file": "thegn-maintenance08-production-source-equivalence-20260915.json",
+      "sha256": "cb408e39cc48e307488d2e703df235a46ff4d899e143f430b5681805f076ca6f",
+      "bytes": 753,
+      "original_path": "/tmp/thegn-maintenance08-production-source-equivalence-20260915.json"
+    },
+    {
+      "file": "thegn-maintenance08-redirect-matrix-independent-review-luna-20260915.json",
+      "sha256": "47e8fc959b8691071ef1ad1afc9670991b9e506bdc3c2b16588c8126557dd0e5",
+      "bytes": 2423,
+      "original_path": "/tmp/thegn-maintenance08-redirect-matrix-independent-review-luna-20260915.json"
+    },
+    {
+      "file": "thegn-maintenance08-redirect-matrix-independent-review-luna-20260915.md",
+      "sha256": "bb89ea60a6d9708fb2c2fa70d1d20980d93415497ec68107976cb0162df7523e",
+      "bytes": 1478,
+      "original_path": "/tmp/thegn-maintenance08-redirect-matrix-independent-review-luna-20260915.md"
+    },
+    {
+      "file": "thegn-maintenance08-source-admitted-diff-20260915.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0,
+      "original_path": "/tmp/thegn-maintenance08-source-admitted-diff-20260915.log"
+    },
+    {
+      "file": "thegn-maintenance08-source-admitted-format-20260915.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0,
+      "original_path": "/tmp/thegn-maintenance08-source-admitted-format-20260915.log"
+    },
+    {
+      "file": "thegn-maintenance08-source-admitted-ratchets-20260915.log",
+      "sha256": "df39603e698d21f156e2c62fae1c5c938c09561cb01296c01abca358b9422935",
+      "bytes": 4797,
+      "original_path": "/tmp/thegn-maintenance08-source-admitted-ratchets-20260915.log"
+    },
+    {
+      "file": "thegn-maintenance08-source-diff-20260915.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0,
+      "original_path": "/tmp/thegn-maintenance08-source-diff-20260915.log"
+    },
+    {
+      "file": "thegn-maintenance08-source-format-20260915.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0,
+      "original_path": "/tmp/thegn-maintenance08-source-format-20260915.log"
+    },
+    {
+      "file": "thegn-maintenance08-source-gates-20260915.json",
+      "sha256": "da42ff01c89228cf6f1ee158c8e242c25707e9174d4d0ed1267bf022ec8d0f41",
+      "bytes": 2108,
+      "original_path": "/tmp/thegn-maintenance08-source-gates-20260915.json"
+    },
+    {
+      "file": "thegn-maintenance08-source-gates-admitted-20260915.json",
+      "sha256": "0654138fbb1d3a8681c4deeab5d2ca33b70a9d5a99463863030774cf3fea7d48",
+      "bytes": 1907,
+      "original_path": "/tmp/thegn-maintenance08-source-gates-admitted-20260915.json"
+    },
+    {
+      "file": "thegn-maintenance08-source-gates-lintready-20260915.json",
+      "sha256": "1d14fc6411408455b02c88a7a6ec7d3f1d59f70383bea88b820cbc1047bc725e",
+      "bytes": 1910,
+      "original_path": "/tmp/thegn-maintenance08-source-gates-lintready-20260915.json"
+    },
+    {
+      "file": "thegn-maintenance08-source-lintready-diff-20260915.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0,
+      "original_path": "/tmp/thegn-maintenance08-source-lintready-diff-20260915.log"
+    },
+    {
+      "file": "thegn-maintenance08-source-lintready-format-20260915.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0,
+      "original_path": "/tmp/thegn-maintenance08-source-lintready-format-20260915.log"
+    },
+    {
+      "file": "thegn-maintenance08-source-lintready-ratchets-20260915.log",
+      "sha256": "df39603e698d21f156e2c62fae1c5c938c09561cb01296c01abca358b9422935",
+      "bytes": 4797,
+      "original_path": "/tmp/thegn-maintenance08-source-lintready-ratchets-20260915.log"
+    },
+    {
+      "file": "thegn-maintenance08-source-ratchets-20260915.log.gz",
+      "sha256": "73cd3937384ec789a2fb0e8899ebbf2e6c67ab78da1418cc536d01a536825497",
+      "bytes": 957,
+      "original_path": "/tmp/thegn-maintenance08-source-ratchets-20260915.log",
+      "encoding": "gzip",
+      "payload_sha256": "76cb68cf9b6403fd0f3ce58a52841a002920a393b2cf28bc6e9bc906298caf60"
+    },
+    {
+      "file": "thegn-maintenance08-source-spec-20260915.log",
+      "sha256": "34876c88300b7e18e8e263bd8000faef1f9d9778d6ccae718bd596df5b22caa1",
+      "bytes": 5381,
+      "original_path": "/tmp/thegn-maintenance08-source-spec-20260915.log"
+    },
+    {
+      "file": "thegn-private-test-runner-20260914.py",
+      "sha256": "6809313d9ce8fea04dcc7ad81d88e7b3ab09a41ec130155eff8514078ed3ea07",
+      "bytes": 2101,
+      "original_path": "/tmp/thegn-private-test-runner-20260914.py"
+    },
+    {
+      "file": "thegn-maintenance08-final-independent-evidence-review-luna-20260915.md",
+      "sha256": "c5feb2595c709f0fc5be264a447a8de8656b633f654d6725aec7e889407853ec",
+      "bytes": 1887,
+      "original_path": "/tmp/thegn-maintenance08-final-independent-evidence-review-luna-20260915.md"
+    },
+    {
+      "file": "thegn-maintenance08-final-independent-evidence-review-luna-20260915.json",
+      "sha256": "cadce65016ec1a14eb2163d8395e7d10c8f515a0da6244f9a198b45fe323dd65",
+      "bytes": 4572,
+      "original_path": "/tmp/thegn-maintenance08-final-independent-evidence-review-luna-20260915.json"
+    },
+    {
+      "file": "thegn-maintenance08-delivery-first-20260915.json",
+      "sha256": "a6e58d384590c58c338cdc306bd418715a518a405dff70dd7a26a3744a015e99",
+      "bytes": 2179,
+      "original_path": "/tmp/thegn-maintenance08-delivery-first-20260915.json"
+    },
+    {
+      "file": "thegn-maintenance08-delivery-first-format-20260915.log.gz",
+      "sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64",
+      "bytes": 20,
+      "original_path": "/tmp/thegn-maintenance08-delivery-first-format-20260915.log",
+      "encoding": "gzip",
+      "payload_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "file": "thegn-maintenance08-delivery-first-ratchets-20260915.log.gz",
+      "sha256": "018635b68903d70fb67abad4c37ca1e7590e943e3e042e3f382ca4d78857fdbc",
+      "bytes": 224,
+      "original_path": "/tmp/thegn-maintenance08-delivery-first-ratchets-20260915.log",
+      "encoding": "gzip",
+      "payload_sha256": "52685d57d1ba714178378f0e098d3a6715d628d07ee95be27d526c5b2bcca6ce"
+    },
+    {
+      "file": "thegn-maintenance08-delivery-first-spec-20260915.log.gz",
+      "sha256": "a21b2556f0690cb1c59ff44f5725e29d85f9903f5b0549383a7c39e7f210edf2",
+      "bytes": 1889,
+      "original_path": "/tmp/thegn-maintenance08-delivery-first-spec-20260915.log",
+      "encoding": "gzip",
+      "payload_sha256": "34876c88300b7e18e8e263bd8000faef1f9d9778d6ccae718bd596df5b22caa1"
+    },
+    {
+      "file": "thegn-maintenance08-delivery-first-diff-20260915.log.gz",
+      "sha256": "5ba62514b8a2c4d1cc7f58148d0c68887e1e08ffd26ef4c7efcfb72fa5eec4ac",
+      "bytes": 506,
+      "original_path": "/tmp/thegn-maintenance08-delivery-first-diff-20260915.log",
+      "encoding": "gzip",
+      "payload_sha256": "cceb5ab7f597223a5aebf4456a4b3b56b459742dd89ec7b1dadea3699b034162"
+    },
+    {
+      "file": "thegn-maintenance08-delivery-final-20260915.json",
+      "sha256": "5a9498932c454209076367a579072715b206acebd71cc6882a9a2e9124fe4457",
+      "bytes": 2267,
+      "original_path": "/tmp/thegn-maintenance08-delivery-final-20260915.json"
+    },
+    {
+      "file": "thegn-maintenance08-delivery-final-format-20260915.log.gz",
+      "sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64",
+      "bytes": 20,
+      "original_path": "/tmp/thegn-maintenance08-delivery-final-format-20260915.log",
+      "encoding": "gzip",
+      "payload_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "file": "thegn-maintenance08-delivery-final-ratchets-20260915.log.gz",
+      "sha256": "aa37017f3df5164940949bd726a554ebf95df69702b3922ee43179faebef1184",
+      "bytes": 1016,
+      "original_path": "/tmp/thegn-maintenance08-delivery-final-ratchets-20260915.log",
+      "encoding": "gzip",
+      "payload_sha256": "788ec3f7f6461711d82769eead5cd389fb7da12452439b1eaec9ae8ec9ff0495"
+    },
+    {
+      "file": "thegn-maintenance08-delivery-final-spec-20260915.log.gz",
+      "sha256": "a21b2556f0690cb1c59ff44f5725e29d85f9903f5b0549383a7c39e7f210edf2",
+      "bytes": 1889,
+      "original_path": "/tmp/thegn-maintenance08-delivery-final-spec-20260915.log",
+      "encoding": "gzip",
+      "payload_sha256": "34876c88300b7e18e8e263bd8000faef1f9d9778d6ccae718bd596df5b22caa1"
+    },
+    {
+      "file": "thegn-maintenance08-delivery-final-diff-20260915.log.gz",
+      "sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64",
+      "bytes": 20,
+      "original_path": "/tmp/thegn-maintenance08-delivery-final-diff-20260915.log",
+      "encoding": "gzip",
+      "payload_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "file": "thegn-maintenance08-delivery-admitted-20260915.json",
+      "sha256": "a2e7af0cdd1d3884b04f9d5f8d53dd2d7aa573d2bc72c76d7f41b8b1caba6114",
+      "bytes": 2279,
+      "original_path": "/tmp/thegn-maintenance08-delivery-admitted-20260915.json"
+    },
+    {
+      "file": "thegn-maintenance08-delivery-admitted-format-20260915.log.gz",
+      "sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64",
+      "bytes": 20,
+      "original_path": "/tmp/thegn-maintenance08-delivery-admitted-format-20260915.log",
+      "encoding": "gzip",
+      "payload_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "file": "thegn-maintenance08-delivery-admitted-ratchets-20260915.log.gz",
+      "sha256": "18796842eab3b6274b0c8df478dab98d8292cd2d0c2377aebcf35012b5348f88",
+      "bytes": 2084,
+      "original_path": "/tmp/thegn-maintenance08-delivery-admitted-ratchets-20260915.log",
+      "encoding": "gzip",
+      "payload_sha256": "df39603e698d21f156e2c62fae1c5c938c09561cb01296c01abca358b9422935"
+    },
+    {
+      "file": "thegn-maintenance08-delivery-admitted-spec-20260915.log.gz",
+      "sha256": "a21b2556f0690cb1c59ff44f5725e29d85f9903f5b0549383a7c39e7f210edf2",
+      "bytes": 1889,
+      "original_path": "/tmp/thegn-maintenance08-delivery-admitted-spec-20260915.log",
+      "encoding": "gzip",
+      "payload_sha256": "34876c88300b7e18e8e263bd8000faef1f9d9778d6ccae718bd596df5b22caa1"
+    },
+    {
+      "file": "thegn-maintenance08-delivery-admitted-diff-20260915.log.gz",
+      "sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64",
+      "bytes": 20,
+      "original_path": "/tmp/thegn-maintenance08-delivery-admitted-diff-20260915.log",
+      "encoding": "gzip",
+      "payload_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "file": "primary-final-review.json",
+      "sha256": "e62f373ffdc7e8468d3d24a42c3ffd2bcadd688f12e34e67973faf0b1ef0e76a",
+      "bytes": 3533,
+      "original_path": "root final review in delivery checkout"
+    }
+  ],
+  "qualifications": [
+    "Linux native tests with synthetic providers and isolated XDG; no live provider, production DB, release/performance, Windows runtime or full-workspace native claim.",
+    "Host registry refusal wrappers and refresh-worker malformed-old-cache branch were source-reviewed but not directly executed; underlying service contracts and real panel hydration were tested.",
+    "THE315 GitHub creation scope, THE324 account authority, THE323 pagination, THE314 process bounds and provider business semantics remain open.",
+    "Historical failed receipts remain immutable. Reused host4256 and unchanged svc f46 fixtures are explicitly mapped; final redirect matrix ran from759.",
+    "No push or live restart."
+  ],
+  "independent_final_review": "thegn-maintenance08-final-independent-evidence-review-luna-20260915.json",
+  "raw_evidence_policy": "Immutable raw artifacts preserve observed bytes. The historical brand-guard failure log is losslessly gzipped to retain legacy-path diagnostics without extending the product-name allowlist. Whitespace checks cover source and authored delivery metadata; raw artifact integrity is verified by hashes.",
+  "final_source_gates": "thegn-maintenance08-delivery-admitted-20260915.json",
+  "primary_final_review": "primary-final-review.json",
+  "shipping_rust_unchanged_from_source": true
+}

@@ -1,0 +1,43 @@
+{
+  "source": "7a36ab0316e050a3056e72eabb8c44939306d326",
+  "build_checkout": "/tmp/thegn-maintenance-07-combined-20260915",
+  "review_checkout": "/tmp/thegn-maintenance08-combined-20260915",
+  "command": [
+    "systemd-run",
+    "--user",
+    "--scope",
+    "--quiet",
+    "--unit=thegn-maintenance08-clippy-corrected-20260915",
+    "--property=CPUQuota=100%",
+    "nice",
+    "-n",
+    "10",
+    "cargo",
+    "clippy",
+    "--locked",
+    "--workspace",
+    "--all-targets",
+    "--keep-going",
+    "--",
+    "-D",
+    "warnings"
+  ],
+  "jobs": 1,
+  "cache": "/tmp/thegn-batch03-native-cache-f_3lx_t_",
+  "queued_at_utc": "2026-09-15T23:14:25.781361+00:00",
+  "status": "failed; root review required",
+  "competing_builds": [],
+  "started_at_utc": "2026-09-15T23:14:26.012481+00:00",
+  "cgroup": "/user.slice/user-1000.slice/user@1000.service/app.slice/thegn-maintenance08-clippy-corrected-20260915.scope",
+  "cpu_max": "100000 100000",
+  "systemd_properties": {
+    "ControlGroup": "/user.slice/user-1000.slice/user@1000.service/app.slice/thegn-maintenance08-clippy-corrected-20260915.scope",
+    "CPUQuotaPerSecUSec": "1s"
+  },
+  "exit_code": 101,
+  "finished_at_utc": "2026-09-15T23:16:07.188504+00:00",
+  "log": "/tmp/thegn-maintenance08-clippy-corrected-20260915.log",
+  "log_sha256": "960b72fcff0e1a19b918703e8961bf5b632f61adcf4ab2666514920f998cfbbd",
+  "messages": "/tmp/thegn-maintenance08-clippy-corrected-20260915.jsonl",
+  "messages_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+}

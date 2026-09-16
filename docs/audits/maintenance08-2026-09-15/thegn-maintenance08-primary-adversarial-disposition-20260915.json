@@ -1,0 +1,14 @@
+{
+  "at_utc": "2026-09-15T22:58:34.827169+00:00",
+  "reviewer": "root",
+  "review_input": "/tmp/thegn-maintenance08-combined-adversarial-luna-20260915.json",
+  "decision": "blocked pending Linear fixes and independent rereview",
+  "dispositions": {
+    "Kaneo nested Result": "Fixed in 551fda53; other fallible conversion call sites audited.",
+    "Linear stateId injection and response admission": "Accepted; Luna revising isolated Linear source and malicious-response tests.",
+    "GitHub create repository scope": "Valid pre-existing bug already owned exactly by THE-315 (UUID e2bbb79c-a363-4172-bf96-0158ffa352cb), confirmed fresh tracker read. Keep open; no eleventh activation and no claim THE322 resolves account/repo precedence. Correct misleading follow-up comment. THE322 syntax validation and exact scoped follow-up remain required.",
+    "Rust API signature compatibility": "Intentional checked admission change accepted for unpublished workspace-only thegn-svc (publish=false, version0.1.0-alpha.2). All in-tree call sites migrated, to be checked with workspace all-target Clippy. No HTTP/control/plugin wire contract changed. Adding panic/silent-drop compatibility wrappers would undermine admission. Public HTTP backend constructor compatibility remains preserved.",
+    "review provenance": "Adversarial report reviewed_tree mistakenly copied 7ef9 tree; requested correction, file hashes remain available. Preserve original report."
+  },
+  "compiled_gates": "not started"
+}

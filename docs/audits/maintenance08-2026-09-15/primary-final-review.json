@@ -1,0 +1,44 @@
+{
+  "source": "759cd1ad252cb131c87cf9078923c31203cdfeb5",
+  "reviewer": "root",
+  "at_utc": "2026-09-16T00:06:49.168348+00:00",
+  "decision": "approve local-main fast-forward after canonical preservation and delivery-tree verification",
+  "issues": [
+    "THE-321",
+    "THE-322"
+  ],
+  "native_distinct_tests": 107,
+  "independent_review": "thegn-maintenance08-final-independent-evidence-review-luna-20260915.json",
+  "final_gates": "thegn-maintenance08-delivery-admitted-20260915.json",
+  "source_hashes": {
+    "crates/thegn-host/src/daemon/service.rs": "a379b51c388b550abf62ea2cf625acd2044c17559e8c4bef1afe8a4e88ab3a2b",
+    "crates/thegn-host/src/hydrate_tests.rs": "708a409c20f9b80cabef440ed0c49baa4d6455e9af0d7577648f85aa65691b45",
+    "crates/thegn-host/src/hydrate_tracker.rs": "83d69ac900d8c2deadf3fc0b002b4c761efe267b32753accfbf09d76980e8278",
+    "crates/thegn-host/src/plugin_providers.rs": "154bed712590d6e694e7a28f24502b03928c5df0c6f987e0e3c78ba986c3b445",
+    "crates/thegn-svc/src/conformance.rs": "c875717a074e0b222cc02710125c984a6f4fa23717f32d25d68bffb0f5e249c4",
+    "crates/thegn-svc/src/control/client.rs": "a7b4cebacef91529af4fa6ecb7e3193855df0c424b28c7f8101a9348eb204542",
+    "crates/thegn-svc/src/control/http.rs": "ce2ccccad83a2f1a218e776ddf1f6cb9c57300223156bf90a2241a0f41506370",
+    "crates/thegn-svc/src/control/tests.rs": "9e742a0f0bc9e0a0c115eaf288fa7b6aa290eef96576c85189d6481aa7df8d90",
+    "crates/thegn-svc/src/issue/github.rs": "6fabcac898846480bd8279c050c67e44c55aebd640752f08ac82f0541579e34b",
+    "crates/thegn-svc/src/issue/http.rs": "927a24b747eecc6a96a4cd696e720a2694824488dd11fddf3542e0ae06f2670d",
+    "crates/thegn-svc/src/issue/identity.rs": "867c67a9d64356b5f76f048d410fac20e44da47f86d0e90d4a78fe08ed65b01a",
+    "crates/thegn-svc/src/issue/jira.rs": "69abd007d02ab850415c6a82fe59bc8b71b30479646bbc017caeea147df12fcf",
+    "crates/thegn-svc/src/issue/kaneo.rs": "397a3d97a8d3fb6bc43a02d9f02f74e7c1633207fa1dd5dab094af6ded69f8fd",
+    "crates/thegn-svc/src/issue/linear.rs": "d6cac08c96a29ad6d1c378be70a55291d0b553c1074829f6cc4b869f05c4455b",
+    "crates/thegn-svc/src/issue/mod.rs": "6297d9524882c61e90b01693f36b836c15fd9adbbe6f54f655a3f008d8f7da96",
+    "crates/thegn-svc/src/plugin/provider.rs": "01b5edf3e86055084e32d6f1b3b7a4742bb7c1a7b39731c8028fb9d9ed7d4628"
+  },
+  "qualifications": [
+    "Linux native tests with synthetic providers and isolated XDG; no live provider, production DB, release/performance, Windows runtime or full-workspace native claim.",
+    "Host registry refusal wrappers and refresh-worker malformed-old-cache branch were source-reviewed but not directly executed; underlying service contracts and real panel hydration were tested.",
+    "THE315 GitHub creation scope, THE324 account authority, THE323 pagination, THE314 process bounds and provider business semantics remain open.",
+    "Historical failed receipts remain immutable. Reused host4256 and unchanged svc f46 fixtures are explicitly mapped; final redirect matrix ran from759.",
+    "No push or live restart."
+  ],
+  "packaging_corrections": [
+    "Completed-task lifecycle set to delivered-awaiting-archive.",
+    "Raw whitespace preserved by hash; whitespace check excludes only evidence artifact directory.",
+    "Historical brand failure rawlog losslessly compressed; no new name-guard exemption."
+  ],
+  "final_artifact_policy": "Adding immutable gate receipts and this approval changes documentation only; validate every artifact hash and all shipping Rust bytes before commit/landing."
+}

@@ -1,0 +1,283 @@
+    Checking thegn-svc v0.1.0-alpha.2 (/tmp/thegn-maintenance-07-combined-20260915/crates/thegn-svc)
+error[E0407]: method `list_issues_with_op` is not a member of trait `IssueBackend`
+   --> crates/thegn-svc/src/issue/kaneo.rs:590:5
+    |
+590 | /     async fn list_issues_with_op(
+591 | |         &self,
+592 | |         op: &mut TrackerHttpOperation<'_>,
+593 | |         filter: &IssueFilter,
+...   |
+627 | |         Ok(all)
+628 | |     }
+    | |_____^ not a member of trait `IssueBackend`
+
+error[E0609]: no field `base_url` on type `&'a issue::jira::JiraBackend`
+   --> crates/thegn-svc/src/issue/jira.rs:401:58
+    |
+401 |                     Ok(jira_issue_to_domain(issue, &self.base_url))
+    |                                                          ^^^^^^^^ unknown field
+    |
+    = note: available fields are: `http`, `http_error`, `project_key`
+
+error[E0609]: no field `base_url` on type `&'a issue::jira::JiraBackend`
+   --> crates/thegn-svc/src/issue/jira.rs:438:55
+    |
+438 |                 issue: jira_issue_to_domain(ji, &self.base_url),
+    |                                                       ^^^^^^^^ unknown field
+    |
+    = note: available fields are: `http`, `http_error`, `project_key`
+
+error[E0609]: no field `base_url` on type `&'a issue::jira::JiraBackend`
+   --> crates/thegn-svc/src/issue/jira.rs:552:47
+    |
+552 |             Ok(jira_issue_to_domain(ji, &self.base_url))
+    |                                               ^^^^^^^^ unknown field
+    |
+    = note: available fields are: `http`, `http_error`, `project_key`
+
+error[E0609]: no field `base_url` on type `&'a issue::jira::JiraBackend`
+   --> crates/thegn-svc/src/issue/jira.rs:639:47
+    |
+639 |             Ok(jira_issue_to_domain(ji, &self.base_url))
+    |                                               ^^^^^^^^ unknown field
+    |
+    = note: available fields are: `http`, `http_error`, `project_key`
+
+error[E0609]: no field `base_url` on type `&'a issue::jira::JiraBackend`
+   --> crates/thegn-svc/src/issue/jira.rs:671:58
+    |
+671 |                     Ok(jira_issue_to_domain(issue, &self.base_url))
+    |                                                          ^^^^^^^^ unknown field
+    |
+    = note: available fields are: `http`, `http_error`, `project_key`
+
+error[E0599]: no method named `list_issues_with_op` found for reference `&'a issue::kaneo::KaneoBackend` in the current scope
+   --> crates/thegn-svc/src/issue/kaneo.rs:586:18
+    |
+586 |             self.list_issues_with_op(&mut op, filter).await
+    |                  ^^^^^^^^^^^^^^^^^^^
+    |
+help: there is a method `list_issues` with a similar name, but with different arguments
+   --> crates/thegn-svc/src/issue/mod.rs:280:5
+    |
+280 | /     fn list_issues<'a>(
+281 | |         &'a self,
+282 | |         filter: &'a IssueFilter,
+283 | |     ) -> BoxFuture<'a, Result<Vec<Issue>, IssueError>>;
+    | |_______________________________________________________^
+
+error[E0599]: no method named `list_issues_with_op` found for reference `&'a issue::kaneo::KaneoBackend` in the current scope
+   --> crates/thegn-svc/src/issue/kaneo.rs:797:35
+    |
+797 |             let mut issues = self.list_issues_with_op(&mut op, &filter).await?;
+    |                                   ^^^^^^^^^^^^^^^^^^^
+    |
+help: there is a method `list_issues` with a similar name, but with different arguments
+   --> crates/thegn-svc/src/issue/mod.rs:280:5
+    |
+280 | /     fn list_issues<'a>(
+281 | |         &'a self,
+282 | |         filter: &'a IssueFilter,
+283 | |     ) -> BoxFuture<'a, Result<Vec<Issue>, IssueError>>;
+    | |_______________________________________________________^
+
+Some errors have detailed explanations: E0407, E0599, E0609.
+For more information about an error, try `rustc --explain E0407`.
+error: could not compile `thegn-svc` (lib) due to 8 previous errors
+   Compiling thegn-host v0.1.0-alpha.2 (/tmp/thegn-maintenance-07-combined-20260915/crates/thegn-host)
+warning: hiding a lifetime that's elided elsewhere is confusing
+   --> vendor/termwiz/src/hyperlink.rs:247:18
+    |
+247 |     fn highlight(&self) -> Option<fancy_regex::Match> {
+    |                  ^^^^^            ^^^^^^^^^^^^^^^^^^ the same lifetime is hidden here
+    |                  |
+    |                  the lifetime is elided here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+    = note: `#[warn(mismatched_lifetime_syntaxes)]` on by default
+help: use `'_` for type paths
+    |
+247 |     fn highlight(&self) -> Option<fancy_regex::Match<'_>> {
+    |                                                     ++++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+   --> vendor/termwiz/src/image.rs:567:17
+    |
+567 |     pub fn data(&self) -> MutexGuard<ImageDataType> {
+    |                 ^^^^^     ^^^^^^^^^^^^^^^^^^^^^^^^^ the same lifetime is hidden here
+    |                 |
+    |                 the lifetime is elided here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+    |
+567 |     pub fn data(&self) -> MutexGuard<'_, ImageDataType> {
+    |                                      +++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+  --> vendor/termwiz/src/lineedit/history.rs:12:12
+   |
+12 |     fn get(&self, idx: HistoryIndex) -> Option<Cow<str>>;
+   |            ^^^^^ the lifetime is elided here   ^^^^^^^^ the same lifetime is hidden here
+   |
+   = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+   |
+12 |     fn get(&self, idx: HistoryIndex) -> Option<Cow<'_, str>>;
+   |                                                    +++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+  --> vendor/termwiz/src/lineedit/history.rs:22:9
+   |
+22 |         &self,
+   |         ^^^^^ the lifetime is elided here
+...
+27 |     ) -> Option<SearchResult>;
+   |                 ^^^^^^^^^^^^ the same lifetime is hidden here
+   |
+   = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+   |
+27 |     ) -> Option<SearchResult<'_>>;
+   |                             ++++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+  --> vendor/termwiz/src/lineedit/history.rs:88:12
+   |
+88 |     fn get(&self, idx: HistoryIndex) -> Option<Cow<str>> {
+   |            ^^^^^ the lifetime is elided here   ^^^^^^^^ the same lifetime is hidden here
+   |
+   = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+   |
+88 |     fn get(&self, idx: HistoryIndex) -> Option<Cow<'_, str>> {
+   |                                                    +++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+   --> vendor/termwiz/src/lineedit/history.rs:109:9
+    |
+109 |         &self,
+    |         ^^^^^ the lifetime is elided here
+...
+114 |     ) -> Option<SearchResult> {
+    |                 ^^^^^^^^^^^^ the same lifetime is hidden here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+    |
+114 |     ) -> Option<SearchResult<'_>> {
+    |                             ++++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+   --> vendor/termwiz/src/surface/mod.rs:511:25
+    |
+511 |     pub fn screen_lines(&self) -> Vec<Cow<Line>> {
+    |                         ^^^^^         ^^^^^^^^^ the same lifetime is hidden here
+    |                         |
+    |                         the lifetime is elided here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+    |
+511 |     pub fn screen_lines(&self) -> Vec<Cow<'_, Line>> {
+    |                                           +++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+   --> vendor/termwiz/src/surface/mod.rs:526:24
+    |
+526 |     pub fn get_changes(&self, seq: SequenceNo) -> (SequenceNo, Cow<[Change]>) {
+    |                        ^^^^^ the lifetime is elided here       ^^^^^^^^^^^^^ the same lifetime is hidden here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+    |
+526 |     pub fn get_changes(&self, seq: SequenceNo) -> (SequenceNo, Cow<'_, [Change]>) {
+    |                                                                    +++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+   --> vendor/termwiz/src/surface/line/clusterline.rs:165:17
+    |
+165 |     pub fn iter(&self) -> ClusterLineCellIter {
+    |                 ^^^^^     ^^^^^^^^^^^^^^^^^^^ the same lifetime is hidden here
+    |                 |
+    |                 the lifetime is elided here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+    |
+165 |     pub fn iter(&self) -> ClusterLineCellIter<'_> {
+    |                                              ++++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+   --> vendor/termwiz/src/surface/line/line.rs:609:19
+    |
+609 |     pub fn as_str(&self) -> Cow<str> {
+    |                   ^^^^^     ^^^^^^^^ the same lifetime is hidden here
+    |                   |
+    |                   the lifetime is elided here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+    |
+609 |     pub fn as_str(&self) -> Cow<'_, str> {
+    |                                 +++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+    --> vendor/termwiz/src/surface/line/line.rs:1014:21
+     |
+1014 |     pub fn get_cell(&self, cell_index: usize) -> Option<CellRef> {
+     |                     ^^^^^ the lifetime is elided here   ^^^^^^^ the same lifetime is hidden here
+     |
+     = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+     |
+1014 |     pub fn get_cell(&self, cell_index: usize) -> Option<CellRef<'_>> {
+     |                                                                ++++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+  --> vendor/termwiz/src/terminal/mod.rs:74:27
+   |
+74 |     fn probe_capabilities(&mut self) -> Option<ProbeCapabilities> {
+   |                           ^^^^^^^^^            ^^^^^^^^^^^^^^^^^ the same lifetime is hidden here
+   |                           |
+   |                           the lifetime is elided here
+   |
+   = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+   |
+74 |     fn probe_capabilities(&mut self) -> Option<ProbeCapabilities<'_>> {
+   |                                                                 ++++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+   --> vendor/termwiz/src/terminal/unix.rs:389:27
+    |
+389 |     fn probe_capabilities(&mut self) -> Option<ProbeCapabilities> {
+    |                           ^^^^^^^^^            ^^^^^^^^^^^^^^^^^ the same lifetime is hidden here
+    |                           |
+    |                           the lifetime is elided here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+    |
+389 |     fn probe_capabilities(&mut self) -> Option<ProbeCapabilities<'_>> {
+    |                                                                 ++++
+
+warning: `termwiz` (lib) generated 13 warnings (run `cargo clippy --fix --lib -p termwiz -- -D warnings` to apply 13 suggestions)
+error[E0425]: cannot find function `validate_issue_identity` in the crate root
+    --> crates/thegn-svc/src/issue/kaneo.rs:1049:24
+     |
+1049 |         assert!(crate::validate_issue_identity(a).is_ok(), "url: {}", a.url);
+     |                        ^^^^^^^^^^^^^^^^^^^^^^^ not found in the crate root
+     |
+help: consider importing this function
+     |
+ 908 +     use crate::issue::validate_issue_identity;
+     |
+help: if you import `validate_issue_identity`, refer to it directly
+     |
+1049 -         assert!(crate::validate_issue_identity(a).is_ok(), "url: {}", a.url);
+1049 +         assert!(validate_issue_identity(a).is_ok(), "url: {}", a.url);
+     |
+
+Some errors have detailed explanations: E0407, E0425, E0599, E0609.
+error: could not compile `thegn-svc` (lib test) due to 9 previous errors

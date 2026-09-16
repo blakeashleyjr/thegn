@@ -1,0 +1,38 @@
+{
+  "issue": "THE-321",
+  "reviewer": "Luna high",
+  "date": "2026-09-15",
+  "decision": "approve_scoped_http_budget_and_provider_sequence_for_compiled_gates",
+  "reviewed_checkout": "/tmp/thegn-maintenance08-combined-20260915",
+  "reviewed_commit": "834f324245f8840b34c4eefb7a210fbbf638bcef",
+  "reviewed_tree": "f985e848f45686fa2b51d87442d1f556d0231339",
+  "http_provider_anchor": "71c8354b986d39a4c5718b49a109053b7f222576",
+  "baseline": "fadd7164ce46b684e1e23ee2174aa876fc619d42",
+  "source_only": true,
+  "blocked": false,
+  "blockers": [],
+  "scope": [
+    "shared process-wide TrackerHttpBudget and one permit/absolute deadline per operation",
+    "bounded request serialization and response status/MIME/encoding/stream/decode handling",
+    "future-drop permit reclamation and deterministic provider sequence fixtures",
+    "current Linear/Jira/Kaneo operation wiring",
+    "834f3242 cached identity hydration regression test"
+  ],
+  "qualifications": [
+    "separately pending Linear production revision is outside this HTTP/sequence verdict",
+    "no universal disconnected-Axum-handler or detached-hydration cancellation claim",
+    "malformed JSON parse path is source-covered but has no dedicated malformed-body fixture",
+    "Jira/Kaneo structured identifier path/query encoding remains outside THE321"
+  ],
+  "tested_claims_status": "source_inspected_only_compiled_gates_pending",
+  "files": {
+    "crates/thegn-svc/src/issue/http.rs": "77b13e8c927c51158ba7c19012d5bc9ff2ff42861a5378f6479d54ae1c43bc86",
+    "crates/thegn-svc/src/issue/linear.rs": "c410bdcd16df3208d3f329d50a1813d5c6dee4423a7592b612b649fbe9e0fef3",
+    "crates/thegn-svc/src/issue/jira.rs": "1dc3a770ef7a0144d85098603acb9945520a35b80bcb6cc95ab632f54f905eb9",
+    "crates/thegn-svc/src/issue/kaneo.rs": "86c7047f2d3956b468d7b48af9b6118e5a33471ab375ab870aed7ba0beb82f21",
+    "crates/thegn-svc/src/issue/mod.rs": "a5e24e75a19d7887069335313c4ddad0bbfa2755e820204ec007709e68cad13c",
+    "crates/thegn-host/src/hydrate_tracker.rs": "83d69ac900d8c2deadf3fc0b002b4c761efe267b32753accfbf09d76980e8278",
+    "crates/thegn-host/src/hydrate_tests.rs": "708a409c20f9b80cabef440ed0c49baa4d6455e9af0d7577648f85aa65691b45"
+  },
+  "report_sha256": "e868bdacc6d20402e8c50d757be819046dfaebcd9b571ca05deda0e7cbd59ff5"
+}

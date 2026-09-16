@@ -1,0 +1,100 @@
+{
+  "issue": "THE-321 + THE-322",
+  "reviewer": "Luna high independent adversarial source review",
+  "candidate_path": "/tmp/thegn-maintenance08-combined-20260915",
+  "requested_frozen_commit": "7ef9c3c6c0ab5637fc913e1b1b94a0d6a799cfa0",
+  "reviewed_commit": "d96c91faabafed34a5fe4d4e3222ee3c1d981e7a",
+  "reviewed_tree": "32c1ebc922c7f35bfee7bbc7c048d6ac35553a0b",
+  "base_commit": "fadd7164ce46b684e1e23ee2174aa876fc619d42",
+  "verdict": "BLOCKED",
+  "source_only": true,
+  "operations": {
+    "cargo": false,
+    "build": false,
+    "test": false,
+    "native": false,
+    "provider": false,
+    "authenticated_provider": false,
+    "canonical_mutation": false,
+    "linear_write": false
+  },
+  "findings": [
+    {
+      "severity": "blocker",
+      "area": "compile",
+      "evidence": [
+        "crates/thegn-svc/src/issue/kaneo.rs:360-365",
+        "crates/thegn-svc/src/issue/kaneo.rs:774-783"
+      ],
+      "claim": "task_to_domain returns Result<Issue, IssueError>, but update_issue returns Ok(task_to_domain(...)) without ?, producing Result<Result<Issue, IssueError>, IssueError> where the BoxFuture requires Result<Issue, IssueError>.",
+      "repair": "Propagate the conversion error exactly as create_issue and get_issue do (or otherwise return the conversion Result directly), then recheck all changed provider conversion call sites before compilation."
+    },
+    {
+      "severity": "blocker",
+      "area": "authenticated GraphQL mutation safety",
+      "evidence": [
+        "crates/thegn-svc/src/issue/linear.rs:595-610",
+        "crates/thegn-svc/src/issue/linear.rs:621-629"
+      ],
+      "claim": "A response-controlled workflow state id is inserted raw into the follow-up issueUpdate GraphQL document. A provider response containing a quote, backslash, or GraphQL punctuation can alter the mutation sent with the Linear authorization; user title/id values are escaped but StateNode.id is not.",
+      "repair": "Use a GraphQL variable for stateId, or validate and escape the returned id before constructing the mutation. Add a response-injection fixture that proves no injected field reaches the second request."
+    },
+    {
+      "severity": "high",
+      "area": "GitHub authority before side effects",
+      "evidence": [
+        "crates/thegn-svc/src/issue/github.rs:390-420",
+        "crates/thegn-core/src/config_issues.rs:193-194"
+      ],
+      "claim": "create_issue invokes gh issue create without a repository flag and only validates the printed URL after the create side effect. It derives expected_host from GH_HOST, while configured extra_flags are explicitly list-only. A cwd/host mismatch can therefore create in an unintended repository or create successfully and then return a parse error; the comment claiming it never resolves against cwd is false.",
+      "repair": "Bind creation to an admitted repository/worktree authority before invoking gh, or document and test the existing cwd contract with an explicit preflight. At minimum keep creation and follow-up authority consistent and add a fake gh argv/cwd fixture; do not rely on post-create URL validation to prevent the side effect."
+    },
+    {
+      "severity": "high",
+      "area": "provider response admission ordering",
+      "evidence": [
+        "crates/thegn-svc/src/issue/linear.rs:307-329",
+        "crates/thegn-svc/src/issue/mod.rs:622-639"
+      ],
+      "claim": "Linear converts provider-returned identifier and URL into an Issue before validating them. Router callers later validate the Issue before cache/UI use, but the public Linear backend itself can return a malformed domain object and direct backend consumers bypass the required adapter boundary.",
+      "repair": "Make the Linear conversion fallible and validate the identifier/number/public URL before constructing the domain object, consistently with Jira and Kaneo."
+    },
+    {
+      "severity": "high",
+      "area": "public API compatibility",
+      "evidence": [
+        "crates/thegn-svc/src/plugin/provider.rs:198-212",
+        "crates/thegn-svc/src/issue/mod.rs:429-445"
+      ],
+      "claim": "PluginIssueBackend::new changed from returning Self to Result<Self, IssueError>, and IssueRouter::push_backend changed from returning () to Result<(), IssueError>. Both are public methods, so downstream Rust callers using the pre-change signatures no longer compile. IssueError also gained enum variants, which affects exhaustive downstream matches.",
+      "repair": "Preserve the existing public constructors and add fallible try_new/try_push seams, or explicitly version/document the intentional breaking API change before landing. The approved scope calls for preserving public compatibility."
+    }
+  ],
+  "validated_areas": [
+    "TrackerHttpClient keeps configured scheme/host/effective port/base path, refuses redirects and nonidentity encoding, enforces bounded request/response bodies, and carries one permit/deadline through provider operations in source inspection.",
+    "Jira and Kaneo REST route construction is structurally encoded and checks provider ids before path use; Linear user id/title/query interpolation is escaped or variable-backed except for the returned state id above.",
+    "Control client/server issue identity round-trip tests exercise one complete encoded segment, malformed ids have zero ControlApi calls, and plugin opaque keys retain delimiter/Unicode behavior.",
+    "Router validates returned issue identity before cache/list/search aggregation, while the Linear adapter ordering remains a direct-consumer gap described above.",
+    "The d96 follow-up only tightens fixture signal assertions and cancellation joins relative to 7ef; it does not resolve the production blockers."
+  ],
+  "metadata_note": "Commit 7a2136ef adds two exact immutable maintenance07 receipt paths to test/brand-guard.sh with a reason; this is a hash-preserving metadata exception for historical raw receipts. The reviewed d96 tree also includes the d96 fixture-result checks. Rust source behavior is unchanged between 7ef and d96 apart from final deadline-result checks in http fixtures.",
+  "gate_scope": {
+    "source_diff_check": "pass by inspection/tool output",
+    "rustfmt_openspec_ratchets": "reported pass by root; no rerun here",
+    "compile_or_tests": "not run by instruction",
+    "native_or_provider": "not run by instruction"
+  },
+  "source_hashes": {
+    "crates/thegn-svc/src/issue/http.rs": "464d82d2f9e5ad54517b830266c28bc1e9fe2ff5a38d826ec2769076f880c775",
+    "crates/thegn-svc/src/issue/identity.rs": "8e2355d1b2743eca252c2a0fd77f3b6f866c28329d29316143d1f27ded5e00a0",
+    "crates/thegn-svc/src/issue/mod.rs": "a5e24e75a19d7887069335313c4ddad0bbfa2755e820204ec007709e68cad13c",
+    "crates/thegn-svc/src/issue/github.rs": "e2105b528cfade9b254a2c9226a46bc56f64d0f7bab503257b9d07de2dd087ff",
+    "crates/thegn-svc/src/issue/jira.rs": "1dc3a770ef7a0144d85098603acb9945520a35b80bcb6cc95ab632f54f905eb9",
+    "crates/thegn-svc/src/issue/kaneo.rs": "18fbaea17e4930330c9c04cd848240c07d82c97c7fca0c8272f5eba824b2cd00",
+    "crates/thegn-svc/src/issue/linear.rs": "c410bdcd16df3208d3f329d50a1813d5c6dee4423a7592b612b649fbe9e0fef3",
+    "crates/thegn-svc/src/control/client.rs": "a7b4cebacef91529af4fa6ecb7e3193855df0c424b28c7f8101a9348eb204542",
+    "crates/thegn-svc/src/control/http.rs": "ce2ccccad83a2f1a218e776ddf1f6cb9c57300223156bf90a2241a0f41506370",
+    "crates/thegn-svc/src/control/routes.rs": "342d8b2e16c62528e0649028a7c8e8140d2d67a52ab27e78ed8432723444e4e2",
+    "crates/thegn-svc/src/plugin/provider.rs": "01b5edf3e86055084e32d6f1b3b7a4742bb7c1a7b39731c8028fb9d9ed7d4628"
+  }
+}

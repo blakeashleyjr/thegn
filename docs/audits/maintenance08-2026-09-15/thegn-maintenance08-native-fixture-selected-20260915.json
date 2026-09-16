@@ -1,0 +1,525 @@
+{
+  "source": "f46e043d649a639759333d76faeb6abb6749f2a5",
+  "selection": [
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "conformance::tests::issue_capability_ledger_covers_every_provider_offline"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "conformance::tests::issue_capability_ledger_rejects_over_and_underclaims"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "conformance::tests::issue_error_classification_covers_seam_contract"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "control::client::tests::issue_path_encodes_complete_identity_once_for_server_decode"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "control::client::tests::issue_path_rejects_malformed_identity_before_encoding"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "control::tests::issue_identity_roundtrips_client_encoding_through_real_router"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "control::tests::malformed_issue_identity_reaches_no_control_api_operation"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::capabilities::tests::omitted_and_null_caps_are_least_privilege"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::capabilities::tests::unknown_caps_are_rejected"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::github::tests::explicit_enterprise_scope_admits_response_without_ambient_gh_host"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::github::tests::extra_repo_flag_forms_are_checked"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::github::tests::issue_to_domain_closed_maps_to_done"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::github::tests::issue_to_domain_open_maps_to_todo"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::github::tests::malformed_response_url_does_not_downgrade_to_bare_id"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::github::tests::parse_ms_valid_and_invalid"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::github::tests::repo_from_url_extracts_owner_repo"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::github::tests::split_id_round_trips_scoped_and_bare_ids"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::http::tests::bounded_serializer_refuses_before_a_request_can_be_built"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::http::tests::constructors_admit_linear_and_preserve_self_hosted_base_paths"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::http::tests::fake_http_enforces_redirect_encoding_and_stream_caps"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::http::tests::issue_error_debug_redacts_reqwest_network_details"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::http::tests::origin_policy_preserves_explicit_lan_http_and_rejects_authority_state"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::http::tests::pending_stream_future_drop_releases_permit"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::http::tests::process_budget_is_shared_across_client_construction"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::http::tests::queued_request_does_not_serialize_body_before_capacity"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::http::tests::redirect_target_receives_no_request_or_credentials"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::http::tests::repeated_provider_requests_share_one_explicit_budget"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::http::tests::shared_budget_queue_future_drop_releases_capacity"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::identity::tests::builtin_grammar_keeps_ascii_repository_and_jira_rules_bounded"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::identity::tests::builtins_reject_path_and_option_injection"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::identity::tests::complete_control_identity_bounds_the_whole_envelope"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::identity::tests::native_jira_and_kaneo_compatibility_examples"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::identity::tests::plugin_keys_keep_opaque_utf8_but_reject_controls"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::jira::tests::constructor_admits_self_hosted_base_path"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::jira::tests::create_issue_returns_budget_error_before_jira_followup"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::jira::tests::escape_jql_str_neutralizes_quote_backslash_newline"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::jira::tests::extract_text_walks_adf_and_handles_edges"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::jira::tests::issue_to_domain_maps_all_fields_and_derives_browse_url"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::jira::tests::issue_to_domain_tolerates_missing_optionals"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::jira::tests::map_priority_by_name_and_fallback"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::jira::tests::map_status_by_category_and_fallback"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::jira::tests::parse_ms_valid_and_invalid"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::jira::tests::project_filter_accepts_configured_project_without_issue_number"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::jira::tests::status_filter_uses_statuscategory_not_display_names"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::jira::tests::urlencoding_percent_encodes_plus_and_equals"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::kaneo::tests::api_url_encodes_structured_query_and_rejects_traversal"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::kaneo::tests::board_response_flattens_to_issues"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::kaneo::tests::column_status_uses_is_final_then_name_heuristic"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::kaneo::tests::label_row_deserializes"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::kaneo::tests::list_expansion_returns_budget_error_before_kaneo_project_fetch"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::kaneo::tests::parse_ms_valid_and_invalid"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::kaneo::tests::priority_maps_and_reverses"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::kaneo::tests::project_deserializes_name_and_slug"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::kaneo::tests::task_link_uses_url_segments_and_query_encoding"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::kaneo::tests::task_missing_optionals_tolerated"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::kaneo::tests::url_falls_back_without_workspace"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::linear::schema_contract::backlog_filter_requests_both_backlog_and_triage"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::linear::schema_contract::create_mutation_selects_the_same_fields_as_issue_fields"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::linear::schema_contract::every_recorded_state_type_maps_deliberately"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::linear::schema_contract::get_issue_comments_selection_matches_recorded_schema"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::linear::schema_contract::issue_fields_selection_matches_recorded_schema"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::linear::schema_contract::limit_clamps_to_the_page_maximum"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::linear::schema_contract::overlapping_statuses_deduplicate_in_order"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::linear::schema_contract::parse_selection_handles_nesting_and_reports_unknown_fields"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::linear::schema_contract::recorded_issue_type_has_no_assignees_field"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::linear::schema_contract::state_type_strings_are_recorded_linear_types"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::linear::schema_contract::team_scope_and_assignee_me_join_as_arguments"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::linear::schema_contract::unfiltered_list_query_is_well_formed"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::linear::schema_contract::user_controlled_identifiers_cannot_break_out_of_the_literal"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::linear::tests::constructor_admits_official_linear_endpoint"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::linear::tests::escape_graphql_str_neutralizes_quote_backslash_newline_tab"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::linear::tests::issue_to_domain_maps_all_fields"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::linear::tests::issue_to_domain_rejects_provider_identity_or_url_before_returning"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::linear::tests::issue_to_domain_tolerates_missing_optionals"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::linear::tests::map_state_covers_all_types_and_fallback"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::linear::tests::parse_updated_at_valid_and_invalid"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::linear::tests::priority_maps_and_round_trips"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::linear::tests::update_status_escapes_provider_state_id_before_write"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::linear::tests::update_status_uses_one_budget_across_linear_requests"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::linear::tests::workflow_state_id_is_admitted_and_escaped_before_mutation"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::spec::bare_id_routes_to_the_only_backend"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::spec::bare_id_with_two_backends_routes_nowhere"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::spec::builds_one_backend_per_active_provider"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::spec::cache_boundary_rejects_cross_provider_and_malformed_ids"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::spec::dispatch_by_id_prefix"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::spec::duplicate_provider_ids_keep_the_first_account_for_mutations"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::spec::id_miss_dedupes_repeated_providers"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::spec::id_miss_message_names_the_form_and_the_providers"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::spec::malformed_control_id_reaches_no_fake_provider_effect"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::spec::multiple_accounts_of_one_provider_each_build_a_backend"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::spec::parse_due_date_ms_handles_date_only_and_rfc3339"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::spec::plugin_identity_envelope_is_bounded_before_routing"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::spec::plugin_namespace_routes_by_complete_registered_prefix"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::spec::single_backend_does_not_fallback_foreign_namespace"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::spec::single_provider_back_compat"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "issue::spec::unconfigured_router_is_empty"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "plugin::provider::tests::issue_ops_round_trip_through_a_scripted_plugin"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "plugin::provider::tests::late_and_unknown_responses_are_reported_unroutable"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "plugin::provider::tests::omitted_caps_refuse_optional_ops_without_a_bridge_round_trip"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "plugin::provider::tests::plugin_response_identity_must_match_namespace_and_opaque_fields"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "plugin::provider::tests::resident_eof_fails_pending_calls_without_waiting_for_rpc_deadline"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "plugin::provider::tests::resident_final_reply_before_exit_is_delivered_and_late_call_is_closed"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "plugin::provider::tests::resident_old_session_cannot_route_into_replacement_bridge"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-fixture-binaries-20260915/svc-tests",
+      "selector": "plugin::provider::tests::timeout_and_dead_session_degrade_to_errors"
+    }
+  ]
+}

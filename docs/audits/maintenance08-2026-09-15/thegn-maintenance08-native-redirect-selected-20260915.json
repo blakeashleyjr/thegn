@@ -1,0 +1,10 @@
+{
+  "source": "759cd1ad252cb131c87cf9078923c31203cdfeb5",
+  "selection": [
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance08-native-redirect-binaries-20260915/svc-tests",
+      "selector": "issue::http::tests::redirect_target_receives_no_request_or_credentials"
+    }
+  ]
+}

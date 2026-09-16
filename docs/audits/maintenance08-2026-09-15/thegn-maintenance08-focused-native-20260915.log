@@ -1,0 +1,876 @@
+
+=== svc conformance::tests::issue_capability_ledger_covers_every_provider_offline ===
+
+running 1 test
+test conformance::tests::issue_capability_ledger_covers_every_provider_offline ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc conformance::tests::issue_capability_ledger_rejects_over_and_underclaims ===
+
+running 1 test
+test conformance::tests::issue_capability_ledger_rejects_over_and_underclaims ... 
+thread 'conformance::tests::issue_capability_ledger_rejects_over_and_underclaims' (237305) panicked at crates/thegn-svc/src/conformance.rs:448:9:
+assertion `left == right` failed
+  left: false
+ right: true
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+thread 'conformance::tests::issue_capability_ledger_rejects_over_and_underclaims' (237305) panicked at crates/thegn-svc/src/conformance.rs:448:9:
+assertion `left == right` failed
+  left: true
+ right: false
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc conformance::tests::issue_error_classification_covers_seam_contract ===
+
+running 1 test
+test conformance::tests::issue_error_classification_covers_seam_contract ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc control::client::tests::issue_path_encodes_complete_identity_once_for_server_decode ===
+
+running 1 test
+test control::client::tests::issue_path_encodes_complete_identity_once_for_server_decode ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc control::client::tests::issue_path_rejects_malformed_identity_before_encoding ===
+
+running 1 test
+test control::client::tests::issue_path_rejects_malformed_identity_before_encoding ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc control::tests::issue_identity_roundtrips_client_encoding_through_real_router ===
+
+running 1 test
+test control::tests::issue_identity_roundtrips_client_encoding_through_real_router ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.28s
+
+
+=== svc control::tests::malformed_issue_identity_reaches_no_control_api_operation ===
+
+running 1 test
+test control::tests::malformed_issue_identity_reaches_no_control_api_operation ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.68s
+
+
+=== svc issue::capabilities::tests::omitted_and_null_caps_are_least_privilege ===
+
+running 1 test
+test issue::capabilities::tests::omitted_and_null_caps_are_least_privilege ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc issue::capabilities::tests::unknown_caps_are_rejected ===
+
+running 1 test
+test issue::capabilities::tests::unknown_caps_are_rejected ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc issue::github::tests::explicit_enterprise_scope_admits_response_without_ambient_gh_host ===
+
+running 1 test
+test issue::github::tests::explicit_enterprise_scope_admits_response_without_ambient_gh_host ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc issue::github::tests::extra_repo_flag_forms_are_checked ===
+
+running 1 test
+test issue::github::tests::extra_repo_flag_forms_are_checked ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc issue::github::tests::issue_to_domain_closed_maps_to_done ===
+
+running 1 test
+test issue::github::tests::issue_to_domain_closed_maps_to_done ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc issue::github::tests::issue_to_domain_open_maps_to_todo ===
+
+running 1 test
+test issue::github::tests::issue_to_domain_open_maps_to_todo ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc issue::github::tests::malformed_response_url_does_not_downgrade_to_bare_id ===
+
+running 1 test
+test issue::github::tests::malformed_response_url_does_not_downgrade_to_bare_id ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc issue::github::tests::parse_ms_valid_and_invalid ===
+
+running 1 test
+test issue::github::tests::parse_ms_valid_and_invalid ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc issue::github::tests::repo_from_url_extracts_owner_repo ===
+
+running 1 test
+test issue::github::tests::repo_from_url_extracts_owner_repo ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc issue::github::tests::split_id_round_trips_scoped_and_bare_ids ===
+
+running 1 test
+test issue::github::tests::split_id_round_trips_scoped_and_bare_ids ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc issue::http::tests::bounded_serializer_refuses_before_a_request_can_be_built ===
+
+running 1 test
+test issue::http::tests::bounded_serializer_refuses_before_a_request_can_be_built ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.02s
+
+
+=== svc issue::http::tests::constructors_admit_linear_and_preserve_self_hosted_base_paths ===
+
+running 1 test
+test issue::http::tests::constructors_admit_linear_and_preserve_self_hosted_base_paths ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc issue::http::tests::fake_http_enforces_redirect_encoding_and_stream_caps ===
+
+running 1 test
+test issue::http::tests::fake_http_enforces_redirect_encoding_and_stream_caps ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.03s
+
+
+=== svc issue::http::tests::issue_error_debug_redacts_reqwest_network_details ===
+
+running 1 test
+test issue::http::tests::issue_error_debug_redacts_reqwest_network_details ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc issue::http::tests::origin_policy_preserves_explicit_lan_http_and_rejects_authority_state ===
+
+running 1 test
+test issue::http::tests::origin_policy_preserves_explicit_lan_http_and_rejects_authority_state ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc issue::http::tests::pending_stream_future_drop_releases_permit ===
+
+running 1 test
+test issue::http::tests::pending_stream_future_drop_releases_permit ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc issue::http::tests::process_budget_is_shared_across_client_construction ===
+
+running 1 test
+test issue::http::tests::process_budget_is_shared_across_client_construction ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc issue::http::tests::queued_request_does_not_serialize_body_before_capacity ===
+
+running 1 test
+test issue::http::tests::queued_request_does_not_serialize_body_before_capacity ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc issue::http::tests::redirect_target_receives_no_request_or_credentials ===
+
+running 1 test
+test issue::http::tests::redirect_target_receives_no_request_or_credentials ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc issue::http::tests::repeated_provider_requests_share_one_explicit_budget ===
+
+running 1 test
+test issue::http::tests::repeated_provider_requests_share_one_explicit_budget ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc issue::http::tests::shared_budget_queue_future_drop_releases_capacity ===
+
+running 1 test
+test issue::http::tests::shared_budget_queue_future_drop_releases_capacity ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc issue::identity::tests::builtin_grammar_keeps_ascii_repository_and_jira_rules_bounded ===
+
+running 1 test
+test issue::identity::tests::builtin_grammar_keeps_ascii_repository_and_jira_rules_bounded ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc issue::identity::tests::builtins_reject_path_and_option_injection ===
+
+running 1 test
+test issue::identity::tests::builtins_reject_path_and_option_injection ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc issue::identity::tests::complete_control_identity_bounds_the_whole_envelope ===
+
+running 1 test
+test issue::identity::tests::complete_control_identity_bounds_the_whole_envelope ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc issue::identity::tests::native_jira_and_kaneo_compatibility_examples ===
+
+running 1 test
+test issue::identity::tests::native_jira_and_kaneo_compatibility_examples ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc issue::identity::tests::plugin_keys_keep_opaque_utf8_but_reject_controls ===
+
+running 1 test
+test issue::identity::tests::plugin_keys_keep_opaque_utf8_but_reject_controls ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc issue::jira::tests::constructor_admits_self_hosted_base_path ===
+
+running 1 test
+test issue::jira::tests::constructor_admits_self_hosted_base_path ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc issue::jira::tests::create_issue_returns_budget_error_before_jira_followup ===
+
+running 1 test
+test issue::jira::tests::create_issue_returns_budget_error_before_jira_followup ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc issue::jira::tests::escape_jql_str_neutralizes_quote_backslash_newline ===
+
+running 1 test
+test issue::jira::tests::escape_jql_str_neutralizes_quote_backslash_newline ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc issue::jira::tests::extract_text_walks_adf_and_handles_edges ===
+
+running 1 test
+test issue::jira::tests::extract_text_walks_adf_and_handles_edges ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc issue::jira::tests::issue_to_domain_maps_all_fields_and_derives_browse_url ===
+
+running 1 test
+test issue::jira::tests::issue_to_domain_maps_all_fields_and_derives_browse_url ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc issue::jira::tests::issue_to_domain_tolerates_missing_optionals ===
+
+running 1 test
+test issue::jira::tests::issue_to_domain_tolerates_missing_optionals ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc issue::jira::tests::map_priority_by_name_and_fallback ===
+
+running 1 test
+test issue::jira::tests::map_priority_by_name_and_fallback ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc issue::jira::tests::map_status_by_category_and_fallback ===
+
+running 1 test
+test issue::jira::tests::map_status_by_category_and_fallback ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc issue::jira::tests::parse_ms_valid_and_invalid ===
+
+running 1 test
+test issue::jira::tests::parse_ms_valid_and_invalid ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc issue::jira::tests::project_filter_accepts_configured_project_without_issue_number ===
+
+running 1 test
+test issue::jira::tests::project_filter_accepts_configured_project_without_issue_number ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc issue::jira::tests::status_filter_uses_statuscategory_not_display_names ===
+
+running 1 test
+test issue::jira::tests::status_filter_uses_statuscategory_not_display_names ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc issue::jira::tests::urlencoding_percent_encodes_plus_and_equals ===
+
+running 1 test
+test issue::jira::tests::urlencoding_percent_encodes_plus_and_equals ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc issue::kaneo::tests::api_url_encodes_structured_query_and_rejects_traversal ===
+
+running 1 test
+test issue::kaneo::tests::api_url_encodes_structured_query_and_rejects_traversal ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc issue::kaneo::tests::board_response_flattens_to_issues ===
+
+running 1 test
+test issue::kaneo::tests::board_response_flattens_to_issues ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc issue::kaneo::tests::column_status_uses_is_final_then_name_heuristic ===
+
+running 1 test
+test issue::kaneo::tests::column_status_uses_is_final_then_name_heuristic ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc issue::kaneo::tests::label_row_deserializes ===
+
+running 1 test
+test issue::kaneo::tests::label_row_deserializes ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc issue::kaneo::tests::list_expansion_returns_budget_error_before_kaneo_project_fetch ===
+
+running 1 test
+test issue::kaneo::tests::list_expansion_returns_budget_error_before_kaneo_project_fetch ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc issue::kaneo::tests::parse_ms_valid_and_invalid ===
+
+running 1 test
+test issue::kaneo::tests::parse_ms_valid_and_invalid ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc issue::kaneo::tests::priority_maps_and_reverses ===
+
+running 1 test
+test issue::kaneo::tests::priority_maps_and_reverses ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc issue::kaneo::tests::project_deserializes_name_and_slug ===
+
+running 1 test
+test issue::kaneo::tests::project_deserializes_name_and_slug ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc issue::kaneo::tests::task_link_uses_url_segments_and_query_encoding ===
+
+running 1 test
+test issue::kaneo::tests::task_link_uses_url_segments_and_query_encoding ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc issue::kaneo::tests::task_missing_optionals_tolerated ===
+
+running 1 test
+test issue::kaneo::tests::task_missing_optionals_tolerated ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc issue::kaneo::tests::url_falls_back_without_workspace ===
+
+running 1 test
+test issue::kaneo::tests::url_falls_back_without_workspace ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc issue::linear::schema_contract::backlog_filter_requests_both_backlog_and_triage ===
+
+running 1 test
+test issue::linear::schema_contract::backlog_filter_requests_both_backlog_and_triage ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc issue::linear::schema_contract::create_mutation_selects_the_same_fields_as_issue_fields ===
+
+running 1 test
+test issue::linear::schema_contract::create_mutation_selects_the_same_fields_as_issue_fields ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc issue::linear::schema_contract::every_recorded_state_type_maps_deliberately ===
+
+running 1 test
+test issue::linear::schema_contract::every_recorded_state_type_maps_deliberately ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc issue::linear::schema_contract::get_issue_comments_selection_matches_recorded_schema ===
+
+running 1 test
+test issue::linear::schema_contract::get_issue_comments_selection_matches_recorded_schema ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc issue::linear::schema_contract::issue_fields_selection_matches_recorded_schema ===
+
+running 1 test
+test issue::linear::schema_contract::issue_fields_selection_matches_recorded_schema ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc issue::linear::schema_contract::limit_clamps_to_the_page_maximum ===
+
+running 1 test
+test issue::linear::schema_contract::limit_clamps_to_the_page_maximum ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc issue::linear::schema_contract::overlapping_statuses_deduplicate_in_order ===
+
+running 1 test
+test issue::linear::schema_contract::overlapping_statuses_deduplicate_in_order ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc issue::linear::schema_contract::parse_selection_handles_nesting_and_reports_unknown_fields ===
+
+running 1 test
+test issue::linear::schema_contract::parse_selection_handles_nesting_and_reports_unknown_fields ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc issue::linear::schema_contract::recorded_issue_type_has_no_assignees_field ===
+
+running 1 test
+test issue::linear::schema_contract::recorded_issue_type_has_no_assignees_field ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc issue::linear::schema_contract::state_type_strings_are_recorded_linear_types ===
+
+running 1 test
+test issue::linear::schema_contract::state_type_strings_are_recorded_linear_types ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc issue::linear::schema_contract::team_scope_and_assignee_me_join_as_arguments ===
+
+running 1 test
+test issue::linear::schema_contract::team_scope_and_assignee_me_join_as_arguments ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc issue::linear::schema_contract::unfiltered_list_query_is_well_formed ===
+
+running 1 test
+test issue::linear::schema_contract::unfiltered_list_query_is_well_formed ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc issue::linear::schema_contract::user_controlled_identifiers_cannot_break_out_of_the_literal ===
+
+running 1 test
+test issue::linear::schema_contract::user_controlled_identifiers_cannot_break_out_of_the_literal ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc issue::linear::tests::constructor_admits_official_linear_endpoint ===
+
+running 1 test
+test issue::linear::tests::constructor_admits_official_linear_endpoint ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc issue::linear::tests::escape_graphql_str_neutralizes_quote_backslash_newline_tab ===
+
+running 1 test
+test issue::linear::tests::escape_graphql_str_neutralizes_quote_backslash_newline_tab ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc issue::linear::tests::issue_to_domain_maps_all_fields ===
+
+running 1 test
+test issue::linear::tests::issue_to_domain_maps_all_fields ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc issue::linear::tests::issue_to_domain_rejects_provider_identity_or_url_before_returning ===
+
+running 1 test
+test issue::linear::tests::issue_to_domain_rejects_provider_identity_or_url_before_returning ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc issue::linear::tests::issue_to_domain_tolerates_missing_optionals ===
+
+running 1 test
+test issue::linear::tests::issue_to_domain_tolerates_missing_optionals ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc issue::linear::tests::map_state_covers_all_types_and_fallback ===
+
+running 1 test
+test issue::linear::tests::map_state_covers_all_types_and_fallback ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc issue::linear::tests::parse_updated_at_valid_and_invalid ===
+
+running 1 test
+test issue::linear::tests::parse_updated_at_valid_and_invalid ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc issue::linear::tests::priority_maps_and_round_trips ===
+
+running 1 test
+test issue::linear::tests::priority_maps_and_round_trips ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc issue::linear::tests::update_status_escapes_provider_state_id_before_write ===
+
+running 1 test
+test issue::linear::tests::update_status_escapes_provider_state_id_before_write ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.01s
+
+
+=== svc issue::linear::tests::update_status_uses_one_budget_across_linear_requests ===
+
+running 1 test
+test issue::linear::tests::update_status_uses_one_budget_across_linear_requests ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc issue::linear::tests::workflow_state_id_is_admitted_and_escaped_before_mutation ===
+
+running 1 test
+test issue::linear::tests::workflow_state_id_is_admitted_and_escaped_before_mutation ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc issue::spec::bare_id_routes_to_the_only_backend ===
+
+running 1 test
+test issue::spec::bare_id_routes_to_the_only_backend ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc issue::spec::bare_id_with_two_backends_routes_nowhere ===
+
+running 1 test
+test issue::spec::bare_id_with_two_backends_routes_nowhere ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc issue::spec::builds_one_backend_per_active_provider ===
+
+running 1 test
+test issue::spec::builds_one_backend_per_active_provider ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.10s
+
+
+=== svc issue::spec::cache_boundary_rejects_cross_provider_and_malformed_ids ===
+
+running 1 test
+test issue::spec::cache_boundary_rejects_cross_provider_and_malformed_ids ... 
+thread 'issue::spec::cache_boundary_rejects_cross_provider_and_malformed_ids' (239566) panicked at crates/thegn-svc/src/issue/mod.rs:1056:10:
+called `Result::unwrap()` on an `Err` value: Error("missing field `updated_at_ms`", line: 0, column: 0)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    issue::spec::cache_boundary_rejects_cross_provider_and_malformed_ids
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc issue::spec::dispatch_by_id_prefix ===
+
+running 1 test
+test issue::spec::dispatch_by_id_prefix ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.10s
+
+
+=== svc issue::spec::duplicate_provider_ids_keep_the_first_account_for_mutations ===
+
+running 1 test
+test issue::spec::duplicate_provider_ids_keep_the_first_account_for_mutations ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc issue::spec::id_miss_dedupes_repeated_providers ===
+
+running 1 test
+test issue::spec::id_miss_dedupes_repeated_providers ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc issue::spec::id_miss_message_names_the_form_and_the_providers ===
+
+running 1 test
+test issue::spec::id_miss_message_names_the_form_and_the_providers ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc issue::spec::malformed_control_id_reaches_no_fake_provider_effect ===
+
+running 1 test
+test issue::spec::malformed_control_id_reaches_no_fake_provider_effect ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc issue::spec::multiple_accounts_of_one_provider_each_build_a_backend ===
+
+running 1 test
+test issue::spec::multiple_accounts_of_one_provider_each_build_a_backend ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc issue::spec::parse_due_date_ms_handles_date_only_and_rfc3339 ===
+
+running 1 test
+test issue::spec::parse_due_date_ms_handles_date_only_and_rfc3339 ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc issue::spec::plugin_identity_envelope_is_bounded_before_routing ===
+
+running 1 test
+test issue::spec::plugin_identity_envelope_is_bounded_before_routing ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc issue::spec::plugin_namespace_routes_by_complete_registered_prefix ===
+
+running 1 test
+test issue::spec::plugin_namespace_routes_by_complete_registered_prefix ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc issue::spec::single_backend_does_not_fallback_foreign_namespace ===
+
+running 1 test
+test issue::spec::single_backend_does_not_fallback_foreign_namespace ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc issue::spec::single_provider_back_compat ===
+
+running 1 test
+test issue::spec::single_provider_back_compat ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc issue::spec::unconfigured_router_is_empty ===
+
+running 1 test
+test issue::spec::unconfigured_router_is_empty ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc plugin::provider::tests::issue_ops_round_trip_through_a_scripted_plugin ===
+
+running 1 test
+test plugin::provider::tests::issue_ops_round_trip_through_a_scripted_plugin ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.01s
+
+
+=== svc plugin::provider::tests::late_and_unknown_responses_are_reported_unroutable ===
+
+running 1 test
+test plugin::provider::tests::late_and_unknown_responses_are_reported_unroutable ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc plugin::provider::tests::omitted_caps_refuse_optional_ops_without_a_bridge_round_trip ===
+
+running 1 test
+test plugin::provider::tests::omitted_caps_refuse_optional_ops_without_a_bridge_round_trip ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc plugin::provider::tests::plugin_response_identity_must_match_namespace_and_opaque_fields ===
+
+running 1 test
+test plugin::provider::tests::plugin_response_identity_must_match_namespace_and_opaque_fields ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc plugin::provider::tests::resident_eof_fails_pending_calls_without_waiting_for_rpc_deadline ===
+
+running 1 test
+test plugin::provider::tests::resident_eof_fails_pending_calls_without_waiting_for_rpc_deadline ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.03s
+
+
+=== svc plugin::provider::tests::resident_final_reply_before_exit_is_delivered_and_late_call_is_closed ===
+
+running 1 test
+test plugin::provider::tests::resident_final_reply_before_exit_is_delivered_and_late_call_is_closed ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.01s
+
+
+=== svc plugin::provider::tests::resident_old_session_cannot_route_into_replacement_bridge ===
+
+running 1 test
+test plugin::provider::tests::resident_old_session_cannot_route_into_replacement_bridge ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.00s
+
+
+=== svc plugin::provider::tests::timeout_and_dead_session_degrade_to_errors ===
+
+running 1 test
+test plugin::provider::tests::timeout_and_dead_session_degrade_to_errors ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out; finished in 0.30s
+
+
+=== host daemon::service::tests::issue_verbs_are_unimplemented_without_a_configured_tracker ===
+
+running 1 test
+test daemon::service::tests::issue_verbs_are_unimplemented_without_a_configured_tracker ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3399 filtered out; finished in 0.05s
+
+
+=== host hydrate::tests::tracker_cache_hydration_discards_malformed_identities_before_panel_use ===
+
+running 1 test
+test hydrate::tests::tracker_cache_hydration_discards_malformed_identities_before_panel_use ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3399 filtered out; finished in 0.05s
+
+
+=== host hydrate::tests::tracker_diff_emits_status_changes_and_blocker_resolved_once ===
+
+running 1 test
+test hydrate::tests::tracker_diff_emits_status_changes_and_blocker_resolved_once ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3399 filtered out; finished in 0.00s
+

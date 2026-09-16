@@ -1,0 +1,16 @@
+{
+  "source": "759cd1ad252cb131c87cf9078923c31203cdfeb5",
+  "exit_code": 0,
+  "at_utc": "2026-09-16T00:00:40.577813+00:00",
+  "build_receipt": "/tmp/thegn-maintenance08-native-redirect-20260915.json",
+  "artifacts": {
+    "svc": {
+      "path": "/tmp/thegn-maintenance08-native-redirect-binaries-20260915/svc-tests",
+      "binary_sha256": "a6ebfea72e7435f1b4ee9c2e02cc1c57cda347401ff291907e7f550e2717e2e3",
+      "depfile_sha256": "5a311535638d7ed26a27111a183bea1f4d0ab55f486fb7b97b41d792150772cc",
+      "compiler_artifact_fresh": false,
+      "manifest_dir": "/tmp/thegn-maintenance-07-combined-20260915/crates/thegn-svc",
+      "package_id": "path+file:///tmp/thegn-maintenance-07-combined-20260915/crates/thegn-svc#0.1.0-alpha.2"
+    }
+  }
+}

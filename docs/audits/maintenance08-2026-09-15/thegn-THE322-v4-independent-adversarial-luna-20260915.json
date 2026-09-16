@@ -1,0 +1,61 @@
+{
+  "issue": "THE-322",
+  "reviewer": "Luna high independent adversarial source review",
+  "date": "2026-09-15",
+  "verdict": "approved-scoped-integrated-source",
+  "source_only": true,
+  "baseline_commit": "3f365bfe56a7577dd8e051c56f5f0a4e81ade02e",
+  "private_candidate_commit": "e93821e3e4983e96d886e9f7aadab1150ba19304",
+  "private_candidate_tree": "4814b369ff6d9e5963e737bd7d2288d87a98d61c",
+  "integrated_commit": "7ef9c3c6c0ab5637fc913e1b1b94a0d6a799cfa0",
+  "integrated_tree": "32c1ebc922c7f35bfee7bbc7c048d6ac35553a0b",
+  "operations_not_run": [
+    "cargo",
+    "build",
+    "test execution",
+    "native/provider execution",
+    "authenticated service",
+    "canonical mutation",
+    "Linear mutation"
+  ],
+  "reviewed_areas": {
+    "provider_identity_admission": "pass",
+    "github_effective_authority_before_subprocess": "pass",
+    "plugin_namespace_and_opaque_key_routing": "pass",
+    "actual_control_router_roundtrip": "pass",
+    "kaneo_unified_api_path_and_origin_join": "pass"
+  },
+  "findings": [],
+  "coverage_note": {
+    "severity": "nonblocking",
+    "claim": "Kaneo has separate api_path encoding and shared HTTP base-path tests, but no single fake-request fixture combining a non-root Kaneo base path with Unicode/query-bearing endpoint.",
+    "reason": "Source call graph routes all Kaneo requests through api_path and the shared URL join checks the admitted origin prefix; no source defect was found."
+  },
+  "scope_limits": [
+    "THE-321 owns shared HTTP transport limits and diagnostics",
+    "THE-314 owns gh subprocess resource limits",
+    "THE-324 owns account/generation authority"
+  ],
+  "input_hashes": {
+    "primary_v3_review": "2120c6a35415521a2a2204e542704cfd0890694889473d0e576f4caccb956817",
+    "candidate_v4_report": "a7d794d609ba992a573ac55e630c0db1db794a43eb6998763e69236d1a158857",
+    "approved_plan": "549382ff3b90df0e789bf8c86b0fa3c94e3c6b96276b774099da33f77e90ae6c",
+    "investigation_plan_json": "5276b22d5e3c778e3bd5a89dcd49dc9f89222b0fac712720514ecbd73f7690ce",
+    "investigation_plan_markdown": "628a04a8819481f04f3ebe721d0300f3e6eced9269e43593f5ef83069f670f0b"
+  },
+  "integrated_relevant_file_sha256": {
+    "crates/thegn-host/src/plugin_providers.rs": "154bed712590d6e694e7a28f24502b03928c5df0c6f987e0e3c78ba986c3b445",
+    "crates/thegn-svc/src/issue/github.rs": "e2105b528cfade9b254a2c9226a46bc56f64d0f7bab503257b9d07de2dd087ff",
+    "crates/thegn-svc/src/issue/identity.rs": "8e2355d1b2743eca252c2a0fd77f3b6f866c28329d29316143d1f27ded5e00a0",
+    "crates/thegn-svc/src/issue/jira.rs": "909c89c5b8f2ffc1347aaf3e578ca789e238249b8936b46915221b0f56ddd1fa",
+    "crates/thegn-svc/src/issue/kaneo.rs": "0992e8e4ea0ee62889793f7d31faeae14018a14a6fbac6ac0a0e1d2de0133d7b",
+    "crates/thegn-svc/src/issue/mod.rs": "a5e24e75a19d7887069335313c4ddad0bbfa2755e820204ec007709e68cad13c",
+    "crates/thegn-svc/src/plugin/provider.rs": "01b5edf3e86055084e32d6f1b3b7a4742bb7c1a7b39731c8028fb9d9ed7d4628",
+    "crates/thegn-svc/src/control/client.rs": "a7b4cebacef91529af4fa6ecb7e3193855df0c424b28c7f8101a9348eb204542",
+    "crates/thegn-svc/src/control/tests.rs": "da5a6f88fb75fc3fa109c1747c887c5905c604837fbe3027dfb3123fa495d9aa"
+  },
+  "source_checks": {
+    "git_diff_check": "pass for reviewed THE-322 paths against baseline"
+  }
+}
+

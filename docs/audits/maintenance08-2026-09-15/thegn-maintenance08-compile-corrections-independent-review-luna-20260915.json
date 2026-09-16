@@ -1,0 +1,36 @@
+{
+  "task": "THE-321/THE-322 combined compile-correction independent source review",
+  "reviewer": "luna_sort_review",
+  "candidate": "/tmp/thegn-maintenance08-combined-20260915",
+  "base": "cf978191",
+  "commit": "7a36ab0316e050a3056e72eabb8c44939306d326",
+  "tree": "6166d6b5bab341157244e782122c7652e712b635",
+  "verdict": "approve_corrected_delta_for_warm_compile",
+  "blockers": [],
+  "delta_files": {
+    "crates/thegn-svc/src/issue/jira.rs": "69abd007d02ab850415c6a82fe59bc8b71b30479646bbc017caeea147df12fcf",
+    "crates/thegn-svc/src/issue/kaneo.rs": "e444e2f124b7bced1e4d68fd01829062363341b601dfb05640a9cc95ef482ca3"
+  },
+  "diagnostics": {
+    "path": "/tmp/thegn-maintenance08-clippy-20260915.log",
+    "sha256": "7ae67373510909388456236b6a6e646c0828104431ed4f50626458adae65f573",
+    "pre_fix_errors_addressed": [
+      "JiraBackend lacked the base_url field used by all browse conversion call sites.",
+      "Kaneo list_issues_with_op was placed inside the IssueBackend trait impl instead of an inherent impl.",
+      "Kaneo board fixture referenced validate_issue_identity at the crate root instead of crate::issue::validate_issue_identity."
+    ]
+  },
+  "review": [
+    "JiraBackend stores the constructor base_url and initializes it in the sole backend struct literal; all five existing conversion call sites now have a valid field reference.",
+    "Kaneo list_issues_with_op is now an inherent async helper and the IssueBackend impl calls it from list_issues and search; no duplicate or trait declaration remains.",
+    "The Kaneo fixture uses the module-qualified identity validator already used by sibling provider tests.",
+    "The diff is limited to the two reported provider files and is whitespace-clean."
+  ],
+  "not_run": [
+    "Cargo",
+    "build",
+    "tests",
+    "native/provider execution",
+    "canonical/main mutation"
+  ]
+}

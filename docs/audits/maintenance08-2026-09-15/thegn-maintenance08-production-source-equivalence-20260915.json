@@ -1,0 +1,21 @@
+{
+  "source": "759cd1ad252cb131c87cf9078923c31203cdfeb5",
+  "production_validated_at": "4256d2372057a02a1f6fea96cdc4ce8388911178",
+  "at_utc": "2026-09-15T23:59:57.141328+00:00",
+  "only_changed_files": [
+    "crates/thegn-svc/src/issue/http.rs",
+    "crates/thegn-svc/src/issue/mod.rs"
+  ],
+  "checks": {
+    "crates/thegn-svc/src/issue/http.rs": {
+      "production_prefix_sha256": "61bd919ab28069549837eded54104fa2a76000ba48c182c3b20dfaf4e4da9746",
+      "marker": "#[cfg(test)]\nmod tests {",
+      "unchanged": true
+    },
+    "crates/thegn-svc/src/issue/mod.rs": {
+      "production_prefix_sha256": "624c603dec03ffe76e49c0f88e9505fe2654e888a8e5b6a164363be012220223",
+      "marker": "#[cfg(test)]\nmod spec {",
+      "unchanged": true
+    }
+  }
+}

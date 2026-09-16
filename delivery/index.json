@@ -596,7 +596,7 @@
     },
     {
       "change": "centralize-tracker-http-policy",
-      "lifecycle": "active",
+      "lifecycle": "delivered-awaiting-archive",
       "disposition": "alpha-delivery",
       "owners": [
         {
@@ -604,7 +604,8 @@
           "project": "Alpha Reliability & State Compatibility"
         }
       ],
-      "summary": "Centralize authenticated Linear, Jira, and Kaneo HTTP policy with shared operation budgets, origin pinning, bounded bodies, and redirect/encoding refusal."
+      "summary": "Centralize authenticated Linear, Jira, and Kaneo HTTP policy with shared operation budgets, origin pinning, bounded bodies, and redirect/encoding refusal. Reviewed and verified with 107 distinct native tests and a 24-case redirect supplement; source/artifact mapping and limitations are in the maintenance08 audit.",
+      "delivered_at": "2026-09-15"
     },
     {
       "change": "complete-devcontainer-support",
@@ -1186,7 +1187,7 @@
     },
     {
       "change": "validate-tracker-identifiers",
-      "lifecycle": "active",
+      "lifecycle": "delivered-awaiting-archive",
       "disposition": "verification-gated",
       "owners": [
         {
@@ -1194,7 +1195,8 @@
           "project": "Client API & Remote Access"
         }
       ],
-      "summary": "Admit bounded tracker identities before provider paths, options, caches, and control transport."
+      "summary": "Admit bounded tracker identities before provider paths, options, caches, and control transport. Reviewed and verified with 107 distinct native tests and a 24-case redirect supplement; source/artifact mapping and limitations are in the maintenance08 audit.",
+      "delivered_at": "2026-09-15"
     },
     {
       "change": "verify-gate-workspace",

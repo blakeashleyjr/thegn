@@ -1,0 +1,67 @@
+{
+  "source": "7ef9c3c6c0ab5637fc913e1b1b94a0d6a799cfa0",
+  "cpu_max": "100000 100000",
+  "at_utc": "2026-09-15T22:44:23.264167+00:00",
+  "checks": [
+    {
+      "name": "format",
+      "command": [
+        "rustfmt",
+        "--edition",
+        "2024",
+        "--check",
+        "crates/thegn-host/src/daemon/service.rs",
+        "crates/thegn-host/src/hydrate_tracker.rs",
+        "crates/thegn-host/src/plugin_providers.rs",
+        "crates/thegn-svc/src/conformance.rs",
+        "crates/thegn-svc/src/control/client.rs",
+        "crates/thegn-svc/src/control/http.rs",
+        "crates/thegn-svc/src/control/tests.rs",
+        "crates/thegn-svc/src/issue/github.rs",
+        "crates/thegn-svc/src/issue/http.rs",
+        "crates/thegn-svc/src/issue/identity.rs",
+        "crates/thegn-svc/src/issue/jira.rs",
+        "crates/thegn-svc/src/issue/kaneo.rs",
+        "crates/thegn-svc/src/issue/linear.rs",
+        "crates/thegn-svc/src/issue/mod.rs",
+        "crates/thegn-svc/src/plugin/provider.rs"
+      ],
+      "exit_code": 0,
+      "log": "/tmp/thegn-maintenance08-source-format-20260915.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "name": "ratchets",
+      "command": [
+        "just",
+        "ratchets"
+      ],
+      "exit_code": 1,
+      "log": "/tmp/thegn-maintenance08-source-ratchets-20260915.log",
+      "sha256": "76cb68cf9b6403fd0f3ce58a52841a002920a393b2cf28bc6e9bc906298caf60"
+    },
+    {
+      "name": "spec",
+      "command": [
+        "just",
+        "openspec-validate"
+      ],
+      "exit_code": 0,
+      "log": "/tmp/thegn-maintenance08-source-spec-20260915.log",
+      "sha256": "34876c88300b7e18e8e263bd8000faef1f9d9778d6ccae718bd596df5b22caa1"
+    },
+    {
+      "name": "diff",
+      "command": [
+        "git",
+        "diff",
+        "--check",
+        "fadd7164",
+        "7ef9c3c6c0ab5637fc913e1b1b94a0d6a799cfa0"
+      ],
+      "exit_code": 0,
+      "log": "/tmp/thegn-maintenance08-source-diff-20260915.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  ]
+}

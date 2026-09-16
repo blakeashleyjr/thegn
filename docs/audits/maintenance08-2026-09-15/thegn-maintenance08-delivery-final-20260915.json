@@ -1,0 +1,71 @@
+{
+  "source": "759cd1ad252cb131c87cf9078923c31203cdfeb5",
+  "at_utc": "2026-09-16T00:04:30.074067+00:00",
+  "includes_staged_delivery_docs": true,
+  "cpu_max": "100000 100000",
+  "checks": [
+    {
+      "name": "format",
+      "command": [
+        "rustfmt",
+        "--edition",
+        "2024",
+        "--check",
+        "crates/thegn-host/src/daemon/service.rs",
+        "crates/thegn-host/src/hydrate_tests.rs",
+        "crates/thegn-host/src/hydrate_tracker.rs",
+        "crates/thegn-host/src/plugin_providers.rs",
+        "crates/thegn-svc/src/conformance.rs",
+        "crates/thegn-svc/src/control/client.rs",
+        "crates/thegn-svc/src/control/http.rs",
+        "crates/thegn-svc/src/control/tests.rs",
+        "crates/thegn-svc/src/issue/github.rs",
+        "crates/thegn-svc/src/issue/http.rs",
+        "crates/thegn-svc/src/issue/identity.rs",
+        "crates/thegn-svc/src/issue/jira.rs",
+        "crates/thegn-svc/src/issue/kaneo.rs",
+        "crates/thegn-svc/src/issue/linear.rs",
+        "crates/thegn-svc/src/issue/mod.rs",
+        "crates/thegn-svc/src/plugin/provider.rs"
+      ],
+      "exit_code": 0,
+      "log": "/tmp/thegn-maintenance08-delivery-final-format-20260915.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "name": "ratchets",
+      "command": [
+        "just",
+        "ratchets"
+      ],
+      "exit_code": 1,
+      "log": "/tmp/thegn-maintenance08-delivery-final-ratchets-20260915.log",
+      "sha256": "788ec3f7f6461711d82769eead5cd389fb7da12452439b1eaec9ae8ec9ff0495"
+    },
+    {
+      "name": "spec",
+      "command": [
+        "just",
+        "openspec-validate"
+      ],
+      "exit_code": 0,
+      "log": "/tmp/thegn-maintenance08-delivery-final-spec-20260915.log",
+      "sha256": "34876c88300b7e18e8e263bd8000faef1f9d9778d6ccae718bd596df5b22caa1"
+    },
+    {
+      "name": "diff",
+      "command": [
+        "git",
+        "diff",
+        "--cached",
+        "--check",
+        "--",
+        ".",
+        ":(exclude)docs/audits/maintenance08-2026-09-15/**"
+      ],
+      "exit_code": 0,
+      "log": "/tmp/thegn-maintenance08-delivery-final-diff-20260915.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  ]
+}
