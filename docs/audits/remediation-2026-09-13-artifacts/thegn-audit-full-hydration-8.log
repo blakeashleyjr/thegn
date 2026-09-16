@@ -1,0 +1,132 @@
+
+running 1 test
+test perf_workloads::hydration::controlled_full_hydration_workload ... [
+  {
+    "fixture_helper_present": false,
+    "helper_invocations_total": 0,
+    "samples": [
+      {
+        "child_cpu_ns": 9577347,
+        "parent_cpu_ns": 82938680,
+        "sample": 0,
+        "wall_us": 157662
+      },
+      {
+        "child_cpu_ns": 9879494,
+        "parent_cpu_ns": 63021374,
+        "sample": 1,
+        "wall_us": 80285
+      },
+      {
+        "child_cpu_ns": 9771629,
+        "parent_cpu_ns": 61635675,
+        "sample": 2,
+        "wall_us": 80313
+      },
+      {
+        "child_cpu_ns": 9989815,
+        "parent_cpu_ns": 64160704,
+        "sample": 3,
+        "wall_us": 104330
+      },
+      {
+        "child_cpu_ns": 10188463,
+        "parent_cpu_ns": 62317481,
+        "sample": 4,
+        "wall_us": 79702
+      },
+      {
+        "child_cpu_ns": 9855277,
+        "parent_cpu_ns": 62384492,
+        "sample": 5,
+        "wall_us": 79230
+      },
+      {
+        "child_cpu_ns": 10297843,
+        "parent_cpu_ns": 61787872,
+        "sample": 6,
+        "wall_us": 78280
+      },
+      {
+        "child_cpu_ns": 9700261,
+        "parent_cpu_ns": 63402967,
+        "sample": 7,
+        "wall_us": 99790
+      },
+      {
+        "child_cpu_ns": 9767053,
+        "parent_cpu_ns": 61943487,
+        "sample": 8,
+        "wall_us": 78401
+      }
+    ],
+    "scope": "actual build_model, 64 tracked files per worktree, one dirty file, no providers, no terminal; helper is an immediate local fixture; first sample may be cold",
+    "worktrees": 8
+  },
+  {
+    "fixture_helper_present": true,
+    "helper_invocations_total": 9,
+    "samples": [
+      {
+        "child_cpu_ns": 9844976,
+        "parent_cpu_ns": 63511704,
+        "sample": 0,
+        "wall_us": 90813
+      },
+      {
+        "child_cpu_ns": 9557442,
+        "parent_cpu_ns": 62383135,
+        "sample": 1,
+        "wall_us": 88774
+      },
+      {
+        "child_cpu_ns": 9525244,
+        "parent_cpu_ns": 64745710,
+        "sample": 2,
+        "wall_us": 112075
+      },
+      {
+        "child_cpu_ns": 10631597,
+        "parent_cpu_ns": 63402151,
+        "sample": 3,
+        "wall_us": 92824
+      },
+      {
+        "child_cpu_ns": 9894310,
+        "parent_cpu_ns": 62135743,
+        "sample": 4,
+        "wall_us": 89148
+      },
+      {
+        "child_cpu_ns": 10434406,
+        "parent_cpu_ns": 65063101,
+        "sample": 5,
+        "wall_us": 92546
+      },
+      {
+        "child_cpu_ns": 9294778,
+        "parent_cpu_ns": 64047499,
+        "sample": 6,
+        "wall_us": 109602
+      },
+      {
+        "child_cpu_ns": 10175988,
+        "parent_cpu_ns": 63038477,
+        "sample": 7,
+        "wall_us": 89578
+      },
+      {
+        "child_cpu_ns": 10513880,
+        "parent_cpu_ns": 62968056,
+        "sample": 8,
+        "wall_us": 89895
+      }
+    ],
+    "scope": "actual build_model, 64 tracked files per worktree, one dirty file, no providers, no terminal; helper is an immediate local fixture; first sample may be cold",
+    "worktrees": 8
+  }
+]
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3284 filtered out; finished in 1.99s
+

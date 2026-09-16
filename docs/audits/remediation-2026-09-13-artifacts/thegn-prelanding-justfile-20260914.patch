@@ -1,0 +1,16 @@
+diff --git a/justfile b/justfile
+index 7f967cc5..21db6b9a 100644
+--- a/justfile
++++ b/justfile
+@@ -342,8 +342,10 @@ perf: bench bench-idle bench-micro
+ # feature). SIGUSR2 toggles a flamegraph capture written to
+ # $XDG_STATE_HOME/thegn/profiles/. Profiles the live process (sidesteps
+ # ptrace_scope=1, which blocks external perf/gdb attach).
++# An empty override disables wrappers from both the dev shell and Cargo
++# config, so launching the live build cannot depend on an sccache daemon.
+ release-profiling:
+-    cargo build --release --features profiling -p thegn-host
++    RUSTC_WRAPPER='' cargo build --release --features profiling -p thegn-host
+ 
+ # Launch thegn under the profiler and print how to drive it. Run from a real
+ # terminal. `kill -USR2 <pid>` once to start sampling, again to dump.

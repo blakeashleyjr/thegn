@@ -1,0 +1,842 @@
+[
+  {
+    "test": "backoff::tests::classify_falls_back_to_status_code",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.02,
+    "log": "/tmp/thegn-batch02-core-final-results/backoff__tests__classify_falls_back_to_status_code.log"
+  },
+  {
+    "test": "backoff::tests::classify_from_reason_string",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.019,
+    "log": "/tmp/thegn-batch02-core-final-results/backoff__tests__classify_from_reason_string.log"
+  },
+  {
+    "test": "backoff::tests::every_config_arm_is_selected",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.019,
+    "log": "/tmp/thegn-batch02-core-final-results/backoff__tests__every_config_arm_is_selected.log"
+  },
+  {
+    "test": "backoff::tests::exponential_ramp",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.019,
+    "log": "/tmp/thegn-batch02-core-final-results/backoff__tests__exponential_ramp.log"
+  },
+  {
+    "test": "backoff::tests::first_failure_uses_initial",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-final-results/backoff__tests__first_failure_uses_initial.log"
+  },
+  {
+    "test": "backoff::tests::fixed_multiplier_stays_at_initial_until_ceiling_jump",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-final-results/backoff__tests__fixed_multiplier_stays_at_initial_until_ceiling_jump.log"
+  },
+  {
+    "test": "backoff::tests::jitter_is_bounded_and_positive",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-final-results/backoff__tests__jitter_is_bounded_and_positive.log"
+  },
+  {
+    "test": "backoff::tests::jitter_noop_only_when_factor_is_zero",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-final-results/backoff__tests__jitter_noop_only_when_factor_is_zero.log"
+  },
+  {
+    "test": "backoff::tests::jitter_spread_is_seconds_scale_not_nanoseconds",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-final-results/backoff__tests__jitter_spread_is_seconds_scale_not_nanoseconds.log"
+  },
+  {
+    "test": "backoff::tests::kind_staleness",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-final-results/backoff__tests__kind_staleness.log"
+  },
+  {
+    "test": "backoff::tests::oversized_backoff_jitter_never_wraps_or_panics",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.01,
+    "log": "/tmp/thegn-batch02-core-final-results/backoff__tests__oversized_backoff_jitter_never_wraps_or_panics.log"
+  },
+  {
+    "test": "backoff::tests::ramp_clamps_at_ceiling_before_third_failure",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-final-results/backoff__tests__ramp_clamps_at_ceiling_before_third_failure.log"
+  },
+  {
+    "test": "backoff::tests::three_failures_jumps_to_ceiling",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-final-results/backoff__tests__three_failures_jumps_to_ceiling.log"
+  },
+  {
+    "test": "config_duration::tests::cached_base_diagnostics_follow_source_changes",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.044,
+    "log": "/tmp/thegn-batch02-core-final-results/config_duration__tests__cached_base_diagnostics_follow_source_changes.log"
+  },
+  {
+    "test": "config_duration::tests::defaults_and_zero_inheritance_have_no_duration_errors",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.12,
+    "log": "/tmp/thegn-batch02-core-final-results/config_duration__tests__defaults_and_zero_inheritance_have_no_duration_errors.log"
+  },
+  {
+    "test": "config_duration::tests::direct_environment_checks_match_complete_schema_policy",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.042,
+    "log": "/tmp/thegn-batch02-core-final-results/config_duration__tests__direct_environment_checks_match_complete_schema_policy.log"
+  },
+  {
+    "test": "config_duration::tests::duration_write_rejection_happens_before_existing_or_missing_file_changes",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.112,
+    "log": "/tmp/thegn-batch02-core-final-results/config_duration__tests__duration_write_rejection_happens_before_existing_or_missing_file_changes.log"
+  },
+  {
+    "test": "config_duration::tests::every_shared_cadence_range_matches_schema_and_strict_validation",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.92,
+    "log": "/tmp/thegn-batch02-core-final-results/config_duration__tests__every_shared_cadence_range_matches_schema_and_strict_validation.log"
+  },
+  {
+    "test": "config_duration::tests::floating_duration_is_finite_and_millisecond_bounds_use_milliseconds",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.058,
+    "log": "/tmp/thegn-batch02-core-final-results/config_duration__tests__floating_duration_is_finite_and_millisecond_bounds_use_milliseconds.log"
+  },
+  {
+    "test": "config_duration::tests::invalid_env_duration_cannot_discard_base_security_settings",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.028,
+    "log": "/tmp/thegn-batch02-core-final-results/config_duration__tests__invalid_env_duration_cannot_discard_base_security_settings.log"
+  },
+  {
+    "test": "config_duration::tests::invalid_env_duration_retains_valid_explicit_security_overrides",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.029,
+    "log": "/tmp/thegn-batch02-core-final-results/config_duration__tests__invalid_env_duration_retains_valid_explicit_security_overrides.log"
+  },
+  {
+    "test": "config_duration::tests::invalid_explicit_overlay_is_atomic_and_unrelated_repair_is_allowed",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.123,
+    "log": "/tmp/thegn-batch02-core-final-results/config_duration__tests__invalid_explicit_overlay_is_atomic_and_unrelated_repair_is_allowed.log"
+  },
+  {
+    "test": "config_duration::tests::permissive_base_duration_error_retains_security_policy",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.034,
+    "log": "/tmp/thegn-batch02-core-final-results/config_duration__tests__permissive_base_duration_error_retains_security_policy.log"
+  },
+  {
+    "test": "config_duration::tests::strict_duration_aliases_cannot_bypass_numeric_admission",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.228,
+    "log": "/tmp/thegn-batch02-core-final-results/config_duration__tests__strict_duration_aliases_cannot_bypass_numeric_admission.log"
+  },
+  {
+    "test": "config_duration::tests::unsigned_programmatic_extremes_are_diagnosed_without_narrowing",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.039,
+    "log": "/tmp/thegn-batch02-core-final-results/config_duration__tests__unsigned_programmatic_extremes_are_diagnosed_without_narrowing.log"
+  },
+  {
+    "test": "config_write::tests::read_doc_does_not_treat_an_unreadable_file_as_empty",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.035,
+    "log": "/tmp/thegn-batch02-core-final-results/config_write__tests__read_doc_does_not_treat_an_unreadable_file_as_empty.log"
+  },
+  {
+    "test": "config_write::tests::repo_select_writes_only_a_string",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.052,
+    "log": "/tmp/thegn-batch02-core-final-results/config_write__tests__repo_select_writes_only_a_string.log"
+  },
+  {
+    "test": "config_write::tests::set_key_creates_nested_tables",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.047,
+    "log": "/tmp/thegn-batch02-core-final-results/config_write__tests__set_key_creates_nested_tables.log"
+  },
+  {
+    "test": "config_write::tests::set_key_infers_scalar_types_and_config_stays_parseable",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.152,
+    "log": "/tmp/thegn-batch02-core-final-results/config_write__tests__set_key_infers_scalar_types_and_config_stays_parseable.log"
+  },
+  {
+    "test": "config_write::tests::set_key_keeps_bracketed_prose_as_a_string",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.068,
+    "log": "/tmp/thegn-batch02-core-final-results/config_write__tests__set_key_keeps_bracketed_prose_as_a_string.log"
+  },
+  {
+    "test": "config_write::tests::set_key_writes_arrays_and_inline_tables",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.071,
+    "log": "/tmp/thegn-batch02-core-final-results/config_write__tests__set_key_writes_arrays_and_inline_tables.log"
+  },
+  {
+    "test": "config_write::tests::set_key_writes_canonical_names_for_legacy_keys",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.073,
+    "log": "/tmp/thegn-batch02-core-final-results/config_write__tests__set_key_writes_canonical_names_for_legacy_keys.log"
+  },
+  {
+    "test": "config_write::tests::set_string_array_round_trips_and_preserves_comments",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.099,
+    "log": "/tmp/thegn-batch02-core-final-results/config_write__tests__set_string_array_round_trips_and_preserves_comments.log"
+  },
+  {
+    "test": "config_write::tests::upsert_forge_writes_kind_and_host",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.042,
+    "log": "/tmp/thegn-batch02-core-final-results/config_write__tests__upsert_forge_writes_kind_and_host.log"
+  },
+  {
+    "test": "config_write::tests::upsert_host_rejects_empty_inputs",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.006,
+    "log": "/tmp/thegn-batch02-core-final-results/config_write__tests__upsert_host_rejects_empty_inputs.log"
+  },
+  {
+    "test": "config_write::tests::upsert_host_writes_reach_and_ssh_and_keeps_siblings",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.11,
+    "log": "/tmp/thegn-batch02-core-final-results/config_write__tests__upsert_host_writes_reach_and_ssh_and_keeps_siblings.log"
+  },
+  {
+    "test": "config_write::tests::upsert_issue_account_appends_updates_and_removes",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.202,
+    "log": "/tmp/thegn-batch02-core-final-results/config_write__tests__upsert_issue_account_appends_updates_and_removes.log"
+  },
+  {
+    "test": "config_write::tests::upsert_issue_account_rejects_empty_name",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-final-results/config_write__tests__upsert_issue_account_rejects_empty_name.log"
+  },
+  {
+    "test": "config_write::tests::upsert_provider_env_round_trips_and_preserves_comments",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.133,
+    "log": "/tmp/thegn-batch02-core-final-results/config_write__tests__upsert_provider_env_round_trips_and_preserves_comments.log"
+  },
+  {
+    "test": "config_write::tests::write_doc_is_atomic_and_leaves_no_tmp",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.046,
+    "log": "/tmp/thegn-batch02-core-final-results/config_write__tests__write_doc_is_atomic_and_leaves_no_tmp.log"
+  },
+  {
+    "test": "custom_cmd::command_tests::alias_and_missing_selection_coverage_uses_the_real_compiler",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-batch02-core-final-results/custom_cmd__command_tests__alias_and_missing_selection_coverage_uses_the_real_compiler.log"
+  },
+  {
+    "test": "custom_cmd::command_tests::changed_commands_are_rejected_before_write_and_unrelated_repairs_remain_possible",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.123,
+    "log": "/tmp/thegn-batch02-core-final-results/custom_cmd__command_tests__changed_commands_are_rejected_before_write_and_unrelated_repairs_remain_possible.log"
+  },
+  {
+    "test": "custom_cmd::command_tests::cumulative_and_quote_amplification_budgets_fail_during_construction",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.023,
+    "log": "/tmp/thegn-batch02-core-final-results/custom_cmd__command_tests__cumulative_and_quote_amplification_budgets_fail_during_construction.log"
+  },
+  {
+    "test": "custom_cmd::command_tests::every_data_family_is_inert_across_modes_and_transport_projections",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 1.235,
+    "log": "/tmp/thegn-batch02-core-final-results/custom_cmd__command_tests__every_data_family_is_inert_across_modes_and_transport_projections.log"
+  },
+  {
+    "test": "custom_cmd::command_tests::invalid_and_oversized_values_fail_without_partial_program",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.053,
+    "log": "/tmp/thegn-batch02-core-final-results/custom_cmd__command_tests__invalid_and_oversized_values_fail_without_partial_program.log"
+  },
+  {
+    "test": "custom_cmd::command_tests::legacy_migration_and_errors_do_not_echo_values",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.01,
+    "log": "/tmp/thegn-batch02-core-final-results/custom_cmd__command_tests__legacy_migration_and_errors_do_not_echo_values.log"
+  },
+  {
+    "test": "custom_cmd::command_tests::raw_requires_both_explicit_policy_and_filter",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-batch02-core-final-results/custom_cmd__command_tests__raw_requires_both_explicit_policy_and_filter.log"
+  },
+  {
+    "test": "custom_cmd::command_tests::shell_contexts_are_conservatively_refused",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-final-results/custom_cmd__command_tests__shell_contexts_are_conservatively_refused.log"
+  },
+  {
+    "test": "custom_cmd::command_tests::strict_validation_rejects_only_the_command_not_config_deserialization",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.056,
+    "log": "/tmp/thegn-batch02-core-final-results/custom_cmd__command_tests__strict_validation_rejects_only_the_command_not_config_deserialization.log"
+  },
+  {
+    "test": "forge::authorship::tests::actual_cli_model_authors_organization_pr_and_never_guesses_namespace",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-final-results/forge__authorship__tests__actual_cli_model_authors_organization_pr_and_never_guesses_namespace.log"
+  },
+  {
+    "test": "forge::authorship::tests::enterprise_host_is_explicit_and_ambiguous_origins_are_refused",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-final-results/forge__authorship__tests__enterprise_host_is_explicit_and_ambiguous_origins_are_refused.log"
+  },
+  {
+    "test": "forge::authorship::tests::legacy_cache_deleted_bot_empty_and_partial_authority_fail_closed",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-final-results/forge__authorship__tests__legacy_cache_deleted_bot_empty_and_partial_authority_fail_closed.log"
+  },
+  {
+    "test": "forge::authorship::tests::stable_ids_bind_account_author_head_pr_and_repository_generations",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.013,
+    "log": "/tmp/thegn-batch02-core-final-results/forge__authorship__tests__stable_ids_bind_account_author_head_pr_and_repository_generations.log"
+  },
+  {
+    "test": "heal::tests::due_table",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.011,
+    "log": "/tmp/thegn-batch02-core-final-results/heal__tests__due_table.log"
+  },
+  {
+    "test": "heal::tests::from_config_filters_and_falls_back",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-final-results/heal__tests__from_config_filters_and_falls_back.log"
+  },
+  {
+    "test": "heal::tests::schedule_grows_then_caps",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-final-results/heal__tests__schedule_grows_then_caps.log"
+  },
+  {
+    "test": "scan_sched::tests::active_cold_is_always_first",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-final-results/scan_sched__tests__active_cold_is_always_first.log"
+  },
+  {
+    "test": "scan_sched::tests::budget_truncates_but_keeps_priority_order",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-final-results/scan_sched__tests__budget_truncates_but_keeps_priority_order.log"
+  },
+  {
+    "test": "scan_sched::tests::empty_input_plans_nothing",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-final-results/scan_sched__tests__empty_input_plans_nothing.log"
+  },
+  {
+    "test": "scan_sched::tests::exactly_at_the_ttl_boundary_is_stale",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.006,
+    "log": "/tmp/thegn-batch02-core-final-results/scan_sched__tests__exactly_at_the_ttl_boundary_is_stale.log"
+  },
+  {
+    "test": "scan_sched::tests::fresh_targets_are_dropped",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-final-results/scan_sched__tests__fresh_targets_are_dropped.log"
+  },
+  {
+    "test": "scan_sched::tests::future_stamps_count_as_fresh",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-final-results/scan_sched__tests__future_stamps_count_as_fresh.log"
+  },
+  {
+    "test": "scan_sched::tests::never_measured_beats_stale",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-final-results/scan_sched__tests__never_measured_beats_stale.log"
+  },
+  {
+    "test": "scan_sched::tests::oldest_first_within_a_class",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-final-results/scan_sched__tests__oldest_first_within_a_class.log"
+  },
+  {
+    "test": "scan_sched::tests::order_is_deterministic_for_equal_stamps",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-final-results/scan_sched__tests__order_is_deterministic_for_equal_stamps.log"
+  },
+  {
+    "test": "scan_sched::tests::orphans_dedupes_repeated_cache_keys",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-final-results/scan_sched__tests__orphans_dedupes_repeated_cache_keys.log"
+  },
+  {
+    "test": "scan_sched::tests::orphans_of_an_empty_live_set_is_everything",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.036,
+    "log": "/tmp/thegn-batch02-core-final-results/scan_sched__tests__orphans_of_an_empty_live_set_is_everything.log"
+  },
+  {
+    "test": "scan_sched::tests::orphans_returns_only_paths_absent_from_live",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.037,
+    "log": "/tmp/thegn-batch02-core-final-results/scan_sched__tests__orphans_returns_only_paths_absent_from_live.log"
+  },
+  {
+    "test": "scan_sched::tests::priority_classes_are_exhaustive_and_ordered",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-final-results/scan_sched__tests__priority_classes_are_exhaustive_and_ordered.log"
+  },
+  {
+    "test": "scan_sched::tests::pump_slots_is_a_quarter_of_the_ttl_and_floored",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-final-results/scan_sched__tests__pump_slots_is_a_quarter_of_the_ttl_and_floored.log"
+  },
+  {
+    "test": "spillover::tests::classification_table",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-final-results/spillover__tests__classification_table.log"
+  },
+  {
+    "test": "spillover::tests::cooldowns_escalate_and_honor_retry_after",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-final-results/spillover__tests__cooldowns_escalate_and_honor_retry_after.log"
+  },
+  {
+    "test": "spillover::tests::kind_round_trips",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-final-results/spillover__tests__kind_round_trips.log"
+  },
+  {
+    "test": "spillover::tests::picker_walks_order_skipping_dead_and_cooling",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-final-results/spillover__tests__picker_walks_order_skipping_dead_and_cooling.log"
+  },
+  {
+    "test": "spillover::tests::spare_claim_rules",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-final-results/spillover__tests__spare_claim_rules.log"
+  },
+  {
+    "test": "time_policy::tests::cache_rollback_and_large_ttl_do_not_force_repolling",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-final-results/time_policy__tests__cache_rollback_and_large_ttl_do_not_force_repolling.log"
+  },
+  {
+    "test": "time_policy::tests::cadence_floors_caps_and_units_never_produce_zero",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-final-results/time_policy__tests__cadence_floors_caps_and_units_never_produce_zero.log"
+  },
+  {
+    "test": "time_policy::tests::expiry_quarantines_unknown_provider_time_and_bad_policy",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-final-results/time_policy__tests__expiry_quarantines_unknown_provider_time_and_bad_policy.log"
+  },
+  {
+    "test": "time_policy::tests::fractional_provider_delays_and_elapsed_extremes_are_checked",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-batch02-core-final-results/time_policy__tests__fractional_provider_delays_and_elapsed_extremes_are_checked.log"
+  },
+  {
+    "test": "time_policy::tests::generated_cadences_are_monotone_and_nonzero",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.01,
+    "log": "/tmp/thegn-batch02-core-final-results/time_policy__tests__generated_cadences_are_monotone_and_nonzero.log"
+  },
+  {
+    "test": "time_policy::tests::milliseconds_never_narrow_to_negative_or_disable_a_window",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-final-results/time_policy__tests__milliseconds_never_narrow_to_negative_or_disable_a_window.log"
+  },
+  {
+    "test": "time_policy::tests::provider_deadlines_reject_overflow_and_unsupported_delays",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-batch02-core-final-results/time_policy__tests__provider_deadlines_reject_overflow_and_unsupported_delays.log"
+  },
+  {
+    "test": "time_policy::tests::unknown_or_invalid_age_never_authorizes_destruction",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-final-results/time_policy__tests__unknown_or_invalid_age_never_authorizes_destruction.log"
+  },
+  {
+    "test": "usage::tests::account_helpers_and_peak",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-final-results/usage__tests__account_helpers_and_peak.log"
+  },
+  {
+    "test": "usage::tests::account_rows_carry_home_and_identity",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-final-results/usage__tests__account_rows_carry_home_and_identity.log"
+  },
+  {
+    "test": "usage::tests::antigravity_and_codex_provider_strings_are_sanitized",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-batch02-core-final-results/usage__tests__antigravity_and_codex_provider_strings_are_sanitized.log"
+  },
+  {
+    "test": "usage::tests::antigravity_lenient_parse_with_aliases_and_nesting",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.011,
+    "log": "/tmp/thegn-batch02-core-final-results/usage__tests__antigravity_lenient_parse_with_aliases_and_nesting.log"
+  },
+  {
+    "test": "usage::tests::claude_credentials_extracts_token_and_plan",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-batch02-core-final-results/usage__tests__claude_credentials_extracts_token_and_plan.log"
+  },
+  {
+    "test": "usage::tests::claude_falls_back_to_flat_fields_without_a_limits_array",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.034,
+    "log": "/tmp/thegn-batch02-core-final-results/usage__tests__claude_falls_back_to_flat_fields_without_a_limits_array.log"
+  },
+  {
+    "test": "usage::tests::claude_identity_degrades_field_by_field",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.032,
+    "log": "/tmp/thegn-batch02-core-final-results/usage__tests__claude_identity_degrades_field_by_field.log"
+  },
+  {
+    "test": "usage::tests::claude_identity_parses_and_keys_on_both_uuids",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.013,
+    "log": "/tmp/thegn-batch02-core-final-results/usage__tests__claude_identity_parses_and_keys_on_both_uuids.log"
+  },
+  {
+    "test": "usage::tests::claude_limit_labels_carry_no_control_bytes_and_stay_bounded",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-batch02-core-final-results/usage__tests__claude_limit_labels_carry_no_control_bytes_and_stay_bounded.log"
+  },
+  {
+    "test": "usage::tests::claude_null_windows_are_not_windows",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-batch02-core-final-results/usage__tests__claude_null_windows_are_not_windows.log"
+  },
+  {
+    "test": "usage::tests::claude_parses_the_real_rfc3339_reset_and_limits_array",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-final-results/usage__tests__claude_parses_the_real_rfc3339_reset_and_limits_array.log"
+  },
+  {
+    "test": "usage::tests::claude_usage_maps_windows",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-final-results/usage__tests__claude_usage_maps_windows.log"
+  },
+  {
+    "test": "usage::tests::codex_derives_a_total_only_when_the_harness_omitted_one",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.01,
+    "log": "/tmp/thegn-batch02-core-final-results/usage__tests__codex_derives_a_total_only_when_the_harness_omitted_one.log"
+  },
+  {
+    "test": "usage::tests::codex_none_when_no_ratelimit_lines",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-final-results/usage__tests__codex_none_when_no_ratelimit_lines.log"
+  },
+  {
+    "test": "usage::tests::codex_parses_legacy_resets_in_seconds_and_keeps_last_nonnull",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.01,
+    "log": "/tmp/thegn-batch02-core-final-results/usage__tests__codex_parses_legacy_resets_in_seconds_and_keeps_last_nonnull.log"
+  },
+  {
+    "test": "usage::tests::codex_parses_new_resets_at_form",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-final-results/usage__tests__codex_parses_new_resets_at_form.log"
+  },
+  {
+    "test": "usage::tests::codex_takes_the_last_cumulative_token_total_not_a_sum",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-final-results/usage__tests__codex_takes_the_last_cumulative_token_total_not_a_sum.log"
+  },
+  {
+    "test": "usage::tests::current_run_starts_after_the_last_reset",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-final-results/usage__tests__current_run_starts_after_the_last_reset.log"
+  },
+  {
+    "test": "usage::tests::dedupe_by_identity_keeps_the_most_informative_row",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-final-results/usage__tests__dedupe_by_identity_keeps_the_most_informative_row.log"
+  },
+  {
+    "test": "usage::tests::discover_homes_dedupes_by_path_and_ranks_by_origin",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-final-results/usage__tests__discover_homes_dedupes_by_path_and_ranks_by_origin.log"
+  },
+  {
+    "test": "usage::tests::discover_homes_respects_explicit_config",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-final-results/usage__tests__discover_homes_respects_explicit_config.log"
+  },
+  {
+    "test": "usage::tests::explicit_account_dir_decides_whether_the_default_home_applies",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-final-results/usage__tests__explicit_account_dir_decides_whether_the_default_home_applies.log"
+  },
+  {
+    "test": "usage::tests::fallback_label_uses_the_profile_dir_not_the_generic_leaf",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-batch02-core-final-results/usage__tests__fallback_label_uses_the_profile_dir_not_the_generic_leaf.log"
+  },
+  {
+    "test": "usage::tests::fmt_resets_in_units",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-final-results/usage__tests__fmt_resets_in_units.log"
+  },
+  {
+    "test": "usage::tests::fmt_tokens_stays_narrow_at_every_magnitude",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-final-results/usage__tests__fmt_tokens_stays_narrow_at_every_magnitude.log"
+  },
+  {
+    "test": "usage::tests::forecast_declines_to_guess_without_evidence",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-final-results/usage__tests__forecast_declines_to_guess_without_evidence.log"
+  },
+  {
+    "test": "usage::tests::forecast_ignores_history_from_before_a_reset",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-final-results/usage__tests__forecast_ignores_history_from_before_a_reset.log"
+  },
+  {
+    "test": "usage::tests::forecast_is_silent_when_the_window_resets_first",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-final-results/usage__tests__forecast_is_silent_when_the_window_resets_first.log"
+  },
+  {
+    "test": "usage::tests::forecast_projects_the_burn_rate_forward",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-final-results/usage__tests__forecast_projects_the_burn_rate_forward.log"
+  },
+  {
+    "test": "usage::tests::hostile_relative_usage_resets_and_epoch_spans_are_unknown_without_overflow",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-batch02-core-final-results/usage__tests__hostile_relative_usage_resets_and_epoch_spans_are_unknown_without_overflow.log"
+  },
+  {
+    "test": "usage::tests::identity_and_credential_fields_carry_no_control_bytes",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-final-results/usage__tests__identity_and_credential_fields_carry_no_control_bytes.log"
+  },
+  {
+    "test": "usage::tests::peak_across_finds_the_worst_window_and_keeps_ties_stable",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.026,
+    "log": "/tmp/thegn-batch02-core-final-results/usage__tests__peak_across_finds_the_worst_window_and_keeps_ties_stable.log"
+  },
+  {
+    "test": "usage::tests::short_label_stays_chip_sized_and_readable",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-batch02-core-final-results/usage__tests__short_label_stays_chip_sized_and_readable.log"
+  },
+  {
+    "test": "usage::tests::tone_and_frac_thresholds",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.027,
+    "log": "/tmp/thegn-batch02-core-final-results/usage__tests__tone_and_frac_thresholds.log"
+  },
+  {
+    "test": "usage::tests::tone_at_honors_configured_thresholds",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-batch02-core-final-results/usage__tests__tone_at_honors_configured_thresholds.log"
+  },
+  {
+    "test": "usage::tests::window_clamps_percent_and_normalizes_ms_epoch",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-batch02-core-final-results/usage__tests__window_clamps_percent_and_normalizes_ms_epoch.log"
+  },
+  {
+    "test": "usage::tests::window_length_rounds_to_the_provider_s_intended_unit",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.006,
+    "log": "/tmp/thegn-batch02-core-final-results/usage__tests__window_length_rounds_to_the_provider_s_intended_unit.log"
+  }
+]

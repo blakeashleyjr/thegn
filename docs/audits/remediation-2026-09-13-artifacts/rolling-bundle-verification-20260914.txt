@@ -1,0 +1,6 @@
+The bundle contains this ref:
+7014a49696a8baa3d2ef36e4186e6bce853a9e4d refs/heads/main
+The bundle requires this ref:
+1ef8228f917c5cffb2e1993a8843b960aa396372 
+The bundle uses this hash algorithm: sha1
+/home/blake/code/thegn/docs/audits/remediation-2026-09-13-artifacts/rolling-local-main-20260914.bundle is okay

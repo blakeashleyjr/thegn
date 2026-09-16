@@ -1,0 +1,58 @@
+[
+  {
+    "test": "config_diagnostics::tests::content_and_source_determine_deduplication",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.029,
+    "log": "/tmp/thegn-batch02-core-postlint-final-results/config_diagnostics__tests__content_and_source_determine_deduplication.log"
+  },
+  {
+    "test": "config_diagnostics::tests::fixing_then_reintroducing_a_warning_emits_again",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.031,
+    "log": "/tmp/thegn-batch02-core-postlint-final-results/config_diagnostics__tests__fixing_then_reintroducing_a_warning_emits_again.log"
+  },
+  {
+    "test": "config_diagnostics::tests::memory_is_bounded_and_evicted_diagnostics_can_recur",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.032,
+    "log": "/tmp/thegn-batch02-core-postlint-final-results/config_diagnostics__tests__memory_is_bounded_and_evicted_diagnostics_can_recur.log"
+  },
+  {
+    "test": "config_diagnostics::tests::source_context_is_nested_and_thread_local",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.043,
+    "log": "/tmp/thegn-batch02-core-postlint-final-results/config_diagnostics__tests__source_context_is_nested_and_thread_local.log"
+  },
+  {
+    "test": "forge::authorship::tests::actual_cli_model_authors_organization_pr_and_never_guesses_namespace",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.021,
+    "log": "/tmp/thegn-batch02-core-postlint-final-results/forge__authorship__tests__actual_cli_model_authors_organization_pr_and_never_guesses_namespace.log"
+  },
+  {
+    "test": "forge::authorship::tests::enterprise_host_is_explicit_and_ambiguous_origins_are_refused",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.022,
+    "log": "/tmp/thegn-batch02-core-postlint-final-results/forge__authorship__tests__enterprise_host_is_explicit_and_ambiguous_origins_are_refused.log"
+  },
+  {
+    "test": "forge::authorship::tests::legacy_cache_deleted_bot_empty_and_partial_authority_fail_closed",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.02,
+    "log": "/tmp/thegn-batch02-core-postlint-final-results/forge__authorship__tests__legacy_cache_deleted_bot_empty_and_partial_authority_fail_closed.log"
+  },
+  {
+    "test": "forge::authorship::tests::stable_ids_bind_account_author_head_pr_and_repository_generations",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.011,
+    "log": "/tmp/thegn-batch02-core-postlint-final-results/forge__authorship__tests__stable_ids_bind_account_author_head_pr_and_repository_generations.log"
+  }
+]

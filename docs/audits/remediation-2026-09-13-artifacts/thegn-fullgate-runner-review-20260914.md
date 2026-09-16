@@ -1,0 +1,15 @@
+# Independent full configured test-runner review
+
+Runner: `/tmp/thegn-private-test-runner-20260914.py`. Target source: private integration clone; no Cargo invocation or live provider action performed by this review.
+
+The runner forwards the original test argv and working directory, executes the selected binary once, and preserves failures as nonzero exit status. It does not filter tests, change the nextest profile, skip ignored tests differently, or replace configured group/concurrency/timeout policy. It retains NEXTEST*\* and CARGO_BIN_EXE*\* metadata plus CARGO_MANIFEST_DIR/PATH/locale/terminal settings. Each test gets private XDG directories and no ambient Git global/system configuration. Subprocess fixtures launched directly by their parent test retain the environment their fixture explicitly builds; they do not recursively enter this target runner.
+
+The first draft removed HOME for all tests, which made several existing tests return early or run empty loops. At the parent's authorization the runner now preserves the inherited HOME unchanged for12 exact reviewed names. The sandbox mount helpers construct lists and inspect metadata; the usage candidate test derives a synthetic Antigravity directory without credentials/network; the cache list test only constructs paths. The agent-config test changes CLAUDE_CONFIG_DIR to its own temporary directory and restores it. No runner assignment repurposes HOME and no host directory is created to satisfy a prerequisite.
+
+Directory-specific mount tests still have existing premises: ~/.keychain, ~/.cache/nix, ~/.claude-profiles, ~/.claude/projects or ~/.zsh_history must exist. The inherited-home allowlist prevents the runner from erasing those premises, but does not prove they hold on this host. Bwrap-specific plan assertions remain conditional on backend availability. These are pre-existing test limitations, not a reason to fabricate host state or claim every conditional assertion executed.
+
+One excluded test, build_cache::tests::overmount_caches_overmounts_under_readonly_home, calls create_dir_all on actual home cache paths. The approved private-path helper repair is now committed at b88ff9b6. It shares the real cache enumeration/mkdir/overmount loop and tests cold private directories plus no-readonly-parent refusals without changing HOME. Its final actual host execution remains the coverage gate.
+
+No USER/LOGNAME-triggered early return was found in the bounded source search. Podman tests deliberately require PODMAN_E2E_FORCE; paid/remote provider lifecycle fixtures are #[ignore] and require explicit secrets/opt-in. Those are not activated by this runner or this audit. Snapshot update switches stay absent, which preserves validation rather than rewrite behavior.
+
+The first current full configured run stopped at2291 passed/1 failed/6062 not run, with26 configured skips, due to THE635 plain formatter ANSI field leakage. This is a real production policy mismatch, not a reason to alter runner selection or restore a masking NO_COLOR environment. Exact final passing run/source/binary provenance and the corrected cache fixture receipt remain required for THE606.

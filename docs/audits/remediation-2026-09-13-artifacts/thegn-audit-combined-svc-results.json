@@ -1,0 +1,289 @@
+[
+  {
+    "test": "control::client::tests::attach_refuses_an_incompatible_daemon_proto",
+    "status": "failed",
+    "exit": 101,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-audit-svc-results/control__client__tests__attach_refuses_an_incompatible_daemon_proto.log"
+  },
+  {
+    "test": "control::client::tests::authoritative_roster_rejects_missing_malformed_or_empty_identities",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-audit-svc-results/control__client__tests__authoritative_roster_rejects_missing_malformed_or_empty_identities.log"
+  },
+  {
+    "test": "control::client::tests::control_error_request_code_is_optional_for_old_servers",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-audit-svc-results/control__client__tests__control_error_request_code_is_optional_for_old_servers.log"
+  },
+  {
+    "test": "control::client::tests::discover_picks_the_fresh_same_scope_daemon",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.052,
+    "log": "/tmp/thegn-audit-svc-results/control__client__tests__discover_picks_the_fresh_same_scope_daemon.log"
+  },
+  {
+    "test": "control::client::tests::discover_returns_none_when_every_heartbeat_is_stale",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.053,
+    "log": "/tmp/thegn-audit-svc-results/control__client__tests__discover_returns_none_when_every_heartbeat_is_stale.log"
+  },
+  {
+    "test": "control::client::tests::http_origin_is_an_origin_not_a_socket_or_arbitrary_url",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-audit-svc-results/control__client__tests__http_origin_is_an_origin_not_a_socket_or_arbitrary_url.log"
+  },
+  {
+    "test": "control::client::tests::http_origin_merge_add_crosses_a_real_tcp_listener_with_bearer",
+    "status": "failed",
+    "exit": 101,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-audit-svc-results/control__client__tests__http_origin_merge_add_crosses_a_real_tcp_listener_with_bearer.log"
+  },
+  {
+    "test": "control::client::tests::remote_address_debug_redacts_the_bearer",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-audit-svc-results/control__client__tests__remote_address_debug_redacts_the_bearer.log"
+  },
+  {
+    "test": "forge::native::regression_tests::cancelling_token_future_terminates_owned_group",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.218,
+    "log": "/tmp/thegn-audit-svc-results/forge__native__regression_tests__cancelling_token_future_terminates_owned_group.log"
+  },
+  {
+    "test": "forge::native::regression_tests::helper_capacity_stays_reserved_until_ownership_is_released",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.006,
+    "log": "/tmp/thegn-audit-svc-results/forge__native__regression_tests__helper_capacity_stays_reserved_until_ownership_is_released.log"
+  },
+  {
+    "test": "forge::native::regression_tests::public_host_validation_precedes_credentials",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.017,
+    "log": "/tmp/thegn-audit-svc-results/forge__native__regression_tests__public_host_validation_precedes_credentials.log"
+  },
+  {
+    "test": "forge::native::regression_tests::reaper_spawn_failure_retains_child_and_capacity",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.01,
+    "log": "/tmp/thegn-audit-svc-results/forge__native__regression_tests__reaper_spawn_failure_retains_child_and_capacity.log"
+  },
+  {
+    "test": "forge::native::regression_tests::sdk_error_classification_drives_the_real_ladder",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-audit-svc-results/forge__native__regression_tests__sdk_error_classification_drives_the_real_ladder.log"
+  },
+  {
+    "test": "forge::native::regression_tests::sdk_graphql_envelopes_fall_through_without_offline_evidence",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-audit-svc-results/forge__native__regression_tests__sdk_graphql_envelopes_fall_through_without_offline_evidence.log"
+  },
+  {
+    "test": "forge::native::regression_tests::timeout_and_transport_failure_feed_native_circuit",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.039,
+    "log": "/tmp/thegn-audit-svc-results/forge__native__regression_tests__timeout_and_transport_failure_feed_native_circuit.log"
+  },
+  {
+    "test": "forge::native::regression_tests::token_helper_success_failure_and_output_bound",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.023,
+    "log": "/tmp/thegn-audit-svc-results/forge__native__regression_tests__token_helper_success_failure_and_output_bound.log"
+  },
+  {
+    "test": "forge::native::regression_tests::token_timeout_kills_descendants_even_after_parent_exit",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.427,
+    "log": "/tmp/thegn-audit-svc-results/forge__native__regression_tests__token_timeout_kills_descendants_even_after_parent_exit.log"
+  },
+  {
+    "test": "forge::native::regression_tests::typed_http_answers_are_not_global_network_failures",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.008,
+    "log": "/tmp/thegn-audit-svc-results/forge__native__regression_tests__typed_http_answers_are_not_global_network_failures.log"
+  },
+  {
+    "test": "forge::native::regression_tests::unknown_wait_ownership_is_reaped_without_group_signal",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.119,
+    "log": "/tmp/thegn-audit-svc-results/forge__native__regression_tests__unknown_wait_ownership_is_reaped_without_group_signal.log"
+  },
+  {
+    "test": "forge::native::tests::graphql_no_pr_node_maps_to_no_pr",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.006,
+    "log": "/tmp/thegn-audit-svc-results/forge__native__tests__graphql_no_pr_node_maps_to_no_pr.log"
+  },
+  {
+    "test": "forge::native::tests::graphql_pr_list_parses_headers",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-audit-svc-results/forge__native__tests__graphql_pr_list_parses_headers.log"
+  },
+  {
+    "test": "forge::native::tests::graphql_pr_maps_fields_and_rolls_up_checks",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-audit-svc-results/forge__native__tests__graphql_pr_maps_fields_and_rolls_up_checks.log"
+  },
+  {
+    "test": "forge::native::tests::native_branch_resolution_is_local_rev_parse",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.022,
+    "log": "/tmp/thegn-audit-svc-results/forge__native__tests__native_branch_resolution_is_local_rev_parse.log"
+  },
+  {
+    "test": "forge::native::tests::owner_repo_parses_ssh_and_https_forms",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-audit-svc-results/forge__native__tests__owner_repo_parses_ssh_and_https_forms.log"
+  },
+  {
+    "test": "forge::native::tests::token_is_trimmed",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.006,
+    "log": "/tmp/thegn-audit-svc-results/forge__native__tests__token_is_trimmed.log"
+  },
+  {
+    "test": "forge::native::tests::token_precedence_prefers_gh_token_then_github_token_then_cli",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.006,
+    "log": "/tmp/thegn-audit-svc-results/forge__native__tests__token_precedence_prefers_gh_token_then_github_token_then_cli.log"
+  },
+  {
+    "test": "forge::tests::auth_failure_is_final",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.006,
+    "log": "/tmp/thegn-audit-svc-results/forge__tests__auth_failure_is_final.log"
+  },
+  {
+    "test": "forge::tests::forge_set_routes_by_host",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-audit-svc-results/forge__tests__forge_set_routes_by_host.log"
+  },
+  {
+    "test": "forge::tests::github_ladder_is_native_over_cli_and_kinds_agree_with_reserved",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.006,
+    "log": "/tmp/thegn-audit-svc-results/forge__tests__github_ladder_is_native_over_cli_and_kinds_agree_with_reserved.log"
+  },
+  {
+    "test": "forge::tests::native_answer_wins",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.006,
+    "log": "/tmp/thegn-audit-svc-results/forge__tests__native_answer_wins.log"
+  },
+  {
+    "test": "forge::tests::not_configured_falls_through_to_cli",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.006,
+    "log": "/tmp/thegn-audit-svc-results/forge__tests__not_configured_falls_through_to_cli.log"
+  },
+  {
+    "test": "forge::tests::remote_host_parses_every_url_shape",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.006,
+    "log": "/tmp/thegn-audit-svc-results/forge__tests__remote_host_parses_every_url_shape.log"
+  },
+  {
+    "test": "log::provider::tests::tails_only_appends_not_history",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 2.012,
+    "log": "/tmp/thegn-audit-svc-results/log__provider__tests__tails_only_appends_not_history.log"
+  },
+  {
+    "test": "log::tail::tests::initial_attachment_does_not_emit_the_suffix_of_historical_partial_input",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-audit-svc-results/log__tail__tests__initial_attachment_does_not_emit_the_suffix_of_historical_partial_input.log"
+  },
+  {
+    "test": "log::tail::tests::initially_absent_file_is_read_when_created",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-audit-svc-results/log__tail__tests__initially_absent_file_is_read_when_created.log"
+  },
+  {
+    "test": "log::tail::tests::missing_path_and_recreation_keep_the_follower_alive",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-audit-svc-results/log__tail__tests__missing_path_and_recreation_keep_the_follower_alive.log"
+  },
+  {
+    "test": "log::tail::tests::observed_truncation_resets_cursor_and_partial_record",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-audit-svc-results/log__tail__tests__observed_truncation_resets_cursor_and_partial_record.log"
+  },
+  {
+    "test": "log::tail::tests::oversized_partial_records_have_bounded_memory",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.023,
+    "log": "/tmp/thegn-audit-svc-results/log__tail__tests__oversized_partial_records_have_bounded_memory.log"
+  },
+  {
+    "test": "log::tail::tests::retired_writer_cannot_starve_replacement",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.009,
+    "log": "/tmp/thegn-audit-svc-results/log__tail__tests__retired_writer_cannot_starve_replacement.log"
+  },
+  {
+    "test": "log::tail::tests::rotation_drains_old_complete_lines_then_reads_new_from_zero",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-audit-svc-results/log__tail__tests__rotation_drains_old_complete_lines_then_reads_new_from_zero.log"
+  },
+  {
+    "test": "log::tail::tests::skips_history_and_waits_for_a_complete_record",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.007,
+    "log": "/tmp/thegn-audit-svc-results/log__tail__tests__skips_history_and_waits_for_a_complete_record.log"
+  }
+]

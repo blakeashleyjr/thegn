@@ -1,0 +1,191 @@
+[
+  {
+    "test": "bounded_git_probe::tests::failed_pipe_worker_creation_hands_owned_child_to_bounded_reaper",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.067,
+    "log": "/tmp/thegn-batch02-host-postlint-final-results/bounded_git_probe__tests__failed_pipe_worker_creation_hands_owned_child_to_bounded_reaper.log"
+  },
+  {
+    "test": "bounded_git_probe::tests::inherited_pipe_is_bounded_and_keeps_its_resource_budget",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.264,
+    "log": "/tmp/thegn-batch02-host-postlint-final-results/bounded_git_probe__tests__inherited_pipe_is_bounded_and_keeps_its_resource_budget.log"
+  },
+  {
+    "test": "bounded_git_probe::tests::timeout_returns_without_waiting_for_child_reap",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.113,
+    "log": "/tmp/thegn-batch02-host-postlint-final-results/bounded_git_probe__tests__timeout_returns_without_waiting_for_child_reap.log"
+  },
+  {
+    "test": "bounded_git_probe::tests::unfinished_child_or_pipe_owns_capacity_until_all_holders_release",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.043,
+    "log": "/tmp/thegn-batch02-host-postlint-final-results/bounded_git_probe__tests__unfinished_child_or_pipe_owns_capacity_until_all_holders_release.log"
+  },
+  {
+    "test": "platform_ratchet_tests::color_literals_stay_in_the_chokepoints",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.443,
+    "log": "/tmp/thegn-batch02-host-postlint-final-results/platform_ratchet_tests__color_literals_stay_in_the_chokepoints.log"
+  },
+  {
+    "test": "platform_ratchet_tests::glyph_literals_go_through_active_glyphs",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.403,
+    "log": "/tmp/thegn-batch02-host-postlint-final-results/platform_ratchet_tests__glyph_literals_go_through_active_glyphs.log"
+  },
+  {
+    "test": "platform_ratchet_tests::host_key_literals_stay_in_the_chokepoint",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.304,
+    "log": "/tmp/thegn-batch02-host-postlint-final-results/platform_ratchet_tests__host_key_literals_stay_in_the_chokepoint.log"
+  },
+  {
+    "test": "platform_ratchet_tests::long_lived_threads_declare_a_qos_class",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.203,
+    "log": "/tmp/thegn-batch02-host-postlint-final-results/platform_ratchet_tests__long_lived_threads_declare_a_qos_class.log"
+  },
+  {
+    "test": "platform_ratchet_tests::platform_cfgs_live_in_platform_modules",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.206,
+    "log": "/tmp/thegn-batch02-host-postlint-final-results/platform_ratchet_tests__platform_cfgs_live_in_platform_modules.log"
+  },
+  {
+    "test": "queries::clipboard::tests::all_selectors_and_terminators_survive_every_split",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.014,
+    "log": "/tmp/thegn-batch02-host-postlint-final-results/queries__clipboard__tests__all_selectors_and_terminators_survive_every_split.log"
+  },
+  {
+    "test": "queries::clipboard::tests::barrier_discards_both_partial_and_refused_pending",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.014,
+    "log": "/tmp/thegn-batch02-host-postlint-final-results/queries__clipboard__tests__barrier_discards_both_partial_and_refused_pending.log"
+  },
+  {
+    "test": "queries::clipboard::tests::clipboard_sequences_inside_other_control_strings_are_not_admitted",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.014,
+    "log": "/tmp/thegn-batch02-host-postlint-final-results/queries__clipboard__tests__clipboard_sequences_inside_other_control_strings_are_not_admitted.log"
+  },
+  {
+    "test": "queries::clipboard::tests::maximum_decoded_size_and_oversize_discard_are_bounded_linear",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.019,
+    "log": "/tmp/thegn-batch02-host-postlint-final-results/queries__clipboard__tests__maximum_decoded_size_and_oversize_discard_are_bounded_linear.log"
+  },
+  {
+    "test": "queries::clipboard::tests::reads_clears_ambiguous_fields_and_noncanonical_data_never_replace_a_set",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.011,
+    "log": "/tmp/thegn-batch02-host-postlint-final-results/queries__clipboard__tests__reads_clears_ambiguous_fields_and_noncanonical_data_never_replace_a_set.log"
+  },
+  {
+    "test": "queries::clipboard::tests::valid_replacement_is_latest_and_panes_are_isolated",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.012,
+    "log": "/tmp/thegn-batch02-host-postlint-final-results/queries__clipboard__tests__valid_replacement_is_latest_and_panes_are_isolated.log"
+  },
+  {
+    "test": "queries::tests::da_and_dsr_queries_get_answers",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.017,
+    "log": "/tmp/thegn-batch02-host-postlint-final-results/queries__tests__da_and_dsr_queries_get_answers.log"
+  },
+  {
+    "test": "queries::tests::kitty_graphics_probe_gets_an_error_reply",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.013,
+    "log": "/tmp/thegn-batch02-host-postlint-final-results/queries__tests__kitty_graphics_probe_gets_an_error_reply.log"
+  },
+  {
+    "test": "queries::tests::ordinary_output_produces_no_responses",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.013,
+    "log": "/tmp/thegn-batch02-host-postlint-final-results/queries__tests__ordinary_output_produces_no_responses.log"
+  },
+  {
+    "test": "queries::tests::osc52_clipboard_sets_forward_verbatim",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.013,
+    "log": "/tmp/thegn-batch02-host-postlint-final-results/queries__tests__osc52_clipboard_sets_forward_verbatim.log"
+  },
+  {
+    "test": "queries::tests::osc_color_queries_follow_a_recoloured_palette",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.015,
+    "log": "/tmp/thegn-batch02-host-postlint-final-results/queries__tests__osc_color_queries_follow_a_recoloured_palette.log"
+  },
+  {
+    "test": "queries::tests::osc_color_queries_report_the_callers_pane_colors",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.012,
+    "log": "/tmp/thegn-batch02-host-postlint-final-results/queries__tests__osc_color_queries_report_the_callers_pane_colors.log"
+  },
+  {
+    "test": "queries::tests::window_size_reports_cells_and_pixels",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.015,
+    "log": "/tmp/thegn-batch02-host-postlint-final-results/queries__tests__window_size_reports_cells_and_pixels.log"
+  },
+  {
+    "test": "review_task_handoff::tests::exact_expected_head_verification_rejects_foreign_pushes",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.014,
+    "log": "/tmp/thegn-batch02-host-postlint-final-results/review_task_handoff__tests__exact_expected_head_verification_rejects_foreign_pushes.log"
+  },
+  {
+    "test": "review_task_handoff::tests::handle_without_configured_agent_leaves_unclaimed_revision_unchanged",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.141,
+    "log": "/tmp/thegn-batch02-host-postlint-final-results/review_task_handoff__tests__handle_without_configured_agent_leaves_unclaimed_revision_unchanged.log"
+  },
+  {
+    "test": "review_task_handoff::tests::rate_limits_back_off_but_unsupported_never_auto_retries",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.014,
+    "log": "/tmp/thegn-batch02-host-postlint-final-results/review_task_handoff__tests__rate_limits_back_off_but_unsupported_never_auto_retries.log"
+  },
+  {
+    "test": "review_task_handoff::tests::unknown_author_holds_review_before_claim_without_reparking_the_row",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.456,
+    "log": "/tmp/thegn-batch02-host-postlint-final-results/review_task_handoff__tests__unknown_author_holds_review_before_claim_without_reparking_the_row.log"
+  },
+  {
+    "test": "review_task_handoff::tests::unsupported_and_rate_limited_resolve_attempts_remain_auditable",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.142,
+    "log": "/tmp/thegn-batch02-host-postlint-final-results/review_task_handoff__tests__unsupported_and_rate_limited_resolve_attempts_remain_auditable.log"
+  }
+]

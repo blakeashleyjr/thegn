@@ -1,0 +1,30 @@
+[
+  {
+    "test": "framing_smoke_for_test_helpers",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.003,
+    "log": "/tmp/thegn-batch02-lsp-final-results/framing_smoke_for_test_helpers.log"
+  },
+  {
+    "test": "initialize_handshake_and_pushed_diagnostics",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.004,
+    "log": "/tmp/thegn-batch02-lsp-final-results/initialize_handshake_and_pushed_diagnostics.log"
+  },
+  {
+    "test": "requests_return_mapped_results",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.005,
+    "log": "/tmp/thegn-batch02-lsp-final-results/requests_return_mapped_results.log"
+  },
+  {
+    "test": "undeclared_capability_is_not_sent_and_returns_not_available",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.006,
+    "log": "/tmp/thegn-batch02-lsp-final-results/undeclared_capability_is_not_sent_and_returns_not_available.log"
+  }
+]

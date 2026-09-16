@@ -1,0 +1,51 @@
+[
+  {
+    "test": "hydrate::tests::ticker_pr_cadence_is_a_multiple_of_the_model_cadence",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.012,
+    "log": "/tmp/thegn-batch02-host-extra2-results/hydrate__tests__ticker_pr_cadence_is_a_multiple_of_the_model_cadence.log"
+  },
+  {
+    "test": "platform_ratchet_tests::color_literals_stay_in_the_chokepoints",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.392,
+    "log": "/tmp/thegn-batch02-host-extra2-results/platform_ratchet_tests__color_literals_stay_in_the_chokepoints.log"
+  },
+  {
+    "test": "platform_ratchet_tests::glyph_literals_go_through_active_glyphs",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.369,
+    "log": "/tmp/thegn-batch02-host-extra2-results/platform_ratchet_tests__glyph_literals_go_through_active_glyphs.log"
+  },
+  {
+    "test": "platform_ratchet_tests::host_key_literals_stay_in_the_chokepoint",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.279,
+    "log": "/tmp/thegn-batch02-host-extra2-results/platform_ratchet_tests__host_key_literals_stay_in_the_chokepoint.log"
+  },
+  {
+    "test": "platform_ratchet_tests::long_lived_threads_declare_a_qos_class",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.187,
+    "log": "/tmp/thegn-batch02-host-extra2-results/platform_ratchet_tests__long_lived_threads_declare_a_qos_class.log"
+  },
+  {
+    "test": "platform_ratchet_tests::platform_cfgs_live_in_platform_modules",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.157,
+    "log": "/tmp/thegn-batch02-host-extra2-results/platform_ratchet_tests__platform_cfgs_live_in_platform_modules.log"
+  },
+  {
+    "test": "worker_failure::tests::worker_panic_notifies_once_and_normal_shutdown_is_silent",
+    "status": "passed",
+    "exit": 0,
+    "seconds": 0.02,
+    "log": "/tmp/thegn-batch02-host-extra2-results/worker_failure__tests__worker_panic_notifies_once_and_normal_shutdown_is_silent.log"
+  }
+]

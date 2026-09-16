@@ -1,0 +1,70 @@
+   Compiling thegn-svc v0.1.0-alpha.2 (/tmp/thegn-audit-maintenance-protocols-20260913/crates/thegn-svc)
+warning: unused variable: `require_hardening`
+   --> crates/thegn-svc/src/ipc.rs:286:9
+    |
+286 |         require_hardening: bool,
+    |         ^^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_require_hardening`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: calls to `std::mem::drop` with a reference instead of an owned value does nothing
+   --> crates/thegn-svc/src/ipc.rs:191:17
+    |
+191 |                 drop(path);
+    |                 ^^^^^----^
+    |                      |
+    |                      argument has type `&PathBuf`
+    |
+    = note: `#[warn(dropping_references)]` on by default
+help: use `let _ = ...` to ignore the expression or result
+    |
+191 -                 drop(path);
+191 +                 let _ = path;
+    |
+
+warning: calls to `std::mem::drop` with a reference instead of an owned value does nothing
+   --> crates/thegn-svc/src/ipc.rs:353:21
+    |
+353 |                     drop(sock);
+    |                     ^^^^^----^
+    |                          |
+    |                          argument has type `&PathBuf`
+    |
+help: use `let _ = ...` to ignore the expression or result
+    |
+353 -                     drop(sock);
+353 +                     let _ = sock;
+    |
+
+warning: `thegn-svc` (lib) generated 3 warnings (run `cargo fix --lib -p thegn-svc` to apply 1 suggestion)
+warning: calls to `std::mem::drop` with a reference instead of an owned value does nothing
+   --> crates/thegn-svc/src/ipc.rs:191:17
+    |
+191 |                 drop(path);
+    |                 ^^^^^----^
+    |                      |
+    |                      argument has type `&std::path::PathBuf`
+    |
+    = note: `#[warn(dropping_references)]` on by default
+help: use `let _ = ...` to ignore the expression or result
+    |
+191 -                 drop(path);
+191 +                 let _ = path;
+    |
+
+warning: calls to `std::mem::drop` with a reference instead of an owned value does nothing
+   --> crates/thegn-svc/src/ipc.rs:353:21
+    |
+353 |                     drop(sock);
+    |                     ^^^^^----^
+    |                          |
+    |                          argument has type `&std::path::PathBuf`
+    |
+help: use `let _ = ...` to ignore the expression or result
+    |
+353 -                     drop(sock);
+353 +                     let _ = sock;
+    |
+
+warning: `thegn-svc` (lib test) generated 3 warnings (1 duplicate)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 13.12s

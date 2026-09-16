@@ -1,0 +1,20 @@
+[
+  {
+    "kind": "host",
+    "binary": "/tmp/thegn-rolling-host-tests-20260914",
+    "sha256": "172b4306baad9f3fdb63fcbd0bd342b5719c6e9836e983f75f26ac18e842b008",
+    "source_checkpoint": "38107f9d"
+  },
+  {
+    "kind": "core",
+    "binary": "/tmp/thegn-rolling-core-tests-20260914",
+    "sha256": "603b8fd5dcbedb6425ec8df7d32b5cd29bc53a789e8968429db1dabbd715cbac",
+    "source_checkpoint": "38107f9d"
+  },
+  {
+    "kind": "svc",
+    "binary": "/tmp/thegn-rolling-svc-tests-20260914",
+    "sha256": "218bda4375c00d7b078fbf2c8b8974307ecd25b915b11f5c1632538fdfed3bf8",
+    "source_checkpoint": "38107f9d"
+  }
+]
