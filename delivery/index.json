@@ -925,7 +925,8 @@
     },
     {
       "change": "reduce-process-monitor-idle-work",
-      "lifecycle": "active",
+      "lifecycle": "delivered-awaiting-archive",
+      "delivered_at": "2026-09-16",
       "disposition": "alpha-delivery",
       "owners": [
         {
@@ -941,7 +942,7 @@
           "project": "Workspace Product & Observability"
         }
       ],
-      "summary": "Current-main port of the existing parked process sampler, relevant monitor invalidation cache, stable Processes columns and render allocation repair; native and paired performance acceptance remain held."
+      "summary": "Existing parked process sampler, relevant monitor invalidation cache, stable Processes columns and render allocation repair; current-source native/UI and measured-cost evidence recorded with explicit tail and inherited-warning qualifications; native queue receipt supplies final gate/landing status."
     },
     {
       "change": "repair-kitty-stream-parser",

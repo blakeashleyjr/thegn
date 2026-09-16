@@ -1,140 +1,113 @@
 # Task manager maintenance: THE-630 / THE-631 / THE-632
 
-Historical base: 7014a496. Current-main port base: 6884c3f0. This is an
-implementation/review checkpoint, not a completion receipt; the current-main
-port remains unaccepted pending primary/adversarial review, native gates and
-paired performance evidence. THE-633 provider probing is already landed on
-current main and is outside this existing THE-630/631/632 port.
+This existing-maintenance bundle starts from main `6884c3f0`. Production changes
+are in `453762af`; `b3892624` corrects one test fixture publication revision.
+No collectors, settings, controls or other features are added. THE-633 and
+THE-640 fixes already on main are preserved.
 
-## THE-630 implemented boundary
+## Implementation and correctness
 
-`proc_worker.rs` replaces the detached 500ms polling process thread with a
-fallible worker, indefinite condition-variable park, monotonic enabled deadline,
-one replaceable publication and generation/reset fencing. The worker owns the
-existing `ProcSampler`; CPU baseline reset never bypasses its two-second minimum.
-A parked acknowledgement follows any previous scan, wake attempt and reset.
-The consumer rejects stale generations and Drop cancels without requiring a send.
+The process sampler is an owned worker with an indefinite hidden/paused park,
+a two-second minimum between scan starts, generation/reset fencing and one
+replaceable publication. Process-wide custody retains an unfinished OS-thread
+handle across cancellation and unwind. Shutdown shares the resident supervisor's
+deadline and distinguishes settled, failed and held outcomes; it never promises
+to interrupt an OS collection. Failure publication precedes opaque panic-payload
+destruction. Pane/daemon attribution is written before positive admission.
 
-`proc_worker_custody.rs` reserves the process-wide slot before spawning. The
-successful handle is immediately guarded; reservation unwind recovers custody
-without granting poisoned-slot admission. Retirement retains a token across an
-outside-lock exact join. The slot survives run-future cancellation and startup
-unwind; no application owner Drop detaches a live handle. A watch receipt alone
-cannot release a thread that has not returned. Shutdown uses the same deadline
-as the existing resident supervisor, requests both cancellations first, and
-reports Held/Failed separately from Settled.
+Process row caches use the accepted publication revision and complete
+sort/direction/tree/filter inputs. Hydration transfers snapshots and revisions
+together. Disk cache revisions cover both size and timestamp maps; cached ages
+advance independently and exhausted revisions disable reuse. Unrelated graph
+refreshes retain their cadence without rebuilding process or disk rows.
 
-Failures publish a fixed receipt before opaque panic payload destruction and
-attempt exactly one guarded terminal notification so pre-sample failure can be
-seen by the compositor. Wake failure is terminal; it cannot strand a silently
-replaced pending slot. Exact-join failure publishes before releasing retirement
-into a terminal Failed slot that retains the exceptional join-error payload.
-It refuses replacement without invoking arbitrary Drop on a cleanup caller.
+Processes alone use viewport-derived column widths and sanitized grapheme
+clipping. Selection and signal confirmation preserve PID/birth-time identity.
+Paused resize reflows geometry without consuming a new sample. Fixed rows avoid
+duplicate painting, and layer remapping reuses equal default/color attributes.
+Native fixtures cover control races, failure custody, invalidation, clipping,
+selection and attribute equivalence.
 
-At the UI boundary, hidden demand is revoked before unrelated loop work and
-again before final take. Pane/daemon attribution is published before positive
-admission; the first immediate sample therefore uses the available inputs.
-Accepted publication revisions travel with the snapshot across hydration.
+## Current-source validation
 
-## Historical evidence retained
+Release build `453762af` completed in 2800.285 seconds. Its 68 selected controls
+produced **67 passes and one failure**: the sort fixture changed RSS without
+advancing the process publication revision. The failure is retained. The single
+added line in `b3892624` models that publication boundary; all production and
+common benchmark bytes remain identical. A separate debug host/test build
+completed in 613.910 seconds, and **all 68 focused controls passed** across
+21 groups. This is not a claim that the old release artifact passed 68 tests or
+that the two binaries are equivalent.
 
-The worker/custody harness receipts are historical source-only evidence from the
-older candidate, not current-main acceptance:
+Scoped debug Clippy exited zero with no errors. The stricter zero-warning
+wrapper failed on five records: two copies of an unchanged-main `hydrate.rs`
+collapsible-if warning, and three warnings in the immutable common benchmark
+fixture (two intentional release-only assertions and a fixture initializer).
+Primary and independent review accepted exactly that inventory by source/hash.
+The raw failure remains unchanged; no suppressions, warning-free claim or lint
+rerun is used. This is scoped host lint, not a full-workspace lint claim.
 
-- **13/13** in `/tmp/thegn-630-worker-harness-tests.log`;
-- revision-2 receipts in `/tmp/thegn-630-worker-harness-revision2-tests.log` and
-  `/tmp/thegn-process-allocation-harness-tests.log`;
-- **14/14 worker/custody** and **1/1 allocator scope** in
-  `/tmp/thegn-630-worker-harness-revision3-tests.log`;
-- baseline source manifest at
-  `/tmp/thegn-maintenance-03-process-baseline-20260914/manifest.json`.
+Owned Muse verification passed at 80x24, 160x48 and 240x72: paused stability,
+selection/navigation, sort-arrow agreement, tree/filter transitions with an
+actual exclusion witness, Unicode cell/column alignment, resume/reopen and
+normal exit. Every owned app/pane/helper/daemon exited; host logs contained no
+review-required entries. PNG, styled, text and trace evidence is retained.
+This supports terminal-cell behavior, not arbitrary font shaping or other OSes.
 
-These harnesses imported production source with cached debug dependencies and
-inert observer/QoS/perf hooks. They did not prove a current-main host build,
-coordinated host tests, release measurements or native UI behavior. The earlier
-scoped OpenSpec/delivery validation belongs to that historical candidate.
+## Release measurements and limitations
 
-## Current port HOLD and pending evidence
+The declared CPU2 series ran warmup A/B followed by ABBAABBA renderer invocations,
+then one matched sampler A/B pair with 120-second hidden/visible/paused windows.
+It completed once in 12m28s, using 33.071 total CPU seconds. Workloads,
+instrumentation and comparison thresholds were unchanged; no retry was used.
 
-The current-main source port is based on `6884c3f0` and includes the reviewed
-render change from `cdffef53`. That hash identifies source provenance for the
-copied layer change, not a current-main acceptance commit. The port has no
-compiler or host acceptance receipt. The separate frozen candidate's release
-build/performance evidence path is
-`/tmp/thegn-layer-host-build-20260916-1m4i32rq`; its result must be paired with
-the matching baseline before any regression decision. Retained stage-B results
-from `f2a39b40` are at
-`/tmp/thegn-frame-stage-resume-20260916-gvm3bab7/candidate-f2a39b40-frame-stage-release-tests`
-and its primary/independent analysis files; they describe the older candidate
-and are not current-port acceptance.
+Hidden and paused scheduled sampler wakes each fell **240 to zero**; both
+candidate windows had zero scans, publications and terminal wake attempts.
+Visible sampling produced 60 completed/consumed samples in 120.058 seconds;
+reopen produced unprimed then primed samples. Whole-test-process CPU seconds were
+hidden 0.02 to 0.01, visible 6.44 to 6.37, paused 0.02 to 0.02. These counters
+include fixture polling and all threads, have 10ms resolution, and do not prove
+worker-only CPU cost or statistical significance.
 
-Native host tests, scoped strict source/lint gates, owned Muse frames, paired
-refresh/render measurements, final primary/adversarial review and local-main
-landing remain pending. The performance HOLD and no-queue-admission boundary
-remain unchanged.
+All 24 renderer-series paired changed-frame medians improved (6.77-54.53%);
+the extra sampler workload's six renderer medians also improved. Across the
+four measured runs per side, the descriptive median of run summaries improved
+for both median and p95 at all six shapes. These are not pooled quantiles.
+Changed-frame allocation calls fell 21.47-33.62%. Unchanged Process refreshes
+reported no dirty frame and performed zero process/disk/body rebuilds.
+The unrelated CPU-tab workload reduced process and disk row builds from 500
+each to zero while preserving its 500 graph-body builds.
 
-## Renderer stage status
+Tail qualifications remain explicit: renderer pair 3 p95 increased at 64 rows
+for 80/160/240 columns (+36.33%, +40.35%, +48.13%); pair 4 increased at 64/240
+(+12.62%) and 400/80 (+11.13%). The sampler workload's extra 64/80 render p95
+increased 27.58%. The prior frozen candidate's +24.56% renderer and +10.78%
+lifecycle flags are also retained. No CPU/load cause is established. Primary
+review accepts the consistent measured median/CPU/allocation improvements and
+functional repair with this tail variability; it does not claim every p95
+improved or provide a universal latency guarantee.
 
-At the historical checkpoint, root owned the separate Processes-only
-fixed-column renderer and sanitized Unicode clipping/selection tests. The
-current-main port now stages that existing renderer and its tests; native
-execution, paired performance, Muse frames and final acceptance remain
-pending.
+## Evidence and landing boundary
 
-## THE-631 implementation and paired measurement revision
+- Release source/build, source bridge, exact series and primary comparisons:
+  `/tmp/thegn-current-port-build-20260916-sowgq_pv`.
+- Corrected debug build, 68 controls, raw lint and separate warning disposition:
+  `/tmp/thegn-final-debug-build-20260916-hr0ltkff`.
+- Owned UI and exact cleanup: `/tmp/thegn-muse-procs-xnlah7xz`.
+- Independent source review:
+  `/tmp/thegn-existing-monitor-source-review-luna-20260916.md`.
+- Independent fixture, lint and UI reviews:
+  `/tmp/thegn-final-fixture-source-bridge-review-luna-20260916.md`,
+  `/tmp/thegn-final-lint-disposition-review-luna-20260916.md`,
+  `/tmp/thegn-final-ui-review-luna-20260916.md`.
+- Earlier frozen measurements and retained adverse observations:
+  `/tmp/thegn-layer-host-build-20260916-1m4i32rq` and
+  `/tmp/thegn-frame-stage-resume-20260916-gvm3bab7`.
 
-`monitor/invalidation.rs` caches rows only for the active list. The process key
-contains the entire accepted publication revision plus sort/direction/tree/filter;
-no snapshot clone or PID-only key is used. Geometry/navigation can rebuild the
-body without sorting rows. A Process body with unchanged inputs returns no
-repaint. Existing history coverage text can still advance independently without
-rebuilding its body or rows. Graph tabs retain the previous refresh/time cadence.
-
-Disk inputs receive a semantic revision at the authoritative hydration swap,
-comparing both size and timestamp maps by borrow. Saturation disables that cache
-rather than reusing a wrapped revision. Cached rows retain their measurement
-stamps so displayed ages advance independently of ordering and labels. Equal
-size/name rows use the full path as the final deterministic ordering key; a
-reverse-insertion fixture covers identical basenames.
-
-`FrameModel::take_process_publication` is the real compositor's sole live
-process assignment and reconciles the gate before final take. Hydration's
-`carry_monitor_state_from` is the other production assignment (initialization
-excepted). The new host fixture queues an actual worker publication across a
-pause, proves admission rejects it, and then drives paused filtering/navigation
-and verifies the sampled identity in signal confirmation. No second frozen
-snapshot is introduced. Eight host invalidation/boundary fixtures and a disk
-revision/exhaustion fixture await coordinated host execution.
-
-The measurement revision adds a test-only System-forwarding allocator with
-constant, non-dropping thread-local counters. Its scoped calling-thread counts
-exclude fixture mutation, result-vector recording and JSON serialization;
-requested bytes count allocation/reallocation calls, not live heap size. Actual
-process/disk/body builder entries have test-only counters. Both baseline and
-candidate must receive identical instrumentation before comparison. Independent
-allocator/provenance source review approved this revision. An extra renderer-only
-ignored selector avoids repeating sampler windows for renderer-only revisions.
-
-After metrics-factory extraction and measurement hooks, the isolated actual-source
-worker/custody harness still passed13/13 and the actual counter isolation/unwind
-fixture passed1/1. Logs: `/tmp/thegn-630-worker-harness-revision2-tests.log` and
-`/tmp/thegn-process-allocation-harness-tests.log`. These use cached debug
-artifacts and inert observer/QoS/perf harness hooks; they are not release or full
-host evidence. The blocking-payload regression now runs cleanup in an owned
-helper, releases the controlled destructor gate and joins before asserting,
-so a regression cannot hang the watchdog caller before its deadline check.
-
-The final source-only checkpoint passes **14/14 worker/custody tests** and
-**1/1 allocator scope test**. Log:
-`/tmp/thegn-630-worker-harness-revision3-tests.log`. The additional regression
-unwinds an assertion while the actual fixture collector is blocked and proves
-its first-field cleanup guard releases the owned gate and retires the exact
-thread. A test-only 32-slot reservation retains private custody before spawn;
-cleanup has a ten-second deadline and never joins an unfinished handle. Failure
-to settle retains that slot until test-process exit instead of detaching it.
-This private test mechanism does not consume or relax production admission.
-
-The paired common workload SHA256 remains
-`61f2e5d025f61c9c640ad14ca15ffc921aa77666f7cd50e9272e9659bb60421c`.
-This metadata records provenance only; it does not claim current-port host
-execution or release acceptance.
+Landing uses native `merge add` then `merge land`, with the configured isolated
+`XDG_STATE_HOME=/home/blake/.superzej/pipeline-state just test` gate, one build
+job and one test worker. The receipt selected by
+`/tmp/thegn-final-native-queue-latest-20260916` is authoritative for the final
+full-workspace test result and landed main commit. The proposed delivery-ledger transition takes effect with successful native
+landing; this source record does not preclaim a gate result. Existing historical receipts are retained; current
+acceptance is based on the sources and measurements identified above.

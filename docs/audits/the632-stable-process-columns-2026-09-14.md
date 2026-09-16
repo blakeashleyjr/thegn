@@ -1,8 +1,9 @@
 # THE-632: stable process columns
 
-This receipt describes the source candidate stage. The current-main port is
-based on 6884c3f0 and remains unaccepted pending native integration, paired
-performance and final review gates.
+This receipt describes the fixed-column design. The current-main port starts
+from 6884c3f0. Current native, UI and release evidence, including retained p95
+qualifications and the native landing boundary, is recorded in
+`task-manager-maintenance-THE-630-632.md`.
 
 The Processes table now allocates PID, name, owner, CPU and memory widths from
 the viewport. A new opt-in fixed table section clips each cell before drawing
@@ -31,6 +32,8 @@ complete host integration or a release performance result. The host test also
 checks the actual Processes builder across narrow/wide viewports and changing
 sample values, including full PID visibility and unchanged confirmation identity.
 
-Pending: final independent review, host-native regression tests, paired release
-refresh/render measurements, owned Muse frame checks, combined repository gates
-and local-main landing. THE-638 tracks the selected maintenance batch.
+The current-source verification includes 68 focused host tests and owned Muse
+frames at three sizes. Release comparisons support lower measured median and
+allocation cost, with individual p95 regressions retained explicitly in the
+maintenance audit. Native queue receipts supply the final repository gate and
+local-main landing result. THE-638 tracks the selected maintenance batch.
