@@ -924,6 +924,27 @@
       "delivered_at": "2026-09-14"
     },
     {
+      "change": "reduce-process-monitor-idle-work",
+      "lifecycle": "delivered-awaiting-archive",
+      "delivered_at": "2026-09-16",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-630",
+          "project": "Workspace Product & Observability"
+        },
+        {
+          "issue": "THE-631",
+          "project": "Workspace Product & Observability"
+        },
+        {
+          "issue": "THE-632",
+          "project": "Workspace Product & Observability"
+        }
+      ],
+      "summary": "Existing parked process sampler, relevant monitor invalidation cache, stable Processes columns and render allocation repair; current-source native/UI and measured-cost evidence recorded with explicit tail and inherited-warning qualifications; native queue receipt supplies final gate/landing status."
+    },
+    {
       "change": "repair-kitty-stream-parser",
       "lifecycle": "active",
       "disposition": "alpha-delivery",

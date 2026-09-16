@@ -8289,6 +8289,7 @@ dependencies = [
  "clap",
  "clap_complete",
  "fff-search",
+ "finl_unicode",
  "flate2",
  "futures",
  "getrandom 0.4.3",

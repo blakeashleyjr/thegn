@@ -37,6 +37,7 @@ use thegn_metrics::StatsSnapshot;
 
 mod build;
 mod footer;
+mod invalidation;
 pub(crate) mod procs_view;
 pub(crate) mod state;
 mod tabbar;
@@ -423,6 +424,9 @@ pub struct MonitorOverlay {
     /// indexes and the signal action reads. Recomputed on rebuild so the key
     /// handler never re-derives ordering out of step with the render.
     proc_rows: Vec<procs_view::ProcRow>,
+    lists: invalidation::Lists,
+    /// The last body was Processes with these header/display-only inputs.
+    process_body: Option<(u64, bool, bool)>,
     /// The Disk-tab worktree paths currently displayed, in row order — what the
     /// clean action targets. Recomputed on rebuild.
     disk_rows: Vec<build::DiskWtRow>,
@@ -499,6 +503,8 @@ impl MonitorOverlay {
             filter: String::new(),
             filtering: false,
             proc_rows: Vec::new(),
+            lists: invalidation::Lists::default(),
+            process_body: None,
             disk_rows: Vec::new(),
             container_rows: Vec::new(),
             confirm: None,
@@ -597,26 +603,14 @@ impl MonitorOverlay {
 
     /// Rebuild the active tab's body from current data.
     fn rebuild(&mut self, model: &FrameModel, ctx: &StatusCtx, preserve_process: bool) {
+        #[cfg(test)]
+        crate::proc_workload_alloc::body();
         let live_now = ctx.now_ms.max(0) as u64;
         self.last_now_ms = live_now;
         let now = self.frozen_now_ms.unwrap_or(live_now);
-        // Recompute EVERY list tab's rows first — Processes, Disk and Containers
-        // — so `sel`, the signal action, the clean action and the container row
-        // actions all index exactly what the renderer draws. Rows first, then
-        // one clamp for the active tab, then the build.
-        let selected = preserve_process
-            .then(|| self.proc_rows.get(self.sel).map(|r| (r.pid, r.start_time)))
-            .flatten();
-        self.proc_rows = procs_view::rows(&model.procs, self.proc_view());
-        if let Some(identity) = selected
-            && let Some(index) = self
-                .proc_rows
-                .iter()
-                .position(|r| (r.pid, r.start_time) == identity)
-        {
-            self.sel = index;
-        }
-        self.disk_rows = build::worktree_disk_rows(model, now / 1000);
+        // Only the active list is derived, and navigation/geometry changes do
+        // not re-sort an unchanged process snapshot. Identity remains sampled.
+        self.refresh_active_rows(model, now / 1000, preserve_process);
         // Container row identities for the key handler (the same order the
         // builder renders `model.containers` in), so a key resolves `sel`
         // without a model borrow.
@@ -654,6 +648,11 @@ impl MonitorOverlay {
         });
         self.body = b.sections;
         self.row_y = b.row_y;
+        self.process_body = (self.tab == MonitorTab::Procs).then_some((
+            model.process_revision,
+            model.procs_enabled(),
+            self.filtering,
+        ));
         self.covered_secs = ctx.hist.coverage_secs(now, self.prefs.tab(self.tab).window);
         self.clamp();
         // After the clamp, so a stack that just shrank is bounded before the
@@ -747,22 +746,70 @@ impl MonitorOverlay {
         if self.paused {
             return false;
         }
+        let geometry_changed = (self.cols, self.rows) != Self::dims(ctx.screen);
         self.resize(ctx.screen);
-        self.tabs = MonitorTab::visible_for(
+        let tabs = MonitorTab::visible_for(
             &model.stats,
             !model.containers.is_empty(),
             model.notification_delivery_configured || model.notification_delivery.visible(),
         );
+        let tabs_changed = tabs != self.tabs;
+        self.tabs = tabs;
         if !self.tabs.contains(&self.tab) {
-            // The metric vanished under the user (GPU driver unloaded, battery
-            // removed). Fall back rather than render an empty tab.
             self.tab = self.tabs.first().copied().unwrap_or(MonitorTab::Cpu);
         }
+        if self.tab == MonitorTab::Procs
+            && !geometry_changed
+            && !tabs_changed
+            && self.process_rows_current(model)
+            && self.process_body
+                == Some((
+                    model.process_revision,
+                    model.procs_enabled(),
+                    self.filtering,
+                ))
+        {
+            self.last_now_ms = ctx.now_ms.max(0) as u64;
+            let coverage = ctx
+                .hist
+                .coverage_secs(self.last_now_ms, self.prefs.tab(self.tab).window);
+            let note_changed =
+                self.coverage_marker(self.covered_secs) != self.coverage_marker(coverage);
+            self.covered_secs = coverage;
+            // Existing coverage text can advance without rebuilding rows/body.
+            return note_changed;
+        }
+        // Graph tabs retain existing history/time cadence. Their row caches
+        // are independent; a cached disk order never freezes displayed ages.
         self.rebuild(model, ctx, self.tab == MonitorTab::Procs);
         true
     }
 
-    /// Re-clamp to a resized terminal.
+    /// Reflow owned content on a terminal resize, including while paused.
+    /// This event needs no model or clock: newer sampled data remains separate.
+    pub fn reflow_geometry(&mut self, screen: Rect) -> bool {
+        if (self.cols, self.rows) == Self::dims(screen) {
+            return false;
+        }
+        self.resize(screen);
+        if self.tab == MonitorTab::Procs {
+            #[cfg(test)]
+            crate::proc_workload_alloc::body();
+            build::reflow_process_geometry(
+                &mut self.body,
+                &self.proc_rows,
+                self.prefs.proc_tree,
+                self.cols,
+            );
+        }
+        self.clamp();
+        if self.follow {
+            self.follow_row();
+        }
+        true
+    }
+
+    /// Update cached dimensions; content reflow/rebuild is the caller's job.
     fn resize(&mut self, screen: Rect) {
         let (cols, rows) = Self::dims(screen);
         if (cols, rows) != (self.cols, self.rows) {
@@ -1498,17 +1545,17 @@ impl MonitorOverlay {
 
     /// `2m` — or `1h · 4m of history` when the ring holds less than the window
     /// asks for, so a wide window never implies data it doesn't have.
+    fn coverage_marker(&self, covered: Option<f32>) -> Option<(u64, &'static str)> {
+        match (self.prefs.tab(self.tab).window.secs(), covered) {
+            (Some(want), Some(have)) if have + 5.0 < want as f32 => Some(span_units(have)),
+            _ => None,
+        }
+    }
     fn coverage_note(&self) -> String {
-        let p = self.prefs.tab(self.tab);
-        let want = p.window;
-        match (want.secs(), self.covered_secs) {
-            // `w as f32`, NOT `f32::from(w as u16)`: the u16 cast silently
-            // truncates any window past 18h12m, so a wide rung would compare
-            // against a wrapped span and claim full coverage it doesn't have.
-            (Some(w), Some(c)) if c + 5.0 < w as f32 => {
-                format!("{} · {} of history", want.label(), fmt_secs(c))
-            }
-            _ => want.label(),
+        let want = self.prefs.tab(self.tab).window;
+        match self.coverage_marker(self.covered_secs) {
+            Some((value, unit)) => format!("{} · {value}{unit} of history", want.label()),
+            None => want.label(),
         }
     }
 
@@ -1532,13 +1579,13 @@ impl MonitorOverlay {
     }
 }
 
-fn fmt_secs(s: f32) -> String {
+fn span_units(s: f32) -> (u64, &'static str) {
     let s = s.max(0.0) as u64;
     if s < 60 {
-        format!("{s}s")
+        (s, "s")
     } else if s < 3600 {
-        format!("{}m", s / 60)
+        (s / 60, "m")
     } else {
-        format!("{}h", s / 3600)
+        (s / 3600, "h")
     }
 }

@@ -36,6 +36,7 @@ pub(super) struct DiskWtRow {
     pub target_bytes: u64,
     /// Age of the cached measurement in seconds, `None` when unknown/unstamped.
     pub age_secs: Option<u64>,
+    pub measured_at_secs: Option<u64>,
 }
 
 /// Everything the overlay hands the renderer for one tab. A struct rather than a
@@ -176,16 +177,16 @@ fn notifications(cx: &Ctx<'_>) -> TabBuild {
 /// cache — sorted by total size (biggest first), with the measurement age. Pure:
 /// no filesystem walk, so opening the tab never triggers a `du`.
 pub(super) fn worktree_disk_rows(model: &FrameModel, now_secs: u64) -> Vec<DiskWtRow> {
+    #[cfg(test)]
+    crate::proc_workload_alloc::disk_rows();
     let stamps = &model.sidebar_status.disk_stamps;
     let mut rows: Vec<DiskWtRow> = model
         .sidebar_status
         .disk_sizes
         .iter()
         .map(|(path, (total, target))| {
-            let age_secs = stamps
-                .get(path)
-                .filter(|&&t| t > 0)
-                .map(|&t| now_secs.saturating_sub(t as u64));
+            let measured_at_secs = stamps.get(path).filter(|&&t| t > 0).map(|&t| t as u64);
+            let age_secs = measured_at_secs.map(|stamp| now_secs.saturating_sub(stamp));
             DiskWtRow {
                 name: std::path::Path::new(path)
                     .file_name()
@@ -195,15 +196,17 @@ pub(super) fn worktree_disk_rows(model: &FrameModel, now_secs: u64) -> Vec<DiskW
                 total_bytes: (*total).max(0) as u64,
                 target_bytes: (*target).max(0) as u64,
                 age_secs,
+                measured_at_secs,
             }
         })
         .collect();
     // Biggest first — the point is finding the worktree eating the disk. Ties
-    // break by name so the order is stable frame to frame.
+    // break by name and then the full path, including duplicate basenames.
     rows.sort_by(|a, b| {
         b.total_bytes
             .cmp(&a.total_bytes)
             .then_with(|| a.name.cmp(&b.name))
+            .then_with(|| a.path.cmp(&b.path))
     });
     rows
 }
@@ -906,6 +909,8 @@ fn procs(
         return plain(out);
     }
 
+    let widths = process_column_widths(cx.cols);
+    let name_width = widths[1];
     let body: Vec<Vec<Cell>> = rows
         .iter()
         .map(|p| {
@@ -915,18 +920,10 @@ fn procs(
             let name_tone = owner_tone(p.owner);
             // Tree indent: two spaces per depth, with an elision marker on a row
             // whose real parent fell outside the kept top-N set.
-            let mut name = String::new();
-            if tree && p.depth > 0 {
-                name.push_str(&"  ".repeat(p.depth));
-            }
-            if p.elided_parent && tree {
-                name.push_str("… ");
-            }
-            name.push_str(&p.name);
-            let name_budget = 24usize.saturating_sub(p.depth * 2);
+            let name = process_name(p, tree, name_width);
             vec![
-                Cell::Text(format!("{:>7}", p.pid), Tok::Slot(S::Ghost)),
-                Cell::Text(trunc(&name, name_budget.max(6)), name_tone),
+                Cell::Text(p.pid.to_string(), Tok::Slot(S::Ghost)),
+                Cell::Text(name, name_tone),
                 Cell::Text(procs_view::owner_label(p.owner), Tok::Slot(S::Ghost)),
                 Cell::Text(
                     if snap.primed {
@@ -941,17 +938,20 @@ fn procs(
         })
         .collect();
     let row_y = row_ys(&out, body.len(), true);
-    out.push(Section::Table(TableSection {
-        header: vec![
-            "pid".into(),
-            "name".into(),
-            "owner".into(),
-            "cpu".into(),
-            "mem".into(),
-        ],
-        rows: body,
-        sel: Some(sel),
-    }));
+    out.push(Section::FixedTable {
+        table: TableSection {
+            header: vec![
+                "pid".into(),
+                "name".into(),
+                "owner".into(),
+                "cpu".into(),
+                "mem".into(),
+            ],
+            rows: body,
+            sel: Some(sel),
+        },
+        widths: widths.to_vec(),
+    });
     TabBuild {
         sections: out,
         row_y,
@@ -959,6 +959,64 @@ fn procs(
 }
 
 // --- Containers ----------------------------------------------------------
+
+fn process_name(row: &ProcRow, tree: bool, name_width: usize) -> String {
+    let mut name = String::new();
+    if tree && row.depth > 0 {
+        name.push_str(
+            &" ".repeat(
+                row.depth
+                    .saturating_mul(2)
+                    .min(name_width.saturating_sub(1)),
+            ),
+        );
+    }
+    if row.elided_parent && tree {
+        name.push_str("… ");
+    }
+    name.push_str(&row.name);
+    name
+}
+
+/// Reflow the already-owned process body without observing a newer snapshot.
+/// Its headings, values and selected identity remain frozen while paused.
+pub(super) fn reflow_process_geometry(
+    body: &mut [Section],
+    rows: &[ProcRow],
+    tree: bool,
+    cols: usize,
+) {
+    let new_widths = process_column_widths(cols);
+    for section in body {
+        if let Section::FixedTable { table, widths } = section {
+            *widths = new_widths.to_vec();
+            for (cells, row) in table.rows.iter_mut().zip(rows) {
+                if let Some(Cell::Text(name, _)) = cells.get_mut(1) {
+                    *name = process_name(row, tree, new_widths[1]);
+                }
+            }
+        }
+    }
+}
+
+/// Stable at each viewport width, independent of sampled values and ordering.
+/// Include one cursor gutter and four intercolumn spaces in the budget. Preserve
+/// numeric/owner room first; the name receives the remaining viewport space.
+fn process_column_widths(cols: usize) -> [usize; 5] {
+    let mut remaining = cols.saturating_sub(5);
+    let mut widths = [0usize; 5];
+    for width in &mut widths {
+        *width = remaining.min(1);
+        remaining -= *width;
+    }
+    for (index, target) in [(0, 10usize), (3, 7), (4, 9), (2, 9)] {
+        let extra = target.saturating_sub(widths[index]).min(remaining);
+        widths[index] += extra;
+        remaining -= extra;
+    }
+    widths[1] += remaining;
+    widths
+}
 
 fn containers(cx: &Ctx, sel: usize) -> TabBuild {
     use thegn_core::sandbox_manage::{Health, container_health, human_bytes};
