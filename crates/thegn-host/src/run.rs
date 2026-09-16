@@ -1590,6 +1590,21 @@ fn restore_failed_region_switch(
     *region_last_t = prior_last_t;
 }
 
+fn is_project_activation_target(target: &crate::sidebar::RowTarget) -> bool {
+    matches!(
+        target,
+        crate::sidebar::RowTarget::Workspace { repo_path, .. } if repo_path != "terminal"
+    )
+}
+
+fn should_restore_failed_activation(
+    project_target: bool,
+    landed: bool,
+    same_session: bool,
+) -> bool {
+    project_target && !landed && same_session
+}
+
 /// Worktree group indices in the order the sidebar DISPLAYS them (home-first
 /// name sort, pins, filter). Alt+↑/↓ steps through this, not the session's
 /// internal order — otherwise switching "skips around" relative to the tree.
@@ -7270,6 +7285,7 @@ async fn event_loop<T: Terminal>(
         ($target:expr) => {{
             let target = $target;
             let was_terminal = active_is_terminal(&session);
+            let project_target = is_project_activation_target(&target);
             let prior_session = session.id.clone();
             let prior_active = session.active;
             let prior_last_w = region_last_w.clone();
@@ -7281,10 +7297,7 @@ async fn event_loop<T: Terminal>(
             // A row that switches PROJECT leaves the terminals region first, so
             // this workspace parks on a worktree (see `leave_terminal_region!`).
             // The `"terminal"` sentinel is not such a row — it stays in-region.
-            if matches!(
-                &target,
-                crate::sidebar::RowTarget::Workspace { repo_path, .. } if repo_path != "terminal"
-            ) {
+            if project_target {
                 leave_terminal_region!();
             }
             let landed = activate_row_target(
@@ -7301,7 +7314,8 @@ async fn event_loop<T: Terminal>(
                 &mut clear_on_next_frame,
                 Some((&terminal_restore_tx, &waker)),
             );
-            if !landed && session.id == prior_session {
+            if should_restore_failed_activation(project_target, landed, session.id == prior_session)
+            {
                 // Project activation sanitizes a terminal focus before the
                 // cold switch so a successfully parked workspace resumes on a
                 // worktree. That mutation is provisional: if DB open/resurrect
