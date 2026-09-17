@@ -207,6 +207,9 @@ pub struct NewWorktreeWizard {
     sandbox_sel: usize,
     agent_rows: Vec<(String, String)>,
     agent_sel: usize,
+    /// A speculative worker can fail before the user has submitted. Keep its
+    /// explanation visible until dismissed, without accepting more commands.
+    failure: Option<String>,
 }
 
 impl NewWorktreeWizard {
@@ -294,12 +297,17 @@ impl NewWorktreeWizard {
             sandbox_sel,
             agent_rows,
             agent_sel: 0,
+            failure: None,
         }
     }
 
     /// The repo root this wizard creates worktrees under.
     pub fn root(&self) -> &PathBuf {
         &self.root
+    }
+
+    pub(crate) fn set_failure(&mut self, error: &str) {
+        self.failure = Some(crate::provision_recover::sanitize_detail(error));
     }
 
     /// Attach per-env host-readiness badges (see
@@ -476,7 +484,7 @@ impl NewWorktreeWizard {
     /// paste appends there (newlines stripped so it can't submit); pastes on
     /// the cycle/list fields are ignored.
     pub fn handle_paste(&mut self, text: &str) {
-        if self.focus != Field::Name {
+        if self.failure.is_some() || self.focus != Field::Name {
             return;
         }
         for c in text.chars().filter(|c| !matches!(c, '\n' | '\r')) {
@@ -497,6 +505,9 @@ impl NewWorktreeWizard {
         }
         if crate::input::is_escape_key(key) {
             return WizardOutcome::Cancel;
+        }
+        if self.failure.is_some() {
+            return WizardOutcome::Pending;
         }
         // Enter is field-specific: it *creates* only on the Program list (the
         // terminal field the wizard opens on); on every other field it means
@@ -607,6 +618,10 @@ impl NewWorktreeWizard {
     /// Paint the single-plane form as a centered layer: name, host, sandbox,
     /// program list, and a footer hint.
     pub fn render(&self, surface: &mut Surface, screen: Rect) {
+        if let Some(error) = &self.failure {
+            self.render_failure(surface, screen, error);
+            return;
+        }
         let show_collision = self.focus == Field::Name && !self.name_checked && !self.name_edited;
         // name + host + sandbox + program header + the program list, plus the
         // transient collision line and a footer/gap.
@@ -783,6 +798,43 @@ impl NewWorktreeWizard {
             &Line::segs(vec![seg(
                 Tok::Slot(S::Faint),
                 format!("↑↓ move · ←→ change · {enter_verb} · esc cancel"),
+            )]),
+            panel,
+        );
+    }
+
+    fn render_failure(&self, surface: &mut Surface, screen: Rect, error: &str) {
+        let cols = 70.min(screen.cols.saturating_sub(6));
+        let lines = seg::wrap(&[seg(Tok::Slot(S::Text), error)], cols, 0);
+        let spec = LayerSpec {
+            title: format!("new worktree — {}", self.repo_slug),
+            cols,
+            rows: lines.len() + 4,
+            ..LayerSpec::default()
+        };
+        let Some(inner) = open_layer(surface, screen, &spec) else {
+            return;
+        };
+        let panel = Tok::Slot(S::Panel);
+        let mut body = vec![
+            Line::segs(vec![
+                seg(Tok::Slot(S::Accent), "Could not prepare worktree").bold(),
+            ]),
+            Line::Blank,
+        ];
+        body.extend(lines.into_iter().map(Line::segs));
+        // Reserve the last visible row for dismissal, including small screens.
+        for (row, line) in body.iter().take(inner.rows.saturating_sub(1)).enumerate() {
+            seg::draw_line(surface, inner.x, inner.y + row, inner.cols, line, panel);
+        }
+        seg::draw_line(
+            surface,
+            inner.x,
+            inner.y + inner.rows - 1,
+            inner.cols,
+            &Line::segs(vec![seg(
+                Tok::Slot(S::Faint),
+                "esc close · fix the error, then reopen",
             )]),
             panel,
         );
@@ -1029,6 +1081,52 @@ pub struct WorkerCtx {
     pub base_override: Option<String>,
 }
 
+/// Preserve Git's failure reason: a missing ref, an inaccessible repository,
+/// and an unborn branch must not all be reported as "no commits".
+fn verify_base(root: &Path, base: &str) -> Result<(), String> {
+    let result = util::git_cmd(root)
+        .args([
+            "rev-parse",
+            "--verify",
+            "--end-of-options",
+            &format!("{base}^{{commit}}"),
+        ])
+        .output();
+    let reason = match result {
+        Ok(output) if output.status.success() => return Ok(()),
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if stderr.trim().is_empty() {
+                format!("git exited with {}", output.status)
+            } else {
+                stderr.trim().to_string()
+            }
+        }
+        Err(error) => format!("could not run git: {error}"),
+    };
+    let branch_ref = if base.starts_with("refs/heads/") {
+        base.to_string()
+    } else {
+        format!("refs/heads/{base}")
+    };
+    let unborn = util::git_out(root, &["symbolic-ref", "--quiet", "HEAD"])
+        .is_some_and(|head| head == branch_ref)
+        && util::git_cmd(root)
+            .args(["show-ref", "--verify", "--quiet", &branch_ref])
+            .output()
+            .is_ok_and(|output| output.status.code() == Some(1));
+    if unborn {
+        return Err(format!(
+            "Base branch '{base}' has no commit yet. Make an initial commit before creating a worktree. Repository: {}. Git: {reason}",
+            root.display()
+        ));
+    }
+    Err(format!(
+        "Cannot resolve base '{base}': {reason} (repository: {})",
+        root.display()
+    ))
+}
+
 /// The blocking half of worktree creation, run on a `spawn_blocking` thread:
 /// preflight (collision-free name + base), speculative `git worktree add`
 /// under the suggested name, then a command loop driven by the wizard —
@@ -1052,6 +1150,7 @@ pub fn run_worker(
         tracing::info!(
             target: "thegn::worktree_create",
             since_ms = started.elapsed().as_millis() as u64,
+            repo = %root.display(),
             step = s.label(),
             state = ?state,
             "step"
@@ -1091,11 +1190,8 @@ pub fn run_worker(
         Some(b) if !b.is_empty() => b.to_string(),
         _ => worktree::resolve_base(root, cfg),
     };
-    if util::git_out(root, &["rev-parse", "--verify", "--quiet", &base]).is_none() {
-        fail(
-            CreateStep::ResolveBase,
-            format!("'{base}' has no commits yet — make an initial commit first"),
-        );
+    if let Err(error) = verify_base(root, &base) {
+        fail(CreateStep::ResolveBase, error);
         return;
     }
     let mut branch = worktree::dedupe(&ctx.candidate, &taken);
@@ -1839,6 +1935,72 @@ mod tests {
     }
 
     #[test]
+    fn failed_wizard_stays_visible_and_cannot_submit_or_prepare() {
+        let mut w = NewWorktreeWizard::new(std::env::temp_dir(), &test_cfg());
+        w.focus = Field::Name;
+        let candidate = w.candidate();
+        w.set_failure("resolve base: \x1b[31mfatal: Needed a single revision\x1b[0m");
+        w.handle_paste("unwanted-edit");
+        for keycode in [
+            KeyCode::Enter,
+            KeyCode::DownArrow,
+            KeyCode::RightArrow,
+            KeyCode::Char('a'),
+        ] {
+            assert_eq!(key(&mut w, keycode), WizardOutcome::Pending);
+        }
+        assert_eq!(w.candidate(), candidate);
+        for (cols, rows) in [(80, 24), (40, 12), (8, 4)] {
+            // Repeated frames model worker/hydration/pane-output redraws. The
+            // error remains owned by the wizard, independent of status text.
+            for _ in 0..3 {
+                let mut surface = Surface::new(cols, rows);
+                w.render(
+                    &mut surface,
+                    Rect {
+                        x: 0,
+                        y: 0,
+                        cols,
+                        rows,
+                    },
+                );
+                let frame = surface
+                    .screen_cells()
+                    .iter()
+                    .map(|row| row.iter().map(|cell| cell.str()).collect::<String>())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if cols >= 40 {
+                    assert!(frame.contains("Could not prepare worktree"));
+                    assert!(frame.contains("fatal:"));
+                    assert!(frame.contains("esc close"));
+                    assert!(!frame.contains("enter create"));
+                    assert!(!frame.contains("[31m"));
+                }
+            }
+        }
+        assert_eq!(key(&mut w, KeyCode::Escape), WizardOutcome::Cancel);
+    }
+
+    #[test]
+    fn verify_base_reports_missing_repo_and_ref_without_claiming_no_commits() {
+        let repo = temp_repo("verify-base");
+        assert!(verify_base(&repo, "main").is_ok());
+        let error = verify_base(&repo, "missing-branch").unwrap_err();
+        assert!(error.contains("missing-branch"));
+        assert!(error.contains("fatal:"));
+        assert!(!error.contains("no commits"));
+        let error = verify_base(&repo.join("missing-directory"), "main").unwrap_err();
+        assert!(error.contains("missing-directory"));
+        assert!(error.contains("cannot change to"));
+        assert!(!error.contains("no commits"));
+        // A tree exists but cannot be used as the base of a new branch.
+        assert!(verify_base(&repo, "HEAD^{tree}").is_err());
+        assert!(verify_base(&repo, "--help").is_err());
+        std::fs::remove_dir_all(&repo).unwrap();
+    }
+
+    #[test]
     fn worker_creates_speculatively_and_finishes_on_submit() {
         let repo = temp_repo("happy");
         let db = repo.join("state/thegn.db");
@@ -2100,13 +2262,24 @@ mod tests {
         let db = dir.join("state/thegn.db");
         let events = drive_worker(&dir, "tg/x", vec![], &db);
         assert!(done_payload(&events).is_none());
-        assert!(events.iter().any(|e| matches!(
-            e,
-            CreateEvent::Failed {
-                step: CreateStep::ResolveBase,
-                ..
-            }
-        )));
+        let error = events
+            .iter()
+            .find_map(|e| match e {
+                CreateEvent::Failed {
+                    step: CreateStep::ResolveBase,
+                    error,
+                    ..
+                } => Some(error),
+                _ => None,
+            })
+            .expect("empty repo must fail preflight");
+        assert!(error.contains("Make an initial commit"));
+        assert!(error.contains(&dir.to_string_lossy().to_string()));
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, CreateEvent::TabOpened { .. }))
+        );
         let _ = std::fs::remove_dir_all(&dir); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 
