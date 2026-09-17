@@ -1028,6 +1028,9 @@ fn compose_spec_clean_shell_choice_uses_rc_free_shell() {
 fn prepare_sandbox_none_backend_falls_to_host() {
     let mut cfg = Config::default();
     cfg.sandbox.backend = thegn_core::config::SandboxBackend::None;
+    // `none` is an intentional host decision, so `on_missing = fail` must not
+    // turn the post-resolution notice into a process-fatal diagnostic.
+    cfg.sandbox.on_missing = thegn_core::config::OnMissing::Fail;
     cfg.sandbox
         .volumes
         .insert("/tmp/ignored".into(), "/mnt/ignored".into());
@@ -1048,6 +1051,20 @@ fn prepare_sandbox_none_backend_falls_to_host() {
     )
     .unwrap();
     assert!(out.spec.is_none());
+    assert!(out.warnings.is_empty());
+}
+
+#[test]
+fn disabled_sandbox_auto_backend_skips_host_fallback_notice() {
+    let mut cfg = Config::default();
+    cfg.sandbox.enabled = false;
+    cfg.sandbox.on_missing = thegn_core::config::OnMissing::Fail;
+    let loc = GitLoc::from_db("/wt/x", None);
+    let out = prepare_sandbox_env(&cfg, Path::new("/repo"), "/wt/x", &loc, None, false, None)
+        .expect("disabled sandbox is an intentional host decision");
+    assert!(out.spec.is_none());
+    assert_eq!(out.backend_label, "host");
+    assert!(out.warnings.is_empty());
 }
 
 #[test]
