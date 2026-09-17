@@ -437,7 +437,13 @@ mod tests {
             t0 + Duration::from_secs(1),
             |command| scheduled.push(command),
         );
-        assert!(matches!(scheduled[0], StatusTimerCommand::Arm { .. }));
+        assert_eq!(
+            scheduled[0],
+            StatusTimerCommand::Arm {
+                generation: 1,
+                delay: STATUS_TTL
+            }
+        );
         assert_eq!(scheduled[1], StatusTimerCommand::Cancel);
     }
 
@@ -577,13 +583,13 @@ mod tests {
             m.status = format!("message-{n}");
             sl.tick(&mut m, Mode::Normal, t0, |command| latest = Some(command));
         }
-        assert!(matches!(
+        assert_eq!(
             latest,
             Some(StatusTimerCommand::Arm {
                 generation: 128,
-                ..
+                delay: STATUS_TTL,
             })
-        ));
+        );
         assert_eq!(m.status, "message-127");
     }
 
