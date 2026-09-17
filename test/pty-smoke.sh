@@ -38,6 +38,12 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# A live thegn exports config overlays, including database migration authority.
+# This fixture owns its state and must not inherit another executable's policy.
+for var in "${!THEGN_@}"; do
+  unset "$var"
+done
+
 fail=0
 ok() { printf '  \033[32mok\033[0m   %s\n' "$1"; }
 bad() {
@@ -51,13 +57,15 @@ run_case() {
   local home="$root/home"
   local config="$root/config"
   local state="$root/state"
+  local runtime="$root/run"
   local log="$root/typescript"
-  mkdir -p "$home" "$config" "$state"
+  mkdir -p "$home" "$config" "$state" "$runtime"
+  chmod 700 "$runtime"
 
   local cmd
   printf -v cmd \
-    'stty cols %q rows %q; env HOME=%q XDG_CONFIG_HOME=%q XDG_STATE_HOME=%q THEGN_BENCH_FIRST_FRAME_EXIT=1 %q' \
-    "$cols" "$rows" "$home" "$config" "$state" "$TG"
+    'stty cols %q rows %q; env HOME=%q XDG_CONFIG_HOME=%q XDG_STATE_HOME=%q XDG_RUNTIME_DIR=%q THEGN_BENCH_FIRST_FRAME_EXIT=1 %q' \
+    "$cols" "$rows" "$home" "$config" "$state" "$runtime" "$TG"
 
   # `script`'s CLI differs between util-linux and BSD — see test/lib/pty.sh.
   # Single quotes are deliberate: $0/$1/$2 are the INNER bash's positionals,
