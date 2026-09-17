@@ -64,7 +64,13 @@ pub struct ControlState {
 pub(super) struct RequestAuth {
     headers: HttpHeaderMap,
     peer: Option<PeerIdentity>,
+    admitted_capability: Option<String>,
 }
+
+/// Capability admitted by the authenticated push-inbox envelope. It is an
+/// in-process request extension, never accepted from an external HTTP peer.
+#[derive(Clone)]
+struct AdmittedCapability(String);
 
 impl<S> FromRequestParts<S> for RequestAuth
 where
@@ -80,6 +86,10 @@ where
         Ok(Self {
             headers: parts.headers.clone(),
             peer,
+            admitted_capability: parts
+                .extensions
+                .get::<AdmittedCapability>()
+                .map(|cap| cap.0.clone()),
         })
     }
 }
@@ -163,9 +173,12 @@ const DISPATCH_BODY_LIMIT: usize = 1024 * 1024;
 /// — one capability dispatch, never a second policy table. `state` must be built
 /// with `local_admin = true` (the inbox is the authenticator; the handler's
 /// transport-auth is satisfied in-process), so callers outside the daemon must
-/// not expose this.
+/// not expose this. The admitted capability is carried in a private request
+/// extension and rechecked against the handler's routed verb before the API is
+/// invoked.
 pub async fn dispatch_local(
     state: ControlState,
+    admitted_capability: &str,
     method: &str,
     path: &str,
     body: Option<serde_json::Value>,
@@ -191,6 +204,9 @@ pub async fn dispatch_local(
     request
         .extensions_mut()
         .insert(ConnectInfo(IpcConnectInfo::trusted_internal()));
+    request
+        .extensions_mut()
+        .insert(AdmittedCapability(admitted_capability.to_string()));
     let response = match router(state).oneshot(request).await {
         Ok(r) => r,
         // The router service is infallible (`Error = Infallible`); this arm is
@@ -299,6 +315,16 @@ pub(super) fn authed_target(
             }
         }
     };
+    if let Some(admitted) = headers.admitted_capability.as_deref()
+        && thegn_core::capability::lookup(admitted).is_none_or(|cap| cap.verb != verb)
+    {
+        audit(&ctx, verb, target, AuditOutcome::NoScope);
+        return Err(error_json(
+            StatusCode::BAD_REQUEST,
+            ControlErrorCode::BadRequest,
+            "admitted capability does not match the routed method",
+        ));
+    }
     if let Err(e) = ctx.require(required_scope(verb)) {
         audit(&ctx, verb, target, AuditOutcome::NoScope);
         return Err(e.into_response());
