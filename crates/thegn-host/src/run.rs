@@ -6511,6 +6511,10 @@ async fn event_loop<T: Terminal>(
     let mut last_acked_tab: Option<String> = None;
     // Status-message TTL tracker (loop-owned; see `handlers::status_line`).
     let mut status_line = crate::handlers::status_line::StatusLine::default();
+    // One replaceable deadline owner for transient status messages. It emits
+    // a waker pulse only when the armed deadline expires; idle state waits
+    // indefinitely on its Condvar (see `handlers::status_line`).
+    let status_scheduler = crate::handlers::status_line::StatusScheduler::new(waker.clone());
 
     // The pin supervisor owns daemon panes independent of tabs/visibility.
     let mut supervisor = crate::pins::PinSupervisor::from_config(keymap.config());
@@ -12164,15 +12168,18 @@ async fn event_loop<T: Terminal>(
             last_acked_tab = None;
         }
 
-        // Expire a transient status message past its TTL (the tracker schedules
-        // the wake that brings us here, so an idle loop still clears on time).
-        if status_line.tick(&mut model, mode, std::time::Instant::now(), |delay| {
-            let wk = waker.clone();
-            std::thread::spawn(move || {
-                std::thread::sleep(delay);
-                let _ = wk.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
-            });
+        // Observe status changes before consuming a timer pulse. That ordering
+        // advances the generation first when an action replaced the message in
+        // the same iteration, so a stale expiry cannot clear the replacement.
+        let status_now = std::time::Instant::now();
+        if status_line.tick(&mut model, mode, status_now, |command| {
+            status_scheduler.apply(command);
         }) {
+            dirty = true;
+        }
+        if let Some(generation) = status_scheduler.take_expired()
+            && status_line.expire(&mut model, mode, generation, status_now)
+        {
             dirty = true;
         }
         // Mirror the focus zone into the render model RIGHT BEFORE rendering —
