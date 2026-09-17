@@ -33,6 +33,17 @@ cleanup() {
 trap cleanup EXIT
 
 export HOME="$TMP" XDG_CONFIG_HOME="$TMP/.config" XDG_STATE_HOME="$TMP/.local/state"
+# Git's config is part of the fixture boundary too. A runner may provide a
+# global/system LFS filter (or injected GIT_CONFIG_* pairs); merge cleanup
+# deliberately refuses those filters because status could execute them. Keep
+# the smoke repo independent of whichever Git config launched the test.
+export GIT_CONFIG_GLOBAL="$TMP/gitconfig" GIT_CONFIG_SYSTEM=/dev/null GIT_CONFIG_NOSYSTEM=1
+export GIT_CONFIG_COUNT=0
+unset GIT_CONFIG GIT_CONFIG_PARAMETERS GIT_TEMPLATE_DIR
+for var in "${!GIT_CONFIG_KEY_@}" "${!GIT_CONFIG_VALUE_@}"; do
+  unset "$var"
+done
+: >"$GIT_CONFIG_GLOBAL"
 # Isolate the runtime dir too: the daemon control socket prefers
 # $XDG_RUNTIME_DIR/thegn/daemon.sock, so leaving the real one exported would
 # let the socket probe cross-connect these checks to a live daemon.
@@ -818,15 +829,29 @@ sweep_fixture() {
   PATH="$TMP/sweep-bin" "$SZ" --set sandbox.enabled=false \
     --set sandbox.vpn.provider=none merge sweep "$@"
 }
+# Capture the complete report before matching it. This keeps a future refusal
+# reason visible when a check fails instead of letting a pipe consume it.
+sweep_has() {
+  local pattern=$1 output="$TMP/sweep-output"
+  shift
+  if ! sweep_fixture "$@" >"$output" 2>&1; then
+    cat "$output" >&2
+    return 1
+  fi
+  if ! grep "$pattern" "$output" >/dev/null; then
+    cat "$output" >&2
+    return 1
+  fi
+}
 printf '/.smoke-sweep-ignored\n' >>"$(git -C "$MP" rev-parse --git-path info/exclude)"
 printf 'keep-me\n' >"$MP/.smoke-sweep-ignored"
 check "sweep fixture contains ignored work" \
   "git -C '$MP' check-ignore -q .smoke-sweep-ignored"
 check "sweep --force preserves ignored work" \
-  "sweep_fixture --force | grep 'ignored work' >/dev/null && [[ \$(cat '$MP/.smoke-sweep-ignored') == keep-me ]]"
+  "sweep_has 'ignored work' --force && [[ \$(cat '$MP/.smoke-sweep-ignored') == keep-me ]]"
 rm -- "$MP/.smoke-sweep-ignored"
 check "sweep --force removes the merged worktree" \
-  "sweep_fixture --force | grep 'swept' >/dev/null && [[ ! -d '$MP' ]]"
+  "sweep_has swept --force && [[ ! -d '$MP' ]]"
 # Physical collection deliberately retains the branch and an explicit cleanup
 # hold (THE-596); branch deletion cannot atomically prove the ref type yet.
 check "sweep --force retains the merged branch for explicit cleanup" \
