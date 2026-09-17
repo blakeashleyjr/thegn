@@ -133,6 +133,31 @@ impl std::fmt::Display for ControlRequestError {
 
 impl std::error::Error for ControlRequestError {}
 
+/// A successful control response that violates the JSON protocol. Keep these
+/// messages fixed: proxy bodies and content-type values are untrusted and must
+/// never become part of an error shown or logged by callers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlProtocolError {
+    EmptySuccessBody,
+    MissingJsonContentType,
+    InvalidJson,
+}
+
+impl std::fmt::Display for ControlProtocolError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let message = match self {
+            Self::EmptySuccessBody => "control protocol success response was empty",
+            Self::MissingJsonContentType => {
+                "control protocol success response was not declared as JSON"
+            }
+            Self::InvalidJson => "control protocol success response contained invalid JSON",
+        };
+        f.write_str(message)
+    }
+}
+
+impl std::error::Error for ControlProtocolError {}
+
 fn request_error(status: u16, value: &Value) -> ControlRequestError {
     let message = value
         .get("error")
@@ -142,6 +167,49 @@ fn request_error(status: u16, value: &Value) -> ControlRequestError {
         .get("code")
         .and_then(|value| serde_json::from_value(value.clone()).ok());
     ControlRequestError::with_code(status, message, code)
+}
+
+fn required_field<'a>(value: &'a Value, field: &str) -> Result<&'a Value> {
+    value
+        .get(field)
+        .ok_or_else(|| anyhow!("control response is missing required `{field}` field"))
+}
+
+fn required_array<'a>(value: &'a Value, field: &str) -> Result<&'a Value> {
+    let value = required_field(value, field)?;
+    anyhow::ensure!(
+        value.is_array(),
+        "control response field `{field}` was not an array"
+    );
+    Ok(value)
+}
+
+fn is_json_content_type(value: &str) -> bool {
+    value
+        .split(';')
+        .next()
+        .is_some_and(|kind| kind.trim().eq_ignore_ascii_case("application/json"))
+}
+
+/// Parse a response body for the two HTTP control transports. Every current
+/// JSON control route declares a JSON success body; there is no documented
+/// empty-body success route to allow here. Non-success bodies remain best
+/// effort because they feed the existing structured server-error fallback.
+fn parse_response_body(status: u16, content_type: Option<&str>, bytes: &[u8]) -> Result<Value> {
+    if !(200..300).contains(&status) {
+        return Ok(if bytes.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(bytes).unwrap_or(Value::Null)
+        });
+    }
+    if bytes.is_empty() {
+        return Err(ControlProtocolError::EmptySuccessBody.into());
+    }
+    if !content_type.is_some_and(is_json_content_type) {
+        return Err(ControlProtocolError::MissingJsonContentType.into());
+    }
+    serde_json::from_slice(bytes).map_err(|_| ControlProtocolError::InvalidJson.into())
 }
 
 /// Control messages for an attached session stream.
@@ -306,7 +374,7 @@ impl ControlClient {
     pub async fn worktrees(&self) -> Result<Vec<super::WorktreeInfo>> {
         let v = self.request("GET", "/v1/worktrees", None).await?;
         Ok(serde_json::from_value(
-            v.get("worktrees").cloned().unwrap_or(Value::Array(vec![])),
+            required_array(&v, "worktrees")?.clone(),
         )?)
     }
 
@@ -333,15 +401,36 @@ impl ControlClient {
         let v = self
             .request("GET", &format!("/v1/sessions/{session}/snapshot"), None)
             .await?;
+        let returned_session = required_field(&v, "session")?
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow!("snapshot response has no session identity"))?;
+        anyhow::ensure!(
+            returned_session == session,
+            "snapshot response session identity did not match the request"
+        );
+        let seq = required_field(&v, "seq")?
+            .as_u64()
+            .ok_or_else(|| anyhow!("snapshot response has no valid sequence"))?;
+        let rows = u16::try_from(
+            required_field(&v, "rows")?
+                .as_u64()
+                .ok_or_else(|| anyhow!("snapshot response has no valid row count"))?,
+        )
+        .map_err(|_| anyhow!("snapshot response row count exceeded u16"))?;
+        let cols = u16::try_from(
+            required_field(&v, "cols")?
+                .as_u64()
+                .ok_or_else(|| anyhow!("snapshot response has no valid column count"))?,
+        )
+        .map_err(|_| anyhow!("snapshot response column count exceeded u16"))?;
+        let ansi_b64 = required_field(&v, "ansi_b64")?
+            .as_str()
+            .ok_or_else(|| anyhow!("snapshot response has no ANSI payload"))?;
         let bytes = base64::engine::general_purpose::STANDARD
-            .decode(v.get("ansi_b64").and_then(Value::as_str).unwrap_or(""))
+            .decode(ansi_b64)
             .context("snapshot base64")?;
-        Ok((
-            v.get("seq").and_then(Value::as_u64).unwrap_or(0),
-            v.get("rows").and_then(Value::as_u64).unwrap_or(0) as u16,
-            v.get("cols").and_then(Value::as_u64).unwrap_or(0) as u16,
-            bytes,
-        ))
+        Ok((seq, rows, cols, bytes))
     }
 
     pub async fn send_input(&self, session: &str, bytes: &[u8], enter: bool) -> Result<()> {
@@ -446,9 +535,7 @@ impl ControlClient {
     /// `pr_cache` entry.
     pub async fn pr_status(&self) -> Result<Vec<super::PrStatusRow>> {
         let v = self.request("GET", "/v1/pr/status", None).await?;
-        Ok(serde_json::from_value(
-            v.get("prs").cloned().unwrap_or(Value::Array(vec![])),
-        )?)
+        Ok(serde_json::from_value(required_array(&v, "prs")?.clone())?)
     }
 
     /// `GET /v1/ci/runs` — cache-first CI run history for a worktree.
@@ -496,10 +583,7 @@ impl ControlClient {
     pub async fn automations_list(&self) -> Result<Vec<super::AutomationRuleInfo>> {
         let value = self.request("GET", "/v1/automations", None).await?;
         Ok(serde_json::from_value(
-            value
-                .get("rules")
-                .cloned()
-                .unwrap_or(Value::Array(Vec::new())),
+            required_array(&value, "rules")?.clone(),
         )?)
     }
 
@@ -620,7 +704,7 @@ impl ControlClient {
         }
         let v = self.request("GET", &path, None).await?;
         Ok(serde_json::from_value(
-            v.get("issues").cloned().unwrap_or(Value::Array(vec![])),
+            required_array(&v, "issues")?.clone(),
         )?)
     }
 
@@ -656,7 +740,7 @@ impl ControlClient {
     pub async fn dispatches_list(&self) -> Result<Vec<thegn_core::issue::AgentDispatch>> {
         let v = self.request("GET", "/v1/dispatches", None).await?;
         Ok(serde_json::from_value(
-            v.get("dispatches").cloned().unwrap_or(Value::Array(vec![])),
+            required_array(&v, "dispatches")?.clone(),
         )?)
     }
 
@@ -1155,6 +1239,11 @@ async fn send_origin_request(
     }
     let response = request.send().await.context("control HTTP request")?;
     let status = response.status().as_u16();
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
     if (300..400).contains(&status) {
         // Do not parse a redirect body. The caller turns this into a fixed
         // error, and dropping the response is sufficient to release it.
@@ -1164,11 +1253,7 @@ async fn send_origin_request(
         .bytes()
         .await
         .context("control HTTP response body")?;
-    let value = if bytes.is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_slice(&bytes).unwrap_or(Value::Null)
-    };
+    let value = parse_response_body(status, content_type.as_deref(), &bytes)?;
     Ok((status, value))
 }
 
@@ -1215,17 +1300,18 @@ where
         // explicit so this path cannot grow replay behavior later.
         return Ok((status, Value::Null));
     }
+    let content_type = res
+        .headers()
+        .get(hyper::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok());
+    let content_type = content_type.map(str::to_owned);
     let bytes = res
         .into_body()
         .collect()
         .await
         .context("control response body")?
         .to_bytes();
-    let value = if bytes.is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_slice(&bytes).unwrap_or(Value::Null)
-    };
+    let value = parse_response_body(status, content_type.as_deref(), &bytes)?;
     Ok((status, value))
 }
 
@@ -1233,6 +1319,211 @@ where
 mod tests {
     use super::*;
     use thegn_core::db::Db;
+
+    async fn one_response_client(
+        origin: bool,
+        content_type: Option<&str>,
+        body: &[u8],
+        path: &str,
+    ) -> Result<Value> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let body = body.to_vec();
+        let content_type = content_type.map(str::to_owned);
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            const MAX_HEADERS: usize = 64 * 1024;
+            let mut request = Vec::with_capacity(4096);
+            loop {
+                let mut chunk = [0; 1024];
+                let n = stream.read(&mut chunk).await.unwrap();
+                assert!(n > 0, "client closed before complete request headers");
+                request.extend_from_slice(&chunk[..n]);
+                assert!(
+                    request.len() <= MAX_HEADERS,
+                    "request headers exceeded bound"
+                );
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let content_type = content_type
+                .as_deref()
+                .map_or(String::new(), |value| format!("Content-Type: {value}\r\n"));
+            let header = format!(
+                "HTTP/1.1 200 OK\r\n{content_type}Content-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(header.as_bytes()).await.unwrap();
+            stream.write_all(&body).await.unwrap();
+        });
+        let client = if origin {
+            ControlClient::new(ControlAddr::HttpOrigin {
+                origin: format!("http://{addr}"),
+                token: "protocol-token".into(),
+            })
+        } else {
+            ControlClient::new(ControlAddr::Tcp {
+                addr: addr.to_string(),
+                token: "protocol-token".into(),
+            })
+        };
+        let result = match path {
+            "/v1/worktrees" => client.worktrees().await.map(|_| Value::Bool(true)),
+            "/v1/pr/status" => client.pr_status().await.map(|_| Value::Bool(true)),
+            "/v1/automations" => client.automations_list().await.map(|_| Value::Bool(true)),
+            "/v1/issues" => client.issues_list(&[], 0).await.map(|_| Value::Bool(true)),
+            "/v1/dispatches" => client.dispatches_list().await.map(|_| Value::Bool(true)),
+            path if path.ends_with("/snapshot") => {
+                client.snapshot("s1").await.map(|_| Value::Bool(true))
+            }
+            _ => client.call_raw("GET", path, None).await,
+        };
+        server.await.unwrap();
+        result
+    }
+
+    #[tokio::test]
+    async fn successful_control_replies_require_json_and_do_not_fabricate_envelopes() {
+        for (path, valid, missing) in [
+            (
+                "/v1/worktrees",
+                br#"{"worktrees":[]}"#.as_slice(),
+                br#"{}"#.as_slice(),
+            ),
+            (
+                "/v1/pr/status",
+                br#"{"prs":[]}"#.as_slice(),
+                br#"{}"#.as_slice(),
+            ),
+            (
+                "/v1/automations",
+                br#"{"rules":[]}"#.as_slice(),
+                br#"{}"#.as_slice(),
+            ),
+            (
+                "/v1/issues",
+                br#"{"issues":[]}"#.as_slice(),
+                br#"{}"#.as_slice(),
+            ),
+            (
+                "/v1/dispatches",
+                br#"{"dispatches":[]}"#.as_slice(),
+                br#"{}"#.as_slice(),
+            ),
+        ] {
+            for origin in [false, true] {
+                let valid_result = tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    one_response_client(origin, Some("application/json"), valid, path),
+                )
+                .await
+                .expect("valid collection probe exceeded timeout");
+                assert!(valid_result.is_ok(), "origin={origin}, path={path}");
+
+                let missing_result = tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    one_response_client(origin, Some("application/json"), missing, path),
+                )
+                .await
+                .expect("missing collection envelope probe exceeded timeout");
+                assert!(missing_result.is_err(), "origin={origin}, path={path}");
+            }
+        }
+
+        for origin in [false, true] {
+            for (content_type, body, expected, protocol_error) in [
+                (
+                    Some("application/json"),
+                    br#"{"worktrees": []}"#.as_slice(),
+                    true,
+                    None,
+                ),
+                (
+                    Some("application/json"),
+                    b"{truncated".as_slice(),
+                    false,
+                    Some(ControlProtocolError::InvalidJson),
+                ),
+                (
+                    Some("text/html"),
+                    br#"{"worktrees": []}"#.as_slice(),
+                    false,
+                    Some(ControlProtocolError::MissingJsonContentType),
+                ),
+                (Some("application/json"), br#"{}"#.as_slice(), false, None),
+                (
+                    None,
+                    br#"{"worktrees": []}"#.as_slice(),
+                    false,
+                    Some(ControlProtocolError::MissingJsonContentType),
+                ),
+                (
+                    Some("application/json"),
+                    b"".as_slice(),
+                    false,
+                    Some(ControlProtocolError::EmptySuccessBody),
+                ),
+            ] {
+                let result = tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    one_response_client(origin, content_type, body, "/v1/worktrees"),
+                )
+                .await
+                .expect("protocol response probe exceeded timeout");
+                assert_eq!(result.is_ok(), expected, "origin={origin}, body={body:?}");
+                if !expected {
+                    let error = result.unwrap_err();
+                    assert_eq!(
+                        error.downcast_ref::<ControlProtocolError>().copied(),
+                        protocol_error,
+                        "origin={origin}, body={body:?}"
+                    );
+                    let error = format!("{error:#}");
+                    assert!(!error.contains("truncated"));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn snapshot_requires_identity_dimensions_and_payload_on_both_transports() {
+        for origin in [false, true] {
+            for (body, expected) in [
+                (
+                    br#"{"session":"s1","seq":7,"rows":24,"cols":80,"ansi_b64":""}"#.as_slice(),
+                    true,
+                ),
+                (
+                    br#"{"session":"other","seq":7,"rows":24,"cols":80,"ansi_b64":""}"#.as_slice(),
+                    false,
+                ),
+                (
+                    br#"{"session":"s1","seq":7,"rows":65536,"cols":80,"ansi_b64":""}"#.as_slice(),
+                    false,
+                ),
+                (
+                    br#"{"session":"s1","seq":7,"rows":24,"cols":80}"#.as_slice(),
+                    false,
+                ),
+            ] {
+                let result = tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    one_response_client(
+                        origin,
+                        Some("application/json"),
+                        body,
+                        "/v1/sessions/s1/snapshot",
+                    ),
+                )
+                .await
+                .expect("snapshot protocol probe exceeded timeout");
+                assert_eq!(result.is_ok(), expected, "origin={origin}, body={body:?}");
+            }
+        }
+    }
 
     #[test]
     fn authoritative_roster_rejects_missing_malformed_or_empty_identities() {
