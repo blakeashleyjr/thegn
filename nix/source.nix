@@ -25,6 +25,7 @@
     "Cargo.lock"
     ".cargo"
     "crates"
+    "vendor/termwiz" # Cargo.toml patches termwiz to this path dependency.
     "config"
     "extensions"
     "nix/batteries.nix"
