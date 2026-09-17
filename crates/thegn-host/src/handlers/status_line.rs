@@ -441,7 +441,7 @@ mod tests {
             scheduled[0],
             StatusTimerCommand::Arm {
                 generation: 1,
-                delay: STATUS_TTL
+                delay: STATUS_TTL + Duration::from_millis(50),
             }
         );
         assert_eq!(scheduled[1], StatusTimerCommand::Cancel);
@@ -587,7 +587,7 @@ mod tests {
             latest,
             Some(StatusTimerCommand::Arm {
                 generation: 128,
-                delay: STATUS_TTL,
+                delay: STATUS_TTL + Duration::from_millis(50),
             })
         );
         assert_eq!(m.status, "message-127");
