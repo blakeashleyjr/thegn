@@ -122,8 +122,12 @@ fn run_bounded(mut command: Command) -> Output {
             };
         }
         if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
+            if let Err(error) = child.kill() {
+                eprintln!("CLI timeout cleanup could not kill child: {error}");
+            }
+            if let Err(error) = child.wait() {
+                eprintln!("CLI timeout cleanup could not reap child: {error}");
+            }
             panic!("thegn CLI child exceeded bounded test timeout");
         }
         std::thread::sleep(Duration::from_millis(20));
