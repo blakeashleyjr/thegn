@@ -39,7 +39,7 @@ pub fn checkout_scope_for_branch(
     loc: &GitLoc,
     branch: &str,
 ) -> Result<ForgeCheckoutScope, ForgeError> {
-    if branch.is_empty() || branch == "HEAD" || has_control(&branch) {
+    if branch.is_empty() || branch == "HEAD" || has_control(branch) {
         return Err(ForgeError::NoPr);
     }
 
@@ -117,10 +117,6 @@ mod tests {
     use crate::remote::GitLoc;
     use std::path::Path;
 
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "private git fixture subprocess, never on the event loop"
-    )]
     fn git(dir: &Path, args: &[&str]) {
         let status = crate::util::git_cmd(dir).args(args).status().unwrap();
         assert!(status.success(), "git {args:?} failed: {status}");
