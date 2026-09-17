@@ -348,12 +348,9 @@ pub fn remote_host(url: &str) -> Option<String> {
     if url.is_empty() || url.trim() != url || url.bytes().any(|b| b.is_ascii_control()) {
         return None;
     }
-    // A Windows drive path is a local path, not SCP's `host:path` form.
-    if url.len() >= 3
-        && url.as_bytes()[0].is_ascii_alphabetic()
-        && url.as_bytes()[1] == b':'
-        && matches!(url.as_bytes()[2], b'/' | b'\\')
-    {
+    // A Windows drive path, including drive-relative `C:repo`, is local
+    // path syntax, not SCP's `host:path` form.
+    if url.len() >= 2 && url.as_bytes()[0].is_ascii_alphabetic() && url.as_bytes()[1] == b':' {
         return None;
     }
 
@@ -740,6 +737,7 @@ mod tests {
             "dir/git@github.com:repo",
             "C:/repo",
             r"C:\repo",
+            "C:repo",
             "@[2001:db8::1]:repo",
         ] {
             assert_eq!(remote_host(url), None, "{url}");
