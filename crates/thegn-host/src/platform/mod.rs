@@ -200,6 +200,27 @@ mod windows;
 #[cfg(windows)]
 pub use windows::*;
 
+/// Placeholder for targets without a process-group/job implementation. The
+/// desktop dispatcher still drains its bounded channel there, but has no
+/// platform notifier to launch.
+#[cfg(not(any(unix, windows)))]
+pub struct DesktopChild;
+
+#[cfg(not(any(unix, windows)))]
+impl DesktopChild {
+    pub fn poll_exit(&mut self) -> std::io::Result<bool> {
+        Ok(true)
+    }
+
+    pub fn terminate_and_wait(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    pub fn reap_owned(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// Redirect process stderr to `$XDG_STATE_HOME/thegn/logs/thegn-stderr.log`
 /// for the compositor's lifetime. Returns a guard whose `Drop` restores the
 /// original stderr. `None` (no redirect) if any step fails — never blocks

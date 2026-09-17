@@ -1109,7 +1109,8 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     // events and feeds desktop notifications + the in-app inbox + sidebar badges.
     // The desktop dispatcher reads the bus' desktop channel on its own thread.
     let event_bus = thegn_core::event_bus::EventBus::new();
-    crate::desktop_notify::spawn(
+    let desktop_dispatcher = crate::desktop_notify::spawn(
+        event_bus.clone(),
         event_bus.desktop_receiver(),
         cfg.notifications.desktop,
         thegn_core::event_bus::NotificationUrgency::parse(&cfg.notifications.desktop_min_urgency),
@@ -1184,11 +1185,13 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     // Outside the UI loop, including every early/error return. All sessions
     // close together under one application deadline; reloads share this owner.
     let cleanup_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+    desktop_dispatcher.request_stop();
     resident_supervisor.request_shutdown(cleanup_deadline);
     if let Some(worker) = &process_worker {
         worker.request_stop();
     }
-    let (resident_report, process_settlement) = tokio::join!(
+    let ((), resident_report, process_settlement) = tokio::join!(
+        desktop_dispatcher.shutdown_until(cleanup_deadline),
         resident_supervisor.shutdown_until(cleanup_deadline),
         async {
             match &process_worker {
