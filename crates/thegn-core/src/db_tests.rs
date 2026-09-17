@@ -142,6 +142,8 @@ fn creating_a_fresh_database_is_not_advancing_one() {
 
 const MIGRATION_POLICY_CHILD_CASE: &str = "THEGN_TEST_MIGRATION_POLICY_CHILD_CASE";
 const MIGRATION_POLICY_CHILD_DONE: &str = "migration-policy-child.done";
+const COMPATIBILITY_LEASE_CHILD: &str = "THEGN_TEST_COMPATIBILITY_LEASE_CHILD";
+const COMPATIBILITY_LEASE_CHILD_DONE: &str = "compatibility-lease-child.done";
 
 fn stored_user_version(path: &std::path::Path) -> i64 {
     let conn = Connection::open(path).unwrap();
@@ -621,6 +623,40 @@ fn missing_declared_column_is_typed_before_guard_sql() {
 
 #[test]
 fn compatibility_handle_and_controller_lease_exclude_each_other() {
+    if std::env::var_os(COMPATIBILITY_LEASE_CHILD).is_some() {
+        compatibility_handle_and_controller_lease_exclude_each_other_inner();
+        let state_home = std::path::PathBuf::from(std::env::var_os("XDG_STATE_HOME").unwrap());
+        std::fs::write(state_home.join(COMPATIBILITY_LEASE_CHILD_DONE), "ok").unwrap();
+        return;
+    }
+
+    // This test must not hold a flock while a sibling libtest thread forks an
+    // exact child: the fork-to-exec window can transiently retain the lock.
+    let state_home = tempfile::tempdir().unwrap();
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "db::tests::compatibility_handle_and_controller_lease_exclude_each_other",
+            "--nocapture",
+        ])
+        .env(COMPATIBILITY_LEASE_CHILD, "1")
+        .env("XDG_STATE_HOME", state_home.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "compatibility lease child failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(state_home.path().join(COMPATIBILITY_LEASE_CHILD_DONE)).unwrap(),
+        "ok",
+        "the exact compatibility lease child must have run"
+    );
+}
+
+fn compatibility_handle_and_controller_lease_exclude_each_other_inner() {
     let (_dir, path) = compatible_v66_fixture();
     let lock = open_schema_lock(&path.canonicalize().unwrap()).unwrap();
     try_exclusive_lock(&lock, &path).unwrap();
