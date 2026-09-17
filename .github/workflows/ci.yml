@@ -260,10 +260,12 @@ jobs:
     # roughly doubles the job, so it runs on dispatch instead (and before a
     # release; see RELEASING.md).
     #
-    # The 60m budget is for a cold build. Warm runs should now be far quicker:
+    # Allow 90m for a cold full install: the musl bridge and native release
+    # together can exceed 60m when the store cache is unavailable. Warm runs
+    # should be far quicker:
     # the source is allowlisted (nix/source.nix), so docs/CI/test commits no
     # longer change the derivation hash and simply reuse the cached store path.
-    timeout-minutes: 60
+    timeout-minutes: 90
     env:
       # step `if:` can't reference `secrets` directly (GitHub rejects the whole
       # workflow run at validation time, before any job is scheduled, if it
