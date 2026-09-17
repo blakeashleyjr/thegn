@@ -39,7 +39,7 @@ pub fn checkout_scope_for_branch(
     loc: &GitLoc,
     branch: &str,
 ) -> Result<ForgeCheckoutScope, ForgeError> {
-    if branch.is_empty() || branch == "HEAD" || has_control(&branch) {
+    if branch.is_empty() || branch == "HEAD" || has_control(branch) {
         return Err(ForgeError::NoPr);
     }
 
