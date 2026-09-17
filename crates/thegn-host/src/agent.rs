@@ -3866,6 +3866,14 @@ pub(crate) fn repo_slug(db: &Db, repo_root: &Path) -> Option<String> {
 fn sandbox_candidates(
     sb: &thegn_core::config::SandboxConfig,
 ) -> Vec<thegn_core::config::SandboxConfig> {
+    // Disabled sandboxing is an intentional host decision. Keep the final host
+    // admission check below (so an explicitly demanded isolation floor still
+    // applies), but do not walk or probe the configured backend chain.
+    if !sb.enabled {
+        let mut host = sb.clone();
+        host.backend = thegn_core::config::SandboxBackend::None;
+        return vec![host];
+    }
     if sb.backend != thegn_core::config::SandboxBackend::Auto {
         return vec![sb.clone()];
     }
