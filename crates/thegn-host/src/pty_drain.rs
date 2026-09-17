@@ -281,7 +281,7 @@ impl PtyBacklog {
     }
 
     fn has_work(&self) -> bool {
-        self.total != 0 || !self.pending_exits.is_empty()
+        !self.is_empty()
     }
 }
 
