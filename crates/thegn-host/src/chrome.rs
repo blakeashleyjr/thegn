@@ -635,6 +635,9 @@ pub struct FrameModel {
     pub procs: thegn_metrics::ProcSnapshot,
     /// Monotonic accepted process publication; preserved across hydration.
     pub process_revision: u64,
+    /// Whether the process snapshot is current, awaiting a new visibility
+    /// generation, or unavailable because the sampler failed.
+    pub process_state: crate::model_eq::ProcessViewState,
     /// Semantic hydrated disk-row inputs; unrelated status fields do not advance it.
     pub monitor_disk_revision: crate::model_eq::ContentRevision,
     /// Latest Prometheus scrape state for the sidebar metrics section.

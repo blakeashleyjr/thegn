@@ -3,6 +3,17 @@
 
 use crate::chrome::FrameModel;
 
+/// What the process tab is allowed to present from the loop-owned snapshot.
+/// A sampler publication changes this to `Fresh`; visibility transitions and
+/// terminal sampler errors deliberately make the old snapshot unavailable.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ProcessViewState {
+    #[default]
+    Waiting,
+    Fresh,
+    Failed(&'static str),
+}
+
 /// Semantic revision for hydrated row caches. Exhaustion disables caching
 /// instead of wrapping into an old valid key.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -46,7 +57,22 @@ impl FrameModel {
         };
         self.process_revision = publication.revision;
         self.procs = publication.snapshot;
+        self.process_state = ProcessViewState::Fresh;
         true
+    }
+
+    /// Drop process data when the live Processes view is no longer active.
+    /// Keeping the publication revision avoids pretending a UI transition is
+    /// a sampler publication; `ProcessViewState` is part of monitor identity.
+    pub fn invalidate_processes(&mut self) {
+        self.procs = Default::default();
+        self.process_state = ProcessViewState::Waiting;
+    }
+
+    /// Replace a previously visible snapshot with an explicit sampler error.
+    pub fn fail_processes(&mut self, reason: &'static str) {
+        self.procs = Default::default();
+        self.process_state = ProcessViewState::Failed(reason);
     }
 
     /// Hydration owns Git/DB state, while the process sampler owns this snapshot.
@@ -57,8 +83,13 @@ impl FrameModel {
         let disk_changed = self.sidebar_status.disk_sizes != current.sidebar_status.disk_sizes
             || self.sidebar_status.disk_stamps != current.sidebar_status.disk_stamps;
         self.monitor_disk_revision = current.monitor_disk_revision.advanced(disk_changed);
-        self.procs = std::mem::take(&mut current.procs);
-        self.process_revision = current.process_revision;
+        if self.procs_disabled {
+            self.invalidate_processes();
+        } else {
+            self.procs = std::mem::take(&mut current.procs);
+            self.process_revision = current.process_revision;
+            self.process_state = current.process_state;
+        }
     }
 
     /// True when a freshly hydrated model carries no render-affecting change
@@ -269,5 +300,19 @@ mod revision_tests {
         .advanced(true);
         assert!(!exhausted.same_cacheable(exhausted));
         assert_eq!(exhausted.advanced(true), exhausted);
+    }
+
+    #[test]
+    fn hydration_does_not_carry_processes_when_sampling_is_disabled() {
+        let mut prior = FrameModel::default();
+        prior.process_state = ProcessViewState::Fresh;
+        prior.procs.enabled = true;
+        prior.procs.total = 1;
+        let mut next = FrameModel::default();
+        next.procs_disabled = true;
+        next.carry_monitor_state_from(&mut prior);
+        assert_eq!(next.process_state, ProcessViewState::Waiting);
+        assert!(!next.procs.enabled);
+        assert_eq!(next.procs.total, 0);
     }
 }
