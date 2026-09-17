@@ -3616,6 +3616,81 @@ fn pending_folder_intent_is_generation_scoped_and_identity_checked() {
 }
 
 #[test]
+fn terminal_process_failure_returns_after_close_and_reopen() {
+    let mut model = FrameModel::default();
+    let process_failure = Some("process sampler stopped");
+
+    sync_process_failure_visibility(&mut model, process_failure, false);
+    assert_eq!(
+        model.process_state,
+        crate::model_eq::ProcessViewState::Failed("process sampler stopped")
+    );
+
+    // Closing the monitor clears its displayed body. Reopening must consult
+    // the loop-owned terminal reason even though no worker can publish again.
+    reconcile_process_view_transition(&mut model, process_failure, true, false, true, false, false);
+    reconcile_process_view_transition(
+        &mut model,
+        process_failure,
+        false,
+        true,
+        false,
+        false,
+        false,
+    );
+    assert_eq!(
+        model.process_state,
+        crate::model_eq::ProcessViewState::Failed("process sampler stopped")
+    );
+}
+
+#[test]
+fn paused_process_failure_waits_for_resume_without_thawing_rows() {
+    let mut model = FrameModel::default();
+    model.procs.total = 7;
+    model.process_state = crate::model_eq::ProcessViewState::Fresh;
+    let process_failure = Some("process sampler stopped");
+
+    sync_process_failure_visibility(&mut model, process_failure, true);
+    assert_eq!(
+        model.process_state,
+        crate::model_eq::ProcessViewState::Fresh
+    );
+    assert_eq!(model.procs.total, 7);
+
+    sync_process_failure_visibility(&mut model, process_failure, false);
+    assert_eq!(
+        model.process_state,
+        crate::model_eq::ProcessViewState::Failed("process sampler stopped")
+    );
+    assert_eq!(model.procs.total, 0);
+}
+
+#[test]
+fn startup_process_failure_without_control_is_restored_after_reopen() {
+    let mut model = FrameModel::default();
+    let process_failure = Some("process sampler unavailable");
+
+    // This is the startup-spawn-failure path: there is no Control to query,
+    // so the event loop must retain the reason independently of the worker.
+    sync_process_failure_visibility(&mut model, process_failure, false);
+    reconcile_process_view_transition(&mut model, process_failure, true, false, true, false, false);
+    reconcile_process_view_transition(
+        &mut model,
+        process_failure,
+        false,
+        true,
+        false,
+        false,
+        false,
+    );
+    assert_eq!(
+        model.process_state,
+        crate::model_eq::ProcessViewState::Failed("process sampler unavailable")
+    );
+}
+
+#[test]
 fn halted_folder_intent_uses_the_generation_owned_group_path() {
     let session = Session {
         id: "session".into(),

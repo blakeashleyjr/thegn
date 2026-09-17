@@ -814,6 +814,7 @@ fn model_with_procs(procs: Vec<thegn_metrics::ProcSample>) -> FrameModel {
         primed: true,
         enabled: true,
     };
+    m.process_state = crate::model_eq::ProcessViewState::Fresh;
     m
 }
 
@@ -1456,6 +1457,21 @@ fn an_unsampled_processes_tab_says_sampling_not_disabled() {
     );
 }
 
+#[test]
+fn failed_process_sampling_replaces_old_rows_with_an_explicit_error() {
+    let hist = history(120, NOW_MS);
+    let mut model = model_with_procs(vec![proc(1000, None, "old-worker", 2.0, 1024)]);
+    let mut ov = open_tab(MonitorTab::Procs, &model, &hist, Rect::full(120, 40));
+    assert!(render_text(&ov, 120, 40).contains("old-worker"));
+
+    // Keep the publication revision unchanged: state is the invalidation key.
+    model.fail_processes("sampler stopped");
+    assert!(ov.refresh(&model, &ctx_at(&hist, Rect::full(120, 40))));
+    let text = render_text(&ov, 120, 40);
+    assert!(text.contains("process sampling unavailable: sampler stopped"));
+    assert!(!text.contains("old-worker"));
+}
+
 // --- Chunk 3: per-tab footer hints and the help door ---------------------
 
 /// The footer text for `tab`, built straight from the pure builder — no
@@ -1774,6 +1790,7 @@ fn paused_process_refresh_does_not_change_the_displayed_snapshot() {
     m.procs.procs.reverse();
     m.procs.procs[0].cpu_pct = 1000.0;
     m.process_revision += 1;
+    m.fail_processes("sampler stopped while frozen");
     assert!(!ov.refresh(&m, &ctx_at(&h, screen)));
     assert_eq!(ov.proc_rows, before);
 }

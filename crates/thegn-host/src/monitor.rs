@@ -426,7 +426,7 @@ pub struct MonitorOverlay {
     proc_rows: Vec<procs_view::ProcRow>,
     lists: invalidation::Lists,
     /// The last body was Processes with these header/display-only inputs.
-    process_body: Option<(u64, bool, bool)>,
+    process_body: Option<(u64, crate::model_eq::ProcessViewState, bool, bool)>,
     /// The Disk-tab worktree paths currently displayed, in row order — what the
     /// clean action targets. Recomputed on rebuild.
     disk_rows: Vec<build::DiskWtRow>,
@@ -650,6 +650,7 @@ impl MonitorOverlay {
         self.row_y = b.row_y;
         self.process_body = (self.tab == MonitorTab::Procs).then_some((
             model.process_revision,
+            model.process_state,
             model.procs_enabled(),
             self.filtering,
         ));
@@ -765,6 +766,7 @@ impl MonitorOverlay {
             && self.process_body
                 == Some((
                     model.process_revision,
+                    model.process_state,
                     model.procs_enabled(),
                     self.filtering,
                 ))

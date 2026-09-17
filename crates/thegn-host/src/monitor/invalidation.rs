@@ -6,6 +6,7 @@ use crate::model_eq::ContentRevision;
 #[derive(Debug)]
 pub(super) struct ProcessRowsKey {
     revision: u64,
+    state: crate::model_eq::ProcessViewState,
     sort: ProcSort,
     desc: bool,
     tree: bool,
@@ -15,6 +16,7 @@ impl ProcessRowsKey {
     fn capture(overlay: &MonitorOverlay, model: &FrameModel) -> Self {
         Self {
             revision: model.process_revision,
+            state: model.process_state,
             sort: overlay.prefs.proc_sort,
             desc: overlay.prefs.proc_desc,
             tree: overlay.prefs.proc_tree,
@@ -23,6 +25,7 @@ impl ProcessRowsKey {
     }
     fn matches(&self, overlay: &MonitorOverlay, model: &FrameModel) -> bool {
         self.revision == model.process_revision
+            && self.state == model.process_state
             && self.sort == overlay.prefs.proc_sort
             && self.desc == overlay.prefs.proc_desc
             && self.tree == overlay.prefs.proc_tree

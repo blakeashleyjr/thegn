@@ -449,6 +449,39 @@ fn queued_worker_sample_is_revoked_before_paused_navigation_and_confirmation() {
 }
 
 #[test]
+fn reopening_after_process_view_invalidation_waits_for_a_new_snapshot() {
+    let hist = TelemetryHistory::default();
+    let screen = Rect::full(160, 48);
+    let mut model = model_with_n_procs(2);
+    let mut overlay = open_tab(MonitorTab::Procs, &model, &hist, screen);
+    assert!(!overlay.proc_rows.is_empty());
+
+    model.invalidate_processes();
+    assert!(overlay.refresh(&model, &ctx_at(&hist, screen)));
+    assert!(overlay.proc_rows.is_empty());
+    assert!(headings(&overlay)[0].0.contains("sampling"));
+}
+
+#[test]
+fn reopening_after_terminal_process_failure_builds_the_error_body_immediately() {
+    let hist = TelemetryHistory::default();
+    let screen = Rect::full(160, 48);
+    let mut model = model_with_n_procs(2);
+    let overlay = open_tab(MonitorTab::Procs, &model, &hist, screen);
+    assert!(!render_text(&overlay, 160, 48).contains("unavailable"));
+
+    // The loop re-applies its persistent terminal reason before constructing a
+    // reopened overlay. The constructor must therefore render the error in its
+    // initial body; waiting for a future sampler wake would leave "sampling…".
+    model.invalidate_processes();
+    model.fail_processes("sampler stopped");
+    let reopened = open_tab(MonitorTab::Procs, &model, &hist, screen);
+    let text = render_text(&reopened, 160, 48);
+    assert!(text.contains("process sampling unavailable: sampler stopped"));
+    assert!(!text.contains("sampling…"));
+}
+
+#[test]
 fn equal_disk_sizes_and_basenames_have_deterministic_full_path_order() {
     let paths = [
         "/fixture/z/shared",
