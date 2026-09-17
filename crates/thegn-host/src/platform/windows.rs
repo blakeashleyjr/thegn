@@ -762,6 +762,10 @@ impl DesktopChild {
 
     /// Terminate through the owned Job Object, or through the owned direct
     /// Child on the documented degraded path, then reap that same Child.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "owned child wait runs only on the dedicated desktop dispatcher thread"
+    )]
     pub fn terminate_and_wait(&mut self) -> io::Result<()> {
         match self.state {
             DesktopChildState::Live => {
@@ -804,6 +808,10 @@ impl DesktopChild {
 
     /// Reap only through the still-owned direct child. Used by quarantine and
     /// never attempts a PID or Job Object signal after ownership is uncertain.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "owned child wait runs only on the dedicated desktop dispatcher thread"
+    )]
     pub fn reap_owned(&mut self) -> io::Result<()> {
         if self.state == DesktopChildState::Reaped {
             return Err(io::Error::other("desktop child was already reaped"));

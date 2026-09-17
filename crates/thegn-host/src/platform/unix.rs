@@ -420,6 +420,10 @@ impl DesktopChild {
     /// Terminate the owned group before reaping the direct child. This is also
     /// used after a normal exit: the unreaped leader keeps the original group
     /// identity available long enough to stop surviving descendants.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "owned child wait runs only on the dedicated desktop dispatcher thread"
+    )]
     pub fn terminate_and_wait(&mut self) -> io::Result<()> {
         let exited = match self.state {
             DesktopChildState::Live => self.poll_exit()?,
@@ -467,6 +471,10 @@ impl DesktopChild {
 
     /// Reap only through the still-owned direct child. Used by quarantine;
     /// this method never signals a process group after ownership is uncertain.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "owned child wait runs only on the dedicated desktop dispatcher thread"
+    )]
     pub fn reap_owned(&mut self) -> io::Result<()> {
         if self.state == DesktopChildState::Reaped {
             return Err(io::Error::other("desktop child was already reaped"));
@@ -542,6 +550,10 @@ mod desktop_child_tests {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "reap the private fixture child after testing uncertain ownership"
+    )]
     fn uncertain_wait_rejects_cleanup_without_signaling_cached_group() {
         let mut command = Command::new("/bin/sh");
         command.args(["-c", "exec sleep 30"]);
