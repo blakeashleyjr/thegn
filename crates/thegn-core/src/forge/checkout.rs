@@ -117,10 +117,6 @@ mod tests {
     use crate::remote::GitLoc;
     use std::path::Path;
 
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "private git fixture subprocess, never on the event loop"
-    )]
     fn git(dir: &Path, args: &[&str]) {
         let status = crate::util::git_cmd(dir).args(args).status().unwrap();
         assert!(status.success(), "git {args:?} failed: {status}");
