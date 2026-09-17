@@ -268,6 +268,15 @@ impl ControlClient {
         };
         if (200..300).contains(&status) {
             Ok(value)
+        } else if (300..400).contains(&status) {
+            // Redirects are never part of the control endpoint contract. Keep
+            // the response body and Location header out of the error: both
+            // can be attacker-controlled and state-changing requests must not
+            // be replayed at a new destination.
+            Err(anyhow::Error::new(ControlRequestError::new(
+                status,
+                "control endpoint redirect refused",
+            )))
         } else {
             Err(anyhow::Error::new(request_error(status, &value)))
         }
@@ -1121,9 +1130,11 @@ fn websocket_url(origin: &str, path: &str) -> Result<String> {
     Ok(url.to_string())
 }
 
-/// Send one request to the client-facing HTTP(S) origin. reqwest supplies the
-/// normal WebPKI verification path for `https`; TLS termination remains outside
-/// thegn's plaintext loopback backend.
+/// Send one request to the client-facing HTTP(S) origin. Redirects are
+/// explicitly disabled: a 307/308 must never replay an authenticated command
+/// body at a second origin. Reqwest supplies the normal WebPKI verification
+/// path for `https`; TLS termination remains outside thegn's plaintext loopback
+/// backend.
 async fn send_origin_request(
     origin: &str,
     token: &str,
@@ -1134,13 +1145,21 @@ async fn send_origin_request(
     let method = reqwest::Method::from_bytes(method.as_bytes())
         .with_context(|| format!("invalid control HTTP method {method:?}"))?;
     let url = origin_request_url(origin, path)?;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .context("build control HTTP client")?;
     let mut request = client.request(method, url).bearer_auth(token);
     if let Some(body) = body {
         request = request.json(&body);
     }
     let response = request.send().await.context("control HTTP request")?;
     let status = response.status().as_u16();
+    if (300..400).contains(&status) {
+        // Do not parse a redirect body. The caller turns this into a fixed
+        // error, and dropping the response is sufficient to release it.
+        return Ok((status, Value::Null));
+    }
     let bytes = response
         .bytes()
         .await
@@ -1191,6 +1210,11 @@ where
 
     let res = sender.send_request(req).await.context("control request")?;
     let status = res.status().as_u16();
+    if (300..400).contains(&status) {
+        // Hyper does not follow redirects, but keep the transport contract
+        // explicit so this path cannot grow replay behavior later.
+        return Ok((status, Value::Null));
+    }
     let bytes = res
         .into_body()
         .collect()
@@ -1322,6 +1346,136 @@ mod tests {
         assert_eq!(reply["authorization"], "Bearer route-token");
         assert_eq!(reply["worktree"], "/registered/remote");
         server.abort();
+    }
+
+    /// A redirect is an endpoint-contract error for both client transports.
+    /// The second listener is deliberately a different authority so this
+    /// catches the sensitive-body replay that 307/308 would otherwise permit.
+    #[tokio::test]
+    async fn control_requests_never_follow_redirects_or_replay_credentials() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        async fn probe(status: u16, origin: bool) -> (bool, Vec<u8>, String) {
+            async fn consume_request(stream: &mut tokio::net::TcpStream) {
+                const MAX_REQUEST: usize = 64 * 1024;
+                let mut request = Vec::with_capacity(4096);
+                let header_end = loop {
+                    let mut chunk = [0; 1024];
+                    let n = stream.read(&mut chunk).await.unwrap();
+                    assert!(n > 0, "redirect source closed before request headers");
+                    request.extend_from_slice(&chunk[..n]);
+                    assert!(
+                        request.len() <= MAX_REQUEST,
+                        "fixture request exceeded bound"
+                    );
+                    if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break end + 4;
+                    }
+                };
+                let content_length = String::from_utf8_lossy(&request[..header_end])
+                    .lines()
+                    .find_map(|line| {
+                        line.strip_prefix("Content-Length:")
+                            .or_else(|| line.strip_prefix("content-length:"))
+                    })
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                let needed = header_end.saturating_add(content_length);
+                assert!(needed <= MAX_REQUEST, "fixture request body exceeded bound");
+                while request.len() < needed {
+                    let mut chunk = [0; 1024];
+                    let n = stream.read(&mut chunk).await.unwrap();
+                    assert!(n > 0, "redirect source closed before request body");
+                    request.extend_from_slice(&chunk[..n]);
+                    assert!(
+                        request.len() <= MAX_REQUEST,
+                        "fixture request exceeded bound"
+                    );
+                }
+            }
+
+            let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let target_addr = target.local_addr().unwrap();
+            let source = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let source_addr = source.local_addr().unwrap();
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let reason = match status {
+                301 => "Moved Permanently",
+                302 => "Found",
+                303 => "See Other",
+                307 => "Temporary Redirect",
+                308 => "Permanent Redirect",
+                _ => unreachable!(),
+            };
+            tokio::spawn(async move {
+                let (mut stream, _) = source.accept().await.unwrap();
+                consume_request(&mut stream).await;
+                let location = format!("http://{target_addr}/replay-target");
+                let response = format!(
+                    "HTTP/1.1 {status} {reason}\r\nLocation: {location}\r\nContent-Type: text/plain\r\nContent-Length: 20\r\nConnection: close\r\n\r\nredirect-body-secret"
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+                drop(stream);
+                let replay =
+                    tokio::time::timeout(std::time::Duration::from_millis(300), target.accept())
+                        .await
+                        .ok()
+                        .and_then(Result::ok);
+                let followed = replay.is_some();
+                let mut bytes = Vec::new();
+                if let Some((mut stream, _)) = replay {
+                    let mut request = [0; 4096];
+                    if let Ok(n) = stream.read(&mut request).await {
+                        bytes.extend_from_slice(&request[..n]);
+                    }
+                    let _ = stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await;
+                }
+                let _ = tx.send((followed, bytes));
+            });
+
+            let client = if origin {
+                ControlClient::new(ControlAddr::HttpOrigin {
+                    origin: format!("http://{source_addr}"),
+                    token: "redirect-token".into(),
+                })
+            } else {
+                ControlClient::new(ControlAddr::Tcp {
+                    addr: source_addr.to_string(),
+                    token: "redirect-token".into(),
+                })
+            };
+            let error = client
+                .call_raw(
+                    "POST",
+                    "/v1/tools/run",
+                    Some(json!({"sentinel": "redirect-body-secret"})),
+                )
+                .await
+                .expect_err("3xx must be rejected");
+            let error = format!("{error:#}");
+            let (followed, bytes) = rx.await.unwrap();
+            (followed, bytes, error)
+        }
+
+        for status in [301, 302, 303, 307, 308] {
+            for origin in [false, true] {
+                let (followed, bytes, error) =
+                    tokio::time::timeout(std::time::Duration::from_secs(3), probe(status, origin))
+                        .await
+                        .expect("redirect probe exceeded timeout");
+                assert!(!followed, "{status} followed on origin={origin}: {error}");
+                assert!(bytes.is_empty(), "redirect target received a request");
+                assert!(error.contains("control endpoint redirect refused"));
+                assert!(error.contains(&format!("http {status}")));
+                assert!(!error.contains("redirect-token"));
+                assert!(!error.contains("replay-target"));
+                assert!(!error.contains("redirect-body-secret"));
+            }
+        }
     }
 
     #[test]
