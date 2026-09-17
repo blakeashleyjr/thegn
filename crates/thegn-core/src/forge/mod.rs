@@ -24,8 +24,8 @@
 //! those files may name the GitHub CLI layer — the `forge-leak` ratchet in
 //! `just lint` pins it.
 
-pub mod model;
 pub mod checkout;
+pub mod model;
 
 use crate::remote::GitLoc;
 use crate::seam::{ErrorClass, Probe, SeamError};

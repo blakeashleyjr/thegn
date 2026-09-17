@@ -85,13 +85,15 @@ fn process_context() -> serde_json::Value {
     })
 }
 
+fn require_release_dependencies() {
+    #[cfg(debug_assertions)]
+    panic!("release dependencies are required for this workload");
+}
+
 #[test]
 #[ignore = "owned real sampler/renderer performance workload; run alone in a release test binary"]
 fn controlled_process_monitor_workload() {
-    assert!(
-        !cfg!(debug_assertions),
-        "release dependencies are required for this workload"
-    );
+    require_release_dependencies();
     // Event counts describe steady-state windows, not an atomic cross-thread
     // CPU/sample transaction. Initial prime/wake precedes the visible window;
     // a collection may straddle either boundary. Context reads are separate.
@@ -190,23 +192,25 @@ fn render_workloads() -> Vec<serde_json::Value> {
     use termwiz::surface::Surface;
     let mut output = Vec::new();
     for count in [64, 400] {
-        let mut model = FrameModel::default();
-        model.procs = thegn_metrics::ProcSnapshot {
-            total: count,
-            primed: true,
-            enabled: true,
-            procs: (0..count)
-                .map(|i| thegn_metrics::ProcSample {
-                    pid: 10_000 + i as u32,
-                    ppid: None,
-                    start_time: 1_000 + i as u64,
-                    name: format!("fixture-{i:03}-世-e\u{301}-worker"),
-                    cpu_pct: (i % 101) as f32,
-                    rss_bytes: (i as u64 + 1) * 1_048_576,
-                    run_secs: i as u64,
-                    owner: thegn_metrics::ProcOwner::Other,
-                })
-                .collect(),
+        let mut model = FrameModel {
+            procs: thegn_metrics::ProcSnapshot {
+                total: count,
+                primed: true,
+                enabled: true,
+                procs: (0..count)
+                    .map(|i| thegn_metrics::ProcSample {
+                        pid: 10_000 + i as u32,
+                        ppid: None,
+                        start_time: 1_000 + i as u64,
+                        name: format!("fixture-{i:03}-世-e\u{301}-worker"),
+                        cpu_pct: (i % 101) as f32,
+                        rss_bytes: (i as u64 + 1) * 1_048_576,
+                        run_secs: i as u64,
+                        owner: thegn_metrics::ProcOwner::Other,
+                    })
+                    .collect(),
+            },
+            ..FrameModel::default()
         };
         adapter::published(&mut model);
         for (cols, rows) in [(80, 24), (160, 48), (240, 72)] {
@@ -296,7 +300,7 @@ fn count_totals(values: Vec<crate::proc_workload_alloc::Counts>) -> serde_json::
 #[test]
 #[ignore = "paired release renderer/allocation workload; excludes sampler windows"]
 fn controlled_process_monitor_render_workload() {
-    assert!(!cfg!(debug_assertions), "release dependencies are required");
+    require_release_dependencies();
     use std::io::Write;
     writeln!(std::io::stdout(), "{}", serde_json::to_string_pretty(&serde_json::json!({
         "implementation": adapter::LABEL,

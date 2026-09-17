@@ -3630,17 +3630,10 @@ pub(crate) fn spawn_pr_cache_refresh(
             // it matches the configured policy, reclaim that worktree's
             // `target/`. The active worktree is never touched (you may still be
             // working in it), nor one with a thegn-spawned build in flight.
-            if disk_cfg.auto_clean_on_merge || disk_cfg.clean_on_pr_closed {
-                if let Some(source_repo) = origin_after.as_ref() {
-                    maybe_clean_merged_worktrees(
-                        &db,
-                        &cwd,
-                        &repo_root,
-                        &prs,
-                        source_repo,
-                        &disk_cfg,
-                    );
-                }
+            if (disk_cfg.auto_clean_on_merge || disk_cfg.clean_on_pr_closed)
+                && let Some(source_repo) = origin_after.as_ref()
+            {
+                maybe_clean_merged_worktrees(&db, &cwd, &repo_root, &prs, source_repo, &disk_cfg);
             }
 
             // pr_linked producer: a PR newly entering the open set whose head

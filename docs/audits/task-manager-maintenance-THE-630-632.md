@@ -105,9 +105,10 @@ improved or provide a universal latency guarantee.
   `/tmp/thegn-frame-stage-resume-20260916-gvm3bab7`.
 
 Landing uses native `merge add` then `merge land`, with the configured isolated
-`XDG_STATE_HOME=/home/blake/.superzej/pipeline-state just test` gate, one build
-job and one test worker. The receipt selected by
+pipeline state for the `just test` gate, one build job and one test worker. The
+receipt selected by
 `/tmp/thegn-final-native-queue-latest-20260916` is authoritative for the final
 full-workspace test result and landed main commit. The proposed delivery-ledger transition takes effect with successful native
-landing; this source record does not preclaim a gate result. Existing historical receipts are retained; current
-acceptance is based on the sources and measurements identified above.
+landing; this source record does not preclaim a gate result. Existing historical
+receipts are retained; the performance receipts refer to the original fixture.
+Current acceptance is based on the sources and measurements identified above.

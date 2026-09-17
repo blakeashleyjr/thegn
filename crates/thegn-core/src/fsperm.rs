@@ -32,7 +32,7 @@ pub fn make_executable_for_test(path: &Path) -> std::io::Result<()> {
         use std::os::unix::fs::PermissionsExt;
         let mut permissions = std::fs::metadata(path)?.permissions();
         permissions.set_mode(0o700);
-        return std::fs::set_permissions(path, permissions);
+        std::fs::set_permissions(path, permissions)
     }
     #[cfg(not(unix))]
     {
