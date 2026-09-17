@@ -610,10 +610,10 @@ fn claim(
             }
             // Exit 2 = retryable, matching `verify`/`wait`: the supervisor's
             // correct response is to reconcile and try again, not to abort.
-            anyhow::bail!(
+            Err(anyhow::Error::new(crate::cmd::Retryable(anyhow::anyhow!(
                 "dispatch refused: {}\n(exit 2 — reconcile and retry)",
                 decision.reason()
-            )
+            ))))
         }
     }
 }
@@ -672,11 +672,11 @@ fn lease(action: &str, owner: Option<&str>, ttl: i64, name: &str, json: bool) ->
                             &serde_json::json!({ "acquired": false, "holder": holder }),
                         )?;
                     }
-                    anyhow::bail!(
+                    Err(anyhow::Error::new(crate::cmd::Retryable(anyhow::anyhow!(
                         "lease {name} is held by {holder} — another monitor is already driving \
                          this pipeline. Stop it, or wait for its lease to lapse, before starting \
                          a second one.\n(exit 2 — retryable)"
-                    )
+                    ))))
                 }
             }
         }

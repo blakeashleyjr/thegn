@@ -854,7 +854,24 @@ fn report_migration(migration: &thegn_core::migrate_brand::MigrationReport) {
     }
 }
 
-fn main() -> anyhow::Result<()> {
+fn main() -> std::process::ExitCode {
+    match run_main() {
+        Ok(()) => std::process::ExitCode::from(cmd::EXIT_OK as u8),
+        Err(error) => {
+            let code = if error.downcast_ref::<cmd::NotFound>().is_some() {
+                cmd::EXIT_NOT_FOUND
+            } else if error.downcast_ref::<cmd::Retryable>().is_some() {
+                cmd::EXIT_RETRYABLE
+            } else {
+                cmd::EXIT_ERROR
+            };
+            thegn_core::msg::error(&format!("{error:#}"));
+            std::process::ExitCode::from(code as u8)
+        }
+    }
+}
+
+fn run_main() -> anyhow::Result<()> {
     // Cap glibc's per-thread arena count before the runtime spawns any threads,
     // so the host can't sprawl across dozens of never-trimmed arenas (an audit
     // traced ~2.5 GB RSS to ~131 of them). No-op off glibc. See `mem`.
@@ -988,12 +1005,9 @@ fn main() -> anyhow::Result<()> {
         };
         match result {
             Ok(()) => return Ok(()),
-            // Typed not-found errors map to the scripting exit-code contract
-            // (cmd::EXIT_NOT_FOUND); everything else keeps anyhow's exit 1.
-            Err(Some(e)) if e.downcast_ref::<cmd::NotFound>().is_some() => {
-                thegn_core::msg::error(&format!("{e:#}"));
-                std::process::exit(cmd::EXIT_NOT_FOUND);
-            }
+            // The outer process wrapper maps typed command errors after this
+            // function returns, so command-local guards and DB handles unwind
+            // normally before the process exit code is selected.
             Err(Some(e)) => return Err(e),
             Err(None) => {} // `open` with no live instance: launch the TUI
         }
@@ -1069,26 +1083,10 @@ fn main() -> anyhow::Result<()> {
     ));
     rt.shutdown_background();
     report_kept_sessions(handlers::daemon_lifecycle::kept_sessions());
-    // termwiz opens /dev/tty without O_CLOEXEC; child pane shells inherit that
-    // FD and keep the outer PTY open after thegn exits, preventing the parent
-    // from seeing EOF. process::exit is the correct terminal-emulator exit: it
-    // kills the whole process group atomically, matching what alacritty/kitty do.
-    let code: i32 = match &result {
-        Ok(()) => cmd::EXIT_OK,
-        Err(e) if e.downcast_ref::<cmd::Retryable>().is_some() => {
-            thegn_core::msg::error(&format!("{e:#}"));
-            cmd::EXIT_RETRYABLE
-        }
-        Err(e) => {
-            // Print the error chain: the compositor redirected stderr to the
-            // logfile during the session, and the alt screen is now torn down,
-            // so an early `?` (e.g. "term capabilities", "open terminal") would
-            // otherwise exit 1 with a blank terminal and no explanation.
-            thegn_core::msg::error(&format!("{e:#}"));
-            cmd::EXIT_ERROR
-        }
-    };
-    std::process::exit(code);
+    // The outer process wrapper prints the error after the compositor has torn
+    // down its alternate screen and maps Retryable to exit 2. Returning here
+    // also lets the runtime, profile lock, and other guards unwind normally.
+    result
 }
 
 /// Map a subcommand to the experimental [`Feature`](thegn_core::channel::Feature)
