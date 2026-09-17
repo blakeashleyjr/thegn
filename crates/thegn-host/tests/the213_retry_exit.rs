@@ -93,6 +93,10 @@ impl Fixture {
     }
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "bounded private CLI fixture waits outside the event loop"
+)]
 fn run_bounded(mut command: Command) -> Output {
     let capture = tempfile::tempdir().unwrap();
     let stdout_path = capture.path().join("stdout");
@@ -123,10 +127,10 @@ fn run_bounded(mut command: Command) -> Output {
         }
         if Instant::now() >= deadline {
             if let Err(error) = child.kill() {
-                eprintln!("CLI timeout cleanup could not kill child: {error}");
+                tracing::warn!(%error, "CLI timeout cleanup could not kill child");
             }
             if let Err(error) = child.wait() {
-                eprintln!("CLI timeout cleanup could not reap child: {error}");
+                tracing::warn!(%error, "CLI timeout cleanup could not reap child");
             }
             panic!("thegn CLI child exceeded bounded test timeout");
         }
