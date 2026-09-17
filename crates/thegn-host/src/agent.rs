@@ -879,10 +879,17 @@ pub fn prepare_sandbox_env(
     // Every candidate is spent and we are opening a bare host shell. Say it once
     // here — under `Fallthrough::Exact` the resolver deliberately stays quiet,
     // because only this loop knows which candidate was the last one.
-    thegn_core::sandbox_backend::host_fallback_notice(&sb, &exec_placement);
-    if auto_choice && warnings.is_empty() {
+    // An explicit `none`/disabled sandbox is already an intentional host
+    // decision. Calling the notice in that case would apply `on_missing` to a
+    // non-miss (including `OnMissing::Fail` → process exit) and probe runtimes
+    // that the user did not request. Keep the notice for genuine auto-chain
+    // fallback, while preserving the isolation-floor admission above.
+    if sb.enabled && sb.backend != thegn_core::config::SandboxBackend::None {
+        thegn_core::sandbox_backend::host_fallback_notice(&sb, &exec_placement);
+    }
+    if sb.enabled && auto_choice && warnings.is_empty() {
         warnings.push("sandbox auto selected host".to_string());
-    } else if auto_choice {
+    } else if sb.enabled && auto_choice {
         warnings.push("running on host after sandbox fallback".to_string());
     }
     Ok(SandboxOutcome {
