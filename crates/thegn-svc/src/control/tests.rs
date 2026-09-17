@@ -1087,7 +1087,7 @@ async fn in_process_dispatch_rechecks_the_admitted_capability_after_routing() {
         r.state.clone(),
         "issues.update",
         "POST",
-        "/v1/issues/ABC/comment",
+        "/v1/issues/plugin:demo:ABC/comment",
         Some(body.clone()),
     )
     .await;
@@ -1098,26 +1098,29 @@ async fn in_process_dispatch_rechecks_the_admitted_capability_after_routing() {
         r.state.clone(),
         "issues.comment",
         "POST",
-        "/v1/issues/ABC/comment",
+        "/v1/issues/plugin:demo:ABC/comment",
         Some(body),
     )
     .await;
     assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
-    assert_eq!(r.api.calls(), vec!["issues_comment:ABC".to_string()]);
+    assert_eq!(
+        r.api.calls(),
+        vec!["issues_comment:plugin:demo:ABC".to_string()]
+    );
 
-    let params = serde_json::json!({"id": "ABC/comment"})
+    let params = serde_json::json!({"id": "plugin:demo:ABC/comment"})
         .as_object()
         .cloned()
         .unwrap();
     let (method, path, body) = super::routes::build_call("issues.update", params).unwrap();
-    assert_eq!(path, "/v1/issues/ABC%2Fcomment");
+    assert_eq!(path, "/v1/issues/plugin%3Ademo%3AABC%2Fcomment");
     let encoded = rig(true);
     let (status, _) =
         dispatch_local(encoded.state.clone(), "issues.update", method, &path, body).await;
     assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
     assert_eq!(
         encoded.api.calls(),
-        vec!["issues_update:ABC/comment".to_string()]
+        vec!["issues_update:plugin:demo:ABC/comment".to_string()]
     );
 }
 
