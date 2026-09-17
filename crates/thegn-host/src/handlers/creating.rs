@@ -36,8 +36,8 @@ pub(crate) struct InFlight {
     /// SandboxPrep/Register/... rows until `Done`/`Failed`/cancel removes it.
     pub progress: HashMap<u64, CreationProgress>,
     /// Generation of the modal wizard currently on screen (Cancel/Submit/
-    /// PrepChosen target it). `None` whenever no wizard form is open — including
-    /// after Submit, once the creation has committed to the background.
+    /// PrepChosen target it). `None` after Submit or worker failure; a failed
+    /// wizard can remain on screen solely to display its error until dismissed.
     pub wizard_gen: Option<u64>,
     /// `generation -> settled tab key`, populated when the tab (or its optimistic
     /// placeholder) opens.
@@ -496,8 +496,9 @@ pub(crate) fn on_step(
 }
 
 /// `CreateEvent::Failed`: drop only this creation's tab + progress, clearing the
-/// modal wizard only if it owns this generation (a committed background failure
-/// must not disturb a freshly-opened wizard). Returns whether it was a live
+/// modal's worker only if it owns this generation. A pre-submit failure stays
+/// visible in that wizard until dismissed; a committed background failure
+/// must not disturb a freshly-opened wizard. Returns whether it was a live
 /// creation — the caller then surfaces the error + repaints.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn on_failed(
@@ -510,12 +511,15 @@ pub(crate) fn on_failed(
     wizard_ui: &mut Option<crate::wizard::NewWorktreeWizard>,
     wizard_cmd_tx: &mut Option<std::sync::mpsc::Sender<crate::wizard::WizardCmd>>,
     generation: u64,
+    error: &str,
 ) -> bool {
     if inflight.progress.remove(&generation).is_none() {
         return false;
     }
     if inflight.wizard_gen == Some(generation) {
-        *wizard_ui = None;
+        if let Some(wizard) = wizard_ui.as_mut() {
+            wizard.set_failure(error);
+        }
         *wizard_cmd_tx = None;
         inflight.wizard_gen = None;
     }
@@ -574,6 +578,97 @@ pub(crate) fn on_halted(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_speculation_keeps_error_modal_and_isolates_other_generations() {
+        use crate::wizard::{NewWorktreeWizard, WizardCmd, WizardOutcome};
+        use termwiz::input::{KeyCode, Modifiers};
+        let mut session = Session::default();
+        let mut model = FrameModel::default();
+        let mut sb = SidebarState::default();
+        let mut loading = LoadingState::default();
+        let mut creating = HashSet::new();
+        let mut inflight = InFlight::default();
+        inflight
+            .progress
+            .insert(1, CreationProgress::new("old".into()));
+        inflight
+            .progress
+            .insert(2, CreationProgress::new("current".into()));
+        inflight.wizard_gen = Some(2);
+        let mut wizard = Some(NewWorktreeWizard::new(
+            std::env::temp_dir(),
+            &Default::default(),
+        ));
+        let (tx, _rx) = std::sync::mpsc::channel::<WizardCmd>();
+        let mut sender = Some(tx);
+
+        // A committed background failure cannot close or poison the new form.
+        assert!(on_failed(
+            &mut session,
+            &mut model,
+            &mut sb,
+            &mut loading,
+            &mut creating,
+            &mut inflight,
+            &mut wizard,
+            &mut sender,
+            1,
+            "old failure"
+        ));
+        assert!(matches!(
+            wizard
+                .as_mut()
+                .unwrap()
+                .handle_key(&KeyCode::Enter, Modifiers::NONE),
+            WizardOutcome::Submit(_)
+        ));
+        assert!(sender.is_some());
+        assert_eq!(inflight.wizard_gen, Some(2));
+
+        assert!(on_failed(
+            &mut session,
+            &mut model,
+            &mut sb,
+            &mut loading,
+            &mut creating,
+            &mut inflight,
+            &mut wizard,
+            &mut sender,
+            2,
+            "resolve base failed"
+        ));
+        assert!(wizard.is_some(), "the form must survive a failed preflight");
+        assert!(sender.is_none());
+        assert!(inflight.wizard_gen.is_none());
+        assert!(inflight.progress.is_empty());
+        assert_eq!(
+            wizard
+                .as_mut()
+                .unwrap()
+                .handle_key(&KeyCode::Enter, Modifiers::NONE),
+            WizardOutcome::Pending
+        );
+        assert!(!on_failed(
+            &mut session,
+            &mut model,
+            &mut sb,
+            &mut loading,
+            &mut creating,
+            &mut inflight,
+            &mut wizard,
+            &mut sender,
+            2,
+            "stale failure"
+        ));
+        assert_eq!(
+            wizard
+                .as_mut()
+                .unwrap()
+                .handle_key(&KeyCode::Escape, Modifiers::NONE),
+            WizardOutcome::Cancel
+        );
+    }
 
     /// Build a placeholder group + its per-tab markers for `gen`, as
     /// `open_optimistic`/`open_tab` would.
