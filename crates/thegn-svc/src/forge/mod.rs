@@ -342,18 +342,133 @@ pub fn forge_for_kind(kind: ForgeKind) -> Option<Box<dyn Forge>> {
     }
 }
 
-/// Host of a git remote URL, lowercased (`git@github.com:o/r`, `https://…`,
-/// `ssh://git@…`).
+/// Host of a git remote URL, lowercased. Only the authority is inspected, so
+/// `@` in a repository path/query/fragment cannot change the route.
 pub fn remote_host(url: &str) -> Option<String> {
-    let u = url.trim();
-    let u = u.strip_prefix("ssh://").unwrap_or(u);
-    let u = u
-        .strip_prefix("https://")
-        .or_else(|| u.strip_prefix("http://"))
-        .unwrap_or(u);
-    let u = u.split_once('@').map(|(_, r)| r).unwrap_or(u);
-    let host = u.split(['/', ':']).next()?;
-    (!host.is_empty()).then(|| host.to_ascii_lowercase())
+    if url.is_empty() || url.trim() != url || url.bytes().any(|b| b.is_ascii_control()) {
+        return None;
+    }
+    // A Windows drive path is a local path, not SCP's `host:path` form.
+    if url.len() >= 3
+        && url.as_bytes()[0].is_ascii_alphabetic()
+        && url.as_bytes()[1] == b':'
+        && matches!(url.as_bytes()[2], b'/' | b'\\')
+    {
+        return None;
+    }
+
+    for scheme in ["https://", "http://", "ssh://"] {
+        if url
+            .get(..scheme.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(scheme))
+        {
+            let rest = &url[scheme.len()..];
+            let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+            return authority_host(&rest[..authority_end]);
+        }
+    }
+
+    // A supported scheme was not present. Do not reinterpret an unsupported
+    // URL scheme such as ftp:// as SCP syntax.
+    if url.contains("://") {
+        return None;
+    }
+    scp_host(url)
+}
+
+fn authority_host(authority: &str) -> Option<String> {
+    if authority.is_empty() || authority.bytes().any(|b| b.is_ascii_whitespace()) {
+        return None;
+    }
+    let host_port = if let Some((userinfo, host_port)) = authority.rsplit_once('@') {
+        if !valid_userinfo(userinfo) {
+            return None;
+        }
+        host_port
+    } else {
+        authority
+    };
+
+    if let Some(rest) = host_port.strip_prefix('[') {
+        let (host, suffix) = rest.split_once(']')?;
+        host.parse::<std::net::Ipv6Addr>().ok()?;
+        // Routing keys are hosts, so discard brackets and any valid port.
+        if !suffix.is_empty() {
+            parse_port(suffix.strip_prefix(':')?)?;
+        }
+        return Some(host.to_ascii_lowercase());
+    }
+    if host_port.contains(']') || host_port.matches(':').count() > 1 {
+        return None;
+    }
+    let host = match host_port.rsplit_once(':') {
+        Some((host, suffix)) => {
+            parse_port(suffix)?;
+            host
+        }
+        None => host_port,
+    };
+    valid_dns_host(host).then(|| host.to_ascii_lowercase())
+}
+
+fn parse_port(suffix: &str) -> Option<u16> {
+    (!suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| suffix.parse().ok())
+        .flatten()
+}
+
+fn valid_dns_host(host: &str) -> bool {
+    // Forge configuration and routing keys use the existing ASCII hostname
+    // policy; Unicode remains valid in the repository path.
+    !host.is_empty()
+        && host.split('.').all(|part| {
+            !part.is_empty()
+                && !part.starts_with('-')
+                && !part.ends_with('-')
+                && part.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        })
+}
+
+fn scp_host(url: &str) -> Option<String> {
+    let bracket_open = if url.starts_with('[') {
+        Some(0)
+    } else {
+        url.find("@[").map(|index| index + 1)
+    };
+    if let Some(open) = bracket_open {
+        let prefix = &url[..open];
+        if !prefix.is_empty()
+            && (!prefix.ends_with('@')
+                || prefix[..prefix.len() - 1].is_empty()
+                || !valid_userinfo(&prefix[..prefix.len() - 1]))
+        {
+            return None;
+        }
+        let rest = &url[open + 1..];
+        let (host, suffix) = rest.split_once(']')?;
+        host.parse::<std::net::Ipv6Addr>().ok()?;
+        suffix.strip_prefix(':')?;
+        return Some(host.to_ascii_lowercase());
+    }
+    let (authority, _) = url.split_once(':')?;
+    let authority = if let Some((userinfo, host)) = authority.rsplit_once('@') {
+        if !valid_userinfo(userinfo) {
+            return None;
+        }
+        host
+    } else {
+        authority
+    };
+    valid_dns_host(authority).then(|| authority.to_ascii_lowercase())
+}
+
+fn valid_userinfo(userinfo: &str) -> bool {
+    !userinfo.is_empty()
+        && !userinfo.bytes().any(|b| {
+            matches!(b, b'@' | b'/' | b'?' | b'#' | b'\\')
+                || b.is_ascii_whitespace()
+                || b.is_ascii_control()
+        })
 }
 
 /// Every configured forge's probe (the seam registry's view).
@@ -580,18 +695,87 @@ mod tests {
 
     #[test]
     fn remote_host_parses_every_url_shape() {
-        assert_eq!(
-            remote_host("git@github.com:o/r.git").as_deref(),
-            Some("github.com")
+        for (url, expected) in [
+            ("git@github.com:o/r.git", Some("github.com")),
+            ("https://GitHub.com/o/r", Some("github.com")),
+            (
+                "HTTP://git@GitHub.com:443/o/r?next=@evil#frag",
+                Some("github.com"),
+            ),
+            ("ssh://git@codeberg.org:22/o/r", Some("codeberg.org")),
+            (
+                "ssh://git@evil.example/foo@github.com/bar",
+                Some("evil.example"),
+            ),
+            (
+                "https://evil.example/org/repo?next=@github.com",
+                Some("evil.example"),
+            ),
+            (
+                "https://evil.example/org/repo#@github.com",
+                Some("evil.example"),
+            ),
+            (
+                "https://evil.example/org/é@github.com",
+                Some("evil.example"),
+            ),
+            ("ssh://git@[2001:DB8::1]:22/o/r", Some("2001:db8::1")),
+            ("git@[2001:db8::1]:o/r", Some("2001:db8::1")),
+        ] {
+            assert_eq!(remote_host(url).as_deref(), expected, "{url}");
+        }
+        for url in [
+            "",
+            "not a url",
+            "github.com/o/r",
+            "ftp://github.com/o/r",
+            "https:///o/r",
+            "https://:443/o/r",
+            "https://github.com:not-a-port/o/r",
+            "https://github.com:65536/o/r",
+            "https://[2001:db8::1/o/r",
+            "https://[2001:db8::1]x/o/r",
+            "https://é.example/o/r",
+            "/tmp/git@github.com:repo",
+            "dir/git@github.com:repo",
+            "C:/repo",
+            r"C:\repo",
+            "@[2001:db8::1]:repo",
+        ] {
+            assert_eq!(remote_host(url), None, "{url}");
+        }
+    }
+
+    #[test]
+    fn forge_set_routes_by_actual_authority_from_private_git_origin() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            thegn_core::util::git_cmd(dir.path())
+                .args(["init", "-q"])
+                .status()
+                .unwrap()
+                .success()
         );
-        assert_eq!(
-            remote_host("https://GitHub.com/o/r").as_deref(),
-            Some("github.com")
+        assert!(
+            thegn_core::util::git_cmd(dir.path())
+                .args([
+                    "config",
+                    "remote.origin.url",
+                    "https://evil.example/foo@github.com/bar",
+                ])
+                .status()
+                .unwrap()
+                .success()
         );
-        assert_eq!(
-            remote_host("ssh://git@codeberg.org:22/o/r").as_deref(),
-            Some("codeberg.org")
-        );
-        assert_eq!(remote_host(""), None);
+
+        let mut cfg = Config::default();
+        cfg.forges.push(thegn_core::config_forge::ForgeConfig {
+            name: "private".into(),
+            kind: ForgeKind::Ghe,
+            host: "evil.example".into(),
+            ..Default::default()
+        });
+        let set = ForgeSet::from_config(&cfg);
+        assert_eq!(set.for_loc(&GitLoc::Local(dir.path().into())).id(), "ghe");
     }
 }
