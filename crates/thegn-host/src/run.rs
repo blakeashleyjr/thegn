@@ -10797,9 +10797,10 @@ async fn event_loop<T: Terminal>(
                     step,
                     error,
                 } => {
+                    let error = crate::provision_recover::sanitize_detail(&error);
                     discard_pending_folder(&mut pending_folder, generation);
                     // Worker cleaned up + exited; surface it, drop only THIS
-                    // creation's tab. Clears the modal only if it owns this gen.
+                    // creation's tab. Keep a pre-submit error visible in its form.
                     if crate::handlers::creating::on_failed(
                         &mut session,
                         &mut model,
@@ -10810,6 +10811,7 @@ async fn event_loop<T: Terminal>(
                         &mut wizard_ui,
                         &mut wizard_cmd_tx,
                         generation,
+                        &format!("{}: {error}", step.label()),
                     ) {
                         model.status =
                             format!("worktree creation failed ({}): {error}", step.label());
