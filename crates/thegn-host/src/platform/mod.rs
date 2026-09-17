@@ -206,7 +206,7 @@ pub(crate) fn test_make_unreadable(path: &std::path::Path) -> bool {
     {
         use std::os::unix::fs::PermissionsExt;
 
-        if std::fs::set_permissions(path, std::fs::Permissions::from_mode(0)).is_err() {
+        if std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o0)).is_err() {
             return false;
         }
         std::fs::read(path).is_err()
