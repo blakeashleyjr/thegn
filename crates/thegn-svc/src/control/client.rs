@@ -1385,6 +1385,59 @@ mod tests {
         result
     }
 
+    #[test]
+    fn response_parser_keeps_success_protocol_errors_typed_and_fixed() {
+        let valid = parse_response_body(200, Some("application/json; charset=utf-8"), br#"{}"#)
+            .expect("valid JSON success response");
+        assert_eq!(valid, Value::Object(Default::default()));
+
+        for (content_type, body, expected) in [
+            (
+                Some("application/json"),
+                b"".as_slice(),
+                ControlProtocolError::EmptySuccessBody,
+            ),
+            (
+                Some("text/html"),
+                br#"{}"#.as_slice(),
+                ControlProtocolError::MissingJsonContentType,
+            ),
+            (
+                None,
+                br#"{}"#.as_slice(),
+                ControlProtocolError::MissingJsonContentType,
+            ),
+            (
+                Some("application/json"),
+                b"{truncated".as_slice(),
+                ControlProtocolError::InvalidJson,
+            ),
+        ] {
+            let error = parse_response_body(200, content_type, body).unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<ControlProtocolError>(),
+                Some(&expected)
+            );
+            let rendered = format!("{error:#}");
+            assert!(!rendered.contains("truncated"));
+            assert!(!rendered.contains("text/html"));
+        }
+
+        assert_eq!(
+            parse_response_body(404, Some("text/html"), b"not-json").unwrap(),
+            Value::Null
+        );
+        assert_eq!(
+            parse_response_body(404, Some("application/json"), br#"{"error":"gone"}"#).unwrap(),
+            serde_json::json!({"error": "gone"})
+        );
+        let redirect = ControlRequestError::new(307, "control endpoint redirect refused");
+        assert_eq!(
+            redirect.to_string(),
+            "control endpoint redirect refused (http 307)"
+        );
+    }
+
     #[tokio::test]
     async fn successful_control_replies_require_json_and_do_not_fabricate_envelopes() {
         for (path, valid, missing) in [
@@ -1421,7 +1474,10 @@ mod tests {
                 )
                 .await
                 .expect("valid collection probe exceeded timeout");
-                assert!(valid_result.is_ok(), "origin={origin}, path={path}");
+                assert!(
+                    valid_result.is_ok(),
+                    "origin={origin}, path={path}, result={valid_result:?}"
+                );
 
                 let missing_result = tokio::time::timeout(
                     std::time::Duration::from_secs(3),
@@ -1429,7 +1485,10 @@ mod tests {
                 )
                 .await
                 .expect("missing collection envelope probe exceeded timeout");
-                assert!(missing_result.is_err(), "origin={origin}, path={path}");
+                assert!(
+                    missing_result.is_err(),
+                    "origin={origin}, path={path}, result={missing_result:?}"
+                );
             }
         }
 
@@ -1473,7 +1532,11 @@ mod tests {
                 )
                 .await
                 .expect("protocol response probe exceeded timeout");
-                assert_eq!(result.is_ok(), expected, "origin={origin}, body={body:?}");
+                assert_eq!(
+                    result.is_ok(),
+                    expected,
+                    "origin={origin}, body={body:?}, result={result:?}"
+                );
                 if !expected {
                     let error = result.unwrap_err();
                     assert_eq!(
@@ -1520,7 +1583,11 @@ mod tests {
                 )
                 .await
                 .expect("snapshot protocol probe exceeded timeout");
-                assert_eq!(result.is_ok(), expected, "origin={origin}, body={body:?}");
+                assert_eq!(
+                    result.is_ok(),
+                    expected,
+                    "origin={origin}, body={body:?}, result={result:?}"
+                );
             }
         }
     }
