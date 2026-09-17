@@ -9,7 +9,7 @@ use base64::Engine as _;
 use std::path::Path;
 use thegn_core::agent_task::template_vars;
 use thegn_core::config::Config;
-use thegn_core::db::Db;
+use thegn_core::db::{Db, ResumeDispatchConflict};
 use thegn_core::issue::{AgentDispatchStatus, DispatchRunPublishOutcome, NewDispatch};
 use thegn_core::outln;
 use thegn_core::pipeline_resume;
@@ -1240,7 +1240,7 @@ fn claim_resume_dispatch(
     agent_name: &str,
     json: bool,
 ) -> Result<i64> {
-    match db.claim_resume_dispatch(
+    let claim = match db.claim_resume_dispatch(
         row.id,
         row.status,
         NewDispatch {
@@ -1254,7 +1254,22 @@ fn claim_resume_dispatch(
             chunk_path: row.chunk_path.as_deref(),
         },
         stage.concurrency,
-    )? {
+    ) {
+        Ok(claim) => claim,
+        Err(error) => {
+            // Only the typed lost-verdict race is retryable. Other DB errors
+            // retain the normal fatal exit code rather than being mistaken for
+            // contention.
+            if resume_claim_is_conflict(&error) {
+                if json {
+                    super::emit_json(&resume_conflict_payload())?;
+                }
+                return Err(anyhow::Error::new(crate::cmd::Retryable(error)));
+            }
+            return Err(error);
+        }
+    };
+    match claim {
         Ok(id) => Ok(id),
         Err(decision) => {
             let reason = decision.reason();
@@ -1270,6 +1285,17 @@ fn claim_resume_dispatch(
             ))))
         }
     }
+}
+
+fn resume_claim_is_conflict(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<ResumeDispatchConflict>().is_some()
+}
+
+fn resume_conflict_payload() -> serde_json::Value {
+    serde_json::json!({
+        "granted": false,
+        "reason": "source_changed",
+    })
 }
 
 /// The previous session's final screen as non-blank lines. Best-effort by
@@ -1699,10 +1725,10 @@ mod open_stage_tests {
 mod resume_work_tests {
     use super::{
         IssueFacts, ResumePromptInput, claim_resume_dispatch, render_resume_prompt,
-        resume_row_checks,
+        resume_claim_is_conflict, resume_conflict_payload, resume_row_checks,
     };
     use thegn_core::config_pipeline::PipelineStage;
-    use thegn_core::db::Db;
+    use thegn_core::db::{Db, ResumeDispatchConflict};
     use thegn_core::issue::{AgentDispatch, AgentDispatchStatus};
     use thegn_core::store::NotificationStore;
 
@@ -1925,6 +1951,32 @@ mod resume_work_tests {
             AgentDispatchStatus::WaitingHuman
         );
         assert!(db.dispatch_notes(source, None, 0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_noncontention_database_error_remains_fatal() {
+        let error = anyhow::anyhow!("database is locked");
+        assert!(
+            !resume_claim_is_conflict(&error),
+            "ordinary database failures must retain the fatal exit classification"
+        );
+        let conflict = anyhow::Error::new(ResumeDispatchConflict::SourceStatusChanged {
+            source_id: 7,
+            expected: AgentDispatchStatus::WaitingHuman,
+            actual: AgentDispatchStatus::Done,
+        });
+        assert!(resume_claim_is_conflict(&conflict));
+    }
+
+    #[test]
+    fn a_source_verdict_conflict_has_one_safe_json_refusal_reason() {
+        assert_eq!(
+            resume_conflict_payload(),
+            serde_json::json!({
+                "granted": false,
+                "reason": "source_changed",
+            })
+        );
     }
 
     #[test]

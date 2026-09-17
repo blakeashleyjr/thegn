@@ -954,6 +954,7 @@ impl PrQueueRow {
 
 // Share/forward resurrection rows live in `models` (size-capped file); the
 // `crate::db::{ShareRow, ForwardRow}` paths stay valid via this re-export.
+pub use crate::db_dispatch::ResumeDispatchConflict;
 pub use crate::models::{ForwardRow, ShareRow};
 
 /// One pre-provisioned spare in the warm pool (`pool_spares`). A spare is created
