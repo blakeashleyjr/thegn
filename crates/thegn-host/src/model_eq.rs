@@ -304,12 +304,16 @@ mod revision_tests {
 
     #[test]
     fn hydration_does_not_carry_processes_when_sampling_is_disabled() {
-        let mut prior = FrameModel::default();
-        prior.process_state = ProcessViewState::Fresh;
+        let mut prior = FrameModel {
+            process_state: ProcessViewState::Fresh,
+            ..Default::default()
+        };
         prior.procs.enabled = true;
         prior.procs.total = 1;
-        let mut next = FrameModel::default();
-        next.procs_disabled = true;
+        let mut next = FrameModel {
+            procs_disabled: true,
+            ..Default::default()
+        };
         next.carry_monitor_state_from(&mut prior);
         assert_eq!(next.process_state, ProcessViewState::Waiting);
         assert!(!next.procs.enabled);
