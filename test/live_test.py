@@ -178,15 +178,32 @@ class LiveTests(unittest.TestCase):
             writer.execute("INSERT INTO sample VALUES ('in WAL')")
             writer.commit()
             self.assertTrue(Path(str(self.db) + "-wal").exists())
-            recovery = live.backup(self.paths, self.record)
+            recovery = live.backup(self.paths, dict(self.record, stage=str(self.repo / "target" / ".thegn-live-build-transient")))
             with contextlib.closing(sqlite3.connect(recovery / "thegn.db")) as copied:
                 self.assertEqual(copied.execute("SELECT value FROM sample ORDER BY rowid").fetchall(), [("preserved",), ("in WAL",)])
         record = json.loads((recovery / "complete.json").read_text())
         self.assertEqual(record["schema"], 3)
         self.assertEqual(record["database_sha256"], live.digest(recovery / "thegn.db"))
         self.assertEqual(record["build"], self.record)
+        self.assertNotIn("stage", record["build"])
         self.assertEqual((recovery / "thegn.previous").read_bytes(), b"old executable")
         self.assertEqual(recovery.stat().st_mode & 0o777, 0o700)
+
+    def test_repeated_success_backups_do_not_pin_owned_stages(self):
+        first = live.backup(self.paths, dict(self.record, stage=str(self.repo / "target" / ".thegn-live-build-old")))
+        self._staged_fixture(live.LIVE_STAGE_PREFIX + "old", 100)
+        self._staged_fixture(live.LIVE_STAGE_PREFIX + "middle", 10)
+        newest = self._staged_fixture(live.LIVE_STAGE_PREFIX + "newest", 1)
+        second = live.backup(self.paths, dict(self.record, stage=str(newest)))
+
+        self.assertEqual(live.retain_live_stages(self.paths), 1)
+        self.assertFalse((self.repo / "target" / (live.LIVE_STAGE_PREFIX + "old")).exists())
+        self.assertTrue((self.repo / "target" / (live.LIVE_STAGE_PREFIX + "middle")).exists())
+        self.assertTrue(newest.exists())
+        self.assertEqual((first / "thegn.previous").read_bytes(), b"old executable")
+        self.assertEqual((second / "thegn.previous").read_bytes(), b"old executable")
+        for recovery in (first, second):
+            self.assertNotIn("stage", json.loads((recovery / "complete.json").read_text())["build"])
 
     def test_backup_deadline_newer_schema_and_malformed_leave_target(self):
         for schema in (2,):
@@ -387,7 +404,124 @@ class LiveTests(unittest.TestCase):
         with patch.object(live, "source_revision", return_value="a" * 40), patch.object(live.subprocess, "run", side_effect=subprocess.CalledProcessError(97, live.BUILD)):
             with self.assertRaises(subprocess.CalledProcessError):
                 live.build_stage(self.paths, self.env)
+        failed = max((path for path in (self.repo / "target").glob(live.LIVE_STAGE_PREFIX + "*")), key=lambda path: path.lstat().st_mtime_ns)
+        self.assertEqual((failed / live.LIVE_STAGE_MARKER).read_bytes(), b"thegn-live-build-v1\n")
         self.assertEqual(self.target.read_bytes(), b"old executable")
+
+    def test_prebuild_preflight_rechecks_and_releases_schema_lease(self):
+        schema_lock = Path(str(self.db) + ".schema.lock")
+        observations = []
+
+        def observe(*_args):
+            observations.append(True)
+            if len(observations) == 2:
+                with self.assertRaisesRegex(live.Refusal, "busy"):
+                    with live.locked(schema_lock, schema=True):
+                        self.fail("Schema lease was not held during the final preflight observation")
+
+        with patch.object(live, "source_revision", return_value="a" * 40), patch.object(live, "quiescent", side_effect=observe):
+            live.prebuild_preflight(self.paths, self.env)
+        self.assertEqual(len(observations), 2)
+        with live.locked(schema_lock, schema=True):
+            pass
+
+    def _staged_fixture(self, name, age, marker=True):
+        stage = self.repo / "target" / name
+        stage.mkdir(mode=0o700)
+        (stage / "output").mkdir(mode=0o700)
+        (stage / "output" / "thegn").write_bytes(b"staged")
+        (stage / live.LIVE_STAGE_LOCK).touch(mode=0o600)
+        if marker:
+            (stage / live.LIVE_STAGE_MARKER).write_bytes(b"thegn-live-build-v1\n")
+            (stage / live.LIVE_STAGE_MARKER).chmod(0o600)
+        stamp = time.time() - age
+        os.utime(stage, (stamp, stamp), follow_symlinks=False)
+        return stage
+
+    def test_stage_retention_keeps_two_owned_newest_and_unknown_entries(self):
+        stages = [self._staged_fixture(live.LIVE_STAGE_PREFIX + str(index), 100 - index) for index in range(4)]
+        unknown = self._staged_fixture(live.LIVE_STAGE_PREFIX + "unmarked", 200, marker=False)
+        self.assertEqual(live.retain_live_stages(self.paths), 2)
+        self.assertTrue(stages[2].exists())
+        self.assertTrue(stages[3].exists())
+        self.assertFalse(stages[0].exists())
+        self.assertFalse(stages[1].exists())
+        self.assertTrue(unknown.exists())
+
+    def test_stage_validation_and_cleanup_have_separate_entry_budgets(self):
+        stages = [self._staged_fixture(live.LIVE_STAGE_PREFIX + str(index), 100 - index) for index in range(3)]
+        with patch.object(live, "MAX_STAGE_ENTRIES", 6):
+            self.assertEqual(live.retain_live_stages(self.paths), 1)
+        self.assertFalse(stages[0].exists())
+        self.assertTrue(stages[1].exists())
+        self.assertTrue(stages[2].exists())
+
+    def test_stage_retention_allows_internal_cargo_hardlinks(self):
+        old = self._staged_fixture(live.LIVE_STAGE_PREFIX + "old", 100)
+        self._staged_fixture(live.LIVE_STAGE_PREFIX + "middle", 10)
+        self._staged_fixture(live.LIVE_STAGE_PREFIX + "newest", 1)
+        outside = self.root / "cargo-deps-thegn"
+        os.link(old / "output" / "thegn", outside)
+
+        self.assertEqual(live.retain_live_stages(self.paths), 1)
+        self.assertFalse(old.exists())
+        self.assertEqual(outside.read_bytes(), b"staged")
+
+    def test_stage_retention_preserves_active_recovery_linked_and_unsafe_trees(self):
+        active = self._staged_fixture(live.LIVE_STAGE_PREFIX + "active", 400)
+        linked = self._staged_fixture(live.LIVE_STAGE_PREFIX + "linked", 300)
+        unsafe = self._staged_fixture(live.LIVE_STAGE_PREFIX + "unsafe", 200)
+        retained = self._staged_fixture(live.LIVE_STAGE_PREFIX + "retained", 100)
+        newest = self._staged_fixture(live.LIVE_STAGE_PREFIX + "newest", 1)
+        with live.locked(active / live.LIVE_STAGE_LOCK):
+            recovery = self.state / "live-backup-test"
+            recovery.mkdir(mode=0o700)
+            (recovery / "complete.json").write_text(json.dumps({"artifact": str(linked / "output" / "thegn")}))
+            (unsafe / "output" / "escape").symlink_to(self.binary)
+            self.assertEqual(live.retain_live_stages(self.paths), 0)
+        self.assertTrue(active.exists())
+        self.assertTrue(linked.exists())
+        self.assertTrue(unsafe.exists())
+        self.assertTrue(newest.exists())
+
+    def test_stage_retention_fails_closed_for_bad_recovery_and_symlink_lock(self):
+        stages = [self._staged_fixture(live.LIVE_STAGE_PREFIX + str(index), 100 - index) for index in range(3)]
+        bad_recovery = self.state / "live-backup-incomplete"
+        bad_recovery.mkdir(mode=0o700)
+        (bad_recovery / "complete.json").write_text("{incomplete")
+        self.assertEqual(live.retain_live_stages(self.paths), 0)
+        self.assertTrue(all(stage.exists() for stage in stages))
+
+        shutil.rmtree(bad_recovery)
+        symlink_lock = stages[0]
+        (symlink_lock / live.LIVE_STAGE_LOCK).unlink()
+        (symlink_lock / live.LIVE_STAGE_LOCK).symlink_to(self.binary)
+        self.assertEqual(live.retain_live_stages(self.paths), 0)
+        self.assertTrue(symlink_lock.exists())
+
+    def test_stage_retention_binds_expected_root_identity(self):
+        swap = self._staged_fixture(live.LIVE_STAGE_PREFIX + "swap", 100)
+        self._staged_fixture(live.LIVE_STAGE_PREFIX + "retained", 10)
+        self._staged_fixture(live.LIVE_STAGE_PREFIX + "newest", 1)
+        swapped = False
+
+        original_validate = live._validate_stage_tree
+
+        def replace_after_validate(fd, count):
+            nonlocal swapped
+            result = original_validate(fd, count)
+            if result and not swapped:
+                swapped = True
+                replacement = swap.with_name("legacy-stage-replacement")
+                swap.rename(replacement)
+                self._staged_fixture(swap.name, 100)
+            return result
+
+        with patch.object(live, "_validate_stage_tree", side_effect=replace_after_validate):
+            self.assertEqual(live.retain_live_stages(self.paths), 0)
+        self.assertTrue(swapped)
+        self.assertTrue(swap.exists())
+        self.assertTrue(swap.with_name("legacy-stage-replacement").exists())
 
     def test_plan_and_confirmation_have_no_install_effects(self):
         with patch.object(live, "settings", return_value=self.paths), patch.object(live, "source_revision", return_value="a" * 40), patch.object(live, "build_stage") as build:

@@ -23,18 +23,25 @@ artifact that is copied into the installation.
 
 ## Upgrade sequence
 
-1. Check the supported paths and migration policy, then build the release host
-   with profiling in fresh, isolated Cargo output and intermediate directories.
-   The existing installed executable remains untouched during the build.
-2. Close the old controllers and daemons yourself, including any automatic
+1. Check the supported paths and migration policy. The helper then holds both
+   launcher locks, rechecks the clean checkout and observable same-user process
+   state, and briefly acquires and releases the database schema lock. This
+   preflight lease is released before the build and is not a promise that a
+   process cannot start later.
+2. Build the release host with profiling in fresh, isolated Cargo output and
+   intermediate directories. The existing installed executable remains untouched
+   during the build. Every stage is marked as owned before Cargo starts, so a
+   failed build remains available for inspection.
+3. Close the old controllers and daemons yourself, including any automatic
    restart service. Save pane work first. Confirm the displayed installation
    before proceeding. The helper never signals existing controllers or daemons
    and never trusts a stale PID file.
-3. Check for observable same-user processes using the destination executable or
-   database files, acquire the database schema lock, and create a private recovery
-   directory containing an online SQLite backup and a copy of the old executable.
-   Failures before installation leave the installed executable unchanged.
-4. Atomically replace the executable and launch it in the foreground with
+4. Check again for observable same-user processes using the destination
+   executable or database files, acquire the database schema lock, and create a
+   private recovery directory containing an online SQLite backup and a copy of
+   the old executable. Failures before installation leave the installed
+   executable unchanged.
+5. Atomically replace the executable and launch it in the foreground with
    profiling and rotating logs enabled. Database migration is performed by the
    normal controller startup under the existing migration authority. The helper
    does not override `THEGN_DATABASE_MIGRATION_EXECUTABLE` or grant itself migration
@@ -44,8 +51,16 @@ The default rotating application log allowance is 120 MB: 20 MB active plus five
 rotations. `just live trace` changes verbosity; `just live debug 5 2` requests
 15 MB instead. These are positional arguments, not `level=trace` assignments.
 Build artifacts, recovery backups, stderr and profiler output are separate from
-the rotating application log allowance. Review and remove retained artifacts
-manually when they are no longer needed; there is no automatic backup pruning.
+the rotating application log allowance. The helper retains the current staged
+build and the two newest prior owned stages. It removes only marked, current-user
+owned, private stages whose descriptor-checked trees contain regular files and
+directories, and only after acquiring their per-stage lock. Active stages and
+stages named by recovery metadata are preserved. Unmarked or otherwise unknown
+legacy entries are preserved for manual inspection. Recovery backups are never
+automatically pruned.
+Recovery descriptors omit transient staged-build paths, so completed upgrades do
+not pin every successful stage; explicit legacy or external recovery references
+remain protected.
 Each recovery directory retains its own `thegn-stderr.log`; the previous shared
 stderr file is not truncated. Fresh isolated builds trade incremental build speed
 and disk use for separation from other worktrees' Cargo outputs.
@@ -73,6 +88,10 @@ point-in-time observation: it cannot prevent an older launcher, an unrelated
 CLI, or a service from starting after the scan. Do not run other launchers or
 database commands during the transition. Root or hostile processes running as
 your own user are outside this developer tool's protection boundary.
+Stage retention binds each candidate's marker, lock and directory identity to
+descriptor-relative checks; if an entry changes during inspection, cleanup is
+refused and the stage is preserved for manual review. Do not edit or remove
+staged-build directories concurrently with the helper.
 
 Backup time limits are checked between SQLite and copy steps. They do not
 interrupt a stalled kernel or filesystem operation.
