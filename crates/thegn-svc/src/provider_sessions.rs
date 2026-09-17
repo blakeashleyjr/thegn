@@ -1,6 +1,6 @@
 //! Authoritative native-session absence. Transport/status/decoding failures are
 //! never an empty roster. The Sprites list contract is documented at
-//! https://sprites.dev/api/sprites/exec (GET /v1/sprites/{name}/exec).
+//! <https://sprites.dev/api/sprites/exec> (GET /v1/sprites/{name}/exec).
 
 use super::{CONTROL_TIMEOUT, Provider, SpritesProvider};
 use anyhow::{Context, Result, bail};

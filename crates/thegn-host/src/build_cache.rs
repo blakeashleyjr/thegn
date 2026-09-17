@@ -595,6 +595,7 @@ fn overmount_caches_at_home(
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
     fn resolved_bwrap_spec(cfg: &Config) -> Option<SandboxSpec> {
         let mut sandbox = cfg.sandbox.clone();
         sandbox.backend = thegn_core::config::SandboxBackend::Bwrap;
@@ -603,6 +604,48 @@ mod tests {
             std::fs::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).ok()?;
         let loc = thegn_core::remote::GitLoc::for_worktree(&root);
         thegn_core::sandbox::resolve(&sandbox, &loc, "cache-policy-test")
+    }
+
+    // The policy tests below render (but never execute) bwrap argv. Keep their
+    // spec independent of the host's installed sandbox runtimes; the ignored
+    // real-bwrap smoke still uses resolved_bwrap_spec for runtime coverage.
+    fn policy_bwrap_spec() -> SandboxSpec {
+        SandboxSpec {
+            backend: Backend::Bwrap,
+            placement: thegn_core::placement::Placement::Local,
+            image: None,
+            worktree: std::path::PathBuf::from("/repo"),
+            mounts: Vec::new(),
+            env: Vec::new(),
+            env_overrides: std::collections::HashMap::new(),
+            env_block: Vec::new(),
+            network: thegn_core::config::Network::Nat,
+            network_allow: Vec::new(),
+            network_block: Vec::new(),
+            read_only_root: false,
+            no_new_privileges: false,
+            pids_limit: None,
+            drop_capabilities: Vec::new(),
+            add_capabilities: Vec::new(),
+            file_access: thegn_core::config::FileAccess::Worktree,
+            ports: Vec::new(),
+            gpu: None,
+            limits: thegn_core::sandbox::SandboxLimits {
+                cpu_total: Some("off".into()),
+                ..thegn_core::sandbox::SandboxLimits::default()
+            },
+            volumes: Vec::new(),
+            compose: None,
+            build: None,
+            init_script: None,
+            devenv: false,
+            devenv_path: None,
+            name: "cache-policy-test".into(),
+            vpn: None,
+            oci_host: None,
+            oci_runtime: None,
+            daemon_persistent: false,
+        }
     }
 
     #[test]
@@ -741,9 +784,7 @@ mod tests {
     #[test]
     fn sandbox_cache_off_strips_sccache_but_preserves_custom_wrappers() {
         let cfg = Config::default();
-        let Some(mut spec) = resolved_bwrap_spec(&cfg) else {
-            return;
-        };
+        let mut spec = policy_bwrap_spec();
         spec.env_overrides
             .insert("RUSTC_WRAPPER".into(), "sccache".into());
         spec.env_overrides
@@ -778,9 +819,7 @@ mod tests {
         let mut cfg = Config::default();
         cfg.sandbox.compiler_cache = SandboxCompilerCache::Auto;
         cfg.disk.sccache_dir = "/tmp/thegn-sccache-policy-test".into();
-        let Some(mut spec) = resolved_bwrap_spec(&cfg) else {
-            return;
-        };
+        let mut spec = policy_bwrap_spec();
         spec.env_overrides
             .insert("RUSTC_WRAPPER".into(), "sccache".into());
         spec.env_overrides
@@ -838,9 +877,7 @@ mod tests {
         let mut cfg = Config::default();
         cfg.sandbox.compiler_cache = SandboxCompilerCache::Auto;
         cfg.disk.sccache_dir = "/tmp/thegn-sccache-policy-test-fail".into();
-        let Some(mut spec) = resolved_bwrap_spec(&cfg) else {
-            return;
-        };
+        let mut spec = policy_bwrap_spec();
         spec.env_overrides
             .insert("RUSTC_WRAPPER".into(), "sccache".into());
         let decision =
