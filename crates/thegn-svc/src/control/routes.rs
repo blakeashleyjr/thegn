@@ -239,8 +239,11 @@ pub fn api_call_for(cap: &str) -> Option<(&'static str, &'static str)> {
 /// — the shared spine of `thegn api call` (the generic CLI client) and the push
 /// command inbox (the daemon's in-process dispatch). `{placeholders}` in the
 /// path template are filled from `params` (and removed); remaining params ride
-/// the query string on `GET`/`DELETE` and the JSON body on `POST`. `Err` names
-/// the problem (unknown/unrouted cap, streaming cap, missing placeholder).
+/// the percent-encoded query string on `GET`/`DELETE` and the JSON body on
+/// `POST`. Non-string query values, including arrays, retain their existing
+/// JSON text representation as one value; an empty query value remains
+/// `name=`. `Err` names the problem (unknown/unrouted cap, streaming cap,
+/// missing or unsafe placeholder).
 ///
 /// This is the ONE place the catalog id → HTTP call mapping lives, so a new door
 /// (the inbox) reuses it rather than growing a second dispatch table.
@@ -269,7 +272,11 @@ pub fn build_call(
                         serde_json::Value::String(s) => s.clone(),
                         other => other.to_string(),
                     };
-                    format!("{k}={v}")
+                    format!(
+                        "{}={}",
+                        encode_query_component(k),
+                        encode_query_component(&v)
+                    )
                 })
                 .collect();
             path = format!("{path}?{}", qs.join("&"));
@@ -299,14 +306,47 @@ pub fn fill_path(
         let val = params
             .remove(key)
             .ok_or_else(|| format!("missing path parameter {key:?}"))?;
-        match val {
-            serde_json::Value::String(s) => out.push_str(&s),
-            other => out.push_str(other.to_string().trim_matches('"')),
+        let raw = match val {
+            serde_json::Value::String(s) => s,
+            other => other.to_string().trim_matches('"').to_string(),
+        };
+        if raw.is_empty() {
+            return Err(format!("path parameter {key:?} must not be empty"));
         }
+        if raw == "." || raw == ".." {
+            return Err(format!("path parameter {key:?} must not be a dot segment"));
+        }
+        out.push_str(&encode_path_component(&raw));
         rest = &rest[close + 1..];
     }
     out.push_str(rest);
     Ok(out)
+}
+
+/// Encode one raw path component. Exact `.` and `..` are rejected by
+/// [`fill_path`] because URL implementations normalize even percent-encoded
+/// dot segments; all other reserved bytes remain data in this segment.
+fn encode_path_component(value: &str) -> String {
+    percent_encode(value)
+}
+
+/// Encode one query name/value. Spaces use `%20` rather than `+` so the
+/// generated call round-trips through query decoders without form semantics.
+fn encode_query_component(value: &str) -> String {
+    percent_encode(value)
+}
+
+fn percent_encode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.as_bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(*byte, b'-' | b'_' | b'.' | b'~') {
+            out.push(*byte as char);
+        } else {
+            use std::fmt::Write as _;
+            write!(out, "%{byte:02X}").expect("writing percent encoding to String cannot fail");
+        }
+    }
+    out
 }
 
 /// Every capability id the HTTP surface implements (duplicates collapsed).
@@ -366,7 +406,7 @@ mod tests {
             .unwrap();
         let (method, path, body) = build_call("git.status", params).unwrap();
         assert_eq!(method, "GET");
-        assert_eq!(path, "/v1/git/status?worktree=/w");
+        assert_eq!(path, "/v1/git/status?worktree=%2Fw");
         assert!(body.is_none());
         // POST: params become the JSON body.
         let params = serde_json::json!({"worktree": "/w", "message": "hi"})
@@ -385,6 +425,76 @@ mod tests {
         let (_, path, body) = build_call("sessions.input", params).unwrap();
         assert_eq!(path, "/v1/sessions/abc/input");
         assert_eq!(body.unwrap()["b64"], "AA==");
+    }
+
+    #[test]
+    fn build_call_encodes_path_components_and_query_names_and_values() {
+        let params = serde_json::json!({
+            "s": "client/with?delimiters#and%escapes",
+        })
+        .as_object()
+        .cloned()
+        .unwrap();
+        let (_, path, _) = build_call("sessions.snapshot", params).unwrap();
+        assert_eq!(
+            path,
+            "/v1/sessions/client%2Fwith%3Fdelimiters%23and%25escapes/snapshot"
+        );
+
+        let params = serde_json::json!({"s": r"client\with"})
+            .as_object()
+            .cloned()
+            .unwrap();
+        let (_, path, _) = build_call("sessions.snapshot", params).unwrap();
+        assert_eq!(path, "/v1/sessions/client%5Cwith/snapshot");
+
+        let params = serde_json::json!({
+            "work tree&name": "a/b?c#d% e客户",
+            "array": ["x", "y"],
+        })
+        .as_object()
+        .cloned()
+        .unwrap();
+        let (_, path, _) = build_call("git.status", params).unwrap();
+        assert_eq!(
+            path,
+            "/v1/git/status?array=%5B%22x%22%2C%22y%22%5D&work%20tree%26name=a%2Fb%3Fc%23d%25%20e%E5%AE%A2%E6%88%B7"
+        );
+
+        let params = serde_json::json!({"optional": ""})
+            .as_object()
+            .cloned()
+            .unwrap();
+        let (_, path, _) = build_call("git.status", params).unwrap();
+        assert_eq!(path, "/v1/git/status?optional=");
+    }
+
+    #[test]
+    fn build_call_rejects_empty_and_exact_dot_path_components() {
+        for value in ["", ".", ".."] {
+            let params = serde_json::json!({"s": value})
+                .as_object()
+                .cloned()
+                .unwrap();
+            let error = build_call("sessions.snapshot", params).unwrap_err();
+            assert!(error.contains("path parameter"), "{value:?}: {error}");
+        }
+
+        let params = serde_json::json!({"s": "../other"})
+            .as_object()
+            .cloned()
+            .unwrap();
+        let (_, path, _) = build_call("sessions.snapshot", params).unwrap();
+        assert_eq!(path, "/v1/sessions/..%2Fother/snapshot");
+
+        for (value, encoded) in [("%2E", "%252E"), ("%2E%2E", "%252E%252E")] {
+            let params = serde_json::json!({"s": value})
+                .as_object()
+                .cloned()
+                .unwrap();
+            let (_, path, _) = build_call("sessions.snapshot", params).unwrap();
+            assert_eq!(path, format!("/v1/sessions/{encoded}/snapshot"));
+        }
     }
 
     #[test]
