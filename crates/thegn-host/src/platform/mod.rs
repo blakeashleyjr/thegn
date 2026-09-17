@@ -195,6 +195,28 @@ pub(crate) fn test_fifo(path: &std::path::Path) -> std::io::Result<()> {
         ))
     }
 }
+
+/// Make a fixture unreadable where the host OS exposes owner mode bits, then
+/// independently report whether the read was actually denied. This keeps
+/// Unix-only permission setup out of portable source tests and avoids treating
+/// a root-runner bypass as evidence that the scanner handled an error.
+#[cfg(test)]
+pub(crate) fn test_make_unreadable(path: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        if std::fs::set_permissions(path, std::fs::Permissions::from_mode(0)).is_err() {
+            return false;
+        }
+        std::fs::read(path).is_err()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        false
+    }
+}
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
