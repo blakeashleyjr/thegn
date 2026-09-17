@@ -9,6 +9,50 @@ use crate::util;
 use anyhow::Result;
 use rusqlite::OptionalExtension as _;
 
+/// The source row's verdict changed after the resume caller read it but
+/// before the atomic claim could reconcile it. This is a contention result,
+/// rather than a database failure: the newer verdict must be preserved and a
+/// caller may retry from a fresh roster read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResumeDispatchConflict {
+    /// The write transaction observed a different status than the caller's
+    /// expected source verdict.
+    SourceStatusChanged {
+        source_id: i64,
+        expected: AgentDispatchStatus,
+        actual: AgentDispatchStatus,
+    },
+    /// The guarded source update lost its compare-and-set race. The winner's
+    /// exact verdict is deliberately read by the next retry.
+    SourceUpdateLost {
+        source_id: i64,
+        expected: AgentDispatchStatus,
+    },
+}
+
+impl std::fmt::Display for ResumeDispatchConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SourceStatusChanged {
+                source_id,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "dispatch {source_id} changed from {} to {} while --resume-work was preparing it; the newer verdict was preserved",
+                expected.as_str(),
+                actual.as_str()
+            ),
+            Self::SourceUpdateLost { source_id, .. } => write!(
+                f,
+                "dispatch {source_id} changed while --resume-work was preparing it; the newer verdict was preserved"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ResumeDispatchConflict {}
+
 impl Db {
     /// Atomically publish the server-generated identity of an opened worker and
     /// move its reserved row to `running`. Only `queued`/`spawning` are
@@ -352,12 +396,13 @@ impl Db {
                     .ok_or_else(|| anyhow::anyhow!("dispatch {source_id} disappeared"))?;
                 let current = AgentDispatchStatus::parse(&stored);
                 if current != expected_source_status {
-                    anyhow::bail!(
-                        "dispatch {source_id} changed from {} to {} while --resume-work was \
-                         preparing it; the newer verdict was preserved",
-                        expected_source_status.as_str(),
-                        current.as_str()
-                    );
+                    return Err(anyhow::Error::new(
+                        ResumeDispatchConflict::SourceStatusChanged {
+                            source_id,
+                            expected: expected_source_status,
+                            actual: current,
+                        },
+                    ));
                 }
                 if current.is_active() {
                     let changed = conn.execute(
@@ -369,10 +414,12 @@ impl Db {
                         ],
                     )?;
                     if changed == 0 {
-                        anyhow::bail!(
-                            "dispatch {source_id} changed while --resume-work was preparing it; \
-                             the newer verdict was preserved"
-                        );
+                        return Err(anyhow::Error::new(
+                            ResumeDispatchConflict::SourceUpdateLost {
+                                source_id,
+                                expected: expected_source_status,
+                            },
+                        ));
                     }
                     self.append_dispatch_note(
                         source_id,
@@ -902,6 +949,14 @@ mod tests {
         let stale = db
             .claim_resume_dispatch(source, AgentDispatchStatus::Running, new(), 1)
             .unwrap_err();
+        assert!(matches!(
+            stale.downcast_ref::<ResumeDispatchConflict>(),
+            Some(ResumeDispatchConflict::SourceStatusChanged {
+                source_id: id,
+                expected: AgentDispatchStatus::Running,
+                actual: AgentDispatchStatus::Abandoned,
+            }) if *id == source
+        ));
         assert!(
             stale
                 .to_string()
@@ -910,6 +965,7 @@ mod tests {
         let missing = db
             .claim_resume_dispatch(99_999, AgentDispatchStatus::Running, new(), 1)
             .unwrap_err();
+        assert!(missing.downcast_ref::<ResumeDispatchConflict>().is_none());
         assert!(missing.to_string().contains("dispatch 99999 disappeared"));
         assert_eq!(db.list_dispatches().unwrap().len(), 1);
     }
