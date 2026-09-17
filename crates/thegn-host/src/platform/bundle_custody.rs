@@ -3,7 +3,7 @@
 //!
 //! The custody guarantee is a syscall property, so it is per-OS and lives here
 //! rather than at the call site (`merge_remote.rs`, which stays platform-free).
-//! Unix goes through the descriptor-relative gate seam ([`super::gate_path`]);
+//! Unix goes through the descriptor-relative gate seam ([`crate::platform::gate_path`]);
 //! Windows keeps the fetch path openable with `CREATE_NEW`, delete-sharing and
 //! a final reparse-point refusal, and compares handle identities instead of
 //! inode identities. Every other platform refuses rather than degrading to an

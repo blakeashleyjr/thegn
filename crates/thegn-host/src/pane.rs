@@ -960,7 +960,7 @@ impl PtyPane {
 /// exact contract the PTY reader thread fulfills, so the event loop is blind to
 /// which transport a pane uses. Forwards stdin/resize from `ctrl_rx`, publishes
 /// the announced session id into `session_cell`, and ends on exit/close/drop.
-/// How a single [`relay_session`] ended — drives reconnect vs propagate.
+/// How a single [`relay_session_pending`] ended — drives reconnect vs propagate.
 #[derive(Debug, PartialEq, Eq)]
 enum SessionEnd {
     /// The server reported a command exit (terminal — propagate it).
