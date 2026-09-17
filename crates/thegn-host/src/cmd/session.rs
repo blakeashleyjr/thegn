@@ -987,11 +987,19 @@ async fn open_stage(cfg: &Config, client: &ControlClient, d: StageDispatch<'_>) 
         None,
     )? {
         Ok(id) => id,
-        Err(decision) => anyhow::bail!(
-            "stage dispatch refused: {}\n(override with `thegn dispatch claim … \
-             --allow-duplicate <reason>` if this really is separate work)",
-            decision.reason()
-        ),
+        Err(decision) => {
+            let reason = decision.reason();
+            if d.json {
+                super::emit_json(&serde_json::json!({
+                    "granted": false,
+                    "reason": reason.as_str(),
+                }))?;
+            }
+            return Err(anyhow::Error::new(crate::cmd::Retryable(anyhow::anyhow!(
+                "stage dispatch refused: {reason}\n(override with `thegn dispatch claim … \
+                 --allow-duplicate <reason>` if this really is separate work)"
+            ))));
+        }
     };
     // 7. The artifact path this stage's worker will write (D6: sanitized,
     //    per-issue, row-keyed — the row id keeps parallel coders collide-free).
@@ -1230,6 +1238,7 @@ fn claim_resume_dispatch(
     stage: &thegn_core::config_pipeline::PipelineStage,
     worktree: &str,
     agent_name: &str,
+    json: bool,
 ) -> Result<i64> {
     match db.claim_resume_dispatch(
         row.id,
@@ -1247,11 +1256,19 @@ fn claim_resume_dispatch(
         stage.concurrency,
     )? {
         Ok(id) => Ok(id),
-        Err(decision) => anyhow::bail!(
-            "resume dispatch refused; row {} was left unchanged: {}",
-            row.id,
-            decision.reason()
-        ),
+        Err(decision) => {
+            let reason = decision.reason();
+            if json {
+                super::emit_json(&serde_json::json!({
+                    "granted": false,
+                    "reason": reason.as_str(),
+                }))?;
+            }
+            Err(anyhow::Error::new(crate::cmd::Retryable(anyhow::anyhow!(
+                "resume dispatch refused; row {} was left unchanged: {reason}",
+                row.id
+            ))))
+        }
     }
 }
 
@@ -1381,7 +1398,7 @@ async fn resume_work(
     // checked inside BEGIN IMMEDIATE with the insert. If another monitor takes
     // the freed slot first, this attempt is safely refused rather than
     // oversubscribing the stage.
-    let new_row = claim_resume_dispatch(&db, &row, stage, &wt, &agent_name)?;
+    let new_row = claim_resume_dispatch(&db, &row, stage, &wt, &agent_name, json)?;
     let artifact = pipeline_run::artifact_path(&row.issue_id, &stage.name, new_row);
     // 6b. Only now is the finisher's row-derived identity known. Render its
     // stage prompt with the NEW row id/artifact and the source artifact as its
@@ -1859,7 +1876,7 @@ mod resume_work_tests {
             ..Default::default()
         };
 
-        let finisher = claim_resume_dispatch(&db, &source_row, &stage, "/wt/121", "claude")
+        let finisher = claim_resume_dispatch(&db, &source_row, &stage, "/wt/121", "claude", false)
             .expect("reconciled source frees its slot");
         let source_after = db.get_dispatch(source).unwrap().unwrap();
         let finisher = db.get_dispatch(finisher).unwrap().unwrap();
@@ -1893,9 +1910,13 @@ mod resume_work_tests {
             ..Default::default()
         };
 
-        let error = claim_resume_dispatch(&db, &source_row, &stage, "/wt/121", "claude")
-            .unwrap_err()
-            .to_string();
+        let error = claim_resume_dispatch(&db, &source_row, &stage, "/wt/121", "claude", false)
+            .unwrap_err();
+        assert!(
+            error.downcast_ref::<crate::cmd::Retryable>().is_some(),
+            "capacity refusal must be retryable: {error:#}"
+        );
+        let error = error.to_string();
         assert!(error.contains("at capacity"), "{error}");
         assert!(error.contains("left unchanged"), "{error}");
         assert_eq!(db.list_dispatches().unwrap().len(), 2);
@@ -1926,9 +1947,13 @@ mod resume_work_tests {
             ..Default::default()
         };
 
-        let error = claim_resume_dispatch(&db, &stale_source, &stage, "/wt/121", "claude")
-            .unwrap_err()
-            .to_string();
+        let error = claim_resume_dispatch(&db, &stale_source, &stage, "/wt/121", "claude", false)
+            .unwrap_err();
+        assert!(
+            error.downcast_ref::<crate::cmd::Retryable>().is_some(),
+            "concurrent verdict refusal must be retryable: {error:#}"
+        );
+        let error = error.to_string();
         assert!(
             error.contains("changed from waiting_human to done"),
             "{error}"
