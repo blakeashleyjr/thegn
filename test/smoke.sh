@@ -96,6 +96,7 @@ session_end = []
 key = "p"
 context = "branches"
 command = "git push {{.SelectedBranch.Name | quote}}"
+template_policy = "safe"
 output = "popup"
 prompts = [{ type = "input", title = "Remote", key = "Remote" }]
 
@@ -518,7 +519,7 @@ fi
 check "program list --json reports the two members" \
   "[[ \$('$SZ' program list --json | grep -o '\"members\":2' | head -1) == '\"members\":2' ]]"
 check "legacy project alias warns" \
-  "'$SZ' project list --json 2>&1 >/dev/null | grep -q 'use.*thegn program'"
+  "'$SZ' project list --json 2>&1 >/dev/null | grep 'use.*thegn program' >/dev/null"
 check "program rm refuses a non-empty program without --force" \
   "! '$SZ' program rm smoke-proj >/dev/null 2>&1"
 
@@ -537,7 +538,7 @@ check "batched create made the branch in beta" \
 check "re-running --project alias warns and attaches existing members" \
   "'$SZ' wt new cross-feat --project smoke-proj --json 2>&1 | grep -q '\"status\":\"exists\"'"
 check "re-running --project alias emits deprecation warning" \
-  "'$SZ' wt new cross-feat --project smoke-proj --json 2>&1 >/dev/null | grep -q 'use.*wt new --program'"
+  "'$SZ' wt new cross-feat --project smoke-proj --json 2>&1 >/dev/null | grep 'use.*wt new --program' >/dev/null"
 
 # Subset: --repos restricts creation to the named member(s) only.
 # shellcheck disable=SC2034 # read by the `check` bodies below, which run under `eval`
@@ -763,7 +764,9 @@ check "merge list starts empty" \
 MP="$("$SZ" wt new smoke-merge --repo "$R")"
 MB="$(git -C "$MP" symbolic-ref --short HEAD)"
 echo hi >"$MP/smoke-merge.txt"
-git -C "$MP" add -A && git -C "$MP" commit -q -m "smoke merge change"
+# This fresh fixture also contains ignored, generated agent assets. Track them
+# here so the positive cleanup case has no uncommitted or ignored payload.
+git -C "$MP" add -f -A && git -C "$MP" commit -q -m "smoke merge change"
 check "merge add queues the worktree branch" \
   "'$SZ' merge add '$MP' | grep -q 'queued'"
 check "merge list shows the queued branch" \
@@ -773,8 +776,8 @@ if command -v sqlite3 >/dev/null 2>&1; then
     "[[ \$(sqlite3 \"$XDG_STATE_HOME/thegn/thegn.db\" \
        \"SELECT count(*) FROM merge_queue WHERE branch='$MB' AND status='queued'\") -eq 1 ]]"
 fi
-# `merge rm` removes a queued entry by path; re-add so drain has work. Done while
-# the worktree still exists — a clean land now auto-removes it (see below).
+# `merge rm` removes a queued entry by path; re-add so drain has work. The
+# post-collection dismissal below also exercises a path that no longer exists.
 check "merge rm deletes the entry by the same path" \
   "'$SZ' merge rm '$MP' >/dev/null 2>&1"
 # Flag-form twin: `merge rm` on a non-queued path exits non-zero, so it needs
@@ -804,11 +807,35 @@ check "the landed row survives as the grace-period clock" \
 # week, and an expiry that fires early is the bug the grace period exists to stop.
 check "sweep leaves a worktree that is not yet due" \
   "'$SZ' merge sweep | grep -q 'Nothing to sweep' && [[ -d '$MP' ]]"
-# --force is the "clear merged now" gesture: same collection, ignoring the clock.
+# --force ignores the clock, never the protection for ignored work.
+# This fixture is local-only. Do not let the VPN config tested above or OCI
+# tools installed on the developer's machine imply unresolved runtime custody.
+mkdir -p "$TMP/sweep-bin"
+for tool in git sh; do
+  ln -s "$(command -v "$tool")" "$TMP/sweep-bin/$tool"
+done
+sweep_fixture() {
+  PATH="$TMP/sweep-bin" "$SZ" --set sandbox.enabled=false \
+    --set sandbox.vpn.provider=none merge sweep "$@"
+}
+printf '/.smoke-sweep-ignored\n' >>"$(git -C "$MP" rev-parse --git-path info/exclude)"
+printf 'keep-me\n' >"$MP/.smoke-sweep-ignored"
+check "sweep fixture contains ignored work" \
+  "git -C '$MP' check-ignore -q .smoke-sweep-ignored"
+check "sweep --force preserves ignored work" \
+  "sweep_fixture --force | grep 'ignored work' >/dev/null && [[ \$(cat '$MP/.smoke-sweep-ignored') == keep-me ]]"
+rm -- "$MP/.smoke-sweep-ignored"
 check "sweep --force removes the merged worktree" \
-  "'$SZ' merge sweep --force | grep -q 'swept' && [[ ! -d '$MP' ]]"
-check "sweep --force deletes the merged branch" \
-  "[[ -z \$(git -C '$R' branch --list '$MB') ]]"
+  "sweep_fixture --force | grep 'swept' >/dev/null && [[ ! -d '$MP' ]]"
+# Physical collection deliberately retains the branch and an explicit cleanup
+# hold (THE-596); branch deletion cannot atomically prove the ref type yet.
+check "sweep --force retains the merged branch for explicit cleanup" \
+  "[[ -n \$(git -C '$R' branch --list '$MB') ]]"
+check "sweep records the retained branch cleanup hold" \
+  "[[ \$(sqlite3 \"$XDG_STATE_HOME/thegn/thegn.db\" \
+     \"SELECT count(*) FROM merge_queue WHERE branch='$MB' AND status='landed' AND error_detail='thegn-cleanup-hold:v1:branch-retained'\") -eq 1 ]]"
+check "explicit queue dismissal clears the collected fixture hold" \
+  "'$SZ' merge rm --worktree '$MP' >/dev/null && [[ \$(sqlite3 \"$XDG_STATE_HOME/thegn/thegn.db\" \"SELECT count(*) FROM merge_queue WHERE branch='$MB'\") -eq 0 ]]"
 
 # `--json` must emit EXACTLY one document on every path. The empty queue is the
 # case a cron/CI loop hits most often, and it used to print prose ("Nothing to
@@ -1819,7 +1846,9 @@ if command -v curl >/dev/null 2>&1; then
   check "session list shows the daemon-owned session" "[[ $slist_ok -eq 1 ]]"
   sid="$("$SZ" session list --json | sed -n 's/.*"id": "\([a-f0-9]*\)".*/\1/p' | head -1)"
   snap_ok=1
-  "$SZ" session snapshot --session "$sid" | grep -aq smoke-marker || snap_ok=0
+  # Drain the ANSI repaint: grep -q can close the pipe after the marker and
+  # make a correct snapshot fail with BrokenPipe under pipefail.
+  "$SZ" session snapshot --session "$sid" | grep -a smoke-marker >/dev/null || snap_ok=0
   check "snapshot carries the detached session's output" "[[ $snap_ok -eq 1 ]]"
 
   # THE-116/THE-121: the actual stage-dispatch composition, not DB-direct
