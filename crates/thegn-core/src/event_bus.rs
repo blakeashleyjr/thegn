@@ -10,8 +10,12 @@
 //! are dispatched for user-visible events.
 
 use serde::{Deserialize, Serialize};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
+
+/// Maximum number of desktop notifications waiting behind the active helper.
+/// The producer must never block on a desktop integration.
+pub const MAX_PENDING_DESKTOP: usize = 32;
 
 /// Urgency level for desktop notifications.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -425,7 +429,7 @@ impl EventSubscriber {
 /// Internal state for the event bus.
 struct EventBusState {
     subscribers: Vec<Sender<Event>>,
-    desktop_receivers: Vec<Sender<DesktopNotification>>,
+    desktop_receivers: Vec<SyncSender<DesktopNotification>>,
     /// Receivers of the audible-cue channel: a published
     /// [`Event::NotificationReceived`] is forwarded here so the host can route
     /// it through `notify::emit_sound`. Typed events (test/process/worktree)
@@ -475,11 +479,35 @@ impl EventBus {
 
         // Queue desktop notification if applicable
         if let Some(notif) = DesktopNotification::from_event(event)
-            && let Ok(state) = self.state.lock()
+            && let Ok(mut state) = self.state.lock()
         {
-            for tx in &state.desktop_receivers {
-                let _ = tx.send(notif.clone()); // best-effort: send to possibly-gone subscriber; a closed channel is the subscriber going away
+            let mut dropped = 0usize;
+            state
+                .desktop_receivers
+                .retain(|tx| match tx.try_send(notif.clone()) {
+                    Ok(()) => true,
+                    Err(TrySendError::Full(_)) => {
+                        dropped += 1;
+                        true
+                    }
+                    Err(TrySendError::Disconnected(_)) => false,
+                });
+            if dropped > 0 {
+                tracing::debug!(
+                    target: "thegn::desktop_notify",
+                    dropped,
+                    "desktop notification queue is full"
+                );
             }
+        }
+    }
+
+    /// Close the desktop sender owner so a dispatcher blocked in `recv` wakes.
+    /// The production host has one desktop subscription; clearing the stored
+    /// owners also removes any disconnected test or replacement subscribers.
+    pub fn close_desktop_receivers(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.desktop_receivers.clear();
         }
     }
 
@@ -499,7 +527,7 @@ impl EventBus {
 
     /// Get a receiver for desktop notifications.
     pub fn desktop_receiver(&self) -> Receiver<DesktopNotification> {
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(MAX_PENDING_DESKTOP);
         if let Ok(mut state) = self.state.lock() {
             state.desktop_receivers.push(tx);
         }
@@ -678,6 +706,26 @@ mod tests {
         let notif = desktop_rx.try_recv().expect("desktop notification queued");
         assert_eq!(notif.title, "Tests Failed");
         assert_eq!(notif.urgency, NotificationUrgency::Critical);
+    }
+
+    #[test]
+    fn desktop_channel_is_bounded_and_close_wakes_receiver() {
+        let bus = EventBus::new();
+        let desktop_rx = bus.desktop_receiver();
+        let event = Event::TestsFailed {
+            worktree: "/wt/app".into(),
+            count: 2,
+        };
+        for _ in 0..=MAX_PENDING_DESKTOP {
+            bus.publish_with_notification(&event);
+        }
+        let mut queued = 0;
+        while desktop_rx.try_recv().is_ok() {
+            queued += 1;
+        }
+        assert_eq!(queued, MAX_PENDING_DESKTOP);
+        bus.close_desktop_receivers();
+        assert!(matches!(desktop_rx.recv(), Err(mpsc::RecvError)));
     }
 
     #[test]
