@@ -15269,13 +15269,12 @@ async fn event_loop<T: Terminal>(
                     // Revoke the worker generation at the input boundary.
                     // Waiting for the next stats drain would leave a sample
                     // collected before pause/tab-away eligible for admission.
-                    if (!was_paused && is_paused)
+                    if ((!was_paused && is_paused)
                         || (was_process_tab && !still_process_tab)
-                        || outcome == crate::monitor::MonitorOutcome::Close
+                        || outcome == crate::monitor::MonitorOutcome::Close)
+                        && let Some(control) = &process_control
                     {
-                        if let Some(control) = &process_control {
-                            control.set_enabled(false);
-                        }
+                        control.set_enabled(false);
                     }
                     match action {
                         // A Containers-tab row action: dispatch off-loop
@@ -21222,7 +21221,7 @@ async fn event_loop<T: Terminal>(
                                                 false,
                                             );
                                         }
-                                        let opened = Some(crate::monitor::MonitorOverlay::open(
+                                        Some(crate::monitor::MonitorOverlay::open(
                                             monitor_prefs.last_tab,
                                             monitor_prefs.clone(),
                                             &model,
@@ -21232,8 +21231,7 @@ async fn event_loop<T: Terminal>(
                                                 Rect::full(cols, rows),
                                                 &current_config.daemon,
                                             ),
-                                        ));
-                                        opened
+                                        ))
                                     }
                                 };
                             }
