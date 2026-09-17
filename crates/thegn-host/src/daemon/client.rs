@@ -576,24 +576,63 @@ mod tests {
 
     #[tokio::test]
     async fn lazy_absence_queries_only_the_last_attach_endpoint_and_decodes_strictly() {
-        use axum::{Json, Router, routing::get};
+        use axum::{Router, body::Body, http::header, response::Response, routing::get};
         use serde_json::json;
-        for (body, expected) in [
-            (json!({"sessions": []}), Some(true)),
+        let cases: Vec<(Vec<u8>, Option<&'static str>, Option<bool>)> = vec![
             (
-                json!({"sessions": [SessionInfo { id: "live".into(), ..Default::default() }]}),
+                serde_json::to_vec(&json!({"sessions": []})).unwrap(),
+                Some("application/json"),
+                Some(true),
+            ),
+            (
+                serde_json::to_vec(
+                    &json!({"sessions": [SessionInfo { id: "live".into(), ..Default::default() }]}),
+                )
+                .unwrap(),
+                Some("application/json"),
                 Some(false),
             ),
-            (json!({}), None),
-            (json!({"sessions": null}), None),
-            (json!({"sessions": [SessionInfo::default()]}), None),
-        ] {
+            (
+                serde_json::to_vec(&json!({})).unwrap(),
+                Some("application/json"),
+                None,
+            ),
+            (
+                serde_json::to_vec(&json!({"sessions": null})).unwrap(),
+                Some("application/json"),
+                None,
+            ),
+            (
+                serde_json::to_vec(&json!({"sessions": [SessionInfo::default()]})).unwrap(),
+                Some("application/json"),
+                None,
+            ),
+            (b"{truncated".to_vec(), Some("application/json"), None),
+            (
+                b"<html>proxy failure</html>".to_vec(),
+                Some("text/html"),
+                None,
+            ),
+            (Vec::new(), Some("application/json"), None),
+        ];
+        for (body, content_type, expected) in cases {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap();
             let server = tokio::spawn(async move {
                 axum::serve(
                     listener,
-                    Router::new().route("/v1/sessions", get(move || async move { Json(body) })),
+                    Router::new().route(
+                        "/v1/sessions",
+                        get(move || async move {
+                            let mut response = Response::new(Body::from(body));
+                            if let Some(content_type) = content_type {
+                                response
+                                    .headers_mut()
+                                    .insert(header::CONTENT_TYPE, content_type.parse().unwrap());
+                            }
+                            response
+                        }),
+                    ),
                 )
                 .await
                 .unwrap();
