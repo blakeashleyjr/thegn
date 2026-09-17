@@ -1083,6 +1083,10 @@ pub struct WorkerCtx {
 
 /// Preserve Git's failure reason: a missing ref, an inaccessible repository,
 /// and an unborn branch must not all be reported as "no commits".
+#[expect(
+    clippy::disallowed_methods,
+    reason = "called only by run_worker on spawn_blocking threads, or synchronous tests"
+)]
 fn verify_base(root: &Path, base: &str) -> Result<(), String> {
     let result = util::git_cmd(root)
         .args([
