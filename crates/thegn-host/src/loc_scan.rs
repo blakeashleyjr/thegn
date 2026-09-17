@@ -8,14 +8,30 @@ use std::path::Path;
 
 use thegn_core::loc::{LocLang, LocReport};
 
+/// Result of one filesystem count. A partial report is useful for diagnostics,
+/// but must never be published as a fresh complete cache row.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ScanOutcome {
+    /// The root is absent or is not a directory.
+    Unavailable,
+    /// No language parse failure was surfaced by Tokei. `None` means there was
+    /// nothing measurable. Tokei's ignore walker logs directory errors and does
+    /// not expose them in `Languages`, so this is not a certification that every
+    /// directory was traversed; that observability gap remains explicit here.
+    Complete(Option<LocReport>),
+    /// Tokei parsed some data but marked at least one language inaccurate.
+    /// The report is retained only for tests/diagnostics; callers must not cache it.
+    Incomplete(LocReport),
+}
+
 /// Count lines under `path` with tokei and fold into a sorted [`LocReport`].
 /// Doc strings count as comments (matching the previous behavior).
 ///
-/// `None` when `path` isn't a readable directory, or when the walk finds nothing
-/// countable. Without that guard tokei on a missing or remote path returned a
-/// default report and the bottom bar rendered a confident `0 LOC` — the chip
-/// must hide instead of asserting an empty tree.
-pub fn scan(path: &Path) -> Option<LocReport> {
+/// `Unavailable` when `path` isn't a readable directory, and `Complete(None)`
+/// when the walk finds nothing countable. Without that distinction tokei on a
+/// missing or remote path returned a default report and the bottom bar rendered
+/// a confident `0 LOC` — the chip must hide instead of asserting an empty tree.
+pub(crate) fn scan(path: &Path) -> ScanOutcome {
     let boundaries = path
         .join(".gitmodules")
         .is_file()
@@ -33,9 +49,9 @@ pub fn scan(path: &Path) -> Option<LocReport> {
 /// Count a worktree while excluding each normalized submodule directory and
 /// all of its descendants. The boundary list is repository-relative and is
 /// compared component-wise by the core helper before it is joined to root.
-pub fn scan_excluding(path: &Path, submodule_paths: &[String]) -> Option<LocReport> {
+pub(crate) fn scan_excluding(path: &Path, submodule_paths: &[String]) -> ScanOutcome {
     if !path.is_dir() {
-        return None;
+        return ScanOutcome::Unavailable;
     }
     let excludes: Vec<String> = submodule_paths
         .iter()
@@ -49,6 +65,15 @@ pub fn scan_excluding(path: &Path, submodule_paths: &[String]) -> Option<LocRepo
         ..Default::default()
     };
     languages.get_statistics(&[path.to_path_buf()], &exclude_refs, &config);
+    outcome_from_languages(&languages)
+}
+
+/// Convert Tokei's aggregate while retaining its completeness marker. A
+/// language can be marked inaccurate after every attempted file read failed,
+/// leaving no positive line count to survive the row filter.
+fn outcome_from_languages(languages: &tokei::Languages) -> ScanOutcome {
+    // Check this before filtering zero-line languages.
+    let incomplete = languages.iter().any(|(_, lang)| lang.inaccurate);
     let langs: Vec<LocLang> = languages
         .iter()
         .filter(|(_, lang)| lang.lines() > 0)
@@ -62,7 +87,11 @@ pub fn scan_excluding(path: &Path, submodule_paths: &[String]) -> Option<LocRepo
         })
         .collect();
     let report = LocReport::from_langs(langs);
-    report.is_measurable().then_some(report)
+    if incomplete {
+        ScanOutcome::Incomplete(report)
+    } else {
+        ScanOutcome::Complete(report.is_measurable().then_some(report))
+    }
 }
 
 #[cfg(test)]
@@ -73,7 +102,9 @@ mod tests {
     fn scans_this_crate_and_detects_rust() {
         // Scan this crate's own `src/` — a real tree that always has Rust.
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let report = scan(&src).expect("this crate's src/ is countable");
+        let ScanOutcome::Complete(Some(report)) = scan(&src) else {
+            panic!("this crate's src/ is countable");
+        };
         assert!(report.total_code > 0, "expected some code lines");
         let rust = report.langs.iter().find(|l| l.name == "Rust");
         let rust = rust.expect("Rust should be detected");
@@ -90,17 +121,17 @@ mod tests {
     #[test]
     fn a_missing_or_empty_path_is_not_measurable() {
         let missing = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("no-such-dir");
-        assert!(scan(&missing).is_none(), "missing dir");
+        assert_eq!(scan(&missing), ScanOutcome::Unavailable);
 
         // A file, not a directory.
         let file = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
-        assert!(scan(&file).is_none(), "not a directory");
+        assert_eq!(scan(&file), ScanOutcome::Unavailable);
 
         // A real but empty directory has nothing countable in it.
         let empty = std::env::temp_dir().join(format!("tg-loc-empty-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&empty); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
         std::fs::create_dir_all(&empty).unwrap();
-        assert!(scan(&empty).is_none(), "empty dir");
+        assert_eq!(scan(&empty), ScanOutcome::Complete(None));
         let _ = std::fs::remove_dir_all(&empty); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 
@@ -116,7 +147,11 @@ mod tests {
         )
         .unwrap();
 
-        let report = scan_excluding(dir.path(), &["vendor/lib".into()]).unwrap();
+        let ScanOutcome::Complete(Some(report)) =
+            scan_excluding(dir.path(), &["vendor/lib".into()])
+        else {
+            panic!("superproject source is countable");
+        };
         assert_eq!(report.langs.iter().map(|lang| lang.files).sum::<usize>(), 1);
         assert!(report.total_code > 0);
     }
@@ -131,6 +166,69 @@ mod tests {
         )
         .unwrap();
         std::fs::write(dir.path().join("vendor/lib/lib.rs"), "fn vendored() {}\n").unwrap();
-        assert!(scan(dir.path()).is_some());
+        assert!(matches!(scan(dir.path()), ScanOutcome::Complete(Some(_))));
+    }
+
+    fn synthetic_language(code: usize, inaccurate: bool) -> tokei::Language {
+        tokei::Language {
+            code,
+            reports: vec![tokei::Report::new("fixture.rs".into())],
+            inaccurate,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn inaccurate_positive_language_is_not_a_complete_report() {
+        let mut languages = tokei::Languages::new();
+        languages.insert(tokei::LanguageType::Rust, synthetic_language(4, false));
+        languages.insert(tokei::LanguageType::Python, synthetic_language(2, true));
+
+        // A valid count cannot make a report look fresh when another language
+        // failed, even though the failed language has no usable row.
+        let ScanOutcome::Incomplete(report) = outcome_from_languages(&languages) else {
+            panic!("an inaccurate language must invalidate the report");
+        };
+        assert!(report.total_code > 0);
+    }
+
+    #[test]
+    fn inaccurate_zero_line_language_is_seen_before_filtering() {
+        let mut languages = tokei::Languages::new();
+        languages.insert(tokei::LanguageType::Rust, synthetic_language(4, false));
+        languages.insert(
+            tokei::LanguageType::Python,
+            tokei::Language {
+                inaccurate: true,
+                ..Default::default()
+            },
+        );
+        let ScanOutcome::Incomplete(report) = outcome_from_languages(&languages) else {
+            panic!("a zero-line inaccurate language must invalidate the report");
+        };
+        assert_eq!(
+            report.langs.len(),
+            1,
+            "failed zero-line language has no row"
+        );
+    }
+
+    /// On a non-root Unix test runner, an unreadable source file exercises the
+    /// real Tokei parse-error path. Root can still read mode-000 files, so that
+    /// environment is an explicit skip rather than a false failure.
+    #[test]
+    fn unreadable_source_is_not_published_as_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("secret.rs");
+        std::fs::write(&source, "fn secret() {}\n").unwrap();
+        // The platform helper changes permissions and checks the boundary
+        // independently of the scan result. A complete empty result is not
+        // evidence that this test exercised a read failure: root can bypass
+        // mode bits.
+        if !crate::platform::test_make_unreadable(&source) {
+            return;
+        }
+        let outcome = scan(dir.path());
+        assert!(matches!(outcome, ScanOutcome::Incomplete(_)));
     }
 }
