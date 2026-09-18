@@ -169,14 +169,19 @@ fn automatic_prewarm_rejects_host_reintroduced_by_remembered_agent_relaunch() {
             false,
         );
         assert!(
-            specs.as_ref().unwrap()[0]
+            specs.as_ref().ok().expect("resolved launch specs")[0]
                 .1
                 .argv
                 .join(" ")
                 .contains("remembered-agent"),
             "the real prewarm batch includes the remembered-agent substitution"
         );
-        assert_eq!(specs.as_ref().unwrap()[0].1.backend, "host");
+        assert_eq!(
+            specs.as_ref().ok().expect("resolved launch specs")[0]
+                .1
+                .backend,
+            "host"
+        );
 
         reject_host_prewarm(&mut specs);
         assert!(matches!(
@@ -262,7 +267,12 @@ fn automatic_prewarm_drains_host_result_without_spawning_or_evaluating() {
         )
         .map(|spec| vec![(7, spec)])
         .map_err(crate::handlers::provision::spec_err);
-        assert_eq!(specs.as_ref().unwrap()[0].1.backend, "host");
+        assert_eq!(
+            specs.as_ref().ok().expect("resolved launch specs")[0]
+                .1
+                .backend,
+            "host"
+        );
         crate::handlers::worktree_launch::apply_relaunch(
             &mut specs,
             &cfg,
@@ -271,7 +281,12 @@ fn automatic_prewarm_drains_host_result_without_spawning_or_evaluating() {
             true,
             false,
         );
-        assert_eq!(specs.as_ref().unwrap()[0].1.backend, "host");
+        assert_eq!(
+            specs.as_ref().ok().expect("resolved launch specs")[0]
+                .1
+                .backend,
+            "host"
+        );
         reject_host_prewarm(&mut specs);
         assert!(matches!(
             specs,
