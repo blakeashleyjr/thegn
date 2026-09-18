@@ -6947,6 +6947,42 @@ async fn event_loop<T: Terminal>(
     // placeholders can never collide with the panes we're about to spawn.
     remap_cold_workspace_ids(&mut session, &mut panes);
     let mut need_relayout = true;
+    // THE single place a new window size is adopted. Both sources funnel here:
+    // the SIGWINCH-driven `InputEvent::Resized` arm and the per-iteration poll of
+    // the tty's winsize. They used to be two hand-copied blocks, and they had
+    // drifted — the poll skipped `set_window_cols` + `sidebar_cols`, so a size
+    // adopted through it left the sidebar's width clamp at the OLD window width.
+    // The reconciliation block further down then noticed the mismatch a frame
+    // later and fired a second chrome recompute + relayout, which is how one
+    // compositor resize turned into a ±1-column ping-pong (2026-09-17: a niri
+    // config reload had thegn strobing at ~20 full repaints/s with `idle_ratio`
+    // pinned at 0). A same-size call is a no-op.
+    macro_rules! adopt_window_size {
+        ($r:expr, $c:expr) => {{
+            let (r, c) = ($r, $c);
+            if r != rows || c != cols {
+                rows = r;
+                cols = c;
+                if let Some(m) = monitor.as_mut() {
+                    // Resize is independent of live refresh: paused content
+                    // must fit the new viewport without consuming new data.
+                    m.reflow_geometry(Rect::full(cols, rows));
+                }
+                // A Wide sidebar tracks the new window width, and the
+                // nudge/drag ceiling (~half the window) moves with it.
+                layout::set_window_cols(cols);
+                sidebar_cols = sb.effective_cols(cols);
+                chrome = recompute_chrome!();
+                need_relayout = true;
+                buf.resize(cols, rows);
+                // A real resize scrambles the physical screen (terminals
+                // reflow/clip during the transition), so rebuild the wire
+                // state from scratch.
+                full_repaint = true;
+                dirty = true;
+            }
+        }};
+    }
     // Region-navigation memory: where the user last was in each region, so the
     // Alt+` toggle (and the Shift+Alt+↑/↓ overflow ring) can restore their place.
     // BOTH are group NAMES, resolved against the live session at use.
@@ -8709,18 +8745,10 @@ async fn event_loop<T: Terminal>(
             }
         }
 
-        if let Ok(size) = buf.terminal().get_screen_size()
-            && (size.rows != rows || size.cols != cols)
-        {
-            rows = size.rows;
-            cols = size.cols;
-            chrome = recompute_chrome!();
-            need_relayout = true;
-            buf.resize(cols, rows);
-            // The physical screen content is untrustworthy after a resize —
-            // rebuild the wire state from scratch (see the Resized arm).
-            full_repaint = true;
-            dirty = true;
+        // Poll the tty's winsize. SIGWINCH is the fast path; this catches a size
+        // change that arrived without one (or while the input queue was busy).
+        if let Ok(size) = buf.terminal().get_screen_size() {
+            adopt_window_size!(size.rows, size.cols);
         }
 
         // The active tab's panes are spawned lazily on first focus. While the
@@ -23367,33 +23395,18 @@ async fn event_loop<T: Terminal>(
                     full_repaint = true;
                     dirty = true;
                 } else {
-                    rows = r;
-                    cols = c;
-                    if let Some(m) = monitor.as_mut() {
-                        // Resize is independent of live refresh: paused content
-                        // must fit the new viewport without consuming new data.
-                        m.reflow_geometry(Rect::full(cols, rows));
-                    }
-                    // A Wide sidebar tracks the new window width, and the
-                    // nudge/drag ceiling (~half the window) moves with it.
-                    layout::set_window_cols(cols);
-                    sidebar_cols = sb.effective_cols(cols);
-                    chrome = recompute_chrome!();
-                    need_relayout = true;
-                    buf.resize(cols, rows);
-                    let _ = buf // best-effort: screen size: a failed set is corrected by the next resize
-                        .terminal()
-                        .set_screen_size(termwiz::terminal::ScreenSize {
-                            rows,
-                            cols,
-                            xpixel: 0,
-                            ypixel: 0,
-                        });
-                    // A real resize scrambles the physical screen (terminals
-                    // reflow/clip during the transition), so rebuild the wire
-                    // state from scratch.
-                    full_repaint = true;
-                    dirty = true;
+                    // NEVER write the size back to the tty. The winsize belongs
+                    // to the terminal emulator; `set_screen_size` is a
+                    // `TIOCSWINSZ` on our OWN controlling tty, and the kernel
+                    // answers a winsize change by SIGWINCHing the foreground
+                    // process group — i.e. us. Racing a compositor that is still
+                    // re-tiling, we would write back the size we just read while
+                    // the emulator asserted a newer one, and the two sides then
+                    // took turns re-asserting. That is the other half of the
+                    // 2026-09-17 strobe; the `buf.resize` in `adopt_window_size!`
+                    // already updates termwiz's own surface, which is all we
+                    // actually needed.
+                    adopt_window_size!(r, c);
                 }
             }
             Ok(Some(InputEvent::Paste(s))) => {

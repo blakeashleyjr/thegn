@@ -642,6 +642,11 @@ ratchets: delivery-check
     # one timed site that consumes `idle_poll::poll_timeout` (tested pure).
     bash test/idle-poll-guard.sh --self-test
     bash test/idle-poll-guard.sh
+    # Guardrail: the terminal emulator owns the tty winsize (we never
+    # TIOCSWINSZ ourselves back into a SIGWINCH), and every window-size
+    # adoption funnels through the one `adopt_window_size!` site.
+    bash test/winsize-guard.sh --self-test
+    bash test/winsize-guard.sh
 
 # The complete ratchet contract. Unlike `ratchets`, this also executes the
 # Rust-side platform/host-key/surface/completion/help checks and therefore
