@@ -659,7 +659,7 @@ mod tests {
                     vec![7u8; INSTANCE_ID_BYTES],
                     vec![8u8; GENERATION_BYTES],
                     vec![9u8; REPOSITORY_ID_BYTES],
-                    MAX_IDENTITY_FIELD_BYTES + 1,
+                    i64::try_from(MAX_IDENTITY_FIELD_BYTES + 1).unwrap(),
                     vec![10u8; 4],
                     b"branch".as_slice(),
                     b"/repo/.worktrees/oversized".as_slice(),

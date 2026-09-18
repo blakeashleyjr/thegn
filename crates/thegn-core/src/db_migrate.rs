@@ -1447,9 +1447,14 @@ pub(crate) fn verify_v66_schema(conn: &Connection) -> Result<()> {
 }
 #[cfg(test)]
 mod tests {
+    use super::{
+        V69_WORKTREE_INSTANCES_TABLE_DDL, has_column, migrate_v69, refuse_v69_rebuild_remnants,
+        verify_v69_schema,
+    };
     use crate::autopilot::AutopilotIssueKey;
     use crate::db::Db;
     use crate::store::{AutopilotStore, ClaimOutcome, SessionForkStore, WorkspaceStore};
+    use rusqlite::{Connection, params};
 
     #[test]
     fn detect_newer_schema_flags_only_a_newer_db() {
@@ -2515,6 +2520,96 @@ mod tests {
             "worktree_instances",
             "operation_revision"
         ));
+    }
+
+    #[test]
+    fn v69_unique_index_failure_rolls_back_rebuild_and_preserves_both_claims() {
+        // Two old-ledger rows both claim `verified` for the same path. The
+        // copy succeeds, but the verified-path partial unique index cannot be
+        // created. The whole rebuild must roll back: the old table (without
+        // `operation_revision`) and both claims survive, no rebuild remnant is
+        // left, and a retry refuses the same way rather than accepting a
+        // half-built replacement.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE worktrees (path TEXT);
+             CREATE TABLE tab_groups (name TEXT);
+             CREATE TABLE worktree_instances (
+               instance_id BLOB PRIMARY KEY,
+               generation BLOB NOT NULL,
+               repo_id BLOB NOT NULL,
+               common_dir BLOB NOT NULL,
+               admin_id BLOB NOT NULL,
+               branch_ref BLOB,
+               path BLOB NOT NULL,
+               owner BLOB NOT NULL,
+               state TEXT NOT NULL,
+               quarantine_reason TEXT,
+               created_at INTEGER NOT NULL
+             );
+             INSERT INTO worktree_instances VALUES
+               (randomblob(32), randomblob(16), zeroblob(32), X'2f72', X'61', NULL,
+                X'2f722f77', X'74', 'verified', NULL, 1),
+               (randomblob(32), randomblob(16), zeroblob(32), X'2f72', X'62', NULL,
+                X'2f722f77', X'74', 'verified', NULL, 2);",
+        )
+        .unwrap();
+        for attempt in 0..2 {
+            assert!(
+                migrate_v69(&conn).is_err(),
+                "attempt {attempt}: colliding verified claims must refuse"
+            );
+            let count: i64 = conn
+                .query_row("SELECT count(*) FROM worktree_instances", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 2, "both original claims survive the rollback");
+            assert!(!has_column(
+                &conn,
+                "worktree_instances",
+                "operation_revision"
+            ));
+            assert!(!has_column(&conn, "worktrees", "instance_id"));
+            refuse_v69_rebuild_remnants(&conn).unwrap();
+        }
+    }
+
+    #[test]
+    fn v69_migration_is_idempotent_over_a_valid_old_ledger() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE worktrees (path TEXT);
+             CREATE TABLE tab_groups (name TEXT);
+             CREATE TABLE worktree_instances (
+               instance_id BLOB PRIMARY KEY,
+               generation BLOB NOT NULL,
+               repo_id BLOB NOT NULL,
+               common_dir BLOB NOT NULL,
+               admin_id BLOB NOT NULL,
+               branch_ref BLOB,
+               path BLOB NOT NULL,
+               owner BLOB NOT NULL,
+               state TEXT NOT NULL,
+               quarantine_reason TEXT,
+               created_at INTEGER NOT NULL
+             );
+             INSERT INTO worktree_instances VALUES
+               (randomblob(32), randomblob(16), zeroblob(32), X'2f72', X'61', X'62',
+                X'2f722f77', X'74', 'legacy', NULL, 1);",
+        )
+        .unwrap();
+        migrate_v69(&conn).unwrap();
+        migrate_v69(&conn).unwrap();
+        verify_v69_schema(&conn).unwrap();
+        let (count, revision): (i64, i64) = conn
+            .query_row(
+                "SELECT count(*), max(operation_revision) FROM worktree_instances",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((count, revision), (1, 0));
     }
 
     #[test]
