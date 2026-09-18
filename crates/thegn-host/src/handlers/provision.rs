@@ -1412,4 +1412,77 @@ mod tests {
         assert!(!need_relayout);
         assert!(!dirty);
     }
+
+    /// A worktree can be removed while its off-thread prewarm is resolving.
+    /// The result has no tab left to target, but its reservation still belongs
+    /// to the removed group and must not remain in the loop-local set forever.
+    #[test]
+    fn drain_specs_releases_prewarm_reservation_when_group_disappears() {
+        let mut session = Session {
+            id: "s1".into(),
+            worktrees: Vec::new(),
+            active: 0,
+        };
+        let (pane_tx, _pane_rx) = tokio_mpsc::channel::<PaneEvent>(16);
+        let mut panes = crate::panes::Panes::new(pane_tx);
+        let cfg = thegn_core::config::Config::default();
+        let mut model = crate::chrome::FrameModel::default();
+        let mut active_menu: Option<MenuOverlay> = None;
+        let mut loading_state = crate::loading::track::LoadingTracker::default();
+        let mut loading_remote = std::collections::HashMap::new();
+        let mut materialize_inflight = std::collections::HashSet::new();
+        let mut prewarm_inflight =
+            std::collections::HashSet::from([("removed/group".into(), 0usize)]);
+        let mut materialize_failed = std::collections::HashSet::new();
+        let mut prewarm_failed = std::collections::HashSet::new();
+        let mut halt_dismissed = std::collections::HashSet::new();
+        let mut last_pool_reconcile = None;
+        let mut center_dormant = false;
+        let mut need_relayout = false;
+        let mut dirty = false;
+        let mut loop_perf = crate::perf::LoopPerf::new();
+        let (spec_tx, mut spec_rx) = tokio::sync::mpsc::unbounded_channel();
+        spec_tx
+            .send(SpecBatch {
+                group: "removed/group".into(),
+                worktree: String::new(),
+                tab: 0,
+                target_leaves: vec![42],
+                origin: SpecOrigin::Prewarm,
+                specs: Err(SpecError::PrewarmSkipped),
+                attach: Vec::new(),
+            })
+            .unwrap();
+
+        drain_specs(
+            &mut spec_rx,
+            &mut SpecDrainCtx {
+                session: &mut session,
+                panes: &mut panes,
+                model: &mut model,
+                active_menu: &mut active_menu,
+                current_config: &cfg,
+                center: crate::layout::compute(160, 40, true, true).center,
+                loading_state: &mut loading_state,
+                loading_remote: &mut loading_remote,
+                materialize_inflight: &mut materialize_inflight,
+                prewarm_inflight: &mut prewarm_inflight,
+                materialize_failed: &mut materialize_failed,
+                prewarm_failed: &mut prewarm_failed,
+                halt_dismissed: &mut halt_dismissed,
+                last_pool_reconcile: &mut last_pool_reconcile,
+                center_dormant: &mut center_dormant,
+                need_relayout: &mut need_relayout,
+                dirty: &mut dirty,
+                loop_perf: &mut loop_perf,
+            },
+        );
+
+        assert!(
+            prewarm_inflight.is_empty(),
+            "a vanished group must not retain its completed prewarm reservation"
+        );
+        assert!(!need_relayout);
+        assert!(!dirty);
+    }
 }
