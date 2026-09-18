@@ -533,16 +533,25 @@ pub fn normalize_remote_calendar_url(
     raw: &str,
     allow_webcal: bool,
 ) -> Result<String, &'static str> {
-    let mut url = url::Url::parse(raw.trim()).map_err(|_| "must be a valid URL")?;
+    let raw = raw.trim();
+    // `Url::set_scheme` intentionally refuses a non-special → special
+    // transition.  Normalize the legacy webcal spelling before parsing so the
+    // resulting URL is a normal HTTPS URL while retaining its authority,
+    // path, query, and percent-encoding exactly as the URL parser defines them.
+    let parse_raw = match raw.split_once(':') {
+        Some((scheme, rest)) if scheme.eq_ignore_ascii_case("webcal") => {
+            if !allow_webcal {
+                return Err("must use http:// or https:// (webcal:// is accepted for ics_url)");
+            }
+            format!("https:{rest}")
+        }
+        _ => raw.to_owned(),
+    };
+    let url = url::Url::parse(&parse_raw).map_err(|_| "must be a valid URL")?;
     let scheme = url.scheme().to_ascii_lowercase();
-    let accepted =
-        matches!(scheme.as_str(), "http" | "https") || (allow_webcal && scheme == "webcal");
+    let accepted = matches!(scheme.as_str(), "http" | "https");
     if !accepted {
         return Err("must use http:// or https:// (webcal:// is accepted for ics_url)");
-    }
-    if scheme == "webcal" {
-        url.set_scheme("https")
-            .map_err(|_| "webcal URL could not be normalized")?;
     }
     if url.host_str().is_none()
         || !url.username().is_empty()
