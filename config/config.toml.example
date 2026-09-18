@@ -2754,8 +2754,9 @@ inject_devshell = true
 nix_daemon = false
 
 # ── Missing backend behaviour ─────────────────────────────────────────────────
-# What to do when no backend in backend_chain is available:
-#   warn   — refuse the sandbox launch with an actionable warning (default).
+# What to do when no sandbox backend in backend_chain is available and the
+# chain itself names `host` (a chain without `host` always refuses instead):
+#   warn   — open the pane on the host and show a banner (default).
 #   prompt — ask before falling back to host.
 #   fail   — refuse to open the pane.
 on_missing = "warn"

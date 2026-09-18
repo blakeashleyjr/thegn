@@ -808,8 +808,11 @@ pub fn prepare_sandbox_env(
     }
     // Reaching here means no candidate produced a runnable sandbox. A requested
     // sandbox must halt with the existing actionable error instead of becoming a
-    // host login shell, regardless of failover mode or placement.
-    if !degrade_allowed {
+    // host login shell, regardless of failover mode — unless this is a local
+    // `auto` walk whose configured chain itself names the host: landing there
+    // is the chain's configured outcome, not a fallback (the default chain ends
+    // in `host`, so refusing here would refuse every pane on a runtime-less box).
+    if !degrade_allowed && !(placement.is_local() && auto_chain_names_host(&sb)) {
         let reachable = sandbox::placement_reachable(&exec_placement, &sb.backend_chain);
         return Err(SandboxHalt {
             env_name: env_name.clone(),
@@ -1596,6 +1599,18 @@ fn host_fallback_allowed(
         && (force_host
             || !sandbox.enabled
             || sandbox.backend == thegn_core::config::SandboxBackend::None)
+}
+
+/// Whether an enabled `auto` sandbox's configured `backend_chain` explicitly
+/// lists the host (`host`/`none`). Only the user's own chain counts — the
+/// implicit host tail `sandbox_candidates` appends is not consent.
+fn auto_chain_names_host(sandbox: &thegn_core::config::SandboxConfig) -> bool {
+    sandbox.enabled
+        && sandbox.backend == thegn_core::config::SandboxBackend::Auto
+        && sandbox.backend_chain.iter().any(|name| {
+            thegn_core::config::SandboxBackend::from_str_validated(name)
+                .is_ok_and(|b| b == thegn_core::config::SandboxBackend::None)
+        })
 }
 
 /// Un-pin `worktree` from the host so an explicit retry re-attempts the real env.

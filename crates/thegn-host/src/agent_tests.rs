@@ -20,6 +20,48 @@ fn sandbox_resolution_does_not_authorize_implicit_host_fallback() {
 }
 
 #[test]
+fn only_a_configured_auto_chain_naming_the_host_lands_there() {
+    use thegn_core::config::{SandboxBackend, SandboxConfig};
+
+    let mut sb = SandboxConfig::default();
+    sb.enabled = true;
+    sb.backend = SandboxBackend::Auto;
+    // The default chain ends in `host`: landing there is configured, not a fallback.
+    assert!(auto_chain_names_host(&sb));
+    sb.backend_chain = vec!["none".into()];
+    assert!(auto_chain_names_host(&sb));
+    // A chain without the host must not inherit the implicit host tail.
+    sb.backend_chain = vec!["podman-rootless".into(), "bwrap".into()];
+    assert!(!auto_chain_names_host(&sb));
+    // An explicit backend is a containment request, whatever the chain says.
+    sb.backend_chain = vec!["host".into()];
+    sb.backend = SandboxBackend::Bwrap;
+    assert!(!auto_chain_names_host(&sb));
+    // Disabled is the separate explicit-host policy, not this rule.
+    sb.backend = SandboxBackend::Auto;
+    sb.enabled = false;
+    assert!(!auto_chain_names_host(&sb));
+}
+
+#[test]
+fn auto_chain_without_host_halts_instead_of_opening_a_host_shell() {
+    with_temp_state("auto-no-host", || {
+        let mut cfg = cfg_with(&[], &[]);
+        cfg.sandbox.backend = thegn_core::config::SandboxBackend::Auto;
+        // `apple` is a real backend whose binary is absent on Linux.
+        cfg.sandbox.backend_chain = vec!["apple".to_string()];
+        let worktree =
+            std::env::temp_dir().join(format!("tg-agent-auto-no-host-{}", std::process::id()));
+        let err = launch_spec(&cfg, &worktree.to_string_lossy(), None, "shell")
+            .expect_err("a chain that never names the host must not open a host shell");
+        assert!(
+            format!("{err:#}").contains("will not silently fall back to the host"),
+            "actionable halt: {err:#}"
+        );
+    });
+}
+
+#[test]
 fn remote_native_resolution_never_uses_the_local_none_host_fallback() {
     with_temp_state("remote-none-resolution", || {
         let cfg: Config = toml::from_str(
@@ -59,7 +101,8 @@ exec_command = ["fixture-exec", "{id}", "--"]
         .expect("native ssh resolution does not need a host fallback");
         assert!(ssh.spec.is_some());
         assert!(ssh.is_remote);
-        assert_eq!(ssh.backend_label, "none");
+        // `Backend::None` labels itself "host"; `is_remote` is what proves no local shell.
+        assert_eq!(ssh.backend_label, "host");
 
         // The provider fixture is likewise resolved by its injected static
         // placement outcome; no provider API or availability probe is needed.
@@ -75,13 +118,14 @@ exec_command = ["fixture-exec", "{id}", "--"]
         .expect("native provider resolution does not need a host fallback");
         assert!(provider.spec.is_some());
         assert!(provider.is_remote);
-        assert_eq!(provider.backend_label, "none");
+        assert_eq!(provider.backend_label, "host");
 
         // A disabled remote environment still has a remote placement and must
-        // not turn a missing nested backend into a local host shell.
+        // not turn a missing nested backend into a local host shell: it either
+        // stays remote or halts (the unreachable fixture host halts).
         let mut disabled = cfg.clone();
         disabled.sandbox.enabled = false;
-        let outcome = prepare_sandbox_env(
+        match prepare_sandbox_env(
             &disabled,
             Path::new("/repo"),
             "/local/worktree",
@@ -89,10 +133,16 @@ exec_command = ["fixture-exec", "{id}", "--"]
             None,
             false,
             Some("ssh"),
-        )
-        .expect("disabled remote native resolution remains remote");
-        assert!(outcome.spec.is_some());
-        assert!(outcome.is_remote);
+        ) {
+            Ok(outcome) => {
+                assert!(outcome.spec.is_some());
+                assert!(outcome.is_remote);
+            }
+            Err(e) => assert!(
+                e.downcast_ref::<crate::agent::SandboxHalt>().is_some(),
+                "a refusal, not a local host shell: {e:#}"
+            ),
+        }
     });
 }
 
@@ -1683,9 +1733,9 @@ fn final_host_fallback_honors_fail_closed_floor_without_a_resolved_candidate() {
     with_temp_state("floor-auto-host", || {
         let mut cfg = Config::default();
         cfg.sandbox.backend = thegn_core::config::SandboxBackend::Auto;
-        // No candidate reaches the pre-ensure floor check. The candidate builder
-        // still appends host: this used to bypass fail-closed admission entirely.
-        cfg.sandbox.backend_chain.clear();
+        // No candidate reaches the pre-ensure floor check; the chain lands on
+        // the host directly. This used to bypass fail-closed admission entirely.
+        cfg.sandbox.backend_chain = vec!["host".to_string()];
         cfg.sandbox.isolation_floor = thegn_core::config::IsolationFloor::SharedKernel;
         cfg.sandbox.on_floor_miss = thegn_core::config::OnFloorMiss::Fail;
         let loc = GitLoc::from_db("/wt/x", None);
@@ -1837,8 +1887,8 @@ fn explicit_host_pick_overrides_nonauto_config() {
 fn selected_env_with_no_table_halts_or_degrades_loudly() {
     // Regression ("machine0 silently fell back to local bwrap"): selecting an env
     // that has no `[env.<name>]` table must NOT open a silent local shell.
-    // failover = halt ⇒ Err(SandboxHalt); failover = auto ⇒ Ok but with
-    // `degraded_from_provider` set so the notification/status/sidebar marker fire.
+    // Any failover mode ⇒ Err(SandboxHalt); only an explicit host policy ⇒ Ok,
+    // with `degraded_from_provider` set so the notification/status/sidebar fire.
     with_temp_state("prep-phantom-env", || {
         let loc = GitLoc::from_db("/wt/x", None);
 
@@ -1859,9 +1909,26 @@ fn selected_env_with_no_table_halts_or_degrades_loudly() {
             .expect("the error is a SandboxHalt");
         assert_eq!(halt.env_name, "ghost");
 
-        // failover = auto ⇒ degrade, but LOUDLY (degraded flag set).
+        // failover = auto is not permission to bypass a requested env (THE-418):
+        // the dropped selection still halts rather than opening a host shell.
         let mut cfg = Config::default();
         cfg.sandbox.failover = thegn_core::config::FailoverMode::Auto;
+        let err = prepare_sandbox_env(
+            &cfg,
+            Path::new("/repo"),
+            "/wt/x",
+            &loc,
+            None,
+            false,
+            Some("ghost"),
+        )
+        .expect_err("auto failover no longer degrades a dropped selection");
+        assert!(err.downcast_ref::<crate::agent::SandboxHalt>().is_some());
+
+        // An explicit local host policy is a deliberate host decision: degrade,
+        // but LOUDLY (degraded flag set) so the notification fires.
+        let mut cfg = Config::default();
+        cfg.sandbox.backend = thegn_core::config::SandboxBackend::None;
         let out = prepare_sandbox_env(
             &cfg,
             Path::new("/repo"),
@@ -1871,7 +1938,7 @@ fn selected_env_with_no_table_halts_or_degrades_loudly() {
             false,
             Some("ghost"),
         )
-        .expect("auto failover degrades rather than halting");
+        .expect("an explicit host policy degrades rather than halting");
         assert!(
             out.degraded_from_provider,
             "the dropped selection is flagged degraded so the notification fires"
