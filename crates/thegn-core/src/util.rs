@@ -2,8 +2,9 @@
 //! and thin subprocess wrappers (git / generic commands).
 
 use crate::msg;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
@@ -139,6 +140,78 @@ pub(crate) fn immutable_sqlite_uri(path: &std::path::Path) -> String {
     }
     uri.push_str("?immutable=1");
     uri
+}
+
+/// Capture a bounded Git stdout stream for identity probes. The identity seam
+/// cannot use the lossy `git_out` helper, and a malformed repository must not
+/// be able to make a probe allocate without limit. Stderr is intentionally
+/// redirected away: callers only use the typed probe result, not unbounded Git
+/// diagnostics.
+pub(crate) fn git_stdout_bounded(
+    dir: &Path,
+    args: &[&str],
+    max_bytes: usize,
+) -> Result<Vec<u8>, String> {
+    let mut child = git_cmd(dir)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "git stdout pipe was unavailable".to_string())?;
+    let mut bytes = Vec::with_capacity(max_bytes.min(4096));
+    let read = stdout
+        .take(max_bytes.saturating_add(1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|e| e.to_string());
+    if read.is_err() || bytes.len() > max_bytes {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err("git identity probe output exceeded its bound".into());
+    }
+    let status = child.wait().map_err(|e| e.to_string())?;
+    if !status.success() {
+        return Err(format!("git exited with {status}"));
+    }
+    Ok(bytes)
+}
+
+/// Exact native path bytes used by the identity seam. The platform-specific
+/// conversion lives here so identity types never need to invent a lossy
+/// `Path`/`String` boundary.
+pub(crate) fn native_path_bytes(path: &Path) -> Option<Vec<u8>> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        return Some(path.as_os_str().as_bytes().to_vec());
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        let mut out = Vec::with_capacity(path.as_os_str().len() * 2);
+        for unit in path.as_os_str().encode_wide() {
+            out.extend_from_slice(&unit.to_le_bytes());
+        }
+        return Some(out);
+    }
+    #[cfg(not(any(unix, windows)))]
+    path.to_str().map(|text| text.as_bytes().to_vec())
+}
+
+/// Convert Git's bounded path output to a native path without using lossy
+/// UTF-8 conversion. Git emits UTF-8 on Windows; the native representation is
+/// captured by [`native_path_bytes`] after that conversion.
+pub(crate) fn path_from_git_bytes(bytes: &[u8]) -> Option<PathBuf> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        return Some(PathBuf::from(std::ffi::OsString::from_vec(bytes.to_vec())));
+    }
+    #[cfg(not(unix))]
+    String::from_utf8(bytes.to_vec()).ok().map(PathBuf::from)
 }
 
 /// A short, STABLE alphanumeric digest of a string — deterministic across runs,

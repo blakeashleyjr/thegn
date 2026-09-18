@@ -1,10 +1,148 @@
 //! Branch-name generation, base-branch resolution, and worktree add/remove.
 
 use crate::config::{Config, NameScheme, WorktreeMode};
+use crate::identity::{BranchRef, ExactPath, IdentityError};
 use crate::msg;
 use crate::repo;
 use crate::util;
 use std::path::{Path, PathBuf};
+
+const MAX_GIT_IDENTITY_OUTPUT: usize = 64 * 1024;
+
+/// Exact Git metadata for one registered worktree. The paths retain their
+/// native bytes and the branch is kept separate from its display label. Git
+/// remains authoritative; this is an inspection result, not a claim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitWorktreeIdentity {
+    pub common_dir: ExactPath,
+    pub admin_dir: ExactPath,
+    pub registered_path: ExactPath,
+    pub branch: Option<BranchRef>,
+}
+
+impl GitWorktreeIdentity {
+    /// Exact administrative path bytes used as the stable Git-instance input.
+    pub fn admin_id(&self) -> &[u8] {
+        self.admin_dir.as_bytes()
+    }
+}
+
+/// Inspect the one Git worktree registered at `path` without converting
+/// porcelain output through UTF-8. A relative or symlink alias is accepted for
+/// lookup, but the returned path is Git's exact registered path.
+pub fn inspect_registered(root: &Path, path: &Path) -> Result<GitWorktreeIdentity, IdentityError> {
+    let requested = std::fs::canonicalize(path).map_err(|_| IdentityError::GitProbeFailed {
+        operation: "canonicalize requested worktree",
+    })?;
+    let porcelain = util::git_stdout_bounded(
+        root,
+        &["worktree", "list", "--porcelain", "-z"],
+        MAX_GIT_IDENTITY_OUTPUT,
+    )
+    .map_err(|_| IdentityError::GitProbeFailed {
+        operation: "git worktree list --porcelain -z",
+    })?;
+    let entries = parse_worktree_identity_records(&porcelain)?;
+    let mut matches = entries
+        .into_iter()
+        .filter(|entry| {
+            std::fs::canonicalize(entry.path.as_path())
+                .map(|candidate| candidate == requested)
+                .unwrap_or(false)
+        })
+        .collect::<Vec<_>>();
+    if matches.is_empty() {
+        return Err(IdentityError::NotRegistered);
+    }
+    if matches.len() != 1 {
+        return Err(IdentityError::Ambiguous {
+            kind: "Git worktree registration",
+        });
+    }
+    let entry = matches.pop().expect("one match checked");
+    let common_dir = repo::canonical_common_dir(entry.path.as_path())?;
+    let admin_dir = exact_git_path(
+        &entry.path,
+        &["rev-parse", "--path-format=absolute", "--git-dir"],
+        "rev-parse --git-dir",
+    )?;
+    Ok(GitWorktreeIdentity {
+        common_dir,
+        admin_dir,
+        registered_path: entry.path,
+        branch: entry.branch,
+    })
+}
+
+#[derive(Debug)]
+struct WorktreeIdentityRecord {
+    path: ExactPath,
+    branch: Option<BranchRef>,
+}
+
+fn exact_git_path(
+    dir: &ExactPath,
+    args: &[&str],
+    operation: &'static str,
+) -> Result<ExactPath, IdentityError> {
+    let output = util::git_stdout_bounded(dir.as_path(), args, MAX_GIT_IDENTITY_OUTPUT)
+        .map_err(|_| IdentityError::GitProbeFailed { operation })?;
+    let raw = trim_git_line(&output).ok_or(IdentityError::GitProbeFailed { operation })?;
+    ExactPath::from_git_bytes(raw)
+}
+
+fn trim_git_line(output: &[u8]) -> Option<&[u8]> {
+    let mut end = output.len();
+    if output.get(end.wrapping_sub(1)) == Some(&b'\n') {
+        end -= 1;
+    }
+    if output.get(end.wrapping_sub(1)) == Some(&b'\r') {
+        end -= 1;
+    }
+    (end > 0).then_some(&output[..end])
+}
+
+fn parse_worktree_identity_records(
+    porcelain: &[u8],
+) -> Result<Vec<WorktreeIdentityRecord>, IdentityError> {
+    let mut records = Vec::new();
+    let mut current_path: Option<ExactPath> = None;
+    let mut current_branch: Option<BranchRef> = None;
+    let mut finish = |records: &mut Vec<WorktreeIdentityRecord>,
+                      current_path: &mut Option<ExactPath>,
+                      current_branch: &mut Option<BranchRef>| {
+        if let Some(path) = current_path.take() {
+            records.push(WorktreeIdentityRecord {
+                path,
+                branch: current_branch.take(),
+            });
+        }
+    };
+
+    // Git's -z form terminates fields with NUL on supported versions. Only
+    // fall back to line records when no NUL is present; otherwise a valid path
+    // containing a newline would be silently split into a different claimant.
+    let fields: Vec<&[u8]> = if porcelain.contains(&0) {
+        porcelain.split(|byte| *byte == 0).collect()
+    } else {
+        porcelain.split(|byte| *byte == b'\n').collect()
+    };
+    for field in fields {
+        if field.is_empty() {
+            continue;
+        }
+        if let Some(raw) = field.strip_prefix(b"worktree ") {
+            finish(&mut records, &mut current_path, &mut current_branch);
+            current_path = Some(ExactPath::from_git_bytes(raw)?);
+        } else if let Some(raw) = field.strip_prefix(b"branch refs/heads/") {
+            current_branch = Some(BranchRef::from_bytes(raw)?);
+        } else if field == b"detached" {
+            current_branch = None;
+        }
+    }
+    finish(&mut records, &mut current_path, &mut current_branch);
+    Ok(records)
+}
 
 const ADJ: &[&str] = &[
     // Original small set + expansion
@@ -709,6 +847,33 @@ mod tests {
         // Empty new name is rejected.
         assert!(rename(&repo, &path, "keep", "", &cfg).is_err());
         // best-effort: test cleanup: scratch removal must never fail the test
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn porcelain_identity_parser_keeps_unix_raw_path_and_ref_bytes() {
+        let porcelain = b"worktree /tmp/raw-path\0HEAD deadbeef\0branch refs/heads/feat/\xff\0";
+        let records = parse_worktree_identity_records(porcelain).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].path.as_bytes(), b"/tmp/raw-path");
+        assert_eq!(records[0].branch.as_ref().unwrap().raw(), b"feat/\xff");
+    }
+
+    #[test]
+    fn inspect_registered_returns_exact_common_admin_and_branch_identity() {
+        let repo = temp_repo("identity-inspect");
+        let cfg = Config {
+            worktrees_dir: repo.join(".external").to_string_lossy().into_owned(),
+            ..Default::default()
+        };
+        let path = worktree_path(&repo, "feat/a", &cfg);
+        add_checked(&repo, "feat/a", "main", &path, &cfg).unwrap();
+        let inspected = inspect_registered(&repo, &path).unwrap();
+        assert_eq!(inspected.registered_path.as_path(), path);
+        assert_eq!(inspected.branch.as_ref().unwrap().raw(), b"feat/a");
+        assert!(inspected.common_dir.as_path().is_absolute());
+        assert!(inspected.admin_dir.as_path().is_absolute());
+        assert!(!inspected.admin_id().is_empty());
         let _ = std::fs::remove_dir_all(&repo);
     }
 }

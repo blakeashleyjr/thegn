@@ -2,7 +2,7 @@
 //! keep-god-files-flat guidance). These run inside [`crate::db::Db`]'s `init()` ladder and
 //! are exercised by the ladder tests in `db.rs`.
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use rusqlite::{Connection, OptionalExtension, params};
 
 impl crate::db::Db {
@@ -864,6 +864,92 @@ pub(crate) fn migrate_v67(conn: &Connection) -> Result<()> {
            PRIMARY KEY (worktree, run_id, job_id, head_sha)
          );",
     )?;
+    Ok(())
+}
+
+/// v69: exact Git worktree identity ledger. This migration is deliberately
+/// additive and schema-only: legacy rows remain legacy until an existing
+/// background admission lane inspects Git and writes an exact claim.
+pub(crate) fn migrate_v69(conn: &Connection) -> Result<()> {
+    if !has_column(conn, "worktrees", "instance_id") {
+        conn.execute("ALTER TABLE worktrees ADD COLUMN instance_id BLOB", [])?;
+    }
+    if !has_column(conn, "worktrees", "identity_state") {
+        conn.execute(
+            "ALTER TABLE worktrees ADD COLUMN identity_state TEXT NOT NULL DEFAULT 'legacy'",
+            [],
+        )?;
+    }
+    if !has_column(conn, "worktrees", "quarantine_reason") {
+        conn.execute(
+            "ALTER TABLE worktrees ADD COLUMN quarantine_reason TEXT",
+            [],
+        )?;
+    }
+    if !has_column(conn, "tab_groups", "instance_id") {
+        conn.execute("ALTER TABLE tab_groups ADD COLUMN instance_id BLOB", [])?;
+    }
+    if !has_column(conn, "tab_groups", "identity_state") {
+        conn.execute(
+            "ALTER TABLE tab_groups ADD COLUMN identity_state TEXT NOT NULL DEFAULT 'legacy'",
+            [],
+        )?;
+    }
+    if !has_column(conn, "tab_groups", "quarantine_reason") {
+        conn.execute(
+            "ALTER TABLE tab_groups ADD COLUMN quarantine_reason TEXT",
+            [],
+        )?;
+    }
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS worktree_instances (
+           instance_id       BLOB PRIMARY KEY CHECK(length(instance_id)=32),
+           generation        BLOB NOT NULL CHECK(length(generation)=16),
+           repo_id           BLOB NOT NULL CHECK(length(repo_id)=32),
+           common_dir        BLOB NOT NULL,
+           admin_id          BLOB NOT NULL,
+           branch_ref        BLOB NOT NULL,
+           path              BLOB NOT NULL,
+           owner             BLOB NOT NULL,
+           state             TEXT NOT NULL CHECK(state IN ('verified','legacy','quarantined','split')),
+           quarantine_reason TEXT,
+           created_at        INTEGER NOT NULL,
+           UNIQUE(repo_id, admin_id),
+           UNIQUE(path)
+         );
+         CREATE INDEX IF NOT EXISTS idx_worktree_instances_repo
+           ON worktree_instances(repo_id, created_at);
+         CREATE INDEX IF NOT EXISTS idx_worktree_instances_state
+           ON worktree_instances(state, created_at);",
+    )?;
+    Ok(())
+}
+
+/// Verify the v69 identity ledger before the schema version is stamped. A
+/// missing column/table must never look like a completed migration.
+pub(crate) fn verify_v69_schema(conn: &Connection) -> Result<()> {
+    for (table, column) in [
+        ("worktrees", "instance_id"),
+        ("worktrees", "identity_state"),
+        ("worktrees", "quarantine_reason"),
+        ("tab_groups", "instance_id"),
+        ("tab_groups", "identity_state"),
+        ("tab_groups", "quarantine_reason"),
+    ] {
+        if !has_column(conn, table, column) {
+            bail!("schema v69 migration did not add {table}.{column}");
+        }
+    }
+    let kind: Option<String> = conn
+        .query_row(
+            "SELECT type FROM sqlite_master WHERE name='worktree_instances'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if kind.as_deref() != Some("table") {
+        bail!("schema v69 migration did not create worktree_instances");
+    }
     Ok(())
 }
 
