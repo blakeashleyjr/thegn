@@ -8619,7 +8619,7 @@ async fn event_loop<T: Terminal>(
                             } else if let Some(halt) = crate::agent::env_halt_reason(&cfg, &wt) {
                                 // Non-local env, failover off, known-down (token unset /
                                 // exec cooldown): halt rather than degrade to host.
-                                Err(SpecError::Halt(halt))
+                                Err(SpecError::Halt(Box::new(halt)))
                             } else if crate::agent::provision_pending(&cfg, &wt)
                                 || crate::host_flow::host_pending(&cfg, &wt)
                             {

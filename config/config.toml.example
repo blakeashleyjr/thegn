@@ -2757,8 +2757,8 @@ nix_daemon = false
 # What to do when no sandbox backend in backend_chain is available and the
 # chain itself names `host` (a chain without `host` always refuses instead):
 #   warn   — open the pane on the host and show a banner (default).
-#   prompt — ask before falling back to host.
-#   fail   — refuse to open the pane.
+#   prompt — currently behaves like warn (the picker layer may offer choices).
+#   fail   — refuse to open that pane (a halt modal, never a process exit).
 on_missing = "warn"
 
 # ── Failover when the SELECTED environment can't be brought up ─────────────────
@@ -2772,9 +2772,10 @@ on_missing = "warn"
 #   "ask"  — block and PROMPT: a modal shows the real failure cause and lets you
 #            [r] retry bring-up or [h] run on the host for now. The honest middle
 #            ground — you always know when you're NOT on the env you picked.
-#   "auto" — walk backend_chain down to the host on failure, silently (the
-#            worktree is still marked degraded in the sidebar). Historical
-#            `failover = true` behavior.
+#   "auto" — accepted for compatibility but no longer authorizes a host shell:
+#            a failed selected/remote env halts exactly like "halt". Only an
+#            explicit local host policy (`backend = "none"`, sandbox disabled,
+#            or the modal's "run on host") runs a pane on the host.
 # Legacy booleans still parse: true ⇒ "auto", false ⇒ "halt".
 # Override per environment with `[env.<name>] failover = "halt"|"ask"|"auto"`.
 failover = "halt"
@@ -2796,9 +2797,8 @@ failover = "halt"
 # here, or the per-worktree/terminal choice from the wizard. `backend = "auto"`
 # means "walk backend_chain and land wherever", so landing on the host is the
 # configured outcome, not a degradation, and never prompts.
-# Also skipped when `failover = "auto"` (above) or the worktree is pinned to the
-# host — those are standing answers to this same question, and re-asking would
-# nag someone who already configured their way out of it.
+# Also skipped when the worktree is pinned to the host — a standing answer to
+# this same question. (`failover = "auto"` no longer is one.)
 on_dormant = "ask"
 
 # Drive the OCI runtime against a REMOTE daemon instead of SSH-wrapping the whole

@@ -3641,8 +3641,9 @@ pub use crate::config_env_tables::{
 };
 
 /// `[sandbox]` — containerize/sandbox a worktree's interactive process. On by
-/// default; `backend = "auto"` walks `backend_chain` and refuses to become a
-/// host shell when no sandbox is available.
+/// default; `backend = "auto"` walks `backend_chain` and lands on the host only
+/// when that chain itself names `host` — otherwise it refuses to become a host
+/// shell when no sandbox is available.
 #[derive(
     Debug,
     Clone,
