@@ -68,9 +68,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Exit-code contract for scripting. `anyhow` errors default to [`EXIT_ERROR`];
-/// commands opt into the other codes deliberately (retryable via an explicit
-/// `std::process::exit`, not-found via the [`NotFound`] error downcast in
-/// `main`). Scripts branch on these — treat them as a stable API.
+/// commands opt into the other codes deliberately (retryable and not-found
+/// errors are downcast by the top-level process wrapper). Scripts branch on
+/// these — treat them as a stable API.
 pub const EXIT_OK: i32 = 0;
 /// Generic failure.
 pub const EXIT_ERROR: i32 = 1;
