@@ -205,6 +205,33 @@ fn selected_profile_read_error_refuses_before_sqlite_capture() {
 }
 
 #[test]
+fn invalid_process_profile_slug_is_refused_instead_of_selecting_default() {
+    let cwd = std::env::temp_dir().join("thegn-capture-invalid-profile");
+    let keys = crate::platform::config_file_capture::native_path_keys();
+    let vars = BTreeMap::from([
+        (keys.home.to_owned(), cwd.join("home").into_os_string()),
+        (keys.config.to_owned(), cwd.join("config").into_os_string()),
+        (keys.state.to_owned(), cwd.join("state").into_os_string()),
+        ("THEGN_DIR".to_owned(), cwd.join("app").into_os_string()),
+    ]);
+    let result = ConfigCaptureSeed::capture_with(
+        CapturedCliInputs {
+            config: None,
+            profile: Some("!!!"),
+            profile_paths: None,
+            overrides: &[],
+        },
+        cwd,
+        |key| vars.get(key).cloned(),
+        Config::default,
+    );
+    assert!(
+        result.is_err(),
+        "a nonempty process selector that normalizes to an empty slug must not select default"
+    );
+}
+
+#[test]
 fn cli_profile_wins_and_pre_resolved_roots_are_not_double_rerooted() {
     let cwd = std::env::temp_dir().join("thegn-capture-profile-contract");
     let base = cwd.join("app");
@@ -247,6 +274,26 @@ fn cli_profile_wins_and_pre_resolved_roots_are_not_double_rerooted() {
 }
 
 #[test]
+fn keybind_profile_override_does_not_change_captured_storage_profile() {
+    let overrides = vec!["profile=vim".to_owned()];
+    let captured = seed(&[("THEGN_PROFILE", "work")], &overrides);
+    let mut sources = Sources::empty();
+    sources.bodies.insert(
+        captured.base.path.clone(),
+        Ok(Some(b"branch_prefix = 'base/'\n".to_vec())),
+    );
+    sources.bodies.insert(
+        captured.profile.as_ref().unwrap().path.clone(),
+        Ok(Some(Vec::new())),
+    );
+
+    let admitted = load_empty(&captured, &sources).unwrap();
+    assert_eq!(admitted.profile_name(), "work");
+    assert_eq!(admitted.config().profile, "vim");
+    assert!(captured.app_root.ends_with("profiles/work"));
+}
+
+#[test]
 fn selected_profile_path_bound_is_checked_after_join() {
     let cwd = std::env::temp_dir().join("thegn-capture-profile-bounds");
     let keys = crate::platform::config_file_capture::native_path_keys();
@@ -262,7 +309,7 @@ fn selected_profile_path_bound_is_checked_after_join() {
         ),
         ("THEGN_PROFILE".to_owned(), OsString::from("work")),
     ]);
-    let long_root = PathBuf::from(format!("/{}", "p".repeat(MAX_PATH_BYTES)));
+    let long_root = PathBuf::from(format!("/{}", "p".repeat(MAX_PATH_BYTES - 5)));
     let profile_paths = thegn_core::profile::ProfilePaths {
         name: "work".to_owned(),
         root: long_root,
@@ -361,6 +408,7 @@ fn load_once_uses_private_config_and_wal_fixtures_and_fails_closed() {
     let writer = create_host_db(&seed.state_db, true);
     let admitted = seed.load_once().unwrap();
     assert_eq!(admitted.config().branch_prefix, "captured/");
+    assert!(admitted.config().host.contains_key("integration-host"));
     drop(writer);
 
     // Every failure below travels through the real ConfigCaptureSeed::load_once
