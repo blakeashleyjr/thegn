@@ -141,6 +141,42 @@ fn create_list_destroy_with_ledger() {
         .enable_all()
         .build()
         .unwrap();
+
+    // Static admission is exercised through the real RemoteProvider::create
+    // boundary. Every invalid field must stop before the mock sees a request
+    // and before the lifecycle ledger gets an intent row.
+    for (suffix, invalid) in [
+        ("size", 0u8),
+        ("image", 1),
+        ("endpoint", 2),
+        ("name", 3),
+        ("cap", 4),
+        ("key", 5),
+    ] {
+        let mut bad = spec(&base, tmp.path());
+        bad.name = format!("tg-fly-invalid-{suffix}");
+        match invalid {
+            0 => bad.size = "shared-cpu-3x".into(),
+            1 => bad.image = "snapshot:42".into(),
+            2 => bad.api_base = "https://user:token@example.invalid/v1".into(),
+            3 => bad.name = " tg-fly-invalid ".into(),
+            4 => bad.max_instances = 257,
+            _ => bad.pubkey = "not-a-public-key".into(),
+        }
+        assert!(
+            rt.block_on(FlyProvider::new(bad).create()).is_err(),
+            "invalid {suffix} must be rejected locally"
+        );
+        assert!(
+            recorded.lock().unwrap().is_empty(),
+            "invalid {suffix} made a request"
+        );
+        assert!(
+            registry::read(&format!("tg-fly-invalid-{suffix}")).is_none(),
+            "invalid {suffix} wrote a ledger row"
+        );
+    }
+
     let p = FlyProvider::new(spec(&base, tmp.path()));
 
     // --- create: app-exists → allocate IPv4 → create machine; ledger finalized.

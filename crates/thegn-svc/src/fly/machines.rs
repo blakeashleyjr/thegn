@@ -77,7 +77,7 @@ pub fn stop_body() -> serde_json::Value {
 /// a VPS there is no snapshot concept (Fly speed comes from small images).
 pub fn image_ref(template: &str) -> Option<&str> {
     let t = template.trim();
-    if t.is_empty() {
+    if t.is_empty() || t.starts_with("snapshot:") {
         None
     } else {
         Some(t.strip_prefix("image:").map(str::trim).unwrap_or(t))
@@ -87,19 +87,15 @@ pub fn image_ref(template: &str) -> Option<&str> {
 /// Map a Fly size preset (`shared-cpu-2x`, `performance-1x`, …) to a guest
 /// `{cpu_kind, cpus, memory_mb}`. Unknown presets fall back to shared-cpu-1x so a
 /// typo degrades to the cheapest machine, never a create failure.
-pub fn guest_for_size(size: &str) -> serde_json::Value {
-    let s = size.trim();
-    let (kind, cpus, mem) = match s {
-        "shared-cpu-1x" => ("shared", 1, 256),
-        "shared-cpu-2x" => ("shared", 2, 512),
-        "shared-cpu-4x" => ("shared", 4, 1024),
-        "shared-cpu-8x" => ("shared", 8, 2048),
-        "performance-1x" => ("performance", 1, 2048),
-        "performance-2x" => ("performance", 2, 4096),
-        "performance-4x" => ("performance", 4, 8192),
-        _ => ("shared", 1, 256),
-    };
-    serde_json::json!({ "cpu_kind": kind, "cpus": cpus, "memory_mb": mem })
+pub fn guest_for_size(
+    size: &str,
+) -> Result<serde_json::Value, thegn_core::provider_admission::ProviderAdmissionError> {
+    let guest = thegn_core::provider_admission::FlySize::parse(size)?.guest();
+    Ok(serde_json::json!({
+        "cpu_kind": guest.0,
+        "cpus": guest.1,
+        "memory_mb": guest.2
+    }))
 }
 
 /// The internal + external ssh port (per-sandbox app ⇒ a dedicated IPv4, so the
@@ -146,7 +142,7 @@ pub fn create_machine_body(
     metadata: &BTreeMap<String, String>,
     prebaked: bool,
     iroh: Option<&super::IrohInject>,
-) -> serde_json::Value {
+) -> Result<serde_json::Value, thegn_core::provider_admission::ProviderAdmissionError> {
     let meta: serde_json::Map<String, serde_json::Value> = metadata
         .iter()
         .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
@@ -154,7 +150,7 @@ pub fn create_machine_body(
     let authkeys_b64 = super::b64(authorized_key.trim().as_bytes());
     let mut config = serde_json::json!({
         "image": image,
-        "guest": guest_for_size(size),
+        "guest": guest_for_size(size)?,
         "metadata": meta,
         "auto_destroy": false,
         // Don't let Fly auto-restart a machine thegn parked (scale-to-zero).
@@ -186,7 +182,7 @@ pub fn create_machine_body(
             thegn_core::iroh_wire::SANDBOX_ID_ENV: inject.sandbox_id,
         });
     }
-    serde_json::json!({ "name": name, "region": region, "config": config })
+    Ok(serde_json::json!({ "name": name, "region": region, "config": config }))
 }
 
 /// One Machine as parsed from the API.
@@ -393,12 +389,13 @@ mod tests {
     }
 
     #[test]
-    fn guest_maps_known_presets_and_falls_back() {
-        assert_eq!(guest_for_size("shared-cpu-2x")["memory_mb"], 512);
-        assert_eq!(guest_for_size("performance-1x")["cpu_kind"], "performance");
-        // Unknown → cheapest shared machine, not a failure.
-        assert_eq!(guest_for_size("nonsense")["cpu_kind"], "shared");
-        assert_eq!(guest_for_size("nonsense")["cpus"], 1);
+    fn guest_maps_known_presets_and_rejects_unknown() {
+        assert_eq!(guest_for_size("shared-cpu-2x").unwrap()["memory_mb"], 512);
+        assert_eq!(
+            guest_for_size("performance-1x").unwrap()["cpu_kind"],
+            "performance"
+        );
+        assert_eq!(guest_for_size("nonsense").unwrap_err().field, "size");
     }
 
     #[test]
@@ -415,7 +412,8 @@ mod tests {
             &meta,
             false,
             None,
-        );
+        )
+        .unwrap();
         assert_eq!(b["name"], "tg-fly-1");
         assert_eq!(b["config"]["image"], "ubuntu:24.04");
         assert_eq!(b["config"]["guest"]["memory_mb"], 512);
@@ -460,7 +458,8 @@ mod tests {
             &meta,
             true,
             None,
-        );
+        )
+        .unwrap();
         // Key still injected + ssh service exposed, but the image's OWN entrypoint
         // runs sshd — no init override that would replace it.
         assert_eq!(
@@ -496,7 +495,8 @@ mod tests {
             &meta,
             true,
             Some(&inject),
-        );
+        )
+        .unwrap();
         // The three call-home env vars are keyed by the iroh_wire constants (never
         // hardcoded) and carry the injected per-sandbox values.
         assert_eq!(

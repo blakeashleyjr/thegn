@@ -23,6 +23,7 @@ pub mod graphql;
 pub mod machines;
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::sync::Mutex;
 
 use anyhow::{Context, Result, anyhow};
@@ -62,7 +63,7 @@ fn app_name(sandbox: &str) -> String {
 }
 
 /// Everything needed to drive one named Fly machine.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct FlySpec {
     /// Machines API base (empty ⇒ [`machines::DEFAULT_API_BASE`]).
     pub api_base: String,
@@ -95,11 +96,31 @@ pub struct FlySpec {
     pub skip_ready_wait: bool,
 }
 
+impl fmt::Debug for FlySpec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FlySpec")
+            .field("name", &"<redacted>")
+            .field("region", &"<redacted>")
+            .field("size", &"<redacted>")
+            .field("image", &"<redacted>")
+            .field("api_base", &"<redacted>")
+            .field("graphql_url", &"<redacted>")
+            .field("org_slug", &"<redacted>")
+            .field("max_instances", &self.max_instances)
+            .field("max_lifetime_secs", &self.max_lifetime_secs)
+            .field("key_path", &"<redacted>")
+            .field("pubkey", &"<redacted>")
+            .field("iroh", &self.iroh.as_ref().map(|_| "<redacted>"))
+            .field("skip_ready_wait", &self.skip_ready_wait)
+            .finish()
+    }
+}
+
 /// The three iroh call-home values injected into a Fly machine's environment so
 /// the baked `tg-agent` (see `nix/fly-sandbox-image.nix`) can reach the
 /// compositor. The env-var *keys* come from `thegn_core::iroh_wire`; these are
 /// the per-sandbox *values* the host mints at provision time.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct IrohInject {
     /// The compositor's stable home EndpointId (the agent's dial target).
     pub home_node: String,
@@ -107,6 +128,16 @@ pub struct IrohInject {
     pub sandbox_auth: String,
     /// Which sandbox the agent serves (the home registry key).
     pub sandbox_id: String,
+}
+
+impl fmt::Debug for IrohInject {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("IrohInject")
+            .field("home_node", &"<redacted>")
+            .field("sandbox_auth", &"<redacted>")
+            .field("sandbox_id", &"<redacted>")
+            .finish()
+    }
 }
 
 impl FlySpec {
@@ -151,10 +182,9 @@ impl FlySpec {
         }
     }
 
-    fn image(&self) -> String {
-        machines::image_ref(&self.image)
-            .unwrap_or(machines::DEFAULT_IMAGE)
-            .to_string()
+    fn image(&self) -> Result<String> {
+        let admitted = self.admit_static(&self.metadata())?;
+        Ok(admitted.image.resolve(machines::DEFAULT_IMAGE).to_owned())
     }
 
     fn max_instances(&self) -> usize {
@@ -178,6 +208,33 @@ impl FlySpec {
     /// template is a stock distro that gets [`machines::SSHD_INIT`] instead.
     fn is_prebaked(&self) -> bool {
         self.image.trim().starts_with("image:")
+    }
+
+    fn admit_static(
+        &self,
+        metadata: &BTreeMap<String, String>,
+    ) -> Result<thegn_core::provider_admission::FlyStaticSpec> {
+        let key_path = self
+            .key_path
+            .to_str()
+            .ok_or_else(|| anyhow!("fly: managed key path is not valid UTF-8"))?;
+        if key_path.is_empty() || key_path.len() > 4_096 || key_path.chars().any(char::is_control) {
+            return Err(anyhow!("fly: managed key path is invalid"));
+        }
+        thegn_core::provider_admission::admit_fly(thegn_core::provider_admission::FlyInput {
+            api_base: &self.api_base,
+            graphql_url: &self.graphql_url,
+            org_slug: &self.org_slug,
+            name: Some(&self.name),
+            region: &self.region,
+            size: &self.size,
+            image: &self.image,
+            max_instances: self.max_instances,
+            max_lifetime_secs: self.max_lifetime_secs,
+            pubkey: Some(&self.pubkey),
+            metadata: Some(metadata),
+        })
+        .map_err(anyhow::Error::from)
     }
 }
 
@@ -208,11 +265,11 @@ impl FlyProvider {
             .bearer_auth(&self.spec.token)
             .send()
             .await
-            .with_context(|| format!("fly: GET {url}"))?;
+            .with_context(|| "fly: GET provider endpoint")?;
         let status = resp.status();
-        let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
+        let _body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
         if !status.is_success() {
-            return Err(anyhow!("fly GET {url} failed ({status}): {body}"));
+            return Err(anyhow!("fly GET request failed ({status})"));
         }
         Ok(body)
     }
@@ -225,11 +282,11 @@ impl FlyProvider {
             .json(body)
             .send()
             .await
-            .with_context(|| format!("fly: POST {url}"))?;
+            .with_context(|| "fly: POST provider endpoint")?;
         let status = resp.status();
-        let out: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
+        let _out: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
         if !status.is_success() {
-            return Err(anyhow!("fly POST {url} failed ({status}): {out}"));
+            return Err(anyhow!("fly POST request failed ({status})"));
         }
         Ok(out)
     }
@@ -537,10 +594,12 @@ impl FlyProvider {
 impl RemoteProvider for FlyProvider {
     fn create<'a>(&'a self) -> BoxFuture<'a, Result<SandboxHandle>> {
         Box::pin(async move {
-            let name = self.spec.name.trim().to_string();
-            if name.is_empty() {
-                return Err(anyhow!("fly: the sandbox name is empty"));
-            }
+            let metadata = self.spec.metadata();
+            let admitted = self.spec.admit_static(&metadata)?;
+            let name = admitted
+                .name
+                .clone()
+                .expect("runtime provider admission requires a name");
             // Spend guardrail (ledger-based, covers in-flight creates).
             let managed = self.ledger_names().len();
             if managed >= self.spec.max_instances() {
@@ -583,14 +642,14 @@ impl RemoteProvider for FlyProvider {
                 let base = self.spec.api_base();
                 let body = machines::create_machine_body(
                     &name,
-                    self.spec.region(),
-                    &self.spec.image(),
-                    self.spec.size(),
+                    &admitted.region,
+                    admitted.image.resolve(machines::DEFAULT_IMAGE),
+                    admitted.size.as_str(),
                     &self.spec.pubkey,
-                    &self.spec.metadata(),
+                    &metadata,
                     self.spec.is_prebaked(),
                     self.spec.iroh.as_ref(),
-                );
+                )?;
                 let created = self
                     .post_json(&machines::machines_url(&base, &app), &body)
                     .await?;
@@ -779,7 +838,7 @@ mod tests {
             max_instances: 0,
             max_lifetime_secs: 0,
             key_path: "/k".into(),
-            pubkey: "ssh-ed25519 A".into(),
+            pubkey: "ssh-ed25519 MOCKKEY".into(),
             iroh: None,
             skip_ready_wait: true,
         }
@@ -793,7 +852,7 @@ mod tests {
         assert_eq!(s.org_slug(), "personal");
         assert_eq!(s.region(), "iad");
         assert_eq!(s.size(), "shared-cpu-2x");
-        assert_eq!(s.image(), "ubuntu:24.04");
+        assert_eq!(s.image().unwrap(), "ubuntu:24.04");
         assert_eq!(s.max_instances(), 5);
         let m = s.metadata();
         assert_eq!(m.get("managed-by").map(String::as_str), Some("thegn"));
@@ -929,7 +988,7 @@ mod tests {
             org_slug: "acme".into(),
             ..spec()
         };
-        assert_eq!(s.image(), "registry.fly.io/x:deployment-2");
+        assert_eq!(s.image().unwrap(), "registry.fly.io/x:deployment-2");
         assert_eq!(s.size(), "performance-1x");
         assert_eq!(s.region(), "ams");
         assert_eq!(s.org_slug(), "acme");
