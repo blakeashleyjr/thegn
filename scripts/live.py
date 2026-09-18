@@ -27,6 +27,11 @@ if sys.platform == "linux":
 MAX_CONFIG = 1024 * 1024
 BACKUP_SECONDS = 60
 BUILD = ["cargo", "build", "--locked", "--release", "--features", "profiling", "-p", "thegn-host", "--bin", "thegn"]
+LIVE_STAGE_PREFIX = ".thegn-live-build-"
+LIVE_STAGE_MARKER = ".thegn-live-build.marker"
+LIVE_STAGE_LOCK = ".thegn-live-build.lock"
+MAX_RETAINED_LIVE_STAGES = 2
+MAX_STAGE_ENTRIES = 100_000
 
 
 class Refusal(Exception):
@@ -80,6 +85,19 @@ def read_small(path, maximum=MAX_CONFIG):
         if len(data) > maximum:
             raise Refusal("Input exceeds size limit")
         return data
+
+
+def read_fd_small(fd, maximum):
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode) or info.st_size > maximum:
+        raise Refusal("Expected bounded regular input")
+    data = bytearray()
+    while len(data) <= maximum:
+        chunk = os.read(fd, maximum + 1 - len(data))
+        if not chunk:
+            return bytes(data)
+        data.extend(chunk)
+    raise Refusal("Input exceeds size limit")
 
 
 def settings(repo, env):
@@ -155,6 +173,257 @@ def locked(path, schema=False):
 def identity(path):
     info = path.stat()
     return info.st_dev, info.st_ino
+
+
+def _validate_stage_tree(fd, count):
+    """Validate a stage without following links before descriptor deletion."""
+    for name in os.listdir(fd):
+        count[0] += 1
+        if count[0] > MAX_STAGE_ENTRIES:
+            return False
+        try:
+            info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return False
+        if info.st_uid != os.getuid():
+            return False
+        if stat.S_ISDIR(info.st_mode):
+            try:
+                child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            except OSError:
+                return False
+            try:
+                if not _validate_stage_tree(child, count):
+                    return False
+            finally:
+                os.close(child)
+        elif not stat.S_ISREG(info.st_mode):
+            return False
+    return True
+
+
+def _remove_stage_tree(fd, count=None):
+    for name in os.listdir(fd):
+        if count is not None:
+            count[0] += 1
+            if count[0] > MAX_STAGE_ENTRIES:
+                raise Refusal("stage cleanup bound exceeded")
+        info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+        if stat.S_ISDIR(info.st_mode):
+            child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            try:
+                _remove_stage_tree(child, count)
+            finally:
+                os.close(child)
+            os.rmdir(name, dir_fd=fd)
+        elif stat.S_ISREG(info.st_mode):
+            os.unlink(name, dir_fd=fd)
+        else:
+            raise Refusal("stage changed to an unsupported entry during cleanup")
+
+
+def _recovery_linked_stages(paths):
+    """Find stage paths named by bounded recovery metadata, if any."""
+    linked = set()
+
+    def strings(value, depth=0):
+        if depth > 12:
+            return
+        if isinstance(value, str):
+            yield value
+        elif isinstance(value, dict):
+            for child in value.values():
+                yield from strings(child, depth + 1)
+        elif isinstance(value, list):
+            for child in value:
+                yield from strings(child, depth + 1)
+
+    stage_prefix = str(paths["repo"] / "target" / LIVE_STAGE_PREFIX)
+    try:
+        with os.scandir(paths["state"]) as entries:
+            for index, entry in enumerate(entries, 1):
+                if index > MAX_STAGE_ENTRIES:
+                    return None
+                if not entry.name.startswith("live-backup-"):
+                    continue
+                try:
+                    is_directory = entry.is_dir(follow_symlinks=False)
+                except OSError:
+                    return None
+                if not is_directory:
+                    continue
+                complete = Path(entry.path) / "complete.json"
+                try:
+                    document = json.loads(read_small(complete, 256 * 1024))
+                except (FileNotFoundError, OSError, Refusal, ValueError, UnicodeError):
+                    # A missing or malformed recovery descriptor may still refer to a
+                    # live artifact. Preserve all stages until an operator resolves it.
+                    return None
+                for value in strings(document):
+                    if value.startswith(stage_prefix):
+                        # A recovery descriptor can name either the stage
+                        # itself or an artifact inside it. Protect the root.
+                        stage_name = Path(value).relative_to(paths["repo"] / "target").parts[0]
+                        linked.add(str(paths["repo"] / "target" / stage_name))
+                        if len(linked) > MAX_STAGE_ENTRIES:
+                            return None
+    except OSError:
+        return None
+    return linked
+
+
+def _open_stage_candidate(target_fd, name, expected_inode):
+    """Open and lock one stage, binding later checks to its descriptors."""
+    stage_fd = None
+    lock_fd = None
+    success = False
+    try:
+        stage_fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=target_fd)
+        info = os.fstat(stage_fd)
+        if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077
+                or expected_inode not in (None, (info.st_dev, info.st_ino))):
+            return None
+        marker_fd = os.open(LIVE_STAGE_MARKER, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=stage_fd)
+        try:
+            marker_info = os.fstat(marker_fd)
+            if (not stat.S_ISREG(marker_info.st_mode) or marker_info.st_uid != os.getuid()
+                    or marker_info.st_nlink != 1 or marker_info.st_mode & 0o077):
+                return None
+            if read_fd_small(marker_fd, 128) != b"thegn-live-build-v1\n":
+                return None
+        finally:
+            os.close(marker_fd)
+        lock_fd = os.open(LIVE_STAGE_LOCK, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=stage_fd)
+        lock_info = os.fstat(lock_fd)
+        if (not stat.S_ISREG(lock_info.st_mode) or lock_info.st_uid != os.getuid()
+                or lock_info.st_nlink != 1 or lock_info.st_mode & 0o077):
+            return None
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return None
+        success = True
+        return stage_fd, lock_fd, (info.st_dev, info.st_ino), info.st_mtime_ns
+    except (FileNotFoundError, OSError, Refusal):
+        return None
+    finally:
+        if not success and lock_fd is not None:
+            os.close(lock_fd)
+        if not success and stage_fd is not None:
+            os.close(stage_fd)
+
+
+def _stage_name_identity(target_fd, name, expected_identity):
+    """Verify that the parent entry still names the opened stage directory."""
+    try:
+        info = os.stat(name, dir_fd=target_fd, follow_symlinks=False)
+    except OSError:
+        return False
+    return (stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid()
+            and not info.st_mode & 0o077
+            and (info.st_dev, info.st_ino) == expected_identity)
+
+
+def retain_live_stages(paths, current=None):
+    """Keep the newest owned stages; preserve unverifiable entries."""
+    target = paths["repo"] / "target"
+    linked = _recovery_linked_stages(paths)
+    if linked is None:
+        return 0
+    target_fd = None
+    try:
+        target_fd = os.open(target, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        target_info = os.fstat(target_fd)
+        if not stat.S_ISDIR(target_info.st_mode) or target_info.st_uid != os.getuid():
+            return 0
+        metadata = []
+        with os.scandir(target_fd) as entries:
+            for index, entry in enumerate(entries, 1):
+                if index > MAX_STAGE_ENTRIES:
+                    return 0
+                if (not entry.name.startswith(LIVE_STAGE_PREFIX)
+                        or (current is not None and target / entry.name == current)):
+                    continue
+                try:
+                    if not entry.is_dir(follow_symlinks=False):
+                        continue
+                    info = entry.stat(follow_symlinks=False)
+                    metadata.append((info.st_mtime_ns, entry.name, (info.st_dev, info.st_ino)))
+                except OSError:
+                    continue
+        metadata.sort(key=lambda candidate: (candidate[0], candidate[1]), reverse=True)
+        removed = 0
+        eligible = 0
+        for _mtime, name, stage_identity in metadata:
+            stage = target / name
+            if str(stage) in linked:
+                continue
+            candidate = _open_stage_candidate(target_fd, name, stage_identity)
+            if candidate is None:
+                continue
+            stage_fd, lock_fd, opened_identity, _opened_mtime = candidate
+            try:
+                if opened_identity != stage_identity or not _stage_name_identity(target_fd, name, opened_identity):
+                    continue
+                if eligible < MAX_RETAINED_LIVE_STAGES:
+                    eligible += 1
+                    continue
+                count = [0]
+                if not _validate_stage_tree(stage_fd, count):
+                    continue
+                if not _stage_name_identity(target_fd, name, opened_identity):
+                    continue
+                _remove_stage_tree(stage_fd, [0])
+                if not _stage_name_identity(target_fd, name, opened_identity):
+                    continue
+                os.rmdir(name, dir_fd=target_fd)
+                removed += 1
+            except (FileNotFoundError, OSError, Refusal):
+                # A changed or unverifiable candidate stays for manual inspection.
+                continue
+            finally:
+                os.close(lock_fd)
+                os.close(stage_fd)
+        return removed
+    except (FileNotFoundError, OSError):
+        return 0
+    finally:
+        if target_fd is not None:
+            os.close(target_fd)
+
+
+def prebuild_preflight(paths, env):
+    """Recheck source and quiescence, then briefly reserve the schema lease."""
+    source_revision(paths["repo"], env)
+    quiescent(paths)
+    with locked(Path(str(paths["database"]) + ".schema.lock"), schema=True):
+        quiescent(paths)
+
+
+@contextlib.contextmanager
+def _stage_build_lock(stage):
+    """Create and hold a private lock for the lifetime of a staged build."""
+    fd = os.open(stage / LIVE_STAGE_LOCK, os.O_CREAT | os.O_EXCL | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1 or info.st_mode & 0o077:
+            raise Refusal("Unsafe staged-build lock")
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
+def _mark_stage(stage):
+    """Mark a newly-created stage before any build process starts."""
+    fd = os.open(stage / LIVE_STAGE_MARKER, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+    try:
+        marker = b"thegn-live-build-v1\n"
+        if os.write(fd, marker) != len(marker):
+            raise Refusal("Could not write complete staged-build marker")
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 def comm(status_text):
@@ -270,17 +539,21 @@ def build_stage(paths, env):
     if len(versions) != 1:
         raise Refusal("Cannot determine this source's database schema version")
     schema = int(versions[0])
+    retain_live_stages(paths)
     stage = Path(tempfile.mkdtemp(prefix=".thegn-live-build-", dir=paths["repo"] / "target"))
     print(f"Retaining staged build at {stage}", flush=True)
     build_env = dict(env, RUSTC_WRAPPER="", CARGO_TARGET_DIR=str(stage / "output"), CARGO_BUILD_BUILD_DIR=str(stage / "intermediate"))
-    subprocess.run(BUILD, cwd=paths["repo"], env=build_env, check=True)
-    if source_revision(paths["repo"], env) != revision:
-        raise Refusal("Source changed during build; artifact retained but not admitted")
-    binary = stage / "output/release/thegn"
-    regular(binary, executable=True)
-    # Observed Git metadata, not exact commit materialization/content proof.
-    record = {"repo": str(paths["repo"]), "observed_revision": revision, "schema": schema, "sha256": digest(binary), "build": BUILD}
-    (stage / "build.json").write_text(json.dumps(record))
+    with _stage_build_lock(stage):
+        _mark_stage(stage)
+        subprocess.run(BUILD, cwd=paths["repo"], env=build_env, check=True)
+        if source_revision(paths["repo"], env) != revision:
+            raise Refusal("Source changed during build; artifact retained but not admitted")
+        binary = stage / "output/release/thegn"
+        regular(binary, executable=True)
+        # Observed Git metadata, not exact commit materialization/content proof.
+        record = {"repo": str(paths["repo"]), "stage": str(stage), "observed_revision": revision,
+                  "schema": schema, "sha256": digest(binary), "build": BUILD}
+        (stage / "build.json").write_text(json.dumps(record))
     print("Build retained for inspection; automated artifact reuse is unsupported.", flush=True)
     return stage, binary, record
 
@@ -320,9 +593,14 @@ def backup(paths, record):
                 raise Refusal("Database is newer than selected source; downgrade refused")
     with output.open("rb") as stream:
         os.fsync(stream.fileno())
+    # The staged path is transient build provenance. Persisting it in a
+    # recovery descriptor would make every successful build permanently
+    # ineligible for retention. Legacy or explicitly supplied recovery
+    # references remain protected by _recovery_linked_stages.
+    persisted_record = {key: value for key, value in record.items() if key != "stage"}
     with (recovery / "complete.json").open("x") as stream:
         json.dump({"database": str(paths["database"]), "target": str(paths["target"]), "schema": version,
-                   "binary_sha256": digest(recovery / "thegn.previous"), "database_sha256": digest(output), "build": record}, stream)
+                   "binary_sha256": digest(recovery / "thegn.previous"), "database_sha256": digest(output), "build": persisted_record}, stream)
         stream.flush()
         os.fsync(stream.fileno())
     # Reserve a fresh per-launch stderr file before replacing anything. Never
@@ -391,6 +669,8 @@ def main(argv=None):
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         raise Refusal("A real terminal and explicit install confirmation are required")
     with locked(paths["target"].parent / ".thegn-live-install.lock"), locked(paths["state"] / "live-upgrade.lock"):
+        prebuild_preflight(paths, env)
+        print("Preflight passed: source is clean, observed processes are quiescent, and the schema lease was available.")
         _stage, binary, record = build_stage(paths, env)
         print("Save work. Manually stop ALL thegn controllers/daemons and disable automatic restarts.")
         if input("Type INSTALL AND LAUNCH to confirm backups, replacement and normal startup: ") != "INSTALL AND LAUNCH":
