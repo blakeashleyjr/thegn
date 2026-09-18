@@ -1208,8 +1208,29 @@ pub fn run_worker(
     // --- speculative create under the suggested name (the dominant cost —
     // overlaps the checkout with the user's wizard time).
     step(CreateStep::CreateWorktree, StepState::Running, None);
-    let mut path = worktree::worktree_path(root, &branch, cfg);
-    let slug = repo::repo_slug(root);
+    // THE-516: resolve the checkout path and workspace slug as identities;
+    // either failing refuses the create instead of aliasing another repo's
+    // or branch's checkout/tab.
+    let mut path = match worktree::allocate_worktree_path(root, &branch, cfg) {
+        Ok(path) => path,
+        Err(e) => {
+            fail(
+                CreateStep::CreateWorktree,
+                format!("worktree identity: {e}"),
+            );
+            return;
+        }
+    };
+    let slug = match repo::repo_slug_checked(root) {
+        Ok(slug) => slug,
+        Err(e) => {
+            fail(
+                CreateStep::CreateWorktree,
+                format!("workspace identity unavailable: {e}"),
+            );
+            return;
+        }
+    };
     let pre = crate::worktree_lifecycle::run_event(
         cfg,
         root,
@@ -1224,13 +1245,13 @@ pub fn run_worker(
         return;
     }
     if let Err(e) = worktree::add_checked_with_state(root, &branch, &base, &path, cfg) {
-        let error = crate::worktree_lifecycle::create_failure_with_add_state(
-            e.message,
+        let error = crate::worktree_lifecycle::create_failure_after_add(
+            e.message.clone(),
             cfg,
             root,
             &path,
             &branch,
-            e.branch_created,
+            &e,
         );
         fail(CreateStep::CreateWorktree, error);
         return;

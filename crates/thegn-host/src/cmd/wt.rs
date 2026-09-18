@@ -257,8 +257,9 @@ fn create_and_register(
     env: Option<&str>,
     db: &Db,
 ) -> Result<String> {
-    let path = worktree::worktree_path(root, branch, cfg);
-    let workspace = thegn_core::repo::repo_slug(root);
+    // THE-516: fallible identity resolution — never a basename/slug alias.
+    let path = worktree::allocate_worktree_path(root, branch, cfg)?;
+    let workspace = thegn_core::repo::repo_slug_checked(root)?;
     let pre = crate::worktree_lifecycle::run_event_with_db(
         cfg,
         root,
@@ -274,13 +275,13 @@ fn create_and_register(
     }
     worktree::add_checked_with_state(root, branch, base, &path, cfg).map_err(|e| {
         // Roll the speculative checkout back so a failed create leaves nothing.
-        let message = crate::worktree_lifecycle::create_failure_with_add_state(
-            e.message,
+        let message = crate::worktree_lifecycle::create_failure_after_add(
+            e.message.clone(),
             cfg,
             root,
             &path,
             branch,
-            e.branch_created,
+            &e,
         );
         anyhow::anyhow!(message)
     })?;
@@ -296,7 +297,7 @@ fn create_and_register(
     // pin upserts after it.
     let root_s = root.to_string_lossy().into_owned();
     let path_s = path.to_string_lossy().into_owned();
-    let tab = thegn_core::repo::branch_tab(&thegn_core::repo::repo_slug(root), branch);
+    let tab = thegn_core::repo::branch_tab(&workspace, branch);
     if let Err(e) = db.put_worktree(&tab, &root_s, &path_s, branch, None, None) {
         let message = match crate::worktree_lifecycle::rollback_remove(cfg, root, &path, branch) {
             Ok(()) => format!("db: {e}"),
@@ -400,7 +401,8 @@ fn new_batched(
 
     // Resolve the single, literal branch name ONCE (no per-repo dedup), then
     // probe each member for it (exact existence) to classify create vs attach.
-    let branch = project::feature_branch_name(&feature, &cfg.branch_prefix);
+    let branch = project::feature_branch_name(&feature, &cfg.branch_prefix)
+        .map_err(|e| anyhow::anyhow!(e))?;
     let states: Vec<MemberBranchState> = members
         .iter()
         .map(|(root, repo_name)| MemberBranchState {
