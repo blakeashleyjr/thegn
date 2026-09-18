@@ -910,7 +910,8 @@ pub fn prepare_sandbox_env(
         // `on_missing = "fail"` refuses THIS pane. The shared notice would
         // `msg::die` — exiting the whole TUI from a (possibly automatic prewarm)
         // worker thread with the terminal still in raw mode.
-        if sb.on_missing == thegn_core::config::OnMissing::Fail {
+        // An explicit "run on host" answer (the halt modal's choice) still wins.
+        if sb.on_missing == thegn_core::config::OnMissing::Fail && !force_host_requested(worktree) {
             return Err(SandboxHalt {
                 env_name: env_name.clone(),
                 placement: placement_label.clone(),
