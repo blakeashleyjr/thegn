@@ -20,7 +20,7 @@ use thegn_core::db::Db;
 use thegn_core::store::LeaseRow;
 
 use super::auth;
-use super::http::{ControlState, router};
+use super::http::{ControlState, dispatch_local, router};
 use super::{
     AttachKind, AttachReply, ControlApi, ControlResult, GitFileStatus, OpenSpec, PreviewFetchReply,
     PreviewFetchRequest, SessionInfo,
@@ -1076,6 +1076,51 @@ async fn pr_status_and_notify_push_route_to_the_api() {
     assert_eq!(
         r.api.calls(),
         vec!["pr_status".to_string(), "notify_push".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn in_process_dispatch_rechecks_the_admitted_capability_after_routing() {
+    let r = rig(true);
+    let body = serde_json::json!({"body": "fixture"});
+    let (status, _) = dispatch_local(
+        r.state.clone(),
+        "issues.update",
+        "POST",
+        "/v1/issues/plugin:demo:ABC/comment",
+        Some(body.clone()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(r.api.calls().is_empty(), "mismatched route reached the API");
+
+    let (status, _) = dispatch_local(
+        r.state.clone(),
+        "issues.comment",
+        "POST",
+        "/v1/issues/plugin:demo:ABC/comment",
+        Some(body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(
+        r.api.calls(),
+        vec!["issues_comment:plugin:demo:ABC".to_string()]
+    );
+
+    let params = serde_json::json!({"id": "plugin:demo:ABC/comment"})
+        .as_object()
+        .cloned()
+        .unwrap();
+    let (method, path, body) = super::routes::build_call("issues.update", params).unwrap();
+    assert_eq!(path, "/v1/issues/plugin%3Ademo%3AABC%2Fcomment");
+    let encoded = rig(true);
+    let (status, _) =
+        dispatch_local(encoded.state.clone(), "issues.update", method, &path, body).await;
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(
+        encoded.api.calls(),
+        vec!["issues_update:plugin:demo:ABC/comment".to_string()]
     );
 }
 

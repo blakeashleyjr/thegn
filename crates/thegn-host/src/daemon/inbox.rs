@@ -191,7 +191,7 @@ async fn execute_loop(
                 continue;
             }
         };
-        let (status, result) = dispatch_local(state.clone(), method, &path, body).await;
+        let (status, result) = dispatch_local(state.clone(), &acc.cap, method, &path, body).await;
         tracing::info!(
             target: "thegn::push",
             cap = %acc.cap,
