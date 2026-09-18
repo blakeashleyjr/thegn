@@ -501,6 +501,30 @@ impl Db {
         })
     }
 
+    /// Mark legacy registry rows as quarantined (THE-516). Only rows still in
+    /// the `legacy` state change; an already verified/quarantined row keeps
+    /// its state. Annotation only — it opens, moves and deletes nothing.
+    pub fn quarantine_legacy_worktree_rows(
+        &self,
+        worktrees: &[String],
+        reason: &str,
+    ) -> Result<usize> {
+        if reason.trim().is_empty() || reason.len() > MAX_REASON_BYTES {
+            bail!("quarantine requires a bounded non-empty reason");
+        }
+        self.transaction(|db| {
+            let mut changed = 0;
+            for wt in worktrees {
+                changed += db.conn().execute(
+                    "UPDATE worktrees SET identity_state='quarantined', quarantine_reason=?2
+                      WHERE worktree=?1 AND identity_state='legacy'",
+                    params![wt, reason],
+                )?;
+            }
+            Ok(changed)
+        })
+    }
+
     pub fn advance_worktree_operation_revision(
         &self,
         instance_id: &[u8],
@@ -672,5 +696,38 @@ mod tests {
                 .worktree_instances_for_path(b"/repo/.worktrees/oversized")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn legacy_registry_rows_are_quarantined_without_being_removed() {
+        use crate::store::WorkspaceStore;
+        let db = Db::open_memory().unwrap();
+        db.put_worktree("app/feat-a", "/r", "/wt/one", "feat/a", None, None)
+            .unwrap();
+        db.put_worktree("app/feat-a", "/r", "/wt/two", "feat-a", None, None)
+            .unwrap();
+        let contested = vec!["/wt/one".to_string(), "/wt/two".to_string()];
+        assert_eq!(
+            db.quarantine_legacy_worktree_rows(&contested, "ambiguous tab")
+                .unwrap(),
+            2
+        );
+        // Idempotent: already-quarantined rows are not re-stamped.
+        assert_eq!(
+            db.quarantine_legacy_worktree_rows(&contested, "ambiguous tab")
+                .unwrap(),
+            0
+        );
+        assert_eq!(db.worktrees().unwrap().len(), 2, "no row is deleted");
+        let state: String = db
+            .conn()
+            .query_row(
+                "SELECT identity_state FROM worktrees WHERE worktree='/wt/one'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "quarantined");
+        assert!(db.quarantine_legacy_worktree_rows(&contested, " ").is_err());
     }
 }

@@ -149,10 +149,45 @@ pub fn home_tab(slug: &str) -> String {
     format!("{slug}/home")
 }
 
-/// Tab name for a worktree of `slug` on `branch` (`"{slug}/{branch-slug}"`).
-/// Globally unique, so it doubles as the key the panel/`resolve-worktree` use.
+/// Tab name for a worktree of `slug` on `branch`: `"{slug}/{branch}"` with the
+/// EXACT branch name (THE-516). It used to slugify the branch, so `feat/a`,
+/// `feat-a` and `feat_a` all became `{slug}/feat-a` and shared one tab/DB key.
+/// Branch names are already unique per repository, so the exact name is a
+/// collision-free key; `split_tab` splits on the FIRST `/` (the slug never
+/// contains one), so a branch containing `/` round-trips.
+///
+/// The one reserved name is `home`, which would alias [`home_tab`]. It is
+/// escaped as `home~`: `~` can never appear in a Git ref name, so no real
+/// branch produces that tab.
 pub fn branch_tab(slug: &str, branch: &str) -> String {
-    format!("{slug}/{}", util::slugify(branch))
+    if branch == "home" {
+        return format!("{slug}/home~");
+    }
+    format!("{slug}/{branch}")
+}
+
+/// [`repo_slug`] for authority-bearing callers (registration, routing). The
+/// infallible variant falls back to the unsuffixed basename slug when the DB
+/// is unavailable, which re-aliases same-basename repositories (`repo` vs
+/// `repo-2`). This variant refuses instead, so nothing is registered or routed
+/// under a fabricated identity.
+pub fn repo_slug_checked(root: &Path) -> anyhow::Result<String> {
+    let db = crate::db::Db::open()?;
+    db.slug_for_repo(&root.to_string_lossy(), &slug_base(&repo_name(root)))
+}
+
+/// [`repo_slug_with`] that refuses instead of falling back (see
+/// [`repo_slug_checked`]). Path-derived name, no Git, like [`repo_slug_with`].
+pub fn repo_slug_with_checked(db: &crate::db::Db, root: &Path) -> anyhow::Result<String> {
+    db.slug_for_repo(
+        &root.to_string_lossy(),
+        &slug_base(&repo_name_from_path(root)),
+    )
+}
+
+fn slug_base(name: &str) -> String {
+    let s = util::slugify(name);
+    if s.is_empty() { "repo".to_string() } else { s }
 }
 
 /// Discover git repos under the configured roots (parent dirs of a `.git`
@@ -298,5 +333,19 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_dir_all(other);
+    }
+
+    #[test]
+    fn branch_tabs_are_exact_and_never_alias() {
+        let branches = [
+            "feat/a", "feat-a", "feat_a", "FEAT-A", "修复", "home", "home~x",
+        ];
+        let tabs: Vec<String> = branches.iter().map(|b| branch_tab("app", b)).collect();
+        for (i, t) in tabs.iter().enumerate() {
+            assert!(tabs[i + 1..].iter().all(|u| u != t), "{t} aliased");
+            assert_ne!(t, &home_tab("app"), "no branch aliases the home tab");
+        }
+        assert_eq!(branch_tab("app", "feat/a"), "app/feat/a");
+        assert_eq!(branch_tab("app", "home"), "app/home~");
     }
 }

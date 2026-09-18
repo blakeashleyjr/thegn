@@ -360,6 +360,10 @@ fn bounded_stdout_with(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NativePathError {
     TooLong,
+    #[allow(
+        dead_code,
+        reason = "constructed only on targets that are neither unix nor windows"
+    )]
     Unsupported,
 }
 
