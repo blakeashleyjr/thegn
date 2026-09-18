@@ -1071,6 +1071,31 @@ pub fn create_failure_with_rollback(
     }
 }
 
+/// [`create_failure_with_add_state`] for a structured add failure. A refused
+/// pre-existing destination is someone else's path (another worktree, user
+/// data, a racing create), so NO rollback runs against it (THE-516).
+pub fn create_failure_after_add(
+    primary: impl Into<String>,
+    cfg: &Config,
+    repo_root: &Path,
+    worktree: &Path,
+    branch: &str,
+    add: &thegn_core::worktree::AddError,
+) -> String {
+    let primary = primary.into();
+    if add.destination_preexisted {
+        return format!("{primary}; the existing destination was left untouched");
+    }
+    create_failure_with_add_state(
+        primary,
+        cfg,
+        repo_root,
+        worktree,
+        branch,
+        add.branch_created,
+    )
+}
+
 pub fn create_failure_with_add_state(
     primary: impl Into<String>,
     cfg: &Config,

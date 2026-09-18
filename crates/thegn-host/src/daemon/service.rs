@@ -1827,8 +1827,11 @@ impl ControlApi for DaemonService {
                 let base = wt::resolve_base(&root, &cfg);
                 let taken = wt::BranchSet::load(&root);
                 let branch = wt::dedupe(&seed, &taken);
-                let path = wt::worktree_path(&root, &branch, &cfg);
-                let slug = repo::repo_slug(&root);
+                // THE-516: fallible identities — never a basename/slug alias.
+                let path = wt::allocate_worktree_path(&root, &branch, &cfg)
+                    .map_err(|e| anyhow::anyhow!("worktrees.create: {e}"))?;
+                let slug = repo::repo_slug_checked(&root)
+                    .map_err(|e| anyhow::anyhow!("worktrees.create: workspace identity unavailable: {e}"))?;
                 let pre = crate::worktree_lifecycle::run_event_with_db(
                     &cfg,
                     &root,
@@ -1843,13 +1846,13 @@ impl ControlApi for DaemonService {
                     anyhow::bail!("worktrees.create: {}", pre.message());
                 }
                 wt::add_checked_with_state(&root, &branch, &base, &path, &cfg).map_err(|e| {
-                    anyhow::anyhow!(crate::worktree_lifecycle::create_failure_with_add_state(
-                        e.message,
+                    anyhow::anyhow!(crate::worktree_lifecycle::create_failure_after_add(
+                        e.message.clone(),
                         &cfg,
                         &root,
                         &path,
                         &branch,
-                        e.branch_created,
+                        &e,
                     ))
                 })?;
                 if let Err(e) = crate::git_worktree::initialize(&cfg, &root, &path, None) {

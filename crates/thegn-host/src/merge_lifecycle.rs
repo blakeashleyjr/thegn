@@ -429,7 +429,17 @@ pub(crate) fn remove_landed_with_config(
     // Automatic reclaim is unattended: the shared transaction runs the hook,
     // runtime teardown, removal, and post-hook in order, but a repository-
     // authored failure can never wedge the queue.
-    let workspace = thegn_core::util::slugify(&thegn_core::repo::repo_name_from_path(repo_root));
+    // THE-516: the hook's workspace identity is the DB-assigned slug; an
+    // unavailable slug refuses cleanup rather than presenting the unsuffixed
+    // basename that a same-named repository also resolves to.
+    let workspace = match thegn_core::repo::repo_slug_with_checked(db, repo_root) {
+        Ok(slug) => slug,
+        Err(error) => {
+            return CleanupOutcome::Refused {
+                reason: format!("workspace identity unavailable: {error}"),
+            };
+        }
+    };
     let (removed, message) = crate::worktree_lifecycle::destroy_one_checked(
         cfg,
         repo_root,

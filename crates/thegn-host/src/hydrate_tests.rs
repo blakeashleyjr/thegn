@@ -1862,3 +1862,22 @@ fn auto_clean_refuses_a_target_origin_change_before_and_during_state_lookup() {
         "a scope change during the provider request must prevent cleanup"
     );
 }
+
+/// THE-516: two legacy registry rows sharing one slugged tab are quarantined —
+/// neither is surfaced for tab-keyed routing — while a same-named tab in a
+/// DIFFERENT repository and the uncontested rows are unaffected.
+#[test]
+fn ambiguous_legacy_tabs_are_quarantined_from_the_registry_list() {
+    use thegn_core::store::WorkspaceStore;
+    let db = thegn_core::db::Db::open_memory().unwrap();
+    db.put_worktree("app/feat-a", "/r/app", "/wt/one", "feat/a", None, None)
+        .unwrap();
+    db.put_worktree("app/feat-a", "/r/app", "/wt/two", "feat-a", None, None)
+        .unwrap();
+    db.put_worktree("app/feat-a", "/r/other", "/wt/three", "feat-a", None, None)
+        .unwrap();
+    let rows = db.worktrees().unwrap();
+    let ambiguous = super::ambiguous_registry_tabs(&rows);
+    assert_eq!(ambiguous.len(), 1);
+    assert!(ambiguous.contains(&("/r/app".to_string(), "app/feat-a".to_string())));
+}

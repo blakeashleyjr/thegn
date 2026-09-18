@@ -1145,7 +1145,36 @@ pub(crate) fn db_worktree_list(
             Vec::new()
         }
     };
+    // THE-516: legacy slugged tab names can alias distinct worktrees
+    // (`feat/a` and `feat-a` both registered as `app/feat-a`). Such a tab is
+    // quarantined: reported, and neither claimant is surfaced for tab-keyed
+    // routing/assignment. Nothing is opened, moved or deleted.
+    let ambiguous = ambiguous_registry_tabs(&rows);
+    if !ambiguous.is_empty() {
+        let contested: Vec<String> = rows
+            .iter()
+            .filter(|w| ambiguous.contains(&(w.repo_root.clone(), w.tab_name.clone())))
+            .map(|w| w.worktree.clone())
+            .collect();
+        for (repo_root, tab) in &ambiguous {
+            tracing::warn!(
+                target: "thegn::hydrate",
+                repo_root = %repo_root,
+                tab = %tab,
+                "quarantined ambiguous legacy tab: several worktrees claim it; none is routed by it"
+            );
+        }
+        // best-effort: the quarantine marker is a cache annotation; the skip
+        // below is what keeps the contested rows out of routing this pass.
+        let _ = db.quarantine_legacy_worktree_rows(
+            &contested,
+            "legacy tab name is claimed by several worktrees",
+        );
+    }
     for w in rows {
+        if ambiguous.contains(&(w.repo_root.clone(), w.tab_name.clone())) {
+            continue;
+        }
         // git is the source of truth: a LOCAL registry row that git no longer
         // lists and whose dir vanished (deleted outside thegn) is dead — delete
         // it here (we're on the hydration thread) instead of merely hiding it,
@@ -1230,6 +1259,21 @@ pub(crate) fn db_worktree_list(
         });
     }
     out
+}
+
+/// `(repo_root, tab_name)` pairs claimed by more than one registry row. Pure.
+pub(crate) fn ambiguous_registry_tabs(
+    rows: &[thegn_core::models::WorktreeRow],
+) -> std::collections::HashSet<(String, String)> {
+    let mut seen = std::collections::HashSet::new();
+    let mut dup = std::collections::HashSet::new();
+    for w in rows {
+        let key = (w.repo_root.clone(), w.tab_name.clone());
+        if !seen.insert(key.clone()) {
+            dup.insert(key);
+        }
+    }
+    dup
 }
 
 /// Gather per-worktree git/agent/activity status for every tab in the session.

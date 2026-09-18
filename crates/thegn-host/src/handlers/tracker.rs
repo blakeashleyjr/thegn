@@ -268,14 +268,31 @@ fn dispatch_agent(ctx: &mut TrackerCtx) {
             let raw_branch =
                 thegn_core::issue::issue_branch_seed(issue.branch_hint.as_deref(), &issue_number);
             let branch = wt::dedupe(&raw_branch, &taken);
-            let path = wt::worktree_path(&root, &branch, &cfg2);
+            // THE-516: the checkout path and workspace slug are identities;
+            // resolution failures refuse instead of falling back to aliases.
+            let path = match wt::allocate_worktree_path(&root, &branch, &cfg2) {
+                Ok(path) => path,
+                Err(e) => {
+                    thegn_core::msg::warn(&format!("agent dispatch: {e}"));
+                    return;
+                }
+            };
+            let slug = match repo::repo_slug_checked(&root) {
+                Ok(slug) => slug,
+                Err(e) => {
+                    thegn_core::msg::warn(&format!(
+                        "agent dispatch: workspace identity unavailable: {e}"
+                    ));
+                    return;
+                }
+            };
 
             let pre = crate::worktree_lifecycle::run_event(
                 &cfg2,
                 &root,
                 &path,
                 &branch,
-                &repo::repo_slug(&root),
+                &slug,
                 thegn_core::hooks::HookEvent::PreCreate,
                 thegn_core::hooks::HookExecutionMode::User,
             );
@@ -285,13 +302,13 @@ fn dispatch_agent(ctx: &mut TrackerCtx) {
             }
 
             if let Err(e) = wt::add_checked_with_state(&root, &branch, &base, &path, &cfg2) {
-                let message = crate::worktree_lifecycle::create_failure_with_add_state(
+                let message = crate::worktree_lifecycle::create_failure_after_add(
                     format!("agent dispatch: {}", e.message),
                     &cfg2,
                     &root,
                     &path,
                     &branch,
-                    e.branch_created,
+                    &e,
                 );
                 thegn_core::msg::warn(&message);
                 return;
@@ -355,7 +372,7 @@ fn dispatch_agent(ctx: &mut TrackerCtx) {
             spec.env.push(("THEGN_ISSUE_BODY".into(), issue_body));
             spec.env.push(("THEGN_ISSUE_URL".into(), issue_url));
 
-            let slug = repo::repo_slug(&root);
+            // `slug` was resolved (fallibly) before the create above.
             let tab = repo::branch_tab(&slug, &branch);
             let root_s = root.to_string_lossy();
 
