@@ -528,11 +528,20 @@ fn bounded_reserve_needed(
 
 /// Drain an error body without retaining it.  This bounds both diagnostic
 /// work and memory while ensuring never-ending error responses still obey the
-/// same idle/total deadlines as successful responses.
+/// same idle/total deadlines as successful responses. Error media types are
+/// deliberately unrestricted: authentication gateways commonly return HTML,
+/// text, or JSON. These bytes are never parsed, retained, rendered, or logged;
+/// only success bodies must match the calendar/DAV parser's media contract.
 pub(crate) async fn discard_body(
     response: Response,
     deadline: Instant,
 ) -> Result<(), CalendarHttpError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_ERROR_BODY_BYTES as u64)
+    {
+        return Err(CalendarHttpError::BodyLimit);
+    }
     let mut count = 0usize;
     let mut stream = response.bytes_stream();
     while let Some(chunk) = timeout_at(deadline, stream.next())
