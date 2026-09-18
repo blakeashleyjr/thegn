@@ -1146,6 +1146,7 @@ fn shell_materialize_with_suppressed_record_leaves_the_worktrees_agent_alone() {
             &wt,
             None,
             "shell",
+            false,
             LaunchExtras {
                 suppress_agent_record: true,
                 ..Default::default()
@@ -1257,6 +1258,7 @@ fn sandbox_argv_resolution_leaves_the_worktrees_agent_alone() {
             &wt,
             None,
             "shell",
+            false,
             LaunchExtras {
                 suppress_agent_record: true,
                 ..Default::default()
