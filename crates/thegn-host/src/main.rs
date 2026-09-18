@@ -9,7 +9,6 @@ mod agent;
 mod agent_configs;
 mod agent_home;
 mod agent_output;
-mod agent_permissions;
 mod agent_run;
 mod agent_ssh;
 mod agent_teardown;

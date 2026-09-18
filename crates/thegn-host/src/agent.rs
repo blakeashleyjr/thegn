@@ -3205,23 +3205,13 @@ pub fn launch_spec_full(
 ) -> anyhow::Result<LaunchSpec> {
     let loc = GitLoc::for_worktree(Path::new(worktree));
 
-    // A headless allow-list (`[[agents]].permissions`, or the stage's) is
-    // seeded into the LOCAL worktree before the harness starts, so a headless
-    // worker does not auto-deny its first tool call. Best-effort: a failure to
-    // write is logged and the launch proceeds (the harness then prompts/denies
-    // as it would have anyway).
-    // Resolved once: the permissions seed below needs the allow-list, and the
-    // host env fold near the end needs the entry's env KEYS (see there).
+    // Resolved once: the host env fold near the end needs the entry's env KEYS
+    // (see there). The headless allow-list (`[[agents]].permissions`, or the
+    // stage's) is NOT applied here: it rides the launch command itself through
+    // the harness's command-scoped mechanism (`EffectiveAgent::permission_args`,
+    // THE-440), so launch preparation never reads or writes anything under the
+    // repository-controlled worktree.
     let eff_agent = thegn_core::agent_task::effective_agent(cfg, choice, extras.stage).ok();
-
-    if !loc.is_remote()
-        && let Some(eff) = &eff_agent
-        && !eff.permissions.is_empty()
-        && let Err(e) =
-            crate::agent_permissions::seed(Path::new(worktree), &eff.harness, &eff.permissions)
-    {
-        tracing::warn!(target: "thegn::agent", agent = %choice, "permissions not seeded: {e}");
-    }
 
     // One DB handle for the whole spec resolution (each open re-runs pragmas).
     let db = Db::open().ok(); // best-effort: cache: choice recording and repo-root/sandbox lookups all fall back to local git below

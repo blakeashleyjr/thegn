@@ -17,9 +17,10 @@ use thegn_core::pipeline_run;
 use thegn_core::store::{NotificationStore, WorkspaceStore};
 use thegn_core::util::git_out;
 use thegn_svc::control::client::{AttachControl, ControlAddr, ControlClient};
-// NOTE: stage `permissions` are seeded by the daemon (`agent_permissions`,
-// over the *effective* list, harness-aware) — the dispatch only carries the
-// stage name through `AgentLaunch.stage`. No CLI-side seeder lives here.
+// NOTE: stage `permissions` ride the daemon's launch command (the harness's
+// command-scoped grant, over the *effective* list — THE-440); the dispatch
+// only carries the stage name through `AgentLaunch.stage` and refuses, before
+// any roster row exists, a grant the harness cannot take (`policy_admission`).
 
 #[derive(clap::Subcommand, Clone)]
 pub enum SessionAction {
@@ -807,6 +808,24 @@ fn stage_or_bail<'a>(
     })
 }
 
+/// Admit a stage launch's effective permission policy before anything is
+/// claimed or spawned (THE-440). The grant must be expressible as the
+/// harness's command-scoped mechanism; otherwise the dispatch is held with an
+/// actionable error — no roster row, no process, no task failure recorded.
+/// The daemon re-derives the same command from the same config, so this is
+/// an early, row-free refusal, not a second source of truth.
+///
+/// An agent/stage that does not resolve at all is left to the daemon's launch
+/// (which fails the row exactly as before); only the policy is admitted here.
+fn policy_admission(cfg: &Config, agent: &str, stage: &str) -> Result<()> {
+    let Ok(eff) = thegn_core::agent_task::effective_agent(cfg, agent, Some(stage)) else {
+        return Ok(());
+    };
+    eff.permission_args()
+        .map(drop)
+        .map_err(|why| anyhow::anyhow!("stage `{stage}` (agent `{agent}`) not dispatched: {why}"))
+}
+
 /// The `session open` refusals that are answerable before `connect` — both are
 /// caller mistakes, not daemon problems:
 ///
@@ -915,9 +934,10 @@ fn resolve_branch(db: &Db, wt: &str) -> String {
 /// The stage's `model` / `env` / `permissions` are NOT applied here: the
 /// dispatch carries the stage name through `AgentLaunch.stage`, so the daemon
 /// resolves the effective agent exactly as a TUI launch does (`command_for`
-/// layers the stage over the entry, and `launch_spec_full` seeds the
-/// effective allow-list into the harness's per-worktree settings file).
-/// One seeder, every launch path — the dispatch never keeps a second one.
+/// layers the stage over the entry and appends the effective allow-list as the
+/// harness's command-scoped grant). The dispatch only ADMITS the policy
+/// ([`policy_admission`]) before the roster row is claimed, so an
+/// unattestable grant is a pre-launch hold, never a failed task.
 async fn open_stage(cfg: &Config, client: &ControlClient, d: StageDispatch<'_>) -> Result<()> {
     use thegn_svc::control::{AgentLaunch, OpenSpec};
 
@@ -961,6 +981,9 @@ async fn open_stage(cfg: &Config, client: &ControlClient, d: StageDispatch<'_>) 
         .agent
         .map(str::to_string)
         .unwrap_or_else(|| stage.agent.clone());
+    // 6a. Permission-policy admission, BEFORE the claim: a grant the harness
+    //     cannot take command-scoped leaves no row and spawns nothing.
+    policy_admission(cfg, &agent_name, &stage.name)?;
     // Route the insert through the atomic claim rather than a bare append.
     // This is the path a Lead actually dispatches on, so it is the one that
     // must not race: `dispatch list` -> judgment -> insert is a
@@ -1424,6 +1447,7 @@ async fn resume_work(
     // checked inside BEGIN IMMEDIATE with the insert. If another monitor takes
     // the freed slot first, this attempt is safely refused rather than
     // oversubscribing the stage.
+    policy_admission(cfg, &agent_name, &stage.name)?;
     let new_row = claim_resume_dispatch(&db, &row, stage, &wt, &agent_name, json)?;
     let artifact = pipeline_run::artifact_path(&row.issue_id, &stage.name, new_row);
     // 6b. Only now is the finisher's row-derived identity known. Render its
@@ -1611,7 +1635,7 @@ mod session_line_tests {
 
 #[cfg(test)]
 mod open_stage_tests {
-    use super::{IssueFacts, open_preflight, stage_or_bail, stage_task_vars};
+    use super::{IssueFacts, open_preflight, policy_admission, stage_or_bail, stage_task_vars};
     use thegn_core::agent_task::render_prompt;
     use thegn_core::config::Config;
     use thegn_core::config_pipeline::PipelineStage;
@@ -1625,6 +1649,34 @@ mod open_stage_tests {
             ..Default::default()
         });
         cfg
+    }
+
+    /// THE-440: a stage whose effective allow-list the harness cannot grant
+    /// command-scoped is held before the roster claim, with an actionable
+    /// message; a grantable list and an empty list are admitted.
+    #[test]
+    fn stage_policy_admission_holds_an_unattestable_grant() {
+        let mut cfg = cfg_with_stage();
+        cfg.pipeline.stages[0].permissions = vec!["Read".into(), "Bash(git *)".into()];
+        policy_admission(&cfg, "claude", "code").expect("claude grants command-scoped");
+        cfg.pipeline.stages.push(PipelineStage {
+            name: "fanout".into(),
+            agent: "claude".into(),
+            harness: Some("pi".into()),
+            permissions: vec!["Read".into()],
+            prompt: "x".into(),
+            ..Default::default()
+        });
+        let err = policy_admission(&cfg, "claude", "fanout").expect_err("pi cannot take it");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("not dispatched"), "{msg}");
+        assert!(msg.contains("permission policy hold"), "{msg}");
+        assert!(msg.contains("fanout"), "{msg}");
+        // No permissions at all ⇒ nothing to admit, on any harness.
+        cfg.pipeline.stages[1].permissions.clear();
+        policy_admission(&cfg, "claude", "fanout").expect("empty list");
+        // An unresolvable agent is left to the launch path (unchanged).
+        policy_admission(&cfg, "ghost", "code").expect("not a policy question");
     }
 
     #[test]
