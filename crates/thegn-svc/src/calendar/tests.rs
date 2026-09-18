@@ -668,60 +668,113 @@ async fn declared_oversized_error_body_is_refused_without_waiting_for_payload() 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     for provider in [CalendarProviderKind::IcsUrl, CalendarProviderKind::CalDav] {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = [0; 4096];
-            socket.read(&mut request).await.unwrap();
-            let (media, method) = if provider == CalendarProviderKind::CalDav {
-                ("application/xml", "REPORT")
-            } else {
-                ("text/calendar", "GET")
+        for status in [
+            "401 Unauthorized",
+            "403 Forbidden",
+            "409 Conflict",
+            "500 Internal Server Error",
+            "507 Insufficient Storage",
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0; 4096];
+                socket.read(&mut request).await.unwrap();
+                let (media, method) = if provider == CalendarProviderKind::CalDav {
+                    ("application/xml", "REPORT")
+                } else {
+                    ("text/calendar", "GET")
+                };
+                let headers = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: {media}\r\nContent-Length: {}\r\n\r\n",
+                    crate::http::MAX_ERROR_BODY_BYTES + 1
+                );
+                assert!(
+                    std::str::from_utf8(&request)
+                        .unwrap_or_default()
+                        .starts_with(method),
+                    "backend must use the expected request method"
+                );
+                socket.write_all(headers.as_bytes()).await.unwrap();
+                // A header-only error must be rejected at the diagnostic cap; do
+                // not make the client wait for an absent body until its deadline.
+                std::future::pending::<()>().await;
+            });
+            let cfg = CalendarAccount {
+                url: format!("http://{address}/declared-error"),
+                allow_private_network: true,
+                ..account("declared-error", provider)
             };
-            let headers = format!(
-                "HTTP/1.1 500 Internal Server Error\r\nContent-Type: {media}\r\nContent-Length: {}\r\n\r\n",
-                crate::http::MAX_ERROR_BODY_BYTES + 1
-            );
+            let result = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                match provider {
+                    CalendarProviderKind::IcsUrl => {
+                        ics_url::IcsUrlBackend::new(&cfg)
+                            .list_events(window().0, window().1, "prior-token")
+                            .await
+                    }
+                    _ => {
+                        caldav::CalDavBackend::new(&cfg)
+                            .list_events(window().0, window().1, "prior-token")
+                            .await
+                    }
+                }
+            })
+            .await
+            .expect("oversized error headers must refuse without reading the body");
             assert!(
-                std::str::from_utf8(&request)
-                    .unwrap_or_default()
-                    .starts_with(method),
-                "backend must use the expected request method"
+                matches!(result, Err(CalendarError::BodyLimit(_))),
+                "{result:?}"
             );
-            socket.write_all(headers.as_bytes()).await.unwrap();
-            // A header-only error must be rejected at the diagnostic cap; do
-            // not make the client wait for an absent body until its deadline.
-            std::future::pending::<()>().await;
-        });
-        let cfg = CalendarAccount {
-            url: format!("http://{address}/declared-error"),
-            allow_private_network: true,
-            ..account("declared-error", provider)
-        };
-        let result = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            match provider {
-                CalendarProviderKind::IcsUrl => {
-                    ics_url::IcsUrlBackend::new(&cfg)
-                        .list_events(window().0, window().1, "")
-                        .await
-                }
-                _ => {
-                    caldav::CalDavBackend::new(&cfg)
-                        .list_events(window().0, window().1, "")
-                        .await
-                }
-            }
-        })
-        .await
-        .expect("oversized error headers must refuse without reading the body");
-        assert!(
-            matches!(result, Err(CalendarError::BodyLimit(_))),
-            "{result:?}"
-        );
-        server.abort();
-        let _ = server.await;
+            server.abort();
+            let _ = server.await;
+        }
     }
+}
+
+#[tokio::test]
+async fn gateway_error_media_is_discarded_without_parsing_or_disclosure() {
+    use axum::{Router, http::StatusCode, routing::any};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new().fallback(any(|| async {
+                (
+                    StatusCode::UNAUTHORIZED,
+                    [("content-type", "text/html")],
+                    "<html>secret-gateway-token</html>",
+                )
+            })),
+        )
+        .await
+        .unwrap();
+    });
+    for provider in [CalendarProviderKind::IcsUrl, CalendarProviderKind::CalDav] {
+        let cfg = CalendarAccount {
+            url: format!("http://{address}/error"),
+            allow_private_network: true,
+            ..account("gateway", provider)
+        };
+        let result = match provider {
+            CalendarProviderKind::IcsUrl => {
+                ics_url::IcsUrlBackend::new(&cfg)
+                    .list_events(window().0, window().1, "")
+                    .await
+            }
+            _ => {
+                caldav::CalDavBackend::new(&cfg)
+                    .list_events(window().0, window().1, "")
+                    .await
+            }
+        };
+        let error = result.unwrap_err();
+        assert!(matches!(error, CalendarError::Auth(_)), "{error:?}");
+        assert!(!format!("{error:?}").contains("secret-gateway-token"));
+    }
+    server.abort();
+    let _ = server.await;
 }
 
 #[tokio::test]

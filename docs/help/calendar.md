@@ -160,7 +160,11 @@ trusted LAN calendar may set `allow_private_network = true`; that permission
 still rejects unspecified, multicast, and broadcast addresses. Query strings
 are retained for signed subscriptions but are never included in errors or
 diagnostics. Responses are streamed with a 32 MiB hard cap, and compressed
-responses are rejected rather than decompressed.
+responses are rejected rather than decompressed. Error bodies are discarded under a separate
+8 KiB cap, including a declared-length check before reading. HTML, text, or JSON
+errors from authentication gateways are accepted only for discard; their contents
+are never parsed or shown. Successful bodies must use a supported ICS or DAV
+media type.
 
 There's deliberately no Google or Outlook integration: both need an OAuth client
 registration and a consent flow, and both hand out a secret `.ics` URL that
