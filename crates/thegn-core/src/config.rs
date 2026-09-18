@@ -2319,7 +2319,7 @@ impl GitOverlay {
 /// Host keybinding overrides. The flat `[keybinds]` table remains the
 /// default/global layer for backwards compatibility; nested tables such as
 /// `[keybinds.vim_normal]` override only the native host's named modes.
-#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct KeybindConfig {
     /// Backwards-compatible flat `[keybinds] action-id = "Chord"` entries.
@@ -2334,6 +2334,33 @@ pub struct KeybindConfig {
     /// Native host emacs-mode overrides.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub emacs: BTreeMap<String, String>,
+}
+
+// Schemars 0.8 loses the flattened map's additionalProperties when it
+// coexists with named mode maps. Describe the actual serde shape explicitly.
+impl schemars::JsonSchema for KeybindConfig {
+    fn schema_name() -> String {
+        "KeybindConfig".into()
+    }
+
+    fn json_schema(generator: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
+        use schemars::schema::{InstanceType, ObjectValidation, SchemaObject};
+        let chord = generator.subschema_for::<String>();
+        let mode = generator.subschema_for::<BTreeMap<String, String>>();
+        SchemaObject {
+            instance_type: Some(InstanceType::Object.into()),
+            object: Some(Box::new(ObjectValidation {
+                properties: ["vim_normal", "vim_insert", "emacs"]
+                    .into_iter()
+                    .map(|name| (name.to_string(), mode.clone()))
+                    .collect(),
+                additional_properties: Some(Box::new(chord)),
+                ..Default::default()
+            })),
+            ..Default::default()
+        }
+        .into()
+    }
 }
 
 impl KeybindConfig {

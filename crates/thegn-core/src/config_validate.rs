@@ -11,8 +11,7 @@
 //! Honest coverage contract: "every `config_enum!` reachable from `Config`'s
 //! serde tree is validated". `ShareReach` is intentionally out of scope (it
 //! has no config.toml key — CLI/runtime vocabulary only), and the flattened
-//! `[keybinds]` map is skipped (schemars 0.8 drops a flattened map's
-//! `additionalProperties`, so its free-form keys are simply not traversed).
+//! `[keybinds]` map has an explicit schema preserving free-form chord strings.
 
 use std::sync::OnceLock;
 
@@ -1632,5 +1631,29 @@ on_blocked = "escalate"
             .collect();
         assert!(values.contains(&"in_repo"), "{values:?}");
         assert!(!values.contains(&"InRepo"), "{values:?}");
+    }
+}
+
+#[cfg(test)]
+mod keybind_schema_tests {
+    #[test]
+    fn flat_and_mode_chords_preserve_strict_types() {
+        for value in [
+            serde_json::json!({"custom-action": "ctrl-x", "vim_normal": {"other": "x"}}),
+            serde_json::json!({"emacs": {}, "vim_insert": {"other": "y"}}),
+        ] {
+            assert!(
+                super::validate_schema_value::<crate::config::KeybindConfig>(&value).is_empty()
+            );
+        }
+        for value in [
+            serde_json::json!({"custom-action": 42}),
+            serde_json::json!({"vim_normal": "ctrl-x"}),
+            serde_json::json!({"vim_insert": {"other": false}}),
+        ] {
+            assert!(
+                !super::validate_schema_value::<crate::config::KeybindConfig>(&value).is_empty()
+            );
+        }
     }
 }
