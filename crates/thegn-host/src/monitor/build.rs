@@ -874,6 +874,10 @@ fn procs(
             None,
         )]);
     }
+    if let crate::model_eq::ProcessViewState::Failed(reason) = cx.model.process_state {
+        let label = format!("process sampling unavailable: {reason}");
+        return plain(vec![heading(&label, None)]);
+    }
     if !snap.enabled || snap.procs.is_empty() {
         // The gate is open but no sample has landed: either the model still
         // holds `ProcSnapshot::default()` (the first frame after the tab
