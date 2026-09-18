@@ -542,7 +542,7 @@ mod tests {
 
     #[test]
     fn destination_policy_covers_literal_special_and_mapped_addresses() {
-        for raw in ["127.0.0.1", "10.0.0.1", "169.254.1.1", "0.0.0.0"] {
+        for raw in ["127.0.0.1", "10.0.0.1", "169.254.1.1"] {
             let ip = raw.parse().unwrap();
             assert!(!address_allowed(ip, false), "{raw} must be refused");
             assert!(
@@ -550,7 +550,7 @@ mod tests {
                 "{raw} is an intentional local range"
             );
         }
-        for raw in ["224.0.0.1", "255.255.255.255", "::", "ff02::1"] {
+        for raw in ["0.0.0.0", "224.0.0.1", "255.255.255.255", "::", "ff02::1"] {
             let ip = raw.parse().unwrap();
             assert!(!address_allowed(ip, false), "{raw} must be refused");
             assert!(
