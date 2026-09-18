@@ -3,10 +3,54 @@
 //! resurrection (git is the source of truth; the DB is only a cache).
 
 use crate::config::Config;
+use crate::identity::{ExactPath, IdentityError, RepositoryId};
 use crate::store::WorkspaceStore;
 use crate::util;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
+
+const MAX_GIT_IDENTITY_OUTPUT: usize = 16 * 1024;
+
+/// Resolve Git's canonical common directory as an exact, bounded path.
+///
+/// Repository identity is intentionally tied to this directory rather than a
+/// remote URL or basename. Moving the common directory therefore changes the
+/// [`RepositoryId`] and requires an explicit trusted-overlay migration.
+pub fn canonical_common_dir(root: &Path) -> Result<ExactPath, IdentityError> {
+    let output = util::git_stdout_bounded(
+        root,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        MAX_GIT_IDENTITY_OUTPUT,
+    )
+    .map_err(|_| IdentityError::GitProbeFailed {
+        operation: "rev-parse --git-common-dir",
+    })?;
+    let raw = trim_git_line(&output).ok_or(IdentityError::GitProbeFailed {
+        operation: "empty git common directory",
+    })?;
+    let path = ExactPath::from_git_bytes(raw)?;
+    let canonical =
+        std::fs::canonicalize(path.as_path()).map_err(|_| IdentityError::GitProbeFailed {
+            operation: "canonicalize git common directory",
+        })?;
+    ExactPath::from_path(&canonical)
+}
+
+/// Construct the canonical repository identity without consulting SQLite.
+pub fn repository_id(root: &Path) -> Result<RepositoryId, IdentityError> {
+    Ok(RepositoryId::from_common_dir(&canonical_common_dir(root)?))
+}
+
+fn trim_git_line(output: &[u8]) -> Option<&[u8]> {
+    let mut end = output.len();
+    if output.get(end.wrapping_sub(1)) == Some(&b'\n') {
+        end -= 1;
+    }
+    if output.get(end.wrapping_sub(1)) == Some(&b'\r') {
+        end -= 1;
+    }
+    (end > 0).then_some(&output[..end])
+}
 
 /// Toplevel of the working tree containing `dir`.
 pub fn toplevel(dir: &Path) -> Option<PathBuf> {
@@ -216,5 +260,33 @@ mod tests {
         assert_eq!(worktree_root_for_cwd(&dir.join("missing")), None);
         // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn repository_id_uses_git_common_dir_not_basename_or_symlink_alias() {
+        let root = tmp("identity-root");
+        let other = tmp("identity-other");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&other);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        assert!(util::git_cmd(&root).arg("init").status().unwrap().success());
+        assert!(
+            util::git_cmd(&other)
+                .arg("init")
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        let first = repository_id(&root).unwrap();
+        let second = repository_id(&other).unwrap();
+        assert_ne!(
+            first, second,
+            "same basename roots must not share a repository ID"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(other);
     }
 }

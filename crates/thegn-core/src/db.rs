@@ -178,7 +178,11 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 /// the source of truth.
 /// v68: separates the daemon's actual TCP bind address from its advertised
 /// client-facing control origin.
-pub const SCHEMA_VERSION: i64 = 68;
+/// v69: adds the exact worktree identity ledger and nullable compatibility
+/// columns on the legacy path/tab registries. Admission remains a background
+/// Git-verification responsibility; schema migration performs no Git or
+/// filesystem I/O.
+pub const SCHEMA_VERSION: i64 = 69;
 
 /// Escape hatch for [`schema_refusal`] — set to `1`/`true` to run a build older
 /// than the on-disk schema anyway (read-only, as before). Deliberately awkward:
@@ -1980,6 +1984,7 @@ impl Db {
         crate::db_migrate::migrate_v66(&conn)?;
         crate::db_migrate::migrate_v67(&conn)?;
         crate::db_control::migrate_v68(&conn)?;
+        crate::db_migrate::migrate_v69(&conn)?;
         if ver < SCHEMA_VERSION {
             crate::db_migrate::verify_v62_schema(&conn)?;
             crate::db_migrate::verify_v63_schema(&conn)?;
@@ -1988,6 +1993,7 @@ impl Db {
             crate::db_migrate::verify_v66_schema(&conn)?;
             crate::db_migrate::verify_v67_schema(&conn)?;
             crate::db_control::verify_v68_schema(&conn)?;
+            crate::db_migrate::verify_v69_schema(&conn)?;
         }
         // v46: one-time cleanup of the spurious `process_failed` notification
         // pile that accrued while routine shell teardown (and unreapable /
