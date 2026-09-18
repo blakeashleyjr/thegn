@@ -5,7 +5,7 @@ use crate::msg;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
@@ -152,53 +152,175 @@ pub(crate) fn git_stdout_bounded(
     args: &[&str],
     max_bytes: usize,
 ) -> Result<Vec<u8>, String> {
-    let mut child = git_cmd(dir)
+    if max_bytes == 0 {
+        return Err("git identity probe has an invalid output bound".into());
+    }
+    let read_limit = u64::try_from(max_bytes)
+        .ok()
+        .and_then(|limit| limit.checked_add(1))
+        .ok_or_else(|| "git identity probe has an invalid output bound".to_string())?;
+    let capture_path = std::env::temp_dir().join(format!(
+        ".thegn-git-identity-{}-{}",
+        std::process::id(),
+        now_nanos().saturating_add({
+            static NEXT_CAPTURE: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(0);
+            u128::from(NEXT_CAPTURE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)),
+        })
+    ));
+    let capture = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&capture_path)
+        .map_err(|e| e.to_string())?;
+    let mut child = match git_cmd(dir)
         .args(args)
-        .stdout(Stdio::piped())
+        .stdout(Stdio::from(capture))
         .stderr(Stdio::null())
         .spawn()
-        .map_err(|e| e.to_string())?;
-    let mut stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "git stdout pipe was unavailable".to_string())?;
+    {
+        Ok(child) => child,
+        Err(error) => {
+            let _ = std::fs::remove_file(&capture_path);
+            return Err(error.to_string());
+        }
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let status = loop {
+        if std::fs::metadata(&capture_path)
+            .map(|metadata| metadata.len() > max_bytes as u64)
+            .unwrap_or(false)
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = std::fs::remove_file(&capture_path);
+            return Err("git identity probe output exceeded its bound".into());
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = std::fs::remove_file(&capture_path);
+                return Err("git identity probe exceeded its time bound".into());
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = std::fs::remove_file(&capture_path);
+                return Err(error.to_string());
+            }
+        }
+    };
+    let mut file = match std::fs::File::open(&capture_path) {
+        Ok(file) => file,
+        Err(error) => {
+            let _ = std::fs::remove_file(&capture_path);
+            return Err(error.to_string());
+        }
+    };
     let mut bytes = Vec::with_capacity(max_bytes.min(4096));
-    let read = stdout
-        .take(max_bytes.saturating_add(1) as u64)
-        .read_to_end(&mut bytes)
-        .map_err(|e| e.to_string());
-    if read.is_err() || bytes.len() > max_bytes {
-        let _ = child.kill();
-        let _ = child.wait();
+    if let Err(error) = file.take(read_limit).read_to_end(&mut bytes) {
+        let _ = std::fs::remove_file(&capture_path);
+        return Err(error.to_string());
+    }
+    let _ = std::fs::remove_file(&capture_path);
+    if bytes.len() > max_bytes {
         return Err("git identity probe output exceeded its bound".into());
     }
-    let status = child.wait().map_err(|e| e.to_string())?;
     if !status.success() {
         return Err(format!("git exited with {status}"));
     }
     Ok(bytes)
 }
 
-/// Exact native path bytes used by the identity seam. The platform-specific
-/// conversion lives here so identity types never need to invent a lossy
-/// `Path`/`String` boundary.
-pub(crate) fn native_path_bytes(path: &Path) -> Option<Vec<u8>> {
+fn now_nanos() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NativePathError {
+    TooLong,
+    Unsupported,
+}
+
+/// Capture the platform representation only after checking its borrowed size.
+/// This keeps a hostile path from forcing an allocation before the identity
+/// bound has been established.
+pub(crate) fn native_path_bytes_bounded(
+    path: &Path,
+    max_bytes: usize,
+) -> Result<Vec<u8>, NativePathError> {
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStrExt;
-        return Some(path.as_os_str().as_bytes().to_vec());
+        let bytes = path.as_os_str().as_bytes();
+        if bytes.len() > max_bytes {
+            return Err(NativePathError::TooLong);
+        }
+        return Ok(bytes.to_vec());
     }
     #[cfg(windows)]
     {
         use std::os::windows::ffi::OsStrExt;
-        let mut out = Vec::with_capacity(path.as_os_str().len() * 2);
-        for unit in path.as_os_str().encode_wide() {
-            out.extend_from_slice(&unit.to_le_bytes());
+        let units = path.as_os_str().encode_wide();
+        let byte_len = path
+            .as_os_str()
+            .len()
+            .checked_mul(2)
+            .ok_or(NativePathError::TooLong)?;
+        if byte_len > max_bytes {
+            return Err(NativePathError::TooLong);
         }
-        return Some(out);
+        return Ok(units.flat_map(u16::to_le_bytes).collect());
     }
     #[cfg(not(any(unix, windows)))]
-    path.to_str().map(|text| text.as_bytes().to_vec())
+    {
+        let text = path.to_str().ok_or(NativePathError::Unsupported)?;
+        if text.len() > max_bytes {
+            return Err(NativePathError::TooLong);
+        }
+        Ok(text.as_bytes().to_vec())
+    }
+}
+
+/// Capture the OS identity of a Git administrative directory. The resulting
+/// bytes remain an inspection proof owned by the Git adapter; callers must not
+/// manufacture a generation from random bytes.
+pub(crate) fn git_admin_instance_stamp(path: &Path) -> Option<Vec<u8>> {
+    let metadata = std::fs::metadata(path).ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let mut stamp = Vec::with_capacity(48);
+        for value in [
+            metadata.dev(),
+            metadata.ino(),
+            metadata.ctime() as u64,
+            metadata.ctime_nsec() as u64,
+        ] {
+            stamp.extend_from_slice(&value.to_be_bytes());
+        }
+        return Some(stamp);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        let mut stamp = Vec::with_capacity(16);
+        stamp.extend_from_slice(&metadata.volume_serial_number()?.to_be_bytes());
+        stamp.extend_from_slice(&metadata.file_index()?.to_be_bytes());
+        return Some(stamp);
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = metadata;
+        None
+    }
 }
 
 /// Convert Git's bounded path output to a native path without using lossy

@@ -1342,6 +1342,9 @@ impl Db {
         // Only `on_disk < current` (fresh or genuinely stale) takes the full
         // path with its migrations.
         if open_mode(ver, SCHEMA_VERSION) == OpenMode::Fast {
+            if ver == SCHEMA_VERSION {
+                crate::db_migrate::verify_v69_schema(&conn)?;
+            }
             return Ok(Db {
                 conn,
                 schema_mismatch: None,
@@ -1993,8 +1996,11 @@ impl Db {
             crate::db_migrate::verify_v66_schema(&conn)?;
             crate::db_migrate::verify_v67_schema(&conn)?;
             crate::db_control::verify_v68_schema(&conn)?;
-            crate::db_migrate::verify_v69_schema(&conn)?;
         }
+        // v69 is an authority ledger, not an optional cache. Verify its full
+        // shape even on the fast/current-version path so a malformed table can
+        // never be treated as an admitted identity store.
+        crate::db_migrate::verify_v69_schema(&conn)?;
         // v46: one-time cleanup of the spurious `process_failed` notification
         // pile that accrued while routine shell teardown (and unreapable /
         // relay-lost `None` exits) were mis-classified as failures — see

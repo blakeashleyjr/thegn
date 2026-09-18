@@ -232,11 +232,13 @@ pub struct WorktreeInstanceRow {
     pub repo_id: Vec<u8>,
     pub common_dir: Vec<u8>,
     pub admin_id: Vec<u8>,
-    pub branch_ref: Vec<u8>,
+    /// None is the exact detached-worktree state; it is not an empty branch.
+    pub branch_ref: Option<Vec<u8>>,
     pub path: Vec<u8>,
     pub owner: Vec<u8>,
     pub state: String,
     pub quarantine_reason: Option<String>,
+    pub operation_revision: i64,
     pub created_at: i64,
 }
 

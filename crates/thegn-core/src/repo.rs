@@ -38,17 +38,14 @@ pub fn canonical_common_dir(root: &Path) -> Result<ExactPath, IdentityError> {
 
 /// Construct the canonical repository identity without consulting SQLite.
 pub fn repository_id(root: &Path) -> Result<RepositoryId, IdentityError> {
-    Ok(RepositoryId::from_common_dir(&canonical_common_dir(root)?))
+    RepositoryId::from_common_dir(&canonical_common_dir(root)?)
 }
 
 fn trim_git_line(output: &[u8]) -> Option<&[u8]> {
-    let mut end = output.len();
-    if output.get(end.wrapping_sub(1)) == Some(&b'\n') {
-        end -= 1;
-    }
-    if output.get(end.wrapping_sub(1)) == Some(&b'\r') {
-        end -= 1;
-    }
+    let end = output
+        .len()
+        .checked_sub(1)
+        .filter(|&end| output[end] == b'\n')?;
     (end > 0).then_some(&output[..end])
 }
 
