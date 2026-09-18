@@ -1,0 +1,15 @@
+# Primary plan review: revise before implementation
+
+The investigation establishes the bugs, but the proposed new manifest authority and blanket foreign-key rewrite are not yet approved. Git is the repository's source of truth; the DB remains a cache. Produce concrete serial implementation chunks that preserve this invariant and cover the full issue without importing unrelated features.
+
+Decisions and constraints:
+
+- Canonical repository identity comes from exact Git common-directory identity, not origin or basename. Keep path/ref bytes lossless on supported platforms and make unsupported representations a typed refusal before mutation. Display text is separate. Scope keys must not depend on DB availability.
+- Prefer versioned, bounded components using the full collision-resistant digest of length-delimited exact identity inputs, with optional bounded readable prefixes. Do not truncate hashes to six/eight hex digits or use lossy string conversions. A digest selects a candidate; authoritative reuse/removal still verifies exact Git metadata and claimant identity.
+- Reuse Git worktree administrative identity and the repository mutation lock where possible. A private journal may record incomplete rename/migration, but do not invent a competing user-facing manifest source of truth. Explain precisely which data needs persistence versus derivation/revalidation.
+- Legacy existing worktrees must remain reachable at their current paths; never mass-move existing user worktrees automatically. Migrate tab/cache identities only after unique exact matching against Git, and quarantine ambiguity before opening/routing/deleting/assigning. Eliminate LIMIT 1 selection of contested identities and basename fallback for authority. Read-only degraded display may use last-known exact mappings.
+- Define generation changes and stale-result rejection at actual creation/rename/publication boundaries. Show the data that each consumer needs. Do not implement entire downstream sandbox/drawer feature issues; update their existing identity inputs and leave no ambiguous route introduced by this fix.
+- Rename must preflight destination and membership under lock, journal the steps, revalidate exact source/destination, and recover after branch/move/DB failure. Decide explicitly if stable physical checkout paths can be preserved during a label rename; retain documented behavior unless the maintenance change is justified. Never silently report success after partial mutation.
+- Feature identities must distinguish exact names that normalize alike; preserve intentional membership and legacy project associations with explicit unambiguous mapping. Explain the minimum schema changes needed, not a blanket conversion of all caches into authority.
+
+Deliver ordered chunks with exact APIs, schema/compatibility strategy, all call-site migrations, fault-injection and acceptance tests, and first-chunk recommendation. Include THE-515 coordination: it will reuse this repository identity rather than develop another algorithm. No production changes, builds or child agents yet.
