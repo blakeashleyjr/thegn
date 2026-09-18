@@ -185,13 +185,32 @@ fn metadata_target(path: &Path) -> Result<Option<File>, Error> {
     Ok(Some(current))
 }
 
-fn identity(file: &File) -> Result<(u64, u64, u64), Error> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Identity {
+    device: u64,
+    inode: u64,
+    length: u64,
+    mtime_seconds: i64,
+    mtime_nanoseconds: i64,
+    ctime_seconds: i64,
+    ctime_nanoseconds: i64,
+}
+
+fn identity(file: &File) -> Result<Identity, Error> {
     let metadata = file.metadata().map_err(|_| Error::Unavailable)?;
     if !metadata.is_file() {
         return Err(Error::NonRegular);
     }
     local_fs(file)?;
-    Ok((metadata.dev(), metadata.ino(), metadata.len()))
+    Ok(Identity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        length: metadata.len(),
+        mtime_seconds: metadata.mtime(),
+        mtime_nanoseconds: metadata.mtime_nsec(),
+        ctime_seconds: metadata.ctime(),
+        ctime_nanoseconds: metadata.ctime_nsec(),
+    })
 }
 
 fn readable(metadata: &File) -> Result<File, Error> {
@@ -249,11 +268,34 @@ fn read_target(
     Ok(bytes)
 }
 
-pub(super) fn read(path: &Path, limit: usize) -> Result<Option<Vec<u8>>, Error> {
-    match metadata_target(path)? {
-        Some(file) => read_target(file, limit, readable).map(Some),
-        None => Ok(None),
+fn read_path(
+    path: &Path,
+    limit: usize,
+    after_read: impl FnOnce() -> Result<(), Error>,
+) -> Result<Option<Vec<u8>>, Error> {
+    if limit > thegn_core::config_budget::MAX_SOURCE_BYTES {
+        return Err(Error::TooLarge);
     }
+    let Some(metadata) = metadata_target(path)? else {
+        return Ok(None);
+    };
+    let expected = identity(&metadata)?;
+    let bytes = read_target(metadata, limit, readable)?;
+    after_read()?;
+    // Re-open only for an O_PATH observation: data is read through the
+    // already-opened descriptor above. This detects equal-size replacement of
+    // the pathname while preserving the descriptor identity claim.
+    let Some(after) = metadata_target(path)? else {
+        return Err(Error::Changed);
+    };
+    if identity(&after)? != expected {
+        return Err(Error::Changed);
+    }
+    Ok(Some(bytes))
+}
+
+pub(super) fn read(path: &Path, limit: usize) -> Result<Option<Vec<u8>>, Error> {
+    read_path(path, limit, || Ok(()))
 }
 
 #[cfg(test)]

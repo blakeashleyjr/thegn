@@ -10,7 +10,7 @@ fn fixture() -> Option<tempfile::TempDir> {
     let dir = tempfile::Builder::new()
         .prefix("thegn-config-capture-")
         .tempdir_in("/dev/shm")
-        .ok()?;
+        .unwrap_or_else(|error| panic!("Linux config capture fixture setup failed: {error}"));
     let canary = dir.path().join("canary");
     std::fs::write(&canary, b"canary").unwrap();
     match read(&canary, 64) {
@@ -18,7 +18,12 @@ fn fixture() -> Option<tempfile::TempDir> {
             assert_eq!(bytes, b"canary");
             Some(dir)
         }
-        Err(Error::Unavailable) => None,
+        Err(Error::Unavailable) => {
+            eprintln!(
+                "SKIP: Linux config capture fixture cannot exercise the supported /dev/shm tmpfs"
+            );
+            None
+        }
         other => panic!("unexpected config fixture result: {other:?}"),
     }
 }
@@ -68,6 +73,40 @@ fn opened_identity_change_is_rejected_without_path_reread() {
         }),
         Err(Error::Changed)
     );
+}
+
+#[test]
+fn equal_length_mutation_changes_observed_descriptor_time_identity() {
+    let Some(dir) = fixture() else { return };
+    let original = dir.path().join("same-length");
+    std::fs::write(&original, b"one").unwrap();
+    let metadata = metadata_target(&original).unwrap().unwrap();
+    assert_eq!(
+        read_target(metadata, 64, |file| {
+            let readable = readable(file)?;
+            // Keep the same inode and length. Linux mtime/ctime nanoseconds
+            // are the observable mutation evidence; the old identity tuple
+            // (dev, inode, length) incorrectly accepted this.
+            std::fs::write(&original, b"two").unwrap();
+            Ok(readable)
+        }),
+        Err(Error::Changed)
+    );
+}
+
+#[test]
+fn equal_size_path_replacement_is_rejected_after_descriptor_read() {
+    let Some(dir) = fixture() else { return };
+    let original = dir.path().join("original");
+    let replacement = dir.path().join("replacement");
+    std::fs::write(&original, b"one").unwrap();
+    std::fs::write(&replacement, b"two").unwrap();
+    let result = read_path(&original, 64, || {
+        std::fs::rename(&original, dir.path().join("old")).unwrap();
+        std::fs::rename(&replacement, &original).unwrap();
+        Ok(())
+    });
+    assert_eq!(result, Err(Error::Changed));
 }
 
 #[test]

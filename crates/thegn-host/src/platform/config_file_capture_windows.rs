@@ -1,6 +1,5 @@
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::Read;
-use std::os::windows::fs::OpenOptionsExt;
 use std::path::Path;
 
 use crate::config_capture::ConfigFileReadError as Error;
@@ -8,46 +7,56 @@ use crate::config_capture::ConfigFileReadError as Error;
 // Win32 FILE_FLAG_OPEN_REPARSE_POINT: do not traverse a final reparse point
 // while opening the selected source.  Ancestor custody remains the documented
 // stable-namespace assumption, as on the Unix adapters.
-const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
 
-fn identity(metadata: &fs::Metadata) -> Result<(u64, Option<std::time::SystemTime>), Error> {
-    if metadata.file_type().is_symlink() {
-        return Err(Error::Unsupported);
-    }
+// Handle identity and the final path recheck assume a stable, owner-controlled
+// namespace; they do not claim protection from hostile same-UID replacement.
+fn identity(file: &File) -> Result<(u32, u32, u32, u64), Error> {
+    let metadata = file.metadata().map_err(|_| Error::Unavailable)?;
     if !metadata.is_file() {
         return Err(Error::NonRegular);
     }
-    Ok((metadata.len(), metadata.modified().ok()))
+    if crate::platform::handle_file_attributes(file).map_err(|_| Error::Unavailable)?
+        & FILE_ATTRIBUTE_REPARSE_POINT
+        != 0
+    {
+        // Reject every final reparse point. No unreviewed tag is treated as a
+        // regular config-file symlink policy.
+        return Err(Error::Unsupported);
+    }
+    let (volume, high, low) =
+        crate::platform::handle_identity(file).map_err(|_| Error::Unavailable)?;
+    Ok((volume, high, low, metadata.len()))
 }
 
 fn open(path: &Path) -> Result<Option<File>, Error> {
-    let before = match fs::symlink_metadata(path) {
-        Ok(metadata) => Some(identity(&metadata)?),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+    let present = match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => return Err(Error::Unsupported),
+        Ok(metadata) if !metadata.is_file() => return Err(Error::NonRegular),
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
         Err(_) => return Err(Error::Unavailable),
     };
-    let Some(before) = before else {
+    if !present {
         return Ok(None);
-    };
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(path)
-        .map_err(|_| Error::Unavailable)?;
-    if identity(&file.metadata().map_err(|_| Error::Unavailable)?)? != before {
-        return Err(Error::Changed);
     }
-    Ok(Some(file))
+    crate::platform::open_nofollow(path)
+        .map(Some)
+        .map_err(|_| Error::Unavailable)
 }
 
-pub(super) fn read(path: &Path, limit: usize) -> Result<Option<Vec<u8>>, Error> {
+fn read_path(
+    path: &Path,
+    limit: usize,
+    after_read: impl FnOnce() -> Result<(), Error>,
+) -> Result<Option<Vec<u8>>, Error> {
     if limit > thegn_core::config_budget::MAX_SOURCE_BYTES {
         return Err(Error::TooLarge);
     }
     let Some(mut file) = open(path)? else {
         return Ok(None);
     };
-    let expected = identity(&file.metadata().map_err(|_| Error::Unavailable)?)?;
+    let expected = identity(&file)?;
     let mut bytes = Vec::new();
     let mut chunk = [0u8; 8192];
     loop {
@@ -60,15 +69,41 @@ pub(super) fn read(path: &Path, limit: usize) -> Result<Option<Vec<u8>>, Error> 
         }
         bytes.extend_from_slice(&chunk[..count]);
     }
-    if identity(&file.metadata().map_err(|_| Error::Unavailable)?)? != expected {
+    if identity(&file)? != expected {
         return Err(Error::Changed);
     }
-    if let Ok(after) = fs::symlink_metadata(path) {
-        if identity(&after)? != expected {
-            return Err(Error::Changed);
-        }
-    } else {
+    after_read()?;
+    let Some(after) = open(path)? else {
+        return Err(Error::Changed);
+    };
+    if identity(&after)? != expected {
         return Err(Error::Changed);
     }
     Ok(Some(bytes))
+}
+
+pub(super) fn read(path: &Path, limit: usize) -> Result<Option<Vec<u8>>, Error> {
+    read_path(path, limit, || Ok(()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn owned_handle_identity_rejects_equal_size_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = dir.path().join("original");
+        let replacement = dir.path().join("replacement");
+        fs::write(&original, b"one").unwrap();
+        fs::write(&replacement, b"two").unwrap();
+        assert_eq!(
+            read_path(&original, 64, || {
+                fs::rename(&original, dir.path().join("old")).unwrap();
+                fs::rename(&replacement, &original).unwrap();
+                Ok(())
+            }),
+            Err(Error::Changed)
+        );
+    }
 }
