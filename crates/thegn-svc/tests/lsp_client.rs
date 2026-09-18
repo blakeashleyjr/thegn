@@ -5,7 +5,8 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use thegn_svc::lsp::{
-    LspClient, LspError, Position, ServerSpec, SymbolKind, framing::FrameDecoder,
+    LspClient, LspError, Position, ServerSpec, SymbolKind, diagnostics_channel,
+    framing::FrameDecoder,
 };
 
 fn spec_with(args: Vec<String>) -> ServerSpec {
@@ -167,4 +168,22 @@ fn framing_smoke_for_test_helpers() {
         d.next_message().expect("valid frame decodes").as_deref(),
         Some("{\"x\":1}")
     );
+}
+
+#[test]
+fn fake_server_deep_symbol_response_is_dropped_before_value_projection() {
+    let (diagnostics, health) = diagnostics_channel();
+    let root = std::env::temp_dir();
+    let client = LspClient::start(
+        &spec_with(vec!["--deep-symbols".to_string()]),
+        &root,
+        diagnostics,
+    )
+    .expect("spawn fake server");
+    client.initialize(&root).expect("initialize");
+    let err = client
+        .document_symbols("file:///proj/src/lib.rs")
+        .expect_err("over-depth response must not be projected");
+    assert_eq!(err, LspError::Timeout);
+    assert!(health.health().invalid >= 1);
 }

@@ -2364,8 +2364,9 @@ fn spawn_outline_fetch(
     file: String,
     root: std::path::PathBuf,
     lsp: std::sync::Arc<crate::lsp::LspInner>,
-    tx: tokio_mpsc::UnboundedSender<SymbolsFetch>,
+    tx: tokio_mpsc::Sender<SymbolsFetch>,
     waker: TerminalWaker,
+    busy: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) {
     use thegn_core::semantic::Lang;
     tokio::task::spawn_blocking(move || {
@@ -2382,7 +2383,9 @@ fn spawn_outline_fetch(
         } else {
             Vec::new()
         };
-        let _ = tx.send(SymbolsFetch::Outline { file, rows }); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
+        if tx.try_send(SymbolsFetch::Outline { file, rows }).is_err() {
+            busy.store(false, std::sync::atomic::Ordering::Release);
+        } // best-effort: bounded replaceable result; a full queue drops stale work
         let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
     });
 }
@@ -2398,8 +2401,9 @@ fn spawn_refs_fetch(
     label: String,
     root: std::path::PathBuf,
     lsp: std::sync::Arc<crate::lsp::LspInner>,
-    tx: tokio_mpsc::UnboundedSender<SymbolsFetch>,
+    tx: tokio_mpsc::Sender<SymbolsFetch>,
     waker: TerminalWaker,
+    busy: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) {
     tokio::task::spawn_blocking(move || {
         let mut rows = Vec::new();
@@ -2435,7 +2439,9 @@ fn spawn_refs_fetch(
                     .collect();
             }
         }
-        let _ = tx.send(SymbolsFetch::Refs { label, rows }); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
+        if tx.try_send(SymbolsFetch::Refs { label, rows }).is_err() {
+            busy.store(false, std::sync::atomic::Ordering::Release);
+        } // best-effort: bounded replaceable result; a full queue drops stale work
         let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
     });
 }
@@ -2451,8 +2457,9 @@ fn spawn_hover_fetch(
     label: String,
     root: std::path::PathBuf,
     lsp: std::sync::Arc<crate::lsp::LspInner>,
-    tx: tokio_mpsc::UnboundedSender<crate::hover::HoverPopup>,
+    tx: tokio_mpsc::Sender<crate::hover::HoverPopup>,
     waker: TerminalWaker,
+    busy: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) {
     tokio::task::spawn_blocking(move || {
         let mut hover_md: Option<String> = None;
@@ -2485,7 +2492,9 @@ fn spawn_hover_fetch(
         }
         let popup =
             crate::hover::HoverPopup::build(&label, hover_md.as_deref(), &signatures, &actions);
-        let _ = tx.send(popup); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
+        if tx.try_send(popup).is_err() {
+            busy.store(false, std::sync::atomic::Ordering::Release);
+        } // best-effort: bounded replaceable result; a full queue drops stale work
         let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
     });
 }
@@ -6635,15 +6644,15 @@ async fn event_loop<T: Terminal>(
     // the waker (svc has no waker). `lsp_diags` persists them across model swaps.
     let mut lsp_supervisor = crate::lsp::LspSupervisor::from_config(keymap.config());
     let mut lsp_diags = crate::lsp::LspDiagnostics::new();
-    let (lsp_diag_tx, mut lsp_diag_rx) =
-        tokio_mpsc::unbounded_channel::<thegn_svc::lsp::PublishedDiagnostics>();
-    if let Some(raw_rx) = lsp_supervisor.take_diagnostics_rx() {
+    let mut lsp_diag_rx = lsp_supervisor
+        .take_diagnostics_rx()
+        .expect("LSP diagnostics receiver is installed once at startup");
+    {
+        let wake_rx = lsp_diag_rx.clone();
         let bridge_waker = waker.clone();
         std::thread::spawn(move || {
-            while let Ok(pd) = raw_rx.recv() {
-                if lsp_diag_tx.send(pd).is_err() {
-                    break;
-                }
+            loop {
+                wake_rx.wait();
                 let _ = bridge_waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
             }
         });
@@ -6663,16 +6672,23 @@ async fn event_loop<T: Terminal>(
     // Symbols section: the fetched outline / references, cached host-side so they
     // survive model-hydration swaps. The displayed list is derived each frame
     // from the active view (outline vs references) — see the pre-render block.
-    let (outline_tx, mut outline_rx) = tokio_mpsc::unbounded_channel::<SymbolsFetch>();
+    // Result queues are bounded by projection capacity as well as count: one
+    // symbol/reference result is capped at 1 MiB, so eight pending results stay
+    // within the same order of budget as the diagnostics queue.
+    let (outline_tx, mut outline_rx) = tokio_mpsc::channel::<SymbolsFetch>(8);
     let mut outline_file = String::new();
     let mut outline_syms: Vec<crate::panel::SymbolRow> = Vec::new();
     let mut outline_inflight: Option<String> = None;
+    let outline_busy = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut refs_label = String::new();
     let mut refs_rows: Vec<crate::panel::SymbolRow> = Vec::new();
     let mut refs_inflight = false;
+    let refs_busy = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     // The hover/signature/code-action preview overlay (item 532): built off-loop
     // from the language server, dismissed by any key.
-    let (hover_tx, mut hover_rx) = tokio_mpsc::unbounded_channel::<crate::hover::HoverPopup>();
+    let (hover_tx, mut hover_rx) = tokio_mpsc::channel::<crate::hover::HoverPopup>(32);
+    let mut hover_inflight = false;
+    let hover_busy = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     let (logs_tx, mut logs_rx) =
         tokio_mpsc::unbounded_channel::<Vec<thegn_core::log::parser::ParsedLog>>();
@@ -9255,12 +9271,34 @@ async fn event_loop<T: Terminal>(
         // server in another workspace never bleeds into this panel.
         {
             let mut got = false;
-            while let Ok(pd) = lsp_diag_rx.try_recv() {
+            let mut publications = 0usize;
+            let mut publication_bytes = 0usize;
+            let drain_started = std::time::Instant::now();
+            while pending_input.is_empty()
+                && publications < 8
+                && publication_bytes < thegn_svc::lsp::limits::MAX_DIAGNOSTIC_BYTES
+                && drain_started.elapsed() < std::time::Duration::from_millis(2)
+            {
+                let Ok(pd) = lsp_diag_rx.try_recv() else {
+                    break;
+                };
                 loop_perf.tick(crate::perf::WakeSource::Lsp);
+                publication_bytes = publication_bytes
+                    .saturating_add(thegn_svc::lsp::published_diagnostics_bytes(&pd));
+                publications += 1;
                 lsp_diags.apply(pd);
                 got = true;
             }
-            if got {
+            if publications >= 8
+                || publication_bytes >= thegn_svc::lsp::limits::MAX_DIAGNOSTIC_BYTES
+                || drain_started.elapsed() >= std::time::Duration::from_millis(2)
+            {
+                lsp_diag_rx.rearm_if_pending();
+            }
+            let health = lsp_diag_rx.take_health();
+            lsp_diags.mark_incomplete(lsp_diag_rx.take_incomplete());
+            lsp_diags.record_health(health);
+            if got || health.has_findings() {
                 lsp_diags.merge_into(&active_tab_path(&session), &mut model.panel.diagnostics);
                 dirty = true;
             }
@@ -12380,6 +12418,7 @@ async fn event_loop<T: Terminal>(
             loop_perf.tick(crate::perf::WakeSource::Outline);
             match msg {
                 SymbolsFetch::Outline { file, rows } => {
+                    outline_busy.store(false, std::sync::atomic::Ordering::Release);
                     if outline_inflight.as_deref() == Some(file.as_str()) {
                         outline_inflight = None;
                     }
@@ -12387,6 +12426,7 @@ async fn event_loop<T: Terminal>(
                     outline_syms = rows;
                 }
                 SymbolsFetch::Refs { label, rows } => {
+                    refs_busy.store(false, std::sync::atomic::Ordering::Release);
                     refs_inflight = false;
                     refs_label = label;
                     refs_rows = rows;
@@ -12396,6 +12436,8 @@ async fn event_loop<T: Terminal>(
         }
         // Hover preview: a completed fetch pops the overlay open.
         while let Ok(popup) = hover_rx.try_recv() {
+            hover_busy.store(false, std::sync::atomic::Ordering::Release);
+            hover_inflight = false;
             loop_perf.tick(crate::perf::WakeSource::Hover);
             hover_popup = Some(popup);
             dirty = true;
@@ -12422,15 +12464,18 @@ async fn event_loop<T: Terminal>(
                     .map(|c| c.path.clone());
                 if let Some(target) = &target
                     && *target != outline_file
-                    && outline_inflight.as_deref() != Some(target.as_str())
+                    && (outline_inflight.as_deref() != Some(target.as_str())
+                        || !outline_busy.load(std::sync::atomic::Ordering::Acquire))
                 {
                     outline_inflight = Some(target.clone());
+                    outline_busy.store(true, std::sync::atomic::Ordering::Release);
                     spawn_outline_fetch(
                         target.clone(),
                         active_tab_path(&session),
                         lsp_supervisor.handle(),
                         outline_tx.clone(),
                         waker.clone(),
+                        outline_busy.clone(),
                     );
                 }
                 if model.panel.symbols != outline_syms || model.panel.symbols_file != outline_file {
@@ -20004,9 +20049,11 @@ async fn event_loop<T: Terminal>(
                             if !panel_ui.symbols_show_refs
                                 && let Some(s) =
                                     model.panel.symbols.get(panel_ui.symbols_cursor).cloned()
-                                && !refs_inflight
+                                && (!refs_inflight
+                                    || !refs_busy.load(std::sync::atomic::Ordering::Acquire))
                             {
                                 refs_inflight = true;
+                                refs_busy.store(true, std::sync::atomic::Ordering::Release);
                                 refs_label = s.name.clone();
                                 refs_rows.clear();
                                 panel_ui.symbols_show_refs = true;
@@ -20022,6 +20069,7 @@ async fn event_loop<T: Terminal>(
                                     lsp_supervisor.handle(),
                                     outline_tx.clone(),
                                     waker.clone(),
+                                    refs_busy.clone(),
                                 );
                             }
                             true
@@ -20033,10 +20081,14 @@ async fn event_loop<T: Terminal>(
                             true
                         }
                         (Section::Symbols, KeyCode::Char('h')) => {
-                            if current_config.lsp.hover
+                            if (!hover_inflight
+                                || !hover_busy.load(std::sync::atomic::Ordering::Acquire))
+                                && current_config.lsp.hover
                                 && let Some(s) =
                                     model.panel.symbols.get(panel_ui.symbols_cursor).cloned()
                             {
+                                hover_inflight = true;
+                                hover_busy.store(true, std::sync::atomic::Ordering::Release);
                                 model.status = format!("Hover: {}…", s.name);
                                 spawn_hover_fetch(
                                     s.file,
@@ -20047,6 +20099,7 @@ async fn event_loop<T: Terminal>(
                                     lsp_supervisor.handle(),
                                     hover_tx.clone(),
                                     waker.clone(),
+                                    hover_busy.clone(),
                                 );
                             }
                             true
