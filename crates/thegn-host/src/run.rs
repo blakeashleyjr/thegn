@@ -8574,7 +8574,9 @@ async fn event_loop<T: Terminal>(
                 &waker,
             );
             // Pre-warm sibling tabs so first focus of a neighbor is instant.
-            for (name, wt, ti, missing, is_terminal) in prewarm_requests(&panes, &mut session) {
+            for (name, wt, ti, missing, target_leaves, is_terminal) in
+                prewarm_requests(&panes, &mut session)
+            {
                 let key = (name.clone(), ti);
                 if prewarm_inflight.contains(&key)
                     || prewarm_failed.contains(&key)
@@ -8601,89 +8603,79 @@ async fn event_loop<T: Terminal>(
                     // THE-84: the primary missing leaf — captured before the
                     // resolve below moves `missing` into the batch.
                     let first_leaf = missing.first().copied();
-                    let mut specs = if is_terminal {
-                        // This session's wizard choice wins over the DB row (a
-                        // failed best-effort persist must not change the spawn).
-                        let (conn, sandbox) = crate::handlers::terminal::live_choice(&name)
-                            .unwrap_or_else(|| terminal_launch_for(&name));
-                        crate::panes::terminal_launch_spec(&cfg, &conn, &sandbox)
-                            .map(|spec| missing.into_iter().map(|id| (id, spec.clone())).collect())
-                            .map_err(spec_err)
-                    } else if let Some(halt) = crate::agent::env_halt_reason(&cfg, &wt) {
-                        // Non-local env, failover off, known-down (token unset /
-                        // exec cooldown): halt rather than degrade to host.
-                        Err(SpecError::Halt(halt))
-                    } else if crate::agent::provision_pending(&cfg, &wt)
-                        || crate::host_flow::host_pending(&cfg, &wt)
-                    {
-                        // Provider env not provisioned yet (sandbox missing, or
-                        // bare — no provision marker): `launch_spec` would
-                        // ensure_exists a BARE sprite and attach a premature raw
-                        // shell. Benign skip; the focused materialize provisions
-                        // (with the loading splash) and opens it.
-                        Err(SpecError::PrewarmSkipped)
-                    } else {
-                        crate::direnv_warm::launch_spec_synced_with(
-                            &cfg,
-                            &wt,
-                            None,
-                            "shell",
-                            crate::agent::LaunchExtras {
-                                suppress_agent_record: true,
-                                ..Default::default()
-                            },
-                        )
-                        .map(|spec| missing.into_iter().map(|id| (id, spec.clone())).collect())
-                        .map_err(spec_err)
-                    };
-                    // Refuse an initial host spec at the prewarm boundary
-                    // before any remembered-agent replacement can run.
-                    crate::agent::reject_host_prewarm(&mut specs);
-                    // Attach-on-open (THE-85): the same probe the materialize
-                    // worker makes — list this worktree's live daemon agent
-                    // sessions (connect-only; any failure → empty) so a
-                    // prewarmed tab opens onto its running agent too. Skipped
-                    // for terminal groups; `shown` is re-deduped on the drain.
-                    // Automatic prewarm is allowed to reattach an already-live
-                    // daemon session even when its fresh sibling spec was
-                    // refused as host execution. Attachment is not a new host
-                    // process and must not be coupled to spec resolution.
-                    let attach = if !is_terminal && crate::handlers::startup::daemon_active(&cfg) {
-                        rt.block_on(crate::handlers::worktree_attach::probe(
-                            &cfg.daemon,
-                            &wt,
-                            Vec::new(),
-                        ))
-                    } else {
-                        Vec::new()
-                    };
-                    // THE-84: a resurrected tab with no live daemon session
-                    // relaunches the worktree's remembered agent as the first
-                    // missing leaf's process — the same fold the materialize
-                    // worker applies (resume-aware, record-preserving; see
-                    // `handlers::worktree_launch`). Terminal groups host no
-                    // agent sessions; a live session still wins; a prewarm is
-                    // never a split gesture.
-                    if !is_terminal {
-                        crate::handlers::worktree_launch::apply_relaunch(
-                            &mut specs,
-                            &cfg,
-                            &wt,
-                            first_leaf,
-                            attach.is_empty(),
-                            false,
-                        );
-                    }
-                    // Apply this after remembered-agent replacement as well as
-                    // to the initial shell spec: a remembered agent must not
-                    // reintroduce a bare host login shell into automatic
-                    // sibling/tab prewarm.
-                    crate::agent::reject_host_prewarm(&mut specs);
+                    let (specs, attach) = crate::handlers::prewarm::resolve_automatic_with(
+                        first_leaf,
+                        || {
+                            if is_terminal {
+                                // This session's wizard choice wins over the DB row (a
+                                // failed best-effort persist must not change the spawn).
+                                let (conn, sandbox) = crate::handlers::terminal::live_choice(&name)
+                                    .unwrap_or_else(|| terminal_launch_for(&name));
+                                crate::panes::terminal_launch_spec(&cfg, &conn, &sandbox)
+                                    .map(|spec| {
+                                        missing.iter().map(|id| (*id, spec.clone())).collect()
+                                    })
+                                    .map_err(spec_err)
+                            } else if let Some(halt) = crate::agent::env_halt_reason(&cfg, &wt) {
+                                // Non-local env, failover off, known-down (token unset /
+                                // exec cooldown): halt rather than degrade to host.
+                                Err(SpecError::Halt(halt))
+                            } else if crate::agent::provision_pending(&cfg, &wt)
+                                || crate::host_flow::host_pending(&cfg, &wt)
+                            {
+                                // Provider env not provisioned yet (sandbox missing, or
+                                // bare — no provision marker): `launch_spec` would
+                                // ensure_exists a BARE sprite and attach a premature raw
+                                // shell. Benign skip; the focused materialize provisions
+                                // (with the loading splash) and opens it.
+                                Err(SpecError::PrewarmSkipped)
+                            } else {
+                                crate::direnv_warm::launch_spec_synced_with(
+                                    &cfg,
+                                    &wt,
+                                    None,
+                                    "shell",
+                                    crate::agent::LaunchExtras {
+                                        suppress_agent_record: true,
+                                        ..Default::default()
+                                    },
+                                )
+                                .map(|spec| missing.iter().map(|id| (*id, spec.clone())).collect())
+                                .map_err(spec_err)
+                            }
+                        },
+                        || {
+                            // Connect-only attach: this can adopt an already-live
+                            // daemon session but never creates a host pane.
+                            if !is_terminal && crate::handlers::startup::daemon_active(&cfg) {
+                                rt.block_on(crate::handlers::worktree_attach::probe(
+                                    &cfg.daemon,
+                                    &wt,
+                                    Vec::new(),
+                                ))
+                            } else {
+                                Vec::new()
+                            }
+                        },
+                        |specs, first_leaf, attach_is_empty| {
+                            if !is_terminal {
+                                crate::handlers::worktree_launch::apply_relaunch(
+                                    specs,
+                                    &cfg,
+                                    &wt,
+                                    first_leaf,
+                                    attach_is_empty,
+                                    false,
+                                );
+                            }
+                        },
+                    );
                     if tx
                         .send(SpecBatch {
                             group: name,
                             worktree: wt,
                             tab: ti,
+                            target_leaves,
                             origin: SpecOrigin::Prewarm,
                             specs,
                             attach,
@@ -8827,6 +8819,7 @@ async fn event_loop<T: Terminal>(
             // sandbox bring-up phases into the splash). Out-of-band vanished
             // worktrees are reconciled by the worker-backed refresh path below.
             let missing = panes.missing_leaves(&session.worktrees[session.active].tabs[ti]);
+            let target_leaves = session.worktrees[session.active].tabs[ti].center.pane_ids();
             let quiet = panes.tab_has_live_pane(&session.worktrees[session.active].tabs[ti]);
             // Seed the splash for THIS worktree's effective backend, not the
             // global default: `path`/`name` are the active group, so
@@ -8859,6 +8852,7 @@ async fn event_loop<T: Terminal>(
                     rt: tokio::runtime::Handle::current(),
                 },
                 missing,
+                target_leaves,
                 &name,
                 &path,
                 ti,

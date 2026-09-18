@@ -149,24 +149,32 @@ fn automatic_prewarm_rejects_host_reintroduced_by_remembered_agent_relaunch() {
         // agent fold that can replace its first leaf with a host spec. The
         // second guard must inspect the post-relaunch batch, not only the
         // result that existed before resurrection.
-        let mut specs = Ok(vec![(
-            7,
-            LaunchSpec {
-                argv: vec!["fake-contained-shell".into()],
-                cwd: None,
-                env: Vec::new(),
-                backend: "bwrap".into(),
-                warnings: Vec::new(),
-                degraded: false,
-            },
-        )]);
-        crate::handlers::worktree_launch::apply_relaunch(
-            &mut specs,
-            &cfg,
-            &wt,
+        let (specs, _) = crate::handlers::prewarm::resolve_automatic_with(
             Some(7),
-            true,
-            false,
+            || {
+                Ok(vec![(
+                    7,
+                    LaunchSpec {
+                        argv: vec!["fake-contained-shell".into()],
+                        cwd: None,
+                        env: Vec::new(),
+                        backend: "bwrap".into(),
+                        warnings: Vec::new(),
+                        degraded: false,
+                    },
+                )])
+            },
+            || Vec::<crate::handlers::worktree_attach::AttachTarget>::new(),
+            |specs, first_leaf, attach_is_empty| {
+                crate::handlers::worktree_launch::apply_relaunch(
+                    specs,
+                    &cfg,
+                    &wt,
+                    first_leaf,
+                    attach_is_empty,
+                    false,
+                );
+            },
         );
         assert!(
             specs.as_ref().ok().expect("resolved launch specs")[0]
@@ -183,11 +191,32 @@ fn automatic_prewarm_rejects_host_reintroduced_by_remembered_agent_relaunch() {
             "host"
         );
 
-        reject_host_prewarm(&mut specs);
         assert!(matches!(
             specs,
             Err(crate::handlers::provision::SpecError::PrewarmSkipped)
         ));
+    });
+}
+
+/// Positive control: a focused user launch may still choose the host backend;
+/// only the automatic prewarm route applies the host rejection policy.
+#[test]
+fn focused_host_launch_remains_an_explicit_positive_control() {
+    with_temp_state("focused-host-positive", || {
+        let mut cfg = cfg_with(&[], &[]);
+        cfg.sandbox.enabled = false;
+        cfg.sandbox.backend = thegn_core::config::SandboxBackend::None;
+        let worktree =
+            std::env::temp_dir().join(format!("tg-focused-host-positive-{}", std::process::id()));
+        let spec = crate::direnv_warm::launch_spec_synced_with(
+            &cfg,
+            &worktree.to_string_lossy(),
+            None,
+            "shell",
+            LaunchExtras::default(),
+        )
+        .expect("an explicit focused host launch remains available");
+        assert_eq!(spec.backend, "host");
     });
 }
 
@@ -252,34 +281,37 @@ fn automatic_prewarm_drains_host_result_without_spawning_or_evaluating() {
         db.set_worktree_agent(&wt, "remembered").unwrap();
         drop(db);
 
-        // Resolve through the same launch builder used by the automatic
-        // prewarm worker, then apply the remembered-agent fold that previously
-        // reintroduced a host spec after the first rejection guard.
-        let mut specs = crate::direnv_warm::launch_spec_synced_with(
-            &cfg,
-            &wt,
-            None,
-            "shell",
-            LaunchExtras {
-                suppress_agent_record: true,
-                ..Default::default()
-            },
-        )
-        .map(|spec| vec![(7, spec)])
-        .map_err(crate::handlers::provision::spec_err);
-        assert_eq!(
-            specs.as_ref().ok().expect("resolved launch specs")[0]
-                .1
-                .backend,
-            "host"
-        );
-        crate::handlers::worktree_launch::apply_relaunch(
-            &mut specs,
-            &cfg,
-            &wt,
+        // Resolve through the same automatic-prewarm helper used by the real
+        // worker. The fake evaluator executables and hostile files provide the
+        // external evidence; this test does not manufacture a skip with a
+        // separate reject call.
+        let (specs, _) = crate::handlers::prewarm::resolve_automatic_with(
             Some(7),
-            true,
-            false,
+            || {
+                crate::direnv_warm::launch_spec_synced_with(
+                    &cfg,
+                    &wt,
+                    None,
+                    "shell",
+                    LaunchExtras {
+                        suppress_agent_record: true,
+                        ..Default::default()
+                    },
+                )
+                .map(|spec| vec![(7, spec)])
+                .map_err(crate::handlers::provision::spec_err)
+            },
+            || Vec::<crate::handlers::worktree_attach::AttachTarget>::new(),
+            |specs, first_leaf, attach_is_empty| {
+                crate::handlers::worktree_launch::apply_relaunch(
+                    specs,
+                    &cfg,
+                    &wt,
+                    first_leaf,
+                    attach_is_empty,
+                    false,
+                );
+            },
         );
         assert_eq!(
             specs.as_ref().ok().expect("resolved launch specs")[0]
@@ -287,7 +319,6 @@ fn automatic_prewarm_drains_host_result_without_spawning_or_evaluating() {
                 .backend,
             "host"
         );
-        reject_host_prewarm(&mut specs);
         assert!(matches!(
             specs,
             Err(crate::handlers::provision::SpecError::PrewarmSkipped)
@@ -326,6 +357,7 @@ fn automatic_prewarm_drains_host_result_without_spawning_or_evaluating() {
                 group: "app/wt".into(),
                 worktree: wt,
                 tab: 0,
+                target_leaves: vec![7],
                 origin: crate::loading::SpecOrigin::Prewarm,
                 specs,
                 attach: Vec::new(),

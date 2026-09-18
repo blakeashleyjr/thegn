@@ -27,6 +27,7 @@ pub(crate) mod paste_image;
 pub(crate) mod plugins;
 pub(crate) mod pr_queue;
 pub(crate) mod prefetch_policy;
+pub(crate) mod prewarm;
 pub(crate) mod provision;
 pub(crate) mod repo_trust;
 pub(crate) mod ring;
