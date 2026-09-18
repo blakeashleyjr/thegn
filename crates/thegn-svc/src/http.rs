@@ -308,8 +308,7 @@ fn addresses_allowed(addresses: &[SocketAddr], allow_private_network: bool) -> b
 
 fn public_ipv4(ip: Ipv4Addr) -> bool {
     let [a, b, c, d] = ip.octets();
-    a >= 1
-        && a < 224
+    (1..224).contains(&a)
         && !in_ipv4_prefix(ip, [10, 0, 0, 0], 8)
         && !in_ipv4_prefix(ip, [100, 64, 0, 0], 10) // shared address space
         && !in_ipv4_prefix(ip, [127, 0, 0, 0], 8)
