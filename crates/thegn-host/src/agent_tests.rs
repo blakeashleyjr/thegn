@@ -2281,9 +2281,7 @@ fn permissioned_launch_is_command_scoped_and_never_touches_the_repository() {
         std::fs::create_dir_all(outside.join("claude-dir")).unwrap();
 
         let git = |dir: &Path, args: &[&str]| -> Vec<u8> {
-            let out = std::process::Command::new("git")
-                .arg("-C")
-                .arg(dir)
+            let out = thegn_core::util::git_cmd(dir)
                 .args([
                     "-c",
                     "commit.gpgsign=false",
