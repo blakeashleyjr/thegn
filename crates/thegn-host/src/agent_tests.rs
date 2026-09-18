@@ -133,7 +133,7 @@ fn automatic_prewarm_rejects_host_specs_but_keeps_contained_specs() {
 #[test]
 fn automatic_prewarm_rejects_host_reintroduced_by_remembered_agent_relaunch() {
     with_temp_state("prewarm-relaunch-host", || {
-        let mut cfg = cfg_with(&[("claude", "claude")], &[]);
+        let mut cfg = cfg_with(&[("remembered", "remembered-agent")], &[]);
         cfg.sandbox.backend = thegn_core::config::SandboxBackend::Auto;
         cfg.sandbox.backend_chain = vec!["host".to_string()];
         let worktree =
@@ -142,7 +142,7 @@ fn automatic_prewarm_rejects_host_reintroduced_by_remembered_agent_relaunch() {
         let db = thegn_core::db::Db::open().unwrap();
         db.put_worktree("app/wt", "/x/app", &wt, "tg/wt", None, None)
             .unwrap();
-        db.set_worktree_agent(&wt, "claude").unwrap();
+        db.set_worktree_agent(&wt, "remembered").unwrap();
         drop(db);
 
         // Model the first guard's contained resolution, then the remembered
@@ -174,21 +174,21 @@ fn automatic_prewarm_rejects_host_reintroduced_by_remembered_agent_relaunch() {
                     attach_is_empty,
                     false,
                 );
+                assert!(
+                    specs.as_ref().ok().expect("resolved launch specs")[0]
+                        .1
+                        .argv
+                        .join(" ")
+                        .contains("remembered-agent"),
+                    "the real prewarm batch includes the remembered-agent substitution"
+                );
+                assert_eq!(
+                    specs.as_ref().ok().expect("resolved launch specs")[0]
+                        .1
+                        .backend,
+                    "host"
+                );
             },
-        );
-        assert!(
-            specs.as_ref().ok().expect("resolved launch specs")[0]
-                .1
-                .argv
-                .join(" ")
-                .contains("remembered-agent"),
-            "the real prewarm batch includes the remembered-agent substitution"
-        );
-        assert_eq!(
-            specs.as_ref().ok().expect("resolved launch specs")[0]
-                .1
-                .backend,
-            "host"
         );
 
         assert!(matches!(
@@ -257,6 +257,21 @@ fn automatic_prewarm_drains_host_result_without_spawning_or_evaluating() {
         script(&fake_shell, &shell_ran);
         script(&fake_bin.join("direnv"), &direnv_ran);
         script(&fake_bin.join("nix"), &nix_ran);
+        // Positive controls prove the same executable sentinels can fire.
+        for (program, marker) in [
+            (&fake_shell, &shell_ran),
+            (&fake_bin.join("direnv"), &direnv_ran),
+            (&fake_bin.join("nix"), &nix_ran),
+        ] {
+            assert!(
+                std::process::Command::new(program)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            assert!(marker.exists());
+            std::fs::remove_file(marker).unwrap();
+        }
 
         let old_shell = std::env::var_os("SHELL");
         let old_path = std::env::var_os("PATH");
@@ -298,7 +313,10 @@ fn automatic_prewarm_drains_host_result_without_spawning_or_evaluating() {
                         ..Default::default()
                     },
                 )
-                .map(|spec| vec![(7, spec)])
+                .map(|spec| {
+                    assert_eq!(spec.backend, "host", "fixture starts with a host result");
+                    vec![(7, spec)]
+                })
                 .map_err(crate::handlers::provision::spec_err)
             },
             || Vec::<crate::handlers::worktree_attach::AttachTarget>::new(),
@@ -312,12 +330,6 @@ fn automatic_prewarm_drains_host_result_without_spawning_or_evaluating() {
                     false,
                 );
             },
-        );
-        assert_eq!(
-            specs.as_ref().ok().expect("resolved launch specs")[0]
-                .1
-                .backend,
-            "host"
         );
         assert!(matches!(
             specs,

@@ -463,6 +463,32 @@ pub(crate) fn drain_specs(
                 target_leaves.iter().any(|id| leaves.contains(id))
             });
         if !target_matches {
+            // A close shifts inflight keys along with the surviving tab. Settle
+            // this request at its current index only when its captured leaves
+            // identify exactly one surviving tab; never clear the replacement
+            // at the old numeric index or guess between ambiguous targets.
+            let mut matching =
+                ctx.session.worktrees[gi]
+                    .tabs
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, tab)| {
+                        let leaves = tab.center.pane_ids();
+                        target_leaves.iter().any(|id| leaves.contains(id))
+                    });
+            if let Some((current_index, _)) = matching.next()
+                && matching.next().is_none()
+            {
+                let captured_key = (name.clone(), current_index);
+                match origin {
+                    SpecOrigin::Materialize => {
+                        ctx.materialize_inflight.remove(&captured_key);
+                    }
+                    SpecOrigin::Prewarm => {
+                        ctx.prewarm_inflight.remove(&captured_key);
+                    }
+                }
+            }
             tracing::debug!(
                 target: "thegn::startup",
                 group = %name, tab = ti,
@@ -1112,7 +1138,8 @@ mod tests {
         let mut materialize_inflight = std::collections::HashSet::new();
         // Model a replacement request that owns the shifted index. A late
         // result for the closed tab must not settle this newer reservation.
-        let mut prewarm_inflight = std::collections::HashSet::from([("app/home".into(), 1)]);
+        let mut prewarm_inflight =
+            std::collections::HashSet::from([("app/home".into(), 0), ("app/home".into(), 1)]);
         let mut materialize_failed = std::collections::HashSet::new();
         let mut prewarm_failed = std::collections::HashSet::new();
         let mut halt_dismissed = std::collections::HashSet::new();
@@ -1179,6 +1206,10 @@ mod tests {
         assert!(
             prewarm_inflight.contains(&("app/home".into(), 1)),
             "a stale result must not settle the replacement tab's reservation"
+        );
+        assert!(
+            !prewarm_inflight.contains(&("app/home".into(), 0)),
+            "the captured tab's shifted reservation is settled"
         );
         assert!(!need_relayout, "a dropped batch does not change geometry");
         assert!(!dirty, "a dropped batch does not dirty the frame");
