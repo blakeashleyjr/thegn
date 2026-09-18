@@ -10,11 +10,10 @@ use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::io;
-use std::sync::{Arc, Mutex};
 
 use sha2::{Digest, Sha256};
 
-use crate::config::{Config, EnvSource};
+use crate::config::{Config, EnvSource, PathExpansionContext};
 use crate::config_budget;
 use crate::config_validate::{self, SemanticMode};
 use crate::host_definition_snapshot::HostDefinitionsSnapshot;
@@ -104,6 +103,7 @@ pub struct AdmissionInputs<'a> {
     pub env: &'a dyn EnvSource,
     pub overrides: &'a [String],
     pub hosts: &'a HostDefinitionsSnapshot,
+    pub paths: &'a PathExpansionContext,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -190,6 +190,7 @@ pub struct SourceIdentities {
     environment_digest: [u8; 32],
     overrides_digest: [u8; 32],
     host_digest: [u8; 32],
+    path_context_digest: [u8; 32],
 }
 
 impl fmt::Debug for SourceIdentities {
@@ -200,6 +201,7 @@ impl fmt::Debug for SourceIdentities {
             .field("environment_digest", &"<redacted>")
             .field("overrides_digest", &"<redacted>")
             .field("host_digest", &"<redacted>")
+            .field("path_context_digest", &"<redacted>")
             .finish()
     }
 }
@@ -322,170 +324,6 @@ impl AdmittedConfig {
     pub fn health(&self) -> AdmissionHealth {
         self.health
     }
-
-    fn with_generation(mut self, generation: u64) -> Self {
-        self.revision.generation = generation;
-        self
-    }
-}
-
-#[derive(Default)]
-pub struct AdmissionStore {
-    current: Mutex<Option<Arc<AdmittedConfig>>>,
-    health: Mutex<StoreHealth>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StoreHealth {
-    Empty,
-    Healthy,
-    ReloadFailed,
-}
-
-impl Default for StoreHealth {
-    fn default() -> Self {
-        Self::Empty
-    }
-}
-
-impl AdmissionStore {
-    pub fn new(initial: AdmittedConfig) -> Self {
-        Self {
-            current: Mutex::new(Some(Arc::new(initial.with_generation(1)))),
-            health: Mutex::new(StoreHealth::Healthy),
-        }
-    }
-
-    pub fn current(&self) -> Option<Arc<AdmittedConfig>> {
-        self.current.lock().ok().and_then(|current| current.clone())
-    }
-
-    pub fn health(&self) -> StoreHealth {
-        self.health
-            .lock()
-            .map(|health| *health)
-            .unwrap_or(StoreHealth::ReloadFailed)
-    }
-
-    /// Record a failed reload without replacing the last authenticated
-    /// snapshot.  `require_current` refuses authority use while degraded.
-    pub fn record_reload_failure(&self) {
-        if let Ok(mut health) = self.health.lock() {
-            *health = StoreHealth::ReloadFailed;
-        }
-    }
-
-    pub fn publish(
-        &self,
-        candidate: AdmittedConfig,
-        expected_generation: u64,
-    ) -> Result<Arc<AdmittedConfig>, StaleConfigError> {
-        let mut current = self.current.lock().map_err(|_| StaleConfigError {
-            expected_generation,
-            observed_generation: None,
-            reason: StaleConfigReason::Poisoned,
-        })?;
-        let observed = current.as_ref().map(|config| config.revision.generation);
-        if observed != Some(expected_generation)
-            && !(observed.is_none() && expected_generation == 0)
-        {
-            return Err(StaleConfigError {
-                expected_generation,
-                observed_generation: observed,
-                reason: if observed.is_none() {
-                    StaleConfigReason::NoSnapshot
-                } else {
-                    StaleConfigReason::GenerationMismatch
-                },
-            });
-        }
-        let generation = if observed.is_none() {
-            1
-        } else {
-            expected_generation.checked_add(1).ok_or(StaleConfigError {
-                expected_generation,
-                observed_generation: observed,
-                reason: StaleConfigReason::GenerationExhausted,
-            })?
-        };
-        let admitted = Arc::new(candidate.with_generation(generation));
-        *current = Some(admitted.clone());
-        if let Ok(mut health) = self.health.lock() {
-            *health = StoreHealth::Healthy;
-        }
-        Ok(admitted)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StaleConfigReason {
-    NoSnapshot,
-    GenerationMismatch,
-    GenerationExhausted,
-    Poisoned,
-    ReloadFailed,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StaleConfigError {
-    pub expected_generation: u64,
-    pub observed_generation: Option<u64>,
-    pub reason: StaleConfigReason,
-}
-
-impl fmt::Display for StaleConfigError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "configuration generation {} is unavailable ({:?}; current {:?})",
-            self.expected_generation, self.reason, self.observed_generation
-        )
-    }
-}
-
-impl std::error::Error for StaleConfigError {}
-
-pub struct RevisionGuard {
-    revision: ConfigRevision,
-}
-
-impl RevisionGuard {
-    pub fn revision(&self) -> &ConfigRevision {
-        &self.revision
-    }
-}
-
-pub fn require_current(
-    expected: &ConfigRevision,
-    current: &AdmissionStore,
-) -> Result<RevisionGuard, StaleConfigError> {
-    if current.health() == StoreHealth::ReloadFailed {
-        return Err(StaleConfigError {
-            expected_generation: expected.generation,
-            observed_generation: current.current().map(|value| value.revision.generation),
-            reason: StaleConfigReason::ReloadFailed,
-        });
-    }
-    let observed = current.current();
-    let Some(observed) = observed else {
-        return Err(StaleConfigError {
-            expected_generation: expected.generation,
-            observed_generation: None,
-            reason: StaleConfigReason::NoSnapshot,
-        });
-    };
-    if observed.revision.generation != expected.generation
-        || observed.revision.digest != expected.digest
-    {
-        return Err(StaleConfigError {
-            expected_generation: expected.generation,
-            observed_generation: Some(observed.revision.generation),
-            reason: StaleConfigReason::GenerationMismatch,
-        });
-    }
-    Ok(RevisionGuard {
-        revision: expected.clone(),
-    })
 }
 
 struct ParsedLayer {
@@ -562,6 +400,13 @@ impl EnvSource for CapturedEnv<'_> {
 /// Admit one complete candidate.  No legacy loader is called here, and all
 /// failures return before an `AdmittedConfig` can be constructed.
 pub fn admit(inputs: AdmissionInputs<'_>) -> Result<AdmittedConfig, ConfigAdmissionError> {
+    let path_context_digest = validate_admission_context(&inputs)?;
+    validate_source_identity(&inputs.base)?;
+    if let Some(profile) = inputs.profile {
+        validate_source_identity(&profile)?;
+    }
+    crate::host_config_checked::check_config_bounds(&inputs.defaults)
+        .map_err(|_| ConfigAdmissionError::Oversized)?;
     let base_bytes = source_bytes(&inputs.base, false)?;
     let base = parse_layer(&inputs.base, base_bytes, LayerKind::Base)?;
     let profile = match inputs.profile {
@@ -597,13 +442,17 @@ pub fn admit(inputs: AdmissionInputs<'_>) -> Result<AdmittedConfig, ConfigAdmiss
     if let Some(base) = base {
         diagnostics.extend(base.diagnostics.clone());
         entries.push(trace_entry(LayerKind::Base, &base));
+        check_config_bounds(&cfg)?;
         apply_layer_overlay(&mut cfg, &base.normalized)?;
+        check_config_bounds(&cfg)?;
     }
     if let Some(profile) = profile {
         diagnostics.extend(profile.diagnostics.clone());
         entries.push(trace_entry(LayerKind::Profile, &profile));
+        check_config_bounds(&cfg)?;
         apply_layer_overlay(&mut cfg, &profile.normalized)
             .map_err(|_| ConfigAdmissionError::ProfileInvalid)?;
+        check_config_bounds(&cfg).map_err(|_| ConfigAdmissionError::ProfileInvalid)?;
     }
 
     let captured_env = CapturedEnv::new(inputs.env);
@@ -624,6 +473,7 @@ pub fn admit(inputs: AdmissionInputs<'_>) -> Result<AdmittedConfig, ConfigAdmiss
     if !duration_input_errors.is_empty() {
         return Err(ConfigAdmissionError::EnvironmentInvalid);
     }
+    check_config_bounds(&cfg)?;
     let env_diagnostics = bounded_diagnostics(
         env_warnings
             .into_iter()
@@ -657,7 +507,7 @@ pub fn admit(inputs: AdmissionInputs<'_>) -> Result<AdmittedConfig, ConfigAdmiss
     // to use for derived defaults and path expansion.
     check_pre_process_candidate(&cfg)?;
     check_final_config(&cfg)?;
-    cfg.post_process_pure();
+    cfg.post_process_pure(inputs.paths);
     check_normalized_candidate(&cfg)?;
     // Validate the complete file/profile/env/CLI candidate before host rows are
     // merged, so a trusted-layer semantic failure cannot be mislabeled as a
@@ -710,6 +560,7 @@ pub fn admit(inputs: AdmissionInputs<'_>) -> Result<AdmittedConfig, ConfigAdmiss
         environment_digest: env_identity.content_digest,
         overrides_digest: override_identity.content_digest,
         host_digest: host_identity.content_digest,
+        path_context_digest,
     };
     let profile_identity_digest = sources
         .profile
@@ -730,6 +581,7 @@ pub fn admit(inputs: AdmissionInputs<'_>) -> Result<AdmittedConfig, ConfigAdmiss
             &sources.environment_digest,
             &sources.overrides_digest,
             &sources.host_digest,
+            &path_context_digest,
         ],
     );
     let trace = LayerTrace {
@@ -793,6 +645,32 @@ fn source_bytes<'a>(
             Ok(Some(bytes))
         }
     }
+}
+
+fn validate_source_identity(input: &SourceInput<'_>) -> Result<(), ConfigAdmissionError> {
+    if input.identity.len() > config_budget::MAX_CONTEXT_BYTES {
+        Err(ConfigAdmissionError::Oversized)
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_admission_context(
+    inputs: &AdmissionInputs<'_>,
+) -> Result<[u8; 32], ConfigAdmissionError> {
+    let home = inputs.paths.home().to_string_lossy();
+    if home.len() > config_budget::MAX_CONTEXT_BYTES {
+        return Err(ConfigAdmissionError::Oversized);
+    }
+    Ok(digest(
+        b"thegn/config-admission/path-context/v1",
+        &[home.as_bytes()],
+    ))
+}
+
+fn check_config_bounds(cfg: &Config) -> Result<(), ConfigAdmissionError> {
+    crate::host_config_checked::check_config_bounds(cfg)
+        .map_err(|_| ConfigAdmissionError::Oversized)
 }
 
 fn parse_layer(
@@ -930,7 +808,10 @@ fn validate_and_apply_overrides(
         let Some((key, value)) = override_value.split_once('=') else {
             return Err(ConfigAdmissionError::CliInvalid);
         };
-        if key.is_empty() || key.split('.').count() > config_budget::MAX_DEPTH {
+        if key.is_empty()
+            || key.len() > config_budget::MAX_CONTEXT_BYTES
+            || key.split('.').count() > config_budget::MAX_DEPTH
+        {
             return Err(ConfigAdmissionError::Oversized);
         }
         let trimmed = value.trim();
@@ -958,21 +839,69 @@ fn validate_and_apply_overrides(
         let (key, value) = override_value
             .split_once('=')
             .ok_or(ConfigAdmissionError::CliInvalid)?;
-        let (result, warnings, _) = crate::config_diagnostics::capture_quiet(|| {
+        validate_cli_override_shape(cfg, key, value)?;
+        check_config_bounds(cfg)?;
+        let (result, _warnings, _) = crate::config_diagnostics::capture_quiet(|| {
             Config::apply_override_str(cfg, key, value)
         });
-        // The legacy enum deserializers warn-and-default without returning an
-        // error. Any warning emitted while applying a supplied override is
-        // therefore a strict CLI rejection (there are no compatibility
-        // warnings on this direct dotted-key path).
-        if result.is_err() || !warnings.is_empty() {
+        if result.is_err() {
             return Err(ConfigAdmissionError::CliInvalid);
         }
+        check_config_bounds(cfg)?;
     }
     Ok(synthetic_identity_from_strings("cli", overrides))
 }
 
+/// Validate a raw CLI assignment against the same generated schema used for
+/// file admission before serde gets a chance to warn-and-default an enum or
+/// discard an unknown leaf.  The legacy coercion function is shared so quoted
+/// strings, arrays, inline tables, booleans, numbers, and custom map keys keep
+/// their established meanings.
+fn validate_cli_override_shape(
+    cfg: &Config,
+    key: &str,
+    raw_value: &str,
+) -> Result<(), ConfigAdmissionError> {
+    let key = crate::config_compat::canonical_key(key);
+    let mut tree = bounded_json_value(cfg)?;
+    let value = if key == "apps.tab_order" {
+        serde_json::Value::Array(
+            raw_value
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|value| serde_json::Value::String(value.to_string()))
+                .collect(),
+        )
+    } else {
+        Config::coerce_override_value(raw_value)
+    };
+    let parts: Vec<&str> = key.split('.').collect();
+    let mut current = &mut tree;
+    for (index, part) in parts.iter().enumerate() {
+        if index == parts.len() - 1 {
+            if !current.is_object() {
+                return Err(ConfigAdmissionError::CliInvalid);
+            }
+            current[*part] = value.clone();
+        } else {
+            current = current
+                .get_mut(*part)
+                .ok_or(ConfigAdmissionError::CliInvalid)?;
+            if !current.is_object() {
+                return Err(ConfigAdmissionError::CliInvalid);
+            }
+        }
+    }
+    if config_validate::validate_config_schema_value(&tree).is_empty() {
+        Ok(())
+    } else {
+        Err(ConfigAdmissionError::CliInvalid)
+    }
+}
+
 fn check_normalized_candidate(cfg: &Config) -> Result<(), ConfigAdmissionError> {
+    check_config_bounds(cfg)?;
     let bytes = bounded_serialized_config(cfg)?;
     if bytes.len() > config_budget::MAX_NORMALIZED_BYTES {
         return Err(ConfigAdmissionError::Oversized);
@@ -981,7 +910,8 @@ fn check_normalized_candidate(cfg: &Config) -> Result<(), ConfigAdmissionError> 
 }
 
 fn check_final_config(cfg: &Config) -> Result<(), ConfigAdmissionError> {
-    let value = serde_json::to_value(cfg).map_err(|_| ConfigAdmissionError::SchemaInvalid)?;
+    check_config_bounds(cfg)?;
+    let value = bounded_json_value(cfg)?;
     if !config_validate::validate_config_schema_value(&value).is_empty() {
         return Err(ConfigAdmissionError::SchemaInvalid);
     }
@@ -1054,6 +984,33 @@ fn bounded_json_bytes<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, ConfigA
                     "serialization budget",
                 ));
             }
+            let needed = self.bytes.len() + bytes.len();
+            if needed > self.bytes.capacity() {
+                // `try_reserve_exact` takes additional capacity, not the
+                // desired final capacity.  Grow geometrically, but clamp the
+                // requested final capacity to the logical limit so a write
+                // can never retain more than the admitted budget.
+                let mut capacity = self.bytes.capacity().max(1);
+                while capacity < needed {
+                    capacity = capacity.saturating_mul(2).min(self.limit);
+                    if capacity < needed && capacity == self.limit {
+                        return Err(io::Error::new(
+                            io::ErrorKind::WriteZero,
+                            "serialization budget",
+                        ));
+                    }
+                }
+                let additional = capacity - self.bytes.len();
+                self.bytes
+                    .try_reserve_exact(additional)
+                    .map_err(|_| io::Error::other("serialization allocation"))?;
+                if self.bytes.capacity() > self.limit {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "serialization capacity budget",
+                    ));
+                }
+            }
             self.bytes.extend_from_slice(bytes);
             Ok(bytes.len())
         }
@@ -1064,7 +1021,7 @@ fn bounded_json_bytes<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, ConfigA
     }
 
     let mut output = Limited {
-        bytes: Vec::new(),
+        bytes: Vec::with_capacity(config_budget::MAX_NORMALIZED_BYTES.min(4096)),
         limit: config_budget::MAX_NORMALIZED_BYTES,
     };
     serde_json::to_writer(&mut output, value).map_err(|error| {
@@ -1075,6 +1032,13 @@ fn bounded_json_bytes<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, ConfigA
         }
     })?;
     Ok(output.bytes)
+}
+
+fn bounded_json_value<T: serde::Serialize>(
+    value: &T,
+) -> Result<serde_json::Value, ConfigAdmissionError> {
+    let bytes = bounded_json_bytes(value)?;
+    serde_json::from_slice(&bytes).map_err(|_| ConfigAdmissionError::SchemaInvalid)
 }
 
 fn trace_entry(layer: LayerKind, parsed: &ParsedLayer) -> LayerTraceEntry {

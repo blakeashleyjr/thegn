@@ -19,6 +19,7 @@ pub const MAX_NORMALIZED_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_CLI_ENTRIES: usize = 1_024;
 pub const MAX_CLI_ENTRY_BYTES: usize = 16 * 1024;
 pub const MAX_CLI_BYTES: usize = 1024 * 1024;
+pub const MAX_CONTEXT_BYTES: usize = 16 * 1024;
 pub const MAX_ENV_ENTRIES: usize = 1_024;
 pub const MAX_ENV_VALUE_BYTES: usize = 16 * 1024;
 pub const MAX_ENV_BYTES: usize = 1024 * 1024;
@@ -92,6 +93,58 @@ enum ContainerKind {
 struct Container {
     kind: ContainerKind,
     members: usize,
+    value_started: bool,
+    saved_key_depth: usize,
+    saved_key_has_token: bool,
+    saved_in_key: bool,
+    key_prefix_depth: usize,
+}
+
+fn note_array_value(containers: &mut [Container], nodes: &mut usize) -> Result<(), BudgetError> {
+    let Some(container) = containers.last_mut() else {
+        return Ok(());
+    };
+    if container.kind != ContainerKind::Array || container.value_started {
+        return Ok(());
+    }
+    container.value_started = true;
+    container.members = container
+        .members
+        .checked_add(1)
+        .ok_or(BudgetError::Members)?;
+    if container.members > MAX_MEMBERS {
+        return Err(BudgetError::Members);
+    }
+    *nodes = nodes.checked_add(1).ok_or(BudgetError::Nodes)?;
+    if *nodes > MAX_NODES {
+        return Err(BudgetError::Nodes);
+    }
+    Ok(())
+}
+
+/// Count physical source bytes independently from the TOML token walk.  The
+/// token walk is allowed to skip a three-byte multiline-string delimiter, but
+/// a delimiter is still part of the physical line and must consume line
+/// budget.  Keeping this pass separate also makes the line limit independent
+/// of parser-state recovery on malformed input.
+fn check_physical_bounds(bytes: &[u8]) -> Result<(), BudgetError> {
+    let mut line_bytes = 0usize;
+    let mut lines = 1usize;
+    for &byte in bytes {
+        if byte == b'\n' {
+            lines = lines.checked_add(1).ok_or(BudgetError::Lines)?;
+            if lines > MAX_LINES {
+                return Err(BudgetError::Lines);
+            }
+            line_bytes = 0;
+        } else {
+            line_bytes = line_bytes.checked_add(1).ok_or(BudgetError::LineBytes)?;
+            if line_bytes > MAX_LINE_BYTES {
+                return Err(BudgetError::LineBytes);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Scan a UTF-8 TOML source after the caller has checked its encoding.
@@ -101,9 +154,8 @@ pub fn scan(bytes: &[u8]) -> Result<(), BudgetError> {
     if bytes.len() > MAX_SOURCE_BYTES {
         return Err(BudgetError::SourceBytes);
     }
+    check_physical_bounds(bytes)?;
 
-    let mut line_bytes = 0usize;
-    let mut lines = 1usize;
     let mut depth = 0usize;
     let mut tables = 0usize;
     let mut nodes = 0usize;
@@ -113,8 +165,9 @@ pub fn scan(bytes: &[u8]) -> Result<(), BudgetError> {
     let mut in_key = true;
     let mut statement_start = true;
     let mut table_header_closer = 0usize;
+    let mut table_path_depth = 0usize;
     let mut scope_members = 0usize;
-    let mut containers = Vec::new();
+    let mut containers: Vec<Container> = Vec::new();
     let mut string: Option<(StringKind, usize)> = None;
     let mut escaped = false;
     let mut comment = false;
@@ -124,11 +177,6 @@ pub fn scan(bytes: &[u8]) -> Result<(), BudgetError> {
         let byte = bytes[index];
 
         if byte == b'\n' {
-            line_bytes = 0;
-            lines = lines.checked_add(1).ok_or(BudgetError::Lines)?;
-            if lines > MAX_LINES {
-                return Err(BudgetError::Lines);
-            }
             if containers.is_empty() {
                 key_depth = 0;
                 key_has_token = false;
@@ -139,14 +187,11 @@ pub fn scan(bytes: &[u8]) -> Result<(), BudgetError> {
                 .last()
                 .is_some_and(|c| c.kind == ContainerKind::InlineTable)
             {
-                key_depth = 0;
+                key_depth = containers
+                    .last()
+                    .map_or(0, |container| container.key_prefix_depth);
                 key_has_token = false;
                 in_key = true;
-            }
-        } else {
-            line_bytes = line_bytes.checked_add(1).ok_or(BudgetError::LineBytes)?;
-            if line_bytes > MAX_LINE_BYTES {
-                return Err(BudgetError::LineBytes);
             }
         }
 
@@ -228,6 +273,8 @@ pub fn scan(bytes: &[u8]) -> Result<(), BudgetError> {
                 if in_key && !key_has_token {
                     key_has_token = true;
                     key_depth = 1;
+                } else if !in_key {
+                    note_array_value(&mut containers, &mut nodes)?;
                 }
                 let (kind, width) = if bytes.get(index..index + 3) == Some(b"\"\"\"") {
                     (StringKind::MultilineBasic, 3)
@@ -260,7 +307,8 @@ pub fn scan(bytes: &[u8]) -> Result<(), BudgetError> {
                 if nodes > MAX_NODES {
                     return Err(BudgetError::Nodes);
                 }
-                key_depth = 1;
+                key_depth = 0;
+                table_path_depth = 0;
                 key_has_token = false;
                 in_key = true;
                 table_header_closer = width;
@@ -268,12 +316,15 @@ pub fn scan(bytes: &[u8]) -> Result<(), BudgetError> {
                 index += width;
             }
             b'[' => {
+                if !in_key {
+                    note_array_value(&mut containers, &mut nodes)?;
+                }
                 tables = tables.checked_add(1).ok_or(BudgetError::Tables)?;
                 if tables > MAX_TABLES {
                     return Err(BudgetError::Tables);
                 }
                 depth = depth.checked_add(1).ok_or(BudgetError::Depth)?;
-                if depth > MAX_DEPTH {
+                if table_path_depth + depth + key_depth > MAX_DEPTH {
                     return Err(BudgetError::Depth);
                 }
                 nodes = nodes.checked_add(1).ok_or(BudgetError::Nodes)?;
@@ -283,18 +334,26 @@ pub fn scan(bytes: &[u8]) -> Result<(), BudgetError> {
                 containers.push(Container {
                     kind: ContainerKind::Array,
                     members: 0,
+                    value_started: false,
+                    saved_key_depth: key_depth,
+                    saved_key_has_token: key_has_token,
+                    saved_in_key: in_key,
+                    key_prefix_depth: key_depth,
                 });
                 statement_start = false;
                 in_key = false;
                 index += 1;
             }
             b'{' => {
+                if !in_key {
+                    note_array_value(&mut containers, &mut nodes)?;
+                }
                 tables = tables.checked_add(1).ok_or(BudgetError::Tables)?;
                 if tables > MAX_TABLES {
                     return Err(BudgetError::Tables);
                 }
                 depth = depth.checked_add(1).ok_or(BudgetError::Depth)?;
-                if depth > MAX_DEPTH {
+                if table_path_depth + depth + key_depth > MAX_DEPTH {
                     return Err(BudgetError::Depth);
                 }
                 nodes = nodes.checked_add(1).ok_or(BudgetError::Nodes)?;
@@ -304,8 +363,15 @@ pub fn scan(bytes: &[u8]) -> Result<(), BudgetError> {
                 containers.push(Container {
                     kind: ContainerKind::InlineTable,
                     members: 0,
+                    value_started: false,
+                    saved_key_depth: key_depth,
+                    saved_key_has_token: key_has_token,
+                    saved_in_key: in_key,
+                    key_prefix_depth: key_depth,
                 });
-                key_depth = 0;
+                key_depth = containers
+                    .last()
+                    .map_or(0, |container| container.key_prefix_depth);
                 key_has_token = false;
                 in_key = true;
                 statement_start = false;
@@ -315,6 +381,10 @@ pub fn scan(bytes: &[u8]) -> Result<(), BudgetError> {
                 table_header_closer -= 1;
                 if table_header_closer == 0 {
                     if key_depth > MAX_DEPTH {
+                        return Err(BudgetError::Depth);
+                    }
+                    table_path_depth = key_depth;
+                    if table_path_depth > MAX_DEPTH {
                         return Err(BudgetError::Depth);
                     }
                     scope_members = 0;
@@ -338,6 +408,11 @@ pub fn scan(bytes: &[u8]) -> Result<(), BudgetError> {
                 if byte == b'}' && container.kind != ContainerKind::InlineTable {
                     index += 1;
                     continue;
+                }
+                if container.kind == ContainerKind::InlineTable {
+                    key_depth = container.saved_key_depth;
+                    key_has_token = container.saved_key_has_token;
+                    in_key = container.saved_in_key;
                 }
                 index += 1;
             }
@@ -367,23 +442,19 @@ pub fn scan(bytes: &[u8]) -> Result<(), BudgetError> {
                 if let Some(container) = containers.last_mut()
                     && container.kind == ContainerKind::Array
                 {
-                    container.members = container
-                        .members
-                        .checked_add(1)
-                        .ok_or(BudgetError::Members)?;
-                    if container.members > MAX_MEMBERS {
-                        return Err(BudgetError::Members);
-                    }
-                    nodes = nodes.checked_add(1).ok_or(BudgetError::Nodes)?;
-                    if nodes > MAX_NODES {
-                        return Err(BudgetError::Nodes);
-                    }
+                    // A comma terminates a member; a trailing comma must not
+                    // invent an additional value.  Members are charged when
+                    // their first token is seen, so arrays with and without a
+                    // trailing comma have identical accounting.
+                    container.value_started = false;
                 }
                 if containers
                     .last()
                     .is_some_and(|c| c.kind == ContainerKind::InlineTable)
                 {
-                    key_depth = 0;
+                    key_depth = containers
+                        .last()
+                        .map_or(0, |container| container.key_prefix_depth);
                     key_has_token = false;
                     in_key = true;
                 }
@@ -395,7 +466,7 @@ pub fn scan(bytes: &[u8]) -> Result<(), BudgetError> {
                     key_depth = 1;
                 }
                 key_depth = key_depth.checked_add(1).ok_or(BudgetError::Depth)?;
-                if containers.len() + key_depth > MAX_DEPTH {
+                if table_path_depth + containers.len() + key_depth > MAX_DEPTH {
                     return Err(BudgetError::Depth);
                 }
                 index += 1;
@@ -407,9 +478,12 @@ pub fn scan(bytes: &[u8]) -> Result<(), BudgetError> {
                     if key_depth == 0 {
                         key_depth = 1;
                     }
-                    if containers.len() + key_depth > MAX_DEPTH {
+                    if table_path_depth + containers.len() + key_depth > MAX_DEPTH {
                         return Err(BudgetError::Depth);
                     }
+                }
+                if !in_key && !byte.is_ascii_whitespace() {
+                    note_array_value(&mut containers, &mut nodes)?;
                 }
                 if statement_start && !byte.is_ascii_whitespace() {
                     statement_start = false;

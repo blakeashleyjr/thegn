@@ -22,6 +22,38 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+/// Captured inputs used by pure configuration normalization.  Admission must
+/// never reopen HOME (or another ambient source) while it is composing a
+/// candidate; legacy effectful callers capture this once at their own edge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathExpansionContext {
+    home: PathBuf,
+}
+
+impl PathExpansionContext {
+    pub fn captured() -> Self {
+        Self { home: util::home() }
+    }
+
+    pub fn from_home(home: PathBuf) -> Self {
+        Self { home }
+    }
+
+    pub(crate) fn home(&self) -> &Path {
+        &self.home
+    }
+
+    pub(crate) fn expand_tilde(&self, path: &str) -> String {
+        if path == "~" {
+            self.home.to_string_lossy().into_owned()
+        } else if let Some(rest) = path.strip_prefix("~/") {
+            self.home.join(rest).to_string_lossy().into_owned()
+        } else {
+            path.to_string()
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) use crate::config_repo::lenient_env_selector;
 pub(crate) use crate::config_repo::{RepoConfigFile, reject_overlay_command_collectors};
@@ -6138,11 +6170,13 @@ impl Config {
     /// bracketed forms because that is what the config file itself uses — a
     /// value the user can paste either way. A bare string still wins by default,
     /// so nothing that used to parse changes meaning.
-    fn coerce_override_value(val: &str) -> serde_json::Value {
+    pub(crate) fn coerce_override_value(val: &str) -> serde_json::Value {
         let t = val.trim();
         let bracketed =
             (t.starts_with('[') && t.ends_with(']')) || (t.starts_with('{') && t.ends_with('}'));
-        if bracketed
+        let quoted =
+            (t.starts_with('"') && t.ends_with('"')) || (t.starts_with('\'') && t.ends_with('\''));
+        if (bracketed || quoted)
             && let Ok(parsed) = toml::from_str::<serde_json::Value>(&format!("v = {t}"))
             && let Some(v) = parsed.get("v")
         {
@@ -6218,17 +6252,18 @@ impl Config {
     /// The admission boundary calls this exactly once; it remains crate-visible
     /// so legacy loaders and later host migration can share the same behavior.
     pub(crate) fn post_process(&mut self) {
-        self.post_process_inner(true);
+        let paths = PathExpansionContext::captured();
+        self.post_process_inner(true, &paths);
     }
 
     /// Normalize an admitted candidate without emitting diagnostics or
     /// installing process-global policy.  Admission calls this before its
     /// final checks; the legacy loader keeps the effectful wrapper above.
-    pub(crate) fn post_process_pure(&mut self) {
-        self.post_process_inner(false);
+    pub(crate) fn post_process_pure(&mut self, paths: &PathExpansionContext) {
+        self.post_process_inner(false, paths);
     }
 
-    fn post_process_inner(&mut self, emit_runtime_effects: bool) {
+    fn post_process_inner(&mut self, emit_runtime_effects: bool, paths: &PathExpansionContext) {
         if emit_runtime_effects {
             crate::config_drawer::warn_policy_issues(self);
         }
@@ -6339,18 +6374,18 @@ impl Config {
         }
         for p in &mut self.pins {
             if let Some(cwd) = &p.cwd {
-                p.cwd = Some(util::expand_tilde(cwd));
+                p.cwd = Some(paths.expand_tilde(cwd));
             }
         }
-        self.worktrees_dir = util::expand_tilde(&self.worktrees_dir);
-        self.workspaces_dir = util::expand_tilde(&self.workspaces_dir);
+        self.worktrees_dir = paths.expand_tilde(&self.worktrees_dir);
+        self.workspaces_dir = paths.expand_tilde(&self.workspaces_dir);
         if self.repo_roots.is_empty() {
             self.repo_roots = vec![self.workspaces_dir.clone()];
         }
         self.repo_roots = self
             .repo_roots
             .iter()
-            .map(|r| util::expand_tilde(r))
+            .map(|r| paths.expand_tilde(r))
             .collect();
         self.metrics.interval_secs = self.metrics.interval_secs.max(1.0);
         self.metrics.timeout_ms = self.metrics.timeout_ms.clamp(100, 30_000);
