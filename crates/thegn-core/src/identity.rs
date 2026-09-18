@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 /// Changing this is an intentional identity migration, not a formatting tweak.
 pub const IDENTITY_ENCODING_VERSION: u8 = 1;
 pub const MAX_IDENTITY_BYTES: usize = 16 * 1024;
+pub const MAX_IDENTITY_COMPONENT_BYTES: usize = 16 * 1024;
 pub const MAX_DISPLAY_LABEL_BYTES: usize = 64;
 pub const REPOSITORY_ID_BYTES: usize = 32;
 pub const WORKTREE_ID_BYTES: usize = 32;
@@ -47,17 +48,44 @@ impl<'a> BytePart<'a> {
 /// The encoding deliberately includes the version and part count. A delimiter
 /// based encoding would make `(ab, c)` and `(a, bc)` indistinguishable and
 /// would make future additions silently change the meaning of old IDs.
-pub fn encode_parts<D: AsRef<[u8]>>(domain: D, parts: &[BytePart<'_>]) -> Vec<u8> {
+pub fn encode_parts<D: AsRef<[u8]>>(
+    domain: D,
+    parts: &[BytePart<'_>],
+) -> Result<Vec<u8>, IdentityError> {
     let domain = domain.as_ref();
-    let total = 1usize
-        .saturating_add(8)
-        .saturating_add(domain.len())
-        .saturating_add(8)
-        .saturating_add(parts.iter().map(|p| 8usize.saturating_add(p.0.len())).sum());
-    assert!(
-        total <= MAX_IDENTITY_BYTES,
-        "identity encoding exceeds its bounded input limit"
-    );
+    if domain.len() > MAX_IDENTITY_COMPONENT_BYTES {
+        return Err(IdentityError::InputTooLong {
+            kind: "identity domain",
+        });
+    }
+    let mut total = 1usize
+        .checked_add(8)
+        .and_then(|size| size.checked_add(domain.len()))
+        .and_then(|size| size.checked_add(8))
+        .ok_or(IdentityError::EncodingTooLong {
+            actual: usize::MAX,
+            limit: MAX_IDENTITY_BYTES,
+        })?;
+    for part in parts {
+        if part.0.len() > MAX_IDENTITY_COMPONENT_BYTES {
+            return Err(IdentityError::InputTooLong {
+                kind: "identity component",
+            });
+        }
+        total = total
+            .checked_add(8)
+            .and_then(|size| size.checked_add(part.0.len()))
+            .ok_or(IdentityError::EncodingTooLong {
+                actual: usize::MAX,
+                limit: MAX_IDENTITY_BYTES,
+            })?;
+    }
+    if total > MAX_IDENTITY_BYTES {
+        return Err(IdentityError::EncodingTooLong {
+            actual: total,
+            limit: MAX_IDENTITY_BYTES,
+        });
+    }
     let mut out = Vec::with_capacity(total);
     out.push(IDENTITY_ENCODING_VERSION);
     push_len(&mut out, domain.len());
@@ -67,7 +95,7 @@ pub fn encode_parts<D: AsRef<[u8]>>(domain: D, parts: &[BytePart<'_>]) -> Vec<u8
         push_len(&mut out, part.0.len());
         out.extend_from_slice(part.0);
     }
-    out
+    Ok(out)
 }
 
 fn push_len(out: &mut Vec<u8>, len: usize) {
@@ -75,8 +103,11 @@ fn push_len(out: &mut Vec<u8>, len: usize) {
 }
 
 /// Hash canonical identity inputs with SHA-256, retaining the complete digest.
-pub fn digest_parts<D: AsRef<[u8]>>(domain: D, parts: &[BytePart<'_>]) -> [u8; 32] {
-    Sha256::digest(encode_parts(domain, parts)).into()
+pub fn digest_parts<D: AsRef<[u8]>>(
+    domain: D,
+    parts: &[BytePart<'_>],
+) -> Result<[u8; 32], IdentityError> {
+    Ok(Sha256::digest(encode_parts(domain, parts)?).into())
 }
 
 /// A display-only label derived from exact bytes. It is bounded and must never
@@ -100,39 +131,62 @@ impl fmt::Display for DisplayLabel {
 /// controls are escaped because callers may place this label in a path.
 pub fn display_label(raw: &[u8]) -> DisplayLabel {
     let mut rendered = String::new();
+    let mut push = |text: &str| {
+        let remaining = MAX_DISPLAY_LABEL_BYTES.saturating_sub(rendered.len());
+        if remaining == 0 {
+            return false;
+        }
+        let end = text
+            .char_indices()
+            .take_while(|(index, ch)| index + ch.len_utf8() <= remaining)
+            .last()
+            .map_or(0, |(index, ch)| index + ch.len_utf8());
+        if end == 0 {
+            return false;
+        }
+        let text = &text[..end];
+        rendered.push_str(text);
+        rendered.len() < MAX_DISPLAY_LABEL_BYTES
+    };
     if let Ok(text) = std::str::from_utf8(raw) {
-        for ch in text.chars() {
+        'input: for ch in text.chars() {
             match ch {
-                '/' | '\\' => rendered.push('⁄'),
-                c if c.is_control() => {
-                    for byte in c.to_string().as_bytes() {
-                        rendered.push_str(&format!("\\x{byte:02x}"));
+                '/' | '\\' => {
+                    if !push("⁄") {
+                        break;
                     }
                 }
-                c => rendered.push(c),
+                c if c.is_control() => {
+                    for byte in c.to_string().as_bytes() {
+                        if !push(&format!("\\x{byte:02x}")) {
+                            break 'input;
+                        }
+                    }
+                }
+                c => {
+                    if !push(&c.to_string()) {
+                        break;
+                    }
+                }
             }
         }
     } else {
-        for byte in raw {
+        'input: for byte in raw {
             if byte.is_ascii_graphic() && !matches!(*byte, b'/' | b'\\') {
-                rendered.push(char::from(*byte));
+                if !push(&char::from(*byte).to_string()) {
+                    break;
+                }
             } else {
-                rendered.push_str(&format!("\\x{byte:02x}"));
+                if !push(&format!("\\x{byte:02x}")) {
+                    break 'input;
+                }
             }
         }
     }
     if rendered.is_empty() {
         rendered.push_str("(unnamed)");
     }
-    let mut bounded = String::new();
-    for ch in rendered.chars() {
-        let next = bounded.len().saturating_add(ch.len_utf8());
-        if next > MAX_DISPLAY_LABEL_BYTES {
-            break;
-        }
-        bounded.push(ch);
-    }
-    DisplayLabel(bounded)
+    DisplayLabel(rendered)
 }
 
 /// An absolute path whose native representation has been captured before it
@@ -152,10 +206,19 @@ impl ExactPath {
                 reason: "path must be absolute",
             });
         }
-        let bytes = util::native_path_bytes(path)
-            .ok_or(IdentityError::UnsupportedEncoding { kind: "path" })?;
-        if bytes.is_empty() || bytes.len() > MAX_IDENTITY_BYTES {
-            return Err(IdentityError::InputTooLong { kind: "path" });
+        let bytes = util::native_path_bytes_bounded(path, MAX_IDENTITY_COMPONENT_BYTES).map_err(
+            |error| match error {
+                util::NativePathError::TooLong => IdentityError::InputTooLong { kind: "path" },
+                util::NativePathError::Unsupported => {
+                    IdentityError::UnsupportedEncoding { kind: "path" }
+                }
+            },
+        )?;
+        if bytes.is_empty() {
+            return Err(IdentityError::InvalidInput {
+                kind: "path",
+                reason: "path must not be empty",
+            });
         }
         Ok(Self {
             path: path.to_path_buf(),
@@ -225,11 +288,11 @@ impl BranchRef {
 pub struct RepositoryId([u8; REPOSITORY_ID_BYTES]);
 
 impl RepositoryId {
-    pub fn from_common_dir(common_dir: &ExactPath) -> Self {
-        Self(digest_parts(
+    pub fn from_common_dir(common_dir: &ExactPath) -> Result<Self, IdentityError> {
+        Ok(Self(digest_parts(
             b"thegn/repository-id",
             &[BytePart::new(common_dir.as_bytes())],
-        ))
+        )?))
     }
 
     pub fn from_bytes(bytes: [u8; REPOSITORY_ID_BYTES]) -> Self {
@@ -255,8 +318,8 @@ impl WorktreeId {
         generation: WorktreeGeneration,
         branch: &BranchRef,
         path_mode: &[u8],
-    ) -> Self {
-        Self(digest_parts(
+    ) -> Result<Self, IdentityError> {
+        Ok(Self(digest_parts(
             b"thegn/worktree-id",
             &[
                 BytePart::new(repository.as_bytes()),
@@ -264,7 +327,7 @@ impl WorktreeId {
                 BytePart::new(branch.raw()),
                 BytePart::new(path_mode),
             ],
-        ))
+        )?))
     }
 
     pub fn from_bytes(bytes: [u8; WORKTREE_ID_BYTES]) -> Self {
@@ -286,8 +349,18 @@ impl WorktreeId {
 pub struct WorktreeGeneration([u8; WORKTREE_GENERATION_BYTES]);
 
 impl WorktreeGeneration {
-    pub fn from_bytes(bytes: [u8; WORKTREE_GENERATION_BYTES]) -> Self {
+    pub(crate) fn from_bytes(bytes: [u8; WORKTREE_GENERATION_BYTES]) -> Self {
         Self(bytes)
+    }
+
+    /// Constructed only from the exact instance stamp captured by the Git
+    /// inspection seam. The stamp is an OS identity proof, not caller-chosen
+    /// randomness; unsupported platforms must refuse capture before effects.
+    pub(crate) fn from_captured_instance_stamp(stamp: &[u8]) -> Result<Self, IdentityError> {
+        let digest = digest_parts(b"thegn/worktree-generation", &[BytePart::new(stamp)])?;
+        let mut bytes = [0; WORKTREE_GENERATION_BYTES];
+        bytes.copy_from_slice(&digest[..WORKTREE_GENERATION_BYTES]);
+        Ok(Self(bytes))
     }
 
     pub fn as_bytes(&self) -> &[u8; WORKTREE_GENERATION_BYTES] {
@@ -318,6 +391,10 @@ pub enum IdentityError {
     InputTooLong {
         kind: &'static str,
     },
+    EncodingTooLong {
+        actual: usize,
+        limit: usize,
+    },
     UnsupportedEncoding {
         kind: &'static str,
     },
@@ -336,6 +413,9 @@ impl fmt::Display for IdentityError {
         match self {
             Self::InvalidInput { kind, reason } => write!(f, "invalid {kind}: {reason}"),
             Self::InputTooLong { kind } => write!(f, "{kind} exceeds the identity bound"),
+            Self::EncodingTooLong { actual, limit } => {
+                write!(f, "identity encoding is {actual} bytes; limit is {limit}")
+            }
             Self::UnsupportedEncoding { kind } => {
                 write!(f, "cannot preserve exact {kind} representation")
             }
@@ -634,7 +714,7 @@ mod tests {
 
     #[test]
     fn encoding_is_versioned_length_delimited_and_domain_separated() {
-        let encoded = encode_parts("test", &[BytePart::new(b"a"), BytePart::new(b"bc")]);
+        let encoded = encode_parts("test", &[BytePart::new(b"a"), BytePart::new(b"bc")]).unwrap();
         assert_eq!(encoded[0], IDENTITY_ENCODING_VERSION);
         assert_eq!(&encoded[1..9], &(4u64.to_be_bytes()));
         assert_eq!(&encoded[9..13], b"test");
@@ -642,19 +722,16 @@ mod tests {
         assert_eq!(&encoded[21..29], &(1u64.to_be_bytes()));
         assert_eq!(encoded[29], b'a');
         assert_eq!(
-            hex_bytes(&digest_parts(
-                "test",
-                &[BytePart::new(b"a"), BytePart::new(b"bc")]
-            )),
+            hex_bytes(&digest_parts("test", &[BytePart::new(b"a"), BytePart::new(b"bc")]).unwrap()),
             "8210dc11675e74e4907461f6f77155f4a726d2d76d6a8db44cb98e0dc6a73fa5"
         );
         assert_ne!(
-            encode_parts("test", &[BytePart::new(b"ab"), BytePart::new(b"c")]),
-            encode_parts("test", &[BytePart::new(b"a"), BytePart::new(b"bc")])
+            encode_parts("test", &[BytePart::new(b"ab"), BytePart::new(b"c")]).unwrap(),
+            encode_parts("test", &[BytePart::new(b"a"), BytePart::new(b"bc")]).unwrap()
         );
         assert_ne!(
-            digest_parts("repo", &[BytePart::new(b"same")]),
-            digest_parts("worktree", &[BytePart::new(b"same")])
+            digest_parts("repo", &[BytePart::new(b"same")]).unwrap(),
+            digest_parts("worktree", &[BytePart::new(b"same")]).unwrap()
         );
     }
 
@@ -677,6 +754,7 @@ mod tests {
                     &branch,
                     b"in-repo",
                 )
+                .unwrap()
             })
             .collect();
         for (index, id) in ids.iter().enumerate() {
@@ -701,5 +779,20 @@ mod tests {
             BranchRef::from_bytes(b"feat\0ref").unwrap_err(),
             IdentityError::UnsupportedEncoding { kind: "branch ref" }
         );
+    }
+
+    #[test]
+    fn identity_bounds_return_errors_without_panicking() {
+        let component = vec![b'x'; MAX_IDENTITY_COMPONENT_BYTES];
+        assert!(encode_parts("d", &[BytePart::new(&component)]).is_err());
+        assert!(encode_parts("d", &[BytePart::new(&vec![b'x'; MAX_IDENTITY_BYTES - 26])]).is_ok());
+        assert!(encode_parts("d", &[BytePart::new(&vec![b'x'; MAX_IDENTITY_BYTES - 25])]).is_err());
+        assert!(BranchRef::from_bytes(&vec![b'x'; MAX_IDENTITY_COMPONENT_BYTES + 1]).is_err());
+    }
+
+    #[test]
+    fn display_label_stops_before_rendering_unbounded_input() {
+        let label = display_label(&[b'/'; MAX_DISPLAY_LABEL_BYTES * 100]);
+        assert!(label.as_str().len() <= MAX_DISPLAY_LABEL_BYTES);
     }
 }

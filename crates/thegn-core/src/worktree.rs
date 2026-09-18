@@ -14,10 +14,11 @@ const MAX_GIT_IDENTITY_OUTPUT: usize = 64 * 1024;
 /// remains authoritative; this is an inspection result, not a claim.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitWorktreeIdentity {
-    pub common_dir: ExactPath,
-    pub admin_dir: ExactPath,
-    pub registered_path: ExactPath,
-    pub branch: Option<BranchRef>,
+    common_dir: ExactPath,
+    admin_dir: ExactPath,
+    registered_path: ExactPath,
+    branch: Option<BranchRef>,
+    generation: crate::identity::WorktreeGeneration,
 }
 
 impl GitWorktreeIdentity {
@@ -25,12 +26,33 @@ impl GitWorktreeIdentity {
     pub fn admin_id(&self) -> &[u8] {
         self.admin_dir.as_bytes()
     }
+
+    pub fn common_dir(&self) -> &ExactPath {
+        &self.common_dir
+    }
+
+    pub fn admin_dir(&self) -> &ExactPath {
+        &self.admin_dir
+    }
+
+    pub fn registered_path(&self) -> &ExactPath {
+        &self.registered_path
+    }
+
+    pub fn branch(&self) -> Option<&BranchRef> {
+        self.branch.as_ref()
+    }
+
+    pub fn generation(&self) -> crate::identity::WorktreeGeneration {
+        self.generation
+    }
 }
 
 /// Inspect the one Git worktree registered at `path` without converting
 /// porcelain output through UTF-8. A relative or symlink alias is accepted for
 /// lookup, but the returned path is Git's exact registered path.
 pub fn inspect_registered(root: &Path, path: &Path) -> Result<GitWorktreeIdentity, IdentityError> {
+    let inspected_common = repo::canonical_common_dir(root)?;
     let requested = std::fs::canonicalize(path).map_err(|_| IdentityError::GitProbeFailed {
         operation: "canonicalize requested worktree",
     })?;
@@ -61,16 +83,44 @@ pub fn inspect_registered(root: &Path, path: &Path) -> Result<GitWorktreeIdentit
     }
     let entry = matches.pop().expect("one match checked");
     let common_dir = repo::canonical_common_dir(entry.path.as_path())?;
+    if common_dir != inspected_common {
+        return Err(IdentityError::GitProbeFailed {
+            operation: "repository changed during worktree inspection",
+        });
+    }
     let admin_dir = exact_git_path(
         &entry.path,
         &["rev-parse", "--path-format=absolute", "--git-dir"],
         "rev-parse --git-dir",
     )?;
+    let confirmed_common = repo::canonical_common_dir(root)?;
+    if confirmed_common != inspected_common {
+        return Err(IdentityError::GitProbeFailed {
+            operation: "repository registration changed during worktree inspection",
+        });
+    }
+    let confirmed_admin = exact_git_path(
+        &entry.path,
+        &["rev-parse", "--path-format=absolute", "--git-dir"],
+        "rev-parse --git-dir",
+    )?;
+    if confirmed_admin != admin_dir {
+        return Err(IdentityError::GitProbeFailed {
+            operation: "worktree admin identity changed during inspection",
+        });
+    }
+    let stamp = util::git_admin_instance_stamp(admin_dir.as_path()).ok_or(
+        IdentityError::UnsupportedEncoding {
+            kind: "Git admin instance",
+        },
+    )?;
+    let generation = crate::identity::WorktreeGeneration::from_captured_instance_stamp(&stamp)?;
     Ok(GitWorktreeIdentity {
         common_dir,
         admin_dir,
         registered_path: entry.path,
         branch: entry.branch,
+        generation,
     })
 }
 
@@ -92,13 +142,10 @@ fn exact_git_path(
 }
 
 fn trim_git_line(output: &[u8]) -> Option<&[u8]> {
-    let mut end = output.len();
-    if output.get(end.wrapping_sub(1)) == Some(&b'\n') {
-        end -= 1;
-    }
-    if output.get(end.wrapping_sub(1)) == Some(&b'\r') {
-        end -= 1;
-    }
+    let end = output
+        .len()
+        .checked_sub(1)
+        .filter(|&end| output[end] == b'\n')?;
     (end > 0).then_some(&output[..end])
 }
 
@@ -108,39 +155,90 @@ fn parse_worktree_identity_records(
     let mut records = Vec::new();
     let mut current_path: Option<ExactPath> = None;
     let mut current_branch: Option<BranchRef> = None;
-    let mut finish = |records: &mut Vec<WorktreeIdentityRecord>,
-                      current_path: &mut Option<ExactPath>,
-                      current_branch: &mut Option<BranchRef>| {
+    let mut detached = false;
+    let finish = |records: &mut Vec<WorktreeIdentityRecord>,
+                  current_path: &mut Option<ExactPath>,
+                  current_branch: &mut Option<BranchRef>,
+                  detached: &mut bool|
+     -> Result<(), IdentityError> {
         if let Some(path) = current_path.take() {
+            if *detached && current_branch.is_some() {
+                return Err(IdentityError::GitProbeFailed {
+                    operation: "conflicting branch and detached worktree fields",
+                });
+            }
             records.push(WorktreeIdentityRecord {
                 path,
                 branch: current_branch.take(),
             });
         }
+        *detached = false;
+        Ok(())
     };
 
-    // Git's -z form terminates fields with NUL on supported versions. Only
-    // fall back to line records when no NUL is present; otherwise a valid path
-    // containing a newline would be silently split into a different claimant.
-    let fields: Vec<&[u8]> = if porcelain.contains(&0) {
-        porcelain.split(|byte| *byte == 0).collect()
-    } else {
-        porcelain.split(|byte| *byte == b'\n').collect()
-    };
+    // `-z` is an exact framing contract. Missing the final NUL is a truncated
+    // capture, not permission to reinterpret path bytes as line records.
+    if !porcelain.last().is_some_and(|byte| *byte == 0) {
+        return Err(IdentityError::GitProbeFailed {
+            operation: "truncated Git worktree framing",
+        });
+    }
+    let fields = porcelain.split(|byte| *byte == 0);
     for field in fields {
         if field.is_empty() {
             continue;
         }
         if let Some(raw) = field.strip_prefix(b"worktree ") {
-            finish(&mut records, &mut current_path, &mut current_branch);
+            finish(
+                &mut records,
+                &mut current_path,
+                &mut current_branch,
+                &mut detached,
+            )?;
             current_path = Some(ExactPath::from_git_bytes(raw)?);
         } else if let Some(raw) = field.strip_prefix(b"branch refs/heads/") {
+            if current_path.is_none() || detached || current_branch.is_some() {
+                return Err(IdentityError::GitProbeFailed {
+                    operation: "duplicate or conflicting Git branch field",
+                });
+            }
             current_branch = Some(BranchRef::from_bytes(raw)?);
         } else if field == b"detached" {
-            current_branch = None;
+            if current_path.is_none() || detached || current_branch.is_some() {
+                return Err(IdentityError::GitProbeFailed {
+                    operation: "duplicate or conflicting Git detached field",
+                });
+            }
+            detached = true;
+        } else if field == b"bare"
+            || field == b"locked"
+            || field.starts_with(b"locked ")
+            || field == b"prunable"
+            || field.starts_with(b"prunable ")
+            || field.starts_with(b"HEAD ")
+        {
+            if current_path.is_none() {
+                return Err(IdentityError::GitProbeFailed {
+                    operation: "Git worktree field precedes its record",
+                });
+            }
+        } else {
+            return Err(IdentityError::GitProbeFailed {
+                operation: "unknown Git worktree field",
+            });
         }
     }
-    finish(&mut records, &mut current_path, &mut current_branch);
+    finish(
+        &mut records,
+        &mut current_path,
+        &mut current_branch,
+        &mut detached,
+    )?;
+    if records.is_empty() {
+        return Err(IdentityError::GitProbeFailed {
+            operation: "empty Git worktree registration",
+        });
+    }
     Ok(records)
 }
 
@@ -852,11 +950,28 @@ mod tests {
 
     #[test]
     fn porcelain_identity_parser_keeps_unix_raw_path_and_ref_bytes() {
-        let porcelain = b"worktree /tmp/raw-path\0HEAD deadbeef\0branch refs/heads/feat/\xff\0";
+        let porcelain = b"worktree /tmp/raw-path\r\0HEAD deadbeef\0branch refs/heads/feat/\xff\0";
         let records = parse_worktree_identity_records(porcelain).unwrap();
         assert_eq!(records.len(), 1);
-        assert_eq!(records[0].path.as_bytes(), b"/tmp/raw-path");
+        assert_eq!(records[0].path.as_bytes(), b"/tmp/raw-path\r");
         assert_eq!(records[0].branch.as_ref().unwrap().raw(), b"feat/\xff");
+    }
+
+    #[test]
+    fn porcelain_identity_parser_rejects_truncation_and_conflicts() {
+        assert!(parse_worktree_identity_records(b"worktree /tmp/raw\n").is_err());
+        assert!(
+            parse_worktree_identity_records(
+                b"worktree /tmp/raw\0branch refs/heads/one\0branch refs/heads/two\0"
+            )
+            .is_err()
+        );
+        assert!(
+            parse_worktree_identity_records(
+                b"worktree /tmp/raw\0detached\0branch refs/heads/one\0"
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -869,11 +984,18 @@ mod tests {
         let path = worktree_path(&repo, "feat/a", &cfg);
         add_checked(&repo, "feat/a", "main", &path, &cfg).unwrap();
         let inspected = inspect_registered(&repo, &path).unwrap();
-        assert_eq!(inspected.registered_path.as_path(), path);
-        assert_eq!(inspected.branch.as_ref().unwrap().raw(), b"feat/a");
-        assert!(inspected.common_dir.as_path().is_absolute());
-        assert!(inspected.admin_dir.as_path().is_absolute());
+        assert_eq!(inspected.registered_path().as_path(), path);
+        assert_eq!(inspected.branch().unwrap().raw(), b"feat/a");
+        assert!(inspected.common_dir().as_path().is_absolute());
+        assert!(inspected.admin_dir().as_path().is_absolute());
         assert!(!inspected.admin_id().is_empty());
+        assert!(
+            !inspected
+                .generation()
+                .as_bytes()
+                .iter()
+                .all(|byte| *byte == 0)
+        );
         let _ = std::fs::remove_dir_all(&repo);
     }
 }
