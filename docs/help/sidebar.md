@@ -225,7 +225,10 @@ repo-local `.thegn.toml`.
 - `g` — flat / grouped: toggle between one list of every worktree across
   all repos (each tagged with its repo, ordered by the current `s` sort)
   and the per-project grouping. Pair with the `s` → live sort to always
-  see the latest-changed worktree at the top, regardless of project
+  see the latest-changed worktree at the top, regardless of project. The
+  header always names the current layout (`grouped`, or `flat` in the accent
+  colour) next to the sort chip. Click it to switch back: if your projects
+  and folders have vanished into one long list, that is flat mode
 - `i` — row detail: cycle the secondary line (branch, ahead/behind, PR)
   between **all** rows, the **cursor** row only, and **off**. The detail
   line only ever shows while the sidebar has focus. Defaults to the cursor

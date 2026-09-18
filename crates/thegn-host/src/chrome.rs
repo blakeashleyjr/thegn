@@ -452,6 +452,10 @@ pub struct FrameModel {
     /// `hold` mark. Mirrored from `SidebarState`, so it is loop-owned like
     /// `sidebar_focused` and deliberately outside hydration equality.
     pub sidebar_sort_frozen: bool,
+    /// True in the flat cross-workspace layout (`g`). Renders as the header's
+    /// clickable layout chip. Mirrored from `SidebarState` like
+    /// `sidebar_sort_frozen`, so loop-owned and outside hydration equality.
+    pub sidebar_flat: bool,
     /// Row indices (into the visible list) that are multi-selected.
     pub sidebar_marked: std::collections::HashSet<usize>,
     /// When `Some`, an open row context menu: (anchor visible-row index,
