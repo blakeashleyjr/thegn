@@ -80,15 +80,7 @@ pub(crate) fn spawn_scan(
             let path = std::path::Path::new(path_s);
             // loc_scan owns the repository boundary rule: a gitlink's checked
             // out source is not part of the superproject's LOC total.
-            let Some(report) = crate::loc_scan::scan(path) else {
-                // Unreadable or empty: drop any previous count rather than let
-                // the chip keep showing a number for a tree that is gone.
-                let _ = db.delete_loc_cache(path_s); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
-                counted += 1;
-                continue;
-            };
-            if let Ok(json) = serde_json::to_string(&report) {
-                let _ = db.put_loc_cache(path_s, report.total_code, &json); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+            if apply_scan_result(&db, path_s, crate::loc_scan::scan(path)) {
                 counted += 1;
             }
         }
@@ -99,6 +91,42 @@ pub(crate) fn spawn_scan(
             let _ = w.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
     });
+}
+
+/// Apply one scan without allowing an incomplete report to advance the cache's
+/// freshness timestamp. Returns whether the visible cache changed and should
+/// wake hydration.
+fn apply_scan_result(db: &Db, path: &str, outcome: crate::loc_scan::ScanOutcome) -> bool {
+    match outcome {
+        crate::loc_scan::ScanOutcome::Unavailable
+        | crate::loc_scan::ScanOutcome::Complete(None) => {
+            // An absent root or a completed empty walk means the old count no
+            // longer describes this target. Keep the prior deletion behavior.
+            let _ = db.delete_loc_cache(path); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+            true
+        }
+        crate::loc_scan::ScanOutcome::Complete(Some(report)) => {
+            if let Ok(json) = serde_json::to_string(&report) {
+                let _ = db.put_loc_cache(path, report.total_code, &json); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+                true
+            } else {
+                false
+            }
+        }
+        crate::loc_scan::ScanOutcome::Incomplete(report) => {
+            // Tokei found usable rows but at least one language read failed.
+            // Do not turn a partial result into a fresh cache stamp: retain the
+            // last complete row and let the normal bounded scheduler revisit
+            // this target later. There is no retry loop or extra wakeup here.
+            tracing::debug!(
+                target: LOG,
+                path,
+                partial_code = report.total_code,
+                "LOC scan incomplete; retaining previous cache"
+            );
+            false
+        }
+    }
 }
 
 /// Content-driven invalidation for the ACTIVE target: if its last count is
@@ -142,6 +170,7 @@ fn sweep_orphans(db: &Db) -> usize {
 mod tests {
     use super::*;
     use thegn_core::scan_sched::ScanTarget;
+    use thegn_core::store::CacheStore;
 
     const NOW: i64 = 1_000_000;
 
@@ -188,5 +217,103 @@ mod tests {
         let mut t = vec![ScanTarget::cold("/wt/new").active()];
         expire_watched(&mut t, NOW, 60);
         assert!(t[0].measured_at.is_none());
+    }
+
+    #[test]
+    fn incomplete_scan_retains_last_complete_cache_until_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("loc.db");
+        let db = Db::open_at(&db_path).unwrap();
+        let complete = thegn_core::loc::LocReport::total_only(12);
+        let complete_json = serde_json::to_string(&complete).unwrap();
+        assert!(apply_scan_result(
+            &db,
+            "/wt",
+            crate::loc_scan::ScanOutcome::Complete(Some(complete.clone()))
+        ));
+        drop(db);
+        // Move the fixture into the past so recovery must advance the stamp;
+        // two fast writes can otherwise legitimately share the same second.
+        let sql = rusqlite::Connection::open(&db_path).unwrap();
+        sql.execute(
+            "UPDATE loc_cache SET fetched_at=123 WHERE worktree='/wt'",
+            [],
+        )
+        .unwrap();
+        drop(sql);
+        let db = Db::open_at(&db_path).unwrap();
+        let (before_json, before_at) = db.get_loc_cache_entry("/wt").unwrap().unwrap();
+        assert_eq!(before_json, complete_json);
+        assert_eq!(before_at, 123);
+
+        let partial = thegn_core::loc::LocReport::total_only(99);
+        assert!(!apply_scan_result(
+            &db,
+            "/wt",
+            crate::loc_scan::ScanOutcome::Incomplete(partial)
+        ));
+        drop(db);
+        let db = Db::open_at(&db_path).unwrap();
+        let (retained_json, retained_at) = db.get_loc_cache_entry("/wt").unwrap().unwrap();
+        assert_eq!(retained_json, before_json);
+        assert_eq!(retained_at, before_at);
+
+        let recovered = thegn_core::loc::LocReport::total_only(21);
+        assert!(apply_scan_result(
+            &db,
+            "/wt",
+            crate::loc_scan::ScanOutcome::Complete(Some(recovered.clone()))
+        ));
+        let (recovered_json, recovered_at) = db.get_loc_cache_entry("/wt").unwrap().unwrap();
+        assert_eq!(
+            serde_json::from_str::<thegn_core::loc::LocReport>(&recovered_json).unwrap(),
+            recovered
+        );
+        assert!(recovered_at > retained_at);
+    }
+
+    #[test]
+    fn unavailable_or_empty_scan_keeps_the_delete_policy() {
+        let db = Db::open_memory().unwrap();
+        let report = thegn_core::loc::LocReport::total_only(12);
+        db.put_loc_cache(
+            "/wt",
+            report.total_code,
+            &serde_json::to_string(&report).unwrap(),
+        )
+        .unwrap();
+        assert!(apply_scan_result(
+            &db,
+            "/wt",
+            crate::loc_scan::ScanOutcome::Complete(None)
+        ));
+        assert!(db.get_loc_cache_entry("/wt").unwrap().is_none());
+
+        let report = thegn_core::loc::LocReport::total_only(12);
+        db.put_loc_cache(
+            "/wt",
+            report.total_code,
+            &serde_json::to_string(&report).unwrap(),
+        )
+        .unwrap();
+        assert!(apply_scan_result(
+            &db,
+            "/wt",
+            crate::loc_scan::ScanOutcome::Unavailable
+        ));
+        assert!(db.get_loc_cache_entry("/wt").unwrap().is_none());
+
+        let fresh = Db::open_memory().unwrap();
+        assert!(!apply_scan_result(
+            &fresh,
+            "/never-cached",
+            crate::loc_scan::ScanOutcome::Incomplete(thegn_core::loc::LocReport::total_only(99),)
+        ));
+        assert!(
+            fresh
+                .get_loc_cache_entry("/never-cached")
+                .unwrap()
+                .is_none()
+        );
     }
 }
