@@ -2758,7 +2758,9 @@ nix_daemon = false
 # chain itself names `host` (a chain without `host` always refuses instead):
 #   warn   — open the pane on the host and show a banner (default).
 #   prompt — currently behaves like warn (the picker layer may offer choices).
-#   fail   — refuse to open that pane (a halt modal, never a process exit).
+#   fail   — worktree panes: refuse that pane with a halt modal. (Terminal tabs
+#            and queue agent handoffs still use the older behaviour and exit
+#            thegn — known debt.)
 on_missing = "warn"
 
 # ── Failover when the SELECTED environment can't be brought up ─────────────────

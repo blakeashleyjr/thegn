@@ -11,7 +11,7 @@ gracefully across the available container/sandbox runtimes.
 
 ### Requirement: Graceful backend selection
 
-The sandbox SHALL select an isolation backend by preference order podman -> docker -> bwrap -> none, and MUST fall back to the next when a runtime is unavailable. When no backend is runnable, an `auto` selection on a LOCAL placement MUST fall back to `none` (run on the host) only when the user's configured `backend_chain` itself names `host`/`none` (the default chain does); otherwise, and for every explicit backend, dropped env selection, or non-local placement, the launch MUST halt with an actionable error instead of opening a host shell. `failover = "auto"` MUST NOT authorize host execution. Every fallback MUST be reported truthfully: the containment reported for a launch MUST describe what that launch actually entered, never what was requested.
+The sandbox SHALL select an isolation backend by preference order podman -> docker -> bwrap -> none, and MUST fall back to the next when a runtime is unavailable. When no backend is runnable, an `auto` selection on a LOCAL placement MUST fall back to `none` (run on the host) only when the user's configured `backend_chain` itself names `host`/`none` (the default chain does); otherwise, and for every explicit backend of a worktree pane, dropped env selection, or non-local placement, the launch MUST halt with an actionable error instead of opening a host shell. `failover = "auto"` MUST NOT authorize host execution. Every fallback MUST be reported truthfully: the containment reported for a launch MUST describe what that launch actually entered, never what was requested.
 
 #### Scenario: Preferred runtime missing
 
@@ -38,7 +38,7 @@ The sandbox SHALL select an isolation backend by preference order podman -> dock
 
 #### Scenario: Fallback is reported, not hidden
 
-- **WHEN** an explicit backend pick cannot be honoured and the launch degrades to the host
+- **WHEN** a terminal tab's explicit backend pick cannot be honoured and the tab degrades to the host
 - **THEN** the launch is labelled `host`, is flagged as degraded, and carries a warning naming the
   backend that was unavailable
 
