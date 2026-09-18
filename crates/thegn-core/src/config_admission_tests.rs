@@ -417,7 +417,12 @@ fn cli_schema_is_checked_before_lenient_override_deserialization() {
     let host_snapshot = hosts();
     let cases = [
         ("picker=\"not-a-picker\"", ConfigAdmissionError::CliInvalid),
-        ("metrics.timeout_ms=99", ConfigAdmissionError::CliInvalid),
+        // The schema admits an integer; final domain validation rejects
+        // the out-of-range value before publication.
+        (
+            "metrics.timeout_ms=99",
+            ConfigAdmissionError::SemanticInvalid,
+        ),
     ];
     for (override_value, expected) in cases {
         let overrides = vec![override_value.to_string()];

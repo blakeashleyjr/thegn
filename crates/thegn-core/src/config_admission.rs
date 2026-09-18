@@ -870,7 +870,7 @@ fn validate_cli_override_shape(
 ) -> Result<(), ConfigAdmissionError> {
     let key = crate::config_compat::canonical_key(key);
     let mut tree = bounded_json_value(cfg)?;
-    let value = if key == "apps.tab_order" {
+    let value = if key == "apps.tab_order" && !raw_value.trim().starts_with('[') {
         serde_json::Value::Array(
             raw_value
                 .split(',')
