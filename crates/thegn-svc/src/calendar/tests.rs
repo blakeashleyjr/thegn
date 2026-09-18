@@ -1,4 +1,5 @@
 use super::*;
+use axum::serve::Listener;
 use thegn_core::config_calendar::{CalendarAccount, CalendarConfig, CalendarProviderKind};
 
 struct CountingListener {
@@ -101,7 +102,23 @@ fn only_network_failures_are_transient() {
     assert!(!CalendarError::Auth("401".into()).is_transient());
     assert!(!CalendarError::Parse("bad".into()).is_transient());
     assert!(!CalendarError::NotConfigured.is_transient());
+    assert!(!CalendarError::Policy("calendar destination refused").is_transient());
     assert!(!CalendarError::Unsupported("create").is_transient());
+}
+
+#[test]
+fn dns_policy_and_network_failures_keep_distinct_calendar_classifications() {
+    assert!(matches!(
+        ics_url::map_transport_error(crate::http::CalendarHttpError::DestinationRefused),
+        CalendarError::Policy("calendar destination refused")
+    ));
+    assert!(matches!(
+        caldav::map_transport_error(crate::http::CalendarHttpError::DestinationRefused),
+        CalendarError::Policy("calendar destination refused")
+    ));
+    let network = ics_url::map_transport_error(crate::http::CalendarHttpError::Network);
+    assert!(matches!(network, CalendarError::Network(_)));
+    assert!(network.is_transient());
 }
 
 #[test]
@@ -236,6 +253,7 @@ async fn caldav_redirect_never_replays_a_sync_token_body_for_any_status() {
                         target.fetch_add(1, Ordering::SeqCst);
                         return (StatusCode::OK, "unexpected target").into_response();
                     }
+                    let path = request.uri().path().to_owned();
                     let body = to_bytes(request.into_body(), 128 * 1024).await.unwrap();
                     if body
                         .windows(b"sync-secret".len())
@@ -243,9 +261,7 @@ async fn caldav_redirect_never_replays_a_sync_token_body_for_any_status() {
                     {
                         token.fetch_add(1, Ordering::SeqCst);
                     }
-                    let status = request
-                        .uri()
-                        .path()
+                    let status = path
                         .rsplit('/')
                         .next()
                         .and_then(|value| value.parse::<u16>().ok())
@@ -407,7 +423,7 @@ async fn caldav_token_recovery_is_one_bounded_retry_with_shared_deadline() {
         let server = tokio::spawn(async move {
             axum::serve(
                 listener,
-                Router::new().fallback(any(move |request: Request| {
+                Router::new().fallback(any(move |_request: Request| {
                     let observed = Arc::clone(&observed);
                     let recorded = Arc::clone(&recorded);
                     async move {
@@ -598,6 +614,124 @@ async fn oversized_chunked_and_encoded_calendar_bodies_are_rejected_before_parse
                 "{path} must fail at the application-owned limit"
             );
         }
+    }
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn caldav_body_limits_cover_exact_chunked_and_error_responses() {
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let exact_prefix = b"<multistatus><sync-token>exact</sync-token><!--";
+    let exact_suffix = b"--></multistatus>";
+    let mut exact = Vec::with_capacity(crate::http::MAX_BODY_BYTES);
+    exact.extend_from_slice(exact_prefix);
+    exact.extend(std::iter::repeat_n(
+        b'x',
+        crate::http::MAX_BODY_BYTES - exact_prefix.len() - exact_suffix.len(),
+    ));
+    exact.extend_from_slice(exact_suffix);
+    let exact = Arc::new(exact);
+    let oversized = Arc::new(vec![b'x'; crate::http::MAX_BODY_BYTES + 1]);
+    let server = tokio::spawn({
+        let exact = Arc::clone(&exact);
+        let oversized = Arc::clone(&oversized);
+        async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let exact = Arc::clone(&exact);
+                let oversized = Arc::clone(&oversized);
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut byte = [0_u8; 1];
+                    while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        if socket.read(&mut byte).await.unwrap_or(0) == 0 {
+                            return;
+                        }
+                        request.push(byte[0]);
+                        if request.len() > 64 * 1024 {
+                            return;
+                        }
+                    }
+                    let path = request
+                        .split(|byte| *byte == b' ')
+                        .nth(1)
+                        .and_then(|path| std::str::from_utf8(path).ok())
+                        .unwrap_or_default();
+                    let (status, body, chunked) = match path {
+                        "/dav-exact" => ("207 Multi-Status", exact.as_slice(), false),
+                        "/dav-error" => ("500 Internal Server Error", oversized.as_slice(), true),
+                        _ => ("207 Multi-Status", oversized.as_slice(), true),
+                    };
+                    let transfer = if chunked {
+                        "Transfer-Encoding: chunked\r\n"
+                    } else {
+                        ""
+                    };
+                    let length = if chunked {
+                        String::new()
+                    } else {
+                        format!("Content-Length: {}\r\n", body.len())
+                    };
+                    let header = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/xml\r\n{transfer}{length}Connection: close\r\n\r\n"
+                    );
+                    if socket.write_all(header.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    if chunked {
+                        for chunk in body.chunks(64 * 1024) {
+                            if socket
+                                .write_all(format!("{:x}\r\n", chunk.len()).as_bytes())
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                            if socket.write_all(chunk).await.is_err()
+                                || socket.write_all(b"\r\n").await.is_err()
+                            {
+                                return;
+                            }
+                        }
+                        let _ = socket.write_all(b"0\r\n\r\n").await;
+                    } else {
+                        let _ = socket.write_all(body).await;
+                    }
+                });
+            }
+        }
+    });
+
+    let exact_result = caldav::CalDavBackend::new(&CalendarAccount {
+        url: format!("http://{address}/dav-exact"),
+        allow_private_network: true,
+        ..account("dav-exact", CalendarProviderKind::CalDav)
+    })
+    .list_events(window().0, window().1, "")
+    .await;
+    assert!(
+        exact_result.is_ok(),
+        "exactly capped CalDAV body must parse"
+    );
+
+    for path in ["/dav-oversized", "/dav-error"] {
+        let error = caldav::CalDavBackend::new(&CalendarAccount {
+            url: format!("http://{address}{path}"),
+            allow_private_network: true,
+            ..account("dav-limit", CalendarProviderKind::CalDav)
+        })
+        .list_events(window().0, window().1, "")
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(error, CalendarError::BodyLimit(_)),
+            "{path} must stop at the application-owned cap: {error:?}"
+        );
     }
     server.abort();
     let _ = server.await;
