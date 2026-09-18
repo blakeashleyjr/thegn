@@ -929,3 +929,32 @@ fn admission_refuses_lossy_captured_home_identity() {
     });
     assert!(matches!(result, Err(ConfigAdmissionError::InvalidUtf8)));
 }
+
+#[test]
+fn compatibility_diagnostics_are_bounded_by_bytes_as_well_as_count() {
+    // A wide legacy workspace table produces one compatibility diagnostic per
+    // child.  Keep the source under the scanner work cap while making each
+    // diagnostic large enough to expose count-only retention.
+    let slug = "s".repeat(900);
+    let mut source = String::new();
+    for index in 0..crate::config_budget::MAX_DIAGNOSTICS {
+        source.push_str(&format!("[workspace.\"{slug}{index:03}\"]\n"));
+    }
+    let normalized = crate::config_compat::normalize_admission(&source)
+        .expect("wide compatibility source remains within source/serialization budgets");
+    assert!(normalized.diagnostics.len() <= crate::config_budget::MAX_DIAGNOSTICS);
+    assert!(
+        normalized
+            .diagnostics
+            .iter()
+            .all(|message| message.len() <= crate::config_budget::MAX_DIAGNOSTIC_BYTES)
+    );
+    let total = normalized
+        .diagnostics
+        .iter()
+        .map(String::len)
+        .sum::<usize>();
+    assert!(
+        total <= crate::config_budget::MAX_DIAGNOSTICS * crate::config_budget::MAX_DIAGNOSTIC_BYTES
+    );
+}
