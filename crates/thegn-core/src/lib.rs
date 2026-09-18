@@ -40,6 +40,7 @@ pub mod completion;
 pub mod config;
 pub mod config_activity;
 pub mod config_admission;
+pub mod config_admission_store;
 pub mod config_automations;
 pub mod config_autopilot;
 pub mod config_budget;

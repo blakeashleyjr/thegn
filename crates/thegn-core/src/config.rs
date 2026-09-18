@@ -6283,6 +6283,20 @@ impl Config {
         self.post_process_inner(true, &paths);
     }
 
+    /// Install the process-wide runtime effects of an **already admitted**
+    /// configuration: the `[remote]`/`[network]` tuning holders plus the
+    /// advisory policy/command warnings the legacy loader emitted. Admission
+    /// itself is side-effect-free, so a rejected candidate never reaches this;
+    /// the host calls it exactly when it publishes a generation.
+    pub fn install_admitted_runtime(&self) {
+        crate::config_drawer::warn_policy_issues(self);
+        self.remote.install();
+        self.network.install();
+        for diagnostic in crate::custom_cmd::validate_commands(&self.git_commands) {
+            config_warn(&diagnostic);
+        }
+    }
+
     /// Normalize an admitted candidate without emitting diagnostics or
     /// installing process-global policy.  Admission calls this before its
     /// final checks; the legacy loader keeps the effectful wrapper above.
