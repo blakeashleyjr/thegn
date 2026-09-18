@@ -815,6 +815,21 @@ async fn caldav_body_limits_cover_exact_chunked_and_error_responses() {
                             return;
                         }
                     }
+                    // Consume the REPORT body before closing the socket.
+                    // Closing with unread request bytes can reset TCP and
+                    // truncate an otherwise exactly-sized valid response.
+                    let headers = std::str::from_utf8(&request).unwrap();
+                    let length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap_or(0);
+                    assert!(length <= crate::http::MAX_REQUEST_BYTES);
+                    let mut request_body = vec![0; length];
+                    socket.read_exact(&mut request_body).await.unwrap();
                     let path = request
                         .split(|byte| *byte == b' ')
                         .nth(1)
@@ -874,7 +889,7 @@ async fn caldav_body_limits_cover_exact_chunked_and_error_responses() {
     .await;
     assert!(
         exact_result.is_ok(),
-        "exactly capped CalDAV body must parse"
+        "exactly capped CalDAV body must parse: {exact_result:?}"
     );
 
     for path in ["/dav-oversized", "/dav-error"] {

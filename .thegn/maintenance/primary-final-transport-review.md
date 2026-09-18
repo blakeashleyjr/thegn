@@ -3,3 +3,5 @@ Follow-up independent review of496. Scope the revision since f64ee3f3 /15aff858 
 Source-only review, optional tests, no production changes or builds. Existing central focused run is still validating frozen f64ee3f3 and cannot attest the later revision yet. Primary will run new regressions and final gate. Record source-review-clear/revisions-needed with pending validation, no merge/close.
 
 Central frozen f64ee3f3 compilation failed before tests: a used request parameter had been renamed \_request, and sibling classification tests called private map_transport_error functions. Primary repaired the parameter and widened helpers only to pub(super); all Rust tests remain pending at this latest head. Review these small repairs too.
+
+Latest c8b625a5 focused core/service run compiled and ran144tests:143pass, one exact-capCalDAV rawserverfixture failed. Primary corrected rawserver to consume bounded REPORT requestbody before socketclose (unreadTCPrequestbytes can reset/truncate response); added actual result tofailuremessage. Allother tests—including realDNS/connecttimeout/pool/body/errorheader caps—passed. Updated exactfixture remains pending rerun.
