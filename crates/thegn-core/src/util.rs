@@ -5,7 +5,11 @@ use crate::msg;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc;
+use std::sync::{
+    Arc, OnceLock,
+    atomic::{AtomicUsize, Ordering},
+    mpsc,
+};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
@@ -169,110 +173,213 @@ pub(crate) fn git_stdout_bounded(
 /// the reader stops at `max_bytes + 1` instead of polling an unbounded spool.
 /// Unix probes are put in their own process group so descendants holding the
 /// pipe are torn down with the probe.
-fn bounded_stdout(mut command: Command, max_bytes: usize) -> Result<Vec<u8>, String> {
-    let read_limit = u64::try_from(max_bytes)
-        .ok()
-        .and_then(|limit| limit.checked_add(1))
-        .ok_or_else(|| "git identity probe has an invalid output bound".to_string())?;
-    #[cfg(unix)]
-    command.process_group(0);
-    let mut child = command.spawn().map_err(|error| error.to_string())?;
-    let stdout = match child.stdout.take() {
-        Some(stdout) => stdout,
-        None => {
-            terminate_and_reap(child);
-            return Err("git identity probe stdout pipe was not created".into());
-        }
-    };
-    let (sender, receiver) = mpsc::sync_channel(1);
-    std::thread::Builder::new()
-        .name("thegn-git-identity-reader".into())
-        .spawn(move || {
-            let mut bytes = Vec::with_capacity(max_bytes.min(4096));
-            let result = stdout
-                .take(read_limit)
-                .read_to_end(&mut bytes)
-                .map(|_| bytes);
-            let _ = sender.send(result);
-        })
-        .map_err(|error| {
-            terminate_and_reap(child);
-            error.to_string()
-        })?;
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
-    let mut captured = None;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if std::time::Instant::now() < deadline => {
-                if captured.is_none() {
-                    captured = receiver.try_recv().ok();
-                }
-                if let Some(Ok(bytes)) = captured.as_ref() {
-                    if bytes.len() > max_bytes {
-                        terminate_and_reap(child);
-                        return Err("git identity probe output exceeded its bound".into());
-                    }
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            Ok(None) => {
-                terminate_and_reap(child);
-                return Err("git identity probe exceeded its time bound".into());
-            }
-            Err(error) => {
-                terminate_and_reap(child);
-                return Err(error.to_string());
-            }
-        }
-    };
-    let bytes = match captured {
-        Some(result) => result.map_err(|error| error.to_string())?,
-        None => match receiver
-            .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
-        {
-            Ok(result) => result.map_err(|error| error.to_string())?,
-            Err(_) => {
-                terminate_and_reap(child);
-                return Err("git identity probe stdout reader exceeded its time bound".into());
-            }
-        },
-    };
-    if bytes.len() > max_bytes {
-        return Err("git identity probe output exceeded its bound".into());
+const IDENTITY_CAPTURE_SLOTS: usize = 2;
+static IDENTITY_CAPTURE_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+
+struct IdentityCaptureBudget(&'static AtomicUsize);
+
+impl Drop for IdentityCaptureBudget {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
     }
-    if !status.success() {
-        return Err(format!("git exited with {status}"));
-    }
-    Ok(bytes)
 }
 
-fn terminate_and_reap(mut child: Child) {
+fn identity_capture_budget() -> Result<Arc<IdentityCaptureBudget>, String> {
+    IDENTITY_CAPTURE_IN_FLIGHT
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+            (count < IDENTITY_CAPTURE_SLOTS).then_some(count + 1)
+        })
+        .map(|_| Arc::new(IdentityCaptureBudget(&IDENTITY_CAPTURE_IN_FLIGHT)))
+        .map_err(|_| {
+            "git identity capture capacity is held by unfinished child or pipe; retry later"
+                .to_string()
+        })
+}
+
+type IdentityReapJob = (Child, Arc<IdentityCaptureBudget>);
+
+fn identity_reaper() -> Result<&'static mpsc::SyncSender<IdentityReapJob>, String> {
+    static REAPER: OnceLock<Result<mpsc::SyncSender<IdentityReapJob>, String>> = OnceLock::new();
+    REAPER
+        .get_or_init(|| {
+            let (sender, receiver) = mpsc::sync_channel(IDENTITY_CAPTURE_SLOTS);
+            std::thread::Builder::new()
+                .name("thegn-git-identity-reaper".into())
+                .spawn(move || {
+                    while let Ok((mut child, budget)) = receiver.recv() {
+                        // This is the one shared reaper for the fixed capture
+                        // lane. Its queue is bounded, so a stuck child cannot
+                        // create one new waiter per timed-out probe.
+                        match child.wait() {
+                            Ok(_) => drop(budget),
+                            Err(_) => {
+                                // Unknown wait ownership is fail-closed: keep
+                                // both the child and capacity permanently held
+                                // rather than admitting an unbounded successor.
+                                std::mem::forget((child, budget));
+                            }
+                        }
+                    }
+                })
+                .map(|_| sender)
+                .map_err(|error| error.to_string())
+        })
+        .as_ref()
+        .map_err(|error| error.clone())
+}
+
+fn reap_identity_later(child: Child, budget: Arc<IdentityCaptureBudget>) {
+    let sender = identity_reaper().expect("identity reaper initialized before child spawn");
+    match sender.try_send((child, budget)) {
+        Ok(()) => {}
+        Err(mpsc::TrySendError::Full(job) | mpsc::TrySendError::Disconnected(job)) => {
+            // The finite lane is exhausted by unresolved ownership. Do not
+            // drop the job and falsely release capacity for a PID/pipe whose
+            // lifetime is unknown.
+            std::mem::forget(job);
+        }
+    }
+}
+
+fn kill_identity_process_tree(child: &mut Child) {
     #[cfg(unix)]
     {
         use nix::sys::signal::{Signal, killpg};
         use nix::unistd::Pid;
         if let Ok(pid) = i32::try_from(child.id()) {
+            // The direct child remains owned and unreaped while this runs, so
+            // the process-group identity cannot have been reused.
             let _ = killpg(Pid::from_raw(pid), Signal::SIGKILL);
         }
     }
+    // Windows has no process-group operation in this core seam. The direct
+    // child is killed, while the reader/reaper budget remains held if a
+    // descendant retains stdout; callers therefore fail closed instead of
+    // claiming descendant containment parity.
     let _ = child.kill();
-    let reap_deadline = std::time::Instant::now() + Duration::from_millis(250);
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) | Err(_) => return,
-            Ok(None) if std::time::Instant::now() >= reap_deadline => break,
-            Ok(None) => std::thread::sleep(Duration::from_millis(5)),
+}
+
+type IdentityReaderSpawner = fn(Box<dyn FnOnce() + Send>) -> std::io::Result<()>;
+
+fn spawn_identity_reader(task: Box<dyn FnOnce() + Send>) -> std::io::Result<()> {
+    std::thread::Builder::new()
+        .name("thegn-git-identity-reader".into())
+        .spawn(task)
+        .map(drop)
+}
+
+fn bounded_stdout(command: Command, max_bytes: usize) -> Result<Vec<u8>, String> {
+    bounded_stdout_with(command, max_bytes, spawn_identity_reader)
+}
+
+fn bounded_stdout_with(
+    mut command: Command,
+    max_bytes: usize,
+    spawn_reader: IdentityReaderSpawner,
+) -> Result<Vec<u8>, String> {
+    command.stdout(Stdio::piped()).stderr(Stdio::null());
+    let read_limit = u64::try_from(max_bytes)
+        .ok()
+        .and_then(|limit| limit.checked_add(1))
+        .ok_or_else(|| "git identity probe has an invalid output bound".to_string())?;
+    identity_reaper()?;
+    let budget = identity_capture_budget()?;
+    #[cfg(unix)]
+    command.process_group(0);
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => return Err(error.to_string()),
+    };
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            kill_identity_process_tree(&mut child);
+            reap_identity_later(child, budget.clone());
+            return Err("git identity probe stdout pipe was not created".into());
         }
+    };
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let reader_budget = Arc::clone(&budget);
+    let reader_task = Box::new(move || {
+        let mut bytes = Vec::with_capacity(max_bytes.min(4096));
+        let result = stdout
+            .take(read_limit)
+            .read_to_end(&mut bytes)
+            .map(|_| bytes);
+        drop(reader_budget);
+        let _ = sender.send(result);
+    });
+    if let Err(error) = spawn_reader(reader_task) {
+        kill_identity_process_tree(&mut child);
+        reap_identity_later(child, budget.clone());
+        return Err(error.to_string());
     }
-    // Ownership is explicit even when the OS cannot reap immediately. The
-    // caller never performs an unbounded wait; this bounded reaper owns the
-    // child until the kernel reports its exit.
-    let _ = std::thread::Builder::new()
-        .name("thegn-git-identity-reaper".into())
-        .spawn(move || {
-            let _ = child.wait();
-        });
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let mut captured = None;
+    let status = loop {
+        if captured.is_none() {
+            if let Ok(result) = receiver.try_recv() {
+                if result.as_ref().is_ok_and(|bytes| bytes.len() > max_bytes) {
+                    kill_identity_process_tree(&mut child);
+                    reap_identity_later(child, budget.clone());
+                    return Err("git identity probe output exceeded its bound".into());
+                }
+                captured = Some(result);
+            }
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10))
+            }
+            Ok(None) => {
+                kill_identity_process_tree(&mut child);
+                reap_identity_later(child, budget.clone());
+                return Err("git identity probe exceeded its time bound".into());
+            }
+            Err(error) => {
+                reap_identity_later(child, budget.clone());
+                return Err(error.to_string());
+            }
+        }
+    };
+    let result = match captured.or_else(|| {
+        receiver
+            .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+            .ok()
+    }) {
+        Some(result) => result,
+        None => {
+            // The leader has exited but a descendant may still own the pipe.
+            // Kill while the unreaped leader still proves process-group
+            // ownership, then transfer the direct child to the shared reaper.
+            kill_identity_process_tree(&mut child);
+            reap_identity_later(child, budget.clone());
+            return Err("git identity probe stdout reader exceeded its time bound".into());
+        }
+    };
+    let bytes = match result {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            reap_identity_later(child, budget.clone());
+            return Err(error.to_string());
+        }
+    };
+    if bytes.len() > max_bytes {
+        // The child is already known to have exited, but it remains unreaped;
+        // cleanup is still done while ownership is explicit.
+        kill_identity_process_tree(&mut child);
+        reap_identity_later(child, budget.clone());
+        return Err("git identity probe output exceeded its bound".into());
+    }
+    if let Err(error) = child.wait() {
+        reap_identity_later(child, budget.clone());
+        return Err(error.to_string());
+    }
+    if !status.success() {
+        return Err(format!("git exited with {status}"));
+    }
+    Ok(bytes)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -321,20 +428,42 @@ pub(crate) fn native_path_bytes_bounded(
     }
 }
 
+/// An opened Git administrative directory and its exact instance stamp.
+/// Keeping the handle alive across the inspection closes the path-swap window;
+/// the creation identity is read from that same handle before it is released.
+pub(crate) struct GitAdminInstanceStamp {
+    _handle: same_file::Handle,
+    bytes: Vec<u8>,
+}
+
+impl GitAdminInstanceStamp {
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
 /// Capture the OS identity of a Git administrative directory. The resulting
 /// bytes remain an inspection proof owned by the Git adapter; callers must not
-/// manufacture a generation from random bytes.
-pub(crate) fn git_admin_instance_stamp(path: &Path) -> Option<Vec<u8>> {
-    // `same-file` owns the platform-specific handle implementation. In
-    // particular, this avoids the unstable Windows MetadataExt accessors and
-    // does not include mutable timestamps: checkout/index-lock activity may
-    // change ctime while the Git administrative directory is still the same
-    // instance. The Hash implementation is the crate's stable identity pair
-    // (dev+inode on Unix, volume+file index on Windows).
+/// manufacture a generation from random bytes. `Metadata::created` is read
+/// from the same opened handle as the object identity and is required: device
+/// plus inode/file-index alone identifies an object only while it is held and
+/// can be reused after delete/recreate. Platforms/filesystems without a
+/// creation identity fail closed.
+pub(crate) fn git_admin_instance_stamp(path: &Path) -> Option<GitAdminInstanceStamp> {
+    use std::hash::Hash as _;
+
     let handle = same_file::Handle::from_path(path).ok()?;
+    let created = handle.as_file().metadata().ok()?.created().ok()?;
+    let since_epoch = created.duration_since(UNIX_EPOCH).ok()?;
     let mut hasher = IdentityStampHasher::default();
+    hasher.write(b"thegn/git-admin-instance-v2");
     std::hash::Hash::hash(&handle, &mut hasher);
-    (!hasher.bytes.is_empty()).then_some(hasher.bytes)
+    since_epoch.as_secs().hash(&mut hasher);
+    since_epoch.subsec_nanos().hash(&mut hasher);
+    (!hasher.bytes.is_empty()).then_some(GitAdminInstanceStamp {
+        _handle: handle,
+        bytes: hasher.bytes,
+    })
 }
 
 #[derive(Default)]
@@ -1340,25 +1469,49 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn bounded_stdout_handles_idle_and_oversized_injected_children() {
-        let idle = Command::new("/bin/sh");
-        assert!(
-            bounded_stdout(idle.args(["-c", "exit 0"]), 32)
-                .unwrap()
-                .is_empty()
-        );
+        let mut idle = Command::new("/bin/sh");
+        idle.args(["-c", "exit 0"]);
+        assert!(bounded_stdout(idle, 32).unwrap().is_empty());
 
-        let oversized = Command::new("/bin/sh");
-        let error =
-            bounded_stdout(oversized.args(["-c", "head -c 128 /dev/zero"]), 32).unwrap_err();
+        let mut oversized = Command::new("/bin/sh");
+        oversized.args(["-c", "head -c 128 /dev/zero"]);
+        let error = bounded_stdout(oversized, 32).unwrap_err();
         assert!(error.contains("exceeded its bound"));
     }
 
     #[cfg(unix)]
     #[test]
     fn bounded_stdout_cleans_a_child_that_holds_stdout_after_exit() {
-        let holding = Command::new("/bin/sh");
-        let error = bounded_stdout(holding.args(["-c", "(sleep 10) & exit 0"]), 32).unwrap_err();
+        let mut holding = Command::new("/bin/sh");
+        holding.args(["-c", "(sleep 10) & exit 0"]);
+        let error = bounded_stdout(holding, 32).unwrap_err();
         assert!(error.contains("reader") || error.contains("time bound"));
+    }
+
+    #[test]
+    fn identity_capture_budget_is_finite_and_reclaims_completed_slots() {
+        let first = identity_capture_budget().unwrap();
+        let second = identity_capture_budget().unwrap();
+        assert!(identity_capture_budget().is_err());
+        drop(first);
+        assert!(identity_capture_budget().is_ok());
+        drop(second);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_stdout_reader_setup_failure_keeps_child_in_the_shared_reaper() {
+        fn refuse_reader(_: Box<dyn FnOnce() + Send>) -> std::io::Result<()> {
+            Err(std::io::Error::other("injected reader setup refusal"))
+        }
+
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "sleep 1"]);
+        let error = bounded_stdout_with(command, 32, refuse_reader).unwrap_err();
+        assert!(error.contains("injected reader setup refusal"));
+        // A setup failure must not release the slot until the owned child has
+        // actually been reaped by the bounded shared queue.
+        assert!(identity_capture_budget().is_err());
     }
 
     #[test]
