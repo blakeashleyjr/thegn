@@ -130,7 +130,7 @@ fn rename_scalar(
             table.remove(legacy);
             push_diagnostic(
                 diagnostics,
-                format!(
+                format_args!(
                     "duplicate config keys `{canonical_path}` and `{legacy_path}`; using canonical `{canonical_path}` (legacy accepted for {LEGACY_RELEASE_WINDOW} stable releases; removal: {LEGACY_REMOVAL_RELEASE})"
                 ),
             );
@@ -138,7 +138,7 @@ fn rename_scalar(
             table.insert(canonical.to_string(), value);
             push_diagnostic(
                 diagnostics,
-                format!(
+                format_args!(
                     "deprecated config key `{legacy_path}`; use `{canonical_path}` (accepted for {LEGACY_RELEASE_WINDOW} stable releases; removal: {LEGACY_REMOVAL_RELEASE})"
                 ),
             );
@@ -176,29 +176,27 @@ fn normalize_project_tables(
     if entries.is_empty() {
         push_diagnostic(
             diagnostics,
-            format!(
+            format_args!(
                 "deprecated config table `workspace`; use `project` (accepted for {LEGACY_RELEASE_WINDOW} stable releases; removal: {LEGACY_REMOVAL_RELEASE})"
             ),
         );
     }
     for (slug, item) in entries {
-        let legacy_path = format!("workspace.{slug}");
-        let canonical_path = format!("project.{slug}");
         if canonical_table.contains_key(&slug) {
             push_diagnostic(
                 diagnostics,
-                format!(
-                    "duplicate config tables `{canonical_path}` and `{legacy_path}`; using canonical `{canonical_path}` (legacy accepted for {LEGACY_RELEASE_WINDOW} stable releases; removal: {LEGACY_REMOVAL_RELEASE})"
+                format_args!(
+                    "duplicate config tables `project.{slug}` and `workspace.{slug}`; using canonical `project.{slug}` (legacy accepted for {LEGACY_RELEASE_WINDOW} stable releases; removal: {LEGACY_REMOVAL_RELEASE})"
                 ),
             );
         } else {
-            canonical_table.insert(slug, item);
             push_diagnostic(
                 diagnostics,
-                format!(
-                    "deprecated config table `{legacy_path}`; use `{canonical_path}` (accepted for {LEGACY_RELEASE_WINDOW} stable releases; removal: {LEGACY_REMOVAL_RELEASE})"
+                format_args!(
+                    "deprecated config table `workspace.{slug}`; use `project.{slug}` (accepted for {LEGACY_RELEASE_WINDOW} stable releases; removal: {LEGACY_REMOVAL_RELEASE})"
                 ),
             );
+            canonical_table.insert(slug, item);
         }
     }
 }
@@ -261,10 +259,33 @@ fn encoded_upper_bound(value: &toml::Value) -> Result<usize, crate::config_budge
     walk(value, 0)
 }
 
-fn push_diagnostic(diagnostics: &mut Vec<String>, diagnostic: String) {
-    if diagnostics.len() < crate::config_budget::MAX_DIAGNOSTICS {
-        diagnostics.push(diagnostic);
+fn push_diagnostic(diagnostics: &mut Vec<String>, diagnostic: std::fmt::Arguments<'_>) {
+    use std::fmt::Write;
+    if diagnostics.len() >= crate::config_budget::MAX_DIAGNOSTICS {
+        return;
     }
+    struct BoundedMessage(String);
+    impl Write for BoundedMessage {
+        fn write_str(&mut self, text: &str) -> std::fmt::Result {
+            let remaining = crate::config_budget::MAX_DIAGNOSTIC_BYTES - self.0.len();
+            let mut end = text.len().min(remaining);
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            self.0.push_str(&text[..end]);
+            if end < text.len() {
+                Err(std::fmt::Error)
+            } else {
+                Ok(())
+            }
+        }
+    }
+    let mut message = BoundedMessage(String::with_capacity(
+        crate::config_budget::MAX_DIAGNOSTIC_BYTES,
+    ));
+    // Best-effort diagnostic projection: stop formatting at the byte cap.
+    let _ = message.write_fmt(diagnostic);
+    diagnostics.push(message.0);
 }
 
 #[cfg(test)]
