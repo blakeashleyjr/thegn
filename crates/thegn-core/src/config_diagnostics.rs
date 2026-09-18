@@ -80,10 +80,10 @@ impl Recent {
 pub(crate) fn warn(message: &str) {
     let message = safe_warning(message);
     CAPTURE.with_borrow_mut(|captured| {
-        if let Some(captured) = captured {
-            if captured.len() < MAX_DIAGNOSTICS {
-                captured.push(message.clone());
-            }
+        if let Some(captured) = captured
+            && captured.len() < MAX_DIAGNOSTICS
+        {
+            captured.push(message.clone());
         }
     });
     let emit = !QUIET.get()

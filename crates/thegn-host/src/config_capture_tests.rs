@@ -478,7 +478,8 @@ fn load_once_uses_private_config_and_wal_fixtures_and_fails_closed() {
     // Every failure below travels through the real ConfigCaptureSeed::load_once
     // path. None can be reclassified as an absent/empty host snapshot.
     for suffix in ["-wal", "-shm", "-journal"] {
-        let _ = std::fs::remove_file(seed.state_db.with_extension(format!("db{suffix}"))); // best-effort: fixture cleanup; never hides an expected refusal
+        std::fs::remove_file(seed.state_db.with_extension(format!("db{suffix}")))
+            .unwrap_or_default(); // best-effort: fixture cleanup; never hides an expected refusal
     }
     std::fs::write(&seed.state_db, b"not sqlite").unwrap();
     assert!(matches!(
@@ -486,7 +487,7 @@ fn load_once_uses_private_config_and_wal_fixtures_and_fails_closed() {
         Err(CaptureFailure::State(StateHostReadError::Database(_)))
     ));
 
-    let _ = std::fs::remove_file(&seed.state_db); // best-effort: fixture cleanup; refusal is asserted below
+    std::fs::remove_file(&seed.state_db).unwrap_or_default(); // best-effort: fixture cleanup; refusal is asserted below
     let wrong = Connection::open(&seed.state_db).unwrap();
     wrong
         .execute_batch(
@@ -499,15 +500,15 @@ fn load_once_uses_private_config_and_wal_fixtures_and_fails_closed() {
         Err(CaptureFailure::State(StateHostReadError::Database(_)))
     ));
 
-    let _ = std::fs::remove_file(&seed.state_db); // best-effort: fixture cleanup; refusal is asserted below
+    std::fs::remove_file(&seed.state_db).unwrap_or_default(); // best-effort: fixture cleanup; refusal is asserted below
     std::fs::write(seed.state_db.with_extension("db-wal"), b"orphan").unwrap();
     assert!(matches!(
         seed.load_once(),
         Err(CaptureFailure::State(StateHostReadError::OrphanedSidecar))
     ));
 
-    let _ = std::fs::remove_file(seed.state_db.with_extension("db-wal")); // best-effort: fixture cleanup; orphan refusal is already asserted
-    let _ = std::fs::remove_file(&seed.state_db); // best-effort: fixture cleanup; busy refusal is asserted below
+    std::fs::remove_file(seed.state_db.with_extension("db-wal")).unwrap_or_default(); // best-effort: fixture cleanup; orphan refusal is already asserted
+    std::fs::remove_file(&seed.state_db).unwrap_or_default(); // best-effort: fixture cleanup; busy refusal is asserted below
     let locked = create_host_db(&seed.state_db, false);
     locked.execute_batch("BEGIN EXCLUSIVE").unwrap();
     assert!(matches!(

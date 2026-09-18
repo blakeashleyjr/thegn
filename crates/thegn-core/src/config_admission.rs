@@ -419,7 +419,7 @@ pub fn admit(inputs: AdmissionInputs<'_>) -> Result<AdmittedConfig, ConfigAdmiss
     let profile = match inputs.profile {
         Some(profile) => {
             let bytes = source_bytes(&profile, true)
-                .map_err(|error| map_profile_error(error))?
+                .map_err(map_profile_error)?
                 .ok_or(ConfigAdmissionError::ProfileInvalid)?;
             parse_layer(&profile, Some(bytes), LayerKind::Profile).map_err(map_profile_error)?
         }

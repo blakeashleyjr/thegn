@@ -954,7 +954,7 @@ fn check_iroh(
     let token_ok = auth.len() <= MAX_PROVIDER_INJECTION_BYTES
         && auth
             .strip_prefix("tgi_")
-            .is_some_and(|hex| hex.len() >= 32 && hex.len() % 2 == 0 && lower_hex(hex));
+            .is_some_and(|hex| hex.len() >= 32 && hex.len().is_multiple_of(2) && lower_hex(hex));
     if !token_ok {
         return Err(err("iroh.sandbox_auth", "sandbox token is malformed"));
     }
@@ -1061,7 +1061,7 @@ impl<'a> Wire<'a> {
 /// Strict, bounded standard-alphabet base64 with mandatory canonical padding.
 fn decode_base64(raw: &str) -> Option<Vec<u8>> {
     let bytes = raw.as_bytes();
-    if bytes.is_empty() || bytes.len() % 4 != 0 || bytes.len() > MAX_PROVIDER_KEY_BYTES {
+    if bytes.is_empty() || !bytes.len().is_multiple_of(4) || bytes.len() > MAX_PROVIDER_KEY_BYTES {
         return None;
     }
     fn value(byte: u8) -> Option<u8> {
