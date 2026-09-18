@@ -10,11 +10,12 @@
 //! [`GroupHandle`] does too — better orphan hygiene than unix pgids (a thegn
 //! that dies mid-run takes its spawned trees with it).
 
-use std::process::Command;
+use std::io;
+use std::process::{Child, Command};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, STILL_ACTIVE};
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, STILL_ACTIVE, WAIT_OBJECT_0};
 use windows_sys::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE, SetStdHandle};
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
@@ -34,7 +35,7 @@ pub(crate) fn display_git_path(path: &std::path::Path) -> String {
 }
 use windows_sys::Win32::System::Threading::{
     GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
-    TerminateProcess,
+    TerminateProcess, WaitForSingleObject,
 };
 
 /// Restores the original stderr handle on drop
@@ -697,6 +698,190 @@ pub fn spawn_grouped(cmd: &mut Command) -> std::io::Result<(std::process::Child,
         }
     };
     Ok((child, GroupHandle { pid, job }))
+}
+
+/// A desktop helper together with its owned direct child and optional Job
+/// Object. The child remains owned until process-tree cleanup and wait finish.
+pub struct DesktopChild {
+    child: Child,
+    group: GroupHandle,
+    state: DesktopChildState,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DesktopChildState {
+    Live,
+    ObservedExited,
+    Reaped,
+    Uncertain,
+}
+
+impl DesktopChild {
+    /// Spawn a notifier and retain its Job Object (or degraded direct-child
+    /// ownership when Job Object setup fails).
+    pub fn spawn(cmd: &mut Command) -> io::Result<Self> {
+        let (child, group) = spawn_grouped(cmd)?;
+        Ok(Self {
+            child,
+            group,
+            state: DesktopChildState::Live,
+        })
+    }
+
+    /// Observe process exit without consuming the direct-child wait status.
+    pub fn poll_exit(&mut self) -> io::Result<bool> {
+        match self.state {
+            DesktopChildState::ObservedExited => return Ok(true),
+            DesktopChildState::Reaped => {
+                return Err(io::Error::other("desktop child was already reaped"));
+            }
+            DesktopChildState::Uncertain => {
+                return Err(io::Error::other(
+                    "desktop child wait ownership is uncertain",
+                ));
+            }
+            DesktopChildState::Live => {}
+        }
+        use std::os::windows::io::AsRawHandle;
+
+        // SAFETY: waiting with zero timeout on the owned process handle does
+        // not consume its wait state.
+        let result = unsafe { WaitForSingleObject(self.child.as_raw_handle() as HANDLE, 0) };
+        match result {
+            WAIT_OBJECT_0 => {
+                self.state = DesktopChildState::ObservedExited;
+                Ok(true)
+            }
+            windows_sys::Win32::Foundation::WAIT_TIMEOUT => Ok(false),
+            _ => {
+                self.state = DesktopChildState::Uncertain;
+                Err(io::Error::last_os_error())
+            }
+        }
+    }
+
+    /// Terminate through the owned Job Object, or through the owned direct
+    /// Child on the documented degraded path, then reap that same Child.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "owned child wait runs only on the dedicated desktop dispatcher thread"
+    )]
+    pub fn terminate_and_wait(&mut self) -> io::Result<()> {
+        match self.state {
+            DesktopChildState::Live => {
+                self.poll_exit()?;
+            }
+            DesktopChildState::ObservedExited => {}
+            DesktopChildState::Reaped => {
+                return Err(io::Error::other("desktop child was already reaped"));
+            }
+            DesktopChildState::Uncertain => {
+                return Err(io::Error::other(
+                    "desktop child wait ownership is uncertain",
+                ));
+            }
+        }
+        let exited = self.state == DesktopChildState::ObservedExited;
+        let termination_error = if let Some(job) = self.group.job.as_ref() {
+            // SAFETY: the Job Object handle is owned by this child wrapper.
+            (unsafe { TerminateJobObject(job.0, 1) } == 0).then(io::Error::last_os_error)
+        } else if exited {
+            // The direct child has already exited. There is no owned Job Object
+            // to clean up, and Child::kill would spuriously report failure.
+            None
+        } else {
+            // No raw PID fallback: the std Child remains the direct owner.
+            self.child.kill().err()
+        };
+        match self.child.wait() {
+            Ok(_) => self.state = DesktopChildState::Reaped,
+            Err(error) => {
+                self.state = DesktopChildState::Uncertain;
+                return Err(error);
+            }
+        }
+        if let Some(error) = termination_error {
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Reap only through the still-owned direct child. Used by quarantine and
+    /// never attempts a PID or Job Object signal after ownership is uncertain.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "owned child wait runs only on the dedicated desktop dispatcher thread"
+    )]
+    pub fn reap_owned(&mut self) -> io::Result<()> {
+        if self.state == DesktopChildState::Reaped {
+            return Err(io::Error::other("desktop child was already reaped"));
+        }
+        match self.child.wait() {
+            Ok(_) => {
+                self.state = DesktopChildState::Reaped;
+                Ok(())
+            }
+            Err(error) => {
+                self.state = DesktopChildState::Uncertain;
+                Err(error)
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod desktop_child_tests {
+    use super::*;
+
+    #[test]
+    fn desktop_child_terminates_owned_job_before_reap() {
+        let mut command = Command::new("cmd.exe");
+        command.args(["/C", "ping -n 30 127.0.0.1 > NUL"]);
+        let mut child = DesktopChild::spawn(&mut command).unwrap();
+        assert!(child.group.job.is_some());
+        child.terminate_and_wait().unwrap();
+        assert!(child.poll_exit().is_err());
+    }
+
+    #[test]
+    fn desktop_child_uses_direct_child_when_job_setup_is_degraded() {
+        let mut command = Command::new("cmd.exe");
+        command.args(["/C", "ping -n 30 127.0.0.1 > NUL"]);
+        let child = command.spawn().unwrap();
+        let pid = child.id();
+        let mut child = DesktopChild {
+            child,
+            group: GroupHandle { pid, job: None },
+            state: DesktopChildState::Live,
+        };
+        child.terminate_and_wait().unwrap();
+        assert!(child.poll_exit().is_err());
+    }
+
+    #[test]
+    fn degraded_fast_exit_reaps_without_kill() {
+        let mut command = Command::new("cmd.exe");
+        command.args(["/C", "exit 0"]);
+        let child = command.spawn().unwrap();
+        let pid = child.id();
+        let mut child = DesktopChild {
+            child,
+            group: GroupHandle { pid, job: None },
+            state: DesktopChildState::Live,
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut observed_exit = false;
+        while std::time::Instant::now() < deadline {
+            if child.poll_exit().unwrap() {
+                observed_exit = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(observed_exit, "fast child did not reach ObservedExited");
+        child.terminate_and_wait().unwrap();
+        assert!(child.poll_exit().is_err());
+    }
 }
 
 /// No `rlimit` on Windows; the fd-limit report prints this as "unlimited".

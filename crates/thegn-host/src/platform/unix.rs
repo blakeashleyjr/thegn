@@ -1,6 +1,7 @@
 //! Unix impls of the platform seam: real fds, signals, and process groups.
 
-use std::process::Command;
+use std::io;
+use std::process::{Child, Command};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
@@ -345,6 +346,223 @@ pub fn spawn_grouped(cmd: &mut Command) -> std::io::Result<(std::process::Child,
     let child = cmd.spawn()?;
     let pgid = child.id() as i32;
     Ok((child, GroupHandle { pgid }))
+}
+
+/// A desktop helper together with the process-group identity created for it.
+/// The direct child stays owned here until group cleanup has completed and the
+/// child has been waited, so callers cannot accidentally signal a reused PGID.
+pub struct DesktopChild {
+    child: Child,
+    pgid: i32,
+    state: DesktopChildState,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DesktopChildState {
+    Live,
+    ObservedExited,
+    Reaped,
+    Uncertain,
+}
+
+impl DesktopChild {
+    /// Spawn a notifier in a fresh process group.
+    pub fn spawn(cmd: &mut Command) -> io::Result<Self> {
+        use std::os::unix::process::CommandExt;
+
+        cmd.process_group(0);
+        let child = cmd.spawn()?;
+        let pgid = child.id() as i32;
+        Ok(Self {
+            child,
+            pgid,
+            state: DesktopChildState::Live,
+        })
+    }
+
+    /// Observe exit without consuming the wait status. A `true` result keeps
+    /// the leader unreaped so its process group remains owned for cleanup.
+    pub fn poll_exit(&mut self) -> io::Result<bool> {
+        match self.state {
+            DesktopChildState::ObservedExited => return Ok(true),
+            DesktopChildState::Reaped => {
+                return Err(io::Error::other("desktop child was already reaped"));
+            }
+            DesktopChildState::Uncertain => {
+                return Err(io::Error::other(
+                    "desktop child wait ownership is uncertain",
+                ));
+            }
+            DesktopChildState::Live => {}
+        }
+        // SAFETY: zeroed siginfo is valid output storage; WNOHANG avoids a
+        // blocking wait and WNOWAIT retains the direct-child identity.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                self.child.id() as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if result < 0 {
+            self.state = DesktopChildState::Uncertain;
+            return Err(io::Error::last_os_error());
+        }
+        let exited = unsafe { info.si_pid() } != 0;
+        if exited {
+            self.state = DesktopChildState::ObservedExited;
+        }
+        Ok(exited)
+    }
+
+    /// Terminate the owned group before reaping the direct child. This is also
+    /// used after a normal exit: the unreaped leader keeps the original group
+    /// identity available long enough to stop surviving descendants.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "owned child wait runs only on the dedicated desktop dispatcher thread"
+    )]
+    pub fn terminate_and_wait(&mut self) -> io::Result<()> {
+        let exited = match self.state {
+            DesktopChildState::Live => self.poll_exit()?,
+            DesktopChildState::ObservedExited => true,
+            DesktopChildState::Reaped => {
+                return Err(io::Error::other("desktop child was already reaped"));
+            }
+            DesktopChildState::Uncertain => {
+                return Err(io::Error::other(
+                    "desktop child wait ownership is uncertain",
+                ));
+            }
+        };
+        let group_error = nix::sys::signal::killpg(
+            nix::unistd::Pid::from_raw(self.pgid),
+            nix::sys::signal::Signal::SIGKILL,
+        )
+        .err()
+        .map(io::Error::from);
+        let child_error = if exited {
+            None
+        } else {
+            self.child.kill().err()
+        };
+        let wait_result = self.child.wait();
+        match wait_result {
+            Ok(_) => self.state = DesktopChildState::Reaped,
+            Err(error) => {
+                self.state = DesktopChildState::Uncertain;
+                return Err(error);
+            }
+        }
+        if let Some(error) = group_error
+            && error.raw_os_error() != Some(libc::ESRCH)
+        {
+            return Err(error);
+        }
+        if let Some(error) = child_error
+            && error.raw_os_error() != Some(libc::ESRCH)
+        {
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Reap only through the still-owned direct child. Used by quarantine;
+    /// this method never signals a process group after ownership is uncertain.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "owned child wait runs only on the dedicated desktop dispatcher thread"
+    )]
+    pub fn reap_owned(&mut self) -> io::Result<()> {
+        if self.state == DesktopChildState::Reaped {
+            return Err(io::Error::other("desktop child was already reaped"));
+        }
+        match self.child.wait() {
+            Ok(_) => {
+                self.state = DesktopChildState::Reaped;
+                Ok(())
+            }
+            Err(error) => {
+                self.state = DesktopChildState::Uncertain;
+                Err(error)
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn mark_wait_uncertain_for_test(&mut self) {
+        self.state = DesktopChildState::Uncertain;
+    }
+}
+
+#[cfg(test)]
+mod desktop_child_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn observed_exit_keeps_group_owned_until_cleanup_and_reap() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "exit 0"]);
+        let mut child = DesktopChild::spawn(&mut command).unwrap();
+        for _ in 0..80 {
+            if child.poll_exit().unwrap() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(child.poll_exit().unwrap());
+        child.terminate_and_wait().unwrap();
+        assert!(child.poll_exit().is_err());
+        assert!(child.terminate_and_wait().is_err());
+    }
+
+    #[test]
+    fn natural_leader_exit_cleans_held_descendant_before_reap() {
+        let fixture = tempfile::tempdir().unwrap();
+        let started_file = fixture.path().join("descendant.started");
+        let survivor_file = fixture.path().join("descendant.survived");
+        let script = format!(
+            "(echo started > {}; sleep 2; echo survivor > {}) & exit 0",
+            started_file.display(),
+            survivor_file.display()
+        );
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", &script]);
+        let mut child = DesktopChild::spawn(&mut command).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !started_file.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(started_file.exists());
+        while !child.poll_exit().unwrap() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(child.poll_exit().unwrap());
+        child.terminate_and_wait().unwrap();
+        std::thread::sleep(Duration::from_millis(2_200));
+        assert!(
+            !survivor_file.exists(),
+            "held descendant survived process-group cleanup"
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "reap the private fixture child after testing uncertain ownership"
+    )]
+    fn uncertain_wait_rejects_cleanup_without_signaling_cached_group() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "exec sleep 30"]);
+        let mut child = DesktopChild::spawn(&mut command).unwrap();
+        child.mark_wait_uncertain_for_test();
+        assert!(child.terminate_and_wait().is_err());
+        child.child.kill().unwrap();
+        child.child.wait().unwrap();
+    }
 }
 
 /// Compositor shutdown: on SIGTERM/SIGHUP set `flag` and pulse `waker` so the
