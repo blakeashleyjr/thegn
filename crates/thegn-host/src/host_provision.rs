@@ -269,7 +269,6 @@ pub(crate) fn provision_worktree_on_host(
                 // Provider-only machinery: no meaning on a plain OCI host.
                 StepKind::Checkpoint
                 | StepKind::HomeClosurePush(_)
-                | StepKind::DevShellClosurePush
                 | StepKind::LocalParity { .. }
                 | StepKind::SnapshotRestore { .. } => {
                     tracing::debug!(target: "thegn::host", step = %step.id, "skipped (provider-only)");

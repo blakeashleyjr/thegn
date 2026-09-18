@@ -472,12 +472,8 @@ pub struct PlanOpts {
     /// Opt-in: carry the host's atuin credentials + config into the sandbox so its
     /// shell history joins atuin sync. Emits an `atuin_sync` step after `tools`.
     pub atuin: bool,
-    /// Opt-in: seed the host's already-built devShell closure into the sandbox
-    /// store so the in-sandbox devShell is a local store hit, not a from-source
-    /// rebuild. SCOPED — the host uploads only the paths public caches lack (the
-    /// repo's from-source builds + rust-overlay output) and the sandbox fills the
-    /// rest from cache.nixos.org. Emits a `devshell_push` step after `nix`,
-    /// independent of `skip_devshell_warm`. Only meaningful with a nix devShell.
+    /// Deprecated compatibility flag. Host-side devShell transfer is disabled;
+    /// target-side provisioning is the only source of this behavior.
     pub push_devshell: bool,
     /// Opt-in: skip the blocking `devshell` warm/build step during provisioning
     /// (and the p2p push + cache push that feed it). The repo's devShell then
@@ -591,13 +587,6 @@ pub enum StepKind {
     /// (`[sandbox.home] atuin = true`). Best-effort; the history DBs are NOT copied
     /// (the sync server reconciles those).
     AtuinSync,
-    /// Host-executed: transfer the repo's devShell closure — already built on the
-    /// HOST — into the sandbox store (host `nix copy --to file://` → fs upload →
-    /// sandbox `nix copy --from file://`), so the in-sandbox devShell is a local
-    /// store hit instead of a rebuild. Opt-in (`[env.<name>.provider] push_devshell
-    /// = true`). Best-effort; runs after Nix is installed/claimed, before the
-    /// devShell warm. The host repo root is resolved in the applier.
-    DevShellClosurePush,
     /// Host-executed: bring the sandbox clone to full parity with the LOCAL
     /// worktree — replay unpushed commits (a thin `git bundle`), uncommitted
     /// tracked changes (`git diff HEAD`), and untracked non-ignored files. The
@@ -733,19 +722,6 @@ pub fn plan(req: &EnvRequirements, opts: &PlanOpts) -> EnvPlan {
                         kind: StepKind::Exec(direnv_install_script()),
                     });
                 }
-                // Seed the host's already-built closure into the sandbox store
-                // (scoped: the push uploads only the paths public caches lack — the
-                // repo's from-source builds + rust-overlay output — and the sandbox
-                // fills the rest from cache.nixos.org). This is the FAST path: a
-                // local store hit instead of a from-source compile. Independent of
-                // `skip_devshell_warm` — seeding isn't the slow build, it replaces it.
-                if opts.push_devshell {
-                    steps.push(ProvisionStep {
-                        id: "devshell_push".into(),
-                        label: "Seed dev shell from host".into(),
-                        kind: StepKind::DevShellClosurePush,
-                    });
-                }
                 // The from-scratch devShell BUILD is the single longest, most CPU/
                 // network-bound part of a provision. When `skip_devshell_warm` is set
                 // it's omitted: the loading screen no longer blocks on it, and the
@@ -770,15 +746,6 @@ pub fn plan(req: &EnvRequirements, opts: &PlanOpts) -> EnvPlan {
                             kind: StepKind::Exec(cache_push_script(&opts.workdir, c)),
                         });
                     }
-                } else if req.direnv {
-                    // Skipping the build, but still TRUST the repo's `.envrc` (cheap,
-                    // instant) so the lazy in-pane build fires the moment you `cd` in
-                    // — no manual `direnv allow` needed.
-                    steps.push(ProvisionStep {
-                        id: "direnv_allow".into(),
-                        label: "Allow direnv".into(),
-                        kind: StepKind::Exec(direnv_allow_script(&opts.workdir)),
-                    });
                 }
             }
         }
@@ -1179,8 +1146,8 @@ pub fn bake_scripts(
     ]
 }
 
-/// Warm the dev environment so the first interactive shell is instant. With
-/// direnv+flake we `direnv allow` + evaluate once; a flake devShell (even
+/// Prepare the target-side dev environment so the first interactive shell is
+/// useful. With direnv+flake we evaluate once; a flake devShell (even
 /// alongside a `devenv.nix`) warms with `nix develop`; only a PURE-devenv repo
 /// (no flake devShell) installs the heavy `devenv` CLI; otherwise `nix-shell`
 /// (classic) or `nix develop`.
@@ -1201,7 +1168,7 @@ fn devshell_warm_script(workdir: &str, req: &EnvRequirements) -> String {
     let nixsh = nixsh.as_str();
     if req.direnv && req.direnv_uses_flake {
         format!(
-            "{nixsh}; cd {wd} 2>/dev/null && direnv allow . 2>/dev/null; direnv exec . true 2>/dev/null || nix develop --command true 2>/dev/null || true; true"
+            "{nixsh}; cd {wd} 2>/dev/null && direnv exec . true 2>/dev/null || nix develop --command true 2>/dev/null || true; true"
         )
     } else if req.devenv && !req.nix_flake_devshell {
         // Pure-devenv (no flake devShell to fall back on): the `devenv` CLI is the
@@ -1223,20 +1190,6 @@ fn devshell_warm_script(workdir: &str, req: &EnvRequirements) -> String {
             "{nixsh}; cd {wd} 2>/dev/null && nix develop --command true 2>/dev/null || true; true"
         )
     }
-}
-
-/// Trust the repo's `.envrc` without building anything (the companion to
-/// `skip_devshell_warm`). `direnv allow` is instant — it only marks the `.envrc`
-/// approved — so the loading screen doesn't block, yet the first in-pane `cd` into
-/// the worktree replays direnv and builds the devShell lazily, with no manual
-/// `direnv allow`. Best-effort: a missing direnv / no `.envrc` is a no-op.
-fn direnv_allow_script(workdir: &str) -> String {
-    let wd = sh_quote(workdir);
-    format!(
-        "{tok}export PATH=\"$HOME/.nix-profile/bin:/nix/var/nix/profiles/default/bin:$HOME/.local/state/nix/profile/bin:$HOME/.local/bin:$PATH\"; \
-         command -v direnv >/dev/null 2>&1 && cd {wd} 2>/dev/null && [ -f .envrc ] && direnv allow . 2>/dev/null; true",
-        tok = nix_runtime_prelude(),
-    )
 }
 
 /// Push the project's built devShell closure to a binary cache so later sandboxes
@@ -2102,7 +2055,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_devshell_push_after_nix_before_devshell_when_opted_in() {
+    fn plan_ignores_legacy_host_devshell_push() {
         let req = EnvRequirements {
             nix_flake_devshell: true,
             direnv: true,
@@ -2115,24 +2068,10 @@ mod tests {
         };
         let p = plan(&req, &opts);
         let ids: Vec<&str> = p.steps.iter().map(|s| s.id.as_str()).collect();
-        let nix = ids.iter().position(|i| *i == "nix").expect("nix");
-        let push = ids
-            .iter()
-            .position(|i| *i == "devshell_push")
-            .expect("devshell_push present when opted in");
-        let dev = ids.iter().position(|i| *i == "devshell").expect("devshell");
         assert!(
-            nix < push && push < dev,
-            "devshell_push after nix, before devshell: {ids:?}"
+            !ids.contains(&"devshell_push"),
+            "legacy host push is inert: {ids:?}"
         );
-        assert!(matches!(
-            p.steps
-                .iter()
-                .find(|s| s.id == "devshell_push")
-                .unwrap()
-                .kind,
-            StepKind::DevShellClosurePush
-        ));
     }
 
     #[test]
@@ -2146,15 +2085,15 @@ mod tests {
     }
 
     #[test]
-    fn plan_skip_devshell_warm_omits_build_but_keeps_scoped_push() {
+    fn plan_skip_devshell_warm_omits_build_without_approval_step() {
         let req = EnvRequirements {
             nix_flake_devshell: true,
             direnv: true,
             direnv_uses_flake: true,
             ..Default::default()
         };
-        // Skip drops the from-source BUILD (+ its cache push), but the scoped push
-        // (the fast seed) and the cheap `direnv allow` stay.
+        // Skip drops the from-source BUILD (+ its cache push). It must not add a
+        // generated approval command or a host-side closure push.
         let opts = PlanOpts {
             push_devshell: true,
             skip_devshell_warm: true,
@@ -2172,24 +2111,18 @@ mod tests {
             !ids.contains(&"devshell") && !ids.contains(&"cache_push"),
             "skip_devshell_warm omits the build + cache push: {ids:?}"
         );
-        // The scoped push (fast seed) is independent of the warm decision.
-        let push = p
-            .steps
-            .iter()
-            .position(|s| s.id == "devshell_push")
-            .expect("scoped devshell_push present even when skipping the build");
-        let nix = ids.iter().position(|i| *i == "nix").unwrap();
-        assert!(nix < push, "push after nix: {ids:?}");
-        // ...and the cheap `direnv allow` stays, so the in-pane lazy build fires.
-        let allow = p
-            .steps
-            .iter()
-            .find(|s| s.id == "direnv_allow")
-            .expect("direnv_allow present when skipping the build with direnv");
-        assert!(matches!(
-            &allow.kind,
-            StepKind::Exec(s) if s.contains("direnv allow")
-        ));
+        assert!(
+            !ids.contains(&"devshell_push"),
+            "host push is removed: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&"direnv_allow"),
+            "approval is never generated: {ids:?}"
+        );
+        assert!(p.steps.iter().all(|step| match &step.kind {
+            StepKind::Exec(script) => !script.contains("direnv allow"),
+            _ => true,
+        }));
     }
 
     #[test]

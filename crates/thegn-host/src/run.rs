@@ -737,19 +737,6 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         since_start_ms = start.elapsed().as_millis() as u64,
         "config loaded"
     );
-    // Warm the active workspace's flake devShell cache off-thread so the first
-    // pane is injected with the project toolchain (Tier A). No-op without a
-    // flake / `nix` / `[sandbox] inject_devshell`. See `thegn_core::devenv`.
-    if cfg.sandbox.inject_devshell && !session.id.is_empty() {
-        thegn_core::devenv::prewarm(std::path::Path::new(&session.id));
-    }
-    // Pre-warm the active worktree's `direnv` cache off-thread so the first
-    // pane's in-sandbox direnv hook replays a warm cache instead of failing on
-    // the read-only `/nix/store`. No-op when `warm_direnv = off` or there's no
-    // cold flake-backed `.envrc`. See `thegn_core::direnv`.
-    if !session.id.is_empty() {
-        crate::direnv_warm::warm_direnv(&cfg, std::path::Path::new(&session.id));
-    }
     // Install/refresh the in-sandbox merge guard into the shared hooks dir
     // (`core.hooksPath` → the canonical `.git/hooks`). On by default; it refuses
     // a raw `git merge` run against the canonical checkout from inside a sandbox

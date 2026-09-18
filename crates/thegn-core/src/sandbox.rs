@@ -1020,13 +1020,11 @@ fn resolve_placed_with(
     // `nix develop`/`build`/`fmt` work there (Tier A only gives read-only tools
     // on PATH). Path-preserving bind of the daemon-socket dir + `NIX_REMOTE`;
     // the daemon mediates store writes, so the read-only `/nix/store` mount is
-    // fine. `nix_daemon = true` forces it on for every sandbox; otherwise it's a
-    // backstop auto-enabled for a local flake-backed worktree so an in-sandbox
-    // `nix-direnv` cache MISS re-evals via the daemon instead of dying on the
-    // read-only `/nix/store` (see [`crate::direnv`]). Opt out with
-    // `warm_direnv = off` (disables the whole in-sandbox-direnv machinery) or
-    // `profile = sealed` (no-network floor). The socket is a local unix socket,
-    // so this is compatible with `network = none`.
+    // fine. `nix_daemon = true` is the only way to enable this trusted host
+    // boundary. Host direnv warming and automatic daemon mounting are removed;
+    // an in-sandbox environment must either use target-side policy or remain a
+    // normal user-approved shell. The socket is a local unix socket, so this
+    // is compatible with `network = none`.
     //
     // Withheld across an ABI boundary (see [`guest_shares_host_abi`]): a Mac's
     // nix-daemon serves *darwin* store paths, which a Linux guest cannot execute
@@ -1034,10 +1032,6 @@ fn resolve_placed_with(
     // share `/nix`. This is the same gate the host-toolchain mounts already use;
     // it reaches here because the socket is injected separately from them.
     let abi_ok = guest_shares_host_abi(backend, crate::sandbox_backend::host_os());
-    let auto_daemon = placement.is_local()
-        && !profile.forces_no_network()
-        && cfg.warm_direnv != crate::config::WarmDirenv::Off
-        && crate::direnv::has_flake_envrc(&worktree);
     if !abi_ok && cfg.nix_daemon {
         // Explicitly requested and dropped: say so, per the same rule
         // `unsupported_hardening` follows — never ship a quietly different
@@ -1049,7 +1043,7 @@ fn resolve_placed_with(
             backend.label()
         ));
     }
-    if abi_ok && (cfg.nix_daemon || auto_daemon) {
+    if abi_ok && cfg.nix_daemon {
         const SOCK_DIR: &str = "/nix/var/nix/daemon-socket";
         if std::path::Path::new(SOCK_DIR).join("socket").exists() {
             mounts.push(Mount {

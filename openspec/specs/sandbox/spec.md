@@ -103,29 +103,38 @@ When a tunnel fails to come up, the `on_error` policy SHALL govern the outcome a
 - **WHEN** the tunnel fails to become ready and `on_error=fail`
 - **THEN** the worktree does not launch with direct host egress
 
-### Requirement: Resolve and inject the repo devShell env into worktree panes
+### Requirement: Never implicitly evaluate repository environments on the host
 
-When a worktree's repo exposes a flake `devShell` and `[sandbox] inject_devshell` is enabled, thegn SHALL resolve the devShell env on the host (`nix print-dev-env --json`), cache it by a `flake.lock`+`flake.nix` hash, and merge the exported variables into each worktree pane before the sandbox exec (PATH prepended, other vars set only if unset); a repo without `nix`/`devShell` MUST be a clean no-op.
+Thegn SHALL NOT evaluate a repository `.envrc` or devShell on the host during
+startup, materialization, launch, or daemon preparation. It SHALL NOT run
+`direnv allow`, start a host warm thread, write `.direnv`, or implicitly mount a
+Nix daemon because a repository has a flake. An already-existing, valid
+`inject_devshell` cache MAY be read; a cold cache MUST be a no-op until the user
+or the selected target explicitly performs environment setup. `[sandbox]
+warm_direnv` defaults to `off`; legacy values remain parseable but are inert and
+produce a bounded deprecation diagnostic.
 
-#### Scenario: Flake repo gets the toolchain
+#### Scenario: Existing cache can provide the toolchain
 
-- **WHEN** a worktree pane is spawned in a repo with a flake devShell
+- **WHEN** a worktree pane is spawned in a repo with a previously-created valid cache
 - **THEN** the pane's PATH includes the devShell tool directories
 
-#### Scenario: Non-flake repo is a no-op
+#### Scenario: Cold repository environment is not evaluated by the host
 
-- **WHEN** a worktree pane is spawned in a repo with no flake devShell
-- **THEN** no `nix` is invoked and the pane gets its ordinary environment
+- **WHEN** a worktree pane is spawned in a repo with a cold devShell or `.envrc`
+- **THEN** no host `nix` or `direnv` process is invoked, no cache is written, and
+  the pane gets its ordinary environment until target-side setup is explicit
 
-### Requirement: devShell resolution runs off the event loop
+### Requirement: Cached devShell reads do not block the event loop
 
-The devShell resolve SHALL run on a background thread that pulses the `TerminalWaker` and writes the cache, MUST NOT block pane spawn, and MUST NOT add a polling timeout; a cold pane applies the cache on a later spawn once warm.
+Reading an already-existing devShell cache MUST NOT block pane spawn or start a
+background evaluator. A cold pane remains uncached and target-side setup is
+responsible for any later environment work.
 
-#### Scenario: Cold resolve does not block
+#### Scenario: Cold cache does not start a host evaluator
 
 - **WHEN** the devShell cache is cold at pane spawn
-- **THEN** the pane spawns immediately and the resolve proceeds off-loop, applying
-  to subsequent spawns
+- **THEN** the pane spawns immediately and no host resolver proceeds in the background
 
 ### Requirement: Opt-in nix daemon mount
 

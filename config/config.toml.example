@@ -2714,34 +2714,25 @@ init_script = ""
 # worktree is created, before its first pane spawns. Unlike `init_script` these
 # run on the host — with the writable Nix store, the Nix daemon, and full
 # network — so they suit heavyweight setup that a sandboxed pane can't do
-# itself. The built-in `direnv` warm (`warm_direnv`, below) runs alongside them.
+# itself. Repository `.envrc` files are never evaluated by this lifecycle path.
 # prepare = ["mise install || true", "pnpm install --frozen-lockfile || true"]
 prepare = []
 
-# ── direnv ────────────────────────────────────────────────────────────────────
-# Pre-warm a worktree's `direnv` cache on the HOST so the in-sandbox `direnv`
-# hook actually works. A worktree pane is a login shell, so your rc's `direnv
-# hook` fires inside the sandbox; with `use flake`, a cold nix-direnv cache makes
-# direnv rebuild the devShell — which writes/locks `/nix/store` and fails on the
-# sandbox's read-only store (no daemon). Warming on the host (writable store +
-# daemon) means the in-pane direnv replays the cached env read-only instead.
-#   "auto"         — warm + `direnv allow` the worktree (trusts the repo's own
-#                    .envrc, the same boundary `inject_devshell` already crosses)
-#   "allowed-only" — warm only worktrees you've already `direnv allow`-ed
-#   "off"          — never warm (the in-pane direnv falls back as before)
-warm_direnv = "auto"
+# ── direnv compatibility ─────────────────────────────────────────────────────
+# Host direnv evaluation, cache mutation, detached warming, and generated
+# approval commands are disabled. The historical values "auto" and
+# "allowed-only" remain parseable for compatibility but warn and behave as off.
+warm_direnv = "off"
 
 # Wrap the inner command in `devenv shell --`. Auto-enabled if devenv.nix is
 # present in the worktree root and the `devenv` binary is on PATH.
 devenv = false
 
 # ── Nix devShell tooling ──────────────────────────────────────────────────────
-# Tier A (read-only, safe): inject the repo's Nix flake `devShell` toolchain
-# (its PATH + safe exported vars) into worktree panes. thegn resolves the
-# devShell on the HOST (writable store + daemon) via `nix print-dev-env`, caches
-# it under $XDG_STATE_HOME/thegn/devenv/, and prepends it to the pane's PATH —
-# so a sandboxed pane that can't reach the Nix daemon still gets the project's
-# linters/formatters/tools out of the box. No-op for repos without a devShell.
+# Tier A (read-only, safe): inject an already-existing cached repo Nix flake
+# `devShell` toolchain (its PATH + safe exported vars) into worktree panes.
+# Cold caches are a no-op; this setting never evaluates the repository on the
+# host or writes a cache. Target-side setup remains available in the sandbox.
 inject_devshell = true
 # Which flake devShell a sandbox/sprite enters. Empty = the flake default (same as
 # host dev — the FULL closure). Set to a leaner attr so a remote sprite builds/seeds
@@ -2758,18 +2749,13 @@ inject_devshell = true
 # while a bigger VPS env keeps the full default).
 # devshell = "sandbox"
 # Tier B: bind-mount the host Nix daemon socket into the sandbox so full
-# `nix develop`/`build`/`fmt` run INSIDE it. `true` forces it on for every
-# sandbox. `false` (default) does NOT fully disable it: as a backstop it is
-# auto-enabled for a local flake-backed worktree, so an in-sandbox `nix-direnv`
-# cache MISS re-evals via the daemon instead of dying on the read-only
-# `/nix/store`. The socket is a local unix socket, so this is compatible with
-# `network = none`. To suppress the auto-backstop, set `warm_direnv = off` or
-# use a `sealed` profile. Ignored if the host has no Nix daemon.
+# `nix develop`/`build`/`fmt` run INSIDE it. `true` is an explicit trusted
+# policy; `false` never auto-mounts it. Ignored if the host has no Nix daemon.
 nix_daemon = false
 
 # ── Missing backend behaviour ─────────────────────────────────────────────────
 # What to do when no backend in backend_chain is available:
-#   warn   — open the pane on the host and show a banner (default).
+#   warn   — refuse the sandbox launch with an actionable warning (default).
 #   prompt — ask before falling back to host.
 #   fail   — refuse to open the pane.
 on_missing = "warn"
@@ -3555,24 +3541,12 @@ open_on_detect = false # auto-open the browser when a new forward comes up
 # #                                 #   reverse tunnel, so in-sprite `nix develop`/`direnv`
 # #                                 #   SUBSTITUTE prebuilt store paths from your host
 # #                                 #   instead of building from source. A general cache
-# #                                 #   over the WHOLE host store — strictly more capable
-# #                                 #   than push_devshell's one-shot devShell upload,
-# #                                 #   which it SUPERSEDES when set. Unsigned + loopback-
+# #                                 #   over the WHOLE host store. Unsigned + loopback-
 # #                                 #   tunnel-only (require-sigs=false in the sprite). The
 # #                                 #   host serves it from the thegn process; needs a
 # #                                 #   resident-bridge provider (sprites). Recommended.
-# # push_devshell = false           # Use your HOST as the devShell cache (nix users).
-# #                                 #   Seeds the repo's closure — ALREADY BUILT on your
-# #                                 #   host (you run `nix develop`/direnv locally) —
-# #                                 #   into the sandbox store. SCOPED: uploads only the
-# #                                 #   paths public caches lack (the repo's from-source
-# #                                 #   builds + rust-overlay output) via a file:// cache
-# #                                 #   + the fs API; the sandbox fills the rest from
-# #                                 #   cache.nixos.org → a local store hit, not a
-# #                                 #   minutes-long from-source compile. No hosted
-# #                                 #   cache/signing key needed; the host IS the cache.
-# #                                 #   No-op without a nix devShell. Best-effort.
-# #                                 #   (host_cache above supersedes this when both set.)
+# # push_devshell = false           # Deprecated and ignored: host-side devShell
+# #                                 #   evaluation and closure transfer are disabled.
 # # skip_devshell_warm = false      # skip the blocking devShell BUILD during
 # #                                 #   provisioning. The repo's devShell then builds
 # #                                 #   lazily in-pane on first `direnv`/`nix develop`
