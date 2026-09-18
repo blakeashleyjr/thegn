@@ -298,7 +298,7 @@ pub(crate) fn remove_landed(
             reason: "committed outcome does not match a current landed queue row".into(),
         };
     };
-    let cfg = thegn_core::config::Config::load_layered(&thegn_core::config::ProcessEnv, &[], None);
+    let cfg = crate::config_startup::cleanup_config();
     remove_landed_with_config(
         &cfg,
         db,
