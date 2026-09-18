@@ -34,6 +34,22 @@ All notable changes to **thegn** are documented here. The format follows
   the next step). Landed-worktree sweeps and review-agent handoffs also stop
   under a refused block instead of using the global policy.
 
+### Security — agent `permissions` no longer write into the worktree
+
+- **`[[agents]]` / `[[pipeline.stages]]` `permissions` are now command-scoped.**
+  A launch used to read-modify-write `<worktree>/.claude/settings.local.json`
+  before sandbox preparation — following repository-controlled symlinks,
+  non-atomically, dirtying the branch, persisting after the session, and
+  launching anyway when the write failed. The grant now rides the launch
+  command itself (claude: `--settings '{"permissions":{"allow":[…]}}'`, a
+  documented per-session layer that merges with your settings files, keeps
+  their deny rules and hooks, and writes nothing). Nothing under the worktree
+  is touched. Behaviour change: the list is now _added to_ the worktree's own
+  `permissions.allow` instead of replacing it, and a non-empty list on a
+  harness with no command-scoped grant (codex, pi, aider) refuses the launch
+  — a stage dispatch is held before its roster row exists — instead of being
+  ignored with a warning. `thegn config validate` reports such entries.
+
 ### Fixed — a project no longer resumes in a terminal
 
 - **Switching back to a project landed you in a terminal instead of your work.**
