@@ -50,7 +50,7 @@ pub fn normalize_admission(body: &str) -> Result<NormalizedToml, NormalizeError>
     let mut diagnostics = Vec::new();
     let root = value
         .as_table_mut()
-        .ok_or_else(|| "config document must be a TOML table".to_string())?;
+        .ok_or_else(|| NormalizeError::Parse("config document must be a TOML table".to_string()))?;
 
     rename_scalar(
         root,
