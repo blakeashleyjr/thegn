@@ -248,7 +248,8 @@ pub(crate) fn run<'a>(
                 let source_command = command.clone();
                 let resolved = service
                     .with_db(move |db| {
-                        let fresh = crate::config_source::fresh(&snapshot);
+                        let fresh = crate::config_source::fresh(&snapshot)
+                            .map_err(|error| anyhow::anyhow!("configuration refused: {error}"))?;
                         let cfg = fresh.as_ref().unwrap_or(&snapshot);
                         super::agent_open::resolve_fork(
                             cfg,

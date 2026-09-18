@@ -1,9 +1,10 @@
 //! Frozen process-source capture for the typed configuration admission edge.
 //!
-//! This module is intentionally standalone.  It captures ambient inputs once,
-//! then admits one candidate through `thegn_core::config_admission`; it is not
-//! startup or authority wiring.  Filesystem and SQLite reads are blocking and
-//! must remain owned by a future off-loop worker.
+//! It captures ambient inputs once, then admits candidates through
+//! `thegn_core::config_admission`.  Startup/reload wiring and the live
+//! generation store live in `crate::config_startup`.  Filesystem and SQLite
+//! reads are blocking: startup runs them before the input/render loop and
+//! reload runs them on its watcher thread, never on the loop.
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
@@ -13,7 +14,7 @@ use std::path::{Path, PathBuf};
 use sha2::{Digest, Sha256};
 use thegn_core::config::{Config, EnvSource, PathExpansionContext};
 use thegn_core::config_admission::{
-    self, AdmissionDiagnostic, AdmittedConfig, ConfigAdmissionError, SourceContent, SourceInput,
+    self, AdmittedConfig, ConfigAdmissionError, SourceContent, SourceInput,
 };
 use thegn_core::host_definition_snapshot::HostDefinitionsSnapshot;
 
@@ -25,8 +26,14 @@ pub(crate) enum ConfigFileReadError {
     NonRegular,
     Changed,
     TooLarge,
-    InvalidUtf8,
+    /// The Linux `O_PATH` reader does not vouch for this filesystem type.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    UnsupportedFilesystem,
+    /// Constructed by the macOS/Windows no-follow readers only.
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
     FinalLinkUnsupported,
+    /// Constructed by the unsupported-platform reader only.
+    #[allow(dead_code)]
     Unsupported,
 }
 
@@ -37,7 +44,9 @@ impl std::fmt::Display for ConfigFileReadError {
             Self::NonRegular => "configuration source is not a regular file",
             Self::Changed => "configuration source changed during capture",
             Self::TooLarge => "configuration source exceeds its byte limit",
-            Self::InvalidUtf8 => "configuration source is not valid UTF-8",
+            Self::UnsupportedFilesystem => {
+                "configuration source is on a filesystem the opened-file reader does not support"
+            }
             Self::FinalLinkUnsupported => {
                 "configuration file is a final symlink/reparse point; select a reviewed ordinary private file (copying a managed config stops automatic tracking)"
             }
@@ -55,6 +64,49 @@ pub(crate) trait ConfigSourceReader {
         path: &Path,
         limit: usize,
     ) -> Result<Option<Vec<u8>>, ConfigFileReadError>;
+}
+
+/// Resolve a *final* config-file symlink before the platform reader runs.
+///
+/// The macOS and Windows opened-file readers refuse a final link outright,
+/// which would make ordinary Nix/home-manager-managed configs unusable once
+/// admission gates startup. This adapter resolves the link with the OS
+/// resolver (bounded by the kernel's own link-count limit), reads the
+/// resolved **ordinary** file through the unchanged no-follow platform reader
+/// (so regular-file, no-FIFO, identity and byte bounds still apply to the
+/// target), then resolves again and refuses if the link was retargeted during
+/// the read. A dangling link is an existing-but-unreadable source, never an
+/// absent one. Like the platform readers, this is observed coherence in a
+/// stable owner-controlled namespace, not a hostile same-UID guarantee.
+// Constructed by the macOS/Windows `startup_reader` and by tests.
+#[cfg_attr(all(target_os = "linux", not(test)), allow(dead_code))]
+pub(crate) struct FinalLinkResolvingReader<R>(pub(crate) R);
+
+impl<R: ConfigSourceReader> ConfigSourceReader for FinalLinkResolvingReader<R> {
+    fn read_bounded(
+        &self,
+        path: &Path,
+        limit: usize,
+    ) -> Result<Option<Vec<u8>>, ConfigFileReadError> {
+        match std::fs::symlink_metadata(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => return Err(ConfigFileReadError::Unavailable),
+            Ok(metadata) if !metadata.file_type().is_symlink() => {
+                return self.0.read_bounded(path, limit);
+            }
+            Ok(_) => {}
+        }
+        let target = std::fs::canonicalize(path).map_err(|_| ConfigFileReadError::Unavailable)?;
+        checked_path(&target).map_err(|_| ConfigFileReadError::Unavailable)?;
+        let Some(bytes) = self.0.read_bounded(&target, limit)? else {
+            return Err(ConfigFileReadError::Changed);
+        };
+        let again = std::fs::canonicalize(path).map_err(|_| ConfigFileReadError::Changed)?;
+        if again != target {
+            return Err(ConfigFileReadError::Changed);
+        }
+        Ok(Some(bytes))
+    }
 }
 
 pub(crate) struct CapturedCliInputs<'a> {
@@ -88,7 +140,58 @@ pub(crate) enum CaptureFailure {
     Input(CaptureInputError),
     Source(ConfigFileReadError),
     Admission(ConfigAdmissionError),
+    /// The standalone strict WAL capture route (`load_with`), exercised by
+    /// tests; production composes hosts from the migrated store (`Hosts`).
+    #[cfg_attr(not(test), allow(dead_code))]
     State(crate::state_host_capture::StateHostReadError),
+    Hosts(HostStoreFailure),
+}
+
+/// Why the strict host-definition layer could not be captured from the
+/// (migrated) state store. Never replaced by an empty host map.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HostStoreFailure {
+    /// The admitted `[database]` migration policy could not be installed.
+    MigrationPolicy(String),
+    /// The state DB was advanced by a newer build.
+    NewerSchema { observed: i64, supported: i64 },
+    /// The state DB could not be opened or migrated.
+    Open(String),
+    /// The strict host-table read refused the stored definitions.
+    Definitions(thegn_core::host_definition_snapshot::HostDefinitionReadError),
+}
+
+impl std::fmt::Display for HostStoreFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MigrationPolicy(detail) => {
+                write!(f, "database migration policy refused: {detail}")
+            }
+            Self::NewerSchema {
+                observed,
+                supported,
+            } => write!(
+                f,
+                "state database schema v{observed} is newer than this build (v{supported}); run the newer build"
+            ),
+            Self::Open(detail) => write!(f, "state database could not be opened: {detail}"),
+            Self::Definitions(_) => f.write_str("stored host definitions could not be admitted"),
+        }
+    }
+}
+
+/// Bound an operator-facing detail from a DB/policy error before it is kept.
+pub(crate) fn bounded_detail(text: &str) -> String {
+    const LIMIT: usize = 240;
+    let redacted = thegn_core::log_redact::redact_text_line(text);
+    if redacted.len() <= LIMIT {
+        return redacted;
+    }
+    let mut end = LIMIT;
+    while !redacted.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &redacted[..end])
 }
 
 impl std::fmt::Display for CaptureFailure {
@@ -96,12 +199,18 @@ impl std::fmt::Display for CaptureFailure {
         // Deliberately omit paths, parser fragments, environment values and
         // host definitions from the rendered failure.
         f.write_str(match self {
-            Self::Input(_) => "configuration input capture failed",
+            Self::Input(error) => {
+                // Typed, value-free category names only.
+                return write!(f, "configuration input capture failed: {error:?}");
+            }
             Self::Source(error) => {
                 return write!(f, "configuration source capture failed: {error}");
             }
             Self::Admission(error) => return write!(f, "configuration admission failed: {error}"),
             Self::State(_) => "configuration host-state capture failed",
+            Self::Hosts(error) => {
+                return write!(f, "configuration host capture failed: {error}");
+            }
         })
     }
 }
@@ -128,15 +237,13 @@ impl std::fmt::Debug for CapturedSource {
 
 pub(crate) struct ConfigCaptureSeed {
     defaults: Config,
-    user_home_path: PathBuf,
     paths: PathExpansionContext,
-    source_cwd: PathBuf,
-    config_home: PathBuf,
-    state_home: PathBuf,
+    #[cfg_attr(not(test), allow(dead_code))]
     app_root: PathBuf,
     profile_name: String,
     base: CapturedSource,
     profile: Option<CapturedSource>,
+    #[cfg_attr(not(test), allow(dead_code))]
     state_db: PathBuf,
     env: FrozenEnv,
     overrides: Vec<String>,
@@ -145,9 +252,6 @@ pub(crate) struct ConfigCaptureSeed {
 impl std::fmt::Debug for ConfigCaptureSeed {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ConfigCaptureSeed")
-            .field("source_cwd", &"<redacted>")
-            .field("config_home", &"<redacted>")
-            .field("state_home", &"<redacted>")
             .field("app_root", &"<redacted>")
             .field("profile_name", &self.profile_name)
             .field("base", &self.base)
@@ -159,20 +263,16 @@ impl std::fmt::Debug for ConfigCaptureSeed {
 
 pub(crate) struct CapturedConfig {
     admitted: AdmittedConfig,
+    #[cfg_attr(not(test), allow(dead_code))]
     profile_name: String,
 }
 
+// Accessors below are used by the capture tests; production consumes the
+// published `AdmittedConfig` via `into_admitted`.
+#[cfg_attr(not(test), allow(dead_code))]
 impl CapturedConfig {
     pub(crate) fn config(&self) -> &Config {
         self.admitted.config()
-    }
-
-    pub(crate) fn diagnostics(&self) -> &[AdmissionDiagnostic] {
-        self.admitted.trace().diagnostics()
-    }
-
-    pub(crate) fn revision(&self) -> thegn_core::config_admission::ConfigRevision {
-        self.admitted.revision()
     }
 
     pub(crate) fn profile_name(&self) -> &str {
@@ -181,6 +281,10 @@ impl CapturedConfig {
 
     pub(crate) fn health(&self) -> thegn_core::config_admission::AdmissionHealth {
         self.admitted.health()
+    }
+
+    pub(crate) fn into_admitted(self) -> AdmittedConfig {
+        self.admitted
     }
 }
 
@@ -510,11 +614,7 @@ impl ConfigCaptureSeed {
 
         Ok(Self {
             defaults,
-            user_home_path: home.clone(),
             paths: PathExpansionContext::from_home(home.clone()),
-            source_cwd: cwd,
-            config_home,
-            state_home: selected_state_home,
             app_root: resolved_profile.root,
             profile_name,
             base,
@@ -543,14 +643,18 @@ impl ConfigCaptureSeed {
         }
     }
 
-    /// Blocking and deliberately unwired.  The state adapter decides whether
-    /// an absent DB is genuine absence; all other DB failures remain fatal.
+    /// Blocking. The state adapter decides whether an absent DB is genuine
+    /// absence; all other DB failures remain fatal. Used by the standalone
+    /// capture tests; production startup composes hosts through
+    /// [`Self::admit_staged`] with the migrated state store instead.
+    #[cfg(test)]
     pub(crate) fn load_once(&self) -> Result<CapturedConfig, CaptureFailure> {
         self.load_with(&crate::platform::config_file_capture::Reader, || {
             crate::state_host_capture::capture(&self.state_db)
         })
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn load_with(
         &self,
         reader: &dyn ConfigSourceReader,
@@ -558,6 +662,33 @@ impl ConfigCaptureSeed {
             crate::state_host_capture::StateHostCapture,
             crate::state_host_capture::StateHostReadError,
         >,
+    ) -> Result<CapturedConfig, CaptureFailure> {
+        self.admit_staged(reader, |_| {
+            Ok(match capture_state().map_err(CaptureFailure::State)? {
+                crate::state_host_capture::StateHostCapture::Absent => {
+                    HostDefinitionsSnapshot::empty(thegn_core::db::SCHEMA_VERSION)
+                }
+                crate::state_host_capture::StateHostCapture::Present(snapshot) => snapshot,
+            })
+        })
+    }
+
+    /// Two-stage admission over ONE read of each config source:
+    ///
+    /// 1. every non-DB layer (base, selected profile, frozen env, CLI) is
+    ///    admitted against an empty host snapshot, so an invalid trusted
+    ///    layer is refused before the state DB is opened, migrated, or read;
+    /// 2. `capture_hosts` receives that pre-DB candidate (e.g. to install
+    ///    its `[database]` migration policy before the first open, which lets
+    ///    a legitimate older schema reach its upgrade) and returns one strict
+    ///    host snapshot; the final candidate is admitted with those hosts.
+    ///
+    /// The pre-DB candidate is never published. Nothing here installs
+    /// process-global state; the caller does that only on success.
+    pub(crate) fn admit_staged(
+        &self,
+        reader: &dyn ConfigSourceReader,
+        capture_hosts: impl FnOnce(&Config) -> Result<HostDefinitionsSnapshot, CaptureFailure>,
     ) -> Result<CapturedConfig, CaptureFailure> {
         self.env.missing.set(false);
         let base = reader
@@ -571,17 +702,15 @@ impl ConfigCaptureSeed {
             ),
             None => None,
         };
-        let base_input = SourceInput {
-            identity: &self.base.identity,
-            explicit: self.base.explicit,
-            content: SourceContent::Bytes(base.as_deref().unwrap_or_default()),
-        };
         // An absent implicit base must stay Absent, not become an empty byte
         // source: the core admission health distinguishes first-run defaults.
-        let base_input = if base.is_some() {
-            base_input
-        } else {
-            SourceInput::absent(&self.base.identity, self.base.explicit)
+        let base_input = match base.as_deref() {
+            Some(bytes) => SourceInput {
+                identity: &self.base.identity,
+                explicit: self.base.explicit,
+                content: SourceContent::Bytes(bytes),
+            },
+            None => SourceInput::absent(&self.base.identity, self.base.explicit),
         };
         let profile_content = profile.as_ref().map(|content| content.as_deref());
         let profile_input = match (&self.profile, profile_content) {
@@ -593,7 +722,7 @@ impl ConfigCaptureSeed {
         // Validate all non-DB layers before touching SQLite.  The empty
         // snapshot is only a preflight input and is never published.
         let empty_hosts = HostDefinitionsSnapshot::empty(thegn_core::db::SCHEMA_VERSION);
-        config_admission::admit(config_admission::AdmissionInputs {
+        let preflight = config_admission::admit(config_admission::AdmissionInputs {
             defaults: self.defaults.clone(),
             base: base_input,
             profile: profile_input,
@@ -608,12 +737,8 @@ impl ConfigCaptureSeed {
                 CaptureInputError::UncapturedEnvironmentKey,
             ));
         }
-        let hosts = match capture_state().map_err(CaptureFailure::State)? {
-            crate::state_host_capture::StateHostCapture::Absent => {
-                HostDefinitionsSnapshot::empty(thegn_core::db::SCHEMA_VERSION)
-            }
-            crate::state_host_capture::StateHostCapture::Present(snapshot) => snapshot,
-        };
+        let hosts = capture_hosts(preflight.config())?;
+        drop(preflight);
         let admitted = config_admission::admit(config_admission::AdmissionInputs {
             defaults: self.defaults.clone(),
             base: base_input,

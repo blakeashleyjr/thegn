@@ -33,7 +33,7 @@ fn fs_kind(file: &File) -> Result<i64, Error> {
 fn local_fs(file: &File) -> Result<(), Error> {
     match fs_kind(file)? {
         0xef53 | 0x58465342 | 0x9123683e | 0x01021994 => Ok(()),
-        _ => Err(Error::Unavailable),
+        _ => Err(Error::UnsupportedFilesystem),
     }
 }
 

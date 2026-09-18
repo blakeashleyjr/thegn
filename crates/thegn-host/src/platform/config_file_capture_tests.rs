@@ -131,6 +131,43 @@ fn production_reader_refuses_world_writable_dev_shm_ancestor() {
     let shared = std::fs::metadata("/dev/shm").expect("/dev/shm metadata");
     assert_ne!(shared.permissions().mode() & 0o022, 0);
     let error = read(&canary, 64).unwrap_err();
-    assert_eq!(error, Error::Unavailable);
+    assert_eq!(error, Error::UnsupportedFilesystem);
     assert!(!error.to_string().contains("private config body"));
+}
+
+/// Startup must not become impossible for a config on a filesystem outside
+/// the O_PATH reader's set: the startup reader falls back to the shared
+/// no-follow reader, which still refuses non-regular targets and bounds.
+#[test]
+fn startup_reader_falls_back_for_unsupported_filesystems_only() {
+    use crate::config_capture::ConfigSourceReader;
+    let dir = tempfile::Builder::new()
+        .prefix("thegn-config-capture-fallback-")
+        .tempdir_in("/dev/shm")
+        .expect("Linux fallback fixture requires /dev/shm");
+    let file = dir.path().join("config.toml");
+    std::fs::write(&file, b"branch_prefix = \"shm/\"\n").unwrap();
+    let reader = super::super::startup_reader();
+    assert_eq!(
+        reader.read_bounded(&file, 64).unwrap().as_deref(),
+        Some(&b"branch_prefix = \"shm/\"\n"[..])
+    );
+    assert_eq!(
+        reader.read_bounded(&file, 4),
+        Err(Error::TooLarge),
+        "the fallback keeps the byte bound"
+    );
+    assert_eq!(
+        reader.read_bounded(dir.path(), 64),
+        Err(Error::NonRegular),
+        "the fallback keeps the regular-file requirement"
+    );
+    assert_eq!(
+        reader.read_bounded(&dir.path().join("absent"), 64),
+        Ok(None)
+    );
+    // A final link on the unsupported filesystem is resolved and re-checked.
+    let link = dir.path().join("link.toml");
+    symlink(&file, &link).unwrap();
+    assert!(reader.read_bounded(&link, 64).unwrap().is_some());
 }
