@@ -181,6 +181,18 @@ restart. A sync that fails leaves the cache alone — you get yesterday's calend
 rather than an empty one — and a provider that returns an empty calendar when
 thegn has events cached is treated as suspect rather than believed.
 
+`max_events` (default 2000, allowed 1–10000) is an admission budget per
+account, not a display limit. It counts events plus deletions, and it is
+enforced while a source is being parsed. A source that goes over is refused
+as a whole. It is never truncated, because a truncated full fetch would
+replace the cache with a prefix and move the sync cursor past the events that
+were cut. The account keeps its previous events and cursor and records the
+overflow as its sync error. Single oversized events, very long content
+lines, and oversized local files are refused the same way. All accounts
+also share one process-wide budget. When other syncs are holding it, a sync
+is refused immediately and retried on its normal cadence instead of waiting.
+`0` is rejected; it does not mean unlimited.
+
 Recurring events are expanded from their `RRULE` in the event's own timezone,
 which is what keeps a weekly 09:00 meeting at 09:00 across a daylight-saving
 change instead of drifting an hour twice a year.
@@ -208,7 +220,8 @@ timeout_secs = 20
 
 thegn sets `THEGN_CAL_FROM` and `THEGN_CAL_TO` (as `YYYY-MM-DD`),
 `THEGN_CAL_SYNC_TOKEN`, `THEGN_CAL_HOME_ZONE`, `THEGN_CAL_MAX_EVENTS`, and
-`THEGN_PLUGIN_API`.
+`THEGN_PLUGIN_API`. A plugin that emits more events plus deletions than
+`THEGN_CAL_MAX_EVENTS`, or more than 20000 lines, fails the whole run.
 
 Each output line is `{"method": "...", "params": {...}}`:
 
