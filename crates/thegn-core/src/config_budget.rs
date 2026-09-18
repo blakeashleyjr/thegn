@@ -232,9 +232,17 @@ pub fn scan(bytes: &[u8]) -> Result<(), BudgetError> {
                 StringKind::MultilineLiteral => bytes.get(index..index + 3) == Some(b"'''"),
             };
             if closing {
-                let width = if kind.multiline() { 3 } else { 1 };
-                if kind.multiline() && bytes.get(index..index + 3).is_none() {
-                    return Err(BudgetError::StringBytes);
+                let mut width = if kind.multiline() { 3 } else { 1 };
+                if kind.multiline() {
+                    // TOML permits one or two literal quotes immediately
+                    // before the three-quote terminator. Consume that complete
+                    // run instead of treating its fourth quote as a new string.
+                    while width < 5 && bytes.get(index + width) == Some(&byte) {
+                        width += 1;
+                    }
+                    if string_bytes.saturating_add(width - 3) > MAX_STRING_BYTES {
+                        return Err(BudgetError::StringBytes);
+                    }
                 }
                 string = None;
                 escaped = false;

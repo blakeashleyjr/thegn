@@ -97,6 +97,25 @@ fn scanner_ignores_structure_inside_all_toml_string_forms() {
 }
 
 #[test]
+fn scanner_accepts_literal_quotes_before_multiline_terminators() {
+    for quote in ['"', '\''] {
+        for trailing_quotes in 3..=5 {
+            let source = format!(
+                "x = {}value{}\nnext = 1\n",
+                quote.to_string().repeat(3),
+                quote.to_string().repeat(trailing_quotes),
+            );
+            assert!(
+                crate::config_budget::scan(source.as_bytes()).is_ok(),
+                "{source:?}"
+            );
+            let parsed: toml::Value = source.parse().unwrap();
+            assert_eq!(parsed["x"].as_str().unwrap().len(), 5 + trailing_quotes - 3);
+        }
+    }
+}
+
+#[test]
 fn scanner_rejects_line_depth_node_member_string_and_work_overages() {
     assert!(matches!(
         crate::config_budget::scan(&vec![b'a'; crate::config_budget::MAX_LINE_BYTES + 1]),
