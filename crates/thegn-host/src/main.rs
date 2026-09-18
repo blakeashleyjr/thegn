@@ -45,6 +45,9 @@ mod compat;
 mod complete;
 mod completions_health;
 mod compositor;
+// THE-505 standalone process-source capture; no startup/authority wiring yet.
+#[allow(dead_code)]
+mod config_capture;
 mod config_source;
 mod connectivity_gate;
 mod copymode;

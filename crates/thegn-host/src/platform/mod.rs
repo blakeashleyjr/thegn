@@ -43,6 +43,10 @@ pub(crate) mod qos;
 
 pub(crate) mod sound;
 
+// THE-505 opened config-source adapter; intentionally unwired until review.
+#[allow(dead_code)]
+pub(crate) mod config_file_capture;
+
 // Standalone THE-603 helper; no production launch/startup callers yet.
 #[allow(dead_code)]
 pub(crate) mod state_db_capture;

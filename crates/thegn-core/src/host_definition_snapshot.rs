@@ -84,6 +84,17 @@ impl fmt::Debug for HostDefinitionsSnapshot {
 }
 
 impl HostDefinitionsSnapshot {
+    /// Construct the empty snapshot used when the selected state database is
+    /// genuinely absent.  Absence is a source observation, not a recovery
+    /// value for an unreadable or invalid database; the host adapter decides
+    /// which case it is before calling this constructor.
+    pub fn empty(observed_schema: i64) -> Self {
+        Self {
+            observed_schema,
+            definitions: Vec::new(),
+        }
+    }
+
     pub fn observed_schema(&self) -> i64 {
         self.observed_schema
     }

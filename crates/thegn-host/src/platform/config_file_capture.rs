@@ -1,0 +1,109 @@
+//! Platform dispatch for bounded, opened configuration-source reads.
+//!
+//! This is a source-validity adapter, not a same-UID filesystem ownership
+//! proof.  Each supported implementation documents its namespace assumption;
+//! unsupported targets return a typed refusal rather than falling back to an
+//! ordinary pathname read.
+
+use std::path::Path;
+
+use crate::config_capture::{ConfigFileReadError, ConfigSourceReader};
+
+pub(crate) struct Reader;
+
+impl ConfigSourceReader for Reader {
+    fn read_bounded(
+        &self,
+        path: &Path,
+        limit: usize,
+    ) -> Result<Option<Vec<u8>>, ConfigFileReadError> {
+        read(path, limit)
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[path = "config_file_capture_linux.rs"]
+mod linux;
+#[cfg(target_os = "linux")]
+use linux::read;
+
+#[cfg(target_os = "macos")]
+#[path = "config_file_capture_macos.rs"]
+mod macos;
+#[cfg(target_os = "macos")]
+use macos::read;
+
+#[cfg(target_os = "windows")]
+#[path = "config_file_capture_windows.rs"]
+mod windows;
+#[cfg(target_os = "windows")]
+use windows::read;
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+fn read(_: &Path, _: usize) -> Result<Option<Vec<u8>>, ConfigFileReadError> {
+    Err(ConfigFileReadError::Unsupported)
+}
+
+pub(crate) struct NativePathKeys {
+    pub(crate) home: &'static str,
+    pub(crate) home_fallback: &'static str,
+    pub(crate) config: &'static str,
+    pub(crate) config_fallback: &'static str,
+    pub(crate) state: &'static str,
+    pub(crate) state_fallback: &'static str,
+}
+
+pub(crate) fn native_path_keys() -> NativePathKeys {
+    #[cfg(windows)]
+    {
+        NativePathKeys {
+            home: "USERPROFILE",
+            home_fallback: "C:\\",
+            config: "APPDATA",
+            config_fallback: "AppData/Roaming",
+            state: "LOCALAPPDATA",
+            state_fallback: "AppData/Local",
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        NativePathKeys {
+            home: "HOME",
+            home_fallback: "/",
+            config: "XDG_CONFIG_HOME",
+            config_fallback: ".config",
+            state: "XDG_STATE_HOME",
+            state_fallback: ".local/state",
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn invalid_native_string() -> std::ffi::OsString {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        std::ffi::OsString::from_vec(vec![0xff])
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStringExt;
+        std::ffi::OsString::from_wide(&[0xd800])
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        std::ffi::OsString::from("invalid")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn unsupported_platforms_refuse_instead_of_using_a_legacy_reader() {
+        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+        assert_eq!(
+            super::Reader.read_bounded(std::path::Path::new("unused"), 1),
+            Err(super::ConfigFileReadError::Unsupported)
+        );
+    }
+}
