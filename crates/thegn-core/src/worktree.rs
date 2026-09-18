@@ -115,13 +115,13 @@ pub fn inspect_registered(root: &Path, path: &Path) -> Result<GitWorktreeIdentit
             kind: "Git admin instance",
         },
     )?;
-    if stamp_after != stamp_before {
+    if stamp_after.as_bytes() != stamp_before.as_bytes() {
         return Err(IdentityError::GitProbeFailed {
             operation: "Git admin instance changed during inspection",
         });
     }
     let generation =
-        crate::identity::WorktreeGeneration::from_captured_instance_stamp(&stamp_after)?;
+        crate::identity::WorktreeGeneration::from_captured_instance_stamp(stamp_after.as_bytes())?;
     Ok(GitWorktreeIdentity {
         common_dir,
         admin_dir,
@@ -131,7 +131,7 @@ pub fn inspect_registered(root: &Path, path: &Path) -> Result<GitWorktreeIdentit
     })
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct WorktreeIdentityRecord {
     path: ExactPath,
     branch: Option<BranchRef>,

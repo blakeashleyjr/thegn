@@ -134,6 +134,103 @@ fn bounded_blob(
     Ok(bytes.to_vec())
 }
 
+fn preflight_blob_len(
+    row: &Row<'_>,
+    index: usize,
+    name: &str,
+    exact: Option<usize>,
+) -> rusqlite::Result<usize> {
+    let bytes = match row.get_ref(index)? {
+        ValueRef::Blob(bytes) => bytes,
+        _ => return Err(malformed(index, &format!("{name} is not a BLOB"))),
+    };
+    if bytes.is_empty()
+        || bytes.len() > MAX_IDENTITY_FIELD_BYTES
+        || exact.is_some_and(|n| bytes.len() != n)
+    {
+        return Err(malformed(
+            index,
+            &format!("{name} exceeds its stored bound"),
+        ));
+    }
+    Ok(bytes.len())
+}
+
+fn preflight_text_len(
+    row: &Row<'_>,
+    index: usize,
+    name: &str,
+    max: usize,
+) -> rusqlite::Result<usize> {
+    let bytes = match row.get_ref(index)? {
+        ValueRef::Text(bytes) => bytes,
+        _ => return Err(malformed(index, &format!("{name} is not TEXT"))),
+    };
+    if bytes.is_empty() || bytes.len() > max || std::str::from_utf8(bytes).is_err() {
+        return Err(malformed(
+            index,
+            &format!("{name} exceeds its stored bound"),
+        ));
+    }
+    Ok(bytes.len())
+}
+
+/// Validate SQLite's borrowed values before any row field is cloned. This is
+/// the admission gate for path enumeration and verification: a malformed or
+/// oversized legacy row cannot force an unbounded allocation before the count
+/// and aggregate budgets are enforced.
+fn preflight_row(row: &Row<'_>) -> rusqlite::Result<usize> {
+    let mut total = 0usize;
+    for (index, name, exact) in [
+        (0, "instance_id", Some(INSTANCE_ID_BYTES)),
+        (1, "generation", Some(GENERATION_BYTES)),
+        (2, "repo_id", Some(REPOSITORY_ID_BYTES)),
+        (3, "common_dir", None),
+        (4, "admin_id", None),
+        (6, "path", None),
+        (7, "owner", None),
+    ] {
+        total = total
+            .checked_add(preflight_blob_len(row, index, name, exact)?)
+            .ok_or_else(|| malformed(index, "worktree identity claim size overflow"))?;
+    }
+    match row.get_ref(5)? {
+        ValueRef::Null => {}
+        ValueRef::Blob(bytes)
+            if !bytes.is_empty()
+                && bytes.len() <= MAX_IDENTITY_FIELD_BYTES
+                && !bytes.contains(&0) =>
+        {
+            total = total
+                .checked_add(bytes.len())
+                .ok_or_else(|| malformed(5, "worktree identity claim size overflow"))?;
+        }
+        _ => return Err(malformed(5, "branch_ref exceeds its stored bound")),
+    }
+    total = total
+        .checked_add(preflight_text_len(row, 8, "state", 32)?)
+        .ok_or_else(|| malformed(8, "worktree identity claim size overflow"))?;
+    match row.get_ref(9)? {
+        ValueRef::Null => {}
+        ValueRef::Text(bytes) if !bytes.is_empty() && bytes.len() <= MAX_REASON_BYTES => {
+            if std::str::from_utf8(bytes).is_err() {
+                return Err(malformed(9, "quarantine_reason is not UTF-8"));
+            }
+            total = total
+                .checked_add(bytes.len())
+                .ok_or_else(|| malformed(9, "worktree identity claim size overflow"))?;
+        }
+        _ => return Err(malformed(9, "quarantine_reason exceeds its stored bound")),
+    }
+    if !matches!(row.get_ref(10)?, ValueRef::Integer(value) if value >= 0) {
+        return Err(malformed(10, "operation_revision is not a bounded integer"));
+    }
+    if !matches!(row.get_ref(11)?, ValueRef::Integer(_)) {
+        return Err(malformed(11, "created_at is not an integer"));
+    }
+    Ok(total)
+}
+
 fn optional_branch(row: &Row<'_>) -> rusqlite::Result<Option<Vec<u8>>> {
     match row.get_ref(5)? {
         ValueRef::Null => Ok(None),
@@ -229,41 +326,45 @@ impl Db {
     }
 
     pub fn worktree_instances_for_path(&self, path: &[u8]) -> Result<Vec<WorktreeInstanceRow>> {
+        self.transaction(|db| db.worktree_instances_for_path_snapshot(path))
+    }
+
+    fn worktree_instances_for_path_snapshot(
+        &self,
+        path: &[u8],
+    ) -> Result<Vec<WorktreeInstanceRow>> {
         if path.is_empty() || path.len() > MAX_IDENTITY_FIELD_BYTES {
             bail!("path is empty or exceeds the identity bound");
         }
-        let mut stmt = self.conn().prepare(&format!(
+        let query = format!(
             "SELECT {COLUMNS} FROM worktree_instances WHERE path=?1 ORDER BY created_at, instance_id LIMIT ?2"
-        ))?;
+        );
         let limit = i64::try_from(MAX_PATH_CLAIMS + 1).expect("identity claim limit fits SQLite");
+        // Preflight in a first pass so no retained Vec/String is allocated
+        // until both the row-count and aggregate-byte budgets are known.
+        let mut total_bytes = 0usize;
+        {
+            let mut stmt = self.conn().prepare(&query)?;
+            let rows = stmt.query_map(params![path, limit], preflight_row)?;
+            for (index, row) in rows.enumerate() {
+                let row_bytes = row?;
+                if index >= MAX_PATH_CLAIMS {
+                    bail!("worktree path has too many identity claims");
+                }
+                total_bytes = total_bytes
+                    .checked_add(row_bytes)
+                    .ok_or_else(|| anyhow::anyhow!("worktree identity claim size overflow"))?;
+                if total_bytes > MAX_PATH_CLAIM_BYTES {
+                    bail!("worktree path identity claims exceed their aggregate bound");
+                }
+            }
+        }
+        let mut stmt = self.conn().prepare(&query)?;
         let rows = stmt.query_map(params![path, limit], decode)?;
         let mut out = Vec::new();
-        let mut total_bytes = 0usize;
-        for (index, row) in rows.enumerate() {
+        for row in rows {
             let row = row?;
             validate_row(&row)?;
-            if index >= MAX_PATH_CLAIMS {
-                bail!("worktree path has too many identity claims");
-            }
-            let row_bytes = row
-                .instance_id
-                .len()
-                .checked_add(row.generation.len())
-                .and_then(|n| n.checked_add(row.repo_id.len()))
-                .and_then(|n| n.checked_add(row.common_dir.len()))
-                .and_then(|n| n.checked_add(row.admin_id.len()))
-                .and_then(|n| n.checked_add(row.branch_ref.as_ref().map_or(0, Vec::len)))
-                .and_then(|n| n.checked_add(row.path.len()))
-                .and_then(|n| n.checked_add(row.owner.len()))
-                .and_then(|n| n.checked_add(row.state.len()))
-                .and_then(|n| n.checked_add(row.quarantine_reason.as_ref().map_or(0, String::len)))
-                .ok_or_else(|| anyhow::anyhow!("worktree identity claim size overflow"))?;
-            total_bytes = total_bytes
-                .checked_add(row_bytes)
-                .ok_or_else(|| anyhow::anyhow!("worktree identity claim size overflow"))?;
-            if total_bytes > MAX_PATH_CLAIM_BYTES {
-                bail!("worktree path identity claims exceed their aggregate bound");
-            }
             out.push(row);
         }
         Ok(out)
@@ -307,22 +408,59 @@ impl Db {
         }
         ensure_revision_can_advance(expected)?;
         self.transaction(|db| {
-            let Some((path, repo_id, admin_id, generation, revision, state, reason)) = db
+            let Some((path, repo_id, admin_id, generation, revision, state)) = db
                 .conn()
                 .query_row(
                     "SELECT path, repo_id, admin_id, generation, operation_revision, state, quarantine_reason
                        FROM worktree_instances WHERE instance_id=?1",
                     [instance_id],
                     |row| {
-                        Ok((
-                            row.get::<_, Vec<u8>>(0)?,
-                            row.get::<_, Vec<u8>>(1)?,
-                            row.get::<_, Vec<u8>>(2)?,
-                            row.get::<_, Vec<u8>>(3)?,
-                            row.get::<_, i64>(4)?,
-                            row.get::<_, String>(5)?,
-                            row.get::<_, Option<String>>(6)?,
-                        ))
+                        let path_len = preflight_blob_len(row, 0, "path", None)?;
+                        let repo_len = preflight_blob_len(
+                            row,
+                            1,
+                            "repo_id",
+                            Some(REPOSITORY_ID_BYTES),
+                        )?;
+                        let admin_len = preflight_blob_len(row, 2, "admin_id", None)?;
+                        let generation_len = preflight_blob_len(
+                            row,
+                            3,
+                            "generation",
+                            Some(GENERATION_BYTES),
+                        )?;
+                        let revision = match row.get_ref(4)? {
+                            ValueRef::Integer(value) if value >= 0 => value,
+                            _ => return Err(malformed(4, "operation_revision is not a bounded integer")),
+                        };
+                        let state = match row.get_ref(5)? {
+                            ValueRef::Text(bytes) if bytes == b"legacy" => true,
+                            _ => return Err(malformed(5, "worktree claim is not legacy UTF-8 text")),
+                        };
+                        if !matches!(row.get_ref(6)?, ValueRef::Null) {
+                            return Err(malformed(6, "legacy worktree claim has a quarantine reason"));
+                        }
+                        let path = match row.get_ref(0)? {
+                            ValueRef::Blob(bytes) => bytes.to_vec(),
+                            _ => unreachable!("preflight checked path type"),
+                        };
+                        let repo_id = match row.get_ref(1)? {
+                            ValueRef::Blob(bytes) => bytes.to_vec(),
+                            _ => unreachable!("preflight checked repository type"),
+                        };
+                        let admin_id = match row.get_ref(2)? {
+                            ValueRef::Blob(bytes) => bytes.to_vec(),
+                            _ => unreachable!("preflight checked admin type"),
+                        };
+                        let generation = match row.get_ref(3)? {
+                            ValueRef::Blob(bytes) => bytes.to_vec(),
+                            _ => unreachable!("preflight checked generation type"),
+                        };
+                        debug_assert_eq!(path.len(), path_len);
+                        debug_assert_eq!(repo_id.len(), repo_len);
+                        debug_assert_eq!(admin_id.len(), admin_len);
+                        debug_assert_eq!(generation.len(), generation_len);
+                        Ok((path, repo_id, admin_id, generation, revision, state))
                     },
                 )
                 .optional()?
@@ -331,27 +469,27 @@ impl Db {
             };
             if generation != expected.generation
                 || revision != expected.operation_revision
-                || state != "legacy"
-                || reason.is_some()
+                || !state
             {
                 return Ok(false);
             }
-            if path.is_empty()
-                || path.len() > MAX_IDENTITY_FIELD_BYTES
-                || repo_id.len() != REPOSITORY_ID_BYTES
-                || admin_id.is_empty()
-                || admin_id.len() > MAX_IDENTITY_FIELD_BYTES
-            {
-                bail!("worktree identity claim is malformed");
-            }
-            let competing: i64 = db.conn().query_row(
-                "SELECT count(*) FROM worktree_instances
-                   WHERE instance_id != ?1
-                     AND (path = ?2 OR (repo_id = ?3 AND admin_id = ?4))",
-                params![instance_id, &path, &repo_id, &admin_id],
+            let competing_path: bool = db.conn().query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM worktree_instances
+                    WHERE instance_id != ?1 AND path = ?2 LIMIT 1
+                 )",
+                params![instance_id, &path],
                 |row| row.get(0),
             )?;
-            if competing != 0 {
+            let competing_repo_admin: bool = db.conn().query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM worktree_instances
+                    WHERE instance_id != ?1 AND repo_id = ?2 AND admin_id = ?3 LIMIT 1
+                 )",
+                params![instance_id, &repo_id, &admin_id],
+                |row| row.get(0),
+            )?;
+            if competing_path || competing_repo_admin {
                 bail!("worktree identity has unresolved competing claims");
             }
             let changed = db.conn().execute(
