@@ -4,6 +4,15 @@
 //! proof.  Each supported implementation documents its namespace assumption;
 //! unsupported targets return a typed refusal rather than falling back to an
 //! ordinary pathname read.
+//!
+//! Platform acceptance boundary: the macOS and Windows config-file readers
+//! deliberately refuse a final symlink/reparse point because this chunk does
+//! not yet have a reviewed bounded target walker for those platforms. The
+//! typed diagnostic tells the operator to select a reviewed ordinary private
+//! config file; copying a manager-owned file means it no longer automatically
+//! tracks that manager. This limitation applies to config files only. The
+//! state DB reader has a separate platform support contract, and this parked
+//! adapter does not claim universal startup support.
 
 use std::path::Path;
 

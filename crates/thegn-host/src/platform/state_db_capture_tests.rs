@@ -316,6 +316,16 @@ fn production_route_does_not_ignore_globally_writable_ancestors() {
         .expect("owned production-refusal fixture cleanup");
 }
 
+#[test]
+fn production_route_refuses_world_writable_dev_shm_ancestor() {
+    let shared = open_at(libc::AT_FDCWD, OsStr::new("/dev/shm")).unwrap();
+    assert_ne!(shared.metadata().unwrap().mode() & 0o022, 0);
+    let path = Path::new("/dev/shm/thegn-603-production-refusal/state.db");
+    let error = crate::state_host_capture::capture(path).unwrap_err();
+    assert_eq!(error, Error::Unsupported);
+    assert!(!error.to_string().contains("thegn-603-production-refusal"));
+}
+
 // Permission restoration uses an ordinary descriptor acquired while the owned
 // path is readable, not O_PATH (which cannot be used with fchmod).
 struct RestorePermissions {

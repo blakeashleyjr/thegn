@@ -26,6 +26,7 @@ pub(crate) enum ConfigFileReadError {
     Changed,
     TooLarge,
     InvalidUtf8,
+    FinalLinkUnsupported,
     Unsupported,
 }
 
@@ -37,6 +38,9 @@ impl std::fmt::Display for ConfigFileReadError {
             Self::Changed => "configuration source changed during capture",
             Self::TooLarge => "configuration source exceeds its byte limit",
             Self::InvalidUtf8 => "configuration source is not valid UTF-8",
+            Self::FinalLinkUnsupported => {
+                "configuration file is a final symlink/reparse point; select a reviewed ordinary private file (copying a managed config stops automatic tracking)"
+            }
             Self::Unsupported => "configuration source capture is unsupported on this platform",
         })
     }
@@ -75,6 +79,7 @@ pub(crate) enum CaptureInputError {
     Bounds,
     InvalidUtf8,
     ProfileBindingMismatch,
+    ProfileSelector(thegn_core::profile::ProfileSelectorError),
     UncapturedEnvironmentKey,
 }
 
@@ -407,6 +412,12 @@ impl ConfigCaptureSeed {
             return Err(error);
         }
         let base_app_root = app_root.clone();
+        // Validate the selected process profile even when a caller supplies a
+        // pre-rerooted path. This preserves CLI-over-environment precedence
+        // and prevents an invalid raw selector from being hidden by a frozen
+        // path identity.
+        let selector = thegn_core::profile::resolve_selector(cli.profile, env_profile.as_deref())
+            .map_err(CaptureInputError::ProfileSelector)?;
         let resolved_profile = if let Some(paths) = cli.profile_paths {
             // Reject the complete retained root before cloning it into the
             // seed.  This is also the no-double-reroot path.
@@ -417,17 +428,12 @@ impl ConfigCaptureSeed {
                 &base_app_root,
                 cli.profile,
                 env_profile.as_deref(),
-            );
+            )
+            .map_err(CaptureInputError::ProfileSelector)?;
             checked_path(&paths.root)?;
             paths
         };
-        let requested_profile = cli
-            .profile
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .or(env_profile.as_deref())
-            .unwrap_or_default();
-        let requested_name = thegn_core::profile::normalize_name(requested_profile);
+        let requested_name = selector.name;
         let requested_capped = thegn_core::profile::cap_name(
             &requested_name,
             thegn_core::profile::MAX_NEW_PROFILE_NAME,
