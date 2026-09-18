@@ -27,6 +27,35 @@ runner-only infrastructure — see below); `just ci-local` adds the local e2e
 gate. Follow the dev-loop policy in `CLAUDE.md` and run the full gates once at
 the appropriate boundary.
 
+## Checkout hooks and linked worktrees
+
+The dev shell installs only the generated pre-commit/pre-merge/pre-push gates.
+It does not install a `post-checkout` hook, seed `.pre-commit-config.yaml`, or
+run a healer after checkout/worktree creation. Git checkout and `git worktree
+add` therefore do not execute files selected by the branch being entered.
+
+`PREK_ALLOW_NO_CONFIG=1` remains an optional local-development compatibility
+setting for a missing generated config; it is not a test waiver or a security
+boundary. Review a linked worktree before explicitly configuring its local
+prek hooks. CI and explicit merge gates are the authoritative enforcement
+path.
+
+On shell entry, immutable trusted detector code performs a bounded, read-only
+check for the exact known legacy `post-checkout` bytes. It accepts only the
+canonical checkout's ordinary `.git/hooks` directory, optionally when local
+`core.hooksPath` resolves exactly to that same directory; custom/global/shared
+paths and symlinks/special files are reported and untouched. If the exact
+legacy file is found, remove it manually
+after reviewing it (for example, after confirming the reported digest and
+running `rm -- .git/hooks/post-checkout` from that canonical checkout). The
+detector never performs that deletion, and unknown files must remain untouched.
+
+`just heal-git` is still available as an explicit developer repair command for
+a wedged shared Git config. It executes the checked-out shell utility only by
+deliberate invocation and is not generation-fenced or race-safe; it is not a
+checkout-hook security boundary. That shared-config repair is tracked by
+THE-371.
+
 ## Faithful path — `act`
 
 [`act`](https://github.com/nektos/act) runs the actual GitHub Actions workflow

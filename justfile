@@ -679,14 +679,16 @@ lint: ratchets
     # of them ours.
     git ls-files -z '*.toml' | xargs -0 taplo lint
 
-# Repair a wedged checkout: strip a stray `core.worktree` that an external
+# Explicit developer repair only (never a checkout hook): strip a stray
+# `core.worktree` that an external
 # worktree tool (herdr) or a GIT_*-exporting child leaked into the shared
 # `.git/config`. Symptom: `git add`/`commit`/`status` mis-target another tree,
 # or (once the leaked path is deleted) git aborts with "Invalid path" / "must be
 # run in a work tree". Pure-text repair — needs no working git, so it fixes the
 # case a pre-commit hook can't (git dies before hooks run). Same key thegn heals
 # in-process at startup + on worktree switch; this covers manual/CI git. No-op
-# when clean.
+# when clean. This shell command is not generation-fenced or race-safe; shared
+# config repair belongs to THE-371. Review the checkout and invoke it deliberately.
 heal-git:
     sh test/git-hooks/heal-worktree.sh -v || true
     @top=$(git rev-parse --show-toplevel 2>/dev/null) && echo "heal-git: ok — worktree $top" || echo "heal-git: git still wedged — inspect .git/config by hand"
@@ -736,7 +738,7 @@ fmt-check:
 # `cargo test`. This recipe is the single source of truth shared by the CI
 # `test` job and the pre-push hook. Doctests are `test-doc` (CI-only) — see
 # the note there.
-test: contract-ratchets test-live test-build-metadata
+test: contract-ratchets test-live test-build-metadata test-the429
     cargo nextest run --workspace
 
 # Doctest pass. Split out of `test` (and therefore off pre-push) because it is
@@ -1110,6 +1112,11 @@ test-live:
 # freshness without rebuilding the application.
 test-build-metadata:
     python3 -B test/build_metadata_test.py
+
+# Read-only checkout-hook regression; intentionally runs before the Rust suite
+# and uses only throwaway repositories, isolated Git config, and XDG state.
+test-the429:
+    binary="${THEGN_TEST_BINARY:-}"; if [ -z "$binary" ] && [ -x "${CARGO_TARGET_DIR:-target}/release/thegn" ]; then binary="${CARGO_TARGET_DIR:-target}/release/thegn"; fi; if [ -z "$binary" ]; then echo "THE-429 native fixture: missing compiled binary; set THEGN_TEST_BINARY for the final native gate" >&2; else binary="$(realpath -- "$binary")"; echo "THE-429 native fixture: selected $binary"; fi; THEGN_TEST_BINARY="$binary" python3 -B test/the429_checkout_hooks.py
 
 # Install/update the native thegn host onto your PATH (standalone, non-Nix):
 # builds release artifacts, installs `tg` as the dedicated alacritty launcher,
