@@ -46,7 +46,7 @@ def detector(repo: Path, env: dict[str, str]) -> str:
     return result.stderr
 
 
-def shell_entry(repo: Path, env: dict[str, str]) -> str:
+def shell_entry_body() -> str:
     # Execute the actual hookExtras body, substituting only the two immutable
     # Nix store references. This detects an installer reintroduced beside the
     # detector, which invoking the detector alone would miss.
@@ -55,7 +55,22 @@ def shell_entry(repo: Path, env: dict[str, str]) -> str:
     body = body.replace("${pkgs.python3}/bin/python3", shlex.quote(sys.executable))
     body = body.replace("${./nix/detect-legacy-post-checkout.py}", shlex.quote(str(DETECTOR)))
     body = body.replace("''${", "${")
-    return run("sh", "-c", body, cwd=repo, env={**env, "CI": ""}).stderr
+    return body
+
+
+def shell_entry(repo: Path, env: dict[str, str]) -> str:
+    return run("sh", "-c", shell_entry_body(), cwd=repo, env={**env, "CI": ""}).stderr
+
+
+def shell_entry_async(repo: Path, env: dict[str, str]) -> subprocess.Popen[str]:
+    return subprocess.Popen(
+        ["sh", "-c", shell_entry_body()],
+        cwd=repo,
+        env={**env, "CI": ""},
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
 
 
 def fake_git(sandbox: Path, mode: str) -> dict[str, str]:
@@ -346,6 +361,23 @@ def main() -> int:
                 assert snapshot(config_target) == before_config_target, case
         remove_entry(config_path)
         remove_entry(config_target)
+
+        # The no-op shell setup must remain harmless even while a real checkout
+        # changes the selected branch. This overlaps several immutable shell
+        # entries with ordinary checkout operations around a foreign config;
+        # there is no installer/uninstaller race left to win.
+        concurrent_config = repo / ".pre-commit-config.yaml"
+        concurrent_config.write_bytes(b"foreign concurrent shell config\n")
+        concurrent_before = snapshot(concurrent_config)
+        shell_entries = [shell_entry_async(repo, env) for _ in range(3)]
+        for branch in ("hostile", "main", "hostile", "main"):
+            git("checkout", "-q", branch, cwd=repo, env=env)
+        for process in shell_entries:
+            stdout, stderr = process.communicate(timeout=10)
+            assert process.returncode == 0, (stdout, stderr)
+        assert snapshot(concurrent_config) == concurrent_before
+        assert not sentinel.exists(), "a concurrent branch-controlled checkout payload ran"
+        concurrent_config.unlink()
 
         binary = os.environ.get("THEGN_TEST_BINARY")
         if binary:
