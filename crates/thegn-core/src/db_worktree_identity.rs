@@ -18,6 +18,8 @@ pub(crate) const GENERATION_BYTES: usize = 16;
 pub(crate) const REPOSITORY_ID_BYTES: usize = 32;
 pub(crate) const MAX_IDENTITY_FIELD_BYTES: usize = 16 * 1024;
 const MAX_REASON_BYTES: usize = 1024;
+const MAX_PATH_CLAIMS: usize = 1024;
+const MAX_PATH_CLAIM_BYTES: usize = 16 * 1024 * 1024;
 
 /// Expected generation and operation revision for a compare-and-set ledger
 /// transition. The generation is stable across rename; the revision changes on
@@ -101,6 +103,13 @@ fn malformed(index: usize, message: &str) -> rusqlite::Error {
             message,
         )),
     )
+}
+
+fn ensure_revision_can_advance(expected: &ExpectedWorktreeRevision) -> Result<()> {
+    if expected.operation_revision == i64::MAX {
+        bail!("worktree operation revision is exhausted");
+    }
+    Ok(())
 }
 
 fn bounded_blob(
@@ -223,12 +232,38 @@ impl Db {
         if path.is_empty() || path.len() > MAX_IDENTITY_FIELD_BYTES {
             bail!("path is empty or exceeds the identity bound");
         }
-        let mut stmt = self.conn().prepare(&format!("SELECT {COLUMNS} FROM worktree_instances WHERE path=?1 ORDER BY created_at, instance_id"))?;
-        let rows = stmt.query_map([path], decode)?;
+        let mut stmt = self.conn().prepare(&format!(
+            "SELECT {COLUMNS} FROM worktree_instances WHERE path=?1 ORDER BY created_at, instance_id LIMIT ?2"
+        ))?;
+        let limit = i64::try_from(MAX_PATH_CLAIMS + 1).expect("identity claim limit fits SQLite");
+        let rows = stmt.query_map(params![path, limit], decode)?;
         let mut out = Vec::new();
-        for row in rows {
+        let mut total_bytes = 0usize;
+        for (index, row) in rows.enumerate() {
             let row = row?;
             validate_row(&row)?;
+            if index >= MAX_PATH_CLAIMS {
+                bail!("worktree path has too many identity claims");
+            }
+            let row_bytes = row
+                .instance_id
+                .len()
+                .checked_add(row.generation.len())
+                .and_then(|n| n.checked_add(row.repo_id.len()))
+                .and_then(|n| n.checked_add(row.common_dir.len()))
+                .and_then(|n| n.checked_add(row.admin_id.len()))
+                .and_then(|n| n.checked_add(row.branch_ref.as_ref().map_or(0, Vec::len)))
+                .and_then(|n| n.checked_add(row.path.len()))
+                .and_then(|n| n.checked_add(row.owner.len()))
+                .and_then(|n| n.checked_add(row.state.len()))
+                .and_then(|n| n.checked_add(row.quarantine_reason.as_ref().map_or(0, String::len)))
+                .ok_or_else(|| anyhow::anyhow!("worktree identity claim size overflow"))?;
+            total_bytes = total_bytes
+                .checked_add(row_bytes)
+                .ok_or_else(|| anyhow::anyhow!("worktree identity claim size overflow"))?;
+            if total_bytes > MAX_PATH_CLAIM_BYTES {
+                bail!("worktree path identity claims exceed their aggregate bound");
+            }
             out.push(row);
         }
         Ok(out)
@@ -251,6 +286,7 @@ impl Db {
         {
             bail!("quarantine state requires a bounded non-empty reason");
         }
+        ensure_revision_can_advance(expected)?;
         let changed = self.conn().execute(
             "UPDATE worktree_instances SET state=?3, quarantine_reason=?4, operation_revision=operation_revision+1
               WHERE instance_id=?1 AND generation=?2 AND operation_revision=?5",
@@ -269,12 +305,62 @@ impl Db {
         if instance_id.len() != INSTANCE_ID_BYTES {
             bail!("instance_id must contain exactly {INSTANCE_ID_BYTES} bytes");
         }
-        let changed = self.conn().execute(
-            "UPDATE worktree_instances SET state='verified', quarantine_reason=NULL, operation_revision=operation_revision+1
-              WHERE instance_id=?1 AND generation=?2 AND operation_revision=?3 AND state='legacy' AND quarantine_reason IS NULL",
-            params![instance_id, &expected.generation, expected.operation_revision],
-        )?;
-        Ok(changed == 1)
+        ensure_revision_can_advance(expected)?;
+        self.transaction(|db| {
+            let Some((path, repo_id, admin_id, generation, revision, state, reason)) = db
+                .conn()
+                .query_row(
+                    "SELECT path, repo_id, admin_id, generation, operation_revision, state, quarantine_reason
+                       FROM worktree_instances WHERE instance_id=?1",
+                    [instance_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, Vec<u8>>(0)?,
+                            row.get::<_, Vec<u8>>(1)?,
+                            row.get::<_, Vec<u8>>(2)?,
+                            row.get::<_, Vec<u8>>(3)?,
+                            row.get::<_, i64>(4)?,
+                            row.get::<_, String>(5)?,
+                            row.get::<_, Option<String>>(6)?,
+                        ))
+                    },
+                )
+                .optional()?
+            else {
+                return Ok(false);
+            };
+            if generation != expected.generation
+                || revision != expected.operation_revision
+                || state != "legacy"
+                || reason.is_some()
+            {
+                return Ok(false);
+            }
+            if path.is_empty()
+                || path.len() > MAX_IDENTITY_FIELD_BYTES
+                || repo_id.len() != REPOSITORY_ID_BYTES
+                || admin_id.is_empty()
+                || admin_id.len() > MAX_IDENTITY_FIELD_BYTES
+            {
+                bail!("worktree identity claim is malformed");
+            }
+            let competing: i64 = db.conn().query_row(
+                "SELECT count(*) FROM worktree_instances
+                   WHERE instance_id != ?1
+                     AND (path = ?2 OR (repo_id = ?3 AND admin_id = ?4))",
+                params![instance_id, &path, &repo_id, &admin_id],
+                |row| row.get(0),
+            )?;
+            if competing != 0 {
+                bail!("worktree identity has unresolved competing claims");
+            }
+            let changed = db.conn().execute(
+                "UPDATE worktree_instances SET state='verified', quarantine_reason=NULL, operation_revision=operation_revision+1
+                  WHERE instance_id=?1 AND generation=?2 AND operation_revision=?3 AND state='legacy' AND quarantine_reason IS NULL",
+                params![instance_id, &expected.generation, expected.operation_revision],
+            )?;
+            Ok(changed == 1)
+        })
     }
 
     pub fn advance_worktree_operation_revision(
@@ -285,6 +371,7 @@ impl Db {
         if instance_id.len() != INSTANCE_ID_BYTES {
             bail!("instance_id must contain exactly {INSTANCE_ID_BYTES} bytes");
         }
+        ensure_revision_can_advance(expected)?;
         let changed = self.conn().execute(
             "UPDATE worktree_instances SET operation_revision=operation_revision+1 WHERE instance_id=?1 AND generation=?2 AND operation_revision=?3",
             params![instance_id, &expected.generation, expected.operation_revision],
@@ -315,7 +402,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_claims_can_share_paths_until_verified() {
+    fn competing_legacy_claims_never_promote_first_wins() {
         let db = Db::open_memory().unwrap();
         let first = row(1, b"/repo/.worktrees/one");
         let second = row(2, b"/repo/.worktrees/one");
@@ -330,12 +417,19 @@ mod tests {
         let expected = ExpectedWorktreeRevision::new(&first.generation, 0).unwrap();
         assert!(
             db.verify_worktree_instance(&first.instance_id, &expected)
-                .unwrap()
+                .is_err()
         );
         let expected_second = ExpectedWorktreeRevision::new(&second.generation, 0).unwrap();
         assert!(
             db.verify_worktree_instance(&second.instance_id, &expected_second)
                 .is_err()
+        );
+        assert!(
+            db.worktree_instance(&first.instance_id)
+                .unwrap()
+                .unwrap()
+                .state
+                == "legacy"
         );
     }
 
@@ -360,5 +454,85 @@ mod tests {
             .unwrap();
         assert_eq!(current.branch_ref, None);
         assert_eq!(current.operation_revision, 1);
+    }
+
+    #[test]
+    fn revision_maximum_is_rejected_before_sqlite_can_promote_it() {
+        let db = Db::open_memory().unwrap();
+        let mut row = row(4, b"/repo/.worktrees/max");
+        row.operation_revision = i64::MAX;
+        db.put_worktree_instance(&row).unwrap();
+        let expected = ExpectedWorktreeRevision::new(&row.generation, i64::MAX).unwrap();
+        assert!(
+            db.advance_worktree_operation_revision(&row.instance_id, &expected)
+                .is_err()
+        );
+        assert_eq!(
+            db.worktree_instance(&row.instance_id)
+                .unwrap()
+                .unwrap()
+                .operation_revision,
+            i64::MAX
+        );
+    }
+
+    #[test]
+    fn path_claim_listing_has_exact_and_over_limit_behavior() {
+        let db = Db::open_memory().unwrap();
+        for index in 0..=MAX_PATH_CLAIMS {
+            let mut claim = row(5, b"/repo/.worktrees/many");
+            claim.instance_id[0] = (index & 0xff) as u8;
+            claim.instance_id[1] = (index >> 8) as u8;
+            claim.generation[0] = (index & 0xff) as u8;
+            claim.created_at = index as i64;
+            db.put_worktree_instance(&claim).unwrap();
+        }
+        assert!(
+            db.worktree_instances_for_path(b"/repo/.worktrees/many")
+                .is_err()
+        );
+        // A fresh database with exactly the cap is still a complete result,
+        // rather than an arbitrary SQL prefix.
+        let exact = Db::open_memory().unwrap();
+        for index in 0..MAX_PATH_CLAIMS {
+            let mut claim = row(6, b"/repo/.worktrees/exact");
+            claim.instance_id[0] = (index & 0xff) as u8;
+            claim.instance_id[1] = (index >> 8) as u8;
+            claim.generation[0] = (index & 0xff) as u8;
+            claim.created_at = index as i64;
+            exact.put_worktree_instance(&claim).unwrap();
+        }
+        assert_eq!(
+            exact
+                .worktree_instances_for_path(b"/repo/.worktrees/exact")
+                .unwrap()
+                .len(),
+            MAX_PATH_CLAIMS
+        );
+
+        let malformed = Db::open_memory().unwrap();
+        malformed
+            .conn()
+            .execute(
+                "INSERT INTO worktree_instances
+                 (instance_id,generation,repo_id,common_dir,admin_id,branch_ref,path,owner,state,operation_revision,created_at)
+                 VALUES (?1,?2,?3,zeroblob(?4),?5,?6,?7,?8,'legacy',0,0)",
+                params![
+                    vec![7u8; INSTANCE_ID_BYTES],
+                    vec![8u8; GENERATION_BYTES],
+                    vec![9u8; REPOSITORY_ID_BYTES],
+                    MAX_IDENTITY_FIELD_BYTES + 1,
+                    vec![10u8; 4],
+                    b"branch".as_slice(),
+                    b"/repo/.worktrees/oversized".as_slice(),
+                    b"test".as_slice(),
+                ],
+            )
+            .unwrap();
+        assert!(
+            malformed
+                .worktree_instances_for_path(b"/repo/.worktrees/oversized")
+                .is_err()
+        );
     }
 }

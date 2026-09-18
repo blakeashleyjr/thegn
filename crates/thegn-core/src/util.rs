@@ -4,7 +4,8 @@
 use crate::msg;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::sync::mpsc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
@@ -155,79 +156,88 @@ pub(crate) fn git_stdout_bounded(
     if max_bytes == 0 {
         return Err("git identity probe has an invalid output bound".into());
     }
+    let mut command = git_cmd(dir);
+    command
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    bounded_stdout(command, max_bytes)
+}
+
+/// Capture a subprocess stdout pipe with one owner for the child and one owner
+/// for the reader. There is no named temporary file to replace or reopen, and
+/// the reader stops at `max_bytes + 1` instead of polling an unbounded spool.
+/// Unix probes are put in their own process group so descendants holding the
+/// pipe are torn down with the probe.
+fn bounded_stdout(mut command: Command, max_bytes: usize) -> Result<Vec<u8>, String> {
     let read_limit = u64::try_from(max_bytes)
         .ok()
         .and_then(|limit| limit.checked_add(1))
         .ok_or_else(|| "git identity probe has an invalid output bound".to_string())?;
-    let capture_path = std::env::temp_dir().join(format!(
-        ".thegn-git-identity-{}-{}",
-        std::process::id(),
-        now_nanos().saturating_add({
-            static NEXT_CAPTURE: std::sync::atomic::AtomicU64 =
-                std::sync::atomic::AtomicU64::new(0);
-            u128::from(NEXT_CAPTURE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)),
-        })
-    ));
-    let capture = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&capture_path)
-        .map_err(|e| e.to_string())?;
-    let mut child = match git_cmd(dir)
-        .args(args)
-        .stdout(Stdio::from(capture))
-        .stderr(Stdio::null())
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(error) => {
-            let _ = std::fs::remove_file(&capture_path);
-            return Err(error.to_string());
+    #[cfg(unix)]
+    command.process_group(0);
+    let mut child = command.spawn().map_err(|error| error.to_string())?;
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            terminate_and_reap(child);
+            return Err("git identity probe stdout pipe was not created".into());
         }
     };
+    let (sender, receiver) = mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("thegn-git-identity-reader".into())
+        .spawn(move || {
+            let mut bytes = Vec::with_capacity(max_bytes.min(4096));
+            let result = stdout
+                .take(read_limit)
+                .read_to_end(&mut bytes)
+                .map(|_| bytes);
+            let _ = sender.send(result);
+        })
+        .map_err(|error| {
+            terminate_and_reap(child);
+            error.to_string()
+        })?;
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let mut captured = None;
     let status = loop {
-        if std::fs::metadata(&capture_path)
-            .map(|metadata| metadata.len() > max_bytes as u64)
-            .unwrap_or(false)
-        {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = std::fs::remove_file(&capture_path);
-            return Err("git identity probe output exceeded its bound".into());
-        }
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) if std::time::Instant::now() < deadline => {
+                if captured.is_none() {
+                    captured = receiver.try_recv().ok();
+                }
+                if let Some(Ok(bytes)) = captured.as_ref() {
+                    if bytes.len() > max_bytes {
+                        terminate_and_reap(child);
+                        return Err("git identity probe output exceeded its bound".into());
+                    }
+                }
                 std::thread::sleep(Duration::from_millis(10));
             }
             Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = std::fs::remove_file(&capture_path);
+                terminate_and_reap(child);
                 return Err("git identity probe exceeded its time bound".into());
             }
             Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = std::fs::remove_file(&capture_path);
+                terminate_and_reap(child);
                 return Err(error.to_string());
             }
         }
     };
-    let mut file = match std::fs::File::open(&capture_path) {
-        Ok(file) => file,
-        Err(error) => {
-            let _ = std::fs::remove_file(&capture_path);
-            return Err(error.to_string());
-        }
+    let bytes = match captured {
+        Some(result) => result.map_err(|error| error.to_string())?,
+        None => match receiver
+            .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+        {
+            Ok(result) => result.map_err(|error| error.to_string())?,
+            Err(_) => {
+                terminate_and_reap(child);
+                return Err("git identity probe stdout reader exceeded its time bound".into());
+            }
+        },
     };
-    let mut bytes = Vec::with_capacity(max_bytes.min(4096));
-    if let Err(error) = file.take(read_limit).read_to_end(&mut bytes) {
-        let _ = std::fs::remove_file(&capture_path);
-        return Err(error.to_string());
-    }
-    let _ = std::fs::remove_file(&capture_path);
     if bytes.len() > max_bytes {
         return Err("git identity probe output exceeded its bound".into());
     }
@@ -237,10 +247,32 @@ pub(crate) fn git_stdout_bounded(
     Ok(bytes)
 }
 
-fn now_nanos() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_nanos())
+fn terminate_and_reap(mut child: Child) {
+    #[cfg(unix)]
+    {
+        use nix::sys::signal::{Signal, killpg};
+        use nix::unistd::Pid;
+        if let Ok(pid) = i32::try_from(child.id()) {
+            let _ = killpg(Pid::from_raw(pid), Signal::SIGKILL);
+        }
+    }
+    let _ = child.kill();
+    let reap_deadline = std::time::Instant::now() + Duration::from_millis(250);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => return,
+            Ok(None) if std::time::Instant::now() >= reap_deadline => break,
+            Ok(None) => std::thread::sleep(Duration::from_millis(5)),
+        }
+    }
+    // Ownership is explicit even when the OS cannot reap immediately. The
+    // caller never performs an unbounded wait; this bounded reaper owns the
+    // child until the kernel reports its exit.
+    let _ = std::thread::Builder::new()
+        .name("thegn-git-identity-reaper".into())
+        .spawn(move || {
+            let _ = child.wait();
+        });
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -268,16 +300,16 @@ pub(crate) fn native_path_bytes_bounded(
     #[cfg(windows)]
     {
         use std::os::windows::ffi::OsStrExt;
-        let units = path.as_os_str().encode_wide();
-        let byte_len = path
-            .as_os_str()
-            .len()
-            .checked_mul(2)
-            .ok_or(NativePathError::TooLong)?;
-        if byte_len > max_bytes {
+        let max_units = max_bytes / 2;
+        let unit_count = path.as_os_str().encode_wide().take(max_units + 1).count();
+        if unit_count > max_units {
             return Err(NativePathError::TooLong);
         }
-        return Ok(units.flat_map(u16::to_le_bytes).collect());
+        return Ok(path
+            .as_os_str()
+            .encode_wide()
+            .flat_map(u16::to_le_bytes)
+            .collect());
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -293,33 +325,34 @@ pub(crate) fn native_path_bytes_bounded(
 /// bytes remain an inspection proof owned by the Git adapter; callers must not
 /// manufacture a generation from random bytes.
 pub(crate) fn git_admin_instance_stamp(path: &Path) -> Option<Vec<u8>> {
-    let metadata = std::fs::metadata(path).ok()?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        let mut stamp = Vec::with_capacity(48);
-        for value in [
-            metadata.dev(),
-            metadata.ino(),
-            metadata.ctime() as u64,
-            metadata.ctime_nsec() as u64,
-        ] {
-            stamp.extend_from_slice(&value.to_be_bytes());
-        }
-        return Some(stamp);
+    // `same-file` owns the platform-specific handle implementation. In
+    // particular, this avoids the unstable Windows MetadataExt accessors and
+    // does not include mutable timestamps: checkout/index-lock activity may
+    // change ctime while the Git administrative directory is still the same
+    // instance. The Hash implementation is the crate's stable identity pair
+    // (dev+inode on Unix, volume+file index on Windows).
+    let handle = same_file::Handle::from_path(path).ok()?;
+    let mut hasher = IdentityStampHasher::default();
+    std::hash::Hash::hash(&handle, &mut hasher);
+    (!hasher.bytes.is_empty()).then_some(hasher.bytes)
+}
+
+#[derive(Default)]
+struct IdentityStampHasher {
+    bytes: Vec<u8>,
+}
+
+impl std::hash::Hasher for IdentityStampHasher {
+    fn finish(&self) -> u64 {
+        0
     }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        let mut stamp = Vec::with_capacity(16);
-        stamp.extend_from_slice(&metadata.volume_serial_number()?.to_be_bytes());
-        stamp.extend_from_slice(&metadata.file_index()?.to_be_bytes());
-        return Some(stamp);
+
+    fn write(&mut self, bytes: &[u8]) {
+        self.bytes.extend_from_slice(bytes);
     }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = metadata;
-        None
+
+    fn write_u64(&mut self, value: u64) {
+        self.bytes.extend_from_slice(&value.to_be_bytes());
     }
 }
 
@@ -1303,6 +1336,30 @@ fn platform_hostname() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_stdout_handles_idle_and_oversized_injected_children() {
+        let idle = Command::new("/bin/sh");
+        assert!(
+            bounded_stdout(idle.args(["-c", "exit 0"]), 32)
+                .unwrap()
+                .is_empty()
+        );
+
+        let oversized = Command::new("/bin/sh");
+        let error =
+            bounded_stdout(oversized.args(["-c", "head -c 128 /dev/zero"]), 32).unwrap_err();
+        assert!(error.contains("exceeded its bound"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_stdout_cleans_a_child_that_holds_stdout_after_exit() {
+        let holding = Command::new("/bin/sh");
+        let error = bounded_stdout(holding.args(["-c", "(sleep 10) & exit 0"]), 32).unwrap_err();
+        assert!(error.contains("reader") || error.contains("time bound"));
+    }
 
     #[test]
     fn strips_the_linux_deleted_marker() {

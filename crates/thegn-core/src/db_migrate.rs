@@ -949,7 +949,7 @@ pub(crate) fn migrate_v69(conn: &Connection) -> Result<()> {
              DROP INDEX IF EXISTS idx_worktree_instances_state;
              ALTER TABLE worktree_instances RENAME TO worktree_instances_v69_legacy;
              CREATE TABLE worktree_instances (
-               instance_id BLOB PRIMARY KEY CHECK(length(instance_id)=32),
+               instance_id BLOB NOT NULL PRIMARY KEY CHECK(length(instance_id)=32),
                generation BLOB NOT NULL CHECK(length(generation)=16),
                repo_id BLOB NOT NULL CHECK(length(repo_id)=32),
                common_dir BLOB NOT NULL, admin_id BLOB NOT NULL, branch_ref BLOB,
@@ -970,7 +970,7 @@ pub(crate) fn migrate_v69(conn: &Connection) -> Result<()> {
     } else if !ledger_exists {
         conn.execute_batch(
             "CREATE TABLE worktree_instances (
-           instance_id       BLOB PRIMARY KEY CHECK(length(instance_id)=32),
+           instance_id       BLOB NOT NULL PRIMARY KEY CHECK(length(instance_id)=32),
            generation        BLOB NOT NULL CHECK(length(generation)=16),
            repo_id           BLOB NOT NULL CHECK(length(repo_id)=32),
            common_dir        BLOB NOT NULL,
@@ -1023,11 +1023,12 @@ pub(crate) fn verify_v69_schema(conn: &Connection) -> Result<()> {
     if kind.as_deref() != Some("table") {
         bail!("schema v69 migration did not create worktree_instances");
     }
-    let columns: Vec<(String, i64, i64, Option<String>, i64)> = conn
+    let columns: Vec<(String, String, i64, i64, Option<String>, i64)> = conn
         .prepare("PRAGMA table_info(worktree_instances)")?
         .query_map([], |row| {
             Ok((
                 row.get(1)?,
+                row.get(2)?,
                 row.get(3)?,
                 row.get(5)?,
                 row.get(4)?,
@@ -1036,28 +1037,29 @@ pub(crate) fn verify_v69_schema(conn: &Connection) -> Result<()> {
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let expected = [
-        ("instance_id", 1, 1, None, 0),
-        ("generation", 1, 0, Some("16"), 1),
-        ("repo_id", 1, 0, Some("32"), 2),
-        ("common_dir", 1, 0, None, 3),
-        ("admin_id", 1, 0, None, 4),
-        ("branch_ref", 0, 0, None, 5),
-        ("path", 1, 0, None, 6),
-        ("owner", 1, 0, None, 7),
-        ("state", 1, 0, None, 8),
-        ("quarantine_reason", 0, 0, None, 9),
-        ("operation_revision", 1, 0, Some("0"), 10),
-        ("created_at", 1, 0, None, 11),
+        ("instance_id", "BLOB", 1, 1, None, 0),
+        ("generation", "BLOB", 1, 0, None, 1),
+        ("repo_id", "BLOB", 1, 0, None, 2),
+        ("common_dir", "BLOB", 1, 0, None, 3),
+        ("admin_id", "BLOB", 1, 0, None, 4),
+        ("branch_ref", "BLOB", 0, 0, None, 5),
+        ("path", "BLOB", 1, 0, None, 6),
+        ("owner", "BLOB", 1, 0, None, 7),
+        ("state", "TEXT", 1, 0, None, 8),
+        ("quarantine_reason", "TEXT", 0, 0, None, 9),
+        ("operation_revision", "INTEGER", 1, 0, Some("0"), 10),
+        ("created_at", "INTEGER", 1, 0, None, 11),
     ];
     if columns.len() != expected.len()
         || expected
             .iter()
-            .any(|(name, notnull, pk, default, ordinal)| {
+            .any(|(name, kind, notnull, pk, default, ordinal)| {
                 columns.get(*ordinal).is_none_or(|actual| {
                     actual.0 != *name
-                        || actual.1 != *notnull
-                        || actual.2 != *pk
-                        || actual.3.as_deref() != *default
+                        || actual.1.to_ascii_uppercase() != *kind
+                        || actual.2 != *notnull
+                        || actual.3 != *pk
+                        || actual.4.as_deref() != *default
                 })
             })
     {
@@ -1088,14 +1090,51 @@ pub(crate) fn verify_v69_schema(conn: &Connection) -> Result<()> {
         "SELECT sql FROM sqlite_master WHERE type='index' AND name='uq_worktree_instances_verified_repo_admin'",
         [], |row| row.get(0),
     )?;
-    if !path_sql
-        .to_ascii_lowercase()
-        .contains("where state='verified'")
-        || !repo_sql
-            .to_ascii_lowercase()
-            .contains("where state='verified'")
+    let compact_sql = |sql: &str| {
+        sql.chars()
+            .filter(|ch| !ch.is_whitespace())
+            .flat_map(char::to_lowercase)
+            .collect::<String>()
+    };
+    if compact_sql(&path_sql)
+        != "createuniqueindexuq_worktree_instances_verified_pathonworktree_instances(path)wherestate='verified'"
+        || compact_sql(&repo_sql)
+            != "createuniqueindexuq_worktree_instances_verified_repo_adminonworktree_instances(repo_id,admin_id)wherestate='verified'"
     {
         bail!("schema v69 verified uniqueness indices are not partial");
+    }
+    let index_flags: std::collections::HashMap<String, (i64, i64)> = conn
+        .prepare("PRAGMA index_list('worktree_instances')")?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(1)?,
+                (row.get::<_, i64>(2)?, row.get::<_, i64>(4)?),
+            ))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    if index_flags.get("idx_worktree_instances_repo") != Some(&(0, 0))
+        || index_flags.get("idx_worktree_instances_state") != Some(&(0, 0))
+        || index_flags.get("uq_worktree_instances_verified_path") != Some(&(1, 1))
+        || index_flags.get("uq_worktree_instances_verified_repo_admin") != Some(&(1, 1))
+    {
+        bail!("schema v69 worktree identity index flags are incompatible");
+    }
+    let table_sql: String = conn.query_row(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='worktree_instances'",
+        [],
+        |row| row.get(0),
+    )?;
+    let table_sql = compact_sql(&table_sql);
+    for check in [
+        "check(length(instance_id)=32)",
+        "check(length(generation)=16)",
+        "check(length(repo_id)=32)",
+        "check(statein('verified','legacy','quarantined','split'))",
+        "check(operation_revision>=0)",
+    ] {
+        if !table_sql.contains(check) {
+            bail!("schema v69 worktree identity CHECK constraint is missing");
+        }
     }
     let index_columns = |name: &str| -> Result<Vec<String>> {
         Ok(conn
@@ -2372,5 +2411,25 @@ mod tests {
         )
         .unwrap();
         assert!(migrate_v69(&conn).is_err());
+    }
+
+    #[test]
+    fn v69_verifier_checks_types_checks_and_partial_unique_flags() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE worktrees (path TEXT);
+             CREATE TABLE tab_groups (name TEXT);",
+        )
+        .unwrap();
+        migrate_v69(&conn).unwrap();
+        verify_v69_schema(&conn).unwrap();
+
+        conn.execute_batch(
+            "DROP INDEX uq_worktree_instances_verified_path;
+             CREATE UNIQUE INDEX uq_worktree_instances_verified_path
+               ON worktree_instances(path) WHERE state='legacy';",
+        )
+        .unwrap();
+        assert!(verify_v69_schema(&conn).is_err());
     }
 }
