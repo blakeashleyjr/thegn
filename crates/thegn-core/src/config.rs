@@ -5924,7 +5924,7 @@ pub fn env_overlay(env: &dyn EnvSource) -> ConfigOverlay {
 /// Recursively merge `overlay` into `base` (both JSON): objects merge key-wise
 /// (recursing), any other value replaces. The primitive behind config profile
 /// overlays — a key the overlay omits keeps the base value.
-fn deep_merge_json(base: &mut serde_json::Value, overlay: serde_json::Value) {
+pub(crate) fn deep_merge_json(base: &mut serde_json::Value, overlay: serde_json::Value) {
     match (base, overlay) {
         (serde_json::Value::Object(b), serde_json::Value::Object(o)) => {
             for (k, v) in o {
@@ -5933,6 +5933,22 @@ fn deep_merge_json(base: &mut serde_json::Value, overlay: serde_json::Value) {
         }
         (b, o) => *b = o,
     }
+}
+
+/// Apply an already normalized JSON overlay. Trusted admission uses this
+/// after its one compatibility-normalization pass.
+pub(crate) fn apply_json_overlay(
+    cfg: &mut Config,
+    overlay: serde_json::Value,
+) -> Result<(), String> {
+    let mut base = serde_json::to_value(&*cfg).map_err(|e| e.to_string())?;
+    crate::config_duration::introduced(
+        &[],
+        crate::config_duration::errors_for_value::<Config>(&overlay),
+    )?;
+    deep_merge_json(&mut base, overlay);
+    *cfg = serde_json::from_value(base).map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 fn parse_bool(raw: &str, key: &str) -> Option<bool> {
@@ -5946,8 +5962,7 @@ fn parse_bool(raw: &str, key: &str) -> Option<bool> {
     }
 }
 
-fn apply_env_duration_checked(cfg: &mut Config, env: &dyn EnvSource) {
-    let mut overlay = env_overlay(env);
+pub(crate) fn apply_env_overlay_checked(cfg: &mut Config, mut overlay: ConfigOverlay) {
     for error in crate::config_duration::retain_valid_env_durations(&mut overlay) {
         config_warn(&error);
     }
@@ -5956,13 +5971,19 @@ fn apply_env_duration_checked(cfg: &mut Config, env: &dyn EnvSource) {
     overlay.apply(cfg);
 }
 
+fn apply_env_duration_checked(cfg: &mut Config, env: &dyn EnvSource) {
+    apply_env_overlay_checked(cfg, env_overlay(env));
+}
+
 impl Config {
     /// The default config path (overridable with `--config`).
     pub fn path() -> PathBuf {
         util::xdg_config_home().join("thegn/config.toml")
     }
 
-    /// Load with all layers: defaults < file (`path` or the default) < env < flags.
+    /// Legacy tolerant loader retained until host callers migrate to
+    /// [`crate::config_admission::admit`]. Authority-bearing callers must not
+    /// use this fallback path; remove it after that migration.
     pub fn try_load_layered(
         env: &dyn EnvSource,
         cli_overrides: &[String],
@@ -6045,7 +6066,8 @@ impl Config {
         Ok(cfg)
     }
 
-    /// Load with all layers: defaults < file (`path` or the default) < env < flags.
+    /// Legacy tolerant loader retained for existing non-authority callers.
+    /// New admission code deliberately never calls this default-recovery path.
     pub fn load_layered(
         env: &dyn EnvSource,
         cli_overrides: &[String],
@@ -6097,14 +6119,7 @@ impl Config {
         }
         let overlay: serde_json::Value =
             toml::from_str(&normalized.body).map_err(|e| format!("{e}"))?;
-        let mut base = serde_json::to_value(&*cfg).map_err(|e| e.to_string())?;
-        crate::config_duration::introduced(
-            &[],
-            crate::config_duration::errors_for_value::<Config>(&overlay),
-        )?;
-        deep_merge_json(&mut base, overlay);
-        *cfg = serde_json::from_value(base).map_err(|e| format!("{e}"))?;
-        Ok(())
+        apply_json_overlay(cfg, overlay)
     }
 
     /// Coerce a `--set KEY=VALUE` string to the JSON type the field expects.
@@ -6191,6 +6206,9 @@ impl Config {
         Ok(())
     }
 
+    /// Finish the runtime-shaped config after all trusted layers have merged.
+    /// The admission boundary calls this exactly once; it remains crate-visible
+    /// so legacy loaders and later host migration can share the same behavior.
     pub(crate) fn post_process(&mut self) {
         crate::config_drawer::warn_policy_issues(self);
         crate::config_drawer::strip_agent_metadata(&mut self.agents);
