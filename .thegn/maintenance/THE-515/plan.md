@@ -212,3 +212,23 @@ retention; migration preserving every legacy block.
 | Queue/agent records retain repo/config identity                                              | **Open** (slice 3)                                                                                                                    |
 | Migration preserves every legacy block, explicit mapping                                     | **Partial**: no block is deleted or rewritten; refusal preserves source; mapping command is slice 2                                   |
 | Aliases possible but uniqueness-checked, not authority by themselves                         | **Partial**: uniqueness/normalization checked; "not authority by themselves" needs the binding (slice 2)                              |
+
+## 6. Slice 1 validation (commit 78eafc27)
+
+Lane runs on the per-worktree target dir (after the coordinator fixed the lane
+reusing other worktrees' build output; results from the old shared target are discarded):
+
+- `cargo nextest run --workspace --offline --locked --no-fail-fast -E
+'(package(thegn-core) & test(/workspace_overlay|overlay|repo_git|repo_ci|repo_merge_queue|workspace_slug|account::|bundle::|editor::|config_validate/))
+| (package(thegn-host) & test(/review_handoff|workspace_layer|ide_handoff|worktree_lifecycle|cmd::repos|trusted_repo_remote_mode|keymap::/))'`
+  → 290 passed, 0 failed.
+- `cargo clippy --workspace --offline --locked --all-targets -- -D warnings` → clean.
+- `nix develop --command treefmt --ci` → 0 changed; `just ratchets` → exit 0.
+
+Reviewer focus: (a) the fail-closed semantics on `Refused` (queues/autopilot/
+autofix disabled, git falls back to global, land/integrate bail); (b) the pure
+key derivation (`repo_name_from_path`) replacing `git rev-parse
+--show-toplevel` — equivalent for repository roots, differs only for callers
+that pass a subdirectory or a symlinked root whose link name differs from the
+target's; (c) the accounts/bundle/editor/keybind consumers still key by the DB
+tab slug (a known hybrid that remains until slice 2, see §4).
