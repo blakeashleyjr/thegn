@@ -65,8 +65,6 @@ pub(crate) enum ExpectedMedia {
 pub(crate) struct CalendarHttpClient {
     client: Client,
     url: Url,
-    #[cfg(test)]
-    connect_gate: Option<(std::sync::Arc<tokio::sync::Notify>, Duration)>,
 }
 
 impl CalendarHttpClient {
@@ -93,12 +91,7 @@ impl CalendarHttpClient {
             _ => {}
         }
         let client = process_client(allow_private_network)?;
-        Ok(Self {
-            client,
-            url,
-            #[cfg(test)]
-            connect_gate: None,
-        })
+        Ok(Self { client, url })
     }
 
     pub(crate) fn request(&self, method: reqwest::Method) -> RequestBuilder {
@@ -115,15 +108,6 @@ impl CalendarHttpClient {
         request: RequestBuilder,
         deadline: Instant,
     ) -> Result<Response, CalendarHttpError> {
-        #[cfg(test)]
-        if let Some((gate, timeout)) = &self.connect_gate {
-            // This is a test-only connector-establishment seam.  It keeps the
-            // connect phase deterministic and proves that a stalled connector
-            // is bounded before request headers/response deadlines are used.
-            timeout_at(deadline.min(Instant::now() + *timeout), gate.notified())
-                .await
-                .map_err(|_| CalendarHttpError::Timeout)?;
-        }
         timeout_at(deadline, request.send())
             .await
             .map_err(|_| CalendarHttpError::Timeout)?
@@ -136,16 +120,6 @@ impl CalendarHttpClient {
                     CalendarHttpError::Network
                 }
             })
-    }
-
-    #[cfg(test)]
-    fn with_connect_gate_for_test(
-        mut self,
-        gate: std::sync::Arc<tokio::sync::Notify>,
-        timeout: Duration,
-    ) -> Self {
-        self.connect_gate = Some((gate, timeout));
-        self
     }
 }
 
@@ -171,12 +145,14 @@ fn build_client(allow_private_network: bool) -> Result<Client, CalendarHttpError
     })
 }
 
-fn build_client_with_resolver(resolver: CalendarResolver) -> Result<Client, CalendarHttpError> {
+fn build_client_with_resolver(
+    resolver: impl reqwest::dns::Resolve + 'static,
+) -> Result<Client, CalendarHttpError> {
     build_client_with_resolver_and_read_timeout(resolver, READ_IDLE_TIMEOUT)
 }
 
 fn build_client_with_resolver_and_read_timeout(
-    resolver: CalendarResolver,
+    resolver: impl reqwest::dns::Resolve + 'static,
     read_timeout: Duration,
 ) -> Result<Client, CalendarHttpError> {
     Client::builder()
@@ -231,17 +207,17 @@ impl reqwest::dns::Resolve for CalendarResolver {
                 let resolved = tokio::net::lookup_host((host.as_str(), 0))
                     .await
                     .map_err(|_| resolver_network_error())?;
-                collect_resolved_addresses(resolved).map_err(|_| resolver_network_error())?
+                collect_resolved_addresses(resolved).map_err(|_| resolver_policy_error())?
             };
             #[cfg(not(test))]
             let addresses = {
                 let resolved = tokio::net::lookup_host((host.as_str(), 0))
                     .await
                     .map_err(|_| resolver_network_error())?;
-                collect_resolved_addresses(resolved).map_err(|_| resolver_network_error())?
+                collect_resolved_addresses(resolved).map_err(|_| resolver_policy_error())?
             };
             if !addresses_allowed(&addresses, allow_private_network) {
-                return Err(Box::new(DestinationPolicyError));
+                return Err(resolver_policy_error());
             }
             Ok(Box::new(addresses.into_iter()) as reqwest::dns::Addrs)
         })
@@ -276,11 +252,12 @@ impl std::fmt::Display for DestinationPolicyError {
 
 impl std::error::Error for DestinationPolicyError {}
 
+fn resolver_policy_error() -> Box<dyn std::error::Error + Send + Sync> {
+    Box::new(DestinationPolicyError)
+}
+
 fn resolver_network_error() -> Box<dyn std::error::Error + Send + Sync> {
-    Box::new(std::io::Error::new(
-        std::io::ErrorKind::Other,
-        "calendar DNS resolution failed",
-    ))
+    Box::new(std::io::Error::other("calendar DNS resolution failed"))
 }
 
 fn has_destination_policy_source(error: &reqwest::Error) -> bool {
@@ -862,7 +839,6 @@ mod tests {
                 })
                 .unwrap(),
                 url: Url::parse(&format!("http://calendar.test:{}/feed", address.port())).unwrap(),
-                connect_gate: None,
             }
         };
         let answers = Arc::new(Mutex::new(vec![vec![address]]));
@@ -990,7 +966,6 @@ mod tests {
             )
             .unwrap(),
             url: Url::parse(&format!("http://{address}/idle")).unwrap(),
-            connect_gate: None,
         };
         let idle_response = idle
             .send(
@@ -1018,7 +993,6 @@ mod tests {
             )
             .unwrap(),
             url: Url::parse(&format!("http://{address}/body")).unwrap(),
-            connect_gate: None,
         };
         let response = body
             .send(
@@ -1050,27 +1024,36 @@ mod tests {
 
     #[tokio::test]
     async fn connector_establishment_timeout_is_distinct_and_deterministic() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let gate = std::sync::Arc::new(tokio::sync::Notify::new());
-        let client = CalendarHttpClient::new(&format!("http://{address}/connect"), true)
-            .unwrap()
-            .with_connect_gate_for_test(std::sync::Arc::clone(&gate), Duration::from_millis(20));
-
-        // The connector gate never opens.  This exercises the connect phase
-        // without relying on an unroutable address or a public network.
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        struct PendingResolver(Arc<AtomicBool>);
+        impl reqwest::dns::Resolve for PendingResolver {
+            fn resolve(&self, _name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+                self.0.store(true, Ordering::SeqCst);
+                Box::pin(std::future::pending())
+            }
+        }
+        let entered = Arc::new(AtomicBool::new(false));
+        let client = CalendarHttpClient {
+            client: build_client_with_resolver(PendingResolver(Arc::clone(&entered))).unwrap(),
+            url: Url::parse("http://calendar.test/connect").unwrap(),
+        };
+        let start = Instant::now();
         assert!(matches!(
             client
                 .send(
                     client.request(reqwest::Method::GET),
-                    Instant::now() + Duration::from_secs(1),
+                    start + CONNECT_TIMEOUT * 3
                 )
                 .await,
             Err(CalendarHttpError::Timeout)
         ));
-        // The request must not reach the fixture while connector setup is
-        // pending; the listener remains owned by this test.
-        drop(listener);
+        assert!(entered.load(Ordering::SeqCst));
+        // Exercise reqwest's actual production connect deadline. Removing it
+        // reaches the much later total deadline and fails this assertion.
+        assert!(start.elapsed() < CONNECT_TIMEOUT * 2);
     }
 
     #[tokio::test]
@@ -1087,9 +1070,11 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let requests = std::sync::Arc::new(AtomicUsize::new(0));
         let first_wave = std::sync::Arc::new(Barrier::new(4));
+        let second_wave = std::sync::Arc::new(Barrier::new(3));
         let server = tokio::spawn({
             let requests = std::sync::Arc::clone(&requests);
             let first_wave = std::sync::Arc::clone(&first_wave);
+            let second_wave = std::sync::Arc::clone(&second_wave);
             async move {
                 axum::serve(
                     listener,
@@ -1097,9 +1082,12 @@ mod tests {
                         move |_request: axum::extract::Request| {
                             let number = requests.fetch_add(1, Ordering::SeqCst) + 1;
                             let first_wave = std::sync::Arc::clone(&first_wave);
+                            let second_wave = std::sync::Arc::clone(&second_wave);
                             async move {
                                 if number <= 4 {
                                     first_wave.wait().await;
+                                } else if number <= 7 {
+                                    second_wave.wait().await;
                                 }
                                 "ok".into_response()
                             }
@@ -1119,7 +1107,6 @@ mod tests {
             })
             .unwrap(),
             url: Url::parse(&format!("http://{address}/feed")).unwrap(),
-            connect_gate: None,
         };
         let mut wave = Vec::new();
         for _ in 0..4 {
@@ -1142,19 +1129,27 @@ mod tests {
         }
         assert_eq!(accepts.load(Ordering::SeqCst), 4);
 
-        // Four simultaneous responses create four idle connections, but only
-        // the explicit two-connection per-host bound may remain reusable.
+        // A second simultaneous wave needs three sockets. Exactly two can
+        // come from the idle pool, so one new accept is required. Sequential
+        // requests would merely reuse one connection and prove no idle cap.
+        let mut wave = Vec::new();
         for _ in 0..3 {
-            let response = client
-                .send(
-                    client.request(reqwest::Method::GET),
-                    Instant::now() + Duration::from_secs(2),
-                )
-                .await
-                .unwrap();
-            read_body(response, Instant::now() + Duration::from_secs(2))
-                .await
-                .unwrap();
+            let client = client.clone();
+            wave.push(tokio::spawn(async move {
+                let response = client
+                    .send(
+                        client.request(reqwest::Method::GET),
+                        Instant::now() + Duration::from_secs(2),
+                    )
+                    .await
+                    .unwrap();
+                read_body(response, Instant::now() + Duration::from_secs(2))
+                    .await
+                    .unwrap();
+            }));
+        }
+        for task in wave {
+            task.await.unwrap();
         }
         assert_eq!(accepts.load(Ordering::SeqCst), 5);
         server.abort();

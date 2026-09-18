@@ -560,16 +560,6 @@ async fn oversized_chunked_and_encoded_calendar_bodies_are_rejected_before_parse
                         *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
                         return response;
                     }
-                    if request.uri().path() == "/declared" {
-                        let mut response = (StatusCode::OK, Body::empty()).into_response();
-                        response
-                            .headers_mut()
-                            .insert("content-type", HeaderValue::from_static("text/calendar"));
-                        response
-                            .headers_mut()
-                            .insert("content-length", HeaderValue::from_static("33554433"));
-                        return response;
-                    }
                     if request.uri().path() == "/exact" {
                         let mut response = Body::from(exact_body).into_response();
                         response
@@ -593,7 +583,7 @@ async fn oversized_chunked_and_encoded_calendar_bodies_are_rejected_before_parse
         .unwrap();
     });
 
-    for path in ["/chunked", "/exact", "/declared", "/error", "/encoded"] {
+    for path in ["/chunked", "/exact", "/error", "/encoded"] {
         let backend = ics_url::IcsUrlBackend::new(&CalendarAccount {
             url: format!("http://{address}{path}"),
             allow_private_network: true,
@@ -617,6 +607,60 @@ async fn oversized_chunked_and_encoded_calendar_bodies_are_rejected_before_parse
     }
     server.abort();
     let _ = server.await;
+}
+
+#[tokio::test]
+async fn declared_oversized_calendar_body_is_refused_without_reading_payload() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    for provider in [CalendarProviderKind::IcsUrl, CalendarProviderKind::CalDav] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            socket.read(&mut request).await.unwrap();
+            let (status, media) = if provider == CalendarProviderKind::CalDav {
+                ("207 Multi-Status", "application/xml")
+            } else {
+                ("200 OK", "text/calendar")
+            };
+            let headers = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: {media}\r\nContent-Length: {}\r\n\r\n",
+                crate::http::MAX_BODY_BYTES + 1
+            );
+            socket.write_all(headers.as_bytes()).await.unwrap();
+            // Never send the declared payload. Admission must reject headers
+            // immediately instead of waiting for body/idle/operation timeout.
+            std::future::pending::<()>().await;
+        });
+        let cfg = CalendarAccount {
+            url: format!("http://{address}/declared"),
+            allow_private_network: true,
+            ..account("declared", provider)
+        };
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            match provider {
+                CalendarProviderKind::IcsUrl => {
+                    ics_url::IcsUrlBackend::new(&cfg)
+                        .list_events(window().0, window().1, "")
+                        .await
+                }
+                _ => {
+                    caldav::CalDavBackend::new(&cfg)
+                        .list_events(window().0, window().1, "")
+                        .await
+                }
+            }
+        })
+        .await
+        .expect("oversized headers must refuse without reading the body");
+        assert!(
+            matches!(result, Err(CalendarError::BodyLimit(_))),
+            "{result:?}"
+        );
+        server.abort();
+        let _ = server.await;
+    }
 }
 
 #[tokio::test]
