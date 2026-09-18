@@ -1220,10 +1220,13 @@ command = "claude"
 #                       #   Values expand `env:VAR` / `file:PATH`; never store a
 #                       #   raw secret here.
 # permissions = ["Read", "Edit", "Bash"]
-#                       # headless tool allow-list seeded into the worktree at
-#                       #   launch (claude: .claude/settings.local.json →
-#                       #   permissions.allow; other keys in that file survive).
-#                       #   Empty = leave the file alone.
+#                       # tool allow-list granted to THIS launch only, on the
+#                       #   command line (claude: `--settings` carrying
+#                       #   permissions.allow, merged with your settings files;
+#                       #   deny rules/hooks keep applying). Nothing is written
+#                       #   into the worktree. A harness with no command-scoped
+#                       #   grant (codex, pi, aider) refuses the launch rather
+#                       #   than dropping the list. Empty = no grant.
 # Add this agent to the drawer at worktree or process-global scope; unset by default.
 # drawer_scope = "worktree"
 # Start its drawer pane relative to the scope root (or absolute/~); unset uses the root.
@@ -1372,7 +1375,7 @@ command = "lazygit"
 # harness = ""          # launch harness id (claude | codex | pi | aider); precedes provider
 # model = ""            # appended via the harness's model flag (see [[agents]])
 # env = {}              # per-entry env overlay, applied last (env:/file: expand)
-# permissions = []      # headless allow-list seeded into the worktree at launch
+# permissions = []      # command-scoped allow-list (see [[agents]]; never written to the worktree)
 # route_via_proxy = false  # route this tool's model traffic through [model_proxy]
 #                       #   (see the [[agents]] note above); off by default
 # drawer_scope = "worktree"  # add this tool to the drawer: worktree | global
@@ -1665,10 +1668,13 @@ command = "git diff"
 #                "park" (default; set the row waiting_human and move on),
 #                "escalate" (raise it to the operator), "abandon" (drop it).
 #   permissions  per-stage headless tool allow-list — replaces the agent
-#                entry's `permissions` when non-empty. At launch thegn writes
-#                the effective list into the harness's per-worktree settings
-#                file; thegn does not interpret them — they are the harness's
-#                own vocabulary. Empty = the entry's list, if any.
+#                entry's `permissions` when non-empty. The effective list
+#                rides the launch command (claude: `--settings`), never a
+#                file in the worktree; a harness that cannot take it (the
+#                stage's own, or one swapped in via `harness`) holds the
+#                dispatch before a roster row exists. thegn does not
+#                interpret them — they are the harness's own vocabulary.
+#                Empty = the entry's list, if any.
 #
 # The handoff between stages is a FILE COMMITTED ON THE BRANCH (git is the
 # source of truth) — the roster only stores a pointer to it, conventionally
@@ -1715,6 +1721,8 @@ command = "git diff"
 # model = "model-proxy/fast"     # this stage's tier (entry `model` is the default)
 # env = { CLAUDE_CONFIG_DIR = "file:~/.thegn/accounts/bulk" }  # key-by-key overlay
 # permissions = ["Read", "Edit", "Bash", "Grep", "Glob"]        # replaces the entry's
+#                                # (claude only: on this pi stage a non-empty
+#                                #  list — its own or inherited — is refused)
 #
 # [[pipeline.stages]]
 # name = "review"
