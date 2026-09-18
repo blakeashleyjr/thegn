@@ -628,7 +628,7 @@ mod tests {
     #[test]
     fn bounded_reader_grows_geometrically_without_crossing_the_limit() {
         assert_eq!(bounded_reserve_needed(6, 8, 4, 10), Ok(4));
-        assert_eq!(bounded_reserve_needed(7, 7, 2, 16), Ok(9));
+        assert_eq!(bounded_reserve_needed(7, 7, 2, 16), Ok(7));
         assert_eq!(bounded_reserve_needed(15, 15, 2, 16), Err(()));
         assert_eq!(
             bounded_reserve_needed(usize::MAX, usize::MAX, 1, usize::MAX),

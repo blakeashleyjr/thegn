@@ -467,11 +467,19 @@ async fn caldav_token_recovery_is_one_bounded_retry_with_shared_deadline() {
                     let observed = Arc::clone(&observed);
                     async move {
                         let count = observed.fetch_add(1, Ordering::SeqCst);
+                        // Each response fits the operation budget separately;
+                        // together they exceed it. Resetting the deadline on
+                        // recovery would therefore make this fetch succeed.
+                        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
                         if count == 0 {
                             return (recovery_status, Body::empty()).into_response();
                         }
-                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                        (StatusCode::MULTI_STATUS, Body::empty()).into_response()
+                        (
+                            StatusCode::MULTI_STATUS,
+                            [("content-type", "application/xml")],
+                            "<multistatus><sync-token>new-token</sync-token></multistatus>",
+                        )
+                            .into_response()
                     }
                 })),
             )
@@ -483,7 +491,7 @@ async fn caldav_token_recovery_is_one_bounded_retry_with_shared_deadline() {
             allow_private_network: true,
             ..account("dav", CalendarProviderKind::CalDav)
         })
-        .with_timeout_for_test(std::time::Duration::from_millis(30));
+        .with_timeout_for_test(std::time::Duration::from_millis(250));
         let error = backend
             .list_events(window().0, window().1, "expired-token")
             .await
