@@ -1046,6 +1046,7 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         Err(reason) => {
             tracing::error!(target: "thegn::procs", reason, "process sampling unavailable");
             model.status = reason.into();
+            model.fail_processes(reason);
             None
         }
     };
@@ -6046,6 +6047,46 @@ fn discard_pending_folder(pending: &mut PendingFolder, generation: u64) {
     pending.remove(&generation);
 }
 
+/// Keep a terminal process-sampler failure visible across monitor lifecycle
+/// changes. A paused monitor owns a frozen process body, so defer applying the
+/// failure until resume; an active Processes view can replace its old rows
+/// immediately. With no failure, resume/entry waits for a fresh publication.
+fn sync_process_failure_visibility(
+    model: &mut FrameModel,
+    failure: Option<&'static str>,
+    paused: bool,
+) {
+    if paused {
+        return;
+    }
+    if let Some(reason) = failure {
+        model.fail_processes(reason);
+    } else {
+        model.invalidate_processes();
+    }
+}
+
+/// Apply the production monitor transition that changes whether process rows
+/// are visible. Keeping this branch in one helper lets lifecycle tests drive
+/// the same close/tab/resume behavior as the event loop.
+fn reconcile_process_view_transition(
+    model: &mut FrameModel,
+    failure: Option<&'static str>,
+    was_process_tab: bool,
+    still_process_tab: bool,
+    closed: bool,
+    was_paused: bool,
+    is_paused: bool,
+) {
+    if (was_process_tab && !still_process_tab) || closed {
+        model.invalidate_processes();
+    } else if !was_process_tab && still_process_tab {
+        sync_process_failure_visibility(model, failure, is_paused);
+    } else if was_paused && !is_paused {
+        sync_process_failure_visibility(model, failure, false);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn event_loop<T: Terminal>(
     resident_supervisor: thegn_svc::plugin::ResidentSupervisor,
@@ -6090,7 +6131,16 @@ async fn event_loop<T: Terminal>(
     host_cache_port: Option<u16>,
 ) -> Result<()> {
     crate::worktree_lifecycle::install_refresh(refresh_tx.clone());
+    // The worker may have failed before the loop started (including a startup
+    // spawn failure, where there is no Control to query). Keep that terminal
+    // reason outside the hydrated model so close/reopen cannot erase it.
+    let mut process_failure = match model.process_state {
+        crate::model_eq::ProcessViewState::Failed(reason) => Some(reason),
+        _ => None,
+    };
     let mut process_failure_reported = false;
+    // A paused monitor owns a frozen process body. Apply a sampler failure
+    // only when it resumes, so a key-driven rebuild cannot thaw the picture.
     let mut recorder: Option<Recorder> = None;
     let mut scratch = Surface::new(cols, rows);
     // What the terminal currently shows; the render path diffs scratch
@@ -10544,10 +10594,30 @@ async fn event_loop<T: Terminal>(
                 && let crate::proc_worker::Phase::Failed(reason) = control.status().phase
             {
                 process_failure_reported = true;
+                process_failure = Some(reason);
                 tracing::error!(target: "thegn::procs", reason, "process sampling stopped");
                 model.status = reason.into();
+                if !monitor.as_ref().is_some_and(|m| m.is_paused()) {
+                    model.fail_processes(reason);
+                    // The process body may otherwise take the unchanged-row
+                    // fast path and leave the last successful sample visible.
+                    status_data_moved = true;
+                }
                 dirty = true;
             }
+        }
+        // Hydration can clear process state while a Processes overlay remains
+        // open (for example when config disables then re-enables sampling).
+        // Reapply the loop-owned terminal reason independently of the worker's
+        // one-shot failure report; a stopped worker will never publish a wake.
+        if processes_live
+            && !monitor.as_ref().is_some_and(|m| m.is_paused())
+            && let Some(reason) = process_failure
+            && model.process_state != crate::model_eq::ProcessViewState::Failed(reason)
+        {
+            sync_process_failure_visibility(&mut model, Some(reason), false);
+            status_data_moved = true;
+            dirty = true;
         }
 
         // Cached daemon/status from the ticker (far-right chip + its modal). A
@@ -14354,6 +14424,13 @@ async fn event_loop<T: Terminal>(
                             });
                             if let Some(tab) = expand {
                                 bar_detail = None;
+                                if tab == crate::monitor::MonitorTab::Procs {
+                                    sync_process_failure_visibility(
+                                        &mut model,
+                                        process_failure,
+                                        false,
+                                    );
+                                }
                                 monitor = Some(crate::monitor::MonitorOverlay::open(
                                     tab,
                                     monitor_prefs.clone(),
@@ -15183,9 +15260,20 @@ async fn event_loop<T: Terminal>(
                 if monitor.is_some() {
                     // Scope the `&mut monitor` borrow so the pending row action
                     // can be handled afterwards (dispatch may close the monitor).
-                    let (outcome, action) = {
+                    let (
+                        outcome,
+                        action,
+                        was_process_tab,
+                        still_process_tab,
+                        was_paused,
+                        is_paused,
+                    ) = {
                         let m = monitor.as_mut().expect("is_some");
+                        let was_process_tab = m.tab() == crate::monitor::MonitorTab::Procs;
+                        let was_paused = m.is_paused();
                         let outcome = m.handle_key(&k.key, k.modifiers);
+                        let still_process_tab = m.tab() == crate::monitor::MonitorTab::Procs;
+                        let is_paused = m.is_paused();
                         if outcome == crate::monitor::MonitorOutcome::PrefsChanged {
                             monitor_prefs = m.prefs().clone();
                             // Best-effort, off the loop: a preference is a
@@ -15197,8 +15285,25 @@ async fn event_loop<T: Terminal>(
                         // `Action`, but a confirmed Disk clean is raised behind a
                         // `Pending` outcome, so gating the drain on the outcome
                         // would silently swallow it.
-                        (outcome, m.take_action())
+                        (
+                            outcome,
+                            m.take_action(),
+                            was_process_tab,
+                            still_process_tab,
+                            was_paused,
+                            is_paused,
+                        )
                     };
+                    // Revoke the worker generation at the input boundary.
+                    // Waiting for the next stats drain would leave a sample
+                    // collected before pause/tab-away eligible for admission.
+                    if ((!was_paused && is_paused)
+                        || (was_process_tab && !still_process_tab)
+                        || outcome == crate::monitor::MonitorOutcome::Close)
+                        && let Some(control) = &process_control
+                    {
+                        control.set_enabled(false);
+                    }
                     match action {
                         // A Containers-tab row action: dispatch off-loop
                         // (lifecycle subprocess) or open a pane (shell-in/logs).
@@ -15219,6 +15324,18 @@ async fn event_loop<T: Terminal>(
                             if d.opened_pane {
                                 // A pane opened under the modal — close the monitor
                                 // so the shell/logs pane is usable, and relayout.
+                                if let Some(control) = &process_control {
+                                    control.set_enabled(false);
+                                }
+                                reconcile_process_view_transition(
+                                    &mut model,
+                                    process_failure,
+                                    was_process_tab,
+                                    false,
+                                    true,
+                                    was_paused,
+                                    false,
+                                );
                                 monitor = None;
                                 focus.zone = crate::focus::Zone::Center;
                                 refresh_tab_model(&mut model, &session, &mut sb);
@@ -15248,6 +15365,15 @@ async fn event_loop<T: Terminal>(
                         None => {}
                     }
                     let passthrough = outcome == crate::monitor::MonitorOutcome::Passthrough;
+                    reconcile_process_view_transition(
+                        &mut model,
+                        process_failure,
+                        was_process_tab,
+                        still_process_tab,
+                        outcome == crate::monitor::MonitorOutcome::Close,
+                        was_paused,
+                        is_paused,
+                    );
                     if outcome == crate::monitor::MonitorOutcome::Close {
                         monitor = None;
                     } else if outcome == crate::monitor::MonitorOutcome::Help {
@@ -15299,6 +15425,9 @@ async fn event_loop<T: Terminal>(
                             crate::detail::DetailAction::OpenMonitor { tab },
                         ) => {
                             bar_detail = None;
+                            if tab == crate::monitor::MonitorTab::Procs {
+                                sync_process_failure_visibility(&mut model, process_failure, false);
+                            }
                             monitor = Some(crate::monitor::MonitorOverlay::open(
                                 tab,
                                 monitor_prefs.clone(),
@@ -21093,18 +21222,45 @@ async fn event_loop<T: Terminal>(
                                 // Toggle: the same chord that opened it shuts
                                 // it, matching every other chrome toggle.
                                 monitor = match monitor.take() {
-                                    Some(_) => None,
-                                    None => Some(crate::monitor::MonitorOverlay::open(
-                                        monitor_prefs.last_tab,
-                                        monitor_prefs.clone(),
-                                        &model,
-                                        &crate::detail::StatusCtx::new(
-                                            &panel_ui.docs,
-                                            start.elapsed().as_secs(),
-                                            Rect::full(cols, rows),
-                                            &current_config.daemon,
-                                        ),
-                                    )),
+                                    Some(opened) => {
+                                        if let Some(control) = &process_control {
+                                            control.set_enabled(false);
+                                        }
+                                        reconcile_process_view_transition(
+                                            &mut model,
+                                            process_failure,
+                                            opened.tab() == crate::monitor::MonitorTab::Procs,
+                                            false,
+                                            true,
+                                            opened.is_paused(),
+                                            false,
+                                        );
+                                        None
+                                    }
+                                    None => {
+                                        if monitor_prefs.last_tab
+                                            == crate::monitor::MonitorTab::Procs
+                                        {
+                                            // Apply before `open`: its constructor builds the
+                                            // initial body synchronously.
+                                            sync_process_failure_visibility(
+                                                &mut model,
+                                                process_failure,
+                                                false,
+                                            );
+                                        }
+                                        Some(crate::monitor::MonitorOverlay::open(
+                                            monitor_prefs.last_tab,
+                                            monitor_prefs.clone(),
+                                            &model,
+                                            &crate::detail::StatusCtx::new(
+                                                &panel_ui.docs,
+                                                start.elapsed().as_secs(),
+                                                Rect::full(cols, rows),
+                                                &current_config.daemon,
+                                            ),
+                                        ))
+                                    }
                                 };
                             }
                             Action::OpenPipelineBoard => {
