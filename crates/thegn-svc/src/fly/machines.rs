@@ -73,29 +73,18 @@ pub fn stop_body() -> serde_json::Value {
     serde_json::json!({ "signal": "SIGTERM", "timeout": "30s" })
 }
 
-/// A `template` of `image:<ref>` or a bare registry ref selects the image; unlike
-/// a VPS there is no snapshot concept (Fly speed comes from small images).
-pub fn image_ref(template: &str) -> Option<&str> {
-    let t = template.trim();
-    if t.is_empty() || t.starts_with("snapshot:") {
-        None
-    } else {
-        Some(t.strip_prefix("image:").map(str::trim).unwrap_or(t))
-    }
-}
-
 /// Map a Fly size preset (`shared-cpu-2x`, `performance-1x`, …) to a guest
-/// `{cpu_kind, cpus, memory_mb}`. Unknown presets fall back to shared-cpu-1x so a
-/// typo degrades to the cheapest machine, never a create failure.
+/// `{cpu_kind, cpus, memory_mb}`. An unknown preset is a typed admission error,
+/// never a silently substituted machine size.
 pub fn guest_for_size(
     size: &str,
 ) -> Result<serde_json::Value, thegn_core::provider_admission::ProviderAdmissionError> {
-    let guest = thegn_core::provider_admission::FlySize::parse(size)?.guest();
-    Ok(serde_json::json!({
-        "cpu_kind": guest.0,
-        "cpus": guest.1,
-        "memory_mb": guest.2
-    }))
+    thegn_core::provider_admission::FlySize::parse(size).map(guest)
+}
+
+fn guest(size: thegn_core::provider_admission::FlySize) -> serde_json::Value {
+    let (cpu_kind, cpus, memory_mb) = size.guest();
+    serde_json::json!({ "cpu_kind": cpu_kind, "cpus": cpus, "memory_mb": memory_mb })
 }
 
 /// The internal + external ssh port (per-sandbox app ⇒ a dedicated IPv4, so the
@@ -137,12 +126,12 @@ pub fn create_machine_body(
     name: &str,
     region: &str,
     image: &str,
-    size: &str,
+    size: thegn_core::provider_admission::FlySize,
     authorized_key: &str,
     metadata: &BTreeMap<String, String>,
     prebaked: bool,
     iroh: Option<&super::IrohInject>,
-) -> Result<serde_json::Value, thegn_core::provider_admission::ProviderAdmissionError> {
+) -> serde_json::Value {
     let meta: serde_json::Map<String, serde_json::Value> = metadata
         .iter()
         .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
@@ -150,7 +139,7 @@ pub fn create_machine_body(
     let authkeys_b64 = super::b64(authorized_key.trim().as_bytes());
     let mut config = serde_json::json!({
         "image": image,
-        "guest": guest_for_size(size)?,
+        "guest": guest(size),
         "metadata": meta,
         "auto_destroy": false,
         // Don't let Fly auto-restart a machine thegn parked (scale-to-zero).
@@ -182,7 +171,7 @@ pub fn create_machine_body(
             thegn_core::iroh_wire::SANDBOX_ID_ENV: inject.sandbox_id,
         });
     }
-    Ok(serde_json::json!({ "name": name, "region": region, "config": config }))
+    serde_json::json!({ "name": name, "region": region, "config": config })
 }
 
 /// One Machine as parsed from the API.
@@ -379,16 +368,6 @@ mod tests {
     }
 
     #[test]
-    fn image_ref_strips_prefix() {
-        assert_eq!(image_ref("image:ubuntu:24.04"), Some("ubuntu:24.04"));
-        assert_eq!(
-            image_ref("registry.fly.io/x:deployment-1"),
-            Some("registry.fly.io/x:deployment-1")
-        );
-        assert_eq!(image_ref("  "), None);
-    }
-
-    #[test]
     fn guest_maps_known_presets_and_rejects_unknown() {
         assert_eq!(guest_for_size("shared-cpu-2x").unwrap()["memory_mb"], 512);
         assert_eq!(
@@ -407,13 +386,12 @@ mod tests {
             "tg-fly-1",
             "iad",
             "ubuntu:24.04",
-            "shared-cpu-2x",
+            thegn_core::provider_admission::FlySize::SharedCpu2x,
             "ssh-ed25519 AAAAKEY thegn",
             &meta,
             false,
             None,
-        )
-        .unwrap();
+        );
         assert_eq!(b["name"], "tg-fly-1");
         assert_eq!(b["config"]["image"], "ubuntu:24.04");
         assert_eq!(b["config"]["guest"]["memory_mb"], 512);
@@ -453,13 +431,12 @@ mod tests {
             "tg-fly-1",
             "iad",
             "registry.fly.io/x:tg",
-            "shared-cpu-2x",
+            thegn_core::provider_admission::FlySize::SharedCpu2x,
             "ssh-ed25519 AAAAKEY thegn",
             &meta,
             true,
             None,
-        )
-        .unwrap();
+        );
         // Key still injected + ssh service exposed, but the image's OWN entrypoint
         // runs sshd — no init override that would replace it.
         assert_eq!(
@@ -490,13 +467,12 @@ mod tests {
             "tg-fly-1",
             "iad",
             "registry.fly.io/x:tg",
-            "shared-cpu-2x",
+            thegn_core::provider_admission::FlySize::SharedCpu2x,
             "ssh-ed25519 AAAAKEY thegn",
             &meta,
             true,
             Some(&inject),
-        )
-        .unwrap();
+        );
         // The three call-home env vars are keyed by the iroh_wire constants (never
         // hardcoded) and carry the injected per-sandbox values.
         assert_eq!(
