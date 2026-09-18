@@ -802,7 +802,7 @@ mod tests {
             .unwrap();
         assert!(response.status().is_success());
         server.abort();
-        let _ = server.await;
+        assert!(server.await.unwrap_err().is_cancelled());
     }
 
     #[tokio::test]
@@ -910,7 +910,7 @@ mod tests {
         ));
         assert_eq!(resolutions.load(std::sync::atomic::Ordering::SeqCst), 4);
         server.abort();
-        let _ = server.await;
+        assert!(server.await.unwrap_err().is_cancelled());
     }
 
     #[tokio::test]
@@ -1027,7 +1027,7 @@ mod tests {
             Err(CalendarHttpError::Timeout)
         ));
         server.abort();
-        let _ = server.await;
+        assert!(server.await.unwrap_err().is_cancelled());
     }
 
     #[tokio::test]
@@ -1161,7 +1161,7 @@ mod tests {
         }
         assert_eq!(accepts.load(Ordering::SeqCst), 5);
         server.abort();
-        let _ = server.await;
+        assert!(server.await.unwrap_err().is_cancelled());
     }
 
     #[test]
