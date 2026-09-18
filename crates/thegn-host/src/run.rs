@@ -8636,15 +8636,19 @@ async fn event_loop<T: Terminal>(
                         .map(|spec| missing.into_iter().map(|id| (id, spec.clone())).collect())
                         .map_err(spec_err)
                     };
+                    // Refuse an initial host spec at the prewarm boundary
+                    // before any remembered-agent replacement can run.
+                    crate::agent::reject_host_prewarm(&mut specs);
                     // Attach-on-open (THE-85): the same probe the materialize
                     // worker makes — list this worktree's live daemon agent
                     // sessions (connect-only; any failure → empty) so a
                     // prewarmed tab opens onto its running agent too. Skipped
                     // for terminal groups; `shown` is re-deduped on the drain.
-                    let attach = if specs.is_ok()
-                        && !is_terminal
-                        && crate::handlers::startup::daemon_active(&cfg)
-                    {
+                    // Automatic prewarm is allowed to reattach an already-live
+                    // daemon session even when its fresh sibling spec was
+                    // refused as host execution. Attachment is not a new host
+                    // process and must not be coupled to spec resolution.
+                    let attach = if !is_terminal && crate::handlers::startup::daemon_active(&cfg) {
                         rt.block_on(crate::handlers::worktree_attach::probe(
                             &cfg.daemon,
                             &wt,
@@ -8670,6 +8674,11 @@ async fn event_loop<T: Terminal>(
                             false,
                         );
                     }
+                    // Apply this after remembered-agent replacement as well as
+                    // to the initial shell spec: a remembered agent must not
+                    // reintroduce a bare host login shell into automatic
+                    // sibling/tab prewarm.
+                    crate::agent::reject_host_prewarm(&mut specs);
                     if tx
                         .send(SpecBatch {
                             group: name,

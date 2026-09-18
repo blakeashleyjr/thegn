@@ -263,6 +263,70 @@ pub(crate) fn session_for(worktree: &str) -> Option<DevcontainerSession> {
     Some(session)
 }
 
+#[cfg(test)]
+pub(crate) fn install_failing_test_session(
+    worktree: &str,
+    config_path: &Path,
+) -> anyhow::Result<()> {
+    struct FailingExecProvider;
+
+    impl DevcontainerProvider for FailingExecProvider {
+        fn probe(&self) -> ProbeReport {
+            ProbeReport::unavailable("test provider")
+        }
+
+        fn prepare_start(
+            &self,
+            _workspace_folder: &Path,
+            _config_path: &Path,
+            _config_digest: &[u8; 32],
+            _config_content: &[u8],
+            _env: &[(String, String)],
+        ) -> anyhow::Result<PreparedStartup> {
+            anyhow::bail!("test provider cannot start")
+        }
+
+        fn exec_argv(
+            &self,
+            _handle: &DevcontainerHandle,
+            _command: &str,
+        ) -> anyhow::Result<Vec<String>> {
+            anyhow::bail!("fake devcontainer exec failure")
+        }
+    }
+
+    let content = std::fs::read(config_path)?;
+    let digest = config_digest_bytes(&content);
+    let snapshot = snapshot_config(config_path, &digest, &content)?;
+    let handle = DevcontainerHandle {
+        executable: "fake-devcontainer".into(),
+        workspace_folder: worktree.into(),
+        config_path: config_path.to_path_buf(),
+        config_digest: digest,
+        config_snapshot: snapshot,
+        env: Vec::new(),
+    };
+    sessions()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(
+            worktree.to_string(),
+            DevcontainerSession {
+                provider: Arc::new(FailingExecProvider),
+                handle,
+            },
+        );
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn remove_test_session(worktree: &str) {
+    sessions()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(worktree);
+}
+
 /// Derive the single status decision shared by launch, doctor, and hydration.
 /// No process is started here; the caller supplies the already-bounded probe.
 pub(crate) fn status_for_selected(

@@ -150,6 +150,26 @@ pub struct SandboxHalt {
     pub dormant: Option<thegn_core::sandbox_dormant::DormantRuntime>,
 }
 
+/// A provider session was selected, but its trusted launch command could no
+/// longer be constructed. This is a refusal, not a permission to reinterpret
+/// the request as a host shell: the caller must prepare the provider again.
+#[derive(Debug, Clone)]
+pub(crate) struct DevcontainerLaunchRefused {
+    pub reason: String,
+}
+
+impl std::fmt::Display for DevcontainerLaunchRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "devcontainer launch refused; prepare the environment again: {}",
+            self.reason
+        )
+    }
+}
+
+impl std::error::Error for DevcontainerLaunchRefused {}
+
 impl std::fmt::Display for SandboxHalt {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let allow = if self.ask {
@@ -789,7 +809,7 @@ pub fn prepare_sandbox_env(
     // Reaching here means no candidate produced a runnable sandbox. A requested
     // sandbox must halt with the existing actionable error instead of becoming a
     // host login shell, regardless of failover mode or placement.
-    if !degrade_allowed && sb.enabled && sb.backend != thegn_core::config::SandboxBackend::None {
+    if !degrade_allowed {
         let reachable = sandbox::placement_reachable(&exec_placement, &sb.backend_chain);
         return Err(SandboxHalt {
             env_name: env_name.clone(),
@@ -2181,7 +2201,7 @@ pub fn provision_provider_env_named(
         };
 
         if let Err(e) = result {
-            // A pure pre-warm (devShell/cache/direnv-allow) that failed is invisible
+            // A pure target-side devShell pre-warm that failed is invisible
             // to the user — the pane rebuilds it lazily — so don't alarm with a red
             // `Failed` row (its usual failure is an OOM/timeout on a heavy Nix build
             // in a pooled microVM). Mark it done with a "finishes in the shell" hint.
@@ -2958,17 +2978,15 @@ pub fn compose_spec(
             ),
             Err(error) => {
                 tracing::warn!(target: "thegn::config_trust", "devcontainer session rejected: {error}");
-                provider_session = None;
-                degraded = true;
-                warnings.push(format!(
-                    "devcontainer config changed; launch blocked until the environment is prepared again ({error})"
-                ));
                 // The provider was selected before the native OCI candidate was
                 // resolved, so there is no equivalent containment spec to enter
-                // here. Never turn config invalidation into execution of the
-                // requested repo command on the host. The pane exits visibly and
-                // the next launch re-runs preparation against the new config.
-                blocked_devcontainer_argv()
+                // here. Returning a typed refusal keeps the pane spawn site
+                // from turning invalidated target authority into a host login
+                // shell whose rc files could execute repository code.
+                return Err(DevcontainerLaunchRefused {
+                    reason: error.to_string(),
+                }
+                .into());
             }
         },
         (Some(spec), _) => sandbox::enter_argv(spec, &cmd)
@@ -3017,14 +3035,6 @@ pub fn compose_spec(
     })
 }
 
-fn blocked_devcontainer_argv() -> Vec<String> {
-    vec![
-        thegn_core::util::shell(),
-        "-lc".to_string(),
-        "printf '%s\\n' 'thegn: devcontainer configuration changed; launch blocked; retry to prepare it' >&2; exit 126".to_string(),
-    ]
-}
-
 /// Compose the [`LaunchSpec`] for running `choice` in `worktree`. Records the
 /// choice (and any sandbox backend) in the DB, mirroring the zellij path's
 /// side effects so the dashboard/`--resume` keep working. Errors when an
@@ -3061,9 +3071,9 @@ pub fn launch_spec(
 
 /// [`launch_spec`] for a **daemon-routed center pane resolved ON the loop** —
 /// a split (`spawn_worktree_shell_pane`) or the startup watchdog's clean-shell
-/// fallback. Identical to `launch_spec` (async direnv warm, safe on the loop)
-/// except that it marks the sandbox spec pane-daemon-owned when the daemon
-/// route is active, so a local bwrap pane drops `--die-with-parent`.
+/// fallback. Identical to `launch_spec` except that it marks the sandbox spec
+/// pane-daemon-owned when the daemon route is active, so a local bwrap pane
+/// drops `--die-with-parent`.
 ///
 /// That guard is `prctl(PR_SET_PDEATHSIG)`, keyed to the *thread* that forked
 /// bwrap, not the process — on a daemon-owned pane it reaps a shell that is
@@ -3112,6 +3122,21 @@ pub(crate) fn prewarm_spec(cfg: &Config, worktree: &str) -> anyhow::Result<Launc
             ..Default::default()
         },
     )
+}
+
+/// Automatic sibling/tab prewarm may prepare a contained target or attach an
+/// already-running daemon session, but it must never synthesize a host pane.
+/// Focused materialize/launch paths deliberately do not call this policy: an
+/// explicit host choice remains an explicit user action.
+pub(crate) fn reject_host_prewarm(
+    specs: &mut Result<Vec<(u32, LaunchSpec)>, crate::handlers::provision::SpecError>,
+) {
+    if specs
+        .as_ref()
+        .is_ok_and(|resolved| resolved.iter().any(|(_, spec)| spec.backend == "host"))
+    {
+        *specs = Err(crate::handlers::provision::SpecError::PrewarmSkipped);
+    }
 }
 
 /// Like [`launch_spec`] but with the full set of launch knobs.

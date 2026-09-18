@@ -41,9 +41,10 @@ pub(crate) type ProvisionProgress = (String, usize, Vec<LoadStep>);
 pub(crate) enum SpecError {
     Halt(crate::agent::SandboxHalt),
     Other(String),
-    /// Benign pre-warm skip (provider env not provisioned yet). Clears
-    /// `prewarm_inflight` on arrival; paints NO failed splash and sets NO
-    /// failed mark — the tab is simply left for materialize to bring up.
+    /// Benign automatic pre-warm skip (provider env not provisioned yet, or
+    /// host execution was the only fresh spec). Clears `prewarm_inflight` on
+    /// arrival; paints NO failed splash and sets NO failed mark — the tab is
+    /// simply left for focused materialize to bring up.
     PrewarmSkipped,
 }
 
@@ -378,6 +379,48 @@ pub(crate) fn drain_provision(
     dirty
 }
 
+/// Adopt live daemon sessions when a prewarm has no safe fresh spec to spawn.
+/// The empty leaf list deliberately makes every target a surplus split, so no
+/// shell is synthesized just to make an attachment possible.
+fn attach_prewarm_sessions(
+    ctx: &mut SpecDrainCtx<'_>,
+    gi: usize,
+    ti: usize,
+    targets: Vec<worktree_attach::AttachTarget>,
+) {
+    if targets.is_empty() || !ctx.panes.daemon_route_enabled() {
+        return;
+    }
+    let shown: Vec<String> = ctx
+        .panes
+        .table
+        .values()
+        .filter_map(|pane| pane.provider_session())
+        .filter(|session| session.provider == "daemon")
+        .map(|session| session.session.clone())
+        .collect();
+    let targets: Vec<_> = targets
+        .into_iter()
+        .filter(|target| !shown.contains(&target.session))
+        .collect();
+    let budget = worktree_attach::MAX_PANES_PER_TAB
+        .saturating_sub(ctx.session.worktrees[gi].tabs[ti].center.pane_ids().len());
+    let plan = worktree_attach::plan(&[], targets, budget);
+    let landed = worktree_attach::graft_surplus(
+        &plan.surplus,
+        gi,
+        ti,
+        ctx.session,
+        ctx.panes,
+        ctx.current_config,
+        ctx.center,
+    );
+    if landed > 0 {
+        *ctx.need_relayout = true;
+        *ctx.dirty = true;
+    }
+}
+
 /// Drain resolved launch specs: finish the deferred materialize (lazy focus
 /// path and pre-warm alike). Results for a group/tab that vanished mid-flight
 /// are dropped, and `materialize_with_specs` itself skips leaves that came
@@ -497,10 +540,20 @@ pub(crate) fn drain_specs(
                 // warning modal instead of just a status line. Otherwise a
                 // plain blocked-launch status.
                 let err_detail = match e {
-                    // Benign prewarm skip (provider env not provisioned yet):
-                    // no failed splash, no failed mark — the tab is left for
-                    // the focused materialize to provision + open.
-                    SpecError::PrewarmSkipped => continue,
+                    // Benign prewarm skip (provider env not provisioned yet, or
+                    // host execution was the only fresh spec): no failed splash,
+                    // no failed mark — focused materialize owns any new launch.
+                    SpecError::PrewarmSkipped => {
+                        // A host prewarm is also skipped, but a live daemon
+                        // session discovered beside it is still safe to adopt.
+                        // Keep attachment independent from fresh host-spec
+                        // construction so a prewarm cannot create a host shell
+                        // merely to preserve resurrection behavior.
+                        if origin == SpecOrigin::Prewarm {
+                            attach_prewarm_sessions(ctx, gi, ti, batch_attach);
+                        }
+                        continue;
+                    }
                     SpecError::Halt(halt) => {
                         ctx.model.status =
                             format!("{} unavailable: {}", halt.placement, halt.reason);

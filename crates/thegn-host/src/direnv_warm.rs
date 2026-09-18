@@ -1,8 +1,9 @@
 //! Compatibility wrappers for the removed host-side `direnv` warm path.
 //!
 //! The old public helper names remain so lifecycle/materialize callers do not
-//! need a flag-day API change. They are deliberately inert: no host process,
-//! thread, approval, cache write, or repository filesystem probe occurs.
+//! need a flag-day API change. They perform no removed direnv warming,
+//! approval, or cache write; the normal launch resolver may still perform its
+//! ordinary sandbox/provider probes and provisioning.
 
 use crate::agent::LaunchSpec;
 use thegn_core::config::Config;
