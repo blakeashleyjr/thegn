@@ -390,8 +390,9 @@ part of the shipped `thegn` binary.
   via the `preCommit` block in `flake.nix`) — edit `flake.nix`, then re-enter
   `nix develop` to regenerate. The hooks are tiered: pre-commit stays cheap
   (treefmt + shellcheck + yamllint), pre-push carries the correctness gates
-  (clippy, `just test`, `just smoke`). `git add` new files before
-  `nix flake check`.
+  (clippy, `just test`, `just smoke`). The dev shell installs no checkout hook
+  and never seeds this config into another worktree; review and configure
+  linked worktrees explicitly. `git add` new files before `nix flake check`.
 - Commit/push only when asked; branch off `main` first. Conventional commit
   style (`feat(scope):`, `fix(scope):`) matches the history.
 - **Landing on `main` from a sandbox/worktree.** The canonical checkout's
