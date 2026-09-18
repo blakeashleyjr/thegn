@@ -2423,6 +2423,42 @@ mod tests {
     }
 
     #[test]
+    fn failed_v69_ledger_rebuild_cannot_hide_claims_on_retry() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE worktrees (path TEXT);
+             CREATE TABLE tab_groups (name TEXT);
+             CREATE TABLE worktree_instances (
+               instance_id BLOB PRIMARY KEY,
+               generation BLOB NOT NULL,
+               repo_id BLOB NOT NULL,
+               common_dir BLOB NOT NULL,
+               admin_id BLOB NOT NULL,
+               branch_ref BLOB,
+               path BLOB NOT NULL,
+               owner BLOB NOT NULL,
+               state TEXT NOT NULL,
+               quarantine_reason TEXT,
+               created_at INTEGER NOT NULL
+             );
+             INSERT INTO worktree_instances
+               VALUES (zeroblob(1), zeroblob(1), zeroblob(1), zeroblob(1),
+                       zeroblob(1), NULL, zeroblob(1), zeroblob(1),
+                       'legacy', NULL, 0);",
+        )
+        .unwrap();
+
+        // The copy into the v69 CHECK-constrained table fails. A retry must
+        // not accept an empty/partial replacement while the old claims remain
+        // stranded in worktree_instances_v69_legacy.
+        assert!(migrate_v69(&conn).is_err());
+        assert!(
+            migrate_v69(&conn).is_err(),
+            "a failed rebuild must remain refused until the old claims are recovered"
+        );
+    }
+
+    #[test]
     fn v69_verifier_checks_types_checks_and_partial_unique_flags() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
