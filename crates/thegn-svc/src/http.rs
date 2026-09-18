@@ -108,7 +108,13 @@ impl CalendarHttpClient {
         timeout_at(deadline, request.send())
             .await
             .map_err(|_| CalendarHttpError::Timeout)?
-            .map_err(|_| CalendarHttpError::Network)
+            .map_err(|error| {
+                if error.is_timeout() {
+                    CalendarHttpError::Timeout
+                } else {
+                    CalendarHttpError::Network
+                }
+            })
     }
 }
 
@@ -129,10 +135,19 @@ fn build_client(allow_private_network: bool) -> Result<Client, CalendarHttpError
         allow_private_network,
         #[cfg(test)]
         test_answers: None,
+        #[cfg(test)]
+        test_resolutions: None,
     })
 }
 
 fn build_client_with_resolver(resolver: CalendarResolver) -> Result<Client, CalendarHttpError> {
+    build_client_with_resolver_and_read_timeout(resolver, READ_IDLE_TIMEOUT)
+}
+
+fn build_client_with_resolver_and_read_timeout(
+    resolver: CalendarResolver,
+    read_timeout: Duration,
+) -> Result<Client, CalendarHttpError> {
     Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .no_proxy()
@@ -144,7 +159,7 @@ fn build_client_with_resolver(resolver: CalendarResolver) -> Result<Client, Cale
         .no_deflate()
         .no_zstd()
         .connect_timeout(CONNECT_TIMEOUT)
-        .read_timeout(READ_IDLE_TIMEOUT)
+        .read_timeout(read_timeout)
         .dns_resolver2(resolver)
         .build()
         .map_err(|_| CalendarHttpError::ClientConfiguration)
@@ -155,6 +170,8 @@ struct CalendarResolver {
     allow_private_network: bool,
     #[cfg(test)]
     test_answers: Option<std::sync::Arc<std::sync::Mutex<Vec<Vec<SocketAddr>>>>>,
+    #[cfg(test)]
+    test_resolutions: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
 }
 
 impl reqwest::dns::Resolve for CalendarResolver {
@@ -163,7 +180,13 @@ impl reqwest::dns::Resolve for CalendarResolver {
         let allow_private_network = self.allow_private_network;
         #[cfg(test)]
         let test_answers = self.test_answers.clone();
+        #[cfg(test)]
+        let test_resolutions = self.test_resolutions.clone();
         Box::pin(async move {
+            #[cfg(test)]
+            if let Some(test_resolutions) = test_resolutions {
+                test_resolutions.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
             #[cfg(test)]
             let addresses = if let Some(test_answers) = test_answers {
                 test_answers
@@ -225,7 +248,7 @@ fn resolver_error() -> Box<dyn std::error::Error + Send + Sync> {
 /// remain refused even with the opt-in.
 fn address_allowed(ip: IpAddr, allow_private_network: bool) -> bool {
     let ip = match ip {
-        IpAddr::V6(v6) => match v6.to_ipv4() {
+        IpAddr::V6(v6) => match mapped_ipv4(v6) {
             Some(v4) => IpAddr::V4(v4),
             None => IpAddr::V6(v6),
         },
@@ -235,6 +258,13 @@ fn address_allowed(ip: IpAddr, allow_private_network: bool) -> bool {
         IpAddr::V4(v4) => public_ipv4(v4) || (allow_private_network && local_ipv4(v4)),
         IpAddr::V6(v6) => public_ipv6(v6) || (allow_private_network && local_ipv6(v6)),
     }
+}
+
+fn mapped_ipv4(ip: Ipv6Addr) -> Option<Ipv4Addr> {
+    let segments = ip.segments();
+    (segments[..5].iter().all(|segment| *segment == 0) && segments[5] == 0xffff)
+        .then(|| ip.to_ipv4())
+        .flatten()
 }
 
 fn addresses_allowed(addresses: &[SocketAddr], allow_private_network: bool) -> bool {
@@ -267,11 +297,12 @@ fn public_ipv4(ip: Ipv4Addr) -> bool {
 fn public_ipv6(ip: Ipv6Addr) -> bool {
     let segments = ip.segments();
     // Global unicast is 2000::/3.  The exclusions below are the reviewed
-    // special-purpose/transition blocks that sit inside that range.
+    // special-purpose/transition blocks that sit inside that range.  The
+    // conservative 2001::/23 exclusion covers IANA's entire enclosing
+    // protocol-assignment range, including ORCHID (2001:10::/28) and
+    // ORCHIDv2 (2001:20::/28), rather than relying on a partial subrange.
     (segments[0] & 0xe000) == 0x2000
-        && !in_ipv6_prefix(ip, [0x2001, 0, 0, 0, 0, 0, 0, 0], 29) // Teredo and IETF assignments
-        && !in_ipv6_prefix(ip, [0x2001, 0x0010, 0, 0, 0, 0, 0, 0], 28) // ORCHIDv2
-        && !in_ipv6_prefix(ip, [0x2001, 0x0020, 0, 0, 0, 0, 0, 0], 28) // ORCHID
+        && !in_ipv6_prefix(ip, [0x2001, 0, 0, 0, 0, 0, 0, 0], 23)
         && !in_ipv6_prefix(ip, [0x2001, 0x0db8, 0, 0, 0, 0, 0, 0], 32) // documentation
         && !in_ipv6_prefix(ip, [0x2002, 0, 0, 0, 0, 0, 0, 0], 16) // 6to4
         && !in_ipv6_prefix(ip, [0x3fff, 0, 0, 0, 0, 0, 0, 0], 20) // documentation
@@ -422,7 +453,13 @@ pub(crate) async fn read_bounded_response(
         .await
         .map_err(|_| BodyReadError::Timeout)?
     {
-        let chunk = chunk.map_err(BodyReadError::Network)?;
+        let chunk = chunk.map_err(|error| {
+            if error.is_timeout() {
+                BodyReadError::Timeout
+            } else {
+                BodyReadError::Network(error)
+            }
+        })?;
         if body.len().saturating_add(chunk.len()) > limit {
             return Err(BodyReadError::Limit);
         }
@@ -431,9 +468,9 @@ pub(crate) async fn read_bounded_response(
         if additional > 0 {
             body.try_reserve_exact(additional)
                 .map_err(|_| BodyReadError::Limit)?;
-            if body.capacity() > limit {
-                return Err(BodyReadError::Limit);
-            }
+        }
+        if body.capacity() > limit {
+            return Err(BodyReadError::Limit);
         }
         body.extend_from_slice(&chunk);
     }
@@ -450,7 +487,11 @@ fn bounded_reserve_needed(
     if new_len > limit {
         return Err(());
     }
-    Ok(new_len.saturating_sub(capacity))
+    if new_len <= capacity {
+        return Ok(0);
+    }
+    let target_capacity = capacity.saturating_mul(2).min(limit).max(new_len);
+    target_capacity.checked_sub(len).ok_or(())
 }
 
 /// Drain an error body without retaining it.  This bounds both diagnostic
@@ -466,7 +507,13 @@ pub(crate) async fn discard_body(
         .await
         .map_err(|_| CalendarHttpError::Timeout)?
     {
-        let chunk = chunk.map_err(|_| CalendarHttpError::Network)?;
+        let chunk = chunk.map_err(|error| {
+            if error.is_timeout() {
+                CalendarHttpError::Timeout
+            } else {
+                CalendarHttpError::Network
+            }
+        })?;
         count = count.saturating_add(chunk.len());
         if count > MAX_ERROR_BODY_BYTES {
             return Err(CalendarHttpError::BodyLimit);
@@ -557,21 +604,62 @@ mod tests {
     fn public_destination_policy_rejects_non_global_ipv6_special_prefixes() {
         // These are not globally routable unicast destinations, but the
         // hand-written allowlist below would otherwise admit them.
-        for raw in ["2001:2::1", "2001:10::1", "3fff::1"] {
+        for raw in [
+            "2001:2::1",
+            "2001:10::1",
+            "2001:100::1",
+            "2001:1ff::1",
+            "3fff::1",
+        ] {
             let ip = raw.parse().unwrap();
             assert!(!address_allowed(ip, false), "{raw} must be refused");
+        }
+        assert!(address_allowed("2001:200::1".parse().unwrap(), false));
+        for raw in ["::192.0.2.1", "::8.8.8.8"] {
+            let ip = raw.parse().unwrap();
+            assert!(!address_allowed(ip, false), "{raw} must be refused");
+            assert!(
+                !address_allowed(ip, true),
+                "{raw} is deprecated compatible form"
+            );
         }
     }
 
     #[test]
-    fn bounded_reader_requests_only_exact_capacity_growth() {
-        assert_eq!(bounded_reserve_needed(7, 8, 2, 16), Ok(1));
-        assert_eq!(bounded_reserve_needed(7, 7, 2, 16), Ok(2));
+    fn bounded_reader_grows_geometrically_without_crossing_the_limit() {
+        assert_eq!(bounded_reserve_needed(6, 8, 4, 10), Ok(4));
+        assert_eq!(bounded_reserve_needed(7, 7, 2, 16), Ok(9));
         assert_eq!(bounded_reserve_needed(15, 15, 2, 16), Err(()));
         assert_eq!(
             bounded_reserve_needed(usize::MAX, usize::MAX, 1, usize::MAX),
             Err(())
         );
+
+        let mut body = Vec::with_capacity(8);
+        body.extend_from_slice(&[0; 6]);
+        let extra = bounded_reserve_needed(body.len(), body.capacity(), 4, 10).unwrap();
+        body.try_reserve_exact(extra).unwrap();
+        assert_eq!(body.capacity(), 10);
+        body.extend_from_slice(&[1; 4]);
+        assert_eq!(body.len(), 10);
+        assert!(body.capacity() <= 10);
+
+        let mut exact = Vec::with_capacity(10);
+        exact.extend_from_slice(&[0; 10]);
+        assert_eq!(
+            bounded_reserve_needed(exact.len(), exact.capacity(), 0, 10),
+            Ok(0)
+        );
+        assert_eq!(bounded_reserve_needed(10, 10, 1, 10), Err(()));
+
+        let mut repeated = Vec::new();
+        for _ in 0..20 {
+            let extra =
+                bounded_reserve_needed(repeated.len(), repeated.capacity(), 3, 1024).unwrap();
+            repeated.try_reserve_exact(extra).unwrap();
+            repeated.extend_from_slice(&[2; 3]);
+            assert!(repeated.capacity() <= repeated.len().saturating_mul(2));
+        }
     }
 
     #[test]
@@ -615,6 +703,11 @@ mod tests {
                 .env("HTTP_PROXY", "http://127.0.0.1:9")
                 .env("HTTPS_PROXY", "http://127.0.0.1:9")
                 .env("ALL_PROXY", "http://127.0.0.1:9")
+                .env("http_proxy", "http://127.0.0.1:9")
+                .env("https_proxy", "http://127.0.0.1:9")
+                .env("all_proxy", "http://127.0.0.1:9")
+                .env_remove("NO_PROXY")
+                .env_remove("no_proxy")
                 .output()
                 .unwrap();
             assert!(
@@ -652,6 +745,7 @@ mod tests {
 
     #[tokio::test]
     async fn checked_dns_answers_are_the_addresses_used_by_the_connection_path() {
+        use axum::response::IntoResponse;
         use std::sync::{Arc, Mutex};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -664,7 +758,14 @@ mod tests {
                 axum::Router::new().fallback(axum::routing::any(
                     move |_request: axum::extract::Request| {
                         observed_hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        async { "direct" }
+                        async {
+                            let mut response = "direct".into_response();
+                            response.headers_mut().insert(
+                                "connection",
+                                axum::http::HeaderValue::from_static("close"),
+                            );
+                            response
+                        }
                     },
                 )),
             )
@@ -672,16 +773,24 @@ mod tests {
             .unwrap();
         });
 
-        let make_client =
-            |allow_private_network: bool, answers: Vec<Vec<SocketAddr>>| CalendarHttpClient {
+        let resolutions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let make_client = |allow_private_network: bool,
+                           answers: Arc<Mutex<Vec<Vec<SocketAddr>>>>|
+         -> CalendarHttpClient {
+            CalendarHttpClient {
                 client: build_client_with_resolver(CalendarResolver {
                     allow_private_network,
-                    test_answers: Some(Arc::new(Mutex::new(answers))),
+                    test_answers: Some(answers),
+                    test_resolutions: Some(Arc::clone(&resolutions)),
                 })
                 .unwrap(),
-                url: Url::parse("http://calendar.test/feed").unwrap(),
-            };
-        let allowed = make_client(true, vec![vec![address]]);
+                url: Url::parse(&format!("http://calendar.test:{}/feed", address.port())).unwrap(),
+            }
+        };
+        let answers = Arc::new(Mutex::new(vec![vec![address]]));
+        let allowed = make_client(true, Arc::clone(&answers));
+        // The response closes its connection below, forcing the same client
+        // to resolve again.  The second answer models DNS rebinding.
         let response = allowed
             .send(
                 allowed.request(reqwest::Method::GET),
@@ -691,16 +800,29 @@ mod tests {
             .unwrap();
         assert!(response.status().is_success());
         assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+        answers
+            .lock()
+            .unwrap()
+            .push(vec![SocketAddr::from(([224, 0, 0, 1], address.port()))]);
+        assert!(
+            allowed
+                .send(
+                    allowed.request(reqwest::Method::GET),
+                    Instant::now() + Duration::from_secs(2),
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(resolutions.load(std::sync::atomic::Ordering::SeqCst), 2);
 
         // A resolver result that contains one approved and one forbidden
         // address fails closed before reqwest can try either destination.
-        let mixed = make_client(
-            true,
-            vec![vec![
-                address,
-                SocketAddr::from(([224, 0, 0, 1], address.port())),
-            ]],
-        );
+        let mixed_answers = Arc::new(Mutex::new(vec![vec![
+            address,
+            SocketAddr::from(([224, 0, 0, 1], address.port())),
+        ]]));
+        let mixed = make_client(true, mixed_answers);
         assert!(
             mixed
                 .send(
@@ -712,22 +834,7 @@ mod tests {
         );
         assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
 
-        // A later resolution is checked independently; this models a DNS
-        // rebinding result without mutating process-global resolver state.
-        let rebound = make_client(
-            false,
-            vec![vec![SocketAddr::from(([10, 0, 0, 1], address.port()))]],
-        );
-        assert!(
-            rebound
-                .send(
-                    rebound.request(reqwest::Method::GET),
-                    Instant::now() + Duration::from_secs(2),
-                )
-                .await
-                .is_err()
-        );
-        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(resolutions.load(std::sync::atomic::Ordering::SeqCst), 3);
         server.abort();
         let _ = server.await;
     }
@@ -749,11 +856,22 @@ mod tests {
                         tokio::time::sleep(Duration::from_millis(100)).await;
                         return ("late").into_response();
                     }
+                    if request.uri().path() == "/idle" {
+                        let stream = futures_util::stream::once(async {
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                            Ok::<_, Infallible>(vec![b'x'])
+                        });
+                        return Body::from_stream(stream).into_response();
+                    }
                     let stream = futures_util::stream::unfold((), |_| async {
                         tokio::time::sleep(Duration::from_millis(10)).await;
                         Some((Ok::<_, Infallible>(vec![b'x']), ()))
                     });
-                    Body::from_stream(stream).into_response()
+                    let mut response = Body::from_stream(stream).into_response();
+                    if request.uri().path() == "/error" {
+                        *response.status_mut() = axum::http::StatusCode::INTERNAL_SERVER_ERROR;
+                    }
+                    response
                 }),
             )
             .await
@@ -771,7 +889,45 @@ mod tests {
             Err(CalendarHttpError::Timeout)
         ));
 
-        let body = CalendarHttpClient::new(&format!("http://{address}/body"), true).unwrap();
+        let idle = CalendarHttpClient {
+            client: build_client_with_resolver_and_read_timeout(
+                CalendarResolver {
+                    allow_private_network: true,
+                    test_answers: None,
+                    test_resolutions: None,
+                },
+                Duration::from_millis(20),
+            )
+            .unwrap(),
+            url: Url::parse(&format!("http://{address}/idle")).unwrap(),
+        };
+        let idle_response = idle
+            .send(
+                idle.request(reqwest::Method::GET),
+                Instant::now() + Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            read_bounded_response(idle_response, Instant::now() + Duration::from_secs(1), 128)
+                .await,
+            Err(BodyReadError::Timeout)
+        ));
+
+        // A body that keeps dripping is governed by the operation deadline,
+        // independently of the injected idle/read timeout above.
+        let body = CalendarHttpClient {
+            client: build_client_with_resolver_and_read_timeout(
+                CalendarResolver {
+                    allow_private_network: true,
+                    test_answers: None,
+                    test_resolutions: None,
+                },
+                Duration::from_secs(1),
+            )
+            .unwrap(),
+            url: Url::parse(&format!("http://{address}/body")).unwrap(),
+        };
         let response = body
             .send(
                 body.request(reqwest::Method::GET),
@@ -782,6 +938,19 @@ mod tests {
         assert!(matches!(
             read_bounded_response(response, Instant::now() + Duration::from_millis(25), 128,).await,
             Err(BodyReadError::Timeout)
+        ));
+        let error_client =
+            CalendarHttpClient::new(&format!("http://{address}/error"), true).unwrap();
+        let error = error_client
+            .send(
+                error_client.request(reqwest::Method::GET),
+                Instant::now() + Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            discard_body(error, Instant::now() + Duration::from_millis(25)).await,
+            Err(CalendarHttpError::Timeout)
         ));
         server.abort();
         let _ = server.await;

@@ -21,6 +21,14 @@ use crate::http::{
 };
 use tokio::time::Instant;
 
+fn map_transport_error(error: CalendarHttpError) -> CalendarError {
+    match error {
+        CalendarHttpError::Timeout => CalendarError::Timeout(map_error(error)),
+        CalendarHttpError::BodyLimit => CalendarError::BodyLimit(map_error(error)),
+        other => CalendarError::Network(map_error(other).into()),
+    }
+}
+
 pub struct IcsUrlBackend {
     username: String,
     token: String,
@@ -112,7 +120,7 @@ impl CalendarBackend for IcsUrlBackend {
             let resp = http
                 .send(req, deadline)
                 .await
-                .map_err(|error| CalendarError::Network(map_error(error).into()))?;
+                .map_err(map_transport_error)?;
 
             // 304 is the one protocol-level 3xx compatibility response: it is
             // not a redirect and preserves the existing ETag cache behavior.
@@ -141,14 +149,14 @@ impl CalendarBackend for IcsUrlBackend {
                 let status = resp.status();
                 discard_body(resp, deadline)
                     .await
-                    .map_err(|error| CalendarError::Network(map_error(error).into()))?;
+                    .map_err(map_transport_error)?;
                 return Err(CalendarError::Auth(format!("HTTP {status}")));
             }
             if !resp.status().is_success() {
                 let status = resp.status();
                 discard_body(resp, deadline)
                     .await
-                    .map_err(|error| CalendarError::Network(map_error(error).into()))?;
+                    .map_err(map_transport_error)?;
                 return Err(CalendarError::Api(format!("HTTP {status}")));
             }
             validate_media(&resp, ExpectedMedia::Ics)

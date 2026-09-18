@@ -25,6 +25,14 @@ use crate::http::{
     map_error, read_body, validate_encoding, validate_media,
 };
 
+fn map_transport_error(error: CalendarHttpError) -> CalendarError {
+    match error {
+        CalendarHttpError::Timeout => CalendarError::Timeout(map_error(error)),
+        CalendarHttpError::BodyLimit => CalendarError::BodyLimit(map_error(error)),
+        other => CalendarError::Network(map_error(other).into()),
+    }
+}
+
 pub struct CalDavBackend {
     username: String,
     token: String,
@@ -67,6 +75,12 @@ impl CalDavBackend {
 
     pub fn with_max_events(mut self, n: usize) -> Self {
         self.max_events = n;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_timeout_for_test(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
         self
     }
 
@@ -332,7 +346,7 @@ impl CalendarBackend for CalDavBackend {
             let resp = http
                 .send(resp, deadline)
                 .await
-                .map_err(|error| CalendarError::Network(map_error(error).into()))?;
+                .map_err(map_transport_error)?;
 
             if resp.status().is_redirection() {
                 return Err(CalendarError::Policy(map_error(
@@ -347,7 +361,7 @@ impl CalendarBackend for CalDavBackend {
                 let status = resp.status();
                 discard_body(resp, deadline)
                     .await
-                    .map_err(|error| CalendarError::Network(map_error(error).into()))?;
+                    .map_err(map_transport_error)?;
                 return Err(CalendarError::Auth(format!("HTTP {status}")));
             }
             // A server that has expired or never knew our token answers 409/507.
@@ -366,14 +380,14 @@ impl CalendarBackend for CalDavBackend {
                 );
                 discard_body(resp, deadline)
                     .await
-                    .map_err(|error| CalendarError::Network(map_error(error).into()))?;
+                    .map_err(map_transport_error)?;
                 return self.fetch_full(from, to, deadline).await;
             }
             if !resp.status().is_success() && resp.status() != reqwest::StatusCode::MULTI_STATUS {
                 let status = resp.status();
                 discard_body(resp, deadline)
                     .await
-                    .map_err(|error| CalendarError::Network(map_error(error).into()))?;
+                    .map_err(map_transport_error)?;
                 return Err(CalendarError::Api(format!("HTTP {status}")));
             }
 
@@ -446,7 +460,7 @@ impl CalDavBackend {
         let response = http
             .send(req, deadline)
             .await
-            .map_err(|error| CalendarError::Network(map_error(error).into()))?;
+            .map_err(map_transport_error)?;
         if response.status().is_redirection() {
             return Err(CalendarError::Policy(map_error(
                 CalendarHttpError::Redirect,
@@ -458,7 +472,7 @@ impl CalDavBackend {
             let status = response.status();
             discard_body(response, deadline)
                 .await
-                .map_err(|error| CalendarError::Network(map_error(error).into()))?;
+                .map_err(map_transport_error)?;
             return Err(CalendarError::Api(format!("HTTP {status}")));
         }
         validate_media(&response, ExpectedMedia::Dav)
