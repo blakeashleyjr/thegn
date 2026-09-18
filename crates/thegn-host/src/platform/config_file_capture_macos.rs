@@ -13,7 +13,7 @@ use crate::config_capture::ConfigFileReadError as Error;
 // namespace. It is not a hostile same-UID or mount-administrator guarantee.
 fn regular_path(path: &Path) -> Result<bool, Error> {
     match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => Err(Error::Unsupported),
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(Error::FinalLinkUnsupported),
         Ok(metadata) if !metadata.is_file() => Err(Error::NonRegular),
         Ok(_) => Ok(true),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
@@ -49,7 +49,7 @@ fn open(path: &Path) -> Result<Option<File>, Error> {
     if fd < 0 {
         return match std::io::Error::last_os_error().raw_os_error() {
             Some(libc::ENOENT) => Ok(None),
-            Some(libc::ELOOP) => Err(Error::Unsupported),
+            Some(libc::ELOOP) => Err(Error::FinalLinkUnsupported),
             _ => Err(Error::Unavailable),
         };
     }
@@ -130,7 +130,9 @@ mod tests {
         fs::write(&original, b"one").unwrap();
         fs::write(&replacement, b"two").unwrap();
         std::os::unix::fs::symlink(&original, dir.path().join("link")).unwrap();
-        assert_eq!(read(&dir.path().join("link"), 64), Err(Error::Unsupported));
+        let error = read(&dir.path().join("link"), 64).unwrap_err();
+        assert_eq!(error, Error::FinalLinkUnsupported);
+        assert!(!error.to_string().contains("one"));
         assert_eq!(
             read_path(&original, 64, || {
                 fs::rename(&original, dir.path().join("old")).unwrap();

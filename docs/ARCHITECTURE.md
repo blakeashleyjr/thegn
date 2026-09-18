@@ -238,6 +238,16 @@ strictly checks the main file, active profile, and selected repo overlay with
 file/key context. When candidates are shadowed, the loader warns with paths
 only.
 
+The parked THE-505 config-file capture adapter has an explicit platform
+boundary: Linux can admit a bounded read of a resolved regular-file symlink,
+but macOS and Windows deliberately refuse a final config-file symlink/reparse
+point until a reviewed bounded target walker exists. Its typed diagnostic tells
+the operator to select a reviewed ordinary private config file; copying a
+managed config makes it stop tracking that manager automatically. This is a
+config-file-only limitation, not a claim that the state DB has the same
+platform support matrix. The adapter is not startup wiring yet, so no universal
+startup support claim is made from Linux evidence.
+
 **Gate:** `tests/config_example.rs` (every key documented; example parses and
 validates clean, and the generated reference retains the documented key set),
 `tests/env_overlay_coverage.rs` (every shallow key has an env knob or is

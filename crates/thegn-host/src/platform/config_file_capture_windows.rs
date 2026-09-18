@@ -22,7 +22,7 @@ fn identity(file: &File) -> Result<(u32, u32, u32, u64, std::time::SystemTime), 
     {
         // Reject every final reparse point. No unreviewed tag is treated as a
         // regular config-file symlink policy.
-        return Err(Error::Unsupported);
+        return Err(Error::FinalLinkUnsupported);
     }
     let (volume, high, low) =
         crate::platform::handle_identity(file).map_err(|_| Error::Unavailable)?;
@@ -37,7 +37,9 @@ fn identity(file: &File) -> Result<(u32, u32, u32, u64, std::time::SystemTime), 
 
 fn open(path: &Path) -> Result<Option<File>, Error> {
     let present = match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => return Err(Error::Unsupported),
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(Error::FinalLinkUnsupported);
+        }
         Ok(metadata) if !metadata.is_file() => return Err(Error::NonRegular),
         Ok(_) => true,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
@@ -111,5 +113,20 @@ mod tests {
             }),
             Err(Error::Changed)
         );
+    }
+
+    #[test]
+    fn final_reparse_point_is_refused_without_disclosing_contents_when_supported() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = dir.path().join("ordinary");
+        let link = dir.path().join("managed-config");
+        fs::write(&original, b"private config contents").unwrap();
+        if let Err(error) = crate::platform::symlink_file_for_test(&original, &link) {
+            eprintln!("SKIP: Windows final-reparse fixture unavailable: {error}");
+            return;
+        }
+        let error = read(&link, 64).unwrap_err();
+        assert_eq!(error, Error::FinalLinkUnsupported);
+        assert!(!error.to_string().contains("private config contents"));
     }
 }

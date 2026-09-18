@@ -221,14 +221,54 @@ fn invalid_process_profile_slug_is_refused_instead_of_selecting_default() {
             profile_paths: None,
             overrides: &[],
         },
-        cwd,
+        cwd.clone(),
         |key| vars.get(key).cloned(),
         Config::default,
     );
+    assert!(matches!(
+        result,
+        Err(CaptureInputError::ProfileSelector(
+            thegn_core::profile::ProfileSelectorError::EmptyNormalized
+        ))
+    ));
     assert!(
-        result.is_err(),
-        "a nonempty process selector that normalizes to an empty slug must not select default"
+        !cwd.join("app").exists() && !cwd.join("config").exists() && !cwd.join("state").exists(),
+        "selector refusal must not create or reroot storage roots"
     );
+}
+
+#[test]
+fn invalid_environment_process_profile_is_typed_and_redacted() {
+    let cwd = std::env::temp_dir().join("thegn-capture-invalid-env-profile");
+    let keys = crate::platform::config_file_capture::native_path_keys();
+    let vars = BTreeMap::from([
+        (keys.home.to_owned(), cwd.join("home").into_os_string()),
+        (keys.config.to_owned(), cwd.join("config").into_os_string()),
+        (keys.state.to_owned(), cwd.join("state").into_os_string()),
+        ("THEGN_DIR".to_owned(), cwd.join("app").into_os_string()),
+        ("THEGN_PROFILE".to_owned(), OsString::from("!!!")),
+    ]);
+    let result = ConfigCaptureSeed::capture_with(
+        CapturedCliInputs {
+            config: None,
+            profile: None,
+            profile_paths: None,
+            overrides: &[],
+        },
+        cwd.clone(),
+        |key| vars.get(key).cloned(),
+        Config::default,
+    );
+    let error = match result {
+        Ok(_) => panic!("invalid environment selector unexpectedly admitted"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        CaptureInputError::ProfileSelector(
+            thegn_core::profile::ProfileSelectorError::EmptyNormalized
+        )
+    ));
 }
 
 #[test]
@@ -271,6 +311,37 @@ fn cli_profile_wins_and_pre_resolved_roots_are_not_double_rerooted() {
         captured.app_root.join("state/thegn/thegn.db")
     );
     assert!(!captured.app_root.ends_with("profiles/cli/profiles/cli"));
+}
+
+#[test]
+fn pre_resolved_profile_mismatch_is_refused_without_using_the_frozen_root() {
+    let cwd = std::env::temp_dir().join("thegn-capture-profile-mismatch");
+    let keys = crate::platform::config_file_capture::native_path_keys();
+    let vars = BTreeMap::from([
+        (keys.home.to_owned(), OsString::from(cwd.join("home"))),
+        (keys.config.to_owned(), OsString::from(cwd.join("config"))),
+        (keys.state.to_owned(), OsString::from(cwd.join("state"))),
+        ("THEGN_DIR".to_owned(), OsString::from(cwd.join("app"))),
+    ]);
+    let frozen = thegn_core::profile::ProfilePaths {
+        name: "work".to_owned(),
+        root: cwd.join("app/profiles/work"),
+    };
+    let result = ConfigCaptureSeed::capture_with(
+        CapturedCliInputs {
+            config: None,
+            profile: Some("other"),
+            profile_paths: Some(&frozen),
+            overrides: &[],
+        },
+        cwd,
+        |key| vars.get(key).cloned(),
+        Config::default,
+    );
+    assert!(matches!(
+        result,
+        Err(CaptureInputError::ProfileBindingMismatch)
+    ));
 }
 
 #[test]
@@ -407,7 +478,7 @@ fn load_once_uses_private_config_and_wal_fixtures_and_fails_closed() {
     // Every failure below travels through the real ConfigCaptureSeed::load_once
     // path. None can be reclassified as an absent/empty host snapshot.
     for suffix in ["-wal", "-shm", "-journal"] {
-        let _ = std::fs::remove_file(seed.state_db.with_extension(format!("db{suffix}")));
+        let _ = std::fs::remove_file(seed.state_db.with_extension(format!("db{suffix}"))); // best-effort: fixture cleanup; never hides an expected refusal
     }
     std::fs::write(&seed.state_db, b"not sqlite").unwrap();
     assert!(matches!(
@@ -415,7 +486,7 @@ fn load_once_uses_private_config_and_wal_fixtures_and_fails_closed() {
         Err(CaptureFailure::State(StateHostReadError::Database(_)))
     ));
 
-    let _ = std::fs::remove_file(&seed.state_db);
+    let _ = std::fs::remove_file(&seed.state_db); // best-effort: fixture cleanup; refusal is asserted below
     let wrong = Connection::open(&seed.state_db).unwrap();
     wrong
         .execute_batch(
@@ -428,15 +499,15 @@ fn load_once_uses_private_config_and_wal_fixtures_and_fails_closed() {
         Err(CaptureFailure::State(StateHostReadError::Database(_)))
     ));
 
-    let _ = std::fs::remove_file(&seed.state_db);
+    let _ = std::fs::remove_file(&seed.state_db); // best-effort: fixture cleanup; refusal is asserted below
     std::fs::write(seed.state_db.with_extension("db-wal"), b"orphan").unwrap();
     assert!(matches!(
         seed.load_once(),
         Err(CaptureFailure::State(StateHostReadError::OrphanedSidecar))
     ));
 
-    let _ = std::fs::remove_file(seed.state_db.with_extension("db-wal"));
-    let _ = std::fs::remove_file(&seed.state_db);
+    let _ = std::fs::remove_file(seed.state_db.with_extension("db-wal")); // best-effort: fixture cleanup; orphan refusal is already asserted
+    let _ = std::fs::remove_file(&seed.state_db); // best-effort: fixture cleanup; busy refusal is asserted below
     let locked = create_host_db(&seed.state_db, false);
     locked.execute_batch("BEGIN EXCLUSIVE").unwrap();
     assert!(matches!(
@@ -465,6 +536,14 @@ fn invalid_utf8_oversized_and_source_failures_are_typed() {
         load_empty(&captured, &sources),
         Err(CaptureFailure::Source(ConfigFileReadError::TooLarge))
     ));
+}
+
+#[test]
+fn final_link_refusal_is_actionable_but_does_not_disclose_source_contents() {
+    let error = CaptureFailure::Source(ConfigFileReadError::FinalLinkUnsupported);
+    let diagnostic = error.to_string();
+    assert!(diagnostic.contains("ordinary private file"));
+    assert!(!diagnostic.contains("private config contents"));
 }
 
 #[test]

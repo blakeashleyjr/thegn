@@ -958,7 +958,8 @@ fn run_main() -> anyhow::Result<()> {
     // profile (today's shared paths). Sequencing is load-bearing: a single
     // `Db::open()` before this would touch the wrong (shared) DB. Runs for
     // subcommands too, so `thegn --profile work pr …` uses the work DB.
-    thegn_core::profile::reroot(cli.profile.as_deref());
+    thegn_core::profile::reroot(cli.profile.as_deref())
+        .map_err(|error| anyhow::anyhow!("profile selection refused: {error}"))?;
 
     // Test-only: a deliberate panic to exercise the crash-report writer end to
     // end (smoke). Gated behind an env var production never sets; placed after
