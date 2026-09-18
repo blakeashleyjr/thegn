@@ -3486,8 +3486,16 @@ fn ambiguous_overlay_keys_fail_closed_for_every_authority() {
     assert_eq!(
         cfg.repo_git(root).structural_diff,
         cfg.git.structural_diff,
-        "git falls back to the user's own global policy"
+        "presentation knobs stay global"
     );
+    // Security-relevant git knobs clamp to strictest instead of loosening.
+    cfg.git.submodules = crate::config_git::SubmoduleMode::Auto;
+    cfg.git.merge_guard = false;
+    cfg.git.override_gpg = true;
+    cfg.git.auto_fetch = true;
+    let git = cfg.repo_git(root);
+    assert_eq!(git.submodules, crate::config_git::SubmoduleMode::Off);
+    assert!(git.merge_guard && !git.override_gpg && !git.auto_fetch);
     let approvals = crate::config_resolve::Approvals::deny_all();
     assert!(
         !cfg.repo_sandbox_resolved(root, &approvals)

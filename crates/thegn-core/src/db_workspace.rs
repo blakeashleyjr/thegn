@@ -150,6 +150,14 @@ impl WorkspaceStore for Db {
         })
     }
 
+    fn repo_slug_rows(&self) -> Result<Vec<(String, String)>> {
+        let mut stmt = self
+            .conn()
+            .prepare("SELECT repo_path, slug FROM repo_slugs ORDER BY repo_path")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
     /// Drop a repo's stable sidebar slug so a removed workspace can't reclaim a
     /// stale slug if it is reopened later.
     fn del_repo_slug(&self, repo_path: &str) -> Result<()> {

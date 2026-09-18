@@ -133,18 +133,37 @@ pub(crate) fn spawn_drive(tx: &PrqTx, waker: &TerminalWaker, cfg: Config, any_pa
     let tx = tx.clone();
     let waker = waker.clone();
     tokio::task::spawn_blocking(move || {
-        let send = |m: PrqMsg| {
+        drive_blocking(&cfg, &any_path, |m: PrqMsg| {
             if tx.send(m).is_ok() {
                 let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
             }
-        };
-        let Some(root) = crate::integrate::main_checkout(&any_path) else {
+        });
+    });
+}
+
+/// The blocking body of [`spawn_drive`], separated so the entry gates are
+/// testable without a runtime.
+fn drive_blocking(cfg: &Config, any_path: &std::path::Path, send: impl Fn(PrqMsg)) {
+    {
+        let Some(root) = crate::integrate::main_checkout(any_path) else {
             send(PrqMsg::Failed("not inside a git repository".into()));
             return;
         };
+        // THE-515: the ticker (and `D`/palette) are armed on the GLOBAL
+        // `[pr_queue] enabled`; the repo's resolved policy decides here. A
+        // refused trusted overlay is reported; a queue the repo turned off is
+        // a quiet no-op. Neither talks to the forge or dispatches an agent.
+        if let Some(refusal) = cfg.workspace_overlay_refusal(&root) {
+            send(PrqMsg::Failed(format!("{}: {refusal}", root.display())));
+            return;
+        }
         // Repo-resolved inside the blocking task: the loop must not pay for the
         // git call that derives the workspace slug.
         let pq = cfg.repo_pr_queue(&root);
+        if !pq.enabled {
+            send(PrqMsg::Done(Box::default()));
+            return;
+        }
         let db = match Db::open() {
             Ok(d) => d,
             Err(e) => {
@@ -166,7 +185,7 @@ pub(crate) fn spawn_drive(tx: &PrqTx, waker: &TerminalWaker, cfg: Config, any_pa
             &root.to_string_lossy(),
             None,
         ));
-        let out = pr_driver::drive_queue(&pq, &cfg, forge, &root, &db, items, |s| {
+        let out = pr_driver::drive_queue(&pq, cfg, forge, &root, &db, items, |s| {
             send(PrqMsg::Step {
                 key: s.key.to_string(),
                 number: s.number,
@@ -178,7 +197,7 @@ pub(crate) fn spawn_drive(tx: &PrqTx, waker: &TerminalWaker, cfg: Config, any_pa
             // an observed `merged` row closes an autopilot run; the transient
             // "merge requested"/ready states do not.
             if s.status == "merged" {
-                crate::autopilot_driver::on_pr_merged(&cfg, &root, s.number);
+                crate::autopilot_driver::on_pr_merged(cfg, &root, s.number);
             }
         });
         for (event, revised) in &out.review_events {
@@ -188,7 +207,7 @@ pub(crate) fn spawn_drive(tx: &PrqTx, waker: &TerminalWaker, cfg: Config, any_pa
             });
         }
         send(PrqMsg::Done(Box::new(out)));
-    });
+    }
 }
 
 /// Queue the current worktree's pull request, off the loop (it asks the forge).
@@ -702,6 +721,71 @@ pub(crate) fn selected_review_task(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// THE-515 fixture: a real git repo named `acme` plus an isolated state
+    /// dir, and a config whose trusted overlay for it is ambiguous.
+    fn refused_acme() -> (
+        crate::testenv::EnvVarGuard,
+        tempfile::TempDir,
+        std::path::PathBuf,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        let env = crate::testenv::EnvVarGuard::set(&[("XDG_STATE_HOME", state.to_str().unwrap())]);
+        let repo = dir.path().join("acme");
+        std::fs::create_dir_all(&repo).unwrap();
+        #[expect(clippy::disallowed_methods)]
+        let ok = thegn_core::util::git_cmd(&repo)
+            .args(["init", "-q"])
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok);
+        (env, dir, repo)
+    }
+
+    #[test]
+    fn drive_refuses_an_ambiguous_overlay_before_any_forge_work() {
+        let (_env, _dir, repo) = refused_acme();
+        let mut cfg = Config::default();
+        cfg.pr_queue.enabled = true;
+        cfg.workspace.insert("acme".into(), Default::default());
+        cfg.workspace.insert("ACME".into(), Default::default());
+        let sent = std::cell::RefCell::new(Vec::new());
+        drive_blocking(&cfg, &repo, |m| sent.borrow_mut().push(m));
+        let sent = sent.into_inner();
+        assert_eq!(sent.len(), 1);
+        assert!(
+            matches!(&sent[0], PrqMsg::Failed(m) if m.contains("refused") && m.contains("`ACME`")),
+            "refusal must be reported, not a drive pass"
+        );
+    }
+
+    #[test]
+    fn drive_honours_the_repo_resolved_enabled_flag() {
+        // Ticker armed on the GLOBAL flag; the repo's own block turned it off.
+        let (_env, dir, repo) = refused_acme();
+        let mut cfg = Config::default();
+        cfg.pr_queue.enabled = true;
+        let mut ws = thegn_core::config::WorkspaceConfig::default();
+        ws.pr_queue.enabled = Some(false);
+        cfg.workspace.insert("acme".into(), ws);
+        let sent = std::cell::RefCell::new(Vec::new());
+        drive_blocking(&cfg, &repo, |m| sent.borrow_mut().push(m));
+        let sent = sent.into_inner();
+        assert_eq!(sent.len(), 1);
+        match &sent[0] {
+            PrqMsg::Done(out) => assert!(out.merged.is_empty()),
+            _ => panic!("a repo-disabled queue must be a no-op pass"),
+        }
+        // The pass stopped before touching state (the old code opened the DB
+        // and walked the queue rows toward the forge).
+        assert!(
+            !dir.path().join("state/thegn/thegn.db").exists(),
+            "a repo-disabled PR queue must not start a drive pass"
+        );
+    }
 
     fn row(key: &str, number: u64, status: &str) -> PrQueueRow {
         PrQueueRow {

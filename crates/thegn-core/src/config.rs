@@ -6603,6 +6603,34 @@ impl Config {
         crate::workspace_overlay::resolve(&self.workspace, Some(key))
     }
 
+    /// The trusted overlay for a TAB-namespace slug (`repo_slugs`, the key the
+    /// account / env-bundle consumers still carry until the RepositoryId
+    /// binding lands). Same as [`Self::workspace_overlay_for_key`], plus a
+    /// refusal when the registry shows the slug is synthetic (`repo`, `-N`)
+    /// or shared by several registered repositories. The registry is only
+    /// ever used to refuse; an unreadable registry refuses too.
+    pub fn workspace_overlay_for_tab_slug(
+        &self,
+        db: &crate::db::Db,
+        slug: &str,
+    ) -> crate::workspace_overlay::WorkspaceOverlay<'_> {
+        use crate::store::WorkspaceStore;
+        use crate::workspace_overlay::{OverlayRefusal, WorkspaceOverlay};
+        let base = self.workspace_overlay_for_key(slug);
+        if !matches!(base, WorkspaceOverlay::Selected { .. }) {
+            return base;
+        }
+        match db.repo_slug_rows() {
+            Ok(rows) => match crate::workspace_overlay::tab_slug_refusal(slug, &rows) {
+                Some(refusal) => WorkspaceOverlay::Refused(refusal),
+                None => base,
+            },
+            Err(_) => WorkspaceOverlay::Refused(OverlayRefusal::RegistryUnavailable {
+                key: slug.to_string(),
+            }),
+        }
+    }
+
     /// The refusal for a repository's trusted overlay, if selection is
     /// ambiguous. Effectful manual entry points (`thegn land`, `thegn
     /// integrate`, lifecycle hooks) bail on `Some`.
@@ -6620,11 +6648,25 @@ impl Config {
     /// layer takes effect on that path.
     pub fn repo_git(&self, repo_root: &Path) -> GitConfig {
         let mut git = self.git.clone();
-        // A refused overlay leaves the user's own global `[git]` in force.
-        if let Some(ws) = self.workspace_overlay(repo_root).overlay()
-            && !ws.git.is_empty()
-        {
-            ws.git.clone().apply(&mut git);
+        match self.workspace_overlay(repo_root) {
+            crate::workspace_overlay::WorkspaceOverlay::Selected { overlay, .. }
+                if !overlay.git.is_empty() =>
+            {
+                overlay.git.clone().apply(&mut git);
+            }
+            // Fail closed (THE-515): the refused block may have TIGHTENED
+            // git (submodules off, merge guard on, signing kept), so falling
+            // back to the global table could loosen it. Clamp every
+            // security-relevant knob to its strictest value instead;
+            // presentation knobs (backend, structural_diff) stay global.
+            crate::workspace_overlay::WorkspaceOverlay::Refused(_) => {
+                git.submodules = crate::config_git::SubmoduleMode::Off;
+                git.merge_guard = true;
+                git.override_gpg = false;
+                git.auto_fetch = false;
+                git.auto_fetch_colocated = false;
+            }
+            _ => {}
         }
         git
     }
