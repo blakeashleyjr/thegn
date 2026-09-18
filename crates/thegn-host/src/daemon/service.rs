@@ -465,7 +465,7 @@ impl ControlApi for DaemonService {
             // An agent launch resolves through the same pipeline the wizard
             // uses — sandbox, credentials, cap and all — so what runs here is
             // identical to what a TUI-launched agent runs. Blocking work
-            // (SQLite, sandbox prep, a bounded direnv warm), so it goes off the
+            // (SQLite and sandbox/provider preparation), so it goes off the
             // runtime's worker threads.
             // Keep only a memory-resident recipe for a later live fork. Raw
             // argv/env never enter a response, tombstone, or cache row. For an

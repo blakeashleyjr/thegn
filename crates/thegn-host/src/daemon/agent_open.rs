@@ -21,8 +21,8 @@
 //! already CPU-capped. A daemon-launched agent and a TUI-launched agent are the
 //! same thing by construction, not by parallel maintenance.
 //!
-//! Blocking (SQLite, sandbox preparation, a bounded direnv warm), so callers run
-//! it under `spawn_blocking`. That makes an agent-spawning `sessions.open`
+//! Blocking (SQLite and sandbox/provider preparation), so callers run it under
+//! `spawn_blocking`. That makes an agent-spawning `sessions.open`
 //! measurably slower than a raw-argv one — seconds, not milliseconds, on a cold
 //! worktree. That is the price of parity and it is worth paying.
 
