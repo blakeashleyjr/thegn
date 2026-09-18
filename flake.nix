@@ -449,36 +449,26 @@
         };
       };
 
-      # The two hook-adjacent bits of shell that git-hooks.nix itself doesn't do.
+      # The one hook-adjacent bit of shell that git-hooks.nix itself doesn't do.
       # Skipped on CI: every job runs `nix develop --command just <gate>` in a
-      # throwaway checkout whose hooks are never fired, so installing them there
-      # is pure noise.
+      # throwaway checkout whose hooks are never fired, so this diagnostic is
+      # pure noise there. The detector is in the Nix store: it never executes a
+      # file from the checkout and never mutates a hook or configuration file.
       hookExtras = ''
         if [ -z "''${CI:-}" ]; then
-          # Backstop for a missing config: if a worktree's gitignored
-          # .pre-commit-config.yaml symlink is absent or dangling (the
-          # post-checkout seed hasn't run, or a flake re-lock left it pointing at
-          # a gone store path), let prek SKIP its hooks rather than abort the
-          # commit. Harmless where the config is present — prek runs the hooks as
-          # usual; the real gate is pre-push (clippy/test/smoke). Mirrors the
-          # PREK_ALLOW_NO_CONFIG injected into thegn sandboxes
+          # Backstop for a missing config: let prek SKIP its hooks rather than
+          # abort the commit. This is optional developer compatibility only; the
+          # real gates remain pre-push (clippy/test/smoke) and CI/merge checks.
+          # Mirrors the PREK_ALLOW_NO_CONFIG injected into thegn sandboxes
           # (crates/thegn-core/src/sandbox.rs).
           export PREK_ALLOW_NO_CONFIG=1
 
-          # Install the post-checkout hook into the effective (shared) hooks dir
-          # so the prek hooks work in EVERY worktree. prek needs
-          # .pre-commit-config.yaml in each worktree root, but the store symlink
-          # is only materialized in the checkout where the shell is entered; the
-          # hook seeds it into every other worktree on `git worktree add`. Copied
-          # (not symlinked) so it doesn't depend on any one worktree's path, and
-          # refreshed on every entry so it self-heals. See
-          # test/git-hooks/post-checkout.sh.
-          hooks_dir=$(git config core.hooksPath 2>/dev/null || true)
-          [ -n "$hooks_dir" ] || hooks_dir=$(git rev-parse --git-common-dir 2>/dev/null)/hooks
-          if [ -d "$hooks_dir" ] && [ -f test/git-hooks/post-checkout.sh ]; then
-            install -m 0755 test/git-hooks/post-checkout.sh "$hooks_dir/post-checkout"
+          # Do not install or invoke a checkout hook. Report an old exact legacy
+          # installation only through immutable trusted code; cleanup is an
+          # explicit user action after review and is never performed here.
+          if ! ${pkgs.python3}/bin/python3 ${./nix/detect-legacy-post-checkout.py}; then
+            echo "thegn: legacy checkout-hook detector could not complete; inspect the repository-local hooks directory manually" >&2
           fi
-          unset hooks_dir
         fi
       '';
 
@@ -770,9 +760,9 @@
           # read-only /nix with PREK_ALLOW_NO_CONFIG already injected, and must
           # never reach out to install hooks in the host's shared hooks dir.
           ++ preCommit.enabledPackages;
-        # hookExtras runs AFTER preCommit.shellHook: git-hooks.nix rewrites
-        # core.hooksPath as its last act, and the post-checkout installer has to
-        # land in whatever dir it settled on.
+        # hookExtras runs AFTER preCommit.shellHook so its read-only legacy
+        # diagnostic sees the final generated-hook configuration. It does not
+        # install a checkout hook or inspect custom/shared hooksPath targets.
         shellHook = devShellHook + mingwCrossEnv + preCommit.shellHook + hookExtras;
       };
 

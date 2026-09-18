@@ -679,14 +679,16 @@ lint: ratchets
     # of them ours.
     git ls-files -z '*.toml' | xargs -0 taplo lint
 
-# Repair a wedged checkout: strip a stray `core.worktree` that an external
+# Explicit developer repair only (never a checkout hook): strip a stray
+# `core.worktree` that an external
 # worktree tool (herdr) or a GIT_*-exporting child leaked into the shared
 # `.git/config`. Symptom: `git add`/`commit`/`status` mis-target another tree,
 # or (once the leaked path is deleted) git aborts with "Invalid path" / "must be
 # run in a work tree". Pure-text repair — needs no working git, so it fixes the
 # case a pre-commit hook can't (git dies before hooks run). Same key thegn heals
 # in-process at startup + on worktree switch; this covers manual/CI git. No-op
-# when clean.
+# when clean. This shell command is not generation-fenced or race-safe; shared
+# config repair belongs to THE-371. Review the checkout and invoke it deliberately.
 heal-git:
     sh test/git-hooks/heal-worktree.sh -v || true
     @top=$(git rev-parse --show-toplevel 2>/dev/null) && echo "heal-git: ok — worktree $top" || echo "heal-git: git still wedged — inspect .git/config by hand"

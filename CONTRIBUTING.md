@@ -49,7 +49,20 @@ If something is off, `just doctor` diagnoses the dev environment.
 **Enter the dev shell once, right after cloning** (`nix develop`, or `direnv
 allow` to auto-enter per-cd). The pre-commit / pre-push git hooks are generated
 and installed by the dev shell — a bare clone that never enters it silently has
-no hooks, so formatting and the heavy gates won't run until you push into CI.
+no local gates, so formatting and the heavy gates won't run until you push into
+CI. The dev shell does not install a `post-checkout` hook: checkout and
+worktree creation never execute scripts from the selected branch. Linked
+worktrees may not have the generated, gitignored prek config; review the
+worktree first and seed/configure it explicitly if you want optional local
+prek hooks there. These developer hooks are convenience gates only; CI and
+explicit merge gates remain authoritative.
+
+If upgrading a checkout that already has the old Thegn `post-checkout` hook,
+retire it explicitly after reviewing the path and its digest. The shell reports
+the exact known legacy regular file in the canonical repository's ordinary
+`.git/hooks` directory, but never deletes it. Do not inspect or remove a
+custom, global, shared, symlink, directory, FIFO, or foreign hook automatically.
+An old installed copy remains unsafe until a user explicitly removes it.
 
 The heavy gates are full-workspace compiles — don't run them per-edit:
 
