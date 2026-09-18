@@ -86,9 +86,11 @@ pub struct PipelineStage {
     /// entry's `env` (same `env:`/`file:` secret expansion).
     pub env: BTreeMap<String, String>,
     /// Per-stage headless tool allow-list; replaces the agent entry's
-    /// `permissions` when non-empty. At launch thegn writes the effective
-    /// list into the harness's per-worktree settings file and does NOT
-    /// interpret the strings — they are the harness's own vocabulary
+    /// `permissions` when non-empty. The effective list rides the launch
+    /// command through the harness's command-scoped grant (claude:
+    /// `--settings`) — nothing is written into the worktree — and a harness
+    /// without one refuses the dispatch before a roster row exists. thegn does
+    /// NOT interpret the strings — they are the harness's own vocabulary
     /// (`Bash(git status:*)`, `Read`, `mcp__srv__tool`). Empty = the entry's
     /// list, if any.
     pub permissions: Vec<String>,

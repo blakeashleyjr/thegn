@@ -1816,10 +1816,12 @@ pub struct NamedCommand {
     /// (`PI_CODING_AGENT_DIR`). A stage's `env` is layered on top, key by key.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, String>,
-    /// Headless tool allow-list seeded into the worktree at launch (for the
-    /// `claude` harness: `.claude/settings.local.json` → `permissions.allow`).
-    /// Empty = leave the worktree's file alone. A stage's `permissions`
-    /// replaces (not merges) this list.
+    /// Tool allow-list granted to this entry's launches, command-scoped: it
+    /// rides the harness's own per-process mechanism (claude: `--settings`
+    /// with `permissions.allow`, merged with — never replacing — the user's
+    /// and repository's settings) and is never written into the worktree. A
+    /// harness with no such mechanism refuses the launch (fail closed). Empty
+    /// = no grant. A stage's `permissions` replaces (not merges) this list.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub permissions: Vec<String>,
     /// Resume this agent's most recent session on session resurrection, when its

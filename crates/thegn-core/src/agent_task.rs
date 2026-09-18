@@ -645,7 +645,9 @@ pub struct EffectiveAgent {
     pub model: Option<String>,
     /// The env overlay, values still in their `env:`/`file:` form.
     pub env: BTreeMap<String, String>,
-    /// The headless tool allow-list to seed (empty = leave alone).
+    /// The tool allow-list granted to this launch through the harness's
+    /// command-scoped mechanism ([`EffectiveAgent::permission_args`]); empty =
+    /// no grant. Never written to the worktree (THE-440).
     pub permissions: Vec<String>,
     /// The entry's `route_via_proxy` (a bare harness id never routes).
     pub route_via_proxy: bool,
@@ -653,20 +655,46 @@ pub struct EffectiveAgent {
 
 impl EffectiveAgent {
     /// The command to launch interactively: the entry's command plus the model
-    /// flag when a model is set.
+    /// flag when a model is set, plus the command-scoped permission grant.
     pub fn interactive_command(&self) -> Result<String, String> {
-        with_model(&self.command, &self.harness, self.model.as_deref())
+        let cmd = with_model(&self.command, &self.harness, self.model.as_deref())?;
+        Ok(format!("{cmd}{}", self.permission_args()?))
     }
 
     /// The headless command **template** (still carries `{prompt}`): the
     /// harness's headless form (or the `{command} {prompt}` fallback) plus the
-    /// model flag. Substitute with [`substitute_command`].
+    /// model flag and the command-scoped permission grant. Substitute with
+    /// [`substitute_command`].
     pub fn headless_template(&self) -> Result<String, String> {
-        with_model(
+        let cmd = with_model(
             &headless_command(&self.harness, &self.command),
             &self.harness,
             self.model.as_deref(),
-        )
+        )?;
+        // The grant is literal text in a template: escape its braces (a JSON
+        // object) so substitution renders it verbatim instead of reading a
+        // placeholder out of it.
+        let grant = self
+            .permission_args()?
+            .replace('{', "{{")
+            .replace('}', "}}");
+        Ok(format!("{cmd}{grant}"))
+    }
+
+    /// The permission grant as a command-line suffix (leading space, each
+    /// token shell-quoted), or `""` when no `permissions` are configured.
+    ///
+    /// The grant is **command-scoped**: it rides this one process's argv
+    /// through the harness's documented per-session mechanism
+    /// ([`crate::harness::Harness::session_permission_args`]) — nothing is
+    /// written to the worktree, so a repository-controlled path can never
+    /// redirect it, concurrent launches cannot inherit one another's grant,
+    /// and nothing persists past the process. A harness without such a
+    /// mechanism is an `Err` (fail closed): the list is never silently
+    /// dropped, never written to a file, and never replaced by a
+    /// skip-permissions mode.
+    pub fn permission_args(&self) -> Result<String, String> {
+        permission_suffix(&self.harness, &self.permissions)
     }
 
     /// The env overlay with secrets expanded, in key order. A value the secret
@@ -706,6 +734,29 @@ pub fn with_model(command: &str, harness: &str, model: Option<&str>) -> Result<S
         "{command} {}",
         flag.replace("{model}", &util::sh_quote(model))
     ))
+}
+
+/// Render `allow` for `harness` as a shell-quoted command-line suffix (see
+/// [`EffectiveAgent::permission_args`]). Empty `allow` ⇒ `""`.
+pub fn permission_suffix(harness: &str, allow: &[String]) -> Result<String, String> {
+    if allow.is_empty() {
+        return Ok(String::new());
+    }
+    let args = crate::harness::harness(harness)
+        .and_then(|h| h.session_permission_args(allow))
+        .ok_or_else(|| {
+            format!(
+                "permission policy hold: harness {harness:?} has no command-scoped permission \
+                 mechanism thegn can attest, so `permissions` cannot be granted to this launch \
+                 (thegn never writes them into the worktree and never drops them silently) — \
+                 remove `permissions` from this agent/stage or run it on a harness that \
+                 supports it (claude)"
+            )
+        })?;
+    Ok(args
+        .iter()
+        .map(|a| format!(" {}", util::sh_quote(a)))
+        .collect())
 }
 
 /// Resolve `agent` (an entry name, else a launchable bare harness id) and
@@ -812,6 +863,9 @@ pub fn validate_agent_models(cfg: &Config) -> Vec<String> {
             {
                 out.push(format!("[[{section}]] {:?}.model: {why}", e.name));
             }
+            if let Err(why) = permission_suffix(&provider_id(e), &e.permissions) {
+                out.push(format!("[[{section}]] {:?}.permissions: {why}", e.name));
+            }
             for k in e.env.keys() {
                 if !env_key_ok(k) {
                     out.push(format!(
@@ -842,6 +896,17 @@ pub fn validate_agent_models(cfg: &Config) -> Vec<String> {
                     "{label}.env: {k:?} is not an environment variable name"
                 ));
             }
+        }
+        // The EFFECTIVE list on the EFFECTIVE harness: a stage that swaps the
+        // harness inherits the entry's list, which the new harness may not be
+        // able to grant. Only reported when the stage itself is the cause
+        // (its own list, or its harness swap) — the entry's own mismatch is
+        // reported once above.
+        if (!s.permissions.is_empty() || s.harness.as_deref().is_some_and(|h| !h.trim().is_empty()))
+            && let Ok(eff) = effective_agent(cfg, &s.agent, s.stage_name())
+            && let Err(why) = eff.permission_args()
+        {
+            out.push(format!("{label}.permissions: {why}"));
         }
     }
     out
@@ -1028,11 +1093,12 @@ mod tests {
         assert_eq!(plain.permissions, vec!["Read"]);
         assert_eq!(
             plain.interactive_command().unwrap(),
-            "claude --model claude-sonnet-5"
+            r#"claude --model claude-sonnet-5 --settings '{"permissions":{"allow":["Read"]}}'"#
         );
         assert_eq!(
             plain.headless_template().unwrap(),
-            "claude -p {prompt} --permission-mode acceptEdits --model claude-sonnet-5"
+            "claude -p {prompt} --permission-mode acceptEdits --model claude-sonnet-5 \
+             --settings '{{\"permissions\":{{\"allow\":[\"Read\"]}}}}'"
         );
 
         let staged = effective_agent(&cfg, "worker", Some("review")).unwrap();
@@ -1071,8 +1137,27 @@ mod tests {
         let swapped = effective_agent(&cfg, "worker", Some("code")).unwrap();
         assert_eq!(swapped.harness, "pi");
         assert_eq!(swapped.command, "pi");
+        // The entry's claude allow-list is inherited by the pi stage, which
+        // has no command-scoped grant: refused (fail closed), never dropped.
+        for rendered in [swapped.headless_template(), swapped.interactive_command()] {
+            assert!(
+                rendered.unwrap_err().contains("permission policy hold"),
+                "an unattestable grant must refuse the launch command"
+            );
+        }
+        assert!(
+            validate_agent_models(&cfg)
+                .iter()
+                .any(|e| e.contains("(\"code\").permissions") && e.contains("\"pi\"")),
+            "{:?}",
+            validate_agent_models(&cfg)
+        );
+        let ungranted = EffectiveAgent {
+            permissions: Vec::new(),
+            ..swapped.clone()
+        };
         assert_eq!(
-            swapped.headless_template().unwrap(),
+            ungranted.headless_template().unwrap(),
             "pi -p {prompt} --model model-proxy/fast"
         );
         let mut bad = crate::config_pipeline::PipelineStage {
@@ -1097,6 +1182,75 @@ mod tests {
                 .unwrap_err()
                 .contains("unknown agent")
         );
+    }
+
+    /// The grant rides the command as shell-quoted argv: hostile patterns
+    /// (quotes, `$()`, braces, spaces) survive template substitution and come
+    /// back byte-identical as one JSON argument, and an empty list adds
+    /// nothing at all.
+    #[test]
+    fn permission_grant_is_quoted_argv_that_survives_substitution() {
+        let hostile = vec![
+            "Bash(echo 'x' \"$(id)\" `id`; rm -rf ~)".to_string(),
+            "Read({prompt})".to_string(),
+            "Edit(src/**)".to_string(),
+        ];
+        let eff = EffectiveAgent {
+            name: "claude".into(),
+            command: "claude".into(),
+            harness: "claude".into(),
+            permissions: hostile.clone(),
+            ..EffectiveAgent::default()
+        };
+        let expected_json = serde_json::json!({ "permissions": { "allow": hostile } }).to_string();
+        let suffix = format!(" --settings {}", util::sh_quote(&expected_json));
+        assert_eq!(eff.permission_args().unwrap(), suffix);
+        assert_eq!(
+            eff.interactive_command().unwrap(),
+            format!("claude{suffix}")
+        );
+        // Substitution unescapes the template braces back to the exact JSON,
+        // and the `{prompt}` inside a PATTERN is data, not a placeholder.
+        let rendered =
+            substitute_command(&eff.headless_template().unwrap(), "do it", &TaskVars::new())
+                .unwrap();
+        assert_eq!(
+            rendered,
+            format!("claude -p 'do it' --permission-mode acceptEdits{suffix}")
+        );
+        let empty = EffectiveAgent {
+            permissions: Vec::new(),
+            ..eff
+        };
+        assert_eq!(empty.permission_args().unwrap(), "");
+        assert_eq!(empty.interactive_command().unwrap(), "claude");
+        assert_eq!(permission_suffix("pi", &[]).unwrap(), "");
+    }
+
+    /// Every harness without an attested command-scoped mechanism refuses a
+    /// non-empty list, and `config validate` reports the entry.
+    #[test]
+    fn permissions_on_a_harness_without_a_grant_mechanism_fail_closed() {
+        for h in ["codex", "pi", "aider", "antigravity", "frobnicate"] {
+            let err = permission_suffix(h, &["Read".to_string()]).unwrap_err();
+            assert!(err.contains("permission policy hold"), "{h}: {err}");
+            assert!(err.contains(h), "{h}: {err}");
+        }
+        let mut cfg = Config::default();
+        let mut e = entry("coder", "pi");
+        e.permissions = vec!["Read".into()];
+        cfg.agents.push(e);
+        let errs = validate_agent_models(&cfg);
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("[[agents]] \"coder\".permissions")),
+            "{errs:?}"
+        );
+        let mut ok = Config::default();
+        let mut c = entry("rev", "claude");
+        c.permissions = vec!["Read".into()];
+        ok.agents.push(c);
+        assert!(validate_agent_models(&ok).is_empty());
     }
 
     #[test]
