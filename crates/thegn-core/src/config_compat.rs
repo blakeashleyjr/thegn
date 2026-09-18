@@ -4,6 +4,7 @@
 //! the raw-document boundary lets us diagnose duplicate canonical/legacy keys
 //! while keeping the internal `Workspace*` names stable.
 
+use serde::Serialize;
 use std::collections::BTreeMap;
 
 /// Legacy spellings remain accepted for three stable releases.
@@ -78,8 +79,21 @@ pub fn normalize_admission(body: &str) -> Result<NormalizedToml, NormalizeError>
 
     normalize_project_tables(root, &mut diagnostics);
 
-    let body = toml::to_string(&value)
+    // TOML's serializer writes into a caller-owned String.  Give it a buffer
+    // whose capacity is the explicit normalized-source ceiling before any
+    // compatibility-expanded document is serialized; do not let the helper's
+    // unconstrained `to_string()` grow an arbitrary intermediate buffer.
+    let encoded_bound = encoded_upper_bound(&value).map_err(NormalizeError::Budget)?;
+    let mut body = String::with_capacity(encoded_bound);
+    let initial_capacity = body.capacity();
+    value
+        .serialize(toml::ser::Serializer::new(&mut body))
         .map_err(|error| NormalizeError::Serialize(format!("cannot normalize config: {error}")))?;
+    if body.capacity() > initial_capacity {
+        return Err(NormalizeError::Budget(
+            crate::config_budget::BudgetError::AggregateBytes,
+        ));
+    }
     if body.len() > crate::config_budget::MAX_NORMALIZED_BYTES {
         return Err(NormalizeError::Budget(
             crate::config_budget::BudgetError::AggregateBytes,
@@ -188,6 +202,56 @@ fn normalize_project_tables(
             );
         }
     }
+}
+
+fn encoded_upper_bound(value: &toml::Value) -> Result<usize, crate::config_budget::BudgetError> {
+    fn add(total: &mut usize, amount: usize) -> Result<(), crate::config_budget::BudgetError> {
+        *total = total
+            .checked_add(amount)
+            .filter(|value| *value <= crate::config_budget::MAX_NORMALIZED_BYTES)
+            .ok_or(crate::config_budget::BudgetError::AggregateBytes)?;
+        Ok(())
+    }
+
+    fn string_bytes(value: &str) -> Result<usize, crate::config_budget::BudgetError> {
+        value
+            .len()
+            .checked_mul(6)
+            .and_then(|value| value.checked_add(2))
+            .filter(|value| *value <= crate::config_budget::MAX_NORMALIZED_BYTES)
+            .ok_or(crate::config_budget::BudgetError::AggregateBytes)
+    }
+
+    fn walk(value: &toml::Value) -> Result<usize, crate::config_budget::BudgetError> {
+        let mut total = 0;
+        match value {
+            toml::Value::String(value) => add(&mut total, string_bytes(value)?)?,
+            toml::Value::Integer(_) => add(&mut total, 32)?,
+            toml::Value::Float(_) => add(&mut total, 64)?,
+            toml::Value::Boolean(_) => add(&mut total, 8)?,
+            toml::Value::Datetime(_) => add(&mut total, 64)?,
+            toml::Value::Array(values) => {
+                add(&mut total, 2)?;
+                for value in values {
+                    add(&mut total, walk(value)?)?;
+                    add(&mut total, 2)?;
+                }
+            }
+            toml::Value::Table(values) => {
+                for (key, value) in values {
+                    // A nested TOML table repeats ancestor keys in each
+                    // header; 128 is above the scanner's depth ceiling and
+                    // therefore bounds every possible path repetition.
+                    add(&mut total, string_bytes(key)?.saturating_mul(128))?;
+                    add(&mut total, walk(value)?)?;
+                    add(&mut total, 32)?;
+                }
+            }
+        }
+        Ok(total)
+    }
+
+    walk(value)
 }
 
 fn push_diagnostic(diagnostics: &mut Vec<String>, diagnostic: String) {
