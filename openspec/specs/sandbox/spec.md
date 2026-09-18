@@ -11,7 +11,7 @@ gracefully across the available container/sandbox runtimes.
 
 ### Requirement: Graceful backend selection
 
-The sandbox SHALL select an isolation backend by preference order podman -> docker -> bwrap -> none, MUST fall back to the next when a runtime is unavailable, and MUST fall back to `none` (run on the host) rather than failing to launch when no backend exists. Every fallback MUST be reported truthfully: the containment reported for a launch MUST describe what that launch actually entered, never what was requested.
+The sandbox SHALL select an isolation backend by preference order podman -> docker -> bwrap -> none, and MUST fall back to the next when a runtime is unavailable. When no backend is runnable, an `auto` selection on a LOCAL placement MUST fall back to `none` (run on the host) only when the user's configured `backend_chain` itself names `host`/`none` (the default chain does); otherwise, and for every explicit backend, dropped env selection, or non-local placement, the launch MUST halt with an actionable error instead of opening a host shell. `failover = "auto"` MUST NOT authorize host execution. Every fallback MUST be reported truthfully: the containment reported for a launch MUST describe what that launch actually entered, never what was requested.
 
 #### Scenario: Preferred runtime missing
 
@@ -20,9 +20,21 @@ The sandbox SHALL select an isolation backend by preference order podman -> dock
 
 #### Scenario: No runtime available
 
-- **WHEN** none of podman, docker, or bwrap is available
+- **WHEN** none of podman, docker, or bwrap is available and `backend_chain`
+  names `host` (the default)
 - **THEN** the process runs with backend `none` on the host and the worktree is
   still usable
+
+#### Scenario: Chain without host refuses
+
+- **WHEN** no backend is runnable and the configured `backend_chain` does not name `host`
+- **THEN** the launch halts with an actionable error and no host shell is opened
+
+#### Scenario: Failover auto does not authorize the host
+
+- **WHEN** a selected env is undefined, or a provider/ssh/k8s env fails to come
+  up, and `failover = "auto"`
+- **THEN** the launch halts rather than degrading to a host shell
 
 #### Scenario: Fallback is reported, not hidden
 
@@ -820,8 +832,8 @@ be configurable for users who want one answer every time.
 
 #### Scenario: The user has already accepted degrading
 
-- **WHEN** a dormant runtime is found but the backend is `auto`, failover is
-  `auto`, or the worktree is pinned to the host
+- **WHEN** a dormant runtime is found but the backend is `auto` or the worktree
+  is pinned to the host
 - **THEN** no prompt is raised and the launch proceeds, because that policy is a
   standing answer to the same question
 

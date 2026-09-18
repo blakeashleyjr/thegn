@@ -6,9 +6,11 @@ fn sandbox_resolution_does_not_authorize_implicit_host_fallback() {
     use thegn_core::placement::Placement;
 
     let local = Placement::Local;
-    let mut requested = SandboxConfig::default();
-    requested.enabled = true;
-    requested.backend = SandboxBackend::Auto;
+    let mut requested = SandboxConfig {
+        enabled: true,
+        backend: SandboxBackend::Auto,
+        ..Default::default()
+    };
     assert!(!host_fallback_allowed(&local, &requested, false));
     assert!(host_fallback_allowed(&local, &requested, true));
 
@@ -20,12 +22,53 @@ fn sandbox_resolution_does_not_authorize_implicit_host_fallback() {
 }
 
 #[test]
+fn on_missing_fail_refuses_the_pane_instead_of_exiting() {
+    with_temp_state("auto-host-on-missing-fail", || {
+        let mut cfg = cfg_with(&[], &[]);
+        cfg.sandbox.backend = thegn_core::config::SandboxBackend::Auto;
+        cfg.sandbox.backend_chain = vec!["host".to_string()];
+        cfg.sandbox.on_missing = thegn_core::config::OnMissing::Fail;
+        let worktree =
+            std::env::temp_dir().join(format!("tg-agent-on-missing-{}", std::process::id()));
+        // Before: `msg::die` exited the test process here.
+        let err = launch_spec(&cfg, &worktree.to_string_lossy(), None, "shell")
+            .expect_err("on_missing = fail refuses the pane");
+        assert!(format!("{err:#}").contains("on_missing"), "{err:#}");
+    });
+}
+
+#[test]
+fn automatic_prewarm_keeps_remote_native_specs() {
+    let spec = |remote| LaunchSpec {
+        argv: vec!["ssh".into()],
+        cwd: None,
+        env: Vec::new(),
+        backend: "host".into(),
+        warnings: Vec::new(),
+        degraded: false,
+        remote,
+    };
+    // A remote native pane labels itself `host` but is not a local host shell.
+    let mut remote = Ok(vec![(1, spec(true))]);
+    reject_host_prewarm(&mut remote);
+    assert!(remote.is_ok());
+    let mut local = Ok(vec![(1, spec(false))]);
+    reject_host_prewarm(&mut local);
+    assert!(matches!(
+        local,
+        Err(crate::handlers::provision::SpecError::PrewarmSkipped)
+    ));
+}
+
+#[test]
 fn only_a_configured_auto_chain_naming_the_host_lands_there() {
     use thegn_core::config::{SandboxBackend, SandboxConfig};
 
-    let mut sb = SandboxConfig::default();
-    sb.enabled = true;
-    sb.backend = SandboxBackend::Auto;
+    let mut sb = SandboxConfig {
+        enabled: true,
+        backend: SandboxBackend::Auto,
+        ..Default::default()
+    };
     // The default chain ends in `host`: landing there is configured, not a fallback.
     assert!(auto_chain_names_host(&sb));
     sb.backend_chain = vec!["none".into()];
@@ -48,8 +91,9 @@ fn auto_chain_without_host_halts_instead_of_opening_a_host_shell() {
     with_temp_state("auto-no-host", || {
         let mut cfg = cfg_with(&[], &[]);
         cfg.sandbox.backend = thegn_core::config::SandboxBackend::Auto;
-        // `apple` is a real backend whose binary is absent on Linux.
-        cfg.sandbox.backend_chain = vec!["apple".to_string()];
+        // `wsl` is a reserved kind: the chain skips it outright on every OS, so
+        // no runtime is probed and only the implicit host tail remains.
+        cfg.sandbox.backend_chain = vec!["wsl".to_string()];
         let worktree =
             std::env::temp_dir().join(format!("tg-agent-auto-no-host-{}", std::process::id()));
         let err = launch_spec(&cfg, &worktree.to_string_lossy(), None, "shell")
@@ -101,7 +145,8 @@ exec_command = ["fixture-exec", "{id}", "--"]
         .expect("native ssh resolution does not need a host fallback");
         assert!(ssh.spec.is_some());
         assert!(ssh.is_remote);
-        // `Backend::None` labels itself "host"; `is_remote` is what proves no local shell.
+        // `Backend::None` labels itself "host"; `is_remote` (and LaunchSpec.remote)
+        // is what distinguishes it from a local host shell for prewarm.
         assert_eq!(ssh.backend_label, "host");
 
         // The provider fixture is likewise resolved by its injected static
@@ -122,10 +167,11 @@ exec_command = ["fixture-exec", "{id}", "--"]
 
         // A disabled remote environment still has a remote placement and must
         // not turn a missing nested backend into a local host shell: it either
-        // stays remote or halts (the unreachable fixture host halts).
+        // halts (a disabled sandbox resolves no remote spec, so the non-local
+        // no-candidate halt fires).
         let mut disabled = cfg.clone();
         disabled.sandbox.enabled = false;
-        match prepare_sandbox_env(
+        let err = prepare_sandbox_env(
             &disabled,
             Path::new("/repo"),
             "/local/worktree",
@@ -133,16 +179,12 @@ exec_command = ["fixture-exec", "{id}", "--"]
             None,
             false,
             Some("ssh"),
-        ) {
-            Ok(outcome) => {
-                assert!(outcome.spec.is_some());
-                assert!(outcome.is_remote);
-            }
-            Err(e) => assert!(
-                e.downcast_ref::<crate::agent::SandboxHalt>().is_some(),
-                "a refusal, not a local host shell: {e:#}"
-            ),
-        }
+        )
+        .expect_err("a disabled remote env refuses rather than opening a local shell");
+        assert!(
+            err.downcast_ref::<crate::agent::SandboxHalt>().is_some(),
+            "{err:#}"
+        );
     });
 }
 
@@ -157,6 +199,7 @@ fn automatic_prewarm_rejects_host_specs_but_keeps_contained_specs() {
             backend: "host".into(),
             warnings: Vec::new(),
             degraded: false,
+            remote: false,
         },
     )]);
     reject_host_prewarm(&mut host);
@@ -174,6 +217,7 @@ fn automatic_prewarm_rejects_host_specs_but_keeps_contained_specs() {
             backend: "bwrap".into(),
             warnings: Vec::new(),
             degraded: false,
+            remote: false,
         },
     )]);
     reject_host_prewarm(&mut contained);
@@ -211,10 +255,11 @@ fn automatic_prewarm_rejects_host_reintroduced_by_remembered_agent_relaunch() {
                         backend: "bwrap".into(),
                         warnings: Vec::new(),
                         degraded: false,
+                        remote: false,
                     },
                 )])
             },
-            || Vec::<crate::handlers::worktree_attach::AttachTarget>::new(),
+            Vec::<crate::handlers::worktree_attach::AttachTarget>::new,
             |specs, first_leaf, attach_is_empty| {
                 crate::handlers::worktree_launch::apply_relaunch(
                     specs,
@@ -272,6 +317,10 @@ fn focused_host_launch_remains_an_explicit_positive_control() {
 
 #[cfg(unix)]
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "test fixture: a blocking wait on a fake binary is the positive control"
+)]
 fn automatic_prewarm_drains_host_result_without_spawning_or_evaluating() {
     use std::os::unix::fs::PermissionsExt;
 
@@ -369,7 +418,7 @@ fn automatic_prewarm_drains_host_result_without_spawning_or_evaluating() {
                 })
                 .map_err(crate::handlers::provision::spec_err)
             },
-            || Vec::<crate::handlers::worktree_attach::AttachTarget>::new(),
+            Vec::<crate::handlers::worktree_attach::AttachTarget>::new,
             |specs, first_leaf, attach_is_empty| {
                 crate::handlers::worktree_launch::apply_relaunch(
                     specs,
@@ -479,6 +528,10 @@ fn automatic_prewarm_drains_host_result_without_spawning_or_evaluating() {
 
 #[cfg(unix)]
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "test fixture: a blocking wait on a fake binary is the positive control"
+)]
 fn removed_direnv_warm_is_inert_across_launch_seams_and_cache_leaf_shapes() {
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::{FileTypeExt, PermissionsExt, symlink};
@@ -1986,6 +2039,7 @@ fn inject_devshell_host_prepends_path_and_merges_vars() {
         backend: "host".into(),
         warnings: vec![],
         degraded: false,
+        remote: false,
     };
     // `inject_devshell_host` prepends to the *process* PATH, so set a known
     // base under the env guard. Without restoring it, `/usr/bin:/bin` would

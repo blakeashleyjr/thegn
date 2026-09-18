@@ -43,7 +43,8 @@ pub(crate) type ProvisionProgress = (String, usize, Vec<LoadStep>);
 /// [`SandboxHalt`](crate::agent::SandboxHalt) (so the receiver can raise the
 /// warning modal) and stringifies everything else.
 pub(crate) enum SpecError {
-    Halt(crate::agent::SandboxHalt),
+    /// Boxed: `SandboxHalt` is large and every spec closure returns this error.
+    Halt(Box<crate::agent::SandboxHalt>),
     Other(String),
     /// Benign automatic pre-warm skip (provider env not provisioned yet, or
     /// host execution was the only fresh spec). Clears `prewarm_inflight` on
@@ -56,7 +57,7 @@ pub(crate) enum SpecError {
 /// keeping the typed halt when present.
 pub(crate) fn spec_err(e: anyhow::Error) -> SpecError {
     match sandbox_halt_in(&e) {
-        Some(h) => SpecError::Halt(h.clone()),
+        Some(h) => SpecError::Halt(Box::new(h.clone())),
         None => SpecError::Other(e.to_string()),
     }
 }
@@ -935,6 +936,7 @@ mod tests {
             backend: "host".into(),
             warnings: Vec::new(),
             degraded: false,
+            remote: false,
         };
         spec_tx
             .send(SpecBatch {
@@ -1281,6 +1283,7 @@ mod tests {
             backend: "host".into(),
             warnings: Vec::new(),
             degraded: false,
+            remote: false,
         };
         // Leaf 99 belonged to the tab that was closed; index 1 now names a
         // different, live tab (leaf 6).

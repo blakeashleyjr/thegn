@@ -120,6 +120,11 @@ pub struct LaunchSpec {
     /// A managed-PROVIDER env failed and an explicit run-on-host choice dropped
     /// this launch to the host — drives the `provider_degraded` notification.
     pub degraded: bool,
+    /// The pane runs on a non-local placement (ssh/k8s/provider). A remote
+    /// native `Backend::None` still labels itself `host`, so "is this a LOCAL
+    /// host shell?" is `backend == "host" && !remote` — see
+    /// [`reject_host_prewarm`].
+    pub remote: bool,
 }
 
 impl LaunchSpec {
@@ -175,7 +180,8 @@ impl std::fmt::Display for SandboxHalt {
         let allow = if self.ask {
             "choose \"run on host\", or explicitly set the sandbox backend to `none`"
         } else {
-            "explicitly select host execution (`backend = \"none\"`) or fix the sandbox"
+            "explicitly select host execution (`backend = \"none\"`, or list \"host\" in \
+             `backend_chain`) or fix the sandbox"
         };
         write!(
             f,
@@ -830,7 +836,9 @@ pub fn prepare_sandbox_env(
     // `failover = "auto"` is not a permission to bypass containment.
     if placement.is_local() && !degrade_allowed {
         // Only an explicit containment choice counts as asking for this recovery
-        // path. An automatic chain miss is handled by the actionable halt below.
+        // path; reached only by an auto chain that names the host (the halt
+        // above refuses every other miss), so `wanted` is false and this never
+        // nags a default config.
         let wanted = explicit_backend.is_some();
         let report = thegn_core::sandbox_support::support_report(
             &sb.backend_chain,
@@ -899,6 +907,20 @@ pub fn prepare_sandbox_env(
     // that the user did not request. Keep the notice for genuine auto-chain
     // fallback, while preserving the isolation-floor admission above.
     if sb.enabled && sb.backend != thegn_core::config::SandboxBackend::None {
+        // `on_missing = "fail"` refuses THIS pane. The shared notice would
+        // `msg::die` — exiting the whole TUI from a (possibly automatic prewarm)
+        // worker thread with the terminal still in raw mode.
+        if sb.on_missing == thegn_core::config::OnMissing::Fail {
+            return Err(SandboxHalt {
+                env_name: env_name.clone(),
+                placement: placement_label.clone(),
+                reason: "no container backend available and `[sandbox] on_missing = \"fail\"`"
+                    .to_string(),
+                ask: false,
+                dormant: None,
+            }
+            .into());
+        }
         thegn_core::sandbox_backend::host_fallback_notice(&sb, &exec_placement);
     }
     if sb.enabled && auto_choice && warnings.is_empty() {
@@ -3034,6 +3056,7 @@ pub fn compose_spec(
     // transport whose argv shape can't be read from here (see `sandbox_truth`).
     let local =
         sb.spec.as_ref().is_none_or(|s| s.placement.is_local()) && provider_session.is_none();
+    let remote = sb.spec.as_ref().is_some_and(|s| !s.placement.is_local());
     let truth = local.then(|| thegn_core::sandbox_truth::reconcile(&sb.backend_label, &argv));
     let backend = match truth {
         Some(t) => {
@@ -3053,6 +3076,7 @@ pub fn compose_spec(
         backend,
         warnings,
         degraded,
+        remote,
     })
 }
 
@@ -3152,10 +3176,11 @@ pub(crate) fn prewarm_spec(cfg: &Config, worktree: &str) -> anyhow::Result<Launc
 pub(crate) fn reject_host_prewarm(
     specs: &mut Result<Vec<(u32, LaunchSpec)>, crate::handlers::provision::SpecError>,
 ) {
-    if specs
-        .as_ref()
-        .is_ok_and(|resolved| resolved.iter().any(|(_, spec)| spec.backend == "host"))
-    {
+    if specs.as_ref().is_ok_and(|resolved| {
+        resolved
+            .iter()
+            .any(|(_, spec)| spec.backend == "host" && !spec.remote)
+    }) {
         *specs = Err(crate::handlers::provision::SpecError::PrewarmSkipped);
     }
 }

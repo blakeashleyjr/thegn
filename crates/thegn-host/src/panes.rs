@@ -170,6 +170,7 @@ pub(crate) fn terminal_launch_spec(
                     backend: "host".to_string(),
                     warnings: vec![],
                     degraded: false,
+                    remote: false,
                 });
             }
         };
@@ -187,6 +188,7 @@ pub(crate) fn terminal_launch_spec(
                 backend: truth.label,
                 warnings: vec![],
                 degraded: false,
+                remote: false,
             });
         }
         // Containment was asked for and not delivered: fall through to the plain
@@ -202,6 +204,7 @@ pub(crate) fn terminal_launch_spec(
             backend: truth.label,
             warnings: truth.warning.into_iter().collect(),
             degraded: true,
+            remote: false,
         });
     }
     Ok(crate::agent::LaunchSpec {
@@ -211,6 +214,8 @@ pub(crate) fn terminal_launch_spec(
         backend: "host".to_string(),
         warnings: vec![],
         degraded: false,
+        // An ssh/mosh terminal runs on the remote end, not as a local host shell.
+        remote: !connection.is_empty(),
     })
 }
 
@@ -1044,6 +1049,10 @@ fn prewarm_targets(active: usize, len: usize, radius: usize) -> Vec<usize> {
 /// per tab on a large session.
 const PREWARM_RADIUS: usize = 1;
 
+/// One automatic prewarm request: `(worktree, …, group index, missing leaves,
+/// target leaves, is_terminal)` — see [`prewarm_requests`].
+pub(crate) type PrewarmRequest = (String, String, usize, Vec<u32>, Vec<u32>, bool);
+
 /// The (group name, worktree path, tab, missing leaf ids) tuples a pre-warm
 /// pass should resolve specs for: the tabs adjacent to the active one (within
 /// the active worktree) and the neighboring worktrees' active tabs, so first
@@ -1059,7 +1068,7 @@ const PREWARM_RADIUS: usize = 1;
 pub(crate) fn prewarm_requests(
     panes: &Panes,
     session: &mut crate::session::Session,
-) -> Vec<(String, String, usize, Vec<u32>, Vec<u32>, bool)> {
+) -> Vec<PrewarmRequest> {
     let mut out = Vec::new();
     if session.worktrees.is_empty() {
         return out;
@@ -1447,6 +1456,7 @@ mod tests {
             backend: "host".into(),
             warnings: Vec::new(),
             degraded: false,
+            remote: false,
         };
         let chrome = layout::compute(160, 40, true, true);
 
