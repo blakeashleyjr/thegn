@@ -78,6 +78,18 @@ class LiveTests(unittest.TestCase):
     def settings(self, **extra):
         return live.settings(self.repo, dict(self.env, **extra))
 
+    @contextlib.contextmanager
+    def private_quiescence(self):
+        proc = self.root / "private-proc"
+        proc.mkdir(mode=0o700)
+        real_quiescent = live.quiescent
+
+        def isolated_quiescent(paths):
+            return real_quiescent(paths, proc)
+
+        with patch.object(live, "quiescent", side_effect=isolated_quiescent):
+            yield
+
     def test_unmapped_ancestor_remains_a_production_refusal(self):
         self.ancestor_patch.stop()
         try:
@@ -524,7 +536,7 @@ class LiveTests(unittest.TestCase):
         self.assertTrue(swap.with_name("legacy-stage-replacement").exists())
 
     def test_plan_and_confirmation_have_no_install_effects(self):
-        with patch.object(live, "settings", return_value=self.paths), patch.object(live, "source_revision", return_value="a" * 40), patch.object(live, "build_stage") as build:
+        with self.private_quiescence(), patch.object(live, "settings", return_value=self.paths), patch.object(live, "source_revision", return_value="a" * 40), patch.object(live, "build_stage") as build:
             before = set(self.root.rglob("*"))
             with contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(live.main(["--plan", "--repo", str(self.repo)]), 0)
@@ -570,7 +582,7 @@ class LiveTests(unittest.TestCase):
                         self.fail("An install lock was not held")
             return recovery
 
-        with patch.object(live, "settings", return_value=self.paths), patch.object(live, "source_revision", return_value="a" * 40), patch.object(live, "build_stage", return_value=(self.root, self.binary, self.record)), patch.object(live, "install", side_effect=install), patch.object(live.sys.stdin, "isatty", return_value=True), patch.object(live.sys.stdout, "isatty", return_value=True), patch("builtins.input", return_value="INSTALL AND LAUNCH"), patch.object(live.subprocess, "Popen", side_effect=spawn):
+        with self.private_quiescence(), patch.object(live, "settings", return_value=self.paths), patch.object(live, "source_revision", return_value="a" * 40), patch.object(live, "build_stage", return_value=(self.root, self.binary, self.record)), patch.object(live, "install", side_effect=install), patch.object(live.sys.stdin, "isatty", return_value=True), patch.object(live.sys.stdout, "isatty", return_value=True), patch("builtins.input", return_value="INSTALL AND LAUNCH"), patch.object(live.subprocess, "Popen", side_effect=spawn):
             for expected_pin in (None, str(self.target)):
                 # Keep HOME unchanged; test only captured migration override.
                 env = dict(os.environ, **self.env)
