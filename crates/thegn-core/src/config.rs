@@ -6193,7 +6193,7 @@ impl Config {
 
     pub(crate) fn apply_override_str(cfg: &mut Config, key: &str, val: &str) -> Result<(), String> {
         let key = crate::config_compat::canonical_key(key);
-        if key == "apps.tab_order" {
+        if key == "apps.tab_order" && !val.trim().starts_with('[') {
             cfg.apps.tab_order = val
                 .split(',')
                 .map(str::trim)
