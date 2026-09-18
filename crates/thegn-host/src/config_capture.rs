@@ -339,6 +339,15 @@ impl ConfigCaptureSeed {
         if let Some(path) = cli.config {
             checked_path(path)?;
         }
+        if cli
+            .profile
+            .is_some_and(|value| value.len() > thegn_core::config_budget::MAX_CONTEXT_BYTES)
+            || cli.profile_paths.is_some_and(|paths| {
+                paths.name.len() > thegn_core::config_budget::MAX_CONTEXT_BYTES
+            })
+        {
+            return Err(CaptureInputError::Bounds);
+        }
         if !cwd.is_absolute() {
             return Err(CaptureInputError::InvalidPath);
         }
@@ -570,7 +579,7 @@ impl ConfigCaptureSeed {
         };
         let profile_content = profile.as_ref().map(|content| content.as_deref());
         let profile_input = match (&self.profile, profile_content) {
-            (Some(source), Some(content)) => Some(Self::source_input(source, Some(content))),
+            (Some(source), Some(content)) => Some(Self::source_input(source, content)),
             (Some(source), None) => Some(Self::source_input(source, None)),
             (None, None) => None,
             (None, Some(_)) => unreachable!("profile content without a selected profile"),

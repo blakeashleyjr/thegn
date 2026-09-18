@@ -11,7 +11,7 @@ const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
 
 // Handle identity and the final path recheck assume a stable, owner-controlled
 // namespace; they do not claim protection from hostile same-UID replacement.
-fn identity(file: &File) -> Result<(u32, u32, u32, u64), Error> {
+fn identity(file: &File) -> Result<(u32, u32, u32, u64, std::time::SystemTime), Error> {
     let metadata = file.metadata().map_err(|_| Error::Unavailable)?;
     if !metadata.is_file() {
         return Err(Error::NonRegular);
@@ -26,7 +26,13 @@ fn identity(file: &File) -> Result<(u32, u32, u32, u64), Error> {
     }
     let (volume, high, low) =
         crate::platform::handle_identity(file).map_err(|_| Error::Unavailable)?;
-    Ok((volume, high, low, metadata.len()))
+    Ok((
+        volume,
+        high,
+        low,
+        metadata.len(),
+        metadata.modified().map_err(|_| Error::Unavailable)?,
+    ))
 }
 
 fn open(path: &Path) -> Result<Option<File>, Error> {

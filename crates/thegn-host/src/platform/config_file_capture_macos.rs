@@ -69,10 +69,10 @@ fn regular_identity(file: &File) -> Result<Identity, Error> {
         device: stat.st_dev as u64,
         inode: stat.st_ino as u64,
         length: stat.st_size as u64,
-        mtime_seconds: stat.st_mtimespec.tv_sec as i64,
-        mtime_nanoseconds: stat.st_mtimespec.tv_nsec as i64,
-        ctime_seconds: stat.st_ctimespec.tv_sec as i64,
-        ctime_nanoseconds: stat.st_ctimespec.tv_nsec as i64,
+        mtime_seconds: stat.st_mtime as i64,
+        mtime_nanoseconds: stat.st_mtime_nsec as i64,
+        ctime_seconds: stat.st_ctime as i64,
+        ctime_nanoseconds: stat.st_ctime_nsec as i64,
     })
 }
 
