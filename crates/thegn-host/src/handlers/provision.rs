@@ -1063,6 +1063,125 @@ mod tests {
         assert!(dirty, "the adopted pane changes the frame");
     }
 
+    /// A skipped prewarm still carries attach targets, but its result has no
+    /// resolved leaf ids for the stale-batch guard to inspect.  Close the tab
+    /// to the left of the captured target so the same index now names a
+    /// different live tab; the delayed attach must be dropped rather than
+    /// grafting an agent into that unrelated tab.
+    #[test]
+    fn drain_specs_drops_stale_prewarm_skip_before_attaching_to_shifted_tab() {
+        let mut session = Session {
+            id: "s1".into(),
+            worktrees: vec![WorktreeGroup::new("app/home", GroupKind::Home, "")],
+            active: 0,
+        };
+        {
+            let g = &mut session.worktrees[0];
+            g.tabs[0].center = crate::center::CenterTree::Leaf(5);
+            g.tabs[0].focused_pane = 5;
+            g.add_tab();
+            g.tabs[1].center = crate::center::CenterTree::Leaf(6);
+            g.tabs[1].focused_pane = 6;
+            g.add_tab();
+            g.tabs[2].center = crate::center::CenterTree::Leaf(7);
+            g.tabs[2].focused_pane = 7;
+            g.active_tab = 1;
+            // The worker captured tab index 1 while it held leaf 6.  Closing
+            // the tab to its left shifts leaf 7 into that index.
+            g.tabs.remove(0);
+            g.active_tab = 0;
+        }
+
+        let (pane_tx, _pane_rx) = tokio_mpsc::channel::<PaneEvent>(1024);
+        let mut panes = crate::panes::Panes::new(pane_tx);
+        panes.insert_test_pane(5);
+        panes.insert_test_pane(6);
+        panes.insert_test_pane(7);
+        let cfg = thegn_core::config::Config::default();
+        let mut daemon_cfg = cfg.daemon.clone();
+        daemon_cfg.enabled = true;
+        panes.set_daemon_config(daemon_cfg);
+        let attached = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let attached_by_spawn = std::sync::Arc::clone(&attached);
+        panes.set_test_daemon_spawn(move |panes, session| {
+            let session = session.ok_or_else(|| anyhow::anyhow!("attach target missing"))?;
+            attached_by_spawn.lock().unwrap().push(session.to_string());
+            Ok(panes.insert_test_daemon_pane(session.to_string()))
+        });
+
+        let mut model = crate::chrome::FrameModel::default();
+        let mut active_menu: Option<MenuOverlay> = None;
+        let mut loading_state = crate::loading::track::LoadingTracker::default();
+        let mut loading_remote = std::collections::HashMap::new();
+        let mut materialize_inflight = std::collections::HashSet::new();
+        let mut prewarm_inflight = std::collections::HashSet::from([("app/home".into(), 1)]);
+        let mut materialize_failed = std::collections::HashSet::new();
+        let mut prewarm_failed = std::collections::HashSet::new();
+        let mut halt_dismissed = std::collections::HashSet::new();
+        let mut last_pool_reconcile = None;
+        let mut center_dormant = false;
+        let mut need_relayout = false;
+        let mut dirty = false;
+        let mut loop_perf = crate::perf::LoopPerf::new();
+        let (spec_tx, mut spec_rx) = tokio::sync::mpsc::unbounded_channel();
+        spec_tx
+            .send(SpecBatch {
+                group: "app/home".into(),
+                worktree: String::new(),
+                tab: 1,
+                origin: SpecOrigin::Prewarm,
+                specs: Err(SpecError::PrewarmSkipped),
+                attach: vec![AttachTarget {
+                    session: "stale-session".into(),
+                    program: "claude".into(),
+                }],
+            })
+            .unwrap();
+
+        drain_specs(
+            &mut spec_rx,
+            &mut SpecDrainCtx {
+                session: &mut session,
+                panes: &mut panes,
+                model: &mut model,
+                active_menu: &mut active_menu,
+                current_config: &cfg,
+                center: crate::layout::compute(160, 40, true, true).center,
+                loading_state: &mut loading_state,
+                loading_remote: &mut loading_remote,
+                materialize_inflight: &mut materialize_inflight,
+                prewarm_inflight: &mut prewarm_inflight,
+                materialize_failed: &mut materialize_failed,
+                prewarm_failed: &mut prewarm_failed,
+                halt_dismissed: &mut halt_dismissed,
+                last_pool_reconcile: &mut last_pool_reconcile,
+                center_dormant: &mut center_dormant,
+                need_relayout: &mut need_relayout,
+                dirty: &mut dirty,
+                loop_perf: &mut loop_perf,
+            },
+        );
+
+        assert!(
+            attached.lock().unwrap().is_empty(),
+            "a stale skipped prewarm must not attach into the shifted tab"
+        );
+        assert_eq!(
+            panes.table.len(),
+            3,
+            "no pane may be grafted by a stale batch"
+        );
+        assert_eq!(session.worktrees[0].tabs.len(), 2);
+        assert_eq!(
+            session.worktrees[0].tabs[1].center,
+            crate::center::CenterTree::Leaf(7),
+            "the shifted live tab remains unchanged"
+        );
+        assert!(prewarm_inflight.is_empty(), "the stale request is settled");
+        assert!(!need_relayout, "a dropped batch does not change geometry");
+        assert!(!dirty, "a dropped batch does not dirty the frame");
+    }
+
     /// A spec batch is addressed by tab INDEX, captured at request time. Close a
     /// tab to its left and that index names a different, already-live tab — so
     /// the batch must be dropped WHOLE, before any loading write. Without the
