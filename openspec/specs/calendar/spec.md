@@ -140,6 +140,42 @@ a misconfigured value cannot poll a provider in a tight loop.
 - **WHEN** an account configures a refresh interval below the minimum
 - **THEN** the minimum is used
 
+### Requirement: Source admission is a bounded, all-or-nothing budget
+
+Every calendar backend SHALL be constructed with a typed, nonzero per-account
+admission budget derived from `[calendar] max_events`. Configuration MUST
+reject `max_events` below 1 or above 10000, and zero MUST NOT mean unlimited.
+The budget MUST be enforced while a source is parsed or decoded — before the
+next event is built — and it MUST cover events, deletions, and retained bytes.
+It MUST also enforce per-event size and child-count ceilings, a
+content-line ceiling, and a source-document ceiling. A process-wide budget
+MUST bound admitted records and reserved bytes across every concurrent fetch.
+Reservations MUST be non-blocking, and each MUST be released when the data it
+accounts for is dropped.
+
+A source that exceeds any budget MUST fail with a typed admission error. A
+truncated result MUST NOT be published. The account MUST keep its previous
+cached events and sync cursor, and it MUST record the failure as its sync
+error.
+
+#### Scenario: A source over max_events
+
+- **WHEN** a source returns more events plus deletions than `max_events`
+- **THEN** the fetch fails with an admission error, the account's cached
+  events and sync cursor are unchanged, and the error is recorded
+
+#### Scenario: max_events set to zero
+
+- **WHEN** `max_events = 0` is configured
+- **THEN** config validation reports it as an error and the runtime uses the
+  minimum budget of 1, never an unlimited one
+
+#### Scenario: The shared budget is in use
+
+- **WHEN** concurrent fetches hold the process-wide budget
+- **THEN** a further fetch is refused immediately with a typed error and
+  retried on its normal cadence, without waiting
+
 ### Requirement: Recurring events are expanded correctly across daylight saving
 
 thegn SHALL expand recurring events from their recurrence rule, including

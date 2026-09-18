@@ -321,3 +321,232 @@ fn a_recurring_event_expands_with_its_duration_intact() {
         }
     }
 }
+
+// --- admission ---------------------------------------------------------------
+
+use crate::calendar::admission::{
+    AdmissionBudget, AdmissionLimit, AdmissionMeter, AdmissionPool, MAX_COMPONENT_DEPTH,
+    MAX_EVENT_BYTES, MAX_LINE_BYTES,
+};
+
+fn feed(n: usize) -> String {
+    let mut s = String::from("BEGIN:VCALENDAR\r\n");
+    for i in 0..n {
+        s.push_str(&format!(
+            "BEGIN:VEVENT\r\nUID:e{i}\r\nSUMMARY:Event {i}\r\nDTSTART:20260821T090000Z\r\nEND:VEVENT\r\n"
+        ));
+    }
+    s.push_str("END:VCALENDAR\r\n");
+    s
+}
+
+fn admitted(input: &str, max: usize) -> (Result<(), AdmissionError>, Vec<CalEvent>) {
+    let mut meter = AdmissionMeter::isolated(AdmissionBudget::new(max).unwrap());
+    let mut out = Vec::new();
+    let r = parse_ics_admitted(input, "UTC", &mut meter, &mut out);
+    (r, out)
+}
+
+#[test]
+fn incremental_unfolding_matches_the_folding_rules() {
+    let doc = "A:1\r\n B\r\n\tC\r\nD:2\n E\nF:3";
+    let lines: Vec<_> = LogicalLines::new(doc).collect();
+    assert_eq!(lines.len(), 3);
+    assert_eq!(lines[0].text(), "A:1BC");
+    assert_eq!(lines[0].len(), "A:1BC".len());
+    assert_eq!(lines[1].text(), "D:2E");
+    assert_eq!(lines[2].text(), "F:3");
+    // An unfolded line is borrowed, never copied.
+    assert!(matches!(lines[2].text(), std::borrow::Cow::Borrowed(_)));
+    assert!(!lines[2].is_empty());
+    // The same shapes the old whole-document unfold produced.
+    assert_eq!(unfold("A\n"), vec!["A", ""]);
+    assert_eq!(unfold(""), vec![""]);
+}
+
+#[test]
+fn exactly_max_events_are_admitted() {
+    let (r, out) = admitted(&feed(3), 3);
+    r.unwrap();
+    assert_eq!(out.len(), 3);
+}
+
+#[test]
+fn one_event_over_the_budget_refuses_the_fetch_before_building_it() {
+    let (r, out) = admitted(&feed(4), 3);
+    assert_eq!(r.unwrap_err().limit, AdmissionLimit::AccountRecords);
+    // The overflowing event was never materialized.
+    assert_eq!(out.len(), 3);
+}
+
+#[test]
+fn a_budget_of_one_admits_one() {
+    let (r, _) = admitted(&feed(1), 1);
+    r.unwrap();
+    let (r, out) = admitted(&feed(2), 1);
+    assert!(r.is_err());
+    assert_eq!(out.len(), 1);
+}
+
+#[test]
+fn a_huge_feed_stops_at_the_cap_not_at_the_end() {
+    // Accounting is incremental: a feed of 50k events is refused after the
+    // cap's worth, never after allocating all of them.
+    let pool = AdmissionPool::new(1_000_000, 1 << 30);
+    let mut meter = AdmissionMeter::new(AdmissionBudget::new(100).unwrap(), pool.clone());
+    let mut out = Vec::new();
+    let r = parse_ics_admitted(&feed(50_000), "UTC", &mut meter, &mut out);
+    assert_eq!(r.unwrap_err().limit, AdmissionLimit::AccountRecords);
+    assert_eq!(out.len(), 100);
+    assert_eq!(pool.in_use().0, 100);
+}
+
+#[test]
+fn events_without_a_start_are_not_admitted_or_charged() {
+    let doc = "BEGIN:VEVENT\r\nUID:x\r\nSUMMARY:no start\r\nEND:VEVENT\r\n";
+    let mut meter = AdmissionMeter::isolated(AdmissionBudget::new(1).unwrap());
+    let mut out = Vec::new();
+    parse_ics_admitted(doc, "UTC", &mut meter, &mut out).unwrap();
+    assert!(out.is_empty());
+    assert_eq!(meter.records(), 0);
+    assert_eq!(meter.retained_bytes(), 0);
+    // And a document truncated mid-event keeps nothing of it either.
+    parse_ics_admitted("BEGIN:VEVENT\r\nSUMMARY:x\r\n", "UTC", &mut meter, &mut out).unwrap();
+    assert_eq!(meter.retained_bytes(), 0);
+}
+
+#[test]
+fn an_oversized_retained_property_refuses_its_event() {
+    let big = "x".repeat(MAX_EVENT_BYTES);
+    let doc = format!(
+        "BEGIN:VEVENT\r\nUID:a\r\nDTSTART:20260821T090000Z\r\nDESCRIPTION:{big}\r\nEND:VEVENT\r\n"
+    );
+    let (r, out) = admitted(&doc, 10);
+    assert_eq!(r.unwrap_err().limit, AdmissionLimit::EventBytes);
+    assert!(out.is_empty());
+}
+
+#[test]
+fn an_oversized_line_is_refused_before_it_is_unfolded() {
+    // Over the line cap and folded: a retained property refuses the event…
+    let mut folded = String::from("DESCRIPTION:");
+    for _ in 0..(MAX_LINE_BYTES / 70 + 2) {
+        folded.push_str(&"y".repeat(70));
+        folded.push_str("\r\n ");
+    }
+    let doc = format!("BEGIN:VEVENT\r\nDTSTART:20260821T090000Z\r\n{folded}\r\nEND:VEVENT\r\n");
+    let (r, _) = admitted(&doc, 10);
+    assert_eq!(r.unwrap_err().limit, AdmissionLimit::EventBytes);
+
+    // …but one we never keep (an inline attachment) is skipped, and the event
+    // still arrives.
+    let attach = folded.replacen("DESCRIPTION", "ATTACH;ENCODING=BASE64", 1);
+    let doc =
+        format!("BEGIN:VEVENT\r\nUID:a\r\nDTSTART:20260821T090000Z\r\n{attach}\r\nEND:VEVENT\r\n");
+    let (r, out) = admitted(&doc, 10);
+    r.unwrap();
+    assert_eq!(out.len(), 1);
+
+    // A huge calendar name outside any event is refused as a line.
+    let doc = format!("X-WR-CALNAME:{}\r\n", "n".repeat(MAX_LINE_BYTES + 1));
+    let (r, _) = admitted(&doc, 10);
+    assert_eq!(r.unwrap_err().limit, AdmissionLimit::LineBytes);
+    // An oversized line of an unknown shape is simply skipped.
+    let (r, _) = admitted(&"z".repeat(MAX_LINE_BYTES + 1), 10);
+    r.unwrap();
+    // Inside a VALARM only TRIGGER is kept.
+    let doc = format!(
+        "BEGIN:VEVENT\r\nDTSTART:20260821T090000Z\r\nBEGIN:VALARM\r\nTRIGGER:{}\r\nEND:VALARM\r\nEND:VEVENT\r\n",
+        "-".repeat(MAX_LINE_BYTES + 1)
+    );
+    assert_eq!(
+        admitted(&doc, 10).0.unwrap_err().limit,
+        AdmissionLimit::EventBytes
+    );
+    let doc = doc.replace("TRIGGER", "DESCRIPTION");
+    admitted(&doc, 10).0.unwrap();
+}
+
+#[test]
+fn the_calendar_name_copy_is_charged_to_every_event() {
+    // A large X-WR-CALNAME is copied into each event; the copies are what
+    // amplify, so they are what is counted.
+    // 256 KiB fits one event, but 128 copies fill the 32 MiB account budget.
+    let name = "n".repeat(256 * 1024);
+    let doc = format!("X-WR-CALNAME:{name}\r\n{}", feed(200));
+    let (r, out) = admitted(&doc, 200);
+    assert_eq!(r.unwrap_err().limit, AdmissionLimit::AccountBytes);
+    assert!(
+        out.len() < 128,
+        "stopped at the byte budget, got {}",
+        out.len()
+    );
+    // A name that alone fills an event's budget refuses the first event.
+    let doc = format!(
+        "X-WR-CALNAME:{}\r\n{}",
+        "n".repeat(MAX_LINE_BYTES - 20),
+        feed(1)
+    );
+    assert_eq!(
+        admitted(&doc, 10).0.unwrap_err().limit,
+        AdmissionLimit::EventBytes
+    );
+}
+
+#[test]
+fn child_values_are_bounded_per_event() {
+    let dates: Vec<String> = (0..20_000)
+        .map(|_| "20260821T090000Z".to_string())
+        .collect();
+    let doc = format!(
+        "BEGIN:VEVENT\r\nDTSTART:20260821T090000Z\r\nEXDATE:{}\r\nEND:VEVENT\r\n",
+        dates[..1_000].join(",")
+    );
+    admitted(&doc, 10).0.unwrap();
+    let mut doc = String::from("BEGIN:VEVENT\r\nDTSTART:20260821T090000Z\r\n");
+    for chunk in dates.chunks(1_000) {
+        doc.push_str(&format!("RDATE:{}\r\n", chunk.join(",")));
+    }
+    doc.push_str("END:VEVENT\r\n");
+    // Each child also carries bookkeeping bytes, so whichever per-event
+    // ceiling is reached first refuses it — never a silently shortened list.
+    let per_event = |l| {
+        matches!(
+            l,
+            AdmissionLimit::EventChildren | AdmissionLimit::EventBytes
+        )
+    };
+    assert!(per_event(admitted(&doc, 10).0.unwrap_err().limit));
+    let mut doc = String::from("BEGIN:VEVENT\r\nDTSTART:20260821T090000Z\r\n");
+    for i in 0..20_000 {
+        doc.push_str(&format!("X-K{i}:v\r\n"));
+    }
+    doc.push_str("END:VEVENT\r\n");
+    assert!(per_event(admitted(&doc, 10).0.unwrap_err().limit));
+}
+
+#[test]
+fn component_nesting_is_bounded() {
+    let mut doc = String::from("BEGIN:VEVENT\r\nDTSTART:20260821T090000Z\r\n");
+    for _ in 0..MAX_COMPONENT_DEPTH {
+        doc.push_str("BEGIN:X-THING\r\n");
+    }
+    let ok = format!(
+        "{doc}{}END:VEVENT\r\n",
+        "END:X-THING\r\n".repeat(MAX_COMPONENT_DEPTH)
+    );
+    let (r, out) = admitted(&ok, 10);
+    r.unwrap();
+    assert_eq!(out.len(), 1);
+    doc.push_str("BEGIN:X-THING\r\n");
+    assert_eq!(
+        admitted(&doc, 10).0.unwrap_err().limit,
+        AdmissionLimit::Nesting
+    );
+}
+
+#[test]
+fn the_fixture_wrapper_never_returns_a_truncated_calendar() {
+    // Over the default budget: nothing rather than a prefix.
+    assert!(parse_ics(&feed(AdmissionBudget::default().max_events() + 1), "UTC").is_empty());
+}
