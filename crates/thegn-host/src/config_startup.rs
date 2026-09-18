@@ -189,7 +189,14 @@ pub(crate) fn admit_process(
         ProcessAdmission::admit_initial(seed, inputs.actor, &production_admit)?;
     // Startup is single-threaded here; a lost race would mean two admissions
     // in one process, which the early return above already prevents.
-    let _ = PROCESS.set(process); // best-effort: first-set-wins: only one startup admission runs per process
+    if PROCESS.set(process).is_err() {
+        // Unreachable in practice (startup is single-threaded and the early
+        // return above covers a second call); refuse rather than publish a
+        // second, divergent process store.
+        return Err(CaptureFailure::Admission(
+            thegn_core::config_admission::ConfigAdmissionError::TransientIo,
+        ));
+    }
     published.config().install_admitted_runtime();
     // Advisory (deprecation/compatibility) diagnostics: already bounded and
     // redacted by admission; errors never reach here.
@@ -209,6 +216,21 @@ pub(crate) fn store() -> Option<&'static AdmissionStore> {
 /// authority must go through [`AdmissionStore::authorize`] / `current`.
 pub(crate) fn display() -> Option<Arc<AdmittedConfig>> {
     store().and_then(AdmissionStore::display)
+}
+
+/// The configuration for cleanup/teardown that an earlier admitted
+/// generation already authorized (VPN deregistration, provider sync-back,
+/// close checkpoints, landed-worktree removal). It is the last admitted
+/// generation even when a later reload failed — cleanup must stay possible
+/// while new authority is refused — and never a default. Only a process
+/// without startup admission (unit tests) uses the legacy layered load.
+pub(crate) fn cleanup_config() -> thegn_core::config::Config {
+    match display() {
+        Some(admitted) => admitted.config().clone(),
+        None => {
+            thegn_core::config::Config::load_layered(&thegn_core::config::ProcessEnv, &[], None)
+        }
+    }
 }
 
 /// Re-admit from the frozen process capture and publish by CAS. Installs the

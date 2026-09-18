@@ -133,7 +133,18 @@ pub fn daemon_reload(baseline: &Config) -> McpProxyReloadReport {
     use thegn_core::config::{Config as CoreConfig, ProcessEnv};
     use thegn_core::mcp::proxy::reconcile::{ReconcileAction, reconcile};
 
-    let disk = CoreConfig::load_layered(&ProcessEnv, &[], None);
+    // Reconcile against a freshly admitted generation. A failed reload keeps
+    // the prior generation, so nothing is reconciled (no partial/default
+    // set is ever applied); a superseded reload uses what is current.
+    use crate::config_startup::ReloadOutcome;
+    let disk = match crate::config_startup::reload() {
+        ReloadOutcome::Published(admitted) => admitted.config().clone(),
+        ReloadOutcome::Superseded => crate::config_startup::display()
+            .map(|admitted| admitted.config().clone())
+            .unwrap_or_else(|| baseline.clone()),
+        ReloadOutcome::Failed(_) | ReloadOutcome::FailedCoalesced => baseline.clone(),
+        ReloadOutcome::Unavailable => CoreConfig::load_layered(&ProcessEnv, &[], None),
+    };
     let old = effective_global_instances(baseline);
     let new = effective_global_instances(&disk);
     let actions = reconcile(&old, &new);
