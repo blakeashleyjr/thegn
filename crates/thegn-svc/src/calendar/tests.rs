@@ -464,9 +464,11 @@ async fn caldav_token_recovery_is_one_bounded_retry_with_shared_deadline() {
             .unwrap();
         assert_eq!(page.sync_token, "new-token");
         assert_eq!(requests.load(Ordering::SeqCst), 2);
-        let bodies = bodies.lock().unwrap();
-        assert!(bodies[0].contains("expired-token"));
-        assert!(!bodies[1].contains("expired-token"));
+        {
+            let bodies = bodies.lock().unwrap();
+            assert!(bodies[0].contains("expired-token"));
+            assert!(!bodies[1].contains("expired-token"));
+        }
         server.abort();
         let _ = server.await;
     }
@@ -609,16 +611,25 @@ async fn oversized_chunked_and_encoded_calendar_bodies_are_rejected_before_parse
     let _ = server.await;
 }
 
+async fn raw_fixture_headers(socket: &mut tokio::net::TcpStream) -> Vec<u8> {
+    use tokio::io::AsyncReadExt;
+    let mut headers = Vec::new();
+    while !headers.ends_with(b"\r\n\r\n") {
+        assert!(headers.len() < crate::http::MAX_REQUEST_BYTES);
+        headers.push(socket.read_u8().await.unwrap());
+    }
+    headers
+}
+
 #[tokio::test]
 async fn declared_oversized_calendar_body_is_refused_without_reading_payload() {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncWriteExt;
     for provider in [CalendarProviderKind::IcsUrl, CalendarProviderKind::CalDav] {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = [0; 4096];
-            socket.read(&mut request).await.unwrap();
+            let _request = raw_fixture_headers(&mut socket).await;
             let (status, media) = if provider == CalendarProviderKind::CalDav {
                 ("207 Multi-Status", "application/xml")
             } else {
@@ -665,7 +676,7 @@ async fn declared_oversized_calendar_body_is_refused_without_reading_payload() {
 
 #[tokio::test]
 async fn declared_oversized_error_body_is_refused_without_waiting_for_payload() {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncWriteExt;
 
     for provider in [CalendarProviderKind::IcsUrl, CalendarProviderKind::CalDav] {
         for status in [
@@ -679,8 +690,7 @@ async fn declared_oversized_error_body_is_refused_without_waiting_for_payload() 
             let address = listener.local_addr().unwrap();
             let server = tokio::spawn(async move {
                 let (mut socket, _) = listener.accept().await.unwrap();
-                let mut request = [0; 4096];
-                socket.read(&mut request).await.unwrap();
+                let request = raw_fixture_headers(&mut socket).await;
                 let (media, method) = if provider == CalendarProviderKind::CalDav {
                     ("application/xml", "REPORT")
                 } else {
@@ -804,17 +814,7 @@ async fn caldav_body_limits_cover_exact_chunked_and_error_responses() {
                 let exact = Arc::clone(&exact);
                 let oversized = Arc::clone(&oversized);
                 tokio::spawn(async move {
-                    let mut request = Vec::new();
-                    let mut byte = [0_u8; 1];
-                    while !request.windows(4).any(|window| window == b"\r\n\r\n") {
-                        if socket.read(&mut byte).await.unwrap_or(0) == 0 {
-                            return;
-                        }
-                        request.push(byte[0]);
-                        if request.len() > 64 * 1024 {
-                            return;
-                        }
-                    }
+                    let request = raw_fixture_headers(&mut socket).await;
                     // Consume the REPORT body before closing the socket.
                     // Closing with unread request bytes can reset TCP and
                     // truncate an otherwise exactly-sized valid response.
@@ -1163,53 +1163,55 @@ async fn media_encoding_and_shared_pool_policies_apply_to_real_backends() {
         CalendarError::Policy("calendar response content type refused")
     ));
 
-    let records = records.lock().unwrap();
-    let first_records: Vec<_> = records
-        .iter()
-        .filter(|record| record.0.contains("account=first-query"))
-        .collect();
-    let second_records: Vec<_> = records
-        .iter()
-        .filter(|record| record.0.contains("account=second-query"))
-        .collect();
-    assert_eq!(first_records.len(), 2);
-    assert_eq!(second_records.len(), 2);
-    assert!(
-        first_records
+    {
+        let records = records.lock().unwrap();
+        let first_records: Vec<_> = records
             .iter()
-            .all(|record| record.1.starts_with("Basic "))
-    );
-    assert!(
-        second_records
+            .filter(|record| record.0.contains("account=first-query"))
+            .collect();
+        let second_records: Vec<_> = records
             .iter()
-            .all(|record| record.1.starts_with("Basic "))
-    );
-    assert_ne!(first_records[0].1, second_records[0].1);
-    assert!(
-        first_records
-            .iter()
-            .any(|record| record.2.as_deref() == Some("first-validator"))
-    );
-    assert!(
-        second_records
-            .iter()
-            .any(|record| record.2.as_deref() == Some("second-validator"))
-    );
-    assert!(
-        records
-            .iter()
-            .any(|record| record.0.contains("account=dav-query"))
-    );
-    assert!(
-        records
-            .iter()
-            .any(|record| record.3.contains("dav-sync-secret"))
-    );
-    assert!(
-        records.iter().all(|record| !record.4),
-        "pool must not retain cookies"
-    );
-    assert!(accepts.load(std::sync::atomic::Ordering::SeqCst) < records.len());
+            .filter(|record| record.0.contains("account=second-query"))
+            .collect();
+        assert_eq!(first_records.len(), 2);
+        assert_eq!(second_records.len(), 2);
+        assert!(
+            first_records
+                .iter()
+                .all(|record| record.1.starts_with("Basic "))
+        );
+        assert!(
+            second_records
+                .iter()
+                .all(|record| record.1.starts_with("Basic "))
+        );
+        assert_ne!(first_records[0].1, second_records[0].1);
+        assert!(
+            first_records
+                .iter()
+                .any(|record| record.2.as_deref() == Some("first-validator"))
+        );
+        assert!(
+            second_records
+                .iter()
+                .any(|record| record.2.as_deref() == Some("second-validator"))
+        );
+        assert!(
+            records
+                .iter()
+                .any(|record| record.0.contains("account=dav-query"))
+        );
+        assert!(
+            records
+                .iter()
+                .any(|record| record.3.contains("dav-sync-secret"))
+        );
+        assert!(
+            records.iter().all(|record| !record.4),
+            "pool must not retain cookies"
+        );
+        assert!(accepts.load(std::sync::atomic::Ordering::SeqCst) < records.len());
+    }
     server.abort();
     let _ = server.await;
 }
