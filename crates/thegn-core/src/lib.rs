@@ -236,6 +236,7 @@ pub mod profile;
 pub mod progress;
 pub mod project;
 pub mod projection;
+pub mod provider_admission;
 pub mod proxy;
 pub mod pull_progress;
 pub mod rebase_todo;

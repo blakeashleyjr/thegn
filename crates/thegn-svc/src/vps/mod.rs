@@ -19,6 +19,7 @@ pub mod registry;
 pub mod ssh_shim;
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -313,7 +314,7 @@ pub struct VpsInstance {
 
 /// Everything needed to drive one named instance (resolved host-side from
 /// `[env.<name>.provider]` + the managed keypair).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct VpsSpec {
     pub kind: VpsKind,
     /// API base (empty ⇒ the kind's default).
@@ -341,6 +342,24 @@ pub struct VpsSpec {
     /// answer ssh). Never set outside tests.
     #[doc(hidden)]
     pub skip_ready_wait: bool,
+}
+
+impl fmt::Debug for VpsSpec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("VpsSpec")
+            .field("kind", &self.kind)
+            .field("name", &"<redacted>")
+            .field("region", &"<redacted>")
+            .field("size", &"<redacted>")
+            .field("image", &"<redacted>")
+            .field("api_base", &"<redacted>")
+            .field("max_instances", &self.max_instances)
+            .field("max_lifetime_secs", &self.max_lifetime_secs)
+            .field("key_path", &"<redacted>")
+            .field("pubkey", &"<redacted>")
+            .field("skip_ready_wait", &self.skip_ready_wait)
+            .finish()
+    }
 }
 
 impl VpsSpec {
@@ -373,17 +392,15 @@ impl VpsSpec {
 
     /// `(image argument, is_snapshot)` — a baked snapshot skips the cloud-init
     /// prereq installs.
-    fn image(&self) -> (String, bool) {
-        let shaper = self.kind.shaper();
-        if let Some(id) = shaper.snapshot_image(&self.image) {
-            return (id.to_string(), true);
-        }
-        let i = self.image.trim();
-        if i.is_empty() {
-            (shaper.default_image().to_string(), false)
-        } else {
-            (i.to_string(), false)
-        }
+    fn image(&self) -> Result<(String, bool)> {
+        let admitted = self.admit_static(&self.labels())?;
+        Ok((
+            admitted
+                .image
+                .resolve(self.kind.shaper().default_image())
+                .to_owned(),
+            admitted.image.is_snapshot(),
+        ))
     }
 
     fn max_instances(&self) -> usize {
@@ -392,6 +409,32 @@ impl VpsSpec {
         } else {
             self.max_instances as usize
         }
+    }
+
+    fn admit_static(
+        &self,
+        metadata: &BTreeMap<String, String>,
+    ) -> Result<thegn_core::provider_admission::VpsStaticSpec> {
+        let key_path = self
+            .key_path
+            .to_str()
+            .ok_or_else(|| anyhow!("vps: managed key path is not valid UTF-8"))?;
+        if key_path.is_empty() || key_path.len() > 4_096 || key_path.chars().any(char::is_control) {
+            return Err(anyhow!("vps: managed key path is invalid"));
+        }
+        thegn_core::provider_admission::validate_metadata(metadata).map_err(anyhow::Error::from)?;
+        thegn_core::provider_admission::admit_vps(thegn_core::provider_admission::VpsInput {
+            kind: self.kind.as_str(),
+            api_base: &self.api_base,
+            name: Some(&self.name),
+            region: &self.region,
+            size: &self.size,
+            image: &self.image,
+            max_instances: self.max_instances,
+            max_lifetime_secs: self.max_lifetime_secs,
+            pubkey: Some(&self.pubkey),
+        })
+        .map_err(anyhow::Error::from)
     }
 }
 
@@ -438,11 +481,11 @@ impl VpsProvider {
             .bearer_auth(&self.spec.token)
             .send()
             .await
-            .with_context(|| format!("vps: GET {url}"))?;
+            .with_context(|| "vps: GET provider endpoint")?;
         let status = resp.status();
-        let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
+        let _body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
         if !status.is_success() {
-            return Err(anyhow!("vps GET {url} failed ({status}): {body}"));
+            return Err(anyhow!("vps GET request failed ({status})"));
         }
         Ok(body)
     }
@@ -455,11 +498,11 @@ impl VpsProvider {
             .json(body)
             .send()
             .await
-            .with_context(|| format!("vps: POST {url}"))?;
+            .with_context(|| "vps: POST provider endpoint")?;
         let status = resp.status();
-        let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
+        let _body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
         if !status.is_success() {
-            return Err(anyhow!("vps POST {url} failed ({status}): {body}"));
+            return Err(anyhow!("vps POST request failed ({status})"));
         }
         Ok(body)
     }
@@ -719,10 +762,12 @@ impl VpsProvider {
 impl RemoteProvider for VpsProvider {
     fn create<'a>(&'a self) -> BoxFuture<'a, Result<SandboxHandle>> {
         Box::pin(async move {
-            let name = self.spec.name.trim().to_string();
-            if name.is_empty() {
-                return Err(anyhow!("vps: the sandbox name is empty"));
-            }
+            let labels = self.labels();
+            let admitted = self.spec.admit_static(&labels)?;
+            let name = admitted
+                .name
+                .clone()
+                .expect("runtime provider admission requires a name");
             // Spend guardrail: never mint past the cap. Ledger-based (covers
             // in-flight creates the API can't see yet).
             let managed = registry::list().len();
@@ -734,7 +779,11 @@ impl RemoteProvider for VpsProvider {
                 ));
             }
             let key_id = self.ensure_ssh_key().await?;
-            let (image, is_snapshot) = self.spec.image();
+            let image = admitted
+                .image
+                .resolve(self.shaper().default_image())
+                .to_owned();
+            let is_snapshot = admitted.image.is_snapshot();
             let user_data = cloudinit::user_data(&self.spec.pubkey, !is_snapshot);
 
             // Intent BEFORE the POST — the crash-between-create-and-record leak
@@ -757,7 +806,7 @@ impl RemoteProvider for VpsProvider {
                 self.spec.region(),
                 &[key_id],
                 &user_data,
-                &self.labels(),
+                &labels,
             );
             let created = match self.post_json(&shaper.servers_url(&base), &body).await {
                 Ok(v) => v,
@@ -972,19 +1021,22 @@ mod tests {
             max_instances: 0,
             max_lifetime_secs: 0,
             key_path: "/k".into(),
-            pubkey: "ssh-ed25519 A".into(),
+            pubkey: "ssh-ed25519 MOCKKEY".into(),
             skip_ready_wait: true,
         };
         assert_eq!(spec.api_base(), digitalocean::DEFAULT_API_BASE);
         assert_eq!(spec.region(), "nyc3");
         assert_eq!(spec.size(), "s-1vcpu-2gb");
-        assert_eq!(spec.image(), ("ubuntu-24-04-x64".to_string(), false));
+        assert_eq!(
+            spec.image().unwrap(),
+            ("ubuntu-24-04-x64".to_string(), false)
+        );
         // Snapshot template still flips the keys-only cloud-init flag.
         let snap = VpsSpec {
             image: "snapshot:555".into(),
             ..spec
         };
-        assert_eq!(snap.image(), ("555".to_string(), true));
+        assert_eq!(snap.image().unwrap(), ("555".to_string(), true));
     }
 
     #[test]
@@ -1010,13 +1062,13 @@ mod tests {
             max_instances: 0,
             max_lifetime_secs: 0,
             key_path: "/k".into(),
-            pubkey: "ssh-ed25519 A".into(),
+            pubkey: "ssh-ed25519 MOCKKEY".into(),
             skip_ready_wait: true,
         };
         assert_eq!(spec.api_base(), hetzner::DEFAULT_API_BASE);
         assert_eq!(spec.region(), "fsn1");
         assert_eq!(spec.size(), "cx23");
-        assert_eq!(spec.image(), ("ubuntu-24.04".to_string(), false));
+        assert_eq!(spec.image().unwrap(), ("ubuntu-24.04".to_string(), false));
         assert_eq!(
             spec.max_instances(),
             5,
@@ -1027,7 +1079,7 @@ mod tests {
             image: "snapshot:777".into(),
             ..spec
         };
-        assert_eq!(snap.image(), ("777".to_string(), true));
+        assert_eq!(snap.image().unwrap(), ("777".to_string(), true));
     }
 
     #[test]

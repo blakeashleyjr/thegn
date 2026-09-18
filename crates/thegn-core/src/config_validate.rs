@@ -285,6 +285,7 @@ pub(crate) fn typed_semantic_errors(cfg: &Config, mode: SemanticMode) -> Vec<Str
     // providers, aliases naming real routes. Only when enabled.
     batch!(cfg.model_proxy.validate());
     batch!(cfg.ci.validate());
+    batch!(crate::provider_admission::validate_config(cfg));
     errs
 }
 
@@ -1269,6 +1270,52 @@ pre_create = [
         let errs = validate_str("[host.box]\nreach = \"bogus\"\n");
         assert_eq!(errs.len(), 1, "{errs:?}");
         assert!(errs[0].starts_with("host.box.reach: "), "{errs:?}");
+    }
+
+    #[test]
+    fn provider_static_grammar_is_part_of_strict_config_validation() {
+        let cases = [
+            (
+                "[env.fly.provider]\nprovider = \"fly\"\nsize = \"shared-cpu-3x\"\n",
+                "unknown Fly guest preset",
+            ),
+            (
+                "[env.fly.provider]\nprovider = \"fly\"\ntemplate = \"snapshot:42\"\n",
+                "Fly does not support snapshot image forms",
+            ),
+            (
+                "[env.digitalocean.provider]\nprovider = \"digitalocean\"\ntemplate = \"snapshot:nope\"\n",
+                "snapshot id is malformed",
+            ),
+            (
+                "[env.hetzner.provider]\nprovider = \"hetzner\"\napi_base = \"https://user:token@example.invalid/v1\"\n",
+                "endpoint host is missing or has credentials",
+            ),
+            (
+                "[env.hetzner.provider]\nprovider = \"hetzner\"\nmax_instances = 257\n",
+                "provider safety bound",
+            ),
+        ];
+        for (body, reason) in cases {
+            let errors = validate_str(body);
+            assert!(
+                errors.iter().any(|error| error.contains(reason)),
+                "{body:?} -> {errors:?}"
+            );
+            assert!(
+                !errors.iter().any(|error| error.contains("token")),
+                "provider diagnostics must not echo endpoint credentials: {errors:?}"
+            );
+        }
+
+        let valid = r#"
+[env.fly.provider]
+provider = "fly"
+api_base = "http://127.0.0.1:8080/v1"
+size = "shared-cpu-2x"
+template = "image:registry.example/dev:1"
+"#;
+        assert!(validate_str(valid).is_empty(), "{:?}", validate_str(valid));
     }
 
     #[test]

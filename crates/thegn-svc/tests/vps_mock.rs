@@ -140,6 +140,39 @@ fn create_list_destroy_round_trip_with_ledger() {
         .enable_all()
         .build()
         .unwrap();
+
+    // Drive the actual create boundary for malformed local inputs. Admission
+    // must happen before ensure_ssh_key, registry::write, or any HTTP request.
+    for (suffix, invalid) in [
+        ("image", 0u8),
+        ("endpoint", 1),
+        ("name", 2),
+        ("cap", 3),
+        ("key", 4),
+    ] {
+        let mut bad = spec(&base, tmp.path());
+        bad.name = format!("tg-vps-invalid-{suffix}");
+        match invalid {
+            0 => bad.image = "snapshot:not-numeric".into(),
+            1 => bad.api_base = "https://user:token@example.invalid/v1".into(),
+            2 => bad.name = " tg-vps-invalid ".into(),
+            3 => bad.max_instances = 257,
+            _ => bad.pubkey = "not-a-public-key".into(),
+        }
+        assert!(
+            rt.block_on(VpsProvider::new(bad).create()).is_err(),
+            "invalid {suffix} must be rejected locally"
+        );
+        assert!(
+            recorded.lock().unwrap().is_empty(),
+            "invalid {suffix} made a request"
+        );
+        assert!(
+            registry::read(&format!("tg-vps-invalid-{suffix}")).is_none(),
+            "invalid {suffix} wrote a ledger row"
+        );
+    }
+
     let p = VpsProvider::new(spec(&base, tmp.path()));
 
     // --- create: registers our key (the listed one differs), posts the server,
