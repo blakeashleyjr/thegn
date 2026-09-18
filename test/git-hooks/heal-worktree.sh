@@ -18,7 +18,9 @@
 # other byte. It mirrors `thegn_core::util::strip_core_worktree` so the
 # in-process (thegn) heal and this out-of-process heal agree.
 #
-# Usage: run from anywhere inside the checkout. `-v` prints when it heals.
+# Usage: explicit developer repair from inside a reviewed checkout. `-v` prints
+# when it heals. This is not a checkout hook, is not generation-fenced, and is
+# not a race-safe security boundary; shared-config repair belongs to THE-371.
 #   sh test/git-hooks/heal-worktree.sh [-v] [dir]
 # Exit 0 always (a stray key found+stripped, or nothing to do); it is a safe,
 # idempotent no-op on a clean config and on a linked worktree's own config
