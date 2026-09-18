@@ -68,7 +68,7 @@ fn opened_identity_change_is_rejected_without_path_reread() {
     std::fs::write(&replacement, b"two").unwrap();
     let metadata = metadata_target(&original).unwrap().unwrap();
     assert_eq!(
-        read_target(metadata, 64, |file| {
+        read_target(metadata, 64, |_file| {
             std::fs::File::open(replacement).map_err(|_| Error::Unavailable)
         }),
         Err(Error::Changed)

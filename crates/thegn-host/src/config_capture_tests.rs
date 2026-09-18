@@ -361,23 +361,16 @@ fn native_linux_seed(dir: &tempfile::TempDir) -> ConfigCaptureSeed {
 }
 
 #[cfg(target_os = "linux")]
-fn native_fixture() -> Option<tempfile::TempDir> {
-    let dir = tempfile::Builder::new()
-        .prefix("thegn-config-integration-")
-        .tempdir_in("/dev/shm")
-        .unwrap_or_else(|error| panic!("Linux integration fixture setup failed: {error}"));
-    let probe = dir.path().join("probe");
-    std::fs::write(&probe, b"probe").unwrap();
-    match crate::platform::config_file_capture::Reader.read_bounded(&probe, 64) {
-        Ok(Some(_)) => Some(dir),
-        Err(ConfigFileReadError::Unavailable) => {
-            eprintln!(
-                "SKIP: Linux config integration cannot exercise the supported /dev/shm tmpfs"
-            );
-            None
-        }
-        other => panic!("unexpected native config fixture probe: {other:?}"),
-    }
+fn native_fixture() -> tempfile::TempDir {
+    // The production DB adapter checks every ancestor from /. A shared /tmp
+    // or /dev/shm fixture must be refused, even when its leaf is private.
+    // Keep this real integration fixture below the user's private home. An
+    // unsupported home filesystem is a visible test failure, not fake coverage.
+    let home = std::env::var_os("HOME").expect("Linux integration fixture needs HOME");
+    tempfile::Builder::new()
+        .prefix(".thegn-config-integration-")
+        .tempdir_in(home)
+        .expect("create private configuration integration fixture")
 }
 
 #[cfg(target_os = "linux")]
@@ -402,7 +395,7 @@ fn create_host_db(path: &Path, wal: bool) -> Connection {
 #[cfg(target_os = "linux")]
 #[test]
 fn load_once_uses_private_config_and_wal_fixtures_and_fails_closed() {
-    let Some(dir) = native_fixture() else { return };
+    let dir = native_fixture();
     let seed = native_linux_seed(&dir);
     std::fs::write(&seed.base.path, b"branch_prefix = 'captured/'\n").unwrap();
     let writer = create_host_db(&seed.state_db, true);
