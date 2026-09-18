@@ -12,9 +12,11 @@
 //!    `cat bigfile`. Bytes are NEVER dropped: a dropped chunk can split an
 //!    escape sequence (corrupting emulator state) and silently lose
 //!    scrollback; backpressure is the correct throttle.
-//! 2. **Exits**: a pane's stashed output parses before its Exit is honored, so
-//!    final output lands in scrollback before the pane leaves the table.
-//! 3. **Parse**: round-robin across panes with backlog, coalescing each
+//! 2. **Exits**: exit notifications persist beside the backlog; a pane's
+//!    stashed output parses before its Exit is honored, so final output lands
+//!    in scrollback before the pane leaves the table.
+//! 3. **Parse**: round-robin across ordinary and pending-exit panes,
+//!    coalescing each
 //!    pane's queued chunks into one buffer per [`crate::loop_policy::pane_slice`] —
 //!    one emulator feed + one query scan + one OSC pass per merged buffer
 //!    instead of per 8KB chunk. Slices are capped (`loop_policy::MAX_SLICE`)
@@ -99,8 +101,13 @@ fn report_pane_connect_failure(cfg: &thegn_core::config::Config, wt: &str) {
 pub(crate) struct PtyBacklog {
     per_pane: HashMap<u32, VecDeque<(u64, Vec<u8>)>>,
     generations: HashMap<u32, u64>,
+    /// Exit notifications persist until the pane's queued tail is parsed.
+    pending_exits: HashMap<u32, Option<i32>>,
     clipboard_ready: VecDeque<u32>,
     /// Round-robin cursor order over panes with backlog.
+    /// The same queue carries ordinary output and pending exits. An exit with
+    /// no output is queued here when it arrives, so it cannot bypass the byte
+    /// budget or starve ordinary panes.
     rr: VecDeque<u32>,
     /// Total stashed bytes (the high-water gauge).
     total: usize,
@@ -108,7 +115,7 @@ pub(crate) struct PtyBacklog {
 
 impl PtyBacklog {
     pub(crate) fn is_empty(&self) -> bool {
-        self.total == 0
+        self.total == 0 && self.pending_exits.is_empty()
     }
 
     fn push(&mut self, id: u32, chunk: Vec<u8>) {
@@ -172,6 +179,39 @@ impl PtyBacklog {
         self.clipboard_ready.retain(|&p| p != id);
     }
 
+    fn pending_exit(&mut self, id: u32, code: Option<i32>) {
+        if self.pending_exits.contains_key(&id) {
+            return;
+        }
+        self.pending_exits.insert(id, code);
+        if !self.rr.contains(&id) {
+            self.rr.push_back(id);
+        }
+    }
+
+    /// Admit an exit only while its pane is live, or while an earlier exit is
+    /// still draining. Once retirement removes both states, a late duplicate
+    /// cannot re-enter the lifecycle without a lifetime tombstone set.
+    fn queue_exit_if_live(&mut self, id: u32, code: Option<i32>, pane_live: bool) {
+        if pane_live || self.pending_exits.contains_key(&id) {
+            self.pending_exit(id, code);
+        }
+    }
+
+    fn take_exit(&mut self, id: u32) -> Option<Option<i32>> {
+        self.pending_exits.remove(&id)
+    }
+
+    fn retire(&mut self, id: u32) {
+        if let Some(q) = self.per_pane.remove(&id) {
+            self.total -= q.iter().map(|(_, bytes)| bytes.len()).sum::<usize>();
+        }
+        self.rr.retain(|&queued| queued != id);
+        self.take_exit(id);
+        self.generations.remove(&id);
+        self.clipboard_ready.retain(|&queued| queued != id);
+    }
+
     fn clipboard_pending(&mut self, id: u32) {
         if !self.clipboard_ready.contains(&id) {
             self.clipboard_ready.push_back(id);
@@ -226,7 +266,9 @@ impl PtyBacklog {
     /// a flooding pane yields to its siblings between slices.
     fn next_pane(&mut self) -> Option<u32> {
         while let Some(id) = self.rr.pop_front() {
-            if self.per_pane.get(&id).is_some_and(|q| !q.is_empty()) {
+            if self.per_pane.get(&id).is_some_and(|q| !q.is_empty())
+                || self.pending_exits.contains_key(&id)
+            {
                 self.rr.push_back(id);
                 return Some(id);
             }
@@ -236,6 +278,10 @@ impl PtyBacklog {
 
     fn panes_with_backlog(&self) -> usize {
         self.per_pane.len()
+    }
+
+    fn has_work(&self) -> bool {
+        !self.is_empty()
     }
 }
 
@@ -321,6 +367,86 @@ pub(crate) struct DrainCtx<'a> {
     pub waker: &'a termwiz::terminal::TerminalWaker,
 }
 
+/// Commit one exit after its final output slice has been parsed. The exit map
+/// is removed before this runs, so duplicate notifications cannot run cleanup
+/// or `handle_exit` twice. Reader channels preserve per-pane output-before-exit
+/// order; the receive path also ignores output for panes already removed.
+fn finish_exit(
+    ctx: &mut DrainCtx<'_>,
+    id: u32,
+    exit_code: Option<i32>,
+    summary: &mut DrainSummary,
+) {
+    if let Some(p) = ctx.panes.table.get_mut(&id) {
+        p.clipboard
+            .submit(|bytes| ctx.writer.try_submit_clipboard(bytes, || {}));
+        p.clipboard.reset();
+    }
+    if ctx.preview.pane_exit(id) {
+        *ctx.dirty = true;
+    }
+    // A degraded pane that exited needs no watchdog entry. (A missed prune
+    // is harmless memory — pane ids are monotonic and never reused.)
+    ctx.degraded_at.remove(&id);
+    summary.left_for_materialize |= handle_exit(ctx, id, exit_code);
+    summary.exited.push(id);
+}
+
+#[derive(Default)]
+struct BacklogDrainSummary {
+    fed_panes: Vec<u32>,
+    completed_exits: Vec<(u32, Option<i32>)>,
+    preempted: bool,
+}
+
+/// The production byte/deadline/input seam for both ordinary output and exit
+/// tails. The full drain supplies the emulator/clipboard callback; tests can
+/// supply a recording parser and deterministic input source without bypassing
+/// the scheduling path itself.
+fn drain_backlog_work(
+    backlog: &mut PtyBacklog,
+    max_bytes: usize,
+    deadline: Duration,
+    started: Instant,
+    mut feed: impl FnMut(u32, &[u8], bool),
+    mut input_pending: impl FnMut() -> bool,
+) -> BacklogDrainSummary {
+    let mut out = BacklogDrainSummary::default();
+    let mut spent = 0usize;
+    while backlog.has_work() {
+        if spent >= max_bytes || started.elapsed() >= deadline {
+            break;
+        }
+        let Some(id) = backlog.next_pane() else {
+            break;
+        };
+        // The one RR queue reaches an exiting pane once per slice. Once its
+        // tail is gone, the next visit commits the exit without consuming
+        // byte budget; a zero-tail exit follows the same path immediately.
+        if backlog.pending_exits.contains_key(&id) && !backlog.per_pane.contains_key(&id) {
+            if let Some(code) = backlog.take_exit(id) {
+                backlog.retire(id);
+                out.completed_exits.push((id, code));
+            }
+            continue;
+        }
+        let slice = crate::loop_policy::pane_slice(max_bytes - spent, backlog.panes_with_backlog());
+        let (generation, merged) = backlog.take_tagged_slice(id, slice);
+        if merged.is_empty() {
+            continue;
+        }
+        spent += merged.len();
+        let current = *backlog.generations.get(&id).unwrap_or(&0);
+        feed(id, &merged, generation == current);
+        out.fed_panes.push(id);
+        if input_pending() {
+            out.preempted = true;
+            break;
+        }
+    }
+    out
+}
+
 /// One budgeted drain pass. See the module docs for the shape.
 pub(crate) fn drain<T: Terminal>(
     ctx: &mut DrainCtx<'_>,
@@ -331,22 +457,31 @@ pub(crate) fn drain<T: Terminal>(
     input_at: &mut Option<Instant>,
 ) -> DrainSummary {
     let budget = crate::loop_policy::drain_budget(input_at.is_some() || !pending_input.is_empty());
-    let t0 = Instant::now();
+    // The receive phase and parser phase share this start. In particular, a
+    // large ready channel cannot reset the parser's wall-clock allowance.
+    let started = Instant::now();
     let mut summary = DrainSummary::default();
 
     // 1. Receive — stash raw chunks, no parsing. Stop at the high-water so the
     // bounded channel backpressures the reader threads (and the child).
-    let mut exits: Vec<(u32, Option<i32>)> = Vec::new();
     let mut fallbacks: Vec<u32> = Vec::new();
     let mut reattached: Vec<u32> = Vec::new();
     while backlog.total < crate::loop_policy::BACKLOG_HIGH_WATER {
         match rx.try_recv() {
             Ok(PaneEvent::Output(id, chunk)) => {
-                summary.chunks += 1;
-                summary.bytes += chunk.len() as u64;
-                backlog.push(id, chunk);
+                // A pane removed by an earlier lifecycle action has no
+                // consumer left for its bytes. Reader ordering guarantees a
+                // live pane's output precedes its Exit; an already-pending
+                // exit is still accepted until its tail is complete.
+                if ctx.panes.table.contains_key(&id) || backlog.pending_exits.contains_key(&id) {
+                    summary.chunks += 1;
+                    summary.bytes += chunk.len() as u64;
+                    backlog.push(id, chunk);
+                }
             }
-            Ok(PaneEvent::Exit(id, code)) => exits.push((id, code)),
+            Ok(PaneEvent::Exit(id, code)) => {
+                backlog.queue_exit_if_live(id, code, ctx.panes.table.contains_key(&id));
+            }
             Ok(PaneEvent::SessionFallback(id)) => {
                 backlog.barrier(id);
                 if let Some(p) = ctx.panes.table.get_mut(&id) {
@@ -387,52 +522,37 @@ pub(crate) fn drain<T: Terminal>(
         crate::handlers::daemon_lifecycle::handle_session_fallback(ctx, id);
     }
 
-    // 2. Exits — flush the pane's stashed tail into its emulator first, so
-    // its final output reaches scrollback before the pane leaves the table.
-    summary.exited = exits.iter().map(|(id, _)| *id).collect();
-    for (id, code) in exits {
-        loop {
-            let (generation, tail) = backlog.take_tagged_slice(id, crate::loop_policy::MAX_SLICE);
-            if tail.is_empty() {
-                break;
+    // 2+3+4. Parse ordinary and pending-exit panes under one shared budget,
+    // with input preemption between every parser slice. An exit is finalized
+    // only after its stashed tail reaches the emulator.
+    let work = drain_backlog_work(
+        backlog,
+        budget.max_bytes,
+        budget.deadline,
+        started,
+        |id, merged, admit_clipboard| {
+            handle_output(ctx, id, merged, admit_clipboard);
+        },
+        || {
+            // Input preemption: a keystroke found here aborts the drain — its
+            // dispatch must not wait out the backlog. Wake/Resized events just
+            // queue; they don't abort.
+            if let Ok(Some(ev)) = buf.terminal().poll_input(Some(Duration::ZERO)) {
+                use termwiz::input::InputEvent;
+                let interactive = matches!(
+                    ev,
+                    InputEvent::Key(_) | InputEvent::Mouse(_) | InputEvent::Paste(_)
+                );
+                pending_input.push_back(ev);
+                if interactive {
+                    crate::perf_timing::observe_input(input_at, Instant::now());
+                    return true;
+                }
             }
-            let current = *backlog.generations.get(&id).unwrap_or(&0);
-            handle_output(ctx, id, &tail, generation == current);
-        }
-        if let Some(p) = ctx.panes.table.get_mut(&id) {
-            p.clipboard
-                .submit(|bytes| ctx.writer.try_submit_clipboard(bytes, || {}));
-            p.clipboard.reset();
-        }
-        backlog.clipboard_ready.retain(|&p| p != id);
-        backlog.generations.remove(&id);
-        backlog.rr.retain(|&p| p != id);
-        if ctx.preview.pane_exit(id) {
-            *ctx.dirty = true;
-        }
-        // A degraded pane that exited needs no watchdog entry. (A missed prune
-        // is harmless memory — pane ids are monotonic and never reused.)
-        ctx.degraded_at.remove(&id);
-        summary.left_for_materialize |= handle_exit(ctx, id, code);
-    }
-
-    // 3+4. Parse round-robin under the byte/deadline budget, with input
-    // preemption between pane slices.
-    let mut spent = 0usize;
-    while !backlog.is_empty() {
-        if spent >= budget.max_bytes || t0.elapsed() >= budget.deadline {
-            break;
-        }
-        let slice =
-            crate::loop_policy::pane_slice(budget.max_bytes - spent, backlog.panes_with_backlog());
-        let Some(id) = backlog.next_pane() else { break };
-        let (generation, merged) = backlog.take_tagged_slice(id, slice);
-        if merged.is_empty() {
-            continue;
-        }
-        spent += merged.len();
-        let current = *backlog.generations.get(&id).unwrap_or(&0);
-        handle_output(ctx, id, &merged, generation == current);
+            false
+        },
+    );
+    for id in work.fed_panes {
         if ctx
             .panes
             .table
@@ -441,23 +561,10 @@ pub(crate) fn drain<T: Terminal>(
         {
             backlog.clipboard_pending(id);
         }
-
-        // Input preemption: a keystroke found here aborts the drain — its
-        // dispatch (and the frame showing its effect) must not wait out the
-        // backlog. Wake/Resized events just queue; they don't abort.
-        if let Ok(Some(ev)) = buf.terminal().poll_input(Some(Duration::ZERO)) {
-            use termwiz::input::InputEvent;
-            let interactive = matches!(
-                ev,
-                InputEvent::Key(_) | InputEvent::Mouse(_) | InputEvent::Paste(_)
-            );
-            pending_input.push_back(ev);
-            if interactive {
-                crate::perf_timing::observe_input(input_at, Instant::now());
-                summary.preempted = true;
-                break;
-            }
-        }
+    }
+    summary.preempted = work.preempted;
+    for (id, code) in work.completed_exits {
+        finish_exit(ctx, id, code, &mut summary);
     }
 
     // Retry a bounded round-robin pass. Writer capacity release supplies the
@@ -484,7 +591,7 @@ pub(crate) fn drain<T: Terminal>(
     // the common case.
     prune_output_degraded(ctx.degraded_at, ctx.panes);
 
-    summary.budget_exhausted = !backlog.is_empty();
+    summary.budget_exhausted = backlog.has_work();
     summary
 }
 
@@ -1439,6 +1546,7 @@ fn detach_exited_terminal(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::emulator::{AlacrittyEmulator, PaneEmulator};
     use crate::session::{GroupKind, Session, WorktreeGroup};
 
     fn term_row(id: i64, name: &str) -> thegn_core::models::TerminalRow {
@@ -1654,6 +1762,182 @@ mod tests {
         assert_eq!(b.total, 100, "other panes' backlog is untouched");
         assert!(b.drain_pane(3).is_empty());
     }
+
+    #[test]
+    fn production_backlog_seam_bounds_a_multimeg_exit_tail_and_retires_once() {
+        let mut backlog = PtyBacklog::default();
+        let bytes = (0..2 * 1024 * 1024)
+            .map(|n| b'a' + (n % 26) as u8)
+            .collect::<Vec<_>>();
+        backlog.push(7, bytes.clone());
+        backlog.pending_exit(7, Some(23));
+        backlog.pending_exit(7, Some(99));
+        assert_eq!(backlog.pending_exits.get(&7), Some(&Some(23)));
+
+        let mut parsed = Vec::new();
+        let first = drain_backlog_work(
+            &mut backlog,
+            128 * 1024,
+            Duration::from_secs(5),
+            Instant::now(),
+            |_, slice, _| parsed.extend_from_slice(slice),
+            || false,
+        );
+        assert!(parsed.len() <= 128 * 1024);
+        assert!(first.completed_exits.is_empty());
+        assert!(backlog.pending_exits.contains_key(&7));
+
+        let mut completed = first.completed_exits;
+        while backlog.has_work() {
+            let pass = drain_backlog_work(
+                &mut backlog,
+                128 * 1024,
+                Duration::from_secs(5),
+                Instant::now(),
+                |_, slice, _| parsed.extend_from_slice(slice),
+                || false,
+            );
+            completed.extend(pass.completed_exits);
+        }
+        assert_eq!(parsed, bytes, "exit tail remains FIFO and byte exact");
+        assert_eq!(completed, vec![(7, Some(23))]);
+        assert!(backlog.pending_exits.is_empty());
+
+        assert!(backlog.is_empty());
+    }
+
+    #[test]
+    fn production_backlog_seam_rejects_duplicate_exit_after_retirement() {
+        let mut backlog = PtyBacklog::default();
+        backlog.queue_exit_if_live(7, Some(23), true);
+        backlog.queue_exit_if_live(7, Some(99), true);
+        assert_eq!(backlog.pending_exits.get(&7), Some(&Some(23)));
+        backlog.retire(7);
+        backlog.queue_exit_if_live(7, Some(99), false);
+        assert!(backlog.pending_exits.is_empty());
+    }
+
+    #[test]
+    fn production_backlog_seam_preempts_a_pending_exit_and_keeps_it_queued() {
+        let mut backlog = PtyBacklog::default();
+        backlog.push(3, vec![b'x'; 64 * 1024]);
+        backlog.pending_exit(3, Some(1));
+        let mut polls = 0;
+        let pass = drain_backlog_work(
+            &mut backlog,
+            128 * 1024,
+            Duration::from_secs(5),
+            Instant::now(),
+            |_, _, _| {},
+            || {
+                polls += 1;
+                true
+            },
+        );
+        assert!(pass.preempted);
+        assert_eq!(polls, 1);
+        assert!(pass.completed_exits.is_empty());
+        assert!(backlog.pending_exits.contains_key(&3));
+        assert!(backlog.total > 0);
+    }
+
+    #[test]
+    fn production_backlog_seam_keeps_pending_exit_when_deadline_is_already_spent() {
+        let mut backlog = PtyBacklog::default();
+        backlog.push(5, vec![b'x'; 32 * 1024]);
+        backlog.pending_exit(5, Some(2));
+        let mut parsed = Vec::new();
+        let started = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .expect("test instant supports subtraction");
+        let pass = drain_backlog_work(
+            &mut backlog,
+            128 * 1024,
+            Duration::from_millis(1),
+            started,
+            |_, slice, _| parsed.extend_from_slice(slice),
+            || false,
+        );
+        assert!(
+            parsed.is_empty(),
+            "an expired shared deadline feeds nothing"
+        );
+        assert!(pass.completed_exits.is_empty());
+        assert!(backlog.pending_exits.contains_key(&5));
+        assert_eq!(backlog.total, 32 * 1024);
+    }
+
+    #[test]
+    fn production_backlog_seam_interleaves_quiet_pane_with_exit_flood() {
+        let mut backlog = PtyBacklog::default();
+        backlog.push(1, vec![b'f'; 2 * 1024 * 1024]);
+        backlog.pending_exit(1, Some(0));
+        backlog.push(2, b"quiet pane\n".to_vec());
+        let mut order = Vec::new();
+        let pass = drain_backlog_work(
+            &mut backlog,
+            128 * 1024,
+            Duration::from_secs(5),
+            Instant::now(),
+            |id, slice, _| order.push((id, slice.to_vec())),
+            || false,
+        );
+        assert!(pass.completed_exits.is_empty());
+        assert!(order.iter().any(|(id, _)| *id == 2));
+        assert!(
+            order
+                .iter()
+                .any(|(id, bytes)| *id == 1 && bytes.len() <= 16 * 1024)
+        );
+        assert!(backlog.pending_exits.contains_key(&1));
+    }
+
+    #[test]
+    fn production_backlog_seam_preserves_split_utf8_and_feed_order() {
+        let mut backlog = PtyBacklog::default();
+        let mut bytes = b"\x1b[2J\x1b[H".to_vec();
+        bytes.extend(vec![b'a'; 16_375]);
+        bytes.extend("🙂\n".as_bytes());
+        bytes.extend(b"\x1b[1;1HX\n");
+        // The emoji begins at byte 16,382, so MAX_SLICE splits its UTF-8
+        // sequence across two production parser feeds.
+        assert_eq!(bytes[16_382], 0xf0);
+        backlog.push(4, bytes.clone());
+        backlog.pending_exit(4, Some(0));
+        let mut feed_chunks = Vec::new();
+        let mut admitted = Vec::new();
+        let mut emulator = AlacrittyEmulator::new(24, 80, 1000);
+        let mut expected = AlacrittyEmulator::new(24, 80, 1000);
+        expected.advance(&bytes);
+        let pass = drain_backlog_work(
+            &mut backlog,
+            128 * 1024,
+            Duration::from_secs(5),
+            Instant::now(),
+            |_, slice, admit| {
+                emulator.advance(slice);
+                feed_chunks.push(slice.to_vec());
+                admitted.push(admit);
+            },
+            || false,
+        );
+        assert_eq!(pass.completed_exits, vec![(4, Some(0))]);
+        assert!(!admitted.is_empty());
+        assert!(admitted.into_iter().all(|admit| admit));
+        assert!(feed_chunks.len() >= 2, "MAX_SLICE must split the tail");
+        assert_eq!(feed_chunks[0].len(), 16 * 1024);
+        assert_eq!(feed_chunks.into_iter().flatten().collect::<Vec<_>>(), bytes);
+        for row in 0..24 {
+            for col in 0..80 {
+                assert_eq!(
+                    emulator.cell(row, col),
+                    expected.cell(row, col),
+                    "split parser differs at ({row},{col})"
+                );
+            }
+        }
+    }
+
     #[test]
     fn backlog_generation_barriers_preserve_bytes_without_crossing_clipboard_state() {
         let mut backlog = PtyBacklog::default();
