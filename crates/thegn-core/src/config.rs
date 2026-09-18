@@ -5528,6 +5528,7 @@ pub fn env_overlay(env: &dyn EnvSource) -> ConfigOverlay {
         match raw.trim().parse::<u64>() {
             Ok(n) => Some(n),
             Err(_) => {
+                crate::config_diagnostics::supplied_error(key, "number");
                 config_warn(&format!("{key}: not a number ({raw:?}); ignoring"));
                 None
             }
@@ -5537,6 +5538,7 @@ pub fn env_overlay(env: &dyn EnvSource) -> ConfigOverlay {
         match raw.trim().parse::<f64>() {
             Ok(n) if n.is_finite() => Some(n),
             _ => {
+                crate::config_diagnostics::supplied_error(key, "finite-number");
                 config_warn(&format!("{key}: not a finite number ({raw:?}); ignoring"));
                 None
             }
@@ -5548,6 +5550,7 @@ pub fn env_overlay(env: &dyn EnvSource) -> ConfigOverlay {
         match parse(raw) {
             Ok(v) => Some(v),
             Err(e) => {
+                crate::config_diagnostics::supplied_error(key, "enum");
                 config_warn(&format!("{key}: {e}; ignoring"));
                 None
             }
@@ -5819,7 +5822,10 @@ pub fn env_overlay(env: &dyn EnvSource) -> ConfigOverlay {
     if let Some(v) = env.get("THEGN_PREVIEW_PORTS") {
         match crate::config_preview::parse_ports_env(&v) {
             Ok(ports) => o.preview.ports = Some(ports),
-            Err(error) => config_warn(&format!("THEGN_PREVIEW_PORTS: {error}; ignoring")),
+            Err(error) => {
+                crate::config_diagnostics::supplied_error("THEGN_PREVIEW_PORTS", "ports");
+                config_warn(&format!("THEGN_PREVIEW_PORTS: {error}; ignoring"));
+            }
         }
     }
     if let Some(v) = env.get("THEGN_PREVIEW_FETCH_TIMEOUT_MS") {
@@ -5956,6 +5962,7 @@ fn parse_bool(raw: &str, key: &str) -> Option<bool> {
         "1" | "true" | "yes" | "on" => Some(true),
         "0" | "false" | "no" | "off" => Some(false),
         other => {
+            crate::config_diagnostics::supplied_error(key, "boolean");
             config_warn(&format!("{key}: not a boolean ({other:?}); ignoring"));
             None
         }
@@ -5964,6 +5971,7 @@ fn parse_bool(raw: &str, key: &str) -> Option<bool> {
 
 pub(crate) fn apply_env_overlay_checked(cfg: &mut Config, mut overlay: ConfigOverlay) {
     for error in crate::config_duration::retain_valid_env_durations(&mut overlay) {
+        crate::config_diagnostics::supplied_error("environment duration", "range");
         config_warn(&error);
     }
     // Invalid duration fields never discard unrelated explicit authority such
@@ -6210,12 +6218,27 @@ impl Config {
     /// The admission boundary calls this exactly once; it remains crate-visible
     /// so legacy loaders and later host migration can share the same behavior.
     pub(crate) fn post_process(&mut self) {
-        crate::config_drawer::warn_policy_issues(self);
+        self.post_process_inner(true);
+    }
+
+    /// Normalize an admitted candidate without emitting diagnostics or
+    /// installing process-global policy.  Admission calls this before its
+    /// final checks; the legacy loader keeps the effectful wrapper above.
+    pub(crate) fn post_process_pure(&mut self) {
+        self.post_process_inner(false);
+    }
+
+    fn post_process_inner(&mut self, emit_runtime_effects: bool) {
+        if emit_runtime_effects {
+            crate::config_drawer::warn_policy_issues(self);
+        }
         crate::config_drawer::strip_agent_metadata(&mut self.agents);
-        // Install the resolved [remote] tuning into the process-global holders
-        // (ssh keepalives / control-plane retry / heal cadence); first set wins.
-        self.remote.install();
-        self.network.install(); // [network] → connectivity holder (mode + thresholds)
+        if emit_runtime_effects {
+            // Install the resolved [remote] tuning into the process-global
+            // holders (ssh keepalives / control-plane retry / heal cadence).
+            self.remote.install();
+            self.network.install(); // [network] → connectivity holder
+        }
         if self.agents.is_empty() {
             self.agents = vec![
                 NamedCommand {
@@ -6309,8 +6332,10 @@ impl Config {
             ];
         }
 
-        for diagnostic in crate::custom_cmd::validate_commands(&self.git_commands) {
-            config_warn(&diagnostic);
+        if emit_runtime_effects {
+            for diagnostic in crate::custom_cmd::validate_commands(&self.git_commands) {
+                config_warn(&diagnostic);
+            }
         }
         for p in &mut self.pins {
             if let Some(cwd) = &p.cwd {
@@ -6338,19 +6363,23 @@ impl Config {
         // and remove, rather than parade a permanently-erroring target.
         self.metrics.targets.retain(|t| match t.kind {
             MetricsTargetKind::Command if t.command_argv().is_none() => {
-                tracing::warn!(
-                    target: "thegn::config",
-                    name = %t.name,
-                    "dropping metrics command collector with empty argv"
-                );
+                if emit_runtime_effects {
+                    tracing::warn!(
+                        target: "thegn::config",
+                        name = %t.name,
+                        "dropping metrics command collector with empty argv"
+                    );
+                }
                 false
             }
             MetricsTargetKind::Prometheus if t.url.trim().is_empty() => {
-                tracing::warn!(
-                    target: "thegn::config",
-                    name = %t.name,
-                    "dropping prometheus metrics target with no url"
-                );
+                if emit_runtime_effects {
+                    tracing::warn!(
+                        target: "thegn::config",
+                        name = %t.name,
+                        "dropping prometheus metrics target with no url"
+                    );
+                }
                 false
             }
             _ => true,
@@ -6374,7 +6403,9 @@ impl Config {
             ),
         ] {
             if let Err(e) = validate_strftime(fmt) {
-                config_warn(&format!("{label}: {e} — using {fallback:?}"));
+                if emit_runtime_effects {
+                    config_warn(&format!("{label}: {e} — using {fallback:?}"));
+                }
                 *fmt = fallback;
             }
         }

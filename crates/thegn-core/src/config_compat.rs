@@ -17,10 +17,35 @@ pub struct NormalizedToml {
     pub diagnostics: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NormalizeError {
+    Parse(String),
+    Budget(crate::config_budget::BudgetError),
+    Serialize(String),
+}
+
+impl std::fmt::Display for NormalizeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Parse(error) => f.write_str(error),
+            Self::Budget(error) => write!(f, "{error}"),
+            Self::Serialize(error) => f.write_str(error),
+        }
+    }
+}
+
 /// Normalize legacy project/workspace config spellings and report every
 /// compatibility use.  Canonical values/tables always win on duplicates.
 pub fn normalize(body: &str) -> Result<NormalizedToml, String> {
-    let mut value: toml::Value = body.parse().map_err(|e| format!("{e}"))?;
+    normalize_admission(body).map_err(|error| error.to_string())
+}
+
+pub fn normalize_admission(body: &str) -> Result<NormalizedToml, NormalizeError> {
+    crate::config_budget::scan(body.as_bytes()).map_err(NormalizeError::Budget)?;
+    let mut value: toml::Value = body
+        .parse()
+        .map_err(|error| NormalizeError::Parse(format!("{error}")))?;
+    crate::config_budget::check_toml_value(&value).map_err(NormalizeError::Budget)?;
     let mut diagnostics = Vec::new();
     let root = value
         .as_table_mut()
@@ -53,10 +78,14 @@ pub fn normalize(body: &str) -> Result<NormalizedToml, String> {
 
     normalize_project_tables(root, &mut diagnostics);
 
-    Ok(NormalizedToml {
-        body: toml::to_string(&value).map_err(|e| format!("cannot normalize config: {e}"))?,
-        diagnostics,
-    })
+    let body = toml::to_string(&value)
+        .map_err(|error| NormalizeError::Serialize(format!("cannot normalize config: {error}")))?;
+    if body.len() > crate::config_budget::MAX_NORMALIZED_BYTES {
+        return Err(NormalizeError::Budget(
+            crate::config_budget::BudgetError::AggregateBytes,
+        ));
+    }
+    Ok(NormalizedToml { body, diagnostics })
 }
 
 /// Convert a dotted key used by `config get/set` or `--set` to its canonical
@@ -86,14 +115,20 @@ fn rename_scalar(
     if table.contains_key(legacy) {
         if table.contains_key(canonical) {
             table.remove(legacy);
-            diagnostics.push(format!(
-                "duplicate config keys `{canonical_path}` and `{legacy_path}`; using canonical `{canonical_path}` (legacy accepted for {LEGACY_RELEASE_WINDOW} stable releases; removal: {LEGACY_REMOVAL_RELEASE})"
-            ));
+            push_diagnostic(
+                diagnostics,
+                format!(
+                    "duplicate config keys `{canonical_path}` and `{legacy_path}`; using canonical `{canonical_path}` (legacy accepted for {LEGACY_RELEASE_WINDOW} stable releases; removal: {LEGACY_REMOVAL_RELEASE})"
+                ),
+            );
         } else if let Some(value) = table.remove(legacy) {
             table.insert(canonical.to_string(), value);
-            diagnostics.push(format!(
-                "deprecated config key `{legacy_path}`; use `{canonical_path}` (accepted for {LEGACY_RELEASE_WINDOW} stable releases; removal: {LEGACY_REMOVAL_RELEASE})"
-            ));
+            push_diagnostic(
+                diagnostics,
+                format!(
+                    "deprecated config key `{legacy_path}`; use `{canonical_path}` (accepted for {LEGACY_RELEASE_WINDOW} stable releases; removal: {LEGACY_REMOVAL_RELEASE})"
+                ),
+            );
         }
     }
 }
@@ -126,23 +161,38 @@ fn normalize_project_tables(
     // BTreeMap makes diagnostics deterministic while retaining TOML values.
     let entries: BTreeMap<_, _> = legacy_table.clone().into_iter().collect();
     if entries.is_empty() {
-        diagnostics.push(format!(
-            "deprecated config table `workspace`; use `project` (accepted for {LEGACY_RELEASE_WINDOW} stable releases; removal: {LEGACY_REMOVAL_RELEASE})"
-        ));
+        push_diagnostic(
+            diagnostics,
+            format!(
+                "deprecated config table `workspace`; use `project` (accepted for {LEGACY_RELEASE_WINDOW} stable releases; removal: {LEGACY_REMOVAL_RELEASE})"
+            ),
+        );
     }
     for (slug, item) in entries {
         let legacy_path = format!("workspace.{slug}");
         let canonical_path = format!("project.{slug}");
         if canonical_table.contains_key(&slug) {
-            diagnostics.push(format!(
-                "duplicate config tables `{canonical_path}` and `{legacy_path}`; using canonical `{canonical_path}` (legacy accepted for {LEGACY_RELEASE_WINDOW} stable releases; removal: {LEGACY_REMOVAL_RELEASE})"
-            ));
+            push_diagnostic(
+                diagnostics,
+                format!(
+                    "duplicate config tables `{canonical_path}` and `{legacy_path}`; using canonical `{canonical_path}` (legacy accepted for {LEGACY_RELEASE_WINDOW} stable releases; removal: {LEGACY_REMOVAL_RELEASE})"
+                ),
+            );
         } else {
             canonical_table.insert(slug, item);
-            diagnostics.push(format!(
-                "deprecated config table `{legacy_path}`; use `{canonical_path}` (accepted for {LEGACY_RELEASE_WINDOW} stable releases; removal: {LEGACY_REMOVAL_RELEASE})"
-            ));
+            push_diagnostic(
+                diagnostics,
+                format!(
+                    "deprecated config table `{legacy_path}`; use `{canonical_path}` (accepted for {LEGACY_RELEASE_WINDOW} stable releases; removal: {LEGACY_REMOVAL_RELEASE})"
+                ),
+            );
         }
+    }
+}
+
+fn push_diagnostic(diagnostics: &mut Vec<String>, diagnostic: String) {
+    if diagnostics.len() < crate::config_budget::MAX_DIAGNOSTICS {
+        diagnostics.push(diagnostic);
     }
 }
 

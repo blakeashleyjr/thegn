@@ -9,6 +9,8 @@ use std::sync::{Mutex, OnceLock};
 const MAX_DIAGNOSTICS: usize = 256;
 thread_local! { static SOURCE: Cell<u64> = const { Cell::new(0) }; }
 thread_local! { static CAPTURE: RefCell<Option<Vec<String>>> = const { RefCell::new(None) }; }
+thread_local! { static SUPPLIED: RefCell<Option<Vec<String>>> = const { RefCell::new(None) }; }
+thread_local! { static QUIET: Cell<bool> = const { Cell::new(false) }; }
 static RECENT: OnceLock<Mutex<Recent>> = OnceLock::new();
 fn recent() -> &'static Mutex<Recent> {
     RECENT.get_or_init(|| Mutex::new(Recent::default()))
@@ -79,13 +81,16 @@ pub(crate) fn warn(message: &str) {
     let message = safe_warning(message);
     CAPTURE.with_borrow_mut(|captured| {
         if let Some(captured) = captured {
-            captured.push(message.clone());
+            if captured.len() < MAX_DIAGNOSTICS {
+                captured.push(message.clone());
+            }
         }
     });
-    let emit = recent()
-        .lock()
-        .map(|mut seen| seen.admit(SOURCE.get(), (std::panic::Location::caller(), &message)))
-        .unwrap_or(true);
+    let emit = !QUIET.get()
+        && recent()
+            .lock()
+            .map(|mut seen| seen.admit(SOURCE.get(), (std::panic::Location::caller(), &message)))
+            .unwrap_or(true);
     if emit {
         crate::msg::warn(&format!("config: {message}"));
     }
@@ -122,6 +127,52 @@ pub(crate) fn capture<T>(action: impl FnOnce() -> T) -> (T, Vec<String>) {
         .unwrap_or_default();
     drop(restore);
     (result, captured)
+}
+
+/// Record a parser-classified supplied-value failure without encoding the
+/// security decision in warning prose.  The key and kind are bounded and do
+/// not retain the supplied value.
+pub(crate) fn supplied_error(key: &str, kind: &str) {
+    SUPPLIED.with_borrow_mut(|errors| {
+        if let Some(errors) = errors
+            && errors.len() < MAX_DIAGNOSTICS
+        {
+            let mut item = String::with_capacity(key.len() + kind.len() + 1);
+            item.push_str(key);
+            item.push(':');
+            item.push_str(kind);
+            errors.push(item);
+        }
+    });
+}
+
+/// Capture environment/CLI parsing without emitting a runtime warning.  The
+/// typed supplied-value list is separate from redacted human diagnostics.
+pub(crate) fn capture_quiet<T>(action: impl FnOnce() -> T) -> (T, Vec<String>, Vec<String>) {
+    struct Restore(Option<Vec<String>>, Option<Vec<String>>, bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            CAPTURE.with(|captured| *captured.borrow_mut() = self.0.take());
+            SUPPLIED.with(|errors| *errors.borrow_mut() = self.1.take());
+            QUIET.set(self.2);
+        }
+    }
+
+    let previous = QUIET.replace(true);
+    let restore = Restore(
+        CAPTURE.with(|captured| captured.replace(Some(Vec::new()))),
+        SUPPLIED.with(|errors| errors.replace(Some(Vec::new()))),
+        previous,
+    );
+    let result = action();
+    let warnings = CAPTURE
+        .with(|captured| captured.replace(None))
+        .unwrap_or_default();
+    let supplied = SUPPLIED
+        .with(|errors| errors.replace(None))
+        .unwrap_or_default();
+    drop(restore);
+    (result, warnings, supplied)
 }
 
 #[cfg(test)]
