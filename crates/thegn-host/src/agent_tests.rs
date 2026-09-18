@@ -134,7 +134,7 @@ fn automatic_prewarm_rejects_host_specs_but_keeps_contained_specs() {
 #[test]
 fn removed_direnv_warm_is_inert_across_launch_seams_and_cache_leaf_shapes() {
     use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::fs::symlink;
+    use std::os::unix::fs::{PermissionsExt, symlink};
     use std::time::SystemTime;
 
     with_temp_state("direnv-zero-exec", || {
@@ -158,6 +158,17 @@ fn removed_direnv_warm_is_inert_across_launch_seams_and_cache_leaf_shapes() {
                 format!("#!/bin/sh\nprintf called > {}\n", marker.display()),
             )
             .unwrap();
+            std::fs::set_permissions(fake_bin.join(name), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+            // Positive control: an attempted evaluator call must leave evidence.
+            assert!(
+                std::process::Command::new(fake_bin.join(name))
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            assert!(marker.exists());
+            std::fs::remove_file(marker).unwrap();
         }
 
         let external = root.join("external.rc");
@@ -173,6 +184,16 @@ fn removed_direnv_warm_is_inert_across_launch_seams_and_cache_leaf_shapes() {
         let fifo_name = std::ffi::CString::new(fifo_leaf.as_os_str().as_bytes()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) }, 0);
         std::fs::create_dir(&directory_leaf).unwrap();
+        // Force stale cache targets so the removed blessing path would touch
+        // them if accidentally restored. Fresh fixture mtimes would hide it.
+        for target in [&external, &hard_target] {
+            std::fs::File::options()
+                .write(true)
+                .open(target)
+                .unwrap()
+                .set_modified(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(60))
+                .unwrap();
+        }
         let external_bytes = std::fs::read(&external).unwrap();
         let hard_bytes = std::fs::read(&hard_target).unwrap();
         let external_mtime: SystemTime = std::fs::metadata(&external).unwrap().modified().unwrap();
@@ -1139,6 +1160,22 @@ fn invalidated_devcontainer_exec_refuses_before_invoking_a_host_shell() {
             "the rejected target must not be replaced by a host shell"
         );
         crate::devcontainer_provider::remove_test_session(&worktree);
+        let missing = compose_spec(
+            &cfg,
+            &worktree,
+            None,
+            "shell",
+            &loc,
+            &outcome,
+            LaunchExtras::default(),
+        )
+        .expect_err("a vanished provider session must not become a host launch");
+        assert!(
+            missing
+                .downcast_ref::<DevcontainerLaunchRefused>()
+                .is_some()
+        );
+        assert!(!sentinel.exists());
         match old_shell {
             Some(shell) => unsafe { std::env::set_var("SHELL", shell) },
             None => unsafe { std::env::remove_var("SHELL") },

@@ -2857,9 +2857,15 @@ pub fn compose_spec(
     // the snippet loads the toolchain. Only a BARE-HOST pane (no sandbox spec,
     // `backend = none` local) keeps `${SHELL} -l` — there `$SHELL` is the user's
     // real zsh and the login files load the devShell via the rc-hook.
-    let mut provider_session = (sb.backend_label == "devcontainer")
+    let provider_session = (sb.backend_label == "devcontainer")
         .then(|| crate::devcontainer_provider::session_for(worktree))
         .flatten();
+    if sb.backend_label == "devcontainer" && sb.spec.is_none() && provider_session.is_none() {
+        return Err(DevcontainerLaunchRefused {
+            reason: "selected provider session is no longer available".into(),
+        }
+        .into());
+    }
     let in_oci = sb.spec.is_some() || provider_session.is_some();
     let cmd = if let Some(over) = extras.cmd_override {
         // An agent launched on a task: the caller already rendered the command.
