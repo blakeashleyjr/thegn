@@ -7,6 +7,7 @@ import os
 import shlex
 import hashlib
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -252,9 +253,12 @@ def main() -> int:
         assert candidate.read_bytes() == legacy
 
         candidate.write_bytes(b"foreign hook\n")
+        os.chmod(candidate, 0o755)
         before = metadata(candidate)
+        before_mode = stat.S_IMODE(os.lstat(candidate).st_mode)
         assert "foreign post-checkout" in detector(repo, env)
         assert metadata(candidate) == before
+        assert stat.S_IMODE(os.lstat(candidate).st_mode) == before_mode
         assert candidate.read_bytes() == b"foreign hook\n"
 
         for mode in ("fifo", "symlink", "regular"):
@@ -305,6 +309,20 @@ def main() -> int:
         fifo_before = metadata(candidate)
         assert "not an ordinary regular file" in detector(repo, env)
         assert metadata(candidate) == fifo_before
+
+        # A symlinked parent is also out of scope; the detector must not follow
+        # it merely because the target contains an otherwise valid hook.
+        real_hooks = repo / ".git/hooks-real"
+        hooks.rename(real_hooks)
+        hooks.symlink_to(real_hooks, target_is_directory=True)
+        try:
+            hooks_before = metadata(hooks)
+            assert "not a real local directory" in detector(repo, env)
+            assert metadata(hooks) == hooks_before
+        finally:
+            hooks.unlink()
+            real_hooks.rename(hooks)
+
         candidate.unlink()
         candidate.write_bytes(b"x" * (64 * 1024 + 1))
         assert "read bound" in detector(repo, env)
