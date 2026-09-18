@@ -242,7 +242,7 @@ impl Default for WorldClock {
 /// an internally-tagged enum: it matches `[[issue_accounts]]`, keeps the TOML
 /// flat, and means only the fields relevant to `provider` are read (the rest
 /// stay at their empty default).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct CalendarAccount {
     /// Stable id for this source, e.g. `"work"`. Also the cache key, so
@@ -266,13 +266,19 @@ pub struct CalendarAccount {
     /// `ics`: path to a `.ics` file, or to a directory of them (which is the
     /// vdir layout vdirsyncer and khal already write).
     pub path: String,
-    /// `ics_url` / `caldav`: the URL to fetch. `webcal://` is treated as https.
+    /// `ics_url`: an HTTP(S) or `webcal://` subscription URL. Webcal is
+    /// normalized to HTTPS during validation.
+    /// `caldav`: an HTTP(S) collection URL.
     pub url: String,
     /// `caldav`: username for Basic auth.
     pub username: String,
     /// `ics_url` / `caldav`: secret ref (`"env:VAR"` / `"file:PATH"`), resolved
     /// at fetch time. Note the URL itself is often a credential too.
     pub token: String,
+    /// Permit intentional local/LAN calendar destinations. This is a trusted
+    /// security boundary; unspecified, multicast, and broadcast destinations
+    /// remain refused, and ambient proxies are never used.
+    pub allow_private_network: bool,
     /// `caldav`: restrict to specific collections; empty means all.
     pub calendar_ids: Vec<String>,
 
@@ -291,6 +297,54 @@ pub struct CalendarAccount {
     pub timeout_secs: u64,
 }
 
+impl std::fmt::Debug for CalendarAccount {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Subscription URLs frequently contain credentials in their query.
+        // Keep config diagnostics useful without ever making Debug a secret
+        // disclosure path.
+        f.debug_struct("CalendarAccount")
+            .field("name", &self.name)
+            .field("provider", &self.provider)
+            .field("enabled", &self.enabled)
+            .field("color", &self.color)
+            .field("read_only", &self.read_only)
+            .field("refresh_interval_secs", &self.refresh_interval_secs)
+            .field("path", &self.path)
+            .field(
+                "url",
+                &if self.url.is_empty() {
+                    ""
+                } else {
+                    "<redacted>"
+                },
+            )
+            .field(
+                "username",
+                &if self.username.is_empty() {
+                    ""
+                } else {
+                    "<redacted>"
+                },
+            )
+            .field(
+                "token",
+                &if self.token.is_empty() {
+                    ""
+                } else {
+                    "<redacted>"
+                },
+            )
+            .field("allow_private_network", &self.allow_private_network)
+            .field("calendar_ids", &self.calendar_ids)
+            .field("command", &self.command)
+            .field("cwd", &self.cwd)
+            .field("env", &self.env)
+            .field("capabilities", &self.capabilities)
+            .field("timeout_secs", &self.timeout_secs)
+            .finish()
+    }
+}
+
 impl Default for CalendarAccount {
     fn default() -> Self {
         CalendarAccount {
@@ -304,6 +358,7 @@ impl Default for CalendarAccount {
             url: String::new(),
             username: String::new(),
             token: String::new(),
+            allow_private_network: false,
             calendar_ids: Vec::new(),
             command: Vec::new(),
             cwd: String::new(),
@@ -441,13 +496,18 @@ pub fn validate_calendar(cfg: &CalendarConfig) -> Vec<String> {
             CalendarProviderKind::Ics if a.path.trim().is_empty() => out.push(format!(
                 "calendar.accounts[{i}].path: required for provider \"ics\""
             )),
-            CalendarProviderKind::IcsUrl | CalendarProviderKind::CalDav
-                if a.url.trim().is_empty() =>
-            {
-                out.push(format!(
-                    "calendar.accounts[{i}].url: required for provider {:?}",
-                    a.provider.as_str()
-                ))
+            CalendarProviderKind::IcsUrl | CalendarProviderKind::CalDav => {
+                if a.url.trim().is_empty() {
+                    out.push(format!(
+                        "calendar.accounts[{i}].url: required for provider {:?}",
+                        a.provider.as_str()
+                    ));
+                } else if let Err(reason) = validate_remote_calendar_url(
+                    &a.url,
+                    matches!(a.provider, CalendarProviderKind::IcsUrl),
+                ) {
+                    out.push(format!("calendar.accounts[{i}].url: {reason}"));
+                }
             }
             CalendarProviderKind::Command if a.command.is_empty() => out.push(format!(
                 "calendar.accounts[{i}].command: required for provider \"command\""
@@ -463,6 +523,39 @@ pub fn validate_calendar(cfg: &CalendarConfig) -> Vec<String> {
         }
     }
     out
+}
+
+/// Parse and normalize a remote calendar URL without echoing it in a
+/// diagnostic. Query strings are intentionally retained because subscribed
+/// feeds commonly use signed query credentials, but userinfo and fragments
+/// are rejected so they cannot become an accidental secret/logging surface.
+pub fn normalize_remote_calendar_url(
+    raw: &str,
+    allow_webcal: bool,
+) -> Result<String, &'static str> {
+    let mut url = url::Url::parse(raw.trim()).map_err(|_| "must be a valid URL")?;
+    let scheme = url.scheme().to_ascii_lowercase();
+    let accepted =
+        matches!(scheme.as_str(), "http" | "https") || (allow_webcal && scheme == "webcal");
+    if !accepted {
+        return Err("must use http:// or https:// (webcal:// is accepted for ics_url)");
+    }
+    if scheme == "webcal" {
+        url.set_scheme("https")
+            .map_err(|_| "webcal URL could not be normalized")?;
+    }
+    if url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+    {
+        return Err("must not contain URL userinfo or a fragment");
+    }
+    Ok(url.to_string())
+}
+
+fn validate_remote_calendar_url(raw: &str, allow_webcal: bool) -> Result<(), &'static str> {
+    normalize_remote_calendar_url(raw, allow_webcal).map(|_| ())
 }
 
 /// Advisory display diagnostics. Raw account names remain semantic cache keys;

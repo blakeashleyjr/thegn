@@ -17,30 +17,46 @@ use std::time::Duration;
 use chrono::NaiveDate;
 use futures_util::future::BoxFuture;
 use thegn_core::config_calendar::CalendarAccount;
+use tokio::time::Instant;
 
 use super::{CalendarBackend, CalendarCaps, CalendarError, EventPage};
-
-/// Refuse to buffer a response larger than this.
-const MAX_BODY: usize = 32 << 20;
+use crate::http::{
+    CalendarHttpClient, CalendarHttpError, ExpectedMedia, MAX_REQUEST_BYTES, discard_body,
+    map_error, read_body, validate_encoding, validate_media,
+};
 
 pub struct CalDavBackend {
-    url: String,
     username: String,
     token: String,
     zone: String,
     timeout: Duration,
     max_events: usize,
+    http: Option<CalendarHttpClient>,
+    init_error: Option<CalendarHttpError>,
 }
 
 impl CalDavBackend {
     pub fn new(a: &CalendarAccount) -> Self {
+        let configured = !a.url.trim().is_empty();
+        let (http, init_error) = if !configured {
+            (None, None)
+        } else {
+            match thegn_core::config_calendar::normalize_remote_calendar_url(&a.url, false) {
+                Ok(url) => match CalendarHttpClient::new(&url, a.allow_private_network) {
+                    Ok(client) => (Some(client), None),
+                    Err(error) => (None, Some(error)),
+                },
+                Err(_) => (None, Some(CalendarHttpError::InvalidUrl)),
+            }
+        };
         CalDavBackend {
-            url: a.url.trim().to_string(),
             username: a.username.clone(),
             token: thegn_core::config::expand_env_ref(&a.token).unwrap_or_default(),
             zone: String::new(),
             timeout: Duration::from_secs(a.timeout_secs.clamp(5, 120)),
             max_events: 0,
+            http,
+            init_error,
         }
     }
 
@@ -87,8 +103,13 @@ fn calendar_query_body(from: NaiveDate, to: NaiveDate) -> String {
 }
 
 /// A `sync-collection` report resuming from `token`.
-fn sync_collection_body(token: &str) -> String {
-    format!(
+fn sync_collection_body(token: &str) -> Result<String, CalendarError> {
+    if token.len() > MAX_REQUEST_BYTES {
+        return Err(CalendarError::BodyLimit(
+            "calendar sync token exceeds limit",
+        ));
+    }
+    Ok(format!(
         r#"<?xml version="1.0" encoding="utf-8" ?>
 <d:sync-collection xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
   <d:sync-token>{}</d:sync-token>
@@ -96,7 +117,7 @@ fn sync_collection_body(token: &str) -> String {
   <d:prop><d:getetag/><c:calendar-data/></d:prop>
 </d:sync-collection>"#,
         xml_escape(token)
-    )
+    ))
 }
 
 fn xml_escape(s: &str) -> String {
@@ -230,24 +251,28 @@ impl CalendarBackend for CalDavBackend {
         sync_token: &'a str,
     ) -> BoxFuture<'a, Result<EventPage, CalendarError>> {
         Box::pin(async move {
-            if self.url.is_empty() {
+            if self.http.is_none() && self.init_error.is_none() {
                 return Err(CalendarError::NotConfigured);
             }
-            let client = reqwest::Client::builder()
-                .timeout(self.timeout)
-                .build()
-                .map_err(|e| CalendarError::Network(e.to_string()))?;
+            if let Some(error) = self.init_error {
+                return Err(CalendarError::Policy(map_error(error)));
+            }
+            let http = self.http.as_ref().expect("checked above");
+            let deadline = Instant::now() + self.timeout;
 
             let incremental = !sync_token.is_empty();
             let body = if incremental {
-                sync_collection_body(sync_token)
+                sync_collection_body(sync_token)?
             } else {
                 calendar_query_body(from, to)
             };
+            if body.len() > MAX_REQUEST_BYTES {
+                return Err(CalendarError::BodyLimit("calendar request exceeds limit"));
+            }
             let method = reqwest::Method::from_bytes(b"REPORT")
-                .map_err(|e| CalendarError::Api(e.to_string()))?;
-            let req = client
-                .request(method, &self.url)
+                .map_err(|_| CalendarError::Policy("calendar REPORT method unavailable"))?;
+            let req = http
+                .request(method)
                 .header(
                     reqwest::header::CONTENT_TYPE,
                     "application/xml; charset=utf-8",
@@ -256,16 +281,27 @@ impl CalendarBackend for CalDavBackend {
                 .header("Depth", "1")
                 .body(body);
 
-            let resp = self
-                .auth(req)
-                .send()
+            let resp = self.auth(req);
+            let resp = http
+                .send(resp, deadline)
                 .await
-                .map_err(|e| CalendarError::Network(e.to_string()))?;
+                .map_err(|error| CalendarError::Network(map_error(error).into()))?;
+
+            if resp.status().is_redirection() {
+                return Err(CalendarError::Policy(map_error(
+                    CalendarHttpError::Redirect,
+                )));
+            }
+            validate_encoding(&resp).map_err(|error| CalendarError::Policy(map_error(error)))?;
 
             if resp.status() == reqwest::StatusCode::UNAUTHORIZED
                 || resp.status() == reqwest::StatusCode::FORBIDDEN
             {
-                return Err(CalendarError::Auth(format!("HTTP {}", resp.status())));
+                let status = resp.status();
+                discard_body(resp, deadline)
+                    .await
+                    .map_err(|error| CalendarError::Network(map_error(error).into()))?;
+                return Err(CalendarError::Auth(format!("HTTP {status}")));
             }
             // A server that has expired or never knew our token answers 409/507.
             // Falling back to a full fetch is the RFC 6578 recovery, and without it
@@ -281,19 +317,30 @@ impl CalendarBackend for CalDavBackend {
                     status = %resp.status(),
                     "caldav sync token rejected — falling back to a full fetch"
                 );
-                return self.list_events(from, to, "").await;
+                discard_body(resp, deadline)
+                    .await
+                    .map_err(|error| CalendarError::Network(map_error(error).into()))?;
+                return self.fetch_full(from, to, deadline).await;
             }
             if !resp.status().is_success() && resp.status() != reqwest::StatusCode::MULTI_STATUS {
-                return Err(CalendarError::Api(format!("HTTP {}", resp.status())));
+                let status = resp.status();
+                discard_body(resp, deadline)
+                    .await
+                    .map_err(|error| CalendarError::Network(map_error(error).into()))?;
+                return Err(CalendarError::Api(format!("HTTP {status}")));
             }
 
-            let text = resp
-                .text()
+            validate_media(&resp, ExpectedMedia::Dav)
+                .map_err(|error| CalendarError::Policy(map_error(error)))?;
+            let text = read_body(resp, deadline)
                 .await
-                .map_err(|e| CalendarError::Network(e.to_string()))?;
-            if text.len() > MAX_BODY {
-                return Err(CalendarError::Api("calendar too large".into()));
-            }
+                .map_err(|error| match error {
+                    CalendarHttpError::BodyLimit => CalendarError::BodyLimit(map_error(error)),
+                    CalendarHttpError::Timeout => CalendarError::Timeout(map_error(error)),
+                    other => CalendarError::Network(map_error(other).into()),
+                })?;
+            let text = String::from_utf8(text)
+                .map_err(|_| CalendarError::Parse("CalDAV response is not UTF-8".into()))?;
 
             let (responses, token) = parse_multistatus(&text);
             let zone = if self.zone.is_empty() {
@@ -323,6 +370,90 @@ impl CalendarBackend for CalDavBackend {
                 partial,
                 unchanged: false,
             })
+        })
+    }
+}
+
+impl CalDavBackend {
+    /// A 409/507 token recovery is exactly one additional REPORT, sharing the
+    /// original absolute deadline and never recursively refreshing it.
+    async fn fetch_full(
+        &self,
+        from: NaiveDate,
+        to: NaiveDate,
+        deadline: Instant,
+    ) -> Result<EventPage, CalendarError> {
+        let http = self.http.as_ref().expect("initialized backend");
+        let body = calendar_query_body(from, to);
+        let method = reqwest::Method::from_bytes(b"REPORT")
+            .map_err(|_| CalendarError::Policy("calendar REPORT method unavailable"))?;
+        let req = self.auth(
+            http.request(method)
+                .header(
+                    reqwest::header::CONTENT_TYPE,
+                    "application/xml; charset=utf-8",
+                )
+                .header("Depth", "1")
+                .body(body),
+        );
+        let response = http
+            .send(req, deadline)
+            .await
+            .map_err(|error| CalendarError::Network(map_error(error).into()))?;
+        if response.status().is_redirection() {
+            return Err(CalendarError::Policy(map_error(
+                CalendarHttpError::Redirect,
+            )));
+        }
+        validate_encoding(&response).map_err(|error| CalendarError::Policy(map_error(error)))?;
+        if !response.status().is_success() && response.status() != reqwest::StatusCode::MULTI_STATUS
+        {
+            let status = response.status();
+            discard_body(response, deadline)
+                .await
+                .map_err(|error| CalendarError::Network(map_error(error).into()))?;
+            return Err(CalendarError::Api(format!("HTTP {status}")));
+        }
+        validate_media(&response, ExpectedMedia::Dav)
+            .map_err(|error| CalendarError::Policy(map_error(error)))?;
+        let bytes = read_body(response, deadline)
+            .await
+            .map_err(|error| match error {
+                CalendarHttpError::BodyLimit => CalendarError::BodyLimit(map_error(error)),
+                CalendarHttpError::Timeout => CalendarError::Timeout(map_error(error)),
+                other => CalendarError::Network(map_error(other).into()),
+            })?;
+        let text = String::from_utf8(bytes)
+            .map_err(|_| CalendarError::Parse("CalDAV response is not UTF-8".into()))?;
+        self.page_from_multistatus(text)
+    }
+
+    fn page_from_multistatus(&self, text: String) -> Result<EventPage, CalendarError> {
+        let (responses, token) = parse_multistatus(&text);
+        let zone = if self.zone.is_empty() {
+            "UTC"
+        } else {
+            &self.zone
+        };
+        let mut events = Vec::new();
+        let mut deleted = Vec::new();
+        for r in responses {
+            if r.deleted {
+                deleted.push(uid_from_href(&r.href));
+            } else {
+                events.extend(thegn_core::calendar::parse_ics(&r.ics, zone));
+            }
+        }
+        let partial = self.max_events > 0 && events.len() > self.max_events;
+        if partial {
+            events.truncate(self.max_events);
+        }
+        Ok(EventPage {
+            events,
+            deleted,
+            sync_token: token,
+            partial,
+            unchanged: false,
         })
     }
 }

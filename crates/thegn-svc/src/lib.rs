@@ -17,6 +17,7 @@ pub mod forward;
 pub mod git;
 pub mod host;
 pub mod host_discovery;
+pub(crate) mod http;
 pub mod ipc;
 pub mod iroh_reach;
 pub mod issue;

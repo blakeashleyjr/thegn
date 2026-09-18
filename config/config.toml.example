@@ -397,6 +397,7 @@ reminder_default_mins = [10]
 # refresh_interval_secs = 0 # 0 inherits [calendar]; always floored at 60
 # token = ""                # "env:VAR" / "file:PATH" — note the URL is a secret too
 # username = ""             # caldav: Basic-auth user
+# allow_private_network = false # trusted LAN opt-in; ambient proxies are never used
 # read_only = true
 # calendar_ids = []         # caldav: restrict to these collections; [] = all
 #
