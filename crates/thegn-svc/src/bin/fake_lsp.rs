@@ -31,6 +31,23 @@ fn reply(out: &mut impl Write, id: &Value, result: Value) {
     );
 }
 
+fn deep_symbol_result() -> Value {
+    let mut symbol = json!({
+        "name": "leaf",
+        "kind": 12,
+        "range": { "start": { "line": 0, "character": 0 } }
+    });
+    for index in 0..=64 {
+        symbol = json!({
+            "name": format!("deep{index}"),
+            "kind": 12,
+            "range": { "start": { "line": index, "character": 0 } },
+            "children": [symbol]
+        });
+    }
+    json!([symbol])
+}
+
 /// Pull the next complete message body out of `buf`, draining it.
 fn next_message(buf: &mut Vec<u8>) -> Option<String> {
     let sep = buf.windows(4).position(|w| w == b"\r\n\r\n")?;
@@ -118,11 +135,15 @@ fn main() {
                     &id.unwrap_or(Value::Null),
                     // A name no tree-sitter parse of the fixture would produce, so
                     // a test seeing it knows the result came from the server.
-                    json!([{
-                        "name": "lspProbe", "kind": 12,
-                        "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 2, "character": 0 } },
-                        "selectionRange": { "start": { "line": 0, "character": 3 }, "end": { "line": 0, "character": 8 } }
-                    }]),
+                    if std::env::args().any(|a| a == "--deep-symbols") {
+                        deep_symbol_result()
+                    } else {
+                        json!([{
+                            "name": "lspProbe", "kind": 12,
+                            "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 2, "character": 0 } },
+                            "selectionRange": { "start": { "line": 0, "character": 3 }, "end": { "line": 0, "character": 8 } }
+                        }])
+                    },
                 ),
                 "workspace/symbol" => reply(
                     &mut out,

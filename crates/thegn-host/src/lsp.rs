@@ -13,13 +13,16 @@
 //! sets up a bridge thread (it owns the `TerminalWaker`; svc does not) that
 //! forwards them onto the loop's channel and pulses the waker.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use thegn_core::config::Config;
-use thegn_svc::lsp::{LspClient, LspError, LspSeverity, PublishedDiagnostics, Registry};
+use thegn_svc::lsp::{
+    DiagnosticKey, DiagnosticsReceiver, DiagnosticsSender, LspClient, LspError, LspHealth,
+    LspSeverity, PublishedDiagnostics, Registry,
+};
 
 use crate::panel::{DiagnosticItem, Severity};
 
@@ -28,14 +31,14 @@ pub struct LspSupervisor {
     inner: Arc<LspInner>,
     /// Receiver end of the diagnostics channel handed to clients; taken once by
     /// the host to drive the bridge thread.
-    raw_rx: Option<Receiver<PublishedDiagnostics>>,
+    raw_rx: Option<DiagnosticsReceiver>,
 }
 
 /// `(root, registry key)` → started client, or `None` once we've tried and found
 /// no server (so we don't re-spawn on every request). Keying on the registry key
 /// (not the tree-sitter `Lang`) is what lets an arbitrary language server —
 /// `zls`, `clangd`, an in-house DSL server — hold a per-worktree instance.
-type ClientMap = HashMap<(PathBuf, String), Option<Arc<LspClient>>>;
+type ClientMap = HashMap<(PathBuf, String), (Option<Arc<LspClient>>, u64)>;
 
 pub struct LspInner {
     enabled: bool,
@@ -43,19 +46,21 @@ pub struct LspInner {
     /// once at startup and immutable, so it needs no lock and is shared read-only
     /// across every off-loop request task.
     registry: Registry,
-    diag_tx: Sender<PublishedDiagnostics>,
+    diag_tx: DiagnosticsSender,
+    generation: AtomicU64,
     clients: Mutex<ClientMap>,
 }
 
 impl LspSupervisor {
     /// Build from config. Starts nothing; just records the policy + registry.
     pub fn from_config(cfg: &Config) -> Self {
-        let (diag_tx, raw_rx) = channel();
+        let (diag_tx, raw_rx) = thegn_svc::lsp::diagnostics_channel();
         LspSupervisor {
             inner: Arc::new(LspInner {
                 enabled: cfg.lsp.enabled,
                 registry: Registry::build(&cfg.lsp.servers),
                 diag_tx,
+                generation: AtomicU64::new(1),
                 clients: Mutex::new(HashMap::new()),
             }),
             raw_rx: Some(raw_rx),
@@ -63,7 +68,7 @@ impl LspSupervisor {
     }
 
     /// Take the diagnostics receiver to drive the host bridge thread (once).
-    pub fn take_diagnostics_rx(&mut self) -> Option<Receiver<PublishedDiagnostics>> {
+    pub fn take_diagnostics_rx(&mut self) -> Option<DiagnosticsReceiver> {
         self.raw_rx.take()
     }
 
@@ -89,9 +94,26 @@ impl LspInner {
         let map_key = (root.to_path_buf(), key.to_string());
         let mut clients = self.clients.lock().unwrap();
         if let Some(slot) = clients.get(&map_key) {
-            return slot.clone().ok_or(LspError::NotAvailable);
+            return slot.0.clone().ok_or(LspError::NotAvailable);
+        }
+        if !clients.keys().any(|(existing, _)| existing == root)
+            && clients
+                .keys()
+                .map(|(existing, _)| existing)
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+                >= thegn_svc::lsp::limits::MAX_ROOTS
+        {
+            return Err(LspError::Bounded("LSP root limit reached".into()));
         }
 
+        let generation = self.generation.fetch_add(1, Ordering::Relaxed);
+        if !self
+            .diag_tx
+            .set_active(root.to_path_buf(), key.to_string(), generation)
+        {
+            return Err(LspError::Bounded("LSP root registry limit reached".into()));
+        }
         let started = match self.registry.resolve(key) {
             Some(spec) => {
                 // Join the shared aggregate slice, like every pane and background
@@ -101,25 +123,45 @@ impl LspInner {
                 // the server spawns unwrapped, exactly as before. Off-loop, so the
                 // wrap's probe spawn is fine here.
                 let argv = thegn_core::sandbox_cpucap::wrap_background_argv(spec.argv());
-                LspClient::start_argv(&argv, &spec.language_id, root, self.diag_tx.clone())
-                    .and_then(|c| c.initialize(root).map(|_| c))
-                    .map(Arc::new)
+                LspClient::start_argv_with_identity(
+                    &argv,
+                    &spec.language_id,
+                    root,
+                    self.diag_tx.clone(),
+                    key.to_string(),
+                    generation,
+                )
+                .and_then(|c| c.initialize(root).map(|_| c))
+                .map(Arc::new)
             }
             None => Err(LspError::NotAvailable),
         };
 
         match started {
             Ok(client) => {
-                clients.insert(map_key, Some(client.clone()));
+                clients.insert(map_key, (Some(client.clone()), generation));
                 Ok(client)
             }
             Err(e) => {
+                self.diag_tx.retire(root, key, generation);
                 // Cache "no server" so we don't try to spawn on every request.
                 if e == LspError::NotAvailable {
-                    clients.insert(map_key, None);
+                    clients.insert(map_key, (None, generation));
                 }
                 Err(e)
             }
+        }
+    }
+
+    /// Retire an authority before removing/recreating its client.  A late
+    /// publication from the old reader remains stale even if its numeric
+    /// sequence is larger than the replacement's.
+    pub fn close(&self, root: &Path, key: &str) {
+        if let Ok(mut clients) = self.clients.lock()
+            && let Some((_client, generation)) =
+                clients.remove(&(root.to_path_buf(), key.to_string()))
+        {
+            self.diag_tx.retire(root, key, generation);
         }
     }
 }
@@ -132,7 +174,25 @@ impl LspInner {
 /// across tab switches) from bleeding diagnostics into another's panel.
 #[derive(Debug, Default)]
 pub struct LspDiagnostics {
-    by_root: HashMap<PathBuf, HashMap<String, Vec<DiagnosticItem>>>,
+    by_root: HashMap<PathBuf, RootDiagnostics>,
+    retained_bytes: usize,
+    health: LspHealth,
+    incomplete: HashSet<StoreFileKey>,
+}
+
+#[derive(Debug, Default)]
+struct RootDiagnostics {
+    files: HashMap<StoreFileKey, Vec<DiagnosticItem>>,
+    order: VecDeque<StoreFileKey>,
+    bytes: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+struct StoreFileKey {
+    root: PathBuf,
+    server_identity: String,
+    generation: u64,
+    path: String,
 }
 
 impl LspDiagnostics {
@@ -144,22 +204,106 @@ impl LspDiagnostics {
     /// originating client's worktree root (stamped on the message). An empty
     /// set clears that file.
     pub fn apply(&mut self, pd: PublishedDiagnostics) {
+        if pd.root.as_os_str().to_string_lossy().len() > thegn_svc::lsp::limits::MAX_IDENTITY_BYTES
+            || pd.server_identity.len() > thegn_svc::lsp::limits::MAX_IDENTITY_BYTES
+        {
+            self.health.invalid = self.health.invalid.saturating_add(1);
+            return;
+        }
         let file = relativize(&pd.path, &pd.root);
+        let store_key = StoreFileKey {
+            root: pd.root.clone(),
+            server_identity: pd.server_identity.clone(),
+            generation: pd.generation,
+            path: file.clone(),
+        };
+        self.remove_retired_streams(&store_key);
+        if !pd.complete {
+            self.remember_incomplete(store_key.clone());
+            self.health.incomplete = self.health.incomplete.saturating_add(1);
+            if pd.diagnostics.is_empty() {
+                return;
+            }
+        } else {
+            self.incomplete.remove(&store_key);
+        }
         if pd.diagnostics.is_empty() {
-            if let Some(files) = self.by_root.get_mut(&pd.root) {
-                files.remove(&file);
-                if files.is_empty() {
+            let old_bytes = self
+                .by_root
+                .get(&pd.root)
+                .and_then(|root| root.files.get(&store_key))
+                .map(|old| diagnostics_bytes(&store_key, old))
+                .unwrap_or(0);
+            if let Some(root) = self.by_root.get_mut(&pd.root) {
+                root.files.remove(&store_key);
+                root.bytes = root.bytes.saturating_sub(old_bytes);
+                root.order.retain(|candidate| candidate != &store_key);
+                let empty = root.files.is_empty();
+                if empty {
                     self.by_root.remove(&pd.root);
                 }
             }
+            self.retained_bytes = self.retained_bytes.saturating_sub(old_bytes);
             return;
         }
         let items = pd
             .diagnostics
             .into_iter()
             .map(|d| to_panel_item(&file, d))
-            .collect();
-        self.by_root.entry(pd.root).or_default().insert(file, items);
+            .collect::<Vec<_>>();
+        let bytes = diagnostics_bytes(&store_key, &items);
+        if bytes > thegn_svc::lsp::limits::MAX_RETAINED_BYTES {
+            self.health.dropped = self.health.dropped.saturating_add(1);
+            self.health.incomplete = self.health.incomplete.saturating_add(1);
+            return;
+        }
+        if !self.by_root.contains_key(&pd.root)
+            && self.by_root.len() >= thegn_svc::lsp::limits::MAX_ROOTS
+        {
+            self.health.dropped = self.health.dropped.saturating_add(1);
+            self.health.incomplete = self.health.incomplete.saturating_add(1);
+            return;
+        }
+        let old_bytes = self
+            .by_root
+            .get(&pd.root)
+            .and_then(|root| root.files.get(&store_key))
+            .map(|old| diagnostics_bytes(&store_key, old))
+            .unwrap_or(0);
+        let is_new_file = self
+            .by_root
+            .get(&pd.root)
+            .map_or(true, |root| !root.files.contains_key(&store_key));
+        if is_new_file
+            && self
+                .by_root
+                .get(&pd.root)
+                .is_some_and(|root| root.files.len() >= thegn_svc::lsp::limits::MAX_FILES_PER_ROOT)
+        {
+            self.health.dropped = self.health.dropped.saturating_add(1);
+            self.health.incomplete = self.health.incomplete.saturating_add(1);
+            return;
+        }
+        if self
+            .retained_bytes
+            .saturating_sub(old_bytes)
+            .saturating_add(bytes)
+            > thegn_svc::lsp::limits::MAX_RETAINED_BYTES
+        {
+            self.health.dropped = self.health.dropped.saturating_add(1);
+            self.health.incomplete = self.health.incomplete.saturating_add(1);
+            return;
+        }
+        let root = self.by_root.entry(pd.root.clone()).or_default();
+        if root.files.remove(&store_key).is_some() {
+            root.bytes = root.bytes.saturating_sub(old_bytes);
+            root.order.retain(|candidate| candidate != &store_key);
+        }
+        self.retained_bytes = self.retained_bytes.saturating_sub(old_bytes);
+        root.bytes = root.bytes.saturating_add(bytes);
+        self.retained_bytes = self.retained_bytes.saturating_add(bytes);
+        root.order.push_back(store_key.clone());
+        root.files.insert(store_key, items);
     }
 
     /// Replace the LSP-sourced entries in `dst` with the current store's
@@ -169,9 +313,22 @@ impl LspDiagnostics {
     pub fn merge_into(&self, root: &Path, dst: &mut Vec<DiagnosticItem>) {
         dst.retain(|d| !d.source.starts_with("lsp:"));
         if let Some(files) = self.by_root.get(root) {
-            for items in files.values() {
-                dst.extend(items.iter().cloned());
+            for file in &files.order {
+                if let Some(items) = files.files.get(file) {
+                    dst.extend(items.iter().cloned());
+                }
             }
+        }
+        if self.health.has_findings() {
+            dst.push(DiagnosticItem {
+                file: String::new(),
+                line: 0,
+                col: None,
+                severity: Severity::Warning,
+                message: format!("{} active={}", self.health.summary(), self.incomplete.len()),
+                source: "lsp:health".to_string(),
+                code: None,
+            });
         }
         dst.sort_by_key(|d| d.severity as u8);
     }
@@ -180,20 +337,109 @@ impl LspDiagnostics {
     /// rendering already ignores non-active roots).
     #[allow(dead_code)] // exercised by tests; the loop evicts via `retain_roots`
     pub fn evict_root(&mut self, root: &Path) {
-        self.by_root.remove(root);
+        if let Some(old) = self.by_root.remove(root) {
+            self.retained_bytes = self.retained_bytes.saturating_sub(old.bytes);
+        }
+        self.incomplete.retain(|key| key.root.as_path() != root);
     }
 
     /// Keep only the roots `keep` approves — called on the periodic model swap
     /// with the set of open worktree tabs, so closed/deleted worktrees' entries
     /// don't accumulate for the life of the process.
     pub fn retain_roots(&mut self, keep: impl Fn(&Path) -> bool) {
+        let removed = self
+            .by_root
+            .iter()
+            .filter(|(root, _)| !keep(root))
+            .map(|(_, state)| state.bytes)
+            .sum::<usize>();
         self.by_root.retain(|root, _| keep(root));
+        self.retained_bytes = self.retained_bytes.saturating_sub(removed);
+        self.incomplete.retain(|key| keep(&key.root));
     }
 
     #[allow(dead_code)] // exercised by tests; the loop-side caller was removed
     pub fn is_empty(&self) -> bool {
-        self.by_root.is_empty()
+        self.by_root.is_empty() && !self.health.has_findings()
     }
+
+    pub fn record_health(&mut self, health: LspHealth) {
+        self.health.saturating_add(health);
+    }
+
+    pub fn mark_incomplete(&mut self, keys: impl IntoIterator<Item = DiagnosticKey>) {
+        for key in keys {
+            let store_key = StoreFileKey {
+                root: key.root.clone(),
+                server_identity: key.server_identity,
+                generation: key.generation,
+                path: relativize(&key.path, &key.root),
+            };
+            self.remember_incomplete(store_key);
+        }
+    }
+
+    fn remember_incomplete(&mut self, key: StoreFileKey) {
+        if self.incomplete.len() >= thegn_svc::lsp::limits::MAX_QUEUE_DOCUMENTS
+            && !self.incomplete.contains(&key)
+        {
+            if let Some(oldest) = self.incomplete.iter().min().cloned() {
+                self.incomplete.remove(&oldest);
+            }
+        }
+        self.incomplete.insert(key);
+    }
+
+    fn remove_retired_streams(&mut self, current: &StoreFileKey) {
+        let retired = self
+            .by_root
+            .get(&current.root)
+            .map(|root| {
+                root.files
+                    .keys()
+                    .filter(|key| {
+                        key.server_identity == current.server_identity
+                            && key.path == current.path
+                            && key.generation != current.generation
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for key in retired {
+            if let Some(items) = self
+                .by_root
+                .get_mut(&current.root)
+                .and_then(|root| root.files.remove(&key))
+            {
+                let bytes = diagnostics_bytes(&key, &items);
+                self.retained_bytes = self.retained_bytes.saturating_sub(bytes);
+                if let Some(root) = self.by_root.get_mut(&current.root) {
+                    root.bytes = root.bytes.saturating_sub(bytes);
+                    root.order.retain(|candidate| candidate != &key);
+                }
+            }
+            self.incomplete.remove(&key);
+        }
+    }
+}
+
+fn diagnostics_bytes(key: &StoreFileKey, items: &[DiagnosticItem]) -> usize {
+    key.root
+        .as_os_str()
+        .to_string_lossy()
+        .len()
+        .saturating_add(key.server_identity.len())
+        .saturating_add(key.path.len())
+        .saturating_add(std::mem::size_of::<DiagnosticItem>())
+        .saturating_add(std::mem::size_of::<StoreFileKey>())
+        .saturating_add(64) // authority/generation/hash-map bookkeeping
+        .saturating_add(items.iter().fold(0usize, |n, item| {
+            n.saturating_add(item.file.len())
+                .saturating_add(item.message.len())
+                .saturating_add(item.source.len())
+                .saturating_add(item.code.as_ref().map_or(0, String::len))
+        }))
 }
 
 /// Convert one svc diagnostic to a panel item (source tagged `lsp:<source>`).
@@ -208,9 +454,14 @@ fn to_panel_item(file: &str, d: thegn_svc::lsp::LspDiagnostic) -> DiagnosticItem
             LspSeverity::Info => Severity::Info,
             LspSeverity::Hint => Severity::Hint,
         },
-        message: d.message,
-        source: format!("lsp:{}", d.source.as_deref().unwrap_or("server")),
-        code: d.code,
+        message: thegn_svc::lsp::sanitize_for_terminal(&d.message),
+        source: format!(
+            "lsp:{}",
+            thegn_svc::lsp::sanitize_for_terminal(d.source.as_deref().unwrap_or("server"))
+        ),
+        code: d
+            .code
+            .map(|code| thegn_svc::lsp::sanitize_for_terminal(&code)),
     }
 }
 
@@ -232,6 +483,10 @@ mod tests {
             root: PathBuf::from(root),
             path: path.to_string(),
             diagnostics: diags,
+            server_identity: "test".into(),
+            generation: 1,
+            sequence: 1,
+            complete: true,
         }
     }
 
@@ -396,5 +651,53 @@ mod tests {
         }];
         let inner = LspSupervisor::from_config(&cfg).handle();
         assert_eq!(inner.resolve_key("main.zig").as_deref(), Some("zig"));
+    }
+
+    #[test]
+    fn same_document_streams_do_not_clear_each_other() {
+        let mut store = LspDiagnostics::new();
+        let mut rust = pd("/p", "/p/a.rs", vec![diag(0, LspSeverity::Error, "rust")]);
+        rust.server_identity = "rust".into();
+        let mut clang = pd(
+            "/p",
+            "/p/a.rs",
+            vec![diag(1, LspSeverity::Warning, "clang")],
+        );
+        clang.server_identity = "clang".into();
+        store.apply(rust.clone());
+        store.apply(clang);
+        store.apply(PublishedDiagnostics {
+            diagnostics: vec![],
+            ..rust
+        });
+        let mut dst = Vec::new();
+        store.merge_into(Path::new("/p"), &mut dst);
+        assert_eq!(
+            dst.iter()
+                .filter(|item| item.source.starts_with("lsp:"))
+                .count(),
+            1
+        );
+        assert_eq!(dst[0].message, "clang");
+    }
+
+    #[test]
+    fn retained_store_caps_files_and_sanitizes_display_text() {
+        let mut store = LspDiagnostics::new();
+        for index in 0..=thegn_svc::lsp::limits::MAX_FILES_PER_ROOT {
+            store.apply(pd(
+                "/p",
+                &format!("/p/{index}.rs"),
+                vec![diag(0, LspSeverity::Error, "bad\u{1b}]0;title\u{7} text")],
+            ));
+        }
+        let mut dst = Vec::new();
+        store.merge_into(Path::new("/p"), &mut dst);
+        assert!(dst.len() <= thegn_svc::lsp::limits::MAX_FILES_PER_ROOT + 1);
+        assert!(
+            dst.iter()
+                .all(|item| !item.message.chars().any(char::is_control))
+        );
+        assert!(dst.iter().any(|item| item.source == "lsp:health"));
     }
 }
