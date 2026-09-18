@@ -130,11 +130,59 @@ fn automatic_prewarm_rejects_host_specs_but_keeps_contained_specs() {
     assert!(contained.is_ok(), "contained prewarm remains eligible");
 }
 
+#[test]
+fn automatic_prewarm_rejects_host_reintroduced_by_remembered_agent_relaunch() {
+    with_temp_state("prewarm-relaunch-host", || {
+        let mut cfg = cfg_with(&[("claude", "claude")], &[]);
+        cfg.sandbox.backend = thegn_core::config::SandboxBackend::Auto;
+        cfg.sandbox.backend_chain = vec!["host".to_string()];
+        let worktree =
+            std::env::temp_dir().join(format!("tg-prewarm-relaunch-host-{}", std::process::id()));
+        let wt = worktree.to_string_lossy().into_owned();
+        let db = thegn_core::db::Db::open().unwrap();
+        db.put_worktree("app/wt", "/x/app", &wt, "tg/wt", None, None)
+            .unwrap();
+        db.set_worktree_agent(&wt, "claude").unwrap();
+        drop(db);
+
+        // Model the first guard's contained resolution, then the remembered
+        // agent fold that can replace its first leaf with a host spec. The
+        // second guard must inspect the post-relaunch batch, not only the
+        // result that existed before resurrection.
+        let mut specs = Ok(vec![(
+            7,
+            LaunchSpec {
+                argv: vec!["fake-contained-shell".into()],
+                cwd: None,
+                env: Vec::new(),
+                backend: "bwrap".into(),
+                warnings: Vec::new(),
+                degraded: false,
+            },
+        )]);
+        crate::handlers::worktree_launch::apply_relaunch(
+            &mut specs,
+            &cfg,
+            &wt,
+            Some(7),
+            true,
+            false,
+        );
+        assert_eq!(specs.as_ref().unwrap()[0].1.backend, "host");
+
+        reject_host_prewarm(&mut specs);
+        assert!(matches!(
+            specs,
+            Err(crate::handlers::provision::SpecError::PrewarmSkipped)
+        ));
+    });
+}
+
 #[cfg(unix)]
 #[test]
 fn removed_direnv_warm_is_inert_across_launch_seams_and_cache_leaf_shapes() {
     use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::os::unix::fs::{FileTypeExt, PermissionsExt, symlink};
     use std::time::SystemTime;
 
     with_temp_state("direnv-zero-exec", || {
@@ -252,6 +300,15 @@ fn removed_direnv_warm_is_inert_across_launch_seams_and_cache_leaf_shapes() {
         assert!(!nix_calls.exists());
         assert_eq!(std::fs::read(&external).unwrap(), external_bytes);
         assert_eq!(std::fs::read(&hard_target).unwrap(), hard_bytes);
+        assert_eq!(std::fs::read_link(&symlink_leaf).unwrap(), external);
+        assert_eq!(std::fs::read(&hardlink_leaf).unwrap(), hard_bytes);
+        assert!(
+            std::fs::symlink_metadata(&fifo_leaf)
+                .unwrap()
+                .file_type()
+                .is_fifo()
+        );
+        assert!(directory_leaf.is_dir());
         assert_eq!(
             std::fs::metadata(&external).unwrap().modified().unwrap(),
             external_mtime
