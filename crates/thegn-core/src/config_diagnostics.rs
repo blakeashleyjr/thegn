@@ -109,26 +109,6 @@ fn safe_warning(message: &str) -> String {
     redacted
 }
 
-/// Capture warnings emitted by one composition step while retaining normal
-/// warning delivery.  Admission uses this only to turn malformed supplied
-/// env/CLI values into typed errors; compatibility warnings remain warnings.
-pub(crate) fn capture<T>(action: impl FnOnce() -> T) -> (T, Vec<String>) {
-    struct Restore(Option<Vec<String>>);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            CAPTURE.with(|captured| *captured.borrow_mut() = self.0.take());
-        }
-    }
-
-    let restore = Restore(CAPTURE.with(|captured| captured.replace(Some(Vec::new()))));
-    let result = action();
-    let captured = CAPTURE
-        .with(|captured| captured.replace(None))
-        .unwrap_or_default();
-    drop(restore);
-    (result, captured)
-}
-
 /// Record a parser-classified supplied-value failure without encoding the
 /// security decision in warning prose.  The key and kind are bounded and do
 /// not retain the supplied value.
