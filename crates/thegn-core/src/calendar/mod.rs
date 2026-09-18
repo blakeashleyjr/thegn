@@ -15,6 +15,7 @@
 //! Naming note: the event type is [`CalEvent`], never `Event` —
 //! [`crate::event_bus::Event`] already owns that name.
 
+pub mod admission;
 pub mod cursor;
 pub mod display;
 pub mod grid;
@@ -24,9 +25,12 @@ pub mod recur;
 pub mod reminders;
 pub mod tz;
 
+pub use admission::{
+    AdmissionBudget, AdmissionError, AdmissionLease, AdmissionLimit, AdmissionMeter, AdmissionPool,
+};
 pub use cursor::{CalCursor, CalNav};
 pub use grid::{DayCell, MonthGrid, WeekdayStyle, month_bounds, weekday_headers};
-pub use ics::parse_ics;
+pub use ics::{parse_ics, parse_ics_admitted};
 pub use locale::{resolve_time_format, resolve_week_start};
 pub use recur::{ByDay, Freq, RRule, RecurError, Recurrence};
 pub use reminders::{DueReminder, next_event};
