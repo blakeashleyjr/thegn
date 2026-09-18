@@ -604,16 +604,20 @@ async fn oversized_chunked_and_encoded_calendar_bodies_are_rejected_before_parse
 }
 
 #[tokio::test]
-async fn both_remote_backends_refuse_literal_loopback_before_connecting() {
+async fn both_remote_backends_refuse_literal_non_public_addresses_before_connecting() {
     for (provider, url) in [
         (CalendarProviderKind::IcsUrl, "http://127.0.0.1:9/feed"),
+        (CalendarProviderKind::IcsUrl, "http://0.0.0.0:9/feed"),
         (CalendarProviderKind::IcsUrl, "http://[::1]:9/feed"),
+        (CalendarProviderKind::IcsUrl, "http://[::]:9/feed"),
         (
             CalendarProviderKind::IcsUrl,
             "http://[::ffff:127.0.0.1]:9/feed",
         ),
         (CalendarProviderKind::CalDav, "http://127.0.0.1:9/dav"),
+        (CalendarProviderKind::CalDav, "http://0.0.0.0:9/dav"),
         (CalendarProviderKind::CalDav, "http://[::1]:9/dav"),
+        (CalendarProviderKind::CalDav, "http://[::]:9/dav"),
     ] {
         let backend = match provider {
             CalendarProviderKind::IcsUrl => ics_url::IcsUrlBackend::new(&CalendarAccount {
