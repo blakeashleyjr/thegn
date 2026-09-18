@@ -79,10 +79,9 @@ pub fn normalize_admission(body: &str) -> Result<NormalizedToml, NormalizeError>
 
     normalize_project_tables(root, &mut diagnostics);
 
-    // TOML's serializer writes into a caller-owned String.  Give it a buffer
-    // whose capacity is the explicit normalized-source ceiling before any
-    // compatibility-expanded document is serialized; do not let the helper's
-    // unconstrained `to_string()` grow an arbitrary intermediate buffer.
+    // Bound serialized output before handing the String to TOML's serializer.
+    // Header paths repeat for every descendant table, so account for the full
+    // inherited path at each node rather than a fixed depth multiplier.
     let encoded_bound = encoded_upper_bound(&value).map_err(NormalizeError::Budget)?;
     let mut body = String::with_capacity(encoded_bound);
     let initial_capacity = body.capacity();
@@ -222,36 +221,44 @@ fn encoded_upper_bound(value: &toml::Value) -> Result<usize, crate::config_budge
             .ok_or(crate::config_budget::BudgetError::AggregateBytes)
     }
 
-    fn walk(value: &toml::Value) -> Result<usize, crate::config_budget::BudgetError> {
+    fn walk(
+        value: &toml::Value,
+        path_bytes: usize,
+    ) -> Result<usize, crate::config_budget::BudgetError> {
         let mut total = 0;
         match value {
-            toml::Value::String(value) => add(&mut total, string_bytes(value)?)?,
-            toml::Value::Integer(_) => add(&mut total, 32)?,
-            toml::Value::Float(_) => add(&mut total, 64)?,
+            toml::Value::String(value) => add(&mut total, string_bytes(value)?.saturating_add(8))?,
+            toml::Value::Integer(_) | toml::Value::Float(_) | toml::Value::Datetime(_) => {
+                add(&mut total, 64)?;
+            }
             toml::Value::Boolean(_) => add(&mut total, 8)?,
-            toml::Value::Datetime(_) => add(&mut total, 64)?,
             toml::Value::Array(values) => {
-                add(&mut total, 2)?;
+                add(&mut total, 8)?;
                 for value in values {
-                    add(&mut total, walk(value)?)?;
-                    add(&mut total, 2)?;
+                    // Arrays of tables emit a full [[ancestor.path]] for each
+                    // element. Charging all elements also bounds mixed/nested
+                    // arrays without depending on serializer layout choices.
+                    add(&mut total, path_bytes.saturating_add(16))?;
+                    add(&mut total, walk(value, path_bytes)?)?;
                 }
             }
             toml::Value::Table(values) => {
+                add(&mut total, 32)?;
                 for (key, value) in values {
-                    // A nested TOML table repeats ancestor keys in each
-                    // header; 128 is above the scanner's depth ceiling and
-                    // therefore bounds every possible path repetition.
-                    add(&mut total, string_bytes(key)?.saturating_mul(128))?;
-                    add(&mut total, walk(value)?)?;
-                    add(&mut total, 32)?;
+                    let mut child_path = path_bytes;
+                    add(&mut child_path, string_bytes(key)?.saturating_add(1))?;
+                    // Charge the full path even for scalar assignments, whose
+                    // serializer only needs the leaf. Empty tables still pay
+                    // their header, and wide trees pay for every repetition.
+                    add(&mut total, child_path.saturating_add(16))?;
+                    add(&mut total, walk(value, child_path)?)?;
                 }
             }
         }
         Ok(total)
     }
 
-    walk(value)
+    walk(value, 0)
 }
 
 fn push_diagnostic(diagnostics: &mut Vec<String>, diagnostic: String) {
@@ -263,6 +270,40 @@ fn push_diagnostic(diagnostics: &mut Vec<String>, diagnostic: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn admission_encoding_bound_counts_repeated_ancestor_paths() {
+        let parent = "p".repeat(5_500);
+        let mut source = format!("[{parent}]\n");
+        for index in 0..1_500 {
+            source.push_str(&format!("k{index} = {{}}\n"));
+        }
+        assert!(crate::config_budget::scan(source.as_bytes()).is_ok());
+        assert!(matches!(
+            normalize_admission(&source),
+            Err(NormalizeError::Budget(
+                crate::config_budget::BudgetError::AggregateBytes
+            ))
+        ));
+    }
+
+    #[test]
+    fn admission_encoding_bound_covers_wide_deep_and_escaped_documents() {
+        let sources = [
+            "x = \"a\\n\\t\\\"b\"\n",
+            "[a]\nx = {}\ny = {}\n[a.b.c]\nz = [1, 2, 3]\n",
+            "[[a.b]]\nx = 1\n[[a.b]]\ny = { z = {} }\n",
+            "values = [[1,2], [3,4]]\n",
+            "[\"quoted.key\"]\n\"\\t\" = \"\\u0000\"\n",
+        ];
+        for source in sources {
+            let value: toml::Value = source.parse().unwrap();
+            let bound = encoded_upper_bound(&value).unwrap();
+            let serialized = toml::to_string(&value).unwrap();
+            assert!(serialized.len() <= bound, "source={source:?} bound={bound}");
+            assert!(normalize_admission(source).is_ok());
+        }
+    }
 
     #[test]
     fn canonical_values_win_and_diagnose_exact_paths() {
