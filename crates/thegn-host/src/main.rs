@@ -1397,7 +1397,6 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
                 None,
                 "shell",
                 false,
-                false,
                 crate::agent::LaunchExtras {
                     suppress_agent_record: true,
                     ..Default::default()

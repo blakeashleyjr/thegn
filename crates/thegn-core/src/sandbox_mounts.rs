@@ -161,13 +161,8 @@ pub fn auto_cache_mounts() -> Vec<Mount> {
         ".cache/sccache",
         ".cache/prek",
         ".cache/pre-commit",
-        // Nix's CLIENT-SIDE caches (flake tarball fetches, eval/fetcher sqlite).
-        // On an in-sandbox nix-direnv cache MISS the flake re-evaluates here and
-        // must fetch inputs into ~/.cache/nix/tarball-cache-v2; the daemon
-        // backstop (NIX_REMOTE=daemon) mediates /nix/store writes but NOT this
-        // client cache, so without it the fetch dies "Read-only file system" and
-        // direnv falls back to the previous env. Shared with the host cache
-        // (sqlite-WAL / git-safe), same as the compile caches above.
+        // Nix's client-side caches remain an explicit target-side convenience;
+        // they do not authorize host evaluation or repository `.direnv` writes.
         ".cache/nix",
     ];
     candidates

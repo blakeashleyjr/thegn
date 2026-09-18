@@ -115,10 +115,10 @@ pub struct LaunchSpec {
     pub env: Vec<(String, String)>,
     /// The effective containment backend used for this launch (`host` after fallback).
     pub backend: String,
-    /// Human-visible notes when auto sandbox resolution fell through to another backend.
+    /// Human-visible notes when an explicitly-authorized fallback was selected.
     pub warnings: Vec<String>,
-    /// A managed-PROVIDER env failed and `auto`/run-on-host dropped this launch to
-    /// the host — drives the `provider_degraded` notification.
+    /// A managed-PROVIDER env failed and an explicit run-on-host choice dropped
+    /// this launch to the host — drives the `provider_degraded` notification.
     pub degraded: bool,
 }
 
@@ -129,8 +129,8 @@ impl LaunchSpec {
 }
 
 /// Why a NON-LOCAL environment (provider/k8s/ssh) could not be brought up while
-/// failover is disabled (`[sandbox] failover = false`, or a per-env override).
-/// Carried as the error so silent host degradation is refused — the spawn site
+/// failover cannot authorize host execution. Carried as the error so silent host
+/// degradation is refused — the spawn site
 /// surfaces it as a warning modal instead of opening a host shell. See
 /// [`env_halt_reason`] (the cheap proactive check) and `prepare_sandbox_env`
 /// (the bring-up-failure path).
@@ -153,9 +153,9 @@ pub struct SandboxHalt {
 impl std::fmt::Display for SandboxHalt {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let allow = if self.ask {
-            "choose \"run on host\", or set `failover = \"auto\"`"
+            "choose \"run on host\", or explicitly set the sandbox backend to `none`"
         } else {
-            "set `failover = \"ask\"` or `\"auto\"`"
+            "explicitly select host execution (`backend = \"none\"`) or fix the sandbox"
         };
         write!(
             f,
@@ -276,11 +276,11 @@ pub fn prepare_sandbox_env(
     // so it's routed through the same failover decision explicitly — see the guard
     // after `warnings` is declared.
     let unresolved_selection = environment.unresolved_selection;
-    // Failover: `halt`/`ask` block a bring-up failure; `auto`/`force_host` degrade.
+    // Failover never silently turns a requested sandbox into a host shell.
+    // Host fallback is allowed only for a local explicit host/disabled policy or
+    // the existing, deliberate run-on-host choice.
     let failover_mode = cfg.env_failover_mode(repo_root, &env_name);
     let ask = matches!(failover_mode, thegn_core::config::FailoverMode::Ask);
-    let degrade_allowed = matches!(failover_mode, thegn_core::config::FailoverMode::Auto)
-        || force_host_requested(worktree);
     let placement_label = placement.label();
     // For a managed-provider env, persist a `GitLoc::Provider` location so the
     // chrome's git/fs reads route into the sandbox via the control-plane exec
@@ -383,6 +383,7 @@ pub fn prepare_sandbox_env(
         explicit_backend = None;
         sb.backend = thegn_core::config::SandboxBackend::Auto;
     }
+    let degrade_allowed = host_fallback_allowed(&placement, &sb, force_host_requested(worktree));
     let mut explicit_choice = explicit_backend.is_some();
     let auto_choice = sb.backend == thegn_core::config::SandboxBackend::Auto;
     let mut warnings = Vec::new();
@@ -471,8 +472,8 @@ pub fn prepare_sandbox_env(
     if matches!(placement, thegn_core::placement::Placement::Provider(_))
         && let Err(e) = auto_provision_sandbox(cfg, &env_name, worktree)
     {
-        // Provider won't provision (bad token, quota, API down): `halt`/`ask`
-        // surface the REAL cause (`{e:#}`); `auto`/run-on-host degrade to host.
+        // Provider won't provision (bad token, quota, API down): surface the
+        // real cause (`{e:#}`); only an explicit local host choice may degrade.
         if !degrade_allowed {
             return Err(SandboxHalt {
                 env_name: env_name.clone(),
@@ -785,10 +786,10 @@ pub fn prepare_sandbox_env(
         }
         .into());
     }
-    // Reaching here means no candidate produced a runnable sandbox and we'd fall
-    // back to a bare host shell. For a NON-LOCAL env with failover off, that
-    // silent drop is exactly what we refuse — halt with a warning instead.
-    if !placement.is_local() && !degrade_allowed {
+    // Reaching here means no candidate produced a runnable sandbox. A requested
+    // sandbox must halt with the existing actionable error instead of becoming a
+    // host login shell, regardless of failover mode or placement.
+    if !degrade_allowed && sb.enabled && sb.backend != thegn_core::config::SandboxBackend::None {
         let reachable = sandbox::placement_reachable(&exec_placement, &sb.backend_chain);
         return Err(SandboxHalt {
             env_name: env_name.clone(),
@@ -802,21 +803,11 @@ pub fn prepare_sandbox_env(
     // An installed runtime failed its availability probe. A stopped service is
     // one possible cause; access or runtime failure can look the same. Offer
     // the configured recovery choices — start it, run on the host, or
-    // cancel — per `[sandbox] on_dormant`. Only when this launch actually asked
-    // for containment: an `auto`/`host` launch landing on the host is the
-    // configured outcome, not a degradation, and must never nag.
-    // …unless the user has ALREADY said that degrading to the host is fine:
-    // `failover = "auto"`, or a worktree explicitly pinned to the host. Those are
-    // standing answers to this exact question, and re-asking would nag someone
-    // who configured their way out of it. `on_dormant` governs the default
-    // (blocking) posture; an explicit degrade policy wins.
+    // cancel — per `[sandbox] on_dormant`. A host choice is explicit;
+    // `failover = "auto"` is not a permission to bypass containment.
     if placement.is_local() && !degrade_allowed {
-        // Only an EXPLICIT pick counts as asking for containment — a config
-        // `backend = "podman-rootless"`, or the wizard's per-worktree/terminal
-        // choice. `auto` means "walk the chain and land wherever", so landing on
-        // the host is the configured outcome, not a degradation: treating it as
-        // one raised this modal on every pane on any machine with a stopped
-        // runtime, which is nagging, not honesty.
+        // Only an explicit containment choice counts as asking for this recovery
+        // path. An automatic chain miss is handled by the actionable halt below.
         let wanted = explicit_backend.is_some();
         let report = thegn_core::sandbox_support::support_report(
             &sb.backend_chain,
@@ -1572,6 +1563,21 @@ pub(crate) fn force_host_requested(worktree: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether an unavailable sandbox may intentionally become a host shell.
+/// Remote/provider placement is always a sandbox request, even when its nested
+/// backend is `none`; only a local disabled/`none` policy or the existing
+/// explicit run-on-host choice authorizes host execution.
+fn host_fallback_allowed(
+    placement: &thegn_core::placement::Placement,
+    sandbox: &thegn_core::config::SandboxConfig,
+    force_host: bool,
+) -> bool {
+    placement.is_local()
+        && (force_host
+            || !sandbox.enabled
+            || sandbox.backend == thegn_core::config::SandboxBackend::None)
+}
+
 /// Un-pin `worktree` from the host so an explicit retry re-attempts the real env.
 pub fn clear_force_host(worktree: &str) {
     if let Ok(mut s) = force_host_registry().lock() {
@@ -1849,10 +1855,6 @@ pub fn provision_provider_env_named(
     // reach the network/model. Remote-safe (no host-local socket vars).
     let mut exec_env = cfg.repo_sandbox(&repo_root).passthrough_env_remote();
     crate::agent_configs::push_host_git_identity(&repo_root, &mut exec_env);
-    // Which flake devShell the sandbox builds/enters ([sandbox] devshell, e.g.
-    // "sandbox" for the lean build shell). Drives the seed build + realise so they
-    // match the in-pane `.envrc` (which reads THEGN_DEVSHELL from exec_env).
-    let devshell_attr = cfg.repo_sandbox(&repo_root).devshell.trim().to_string();
     // The generic, declarative personal layer ([sandbox.home]) — applied to every
     // sandbox so it feels like local. Resolve it PER-ENV (the env overlay may set a
     // different `strategy`, e.g. host-parity on a big box, clean on a sprite), then
@@ -1979,10 +1981,9 @@ pub fn provision_provider_env_named(
         home_closure_p2p: p2p_parity,
         home_profile_installs,
         atuin: home.atuin,
-        // The embedded host cache (a general substituter over the whole host store)
-        // SUPERSEDES the one-shot devShell file:// push when on — keep push_devshell
-        // only as the fallback for providers without the reverse tunnel.
-        push_devshell: pc.push_devshell && !pc.host_cache,
+        // `push_devshell` is retained as a parse-compatible config key but no
+        // longer creates a host-side Nix evaluation or transfer step.
+        push_devshell: false,
         // devShell warm policy:
         //  • Real worktree: respect the configured `skip_devshell_warm` (the
         //    in-pane `direnv` realizes the devShell lazily).
@@ -2119,20 +2120,6 @@ pub fn provision_provider_env_named(
                 crate::agent_configs::upload_agent_configs(&provider, &id, &sprite_home, agents)
             }
             StepKind::AtuinSync => upload_atuin_creds(&provider, &id, &sprite_home, &exec_env),
-            StepKind::DevShellClosurePush => {
-                // Host-executed: build the repo's devShell on the host (a no-op for a
-                // nix user who already has it) + transfer its closure into the sandbox
-                // store, so the `devshell` warm below is a local store hit. Best-effort
-                // — a failure just means the sandbox builds the devShell itself.
-                if let Err(e) =
-                    push_devshell_closure(&provider, &id, &repo_root, &workdir, &devshell_attr)
-                {
-                    thegn_core::msg::warn(&format!(
-                        "devshell push: {e}; the sandbox will build the devShell itself."
-                    ));
-                }
-                Ok(())
-            }
             StepKind::LocalParity {
                 worktree: wt,
                 workdir: wd,
@@ -2490,51 +2477,6 @@ fn push_home_closure_p2p(
 /// slow/unreachable transfer.
 const HOME_CLOSURE_PUSH_TIMEOUT_SECS: u32 = 75;
 
-/// Ceiling (seconds) for each host-side `nix` invocation in the devShell push
-/// (build+gcroot, then the `file://` copy). Generous: instant for a nix user who
-/// already has the devShell, but a cold host build can take a while.
-const DEVSHELL_PUSH_NIX_TIMEOUT_SECS: u32 = 600;
-
-/// Pure: the `nix develop <ref> --profile <gcroot> --command true` argv — builds
-/// the repo's devShell on the HOST and pins it behind a gcroot (so the copy can't
-/// race nix GC). Instant when the devShell is already built locally. `attr`
-/// selects the devShell (`<repo>#<attr>`, e.g. the lean `sandbox`); empty ⇒ the
-/// flake default — matching what the sandbox `.envrc` will enter.
-fn nix_develop_profile_argv(repo_root: &str, gcroot: &str, attr: &str) -> Vec<String> {
-    let reference = if attr.trim().is_empty() {
-        repo_root.to_string()
-    } else {
-        format!("{repo_root}#{}", attr.trim())
-    };
-    vec![
-        "develop".into(),
-        reference,
-        "--profile".into(),
-        gcroot.into(),
-        "--command".into(),
-        "true".into(),
-    ]
-}
-
-/// Pure: `nix copy --to file://<dir> --no-check-sigs <path>` — write a
-/// self-contained binary cache of `path`'s closure to a host dir for transfer.
-fn nix_copy_to_file_argv(cache_dir: &str, path: &str) -> Vec<String> {
-    vec![
-        "copy".into(),
-        "--to".into(),
-        // `compression=zstd`: the cache is built then mostly PRUNED (rust + public
-        // paths dropped), so we'd otherwise burn minutes xz-compressing ~600MB we
-        // immediately delete. zstd is ~100x faster to compress (the discarded bulk
-        // is then nearly free) and the kept paths still ship small. Modern nix on
-        // the sandbox reads zstd NARs fine.
-        format!("file://{cache_dir}?compression=zstd"),
-        "--no-check-sigs".into(),
-        path.into(),
-    ]
-}
-
-pub(crate) use crate::parity::sanitize_tag;
-
 /// The coreutils `timeout` binary, under whichever name this host has it.
 ///
 /// Stock macOS ships **neither**: `timeout` is GNU coreutils, and Homebrew
@@ -2558,201 +2500,6 @@ fn timeout_bin() -> anyhow::Result<&'static str> {
         "no `timeout` binary (GNU coreutils) on PATH — install coreutils \
          (macOS: `brew install coreutils` provides `gtimeout`)"
     )
-}
-
-/// Run a host `nix` subcommand bounded by `timeout` (coreutils). `Ok(output)` on
-/// success; `Err` with a tail of stderr (or "timed out") otherwise.
-// off-loop: provisioning path — reached only via spawn_blocking / the pool thread / CLI.
-#[expect(clippy::disallowed_methods)]
-fn run_host_nix_timeout(secs: u32, argv: &[String]) -> anyhow::Result<std::process::Output> {
-    let out = std::process::Command::new(timeout_bin()?)
-        .arg("--kill-after=5")
-        .arg(secs.to_string())
-        .arg("nix")
-        .args(argv)
-        .output()
-        .map_err(|e| anyhow::anyhow!("spawn nix: {e}"))?;
-    if out.status.success() {
-        return Ok(out);
-    }
-    let code = out.status.code().unwrap_or(-1);
-    let why = if code == 124 {
-        format!("timed out after {secs}s")
-    } else {
-        format!("exit {code}")
-    };
-    Err(anyhow::anyhow!(
-        "nix {} {}: {}",
-        argv.first().map(String::as_str).unwrap_or("?"),
-        why,
-        tail_lines(&String::from_utf8_lossy(&out.stderr), 4)
-    ))
-}
-
-/// Host-side devShell speedup: build the repo's devShell on the HOST (instant for a
-/// nix user who already has it), serialize its closure to a `file://` binary cache,
-/// upload that cache into the sandbox, and import it there — so the in-sandbox
-/// devShell warm is a local store hit instead of a rebuild. Best-effort; the host
-/// `nix` steps are timeout-bounded. Requires the sandbox store to be writable (the
-/// `nix` step's `claim_store` ran first) + `nix` on the sandbox PATH.
-// off-loop: provisioning path — reached only via spawn_blocking / the pool thread / CLI.
-fn push_devshell_closure(
-    provider: &thegn_svc::provider::Provider,
-    id: &str,
-    repo_root: &Path,
-    workdir: &str,
-    devshell_attr: &str,
-) -> anyhow::Result<()> {
-    let repo = repo_root.to_string_lossy().into_owned();
-    if repo.trim().is_empty() {
-        return Err(anyhow::anyhow!("no repo root to build the devShell from"));
-    }
-    let tag = sanitize_tag(id);
-    let tmp = std::env::temp_dir();
-    let gcroot = tmp.join(format!("tg-devshell-gc-{tag}-{}", std::process::id()));
-    let cache = tmp.join(format!("tg-devshell-cache-{tag}-{}", std::process::id()));
-    let cache_str = cache.to_string_lossy().into_owned();
-    let gcroot_str = gcroot.to_string_lossy().into_owned();
-
-    // 1. Build + pin the devShell on the host (instant if already built). Build
-    //    the SAME attr the sandbox will enter, so the seeded paths match.
-    run_host_nix_timeout(
-        DEVSHELL_PUSH_NIX_TIMEOUT_SECS,
-        &nix_develop_profile_argv(&repo, &gcroot_str, devshell_attr),
-    )?;
-    // 2. Resolve the devShell store path (what the sandbox must import). Bounded
-    //    like the sibling nix calls: a wedged daemon would hang path-info forever.
-    let pi = run_host_nix_timeout(
-        DEVSHELL_PUSH_NIX_TIMEOUT_SECS,
-        &["path-info".to_string(), gcroot_str.clone()],
-    )?;
-    let store_path = String::from_utf8_lossy(&pi.stdout)
-        .lines()
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_string();
-    // 3. Serialize the closure to a host file:// cache.
-    let copy_res = run_host_nix_timeout(
-        DEVSHELL_PUSH_NIX_TIMEOUT_SECS,
-        &nix_copy_to_file_argv(&cache_str, &gcroot_str),
-    );
-    // 4. Upload the cache into the sandbox + realise it there, then clean up.
-    let result = (|| -> anyhow::Result<()> {
-        copy_res?;
-        if store_path.is_empty() {
-            return Err(anyhow::anyhow!("could not resolve the devShell store path"));
-        }
-        // SCOPE the push: drop every NAR cache.nixos.org already serves so the
-        // upload carries only the paths public caches lack (the repo's from-source
-        // builds + rust-overlay output) — far smaller than the full closure. The
-        // sandbox fills the pruned paths from cache.nixos.org when it realises.
-        // Best-effort: if pruning fails we just upload the full (correct) cache.
-        if let Err(e) = prune_cache_to_public(&cache_str) {
-            thegn_core::msg::warn(&format!(
-                "devshell push: cache pruning skipped ({e}); uploading the full closure."
-            ));
-        }
-        let dest = "/tmp/tg-devshell-cache";
-        with_provision_timeout(
-            "devshell cache upload",
-            provision_step_timeout("devshell"),
-            || provider.upload_dir(id, &cache, dest),
-        )?;
-        // `nix` is on PATH after `claim_store`. Realise the devShell via an
-        // EVAL-based `nix develop` in the worktree, with the uploaded cache as an
-        // extra substituter. This resolves the full closure from three sources at
-        // once: our seeded paths (the repo's from-source builds) from the local
-        // file:// cache, the rust toolchain rebuilt from the upstream Rust CDN
-        // (its derivation, since we pruned it from the upload), and everything else
-        // from cache.nixos.org. Eval-based (not `nix-store -r <path>`) so nix has
-        // the derivations to build the pruned rust paths. Unsigned file:// paths are
-        // fine — the sandbox user owns the store (single-user). Then reclaim /tmp.
-        // Enter the SAME devShell attr the seed built (and the in-pane `.envrc`
-        // will use) — `.#<attr>` for the lean sandbox shell, bare for the default.
-        let dev_ref = if devshell_attr.is_empty() {
-            String::new()
-        } else {
-            format!(".#{devshell_attr} ")
-        };
-        let import = format!(
-            "export PATH=\"$HOME/.nix-profile/bin:/nix/var/nix/profiles/default/bin:$PATH\"; \
-             cd {workdir} 2>/dev/null || exit 1; \
-             nix develop {dev_ref}--command true --option extra-substituters file://{dest} \
-             --option require-sigs false 2>&1; rc=$?; \
-             rm -rf {dest}; exit $rc"
-        );
-        let argv = vec!["/bin/sh".to_string(), "-lc".to_string(), import];
-        let (code, out) = with_provision_timeout(
-            "devshell realise",
-            provision_step_timeout("devshell"),
-            || provider.run_exec(id, &argv, None, &[]),
-        )?;
-        if code != 0 {
-            return Err(anyhow::anyhow!(
-                "sandbox realise (exit {code}): {}",
-                tail_lines(&out, 4)
-            ));
-        }
-        Ok(())
-    })();
-    // Host cleanup (best-effort): the gcroot symlink + the cache dir.
-    let _ = std::fs::remove_dir_all(&cache);
-    let _ = std::fs::remove_file(&gcroot); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
-    result
-}
-
-/// Prune a host `file://` binary cache down to ONLY the paths the sandbox can't
-/// get cheaply elsewhere — the repo's own from-source builds (muse/openspec/…) —
-/// so the scoped devShell push uploads ~tens of MB instead of the whole (multi-
-/// hundred-MB) closure. Two passes drop what the sandbox can get cheaply itself:
-/// the **rust-overlay toolchain** (rustc/cargo/rust-std/clippy/…), which the
-/// sandbox rebuilds from the upstream Rust CDN (static.rust-lang.org) on its own
-/// fast downstream — far quicker than shipping ~300MB over the host's upstream
-/// (this is the bulk of a rust devShell) — and every path **cache.nixos.org**
-/// already serves (a quick HEAD on `/<hash>.narinfo`), which the sandbox
-/// substitutes from there. Best-effort (a missing tool / network blip just leaves
-/// more in the cache — still correct, just larger); bounded so it can't wedge a
-/// provision.
-// off-loop: provisioning path — reached only via spawn_blocking / the pool thread / CLI.
-#[expect(clippy::disallowed_methods)]
-fn prune_cache_to_public(cache_dir: &str) -> anyhow::Result<()> {
-    // POSIX sh. Pass 1 is name-based (rust toolchain); pass 2 is a parallel
-    // (`xargs -P`) HEAD against cache.nixos.org. `$1` is the cache dir.
-    let script = r#"cd "$1" 2>/dev/null || exit 0
-# Pass 1: drop rust-overlay toolchain paths (sandbox fetches them from the Rust CDN).
-for ni in *.narinfo; do
-  [ -e "$ni" ] || continue
-  sp=$(sed -n 's/^StorePath: //p' "$ni"); name=${sp##*/}; name=${name#*-}
-  case "$name" in
-    rustc-*|cargo-*|rust-std-*|rust-docs-*|rust-default-*|rust-src-*|rust-analyzer*|clippy-preview-*|rustfmt-preview-*|llvm-tools-preview-*)
-      nar=$(sed -n 's/^URL: //p' "$ni"); rm -f "$ni" "$nar" ;;
-  esac
-done
-# Pass 2: drop paths cache.nixos.org already serves (parallel HEAD).
-ls *.narinfo 2>/dev/null | xargs -P 16 -n1 sh -c '
-  ni=$0; h=${ni%.narinfo}
-  if curl -sfI --max-time 4 "https://cache.nixos.org/$h.narinfo" >/dev/null 2>&1; then
-    nar=$(sed -n "s/^URL: //p" "$ni")
-    rm -f "$ni" "$nar"
-  fi
-'
-exit 0"#;
-    let out = std::process::Command::new(timeout_bin()?)
-        .arg("--kill-after=5")
-        .arg("180")
-        .arg("sh")
-        .arg("-c")
-        .arg(script)
-        .arg("sh")
-        .arg(cache_dir)
-        .output()
-        .map_err(|e| anyhow::anyhow!("spawn prune: {e}"))?;
-    if out.status.success() {
-        Ok(())
-    } else {
-        Err(anyhow::anyhow!("exit {}", out.status.code().unwrap_or(-1)))
-    }
 }
 
 /// Host dotfiles to carry into a sandbox `$HOME` so the shell feels like home.
@@ -3308,7 +3055,6 @@ pub fn launch_spec(
         branch,
         choice,
         false,
-        false,
         LaunchExtras::default(),
     )
 }
@@ -3349,15 +3095,7 @@ pub fn launch_spec_center_with(
     extras: LaunchExtras<'_>,
 ) -> anyhow::Result<LaunchSpec> {
     let daemon_persistent = crate::handlers::startup::daemon_active(cfg);
-    launch_spec_full(
-        cfg,
-        worktree,
-        branch,
-        choice,
-        false,
-        daemon_persistent,
-        extras,
-    )
+    launch_spec_full(cfg, worktree, branch, choice, daemon_persistent, extras)
 }
 
 /// The sandbox-chain pre-warm resolution (run.rs `prewarm_sandbox_chain`):
@@ -3378,11 +3116,6 @@ pub(crate) fn prewarm_spec(cfg: &Config, worktree: &str) -> anyhow::Result<Launc
 
 /// Like [`launch_spec`] but with the full set of launch knobs.
 ///
-/// `sync_warm` gates the `direnv` cache warm: `false` kicks the async
-/// background warm (the first launch of a cold worktree falls back), `true`
-/// warms synchronously + bounded before composing the spec (off-loop callers
-/// only — see [`crate::direnv_warm::launch_spec_synced_with`]).
-///
 /// `daemon_persistent` marks the resolved sandbox spec as pane-daemon-owned so
 /// a local bwrap pane drops `--die-with-parent` and survives UI detach instead
 /// of being reaped with its forking thread. Set `true` for daemon-routed center
@@ -3395,7 +3128,6 @@ pub fn launch_spec_full(
     worktree: &str,
     branch: Option<&str>,
     choice: &str,
-    sync_warm: bool,
     daemon_persistent: bool,
     extras: LaunchExtras<'_>,
 ) -> anyhow::Result<LaunchSpec> {
@@ -3590,21 +3322,12 @@ pub fn launch_spec_full(
     // Tier A: inject the repo's flake `devShell` toolchain (PATH + safe vars) so
     // the pane gets the project's linters/formatters/compilers out of the box —
     // crucial inside a sandbox, which can't reach the Nix daemon to `nix develop`
-    // itself. Resolved on the host + cached; a cold cache kicks a background
-    // resolve the next launch picks up. Local worktrees only (remote panes run
-    // where the host store isn't mounted). See [`devenv`].
+    // itself. Only an already-existing cache is read; a cold cache is left to
+    // explicit target-side setup. Local worktrees only (remote panes run where
+    // the host store isn't mounted). See [`devenv`].
     let devshell = (cfg.sandbox.inject_devshell && !loc.is_remote() && !outcome.is_remote)
         .then(|| devenv::cached(&repo_root))
         .flatten();
-    match (&devshell, outcome.spec.as_mut()) {
-        (Some(_), _) => {}
-        // No cache yet — warm it in the background for the next launch.
-        (None, _) if cfg.sandbox.inject_devshell && !loc.is_remote() && !outcome.is_remote => {
-            devenv::prewarm(&repo_root);
-        }
-        _ => {}
-    }
-
     // Toolchain activation is one shared, cache-first composition for host,
     // sandbox, provider, and daemon launches. The provider call performs no
     // child-process work here: a cold approved environment schedules a bounded
@@ -3618,21 +3341,6 @@ pub fn launch_spec_full(
         devshell.as_ref(),
         db.as_ref(),
     );
-
-    // Pre-warm this worktree's `direnv` cache on the host so the in-sandbox
-    // direnv hook replays it read-only instead of failing on the read-only
-    // `/nix/store`. A host fallback has a writable store already, so warming
-    // there is both unnecessary and potentially expensive. Keep the gate on
-    // the resolved launch, rather than the configured backend: auto may have
-    // fallen through to `none` because no sandbox runtime is available.
-    let has_local_sandbox = !loc.is_remote()
-        && !outcome.is_remote
-        && outcome.spec.as_ref().is_some_and(|spec| {
-            spec.placement.is_local() && spec.backend != sandbox::Backend::None
-        });
-    if has_local_sandbox {
-        crate::direnv_warm::warm_for_launch(cfg, Path::new(worktree), sync_warm);
-    }
 
     // Mark the resolved sandbox as pane-daemon-owned when this pane is
     // daemon-routed, so `enter_argv` drops the bwrap `--die-with-parent` guard

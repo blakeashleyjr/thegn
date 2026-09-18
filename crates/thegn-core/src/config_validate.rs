@@ -86,6 +86,12 @@ pub fn validate_diagnostics(body: &str) -> Vec<ValidationDiagnostic> {
             }),
     );
     if let Ok(cfg) = toml::from_str::<Config>(&normalized.body) {
+        if let Some(message) = cfg.sandbox.warm_direnv.deprecation_warning() {
+            diagnostics.push(ValidationDiagnostic {
+                severity: ValidationSeverity::Warning,
+                message: message.to_string(),
+            });
+        }
         diagnostics.extend(
             crate::config_calendar::display_warnings(&cfg.calendar)
                 .into_iter()
@@ -1369,6 +1375,15 @@ pre_create = [
         let errs = validate_str("picker = 3\n");
         assert_eq!(errs.len(), 1, "{errs:?}");
         assert!(errs[0].contains("rejected on load"), "{errs:?}");
+    }
+
+    #[test]
+    fn legacy_warm_direnv_is_a_warning_but_never_an_error() {
+        let diagnostics = validate_diagnostics("[sandbox]\nwarm_direnv = \"auto\"\n");
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(diagnostics[0].severity, ValidationSeverity::Warning);
+        assert!(diagnostics[0].message.contains("deprecated and disabled"));
+        assert!(validate_str("[sandbox]\nwarm_direnv = \"auto\"\n").is_empty());
     }
 
     #[test]

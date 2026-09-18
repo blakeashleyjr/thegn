@@ -1,6 +1,25 @@
 use super::*;
 
 #[test]
+fn sandbox_resolution_does_not_authorize_implicit_host_fallback() {
+    use thegn_core::config::{SandboxBackend, SandboxConfig};
+    use thegn_core::placement::Placement;
+
+    let local = Placement::Local;
+    let mut requested = SandboxConfig::default();
+    requested.enabled = true;
+    requested.backend = SandboxBackend::Auto;
+    assert!(!host_fallback_allowed(&local, &requested, false));
+    assert!(host_fallback_allowed(&local, &requested, true));
+
+    requested.backend = SandboxBackend::None;
+    assert!(host_fallback_allowed(&local, &requested, false));
+    requested.enabled = false;
+    requested.backend = SandboxBackend::Auto;
+    assert!(host_fallback_allowed(&local, &requested, false));
+}
+
+#[test]
 fn resolve_personal_dotfiles_drops_nonportable_under_portable() {
     use thegn_core::config::{HomeConfig, ShellStrategy};
     let home_dir = std::env::temp_dir().join(format!("tg-home-{}", std::process::id()));
@@ -120,42 +139,6 @@ fn nix_copy_argv_builds_push_command() {
             "s3://my-cache".to_string(),
             "/nix/store/a-foo".to_string(),
             "/nix/store/b-bar".to_string(),
-        ]
-    );
-}
-
-#[test]
-fn devshell_push_argv_builders() {
-    assert_eq!(
-        nix_develop_profile_argv("/home/me/repo", "/tmp/gc", ""),
-        vec![
-            "develop",
-            "/home/me/repo",
-            "--profile",
-            "/tmp/gc",
-            "--command",
-            "true"
-        ]
-    );
-    assert_eq!(
-        nix_develop_profile_argv("/home/me/repo", "/tmp/gc", "sandbox"),
-        vec![
-            "develop",
-            "/home/me/repo#sandbox",
-            "--profile",
-            "/tmp/gc",
-            "--command",
-            "true"
-        ]
-    );
-    assert_eq!(
-        nix_copy_to_file_argv("/tmp/cache", "/tmp/gc"),
-        vec![
-            "copy",
-            "--to",
-            "file:///tmp/cache?compression=zstd",
-            "--no-check-sigs",
-            "/tmp/gc"
         ]
     );
 }
@@ -612,8 +595,6 @@ fn shell_materialize_with_suppressed_record_leaves_the_worktrees_agent_alone() {
             &wt,
             None,
             "shell",
-            false,
-            false,
             LaunchExtras {
                 suppress_agent_record: true,
                 ..Default::default()
@@ -725,8 +706,6 @@ fn sandbox_argv_resolution_leaves_the_worktrees_agent_alone() {
             &wt,
             None,
             "shell",
-            false,
-            false,
             LaunchExtras {
                 suppress_agent_record: true,
                 ..Default::default()

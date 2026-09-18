@@ -1,25 +1,20 @@
-//! Resolve a repo's Nix flake `devShell` environment on the host and cache it,
-//! so a sandboxed worktree pane — which can't reach the Nix daemon or write to
-//! the read-only `/nix/store` — still gets the project toolchain
-//! (linters/formatters/compilers) on `PATH` out of the box.
+//! Read an already-existing cached Nix flake `devShell` environment for a
+//! sandboxed worktree pane. This module deliberately does not evaluate flakes,
+//! spawn `nix`, or write cache entries; cold environments remain uncached until
+//! explicit user or target-side setup.
 //!
 //! Flow (Tier A in
 //! `docs/superpowers/specs/2026-06-26-sandbox-devshell-injection-design.md`):
 //!
-//! 1. The compositor runs on the host, where the store is writable and the
-//!    daemon lives; [`prewarm`] shells out to `nix print-dev-env --json` on a
-//!    background thread and writes the parsed env to a content-addressed cache.
-//! 2. At pane-spawn the host calls [`cached`] (fast — file IO only) and prepends
+//! 1. At pane-spawn the host calls [`cached`] (fast — file IO only) and prepends
 //!    the resolved `PATH` to the pane's environment. The referenced store paths
 //!    are already realized and bind-mounted read-only, so the tools just run.
 //!
-//! Everything degrades silently: no flake → no-op; `nix` missing or the eval
-//! fails → `None`, and the pane gets exactly today's environment.
+//! Everything degrades silently: no flake or cold cache → `None`, and the pane
+//! gets exactly today's environment.
 
-use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 
@@ -33,9 +28,8 @@ pub struct Devshell {
 }
 
 impl Devshell {
-    /// Nothing worth injecting — used both to skip injection and as a negative
-    /// cache marker (a flake with no usable devShell still writes an empty file
-    /// so [`prewarm`] doesn't re-run `nix` on every cold pane spawn).
+    /// Nothing worth injecting — used to skip injection and reject empty cache
+    /// entries.
     pub fn is_empty(&self) -> bool {
         self.path.is_none() && self.vars.is_empty()
     }
@@ -159,94 +153,13 @@ fn cache_path(key: &str) -> PathBuf {
 /// The cached devShell env for `repo_root`, or `None` when the repo has no
 /// flake, the cache is cold or stale, or the resolve produced nothing usable.
 /// Fast (a single small file read + parse) — safe to call on the pane-spawn
-/// path. Pair with [`prewarm`] to populate a cold cache off the event loop.
+/// path. A cold cache remains cold; this function never evaluates or writes it.
 pub fn cached(repo_root: &Path) -> Option<Devshell> {
     let key = cache_key(repo_root)?;
     let raw = std::fs::read_to_string(cache_path(&key)).ok()?;
     serde_json::from_str::<Devshell>(&raw)
         .ok()
         .filter(|d| !d.is_empty())
-}
-
-/// Tracks cache keys with an in-flight background resolve, so [`prewarm`] never
-/// spawns two `nix` invocations for the same key concurrently.
-fn in_flight() -> &'static Mutex<HashSet<String>> {
-    static S: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-    S.get_or_init(|| Mutex::new(HashSet::new()))
-}
-
-/// Kick a background resolve (`nix print-dev-env --json`) that writes the cache,
-/// if it isn't already warm. No-op when: the repo has no `flake.nix`, `nix`
-/// isn't on PATH, the cache file already exists, or a resolve for this key is
-/// already running. Returns immediately — **never blocks the caller** (the
-/// `nix` eval can take seconds). Results are picked up by the next [`cached`].
-pub fn prewarm(repo_root: &Path) {
-    let Some(key) = cache_key(repo_root) else {
-        return;
-    };
-    if cache_path(&key).is_file() {
-        return; // already resolved (warm, or a negative-cache marker)
-    }
-    if !crate::util::have("nix") {
-        return;
-    }
-    {
-        let mut set = in_flight().lock().unwrap();
-        if !set.insert(key.clone()) {
-            return; // a resolve for this key is already in flight
-        }
-    }
-    let root = repo_root.to_path_buf();
-    std::thread::spawn(move || {
-        resolve_and_cache(&root, &key);
-        in_flight().lock().unwrap().remove(&key);
-    });
-}
-
-/// Run `nix print-dev-env --json` for `repo_root`, parse it, and write the cache
-/// file (always — an empty `Devshell` on failure acts as a negative cache so we
-/// don't re-shell-out every cold spawn for a flake with no usable devShell).
-/// Subprocess seam: excluded from coverage, exercised by smoke.
-fn resolve_and_cache(repo_root: &Path, key: &str) {
-    let dev = run_print_dev_env(repo_root).unwrap_or_default();
-    let path = cache_path(key);
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent); // best-effort: dir prep: a later write reports the real failure
-    }
-    if let Ok(json) = serde_json::to_string(&dev) {
-        let _ = std::fs::write(&path, json); // best-effort: cache write: the devenv info snapshot; absence just means no snapshot
-    }
-}
-
-/// Ceiling for a `nix print-dev-env` eval. A cold-cache eval that has to fetch
-/// flake inputs is legitimately slow, but a network drop mid-fetch would
-/// otherwise hang forever (nix has no default fetch deadline) — and because
-/// [`prewarm`] only clears the `in_flight` marker after this returns, one hung
-/// eval would permanently wedge devshell resolution for the repo. Bound it so
-/// the marker is always released and a negative cache always written.
-const PRINT_DEV_ENV_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
-
-/// Invoke `nix print-dev-env --json` against the flake at `repo_root` and parse
-/// it. `None` on a non-zero exit, spawn failure, or timeout (degrade silently).
-/// Subprocess seam.
-fn run_print_dev_env(repo_root: &Path) -> Option<Devshell> {
-    let installable = format!("{}#", repo_root.display());
-    let argv = [
-        "nix".to_string(),
-        "--extra-experimental-features".to_string(),
-        "nix-command flakes".to_string(),
-        "print-dev-env".to_string(),
-        "--json".to_string(),
-        installable,
-    ];
-    // Hard deadline: the child is killed + reaped on timeout, so the caller's
-    // `in_flight` entry is released even on a wedged eval.
-    let (ok, stdout) = crate::sandbox::output_with_timeout(&argv, PRINT_DEV_ENV_TIMEOUT)?;
-    if !ok {
-        return None;
-    }
-    let dev = parse_print_dev_env(&stdout);
-    (!dev.is_empty()).then_some(dev)
 }
 
 #[cfg(test)]
@@ -316,7 +229,8 @@ mod tests {
     #[test]
     fn devshell_round_trips_through_cache_json() {
         // The on-disk cache is just serialized Devshell; round-trip must hold so
-        // `cached()` reads back what `resolve_and_cache()` wrote.
+        // `cached()` reads the same serialized shape that target-side tooling
+        // may have placed in the cache.
         let dev = Devshell {
             path: Some("/nix/store/x/bin".into()),
             vars: vec![("FOO".into(), "bar".into())],

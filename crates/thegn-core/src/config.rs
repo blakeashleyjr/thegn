@@ -421,24 +421,37 @@ config_enum! {
     } default = Hardened;
 }
 config_enum! {
-    /// Whether thegn pre-warms a worktree's `direnv` cache **on the host** so
-    /// the in-sandbox `direnv` hook works against the read-only `/nix/store`.
-    /// A cold `nix-direnv` (`use flake`) cache makes the in-pane direnv try to
-    /// rebuild the devShell, which fails on the read-only store + no daemon;
-    /// warming on the host (writable store + daemon) lets the pane replay the
-    /// cached env read-only. See [`crate::direnv`].
+    /// Legacy spelling for the removed host-side `direnv` warm policy.
     ///
-    /// - `auto`         — warm + `direnv allow` the worktree (trusts the repo's
-    ///                    own `.envrc`, the same boundary `inject_devshell`
-    ///                    already crosses). The default.
-    /// - `allowed-only` — warm only worktrees the user has already
-    ///                    `direnv allow`-ed; never auto-allows.
-    /// - `off`          — never warm (the in-pane direnv falls back as before).
+    /// Host warming, host `direnv` evaluation, cache writes, and generated
+    /// approval commands are disabled for every value. `off` is the default.
+    /// The historical values remain parseable so old configuration files do
+    /// not silently change shape; `auto` and `allowed-only` produce a bounded
+    /// deprecation diagnostic when loaded.
     pub enum WarmDirenv: "warm_direnv" {
         Auto = "auto" | "on" | "true",
         AllowedOnly = "allowed-only" | "allowed_only" | "allowed",
         Off = "off" | "false" | "none" | "no",
-    } default = Auto;
+    } default = Off;
+}
+
+impl WarmDirenv {
+    /// Host warming is intentionally unavailable for every compatibility
+    /// value. Keep this explicit so callers cannot accidentally resurrect the
+    /// old subprocess/cache path by branching on the enum.
+    pub const fn host_warming_enabled(self) -> bool {
+        false
+    }
+
+    /// Return the bounded compatibility diagnostic for removed modes.
+    pub const fn deprecation_warning(self) -> Option<&'static str> {
+        match self {
+            Self::Auto | Self::AllowedOnly => Some(
+                "sandbox.warm_direnv is deprecated and disabled; host direnv warming and approval are never automatic (use off)",
+            ),
+            Self::Off => None,
+        }
+    }
 }
 config_enum! {
     /// How an env-bundle's Tier-2 dotfiles are materialized into its managed
@@ -3628,8 +3641,8 @@ pub use crate::config_env_tables::{
 };
 
 /// `[sandbox]` — containerize/sandbox a worktree's interactive process. On by
-/// default; `backend = "auto"` walks `backend_chain` and falls back to the host
-/// shell (with a warning) when nothing is available.
+/// default; `backend = "auto"` walks `backend_chain` and refuses to become a
+/// host shell when no sandbox is available.
 #[derive(
     Debug,
     Clone,
@@ -4005,18 +4018,17 @@ pub struct SandboxConfig {
     /// Host-side setup commands run (off-loop, via `sh -lc` in the worktree)
     /// once when a worktree is created, before its first pane spawns — for
     /// heavyweight prep that benefits from the host's writable store/daemon and
-    /// network (e.g. `mise install`, a cache warm). The built-in `direnv` warm
-    /// (`warm_direnv`) runs alongside these.
+    /// network (e.g. `mise install`). Repository `.envrc` evaluation is not part
+    /// of this lifecycle path.
     pub prepare: Vec<String>,
-    /// Pre-warm a worktree's `direnv` cache on the host so the in-sandbox
-    /// `direnv` hook works against the read-only `/nix/store`. See
-    /// [`crate::direnv`] and [`WarmDirenv`].
+    /// Deprecated compatibility policy for the removed host-side `direnv` warm.
+    /// Every value is inert; see [`WarmDirenv`].
     pub warm_direnv: WarmDirenv,
     pub devenv: bool, // wrap inner cmd with `devenv shell --`
     /// Inject the repo's Nix flake `devShell` toolchain (its `PATH` + safe
-    /// exported vars) into worktree panes — resolved on the host and cached, so a
-    /// sandboxed pane that can't reach the Nix daemon still gets the project
-    /// tools. No-op without a flake `devShell`. See [`crate::devenv`].
+    /// exported vars) into worktree panes from an already-existing cache. A cold
+    /// cache is a no-op; this setting never evaluates a repository on the host.
+    /// See [`crate::devenv`].
     pub inject_devshell: bool,
     /// Which flake devShell attribute a sandbox/sprite enters, e.g. `"sandbox"`
     /// for a lean build-only shell (`.#devShells.sandbox`). Empty ⇒ `default`.
@@ -4025,16 +4037,18 @@ pub struct SandboxConfig {
     /// host dev (the host, with it unset, uses devenv instead).
     pub devshell: String,
     /// Bind-mount the host Nix daemon socket into the sandbox for full in-sandbox
-    /// `nix develop`/`build`/`fmt`. `true` forces it on; `false` still auto-enables
-    /// it as a backstop for a local flake `.envrc` — off: `warm_direnv=off`/sealed.
+    /// `nix develop`/`build`/`fmt`. `true` explicitly enables it; `false` never
+    /// auto-enables it.
     pub nix_daemon: bool,
     /// Shell to use inside the sandbox. `""` = resolve from the host's `$SHELL`
     /// at pane-spawn time; else an absolute path or name (e.g. `"zsh"`).
     pub shell: String,
     pub on_missing: OnMissing,
     /// When a *selected* non-local env can't be brought up: `halt` (default,
-    /// blocks+warns), `ask` (prompt: retry/run-on-host), `auto` (silent host
-    /// fallback). Legacy bool: `true`⇒`auto`, `false`⇒`halt`. Per-env overridable.
+    /// blocks+warns), `ask` (prompt: retry/run-on-host), `auto` (legacy
+    /// compatibility; sandbox resolution still halts rather than silently
+    /// becoming a host shell). Legacy bool: `true`⇒`auto`, `false`⇒`halt`.
+    /// Per-env overridable.
     #[serde(deserialize_with = "de_failover")]
     pub failover: FailoverMode,
     /// What to do when a launch would degrade because a container runtime is
@@ -4133,7 +4147,7 @@ impl Default for SandboxConfig {
             mounts: vec!["~/.gitconfig:ro".into(), "~/.gnupg:rw".into()],
             init_script: String::new(),
             prepare: Vec::new(),
-            warm_direnv: WarmDirenv::Auto,
+            warm_direnv: WarmDirenv::Off,
             devenv: false,
             inject_devshell: true,
             devshell: String::new(),
@@ -5996,6 +6010,10 @@ impl Config {
             }
         }
 
+        if let Some(warning) = cfg.sandbox.warm_direnv.deprecation_warning() {
+            config_warn(warning);
+        }
+
         cfg.post_process();
         Ok(cfg)
     }
@@ -6016,6 +6034,9 @@ impl Config {
                     if let Some((key, val)) = ov.split_once('=') {
                         let _ = Self::apply_override_str(&mut cfg, key, val); // best-effort: the parse-error path was already surfaced via config_warn; overrides still apply so env/THEGN_* win
                     }
+                }
+                if let Some(warning) = cfg.sandbox.warm_direnv.deprecation_warning() {
+                    config_warn(warning);
                 }
                 cfg.post_process();
                 cfg
