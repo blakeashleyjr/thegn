@@ -168,6 +168,14 @@ fn automatic_prewarm_rejects_host_reintroduced_by_remembered_agent_relaunch() {
             true,
             false,
         );
+        assert!(
+            specs.as_ref().unwrap()[0]
+                .1
+                .argv
+                .join(" ")
+                .contains("remembered-agent"),
+            "the real prewarm batch includes the remembered-agent substitution"
+        );
         assert_eq!(specs.as_ref().unwrap()[0].1.backend, "host");
 
         reject_host_prewarm(&mut specs);
@@ -175,6 +183,188 @@ fn automatic_prewarm_rejects_host_reintroduced_by_remembered_agent_relaunch() {
             specs,
             Err(crate::handlers::provision::SpecError::PrewarmSkipped)
         ));
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn automatic_prewarm_drains_host_result_without_spawning_or_evaluating() {
+    use std::os::unix::fs::PermissionsExt;
+
+    with_temp_state("prewarm-executable-drain", || {
+        let root = std::env::temp_dir().join(format!(
+            "tg-prewarm-executable-drain-{}",
+            std::process::id()
+        ));
+        let worktree = root.join("repo");
+        let fake_bin = root.join("bin");
+        let shell_ran = root.join("shell-ran");
+        let direnv_ran = root.join("direnv-ran");
+        let nix_ran = root.join("nix-ran");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::create_dir_all(&fake_bin).unwrap();
+        std::fs::write(
+            worktree.join(".envrc"),
+            format!("printf hostile > {}\n", root.join("envrc-ran").display()),
+        )
+        .unwrap();
+        std::fs::write(worktree.join("flake.nix"), "{ outputs = _: {}; }\n").unwrap();
+        std::fs::write(worktree.join("flake.lock"), "locked\n").unwrap();
+
+        let script = |path: &std::path::Path, marker: &std::path::Path| {
+            std::fs::write(
+                path,
+                format!("#!/bin/sh\nprintf called > {}\n", marker.display()),
+            )
+            .unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        let fake_shell = fake_bin.join("shell");
+        script(&fake_shell, &shell_ran);
+        script(&fake_bin.join("direnv"), &direnv_ran);
+        script(&fake_bin.join("nix"), &nix_ran);
+
+        let old_shell = std::env::var_os("SHELL");
+        let old_path = std::env::var_os("PATH");
+        let mut path = fake_bin.as_os_str().to_os_string();
+        path.push(":/usr/bin:/bin");
+        // SAFETY: with_temp_state holds ENV_LOCK for this whole test.
+        unsafe {
+            std::env::set_var("SHELL", &fake_shell);
+            std::env::set_var("PATH", &path);
+        }
+
+        let mut cfg = cfg_with(&[("remembered", "placeholder")], &[]);
+        cfg.agents[0].command = fake_bin.join("remembered-agent").display().to_string();
+        cfg.sandbox.enabled = false;
+        cfg.sandbox.backend = thegn_core::config::SandboxBackend::None;
+        cfg.sandbox.warm_direnv = thegn_core::config::WarmDirenv::Auto;
+        cfg.sandbox.inject_devshell = true;
+        let wt = worktree.to_string_lossy().into_owned();
+        let db = thegn_core::db::Db::open().unwrap();
+        db.put_worktree("app/wt", "/x/app", &wt, "tg/wt", None, None)
+            .unwrap();
+        db.set_worktree_agent(&wt, "remembered").unwrap();
+        drop(db);
+
+        // Resolve through the same launch builder used by the automatic
+        // prewarm worker, then apply the remembered-agent fold that previously
+        // reintroduced a host spec after the first rejection guard.
+        let mut specs = crate::direnv_warm::launch_spec_synced_with(
+            &cfg,
+            &wt,
+            None,
+            "shell",
+            LaunchExtras {
+                suppress_agent_record: true,
+                ..Default::default()
+            },
+        )
+        .map(|spec| vec![(7, spec)])
+        .map_err(crate::handlers::provision::spec_err);
+        assert_eq!(specs.as_ref().unwrap()[0].1.backend, "host");
+        crate::handlers::worktree_launch::apply_relaunch(
+            &mut specs,
+            &cfg,
+            &wt,
+            Some(7),
+            true,
+            false,
+        );
+        assert_eq!(specs.as_ref().unwrap()[0].1.backend, "host");
+        reject_host_prewarm(&mut specs);
+        assert!(matches!(
+            specs,
+            Err(crate::handlers::provision::SpecError::PrewarmSkipped)
+        ));
+
+        let mut session = crate::session::Session {
+            id: "s1".into(),
+            worktrees: vec![crate::session::WorktreeGroup::new(
+                "app/wt",
+                crate::session::GroupKind::Branch,
+                wt.clone(),
+            )],
+            active: 0,
+        };
+        session.worktrees[0].tabs[0].center = crate::center::CenterTree::Leaf(7);
+        session.worktrees[0].tabs[0].focused_pane = 7;
+        let (pane_tx, _pane_rx) = tokio::sync::mpsc::channel::<crate::pane::PaneEvent>(1024);
+        let mut panes = crate::panes::Panes::new(pane_tx);
+        let mut model = crate::chrome::FrameModel::default();
+        let mut active_menu: Option<crate::menu::MenuOverlay> = None;
+        let mut loading_state = crate::loading::track::LoadingTracker::default();
+        let mut loading_remote = std::collections::HashMap::new();
+        let mut materialize_inflight = std::collections::HashSet::new();
+        let mut prewarm_inflight = std::collections::HashSet::from([("app/wt".into(), 0)]);
+        let mut materialize_failed = std::collections::HashSet::new();
+        let mut prewarm_failed = std::collections::HashSet::new();
+        let mut halt_dismissed = std::collections::HashSet::new();
+        let mut last_pool_reconcile = None;
+        let mut center_dormant = false;
+        let mut need_relayout = false;
+        let mut dirty = false;
+        let mut loop_perf = crate::perf::LoopPerf::new();
+        let (spec_tx, mut spec_rx) = tokio::sync::mpsc::unbounded_channel();
+        spec_tx
+            .send(crate::handlers::provision::SpecBatch {
+                group: "app/wt".into(),
+                worktree: wt,
+                tab: 0,
+                origin: crate::loading::SpecOrigin::Prewarm,
+                specs,
+                attach: Vec::new(),
+            })
+            .unwrap();
+
+        crate::handlers::provision::drain_specs(
+            &mut spec_rx,
+            &mut crate::handlers::provision::SpecDrainCtx {
+                session: &mut session,
+                panes: &mut panes,
+                model: &mut model,
+                active_menu: &mut active_menu,
+                current_config: &cfg,
+                center: crate::layout::compute(160, 40, true, true).center,
+                loading_state: &mut loading_state,
+                loading_remote: &mut loading_remote,
+                materialize_inflight: &mut materialize_inflight,
+                prewarm_inflight: &mut prewarm_inflight,
+                materialize_failed: &mut materialize_failed,
+                prewarm_failed: &mut prewarm_failed,
+                halt_dismissed: &mut halt_dismissed,
+                last_pool_reconcile: &mut last_pool_reconcile,
+                center_dormant: &mut center_dormant,
+                need_relayout: &mut need_relayout,
+                dirty: &mut dirty,
+                loop_perf: &mut loop_perf,
+            },
+        );
+
+        assert!(
+            panes.table.is_empty(),
+            "prewarm skip must not spawn a host pane"
+        );
+        assert!(
+            prewarm_inflight.is_empty(),
+            "the skipped request is settled"
+        );
+        assert!(prewarm_failed.is_empty(), "a benign skip is not a failure");
+        assert!(!dirty, "no pane was spawned or attached");
+        assert!(!root.join("envrc-ran").exists());
+        assert!(!shell_ran.exists());
+        assert!(!direnv_ran.exists());
+        assert!(!nix_ran.exists());
+
+        match old_shell {
+            Some(value) => unsafe { std::env::set_var("SHELL", value) },
+            None => unsafe { std::env::remove_var("SHELL") },
+        }
+        match old_path {
+            Some(value) => unsafe { std::env::set_var("PATH", value) },
+            None => unsafe { std::env::remove_var("PATH") },
+        }
+        std::fs::remove_dir_all(&root).unwrap();
     });
 }
 

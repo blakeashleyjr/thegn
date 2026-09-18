@@ -12,6 +12,9 @@ use crate::compositor::Rect;
 use crate::pane::{PaneEvent, PtyPane};
 use thegn_core::store::WorkspaceStore;
 
+#[cfg(test)]
+type TestDaemonSpawn = Box<dyn FnMut(&mut Panes, Option<&str>) -> Result<u32>>;
+
 /// The shell argv used for new panes. Non-login interactive shells are the
 /// default because login startup files are expensive and can trigger user
 /// autostart logic inside the compositor. Set `THEGN_LOGIN_SHELL=1` to opt
@@ -332,6 +335,12 @@ pub(crate) struct Panes {
     /// pane daemon (control plane) and survive UI exit. `None` ⇒ today's
     /// in-process PTYs, byte-for-byte.
     daemon_cfg: Option<thegn_core::config::DaemonConfig>,
+    /// Test-only replacement for the daemon's external attach effect. The
+    /// production route still enters through `spawn_daemon_backed`; the hook
+    /// keeps drain tests from starting a real user daemon while exercising the
+    /// same selection and graft path.
+    #[cfg(test)]
+    test_daemon_spawn: Option<TestDaemonSpawn>,
 }
 
 impl Panes {
@@ -346,6 +355,8 @@ impl Panes {
             rt: tokio::runtime::Handle::try_current().ok(),
             replay_cfg: None,
             daemon_cfg: None,
+            #[cfg(test)]
+            test_daemon_spawn: None,
         }
     }
 
@@ -358,6 +369,17 @@ impl Panes {
         self.table.insert(id, PtyPane::test_stream(ctrl_tx, 24, 80));
     }
 
+    /// Insert a daemon-shaped test pane without creating a relay or socket.
+    #[cfg(test)]
+    pub(crate) fn insert_test_daemon_pane(&mut self, session: String) -> u32 {
+        let (ctrl_tx, _ctrl_rx) = tokio_mpsc::channel::<thegn_svc::provider::ExecControl>(1);
+        let id = self.next_id;
+        self.next_id += 1;
+        self.table
+            .insert(id, PtyPane::test_daemon_stream(ctrl_tx, session, 24, 80));
+        id
+    }
+
     pub(crate) fn with_waker(tx: tokio_mpsc::Sender<PaneEvent>, waker: TerminalWaker) -> Self {
         Self {
             table: std::collections::HashMap::new(),
@@ -368,6 +390,8 @@ impl Panes {
             rt: tokio::runtime::Handle::try_current().ok(),
             replay_cfg: None,
             daemon_cfg: None,
+            #[cfg(test)]
+            test_daemon_spawn: None,
         }
     }
 
@@ -391,6 +415,17 @@ impl Panes {
     /// agrees by construction with the fallback materialize will take.
     pub(crate) fn daemon_route_enabled(&self) -> bool {
         self.daemon_cfg.is_some()
+    }
+
+    /// Install a test-only daemon attach effect. The real production method
+    /// remains the caller, so tests still traverse the daemon-backed branch
+    /// without connecting to or spawning a user daemon.
+    #[cfg(test)]
+    pub(crate) fn set_test_daemon_spawn(
+        &mut self,
+        effect: impl FnMut(&mut Panes, Option<&str>) -> Result<u32> + 'static,
+    ) {
+        self.test_daemon_spawn = Some(Box::new(effect));
     }
 
     /// Attach a fresh recording ring to a just-spawned pane when replay is on.
@@ -513,6 +548,16 @@ impl Panes {
         attach: Option<String>,
         label: Option<&str>,
     ) -> Result<u32> {
+        #[cfg(test)]
+        if self.test_daemon_spawn.is_some() {
+            let mut effect = self
+                .test_daemon_spawn
+                .take()
+                .expect("test daemon spawn effect disappeared");
+            let result = effect(self, attach.as_deref());
+            self.test_daemon_spawn = Some(effect);
+            return result;
+        }
         let dcfg = self
             .daemon_cfg
             .clone()
