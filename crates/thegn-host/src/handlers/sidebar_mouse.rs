@@ -204,13 +204,23 @@ pub(crate) fn on_left_press(
     // The header row sits above the list, so `row_at` resolves it to nothing and
     // the click would be swallowed. Give the sort chip its branch first: an
     // indicator you can click to change what it indicates. Geometry comes from
-    // the same `sort_chip` the painter uses, so the target is exactly the text.
-    if my == rect.y
-        && let Some((_, cx, ccols)) = crate::sidebar_view::sort_chip(model, rect)
-        && mx >= cx
-        && mx < cx + ccols
-    {
-        return PressOut::Outcome(SidebarOutcome::SortMenu);
+    // the same `header_chips` the painter uses, so the target is exactly the
+    // text. The layout chip beside it toggles flat/grouped, like `g`.
+    if my == rect.y {
+        let chips = crate::sidebar_view::header_chips(model, rect);
+        let over = |chip: &Option<(String, usize, usize)>| {
+            chip.as_ref()
+                .is_some_and(|(_, cx, ccols)| mx >= *cx && mx < cx + ccols)
+        };
+        if over(&chips.sort) {
+            return PressOut::Outcome(SidebarOutcome::SortMenu);
+        }
+        if over(&chips.layout) {
+            return match sb.toggle_flat(model, session) {
+                SidebarOutcome::Redraw => PressOut::Consumed,
+                out => PressOut::Outcome(out),
+            };
+        }
     }
     let hits = hit_rows(model, rect);
     let Some(hit) = row_at(&hits, my).cloned() else {
@@ -2129,6 +2139,59 @@ mod tests {
             press(&mut model, cx, rect.y),
             PressOut::Outcome(SidebarOutcome::SortMenu)
         ));
+    }
+
+    /// The layout chip is the visible way back out of an accidental `g`:
+    /// clicking it toggles flat ⇄ grouped. The toggle persists to the DB, so
+    /// isolate `XDG_STATE_HOME`.
+    #[test]
+    fn clicking_the_header_layout_chip_toggles_flat() {
+        let (mut model, rect) = fixture();
+        let dir = std::env::temp_dir().join(format!("thegn-layout-chip-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
+        std::fs::create_dir_all(&dir).unwrap();
+        let _env = crate::testenv::EnvVarGuard::set(&[("XDG_STATE_HOME", dir.to_str().unwrap())]);
+
+        let mut sb = SidebarState::default();
+        let session = crate::session::Session::default();
+        let mut press = |sb: &mut SidebarState, model: &mut crate::chrome::FrameModel, mx| {
+            on_left_press(
+                &mut MouseUi::default(),
+                sb,
+                model,
+                &session,
+                rect,
+                mx,
+                rect.y,
+                false,
+                Instant::now(),
+            )
+        };
+
+        let (label, lx, _) = crate::sidebar_view::header_chips(&model, rect)
+            .layout
+            .expect("layout chip fits the fixture width");
+        assert_eq!(label, "grouped");
+        let out = press(&mut sb, &mut model, lx);
+        assert!(!matches!(out, PressOut::Outcome(SidebarOutcome::SortMenu)));
+        assert!(sb.view.flat, "a click on `grouped` switches to flat");
+        assert!(model.sidebar_flat, "and the chip's model mirror follows");
+
+        let (label, lx, lcols) = crate::sidebar_view::header_chips(&model, rect)
+            .layout
+            .expect("flat chip always fits where grouped did");
+        assert_eq!(label, "flat");
+        press(&mut sb, &mut model, lx + lcols - 1);
+        assert!(!sb.view.flat, "a click on `flat` switches back to grouped");
+
+        // The column just left of the chip is bare header and stays inert.
+        // Re-read the chip: `grouped` is wider than `flat` and starts further left.
+        let (_, lx, _) = crate::sidebar_view::header_chips(&model, rect)
+            .layout
+            .unwrap();
+        press(&mut sb, &mut model, lx - 1);
+        assert!(!sb.view.flat);
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 
     #[test]

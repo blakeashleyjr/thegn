@@ -155,6 +155,7 @@ mod tests {
         // the freeze would itself count as "hydration changed" and force the
         // repaint the idle guard exists to avoid.
         other.sidebar_sort_frozen = true;
+        other.sidebar_flat = true;
         // Loop-owned, like `stats`: pushed by the weather task, never by
         // hydration — which is exactly why the swap in `run.rs` has to CARRY it
         // (a dropped snapshot is not visible here, it just blanks the widget

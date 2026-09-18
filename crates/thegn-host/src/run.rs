@@ -1515,6 +1515,7 @@ impl SidebarState {
         // manual/name/recent would advertise a hold the user cannot observe,
         // since those orders never move on their own in the first place.
         model.sidebar_sort_frozen = self.view.freeze.is_some() && self.view.sort.is_computed();
+        model.sidebar_flat = self.view.flat;
         // Project the stable mark identities onto the current visible-row
         // indices the renderer paints (`chrome::row_bg`). Re-derived every frame
         // so marks always land on the right rows after any rebuild.

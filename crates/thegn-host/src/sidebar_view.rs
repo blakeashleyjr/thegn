@@ -198,54 +198,114 @@ pub fn menu_step(entries: &[RowMenuEntry], from: usize, dir: i32) -> usize {
 /// The `WORKSPACES` header row's title, and the width it occupies.
 const HEADER_TITLE: &str = " WORKSPACES";
 
-/// The header-row sort chip: its label and painted half-open x-range, or `None`
-/// when there is nowhere to put it.
-///
-/// **The only source of this geometry.** `draw_sidebar` paints from it and
-/// `handlers::sidebar_mouse::on_left_press` hit-tests from it, so a click can
-/// never land off the chip the user can see — the same one-layout-pass contract
-/// `build_sidebar` holds for the rows below.
-///
-/// The chip exists because nothing else on screen names the active sort: the
-/// mode lived only in the `s` menu, so a `live` sort silently reordering rows
-/// read as the sidebar misbehaving rather than as a mode doing its job.
+/// The header-row sort chip on its own; a test shorthand for
+/// `header_chips(..).sort`.
+#[cfg(test)]
 pub(crate) fn sort_chip(model: &FrameModel, rect: Rect) -> Option<(String, usize, usize)> {
+    header_chips(model, rect).sort
+}
+
+/// The header row's two chips, each as its label and painted half-open x-range
+/// (`None` when there is no room for it). Painted as `layout  sort`,
+/// right-aligned.
+///
+/// - **sort** (`live`, `manual`, …; clicking opens the `s` menu) exists
+///   because nothing else on screen names the active sort: the mode lived only
+///   in the `s` menu, so a `live` sort silently reordering rows read as the
+///   sidebar misbehaving rather than as a mode doing its job.
+/// - **layout** (`flat` / `grouped`; clicking toggles it, like `g`) exists for
+///   the same reason: someone who pressed `g` by accident was left with one
+///   long list, no workspaces or folders, and nothing on screen saying why.
+#[derive(Debug, Default)]
+pub(crate) struct HeaderChips {
+    pub layout: Option<(String, usize, usize)>,
+    pub sort: Option<(String, usize, usize)>,
+}
+
+/// Columns between the layout chip and the sort chip. Two, because both chips
+/// are plain words and one space would read them as a single phrase.
+const CHIP_GAP: usize = 2;
+
+/// **The only source of the header's chip geometry.** `draw_sidebar` paints
+/// from it and `handlers::sidebar_mouse::on_left_press` hit-tests from it, so a
+/// click can never land off the chip the user can see. This is the same
+/// one-layout-pass contract `build_sidebar` holds for the rows below.
+pub(crate) fn header_chips(model: &FrameModel, rect: Rect) -> HeaderChips {
+    use unicode_width::UnicodeWidthStr;
     // The slim rail paints no header at all and is a handful of columns wide;
     // a mode word is illegible there, and a rail user has opted out of labels.
     if model.sidebar_rail {
-        return None;
+        return HeaderChips::default();
     }
     // The filter input owns the header row while filtering. It is a live text
     // field that grows to the right, so a right-aligned chip beside it is a
     // collision waiting to happen — and while filtering, the order question is
     // moot anyway. Returns the instant the filter clears.
     if model.sidebar_filtering || !model.sidebar_filter.is_empty() {
-        return None;
+        return HeaderChips::default();
     }
 
     // Degrade by budget, never by truncation: a half-word mode name reads as a
-    // rendering bug, so the chip drops its `hold` qualifier first and then
-    // disappears entirely rather than being clipped.
+    // rendering bug, so qualifiers and whole chips drop out rather than clip.
     let mode = model.sidebar_sort.as_str();
-    let candidates: [String; 2] = [
-        if model.sidebar_sort_frozen {
-            format!("{mode} hold ")
-        } else {
-            format!("{mode} ")
-        },
-        format!("{mode} "),
-    ];
-    for label in candidates {
-        let w = unicode_width::UnicodeWidthStr::width(label.as_str());
-        // One column of breathing room between the title and the chip.
-        if rect.cols >= unicode_width::UnicodeWidthStr::width(HEADER_TITLE) + 1 + w {
-            // Right-aligned against the FULL width: the header sits above
-            // `list_y`, so the scrollbar gutter `build_sidebar` reserves for the
-            // rows does not narrow this row.
-            return Some((label, rect.x + rect.cols - w, w));
+    let sort_full = if model.sidebar_sort_frozen {
+        format!("{mode} hold ")
+    } else {
+        format!("{mode} ")
+    };
+    let sort_bare = format!("{mode} ");
+    let layout = if model.sidebar_flat {
+        "flat"
+    } else {
+        "grouped"
+    };
+
+    // Which chip gives way first depends on the layout. Grouped is the default
+    // and the chip there is only a signpost, so it goes before anything the
+    // sort chip says. Flat is the state people get stuck in, so there it is
+    // the last thing on the row to go.
+    let s_full = Some(sort_full.as_str());
+    let s_bare = Some(sort_bare.as_str());
+    let candidates: [(Option<&str>, Option<&str>); 4] = if model.sidebar_flat {
+        [
+            (Some(layout), s_full),
+            (Some(layout), s_bare),
+            (Some(layout), None),
+            (None, None),
+        ]
+    } else {
+        [
+            (Some(layout), s_full),
+            (None, s_full),
+            (None, s_bare),
+            (None, None),
+        ]
+    };
+    // One column of breathing room between the title and the chips.
+    let budget = rect.cols.saturating_sub(HEADER_TITLE.width() + 1);
+    for (l, s) in candidates {
+        let lw = l.map_or(0, |l| l.width());
+        let sw = s.map_or(0, |s| s.width());
+        // A lone layout chip keeps the trailing space the sort label carries,
+        // so the word never touches the column edge.
+        let tail = match (l, s) {
+            (Some(_), Some(_)) => CHIP_GAP + sw,
+            (Some(_), None) => 1,
+            (None, _) => sw,
+        };
+        if lw + tail > budget {
+            continue;
         }
+        // Right-aligned against the FULL width: the header sits above
+        // `list_y`, so the scrollbar gutter `build_sidebar` reserves for the
+        // rows does not narrow this row.
+        let end = rect.x + rect.cols;
+        return HeaderChips {
+            sort: s.map(|s| (s.to_string(), end - sw, sw)),
+            layout: l.map(|l| (l.to_string(), end - tail - lw, lw)),
+        };
     }
-    None
+    HeaderChips::default()
 }
 
 pub fn draw_sidebar(surface: &mut Surface, rect: Rect, model: &FrameModel) {
@@ -287,9 +347,21 @@ pub fn draw_sidebar(surface: &mut Surface, rect: Rect, model: &FrameModel) {
         // The active sort, right-aligned and quiet — the answer to "why did
         // that row move?" without opening the `s` menu. Brighter while held so
         // the two states are distinguishable at a glance.
-        if let Some((label, x, cols)) = sort_chip(model, rect) {
+        let chips = header_chips(model, rect);
+        if let Some((label, x, cols)) = chips.sort {
             let fg = if model.sidebar_sort_frozen {
                 col(S::Dim)
+            } else {
+                col(S::Faint)
+            };
+            draw_text(surface, x, rect.y, &label, fg, col(S::Panel), cols);
+        }
+        // The layout, in the accent while flat. Flat is the non-default state
+        // and the one people get stuck in, so it should read as a mode that is
+        // switched on, with the fix a click away.
+        if let Some((label, x, cols)) = chips.layout {
+            let fg = if model.sidebar_flat {
+                accent
             } else {
                 col(S::Faint)
             };
@@ -3091,6 +3163,84 @@ mod tests {
         assert_eq!(cols, label.chars().count());
         assert_eq!(x + cols, rect.x + rect.cols, "flush with the right edge");
         assert!(x > rect.x + " WORKSPACES".chars().count());
+    }
+
+    #[test]
+    fn layout_chip_names_the_layout_left_of_the_sort_chip() {
+        for (flat, word) in [(false, "grouped"), (true, "flat")] {
+            let m = FrameModel {
+                sidebar_flat: flat,
+                ..Default::default()
+            };
+            let chips = header_chips(&m, chip_rect(40));
+            let (label, lx, lcols) = chips.layout.expect("layout chip fits at 40 cols");
+            let (_, sx, _) = chips.sort.expect("sort chip fits at 40 cols");
+            assert_eq!(label, word);
+            assert_eq!(lcols, word.len());
+            // Two columns apart, so the two words never read as one phrase.
+            assert_eq!(lx + lcols + CHIP_GAP, sx);
+            assert!(lx > " WORKSPACES".len());
+        }
+    }
+
+    /// Adding the layout chip must not move the sort chip: it is right-aligned
+    /// either way, so the only thing a narrow column costs is the layout chip.
+    #[test]
+    fn grouped_layout_chip_gives_way_before_the_sort_chip() {
+        let m = FrameModel {
+            sidebar_sort: crate::sidebar::SortMode::Attention,
+            sidebar_sort_frozen: true,
+            ..Default::default()
+        };
+        // 11 + 1 + "grouped" (7) + 2 + "attention hold " (15) = 36
+        let wide = header_chips(&m, chip_rect(36));
+        assert!(wide.layout.is_some());
+        let narrow = header_chips(&m, chip_rect(35));
+        assert!(narrow.layout.is_none());
+        assert_eq!(narrow.sort.unwrap().0, "attention hold ");
+    }
+
+    /// Flat is the state people get stuck in, so its chip is the last thing on
+    /// the header row to go: the sort chip drops out first.
+    #[test]
+    fn flat_layout_chip_outlasts_the_sort_chip() {
+        let m = FrameModel {
+            sidebar_flat: true,
+            sidebar_sort: crate::sidebar::SortMode::Attention,
+            sidebar_sort_frozen: true,
+            ..Default::default()
+        };
+        // 11 + 1 + "flat" (4) + 2 + "attention " (10) = 28: hold dropped.
+        let c = header_chips(&m, chip_rect(28));
+        assert_eq!(c.sort.unwrap().0, "attention ");
+        assert!(c.layout.is_some());
+        // 11 + 1 + "flat" (4) + 1 trailing = 17: the sort chip is gone.
+        let c = header_chips(&m, chip_rect(17));
+        assert!(c.sort.is_none());
+        let (label, x, cols) = c.layout.unwrap();
+        assert_eq!(label, "flat");
+        assert_eq!(x + cols + 1, 17, "keeps one column off the edge");
+        // Below that, nothing at all rather than a clipped word.
+        let c = header_chips(&m, chip_rect(16));
+        assert!(c.layout.is_none() && c.sort.is_none());
+    }
+
+    #[test]
+    fn layout_chip_yields_the_header_row_to_the_rail_and_the_filter() {
+        for m in [
+            FrameModel {
+                sidebar_flat: true,
+                sidebar_rail: true,
+                ..Default::default()
+            },
+            FrameModel {
+                sidebar_flat: true,
+                sidebar_filter: "wt".into(),
+                ..Default::default()
+            },
+        ] {
+            assert!(header_chips(&m, chip_rect(40)).layout.is_none());
+        }
     }
 
     #[test]
