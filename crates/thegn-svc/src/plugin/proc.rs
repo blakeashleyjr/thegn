@@ -63,6 +63,41 @@ pub struct PluginRun {
     pub truncated: bool,
 }
 
+/// Consumes a plugin's stdout one line at a time, on the reader thread.
+///
+/// Streaming is what bounds memory: a sink that decides per line what to keep
+/// never holds more than one line of undecided output, where collecting first
+/// would hold up to [`MAX_LINES`] × [`MAX_LINE_BYTES`].
+pub trait NdjsonSink: Send + 'static {
+    /// One non-empty, trimmed, lossily-decoded line of at most
+    /// [`MAX_LINE_BYTES`]. Return `false` to stop receiving lines; the pipe is
+    /// still drained to EOF so the plugin never sees a SIGPIPE.
+    fn line(&mut self, text: &str) -> bool;
+}
+
+/// What a streamed run produced besides the sink's own state.
+#[derive(Debug)]
+pub struct StreamRun<S> {
+    pub sink: S,
+    /// Tail of stderr, capped.
+    pub stderr: String,
+    /// Whether output was cut off by [`MAX_LINES`].
+    pub truncated: bool,
+}
+
+/// Collects every message — the classic [`spawn_ndjson`] behaviour.
+struct Collect(PluginRun);
+
+impl NdjsonSink for Collect {
+    fn line(&mut self, text: &str) -> bool {
+        match serde_json::from_str::<RpcMessage>(text) {
+            Ok(m) => self.0.messages.push(m),
+            Err(_) => self.0.junk.push(text.chars().take(200).collect()),
+        }
+        true
+    }
+}
+
 /// Run `argv` and collect its NDJSON output.
 ///
 /// The child is put in its own process group so a timeout can take down the
@@ -75,6 +110,24 @@ pub fn spawn_ndjson(
     cwd: Option<&Path>,
     timeout: Duration,
 ) -> Result<PluginRun, PluginError> {
+    let out = spawn_ndjson_stream(argv, env, cwd, timeout, Collect(PluginRun::default()))?;
+    let mut run = out.sink.0;
+    run.stderr = out.stderr;
+    run.truncated = out.truncated;
+    Ok(run)
+}
+
+/// Run `argv`, handing each stdout line to `sink` as it arrives.
+///
+/// Same process-group, timeout, line-size and line-count limits as
+/// [`spawn_ndjson`]; the difference is that nothing is retained here.
+pub fn spawn_ndjson_stream<S: NdjsonSink>(
+    argv: &[String],
+    env: &BTreeMap<String, String>,
+    cwd: Option<&Path>,
+    timeout: Duration,
+    sink: S,
+) -> Result<StreamRun<S>, PluginError> {
     let Some((program, args)) = argv.split_first() else {
         return Err(PluginError::Spawn("empty command".into()));
     };
@@ -110,7 +163,10 @@ pub fn spawn_ndjson(
     // Drain both pipes on their own threads: a child that fills the stderr pipe
     // while we read stdout would otherwise deadlock.
     let reader = std::thread::spawn(move || {
-        let mut run = PluginRun::default();
+        let mut sink = sink;
+        let mut truncated = false;
+        let mut accepting = true;
+        let mut lines = 0usize;
         if let Some(out) = stdout {
             let mut buf = BufReader::new(out);
             let mut line = Vec::new();
@@ -131,21 +187,23 @@ pub fn spawn_ndjson(
                 // over-chatty plugin into a "killed by signal" failure with no
                 // usable output at all — when what we want is its first N
                 // messages plus an honest `truncated`.
-                if run.truncated || run.messages.len() + run.junk.len() >= MAX_LINES {
-                    run.truncated = true;
+                if truncated || lines >= MAX_LINES {
+                    truncated = true;
                     continue;
                 }
-                let text = String::from_utf8_lossy(&line[..n]).trim().to_string();
+                if !accepting {
+                    continue;
+                }
+                let text = String::from_utf8_lossy(&line[..n]);
+                let text = text.trim();
                 if text.is_empty() {
                     continue;
                 }
-                match serde_json::from_str::<RpcMessage>(&text) {
-                    Ok(m) => run.messages.push(m),
-                    Err(_) => run.junk.push(text.chars().take(200).collect()),
-                }
+                lines += 1;
+                accepting = sink.line(text);
             }
         }
-        run
+        (sink, truncated)
     });
 
     let err_thread = std::thread::spawn(move || {
@@ -187,16 +245,22 @@ pub fn spawn_ndjson(
         std::thread::sleep(Duration::from_millis(20));
     };
 
-    let mut run = reader.join().unwrap_or_default();
-    run.stderr = err_thread.join().unwrap_or_default();
+    let joined = reader.join();
+    let stderr = err_thread.join().unwrap_or_default();
+    let (sink, truncated) =
+        joined.map_err(|_| PluginError::Protocol("plugin output reader failed".into()))?;
 
     match status {
         None => Err(PluginError::Timeout(timeout.as_secs())),
         Some(s) if !s.success() => Err(PluginError::Exit {
             code: s.code(),
-            stderr: run.stderr,
+            stderr,
         }),
-        Some(_) => Ok(run),
+        Some(_) => Ok(StreamRun {
+            sink,
+            stderr,
+            truncated,
+        }),
     }
 }
 
