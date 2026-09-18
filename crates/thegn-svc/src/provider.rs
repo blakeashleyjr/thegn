@@ -37,6 +37,33 @@ pub(crate) fn provider_http_client() -> reqwest::Client {
         .unwrap_or_else(|_| reqwest::Client::new())
 }
 
+/// A stable, value-free description of a failed provider HTTP exchange.
+///
+/// `reqwest::Error` carries the request URL in its `Display`, and anyhow's
+/// context chains keep that error as a `source()`, so `{:#}`/`{:?}` renderings
+/// would echo an endpoint (and any query or path secret in it). The original
+/// error is therefore dropped here and replaced by its category alone.
+pub(crate) fn redacted_transport_error(
+    provider: &str,
+    method: &str,
+    error: &reqwest::Error,
+) -> anyhow::Error {
+    let kind = if error.is_timeout() {
+        "timed out"
+    } else if error.is_connect() {
+        "could not connect"
+    } else if error.is_redirect() {
+        "redirect refused"
+    } else if error.is_body() || error.is_decode() {
+        "response body failed"
+    } else if error.is_builder() {
+        "request could not be built"
+    } else {
+        "request failed"
+    };
+    anyhow::anyhow!("{provider}: {method} provider endpoint {kind}")
+}
+
 #[path = "provider_sessions.rs"]
 mod sessions;
 

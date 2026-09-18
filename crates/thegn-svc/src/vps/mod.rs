@@ -122,9 +122,6 @@ pub(crate) trait VpsShaper: Sync {
     fn default_region(&self) -> &'static str;
     fn default_size(&self) -> &'static str;
     fn default_image(&self) -> &'static str;
-    /// `Some(id)` when `template` is `snapshot:<id>` (a baked image ⇒ keys-only
-    /// cloud-init).
-    fn snapshot_image<'a>(&self, template: &'a str) -> Option<&'a str>;
 
     fn servers_url(&self, base: &str) -> String;
     fn server_url(&self, base: &str, id: &str) -> String;
@@ -166,9 +163,6 @@ impl VpsShaper for HetznerShaper {
     }
     fn default_image(&self) -> &'static str {
         hetzner::DEFAULT_IMAGE
-    }
-    fn snapshot_image<'a>(&self, template: &'a str) -> Option<&'a str> {
-        hetzner::snapshot_image(template)
     }
     fn servers_url(&self, base: &str) -> String {
         hetzner::servers_url(base)
@@ -232,9 +226,6 @@ impl VpsShaper for DigitalOceanShaper {
     }
     fn default_image(&self) -> &'static str {
         digitalocean::DEFAULT_IMAGE
-    }
-    fn snapshot_image<'a>(&self, template: &'a str) -> Option<&'a str> {
-        digitalocean::snapshot_image(template)
     }
     fn servers_url(&self, base: &str) -> String {
         digitalocean::droplets_url(base)
@@ -372,37 +363,6 @@ impl VpsSpec {
         }
     }
 
-    fn region(&self) -> &str {
-        let r = self.region.trim();
-        if r.is_empty() {
-            self.kind.shaper().default_region()
-        } else {
-            r
-        }
-    }
-
-    fn size(&self) -> &str {
-        let s = self.size.trim();
-        if s.is_empty() {
-            self.kind.shaper().default_size()
-        } else {
-            s
-        }
-    }
-
-    /// `(image argument, is_snapshot)` — a baked snapshot skips the cloud-init
-    /// prereq installs.
-    fn image(&self) -> Result<(String, bool)> {
-        let admitted = self.admit_static(&self.labels())?;
-        Ok((
-            admitted
-                .image
-                .resolve(self.kind.shaper().default_image())
-                .to_owned(),
-            admitted.image.is_snapshot(),
-        ))
-    }
-
     fn max_instances(&self) -> usize {
         if self.max_instances == 0 {
             5
@@ -411,10 +371,10 @@ impl VpsSpec {
         }
     }
 
-    fn admit_static(
-        &self,
-        metadata: &BTreeMap<String, String>,
-    ) -> Result<thegn_core::provider_admission::VpsStaticSpec> {
+    /// Admit every local create input through the shared core grammar and
+    /// resolve the vendor defaults for absent optional fields. This runs before
+    /// any ledger read/write, SSH-key lookup/registration, or server request.
+    fn admit_resolved(&self, labels: &BTreeMap<String, String>) -> Result<ResolvedVpsSpec> {
         let key_path = self
             .key_path
             .to_str()
@@ -422,20 +382,42 @@ impl VpsSpec {
         if key_path.is_empty() || key_path.len() > 4_096 || key_path.chars().any(char::is_control) {
             return Err(anyhow!("vps: managed key path is invalid"));
         }
-        thegn_core::provider_admission::validate_metadata(metadata).map_err(anyhow::Error::from)?;
-        thegn_core::provider_admission::admit_vps(thegn_core::provider_admission::VpsInput {
-            kind: self.kind.as_str(),
-            api_base: &self.api_base,
-            name: Some(&self.name),
-            region: &self.region,
-            size: &self.size,
-            image: &self.image,
-            max_instances: self.max_instances,
-            max_lifetime_secs: self.max_lifetime_secs,
-            pubkey: Some(&self.pubkey),
+        let admitted =
+            thegn_core::provider_admission::admit_vps(thegn_core::provider_admission::VpsInput {
+                kind: self.kind.as_str(),
+                api_base: &self.api_base,
+                name: Some(&self.name),
+                region: &self.region,
+                size: &self.size,
+                image: &self.image,
+                max_instances: self.max_instances,
+                max_lifetime_secs: self.max_lifetime_secs,
+                pubkey: Some(&self.pubkey),
+                metadata: Some(labels),
+            })
+            .map_err(|error| anyhow!("vps: provider spec refused: {error}"))?;
+        let shaper = self.kind.shaper();
+        Ok(ResolvedVpsSpec {
+            region: admitted
+                .region
+                .unwrap_or_else(|| shaper.default_region().to_owned()),
+            size: admitted
+                .size
+                .unwrap_or_else(|| shaper.default_size().to_owned()),
+            image: admitted.image.resolve(shaper.default_image()).to_owned(),
+            is_snapshot: admitted.image.is_snapshot(),
         })
-        .map_err(anyhow::Error::from)
     }
+}
+
+/// Admitted create inputs with the vendor defaults filled in. A baked snapshot
+/// (`is_snapshot`) skips the cloud-init prereq installs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedVpsSpec {
+    region: String,
+    size: String,
+    image: String,
+    is_snapshot: bool,
 }
 
 /// The remote user provisioning + attach run as. Stock cloud images boot with
@@ -481,13 +463,13 @@ impl VpsProvider {
             .bearer_auth(&self.spec.token)
             .send()
             .await
-            .with_context(|| "vps: GET provider endpoint")?;
+            .map_err(|error| crate::provider::redacted_transport_error("vps", "GET", &error))?;
         let status = resp.status();
-        let _body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
         if !status.is_success() {
+            // The remote error body is neither read nor echoed.
             return Err(anyhow!("vps GET request failed ({status})"));
         }
-        Ok(body)
+        Ok(resp.json().await.unwrap_or(serde_json::Value::Null))
     }
 
     async fn post_json(&self, url: &str, body: &serde_json::Value) -> Result<serde_json::Value> {
@@ -498,13 +480,12 @@ impl VpsProvider {
             .json(body)
             .send()
             .await
-            .with_context(|| "vps: POST provider endpoint")?;
+            .map_err(|error| crate::provider::redacted_transport_error("vps", "POST", &error))?;
         let status = resp.status();
-        let _body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
         if !status.is_success() {
             return Err(anyhow!("vps POST request failed ({status})"));
         }
-        Ok(body)
+        Ok(resp.json().await.unwrap_or(serde_json::Value::Null))
     }
 
     /// All thegn-managed instances (label-filtered server-side), with
@@ -552,7 +533,7 @@ impl VpsProvider {
             .await?;
         shaper
             .parse_ssh_key_created(&created)
-            .ok_or_else(|| anyhow!("vps: no ssh key id in response: {created}"))
+            .ok_or_else(|| anyhow!("vps: no ssh key id in response"))
     }
 
     /// Resolve the instance's public IP: cache → registry → API (then persist).
@@ -715,7 +696,7 @@ impl VpsProvider {
                     .await?;
                 hetzner::parse_image_created(&body)
                     .map(|id| id.to_string())
-                    .ok_or_else(|| anyhow!("vps: no image id in snapshot response: {body}"))
+                    .ok_or_else(|| anyhow!("vps: no image id in snapshot response"))
             }
             VpsKind::DigitalOcean => self.snapshot_do(&base, &inst.id, description).await,
         }
@@ -731,7 +712,7 @@ impl VpsProvider {
             )
             .await?;
         let (action_id, mut status) = digitalocean::parse_action(&action)
-            .ok_or_else(|| anyhow!("vps: no action in DO snapshot response: {action}"))?;
+            .ok_or_else(|| anyhow!("vps: no action in DO snapshot response"))?;
         // Snapshotting a fresh dev image takes minutes; poll bounded.
         const BUDGET: std::time::Duration = std::time::Duration::from_secs(600);
         let start = std::time::Instant::now();
@@ -762,12 +743,12 @@ impl VpsProvider {
 impl RemoteProvider for VpsProvider {
     fn create<'a>(&'a self) -> BoxFuture<'a, Result<SandboxHandle>> {
         Box::pin(async move {
+            // Every local input is admitted before the ledger is read, the SSH
+            // key is looked up or registered, or any server request is made.
             let labels = self.labels();
-            let admitted = self.spec.admit_static(&labels)?;
-            let name = admitted
-                .name
-                .clone()
-                .expect("runtime provider admission requires a name");
+            let resolved = self.spec.admit_resolved(&labels)?;
+            let name = self.spec.name.clone();
+            let user_data = cloudinit::user_data(&self.spec.pubkey, !resolved.is_snapshot);
             // Spend guardrail: never mint past the cap. Ledger-based (covers
             // in-flight creates the API can't see yet).
             let managed = registry::list().len();
@@ -779,12 +760,6 @@ impl RemoteProvider for VpsProvider {
                 ));
             }
             let key_id = self.ensure_ssh_key().await?;
-            let image = admitted
-                .image
-                .resolve(self.shaper().default_image())
-                .to_owned();
-            let is_snapshot = admitted.image.is_snapshot();
-            let user_data = cloudinit::user_data(&self.spec.pubkey, !is_snapshot);
 
             // Intent BEFORE the POST — the crash-between-create-and-record leak
             // window closes here; the reaper reconciles `creating` records.
@@ -801,9 +776,9 @@ impl RemoteProvider for VpsProvider {
             let shaper = self.shaper();
             let body = shaper.create_body(
                 &name,
-                self.spec.size(),
-                &image,
-                self.spec.region(),
+                &resolved.size,
+                &resolved.image,
+                &resolved.region,
                 &[key_id],
                 &user_data,
                 &labels,
@@ -822,7 +797,7 @@ impl RemoteProvider for VpsProvider {
             };
             let inst = shaper
                 .parse_create(&created)
-                .ok_or_else(|| anyhow!("vps: no server in create response: {created}"))?;
+                .ok_or_else(|| anyhow!("vps: no server in create response"))?;
 
             let (ip, instance_id, created_at) = if self.spec.skip_ready_wait {
                 (
@@ -900,7 +875,9 @@ impl RemoteProvider for VpsProvider {
                     .bearer_auth(&self.spec.token)
                     .send()
                     .await
-                    .context("vps: DELETE /servers/{id}")?;
+                    .map_err(|error| {
+                        crate::provider::redacted_transport_error("vps", "DELETE", &error)
+                    })?;
                 let status = resp.status();
                 if status.is_success() || status == reqwest::StatusCode::NOT_FOUND {
                     registry::remove(id);
@@ -1021,22 +998,71 @@ mod tests {
             max_instances: 0,
             max_lifetime_secs: 0,
             key_path: "/k".into(),
-            pubkey: "ssh-ed25519 MOCKKEY".into(),
+            pubkey: TEST_PUBKEY.into(),
             skip_ready_wait: true,
         };
         assert_eq!(spec.api_base(), digitalocean::DEFAULT_API_BASE);
-        assert_eq!(spec.region(), "nyc3");
-        assert_eq!(spec.size(), "s-1vcpu-2gb");
-        assert_eq!(
-            spec.image().unwrap(),
-            ("ubuntu-24-04-x64".to_string(), false)
-        );
+        let resolved = spec.admit_resolved(&test_labels()).unwrap();
+        assert_eq!(resolved.region, "nyc3");
+        assert_eq!(resolved.size, "s-1vcpu-2gb");
+        assert_eq!(resolved.image, "ubuntu-24-04-x64");
+        assert!(!resolved.is_snapshot);
         // Snapshot template still flips the keys-only cloud-init flag.
         let snap = VpsSpec {
             image: "snapshot:555".into(),
+            ..spec.clone()
+        };
+        let resolved = snap.admit_resolved(&test_labels()).unwrap();
+        assert_eq!(
+            (resolved.image.as_str(), resolved.is_snapshot),
+            ("555", true)
+        );
+        // `size = "auto"` is the documented spelling of the vendor default.
+        let auto = VpsSpec {
+            size: "auto".into(),
             ..spec
         };
-        assert_eq!(snap.image().unwrap(), ("555".to_string(), true));
+        assert_eq!(
+            auto.admit_resolved(&test_labels()).unwrap().size,
+            "s-1vcpu-2gb"
+        );
+    }
+
+    /// A structurally valid (throwaway) ed25519 public key.
+    const TEST_PUBKEY: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIgVgF3FLyN2aHUalBpkk3cMVfTgD+7TrbdfTAcSvLvB thegn";
+
+    fn test_labels() -> BTreeMap<String, String> {
+        let mut labels = BTreeMap::new();
+        labels.insert(MANAGED_KEY.into(), MANAGED_VAL.into());
+        labels.insert(HOST_KEY.into(), host_label());
+        labels
+    }
+
+    #[test]
+    fn malformed_snapshot_or_prefixed_image_never_falls_back_to_the_base_image() {
+        for image in [
+            "snapshot:",
+            "snapshot:x",
+            "snapshot:0",
+            "image:ubuntu-24.04",
+        ] {
+            let spec = VpsSpec {
+                kind: VpsKind::Hetzner,
+                api_base: String::new(),
+                token: "t".into(),
+                name: "n".into(),
+                region: String::new(),
+                size: String::new(),
+                image: image.into(),
+                max_instances: 0,
+                max_lifetime_secs: 0,
+                key_path: "/k".into(),
+                pubkey: TEST_PUBKEY.into(),
+                skip_ready_wait: true,
+            };
+            assert!(spec.admit_resolved(&test_labels()).is_err(), "{image:?}");
+        }
     }
 
     #[test]
@@ -1062,13 +1088,15 @@ mod tests {
             max_instances: 0,
             max_lifetime_secs: 0,
             key_path: "/k".into(),
-            pubkey: "ssh-ed25519 MOCKKEY".into(),
+            pubkey: TEST_PUBKEY.into(),
             skip_ready_wait: true,
         };
         assert_eq!(spec.api_base(), hetzner::DEFAULT_API_BASE);
-        assert_eq!(spec.region(), "fsn1");
-        assert_eq!(spec.size(), "cx23");
-        assert_eq!(spec.image().unwrap(), ("ubuntu-24.04".to_string(), false));
+        let resolved = spec.admit_resolved(&test_labels()).unwrap();
+        assert_eq!(resolved.region, "fsn1");
+        assert_eq!(resolved.size, "cx23");
+        assert_eq!(resolved.image, "ubuntu-24.04");
+        assert!(!resolved.is_snapshot);
         assert_eq!(
             spec.max_instances(),
             5,
@@ -1079,7 +1107,11 @@ mod tests {
             image: "snapshot:777".into(),
             ..spec
         };
-        assert_eq!(snap.image().unwrap(), ("777".to_string(), true));
+        let resolved = snap.admit_resolved(&test_labels()).unwrap();
+        assert_eq!(
+            (resolved.image.as_str(), resolved.is_snapshot),
+            ("777", true)
+        );
     }
 
     #[test]
