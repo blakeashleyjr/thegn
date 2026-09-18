@@ -29,6 +29,7 @@ fn map_transport_error(error: CalendarHttpError) -> CalendarError {
     match error {
         CalendarHttpError::Timeout => CalendarError::Timeout(map_error(error)),
         CalendarHttpError::BodyLimit => CalendarError::BodyLimit(map_error(error)),
+        CalendarHttpError::DestinationRefused => CalendarError::Policy(map_error(error)),
         other => CalendarError::Network(map_error(other).into()),
     }
 }
@@ -198,6 +199,7 @@ pub(crate) struct DavResponse {
 ///
 /// Namespace prefixes vary by server (`d:`, `D:`, none), so tags are matched on
 /// their local name.
+#[cfg(test)]
 pub(crate) fn parse_multistatus(xml: &str) -> (Vec<DavResponse>, String) {
     parse_multistatus_checked(xml).unwrap_or_default()
 }

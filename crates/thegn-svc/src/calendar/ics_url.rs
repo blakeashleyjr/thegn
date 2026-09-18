@@ -25,6 +25,7 @@ fn map_transport_error(error: CalendarHttpError) -> CalendarError {
     match error {
         CalendarHttpError::Timeout => CalendarError::Timeout(map_error(error)),
         CalendarHttpError::BodyLimit => CalendarError::BodyLimit(map_error(error)),
+        CalendarHttpError::DestinationRefused => CalendarError::Policy(map_error(error)),
         other => CalendarError::Network(map_error(other).into()),
     }
 }

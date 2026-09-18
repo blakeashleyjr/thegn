@@ -6,6 +6,8 @@
 
 use super::IssueError;
 use crate::http::{BodyReadError, read_bounded_response};
+#[cfg(test)]
+use futures_util::StreamExt;
 use reqwest::{Client, Method, RequestBuilder, Response, Url};
 use serde::{Serialize, de::DeserializeOwned};
 #[cfg(test)]
