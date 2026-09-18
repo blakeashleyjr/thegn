@@ -1116,7 +1116,7 @@ test-build-metadata:
 # Read-only checkout-hook regression; intentionally runs before the Rust suite
 # and uses only throwaway repositories, isolated Git config, and XDG state.
 test-the429:
-    python3 -B test/the429_checkout_hooks.py
+    binary="${THEGN_TEST_BINARY:-}"; if [ -z "$binary" ]; then for candidate in target/release/thegn /home/blake/code/thegn/target/release/thegn; do if [ -x "$candidate" ]; then binary="$candidate"; echo "THE-429 native fixture: using $binary"; break; fi; done; fi; if [ -z "$binary" ]; then echo "THE-429 native fixture: missing compiled binary; set THEGN_TEST_BINARY for the final native gate" >&2; else echo "THE-429 native fixture: selected $binary"; fi; THEGN_TEST_BINARY="$binary" python3 -B test/the429_checkout_hooks.py
 
 # Install/update the native thegn host onto your PATH (standalone, non-Nix):
 # builds release artifacts, installs `tg` as the dedicated alacritty launcher,

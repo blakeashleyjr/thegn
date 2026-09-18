@@ -14,6 +14,7 @@ from __future__ import annotations
 import hashlib
 import os
 import selectors
+import signal
 import stat
 import subprocess
 import sys
@@ -26,6 +27,28 @@ LEGACY_SHA256 = "90b85945a3c30c3a9aa806f87fe9585e9ce660e450672e3e5e24b40dca14036
 MAX_BYTES = 64 * 1024
 GIT_TIMEOUT_SECONDS = 2.0
 MAX_GIT_OUTPUT = 64 * 1024
+DIRECT_REAP_TIMEOUT_SECONDS = 0.5
+
+# Keep normal user configuration discovery intact, including HOME/XDG and the
+# configured global file. These variables can instead retarget the repository,
+# object database, discovery, or command-local config and must not cross the
+# detector boundary.
+GIT_REDIRECT_ENV = frozenset(
+    {
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_NAMESPACE",
+        "GIT_CEILING_DIRECTORIES",
+        "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+        "GIT_CONFIG_SYSTEM",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_PARAMETERS",
+    }
+)
 
 
 class GitQueryRefusal(Exception):
@@ -43,10 +66,64 @@ def say(message: str) -> None:
     print(f"thegn legacy checkout-hook detector: {message}", file=sys.stderr)
 
 
+def unsupported_platform_reason() -> str | None:
+    """Return a refusal reason before any subprocess is created."""
+
+    if os.name != "posix":
+        return "this detector supports only POSIX process groups and no-follow primitives"
+    required = ("O_NOFOLLOW", "O_DIRECTORY", "O_NONBLOCK", "O_CLOEXEC", "killpg")
+    if any(not getattr(os, name, 0) for name in required[:-1]) or not hasattr(os, "killpg"):
+        return "this platform lacks the required POSIX process-group/no-follow primitives"
+    return None
+
+
+def terminate_process_group(process: subprocess.Popen[bytes]) -> None:
+    """Kill only the isolated Git process group, never an ambient group."""
+
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except (ProcessLookupError, OSError):
+        # The group may have exited between poll and cleanup. Direct reaping
+        # below is still required to avoid leaving the Git leader a zombie.
+        pass
+
+
+def close_pipes(process: subprocess.Popen[bytes]) -> None:
+    for stream in (process.stdout, process.stderr):
+        if stream is not None:
+            try:
+                stream.close()
+            except OSError:
+                pass
+
+
+def reap_direct(process: subprocess.Popen[bytes]) -> None:
+    """Reap the direct leader with a finite bound after group termination."""
+
+    try:
+        process.wait(timeout=DIRECT_REAP_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        # A process that ignored SIGKILL is not expected, but retain a bounded
+        # direct-child fallback. This does not broaden the process-group scope.
+        try:
+            process.kill()
+        except OSError:
+            pass
+        try:
+            process.wait(timeout=DIRECT_REAP_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            pass
+
+
 def git(root: Path, *args: str) -> GitResult:
     """Run one non-interactive Git query with bounded time and output."""
 
+    if (reason := unsupported_platform_reason()) is not None:
+        raise GitQueryRefusal(reason)
     query_env = os.environ.copy()
+    for variable in list(query_env):
+        if variable in GIT_REDIRECT_ENV or variable.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_")):
+            query_env.pop(variable, None)
     query_env.update(
         {
             "GIT_EDITOR": ":",
@@ -75,13 +152,12 @@ def git(root: Path, *args: str) -> GitResult:
     stderr_fd = process.stderr.fileno()
     streams = {stdout_fd: bytearray(), stderr_fd: bytearray()}
     selector = selectors.DefaultSelector()
-    for stream in (process.stdout, process.stderr):
-        os.set_blocking(stream.fileno(), False)
-        selector.register(stream, selectors.EVENT_READ)
-
     deadline = time.monotonic() + GIT_TIMEOUT_SECONDS
     refusal: str | None = None
     try:
+        for stream in (process.stdout, process.stderr):
+            os.set_blocking(stream.fileno(), False)
+            selector.register(stream, selectors.EVENT_READ)
         while selector.get_map():
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -100,21 +176,29 @@ def git(root: Path, *args: str) -> GitResult:
                     break
             if refusal is not None:
                 break
+    except OSError as error:
+        refusal = f"Git output could not be captured safely: {error}"
     finally:
+        streams_drained = not selector.get_map()
         selector.close()
-        if refusal is not None or process.poll() is None:
+        if refusal is None and streams_drained:
+            # EOF can be observed just before waitpid reports the leader's
+            # exit. Give the successful child the remaining bounded deadline;
+            # do not mistake that small race for a hung Git process.
+            remaining = max(0.0, deadline - time.monotonic())
             try:
-                process.kill()
-            except OSError:
-                pass
-            try:
-                process.wait(timeout=0.5)
+                process.wait(timeout=remaining)
             except subprocess.TimeoutExpired:
-                pass
-        else:
-            process.wait()
-        process.stdout.close()
-        process.stderr.close()
+                refusal = f"Git query timed out after {GIT_TIMEOUT_SECONDS:g}s"
+        if refusal is not None:
+            terminate_process_group(process)
+        close_pipes(process)
+        if refusal is not None:
+            reap_direct(process)
+        elif process.poll() is None:
+            # The normal path above normally reaps the leader. Keep this
+            # defensive branch bounded if a platform reports a stale poll.
+            reap_direct(process)
 
     if refusal is not None:
         raise GitQueryRefusal(refusal)
@@ -171,6 +255,8 @@ def one_line(data: bytes, description: str) -> str:
 
 def main() -> int:
     try:
+        if (reason := unsupported_platform_reason()) is not None:
+            return refuse(reason)
         cwd = Path.cwd()
         if command_scope_hooks_path():
             return refuse("inherited command-scope core.hooksPath is ambiguous")
