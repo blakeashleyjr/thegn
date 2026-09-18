@@ -283,8 +283,9 @@ fn push_diagnostic(diagnostics: &mut Vec<String>, diagnostic: std::fmt::Argument
     let mut message = BoundedMessage(String::with_capacity(
         crate::config_budget::MAX_DIAGNOSTIC_BYTES,
     ));
-    // Best-effort diagnostic projection: stop formatting at the byte cap.
-    let _ = message.write_fmt(diagnostic);
+    // Best-effort diagnostic projection: formatting stops at the byte cap,
+    // which surfaces as a fmt::Error that is expected and carries nothing.
+    message.write_fmt(diagnostic).unwrap_or_default();
     diagnostics.push(message.0);
 }
 

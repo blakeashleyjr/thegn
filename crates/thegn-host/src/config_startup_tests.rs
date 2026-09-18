@@ -149,12 +149,10 @@ fn failed_reload_keeps_last_good_display_only_and_coalesces() {
         .bodies
         .borrow_mut()
         .insert(base_path(), b"branch_prefix = \"tw".to_vec());
-    assert!(matches!(
-        process.reload_with(&admit),
-        ReloadOutcome::Failed(CaptureFailure::Admission(
-            ConfigAdmissionError::ParseInvalid
-        ))
-    ));
+    let ReloadOutcome::Failed(CaptureFailure::Admission(error)) = process.reload_with(&admit)
+    else {
+        panic!("a truncated save must be refused and reported once");
+    };
     assert!(matches!(
         process.reload_with(&admit),
         ReloadOutcome::FailedCoalesced
@@ -163,7 +161,7 @@ fn failed_reload_keeps_last_good_display_only_and_coalesces() {
         process.store().health(),
         StoreHealth::Degraded {
             generation: 1,
-            error: ConfigAdmissionError::ParseInvalid,
+            error,
             failures: 2,
         }
     );

@@ -409,10 +409,11 @@ fn opaque_identity(role: &str, path: &Path, explicit: bool, profile: &str) -> St
     hasher.update([0]);
     hasher.update(path.as_os_str().as_encoded_bytes());
     let digest = hasher.finalize();
+    const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut text = String::with_capacity(64);
     for byte in digest {
-        use std::fmt::Write;
-        let _ = write!(text, "{byte:02x}");
+        text.push(char::from(HEX[usize::from(byte >> 4)]));
+        text.push(char::from(HEX[usize::from(byte & 0x0f)]));
     }
     text
 }
@@ -511,7 +512,7 @@ impl ConfigCaptureSeed {
         // later receives FrozenEnv and can therefore never consult ambient
         // process state a second time.
         let env_profile = env.raw("THEGN_PROFILE");
-        let _ = thegn_core::config::env_overlay(&env);
+        drop(thegn_core::config::env_overlay(&env));
         if let Some(error) = env.error.get() {
             return Err(error);
         }

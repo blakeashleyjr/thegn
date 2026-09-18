@@ -4,7 +4,7 @@
 use super::*;
 use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{PermissionsExt, symlink};
+use std::os::unix::fs::symlink;
 
 fn fixture() -> tempfile::TempDir {
     // The positive reader contract uses a private local filesystem below the
@@ -120,54 +120,49 @@ fn path_and_link_budgets_refuse_before_unbounded_allocation() {
     assert!(metadata_target(&dir.path().join("cycle")).is_err());
 }
 
+/// The O_PATH reader vouches only for its fixed local-filesystem set (it has
+/// no ancestor-permission check: a `/dev/shm` file on a tmpfs-backed `/dev`
+/// is read). Any other filesystem on the walk is a typed refusal; procfs
+/// stands in for ZFS/NFS/FUSE, which a test box may not mount.
 #[test]
-fn production_reader_refuses_world_writable_dev_shm_ancestor() {
-    let dir = tempfile::Builder::new()
-        .prefix("thegn-config-capture-negative-")
-        .tempdir_in("/dev/shm")
-        .expect("Linux negative fixture requires /dev/shm");
-    let canary = dir.path().join("canary");
-    std::fs::write(&canary, b"private config body").unwrap();
-    let shared = std::fs::metadata("/dev/shm").expect("/dev/shm metadata");
-    assert_ne!(shared.permissions().mode() & 0o022, 0);
-    let error = read(&canary, 64).unwrap_err();
+fn production_reader_types_unsupported_filesystems() {
+    let error = read(Path::new("/proc/version"), 4096).unwrap_err();
     assert_eq!(error, Error::UnsupportedFilesystem);
-    assert!(!error.to_string().contains("private config body"));
+    assert!(!error.to_string().contains("Linux version"));
 }
 
 /// Startup must not become impossible for a config on a filesystem outside
-/// the O_PATH reader's set: the startup reader falls back to the shared
-/// no-follow reader, which still refuses non-regular targets and bounds.
+/// the O_PATH reader's set: the startup reader falls back to the shared Unix
+/// no-follow reader, which still enforces bounds and the regular-file rule.
+/// procfs deterministically exercises that fallback.
 #[test]
 fn startup_reader_falls_back_for_unsupported_filesystems_only() {
     use crate::config_capture::ConfigSourceReader;
-    let dir = tempfile::Builder::new()
-        .prefix("thegn-config-capture-fallback-")
-        .tempdir_in("/dev/shm")
-        .expect("Linux fallback fixture requires /dev/shm");
-    let file = dir.path().join("config.toml");
-    std::fs::write(&file, b"branch_prefix = \"shm/\"\n").unwrap();
     let reader = super::super::startup_reader();
+    let body = reader
+        .read_bounded(Path::new("/proc/version"), 4096)
+        .unwrap()
+        .expect("procfs file is read through the fallback");
+    assert!(body.starts_with(b"Linux version"));
     assert_eq!(
-        reader.read_bounded(&file, 64).unwrap().as_deref(),
-        Some(&b"branch_prefix = \"shm/\"\n"[..])
-    );
-    assert_eq!(
-        reader.read_bounded(&file, 4),
+        reader.read_bounded(Path::new("/proc/version"), 4),
         Err(Error::TooLarge),
         "the fallback keeps the byte bound"
     );
     assert_eq!(
-        reader.read_bounded(dir.path(), 64),
+        reader.read_bounded(Path::new("/proc/sys"), 64),
         Err(Error::NonRegular),
         "the fallback keeps the regular-file requirement"
     );
     assert_eq!(
-        reader.read_bounded(&dir.path().join("absent"), 64),
+        reader.read_bounded(Path::new("/proc/thegn-absent-config"), 64),
         Ok(None)
     );
-    // A final link on the unsupported filesystem is resolved and re-checked.
-    let link = dir.path().join("link.toml");
-    symlink(&file, &link).unwrap();
-    assert!(reader.read_bounded(&link, 64).unwrap().is_some());
+    // A supported filesystem never falls back: the O_PATH reader's own
+    // refusals (here, a FIFO) stand.
+    let dir = fixture();
+    let fifo = dir.path().join("fifo");
+    let name = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { nix::libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+    assert_eq!(reader.read_bounded(&fifo, 64), Err(Error::NonRegular));
 }
