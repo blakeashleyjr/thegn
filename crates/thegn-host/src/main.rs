@@ -45,10 +45,10 @@ mod compat;
 mod complete;
 mod completions_health;
 mod compositor;
-// THE-505 standalone process-source capture; no startup/authority wiring yet.
-#[allow(dead_code)]
+// THE-505 process-source capture, wired through `config_startup`.
 mod config_capture;
 mod config_source;
+mod config_startup;
 mod connectivity_gate;
 mod copymode;
 mod daemon;
@@ -984,19 +984,11 @@ fn run_main() -> anyhow::Result<()> {
             preset,
         } = command
         {
-            let mut cfg = thegn_core::config::Config::load_layered(
-                &thegn_core::config::ProcessEnv,
-                &cli.overrides,
-                cli.config.clone(),
-            );
-            // `open` may fall through and become the interactive controller.
-            // Install its schema authority before `merge_db_hosts` performs the
-            // first best-effort DB open.
-            thegn_core::db::install_migration_policy(
-                &cfg.database,
-                thegn_core::db::MigrationActor::Controller,
-            )?;
-            thegn_core::host_config::merge_db_hosts(&mut cfg);
+            // `open` may fall through and become the interactive controller,
+            // so it admits as the controller; the interactive launch below
+            // then reuses this same published generation.
+            let admitted = admit_configuration(&cli, thegn_core::db::MigrationActor::Controller)?;
+            let mut cfg = admitted.config().clone();
             let _ = cfg.clamp_to_channel(crate::channel_state::resolve_and_install());
             match cmd::open::run(&cfg, &repo, no_launch, preset.as_deref()) {
                 Ok(cmd::open::OpenOutcome::Delivered) => Ok(()),
@@ -1070,7 +1062,11 @@ fn run_main() -> anyhow::Result<()> {
         .thread_keep_alive(std::time::Duration::from_secs(3))
         .thread_name("thegn-rt")
         .build()?;
-    let result = rt.block_on(run::main(cli));
+    // Admit the configuration before the runtime starts and before the
+    // terminal enters the alternate screen, so a refusal is a plain typed
+    // error on the user's terminal and nothing authority-bearing has run.
+    let admitted = admit_configuration(&cli, thegn_core::db::MigrationActor::Controller)?;
+    let result = rt.block_on(run::main(cli, admitted));
     // Drain queued best-effort DB writes (yank registers, panel ui_state) before
     // exit. The writer is its own std thread, so it outlives the runtime and this
     // catches every quit path with one call.
@@ -1090,6 +1086,25 @@ fn run_main() -> anyhow::Result<()> {
     // down its alternate screen and maps Retryable to exit 2. Returning here
     // also lets the runtime, profile lock, and other guards unwind normally.
     result
+}
+
+/// Admit this process's configuration (see `config_startup`), mapping a
+/// refusal to one bounded, typed, value-free error.
+fn admit_configuration(
+    cli: &Cli,
+    actor: thegn_core::db::MigrationActor,
+) -> anyhow::Result<std::sync::Arc<thegn_core::config_admission::AdmittedConfig>> {
+    crate::config_startup::admit_process(crate::config_startup::ProcessInputs {
+        config: cli.config.as_deref(),
+        profile: cli.profile.as_deref(),
+        overrides: &cli.overrides,
+        actor,
+    })
+    .map_err(|error| {
+        anyhow::anyhow!(
+            "configuration refused: {error}. Nothing was started; fix the configuration (`thegn config validate` explains it) and retry"
+        )
+    })
 }
 
 /// Map a subcommand to the experimental [`Feature`](thegn_core::channel::Feature)
@@ -1139,12 +1154,6 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
             feat.id(),
         );
     }
-    let mut cfg = thegn_core::config::Config::load_layered(
-        &thegn_core::config::ProcessEnv,
-        &cli.overrides,
-        cli.config.clone(),
-    );
-    // Install before `merge_db_hosts` (the first DB consumer on this path).
     // Only processes that actually own long-lived shared state are controllers;
     // a worktree-resolved `thegn dispatch report` is always a client.
     let migration_actor = if matches!(
@@ -1155,7 +1164,27 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
     } else {
         thegn_core::db::MigrationActor::Client
     };
-    thegn_core::db::install_migration_policy(&cfg.database, migration_actor)?;
+    // Every configured verb runs on one strictly admitted generation (hosts
+    // composed from the migrated store) or refuses before any effect. Only
+    // source-inspection and recovery verbs (`config show/get/validate/explain`,
+    // `config edit/set`, `automations test`) — which must work precisely when
+    // the file is broken — keep the tolerant display projection, which is
+    // never published and grants no authority.
+    let authority = matches!(
+        command_intent::classify(Some(&command)),
+        command_intent::CommandIntent::Configured
+    );
+    let mut cfg = if authority {
+        admit_configuration(cli, migration_actor)?.config().clone()
+    } else {
+        let cfg = thegn_core::config::Config::load_layered(
+            &thegn_core::config::ProcessEnv,
+            &cli.overrides,
+            cli.config.clone(),
+        );
+        thegn_core::db::install_migration_policy(&cfg.database, migration_actor)?;
+        cfg
+    };
     // The dry-run is store-free by contract: dispatch it before host merging,
     // diagnostics, provider installation, and the automation runtime. Config
     // loading itself reads only the caller-selected files.
@@ -1174,7 +1203,10 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
     // Remember where it came from: a long-lived process (the daemon) re-reads
     // the same source per agent launch instead of serving a startup snapshot.
     crate::config_source::install(cli.overrides.clone(), cli.config.clone());
-    thegn_core::host_config::merge_db_hosts(&mut cfg);
+    if !authority {
+        // Display projection only: best-effort host merge, as before.
+        thegn_core::host_config::merge_db_hosts(&mut cfg);
+    }
     // Neutralise experimental toggles a stable build doesn't ship (see run.rs).
     let _ = cfg.clamp_to_channel(channel);
     let cfg = cfg;

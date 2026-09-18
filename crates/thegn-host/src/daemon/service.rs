@@ -483,7 +483,8 @@ impl ControlApi for DaemonService {
                         // not after a restart. The snapshot is the fallback
                         // when the file no longer loads. Both the retained
                         // recipe and the actual resolution use this same cfg.
-                        let fresh = crate::config_source::fresh(&snapshot);
+                        let fresh = crate::config_source::fresh(&snapshot)
+                            .map_err(|error| anyhow::anyhow!("configuration refused: {error}"))?;
                         let cfg = fresh.as_ref().unwrap_or(&snapshot);
                         super::agent_open::ensure_configured_agent(cfg, &launch.agent)?;
                         let recipe = super::fork::agent_recipe(cfg, &launch, &spec2);
@@ -1589,7 +1590,8 @@ impl ControlApi for DaemonService {
             let worktree_for_resolve = worktree.clone();
             let launch = self
                 .with_db(move |db| {
-                    let fresh = crate::config_source::fresh(&snapshot);
+                    let fresh = crate::config_source::fresh(&snapshot)
+                        .map_err(|error| anyhow::anyhow!("configuration refused: {error}"))?;
                     let cfg = fresh.as_ref().unwrap_or(&snapshot);
                     super::agent_open::resolve_tool(cfg, db, &worktree_for_resolve, &name)
                 })

@@ -36,11 +36,14 @@ mod linux;
 #[cfg(target_os = "linux")]
 use linux::read;
 
-#[cfg(target_os = "macos")]
+// The no-follow opened-file reader shared by every Unix: the macOS
+// production reader, and the Linux fallback for filesystems outside the
+// Linux O_PATH reader's supported set (see `LinuxStartupReader`).
+#[cfg(unix)]
 #[path = "config_file_capture_macos.rs"]
-mod macos;
+mod portable;
 #[cfg(target_os = "macos")]
-use macos::read;
+use portable::read;
 
 #[cfg(target_os = "windows")]
 #[path = "config_file_capture_windows.rs"]
@@ -51,6 +54,64 @@ use windows::read;
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 fn read(_: &Path, _: usize) -> Result<Option<Vec<u8>>, ConfigFileReadError> {
     Err(ConfigFileReadError::Unsupported)
+}
+
+/// The reader production startup and reload use. Linux's reader already
+/// walks symlinks component-by-component with `O_PATH`; elsewhere final links
+/// are resolved by [`crate::config_capture::FinalLinkResolvingReader`] first so
+/// managed (e.g. Nix/home-manager) config symlinks keep working.
+pub(crate) fn startup_reader() -> impl ConfigSourceReader {
+    #[cfg(target_os = "linux")]
+    {
+        LinuxStartupReader
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        crate::config_capture::FinalLinkResolvingReader(Reader)
+    }
+}
+
+/// Linux startup reader: the component-walking `O_PATH` reader, which only
+/// vouches for a fixed set of local filesystems. A config on any other
+/// filesystem (ZFS, NFS, overlayfs, FUSE, 9p, bcachefs, …) is read through
+/// the shared Unix no-follow reader instead of making startup impossible:
+/// final links are resolved and re-checked, the target must be an ordinary
+/// file, and length/identity are still checked around a bounded read. Every
+/// other refusal of the O_PATH reader stands.
+#[cfg(target_os = "linux")]
+pub(crate) struct LinuxStartupReader;
+
+#[cfg(target_os = "linux")]
+impl ConfigSourceReader for LinuxStartupReader {
+    fn read_bounded(
+        &self,
+        path: &Path,
+        limit: usize,
+    ) -> Result<Option<Vec<u8>>, ConfigFileReadError> {
+        match linux::read(path, limit) {
+            Err(ConfigFileReadError::UnsupportedFilesystem) => {
+                crate::config_capture::FinalLinkResolvingReader(PortableReader)
+                    .read_bounded(path, limit)
+            }
+            other => other,
+        }
+    }
+}
+
+/// The shared Unix no-follow reader as a [`ConfigSourceReader`].
+#[cfg(unix)]
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+pub(crate) struct PortableReader;
+
+#[cfg(unix)]
+impl ConfigSourceReader for PortableReader {
+    fn read_bounded(
+        &self,
+        path: &Path,
+        limit: usize,
+    ) -> Result<Option<Vec<u8>>, ConfigFileReadError> {
+        portable::read(path, limit)
+    }
 }
 
 pub(crate) struct NativePathKeys {

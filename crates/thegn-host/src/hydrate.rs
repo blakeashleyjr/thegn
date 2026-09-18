@@ -4082,10 +4082,19 @@ pub(crate) fn set_config_source(overrides: Vec<String>, config: Option<std::path
     let _ = CONFIG_SOURCE.set((overrides, config)); // best-effort: first-set-wins: the first config source serves for the process
 }
 
-/// The one config loader every off-loop hydration path uses: layered load with
-/// the CLI source, plus the runtime-added `[host.*]` defs from the DB (which
-/// `merge_db_hosts` synthesizes envs for) — matching what the loop holds.
+/// The one config every off-loop hydration path uses. In a process that ran
+/// startup admission this is the latest **admitted** generation — the exact
+/// snapshot the loop published (hosts included), with no reparse and no
+/// silent default: a failed reload keeps the last admitted generation for
+/// display. Hydration is a display projection; authority-bearing actions
+/// must re-check the store (`config_startup::store()`), not trust this copy.
+///
+/// Only a process without startup admission (unit tests) falls back to the
+/// legacy tolerant layered load.
 pub(crate) fn load_hydration_config() -> thegn_core::config::Config {
+    if let Some(admitted) = crate::config_startup::display() {
+        return admitted.config().clone();
+    }
     let (overrides, path) = CONFIG_SOURCE.get().cloned().unwrap_or_default();
     let mut cfg = thegn_core::config::Config::try_load_layered(
         &thegn_core::config::ProcessEnv,
