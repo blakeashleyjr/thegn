@@ -11,6 +11,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 
@@ -63,6 +64,7 @@ def fake_git(sandbox: Path, mode: str) -> dict[str, str]:
     executable = fake_bin / "git"
     executable.write_text(
         "#!/usr/bin/env python3\n"
+        "import os\n"
         "import sys\n"
         "import time\n"
         f"mode = {mode!r}\n"
@@ -72,11 +74,93 @@ def fake_git(sandbox: Path, mode: str) -> dict[str, str]:
         "    sys.stdout.write('x' * (128 * 1024))\n"
         "elif mode == 'invalid':\n"
         "    sys.stdout.buffer.write(b'/tmp/invalid-\\xff\\n')\n"
+        "elif mode == 'eof-race':\n"
+        "    sys.stdout.close()\n"
+        "    sys.stderr.close()\n"
+        "    time.sleep(0.05)\n"
+        "elif mode.startswith('fork-holder'):\n"
+        "    holder = os.fork()\n"
+        "    if holder == 0:\n"
+        "        with open(os.environ['THE429_HOLDER_PID'], 'w') as pid_file:\n"
+        "            pid_file.write(str(os.getpid()))\n"
+        "            pid_file.flush()\n"
+        "        time.sleep(30)\n"
+        "        os._exit(0)\n"
+        "    os._exit(0)\n"
     )
     executable.chmod(0o755)
     environment = os.environ.copy()
     environment["PATH"] = f"{fake_bin}{os.pathsep}{environment['PATH']}"
+    if mode.startswith("fork-holder"):
+        environment["THE429_HOLDER_PID"] = str(sandbox / f"holder-{mode}.pid")
     return environment
+
+
+def detector_module():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("the429_detector_test", DETECTOR)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def remove_entry(path: Path) -> None:
+    try:
+        entry = os.lstat(path)
+    except FileNotFoundError:
+        return
+    if stat.S_ISDIR(entry.st_mode) and not stat.S_ISLNK(entry.st_mode):
+        shutil.rmtree(path)
+    else:
+        path.unlink()
+
+
+def snapshot(path: Path) -> tuple[object, ...]:
+    """Snapshot without opening a FIFO or following a symlink."""
+
+    entry = os.lstat(path)
+    identity = (
+        entry.st_dev,
+        entry.st_ino,
+        entry.st_mode,
+        entry.st_uid,
+        entry.st_gid,
+        entry.st_size,
+        entry.st_mtime_ns,
+    )
+    if stat.S_ISLNK(entry.st_mode):
+        return ("symlink", os.readlink(path), identity)
+    if stat.S_ISREG(entry.st_mode):
+        return ("regular", path.read_bytes(), identity)
+    if stat.S_ISDIR(entry.st_mode):
+        return ("directory", identity)
+    return ("special", identity)
+
+
+def process_running(pid: int) -> bool:
+    """Treat a Linux zombie as reaped for the fixture's process-tree check."""
+
+    proc_stat = Path(f"/proc/{pid}/stat")
+    try:
+        fields = proc_stat.read_text().split()
+    except FileNotFoundError:
+        return False
+    return len(fields) < 3 or fields[2] != "Z"
+
+
+def assert_process_gone(pid_file: Path) -> None:
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        if pid_file.exists():
+            pid = int(pid_file.read_text())
+            if not process_running(pid):
+                return
+        time.sleep(0.02)
+    assert pid_file.exists(), "fork-holder did not publish its pid"
+    assert not process_running(int(pid_file.read_text())), "Git process-group descendant survived cleanup"
 
 
 def injected_replacement(repo: Path, env: dict[str, str], kind: str) -> str:
@@ -226,6 +310,43 @@ def main() -> int:
         assert (worktree / ".pre-commit-config.yaml").read_bytes() == before_config
         assert metadata(worktree / ".pre-commit-config.yaml") == before_config_meta
 
+        # The former checkout hook also seeded this path. Exercise the actual
+        # shell-entry body around real checkout operations and retain every
+        # collision type without opening the FIFO case.
+        config_path = worktree / ".pre-commit-config.yaml"
+        config_target = sandbox / "config-target"
+        config_cases = ("regular", "directory", "valid-symlink", "dangling-symlink", "fifo", "hardlink")
+        for case in config_cases:
+            remove_entry(config_path)
+            if config_target.exists() or config_target.is_symlink():
+                remove_entry(config_target)
+            if case == "regular":
+                config_path.write_bytes(b"foreign regular config\n")
+            elif case == "directory":
+                config_path.mkdir()
+            elif case == "valid-symlink":
+                config_target.write_bytes(b"valid symlink target\n")
+                config_path.symlink_to(config_target)
+            elif case == "dangling-symlink":
+                config_path.symlink_to(config_target)
+            elif case == "fifo":
+                os.mkfifo(config_path)
+            else:
+                config_target.write_bytes(b"hardlink bytes\n")
+                fixed_ns = 1_700_000_000_123_456_789
+                os.utime(config_target, ns=(fixed_ns, fixed_ns))
+                config_path.hardlink_to(config_target)
+            before_config_path = snapshot(config_path)
+            before_config_target = snapshot(config_target) if config_target.exists() else None
+            assert "main checkout" in shell_entry(worktree, env)
+            git("checkout", "-q", "hostile", cwd=worktree, env=env)
+            git("checkout", "-q", "fixture-clean", cwd=worktree, env=env)
+            assert snapshot(config_path) == before_config_path, case
+            if before_config_target is not None:
+                assert snapshot(config_target) == before_config_target, case
+        remove_entry(config_path)
+        remove_entry(config_target)
+
         binary = os.environ.get("THEGN_TEST_BINARY")
         if binary:
             native_env = {**env, "XDG_STATE_HOME": str(sandbox / "state"),
@@ -238,6 +359,11 @@ def main() -> int:
             run(binary, "--config", str(cfg), "wt", "new", "native-hook-fixture",
                 "--repo", str(repo), "--base", "hostile", "--json", cwd=repo, env=native_env)
             assert not sentinel.exists(), "native worktree creation ran candidate checkout code"
+            native_root = sandbox / "native-worktrees"
+            if native_root.exists():
+                assert not list(native_root.rglob(".pre-commit-config.yaml")), (
+                    "native worktree creation seeded branch-controlled config"
+                )
             print("THE-429 native worktree fixture: ok")
         else:
             print("THE-429 native worktree fixture: not run (set THEGN_TEST_BINARY)")
@@ -274,6 +400,57 @@ def main() -> int:
         assert "output bound" in detector(repo, fake_git(sandbox, "oversized"))
         assert "timed out" in detector(repo, fake_git(sandbox, "hang"))
         assert "refusing inspection" in detector(repo, fake_git(sandbox, "invalid"))
+
+        # EOF may arrive just before waitpid observes a successful leader exit;
+        # the helper must reap that leader rather than killing it spuriously.
+        detector_impl = detector_module()
+        eof_env = fake_git(sandbox, "eof-race")
+        original_path = os.environ.get("PATH")
+        try:
+            os.environ["PATH"] = eof_env["PATH"]
+            eof_result = detector_impl.git(repo, "--eof-race")
+        finally:
+            if original_path is None:
+                os.environ.pop("PATH", None)
+            else:
+                os.environ["PATH"] = original_path
+        assert eof_result.returncode == 0, eof_result
+
+        # A direct fake-Git leader exits while a descendant retains both pipes.
+        # Repeat it to catch process/fd growth and require the exact isolated
+        # process group to be gone before continuing.
+        for index in range(3):
+            holder_env = fake_git(sandbox, f"fork-holder-{index}")
+            started = time.monotonic()
+            assert "timed out" in detector(repo, holder_env)
+            assert time.monotonic() - started < 4.5, "bounded Git cleanup exceeded its deadline"
+            assert_process_gone(Path(holder_env["THE429_HOLDER_PID"]))
+
+        # Repository identity must come from cwd, not ambient directory,
+        # index, object, namespace, discovery, or config redirection variables.
+        redirected = sandbox / "redirected-repo"
+        redirected.mkdir()
+        git("init", "-q", cwd=redirected, env=env)
+        redirected_candidate = redirected / ".git/hooks/post-checkout"
+        redirected_candidate.write_bytes(legacy)
+        redirected_before = snapshot(redirected_candidate)
+        redirected_env = {
+            **env,
+            "GIT_DIR": str(redirected / ".git"),
+            "GIT_WORK_TREE": str(redirected),
+            "GIT_COMMON_DIR": str(redirected / ".git"),
+            "GIT_INDEX_FILE": str(redirected / ".git/index"),
+            "GIT_OBJECT_DIRECTORY": str(redirected / ".git/objects"),
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(redirected / ".git/objects"),
+            "GIT_NAMESPACE": "redirected",
+            "GIT_CEILING_DIRECTORIES": str(redirected.parent),
+            "GIT_DISCOVERY_ACROSS_FILESYSTEM": "1",
+            "GIT_CONFIG_SYSTEM": str(redirected / ".git/config"),
+        }
+        remove_entry(candidate)
+        assert "no legacy post-checkout hook" in detector(repo, redirected_env)
+        assert snapshot(redirected_candidate) == redirected_before
+        candidate.write_bytes(b"foreign after environment scrub\n")
 
         command_scope = dict(
             env,
