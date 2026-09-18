@@ -49,7 +49,10 @@ pub fn run(
         let mode = if structural {
             StructuralDiff::Difft
         } else {
-            cfg.repo_git(&wt).structural_diff
+            // The repository's overlay, not one keyed by the worktree
+            // directory's basename (THE-515). CLI: git is fine here.
+            let root = thegn_core::repo::main_worktree(&wt).unwrap_or_else(|| wt.clone());
+            cfg.repo_git(&root).structural_diff
         };
         if mode != StructuralDiff::Off {
             if let Some(difft) = crate::structural_diff::choose(cfg, mode) {

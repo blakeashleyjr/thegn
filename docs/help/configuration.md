@@ -27,6 +27,12 @@ including `[project.<slug>.merge_queue]` and
 `[project.<slug>.pr_queue]`, which is where a repo whose gate,
 integration branch, or review rules differ from your defaults belongs. `thegn
 config explain <key>`, run inside the repo, names the layer that won.
+The `<slug>` must be the normalized repo directory name (`My_Repo` →
+`my-repo`). A differently spelled key, or two keys that normalize to the same
+slug, fails `thegn config validate` and the block is refused rather than
+guessed: none of it applies, that repo's queues, CI autofix and autopilot are
+held off, `thegn land`/`integrate` refuse, and `config explain` and
+`thegn repo trust` print why.
 
 The canonical root for repositories is `projects_dir`; the former
 `workspaces_dir` spelling remains accepted for three stable releases. The

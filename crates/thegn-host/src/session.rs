@@ -606,6 +606,15 @@ impl Session {
             .or_else(|| self.worktrees.last())
     }
 
+    /// The session's repository root: every group in a session belongs to its
+    /// workspace, so an absolute id IS the repo root (see `hydrate`). A legacy
+    /// non-path id ("default") yields `None` rather than something that would
+    /// resolve against the process cwd. Pure — safe on the UI loop.
+    pub fn repo_root(&self) -> Option<&std::path::Path> {
+        let root = std::path::Path::new(&self.id);
+        root.is_absolute().then_some(root)
+    }
+
     pub fn active_group_mut(&mut self) -> Option<&mut WorktreeGroup> {
         if self.active >= self.worktrees.len() {
             self.worktrees.last_mut()
