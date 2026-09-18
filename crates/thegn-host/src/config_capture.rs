@@ -55,6 +55,16 @@ pub(crate) trait ConfigSourceReader {
 
 pub(crate) struct CapturedCliInputs<'a> {
     pub(crate) config: Option<&'a Path>,
+    /// Raw CLI selector.  It is resolved with CLI-over-environment precedence
+    /// and must not be reread by the capture worker.
+    pub(crate) profile: Option<&'a str>,
+    /// When the single-threaded startup adapter has already called
+    /// `profile::reroot`, pass its frozen result here.  This prevents capture
+    /// from deriving a second `profiles/<name>` root from the already-rerooted
+    /// `THEGN_DIR`.  `None` is valid only for the pre-reroot/pure-capture
+    /// contract; it derives the same profile paths without mutating the
+    /// process environment.
+    pub(crate) profile_paths: Option<&'a thegn_core::profile::ProfilePaths>,
     pub(crate) overrides: &'a [String],
 }
 
@@ -64,6 +74,7 @@ pub(crate) enum CaptureInputError {
     InvalidPath,
     Bounds,
     InvalidUtf8,
+    ProfileBindingMismatch,
     UncapturedEnvironmentKey,
 }
 
@@ -304,6 +315,17 @@ impl ConfigCaptureSeed {
         }
         let cwd = std::env::current_dir()
             .map_err(|_| CaptureFailure::Input(CaptureInputError::CwdUnavailable))?;
+        // `reroot` is deliberately not called here.  A future single-threaded
+        // adapter calls it before this function and its immutable result is
+        // used to prevent a second reroot; tests may use the pure fallback in
+        // `capture_with` before reroot.
+        let active = thegn_core::profile::active();
+        let cli = CapturedCliInputs {
+            config: cli.config,
+            profile: cli.profile,
+            profile_paths: Some(&active),
+            overrides: cli.overrides,
+        };
         Self::capture_with(cli, cwd, |key| std::env::var_os(key), Config::default)
             .map_err(CaptureFailure::Input)
     }
@@ -370,12 +392,51 @@ impl ConfigCaptureSeed {
         // Populate the exact mapper-requested set once.  The admission call
         // later receives FrozenEnv and can therefore never consult ambient
         // process state a second time.
+        let env_profile = env.raw("THEGN_PROFILE");
         let _ = thegn_core::config::env_overlay(&env);
         if let Some(error) = env.error.get() {
             return Err(error);
         }
-        let profile_name =
-            thegn_core::profile::normalize_name(&env.get("THEGN_PROFILE").unwrap_or_default());
+        let base_app_root = app_root.clone();
+        let resolved_profile = if let Some(paths) = cli.profile_paths {
+            // Reject the complete retained root before cloning it into the
+            // seed.  This is also the no-double-reroot path.
+            checked_path(&paths.root)?;
+            paths.clone()
+        } else {
+            let paths = thegn_core::profile::resolve_for_capture(
+                &base_app_root,
+                cli.profile,
+                env_profile.as_deref(),
+            );
+            checked_path(&paths.root)?;
+            paths
+        };
+        let requested_profile = cli
+            .profile
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .or(env_profile.as_deref())
+            .unwrap_or_default();
+        let requested_name = thegn_core::profile::normalize_name(requested_profile);
+        let requested_capped = thegn_core::profile::cap_name(
+            &requested_name,
+            thegn_core::profile::MAX_NEW_PROFILE_NAME,
+        );
+        if resolved_profile
+            .root
+            .as_os_str()
+            .as_encoded_bytes()
+            .is_empty()
+            || !resolved_profile.root.is_absolute()
+            || (requested_name == "default" && resolved_profile.name != "default")
+            || (requested_name != "default"
+                && resolved_profile.name != requested_name
+                && resolved_profile.name != requested_capped)
+        {
+            return Err(CaptureInputError::ProfileBindingMismatch);
+        }
+        let profile_name = resolved_profile.name.clone();
         let base_path = settle(
             &cwd,
             &cli.config
@@ -387,24 +448,34 @@ impl ConfigCaptureSeed {
             path: base_path,
             explicit: cli.config.is_some(),
         };
-        let profile = (profile_name != "default").then(|| {
+        let profile = if profile_name != "default" {
             let path = config_home
                 .join("thegn/profiles")
                 .join(&profile_name)
                 .join("config.toml");
-            CapturedSource {
+            checked_path(&path)?;
+            Some(CapturedSource {
                 identity: opaque_identity("profile", &path, true, &profile_name),
                 path,
                 explicit: true,
-            }
-        });
-        let state_db = settle(&cwd, &state_home.join("thegn/thegn.db"))?;
+            })
+        } else {
+            None
+        };
+        let selected_state_home = if profile_name == "default" {
+            state_home.clone()
+        } else {
+            resolved_profile.root.join("state")
+        };
+        checked_path(&selected_state_home)?;
+        let state_db = settle(&cwd, &selected_state_home.join("thegn/thegn.db"))?;
 
         // Config::default consults ambient roots.  Replace every root it owns
         // with the already-captured values before any caller can mutate them.
         let mut defaults = defaults();
-        defaults.worktrees_dir = app_root
-            .join("worktrees")
+        let worktrees_root = resolved_profile.root.join("worktrees");
+        checked_path(&worktrees_root)?;
+        defaults.worktrees_dir = worktrees_root
             .to_str()
             .ok_or(CaptureInputError::InvalidUtf8)?
             .to_owned();
@@ -414,24 +485,47 @@ impl ConfigCaptureSeed {
             .ok_or(CaptureInputError::InvalidUtf8)?
             .to_owned();
 
+        let mut frozen_values = env.values.into_inner();
+        if cli.profile.is_some() || env_profile.is_some() || profile_name != "default" {
+            // The selector is a captured process input, not an ambient
+            // mutation.  Pin it in the frozen mapper view so CLI-over-env
+            // selection cannot be undone by config admission's env overlay.
+            frozen_values.insert("THEGN_PROFILE".to_owned(), Some(profile_name.clone()));
+        }
+
         Ok(Self {
             defaults,
             user_home_path: home.clone(),
             paths: PathExpansionContext::from_home(home.clone()),
             source_cwd: cwd,
             config_home,
-            state_home,
-            app_root,
+            state_home: selected_state_home,
+            app_root: resolved_profile.root,
             profile_name,
             base,
             profile,
             state_db,
             env: FrozenEnv {
-                values: env.values.into_inner(),
+                values: frozen_values,
                 missing: Cell::new(false),
             },
             overrides: cli.overrides.to_vec(),
         })
+    }
+
+    /// The selected profile is part of the frozen capture contract.  The
+    /// profile file is read once when selected; `Some(None)` means that the
+    /// selected file is absent and must become `SourceInput::Absent`, while
+    /// `Some(Some(Vec::new()))` is a present empty overlay.
+    fn source_input<'a>(source: &'a CapturedSource, content: Option<&'a [u8]>) -> SourceInput<'a> {
+        match content {
+            Some(content) => SourceInput {
+                identity: &source.identity,
+                explicit: source.explicit,
+                content: SourceContent::Bytes(content),
+            },
+            None => SourceInput::absent(&source.identity, source.explicit),
+        }
     }
 
     /// Blocking and deliberately unwired.  The state adapter decides whether
@@ -474,15 +568,12 @@ impl ConfigCaptureSeed {
         } else {
             SourceInput::absent(&self.base.identity, self.base.explicit)
         };
-        let profile_input = self.profile.as_ref().map(|source| SourceInput {
-            identity: &source.identity,
-            explicit: source.explicit,
-            content: SourceContent::Bytes(profile.as_deref().unwrap_or_default()),
-        });
-        let profile_input = match (profile_input, profile.as_ref()) {
-            (Some(input), Some(_)) => Some(input),
-            (Some(input), None) => Some(SourceInput::absent(input.identity, input.explicit)),
-            _ => None,
+        let profile_content = profile.as_ref().map(|content| content.as_deref());
+        let profile_input = match (&self.profile, profile_content) {
+            (Some(source), Some(content)) => Some(Self::source_input(source, Some(content))),
+            (Some(source), None) => Some(Self::source_input(source, None)),
+            (None, None) => None,
+            (None, Some(_)) => unreachable!("profile content without a selected profile"),
         };
         // Validate all non-DB layers before touching SQLite.  The empty
         // snapshot is only a preflight input and is never published.

@@ -87,6 +87,28 @@ pub fn profile_root(base: &std::path::Path, name: &str) -> Option<PathBuf> {
     (name != "default").then(|| base.join("profiles").join(name))
 }
 
+/// Resolve the profile selection for a source-capture adapter without changing
+/// process state.  The caller is responsible for passing the result from the
+/// single-threaded startup adapter when [`reroot`] has already run; this pure
+/// fallback is for an adapter that is capturing before reroot.  In either case
+/// CLI selection wins over the environment, the default profile keeps the
+/// legacy root, and an existing long profile name is never silently capped.
+pub fn resolve_for_capture(
+    base: &std::path::Path,
+    cli_profile: Option<&str>,
+    env_profile: Option<&str>,
+) -> ProfilePaths {
+    let raw = cli_profile
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or(env_profile)
+        .unwrap_or_default();
+    let requested = normalize_name(raw);
+    let name = on_disk_name(base, &requested);
+    let root = profile_root(base, &name).unwrap_or_else(|| base.to_path_buf());
+    ProfilePaths { name, root }
+}
+
 /// Resolve an already-created target profile without changing process state.
 ///
 /// Migration is a two-store operation, so it must never call [`reroot`] for the

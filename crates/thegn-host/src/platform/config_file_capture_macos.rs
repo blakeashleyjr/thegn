@@ -1,5 +1,5 @@
 use std::ffi::CString;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::Read;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
@@ -9,7 +9,36 @@ use nix::libc;
 
 use crate::config_capture::ConfigFileReadError as Error;
 
+// The guarantee is observed coherence in a stable, owner-controlled
+// namespace. It is not a hostile same-UID or mount-administrator guarantee.
+fn regular_path(path: &Path) -> Result<bool, Error> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(Error::Unsupported),
+        Ok(metadata) if !metadata.is_file() => Err(Error::NonRegular),
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(_) => Err(Error::Unavailable),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Identity {
+    device: u64,
+    inode: u64,
+    length: u64,
+    mtime_seconds: i64,
+    mtime_nanoseconds: i64,
+    ctime_seconds: i64,
+    ctime_nanoseconds: i64,
+}
+
 fn open(path: &Path) -> Result<Option<File>, Error> {
+    // macOS has no O_PATH equivalent. Prove the pathname is an ordinary file
+    // before the nonblocking data open, then repeat the proof on the handle;
+    // final symlinks are intentionally refused (including Nix-managed ones).
+    if !regular_path(path)? {
+        return Ok(None);
+    }
     let name = CString::new(path.as_os_str().as_bytes()).map_err(|_| Error::Unavailable)?;
     let fd = unsafe {
         libc::open(
@@ -27,7 +56,7 @@ fn open(path: &Path) -> Result<Option<File>, Error> {
     Ok(Some(unsafe { File::from_raw_fd(fd) }))
 }
 
-fn regular_identity(file: &File) -> Result<(u64, u64, u64), Error> {
+fn regular_identity(file: &File) -> Result<Identity, Error> {
     let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
     if unsafe { libc::fstat(file.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
         return Err(Error::Unavailable);
@@ -36,10 +65,22 @@ fn regular_identity(file: &File) -> Result<(u64, u64, u64), Error> {
     if (stat.st_mode & libc::S_IFMT) != libc::S_IFREG {
         return Err(Error::NonRegular);
     }
-    Ok((stat.st_dev as u64, stat.st_ino as u64, stat.st_size as u64))
+    Ok(Identity {
+        device: stat.st_dev as u64,
+        inode: stat.st_ino as u64,
+        length: stat.st_size as u64,
+        mtime_seconds: stat.st_mtimespec.tv_sec as i64,
+        mtime_nanoseconds: stat.st_mtimespec.tv_nsec as i64,
+        ctime_seconds: stat.st_ctimespec.tv_sec as i64,
+        ctime_nanoseconds: stat.st_ctimespec.tv_nsec as i64,
+    })
 }
 
-pub(super) fn read(path: &Path, limit: usize) -> Result<Option<Vec<u8>>, Error> {
+fn read_path(
+    path: &Path,
+    limit: usize,
+    after_read: impl FnOnce() -> Result<(), Error>,
+) -> Result<Option<Vec<u8>>, Error> {
     if limit > thegn_core::config_budget::MAX_SOURCE_BYTES {
         return Err(Error::TooLarge);
     }
@@ -63,5 +104,40 @@ pub(super) fn read(path: &Path, limit: usize) -> Result<Option<Vec<u8>>, Error> 
     if regular_identity(&input)? != expected {
         return Err(Error::Changed);
     }
+    after_read()?;
+    let Some(after) = open(path)? else {
+        return Err(Error::Changed);
+    };
+    if regular_identity(&after)? != expected {
+        return Err(Error::Changed);
+    }
     Ok(Some(bytes))
+}
+
+pub(super) fn read(path: &Path, limit: usize) -> Result<Option<Vec<u8>>, Error> {
+    read_path(path, limit, || Ok(()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn final_symlink_and_equal_length_replacement_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = dir.path().join("original");
+        let replacement = dir.path().join("replacement");
+        fs::write(&original, b"one").unwrap();
+        fs::write(&replacement, b"two").unwrap();
+        std::os::unix::fs::symlink(&original, dir.path().join("link")).unwrap();
+        assert_eq!(read(&dir.path().join("link"), 64), Err(Error::Unsupported));
+        assert_eq!(
+            read_path(&original, 64, || {
+                fs::rename(&original, dir.path().join("old")).unwrap();
+                fs::rename(&replacement, &original).unwrap();
+                Ok(())
+            }),
+            Err(Error::Changed)
+        );
+    }
 }
