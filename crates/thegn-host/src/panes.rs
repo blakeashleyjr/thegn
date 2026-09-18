@@ -1052,13 +1052,14 @@ const PREWARM_RADIUS: usize = 1;
 /// when they land, exactly like the lazy materialize path. The group name is
 /// the routing key (unique per session); the path is the spawn cwd.
 /// Pre-warm requests as `(group name, worktree path, tab index, missing leaves,
-/// is_terminal)`. The `is_terminal` flag tells the caller's off-thread spec
+/// target leaves, is_terminal)`. The target leaves are the stable identity
+/// captured with the request; the `is_terminal` flag tells the caller's off-thread spec
 /// resolver to build the spec from the terminal's connection (ssh/mosh/local)
 /// rather than `launch_spec` over the — empty, for terminals — worktree path.
 pub(crate) fn prewarm_requests(
     panes: &Panes,
     session: &mut crate::session::Session,
-) -> Vec<(String, String, usize, Vec<u32>, bool)> {
+) -> Vec<(String, String, usize, Vec<u32>, Vec<u32>, bool)> {
     let mut out = Vec::new();
     if session.worktrees.is_empty() {
         return out;
@@ -1069,7 +1070,14 @@ pub(crate) fn prewarm_requests(
     for ti in prewarm_targets(g.active_tab, g.tabs.len(), PREWARM_RADIUS) {
         let missing = panes.missing_leaves(&g.tabs[ti]);
         if !missing.is_empty() {
-            out.push((g.name.clone(), g.path.clone(), ti, missing, is_term));
+            out.push((
+                g.name.clone(),
+                g.path.clone(),
+                ti,
+                missing,
+                g.tabs[ti].center.pane_ids(),
+                is_term,
+            ));
         }
     }
     // Neighboring worktrees: their remembered active tab.
@@ -1081,7 +1089,14 @@ pub(crate) fn prewarm_requests(
         if let Some(tab) = g.tabs.get(at) {
             let missing = panes.missing_leaves(tab);
             if !missing.is_empty() {
-                out.push((g.name.clone(), g.path.clone(), at, missing, is_term));
+                out.push((
+                    g.name.clone(),
+                    g.path.clone(),
+                    at,
+                    missing,
+                    tab.center.pane_ids(),
+                    is_term,
+                ));
             }
         }
     }
@@ -1218,7 +1233,7 @@ mod tests {
         let reqs = prewarm_requests(&panes, &mut session);
         let neighbor = reqs
             .iter()
-            .find(|(name, _, _, _, _)| name == "app/dup")
+            .find(|(name, _, _, _, _, _)| name == "app/dup")
             .expect("the same-path neighbor is pre-warmed under its own name");
         assert_eq!(neighbor.1, "/tmp/app", "the path is carried for the cwd");
         // The routing key (name, ti) is distinct from the active group's,

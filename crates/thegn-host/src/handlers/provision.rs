@@ -23,6 +23,10 @@ pub(crate) struct SpecBatch {
     pub worktree: String,
     /// Tab index the batch was captured for.
     pub tab: usize,
+    /// Stable leaf identities captured with the request. The tab index is only
+    /// a routing hint: closes can shift it onto another live tab before the
+    /// worker returns, including for `PrewarmSkipped` errors with no specs.
+    pub target_leaves: Vec<u32>,
     /// Which inflight set to clear; prewarm batches may be dropped.
     pub origin: SpecOrigin,
     pub specs: std::result::Result<Vec<(u32, crate::agent::LaunchSpec)>, SpecError>,
@@ -434,12 +438,38 @@ pub(crate) fn drain_specs(
             group: name,
             worktree: wt,
             tab: ti,
+            target_leaves,
             origin,
             specs,
             attach: batch_attach,
         } = batch;
         ctx.loop_perf.tick(crate::perf::WakeSource::Spec);
         let tab_key = (name.clone(), ti);
+        let Some(gi) = ctx.session.worktrees.iter().position(|g| g.name == name) else {
+            continue;
+        };
+        // The numeric tab index is only a routing hint. Validate the captured
+        // stable leaf identity before settling a reservation or touching any
+        // loading/pool/attach state. In particular, an Err(PrewarmSkipped)
+        // batch has no resolved leaves to inspect, so `target_leaves` is the
+        // only stale-result guard it has.
+        let target_matches = ctx
+            .session
+            .worktrees
+            .get(gi)
+            .and_then(|g| g.tabs.get(ti))
+            .is_some_and(|tab| {
+                let leaves = tab.center.pane_ids();
+                target_leaves.iter().any(|id| leaves.contains(id))
+            });
+        if !target_matches {
+            tracing::debug!(
+                target: "thegn::startup",
+                group = %name, tab = ti,
+                "dropping a spec batch whose captured target leaves no longer belong to the tab"
+            );
+            continue;
+        }
         match origin {
             SpecOrigin::Materialize => {
                 ctx.materialize_inflight.remove(&tab_key);
@@ -474,45 +504,9 @@ pub(crate) fn drain_specs(
         if tab_remote {
             *ctx.last_pool_reconcile = None;
         }
-        let Some(gi) = ctx.session.worktrees.iter().position(|g| g.name == name) else {
-            continue;
-        };
-        // STALE-BATCH GUARD. A batch is addressed by tab *index*, captured when
-        // the request was made — but a tab close (`Vec::remove`) shifts every
-        // tab to the right of it down one, so by the time a slow spec
-        // resolution lands, `ti` can name a completely different, already-live
-        // tab. Applying the batch there is not a harmless no-op: the loading
-        // writes below (`advance_to_shell`) would dress a live tab in the
-        // shell-wait splash, which is exactly what arms
-        // `startup_watchdog::tick` against its healthy long-lived pane — the
-        // watchdog then drops that pane and swaps in a clean rc-free shell
-        // (the user's running program replaced by a bare prompt).
-        //
-        // Pane ids ARE stable (monotonic, never reused), so the batch's own
-        // leaf ids are the identity check: if the tab at `ti` holds none of
-        // them, this batch was not addressed to it. Checked BEFORE any loading
-        // mutation — `materialize_with_specs`'s own departed-leaf skip runs too
-        // late to prevent the splash write.
-        let Some(tab_leaves) = ctx
-            .session
-            .worktrees
-            .get(gi)
-            .and_then(|g| g.tabs.get(ti))
-            .map(|t| t.center.pane_ids())
-        else {
-            continue;
-        };
-        if let Ok(resolved) = &specs
-            && !resolved.iter().any(|(id, _)| tab_leaves.contains(id))
-        {
-            tracing::debug!(
-                target: "thegn::startup",
-                group = %name, tab = ti,
-                "dropping a spec batch whose target tab no longer holds its leaves \
-                 (a tab close shifted the indices)"
-            );
-            continue;
-        }
+        // The stable-leaf guard above handles the tab-index shift before any
+        // loading mutation. `materialize_with_specs` still independently skips
+        // individual leaves that came alive while this batch was in flight.
         let is_active = gi == ctx.session.active && ctx.session.worktrees[gi].active_tab == ti;
         if is_active && *ctx.center_dormant {
             continue; // splash still up: stay lazy
@@ -910,6 +904,7 @@ mod tests {
                 group: "app/home".into(),
                 worktree: String::new(),
                 tab: 0,
+                target_leaves: vec![leaf],
                 origin: SpecOrigin::Materialize,
                 specs: Ok(vec![(leaf, spec)]),
                 attach: Vec::new(),
@@ -1008,6 +1003,7 @@ mod tests {
                 group: "app/home".into(),
                 worktree: String::new(),
                 tab: 0,
+                target_leaves: vec![leaf],
                 origin: SpecOrigin::Prewarm,
                 specs: Err(SpecError::PrewarmSkipped),
                 attach: vec![AttachTarget {
@@ -1114,6 +1110,8 @@ mod tests {
         let mut loading_state = crate::loading::track::LoadingTracker::default();
         let mut loading_remote = std::collections::HashMap::new();
         let mut materialize_inflight = std::collections::HashSet::new();
+        // Model a replacement request that owns the shifted index. A late
+        // result for the closed tab must not settle this newer reservation.
         let mut prewarm_inflight = std::collections::HashSet::from([("app/home".into(), 1)]);
         let mut materialize_failed = std::collections::HashSet::new();
         let mut prewarm_failed = std::collections::HashSet::new();
@@ -1129,6 +1127,7 @@ mod tests {
                 group: "app/home".into(),
                 worktree: String::new(),
                 tab: 1,
+                target_leaves: vec![6],
                 origin: SpecOrigin::Prewarm,
                 specs: Err(SpecError::PrewarmSkipped),
                 attach: vec![AttachTarget {
@@ -1177,7 +1176,10 @@ mod tests {
             crate::center::CenterTree::Leaf(7),
             "the shifted live tab remains unchanged"
         );
-        assert!(prewarm_inflight.is_empty(), "the stale request is settled");
+        assert!(
+            prewarm_inflight.contains(&("app/home".into(), 1)),
+            "a stale result must not settle the replacement tab's reservation"
+        );
         assert!(!need_relayout, "a dropped batch does not change geometry");
         assert!(!dirty, "a dropped batch does not dirty the frame");
     }
@@ -1245,6 +1247,7 @@ mod tests {
                 group: "app/home".into(),
                 worktree: String::new(),
                 tab: 1,
+                target_leaves: vec![99],
                 origin: SpecOrigin::Prewarm,
                 specs: Ok(vec![(99u32, spec)]),
                 attach: Vec::new(),
@@ -1290,5 +1293,92 @@ mod tests {
             panes.table.contains_key(&5) && panes.table.contains_key(&6),
             "no live pane is disturbed"
         );
+    }
+
+    /// The stale guard must also run when there is no daemon attachment to
+    /// graft. This keeps the replacement request's reservation intact for the
+    /// same shifted-index race without relying on the attach effect to expose
+    /// the bug.
+    #[test]
+    fn drain_specs_drops_stale_prewarm_skip_without_attach() {
+        let mut session = Session {
+            id: "s1".into(),
+            worktrees: vec![WorktreeGroup::new("app/home", GroupKind::Home, "")],
+            active: 0,
+        };
+        {
+            let g = &mut session.worktrees[0];
+            g.tabs[0].center = crate::center::CenterTree::Leaf(5);
+            g.tabs[0].focused_pane = 5;
+            g.add_tab();
+            g.tabs[1].center = crate::center::CenterTree::Leaf(6);
+            g.tabs[1].focused_pane = 6;
+            g.add_tab();
+            g.tabs[2].center = crate::center::CenterTree::Leaf(7);
+            g.tabs[2].focused_pane = 7;
+            g.tabs.remove(0);
+        }
+
+        let (pane_tx, _pane_rx) = tokio_mpsc::channel::<PaneEvent>(16);
+        let mut panes = crate::panes::Panes::new(pane_tx);
+        for id in [6, 7] {
+            panes.insert_test_pane(id);
+        }
+        let cfg = thegn_core::config::Config::default();
+        let mut model = crate::chrome::FrameModel::default();
+        let mut active_menu: Option<MenuOverlay> = None;
+        let mut loading_state = crate::loading::track::LoadingTracker::default();
+        let mut loading_remote = std::collections::HashMap::new();
+        let mut materialize_inflight = std::collections::HashSet::new();
+        let mut prewarm_inflight = std::collections::HashSet::from([("app/home".into(), 1)]);
+        let mut materialize_failed = std::collections::HashSet::new();
+        let mut prewarm_failed = std::collections::HashSet::new();
+        let mut halt_dismissed = std::collections::HashSet::new();
+        let mut last_pool_reconcile = None;
+        let mut center_dormant = false;
+        let mut need_relayout = false;
+        let mut dirty = false;
+        let mut loop_perf = crate::perf::LoopPerf::new();
+        let (spec_tx, mut spec_rx) = tokio::sync::mpsc::unbounded_channel();
+        spec_tx
+            .send(SpecBatch {
+                group: "app/home".into(),
+                worktree: String::new(),
+                tab: 1,
+                target_leaves: vec![6],
+                origin: SpecOrigin::Prewarm,
+                specs: Err(SpecError::PrewarmSkipped),
+                attach: Vec::new(),
+            })
+            .unwrap();
+
+        drain_specs(
+            &mut spec_rx,
+            &mut SpecDrainCtx {
+                session: &mut session,
+                panes: &mut panes,
+                model: &mut model,
+                active_menu: &mut active_menu,
+                current_config: &cfg,
+                center: crate::layout::compute(160, 40, true, true).center,
+                loading_state: &mut loading_state,
+                loading_remote: &mut loading_remote,
+                materialize_inflight: &mut materialize_inflight,
+                prewarm_inflight: &mut prewarm_inflight,
+                materialize_failed: &mut materialize_failed,
+                prewarm_failed: &mut prewarm_failed,
+                halt_dismissed: &mut halt_dismissed,
+                last_pool_reconcile: &mut last_pool_reconcile,
+                center_dormant: &mut center_dormant,
+                need_relayout: &mut need_relayout,
+                dirty: &mut dirty,
+                loop_perf: &mut loop_perf,
+            },
+        );
+
+        assert!(prewarm_inflight.contains(&("app/home".into(), 1)));
+        assert!(loading_state.get(&("app/home".into(), 1)).is_none());
+        assert!(!need_relayout);
+        assert!(!dirty);
     }
 }
