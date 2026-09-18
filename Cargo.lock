@@ -8415,6 +8415,7 @@ dependencies = [
  "tower",
  "tower-http",
  "tracing",
+ "url",
  "windows-sys 0.59.0",
 ]
 
