@@ -283,6 +283,19 @@ mod tests {
             "same basename roots must not share a repository ID"
         );
 
+        #[cfg(unix)]
+        {
+            let alias = tmp("identity-root-alias");
+            let _ = std::fs::remove_file(&alias);
+            std::os::unix::fs::symlink(&root, &alias).unwrap();
+            assert_eq!(
+                first,
+                repository_id(&alias).unwrap(),
+                "a symlink alias must resolve to the same Git common-dir identity"
+            );
+            let _ = std::fs::remove_file(alias);
+        }
+
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_dir_all(other);
     }

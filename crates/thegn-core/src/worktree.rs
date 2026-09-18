@@ -64,24 +64,7 @@ pub fn inspect_registered(root: &Path, path: &Path) -> Result<GitWorktreeIdentit
     .map_err(|_| IdentityError::GitProbeFailed {
         operation: "git worktree list --porcelain -z",
     })?;
-    let entries = parse_worktree_identity_records(&porcelain)?;
-    let mut matches = entries
-        .into_iter()
-        .filter(|entry| {
-            std::fs::canonicalize(entry.path.as_path())
-                .map(|candidate| candidate == requested)
-                .unwrap_or(false)
-        })
-        .collect::<Vec<_>>();
-    if matches.is_empty() {
-        return Err(IdentityError::NotRegistered);
-    }
-    if matches.len() != 1 {
-        return Err(IdentityError::Ambiguous {
-            kind: "Git worktree registration",
-        });
-    }
-    let entry = matches.pop().expect("one match checked");
+    let entry = registered_entry(&parse_worktree_identity_records(&porcelain)?, &requested)?;
     let common_dir = repo::canonical_common_dir(entry.path.as_path())?;
     if common_dir != inspected_common {
         return Err(IdentityError::GitProbeFailed {
@@ -93,12 +76,30 @@ pub fn inspect_registered(root: &Path, path: &Path) -> Result<GitWorktreeIdentit
         &["rev-parse", "--path-format=absolute", "--git-dir"],
         "rev-parse --git-dir",
     )?;
+    let stamp_before = util::git_admin_instance_stamp(admin_dir.as_path()).ok_or(
+        IdentityError::UnsupportedEncoding {
+            kind: "Git admin instance",
+        },
+    )?;
     let confirmed_common = repo::canonical_common_dir(root)?;
     if confirmed_common != inspected_common {
         return Err(IdentityError::GitProbeFailed {
             operation: "repository registration changed during worktree inspection",
         });
     }
+    let confirmed_porcelain = util::git_stdout_bounded(
+        root,
+        &["worktree", "list", "--porcelain", "-z"],
+        MAX_GIT_IDENTITY_OUTPUT,
+    )
+    .map_err(|_| IdentityError::GitProbeFailed {
+        operation: "git worktree list --porcelain -z",
+    })?;
+    let confirmed_entry = registered_entry(
+        &parse_worktree_identity_records(&confirmed_porcelain)?,
+        &requested,
+    )?;
+    registration_snapshot_consistent(&entry, &confirmed_entry)?;
     let confirmed_admin = exact_git_path(
         &entry.path,
         &["rev-parse", "--path-format=absolute", "--git-dir"],
@@ -109,12 +110,18 @@ pub fn inspect_registered(root: &Path, path: &Path) -> Result<GitWorktreeIdentit
             operation: "worktree admin identity changed during inspection",
         });
     }
-    let stamp = util::git_admin_instance_stamp(admin_dir.as_path()).ok_or(
+    let stamp_after = util::git_admin_instance_stamp(admin_dir.as_path()).ok_or(
         IdentityError::UnsupportedEncoding {
             kind: "Git admin instance",
         },
     )?;
-    let generation = crate::identity::WorktreeGeneration::from_captured_instance_stamp(&stamp)?;
+    if stamp_after != stamp_before {
+        return Err(IdentityError::GitProbeFailed {
+            operation: "Git admin instance changed during inspection",
+        });
+    }
+    let generation =
+        crate::identity::WorktreeGeneration::from_captured_instance_stamp(&stamp_after)?;
     Ok(GitWorktreeIdentity {
         common_dir,
         admin_dir,
@@ -124,10 +131,40 @@ pub fn inspect_registered(root: &Path, path: &Path) -> Result<GitWorktreeIdentit
     })
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 struct WorktreeIdentityRecord {
     path: ExactPath,
     branch: Option<BranchRef>,
+}
+
+fn registered_entry(
+    entries: &[WorktreeIdentityRecord],
+    requested: &Path,
+) -> Result<WorktreeIdentityRecord, IdentityError> {
+    let mut matches = entries.iter().filter(|entry| {
+        std::fs::canonicalize(entry.path.as_path())
+            .map(|candidate| candidate == requested)
+            .unwrap_or(false)
+    });
+    let entry = matches.next().ok_or(IdentityError::NotRegistered)?;
+    if matches.next().is_some() {
+        return Err(IdentityError::Ambiguous {
+            kind: "Git worktree registration",
+        });
+    }
+    Ok(entry.clone())
+}
+
+fn registration_snapshot_consistent(
+    before: &WorktreeIdentityRecord,
+    after: &WorktreeIdentityRecord,
+) -> Result<(), IdentityError> {
+    if before != after {
+        return Err(IdentityError::GitProbeFailed {
+            operation: "worktree branch or registration changed during inspection",
+        });
+    }
+    Ok(())
 }
 
 fn exact_git_path(
@@ -995,6 +1032,151 @@ mod tests {
                 .as_bytes()
                 .iter()
                 .all(|byte| *byte == 0)
+        );
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inspection_preserves_newline_and_non_utf8_paths_and_detached_state() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+        let repo = temp_repo("identity-raw-path");
+        let mut raw = format!("/tmp/thegn-raw-{}-\n", std::process::id()).into_bytes();
+        raw.push(0xff);
+        let path = PathBuf::from(std::ffi::OsString::from_vec(raw));
+        assert!(
+            util::git_cmd(&repo)
+                .args(["worktree", "add", "-q", "--detach"])
+                .arg(&path)
+                .arg("HEAD")
+                .status()
+                .unwrap()
+                .success()
+        );
+        let inspected = inspect_registered(&repo, &path).unwrap();
+        assert_eq!(
+            inspected.registered_path().as_bytes(),
+            path.as_os_str().as_bytes()
+        );
+        assert!(inspected.branch().is_none());
+        let _ = util::git_cmd(&repo)
+            .args(["worktree", "remove", "-f"])
+            .arg(&path)
+            .status();
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn replacement_during_inspection_is_rejected_by_snapshot_consistency() {
+        let repo = temp_repo("identity-replacement");
+        let path = repo.join(".replacement");
+        assert!(
+            util::git_cmd(&repo)
+                .args([
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    "before",
+                    path.to_str().unwrap()
+                ])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let requested = std::fs::canonicalize(&path).unwrap();
+        let before = util::git_stdout_bounded(
+            &repo,
+            &["worktree", "list", "--porcelain", "-z"],
+            MAX_GIT_IDENTITY_OUTPUT,
+        )
+        .unwrap();
+        let before = registered_entry(
+            &parse_worktree_identity_records(&before).unwrap(),
+            &requested,
+        )
+        .unwrap();
+        assert!(
+            util::git_cmd(&path)
+                .args(["branch", "-m", "after"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let after = util::git_stdout_bounded(
+            &repo,
+            &["worktree", "list", "--porcelain", "-z"],
+            MAX_GIT_IDENTITY_OUTPUT,
+        )
+        .unwrap();
+        let after = registered_entry(
+            &parse_worktree_identity_records(&after).unwrap(),
+            &requested,
+        )
+        .unwrap();
+        assert!(registration_snapshot_consistent(&before, &after).is_err());
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn generation_survives_checkout_and_branch_rename_but_changes_on_replacement() {
+        let repo = temp_repo("identity-generation");
+        let path = repo.join(".external/feature");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        assert!(
+            util::git_cmd(&repo)
+                .args([
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    "feat/a",
+                    path.to_str().unwrap()
+                ])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let first = inspect_registered(&repo, &path).unwrap();
+        assert!(
+            util::git_cmd(&path)
+                .args(["switch", "--detach", "-q"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let detached = inspect_registered(&repo, &path).unwrap();
+        assert_eq!(first.generation(), detached.generation());
+        assert!(
+            util::git_cmd(&path)
+                .args(["switch", "-q", "-c", "renamed"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let renamed = inspect_registered(&repo, &path).unwrap();
+        assert_eq!(first.generation(), renamed.generation());
+
+        assert!(
+            util::git_cmd(&repo)
+                .args(["worktree", "remove", "-f", path.to_str().unwrap()])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            util::git_cmd(&repo)
+                .args(["worktree", "add", "-q", path.to_str().unwrap(), "renamed"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let replacement = inspect_registered(&repo, &path).unwrap();
+        assert_ne!(
+            first.generation(),
+            replacement.generation(),
+            "a recreated Git admin directory must not retain the old generation"
         );
         let _ = std::fs::remove_dir_all(&repo);
     }

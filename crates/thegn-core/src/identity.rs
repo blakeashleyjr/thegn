@@ -148,7 +148,18 @@ pub fn display_label(raw: &[u8]) -> DisplayLabel {
         rendered.push_str(text);
         rendered.len() < MAX_DISPLAY_LABEL_BYTES
     };
-    if let Ok(text) = std::str::from_utf8(raw) {
+    // Validate only the bounded prefix. A public identity/display boundary may
+    // receive an arbitrarily large byte slice; validating the whole slice
+    // before projecting it made display work proportional to hostile input.
+    let bounded = &raw[..raw.len().min(MAX_DISPLAY_LABEL_BYTES)];
+    let utf8_prefix = match std::str::from_utf8(bounded) {
+        Ok(text) => Some(text),
+        Err(error) if error.error_len().is_none() => {
+            std::str::from_utf8(&bounded[..error.valid_up_to()]).ok()
+        }
+        Err(_) => None,
+    };
+    if let Some(text) = utf8_prefix {
         'input: for ch in text.chars() {
             match ch {
                 '/' | '\\' => {
@@ -171,7 +182,7 @@ pub fn display_label(raw: &[u8]) -> DisplayLabel {
             }
         }
     } else {
-        'input: for byte in raw {
+        'input: for byte in bounded {
             if byte.is_ascii_graphic() && !matches!(*byte, b'/' | b'\\') {
                 if !push(&char::from(*byte).to_string()) {
                     break;
@@ -227,6 +238,9 @@ impl ExactPath {
     }
 
     pub(crate) fn from_git_bytes(bytes: &[u8]) -> Result<Self, IdentityError> {
+        if bytes.len() > MAX_IDENTITY_COMPONENT_BYTES {
+            return Err(IdentityError::InputTooLong { kind: "git path" });
+        }
         let path = util::path_from_git_bytes(bytes)
             .ok_or(IdentityError::UnsupportedEncoding { kind: "git path" })?;
         Self::from_path(&path)
