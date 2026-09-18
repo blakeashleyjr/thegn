@@ -134,14 +134,17 @@ fn scanner_rejects_line_depth_node_member_string_and_work_overages() {
         Err(crate::config_budget::BudgetError::Members)
     ));
 
-    let mut nodes = String::from("values = [\n");
-    for index in 0..crate::config_budget::MAX_NODES {
-        nodes.push_str("1,");
-        if index % 100 == 0 {
-            nodes.push('\n');
+    let mut nodes = String::new();
+    for array in 0..4 {
+        nodes.push_str(&format!("values{array} = [\n"));
+        for index in 0..crate::config_budget::MAX_MEMBERS {
+            nodes.push_str("1,");
+            if index % 100 == 0 {
+                nodes.push('\n');
+            }
         }
+        nodes.push_str("]\n");
     }
-    nodes.push_str("]\n");
     assert!(matches!(
         crate::config_budget::scan(nodes.as_bytes()),
         Err(crate::config_budget::BudgetError::Nodes)
@@ -165,7 +168,7 @@ fn scanner_resets_statement_depth_and_counts_root_and_inline_members() {
 
     let nested = format!(
         "value = {}0{}\n",
-        "[".repeat(crate::config_budget::MAX_DEPTH),
+        "[".repeat(crate::config_budget::MAX_DEPTH - 1),
         "]".repeat(crate::config_budget::MAX_DEPTH)
     );
     assert!(crate::config_budget::scan(nested.as_bytes()).is_ok());
@@ -197,12 +200,12 @@ fn scanner_resets_statement_depth_and_counts_root_and_inline_members() {
 fn scanner_accepts_physical_line_edge_inside_valid_multiline_string() {
     let exact = format!(
         "value = \"\"\"\n{}\n\"\"\"\n",
-        "x".repeat(crate::config_budget::MAX_LINE_BYTES - 1)
+        "x".repeat(crate::config_budget::MAX_LINE_BYTES)
     );
     assert!(crate::config_budget::scan(exact.as_bytes()).is_ok());
     let over = format!(
         "value = \"\"\"\n{}\n\"\"\"\n",
-        "x".repeat(crate::config_budget::MAX_LINE_BYTES)
+        "x".repeat(crate::config_budget::MAX_LINE_BYTES + 1)
     );
     assert!(matches!(
         crate::config_budget::scan(over.as_bytes()),
@@ -279,24 +282,24 @@ fn scanner_accumulates_table_path_dotted_key_and_inline_depth() {
 #[test]
 fn scanner_counts_array_values_not_commas_or_trailing_delimiters() {
     let exact_no_trailing = format!(
-        "values = [{}]\n",
+        "values = [\n{}\n]\n",
         std::iter::repeat_n("1", crate::config_budget::MAX_MEMBERS)
             .collect::<Vec<_>>()
-            .join(",")
+            .join(",\n")
     );
     assert!(crate::config_budget::scan(exact_no_trailing.as_bytes()).is_ok());
 
     let exact_trailing = format!(
-        "values = [{}]\n",
-        "1,".repeat(crate::config_budget::MAX_MEMBERS)
+        "values = [\n{}\n]\n",
+        "1,\n".repeat(crate::config_budget::MAX_MEMBERS)
     );
     assert!(crate::config_budget::scan(exact_trailing.as_bytes()).is_ok());
 
     let over = format!(
-        "values = [{}]\n",
+        "values = [\n{}\n]\n",
         std::iter::repeat_n("1", crate::config_budget::MAX_MEMBERS + 1)
             .collect::<Vec<_>>()
-            .join(",")
+            .join(",\n")
     );
     assert_eq!(
         crate::config_budget::scan(over.as_bytes()),
@@ -657,6 +660,7 @@ fn revision_changes_for_sources_and_host_snapshot_without_exposing_secret_values
         env: &env,
         overrides: &overrides,
         hosts: &first_hosts,
+        paths: &path_context(),
     })
     .expect("secret-bearing valid config still admits");
     let debug = format!("{first:?}");
@@ -687,6 +691,7 @@ fn revision_changes_for_sources_and_host_snapshot_without_exposing_secret_values
         env: &env,
         overrides: &overrides,
         hosts: &second_hosts,
+        paths: &path_context(),
     })
     .expect("changed source and host snapshot admit");
     assert_ne!(first.revision().digest, second.revision().digest);
@@ -878,4 +883,25 @@ fn store_default_reload_health_and_generation_exhaustion_are_explicit() {
             ..
         })
     ));
+}
+
+#[cfg(unix)]
+#[test]
+fn admission_refuses_lossy_captured_home_identity() {
+    use std::os::unix::ffi::OsStringExt;
+    let paths = PathExpansionContext::from_home(std::path::PathBuf::from(
+        std::ffi::OsString::from_vec(b"/home/non-utf8-\xff".to_vec()),
+    ));
+    let env = TestEnv::default();
+    let host_snapshot = hosts();
+    let result = admit(AdmissionInputs {
+        defaults: Config::default(),
+        base: SourceInput::absent("base", false),
+        profile: None,
+        env: &env,
+        overrides: &[],
+        hosts: &host_snapshot,
+        paths: &paths,
+    });
+    assert!(matches!(result, Err(ConfigAdmissionError::InvalidUtf8)));
 }

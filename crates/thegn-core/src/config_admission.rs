@@ -658,7 +658,13 @@ fn validate_source_identity(input: &SourceInput<'_>) -> Result<(), ConfigAdmissi
 fn validate_admission_context(
     inputs: &AdmissionInputs<'_>,
 ) -> Result<[u8; 32], ConfigAdmissionError> {
-    let home = inputs.paths.home().to_string_lossy();
+    // Config path fields are UTF-8 strings. Refuse an unrepresentable captured
+    // HOME instead of collapsing distinct OS paths to the same lossy identity.
+    let home = inputs
+        .paths
+        .home()
+        .to_str()
+        .ok_or(ConfigAdmissionError::InvalidUtf8)?;
     if home.len() > config_budget::MAX_CONTEXT_BYTES {
         return Err(ConfigAdmissionError::Oversized);
     }
