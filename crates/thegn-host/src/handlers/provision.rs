@@ -446,6 +446,17 @@ pub(crate) fn drain_specs(
         ctx.loop_perf.tick(crate::perf::WakeSource::Spec);
         let tab_key = (name.clone(), ti);
         let Some(gi) = ctx.session.worktrees.iter().position(|g| g.name == name) else {
+            // No group with this name exists, so this completed request cannot
+            // belong to a replacement tab. Release only its own origin's key.
+            // A recreated group takes the stable-leaf guard below instead.
+            match origin {
+                SpecOrigin::Materialize => {
+                    ctx.materialize_inflight.remove(&tab_key);
+                }
+                SpecOrigin::Prewarm => {
+                    ctx.prewarm_inflight.remove(&tab_key);
+                }
+            }
             continue;
         };
         // The numeric tab index is only a routing hint. Validate the captured
@@ -1418,6 +1429,15 @@ mod tests {
     /// to the removed group and must not remain in the loop-local set forever.
     #[test]
     fn drain_specs_releases_prewarm_reservation_when_group_disappears() {
+        vanished_group_reservation(SpecOrigin::Prewarm);
+    }
+
+    #[test]
+    fn drain_specs_releases_materialize_reservation_when_group_disappears() {
+        vanished_group_reservation(SpecOrigin::Materialize);
+    }
+
+    fn vanished_group_reservation(origin: SpecOrigin) {
         let mut session = Session {
             id: "s1".into(),
             worktrees: Vec::new(),
@@ -1430,7 +1450,8 @@ mod tests {
         let mut active_menu: Option<MenuOverlay> = None;
         let mut loading_state = crate::loading::track::LoadingTracker::default();
         let mut loading_remote = std::collections::HashMap::new();
-        let mut materialize_inflight = std::collections::HashSet::new();
+        let mut materialize_inflight =
+            std::collections::HashSet::from([("removed/group".into(), 0usize)]);
         let mut prewarm_inflight =
             std::collections::HashSet::from([("removed/group".into(), 0usize)]);
         let mut materialize_failed = std::collections::HashSet::new();
@@ -1448,7 +1469,7 @@ mod tests {
                 worktree: String::new(),
                 tab: 0,
                 target_leaves: vec![42],
-                origin: SpecOrigin::Prewarm,
+                origin,
                 specs: Err(SpecError::PrewarmSkipped),
                 attach: Vec::new(),
             })
@@ -1478,9 +1499,10 @@ mod tests {
             },
         );
 
-        assert!(
-            prewarm_inflight.is_empty(),
-            "a vanished group must not retain its completed prewarm reservation"
+        assert_eq!(prewarm_inflight.is_empty(), origin == SpecOrigin::Prewarm);
+        assert_eq!(
+            materialize_inflight.is_empty(),
+            origin == SpecOrigin::Materialize
         );
         assert!(!need_relayout);
         assert!(!dirty);
