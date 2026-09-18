@@ -552,6 +552,13 @@ pub fn main_checkout(start: &Path) -> Option<PathBuf> {
 /// command and the in-app (off-loop) runner.
 pub fn fold_active_repo(cfg: &thegn_core::config::Config, any_path: &Path) -> Result<FoldReport> {
     let repo_root = main_checkout(any_path).context("not inside a git repository")?;
+    // THE-515: an ambiguous trusted overlay is refused HERE, in the shared
+    // entry, not only in a CLI wrapper — the in-app Integrate action is armed
+    // on the GLOBAL `enabled` flag and this fold lands even with `auto_land`
+    // off, so without this check it would fold under the weaker global gate.
+    if let Some(refusal) = cfg.workspace_overlay_refusal(&repo_root) {
+        anyhow::bail!("{}: {refusal}", repo_root.display());
+    }
     // Resolved here (off the loop — this runs inside spawn_fold's blocking task)
     // because the per-repo `[merge_queue]` layer needs the repo root.
     let mq = &cfg.repo_merge_queue(&repo_root);

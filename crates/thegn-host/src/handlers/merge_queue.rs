@@ -117,18 +117,40 @@ pub(crate) fn spawn_drive(
     let tx = drive_tx.clone();
     let waker = waker.clone();
     tokio::task::spawn_blocking(move || {
-        let send = |m: DriveMsg| {
+        drive_blocking(&cfg, &any_path, |m: DriveMsg| {
             if tx.send(m).is_ok() {
                 let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
             }
-        };
-        let Some(root) = integrate::main_checkout(&any_path) else {
+        });
+    });
+}
+
+/// The blocking body of [`spawn_drive`], separated so the entry gates are
+/// testable without a runtime.
+fn drive_blocking(cfg: &Config, any_path: &std::path::Path, send: impl Fn(DriveMsg)) {
+    {
+        let Some(root) = integrate::main_checkout(any_path) else {
             send(DriveMsg::Failed("not inside a git repository".into()));
             return;
         };
+        // THE-515: the dispatch is armed on the GLOBAL `enabled` flag; the
+        // repo's resolved policy decides here. A refused (ambiguous) trusted
+        // overlay, or a queue the repo's own overlay turned off, drains
+        // nothing — no gates, no conflict agents.
+        if let Some(refusal) = cfg.workspace_overlay_refusal(&root) {
+            send(DriveMsg::Failed(format!("{}: {refusal}", root.display())));
+            return;
+        }
         // Repo-resolved, inside the blocking task: the loop must not pay for the
         // git call that derives the workspace slug.
         let mq = cfg.repo_merge_queue(&root);
+        if !mq.enabled {
+            send(DriveMsg::Failed(format!(
+                "Merge queue disabled for {} by its [project.*.merge_queue] block",
+                root.display()
+            )));
+            return;
+        }
         let db = match Db::open() {
             Ok(d) => d,
             Err(e) => {
@@ -163,7 +185,7 @@ pub(crate) fn spawn_drive(
             send(DriveMsg::Done(DriveOutcome::default()));
             return;
         }
-        let out = merge_driver::drive_queue(&mq, &cfg, &root, &db, items, |s| {
+        let out = merge_driver::drive_queue(&mq, cfg, &root, &db, items, |s| {
             send(DriveMsg::Step {
                 worktree: s.worktree.to_string(),
                 branch: s.branch.to_string(),
@@ -173,7 +195,7 @@ pub(crate) fn spawn_drive(
             });
         });
         send(DriveMsg::Done(out));
-    });
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1127,6 +1149,58 @@ fn land_ready(cfg: &thegn_core::config::Config, wt: &str) -> DriveMsg {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// THE-515 fixture: a real git repo named `acme` plus an isolated state
+    /// dir, and a config whose trusted overlay for it is ambiguous.
+    fn refused_acme() -> (
+        crate::testenv::EnvVarGuard,
+        tempfile::TempDir,
+        std::path::PathBuf,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        let env = crate::testenv::EnvVarGuard::set(&[("XDG_STATE_HOME", state.to_str().unwrap())]);
+        let repo = dir.path().join("acme");
+        std::fs::create_dir_all(&repo).unwrap();
+        #[expect(clippy::disallowed_methods)]
+        let ok = thegn_core::util::git_cmd(&repo)
+            .args(["init", "-q"])
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok);
+        (env, dir, repo)
+    }
+
+    #[test]
+    fn drain_refuses_an_ambiguous_overlay_before_any_gate() {
+        let (_env, _dir, repo) = refused_acme();
+        let mut cfg = Config::default();
+        cfg.merge_queue.enabled = true;
+        cfg.workspace.insert("acme".into(), Default::default());
+        cfg.workspace.insert("ACME".into(), Default::default());
+        let sent = std::cell::RefCell::new(Vec::new());
+        drive_blocking(&cfg, &repo, |m| sent.borrow_mut().push(m));
+        let sent = sent.into_inner();
+        assert_eq!(sent.len(), 1);
+        assert!(matches!(&sent[0], DriveMsg::Failed(m) if m.contains("refused")));
+    }
+
+    #[test]
+    fn drain_honours_the_repo_resolved_enabled_flag() {
+        let (_env, _dir, repo) = refused_acme();
+        let mut cfg = Config::default();
+        cfg.merge_queue.enabled = true;
+        let mut ws = thegn_core::config::WorkspaceConfig::default();
+        ws.merge_queue.enabled = Some(false);
+        cfg.workspace.insert("acme".into(), ws);
+        let sent = std::cell::RefCell::new(Vec::new());
+        drive_blocking(&cfg, &repo, |m| sent.borrow_mut().push(m));
+        let sent = sent.into_inner();
+        assert_eq!(sent.len(), 1);
+        assert!(matches!(&sent[0], DriveMsg::Failed(m) if m.contains("disabled")));
+    }
 
     #[test]
     fn failed_fold_summary_never_claims_integration_completed() {

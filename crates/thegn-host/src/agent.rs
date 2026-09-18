@@ -3522,6 +3522,15 @@ pub fn launch_spec_full(
     // account selection is just a bundle with no bundle bound (`compose` folds
     // the legacy per-provider active account when nothing else set it). Local
     // worktrees only — a remote agent runs where the host's cred dirs don't exist.
+    // THE-515: when the trusted overlay that would pin this repo's agent
+    // accounts / env bundle (HOME) is refused, refuse the launch instead of
+    // running it with credentials that block did not choose.
+    if !loc.is_remote()
+        && let Some(db) = db.as_ref()
+        && let Some(slug) = repo_slug(db, &repo_root)
+    {
+        credential_overlay_gate(cfg, db, &slug)?;
+    }
     let resolved = (!loc.is_remote())
         .then_some(db.as_ref())
         .flatten()
@@ -3854,6 +3863,19 @@ fn inject_devshell_host(spec: &mut LaunchSpec, dev: &devenv::Devshell) {
             spec.env.push((key.clone(), value.clone()));
         }
     }
+}
+
+/// Refuse an agent launch whose credential-bearing trusted overlay
+/// (`[project.<key>] accounts` / `env_bundle`) is refused (THE-515). A refused
+/// block without credentials only loses its settings; it does not block.
+pub(crate) fn credential_overlay_gate(cfg: &Config, db: &Db, slug: &str) -> anyhow::Result<()> {
+    if let thegn_core::workspace_overlay::WorkspaceOverlay::Refused(refusal) =
+        cfg.workspace_overlay_for_tab_slug(db, slug)
+        && thegn_core::workspace_overlay::candidates_carry_credentials(&cfg.workspace, slug)
+    {
+        anyhow::bail!("agent launch refused: {refusal}");
+    }
+    Ok(())
 }
 
 /// The persisted slug for a repo root (for per-workspace account defaults), or

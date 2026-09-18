@@ -9979,7 +9979,9 @@ async fn event_loop<T: Terminal>(
             // Typed gitlink reads arrive independently of hydration. Carry the
             // last-known payload across an ordinary model refresh so a failed
             // scan cannot make a submodule row appear clean or textual.
-            let active_repo_root = thegn_core::repo::main_worktree(&active_tab_path(&session));
+            // The session id IS the repo root (pure): no `git rev-parse` on the
+            // loop just to pick the repo's `[git]` overlay (THE-515).
+            let active_repo_root = session.repo_root().map(Path::to_path_buf);
             let active_submodules_enabled = active_repo_root
                 .as_deref()
                 .map(|root| {

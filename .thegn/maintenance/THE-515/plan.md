@@ -232,3 +232,36 @@ key derivation (`repo_name_from_path`) replacing `git rev-parse
 that pass a subdirectory or a symlinked root whose link name differs from the
 target's; (c) the accounts/bundle/editor/keybind consumers still key by the DB
 tab slug (a known hybrid that remains until slice 2, see §4).
+
+## 7. Response to adversarial review of slice 1 (review-the-515-slice1.md)
+
+All eight findings were verified against the code before changing it.
+
+1. **HIGH, in-app Integrate/drain bypass: confirmed, fixed.**
+   - `integrate::fold_active_repo` (the shared UI/off-loop entry) now bails on refusal.
+   - `handlers::merge_queue::spawn_drive`'s body moved into a testable `drive_blocking`, which refuses, and also stops when the repo's own block disabled the queue. The dispatch is armed on the GLOBAL flag.
+   - Tests: `ui_fold_refuses_an_ambiguous_trusted_overlay_without_landing`, `drain_refuses_an_ambiguous_overlay_before_any_gate`, `drain_honours_the_repo_resolved_enabled_flag`, `manual_land_refuses_an_ambiguous_trusted_overlay`.
+2. **HIGH, PR ticker ignores the repo-resolved `enabled`: confirmed, fixed.** This was also a pre-existing bug for a plain per-repo `enabled = false`.
+   - `handlers::pr_queue::drive_blocking` reports a refusal. A repo-disabled queue is a quiet no-op, returning before the DB or the forge is touched.
+   - Tests: `drive_refuses_an_ambiguous_overlay_before_any_forge_work`, `drive_honours_the_repo_resolved_enabled_flag` (asserts no DB was opened).
+3. **WARNING, refusal loosens git / accounts: confirmed, fixed.**
+   - `repo_git` on refusal clamps `submodules=off`, `merge_guard=true`, `override_gpg=false`, `auto_fetch=false`, `auto_fetch_colocated=false`.
+   - Account and bundle refusal now REFUSES: no workspace pointer or global binding stands in. An explicit per-worktree pin (the user's own choice) still applies.
+   - An agent launch is refused when the refused block pins accounts or an env bundle (`agent::credential_overlay_gate`).
+4. **WARNING, synthetic tab slugs: confirmed, fixed without the widening.**
+   - `Config::workspace_overlay_for_tab_slug` consults the `repo_slugs` registry ONLY to refuse: a slug that is not its repository's own normalized key (`repo` fallback, `-N`), or a key shared by several registered repositories, refuses.
+   - The first registration no longer wins `[project.foo]` credentials.
+   - Remaining tab-slug consumers:
+     - The editor-intent path (`ide_handoff::target_from_intent` via sidebar row slugs) still uses `for_key`. The editor overlay selects only a provider enum, not a command or credential. Deferred to slice 2.
+     - `effective_keybinds(slug)` receives a slug only in tests; production passes `None`.
+5. **WARNING, symlink split: partially valid.**
+   - Workspace registration (`workspace_create.rs`) already stores `canonicalize` + `main_worktree` roots, so `Session::repo_root()` for registered workspaces is the git-resolved path and the key matches the old derivation.
+   - The real exposure was the DB `registered.repo_root` in `merge_ops` (THE-73: bookkeeping written by the registrant). Those two off-loop sites now canonicalize before selecting the overlay.
+   - Pre-canonicalization legacy session rows remain a theoretical split. The loop sites stay pure by design (no fs on the loop). Slice 2's `RepositoryId` (canonical common dir) removes the question.
+6. **SUGGESTION, adopted.**
+   - `thegn merge list|rm|clear|conflicts` and `thegn pr-queue list|rm|clear|status` work under refusal, with a warning. Every other verb bails with the refusal text rather than "set enabled = true".
+   - CHANGELOG `[Unreleased]` has a migration note.
+7. **SUGGESTION, adopted.** Dropped hooks use `thegn_core::msg::warn`. Test: `refused_trusted_overlay_contributes_no_lifecycle_hooks`.
+8. **SUGGESTION, adopted.** `run.rs` hydration swap uses `session.repo_root()` instead of `main_worktree` (a git subprocess on the loop).
+
+Test-gap note: `overlay_key_is_pure_…` only shows the path-only derivation matches for roots; purity itself is structural (`legacy_key_for_root` calls no I/O).

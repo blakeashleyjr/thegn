@@ -48,6 +48,20 @@ pub enum OverlayRefusal {
     /// The only candidate block is spelled `key`, which is not in normalized
     /// form; it must be renamed to `canonical` to take effect.
     NonCanonicalKey { key: String, canonical: String },
+    /// A tab-namespace slug that is not the repository's own key: the `repo`
+    /// fallback for a nameless repository, or a `-N` collision suffix. Such a
+    /// slug never selects the block that happens to share its spelling.
+    SyntheticTabSlug { slug: String, repository: String },
+    /// Several registered repositories share the legacy key, so the block
+    /// cannot tell them apart until it is bound to a canonical repository
+    /// identity. `repositories` is sorted.
+    AmbiguousRepositories {
+        key: String,
+        repositories: Vec<String>,
+    },
+    /// The registered-repository index could not be read; refuse rather than
+    /// guess.
+    RegistryUnavailable { key: String },
 }
 
 impl fmt::Display for OverlayRefusal {
@@ -67,6 +81,21 @@ impl fmt::Display for OverlayRefusal {
                 f,
                 "trusted [project.{key}] overlay refused: key is not in normalized form; \
                  rename the block to `{canonical}`"
+            ),
+            Self::SyntheticTabSlug { slug, repository } => write!(
+                f,
+                "trusted [project.{slug}] overlay refused for {repository}: `{slug}` is a \
+                 generated tab name, not that repository's own key"
+            ),
+            Self::AmbiguousRepositories { key, repositories } => write!(
+                f,
+                "trusted [project.{key}] overlay refused: registered repositories {} all map to \
+                 `{key}`; remove the duplicate registration or rename a checkout",
+                repositories.join(", ")
+            ),
+            Self::RegistryUnavailable { key } => write!(
+                f,
+                "trusted [project.{key}] overlay refused: the repository registry is unavailable"
             ),
         }
     }
@@ -169,6 +198,49 @@ pub fn refusal(table: &OverlayTable, key: &str) -> Option<OverlayRefusal> {
         }),
         _ => Some(OverlayRefusal::AliasCollision { key, aliases }),
     }
+}
+
+/// Extra refusal for a TAB-namespace slug (`repo_slugs`), given every
+/// registered `(repo_path, slug)` row. Refuses — never grants — when the slug
+/// is not the repository's own legacy key (`repo` fallback, `-N` suffix), or
+/// when another registered repository derives the same key. A slug with no
+/// registered row adds nothing.
+pub fn tab_slug_refusal(slug: &str, rows: &[(String, String)]) -> Option<OverlayRefusal> {
+    let (path, _) = rows.iter().find(|(_, s)| s == slug)?;
+    // Compare normalized forms: a registry row may hold the raw basename
+    // (`My.Repo`), which is that repository's own key once normalized.
+    let key = legacy_key_for_name(slug);
+    let own = legacy_key_for_root(Path::new(path));
+    if key.is_none() || own != key {
+        return Some(OverlayRefusal::SyntheticTabSlug {
+            slug: slug.to_string(),
+            repository: path.clone(),
+        });
+    }
+    let mut repositories: Vec<String> = rows
+        .iter()
+        .filter(|(p, _)| legacy_key_for_root(Path::new(p)) == key)
+        .map(|(p, _)| p.clone())
+        .collect();
+    repositories.sort();
+    repositories.dedup();
+    (repositories.len() > 1).then(|| OverlayRefusal::AmbiguousRepositories {
+        key: key.unwrap_or_default(),
+        repositories,
+    })
+}
+
+/// Whether any block that normalizes to `key` carries credential authority
+/// (agent accounts or an env bundle / HOME). Used to refuse a launch outright
+/// rather than run it with credentials the trusted block did not pin.
+pub fn candidates_carry_credentials(table: &OverlayTable, key: &str) -> bool {
+    let Some(key) = legacy_key_for_name(key) else {
+        return false;
+    };
+    table
+        .iter()
+        .filter(|(k, _)| crate::util::slugify(k) == key)
+        .any(|(_, ws)| !ws.accounts.is_empty() || ws.env_bundle.is_some())
 }
 
 /// Global validation of the overlay table: every key must be a non-empty,
@@ -289,6 +361,56 @@ mod tests {
             message.contains("rename the block to `my-repo`"),
             "{message}"
         );
+    }
+
+    fn rows(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(p, s)| (p.to_string(), s.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn synthetic_and_shared_tab_slugs_are_refused() {
+        // A nameless repository's `repo` fallback.
+        let r = rows(&[("/src/日本語", "repo"), ("/src/repo", "repo-2")]);
+        assert!(matches!(
+            tab_slug_refusal("repo", &r),
+            Some(OverlayRefusal::SyntheticTabSlug { .. })
+        ));
+        // A `-N` suffix is not the second repository's key...
+        let r = rows(&[("/a/foo", "foo"), ("/b/foo", "foo-2")]);
+        assert!(matches!(
+            tab_slug_refusal("foo-2", &r),
+            Some(OverlayRefusal::SyntheticTabSlug { .. })
+        ));
+        // ...and the first registration does not win the shared key either.
+        match tab_slug_refusal("foo", &r) {
+            Some(OverlayRefusal::AmbiguousRepositories { repositories, .. }) => {
+                assert_eq!(
+                    repositories,
+                    vec!["/a/foo".to_string(), "/b/foo".to_string()]
+                );
+            }
+            other => panic!("expected ambiguity, got {other:?}"),
+        }
+        // A unique, own-key slug and an unregistered slug add nothing.
+        let r = rows(&[("/a/foo", "foo"), ("/b/app-2", "app-2")]);
+        assert_eq!(tab_slug_refusal("foo", &r), None);
+        assert_eq!(tab_slug_refusal("app-2", &r), None);
+        assert_eq!(tab_slug_refusal("other", &r), None);
+        // A raw-basename registry slug is the repository's own key.
+        let r = rows(&[("/a/My.Repo", "My.Repo")]);
+        assert_eq!(tab_slug_refusal("My.Repo", &r), None);
+    }
+
+    #[test]
+    fn credential_carrying_candidates_are_detected_across_aliases() {
+        let mut t = table(&["foo", "FOO", "bar"]);
+        assert!(!candidates_carry_credentials(&t, "foo"));
+        t.get_mut("FOO").unwrap().env_bundle = Some("work".into());
+        assert!(candidates_carry_credentials(&t, "foo"));
+        assert!(!candidates_carry_credentials(&t, "bar"));
     }
 
     #[test]

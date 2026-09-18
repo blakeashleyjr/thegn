@@ -289,7 +289,12 @@ pub fn resolve(cfg: &Config, repo_root: &Path, db: Option<&Db>) -> ResolvedHooks
     // contributes no hooks (fail closed: trusted hooks are extra execution).
     let overlay = cfg.workspace_overlay(repo_root);
     if let Some(refusal) = overlay.refusal() {
-        tracing::warn!(repo = %repo_root.display(), "{refusal}");
+        // Visible without THEGN_LOG: the user's trusted hooks are being
+        // skipped, which they must be told about.
+        thegn_core::msg::warn(&format!(
+            "{}: lifecycle hooks from the trusted overlay skipped — {refusal}",
+            repo_root.display()
+        ));
     }
     thegn_core::hooks::resolve(
         &cfg.hooks,
@@ -1484,6 +1489,34 @@ fn report_log_failure(context: &HookContext, result: &crate::hook_run::HookRunRe
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refused_trusted_overlay_contributes_no_lifecycle_hooks() {
+        // THE-515: `[project.acme]` + `[project.ACME]` is ambiguous — neither
+        // block's hooks run; a unique block's hooks do.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("acme");
+        std::fs::create_dir(&root).unwrap();
+        let mut cfg = Config::default();
+        let mut ws = thegn_core::config::WorkspaceConfig::default();
+        ws.hooks.post_create = vec![thegn_core::hooks::HookEntry::Command("echo trusted".into())];
+        cfg.workspace.insert("acme".into(), ws);
+        assert_eq!(
+            resolve(&cfg, &root, None)
+                .entries(HookEvent::PostCreate)
+                .len(),
+            1
+        );
+        cfg.workspace.insert(
+            "ACME".into(),
+            thegn_core::config::WorkspaceConfig::default(),
+        );
+        assert!(
+            resolve(&cfg, &root, None)
+                .entries(HookEvent::PostCreate)
+                .is_empty()
+        );
+    }
 
     #[test]
     fn physical_claims_cover_aliases_and_release_captured_deleted_identity() {

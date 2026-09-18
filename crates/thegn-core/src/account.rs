@@ -263,13 +263,15 @@ pub fn active_name(
     if let Some(slug) = slug {
         // THE-515: the trusted overlay is selected by the one refusing
         // resolver. `slug` is still the tab namespace until RepositoryId
-        // binding lands; an ambiguous key selects no account.
-        if let Some(n) = cfg
-            .workspace_overlay_for_key(slug)
-            .overlay()
-            .and_then(|w| w.accounts.get(provider_id))
-        {
-            return Some(n.clone());
+        // binding lands. A refused overlay REFUSES: no workspace pointer and
+        // no global account stand in for the block the user pinned.
+        match cfg.workspace_overlay_for_tab_slug(db, slug) {
+            crate::workspace_overlay::WorkspaceOverlay::Refused(_) => return None,
+            overlay => {
+                if let Some(n) = overlay.overlay().and_then(|w| w.accounts.get(provider_id)) {
+                    return Some(n.clone());
+                }
+            }
         }
         if let Some(n) = db
             .get_ui_state(&scope_ws(provider_id, slug), "active")
@@ -431,6 +433,51 @@ mod tests {
             account_dir(&cfg, &db, "codex", "db-only"),
             Some(PathBuf::from("/var/creds"))
         );
+    }
+
+    #[test]
+    fn refused_overlay_refuses_the_account_instead_of_falling_back() {
+        // THE-515 #3/#4: two registered checkouts named `foo`; the first
+        // registration must not win `[project.foo]`, and the global / pointer
+        // accounts must not stand in for the refused block.
+        let db = Db::open_memory().unwrap();
+        db.slug_for_repo("/a/foo", "foo").unwrap();
+        db.slug_for_repo("/b/foo", "foo").unwrap();
+        let mut cfg = Config::default();
+        cfg.workspace
+            .entry("foo".into())
+            .or_default()
+            .accounts
+            .insert("codex".into(), "work".into());
+        set_active(&db, Bind::Global, "/wt", Some("foo"), "codex", "g").unwrap();
+        set_active(&db, Bind::Workspace, "/wt", Some("foo"), "codex", "wsp").unwrap();
+        assert_eq!(active_name(&cfg, &db, "/wt", Some("foo"), "codex"), None);
+        // The `-2` tab slug never selects a block spelled like it.
+        cfg.workspace
+            .entry("foo-2".into())
+            .or_default()
+            .accounts
+            .insert("codex".into(), "other".into());
+        assert_eq!(active_name(&cfg, &db, "/wt2", Some("foo-2"), "codex"), None);
+        // An explicit per-worktree pin is the user's own choice and stays.
+        set_active(&db, Bind::Worktree, "/wt", Some("foo"), "codex", "pinned").unwrap();
+        assert_eq!(
+            active_name(&cfg, &db, "/wt", Some("foo"), "codex").as_deref(),
+            Some("pinned")
+        );
+    }
+
+    #[test]
+    fn nameless_repository_does_not_get_the_repo_block_via_its_tab_slug() {
+        let db = Db::open_memory().unwrap();
+        assert_eq!(db.slug_for_repo("/src/日本語", "repo").unwrap(), "repo");
+        let mut cfg = Config::default();
+        cfg.workspace
+            .entry("repo".into())
+            .or_default()
+            .accounts
+            .insert("codex".into(), "work".into());
+        assert_eq!(active_name(&cfg, &db, "/wt", Some("repo"), "codex"), None);
     }
 
     #[test]
