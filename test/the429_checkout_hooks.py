@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+import shlex
 import hashlib
 import shutil
 import subprocess
@@ -41,6 +42,18 @@ def detector(repo: Path, env: dict[str, str]) -> str:
     if result.returncode != 0:
         raise AssertionError(result.stderr)
     return result.stderr
+
+
+def shell_entry(repo: Path, env: dict[str, str]) -> str:
+    # Execute the actual hookExtras body, substituting only the two immutable
+    # Nix store references. This detects an installer reintroduced beside the
+    # detector, which invoking the detector alone would miss.
+    flake = (ROOT / "flake.nix").read_text()
+    body = flake.split("      hookExtras = ''\n", 1)[1].split("\n      '';", 1)[0]
+    body = body.replace("${pkgs.python3}/bin/python3", shlex.quote(sys.executable))
+    body = body.replace("${./nix/detect-legacy-post-checkout.py}", shlex.quote(str(DETECTOR)))
+    body = body.replace("''${", "${")
+    return run("sh", "-c", body, cwd=repo, env={**env, "CI": ""}).stderr
 
 
 def fake_git(sandbox: Path, mode: str) -> dict[str, str]:
@@ -156,6 +169,9 @@ def main() -> int:
         git("config", "user.name", "THE-429 fixture", cwd=repo, env=env)
         (repo / ".gitignore").write_text(".pre-commit-config.yaml\n")
         (repo / "README").write_text("base\n")
+        (repo / "test/git-hooks").mkdir(parents=True)
+        (repo / "test/git-hooks/post-checkout.sh").write_bytes(legacy)
+        (repo / "test/git-hooks/heal-worktree.sh").write_text("#!/bin/sh\nexit 0\n")
         git("add", ".", cwd=repo, env=env)
         git("commit", "-qm", "base", cwd=repo, env=env)
         git("branch", "-M", "main", cwd=repo, env=env)
@@ -163,17 +179,15 @@ def main() -> int:
         # This is the same immutable helper invoked by hookExtras in flake.nix.
         # Run it before creating or entering the hostile branch so the fixture
         # exercises the actual shell-entry setup seam, not only a source check.
-        assert "no legacy post-checkout hook" in detector(repo, env)
+        assert "no legacy post-checkout hook" in shell_entry(repo, env)
 
         sentinel = sandbox / "sentinel"
-        legacy_sentinel = sandbox / "legacy-sentinel"
         payload = (
             "#!/bin/sh\n"
-            f"printf '%s\\n' branch-payload >> {legacy_sentinel}\n"
+            f"printf '%s\\n' branch-payload >> {sentinel}\n"
             "exit 0\n"
         )
         git("checkout", "-qb", "hostile", cwd=repo, env=env)
-        (repo / "test/git-hooks").mkdir(parents=True)
         (repo / "test/git-hooks/post-checkout.sh").write_text(payload)
         (repo / "test/git-hooks/heal-worktree.sh").write_text(payload)
         os.chmod(repo / "test/git-hooks/post-checkout.sh", 0o755)
@@ -191,7 +205,8 @@ def main() -> int:
         legacy_candidate.write_bytes(legacy)
         os.chmod(legacy_candidate, 0o755)
         git("checkout", "-q", "-b", "hostile", "origin/hostile", cwd=legacy_repo, env=env)
-        assert legacy_sentinel.exists(), "historical hook probe did not reach branch payload"
+        assert sentinel.exists(), "historical hook probe did not reach branch payload"
+        sentinel.unlink()
 
         # These are the real Git checkout/worktree operations that used to fire
         # the installed shared post-checkout hook. The current shell-entry seam
@@ -209,6 +224,22 @@ def main() -> int:
         assert not sentinel.exists(), "a branch-controlled checkout payload ran"
         assert (worktree / ".pre-commit-config.yaml").read_bytes() == before_config
         assert metadata(worktree / ".pre-commit-config.yaml") == before_config_meta
+
+        binary = os.environ.get("THEGN_TEST_BINARY")
+        if binary:
+            native_env = {**env, "XDG_STATE_HOME": str(sandbox / "state"),
+                          "XDG_RUNTIME_DIR": str(sandbox / "run"), "THEGN_CHANNEL": "dev"}
+            for key in ["THEGN_WORKTREE", "THEGN_PROFILE", "THEGN_CONFIG"]:
+                native_env.pop(key, None)
+            Path(native_env["XDG_RUNTIME_DIR"]).mkdir(mode=0o700)
+            cfg = sandbox / "native.toml"
+            cfg.write_text('worktrees_dir = ' + repr(str(sandbox / "native-worktrees")) + '\n')
+            run(binary, "--config", str(cfg), "wt", "new", "native-hook-fixture",
+                "--repo", str(repo), "--base", "hostile", "--json", cwd=repo, env=native_env)
+            assert not sentinel.exists(), "native worktree creation ran candidate checkout code"
+            print("THE-429 native worktree fixture: ok")
+        else:
+            print("THE-429 native worktree fixture: not run (set THEGN_TEST_BINARY)")
 
         hooks = repo / ".git/hooks"
         candidate = hooks / "post-checkout"
