@@ -8272,6 +8272,7 @@ dependencies = [
  "tree-sitter-typescript",
  "unic-langid",
  "unicode-width 0.2.2",
+ "url",
  "walkdir",
  "windows-sys 0.59.0",
 ]
