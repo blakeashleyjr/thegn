@@ -202,7 +202,7 @@ fn identity_reaper() -> Result<&'static mpsc::SyncSender<IdentityReapJob>, Strin
     static REAPER: OnceLock<Result<mpsc::SyncSender<IdentityReapJob>, String>> = OnceLock::new();
     REAPER
         .get_or_init(|| {
-            let (sender, receiver) = mpsc::sync_channel(IDENTITY_CAPTURE_SLOTS);
+            let (sender, receiver) = mpsc::sync_channel::<IdentityReapJob>(IDENTITY_CAPTURE_SLOTS);
             std::thread::Builder::new()
                 .name("thegn-git-identity-reaper".into())
                 .spawn(move || {
@@ -315,22 +315,29 @@ fn bounded_stdout_with(
         return Err(error.to_string());
     }
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
-    let mut captured = None;
-    let status = loop {
-        if captured.is_none() {
-            if let Ok(result) = receiver.try_recv() {
-                if result.as_ref().is_ok_and(|bytes| bytes.len() > max_bytes) {
-                    kill_identity_process_tree(&mut child);
-                    reap_identity_later(child, budget.clone());
-                    return Err("git identity probe output exceeded its bound".into());
-                }
-                captured = Some(result);
-            }
+    // Do not reap the leader while its stdout is still held. try_wait(Some)
+    // reaps on Unix: signaling its numeric process group after that could kill
+    // an unrelated reused PID. Waiting for bounded pipe completion first keeps
+    // the leader (including a zombie) owned until every possible group signal.
+    let captured =
+        receiver.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()));
+    let bytes = match captured {
+        Ok(Ok(bytes)) if bytes.len() <= max_bytes => bytes,
+        other => {
+            kill_identity_process_tree(&mut child);
+            reap_identity_later(child, budget.clone());
+            return Err(match other {
+                Ok(Ok(_)) => "git identity probe output exceeded its bound".into(),
+                Ok(Err(error)) => error.to_string(),
+                Err(_) => "git identity probe stdout reader exceeded its time bound".into(),
+            });
         }
+    };
+    let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) if std::time::Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(10))
+                std::thread::sleep(Duration::from_millis(10));
             }
             Ok(None) => {
                 kill_identity_process_tree(&mut child);
@@ -338,44 +345,12 @@ fn bounded_stdout_with(
                 return Err("git identity probe exceeded its time bound".into());
             }
             Err(error) => {
+                // Ownership is uncertain: never signal a numeric PID here.
                 reap_identity_later(child, budget.clone());
                 return Err(error.to_string());
             }
         }
     };
-    let result = match captured.or_else(|| {
-        receiver
-            .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
-            .ok()
-    }) {
-        Some(result) => result,
-        None => {
-            // The leader has exited but a descendant may still own the pipe.
-            // Kill while the unreaped leader still proves process-group
-            // ownership, then transfer the direct child to the shared reaper.
-            kill_identity_process_tree(&mut child);
-            reap_identity_later(child, budget.clone());
-            return Err("git identity probe stdout reader exceeded its time bound".into());
-        }
-    };
-    let bytes = match result {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            reap_identity_later(child, budget.clone());
-            return Err(error.to_string());
-        }
-    };
-    if bytes.len() > max_bytes {
-        // The child is already known to have exited, but it remains unreaped;
-        // cleanup is still done while ownership is explicit.
-        kill_identity_process_tree(&mut child);
-        reap_identity_later(child, budget.clone());
-        return Err("git identity probe output exceeded its bound".into());
-    }
-    if let Err(error) = child.wait() {
-        reap_identity_later(child, budget.clone());
-        return Err(error.to_string());
-    }
     if !status.success() {
         return Err(format!("git exited with {status}"));
     }
@@ -450,7 +425,7 @@ impl GitAdminInstanceStamp {
 /// can be reused after delete/recreate. Platforms/filesystems without a
 /// creation identity fail closed.
 pub(crate) fn git_admin_instance_stamp(path: &Path) -> Option<GitAdminInstanceStamp> {
-    use std::hash::Hash as _;
+    use std::hash::{Hash as _, Hasher as _};
 
     let handle = same_file::Handle::from_path(path).ok()?;
     let created = handle.as_file().metadata().ok()?.created().ok()?;
@@ -478,6 +453,10 @@ impl std::hash::Hasher for IdentityStampHasher {
 
     fn write(&mut self, bytes: &[u8]) {
         self.bytes.extend_from_slice(bytes);
+    }
+
+    fn write_u32(&mut self, value: u32) {
+        self.bytes.extend_from_slice(&value.to_be_bytes());
     }
 
     fn write_u64(&mut self, value: u64) {
@@ -1509,9 +1488,22 @@ mod tests {
         command.args(["-c", "sleep 1"]);
         let error = bounded_stdout_with(command, 32, refuse_reader).unwrap_err();
         assert!(error.contains("injected reader setup refusal"));
-        // A setup failure must not release the slot until the owned child has
-        // actually been reaped by the bounded shared queue.
-        assert!(identity_capture_budget().is_err());
+        // Reaping races with this return. Poll for reclamation without assuming
+        // a single failed capture fills both slots or that the reaper is slow.
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let first = identity_capture_budget();
+            let second = identity_capture_budget();
+            if first.is_ok() && second.is_ok() {
+                break;
+            }
+            drop((first, second));
+            assert!(
+                std::time::Instant::now() < deadline,
+                "setup failure leaked capacity"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[test]
