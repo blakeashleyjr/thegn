@@ -231,7 +231,13 @@ mod tests {
                 provider: *k,
                 ..Default::default()
             };
-            let built = crate::calendar::backend_from_account(&a).is_some();
+            let built = crate::calendar::backend_from_account(
+                &a,
+                crate::calendar::AccountAdmission::isolated(
+                    thegn_core::calendar::AdmissionBudget::default(),
+                ),
+            )
+            .is_some();
             assert_eq!(
                 built,
                 *k != CalendarProviderKind::None && !k.is_reserved(),

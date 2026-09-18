@@ -8,12 +8,15 @@
 //! A thin shell over [`thegn_core::calendar::parse_ics`] — the parsing itself
 //! is pure and lives in core, under the coverage gate.
 
+use std::io::Read;
+
 use chrono::NaiveDate;
 use futures_util::future::BoxFuture;
-use thegn_core::calendar::CalEvent;
+use thegn_core::calendar::admission::{AdmissionLimit, MAX_SOURCE_DOCUMENT_BYTES};
+use thegn_core::calendar::{AdmissionError, AdmissionMeter, CalEvent};
 use thegn_core::config_calendar::CalendarAccount;
 
-use super::{CalendarBackend, CalendarCaps, CalendarError, EventPage};
+use super::{AccountAdmission, CalendarBackend, CalendarCaps, CalendarError, EventPage};
 
 /// Cap on files read from a vdir, so a runaway directory can't stall a sync.
 const MAX_FILES: usize = 20_000;
@@ -22,15 +25,24 @@ pub struct IcsBackend {
     path: String,
     /// Zone for floating times that name no `TZID`.
     zone: String,
-    max_events: usize,
+    admission: AccountAdmission,
+}
+
+/// Why one file could not be read.
+enum ReadFailure {
+    /// Unreadable or not UTF-8 — a vdir skips it.
+    Io(std::io::Error),
+    /// Over the admission budget — never skipped, or the calendar would look
+    /// complete without it.
+    Admission(AdmissionError),
 }
 
 impl IcsBackend {
-    pub fn new(a: &CalendarAccount) -> Self {
+    pub fn new(a: &CalendarAccount, admission: AccountAdmission) -> Self {
         IcsBackend {
             path: thegn_core::util::expand_tilde(&a.path),
             zone: String::new(),
-            max_events: 0,
+            admission,
         }
     }
 
@@ -40,12 +52,50 @@ impl IcsBackend {
         self
     }
 
-    pub fn with_max_events(mut self, n: usize) -> Self {
-        self.max_events = n;
-        self
+    /// Read one file under the document budget, reserving it as transient
+    /// before its bytes are allocated, then parse it into `out`.
+    fn read_one(
+        path: &std::path::Path,
+        zone: &str,
+        meter: &mut AdmissionMeter,
+        out: &mut Vec<CalEvent>,
+    ) -> Result<(), ReadFailure> {
+        let file = std::fs::File::open(path).map_err(ReadFailure::Io)?;
+        let declared = file.metadata().map_err(ReadFailure::Io)?.len();
+        let declared = usize::try_from(declared).unwrap_or(usize::MAX);
+        if declared > MAX_SOURCE_DOCUMENT_BYTES {
+            return Err(ReadFailure::Admission(AdmissionError::new(
+                AdmissionLimit::DocumentBytes,
+            )));
+        }
+        // Reserve the file as declared; a file that grows while being read is
+        // still stopped at the document cap by `take`.
+        meter
+            .reserve_transient(MAX_SOURCE_DOCUMENT_BYTES)
+            .map_err(ReadFailure::Admission)?;
+        let mut body = Vec::with_capacity(declared);
+        let read = file
+            .take(MAX_SOURCE_DOCUMENT_BYTES as u64 + 1)
+            .read_to_end(&mut body);
+        let result = match read {
+            Err(e) => Err(ReadFailure::Io(e)),
+            Ok(n) if n > MAX_SOURCE_DOCUMENT_BYTES => Err(ReadFailure::Admission(
+                AdmissionError::new(AdmissionLimit::DocumentBytes),
+            )),
+            Ok(_) => match String::from_utf8(body) {
+                Err(e) => Err(ReadFailure::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    e.utf8_error(),
+                ))),
+                Ok(text) => thegn_core::calendar::parse_ics_admitted(&text, zone, meter, out)
+                    .map_err(ReadFailure::Admission),
+            },
+        };
+        meter.release_transient(MAX_SOURCE_DOCUMENT_BYTES);
+        result
     }
 
-    fn read_all(&self) -> Result<Vec<CalEvent>, CalendarError> {
+    fn read_all(&self) -> Result<EventPage, CalendarError> {
         let p = std::path::Path::new(&self.path);
         if !p.exists() {
             // A missing file is configuration, not a blip — see
@@ -57,31 +107,40 @@ impl IcsBackend {
         } else {
             &self.zone
         };
+        let mut meter = self.admission.meter();
+        let mut out = Vec::new();
         if p.is_file() {
-            let body = std::fs::read_to_string(p)
-                .map_err(|e| CalendarError::Io(format!("{}: {e}", self.path)))?;
-            return Ok(thegn_core::calendar::parse_ics(&body, zone));
+            match Self::read_one(p, zone, &mut meter, &mut out) {
+                Ok(()) => {}
+                Err(ReadFailure::Io(e)) => {
+                    return Err(CalendarError::Io(format!("{}: {e}", self.path)));
+                }
+                Err(ReadFailure::Admission(e)) => return Err(e.into()),
+            }
+            return EventPage::from_meter(meter, out, Vec::new(), String::new());
         }
         let entries =
             std::fs::read_dir(p).map_err(|e| CalendarError::Io(format!("{}: {e}", self.path)))?;
-        let mut out = Vec::new();
         for entry in entries.flatten().take(MAX_FILES) {
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) != Some("ics") {
                 continue;
             }
-            // One unreadable file in a vdir must not lose the other hundred.
-            match std::fs::read_to_string(&path) {
-                Ok(body) => out.extend(thegn_core::calendar::parse_ics(&body, zone)),
-                Err(e) => tracing::debug!(
+            match Self::read_one(&path, zone, &mut meter, &mut out) {
+                Ok(()) => {}
+                // One unreadable file in a vdir must not lose the other hundred.
+                Err(ReadFailure::Io(e)) => tracing::debug!(
                     target: "thegn::calendar",
                     file = %path.display(),
                     error = %e,
                     "skipping unreadable .ics"
                 ),
+                // But an over-budget one stops the whole fetch: publishing the
+                // rest would present a partial calendar as complete.
+                Err(ReadFailure::Admission(e)) => return Err(e.into()),
             }
         }
-        Ok(out)
+        EventPage::from_meter(meter, out, Vec::new(), String::new())
     }
 }
 
@@ -103,17 +162,9 @@ impl CalendarBackend for IcsBackend {
         Box::pin(async move {
             // Deliberately returns everything rather than pre-filtering by the
             // window: recurrence masters can sit far outside it and still produce
-            // occurrences inside, so the host expands and filters.
-            let mut events = self.read_all()?;
-            let partial = self.max_events > 0 && events.len() > self.max_events;
-            if partial {
-                events.truncate(self.max_events);
-            }
-            Ok(EventPage {
-                events,
-                partial,
-                ..Default::default()
-            })
+            // occurrences inside, so the host expands and filters. The account's
+            // admission budget bounds how much "everything" can be.
+            self.read_all()
         })
     }
 }

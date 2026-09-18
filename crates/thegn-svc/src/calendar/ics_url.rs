@@ -14,12 +14,16 @@ use chrono::NaiveDate;
 use futures_util::future::BoxFuture;
 use thegn_core::config_calendar::CalendarAccount;
 
-use super::{CalendarBackend, CalendarCaps, CalendarError, EventPage};
+use super::{AccountAdmission, CalendarBackend, CalendarCaps, CalendarError, EventPage};
 use crate::http::{
-    CalendarHttpClient, CalendarHttpError, ExpectedMedia, MAX_REQUEST_BYTES, bounded_header_value,
-    discard_body, map_error, read_body, validate_encoding, validate_media,
+    CalendarHttpClient, CalendarHttpError, ExpectedMedia, MAX_BODY_BYTES, MAX_REQUEST_BYTES,
+    bounded_header_value, discard_body, map_error, read_body, validate_encoding, validate_media,
 };
 use tokio::time::Instant;
+
+// The transient reservation a remote fetch takes is the transport's body cap;
+// the admission layer's document ceiling must cover it.
+const _: () = assert!(MAX_BODY_BYTES <= thegn_core::calendar::admission::MAX_SOURCE_DOCUMENT_BYTES);
 
 pub(super) fn map_transport_error(error: CalendarHttpError) -> CalendarError {
     match error {
@@ -35,13 +39,13 @@ pub struct IcsUrlBackend {
     token: String,
     zone: String,
     timeout: Duration,
-    max_events: usize,
+    admission: AccountAdmission,
     http: Option<CalendarHttpClient>,
     init_error: Option<CalendarHttpError>,
 }
 
 impl IcsUrlBackend {
-    pub fn new(a: &CalendarAccount) -> Self {
+    pub fn new(a: &CalendarAccount, admission: AccountAdmission) -> Self {
         let configured = !a.url.trim().is_empty();
         let (http, init_error) = if !configured {
             (None, None)
@@ -59,7 +63,7 @@ impl IcsUrlBackend {
             token: thegn_core::config::expand_env_ref(&a.token).unwrap_or_default(),
             zone: String::new(),
             timeout: Duration::from_secs(a.timeout_secs.clamp(5, 120)),
-            max_events: 0,
+            admission,
             http,
             init_error,
         }
@@ -67,11 +71,6 @@ impl IcsUrlBackend {
 
     pub fn with_zone(mut self, zone: &str) -> Self {
         self.zone = zone.to_string();
-        self
-    }
-
-    pub fn with_max_events(mut self, n: usize) -> Self {
-        self.max_events = n;
         self
     }
 }
@@ -106,6 +105,11 @@ impl CalendarBackend for IcsUrlBackend {
                 return Err(CalendarError::BodyLimit("calendar validator exceeds limit"));
             }
             let http = self.http.as_ref().expect("checked above");
+            // Reserve the largest body the transport will accept before asking
+            // for it, so concurrent fetches can't jointly exceed the shared
+            // budget. Refusal is immediate and typed; nothing is sent.
+            let mut meter = self.admission.meter();
+            meter.reserve_transient(MAX_BODY_BYTES)?;
             let mut req = http.request(reqwest::Method::GET);
             if !sync_token.is_empty() {
                 req = req.header(reqwest::header::IF_NONE_MATCH, sync_token);
@@ -138,11 +142,7 @@ impl CalendarBackend for IcsUrlBackend {
                 // Nothing changed. Return the SAME token and `unchanged`, so the
                 // caller leaves the cache exactly as it is rather than reading an
                 // empty page as "the calendar was emptied".
-                return Ok(EventPage {
-                    sync_token: sync_token.to_string(),
-                    unchanged: true,
-                    ..Default::default()
-                });
+                return Ok(EventPage::unchanged(sync_token));
             }
             if resp.status() == reqwest::StatusCode::UNAUTHORIZED
                 || resp.status() == reqwest::StatusCode::FORBIDDEN
@@ -172,6 +172,8 @@ impl CalendarBackend for IcsUrlBackend {
                     CalendarHttpError::Timeout => CalendarError::Timeout(map_error(error)),
                     other => CalendarError::Network(map_error(other).into()),
                 })?;
+            // Shrink the reservation to the buffer actually allocated.
+            meter.release_transient(MAX_BODY_BYTES - body.capacity().min(MAX_BODY_BYTES));
             let body = String::from_utf8(body)
                 .map_err(|_| CalendarError::Parse("calendar response is not UTF-8".into()))?;
             let zone = if self.zone.is_empty() {
@@ -179,17 +181,13 @@ impl CalendarBackend for IcsUrlBackend {
             } else {
                 &self.zone
             };
-            let mut events = thegn_core::calendar::parse_ics(&body, zone);
-            let partial = self.max_events > 0 && events.len() > self.max_events;
-            if partial {
-                events.truncate(self.max_events);
-            }
-            Ok(EventPage {
-                events,
-                sync_token: etag,
-                partial,
-                ..Default::default()
-            })
+            // Admission happens while parsing: the first event or byte over
+            // the budget refuses the whole fetch, the ETag is not advanced,
+            // and the cached calendar stays as it was.
+            let mut events = Vec::new();
+            thegn_core::calendar::parse_ics_admitted(&body, zone, &mut meter, &mut events)?;
+            drop(body);
+            EventPage::from_meter(meter, events, Vec::new(), etag)
         })
     }
 }

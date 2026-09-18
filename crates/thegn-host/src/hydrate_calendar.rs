@@ -180,9 +180,10 @@ fn sync_accounts(
         return false;
     };
 
-    let results = rt.block_on(router.list_events(from, to, &tokens));
+    // Each account's page is applied and dropped inside the sink, releasing its
+    // share of the global admission budget before the next account is fetched.
     let mut changed = false;
-    for r in results {
+    rt.block_on(router.list_events_each(from, to, &tokens, |r| {
         let page = match r.result {
             Ok(p) => {
                 thegn_core::connectivity::report_success();
@@ -192,8 +193,10 @@ fn sync_accounts(
                 if e.is_transient() {
                     thegn_core::connectivity::report_failure();
                 }
-                // Rule 3: record the failure, touch nothing else. Log the
-                // account NAME only — `token` and `url` are both secrets, and a
+                // Rule 3: record the failure, touch nothing else — this is also
+                // how an over-budget source is reported: its previous cache
+                // and cursor stay, and `last_error` says why. Log the account
+                // NAME only — `token` and `url` are both secrets, and a
                 // subscribed ICS URL *is* a credential.
                 tracing::warn!(
                     target: "thegn::calendar",
@@ -203,13 +206,13 @@ fn sync_accounts(
                     "calendar sync failed — keeping the cached events"
                 );
                 let _ = db.set_calendar_error(&r.account, &e.to_string()); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
-                continue;
+                return;
             }
         };
         if apply_page(db, &r.account, r.provider, &page, from, to) {
             changed = true;
         }
-    }
+    }));
     changed
 }
 
@@ -226,19 +229,17 @@ fn apply_page(
 
     // A conditional fetch that came back 304: nothing to write, but the sync
     // stamp must still advance or we would re-hit the provider every tick.
-    if page.unchanged {
-        let _ = db.put_calendar_sync(account, provider, &page.sync_token, from_ms, to_ms); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+    if page.is_unchanged() {
+        let _ = db.put_calendar_sync(account, provider, page.sync_token(), from_ms, to_ms); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
         return false;
     }
 
-    let incremental = !page.sync_token.is_empty();
+    let incremental = !page.sync_token().is_empty();
     // Rule 2: an EMPTY FULL fetch is only believed when there was nothing
     // cached. Otherwise a 200-with-empty-body from a flaky proxy silently
     // erases a month of meetings — and unlike an error, nothing would warn.
-    if !incremental
-        && page.events.is_empty()
-        && !page.partial
-        && db.has_calendar_events(account).unwrap_or(false)
+    // (A page is always complete: an over-budget source never produces one.)
+    if !incremental && page.events().is_empty() && db.has_calendar_events(account).unwrap_or(false)
     {
         tracing::warn!(
             target: "thegn::calendar",
@@ -249,10 +250,10 @@ fn apply_page(
         return false;
     }
 
-    let rows: Vec<CalendarRow> = page.events.iter().map(row_of).collect();
+    let rows: Vec<CalendarRow> = page.events().iter().map(row_of).collect();
     let wrote = if incremental {
         let put = db.put_calendar_events(account, &rows);
-        let del = db.delete_calendar_events(account, &page.deleted);
+        let del = db.delete_calendar_events(account, page.deleted());
         put.is_ok() && del.is_ok()
     } else {
         db.replace_calendar_account(account, &rows).is_ok()
@@ -260,8 +261,8 @@ fn apply_page(
     if !wrote {
         return false;
     }
-    let _ = db.put_calendar_sync(account, provider, &page.sync_token, from_ms, to_ms); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
-    !rows.is_empty() || !page.deleted.is_empty()
+    let _ = db.put_calendar_sync(account, provider, page.sync_token(), from_ms, to_ms); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+    !rows.is_empty() || !page.deleted().is_empty()
 }
 
 /// Turn an event into its cache row.
