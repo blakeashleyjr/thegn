@@ -423,7 +423,7 @@ async fn caldav_token_recovery_is_one_bounded_retry_with_shared_deadline() {
         let server = tokio::spawn(async move {
             axum::serve(
                 listener,
-                Router::new().fallback(any(move |_request: Request| {
+                Router::new().fallback(any(move |request: Request| {
                     let observed = Arc::clone(&observed);
                     let recorded = Arc::clone(&recorded);
                     async move {
@@ -479,7 +479,7 @@ async fn caldav_token_recovery_is_one_bounded_retry_with_shared_deadline() {
         let server = tokio::spawn(async move {
             axum::serve(
                 listener,
-                Router::new().fallback(any(move |request: Request| {
+                Router::new().fallback(any(move |_request: Request| {
                     let observed = Arc::clone(&observed);
                     async move {
                         let count = observed.fetch_add(1, Ordering::SeqCst);

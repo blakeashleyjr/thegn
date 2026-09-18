@@ -25,7 +25,7 @@ use crate::http::{
     map_error, read_body, validate_encoding, validate_media,
 };
 
-fn map_transport_error(error: CalendarHttpError) -> CalendarError {
+pub(super) fn map_transport_error(error: CalendarHttpError) -> CalendarError {
     match error {
         CalendarHttpError::Timeout => CalendarError::Timeout(map_error(error)),
         CalendarHttpError::BodyLimit => CalendarError::BodyLimit(map_error(error)),

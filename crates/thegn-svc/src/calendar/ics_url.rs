@@ -21,7 +21,7 @@ use crate::http::{
 };
 use tokio::time::Instant;
 
-fn map_transport_error(error: CalendarHttpError) -> CalendarError {
+pub(super) fn map_transport_error(error: CalendarHttpError) -> CalendarError {
     match error {
         CalendarHttpError::Timeout => CalendarError::Timeout(map_error(error)),
         CalendarHttpError::BodyLimit => CalendarError::BodyLimit(map_error(error)),
