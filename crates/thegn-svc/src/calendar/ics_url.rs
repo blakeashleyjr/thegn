@@ -16,8 +16,8 @@ use thegn_core::config_calendar::CalendarAccount;
 
 use super::{CalendarBackend, CalendarCaps, CalendarError, EventPage};
 use crate::http::{
-    CalendarHttpClient, CalendarHttpError, ExpectedMedia, MAX_REQUEST_BYTES, discard_body,
-    map_error, read_body, validate_encoding, validate_media,
+    CalendarHttpClient, CalendarHttpError, ExpectedMedia, MAX_REQUEST_BYTES, bounded_header_value,
+    discard_body, map_error, read_body, validate_encoding, validate_media,
 };
 use tokio::time::Instant;
 
@@ -153,12 +153,9 @@ impl CalendarBackend for IcsUrlBackend {
             }
             validate_media(&resp, ExpectedMedia::Ics)
                 .map_err(|error| CalendarError::Policy(map_error(error)))?;
-            let etag = resp
-                .headers()
-                .get(reqwest::header::ETAG)
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or_default()
-                .to_string();
+            let etag = bounded_header_value(&resp, &reqwest::header::ETAG)
+                .map_err(|error| CalendarError::BodyLimit(map_error(error)))?
+                .unwrap_or_default();
             let body = read_body(resp, deadline)
                 .await
                 .map_err(|error| match error {

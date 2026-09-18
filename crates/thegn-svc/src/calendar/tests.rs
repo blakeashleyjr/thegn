@@ -180,7 +180,7 @@ async fn every_redirect_status_is_refused_without_following_or_replaying_auth() 
 }
 
 #[tokio::test]
-async fn caldav_redirect_never_replays_a_sync_token_body() {
+async fn caldav_redirect_never_replays_a_sync_token_body_for_any_status() {
     use axum::Router;
     use axum::body::{Body, to_bytes};
     use axum::extract::Request;
@@ -196,12 +196,14 @@ async fn caldav_redirect_never_replays_a_sync_token_body() {
     let observed_token = Arc::new(AtomicUsize::new(0));
     let target = Arc::clone(&target_hits);
     let token = Arc::clone(&observed_token);
+    let absolute_target = format!("http://{address}/target?token=redirect-secret");
     let server = tokio::spawn(async move {
         axum::serve(
             listener,
             Router::new().fallback(any(move |request: Request| {
                 let target = Arc::clone(&target);
                 let token = Arc::clone(&token);
+                let absolute_target = absolute_target.clone();
                 async move {
                     if request.uri().path() == "/target" {
                         target.fetch_add(1, Ordering::SeqCst);
@@ -214,11 +216,23 @@ async fn caldav_redirect_never_replays_a_sync_token_body() {
                     {
                         token.fetch_add(1, Ordering::SeqCst);
                     }
+                    let status = request
+                        .uri()
+                        .path()
+                        .rsplit('/')
+                        .next()
+                        .and_then(|value| value.parse::<u16>().ok())
+                        .unwrap_or(307);
+                    let location = if status % 2 == 0 {
+                        absolute_target.clone()
+                    } else {
+                        "/target?token=redirect-secret".to_owned()
+                    };
                     let mut response =
-                        (StatusCode::TEMPORARY_REDIRECT, Body::empty()).into_response();
+                        (StatusCode::from_u16(status).unwrap(), Body::empty()).into_response();
                     response
                         .headers_mut()
-                        .insert("location", HeaderValue::from_static("/target"));
+                        .insert("location", HeaderValue::from_str(&location).unwrap());
                     response
                 }
             })),
@@ -227,23 +241,25 @@ async fn caldav_redirect_never_replays_a_sync_token_body() {
         .unwrap();
     });
 
-    let backend = caldav::CalDavBackend::new(&CalendarAccount {
-        url: format!("http://{address}/report"),
-        token: "dav-secret".into(),
-        allow_private_network: true,
-        ..account("dav", CalendarProviderKind::CalDav)
-    });
-    let error = backend
-        .list_events(window().0, window().1, "sync-secret")
-        .await
-        .unwrap_err();
-    assert!(matches!(
-        &error,
-        CalendarError::Policy("calendar redirect refused")
-    ));
+    for status in [301, 302, 303, 307, 308] {
+        let backend = caldav::CalDavBackend::new(&CalendarAccount {
+            url: format!("http://{address}/report/{status}"),
+            token: "dav-secret".into(),
+            allow_private_network: true,
+            ..account("dav", CalendarProviderKind::CalDav)
+        });
+        let error = backend
+            .list_events(window().0, window().1, "sync-secret")
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            &error,
+            CalendarError::Policy("calendar redirect refused")
+        ));
+        assert!(!error.to_string().contains("redirect-secret"));
+    }
     assert_eq!(target_hits.load(Ordering::SeqCst), 0);
-    assert_eq!(observed_token.load(Ordering::SeqCst), 1);
-    assert!(!error.to_string().contains("sync-secret"));
+    assert_eq!(observed_token.load(Ordering::SeqCst), 5);
     server.abort();
     let _ = server.await;
 }
@@ -336,9 +352,25 @@ async fn oversized_chunked_and_encoded_calendar_bodies_are_rejected_before_parse
                     *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
                     return response;
                 }
-                let stream = futures_util::stream::once(async {
-                    Ok::<_, std::io::Error>(vec![b'x'; (32 << 20) + 1])
-                });
+                if request.uri().path() == "/declared" {
+                    let mut response = (StatusCode::OK, Body::empty()).into_response();
+                    response
+                        .headers_mut()
+                        .insert("content-type", HeaderValue::from_static("text/calendar"));
+                    response
+                        .headers_mut()
+                        .insert("content-length", HeaderValue::from_static("33554433"));
+                    return response;
+                }
+                let size = if request.uri().path() == "/exact" {
+                    32 << 20
+                } else {
+                    (32 << 20) + 1
+                };
+                let stream =
+                    futures_util::stream::once(
+                        async move { Ok::<_, std::io::Error>(vec![b'x'; size]) },
+                    );
                 let mut response = Body::from_stream(stream).into_response();
                 response
                     .headers_mut()
@@ -350,21 +382,193 @@ async fn oversized_chunked_and_encoded_calendar_bodies_are_rejected_before_parse
         .unwrap();
     });
 
-    for path in ["", "/error", "/encoded"] {
+    for path in ["", "/exact", "/declared", "/error", "/encoded"] {
         let backend = ics_url::IcsUrlBackend::new(&CalendarAccount {
             url: format!("http://{address}{path}"),
             allow_private_network: true,
             ..account("remote", CalendarProviderKind::IcsUrl)
         });
+        let result = backend.list_events(window().0, window().1, "").await;
+        if path == "/exact" {
+            assert!(result.is_ok(), "exactly capped body should be readable");
+        } else {
+            let error = result.unwrap_err();
+            assert!(matches!(
+                error,
+                CalendarError::BodyLimit(_) | CalendarError::Policy(_) | CalendarError::Network(_)
+            ));
+        }
+    }
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn both_remote_backends_refuse_literal_loopback_before_connecting() {
+    for (provider, url) in [
+        (CalendarProviderKind::IcsUrl, "http://127.0.0.1:9/feed"),
+        (CalendarProviderKind::IcsUrl, "http://[::1]:9/feed"),
+        (
+            CalendarProviderKind::IcsUrl,
+            "http://[::ffff:127.0.0.1]:9/feed",
+        ),
+        (CalendarProviderKind::CalDav, "http://127.0.0.1:9/dav"),
+        (CalendarProviderKind::CalDav, "http://[::1]:9/dav"),
+    ] {
+        let backend = match provider {
+            CalendarProviderKind::IcsUrl => ics_url::IcsUrlBackend::new(&CalendarAccount {
+                url: url.into(),
+                ..account("remote", provider)
+            }),
+            CalendarProviderKind::CalDav => {
+                let backend = caldav::CalDavBackend::new(&CalendarAccount {
+                    url: url.into(),
+                    ..account("remote", provider)
+                });
+                let error = backend
+                    .list_events(window().0, window().1, "")
+                    .await
+                    .unwrap_err();
+                assert!(matches!(
+                    error,
+                    CalendarError::Policy("calendar destination refused")
+                ));
+                continue;
+            }
+            _ => unreachable!(),
+        };
         let error = backend
             .list_events(window().0, window().1, "")
             .await
             .unwrap_err();
         assert!(matches!(
             error,
-            CalendarError::BodyLimit(_) | CalendarError::Policy(_) | CalendarError::Network(_)
+            CalendarError::Policy("calendar destination refused")
         ));
     }
+}
+
+#[tokio::test]
+async fn media_encoding_and_shared_pool_policies_apply_to_real_backends() {
+    use axum::Router;
+    use axum::body::Body;
+    use axum::extract::Request;
+    use axum::http::{HeaderValue, StatusCode};
+    use axum::response::IntoResponse;
+    use axum::routing::any;
+    use std::sync::{Arc, Mutex};
+
+    let records = Arc::new(Mutex::new(Vec::<(String, String, bool)>::new()));
+    let observed = Arc::clone(&records);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new().fallback(any(move |request: Request| {
+                let observed = Arc::clone(&observed);
+                async move {
+                    let path = request.uri().path().to_owned();
+                    let auth = request
+                        .headers()
+                        .get("authorization")
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or_default()
+                        .to_owned();
+                    let cookie = request.headers().contains_key("cookie");
+                    observed.lock().unwrap().push((auth, path.clone(), cookie));
+                    let mut response = match path.as_str() {
+                        "/dav" => {
+                            (StatusCode::MULTI_STATUS, Body::from("<multistatus/>")).into_response()
+                        }
+                        "/encoding" => (StatusCode::OK, Body::from(ONE_EVENT)).into_response(),
+                        _ => (StatusCode::OK, Body::from(ONE_EVENT)).into_response(),
+                    };
+                    let content_type = if path == "/dav" {
+                        "Application/XML; charset=utf-8"
+                    } else {
+                        "TEXT/CALENDAR; charset=utf-8"
+                    };
+                    response
+                        .headers_mut()
+                        .insert("content-type", HeaderValue::from_static(content_type));
+                    if path == "/encoding" {
+                        response
+                            .headers_mut()
+                            .append("content-encoding", HeaderValue::from_static("identity"));
+                        response
+                            .headers_mut()
+                            .append("content-encoding", HeaderValue::from_static("gzip"));
+                    } else {
+                        response
+                            .headers_mut()
+                            .insert("set-cookie", HeaderValue::from_static("calendar=one"));
+                        response
+                            .headers_mut()
+                            .insert("etag", HeaderValue::from_static("next-validator"));
+                    }
+                    response
+                }
+            })),
+        )
+        .await
+        .unwrap();
+    });
+
+    let first = ics_url::IcsUrlBackend::new(&CalendarAccount {
+        url: format!("http://{address}/feed"),
+        username: "first-user".into(),
+        token: "first-secret".into(),
+        allow_private_network: true,
+        ..account("first", CalendarProviderKind::IcsUrl)
+    });
+    let second = ics_url::IcsUrlBackend::new(&CalendarAccount {
+        url: format!("http://{address}/feed"),
+        username: "second-user".into(),
+        token: "second-secret".into(),
+        allow_private_network: true,
+        ..account("second", CalendarProviderKind::IcsUrl)
+    });
+    first
+        .list_events(window().0, window().1, "first-validator")
+        .await
+        .unwrap();
+    second
+        .list_events(window().0, window().1, "second-validator")
+        .await
+        .unwrap();
+
+    let dav = caldav::CalDavBackend::new(&CalendarAccount {
+        url: format!("http://{address}/dav"),
+        allow_private_network: true,
+        ..account("dav", CalendarProviderKind::CalDav)
+    });
+    dav.list_events(window().0, window().1, "").await.unwrap();
+
+    let encoded = ics_url::IcsUrlBackend::new(&CalendarAccount {
+        url: format!("http://{address}/encoding"),
+        allow_private_network: true,
+        ..account("encoded", CalendarProviderKind::IcsUrl)
+    });
+    let error = encoded
+        .list_events(window().0, window().1, "")
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        CalendarError::Policy("calendar response encoding refused")
+    ));
+
+    let records = records.lock().unwrap();
+    assert_eq!(records.len(), 4);
+    assert!(records[0].0.starts_with("Basic "));
+    assert_ne!(records[0].0, records[1].0);
+    assert!(!records[0].0.contains("first-secret"));
+    assert!(
+        !records[0].2 && !records[1].2,
+        "pool must not retain cookies"
+    );
+    assert!(records.iter().any(|record| record.1 == "/dav"));
     server.abort();
     let _ = server.await;
 }

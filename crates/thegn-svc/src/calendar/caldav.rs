@@ -102,29 +102,62 @@ fn calendar_query_body(from: NaiveDate, to: NaiveDate) -> String {
     )
 }
 
-/// A `sync-collection` report resuming from `token`.
-fn sync_collection_body(token: &str) -> Result<String, CalendarError> {
-    if token.len() > MAX_REQUEST_BYTES {
-        return Err(CalendarError::BodyLimit(
-            "calendar sync token exceeds limit",
-        ));
-    }
-    Ok(format!(
-        r#"<?xml version="1.0" encoding="utf-8" ?>
+const SYNC_COLLECTION_PREFIX: &str = r#"<?xml version="1.0" encoding="utf-8" ?>
 <d:sync-collection xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
-  <d:sync-token>{}</d:sync-token>
+  <d:sync-token>"#;
+const SYNC_COLLECTION_SUFFIX: &str = r#"</d:sync-token>
   <d:sync-level>1</d:sync-level>
   <d:prop><d:getetag/><c:calendar-data/></d:prop>
-</d:sync-collection>"#,
-        xml_escape(token)
-    ))
+</d:sync-collection>"#;
+
+/// A `sync-collection` report resuming from `token`.
+///
+/// The exact escaped size, including the XML envelope, is checked before any
+/// request buffer is allocated.  Escaping is then performed once into that
+/// pre-sized buffer; the old replace-chain temporarily held several large
+/// intermediate strings before applying the limit.
+fn sync_collection_body(token: &str) -> Result<String, CalendarError> {
+    let escaped_len = xml_escaped_len(token).ok_or(CalendarError::BodyLimit(
+        "calendar sync token exceeds limit",
+    ))?;
+    let size = SYNC_COLLECTION_PREFIX
+        .len()
+        .checked_add(escaped_len)
+        .and_then(|size| size.checked_add(SYNC_COLLECTION_SUFFIX.len()))
+        .ok_or(CalendarError::BodyLimit("calendar request exceeds limit"))?;
+    if size > MAX_REQUEST_BYTES {
+        return Err(CalendarError::BodyLimit("calendar request exceeds limit"));
+    }
+    let mut body = String::with_capacity(size);
+    body.push_str(SYNC_COLLECTION_PREFIX);
+    write_xml_escaped(&mut body, token);
+    body.push_str(SYNC_COLLECTION_SUFFIX);
+    debug_assert_eq!(body.len(), size);
+    Ok(body)
 }
 
-fn xml_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
+fn xml_escaped_len(s: &str) -> Option<usize> {
+    s.chars().try_fold(0usize, |size, ch| {
+        let extra = match ch {
+            '&' => 4,
+            '<' | '>' => 3,
+            '"' => 5,
+            _ => 0,
+        };
+        size.checked_add(ch.len_utf8())?.checked_add(extra)
+    })
+}
+
+fn write_xml_escaped(out: &mut String, s: &str) {
+    for ch in s.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            _ => out.push(ch),
+        }
+    }
 }
 
 fn xml_unescape(s: &str) -> String {
@@ -152,6 +185,10 @@ pub(crate) struct DavResponse {
 /// Namespace prefixes vary by server (`d:`, `D:`, none), so tags are matched on
 /// their local name.
 pub(crate) fn parse_multistatus(xml: &str) -> (Vec<DavResponse>, String) {
+    parse_multistatus_checked(xml).unwrap_or_default()
+}
+
+fn parse_multistatus_checked(xml: &str) -> Result<(Vec<DavResponse>, String), CalendarError> {
     let mut out = Vec::new();
     for block in split_elements(xml, "response") {
         let href = first_element(&block, "href").unwrap_or_default();
@@ -163,6 +200,11 @@ pub(crate) fn parse_multistatus(xml: &str) -> (Vec<DavResponse>, String) {
         if href.trim().is_empty() {
             continue;
         }
+        if href.len() > MAX_REQUEST_BYTES {
+            return Err(CalendarError::BodyLimit(
+                "calendar resource href exceeds limit",
+            ));
+        }
         out.push(DavResponse {
             href: href.trim().to_string(),
             ics,
@@ -171,7 +213,12 @@ pub(crate) fn parse_multistatus(xml: &str) -> (Vec<DavResponse>, String) {
     }
     // The collection-level token sits outside any <response>.
     let token = last_element(xml, "sync-token").unwrap_or_default();
-    (out, token.trim().to_string())
+    if token.len() > MAX_REQUEST_BYTES {
+        return Err(CalendarError::BodyLimit(
+            "calendar sync token exceeds limit",
+        ));
+    }
+    Ok((out, token.trim().to_string()))
 }
 
 /// Every `<...name>…</...name>` body in `xml`, prefix-insensitive.
@@ -342,7 +389,7 @@ impl CalendarBackend for CalDavBackend {
             let text = String::from_utf8(text)
                 .map_err(|_| CalendarError::Parse("CalDAV response is not UTF-8".into()))?;
 
-            let (responses, token) = parse_multistatus(&text);
+            let (responses, token) = parse_multistatus_checked(&text)?;
             let zone = if self.zone.is_empty() {
                 "UTC"
             } else {
@@ -429,7 +476,7 @@ impl CalDavBackend {
     }
 
     fn page_from_multistatus(&self, text: String) -> Result<EventPage, CalendarError> {
-        let (responses, token) = parse_multistatus(&text);
+        let (responses, token) = parse_multistatus_checked(&text)?;
         let zone = if self.zone.is_empty() {
             "UTC"
         } else {
@@ -467,4 +514,37 @@ pub(crate) fn uid_from_href(href: &str) -> String {
         .unwrap_or(href)
         .trim_end_matches(".ics")
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sync_request_size_accounts_for_xml_expansion_and_envelope() {
+        let envelope = SYNC_COLLECTION_PREFIX.len() + SYNC_COLLECTION_SUFFIX.len();
+        let plain = "x".repeat(MAX_REQUEST_BYTES - envelope);
+        assert!(sync_collection_body(&plain).is_ok());
+        assert!(sync_collection_body(&format!("{plain}x")).is_err());
+
+        let expanded = "&".repeat((MAX_REQUEST_BYTES - envelope) / 5 + 1);
+        assert!(sync_collection_body(&expanded).is_err());
+    }
+
+    #[test]
+    fn sync_request_escapes_once_into_the_bounded_buffer() {
+        let body = sync_collection_body("a&<b\"").unwrap();
+        assert!(body.contains("a&amp;&lt;b&quot;"));
+        assert!(!body.contains("&amp;lt;"));
+    }
+
+    #[test]
+    fn retained_sync_tokens_are_bounded_before_publication() {
+        let oversized = "x".repeat(MAX_REQUEST_BYTES + 1);
+        let xml = format!("<multistatus><sync-token>{oversized}</sync-token></multistatus>");
+        assert!(matches!(
+            parse_multistatus_checked(&xml),
+            Err(CalendarError::BodyLimit(_))
+        ));
+    }
 }
