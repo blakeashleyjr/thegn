@@ -121,10 +121,10 @@ fn pending_repo_requests(
     let mut pending = cfg.repo_sandbox_resolved(root, approvals).pending;
     let (repo_hooks, repo_prepare) = thegn_core::config::load_repo_hooks(root)
         .unwrap_or_else(|| (thegn_core::config::HooksConfig::default(), Vec::new()));
-    let workspace = cfg.workspace.get(&thegn_core::config::workspace_slug(root));
+    let overlay = cfg.workspace_overlay(root);
     let lifecycle = thegn_core::hooks::resolve(
         &cfg.hooks,
-        workspace.map(|workspace| &workspace.hooks),
+        overlay.overlay().map(|workspace| &workspace.hooks),
         Some(&repo_hooks),
         &cfg.sandbox.prepare,
         &repo_prepare,
@@ -203,6 +203,17 @@ pub fn trust(
 
     // List mode.
     outln!("repo: {}", root.display());
+    // THE-515: the trusted overlay is part of this repo's authority; say so
+    // when it is refused rather than silently omitting its hooks/mounts.
+    match cfg.workspace_overlay(&root) {
+        thegn_core::workspace_overlay::WorkspaceOverlay::Selected { key, .. } => {
+            outln!("  trusted overlay: [project.{key}]");
+        }
+        thegn_core::workspace_overlay::WorkspaceOverlay::Refused(refusal) => {
+            outln!("  REFUSED {refusal}");
+        }
+        thegn_core::workspace_overlay::WorkspaceOverlay::Unconfigured => {}
+    }
     if resolved.events.is_empty() && pending.is_empty() {
         outln!("  no denied or pending overlay requests");
     }

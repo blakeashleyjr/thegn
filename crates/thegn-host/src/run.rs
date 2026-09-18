@@ -23003,9 +23003,12 @@ async fn event_loop<T: Terminal>(
                                 // configured external `diff` tool still wins
                                 // (delta/difftastic in a tab); otherwise the
                                 // native modal opens (internal render).
-                                let wt = crate::hydrate::active_tab_path(&session);
-                                let structural_on = cfg.repo_git(&wt).structural_diff
-                                    != thegn_core::config::StructuralDiff::Off;
+                                // Repo-root keyed and pure (THE-515): not the
+                                // worktree dir's basename, and no git on the loop.
+                                let structural_on =
+                                    session.repo_root().map_or(cfg.git.structural_diff, |root| {
+                                        cfg.repo_git(root).structural_diff
+                                    }) != thegn_core::config::StructuralDiff::Off;
                                 let tool_cmd = if structural_on {
                                     None
                                 } else {

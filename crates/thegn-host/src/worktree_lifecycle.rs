@@ -285,12 +285,15 @@ pub fn resolve(cfg: &Config, repo_root: &Path, db: Option<&Db>) -> ResolvedHooks
         .unwrap_or_else(Approvals::deny_all);
     let (repo_hooks, repo_prepare) = thegn_core::config::load_repo_hooks(repo_root)
         .unwrap_or_else(|| (thegn_core::config::HooksConfig::default(), Vec::new()));
-    let workspace = cfg
-        .workspace
-        .get(&thegn_core::config::workspace_slug(repo_root));
+    // THE-515: the one refusing selector — an ambiguous trusted overlay
+    // contributes no hooks (fail closed: trusted hooks are extra execution).
+    let overlay = cfg.workspace_overlay(repo_root);
+    if let Some(refusal) = overlay.refusal() {
+        tracing::warn!(repo = %repo_root.display(), "{refusal}");
+    }
     thegn_core::hooks::resolve(
         &cfg.hooks,
-        workspace.map(|workspace| &workspace.hooks),
+        overlay.overlay().map(|workspace| &workspace.hooks),
         Some(&repo_hooks),
         &cfg.sandbox.prepare,
         &repo_prepare,

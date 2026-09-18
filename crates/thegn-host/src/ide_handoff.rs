@@ -218,14 +218,15 @@ pub(crate) fn active_target(
         None => EditorTarget::project(&group.path),
     }
     .map_err(|error| error.to_string())?;
-    // Config workspace keys use the pure path-derived slug. Do not call
-    // `repo_slug` here: it opens SQLite and this request phase runs on the UI
-    // loop.
-    let slug = thegn_core::config::workspace_slug(Path::new(if session.id.is_empty() {
-        &group.path
-    } else {
-        &session.id
-    }));
+    // Config workspace keys use the pure path-derived key of the session's
+    // repository root (THE-515). Do not call `repo_slug` (SQLite) or
+    // `config::workspace_slug` (spawns git) here: this request phase runs on
+    // the UI loop. Never key by the group path — a linked worktree's basename
+    // is not the repository. No root ⇒ empty key ⇒ no trusted overlay.
+    let slug = session
+        .repo_root()
+        .and_then(thegn_core::workspace_overlay::legacy_key_for_root)
+        .unwrap_or_default();
     Ok((target, slug))
 }
 
@@ -294,8 +295,9 @@ pub(crate) fn known_worktrees(
                 .map(|path| (PathBuf::from(path), row.workspace_slug.clone()))
         })
         .collect();
-    let active_slug = (!session.id.is_empty())
-        .then(|| thegn_core::config::workspace_slug(Path::new(&session.id)));
+    let active_slug = session
+        .repo_root()
+        .and_then(thegn_core::workspace_overlay::legacy_key_for_root);
     if let Some(slug) = active_slug {
         for group in &session.worktrees {
             let path = PathBuf::from(&group.path);

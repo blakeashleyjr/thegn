@@ -261,9 +261,12 @@ pub fn active_name(
         return Some(n);
     }
     if let Some(slug) = slug {
+        // THE-515: the trusted overlay is selected by the one refusing
+        // resolver. `slug` is still the tab namespace until RepositoryId
+        // binding lands; an ambiguous key selects no account.
         if let Some(n) = cfg
-            .workspace
-            .get(slug)
+            .workspace_overlay_for_key(slug)
+            .overlay()
             .and_then(|w| w.accounts.get(provider_id))
         {
             return Some(n.clone());

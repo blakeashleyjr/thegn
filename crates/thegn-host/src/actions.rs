@@ -1152,7 +1152,12 @@ pub(crate) fn open_diff_view(
         .and_then(|n| n.to_str())
         .map(|n| format!("{n} · diff"))
         .unwrap_or_else(|| "diff".to_string());
-    let mode = cfg.repo_git(&wt).structural_diff;
+    // Keyed by the session's repository root (pure), never the worktree
+    // directory's basename: a linked worktree dir named like another repo
+    // must not select that repo's `[workspace.*.git]` (THE-515).
+    let mode = session.repo_root().map_or(cfg.git.structural_diff, |root| {
+        cfg.repo_git(root).structural_diff
+    });
     let structural = crate::structural_diff::choose(cfg, mode).map(|difft| {
         let light_bg = thegn_core::theme::relative_luminance(&cfg.palette().bg0) > 0.5;
         let opts = crate::structural_diff::CaptureOpts {

@@ -98,7 +98,12 @@ fn global_binding(db: &Db) -> Option<String> {
 /// (config) wins over the `ui_state` pointer, matching `account.rs`.
 fn workspace_binding(cfg: &Config, db: &Db, slug: Option<&str>) -> Option<String> {
     let slug = slug?;
-    if let Some(name) = cfg.workspace.get(slug).and_then(|w| w.env_bundle.clone()) {
+    // THE-515: one refusing selector; an ambiguous key binds no bundle.
+    if let Some(name) = cfg
+        .workspace_overlay_for_key(slug)
+        .overlay()
+        .and_then(|w| w.env_bundle.clone())
+    {
         return Some(name);
     }
     db.get_ui_state(&scope_ws(slug), "active").ok().flatten()
