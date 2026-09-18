@@ -402,6 +402,63 @@ async fn redirect_locations_are_never_followed_across_origins_or_schemes() {
 }
 
 #[tokio::test]
+async fn redirect_self_loops_are_refused_without_a_second_request() {
+    use axum::{Router, extract::Request, http::StatusCode, response::IntoResponse, routing::any};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&hits);
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new().fallback(any(move |_request: Request| {
+                observed.fetch_add(1, Ordering::SeqCst);
+                async {
+                    let mut response = (StatusCode::FOUND, ()).into_response();
+                    response
+                        .headers_mut()
+                        .insert("location", "/loop".parse().unwrap());
+                    response
+                }
+            })),
+        )
+        .await
+        .unwrap();
+    });
+
+    for provider in [CalendarProviderKind::IcsUrl, CalendarProviderKind::CalDav] {
+        let cfg = CalendarAccount {
+            url: format!("http://{address}/loop"),
+            allow_private_network: true,
+            ..account("loop", provider)
+        };
+        let error = match provider {
+            CalendarProviderKind::IcsUrl => ics_url::IcsUrlBackend::new(&cfg)
+                .list_events(window().0, window().1, "")
+                .await
+                .unwrap_err(),
+            CalendarProviderKind::CalDav => caldav::CalDavBackend::new(&cfg)
+                .list_events(window().0, window().1, "")
+                .await
+                .unwrap_err(),
+            _ => unreachable!(),
+        };
+        assert!(matches!(
+            error,
+            CalendarError::Policy("calendar redirect refused")
+        ));
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
 async fn caldav_token_recovery_is_one_bounded_retry_with_shared_deadline() {
     use axum::Router;
     use axum::body::Body;

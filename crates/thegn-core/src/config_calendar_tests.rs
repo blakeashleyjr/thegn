@@ -40,6 +40,28 @@ fn remote_calendar_urls_are_parsed_normalized_and_redacted() {
 }
 
 #[test]
+fn validation_dispatches_remote_url_policy_for_each_http_provider() {
+    let cfg = CalendarConfig {
+        accounts: vec![
+            CalendarAccount {
+                provider: CalendarProviderKind::IcsUrl,
+                url: "ftp://calendar.example/feed.ics".into(),
+                ..account("ics", CalendarProviderKind::IcsUrl)
+            },
+            CalendarAccount {
+                provider: CalendarProviderKind::CalDav,
+                url: "webcal://calendar.example/dav".into(),
+                ..account("dav", CalendarProviderKind::CalDav)
+            },
+        ],
+        ..CalendarConfig::default()
+    };
+    let errors = validate_calendar(&cfg);
+    assert_eq!(errors.len(), 2, "both remote providers must validate URLs");
+    assert!(errors.iter().all(|error| error.contains("url")));
+}
+
+#[test]
 fn remote_url_validation_never_echoes_subscription_credentials() {
     let cfg = CalendarConfig {
         accounts: vec![CalendarAccount {
