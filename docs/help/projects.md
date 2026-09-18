@@ -43,8 +43,11 @@ operation and print a deprecation warning naming `thegn program …`.
 ## Creating a feature across repos
 
 `thegn wt new <name> --program <p>` resolves **one** linked branch name (your
-configured `branch_prefix` + a slug of `<name>`, applied once) and creates that
-exact branch plus a worktree in every member repo:
+configured `branch_prefix` + `<name>` exactly, applied once) and creates that
+exact branch plus a worktree in every member repo. `<name>` is never
+normalized: `payments/retry`, `payments-retry` and `payments_retry` are three
+different features, and a name that is not a valid Git branch name (e.g. one
+with spaces) is refused with a suggested literal instead of being slugged:
 
 ```sh
 thegn program create shop

@@ -16,12 +16,57 @@
 use crate::util;
 
 /// The single, literal branch name a feature uses across every member repo:
-/// `{branch_prefix}{slug(feature)}`. Resolved once and used verbatim in each
-/// member — deliberately NOT per-repo deduped (dedup would make the names differ
-/// across repos and break the branch-name-equality identity). Produces the same
-/// string as [`crate::worktree::human_base`], sharing [`util::slugify`].
-pub fn feature_branch_name(feature: &str, branch_prefix: &str) -> String {
-    format!("{branch_prefix}{}", util::slugify(feature))
+/// `{branch_prefix}{feature}`, with the feature name used EXACTLY (THE-516).
+///
+/// Membership is branch-name equality, so the name must be lossless: it used
+/// to be `slugify(feature)`, which federated `payments/retry`,
+/// `payments-retry`, `payments_retry` and `Payments-Retry` into one branch
+/// across every member repo. A name that is not already a valid Git branch
+/// name is refused with a suggested literal, never silently normalized —
+/// a display alias may propose a branch but cannot define identity.
+///
+/// Resolved once and used verbatim in each member — deliberately NOT per-repo
+/// deduped (dedup would make the names differ across repos).
+pub fn feature_branch_name(feature: &str, branch_prefix: &str) -> Result<String, String> {
+    let branch = format!("{branch_prefix}{feature}");
+    if feature.is_empty() || !is_valid_branch_name(&branch) {
+        let slug = util::slugify(feature);
+        let hint = if slug.is_empty() {
+            String::new()
+        } else {
+            format!(" (did you mean {slug:?}?)")
+        };
+        return Err(format!(
+            "feature name {feature:?} is not a literal Git branch name{hint}; \
+             feature identity is the exact branch, so it is never normalized"
+        ));
+    }
+    Ok(branch)
+}
+
+/// Pure approximation of `git check-ref-format --branch` for the rules that
+/// matter to a user-typed name. Conservative: anything it accepts Git accepts.
+pub fn is_valid_branch_name(name: &str) -> bool {
+    if name.is_empty()
+        || name == "@"
+        || name.starts_with('-')
+        || name.starts_with('/')
+        || name.ends_with('/')
+        || name.ends_with('.')
+        || name.contains("..")
+        || name.contains("//")
+        || name.contains("@{")
+    {
+        return false;
+    }
+    if name
+        .chars()
+        .any(|c| c.is_control() || matches!(c, ' ' | '~' | '^' | ':' | '?' | '*' | '[' | '\\'))
+    {
+        return false;
+    }
+    name.split('/')
+        .all(|part| !part.is_empty() && !part.starts_with('.') && !part.ends_with(".lock"))
 }
 
 /// One member repo of a project, tagged with whether it already has the feature
@@ -136,28 +181,44 @@ mod tests {
     }
 
     #[test]
-    fn branch_name_is_prefix_plus_slug_applied_once() {
-        assert_eq!(
-            feature_branch_name("payments retry", "tg/"),
-            "tg/payments-retry"
-        );
-        // A name that already looks branch-shaped still slugs, once.
-        assert_eq!(
-            feature_branch_name("Fix Bug #42", "feat/"),
-            "feat/fix-bug-42"
-        );
+    fn feature_names_are_literal_and_never_normalized_together() {
+        let names = [
+            "payments/retry",
+            "payments-retry",
+            "payments_retry",
+            "Payments-Retry",
+        ];
+        let branches: Vec<String> = names
+            .iter()
+            .map(|n| feature_branch_name(n, "tg/").unwrap())
+            .collect();
+        for (i, b) in branches.iter().enumerate() {
+            assert_eq!(b, &format!("tg/{}", names[i]));
+            assert!(branches[i + 1..].iter().all(|o| o != b), "{b} federated");
+        }
     }
 
     #[test]
-    fn branch_name_matches_worktree_human_base() {
-        // The batched path must resolve the SAME name the single-repo pipeline
-        // would, so a project feature and a hand-made worktree share identity.
+    fn non_branch_feature_names_are_refused_with_a_hint() {
+        let err = feature_branch_name("payments retry", "tg/").unwrap_err();
+        assert!(err.contains("\"payments-retry\""), "{err}");
+        for bad in ["", "a..b", "x~1", "a:b", "a/", ".hidden", "x.lock", "a//b"] {
+            assert!(feature_branch_name(bad, "tg/").is_err(), "{bad:?} accepted");
+        }
+        // With no prefix, a leading dash would read as a git option.
+        assert!(feature_branch_name("-x", "").is_err());
+    }
+
+    #[test]
+    fn literal_feature_branch_matches_worktree_human_base_for_slug_names() {
+        // A name that is already its own slug resolves identically on both
+        // paths, so a hand-made worktree still joins its project feature.
         let cfg = crate::config::Config {
             branch_prefix: "tg/".into(),
             ..Default::default()
         };
         assert_eq!(
-            feature_branch_name("payments-retry", &cfg.branch_prefix),
+            feature_branch_name("payments-retry", &cfg.branch_prefix).unwrap(),
             crate::worktree::human_base("payments-retry", &cfg),
         );
     }

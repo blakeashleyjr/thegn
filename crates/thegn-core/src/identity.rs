@@ -363,10 +363,6 @@ impl WorktreeId {
 pub struct WorktreeGeneration([u8; WORKTREE_GENERATION_BYTES]);
 
 impl WorktreeGeneration {
-    pub(crate) fn from_bytes(bytes: [u8; WORKTREE_GENERATION_BYTES]) -> Self {
-        Self(bytes)
-    }
-
     /// Constructed only from the exact instance stamp captured by the Git
     /// inspection seam. The stamp is an OS identity proof, not caller-chosen
     /// randomness; unsupported platforms must refuse capture before effects.
@@ -386,7 +382,7 @@ impl WorktreeGeneration {
     }
 }
 
-fn hex_bytes(bytes: &[u8]) -> String {
+pub(crate) fn hex_bytes(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
         use std::fmt::Write as _;
@@ -764,7 +760,7 @@ mod tests {
                 let branch = BranchRef::from_bytes(raw).unwrap();
                 WorktreeId::from_parts(
                     RepositoryId::from_bytes([7; REPOSITORY_ID_BYTES]),
-                    WorktreeGeneration::from_bytes([8; WORKTREE_GENERATION_BYTES]),
+                    WorktreeGeneration::from_captured_instance_stamp(b"fixture").unwrap(),
                     &branch,
                     b"in-repo",
                 )

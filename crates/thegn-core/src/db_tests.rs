@@ -4914,3 +4914,23 @@ fn my_work_cache_scope_transition_keeps_global_and_originless_tracker_work() {
     };
     assert!(legacy.for_scope(None, false).rows.is_empty());
 }
+
+/// THE-516: two legacy rows that share a slugged tab name (the old
+/// `feat/a` and `feat-a` both mapped to `app/feat-a`) are refused, never
+/// resolved to whichever row SQLite returns first.
+#[test]
+fn ambiguous_legacy_tab_is_refused_not_first_wins() {
+    let db = db();
+    db.put_worktree("app/feat-a", "/x/app", "/wt/one", "feat/a", None, None)
+        .unwrap();
+    db.put_worktree("app/feat-a", "/x/app", "/wt/two", "feat-a", None, None)
+        .unwrap();
+    assert!(db.worktree_for_tab(&session(), "app/feat-a").is_err());
+    db.del_worktree("/wt/two").unwrap();
+    assert_eq!(
+        db.worktree_for_tab(&session(), "app/feat-a")
+            .unwrap()
+            .as_deref(),
+        Some("/wt/one")
+    );
+}
