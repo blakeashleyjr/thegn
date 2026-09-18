@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+import hashlib
 import shutil
 import subprocess
 import sys
@@ -13,12 +14,13 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 DETECTOR = ROOT / "nix" / "detect-legacy-post-checkout.py"
-BASE_COMMIT = "0be575cecab318db9049352b0c7ae5cb45b18581"
+LEGACY_FIXTURE = ROOT / "test/fixtures/the429/legacy-post-checkout.sh"
+LEGACY_SHA256 = "90b85945a3c30c3a9aa806f87fe9585e9ce660e450672e3e5e24b40dca140365"
 
 
 def run(*args: str, cwd: Path, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        list(args), cwd=cwd, env=env, check=True, text=True, capture_output=True
+        list(args), cwd=cwd, env=env, check=True, text=True, capture_output=True, timeout=10
     )
 
 
@@ -27,7 +29,91 @@ def git(*args: str, cwd: Path, env: dict[str, str]) -> None:
 
 
 def detector(repo: Path, env: dict[str, str]) -> str:
-    result = run(sys.executable, str(DETECTOR), cwd=repo, env=env)
+    result = subprocess.run(
+        [sys.executable, str(DETECTOR)],
+        cwd=repo,
+        env=env,
+        check=True,
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+    if result.returncode != 0:
+        raise AssertionError(result.stderr)
+    return result.stderr
+
+
+def fake_git(sandbox: Path, mode: str) -> dict[str, str]:
+    fake_bin = sandbox / f"fake-git-{mode}"
+    fake_bin.mkdir()
+    executable = fake_bin / "git"
+    executable.write_text(
+        "#!/usr/bin/env python3\n"
+        "import sys\n"
+        "import time\n"
+        f"mode = {mode!r}\n"
+        "if mode == 'hang':\n"
+        "    time.sleep(30)\n"
+        "elif mode == 'oversized':\n"
+        "    sys.stdout.write('x' * (128 * 1024))\n"
+        "elif mode == 'invalid':\n"
+        "    sys.stdout.buffer.write(b'/tmp/invalid-\\xff\\n')\n"
+    )
+    executable.chmod(0o755)
+    environment = os.environ.copy()
+    environment["PATH"] = f"{fake_bin}{os.pathsep}{environment['PATH']}"
+    return environment
+
+
+def injected_replacement(repo: Path, env: dict[str, str], kind: str) -> str:
+    """Replace the candidate after lstat in a bounded child process."""
+
+    child = r'''
+import importlib.util
+import os
+import sys
+
+detector_path, repo_path, replacement_kind = sys.argv[1:]
+spec = importlib.util.spec_from_file_location("the429_detector", detector_path)
+module = importlib.util.module_from_spec(spec)
+assert spec.loader is not None
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+original_open = os.open
+replaced = False
+
+def replacing_open(path, flags, mode=0o777, *, dir_fd=None):
+    global replaced
+    if not replaced and path == "post-checkout" and dir_fd is not None:
+        replaced = True
+        os.unlink(path, dir_fd=dir_fd)
+        if replacement_kind == "fifo":
+            os.mkfifo(path, mode=0o600, dir_fd=dir_fd)
+        elif replacement_kind == "symlink":
+            os.symlink("replacement-target", path, dir_fd=dir_fd)
+        elif replacement_kind == "regular":
+            fd = original_open(path, os.O_WRONLY | os.O_CREAT, 0o600, dir_fd=dir_fd)
+            try:
+                os.write(fd, b"replacement")
+            finally:
+                os.close(fd)
+    return original_open(path, flags, mode, dir_fd=dir_fd)
+
+module.os.open = replacing_open
+os.chdir(repo_path)
+raise SystemExit(module.main())
+'''
+    result = subprocess.run(
+        [sys.executable, "-c", child, str(DETECTOR), str(repo), kind],
+        cwd=repo,
+        env=env,
+        check=False,
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+    if result.returncode != 0:
+        raise AssertionError(result.stderr)
     return result.stderr
 
 
@@ -40,7 +126,11 @@ def main() -> int:
     assert not (ROOT / "test/git-hooks/post-checkout.sh").exists()
     flake = (ROOT / "flake.nix").read_text()
     assert "test/git-hooks/post-checkout.sh" not in flake
+    assert "nix/detect-legacy-post-checkout.py" in flake
     assert "PREK_ALLOW_NO_CONFIG" in flake
+    legacy = LEGACY_FIXTURE.read_bytes()
+    assert hashlib.sha256(legacy).hexdigest() == LEGACY_SHA256
+    assert not (LEGACY_FIXTURE.stat().st_mode & 0o111)
 
     with tempfile.TemporaryDirectory(prefix="the429-") as temporary:
         sandbox = Path(temporary)
@@ -70,10 +160,16 @@ def main() -> int:
         git("commit", "-qm", "base", cwd=repo, env=env)
         git("branch", "-M", "main", cwd=repo, env=env)
 
+        # This is the same immutable helper invoked by hookExtras in flake.nix.
+        # Run it before creating or entering the hostile branch so the fixture
+        # exercises the actual shell-entry setup seam, not only a source check.
+        assert "no legacy post-checkout hook" in detector(repo, env)
+
         sentinel = sandbox / "sentinel"
+        legacy_sentinel = sandbox / "legacy-sentinel"
         payload = (
             "#!/bin/sh\n"
-            f"printf '%s\\n' branch-payload >> {sentinel}\n"
+            f"printf '%s\\n' branch-payload >> {legacy_sentinel}\n"
             "exit 0\n"
         )
         git("checkout", "-qb", "hostile", cwd=repo, env=env)
@@ -86,11 +182,23 @@ def main() -> int:
         git("commit", "-qm", "hostile branch payloads", cwd=repo, env=env)
         git("checkout", "-q", "main", cwd=repo, env=env)
 
+        # Historical probe: install the preserved bytes only in an isolated
+        # throwaway clone to prove that the malicious branch payload is reached
+        # by the old behavior. This is not product setup or a migration path.
+        legacy_repo = sandbox / "legacy-repo"
+        git("clone", "-q", str(repo), str(legacy_repo), cwd=sandbox, env=env)
+        legacy_candidate = legacy_repo / ".git/hooks/post-checkout"
+        legacy_candidate.write_bytes(legacy)
+        os.chmod(legacy_candidate, 0o755)
+        git("checkout", "-q", "-b", "hostile", "origin/hostile", cwd=legacy_repo, env=env)
+        assert legacy_sentinel.exists(), "historical hook probe did not reach branch payload"
+
         # These are the real Git checkout/worktree operations that used to fire
-        # the installed shared post-checkout hook. There is no installed hook in
-        # this hermetic repository, so branch-controlled files remain inert.
+        # the installed shared post-checkout hook. The current shell-entry seam
+        # installed no hook, so branch-controlled files remain inert.
         git("checkout", "-q", "hostile", cwd=repo, env=env)
         git("checkout", "-q", "main", cwd=repo, env=env)
+        assert not sentinel.exists(), "a branch-controlled checkout payload ran"
         worktree = sandbox / "worktree"
         git("worktree", "add", "-q", "-b", "fixture-clean", str(worktree), "main", cwd=repo, env=env)
         (worktree / ".pre-commit-config.yaml").write_bytes(b"foreign local config\n")
@@ -102,15 +210,6 @@ def main() -> int:
         assert (worktree / ".pre-commit-config.yaml").read_bytes() == before_config
         assert metadata(worktree / ".pre-commit-config.yaml") == before_config_meta
 
-        # Obtain the exact legacy bytes from the reviewed pre-remediation base;
-        # the current tracked executable is intentionally gone.
-        legacy = subprocess.run(
-            ["git", "show", f"{BASE_COMMIT}:test/git-hooks/post-checkout.sh"],
-            cwd=ROOT,
-            env=env,
-            check=True,
-            capture_output=True,
-        ).stdout
         hooks = repo / ".git/hooks"
         candidate = hooks / "post-checkout"
         candidate.write_bytes(legacy)
@@ -126,6 +225,28 @@ def main() -> int:
         assert "foreign post-checkout" in detector(repo, env)
         assert metadata(candidate) == before
         assert candidate.read_bytes() == b"foreign hook\n"
+
+        for mode in ("fifo", "symlink", "regular"):
+            if candidate.exists() or candidate.is_symlink():
+                candidate.unlink()
+            candidate.write_bytes(b"candidate before injected replacement\n")
+            report = injected_replacement(repo, env, mode)
+            assert "replaced" in report or "could not be opened" in report, report
+            assert candidate.exists() or candidate.is_symlink()
+
+        # Git queries are bounded, non-interactive, and preserve undecodable
+        # bytes for an explicit refusal rather than raising a Unicode error.
+        assert "output bound" in detector(repo, fake_git(sandbox, "oversized"))
+        assert "timed out" in detector(repo, fake_git(sandbox, "hang"))
+        assert "refusing inspection" in detector(repo, fake_git(sandbox, "invalid"))
+
+        command_scope = dict(
+            env,
+            GIT_CONFIG_COUNT="1",
+            GIT_CONFIG_KEY_0="core.hooksPath",
+            GIT_CONFIG_VALUE_0=str(hooks),
+        )
+        assert "command-scope" in detector(repo, command_scope)
 
         # All collision types are read-only and no-follow. In particular, the
         # FIFO test would hang if the detector accidentally opened it normally.

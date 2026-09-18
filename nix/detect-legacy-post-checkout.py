@@ -13,28 +13,112 @@ from __future__ import annotations
 
 import hashlib
 import os
+import selectors
 import stat
 import subprocess
 import sys
+import time
+from dataclasses import dataclass
 from pathlib import Path
 
 
 LEGACY_SHA256 = "90b85945a3c30c3a9aa806f87fe9585e9ce660e450672e3e5e24b40dca140365"
 MAX_BYTES = 64 * 1024
+GIT_TIMEOUT_SECONDS = 2.0
+MAX_GIT_OUTPUT = 64 * 1024
+
+
+class GitQueryRefusal(Exception):
+    """A bounded Git query could not produce a safe, complete answer."""
+
+
+@dataclass(frozen=True)
+class GitResult:
+    returncode: int
+    stdout: bytes
+    stderr: bytes
 
 
 def say(message: str) -> None:
     print(f"thegn legacy checkout-hook detector: {message}", file=sys.stderr)
 
 
-def git(root: Path, *args: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        ["git", *args],
-        cwd=root,
-        check=False,
-        capture_output=True,
-        text=True,
+def git(root: Path, *args: str) -> GitResult:
+    """Run one non-interactive Git query with bounded time and output."""
+
+    query_env = os.environ.copy()
+    query_env.update(
+        {
+            "GIT_EDITOR": ":",
+            "GIT_PAGER": "cat",
+            "GIT_SEQUENCE_EDITOR": ":",
+            "GIT_TERMINAL_PROMPT": "0",
+        }
     )
+    try:
+        process = subprocess.Popen(
+            ["git", *args],
+            cwd=root,
+            env=query_env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=(os.name != "nt"),
+            creationflags=(subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0),
+        )
+    except OSError as error:
+        raise GitQueryRefusal(f"Git could not be started: {error}") from error
+
+    assert process.stdout is not None
+    assert process.stderr is not None
+    stdout_fd = process.stdout.fileno()
+    stderr_fd = process.stderr.fileno()
+    streams = {stdout_fd: bytearray(), stderr_fd: bytearray()}
+    selector = selectors.DefaultSelector()
+    for stream in (process.stdout, process.stderr):
+        os.set_blocking(stream.fileno(), False)
+        selector.register(stream, selectors.EVENT_READ)
+
+    deadline = time.monotonic() + GIT_TIMEOUT_SECONDS
+    refusal: str | None = None
+    try:
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                refusal = f"Git query timed out after {GIT_TIMEOUT_SECONDS:g}s"
+                break
+            for key, _ in selector.select(remaining):
+                fd = key.fileobj.fileno()
+                captured = sum(len(stream) for stream in streams.values())
+                chunk = os.read(fd, min(8192, MAX_GIT_OUTPUT + 1 - captured))
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    continue
+                streams[fd].extend(chunk)
+                if sum(len(stream) for stream in streams.values()) > MAX_GIT_OUTPUT:
+                    refusal = f"Git query exceeded the {MAX_GIT_OUTPUT}-byte output bound"
+                    break
+            if refusal is not None:
+                break
+    finally:
+        selector.close()
+        if refusal is not None or process.poll() is None:
+            try:
+                process.kill()
+            except OSError:
+                pass
+            try:
+                process.wait(timeout=0.5)
+            except subprocess.TimeoutExpired:
+                pass
+        else:
+            process.wait()
+        process.stdout.close()
+        process.stderr.close()
+
+    if refusal is not None:
+        raise GitQueryRefusal(refusal)
+    return GitResult(process.returncode, bytes(streams[stdout_fd]), bytes(streams[stderr_fd]))
 
 
 def refuse(reason: str) -> int:
@@ -52,159 +136,201 @@ def local_directory(path: Path) -> os.stat_result | None:
     return entry
 
 
-def main() -> int:
-    cwd = Path.cwd()
-    top = git(cwd, "rev-parse", "--show-toplevel")
-    if top.returncode != 0 or not top.stdout.strip():
-        return refuse("the current directory is not a repository")
-    root = Path(top.stdout.strip()).resolve()
+def command_scope_hooks_path() -> bool:
+    """Return whether inherited Git command-scope config may set hooksPath."""
 
-    if git(root, "rev-parse", "--is-bare-repository").stdout.strip() != "false":
-        return refuse("bare or ambiguous repository")
-
-    dotgit = root / ".git"
-    dotgit_stat = local_directory(dotgit)
-    if dotgit_stat is None:
-        return refuse("only a main checkout with a real .git directory is eligible")
-
-    identity = git(root, "rev-parse", "--git-dir", "--git-common-dir")
-    if identity.returncode != 0:
-        return refuse("Git could not prove repository identity")
-    identity_paths = []
-    for line in identity.stdout.splitlines():
-        path = Path(line)
-        identity_paths.append((root / path if not path.is_absolute() else path).resolve())
-    if len(identity_paths) != 2 or any(path != dotgit.resolve() for path in identity_paths):
-        return refuse("the Git directory is linked, shared, or not this repository's .git")
-
-    hooks = dotgit / "hooks"
-    hooks_stat = local_directory(hooks)
-    if hooks_stat is None:
-        return refuse(".git/hooks is not a real local directory")
-    if hooks_stat.st_uid != dotgit_stat.st_uid:
-        return refuse(".git/hooks ownership is ambiguous")
-
-    # git-hooks.nix may explicitly set the ordinary local path. That exact
-    # value is eligible; every custom, global, system, worktree, or shared
-    # setting is refused before its target can be inspected.
-    local_path = git(root, "config", "--local", "--get-all", "core.hooksPath")
-    if local_path.returncode not in (0, 1):
-        return refuse("could not inspect the local core.hooksPath")
-    local_values = local_path.stdout.splitlines()
-    if len(local_values) > 1:
-        return refuse("multiple local core.hooksPath values are ambiguous")
-    if local_values:
-        configured_path = Path(local_values[0])
-        if not configured_path.is_absolute():
-            configured_path = root / configured_path
-        if configured_path.resolve() != hooks.resolve():
-            return refuse("core.hooksPath is custom rather than this repository's .git/hooks")
-    for scope in ("--global", "--system"):
-        scoped = git(root, "config", scope, "--get-all", "core.hooksPath")
-        if scoped.returncode not in (0, 1):
-            return refuse(f"could not inspect {scope[2:]} core.hooksPath")
-        if scoped.stdout.strip():
-            return refuse(f"{scope[2:]} core.hooksPath is configured and out of scope")
-    worktree_config = git(root, "config", "--local", "--get", "extensions.worktreeConfig")
-    if worktree_config.returncode not in (0, 1):
-        return refuse("could not inspect the worktree-config setting")
-    if worktree_config.stdout.strip().lower() in {"true", "yes", "on", "1"}:
-        scoped = git(root, "config", "--worktree", "--get-all", "core.hooksPath")
-        if scoped.returncode not in (0, 1):
-            return refuse("could not inspect worktree core.hooksPath")
-        if scoped.stdout.strip():
-            return refuse("worktree core.hooksPath is configured and out of scope")
-
-    candidate = hooks / "post-checkout"
-    try:
-        candidate_stat = os.lstat(candidate)
-    except FileNotFoundError:
-        say("no legacy post-checkout hook found")
-        return 0
-    except OSError as error:
-        return refuse(f"could not inspect post-checkout without following it: {error}")
-
-    if not stat.S_ISREG(candidate_stat.st_mode) or stat.S_ISLNK(candidate_stat.st_mode):
-        return refuse("post-checkout is not an ordinary regular file")
-    if candidate_stat.st_uid != dotgit_stat.st_uid:
-        return refuse("post-checkout ownership is ambiguous")
-    if candidate_stat.st_size > MAX_BYTES:
-        return refuse(f"post-checkout exceeds the {MAX_BYTES}-byte read bound")
-
-    nofollow = getattr(os, "O_NOFOLLOW", 0)
-    directory = getattr(os, "O_DIRECTORY", 0)
-    if not nofollow or not directory:
-        return refuse("this platform has no rooted no-follow open primitive")
-    directory_flags = os.O_RDONLY | os.O_CLOEXEC | nofollow | directory
-    try:
-        # Open every parent by descriptor so a replacement of .git or hooks
-        # after lstat cannot redirect the candidate read through a symlink.
-        root_fd = os.open(root, directory_flags)
+    count = os.environ.get("GIT_CONFIG_COUNT")
+    if count is not None:
         try:
-            dotgit_fd = os.open(".git", directory_flags, dir_fd=root_fd)
-            try:
-                opened_dotgit = os.fstat(dotgit_fd)
-                if (opened_dotgit.st_dev, opened_dotgit.st_ino) != (
-                    dotgit_stat.st_dev,
-                    dotgit_stat.st_ino,
-                ):
-                    return refuse(".git changed during no-follow inspection")
-                hooks_fd = os.open("hooks", directory_flags, dir_fd=dotgit_fd)
-                try:
-                    opened_hooks = os.fstat(hooks_fd)
-                    if (opened_hooks.st_dev, opened_hooks.st_ino) != (
-                        hooks_stat.st_dev,
-                        hooks_stat.st_ino,
-                    ):
-                        return refuse(".git/hooks changed during no-follow inspection")
-                    fd = os.open(
-                        "post-checkout",
-                        os.O_RDONLY | os.O_CLOEXEC | nofollow,
-                        dir_fd=hooks_fd,
-                    )
-                finally:
-                    os.close(hooks_fd)
-            finally:
-                os.close(dotgit_fd)
-        finally:
-            os.close(root_fd)
-    except OSError as error:
-        return refuse(f"post-checkout changed or could not be opened without following it: {error}")
-    try:
-        opened = os.fstat(fd)
-        if not stat.S_ISREG(opened.st_mode) or opened.st_uid != dotgit_stat.st_uid:
-            return refuse("post-checkout changed to an ambiguous path while being read")
-        if opened.st_size > MAX_BYTES:
-            return refuse(f"post-checkout exceeds the {MAX_BYTES}-byte read bound")
-        data = bytearray()
-        while len(data) <= MAX_BYTES:
-            chunk = os.read(fd, min(8192, MAX_BYTES + 1 - len(data)))
-            if not chunk:
-                break
-            data.extend(chunk)
-        if len(data) > MAX_BYTES:
-            return refuse(f"post-checkout exceeded the {MAX_BYTES}-byte read bound")
-        after = os.fstat(fd)
-        if (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns) != (
-            after.st_dev,
-            after.st_ino,
-            after.st_size,
-            after.st_mtime_ns,
-        ):
-            return refuse("post-checkout changed during the bounded read")
-    finally:
-        os.close(fd)
+            count_value = int(count)
+        except ValueError:
+            return True
+        if count_value < 0:
+            return True
+        entries = range(count_value)
+        for index in entries:
+            key = os.environ.get(f"GIT_CONFIG_KEY_{index}")
+            if key is None:
+                return True
+            if key.casefold() == "core.hookspath":
+                return True
+    parameters = os.environ.get("GIT_CONFIG_PARAMETERS", "")
+    return "core.hookspath" in parameters.casefold()
 
-    digest = hashlib.sha256(data).hexdigest()
-    if digest == LEGACY_SHA256:
-        say(
-            "found the exact legacy checkout hook; it remains active until explicitly removed. "
-            f"After reviewing {candidate}, remove only that repository-local regular file "
-            "manually (never use this diagnostic as an uninstall step)."
-        )
-    else:
-        say("found a foreign post-checkout file; it was preserved and requires manual review")
-    return 0
+
+def one_line(data: bytes, description: str) -> str:
+    """Decode one Git path/value without lossy Unicode conversion."""
+
+    if b"\0" in data:
+        raise GitQueryRefusal(f"Git returned an unsupported NUL in {description}")
+    line = data[:-1] if data.endswith(b"\n") else data
+    if b"\n" in line or b"\r" in line:
+        raise GitQueryRefusal(f"Git returned ambiguous {description} output")
+    return os.fsdecode(line)
+
+
+def main() -> int:
+    try:
+        cwd = Path.cwd()
+        if command_scope_hooks_path():
+            return refuse("inherited command-scope core.hooksPath is ambiguous")
+        top = git(cwd, "rev-parse", "--show-toplevel")
+        if top.returncode != 0 or not top.stdout.strip():
+            return refuse("the current directory is not a repository")
+        root = Path(one_line(top.stdout, "repository root")).resolve()
+
+        if git(root, "rev-parse", "--is-bare-repository").stdout.strip() != b"false":
+            return refuse("bare or ambiguous repository")
+
+        dotgit = root / ".git"
+        dotgit_stat = local_directory(dotgit)
+        if dotgit_stat is None:
+            return refuse("only a main checkout with a real .git directory is eligible")
+
+        identity = git(root, "rev-parse", "--git-dir", "--git-common-dir")
+        if identity.returncode != 0:
+            return refuse("Git could not prove repository identity")
+        identity_paths = []
+        for line in identity.stdout.splitlines():
+            path = Path(os.fsdecode(line))
+            identity_paths.append((root / path if not path.is_absolute() else path).resolve())
+        if len(identity_paths) != 2 or any(path != dotgit.resolve() for path in identity_paths):
+            return refuse("the Git directory is linked, shared, or not this repository's .git")
+
+        hooks = dotgit / "hooks"
+        hooks_stat = local_directory(hooks)
+        if hooks_stat is None:
+            return refuse(".git/hooks is not a real local directory")
+        if hooks_stat.st_uid != dotgit_stat.st_uid:
+            return refuse(".git/hooks ownership is ambiguous")
+
+        # git-hooks.nix may explicitly set the ordinary local path. That exact
+        # value is eligible; every custom, global, system, worktree, or shared
+        # setting is refused before its target can be inspected.
+        local_path = git(root, "config", "--local", "--get-all", "core.hooksPath")
+        if local_path.returncode not in (0, 1):
+            return refuse("could not inspect the local core.hooksPath")
+        local_values = local_path.stdout.splitlines()
+        if len(local_values) > 1:
+            return refuse("multiple local core.hooksPath values are ambiguous")
+        if local_values:
+            configured_path = Path(os.fsdecode(local_values[0]))
+            if not configured_path.is_absolute():
+                configured_path = root / configured_path
+            if configured_path.resolve() != hooks.resolve():
+                return refuse("core.hooksPath is custom rather than this repository's .git/hooks")
+        for scope in ("--global", "--system"):
+            scoped = git(root, "config", scope, "--get-all", "core.hooksPath")
+            if scoped.returncode not in (0, 1):
+                return refuse(f"could not inspect {scope[2:]} core.hooksPath")
+            if scoped.stdout.strip():
+                return refuse(f"{scope[2:]} core.hooksPath is configured and out of scope")
+        worktree_config = git(root, "config", "--local", "--get", "extensions.worktreeConfig")
+        if worktree_config.returncode not in (0, 1):
+            return refuse("could not inspect the worktree-config setting")
+        if worktree_config.stdout.strip().lower() in {b"true", b"yes", b"on", b"1"}:
+            scoped = git(root, "config", "--worktree", "--get-all", "core.hooksPath")
+            if scoped.returncode not in (0, 1):
+                return refuse("could not inspect worktree core.hooksPath")
+            if scoped.stdout.strip():
+                return refuse("worktree core.hooksPath is configured and out of scope")
+
+        candidate = hooks / "post-checkout"
+        try:
+            candidate_stat = os.lstat(candidate)
+        except FileNotFoundError:
+            say("no legacy post-checkout hook found")
+            return 0
+        except OSError as error:
+            return refuse(f"could not inspect post-checkout without following it: {error}")
+
+        if not stat.S_ISREG(candidate_stat.st_mode) or stat.S_ISLNK(candidate_stat.st_mode):
+            return refuse("post-checkout is not an ordinary regular file")
+        if candidate_stat.st_uid != dotgit_stat.st_uid:
+            return refuse("post-checkout ownership is ambiguous")
+        if candidate_stat.st_size > MAX_BYTES:
+            return refuse(f"post-checkout exceeds the {MAX_BYTES}-byte read bound")
+
+        nofollow = getattr(os, "O_NOFOLLOW", 0)
+        directory = getattr(os, "O_DIRECTORY", 0)
+        nonblock = getattr(os, "O_NONBLOCK", 0)
+        cloexec = getattr(os, "O_CLOEXEC", 0)
+        if not all((nofollow, directory, nonblock, cloexec)):
+            return refuse("this platform has no rooted no-follow nonblocking open primitive")
+        directory_flags = os.O_RDONLY | cloexec | nofollow | directory
+        try:
+            # Open every parent by descriptor so a replacement of .git or hooks
+            # after lstat cannot redirect the candidate read through a symlink.
+            root_fd = os.open(root, directory_flags)
+            try:
+                dotgit_fd = os.open(".git", directory_flags, dir_fd=root_fd)
+                try:
+                    opened_dotgit = os.fstat(dotgit_fd)
+                    if (opened_dotgit.st_dev, opened_dotgit.st_ino) != (
+                        dotgit_stat.st_dev,
+                        dotgit_stat.st_ino,
+                    ):
+                        return refuse(".git changed during no-follow inspection")
+                    hooks_fd = os.open("hooks", directory_flags, dir_fd=dotgit_fd)
+                    try:
+                        opened_hooks = os.fstat(hooks_fd)
+                        if (opened_hooks.st_dev, opened_hooks.st_ino) != (
+                            hooks_stat.st_dev,
+                            hooks_stat.st_ino,
+                        ):
+                            return refuse(".git/hooks changed during no-follow inspection")
+                        fd = os.open(
+                            "post-checkout",
+                            os.O_RDONLY | cloexec | nofollow | nonblock,
+                            dir_fd=hooks_fd,
+                        )
+                    finally:
+                        os.close(hooks_fd)
+                finally:
+                    os.close(dotgit_fd)
+            finally:
+                os.close(root_fd)
+        except OSError as error:
+            return refuse(f"post-checkout changed or could not be opened without following it: {error}")
+        try:
+            opened = os.fstat(fd)
+            if (opened.st_dev, opened.st_ino) != (candidate_stat.st_dev, candidate_stat.st_ino):
+                return refuse("post-checkout was replaced during no-follow inspection")
+            if not stat.S_ISREG(opened.st_mode) or opened.st_uid != dotgit_stat.st_uid:
+                return refuse("post-checkout changed to an ambiguous path while being read")
+            if opened.st_size > MAX_BYTES:
+                return refuse(f"post-checkout exceeds the {MAX_BYTES}-byte read bound")
+            data = bytearray()
+            while len(data) <= MAX_BYTES:
+                chunk = os.read(fd, min(8192, MAX_BYTES + 1 - len(data)))
+                if not chunk:
+                    break
+                data.extend(chunk)
+            if len(data) > MAX_BYTES:
+                return refuse(f"post-checkout exceeded the {MAX_BYTES}-byte read bound")
+            after = os.fstat(fd)
+            if (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns) != (
+                after.st_dev,
+                after.st_ino,
+                after.st_size,
+                after.st_mtime_ns,
+            ):
+                return refuse("post-checkout changed during the bounded read")
+        finally:
+            os.close(fd)
+
+        digest = hashlib.sha256(data).hexdigest()
+        if digest == LEGACY_SHA256:
+            say(
+                "found the exact legacy checkout hook; it remains active until explicitly removed. "
+                f"After reviewing {candidate}, remove only that repository-local regular file "
+                "manually (never use this diagnostic as an uninstall step)."
+            )
+        else:
+            say("found a foreign post-checkout file; it was preserved and requires manual review")
+        return 0
+    except GitQueryRefusal as error:
+        return refuse(str(error))
 
 
 if __name__ == "__main__":
