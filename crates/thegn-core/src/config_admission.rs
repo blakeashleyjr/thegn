@@ -324,6 +324,13 @@ impl AdmittedConfig {
     pub fn health(&self) -> AdmissionHealth {
         self.health
     }
+
+    /// Only the live store assigns generations; an unpublished candidate
+    /// carries generation 0 and so can never match a published revision.
+    pub(crate) fn with_generation(mut self, generation: u64) -> Self {
+        self.revision.generation = generation;
+        self
+    }
 }
 
 struct ParsedLayer {
