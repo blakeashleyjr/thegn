@@ -372,6 +372,16 @@ mod tests {
     }
 
     #[test]
+    fn public_destination_policy_rejects_non_global_ipv6_special_prefixes() {
+        // These are not globally routable unicast destinations, but the
+        // hand-written allowlist below would otherwise admit them.
+        for raw in ["2001:2::1", "2001:10::1", "3fff::1"] {
+            let ip = raw.parse().unwrap();
+            assert!(!address_allowed(ip, false), "{raw} must be refused");
+        }
+    }
+
+    #[test]
     fn invalid_calendar_urls_never_construct_a_transport() {
         for raw in [
             "ftp://calendar.example/events.ics",
