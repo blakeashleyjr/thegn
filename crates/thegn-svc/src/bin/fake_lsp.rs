@@ -105,6 +105,31 @@ fn main() {
                     if std::env::args().any(|a| a == "--no-hover") {
                         caps.as_object_mut().unwrap().remove("hoverProvider");
                     }
+                    // `--flood N`: publish N unique documents BEFORE the
+                    // initialize reply, so a client's `initialize()` returning
+                    // proves every flood notification was already dispatched.
+                    let flood = std::env::args()
+                        .skip_while(|a| a != "--flood")
+                        .nth(1)
+                        .and_then(|n| n.parse::<usize>().ok())
+                        .unwrap_or(0);
+                    for index in 0..flood {
+                        send(
+                            &mut out,
+                            &json!({
+                                "jsonrpc": "2.0",
+                                "method": "textDocument/publishDiagnostics",
+                                "params": {
+                                    "uri": format!("file:///proj/flood/{index}.rs"),
+                                    "diagnostics": [{
+                                        "range": { "start": { "line": 0, "character": 0 } },
+                                        "severity": 2,
+                                        "message": format!("flood {index}")
+                                    }]
+                                }
+                            }),
+                        );
+                    }
                     reply(
                         &mut out,
                         &id.unwrap_or(Value::Null),
@@ -129,6 +154,18 @@ fn main() {
                             }
                         }),
                     );
+                    // `--clear`: then clear the same document (a complete,
+                    // empty publication that must supersede the update).
+                    if std::env::args().any(|a| a == "--clear") {
+                        send(
+                            &mut out,
+                            &json!({
+                                "jsonrpc": "2.0",
+                                "method": "textDocument/publishDiagnostics",
+                                "params": { "uri": "file:///proj/src/lib.rs", "diagnostics": [] }
+                            }),
+                        );
+                    }
                 }
                 "textDocument/documentSymbol" => reply(
                     &mut out,

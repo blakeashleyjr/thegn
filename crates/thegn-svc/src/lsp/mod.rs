@@ -16,18 +16,23 @@
 //! Lifecycle (lazy start, warm reuse, shutdown-on-drop) is owned a layer up by
 //! the host's `LspSupervisor`; this module is just one connection.
 
+pub mod diagnostics_queue;
 pub mod framing;
 pub mod registry;
 
+pub use diagnostics_queue::{
+    DiagnosticKey, DiagnosticsReceiver, DiagnosticsSender, LossMarks, StreamKey,
+    diagnostics_channel, published_diagnostics_bytes,
+};
 pub use registry::{Registry, RegistryEntry, Resolution, binary_on_path};
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Sender, TryRecvError};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::mpsc::{self, Sender};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -54,6 +59,24 @@ pub mod limits {
     pub const MAX_ROOTS: usize = 32;
     pub const MAX_FILES_PER_ROOT: usize = 4096;
     pub const MAX_RETAINED_BYTES: usize = 16 * 1024 * 1024;
+    /// Language servers registered concurrently per root.
+    pub const MAX_SERVERS_PER_ROOT: usize = 32;
+    /// Per-document loss marks held by the queue before it falls back to a
+    /// stream-level mark (and, in the host store, the same bound).
+    pub const MAX_LOSS_MARKS: usize = MAX_QUEUE_DOCUMENTS;
+    /// Queue metadata outside the pending publications: the authority
+    /// registry plus document loss marks. Registration beyond it is refused.
+    pub const MAX_QUEUE_METADATA_BYTES: usize = 4 * 1024 * 1024;
+    /// `[[lsp.servers]]` entries honored at runtime, and args per entry.
+    pub const MAX_REGISTRY_ENTRIES: usize = 256;
+    pub const MAX_REGISTRY_ARGS: usize = 256;
+    /// Host drain budget per loop iteration: publications, accounted bytes
+    /// (`published_diagnostics_bytes`), and wall time. The item that crosses
+    /// a limit is finished (overshoot is at most one publication, itself
+    /// capped at `MAX_DIAGNOSTIC_BYTES`); pending input preempts between items.
+    pub const DRAIN_PUBLICATIONS: usize = 8;
+    pub const DRAIN_BYTES: usize = 256 * 1024;
+    pub const DRAIN_MICROS: u64 = 2_000;
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -99,403 +122,6 @@ pub struct PublishedDiagnostics {
     /// False means the publication was bounded or malformed and cannot
     /// authoritatively clear the previous document state.
     pub complete: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct DiagnosticKey {
-    pub root: PathBuf,
-    pub server_identity: String,
-    pub generation: u64,
-    pub path: String,
-}
-
-#[derive(Debug, Default)]
-struct QueueState {
-    pending: HashMap<DiagnosticKey, PublishedDiagnostics>,
-    order: VecDeque<DiagnosticKey>,
-    last_root: Option<PathBuf>,
-    wake_pending: bool,
-    bytes: usize,
-    health: LspHealth,
-    incomplete: HashMap<DiagnosticKey, ()>,
-    last_sequence: HashMap<DiagnosticKey, u64>,
-}
-
-impl QueueState {
-    fn mark_incomplete(&mut self, key: DiagnosticKey) {
-        if self.incomplete.len() >= limits::MAX_QUEUE_DOCUMENTS
-            && !self.incomplete.contains_key(&key)
-        {
-            if let Some(oldest) = self.incomplete.keys().min().cloned() {
-                self.incomplete.remove(&oldest);
-            }
-        }
-        self.incomplete.insert(key, ());
-    }
-}
-
-/// A non-blocking latest-per-document diagnostics bus.  Reader threads never
-/// wait for the UI: replacements are cheap, new keys use deterministic oldest
-/// eviction, and every loss is sticky health rather than a silent clean state.
-#[derive(Clone, Debug)]
-pub struct DiagnosticsSender {
-    state: Arc<Mutex<QueueState>>,
-    active: Arc<Mutex<HashMap<(PathBuf, String), u64>>>,
-    notify: Arc<Condvar>,
-}
-
-#[derive(Debug, Clone)]
-pub struct DiagnosticsReceiver {
-    state: Arc<Mutex<QueueState>>,
-    active: Arc<Mutex<HashMap<(PathBuf, String), u64>>>,
-    notify: Arc<Condvar>,
-}
-
-pub fn diagnostics_channel() -> (DiagnosticsSender, DiagnosticsReceiver) {
-    let state = Arc::new(Mutex::new(QueueState::default()));
-    let active = Arc::new(Mutex::new(HashMap::new()));
-    let notify = Arc::new(Condvar::new());
-    (
-        DiagnosticsSender {
-            state: state.clone(),
-            active: active.clone(),
-            notify: notify.clone(),
-        },
-        DiagnosticsReceiver {
-            state,
-            active,
-            notify,
-        },
-    )
-}
-
-pub fn published_diagnostics_bytes(pd: &PublishedDiagnostics) -> usize {
-    let diagnostic_bytes = pd.diagnostics.iter().fold(0usize, |n, d| {
-        n.saturating_add(d.message.len())
-            .saturating_add(d.code.as_ref().map_or(0, String::len))
-            .saturating_add(d.source.as_ref().map_or(0, String::len))
-            .saturating_add(std::mem::size_of::<LspDiagnostic>())
-    });
-    pd.root
-        .as_os_str()
-        .to_string_lossy()
-        .len()
-        .saturating_add(pd.path.len())
-        .saturating_add(pd.server_identity.len())
-        .saturating_add(diagnostic_bytes)
-        .saturating_add(std::mem::size_of::<PublishedDiagnostics>())
-}
-
-impl DiagnosticsSender {
-    pub fn set_active(&self, root: PathBuf, identity: String, generation: u64) -> bool {
-        if let Ok(mut active) = self.active.lock() {
-            while active.len() >= limits::MAX_ROOTS * limits::MAX_QUEUE_DOCUMENTS
-                && !active.contains_key(&(root.clone(), identity.clone()))
-            {
-                let Some(retired) = active
-                    .iter()
-                    .filter(|(_, generation)| **generation == u64::MAX)
-                    .map(|(authority, _)| authority.clone())
-                    .min()
-                else {
-                    break;
-                };
-                active.remove(&retired);
-            }
-            if !active.keys().any(|(existing, _)| existing == &root) {
-                while active
-                    .keys()
-                    .map(|(existing, _)| existing)
-                    .collect::<std::collections::HashSet<_>>()
-                    .len()
-                    >= limits::MAX_ROOTS
-                {
-                    let Some(retired_root) = active
-                        .iter()
-                        .filter(|(_, generation)| **generation == u64::MAX)
-                        .map(|((root, _), _)| root.clone())
-                        .min()
-                    else {
-                        return false;
-                    };
-                    active.retain(|(existing, _), generation| {
-                        existing != &retired_root || *generation != u64::MAX
-                    });
-                }
-            }
-            if !active.contains_key(&(root.clone(), identity.clone()))
-                && active
-                    .keys()
-                    .filter(|(existing, _)| existing == &root)
-                    .count()
-                    >= limits::MAX_QUEUE_DOCUMENTS
-            {
-                return false;
-            }
-            active.insert((root, identity), generation);
-            return true;
-        }
-        false
-    }
-
-    pub fn retire(&self, root: &Path, identity: &str, generation: u64) {
-        if let Ok(mut active) = self.active.lock()
-            && active.get(&(root.to_path_buf(), identity.to_string())) == Some(&generation)
-        {
-            active.insert((root.to_path_buf(), identity.to_string()), u64::MAX);
-        }
-    }
-
-    pub fn record(&self, health: LspHealth) {
-        if let Ok(mut state) = self.state.lock() {
-            state.health.saturating_add(health);
-            state.wake_pending = true;
-        }
-        self.notify.notify_all();
-    }
-
-    pub fn publish(&self, pd: PublishedDiagnostics) {
-        let authority = (pd.root.clone(), pd.server_identity.clone());
-        let key = DiagnosticKey {
-            root: pd.root.clone(),
-            server_identity: pd.server_identity.clone(),
-            generation: pd.generation,
-            path: pd.path.clone(),
-        };
-        let bytes = published_diagnostics_bytes(&pd);
-        let complete = pd.complete;
-        let Ok(mut state) = self.state.lock() else {
-            return;
-        };
-        let active = self
-            .active
-            .lock()
-            .ok()
-            .and_then(|g| g.get(&authority).copied());
-        let supervised = !pd.server_identity.is_empty() || pd.generation != 0;
-        if supervised && active != Some(pd.generation) {
-            state.bytes = state.bytes.saturating_sub(published_diagnostics_bytes(&pd));
-            state.health.stale = state.health.stale.saturating_add(1);
-            state.wake_pending = true;
-            self.notify.notify_all();
-            return;
-        }
-        if let Some(previous) = state.last_sequence.get(&key)
-            && pd.sequence <= *previous
-        {
-            state.health.stale = state.health.stale.saturating_add(1);
-            state.wake_pending = true;
-            self.notify.notify_all();
-            return;
-        }
-        if state.last_sequence.len() >= limits::MAX_QUEUE_DOCUMENTS
-            && !state.last_sequence.contains_key(&key)
-        {
-            if let Some(oldest) = state.last_sequence.keys().min().cloned() {
-                state.last_sequence.remove(&oldest);
-            }
-        }
-        state.last_sequence.insert(key.clone(), pd.sequence);
-        if let Some(old) = state.pending.get(&key) {
-            let old_bytes = published_diagnostics_bytes(old);
-            if state.bytes.saturating_sub(old_bytes).saturating_add(bytes) > limits::MAX_QUEUE_BYTES
-            {
-                state.mark_incomplete(key);
-                state.health.dropped = state.health.dropped.saturating_add(1);
-                state.health.incomplete = state.health.incomplete.saturating_add(1);
-                state.wake_pending = true;
-                self.notify.notify_all();
-                return;
-            }
-            let _old = state
-                .pending
-                .insert(key.clone(), pd)
-                .expect("checked above");
-            state.bytes = state.bytes.saturating_sub(old_bytes);
-            state.bytes = state.bytes.saturating_add(bytes);
-            if complete {
-                state.incomplete.remove(&key);
-            } else {
-                state.mark_incomplete(key);
-                state.health.incomplete = state.health.incomplete.saturating_add(1);
-            }
-            state.wake_pending = true;
-            self.notify.notify_all();
-            return;
-        }
-        while state.pending.len() >= limits::MAX_QUEUE_DOCUMENTS
-            || state.bytes.saturating_add(bytes) > limits::MAX_QUEUE_BYTES
-        {
-            let Some(evict) = oldest_key_for_root(&state, &key.root) else {
-                break;
-            };
-            if let Some(old) = state.pending.remove(&evict) {
-                state.bytes = state
-                    .bytes
-                    .saturating_sub(published_diagnostics_bytes(&old));
-                state.order.retain(|candidate| candidate != &evict);
-                state.mark_incomplete(evict);
-                state.health.dropped = state.health.dropped.saturating_add(1);
-                state.health.incomplete = state.health.incomplete.saturating_add(1);
-            } else {
-                break;
-            }
-        }
-        if state.pending.len() >= limits::MAX_QUEUE_DOCUMENTS
-            || state.bytes.saturating_add(bytes) > limits::MAX_QUEUE_BYTES
-        {
-            state.mark_incomplete(key);
-            state.health.dropped = state.health.dropped.saturating_add(1);
-            state.health.incomplete = state.health.incomplete.saturating_add(1);
-            state.wake_pending = true;
-            self.notify.notify_all();
-            return;
-        }
-        state.bytes = state.bytes.saturating_add(bytes);
-        state.order.push_back(key.clone());
-        state.pending.insert(key.clone(), pd);
-        if !complete {
-            state.mark_incomplete(key);
-            state.health.incomplete = state.health.incomplete.saturating_add(1);
-        }
-        state.wake_pending = true;
-        self.notify.notify_all();
-    }
-}
-
-pub trait DiagnosticSink: Send + Sync {
-    fn publish(&self, publication: PublishedDiagnostics);
-    fn record(&self, health: LspHealth);
-}
-
-impl DiagnosticSink for DiagnosticsSender {
-    fn publish(&self, publication: PublishedDiagnostics) {
-        DiagnosticsSender::publish(self, publication);
-    }
-    fn record(&self, health: LspHealth) {
-        DiagnosticsSender::record(self, health);
-    }
-}
-
-impl DiagnosticSink for Sender<PublishedDiagnostics> {
-    fn publish(&self, publication: PublishedDiagnostics) {
-        let _ = self.send(publication);
-    }
-    fn record(&self, _health: LspHealth) {}
-}
-
-fn oldest_key_for_root(state: &QueueState, incoming_root: &Path) -> Option<DiagnosticKey> {
-    let root = state
-        .pending
-        .keys()
-        .filter(|key| key.root == incoming_root)
-        .map(|key| key.root.clone())
-        .next()
-        .or_else(|| {
-            state
-                .pending
-                .keys()
-                .fold(None, |best: Option<(PathBuf, usize)>, key| {
-                    let count = state
-                        .pending
-                        .keys()
-                        .filter(|other| other.root == key.root)
-                        .count();
-                    match best {
-                        None => Some((key.root.clone(), count)),
-                        Some((root, n)) if count > n || (count == n && key.root < root) => {
-                            Some((key.root.clone(), count))
-                        }
-                        other => other,
-                    }
-                })
-                .map(|(root, _)| root)
-        });
-    root.and_then(|root| state.order.iter().find(|key| key.root == root).cloned())
-}
-
-impl DiagnosticsReceiver {
-    pub fn wait(&self) {
-        let Ok(mut state) = self.state.lock() else {
-            return;
-        };
-        while !state.wake_pending {
-            state = match self.notify.wait(state) {
-                Ok(state) => state,
-                Err(_) => return,
-            };
-        }
-        state.wake_pending = false;
-    }
-
-    /// Re-arm the bridge wake after the host deliberately stopped at its
-    /// per-turn budget while queued publications remain.
-    pub fn rearm_if_pending(&self) {
-        if let Ok(mut state) = self.state.lock()
-            && !state.order.is_empty()
-        {
-            state.wake_pending = true;
-            self.notify.notify_all();
-        }
-    }
-
-    pub fn try_recv(&self) -> Result<PublishedDiagnostics, TryRecvError> {
-        let Ok(mut state) = self.state.lock() else {
-            return Err(TryRecvError::Disconnected);
-        };
-        let index = state
-            .order
-            .iter()
-            .position(|key| {
-                state
-                    .last_root
-                    .as_ref()
-                    .is_none_or(|root| &key.root != root)
-            })
-            .unwrap_or(0);
-        let Some(key) = state.order.remove(index) else {
-            return Err(TryRecvError::Empty);
-        };
-        let Some(pd) = state.pending.remove(&key) else {
-            return Err(TryRecvError::Empty);
-        };
-        let supervised = !pd.server_identity.is_empty() || pd.generation != 0;
-        let active = self.active.lock().ok().and_then(|active| {
-            active
-                .get(&(pd.root.clone(), pd.server_identity.clone()))
-                .copied()
-        });
-        if supervised && active != Some(pd.generation) {
-            state.health.stale = state.health.stale.saturating_add(1);
-            state.wake_pending = true;
-            self.notify.notify_all();
-            return Err(TryRecvError::Empty);
-        }
-        state.last_root = Some(key.root.clone());
-        state.bytes = state.bytes.saturating_sub(published_diagnostics_bytes(&pd));
-        Ok(pd)
-    }
-
-    pub fn health(&self) -> LspHealth {
-        self.state
-            .lock()
-            .map(|state| state.health)
-            .unwrap_or_default()
-    }
-
-    pub fn take_health(&self) -> LspHealth {
-        self.state
-            .lock()
-            .map(|mut state| std::mem::take(&mut state.health))
-            .unwrap_or_default()
-    }
-
-    pub fn take_incomplete(&self) -> Vec<DiagnosticKey> {
-        let Ok(mut state) = self.state.lock() else {
-            return Vec::new();
-        };
-        state.incomplete.drain().map(|(key, _)| key).collect()
-    }
 }
 
 /// Why an LSP operation could not complete.
@@ -793,7 +419,7 @@ struct ProjectionHealth {
 }
 
 impl ProjectionHealth {
-    fn record(self, sink: &dyn DiagnosticSink) {
+    fn record(self, sink: &DiagnosticsSender) {
         sink.record(LspHealth {
             truncated: u64::from(self.truncated),
             invalid: u64::from(self.invalid),
@@ -852,11 +478,11 @@ pub fn preflight_json(input: &[u8]) -> Result<(), &'static str> {
         match input[i] {
             b' ' | b'\n' | b'\r' | b'\t' | b':' => i += 1,
             b',' => {
-                if let Some((_, commas, has_item)) = stack.last_mut() {
-                    if *has_item {
-                        *commas = commas.saturating_add(1);
-                        *has_item = false;
-                    }
+                if let Some((_, commas, has_item)) = stack.last_mut()
+                    && *has_item
+                {
+                    *commas = commas.saturating_add(1);
+                    *has_item = false;
                 }
                 i += 1;
             }
@@ -965,6 +591,56 @@ pub fn preflight_json(input: &[u8]) -> Result<(), &'static str> {
     }
 }
 
+/// The integer `id` member of a top-level JSON object, found by a linear scan
+/// that tracks only nesting and string boundaries (no allocation). Used to
+/// fail a request whose response was rejected by [`preflight_json`].
+pub fn top_level_id(input: &[u8]) -> Option<i64> {
+    let mut depth = 0usize;
+    let mut i = 0usize;
+    // Byte range of the most recent depth-1 string, and whether it is a key.
+    let mut last_key: Option<(usize, usize)> = None;
+    while i < input.len() {
+        match input[i] {
+            b'{' | b'[' => {
+                depth += 1;
+                i += 1;
+            }
+            b'}' | b']' => {
+                depth = depth.checked_sub(1)?;
+                i += 1;
+            }
+            b'"' => {
+                let start = i + 1;
+                i += 1;
+                while i < input.len() && input[i] != b'"' {
+                    i += if input[i] == b'\\' { 2 } else { 1 };
+                }
+                let end = i.min(input.len());
+                i += 1;
+                if depth == 1 {
+                    last_key = Some((start, end));
+                }
+            }
+            b':' if depth == 1 => {
+                i += 1;
+                if last_key.is_some_and(|(a, b)| &input[a..b] == b"id") {
+                    while i < input.len() && matches!(input[i], b' ' | b'\n' | b'\r' | b'\t') {
+                        i += 1;
+                    }
+                    let start = i;
+                    while i < input.len() && (input[i] == b'-' || input[i].is_ascii_digit()) {
+                        i += 1;
+                    }
+                    return std::str::from_utf8(&input[start..i]).ok()?.parse().ok();
+                }
+                last_key = None;
+            }
+            _ => i += 1,
+        }
+    }
+    None
+}
+
 /// Encode an absolute filesystem path as a `file://` URI.
 pub fn path_to_uri(path: &str) -> String {
     if path.len() > limits::MAX_IDENTITY_BYTES {
@@ -986,13 +662,12 @@ fn bounded_uri_to_path(uri: &str) -> Option<String> {
     let body = uri.strip_prefix("file://")?;
     let bytes = body.as_bytes();
     for (index, byte) in bytes.iter().enumerate() {
-        if *byte == b'%' {
-            if index + 2 >= bytes.len()
+        if *byte == b'%'
+            && (index + 2 >= bytes.len()
                 || !bytes[index + 1].is_ascii_hexdigit()
-                || !bytes[index + 2].is_ascii_hexdigit()
-            {
-                return None;
-            }
+                || !bytes[index + 2].is_ascii_hexdigit())
+        {
+            return None;
         }
     }
     let path = percent_decode(body);
@@ -1141,13 +816,15 @@ fn project_symbols(
         health.truncated = true;
     }
     let mut projected_bytes = 0usize;
-    let mut stack: Vec<(&Value, Option<String>)> = items
+    // (node, index in `out` of its parent) — the parent's name is cloned only
+    // when the child is actually emitted and byte-accounted, never per push.
+    let mut stack: Vec<(&Value, Option<usize>)> = items
         .iter()
         .take(limits::MAX_CONTAINER_ITEMS)
         .rev()
         .map(|item| (item, None))
         .collect();
-    while let Some((item, container)) = stack.pop() {
+    while let Some((item, parent)) = stack.pop() {
         if out.len() >= limits::MAX_RESULT_ITEMS {
             health.truncated = true;
             break;
@@ -1175,7 +852,11 @@ fn project_symbols(
             .get("containerName")
             .and_then(Value::as_str)
             .and_then(|s| bounded_string(s, limits::MAX_SCALAR_STRING_BYTES, health))
-            .or_else(|| container.clone());
+            .or_else(|| {
+                parent
+                    .and_then(|index| out.get(index))
+                    .map(|p: &SymbolInfo| p.name.clone())
+            });
         let item_bytes = name
             .len()
             .saturating_add(container_name.as_ref().map_or(0, String::len))
@@ -1186,8 +867,9 @@ fn project_symbols(
             break;
         }
         projected_bytes = projected_bytes.saturating_add(item_bytes);
+        let index = out.len();
         out.push(SymbolInfo {
-            name: name.clone(),
+            name,
             kind: SymbolKind::from_lsp(item.get("kind").and_then(Value::as_i64).unwrap_or(0)),
             location,
             container: container_name,
@@ -1197,7 +879,7 @@ fn project_symbols(
                 health.truncated = true;
             }
             for child in children.iter().take(limits::MAX_CONTAINER_ITEMS).rev() {
-                stack.push((child, Some(name.clone())));
+                stack.push((child, Some(index)));
             }
         }
     }
@@ -1290,29 +972,35 @@ fn parse_signatures_limited(result: &Value, health: &mut ProjectionHealth) -> Ve
         health.truncated = true;
     }
     let mut projected_bytes = 0usize;
-    sigs.iter()
-        .take(limits::MAX_RESULT_ITEMS)
-        .filter_map(|s| {
-            let label = bounded_string(
-                s.get("label").and_then(Value::as_str)?,
-                limits::MAX_SCALAR_STRING_BYTES,
-                health,
-            )?;
-            let doc = s
-                .get("documentation")
-                .map(|value| flatten_hover_contents_limited(value, health))
-                .filter(|d| !d.trim().is_empty());
-            let item_bytes = label
-                .len()
-                .saturating_add(doc.as_ref().map_or(0, String::len));
-            if projected_bytes.saturating_add(item_bytes) > limits::MAX_PROJECTED_RESPONSE_BYTES {
-                health.truncated = true;
-                return None;
-            }
-            projected_bytes = projected_bytes.saturating_add(item_bytes);
-            Some(SignatureInfo { label, doc })
-        })
-        .collect()
+    let mut out = Vec::new();
+    for s in sigs.iter().take(limits::MAX_RESULT_ITEMS) {
+        let Some(raw_label) = s.get("label").and_then(Value::as_str) else {
+            continue;
+        };
+        // Preflight the borrowed label against the aggregate before cloning.
+        if projected_bytes.saturating_add(raw_label.len()) > limits::MAX_PROJECTED_RESPONSE_BYTES {
+            health.truncated = true;
+            break;
+        }
+        let Some(label) = bounded_string(raw_label, limits::MAX_SCALAR_STRING_BYTES, health) else {
+            continue;
+        };
+        let doc = s
+            .get("documentation")
+            .map(|value| flatten_hover_contents_limited(value, health))
+            .filter(|d| !d.trim().is_empty());
+        let item_bytes = label
+            .len()
+            .saturating_add(doc.as_ref().map_or(0, String::len))
+            .saturating_add(std::mem::size_of::<SignatureInfo>());
+        if projected_bytes.saturating_add(item_bytes) > limits::MAX_PROJECTED_RESPONSE_BYTES {
+            health.truncated = true;
+            break;
+        }
+        projected_bytes = projected_bytes.saturating_add(item_bytes);
+        out.push(SignatureInfo { label, doc });
+    }
+    out
 }
 
 /// Parse a `textDocument/codeAction` result (`(Command | CodeAction)[]`).
@@ -1332,30 +1020,30 @@ fn parse_code_actions_limited(
         health.truncated = true;
     }
     let mut projected_bytes = 0usize;
-    items
-        .iter()
-        .take(limits::MAX_RESULT_ITEMS)
-        .filter_map(|v| {
-            let title = bounded_string(
-                v.get("title").and_then(Value::as_str)?,
-                limits::MAX_SCALAR_STRING_BYTES,
-                health,
-            )?;
-            let kind = v
-                .get("kind")
-                .and_then(Value::as_str)
-                .and_then(|s| bounded_string(s, limits::MAX_CODE_SOURCE_BYTES, health));
-            let item_bytes = title
-                .len()
-                .saturating_add(kind.as_ref().map_or(0, String::len));
-            if projected_bytes.saturating_add(item_bytes) > limits::MAX_PROJECTED_RESPONSE_BYTES {
-                health.truncated = true;
-                return None;
-            }
-            projected_bytes = projected_bytes.saturating_add(item_bytes);
-            Some(CodeActionInfo { title, kind })
-        })
-        .collect()
+    let mut out = Vec::new();
+    for v in items.iter().take(limits::MAX_RESULT_ITEMS) {
+        let Some(raw_title) = v.get("title").and_then(Value::as_str) else {
+            continue;
+        };
+        let raw_kind = v.get("kind").and_then(Value::as_str);
+        // Borrowed preflight: sanitization only shrinks, so raw lengths bound
+        // the projection before anything is cloned.
+        let item_bytes = raw_title
+            .len()
+            .saturating_add(raw_kind.map_or(0, str::len))
+            .saturating_add(std::mem::size_of::<CodeActionInfo>());
+        if projected_bytes.saturating_add(item_bytes) > limits::MAX_PROJECTED_RESPONSE_BYTES {
+            health.truncated = true;
+            break;
+        }
+        let Some(title) = bounded_string(raw_title, limits::MAX_SCALAR_STRING_BYTES, health) else {
+            continue;
+        };
+        let kind = raw_kind.and_then(|s| bounded_string(s, limits::MAX_CODE_SOURCE_BYTES, health));
+        projected_bytes = projected_bytes.saturating_add(item_bytes);
+        out.push(CodeActionInfo { title, kind });
+    }
+    out
 }
 
 /// Parse a `publishDiagnostics` notification's params, stamping the owning
@@ -1377,7 +1065,6 @@ fn parse_published_diagnostics_with_context(
         .and_then(Value::as_str)
         .and_then(bounded_uri_to_path)
     else {
-        health.invalid = true;
         return (
             None,
             LspHealth {
@@ -1387,7 +1074,6 @@ fn parse_published_diagnostics_with_context(
         );
     };
     let Some(raw_diagnostics) = params.get("diagnostics").and_then(Value::as_array) else {
-        health.invalid = true;
         return (
             Some(PublishedDiagnostics {
                 root: root.to_path_buf(),
@@ -1407,8 +1093,12 @@ fn parse_published_diagnostics_with_context(
     if raw_diagnostics.len() > limits::MAX_DIAGNOSTICS {
         health.truncated = true;
     }
+    // Count everything the publication will own (root, server identity, path
+    // and the struct itself) before admitting any item.
     let mut bytes = path
         .len()
+        .saturating_add(root.as_os_str().as_encoded_bytes().len())
+        .saturating_add(server_identity.len())
         .saturating_add(std::mem::size_of::<PublishedDiagnostics>());
     let mut diagnostics = Vec::new();
     for value in raw_diagnostics.iter().take(limits::MAX_DIAGNOSTICS) {
@@ -1538,7 +1228,11 @@ pub struct LspClient {
     pending: Pending,
     closed: Arc<AtomicBool>,
     root: PathBuf,
-    diagnostics: Arc<dyn DiagnosticSink>,
+    diagnostics: DiagnosticsSender,
+    /// The authority stream this connection publishes under; retired on drop
+    /// (a no-op when the supervisor already retired or replaced it).
+    server_identity: String,
+    generation: u64,
     /// The `languageId` sent in `didOpen` — carried from the resolved spec, so
     /// this connection speaks the wire protocol without any tree-sitter `Lang`.
     language_id: String,
@@ -1551,40 +1245,29 @@ pub struct LspClient {
 }
 
 impl LspClient {
-    /// Spawn and connect to the server described by `spec`, rooted at `root`.
-    /// `diag_tx` receives every `publishDiagnostics` notification. The argv is
-    /// used as-is (no resource wrap) — the host wraps it via
-    /// [`LspClient::start_argv`] before it reaches a live worktree.
-    pub fn start<S: DiagnosticSink + 'static>(
+    /// Spawn and connect to the server described by `spec`, rooted at `root`,
+    /// registering a fresh authority stream `(root, spec.key)` on the bounded
+    /// diagnostics bus. The argv is used as-is (no resource wrap) — the host
+    /// wraps it via [`LspClient::start_argv_with_identity`].
+    pub fn start(
         spec: &ServerSpec,
         root: &Path,
-        diag_tx: S,
+        diagnostics: DiagnosticsSender,
     ) -> Result<LspClient, LspError> {
+        let generation = diagnostics.register(root, &spec.key)?;
         Self::start_argv_with_context(
             &spec.argv(),
             &spec.language_id,
             root,
-            Arc::new(diag_tx),
+            diagnostics,
             spec.key.clone(),
-            0,
+            generation,
         )
     }
 
-    /// Spawn and connect to a local server from a fully-formed `argv`
-    /// (`[command, args…]`), tagging the connection with `language_id`. The host
-    /// passes an argv already wrapped by the shared background resource wrap
-    /// (`sandbox_cpucap::wrap_background_argv`) so the server joins `thegn.slice`.
-    pub fn start_argv<S: DiagnosticSink + 'static>(
-        argv: &[String],
-        language_id: &str,
-        root: &Path,
-        diag_tx: S,
-    ) -> Result<LspClient, LspError> {
-        Self::start_argv_with_context(argv, language_id, root, Arc::new(diag_tx), String::new(), 0)
-    }
-
-    /// Start a client under supervisor-owned authority.  The generation is
-    /// minted by the supervisor and is never trusted from a publication.
+    /// Start a client under a supervisor-registered authority: `generation`
+    /// must come from [`DiagnosticsSender::register`] for `(root,
+    /// server_identity)`; publications under any other generation are stale.
     pub fn start_argv_with_identity(
         argv: &[String],
         language_id: &str,
@@ -1597,7 +1280,7 @@ impl LspClient {
             argv,
             language_id,
             root,
-            Arc::new(diagnostics),
+            diagnostics,
             server_identity,
             generation,
         )
@@ -1607,30 +1290,36 @@ impl LspClient {
         argv: &[String],
         language_id: &str,
         root: &Path,
-        diag_tx: Arc<dyn DiagnosticSink>,
+        diag_tx: DiagnosticsSender,
         server_identity: String,
         generation: u64,
     ) -> Result<LspClient, LspError> {
-        let (cmd, rest) = argv
-            .split_first()
-            .ok_or_else(|| LspError::Spawn("empty server argv".into()))?;
-        let mut child = Command::new(cmd)
+        let Some((cmd, rest)) = argv.split_first() else {
+            diag_tx.retire(root, &server_identity, generation);
+            return Err(LspError::Spawn("empty server argv".into()));
+        };
+        let spawned = Command::new(cmd)
             .args(rest)
             .current_dir(root)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
-            .map_err(|e| LspError::Spawn(e.to_string()))?;
+            .map_err(|e| LspError::Spawn(e.to_string()));
+        let mut child = match spawned {
+            Ok(child) => child,
+            Err(error) => {
+                diag_tx.retire(root, &server_identity, generation);
+                return Err(error);
+            }
+        };
 
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| LspError::Spawn("no stdout".into()))?;
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| LspError::Spawn("no stdin".into()))?;
+        let (Some(stdout), Some(stdin)) = (child.stdout.take(), child.stdin.take()) else {
+            let _ = child.kill(); // best-effort: a child without pipes is unusable
+            let _ = child.wait(); // best-effort: reap it
+            diag_tx.retire(root, &server_identity, generation);
+            return Err(LspError::Spawn("no stdio pipes".into()));
+        };
         // Read the PID before the child moves into the client.
         let pid = child.id();
         let mut client = Self::connect(
@@ -1640,8 +1329,10 @@ impl LspClient {
             root,
             language_id.to_string(),
             diag_tx,
-            server_identity,
-            generation,
+            Authority {
+                server_identity,
+                generation,
+            },
         );
         // The command's file name, not the full path: `/nix/store/…/bin/gopls`
         // is a store hash in a status list, and the args can carry a project
@@ -1661,14 +1352,41 @@ impl LspClient {
     /// Connect to a language server over ARBITRARY stdio rather than spawning a
     /// local child — the seam for an **in-sandbox/remote** server whose stdin/
     /// stdout are bridged to the host (e.g. via the resident bridge or a provider
-    /// exec). Same JSON-RPC behavior; no child to reap (the stream owns
-    /// lifecycle), and no host resource wrap (the sandbox bounds it).
-    pub fn from_io<S: DiagnosticSink + 'static>(
+    /// exec). Same JSON-RPC behavior and the same bounded diagnostics authority
+    /// (`(root, language_id)`, freshly registered); no child to reap (the stream
+    /// owns lifecycle), and no host resource wrap (the sandbox bounds it).
+    pub fn from_io(
         reader: Box<dyn Read + Send>,
         writer: Box<dyn Write + Send>,
         language_id: &str,
         root: &Path,
-        diag_tx: S,
+        diagnostics: DiagnosticsSender,
+    ) -> Result<LspClient, LspError> {
+        let generation = diagnostics.register(root, language_id)?;
+        Ok(Self::connect(
+            reader,
+            writer,
+            None,
+            root,
+            language_id.to_string(),
+            diagnostics,
+            Authority {
+                server_identity: language_id.to_string(),
+                generation,
+            },
+        ))
+    }
+
+    /// [`LspClient::from_io`] under a supervisor-registered authority (see
+    /// [`LspClient::start_argv_with_identity`]).
+    pub fn from_io_with_identity(
+        reader: Box<dyn Read + Send>,
+        writer: Box<dyn Write + Send>,
+        language_id: &str,
+        root: &Path,
+        diagnostics: DiagnosticsSender,
+        server_identity: String,
+        generation: u64,
     ) -> LspClient {
         Self::connect(
             reader,
@@ -1676,9 +1394,11 @@ impl LspClient {
             None,
             root,
             language_id.to_string(),
-            Arc::new(diag_tx),
-            String::new(),
-            0,
+            diagnostics,
+            Authority {
+                server_identity,
+                generation,
+            },
         )
     }
 
@@ -1688,35 +1408,28 @@ impl LspClient {
         child: Option<Child>,
         root: &Path,
         language_id: String,
-        diag_tx: Arc<dyn DiagnosticSink>,
-        server_identity: String,
-        generation: u64,
+        diag_tx: DiagnosticsSender,
+        authority: Authority,
     ) -> LspClient {
+        let Authority {
+            server_identity,
+            generation,
+        } = authority;
         let stdin: SharedWriter = Arc::new(Mutex::new(writer));
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
         let closed = Arc::new(AtomicBool::new(false));
         let reader_thread = {
-            let pending = pending.clone();
-            let stdin = stdin.clone();
-            let root = root.to_path_buf();
-            let closed = closed.clone();
-            let sequence = Arc::new(AtomicU64::new(0));
-            let reader_sequence = sequence.clone();
-            let reader_identity = server_identity.clone();
-            let reader_diag = diag_tx.clone();
-            thread::spawn(move || {
-                reader_loop(
-                    reader,
-                    pending,
-                    reader_diag,
-                    stdin,
-                    root,
-                    closed,
-                    reader_identity,
-                    generation,
-                    reader_sequence,
-                )
-            })
+            let ctx = ReaderContext {
+                pending: pending.clone(),
+                diag_tx: diag_tx.clone(),
+                stdin: stdin.clone(),
+                root: root.to_path_buf(),
+                closed: closed.clone(),
+                server_identity: server_identity.clone(),
+                generation,
+                sequence: AtomicU64::new(0),
+            };
+            thread::spawn(move || reader_loop(reader, ctx))
         };
 
         LspClient {
@@ -1728,6 +1441,8 @@ impl LspClient {
             root: root.to_path_buf(),
             language_id,
             diagnostics: diag_tx,
+            server_identity,
+            generation,
             caps: OnceLock::new(),
             timeout: Duration::from_secs(10),
             _reader: reader_thread,
@@ -1737,6 +1452,11 @@ impl LspClient {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// The supervisor-minted generation this connection publishes under.
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     /// The server's negotiated capabilities (all-`false` until `initialize`).
@@ -1807,7 +1527,7 @@ impl LspClient {
         )?;
         let mut health = ProjectionHealth::default();
         let symbols = project_symbols(&res, &fallback, &mut health);
-        health.record(self.diagnostics.as_ref());
+        health.record(&self.diagnostics);
         Ok(symbols)
     }
 
@@ -1819,7 +1539,7 @@ impl LspClient {
         let res = self.request("workspace/symbol", json!({ "query": query }))?;
         let mut health = ProjectionHealth::default();
         let symbols = project_symbols(&res, "", &mut health);
-        health.record(self.diagnostics.as_ref());
+        health.record(&self.diagnostics);
         Ok(symbols)
     }
 
@@ -1832,7 +1552,7 @@ impl LspClient {
         let res = self.request("textDocument/definition", self.pos_params(uri, pos))?;
         let mut health = ProjectionHealth::default();
         let locations = parse_locations_limited(&res, &mut health);
-        health.record(self.diagnostics.as_ref());
+        health.record(&self.diagnostics);
         Ok(locations)
     }
 
@@ -1852,7 +1572,7 @@ impl LspClient {
         )?;
         let mut health = ProjectionHealth::default();
         let locations = parse_locations_limited(&res, &mut health);
-        health.record(self.diagnostics.as_ref());
+        health.record(&self.diagnostics);
         Ok(locations)
     }
 
@@ -1865,7 +1585,7 @@ impl LspClient {
         let res = self.request("textDocument/hover", self.pos_params(uri, pos))?;
         let mut health = ProjectionHealth::default();
         let hover = parse_hover_limited(&res, &mut health);
-        health.record(self.diagnostics.as_ref());
+        health.record(&self.diagnostics);
         Ok(hover)
     }
 
@@ -1878,7 +1598,7 @@ impl LspClient {
         let res = self.request("textDocument/signatureHelp", self.pos_params(uri, pos))?;
         let mut health = ProjectionHealth::default();
         let signatures = parse_signatures_limited(&res, &mut health);
-        health.record(self.diagnostics.as_ref());
+        health.record(&self.diagnostics);
         Ok(signatures)
     }
 
@@ -1901,7 +1621,7 @@ impl LspClient {
         )?;
         let mut health = ProjectionHealth::default();
         let actions = parse_code_actions_limited(&res, &mut health);
-        health.record(self.diagnostics.as_ref());
+        health.record(&self.diagnostics);
         Ok(actions)
     }
 
@@ -1985,22 +1705,37 @@ impl Drop for LspClient {
             let _ = c.kill(); // best-effort: child may already have exited
             let _ = c.wait(); // best-effort: reap-or-not is terminal here
         }
+        // Idempotent: only retires this exact generation, never a successor.
+        let _ = self
+            .diagnostics
+            .retire(&self.root, &self.server_identity, self.generation); // best-effort: the supervisor usually retired it already
     }
 }
 
-/// Read framed messages off the server's stdout until EOF, dispatching each.
-/// Transport-agnostic: `reader` is a local child's stdout or a bridged stream.
-fn reader_loop(
-    reader: Box<dyn Read + Send>,
+/// Which authority stream a connection publishes under.
+struct Authority {
+    server_identity: String,
+    generation: u64,
+}
+
+/// Everything a reader thread owns: the request table, the diagnostics bus,
+/// the write half (to answer server→client requests), and the stream identity
+/// it stamps (with a reader-assigned monotonic sequence) on publications.
+struct ReaderContext {
     pending: Pending,
-    diag_tx: Arc<dyn DiagnosticSink>,
+    diag_tx: DiagnosticsSender,
     stdin: SharedWriter,
     root: PathBuf,
     closed: Arc<AtomicBool>,
     server_identity: String,
     generation: u64,
-    sequence: Arc<AtomicU64>,
-) {
+    sequence: AtomicU64,
+}
+
+/// Read framed messages off the server's stdout until EOF, dispatching each.
+/// Transport-agnostic: `reader` is a local child's stdout or a bridged stream.
+fn reader_loop(reader: Box<dyn Read + Send>, ctx: ReaderContext) {
+    let (pending, diag_tx) = (&ctx.pending, &ctx.diag_tx);
     let mut reader = framing::FramedReader::with_limit(reader, limits::MAX_BODY_BYTES);
     loop {
         match reader.read_message() {
@@ -2011,19 +1746,20 @@ fn reader_loop(
                         ..LspHealth::default()
                     });
                     tracing::warn!(target: "thegn::lsp", reason, "dropping over-budget LSP JSON message");
+                    // Fail the correlated request now rather than at its
+                    // deadline. The id comes from a linear, allocation-free
+                    // scan of the top-level object only.
+                    if let Some(id) = top_level_id(body.as_bytes())
+                        && let Some(tx) = pending.lock().unwrap().remove(&id)
+                    {
+                        let _ = tx.send(Err(LspError::Bounded(format!(
+                            "LSP response exceeded JSON bounds: {reason}"
+                        )))); // best-effort: requester may have timed out
+                    }
                     continue;
                 }
                 if let Ok(msg) = serde_json::from_str::<Value>(&body) {
-                    dispatch(
-                        &msg,
-                        &pending,
-                        &diag_tx,
-                        &stdin,
-                        &root,
-                        &server_identity,
-                        generation,
-                        &sequence,
-                    );
+                    dispatch(&msg, &ctx);
                 } else {
                     diag_tx.record(LspHealth {
                         invalid: 1,
@@ -2040,22 +1776,16 @@ fn reader_loop(
     }
     // Stream closed — unblock any waiters so they don't hang to the deadline.
     let mut map = pending.lock().unwrap();
-    closed.store(true, Ordering::SeqCst);
+    ctx.closed.store(true, Ordering::SeqCst);
     for (_, tx) in map.drain() {
         let _ = tx.send(Err(LspError::Protocol("server stream closed".into()))); // best-effort: pending requesters may be gone
     }
 }
 
-fn dispatch(
-    msg: &Value,
-    pending: &Pending,
-    diag_tx: &Arc<dyn DiagnosticSink>,
-    stdin: &SharedWriter,
-    root: &Path,
-    server_identity: &str,
-    generation: u64,
-    sequence: &AtomicU64,
-) {
+fn dispatch(msg: &Value, ctx: &ReaderContext) {
+    let (pending, diag_tx, stdin, root) = (&ctx.pending, &ctx.diag_tx, &ctx.stdin, &ctx.root);
+    let (server_identity, generation, sequence) =
+        (ctx.server_identity.as_str(), ctx.generation, &ctx.sequence);
     let id = msg.get("id").and_then(Value::as_i64);
     let method = msg.get("method").and_then(Value::as_str);
 
@@ -2104,6 +1834,15 @@ fn dispatch(
         }
         // Notification.
         (None, Some("textDocument/publishDiagnostics")) => {
+            // A retired/replaced stream's reader may still be draining its
+            // pipe: reject before projecting anything.
+            if !diag_tx.is_current(root, server_identity, generation) {
+                diag_tx.record(LspHealth {
+                    stale: 1,
+                    ..LspHealth::default()
+                });
+                return;
+            }
             if let Some(params) = msg.get("params") {
                 let seq = sequence.fetch_add(1, Ordering::Relaxed).saturating_add(1);
                 let (pd, health) = parse_published_diagnostics_with_context(
@@ -2127,6 +1866,23 @@ fn dispatch(
 mod tests {
     use super::*;
 
+    fn fixture_ctx(
+        pending: Pending,
+        diag_tx: DiagnosticsSender,
+        stdin: SharedWriter,
+    ) -> ReaderContext {
+        ReaderContext {
+            pending,
+            diag_tx,
+            stdin,
+            root: PathBuf::from("/fixture"),
+            closed: Arc::new(AtomicBool::new(false)),
+            server_identity: "fixture".into(),
+            generation: 1,
+            sequence: AtomicU64::new(0),
+        }
+    }
+
     #[test]
     fn invalid_framing_rejects_late_concurrent_requests_without_writing() {
         struct RejectWrites;
@@ -2138,17 +1894,28 @@ mod tests {
                 panic!("closed transport flushed")
             }
         }
-        let (diag_tx, diag_rx) = mpsc::channel();
-        let client = Arc::new(LspClient::from_io(
-            Box::new(std::io::Cursor::new(b"bad\r\n\r\n")),
-            Box::new(RejectWrites),
-            "fixture",
-            Path::new("/fixture"),
-            diag_tx,
-        ));
+        let (diag_tx, diag_rx) = diagnostics_channel();
+        let client = Arc::new(
+            LspClient::from_io(
+                Box::new(std::io::Cursor::new(b"bad\r\n\r\n")),
+                Box::new(RejectWrites),
+                "fixture",
+                Path::new("/fixture"),
+                diag_tx,
+            )
+            .expect("register fixture authority"),
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !client.closed.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            client.closed.load(Ordering::SeqCst),
+            "reader latched closed"
+        );
         assert!(matches!(
-            diag_rx.recv_timeout(Duration::from_secs(2)),
-            Err(mpsc::RecvTimeoutError::Disconnected)
+            diag_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
         ));
         std::thread::scope(|scope| {
             for _ in 0..16 {
@@ -2166,20 +1933,15 @@ mod tests {
     fn invalid_framing_closes_lsp_and_fails_pending_without_dispatch() {
         let (request_tx, request_rx) = mpsc::channel();
         let pending: Pending = Arc::new(Mutex::new(HashMap::from([(7, request_tx)])));
-        let (diag_tx, diag_rx) = mpsc::channel();
+        let (diag_tx, diag_rx) = diagnostics_channel();
+        let generation = diag_tx.register(Path::new("/fixture"), "fixture").unwrap();
+        assert_eq!(generation, 1);
         let stdin: SharedWriter = Arc::new(Mutex::new(Box::new(std::io::sink())));
         let mut wire = b"Content-Length: 1\r\nContent-Length: 1\r\n\r\nX".to_vec();
         wire.extend(framing::encode(r#"{"id":7,"result":"must not dispatch"}"#));
         reader_loop(
             Box::new(std::io::Cursor::new(wire)),
-            pending.clone(),
-            Arc::new(diag_tx),
-            stdin,
-            PathBuf::from("/fixture"),
-            Arc::new(AtomicBool::new(false)),
-            "fixture".into(),
-            1,
-            Arc::new(AtomicU64::new(0)),
+            fixture_ctx(pending.clone(), diag_tx, stdin),
         );
         assert!(matches!(
             request_rx.try_recv(),
@@ -2188,7 +1950,7 @@ mod tests {
         assert!(pending.lock().unwrap().is_empty());
         assert!(matches!(
             diag_rx.try_recv(),
-            Err(mpsc::TryRecvError::Disconnected)
+            Err(std::sync::mpsc::TryRecvError::Empty)
         ));
     }
 
@@ -2400,7 +2162,7 @@ mod tests {
         for _ in 0..=limits::MAX_JSON_DEPTH {
             deep.push('[');
         }
-        deep.push_str("0");
+        deep.push('0');
         for _ in 0..=limits::MAX_JSON_DEPTH {
             deep.push(']');
         }
@@ -2424,22 +2186,50 @@ mod tests {
 
     #[test]
     fn iterative_symbol_projection_has_stable_total_cap() {
-        let mut root = json!({
-            "name": "root",
-            "kind": 12,
-            "range": { "start": { "line": 0, "character": 0 } }
-        });
-        for index in 0..=limits::MAX_RESULT_ITEMS {
-            root = json!({
-                "name": format!("s{index}"),
+        // Anything a server can deliver passed the 64-level JSON preflight, so
+        // build the deepest admissible chain (object → children array per
+        // level) plus enough breadth to cross the total cap by one.
+        let symbol = |name: String, line: usize, children: Vec<Value>| {
+            json!({
+                "name": name,
                 "kind": 12,
-                "range": { "start": { "line": index, "character": 0 } },
-                "children": [root]
-            });
+                "range": { "start": { "line": line, "character": 0 } },
+                "children": children
+            })
+        };
+        let levels = limits::MAX_JSON_DEPTH / 2 - 2;
+        let mut chain = symbol("leaf".into(), 0, vec![]);
+        for depth in 0..levels {
+            chain = symbol(format!("d{depth}"), depth, vec![chain]);
         }
-        let symbols = parse_symbols(&Value::Array(vec![root]), "/safe.rs");
+        let chain_len = levels + 1;
+        let wide: Vec<Value> = (0..=limits::MAX_RESULT_ITEMS - chain_len)
+            .map(|index| symbol(format!("w{index}"), index, vec![]))
+            .collect();
+        let tree = json!([chain, symbol("wide".into(), 0, wide)]);
+        assert!(
+            preflight_json(tree.to_string().as_bytes()).is_ok(),
+            "admissible input"
+        );
+        let mut health = ProjectionHealth::default();
+        let symbols = project_symbols(&tree, "/safe.rs", &mut health);
+        assert_eq!(symbols.len(), limits::MAX_RESULT_ITEMS, "exact total cap");
+        assert!(health.truncated, "cap + 1 is reported");
+        // Stable pre-order prefix: the chain first, root to leaf, then `wide`.
+        assert_eq!(symbols[0].name, format!("d{}", levels - 1));
+        assert_eq!(symbols[levels].name, "leaf");
+        assert_eq!(symbols[levels].container.as_deref(), Some("d0"));
+        assert_eq!(symbols[chain_len].name, "wide");
+        assert_eq!(symbols[chain_len + 1].container.as_deref(), Some("wide"));
+
+        // Exactly at the cap is complete.
+        let exact: Vec<Value> = (0..limits::MAX_RESULT_ITEMS)
+            .map(|index| symbol(format!("e{index}"), index, vec![]))
+            .collect();
+        let mut health = ProjectionHealth::default();
+        let symbols = project_symbols(&Value::Array(exact), "/safe.rs", &mut health);
         assert_eq!(symbols.len(), limits::MAX_RESULT_ITEMS);
-        assert_eq!(symbols.first().map(|s| s.name.as_str()), Some("s4096"));
+        assert!(!health.truncated);
     }
 
     #[test]
@@ -2452,53 +2242,211 @@ mod tests {
         assert_eq!(bounded_uri_to_path("file:///a%20b"), Some("/a b".into()));
     }
 
-    #[test]
-    fn diagnostics_queue_coalesces_and_rejects_retired_generation() {
-        let (tx, rx) = diagnostics_channel();
-        tx.set_active(PathBuf::from("/r"), "rust".into(), 7);
-        let publication = |generation, sequence, message| PublishedDiagnostics {
-            root: PathBuf::from("/r"),
-            path: "/r/a.rs".into(),
-            diagnostics: vec![LspDiagnostic {
-                line: 0,
-                character: 0,
-                severity: LspSeverity::Error,
-                message: message.into(),
-                code: None,
-                source: None,
-            }],
-            server_identity: "rust".into(),
-            generation,
-            sequence,
-            complete: true,
-        };
-        tx.publish(publication(7, 1, "old"));
-        tx.publish(publication(7, 2, "new"));
-        assert_eq!(rx.try_recv().unwrap().diagnostics[0].message, "new");
-        tx.retire(Path::new("/r"), "rust", 7);
-        tx.publish(publication(7, 3, "stale"));
-        assert_eq!(rx.health().stale, 1);
-        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+    fn publish_frame(uri: &str, message: &str) -> Vec<u8> {
+        framing::encode(
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "textDocument/publishDiagnostics",
+                "params": { "uri": uri, "diagnostics": [{
+                    "range": { "start": { "line": 0, "character": 0 } },
+                    "message": message
+                }]}
+            })
+            .to_string(),
+        )
+    }
+
+    fn recv_within(rx: &DiagnosticsReceiver, timeout: Duration) -> Option<PublishedDiagnostics> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if let Ok(pd) = rx.try_recv() {
+                return Some(pd);
+            }
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
     #[test]
-    fn diagnostics_queue_rotates_ready_roots_under_flood() {
+    fn close_reopen_late_old_generation_is_stale_and_cannot_retire_successor() {
         let (tx, rx) = diagnostics_channel();
-        let publication = |root: &str, path: &str| PublishedDiagnostics {
-            root: PathBuf::from(root),
-            path: path.into(),
-            diagnostics: vec![],
-            server_identity: "rust".into(),
-            generation: 1,
-            sequence: 1,
-            complete: true,
-        };
-        for index in 0..10 {
-            tx.publish(publication("/flood", &format!("/flood/{index}.rs")));
-        }
-        tx.publish(publication("/quiet", "/quiet/only.rs"));
+        let root = Path::new("/wt");
+        let (old_read, mut old_write) = std::io::pipe().unwrap();
+        let (new_read, mut new_write) = std::io::pipe().unwrap();
+        let old = LspClient::from_io(
+            Box::new(old_read),
+            Box::new(std::io::sink()),
+            "rust",
+            root,
+            tx.clone(),
+        )
+        .unwrap();
+        // Re-registering the same (root, identity) retires the old stream.
+        let new = LspClient::from_io(
+            Box::new(new_read),
+            Box::new(std::io::sink()),
+            "rust",
+            root,
+            tx.clone(),
+        )
+        .unwrap();
+        assert!(new.generation() > old.generation());
+        assert!(!tx.is_current(root, "rust", old.generation()));
 
-        assert_eq!(rx.try_recv().unwrap().root, PathBuf::from("/flood"));
-        assert_eq!(rx.try_recv().unwrap().root, PathBuf::from("/quiet"));
+        // A late notification from the old reader is rejected before projection.
+        old_write
+            .write_all(&publish_frame("file:///wt/a.rs", "late"))
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while rx.health().stale == 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(rx.health().stale, 1);
+        assert!(!rx.has_pending());
+
+        new_write
+            .write_all(&publish_frame("file:///wt/a.rs", "fresh"))
+            .unwrap();
+        let pd = recv_within(&rx, Duration::from_secs(2)).expect("current stream delivers");
+        assert_eq!(pd.generation, new.generation());
+        assert_eq!(pd.diagnostics[0].message, "fresh");
+
+        // Dropping the old client retires only its own generation.
+        let new_generation = new.generation();
+        drop(old);
+        assert!(tx.is_current(root, "rust", new_generation));
+        drop(new);
+        assert!(!tx.is_current(root, "rust", new_generation));
+        assert_eq!(rx.footprint().active_streams, 0);
+        assert_eq!(rx.footprint().metadata_bytes, 0);
+    }
+
+    #[test]
+    fn over_budget_response_fails_its_request_promptly() {
+        let body = format!(
+            r#"{{"jsonrpc":"2.0","id":42,"result":{}}}"#,
+            "[".repeat(limits::MAX_JSON_DEPTH + 1) + &"]".repeat(limits::MAX_JSON_DEPTH + 1)
+        );
+        assert_eq!(top_level_id(body.as_bytes()), Some(42));
+        assert_eq!(
+            top_level_id(br#"{"result":{"id":7},"x":"\"id\":9","id":-3}"#),
+            Some(-3)
+        );
+        assert_eq!(top_level_id(br#"{"method":"x"}"#), None);
+
+        let (request_tx, request_rx) = mpsc::channel();
+        let pending: Pending = Arc::new(Mutex::new(HashMap::from([(42, request_tx)])));
+        let (diag_tx, diag_rx) = diagnostics_channel();
+        reader_loop(
+            Box::new(std::io::Cursor::new(framing::encode(&body))),
+            fixture_ctx(
+                pending.clone(),
+                diag_tx,
+                Arc::new(Mutex::new(Box::new(std::io::sink()))),
+            ),
+        );
+        assert!(matches!(
+            request_rx.try_recv(),
+            Ok(Err(LspError::Bounded(ref reason))) if reason.contains("json depth limit")
+        ));
+        assert_eq!(diag_rx.health().invalid, 1);
+    }
+
+    #[test]
+    fn signature_and_action_aggregates_stop_before_cloning_past_the_cap() {
+        let label = "l".repeat(limits::MAX_SCALAR_STRING_BYTES);
+        let per_item = label.len() + std::mem::size_of::<SignatureInfo>();
+        let fits = limits::MAX_PROJECTED_RESPONSE_BYTES / per_item;
+        let sigs = json!({ "signatures": (0..fits + 3)
+            .map(|_| json!({ "label": label }))
+            .collect::<Vec<_>>() });
+        let mut health = ProjectionHealth::default();
+        let out = parse_signatures_limited(&sigs, &mut health);
+        assert_eq!(out.len(), fits);
+        assert!(health.truncated);
+
+        let per_action = label.len() + std::mem::size_of::<CodeActionInfo>();
+        let fits = limits::MAX_PROJECTED_RESPONSE_BYTES / per_action;
+        let actions = Value::Array(
+            (0..fits + 3)
+                .map(|_| json!({ "title": label }))
+                .collect::<Vec<_>>(),
+        );
+        let mut health = ProjectionHealth::default();
+        let out = parse_code_actions_limited(&actions, &mut health);
+        assert_eq!(out.len(), fits);
+        assert!(health.truncated);
+    }
+
+    #[test]
+    fn wide_symbol_children_do_not_clone_parent_name_per_child() {
+        // 4096 children under a 64 KiB parent name: cloning the name per push
+        // would retain 256 MiB before any cap. Emission is byte-accounted.
+        let children: Vec<Value> = (0..limits::MAX_CONTAINER_ITEMS)
+            .map(|index| json!({ "name": format!("c{index}"), "kind": 12 }))
+            .collect();
+        let parent = json!([{
+            "name": "p".repeat(limits::MAX_SCALAR_STRING_BYTES),
+            "kind": 5,
+            "children": children
+        }]);
+        let symbols = parse_symbols(&parent, "/f.rs");
+        let bytes: usize = symbols
+            .iter()
+            .map(|s| {
+                s.name.len()
+                    + s.container.as_ref().map_or(0, String::len)
+                    + s.location.path.len()
+                    + std::mem::size_of::<SymbolInfo>()
+            })
+            .sum();
+        assert!(bytes <= limits::MAX_PROJECTED_RESPONSE_BYTES);
+        assert!(
+            symbols.len() < limits::MAX_CONTAINER_ITEMS,
+            "aggregate cap engaged"
+        );
+        assert_eq!(
+            symbols[1].container.as_deref().map(str::len),
+            Some(limits::MAX_SCALAR_STRING_BYTES)
+        );
+    }
+
+    #[test]
+    fn exact_diagnostic_limits_are_inclusive() {
+        let one = |message: &str| json!({ "range": { "start": { "line": 0, "character": 0 } }, "message": message });
+        let at_cap = json!({ "uri": "file:///a.rs", "diagnostics": (0..limits::MAX_DIAGNOSTICS).map(|_| one("m")).collect::<Vec<_>>() });
+        let (pd, health) =
+            parse_published_diagnostics_with_context(&at_cap, Path::new("/"), "s".into(), 1, 1);
+        let pd = pd.unwrap();
+        assert!(pd.complete, "exactly MAX_DIAGNOSTICS is complete");
+        assert_eq!(pd.diagnostics.len(), limits::MAX_DIAGNOSTICS);
+        assert!(!health.has_findings());
+
+        let over = json!({ "uri": "file:///a.rs", "diagnostics": (0..=limits::MAX_DIAGNOSTICS).map(|_| one("m")).collect::<Vec<_>>() });
+        let (pd, health) =
+            parse_published_diagnostics_with_context(&over, Path::new("/"), "s".into(), 1, 1);
+        let pd = pd.unwrap();
+        assert!(!pd.complete);
+        assert_eq!(pd.diagnostics.len(), limits::MAX_DIAGNOSTICS);
+        assert_eq!(health.truncated, 1);
+
+        // Wrong type for `diagnostics` never masquerades as a complete clear.
+        let wrong = json!({ "uri": "file:///a.rs", "diagnostics": {} });
+        let (pd, health) =
+            parse_published_diagnostics_with_context(&wrong, Path::new("/"), "s".into(), 1, 1);
+        let pd = pd.unwrap();
+        assert!(pd.diagnostics.is_empty() && !pd.complete);
+        assert_eq!(health.invalid, 1);
+
+        // Byte aggregate: 64 KiB messages stop before 256 KiB total.
+        let big = "x".repeat(limits::MAX_SCALAR_STRING_BYTES);
+        let heavy = json!({ "uri": "file:///a.rs", "diagnostics": (0..8).map(|_| one(&big)).collect::<Vec<_>>() });
+        let (pd, _) =
+            parse_published_diagnostics_with_context(&heavy, Path::new("/"), "s".into(), 1, 1);
+        let pd = pd.unwrap();
+        assert!(!pd.complete);
+        assert!(published_diagnostics_bytes(&pd) <= limits::MAX_DIAGNOSTIC_BYTES);
     }
 }
