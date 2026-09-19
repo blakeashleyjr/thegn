@@ -5,8 +5,8 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use thegn_core::config::Config;
-use thegn_core::config_admission::ConfigAdmissionError;
 use thegn_core::config_admission_store::{StaleConfigReason, StoreHealth};
+use thegn_core::host_definition_snapshot::HostDefinitionsSnapshot;
 
 /// In-memory sources keyed by path; the body can be swapped between reloads.
 struct Sources {
@@ -57,14 +57,15 @@ fn admit_from<'a>(
 ) -> impl Fn(
     &ConfigCaptureSeed,
     thegn_core::db::MigrationActor,
+    bool,
 ) -> Result<CapturedConfig, CaptureFailure>
 + 'a {
-    move |seed, _| {
+    move |seed, _, _| {
         seed.admit_staged(sources, |_| {
             host_reads.set(host_reads.get() + 1);
-            Ok(HostDefinitionsSnapshot::empty(
+            Ok(HostLayer::Admitted(HostDefinitionsSnapshot::empty(
                 thegn_core::db::SCHEMA_VERSION,
-            ))
+            )))
         })
     }
 }
@@ -106,7 +107,7 @@ fn invalid_startup_config_never_reaches_the_host_store_or_publishes() {
             &admit_from(&files, &host_reads),
         );
         assert!(
-            matches!(result, Err(CaptureFailure::Admission(_))),
+            matches!(result, Err(CaptureFailure::Admission(..))),
             "{body:?} must be refused"
         );
         assert_eq!(
@@ -149,7 +150,7 @@ fn failed_reload_keeps_last_good_display_only_and_coalesces() {
         .bodies
         .borrow_mut()
         .insert(base_path(), b"branch_prefix = \"tw".to_vec());
-    let ReloadOutcome::Failed(CaptureFailure::Admission(error)) = process.reload_with(&admit)
+    let ReloadOutcome::Failed(CaptureFailure::Admission(error, _)) = process.reload_with(&admit)
     else {
         panic!("a truncated save must be refused and reported once");
     };
@@ -200,36 +201,147 @@ fn failed_reload_keeps_last_good_display_only_and_coalesces() {
     assert!(process.store().authorize(&second.revision()).is_ok());
 }
 
+/// A host layer that cannot be captured (here: a newer schema) must not
+/// refuse the process — doctor, logs, notify and the stdio bridges have to
+/// keep working — but the host-less generation is display-only: it is never
+/// authorized for a launch, and the reason is on the persistent banner.
 #[test]
-fn host_capture_failure_on_reload_is_degraded_not_empty_hosts() {
+fn unavailable_host_layer_publishes_a_host_less_non_authoritative_generation() {
+    let files = sources("branch_prefix = \"one/\"\n");
+    let installs = Cell::new(0);
+    let unavailable =
+        |seed: &ConfigCaptureSeed, _: thegn_core::db::MigrationActor, install: bool| {
+            if install {
+                installs.set(installs.get() + 1);
+            }
+            seed.admit_staged(&files, |_| {
+                Ok(HostLayer::Unavailable(HostStoreFailure::NewerSchema {
+                    observed: 99,
+                    supported: 68,
+                }))
+            })
+        };
+    let (process, first) = ProcessAdmission::admit_initial(
+        seed(),
+        thegn_core::db::MigrationActor::Client,
+        &unavailable,
+    )
+    .expect("a newer schema must not refuse startup");
+    assert_eq!(first.config().branch_prefix, "one/");
+    assert_eq!(
+        first.health(),
+        thegn_core::config_admission::AdmissionHealth::HostsUnavailable
+    );
+    assert_eq!(
+        process
+            .store()
+            .authorize(&first.revision())
+            .unwrap_err()
+            .reason,
+        StaleConfigReason::HostsUnavailable
+    );
+    let banner = process.banner().expect("persistent banner");
+    assert!(banner.contains("newer than this build"), "{banner}");
+
+    // Reload never re-installs the migration policy.
+    let ReloadOutcome::Published(_) = process.reload_with(&unavailable) else {
+        panic!("reload publishes");
+    };
+    assert_eq!(
+        installs.get(),
+        1,
+        "policy installed exactly once, at startup"
+    );
+
+    // Recovery: once the host layer is readable, authority returns.
+    let host_reads = Cell::new(0);
+    let ReloadOutcome::Published(healthy) = process.reload_with(&admit_from(&files, &host_reads))
+    else {
+        panic!("recovered reload publishes");
+    };
+    assert!(process.store().authorize(&healthy.revision()).is_ok());
+    assert!(process.banner().is_none());
+}
+
+/// Two different failures of the same category are both reported, and the
+/// banner persists (and names the latest) until a reload succeeds.
+#[test]
+fn distinct_reload_failures_are_reported_and_the_banner_persists() {
     let files = sources("branch_prefix = \"one/\"\n");
     let host_reads = Cell::new(0);
-    let (process, first) = ProcessAdmission::admit_initial(
+    let admit = admit_from(&files, &host_reads);
+    let (process, _) =
+        ProcessAdmission::admit_initial(seed(), thegn_core::db::MigrationActor::Controller, &admit)
+            .unwrap();
+    files
+        .bodies
+        .borrow_mut()
+        .insert(base_path(), b"no_such_key_one = 1\n".to_vec());
+    assert!(matches!(
+        process.reload_with(&admit),
+        ReloadOutcome::Failed(_)
+    ));
+    assert!(matches!(
+        process.reload_with(&admit),
+        ReloadOutcome::FailedCoalesced
+    ));
+    files
+        .bodies
+        .borrow_mut()
+        .insert(base_path(), b"no_such_key_two = 1\n".to_vec());
+    assert!(
+        matches!(process.reload_with(&admit), ReloadOutcome::Failed(_)),
+        "a different problem of the same category is new information"
+    );
+    let banner = process.banner().expect("banner persists while degraded");
+    assert!(banner.contains("no_such_key_two"), "{banner}");
+    files
+        .bodies
+        .borrow_mut()
+        .insert(base_path(), b"branch_prefix = \"two/\"\n".to_vec());
+    assert!(matches!(
+        process.reload_with(&admit),
+        ReloadOutcome::Published(_)
+    ));
+    assert!(process.banner().is_none());
+}
+
+/// A reload that changes `[database]` still publishes; the change is a
+/// restart-required diagnostic, never a refusal of later launches.
+#[test]
+fn database_change_on_reload_is_not_a_refusal() {
+    let files = sources("branch_prefix = \"one/\"\n");
+    let host_reads = Cell::new(0);
+    let admit = admit_from(&files, &host_reads);
+    let (process, _) =
+        ProcessAdmission::admit_initial(seed(), thegn_core::db::MigrationActor::Controller, &admit)
+            .unwrap();
+    files.bodies.borrow_mut().insert(
+        base_path(),
+        b"[database]\nmigration_authority = \"any\"\n".to_vec(),
+    );
+    let ReloadOutcome::Published(published) = process.reload_with(&admit) else {
+        panic!("a [database] edit must publish");
+    };
+    assert!(process.store().authorize(&published.revision()).is_ok());
+    assert!(process.notes().database_restart);
+}
+
+/// The refusal names the file and the key path.
+#[test]
+fn startup_refusal_names_the_source_and_key() {
+    let files = sources("picker = \"sideways\"\n");
+    let host_reads = Cell::new(0);
+    let Err(error) = ProcessAdmission::admit_initial(
         seed(),
         thegn_core::db::MigrationActor::Controller,
         &admit_from(&files, &host_reads),
-    )
-    .unwrap();
-    let failing = |seed: &ConfigCaptureSeed, _: thegn_core::db::MigrationActor| {
-        seed.admit_staged(&files, |_| {
-            Err(CaptureFailure::Hosts(HostStoreFailure::NewerSchema {
-                observed: 99,
-                supported: 68,
-            }))
-        })
+    ) else {
+        panic!("invalid enum refuses");
     };
-    let ReloadOutcome::Failed(error) = process.reload_with(&failing) else {
-        panic!("host failure must be reported");
-    };
-    assert!(error.to_string().contains("newer than this build"));
-    assert!(matches!(
-        process.store().health(),
-        StoreHealth::Degraded {
-            error: ConfigAdmissionError::HostInvalid,
-            ..
-        }
-    ));
-    assert!(process.store().authorize(&first.revision()).is_err());
+    let text = error.to_string();
+    assert!(text.contains("config file:"), "{text}");
+    assert!(text.contains("picker"), "{text}");
 }
 
 #[test]
@@ -300,4 +412,28 @@ fn final_link_resolution_reads_the_target_and_refuses_retargeting() {
         retarget.read_bounded(&link, 1024),
         Err(ConfigFileReadError::Changed)
     );
+}
+
+/// When a concurrent reload wins the CAS, the loop still receives the
+/// winning generation instead of silently keeping its stale copy.
+#[test]
+fn superseded_reload_still_delivers_the_current_generation_to_the_loop() {
+    let files = sources("branch_prefix = \"one/\"\n");
+    let host_reads = Cell::new(0);
+    let admit = admit_from(&files, &host_reads);
+    let (process, _) =
+        ProcessAdmission::admit_initial(seed(), thegn_core::db::MigrationActor::Controller, &admit)
+            .unwrap();
+    files
+        .bodies
+        .borrow_mut()
+        .insert(base_path(), b"branch_prefix = \"two/\"\n".to_vec());
+    let ReloadOutcome::Published(_) = process.reload_with(&admit) else {
+        panic!("publishes");
+    };
+    let delivered = loop_update(ReloadOutcome::Superseded, || process.store().display())
+        .expect("superseded delivers")
+        .expect("ok");
+    assert_eq!(delivered.config().branch_prefix, "two/");
+    assert!(loop_update(ReloadOutcome::FailedCoalesced, || process.store().display()).is_none());
 }

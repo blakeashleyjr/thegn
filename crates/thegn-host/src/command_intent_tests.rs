@@ -57,18 +57,13 @@ fn every_configured_top_level_variant_parses_without_static_authority() {
     case!(Command::Zone { .. }, ["zone", "list"]);
     case!(Command::Project { .. }, ["program", "list"]);
     case!(Command::Placement { .. }, ["placement", "list"]);
-    case!(Command::Host { .. }, ["host", "list"]);
-    case!(Command::Debug { .. }, ["debug", "path"]);
     case!(Command::Mcp { .. }, ["mcp", "list"]);
     case!(Command::Agent { .. }, ["agent", "list"]);
     case!(Command::Skills { .. }, ["skills", "list"]);
     case!(Command::Plugin { .. }, ["plugin", "list"]);
     case!(Command::SandboxArgv { .. }, ["sandbox-argv"]);
     case!(Command::Sandbox { .. }, ["sandbox", "gc"]);
-    case!(Command::Notify { .. }, ["notify", "list"]);
-    case!(Command::Logs { .. }, ["logs", "tail"]);
     case!(Command::Keys { .. }, ["keys", "list"]);
-    case!(Command::Doctor { .. }, ["doctor"]);
     case!(Command::Setup, ["setup"]);
     case!(Command::Serve { .. }, ["serve"]);
     case!(Command::Session { .. }, ["session", "list"]);
@@ -76,11 +71,7 @@ fn every_configured_top_level_variant_parses_without_static_authority() {
     case!(Command::Attach { .. }, ["attach"]);
     case!(Command::Pair { .. }, ["pair", "list"]);
     case!(Command::Daemon { .. }, ["daemon"]);
-    case!(Command::Bridge, ["bridge"]);
-    case!(
-        Command::BridgeRevtunnel { .. },
-        ["bridge-revtunnel", "12345"]
-    );
+    case!(Command::Host { .. }, ["host", "status", "fixture"]);
     case!(Command::SpriteProxy { .. }, ["sprite-proxy"]);
     case!(Command::VpsSsh { .. }, ["vps-ssh", "fixture"]);
     case!(Command::Machine0Ssh { .. }, ["machine0-ssh", "fixture"]);
@@ -258,5 +249,28 @@ fn all_completion_shells_modes_and_global_positions_preserve_borrowed_intent() {
                 assert_eq!(cli.overrides, ["invalid-override"]);
             }
         }
+    }
+}
+
+/// Diagnostic and recovery verbs are never gated on admission: they must run
+/// when the config or the state store is exactly what is broken.
+#[test]
+fn diagnostic_and_recovery_verbs_are_recovery() {
+    for args in [
+        &["doctor"][..],
+        &["logs", "tail"],
+        &["debug", "path"],
+        &["notify", "list"],
+        &["bridge"],
+        &["bridge-revtunnel", "12345"],
+        &["host", "list"],
+        &["host", "rm", "fixture"],
+    ] {
+        let cli = parse(args);
+        assert_eq!(
+            classify(cli.command.as_ref()),
+            CommandIntent::Recovery,
+            "{args:?}"
+        );
     }
 }

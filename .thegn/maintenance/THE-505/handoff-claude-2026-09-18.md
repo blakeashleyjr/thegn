@@ -92,3 +92,50 @@ Not issue-complete: see "Open" below.
   removed and there is no fallback-removal ratchet yet. Cleanup paths use
   the whole last-admitted config, not a narrowed held provider handle.
 - Chunk 9: fuzz/property and process-level (actual binary) startup tests.
+
+## Revision after adversarial review (review-the-505.md)
+
+- **C1** A selected profile whose overlay file is absent is an empty layer
+  (`explicit: false` in capture; core `Absent` non-explicit → no layer). An
+  existing overlay that is unreadable/invalid stays `ProfileInvalid`. The
+  selection is still bound into the base identity, so it changes the revision.
+- **C2** The host layer is no longer a refusal. Policy-install failure,
+  refused migration, newer schema, unopenable store and invalid stored rows
+  all yield `HostLayer::Unavailable`: the generation is published host-less
+  with `AdmissionHealth::HostsUnavailable`; the store never authorizes it
+  (`StaleConfigReason::HostsUnavailable`), daemon launches refuse via
+  `require_launchable`, and a persistent statusbar banner names the reason.
+  Doctor, logs, debug, notify, bridge, bridge-revtunnel, `host list` and
+  `host rm` are `Recovery` (tolerant display path). `THEGN_ALLOW_SCHEMA_
+DOWNGRADE=1` now works: a newer-schema `Db` handle reads hosts through
+  `host_db_snapshot::read_allowing_newer` (structure still checked,
+  observed schema recorded in the revision).
+- **H1** The migration policy is installed exactly once (startup); reload
+  never re-installs or re-canonicalizes. A `[database]` change on reload
+  publishes and emits one "takes effect after restart" warning.
+- **H2** Refusals name source + key: `config_admission::rejection_detail`
+  (config file / profile overlay via the `config validate` validators;
+  env as `VAR has an invalid <kind> value`; `--set <key>`), carried in
+  `CaptureFailure::Admission(error, detail)`. `config validate`/doctor/bundle
+  run `config_startup::check_sources` (the same capture + non-DB admission)
+  and report what startup would refuse. Previously-clamped display values
+  (metrics/preview/clipboard/bars) clamp again, each named as a warning.
+  `config set` still re-validates only the file (not addressed).
+- **H3** `FrozenEnv::get` treats empty/whitespace values as unset.
+- **M1** `loop_update`: a Superseded reload delivers the winning generation.
+- **M2** Coalescing is by category + detail fingerprint; `FrameModel::
+config_banner` is a persistent statusbar banner while degraded/host-less.
+- **M3** Layers are admitted once (`admit_layers` → `with_hosts`); host
+  composition is skipped for an empty snapshot; one redundant bounds pass
+  removed. Bench numbers: see final report.
+- **M4** unchanged (strict unknown keys) — pending the user's decision.
+- **M5** `host list`/`host rm` are Recovery, and a bad row no longer
+  bricks startup (host layer unavailable, banner).
+- **M6 accepted decision:** the state DB is opened (and, for an authorized
+  controller, migrated) _after_ every trusted file/env/CLI layer is admitted
+  but _before_ the final host composition. A later host-layer problem
+  therefore leaves an already-migrated shared DB. This is deliberate: a
+  legitimate older schema must be able to reach its upgrade, the upgrade is
+  the same one the controller performs on main, and no authority is
+  published from a failed host layer (host-less generations never
+  authorize). An invalid trusted layer never reaches the DB.
