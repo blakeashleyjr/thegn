@@ -127,7 +127,24 @@ DOWNGRADE=1` now works: a newer-schema `Db` handle reads hosts through
 config_banner` is a persistent statusbar banner while degraded/host-less.
 - **M3** Layers are admitted once (`admit_layers` → `with_hosts`); host
   composition is skipped for an empty snapshot; one redundant bounds pass
-  removed. Bench numbers: see final report.
+  removed; the candidate is bounds-checked and serialized once (reused for
+  the digest); the full-candidate schema walk runs only when env/`--set`
+  contributed. Measured through the lane (release, hyperfine; before = main
+  f609a349, after = this branch; isolated XDG, THEGN_NO_MIGRATE=1):
+
+  | case                                          | main          | branch        |
+  | --------------------------------------------- | ------------- | ------------- |
+  | `thegn --config config.toml.example recent 1` | 23.4 ± 0.5 ms | 38.7 ± 1.6 ms |
+  | `thegn recent 1` (first run, no file)         | 19.4 ± 0.9 ms | 22.3 ± 2.2 ms |
+  | first frame, example config (pty)             | 252 ± 30 ms   | 298 ± 15 ms   |
+
+  Before the M3 cuts the branch measured 45.4 / 28.6 / 298 ms. The remaining
+  ~12 ms user CPU on a 292 KB config is the strict work main never did: the
+  one-time schemars schema generation plus the raw-schema walk, and the
+  semantic validators. First-frame wall time is within noise of +45 ms
+  (user CPU +11 ms). A build-time schema or a lazier walk is the next lever;
+  not done here.
+
 - **M4** unchanged (strict unknown keys) — pending the user's decision.
 - **M5** `host list`/`host rm` are Recovery, and a bad row no longer
   bricks startup (host layer unavailable, banner).
