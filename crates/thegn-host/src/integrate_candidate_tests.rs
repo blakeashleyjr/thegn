@@ -505,8 +505,7 @@ fn ui_fold_refuses_an_ambiguous_trusted_overlay_without_landing() {
     let main_before = git(&f.repo, &["rev-parse", "main"]);
     let rows = f.db.list_merge_queue().unwrap();
     let error = fold_active_repo(&f.config, &f.repo)
-        .err()
-        .expect("an ambiguous trusted overlay must refuse the fold");
+        .expect_err("an ambiguous trusted overlay must refuse the fold");
     assert!(format!("{error:#}").contains("refused"), "{error:#}");
     assert_eq!(git(&f.queued, &["rev-parse", "HEAD"]), queued_head);
     assert_eq!(git(&f.repo, &["rev-parse", "main"]), main_before);
@@ -526,8 +525,7 @@ fn manual_land_refuses_an_ambiguous_trusted_overlay() {
     );
     let main_before = git(&f.repo, &["rev-parse", "main"]);
     let error = crate::cmd::land::land_branch(&f.config, &f.queued)
-        .err()
-        .expect("an ambiguous trusted overlay must refuse the manual land");
+        .expect_err("an ambiguous trusted overlay must refuse the manual land");
     assert!(format!("{error:#}").contains("refused"), "{error:#}");
     assert_eq!(git(&f.repo, &["rev-parse", "main"]), main_before);
 }
