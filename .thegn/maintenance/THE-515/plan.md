@@ -265,3 +265,10 @@ All eight findings were verified against the code before changing it.
 8. **SUGGESTION, adopted.** `run.rs` hydration swap uses `session.repo_root()` instead of `main_worktree` (a git subprocess on the loop).
 
 Test-gap note: `overlay_key_is_pure_…` only shows the path-only derivation matches for roots; purity itself is structural (`legacy_key_for_root` calls no I/O).
+
+Review-fix validation (d060161d + 31494a87, per-worktree lane target):
+
+- Focused filterset → 392 passed, 0 failed. It widens the slice-1 filterset with `handlers::merge_queue|handlers::pr_queue|agent::tests|merge_ops|cmd::merge|cmd::pr_queue|cmd::land|db_workspace`.
+- `package(thegn-host) & test(/integrate::candidates::tests/)` → 15 passed, including the fold and manual-land refusal tests.
+- `cargo clippy --workspace --offline --locked --all-targets -- -D warnings` → clean.
+- `nix develop --command treefmt --ci` → 0 changed; `nix develop --command just ratchets` → exit 0.
