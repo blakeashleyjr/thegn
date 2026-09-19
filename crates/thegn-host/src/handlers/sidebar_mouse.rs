@@ -2154,7 +2154,7 @@ mod tests {
 
         let mut sb = SidebarState::default();
         let session = crate::session::Session::default();
-        let mut press = |sb: &mut SidebarState, model: &mut crate::chrome::FrameModel, mx| {
+        let press = |sb: &mut SidebarState, model: &mut crate::chrome::FrameModel, mx| {
             on_left_press(
                 &mut MouseUi::default(),
                 sb,
