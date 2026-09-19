@@ -1,4 +1,5 @@
 use super::*;
+use crate::calendar::GapPolicy;
 use chrono::NaiveDate;
 
 fn d(y: i32, m: u32, day: u32) -> NaiveDate {
@@ -694,15 +695,36 @@ fn a_by_part_finer_than_the_frequency_filters_rather_than_expanding() {
 
 #[test]
 fn a_secondly_rule_is_bounded_rather_than_running_away() {
-    // The one place the expander refuses instead of obeying: a SECONDLY rule
-    // over a month is millions of instants and no UI wants them.
+    // A SECONDLY rule over months is millions of instants and no UI wants
+    // them.
     let rec = Recurrence {
         rules: vec![RRule::parse("FREQ=SECONDLY").unwrap()],
         ..Default::default()
     };
-    let times = expand_local(&rec, dt(2026, 8, 1, 0, 0), d(2026, 8, 1), d(2026, 12, 31));
-    assert!(!times.is_empty());
-    assert!(times.len() <= 200_000, "bounded: {}", times.len());
+    // Refused as a typed error — never a silently truncated list that would
+    // read as the complete answer.
+    let mut budget = ExpansionBudget::default();
+    assert_eq!(
+        expand_local_bounded(
+            &rec,
+            dt(2026, 8, 1, 0, 0),
+            d(2026, 8, 1),
+            d(2026, 12, 31),
+            &mut budget
+        ),
+        Err(ExpansionError::Budget(ExpansionLimit::RecurrenceWork))
+    );
+    // A day of it fits, and is complete.
+    let mut budget = ExpansionBudget::default();
+    let day = expand_local_bounded(
+        &rec,
+        dt(2026, 8, 1, 0, 0),
+        d(2026, 8, 1),
+        d(2026, 8, 1),
+        &mut budget,
+    )
+    .unwrap();
+    assert_eq!(day.len(), 86_400);
 }
 
 // --- BY* parts acting as FILTERS on the finer frequencies -------------------
