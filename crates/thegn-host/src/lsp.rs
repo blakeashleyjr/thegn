@@ -22,7 +22,7 @@
 //! the store then drops exactly the retired streams' data, proven by the bus's
 //! registration set rather than by any number carried on a publication.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -60,6 +60,20 @@ enum ClientSlot {
 /// a per-worktree instance.
 type ClientMap = HashMap<(PathBuf, String), ClientSlot>;
 
+/// The client map plus the worktree-root set it was last reconciled against.
+/// Both live under one lock so a request for a root that was just closed can
+/// never respawn a server behind a reconcile.
+#[derive(Default)]
+struct ClientState {
+    map: ClientMap,
+    /// `None` until the host first reconciles; afterwards only these roots
+    /// may start servers.
+    live: Option<HashSet<PathBuf>>,
+    /// Epoch of the applied root set. Reconcile tasks can run out of order
+    /// (they queue on this lock); an older epoch is never applied over a newer.
+    epoch: u64,
+}
+
 pub struct LspInner {
     enabled: bool,
     /// The resolved server registry (built-ins + user `[[lsp.servers]]`). Built
@@ -67,7 +81,7 @@ pub struct LspInner {
     /// across every off-loop request task.
     registry: Registry,
     diag_tx: DiagnosticsSender,
-    clients: Mutex<ClientMap>,
+    clients: Mutex<ClientState>,
 }
 
 impl LspSupervisor {
@@ -79,7 +93,7 @@ impl LspSupervisor {
                 enabled: cfg.lsp.enabled,
                 registry: Registry::build(&cfg.lsp.servers),
                 diag_tx,
-                clients: Mutex::new(HashMap::new()),
+                clients: Mutex::new(ClientState::default()),
             }),
             raw_rx: Some(raw_rx),
         }
@@ -167,10 +181,16 @@ impl LspInner {
         {
             return Err(LspError::Bounded("LSP authority identity limit".into()));
         }
-        let mut clients = self
+        let mut state = self
             .clients
             .lock()
             .map_err(|_| LspError::Protocol("LSP client map poisoned".into()))?;
+        if state.live.as_ref().is_some_and(|live| !live.contains(root)) {
+            // The worktree is closed (or not yet known): never respawn behind
+            // a reconcile. Not cached — reopening the root re-enables it.
+            return Err(LspError::NotAvailable);
+        }
+        let clients = &mut state.map;
         let map_key = (root.to_path_buf(), key.to_string());
         if let Some(slot) = clients.get(&map_key) {
             return match slot {
@@ -230,7 +250,7 @@ impl LspInner {
             .clients
             .lock()
             .ok()
-            .and_then(|mut clients| clients.remove(&(root.to_path_buf(), key.to_string())));
+            .and_then(|mut state| state.map.remove(&(root.to_path_buf(), key.to_string())));
         if let Some(ClientSlot::Live { client, generation }) = removed {
             self.diag_tx.retire(root, key, generation);
             teardown_off_loop(vec![client]);
@@ -240,12 +260,21 @@ impl LspInner {
     /// Retire every server (and negative-cache slot) whose worktree is no
     /// longer in `live_roots`, releasing registry capacity; subprocess
     /// teardown happens on a worker thread. Blocks on the client map (which a
-    /// concurrent spawn may hold) — call off the event loop. Returns how many
-    /// slots were released.
-    pub fn reconcile_roots(&self, live_roots: &HashSet<PathBuf>) -> usize {
+    /// concurrent spawn may hold) — call off the event loop.
+    ///
+    /// `epoch` orders concurrent calls: the host bumps it on every root-set
+    /// change, and a call whose epoch is not newer than the applied one is a
+    /// no-op, so out-of-order tasks converge on the latest set. Returns how
+    /// many slots were released.
+    pub fn reconcile_roots(&self, epoch: u64, live_roots: HashSet<PathBuf>) -> usize {
         let mut teardown = Vec::new();
         let mut released = 0usize;
-        if let Ok(mut clients) = self.clients.lock() {
+        if let Ok(mut state) = self.clients.lock() {
+            if state.live.is_some() && epoch <= state.epoch {
+                return 0;
+            }
+            state.epoch = epoch;
+            let clients = &mut state.map;
             let stale: Vec<(PathBuf, String)> = clients
                 .keys()
                 .filter(|(root, _)| !live_roots.contains(root))
@@ -261,6 +290,7 @@ impl LspInner {
                     teardown.push(client);
                 }
             }
+            state.live = Some(live_roots);
         }
         teardown_off_loop(teardown);
         released
@@ -316,14 +346,58 @@ pub enum DrainStop {
     Input,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// What the visible Problems list needs after a slice. Never a full rebuild
+/// for ordinary traffic: `Patch` touches only the named files (plus the
+/// health rows) of the active root.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum VisibleRefresh {
+    #[default]
+    None,
+    /// Replace the LSP items of these (root-relative) files and the health
+    /// rows; an empty set rewrites only the health rows.
+    Patch(HashSet<String>),
+    /// A retirement changed the active partition wholesale (rare).
+    Full,
+}
+
+impl VisibleRefresh {
+    fn file(&mut self, file: String) {
+        match self {
+            VisibleRefresh::Full => {}
+            VisibleRefresh::Patch(files) => {
+                files.insert(file);
+            }
+            VisibleRefresh::None => *self = VisibleRefresh::Patch(HashSet::from([file])),
+        }
+    }
+
+    fn rows(&mut self) {
+        if *self == VisibleRefresh::None {
+            *self = VisibleRefresh::Patch(HashSet::new());
+        }
+    }
+
+    /// Apply to `dst` for `root` — a bounded patch, or a full merge.
+    pub fn apply_to(&self, store: &LspDiagnostics, root: &Path, dst: &mut Vec<DiagnosticItem>) {
+        match self {
+            VisibleRefresh::None => {}
+            VisibleRefresh::Patch(files) => store.patch_into(root, dst, files),
+            VisibleRefresh::Full => store.merge_into(root, dst),
+        }
+    }
+
+    pub fn is_none(&self) -> bool {
+        *self == VisibleRefresh::None
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DrainOutcome {
     pub applied: usize,
     pub bytes: usize,
     pub stop: DrainStop,
-    /// The active root's partition (or the shared health row) changed, so the
-    /// visible Problems list must be rebuilt — once, for this slice.
-    pub visible_changed: bool,
+    /// How the active root's visible list must be refreshed for this slice.
+    pub refresh: VisibleRefresh,
     /// The slice stopped with work queued and re-armed the bridge wake.
     pub rearmed: bool,
 }
@@ -336,7 +410,9 @@ pub struct DrainOutcome {
 /// steady input stream); after that the slice stops at the publication/byte/
 /// time budget or when `input_pending` reports queued terminal input, finishing
 /// at most one publication past a limit. A slice that stops with work left
-/// re-arms the bus's single wake obligation — never a timer.
+/// re-arms the bus's single wake obligation — never a timer. The returned
+/// refresh names only the active root's files this slice touched, so the
+/// visible update is bounded by the slice too (see [`LspDiagnostics::patch_into`]).
 pub fn drain_diagnostics(
     rx: &DiagnosticsReceiver,
     store: &mut LspDiagnostics,
@@ -346,15 +422,19 @@ pub fn drain_diagnostics(
     mut input_pending: impl FnMut() -> bool,
     mut on_item: impl FnMut(),
 ) -> DrainOutcome {
-    let mut visible_changed = false;
-    if let Some(active) = rx.take_retirements() {
-        visible_changed |= store.retain_streams(&active).contains(active_root);
+    let mut refresh = VisibleRefresh::None;
+    if let Some(active) = rx.take_retirements()
+        && store.retain_streams(&active).contains(active_root)
+    {
+        refresh = VisibleRefresh::Full;
     }
     let marks = rx.take_loss_marks();
     if !marks.is_empty() {
-        visible_changed = true; // the shared health row reflects active loss
-        store.mark_incomplete(marks.documents);
-        store.mark_streams_incomplete(marks.streams);
+        let docs = store.mark_incomplete(marks.documents, active_root);
+        let streams = store.mark_streams_incomplete(marks.streams, active_root);
+        if docs || streams {
+            refresh.rows();
+        }
     }
     let mut applied = 0usize;
     let mut bytes = 0usize;
@@ -384,20 +464,27 @@ pub fn drain_diagnostics(
         on_item();
         bytes = bytes.saturating_add(thegn_svc::lsp::published_diagnostics_bytes(&pd));
         applied += 1;
-        visible_changed |= pd.root == active_root;
-        store.apply(pd);
+        let active = pd.root == active_root;
+        if let Some(file) = store.apply(pd)
+            && active
+        {
+            refresh.file(file);
+        }
     }
     let health = rx.take_health();
     if health.has_findings() {
         store.record_health(health);
-        visible_changed = true;
+        // The counters only render inside the active root's loss summary.
+        if store.active_loss(active_root) > 0 {
+            refresh.rows();
+        }
     }
     let rearmed = stop != DrainStop::Empty && rx.rearm_if_pending();
     DrainOutcome {
         applied,
         bytes,
         stop,
-        visible_changed,
+        refresh,
         rearmed,
     }
 }
@@ -407,28 +494,42 @@ pub fn drain_diagnostics(
 /// Persistent store of LSP-pushed diagnostics, partitioned by the worktree
 /// root that produced them and keyed by `(server stream, file)` within each
 /// root. Survives model-hydration swaps (which only carry git/db state) so the
-/// Problems panel keeps showing them; re-merged into the rendered list when
-/// the active partition changes and on every swap. The partition is what keeps
-/// one workspace's warm servers (they stay alive across tab switches) from
+/// Problems panel keeps showing them. The partition is what keeps one
+/// workspace's warm servers (they stay alive across tab switches) from
 /// bleeding diagnostics into another's panel.
 ///
 /// Bounds: `MAX_ROOTS` roots, `MAX_FILES_PER_ROOT` files per root,
 /// `MAX_DIAGNOSTICS` items per file and `MAX_RETAINED_BYTES` in total, counted
 /// over every owned byte (keys, the per-item duplicated file path, strings and
 /// inline struct sizes) and checked on borrowed lengths *before* any item is
-/// built. A refused publication leaves the previous data in place but marks
-/// the document as having lost state — that mark ends only when a complete
-/// publication for the document is actually committed, or its stream retires.
+/// built.
+///
+/// Loss: a document whose latest state was dropped (refused here, evicted or
+/// unparseable upstream) keeps its previous items but is marked lost, and the
+/// Problems list for that root carries a warning row naming it — so old items
+/// are never presented as current. A document mark ends when a complete
+/// publication for it is committed; a stream-wide mark (losses the bus could
+/// not attribute) marks every stored document of the stream and ends once
+/// those are all republished complete. Retirement ends all of a stream's
+/// marks. The health rows appear only while the root has loss.
 #[derive(Debug, Default)]
 pub struct LspDiagnostics {
     by_root: HashMap<PathBuf, RootDiagnostics>,
     retained_bytes: usize,
+    /// Lifetime counters (sticky); rendered only inside a loss summary.
     health: LspHealth,
-    incomplete: HashSet<StoreFileKey>,
-    incomplete_streams: HashSet<StoreStreamKey>,
-    /// A loss that could not be tracked by document or stream (both mark sets
-    /// full). Ends only when every other mark has ended.
+    loss: HashMap<StoreStreamKey, StreamLoss>,
+    /// Total document marks across `loss` (bounded by `MAX_LOSS_DOCUMENTS`).
+    loss_documents: usize,
+    /// A stream's loss could not even be recorded (stream table full). Ends
+    /// when no loss remains anywhere.
     loss_overflow: bool,
+}
+
+#[derive(Debug, Default)]
+struct StreamLoss {
+    documents: BTreeSet<String>,
+    stream_wide: bool,
 }
 
 #[derive(Debug, Default)]
@@ -452,15 +553,14 @@ struct StoreStreamKey {
 }
 
 impl StoreFileKey {
-    fn stream(&self) -> StreamKey {
-        StreamKey {
+    fn stream_key(&self) -> StoreStreamKey {
+        StoreStreamKey {
             root: self.root.clone(),
             server_identity: self.server_identity.clone(),
             generation: self.generation,
         }
     }
 
-    #[cfg(test)]
     fn is_stream(&self, stream: &StoreStreamKey) -> bool {
         self.root == stream.root
             && self.server_identity == stream.server_identity
@@ -469,7 +569,7 @@ impl StoreFileKey {
 }
 
 impl StoreStreamKey {
-    fn stream(&self) -> StreamKey {
+    fn bus_key(&self) -> StreamKey {
         StreamKey {
             root: self.root.clone(),
             server_identity: self.server_identity.clone(),
@@ -480,7 +580,22 @@ impl StoreStreamKey {
 
 const LSP_SOURCE_PREFIX: &str = "lsp:";
 const LSP_DEFAULT_SOURCE: &str = "server";
-const MAX_INCOMPLETE_STREAMS: usize = limits::MAX_ROOTS * limits::MAX_SERVERS_PER_ROOT;
+/// Health rows are tagged with both, so a server whose `source` happens to be
+/// "health" is never mistaken for one.
+const HEALTH_SOURCE: &str = "lsp:health";
+const HEALTH_CODE: &str = "thegn-lsp-loss";
+const MAX_LOSS_DOCUMENTS: usize = limits::MAX_FILES_PER_ROOT * 4;
+const MAX_LOSS_STREAMS: usize = 2 * limits::MAX_ROOTS * limits::MAX_SERVERS_PER_ROOT;
+/// Per-document loss rows shown for one root (the summary counts them all).
+const MAX_LOSS_ROWS: usize = 64;
+
+fn is_health_row(item: &DiagnosticItem) -> bool {
+    item.source == HEALTH_SOURCE && item.code.as_deref() == Some(HEALTH_CODE)
+}
+
+fn severity_rank(item: &DiagnosticItem) -> u8 {
+    item.severity as u8
+}
 
 fn store_key_bytes(key: &StoreFileKey) -> usize {
     key.root
@@ -550,15 +665,16 @@ impl LspDiagnostics {
     /// Apply a server's latest diagnostics for one document, filed under the
     /// originating client's worktree root (stamped on the message). A
     /// complete empty set clears that file; an incomplete (malformed or
-    /// truncated) empty set never masquerades as a clear.
-    pub fn apply(&mut self, pd: PublishedDiagnostics) {
+    /// truncated) empty set never masquerades as a clear. Returns the
+    /// root-relative file the publication concerned (for a visible patch).
+    pub fn apply(&mut self, pd: PublishedDiagnostics) -> Option<String> {
         if pd.root.as_os_str().is_empty()
             || pd.root.as_os_str().as_encoded_bytes().len() > limits::MAX_IDENTITY_BYTES
             || pd.server_identity.len() > limits::MAX_IDENTITY_BYTES
             || pd.path.len() > limits::MAX_IDENTITY_BYTES
         {
             self.health.invalid = self.health.invalid.saturating_add(1);
-            return;
+            return None;
         }
         let file = relativize(&pd.path, &pd.root);
         let key = StoreFileKey {
@@ -570,12 +686,12 @@ impl LspDiagnostics {
         if pd.diagnostics.is_empty() {
             if pd.complete {
                 self.remove_file(&key);
-                self.incomplete.remove(&key);
+                self.commit_complete(&key);
             } else {
                 self.health.incomplete = self.health.incomplete.saturating_add(1);
-                self.remember_incomplete(key);
+                self.remember_document(&key);
             }
-            return;
+            return Some(key.path);
         }
 
         // ── admission, on borrowed lengths, before building anything ──
@@ -603,8 +719,10 @@ impl LspDiagnostics {
             > limits::MAX_RETAINED_BYTES;
         if pd.diagnostics.len() > limits::MAX_DIAGNOSTICS || over_roots || over_files || over_bytes
         {
-            self.refuse(key);
-            return;
+            self.health.dropped = self.health.dropped.saturating_add(1);
+            self.health.incomplete = self.health.incomplete.saturating_add(1);
+            self.remember_document(&key);
+            return Some(key.path);
         }
 
         let items: Vec<DiagnosticItem> = pd
@@ -619,21 +737,22 @@ impl LspDiagnostics {
             .saturating_sub(old_bytes.unwrap_or(0))
             .saturating_add(bytes)
             .saturating_add(new_root_bytes);
-        let complete = pd.complete;
         let root = self.by_root.entry(key.root.clone()).or_default();
         root.files.insert(key.clone(), items);
-        if complete {
-            self.incomplete.remove(&key);
+        if pd.complete {
+            self.commit_complete(&key);
         } else {
             self.health.incomplete = self.health.incomplete.saturating_add(1);
-            self.remember_incomplete(key);
+            self.remember_document(&key);
         }
+        Some(key.path)
     }
 
     /// Replace the LSP-sourced entries in `dst` with the current store's
-    /// entries **for `root` only**, keeping any non-LSP (task-output)
-    /// diagnostics, then re-sort by severity. Foreign roots' diagnostics stay
-    /// in the store but never render.
+    /// entries **for `root` only** (plus its loss rows), keeping any non-LSP
+    /// (task-output) diagnostics, then re-sort by severity. A full rebuild —
+    /// used on hydration swaps and retirements; per-slice updates go through
+    /// [`LspDiagnostics::patch_into`].
     pub fn merge_into(&self, root: &Path, dst: &mut Vec<DiagnosticItem>) {
         dst.retain(|d| !d.source.starts_with(LSP_SOURCE_PREFIX));
         if let Some(files) = self.by_root.get(root) {
@@ -641,26 +760,113 @@ impl LspDiagnostics {
                 dst.extend(items.iter().cloned());
             }
         }
-        if self.health.has_findings() || self.active_loss() > 0 {
-            dst.push(DiagnosticItem {
-                file: String::new(),
-                line: 0,
-                col: None,
-                severity: Severity::Warning,
-                message: format!("{} active={}", self.health.summary(), self.active_loss()),
-                source: "lsp:health".to_string(),
-                code: None,
-            });
-        }
-        dst.sort_by_key(|d| d.severity as u8);
+        dst.extend(self.health_rows(root));
+        dst.sort_by_key(severity_rank);
     }
 
-    /// Documents/streams whose latest state is currently known to be lost.
-    fn active_loss(&self) -> usize {
-        self.incomplete
-            .len()
-            .saturating_add(self.incomplete_streams.len())
-            .saturating_add(usize::from(self.loss_overflow))
+    /// Incremental form of [`LspDiagnostics::merge_into`]: replace only the
+    /// LSP items of `files` and the health rows, splicing the new items into
+    /// their severity bands. No clone or sort of the untouched partition — the
+    /// cost is one linear pass over `dst` plus the changed files' items. Falls
+    /// back to a full merge if `dst` is not in severity order (e.g. a caller
+    /// appended unsorted task output).
+    pub fn patch_into(&self, root: &Path, dst: &mut Vec<DiagnosticItem>, files: &HashSet<String>) {
+        if !dst.is_sorted_by_key(severity_rank) {
+            self.merge_into(root, dst);
+            return;
+        }
+        dst.retain(|d| {
+            !(is_health_row(d)
+                || (d.source.starts_with(LSP_SOURCE_PREFIX) && files.contains(&d.file)))
+        });
+        let mut add: Vec<DiagnosticItem> = Vec::new();
+        if !files.is_empty()
+            && let Some(state) = self.by_root.get(root)
+        {
+            for (key, items) in &state.files {
+                if files.contains(&key.path) {
+                    add.extend(items.iter().cloned());
+                }
+            }
+        }
+        add.extend(self.health_rows(root));
+        add.sort_by_key(severity_rank);
+        while let Some(last) = add.last() {
+            let rank = severity_rank(last);
+            let split = add.partition_point(|d| severity_rank(d) < rank);
+            let band = add.split_off(split);
+            let at = dst.partition_point(|d| severity_rank(d) <= rank);
+            dst.splice(at..at, band);
+        }
+    }
+
+    /// The loss rows for `root`: nothing while the root has no active loss;
+    /// otherwise a bounded summary plus up to `MAX_LOSS_ROWS` per-document
+    /// rows naming the files whose shown diagnostics are out of date.
+    fn health_rows(&self, root: &Path) -> Vec<DiagnosticItem> {
+        if self.active_loss(root) == 0 {
+            return Vec::new();
+        }
+        let mut streams: Vec<(&StoreStreamKey, &StreamLoss)> = self
+            .loss
+            .iter()
+            .filter(|(key, _)| key.root == root)
+            .collect();
+        streams.sort_by(|a, b| a.0.cmp(b.0));
+        let documents: usize = streams.iter().map(|(_, l)| l.documents.len()).sum();
+        let wide = streams.iter().filter(|(_, l)| l.stream_wide).count();
+        let h = self.health;
+        let mut rows = vec![DiagnosticItem {
+            file: String::new(),
+            line: 0,
+            col: None,
+            severity: Severity::Warning,
+            message: format!(
+                "LSP diagnostics may be out of date: {documents} file(s) and {wide} server(s) \
+                 lost updates{} (dropped={} truncated={} stale={} invalid={})",
+                if self.loss_overflow {
+                    ", more untracked"
+                } else {
+                    ""
+                },
+                h.dropped,
+                h.truncated,
+                h.stale,
+                h.invalid
+            ),
+            source: HEALTH_SOURCE.to_string(),
+            code: Some(HEALTH_CODE.to_string()),
+        }];
+        'rows: for (stream, loss) in streams {
+            let server = thegn_svc::lsp::sanitize_for_terminal(&stream.server_identity);
+            for path in &loss.documents {
+                if rows.len() > MAX_LOSS_ROWS {
+                    break 'rows;
+                }
+                rows.push(DiagnosticItem {
+                    file: thegn_svc::lsp::sanitize_for_terminal(path),
+                    line: 1,
+                    col: None,
+                    severity: Severity::Warning,
+                    message: format!(
+                        "{server}: latest diagnostics for this file were lost; shown items may be out of date"
+                    ),
+                    source: HEALTH_SOURCE.to_string(),
+                    code: Some(HEALTH_CODE.to_string()),
+                });
+            }
+        }
+        rows
+    }
+
+    /// Documents/streams under `root` whose latest state is known lost.
+    pub fn active_loss(&self, root: &Path) -> usize {
+        self.loss
+            .iter()
+            .filter(|(key, _)| key.root == root)
+            .map(|(_, l)| l.documents.len() + usize::from(l.stream_wide))
+            .sum::<usize>()
+            + usize::from(self.loss_overflow)
     }
 
     /// Drop everything a closed worktree's servers pushed (memory hygiene —
@@ -689,16 +895,15 @@ impl LspDiagnostics {
             .fold(0usize, usize::saturating_add);
         self.by_root.retain(|root, _| keep(root));
         self.retained_bytes = self.retained_bytes.saturating_sub(removed);
-        self.incomplete.retain(|key| keep(&key.root));
-        self.incomplete_streams.retain(|key| keep(&key.root));
-        self.settle_overflow();
+        self.loss.retain(|key, _| keep(&key.root));
+        self.settle_loss();
     }
 
     /// Keep only data from streams that are still registered on the bus
     /// (`active`). This is the only path by which a stream's retained
     /// diagnostics and loss marks end besides explicit clears: the evidence is
     /// the supervisor's registration set, never a publication's own numbers.
-    /// Returns the roots whose partitions changed.
+    /// Returns the roots whose partitions or loss rows changed.
     pub fn retain_streams(&mut self, active: &HashSet<StreamKey>) -> HashSet<PathBuf> {
         let mut changed = HashSet::new();
         let mut released = 0usize;
@@ -706,7 +911,7 @@ impl LspDiagnostics {
         for (root, state) in &mut self.by_root {
             let before = state.files.len();
             state.files.retain(|key, items| {
-                let keep = active.contains(&key.stream());
+                let keep = active.contains(&key.stream_key().bus_key());
                 if !keep {
                     released = released.saturating_add(entry_bytes(key, items));
                 }
@@ -724,83 +929,130 @@ impl LspDiagnostics {
             released = released.saturating_add(root_bytes(&root));
         }
         self.retained_bytes = self.retained_bytes.saturating_sub(released);
-        self.incomplete.retain(|key| active.contains(&key.stream()));
-        self.incomplete_streams
-            .retain(|key| active.contains(&key.stream()));
-        self.settle_overflow();
+        self.loss.retain(|key, _| {
+            let keep = active.contains(&key.bus_key());
+            if !keep {
+                changed.insert(key.root.clone());
+            }
+            keep
+        });
+        self.settle_loss();
         changed
     }
 
     #[allow(dead_code)] // exercised by tests; the loop-side caller was removed
     pub fn is_empty(&self) -> bool {
-        self.by_root.is_empty() && !self.health.has_findings() && self.active_loss() == 0
+        self.by_root.is_empty() && self.loss.is_empty() && !self.loss_overflow
     }
 
     pub fn record_health(&mut self, health: LspHealth) {
         self.health.saturating_add(health);
     }
 
-    /// Documents whose latest publication the bus had to drop. Health was
-    /// already counted by the bus.
-    pub fn mark_incomplete(&mut self, keys: impl IntoIterator<Item = DiagnosticKey>) {
+    /// Documents whose latest publication the bus had to drop (health was
+    /// already counted by the bus). Returns whether `active_root` was touched.
+    pub fn mark_incomplete(
+        &mut self,
+        keys: impl IntoIterator<Item = DiagnosticKey>,
+        active_root: &Path,
+    ) -> bool {
+        let mut touched = false;
         for key in keys {
             let path = relativize(&key.path, &key.root);
-            self.remember_incomplete(StoreFileKey {
+            touched |= key.root == active_root;
+            self.remember_document(&StoreFileKey {
                 root: key.root,
                 server_identity: key.server_identity,
                 generation: key.generation,
                 path,
             });
         }
+        touched
     }
 
-    /// Streams with untracked losses; they stay incomplete until they retire.
-    pub fn mark_streams_incomplete(&mut self, streams: impl IntoIterator<Item = StreamKey>) {
+    /// Streams with losses the bus could not attribute: every stored document
+    /// of the stream is marked, and the stream stays marked until those are
+    /// republished complete. Returns whether `active_root` was touched.
+    pub fn mark_streams_incomplete(
+        &mut self,
+        streams: impl IntoIterator<Item = StreamKey>,
+        active_root: &Path,
+    ) -> bool {
+        let mut touched = false;
         for stream in streams {
-            self.remember_incomplete_stream(StoreStreamKey {
+            touched |= stream.root == active_root;
+            let stream = StoreStreamKey {
                 root: stream.root,
                 server_identity: stream.server_identity,
                 generation: stream.generation,
-            });
+            };
+            let stored: Vec<StoreFileKey> = self
+                .by_root
+                .get(&stream.root)
+                .map(|state| {
+                    state
+                        .files
+                        .keys()
+                        .filter(|key| key.is_stream(&stream))
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default();
+            for key in &stored {
+                self.remember_document(key);
+            }
+            if let Some(loss) = self.loss_entry(stream) {
+                loss.stream_wide = true;
+            }
         }
+        touched
     }
 
-    fn refuse(&mut self, key: StoreFileKey) {
-        self.health.dropped = self.health.dropped.saturating_add(1);
-        self.health.incomplete = self.health.incomplete.saturating_add(1);
-        self.remember_incomplete(key);
-    }
-
-    fn remember_incomplete(&mut self, key: StoreFileKey) {
-        if self.incomplete.contains(&key) {
-            return;
-        }
-        if self.incomplete.len() < limits::MAX_LOSS_MARKS {
-            self.incomplete.insert(key);
-            return;
-        }
-        // Mark set full: escalate to the document's stream (never evict an
-        // existing mark — that would silently turn a loss into "clean").
-        self.remember_incomplete_stream(StoreStreamKey {
-            root: key.root,
-            server_identity: key.server_identity,
-            generation: key.generation,
-        });
-    }
-
-    fn remember_incomplete_stream(&mut self, stream: StoreStreamKey) {
-        if self.incomplete_streams.contains(&stream) {
-            return;
-        }
-        if self.incomplete_streams.len() < MAX_INCOMPLETE_STREAMS {
-            self.incomplete_streams.insert(stream);
-        } else {
+    fn loss_entry(&mut self, stream: StoreStreamKey) -> Option<&mut StreamLoss> {
+        if !self.loss.contains_key(&stream) && self.loss.len() >= MAX_LOSS_STREAMS {
             self.loss_overflow = true;
+            return None;
+        }
+        Some(self.loss.entry(stream).or_default())
+    }
+
+    fn remember_document(&mut self, key: &StoreFileKey) {
+        let room = self.loss_documents < MAX_LOSS_DOCUMENTS;
+        let Some(loss) = self.loss_entry(key.stream_key()) else {
+            return;
+        };
+        if loss.documents.contains(&key.path) {
+            return;
+        }
+        if room {
+            loss.documents.insert(key.path.clone());
+            self.loss_documents += 1;
+        } else {
+            // Never evict a mark (that would turn a loss into "clean"):
+            // escalate to the stream instead.
+            loss.stream_wide = true;
         }
     }
 
-    fn settle_overflow(&mut self) {
-        if self.incomplete.is_empty() && self.incomplete_streams.is_empty() {
+    /// A complete publication for `key` was committed: its document mark ends,
+    /// and a stream-wide mark ends once no document of the stream is marked.
+    fn commit_complete(&mut self, key: &StoreFileKey) {
+        let stream = key.stream_key();
+        let Some(loss) = self.loss.get_mut(&stream) else {
+            return;
+        };
+        if loss.documents.remove(&key.path) {
+            self.loss_documents = self.loss_documents.saturating_sub(1);
+        }
+        if loss.documents.is_empty() {
+            self.loss.remove(&stream);
+        }
+        self.settle_loss();
+    }
+
+    fn settle_loss(&mut self) {
+        self.loss_documents = self.loss.values().map(|l| l.documents.len()).sum();
+        if self.loss.is_empty() {
             self.loss_overflow = false;
         }
     }
@@ -850,11 +1102,10 @@ impl LspDiagnostics {
             generation,
         };
         self.loss_overflow
-            || self.incomplete_streams.contains(&stream)
             || self
-                .incomplete
-                .iter()
-                .any(|key| key.is_stream(&stream) && key.path == file)
+                .loss
+                .get(&stream)
+                .is_some_and(|l| l.stream_wide || l.documents.contains(file))
     }
 }
 
@@ -1111,12 +1362,16 @@ mod tests {
         }
         let mut dst = Vec::new();
         store.merge_into(Path::new("/p"), &mut dst);
-        assert!(dst.len() <= thegn_svc::lsp::limits::MAX_FILES_PER_ROOT + 1);
+        assert!(dst.len() <= thegn_svc::lsp::limits::MAX_FILES_PER_ROOT + 1 + MAX_LOSS_ROWS);
         assert!(
             dst.iter()
                 .all(|item| !item.message.chars().any(char::is_control))
         );
-        assert!(dst.iter().any(|item| item.source == "lsp:health"));
+        assert!(dst.iter().any(is_health_row));
+        assert!(
+            dst.iter()
+                .any(|item| is_health_row(item) && item.file == "4096.rs")
+        );
     }
 
     // ── THE-336: bounded store, lifecycle and budgeted drain ────────────────
@@ -1176,6 +1431,12 @@ mod tests {
         let (inner, rx) = enabled_inner();
         for index in 0..(limits::MAX_ROOTS * 3) {
             let root = PathBuf::from(format!("/wt/{index}"));
+            let epoch = 2 * index as u64 + 1;
+            // The worktree opens: it joins the live set.
+            assert_eq!(
+                inner.reconcile_roots(epoch, HashSet::from([root.clone()])),
+                0
+            );
             let client = inner
                 .client_with(&root, "rust", fake_client)
                 .unwrap_or_else(|e| panic!("open #{index}: {e}"));
@@ -1188,11 +1449,16 @@ mod tests {
                 Some(LspError::NotAvailable)
             );
             // The worktree closes: both slots and the registration are released.
-            assert_eq!(inner.reconcile_roots(&HashSet::new()), 2);
+            assert_eq!(inner.reconcile_roots(epoch + 1, HashSet::new()), 2);
+            // A late request for the closed root cannot respawn a server.
+            assert_eq!(
+                inner.client_with(&root, "rust", fake_client).err(),
+                Some(LspError::NotAvailable)
+            );
         }
         assert_eq!(rx.footprint().active_streams, 0);
         assert_eq!(rx.footprint().metadata_bytes, 0);
-        assert!(inner.clients.lock().unwrap().is_empty());
+        assert!(inner.clients.lock().unwrap().map.is_empty());
     }
 
     #[test]
@@ -1274,17 +1540,16 @@ mod tests {
             || false,
             || {},
         );
-        assert!(
-            outcome.visible_changed,
+        assert_eq!(
+            outcome.refresh,
+            VisibleRefresh::Full,
             "retirement changed the active partition"
         );
         let mut dst = Vec::new();
         store.merge_into(root, &mut dst);
-        let messages: Vec<&str> = dst
-            .iter()
-            .filter(|d| d.source != "lsp:health")
-            .map(|d| d.message.as_str())
-            .collect();
+        let messages: Vec<&str> = dst.iter().map(|d| d.message.as_str()).collect();
+        // An ordinary restart (with a stale late publication) is not loss:
+        // no health row appears.
         assert_eq!(messages, vec!["clang"]);
         assert_eq!(store.health.stale, 1);
         assert_store_conserved(&store);
@@ -1494,7 +1759,7 @@ mod tests {
             || {},
         );
         assert_eq!(outcome.applied, 1);
-        assert!(!outcome.visible_changed);
+        assert!(outcome.refresh.is_none());
     }
 
     #[test]
@@ -1535,8 +1800,9 @@ mod tests {
             || {},
         );
         assert!(
-            outcome.visible_changed,
-            "the quiet (active) root landed in the first slice"
+            matches!(outcome.refresh, VisibleRefresh::Patch(ref files) if files.contains("q.rs")),
+            "the quiet (active) root landed in the first slice: {:?}",
+            outcome.refresh
         );
         let mut dst = Vec::new();
         store.merge_into(Path::new("/quiet"), &mut dst);
@@ -1564,7 +1830,11 @@ mod tests {
         assert!(dst.iter().any(|d| d.message == "old"));
         assert!(
             dst.iter()
-                .any(|d| d.source == "lsp:health" && d.message.contains("active=1"))
+                .any(|d| is_health_row(d) && d.message.contains("1 file(s)"))
+        );
+        assert!(
+            dst.iter().any(|d| is_health_row(d) && d.file == "a.rs"),
+            "the stale file is named, so its old items are not presented as current"
         );
 
         // An incomplete (truncated) publication replaces data but stays incomplete.
@@ -1591,8 +1861,8 @@ mod tests {
         assert!(!store.is_incomplete("/p", "test", 1, "a.rs"));
         store.merge_into(Path::new("/p"), &mut dst);
         assert!(
-            dst.iter().any(|d| d.message.contains("active=0")),
-            "counters stay sticky, loss ends"
+            !dst.iter().any(is_health_row),
+            "loss ended: the row goes away (counters stay internal)"
         );
         assert_store_conserved(&store);
     }
@@ -1631,7 +1901,7 @@ mod tests {
         let f = assert_store_conserved(&store);
         assert_eq!((f.bytes, f.files, f.roots), (0, 0, 0));
         assert_eq!(
-            store.active_loss(),
+            store.active_loss(Path::new("/p")),
             0,
             "retired streams take their marks along"
         );
@@ -1649,5 +1919,255 @@ mod tests {
         store.apply(pd("/p", &file, items));
         let f = assert_store_conserved(&store);
         assert!(f.bytes >= limits::MAX_DIAGNOSTICS * (limits::MAX_IDENTITY_BYTES - 16));
+    }
+
+    // ── review round 2: F2–F5 ────────────────────────────────────────────────
+
+    #[track_caller]
+    fn assert_same_items(patched: &[DiagnosticItem], merged: &[DiagnosticItem]) {
+        let key = |d: &DiagnosticItem| {
+            (
+                d.severity as u8,
+                d.file.clone(),
+                d.line,
+                d.message.clone(),
+                d.source.clone(),
+            )
+        };
+        let mut a: Vec<_> = patched.iter().map(key).collect();
+        let mut b: Vec<_> = merged.iter().map(key).collect();
+        a.sort();
+        b.sort();
+        assert_eq!(a, b);
+        assert!(
+            patched.is_sorted_by_key(severity_rank),
+            "patch keeps severity order"
+        );
+    }
+
+    #[test]
+    fn incremental_patch_matches_a_full_merge_without_rebuilding_untouched_files() {
+        let mut store = LspDiagnostics::new();
+        for index in 0..50u32 {
+            let sev =
+                [LspSeverity::Error, LspSeverity::Warning, LspSeverity::Hint][index as usize % 3];
+            store.apply(pd(
+                "/p",
+                &format!("/p/{index}.rs"),
+                vec![diag(index, sev, &format!("m{index}"))],
+            ));
+        }
+        let task = DiagnosticItem {
+            file: "task.rs".into(),
+            line: 1,
+            col: None,
+            severity: Severity::Warning,
+            message: "task".into(),
+            source: "cargo clippy".into(),
+            code: None,
+        };
+        let mut dst = vec![task];
+        store.merge_into(Path::new("/p"), &mut dst);
+
+        // Replace one file, clear another, refuse a third (loss row appears).
+        store.apply(pd(
+            "/p",
+            "/p/3.rs",
+            vec![
+                diag(9, LspSeverity::Error, "new3"),
+                diag(1, LspSeverity::Info, "info3"),
+            ],
+        ));
+        store.apply(pd("/p", "/p/4.rs", vec![]));
+        let too_many: Vec<_> = (0..=limits::MAX_DIAGNOSTICS as u32)
+            .map(|l| diag(l, LspSeverity::Error, "x"))
+            .collect();
+        store.apply(pd("/p", "/p/5.rs", too_many));
+        let files: HashSet<String> = ["3.rs", "4.rs", "5.rs"].map(String::from).into();
+        let mut patched = dst.clone();
+        store.patch_into(Path::new("/p"), &mut patched, &files);
+        let mut merged = dst.clone();
+        store.merge_into(Path::new("/p"), &mut merged);
+        assert_same_items(&patched, &merged);
+        assert!(
+            patched.iter().any(|d| d.message == "task"),
+            "task output kept"
+        );
+        assert!(
+            patched.iter().any(|d| d.message == "m5"),
+            "refused file keeps old items"
+        );
+        assert!(patched.iter().any(|d| is_health_row(d) && d.file == "5.rs"));
+
+        // Loss ends: the rows-only patch removes the health rows again.
+        store.apply(pd(
+            "/p",
+            "/p/5.rs",
+            vec![diag(0, LspSeverity::Error, "ok5")],
+        ));
+        store.patch_into(
+            Path::new("/p"),
+            &mut patched,
+            &HashSet::from(["5.rs".to_string()]),
+        );
+        store.merge_into(Path::new("/p"), &mut merged);
+        assert_same_items(&patched, &merged);
+        assert!(!patched.iter().any(is_health_row));
+    }
+
+    #[test]
+    fn drain_refresh_names_only_the_touched_files() {
+        let (inner, rx) = enabled_inner();
+        let client = inner
+            .client_with(Path::new("/p"), "rust", fake_client)
+            .unwrap();
+        let g = client.generation();
+        for seq in 1..=3 {
+            inner.diag_tx.publish(stamped(
+                "/p",
+                "rust",
+                g,
+                seq,
+                &format!("/p/{seq}.rs"),
+                vec![diag(0, LspSeverity::Error, "e")],
+            ));
+        }
+        let mut store = LspDiagnostics::new();
+        let outcome = drain_diagnostics(
+            &rx,
+            &mut store,
+            Path::new("/p"),
+            DrainBudget::default(),
+            || Duration::ZERO,
+            || false,
+            || {},
+        );
+        assert_eq!(
+            outcome.refresh,
+            VisibleRefresh::Patch(["1.rs", "2.rs", "3.rs"].map(String::from).into())
+        );
+    }
+
+    #[test]
+    fn unparseable_publication_loss_is_shown_for_that_file() {
+        let (inner, rx) = enabled_inner();
+        let client = inner
+            .client_with(Path::new("/p"), "rust", fake_client)
+            .unwrap();
+        let g = client.generation();
+        inner.diag_tx.publish(stamped(
+            "/p",
+            "rust",
+            g,
+            1,
+            "/p/a.rs",
+            vec![diag(0, LspSeverity::Error, "ten")],
+        ));
+        let mut store = LspDiagnostics::new();
+        let mut dst = Vec::new();
+        drain_diagnostics(
+            &rx,
+            &mut store,
+            Path::new("/p"),
+            DrainBudget::default(),
+            || Duration::ZERO,
+            || false,
+            || {},
+        )
+        .refresh
+        .apply_to(&store, Path::new("/p"), &mut dst);
+        // The next publication for a.rs failed the JSON bounds upstream.
+        inner
+            .diag_tx
+            .mark_lost(Path::new("/p"), "rust", g, Some("/p/a.rs"));
+        let outcome = drain_diagnostics(
+            &rx,
+            &mut store,
+            Path::new("/p"),
+            DrainBudget::default(),
+            || Duration::ZERO,
+            || false,
+            || {},
+        );
+        outcome.refresh.apply_to(&store, Path::new("/p"), &mut dst);
+        assert!(store.is_incomplete("/p", "rust", g, "a.rs"));
+        assert!(dst.iter().any(|d| d.message == "ten"));
+        assert!(dst.iter().any(|d| is_health_row(d) && d.file == "a.rs"));
+    }
+
+    #[test]
+    fn stream_wide_loss_clears_once_every_stored_file_is_republished_complete() {
+        let mut store = LspDiagnostics::new();
+        store.apply(pd("/p", "/p/a.rs", vec![diag(0, LspSeverity::Error, "a")]));
+        store.apply(pd("/p", "/p/b.rs", vec![diag(0, LspSeverity::Error, "b")]));
+        let stream = StreamKey {
+            root: PathBuf::from("/p"),
+            server_identity: "test".into(),
+            generation: 1,
+        };
+        assert!(store.mark_streams_incomplete([stream], Path::new("/p")));
+        assert_eq!(
+            store.active_loss(Path::new("/p")),
+            3,
+            "two files + the stream"
+        );
+        store.apply(pd("/p", "/p/a.rs", vec![diag(0, LspSeverity::Error, "a2")]));
+        assert!(store.active_loss(Path::new("/p")) > 0);
+        store.apply(pd("/p", "/p/b.rs", vec![]));
+        assert_eq!(
+            store.active_loss(Path::new("/p")),
+            0,
+            "all republished complete"
+        );
+        let mut dst = Vec::new();
+        store.merge_into(Path::new("/p"), &mut dst);
+        assert!(!dst.iter().any(is_health_row));
+    }
+
+    #[test]
+    fn counters_without_loss_never_render_a_health_row() {
+        let mut store = LspDiagnostics::new();
+        store.apply(pd("/p", "/p/a.rs", vec![diag(0, LspSeverity::Error, "a")]));
+        store.record_health(LspHealth {
+            stale: 3,
+            truncated: 2,
+            invalid: 1,
+            ..LspHealth::default()
+        });
+        let mut dst = Vec::new();
+        store.merge_into(Path::new("/p"), &mut dst);
+        assert_eq!(dst.len(), 1);
+        // Loss in another root does not leak a row into this one.
+        let too_many: Vec<_> = (0..=limits::MAX_DIAGNOSTICS as u32)
+            .map(|l| diag(l, LspSeverity::Error, "x"))
+            .collect();
+        store.apply(pd("/q", "/q/x.rs", too_many));
+        store.merge_into(Path::new("/p"), &mut dst);
+        assert!(!dst.iter().any(is_health_row));
+    }
+
+    #[test]
+    fn out_of_order_reconciles_converge_on_the_latest_root_set() {
+        let (inner, rx) = enabled_inner();
+        let (a, b) = (PathBuf::from("/a"), PathBuf::from("/b"));
+        inner.reconcile_roots(1, HashSet::from([a.clone(), b.clone()]));
+        inner.client_with(&a, "rust", fake_client).unwrap();
+        inner.client_with(&b, "rust", fake_client).unwrap();
+        // S1 = {a} (epoch 2) and S2 = {b} (epoch 3) queued; S2 wins the lock.
+        assert_eq!(inner.reconcile_roots(3, HashSet::from([b.clone()])), 1);
+        assert_eq!(
+            inner.reconcile_roots(2, HashSet::from([a.clone()])),
+            0,
+            "older epoch is a no-op"
+        );
+        assert_eq!(rx.footprint().active_streams, 1);
+        assert!(
+            inner.client_with(&b, "rust", fake_client).is_ok(),
+            "b's server survived"
+        );
+        assert_eq!(
+            inner.client_with(&a, "rust", fake_client).err(),
+            Some(LspError::NotAvailable)
+        );
     }
 }

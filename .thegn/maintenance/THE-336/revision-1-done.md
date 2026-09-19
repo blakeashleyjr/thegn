@@ -64,3 +64,37 @@ the aggregate before cloning.
 - Worktree closure is observed at the periodic model swap, not instantly.
 - A client started for the `current_dir()` fallback root (no active worktree
   path) is reconciled away on the next root-set change and lazily restarted.
+
+## Review round 2 (review-the-336.md) — responses
+
+- **F1 (critical, verified):** `LspClient::write` no longer runs the inbound
+  preflight on our own payloads; outbound is capped only at the 64 MiB frame
+  limit (`MAX_OUTBOUND_BODY_BYTES`). Regression: fake server `--echo-open`
+  receives a didOpen of 2×256 KiB+17 bytes whole.
+- **F2 (verified):** a body that fails preflight (or serde) goes through
+  `reject_unparsed`: a linear `scan_envelope` recovers `id`, whether the method
+  is publishDiagnostics, and `params.uri`; the bus `mark_lost` supersedes any
+  older pending value for that document and marks it lost (stream-wide when the
+  uri is unrecoverable). The store keeps old items but the Problems list names
+  the file in a loss row. Serde-rejected responses now also fail promptly.
+- **F3 (verified):** `reconcile_roots(epoch, set)` — the client map, the live
+  root set and the applied epoch share one lock; older epochs are no-ops, and
+  `client_with` refuses roots outside the live set (no respawn behind a
+  reconcile). The active root is part of the live set (no current_dir churn).
+  Trade-off: a brand-new worktree gets LSP after the next model swap.
+- **F4 (verified):** the loop no longer clones+sorts the active partition per
+  slice. `drain_diagnostics` returns `VisibleRefresh::Patch(files)`;
+  `patch_into` removes those files' LSP items and the health rows in one
+  `retain` pass and splices the replacements into their severity bands (no
+  clone/sort of untouched items). Full merges remain only for hydration swaps
+  and retirements. Residual cost: O(len) memmove per touched slice.
+- **F5 (verified):** health rows render only while the active root has loss;
+  lifetime counters appear only inside that summary. Stream-wide marks mark
+  every stored file of the stream and end once those are republished complete.
+- **F6:** in-flight flags reset by a drop guard inside the spawned task (panic
+  safe); pressing h/r while a fetch runs sets a status message.
+- **F7:** inbound JSON strings admitted up to 256 KiB (hover cap); encoded
+  `file://` URIs up to 3×4 KiB+16 so a bounded non-ASCII path is accepted.
+- Not addressed: a patch applied between a tab switch and its hydration swap
+  touches only the changed files of the new root (the swap's full merge fixes
+  the list, as before).

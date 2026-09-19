@@ -46,8 +46,19 @@ pub mod limits {
     pub const MAX_JSON_DEPTH: usize = 64;
     pub const MAX_JSON_NODES: usize = 65_536;
     pub const MAX_CONTAINER_ITEMS: usize = 4096;
+    /// Per-field cap for names, labels, messages and titles.
     pub const MAX_SCALAR_STRING_BYTES: usize = 64 * 1024;
+    /// Largest single JSON string the inbound preflight admits: the hover
+    /// markdown cap, so a large hover can reach projection (and be bounded
+    /// there) instead of failing wholesale.
+    pub const MAX_JSON_STRING_BYTES: usize = MAX_HOVER_MARKDOWN_BYTES;
     pub const MAX_IDENTITY_BYTES: usize = 4 * 1024;
+    /// An encoded `file://` URI: every byte of a `MAX_IDENTITY_BYTES` path may
+    /// expand to a 3-byte `%XX` escape.
+    pub const MAX_URI_BYTES: usize = 3 * MAX_IDENTITY_BYTES + 16;
+    /// Outbound bodies are our own payloads (e.g. a whole file in `didOpen`),
+    /// not untrusted input: only the framing ceiling applies.
+    pub const MAX_OUTBOUND_BODY_BYTES: usize = super::framing::MAX_FRAME_LEN;
     pub const MAX_CODE_SOURCE_BYTES: usize = 4 * 1024;
     pub const MAX_PROJECTED_RESPONSE_BYTES: usize = 1024 * 1024;
     pub const MAX_HOVER_MARKDOWN_BYTES: usize = 256 * 1024;
@@ -560,7 +571,7 @@ pub fn preflight_json(input: &[u8]) -> Result<(), &'static str> {
                             i += 1;
                         }
                     }
-                    if decoded > limits::MAX_SCALAR_STRING_BYTES {
+                    if decoded > limits::MAX_JSON_STRING_BYTES {
                         return Err("json string limit");
                     }
                 }
@@ -591,54 +602,109 @@ pub fn preflight_json(input: &[u8]) -> Result<(), &'static str> {
     }
 }
 
-/// The integer `id` member of a top-level JSON object, found by a linear scan
-/// that tracks only nesting and string boundaries (no allocation). Used to
-/// fail a request whose response was rejected by [`preflight_json`].
-pub fn top_level_id(input: &[u8]) -> Option<i64> {
+/// What a linear, allocation-free scan of a (possibly over-budget) JSON-RPC
+/// body can recover without building a `Value`: the top-level integer `id`,
+/// whether `method` is `textDocument/publishDiagnostics`, and the byte range
+/// of an escape-free `params.uri` string.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Envelope {
+    pub id: Option<i64>,
+    pub publishes_diagnostics: bool,
+    pub params_uri: Option<(usize, usize)>,
+}
+
+/// Scan `input` for its [`Envelope`]. Tracks only nesting, string boundaries
+/// and the most recent key per depth; linear in the input, never recursive.
+pub fn scan_envelope(input: &[u8]) -> Envelope {
+    let mut env = Envelope::default();
     let mut depth = 0usize;
     let mut i = 0usize;
-    // Byte range of the most recent depth-1 string, and whether it is a key.
-    let mut last_key: Option<(usize, usize)> = None;
+    let mut last_string: Option<(usize, usize, bool)> = None;
+    // The key awaiting its value: (depth, start, end).
+    let mut key: Option<(usize, usize, usize)> = None;
+    let mut in_params = false;
+    let key_is = |key: Option<(usize, usize, usize)>, d: usize, name: &[u8]| {
+        key.is_some_and(|(kd, a, b)| kd == d && &input[a..b] == name)
+    };
     while i < input.len() {
         match input[i] {
             b'{' | b'[' => {
+                if input[i] == b'{' && depth == 1 && key_is(key, 1, b"params") {
+                    in_params = true;
+                }
+                key = None;
+                last_string = None;
                 depth += 1;
                 i += 1;
             }
             b'}' | b']' => {
-                depth = depth.checked_sub(1)?;
+                if depth == 2 {
+                    in_params = false;
+                }
+                depth = depth.saturating_sub(1);
+                key = None;
+                last_string = None;
                 i += 1;
             }
             b'"' => {
                 let start = i + 1;
+                let mut escaped = false;
                 i += 1;
                 while i < input.len() && input[i] != b'"' {
-                    i += if input[i] == b'\\' { 2 } else { 1 };
+                    if input[i] == b'\\' {
+                        escaped = true;
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
                 }
                 let end = i.min(input.len());
                 i += 1;
-                if depth == 1 {
-                    last_key = Some((start, end));
+                if key.is_some() {
+                    // A string value for the pending key.
+                    if key_is(key, 1, b"method") {
+                        env.publishes_diagnostics |=
+                            &input[start..end] == b"textDocument/publishDiagnostics";
+                    } else if in_params && key_is(key, 2, b"uri") && !escaped {
+                        env.params_uri = Some((start, end));
+                    }
+                    key = None;
+                } else {
+                    last_string = Some((start, end, escaped));
                 }
             }
-            b':' if depth == 1 => {
-                i += 1;
-                if last_key.is_some_and(|(a, b)| &input[a..b] == b"id") {
-                    while i < input.len() && matches!(input[i], b' ' | b'\n' | b'\r' | b'\t') {
-                        i += 1;
-                    }
-                    let start = i;
-                    while i < input.len() && (input[i] == b'-' || input[i].is_ascii_digit()) {
-                        i += 1;
-                    }
-                    return std::str::from_utf8(&input[start..i]).ok()?.parse().ok();
+            b':' => {
+                if let Some((start, end, _)) = last_string.take() {
+                    key = Some((depth, start, end));
                 }
-                last_key = None;
+                i += 1;
+            }
+            b',' => {
+                key = None;
+                last_string = None;
+                i += 1;
+            }
+            b'-' | b'0'..=b'9' => {
+                let start = i;
+                while i < input.len() && (input[i] == b'-' || input[i].is_ascii_digit()) {
+                    i += 1;
+                }
+                if key_is(key, 1, b"id") {
+                    env.id = std::str::from_utf8(&input[start..i])
+                        .ok()
+                        .and_then(|n| n.parse().ok());
+                }
+                key = None;
             }
             _ => i += 1,
         }
     }
-    None
+    env
+}
+
+/// The top-level integer `id` of a JSON-RPC body (see [`scan_envelope`]).
+pub fn top_level_id(input: &[u8]) -> Option<i64> {
+    scan_envelope(input).id
 }
 
 /// Encode an absolute filesystem path as a `file://` URI.
@@ -656,7 +722,7 @@ pub fn uri_to_path(uri: &str) -> String {
 }
 
 fn bounded_uri_to_path(uri: &str) -> Option<String> {
-    if uri.len() > limits::MAX_IDENTITY_BYTES {
+    if uri.len() > limits::MAX_URI_BYTES {
         return None;
     }
     let body = uri.strip_prefix("file://")?;
@@ -1676,11 +1742,11 @@ impl LspClient {
 
     fn write(&self, body: &str) -> Result<(), LspError> {
         self.ensure_open()?;
-        if body.len() > limits::MAX_BODY_BYTES {
+        // Our own serialized payload: no inbound (untrusted) JSON limits —
+        // a didOpen carries a whole file as one string.
+        if body.len() > limits::MAX_OUTBOUND_BODY_BYTES {
             return Err(LspError::Bounded("outbound LSP body limit".into()));
         }
-        preflight_json(body.as_bytes())
-            .map_err(|reason| LspError::Bounded(format!("outbound LSP JSON: {reason}")))?;
         let framed = framing::encode(body);
         let mut stdin = self
             .stdin
@@ -1746,16 +1812,7 @@ fn reader_loop(reader: Box<dyn Read + Send>, ctx: ReaderContext) {
                         ..LspHealth::default()
                     });
                     tracing::warn!(target: "thegn::lsp", reason, "dropping over-budget LSP JSON message");
-                    // Fail the correlated request now rather than at its
-                    // deadline. The id comes from a linear, allocation-free
-                    // scan of the top-level object only.
-                    if let Some(id) = top_level_id(body.as_bytes())
-                        && let Some(tx) = pending.lock().unwrap().remove(&id)
-                    {
-                        let _ = tx.send(Err(LspError::Bounded(format!(
-                            "LSP response exceeded JSON bounds: {reason}"
-                        )))); // best-effort: requester may have timed out
-                    }
+                    reject_unparsed(&ctx, body.as_bytes(), reason);
                     continue;
                 }
                 if let Ok(msg) = serde_json::from_str::<Value>(&body) {
@@ -1765,6 +1822,7 @@ fn reader_loop(reader: Box<dyn Read + Send>, ctx: ReaderContext) {
                         invalid: 1,
                         ..LspHealth::default()
                     });
+                    reject_unparsed(&ctx, body.as_bytes(), "invalid JSON");
                 }
             }
             Ok(None) => break,
@@ -1779,6 +1837,34 @@ fn reader_loop(reader: Box<dyn Read + Send>, ctx: ReaderContext) {
     ctx.closed.store(true, Ordering::SeqCst);
     for (_, tx) in map.drain() {
         let _ = tx.send(Err(LspError::Protocol("server stream closed".into()))); // best-effort: pending requesters may be gone
+    }
+}
+
+/// A body that could not be parsed within bounds: fail its correlated request
+/// now rather than at its deadline, and if it was a diagnostics publication,
+/// record that the document's latest state was lost — so the previously shown
+/// diagnostics are never presented as current. The envelope comes from a
+/// linear, allocation-free scan.
+fn reject_unparsed(ctx: &ReaderContext, body: &[u8], reason: &str) {
+    let env = scan_envelope(body);
+    if let Some(id) = env.id
+        && let Some(tx) = ctx.pending.lock().unwrap().remove(&id)
+    {
+        let _ = tx.send(Err(LspError::Bounded(format!(
+            "LSP response exceeded JSON bounds: {reason}"
+        )))); // best-effort: requester may have timed out
+    }
+    if env.publishes_diagnostics {
+        let path = env
+            .params_uri
+            .and_then(|(start, end)| std::str::from_utf8(&body[start..end]).ok())
+            .and_then(bounded_uri_to_path);
+        ctx.diag_tx.mark_lost(
+            &ctx.root,
+            &ctx.server_identity,
+            ctx.generation,
+            path.as_deref(),
+        );
     }
 }
 
@@ -2179,9 +2265,14 @@ mod tests {
 
         let huge = format!(
             r#"{{"value":"{}"}}"#,
-            "x".repeat(limits::MAX_SCALAR_STRING_BYTES + 1)
+            "x".repeat(limits::MAX_JSON_STRING_BYTES + 1)
         );
         assert_eq!(preflight_json(huge.as_bytes()), Err("json string limit"));
+        let at_cap = format!(
+            r#"{{"value":"{}"}}"#,
+            "x".repeat(limits::MAX_JSON_STRING_BYTES)
+        );
+        assert_eq!(preflight_json(at_cap.as_bytes()), Ok(()));
     }
 
     #[test]
@@ -2448,5 +2539,72 @@ mod tests {
         let pd = pd.unwrap();
         assert!(!pd.complete);
         assert!(published_diagnostics_bytes(&pd) <= limits::MAX_DIAGNOSTIC_BYTES);
+    }
+
+    #[test]
+    fn envelope_scan_recovers_publish_uri_without_parsing() {
+        let body = format!(
+            r#"{{"jsonrpc":"2.0","method":"textDocument/publishDiagnostics","params":{{"uri":"file:///w/a.rs","diagnostics":[{{"message":"{}","uri":"file:///decoy"}}]}}}}"#,
+            "x".repeat(limits::MAX_JSON_STRING_BYTES + 1)
+        );
+        assert!(preflight_json(body.as_bytes()).is_err());
+        let env = scan_envelope(body.as_bytes());
+        assert!(env.publishes_diagnostics);
+        assert_eq!(env.id, None);
+        let (a, b) = env.params_uri.unwrap();
+        assert_eq!(&body[a..b], "file:///w/a.rs");
+        let other =
+            scan_envelope(br#"{"method":"window/logMessage","params":{"uri":"file:///x"}}"#);
+        assert!(!other.publishes_diagnostics);
+    }
+
+    #[test]
+    fn over_limit_publication_marks_its_document_lost_and_supersedes_pending() {
+        let (diag_tx, diag_rx) = diagnostics_channel();
+        let generation = diag_tx.register(Path::new("/fixture"), "fixture").unwrap();
+        // An older, still-queued publication for the same document.
+        diag_tx.publish(PublishedDiagnostics {
+            root: PathBuf::from("/fixture"),
+            path: "/fixture/a.rs".into(),
+            diagnostics: vec![],
+            server_identity: "fixture".into(),
+            generation,
+            sequence: 1,
+            complete: true,
+        });
+        let body = format!(
+            r#"{{"jsonrpc":"2.0","method":"textDocument/publishDiagnostics","params":{{"uri":"file:///fixture/a.rs","diagnostics":[{}]}}}}"#,
+            (0..=limits::MAX_CONTAINER_ITEMS)
+                .map(|_| r#"{"range":{"start":{"line":0,"character":0}},"message":"m"}"#)
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+        let mut ctx = fixture_ctx(
+            pending,
+            diag_tx,
+            Arc::new(Mutex::new(Box::new(std::io::sink()))),
+        );
+        ctx.generation = generation;
+        reader_loop(Box::new(std::io::Cursor::new(framing::encode(&body))), ctx);
+        assert!(
+            !diag_rx.has_pending(),
+            "the superseded older value is not delivered"
+        );
+        let marks = diag_rx.take_loss_marks();
+        assert_eq!(marks.documents.len(), 1);
+        assert_eq!(marks.documents[0].path, "/fixture/a.rs");
+        let health = diag_rx.health();
+        assert_eq!((health.invalid, health.dropped), (1, 1));
+    }
+
+    #[test]
+    fn encoded_uri_of_a_bounded_path_is_accepted() {
+        // 1,300 three-byte characters: ~3.9 KiB decoded, ~11.7 KiB encoded.
+        let path = format!("/{}", "€".repeat(1_300));
+        assert!(path.len() <= limits::MAX_IDENTITY_BYTES);
+        let uri = path_to_uri(&path);
+        assert!(uri.len() > limits::MAX_IDENTITY_BYTES);
+        assert_eq!(bounded_uri_to_path(&uri), Some(path));
     }
 }

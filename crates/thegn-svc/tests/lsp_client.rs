@@ -331,3 +331,19 @@ fn fake_server_close_reopen_retires_only_the_old_generation() {
         "{generations:?}"
     );
 }
+
+#[test]
+fn fake_server_receives_a_did_open_larger_than_the_inbound_string_cap() {
+    let (bus, rx) = diagnostics_channel();
+    let root = temp_root("bigopen");
+    let client = start_on(&bus, &root, &["--echo-open"]);
+    // Drain the fixture's post-initialize publication.
+    while recv_timeout(&rx, Duration::from_millis(200)).is_some() {}
+    let text = "x".repeat(limits::MAX_JSON_STRING_BYTES * 2 + 17);
+    let uri = format!("file://{}/big.rs", root.display());
+    client
+        .did_open(&uri, &text)
+        .expect("our own large payload is sent");
+    let pd = recv_timeout(&rx, Duration::from_secs(5)).expect("server saw the open");
+    assert_eq!(pd.diagnostics[0].message, format!("opened {}", text.len()));
+}
