@@ -381,7 +381,7 @@ pub(crate) fn native_path_bytes_bounded(
         if bytes.len() > max_bytes {
             return Err(NativePathError::TooLong);
         }
-        return Ok(bytes.to_vec());
+        Ok(bytes.to_vec())
     }
     #[cfg(windows)]
     {
@@ -391,11 +391,11 @@ pub(crate) fn native_path_bytes_bounded(
         if unit_count > max_units {
             return Err(NativePathError::TooLong);
         }
-        return Ok(path
+        Ok(path
             .as_os_str()
             .encode_wide()
             .flat_map(u16::to_le_bytes)
-            .collect());
+            .collect::<Vec<u8>>())
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -475,10 +475,12 @@ pub(crate) fn path_from_git_bytes(bytes: &[u8]) -> Option<PathBuf> {
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStringExt;
-        return Some(PathBuf::from(std::ffi::OsString::from_vec(bytes.to_vec())));
+        Some(PathBuf::from(std::ffi::OsString::from_vec(bytes.to_vec())))
     }
     #[cfg(not(unix))]
-    String::from_utf8(bytes.to_vec()).ok().map(PathBuf::from)
+    {
+        String::from_utf8(bytes.to_vec()).ok().map(PathBuf::from)
+    }
 }
 
 /// A short, STABLE alphanumeric digest of a string — deterministic across runs,

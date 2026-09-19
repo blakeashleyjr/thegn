@@ -66,3 +66,13 @@ bytes, path mode)>`.
   into `worktree_instances` (chunk 8); quarantine surfaced in UI/doctor.
 - hydrate.rs no-DB home-tab basename fallback (read-only) unchanged.
 - macOS/Windows compile/runtime unverified (Linux lane only).
+
+## Validation (per-worktree lane, after the shared-target fix)
+
+- `cargo clippy --workspace --offline --locked --all-targets -- -D warnings`: clean.
+- `cargo nextest run --workspace --offline --locked --no-fail-fast -E 'test(/ratchet/) | test(/help::/) | (package(thegn-core) & (worktree::|repo::|project::|db_tests::|db_worktree_identity|db_workspace|identity::|db_migrate|util::|v69)) | (package(thegn-host) & (worktree_rename|creating|hydrate|merge_lifecycle|tracker|autopilot|wizard|cmd::wt|worktree_lifecycle|daemon::service|session::))'`:
+  636 run, 636 passed.
+- `nix develop --command treefmt`, `nix develop --command just ratchets`: clean.
+- Fixed along the way: two foundation clippy `needless_return`s in util.rs
+  (cfg tail blocks) and the core platform-cfg ratchet (test-only unix cfgs in
+  repo.rs/worktree.rs pinned with a reason).
