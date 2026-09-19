@@ -31,3 +31,8 @@ toolchain_activation.rs
 # fixtures behind production substrate code would weaken the path-identity
 # assertion they exist to make.
 db_tests.rs
+# TEST-ONLY cfg (THE-516): symlink-alias and raw non-UTF-8 path fixtures for
+# exact Git worktree/repository identity need std::os::unix APIs; the
+# production identity code routes platform bytes through util.rs.
+repo.rs
+worktree.rs
