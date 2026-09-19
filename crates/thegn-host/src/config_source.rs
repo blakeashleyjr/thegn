@@ -49,19 +49,19 @@ pub fn fresh(boot: &Config) -> Result<Option<Config>, String> {
             ReloadOutcome::Published(admitted) => admitted,
             // Another reload published first: use whatever is current now.
             ReloadOutcome::Superseded | ReloadOutcome::Unavailable => {
-                crate::config_startup::store()
-                    .ok_or("configuration store is unavailable")?
-                    .current()
-                    .map_err(|error| error.to_string())?
+                crate::config_startup::display().ok_or("configuration store is unavailable")?
             }
             ReloadOutcome::Failed(error) => return Err(error.to_string()),
             ReloadOutcome::FailedCoalesced => {
-                return Err(
+                return Err(crate::config_startup::banner().unwrap_or_else(|| {
                     "configuration reload failed; the last admitted generation is display-only"
-                        .into(),
-                );
+                        .into()
+                }));
             }
         };
+        // A launch needs the current, healthy generation with its host
+        // layer; a host-less or superseded generation is display-only.
+        crate::config_startup::require_launchable(&admitted)?;
         let mut cfg = admitted.config().clone();
         // best-effort: the clamped-feature report is for `main`'s startup
         // status note; a daemon re-load deliberately discards it.

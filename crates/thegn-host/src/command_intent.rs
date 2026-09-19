@@ -63,6 +63,21 @@ fn classify_command(command: &Command) -> CommandIntent<'_> {
             cmd::automations::Action::Test { .. } => SourceInspection,
             cmd::automations::Action::List { .. } => Configured,
         },
+        // Diagnostic and recovery verbs must keep working when the config
+        // or the state store is what is broken: doctor/logs/debug report it,
+        // notify hooks and the in-sandbox bridges read no authority config,
+        // and `host list`/`host rm` are how a bad stored host row is fixed.
+        // They run on the tolerant display projection; nothing publishes it.
+        Command::Doctor { .. }
+        | Command::Logs { .. }
+        | Command::Debug { .. }
+        | Command::Notify { .. }
+        | Command::Bridge
+        | Command::BridgeRevtunnel { .. } => Recovery,
+        Command::Host { action } => match action {
+            cmd::host::Action::List { .. } | cmd::host::Action::Rm { .. } => Recovery,
+            _ => Configured,
+        },
         Command::Pr { .. }
         | Command::Issue { .. }
         | Command::Kaneo { .. }
@@ -93,18 +108,13 @@ fn classify_command(command: &Command) -> CommandIntent<'_> {
         | Command::Zone { .. }
         | Command::Project { .. }
         | Command::Placement { .. }
-        | Command::Host { .. }
-        | Command::Debug { .. }
         | Command::Mcp { .. }
         | Command::Agent { .. }
         | Command::Skills { .. }
         | Command::Plugin { .. }
         | Command::SandboxArgv { .. }
         | Command::Sandbox { .. }
-        | Command::Notify { .. }
-        | Command::Logs { .. }
         | Command::Keys { .. }
-        | Command::Doctor { .. }
         | Command::Setup
         | Command::Serve { .. }
         | Command::Session { .. }
@@ -112,8 +122,6 @@ fn classify_command(command: &Command) -> CommandIntent<'_> {
         | Command::Attach { .. }
         | Command::Pair { .. }
         | Command::Daemon { .. }
-        | Command::Bridge
-        | Command::BridgeRevtunnel { .. }
         | Command::SpriteProxy { .. }
         | Command::VpsSsh { .. }
         | Command::Machine0Ssh { .. }

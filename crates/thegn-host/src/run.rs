@@ -824,6 +824,9 @@ pub async fn main(
     // First-frame orientation line (a few chords + build stamp); launch
     // warnings below take precedence. Expires like any other status message.
     model.status = crate::hydrate::startup_status_line(&cfg);
+    // Persistent (not TTL'd) when the admitted config is degraded, e.g. a
+    // host-less generation after a newer-schema store.
+    model.config_banner = crate::config_startup::banner();
     apply_mode_status(&mut model, mode, &cfg);
     // Surface keybind conflicts at launch (non-fatal — the shell always opens).
     if let Some(summary) = keybind_conflict_summary(&cfg) {
@@ -940,18 +943,17 @@ pub async fn main(
                     // the loop) and publish by CAS. A failure keeps the prior
                     // generation (display-only) and is reported once per
                     // distinct failure; repeats coalesce silently.
-                    use crate::config_startup::ReloadOutcome;
-                    let new_cfg_res = match crate::config_startup::reload() {
-                        ReloadOutcome::Published(admitted) => {
-                            let mut c = admitted.config().clone();
-                            crate::e2e_freeze::apply_to_config(&mut c);
-                            Ok(c)
-                        }
-                        ReloadOutcome::Failed(error) => Err(error.to_string()),
-                        ReloadOutcome::FailedCoalesced
-                        | ReloadOutcome::Superseded
-                        | ReloadOutcome::Unavailable => continue,
+                    let Some(update) = crate::config_startup::loop_update(
+                        crate::config_startup::reload(),
+                        crate::config_startup::display,
+                    ) else {
+                        continue;
                     };
+                    let new_cfg_res = update.map(|admitted| {
+                        let mut c = admitted.config().clone();
+                        crate::e2e_freeze::apply_to_config(&mut c);
+                        c
+                    });
                     if config_tx.send(new_cfg_res).is_ok() {
                         let _ = config_waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
                     }
@@ -10010,6 +10012,8 @@ async fn event_loop<T: Terminal>(
             // pushes it), so hydration must carry it or the badge blanks on
             // every 2s tick and reappears only on the next poll.
             next_model.usage = std::mem::take(&mut model.usage);
+            // Loop-owned: set from the config store on startup/reload.
+            next_model.config_banner = model.config_banner.take();
             next_model.usage_history = std::mem::take(&mut model.usage_history);
             next_model.usage_tokens = model.usage_tokens.take();
             // And the weather reading, for the same reason with a much longer
@@ -11525,6 +11529,9 @@ async fn event_loop<T: Terminal>(
 
         while let Ok(cfg_res) = config_rx.try_recv() {
             loop_perf.tick(crate::perf::WakeSource::Config);
+            // The banner mirrors the store: set while a reload is failing or
+            // the host layer is unavailable, cleared once a reload publishes.
+            model.config_banner = crate::config_startup::banner();
             match cfg_res {
                 Ok(new_cfg) => {
                     keymap = rebuild_keymap(&new_cfg, &session);

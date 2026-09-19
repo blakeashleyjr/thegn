@@ -139,12 +139,13 @@ pub(crate) enum CaptureInputError {
 pub(crate) enum CaptureFailure {
     Input(CaptureInputError),
     Source(ConfigFileReadError),
-    Admission(ConfigAdmissionError),
+    /// The typed refusal plus, when it can be named, the refused source and
+    /// key path (bounded, redacted, never a value).
+    Admission(ConfigAdmissionError, Option<String>),
     /// The standalone strict WAL capture route (`load_with`), exercised by
     /// tests; production composes hosts from the migrated store (`Hosts`).
     #[cfg_attr(not(test), allow(dead_code))]
     State(crate::state_host_capture::StateHostReadError),
-    Hosts(HostStoreFailure),
 }
 
 /// Why the strict host-definition layer could not be captured from the
@@ -206,11 +207,13 @@ impl std::fmt::Display for CaptureFailure {
             Self::Source(error) => {
                 return write!(f, "configuration source capture failed: {error}");
             }
-            Self::Admission(error) => return write!(f, "configuration admission failed: {error}"),
-            Self::State(_) => "configuration host-state capture failed",
-            Self::Hosts(error) => {
-                return write!(f, "configuration host capture failed: {error}");
+            Self::Admission(error, Some(detail)) => {
+                return write!(f, "configuration admission failed: {error}: {detail}");
             }
+            Self::Admission(error, None) => {
+                return write!(f, "configuration admission failed: {error}");
+            }
+            Self::State(_) => "configuration host-state capture failed",
         })
     }
 }
@@ -265,6 +268,7 @@ pub(crate) struct CapturedConfig {
     admitted: AdmittedConfig,
     #[cfg_attr(not(test), allow(dead_code))]
     profile_name: String,
+    hosts_unavailable: Option<HostStoreFailure>,
 }
 
 // Accessors below are used by the capture tests; production consumes the
@@ -285,6 +289,12 @@ impl CapturedConfig {
 
     pub(crate) fn into_admitted(self) -> AdmittedConfig {
         self.admitted
+    }
+
+    /// Split into the admitted generation and why its host layer is
+    /// unavailable, if it is.
+    pub(crate) fn into_parts(self) -> (AdmittedConfig, Option<HostStoreFailure>) {
+        (self.admitted, self.hosts_unavailable)
     }
 }
 
@@ -366,7 +376,9 @@ struct FrozenEnv {
 impl EnvSource for FrozenEnv {
     fn get(&self, key: &str) -> Option<String> {
         match self.values.get(key) {
-            Some(value) => value.clone(),
+            // Same contract as `ProcessEnv`: an empty or whitespace-only
+            // variable (`THEGN_X=`) is unset, never a supplied value.
+            Some(value) => value.clone().filter(|value| !value.trim().is_empty()),
             None => {
                 self.missing.set(true);
                 None
@@ -574,10 +586,14 @@ impl ConfigCaptureSeed {
                 .join(&profile_name)
                 .join("config.toml");
             checked_path(&path)?;
+            // Nothing creates a profile overlay, so a genuinely absent file is
+            // an empty layer (as on the legacy loader). An existing overlay
+            // that cannot be read, decoded, parsed or validated stays fatal.
+            // The selection itself is still bound into the base identity.
             Some(CapturedSource {
-                identity: opaque_identity("profile", &path, true, &profile_name),
+                identity: opaque_identity("profile", &path, false, &profile_name),
                 path,
-                explicit: true,
+                explicit: false,
             })
         } else {
             None
@@ -665,31 +681,38 @@ impl ConfigCaptureSeed {
         >,
     ) -> Result<CapturedConfig, CaptureFailure> {
         self.admit_staged(reader, |_| {
-            Ok(match capture_state().map_err(CaptureFailure::State)? {
-                crate::state_host_capture::StateHostCapture::Absent => {
-                    HostDefinitionsSnapshot::empty(thegn_core::db::SCHEMA_VERSION)
-                }
-                crate::state_host_capture::StateHostCapture::Present(snapshot) => snapshot,
-            })
+            Ok(HostLayer::Admitted(
+                match capture_state().map_err(CaptureFailure::State)? {
+                    crate::state_host_capture::StateHostCapture::Absent => {
+                        HostDefinitionsSnapshot::empty(thegn_core::db::SCHEMA_VERSION)
+                    }
+                    crate::state_host_capture::StateHostCapture::Present(snapshot) => snapshot,
+                },
+            ))
         })
     }
 
     /// Two-stage admission over ONE read of each config source:
     ///
     /// 1. every non-DB layer (base, selected profile, frozen env, CLI) is
-    ///    admitted against an empty host snapshot, so an invalid trusted
-    ///    layer is refused before the state DB is opened, migrated, or read;
-    /// 2. `capture_hosts` receives that pre-DB candidate (e.g. to install
-    ///    its `[database]` migration policy before the first open, which lets
-    ///    a legitimate older schema reach its upgrade) and returns one strict
-    ///    host snapshot; the final candidate is admitted with those hosts.
+    ///    admitted once (`admit_layers`), so an invalid trusted layer is
+    ///    refused — with a named source/key detail — before the state DB is
+    ///    opened, migrated, or read;
+    /// 2. `capture_hosts` receives that admitted pre-DB candidate (e.g. to
+    ///    install its `[database]` migration policy before the first open,
+    ///    which lets a legitimate older schema reach its upgrade) and returns
+    ///    either one strict host snapshot or a typed reason the host layer is
+    ///    unavailable. The layers are then composed with the hosts — not
+    ///    re-admitted. An unavailable host layer yields a host-less
+    ///    generation marked `HostsUnavailable`: usable for display,
+    ///    diagnostics and recovery, refused by the store for new authority.
     ///
-    /// The pre-DB candidate is never published. Nothing here installs
-    /// process-global state; the caller does that only on success.
+    /// Nothing here installs process-global state; the caller does that only
+    /// on success.
     pub(crate) fn admit_staged(
         &self,
         reader: &dyn ConfigSourceReader,
-        capture_hosts: impl FnOnce(&Config) -> Result<HostDefinitionsSnapshot, CaptureFailure>,
+        capture_hosts: impl FnOnce(&Config) -> Result<HostLayer, CaptureFailure>,
     ) -> Result<CapturedConfig, CaptureFailure> {
         self.env.missing.set(false);
         let base = reader
@@ -720,46 +743,55 @@ impl ConfigCaptureSeed {
             (None, None) => None,
             (None, Some(_)) => unreachable!("profile content without a selected profile"),
         };
-        // Validate all non-DB layers before touching SQLite.  The empty
-        // snapshot is only a preflight input and is never published.
-        let empty_hosts = HostDefinitionsSnapshot::empty(thegn_core::db::SCHEMA_VERSION);
-        let preflight = config_admission::admit(config_admission::AdmissionInputs {
+        let layer_inputs = || config_admission::LayerInputs {
             defaults: self.defaults.clone(),
             base: base_input,
             profile: profile_input,
             env: &self.env,
             overrides: &self.overrides,
-            hosts: &empty_hosts,
             paths: &self.paths,
-        })
-        .map_err(CaptureFailure::Admission)?;
+        };
+        let layers = config_admission::admit_layers(layer_inputs()).map_err(|error| {
+            // Failure path only: name the source and key for the operator.
+            CaptureFailure::Admission(error, config_admission::rejection_detail(&layer_inputs()))
+        })?;
         if self.env.missing.get() {
             return Err(CaptureFailure::Input(
                 CaptureInputError::UncapturedEnvironmentKey,
             ));
         }
-        let hosts = capture_hosts(preflight.config())?;
-        drop(preflight);
-        let admitted = config_admission::admit(config_admission::AdmissionInputs {
-            defaults: self.defaults.clone(),
-            base: base_input,
-            profile: profile_input,
-            env: &self.env,
-            overrides: &self.overrides,
-            hosts: &hosts,
-            paths: &self.paths,
-        })
-        .map_err(CaptureFailure::Admission)?;
-        if self.env.missing.get() {
-            return Err(CaptureFailure::Input(
-                CaptureInputError::UncapturedEnvironmentKey,
-            ));
-        }
+        let (admitted, hosts_unavailable) = match capture_hosts(layers.config())? {
+            HostLayer::Admitted(hosts) => (
+                layers
+                    .with_hosts(&hosts)
+                    .map_err(|error| CaptureFailure::Admission(error, None))?,
+                None,
+            ),
+            HostLayer::Unavailable(reason) => {
+                let empty = HostDefinitionsSnapshot::empty(thegn_core::db::SCHEMA_VERSION);
+                (
+                    layers
+                        .with_hosts(&empty)
+                        .map_err(|error| CaptureFailure::Admission(error, None))?
+                        .mark_hosts_unavailable(),
+                    Some(reason),
+                )
+            }
+        };
         Ok(CapturedConfig {
             admitted,
             profile_name: self.profile_name.clone(),
+            hosts_unavailable,
         })
     }
+}
+
+/// The outcome of capturing the host-definition layer.
+pub(crate) enum HostLayer {
+    Admitted(HostDefinitionsSnapshot),
+    /// The host layer could not be captured; the reason is surfaced and the
+    /// generation is published host-less and non-authoritative.
+    Unavailable(HostStoreFailure),
 }
 
 #[cfg(test)]

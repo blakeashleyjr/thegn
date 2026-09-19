@@ -135,25 +135,39 @@ fn only_absent_implicit_base_selects_first_run_defaults() {
     assert!(matches!(
         load_empty(&explicit, &Sources::empty()),
         Err(CaptureFailure::Admission(
-            ConfigAdmissionError::ExplicitPathMissing
+            ConfigAdmissionError::ExplicitPathMissing,
+            _
         ))
     ));
 }
 
+/// A named profile needs no overlay file: nothing creates one, and every
+/// child of a named-profile session inherits THEGN_PROFILE. Absent is an
+/// empty layer; the selection still changes the admitted revision.
 #[test]
-fn selected_profile_missing_is_fatal_and_not_empty_overlay() {
+fn selected_profile_without_an_overlay_file_is_an_empty_layer() {
     let captured = seed(&[("THEGN_PROFILE", "work")], &[]);
     let mut sources = Sources::empty();
     sources.bodies.insert(
         captured.base.path.clone(),
         Ok(Some(b"branch_prefix = 'base/'\n".to_vec())),
     );
-    assert!(matches!(
-        load_empty(&captured, &sources),
-        Err(CaptureFailure::Admission(
-            ConfigAdmissionError::ProfileInvalid
-        ))
-    ));
+    let admitted = load_empty(&captured, &sources).expect("absent overlay admits");
+    assert_eq!(admitted.profile_name(), "work");
+    assert_eq!(admitted.config().branch_prefix, "base/");
+
+    let default = seed(&[], &[]);
+    let mut default_sources = Sources::empty();
+    default_sources.bodies.insert(
+        default.base.path.clone(),
+        Ok(Some(b"branch_prefix = 'base/'\n".to_vec())),
+    );
+    let default_admitted = load_empty(&default, &default_sources).unwrap();
+    assert_ne!(
+        admitted.into_admitted().revision(),
+        default_admitted.into_admitted().revision(),
+        "the profile selection is part of the revision"
+    );
 }
 
 #[test]
@@ -527,7 +541,10 @@ fn invalid_utf8_oversized_and_source_failures_are_typed() {
         .insert(captured.base.path.clone(), Ok(Some(vec![0xff])));
     assert!(matches!(
         load_empty(&captured, &sources),
-        Err(CaptureFailure::Admission(ConfigAdmissionError::InvalidUtf8))
+        Err(CaptureFailure::Admission(
+            ConfigAdmissionError::InvalidUtf8,
+            _
+        ))
     ));
     sources.bodies.insert(
         captured.base.path.clone(),
@@ -561,4 +578,26 @@ fn host_capture_failure_is_not_replaced_by_empty_hosts() {
         Err(CaptureFailure::State(StateHostReadError::Unavailable))
     ));
     assert_eq!(state_reads.get(), 1);
+}
+
+/// `THEGN_AUTO_REMOVE_WORKTREE=` (an empty export) was ignored by the legacy
+/// ProcessEnv; admission must not turn it into a refusal, and an empty
+/// `THEGN_BRANCH_PREFIX=` must not override the file with "".
+#[test]
+fn empty_and_whitespace_environment_values_are_unset() {
+    let captured = seed(
+        &[
+            ("THEGN_AUTO_REMOVE_WORKTREE", ""),
+            ("THEGN_SANDBOX_ENABLED", "  "),
+            ("THEGN_BRANCH_PREFIX", ""),
+        ],
+        &[],
+    );
+    let mut sources = Sources::empty();
+    sources.bodies.insert(
+        captured.base.path.clone(),
+        Ok(Some(b"branch_prefix = 'file/'\n".to_vec())),
+    );
+    let admitted = load_empty(&captured, &sources).expect("empty exports are unset");
+    assert_eq!(admitted.config().branch_prefix, "file/");
 }

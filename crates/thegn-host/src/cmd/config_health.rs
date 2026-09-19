@@ -92,6 +92,28 @@ pub(crate) fn collect(main_path: &Path, repo_context: Option<&Path>) -> ConfigHe
         validate_toml_file(&mut health, Layer::Profile, &profile_path);
     }
 
+    // The same capture + admission a configured verb runs (file, selected
+    // profile overlay, environment, bounds, semantic and clamp checks — not
+    // the state DB). The file validators above already explain their own
+    // findings; this names what they cannot see, e.g. an invalid environment
+    // variable or an admission-only bound, so `config validate` never says
+    // "ok" for a config that startup refuses.
+    let explicit = (main_path != thegn_core::config::Config::path()).then_some(main_path);
+    match crate::config_startup::check_sources(explicit, &[]) {
+        Ok(warnings) => {
+            for warning in warnings {
+                add_warning(&mut health, main_path, warning);
+            }
+        }
+        Err(detail) if health.problems() == 0 => add_problem(
+            &mut health,
+            Layer::Main,
+            main_path,
+            format!("startup would refuse this configuration: {detail}"),
+        ),
+        Err(_) => {}
+    }
+
     let repo_context = repo_context
         .map(Path::to_path_buf)
         .or_else(|| std::env::current_dir().ok());
@@ -302,6 +324,33 @@ mod tests {
         assert_eq!(health.profile_problems, 1);
         assert_eq!(health.warnings, 1);
         assert_eq!(health.json()["problem_count"], 1);
+    }
+
+    /// `config validate` must report what startup refuses — including an
+    /// environment-layer failure the file validators cannot see — naming the
+    /// variable, and must surface clamped values as named warnings.
+    #[test]
+    fn validate_reports_admission_only_refusals_and_clamps() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[metrics]\ntimeout_ms = 50\n").unwrap();
+        let clean = collect(&path, Some(dir.path()));
+        assert_eq!(clean.problems(), 0, "{:?}", clean.findings);
+        assert!(
+            clean
+                .findings()
+                .any(|finding| finding.warning && finding.message.contains("metrics.timeout_ms")),
+            "{:?}",
+            clean.findings
+        );
+
+        let _env =
+            thegn_core::testenv::EnvGuard::set(&[("THEGN_SANDBOX_ENABLED", "canary-not-a-bool")]);
+        let refused = collect(&path, Some(dir.path()));
+        assert_eq!(refused.problems(), 1, "{:?}", refused.findings);
+        let message = &refused.findings().find(|f| !f.warning).unwrap().message;
+        assert!(message.contains("THEGN_SANDBOX_ENABLED"), "{message}");
+        assert!(!message.contains("canary"), "{message}");
     }
 
     #[test]
