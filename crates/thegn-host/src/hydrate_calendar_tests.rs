@@ -311,7 +311,7 @@ fn remote_transport_failures_persist_only_redacted_calendar_diagnostics() {
         ..CalendarConfig::default()
     };
     let (from, to) = window();
-    assert!(!sync_accounts(&t.db, &cfg, from, to, true));
+    assert!(!sync_accounts(&t.db, &cfg, from, to, true, &mut |_| {}));
     let sync = t.db.get_calendar_sync("remote").unwrap().unwrap();
     assert!(sync.last_error.contains("calendar destination refused"));
     assert!(!sync.last_error.contains("subscription-secret"));
@@ -386,7 +386,19 @@ fn an_over_budget_source_keeps_the_prior_cache_and_cursor() {
         }],
         ..CalendarConfig::default()
     };
-    assert!(!sync_accounts(&t.db, &cfg, from, to, true));
+    let mut toasts = Vec::new();
+    assert!(!sync_accounts(&t.db, &cfg, from, to, true, &mut |m| {
+        toasts.push(m)
+    }));
+    // The refusal is visible: one toast naming the account and the knob.
+    assert_eq!(toasts.len(), 1, "{toasts:?}");
+    assert!(toasts[0].contains("\"work\""), "{toasts:?}");
+    assert!(toasts[0].contains("max_events"), "{toasts:?}");
+    // The same condition on the next sync is not re-announced.
+    assert!(!sync_accounts(&t.db, &cfg, from, to, true, &mut |m| {
+        toasts.push(m)
+    }));
+    assert_eq!(toasts.len(), 1, "{toasts:?}");
     let mut uids: Vec<_> = load_cached(&t.db, from, to)
         .into_iter()
         .map(|e| e.uid)
@@ -402,6 +414,6 @@ fn an_over_budget_source_keeps_the_prior_cache_and_cursor() {
         max_events: 5,
         ..cfg
     };
-    assert!(sync_accounts(&t.db, &cfg, from, to, true));
+    assert!(sync_accounts(&t.db, &cfg, from, to, true, &mut |_| {}));
     assert_eq!(load_cached(&t.db, from, to).len(), 5);
 }

@@ -45,8 +45,15 @@ pub const MAX_MAX_EVENTS: usize = 10_000;
 pub const MAX_EVENT_BYTES: usize = 1 << 20;
 /// Child entries (extras, reminders, rules, RDATE/EXDATE values) per event.
 pub const MAX_EVENT_CHILDREN: usize = 16_384;
-/// Retained bytes one account fetch may admit.
-pub const MAX_ACCOUNT_BYTES: usize = 32 << 20;
+/// Retained bytes an account may admit per event of its `max_events`
+/// budget. Raising `max_events` raises the byte budget with it, so a byte
+/// refusal is always fixable from the same knob.
+pub const ACCOUNT_BYTES_PER_EVENT: usize = 8 << 10;
+/// Floor of the per-account retained byte budget (the default budget's value).
+pub const MIN_ACCOUNT_BYTES: usize = 32 << 20;
+/// Ceiling of the per-account retained byte budget. Together with one
+/// in-flight transport body it still fits the global byte ceiling.
+pub const MAX_ACCOUNT_BYTES: usize = 96 << 20;
 /// Largest single source document (a local `.ics` file, one CalDAV resource).
 /// Equal to the remote transport's response cap.
 pub const MAX_SOURCE_DOCUMENT_BYTES: usize = 32 << 20;
@@ -103,6 +110,15 @@ impl AdmissionError {
         AdmissionError { limit }
     }
 
+    /// Whether the refusal is about this account's own volume — the case
+    /// where retrying a delta as a full (windowed) fetch may fit.
+    pub fn is_account_limit(&self) -> bool {
+        matches!(
+            self.limit,
+            AdmissionLimit::AccountRecords | AdmissionLimit::AccountBytes
+        )
+    }
+
     /// Whether the refusal came from other fetches holding the shared budget,
     /// so the same fetch may succeed on a later tick without any change.
     pub fn is_contention(&self) -> bool {
@@ -117,10 +133,10 @@ impl std::fmt::Display for AdmissionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self.limit {
             AdmissionLimit::AccountRecords => {
-                "calendar has more events than max_events allows; nothing was replaced"
+                "calendar has more events (plus deletions) in the sync window than max_events allows; raise [calendar] max_events (up to 10000) — the previous events were kept"
             }
             AdmissionLimit::AccountBytes => {
-                "calendar exceeds the per-account size budget; nothing was replaced"
+                "calendar events are larger in total than the max_events budget allows; raise [calendar] max_events (up to 10000) — the previous events were kept"
             }
             AdmissionLimit::EventBytes => "a calendar event exceeds the per-event size budget",
             AdmissionLimit::EventChildren => {
@@ -181,14 +197,20 @@ impl AdmissionBudget {
             .ok_or(AdmissionConfigError { value: max_events })
     }
 
-    /// The runtime reading of a possibly-invalid config value: clamped into the
-    /// supported range (0 → 1, never unlimited), with the diagnostic to surface
-    /// when a clamp happened.
+    /// The runtime reading of a possibly-invalid config value, with the
+    /// diagnostic to surface when it was adjusted. A legacy `0` (which used to
+    /// mean unlimited) becomes the default budget — never unlimited, but not a
+    /// one-event calendar either; anything above the ceiling becomes the
+    /// ceiling.
     pub fn clamped(max_events: usize) -> (Self, Option<AdmissionConfigError>) {
         match Self::new(max_events) {
             Ok(b) => (b, None),
             Err(e) => {
-                let n = max_events.clamp(MIN_MAX_EVENTS, MAX_MAX_EVENTS);
+                let n = if max_events == 0 {
+                    DEFAULT_MAX_EVENTS
+                } else {
+                    max_events.min(MAX_MAX_EVENTS)
+                };
                 let b = NonZeroUsize::new(n)
                     .map(|max_events| AdmissionBudget { max_events })
                     .unwrap_or_default();
@@ -199,6 +221,14 @@ impl AdmissionBudget {
 
     pub fn max_events(&self) -> usize {
         self.max_events.get()
+    }
+
+    /// Retained bytes one fetch of this account may admit: scales with
+    /// `max_events`, within `[MIN_ACCOUNT_BYTES, MAX_ACCOUNT_BYTES]`.
+    pub fn account_bytes(&self) -> usize {
+        self.max_events()
+            .saturating_mul(ACCOUNT_BYTES_PER_EVENT)
+            .clamp(MIN_ACCOUNT_BYTES, MAX_ACCOUNT_BYTES)
     }
 }
 
@@ -453,7 +483,7 @@ impl AdmissionMeter {
             .retained
             .checked_add(bytes)
             .ok_or(AdmissionError::new(AdmissionLimit::Arithmetic))?;
-        if next > MAX_ACCOUNT_BYTES {
+        if next > self.budget.account_bytes() {
             return Err(AdmissionError::new(AdmissionLimit::AccountBytes));
         }
         self.lease.reserve(0, bytes)?;

@@ -355,9 +355,10 @@ ttl_secs = 900              # cache lifetime before a re-fetch is worthwhile
 # Default seconds between syncs. Floored at 60 no matter what is written here,
 # so a stray 0 can't spin a poll loop against a provider's rate limit.
 refresh_interval_secs = 900
-# Admission budget per account, 1..=10000. A source with more events (plus
-# deletions) is refused whole — the previous cache and sync cursor are kept and
-# the account reports the overflow — never truncated. 0 is rejected, not "unlimited".
+# Admission budget per account, 1..=10000: events (plus deletions) inside the
+# sync horizon; the account's byte budget scales with it. A source over the
+# budget is refused whole — the previous cache and sync cursor are kept and a
+# warning names the account — never truncated. 0 is rejected, not "unlimited".
 max_events = 2000
 horizon_past_days = 90      # how far back to fetch and keep
 horizon_future_days = 365   # how far ahead to fetch

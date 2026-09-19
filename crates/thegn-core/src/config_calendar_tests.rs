@@ -555,7 +555,8 @@ fn max_events_is_a_nonzero_bounded_admission_budget() {
     let zero = validate_calendar(&with(0)).join("\n");
     assert!(zero.contains("calendar.max_events"), "{zero}");
     assert!(zero.contains("0 does not mean unlimited"), "{zero}");
-    assert_eq!(with(0).admission_budget().max_events(), 1);
+    // A legacy 0 (it used to mean unlimited) runs at the default budget.
+    assert_eq!(with(0).admission_budget().max_events(), DEFAULT_MAX_EVENTS);
     // Above the ceiling is rejected and clamped at runtime.
     assert!(!validate_calendar(&with(MAX_MAX_EVENTS + 1)).is_empty());
     assert_eq!(

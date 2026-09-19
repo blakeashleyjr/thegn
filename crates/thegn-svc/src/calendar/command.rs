@@ -39,12 +39,11 @@ use std::time::Duration;
 
 use chrono::NaiveDate;
 use futures_util::future::BoxFuture;
+use serde::de::{self, DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use thegn_core::calendar::admission::AdmissionLimit;
 use thegn_core::calendar::{AdmissionError, AdmissionMeter, CalEvent};
 use thegn_core::config_calendar::CalendarAccount;
-use thegn_core::plugin_api::{
-    Capability, ExtensionPoint, HostContract, PluginManifest, RpcMessage,
-};
+use thegn_core::plugin_api::{Capability, ExtensionPoint, HostContract, PluginManifest};
 
 use super::{AccountAdmission, CalendarBackend, CalendarCaps, CalendarError, EventPage};
 use crate::plugin::proc::{self, NdjsonSink, PluginError};
@@ -52,88 +51,245 @@ use crate::plugin::proc::{self, NdjsonSink, PluginError};
 /// Non-JSON stdout lines kept for the warning log.
 const MAX_JUNK_KEPT: usize = 3;
 
-/// Admits a plugin's output one line at a time, on the reader thread.
-///
-/// Each line is at most [`proc::MAX_LINE_BYTES`], so its decoded JSON is
-/// bounded by the line; every event is checked against the account's record
-/// budget **before** it is decoded into a [`CalEvent`] and charged right after.
-/// The first refusal stops admission (the pipe is still drained) and the whole
-/// run fails — a plugin's output is never published truncated.
-struct AdmittingSink {
+/// What one plugin run admitted so far.
+struct Admitted {
     meter: AdmissionMeter,
-    granted: Vec<Capability>,
     events: Vec<CalEvent>,
     deleted: Vec<String>,
     sync_token: String,
+    /// Set when a visitor stopped on the budget, so the serde error it had to
+    /// raise to stop is reported as the admission refusal it really is.
+    refusal: Option<AdmissionError>,
+}
+
+impl Admitted {
+    fn refuse<E: de::Error>(&mut self, e: AdmissionError) -> E {
+        self.refusal = Some(e);
+        E::custom("admission budget exceeded")
+    }
+}
+
+/// Admits a plugin's output one line at a time, on the reader thread.
+///
+/// An `events` line is never decoded into an intermediate JSON tree: its
+/// `events` and `deleted` arrays are walked element by element straight off
+/// the line, the account's record budget is checked **before** each element is
+/// decoded (an element that would not fit is skipped unallocated to find out
+/// whether it exists), and each decoded event is charged immediately. Any
+/// refusal or malformed element fails the whole run — a plugin's output is
+/// never published partially — and the pipe is still drained.
+struct AdmittingSink {
+    admitted: Admitted,
+    granted: Vec<Capability>,
     junk: Vec<String>,
     error: Option<CalendarError>,
 }
 
+/// Just the verb, so a line can be routed without building its params.
+/// Unknown fields (the params) are skipped without being allocated.
+#[derive(serde::Deserialize)]
+struct Head {
+    method: String,
+}
+
+#[derive(serde::Deserialize)]
+struct ManifestLine {
+    params: PluginManifest,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct LogParams {
+    #[serde(default)]
+    level: Option<String>,
+    #[serde(default)]
+    message: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct LogLine {
+    #[serde(default)]
+    params: Option<LogParams>,
+}
+
+/// `{"method":"events","params":{...}}`, visited in place.
+struct EventsLine<'s>(&'s mut Admitted);
+/// The `params` object of an events line.
+struct EventsParams<'s>(&'s mut Admitted);
+/// The `events` array.
+struct EventList<'s>(&'s mut Admitted);
+/// The `deleted` array.
+struct DeletedList<'s>(&'s mut Admitted);
+
+impl<'de> DeserializeSeed<'de> for EventsLine<'_> {
+    type Value = ();
+    fn deserialize<D: de::Deserializer<'de>>(self, d: D) -> Result<(), D::Error> {
+        d.deserialize_map(self)
+    }
+}
+
+impl<'de> Visitor<'de> for EventsLine<'_> {
+    type Value = ();
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("an events message")
+    }
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+        let sink = self.0;
+        while let Some(key) = map.next_key::<std::borrow::Cow<'de, str>>()? {
+            if key == "params" {
+                map.next_value_seed(EventsParams(&mut *sink))?;
+            } else {
+                map.next_value::<IgnoredAny>()?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<'de> DeserializeSeed<'de> for EventsParams<'_> {
+    type Value = ();
+    fn deserialize<D: de::Deserializer<'de>>(self, d: D) -> Result<(), D::Error> {
+        d.deserialize_any(self)
+    }
+}
+
+impl<'de> Visitor<'de> for EventsParams<'_> {
+    type Value = ();
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("an events params object")
+    }
+    /// `params` omitted or null: an empty message.
+    fn visit_unit<E: de::Error>(self) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+        let sink = self.0;
+        while let Some(key) = map.next_key::<std::borrow::Cow<'de, str>>()? {
+            match key.as_ref() {
+                "events" => map.next_value_seed(EventList(&mut *sink))?,
+                "deleted" => map.next_value_seed(DeletedList(&mut *sink))?,
+                "sync_token" => sink.sync_token = map.next_value::<String>()?,
+                _ => {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<'de> DeserializeSeed<'de> for EventList<'_> {
+    type Value = ();
+    fn deserialize<D: de::Deserializer<'de>>(self, d: D) -> Result<(), D::Error> {
+        d.deserialize_any(self)
+    }
+}
+
+impl<'de> Visitor<'de> for EventList<'_> {
+    type Value = ();
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("an array of events")
+    }
+    fn visit_unit<E: de::Error>(self) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
+        let sink = self.0;
+        loop {
+            if !sink.meter.has_record_room() {
+                // Full: find out without allocating whether another exists.
+                return match seq.next_element::<IgnoredAny>()? {
+                    None => Ok(()),
+                    Some(_) => {
+                        Err(sink.refuse(AdmissionError::new(AdmissionLimit::AccountRecords)))
+                    }
+                };
+            }
+            let Some(e) = seq.next_element::<CalEvent>()? else {
+                return Ok(());
+            };
+            if let Err(a) = sink.meter.admit_materialized(&e) {
+                return Err(sink.refuse(a));
+            }
+            sink.events.push(e);
+        }
+    }
+}
+
+impl<'de> DeserializeSeed<'de> for DeletedList<'_> {
+    type Value = ();
+    fn deserialize<D: de::Deserializer<'de>>(self, d: D) -> Result<(), D::Error> {
+        d.deserialize_any(self)
+    }
+}
+
+impl<'de> Visitor<'de> for DeletedList<'_> {
+    type Value = ();
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("an array of event ids")
+    }
+    fn visit_unit<E: de::Error>(self) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
+        let sink = self.0;
+        loop {
+            if !sink.meter.has_record_room() {
+                return match seq.next_element::<IgnoredAny>()? {
+                    None => Ok(()),
+                    Some(_) => {
+                        Err(sink.refuse(AdmissionError::new(AdmissionLimit::AccountRecords)))
+                    }
+                };
+            }
+            let Some(id) = seq.next_element::<String>()? else {
+                return Ok(());
+            };
+            if let Err(a) = sink.meter.admit_deletion(id.len()) {
+                return Err(sink.refuse(a));
+            }
+            sink.deleted.push(id);
+        }
+    }
+}
+
 impl AdmittingSink {
-    fn message(&mut self, msg: RpcMessage) -> Result<(), CalendarError> {
-        match msg.method.as_str() {
-            "manifest" => match serde_json::from_value::<PluginManifest>(msg.params) {
-                Ok(m) => check_manifest(&self.granted, &m),
+    fn events_line(&mut self, text: &str) -> Result<(), CalendarError> {
+        let mut de = serde_json::Deserializer::from_str(text);
+        let result = EventsLine(&mut self.admitted)
+            .deserialize(&mut de)
+            .and_then(|()| de.end());
+        match result {
+            Ok(()) => Ok(()),
+            Err(e) => Err(match self.admitted.refusal.take() {
+                Some(a) => a.into(),
+                // Position only: a serde message can quote plugin data.
+                None => CalendarError::Parse(format!(
+                    "plugin sent a malformed events message (column {})",
+                    e.column()
+                )),
+            }),
+        }
+    }
+
+    fn message(&mut self, method: &str, text: &str) -> Result<(), CalendarError> {
+        match method {
+            "manifest" => match serde_json::from_str::<ManifestLine>(text) {
+                Ok(m) => check_manifest(&self.granted, &m.params),
                 Err(e) => Err(CalendarError::Parse(format!("bad manifest: {e}"))),
             },
-            "events" => {
-                let serde_json::Value::Object(mut params) = msg.params else {
-                    return Ok(());
-                };
-                // Every field optional: `{"events":[...]}` is a complete
-                // message, and a plugin may page by sending several. A list
-                // that does not decode is dropped whole, as before.
-                if let Some(serde_json::Value::Array(items)) = params.remove("events") {
-                    let cp = self.meter.checkpoint();
-                    let mark = self.events.len();
-                    for v in items {
-                        if !self.meter.has_record_room() {
-                            return Err(AdmissionError::new(AdmissionLimit::AccountRecords).into());
-                        }
-                        match serde_json::from_value::<CalEvent>(v) {
-                            Ok(e) => {
-                                self.meter.admit_materialized(&e)?;
-                                self.events.push(e);
-                            }
-                            Err(_) => {
-                                self.events.truncate(mark);
-                                self.meter.rollback(cp);
-                                break;
-                            }
-                        }
-                    }
-                }
-                if let Some(serde_json::Value::Array(items)) = params.remove("deleted")
-                    && items.iter().all(serde_json::Value::is_string)
-                {
-                    for v in items {
-                        if let serde_json::Value::String(id) = v {
-                            self.meter.admit_deletion(id.len())?;
-                            self.deleted.push(id);
-                        }
-                    }
-                }
-                if let Some(serde_json::Value::String(t)) = params.remove("sync_token") {
-                    self.sync_token = t;
-                }
-                Ok(())
-            }
+            "events" => self.events_line(text),
             "log" => {
                 // A plugin's own diagnostics belong in the log, never in the
                 // UI — it has no way to know what is on screen.
-                let level = msg
-                    .params
-                    .get("level")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("info");
-                let message = msg
-                    .params
-                    .get("message")
-                    .and_then(|v| v.as_str())
+                let p = serde_json::from_str::<LogLine>(text)
+                    .ok()
+                    .and_then(|l| l.params)
                     .unwrap_or_default();
                 tracing::debug!(
                     target: "thegn::calendar::plugin",
-                    level, message, "plugin log"
+                    level = p.level.as_deref().unwrap_or("info"),
+                    message = p.message.as_deref().unwrap_or_default(),
+                    "plugin log"
                 );
                 Ok(())
             }
@@ -151,16 +307,13 @@ impl AdmittingSink {
 
 impl NdjsonSink for AdmittingSink {
     fn line(&mut self, text: &str) -> bool {
-        let msg = match serde_json::from_str::<RpcMessage>(text) {
-            Ok(m) => m,
-            Err(_) => {
-                if self.junk.len() < MAX_JUNK_KEPT {
-                    self.junk.push(text.chars().take(200).collect());
-                }
-                return true;
+        let Ok(head) = serde_json::from_str::<Head>(text) else {
+            if self.junk.len() < MAX_JUNK_KEPT {
+                self.junk.push(text.chars().take(200).collect());
             }
+            return true;
         };
-        match self.message(msg) {
+        match self.message(&head.method, text) {
             Ok(()) => true,
             Err(e) => {
                 self.error = Some(e);
@@ -286,53 +439,83 @@ impl CalendarBackend for CommandBackend {
         sync_token: &'a str,
     ) -> BoxFuture<'a, Result<EventPage, CalendarError>> {
         Box::pin(async move {
-            if self.argv.is_empty() {
-                return Err(CalendarError::NotConfigured);
+            match self.run_once(from, to, sync_token).await {
+                // A delta over the account's own budget would be refused again
+                // on every tick, since the cursor is (correctly) not advanced.
+                // Ask once for a full snapshot instead; it may well fit.
+                Err(CalendarError::Admission(a))
+                    if !sync_token.is_empty() && a.is_account_limit() =>
+                {
+                    tracing::debug!(
+                        target: "thegn::calendar::plugin",
+                        "plugin delta exceeds the admission budget — retrying as a full fetch"
+                    );
+                    self.run_once(from, to, "").await
+                }
+                other => other,
             }
-            let argv = self.argv.clone();
-            let env = self.query_env(from, to, sync_token);
-            let cwd = self.cwd.clone();
-            let timeout = self.timeout;
-            let sink = AdmittingSink {
+        })
+    }
+}
+
+impl CommandBackend {
+    /// One plugin run, admitted line by line.
+    async fn run_once(
+        &self,
+        from: NaiveDate,
+        to: NaiveDate,
+        sync_token: &str,
+    ) -> Result<EventPage, CalendarError> {
+        if self.argv.is_empty() {
+            return Err(CalendarError::NotConfigured);
+        }
+        let argv = self.argv.clone();
+        let env = self.query_env(from, to, sync_token);
+        let cwd = self.cwd.clone();
+        let timeout = self.timeout;
+        let sink = AdmittingSink {
+            admitted: Admitted {
                 meter: self.admission.meter(),
-                granted: self.granted.clone(),
                 events: Vec::new(),
                 deleted: Vec::new(),
                 sync_token: String::new(),
-                junk: Vec::new(),
-                error: None,
-            };
-            // The runner blocks (it polls for exit to enforce the timeout), so it
-            // must not sit on an async worker.
-            let run = tokio::task::spawn_blocking(move || {
-                let dir = (!cwd.trim().is_empty()).then(|| std::path::PathBuf::from(&cwd));
-                proc::spawn_ndjson_stream(&argv, &env, dir.as_deref(), timeout, sink)
-            })
-            .await
-            .map_err(|e| CalendarError::Subprocess(e.to_string()))?;
-
-            let run = run.map_err(|e| match e {
-                PluginError::Timeout(_) => CalendarError::Network(e.to_string()),
-                other => CalendarError::Subprocess(other.to_string()),
-            })?;
-
-            let sink = run.sink;
-            for j in &sink.junk {
-                tracing::warn!(
-                    target: "thegn::calendar::plugin",
-                    line = %j,
-                    "plugin wrote a non-JSON line to stdout — diagnostics belong on stderr or in a `log` message"
-                );
-            }
-            if let Some(e) = sink.error {
-                return Err(e);
-            }
-            // More messages than one run may send: the output is incomplete, so
-            // it is refused rather than published as a whole calendar.
-            if run.truncated {
-                return Err(AdmissionError::new(AdmissionLimit::Messages).into());
-            }
-            EventPage::from_meter(sink.meter, sink.events, sink.deleted, sink.sync_token)
+                refusal: None,
+            },
+            granted: self.granted.clone(),
+            junk: Vec::new(),
+            error: None,
+        };
+        // The runner blocks (it polls for exit to enforce the timeout), so it
+        // must not sit on an async worker.
+        let run = tokio::task::spawn_blocking(move || {
+            let dir = (!cwd.trim().is_empty()).then(|| std::path::PathBuf::from(&cwd));
+            proc::spawn_ndjson_stream(&argv, &env, dir.as_deref(), timeout, sink)
         })
+        .await
+        .map_err(|e| CalendarError::Subprocess(e.to_string()))?;
+
+        let run = run.map_err(|e| match e {
+            PluginError::Timeout(_) => CalendarError::Network(e.to_string()),
+            other => CalendarError::Subprocess(other.to_string()),
+        })?;
+
+        let sink = run.sink;
+        for j in &sink.junk {
+            tracing::warn!(
+                target: "thegn::calendar::plugin",
+                line = %j,
+                "plugin wrote a non-JSON line to stdout — diagnostics belong on stderr or in a `log` message"
+            );
+        }
+        if let Some(e) = sink.error {
+            return Err(e);
+        }
+        // More messages than one run may send: the output is incomplete, so
+        // it is refused rather than published as a whole calendar.
+        if run.truncated {
+            return Err(AdmissionError::new(AdmissionLimit::Messages).into());
+        }
+        let a = sink.admitted;
+        EventPage::from_meter(a.meter, a.events, a.deleted, a.sync_token)
     }
 }

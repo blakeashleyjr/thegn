@@ -54,11 +54,12 @@ pub struct CalendarConfig {
     /// Floored at [`MIN_REFRESH_SECS`].
     #[schemars(range(max = "crate::time_policy::MAX_CADENCE_SECS"))]
     pub refresh_interval_secs: u64,
-    /// Admission budget: the most events (plus deletions) one account fetch
-    /// may bring in, between 1 and 10000. A source over the cap is refused
-    /// whole — its previous cache and sync cursor are kept and the account
-    /// reports the overflow — rather than truncated. 0 is rejected; it never
-    /// means unlimited.
+    /// Admission budget: the most events (plus deletions) in the sync window
+    /// one account fetch may bring in, between 1 and 10000; the account's
+    /// byte budget scales with it. A source over the cap is refused whole —
+    /// its previous cache and sync cursor are kept and a warning names the
+    /// account — rather than truncated. 0 is rejected by validation and runs
+    /// as the default; it never means unlimited.
     #[schemars(range(min = 1, max = 10000))]
     pub max_events: usize,
     /// How far back to fetch and keep events.
@@ -123,9 +124,9 @@ impl CalendarConfig {
     /// The typed per-account admission budget every calendar backend is
     /// built with.
     ///
-    /// An out-of-range `max_events` is clamped into the supported range (0
-    /// becomes 1, never unlimited) and warned about; `thegn config validate`
-    /// reports it as an error.
+    /// An out-of-range `max_events` is adjusted (a legacy 0 becomes the
+    /// default, never unlimited; above the ceiling becomes the ceiling) and
+    /// warned about; `thegn config validate` reports it as an error.
     pub fn admission_budget(&self) -> crate::calendar::AdmissionBudget {
         let (budget, problem) = crate::calendar::AdmissionBudget::clamped(self.max_events);
         if let Some(problem) = problem {

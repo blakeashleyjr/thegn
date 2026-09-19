@@ -90,8 +90,8 @@ impl CalendarBackend for IcsUrlBackend {
 
     fn list_events<'a>(
         &'a self,
-        _from: NaiveDate,
-        _to: NaiveDate,
+        from: NaiveDate,
+        to: NaiveDate,
         sync_token: &'a str,
     ) -> BoxFuture<'a, Result<EventPage, CalendarError>> {
         Box::pin(async move {
@@ -183,9 +183,17 @@ impl CalendarBackend for IcsUrlBackend {
             };
             // Admission happens while parsing: the first event or byte over
             // the budget refuses the whole fetch, the ETag is not advanced,
-            // and the cached calendar stays as it was.
+            // and the cached calendar stays as it was. A subscribed feed is a
+            // whole document (often years of history), so only events that
+            // can occur in the sync window count toward `max_events`.
             let mut events = Vec::new();
-            thegn_core::calendar::parse_ics_admitted(&body, zone, &mut meter, &mut events)?;
+            thegn_core::calendar::parse_ics_window(
+                &body,
+                zone,
+                Some((from, to)),
+                &mut meter,
+                &mut events,
+            )?;
             drop(body);
             EventPage::from_meter(meter, events, Vec::new(), etag)
         })

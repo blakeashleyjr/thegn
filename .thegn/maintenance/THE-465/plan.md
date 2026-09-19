@@ -125,3 +125,28 @@ pool refusal across two meters + release on page drop; router stamp accounting;
 local file/dir overflow; ICS URL + CalDAV huge-feed overflow over the loopback
 fixtures; command huge stream / many deletions / MAX_LINES; host: overflow error
 leaves prior cache + cursor intact and records `last_error`.
+
+## Revision 1 — adversarial review (REQUEST CHANGES) addressed
+
+- #1 CalDAV and command deltas refused for the account's own volume are
+  retried once as a full fetch, under a fresh meter.
+- #2 Refusals raise an Alert toast that names the account and the limit. The
+  toast is deduplicated against the stored `last_error`. Local and URL ICS
+  count only events that can occur in the sync horizon. The per-account byte
+  budget is now `max_events × 8 KiB`, clamped to 32–96 MiB. The messages tell
+  the user to raise `max_events`. A legacy `0` runs as the default.
+- #3/#4 Plugin `events` lines are walked in place with serde visitors, with no
+  `Value` tree. The record budget is checked before each element is decoded. A
+  malformed element or deletion fails the run with a value-free `Parse` error.
+- #5 CalDAV checks the raw href and token length before unescaping. Unescaping
+  is a single pass, so the 1× transient reservation matches the real peak.
+- #6 Inside an event, oversized lines with a folded name, or BEGIN/END lines,
+  are refused.
+- #7 Local reads use exact capped growth, so capacity never exceeds the
+  reservation.
+- #8 Cache rows are reserved under the page lease. Contention refusals write
+  nothing, so the next sync retries. `list_events` is test-only.
+  `from_meter` has a `debug_assert`.
+- #9 A counting-allocator integration test (`ics_admission_alloc`), plus tests
+  for the incremental fallback, the malformed middle page, and 409 fallback
+  lease release.
