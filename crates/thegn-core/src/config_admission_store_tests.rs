@@ -98,11 +98,11 @@ fn failed_reload_keeps_last_good_for_display_only_and_coalesces() {
         .publish(candidate("branch_prefix = \"a/\"\n"), 0)
         .unwrap();
     assert_eq!(
-        store.record_failure(ConfigAdmissionError::ParseInvalid),
+        store.record_failure(ConfigAdmissionError::ParseInvalid, 7),
         FailureReport::First
     );
     assert_eq!(
-        store.record_failure(ConfigAdmissionError::ParseInvalid),
+        store.record_failure(ConfigAdmissionError::ParseInvalid, 7),
         FailureReport::Coalesced
     );
     assert_eq!(
@@ -124,7 +124,12 @@ fn failed_reload_keeps_last_good_for_display_only_and_coalesces() {
     );
     // A different failure is new information.
     assert_eq!(
-        store.record_failure(ConfigAdmissionError::SchemaInvalid),
+        store.record_failure(ConfigAdmissionError::SchemaInvalid, 7),
+        FailureReport::First
+    );
+    // …and so is a different problem of the same category.
+    assert_eq!(
+        store.record_failure(ConfigAdmissionError::SchemaInvalid, 8),
         FailureReport::First
     );
     // A successful publication clears the degradation.
@@ -138,7 +143,7 @@ fn failed_reload_keeps_last_good_for_display_only_and_coalesces() {
 #[test]
 fn failure_before_any_publication_has_nothing_to_display() {
     let store = AdmissionStore::new();
-    store.record_failure(ConfigAdmissionError::Unreadable);
+    store.record_failure(ConfigAdmissionError::Unreadable, 0);
     assert!(store.display().is_none());
     assert!(matches!(
         store.health(),
@@ -186,4 +191,25 @@ fn concurrent_publishers_against_one_generation_have_exactly_one_winner() {
         .count();
     assert_eq!(winners, 1);
     assert_eq!(store.health(), StoreHealth::Current { generation: 2 });
+}
+
+#[test]
+fn host_less_generation_displays_but_never_authorizes() {
+    let store = AdmissionStore::new();
+    let published = store
+        .publish(
+            candidate("branch_prefix = \"a/\"\n").mark_hosts_unavailable(),
+            0,
+        )
+        .unwrap();
+    assert_eq!(store.display().unwrap().revision(), published.revision());
+    assert_eq!(
+        store.authorize(&published.revision()).unwrap_err().reason,
+        StaleConfigReason::HostsUnavailable
+    );
+    // A later healthy publication restores authority.
+    let healthy = store
+        .publish(candidate("branch_prefix = \"a/\"\n"), 1)
+        .unwrap();
+    assert!(store.authorize(&healthy.revision()).is_ok());
 }
