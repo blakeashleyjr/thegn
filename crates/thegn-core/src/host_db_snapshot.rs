@@ -16,7 +16,16 @@ use crate::host_definition_snapshot::{
 };
 
 pub(crate) fn read(conn: &Connection) -> Result<HostDefinitionsSnapshot, Error> {
-    read_with_snapshot_hook(conn, || Ok(()))
+    read_with_snapshot_hook(conn, false, || Ok(()))
+}
+
+/// [`read`], additionally accepting a NEWER `user_version` whose `hosts`
+/// table still passes the full structural check. Only for the operator's
+/// explicit `THEGN_ALLOW_SCHEMA_DOWNGRADE` override, under which the state
+/// store is already opened read-only by an older build; the observed schema
+/// is recorded in the snapshot (and so in the admitted revision).
+pub(crate) fn read_allowing_newer(conn: &Connection) -> Result<HostDefinitionsSnapshot, Error> {
+    read_with_snapshot_hook(conn, true, || Ok(()))
 }
 
 fn sql_error(error: rusqlite::Error) -> Error {
@@ -38,12 +47,13 @@ fn text<'a>(row: &'a Row<'_>, index: usize, limit: usize) -> Result<&'a str, Err
     std::str::from_utf8(bytes).map_err(|_| Error::InvalidUtf8)
 }
 
-fn schema(conn: &Connection) -> Result<i64, Error> {
+fn schema(conn: &Connection, allow_newer: bool) -> Result<i64, Error> {
     // This is deliberately INSIDE the same transaction as every later read.
     let version: i64 = conn
         .query_row("PRAGMA main.user_version", [], |row| row.get(0))
         .map_err(sql_error)?;
-    if version != crate::db::SCHEMA_VERSION {
+    if version != crate::db::SCHEMA_VERSION && !(allow_newer && version > crate::db::SCHEMA_VERSION)
+    {
         return Err(Error::IncompatibleSchema {
             observed: version,
             supported: crate::db::SCHEMA_VERSION,
@@ -112,13 +122,14 @@ fn schema(conn: &Connection) -> Result<i64, Error> {
 
 fn read_with_snapshot_hook(
     conn: &Connection,
+    allow_newer: bool,
     after_schema: impl FnOnce() -> Result<(), Error>,
 ) -> Result<HostDefinitionsSnapshot, Error> {
     if !conn.is_autocommit() {
         return Err(Error::TransactionActive);
     }
     let transaction = conn.unchecked_transaction().map_err(sql_error)?;
-    let version = schema(&transaction)?;
+    let version = schema(&transaction, allow_newer)?;
     after_schema()?;
     let mut copied = Vec::new();
     let mut names = BTreeSet::new();

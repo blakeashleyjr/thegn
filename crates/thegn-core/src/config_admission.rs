@@ -231,6 +231,12 @@ impl fmt::Debug for ConfigRevision {
 pub enum AdmissionHealth {
     Healthy,
     FirstRunDefault,
+    /// Every trusted file/env/CLI layer was admitted, but the state store's
+    /// host definitions could not be captured (a newer schema, a refused
+    /// migration, an unopenable store, or an invalid stored row). The
+    /// generation is usable for display, diagnostics and recovery verbs;
+    /// the live store refuses to authorize it for new authority.
+    HostsUnavailable,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -325,6 +331,13 @@ impl AdmittedConfig {
         self.health
     }
 
+    /// Downgrade to [`AdmissionHealth::HostsUnavailable`]. There is no
+    /// inverse: a host-less candidate can never be upgraded to healthy.
+    pub fn mark_hosts_unavailable(mut self) -> Self {
+        self.health = AdmissionHealth::HostsUnavailable;
+        self
+    }
+
     /// Only the live store assigns generations; an unpublished candidate
     /// carries generation 0 and so can never match a published revision.
     pub(crate) fn with_generation(mut self, generation: u64) -> Self {
@@ -404,10 +417,63 @@ impl EnvSource for CapturedEnv<'_> {
     }
 }
 
+/// Every trusted non-DB layer admitted, normalized and validated, but not yet
+/// composed with host definitions. Never publishable: only
+/// [`AdmittedLayers::with_hosts`] produces an [`AdmittedConfig`]. A host
+/// adapter uses [`AdmittedLayers::config`] to install the admitted
+/// `[database]` policy before it opens the state store, so an invalid trusted
+/// layer is refused before any DB access — and the layers are admitted once,
+/// not re-admitted after the host capture.
+pub struct AdmittedLayers {
+    config: Config,
+    entries: Vec<LayerTraceEntry>,
+    diagnostics: Vec<AdmissionDiagnostic>,
+    env_digest: [u8; 32],
+    overrides_digest: [u8; 32],
+    path_context_digest: [u8; 32],
+    first_run_default: bool,
+}
+
+impl fmt::Debug for AdmittedLayers {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AdmittedLayers")
+            .field("entries", &self.entries)
+            .finish_non_exhaustive()
+    }
+}
+
+/// [`AdmissionInputs`] without the host layer.
+pub struct LayerInputs<'a> {
+    pub defaults: Config,
+    pub base: SourceInput<'a>,
+    pub profile: Option<SourceInput<'a>>,
+    pub env: &'a dyn EnvSource,
+    pub overrides: &'a [String],
+    pub paths: &'a PathExpansionContext,
+}
+
 /// Admit one complete candidate.  No legacy loader is called here, and all
 /// failures return before an `AdmittedConfig` can be constructed.
 pub fn admit(inputs: AdmissionInputs<'_>) -> Result<AdmittedConfig, ConfigAdmissionError> {
-    let path_context_digest = validate_admission_context(&inputs)?;
+    let hosts = inputs.hosts;
+    admit_layers(LayerInputs {
+        defaults: inputs.defaults,
+        base: inputs.base,
+        profile: inputs.profile,
+        env: inputs.env,
+        overrides: inputs.overrides,
+        paths: inputs.paths,
+    })?
+    .with_hosts(hosts)
+}
+
+/// Admit every trusted non-DB layer (defaults → base → selected profile →
+/// frozen env → `--set`) and normalize the candidate. A selected profile
+/// whose overlay file is genuinely absent (non-explicit `Absent`) is an empty
+/// layer; an existing overlay that cannot be read, decoded, parsed or
+/// validated is `ProfileInvalid`.
+pub fn admit_layers(inputs: LayerInputs<'_>) -> Result<AdmittedLayers, ConfigAdmissionError> {
+    let path_context_digest = validate_path_context(inputs.paths)?;
     validate_source_identity(&inputs.base)?;
     if let Some(profile) = inputs.profile {
         validate_source_identity(&profile)?;
@@ -417,12 +483,12 @@ pub fn admit(inputs: AdmissionInputs<'_>) -> Result<AdmittedConfig, ConfigAdmiss
     let base_bytes = source_bytes(&inputs.base, false)?;
     let base = parse_layer(&inputs.base, base_bytes, LayerKind::Base)?;
     let profile = match inputs.profile {
-        Some(profile) => {
-            let bytes = source_bytes(&profile, true)
-                .map_err(map_profile_error)?
-                .ok_or(ConfigAdmissionError::ProfileInvalid)?;
-            parse_layer(&profile, Some(bytes), LayerKind::Profile).map_err(map_profile_error)?
-        }
+        Some(profile) => match source_bytes(&profile, true).map_err(map_profile_error)? {
+            Some(bytes) => {
+                parse_layer(&profile, Some(bytes), LayerKind::Profile).map_err(map_profile_error)?
+            }
+            None => None,
+        },
         None => None,
     };
 
@@ -449,14 +515,13 @@ pub fn admit(inputs: AdmissionInputs<'_>) -> Result<AdmittedConfig, ConfigAdmiss
     if let Some(base) = base {
         diagnostics.extend(base.diagnostics.clone());
         entries.push(trace_entry(LayerKind::Base, &base));
-        check_config_bounds(&cfg)?;
+        // `cfg` is the defaults, already bounds-checked above.
         apply_layer_overlay(&mut cfg, &base.normalized)?;
         check_config_bounds(&cfg)?;
     }
     if let Some(profile) = profile {
         diagnostics.extend(profile.diagnostics.clone());
         entries.push(trace_entry(LayerKind::Profile, &profile));
-        check_config_bounds(&cfg)?;
         apply_layer_overlay(&mut cfg, &profile.normalized)
             .map_err(|_| ConfigAdmissionError::ProfileInvalid)?;
         check_config_bounds(&cfg).map_err(|_| ConfigAdmissionError::ProfileInvalid)?;
@@ -507,110 +572,229 @@ pub fn admit(inputs: AdmissionInputs<'_>) -> Result<AdmittedConfig, ConfigAdmiss
         diagnostics: Vec::new(),
     });
 
-    // post_process is the existing runtime normalization step.  It is called
-    // only after all trusted layers, and never as a recovery path.
-    // Validate the raw composed candidate before normalization can clamp,
-    // drop, or replace a supplied value.  Pure post-processing is then safe
-    // to use for derived defaults and path expansion.
-    check_pre_process_candidate(&cfg)?;
+    // Validate the raw composed candidate before normalization. Values the
+    // runtime has always clamped or dropped (metrics/preview/clipboard/bars
+    // display settings — none authority-bearing) keep that compatibility
+    // behavior but are reported as warnings instead of disappearing silently.
+    diagnostics.extend(
+        pre_process_warnings(&cfg)
+            .into_iter()
+            .map(|message| AdmissionDiagnostic {
+                severity: DiagnosticSeverity::Warning,
+                message: safe_message(&message),
+            }),
+    );
     check_final_config(&cfg)?;
     cfg.post_process_pure(inputs.paths);
     check_normalized_candidate(&cfg)?;
-    // Validate the complete file/profile/env/CLI candidate before host rows are
-    // merged, so a trusted-layer semantic failure cannot be mislabeled as a
-    // host-source failure. The host composition repeats the same strict
-    // checks after its bounded merge.
     check_final_config(&cfg)?;
-
-    let composed = crate::host_config_checked::compose_host_definitions_checked(&cfg, inputs.hosts)
-        .map_err(|_| ConfigAdmissionError::HostInvalid)?;
-    cfg = composed.config().clone();
-    check_pre_process_candidate(&cfg)?;
-    check_final_config(&cfg)?;
-
-    let host_identity = host_identity(inputs.hosts)?;
-    entries.push(LayerTraceEntry {
-        layer: LayerKind::Hosts,
-        source: host_identity.clone(),
-        normalized_digest: host_identity.content_digest,
-        diagnostics: Vec::new(),
-    });
-    let final_bytes = bounded_serialized_config(&cfg)?;
-    let final_digest = digest(b"thegn/config-admission/final/v1", &[&final_bytes]);
-    let final_identity = SourceIdentity {
-        identity_digest: digest(
-            b"thegn/config-admission/final-identity/v1",
-            &[&final_digest],
-        ),
-        content_digest: final_digest,
-        bytes: final_bytes.len(),
-    };
-    entries.push(LayerTraceEntry {
-        layer: LayerKind::Final,
-        source: final_identity,
-        normalized_digest: final_digest,
-        diagnostics: Vec::new(),
-    });
-
-    let base_identity = entries
-        .iter()
-        .find(|entry| entry.layer == LayerKind::Base)
-        .map(|entry| entry.source.clone())
-        .unwrap_or_else(|| synthetic_identity("base-absent", 0));
-    let profile_identity = entries
-        .iter()
-        .find(|entry| entry.layer == LayerKind::Profile)
-        .map(|entry| entry.source.clone());
-    let sources = SourceIdentities {
-        base: base_identity,
-        profile: profile_identity,
-        environment_digest: env_identity.content_digest,
-        overrides_digest: override_identity.content_digest,
-        host_digest: host_identity.content_digest,
-        path_context_digest,
-    };
-    let profile_identity_digest = sources
-        .profile
-        .as_ref()
-        .map_or([0; 32], |profile| profile.identity_digest);
-    let profile_content_digest = sources
-        .profile
-        .as_ref()
-        .map_or([0; 32], |profile| profile.content_digest);
-    let revision_digest = digest(
-        b"thegn/config-admission/revision/v1",
-        &[
-            &final_digest,
-            &sources.base.identity_digest,
-            &sources.base.content_digest,
-            &profile_identity_digest,
-            &profile_content_digest,
-            &sources.environment_digest,
-            &sources.overrides_digest,
-            &sources.host_digest,
-            &path_context_digest,
-        ],
-    );
-    let trace = LayerTrace {
-        entries,
-        diagnostics: bounded_diagnostics(diagnostics.into_iter()),
-    };
-    Ok(AdmittedConfig {
+    Ok(AdmittedLayers {
         config: cfg,
-        trace,
-        revision: ConfigRevision {
-            generation: 0,
-            digest: revision_digest,
-            sources,
-            normalization_version: NORMALIZATION_VERSION,
-            host_schema: inputs.hosts.observed_schema(),
-        },
-        health: if first_run_default {
-            AdmissionHealth::FirstRunDefault
-        } else {
-            AdmissionHealth::Healthy
-        },
+        entries,
+        diagnostics,
+        env_digest: env_identity.content_digest,
+        overrides_digest: override_identity.content_digest,
+        path_context_digest,
+        first_run_default,
     })
+}
+
+/// Name what an admission refusal refused: the source (config file,
+/// selected profile overlay, an environment variable, a `--set` key) and the
+/// first offending key path, using the same validators `config validate`
+/// reports. The detail is bounded and redacted; environment and CLI failures
+/// name only the variable/key and failure class, never the supplied value.
+/// Called only on the failure path, so it costs nothing on a clean start.
+pub fn rejection_detail(inputs: &LayerInputs<'_>) -> Option<String> {
+    let first_error = |body: &[u8]| {
+        let body = std::str::from_utf8(body).ok()?;
+        config_validate::validate_diagnostics(body)
+            .into_iter()
+            .find(|diagnostic| diagnostic.severity == config_validate::ValidationSeverity::Error)
+            .map(|diagnostic| diagnostic.message)
+    };
+    for (label, source) in [
+        ("config file", Some(inputs.base)),
+        ("profile overlay", inputs.profile),
+    ] {
+        let Some(source) = source else { continue };
+        match source.content {
+            SourceContent::Bytes(bytes) => {
+                if bytes.len() > config_budget::MAX_SOURCE_BYTES
+                    || config_budget::scan(bytes).is_err()
+                {
+                    return Some(format!(
+                        "{label}: exceeds an admission size/structure limit"
+                    ));
+                }
+                if std::str::from_utf8(bytes).is_err() {
+                    return Some(format!("{label}: is not valid UTF-8"));
+                }
+                if let Some(message) = first_error(bytes) {
+                    return Some(safe_message(&format!("{label}: {message}")));
+                }
+            }
+            SourceContent::Failure(_) => return Some(format!("{label}: cannot be read")),
+            SourceContent::Absent if source.explicit => {
+                return Some(format!("{label}: explicitly selected but missing"));
+            }
+            SourceContent::Absent => {}
+        }
+    }
+    let captured_env = CapturedEnv::new(inputs.env);
+    let (overlay, _, env_errors) =
+        crate::config_diagnostics::capture_quiet(|| crate::config::env_overlay(&captured_env));
+    if let Some(error) = env_errors.first() {
+        let (key, kind) = error.split_once(':').unwrap_or((error.as_str(), "value"));
+        return Some(safe_message(&format!(
+            "environment: {key} has an invalid {kind} value"
+        )));
+    }
+    let mut scratch = Config::default();
+    let ((), _, duration_errors) = crate::config_diagnostics::capture_quiet(|| {
+        crate::config::apply_env_overlay_checked(&mut scratch, overlay)
+    });
+    if let Some(error) = duration_errors.first() {
+        let (key, kind) = error.split_once(':').unwrap_or((error.as_str(), "value"));
+        return Some(safe_message(&format!(
+            "environment: {key} has an invalid {kind} value"
+        )));
+    }
+    let defaults = inputs.defaults.clone();
+    for override_value in inputs.overrides {
+        let Some((key, value)) = override_value.split_once('=') else {
+            return Some("--set: an override is not key=value".into());
+        };
+        let key_name = crate::config_compat::canonical_key(key);
+        if key_name.len() > config_budget::MAX_CONTEXT_BYTES
+            || validate_cli_override_shape(&defaults, key, value).is_err()
+        {
+            return Some(safe_message(&format!(
+                "--set {key_name}: invalid value or key"
+            )));
+        }
+    }
+    None
+}
+
+impl AdmittedLayers {
+    /// The admitted pre-host candidate: for installing its `[database]`
+    /// policy before the state store is opened. Never authority.
+    pub fn config(&self) -> &Config {
+        &self.config
+    }
+
+    /// Compose one strict host snapshot and finish admission.
+    pub fn with_hosts(
+        self,
+        hosts: &HostDefinitionsSnapshot,
+    ) -> Result<AdmittedConfig, ConfigAdmissionError> {
+        let AdmittedLayers {
+            config,
+            mut entries,
+            diagnostics,
+            env_digest,
+            overrides_digest,
+            path_context_digest,
+            first_run_default,
+        } = self;
+        // Host composition revalidates schema + semantics after its bounded
+        // merge; the layer candidate was already fully validated.
+        let cfg = if hosts.definitions().is_empty() {
+            config
+        } else {
+            let composed =
+                crate::host_config_checked::compose_host_definitions_checked(&config, hosts)
+                    .map_err(|_| ConfigAdmissionError::HostInvalid)?;
+            let cfg = composed.config().clone();
+            check_final_config(&cfg).map_err(|_| ConfigAdmissionError::HostInvalid)?;
+            cfg
+        };
+
+        let host_identity = host_identity(hosts)?;
+        entries.push(LayerTraceEntry {
+            layer: LayerKind::Hosts,
+            source: host_identity.clone(),
+            normalized_digest: host_identity.content_digest,
+            diagnostics: Vec::new(),
+        });
+        let final_bytes = bounded_serialized_config(&cfg)?;
+        let final_digest = digest(b"thegn/config-admission/final/v1", &[&final_bytes]);
+        let final_identity = SourceIdentity {
+            identity_digest: digest(
+                b"thegn/config-admission/final-identity/v1",
+                &[&final_digest],
+            ),
+            content_digest: final_digest,
+            bytes: final_bytes.len(),
+        };
+        entries.push(LayerTraceEntry {
+            layer: LayerKind::Final,
+            source: final_identity,
+            normalized_digest: final_digest,
+            diagnostics: Vec::new(),
+        });
+
+        let base_identity = entries
+            .iter()
+            .find(|entry| entry.layer == LayerKind::Base)
+            .map(|entry| entry.source.clone())
+            .unwrap_or_else(|| synthetic_identity("base-absent", 0));
+        let profile_identity = entries
+            .iter()
+            .find(|entry| entry.layer == LayerKind::Profile)
+            .map(|entry| entry.source.clone());
+        let sources = SourceIdentities {
+            base: base_identity,
+            profile: profile_identity,
+            environment_digest: env_digest,
+            overrides_digest,
+            host_digest: host_identity.content_digest,
+            path_context_digest,
+        };
+        let profile_identity_digest = sources
+            .profile
+            .as_ref()
+            .map_or([0; 32], |profile| profile.identity_digest);
+        let profile_content_digest = sources
+            .profile
+            .as_ref()
+            .map_or([0; 32], |profile| profile.content_digest);
+        let revision_digest = digest(
+            b"thegn/config-admission/revision/v1",
+            &[
+                &final_digest,
+                &sources.base.identity_digest,
+                &sources.base.content_digest,
+                &profile_identity_digest,
+                &profile_content_digest,
+                &sources.environment_digest,
+                &sources.overrides_digest,
+                &sources.host_digest,
+                &path_context_digest,
+            ],
+        );
+        let trace = LayerTrace {
+            entries,
+            diagnostics: bounded_diagnostics(diagnostics.into_iter()),
+        };
+        Ok(AdmittedConfig {
+            config: cfg,
+            trace,
+            revision: ConfigRevision {
+                generation: 0,
+                digest: revision_digest,
+                sources,
+                normalization_version: NORMALIZATION_VERSION,
+                host_schema: hosts.observed_schema(),
+            },
+            health: if first_run_default {
+                AdmissionHealth::FirstRunDefault
+            } else {
+                AdmissionHealth::Healthy
+            },
+        })
+    }
 }
 
 fn source_bytes<'a>(
@@ -662,13 +846,10 @@ fn validate_source_identity(input: &SourceInput<'_>) -> Result<(), ConfigAdmissi
     }
 }
 
-fn validate_admission_context(
-    inputs: &AdmissionInputs<'_>,
-) -> Result<[u8; 32], ConfigAdmissionError> {
+fn validate_path_context(paths: &PathExpansionContext) -> Result<[u8; 32], ConfigAdmissionError> {
     // Config path fields are UTF-8 strings. Refuse an unrepresentable captured
     // HOME instead of collapsing distinct OS paths to the same lossy identity.
-    let home = inputs
-        .paths
+    let home = paths
         .home()
         .to_str()
         .ok_or(ConfigAdmissionError::InvalidUtf8)?;
@@ -937,32 +1118,62 @@ fn check_final_config(cfg: &Config) -> Result<(), ConfigAdmissionError> {
     Ok(())
 }
 
-fn check_pre_process_candidate(cfg: &Config) -> Result<(), ConfigAdmissionError> {
-    let invalid = cfg.metrics.interval_secs < 1.0
-        || cfg.metrics.timeout_ms < 100
-        || cfg.metrics.timeout_ms > 30_000
-        || cfg.metrics.max_body_bytes == 0
-        || cfg.metrics.targets.iter().any(|target| {
-            (target.kind == crate::config::MetricsTargetKind::Command
-                && target.command_argv().is_none())
-                || (target.kind == crate::config::MetricsTargetKind::Prometheus
-                    && target.url.trim().is_empty())
-        })
-        || cfg.preview.fetch_timeout_ms < crate::config_preview::MIN_FETCH_TIMEOUT_MS
-        || cfg.preview.fetch_timeout_ms > crate::config_preview::MAX_FETCH_TIMEOUT_MS
-        || cfg.preview.max_body_bytes == 0
-        || cfg.preview.max_body_bytes > crate::config_preview::MAX_PREVIEW_BODY_BYTES
-        || cfg.preview.ports.contains(&0)
-        || cfg.clipboard.max_image_bytes == 0
-        || cfg.clipboard.keep_hours == 0
-        || cfg.clipboard.remote_dir.trim().is_empty()
-        || crate::config::validate_strftime(&cfg.bars.date_format).is_err()
-        || crate::config::validate_strftime(&cfg.bars.clock_format).is_err();
-    if invalid {
-        Err(ConfigAdmissionError::SemanticInvalid)
-    } else {
-        Ok(())
+/// Values the runtime normalizer has always clamped, dropped, or replaced
+/// with a default. They are display/telemetry settings, not authority, so
+/// admission keeps that compatibility behavior — but names each one as a
+/// warning (key path only, never the value) instead of hiding it.
+fn pre_process_warnings(cfg: &Config) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let mut warn = |key: &str, action: &str| {
+        warnings.push(format!("{key}: value is out of range and {action}"));
+    };
+    if cfg.metrics.interval_secs < 1.0 {
+        warn("metrics.interval_secs", "is clamped to 1");
     }
+    if cfg.metrics.timeout_ms < 100 || cfg.metrics.timeout_ms > 30_000 {
+        warn("metrics.timeout_ms", "is clamped to 100..=30000");
+    }
+    if cfg.metrics.max_body_bytes == 0 {
+        warn("metrics.max_body_bytes", "is raised to 1");
+    }
+    for target in &cfg.metrics.targets {
+        if (target.kind == crate::config::MetricsTargetKind::Command
+            && target.command_argv().is_none())
+            || (target.kind == crate::config::MetricsTargetKind::Prometheus
+                && target.url.trim().is_empty())
+        {
+            warn("metrics.targets", "an unusable target is dropped");
+        }
+    }
+    if cfg.preview.fetch_timeout_ms < crate::config_preview::MIN_FETCH_TIMEOUT_MS
+        || cfg.preview.fetch_timeout_ms > crate::config_preview::MAX_FETCH_TIMEOUT_MS
+    {
+        warn("preview.fetch_timeout_ms", "is clamped");
+    }
+    if cfg.preview.max_body_bytes == 0
+        || cfg.preview.max_body_bytes > crate::config_preview::MAX_PREVIEW_BODY_BYTES
+    {
+        warn("preview.max_body_bytes", "is clamped");
+    }
+    if cfg.preview.ports.contains(&0) {
+        warn("preview.ports", "port 0 is ignored");
+    }
+    if cfg.clipboard.max_image_bytes == 0 {
+        warn("clipboard.max_image_bytes", "falls back to the default");
+    }
+    if cfg.clipboard.keep_hours == 0 {
+        warn("clipboard.keep_hours", "is raised to 1");
+    }
+    if cfg.clipboard.remote_dir.trim().is_empty() {
+        warn("clipboard.remote_dir", "falls back to the default");
+    }
+    if crate::config::validate_strftime(&cfg.bars.date_format).is_err() {
+        warn("bars.date_format", "falls back to the default");
+    }
+    if crate::config::validate_strftime(&cfg.bars.clock_format).is_err() {
+        warn("bars.clock_format", "falls back to the default");
+    }
+    warnings
 }
 
 fn bounded_serialized_config(cfg: &Config) -> Result<Vec<u8>, ConfigAdmissionError> {

@@ -415,15 +415,7 @@ fn captured_path_context_is_part_of_deterministic_admission_revision() {
 fn cli_schema_is_checked_before_lenient_override_deserialization() {
     let env = TestEnv::default();
     let host_snapshot = hosts();
-    let cases = [
-        ("picker=\"not-a-picker\"", ConfigAdmissionError::CliInvalid),
-        // The schema admits an integer; final domain validation rejects
-        // the out-of-range value before publication.
-        (
-            "metrics.timeout_ms=99",
-            ConfigAdmissionError::SemanticInvalid,
-        ),
-    ];
+    let cases = [("picker=\"not-a-picker\"", ConfigAdmissionError::CliInvalid)];
     for (override_value, expected) in cases {
         let overrides = vec![override_value.to_string()];
         let result = admit(AdmissionInputs {
@@ -830,5 +822,162 @@ fn compatibility_diagnostics_are_bounded_by_bytes_as_well_as_count() {
         .sum::<usize>();
     assert!(
         total <= crate::config_budget::MAX_DIAGNOSTICS * crate::config_budget::MAX_DIAGNOSTIC_BYTES
+    );
+}
+
+/// Display/telemetry values the runtime has always clamped or defaulted keep
+/// that behavior (main started with `metrics.timeout_ms = 50`), but each is
+/// named as a warning instead of refusing startup or disappearing silently.
+#[test]
+fn previously_clamped_values_clamp_with_a_named_warning() {
+    let env = TestEnv::default();
+    let host_snapshot = hosts();
+    for (body, key) in [
+        (&b"[metrics]\ntimeout_ms = 50\n"[..], "metrics.timeout_ms"),
+        (
+            &b"[metrics]\ninterval_secs = 0.5\n"[..],
+            "metrics.interval_secs",
+        ),
+        (
+            &b"[clipboard]\nkeep_hours = 0\n"[..],
+            "clipboard.keep_hours",
+        ),
+        (&b"[bars]\ndate_format = \"%Q\"\n"[..], "bars.date_format"),
+    ] {
+        let admitted = admit(AdmissionInputs {
+            defaults: Config::default(),
+            base: SourceInput::bytes("base", false, body),
+            profile: None,
+            env: &env,
+            overrides: &[],
+            hosts: &host_snapshot,
+            paths: &path_context(),
+        })
+        .unwrap_or_else(|error| panic!("{key}: {error}"));
+        assert!(
+            admitted
+                .trace()
+                .diagnostics()
+                .iter()
+                .any(|d| d.severity == DiagnosticSeverity::Warning && d.message.starts_with(key)),
+            "{key} must be named: {:?}",
+            admitted.trace().diagnostics()
+        );
+    }
+    let admitted = admit(AdmissionInputs {
+        defaults: Config::default(),
+        base: SourceInput::bytes("base", false, b"[metrics]\ntimeout_ms = 50\n"),
+        profile: None,
+        env: &env,
+        overrides: &[],
+        hosts: &host_snapshot,
+        paths: &path_context(),
+    })
+    .unwrap();
+    assert_eq!(admitted.config().metrics.timeout_ms, 100);
+}
+
+/// A selected profile whose overlay file does not exist is an empty layer
+/// (nothing creates one); an explicit missing source stays an error.
+#[test]
+fn absent_selected_profile_overlay_is_an_empty_layer() {
+    let env = TestEnv::default();
+    let host_snapshot = hosts();
+    let admitted = admit(AdmissionInputs {
+        defaults: Config::default(),
+        base: SourceInput::bytes("base", false, b"branch_prefix = \"safe/\"\n"),
+        profile: Some(SourceInput::absent("profile", false)),
+        env: &env,
+        overrides: &[],
+        hosts: &host_snapshot,
+        paths: &path_context(),
+    })
+    .expect("absent overlay admits");
+    assert_eq!(admitted.config().branch_prefix, "safe/");
+    assert!(
+        !admitted
+            .trace()
+            .entries()
+            .iter()
+            .any(|entry| entry.layer == LayerKind::Profile)
+    );
+}
+
+/// Layers are admitted once; composing hosts onto them equals one-shot
+/// admission.
+#[test]
+fn staged_layers_with_hosts_equal_one_shot_admission() {
+    let env = TestEnv::default();
+    let host_snapshot = hosts();
+    let one_shot = admit(AdmissionInputs {
+        defaults: Config::default(),
+        base: SourceInput::bytes("base", false, b"branch_prefix = \"safe/\"\n"),
+        profile: None,
+        env: &env,
+        overrides: &[],
+        hosts: &host_snapshot,
+        paths: &path_context(),
+    })
+    .unwrap();
+    let staged = admit_layers(LayerInputs {
+        defaults: Config::default(),
+        base: SourceInput::bytes("base", false, b"branch_prefix = \"safe/\"\n"),
+        profile: None,
+        env: &env,
+        overrides: &[],
+        paths: &path_context(),
+    })
+    .unwrap()
+    .with_hosts(&host_snapshot)
+    .unwrap();
+    assert_eq!(one_shot.revision(), staged.revision());
+}
+
+/// A refusal names its source and key path (never the value) so the
+/// startup error is actionable; before this the message was category-only.
+#[test]
+fn rejection_detail_names_source_and_key_without_values() {
+    let clean = TestEnv::default();
+    let base = |body: &'static [u8]| SourceInput::bytes("base", false, body);
+    let detail = |base_input, env: &TestEnv, overrides: &[String]| {
+        rejection_detail(&LayerInputs {
+            defaults: Config::default(),
+            base: base_input,
+            profile: None,
+            env,
+            overrides,
+            paths: &path_context(),
+        })
+    };
+    let file = detail(base(b"picker = \"sideways\"\n"), &clean, &[]).expect("file detail");
+    assert!(file.starts_with("config file:"), "{file}");
+    assert!(file.contains("picker"), "{file}");
+
+    let mut env = TestEnv::default();
+    env.0
+        .insert("THEGN_SANDBOX_ENABLED".into(), "canary-not-bool".into());
+    let env_detail = detail(base(b""), &env, &[]).expect("env detail");
+    assert!(env_detail.contains("THEGN_SANDBOX_ENABLED"), "{env_detail}");
+    assert!(!env_detail.contains("canary"), "{env_detail}");
+
+    let cli =
+        detail(base(b""), &clean, &["picker=\"canary-picker\"".to_string()]).expect("cli detail");
+    assert!(cli.starts_with("--set picker"), "{cli}");
+    assert!(!cli.contains("canary"), "{cli}");
+
+    let profile = rejection_detail(&LayerInputs {
+        defaults: Config::default(),
+        base: base(b""),
+        profile: Some(SourceInput::bytes("profile", false, b"picker = [")),
+        env: &clean,
+        overrides: &[],
+        paths: &path_context(),
+    })
+    .expect("profile detail");
+    assert!(profile.starts_with("profile overlay:"), "{profile}");
+
+    assert_eq!(
+        detail(base(b"branch_prefix = \"ok/\"\n"), &clean, &[]),
+        None
     );
 }

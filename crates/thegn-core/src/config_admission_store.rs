@@ -44,6 +44,9 @@ pub enum StaleConfigReason {
     Degraded,
     /// The generation counter cannot advance further.
     GenerationExhausted,
+    /// The current generation was admitted without the state store's host
+    /// definitions; it is display/recovery-only.
+    HostsUnavailable,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,6 +66,9 @@ impl fmt::Display for StaleConfigError {
             }
             StaleConfigReason::GenerationExhausted => {
                 "the configuration generation counter is exhausted"
+            }
+            StaleConfigReason::HostsUnavailable => {
+                "the current configuration generation has no admitted host definitions"
             }
         };
         write!(
@@ -101,7 +107,8 @@ pub enum FailureReport {
 
 struct State {
     current: Option<Arc<AdmittedConfig>>,
-    degraded: Option<(ConfigAdmissionError, u64)>,
+    /// (category, detail fingerprint, consecutive failures)
+    degraded: Option<(ConfigAdmissionError, u64, u64)>,
 }
 
 #[derive(Default)]
@@ -161,19 +168,31 @@ impl AdmissionStore {
     }
 
     /// Record a failed reload. The prior snapshot stays for display only.
-    pub fn record_failure(&self, error: ConfigAdmissionError) -> FailureReport {
+    /// `detail` is a fingerprint of the bounded diagnostic (e.g. a hash of
+    /// its text): a failure is coalesced only when both its category and its
+    /// detail repeat, so a *different* problem of the same category is new
+    /// information and reported again.
+    pub fn record_failure(&self, error: ConfigAdmissionError, detail: u64) -> FailureReport {
         let mut guard = self.lock();
         let state = guard.get_or_insert(State {
             current: None,
             degraded: None,
         });
         match &mut state.degraded {
-            Some((previous, failures)) if *previous == error => {
+            Some((previous, previous_detail, failures))
+                if *previous == error && *previous_detail == detail =>
+            {
                 *failures = failures.saturating_add(1);
                 FailureReport::Coalesced
             }
+            Some((previous, previous_detail, failures)) => {
+                *previous = error;
+                *previous_detail = detail;
+                *failures = failures.saturating_add(1);
+                FailureReport::First
+            }
             degraded => {
-                *degraded = Some((error, 1));
+                *degraded = Some((error, detail, 1));
                 FailureReport::First
             }
         }
@@ -204,14 +223,21 @@ impl AdmissionStore {
                 current_generation: generation,
             });
         }
-        state
+        let current = state
             .current
             .as_ref()
             .map(Arc::clone)
             .ok_or(StaleConfigError {
                 reason: StaleConfigReason::NoSnapshot,
                 current_generation: 0,
-            })
+            })?;
+        if current.health() == crate::config_admission::AdmissionHealth::HostsUnavailable {
+            return Err(StaleConfigError {
+                reason: StaleConfigReason::HostsUnavailable,
+                current_generation: generation,
+            });
+        }
+        Ok(current)
     }
 
     /// Prove that `observed` is still the current, healthy revision.
@@ -235,7 +261,7 @@ impl AdmissionStore {
         match guard.as_ref() {
             None => StoreHealth::Empty,
             Some(State {
-                degraded: Some((error, failures)),
+                degraded: Some((error, _, failures)),
                 ..
             }) => StoreHealth::Degraded {
                 generation,
