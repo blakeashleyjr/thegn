@@ -8166,10 +8166,11 @@ async fn event_loop<T: Terminal>(
         );
     }
 
-    // When reminders were last checked. The due window is half-open against
-    // this, so a reminder fires on exactly the one tick that straddles its
-    // trigger rather than on every tick from then until the meeting starts.
-    let mut last_reminder_check_ms = chrono::Utc::now().timestamp_millis();
+    // When reminders were last checked, and the one evaluation in flight. The
+    // due window is half-open against the cursor, which advances only on a
+    // worker's successful acknowledgment of that exact window.
+    let mut reminder_cursor =
+        crate::hydrate_calendar::ReminderCursor::new(chrono::Utc::now().timestamp_millis());
 
     loop_perf.take(); // loop metrics start here; startup has its own waterfall
     let mut active_clock = crate::perf_timing::ActiveClock::default();
@@ -11606,6 +11607,7 @@ async fn event_loop<T: Terminal>(
                     if panel_ui.docs.calendar.home == prev_cal.home {
                         panel_ui.docs.calendar.events = prev_cal.events;
                         panel_ui.docs.calendar.loaded = prev_cal.loaded;
+                        panel_ui.docs.calendar.errors = prev_cal.errors;
                     }
                     // The help registry embeds the effective keymap page.
                     help_registry =
@@ -11776,11 +11778,14 @@ async fn event_loop<T: Terminal>(
                 // gates per account instead.
                 RefreshKind::Calendar => want_calendar_sync = true,
                 RefreshKind::CalendarReminders => want_reminder_check = true,
+                RefreshKind::CalendarReminderResult { window, outcome } => {
+                    reminder_cursor.finish(window, outcome);
+                }
                 // A month's events landed: fill them into the open popup (and
                 // keep them for the next open). `apply_calendar` drops a
                 // payload the user has already navigated away from.
                 RefreshKind::CalendarMonth(p) => {
-                    panel_ui.docs.calendar.merge(p.month, &p.events);
+                    panel_ui.docs.calendar.merge(&p);
                     dirty |= crate::detail::apply_calendar(&mut bar_detail, *p);
                 }
                 RefreshKind::ClockTick => {
@@ -12174,17 +12179,13 @@ async fn event_loop<T: Terminal>(
         if want_reminder_check {
             // Off the loop: the check reads the DB, and blocking I/O on the
             // loop is the one thing the event model forbids outright.
-            //
-            // The window stamp advances HERE rather than inside the task, so
-            // the next window starts where this one ended even if the task is
-            // delayed — each reminder is then still evaluated exactly once.
-            let now_ms = chrono::Utc::now().timestamp_millis();
             crate::hydrate_calendar::spawn_reminder_check(
+                &mut reminder_cursor,
+                chrono::Utc::now().timestamp_millis(),
                 current_config.calendar.clone(),
-                last_reminder_check_ms,
+                refresh_tx.clone(),
                 waker.clone(),
             );
-            last_reminder_check_ms = now_ms;
         }
         if want_issue_refresh {
             crate::hydrate_tracker::spawn_issue_cache_refresh(
