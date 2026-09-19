@@ -426,6 +426,9 @@ impl EnvSource for CapturedEnv<'_> {
 /// not re-admitted after the host capture.
 pub struct AdmittedLayers {
     config: Config,
+    /// The bounded serialization of `config`, reused as the final bytes when
+    /// no host definition changes the candidate.
+    normalized_bytes: Vec<u8>,
     entries: Vec<LayerTraceEntry>,
     diagnostics: Vec<AdmissionDiagnostic>,
     env_digest: [u8; 32],
@@ -517,14 +520,12 @@ pub fn admit_layers(inputs: LayerInputs<'_>) -> Result<AdmittedLayers, ConfigAdm
         entries.push(trace_entry(LayerKind::Base, &base));
         // `cfg` is the defaults, already bounds-checked above.
         apply_layer_overlay(&mut cfg, &base.normalized)?;
-        check_config_bounds(&cfg)?;
     }
     if let Some(profile) = profile {
         diagnostics.extend(profile.diagnostics.clone());
         entries.push(trace_entry(LayerKind::Profile, &profile));
         apply_layer_overlay(&mut cfg, &profile.normalized)
             .map_err(|_| ConfigAdmissionError::ProfileInvalid)?;
-        check_config_bounds(&cfg).map_err(|_| ConfigAdmissionError::ProfileInvalid)?;
     }
 
     let captured_env = CapturedEnv::new(inputs.env);
@@ -545,7 +546,11 @@ pub fn admit_layers(inputs: LayerInputs<'_>) -> Result<AdmittedLayers, ConfigAdm
     if !duration_input_errors.is_empty() {
         return Err(ConfigAdmissionError::EnvironmentInvalid);
     }
-    check_config_bounds(&cfg)?;
+    // Each file layer was bounded (bytes, lines, depth, members, strings)
+    // before it was parsed, and the environment is bounded at capture, so
+    // the intermediate candidate cannot outgrow those budgets. The strict
+    // final host limits are enforced once on the normalized candidate below
+    // (and per `--set`, whose values are applied one at a time).
     let env_diagnostics = bounded_diagnostics(
         env_warnings
             .into_iter()
@@ -584,12 +589,21 @@ pub fn admit_layers(inputs: LayerInputs<'_>) -> Result<AdmittedLayers, ConfigAdm
                 message: safe_message(&message),
             }),
     );
-    check_final_config(&cfg)?;
+    // One strict pass over the raw composed candidate (schema incl. ranges
+    // for env-supplied values, durations, semantics), before normalization
+    // can clamp or default anything; then one bounds pass + one serialization
+    // of the normalized candidate, reused for the final digest.
+    // The file layers were schema-walked as raw TOML and the defaults come
+    // from the typed `Config`; only environment/`--set` values can introduce
+    // a schema-range violation into the typed candidate, so the full-candidate
+    // walk runs only when one of them contributed.
+    let supplied_runtime_values = !env_values.is_empty() || !inputs.overrides.is_empty();
+    check_final_config(&cfg, supplied_runtime_values)?;
     cfg.post_process_pure(inputs.paths);
-    check_normalized_candidate(&cfg)?;
-    check_final_config(&cfg)?;
+    let normalized_bytes = check_normalized_candidate(&cfg)?;
     Ok(AdmittedLayers {
         config: cfg,
+        normalized_bytes,
         entries,
         diagnostics,
         env_digest: env_identity.content_digest,
@@ -691,6 +705,7 @@ impl AdmittedLayers {
     ) -> Result<AdmittedConfig, ConfigAdmissionError> {
         let AdmittedLayers {
             config,
+            normalized_bytes,
             mut entries,
             diagnostics,
             env_digest,
@@ -700,15 +715,18 @@ impl AdmittedLayers {
         } = self;
         // Host composition revalidates schema + semantics after its bounded
         // merge; the layer candidate was already fully validated.
-        let cfg = if hosts.definitions().is_empty() {
-            config
+        let (cfg, final_bytes) = if hosts.definitions().is_empty() {
+            (config, normalized_bytes)
         } else {
             let composed =
                 crate::host_config_checked::compose_host_definitions_checked(&config, hosts)
                     .map_err(|_| ConfigAdmissionError::HostInvalid)?;
             let cfg = composed.config().clone();
-            check_final_config(&cfg).map_err(|_| ConfigAdmissionError::HostInvalid)?;
-            cfg
+            // compose_host_definitions_checked already schema-walked and
+            // semantically validated the merged candidate.
+            check_final_config(&cfg, false).map_err(|_| ConfigAdmissionError::HostInvalid)?;
+            let bytes = bounded_serialized_config(&cfg)?;
+            (cfg, bytes)
         };
 
         let host_identity = host_identity(hosts)?;
@@ -718,7 +736,6 @@ impl AdmittedLayers {
             normalized_digest: host_identity.content_digest,
             diagnostics: Vec::new(),
         });
-        let final_bytes = bounded_serialized_config(&cfg)?;
         let final_digest = digest(b"thegn/config-admission/final/v1", &[&final_bytes]);
         let final_identity = SourceIdentity {
             identity_digest: digest(
@@ -1094,20 +1111,23 @@ fn validate_cli_override_shape(
     }
 }
 
-fn check_normalized_candidate(cfg: &Config) -> Result<(), ConfigAdmissionError> {
+fn check_normalized_candidate(cfg: &Config) -> Result<Vec<u8>, ConfigAdmissionError> {
     check_config_bounds(cfg)?;
     let bytes = bounded_serialized_config(cfg)?;
     if bytes.len() > config_budget::MAX_NORMALIZED_BYTES {
         return Err(ConfigAdmissionError::Oversized);
     }
-    Ok(())
+    Ok(bytes)
 }
 
-fn check_final_config(cfg: &Config) -> Result<(), ConfigAdmissionError> {
-    check_config_bounds(cfg)?;
-    let value = bounded_json_value(cfg)?;
-    if !config_validate::validate_config_schema_value(&value).is_empty() {
-        return Err(ConfigAdmissionError::SchemaInvalid);
+fn check_final_config(cfg: &Config, schema_walk: bool) -> Result<(), ConfigAdmissionError> {
+    if schema_walk {
+        // `bounded_json_value` bounds the serialization itself; the strict
+        // host structure limits are enforced by `check_normalized_candidate`.
+        let value = bounded_json_value(cfg)?;
+        if !config_validate::validate_config_schema_value(&value).is_empty() {
+            return Err(ConfigAdmissionError::SchemaInvalid);
+        }
     }
     if !crate::config_duration::errors_for_config(cfg).is_empty() {
         return Err(ConfigAdmissionError::SchemaInvalid);
