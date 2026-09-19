@@ -17,12 +17,13 @@ pub(crate) mod layout;
 pub(crate) mod render;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use chrono::{DateTime, Datelike, Local, NaiveDate};
 use chrono_tz::Tz;
 use thegn_core::calendar::{CalCursor, CalEvent, ResolvedClock};
 
-use crate::calendar_docs::{CalUiCfg, CalendarDocs, WxUiCfg};
+use crate::calendar_docs::{CalUiCfg, CalendarDocs, CalendarError, WxUiCfg};
 use crate::chrome::FrameModel;
 use crate::compositor::Rect;
 
@@ -49,8 +50,11 @@ pub(crate) struct CalState {
     pub today: NaiveDate,
     pub pane: CalPane,
     pub agenda_sel: usize,
-    pub events: BTreeMap<NaiveDate, Vec<CalEvent>>,
+    pub events: BTreeMap<NaiveDate, Vec<Arc<CalEvent>>>,
     pub loaded: BTreeSet<(i32, u32)>,
+    /// Months whose last delivery failed or was incomplete (see
+    /// [`crate::calendar_docs::fold_month`]).
+    pub errors: BTreeMap<(i32, u32), CalendarError>,
     /// The month whose fetch is in flight. Guards against firing a second
     /// request for a month already being fetched, and lets a late payload for a
     /// month the user has navigated away from be dropped — the `pending_ci`
@@ -75,8 +79,12 @@ impl CalState {
         self.loaded.contains(&self.cursor.visible_month())
     }
 
+    pub fn month_error(&self) -> Option<CalendarError> {
+        self.errors.get(&self.cursor.visible_month()).copied()
+    }
+
     /// Events on the selected day.
-    pub fn selected_events(&self) -> &[CalEvent] {
+    pub fn selected_events(&self) -> &[Arc<CalEvent>] {
         self.events
             .get(&self.cursor.selected())
             .map(Vec::as_slice)
@@ -102,7 +110,11 @@ pub(crate) struct CalendarDetail {
 #[derive(Debug, Clone)]
 pub struct CalendarPayload {
     pub month: (i32, u32),
-    pub events: Vec<(NaiveDate, Vec<CalEvent>)>,
+    /// The month's per-day buckets, sharing each occurrence's payload; `None`
+    /// when the month could not be produced (the last valid snapshot stays).
+    pub events: Option<Vec<(NaiveDate, Vec<Arc<CalEvent>>)>>,
+    /// Why the month is unavailable — or, alongside `events`, incomplete.
+    pub error: Option<CalendarError>,
 }
 
 /// Build the calendar popup for the `date`/`clock` bar items.
@@ -140,6 +152,7 @@ pub(super) fn open(
         agenda_sel: 0,
         events: docs.events.clone(),
         loaded: docs.loaded.clone(),
+        errors: docs.errors.clone(),
         pending: None,
         // The home row is synthesized HERE, not only in
         // `CalendarDocs::from_config`, so "there is always at least one clock"
@@ -347,10 +360,12 @@ pub fn apply_calendar(slot: &mut Option<super::DetailOverlay>, payload: Calendar
     if c.st.pending != Some(payload.month) {
         return false;
     }
-    for (date, evs) in payload.events {
-        c.st.events.insert(date, evs);
-    }
-    c.st.loaded.insert(payload.month);
+    crate::calendar_docs::fold_month(
+        &mut c.st.events,
+        &mut c.st.loaded,
+        &mut c.st.errors,
+        &payload,
+    );
     c.st.pending = None;
     true
 }

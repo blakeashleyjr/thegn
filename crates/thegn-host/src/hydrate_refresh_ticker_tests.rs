@@ -168,6 +168,7 @@ impl Fixture {
                     RefreshKind::Issues => "issues",
                     RefreshKind::Calendar => "calendar",
                     RefreshKind::CalendarReminders => "reminder",
+                    RefreshKind::CalendarReminderResult { .. } => "reminder-result",
                     RefreshKind::UsagePoll => "usage",
                     RefreshKind::WeatherPoll => "weather",
                     RefreshKind::AutoFetch { sweep: false } => "fetch-startup",

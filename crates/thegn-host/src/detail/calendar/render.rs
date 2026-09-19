@@ -295,15 +295,38 @@ fn agenda_heading(st: &CalState) -> super::super::Section {
             crate::caps::active_glyphs().middot,
             sel.format("%a %-d %b")
         ),
-        note: Some(if !st.month_loaded() {
-            format!("loading{}", crate::caps::active_glyphs().ellipsis)
-        } else {
-            match n {
-                0 => "no events".into(),
-                1 => "1 event".into(),
-                n => format!("{n} events"),
+        note: Some(agenda_note(st, n)),
+    }
+}
+
+/// The agenda status note. A failed or incomplete month is always said so:
+/// "unavailable" when nothing valid was ever loaded (never a false "no
+/// events"), otherwise the retained count marked stale/incomplete.
+fn agenda_note(st: &CalState, n: usize) -> String {
+    let loaded = st.month_loaded();
+    let error = st.month_error();
+    if !loaded {
+        return match error {
+            Some(_) => "unavailable".into(),
+            None => format!("loading{}", crate::caps::active_glyphs().ellipsis),
+        };
+    }
+    let count = match n {
+        0 => "no events".to_string(),
+        1 => "1 event".into(),
+        n => format!("{n} events"),
+    };
+    match error {
+        None => count,
+        Some(e) => format!(
+            "{count} {} {}",
+            crate::caps::active_glyphs().middot,
+            if e.is_partial() {
+                "incomplete"
+            } else {
+                "stale"
             }
-        }),
+        ),
     }
 }
 

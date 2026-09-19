@@ -1,4 +1,5 @@
 use super::*;
+use std::sync::Arc;
 use termwiz::surface::Surface;
 use thegn_core::calendar::EventTime;
 
@@ -38,8 +39,9 @@ fn hostile_calendar_provider_values_stay_inside_popup_and_raw_values_survive() {
             today: date,
             pane: CalPane::Agenda,
             agenda_sel: 0,
-            events: BTreeMap::from([(date, vec![event])]),
+            events: BTreeMap::from([(date, vec![Arc::new(event)])]),
             loaded: BTreeSet::from([(2026, 9)]),
+            errors: BTreeMap::new(),
             pending: None,
             clocks: vec![ResolvedClock {
                 label: raw.clone(),
@@ -91,7 +93,7 @@ fn hostile_calendar_provider_values_stay_inside_popup_and_raw_values_survive() {
                 }
             }
         }
-        assert_eq!(&detail.st.events[&date][0], &original);
+        assert_eq!(&*detail.st.events[&date][0], &original);
     }
 }
 
@@ -154,4 +156,84 @@ fn calendar_display_sites_keep_the_safe_projection() {
     }
     let layout = include_str!("mod.rs");
     assert!(layout.contains("Field::ClockLabel"));
+}
+
+fn status_state(
+    events: BTreeMap<NaiveDate, Vec<Arc<CalEvent>>>,
+    loaded: bool,
+    error: Option<crate::calendar_docs::CalendarError>,
+) -> CalState {
+    let date = NaiveDate::from_ymd_opt(2026, 9, 13).unwrap();
+    CalState {
+        cursor: CalCursor::new(date),
+        today: date,
+        pane: CalPane::Grid,
+        agenda_sel: 0,
+        events,
+        loaded: if loaded {
+            BTreeSet::from([(2026, 9)])
+        } else {
+            BTreeSet::new()
+        },
+        errors: error.map(|e| ((2026, 9), e)).into_iter().collect(),
+        pending: None,
+        clocks: Vec::new(),
+        now: date.and_hms_opt(12, 0, 0).unwrap().and_utc(),
+        home: Tz::UTC,
+        ui: CalUiCfg {
+            has_sources: true,
+            ..Default::default()
+        },
+        weather: None,
+        wx: WxUiCfg::default(),
+    }
+}
+
+fn agenda_note_of(st: &CalState) -> String {
+    let sections = render::sections_of(st);
+    let Some(crate::detail::Section::Heading { note, .. }) = sections.get(2) else {
+        panic!("calendar agenda heading missing")
+    };
+    note.clone().expect("agenda heading carries a note")
+}
+
+#[test]
+fn calendar_expansion_failure_is_visible_as_unavailable() {
+    use crate::calendar_docs::CalendarError;
+    use thegn_core::calendar::{ExpansionError, ExpansionLimit};
+    let failed = CalendarError::Expansion(ExpansionError::Budget(ExpansionLimit::BucketEntries));
+    let date = NaiveDate::from_ymd_opt(2026, 9, 13).unwrap();
+    let event = Arc::new(CalEvent::new(
+        "e",
+        "E",
+        EventTime::Date { date },
+        EventTime::Date {
+            date: date.succ_opt().unwrap(),
+        },
+    ));
+
+    // A complete empty month is the ONLY state that says "no events".
+    assert_eq!(
+        agenda_note_of(&status_state(BTreeMap::new(), true, None)),
+        "no events"
+    );
+    // A first-load failure is unavailable, never a successful empty month.
+    assert_eq!(
+        agenda_note_of(&status_state(BTreeMap::new(), false, Some(failed))),
+        "unavailable"
+    );
+    // A failed refresh keeps the last good events and says they are stale.
+    let kept = BTreeMap::from([(date, vec![Arc::clone(&event)])]);
+    let note = agenda_note_of(&status_state(kept.clone(), true, Some(failed)));
+    assert!(
+        note.starts_with("1 event ") && note.ends_with(" stale"),
+        "{note}"
+    );
+    // Unreadable rows: the readable events show, marked incomplete.
+    let note = agenda_note_of(&status_state(
+        kept,
+        true,
+        Some(CalendarError::MalformedCache),
+    ));
+    assert!(note.ends_with(" incomplete"), "{note}");
 }
