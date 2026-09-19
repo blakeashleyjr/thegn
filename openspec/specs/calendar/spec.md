@@ -232,6 +232,63 @@ no more than one with an end.
 - **WHEN** an unbounded recurrence is expanded over a one-month window
 - **THEN** only that month's occurrences are produced and expansion terminates
 
+### Requirement: Calendar expansion is window-intersected and budgeted
+
+Calendar expansion SHALL resolve an event's span and intersect it with the
+requested date window before enumerating occupied dates. A span wholly outside
+the window MUST require no lifetime-sized date walk, and overlap MUST be decided
+from the span's boundaries, never by materializing its dates. All-day DTEND and
+a timed end at exactly local midnight (sub-seconds included) remain exclusive,
+zero-duration events remain point events, and inverted or unrepresentable spans
+MUST produce a typed error — including a same-day inversion — rather than a
+fabricated one-day event. Date arithmetic at the representable extremes SHALL be
+checked.
+
+A recurring event SHALL include every instance whose span overlaps the window,
+including an instance that starts before the window (the expansion looks back by
+the event's own duration). A rule without COUNT MAY be fast-forwarded to the
+window; a COUNT rule is walked from DTSTART under the shared work budget.
+
+One expansion budget SHALL cover the whole call — source visits, recurrence
+work (every period, candidate, BY-part cross product, RDATE and EXDATE
+visited), materialized occurrences, occupied-date bucket entries, and retained
+bytes — across all source rows, together with a per-row payload and
+child-entry ceiling applied to every row. Retained bytes MUST be reserved
+before a payload is cloned. Exhaustion MUST return a typed error rather than a
+plausible partial calendar. Date buckets SHALL share each materialized
+occurrence's payload, and reminder evaluation SHALL consume the unique
+occurrence list so a multi-day event cannot duplicate notifications.
+
+#### Scenario: A century-scale event is queried for one day
+
+- **WHEN** an event spans centuries and the requested window contains one day
+- **THEN** expansion performs work proportional to that window and returns one
+  shared occurrence handle for the matching day
+
+#### Scenario: A long instance began before the window
+
+- **WHEN** a COUNT=1 or RDATE instance started twenty years ago and ends tomorrow
+- **THEN** today's one-day query includes it without walking the twenty years
+
+#### Scenario: Expansion exceeds its shared budget
+
+- **WHEN** source rows or recurrence candidates exhaust any expansion budget
+- **THEN** the month keeps its last valid snapshot marked stale, or shows
+  "unavailable" on first load (never "no events"), and reminders raise nothing
+  and keep their evaluation cursor for retry
+
+#### Scenario: A reminder evaluation is acknowledged
+
+- **WHEN** the off-loop reminder check finishes the window it was handed
+- **THEN** the reminder cursor advances to exactly that window's end, only on
+  success, and an acknowledgment for a window no longer in flight is ignored
+
+#### Scenario: A cached row cannot be decoded
+
+- **WHEN** a cached calendar row fails to deserialize
+- **THEN** the readable events still show, the month is marked incomplete, and
+  a cache query failure is reported as unavailable rather than an empty month
+
 ### Requirement: Reminders are raised through the notification system
 
 When reminders are enabled, thegn SHALL raise a notification ahead of an event
