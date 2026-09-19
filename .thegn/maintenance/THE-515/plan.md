@@ -272,3 +272,25 @@ Review-fix validation (d060161d + 31494a87, per-worktree lane target):
 - `package(thegn-host) & test(/integrate::candidates::tests/)` → 15 passed, including the fold and manual-land refusal tests.
 - `cargo clippy --workspace --offline --locked --all-targets -- -D warnings` → clean.
 - `nix develop --command treefmt --ci` → 0 changed; `nix develop --command just ratchets` → exit 0.
+
+## 8. Response to round-2 review (review-the-515-round2.md)
+
+- **F1 HIGH, registry cache can lock a correct repo out: confirmed, fixed.**
+  - A tab slug no longer acts as a key. `workspace_overlay_for_tab_slug` maps the slug through the registry to the path it was issued for, and selects by that path's own legacy key. So a `-2` tab of a correctly configured repo gets its block, and `repo`/`-N` never select a block spelled like them.
+  - The whole-table scan is gone. The only refusal left is `AmbiguousRepositories`, and only when another row is a LIVE main checkout (`.git` dir or bare `*.git`) at a different canonical location. Stale rows, plain dir workspaces, linked worktrees and symlink / `/tmp` vs `/private/tmp` spellings of one checkout never count. Metadata-only: no git, and fs work only for rows matching the key.
+  - `credential_overlay_gate` now applies only to choices that resolve to an account provider (agents). Shells never go through it.
+  - Refusal text is actionable: rename or delete the other checkout. The refusal clears itself once that checkout is gone, so no new CLI verb is needed.
+  - Tests: `stale_registry_row_does_not_lock_out_a_single_repo` (deleted clone, plain dir, linked worktree), `a_symlinked_second_spelling_is_the_same_repo`, `two_live_same_named_checkouts_refuse_…`, `only_live_distinct_checkouts_count_as_duplicates`, `credential_gate_refuses_agents_only_for_live_ambiguity` (stale row passes, live duplicate refuses agents, shell passes).
+  - Pushback: an AGENT pane being resurrected in a genuinely ambiguous repo is still refused. The gate cannot tell resurrection from a fresh launch, and relaunching an agent under credentials the trusted block did not choose is exactly the risk. Shells, including resurrected ones, are never refused.
+- **F2, sweep ignores refusal: confirmed, fixed.** `merge_sweep::sweep` and `sweep_with_db` return early with the refusal. The selector also forces `on_landed = off` on refusal, so every sweep path keeps worktrees. Test: `refused_trusted_overlay_sweeps_nothing`.
+- **F3, review agents use the global agent command: confirmed, fixed.**
+  - `review_task_handoff::handle` refuses.
+  - `review_handoff::target` returns `PaneTarget::None` for a new headless agent. Handing feedback to an already-running agent pane is still allowed, since nothing new is launched.
+  - Test: `refused_overlay_never_dispatches_a_headless_reviewer`.
+- **F4, enqueue: adopted.** In-app `a`/`A` (`add_worktree`, `add_all`) and route-to-host remote enqueue (`prepare_remote_enqueue`) refuse.
+- **F5, registry read on the loop: not changed.** The registry read is a single indexed SELECT on the palette's existing DB handle, and only runs when a `[project.*]` block exists. It is the same cost class as the palette's existing `get_ui_state` read, with no idle cost. Fs probes run only for rows deriving the same key.
+
+Round-2 validation (per-worktree lane target):
+
+- Focused filterset → 431 passed, 0 failed. It adds `review_task_handoff|merge_sweep|integrate::candidates` to the round-1 set.
+- `cargo clippy --workspace --offline --locked --all-targets -- -D warnings` → clean.

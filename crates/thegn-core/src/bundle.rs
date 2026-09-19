@@ -810,9 +810,13 @@ mod tests {
     fn refused_overlay_drops_global_and_workspace_bundles() {
         // THE-515: a shared `foo` key refuses the trusted env bundle, and the
         // global binding must not stand in for it.
+        let dir = tempfile::tempdir().unwrap();
         let db = Db::open_memory().unwrap();
-        db.slug_for_repo("/a/foo", "foo").unwrap();
-        db.slug_for_repo("/b/foo", "foo").unwrap();
+        for name in ["a/foo", "b/foo"] {
+            let path = dir.path().join(name);
+            std::fs::create_dir_all(path.join(".git")).unwrap();
+            db.slug_for_repo(&path.to_string_lossy(), "foo").unwrap();
+        }
         let mut cfg = Config::default();
         cfg.workspace.entry("foo".into()).or_default().env_bundle = Some("work".into());
         set_active(&db, Bind::Global, "/wt", Some("foo"), "global").unwrap();

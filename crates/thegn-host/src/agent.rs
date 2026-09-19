@@ -3523,13 +3523,16 @@ pub fn launch_spec_full(
     // the legacy per-provider active account when nothing else set it). Local
     // worktrees only — a remote agent runs where the host's cred dirs don't exist.
     // THE-515: when the trusted overlay that would pin this repo's agent
-    // accounts / env bundle (HOME) is refused, refuse the launch instead of
-    // running it with credentials that block did not choose.
+    // accounts / env bundle (HOME) is refused, refuse an AGENT launch instead
+    // of running it with credentials that block did not choose. Shells (and
+    // any non-agent choice) always launch: the refused block's bundle is then
+    // simply not applied, so a registry problem can never lock the user out
+    // of a terminal.
     if !loc.is_remote()
         && let Some(db) = db.as_ref()
         && let Some(slug) = repo_slug(db, &repo_root)
     {
-        credential_overlay_gate(cfg, db, &slug)?;
+        credential_overlay_gate(cfg, db, &slug, choice)?;
     }
     let resolved = (!loc.is_remote())
         .then_some(db.as_ref())
@@ -3868,12 +3871,32 @@ fn inject_devshell_host(spec: &mut LaunchSpec, dev: &devenv::Devshell) {
 /// Refuse an agent launch whose credential-bearing trusted overlay
 /// (`[project.<key>] accounts` / `env_bundle`) is refused (THE-515). A refused
 /// block without credentials only loses its settings; it does not block.
-pub(crate) fn credential_overlay_gate(cfg: &Config, db: &Db, slug: &str) -> anyhow::Result<()> {
+pub(crate) fn credential_overlay_gate(
+    cfg: &Config,
+    db: &Db,
+    slug: &str,
+    choice: &str,
+) -> anyhow::Result<()> {
+    if thegn_core::account::provider_for(cfg, choice).is_none() {
+        return Ok(());
+    }
     if let thegn_core::workspace_overlay::WorkspaceOverlay::Refused(refusal) =
         cfg.workspace_overlay_for_tab_slug(db, slug)
-        && thegn_core::workspace_overlay::candidates_carry_credentials(&cfg.workspace, slug)
     {
-        anyhow::bail!("agent launch refused: {refusal}");
+        let key = match &refusal {
+            thegn_core::workspace_overlay::OverlayRefusal::AliasCollision { key, .. }
+            | thegn_core::workspace_overlay::OverlayRefusal::NonCanonicalKey {
+                canonical: key,
+                ..
+            }
+            | thegn_core::workspace_overlay::OverlayRefusal::AmbiguousRepositories {
+                key, ..
+            }
+            | thegn_core::workspace_overlay::OverlayRefusal::RegistryUnavailable { key } => key,
+        };
+        if thegn_core::workspace_overlay::candidates_carry_credentials(&cfg.workspace, key) {
+            anyhow::bail!("agent launch refused: {refusal}");
+        }
     }
     Ok(())
 }
