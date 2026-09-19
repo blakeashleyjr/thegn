@@ -2269,6 +2269,10 @@ fn credential_gate_refuses_agents_only_for_live_ambiguity() {
 /// exact JSON, token for token.
 #[cfg(unix)]
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "test fixture: blocking git/sh waits build the repo and re-parse the command"
+)]
 fn permissioned_launch_is_command_scoped_and_never_touches_the_repository() {
     use crate::daemon::agent_open::command_for;
     use std::os::unix::ffi::OsStrExt;
