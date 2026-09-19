@@ -31,8 +31,8 @@ fn zero_is_rejected_and_never_unlimited() {
     let (b, problem) = AdmissionBudget::clamped(0);
     assert_eq!(
         b.max_events(),
-        1,
-        "zero clamps to the minimum, not unlimited"
+        DEFAULT_MAX_EVENTS,
+        "a legacy zero runs as the default budget, never unlimited"
     );
     assert!(
         problem
@@ -106,20 +106,41 @@ fn per_event_bytes_and_children_are_exact() {
 }
 
 #[test]
+fn the_account_byte_budget_scales_with_max_events() {
+    assert_eq!(budget(1).account_bytes(), MIN_ACCOUNT_BYTES);
+    assert_eq!(
+        budget(DEFAULT_MAX_EVENTS).account_bytes(),
+        MIN_ACCOUNT_BYTES
+    );
+    assert_eq!(
+        budget(8_000).account_bytes(),
+        8_000 * ACCOUNT_BYTES_PER_EVENT
+    );
+    assert!(budget(8_000).account_bytes() > MIN_ACCOUNT_BYTES);
+    assert!(budget(MAX_MAX_EVENTS).account_bytes() <= MAX_ACCOUNT_BYTES);
+    // One maximal account plus one in-flight body fits the global pool.
+    const { assert!(MAX_ACCOUNT_BYTES + MAX_SOURCE_DOCUMENT_BYTES <= GLOBAL_MAX_BYTES) };
+}
+
+#[test]
 fn per_account_bytes_are_bounded_across_events() {
-    let mut m = AdmissionMeter::isolated(budget(MAX_MAX_EVENTS));
+    let b = budget(MAX_MAX_EVENTS);
+    let mut m = AdmissionMeter::isolated(b);
     let per = MAX_EVENT_BYTES;
-    for _ in 0..MAX_ACCOUNT_BYTES / per {
+    let full = b.account_bytes() / per;
+    for _ in 0..full {
         m.begin_event();
         m.charge_event(per, 0).unwrap();
         m.admit_event().unwrap();
     }
     m.begin_event();
+    let rest = b.account_bytes() - full * per;
+    m.charge_event(rest, 0).unwrap();
+    assert_eq!(m.retained_bytes(), b.account_bytes());
     assert_eq!(
         m.charge_event(1, 0),
         Err(AdmissionError::new(AdmissionLimit::AccountBytes))
     );
-    assert_eq!(m.retained_bytes(), MAX_ACCOUNT_BYTES);
 }
 
 #[test]
@@ -273,6 +294,13 @@ fn errors_are_value_free_and_distinguish_contention() {
         let e = AdmissionError::new(limit);
         assert!(!e.to_string().is_empty());
         assert_eq!(
+            e.is_account_limit(),
+            matches!(
+                limit,
+                AdmissionLimit::AccountRecords | AdmissionLimit::AccountBytes
+            )
+        );
+        assert_eq!(
             e.is_contention(),
             matches!(
                 limit,
@@ -283,7 +311,7 @@ fn errors_are_value_free_and_distinguish_contention() {
     assert!(
         AdmissionError::new(AdmissionLimit::AccountRecords)
             .to_string()
-            .contains("nothing was replaced")
+            .contains("raise [calendar] max_events")
     );
 }
 

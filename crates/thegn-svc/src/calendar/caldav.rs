@@ -178,14 +178,30 @@ fn xml_unescape(s: &str) -> Cow<'_, str> {
     if !s.contains('&') {
         return Cow::Borrowed(s);
     }
-    // `&amp;` last, or `&amp;lt;` would wrongly become `<`.
-    Cow::Owned(
-        s.replace("&lt;", "<")
-            .replace("&gt;", ">")
-            .replace("&quot;", "\"")
-            .replace("&apos;", "'")
-            .replace("&amp;", "&"),
-    )
+    // One pass into one buffer no larger than the input (every entity is
+    // longer than its character), so an unescaped copy peaks at 1× — the
+    // replace chain it supersedes held two full-size strings at once. Each
+    // entity is decoded exactly once, so `&amp;lt;` stays `&lt;`.
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(i) = rest.find('&') {
+        out.push_str(&rest[..i]);
+        rest = &rest[i..];
+        let (ch, len) = [
+            ("&lt;", '<'),
+            ("&gt;", '>'),
+            ("&quot;", '"'),
+            ("&apos;", '\''),
+            ("&amp;", '&'),
+        ]
+        .iter()
+        .find(|(e, _)| rest.starts_with(e))
+        .map_or(('&', 1), |(e, c)| (*c, e.len()));
+        out.push(ch);
+        rest = &rest[len..];
+    }
+    out.push_str(rest);
+    Cow::Owned(out)
 }
 
 /// One `<response>` from a multistatus body.
@@ -250,6 +266,13 @@ fn walk_multistatus<'a>(
         if href.trim().is_empty() {
             continue;
         }
+        // Size the raw value before unescaping it (the unescaped form is never
+        // longer), so an enormous href costs nothing to refuse.
+        if href.trim().len() > MAX_REQUEST_BYTES {
+            return Err(CalendarError::BodyLimit(
+                "calendar resource href exceeds limit",
+            ));
+        }
         let href = xml_unescape(href.trim());
         if href.len() > MAX_REQUEST_BYTES {
             return Err(CalendarError::BodyLimit(
@@ -269,7 +292,12 @@ fn walk_multistatus<'a>(
         token = body;
         rest = tail;
     }
-    let token = xml_unescape(token);
+    if token.trim().len() > MAX_REQUEST_BYTES {
+        return Err(CalendarError::BodyLimit(
+            "calendar sync token exceeds limit",
+        ));
+    }
+    let token = xml_unescape(token.trim());
     if token.len() > MAX_REQUEST_BYTES {
         return Err(CalendarError::BodyLimit(
             "calendar sync token exceeds limit",
@@ -470,7 +498,25 @@ impl CalendarBackend for CalDavBackend {
             meter.release_transient(MAX_BODY_BYTES - text.capacity().min(MAX_BODY_BYTES));
             let text = String::from_utf8(text)
                 .map_err(|_| CalendarError::Parse("CalDAV response is not UTF-8".into()))?;
-            page_from_multistatus(&text, self.zone(), meter)
+            match page_from_multistatus(&text, self.zone(), meter) {
+                // A delta over the account's own budget (a bulk delete, a
+                // server re-stamping everything) would be refused again on
+                // every tick, because the cursor is — correctly — not
+                // advanced. The windowed full fetch is what the cache needs
+                // anyway, and it may well fit: try it once, under a fresh
+                // meter and the same absolute deadline.
+                Err(CalendarError::Admission(a)) if incremental && a.is_account_limit() => {
+                    drop(text);
+                    tracing::debug!(
+                        target: "thegn::calendar",
+                        "caldav delta exceeds the admission budget — falling back to a full fetch"
+                    );
+                    let mut meter = self.admission.meter();
+                    meter.reserve_transient(MAX_BODY_BYTES)?;
+                    self.fetch_full(from, to, deadline, meter).await
+                }
+                other => other,
+            }
         })
     }
 }

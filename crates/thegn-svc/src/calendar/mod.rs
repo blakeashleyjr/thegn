@@ -194,6 +194,12 @@ impl EventPage {
         deleted: Vec<String>,
         sync_token: String,
     ) -> Result<Self, CalendarError> {
+        // Every event and deletion handed over must have been admitted through
+        // this meter; a page is only as accounted as its lease.
+        debug_assert!(
+            meter.records() >= events.len() + deleted.len(),
+            "EventPage::from_meter given unadmitted data"
+        );
         meter.charge_retained(sync_token.len())?;
         Ok(EventPage {
             events,
@@ -241,6 +247,13 @@ impl EventPage {
     /// `(records, bytes)` this page holds reserved in its pool.
     pub fn reserved(&self) -> (usize, usize) {
         (self.lease.records(), self.lease.bytes())
+    }
+
+    /// Extend this page's reservation to cover `bytes` of data derived from it
+    /// while it is alive (the host's cache rows). Released with the page.
+    pub fn reserve_derived(&mut self, bytes: usize) -> Result<(), CalendarError> {
+        self.lease.reserve(0, bytes)?;
+        Ok(())
     }
 
     /// Stamp the account identity onto every event, charging the copies first.
@@ -408,11 +421,11 @@ impl CalendarRouter {
 
     /// Fetch every account, returning results **per account**.
     ///
-    /// One source failing must never discard another's data, so nothing is
-    /// merged here — the caller writes each account's cache independently.
-    /// Every page's lease is held until the returned vector is dropped; prefer
-    /// [`Self::list_events_each`] where results are applied one at a time.
-    pub async fn list_events(
+    /// Test-only: every page's lease is held until the returned vector is
+    /// dropped, so production uses [`Self::list_events_each`], which lets each
+    /// result be applied and released before the next account is fetched.
+    #[cfg(test)]
+    pub(crate) async fn list_events(
         &self,
         from: NaiveDate,
         to: NaiveDate,

@@ -30,7 +30,7 @@ pub use admission::{
 };
 pub use cursor::{CalCursor, CalNav};
 pub use grid::{DayCell, MonthGrid, WeekdayStyle, month_bounds, weekday_headers};
-pub use ics::{parse_ics, parse_ics_admitted};
+pub use ics::{parse_ics, parse_ics_admitted, parse_ics_window};
 pub use locale::{resolve_time_format, resolve_week_start};
 pub use recur::{ByDay, Freq, RRule, RecurError, Recurrence};
 pub use reminders::{DueReminder, next_event};

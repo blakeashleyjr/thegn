@@ -309,6 +309,26 @@ pub fn parse_ics_admitted(
     meter: &mut AdmissionMeter,
     out: &mut Vec<CalEvent>,
 ) -> Result<(), AdmissionError> {
+    parse_ics_window(input, default_zone, None, meter, out)
+}
+
+/// [`parse_ics_admitted`], admitting only events that can occur within
+/// `window` (inclusive dates, with a day of slack each side for zones).
+///
+/// A whole-document feed (a subscribed or local `.ics`) routinely carries
+/// years of history. Counting all of it against `max_events` would refuse
+/// calendars whose relevant part is small, so events that provably cannot
+/// touch the window — a one-off that ends before it or starts after it, a
+/// series whose `UNTIL` (plus the event's own length) ends before it — are
+/// parsed, released, and not admitted. Anything that might reach the window
+/// (a `COUNT` or open-ended rule, an RDATE inside it) is admitted.
+pub fn parse_ics_window(
+    input: &str,
+    default_zone: &str,
+    window: Option<(NaiveDate, NaiveDate)>,
+    meter: &mut AdmissionMeter,
+    out: &mut Vec<CalEvent>,
+) -> Result<(), AdmissionError> {
     let mut cur: Option<Builder> = None;
     // Nested non-VEVENT components inside the event being built (notably
     // VALARM, and VTIMEZONE's STANDARD/DAYLIGHT), so their properties don't
@@ -320,15 +340,17 @@ pub fn parse_ics_admitted(
     for raw in LogicalLines::new(input) {
         if raw.len() > MAX_LINE_BYTES {
             // Classify from the first physical line without unfolding.
-            let name = raw.name_hint().unwrap_or_default();
+            let hint = raw.name_hint();
             let in_event = cur.is_some();
             let in_alarm = nested.last().copied().unwrap_or(false);
-            let retained = if !in_event {
-                name == "X-WR-CALNAME"
-            } else if nested.is_empty() {
-                is_retained_property(&name)
-            } else {
-                in_alarm && name == "TRIGGER"
+            let retained = match hint.as_deref() {
+                _ if !in_event => hint.as_deref() == Some("X-WR-CALNAME"),
+                // Inside an event, a line whose name is itself folded can't be
+                // classified, and an oversized BEGIN/END would desynchronize
+                // the component stack if skipped — refuse rather than guess.
+                None | Some("BEGIN") | Some("END") => true,
+                Some(n) if nested.is_empty() => is_retained_property(n),
+                Some(n) => in_alarm && n == "TRIGGER",
             };
             if retained {
                 return Err(AdmissionError::new(if in_event {
@@ -354,6 +376,11 @@ pub fn parse_ics_admitted(
             }
             "END" if line.value.eq_ignore_ascii_case("VEVENT") => {
                 match cur.take() {
+                    Some(b) if window.is_some_and(|w| !b.may_occur_in(w)) => {
+                        // Parsed within the per-event ceilings, but outside
+                        // the sync window: released, never admitted.
+                        meter.abandon_event();
+                    }
                     Some(b) if b.start.is_some() => {
                         // The calendar name is copied into every event, and a
                         // synthesized UID is built — both are charged first.
@@ -481,7 +508,48 @@ struct Builder {
     extra: BTreeMap<String, String>,
 }
 
+/// The calendar date a time falls on (its local date; UTC for an instant).
+fn day_of(t: &EventTime) -> NaiveDate {
+    match t {
+        EventTime::Date { date } => *date,
+        EventTime::Zoned { local, .. } => local.date(),
+        EventTime::Instant { at } => at.date_naive(),
+    }
+}
+
 impl Builder {
+    /// Whether any occurrence of this event can touch `[from, to]`. Errs on
+    /// the side of "yes": only provably-outside events are excluded.
+    fn may_occur_in(&self, (from, to): (NaiveDate, NaiveDate)) -> bool {
+        let Some(start) = self.start.as_ref().map(day_of) else {
+            return false;
+        };
+        let lo = from.pred_opt().unwrap_or(from);
+        let hi = to.succ_opt().unwrap_or(to);
+        // The event's own length in days, so a long occurrence that starts
+        // before the window but ends inside it still counts.
+        let end = self.end.as_ref().map(day_of).unwrap_or_else(|| {
+            let extra = self.duration.map_or(0, |d| d.num_days()).max(0) + 1;
+            start
+                .checked_add_signed(chrono::Duration::days(extra))
+                .unwrap_or(NaiveDate::MAX)
+        });
+        let span = chrono::Duration::days((end - start).num_days().max(0));
+        let reaches =
+            |d: NaiveDate| d <= hi && d.checked_add_signed(span).unwrap_or(NaiveDate::MAX) >= lo;
+        if self.rdates.iter().any(|t| reaches(day_of(t))) || reaches(start) {
+            return true;
+        }
+        if self.rrules.is_empty() || start > hi {
+            return false;
+        }
+        // A rule only ends provably before the window through UNTIL.
+        self.rrules.iter().any(|r| match r.until {
+            None => true,
+            Some(u) => u.date().checked_add_signed(span).unwrap_or(NaiveDate::MAX) >= lo,
+        })
+    }
+
     /// Record one property, charging `meter` for what it retains first.
     fn property(
         &mut self,

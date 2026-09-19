@@ -550,3 +550,121 @@ fn the_fixture_wrapper_never_returns_a_truncated_calendar() {
     // Over the default budget: nothing rather than a prefix.
     assert!(parse_ics(&feed(AdmissionBudget::default().max_events() + 1), "UTC").is_empty());
 }
+
+fn windowed(input: &str, max: usize) -> (Result<(), AdmissionError>, Vec<CalEvent>) {
+    let mut meter = AdmissionMeter::isolated(AdmissionBudget::new(max).unwrap());
+    let mut out = Vec::new();
+    let r = parse_ics_window(
+        input,
+        "UTC",
+        Some((d(2026, 8, 1), d(2026, 8, 31))),
+        &mut meter,
+        &mut out,
+    );
+    // Nothing outside the window stays charged.
+    assert_eq!(meter.records(), out.len());
+    (r, out)
+}
+
+fn vevent(uid: &str, body: &str) -> String {
+    format!("BEGIN:VEVENT\r\nUID:{uid}\r\n{body}END:VEVENT\r\n")
+}
+
+#[test]
+fn whole_document_history_outside_the_window_is_not_admitted() {
+    // Years of past one-offs plus one event this month: only the one counts,
+    // so a long-history subscribed feed fits a small budget.
+    let mut doc = String::from("BEGIN:VCALENDAR\r\n");
+    for i in 0..5_000 {
+        doc.push_str(&vevent(
+            &format!("old{i}"),
+            "DTSTART:20200105T090000Z\r\nDTEND:20200105T100000Z\r\n",
+        ));
+    }
+    doc.push_str(&vevent("now", "DTSTART:20260821T090000Z\r\n"));
+    doc.push_str(&vevent("future", "DTSTART:20300101T090000Z\r\n"));
+    doc.push_str("END:VCALENDAR\r\n");
+    let (r, out) = windowed(&doc, 1);
+    r.unwrap();
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].uid, "now");
+}
+
+#[test]
+fn anything_that_can_reach_the_window_is_admitted() {
+    let doc = [
+        // An open-ended weekly series from years ago.
+        vevent("weekly", "DTSTART:20200106T090000Z\r\nRRULE:FREQ=WEEKLY\r\n"),
+        // A counted series: can't be ruled out without expanding it.
+        vevent("counted", "DTSTART:20200106T090000Z\r\nRRULE:FREQ=DAILY;COUNT=5\r\n"),
+        // A long event that started before the window and ends inside it.
+        vevent("long", "DTSTART;VALUE=DATE:20260701\r\nDTEND;VALUE=DATE:20260805\r\n"),
+        // An old event with an extra date inside the window.
+        vevent("rdate", "DTSTART:20200106T090000Z\r\nRDATE:20260815T090000Z\r\n"),
+        // A series whose UNTIL plus its length reaches into the window.
+        vevent(
+            "until-span",
+            "DTSTART;VALUE=DATE:20260601\r\nDTEND;VALUE=DATE:20260710\r\nRRULE:FREQ=MONTHLY;UNTIL=20260701T000000Z\r\n",
+        ),
+        // A one-off exactly on the edge (a day of zone slack).
+        vevent("edge", "DTSTART:20260731T233000Z\r\nDTEND:20260731T235900Z\r\n"),
+    ]
+    .concat();
+    let (r, out) = windowed(&doc, 10);
+    r.unwrap();
+    let uids: Vec<_> = out.iter().map(|e| e.uid.as_str()).collect();
+    assert_eq!(
+        uids,
+        ["weekly", "counted", "long", "rdate", "until-span", "edge"]
+    );
+}
+
+#[test]
+fn a_series_that_ended_before_the_window_is_not_admitted() {
+    let doc = [
+        vevent(
+            "ended",
+            "DTSTART:20200106T090000Z\r\nRRULE:FREQ=WEEKLY;UNTIL=20210101T000000Z\r\n",
+        ),
+        vevent(
+            "starts-later",
+            "DTSTART:20300106T090000Z\r\nRRULE:FREQ=WEEKLY\r\n",
+        ),
+        vevent("no-start", "SUMMARY:x\r\n"),
+    ]
+    .concat();
+    let (r, out) = windowed(&doc, 1);
+    r.unwrap();
+    assert!(out.is_empty());
+}
+
+#[test]
+fn an_oversized_line_with_a_folded_name_is_refused_inside_an_event() {
+    // `DESCRIP` + fold + `TION:…`: the name can't be read from the first
+    // physical line, so the line is refused rather than guessed skippable.
+    let mut line = String::from("DESCRIP\r\n TION:");
+    for _ in 0..(MAX_LINE_BYTES / 70 + 2) {
+        line.push_str(&"y".repeat(70));
+        line.push_str("\r\n ");
+    }
+    let doc = format!("BEGIN:VEVENT\r\nDTSTART:20260821T090000Z\r\n{line}\r\nEND:VEVENT\r\n");
+    assert_eq!(
+        admitted(&doc, 10).0.unwrap_err().limit,
+        AdmissionLimit::EventBytes
+    );
+    // An oversized BEGIN inside an event would desynchronize the component
+    // stack if skipped; refused too.
+    let doc = format!(
+        "BEGIN:VEVENT\r\nDTSTART:20260821T090000Z\r\nBEGIN:VALARM\r\nBEGIN:{}\r\nEND:VALARM\r\nEND:VEVENT\r\n",
+        "X".repeat(MAX_LINE_BYTES + 1)
+    );
+    assert_eq!(
+        admitted(&doc, 10).0.unwrap_err().limit,
+        AdmissionLimit::EventBytes
+    );
+    // Outside any event the same shapes are skipped harmlessly.
+    let doc = format!("{line}\r\n{}", feed(1));
+    let (r, out) = admitted(&doc, 10);
+    r.unwrap();
+    assert_eq!(out.len(), 1);
+}

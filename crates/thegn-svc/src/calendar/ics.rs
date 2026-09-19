@@ -52,11 +52,13 @@ impl IcsBackend {
         self
     }
 
-    /// Read one file under the document budget, reserving it as transient
-    /// before its bytes are allocated, then parse it into `out`.
+    /// Read one file under the document budget, reserving the document
+    /// ceiling as transient before any byte is allocated, then parse the
+    /// events that can occur in `window` into `out`.
     fn read_one(
         path: &std::path::Path,
         zone: &str,
+        window: (NaiveDate, NaiveDate),
         meter: &mut AdmissionMeter,
         out: &mut Vec<CalEvent>,
     ) -> Result<(), ReadFailure> {
@@ -68,34 +70,33 @@ impl IcsBackend {
                 AdmissionLimit::DocumentBytes,
             )));
         }
-        // Reserve the file as declared; a file that grows while being read is
-        // still stopped at the document cap by `take`.
+        // Reserve the ceiling, not the declared size: a file that grows while
+        // being read (or a pseudo-file declaring 0) is still bounded by it,
+        // and `read_capped` never allocates past it.
         meter
             .reserve_transient(MAX_SOURCE_DOCUMENT_BYTES)
             .map_err(ReadFailure::Admission)?;
-        let mut body = Vec::with_capacity(declared);
-        let read = file
-            .take(MAX_SOURCE_DOCUMENT_BYTES as u64 + 1)
-            .read_to_end(&mut body);
-        let result = match read {
+        let result = match read_capped(file, declared, MAX_SOURCE_DOCUMENT_BYTES) {
             Err(e) => Err(ReadFailure::Io(e)),
-            Ok(n) if n > MAX_SOURCE_DOCUMENT_BYTES => Err(ReadFailure::Admission(
-                AdmissionError::new(AdmissionLimit::DocumentBytes),
-            )),
-            Ok(_) => match String::from_utf8(body) {
+            Ok(None) => Err(ReadFailure::Admission(AdmissionError::new(
+                AdmissionLimit::DocumentBytes,
+            ))),
+            Ok(Some(body)) => match String::from_utf8(body) {
                 Err(e) => Err(ReadFailure::Io(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     e.utf8_error(),
                 ))),
-                Ok(text) => thegn_core::calendar::parse_ics_admitted(&text, zone, meter, out)
-                    .map_err(ReadFailure::Admission),
+                Ok(text) => {
+                    thegn_core::calendar::parse_ics_window(&text, zone, Some(window), meter, out)
+                        .map_err(ReadFailure::Admission)
+                }
             },
         };
         meter.release_transient(MAX_SOURCE_DOCUMENT_BYTES);
         result
     }
 
-    fn read_all(&self) -> Result<EventPage, CalendarError> {
+    fn read_all(&self, window: (NaiveDate, NaiveDate)) -> Result<EventPage, CalendarError> {
         let p = std::path::Path::new(&self.path);
         if !p.exists() {
             // A missing file is configuration, not a blip — see
@@ -110,7 +111,7 @@ impl IcsBackend {
         let mut meter = self.admission.meter();
         let mut out = Vec::new();
         if p.is_file() {
-            match Self::read_one(p, zone, &mut meter, &mut out) {
+            match Self::read_one(p, zone, window, &mut meter, &mut out) {
                 Ok(()) => {}
                 Err(ReadFailure::Io(e)) => {
                     return Err(CalendarError::Io(format!("{}: {e}", self.path)));
@@ -126,7 +127,7 @@ impl IcsBackend {
             if path.extension().and_then(|e| e.to_str()) != Some("ics") {
                 continue;
             }
-            match Self::read_one(&path, zone, &mut meter, &mut out) {
+            match Self::read_one(&path, zone, window, &mut meter, &mut out) {
                 Ok(()) => {}
                 // One unreadable file in a vdir must not lose the other hundred.
                 Err(ReadFailure::Io(e)) => tracing::debug!(
@@ -144,6 +145,37 @@ impl IcsBackend {
     }
 }
 
+/// Read at most `limit` bytes; `Ok(None)` when the source holds more.
+///
+/// Growth is explicit and capped, so the buffer's capacity never exceeds
+/// `limit` even for a file that declared a smaller size (or none — a
+/// pseudo-file) and kept growing; `read_to_end`'s doubling could reach twice
+/// the cap.
+fn read_capped(
+    mut r: impl Read,
+    declared: usize,
+    limit: usize,
+) -> std::io::Result<Option<Vec<u8>>> {
+    let mut body: Vec<u8> = Vec::with_capacity(declared.min(limit));
+    let mut chunk = [0u8; 64 * 1024];
+    loop {
+        let n = match r.read(&mut chunk) {
+            Ok(0) => return Ok(Some(body)),
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        if body.len() + n > limit {
+            return Ok(None);
+        }
+        if body.capacity() - body.len() < n {
+            let grown = (body.capacity().max(64 * 1024) * 2).min(limit);
+            body.reserve_exact(grown.max(body.len() + n) - body.len());
+        }
+        body.extend_from_slice(&chunk[..n]);
+    }
+}
+
 impl CalendarBackend for IcsBackend {
     fn provider_id(&self) -> &'static str {
         "ics"
@@ -155,16 +187,16 @@ impl CalendarBackend for IcsBackend {
 
     fn list_events<'a>(
         &'a self,
-        _from: NaiveDate,
-        _to: NaiveDate,
+        from: NaiveDate,
+        to: NaiveDate,
         _sync_token: &'a str,
     ) -> BoxFuture<'a, Result<EventPage, CalendarError>> {
         Box::pin(async move {
-            // Deliberately returns everything rather than pre-filtering by the
-            // window: recurrence masters can sit far outside it and still produce
-            // occurrences inside, so the host expands and filters. The account's
-            // admission budget bounds how much "everything" can be.
-            self.read_all()
+            // Admits every event that can occur in the window — including
+            // recurrence masters that start far before it — and releases the
+            // provably-outside history, so `max_events` counts what the sync
+            // horizon needs. The host expands and filters.
+            self.read_all((from, to))
         })
     }
 }

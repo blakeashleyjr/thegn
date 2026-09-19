@@ -2169,14 +2169,223 @@ fn a_truncated_plugin_run_is_an_error_not_a_partial_page() {
 }
 
 #[test]
-fn an_invalid_event_list_is_dropped_whole_and_uncharged() {
-    let page = plugin_with(
+fn a_malformed_plugin_page_fails_the_whole_run() {
+    // A bad element in a later page must not publish the earlier pages as if
+    // they were the whole calendar.
+    let good = format!(r#"{{"method":"events","params":{{"events":[{PLUGIN_EVENT}]}}}}"#);
+    let bad =
+        format!(r#"{{"method":"events","params":{{"events":[{PLUGIN_EVENT},{{"bogus":1}}]}}}}"#);
+    let err = plugin_with(10, &format!("echo '{good}'; echo '{bad}'")).unwrap_err();
+    assert!(matches!(err, CalendarError::Parse(_)), "{err:?}");
+    // A non-string deletion is malformed too, not silently dropped.
+    let err = plugin_with(
         10,
-        &format!(
-            r#"echo '{{"method":"events","params":{{"events":[{PLUGIN_EVENT},{{"bogus":1}}]}}}}'"#
-        ),
+        r#"echo '{"method":"events","params":{"deleted":["a",7]}}'"#,
     )
-    .unwrap();
-    assert!(page.events().is_empty());
-    assert_eq!(page.reserved().0, 0);
+    .unwrap_err();
+    assert!(matches!(err, CalendarError::Parse(_)), "{err:?}");
+    // The error never quotes plugin data.
+    let err = plugin_with(
+        10,
+        r#"echo '{"method":"events","params":{"events":[{"uid":"secret-value"}]}}'"#,
+    )
+    .unwrap_err();
+    assert!(!err.to_string().contains("secret-value"), "{err}");
+}
+
+#[test]
+fn a_line_of_tiny_elements_is_refused_without_building_them_all() {
+    use thegn_core::calendar::AdmissionLimit;
+    // ~1 MiB of `{}` elements: decoded one at a time, so the first bad one
+    // ends the run (no intermediate tree of 100k+ values)…
+    // (Generated in the shell: a script argument over 128 KiB can't be exec'd.)
+    let script = r#"printf '{"method":"events","params":{"events":['
+        yes '{},' | head -n 150000 | tr -d '\n'
+        printf '{}]}}\n'"#;
+    let err = plugin_with(10, script).unwrap_err();
+    assert!(matches!(err, CalendarError::Parse(_)), "{err:?}");
+    // …and valid-but-too-many elements stop at the budget.
+    let events = [PLUGIN_EVENT; 50].join(",");
+    let script = format!(r#"echo '{{"method":"events","params":{{"events":[{events}]}}}}'"#);
+    let err = plugin_with(10, &script).unwrap_err();
+    assert!(
+        is_admission(&err, AdmissionLimit::AccountRecords),
+        "{err:?}"
+    );
+    // Exactly at the budget is fine, including the end-of-array probe.
+    let events = [PLUGIN_EVENT; 10].join(",");
+    let script = format!(r#"echo '{{"method":"events","params":{{"events":[{events}]}}}}'"#);
+    assert_eq!(plugin_with(10, &script).unwrap().events().len(), 10);
+}
+
+#[test]
+fn an_over_budget_plugin_delta_falls_back_to_a_full_fetch() {
+    // With a token the plugin replies with a delta too big for the budget;
+    // without one, a small snapshot. The account must not be wedged on the
+    // delta forever.
+    let script = format!(
+        r#"if [ -n "$THEGN_CAL_SYNC_TOKEN" ]; then
+             echo '{{"method":"events","params":{{"deleted":["a","b","c","d","e"],"sync_token":"t2"}}}}'
+           else
+             echo '{{"method":"events","params":{{"events":[{PLUGIN_EVENT}],"sync_token":"full"}}}}'
+           fi"#
+    );
+    let b = command::CommandBackend::new(&command_account(&script), budget_of(3));
+    let (from, to) = window();
+    let page = block_on(b.list_events(from, to, "t1")).unwrap();
+    assert_eq!(page.events().len(), 1);
+    assert!(page.deleted().is_empty());
+    assert_eq!(page.sync_token(), "full");
+}
+
+#[tokio::test]
+async fn an_over_budget_caldav_delta_falls_back_to_a_full_fetch() {
+    use axum::response::IntoResponse;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    // First REPORT (sync-collection) returns a bulk delete bigger than the
+    // budget; the fallback calendar-query returns the small current state.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let hits = std::sync::Arc::new(AtomicUsize::new(0));
+    let seen = hits.clone();
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            axum::Router::new().fallback(axum::routing::any(move || {
+                let seen = seen.clone();
+                async move {
+                    let body = if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+                        multistatus(0, 50)
+                    } else {
+                        multistatus(2, 0).replace("<d:sync-token>tok-next</d:sync-token>", "")
+                    };
+                    (
+                        axum::http::StatusCode::MULTI_STATUS,
+                        [("content-type", "application/xml")],
+                        body,
+                    )
+                        .into_response()
+                }
+            })),
+        )
+        .await
+        .unwrap();
+    });
+    let acct = CalendarAccount {
+        url: format!("http://{address}/cal/"),
+        allow_private_network: true,
+        ..account("dav", CalendarProviderKind::CalDav)
+    };
+    let pool = AdmissionPool::new(1_000, 128 << 20);
+    let backend = caldav::CalDavBackend::new(
+        &acct,
+        AccountAdmission::new(AdmissionBudget::new(10).unwrap(), pool.clone()),
+    );
+    let (from, to) = window();
+    let page = backend.list_events(from, to, "tok-prev").await.unwrap();
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        2,
+        "exactly one fallback REPORT"
+    );
+    assert_eq!(page.events().len(), 2);
+    // A full fetch: no cursor, so the host replaces the cache wholesale.
+    assert!(page.sync_token().is_empty());
+    // Only the page is held: the refused delta and both bodies are released.
+    assert_eq!(pool.in_use(), page.reserved());
+    drop(page);
+    assert_eq!(pool.in_use(), (0, 0));
+    server.abort();
+}
+
+#[tokio::test]
+async fn caldav_token_recovery_releases_every_reservation() {
+    use axum::response::IntoResponse;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let hits = std::sync::Arc::new(AtomicUsize::new(0));
+    let seen = hits.clone();
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            axum::Router::new().fallback(axum::routing::any(move || {
+                let seen = seen.clone();
+                async move {
+                    if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+                        return (axum::http::StatusCode::CONFLICT, "").into_response();
+                    }
+                    (
+                        axum::http::StatusCode::MULTI_STATUS,
+                        [("content-type", "application/xml")],
+                        multistatus(3, 0),
+                    )
+                        .into_response()
+                }
+            })),
+        )
+        .await
+        .unwrap();
+    });
+    let acct = CalendarAccount {
+        url: format!("http://{address}/cal/"),
+        allow_private_network: true,
+        ..account("dav", CalendarProviderKind::CalDav)
+    };
+    let pool = AdmissionPool::new(1_000, 128 << 20);
+    let backend = caldav::CalDavBackend::new(
+        &acct,
+        AccountAdmission::new(AdmissionBudget::default(), pool.clone()),
+    );
+    let (from, to) = window();
+    let page = backend.list_events(from, to, "expired").await.unwrap();
+    assert_eq!(page.events().len(), 3);
+    assert_eq!(pool.in_use(), page.reserved());
+    drop(page);
+    assert_eq!(pool.in_use(), (0, 0));
+    server.abort();
+}
+
+#[tokio::test]
+async fn a_long_history_feed_only_counts_the_sync_window() {
+    // A subscribed feed with years of history: previously accepted in full,
+    // it must not now be refused just because the history is long.
+    let mut feed = String::from("BEGIN:VCALENDAR\r\n");
+    for i in 0..3_000 {
+        feed.push_str(&format!(
+            "BEGIN:VEVENT\r\nUID:old{i}\r\nDTSTART:20190301T090000Z\r\nEND:VEVENT\r\n"
+        ));
+    }
+    feed.push_str(
+        "BEGIN:VEVENT\r\nUID:now\r\nDTSTART:20260821T090000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+    );
+    let (address, _hits, server) =
+        serve_fixed(axum::http::StatusCode::OK, "text/calendar", feed).await;
+    let acct = CalendarAccount {
+        url: format!("http://{address}/feed.ics"),
+        allow_private_network: true,
+        ..account("u", CalendarProviderKind::IcsUrl)
+    };
+    let (from, to) = window();
+    let page = ics_url::IcsUrlBackend::new(&acct, budget_of(10))
+        .list_events(from, to, "")
+        .await
+        .unwrap();
+    assert_eq!(page.events().len(), 1);
+    assert_eq!(page.events()[0].uid, "now");
+    server.abort();
+}
+
+#[test]
+fn caldav_unescaping_is_single_pass_and_sized_before_it_runs() {
+    let xml = "<multistatus><response><href>/a&amp;b.ics</href><calendar-data>A &amp;amp; &lt;b&gt; &quot;c&quot; &apos;d&apos; &bogus;</calendar-data></response></multistatus>";
+    let (r, _) = caldav::parse_multistatus(xml);
+    assert_eq!(r[0].href, "/a&b.ics");
+    assert_eq!(r[0].ics, "A &amp; <b> \"c\" 'd' &bogus;");
+    // An enormous escaped href is refused on its raw size.
+    let huge = format!(
+        "<multistatus><response><href>&amp;{}</href></response></multistatus>",
+        "x".repeat(crate::http::MAX_REQUEST_BYTES)
+    );
+    assert!(caldav::parse_multistatus(&huge).0.is_empty());
 }
