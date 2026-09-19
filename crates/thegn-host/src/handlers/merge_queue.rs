@@ -968,6 +968,11 @@ fn add_worktree(cfg: &Config, wt: &Path) -> String {
     let Some(root) = integrate::main_checkout(wt) else {
         return "Add failed: not inside a git repository".into();
     };
+    // THE-515: rows enqueued under a refused overlay would be keyed to the
+    // global target branch; refuse like `thegn merge add`.
+    if let Some(refusal) = cfg.workspace_overlay_refusal(&root) {
+        return format!("Add refused: {refusal}");
+    }
     // Resolved HERE, off the event loop: the per-repo layer needs the repo root,
     // and deriving the workspace slug shells out to git.
     let mq = &cfg.repo_merge_queue(&root);
@@ -1001,6 +1006,9 @@ fn add_all(cfg: &Config, any_path: &Path) -> String {
     let Some(root) = integrate::main_checkout(any_path) else {
         return "Add failed: not inside a git repository".into();
     };
+    if let Some(refusal) = cfg.workspace_overlay_refusal(&root) {
+        return format!("Add refused: {refusal}");
+    }
     let mq = &cfg.repo_merge_queue(&root);
     let target = integrate::resolve_target(mq, &root);
     let cands = match integrate::candidate_branches(mq, &root, &target) {

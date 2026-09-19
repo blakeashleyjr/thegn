@@ -23,11 +23,16 @@ All notable changes to **thegn** are documented here. The format follows
   `repo trust` print the refusal.
 - **Migration:** rename a non-normalized key to the slug the error names, and
   keep exactly one block per slug. A repo whose name has no slug (`___`,
-  non-ASCII-only) no longer inherits `[project.repo]`, and the generated tab
-  names (`repo`, `foo-2`) no longer select the account / env-bundle block that
-  shares their spelling. Two registered checkouts with the same name refuse
-  that name's account / env-bundle block until one is removed (binding blocks to
-  the canonical repository identity is the next step).
+  non-ASCII-only) no longer inherits `[project.repo]`, and a generated tab name
+  (`repo`, `foo-2`) never selects the block that shares its spelling: the
+  account / env-bundle block is chosen by the repository's own directory name.
+  When two LIVE checkouts with the same name are registered (stale registrations,
+  plain folders, linked worktrees and a second spelling of the same checkout
+  don't count), that name's accounts / env bundle are refused and agent launches
+  there stop with the reason; shells always launch. Rename or delete the other
+  checkout to recover (binding blocks to the canonical repository identity is
+  the next step). Landed-worktree sweeps and review-agent handoffs also stop
+  under a refused block instead of using the global policy.
 
 ### Fixed — a project no longer resumes in a terminal
 

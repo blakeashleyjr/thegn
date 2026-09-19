@@ -65,6 +65,11 @@ pub(crate) fn handle(cfg: &Config, context: &HandleContext) -> String {
     }
     let root = crate::integrate::main_checkout(Path::new(&task.worktree_path))
         .unwrap_or_else(|| Path::new(&task.worktree_path).to_path_buf());
+    // THE-515: never dispatch a review agent with the global agent command in
+    // place of a refused trusted block's.
+    if let Some(refusal) = cfg.workspace_overlay_refusal(&root) {
+        return format!("review handoff refused: {refusal}");
+    }
     let queue = cfg.repo_pr_queue(&root);
     let loc = GitLoc::for_worktree(Path::new(&task.worktree_path));
     let forges = crate::forge_handle::get();

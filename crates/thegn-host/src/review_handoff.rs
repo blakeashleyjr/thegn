@@ -77,6 +77,15 @@ pub(crate) fn target(session: &Session, panes: &Panes, cfg: &Config) -> PaneTarg
     if let Some(id) = live_agent_pane(session, panes, cfg) {
         return PaneTarget::Live(id);
     }
+    // THE-515: a refused trusted overlay never falls back to the global
+    // agent command for a NEW headless agent (a live pane the user already
+    // started is fine — nothing new is launched).
+    if session
+        .repo_root()
+        .is_some_and(|root| cfg.workspace_overlay(root).is_refused())
+    {
+        return PaneTarget::None;
+    }
     let queue = review_queue(session, cfg);
     headless_target(cfg, &queue)
 }
@@ -291,6 +300,21 @@ mod tests {
             review_queue(&session, &cfg).agent_command,
             "workspace-agent {prompt}"
         );
+    }
+
+    #[test]
+    fn refused_overlay_never_dispatches_a_headless_reviewer() {
+        let mut cfg = Config::default();
+        cfg.pr_queue.agent_command = "global-agent {prompt}".into();
+        cfg.workspace.insert("widget".into(), Default::default());
+        cfg.workspace.insert("Widget".into(), Default::default());
+        let session = Session {
+            id: "/src/widget".into(),
+            ..Session::default()
+        };
+        let (tx, _rx) = tokio::sync::mpsc::channel::<crate::pane::PaneEvent>(16);
+        let panes = Panes::new(tx);
+        assert_eq!(target(&session, &panes, &cfg), PaneTarget::None);
     }
 
     #[test]

@@ -48,13 +48,9 @@ pub enum OverlayRefusal {
     /// The only candidate block is spelled `key`, which is not in normalized
     /// form; it must be renamed to `canonical` to take effect.
     NonCanonicalKey { key: String, canonical: String },
-    /// A tab-namespace slug that is not the repository's own key: the `repo`
-    /// fallback for a nameless repository, or a `-N` collision suffix. Such a
-    /// slug never selects the block that happens to share its spelling.
-    SyntheticTabSlug { slug: String, repository: String },
-    /// Several registered repositories share the legacy key, so the block
-    /// cannot tell them apart until it is bound to a canonical repository
-    /// identity. `repositories` is sorted.
+    /// Several LIVE main checkouts at different canonical locations share the
+    /// legacy key, so the block cannot tell them apart until it is bound to a
+    /// canonical repository identity. `repositories` is sorted.
     AmbiguousRepositories {
         key: String,
         repositories: Vec<String>,
@@ -82,16 +78,12 @@ impl fmt::Display for OverlayRefusal {
                 "trusted [project.{key}] overlay refused: key is not in normalized form; \
                  rename the block to `{canonical}`"
             ),
-            Self::SyntheticTabSlug { slug, repository } => write!(
-                f,
-                "trusted [project.{slug}] overlay refused for {repository}: `{slug}` is a \
-                 generated tab name, not that repository's own key"
-            ),
             Self::AmbiguousRepositories { key, repositories } => write!(
                 f,
-                "trusted [project.{key}] overlay refused: registered repositories {} all map to \
-                 `{key}`; remove the duplicate registration or rename a checkout",
-                repositories.join(", ")
+                "trusted [project.{key}] overlay refused: {} are separate checkouts all named \
+                 `{key}`, and the block cannot tell them apart yet. Rename or delete the checkout \
+                 the block is NOT for (it stops counting as soon as it is gone)",
+                repositories.join(" and ")
             ),
             Self::RegistryUnavailable { key } => write!(
                 f,
@@ -200,34 +192,41 @@ pub fn refusal(table: &OverlayTable, key: &str) -> Option<OverlayRefusal> {
     }
 }
 
-/// Extra refusal for a TAB-namespace slug (`repo_slugs`), given every
-/// registered `(repo_path, slug)` row. Refuses — never grants — when the slug
-/// is not the repository's own legacy key (`repo` fallback, `-N` suffix), or
-/// when another registered repository derives the same key. A slug with no
-/// registered row adds nothing.
-pub fn tab_slug_refusal(slug: &str, rows: &[(String, String)]) -> Option<OverlayRefusal> {
-    let (path, _) = rows.iter().find(|(_, s)| s == slug)?;
-    // Compare normalized forms: a registry row may hold the raw basename
-    // (`My.Repo`), which is that repository's own key once normalized.
-    let key = legacy_key_for_name(slug);
-    let own = legacy_key_for_root(Path::new(path));
-    if key.is_none() || own != key {
-        return Some(OverlayRefusal::SyntheticTabSlug {
-            slug: slug.to_string(),
-            repository: path.clone(),
-        });
+/// The repository path the registry (`repo_slugs`) records for a tab slug.
+pub fn registered_path<'r>(slug: &str, rows: &'r [(String, String)]) -> Option<&'r str> {
+    rows.iter()
+        .find(|(_, s)| s == slug)
+        .map(|(path, _)| path.as_str())
+}
+
+/// Other registered repositories that derive the same legacy `key` as `own`
+/// AND are live main checkouts at a different canonical location. `live`
+/// returns a path's canonical location iff it is a live main checkout (the
+/// caller's filesystem probe), so stale rows (removed clones, dir workspaces,
+/// linked worktrees) and two spellings of one checkout (symlink, `/tmp` vs
+/// `/private/tmp`) never count. Sorted, deduplicated by canonical location.
+pub fn live_duplicates(
+    key: &str,
+    own: &str,
+    rows: &[(String, String)],
+    live: impl Fn(&str) -> Option<std::path::PathBuf>,
+) -> Vec<String> {
+    let own_canonical = live(own).unwrap_or_else(|| std::path::PathBuf::from(own));
+    let mut seen = std::collections::BTreeSet::new();
+    let mut out: Vec<String> = Vec::new();
+    for (path, _) in rows {
+        if path == own || legacy_key_for_root(Path::new(path)).as_deref() != Some(key) {
+            continue;
+        }
+        let Some(canonical) = live(path) else {
+            continue;
+        };
+        if canonical != own_canonical && seen.insert(canonical) {
+            out.push(path.clone());
+        }
     }
-    let mut repositories: Vec<String> = rows
-        .iter()
-        .filter(|(p, _)| legacy_key_for_root(Path::new(p)) == key)
-        .map(|(p, _)| p.clone())
-        .collect();
-    repositories.sort();
-    repositories.dedup();
-    (repositories.len() > 1).then(|| OverlayRefusal::AmbiguousRepositories {
-        key: key.unwrap_or_default(),
-        repositories,
-    })
+    out.sort();
+    out
 }
 
 /// Whether any block that normalizes to `key` carries credential authority
@@ -371,37 +370,36 @@ mod tests {
     }
 
     #[test]
-    fn synthetic_and_shared_tab_slugs_are_refused() {
-        // A nameless repository's `repo` fallback.
-        let r = rows(&[("/src/日本語", "repo"), ("/src/repo", "repo-2")]);
-        assert!(matches!(
-            tab_slug_refusal("repo", &r),
-            Some(OverlayRefusal::SyntheticTabSlug { .. })
-        ));
-        // A `-N` suffix is not the second repository's key...
-        let r = rows(&[("/a/foo", "foo"), ("/b/foo", "foo-2")]);
-        assert!(matches!(
-            tab_slug_refusal("foo-2", &r),
-            Some(OverlayRefusal::SyntheticTabSlug { .. })
-        ));
-        // ...and the first registration does not win the shared key either.
-        match tab_slug_refusal("foo", &r) {
-            Some(OverlayRefusal::AmbiguousRepositories { repositories, .. }) => {
-                assert_eq!(
-                    repositories,
-                    vec!["/a/foo".to_string(), "/b/foo".to_string()]
-                );
-            }
-            other => panic!("expected ambiguity, got {other:?}"),
-        }
-        // A unique, own-key slug and an unregistered slug add nothing.
-        let r = rows(&[("/a/foo", "foo"), ("/b/app-2", "app-2")]);
-        assert_eq!(tab_slug_refusal("foo", &r), None);
-        assert_eq!(tab_slug_refusal("app-2", &r), None);
-        assert_eq!(tab_slug_refusal("other", &r), None);
-        // A raw-basename registry slug is the repository's own key.
-        let r = rows(&[("/a/My.Repo", "My.Repo")]);
-        assert_eq!(tab_slug_refusal("My.Repo", &r), None);
+    fn only_live_distinct_checkouts_count_as_duplicates() {
+        let r = rows(&[
+            ("/code/foo", "foo-2"),
+            ("/tmp/foo", "foo"),
+            ("/private/tmp/foo", "foo-3"),
+            ("/gone/foo", "foo-4"),
+            ("/code/bar", "bar"),
+        ]);
+        assert_eq!(registered_path("foo-2", &r), Some("/code/foo"));
+        assert_eq!(registered_path("nope", &r), None);
+        // /tmp/foo and /private/tmp/foo are one checkout; /gone/foo is stale.
+        let live = |p: &str| match p {
+            "/code/foo" => Some(std::path::PathBuf::from("/code/foo")),
+            "/tmp/foo" | "/private/tmp/foo" => Some(std::path::PathBuf::from("/private/tmp/foo")),
+            "/code/bar" => Some(std::path::PathBuf::from("/code/bar")),
+            _ => None,
+        };
+        // One live duplicate, reported once (the first registry spelling).
+        assert_eq!(
+            live_duplicates("foo", "/code/foo", &r, live),
+            vec!["/tmp/foo".to_string()]
+        );
+        // Only a stale row besides us: nothing counts.
+        let stale = |p: &str| (p == "/code/foo").then(|| std::path::PathBuf::from(p));
+        assert!(live_duplicates("foo", "/code/foo", &r, stale).is_empty());
+        // A second spelling of our OWN checkout is not a duplicate.
+        let same = |p: &str| {
+            matches!(p, "/code/foo" | "/tmp/foo").then(|| std::path::PathBuf::from("/code/foo"))
+        };
+        assert!(live_duplicates("foo", "/code/foo", &r, same).is_empty());
     }
 
     #[test]

@@ -988,6 +988,20 @@ impl Default for MergeQueueConfig {
     }
 }
 
+/// A registered path's canonical location iff it is a live MAIN checkout (a
+/// `.git` directory, or a bare `*.git` repository). Linked worktrees (`.git`
+/// file), plain dir workspaces and removed clones are not repositories that
+/// can make a trusted block ambiguous. Metadata-only; no Git subprocess.
+fn live_main_checkout(path: &str) -> Option<std::path::PathBuf> {
+    let path = Path::new(path);
+    let is_main = path.join(".git").is_dir()
+        || (path.extension().is_some_and(|ext| ext == "git") && path.join("HEAD").is_file());
+    if !is_main {
+        return None;
+    }
+    std::fs::canonicalize(path).ok()
+}
+
 /// The legacy `[workspace.<slug>]` label for a repo, for display and UI
 /// scoping only (runs `git rev-parse --show-toplevel`, with a `"repo"`
 /// fallback).
@@ -6571,6 +6585,8 @@ impl Config {
             crate::workspace_overlay::WorkspaceOverlay::Refused(_) => {
                 mq.enabled = false;
                 mq.auto_land = false;
+                // Keep landed worktrees: the refused block may have said so.
+                mq.on_landed = OnLanded::Off;
             }
             _ => {}
         }
@@ -6605,10 +6621,18 @@ impl Config {
 
     /// The trusted overlay for a TAB-namespace slug (`repo_slugs`, the key the
     /// account / env-bundle consumers still carry until the RepositoryId
-    /// binding lands). Same as [`Self::workspace_overlay_for_key`], plus a
-    /// refusal when the registry shows the slug is synthetic (`repo`, `-N`)
-    /// or shared by several registered repositories. The registry is only
-    /// ever used to refuse; an unreadable registry refuses too.
+    /// binding lands).
+    ///
+    /// The slug itself is never the key: the registry maps it to the
+    /// repository path it was issued for, and the overlay is selected by that
+    /// path's own legacy key — so the `repo` fallback and `-N` collision
+    /// suffixes never select a block that merely shares their spelling, and a
+    /// `-2` tab of a correctly configured repo still gets its own block. The
+    /// registry is a cache (stale rows, several spellings of one checkout), so
+    /// it is used only to REFUSE, and only when another row is a live main
+    /// checkout at a different canonical location deriving the same key. An
+    /// unregistered slug falls back to the plain key; an unreadable registry
+    /// refuses only if a block would otherwise apply.
     pub fn workspace_overlay_for_tab_slug(
         &self,
         db: &crate::db::Db,
@@ -6616,19 +6640,42 @@ impl Config {
     ) -> crate::workspace_overlay::WorkspaceOverlay<'_> {
         use crate::store::WorkspaceStore;
         use crate::workspace_overlay::{OverlayRefusal, WorkspaceOverlay};
-        let base = self.workspace_overlay_for_key(slug);
+        if self.workspace.is_empty() {
+            return WorkspaceOverlay::Unconfigured;
+        }
+        let rows = match db.repo_slug_rows() {
+            Ok(rows) => rows,
+            Err(_) => {
+                let base = self.workspace_overlay_for_key(slug);
+                return match base {
+                    WorkspaceOverlay::Selected { .. } => {
+                        WorkspaceOverlay::Refused(OverlayRefusal::RegistryUnavailable {
+                            key: slug.to_string(),
+                        })
+                    }
+                    other => other,
+                };
+            }
+        };
+        let Some(path) = crate::workspace_overlay::registered_path(slug, &rows) else {
+            return self.workspace_overlay_for_key(slug);
+        };
+        let Some(key) = crate::workspace_overlay::legacy_key_for_root(Path::new(path)) else {
+            return WorkspaceOverlay::Unconfigured;
+        };
+        let base = self.workspace_overlay_for_key(&key);
         if !matches!(base, WorkspaceOverlay::Selected { .. }) {
             return base;
         }
-        match db.repo_slug_rows() {
-            Ok(rows) => match crate::workspace_overlay::tab_slug_refusal(slug, &rows) {
-                Some(refusal) => WorkspaceOverlay::Refused(refusal),
-                None => base,
-            },
-            Err(_) => WorkspaceOverlay::Refused(OverlayRefusal::RegistryUnavailable {
-                key: slug.to_string(),
-            }),
+        let duplicates =
+            crate::workspace_overlay::live_duplicates(&key, path, &rows, live_main_checkout);
+        if duplicates.is_empty() {
+            return base;
         }
+        let mut repositories = duplicates;
+        repositories.push(path.to_string());
+        repositories.sort();
+        WorkspaceOverlay::Refused(OverlayRefusal::AmbiguousRepositories { key, repositories })
     }
 
     /// The refusal for a repository's trusted overlay, if selection is
