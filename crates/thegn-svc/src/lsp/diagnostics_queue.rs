@@ -462,6 +462,43 @@ impl DiagnosticsSender {
 
     /// Record health findings (no-op for an empty report, so routine traffic
     /// never manufactures wakes).
+    /// A publication for this stream arrived but could not be projected at
+    /// all (it failed the JSON bounds). With the document known, any older
+    /// pending value for it is superseded and the document is marked lost;
+    /// without it, the whole stream is marked lost. Either way the host never
+    /// presents the previous state as current.
+    pub fn mark_lost(&self, root: &Path, identity: &str, generation: u64, path: Option<&str>) {
+        let Some(mut state) = self.shared.lock() else {
+            return;
+        };
+        let notify = &self.shared.notify;
+        if !state.is_current(root, identity, generation) {
+            state.health.stale = state.health.stale.saturating_add(1);
+            state.signal(notify);
+            return;
+        }
+        state.health.dropped = state.health.dropped.saturating_add(1);
+        match path.filter(|path| !path.is_empty() && path.len() <= limits::MAX_IDENTITY_BYTES) {
+            Some(path) => {
+                let key = DiagnosticKey {
+                    root: root.to_path_buf(),
+                    server_identity: identity.to_string(),
+                    generation,
+                    path: path.to_string(),
+                };
+                state.remove_pending(&key); // superseded by the lost publication
+                state.mark_loss(key);
+            }
+            None => {
+                state.health.incomplete = state.health.incomplete.saturating_add(1);
+                if let Some(stream) = state.stream_mut(root, identity) {
+                    stream.lossy = true;
+                }
+            }
+        }
+        state.signal(notify);
+    }
+
     pub fn record(&self, health: LspHealth) {
         if !health.has_findings() {
             return;

@@ -2357,6 +2357,17 @@ enum SymbolsFetch {
     },
 }
 
+/// Clears an off-loop fetch's in-flight flag when the task ends — normally,
+/// on a dropped result, or by panic — so a failed fetch can never disable its
+/// action for the rest of the session.
+struct InflightGuard(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
 /// Fetch the document-symbol outline for `file` (repo-relative) off the loop:
 /// the language server when one is available, the tree-sitter entity parser
 /// otherwise. Sends a `SymbolsFetch::Outline` and pulses the waker.
@@ -2370,6 +2381,7 @@ fn spawn_outline_fetch(
 ) {
     use thegn_core::semantic::Lang;
     tokio::task::spawn_blocking(move || {
+        let _inflight = InflightGuard(busy);
         // A provider exists if the file resolves to a registered server (LSP
         // tier) OR to a tree-sitter grammar. A registry-only language (no
         // grammar) still gets its LSP outline; a file that resolves to neither
@@ -2383,9 +2395,7 @@ fn spawn_outline_fetch(
         } else {
             Vec::new()
         };
-        if tx.try_send(SymbolsFetch::Outline { file, rows }).is_err() {
-            busy.store(false, std::sync::atomic::Ordering::Release);
-        } // best-effort: bounded replaceable result; a full queue drops stale work
+        let _ = tx.try_send(SymbolsFetch::Outline { file, rows }); // best-effort: bounded replaceable result; a full queue drops stale work
         let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
     });
 }
@@ -2406,6 +2416,7 @@ fn spawn_refs_fetch(
     busy: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) {
     tokio::task::spawn_blocking(move || {
+        let _inflight = InflightGuard(busy);
         let mut rows = Vec::new();
         if let Some(key) = lsp.resolve_key(&file)
             && let Ok(client) = lsp.client(&root, &key)
@@ -2439,9 +2450,7 @@ fn spawn_refs_fetch(
                     .collect();
             }
         }
-        if tx.try_send(SymbolsFetch::Refs { label, rows }).is_err() {
-            busy.store(false, std::sync::atomic::Ordering::Release);
-        } // best-effort: bounded replaceable result; a full queue drops stale work
+        let _ = tx.try_send(SymbolsFetch::Refs { label, rows }); // best-effort: bounded replaceable result; a full queue drops stale work
         let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
     });
 }
@@ -2462,6 +2471,7 @@ fn spawn_hover_fetch(
     busy: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) {
     tokio::task::spawn_blocking(move || {
+        let _inflight = InflightGuard(busy);
         let mut hover_md: Option<String> = None;
         let mut signatures: Vec<String> = Vec::new();
         let mut actions: Vec<String> = Vec::new();
@@ -2492,9 +2502,7 @@ fn spawn_hover_fetch(
         }
         let popup =
             crate::hover::HoverPopup::build(&label, hover_md.as_deref(), &signatures, &actions);
-        if tx.try_send(popup).is_err() {
-            busy.store(false, std::sync::atomic::Ordering::Release);
-        } // best-effort: bounded replaceable result; a full queue drops stale work
+        let _ = tx.try_send(popup); // best-effort: bounded replaceable result; a full queue drops stale work
         let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
     });
 }
@@ -6655,6 +6663,8 @@ async fn event_loop<T: Terminal>(
     // The worktree-root set the supervisor was last reconciled against.
     let mut lsp_reconciled_roots: std::collections::HashSet<std::path::PathBuf> =
         std::collections::HashSet::new();
+    // Bumped per root-set change; orders the off-loop reconcile tasks.
+    let mut lsp_reconcile_epoch: u64 = 0;
     {
         let wake_rx = lsp_diag_rx.clone();
         let bridge_waker = waker.clone();
@@ -9286,8 +9296,9 @@ async fn event_loop<T: Terminal>(
         // One bounded slice per iteration (8 publications / 256 KiB / 2 ms,
         // input preempts between items); a slice that stops with work queued
         // re-arms the bus wake, so the remainder arrives on a later iteration
-        // without any polling. The visible list is rebuilt at most once per
-        // slice, and only when the active partition (or health) changed.
+        // without any polling. The visible list is patched only for the
+        // active root's files this slice touched (no full clone + sort), so the
+        // visible update is bounded by the slice as well.
         {
             let active_root = active_tab_path(&session);
             let drain_started = std::time::Instant::now();
@@ -9300,8 +9311,10 @@ async fn event_loop<T: Terminal>(
                 || !pending_input.is_empty(),
                 || loop_perf.tick(crate::perf::WakeSource::Lsp),
             );
-            if outcome.visible_changed {
-                lsp_diags.merge_into(&active_root, &mut model.panel.diagnostics);
+            if !outcome.refresh.is_none() {
+                outcome
+                    .refresh
+                    .apply_to(&lsp_diags, &active_root, &mut model.panel.diagnostics);
                 dirty = true;
             }
         }
@@ -10249,17 +10262,22 @@ async fn event_loop<T: Terminal>(
             // registry slots and negative cache, and tears the subprocesses
             // down. Only when the root set changed, and off-loop — the
             // supervisor's client map can be held by a spawn in progress.
-            let live_roots: std::collections::HashSet<std::path::PathBuf> = session
+            // The active root is included even when it is the `current_dir()`
+            // fallback (no local worktree path), so its server is not churned.
+            let mut live_roots: std::collections::HashSet<std::path::PathBuf> = session
                 .worktrees
                 .iter()
                 .filter(|g| !g.path.is_empty())
                 .map(|g| std::path::PathBuf::from(&g.path))
                 .collect();
+            live_roots.insert(active_tab_path(&session));
             if live_roots != lsp_reconciled_roots {
                 lsp_reconciled_roots = live_roots.clone();
+                lsp_reconcile_epoch += 1;
+                let epoch = lsp_reconcile_epoch;
                 let lsp = lsp_supervisor.handle();
                 tokio::task::spawn_blocking(move || {
-                    let _ = lsp.reconcile_roots(&live_roots); // best-effort: released-slot count is informational
+                    let _ = lsp.reconcile_roots(epoch, live_roots); // best-effort: released-slot count is informational
                 });
             }
             lsp_diags.merge_into(&active_tab_path(&session), &mut model.panel.diagnostics);
@@ -20090,6 +20108,11 @@ async fn event_loop<T: Terminal>(
                                     waker.clone(),
                                     refs_busy.clone(),
                                 );
+                            } else if !panel_ui.symbols_show_refs
+                                && refs_busy.load(std::sync::atomic::Ordering::Acquire)
+                            {
+                                model.status =
+                                    "References: still waiting for the language server…".into();
                             }
                             true
                         }
@@ -20120,6 +20143,11 @@ async fn event_loop<T: Terminal>(
                                     waker.clone(),
                                     hover_busy.clone(),
                                 );
+                            } else if current_config.lsp.hover
+                                && hover_busy.load(std::sync::atomic::Ordering::Acquire)
+                            {
+                                model.status =
+                                    "Hover: still waiting for the language server…".into();
                             }
                             true
                         }

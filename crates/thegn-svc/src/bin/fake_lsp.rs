@@ -212,6 +212,30 @@ fn main() {
                     &id.unwrap_or(Value::Null),
                     json!({ "contents": { "kind": "markdown", "value": "fn greet() -> u8" } }),
                 ),
+                // `--echo-open`: answer didOpen with a diagnostic carrying the
+                // received text length, proving a large document arrived whole.
+                "textDocument/didOpen" if std::env::args().any(|a| a == "--echo-open") => {
+                    let doc = msg.get("params").and_then(|p| p.get("textDocument"));
+                    let uri = doc
+                        .and_then(|d| d.get("uri"))
+                        .cloned()
+                        .unwrap_or(Value::Null);
+                    let len = doc
+                        .and_then(|d| d.get("text"))
+                        .and_then(Value::as_str)
+                        .map_or(0, str::len);
+                    send(
+                        &mut out,
+                        &json!({
+                            "jsonrpc": "2.0",
+                            "method": "textDocument/publishDiagnostics",
+                            "params": { "uri": uri, "diagnostics": [{
+                                "range": { "start": { "line": 0, "character": 0 } },
+                                "message": format!("opened {len}")
+                            }]}
+                        }),
+                    );
+                }
                 "shutdown" => reply(&mut out, &id.unwrap_or(Value::Null), Value::Null),
                 "exit" => break,
                 _ => {
