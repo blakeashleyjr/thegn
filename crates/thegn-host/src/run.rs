@@ -6639,23 +6639,36 @@ async fn event_loop<T: Terminal>(
         );
     }
 
-    // LSP: lazy, warm language servers per worktree. Clients push diagnostics on
-    // a std channel; a bridge thread forwards them onto a loop channel and pulses
-    // the waker (svc has no waker). `lsp_diags` persists them across model swaps.
+    // LSP: lazy, warm language servers per worktree. Clients publish into a
+    // bounded latest-per-document bus; a bridge thread blocks on the bus's
+    // single wake obligation and pulses the waker (svc has no waker) — an idle
+    // bus means a blocked bridge, zero wakes. `lsp_diags` persists applied
+    // diagnostics across model swaps.
     let mut lsp_supervisor = crate::lsp::LspSupervisor::from_config(keymap.config());
     let mut lsp_diags = crate::lsp::LspDiagnostics::new();
-    let mut lsp_diag_rx = lsp_supervisor
+    let lsp_diag_rx = lsp_supervisor
         .take_diagnostics_rx()
         .expect("LSP diagnostics receiver is installed once at startup");
+    // Every exit path of the loop frees the bus (queued publications, marks,
+    // registrations) and releases the bridge thread.
+    let _lsp_bus_shutdown = crate::lsp::BusShutdown::new(lsp_diag_rx.clone());
+    // The worktree-root set the supervisor was last reconciled against.
+    let mut lsp_reconciled_roots: std::collections::HashSet<std::path::PathBuf> =
+        std::collections::HashSet::new();
     {
         let wake_rx = lsp_diag_rx.clone();
         let bridge_waker = waker.clone();
-        std::thread::spawn(move || {
-            loop {
-                wake_rx.wait();
-                let _ = bridge_waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
-            }
-        });
+        let spawned = std::thread::Builder::new()
+            .name("thegn-lsp-bridge".into())
+            .spawn(move || {
+                crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
+                while wake_rx.wait() {
+                    let _ = bridge_waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
+                }
+            });
+        if let Err(error) = spawned {
+            tracing::warn!(target: "thegn::lsp", %error, "LSP diagnostics bridge failed to spawn");
+        }
     }
     // Resident bridge: for a remote/provider worktree, connect a persistent in-env
     // agent (git routes through it; fs.watch becomes refreshes). fs.watch events
@@ -9269,37 +9282,26 @@ async fn event_loop<T: Terminal>(
         // by the worktree root stamped on each message; only the ACTIVE
         // worktree's partition is merged into the rendered list, so a warm
         // server in another workspace never bleeds into this panel.
+        //
+        // One bounded slice per iteration (8 publications / 256 KiB / 2 ms,
+        // input preempts between items); a slice that stops with work queued
+        // re-arms the bus wake, so the remainder arrives on a later iteration
+        // without any polling. The visible list is rebuilt at most once per
+        // slice, and only when the active partition (or health) changed.
         {
-            let mut got = false;
-            let mut publications = 0usize;
-            let mut publication_bytes = 0usize;
+            let active_root = active_tab_path(&session);
             let drain_started = std::time::Instant::now();
-            while pending_input.is_empty()
-                && publications < 8
-                && publication_bytes < thegn_svc::lsp::limits::MAX_DIAGNOSTIC_BYTES
-                && drain_started.elapsed() < std::time::Duration::from_millis(2)
-            {
-                let Ok(pd) = lsp_diag_rx.try_recv() else {
-                    break;
-                };
-                loop_perf.tick(crate::perf::WakeSource::Lsp);
-                publication_bytes = publication_bytes
-                    .saturating_add(thegn_svc::lsp::published_diagnostics_bytes(&pd));
-                publications += 1;
-                lsp_diags.apply(pd);
-                got = true;
-            }
-            if publications >= 8
-                || publication_bytes >= thegn_svc::lsp::limits::MAX_DIAGNOSTIC_BYTES
-                || drain_started.elapsed() >= std::time::Duration::from_millis(2)
-            {
-                lsp_diag_rx.rearm_if_pending();
-            }
-            let health = lsp_diag_rx.take_health();
-            lsp_diags.mark_incomplete(lsp_diag_rx.take_incomplete());
-            lsp_diags.record_health(health);
-            if got || health.has_findings() {
-                lsp_diags.merge_into(&active_tab_path(&session), &mut model.panel.diagnostics);
+            let outcome = crate::lsp::drain_diagnostics(
+                &lsp_diag_rx,
+                &mut lsp_diags,
+                &active_root,
+                crate::lsp::DrainBudget::default(),
+                || drain_started.elapsed(),
+                || !pending_input.is_empty(),
+                || loop_perf.tick(crate::perf::WakeSource::Lsp),
+            );
+            if outcome.visible_changed {
+                lsp_diags.merge_into(&active_root, &mut model.panel.diagnostics);
                 dirty = true;
             }
         }
@@ -10243,6 +10245,23 @@ async fn event_loop<T: Terminal>(
                     .iter()
                     .any(|g| std::path::Path::new(&g.path) == root)
             });
+            // Retire language servers whose worktree is gone: frees their
+            // registry slots and negative cache, and tears the subprocesses
+            // down. Only when the root set changed, and off-loop — the
+            // supervisor's client map can be held by a spawn in progress.
+            let live_roots: std::collections::HashSet<std::path::PathBuf> = session
+                .worktrees
+                .iter()
+                .filter(|g| !g.path.is_empty())
+                .map(|g| std::path::PathBuf::from(&g.path))
+                .collect();
+            if live_roots != lsp_reconciled_roots {
+                lsp_reconciled_roots = live_roots.clone();
+                let lsp = lsp_supervisor.handle();
+                tokio::task::spawn_blocking(move || {
+                    let _ = lsp.reconcile_roots(&live_roots); // best-effort: released-slot count is informational
+                });
+            }
             lsp_diags.merge_into(&active_tab_path(&session), &mut model.panel.diagnostics);
             // Shares live on the supervisor (loop-local), not in hydration; a
             // fresh model wouldn't carry them — re-apply for the active worktree.
