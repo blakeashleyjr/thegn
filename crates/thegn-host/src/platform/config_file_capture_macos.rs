@@ -1,7 +1,7 @@
 use std::ffi::CString;
 use std::fs::{self, File};
 use std::io::Read;
-use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::fd::FromRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
@@ -57,22 +57,22 @@ fn open(path: &Path) -> Result<Option<File>, Error> {
 }
 
 fn regular_identity(file: &File) -> Result<Identity, Error> {
-    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-    if unsafe { libc::fstat(file.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
-        return Err(Error::Unavailable);
-    }
-    let stat = unsafe { stat.assume_init() };
-    if (stat.st_mode & libc::S_IFMT) != libc::S_IFREG {
+    // `File::metadata` is an fstat on the held descriptor; the portable
+    // MetadataExt accessors carry the same fields with fixed widths on every
+    // Unix this module is compiled for (macOS, and Linux as a fallback).
+    use std::os::unix::fs::MetadataExt;
+    let metadata = file.metadata().map_err(|_| Error::Unavailable)?;
+    if !metadata.file_type().is_file() {
         return Err(Error::NonRegular);
     }
     Ok(Identity {
-        device: stat.st_dev as u64,
-        inode: stat.st_ino as u64,
-        length: stat.st_size as u64,
-        mtime_seconds: stat.st_mtime as i64,
-        mtime_nanoseconds: stat.st_mtime_nsec as i64,
-        ctime_seconds: stat.st_ctime as i64,
-        ctime_nanoseconds: stat.st_ctime_nsec as i64,
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        length: metadata.size(),
+        mtime_seconds: metadata.mtime(),
+        mtime_nanoseconds: metadata.mtime_nsec(),
+        ctime_seconds: metadata.ctime(),
+        ctime_nanoseconds: metadata.ctime_nsec(),
     })
 }
 
