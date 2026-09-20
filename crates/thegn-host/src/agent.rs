@@ -42,23 +42,44 @@ pub fn choices(cfg: &Config) -> Vec<String> {
 /// `shell` (and any unknown label) resolves to the interactive login shell.
 /// Always uses the host (non-OCI) form; callers that know the sandbox context
 /// should use `compose_spec` instead.
-pub fn resolve_command(cfg: &Config, choice: &str) -> String {
+///
+/// `Err` when the entry configures `permissions` the harness cannot grant
+/// command-scoped (THE-440): that is the one resolution failure a launch must
+/// NOT paper over, because launching the raw command would run the agent under
+/// a policy the operator did not ask for. Every other resolution complaint (a
+/// `model` on a flagless harness — a `config validate` error) still degrades to
+/// the entry's raw command rather than a dead pane, exactly as before.
+pub fn resolve_command(cfg: &Config, choice: &str) -> Result<String, String> {
     if choice == SHELL {
-        return shell_inner(false);
+        return Ok(shell_inner(false));
     }
     if let Some(c) = cfg
         .agent_command(choice)
         .or_else(|| cfg.tool_command(choice))
     {
-        // The entry's `model` rides on its harness's model flag; an entry the
-        // resolver refuses (a model on a flagless harness — a `config validate`
-        // error) still launches with its raw command rather than a dead pane.
-        return thegn_core::agent_task::effective_agent(cfg, choice, None)
+        let eff = thegn_core::agent_task::effective_agent(cfg, choice, None);
+        // Fail closed on the permission grant, whatever else the resolver said:
+        // the list is configured on the entry, so it is known even when the
+        // entry does not resolve.
+        if let Some(entry) = cfg
+            .agents
+            .iter()
+            .chain(cfg.tools.iter())
+            .find(|a| a.name == choice)
+        {
+            let harness = eff
+                .as_ref()
+                .map(|e| e.harness.clone())
+                .unwrap_or_else(|_| thegn_core::agent_task::provider_id(entry));
+            thegn_core::agent_task::permission_suffix(&harness, &entry.permissions)
+                .map_err(|why| format!("{choice}: {why}"))?;
+        }
+        return Ok(eff
             .and_then(|e| e.interactive_command())
-            .unwrap_or_else(|_| c.to_string());
+            .unwrap_or_else(|_| c.to_string()));
     }
     // Unknown label — drop to a shell rather than spawning a dead pane.
-    shell_inner(false)
+    Ok(shell_inner(false))
 }
 
 /// The `inner` program string for a plain shell pane (what `enter_argv` wraps).
@@ -1422,7 +1443,18 @@ pub fn native_agent_exec(cfg: &Config, worktree: &str, choice: &str) -> Option<N
     }
     // Only real agents (not tools) route through here.
     cfg.agent_command(choice)?;
-    native_exec_for(cfg, worktree, Some(resolve_command(cfg, choice)))
+    // A grant the harness cannot take refuses the AGENT pane (THE-440) — the
+    // caller falls back to a plain login shell, which runs no agent under the
+    // wrong policy. Visible, never silent.
+    let cmd = match resolve_command(cfg, choice) {
+        Ok(cmd) => cmd,
+        Err(why) => {
+            tracing::warn!(target: "thegn::agent", agent = %choice, "{why}");
+            thegn_core::msg::warn(&format!("{why}; no agent pane was started"));
+            return None;
+        }
+    };
+    native_exec_for(cfg, worktree, Some(cmd))
 }
 
 /// Shared body: build a [`NativeShell`] for a native-exec provider worktree. With
@@ -2917,7 +2949,7 @@ pub fn compose_spec(
     } else if choice == "shell" {
         shell_inner(in_oci)
     } else {
-        resolve_command(cfg, choice)
+        resolve_command(cfg, choice).map_err(|why| anyhow::anyhow!("{why}"))?
     };
     // A provider pane lands at $HOME; prefix `cd <workdir>` so direnv/devShell load.
     let placement = sb.spec.as_ref().map(|s| &s.placement);

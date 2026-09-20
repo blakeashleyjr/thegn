@@ -257,8 +257,12 @@ permissions = ["Read", "Edit", "Bash", "Grep", "Glob"]        # headless allow-l
   nothing persists after the process exits. A harness with no command-scoped
   grant thegn can vouch for (codex, pi, aider) **refuses** a non-empty list —
   the launch fails and a stage dispatch is held before its roster row exists —
-  rather than silently dropping it; `thegn config validate` reports it,
-  including a stage that swaps `harness` and inherits the entry's list.
+  rather than silently dropping it; `thegn config validate` and `thegn doctor`
+  report it, including a stage that swaps `harness` and inherits the entry's
+  list. Because the grant merges rather than replaces, a
+  `.claude/settings.local.json` that an older thegn seeded into a worktree
+  still grants whatever it lists — delete the entries you did not write, or a
+  narrowed `permissions` list will not take effect.
 
 A stage overrides any of these for its own launches — including `harness`, so
 one generic role can run on claude for reviews and pi for the fan-out — and

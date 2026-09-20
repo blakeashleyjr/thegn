@@ -566,6 +566,11 @@ fn claim(
             "unknown pipeline stage {stage:?}; configure it under [[pipeline.stages]] before claiming work"
         );
     };
+    // A grant the harness cannot take command-scoped refuses the launch, so
+    // refuse the CLAIM too (THE-440): a row claimed here is dispatched later,
+    // and a supervisor should learn about the policy hold before it occupies a
+    // slot, not when the worker fails to start.
+    crate::cmd::session::policy_admission(cfg, agent_name, stage)?;
     let limit = stage_config.concurrency;
     let outcome = db.claim_dispatch(
         NewDispatch {
