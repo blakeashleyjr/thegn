@@ -47,8 +47,25 @@ All notable changes to **thegn** are documented here. The format follows
   is touched. Behaviour change: the list is now _added to_ the worktree's own
   `permissions.allow` instead of replacing it, and a non-empty list on a
   harness with no command-scoped grant (codex, pi, aider) refuses the launch
-  — a stage dispatch is held before its roster row exists — instead of being
-  ignored with a warning. `thegn config validate` reports such entries.
+  — a stage dispatch is held before its roster row exists, and `thegn dispatch
+claim` refuses the slot — instead of being ignored with a warning. `thegn
+config validate` and `thegn doctor` report such entries.
+- **Upgrading: review the files the old seeder left behind.** Every worktree a
+  permissioned launch ever touched still holds a thegn-written
+  `permissions.allow` in `.claude/settings.local.json`. thegn no longer writes
+  or manages that file, but claude still reads it, and it now ADDS to the
+  command-scoped grant: narrowing an entry or stage (say `["Bash"]` →
+  `["Read"]`) does not take effect while the stale file still grants `Bash`.
+  Review those files and delete the entries you did not put there — thegn will
+  never write them again. `git status` will show the file in worktrees where it
+  is tracked or where the seeder created it.
+- **A branch's own committed allow-list now survives.** The old seeder
+  overwrote `permissions.allow` on every launch, which incidentally clobbered
+  any list a checked-out branch had committed. With merge semantics a
+  repository-authored allow-list is layered under thegn's grant and reaches a
+  headless worker. Command-scoping removes thegn's write primitive; it does not
+  contain what a candidate branch's own harness settings claim (that is the
+  mutable-project-harness work, THE-434) — relevant to THE-233.
 
 ### Fixed — a project no longer resumes in a terminal
 

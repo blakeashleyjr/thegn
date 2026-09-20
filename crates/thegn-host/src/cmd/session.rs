@@ -817,7 +817,7 @@ fn stage_or_bail<'a>(
 ///
 /// An agent/stage that does not resolve at all is left to the daemon's launch
 /// (which fails the row exactly as before); only the policy is admitted here.
-fn policy_admission(cfg: &Config, agent: &str, stage: &str) -> Result<()> {
+pub(crate) fn policy_admission(cfg: &Config, agent: &str, stage: &str) -> Result<()> {
     let Ok(eff) = thegn_core::agent_task::effective_agent(cfg, agent, Some(stage)) else {
         return Ok(());
     };

@@ -499,14 +499,15 @@ itself: insert the roster row, render the stage's configured prompt from the
 bindings the caller provides, refuse to launch on an empty render, derive the
 row's artifact path, open the daemon session (the launch layers the stage's
 `model` / `env` / `permissions` over the agent entry and carries the effective
-allow-list as a command-scoped grant — the same path every launch takes), stamp the row with the session
-id and artifact path, and only then mark the row running. thegn MUST NOT
-decide whether the dispatch is worth making, which stage comes next, or
-whether the result is good — those are the supervising agent's judgment. A
-stage prompt that renders empty MUST be refused with no session opened (an
-empty prompt means an interactive launch, silently — the pilot's
-silent-failure mode). Publishing the opened process MUST transition only its
-still-queued/spawning reservation. If a concurrent supervisor already failed,
+allow-list as a command-scoped grant — the same path every launch takes),
+stamp the row with the session id and artifact path, and only then mark the
+row running. thegn MUST NOT decide whether the dispatch is worth making,
+which stage comes next, or whether the result is good — those are the
+supervising agent's judgment. A stage prompt that renders empty MUST be
+refused with no session opened (an empty prompt means an interactive launch,
+silently — the pilot's silent-failure mode). Publishing the opened process
+MUST transition only its still-queued/spawning reservation. If a concurrent
+supervisor already failed,
 abandoned, or otherwise moved the row, thegn MUST preserve that verdict and
 tear the newly opened process down rather than resurrecting the row.
 

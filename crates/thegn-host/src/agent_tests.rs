@@ -1145,12 +1145,33 @@ fn choices_does_not_duplicate_an_explicit_shell() {
 
 #[test]
 fn resolve_command_maps_agent_tool_and_shell() {
-    let cfg = cfg_with(&[("claude", "claude --foo")], &[("lazygit", "lazygit")]);
-    assert_eq!(resolve_command(&cfg, "claude"), "claude --foo");
-    assert_eq!(resolve_command(&cfg, "lazygit"), "lazygit");
-    assert_eq!(resolve_command(&cfg, "shell"), shell_inner(false));
+    let mut cfg = cfg_with(&[("claude", "claude --foo")], &[("lazygit", "lazygit")]);
+    assert_eq!(resolve_command(&cfg, "claude").unwrap(), "claude --foo");
+    assert_eq!(resolve_command(&cfg, "lazygit").unwrap(), "lazygit");
+    assert_eq!(resolve_command(&cfg, "shell").unwrap(), shell_inner(false));
     // Unknown label degrades to a shell.
-    assert_eq!(resolve_command(&cfg, "nope"), shell_inner(false));
+    assert_eq!(resolve_command(&cfg, "nope").unwrap(), shell_inner(false));
+
+    // THE-440: a grantable list rides the picker command too…
+    cfg.agents[0].permissions = vec!["Read".into()];
+    let granted = resolve_command(&cfg, "claude").unwrap();
+    assert!(
+        granted.ends_with(r#" --settings '{"permissions":{"allow":["Read"]}}'"#),
+        "{granted}"
+    );
+    // …and a list the harness cannot grant REFUSES this path too, instead of
+    // quietly launching the raw command under an unrequested policy.
+    cfg.agents.push(thegn_core::config::NamedCommand {
+        permissions: vec!["Read".into()],
+        ..cfg_with(&[("coder", "pi")], &[]).agents.remove(0)
+    });
+    let why = resolve_command(&cfg, "coder").expect_err("fail closed");
+    assert!(why.contains("permission policy hold"), "{why}");
+    assert!(why.contains("coder"), "{why}");
+    // A resolver complaint that is NOT about permissions still degrades to the
+    // raw command (pinned): a model on a flagless harness.
+    cfg.tools[0].model = Some("x".into());
+    assert_eq!(resolve_command(&cfg, "lazygit").unwrap(), "lazygit");
 }
 
 // Crate-wide env lock (shared with `run`'s sidebar tests): both redirect the
