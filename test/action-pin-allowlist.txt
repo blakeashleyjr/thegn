@@ -1,0 +1,11 @@
+# Reviewed exceptions to the SHA-pinning policy (test/action_pin_test.py).
+#
+# One `owner/repo@ref` per line. SEEDED EMPTY, and it should stay that way:
+# every external action in this tree is pinned to a full commit SHA.
+#
+# An entry here means a privileged workflow -- the release jobs hold
+# contents/id-token/attestations write plus publishing secrets -- executes code
+# resolved through a ref that whoever controls that repository can retarget at
+# any time. GitHub tags are not immutable. Adding a line is therefore a
+# security decision, not a convenience: record WHO reviewed it and WHY the pin
+# is not possible, and remove it as soon as it is.
