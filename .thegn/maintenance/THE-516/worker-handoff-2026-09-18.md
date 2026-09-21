@@ -76,3 +76,73 @@ bytes, path mode)>`.
 - Fixed along the way: two foundation clippy `needless_return`s in util.rs
   (cfg tail blocks) and the core platform-cfg ratchet (test-only unix cfgs in
   repo.rs/worktree.rs pinned with a reason).
+
+## Review round 2 (2026-09-20) — adversarial blockers 1–3 and items 4–7
+
+Rebased onto `main` 18060ae8 (THE-418/454/515 + clippy fix). THE-515 landed at
+SCHEMA_VERSION 68, so the v69 bump here is still the only one.
+
+BLOCKER 1 (capture lane): `IDENTITY_CAPTURE_SLOTS` 2 → 16, and acquisition now
+WAITS (`IDENTITY_CAPTURE_WAIT`, 10s) on a `Condvar` instead of refusing
+instantly, so three concurrent creates queue rather than one being abandoned.
+The two `mem::forget((child, budget))` leak paths are replaced by
+`withhold_unknown_ownership`: the child handle is forgotten (the unreaped
+zombie keeps its PID from being reused, and nothing signals it again) while
+its slot is accounted separately and reclaimed after
+`IDENTITY_CAPTURE_LEAK_RETENTION` (60s). A leak now degrades throughput for a
+minute; it can no longer brick every probe in the process.
+
+BLOCKER 2 (coverage): the lane takes a `&'static IdentityCaptureLane`
+parameter (like the existing reader-spawner seam), and the budget regressions
+use `test_lane(n)`, so nothing asserts on the process-wide lane. `just coverage`
+was then RUN: 4225 core lib tests in one process, gate `core ≥95% lines` green.
+
+BLOCKER 3 (quarantine): ambiguity is now reported, not silent —
+`handlers::startup::quarantined_worktree_status` puts a one-line notice in the
+launch status, and `thegn doctor` gained a "Worktree identity" section (plus
+`worktree_identity` in `--json`). The stamp is RECONCILED, not sticky:
+`reconcile_legacy_tab_quarantine` stamps contested rows and clears rows
+previously stamped with the same reason once they are no longer contested.
+`db_worktree_list_omits_only_contested_rows_and_stamps_them` pins which rows
+are withheld, that nothing is deleted, that the stamp lands, and that removing
+one claimant brings the other back.
+
+4. `worktree_path_for` takes `repo_dir_name` and is genuinely pure; the Git
+   `repo_name` call moved into `allocate_worktree_path` (off-loop).
+5. Merge cleanup keeps the path-derived `$THEGN_WORKSPACE` label (signed off,
+   reverted): `slug_for_repo` is a write transaction, so a transient
+   SQLITE_BUSY would have turned unattended reclaim into a refusal, and the
+   hook variable would have silently changed value. No release note needed.
+   The same reasoning removed the second `Db::open()` from the wizard and the
+   tracker: the authoritative slug is resolved from the handle that registers
+   the row (this is also what broke two wizard tests on the first pass).
+6. `--program` refusal keeps its hard error, now with the migration path in the
+   message (re-run with the literal → attaches to the old slugged branches) and
+   a BREAKING entry in CHANGELOG.
+7. The pre-existing-destination refusal (add and rename) now names the next
+   step (`git worktree list` / `prune`, or pick another name).
+
+Debt also closed: add/rename refuse when `lock_git_mutations` returns None
+(previously both proceeded unlocked, so the loser's rollback could destroy the
+winner's checkout — `AddError::lock_unavailable`, and
+`create_failure_after_add` skips rollback for it); rename validates the new
+branch (`is_valid_branch_name`, which now also rejects `HEAD`); the SPLIT
+STATE recovery command is shell-quoted; the v69 rebuild refusal prints a
+recovery recipe; the porcelain raw-byte test is `#[cfg(unix)]` and its fixture
+writes inside the per-test repo instead of /tmp.
+
+Still recorded as debt, not fixed: `verify_v69_schema` remains a hard gate on
+every `Db::open` (message is now actionable); the platform-cfg ratchet pins are
+file-level, so a future PRODUCTION `#[cfg]` in repo.rs/worktree.rs would pass
+silently; `git_admin_instance_stamp` needs `Metadata::created()` (NFS/CIFS/some
+FUSE will refuse — a chunk-8 landmine, no production caller today);
+`sandbox::container_name` grows ~64 chars against a 64-byte kernel hostname cap;
+Windows MAX_PATH headroom for in-repo checkouts.
+
+### Validation (round 2, per-worktree lane)
+
+- focused: 457 run, 457 passed (ratchet tests included).
+- `just coverage`: 4225 tests, gate `core ≥95% lines` green.
+- `just test` (unfiltered): 8811 run, 8811 passed, 30 skipped.
+- `cargo clippy --workspace --all-targets -- -D warnings`: clean.
+- `treefmt --ci` and `just ratchets`: clean.
