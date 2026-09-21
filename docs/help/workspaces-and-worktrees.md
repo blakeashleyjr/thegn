@@ -106,6 +106,12 @@ aliases; their chords do not change.
 - Deleting from disk is always an explicit second step in the [[sidebar]]
   delete menu — nothing destructive rides on a single keystroke.
 
-Worktrees live under `~/.thegn/worktrees/<repo>/<branch-slug>` by default;
-`worktree_mode = "in_repo"` keeps them in `<repo>/.worktrees`. See the
-[[config-reference]] for every knob.
+New worktrees live under `~/.thegn/worktrees/<repo>/<label>--<digest>` by
+default; `worktree_mode = "in_repo"` keeps them in `<repo>/.worktrees`. The
+label is a readable slug of the branch; the 64-hex digest is derived from the
+repository's Git common directory plus the exact branch name, so `feat/a`,
+`feat-a` and `feat_a` — or two repos that share a basename — never share a
+checkout. Existing worktrees are never moved; they stay where Git has them. A
+destination that already exists is refused rather than reused, and a rename
+whose `git worktree move` fails rolls the branch rename back. Worktree tabs are
+named `<repo>/<exact branch>`. See the [[config-reference]] for every knob.

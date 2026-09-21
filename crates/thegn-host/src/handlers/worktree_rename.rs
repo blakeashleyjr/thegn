@@ -92,18 +92,23 @@ pub(crate) fn apply(
         .map(|(s, _)| s)
         .unwrap_or_default();
     let old_name = g.name.clone();
-    g.name = format!("{slug}/{want}");
+    g.name = thegn_core::repo::branch_tab(&slug, &want);
     g.path = new_path_s.clone();
     let tab = g.name.clone();
     if region_last_w.as_deref() == Some(old_name.as_str()) {
         *region_last_w = Some(tab.clone());
     }
     use thegn_core::store::WorkspaceStore;
-    if let Ok(db) = thegn_core::db::Db::open() {
-        // best-effort: the DB is a cache; git already moved the worktree.
-        let _ = db.rename_worktree(&old_path, &new_path_s, &tab, &want);
+    // Git already moved the worktree (it is the source of truth), so a cache
+    // failure does not undo the rename — but it is reported, never swallowed
+    // as success (THE-516): the registry still names the old path until the
+    // next reconcile.
+    let cached = thegn_core::db::Db::open()
+        .and_then(|db| db.rename_worktree(&old_path, &new_path_s, &tab, &want));
+    match cached {
+        Ok(()) => format!("Renamed to {want}"),
+        Err(e) => format!("Renamed to {want} (registry update failed: {e})"),
     }
-    format!("Renamed to {want}")
 }
 
 #[cfg(test)]

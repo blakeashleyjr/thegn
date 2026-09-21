@@ -558,22 +558,32 @@ impl WorkspaceStore for Db {
     /// The worktree path for a (session, tab) pair — how the panel plugin maps
     /// the focused tab to a worktree (PaneInfo carries no cwd).
     fn worktree_for_tab(&self, session: &str, tab: &str) -> Result<Option<String>> {
-        let res = self.conn().query_row(
-            "SELECT worktree FROM worktrees WHERE session_name=?1 AND tab_name=?2 LIMIT 1",
-            params![session, tab],
-            |r| r.get::<_, String>(0),
-        );
-        // best-effort read: no rows is the None case; a real DB error is
-        // surfaced but still degrades to a miss (the pane maps to nothing).
-        let r = match res {
-            Ok(v) => Some(v),
-            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+        // THE-516: never pick the first of several rows. Legacy slugged tab
+        // names can alias distinct worktrees; an ambiguous tab is refused so
+        // no caller routes to (or mutates) an arbitrary claimant.
+        let res = self
+            .conn()
+            .prepare(
+                "SELECT worktree FROM worktrees WHERE session_name=?1 AND tab_name=?2 \
+                 ORDER BY worktree LIMIT 2",
+            )
+            .and_then(|mut stmt| {
+                stmt.query_map(params![session, tab], |r| r.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            });
+        // best-effort read: a real DB error is surfaced but still degrades to
+        // a miss (the pane maps to nothing).
+        let rows = match res {
+            Ok(rows) => rows,
             Err(e) => {
                 tracing::warn!(target: "thegn::db", error = %e, "worktree_for_tab read failed; treating as a miss");
-                None
+                return Ok(None);
             }
         };
-        Ok(r)
+        if rows.len() > 1 {
+            anyhow::bail!("tab {tab} is claimed by several worktrees; refusing to pick one");
+        }
+        Ok(rows.into_iter().next())
     }
 
     /// All recorded worktrees (metadata only; git supplies live status).

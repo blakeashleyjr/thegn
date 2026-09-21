@@ -2,8 +2,33 @@
 //! keep-god-files-flat guidance). These run inside [`crate::db::Db`]'s `init()` ladder and
 //! are exercised by the ladder tests in `db.rs`.
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use rusqlite::{Connection, OptionalExtension, params};
+
+const V69_WORKTREE_INSTANCES_TABLE_DDL: &str = "CREATE TABLE worktree_instances (
+           instance_id       BLOB NOT NULL PRIMARY KEY CHECK(length(instance_id)=32),
+           generation        BLOB NOT NULL CHECK(length(generation)=16),
+           repo_id           BLOB NOT NULL CHECK(length(repo_id)=32),
+           common_dir        BLOB NOT NULL,
+           admin_id          BLOB NOT NULL,
+           branch_ref        BLOB,
+           path              BLOB NOT NULL,
+           owner             BLOB NOT NULL,
+           state             TEXT NOT NULL CHECK(state IN ('verified','legacy','quarantined','split')),
+           quarantine_reason TEXT,
+           operation_revision INTEGER NOT NULL DEFAULT 0 CHECK(operation_revision >= 0),
+           created_at        INTEGER NOT NULL
+         );";
+
+const V69_WORKTREE_INSTANCES_SUPPORT_INDEXES_DDL: &str =
+    "CREATE INDEX IF NOT EXISTS idx_worktree_instances_path
+           ON worktree_instances(path, created_at, instance_id);
+         CREATE INDEX IF NOT EXISTS idx_worktree_instances_repo_admin
+           ON worktree_instances(repo_id, admin_id, created_at, instance_id);
+         CREATE INDEX IF NOT EXISTS idx_worktree_instances_repo
+           ON worktree_instances(repo_id, created_at);
+         CREATE INDEX IF NOT EXISTS idx_worktree_instances_state
+           ON worktree_instances(state, created_at);";
 
 impl crate::db::Db {
     /// The on-disk schema version when it is newer than this build understands,
@@ -867,6 +892,312 @@ pub(crate) fn migrate_v67(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn refuse_v69_rebuild_remnants(conn: &Connection) -> Result<()> {
+    let remnant: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='worktree_instances_v69_legacy')",
+        [],
+        |row| row.get(0),
+    )?;
+    if remnant {
+        // This refusal also fires on the fast open path, so say exactly how to
+        // get out of it: without a recovery recipe a surviving rebuild table
+        // would read as an undiagnosable "thegn will not start".
+        bail!(
+            "stale v69 ledger rebuild table `worktree_instances_v69_legacy` is present: a \
+             previous identity-ledger rebuild failed part-way and its claims are preserved \
+             there. Inspect them with `sqlite3 <state.db> 'SELECT * FROM \
+             worktree_instances_v69_legacy;'` (the state DB lives under \
+             $XDG_STATE_HOME/thegn/), and once every row is accounted for, clear the refusal \
+             with `sqlite3 <state.db> 'DROP TABLE worktree_instances_v69_legacy;'`. Nothing \
+             is dropped automatically: that table is the only copy of those claims."
+        );
+    }
+    Ok(())
+}
+
+/// v69: exact Git worktree identity ledger. This migration is deliberately
+/// additive and schema-only: legacy rows remain legacy until an existing
+/// background admission lane inspects Git and writes an exact claim.
+pub(crate) fn migrate_v69(conn: &Connection) -> Result<()> {
+    // A failed copy or index creation must restore the original claims and
+    // schema together. Never leave an apparently complete replacement behind.
+    let tx = conn.unchecked_transaction()?;
+    let conn = &*tx;
+    refuse_v69_rebuild_remnants(conn)?;
+    if !has_column(conn, "worktrees", "instance_id") {
+        conn.execute("ALTER TABLE worktrees ADD COLUMN instance_id BLOB", [])?;
+    }
+    if !has_column(conn, "worktrees", "identity_state") {
+        conn.execute(
+            "ALTER TABLE worktrees ADD COLUMN identity_state TEXT NOT NULL DEFAULT 'legacy'",
+            [],
+        )?;
+    }
+    if !has_column(conn, "worktrees", "quarantine_reason") {
+        conn.execute(
+            "ALTER TABLE worktrees ADD COLUMN quarantine_reason TEXT",
+            [],
+        )?;
+    }
+    if !has_column(conn, "tab_groups", "instance_id") {
+        conn.execute("ALTER TABLE tab_groups ADD COLUMN instance_id BLOB", [])?;
+    }
+    if !has_column(conn, "tab_groups", "identity_state") {
+        conn.execute(
+            "ALTER TABLE tab_groups ADD COLUMN identity_state TEXT NOT NULL DEFAULT 'legacy'",
+            [],
+        )?;
+    }
+    if !has_column(conn, "tab_groups", "quarantine_reason") {
+        conn.execute(
+            "ALTER TABLE tab_groups ADD COLUMN quarantine_reason TEXT",
+            [],
+        )?;
+    }
+    let ledger_exists = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='worktree_instances'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .is_some();
+    if ledger_exists && !has_column(conn, "worktree_instances", "operation_revision") {
+        let old_columns: Vec<String> = conn
+            .prepare("PRAGMA table_info(worktree_instances)")?
+            .query_map([], |row| row.get(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let expected_old: Vec<String> = [
+            "instance_id",
+            "generation",
+            "repo_id",
+            "common_dir",
+            "admin_id",
+            "branch_ref",
+            "path",
+            "owner",
+            "state",
+            "quarantine_reason",
+            "created_at",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        if old_columns != expected_old {
+            bail!("pre-existing worktree_instances table is malformed");
+        }
+        conn.execute_batch(&format!(
+            "DROP INDEX IF EXISTS idx_worktree_instances_repo;
+             DROP INDEX IF EXISTS idx_worktree_instances_state;
+             DROP INDEX IF EXISTS idx_worktree_instances_path;
+             DROP INDEX IF EXISTS idx_worktree_instances_repo_admin;
+             ALTER TABLE worktree_instances RENAME TO worktree_instances_v69_legacy;
+             {V69_WORKTREE_INSTANCES_TABLE_DDL}
+             INSERT INTO worktree_instances
+               (instance_id, generation, repo_id, common_dir, admin_id, branch_ref, path, owner,
+                state, quarantine_reason, operation_revision, created_at)
+             SELECT instance_id, generation, repo_id, common_dir, admin_id, branch_ref, path, owner,
+                    state, quarantine_reason, 0, created_at
+               FROM worktree_instances_v69_legacy;
+             DROP TABLE worktree_instances_v69_legacy;"
+        ))?;
+    } else if !ledger_exists {
+        conn.execute_batch(V69_WORKTREE_INSTANCES_TABLE_DDL)?;
+    }
+    conn.execute_batch(V69_WORKTREE_INSTANCES_SUPPORT_INDEXES_DDL)?;
+    conn.execute_batch(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_worktree_instances_verified_path
+           ON worktree_instances(path) WHERE state='verified';
+         CREATE UNIQUE INDEX IF NOT EXISTS uq_worktree_instances_verified_repo_admin
+           ON worktree_instances(repo_id, admin_id) WHERE state='verified';",
+    )?;
+    verify_v69_schema(conn)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Verify the v69 identity ledger before the schema version is stamped. A
+/// missing column/table must never look like a completed migration.
+pub(crate) fn verify_v69_schema(conn: &Connection) -> Result<()> {
+    refuse_v69_rebuild_remnants(conn)?;
+    for (table, column) in [
+        ("worktrees", "instance_id"),
+        ("worktrees", "identity_state"),
+        ("worktrees", "quarantine_reason"),
+        ("tab_groups", "instance_id"),
+        ("tab_groups", "identity_state"),
+        ("tab_groups", "quarantine_reason"),
+    ] {
+        if !has_column(conn, table, column) {
+            bail!("schema v69 migration did not add {table}.{column}");
+        }
+    }
+    let kind: Option<String> = conn
+        .query_row(
+            "SELECT type FROM sqlite_master WHERE name='worktree_instances'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if kind.as_deref() != Some("table") {
+        bail!("schema v69 migration did not create worktree_instances");
+    }
+    let columns: Vec<(String, String, i64, i64, Option<String>, i64)> = conn
+        .prepare("PRAGMA table_info(worktree_instances)")?
+        .query_map([], |row| {
+            Ok((
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(5)?,
+                row.get(4)?,
+                row.get(0)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let expected = [
+        ("instance_id", "BLOB", 1, 1, None, 0),
+        ("generation", "BLOB", 1, 0, None, 1),
+        ("repo_id", "BLOB", 1, 0, None, 2),
+        ("common_dir", "BLOB", 1, 0, None, 3),
+        ("admin_id", "BLOB", 1, 0, None, 4),
+        ("branch_ref", "BLOB", 0, 0, None, 5),
+        ("path", "BLOB", 1, 0, None, 6),
+        ("owner", "BLOB", 1, 0, None, 7),
+        ("state", "TEXT", 1, 0, None, 8),
+        ("quarantine_reason", "TEXT", 0, 0, None, 9),
+        ("operation_revision", "INTEGER", 1, 0, Some("0"), 10),
+        ("created_at", "INTEGER", 1, 0, None, 11),
+    ];
+    if columns.len() != expected.len()
+        || expected
+            .iter()
+            .any(|(name, kind, notnull, pk, default, ordinal)| {
+                columns.get(*ordinal).is_none_or(|actual| {
+                    actual.0 != *name
+                        || actual.1.to_ascii_uppercase() != *kind
+                        || actual.2 != *notnull
+                        || actual.3 != *pk
+                        || actual.4.as_deref() != *default
+                })
+            })
+    {
+        bail!("schema v69 worktree_instances columns are incomplete or incompatible");
+    }
+    // Only syntax outside quoted literals is case/space insensitive. In
+    // particular, state='VERIFIED' must never pass for state='verified'.
+    let compact_sql = |sql: &str| {
+        let mut compact = String::with_capacity(sql.len());
+        let mut quote = None;
+        for ch in sql.chars() {
+            if let Some(end) = quote {
+                compact.push(ch);
+                if ch == end {
+                    quote = None;
+                }
+            } else if matches!(ch, '\'' | '"' | '`' | '[') {
+                quote = Some(if ch == '[' { ']' } else { ch });
+                compact.push(ch);
+            } else if !ch.is_whitespace() {
+                compact.push(ch.to_ascii_lowercase());
+            }
+        }
+        compact
+    };
+    let table_sql: String = conn.query_row(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='worktree_instances'",
+        [],
+        |row| row.get(0),
+    )?;
+    if compact_sql(table_sql.trim_end_matches(';'))
+        != compact_sql(V69_WORKTREE_INSTANCES_TABLE_DDL.trim_end_matches(';'))
+    {
+        bail!("schema v69 worktree_instances table DDL is not the canonical shape");
+    }
+    for index in [
+        "idx_worktree_instances_path",
+        "idx_worktree_instances_repo_admin",
+        "idx_worktree_instances_repo",
+        "idx_worktree_instances_state",
+        "uq_worktree_instances_verified_path",
+        "uq_worktree_instances_verified_repo_admin",
+    ] {
+        let found: Option<String> = conn
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type='index' AND name=?1",
+                [index],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if found.as_deref() != Some(index) {
+            bail!("schema v69 is missing index {index}");
+        }
+    }
+    let path_sql: String = conn.query_row(
+        "SELECT sql FROM sqlite_master WHERE type='index' AND name='uq_worktree_instances_verified_path'",
+        [], |row| row.get(0),
+    )?;
+    let repo_sql: String = conn.query_row(
+        "SELECT sql FROM sqlite_master WHERE type='index' AND name='uq_worktree_instances_verified_repo_admin'",
+        [], |row| row.get(0),
+    )?;
+    if compact_sql(&path_sql)
+        != "createuniqueindexuq_worktree_instances_verified_pathonworktree_instances(path)wherestate='verified'"
+        || compact_sql(&repo_sql)
+            != "createuniqueindexuq_worktree_instances_verified_repo_adminonworktree_instances(repo_id,admin_id)wherestate='verified'"
+    {
+        bail!("schema v69 verified uniqueness indices are not partial");
+    }
+    let index_flags: std::collections::HashMap<String, (i64, i64)> = conn
+        .prepare("PRAGMA index_list('worktree_instances')")?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(1)?,
+                (row.get::<_, i64>(2)?, row.get::<_, i64>(4)?),
+            ))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    if index_flags.get("idx_worktree_instances_path") != Some(&(0, 0))
+        || index_flags.get("idx_worktree_instances_repo_admin") != Some(&(0, 0))
+        || index_flags.get("idx_worktree_instances_repo") != Some(&(0, 0))
+        || index_flags.get("idx_worktree_instances_state") != Some(&(0, 0))
+        || index_flags.get("uq_worktree_instances_verified_path") != Some(&(1, 1))
+        || index_flags.get("uq_worktree_instances_verified_repo_admin") != Some(&(1, 1))
+    {
+        bail!("schema v69 worktree identity index flags are incompatible");
+    }
+    let index_columns = |name: &str| -> Result<Vec<String>> {
+        Ok(conn
+            .prepare(&format!("PRAGMA index_info({name})"))?
+            .query_map([], |row| row.get(2))?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    };
+    if index_columns("idx_worktree_instances_path")?
+        != vec![
+            "path".to_string(),
+            "created_at".to_string(),
+            "instance_id".to_string(),
+        ]
+        || index_columns("idx_worktree_instances_repo_admin")?
+            != vec![
+                "repo_id".to_string(),
+                "admin_id".to_string(),
+                "created_at".to_string(),
+                "instance_id".to_string(),
+            ]
+        || index_columns("idx_worktree_instances_repo")?
+            != vec!["repo_id".to_string(), "created_at".to_string()]
+        || index_columns("idx_worktree_instances_state")?
+            != vec!["state".to_string(), "created_at".to_string()]
+        || index_columns("uq_worktree_instances_verified_path")? != vec!["path".to_string()]
+        || index_columns("uq_worktree_instances_verified_repo_admin")?
+            != vec!["repo_id".to_string(), "admin_id".to_string()]
+    {
+        bail!("schema v69 worktree identity indices have an incompatible shape");
+    }
+    Ok(())
+}
+
 /// Does `table` have a column named `col`? The probe for migrations that can't
 /// be expressed as an idempotent `ALTER` (a primary-key change forces a
 /// rebuild-and-copy, which must run exactly once). Returns false when the table
@@ -1125,9 +1456,14 @@ pub(crate) fn verify_v66_schema(conn: &Connection) -> Result<()> {
 }
 #[cfg(test)]
 mod tests {
+    use super::{
+        V69_WORKTREE_INSTANCES_TABLE_DDL, has_column, migrate_v69, refuse_v69_rebuild_remnants,
+        verify_v69_schema,
+    };
     use crate::autopilot::AutopilotIssueKey;
     use crate::db::Db;
     use crate::store::{AutopilotStore, ClaimOutcome, SessionForkStore, WorkspaceStore};
+    use rusqlite::{Connection, params};
 
     #[test]
     fn detect_newer_schema_flags_only_a_newer_db() {
@@ -2090,5 +2426,347 @@ mod tests {
             .unwrap();
         assert_eq!(p.sandbox_backend, "");
         assert_eq!(p.env_name, "");
+    }
+
+    #[test]
+    fn v68_population_migrates_duplicate_legacy_claims_without_selecting_a_winner() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE worktrees (path TEXT, branch TEXT);
+             CREATE TABLE tab_groups (name TEXT, worktree TEXT);
+             INSERT INTO worktrees VALUES ('/same', 'one'), ('/same', 'two');",
+        )
+        .unwrap();
+        migrate_v69(&conn).unwrap();
+        verify_v69_schema(&conn).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM worktrees WHERE path='/same'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn malformed_preexisting_v69_ledger_fails_closed() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE worktrees (path TEXT);
+             CREATE TABLE tab_groups (name TEXT);
+             CREATE TABLE worktree_instances (instance_id BLOB PRIMARY KEY);",
+        )
+        .unwrap();
+        assert!(migrate_v69(&conn).is_err());
+    }
+
+    #[test]
+    fn failed_v69_ledger_rebuild_cannot_hide_claims_on_retry() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE worktrees (path TEXT);
+             CREATE TABLE tab_groups (name TEXT);
+             CREATE TABLE worktree_instances (
+               instance_id BLOB PRIMARY KEY,
+               generation BLOB NOT NULL,
+               repo_id BLOB NOT NULL,
+               common_dir BLOB NOT NULL,
+               admin_id BLOB NOT NULL,
+               branch_ref BLOB,
+               path BLOB NOT NULL,
+               owner BLOB NOT NULL,
+               state TEXT NOT NULL,
+               quarantine_reason TEXT,
+               created_at INTEGER NOT NULL
+             );
+             INSERT INTO worktree_instances
+               VALUES (zeroblob(1), zeroblob(1), zeroblob(1), zeroblob(1),
+                       zeroblob(1), NULL, zeroblob(1), zeroblob(1),
+                       'legacy', NULL, 0);",
+        )
+        .unwrap();
+
+        // The copy into the v69 CHECK-constrained table fails. A retry must
+        // not accept an empty/partial replacement while the old claims remain
+        // stranded in worktree_instances_v69_legacy.
+        assert!(migrate_v69(&conn).is_err());
+        assert!(
+            migrate_v69(&conn).is_err(),
+            "a failed rebuild must remain refused until the old claims are recovered"
+        );
+        let count: i64 = conn
+            .query_row("SELECT count(*) FROM worktree_instances", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            count, 1,
+            "failed migration must preserve the original claim"
+        );
+        assert!(!has_column(
+            &conn,
+            "worktree_instances",
+            "operation_revision"
+        ));
+        refuse_v69_rebuild_remnants(&conn).unwrap();
+        // After explicit repair of the malformed legacy row, the very same
+        // migration completes and retains it. Refusal is recoverable.
+        conn.execute(
+            "UPDATE worktree_instances SET instance_id=zeroblob(32), generation=zeroblob(16), repo_id=zeroblob(32)",
+            [],
+        ).unwrap();
+        migrate_v69(&conn).unwrap();
+        verify_v69_schema(&conn).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT count(*) FROM worktree_instances", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 1);
+        assert!(has_column(
+            &conn,
+            "worktree_instances",
+            "operation_revision"
+        ));
+    }
+
+    #[test]
+    fn v69_unique_index_failure_rolls_back_rebuild_and_preserves_both_claims() {
+        // Two old-ledger rows both claim `verified` for the same path. The
+        // copy succeeds, but the verified-path partial unique index cannot be
+        // created. The whole rebuild must roll back: the old table (without
+        // `operation_revision`) and both claims survive, no rebuild remnant is
+        // left, and a retry refuses the same way rather than accepting a
+        // half-built replacement.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE worktrees (path TEXT);
+             CREATE TABLE tab_groups (name TEXT);
+             CREATE TABLE worktree_instances (
+               instance_id BLOB PRIMARY KEY,
+               generation BLOB NOT NULL,
+               repo_id BLOB NOT NULL,
+               common_dir BLOB NOT NULL,
+               admin_id BLOB NOT NULL,
+               branch_ref BLOB,
+               path BLOB NOT NULL,
+               owner BLOB NOT NULL,
+               state TEXT NOT NULL,
+               quarantine_reason TEXT,
+               created_at INTEGER NOT NULL
+             );
+             INSERT INTO worktree_instances VALUES
+               (randomblob(32), randomblob(16), zeroblob(32), X'2f72', X'61', NULL,
+                X'2f722f77', X'74', 'verified', NULL, 1),
+               (randomblob(32), randomblob(16), zeroblob(32), X'2f72', X'62', NULL,
+                X'2f722f77', X'74', 'verified', NULL, 2);",
+        )
+        .unwrap();
+        for attempt in 0..2 {
+            assert!(
+                migrate_v69(&conn).is_err(),
+                "attempt {attempt}: colliding verified claims must refuse"
+            );
+            let count: i64 = conn
+                .query_row("SELECT count(*) FROM worktree_instances", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 2, "both original claims survive the rollback");
+            assert!(!has_column(
+                &conn,
+                "worktree_instances",
+                "operation_revision"
+            ));
+            assert!(!has_column(&conn, "worktrees", "instance_id"));
+            refuse_v69_rebuild_remnants(&conn).unwrap();
+        }
+    }
+
+    #[test]
+    fn v69_migration_is_idempotent_over_a_valid_old_ledger() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE worktrees (path TEXT);
+             CREATE TABLE tab_groups (name TEXT);
+             CREATE TABLE worktree_instances (
+               instance_id BLOB PRIMARY KEY,
+               generation BLOB NOT NULL,
+               repo_id BLOB NOT NULL,
+               common_dir BLOB NOT NULL,
+               admin_id BLOB NOT NULL,
+               branch_ref BLOB,
+               path BLOB NOT NULL,
+               owner BLOB NOT NULL,
+               state TEXT NOT NULL,
+               quarantine_reason TEXT,
+               created_at INTEGER NOT NULL
+             );
+             INSERT INTO worktree_instances VALUES
+               (randomblob(32), randomblob(16), zeroblob(32), X'2f72', X'61', X'62',
+                X'2f722f77', X'74', 'legacy', NULL, 1);",
+        )
+        .unwrap();
+        migrate_v69(&conn).unwrap();
+        migrate_v69(&conn).unwrap();
+        verify_v69_schema(&conn).unwrap();
+        let (count, revision): (i64, i64) = conn
+            .query_row(
+                "SELECT count(*), max(operation_revision) FROM worktree_instances",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((count, revision), (1, 0));
+    }
+
+    #[test]
+    fn v69_stale_rebuild_is_refused_even_with_a_complete_replacement() {
+        let conn = fresh_v69_connection();
+        conn.execute_batch(
+            "CREATE TABLE worktree_instances_v69_legacy AS SELECT * FROM worktree_instances;",
+        )
+        .unwrap();
+        assert!(verify_v69_schema(&conn).is_err());
+        assert!(migrate_v69(&conn).is_err());
+        assert!(refuse_v69_rebuild_remnants(&conn).is_err());
+    }
+
+    #[test]
+    fn v69_verifier_preserves_partial_predicate_literal_case_and_spaces() {
+        for state in ["VERIFIED", "ver ified", " verified", "verified "] {
+            let conn = fresh_v69_connection();
+            conn.execute_batch(&format!(
+                "DROP INDEX uq_worktree_instances_verified_path;
+                 CREATE UNIQUE INDEX uq_worktree_instances_verified_path
+                   ON worktree_instances(path) WHERE state='{state}';",
+            ))
+            .unwrap();
+            // These are real duplicate verified-path claims: the malformed
+            // predicate permits both, which is why DDL comparison must refuse.
+            for id in [1u8, 2] {
+                conn.execute(
+                    "INSERT INTO worktree_instances VALUES
+                       (?1, zeroblob(16), zeroblob(32), x'00', ?1, NULL,
+                        x'00', x'00', 'verified', NULL, 0, 0)",
+                    params![vec![id; 32]],
+                )
+                .unwrap();
+            }
+            assert!(verify_v69_schema(&conn).is_err(), "accepted {state:?}");
+        }
+    }
+
+    #[test]
+    fn v69_verifier_preserves_check_literal_case_and_spaces() {
+        for state in ["VERIFIED", "ver ified"] {
+            let conn = fresh_v69_connection();
+            conn.execute_batch("DROP TABLE worktree_instances").unwrap();
+            conn.execute_batch(
+                &V69_WORKTREE_INSTANCES_TABLE_DDL.replace("'verified'", &format!("'{state}'")),
+            )
+            .unwrap();
+            assert!(migrate_v69(&conn).is_err(), "accepted {state:?}");
+            assert!(verify_v69_schema(&conn).is_err());
+        }
+    }
+
+    #[test]
+    fn v69_verifier_checks_types_checks_and_partial_unique_flags() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE worktrees (path TEXT);
+             CREATE TABLE tab_groups (name TEXT);",
+        )
+        .unwrap();
+        migrate_v69(&conn).unwrap();
+        verify_v69_schema(&conn).unwrap();
+
+        conn.execute_batch(
+            "DROP INDEX uq_worktree_instances_verified_path;
+             CREATE UNIQUE INDEX uq_worktree_instances_verified_path
+               ON worktree_instances(path) WHERE state='legacy';",
+        )
+        .unwrap();
+        assert!(verify_v69_schema(&conn).is_err());
+    }
+
+    fn fresh_v69_connection() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE worktrees (path TEXT);
+             CREATE TABLE tab_groups (name TEXT);",
+        )
+        .unwrap();
+        migrate_v69(&conn).unwrap();
+        verify_v69_schema(&conn).unwrap();
+        conn
+    }
+
+    #[test]
+    fn v69_verifier_rejects_wrong_ledger_column_type() {
+        let conn = fresh_v69_connection();
+        conn.execute_batch(
+            "DROP TABLE worktree_instances;
+             CREATE TABLE worktree_instances (
+               instance_id TEXT NOT NULL PRIMARY KEY CHECK(length(instance_id)=32),
+               generation BLOB NOT NULL CHECK(length(generation)=16),
+               repo_id BLOB NOT NULL CHECK(length(repo_id)=32),
+               common_dir BLOB NOT NULL, admin_id BLOB NOT NULL, branch_ref BLOB,
+               path BLOB NOT NULL, owner BLOB NOT NULL,
+               state TEXT NOT NULL CHECK(state IN ('verified','legacy','quarantined','split')),
+               quarantine_reason TEXT,
+               operation_revision INTEGER NOT NULL DEFAULT 0 CHECK(operation_revision >= 0),
+               created_at INTEGER NOT NULL
+             );",
+        )
+        .unwrap();
+        assert!(verify_v69_schema(&conn).is_err());
+    }
+
+    #[test]
+    fn v69_verifier_rejects_nonunique_supporting_claim_index() {
+        let conn = fresh_v69_connection();
+        conn.execute_batch(
+            "DROP INDEX uq_worktree_instances_verified_path;
+             CREATE INDEX uq_worktree_instances_verified_path
+               ON worktree_instances(path) WHERE state='verified';",
+        )
+        .unwrap();
+        assert!(verify_v69_schema(&conn).is_err());
+    }
+
+    #[test]
+    fn v69_verifier_rejects_wrong_partial_index_predicate() {
+        let conn = fresh_v69_connection();
+        conn.execute_batch(
+            "DROP INDEX uq_worktree_instances_verified_path;
+             CREATE UNIQUE INDEX uq_worktree_instances_verified_path
+               ON worktree_instances(path) WHERE state='legacy';",
+        )
+        .unwrap();
+        assert!(verify_v69_schema(&conn).is_err());
+    }
+
+    #[test]
+    fn v69_verifier_rejects_check_text_hidden_in_a_comment() {
+        let conn = fresh_v69_connection();
+        conn.execute_batch(
+            "DROP TABLE worktree_instances;
+             CREATE TABLE worktree_instances (
+               instance_id BLOB NOT NULL PRIMARY KEY /* CHECK(length(instance_id)=32) */,
+               generation BLOB NOT NULL /* CHECK(length(generation)=16) */,
+               repo_id BLOB NOT NULL /* CHECK(length(repo_id)=32) */,
+               common_dir BLOB NOT NULL, admin_id BLOB NOT NULL, branch_ref BLOB,
+               path BLOB NOT NULL, owner BLOB NOT NULL,
+               state TEXT NOT NULL /* CHECK(state IN ('verified','legacy','quarantined','split')) */,
+               quarantine_reason TEXT,
+               operation_revision INTEGER NOT NULL DEFAULT 0 /* CHECK(operation_revision >= 0) */,
+               created_at INTEGER NOT NULL
+             );",
+        )
+        .unwrap();
+        assert!(verify_v69_schema(&conn).is_err());
     }
 }

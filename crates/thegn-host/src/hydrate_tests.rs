@@ -1862,3 +1862,93 @@ fn auto_clean_refuses_a_target_origin_change_before_and_during_state_lookup() {
         "a scope change during the provider request must prevent cleanup"
     );
 }
+
+/// THE-516: two legacy registry rows sharing one slugged tab are quarantined —
+/// neither is surfaced for tab-keyed routing — while a same-named tab in a
+/// DIFFERENT repository and the uncontested rows are unaffected.
+#[test]
+fn ambiguous_legacy_tabs_are_quarantined_from_the_registry_list() {
+    use thegn_core::store::WorkspaceStore;
+    let db = thegn_core::db::Db::open_memory().unwrap();
+    db.put_worktree("app/feat-a", "/r/app", "/wt/one", "feat/a", None, None)
+        .unwrap();
+    db.put_worktree("app/feat-a", "/r/app", "/wt/two", "feat-a", None, None)
+        .unwrap();
+    db.put_worktree("app/feat-a", "/r/other", "/wt/three", "feat-a", None, None)
+        .unwrap();
+    let rows = db.worktrees().unwrap();
+    let ambiguous = super::ambiguous_registry_tabs(&rows);
+    assert_eq!(ambiguous.len(), 1);
+    assert!(ambiguous.contains(&("/r/app".to_string(), "app/feat-a".to_string())));
+}
+
+/// THE-516: `db_worktree_list` omits EXACTLY the contested rows (so nothing
+/// routes to an arbitrary claimant), keeps every other row, deletes nothing,
+/// and stamps the contested rows so the startup notice and `thegn doctor` can
+/// report the worktrees that are missing from the sidebar.
+#[test]
+fn db_worktree_list_omits_only_contested_rows_and_stamps_them() {
+    use thegn_core::store::WorkspaceStore;
+    let scratch = std::env::temp_dir().join(format!(
+        "tg-hydrate-quarantine-{}-{}",
+        std::process::id(),
+        thegn_core::util::now()
+    ));
+    let paths: Vec<String> = ["one", "two", "three", "solo"]
+        .iter()
+        .map(|name| {
+            let path = scratch.join(name);
+            std::fs::create_dir_all(&path).unwrap();
+            path.to_string_lossy().into_owned()
+        })
+        .collect();
+    let db = thegn_core::db::Db::open_memory().unwrap();
+    // `feat/a` and `feat-a` both slugged to `app/feat-a` before THE-516.
+    db.put_worktree("app/feat-a", "/r/app", &paths[0], "feat/a", None, None)
+        .unwrap();
+    db.put_worktree("app/feat-a", "/r/app", &paths[1], "feat-a", None, None)
+        .unwrap();
+    // Same tab text, different repository: not contested.
+    db.put_worktree("app/feat-a", "/r/other", &paths[2], "feat-a", None, None)
+        .unwrap();
+    db.put_worktree("app/solo", "/r/app", &paths[3], "solo", None, None)
+        .unwrap();
+
+    let listed = super::db_worktree_list(&db, &thegn_core::config::Config::default());
+    let shown: Vec<&str> = listed.iter().map(|w| w.path.as_str()).collect();
+    assert_eq!(
+        shown,
+        vec![paths[2].as_str(), paths[3].as_str()],
+        "exactly the two contested rows are withheld from routing"
+    );
+    assert_eq!(
+        db.worktrees().unwrap().len(),
+        4,
+        "no registry row is deleted"
+    );
+    assert_eq!(
+        db.quarantined_worktree_rows().unwrap(),
+        {
+            let mut expect = vec![
+                (
+                    paths[0].clone(),
+                    super::QUARANTINE_AMBIGUOUS_TAB.to_string(),
+                ),
+                (
+                    paths[1].clone(),
+                    super::QUARANTINE_AMBIGUOUS_TAB.to_string(),
+                ),
+            ];
+            expect.sort();
+            expect
+        },
+        "contested rows are stamped so doctor/startup can report them"
+    );
+    // The stamp is reconciled, not sticky: removing one claimant clears it.
+    db.del_worktree(&paths[1]).unwrap();
+    let listed = super::db_worktree_list(&db, &thegn_core::config::Config::default());
+    assert_eq!(listed.len(), 3, "the surviving claimant comes back");
+    assert!(db.quarantined_worktree_rows().unwrap().is_empty());
+    // best-effort: test cleanup
+    let _ = std::fs::remove_dir_all(&scratch);
+}

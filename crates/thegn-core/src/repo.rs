@@ -3,10 +3,51 @@
 //! resurrection (git is the source of truth; the DB is only a cache).
 
 use crate::config::Config;
+use crate::identity::{ExactPath, IdentityError, RepositoryId};
 use crate::store::WorkspaceStore;
 use crate::util;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
+
+const MAX_GIT_IDENTITY_OUTPUT: usize = 16 * 1024;
+
+/// Resolve Git's canonical common directory as an exact, bounded path.
+///
+/// Repository identity is intentionally tied to this directory rather than a
+/// remote URL or basename. Moving the common directory therefore changes the
+/// [`RepositoryId`] and requires an explicit trusted-overlay migration.
+pub fn canonical_common_dir(root: &Path) -> Result<ExactPath, IdentityError> {
+    let output = util::git_stdout_bounded(
+        root,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        MAX_GIT_IDENTITY_OUTPUT,
+    )
+    .map_err(|_| IdentityError::GitProbeFailed {
+        operation: "rev-parse --git-common-dir",
+    })?;
+    let raw = trim_git_line(&output).ok_or(IdentityError::GitProbeFailed {
+        operation: "empty git common directory",
+    })?;
+    let path = ExactPath::from_git_bytes(raw)?;
+    let canonical =
+        std::fs::canonicalize(path.as_path()).map_err(|_| IdentityError::GitProbeFailed {
+            operation: "canonicalize git common directory",
+        })?;
+    ExactPath::from_path(&canonical)
+}
+
+/// Construct the canonical repository identity without consulting SQLite.
+pub fn repository_id(root: &Path) -> Result<RepositoryId, IdentityError> {
+    RepositoryId::from_common_dir(&canonical_common_dir(root)?)
+}
+
+fn trim_git_line(output: &[u8]) -> Option<&[u8]> {
+    let end = output
+        .len()
+        .checked_sub(1)
+        .filter(|&end| output[end] == b'\n')?;
+    (end > 0).then_some(&output[..end])
+}
 
 /// Toplevel of the working tree containing `dir`.
 pub fn toplevel(dir: &Path) -> Option<PathBuf> {
@@ -108,10 +149,45 @@ pub fn home_tab(slug: &str) -> String {
     format!("{slug}/home")
 }
 
-/// Tab name for a worktree of `slug` on `branch` (`"{slug}/{branch-slug}"`).
-/// Globally unique, so it doubles as the key the panel/`resolve-worktree` use.
+/// Tab name for a worktree of `slug` on `branch`: `"{slug}/{branch}"` with the
+/// EXACT branch name (THE-516). It used to slugify the branch, so `feat/a`,
+/// `feat-a` and `feat_a` all became `{slug}/feat-a` and shared one tab/DB key.
+/// Branch names are already unique per repository, so the exact name is a
+/// collision-free key; `split_tab` splits on the FIRST `/` (the slug never
+/// contains one), so a branch containing `/` round-trips.
+///
+/// The one reserved name is `home`, which would alias [`home_tab`]. It is
+/// escaped as `home~`: `~` can never appear in a Git ref name, so no real
+/// branch produces that tab.
 pub fn branch_tab(slug: &str, branch: &str) -> String {
-    format!("{slug}/{}", util::slugify(branch))
+    if branch == "home" {
+        return format!("{slug}/home~");
+    }
+    format!("{slug}/{branch}")
+}
+
+/// [`repo_slug`] for authority-bearing callers (registration, routing). The
+/// infallible variant falls back to the unsuffixed basename slug when the DB
+/// is unavailable, which re-aliases same-basename repositories (`repo` vs
+/// `repo-2`). This variant refuses instead, so nothing is registered or routed
+/// under a fabricated identity.
+pub fn repo_slug_checked(root: &Path) -> anyhow::Result<String> {
+    let db = crate::db::Db::open()?;
+    db.slug_for_repo(&root.to_string_lossy(), &slug_base(&repo_name(root)))
+}
+
+/// [`repo_slug_with`] that refuses instead of falling back (see
+/// [`repo_slug_checked`]). Path-derived name, no Git, like [`repo_slug_with`].
+pub fn repo_slug_with_checked(db: &crate::db::Db, root: &Path) -> anyhow::Result<String> {
+    db.slug_for_repo(
+        &root.to_string_lossy(),
+        &slug_base(&repo_name_from_path(root)),
+    )
+}
+
+fn slug_base(name: &str) -> String {
+    let s = util::slugify(name);
+    if s.is_empty() { "repo".to_string() } else { s }
 }
 
 /// Discover git repos under the configured roots (parent dirs of a `.git`
@@ -216,5 +292,60 @@ mod tests {
         assert_eq!(worktree_root_for_cwd(&dir.join("missing")), None);
         // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn repository_id_uses_git_common_dir_not_basename_or_symlink_alias() {
+        let root = tmp("identity-root");
+        let other = tmp("identity-other");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&other);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        assert!(util::git_cmd(&root).arg("init").status().unwrap().success());
+        assert!(
+            util::git_cmd(&other)
+                .arg("init")
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        let first = repository_id(&root).unwrap();
+        let second = repository_id(&other).unwrap();
+        assert_ne!(
+            first, second,
+            "same basename roots must not share a repository ID"
+        );
+
+        #[cfg(unix)]
+        {
+            let alias = tmp("identity-root-alias");
+            let _ = std::fs::remove_file(&alias);
+            std::os::unix::fs::symlink(&root, &alias).unwrap();
+            assert_eq!(
+                first,
+                repository_id(&alias).unwrap(),
+                "a symlink alias must resolve to the same Git common-dir identity"
+            );
+            let _ = std::fs::remove_file(alias);
+        }
+
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(other);
+    }
+
+    #[test]
+    fn branch_tabs_are_exact_and_never_alias() {
+        let branches = [
+            "feat/a", "feat-a", "feat_a", "FEAT-A", "修复", "home", "home~x",
+        ];
+        let tabs: Vec<String> = branches.iter().map(|b| branch_tab("app", b)).collect();
+        for (i, t) in tabs.iter().enumerate() {
+            assert!(tabs[i + 1..].iter().all(|u| u != t), "{t} aliased");
+            assert_ne!(t, &home_tab("app"), "no branch aliases the home tab");
+        }
+        assert_eq!(branch_tab("app", "feat/a"), "app/feat/a");
+        assert_eq!(branch_tab("app", "home"), "app/home~");
     }
 }

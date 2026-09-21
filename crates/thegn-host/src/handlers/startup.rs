@@ -253,6 +253,27 @@ pub(crate) fn reseed_default_terminal(db: Option<&Db>) {
     }
 }
 
+/// A one-line status note when registry rows are quarantined because several
+/// worktrees claim one legacy tab name (THE-516). Those worktrees are left on
+/// disk and untouched, but they are not routed by that tab, so the user is
+/// told rather than left to notice a missing sidebar row. `None` when the
+/// registry is clean or unreadable.
+pub(crate) fn quarantined_worktree_status(db: Option<&Db>) -> Option<String> {
+    let rows = db?.quarantined_worktree_rows().ok()?;
+    let first = rows.first()?;
+    let more = rows.len().saturating_sub(1);
+    Some(format!(
+        "⚠ {} worktree(s) quarantined (ambiguous legacy tab), e.g. {}{}; run `thegn doctor` — rename a branch or remove one checkout to clear it",
+        rows.len(),
+        first.0,
+        if more > 0 {
+            format!(" (+{more} more)")
+        } else {
+            String::new()
+        }
+    ))
+}
+
 /// A one-line status note when the on-disk DB was written by a newer-schema
 /// build (a different branch sharing this file). `None` when schemas match.
 pub(crate) fn schema_mismatch_status(db: Option<&Db>) -> Option<String> {

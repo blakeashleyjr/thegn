@@ -840,8 +840,9 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     // Surface a newer-schema DB (a different-branch build wrote this shared DB):
     // we open it anyway, but some data may be invisible to this build.
     // Schema mismatch (data-loss risk) wins; else the stable-channel clamp note.
-    if let Some(note) =
-        crate::handlers::startup::schema_mismatch_status(startup_db.as_ref()).or(channel_note)
+    if let Some(note) = crate::handlers::startup::schema_mismatch_status(startup_db.as_ref())
+        .or_else(|| crate::handlers::startup::quarantined_worktree_status(startup_db.as_ref()))
+        .or(channel_note)
     {
         model.status = note;
     }
