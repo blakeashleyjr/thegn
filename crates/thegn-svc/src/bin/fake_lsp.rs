@@ -31,6 +31,23 @@ fn reply(out: &mut impl Write, id: &Value, result: Value) {
     );
 }
 
+fn deep_symbol_result() -> Value {
+    let mut symbol = json!({
+        "name": "leaf",
+        "kind": 12,
+        "range": { "start": { "line": 0, "character": 0 } }
+    });
+    for index in 0..=64 {
+        symbol = json!({
+            "name": format!("deep{index}"),
+            "kind": 12,
+            "range": { "start": { "line": index, "character": 0 } },
+            "children": [symbol]
+        });
+    }
+    json!([symbol])
+}
+
 /// Pull the next complete message body out of `buf`, draining it.
 fn next_message(buf: &mut Vec<u8>) -> Option<String> {
     let sep = buf.windows(4).position(|w| w == b"\r\n\r\n")?;
@@ -88,6 +105,31 @@ fn main() {
                     if std::env::args().any(|a| a == "--no-hover") {
                         caps.as_object_mut().unwrap().remove("hoverProvider");
                     }
+                    // `--flood N`: publish N unique documents BEFORE the
+                    // initialize reply, so a client's `initialize()` returning
+                    // proves every flood notification was already dispatched.
+                    let flood = std::env::args()
+                        .skip_while(|a| a != "--flood")
+                        .nth(1)
+                        .and_then(|n| n.parse::<usize>().ok())
+                        .unwrap_or(0);
+                    for index in 0..flood {
+                        send(
+                            &mut out,
+                            &json!({
+                                "jsonrpc": "2.0",
+                                "method": "textDocument/publishDiagnostics",
+                                "params": {
+                                    "uri": format!("file:///proj/flood/{index}.rs"),
+                                    "diagnostics": [{
+                                        "range": { "start": { "line": 0, "character": 0 } },
+                                        "severity": 2,
+                                        "message": format!("flood {index}")
+                                    }]
+                                }
+                            }),
+                        );
+                    }
                     reply(
                         &mut out,
                         &id.unwrap_or(Value::Null),
@@ -112,17 +154,33 @@ fn main() {
                             }
                         }),
                     );
+                    // `--clear`: then clear the same document (a complete,
+                    // empty publication that must supersede the update).
+                    if std::env::args().any(|a| a == "--clear") {
+                        send(
+                            &mut out,
+                            &json!({
+                                "jsonrpc": "2.0",
+                                "method": "textDocument/publishDiagnostics",
+                                "params": { "uri": "file:///proj/src/lib.rs", "diagnostics": [] }
+                            }),
+                        );
+                    }
                 }
                 "textDocument/documentSymbol" => reply(
                     &mut out,
                     &id.unwrap_or(Value::Null),
                     // A name no tree-sitter parse of the fixture would produce, so
                     // a test seeing it knows the result came from the server.
-                    json!([{
-                        "name": "lspProbe", "kind": 12,
-                        "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 2, "character": 0 } },
-                        "selectionRange": { "start": { "line": 0, "character": 3 }, "end": { "line": 0, "character": 8 } }
-                    }]),
+                    if std::env::args().any(|a| a == "--deep-symbols") {
+                        deep_symbol_result()
+                    } else {
+                        json!([{
+                            "name": "lspProbe", "kind": 12,
+                            "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 2, "character": 0 } },
+                            "selectionRange": { "start": { "line": 0, "character": 3 }, "end": { "line": 0, "character": 8 } }
+                        }])
+                    },
                 ),
                 "workspace/symbol" => reply(
                     &mut out,
@@ -154,6 +212,30 @@ fn main() {
                     &id.unwrap_or(Value::Null),
                     json!({ "contents": { "kind": "markdown", "value": "fn greet() -> u8" } }),
                 ),
+                // `--echo-open`: answer didOpen with a diagnostic carrying the
+                // received text length, proving a large document arrived whole.
+                "textDocument/didOpen" if std::env::args().any(|a| a == "--echo-open") => {
+                    let doc = msg.get("params").and_then(|p| p.get("textDocument"));
+                    let uri = doc
+                        .and_then(|d| d.get("uri"))
+                        .cloned()
+                        .unwrap_or(Value::Null);
+                    let len = doc
+                        .and_then(|d| d.get("text"))
+                        .and_then(Value::as_str)
+                        .map_or(0, str::len);
+                    send(
+                        &mut out,
+                        &json!({
+                            "jsonrpc": "2.0",
+                            "method": "textDocument/publishDiagnostics",
+                            "params": { "uri": uri, "diagnostics": [{
+                                "range": { "start": { "line": 0, "character": 0 } },
+                                "message": format!("opened {len}")
+                            }]}
+                        }),
+                    );
+                }
                 "shutdown" => reply(&mut out, &id.unwrap_or(Value::Null), Value::Null),
                 "exit" => break,
                 _ => {

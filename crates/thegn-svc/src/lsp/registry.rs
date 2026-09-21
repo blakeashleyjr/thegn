@@ -14,7 +14,7 @@ use std::path::Path;
 use thegn_core::config::LspServerConfig;
 use thegn_core::lsp_registry::{BUILTIN_SERVERS, is_builtin_key, normalize_ext};
 
-use super::ServerSpec;
+use super::{ServerSpec, limits};
 
 /// One resolved registry entry: a language key, the extensions it serves, the
 /// `didOpen` languageId, and the server command/args.
@@ -72,7 +72,21 @@ impl Registry {
 
         for s in servers {
             let key = s.lang.trim();
-            if key.is_empty() {
+            if key.is_empty()
+                || key.len() > limits::MAX_IDENTITY_BYTES
+                || s.command.len() > limits::MAX_IDENTITY_BYTES
+                || s.args.len() > limits::MAX_REGISTRY_ARGS
+                || s.args
+                    .iter()
+                    .any(|arg| arg.len() > limits::MAX_SCALAR_STRING_BYTES)
+                || s.extensions.len() > limits::MAX_CONTAINER_ITEMS
+                || s.extensions
+                    .iter()
+                    .any(|ext| ext.len() > limits::MAX_IDENTITY_BYTES)
+                || s.language_id
+                    .as_ref()
+                    .is_some_and(|id| id.len() > limits::MAX_IDENTITY_BYTES)
+            {
                 continue; // flagged by config validation; ignored at runtime
             }
             let ext_override: Vec<String> = s
@@ -87,7 +101,12 @@ impl Registry {
                 // `command = ""` disables (today's semantics); a non-empty
                 // command is trusted outright.
                 slot.command = s.command.clone();
-                slot.args = s.args.clone();
+                slot.args = s
+                    .args
+                    .iter()
+                    .take(limits::MAX_REGISTRY_ARGS)
+                    .cloned()
+                    .collect();
                 slot.default_command = false;
                 if !ext_override.is_empty() {
                     slot.extensions = ext_override;
@@ -104,12 +123,20 @@ impl Registry {
                     .filter(|id| !id.is_empty())
                     .unwrap_or(key)
                     .to_string();
+                if entries.len() >= limits::MAX_REGISTRY_ENTRIES {
+                    continue;
+                }
                 entries.push(RegistryEntry {
                     key: key.to_string(),
                     extensions: ext_override,
                     language_id,
                     command: s.command.clone(),
-                    args: s.args.clone(),
+                    args: s
+                        .args
+                        .iter()
+                        .take(limits::MAX_REGISTRY_ARGS)
+                        .cloned()
+                        .collect(),
                     default_command: false,
                     builtin: is_builtin_key(key),
                 });
