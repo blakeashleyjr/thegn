@@ -23,7 +23,7 @@ use chrono::{DateTime, Datelike, Local, NaiveDate};
 use chrono_tz::Tz;
 use thegn_core::calendar::{CalCursor, CalEvent, ResolvedClock};
 
-use crate::calendar_docs::{CalUiCfg, CalendarDocs, CalendarError, WxUiCfg};
+use crate::calendar_docs::{CalUiCfg, CalendarDocs, CalendarViewError, WxUiCfg};
 use crate::chrome::FrameModel;
 use crate::compositor::Rect;
 
@@ -54,7 +54,7 @@ pub(crate) struct CalState {
     pub loaded: BTreeSet<(i32, u32)>,
     /// Months whose last delivery failed or was incomplete (see
     /// [`crate::calendar_docs::fold_month`]).
-    pub errors: BTreeMap<(i32, u32), CalendarError>,
+    pub errors: BTreeMap<(i32, u32), CalendarViewError>,
     /// The month whose fetch is in flight. Guards against firing a second
     /// request for a month already being fetched, and lets a late payload for a
     /// month the user has navigated away from be dropped — the `pending_ci`
@@ -79,7 +79,7 @@ impl CalState {
         self.loaded.contains(&self.cursor.visible_month())
     }
 
-    pub fn month_error(&self) -> Option<CalendarError> {
+    pub fn month_error(&self) -> Option<CalendarViewError> {
         self.errors.get(&self.cursor.visible_month()).copied()
     }
 
@@ -114,7 +114,7 @@ pub struct CalendarPayload {
     /// when the month could not be produced (the last valid snapshot stays).
     pub events: Option<Vec<(NaiveDate, Vec<Arc<CalEvent>>)>>,
     /// Why the month is unavailable — or, alongside `events`, incomplete.
-    pub error: Option<CalendarError>,
+    pub error: Option<CalendarViewError>,
 }
 
 /// Build the calendar popup for the `date`/`clock` bar items.
