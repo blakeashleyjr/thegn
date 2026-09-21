@@ -498,15 +498,16 @@ thegn SHALL let a supervisor ask it to perform one stage dispatch
 itself: insert the roster row, render the stage's configured prompt from the
 bindings the caller provides, refuse to launch on an empty render, derive the
 row's artifact path, open the daemon session (the launch layers the stage's
-`model` / `env` / `permissions` over the agent entry and seeds the effective
-allow-list — the same path every launch takes), stamp the row with the session
-id and artifact path, and only then mark the row running. thegn MUST NOT
-decide whether the dispatch is worth making, which stage comes next, or
-whether the result is good — those are the supervising agent's judgment. A
-stage prompt that renders empty MUST be refused with no session opened (an
-empty prompt means an interactive launch, silently — the pilot's
-silent-failure mode). Publishing the opened process MUST transition only its
-still-queued/spawning reservation. If a concurrent supervisor already failed,
+`model` / `env` / `permissions` over the agent entry and carries the effective
+allow-list as a command-scoped grant — the same path every launch takes),
+stamp the row with the session id and artifact path, and only then mark the
+row running. thegn MUST NOT decide whether the dispatch is worth making,
+which stage comes next, or whether the result is good — those are the
+supervising agent's judgment. A stage prompt that renders empty MUST be
+refused with no session opened (an empty prompt means an interactive launch,
+silently — the pilot's silent-failure mode). Publishing the opened process
+MUST transition only its still-queued/spawning reservation. If a concurrent
+supervisor already failed,
 abandoned, or otherwise moved the row, thegn MUST preserve that verdict and
 tear the newly opened process down rather than resurrecting the row.
 
@@ -550,39 +551,56 @@ tear the newly opened process down rather than resurrecting the row.
 - **THEN** the rendered stage prompt contains them verbatim — a substituted
   value is never re-parsed, so a value cannot inject a placeholder
 
-### Requirement: Stage permissions ride the launch, never a second seeder
+### Requirement: Stage permissions ride the launch command, never the worktree
 
-`[[pipeline.stages]]` SHALL carry an optional `permissions` list of
-tool-permission patterns in the harness's own vocabulary, and a stage dispatch
-SHALL apply them through the daemon's launch path — the stage's list replaces
-the agent entry's when non-empty, and the _effective_ list is written into the
-harness's per-worktree settings file by the one seeder every launch path uses
-(`agent_permissions`, harness-aware). thegn MUST NOT keep a second,
-CLI-side seeder for the dispatch: one file, one writer. The file contract is
-the launcher's: every other key and value already in the document is
-preserved, and a file thegn cannot parse or whose shape it does not understand
-is refused rather than overwritten. thegn MUST NOT interpret the patterns.
+`[[agents]]` entries and `[[pipeline.stages]]` SHALL carry an optional
+`permissions` list of tool-permission patterns in the harness's own
+vocabulary; the stage's list replaces the agent entry's when non-empty. The
+_effective_ list SHALL be granted to exactly one process through the
+harness's documented, command-scoped mechanism
+(`Harness::session_permission_args`, the `PERMISSIONS` capability — for
+claude, `--settings` carrying `{"permissions":{"allow":[…]}}`), rendered as
+argv with every token shell-quoted, on every launch shape (fresh interactive,
+headless, resume, continue, fork; local, sandboxed and remote alike). Launch
+preparation MUST NOT read, create or write any file under the worktree for
+this purpose, so repository-controlled paths (symlinks, FIFOs, hard links)
+cannot redirect it, concurrent launches cannot inherit one another's grant,
+and nothing persists after the process. The user's and repository's own
+harness settings (deny rules, hooks, unknown keys) are never modified and keep
+applying: the grant is an additional layer, not a replacement. A harness
+without an attested command-scoped mechanism MUST refuse a non-empty list
+(fail closed) — never drop it, never write it to a file, never substitute a
+skip-permissions mode — and a stage dispatch MUST be refused before its roster
+row is claimed. thegn MUST NOT interpret the patterns.
 
-#### Scenario: Unrelated keys survive the seed
+#### Scenario: A permissioned launch leaves the repository untouched
 
-- **WHEN** an existing settings file holds unrelated keys (model, MCP toggles,
-  a deny list) alongside a permissions allow-list
-- **THEN** after the seed every unrelated key holds the same value; only
-  `permissions.allow` is rewritten to the effective list (the entry's, or the
-  stage's when the stage configures one)
+- **WHEN** an agent with a non-empty effective list launches in a worktree
+  whose `.claude/settings.local.json` is a symlink to a missing outside path,
+  whose `.claude` is a symlink to an outside directory, or whose leaf is a FIFO
+- **THEN** the launch command carries the grant, no outside path is created,
+  the FIFO is never opened, and `git status --porcelain=v1 -z` is
+  byte-identical before and after
 
-#### Scenario: A file thegn does not understand is refused, not overwritten
+#### Scenario: Concurrent launches keep their own grants
 
-- **WHEN** the existing settings file is not valid JSON, or its required
-  nesting is not the expected shape
-- **THEN** the seed is refused (best-effort at launch: a warning, and the
-  launch proceeds), and the file is left byte-identical
+- **WHEN** two stages with different lists launch concurrently in one worktree
+- **THEN** each launch command carries exactly its own list and never the
+  other's
+
+#### Scenario: A harness that cannot grant command-scoped is refused
+
+- **WHEN** the effective harness (including one a stage swaps in) has no
+  command-scoped permission mechanism and the effective list is non-empty
+- **THEN** the launch command is refused with a "permission policy hold"
+  error, a stage dispatch claims no roster row and spawns nothing, and
+  `thegn config validate` reports the entry or stage
 
 #### Scenario: A stage with no permissions inherits the entry's list
 
 - **WHEN** a stage's `permissions` list is empty or omitted
-- **THEN** the launch seeds the agent entry's list (if any), no settings file
-  is created for the stage's sake alone, and the config validates clean
+- **THEN** the launch grants the agent entry's list (if any), and a stage
+  whose harness can grant it validates clean
 
 ### Requirement: Run completion is verified, not claimed
 

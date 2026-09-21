@@ -1164,7 +1164,11 @@ fn harness_report(cfg: &Config) {
     if !cfg.agents.is_empty() {
         outln!("  [[agents]] (effective):");
         for a in &cfg.agents {
-            match thegn_core::agent_task::effective_agent(cfg, &a.name, None) {
+            match thegn_core::agent_task::effective_agent(cfg, &a.name, None)
+                // A list the harness cannot grant command-scoped refuses the
+                // launch (THE-440) — show the entry as INVALID, not as a count.
+                .and_then(|e| e.permission_args().map(|_| e))
+            {
                 Ok(e) => outln!(
                     "    {:<20} harness: {:<8} model: {:<24} env: {} · permissions: {}",
                     a.name,
@@ -1189,8 +1193,10 @@ fn agents_json(cfg: &Config) -> serde_json::Value {
     let agents: Vec<serde_json::Value> = cfg
         .agents
         .iter()
-        .map(
-            |a| match thegn_core::agent_task::effective_agent(cfg, &a.name, None) {
+        .map(|a| {
+            match thegn_core::agent_task::effective_agent(cfg, &a.name, None)
+                .and_then(|e| e.permission_args().map(|_| e))
+            {
                 Ok(e) => serde_json::json!({
                     "name": a.name,
                     "harness": e.harness,
@@ -1199,8 +1205,8 @@ fn agents_json(cfg: &Config) -> serde_json::Value {
                     "permissions": e.permissions,
                 }),
                 Err(why) => serde_json::json!({ "name": a.name, "error": why }),
-            },
-        )
+            }
+        })
         .collect();
     serde_json::Value::Array(agents)
 }

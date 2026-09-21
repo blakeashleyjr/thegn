@@ -248,9 +248,21 @@ permissions = ["Read", "Edit", "Bash", "Grep", "Glob"]        # headless allow-l
   expand `env:VAR` and `file:PATH`; never write a raw secret here. This is how
   one entry runs under a second account (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`) or
   a relocated pi home (`PI_CODING_AGENT_DIR`).
-- **`permissions`** is seeded into the worktree before the harness starts
-  (claude: `.claude/settings.local.json` → `permissions.allow`, every other key
-  in that file kept), so a headless worker never auto-denies its first tool.
+- **`permissions`** is granted to that one launch on the command line, so a
+  headless worker never auto-denies its first tool. For claude it rides
+  `--settings '{"permissions":{"allow":[…]}}'`: a per-session layer that
+  merges with your user/project/local settings (their deny rules, hooks and
+  other keys keep applying) and writes no file. Nothing under the worktree is
+  read or written, a concurrent launch never inherits another's grant, and
+  nothing persists after the process exits. A harness with no command-scoped
+  grant thegn can vouch for (codex, pi, aider) **refuses** a non-empty list —
+  the launch fails and a stage dispatch is held before its roster row exists —
+  rather than silently dropping it; `thegn config validate` and `thegn doctor`
+  report it, including a stage that swaps `harness` and inherits the entry's
+  list. Because the grant merges rather than replaces, a
+  `.claude/settings.local.json` that an older thegn seeded into a worktree
+  still grants whatever it lists — delete the entries you did not write, or a
+  narrowed `permissions` list will not take effect.
 
 A stage overrides any of these for its own launches — including `harness`, so
 one generic role can run on claude for reviews and pi for the fan-out — and
@@ -284,7 +296,8 @@ thegn session open --agent pipeline-pi --stage code \
   --worktree ~/wt/app/fix --prompt "Implement chunk 1" --json
 thegn doctor            # "[[agents]] (effective)" — harness · model · env keys · permissions
 thegn config validate   # a model on a flagless harness, a bad env key, a
-                        # harness/provider disagreement: all reported here
+                        # harness/provider disagreement, `permissions` on a
+                        # harness that cannot grant them: all reported here
 ```
 
 Edits to `[[agents]]` take effect on the next launch — the daemon re-reads

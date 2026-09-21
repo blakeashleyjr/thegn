@@ -1145,12 +1145,33 @@ fn choices_does_not_duplicate_an_explicit_shell() {
 
 #[test]
 fn resolve_command_maps_agent_tool_and_shell() {
-    let cfg = cfg_with(&[("claude", "claude --foo")], &[("lazygit", "lazygit")]);
-    assert_eq!(resolve_command(&cfg, "claude"), "claude --foo");
-    assert_eq!(resolve_command(&cfg, "lazygit"), "lazygit");
-    assert_eq!(resolve_command(&cfg, "shell"), shell_inner(false));
+    let mut cfg = cfg_with(&[("claude", "claude --foo")], &[("lazygit", "lazygit")]);
+    assert_eq!(resolve_command(&cfg, "claude").unwrap(), "claude --foo");
+    assert_eq!(resolve_command(&cfg, "lazygit").unwrap(), "lazygit");
+    assert_eq!(resolve_command(&cfg, "shell").unwrap(), shell_inner(false));
     // Unknown label degrades to a shell.
-    assert_eq!(resolve_command(&cfg, "nope"), shell_inner(false));
+    assert_eq!(resolve_command(&cfg, "nope").unwrap(), shell_inner(false));
+
+    // THE-440: a grantable list rides the picker command too…
+    cfg.agents[0].permissions = vec!["Read".into()];
+    let granted = resolve_command(&cfg, "claude").unwrap();
+    assert!(
+        granted.ends_with(r#" --settings '{"permissions":{"allow":["Read"]}}'"#),
+        "{granted}"
+    );
+    // …and a list the harness cannot grant REFUSES this path too, instead of
+    // quietly launching the raw command under an unrequested policy.
+    cfg.agents.push(thegn_core::config::NamedCommand {
+        permissions: vec!["Read".into()],
+        ..cfg_with(&[("coder", "pi")], &[]).agents.remove(0)
+    });
+    let why = resolve_command(&cfg, "coder").expect_err("fail closed");
+    assert!(why.contains("permission policy hold"), "{why}");
+    assert!(why.contains("coder"), "{why}");
+    // A resolver complaint that is NOT about permissions still degrades to the
+    // raw command (pinned): a model on a flagless harness.
+    cfg.tools[0].model = Some("x".into());
+    assert_eq!(resolve_command(&cfg, "lazygit").unwrap(), "lazygit");
 }
 
 // Crate-wide env lock (shared with `run`'s sidebar tests): both redirect the
@@ -2256,4 +2277,255 @@ fn credential_gate_refuses_agents_only_for_live_ambiguity() {
         "{error:#}"
     );
     credential_overlay_gate(&cfg, &db, "foo-2", "shell").expect("a shell always launches");
+}
+
+/// THE-440: a permissioned launch through the real daemon seam (`command_for`
+/// → `launch_spec_full`) never reads or writes the repository tree. The grant
+/// rides the process argv as the harness's command-scoped `--settings` layer,
+/// so repository-controlled redirects (a final `settings.local.json` symlink
+/// to a missing outside target, a symlinked `.claude` directory, a FIFO leaf
+/// that would block any read) have nothing to act on; `git status` is
+/// byte-identical; concurrent launches with different stage policies each
+/// carry only their own grant; and a shell re-parse of the command yields the
+/// exact JSON, token for token.
+#[cfg(unix)]
+#[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "test fixture: blocking git/sh waits build the repo and re-parse the command"
+)]
+fn permissioned_launch_is_command_scoped_and_never_touches_the_repository() {
+    use crate::daemon::agent_open::command_for;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::{FileTypeExt, PermissionsExt, symlink};
+
+    with_temp_state("the440-perm-seam", || {
+        let root = std::env::temp_dir().join(format!("tg-the440-perm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root); // best-effort: test cleanup: stale scratch from a prior run
+        let outside = root.join("outside");
+        std::fs::create_dir_all(outside.join("claude-dir")).unwrap();
+
+        let git = |dir: &Path, args: &[&str]| -> Vec<u8> {
+            let out = thegn_core::util::git_cmd(dir)
+                .args([
+                    "-c",
+                    "commit.gpgsign=false",
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@example.invalid",
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                ])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+            out.stdout
+        };
+        let repo = |name: &str, setup: &dyn Fn(&Path)| -> PathBuf {
+            let wt = root.join(name);
+            std::fs::create_dir_all(&wt).unwrap();
+            git(&wt, &["init", "-q", "-b", "main"]);
+            std::fs::write(wt.join("README"), "x\n").unwrap();
+            setup(&wt);
+            git(&wt, &["add", "-A"]);
+            git(&wt, &["commit", "-q", "-m", "fixture"]);
+            wt
+        };
+        // (a) tracked final-leaf symlink to a MISSING outside target.
+        let missing = outside.join("missing.json");
+        let wt_leaf = repo("leaf-symlink", &|wt| {
+            std::fs::create_dir_all(wt.join(".claude")).unwrap();
+            symlink(&missing, wt.join(".claude/settings.local.json")).unwrap();
+        });
+        // (b) tracked `.claude` directory symlink to an outside directory.
+        let wt_dir = repo("dir-symlink", &|wt| {
+            symlink(outside.join("claude-dir"), wt.join(".claude")).unwrap();
+        });
+        // (c) a FIFO leaf (untracked): any read by the launch would block.
+        let wt_fifo = repo("fifo-leaf", &|wt| {
+            std::fs::create_dir_all(wt.join(".claude")).unwrap();
+            std::fs::write(wt.join(".claude/keep"), "").unwrap();
+        });
+        let fifo = wt_fifo.join(".claude/settings.local.json");
+        let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+        // (d) the user's own settings: deny rules, hooks, unknown keys.
+        let user_bytes = b"{\n  \"permissions\": { \"allow\": [\"Old\"], \"deny\": [\"Bash(rm:*)\"] },\n  \"hooks\": { \"Stop\": [] },\n  \"x-unknown\": 1\n}\n";
+        let wt_user = repo("user-settings", &|wt| {
+            std::fs::create_dir_all(wt.join(".claude")).unwrap();
+            std::fs::write(wt.join(".claude/settings.local.json"), user_bytes).unwrap();
+        });
+        let worktrees = [&wt_leaf, &wt_dir, &wt_fifo, &wt_user];
+
+        let mut cfg = cfg_with(&[("worker", "claude")], &[]);
+        cfg.agents[0].permissions = vec!["Read".into()];
+        cfg.sandbox.backend = thegn_core::config::SandboxBackend::None;
+        cfg.sandbox.inject_devshell = false;
+        for (name, perms, harness) in [
+            ("code", vec!["Edit", "Bash(cargo test:*)"], None),
+            ("review", vec!["Read", "Bash(echo 'a' \"$(id)\")"], None),
+            ("fanout", vec!["Read"], Some("pi")),
+        ] {
+            cfg.pipeline
+                .stages
+                .push(thegn_core::config_pipeline::PipelineStage {
+                    name: name.into(),
+                    agent: "worker".into(),
+                    harness: harness.map(str::to_string),
+                    permissions: perms.into_iter().map(str::to_string).collect(),
+                    prompt: "x".into(),
+                    ..Default::default()
+                });
+        }
+        let grant = |stage: &str| -> String {
+            let allow = &cfg.pipeline.stage(stage).unwrap().permissions;
+            serde_json::json!({ "permissions": { "allow": allow } }).to_string()
+        };
+
+        let status = |wt: &Path| git(wt, &["status", "--porcelain=v1", "-z", "--ignored"]);
+        let before: Vec<Vec<u8>> = worktrees.iter().map(|wt| status(wt)).collect();
+        let outside_listing = |p: &Path| -> Vec<String> {
+            let mut v: Vec<String> = walkdir_names(p);
+            v.sort();
+            v
+        };
+        let outside_before = outside_listing(&outside);
+
+        let launch = |wt: &Path, stage: &str| -> LaunchSpec {
+            let cmd = command_for(&cfg, "worker", "do it", true, None, false, Some(stage))
+                .expect("claude grants command-scoped");
+            launch_spec_full(
+                &cfg,
+                &wt.to_string_lossy(),
+                None,
+                "worker",
+                true,
+                LaunchExtras {
+                    cmd_override: Some(&cmd),
+                    prompt: Some("do it"),
+                    stage: Some(stage),
+                    ..Default::default()
+                },
+            )
+            .expect("launch resolves")
+        };
+
+        // Concurrent launches with different policies on every worktree.
+        std::thread::scope(|s| {
+            let handles: Vec<_> = worktrees
+                .iter()
+                .flat_map(|wt| {
+                    ["code", "review"].map(|stage| {
+                        let launch = &launch;
+                        s.spawn(move || (stage, launch(wt, stage)))
+                    })
+                })
+                .collect();
+            for h in handles {
+                let (stage, spec) = h.join().unwrap();
+                let other = if stage == "code" { "review" } else { "code" };
+                let argv = spec.argv.join("\n");
+                assert!(
+                    argv.contains(&thegn_core::util::sh_quote(&grant(stage))),
+                    "{stage}: its own grant rides the argv: {argv}"
+                );
+                assert!(
+                    !argv.contains(&grant(other)),
+                    "{stage}: never another launch's grant"
+                );
+            }
+        });
+
+        // Resume and continue carry the same grant; an unattestable harness
+        // (the pi stage) refuses rather than dropping it.
+        for (resume, cont) in [(Some("abc-123"), false), (None, true)] {
+            let cmd = command_for(&cfg, "worker", "", true, resume, cont, Some("code")).unwrap();
+            assert!(
+                cmd.ends_with(&format!(
+                    " --settings {}",
+                    thegn_core::util::sh_quote(&grant("code"))
+                )),
+                "{cmd}"
+            );
+        }
+        let err = command_for(&cfg, "worker", "do it", true, None, false, Some("fanout"))
+            .expect_err("pi cannot take a command-scoped grant");
+        assert!(err.to_string().contains("permission policy hold"), "{err}");
+
+        // A real shell parses the command back to the exact argv.
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let args_out = root.join("args");
+        std::fs::write(
+            bin.join("claude"),
+            "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\0' \"$a\"; done > \"$ARGS_OUT\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(bin.join("claude"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        let cmd = command_for(&cfg, "worker", "do it", true, None, false, Some("review")).unwrap();
+        let ok = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&cmd)
+            .current_dir(&wt_user)
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .env("ARGS_OUT", &args_out)
+            .status()
+            .unwrap();
+        assert!(ok.success());
+        let raw = std::fs::read(&args_out).unwrap();
+        let tokens: Vec<String> = raw
+            .split(|b| *b == 0)
+            .filter(|t| !t.is_empty())
+            .map(|t| String::from_utf8(t.to_vec()).unwrap())
+            .collect();
+        assert_eq!(
+            tokens,
+            vec![
+                "-p".to_string(),
+                "do it".into(),
+                "--permission-mode".into(),
+                "acceptEdits".into(),
+                "--settings".into(),
+                grant("review"),
+            ]
+        );
+
+        // Nothing moved: the repository trees, the outside targets, the FIFO,
+        // and the user's own settings bytes.
+        let after: Vec<Vec<u8>> = worktrees.iter().map(|wt| status(wt)).collect();
+        assert_eq!(before, after, "git status must be byte-identical");
+        assert!(!missing.exists(), "a dangling redirect was never followed");
+        assert_eq!(outside_listing(&outside), outside_before);
+        assert!(
+            std::fs::symlink_metadata(&fifo)
+                .unwrap()
+                .file_type()
+                .is_fifo()
+        );
+        assert_eq!(
+            std::fs::read(wt_user.join(".claude/settings.local.json")).unwrap(),
+            user_bytes
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    });
+}
+
+/// Every path under `dir` (relative), not following symlinks.
+#[cfg(unix)]
+fn walkdir_names(dir: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).unwrap() {
+            let p = e.unwrap().path();
+            out.push(p.strip_prefix(dir).unwrap().to_string_lossy().into_owned());
+            if std::fs::symlink_metadata(&p).unwrap().is_dir() {
+                stack.push(p);
+            }
+        }
+    }
+    out
 }
