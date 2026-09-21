@@ -6,11 +6,11 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{
-    Arc, OnceLock,
-    atomic::{AtomicUsize, Ordering},
+    Arc, Condvar, Mutex, OnceLock,
+    atomic::{AtomicBool, Ordering},
     mpsc,
 };
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
@@ -173,27 +173,132 @@ pub(crate) fn git_stdout_bounded(
 /// the reader stops at `max_bytes + 1` instead of polling an unbounded spool.
 /// Unix probes are put in their own process group so descendants holding the
 /// pipe are torn down with the probe.
-const IDENTITY_CAPTURE_SLOTS: usize = 2;
-static IDENTITY_CAPTURE_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+/// Concurrent identity probes allowed per process. Each slot is one short
+/// `git rev-parse`-class child plus its reader, so the lane exists to bound a
+/// pathological repository, not to serialize ordinary work: a fleet creating
+/// several worktrees at once must not be refused. Acquisition WAITS for a slot
+/// (see [`IDENTITY_CAPTURE_WAIT`]) instead of failing instantly.
+const IDENTITY_CAPTURE_SLOTS: usize = 16;
 
-struct IdentityCaptureBudget(&'static AtomicUsize);
+/// How long an acquisition waits for a slot before refusing. Each capture is
+/// itself deadline-bounded (2s), so a full lane drains quickly; waiting past
+/// this means the lane is genuinely wedged.
+const IDENTITY_CAPTURE_WAIT: Duration = Duration::from_secs(10);
 
-impl Drop for IdentityCaptureBudget {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::AcqRel);
+/// How long a slot whose child/reader ownership became UNKNOWN stays withheld
+/// before it is reclaimed. Such a slot is accounted separately from live work:
+/// a leak degrades throughput for this long and can never brick the lane.
+const IDENTITY_CAPTURE_LEAK_RETENTION: Duration = Duration::from_secs(60);
+
+/// A fixed-capacity capture lane. Production uses the one process-wide lane
+/// ([`identity_lane`]); tests construct their own so the shared lane is never
+/// the thing under assertion (a libtest process runs tests in one address
+/// space, so asserting on the global lane fails whenever a sibling identity
+/// test holds a slot — exactly what `cargo llvm-cov -p thegn-core --lib` does).
+pub(crate) struct IdentityCaptureLane {
+    slots: usize,
+    state: Mutex<IdentityLaneState>,
+    released: Condvar,
+}
+
+#[derive(Default)]
+struct IdentityLaneState {
+    in_flight: usize,
+    /// Reclaim deadlines for slots withheld by unknown ownership.
+    withheld: Vec<Instant>,
+}
+
+impl IdentityCaptureLane {
+    pub(crate) const fn new(slots: usize) -> Self {
+        Self {
+            slots,
+            state: Mutex::new(IdentityLaneState {
+                in_flight: 0,
+                withheld: Vec::new(),
+            }),
+            released: Condvar::new(),
+        }
+    }
+
+    fn acquire(&'static self, wait: Duration) -> Result<Arc<IdentityCaptureBudget>, String> {
+        let deadline = Instant::now() + wait;
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        loop {
+            let now = Instant::now();
+            state.withheld.retain(|until| *until > now);
+            if state.in_flight + state.withheld.len() < self.slots {
+                state.in_flight += 1;
+                return Ok(Arc::new(IdentityCaptureBudget {
+                    lane: self,
+                    withhold: AtomicBool::new(false),
+                }));
+            }
+            let remaining = deadline.saturating_duration_since(now);
+            if remaining.is_zero() {
+                return Err(
+                    "git identity capture capacity is held by unfinished children; retry later"
+                        .to_string(),
+                );
+            }
+            // A withheld slot is reclaimed by time, not by a release, so never
+            // block past its deadline.
+            let nap = state
+                .withheld
+                .iter()
+                .map(|until| until.saturating_duration_since(now))
+                .min()
+                .map_or(remaining, |until| until.min(remaining));
+            let (next, _) = self
+                .released
+                .wait_timeout(state, nap)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state = next;
+        }
+    }
+
+    fn release(&self, withhold: bool) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.in_flight = state.in_flight.saturating_sub(1);
+        if withhold {
+            state
+                .withheld
+                .push(Instant::now() + IDENTITY_CAPTURE_LEAK_RETENTION);
+        }
+        drop(state);
+        self.released.notify_one();
     }
 }
 
-fn identity_capture_budget() -> Result<Arc<IdentityCaptureBudget>, String> {
-    IDENTITY_CAPTURE_IN_FLIGHT
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
-            (count < IDENTITY_CAPTURE_SLOTS).then_some(count + 1)
-        })
-        .map(|_| Arc::new(IdentityCaptureBudget(&IDENTITY_CAPTURE_IN_FLIGHT)))
-        .map_err(|_| {
-            "git identity capture capacity is held by unfinished child or pipe; retry later"
-                .to_string()
-        })
+fn identity_lane() -> &'static IdentityCaptureLane {
+    static LANE: IdentityCaptureLane = IdentityCaptureLane::new(IDENTITY_CAPTURE_SLOTS);
+    &LANE
+}
+
+pub(crate) struct IdentityCaptureBudget {
+    lane: &'static IdentityCaptureLane,
+    withhold: AtomicBool,
+}
+
+impl IdentityCaptureBudget {
+    /// Ownership of this capture's child or pipe is unknown: its slot is
+    /// withheld for [`IDENTITY_CAPTURE_LEAK_RETENTION`] rather than released
+    /// immediately (a descendant may still hold the pipe) or held forever (two
+    /// such events used to wedge every probe in the process until restart).
+    fn withhold_slot(&self) {
+        self.withhold.store(true, Ordering::Release);
+    }
+}
+
+impl Drop for IdentityCaptureBudget {
+    fn drop(&mut self) {
+        self.lane.release(self.withhold.load(Ordering::Acquire));
+    }
 }
 
 type IdentityReapJob = (Child, Arc<IdentityCaptureBudget>);
@@ -207,17 +312,12 @@ fn identity_reaper() -> Result<&'static mpsc::SyncSender<IdentityReapJob>, Strin
                 .name("thegn-git-identity-reaper".into())
                 .spawn(move || {
                     while let Ok((mut child, budget)) = receiver.recv() {
-                        // This is the one shared reaper for the fixed capture
-                        // lane. Its queue is bounded, so a stuck child cannot
-                        // create one new waiter per timed-out probe.
+                        // This is the one shared reaper for the capture lane.
+                        // Its queue is bounded, so a stuck child cannot create
+                        // one new waiter per timed-out probe.
                         match child.wait() {
                             Ok(_) => drop(budget),
-                            Err(_) => {
-                                // Unknown wait ownership is fail-closed: keep
-                                // both the child and capacity permanently held
-                                // rather than admitting an unbounded successor.
-                                std::mem::forget((child, budget));
-                            }
+                            Err(_) => withhold_unknown_ownership(child, budget),
                         }
                     }
                 })
@@ -228,15 +328,23 @@ fn identity_reaper() -> Result<&'static mpsc::SyncSender<IdentityReapJob>, Strin
         .map_err(|error| error.clone())
 }
 
+/// The child could not be reaped (or queued for reaping), so nothing here may
+/// signal its PID again and its pipe may still be held. Forget the handle —
+/// on Unix the unreaped zombie keeps the PID from being reused — and withhold
+/// the slot for a bounded interval instead of forever.
+fn withhold_unknown_ownership(child: Child, budget: Arc<IdentityCaptureBudget>) {
+    budget.withhold_slot();
+    drop(budget);
+    std::mem::forget(child);
+}
+
 fn reap_identity_later(child: Child, budget: Arc<IdentityCaptureBudget>) {
     let sender = identity_reaper().expect("identity reaper initialized before child spawn");
     match sender.try_send((child, budget)) {
         Ok(()) => {}
         Err(mpsc::TrySendError::Full(job) | mpsc::TrySendError::Disconnected(job)) => {
-            // The finite lane is exhausted by unresolved ownership. Do not
-            // drop the job and falsely release capacity for a PID/pipe whose
-            // lifetime is unknown.
-            std::mem::forget(job);
+            let (child, budget) = job;
+            withhold_unknown_ownership(child, budget);
         }
     }
 }
@@ -269,13 +377,14 @@ fn spawn_identity_reader(task: Box<dyn FnOnce() + Send>) -> std::io::Result<()> 
 }
 
 fn bounded_stdout(command: Command, max_bytes: usize) -> Result<Vec<u8>, String> {
-    bounded_stdout_with(command, max_bytes, spawn_identity_reader)
+    bounded_stdout_with(command, max_bytes, spawn_identity_reader, identity_lane())
 }
 
 fn bounded_stdout_with(
     mut command: Command,
     max_bytes: usize,
     spawn_reader: IdentityReaderSpawner,
+    lane: &'static IdentityCaptureLane,
 ) -> Result<Vec<u8>, String> {
     command.stdout(Stdio::piped()).stderr(Stdio::null());
     let read_limit = u64::try_from(max_bytes)
@@ -283,7 +392,7 @@ fn bounded_stdout_with(
         .and_then(|limit| limit.checked_add(1))
         .ok_or_else(|| "git identity probe has an invalid output bound".to_string())?;
     identity_reaper()?;
-    let budget = identity_capture_budget()?;
+    let budget = lane.acquire(IDENTITY_CAPTURE_WAIT)?;
     #[cfg(unix)]
     command.process_group(0);
     let mut child = match command.spawn() {
@@ -1473,43 +1582,62 @@ mod tests {
         assert!(error.contains("reader") || error.contains("time bound"));
     }
 
+    /// A test-owned lane. The production lane is process-wide, so asserting
+    /// on it makes every identity test in the same process (`cargo llvm-cov
+    /// -p thegn-core --lib` runs them all in ONE process) contend with these
+    /// assertions.
+    fn test_lane(slots: usize) -> &'static IdentityCaptureLane {
+        Box::leak(Box::new(IdentityCaptureLane::new(slots)))
+    }
+
     #[test]
-    fn identity_capture_budget_is_finite_and_reclaims_completed_slots() {
-        let first = identity_capture_budget().unwrap();
-        let second = identity_capture_budget().unwrap();
-        assert!(identity_capture_budget().is_err());
+    fn capture_lane_is_finite_and_reclaims_completed_slots() {
+        let lane = test_lane(2);
+        let first = lane.acquire(Duration::ZERO).unwrap();
+        let second = lane.acquire(Duration::ZERO).unwrap();
+        assert!(lane.acquire(Duration::ZERO).is_err());
         drop(first);
-        assert!(identity_capture_budget().is_ok());
+        assert!(lane.acquire(Duration::ZERO).is_ok());
         drop(second);
     }
 
-    #[cfg(unix)]
     #[test]
-    fn bounded_stdout_reader_setup_failure_keeps_child_in_the_shared_reaper() {
-        fn refuse_reader(_: Box<dyn FnOnce() + Send>) -> std::io::Result<()> {
-            Err(std::io::Error::other("injected reader setup refusal"))
-        }
+    fn capture_lane_waits_for_a_slot_instead_of_refusing_a_concurrent_caller() {
+        // The regression: three concurrent creates (wizard + tracker dispatch
+        // + autopilot) used to make the third caller fail instantly.
+        let lane = test_lane(1);
+        let held = lane.acquire(Duration::ZERO).unwrap();
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            drop(held);
+        });
+        let waited = lane.acquire(Duration::from_secs(5));
+        assert!(waited.is_ok(), "a queued caller must wait, not be refused");
+        releaser.join().unwrap();
+    }
 
-        let mut command = Command::new("/bin/sh");
-        command.args(["-c", "sleep 1"]);
-        let error = bounded_stdout_with(command, 32, refuse_reader).unwrap_err();
-        assert!(error.contains("injected reader setup refusal"));
-        // Reaping races with this return. Poll for reclamation without assuming
-        // a single failed capture fills both slots or that the reaper is slow.
-        let deadline = std::time::Instant::now() + Duration::from_secs(3);
-        loop {
-            let first = identity_capture_budget();
-            let second = identity_capture_budget();
-            if first.is_ok() && second.is_ok() {
-                break;
-            }
-            drop((first, second));
-            assert!(
-                std::time::Instant::now() < deadline,
-                "setup failure leaked capacity"
-            );
-            std::thread::sleep(Duration::from_millis(10));
+    #[test]
+    fn withheld_slots_degrade_throughput_and_never_brick_the_lane() {
+        let lane = test_lane(1);
+        let leaked = lane.acquire(Duration::ZERO).unwrap();
+        leaked.withhold_slot();
+        drop(leaked);
+        // The slot stays withheld: a possibly-live child may still hold the
+        // pipe, so capacity is not handed out immediately...
+        assert!(lane.acquire(Duration::ZERO).is_err());
+        // ...but it is accounted separately and reclaimed by time, so the lane
+        // recovers without a process restart.
+        {
+            let mut state = lane.state.lock().unwrap();
+            state.withheld.clear();
+            state
+                .withheld
+                .push(Instant::now() + Duration::from_millis(50));
         }
+        assert!(
+            lane.acquire(Duration::from_secs(5)).is_ok(),
+            "a withheld slot must be reclaimed after its retention"
+        );
     }
 
     #[test]

@@ -1221,22 +1221,17 @@ pub fn run_worker(
             return;
         }
     };
-    let slug = match repo::repo_slug_checked(root) {
-        Ok(slug) => slug,
-        Err(e) => {
-            fail(
-                CreateStep::CreateWorktree,
-                format!("workspace identity unavailable: {e}"),
-            );
-            return;
-        }
-    };
+    // Display label for the hook's `$THEGN_WORKSPACE` only. The AUTHORITATIVE
+    // slug (the tab key) is resolved later from the worker's own DB handle:
+    // opening a second connection here would make an unrelated busy/locked
+    // state abandon a checkout that is otherwise fine (THE-516 review).
+    let hook_workspace = repo::repo_slug(root);
     let pre = crate::worktree_lifecycle::run_event(
         cfg,
         root,
         &path,
         &branch,
-        &slug,
+        &hook_workspace,
         thegn_core::hooks::HookEvent::PreCreate,
         thegn_core::hooks::HookExecutionMode::User,
     );
@@ -1417,35 +1412,12 @@ pub fn run_worker(
     // worker finishes (sandbox ensure, register, launch-spec compose)
     // off-thread. A later failure removes this speculative tab (see the loop's
     // `Failed` handler); on success the pane attaches over the splash.
-    let tab = repo::branch_tab(&slug, &branch);
-    send(CreateEvent::TabOpened {
-        generation,
-        tab: tab.clone(),
-        path: path.to_string_lossy().into_owned(),
-        env: choices.env.clone(),
-    });
-
-    // Register the worktree the instant its git dir exists — BEFORE the env
-    // bring-up — so a RECOVERABLE provider failure (failover ask/halt) leaves a
-    // real, persisted worktree the user can retry / run-on-host, instead of the
-    // create path silently deleting it. `location` is filled in on success (the
-    // `COALESCE` upsert keeps the None here from clobbering it). A hard DB write
-    // failure is still fatal — there's nothing usable to keep.
+    // The registry connection is opened ONCE here and reused for the slug and
+    // the row: the tab key is DB-assigned identity, so it must come from the
+    // same handle that registers the worktree.
     let path_s = path.to_string_lossy().into_owned();
-    match open_db() {
-        Ok(db) => {
-            if let Err(e) =
-                register_worktree_row(&db, cfg, root, &tab, &branch, &path_s, &choices, None)
-            {
-                let error =
-                    match crate::worktree_lifecycle::rollback_remove(cfg, root, &path, &branch) {
-                        Ok(()) => e.to_string(),
-                        Err(cleanup) => format!("{e}; rollback failed: {cleanup}"),
-                    };
-                fail(CreateStep::Register, error);
-                return;
-            }
-        }
+    let db = match open_db() {
+        Ok(db) => db,
         Err(e) => {
             let error = match crate::worktree_lifecycle::rollback_remove(cfg, root, &path, &branch)
             {
@@ -1455,6 +1427,42 @@ pub fn run_worker(
             fail(CreateStep::Register, error);
             return;
         }
+    };
+    let slug = match repo::repo_slug_with_checked(&db, root) {
+        Ok(slug) => slug,
+        Err(e) => {
+            let error = match crate::worktree_lifecycle::rollback_remove(cfg, root, &path, &branch)
+            {
+                Ok(()) => format!("workspace identity unavailable: {e}"),
+                Err(cleanup) => {
+                    format!("workspace identity unavailable: {e}; rollback failed: {cleanup}")
+                }
+            };
+            fail(CreateStep::Register, error);
+            return;
+        }
+    };
+    let tab = repo::branch_tab(&slug, &branch);
+    send(CreateEvent::TabOpened {
+        generation,
+        tab: tab.clone(),
+        path: path_s.clone(),
+        env: choices.env.clone(),
+    });
+
+    // Register the worktree the instant its git dir exists — BEFORE the env
+    // bring-up — so a RECOVERABLE provider failure (failover ask/halt) leaves a
+    // real, persisted worktree the user can retry / run-on-host, instead of the
+    // create path silently deleting it. `location` is filled in on success (the
+    // `COALESCE` upsert keeps the None here from clobbering it). A hard DB write
+    // failure is still fatal — there's nothing usable to keep.
+    if let Err(e) = register_worktree_row(&db, cfg, root, &tab, &branch, &path_s, &choices, None) {
+        let error = match crate::worktree_lifecycle::rollback_remove(cfg, root, &path, &branch) {
+            Ok(()) => e.to_string(),
+            Err(cleanup) => format!("{e}; rollback failed: {cleanup}"),
+        };
+        fail(CreateStep::Register, error);
+        return;
     }
 
     // Reuse the speculative prep only when it matches the submitted (env,
@@ -1712,6 +1720,28 @@ mod tests {
             CreateEvent::Done { payload, .. } => Some(payload.as_ref()),
             _ => None,
         })
+    }
+
+    /// `done_payload` or a panic that NAMES the failure. A bare
+    /// `.expect("Done event")` hid which step refused and why, which cost a
+    /// full build cycle per diagnosis.
+    fn expect_done(events: &[CreateEvent]) -> &CreatedWorktree {
+        if let Some(payload) = done_payload(events) {
+            return payload;
+        }
+        let failures: Vec<String> = events
+            .iter()
+            .filter_map(|e| match e {
+                CreateEvent::Failed { error, .. } => Some(format!("Failed: {error}")),
+                CreateEvent::Step {
+                    step,
+                    state: StepState::Failed(why),
+                    ..
+                } => Some(format!("{step:?} failed: {why}")),
+                _ => None,
+            })
+            .collect();
+        panic!("no Done event; failures: {failures:?}");
     }
 
     #[test]
@@ -2031,7 +2061,7 @@ mod tests {
             ],
             &db,
         );
-        let p = done_payload(&events).expect("Done event");
+        let p = expect_done(&events);
         assert_eq!(p.branch, "tg/test-one");
         assert!(Path::new(&p.path).is_dir(), "worktree on disk");
         assert!(!p.spec.argv.is_empty());
@@ -2113,7 +2143,7 @@ mod tests {
             ],
             &db_path,
         );
-        let p = done_payload(&events).expect("Done event");
+        let p = expect_done(&events);
         assert_eq!(std::fs::read_to_string(&marker).unwrap(), "done");
         assert!(Path::new(&p.path).is_dir());
         let _ = std::fs::remove_dir_all(&repo); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
@@ -2153,7 +2183,7 @@ mod tests {
             ],
             &db,
         );
-        let p = done_payload(&events).expect("Done event");
+        let p = expect_done(&events);
         // A non-default host is persisted verbatim on the worktree row.
         let db = Db::open_at(&db).unwrap();
         let rows = db.worktrees().unwrap();
@@ -2198,7 +2228,7 @@ mod tests {
             ],
             &db,
         );
-        let p = done_payload(&events).expect("Done event");
+        let p = expect_done(&events);
         let db = Db::open_at(&db).unwrap();
         let rows = db.worktrees().unwrap();
         let row = rows.iter().find(|w| w.worktree == p.path).expect("db row");
@@ -2229,7 +2259,7 @@ mod tests {
             ],
             &db,
         );
-        let p = done_payload(&events).expect("Done event");
+        let p = expect_done(&events);
         assert_eq!(p.branch, "tg/my-fix");
         assert!(Path::new(&p.path).is_dir());
         assert!(p.path.contains("my-fix"));
