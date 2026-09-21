@@ -391,6 +391,36 @@ impl VisibleRefresh {
     }
 }
 
+/// Which root the visible Problems list currently holds. A patch is only
+/// valid for the list it was computed against: after a tab switch the list
+/// still holds the previous worktree's items (the hydration swap that rebuilds
+/// it runs later), and patching by root-relative path alone would splice the
+/// new worktree's file over the old one's and leave the rest of the old
+/// worktree's problems on screen. Any root change therefore forces a full
+/// rebuild — the partition boundary the store exists to keep.
+#[derive(Debug, Default)]
+pub struct VisibleTarget {
+    root: Option<PathBuf>,
+}
+
+impl VisibleTarget {
+    /// The refresh to actually apply for `root`, given what the slice asked
+    /// for. Records `root` as the list's owner.
+    pub fn refresh_for(&mut self, root: &Path, refresh: VisibleRefresh) -> VisibleRefresh {
+        if self.root.as_deref() == Some(root) {
+            return refresh;
+        }
+        self.root = Some(root.to_path_buf());
+        VisibleRefresh::Full
+    }
+
+    /// The list was rebuilt for `root` by something other than a drain slice
+    /// (the hydration swap).
+    pub fn rebuilt(&mut self, root: &Path) {
+        self.root = Some(root.to_path_buf());
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DrainOutcome {
     pub applied: usize,
@@ -521,6 +551,11 @@ pub struct LspDiagnostics {
     loss: HashMap<StoreStreamKey, StreamLoss>,
     /// Total document marks across `loss` (bounded by `MAX_LOSS_DOCUMENTS`).
     loss_documents: usize,
+    /// Owned bytes held by `loss` (the marks are retained memory too, and a
+    /// count bound alone would admit `MAX_LOSS_DOCUMENTS` × 4 KiB of paths).
+    /// Bounded by `MAX_LOSS_MARK_BYTES`; over it, marks escalate to their
+    /// stream rather than being dropped.
+    loss_bytes: usize,
     /// A stream's loss could not even be recorded (stream table full). Ends
     /// when no loss remains anywhere.
     loss_overflow: bool,
@@ -585,9 +620,28 @@ const LSP_DEFAULT_SOURCE: &str = "server";
 const HEALTH_SOURCE: &str = "lsp:health";
 const HEALTH_CODE: &str = "thegn-lsp-loss";
 const MAX_LOSS_DOCUMENTS: usize = limits::MAX_FILES_PER_ROOT * 4;
+/// Retained-byte ceiling for the loss marks themselves.
+const MAX_LOSS_MARK_BYTES: usize = 1024 * 1024;
 const MAX_LOSS_STREAMS: usize = 2 * limits::MAX_ROOTS * limits::MAX_SERVERS_PER_ROOT;
 /// Per-document loss rows shown for one root (the summary counts them all).
 const MAX_LOSS_ROWS: usize = 64;
+
+/// Owned bytes of one loss entry (its stream key plus the empty set).
+fn loss_entry_bytes(stream: &StoreStreamKey) -> usize {
+    stream
+        .root
+        .as_os_str()
+        .as_encoded_bytes()
+        .len()
+        .saturating_add(stream.server_identity.len())
+        .saturating_add(std::mem::size_of::<StoreStreamKey>())
+        .saturating_add(std::mem::size_of::<StreamLoss>())
+}
+
+/// Owned bytes of one marked document path.
+fn loss_document_bytes(path: &str) -> usize {
+    path.len().saturating_add(std::mem::size_of::<String>())
+}
 
 fn is_health_row(item: &DiagnosticItem) -> bool {
     item.source == HEALTH_SOURCE && item.code.as_deref() == Some(HEALTH_CODE)
@@ -655,6 +709,8 @@ struct StoreFootprint {
     recomputed: usize,
     roots: usize,
     files: usize,
+    loss_bytes: usize,
+    recomputed_loss_bytes: usize,
 }
 
 impl LspDiagnostics {
@@ -1009,15 +1065,23 @@ impl LspDiagnostics {
     }
 
     fn loss_entry(&mut self, stream: StoreStreamKey) -> Option<&mut StreamLoss> {
-        if !self.loss.contains_key(&stream) && self.loss.len() >= MAX_LOSS_STREAMS {
-            self.loss_overflow = true;
-            return None;
+        if !self.loss.contains_key(&stream) {
+            let cost = loss_entry_bytes(&stream);
+            if self.loss.len() >= MAX_LOSS_STREAMS
+                || self.loss_bytes.saturating_add(cost) > MAX_LOSS_MARK_BYTES
+            {
+                self.loss_overflow = true;
+                return None;
+            }
+            self.loss_bytes = self.loss_bytes.saturating_add(cost);
         }
         Some(self.loss.entry(stream).or_default())
     }
 
     fn remember_document(&mut self, key: &StoreFileKey) {
-        let room = self.loss_documents < MAX_LOSS_DOCUMENTS;
+        let cost = loss_document_bytes(&key.path);
+        let room = self.loss_documents < MAX_LOSS_DOCUMENTS
+            && self.loss_bytes.saturating_add(cost) <= MAX_LOSS_MARK_BYTES;
         let Some(loss) = self.loss_entry(key.stream_key()) else {
             return;
         };
@@ -1027,9 +1091,10 @@ impl LspDiagnostics {
         if room {
             loss.documents.insert(key.path.clone());
             self.loss_documents += 1;
+            self.loss_bytes = self.loss_bytes.saturating_add(cost);
         } else {
             // Never evict a mark (that would turn a loss into "clean"):
-            // escalate to the stream instead.
+            // escalate to the stream, which costs no further bytes.
             loss.stream_wide = true;
         }
     }
@@ -1043,8 +1108,13 @@ impl LspDiagnostics {
         };
         if loss.documents.remove(&key.path) {
             self.loss_documents = self.loss_documents.saturating_sub(1);
+            self.loss_bytes = self
+                .loss_bytes
+                .saturating_sub(loss_document_bytes(&key.path));
         }
         if loss.documents.is_empty() {
+            // The stream-wide mark ends with the last attributed document: a
+            // complete publication for this stream proves the resync landed.
             self.loss.remove(&stream);
         }
         self.settle_loss();
@@ -1052,6 +1122,17 @@ impl LspDiagnostics {
 
     fn settle_loss(&mut self) {
         self.loss_documents = self.loss.values().map(|l| l.documents.len()).sum();
+        self.loss_bytes = self
+            .loss
+            .iter()
+            .map(|(stream, loss)| {
+                loss.documents
+                    .iter()
+                    .fold(loss_entry_bytes(stream), |n, path| {
+                        n.saturating_add(loss_document_bytes(path))
+                    })
+            })
+            .fold(0usize, usize::saturating_add);
         if self.loss.is_empty() {
             self.loss_overflow = false;
         }
@@ -1086,11 +1167,24 @@ impl LspDiagnostics {
                     })
             })
             .fold(0usize, usize::saturating_add);
+        let recomputed_loss_bytes = self
+            .loss
+            .iter()
+            .map(|(stream, loss)| {
+                loss.documents
+                    .iter()
+                    .fold(loss_entry_bytes(stream), |n, path| {
+                        n.saturating_add(loss_document_bytes(path))
+                    })
+            })
+            .fold(0usize, usize::saturating_add);
         StoreFootprint {
             bytes: self.retained_bytes,
             recomputed,
             roots: self.by_root.len(),
             files: self.by_root.values().map(|root| root.files.len()).sum(),
+            loss_bytes: self.loss_bytes,
+            recomputed_loss_bytes,
         }
     }
 
@@ -1421,7 +1515,12 @@ mod tests {
     fn assert_store_conserved(store: &LspDiagnostics) -> StoreFootprint {
         let f = store.footprint();
         assert_eq!(f.bytes, f.recomputed, "store bytes drifted: {f:?}");
+        assert_eq!(
+            f.loss_bytes, f.recomputed_loss_bytes,
+            "loss-mark bytes drifted: {f:?}"
+        );
         assert!(f.bytes <= limits::MAX_RETAINED_BYTES);
+        assert!(f.loss_bytes <= MAX_LOSS_MARK_BYTES);
         assert!(f.roots <= limits::MAX_ROOTS);
         f
     }
@@ -2169,5 +2268,95 @@ mod tests {
             inner.client_with(&a, "rust", fake_client).err(),
             Some(LspError::NotAvailable)
         );
+    }
+
+    // ── review round 3: B1 + N1 ─────────────────────────────────────────────
+
+    #[test]
+    fn a_patch_after_a_tab_switch_rebuilds_instead_of_mixing_two_worktrees() {
+        // Both worktrees have src/lib.rs — patching by relative path alone
+        // would splice B's items into A's still-displayed list.
+        let mut store = LspDiagnostics::new();
+        store.apply(pd(
+            "/a",
+            "/a/src/lib.rs",
+            vec![diag(0, LspSeverity::Error, "a-lib")],
+        ));
+        store.apply(pd(
+            "/a",
+            "/a/src/other.rs",
+            vec![diag(0, LspSeverity::Error, "a-other")],
+        ));
+        store.apply(pd(
+            "/b",
+            "/b/src/lib.rs",
+            vec![diag(0, LspSeverity::Error, "b-lib")],
+        ));
+
+        let mut visible = VisibleTarget::default();
+        let mut dst = Vec::new();
+        // The list is built for /a.
+        visible
+            .refresh_for(Path::new("/a"), VisibleRefresh::None)
+            .apply_to(&store, Path::new("/a"), &mut dst);
+        assert_eq!(dst.len(), 2);
+
+        // Tab switch to /b, then /b's warm server publishes src/lib.rs: the
+        // slice asks for a patch, the tracker upgrades it to a full rebuild.
+        let asked = VisibleRefresh::Patch(HashSet::from(["src/lib.rs".to_string()]));
+        let applied = visible.refresh_for(Path::new("/b"), asked);
+        assert_eq!(applied, VisibleRefresh::Full);
+        applied.apply_to(&store, Path::new("/b"), &mut dst);
+        let messages: Vec<&str> = dst.iter().map(|d| d.message.as_str()).collect();
+        assert_eq!(messages, vec!["b-lib"], "no /a items survive the switch");
+
+        // Still on /b: an ordinary patch stays a patch.
+        let asked = VisibleRefresh::Patch(HashSet::from(["src/lib.rs".to_string()]));
+        assert!(matches!(
+            visible.refresh_for(Path::new("/b"), asked),
+            VisibleRefresh::Patch(_)
+        ));
+        // A rebuild by the hydration swap re-owns the list without a refresh.
+        visible.rebuilt(Path::new("/a"));
+        assert!(
+            visible
+                .refresh_for(Path::new("/a"), VisibleRefresh::None)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn loss_mark_bytes_are_bounded_and_conserved() {
+        let mut store = LspDiagnostics::new();
+        // Long paths: a count-only bound would admit ~64 MiB of marks.
+        let long = "p".repeat(limits::MAX_IDENTITY_BYTES - 32);
+        let mut marked = 0usize;
+        for index in 0..4_000 {
+            let key = DiagnosticKey {
+                root: PathBuf::from("/p"),
+                server_identity: "rust".into(),
+                generation: 1,
+                path: format!("/p/{long}{index}.rs"),
+            };
+            store.mark_incomplete([key], Path::new("/p"));
+            marked += 1;
+            if marked.is_multiple_of(250) {
+                assert_store_conserved(&store);
+            }
+        }
+        let f = assert_store_conserved(&store);
+        assert!(f.loss_bytes <= MAX_LOSS_MARK_BYTES);
+        assert!(
+            store.active_loss(Path::new("/p")) > 0,
+            "over the byte bound the loss escalates to the stream, never vanishes"
+        );
+        assert!(
+            store.is_incomplete("/p", "rust", 1, "nothing-was-ever-marked.rs"),
+            "the stream-wide mark covers the documents that did not fit"
+        );
+        // Marks are released again.
+        store.retain_streams(&HashSet::new());
+        let f = assert_store_conserved(&store);
+        assert_eq!((f.loss_bytes, store.active_loss(Path::new("/p"))), (0, 0));
     }
 }
