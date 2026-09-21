@@ -4,7 +4,6 @@
 //! worth testing at the seam that actually writes.
 
 use super::*;
-use thegn_core::calendar::ExpansionError;
 use thegn_core::calendar::{CalEvent, EventTime, TzRef};
 
 /// An isolated DB. `Db::open` reads `XDG_STATE_HOME`, and this shell often runs
@@ -447,7 +446,9 @@ fn a_multi_day_event_raises_one_reminder_for_exactly_the_given_window() {
 }
 
 #[test]
-fn an_expansion_failure_raises_nothing_and_is_an_error() {
+fn one_malformed_row_costs_itself_not_the_month_or_every_reminder() {
+    // The bad row stays in the cache, so failing the whole evaluation would
+    // re-fail identically on every tick: reminders would stop for good.
     let t = TmpDb::new("rem-invalid");
     let mut bad = event("inverted");
     std::mem::swap(&mut bad.start, &mut bad.end);
@@ -467,17 +468,25 @@ fn an_expansion_failure_raises_nothing_and_is_an_error() {
         to,
     );
     let w = reminder_window(0, utc_ms(2026, 8, 21, 8, 49), utc_ms(2026, 8, 21, 8, 51));
-    assert_eq!(
-        due_reminders(&t.db, &reminder_cfg(), w).map(|d| d.reminders.len()),
-        Err(CalendarError::Expansion(ExpansionError::InvalidSpan)),
-        "no reminder from a partial list"
-    );
-    // The month shows the failure instead of a plausible partial calendar.
+    let due = due_reminders(&t.db, &reminder_cfg(), w).unwrap();
+    assert_eq!(due.reminders.len(), 1, "the good event still fires");
+    // The cached row carries no SourceId (the account is the DB key).
+    assert_eq!(due.reminders[0].event_id, "/good");
+    assert_eq!(due.skipped, 1, "and the loss is reported");
+
+    // The month shows the readable events, marked incomplete — not blanked.
     let view = expand_month(&t.db, from, to, chrono_tz::Tz::UTC);
-    assert!(view.events.is_none());
-    assert_eq!(
-        view.error,
-        Some(CalendarError::Expansion(ExpansionError::InvalidSpan))
+    assert_eq!(view.error, Some(CalendarError::MalformedCache));
+    let events = view.events.expect("the readable rows still show");
+    assert!(
+        events
+            .iter()
+            .any(|(_, evs)| evs.iter().any(|e| e.uid == "good"))
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|(_, evs)| evs.iter().any(|e| e.uid == "inverted"))
     );
 }
 

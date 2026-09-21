@@ -20,6 +20,10 @@ use crate::seg::{self, Line, Tok, Under, seg};
 pub struct MonthGridSection {
     pub title: String,
     pub today_chip: String,
+    /// Set when the month is unavailable, stale or incomplete. Drawn in the
+    /// header in place of the today chip, so the state is visible even with
+    /// `show_agenda = false`, where the agenda note is never built.
+    pub status: Option<String>,
     pub dow: [String; 7],
     pub week_numbers: Option<Vec<u32>>,
     pub weeks: Vec<[DayCell; 7]>,
@@ -278,6 +282,7 @@ fn month_section(st: &CalState) -> MonthGridSection {
             st.today.format("%a %-d %b")
         ),
         dow,
+        status: month_status(st),
         week_numbers: st
             .ui
             .show_week_numbers
@@ -297,6 +302,22 @@ fn agenda_heading(st: &CalState) -> super::super::Section {
         ),
         note: Some(agenda_note(st, n)),
     }
+}
+
+/// The month's health, if it is not simply fine: the same three words the
+/// agenda note uses, on the grid header, which is drawn on every config path.
+fn month_status(st: &CalState) -> Option<String> {
+    let error = st.month_error()?;
+    Some(
+        if !st.month_loaded() {
+            "unavailable"
+        } else if error.is_partial() {
+            "incomplete"
+        } else {
+            "stale"
+        }
+        .into(),
+    )
 }
 
 /// The agenda status note. A failed or incomplete month is always said so:
@@ -501,13 +522,20 @@ pub(crate) fn draw_month_grid(
     let glyphs = crate::caps::active_glyphs();
     let title_w = seg::cells(&g.title);
     // Below this the chip would collide with the month title; dropping it is
-    // better than truncating the title the user navigates by.
-    let today_chip = if w >= layout::TODAY_CHIP_MIN_COLS {
-        g.today_chip.as_str()
-    } else {
-        ""
+    // better than truncating the title the user navigates by. A status word
+    // takes the slot ahead of the chip: "which month am I looking at, and is
+    // it real" beats "what is today's date", and it is much shorter.
+    let today_chip = match (&g.status, w >= layout::TODAY_CHIP_MIN_COLS) {
+        (Some(status), _) => status.as_str(),
+        (None, true) => g.today_chip.as_str(),
+        (None, false) => "",
     };
     let today_w = seg::cells(today_chip);
+    let chip_tone = if g.status.is_some() {
+        Tok::Slot(S::Accent)
+    } else {
+        Tok::Slot(S::Ghost)
+    };
     let Some(lay) = layout::grid_layout(
         x,
         y0,
@@ -536,7 +564,7 @@ pub(crate) fn draw_month_grid(
                 seg(Tok::Slot(S::Text), format!(" {} ", g.title)).bold(),
                 seg::Seg::key(" l "),
             ],
-            vec![seg(Tok::Slot(S::Ghost), today_chip.to_string())],
+            vec![seg(chip_tone, today_chip.to_string())],
         ),
         super::super::panel(),
     );

@@ -189,6 +189,14 @@ fn status_state(
     }
 }
 
+fn month_status_of(st: &CalState) -> Option<String> {
+    let sections = render::sections_of(st);
+    let Some(crate::detail::Section::MonthGrid(grid)) = sections.first() else {
+        panic!("the month grid is always the first section")
+    };
+    grid.status.clone()
+}
+
 fn agenda_note_of(st: &CalState) -> String {
     let sections = render::sections_of(st);
     let Some(crate::detail::Section::Heading { note, .. }) = sections.get(2) else {
@@ -236,4 +244,80 @@ fn calendar_expansion_failure_is_visible_as_unavailable() {
         Some(CalendarError::MalformedCache),
     ));
     assert!(note.ends_with(" incomplete"), "{note}");
+}
+
+#[test]
+fn a_failed_month_is_visible_without_the_agenda() {
+    // `show_agenda = false` never builds the agenda note, so the grid header
+    // has to carry the state — or a first-load failure paints as an ordinary
+    // empty month and a stale one paints as current.
+    use crate::calendar_docs::CalendarError;
+    use thegn_core::calendar::{ExpansionError, ExpansionLimit};
+    let failed = CalendarError::Expansion(ExpansionError::Budget(ExpansionLimit::RetainedBytes));
+    let date = NaiveDate::from_ymd_opt(2026, 9, 13).unwrap();
+    let events = BTreeMap::from([(
+        date,
+        vec![Arc::new(CalEvent::new(
+            "e",
+            "E",
+            EventTime::Date { date },
+            EventTime::Date {
+                date: date.succ_opt().unwrap(),
+            },
+        ))],
+    )]);
+    let hide_agenda = |mut st: CalState| {
+        st.ui.show_agenda = false;
+        st
+    };
+
+    let healthy = hide_agenda(status_state(events.clone(), true, None));
+    assert_eq!(month_status_of(&healthy), None, "a good month says nothing");
+    assert_eq!(
+        month_status_of(&hide_agenda(status_state(
+            BTreeMap::new(),
+            false,
+            Some(failed)
+        )))
+        .as_deref(),
+        Some("unavailable")
+    );
+    assert_eq!(
+        month_status_of(&hide_agenda(status_state(
+            events.clone(),
+            true,
+            Some(failed)
+        )))
+        .as_deref(),
+        Some("stale")
+    );
+    assert_eq!(
+        month_status_of(&hide_agenda(status_state(
+            events,
+            true,
+            Some(CalendarError::MalformedCache)
+        )))
+        .as_deref(),
+        Some("incomplete")
+    );
+    // And it reaches the surface: the header draws the status where the today
+    // chip would be.
+    let mut surface = Surface::new(100, 40);
+    let detail = CalendarDetail {
+        st: hide_agenda(status_state(BTreeMap::new(), false, Some(failed))),
+    };
+    let inner = Rect {
+        x: 2,
+        y: 1,
+        cols: 44,
+        rows: 20,
+    };
+    render::render_calendar(&mut surface, inner, 0, &detail);
+    let painted: String = surface
+        .screen_cells()
+        .iter()
+        .map(|row| row.iter().map(|c| c.str().to_string()).collect::<String>())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(painted.contains("unavailable"), "{painted}");
 }
