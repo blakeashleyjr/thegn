@@ -2,9 +2,15 @@
 //! and thin subprocess wrappers (git / generic commands).
 
 use crate::msg;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::process::{Child, Command, Stdio};
+use std::sync::{
+    Arc, Condvar, Mutex, OnceLock,
+    atomic::{AtomicBool, Ordering},
+    mpsc,
+};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
@@ -139,6 +145,451 @@ pub(crate) fn immutable_sqlite_uri(path: &std::path::Path) -> String {
     }
     uri.push_str("?immutable=1");
     uri
+}
+
+/// Capture a bounded Git stdout stream for identity probes. The identity seam
+/// cannot use the lossy `git_out` helper, and a malformed repository must not
+/// be able to make a probe allocate without limit. Stderr is intentionally
+/// redirected away: callers only use the typed probe result, not unbounded Git
+/// diagnostics.
+pub(crate) fn git_stdout_bounded(
+    dir: &Path,
+    args: &[&str],
+    max_bytes: usize,
+) -> Result<Vec<u8>, String> {
+    if max_bytes == 0 {
+        return Err("git identity probe has an invalid output bound".into());
+    }
+    let mut command = git_cmd(dir);
+    command
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    bounded_stdout(command, max_bytes)
+}
+
+/// Capture a subprocess stdout pipe with one owner for the child and one owner
+/// for the reader. There is no named temporary file to replace or reopen, and
+/// the reader stops at `max_bytes + 1` instead of polling an unbounded spool.
+/// Unix probes are put in their own process group so descendants holding the
+/// pipe are torn down with the probe.
+/// Concurrent identity probes allowed per process. Each slot is one short
+/// `git rev-parse`-class child plus its reader, so the lane exists to bound a
+/// pathological repository, not to serialize ordinary work: a fleet creating
+/// several worktrees at once must not be refused. Acquisition WAITS for a slot
+/// (see [`IDENTITY_CAPTURE_WAIT`]) instead of failing instantly.
+const IDENTITY_CAPTURE_SLOTS: usize = 16;
+
+/// How long an acquisition waits for a slot before refusing. Each capture is
+/// itself deadline-bounded (2s), so a full lane drains quickly; waiting past
+/// this means the lane is genuinely wedged.
+const IDENTITY_CAPTURE_WAIT: Duration = Duration::from_secs(10);
+
+/// How long a slot whose child/reader ownership became UNKNOWN stays withheld
+/// before it is reclaimed. Such a slot is accounted separately from live work:
+/// a leak degrades throughput for this long and can never brick the lane.
+const IDENTITY_CAPTURE_LEAK_RETENTION: Duration = Duration::from_secs(60);
+
+/// A fixed-capacity capture lane. Production uses the one process-wide lane
+/// ([`identity_lane`]); tests construct their own so the shared lane is never
+/// the thing under assertion (a libtest process runs tests in one address
+/// space, so asserting on the global lane fails whenever a sibling identity
+/// test holds a slot — exactly what `cargo llvm-cov -p thegn-core --lib` does).
+pub(crate) struct IdentityCaptureLane {
+    slots: usize,
+    state: Mutex<IdentityLaneState>,
+    released: Condvar,
+}
+
+#[derive(Default)]
+struct IdentityLaneState {
+    in_flight: usize,
+    /// Reclaim deadlines for slots withheld by unknown ownership.
+    withheld: Vec<Instant>,
+}
+
+impl IdentityCaptureLane {
+    pub(crate) const fn new(slots: usize) -> Self {
+        Self {
+            slots,
+            state: Mutex::new(IdentityLaneState {
+                in_flight: 0,
+                withheld: Vec::new(),
+            }),
+            released: Condvar::new(),
+        }
+    }
+
+    fn acquire(&'static self, wait: Duration) -> Result<Arc<IdentityCaptureBudget>, String> {
+        let deadline = Instant::now() + wait;
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        loop {
+            let now = Instant::now();
+            state.withheld.retain(|until| *until > now);
+            if state.in_flight + state.withheld.len() < self.slots {
+                state.in_flight += 1;
+                return Ok(Arc::new(IdentityCaptureBudget {
+                    lane: self,
+                    withhold: AtomicBool::new(false),
+                }));
+            }
+            let remaining = deadline.saturating_duration_since(now);
+            if remaining.is_zero() {
+                return Err(
+                    "git identity capture capacity is held by unfinished children; retry later"
+                        .to_string(),
+                );
+            }
+            // A withheld slot is reclaimed by time, not by a release, so never
+            // block past its deadline.
+            let nap = state
+                .withheld
+                .iter()
+                .map(|until| until.saturating_duration_since(now))
+                .min()
+                .map_or(remaining, |until| until.min(remaining));
+            let (next, _) = self
+                .released
+                .wait_timeout(state, nap)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state = next;
+        }
+    }
+
+    fn release(&self, withhold: bool) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.in_flight = state.in_flight.saturating_sub(1);
+        if withhold {
+            state
+                .withheld
+                .push(Instant::now() + IDENTITY_CAPTURE_LEAK_RETENTION);
+        }
+        drop(state);
+        self.released.notify_one();
+    }
+}
+
+fn identity_lane() -> &'static IdentityCaptureLane {
+    static LANE: IdentityCaptureLane = IdentityCaptureLane::new(IDENTITY_CAPTURE_SLOTS);
+    &LANE
+}
+
+pub(crate) struct IdentityCaptureBudget {
+    lane: &'static IdentityCaptureLane,
+    withhold: AtomicBool,
+}
+
+impl IdentityCaptureBudget {
+    /// Ownership of this capture's child or pipe is unknown: its slot is
+    /// withheld for [`IDENTITY_CAPTURE_LEAK_RETENTION`] rather than released
+    /// immediately (a descendant may still hold the pipe) or held forever (two
+    /// such events used to wedge every probe in the process until restart).
+    fn withhold_slot(&self) {
+        self.withhold.store(true, Ordering::Release);
+    }
+}
+
+impl Drop for IdentityCaptureBudget {
+    fn drop(&mut self) {
+        self.lane.release(self.withhold.load(Ordering::Acquire));
+    }
+}
+
+type IdentityReapJob = (Child, Arc<IdentityCaptureBudget>);
+
+fn identity_reaper() -> Result<&'static mpsc::SyncSender<IdentityReapJob>, String> {
+    static REAPER: OnceLock<Result<mpsc::SyncSender<IdentityReapJob>, String>> = OnceLock::new();
+    REAPER
+        .get_or_init(|| {
+            let (sender, receiver) = mpsc::sync_channel::<IdentityReapJob>(IDENTITY_CAPTURE_SLOTS);
+            std::thread::Builder::new()
+                .name("thegn-git-identity-reaper".into())
+                .spawn(move || {
+                    while let Ok((mut child, budget)) = receiver.recv() {
+                        // This is the one shared reaper for the capture lane.
+                        // Its queue is bounded, so a stuck child cannot create
+                        // one new waiter per timed-out probe.
+                        match child.wait() {
+                            Ok(_) => drop(budget),
+                            Err(_) => withhold_unknown_ownership(child, budget),
+                        }
+                    }
+                })
+                .map(|_| sender)
+                .map_err(|error| error.to_string())
+        })
+        .as_ref()
+        .map_err(|error| error.clone())
+}
+
+/// The child could not be reaped (or queued for reaping), so nothing here may
+/// signal its PID again and its pipe may still be held. Forget the handle —
+/// on Unix the unreaped zombie keeps the PID from being reused — and withhold
+/// the slot for a bounded interval instead of forever.
+fn withhold_unknown_ownership(child: Child, budget: Arc<IdentityCaptureBudget>) {
+    budget.withhold_slot();
+    drop(budget);
+    std::mem::forget(child);
+}
+
+fn reap_identity_later(child: Child, budget: Arc<IdentityCaptureBudget>) {
+    let sender = identity_reaper().expect("identity reaper initialized before child spawn");
+    match sender.try_send((child, budget)) {
+        Ok(()) => {}
+        Err(mpsc::TrySendError::Full(job) | mpsc::TrySendError::Disconnected(job)) => {
+            let (child, budget) = job;
+            withhold_unknown_ownership(child, budget);
+        }
+    }
+}
+
+fn kill_identity_process_tree(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        use nix::sys::signal::{Signal, killpg};
+        use nix::unistd::Pid;
+        if let Ok(pid) = i32::try_from(child.id()) {
+            // The direct child remains owned and unreaped while this runs, so
+            // the process-group identity cannot have been reused.
+            let _ = killpg(Pid::from_raw(pid), Signal::SIGKILL);
+        }
+    }
+    // Windows has no process-group operation in this core seam. The direct
+    // child is killed, while the reader/reaper budget remains held if a
+    // descendant retains stdout; callers therefore fail closed instead of
+    // claiming descendant containment parity.
+    let _ = child.kill();
+}
+
+type IdentityReaderSpawner = fn(Box<dyn FnOnce() + Send>) -> std::io::Result<()>;
+
+fn spawn_identity_reader(task: Box<dyn FnOnce() + Send>) -> std::io::Result<()> {
+    std::thread::Builder::new()
+        .name("thegn-git-identity-reader".into())
+        .spawn(task)
+        .map(drop)
+}
+
+fn bounded_stdout(command: Command, max_bytes: usize) -> Result<Vec<u8>, String> {
+    bounded_stdout_with(command, max_bytes, spawn_identity_reader, identity_lane())
+}
+
+fn bounded_stdout_with(
+    mut command: Command,
+    max_bytes: usize,
+    spawn_reader: IdentityReaderSpawner,
+    lane: &'static IdentityCaptureLane,
+) -> Result<Vec<u8>, String> {
+    command.stdout(Stdio::piped()).stderr(Stdio::null());
+    let read_limit = u64::try_from(max_bytes)
+        .ok()
+        .and_then(|limit| limit.checked_add(1))
+        .ok_or_else(|| "git identity probe has an invalid output bound".to_string())?;
+    identity_reaper()?;
+    let budget = lane.acquire(IDENTITY_CAPTURE_WAIT)?;
+    #[cfg(unix)]
+    command.process_group(0);
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => return Err(error.to_string()),
+    };
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            kill_identity_process_tree(&mut child);
+            reap_identity_later(child, budget.clone());
+            return Err("git identity probe stdout pipe was not created".into());
+        }
+    };
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let reader_budget = Arc::clone(&budget);
+    let reader_task = Box::new(move || {
+        let mut bytes = Vec::with_capacity(max_bytes.min(4096));
+        let result = stdout
+            .take(read_limit)
+            .read_to_end(&mut bytes)
+            .map(|_| bytes);
+        drop(reader_budget);
+        let _ = sender.send(result);
+    });
+    if let Err(error) = spawn_reader(reader_task) {
+        kill_identity_process_tree(&mut child);
+        reap_identity_later(child, budget.clone());
+        return Err(error.to_string());
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    // Do not reap the leader while its stdout is still held. try_wait(Some)
+    // reaps on Unix: signaling its numeric process group after that could kill
+    // an unrelated reused PID. Waiting for bounded pipe completion first keeps
+    // the leader (including a zombie) owned until every possible group signal.
+    let captured =
+        receiver.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()));
+    let bytes = match captured {
+        Ok(Ok(bytes)) if bytes.len() <= max_bytes => bytes,
+        other => {
+            kill_identity_process_tree(&mut child);
+            reap_identity_later(child, budget.clone());
+            return Err(match other {
+                Ok(Ok(_)) => "git identity probe output exceeded its bound".into(),
+                Ok(Err(error)) => error.to_string(),
+                Err(_) => "git identity probe stdout reader exceeded its time bound".into(),
+            });
+        }
+    };
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok(None) => {
+                kill_identity_process_tree(&mut child);
+                reap_identity_later(child, budget.clone());
+                return Err("git identity probe exceeded its time bound".into());
+            }
+            Err(error) => {
+                // Ownership is uncertain: never signal a numeric PID here.
+                reap_identity_later(child, budget.clone());
+                return Err(error.to_string());
+            }
+        }
+    };
+    if !status.success() {
+        return Err(format!("git exited with {status}"));
+    }
+    Ok(bytes)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NativePathError {
+    TooLong,
+    #[allow(
+        dead_code,
+        reason = "constructed only on targets that are neither unix nor windows"
+    )]
+    Unsupported,
+}
+
+/// Capture the platform representation only after checking its borrowed size.
+/// This keeps a hostile path from forcing an allocation before the identity
+/// bound has been established.
+pub(crate) fn native_path_bytes_bounded(
+    path: &Path,
+    max_bytes: usize,
+) -> Result<Vec<u8>, NativePathError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let bytes = path.as_os_str().as_bytes();
+        if bytes.len() > max_bytes {
+            return Err(NativePathError::TooLong);
+        }
+        Ok(bytes.to_vec())
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        let max_units = max_bytes / 2;
+        let unit_count = path.as_os_str().encode_wide().take(max_units + 1).count();
+        if unit_count > max_units {
+            return Err(NativePathError::TooLong);
+        }
+        Ok(path
+            .as_os_str()
+            .encode_wide()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<u8>>())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let text = path.to_str().ok_or(NativePathError::Unsupported)?;
+        if text.len() > max_bytes {
+            return Err(NativePathError::TooLong);
+        }
+        Ok(text.as_bytes().to_vec())
+    }
+}
+
+/// An opened Git administrative directory and its exact instance stamp.
+/// Keeping the handle alive across the inspection closes the path-swap window;
+/// the creation identity is read from that same handle before it is released.
+pub(crate) struct GitAdminInstanceStamp {
+    _handle: same_file::Handle,
+    bytes: Vec<u8>,
+}
+
+impl GitAdminInstanceStamp {
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+/// Capture the OS identity of a Git administrative directory. The resulting
+/// bytes remain an inspection proof owned by the Git adapter; callers must not
+/// manufacture a generation from random bytes. `Metadata::created` is read
+/// from the same opened handle as the object identity and is required: device
+/// plus inode/file-index alone identifies an object only while it is held and
+/// can be reused after delete/recreate. Platforms/filesystems without a
+/// creation identity fail closed.
+pub(crate) fn git_admin_instance_stamp(path: &Path) -> Option<GitAdminInstanceStamp> {
+    use std::hash::{Hash as _, Hasher as _};
+
+    let handle = same_file::Handle::from_path(path).ok()?;
+    let created = handle.as_file().metadata().ok()?.created().ok()?;
+    let since_epoch = created.duration_since(UNIX_EPOCH).ok()?;
+    let mut hasher = IdentityStampHasher::default();
+    hasher.write(b"thegn/git-admin-instance-v2");
+    std::hash::Hash::hash(&handle, &mut hasher);
+    since_epoch.as_secs().hash(&mut hasher);
+    since_epoch.subsec_nanos().hash(&mut hasher);
+    (!hasher.bytes.is_empty()).then_some(GitAdminInstanceStamp {
+        _handle: handle,
+        bytes: hasher.bytes,
+    })
+}
+
+#[derive(Default)]
+struct IdentityStampHasher {
+    bytes: Vec<u8>,
+}
+
+impl std::hash::Hasher for IdentityStampHasher {
+    fn finish(&self) -> u64 {
+        0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        self.bytes.extend_from_slice(bytes);
+    }
+
+    fn write_u32(&mut self, value: u32) {
+        self.bytes.extend_from_slice(&value.to_be_bytes());
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        self.bytes.extend_from_slice(&value.to_be_bytes());
+    }
+}
+
+/// Convert Git's bounded path output to a native path without using lossy
+/// UTF-8 conversion. Git emits UTF-8 on Windows; the native representation is
+/// captured by [`native_path_bytes`] after that conversion.
+pub(crate) fn path_from_git_bytes(bytes: &[u8]) -> Option<PathBuf> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        Some(PathBuf::from(std::ffi::OsString::from_vec(bytes.to_vec())))
+    }
+    #[cfg(not(unix))]
+    {
+        String::from_utf8(bytes.to_vec()).ok().map(PathBuf::from)
+    }
 }
 
 /// A short, STABLE alphanumeric digest of a string — deterministic across runs,
@@ -1108,6 +1559,86 @@ fn platform_hostname() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_stdout_handles_idle_and_oversized_injected_children() {
+        let mut idle = Command::new("/bin/sh");
+        idle.args(["-c", "exit 0"]);
+        assert!(bounded_stdout(idle, 32).unwrap().is_empty());
+
+        let mut oversized = Command::new("/bin/sh");
+        oversized.args(["-c", "head -c 128 /dev/zero"]);
+        let error = bounded_stdout(oversized, 32).unwrap_err();
+        assert!(error.contains("exceeded its bound"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_stdout_cleans_a_child_that_holds_stdout_after_exit() {
+        let mut holding = Command::new("/bin/sh");
+        holding.args(["-c", "(sleep 10) & exit 0"]);
+        let error = bounded_stdout(holding, 32).unwrap_err();
+        assert!(error.contains("reader") || error.contains("time bound"));
+    }
+
+    /// A test-owned lane. The production lane is process-wide, so asserting
+    /// on it makes every identity test in the same process (`cargo llvm-cov
+    /// -p thegn-core --lib` runs them all in ONE process) contend with these
+    /// assertions.
+    fn test_lane(slots: usize) -> &'static IdentityCaptureLane {
+        Box::leak(Box::new(IdentityCaptureLane::new(slots)))
+    }
+
+    #[test]
+    fn capture_lane_is_finite_and_reclaims_completed_slots() {
+        let lane = test_lane(2);
+        let first = lane.acquire(Duration::ZERO).unwrap();
+        let second = lane.acquire(Duration::ZERO).unwrap();
+        assert!(lane.acquire(Duration::ZERO).is_err());
+        drop(first);
+        assert!(lane.acquire(Duration::ZERO).is_ok());
+        drop(second);
+    }
+
+    #[test]
+    fn capture_lane_waits_for_a_slot_instead_of_refusing_a_concurrent_caller() {
+        // The regression: three concurrent creates (wizard + tracker dispatch
+        // + autopilot) used to make the third caller fail instantly.
+        let lane = test_lane(1);
+        let held = lane.acquire(Duration::ZERO).unwrap();
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            drop(held);
+        });
+        let waited = lane.acquire(Duration::from_secs(5));
+        assert!(waited.is_ok(), "a queued caller must wait, not be refused");
+        releaser.join().unwrap();
+    }
+
+    #[test]
+    fn withheld_slots_degrade_throughput_and_never_brick_the_lane() {
+        let lane = test_lane(1);
+        let leaked = lane.acquire(Duration::ZERO).unwrap();
+        leaked.withhold_slot();
+        drop(leaked);
+        // The slot stays withheld: a possibly-live child may still hold the
+        // pipe, so capacity is not handed out immediately...
+        assert!(lane.acquire(Duration::ZERO).is_err());
+        // ...but it is accounted separately and reclaimed by time, so the lane
+        // recovers without a process restart.
+        {
+            let mut state = lane.state.lock().unwrap();
+            state.withheld.clear();
+            state
+                .withheld
+                .push(Instant::now() + Duration::from_millis(50));
+        }
+        assert!(
+            lane.acquire(Duration::from_secs(5)).is_ok(),
+            "a withheld slot must be reclaimed after its retention"
+        );
+    }
 
     #[test]
     fn strips_the_linux_deleted_marker() {

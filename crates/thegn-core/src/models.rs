@@ -222,6 +222,26 @@ pub struct WorktreeRow {
     pub env_name: Option<String>,
 }
 
+/// Exact identity ledger row for a Git worktree instance. This is a bounded
+/// reconciliation/cache record; Git metadata must still be verified before an
+/// authority-bearing attach, move, mutation, or cleanup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeInstanceRow {
+    pub instance_id: Vec<u8>,
+    pub generation: Vec<u8>,
+    pub repo_id: Vec<u8>,
+    pub common_dir: Vec<u8>,
+    pub admin_id: Vec<u8>,
+    /// None is the exact detached-worktree state; it is not an empty branch.
+    pub branch_ref: Option<Vec<u8>>,
+    pub path: Vec<u8>,
+    pub owner: Vec<u8>,
+    pub state: String,
+    pub quarantine_reason: Option<String>,
+    pub operation_revision: i64,
+    pub created_at: i64,
+}
+
 /// A persisted worktree group (native host, schema v6): one worktree shown in
 /// the sidebar, owning an ordered set of tabs (`GroupTabRow`).
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -1,0 +1,12 @@
+# THE-516 foundation revision 4
+
+Review 514 identified a real rebuild retry bug and missing ownership regressions. Primary has corrected the migration in the preceding commit: whole-v69 transaction including final schema verification, refusal of any stale rebuild table on both migration and fast verify, and SQL canonical comparison preserving quoted literals. Read the schema-case finding and new regression tests; independent followup review and central Rust validation remain pending. Do not revert these corrections.
+
+Complete only these foundation corrections, then return for review. No creation/routing/rename consumer changes yet, and do not claim the full issue done. Chunks 3-8 remain mandatory after foundation validation.
+
+1. Add deterministic real capture-path coverage for bounded ownership: repeated two-slot saturation, refusal before child spawn while both held, spawn-error reclamation, normal completion reclamation, reader-setup failure reclamation, delayed reader/leader EOF ordering and pipe timeout. Assert children/readers never exceed the fixed limit across retries; do not rely on a single timing sleep or global tests being alone.
+2. Prefer a small private budget/spawner test seam (same production ownership code, test-owned counter) to a global test lock that does not cover sibling identity probes. Keep production one shared fixed two-slot lane and single shared bounded reaper. No unbounded retry queue, extra reaper threads per timeout, or signal after reaping. All error/overflow/timeout paths retain ownership until actual reader AND child completion. Never derive a process group signal from a reaped PID.
+3. Review the primary migration correction and new tests for compile/source mistakes. Add an index-creation-failure rollback case with two valid old verified claims colliding on path, proving originals and old schema survive and a retry refuses. Add positive old-ledger migration/idempotence if existing repaired-row positive control is insufficient. No destructive recovery of stale legacy table; explicit refusal must preserve it.
+4. Address any formatting/ratchet findings. No Cargo/build/Clippy/nextest/test suite commands; primary centrally schedules Rust once its current gate finishes. Narrow Python/SQLite/OS fixtures are allowed. Report exact source changes and unverified runtime checks; commit work and required native artifact.
+
+Full-issue review 514 findings 2-4 are explicitly still pending later approved chunks, not waived. Platform runtime remains unverified and must be documented honestly.

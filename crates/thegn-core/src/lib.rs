@@ -111,6 +111,7 @@ mod db_session_migration;
 mod db_trust;
 mod db_usage;
 mod db_workspace;
+mod db_worktree_identity;
 mod db_zones;
 pub mod debug;
 pub mod devcontainer;

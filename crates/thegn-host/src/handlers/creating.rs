@@ -100,7 +100,8 @@ pub(crate) fn open_tab(
 /// doesn't leave the sidebar empty until the off-loop worker reaches
 /// [`crate::wizard::CreateEvent::TabOpened`]. Name derivation is pure (no
 /// git/DB on the loop): `repo_slug` is already resolved at wizard open, and
-/// `branch_tab`/`worktree_path` are slugify+join. The worker's authoritative
+/// `branch_tab`/`provisional_worktree_path` are pure. The provisional path is
+/// domain-separated so it never names a real checkout. The worker's authoritative
 /// `TabOpened` later reconciles the name via [`reconcile_name`].
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn open_optimistic(
@@ -117,9 +118,10 @@ pub(crate) fn open_optimistic(
     env: &str,
 ) {
     let tab = thegn_core::repo::branch_tab(&wizard.repo_slug, &progress.branch);
-    let path = thegn_core::worktree::worktree_path(wizard.root(), &progress.branch, cfg)
-        .to_string_lossy()
-        .into_owned();
+    let path =
+        thegn_core::worktree::provisional_worktree_path(wizard.root(), &progress.branch, cfg)
+            .to_string_lossy()
+            .into_owned();
     let jump = cfg.session.focus_on_create;
     // Record the wizard's host pick against the optimistic key BEFORE the worker's
     // `TabOpened` (which re-asserts it in `open_or_reconcile`) — otherwise the

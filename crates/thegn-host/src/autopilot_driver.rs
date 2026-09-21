@@ -121,15 +121,28 @@ fn drive_claim(
         fail("configured base branch has no commit");
         return;
     }
-    let worktree = thegn_core::worktree::worktree_path(repo_root, &branch, cfg);
+    let worktree = match thegn_core::worktree::allocate_worktree_path(repo_root, &branch, cfg) {
+        Ok(path) => path,
+        Err(e) => {
+            fail(&format!("worktree identity unavailable: {e}"));
+            return;
+        }
+    };
     if let Err(e) = thegn_core::worktree::add_checked(repo_root, &branch, &base, &worktree, cfg) {
         fail(&format!("worktree creation failed: {e}"));
         return;
     }
     let wt = worktree.to_string_lossy().into_owned();
     let root_s = repo_root.to_string_lossy().into_owned();
-    let tab =
-        thegn_core::repo::branch_tab(&thegn_core::repo::repo_slug_with(db, repo_root), &branch);
+    // THE-516: never register under the unsuffixed basename fallback.
+    let slug = match thegn_core::repo::repo_slug_with_checked(db, repo_root) {
+        Ok(slug) => slug,
+        Err(e) => {
+            fail(&format!("workspace identity unavailable: {e}"));
+            return;
+        }
+    };
+    let tab = thegn_core::repo::branch_tab(&slug, &branch);
     if let Err(e) = db.put_worktree(&tab, &root_s, &wt, &branch, None, None) {
         fail(&format!("worktree registration failed: {e}"));
         return;

@@ -268,14 +268,26 @@ fn dispatch_agent(ctx: &mut TrackerCtx) {
             let raw_branch =
                 thegn_core::issue::issue_branch_seed(issue.branch_hint.as_deref(), &issue_number);
             let branch = wt::dedupe(&raw_branch, &taken);
-            let path = wt::worktree_path(&root, &branch, &cfg2);
+            // THE-516: the checkout path and workspace slug are identities;
+            // resolution failures refuse instead of falling back to aliases.
+            let path = match wt::allocate_worktree_path(&root, &branch, &cfg2) {
+                Ok(path) => path,
+                Err(e) => {
+                    thegn_core::msg::warn(&format!("agent dispatch: {e}"));
+                    return;
+                }
+            };
+            // Display label for the hook's `$THEGN_WORKSPACE`. The tab key is
+            // resolved below from the registration handle itself, so a busy
+            // second connection cannot abandon a finished checkout.
+            let hook_workspace = repo::repo_slug(&root);
 
             let pre = crate::worktree_lifecycle::run_event(
                 &cfg2,
                 &root,
                 &path,
                 &branch,
-                &repo::repo_slug(&root),
+                &hook_workspace,
                 thegn_core::hooks::HookEvent::PreCreate,
                 thegn_core::hooks::HookExecutionMode::User,
             );
@@ -285,13 +297,13 @@ fn dispatch_agent(ctx: &mut TrackerCtx) {
             }
 
             if let Err(e) = wt::add_checked_with_state(&root, &branch, &base, &path, &cfg2) {
-                let message = crate::worktree_lifecycle::create_failure_with_add_state(
+                let message = crate::worktree_lifecycle::create_failure_after_add(
                     format!("agent dispatch: {}", e.message),
                     &cfg2,
                     &root,
                     &path,
                     &branch,
-                    e.branch_created,
+                    &e,
                 );
                 thegn_core::msg::warn(&message);
                 return;
@@ -355,8 +367,6 @@ fn dispatch_agent(ctx: &mut TrackerCtx) {
             spec.env.push(("THEGN_ISSUE_BODY".into(), issue_body));
             spec.env.push(("THEGN_ISSUE_URL".into(), issue_url));
 
-            let slug = repo::repo_slug(&root);
-            let tab = repo::branch_tab(&slug, &branch);
             let root_s = root.to_string_lossy();
 
             // Register the dispatch in the DB. A missing/failed primary row
@@ -367,6 +377,23 @@ fn dispatch_agent(ctx: &mut TrackerCtx) {
                 Err(error) => {
                     let message = crate::worktree_lifecycle::create_failure_with_rollback(
                         format!("agent dispatch database open failed: {error}"),
+                        &cfg2,
+                        &root,
+                        &path,
+                        &branch,
+                    );
+                    thegn_core::msg::warn(&message);
+                    return;
+                }
+            };
+            // THE-516: the tab key is DB-assigned identity, resolved from the
+            // same handle that registers the row — never the unsuffixed
+            // basename fallback.
+            let tab = match repo::repo_slug_with_checked(&db, &root) {
+                Ok(slug) => repo::branch_tab(&slug, &branch),
+                Err(error) => {
+                    let message = crate::worktree_lifecycle::create_failure_with_rollback(
+                        format!("agent dispatch workspace identity unavailable: {error}"),
                         &cfg2,
                         &root,
                         &path,
@@ -400,7 +427,7 @@ fn dispatch_agent(ctx: &mut TrackerCtx) {
                     &root,
                     &path,
                     &branch,
-                    &slug,
+                    &hook_workspace,
                     Some(&db),
                     None,
                 ) {
