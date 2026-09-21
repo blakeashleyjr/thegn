@@ -29,6 +29,23 @@ impl axum::serve::Listener for CountingListener {
     }
 }
 
+/// A default budget over a private pool, so parallel tests never contend for
+/// the process-wide one.
+fn adm() -> AccountAdmission {
+    AccountAdmission::isolated(AdmissionBudget::default())
+}
+
+/// A router over a private pool.
+fn router(cfg: &CalendarConfig) -> CalendarRouter {
+    CalendarRouter::from_config_with_pool(
+        cfg,
+        AdmissionPool::new(
+            thegn_core::calendar::admission::GLOBAL_MAX_RECORDS,
+            thegn_core::calendar::admission::GLOBAL_MAX_BYTES,
+        ),
+    )
+}
+
 fn account(name: &str, provider: CalendarProviderKind) -> CalendarAccount {
     CalendarAccount {
         name: name.into(),
@@ -69,10 +86,13 @@ impl Drop for Tmp {
 
 /// An ICS backend reading `path` (a file or a vdir).
 fn ics_backend(path: &str) -> ics::IcsBackend {
-    ics::IcsBackend::new(&CalendarAccount {
-        path: path.into(),
-        ..account("t", CalendarProviderKind::Ics)
-    })
+    ics::IcsBackend::new(
+        &CalendarAccount {
+            path: path.into(),
+            ..account("t", CalendarProviderKind::Ics)
+        },
+        adm(),
+    )
 }
 
 /// The window every test queries.
@@ -199,12 +219,15 @@ async fn every_redirect_status_is_refused_without_following_or_replaying_auth() 
 
     let mut last_error = None;
     for status in [301, 302, 303, 307, 308] {
-        let backend = ics_url::IcsUrlBackend::new(&CalendarAccount {
-            url: format!("http://{address}/{status}"),
-            token: "feed-secret".into(),
-            allow_private_network: true,
-            ..account("remote", CalendarProviderKind::IcsUrl)
-        });
+        let backend = ics_url::IcsUrlBackend::new(
+            &CalendarAccount {
+                url: format!("http://{address}/{status}"),
+                token: "feed-secret".into(),
+                allow_private_network: true,
+                ..account("remote", CalendarProviderKind::IcsUrl)
+            },
+            adm(),
+        );
         let error = backend
             .list_events(window().0, window().1, "sync-secret")
             .await
@@ -285,12 +308,15 @@ async fn caldav_redirect_never_replays_a_sync_token_body_for_any_status() {
     });
 
     for status in [301, 302, 303, 307, 308] {
-        let backend = caldav::CalDavBackend::new(&CalendarAccount {
-            url: format!("http://{address}/report/{status}"),
-            token: "dav-secret".into(),
-            allow_private_network: true,
-            ..account("dav", CalendarProviderKind::CalDav)
-        });
+        let backend = caldav::CalDavBackend::new(
+            &CalendarAccount {
+                url: format!("http://{address}/report/{status}"),
+                token: "dav-secret".into(),
+                allow_private_network: true,
+                ..account("dav", CalendarProviderKind::CalDav)
+            },
+            adm(),
+        );
         let error = backend
             .list_events(window().0, window().1, "sync-secret")
             .await
@@ -380,11 +406,14 @@ async fn redirect_locations_are_never_followed_across_origins_or_schemes() {
     });
 
     for status in [301, 302, 303, 307, 308] {
-        let backend = ics_url::IcsUrlBackend::new(&CalendarAccount {
-            url: format!("http://{source_address}/{status}"),
-            allow_private_network: true,
-            ..account("remote", CalendarProviderKind::IcsUrl)
-        });
+        let backend = ics_url::IcsUrlBackend::new(
+            &CalendarAccount {
+                url: format!("http://{source_address}/{status}"),
+                allow_private_network: true,
+                ..account("remote", CalendarProviderKind::IcsUrl)
+            },
+            adm(),
+        );
         assert!(matches!(
             backend
                 .list_events(window().0, window().1, "sync-secret")
@@ -438,11 +467,11 @@ async fn redirect_self_loops_are_refused_without_a_second_request() {
             ..account("loop", provider)
         };
         let error = match provider {
-            CalendarProviderKind::IcsUrl => ics_url::IcsUrlBackend::new(&cfg)
+            CalendarProviderKind::IcsUrl => ics_url::IcsUrlBackend::new(&cfg, adm())
                 .list_events(window().0, window().1, "")
                 .await
                 .unwrap_err(),
-            CalendarProviderKind::CalDav => caldav::CalDavBackend::new(&cfg)
+            CalendarProviderKind::CalDav => caldav::CalDavBackend::new(&cfg, adm())
                 .list_events(window().0, window().1, "")
                 .await
                 .unwrap_err(),
@@ -510,16 +539,19 @@ async fn caldav_token_recovery_is_one_bounded_retry_with_shared_deadline() {
             .unwrap();
         });
 
-        let backend = caldav::CalDavBackend::new(&CalendarAccount {
-            url: format!("http://{address}/report"),
-            allow_private_network: true,
-            ..account("dav", CalendarProviderKind::CalDav)
-        });
+        let backend = caldav::CalDavBackend::new(
+            &CalendarAccount {
+                url: format!("http://{address}/report"),
+                allow_private_network: true,
+                ..account("dav", CalendarProviderKind::CalDav)
+            },
+            adm(),
+        );
         let page = backend
             .list_events(window().0, window().1, "expired-token")
             .await
             .unwrap();
-        assert_eq!(page.sync_token, "new-token");
+        assert_eq!(page.sync_token(), "new-token");
         assert_eq!(requests.load(Ordering::SeqCst), 2);
         {
             let bodies = bodies.lock().unwrap();
@@ -561,11 +593,14 @@ async fn caldav_token_recovery_is_one_bounded_retry_with_shared_deadline() {
             .await
             .unwrap();
         });
-        let backend = caldav::CalDavBackend::new(&CalendarAccount {
-            url: format!("http://{address}/report"),
-            allow_private_network: true,
-            ..account("dav", CalendarProviderKind::CalDav)
-        })
+        let backend = caldav::CalDavBackend::new(
+            &CalendarAccount {
+                url: format!("http://{address}/report"),
+                allow_private_network: true,
+                ..account("dav", CalendarProviderKind::CalDav)
+            },
+            adm(),
+        )
         .with_timeout_for_test(std::time::Duration::from_millis(250));
         let error = backend
             .list_events(window().0, window().1, "expired-token")
@@ -643,15 +678,18 @@ async fn oversized_chunked_and_encoded_calendar_bodies_are_rejected_before_parse
     });
 
     for path in ["/chunked", "/exact", "/error", "/encoded"] {
-        let backend = ics_url::IcsUrlBackend::new(&CalendarAccount {
-            url: format!("http://{address}{path}"),
-            allow_private_network: true,
-            ..account("remote", CalendarProviderKind::IcsUrl)
-        });
+        let backend = ics_url::IcsUrlBackend::new(
+            &CalendarAccount {
+                url: format!("http://{address}{path}"),
+                allow_private_network: true,
+                ..account("remote", CalendarProviderKind::IcsUrl)
+            },
+            adm(),
+        );
         let result = backend.list_events(window().0, window().1, "").await;
         if path == "/exact" {
             assert!(result.is_ok(), "exactly capped body should be readable");
-            assert!(result.unwrap().events.is_empty());
+            assert!(result.unwrap().events().is_empty());
         } else if path == "/encoded" {
             assert!(matches!(
                 result.unwrap_err(),
@@ -709,12 +747,12 @@ async fn declared_oversized_calendar_body_is_refused_without_reading_payload() {
         let result = tokio::time::timeout(std::time::Duration::from_secs(2), async {
             match provider {
                 CalendarProviderKind::IcsUrl => {
-                    ics_url::IcsUrlBackend::new(&cfg)
+                    ics_url::IcsUrlBackend::new(&cfg, adm())
                         .list_events(window().0, window().1, "")
                         .await
                 }
                 _ => {
-                    caldav::CalDavBackend::new(&cfg)
+                    caldav::CalDavBackend::new(&cfg, adm())
                         .list_events(window().0, window().1, "")
                         .await
                 }
@@ -776,12 +814,12 @@ async fn declared_oversized_error_body_is_refused_without_waiting_for_payload() 
             let result = tokio::time::timeout(std::time::Duration::from_secs(2), async {
                 match provider {
                     CalendarProviderKind::IcsUrl => {
-                        ics_url::IcsUrlBackend::new(&cfg)
+                        ics_url::IcsUrlBackend::new(&cfg, adm())
                             .list_events(window().0, window().1, "prior-token")
                             .await
                     }
                     _ => {
-                        caldav::CalDavBackend::new(&cfg)
+                        caldav::CalDavBackend::new(&cfg, adm())
                             .list_events(window().0, window().1, "prior-token")
                             .await
                     }
@@ -826,12 +864,12 @@ async fn gateway_error_media_is_discarded_without_parsing_or_disclosure() {
         };
         let result = match provider {
             CalendarProviderKind::IcsUrl => {
-                ics_url::IcsUrlBackend::new(&cfg)
+                ics_url::IcsUrlBackend::new(&cfg, adm())
                     .list_events(window().0, window().1, "")
                     .await
             }
             _ => {
-                caldav::CalDavBackend::new(&cfg)
+                caldav::CalDavBackend::new(&cfg, adm())
                     .list_events(window().0, window().1, "")
                     .await
             }
@@ -937,11 +975,14 @@ async fn caldav_body_limits_cover_exact_chunked_and_error_responses() {
         }
     });
 
-    let exact_result = caldav::CalDavBackend::new(&CalendarAccount {
-        url: format!("http://{address}/dav-exact"),
-        allow_private_network: true,
-        ..account("dav-exact", CalendarProviderKind::CalDav)
-    })
+    let exact_result = caldav::CalDavBackend::new(
+        &CalendarAccount {
+            url: format!("http://{address}/dav-exact"),
+            allow_private_network: true,
+            ..account("dav-exact", CalendarProviderKind::CalDav)
+        },
+        adm(),
+    )
     .list_events(window().0, window().1, "")
     .await;
     assert!(
@@ -950,11 +991,14 @@ async fn caldav_body_limits_cover_exact_chunked_and_error_responses() {
     );
 
     for path in ["/dav-oversized", "/dav-error"] {
-        let error = caldav::CalDavBackend::new(&CalendarAccount {
-            url: format!("http://{address}{path}"),
-            allow_private_network: true,
-            ..account("dav-limit", CalendarProviderKind::CalDav)
-        })
+        let error = caldav::CalDavBackend::new(
+            &CalendarAccount {
+                url: format!("http://{address}{path}"),
+                allow_private_network: true,
+                ..account("dav-limit", CalendarProviderKind::CalDav)
+            },
+            adm(),
+        )
         .list_events(window().0, window().1, "")
         .await
         .unwrap_err();
@@ -988,15 +1032,21 @@ async fn both_remote_backends_refuse_literal_non_public_addresses_before_connect
         ),
     ] {
         let backend = match provider {
-            CalendarProviderKind::IcsUrl => ics_url::IcsUrlBackend::new(&CalendarAccount {
-                url: url.into(),
-                ..account("remote", provider)
-            }),
-            CalendarProviderKind::CalDav => {
-                let backend = caldav::CalDavBackend::new(&CalendarAccount {
+            CalendarProviderKind::IcsUrl => ics_url::IcsUrlBackend::new(
+                &CalendarAccount {
                     url: url.into(),
                     ..account("remote", provider)
-                });
+                },
+                adm(),
+            ),
+            CalendarProviderKind::CalDav => {
+                let backend = caldav::CalDavBackend::new(
+                    &CalendarAccount {
+                        url: url.into(),
+                        ..account("remote", provider)
+                    },
+                    adm(),
+                );
                 let error = backend
                     .list_events(window().0, window().1, "")
                     .await
@@ -1149,21 +1199,24 @@ async fn media_encoding_and_shared_pool_policies_apply_to_real_backends() {
         ("first".to_owned(), "first-validator".to_owned()),
         ("second".to_owned(), "second-validator".to_owned()),
     ]);
-    CalendarRouter::from_config(&config("first-query", "second-query"))
+    router(&config("first-query", "second-query"))
         .list_events(window().0, window().1, &tokens)
         .await;
     // Rebuilding the router/backends must still clone the same process pool;
     // credentials and validators remain request-local.
-    CalendarRouter::from_config(&config("first-query", "second-query"))
+    router(&config("first-query", "second-query"))
         .list_events(window().0, window().1, &tokens)
         .await;
 
-    let dav = caldav::CalDavBackend::new(&CalendarAccount {
-        url: format!("http://{address}/dav?account=dav-query"),
-        token: "dav-secret".into(),
-        allow_private_network: true,
-        ..account("dav", CalendarProviderKind::CalDav)
-    });
+    let dav = caldav::CalDavBackend::new(
+        &CalendarAccount {
+            url: format!("http://{address}/dav?account=dav-query"),
+            token: "dav-secret".into(),
+            allow_private_network: true,
+            ..account("dav", CalendarProviderKind::CalDav)
+        },
+        adm(),
+    );
     dav.list_events(window().0, window().1, "dav-sync-secret")
         .await
         .unwrap();
@@ -1174,31 +1227,40 @@ async fn media_encoding_and_shared_pool_policies_apply_to_real_backends() {
         "/ics-application-ics",
         "/ics-text-plain",
     ] {
-        ics_url::IcsUrlBackend::new(&CalendarAccount {
-            url: format!("http://{address}{path}"),
-            allow_private_network: true,
-            ..account("mime", CalendarProviderKind::IcsUrl)
-        })
+        ics_url::IcsUrlBackend::new(
+            &CalendarAccount {
+                url: format!("http://{address}{path}"),
+                allow_private_network: true,
+                ..account("mime", CalendarProviderKind::IcsUrl)
+            },
+            adm(),
+        )
         .list_events(window().0, window().1, "")
         .await
         .unwrap();
     }
     for path in ["/dav", "/dav-text-xml", "/dav-application-dav"] {
-        caldav::CalDavBackend::new(&CalendarAccount {
-            url: format!("http://{address}{path}"),
-            allow_private_network: true,
-            ..account("mime-dav", CalendarProviderKind::CalDav)
-        })
+        caldav::CalDavBackend::new(
+            &CalendarAccount {
+                url: format!("http://{address}{path}"),
+                allow_private_network: true,
+                ..account("mime-dav", CalendarProviderKind::CalDav)
+            },
+            adm(),
+        )
         .list_events(window().0, window().1, "")
         .await
         .unwrap();
     }
 
-    let encoded = ics_url::IcsUrlBackend::new(&CalendarAccount {
-        url: format!("http://{address}/encoding"),
-        allow_private_network: true,
-        ..account("encoded", CalendarProviderKind::IcsUrl)
-    });
+    let encoded = ics_url::IcsUrlBackend::new(
+        &CalendarAccount {
+            url: format!("http://{address}/encoding"),
+            allow_private_network: true,
+            ..account("encoded", CalendarProviderKind::IcsUrl)
+        },
+        adm(),
+    );
     let error = encoded
         .list_events(window().0, window().1, "")
         .await
@@ -1207,11 +1269,14 @@ async fn media_encoding_and_shared_pool_policies_apply_to_real_backends() {
         error,
         CalendarError::Policy("calendar response encoding refused")
     ));
-    let repeated = ics_url::IcsUrlBackend::new(&CalendarAccount {
-        url: format!("http://{address}/repeat-content-type"),
-        allow_private_network: true,
-        ..account("repeated", CalendarProviderKind::IcsUrl)
-    })
+    let repeated = ics_url::IcsUrlBackend::new(
+        &CalendarAccount {
+            url: format!("http://{address}/repeat-content-type"),
+            allow_private_network: true,
+            ..account("repeated", CalendarProviderKind::IcsUrl)
+        },
+        adm(),
+    )
     .list_events(window().0, window().1, "")
     .await
     .unwrap_err();
@@ -1282,9 +1347,8 @@ fn an_ics_file_is_parsed() {
     std::fs::write(&f, ONE_EVENT).unwrap();
     let (from, to) = window();
     let page = block_on(ics_backend(&f.display().to_string()).list_events(from, to, "")).unwrap();
-    assert_eq!(page.events.len(), 1);
-    assert_eq!(page.events[0].title, "Standup");
-    assert!(!page.partial);
+    assert_eq!(page.events().len(), 1);
+    assert_eq!(page.events()[0].title, "Standup");
 }
 
 #[test]
@@ -1305,7 +1369,7 @@ fn a_directory_of_ics_files_is_read_as_one_calendar() {
 
     let (from, to) = window();
     let page = block_on(ics_backend(&t.0.display().to_string()).list_events(from, to, "")).unwrap();
-    let mut titles: Vec<_> = page.events.iter().map(|e| e.title.clone()).collect();
+    let mut titles: Vec<_> = page.events().iter().map(|e| e.title.clone()).collect();
     titles.sort();
     assert_eq!(titles, vec!["Retro", "Standup"]);
 }
@@ -1352,7 +1416,7 @@ fn the_ics_backend_advertises_no_write_capabilities() {
 
 #[test]
 fn an_empty_config_builds_an_unconfigured_router() {
-    let r = CalendarRouter::from_config(&CalendarConfig::default());
+    let r = router(&CalendarConfig::default());
     assert!(!r.is_configured());
     let (from, to) = window();
     let out = block_on(r.list_events(from, to, &BTreeMap::new()));
@@ -1368,18 +1432,21 @@ fn caldav_reports_real_delta_support() {
         }],
         ..CalendarConfig::default()
     };
-    assert!(CalendarRouter::from_config(&cfg).is_configured());
-    let b = caldav::CalDavBackend::new(&CalendarAccount {
-        url: "https://dav.example.com/cal/".into(),
-        ..account("dav", CalendarProviderKind::CalDav)
-    });
+    assert!(router(&cfg).is_configured());
+    let b = caldav::CalDavBackend::new(
+        &CalendarAccount {
+            url: "https://dav.example.com/cal/".into(),
+            ..account("dav", CalendarProviderKind::CalDav)
+        },
+        adm(),
+    );
     assert_eq!(b.provider_id(), "caldav");
     // `sync-collection` gives tombstones, not just a conditional refetch — the
     // only provider here that populates `EventPage::deleted`.
     assert!(b.caps().incremental);
 
     // A missing url is a config problem, not a network one.
-    let bare = caldav::CalDavBackend::new(&account("dav", CalendarProviderKind::CalDav));
+    let bare = caldav::CalDavBackend::new(&account("dav", CalendarProviderKind::CalDav), adm());
     let (from, to) = window();
     let err = block_on(bare.list_events(from, to, "")).unwrap_err();
     assert!(matches!(err, CalendarError::NotConfigured));
@@ -1500,15 +1567,15 @@ fn every_event_is_stamped_with_its_source_and_color() {
         }],
         ..CalendarConfig::default()
     };
-    let r = CalendarRouter::from_config(&cfg);
+    let r = router(&cfg);
     let (from, to) = window();
     let out = block_on(r.list_events(from, to, &BTreeMap::new()));
     assert_eq!(out.len(), 1);
     let page = out[0].result.as_ref().unwrap();
     // Identity is what makes ids globally unique across accounts.
-    assert_eq!(page.events[0].source.as_str(), "ics:work");
-    assert_eq!(page.events[0].id().as_str(), "ics:work/e1");
-    assert_eq!(page.events[0].color, Some(thegn_core::theme::Hue::Amber));
+    assert_eq!(page.events()[0].source.as_str(), "ics:work");
+    assert_eq!(page.events()[0].id().as_str(), "ics:work/e1");
+    assert_eq!(page.events()[0].color, Some(thegn_core::theme::Hue::Amber));
 }
 
 #[test]
@@ -1531,12 +1598,12 @@ fn one_failing_account_does_not_affect_another() {
         ..CalendarConfig::default()
     };
     let (from, to) = window();
-    let out = block_on(CalendarRouter::from_config(&cfg).list_events(from, to, &BTreeMap::new()));
+    let out = block_on(router(&cfg).list_events(from, to, &BTreeMap::new()));
     assert_eq!(out.len(), 2);
     assert_eq!(out[0].account, "broken");
     assert!(out[0].result.is_err());
     assert_eq!(out[1].account, "good");
-    assert_eq!(out[1].result.as_ref().unwrap().events.len(), 1);
+    assert_eq!(out[1].result.as_ref().unwrap().events().len(), 1);
 }
 
 // --- the command (plugin) backend -------------------------------------------
@@ -1549,7 +1616,7 @@ fn command_account(script: &str) -> CalendarAccount {
 }
 
 fn run_plugin(script: &str) -> Result<EventPage, CalendarError> {
-    let b = command::CommandBackend::new(&command_account(script));
+    let b = command::CommandBackend::new(&command_account(script), adm());
     let (from, to) = window();
     block_on(b.list_events(from, to, ""))
 }
@@ -1561,8 +1628,8 @@ fn a_four_field_event_is_a_complete_plugin_reply() {
         r#"echo '{"method":"events","params":{"events":[{"uid":"1","title":"Standup","start":{"kind":"date","date":"2026-08-21"},"end":{"kind":"date","date":"2026-08-22"}}]}}'"#,
     )
     .unwrap();
-    assert_eq!(page.events.len(), 1);
-    assert_eq!(page.events[0].title, "Standup");
+    assert_eq!(page.events().len(), 1);
+    assert_eq!(page.events()[0].title, "Standup");
 }
 
 #[test]
@@ -1572,7 +1639,7 @@ fn the_query_window_reaches_the_plugin_as_environment() {
         r#"echo "{\"method\":\"events\",\"params\":{\"sync_token\":\"$THEGN_CAL_FROM..$THEGN_CAL_TO\"}}""#,
     )
     .unwrap();
-    assert_eq!(page.sync_token, "2026-08-01..2026-08-31");
+    assert_eq!(page.sync_token(), "2026-08-01..2026-08-31");
 }
 
 #[test]
@@ -1582,8 +1649,8 @@ fn several_event_messages_accumulate() {
            echo '{"method":"events","params":{"events":[{"uid":"2","title":"B","start":{"kind":"date","date":"2026-08-22"},"end":{"kind":"date","date":"2026-08-23"}}],"sync_token":"t2"}}'"#,
     )
     .unwrap();
-    assert_eq!(page.events.len(), 2, "pages accumulate");
-    assert_eq!(page.sync_token, "t2", "the last token wins");
+    assert_eq!(page.events().len(), 2, "pages accumulate");
+    assert_eq!(page.sync_token(), "t2", "the last token wins");
 }
 
 #[test]
@@ -1594,7 +1661,7 @@ fn a_manifest_is_negotiated_and_a_denied_capability_is_not_fatal() {
            echo '{"method":"events","params":{"events":[]}}'"#,
     )
     .unwrap();
-    assert!(page.events.is_empty());
+    assert!(page.events().is_empty());
 }
 
 #[test]
@@ -1618,10 +1685,13 @@ fn a_plugin_that_fails_reports_its_stderr() {
 
 #[test]
 fn a_plugin_timeout_is_transient_so_the_cache_survives() {
-    let b = command::CommandBackend::new(&CalendarAccount {
-        timeout_secs: 1,
-        ..command_account("sleep 30")
-    });
+    let b = command::CommandBackend::new(
+        &CalendarAccount {
+            timeout_secs: 1,
+            ..command_account("sleep 30")
+        },
+        adm(),
+    );
     let err = block_on(b.list_events(
         chrono::NaiveDate::from_ymd_opt(2026, 8, 1).unwrap(),
         chrono::NaiveDate::from_ymd_opt(2026, 8, 31).unwrap(),
@@ -1633,7 +1703,7 @@ fn a_plugin_timeout_is_transient_so_the_cache_survives() {
 
 #[test]
 fn an_unconfigured_command_account_is_not_configured() {
-    let b = command::CommandBackend::new(&account("p", CalendarProviderKind::Command));
+    let b = command::CommandBackend::new(&account("p", CalendarProviderKind::Command), adm());
     let err = block_on(b.list_events(
         chrono::NaiveDate::from_ymd_opt(2026, 8, 1).unwrap(),
         chrono::NaiveDate::from_ymd_opt(2026, 8, 31).unwrap(),
@@ -1645,7 +1715,7 @@ fn an_unconfigured_command_account_is_not_configured() {
 
 #[test]
 fn an_ics_url_account_with_no_url_is_not_configured() {
-    let b = ics_url::IcsUrlBackend::new(&account("u", CalendarProviderKind::IcsUrl));
+    let b = ics_url::IcsUrlBackend::new(&account("u", CalendarProviderKind::IcsUrl), adm());
     let err = block_on(b.list_events(
         chrono::NaiveDate::from_ymd_opt(2026, 8, 1).unwrap(),
         chrono::NaiveDate::from_ymd_opt(2026, 8, 31).unwrap(),
@@ -1661,9 +1731,661 @@ fn an_ics_url_account_with_no_url_is_not_configured() {
 fn webcal_urls_are_fetched_over_https() {
     // `webcal://` only tells the OS to hand the link to a calendar app; over the
     // wire it is an ordinary GET.
-    let b = ics_url::IcsUrlBackend::new(&CalendarAccount {
-        url: "webcal://example.com/c.ics".into(),
-        ..account("u", CalendarProviderKind::IcsUrl)
-    });
+    let b = ics_url::IcsUrlBackend::new(
+        &CalendarAccount {
+            url: "webcal://example.com/c.ics".into(),
+            ..account("u", CalendarProviderKind::IcsUrl)
+        },
+        adm(),
+    );
     assert_eq!(b.provider_id(), "ics_url");
+}
+
+// --- admission budget --------------------------------------------------------
+
+fn budget_of(n: usize) -> AccountAdmission {
+    AccountAdmission::isolated(AdmissionBudget::new(n).unwrap())
+}
+
+fn ics_feed(n: usize) -> String {
+    let mut s = String::from("BEGIN:VCALENDAR\r\n");
+    for i in 0..n {
+        s.push_str(&format!(
+            "BEGIN:VEVENT\r\nUID:e{i}\r\nSUMMARY:E{i}\r\nDTSTART:20260821T090000Z\r\nEND:VEVENT\r\n"
+        ));
+    }
+    s.push_str("END:VCALENDAR\r\n");
+    s
+}
+
+fn is_admission(e: &CalendarError, limit: thegn_core::calendar::AdmissionLimit) -> bool {
+    matches!(e, CalendarError::Admission(a) if a.limit == limit)
+}
+
+#[test]
+fn a_local_file_over_max_events_is_refused_whole() {
+    use thegn_core::calendar::AdmissionLimit;
+    let t = Tmp::new("adm-file");
+    let f = t.0.join("cal.ics");
+    std::fs::write(&f, ics_feed(3)).unwrap();
+    let acct = CalendarAccount {
+        path: f.display().to_string(),
+        ..account("t", CalendarProviderKind::Ics)
+    };
+    let (from, to) = window();
+    let err =
+        block_on(ics::IcsBackend::new(&acct, budget_of(2)).list_events(from, to, "")).unwrap_err();
+    assert!(
+        is_admission(&err, AdmissionLimit::AccountRecords),
+        "{err:?}"
+    );
+    assert!(!err.is_transient());
+    let page =
+        block_on(ics::IcsBackend::new(&acct, budget_of(3)).list_events(from, to, "")).unwrap();
+    assert_eq!(page.events().len(), 3);
+}
+
+#[test]
+fn a_vdir_over_max_events_is_refused_not_truncated() {
+    use thegn_core::calendar::AdmissionLimit;
+    let t = Tmp::new("adm-vdir");
+    for i in 0..3 {
+        std::fs::write(
+            t.0.join(format!("{i}.ics")),
+            ics_feed(1).replace("e0", &format!("f{i}")),
+        )
+        .unwrap();
+    }
+    let acct = CalendarAccount {
+        path: t.0.display().to_string(),
+        ..account("t", CalendarProviderKind::Ics)
+    };
+    let (from, to) = window();
+    let err =
+        block_on(ics::IcsBackend::new(&acct, budget_of(2)).list_events(from, to, "")).unwrap_err();
+    assert!(
+        is_admission(&err, AdmissionLimit::AccountRecords),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn an_oversized_local_file_is_refused_before_it_is_read() {
+    use thegn_core::calendar::AdmissionLimit;
+    let t = Tmp::new("adm-big");
+    let f = t.0.join("big.ics");
+    let file = std::fs::File::create(&f).unwrap();
+    // Sparse: the size is declared without writing 32 MiB.
+    file.set_len(thegn_core::calendar::admission::MAX_SOURCE_DOCUMENT_BYTES as u64 + 1)
+        .unwrap();
+    let (from, to) = window();
+    let err =
+        block_on(ics_backend(&f.display().to_string()).list_events(from, to, "")).unwrap_err();
+    assert!(is_admission(&err, AdmissionLimit::DocumentBytes), "{err:?}");
+}
+
+#[test]
+fn a_page_owns_its_reservation_until_dropped() {
+    let t = Tmp::new("adm-lease");
+    let f = t.0.join("cal.ics");
+    std::fs::write(&f, ics_feed(3)).unwrap();
+    let pool = AdmissionPool::new(100, 64 << 20);
+    let acct = CalendarAccount {
+        path: f.display().to_string(),
+        ..account("t", CalendarProviderKind::Ics)
+    };
+    let backend = ics::IcsBackend::new(
+        &acct,
+        AccountAdmission::new(AdmissionBudget::default(), pool.clone()),
+    );
+    let (from, to) = window();
+    let page = block_on(backend.list_events(from, to, "")).unwrap();
+    // The transient file reservation is gone; the retained events are held.
+    let (records, bytes) = pool.in_use();
+    assert_eq!(records, 3);
+    assert_eq!((records, bytes), page.reserved());
+    assert!(bytes > 0 && bytes < 1 << 20, "{bytes}");
+    drop(page);
+    assert_eq!(pool.in_use(), (0, 0));
+}
+
+fn two_local_accounts(t: &Tmp) -> CalendarConfig {
+    std::fs::write(t.0.join("a.ics"), ics_feed(1)).unwrap();
+    std::fs::write(t.0.join("b.ics"), ics_feed(1)).unwrap();
+    CalendarConfig {
+        accounts: vec![
+            CalendarAccount {
+                path: t.0.join("a.ics").display().to_string(),
+                ..account("a", CalendarProviderKind::Ics)
+            },
+            CalendarAccount {
+                path: t.0.join("b.ics").display().to_string(),
+                ..account("b", CalendarProviderKind::Ics)
+            },
+        ],
+        ..CalendarConfig::default()
+    }
+}
+
+#[test]
+fn applying_each_page_before_the_next_fetch_prevents_starvation() {
+    use thegn_core::calendar::AdmissionLimit;
+    // A pool with room for exactly one record: two accounts can only both
+    // succeed if the first page's lease is released before the second fetch.
+    let t = Tmp::new("adm-each");
+    let cfg = two_local_accounts(&t);
+    let pool = AdmissionPool::new(1, 64 << 20);
+    let r = CalendarRouter::from_config_with_pool(&cfg, pool.clone());
+    let (from, to) = window();
+    let mut ok = 0;
+    block_on(r.list_events_each(from, to, &BTreeMap::new(), |res| {
+        assert!(res.result.is_ok(), "{:?}", res.result.err());
+        ok += 1;
+    }));
+    assert_eq!(ok, 2);
+    assert_eq!(pool.in_use(), (0, 0));
+
+    // Holding every page (the collecting form) keeps the first lease alive, so
+    // the second account is refused — typed, immediate, never a wait.
+    let out = block_on(r.list_events(from, to, &BTreeMap::new()));
+    assert!(out[0].result.is_ok());
+    let err = out[1].result.as_ref().unwrap_err();
+    assert!(is_admission(err, AdmissionLimit::GlobalRecords), "{err:?}");
+    drop(out);
+    assert_eq!(pool.in_use(), (0, 0));
+}
+
+#[test]
+fn the_router_forwards_the_configured_budget_and_charges_stamps() {
+    use thegn_core::calendar::AdmissionLimit;
+    let t = Tmp::new("adm-router");
+    std::fs::write(t.0.join("a.ics"), ics_feed(3)).unwrap();
+    let mut cfg = CalendarConfig {
+        accounts: vec![CalendarAccount {
+            path: t.0.join("a.ics").display().to_string(),
+            ..account("work", CalendarProviderKind::Ics)
+        }],
+        max_events: 2,
+        ..CalendarConfig::default()
+    };
+    let (from, to) = window();
+    let out = block_on(router(&cfg).list_events(from, to, &BTreeMap::new()));
+    let err = out[0].result.as_ref().unwrap_err();
+    assert!(is_admission(err, AdmissionLimit::AccountRecords), "{err:?}");
+
+    cfg.max_events = 3;
+    let out = block_on(router(&cfg).list_events(from, to, &BTreeMap::new()));
+    let page = out[0].result.as_ref().unwrap();
+    let unstamped = {
+        let direct = ics::IcsBackend::new(&cfg.accounts[0], adm());
+        block_on(direct.list_events(from, to, ""))
+            .unwrap()
+            .reserved()
+            .1
+    };
+    assert_eq!(page.reserved().1, unstamped + 3 * "ics:work".len());
+}
+
+async fn serve_fixed(
+    status: axum::http::StatusCode,
+    content_type: &'static str,
+    body: String,
+) -> (
+    std::net::SocketAddr,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    tokio::task::JoinHandle<()>,
+) {
+    use axum::response::IntoResponse;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = hits.clone();
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            axum::Router::new().fallback(axum::routing::any(move || {
+                let body = body.clone();
+                let seen = seen.clone();
+                async move {
+                    seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    (status, [("content-type", content_type)], body).into_response()
+                }
+            })),
+        )
+        .await
+        .unwrap();
+    });
+    (address, hits, server)
+}
+
+#[tokio::test]
+async fn a_remote_feed_over_the_budget_never_advances_its_etag() {
+    use thegn_core::calendar::AdmissionLimit;
+    let (address, _hits, server) =
+        serve_fixed(axum::http::StatusCode::OK, "text/calendar", ics_feed(50)).await;
+    let acct = CalendarAccount {
+        url: format!("http://{address}/feed.ics"),
+        allow_private_network: true,
+        ..account("u", CalendarProviderKind::IcsUrl)
+    };
+    let pool = AdmissionPool::new(1_000, 128 << 20);
+    let b = ics_url::IcsUrlBackend::new(
+        &acct,
+        AccountAdmission::new(AdmissionBudget::new(10).unwrap(), pool.clone()),
+    );
+    let (from, to) = window();
+    let err = b.list_events(from, to, "").await.unwrap_err();
+    assert!(
+        is_admission(&err, AdmissionLimit::AccountRecords),
+        "{err:?}"
+    );
+    // Refusal released the body and every partial reservation.
+    assert_eq!(pool.in_use(), (0, 0));
+
+    let b = ics_url::IcsUrlBackend::new(
+        &acct,
+        AccountAdmission::new(AdmissionBudget::new(50).unwrap(), pool.clone()),
+    );
+    let page = b.list_events(from, to, "").await.unwrap();
+    assert_eq!(page.events().len(), 50);
+    // Only the retained page is held — the 32 MiB body reservation is gone.
+    assert_eq!(pool.in_use(), page.reserved());
+    assert!(page.reserved().1 < 1 << 20);
+    drop(page);
+    assert_eq!(pool.in_use(), (0, 0));
+    server.abort();
+}
+
+#[tokio::test]
+async fn a_saturated_global_budget_refuses_before_any_request() {
+    let (address, hits, server) =
+        serve_fixed(axum::http::StatusCode::OK, "text/calendar", ics_feed(1)).await;
+    // Less room than one transport body: the fetch must not even be sent.
+    let pool = AdmissionPool::new(1_000, 1 << 20);
+    for provider in [CalendarProviderKind::IcsUrl, CalendarProviderKind::CalDav] {
+        let acct = CalendarAccount {
+            url: format!("http://{address}/x"),
+            allow_private_network: true,
+            ..account("r", provider)
+        };
+        let admission = AccountAdmission::new(AdmissionBudget::default(), pool.clone());
+        let backend: Box<dyn CalendarBackend> = match provider {
+            CalendarProviderKind::IcsUrl => Box::new(ics_url::IcsUrlBackend::new(&acct, admission)),
+            _ => Box::new(caldav::CalDavBackend::new(&acct, admission)),
+        };
+        let (from, to) = window();
+        let err = backend.list_events(from, to, "").await.unwrap_err();
+        match err {
+            CalendarError::Admission(a) => assert!(a.is_contention()),
+            other => panic!("expected a contention refusal, got {other:?}"),
+        }
+    }
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(pool.in_use(), (0, 0));
+    server.abort();
+}
+
+fn multistatus(events: usize, deletions: usize) -> String {
+    let mut s = String::from("<d:multistatus xmlns:d=\"DAV:\">");
+    for i in 0..events {
+        s.push_str(&format!(
+            "<d:response><d:href>/cal/e{i}.ics</d:href><d:propstat><d:prop><c:calendar-data>{}</c:calendar-data></d:prop></d:propstat></d:response>",
+            ics_feed(1).replace("e0", &format!("e{i}"))
+        ));
+    }
+    for i in 0..deletions {
+        s.push_str(&format!(
+            "<d:response><d:href>/cal/gone{i}.ics</d:href><d:status>HTTP/1.1 404 Not Found</d:status></d:response>"
+        ));
+    }
+    s.push_str("<d:sync-token>tok-next</d:sync-token></d:multistatus>");
+    s
+}
+
+#[tokio::test]
+async fn caldav_events_and_deletions_share_the_budget() {
+    use thegn_core::calendar::AdmissionLimit;
+    let (address, _hits, server) = serve_fixed(
+        axum::http::StatusCode::MULTI_STATUS,
+        "application/xml",
+        multistatus(2, 3),
+    )
+    .await;
+    let acct = CalendarAccount {
+        url: format!("http://{address}/cal/"),
+        allow_private_network: true,
+        ..account("dav", CalendarProviderKind::CalDav)
+    };
+    let (from, to) = window();
+    let err = caldav::CalDavBackend::new(&acct, budget_of(4))
+        .list_events(from, to, "tok-prev")
+        .await
+        .unwrap_err();
+    assert!(
+        is_admission(&err, AdmissionLimit::AccountRecords),
+        "{err:?}"
+    );
+    let page = caldav::CalDavBackend::new(&acct, budget_of(5))
+        .list_events(from, to, "tok-prev")
+        .await
+        .unwrap();
+    assert_eq!(page.events().len(), 2);
+    assert_eq!(page.deleted().len(), 3);
+    assert_eq!(page.sync_token(), "tok-next");
+    server.abort();
+}
+
+#[tokio::test]
+async fn caldav_many_deletions_are_refused_at_the_cap() {
+    use thegn_core::calendar::AdmissionLimit;
+    let (address, _hits, server) = serve_fixed(
+        axum::http::StatusCode::MULTI_STATUS,
+        "application/xml",
+        multistatus(0, 5_000),
+    )
+    .await;
+    let acct = CalendarAccount {
+        url: format!("http://{address}/cal/"),
+        allow_private_network: true,
+        ..account("dav", CalendarProviderKind::CalDav)
+    };
+    let (from, to) = window();
+    let err = caldav::CalDavBackend::new(&acct, budget_of(100))
+        .list_events(from, to, "tok-prev")
+        .await
+        .unwrap_err();
+    assert!(
+        is_admission(&err, AdmissionLimit::AccountRecords),
+        "{err:?}"
+    );
+    server.abort();
+}
+
+#[test]
+fn caldav_calendar_data_is_unescaped_exactly_once() {
+    let xml = "<multistatus><response><href>/a.ics</href><calendar-data>SUMMARY:a &amp;lt; b</calendar-data></response></multistatus>";
+    let (r, _) = caldav::parse_multistatus(xml);
+    assert_eq!(r[0].ics, "SUMMARY:a &lt; b");
+}
+
+fn plugin_with(budget: usize, script: &str) -> Result<EventPage, CalendarError> {
+    let b = command::CommandBackend::new(&command_account(script), budget_of(budget));
+    let (from, to) = window();
+    block_on(b.list_events(from, to, ""))
+}
+
+const PLUGIN_EVENT: &str = r#"{"uid":"x","title":"T","start":{"kind":"date","date":"2026-08-21"},"end":{"kind":"date","date":"2026-08-22"}}"#;
+
+#[test]
+fn a_huge_plugin_stream_is_refused_at_the_budget() {
+    use thegn_core::calendar::AdmissionLimit;
+    let line =
+        format!(r#"{{"method":"events","params":{{"events":[{PLUGIN_EVENT},{PLUGIN_EVENT}]}}}}"#);
+    // 10 000 lines × 2 events; the plugin still exits cleanly because the
+    // pipe is drained after refusal.
+    let script = format!("yes '{line}' | head -n 10000");
+    let err = plugin_with(10, &script).unwrap_err();
+    assert!(
+        is_admission(&err, AdmissionLimit::AccountRecords),
+        "{err:?}"
+    );
+    let page = plugin_with(20, &format!("yes '{line}' | head -n 10")).unwrap();
+    assert_eq!(page.events().len(), 20);
+}
+
+#[test]
+fn plugin_deletions_count_against_the_budget() {
+    use thegn_core::calendar::AdmissionLimit;
+    let err = plugin_with(
+        2,
+        r#"echo '{"method":"events","params":{"deleted":["a","b","c"],"sync_token":"t"}}'"#,
+    )
+    .unwrap_err();
+    assert!(
+        is_admission(&err, AdmissionLimit::AccountRecords),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn the_plugin_sees_the_real_budget() {
+    let page = plugin_with(
+        7,
+        r#"echo "{\"method\":\"events\",\"params\":{\"sync_token\":\"$THEGN_CAL_MAX_EVENTS\"}}""#,
+    )
+    .unwrap();
+    assert_eq!(page.sync_token(), "7");
+}
+
+#[test]
+fn a_truncated_plugin_run_is_an_error_not_a_partial_page() {
+    use thegn_core::calendar::AdmissionLimit;
+    let script = format!(
+        "yes '{{\"method\":\"log\",\"params\":{{}}}}' | head -n {}",
+        crate::plugin::proc::MAX_LINES + 1
+    );
+    let err = plugin_with(10, &script).unwrap_err();
+    assert!(is_admission(&err, AdmissionLimit::Messages), "{err:?}");
+}
+
+#[test]
+fn a_malformed_plugin_page_fails_the_whole_run() {
+    // A bad element in a later page must not publish the earlier pages as if
+    // they were the whole calendar.
+    let good = format!(r#"{{"method":"events","params":{{"events":[{PLUGIN_EVENT}]}}}}"#);
+    let bad =
+        format!(r#"{{"method":"events","params":{{"events":[{PLUGIN_EVENT},{{"bogus":1}}]}}}}"#);
+    let err = plugin_with(10, &format!("echo '{good}'; echo '{bad}'")).unwrap_err();
+    assert!(matches!(err, CalendarError::Parse(_)), "{err:?}");
+    // A non-string deletion is malformed too, not silently dropped.
+    let err = plugin_with(
+        10,
+        r#"echo '{"method":"events","params":{"deleted":["a",7]}}'"#,
+    )
+    .unwrap_err();
+    assert!(matches!(err, CalendarError::Parse(_)), "{err:?}");
+    // The error never quotes plugin data.
+    let err = plugin_with(
+        10,
+        r#"echo '{"method":"events","params":{"events":[{"uid":"secret-value"}]}}'"#,
+    )
+    .unwrap_err();
+    assert!(!err.to_string().contains("secret-value"), "{err}");
+}
+
+#[test]
+fn a_line_of_tiny_elements_is_refused_without_building_them_all() {
+    use thegn_core::calendar::AdmissionLimit;
+    // ~1 MiB of `{}` elements: decoded one at a time, so the first bad one
+    // ends the run (no intermediate tree of 100k+ values)…
+    // (Generated in the shell: a script argument over 128 KiB can't be exec'd.)
+    let script = r#"printf '{"method":"events","params":{"events":['
+        yes '{},' | head -n 150000 | tr -d '\n'
+        printf '{}]}}\n'"#;
+    let err = plugin_with(10, script).unwrap_err();
+    assert!(matches!(err, CalendarError::Parse(_)), "{err:?}");
+    // …and valid-but-too-many elements stop at the budget.
+    let events = [PLUGIN_EVENT; 50].join(",");
+    let script = format!(r#"echo '{{"method":"events","params":{{"events":[{events}]}}}}'"#);
+    let err = plugin_with(10, &script).unwrap_err();
+    assert!(
+        is_admission(&err, AdmissionLimit::AccountRecords),
+        "{err:?}"
+    );
+    // Exactly at the budget is fine, including the end-of-array probe.
+    let events = [PLUGIN_EVENT; 10].join(",");
+    let script = format!(r#"echo '{{"method":"events","params":{{"events":[{events}]}}}}'"#);
+    assert_eq!(plugin_with(10, &script).unwrap().events().len(), 10);
+}
+
+#[test]
+fn an_over_budget_plugin_delta_falls_back_to_a_full_fetch() {
+    // With a token the plugin replies with a delta too big for the budget;
+    // without one, a small snapshot. The account must not be wedged on the
+    // delta forever.
+    let script = format!(
+        r#"if [ -n "$THEGN_CAL_SYNC_TOKEN" ]; then
+             echo '{{"method":"events","params":{{"deleted":["a","b","c","d","e"],"sync_token":"t2"}}}}'
+           else
+             echo '{{"method":"events","params":{{"events":[{PLUGIN_EVENT}],"sync_token":"full"}}}}'
+           fi"#
+    );
+    let b = command::CommandBackend::new(&command_account(&script), budget_of(3));
+    let (from, to) = window();
+    let page = block_on(b.list_events(from, to, "t1")).unwrap();
+    assert_eq!(page.events().len(), 1);
+    assert!(page.deleted().is_empty());
+    assert_eq!(page.sync_token(), "full");
+}
+
+#[tokio::test]
+async fn an_over_budget_caldav_delta_falls_back_to_a_full_fetch() {
+    use axum::response::IntoResponse;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    // First REPORT (sync-collection) returns a bulk delete bigger than the
+    // budget; the fallback calendar-query returns the small current state.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let hits = std::sync::Arc::new(AtomicUsize::new(0));
+    let seen = hits.clone();
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            axum::Router::new().fallback(axum::routing::any(move || {
+                let seen = seen.clone();
+                async move {
+                    let body = if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+                        multistatus(0, 50)
+                    } else {
+                        multistatus(2, 0).replace("<d:sync-token>tok-next</d:sync-token>", "")
+                    };
+                    (
+                        axum::http::StatusCode::MULTI_STATUS,
+                        [("content-type", "application/xml")],
+                        body,
+                    )
+                        .into_response()
+                }
+            })),
+        )
+        .await
+        .unwrap();
+    });
+    let acct = CalendarAccount {
+        url: format!("http://{address}/cal/"),
+        allow_private_network: true,
+        ..account("dav", CalendarProviderKind::CalDav)
+    };
+    let pool = AdmissionPool::new(1_000, 128 << 20);
+    let backend = caldav::CalDavBackend::new(
+        &acct,
+        AccountAdmission::new(AdmissionBudget::new(10).unwrap(), pool.clone()),
+    );
+    let (from, to) = window();
+    let page = backend.list_events(from, to, "tok-prev").await.unwrap();
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        2,
+        "exactly one fallback REPORT"
+    );
+    assert_eq!(page.events().len(), 2);
+    // A full fetch: no cursor, so the host replaces the cache wholesale.
+    assert!(page.sync_token().is_empty());
+    // Only the page is held: the refused delta and both bodies are released.
+    assert_eq!(pool.in_use(), page.reserved());
+    drop(page);
+    assert_eq!(pool.in_use(), (0, 0));
+    server.abort();
+}
+
+#[tokio::test]
+async fn caldav_token_recovery_releases_every_reservation() {
+    use axum::response::IntoResponse;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let hits = std::sync::Arc::new(AtomicUsize::new(0));
+    let seen = hits.clone();
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            axum::Router::new().fallback(axum::routing::any(move || {
+                let seen = seen.clone();
+                async move {
+                    if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+                        return (axum::http::StatusCode::CONFLICT, "").into_response();
+                    }
+                    (
+                        axum::http::StatusCode::MULTI_STATUS,
+                        [("content-type", "application/xml")],
+                        multistatus(3, 0),
+                    )
+                        .into_response()
+                }
+            })),
+        )
+        .await
+        .unwrap();
+    });
+    let acct = CalendarAccount {
+        url: format!("http://{address}/cal/"),
+        allow_private_network: true,
+        ..account("dav", CalendarProviderKind::CalDav)
+    };
+    let pool = AdmissionPool::new(1_000, 128 << 20);
+    let backend = caldav::CalDavBackend::new(
+        &acct,
+        AccountAdmission::new(AdmissionBudget::default(), pool.clone()),
+    );
+    let (from, to) = window();
+    let page = backend.list_events(from, to, "expired").await.unwrap();
+    assert_eq!(page.events().len(), 3);
+    assert_eq!(pool.in_use(), page.reserved());
+    drop(page);
+    assert_eq!(pool.in_use(), (0, 0));
+    server.abort();
+}
+
+#[tokio::test]
+async fn a_long_history_feed_only_counts_the_sync_window() {
+    // A subscribed feed with years of history: previously accepted in full,
+    // it must not now be refused just because the history is long.
+    let mut feed = String::from("BEGIN:VCALENDAR\r\n");
+    for i in 0..3_000 {
+        feed.push_str(&format!(
+            "BEGIN:VEVENT\r\nUID:old{i}\r\nDTSTART:20190301T090000Z\r\nEND:VEVENT\r\n"
+        ));
+    }
+    feed.push_str(
+        "BEGIN:VEVENT\r\nUID:now\r\nDTSTART:20260821T090000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+    );
+    let (address, _hits, server) =
+        serve_fixed(axum::http::StatusCode::OK, "text/calendar", feed).await;
+    let acct = CalendarAccount {
+        url: format!("http://{address}/feed.ics"),
+        allow_private_network: true,
+        ..account("u", CalendarProviderKind::IcsUrl)
+    };
+    let (from, to) = window();
+    let page = ics_url::IcsUrlBackend::new(&acct, budget_of(10))
+        .list_events(from, to, "")
+        .await
+        .unwrap();
+    assert_eq!(page.events().len(), 1);
+    assert_eq!(page.events()[0].uid, "now");
+    server.abort();
+}
+
+#[test]
+fn caldav_unescaping_is_single_pass_and_sized_before_it_runs() {
+    let xml = "<multistatus><response><href>/a&amp;b.ics</href><calendar-data>A &amp;amp; &lt;b&gt; &quot;c&quot; &apos;d&apos; &bogus;</calendar-data></response></multistatus>";
+    let (r, _) = caldav::parse_multistatus(xml);
+    assert_eq!(r[0].href, "/a&b.ics");
+    assert_eq!(r[0].ics, "A &amp; <b> \"c\" 'd' &bogus;");
+    // An enormous escaped href is refused on its raw size.
+    let huge = format!(
+        "<multistatus><response><href>&amp;{}</href></response></multistatus>",
+        "x".repeat(crate::http::MAX_REQUEST_BYTES)
+    );
+    assert!(caldav::parse_multistatus(&huge).0.is_empty());
 }

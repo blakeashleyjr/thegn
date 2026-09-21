@@ -54,8 +54,13 @@ pub struct CalendarConfig {
     /// Floored at [`MIN_REFRESH_SECS`].
     #[schemars(range(max = "crate::time_policy::MAX_CADENCE_SECS"))]
     pub refresh_interval_secs: u64,
-    /// Cap on cached events per account, so one enormous calendar can't
-    /// dominate the DB or the expansion pass.
+    /// Admission budget: the most events (plus deletions) in the sync window
+    /// one account fetch may bring in, between 1 and 10000; the account's
+    /// byte budget scales with it. A source over the cap is refused whole —
+    /// its previous cache and sync cursor are kept and a warning names the
+    /// account — rather than truncated. 0 is rejected by validation and runs
+    /// as the default; it never means unlimited.
+    #[schemars(range(min = 1, max = 10000))]
     pub max_events: usize,
     /// How far back to fetch and keep events.
     #[schemars(range(max = "crate::time_policy::MAX_DURATION_DAYS"))]
@@ -90,7 +95,7 @@ impl Default for CalendarConfig {
             show_event_markers: true,
             ttl_secs: 900,
             refresh_interval_secs: 900,
-            max_events: 2000,
+            max_events: crate::calendar::admission::DEFAULT_MAX_EVENTS,
             horizon_past_days: 90,
             horizon_future_days: 365,
             reminders_enabled: true,
@@ -114,6 +119,23 @@ impl CalendarConfig {
             .filter(|a| a.enabled && a.provider != CalendarProviderKind::None)
             .cloned()
             .collect()
+    }
+
+    /// The typed per-account admission budget every calendar backend is
+    /// built with.
+    ///
+    /// An out-of-range `max_events` is adjusted (a legacy 0 becomes the
+    /// default, never unlimited; above the ceiling becomes the ceiling) and
+    /// warned about; `thegn config validate` reports it as an error.
+    pub fn admission_budget(&self) -> crate::calendar::AdmissionBudget {
+        let (budget, problem) = crate::calendar::AdmissionBudget::clamped(self.max_events);
+        if let Some(problem) = problem {
+            config_warn(&format!(
+                "calendar.max_events: {problem} — using {}",
+                budget.max_events()
+            ));
+        }
+        budget
     }
 
     /// The configured clocks whose zone this build's tzdb actually knows.
@@ -452,6 +474,9 @@ config_enum! {
 /// checked here instead, with a did-you-mean built from the bundled database.
 pub fn validate_calendar(cfg: &CalendarConfig) -> Vec<String> {
     let mut out = Vec::new();
+    if let Err(problem) = crate::calendar::AdmissionBudget::new(cfg.max_events) {
+        out.push(format!("calendar.max_events: {problem}"));
+    }
     if !cfg.home_zone.trim().is_empty() && resolve_zone(&cfg.home_zone).is_none() {
         out.push(format!(
             "calendar.home_zone: unknown IANA time zone {:?}{}",

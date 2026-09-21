@@ -140,6 +140,63 @@ a misconfigured value cannot poll a provider in a tight loop.
 - **WHEN** an account configures a refresh interval below the minimum
 - **THEN** the minimum is used
 
+### Requirement: Source admission is a bounded, all-or-nothing budget
+
+Every calendar backend SHALL be constructed with a typed, nonzero per-account
+admission budget derived from `[calendar] max_events`. Configuration MUST
+reject `max_events` below 1 or above 10000, and zero MUST NOT mean unlimited.
+The budget MUST be enforced while a source is parsed or decoded — before the
+next event is built — and it MUST cover events, deletions, and retained bytes.
+The byte budget MUST scale with `max_events`. For whole-document sources
+(local and subscribed iCalendar), only events that can occur within the sync
+horizon MUST count toward the budget; events outside it are neither admitted
+nor cached, so a month outside `horizon_past_days`/`horizon_future_days` shows
+no events for those accounts, as it already does for server-windowed sources.
+It MUST also enforce per-event size and child-count ceilings, a
+content-line ceiling, and a source-document ceiling. A process-wide budget
+MUST bound admitted records and reserved bytes across every concurrent fetch.
+Reservations MUST be non-blocking, and each MUST be released when the data it
+accounts for is dropped.
+
+A source that exceeds any budget MUST fail with a typed admission error. A
+truncated result MUST NOT be published. The account MUST keep its previous
+cached events and sync cursor, record the failure as its sync error, and show
+the user which account and limit refused it. It MUST NOT show the same
+condition again on every retry. An incremental fetch refused for the account's
+own volume MUST be retried once as a full fetch, so a large delta cannot wedge
+the account.
+
+#### Scenario: A source over max_events
+
+- **WHEN** a source returns more events plus deletions than `max_events`
+- **THEN** the fetch fails with an admission error, the account's cached
+  events and sync cursor are unchanged, and the error is recorded
+
+#### Scenario: max_events set to zero
+
+- **WHEN** `max_events = 0` is configured
+- **THEN** config validation reports it as an error and the runtime uses the
+  default budget, never an unlimited one
+
+#### Scenario: The shared budget is in use
+
+- **WHEN** concurrent fetches hold the process-wide budget
+- **THEN** a further fetch is refused immediately with a typed error, and
+  nothing is recorded that would delay its next attempt
+
+#### Scenario: A long-history subscribed feed
+
+- **WHEN** a subscribed iCalendar feed holds more past events than
+  `max_events`, but few of them fall within the sync horizon
+- **THEN** only the events that can occur in the horizon are counted and
+  cached, and the feed is admitted
+
+#### Scenario: An incremental delta over the budget
+
+- **WHEN** a CalDAV or plugin delta holds more changes than `max_events`
+- **THEN** the fetch is retried once as a full fetch, and the account is
+  refused only if that also exceeds the budget
+
 ### Requirement: Recurring events are expanded correctly across daylight saving
 
 thegn SHALL expand recurring events from their recurrence rule, including

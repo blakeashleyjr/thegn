@@ -538,3 +538,29 @@ fn calendar_display_warns_for_trimmed_control_only_labels() {
         "display warnings must not become errors"
     );
 }
+
+#[test]
+fn max_events_is_a_nonzero_bounded_admission_budget() {
+    use crate::calendar::admission::{DEFAULT_MAX_EVENTS, MAX_MAX_EVENTS};
+    let with = |n| CalendarConfig {
+        max_events: n,
+        ..CalendarConfig::default()
+    };
+    assert_eq!(CalendarConfig::default().max_events, DEFAULT_MAX_EVENTS);
+    for ok in [1, DEFAULT_MAX_EVENTS, MAX_MAX_EVENTS] {
+        assert!(validate_calendar(&with(ok)).is_empty(), "{ok} is valid");
+        assert_eq!(with(ok).admission_budget().max_events(), ok);
+    }
+    // Zero is a safety cap misread as "off" — rejected, never unlimited.
+    let zero = validate_calendar(&with(0)).join("\n");
+    assert!(zero.contains("calendar.max_events"), "{zero}");
+    assert!(zero.contains("0 does not mean unlimited"), "{zero}");
+    // A legacy 0 (it used to mean unlimited) runs at the default budget.
+    assert_eq!(with(0).admission_budget().max_events(), DEFAULT_MAX_EVENTS);
+    // Above the ceiling is rejected and clamped at runtime.
+    assert!(!validate_calendar(&with(MAX_MAX_EVENTS + 1)).is_empty());
+    assert_eq!(
+        with(usize::MAX).admission_budget().max_events(),
+        MAX_MAX_EVENTS
+    );
+}

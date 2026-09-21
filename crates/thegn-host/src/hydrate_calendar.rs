@@ -25,7 +25,7 @@ use thegn_core::calendar::CalEvent;
 use thegn_core::config_calendar::CalendarConfig;
 use thegn_core::db::Db;
 use thegn_core::store::{CalendarRow, CalendarStore};
-use thegn_svc::calendar::{CalendarRouter, EventPage};
+use thegn_svc::calendar::{CalendarError, CalendarRouter, EventPage};
 use tokio::sync::mpsc as tokio_mpsc;
 
 use crate::hydrate::RefreshKind;
@@ -69,7 +69,9 @@ pub(crate) fn spawn_month_fetch(
         if let Some(db) = db.as_ref() {
             let today = chrono::Utc::now().with_timezone(&home).date_naive();
             let (h_from, h_to) = horizon(&cfg, today);
-            sync_accounts(db, &cfg, h_from, h_to, false);
+            sync_accounts(db, &cfg, h_from, h_to, false, &mut |m| {
+                toast(&tx, &waker, m)
+            });
         }
 
         let events = match db.as_ref() {
@@ -96,7 +98,7 @@ pub(crate) fn spawn_periodic_sync(
             .with_timezone(&home_zone(&cfg))
             .date_naive();
         let (from, to) = horizon(&cfg, today);
-        let changed = sync_accounts(&db, &cfg, from, to, false);
+        let changed = sync_accounts(&db, &cfg, from, to, false, &mut |m| toast(&tx, &waker, m));
         if !changed {
             return;
         }
@@ -122,12 +124,66 @@ pub(crate) fn spawn_periodic_sync(
 /// changed.
 ///
 /// `force` bypasses the `ttl_secs` freshness guard (the popup's `r` key).
+/// How long an account waits after the shared admission budget refused it.
+///
+/// Nothing is written to the DB for a contention refusal — a stamp there would
+/// look like an attempt and hold the account back for `ttl_secs` — so the
+/// backoff lives here instead. Without it the popup would re-sync (and
+/// re-download) the account on every month change for as long as the
+/// contention lasts.
+const CONTENTION_BACKOFF_SECS: i64 = 60;
+
+/// Accounts refused by the shared budget, and when. Bounded by the number of
+/// configured accounts.
+fn contention_seen() -> &'static std::sync::Mutex<BTreeMap<String, i64>> {
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<BTreeMap<String, i64>>> =
+        std::sync::OnceLock::new();
+    SEEN.get_or_init(Default::default)
+}
+
+fn note_contention(account: &str, now: i64) {
+    contention_seen()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(account.to_string(), now);
+}
+
+/// Whether `account` is still inside its post-contention backoff.
+fn contention_backoff(account: &str, now: i64) -> bool {
+    let mut seen = contention_seen().lock().unwrap_or_else(|e| e.into_inner());
+    match seen.get(account) {
+        Some(at) if now.saturating_sub(*at) < CONTENTION_BACKOFF_SECS => true,
+        Some(_) => {
+            seen.remove(account);
+            false
+        }
+        None => false,
+    }
+}
+
+/// Surface a calendar problem the user has to act on as an in-app toast.
+fn toast(tx: &tokio_mpsc::UnboundedSender<RefreshKind>, waker: &TerminalWaker, message: String) {
+    if tx
+        .send(RefreshKind::Toast {
+            message,
+            priority: thegn_core::notification::Priority::Alert,
+        })
+        .is_ok()
+    {
+        // best-effort: the loop may already be shutting down.
+        let _ = waker.wake();
+    }
+}
+
+/// `notify` receives a user-facing message when an account is refused by its
+/// admission budget — once per new condition, not on every retry.
 fn sync_accounts(
     db: &Db,
     cfg: &CalendarConfig,
     from: NaiveDate,
     to: NaiveDate,
     force: bool,
+    notify: &mut dyn FnMut(String),
 ) -> bool {
     let accounts = cfg.active_accounts();
     if accounts.is_empty() {
@@ -139,11 +195,18 @@ fn sync_accounts(
 
     // Which accounts actually need a fetch, and their resume cursors.
     let mut tokens: BTreeMap<String, String> = BTreeMap::new();
+    let mut prior_errors: BTreeMap<String, String> = BTreeMap::new();
     let mut wanted: Vec<String> = Vec::new();
     for a in &accounts {
         // Rule 1: gate the NETWORK-backed accounts only. A local file or a
         // subprocess plugin must keep working offline.
         if offline && a.is_network_backed() {
+            continue;
+        }
+        // Backed off after a shared-budget refusal: nothing was recorded for
+        // it (deliberately — see `record_failure`), so this is what stops the
+        // popup re-fetching it on every month change.
+        if !force && contention_backoff(&a.name, now) {
             continue;
         }
         let sync = db.get_calendar_sync(&a.name).ok().flatten();
@@ -153,6 +216,9 @@ fn sync_accounts(
             });
         if fresh {
             continue;
+        }
+        if let Some(s) = &sync {
+            prior_errors.insert(a.name.clone(), s.last_error.clone());
         }
         if let Some(s) = &sync
             && !s.sync_token.is_empty()
@@ -180,10 +246,11 @@ fn sync_accounts(
         return false;
     };
 
-    let results = rt.block_on(router.list_events(from, to, &tokens));
+    // Each account's page is applied and dropped inside the sink, releasing its
+    // share of the global admission budget before the next account is fetched.
     let mut changed = false;
-    for r in results {
-        let page = match r.result {
+    rt.block_on(router.list_events_each(from, to, &tokens, |r| {
+        let mut page = match r.result {
             Ok(p) => {
                 thegn_core::connectivity::report_success();
                 p
@@ -192,25 +259,73 @@ fn sync_accounts(
                 if e.is_transient() {
                     thegn_core::connectivity::report_failure();
                 }
-                // Rule 3: record the failure, touch nothing else. Log the
-                // account NAME only — `token` and `url` are both secrets, and a
-                // subscribed ICS URL *is* a credential.
-                tracing::warn!(
-                    target: "thegn::calendar",
-                    account = %r.account,
-                    provider = r.provider,
-                    error = %e,
-                    "calendar sync failed — keeping the cached events"
-                );
-                let _ = db.set_calendar_error(&r.account, &e.to_string()); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
-                continue;
+                record_failure(db, &r.account, r.provider, &e, &prior_errors, notify);
+                return;
             }
         };
+        // The cache rows built from the page are a second copy of it, so they
+        // are accounted under the page's lease. Advisory on purpose: the data
+        // is already admitted and in hand, and throwing a valid page away —
+        // silently, since a pool refusal is nobody's fault — would be worse
+        // than one unaccounted copy. The pool is sized so this cannot happen
+        // to an account on its own (see `GLOBAL_MAX_BYTES`).
+        let derived = page.reserved().1;
+        if let Err(e) = page.reserve_derived(derived) {
+            tracing::debug!(
+                target: "thegn::calendar",
+                account = %r.account,
+                error = %e,
+                "cache rows exceed the shared budget — writing them anyway"
+            );
+        }
         if apply_page(db, &r.account, r.provider, &page, from, to) {
             changed = true;
         }
-    }
+    }));
     changed
+}
+
+/// Rule 3: a failed account keeps its events and cursor; only the failure is
+/// recorded. Log the account NAME only — `token` and `url` are both secrets,
+/// and a subscribed ICS URL *is* a credential.
+fn record_failure(
+    db: &Db,
+    account: &str,
+    provider: &str,
+    e: &CalendarError,
+    prior_errors: &BTreeMap<String, String>,
+    notify: &mut dyn FnMut(String),
+) {
+    tracing::warn!(
+        target: "thegn::calendar",
+        account = %account,
+        provider = provider,
+        error = %e,
+        "calendar sync failed — keeping the cached events"
+    );
+    match e {
+        // Other syncs hold the shared budget right now. Nothing is wrong with
+        // this account, so nothing is recorded: without an attempt stamp the
+        // next tick retries it instead of waiting out `ttl_secs`.
+        CalendarError::Admission(a) if a.is_contention() => {
+            note_contention(account, thegn_core::util::now());
+        }
+        CalendarError::Admission(_) => {
+            let message = e.to_string();
+            // Tell the user once per new condition, not on every retry.
+            if prior_errors.get(account) != Some(&message) {
+                let name = thegn_core::calendar::display::DisplayText::new(
+                    account,
+                    thegn_core::calendar::display::Field::Calendar,
+                );
+                notify(format!("Calendar \"{}\": {message}", name.as_str()));
+            }
+            let _ = db.set_calendar_error(account, &message); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+        }
+        _ => {
+            let _ = db.set_calendar_error(account, &e.to_string()); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+        }
+    }
 }
 
 /// Write one account's page into the cache. Returns whether anything changed.
@@ -226,19 +341,17 @@ fn apply_page(
 
     // A conditional fetch that came back 304: nothing to write, but the sync
     // stamp must still advance or we would re-hit the provider every tick.
-    if page.unchanged {
-        let _ = db.put_calendar_sync(account, provider, &page.sync_token, from_ms, to_ms); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+    if page.is_unchanged() {
+        let _ = db.put_calendar_sync(account, provider, page.sync_token(), from_ms, to_ms); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
         return false;
     }
 
-    let incremental = !page.sync_token.is_empty();
+    let incremental = !page.sync_token().is_empty();
     // Rule 2: an EMPTY FULL fetch is only believed when there was nothing
     // cached. Otherwise a 200-with-empty-body from a flaky proxy silently
     // erases a month of meetings — and unlike an error, nothing would warn.
-    if !incremental
-        && page.events.is_empty()
-        && !page.partial
-        && db.has_calendar_events(account).unwrap_or(false)
+    // (A page is always complete: an over-budget source never produces one.)
+    if !incremental && page.events().is_empty() && db.has_calendar_events(account).unwrap_or(false)
     {
         tracing::warn!(
             target: "thegn::calendar",
@@ -249,10 +362,10 @@ fn apply_page(
         return false;
     }
 
-    let rows: Vec<CalendarRow> = page.events.iter().map(row_of).collect();
+    let rows: Vec<CalendarRow> = page.events().iter().map(row_of).collect();
     let wrote = if incremental {
         let put = db.put_calendar_events(account, &rows);
-        let del = db.delete_calendar_events(account, &page.deleted);
+        let del = db.delete_calendar_events(account, page.deleted());
         put.is_ok() && del.is_ok()
     } else {
         db.replace_calendar_account(account, &rows).is_ok()
@@ -260,8 +373,8 @@ fn apply_page(
     if !wrote {
         return false;
     }
-    let _ = db.put_calendar_sync(account, provider, &page.sync_token, from_ms, to_ms); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
-    !rows.is_empty() || !page.deleted.is_empty()
+    let _ = db.put_calendar_sync(account, provider, page.sync_token(), from_ms, to_ms); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+    !rows.is_empty() || !page.deleted().is_empty()
 }
 
 /// Turn an event into its cache row.
