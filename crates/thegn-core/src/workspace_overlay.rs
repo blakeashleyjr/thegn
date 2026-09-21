@@ -55,9 +55,6 @@ pub enum OverlayRefusal {
         key: String,
         repositories: Vec<String>,
     },
-    /// The registered-repository index could not be read; refuse rather than
-    /// guess.
-    RegistryUnavailable { key: String },
 }
 
 impl fmt::Display for OverlayRefusal {
@@ -84,10 +81,6 @@ impl fmt::Display for OverlayRefusal {
                  `{key}`, and the block cannot tell them apart yet. Rename or delete the checkout \
                  the block is NOT for (it stops counting as soon as it is gone)",
                 repositories.join(" and ")
-            ),
-            Self::RegistryUnavailable { key } => write!(
-                f,
-                "trusted [project.{key}] overlay refused: the repository registry is unavailable"
             ),
         }
     }
@@ -200,28 +193,29 @@ pub fn registered_path<'r>(slug: &str, rows: &'r [(String, String)]) -> Option<&
 }
 
 /// Other registered repositories that derive the same legacy `key` as `own`
-/// AND are live main checkouts at a different canonical location. `live`
-/// returns a path's canonical location iff it is a live main checkout (the
-/// caller's filesystem probe), so stale rows (removed clones, dir workspaces,
-/// linked worktrees) and two spellings of one checkout (symlink, `/tmp` vs
-/// `/private/tmp`) never count. Sorted, deduplicated by canonical location.
+/// AND are separate live main checkouts. `live` returns a path's filesystem
+/// IDENTITY iff it is a live main checkout (the caller's probe), so stale rows
+/// (removed clones, dir workspaces, linked worktrees) never count, and neither
+/// does a second spelling of one checkout — a symlink, a bind mount, `/tmp` vs
+/// `/private/tmp`, or a case-insensitive mount all share one identity.
+/// Sorted, deduplicated by identity.
 pub fn live_duplicates(
     key: &str,
     own: &str,
     rows: &[(String, String)],
-    live: impl Fn(&str) -> Option<std::path::PathBuf>,
+    live: impl Fn(&str) -> Option<String>,
 ) -> Vec<String> {
-    let own_canonical = live(own).unwrap_or_else(|| std::path::PathBuf::from(own));
+    let own_identity = live(own).unwrap_or_else(|| own.to_string());
     let mut seen = std::collections::BTreeSet::new();
     let mut out: Vec<String> = Vec::new();
     for (path, _) in rows {
         if path == own || legacy_key_for_root(Path::new(path)).as_deref() != Some(key) {
             continue;
         }
-        let Some(canonical) = live(path) else {
+        let Some(identity) = live(path) else {
             continue;
         };
-        if canonical != own_canonical && seen.insert(canonical) {
+        if identity != own_identity && seen.insert(identity) {
             out.push(path.clone());
         }
     }
@@ -381,10 +375,11 @@ mod tests {
         assert_eq!(registered_path("foo-2", &r), Some("/code/foo"));
         assert_eq!(registered_path("nope", &r), None);
         // /tmp/foo and /private/tmp/foo are one checkout; /gone/foo is stale.
+        // Identities, not paths: /tmp/foo and /private/tmp/foo are one inode.
         let live = |p: &str| match p {
-            "/code/foo" => Some(std::path::PathBuf::from("/code/foo")),
-            "/tmp/foo" | "/private/tmp/foo" => Some(std::path::PathBuf::from("/private/tmp/foo")),
-            "/code/bar" => Some(std::path::PathBuf::from("/code/bar")),
+            "/code/foo" => Some("dev:1".to_string()),
+            "/tmp/foo" | "/private/tmp/foo" => Some("dev:2".to_string()),
+            "/code/bar" => Some("dev:3".to_string()),
             _ => None,
         };
         // One live duplicate, reported once (the first registry spelling).
@@ -393,12 +388,11 @@ mod tests {
             vec!["/tmp/foo".to_string()]
         );
         // Only a stale row besides us: nothing counts.
-        let stale = |p: &str| (p == "/code/foo").then(|| std::path::PathBuf::from(p));
+        let stale = |p: &str| (p == "/code/foo").then(|| "dev:1".to_string());
         assert!(live_duplicates("foo", "/code/foo", &r, stale).is_empty());
         // A second spelling of our OWN checkout is not a duplicate.
-        let same = |p: &str| {
-            matches!(p, "/code/foo" | "/tmp/foo").then(|| std::path::PathBuf::from("/code/foo"))
-        };
+        // A bind mount of our own checkout shares its identity.
+        let same = |p: &str| matches!(p, "/code/foo" | "/tmp/foo").then(|| "dev:1".to_string());
         assert!(live_duplicates("foo", "/code/foo", &r, same).is_empty());
     }
 

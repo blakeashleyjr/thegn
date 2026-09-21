@@ -936,6 +936,7 @@ mod tests {
     #[test]
     fn workspace_config_env_bundle_beats_pointer() {
         let db = Db::open_memory().unwrap();
+        db.slug_for_repo("/src/repo", "repo").unwrap();
         let mut cfg = Config::default();
         cfg.bundle
             .insert("cfg".into(), bundle_with_env(&[("X", "cfg")]));

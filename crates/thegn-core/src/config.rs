@@ -988,18 +988,26 @@ impl Default for MergeQueueConfig {
     }
 }
 
-/// A registered path's canonical location iff it is a live MAIN checkout (a
+/// A registered path's filesystem IDENTITY iff it is a live MAIN checkout (a
 /// `.git` directory, or a bare `*.git` repository). Linked worktrees (`.git`
 /// file), plain dir workspaces and removed clones are not repositories that
-/// can make a trusted block ambiguous. Metadata-only; no Git subprocess.
-fn live_main_checkout(path: &str) -> Option<std::path::PathBuf> {
+/// can make a trusted block ambiguous, and every spelling of one checkout
+/// (symlink, bind mount, case-insensitive mount) shares one identity.
+///
+/// Metadata only — no Git subprocess — but it does `stat` a registered path,
+/// so it runs ONLY for rows that derive the same key as the repository being
+/// resolved (normally none). A dead network mount could block that stat; the
+/// probe is therefore never run just to display something.
+fn live_main_checkout(path: &str) -> Option<String> {
     let path = Path::new(path);
-    let is_main = path.join(".git").is_dir()
-        || (path.extension().is_some_and(|ext| ext == "git") && path.join("HEAD").is_file());
-    if !is_main {
-        return None;
+    let git_dir = path.join(".git");
+    if git_dir.is_dir() {
+        return crate::util::file_identity(&git_dir);
     }
-    std::fs::canonicalize(path).ok()
+    if path.extension().is_some_and(|ext| ext == "git") && path.join("HEAD").is_file() {
+        return crate::util::file_identity(path);
+    }
+    None
 }
 
 /// The legacy `[workspace.<slug>]` label for a repo, for display and UI
@@ -6629,10 +6637,10 @@ impl Config {
     /// suffixes never select a block that merely shares their spelling, and a
     /// `-2` tab of a correctly configured repo still gets its own block. The
     /// registry is a cache (stale rows, several spellings of one checkout), so
-    /// it is used only to REFUSE, and only when another row is a live main
-    /// checkout at a different canonical location deriving the same key. An
-    /// unregistered slug falls back to the plain key; an unreadable registry
-    /// refuses only if a block would otherwise apply.
+    /// it is used only to REFUSE, and only when another row is a separate live
+    /// main checkout (filesystem identity, not path) deriving the same key. An
+    /// unregistered slug, an unreadable registry and a repository whose name
+    /// has no slug all select nothing rather than guessing from spelling.
     pub fn workspace_overlay_for_tab_slug(
         &self,
         db: &crate::db::Db,
@@ -6640,25 +6648,19 @@ impl Config {
     ) -> crate::workspace_overlay::WorkspaceOverlay<'_> {
         use crate::store::WorkspaceStore;
         use crate::workspace_overlay::{OverlayRefusal, WorkspaceOverlay};
+
         if self.workspace.is_empty() {
             return WorkspaceOverlay::Unconfigured;
         }
-        let rows = match db.repo_slug_rows() {
-            Ok(rows) => rows,
-            Err(_) => {
-                let base = self.workspace_overlay_for_key(slug);
-                return match base {
-                    WorkspaceOverlay::Selected { .. } => {
-                        WorkspaceOverlay::Refused(OverlayRefusal::RegistryUnavailable {
-                            key: slug.to_string(),
-                        })
-                    }
-                    other => other,
-                };
-            }
+        // A registry read failure (a busy SQLite, a locked cache) is transient
+        // and proves nothing about ambiguity: apply no block rather than
+        // refusing a launch over it. An unregistered slug likewise selects
+        // nothing — the slug's spelling is not a key.
+        let Ok(rows) = db.repo_slug_rows() else {
+            return WorkspaceOverlay::Unconfigured;
         };
         let Some(path) = crate::workspace_overlay::registered_path(slug, &rows) else {
-            return self.workspace_overlay_for_key(slug);
+            return WorkspaceOverlay::Unconfigured;
         };
         let Some(key) = crate::workspace_overlay::legacy_key_for_root(Path::new(path)) else {
             return WorkspaceOverlay::Unconfigured;

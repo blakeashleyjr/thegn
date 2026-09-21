@@ -238,6 +238,26 @@ fn sweep_with_db(cfg: &Config, repo_root: &Path, force: bool, db: &Db) -> SweepR
     report
 }
 
+/// Resolve the sweep root from any path inside the repo and sweep it.
+/// `None` when the path is not in a git repository.
+///
+/// The root is the MAIN checkout, never `toplevel`: the startup and post-fold
+/// entries are usually handed a LINKED worktree (the launch cwd, the active
+/// tab), whose toplevel is the worktree itself. Keying off that resolved the
+/// per-repo `[project.*]` layer — and the THE-515 refusal — under the worktree
+/// directory's name, so a repo whose block said `on_landed = "move"` had its
+/// merged worktrees swept under the global policy instead.
+pub(crate) fn sweep_from(cfg: &Config, dir: &Path, force: bool) -> Option<SweepReport> {
+    Some(sweep(cfg, &sweep_root(dir)?, force))
+}
+
+/// The repository a sweep of `dir` must be keyed by: its MAIN checkout.
+/// Off-thread (THE-78): it shells out to git, so it must not run on the
+/// pre-first-frame launch path.
+pub(crate) fn sweep_root(dir: &Path) -> Option<std::path::PathBuf> {
+    crate::integrate::main_checkout(dir)
+}
+
 /// Fire-and-forget sweep on a blocking thread — the startup and post-fold entry
 /// point. Never on the event loop: it resolves the repo root, stats worktrees
 /// and shells out to git. `dir` may be any path inside the repo (the launch dir
@@ -245,12 +265,9 @@ fn sweep_with_db(cfg: &Config, repo_root: &Path, force: bool, db: &Db) -> SweepR
 /// no-op.
 pub fn spawn(cfg: Config, dir: std::path::PathBuf) {
     tokio::task::spawn_blocking(move || {
-        // Resolve the sweep root off-thread too (THE-78): `toplevel` shells out
-        // to git, so it must not run on the pre-first-frame launch path.
-        let Some(repo_root) = thegn_core::repo::toplevel(&dir) else {
+        let Some(report) = sweep_from(&cfg, &dir, false) else {
             return;
         };
-        let report = sweep(&cfg, &repo_root, false);
         if !report.collected.is_empty() {
             thegn_core::msg::info(&format!(
                 "merge queue: swept {} merged worktree(s): {}",
@@ -424,6 +441,51 @@ mod tests {
         assert!(report.bookkeeping_errors[0].contains("refused"));
         assert!(wt.exists());
         assert_eq!(db.list_merge_queue().unwrap(), before);
+    }
+
+    #[test]
+    fn startup_sweep_from_a_linked_worktree_resolves_the_main_checkout() {
+        // THE-515 / F2: the startup and post-fold entries are handed a LINKED
+        // worktree. Keying the per-repo layer off its directory name missed
+        // the repo's `[project.*]` block entirely — here, the refusal — and
+        // swept under the global `expire`.
+        let isolation = crate::merge_lifecycle::TestIsolation::new();
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().canonicalize().unwrap();
+        let db = Db::open_memory().unwrap();
+        let (root, wt) = fixture(&parent, "linked", &db, &isolation);
+        let mut cfg = local_config();
+        cfg.merge_queue.on_landed = OnLanded::Expire;
+        cfg.merge_queue.target_branch = "main".into();
+        let key = thegn_core::workspace_overlay::legacy_key_for_root(&root).unwrap();
+        cfg.workspace.insert(key.clone(), Default::default());
+        cfg.workspace.insert(key.to_uppercase(), Default::default());
+
+        // The entry resolves the MAIN checkout from a linked worktree. The old
+        // `toplevel` resolution returned `wt` itself, whose directory name is
+        // not the repository's key — so the refusal below was never computed.
+        let resolved = sweep_root(&wt).expect("inside a git repository");
+        assert_eq!(resolved, root);
+
+        let report = sweep_with_db(&cfg, &resolved, true, &db);
+        assert!(report.collected.is_empty());
+        assert!(
+            report
+                .bookkeeping_errors
+                .iter()
+                .any(|e| e.contains("refused")),
+            "{:?}",
+            report.bookkeeping_errors
+        );
+        assert!(wt.exists());
+        // (Keying by `wt` instead — the old behaviour — makes the block
+        // invisible and sweeps under the global `expire`; not asserted here
+        // because it would delete the worktree this test still needs.)
+        // Without the stray alias the repository's own policy applies again.
+        cfg.workspace.remove(&key.to_uppercase());
+        let report = sweep_with_db(&cfg, &resolved, true, &db);
+        assert_eq!(report.collected, ["feature"]);
+        assert!(!wt.exists());
     }
 
     #[test]

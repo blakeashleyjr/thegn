@@ -294,3 +294,19 @@ Round-2 validation (per-worktree lane target):
 
 - Focused filterset → 431 passed, 0 failed. It adds `review_task_handoff|merge_sweep|integrate::candidates` to the round-1 set.
 - `cargo clippy --workspace --offline --locked --all-targets -- -D warnings` → clean.
+
+## 9. Response to round-3 review
+
+- **F2 BLOCKING, sweep entry bypasses the refusal: confirmed, fixed.** `merge_sweep::spawn` resolved its root with `repo::toplevel`, which in a linked worktree is the worktree itself — so the startup sweep (launch cwd), the in-app `dispatch_sweep_merged` (active tab) and the post-fold entry keyed the per-repo layer, and the refusal, off the worktree directory's name. New `sweep_from(cfg, dir, force)` resolves the MAIN checkout (`integrate::main_checkout`) and is what `spawn` calls. Test: `startup_sweep_from_a_linked_worktree_resolves_the_main_checkout` drives it from the worktree, asserts the refusal holds and the worktree survives, then removes the stray alias and asserts the same entry sweeps — proving the root resolution reaches the repository's own policy. The old test passed the main root and missed this.
+- **W1, canonical paths don't dedupe bind mounts: confirmed, fixed.** `live_duplicates` now compares filesystem IDENTITY. `util::file_identity` is `(st_dev, st_ino)` on Unix and the canonical path elsewhere; `live_main_checkout` returns the identity of the `.git` directory (or of a bare `*.git`). Bind mounts and case-insensitive mounts of one checkout now share an identity. The helper lives in `util.rs`, already on the core platform-cfg ratchet, so no new `#[cfg]` file appears.
+- **W2, `env_bundle` is not provider-specific: confirmed, fixed.** The gate now applies to any configured `[[agents]]`/`[[tools]]` entry, not only ones whose program maps to a known account provider. A choice that is not a configured entry (a shell) still always launches.
+- **W3, transient registry error refused a launch: fixed.** A failed registry read now selects nothing instead of refusing (`RegistryUnavailable` is gone). A busy SQLite proves nothing about ambiguity, and `Db::open` failing already skipped the gate.
+- **Suggestions, adopted:**
+  - The `PaneTarget::None` status names the refusal instead of claiming nothing is configured.
+  - An unregistered slug now selects nothing rather than falling back to the slug's spelling, closing the "nameless repo whose registration failed picks up `[project.repo]`" hole.
+  - `live_main_checkout` documents that it stats registered paths (a dead network mount could block) and that it runs only for rows deriving the same key, never for display.
+- **Noted, out of scope:** `landed_entries` filters rows by target branch only, so a sweep can see other repos' rows. That predates this branch; the main-checkout fix above narrows the root it runs with, but the row filter itself is untouched.
+
+Round-3 validation (per-worktree lane target): focused filterset (round-2 set plus `util::`) → 461 passed, 0 failed; `cargo clippy --workspace --offline --locked --all-targets -- -D warnings` → clean; `just ratchets` → exit 0; `treefmt --ci` → 0 changed on re-run (the first pass reformatted whitespace only).
+
+Two pre-existing tests were updated, not weakened: `account::tests::active_name_precedence` and `bundle::tests::workspace_config_env_bundle_beats_pointer` now register their `repo` scope in the registry, because an unregistered slug deliberately selects nothing.
