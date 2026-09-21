@@ -51,8 +51,7 @@ pub const MAX_EVENT_CHILDREN: usize = 16_384;
 pub const ACCOUNT_BYTES_PER_EVENT: usize = 8 << 10;
 /// Floor of the per-account retained byte budget (the default budget's value).
 pub const MIN_ACCOUNT_BYTES: usize = 32 << 20;
-/// Ceiling of the per-account retained byte budget. Together with one
-/// in-flight transport body it still fits the global byte ceiling.
+/// Ceiling of the per-account retained byte budget.
 pub const MAX_ACCOUNT_BYTES: usize = 96 << 20;
 /// Largest single source document (a local `.ics` file, one CalDAV resource).
 /// Equal to the remote transport's response cap.
@@ -65,7 +64,13 @@ pub const MAX_COMPONENT_DEPTH: usize = 16;
 pub const GLOBAL_MAX_RECORDS: usize = 65_536;
 /// Reserved bytes (retained output + in-flight source documents) across every
 /// concurrent fetch.
-pub const GLOBAL_MAX_BYTES: usize = 128 << 20;
+///
+/// Sized so one maximal account can never refuse *itself*: its admitted page,
+/// the cache rows derived from that page while it is alive, and one in-flight
+/// transport body all fit at once. A refusal here therefore always means other
+/// fetches are holding the budget, never that this account is too big for the
+/// process it is running in.
+pub const GLOBAL_MAX_BYTES: usize = 2 * MAX_ACCOUNT_BYTES + MAX_SOURCE_DOCUMENT_BYTES;
 
 /// Conservative per-entry bookkeeping charged for every retained string, map
 /// entry or child value on top of its payload bytes.
@@ -136,7 +141,9 @@ impl std::fmt::Display for AdmissionError {
                 "calendar has more events (plus deletions) in the sync window than max_events allows; raise [calendar] max_events (up to 10000) — the previous events were kept"
             }
             AdmissionLimit::AccountBytes => {
-                "calendar events are larger in total than the max_events budget allows; raise [calendar] max_events (up to 10000) — the previous events were kept"
+                // The byte budget has a floor, so a small max_events has to be
+                // raised well past it before the budget actually moves.
+                "calendar events are larger in total than the max_events budget allows; raise [calendar] max_events above 4000 (up to 10000) — the previous events were kept"
             }
             AdmissionLimit::EventBytes => "a calendar event exceeds the per-event size budget",
             AdmissionLimit::EventChildren => {

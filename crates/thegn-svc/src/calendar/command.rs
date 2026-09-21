@@ -439,7 +439,10 @@ impl CalendarBackend for CommandBackend {
         sync_token: &'a str,
     ) -> BoxFuture<'a, Result<EventPage, CalendarError>> {
         Box::pin(async move {
-            match self.run_once(from, to, sync_token).await {
+            // One absolute deadline for the whole fetch, fallback included, so
+            // a plugin can never hold the sync thread for two full timeouts.
+            let deadline = std::time::Instant::now() + self.timeout;
+            match self.run_once(from, to, sync_token, deadline).await {
                 // A delta over the account's own budget would be refused again
                 // on every tick, since the cursor is (correctly) not advanced.
                 // Ask once for a full snapshot instead; it may well fit.
@@ -450,7 +453,7 @@ impl CalendarBackend for CommandBackend {
                         target: "thegn::calendar::plugin",
                         "plugin delta exceeds the admission budget — retrying as a full fetch"
                     );
-                    self.run_once(from, to, "").await
+                    self.run_once(from, to, "", deadline).await
                 }
                 other => other,
             }
@@ -465,14 +468,22 @@ impl CommandBackend {
         from: NaiveDate,
         to: NaiveDate,
         sync_token: &str,
+        deadline: std::time::Instant,
     ) -> Result<EventPage, CalendarError> {
         if self.argv.is_empty() {
             return Err(CalendarError::NotConfigured);
         }
+        // What is left of the shared deadline; a fallback run gets the
+        // remainder, never a fresh timeout.
+        let timeout = deadline.saturating_duration_since(std::time::Instant::now());
+        if timeout.is_zero() {
+            return Err(CalendarError::Network(
+                PluginError::Timeout(self.timeout.as_secs()).to_string(),
+            ));
+        }
         let argv = self.argv.clone();
         let env = self.query_env(from, to, sync_token);
         let cwd = self.cwd.clone();
-        let timeout = self.timeout;
         let sink = AdmittingSink {
             admitted: Admitted {
                 meter: self.admission.meter(),

@@ -313,7 +313,7 @@ pub fn parse_ics_admitted(
 }
 
 /// [`parse_ics_admitted`], admitting only events that can occur within
-/// `window` (inclusive dates, with a day of slack each side for zones).
+/// `window` (inclusive dates, with two days of slack each side for zones).
 ///
 /// A whole-document feed (a subscribed or local `.ics`) routinely carries
 /// years of history. Counting all of it against `max_events` would refuse
@@ -524,8 +524,13 @@ impl Builder {
         let Some(start) = self.start.as_ref().map(day_of) else {
             return false;
         };
-        let lo = from.pred_opt().unwrap_or(from);
-        let hi = to.succ_opt().unwrap_or(to);
+        // Two days of slack each side: the same instant can land two calendar
+        // days apart between the extreme zones (UTC+14 vs UTC-12), so a
+        // narrower margin could exclude an event the expansion would place
+        // inside the window.
+        let slack = chrono::Duration::days(2);
+        let lo = from.checked_sub_signed(slack).unwrap_or(NaiveDate::MIN);
+        let hi = to.checked_add_signed(slack).unwrap_or(NaiveDate::MAX);
         // The event's own length in days, so a long occurrence that starts
         // before the window but ends inside it still counts.
         let end = self.end.as_ref().map(day_of).unwrap_or_else(|| {

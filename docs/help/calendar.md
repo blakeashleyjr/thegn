@@ -185,9 +185,15 @@ thegn has events cached is treated as suspect rather than believed.
 account, not a display limit. It counts the events plus deletions that fall in
 the sync horizon (`horizon_past_days` to `horizon_future_days`). For `.ics`
 files and subscribed links, which often carry years of history, events that
-cannot occur in the horizon are skipped rather than counted. Recurring series
-that can still reach it are kept. The account's byte budget grows with
-`max_events`, so raising it is the fix for either kind of overflow.
+cannot occur in the horizon are skipped: they are neither counted nor cached,
+so paging the popup to a month outside the horizon shows nothing for those
+accounts — the same as for CalDAV, which asks its server for the horizon
+only. Widen `horizon_past_days` / `horizon_future_days` to see further back or
+ahead. Recurring series that can still reach the horizon are kept in full,
+and a series that repeats by `COUNT` rather than `UNTIL` cannot be ruled out
+without expanding it, so such a feed still counts every one of them. The
+account's byte budget grows with `max_events` (above about 4000, where it
+leaves its floor), so raising it is the fix for either kind of overflow.
 
 The budget is enforced while a source is being parsed. A source that goes over
 is refused as a whole. It is never truncated, because a truncated full fetch

@@ -118,8 +118,10 @@ fn the_account_byte_budget_scales_with_max_events() {
     );
     assert!(budget(8_000).account_bytes() > MIN_ACCOUNT_BYTES);
     assert!(budget(MAX_MAX_EVENTS).account_bytes() <= MAX_ACCOUNT_BYTES);
-    // One maximal account plus one in-flight body fits the global pool.
-    const { assert!(MAX_ACCOUNT_BYTES + MAX_SOURCE_DOCUMENT_BYTES <= GLOBAL_MAX_BYTES) };
+    // A maximal account's page, the cache rows derived from it, and one
+    // in-flight body fit the global pool at once — so an account can never
+    // refuse itself for lack of shared budget.
+    const { assert!(2 * MAX_ACCOUNT_BYTES + MAX_SOURCE_DOCUMENT_BYTES <= GLOBAL_MAX_BYTES) };
 }
 
 #[test]
@@ -312,6 +314,11 @@ fn errors_are_value_free_and_distinguish_contention() {
         AdmissionError::new(AdmissionLimit::AccountRecords)
             .to_string()
             .contains("raise [calendar] max_events")
+    );
+    assert!(
+        AdmissionError::new(AdmissionLimit::AccountBytes)
+            .to_string()
+            .contains("above 4000")
     );
 }
 

@@ -150,3 +150,24 @@ leaves prior cache + cursor intact and records `last_error`.
 - #9 A counting-allocator integration test (`ics_admission_alloc`), plus tests
   for the incremental fallback, the malformed middle page, and 409 fallback
   lease release.
+
+## Revision 2 — re-review (W1–W3, S1–S5)
+
+- W1 `GLOBAL_MAX_BYTES` is now `2 * MAX_ACCOUNT_BYTES + MAX_SOURCE_DOCUMENT_BYTES`
+  (a const assert pins it), so a maximal account plus its derived cache rows
+  plus one body always fit; and the derived-rows reservation is advisory —
+  a refusal logs and the page is still applied, so it can never silently drop
+  a valid page.
+- W2 A contention refusal now records a 60 s in-process backoff for that
+  account, so the popup cannot re-fetch it on every month change, and still
+  writes nothing to the DB (no false attempt stamp, no false error). A forced
+  refresh bypasses the backoff.
+- W3 Help + spec now say events outside the horizon are neither counted nor
+  cached, naming `horizon_past_days`/`horizon_future_days`.
+- S1 Window slack is two days each side (UTC+14 vs UTC-12).
+- S2 Help notes that a COUNT-style feed still counts every occurrence.
+- S3 The plugin fallback shares one absolute deadline with the first run.
+- S4 The byte-limit message says to raise `max_events` above 4000, where the
+  scaled budget leaves its floor.
+- S5 A counting-allocator test over a 1 MiB plugin `events` line locks in the
+  no-Value-tree property.
