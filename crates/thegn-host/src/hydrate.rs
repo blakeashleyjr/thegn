@@ -258,6 +258,14 @@ pub(crate) enum RefreshKind {
     /// write — a pure `calendar::reminders::due` call, which is why it can ride
     /// the ticker instead of needing a timer thread of its own.
     CalendarReminders,
+    /// Completion acknowledgment for one off-loop reminder evaluation. The
+    /// cursor advances only when `outcome` says the exact `window` was
+    /// evaluated; a failure stays retryable on the next ticker slot, and an
+    /// acknowledgment for a window no longer in flight is ignored.
+    CalendarReminderResult {
+        window: crate::hydrate_calendar::ReminderWindow,
+        outcome: crate::hydrate_calendar::ReminderOutcome,
+    },
     /// One month's calendar events, fetched off-loop when the popup lands on a
     /// month it has not cached, delivered by
     /// [`crate::detail::apply_calendar`]. Boxed so a page of events doesn't

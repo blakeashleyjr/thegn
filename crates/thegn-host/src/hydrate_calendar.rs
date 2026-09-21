@@ -18,16 +18,18 @@
 //!    cursor both survive, so a blip degrades to stale data, not no data.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use chrono::{Datelike, NaiveDate};
 use termwiz::terminal::TerminalWaker;
-use thegn_core::calendar::CalEvent;
+use thegn_core::calendar::{CalEvent, ExpansionError};
 use thegn_core::config_calendar::CalendarConfig;
 use thegn_core::db::Db;
 use thegn_core::store::{CalendarRow, CalendarStore};
 use thegn_svc::calendar::{CalendarError, CalendarRouter, EventPage};
 use tokio::sync::mpsc as tokio_mpsc;
 
+use crate::calendar_docs::CalendarViewError;
 use crate::hydrate::RefreshKind;
 
 /// Days of slack either side of a month window.
@@ -74,15 +76,54 @@ pub(crate) fn spawn_month_fetch(
             });
         }
 
-        let events = match db.as_ref() {
-            Some(db) => load_cached(db, wide_from, wide_to),
-            None => Vec::new(),
+        // No cache is NOT an empty month: without the DB there is nothing to
+        // show, and saying "no events" would be a lie.
+        let month_view = match db.as_ref() {
+            Some(db) => expand_month(db, wide_from, wide_to, home),
+            None => MonthView::failed(CalendarViewError::CacheUnavailable),
         };
-        // Expand recurrence into concrete per-day buckets once, here, so the
-        // popup never re-expands while painting.
-        let by_date = thegn_core::calendar::expand_by_date(&events, wide_from, wide_to, home);
-        deliver(&tx, &waker, year, month, by_date.into_iter().collect());
+        deliver(&tx, &waker, year, month, month_view);
     });
+}
+
+/// One month's expansion outcome, before it becomes a payload.
+pub(crate) struct MonthView {
+    pub events: Option<Vec<(NaiveDate, Vec<Arc<CalEvent>>)>>,
+    pub error: Option<CalendarViewError>,
+}
+
+impl MonthView {
+    fn failed(error: CalendarViewError) -> MonthView {
+        MonthView {
+            events: None,
+            error: Some(error),
+        }
+    }
+}
+
+/// Read the cache for a window and expand it into shared per-day buckets —
+/// once, here, so the popup never re-expands while painting. Any cache or
+/// expansion failure is reported, never collapsed into an empty month.
+pub(crate) fn expand_month(
+    db: &Db,
+    from: NaiveDate,
+    to: NaiveDate,
+    home: chrono_tz::Tz,
+) -> MonthView {
+    let cached = match load_cached(db, from, to) {
+        Ok(cached) => cached,
+        Err(error) => return MonthView::failed(error),
+    };
+    match thegn_core::calendar::expand_calendar(&cached.events, from, to, home) {
+        Ok(calendar) => MonthView {
+            events: Some(calendar.by_date.into_iter().collect()),
+            // An undecodable or malformed row costs only itself, but the month
+            // says so rather than passing for the whole calendar.
+            error: (cached.skipped + calendar.skipped > 0)
+                .then_some(CalendarViewError::MalformedCache),
+        },
+        Err(error) => MonthView::failed(CalendarViewError::Expansion(error)),
+    }
 }
 
 /// The periodic sync pass: refresh every account, then push the visible month
@@ -107,16 +148,8 @@ pub(crate) fn spawn_periodic_sync(
         let (m_from, m_to) =
             thegn_core::calendar::month_bounds(today.year(), today.month()).unwrap_or((from, to));
         let (wide_from, wide_to) = widen(m_from, m_to);
-        let events = load_cached(&db, wide_from, wide_to);
-        let by_date =
-            thegn_core::calendar::expand_by_date(&events, wide_from, wide_to, home_zone(&cfg));
-        deliver(
-            &tx,
-            &waker,
-            today.year(),
-            today.month(),
-            by_date.into_iter().collect(),
-        );
+        let month_view = expand_month(&db, wide_from, wide_to, home_zone(&cfg));
+        deliver(&tx, &waker, today.year(), today.month(), month_view);
     });
 }
 
@@ -397,15 +430,146 @@ fn row_of(e: &CalEvent) -> CalendarRow {
     }
 }
 
+/// Cached events overlapping a window, and how many rows could not be read.
+pub(crate) struct Cached {
+    pub events: Vec<CalEvent>,
+    pub skipped: usize,
+}
+
 /// Read cached events overlapping a window.
-fn load_cached(db: &Db, from: NaiveDate, to: NaiveDate) -> Vec<CalEvent> {
-    db.get_calendar_events(day_ms(from), day_ms(to) + 86_400_000, &[])
-        .unwrap_or_default()
-        .into_iter()
-        // A row that fails to deserialize is from a newer schema or a corrupt
-        // write; skip it rather than losing the whole month.
-        .filter_map(|(_, json)| serde_json::from_str::<CalEvent>(&json).ok())
-        .collect()
+///
+/// A query failure is an error, not an empty calendar. A row that fails to
+/// deserialize (a newer schema, a corrupt write) is skipped rather than
+/// losing the whole month, but counted, so the caller can say the view is
+/// incomplete instead of presenting it as complete.
+fn load_cached(db: &Db, from: NaiveDate, to: NaiveDate) -> Result<Cached, CalendarViewError> {
+    let rows = db
+        .get_calendar_events(day_ms(from), day_ms(to).saturating_add(86_400_000), &[])
+        .map_err(|_| CalendarViewError::CacheUnavailable)?;
+    let mut cached = Cached {
+        events: Vec::with_capacity(rows.len()),
+        skipped: 0,
+    };
+    for (_, json) in rows {
+        match serde_json::from_str::<CalEvent>(&json) {
+            Ok(event) => cached.events.push(event),
+            Err(_) => cached.skipped += 1,
+        }
+    }
+    Ok(cached)
+}
+
+/// One reminder evaluation window, `(from_ms, to_ms]`, tagged with the
+/// generation that dispatched it so a stale acknowledgment can be told apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReminderWindow {
+    pub generation: u64,
+    pub from_ms: i64,
+    pub to_ms: i64,
+}
+
+/// How a reminder evaluation ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReminderOutcome {
+    /// Every cached occurrence in the window was evaluated.
+    Complete,
+    /// Evaluated, but some cached rows could not be decoded. Retrying reads the
+    /// same bytes, so the window is still done; the gap is reported.
+    Incomplete(CalendarViewError),
+    /// Nothing was raised; the window stays pending for the next ticker slot.
+    Failed(CalendarViewError),
+}
+
+/// The loop-side reminder cursor: the last successfully evaluated instant and
+/// the one evaluation in flight.
+///
+/// The cursor advances only when the worker acknowledges success for the
+/// exact window it was handed — not at dispatch — so an expansion failure
+/// leaves the window retryable, and an acknowledgment for a window that is no
+/// longer in flight can neither clear a newer one nor move the cursor back.
+#[derive(Debug)]
+pub(crate) struct ReminderCursor {
+    last_checked_ms: i64,
+    next_generation: u64,
+    inflight: Option<ReminderWindow>,
+    /// The last failure reported, so a persistent one logs once, not per tick.
+    reported: Option<CalendarViewError>,
+}
+
+impl ReminderCursor {
+    pub(crate) fn new(now_ms: i64) -> ReminderCursor {
+        ReminderCursor {
+            last_checked_ms: now_ms,
+            next_generation: 0,
+            inflight: None,
+            reported: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn last_checked_ms(&self) -> i64 {
+        self.last_checked_ms
+    }
+
+    /// Open the window `(last_checked, now]`, or `None` while one is in flight
+    /// (the next ticker slot retries; there is never more than one).
+    pub(crate) fn begin(&mut self, now_ms: i64) -> Option<ReminderWindow> {
+        if self.inflight.is_some() {
+            return None;
+        }
+        let window = ReminderWindow {
+            generation: self.next_generation,
+            from_ms: self.last_checked_ms,
+            to_ms: now_ms,
+        };
+        self.next_generation = self.next_generation.wrapping_add(1);
+        self.inflight = Some(window);
+        Some(window)
+    }
+
+    /// The window could not be dispatched (the background lane was full):
+    /// forget it without moving the cursor.
+    pub(crate) fn abandon(&mut self, window: ReminderWindow) {
+        if self.inflight == Some(window) {
+            self.inflight = None;
+        }
+    }
+
+    /// Nothing to evaluate (reminders off, no sources): the window is
+    /// trivially complete.
+    pub(crate) fn skip(&mut self, now_ms: i64) {
+        if self.inflight.is_none() {
+            self.last_checked_ms = self.last_checked_ms.max(now_ms);
+        }
+    }
+
+    /// Apply a worker's acknowledgment. Returns whether it was current.
+    pub(crate) fn finish(&mut self, window: ReminderWindow, outcome: ReminderOutcome) -> bool {
+        if self.inflight != Some(window) {
+            return false;
+        }
+        self.inflight = None;
+        let error = match outcome {
+            ReminderOutcome::Complete => None,
+            ReminderOutcome::Incomplete(error) | ReminderOutcome::Failed(error) => Some(error),
+        };
+        if !matches!(outcome, ReminderOutcome::Failed(_)) {
+            self.last_checked_ms = self.last_checked_ms.max(window.to_ms);
+        }
+        if error != self.reported {
+            if let Some(error) = error {
+                // The error is a fixed label: no event content reaches the log.
+                tracing::warn!(
+                    target: "thegn::calendar",
+                    error = %error,
+                    retrying = matches!(outcome, ReminderOutcome::Failed(_)),
+                    "calendar reminders could not be fully evaluated"
+                );
+            }
+            self.reported = error;
+        }
+        true
+    }
 }
 
 /// Raise whatever reminders have come due, off the loop.
@@ -414,58 +578,129 @@ fn load_cached(db: &Db, from: NaiveDate, to: NaiveDate) -> Vec<CalEvent> {
 /// there is the one thing the event model forbids outright. Inert when nothing
 /// is configured, so the coarse ticker slot costs a user without a calendar
 /// nothing at all.
+///
+/// The background permit is reserved HERE: a dispatch that silently skipped a
+/// full lane would leave its window "in flight" forever and stop reminders.
 pub(crate) fn spawn_reminder_check(
+    cursor: &mut ReminderCursor,
+    now_ms: i64,
     cfg: CalendarConfig,
-    last_checked_ms: i64,
+    tx: tokio_mpsc::UnboundedSender<RefreshKind>,
     waker: TerminalWaker,
 ) {
-    if !cfg.reminders_enabled || cfg.active_accounts().is_empty() {
+    if !reminders_configured(&cfg) {
+        cursor.skip(now_ms);
         return;
     }
-    crate::sched::spawn_bg(move || {
-        for r in due_reminders(&cfg, last_checked_ms) {
-            crate::handlers::calendar::raise_reminder(&r, &waker);
-        }
+    let Some(window) = cursor.begin(now_ms) else {
+        return;
+    };
+    let Some(permit) = crate::sched::bg_permit() else {
+        cursor.abandon(window); // lane full: the next ticker slot retries
+        return;
+    };
+    crate::sched::spawn_bg_reserved(permit, move || {
+        // Acknowledge even if evaluation panics, or the window would stay in
+        // flight for the life of the process.
+        let mut ack = ReminderAck {
+            tx,
+            waker: waker.clone(),
+            window,
+            outcome: ReminderOutcome::Failed(CalendarViewError::CacheUnavailable),
+        };
+        let outcome = match Db::open() {
+            Err(_) => ReminderOutcome::Failed(CalendarViewError::CacheUnavailable),
+            Ok(db) => match due_reminders(&db, &cfg, window) {
+                Ok(due) => {
+                    for r in &due.reminders {
+                        crate::handlers::calendar::raise_reminder(r, &waker);
+                    }
+                    match due.skipped {
+                        0 => ReminderOutcome::Complete,
+                        _ => ReminderOutcome::Incomplete(CalendarViewError::MalformedCache),
+                    }
+                }
+                Err(error) => ReminderOutcome::Failed(error),
+            },
+        };
+        ack.outcome = outcome;
     });
 }
 
-/// Which reminders have come due.
+/// Sends the worker's acknowledgment on drop, so every exit path reports.
+struct ReminderAck {
+    tx: tokio_mpsc::UnboundedSender<RefreshKind>,
+    waker: TerminalWaker,
+    window: ReminderWindow,
+    outcome: ReminderOutcome,
+}
+
+impl Drop for ReminderAck {
+    fn drop(&mut self) {
+        let sent = self.tx.send(RefreshKind::CalendarReminderResult {
+            window: self.window,
+            outcome: self.outcome,
+        });
+        if sent.is_ok() {
+            let _ = self.waker.wake(); // best-effort: the loop may already be shutting down
+        }
+    }
+}
+
+fn reminders_configured(cfg: &CalendarConfig) -> bool {
+    cfg.reminders_enabled && !cfg.active_accounts().is_empty()
+}
+
+/// Due reminders from one evaluation, plus how many cached rows were unreadable.
+pub(crate) struct DueReminders {
+    pub reminders: Vec<thegn_core::calendar::DueReminder>,
+    pub skipped: usize,
+}
+
+/// Which reminders came due in exactly `window`.
 ///
 /// No network and no re-expansion of the whole horizon — it reads the cache the
-/// sync already filled, and the decision itself is a pure comparison
-/// ([`thegn_core::calendar::reminders::due`]). Split out from the spawn so it
-/// is testable without a runtime.
+/// sync already filled, expands it once under the shared budget, and evaluates
+/// the UNIQUE occurrence list, so a multi-day event is judged once rather than
+/// once per day it occupies. An expansion failure raises nothing: a partial
+/// list must never pass for a complete one.
 pub(crate) fn due_reminders(
+    db: &Db,
     cfg: &CalendarConfig,
-    last_checked_ms: i64,
-) -> Vec<thegn_core::calendar::DueReminder> {
-    if !cfg.reminders_enabled || cfg.active_accounts().is_empty() {
-        return Vec::new();
+    window: ReminderWindow,
+) -> Result<DueReminders, CalendarViewError> {
+    if !reminders_configured(cfg) {
+        return Ok(DueReminders {
+            reminders: Vec::new(),
+            skipped: 0,
+        });
     }
-    let Ok(db) = Db::open() else {
-        return Vec::new();
-    };
     let home = home_zone(cfg);
-    let now = chrono::Utc::now();
-    let today = now.with_timezone(&home).date_naive();
+    let at = chrono::DateTime::from_timestamp_millis(window.to_ms)
+        .ok_or(CalendarViewError::Expansion(ExpansionError::InvalidWindow))?;
+    let today = at.with_timezone(&home).date_naive();
     // A day either side is plenty: no sane reminder leads by more than that,
     // and it keeps the scan small.
     let (from, to) = (
         today.pred_opt().unwrap_or(today),
         today.succ_opt().unwrap_or(today),
     );
-    let events = load_cached(&db, from, to);
-    let expanded: Vec<CalEvent> = thegn_core::calendar::expand_by_date(&events, from, to, home)
-        .into_values()
-        .flatten()
-        .collect();
-    thegn_core::calendar::reminders::due(
-        &expanded,
-        home,
-        &cfg.default_reminders(),
-        last_checked_ms,
-        now.timestamp_millis(),
-    )
+    let cached = load_cached(db, from, to)?;
+    let expanded = thegn_core::calendar::expand_calendar(&cached.events, from, to, home)
+        .map_err(CalendarViewError::Expansion)?;
+    Ok(DueReminders {
+        reminders: thegn_core::calendar::reminders::due_shared(
+            &expanded.occurrences,
+            home,
+            &cfg.default_reminders(),
+            window.from_ms,
+            window.to_ms,
+        ),
+        // Rows the expander skipped as malformed are counted with the ones
+        // that would not decode: both mean "these reminders are everything the
+        // cache could yield", not "the evaluation failed".
+        skipped: cached.skipped + expanded.skipped,
+    })
 }
 
 fn widen(from: NaiveDate, to: NaiveDate) -> (NaiveDate, NaiveDate) {
@@ -506,11 +741,22 @@ fn deliver(
     waker: &TerminalWaker,
     year: i32,
     month: u32,
-    events: Vec<(NaiveDate, Vec<CalEvent>)>,
+    view: MonthView,
 ) {
+    if let Some(error) = view.error {
+        // A fixed label, never event content.
+        tracing::warn!(
+            target: "thegn::calendar",
+            error = %error,
+            year,
+            month,
+            "calendar month is unavailable or incomplete"
+        );
+    }
     let payload = crate::detail::CalendarPayload {
         month: (year, month),
-        events,
+        events: view.events,
+        error: view.error,
     };
     if tx
         .send(RefreshKind::CalendarMonth(Box::new(payload)))

@@ -14,7 +14,7 @@ use std::collections::BTreeSet;
 
 use chrono::{Datelike, Days, Months, NaiveDate, NaiveDateTime, Timelike, Weekday};
 
-use super::{EventTime, GapPolicy, TzRef};
+use super::{EventTime, ExpansionBudget, ExpansionError, ExpansionLimit, TzRef};
 
 /// How often a rule repeats.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -348,12 +348,32 @@ pub fn parse_ics_datetime(s: &str) -> Option<NaiveDateTime> {
         .and_then(|d| d.and_hms_opt(0, 0, 0))
 }
 
-/// A safety valve on pathological rules (`BYSETPOS` over a year of candidates
-/// that never matches). Expansion is already window-bounded; this bounds the
-/// *empty* periods it will skip through before giving up.
-const MAX_EMPTY_PERIODS: usize = 3_000;
+/// Local cap on one sub-daily walk, independent of the shared budget: a
+/// SECONDLY rule over a month is millions of instants and no UI wants them.
+/// Reaching it is a refusal ([`ExpansionError::Budget`]), never a silently
+/// truncated list.
+const MAX_SUBDAILY_STEPS: usize = 200_000;
 
-/// Expand a recurrence into local wall times within `[from, to]`.
+fn work_exhausted() -> ExpansionError {
+    ExpansionError::Budget(ExpansionLimit::RecurrenceWork)
+}
+
+/// Expand a recurrence into local wall times within `[from, to]` — test-only
+/// convenience that swallows a refusal into an empty list. Production goes
+/// through [`expand_local_bounded`].
+#[cfg(test)]
+pub fn expand_local(
+    rec: &Recurrence,
+    start: NaiveDateTime,
+    from: NaiveDate,
+    to: NaiveDate,
+) -> Vec<NaiveDateTime> {
+    let mut budget = ExpansionBudget::default();
+    expand_local_bounded(rec, start, from, to, &mut budget).unwrap_or_default()
+}
+
+/// Expand a recurrence into local wall times within `[from, to]`, charging
+/// every period, candidate, and RDATE/EXDATE visited to `budget`.
 ///
 /// `start` is DTSTART's local time — the seed for every unspecified field, per
 /// RFC 5545 (a `FREQ=WEEKLY` with no `BYDAY` repeats on DTSTART's weekday, at
@@ -361,17 +381,31 @@ const MAX_EMPTY_PERIODS: usize = 3_000;
 ///
 /// Returns local `NaiveDateTime`s, deliberately *not* instants: the caller
 /// converts through the event's own zone so DST is applied per occurrence.
-pub fn expand_local(
+///
+/// A rule without COUNT is fast-forwarded to the window, so an endless rule
+/// from decades ago costs about as much as one from last week. A COUNT rule is
+/// walked from DTSTART (the skipped periods consume its COUNT); when that walk
+/// would exceed the budget the answer is a typed refusal, not a guess.
+pub fn expand_local_bounded(
     rec: &Recurrence,
     start: NaiveDateTime,
     from: NaiveDate,
     to: NaiveDate,
-) -> Vec<NaiveDateTime> {
+    budget: &mut ExpansionBudget,
+) -> Result<Vec<NaiveDateTime>, ExpansionError> {
+    if from > to {
+        return Err(ExpansionError::InvalidWindow);
+    }
+    // Every RDATE and EXDATE is visited below, in or out of the window.
+    let listed = rec
+        .rdates
+        .len()
+        .checked_add(rec.exdates.len())
+        .ok_or_else(work_exhausted)?;
+    budget.recurrence_work(listed)?;
     let mut out: BTreeSet<NaiveDateTime> = BTreeSet::new();
     for rule in &rec.rules {
-        for dt in expand_rule(rule, start, from, to) {
-            out.insert(dt);
-        }
+        out.extend(expand_rule(rule, start, from, to, budget)?);
     }
     // RDATEs are additional occurrences, independent of any rule.
     for r in &rec.rdates {
@@ -388,7 +422,7 @@ pub fn expand_local(
     }
     // EXDATE matches the recurrence-id — the LOCAL value — not the instant.
     let ex: BTreeSet<NaiveDateTime> = rec.exdates.iter().filter_map(local_of).collect();
-    out.into_iter().filter(|d| !ex.contains(d)).collect()
+    Ok(out.into_iter().filter(|d| !ex.contains(d)).collect())
 }
 
 /// The local wall time an `EventTime` denotes, for EXDATE/RDATE matching.
@@ -400,33 +434,84 @@ fn local_of(t: &EventTime) -> Option<NaiveDateTime> {
     }
 }
 
+/// Per-rule work prices, computed once. Every `BY*` list is attacker-sized, so
+/// the cost of walking them is charged, not just the candidates they produce.
+struct RuleCost {
+    /// Upper bound on the work to build one period's candidate dates.
+    period: usize,
+    /// Work to run the day-level filters over one candidate date.
+    filter: usize,
+}
+
+impl RuleCost {
+    fn of(r: &RRule) -> Option<RuleCost> {
+        let by_day = r.by_day.len();
+        let month_day = r.by_month_day.len();
+        // One month under BYDAY walks ≤31 days per entry, and each produced
+        // date (≤5 per entry) is filtered through BYMONTHDAY and BYMONTH.
+        let per_month = by_day
+            .checked_mul(31)?
+            .checked_add(
+                by_day
+                    .checked_mul(5)?
+                    .checked_mul(month_day.checked_add(r.by_month.len())?.max(1))?,
+            )?
+            .checked_add(month_day)?
+            .checked_add(1)?;
+        let dates = match r.freq {
+            Freq::Secondly | Freq::Minutely | Freq::Hourly | Freq::Daily => 1,
+            Freq::Weekly => by_day.max(1).checked_mul(7)?,
+            Freq::Monthly => per_month,
+            Freq::Yearly => r
+                .by_month
+                .len()
+                .max(1)
+                .checked_mul(per_month)?
+                .checked_add(r.by_year_day.len())?
+                .checked_add(r.by_week_no.len().checked_mul(by_day.max(1))?)?,
+        };
+        // Plus sorting the time lists and selecting BYSETPOS once per period.
+        let period = dates
+            .checked_add(r.by_hour.len())?
+            .checked_add(r.by_minute.len())?
+            .checked_add(r.by_second.len())?
+            .checked_add(r.by_set_pos.len())?
+            .checked_add(1)?;
+        let filter = [
+            r.by_month_day.len(),
+            r.by_year_day.len(),
+            r.by_day.len(),
+            r.by_week_no.len(),
+            r.by_month.len(),
+        ]
+        .into_iter()
+        .try_fold(1usize, |n, len| n.checked_add(len))?;
+        Some(RuleCost { period, filter })
+    }
+}
+
 /// Expand one rule.
 fn expand_rule(
     r: &RRule,
     start: NaiveDateTime,
     from: NaiveDate,
     to: NaiveDate,
-) -> Vec<NaiveDateTime> {
+    budget: &mut ExpansionBudget,
+) -> Result<Vec<NaiveDateTime>, ExpansionError> {
+    let cost = RuleCost::of(r).ok_or_else(work_exhausted)?;
     // Sub-daily rules step by a time unit, not by a calendar period, so their
     // INTERVAL means hours/minutes/seconds. Folding them into the day-stepping
     // loop below would read `HOURLY;INTERVAL=24` as "every 24 days".
     if matches!(r.freq, Freq::Secondly | Freq::Minutely | Freq::Hourly) {
-        return expand_subdaily(r, start, from, to);
+        return expand_subdaily(r, start, from, to, budget, &cost);
     }
     let mut out = Vec::new();
     let mut emitted: u32 = 0;
-    let mut empty_periods = 0usize;
-    let mut period = start.date();
+    let mut period = initial_period(r, start.date(), from);
 
     loop {
-        let candidates = period_candidates(r, start, period);
-        if candidates.is_empty() {
-            empty_periods += 1;
-        } else {
-            empty_periods = 0;
-        }
-
-        for dt in candidates {
+        budget.recurrence_work(cost.period)?;
+        for dt in period_candidates(r, start, period, budget, &cost)? {
             // Occurrences before DTSTART are never emitted, but they DO consume
             // COUNT in the sense that COUNT counts from DTSTART — so simply
             // skipping them is correct because they cannot precede it anyway.
@@ -436,71 +521,133 @@ fn expand_rule(
             if let Some(u) = r.until
                 && dt > u
             {
-                return out;
+                return Ok(out);
             }
             if let Some(c) = r.count {
                 if emitted >= c {
-                    return out;
+                    return Ok(out);
                 }
                 emitted += 1;
             }
-            if dt.date() > to {
-                // Past the window: nothing later can be in it either, and
-                // without COUNT there is no reason to keep walking.
-                if r.count.is_none() {
-                    return out;
-                }
-                continue;
-            }
-            if dt.date() >= from {
+            if dt.date() >= from && dt.date() <= to {
+                // Charged before it is held: this vector is the pass's
+                // largest transient, and it is attacker-sized.
+                budget.expanded_local()?;
                 out.push(dt);
             }
         }
-
-        // Stop once the whole period is past the window (and no COUNT budget
-        // still has to be walked off).
-        if period > to && r.count.is_none() {
-            return out;
+        // Stop once a whole period is past the window. A period's candidates
+        // can start up to a week before its nominal date (a WKST-aligned week,
+        // an ISO week straddling New Year), so allow one week of spill. Nothing
+        // after the window can matter — COUNT only ever removes later ones.
+        if period
+            .checked_sub_days(Days::new(7))
+            .is_some_and(|p| p > to)
+        {
+            return Ok(out);
         }
-        if empty_periods > MAX_EMPTY_PERIODS {
-            return out;
-        }
+        // The end of the representable calendar: nothing later exists.
         let Some(next) = advance(r, period) else {
-            return out;
+            return Ok(out);
         };
         // Defensive: a non-advancing period would spin forever.
         if next <= period {
-            return out;
+            return Err(work_exhausted());
         }
         period = next;
     }
 }
 
+/// The first period to walk.
+///
+/// COUNT must be walked from DTSTART, since every earlier period consumes it.
+/// Without COUNT (UNTIL only caps the end) the earlier periods cannot affect
+/// the window, so jump to the period containing `from` — then back one more
+/// step, as slack for candidates that spill across a period boundary.
+fn initial_period(r: &RRule, start: NaiveDate, from: NaiveDate) -> NaiveDate {
+    if r.count.is_some() || from <= start {
+        return start;
+    }
+    let interval = u64::from(r.interval.max(1));
+    let jumped = match r.freq {
+        Freq::Daily | Freq::Weekly => {
+            let step = if r.freq == Freq::Weekly {
+                interval.saturating_mul(7)
+            } else {
+                interval
+            };
+            let elapsed = u64::try_from(from.signed_duration_since(start).num_days()).unwrap_or(0);
+            let periods = (elapsed / step).saturating_sub(1);
+            // periods * step <= elapsed, so this cannot overflow.
+            start.checked_add_days(Days::new(periods * step))
+        }
+        Freq::Monthly | Freq::Yearly => {
+            let step = if r.freq == Freq::Yearly {
+                interval.saturating_mul(12)
+            } else {
+                interval
+            };
+            let elapsed = (i64::from(from.year()) - i64::from(start.year())) * 12
+                + i64::from(from.month())
+                - i64::from(start.month());
+            let elapsed = u64::try_from(elapsed).unwrap_or(0);
+            let periods = (elapsed / step).saturating_sub(1);
+            u32::try_from(periods * step)
+                .ok()
+                .and_then(|m| start.checked_add_months(Months::new(m)))
+        }
+        Freq::Secondly | Freq::Minutely | Freq::Hourly => None,
+    };
+    jumped.unwrap_or(start)
+}
+
 /// Expand a SECONDLY/MINUTELY/HOURLY rule.
 ///
 /// These step the clock rather than the calendar, so the loop walks instants
-/// from DTSTART and every `BY*` part acts as a **filter** (RFC 5545: a part
-/// finer than the frequency limits, it does not expand).
+/// from DTSTART (fast-forwarded to the window when there is no COUNT) and
+/// every `BY*` part acts as a **filter** (RFC 5545: a part finer than the
+/// frequency limits, it does not expand).
 fn expand_subdaily(
     r: &RRule,
     start: NaiveDateTime,
     from: NaiveDate,
     to: NaiveDate,
-) -> Vec<NaiveDateTime> {
-    let step = match r.freq {
-        Freq::Secondly => chrono::Duration::seconds(r.interval.max(1) as i64),
-        Freq::Minutely => chrono::Duration::minutes(r.interval.max(1) as i64),
-        _ => chrono::Duration::hours(r.interval.max(1) as i64),
+    budget: &mut ExpansionBudget,
+    cost: &RuleCost,
+) -> Result<Vec<NaiveDateTime>, ExpansionError> {
+    let unit: i64 = match r.freq {
+        Freq::Secondly => 1,
+        Freq::Minutely => 60,
+        _ => 3_600,
     };
-    // Bound the walk: a SECONDLY rule over a month is millions of instants, and
-    // no calendar UI wants them. This is the one place the expander refuses
-    // rather than obeying.
-    const MAX_STEPS: usize = 200_000;
+    let step_secs = unit
+        .checked_mul(i64::from(r.interval.max(1)))
+        .ok_or(ExpansionError::Arithmetic)?;
+    let step = chrono::Duration::try_seconds(step_secs).ok_or(ExpansionError::Arithmetic)?;
+
+    let mut cur = start;
+    if r.count.is_none()
+        && let Some(window_start) = from.and_hms_opt(0, 0, 0)
+        && window_start > start
+    {
+        let elapsed = window_start.signed_duration_since(start).num_seconds();
+        // (elapsed / step) * step <= elapsed, so neither can overflow.
+        let skip = chrono::Duration::try_seconds((elapsed / step_secs) * step_secs)
+            .ok_or(ExpansionError::Arithmetic)?;
+        cur = start
+            .checked_add_signed(skip)
+            .ok_or(ExpansionError::Arithmetic)?;
+    }
 
     let mut out = Vec::new();
     let mut emitted: u32 = 0;
-    let mut cur = start;
-    for _ in 0..MAX_STEPS {
+    let mut steps = 0usize;
+    loop {
+        if steps >= MAX_SUBDAILY_STEPS {
+            return Err(work_exhausted());
+        }
+        steps += 1;
+        budget.recurrence_work(cost.filter)?;
         if let Some(u) = r.until
             && cur > u
         {
@@ -522,39 +669,55 @@ fn expand_subdaily(
                 emitted += 1;
             }
             if cur.date() >= from {
+                budget.expanded_local()?;
                 out.push(cur);
             }
         }
+        // The end of the representable calendar: nothing later exists.
         let Some(next) = cur.checked_add_signed(step) else {
             break;
         };
         cur = next;
     }
-    out
+    Ok(out)
 }
 
-/// Move to the next period start.
+/// Move to the next period start; `None` past the representable calendar.
 fn advance(r: &RRule, period: NaiveDate) -> Option<NaiveDate> {
-    let n = r.interval.max(1) as u64;
+    let n = u64::from(r.interval.max(1));
     match r.freq {
         // Sub-daily frequencies never reach here (see `expand_subdaily`).
         Freq::Secondly | Freq::Minutely | Freq::Hourly | Freq::Daily => {
             period.checked_add_days(Days::new(n))
         }
-        Freq::Weekly => period.checked_add_days(Days::new(n * 7)),
+        Freq::Weekly => period.checked_add_days(Days::new(n.checked_mul(7)?)),
         Freq::Monthly => period.checked_add_months(Months::new(r.interval.max(1))),
-        Freq::Yearly => period.checked_add_months(Months::new(r.interval.max(1) * 12)),
+        Freq::Yearly => period.checked_add_months(Months::new(r.interval.max(1).checked_mul(12)?)),
     }
 }
 
 /// Every occurrence the rule produces within the period beginning at `period`.
-fn period_candidates(r: &RRule, start: NaiveDateTime, period: NaiveDate) -> Vec<NaiveDateTime> {
+///
+/// The caller has already charged [`RuleCost::period`]; each candidate date's
+/// filter pass and each expanded time is charged here, before it is built.
+fn period_candidates(
+    r: &RRule,
+    start: NaiveDateTime,
+    period: NaiveDate,
+    budget: &mut ExpansionBudget,
+    cost: &RuleCost,
+) -> Result<Vec<NaiveDateTime>, ExpansionError> {
     let dates: Vec<NaiveDate> = match r.freq {
         Freq::Secondly | Freq::Minutely | Freq::Hourly | Freq::Daily => vec![period],
         Freq::Weekly => week_dates(r, start, period),
         Freq::Monthly => month_dates(r, start, period),
         Freq::Yearly => year_dates(r, start, period),
     };
+    let filtering = dates
+        .len()
+        .checked_mul(cost.filter)
+        .ok_or_else(work_exhausted)?;
+    budget.recurrence_work(filtering)?;
 
     // BYMONTH filters every frequency except YEARLY, where it *expands*.
     let dates: Vec<NaiveDate> = dates
@@ -575,6 +738,10 @@ fn period_candidates(r: &RRule, start: NaiveDateTime, period: NaiveDate) -> Vec<
         for h in &hours {
             for mi in &minutes {
                 for s in &seconds {
+                    // Charged before growth, in work AND bytes: a
+                    // BYHOUR×BYMINUTE×BYSECOND cross product is refused as it
+                    // grows, not after it has been built.
+                    budget.candidate()?;
                     if let Some(t) = d.and_hms_opt(*h, *mi, *s) {
                         out.push(t);
                     }
@@ -588,23 +755,26 @@ fn period_candidates(r: &RRule, start: NaiveDateTime, period: NaiveDate) -> Vec<
     // BYSETPOS selects from the period's ordered candidate list — "the last
     // weekday of the month" is BYDAY=MO,TU,WE,TH,FR;BYSETPOS=-1.
     if !r.by_set_pos.is_empty() {
-        let n = out.len() as i32;
+        let n = i64::try_from(out.len()).map_err(|_| work_exhausted())?;
         let picked: BTreeSet<usize> = r
             .by_set_pos
             .iter()
-            .filter_map(|p| match *p {
-                0 => None,
-                p if p > 0 && p <= n => Some((p - 1) as usize),
-                p if p < 0 && -p <= n => Some((n + p) as usize),
-                _ => None,
+            .filter_map(|p| {
+                let p = i64::from(*p);
+                match p {
+                    0 => None,
+                    p if p > 0 && p <= n => usize::try_from(p - 1).ok(),
+                    p if p < 0 && -p <= n => usize::try_from(n + p).ok(),
+                    _ => None,
+                }
             })
             .collect();
-        return picked
+        return Ok(picked
             .into_iter()
             .filter_map(|i| out.get(i).copied())
-            .collect();
+            .collect());
     }
-    out
+    Ok(out)
 }
 
 fn or_default(v: &[u32], fallback: u32) -> Vec<u32> {
@@ -883,40 +1053,61 @@ fn weeks_in_iso_year(y: i32) -> u32 {
         .unwrap_or(52)
 }
 
-/// Expand a recurring event into absolute instants within a date window.
+/// The local wall time a recurrence is seeded from: DTSTART's own wall time
+/// (a floating date at midnight; an instant as seen from `home`).
+pub(crate) fn seed_of(start: &EventTime, home: chrono_tz::Tz) -> Option<NaiveDateTime> {
+    match start {
+        EventTime::Zoned { local, .. } => Some(*local),
+        EventTime::Date { date } => date.and_hms_opt(0, 0, 0),
+        EventTime::Instant { at } => Some(at.with_timezone(&home).naive_local()),
+    }
+}
+
+/// One expanded wall time as an event time of DTSTART's shape: a floating date
+/// stays a date; anything else becomes a wall time in the event's own zone
+/// (or `home`, for an instant-seeded rule).
+pub(crate) fn instance_time(
+    local: NaiveDateTime,
+    start: &EventTime,
+    home: chrono_tz::Tz,
+) -> EventTime {
+    match start {
+        EventTime::Date { .. } => EventTime::Date { date: local.date() },
+        EventTime::Zoned { zone, .. } => EventTime::Zoned {
+            local,
+            zone: zone.clone(),
+        },
+        EventTime::Instant { .. } => EventTime::Zoned {
+            local,
+            zone: TzRef::new(home.name()),
+        },
+    }
+}
+
+/// Expand a recurring event into event times within a date window —
+/// test-only; production materializes instances one at a time in
+/// [`super::CalEvent::occurrences_bounded`].
 ///
-/// Wall times come from [`expand_local`]; each is then resolved through the
-/// event's own zone, so a DST boundary shifts the *instant* while the local
-/// time stays put.
+/// Wall times come from [`expand_local_bounded`]; each is then resolved
+/// through the event's own zone, so a DST boundary shifts the *instant* while
+/// the local time stays put.
+#[cfg(test)]
 pub fn occurrences(
     rec: &Recurrence,
     start: &EventTime,
     from: NaiveDate,
     to: NaiveDate,
     home: chrono_tz::Tz,
-    gap: GapPolicy,
+    gap: super::GapPolicy,
 ) -> Vec<EventTime> {
-    let (seed, zone) = match start {
-        EventTime::Zoned { local, zone } => (*local, Some(zone.clone())),
-        EventTime::Date { date } => match date.and_hms_opt(0, 0, 0) {
-            Some(d) => (d, None),
-            None => return Vec::new(),
-        },
-        EventTime::Instant { at } => (at.with_timezone(&home).naive_local(), None),
+    let mut budget = ExpansionBudget::default();
+    let Some(seed) = seed_of(start, home) else {
+        return Vec::new();
     };
-    let all_day = matches!(start, EventTime::Date { .. });
-    expand_local(rec, seed, from, to)
+    expand_local_bounded(rec, seed, from, to, &mut budget)
+        .unwrap_or_default()
         .into_iter()
-        .map(|local| {
-            if all_day {
-                EventTime::Date { date: local.date() }
-            } else {
-                EventTime::Zoned {
-                    local,
-                    zone: zone.clone().unwrap_or_else(|| TzRef::new(home.name())),
-                }
-            }
-        })
+        .map(|local| instance_time(local, start, home))
         // Under `GapPolicy::Skip` an occurrence that falls in a spring-forward
         // gap genuinely does not happen, so it is dropped rather than nudged.
         .filter(|t| t.is_all_day() || t.instant_in(home, gap).is_some())

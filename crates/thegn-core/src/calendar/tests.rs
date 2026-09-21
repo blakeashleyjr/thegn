@@ -594,7 +594,7 @@ fn a_single_day_event_yields_exactly_that_day() {
         zoned(2026, 8, 21, 9, 0, "UTC"),
         zoned(2026, 8, 20, 9, 0, "UTC"),
     );
-    assert_eq!(backwards.dates_in(Tz::UTC), vec![d(2026, 8, 21)]);
+    assert!(backwards.dates_in(Tz::UTC).is_empty());
 }
 
 #[test]
@@ -793,8 +793,9 @@ fn an_all_day_recurrence_keeps_its_day_length() {
 }
 
 #[test]
-fn a_malformed_event_whose_end_precedes_its_start_has_a_zero_span() {
-    // Bad provider data must not produce a negative duration or a panic.
+fn a_malformed_recurrence_whose_end_precedes_its_start_is_refused() {
+    // Bad provider data is refused by the bounded production expander rather
+    // than being converted into a plausible zero-span recurrence.
     let mut e = CalEvent::new(
         "bad",
         "Backwards",
@@ -805,9 +806,15 @@ fn a_malformed_event_whose_end_precedes_its_start_has_a_zero_span() {
         rules: vec![RRule::parse("FREQ=DAILY;COUNT=2").unwrap()],
         ..Default::default()
     });
-    let occ = e.occurrences(d(2026, 8, 1), d(2026, 8, 31), Tz::UTC);
-    assert_eq!(occ.len(), 2);
-    assert_eq!(occ[0].start, occ[0].end, "clamped to a zero-length span");
+    let mut budget = ExpansionBudget::default();
+    assert_eq!(
+        e.occurrences_bounded(d(2026, 8, 1), d(2026, 8, 31), Tz::UTC, &mut budget),
+        Err(ExpansionError::InvalidSpan)
+    );
+    assert!(
+        e.occurrences(d(2026, 8, 1), d(2026, 8, 31), Tz::UTC)
+            .is_empty()
+    );
 }
 
 #[test]
@@ -825,7 +832,7 @@ fn expand_by_date_buckets_every_day_an_event_touches() {
         zoned(2026, 8, 20, 9, 0, "UTC"),
         zoned(2026, 8, 22, 17, 0, "UTC"),
     );
-    let by_date = expand_by_date(&[single, multi], d(2026, 8, 1), d(2026, 8, 31), Tz::UTC);
+    let by_date = expand_by_date(&[single, multi], d(2026, 8, 1), d(2026, 8, 31), Tz::UTC).unwrap();
     assert_eq!(by_date[&d(2026, 8, 20)].len(), 1);
     assert_eq!(by_date[&d(2026, 8, 21)].len(), 2, "both touch the 21st");
     assert_eq!(by_date[&d(2026, 8, 22)].len(), 1);
@@ -846,7 +853,7 @@ fn expand_by_date_materializes_recurrences_as_plain_events() {
         rules: vec![RRule::parse("FREQ=WEEKLY;BYDAY=MO").unwrap()],
         ..Default::default()
     });
-    let by_date = expand_by_date(&[e], d(2026, 8, 1), d(2026, 8, 31), Tz::UTC);
+    let by_date = expand_by_date(&[e], d(2026, 8, 1), d(2026, 8, 31), Tz::UTC).unwrap();
     let mondays: Vec<_> = by_date.keys().copied().collect();
     assert_eq!(
         mondays,
@@ -897,7 +904,8 @@ fn expand_by_date_orders_a_day_all_day_first_then_by_time() {
         d(2026, 8, 21),
         d(2026, 8, 21),
         Tz::UTC,
-    );
+    )
+    .unwrap();
     let titles: Vec<_> = by_date[&d(2026, 8, 21)]
         .iter()
         .map(|e| e.title.as_str())
@@ -914,12 +922,16 @@ fn expand_by_date_clips_to_the_requested_window() {
         zoned(2026, 7, 30, 9, 0, "UTC"),
         zoned(2026, 8, 2, 17, 0, "UTC"),
     );
-    let by_date = expand_by_date(&[e], d(2026, 8, 1), d(2026, 8, 31), Tz::UTC);
+    let by_date = expand_by_date(&[e], d(2026, 8, 1), d(2026, 8, 31), Tz::UTC).unwrap();
     assert_eq!(
         by_date.keys().copied().collect::<Vec<_>>(),
         vec![d(2026, 8, 1), d(2026, 8, 2)]
     );
-    assert!(expand_by_date(&[], d(2026, 8, 1), d(2026, 8, 31), Tz::UTC).is_empty());
+    assert!(
+        expand_by_date(&[], d(2026, 8, 1), d(2026, 8, 31), Tz::UTC)
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]
@@ -936,4 +948,921 @@ fn an_all_day_date_resolves_to_midnight_in_the_home_zone() {
         .instant_in(Tz::Asia__Tokyo, GapPolicy::ShiftForward)
         .unwrap();
     assert_eq!(tokyo, self::utc(2026, 8, 20, 15, 0));
+}
+
+// --- bounded expansion (THE-458) ---------------------------------------------
+
+fn all_day(from: NaiveDate, to: NaiveDate) -> CalEvent {
+    CalEvent::new(
+        "span",
+        "Span",
+        EventTime::Date { date: from },
+        EventTime::Date { date: to },
+    )
+}
+
+fn recurring(start: EventTime, end: EventTime, rule: &str) -> CalEvent {
+    let mut e = CalEvent::new("r", "Recurring", start, end);
+    e.recurrence = Some(Recurrence {
+        rules: vec![RRule::parse(rule).unwrap()],
+        ..Default::default()
+    });
+    e
+}
+
+fn expand_with(
+    events: &[CalEvent],
+    from: NaiveDate,
+    to: NaiveDate,
+    budget: &mut ExpansionBudget,
+) -> Result<ExpandedCalendar, ExpansionError> {
+    expand_calendar_with_budget(events, from, to, Tz::UTC, budget)
+}
+
+#[test]
+fn a_century_span_costs_the_window_not_its_lifetime() {
+    let event = all_day(d(1900, 1, 1), d(2200, 1, 1));
+    let mut budget = ExpansionBudget::default();
+    let expanded = expand_with(
+        std::slice::from_ref(&event),
+        d(2026, 8, 21),
+        d(2026, 8, 21),
+        &mut budget,
+    )
+    .unwrap();
+    assert_eq!(expanded.by_date.len(), 1);
+    assert_eq!(expanded.by_date[&d(2026, 8, 21)].len(), 1);
+    assert_eq!(budget.used_bucket_entries(), 1, "one day, not 110k");
+    assert_eq!(budget.used_occurrences(), 1);
+    assert_eq!(budget.used_recurrence_work(), 0);
+    assert_eq!(
+        event
+            .occupied_dates_in(d(2026, 8, 21), d(2026, 8, 23), Tz::UTC)
+            .unwrap()
+            .count(),
+        3
+    );
+
+    // Wholly outside: nothing retained, nothing charged but the visit.
+    let mut outside = ExpansionBudget::default();
+    let none = expand_with(&[event], d(1800, 1, 1), d(1800, 1, 1), &mut outside).unwrap();
+    assert!(none.by_date.is_empty() && none.occurrences.is_empty());
+    assert_eq!(outside.used_source_visits(), 1);
+    assert_eq!(outside.used_occurrences(), 0);
+    assert_eq!(outside.used_retained_bytes(), 0);
+}
+
+#[test]
+fn chrono_extrema_are_intersected_without_overflow() {
+    // The whole representable calendar, queried for one day at each end and
+    // in the middle.
+    let everything = all_day(NaiveDate::MIN, NaiveDate::MAX);
+    for day in [
+        NaiveDate::MIN,
+        d(2026, 8, 21),
+        NaiveDate::MAX.pred_opt().unwrap(),
+    ] {
+        let mut budget = ExpansionBudget::default();
+        let expanded =
+            expand_with(std::slice::from_ref(&everything), day, day, &mut budget).unwrap();
+        assert_eq!(
+            expanded.by_date.keys().copied().collect::<Vec<_>>(),
+            vec![day]
+        );
+        assert_eq!(budget.used_bucket_entries(), 1);
+    }
+    // A timed span across every representable instant.
+    let timeline = CalEvent::new(
+        "t",
+        "Timeline",
+        EventTime::Instant {
+            at: DateTime::<Utc>::MIN_UTC,
+        },
+        EventTime::Instant {
+            at: DateTime::<Utc>::MAX_UTC,
+        },
+    );
+    let expanded = expand_calendar(&[timeline], d(2026, 8, 21), d(2026, 8, 21), Tz::UTC).unwrap();
+    assert_eq!(expanded.by_date.len(), 1);
+    // The final representable date is iterated without stepping past it.
+    let last = NaiveDate::MAX;
+    let dates: Vec<_> = all_day(last.pred_opt().unwrap(), last)
+        .occupied_dates_in(last.pred_opt().unwrap(), last, Tz::UTC)
+        .unwrap()
+        .collect();
+    assert_eq!(dates, vec![last.pred_opt().unwrap()], "DTEND is exclusive");
+    let point = all_day(last, last);
+    assert_eq!(
+        point
+            .occupied_dates_in(last, last, Tz::UTC)
+            .unwrap()
+            .collect::<Vec<_>>(),
+        vec![last]
+    );
+}
+
+#[test]
+fn midnight_endings_are_exclusive_but_fractions_past_it_are_not() {
+    let day = |e: CalEvent| -> Vec<NaiveDate> {
+        e.occupied_dates_in(d(2026, 8, 1), d(2026, 8, 31), Tz::UTC)
+            .unwrap()
+            .collect()
+    };
+    // All-day DTEND is exclusive.
+    assert_eq!(
+        day(all_day(d(2026, 8, 20), d(2026, 8, 22))),
+        vec![d(2026, 8, 20), d(2026, 8, 21)]
+    );
+    // A timed end at exactly 00:00 does not mark the next day...
+    let at_midnight = CalEvent::new(
+        "m",
+        "m",
+        zoned(2026, 8, 21, 22, 0, "UTC"),
+        zoned(2026, 8, 22, 0, 0, "UTC"),
+    );
+    assert_eq!(day(at_midnight), vec![d(2026, 8, 21)]);
+    // ...but half a second past midnight does.
+    let past = CalEvent::new(
+        "p",
+        "p",
+        zoned(2026, 8, 21, 22, 0, "UTC"),
+        EventTime::Zoned {
+            local: d(2026, 8, 22).and_hms_milli_opt(0, 0, 0, 500).unwrap(),
+            zone: TzRef::new("UTC"),
+        },
+    );
+    assert_eq!(day(past), vec![d(2026, 8, 21), d(2026, 8, 22)]);
+    // A zero-length event is a point on its start date, midnight included.
+    let point = CalEvent::new(
+        "z",
+        "z",
+        zoned(2026, 8, 21, 0, 0, "UTC"),
+        zoned(2026, 8, 21, 0, 0, "UTC"),
+    );
+    assert_eq!(day(point), vec![d(2026, 8, 21)]);
+    assert_eq!(
+        day(all_day(d(2026, 8, 21), d(2026, 8, 21))),
+        vec![d(2026, 8, 21)]
+    );
+}
+
+#[test]
+fn inverted_spans_are_refused_even_on_the_same_day() {
+    let same_day = CalEvent::new(
+        "i",
+        "i",
+        zoned(2026, 8, 21, 9, 0, "UTC"),
+        zoned(2026, 8, 21, 8, 0, "UTC"),
+    );
+    let dates = all_day(d(2026, 8, 22), d(2026, 8, 21));
+    let instants = CalEvent::new(
+        "x",
+        "x",
+        EventTime::Instant {
+            at: utc(2026, 8, 21, 9, 0),
+        },
+        EventTime::Instant {
+            at: utc(2026, 8, 21, 8, 59),
+        },
+    );
+    for e in [same_day, dates, instants] {
+        let mut budget = ExpansionBudget::default();
+        assert_eq!(
+            e.occurrences_bounded(d(2026, 8, 1), d(2026, 8, 31), Tz::UTC, &mut budget),
+            Err(ExpansionError::InvalidSpan)
+        );
+        // In a whole expansion the bad row is skipped and counted, never
+        // escalated into a failure of the call.
+        let expanded = expand_calendar(
+            std::slice::from_ref(&e),
+            d(2026, 8, 1),
+            d(2026, 8, 31),
+            Tz::UTC,
+        )
+        .unwrap();
+        assert_eq!(expanded.skipped, 1);
+        assert!(expanded.occurrences.is_empty());
+        // Refused even when wholly outside the window: validity is not a
+        // property of the query.
+        assert!(
+            e.occupied_dates_in(d(2030, 1, 1), d(2030, 1, 1), Tz::UTC)
+                .is_err()
+        );
+    }
+    assert_eq!(
+        expand_calendar(&[], d(2026, 8, 2), d(2026, 8, 1), Tz::UTC),
+        Err(ExpansionError::InvalidWindow)
+    );
+    assert!(
+        all_day(d(2026, 8, 1), d(2026, 8, 2))
+            .occupied_dates_in(d(2026, 8, 2), d(2026, 8, 1), Tz::UTC)
+            .is_err()
+    );
+}
+
+#[test]
+fn a_dst_gap_start_before_a_valid_end_is_a_point_not_an_error() {
+    // 02:30→03:10 is 40 minutes of wall time, but 02:30 does not exist on
+    // spring-forward day and resolves forward past the end.
+    let e = CalEvent::new(
+        "g",
+        "gap",
+        zoned(2026, 3, 8, 2, 30, "America/New_York"),
+        zoned(2026, 3, 8, 3, 10, "America/New_York"),
+    );
+    let home: Tz = "America/New_York".parse().unwrap();
+    let got: Vec<_> = e
+        .occupied_dates_in(d(2026, 3, 1), d(2026, 3, 31), home)
+        .unwrap()
+        .collect();
+    assert_eq!(got, vec![d(2026, 3, 8)]);
+}
+
+#[test]
+fn a_count_one_or_rdate_instance_from_decades_ago_still_overlaps_today() {
+    // 20 years long, ending tomorrow: today's narrow query must see it, and
+    // cheaply — without a 7,000-day walk.
+    let start = zoned(2006, 9, 18, 9, 0, "UTC");
+    let end = zoned(2026, 9, 19, 9, 0, "UTC");
+    let count_one = recurring(start.clone(), end.clone(), "FREQ=DAILY;COUNT=1");
+    let mut rdate = CalEvent::new("rd", "RDATE", start.clone(), end);
+    rdate.recurrence = Some(Recurrence {
+        rdates: vec![start],
+        ..Default::default()
+    });
+    for e in [count_one, rdate] {
+        let mut budget = ExpansionBudget::default();
+        let got = expand_with(&[e], d(2026, 9, 18), d(2026, 9, 18), &mut budget).unwrap();
+        assert_eq!(got.occurrences.len(), 1);
+        assert_eq!(got.by_date.len(), 1);
+        assert!(
+            budget.used_recurrence_work() < 100,
+            "{}",
+            budget.used_recurrence_work()
+        );
+    }
+}
+
+#[test]
+fn an_endless_rule_from_long_ago_is_fast_forwarded_to_the_window() {
+    let daily = recurring(
+        zoned(1900, 1, 1, 9, 0, "UTC"),
+        zoned(1900, 1, 1, 10, 0, "UTC"),
+        "FREQ=DAILY",
+    );
+    let hourly = recurring(
+        zoned(1990, 1, 1, 9, 0, "UTC"),
+        zoned(1990, 1, 1, 9, 30, "UTC"),
+        "FREQ=HOURLY;INTERVAL=5",
+    );
+    let mut budget = ExpansionBudget::default();
+    let got = expand_with(&[daily], d(2026, 8, 21), d(2026, 8, 21), &mut budget).unwrap();
+    assert_eq!(got.occurrences.len(), 1);
+    assert!(
+        budget.used_recurrence_work() < 100,
+        "{}",
+        budget.used_recurrence_work()
+    );
+
+    let mut budget = ExpansionBudget::default();
+    let got = expand_with(&[hourly], d(2026, 8, 21), d(2026, 8, 21), &mut budget).unwrap();
+    assert!(!got.occurrences.is_empty());
+    // Every instance lands on the rule's 5-hour grid from DTSTART.
+    let seed = d(1990, 1, 1).and_hms_opt(9, 0, 0).unwrap();
+    for o in &got.occurrences {
+        let EventTime::Zoned { local, .. } = &o.start else {
+            panic!("zoned instance expected")
+        };
+        assert_eq!(local.signed_duration_since(seed).num_hours() % 5, 0);
+    }
+    assert!(
+        budget.used_recurrence_work() < 500,
+        "{}",
+        budget.used_recurrence_work()
+    );
+}
+
+#[test]
+fn fast_forward_matches_the_full_walk() {
+    // A COUNT that never runs out forces the walk from DTSTART; without COUNT
+    // the rule is fast-forwarded. Both must agree on every window — including
+    // windows whose month precedes DTSTART's month-of-year, and DTSTARTs whose
+    // day-of-month (the 31st, Feb 29) does not exist in every period.
+    let cases = [
+        ("FREQ=MONTHLY", d(2019, 11, 15)),
+        ("FREQ=MONTHLY;INTERVAL=5;BYDAY=-1FR", d(2019, 11, 15)),
+        ("FREQ=MONTHLY", d(2019, 1, 31)),
+        ("FREQ=MONTHLY;INTERVAL=2;BYMONTHDAY=-1", d(2019, 1, 31)),
+        ("FREQ=YEARLY", d(2019, 11, 15)),
+        ("FREQ=YEARLY", d(2020, 2, 29)),
+        (
+            "FREQ=YEARLY;INTERVAL=2;BYMONTH=2;BYMONTHDAY=29",
+            d(2020, 2, 29),
+        ),
+        ("FREQ=YEARLY;BYWEEKNO=1;BYDAY=MO", d(2019, 11, 15)),
+        (
+            "FREQ=WEEKLY;INTERVAL=3;BYDAY=SU,WE;WKST=SU",
+            d(2019, 11, 15),
+        ),
+        ("FREQ=DAILY;INTERVAL=7", d(2019, 11, 15)),
+        // Sub-daily rules step the clock and fast-forward by whole steps.
+        ("FREQ=HOURLY;INTERVAL=5", d(2026, 7, 1)),
+        ("FREQ=HOURLY;INTERVAL=7;BYHOUR=9,17", d(2026, 7, 1)),
+        ("FREQ=MINUTELY;INTERVAL=25", d(2026, 7, 30)),
+    ];
+    for (rule, day) in cases {
+        let start = day.and_hms_opt(9, 0, 0).unwrap();
+        let fast = Recurrence {
+            rules: vec![RRule::parse(rule).unwrap()],
+            ..Default::default()
+        };
+        let walked = Recurrence {
+            rules: vec![RRule::parse(&format!("{rule};COUNT=100000")).unwrap()],
+            ..Default::default()
+        };
+        for (from, to) in [
+            (d(2026, 8, 1), d(2026, 8, 3)),
+            (d(2026, 2, 1), d(2026, 2, 28)),
+            (d(2025, 12, 20), d(2026, 1, 10)),
+            (d(2024, 11, 1), d(2024, 11, 30)),
+        ] {
+            if from < day {
+                continue; // before DTSTART: nothing to compare
+            }
+            let mut b1 = ExpansionBudget::default();
+            let mut b2 = ExpansionBudget::default();
+            assert_eq!(
+                recur::expand_local_bounded(&fast, start, from, to, &mut b1).unwrap(),
+                recur::expand_local_bounded(&walked, start, from, to, &mut b2).unwrap(),
+                "{rule} from {day} over {from}..{to}"
+            );
+            assert!(
+                b1.used_recurrence_work() <= b2.used_recurrence_work(),
+                "{rule} from {day}: fast-forward did more work"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_long_instance_starting_before_the_window_is_included() {
+    // Every Monday for three days: a Wednesday query must see Monday's.
+    let e = recurring(
+        zoned(2026, 8, 3, 9, 0, "UTC"),
+        zoned(2026, 8, 6, 9, 0, "UTC"),
+        "FREQ=WEEKLY",
+    );
+    let got = expand_calendar(&[e], d(2026, 8, 19), d(2026, 8, 19), Tz::UTC).unwrap();
+    assert_eq!(got.occurrences.len(), 1);
+    assert_eq!(got.occurrences[0].start, zoned(2026, 8, 17, 9, 0, "UTC"));
+}
+
+#[test]
+fn a_counted_walk_that_exceeds_the_budget_is_refused() {
+    // COUNT has to be walked from DTSTART, so a rule seeded at the dawn of the
+    // representable calendar cannot be answered within the work ceiling. That
+    // is a refusal, not a quietly shortened series.
+    let e = recurring(
+        zoned(-4000, 1, 1, 9, 0, "UTC"),
+        zoned(-4000, 1, 1, 10, 0, "UTC"),
+        "FREQ=DAILY;COUNT=4000000",
+    );
+    let mut budget = ExpansionBudget::default();
+    assert_eq!(
+        expand_with(
+            std::slice::from_ref(&e),
+            d(2026, 8, 1),
+            d(2026, 8, 31),
+            &mut budget
+        ),
+        Err(ExpansionError::Budget(ExpansionLimit::RecurrenceWork))
+    );
+    assert!(budget.used_recurrence_work() <= MAX_EXPANSION_RECURRENCE_WORK);
+    // Whole-call exhaustion is never a row-local skip.
+    assert!(!ExpansionError::Budget(ExpansionLimit::RecurrenceWork).is_row_local());
+
+    // The same shape inside the work ceiling is answered normally.
+    let recent = recurring(
+        zoned(2020, 1, 1, 9, 0, "UTC"),
+        zoned(2020, 1, 1, 10, 0, "UTC"),
+        "FREQ=DAILY;COUNT=4000000",
+    );
+    let got = expand_calendar(&[recent], d(2026, 8, 1), d(2026, 8, 31), Tz::UTC).unwrap();
+    assert_eq!(got.occurrences.len(), 31);
+}
+
+#[test]
+fn a_by_part_cross_product_is_refused_as_it_grows() {
+    // 24 × 60 × 60 candidate times per period. The ceiling here is BELOW one
+    // period's product, so passing this proves the charge lands per candidate
+    // as the product grows — an implementation that built all 86,400 and
+    // charged once per period would blow through it.
+    let mut rule = RRule::parse("FREQ=DAILY").unwrap();
+    rule.by_hour = (0..24).collect();
+    rule.by_minute = (0..60).collect();
+    rule.by_second = (0..60).collect();
+    let mut e = CalEvent::new(
+        "x",
+        "x",
+        zoned(2026, 8, 1, 0, 0, "UTC"),
+        zoned(2026, 8, 1, 0, 0, "UTC"),
+    );
+    e.recurrence = Some(Recurrence {
+        rules: vec![rule],
+        ..Default::default()
+    });
+    let mut budget = ExpansionBudget::limited(31, 1, 10_000, 1_000, 1_000, MAX_EXPANSION_BYTES);
+    assert_eq!(
+        expand_with(
+            std::slice::from_ref(&e),
+            d(2026, 8, 1),
+            d(2026, 8, 31),
+            &mut budget
+        ),
+        Err(ExpansionError::Budget(ExpansionLimit::RecurrenceWork))
+    );
+    assert!(
+        budget.used_recurrence_work() <= 10_000,
+        "charged past its ceiling: {}",
+        budget.used_recurrence_work()
+    );
+    assert_eq!(
+        budget.used_expanded_locals(),
+        0,
+        "refused inside one period"
+    );
+    // Lower bounds, because `spend` leaves the counter untouched when it
+    // refuses: an implementation that built the whole 86,400-element product
+    // and charged once per period would record a handful of units and ZERO
+    // bytes, and would sail through the upper bounds above.
+    assert!(
+        budget.used_retained_bytes() > 0,
+        "candidates were charged as they grew"
+    );
+    assert!(
+        budget.used_recurrence_work() >= 9_000,
+        "charged per candidate, not per period: {}",
+        budget.used_recurrence_work()
+    );
+
+    // Under the DEFAULT budget the same rule is refused too, and the pass's
+    // peak transient stays small: candidates and expanded locals are charged
+    // in bytes as well as work, so the vectors holding them cannot grow to
+    // the work ceiling's worth of instants.
+    let mut budget = ExpansionBudget::default();
+    assert_eq!(
+        expand_with(
+            std::slice::from_ref(&e),
+            d(2026, 8, 1),
+            d(2026, 8, 31),
+            &mut budget
+        ),
+        Err(ExpansionError::Budget(
+            ExpansionLimit::MaterializedOccurrences
+        ))
+    );
+    assert!(budget.used_expanded_locals() <= MAX_EXPANSION_OCCURRENCES);
+    assert!(
+        budget.used_retained_bytes() < 8 * 1024 * 1024,
+        "peak transient: {} bytes",
+        budget.used_retained_bytes()
+    );
+
+    // A yearly BYMONTH × BYDAY list is priced before a single period is built.
+    let mut wide = RRule::parse("FREQ=YEARLY").unwrap();
+    wide.by_month = vec![1; 4_000];
+    wide.by_day = vec![
+        ByDay {
+            nth: None,
+            weekday: Weekday::Mon,
+        };
+        4_000
+    ];
+    let rec = Recurrence {
+        rules: vec![wide],
+        ..Default::default()
+    };
+    let mut budget = ExpansionBudget::default();
+    assert_eq!(
+        recur::expand_local_bounded(
+            &rec,
+            d(2026, 1, 1).and_hms_opt(0, 0, 0).unwrap(),
+            d(2026, 1, 1),
+            d(2026, 12, 31),
+            &mut budget
+        ),
+        Err(ExpansionError::Budget(ExpansionLimit::RecurrenceWork))
+    );
+    assert_eq!(budget.used_recurrence_work(), 0, "priced before any work");
+    assert_eq!(budget.used_retained_bytes(), 0);
+}
+
+#[test]
+fn every_rdate_and_exdate_is_charged_even_outside_the_window() {
+    let far: Vec<EventTime> = (0..10_000)
+        .map(|i| EventTime::Date {
+            date: d(1900, 1, 1) + chrono::Days::new(i),
+        })
+        .collect();
+    let rec = Recurrence {
+        rules: vec![RRule::parse("FREQ=DAILY").unwrap()],
+        rdates: far.clone(),
+        exdates: far,
+    };
+    let seed = d(2026, 8, 1).and_hms_opt(9, 0, 0).unwrap();
+    let mut budget = ExpansionBudget::default();
+    recur::expand_local_bounded(&rec, seed, d(2026, 8, 1), d(2026, 8, 1), &mut budget).unwrap();
+    assert!(budget.used_recurrence_work() >= 20_000);
+    let mut small = ExpansionBudget::limited(10, 10, 19_999, 10, 10, MAX_EXPANSION_BYTES);
+    assert_eq!(
+        recur::expand_local_bounded(&rec, seed, d(2026, 8, 1), d(2026, 8, 1), &mut small),
+        Err(ExpansionError::Budget(ExpansionLimit::RecurrenceWork))
+    );
+}
+
+#[test]
+fn a_sub_daily_rule_that_would_flood_the_window_is_refused() {
+    // Every second of five months: refused on the retained-instant ceiling,
+    // which is charged per instant as the walk produces them.
+    let rec = Recurrence {
+        rules: vec![RRule::parse("FREQ=SECONDLY").unwrap()],
+        ..Default::default()
+    };
+    let mut budget = ExpansionBudget::default();
+    assert_eq!(
+        recur::expand_local_bounded(
+            &rec,
+            d(2026, 8, 1).and_hms_opt(0, 0, 0).unwrap(),
+            d(2026, 8, 1),
+            d(2026, 12, 31),
+            &mut budget
+        ),
+        Err(ExpansionError::Budget(
+            ExpansionLimit::MaterializedOccurrences
+        ))
+    );
+}
+
+#[test]
+fn oversized_rows_are_refused_even_when_outside_the_window() {
+    let mut huge = all_day(d(1800, 1, 1), d(1800, 1, 2));
+    huge.description = "x".repeat(MAX_EVENT_PAYLOAD_BYTES + 1);
+    let mut crowded = all_day(d(1800, 1, 1), d(1800, 1, 2));
+    crowded.extra = (0..=MAX_EVENT_CHILD_ENTRIES)
+        .map(|i| (i.to_string(), String::new()))
+        .collect();
+    // Recurrence children count too — including every BY* list.
+    let mut rule = RRule::parse("FREQ=DAILY").unwrap();
+    rule.by_set_pos = vec![1; MAX_EVENT_CHILD_ENTRIES];
+    let mut nested = recurring(
+        zoned(1800, 1, 1, 9, 0, "UTC"),
+        zoned(1800, 1, 1, 10, 0, "UTC"),
+        "FREQ=DAILY",
+    );
+    nested.reminders = vec![Reminder { minutes_before: 1 }];
+    nested.recurrence.as_mut().unwrap().rules = vec![rule];
+    // A zone name is part of the payload too.
+    let tz = CalEvent::new(
+        "tz",
+        "tz",
+        EventTime::Zoned {
+            local: d(1800, 1, 1).and_hms_opt(9, 0, 0).unwrap(),
+            zone: TzRef::new("z".repeat(MAX_EVENT_PAYLOAD_BYTES)),
+        },
+        zoned(1800, 1, 1, 10, 0, "UTC"),
+    );
+    for (e, limit) in [
+        (huge, ExpansionLimit::EventPayload),
+        (crowded, ExpansionLimit::EventChildren),
+        (nested, ExpansionLimit::EventChildren),
+        (tz, ExpansionLimit::EventPayload),
+    ] {
+        let mut budget = ExpansionBudget::default();
+        assert_eq!(
+            e.occurrences_bounded(d(2026, 8, 1), d(2026, 8, 31), Tz::UTC, &mut budget),
+            Err(ExpansionError::Budget(limit))
+        );
+        assert!(ExpansionError::Budget(limit).is_row_local());
+    }
+}
+
+#[test]
+fn a_row_local_defect_never_fails_the_whole_expansion() {
+    // One bad row must cost that row: the alternative blanks a month — and,
+    // because the row stays in the cache, silences reminders for good.
+    let good = |uid: &str| {
+        let mut e = all_day(d(2026, 8, 20), d(2026, 8, 21));
+        e.uid = uid.into();
+        e
+    };
+    let inverted = CalEvent::new(
+        "inverted",
+        "bad",
+        zoned(2026, 8, 20, 9, 0, "UTC"),
+        zoned(2026, 8, 20, 8, 0, "UTC"),
+    );
+    let mut huge = good("huge");
+    huge.description = "x".repeat(MAX_EVENT_PAYLOAD_BYTES + 1);
+    let mut crowded = good("crowded");
+    crowded.extra = (0..=MAX_EVENT_CHILD_ENTRIES)
+        .map(|i| (i.to_string(), String::new()))
+        .collect();
+
+    let rows = vec![good("a"), inverted, huge, crowded, good("b")];
+    let got = expand_calendar(&rows, d(2026, 8, 20), d(2026, 8, 20), Tz::UTC).unwrap();
+    assert_eq!(got.skipped, 3, "three row-local defects");
+    let uids: Vec<&str> = got.occurrences.iter().map(|e| e.uid.as_str()).collect();
+    assert_eq!(uids, vec!["a", "b"], "the readable rows still expand");
+    assert_eq!(got.by_date[&d(2026, 8, 20)].len(), 2);
+
+    // Shared-dimension exhaustion is NOT row-local: it is a property of the
+    // call and still refuses outright.
+    for limit in [
+        ExpansionLimit::WindowDays,
+        ExpansionLimit::SourceVisits,
+        ExpansionLimit::RecurrenceWork,
+        ExpansionLimit::MaterializedOccurrences,
+        ExpansionLimit::BucketEntries,
+        ExpansionLimit::RetainedBytes,
+    ] {
+        assert!(!ExpansionError::Budget(limit).is_row_local(), "{limit}");
+    }
+    assert!(!ExpansionError::Arithmetic.is_row_local());
+    assert!(!ExpansionError::InvalidWindow.is_row_local());
+    let mut budget = ExpansionBudget::limited(31, 2, 0, 2, 2, MAX_EXPANSION_BYTES);
+    assert_eq!(
+        expand_with(&rows, d(2026, 8, 20), d(2026, 8, 20), &mut budget),
+        Err(ExpansionError::Budget(ExpansionLimit::SourceVisits))
+    );
+}
+
+#[test]
+fn default_ceilings_admit_a_heavy_but_legitimate_month() {
+    // The ceilings exist to stop amplification, not to cap real calendars.
+    // `[calendar] max_events` admits 2,000 rows per account; the heaviest
+    // legitimate shape is a daily recurrence, which yields one occurrence per
+    // day of the widened (month + a week either side) window.
+    const WIDENED_DAYS: u64 = 49;
+    const ROWS: usize = 500;
+    let rows: Vec<CalEvent> = (0..ROWS)
+        .map(|i| {
+            let mut e = recurring(
+                zoned(2026, 1, 1, 9, 0, "UTC"),
+                zoned(2026, 1, 1, 10, 0, "UTC"),
+                "FREQ=DAILY",
+            );
+            e.uid = format!("daily-{i}");
+            e.title = format!("Daily {i}");
+            e
+        })
+        .collect();
+    let from = d(2026, 8, 1);
+    let to = from
+        .checked_add_days(chrono::Days::new(WIDENED_DAYS - 1))
+        .unwrap();
+    let mut budget = ExpansionBudget::default();
+    let got = expand_with(&rows, from, to, &mut budget).unwrap();
+    assert_eq!(got.occurrences.len(), ROWS * WIDENED_DAYS as usize);
+    assert_eq!(got.skipped, 0);
+
+    // 500 daily recurrences is already a heavy month; a whole admitted
+    // account of them (2,000) must still fit the counted dimensions.
+    let factor = 2_000 / ROWS;
+    assert!(budget.used_occurrences() * factor <= MAX_EXPANSION_OCCURRENCES);
+    // Expanded locals share that ceiling and are the tighter of the two: the
+    // walk looks back by the event's own duration, so it produces a few more
+    // locals than it keeps.
+    assert!(
+        budget.used_expanded_locals() * factor <= MAX_EXPANSION_OCCURRENCES,
+        "{} locals per row",
+        budget.used_expanded_locals() / ROWS
+    );
+    assert!(budget.used_bucket_entries() * factor <= MAX_EXPANSION_BUCKET_ENTRIES);
+    assert!(budget.used_recurrence_work() * factor <= MAX_EXPANSION_RECURRENCE_WORK);
+    assert!(budget.used_source_visits() * factor <= MAX_EXPANSION_SOURCE_VISITS);
+
+    // Bytes are the dimension meant to bind first, so they get BOTH a
+    // per-occurrence bound — `CalEvent` is a public plugin struct designed to
+    // gain fields, and a raw total would fail here looking like an unrelated
+    // regression — and the whole-account total DERIVED from that measured
+    // cost, because only the total says whether a saturated account still
+    // expands. Without it a new field can push production to "month
+    // unavailable, reminders stalled" while this test stays green.
+    const BYTES_PER_OCCURRENCE: usize = 1024;
+    let per = budget.used_retained_bytes() / budget.used_occurrences();
+    assert!(
+        per <= BYTES_PER_OCCURRENCE,
+        "{per} bytes per occurrence: re-derive the byte ceiling"
+    );
+    let saturated = per * 2_000 * WIDENED_DAYS as usize;
+    assert!(
+        saturated <= MAX_EXPANSION_BYTES,
+        "a saturated account needs {saturated} bytes at {per} each, past the \
+         {MAX_EXPANSION_BYTES}-byte ceiling: raise MAX_EXPANSION_BYTES (and its \
+         derivation) rather than loosening this bound"
+    );
+}
+
+#[test]
+fn unrepresentable_instance_arithmetic_is_an_error_not_a_wrap() {
+    // A daily recurrence at the end of the representable calendar: the next
+    // instance's end cannot be formed, and that is an arithmetic failure of
+    // the call, not a silently shortened event.
+    let last = NaiveDate::MAX;
+    let mut e = CalEvent::new(
+        "edge",
+        "Edge",
+        EventTime::Date {
+            date: last.pred_opt().unwrap(),
+        },
+        EventTime::Date { date: last },
+    );
+    e.recurrence = Some(Recurrence {
+        rules: vec![RRule::parse("FREQ=DAILY").unwrap()],
+        ..Default::default()
+    });
+    let mut budget = ExpansionBudget::default();
+    assert_eq!(
+        e.occurrences_bounded(
+            last.pred_opt().unwrap().pred_opt().unwrap(),
+            last,
+            Tz::UTC,
+            &mut budget
+        ),
+        Err(ExpansionError::Arithmetic)
+    );
+    assert!(!ExpansionError::Arithmetic.is_row_local());
+}
+
+#[test]
+fn a_large_multi_day_payload_is_shared_not_cloned_per_day() {
+    let mut big = all_day(d(2026, 8, 1), d(2026, 8, 31));
+    big.description = "d".repeat(512 * 1024);
+    let mut budget = ExpansionBudget::default();
+    let got = expand_with(&[big], d(2026, 8, 1), d(2026, 8, 31), &mut budget).unwrap();
+    assert_eq!(got.by_date.len(), 30);
+    assert_eq!(got.occurrences.len(), 1);
+    let one = &got.occurrences[0];
+    assert!(got.by_date.values().all(|v| Arc::ptr_eq(&v[0], one)));
+    // One payload copy is charged, not thirty.
+    assert!(budget.used_retained_bytes() < 2 * 512 * 1024);
+    assert!(budget.used_retained_bytes() > 512 * 1024);
+    assert!(one.recurrence.is_none());
+}
+
+#[test]
+fn retained_bytes_are_reserved_before_the_payload_is_cloned() {
+    let mut e = all_day(d(2026, 8, 1), d(2026, 8, 3));
+    e.description = "d".repeat(4096);
+    let mut probe = ExpansionBudget::default();
+    expand_with(&[e.clone()], d(2026, 8, 1), d(2026, 8, 31), &mut probe).unwrap();
+    let used = probe.used_retained_bytes();
+
+    let mut exact = ExpansionBudget::limited(31, 1, 0, 1, 2, used);
+    assert!(expand_with(&[e.clone()], d(2026, 8, 1), d(2026, 8, 31), &mut exact).is_ok());
+    let mut short = ExpansionBudget::limited(31, 1, 0, 1, 2, used - 1);
+    assert_eq!(
+        expand_with(&[e.clone()], d(2026, 8, 1), d(2026, 8, 31), &mut short),
+        Err(ExpansionError::Budget(ExpansionLimit::RetainedBytes))
+    );
+    // Too small for even the payload: refused before the clone, so nothing
+    // beyond the occurrence reservation is recorded.
+    let mut tiny = ExpansionBudget::limited(31, 1, 0, 1, 2, 1_000);
+    assert_eq!(
+        expand_with(&[e], d(2026, 8, 1), d(2026, 8, 31), &mut tiny),
+        Err(ExpansionError::Budget(ExpansionLimit::RetainedBytes))
+    );
+    assert_eq!(tiny.used_retained_bytes(), 0);
+}
+
+#[test]
+fn each_budget_admits_exactly_its_limit_and_refuses_one_more() {
+    let two_days = all_day(d(2026, 8, 20), d(2026, 8, 22));
+    let rows = vec![two_days.clone(), two_days.clone()];
+    let (from, to) = (d(2026, 8, 20), d(2026, 8, 21));
+    let bytes = MAX_EXPANSION_BYTES;
+    // (window, visits, work, occurrences, bucket entries) → expected refusal
+    let cases = [
+        ((2, 2, 0, 2, 4), None),
+        ((1, 2, 0, 2, 4), Some(ExpansionLimit::WindowDays)),
+        ((2, 1, 0, 2, 4), Some(ExpansionLimit::SourceVisits)),
+        (
+            (2, 2, 0, 1, 4),
+            Some(ExpansionLimit::MaterializedOccurrences),
+        ),
+        ((2, 2, 0, 2, 3), Some(ExpansionLimit::BucketEntries)),
+    ];
+    for ((w, v, r, o, b), want) in cases {
+        let mut budget = ExpansionBudget::limited(w, v, r, o, b, bytes);
+        let got = expand_with(&rows, from, to, &mut budget);
+        match want {
+            None => assert!(got.is_ok(), "{got:?}"),
+            Some(limit) => assert_eq!(got, Err(ExpansionError::Budget(limit))),
+        }
+    }
+    // Zero is zero capacity, never "unlimited".
+    let mut zero = ExpansionBudget::limited(0, 0, 0, 0, 0, 0);
+    assert_eq!(
+        expand_with(&[], from, from, &mut zero),
+        Err(ExpansionError::Budget(ExpansionLimit::WindowDays))
+    );
+    let mut work = ExpansionBudget::limited(2, 2, 0, 2, 4, bytes);
+    let daily = recurring(
+        zoned(2026, 8, 20, 9, 0, "UTC"),
+        zoned(2026, 8, 20, 10, 0, "UTC"),
+        "FREQ=DAILY",
+    );
+    assert_eq!(
+        expand_with(&[daily], from, to, &mut work),
+        Err(ExpansionError::Budget(ExpansionLimit::RecurrenceWork))
+    );
+    // The default window ceiling.
+    assert_eq!(
+        expand_calendar(&[], d(2026, 1, 1), d(2036, 1, 10), Tz::UTC),
+        Err(ExpansionError::Budget(ExpansionLimit::WindowDays))
+    );
+}
+
+#[test]
+fn the_budget_is_shared_across_many_rows() {
+    // Each row is small; together they exhaust the one budget for the call.
+    let rows: Vec<CalEvent> = (0..100)
+        .map(|i| {
+            let mut e = all_day(d(2026, 8, 20), d(2026, 8, 21));
+            e.uid = format!("row-{i}");
+            e
+        })
+        .collect();
+    let mut budget = ExpansionBudget::limited(31, 1_000, 0, 99, 1_000, MAX_EXPANSION_BYTES);
+    assert_eq!(
+        expand_with(&rows, d(2026, 8, 1), d(2026, 8, 31), &mut budget),
+        Err(ExpansionError::Budget(
+            ExpansionLimit::MaterializedOccurrences
+        ))
+    );
+    let mut enough = ExpansionBudget::limited(31, 1_000, 0, 100, 1_000, MAX_EXPANSION_BYTES);
+    let got = expand_with(&rows, d(2026, 8, 1), d(2026, 8, 31), &mut enough).unwrap();
+    assert_eq!(got.occurrences.len(), 100);
+    assert_eq!(enough.used_source_visits(), 100);
+}
+
+#[test]
+fn multi_day_buckets_share_one_occurrence_with_one_reminder() {
+    let mut event = CalEvent::new(
+        "trip",
+        "Trip",
+        zoned(2026, 8, 20, 9, 0, "UTC"),
+        zoned(2026, 8, 22, 17, 0, "UTC"),
+    );
+    event.reminders = vec![Reminder { minutes_before: 10 }];
+    let expanded = expand_calendar(&[event], d(2026, 8, 20), d(2026, 8, 22), Tz::UTC).unwrap();
+    assert_eq!(expanded.occurrences.len(), 1);
+    assert!(Arc::ptr_eq(
+        &expanded.occurrences[0],
+        &expanded.by_date[&d(2026, 8, 20)][0]
+    ));
+    assert!(Arc::ptr_eq(
+        &expanded.by_date[&d(2026, 8, 20)][0],
+        &expanded.by_date[&d(2026, 8, 22)][0]
+    ));
+    let fired = reminders::due_shared(
+        &expanded.occurrences,
+        Tz::UTC,
+        &[],
+        utc(2026, 8, 20, 8, 49).timestamp_millis(),
+        utc(2026, 8, 20, 8, 51).timestamp_millis(),
+    );
+    assert_eq!(fired.len(), 1, "the unique occurrence has one reminder");
+}
+
+#[test]
+fn expansion_errors_render_fixed_labels() {
+    assert_eq!(
+        ExpansionError::Budget(ExpansionLimit::BucketEntries).to_string(),
+        "calendar expansion budget exhausted (day entries)"
+    );
+    for (e, s) in [
+        (ExpansionError::InvalidWindow, "calendar window is invalid"),
+        (
+            ExpansionError::InvalidSpan,
+            "calendar event span is invalid",
+        ),
+        (
+            ExpansionError::Arithmetic,
+            "calendar date arithmetic overflowed",
+        ),
+    ] {
+        assert_eq!(e.to_string(), s);
+    }
+    for limit in [
+        ExpansionLimit::WindowDays,
+        ExpansionLimit::SourceVisits,
+        ExpansionLimit::RecurrenceWork,
+        ExpansionLimit::MaterializedOccurrences,
+        ExpansionLimit::RetainedBytes,
+        ExpansionLimit::EventPayload,
+        ExpansionLimit::EventChildren,
+    ] {
+        assert!(!limit.to_string().is_empty());
+    }
 }
