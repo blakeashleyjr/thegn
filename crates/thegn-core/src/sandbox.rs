@@ -1508,12 +1508,67 @@ pub fn placement_from_loc(cfg: &SandboxConfig, loc: &GitLoc) -> Placement {
 use crate::sandbox_backend::{Fallthrough, HostOs, available, pick_backend_with};
 pub use crate::sandbox_backend::{ProbePass, placement_reachable, probe_pass_guard};
 
-pub const DEFAULT_OCI_IMAGE: &str = "docker.io/library/debian:stable";
+/// The default containment image, pinned by **digest** rather than the
+/// `stable` tag it was resolved from.
+///
+/// A tag is a mutable pointer the registry owner can retarget at any time, so
+/// `debian:stable` meant the default sandbox ran whatever that name resolved to
+/// on the day it was pulled — with no record of what that was. A digest is
+/// content-addressed: the registry cannot substitute different bytes under it,
+/// and `thegn doctor` can state exactly what the containment boundary is made
+/// of.
+///
+/// This is the multi-arch OCI **index** digest (linux/amd64, arm64/v8, arm/v5,
+/// arm/v7, 386, ppc64le, riscv64, s390x), not a single platform's manifest, so
+/// every supported host still resolves its own architecture.
+///
+/// Updating it is deliberate: re-resolve the tag and record what moved.
+///
+/// ```sh
+/// # Resolves docker.io/library/debian:stable to its current index digest.
+/// skopeo inspect --raw docker://docker.io/library/debian:stable |
+///     sha256sum
+/// ```
+///
+/// The tag is kept alongside the digest (`name:tag@sha256:…`, which both
+/// Docker and Podman accept) so the reference still says what it IS. The
+/// runtime resolves the digest; the tag is documentation.
+///
+/// Pinned 2026-09-21 from `debian:stable`.
+pub const DEFAULT_OCI_IMAGE: &str = "docker.io/library/debian:stable@sha256:2bf225230f05881b6a36d20f484088f408c9a1309edc730c0bf01f15e635d411";
 
 pub(crate) fn effective_image(spec: &SandboxSpec) -> String {
     spec.image
         .clone()
         .unwrap_or_else(|| DEFAULT_OCI_IMAGE.to_string())
+}
+
+/// Whether an image reference is content-addressed (`…@sha256:…`) rather than
+/// a mutable tag.
+///
+/// A configured tag stays the user's choice, but it is a choice the rest of
+/// the system should be able to see and report, not a silent default.
+pub fn image_is_digest_pinned(image: &str) -> bool {
+    // Reuse the real reference parser rather than re-deriving digest syntax:
+    // one grammar, one place it can be wrong.
+    crate::image::ImageRef::parse(image).is_ok_and(|r| r.manifest_list_digest.is_some())
+}
+
+/// `--entrypoint` argv that neutralizes whatever ENTRYPOINT an image declares.
+///
+/// Without this the runtime PREPENDS the image's own ENTRYPOINT to the command
+/// we asked for, so `run … <image> sleep infinity` actually executes
+/// `<image-entrypoint> sleep infinity`. An image whose entrypoint is hostile —
+/// or merely a wrapper that execs something else — therefore chooses what runs
+/// inside the containment boundary, with every mount and grant the sandbox was
+/// given.
+///
+/// Naming `sleep` as the entrypoint outright is stronger than clearing it with
+/// an empty string: it is unambiguous across Docker and Podman, and the
+/// container's PID 1 is then exactly what we named regardless of image
+/// metadata.
+pub(crate) fn entrypoint_override() -> [String; 2] {
+    ["--entrypoint".into(), "sleep".into()]
 }
 
 pub fn health_check(spec: &SandboxSpec) -> bool {
@@ -1734,8 +1789,11 @@ pub fn ensure(spec: &SandboxSpec) -> anyhow::Result<()> {
         spec.name.clone(),
     ]);
     argv.extend(oci_create_opts(spec)?);
+    // Before the image: the image's own ENTRYPOINT would otherwise wrap the
+    // command below and decide what actually runs inside the sandbox.
+    argv.extend(entrypoint_override());
     argv.push(effective_image(spec));
-    argv.extend(["sleep".into(), "infinity".into()]);
+    argv.push("infinity".into());
     // Keep the create's stderr: it is the only place the runtime says WHY, and
     // for the commonest macOS failure (a bind the VM cannot resolve) it names the
     // exact path. `run_control_owned` would drop it.
@@ -1785,8 +1843,11 @@ pub fn ensure(spec: &SandboxSpec) -> anyhow::Result<()> {
             spec.name.clone(),
         ]);
         retry.extend(oci_create_opts_with_keep_id(spec, false)?);
+        // The keep-id retry is the same containment boundary; it gets the same
+        // entrypoint neutralization, not a weaker one.
+        retry.extend(entrypoint_override());
         retry.push(effective_image(spec));
-        retry.extend(["sleep".into(), "infinity".into()]);
+        retry.push("infinity".into());
         run_control_owned(spec, &retry, RUN_TIMEOUT);
         if container_status(spec).0 {
             msg::warn(

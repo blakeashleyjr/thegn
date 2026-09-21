@@ -43,8 +43,8 @@ config_enum! {
 pub struct HostConfig {
     pub reach: HostReach,
     /// Base image override (`name[:tag][@sha256:…]`); empty ⇒ the LOCAL sandbox
-    /// base (`[sandbox] image`, else the built-in `debian:stable`), transferred
-    /// to the host — see `Config::default_host_image`.
+    /// base (`[sandbox] image`, else the built-in digest-pinned `debian:stable`),
+    /// transferred to the host — see `Config::default_host_image`.
     pub image: String,
     pub install_runtime: InstallConsent,
     /// Delivery preference order (names per [`DeliveryCap::parse`]); empty ⇒
@@ -354,7 +354,8 @@ pub fn parse_host_target(
 impl Config {
     /// The base image a host delivers when `[host.<n>] image` is unset (or
     /// unparseable): the **local** sandbox base — `[sandbox] image` if set,
-    /// else the built-in `debian:stable` — so a plain `[host.*]` mirrors your
+    /// else the built-in digest-pinned `debian:stable` — so a plain `[host.*]`
+    /// mirrors your
     /// local environment onto the remote (the delivery step transfers it) and
     /// works out of the box, rather than depending on a separately-published
     /// registry image.
@@ -550,7 +551,13 @@ mod tests {
         assert_eq!(b.volumes.len(), 2, "absent volumes ⇒ default set");
         // Unset `[host.*] image` ⇒ the local sandbox base (here the built-in
         // debian, since no `[sandbox] image` is set), transferred to the host.
-        assert_eq!(b.image.name_tag(), crate::sandbox::DEFAULT_OCI_IMAGE);
+        // Compare the whole reference, not `name_tag()`: that drops the digest,
+        // so it would still pass if a remote host silently delivered a
+        // different build of the same tag than the local sandbox runs.
+        assert_eq!(
+            b.image,
+            crate::image::ImageRef::parse(crate::sandbox::DEFAULT_OCI_IMAGE).unwrap()
+        );
     }
 
     #[test]
@@ -758,8 +765,8 @@ mod tests {
             "ghcr.io/me/base:v2"
         );
         assert_eq!(
-            cfg.host_binding("b").unwrap().image.name_tag(),
-            crate::sandbox::DEFAULT_OCI_IMAGE,
+            cfg.host_binding("b").unwrap().image,
+            crate::image::ImageRef::parse(crate::sandbox::DEFAULT_OCI_IMAGE).unwrap(),
             "unparseable override warns + uses the local sandbox base"
         );
     }
@@ -781,8 +788,8 @@ mod tests {
         // and the same for an inline-ssh env with no `[host.*]`.
         let plain = cfg_from("[host.y]\nreach = \"ssh\"\n[host.y.ssh]\nhost = \"me@box\"\n");
         assert_eq!(
-            plain.host_binding("y").unwrap().image.name_tag(),
-            crate::sandbox::DEFAULT_OCI_IMAGE
+            plain.host_binding("y").unwrap().image,
+            crate::image::ImageRef::parse(crate::sandbox::DEFAULT_OCI_IMAGE).unwrap()
         );
     }
 
