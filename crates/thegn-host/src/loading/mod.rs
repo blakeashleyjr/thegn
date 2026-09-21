@@ -69,8 +69,8 @@ pub(crate) fn watchdog_should_extend(remote: bool, already_extended: bool) -> bo
 
 /// Whether a loading-step list is in the terminal "waiting on the shell" shape —
 /// sandbox + container done, the final `shell` step pending/active — as opposed to
-/// a still-live provisioning sequence (`workspace`/`clone`/`nix`/`direnv`/
-/// `devshell_push`/`setup`/`agents`/`atuin`/…). Both the materialize
+/// a still-live provisioning sequence (`workspace`/`clone`/`nix`/`setup`/
+/// `agents`/`atuin`/…). Both the materialize
 /// (`[sandbox, container, shell]`) and eager-provision streams flow through
 /// `load_steps`; the difference is the LAST step's label. Used to gate actions
 /// that must only fire once provisioning is DONE and we're merely waiting on the

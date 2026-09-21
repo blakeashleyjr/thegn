@@ -112,7 +112,10 @@ fi
             sandbox: SandboxConfig {
                 enabled: true,
                 backend,
-                backend_chain: vec!["podman-rootless".into()],
+                // The chain names the host, so an `auto` walk may land there
+                // after the stronger runtime fails (THE-418: a chain without
+                // `host` halts instead, covered in agent_tests).
+                backend_chain: vec!["podman-rootless".into(), "host".into()],
                 image: IMAGE.into(),
                 file_access: FileAccess::None,
                 auto_caches: false,

@@ -893,9 +893,10 @@ fn sandbox_limits_default_and_parse() {
 
 #[test]
 fn sandbox_warm_direnv_and_prepare_parse() {
-    // Default: warm on, no prepare hooks.
+    // Default: host warming is off, with no prepare hooks.
     let d = SandboxConfig::default();
-    assert_eq!(d.warm_direnv, WarmDirenv::Auto);
+    assert_eq!(d.warm_direnv, WarmDirenv::Off);
+    assert!(!d.warm_direnv.host_warming_enabled());
     assert!(d.prepare.is_empty());
     // Round-trips from a `[sandbox]` table, and the overlay layers them.
     let cfg: Config = toml::from_str(
@@ -903,10 +904,11 @@ fn sandbox_warm_direnv_and_prepare_parse() {
     )
     .unwrap();
     assert_eq!(cfg.sandbox.warm_direnv, WarmDirenv::AllowedOnly);
+    assert!(cfg.sandbox.warm_direnv.deprecation_warning().is_some());
     assert_eq!(cfg.sandbox.prepare, vec!["mise install", "echo hi"]);
     // Unknown value warns and falls back to the default (infallible enum).
     let cfg2: Config = toml::from_str("[sandbox]\nwarm_direnv = \"bogus\"\n").unwrap();
-    assert_eq!(cfg2.sandbox.warm_direnv, WarmDirenv::Auto);
+    assert_eq!(cfg2.sandbox.warm_direnv, WarmDirenv::Off);
     // `off` aliases.
     assert_eq!(
         WarmDirenv::from_str_validated("off").unwrap(),

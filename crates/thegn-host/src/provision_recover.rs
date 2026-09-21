@@ -123,7 +123,7 @@ pub(crate) fn step_is_fatal(step_id: &str) -> bool {
 /// (dotfiles, tools, agent configs), whose failure the user DOES want to see —
 /// their effect isn't reproduced lazily in the pane.
 pub(crate) fn step_is_warm_only(step_id: &str) -> bool {
-    matches!(step_id, "devshell" | "cache_push" | "direnv_allow")
+    matches!(step_id, "devshell" | "cache_push")
 }
 
 /// Whether a failed provisioning step likely **restarted the sandbox VM** — so
@@ -208,7 +208,7 @@ mod tests {
             assert!(step_is_fatal(id), "{id} is fatal");
             assert!(!step_is_warm_only(id), "{id} is not a warm-only");
         }
-        for id in ["devshell", "cache_push", "direnv_allow"] {
+        for id in ["devshell", "cache_push"] {
             assert!(step_is_warm_only(id), "{id} is a warm-only pre-warm");
             assert!(!step_is_fatal(id), "{id} is not fatal");
         }

@@ -59,6 +59,7 @@ pub(crate) fn maybe_materialize(
     cfg: &thegn_core::config::Config,
     tx: &MaterializeTx,
     missing: Vec<u32>,
+    target_leaves: Vec<u32>,
     name: &str,
     path: &str,
     ti: usize,
@@ -181,7 +182,7 @@ pub(crate) fn maybe_materialize(
         } else if let Some(halt) = crate::agent::env_halt_reason(&cfg, &wt) {
             // Non-local env, failover off, known-down (token unset / exec
             // cooldown): halt rather than degrade to host.
-            (Err(SpecError::Halt(halt)), Vec::new())
+            (Err(SpecError::Halt(Box::new(halt))), Vec::new())
         } else {
             // FAST PATH: claim a pre-provisioned warm spare for this
             // (repo, env) — an instant hand-over (bind + branch checkout)
@@ -253,7 +254,7 @@ pub(crate) fn maybe_materialize(
                     .map(|spec| missing.iter().map(|id| (*id, spec.clone())).collect())
                     .map_err(spec_err),
                     Err(e) => Err(match crate::handlers::provision::sandbox_halt_in(&e) {
-                        Some(h) => SpecError::Halt(h.clone()),
+                        Some(h) => SpecError::Halt(Box::new(h.clone())),
                         // `{e:#}` keeps the full cause chain (see `ensure sandbox`
                         // in agent.rs) so the provider's real failure is shown.
                         None => SpecError::Other(format!("environment setup failed: {e:#}")),
@@ -298,6 +299,7 @@ pub(crate) fn maybe_materialize(
                 group: gname,
                 worktree: wt,
                 tab: ti,
+                target_leaves,
                 origin: SpecOrigin::Materialize,
                 specs,
                 attach,
