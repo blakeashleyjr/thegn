@@ -146,3 +146,11 @@ Windows MAX_PATH headroom for in-repo checkouts.
 - `just test` (unfiltered): 8811 run, 8811 passed, 30 skipped.
 - `cargo clippy --workspace --all-targets -- -D warnings`: clean.
 - `treefmt --ci` and `just ratchets`: clean.
+
+### Post-rebase re-validation (base `8883b940`, THE-465/440/336 landed)
+
+- `just test` (unfiltered): 8926 run, 8926 passed, 30 skipped.
+- `cargo clippy --workspace --all-targets -- -D warnings`: clean.
+- `just coverage` (gate `core ≥95% lines`, 4225 tests in ONE process) was run on
+  the identical tree one base earlier (`18060ae8`); the rebase touched no file
+  it covers.
