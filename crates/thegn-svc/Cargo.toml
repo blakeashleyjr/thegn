@@ -12,7 +12,24 @@ description = "thegn native service layer: git/GitHub/ssh behind traits with CLI
 workspace = true
 [features]
 # The control-plane gRPC surface (tonic server + generated proto bindings).
-# The HTTP+WS surface is always built; gRPC is additive for external tooling.
+# The HTTP+WS surface is always built.
+#
+# NOT optional in the shipped binary, despite being a Cargo feature.
+# `thegn-host` always enables it (see its dependency line), because
+# `daemon/mod.rs` unconditionally constructs `control::grpc::GrpcControl` and
+# serves it alongside HTTP+WS, and `cmd/api.rs` registers `Surface::Grpc` in
+# the capability ledger. Neither is `#[cfg]`-guarded, so a host build without
+# this feature does not compile. `tonic`/`prost` are therefore in every build
+# of `thegn`.
+#
+# The feature is real only for a direct consumer of `thegn-svc` that is not
+# `thegn-host` — today, nobody. Making it genuinely optional means gating the
+# host's daemon/ledger code too and deciding whether external tooling may lose
+# the gRPC surface; that is THE-679 option 1, deliberately not taken.
+#
+# The lesson for THE-672 (feature-gating `iroh`): a Cargo feature is only
+# optional if EVERY first-party consumer's code is cfg-guarded behind it.
+# Declaring the feature is the easy half.
 control-grpc = ["dep:tonic", "dep:prost"]
 
 [package.metadata.cargo-machete]
