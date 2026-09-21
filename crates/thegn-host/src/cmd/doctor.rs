@@ -1619,6 +1619,7 @@ fn doctor_json_with_health_and_overrides(
         "local_control": local_control_security_json(cfg),
         "remote_control": remote_control_transport_json(cfg),
         "lifecycle_hooks": lifecycle_hooks_json(cfg),
+        "worktree_identity": worktree_identity_json(),
     })
 }
 
@@ -1675,6 +1676,60 @@ fn lifecycle_hooks_json(cfg: &Config) -> serde_json::Value {
         "repo": repo_root.map(|root| root.display().to_string()),
         "events": events,
     })
+}
+
+/// Registry rows quarantined because several worktrees claim one legacy tab
+/// name (THE-516). Such a worktree is left exactly where it is, but it is not
+/// routed by that tab, so it must be REPORTED — `thegn doctor` is the durable
+/// surface for it (the TUI shows a one-line notice at launch).
+fn worktree_identity_json() -> serde_json::Value {
+    match Db::open().and_then(|db| db.quarantined_worktree_rows()) {
+        Ok(rows) => serde_json::json!({
+            "state_db": "ok",
+            "quarantined": rows
+                .into_iter()
+                .map(|(worktree, reason)| serde_json::json!({
+                    "worktree": worktree,
+                    "reason": reason,
+                }))
+                .collect::<Vec<_>>(),
+        }),
+        Err(error) => serde_json::json!({
+            "state_db": format!("unavailable: {error}"),
+            "quarantined": Vec::<serde_json::Value>::new(),
+        }),
+    }
+}
+
+fn worktree_identity_report() {
+    let report = worktree_identity_json();
+    outln!("Worktree identity");
+    let rows = report["quarantined"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    if let Some(state) = report["state_db"].as_str()
+        && state != "ok"
+    {
+        outln!("  state DB      {state}");
+        return;
+    }
+    if rows.is_empty() {
+        outln!("  quarantined   none");
+        return;
+    }
+    outln!("  quarantined   {} worktree(s)", rows.len());
+    for row in rows {
+        outln!(
+            "    {}  ({})",
+            row["worktree"].as_str().unwrap_or_default(),
+            row["reason"].as_str().unwrap_or_default()
+        );
+    }
+    outln!(
+        "  resolve       rename one branch (`thegn wt rename`) or remove one checkout; \
+         the tab is re-keyed on the next launch"
+    );
 }
 
 fn lifecycle_hooks_report(cfg: &Config) {
@@ -1978,6 +2033,9 @@ pub fn run(
 
     outln!("");
     model_proxy_report(cfg);
+
+    outln!("");
+    worktree_identity_report();
 
     outln!("");
     lifecycle_hooks_report(cfg);

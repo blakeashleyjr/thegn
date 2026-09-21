@@ -67,6 +67,39 @@ config validate` and `thegn doctor` report such entries.
   contain what a candidate branch's own harness settings claim (that is the
   mutable-project-harness work, THE-434) — relevant to THE-233.
 
+||||||| parent of 96233600 (fix(identity): bound the capture lane, reconcile quarantine, report it)
+### Changed — worktree paths, tabs and program features are collision-proof (THE-516)
+
+- **New worktrees get a collision-resistant directory.** A checkout is now
+  `<worktrees_dir>/<repo>/<label>--<digest>` (or `<repo>/.worktrees/…` under
+  `worktree_mode = "in_repo"`), where the digest covers the repository's exact
+  Git common directory and the exact branch name. `feat/a`, `feat-a` and
+  `feat_a` used to slug to ONE directory and one tab, and two repositories
+  sharing a basename shared a parent. **Existing worktrees are never moved** —
+  they stay exactly where Git has them registered; only newly created (or
+  renamed) checkouts use the new shape.
+- **A tab is `<repo>/<exact branch>`** instead of `<repo>/<slugged branch>`,
+  so two branches can no longer land on one tab key. Existing rows keep their
+  recorded names. A branch literally named `home` renders as `home~` to avoid
+  the repo's home tab.
+- **A worktree registered under a tab that another worktree also claims is
+  quarantined**: both are left untouched on disk, neither is routed by that
+  tab, and the contested paths are reported at launch and by
+  `thegn doctor` (section "Worktree identity"). Rename one branch or remove one
+  checkout to clear it.
+- **BREAKING (CLI): `thegn wt new <name> --program <p>` no longer slugs the
+  feature name.** Program membership is exact branch equality, and slugging
+  silently federated `payments/retry`, `payments-retry` and `Payments-Retry`
+  into one cross-repo feature. A name that is not already a valid Git branch
+  name (e.g. `"Fix login bug"`) is now refused with the literal to use
+  (`fix-login-bug`); re-running with that literal attaches to the branches an
+  older thegn created under the same slug, so existing features keep working.
+- **Creation refuses a destination that already exists** instead of adopting an
+  empty directory, and says how to clear it. A rename whose `git worktree move`
+  fails rolls the branch rename back; if that rollback also fails, the split is
+  reported with a copy-pasteable recovery command instead of being reported as
+  success.
+
 ### Fixed — a project no longer resumes in a terminal
 
 - **Switching back to a project landed you in a terminal instead of your work.**

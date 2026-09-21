@@ -1086,6 +1086,11 @@ pub fn create_failure_after_add(
     if add.destination_preexisted {
         return format!("{primary}; the existing destination was left untouched");
     }
+    if add.lock_unavailable {
+        // Nothing was mutated, and a concurrent create may hold the path: a
+        // rollback here would destroy the other create's checkout/branch.
+        return format!("{primary}; nothing was created, so nothing was rolled back");
+    }
     create_failure_with_add_state(
         primary,
         cfg,

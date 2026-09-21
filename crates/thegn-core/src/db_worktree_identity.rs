@@ -501,28 +501,69 @@ impl Db {
         })
     }
 
-    /// Mark legacy registry rows as quarantined (THE-516). Only rows still in
-    /// the `legacy` state change; an already verified/quarantined row keeps
-    /// its state. Annotation only — it opens, moves and deletes nothing.
-    pub fn quarantine_legacy_worktree_rows(
+    /// Reconcile the legacy tab-ambiguity quarantine (THE-516).
+    ///
+    /// `contested` rows still in the `legacy` state are stamped
+    /// `quarantined` with `reason`; rows previously stamped with the SAME
+    /// reason that are no longer contested are returned to `legacy`. The
+    /// stamp is therefore RECONCILED, not sticky: resolving the ambiguity
+    /// (renaming a branch, removing a worktree) clears it on the next pass,
+    /// and the later legacy-admission lane never inherits a stale marker.
+    /// Annotation only — it opens, moves and deletes nothing.
+    pub fn reconcile_legacy_tab_quarantine(
         &self,
-        worktrees: &[String],
+        contested: &[String],
         reason: &str,
-    ) -> Result<usize> {
+    ) -> Result<(usize, usize)> {
         if reason.trim().is_empty() || reason.len() > MAX_REASON_BYTES {
             bail!("quarantine requires a bounded non-empty reason");
         }
         self.transaction(|db| {
-            let mut changed = 0;
-            for wt in worktrees {
-                changed += db.conn().execute(
+            let mut stamped = 0;
+            for wt in contested {
+                stamped += db.conn().execute(
                     "UPDATE worktrees SET identity_state='quarantined', quarantine_reason=?2
                       WHERE worktree=?1 AND identity_state='legacy'",
                     params![wt, reason],
                 )?;
             }
-            Ok(changed)
+            let mut cleared = 0;
+            let mut stmt = db.conn().prepare(
+                "SELECT worktree FROM worktrees
+                  WHERE identity_state='quarantined' AND quarantine_reason=?1",
+            )?;
+            let stale: Vec<String> = stmt
+                .query_map(params![reason], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+                .into_iter()
+                .filter(|wt| !contested.contains(wt))
+                .collect();
+            drop(stmt);
+            for wt in stale {
+                cleared += db.conn().execute(
+                    "UPDATE worktrees SET identity_state='legacy', quarantine_reason=NULL
+                      WHERE worktree=?1 AND identity_state='quarantined' AND quarantine_reason=?2",
+                    params![wt, reason],
+                )?;
+            }
+            Ok((stamped, cleared))
         })
+    }
+
+    /// Registry rows currently quarantined, as `(worktree path, reason)`.
+    /// Read-only: used by the startup notice and `thegn doctor` so a
+    /// quarantined worktree is reported rather than silently missing.
+    pub fn quarantined_worktree_rows(&self) -> Result<Vec<(String, String)>> {
+        let mut stmt = self.conn().prepare(
+            "SELECT worktree, COALESCE(quarantine_reason,'') FROM worktrees
+              WHERE identity_state='quarantined' ORDER BY worktree LIMIT 1024",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 
     pub fn advance_worktree_operation_revision(
@@ -699,7 +740,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_registry_rows_are_quarantined_without_being_removed() {
+    fn legacy_tab_quarantine_is_reconciled_and_never_removes_a_row() {
         use crate::store::WorkspaceStore;
         let db = Db::open_memory().unwrap();
         db.put_worktree("app/feat-a", "/r", "/wt/one", "feat/a", None, None)
@@ -708,26 +749,44 @@ mod tests {
             .unwrap();
         let contested = vec!["/wt/one".to_string(), "/wt/two".to_string()];
         assert_eq!(
-            db.quarantine_legacy_worktree_rows(&contested, "ambiguous tab")
+            db.reconcile_legacy_tab_quarantine(&contested, "ambiguous tab")
                 .unwrap(),
-            2
+            (2, 0)
         );
-        // Idempotent: already-quarantined rows are not re-stamped.
+        // Idempotent: already-quarantined rows are not re-stamped or cleared.
         assert_eq!(
-            db.quarantine_legacy_worktree_rows(&contested, "ambiguous tab")
+            db.reconcile_legacy_tab_quarantine(&contested, "ambiguous tab")
                 .unwrap(),
-            0
+            (0, 0)
         );
         assert_eq!(db.worktrees().unwrap().len(), 2, "no row is deleted");
-        let state: String = db
-            .conn()
-            .query_row(
-                "SELECT identity_state FROM worktrees WHERE worktree='/wt/one'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(state, "quarantined");
-        assert!(db.quarantine_legacy_worktree_rows(&contested, " ").is_err());
+        assert_eq!(
+            db.quarantined_worktree_rows().unwrap(),
+            vec![
+                ("/wt/one".to_string(), "ambiguous tab".to_string()),
+                ("/wt/two".to_string(), "ambiguous tab".to_string()),
+            ]
+        );
+
+        // Resolving the ambiguity (one worktree renamed away) clears the
+        // stamp for the row that is no longer contested.
+        let resolved = vec!["/wt/one".to_string()];
+        assert_eq!(
+            db.reconcile_legacy_tab_quarantine(&resolved, "ambiguous tab")
+                .unwrap(),
+            (0, 1)
+        );
+        assert_eq!(
+            db.quarantined_worktree_rows().unwrap(),
+            vec![("/wt/one".to_string(), "ambiguous tab".to_string())]
+        );
+        // A quarantine stamped for a DIFFERENT reason is left alone.
+        assert_eq!(
+            db.reconcile_legacy_tab_quarantine(&[], "other reason")
+                .unwrap(),
+            (0, 0)
+        );
+        assert_eq!(db.quarantined_worktree_rows().unwrap().len(), 1);
+        assert!(db.reconcile_legacy_tab_quarantine(&contested, " ").is_err());
     }
 }

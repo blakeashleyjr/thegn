@@ -38,7 +38,9 @@ pub fn feature_branch_name(feature: &str, branch_prefix: &str) -> Result<String,
         };
         return Err(format!(
             "feature name {feature:?} is not a literal Git branch name{hint}; \
-             feature identity is the exact branch, so it is never normalized"
+             feature identity is the exact branch, so it is never normalized. \
+             Re-run with the literal name: it attaches to branches an older \
+             thegn created under that same slug"
         ));
     }
     Ok(branch)
@@ -49,6 +51,11 @@ pub fn feature_branch_name(feature: &str, branch_prefix: &str) -> Result<String,
 pub fn is_valid_branch_name(name: &str) -> bool {
     if name.is_empty()
         || name == "@"
+        // `HEAD` (and any path whose last component is HEAD) is a pseudo-ref:
+        // Git accepts the branch but every `rev-parse`/checkout that follows
+        // is ambiguous.
+        || name == "HEAD"
+        || name.ends_with("/HEAD")
         || name.starts_with('-')
         || name.starts_with('/')
         || name.ends_with('/')

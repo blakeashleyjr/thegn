@@ -258,8 +258,10 @@ fn create_and_register(
     db: &Db,
 ) -> Result<String> {
     // THE-516: fallible identity resolution — never a basename/slug alias.
+    // The slug comes from the caller's OWN handle (`db`), not a second
+    // connection: authority must not depend on a duplicate open.
     let path = worktree::allocate_worktree_path(root, branch, cfg)?;
-    let workspace = thegn_core::repo::repo_slug_checked(root)?;
+    let workspace = thegn_core::repo::repo_slug_with_checked(db, root)?;
     let pre = crate::worktree_lifecycle::run_event_with_db(
         cfg,
         root,

@@ -487,7 +487,7 @@ fn path_mode_tag(cfg: &Config) -> &'static [u8] {
     }
 }
 
-fn checkout_parent(root: &Path, repo_dir_name: String, cfg: &Config) -> PathBuf {
+fn checkout_parent(root: &Path, repo_dir_name: &str, cfg: &Config) -> PathBuf {
     if cfg.worktree_mode == WorktreeMode::InRepo {
         root.join(".worktrees")
     } else {
@@ -496,8 +496,14 @@ fn checkout_parent(root: &Path, repo_dir_name: String, cfg: &Config) -> PathBuf 
 }
 
 /// The collision-resistant checkout directory for an exact branch of an exact
-/// repository (THE-516). Pure: the caller supplies the [`RepositoryId`]
-/// already resolved from Git.
+/// repository (THE-516).
+///
+/// Pure — no Git, no DB, no filesystem: the caller supplies both the
+/// [`RepositoryId`] and `repo_dir_name` (the readable per-repo parent
+/// component, unused in `in_repo` mode). It takes the name as a PARAMETER
+/// precisely so this stays loop-safe: resolving it from Git
+/// (`repo::repo_name`) spawns `git rev-parse --show-toplevel`, which
+/// [`allocate_worktree_path`] does off the loop.
 ///
 /// Shape: `<parent>/<label>--<digest>` where `<digest>` is the full 64-hex
 /// SHA-256 of the domain-separated `(repository id, exact branch bytes, path
@@ -509,6 +515,7 @@ fn checkout_parent(root: &Path, repo_dir_name: String, cfg: &Config) -> PathBuf 
 pub fn worktree_path_for(
     repository: &RepositoryId,
     root: &Path,
+    repo_dir_name: &str,
     branch: &str,
     cfg: &Config,
 ) -> Result<PathBuf, IdentityError> {
@@ -526,7 +533,7 @@ pub fn worktree_path_for(
         checkout_label(branch),
         crate::identity::hex_bytes(&digest)
     );
-    Ok(checkout_parent(root, repo::repo_name(root), cfg).join(leaf))
+    Ok(checkout_parent(root, repo_dir_name, cfg).join(leaf))
 }
 
 /// Resolve the repository identity from Git and allocate the checkout path
@@ -538,7 +545,9 @@ pub fn allocate_worktree_path(
     cfg: &Config,
 ) -> Result<PathBuf, IdentityError> {
     let repository = repo::repository_id(root)?;
-    worktree_path_for(&repository, root, branch, cfg)
+    // `repo_name` asks Git for the toplevel — off-loop work, which is why the
+    // pure helper takes the resolved name instead of computing it.
+    worktree_path_for(&repository, root, &repo::repo_name(root), branch, cfg)
 }
 
 /// A placeholder path for a creation that has not been allocated yet (the
@@ -562,7 +571,7 @@ pub fn provisional_worktree_path(root: &Path, branch: &str, cfg: &Config) -> Pat
         checkout_label(branch),
         crate::identity::hex_bytes(&digest)
     );
-    checkout_parent(root, repo::repo_name_from_path(root), cfg).join(leaf)
+    checkout_parent(root, &repo::repo_name_from_path(root), cfg).join(leaf)
 }
 
 /// Create a worktree. Returns false on failure (caller decides how to recover)
@@ -587,6 +596,11 @@ pub struct AddError {
     /// touch that path: it belongs to someone else (another worktree, user
     /// data, or a racing create).
     pub destination_preexisted: bool,
+    /// The repository mutation lock could not be taken, so the add was refused
+    /// before Git ran. Nothing was mutated, and no rollback may run: without
+    /// the lock a concurrent create could be mid-flight on the same path, and
+    /// a rollback would destroy ITS checkout and branch.
+    pub lock_unavailable: bool,
 }
 
 /// [`add`] with the failure reason returned instead of warned, for callers
@@ -626,19 +640,39 @@ pub fn add_checked_with_state(
         let _ = std::fs::create_dir_all(parent); // best-effort: dir prep: a later write reports the real failure
     }
     // Serialize against other thegn/agent git mutations on this repo's shared
-    // `.git` (held until the subprocess returns).
-    let _lock = util::lock_git_mutations(root);
+    // `.git` (held until the subprocess returns). Without the lock the
+    // pre-existence check below is worthless — two processes would both pass
+    // it, and the loser's rollback would remove the WINNER's checkout — so an
+    // unavailable lock refuses instead of proceeding unlocked.
+    let Some(_lock) = util::lock_git_mutations(root) else {
+        return Err(AddError {
+            message: format!(
+                "refusing to create worktree for {branch}: could not take the repository \
+                 mutation lock ({}); another thegn/agent git mutation may be in flight — retry",
+                root.join(".git/thegn-git.lock").display()
+            ),
+            branch_created: false,
+            destination_preexisted: false,
+            lock_unavailable: true,
+        });
+    };
     // A pre-created destination (directory, file or symlink — `git worktree
     // add` happily adopts an empty directory) is never reused: it may be
     // another branch's checkout, a racing create, or unrelated user data.
     if std::fs::symlink_metadata(path).is_ok() {
         return Err(AddError {
             message: format!(
-                "refusing to create worktree for {branch}: destination {} already exists",
-                path.display()
+                "refusing to create worktree for {branch}: destination {} already exists. \
+                 Inspect it, then either remove the leftover directory (after \
+                 `git -C {} worktree list` shows it unregistered and \
+                 `git -C {} worktree prune` has run) or pick another branch name",
+                path.display(),
+                root.display(),
+                root.display()
             ),
             branch_created: false,
             destination_preexisted: true,
+            lock_unavailable: false,
         });
     }
     let branch_preexisted = branch_exists(root, branch);
@@ -658,12 +692,14 @@ pub fn add_checked_with_state(
                 ),
                 branch_created: !branch_preexisted && branch_exists(root, branch),
                 destination_preexisted: false,
+                lock_unavailable: false,
             })
         }
         Err(e) => Err(AddError {
             message: format!("could not run git worktree add: {e}"),
             branch_created: !branch_preexisted && branch_exists(root, branch),
             destination_preexisted: false,
+            lock_unavailable: false,
         }),
     }
 }
@@ -828,16 +864,34 @@ pub fn rename(
     if new_branch == old_branch {
         return Ok(old_path.to_path_buf());
     }
+    // Validate before any mutation: an invalid ref would fail at `git branch
+    // -m` anyway, and a name Git accepts but we cannot round-trip has no
+    // business becoming a tab key or a path label.
+    if !crate::project::is_valid_branch_name(new_branch) {
+        return Err(format!(
+            "{new_branch:?} is not a valid Git branch name; rename refused before any change"
+        ));
+    }
     let new_path = allocate_worktree_path(root, new_branch, cfg)
         .map_err(|e| format!("cannot allocate a checkout for {new_branch}: {e}"))?;
     if let Some(parent) = new_path.parent() {
         let _ = std::fs::create_dir_all(parent); // best-effort: dir prep: a later write reports the real failure
     }
-    let _lock = util::lock_git_mutations(root);
+    // As in `add_checked_with_state`: without the lock the preflight below
+    // cannot fence a concurrent create/rename, so refuse rather than mutate.
+    let Some(_lock) = util::lock_git_mutations(root) else {
+        return Err(format!(
+            "refusing to rename {old_branch} → {new_branch}: could not take the repository \
+             mutation lock; another git mutation may be in flight — retry"
+        ));
+    };
     if std::fs::symlink_metadata(&new_path).is_ok() {
         return Err(format!(
-            "refusing to rename {old_branch} → {new_branch}: destination {} already exists",
-            new_path.display()
+            "refusing to rename {old_branch} → {new_branch}: destination {} already exists. \
+             Inspect it, then remove the leftover directory (after `git -C {} worktree prune`) \
+             or choose another name",
+            new_path.display(),
+            root.display()
         ));
     }
     if !util::git_ok(root, &["branch", "-m", old_branch, new_branch]) {
@@ -863,10 +917,19 @@ pub fn rename(
     }
     Err(format!(
         "SPLIT STATE: branch is now {new_branch} but the checkout is still at {}; \
-         restore with `git -C {} branch -m {new_branch} {old_branch}`",
+         restore with: git -C {} branch -m {} {}",
         old_path.display(),
-        root.display()
+        shell_quote(&root.to_string_lossy()),
+        shell_quote(new_branch),
+        shell_quote(old_branch)
     ))
+}
+
+/// Single-quote a value for a copy-pasteable POSIX shell recovery command.
+/// Recovery instructions carry branch names and paths that can contain
+/// spaces; an unquoted command would silently do the wrong thing.
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 #[cfg(test)]
@@ -1114,6 +1177,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&repo);
     }
 
+    #[cfg(unix)]
     #[test]
     fn porcelain_identity_parser_keeps_unix_raw_path_and_ref_bytes() {
         let porcelain = b"worktree /tmp/raw-path\r\0HEAD deadbeef\0branch refs/heads/feat/\xff\0";
@@ -1171,7 +1235,13 @@ mod tests {
         use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
         let repo = temp_repo("identity-raw-path");
-        let mut raw = format!("/tmp/thegn-raw-{}-\n", std::process::id()).into_bytes();
+        // Scratch INSIDE the per-test repo dir, so the fixture never writes a
+        // stray raw-byte path into /tmp and the repo cleanup below reclaims it
+        // even when an assertion fails.
+        let scratch = repo.join("raw");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let mut raw = scratch.as_os_str().as_bytes().to_vec();
+        raw.extend_from_slice(b"/thegn-raw-\n");
         raw.push(0xff);
         let path = PathBuf::from(std::ffi::OsString::from_vec(raw));
         assert!(
@@ -1340,7 +1410,7 @@ mod tests {
             };
             let paths: Vec<PathBuf> = branches
                 .iter()
-                .map(|b| worktree_path_for(&repository, root, b, &cfg).unwrap())
+                .map(|b| worktree_path_for(&repository, root, "app", b, &cfg).unwrap())
                 .collect();
             for (i, p) in paths.iter().enumerate() {
                 let leaf = p.file_name().unwrap().to_str().unwrap();
@@ -1351,13 +1421,13 @@ mod tests {
             // Deterministic for the same exact inputs.
             assert_eq!(
                 paths[0],
-                worktree_path_for(&repository, root, "feat/a", &cfg).unwrap()
+                worktree_path_for(&repository, root, "app", "feat/a", &cfg).unwrap()
             );
         }
         // Empty and NUL-bearing branches are typed refusals, not paths.
         let cfg = Config::default();
-        assert!(worktree_path_for(&repository, root, "", &cfg).is_err());
-        assert!(worktree_path_for(&repository, root, "a\0b", &cfg).is_err());
+        assert!(worktree_path_for(&repository, root, "app", "", &cfg).is_err());
+        assert!(worktree_path_for(&repository, root, "app", "a\0b", &cfg).is_err());
     }
 
     #[test]
@@ -1435,6 +1505,21 @@ mod tests {
         assert!(branch_exists(&repo, "old"));
         assert!(!branch_exists(&repo, "new"));
         assert!(path.is_dir());
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn rename_refuses_an_invalid_new_branch_before_touching_git() {
+        let repo = temp_repo("rename-invalid");
+        let cfg = scratch_cfg(&repo);
+        let path = allocate_worktree_path(&repo, "old", &cfg).unwrap();
+        add_checked(&repo, "old", "main", &path, &cfg).unwrap();
+        for bad in ["new branch", "x~1", "a..b", "HEAD"] {
+            let err = rename(&repo, &path, "old", bad, &cfg).unwrap_err();
+            assert!(err.contains("not a valid Git branch name"), "{bad}: {err}");
+        }
+        assert!(branch_exists(&repo, "old"), "nothing was renamed");
+        assert!(path.is_dir(), "the checkout did not move");
         let _ = std::fs::remove_dir_all(&repo);
     }
 

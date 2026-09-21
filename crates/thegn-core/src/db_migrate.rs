@@ -899,8 +899,17 @@ fn refuse_v69_rebuild_remnants(conn: &Connection) -> Result<()> {
         |row| row.get(0),
     )?;
     if remnant {
+        // This refusal also fires on the fast open path, so say exactly how to
+        // get out of it: without a recovery recipe a surviving rebuild table
+        // would read as an undiagnosable "thegn will not start".
         bail!(
-            "stale v69 ledger rebuild table is present; preserve and recover its claims before retrying"
+            "stale v69 ledger rebuild table `worktree_instances_v69_legacy` is present: a \
+             previous identity-ledger rebuild failed part-way and its claims are preserved \
+             there. Inspect them with `sqlite3 <state.db> 'SELECT * FROM \
+             worktree_instances_v69_legacy;'` (the state DB lives under \
+             $XDG_STATE_HOME/thegn/), and once every row is accounted for, clear the refusal \
+             with `sqlite3 <state.db> 'DROP TABLE worktree_instances_v69_legacy;'`. Nothing \
+             is dropped automatically: that table is the only copy of those claims."
         );
     }
     Ok(())

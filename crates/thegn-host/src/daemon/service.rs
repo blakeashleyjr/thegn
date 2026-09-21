@@ -1830,7 +1830,7 @@ impl ControlApi for DaemonService {
                 // THE-516: fallible identities — never a basename/slug alias.
                 let path = wt::allocate_worktree_path(&root, &branch, &cfg)
                     .map_err(|e| anyhow::anyhow!("worktrees.create: {e}"))?;
-                let slug = repo::repo_slug_checked(&root)
+                let slug = repo::repo_slug_with_checked(db, &root)
                     .map_err(|e| anyhow::anyhow!("worktrees.create: workspace identity unavailable: {e}"))?;
                 let pre = crate::worktree_lifecycle::run_event_with_db(
                     &cfg,

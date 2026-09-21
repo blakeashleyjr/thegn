@@ -277,22 +277,17 @@ fn dispatch_agent(ctx: &mut TrackerCtx) {
                     return;
                 }
             };
-            let slug = match repo::repo_slug_checked(&root) {
-                Ok(slug) => slug,
-                Err(e) => {
-                    thegn_core::msg::warn(&format!(
-                        "agent dispatch: workspace identity unavailable: {e}"
-                    ));
-                    return;
-                }
-            };
+            // Display label for the hook's `$THEGN_WORKSPACE`. The tab key is
+            // resolved below from the registration handle itself, so a busy
+            // second connection cannot abandon a finished checkout.
+            let hook_workspace = repo::repo_slug(&root);
 
             let pre = crate::worktree_lifecycle::run_event(
                 &cfg2,
                 &root,
                 &path,
                 &branch,
-                &slug,
+                &hook_workspace,
                 thegn_core::hooks::HookEvent::PreCreate,
                 thegn_core::hooks::HookExecutionMode::User,
             );
@@ -372,8 +367,6 @@ fn dispatch_agent(ctx: &mut TrackerCtx) {
             spec.env.push(("THEGN_ISSUE_BODY".into(), issue_body));
             spec.env.push(("THEGN_ISSUE_URL".into(), issue_url));
 
-            // `slug` was resolved (fallibly) before the create above.
-            let tab = repo::branch_tab(&slug, &branch);
             let root_s = root.to_string_lossy();
 
             // Register the dispatch in the DB. A missing/failed primary row
@@ -384,6 +377,23 @@ fn dispatch_agent(ctx: &mut TrackerCtx) {
                 Err(error) => {
                     let message = crate::worktree_lifecycle::create_failure_with_rollback(
                         format!("agent dispatch database open failed: {error}"),
+                        &cfg2,
+                        &root,
+                        &path,
+                        &branch,
+                    );
+                    thegn_core::msg::warn(&message);
+                    return;
+                }
+            };
+            // THE-516: the tab key is DB-assigned identity, resolved from the
+            // same handle that registers the row — never the unsuffixed
+            // basename fallback.
+            let tab = match repo::repo_slug_with_checked(&db, &root) {
+                Ok(slug) => repo::branch_tab(&slug, &branch),
+                Err(error) => {
+                    let message = crate::worktree_lifecycle::create_failure_with_rollback(
+                        format!("agent dispatch workspace identity unavailable: {error}"),
                         &cfg2,
                         &root,
                         &path,
@@ -417,7 +427,7 @@ fn dispatch_agent(ctx: &mut TrackerCtx) {
                     &root,
                     &path,
                     &branch,
-                    &slug,
+                    &hook_workspace,
                     Some(&db),
                     None,
                 ) {
