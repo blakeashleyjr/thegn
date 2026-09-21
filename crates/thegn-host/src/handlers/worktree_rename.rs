@@ -73,6 +73,32 @@ pub(crate) fn apply(
     region_last_w: &mut Option<String>,
     done: RenameDone,
 ) -> String {
+    apply_with(
+        session,
+        region_last_w,
+        done,
+        |old_path, new_path, tab, want| {
+            use thegn_core::store::WorkspaceStore;
+            thegn_core::db::Db::open()
+                .and_then(|db| db.rename_worktree(old_path, new_path, tab, want))
+                .map_err(|e| e.to_string())
+        },
+    )
+}
+
+/// `apply` with the registry write injected as a seam.
+///
+/// The session re-keying is pure; only the cache write touches the world. A
+/// unit test must never open the CANONICAL `$XDG_STATE_HOME/thegn/thegn.db` —
+/// doing so made these tests mutate the developer's live registry, and once the
+/// migration guard landed it made them fail outright whenever the on-disk
+/// schema trailed the build. Production passes the real DB; tests pass a stub.
+fn apply_with(
+    session: &mut Session,
+    region_last_w: &mut Option<String>,
+    done: RenameDone,
+    cache_rename: impl FnOnce(&str, &str, &str, &str) -> Result<(), String>,
+) -> String {
     let RenameDone {
         old_path,
         want,
@@ -98,14 +124,11 @@ pub(crate) fn apply(
     if region_last_w.as_deref() == Some(old_name.as_str()) {
         *region_last_w = Some(tab.clone());
     }
-    use thegn_core::store::WorkspaceStore;
     // Git already moved the worktree (it is the source of truth), so a cache
     // failure does not undo the rename — but it is reported, never swallowed
     // as success (THE-516): the registry still names the old path until the
     // next reconcile.
-    let cached = thegn_core::db::Db::open()
-        .and_then(|db| db.rename_worktree(&old_path, &new_path_s, &tab, &want));
-    match cached {
+    match cache_rename(&old_path, &new_path_s, &tab, &want) {
         Ok(()) => format!("Renamed to {want}"),
         Err(e) => format!("Renamed to {want} (registry update failed: {e})"),
     }
@@ -118,6 +141,13 @@ mod tests {
 
     fn group(name: &str, path: &str) -> WorktreeGroup {
         WorktreeGroup::new(name, GroupKind::Branch, path)
+    }
+
+    /// A registry write that succeeds without touching any database. Tests go
+    /// through `apply_with` rather than `apply` so they never open the
+    /// canonical state DB — see `apply_with`'s doc comment.
+    fn cache_ok(_old: &str, _new: &str, _tab: &str, _want: &str) -> Result<(), String> {
+        Ok(())
     }
 
     #[test]
@@ -139,7 +169,7 @@ mod tests {
             result: Ok(std::path::PathBuf::from("/wt/renamed")),
         };
         let mut bookmark = None;
-        let status = apply(&mut session, &mut bookmark, done);
+        let status = apply_with(&mut session, &mut bookmark, done, cache_ok);
         assert_eq!(status, "Renamed to renamed");
         // The correct group (found by old_path) was re-keyed, not whatever now
         // sits at the stale index.
@@ -201,9 +231,75 @@ mod tests {
             result: Ok(std::path::PathBuf::from("/wt/renamed")),
         };
         assert_eq!(
-            apply(&mut session, &mut bookmark, done),
+            apply_with(&mut session, &mut bookmark, done, cache_ok),
             "Renamed to renamed"
         );
         assert_eq!(bookmark.as_deref(), Some("repo/renamed"));
+    }
+
+    /// THE-516: a registry write that fails must be reported in the status
+    /// line, never swallowed as a clean success — git already moved the
+    /// worktree, so the session is correct while the cache still names the old
+    /// path. The seam makes this path reachable without a real database.
+    #[test]
+    fn apply_reports_registry_failure_without_undoing_the_rename() {
+        let mut session = Session {
+            worktrees: vec![group("repo/feature", "/wt/feature")],
+            ..Default::default()
+        };
+        let done = RenameDone {
+            old_path: "/wt/feature".into(),
+            want: "renamed".into(),
+            result: Ok(std::path::PathBuf::from("/wt/renamed")),
+        };
+        let mut bookmark = None;
+        let status = apply_with(&mut session, &mut bookmark, done, |_, _, _, _| {
+            Err("schema v68 → v69 refused".into())
+        });
+        assert_eq!(
+            status,
+            "Renamed to renamed (registry update failed: schema v68 → v69 refused)"
+        );
+        // The in-session re-key still happened: git is the source of truth and
+        // the cache is only a cache.
+        let g = &session.worktrees[0];
+        assert_eq!(g.name, "repo/renamed");
+        assert_eq!(g.path, "/wt/renamed");
+    }
+
+    /// The seam is handed the POST-rename identity, not the stale one — a
+    /// registry keyed on the old path is what lets the next reconcile find the
+    /// row at all.
+    #[test]
+    fn apply_hands_the_registry_both_identities() {
+        let mut session = Session {
+            worktrees: vec![group("repo/feature", "/wt/feature")],
+            ..Default::default()
+        };
+        let done = RenameDone {
+            old_path: "/wt/feature".into(),
+            want: "renamed".into(),
+            result: Ok(std::path::PathBuf::from("/wt/renamed")),
+        };
+        let mut seen = None;
+        let mut bookmark = None;
+        apply_with(&mut session, &mut bookmark, done, |old, new, tab, want| {
+            seen = Some((
+                old.to_string(),
+                new.to_string(),
+                tab.to_string(),
+                want.to_string(),
+            ));
+            Ok(())
+        });
+        assert_eq!(
+            seen,
+            Some((
+                "/wt/feature".into(),
+                "/wt/renamed".into(),
+                "repo/renamed".into(),
+                "renamed".into()
+            ))
+        );
     }
 }
