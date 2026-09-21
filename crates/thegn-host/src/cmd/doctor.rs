@@ -1727,8 +1727,8 @@ fn worktree_identity_report() {
         );
     }
     outln!(
-        "  resolve       rename one branch (`thegn wt rename`) or remove one checkout; \
-         the tab is re-keyed on the next launch"
+        "  resolve       rename one branch from the sidebar (or `git -C <repo> branch -m`) \
+         or remove one checkout with `thegn wt rm`; the tab is re-keyed on the next launch"
     );
 }
 

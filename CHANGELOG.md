@@ -67,7 +67,6 @@ config validate` and `thegn doctor` report such entries.
   contain what a candidate branch's own harness settings claim (that is the
   mutable-project-harness work, THE-434) — relevant to THE-233.
 
-||||||| parent of 96233600 (fix(identity): bound the capture lane, reconcile quarantine, report it)
 ### Changed — worktree paths, tabs and program features are collision-proof (THE-516)
 
 - **New worktrees get a collision-resistant directory.** A checkout is now
