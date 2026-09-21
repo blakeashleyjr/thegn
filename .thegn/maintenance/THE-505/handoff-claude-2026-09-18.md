@@ -221,3 +221,73 @@ the startup tests drive `ProcessAdmission` directly instead of the process
 `OnceLock`, and the config-health test no longer mutates the environment —
 the environment-layer refusal is covered by the core `rejection_detail`
 test, which uses an injected `EnvSource`.
+
+## Round-4 (review F1–F4) and the accepted decisions
+
+- **F1 (blocking) fixed.** `SECURITY_RELEVANT_ROOTS` listed `workspace`, a
+  spelling that can never reach a schema walk: `config_compat::
+normalize_project_tables` rewrites `[workspace.*]` → `[project.*]` and the
+  field is `#[serde(rename = "project", alias = "workspace")]`, so the
+  schema property is `project`. Every unknown key under the per-project
+  overlay — accounts, hooks, sandbox mounts, both queues, ci, autopilot, the
+  MCP scope ceiling, env bundles, git, editor — was only warned about. The
+  protected name is now `project` (the legacy spelling is kept for callers
+  validating a pre-normalization document), the docs are corrected, and two
+  tests cover it: one asserts `is_security_relevant_path("project.x.hooks.
+pre")` and admits real `[workspace.<slug>]` documents through
+  normalization, the other asserts no listed root is dead in the schema so a
+  future rename cannot repeat this silently.
+- **F2 fixed, polarity kept.** Added mcp, mcp_proxy, mcp_servers,
+  managed_tools, calendar, voice, pins, secrets, credentials, bundle, zone,
+  observe, weather, usage, disk — plus drawer, media and stats, which the
+  new rot guard found. The list stays a DENYLIST: the user's decision exists
+  so a table a newer build adds does not brick an older build sharing one
+  config, and an allowlist would refuse exactly that. The guard
+  (`security_relevant_roots_cover_every_executing_or_credential_table`)
+  derives the expectation from the generated schema — any root whose subtree
+  carries a command/argv, a credential, or a URL/host field must be listed —
+  so the constant cannot rot silently.
+- **F3 fixed.** A typo'd top-level security table (`[sandboxx]`, `[metric]`)
+  refuses via the walk's existing ≤2-edit nearest-key hint; a genuinely new
+  table, never within that distance, still warns.
+- **F4 fixed.** `config_resolve::explain` uses the layer policy, so it no
+  longer refuses what admission admits and validate merely warns about.
+  `cmd/config.rs`'s `config set` keeps `Reject` (refusing to WRITE a key
+  this build does not know is deliberate, and it diffs against the prior
+  file's errors so it cannot block an unrelated `config set`).
+
+### Re-bench on this HEAD (required by the review)
+
+Release builds through the lane; before = main `8883b940`, after = this
+branch; hyperfine, isolated XDG, `THEGN_NO_MIGRATE=1`:
+
+| case                                          | main            | branch          |
+| --------------------------------------------- | --------------- | --------------- |
+| `thegn --config config.toml.example recent 1` | 24.2 ± 1.1 ms   | 38.8 ± 1.0 ms   |
+| `thegn recent 1` (first run, no file)         | 19.9 ± 0.6 ms   | 22.3 ± 0.6 ms   |
+| first frame, example config (pty)             | 221.6 ± 26.1 ms | 257.6 ± 21.4 ms |
+
+N4's second validation pass did not move the numbers (round 2 measured
+23.4 → 38.7 / 19.4 → 22.3 on the same harness). **First frame stays under
+the 300 ms invariant** (257.6 ± 21.4 ms), so no exception is needed — but the
+caveats stand: a fast box, `THEGN_NO_MIGRATE=1`, and a state dir with no
+host rows, so the real path costs somewhat more. Build-time schema
+generation remains the next lever, and a re-measure with a populated host
+table is still owed.
+
+### Accepted decisions (no code)
+
+- **`doctor` is Recovery and still execs config-derived binaries**
+  (`cmd/doctor.rs:2319`, `:1101`) from an _unadmitted_ configuration. This
+  is deliberate: doctor's job is to run when the configuration is what is
+  broken, and gating it on admission would remove the tool the operator
+  needs. The exposure is bounded — doctor probes binaries the same config
+  would name anyway — and it already computes `check_sources`, so a later
+  refinement is to skip those probes with "not probed: configuration
+  refused" rather than to re-gate the verb.
+- **`config_validate::validate_normalized` runs its semantics on the
+  PRE-post-process candidate**, while admission now validates both the raw
+  and the post-processed candidate (N4). `config_startup::check_sources` is
+  therefore load-bearing: it is what keeps `config validate`/doctor in
+  agreement with startup, since the file validators alone cannot see the
+  effective candidate (or the environment layer).
