@@ -52,6 +52,19 @@ fn event(uid: &str) -> CalEvent {
     )
 }
 
+/// A complete page admitted against a private pool.
+fn page(events: Vec<CalEvent>, deleted: Vec<String>, sync_token: &str) -> EventPage {
+    EventPage::try_new(
+        events,
+        deleted,
+        sync_token,
+        &thegn_svc::calendar::AccountAdmission::isolated(
+            thegn_core::calendar::AdmissionBudget::default(),
+        ),
+    )
+    .unwrap()
+}
+
 fn window() -> (NaiveDate, NaiveDate) {
     (d(2026, 8, 1), d(2026, 8, 31))
 }
@@ -62,10 +75,7 @@ fn an_empty_full_fetch_does_not_erase_a_populated_cache() {
     // wipe a month of meetings. Unlike an error, nothing else would warn.
     let t = TmpDb::new("empty");
     let (from, to) = window();
-    let full = EventPage {
-        events: vec![event("e1")],
-        ..Default::default()
-    };
+    let full = page(vec![event("e1")], vec![], "");
     assert!(apply_page(&t.db, "work", "ics_url", &full, from, to));
     assert!(t.db.has_calendar_events("work").unwrap());
 
@@ -111,21 +121,13 @@ fn a_304_advances_the_stamp_without_touching_the_events() {
         &t.db,
         "work",
         "ics_url",
-        &EventPage {
-            events: vec![event("e1")],
-            sync_token: "etag-1".into(),
-            ..Default::default()
-        },
+        &page(vec![event("e1")], vec![], "etag-1"),
         from,
         to,
     );
     let before = t.db.get_calendar_sync("work").unwrap().unwrap().fetched_at;
 
-    let not_modified = EventPage {
-        sync_token: "etag-1".into(),
-        unchanged: true,
-        ..Default::default()
-    };
+    let not_modified = EventPage::unchanged("etag-1");
     assert!(
         !apply_page(&t.db, "work", "ics_url", &not_modified, from, to),
         "nothing changed, so no repaint"
@@ -144,10 +146,7 @@ fn an_incremental_page_applies_deltas_and_tombstones() {
         &t.db,
         "work",
         "caldav",
-        &EventPage {
-            events: vec![event("a"), event("b")],
-            ..Default::default()
-        },
+        &page(vec![event("a"), event("b")], vec![], ""),
         from,
         to,
     );
@@ -162,12 +161,7 @@ fn an_incremental_page_applies_deltas_and_tombstones() {
         &t.db,
         "work",
         "caldav",
-        &EventPage {
-            events: vec![updated],
-            deleted: vec!["b".into()],
-            sync_token: "tok-2".into(),
-            ..Default::default()
-        },
+        &page(vec![updated], vec!["b".into()], "tok-2"),
         from,
         to,
     );
@@ -190,10 +184,7 @@ fn a_full_fetch_replaces_rather_than_merging() {
         &t.db,
         "work",
         "ics",
-        &EventPage {
-            events: vec![event("a"), event("b")],
-            ..Default::default()
-        },
+        &page(vec![event("a"), event("b")], vec![], ""),
         from,
         to,
     );
@@ -201,10 +192,7 @@ fn a_full_fetch_replaces_rather_than_merging() {
         &t.db,
         "work",
         "ics",
-        &EventPage {
-            events: vec![event("c")],
-            ..Default::default()
-        },
+        &page(vec![event("c")], vec![], ""),
         from,
         to,
     );
@@ -226,10 +214,7 @@ fn a_recurrence_master_is_flagged_so_the_range_query_keeps_it() {
         &t.db,
         "work",
         "ics",
-        &EventPage {
-            events: vec![recurring, event("once")],
-            ..Default::default()
-        },
+        &page(vec![recurring, event("once")], vec![], ""),
         from,
         to,
     );
@@ -249,10 +234,7 @@ fn an_undeserializable_row_is_skipped_not_fatal() {
         &t.db,
         "work",
         "ics",
-        &EventPage {
-            events: vec![event("good")],
-            ..Default::default()
-        },
+        &page(vec![event("good")], vec![], ""),
         from,
         to,
     );
@@ -329,7 +311,7 @@ fn remote_transport_failures_persist_only_redacted_calendar_diagnostics() {
         ..CalendarConfig::default()
     };
     let (from, to) = window();
-    assert!(!sync_accounts(&t.db, &cfg, from, to, true));
+    assert!(!sync_accounts(&t.db, &cfg, from, to, true, &mut |_| {}));
     let sync = t.db.get_calendar_sync("remote").unwrap().unwrap();
     assert!(sync.last_error.contains("calendar destination refused"));
     assert!(!sync.last_error.contains("subscription-secret"));
@@ -346,10 +328,7 @@ fn an_empty_full_fetch_also_throttles_its_retry() {
         &t.db,
         "work",
         "ics_url",
-        &EventPage {
-            events: vec![event("e1")],
-            ..Default::default()
-        },
+        &page(vec![event("e1")], vec![], ""),
         from,
         to,
     );
@@ -371,4 +350,131 @@ fn reminders_are_inert_without_configuration() {
     assert!(due_reminders(&off, 0).is_empty());
     let no_sources = CalendarConfig::default();
     assert!(due_reminders(&no_sources, 0).is_empty());
+}
+
+#[test]
+fn an_over_budget_source_keeps_the_prior_cache_and_cursor() {
+    // Truncating and publishing would replace the whole account with a prefix
+    // and advance the cursor past the events that were cut — lost for good.
+    // Overflow must instead leave both untouched and say why.
+    let t = TmpDb::new("over-budget");
+    let (from, to) = window();
+    apply_page(
+        &t.db,
+        "work",
+        "ics",
+        &page(vec![event("keep-1"), event("keep-2")], vec![], "cursor-1"),
+        from,
+        to,
+    );
+    let mut feed = String::from("BEGIN:VCALENDAR\r\n");
+    for i in 0..5 {
+        feed.push_str(&format!(
+            "BEGIN:VEVENT\r\nUID:new{i}\r\nDTSTART:20260821T090000Z\r\nEND:VEVENT\r\n"
+        ));
+    }
+    feed.push_str("END:VCALENDAR\r\n");
+    let file = t.dir.join("feed.ics");
+    std::fs::write(&file, feed).unwrap();
+    let cfg = CalendarConfig {
+        max_events: 3,
+        accounts: vec![thegn_core::config_calendar::CalendarAccount {
+            name: "work".into(),
+            provider: thegn_core::config_calendar::CalendarProviderKind::Ics,
+            path: file.display().to_string(),
+            ..Default::default()
+        }],
+        ..CalendarConfig::default()
+    };
+    let mut toasts = Vec::new();
+    assert!(!sync_accounts(&t.db, &cfg, from, to, true, &mut |m| {
+        toasts.push(m)
+    }));
+    // The refusal is visible: one toast naming the account and the knob.
+    assert_eq!(toasts.len(), 1, "{toasts:?}");
+    assert!(toasts[0].contains("\"work\""), "{toasts:?}");
+    assert!(toasts[0].contains("max_events"), "{toasts:?}");
+    // The same condition on the next sync is not re-announced.
+    assert!(!sync_accounts(&t.db, &cfg, from, to, true, &mut |m| {
+        toasts.push(m)
+    }));
+    assert_eq!(toasts.len(), 1, "{toasts:?}");
+    let mut uids: Vec<_> = load_cached(&t.db, from, to)
+        .into_iter()
+        .map(|e| e.uid)
+        .collect();
+    uids.sort();
+    assert_eq!(uids, vec!["keep-1", "keep-2"]);
+    let sync = t.db.get_calendar_sync("work").unwrap().unwrap();
+    assert_eq!(sync.sync_token, "cursor-1", "the cursor must not advance");
+    assert!(sync.last_error.contains("max_events"), "{sync:?}");
+
+    // Within the budget the same source replaces the cache normally.
+    let cfg = CalendarConfig {
+        max_events: 5,
+        ..cfg
+    };
+    assert!(sync_accounts(&t.db, &cfg, from, to, true, &mut |_| {}));
+    assert_eq!(load_cached(&t.db, from, to).len(), 5);
+}
+
+#[test]
+fn a_contention_refusal_backs_the_account_off_instead_of_stamping_it() {
+    // A shared-budget refusal records nothing in the DB (a stamp would look
+    // like an attempt and hold the account back for `ttl_secs`), so the
+    // backoff is what stops every popup open re-fetching it.
+    let account = format!("contended-{}", std::process::id());
+    let now = thegn_core::util::now();
+    assert!(!contention_backoff(&account, now));
+    note_contention(&account, now);
+    assert!(contention_backoff(&account, now));
+    assert!(contention_backoff(
+        &account,
+        now + CONTENTION_BACKOFF_SECS - 1
+    ));
+    // Once it lapses the account is eligible again, and the entry is dropped.
+    assert!(!contention_backoff(&account, now + CONTENTION_BACKOFF_SECS));
+    assert!(
+        !contention_seen()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&account)
+    );
+}
+
+#[test]
+fn a_contention_refusal_leaves_the_accounts_record_untouched() {
+    let t = TmpDb::new("contention-record");
+    let (from, to) = window();
+    // A pid-scoped name: the backoff map is process-wide, and `just coverage`
+    // runs the whole suite in ONE process, so a literal name could couple this
+    // test to another if a panic skipped its cleanup.
+    let account = format!("contended-record-{}", std::process::id());
+    apply_page(
+        &t.db,
+        &account,
+        "ics_url",
+        &page(vec![event("e1")], vec![], "cursor-1"),
+        from,
+        to,
+    );
+    let before = t.db.get_calendar_sync(&account).unwrap().unwrap();
+    let mut toasts = Vec::new();
+    record_failure(
+        &t.db,
+        &account,
+        "ics_url",
+        &CalendarError::Admission(thegn_core::calendar::AdmissionError::new(
+            thegn_core::calendar::AdmissionLimit::GlobalBytes,
+        )),
+        &BTreeMap::new(),
+        &mut |m| toasts.push(m),
+    );
+    let after = t.db.get_calendar_sync(&account).unwrap().unwrap();
+    assert_eq!(after.fetched_at, before.fetched_at, "no attempt stamp");
+    assert_eq!(after.sync_token, "cursor-1");
+    assert!(after.last_error.is_empty(), "{after:?}");
+    assert!(toasts.is_empty(), "contention is not the user's problem");
+    // …but the account is backed off, so the popup won't re-fetch it.
+    assert!(contention_backoff(&account, thegn_core::util::now()));
 }

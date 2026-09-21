@@ -13,6 +13,10 @@ use std::collections::BTreeMap;
 
 use chrono::NaiveDate;
 
+use super::admission::{
+    AdmissionBudget, AdmissionError, AdmissionLimit, AdmissionMeter, ENTRY_OVERHEAD,
+    MAX_COMPONENT_DEPTH, MAX_LINE_BYTES,
+};
 use super::recur::{RRule, Recurrence, parse_ics_datetime};
 use super::{CalEvent, EventStatus, EventTime, Reminder, TzRef};
 
@@ -29,19 +33,119 @@ pub struct ContentLine {
 ///
 /// Feeds wrap at 75 octets mid-word (and mid-UTF-8-sequence), so unfolding
 /// before anything else is what stops long summaries and URLs being mangled.
+///
+/// Materializes every line; the parser itself uses the bounded, borrowing
+/// [`LogicalLines`] instead. Kept for fixtures and tests.
 pub fn unfold(input: &str) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    for raw in input.split('\n') {
-        let line = raw.strip_suffix('\r').unwrap_or(raw);
-        if let Some(rest) = line.strip_prefix([' ', '\t'])
-            && let Some(last) = out.last_mut()
-        {
-            last.push_str(rest);
-            continue;
-        }
-        out.push(line.to_string());
+    LogicalLines::new(input)
+        .map(|l| l.text().into_owned())
+        .collect()
+}
+
+/// One unfolded content line, still borrowed from the document.
+#[derive(Debug, Clone, Copy)]
+pub struct RawLine<'a> {
+    /// The raw span from the first physical line through its last
+    /// continuation, fold markers included.
+    span: &'a str,
+    /// The first physical line (no terminator).
+    first: &'a str,
+    /// Unfolded length in bytes, known before anything is allocated.
+    len: usize,
+    folded: bool,
+}
+
+impl<'a> RawLine<'a> {
+    /// Unfolded length in bytes.
+    pub fn len(&self) -> usize {
+        self.len
     }
-    out
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// The property name as far as the first physical line shows it,
+    /// uppercased — enough to classify an oversized line without unfolding it.
+    fn name_hint(&self) -> Option<String> {
+        let end = self.first.find([';', ':'])?;
+        Some(self.first[..end].trim().to_ascii_uppercase())
+    }
+
+    /// The unfolded text. Borrowed unless the line was actually folded; the
+    /// owned case allocates exactly [`Self::len`] bytes.
+    pub fn text(&self) -> std::borrow::Cow<'a, str> {
+        if !self.folded {
+            return std::borrow::Cow::Borrowed(self.first);
+        }
+        let mut out = String::with_capacity(self.len);
+        for (i, raw) in self.span.split('\n').enumerate() {
+            let line = raw.strip_suffix('\r').unwrap_or(raw);
+            if i == 0 {
+                out.push_str(line);
+            } else {
+                // Continuations start with exactly one space or tab.
+                out.push_str(&line[1..]);
+            }
+        }
+        std::borrow::Cow::Owned(out)
+    }
+}
+
+/// Incremental unfolding: yields one logical line at a time without copying
+/// the document, so the parser can size a line before it allocates it.
+#[derive(Debug, Clone)]
+pub struct LogicalLines<'a> {
+    rest: Option<&'a str>,
+}
+
+impl<'a> LogicalLines<'a> {
+    pub fn new(input: &'a str) -> Self {
+        LogicalLines { rest: Some(input) }
+    }
+}
+
+/// Split off one physical line: `(line without terminator, remainder)`.
+fn physical(s: &str) -> (&str, Option<&str>) {
+    match s.find('\n') {
+        Some(i) => {
+            let line = &s[..i];
+            (line.strip_suffix('\r').unwrap_or(line), Some(&s[i + 1..]))
+        }
+        None => (s.strip_suffix('\r').unwrap_or(s), None),
+    }
+}
+
+impl<'a> Iterator for LogicalLines<'a> {
+    type Item = RawLine<'a>;
+
+    fn next(&mut self) -> Option<RawLine<'a>> {
+        let start = self.rest?;
+        let (first, mut after) = physical(start);
+        let mut len = first.len();
+        let mut folded = false;
+        // Byte offset in `start` just past the last line of this logical line
+        // (before its terminator).
+        let mut end = first.len();
+        while let Some(r) = after
+            && r.starts_with([' ', '\t'])
+        {
+            let (cont, next) = physical(r);
+            let offset = start.len() - r.len();
+            end = offset + cont.len();
+            // Every byte of a continuation but its leading fold marker.
+            len = len.saturating_add(cont.len() - 1);
+            folded = true;
+            after = next;
+        }
+        self.rest = after;
+        Some(RawLine {
+            span: &start[..end],
+            first,
+            len,
+            folded,
+        })
+    }
 }
 
 /// Split a content line into name, parameters, and value.
@@ -155,56 +259,170 @@ pub fn parse_time(line: &ContentLine, default_zone: &str) -> Option<EventTime> {
 ///
 /// `default_zone` anchors floating times that name no `TZID`. Components other
 /// than `VEVENT` (todos, journals, timezone definitions) are skipped.
+///
+/// A convenience for fixtures and tests: it meters against a private pool at
+/// the default budget and returns nothing on overflow. Every production source
+/// parses through [`parse_ics_admitted`] with its account's meter instead.
 pub fn parse_ics(input: &str, default_zone: &str) -> Vec<CalEvent> {
+    let mut meter = AdmissionMeter::isolated(AdmissionBudget::default());
     let mut out = Vec::new();
+    match parse_ics_admitted(input, default_zone, &mut meter, &mut out) {
+        Ok(()) => out,
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Retained VEVENT properties. Anything else is dropped by [`Builder::property`],
+/// so an oversized line naming it can be skipped without being unfolded.
+fn is_retained_property(name: &str) -> bool {
+    matches!(
+        name,
+        "UID"
+            | "SUMMARY"
+            | "DESCRIPTION"
+            | "LOCATION"
+            | "URL"
+            | "CATEGORIES"
+            | "ORGANIZER"
+            | "STATUS"
+            | "DTSTART"
+            | "DTEND"
+            | "DURATION"
+            | "RRULE"
+            | "RDATE"
+            | "EXDATE"
+            | "LAST-MODIFIED"
+            | "DTSTAMP"
+    ) || name.starts_with("X-")
+}
+
+/// Parse `input` into `out`, charging `meter` for everything retained.
+///
+/// Admission happens *during* parsing: each logical line is sized before it is
+/// unfolded, each retained value is charged before it is stored, and each event
+/// is admitted as a record before its [`CalEvent`] is built. Overflow returns
+/// the typed error at that point — `out` then holds a prefix the caller must
+/// discard, never publish.
+pub fn parse_ics_admitted(
+    input: &str,
+    default_zone: &str,
+    meter: &mut AdmissionMeter,
+    out: &mut Vec<CalEvent>,
+) -> Result<(), AdmissionError> {
+    parse_ics_window(input, default_zone, None, meter, out)
+}
+
+/// [`parse_ics_admitted`], admitting only events that can occur within
+/// `window` (inclusive dates, with two days of slack each side for zones).
+///
+/// A whole-document feed (a subscribed or local `.ics`) routinely carries
+/// years of history. Counting all of it against `max_events` would refuse
+/// calendars whose relevant part is small, so events that provably cannot
+/// touch the window — a one-off that ends before it or starts after it, a
+/// series whose `UNTIL` (plus the event's own length) ends before it — are
+/// parsed, released, and not admitted. Anything that might reach the window
+/// (a `COUNT` or open-ended rule, an RDATE inside it) is admitted.
+pub fn parse_ics_window(
+    input: &str,
+    default_zone: &str,
+    window: Option<(NaiveDate, NaiveDate)>,
+    meter: &mut AdmissionMeter,
+    out: &mut Vec<CalEvent>,
+) -> Result<(), AdmissionError> {
     let mut cur: Option<Builder> = None;
-    // Depth of nested non-VEVENT components (notably VALARM inside VEVENT, and
-    // VTIMEZONE's STANDARD/DAYLIGHT), so their properties don't leak into the
-    // event being built.
-    let mut nested: Vec<String> = Vec::new();
+    // Nested non-VEVENT components inside the event being built (notably
+    // VALARM, and VTIMEZONE's STANDARD/DAYLIGHT), so their properties don't
+    // leak into it. Only "is this a VALARM" is ever consulted, so that is all
+    // that is kept — the depth is capped, not the names.
+    let mut nested: Vec<bool> = Vec::new();
     let mut cal_name = String::new();
 
-    for raw in unfold(input) {
-        let Some(line) = parse_line(&raw) else {
+    for raw in LogicalLines::new(input) {
+        if raw.len() > MAX_LINE_BYTES {
+            // Classify from the first physical line without unfolding.
+            let hint = raw.name_hint();
+            let in_event = cur.is_some();
+            let in_alarm = nested.last().copied().unwrap_or(false);
+            let retained = match hint.as_deref() {
+                _ if !in_event => hint.as_deref() == Some("X-WR-CALNAME"),
+                // Inside an event, a line whose name is itself folded can't be
+                // classified, and an oversized BEGIN/END would desynchronize
+                // the component stack if skipped — refuse rather than guess.
+                None | Some("BEGIN") | Some("END") => true,
+                Some(n) if nested.is_empty() => is_retained_property(n),
+                Some(n) => in_alarm && n == "TRIGGER",
+            };
+            if retained {
+                return Err(AdmissionError::new(if in_event {
+                    AdmissionLimit::EventBytes
+                } else {
+                    AdmissionLimit::LineBytes
+                }));
+            }
+            // Not a value we keep: skip it without allocating.
+            continue;
+        }
+        let text = raw.text();
+        let Some(line) = parse_line(&text) else {
             continue;
         };
-        match (line.name.as_str(), line.value.to_ascii_uppercase().as_str()) {
-            ("BEGIN", "VEVENT") => {
+        match line.name.as_str() {
+            "BEGIN" if line.value.eq_ignore_ascii_case("VEVENT") => {
+                meter.begin_event();
+                meter.charge_event(2 * std::mem::size_of::<CalEvent>(), 0)?;
                 cur = Some(Builder::default());
                 nested.clear();
                 continue;
             }
-            ("END", "VEVENT") => {
-                if let Some(b) = cur.take()
-                    && let Some(mut e) = b.finish(default_zone)
-                {
-                    e.calendar = cal_name.clone();
-                    out.push(e);
+            "END" if line.value.eq_ignore_ascii_case("VEVENT") => {
+                match cur.take() {
+                    Some(b) if window.is_some_and(|w| !b.may_occur_in(w)) => {
+                        // Parsed within the per-event ceilings, but outside
+                        // the sync window: released, never admitted.
+                        meter.abandon_event();
+                    }
+                    Some(b) if b.start.is_some() => {
+                        // The calendar name is copied into every event, and a
+                        // synthesized UID is built — both are charged first.
+                        let extra =
+                            cal_name.len() + if b.uid.is_empty() { ENTRY_OVERHEAD } else { 0 };
+                        meter.charge_event(extra, 0)?;
+                        meter.admit_event()?;
+                        if let Some(mut e) = b.finish(default_zone) {
+                            e.calendar = cal_name.clone();
+                            out.push(e);
+                        }
+                    }
+                    _ => meter.abandon_event(),
                 }
                 continue;
             }
-            ("BEGIN", other) => {
+            "BEGIN" => {
                 if cur.is_some() {
-                    nested.push(other.to_string());
+                    if nested.len() >= MAX_COMPONENT_DEPTH {
+                        return Err(AdmissionError::new(AdmissionLimit::Nesting));
+                    }
+                    nested.push(line.value.eq_ignore_ascii_case("VALARM"));
                 }
                 continue;
             }
-            ("END", _) => {
+            "END" => {
                 nested.pop();
                 continue;
             }
             _ => {}
         }
         if line.name == "X-WR-CALNAME" && cur.is_none() {
-            cal_name = line.value.clone();
+            cal_name = line.value;
             continue;
         }
         let Some(b) = cur.as_mut() else { continue };
         // Inside a VALARM: pick up the reminder trigger, ignore everything else.
-        if nested.last().is_some_and(|n| n == "VALARM") {
+        if nested.last().copied().unwrap_or(false) {
             if line.name == "TRIGGER"
                 && let Some(mins) = parse_trigger_minutes(&line.value)
             {
+                meter.charge_event(ENTRY_OVERHEAD, 1)?;
                 b.reminders.push(Reminder {
                     minutes_before: mins,
                 });
@@ -214,9 +432,11 @@ pub fn parse_ics(input: &str, default_zone: &str) -> Vec<CalEvent> {
         if !nested.is_empty() {
             continue;
         }
-        b.property(&line);
+        b.property(&line, meter)?;
     }
-    out
+    // A document that ends mid-event keeps nothing of it.
+    meter.abandon_event();
+    Ok(())
 }
 
 /// `-PT15M` / `-PT1H` / `-P1D` → minutes before. A positive (after-start)
@@ -288,16 +508,88 @@ struct Builder {
     extra: BTreeMap<String, String>,
 }
 
+/// The calendar date a time falls on (its local date; UTC for an instant).
+fn day_of(t: &EventTime) -> NaiveDate {
+    match t {
+        EventTime::Date { date } => *date,
+        EventTime::Zoned { local, .. } => local.date(),
+        EventTime::Instant { at } => at.date_naive(),
+    }
+}
+
 impl Builder {
-    fn property(&mut self, line: &ContentLine) {
+    /// Whether any occurrence of this event can touch `[from, to]`. Errs on
+    /// the side of "yes": only provably-outside events are excluded.
+    fn may_occur_in(&self, (from, to): (NaiveDate, NaiveDate)) -> bool {
+        let Some(start) = self.start.as_ref().map(day_of) else {
+            return false;
+        };
+        // Two days of slack each side: the same instant can land two calendar
+        // days apart between the extreme zones (UTC+14 vs UTC-12), so a
+        // narrower margin could exclude an event the expansion would place
+        // inside the window.
+        let slack = chrono::Duration::days(2);
+        let lo = from.checked_sub_signed(slack).unwrap_or(NaiveDate::MIN);
+        let hi = to.checked_add_signed(slack).unwrap_or(NaiveDate::MAX);
+        // The event's own length in days, so a long occurrence that starts
+        // before the window but ends inside it still counts.
+        let end = self.end.as_ref().map(day_of).unwrap_or_else(|| {
+            let extra = self.duration.map_or(0, |d| d.num_days()).max(0) + 1;
+            start
+                .checked_add_signed(chrono::Duration::days(extra))
+                .unwrap_or(NaiveDate::MAX)
+        });
+        let span = chrono::Duration::days((end - start).num_days().max(0));
+        let reaches =
+            |d: NaiveDate| d <= hi && d.checked_add_signed(span).unwrap_or(NaiveDate::MAX) >= lo;
+        if self.rdates.iter().any(|t| reaches(day_of(t))) || reaches(start) {
+            return true;
+        }
+        if self.rrules.is_empty() || start > hi {
+            return false;
+        }
+        // A rule only ends provably before the window through UNTIL.
+        self.rrules.iter().any(|r| match r.until {
+            None => true,
+            Some(u) => u.date().checked_add_signed(span).unwrap_or(NaiveDate::MAX) >= lo,
+        })
+    }
+
+    /// Record one property, charging `meter` for what it retains first.
+    fn property(
+        &mut self,
+        line: &ContentLine,
+        meter: &mut AdmissionMeter,
+    ) -> Result<(), AdmissionError> {
+        let text = line.value.len() + ENTRY_OVERHEAD;
+        let tz = line.params.get("TZID").map_or(0, String::len);
         match line.name.as_str() {
-            "UID" => self.uid = line.value.clone(),
-            "SUMMARY" => self.summary = line.value.clone(),
-            "DESCRIPTION" => self.description = line.value.clone(),
-            "LOCATION" => self.location = line.value.clone(),
-            "URL" => self.url = line.value.clone(),
-            "CATEGORIES" => self.categories = line.value.clone(),
+            "UID" => {
+                meter.charge_event(text, 0)?;
+                self.uid = line.value.clone();
+            }
+            "SUMMARY" => {
+                meter.charge_event(text, 0)?;
+                self.summary = line.value.clone();
+            }
+            "DESCRIPTION" => {
+                meter.charge_event(text, 0)?;
+                self.description = line.value.clone();
+            }
+            "LOCATION" => {
+                meter.charge_event(text, 0)?;
+                self.location = line.value.clone();
+            }
+            "URL" => {
+                meter.charge_event(text, 0)?;
+                self.url = line.value.clone();
+            }
+            "CATEGORIES" => {
+                meter.charge_event(text, 0)?;
+                self.categories = line.value.clone();
+            }
             "ORGANIZER" => {
+                meter.charge_event(text, 0)?;
                 self.organizer = line
                     .value
                     .trim()
@@ -312,16 +604,46 @@ impl Builder {
                     _ => Some(EventStatus::Confirmed),
                 }
             }
-            "DTSTART" => self.start = parse_time(line, ""),
-            "DTEND" => self.end = parse_time(line, ""),
+            "DTSTART" => {
+                meter.charge_event(tz + ENTRY_OVERHEAD, 0)?;
+                self.start = parse_time(line, "");
+            }
+            "DTEND" => {
+                meter.charge_event(tz + ENTRY_OVERHEAD, 0)?;
+                self.end = parse_time(line, "");
+            }
             "DURATION" => self.duration = parse_duration(&line.value),
             "RRULE" => {
+                // A rule's BY* lists are at most one entry per comma, each at
+                // most 8 bytes — charged before the rule is parsed.
+                let parts = line.value.matches(',').count() + 1;
+                meter.charge_event(
+                    std::mem::size_of::<RRule>()
+                        .saturating_add(parts.saturating_mul(8))
+                        .saturating_add(ENTRY_OVERHEAD),
+                    parts.saturating_add(1),
+                )?;
                 if let Ok(r) = RRule::parse(&line.value) {
                     self.rrules.push(r);
                 }
             }
-            "RDATE" => self.rdates.extend(multi_time(line)),
-            "EXDATE" => self.exdates.extend(multi_time(line)),
+            "RDATE" | "EXDATE" => {
+                let n = line
+                    .value
+                    .split(',')
+                    .filter(|v| !v.trim().is_empty())
+                    .count();
+                meter.charge_event(
+                    n.saturating_mul(std::mem::size_of::<EventTime>() + tz + ENTRY_OVERHEAD),
+                    n,
+                )?;
+                let times = multi_time(line);
+                if line.name == "RDATE" {
+                    self.rdates.extend(times);
+                } else {
+                    self.exdates.extend(times);
+                }
+            }
             "LAST-MODIFIED" | "DTSTAMP" => {
                 if self.last_modified == 0
                     && let Some(d) = parse_ics_datetime(&line.value)
@@ -333,10 +655,12 @@ impl Builder {
             // X- extensions — copying every standard property would bloat every
             // cached row for no gain.
             n if n.starts_with("X-") => {
+                meter.charge_event(n.len() + text, 1)?;
                 self.extra.insert(n.to_string(), line.value.clone());
             }
             _ => {}
         }
+        Ok(())
     }
 
     fn finish(self, default_zone: &str) -> Option<CalEvent> {
@@ -423,20 +747,20 @@ fn stable_hash(s: &str) -> u64 {
 
 /// RDATE/EXDATE may carry a comma-separated list.
 fn multi_time(line: &ContentLine) -> Vec<EventTime> {
-    line.value
-        .split(',')
-        .filter(|s| !s.trim().is_empty())
-        .filter_map(|v| {
-            parse_time(
-                &ContentLine {
-                    name: line.name.clone(),
-                    params: line.params.clone(),
-                    value: v.trim().to_string(),
-                },
-                "",
-            )
-        })
-        .collect()
+    let mut one = ContentLine {
+        name: line.name.clone(),
+        params: line.params.clone(),
+        value: String::new(),
+    };
+    let mut out = Vec::new();
+    for v in line.value.split(',').filter(|s| !s.trim().is_empty()) {
+        one.value.clear();
+        one.value.push_str(v.trim());
+        if let Some(t) = parse_time(&one, "") {
+            out.push(t);
+        }
+    }
+    out
 }
 
 /// Parse an RFC 5545 DURATION (`PT1H30M`, `P1D`).

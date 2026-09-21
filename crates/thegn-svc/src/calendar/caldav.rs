@@ -12,6 +12,7 @@
 //! CalDAV bodies are machine-generated and shallow, and the alternative is a
 //! large dependency for a couple of tag lookups.
 
+use std::borrow::Cow;
 use std::time::Duration;
 
 use chrono::NaiveDate;
@@ -19,11 +20,12 @@ use futures_util::future::BoxFuture;
 use thegn_core::config_calendar::CalendarAccount;
 use tokio::time::Instant;
 
-use super::{CalendarBackend, CalendarCaps, CalendarError, EventPage};
+use super::{AccountAdmission, CalendarBackend, CalendarCaps, CalendarError, EventPage};
 use crate::http::{
-    CalendarHttpClient, CalendarHttpError, ExpectedMedia, MAX_REQUEST_BYTES, discard_body,
-    map_error, read_body, validate_encoding, validate_media,
+    CalendarHttpClient, CalendarHttpError, ExpectedMedia, MAX_BODY_BYTES, MAX_REQUEST_BYTES,
+    discard_body, map_error, read_body, validate_encoding, validate_media,
 };
+use thegn_core::calendar::AdmissionMeter;
 
 pub(super) fn map_transport_error(error: CalendarHttpError) -> CalendarError {
     match error {
@@ -39,13 +41,13 @@ pub struct CalDavBackend {
     token: String,
     zone: String,
     timeout: Duration,
-    max_events: usize,
+    admission: AccountAdmission,
     http: Option<CalendarHttpClient>,
     init_error: Option<CalendarHttpError>,
 }
 
 impl CalDavBackend {
-    pub fn new(a: &CalendarAccount) -> Self {
+    pub fn new(a: &CalendarAccount, admission: AccountAdmission) -> Self {
         let configured = !a.url.trim().is_empty();
         let (http, init_error) = if !configured {
             (None, None)
@@ -63,7 +65,7 @@ impl CalDavBackend {
             token: thegn_core::config::expand_env_ref(&a.token).unwrap_or_default(),
             zone: String::new(),
             timeout: Duration::from_secs(a.timeout_secs.clamp(5, 120)),
-            max_events: 0,
+            admission,
             http,
             init_error,
         }
@@ -71,11 +73,6 @@ impl CalDavBackend {
 
     pub fn with_zone(mut self, zone: &str) -> Self {
         self.zone = zone.to_string();
-        self
-    }
-
-    pub fn with_max_events(mut self, n: usize) -> Self {
-        self.max_events = n;
         self
     }
 
@@ -175,16 +172,40 @@ fn write_xml_escaped(out: &mut String, s: &str) {
     }
 }
 
-fn xml_unescape(s: &str) -> String {
-    // `&amp;` last, or `&amp;lt;` would wrongly become `<`.
-    s.replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&apos;", "'")
-        .replace("&amp;", "&")
+/// Undo the five predefined XML entities. Borrowed when there are none, which
+/// is the common case for calendar data.
+fn xml_unescape(s: &str) -> Cow<'_, str> {
+    if !s.contains('&') {
+        return Cow::Borrowed(s);
+    }
+    // One pass into one buffer no larger than the input (every entity is
+    // longer than its character), so an unescaped copy peaks at 1× — the
+    // replace chain it supersedes held two full-size strings at once. Each
+    // entity is decoded exactly once, so `&amp;lt;` stays `&lt;`.
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(i) = rest.find('&') {
+        out.push_str(&rest[..i]);
+        rest = &rest[i..];
+        let (ch, len) = [
+            ("&lt;", '<'),
+            ("&gt;", '>'),
+            ("&quot;", '"'),
+            ("&apos;", '\''),
+            ("&amp;", '&'),
+        ]
+        .iter()
+        .find(|(e, _)| rest.starts_with(e))
+        .map_or(('&', 1), |(e, c)| (*c, e.len()));
+        out.push(ch);
+        rest = &rest[len..];
+    }
+    out.push_str(rest);
+    Cow::Owned(out)
 }
 
 /// One `<response>` from a multistatus body.
+#[cfg(test)]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct DavResponse {
     pub href: String,
@@ -195,69 +216,137 @@ pub(crate) struct DavResponse {
     pub deleted: bool,
 }
 
+/// One `<response>`, borrowed from the body: `ics` is still XML-escaped so the
+/// caller can account for an unescaped copy before making one.
+struct DavResponseRef<'a> {
+    href: String,
+    ics_raw: &'a str,
+    deleted: bool,
+}
+
 /// Pull the `<response>` elements and the `<sync-token>` out of a multistatus.
 ///
 /// Namespace prefixes vary by server (`d:`, `D:`, none), so tags are matched on
 /// their local name.
 #[cfg(test)]
 pub(crate) fn parse_multistatus(xml: &str) -> (Vec<DavResponse>, String) {
-    parse_multistatus_checked(xml).unwrap_or_default()
+    let mut out = Vec::new();
+    let token = walk_multistatus(xml, |r| {
+        out.push(DavResponse {
+            href: r.href,
+            ics: xml_unescape(r.ics_raw).into_owned(),
+            deleted: r.deleted,
+        });
+        Ok(())
+    });
+    match token {
+        Ok(token) => (out, token),
+        Err(_) => Default::default(),
+    }
 }
 
-fn parse_multistatus_checked(xml: &str) -> Result<(Vec<DavResponse>, String), CalendarError> {
-    let mut out = Vec::new();
-    for block in split_elements(xml, "response") {
-        let href = first_element(&block, "href").unwrap_or_default();
-        let ics = first_element(&block, "calendar-data").unwrap_or_default();
+/// Visit each `<response>` in document order, one at a time, then return the
+/// collection-level sync token.
+///
+/// Nothing is collected here: each response is handed to `visit` straight off
+/// the body, so the caller admits (or refuses) it before the next is looked at.
+fn walk_multistatus<'a>(
+    xml: &'a str,
+    mut visit: impl FnMut(DavResponseRef<'a>) -> Result<(), CalendarError>,
+) -> Result<String, CalendarError> {
+    let mut rest = xml;
+    while let Some((block, tail)) = take_element(rest, "response") {
+        rest = tail;
+        let href = first_element(block, "href").unwrap_or_default();
+        let ics_raw = first_element(block, "calendar-data").unwrap_or_default();
         // A per-response status of 404 is how `sync-collection` reports a
         // deletion; a response with no calendar-data at all is one too.
-        let status = first_element(&block, "status").unwrap_or_default();
-        let deleted = status.contains("404") || ics.trim().is_empty();
+        let status = first_element(block, "status").unwrap_or_default();
+        let deleted = status.contains("404") || ics_raw.trim().is_empty();
         if href.trim().is_empty() {
             continue;
         }
+        // Size the raw value before unescaping it (the unescaped form is never
+        // longer), so an enormous href costs nothing to refuse.
+        if href.trim().len() > MAX_REQUEST_BYTES {
+            return Err(CalendarError::BodyLimit(
+                "calendar resource href exceeds limit",
+            ));
+        }
+        let href = xml_unescape(href.trim());
         if href.len() > MAX_REQUEST_BYTES {
             return Err(CalendarError::BodyLimit(
                 "calendar resource href exceeds limit",
             ));
         }
-        out.push(DavResponse {
-            href: href.trim().to_string(),
-            ics,
+        visit(DavResponseRef {
+            href: href.into_owned(),
+            ics_raw,
             deleted,
-        });
+        })?;
     }
     // The collection-level token sits outside any <response>.
-    let token = last_element(xml, "sync-token").unwrap_or_default();
+    let mut token = "";
+    let mut rest = xml;
+    while let Some((body, tail)) = take_element(rest, "sync-token") {
+        token = body;
+        rest = tail;
+    }
+    if token.trim().len() > MAX_REQUEST_BYTES {
+        return Err(CalendarError::BodyLimit(
+            "calendar sync token exceeds limit",
+        ));
+    }
+    let token = xml_unescape(token.trim());
     if token.len() > MAX_REQUEST_BYTES {
         return Err(CalendarError::BodyLimit(
             "calendar sync token exceeds limit",
         ));
     }
-    Ok((out, token.trim().to_string()))
+    Ok(token.trim().to_string())
 }
 
-/// Every `<...name>…</...name>` body in `xml`, prefix-insensitive.
-fn split_elements(xml: &str, name: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut rest = xml;
-    while let Some((body, tail)) = take_element(rest, name) {
-        out.push(body);
-        rest = tail;
-    }
-    out
+/// Parse a multistatus into a page, admitting each resource as it is reached.
+fn page_from_multistatus(
+    text: &str,
+    zone: &str,
+    mut meter: AdmissionMeter,
+) -> Result<EventPage, CalendarError> {
+    let mut events = Vec::new();
+    let mut deleted = Vec::new();
+    let token = walk_multistatus(text, |r| {
+        if r.deleted {
+            // The href is all a tombstone carries, so it has to be the id.
+            // `uid_from_href` mirrors what the fetch path stores.
+            let id = uid_from_href(&r.href);
+            meter.admit_deletion(id.len())?;
+            deleted.push(id);
+            return Ok(());
+        }
+        // An entity-escaped resource needs an unescaped copy; reserve it as
+        // transient before it exists.
+        let copy = if r.ics_raw.contains('&') {
+            r.ics_raw.len()
+        } else {
+            0
+        };
+        meter.reserve_transient(copy)?;
+        let ics = xml_unescape(r.ics_raw);
+        let parsed = thegn_core::calendar::parse_ics_admitted(&ics, zone, &mut meter, &mut events);
+        drop(ics);
+        meter.release_transient(copy);
+        parsed.map_err(CalendarError::from)
+    })?;
+    EventPage::from_meter(meter, events, deleted, token)
 }
 
-fn first_element(xml: &str, name: &str) -> Option<String> {
+fn first_element<'a>(xml: &'a str, name: &str) -> Option<&'a str> {
     take_element(xml, name).map(|(body, _)| body)
 }
 
-fn last_element(xml: &str, name: &str) -> Option<String> {
-    split_elements(xml, name).pop()
-}
-
-/// Find the first `<name>` element, returning `(unescaped body, remainder)`.
-fn take_element<'a>(xml: &'a str, name: &str) -> Option<(String, &'a str)> {
+/// Find the first `<name>` element, returning `(raw body, remainder)`, both
+/// borrowed from `xml`.
+fn take_element<'a>(xml: &'a str, name: &str) -> Option<(&'a str, &'a str)> {
     let mut search = 0usize;
     loop {
         let rel = xml.get(search..)?.find('<')?;
@@ -281,7 +370,7 @@ fn take_element<'a>(xml: &'a str, name: &str) -> Option<(String, &'a str)> {
         }
         // A self-closing element has an empty body.
         if tag.ends_with('/') {
-            return Some((String::new(), xml.get(gt + 1..)?));
+            return Some(("", xml.get(gt + 1..)?));
         }
         // Find the matching close tag by local name.
         let after = gt + 1;
@@ -289,7 +378,7 @@ fn take_element<'a>(xml: &'a str, name: &str) -> Option<(String, &'a str)> {
         let end = after + close_rel;
         let body = xml.get(after..end)?;
         let tail = xml.get(end + local.len() + 3..).unwrap_or("");
-        return Some((xml_unescape(body), tail));
+        return Some((body, tail));
     }
 }
 
@@ -322,6 +411,10 @@ impl CalendarBackend for CalDavBackend {
             }
             let http = self.http.as_ref().expect("checked above");
             let deadline = Instant::now() + self.timeout;
+            // Reserve the largest body the transport will accept before asking
+            // for it; refusal is immediate and typed, and nothing is sent.
+            let mut meter = self.admission.meter();
+            meter.reserve_transient(MAX_BODY_BYTES)?;
 
             let incremental = !sync_token.is_empty();
             let body = if incremental {
@@ -383,7 +476,7 @@ impl CalendarBackend for CalDavBackend {
                 discard_body(resp, deadline)
                     .await
                     .map_err(map_transport_error)?;
-                return self.fetch_full(from, to, deadline).await;
+                return self.fetch_full(from, to, deadline, meter).await;
             }
             if !resp.status().is_success() && resp.status() != reqwest::StatusCode::MULTI_STATUS {
                 let status = resp.status();
@@ -402,49 +495,50 @@ impl CalendarBackend for CalDavBackend {
                     CalendarHttpError::Timeout => CalendarError::Timeout(map_error(error)),
                     other => CalendarError::Network(map_error(other).into()),
                 })?;
+            meter.release_transient(MAX_BODY_BYTES - text.capacity().min(MAX_BODY_BYTES));
             let text = String::from_utf8(text)
                 .map_err(|_| CalendarError::Parse("CalDAV response is not UTF-8".into()))?;
-
-            let (responses, token) = parse_multistatus_checked(&text)?;
-            let zone = if self.zone.is_empty() {
-                "UTC"
-            } else {
-                &self.zone
-            };
-            let mut events = Vec::new();
-            let mut deleted = Vec::new();
-            for r in responses {
-                if r.deleted {
-                    // The href is all a tombstone carries, so it has to be the id.
-                    // `uid_from_href` mirrors what the fetch path stores.
-                    deleted.push(uid_from_href(&r.href));
-                    continue;
+            match page_from_multistatus(&text, self.zone(), meter) {
+                // A delta over the account's own budget (a bulk delete, a
+                // server re-stamping everything) would be refused again on
+                // every tick, because the cursor is — correctly — not
+                // advanced. The windowed full fetch is what the cache needs
+                // anyway, and it may well fit: try it once, under a fresh
+                // meter and the same absolute deadline.
+                Err(CalendarError::Admission(a)) if incremental && a.is_account_limit() => {
+                    drop(text);
+                    tracing::debug!(
+                        target: "thegn::calendar",
+                        "caldav delta exceeds the admission budget — falling back to a full fetch"
+                    );
+                    let mut meter = self.admission.meter();
+                    meter.reserve_transient(MAX_BODY_BYTES)?;
+                    self.fetch_full(from, to, deadline, meter).await
                 }
-                events.extend(thegn_core::calendar::parse_ics(&r.ics, zone));
+                other => other,
             }
-            let partial = self.max_events > 0 && events.len() > self.max_events;
-            if partial {
-                events.truncate(self.max_events);
-            }
-            Ok(EventPage {
-                events,
-                deleted,
-                sync_token: token,
-                partial,
-                unchanged: false,
-            })
         })
     }
 }
 
 impl CalDavBackend {
+    fn zone(&self) -> &str {
+        if self.zone.is_empty() {
+            "UTC"
+        } else {
+            &self.zone
+        }
+    }
+
     /// A 409/507 token recovery is exactly one additional REPORT, sharing the
-    /// original absolute deadline and never recursively refreshing it.
+    /// original absolute deadline and never recursively refreshing it. It
+    /// reuses the first request's meter (and its body reservation).
     async fn fetch_full(
         &self,
         from: NaiveDate,
         to: NaiveDate,
         deadline: Instant,
+        mut meter: AdmissionMeter,
     ) -> Result<EventPage, CalendarError> {
         let http = self.http.as_ref().expect("initialized backend");
         let body = calendar_query_body(from, to);
@@ -486,38 +580,10 @@ impl CalDavBackend {
                 CalendarHttpError::Timeout => CalendarError::Timeout(map_error(error)),
                 other => CalendarError::Network(map_error(other).into()),
             })?;
+        meter.release_transient(MAX_BODY_BYTES - bytes.capacity().min(MAX_BODY_BYTES));
         let text = String::from_utf8(bytes)
             .map_err(|_| CalendarError::Parse("CalDAV response is not UTF-8".into()))?;
-        self.page_from_multistatus(text)
-    }
-
-    fn page_from_multistatus(&self, text: String) -> Result<EventPage, CalendarError> {
-        let (responses, token) = parse_multistatus_checked(&text)?;
-        let zone = if self.zone.is_empty() {
-            "UTC"
-        } else {
-            &self.zone
-        };
-        let mut events = Vec::new();
-        let mut deleted = Vec::new();
-        for r in responses {
-            if r.deleted {
-                deleted.push(uid_from_href(&r.href));
-            } else {
-                events.extend(thegn_core::calendar::parse_ics(&r.ics, zone));
-            }
-        }
-        let partial = self.max_events > 0 && events.len() > self.max_events;
-        if partial {
-            events.truncate(self.max_events);
-        }
-        Ok(EventPage {
-            events,
-            deleted,
-            sync_token: token,
-            partial,
-            unchanged: false,
-        })
+        page_from_multistatus(&text, self.zone(), meter)
     }
 }
 
@@ -559,7 +625,7 @@ mod tests {
         let oversized = "x".repeat(MAX_REQUEST_BYTES + 1);
         let xml = format!("<multistatus><sync-token>{oversized}</sync-token></multistatus>");
         assert!(matches!(
-            parse_multistatus_checked(&xml),
+            walk_multistatus(&xml, |_| Ok(())),
             Err(CalendarError::BodyLimit(_))
         ));
     }
