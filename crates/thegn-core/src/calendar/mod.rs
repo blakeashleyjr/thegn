@@ -160,6 +160,7 @@ pub struct ExpansionBudget {
     source_visits: usize,
     recurrence_work: usize,
     occurrences: usize,
+    expanded_locals: usize,
     bucket_entries: usize,
     retained_bytes: usize,
 }
@@ -176,6 +177,7 @@ impl Default for ExpansionBudget {
             source_visits: 0,
             recurrence_work: 0,
             occurrences: 0,
+            expanded_locals: 0,
             bucket_entries: 0,
             retained_bytes: 0,
         }
@@ -238,6 +240,30 @@ impl ExpansionBudget {
         )
     }
 
+    /// Reserve one recurrence candidate before it is built. Charged on two
+    /// dimensions because a candidate is both work AND memory: the period's
+    /// candidate vector is real bytes, and at the raised work ceiling an
+    /// unbilled one would be the largest allocation in the pass.
+    pub(crate) fn candidate(&mut self) -> Result<(), ExpansionError> {
+        self.recurrence_work(1)?;
+        self.bytes(CANDIDATE_BYTES)
+    }
+
+    /// Reserve one expanded local time before it is retained. Every local
+    /// becomes at most one materialized occurrence, so it is held to the same
+    /// ceiling (on its own counter, so the two passes do not double-charge)
+    /// and to its share of the byte budget.
+    pub(crate) fn expanded_local(&mut self) -> Result<(), ExpansionError> {
+        let max = self.max_occurrences;
+        Self::spend(
+            &mut self.expanded_locals,
+            max,
+            1,
+            ExpansionLimit::MaterializedOccurrences,
+        )?;
+        self.bytes(CANDIDATE_BYTES)
+    }
+
     fn occurrence(&mut self) -> Result<(), ExpansionError> {
         let max = self.max_occurrences;
         Self::spend(
@@ -276,6 +302,9 @@ impl ExpansionBudget {
     }
     pub fn used_occurrences(&self) -> usize {
         self.occurrences
+    }
+    pub fn used_expanded_locals(&self) -> usize {
+        self.expanded_locals
     }
     pub fn used_bucket_entries(&self) -> usize {
         self.bucket_entries
@@ -846,6 +875,10 @@ const MAP_ENTRY_OVERHEAD: usize = 64;
 const OCCURRENCE_OVERHEAD: usize = 2 * std::mem::size_of::<usize>()
     + std::mem::size_of::<Occurrence>()
     + 2 * std::mem::size_of::<Arc<CalEvent>>();
+
+/// Retained bytes of one expanded local time or recurrence candidate
+/// (doubled for `Vec` growth).
+const CANDIDATE_BYTES: usize = 2 * std::mem::size_of::<NaiveDateTime>();
 
 /// Retained bytes of one bucket handle (doubled for `Vec` growth).
 const BUCKET_ENTRY_BYTES: usize = 2 * std::mem::size_of::<Arc<CalEvent>>();

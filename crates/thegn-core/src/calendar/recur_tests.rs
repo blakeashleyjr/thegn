@@ -702,7 +702,8 @@ fn a_secondly_rule_is_bounded_rather_than_running_away() {
         ..Default::default()
     };
     // Refused as a typed error — never a silently truncated list that would
-    // read as the complete answer.
+    // read as the complete answer. The retained-instant ceiling bites first:
+    // every expanded local is charged before the vector holding it grows.
     let mut budget = ExpansionBudget::default();
     assert_eq!(
         expand_local_bounded(
@@ -712,7 +713,9 @@ fn a_secondly_rule_is_bounded_rather_than_running_away() {
             d(2026, 12, 31),
             &mut budget
         ),
-        Err(ExpansionError::Budget(ExpansionLimit::RecurrenceWork))
+        Err(ExpansionError::Budget(
+            ExpansionLimit::MaterializedOccurrences
+        ))
     );
     // A day of it fits, and is complete.
     let mut budget = ExpansionBudget::default();

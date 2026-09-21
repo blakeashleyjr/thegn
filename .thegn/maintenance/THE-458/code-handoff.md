@@ -69,3 +69,46 @@ note.
   budget sees them, so the 64 MiB ceiling bounds the expansion, NOT the peak
   memory of the read. Source-row admission is THE-465 / THE-455.
 - `expand_by_date` and `reminders::due` remain pub with no production caller.
+
+## Known consequence of advancing on Incomplete (by design, not a bug)
+
+A reminder whose trigger falls inside a window evaluated while its row was
+malformed is lost for good, even after a later sync makes the row readable:
+`ReminderCursor::finish` advanced `last_checked_ms` for that window, and
+`reminders::due` clamps catch-up to one hour, so the trigger is never
+revisited. That is the right trade against the alternative — holding the
+cursor stalls EVERY reminder behind one permanently bad row — but it is a real
+loss, so record it rather than rediscovering it as a defect.
+
+## Transient allocation charging (round-2 review)
+
+`expand_rule`/`expand_subdaily`'s locals vector and `period_candidates`'
+candidate vector are now charged before they grow: candidates cost work AND
+bytes (`ExpansionBudget::candidate`), and each retained local costs a byte
+share plus a slot against `max_occurrences` on its own counter
+(`expanded_local`, so the later materialization pass is not double-charged).
+Without this, the raised work ceiling allowed ~4.15M NaiveDateTime (~50 MB,
+~100 MB across a Vec doubling) for a DAILY rule with a
+BYHOUR×BYMINUTE×BYSECOND product. `a_by_part_cross_product_is_refused_as_it_grows`
+pins the peak under the default budget and refuses inside a SINGLE period
+under a 10,000-unit ceiling (below one period's 86,400 product).
+
+## Follow-ups (agreed: NOT fixed here)
+
+1. Fold `Arithmetic` into `is_row_local` — the cleaner rule is "everything
+   except the six shared budget dimensions is row-local". Practically
+   unreachable today (needs a DTSTART near year -258,000).
+2. Bounded retry on N consecutive identical `Failed` acks: two saturated
+   accounts sharing one budget can exhaust a SHARED dimension every tick, and
+   that path still stalls the cursor indefinitely.
+3. Narrow-width grid status: `draw_month_grid` draws the status
+   unconditionally, bypassing the `w >= TODAY_CHIP_MIN_COLS` guard, so at
+   w ∈ [28,41] "unavailable" (11 cells) overflows the header and eats the
+   `l` keycap, whose hit target still computes from the untruncated width.
+   The render test uses cols: 44, so that band is unexercised.
+4. `expand_by_date` discards `skipped` and has no production caller — make it
+   `cfg(test)` or return the whole `ExpandedCalendar`.
+5. Surface the skipped COUNT: one bad row and two thousand both render
+   "incomplete"; consider `CacheUnavailable` when `skipped == rows.len()`.
+6. Check the mostly-unreachable `Arithmetic` arms against the 95% core
+   coverage gate (CI-only; not run in this batch).
