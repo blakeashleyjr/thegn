@@ -400,7 +400,16 @@ silently not applied: `[sandbox]` (and everything nested under it),
 `[forges]`, `[git]`, `[editor]`, `[lsp]`, `[metrics]`, `[notifications]`,
 `[clipboard]`, `[apps]`, `[skills]`, `[tasks]`, `[toolchain]`, `[limits]`,
 `[presets]`, `[profiles]`, `[worktree_templates]`, `[watch]`, `[ci]`,
-`[pr]`, `[issues]`, `[model_proxy]` and `[workspace.*]`. Everywhere else —
+`[pr]`, `[issues]`, `[model_proxy]`, `[mcp]`, `[mcp_proxy]`,
+`[mcp_servers.*]`, `[managed_tools.*]`, `[calendar]`, `[voice]`, `[pins]`,
+`[secrets]`, `[credentials]`, `[bundle]`, `[zone.*]`, `[observe]`,
+`[weather]`, `[usage]`, `[disk]`, `[drawer]`, `[media]`, `[stats]`, and the
+per-project overlay
+`[project.<slug>]` (also written `[workspace.<slug>]`, which is normalized to
+`[project.<slug>]`) — that subtree holds accounts, hooks, sandbox mounts, the
+queues, ci, autopilot, the MCP scope ceiling, env bundles, git and editor.
+A typo of one of these tables (`[sandboxx]`, `[metric]`) refuses too: the
+nearest-key hint names what you meant. Everywhere else —
 and for an unknown top-level table — the key is ignored with a warning, so
 one `~/.config/thegn/config.toml` shared by builds of different ages keeps
 working when a newer build adds a key. `thegn config validate` reports both,

@@ -78,7 +78,22 @@ pub enum UnknownKeys {
 /// process, reach a remote, hold or select credentials, gate schema
 /// migrations, or set sandbox/placement/queue policy. Everything outside this
 /// list is presentation, telemetry or layout, where an unknown key is
-/// ignorable. Keep this list and `docs/ARCHITECTURE.md` in sync.
+/// ignorable.
+///
+/// This is a DENYLIST on purpose: the whole point of the relaxation is that a
+/// table a NEWER build added must not brick an older build sharing one
+/// `config.toml`, and an allowlist would refuse exactly that case. The cost
+/// is that the list rots as tables are added, so
+/// `security_relevant_roots_cover_every_executing_or_credential_table`
+/// derives the expectation from the generated schema and fails when a new
+/// root carries a command/argv, a secret ref, or a URL/host field.
+///
+/// Names are SCHEMA property names, not the spellings a user may write:
+/// `[workspace.<slug>]` is normalized to `[project.<slug>]` before any walk
+/// (`config_compat::normalize_project_tables`, `#[serde(rename = "project",
+/// alias = "workspace")]`), so the protected name here is `project`. Keep
+/// this list, `docs/ARCHITECTURE.md` and `docs/help/configuration.md` in
+/// sync.
 const SECURITY_RELEVANT_ROOTS: &[&str] = &[
     "accounts",
     "actions",
@@ -86,10 +101,16 @@ const SECURITY_RELEVANT_ROOTS: &[&str] = &[
     "apps",
     "automations",
     "autopilot",
+    "bundle",
+    "calendar",
     "ci",
     "clipboard",
+    "credentials",
     "daemon",
     "database",
+    "disk",
+    // The drawer's scoped entries carry commands.
+    "drawer",
     "editor",
     "env",
     "forges",
@@ -104,45 +125,89 @@ const SECURITY_RELEVANT_ROOTS: &[&str] = &[
     "lifecycle",
     "limits",
     "lsp",
+    "managed_tools",
+    "mcp",
+    "mcp_proxy",
+    "mcp_servers",
+    // Player control commands plus a remote library (url + token).
+    "media",
     "merge_queue",
     "metrics",
     "model_proxy",
     "network",
     "notifications",
+    "observe",
+    "pins",
     "pipeline",
     "placement",
     "plugins",
     "pr",
     "pr_queue",
     "presets",
+    // The per-project overlay: the schema property is `project`; `workspace`
+    // is the legacy spelling normalization rewrites before any walk. Its
+    // subtree carries accounts, hooks, sandbox mounts, the queues, ci,
+    // autopilot, the MCP scope ceiling, env bundles, git and editor.
+    "project",
     "profiles",
     "remote",
     "sandbox",
+    "secrets",
     "serve",
     "share",
     "skills",
+    // Custom stat collectors run commands.
+    "stats",
     "tasks",
     "toolchain",
     "tools",
+    "usage",
+    "voice",
     "watch",
+    "weather",
     "workspace",
     "worktree_templates",
+    "zone",
 ];
 
 /// Whether `path` (a dotted schema path such as `sandbox.mounts[0].source`)
 /// names a security-relevant table. A bare root key (`picker`) is not one:
 /// an unknown ROOT key is exactly the "newer build added a table" case.
 pub fn is_security_relevant_path(path: &str) -> bool {
-    let root = path
-        .split(['.', '['])
+    let root = path_root(path);
+    !root.is_empty() && path.len() > root.len() && SECURITY_RELEVANT_ROOTS.contains(&root)
+}
+
+fn path_root(path: &str) -> &str {
+    path.split(['.', '['])
         .next()
         .unwrap_or_default()
-        .trim_end_matches(']');
-    !root.is_empty() && path.len() > root.len() && SECURITY_RELEVANT_ROOTS.contains(&root)
+        .trim_end_matches(']')
+}
+
+/// Whether an unknown key must refuse: either it sits under a
+/// security-relevant table, or the walk's nearest-key hint says the user
+/// meant one. The hint is how a TYPO'd security table
+/// (`[sandboxx]`, `[metric]`) is caught without refusing a genuinely new
+/// table, which is never within the hint's two-edit distance of an existing
+/// name.
+fn unknown_key_refuses(path: &str, hint: Option<&str>) -> bool {
+    if is_security_relevant_path(path) {
+        return true;
+    }
+    let Some(hint) = hint else { return false };
+    match path.rsplit_once('.') {
+        // A nested typo: judge the corrected path.
+        Some((parent, _)) => is_security_relevant_path(&format!("{parent}.{hint}")),
+        // A top-level typo: the corrected ROOT decides.
+        None => SECURITY_RELEVANT_ROOTS.contains(&hint),
+    }
 }
 
 /// The stable marker the walk uses for an unknown key.
 const UNKNOWN_KEY: &str = ": unknown key";
+/// How the walk renders its nearest-key hint: `(did you mean \`x\`?)`.
+const HINT_PREFIX: &str = "(did you mean `";
 
 /// Split walk errors into (errors, ignorable warnings) under `policy`.
 pub(crate) fn split_unknown_keys(
@@ -156,10 +221,18 @@ pub(crate) fn split_unknown_keys(
     let mut warnings = Vec::new();
     for message in messages {
         match message.split_once(UNKNOWN_KEY) {
-            Some((path, _)) if !is_security_relevant_path(path) => {
-                warnings.push(format!("{message} (ignored by this build)"));
+            Some((path, tail)) => {
+                let hint = tail
+                    .split_once(HINT_PREFIX)
+                    .and_then(|(_, rest)| rest.split_once('`'))
+                    .map(|(hint, _)| hint);
+                if unknown_key_refuses(path, hint) {
+                    errors.push(message);
+                } else {
+                    warnings.push(format!("{message} (ignored by this build)"));
+                }
             }
-            _ => errors.push(message),
+            None => errors.push(message),
         }
     }
     (errors, warnings)
@@ -1838,5 +1911,137 @@ mod keybind_schema_tests {
                 !super::validate_schema_value::<crate::config::KeybindConfig>(&value).is_empty()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod security_root_rot_tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    /// Field names that mean "this subtree can execute a process, hold or
+    /// select a credential, or reach a remote".
+    fn is_dangerous_field(name: &str) -> bool {
+        const EXACT: &[&str] = &[
+            "command", "argv", "exec", "cmd", "script", "shell", "url", "host", "endpoint",
+            "server", "token", "secret", "api_key", "password", "key_path", "account", "accounts",
+            "identity",
+        ];
+        const SUFFIX: &[&str] = &[
+            "_command",
+            "_argv",
+            "_exec",
+            "_url",
+            "_host",
+            "_endpoint",
+            "_token",
+            "_secret",
+            "_key",
+            "_base",
+            "_path",
+        ];
+        EXACT.contains(&name) || SUFFIX.iter().any(|suffix| name.ends_with(suffix))
+    }
+
+    fn collect(root: &RootSchema, schema: &Schema, seen: &mut BTreeSet<String>) -> bool {
+        let Schema::Object(obj) = schema else {
+            return false;
+        };
+        if let Some(reference) = &obj.reference {
+            let name = ref_name(reference).to_string();
+            // Definitions recurse (plugins, providers); visit each once.
+            if !seen.insert(name.clone()) {
+                return false;
+            }
+            let found = root
+                .definitions
+                .get(&name)
+                .is_some_and(|def| collect(root, def, seen));
+            seen.remove(&name);
+            return found;
+        }
+        let mut found = false;
+        if let Some(sub) = &obj.subschemas {
+            for branch in sub
+                .all_of
+                .iter()
+                .chain(sub.any_of.iter())
+                .chain(sub.one_of.iter())
+                .flatten()
+            {
+                found |= collect(root, branch, seen);
+            }
+        }
+        if let Some(ov) = &obj.object {
+            for (name, child) in &ov.properties {
+                if is_dangerous_field(name) {
+                    found = true;
+                }
+                found |= collect(root, child, seen);
+            }
+            if let Some(additional) = &ov.additional_properties {
+                found |= collect(root, additional, seen);
+            }
+        }
+        if let Some(av) = &obj.array
+            && let Some(SingleOrVec::Single(item)) = &av.items
+        {
+            found |= collect(root, item, seen);
+        }
+        found
+    }
+
+    /// The denylist rots as tables are added, and the relaxation is only safe
+    /// while it is complete. Derive the expectation from the generated schema:
+    /// any root whose subtree carries a command/argv, a credential, or a
+    /// URL/host field must be listed. (A denylist — not an allowlist — is
+    /// deliberate: a table a NEWER build adds must not brick an older one.)
+    #[test]
+    fn security_relevant_roots_cover_every_executing_or_credential_table() {
+        let root = config_schema();
+        let properties = &root
+            .schema
+            .object
+            .as_ref()
+            .expect("Config is an object schema")
+            .properties;
+        let mut missing = Vec::new();
+        for (name, schema) in properties {
+            let mut seen = BTreeSet::new();
+            if (is_dangerous_field(name) || collect(root, schema, &mut seen))
+                && !SECURITY_RELEVANT_ROOTS.contains(&name.as_str())
+            {
+                missing.push(name.clone());
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "these roots execute, hold credentials or reach a remote but are \
+             not in SECURITY_RELEVANT_ROOTS (add them, and mirror the list in \
+             docs/help/configuration.md + docs/ARCHITECTURE.md): {missing:?}"
+        );
+    }
+
+    /// Every listed root must still exist in the schema, so a rename cannot
+    /// leave a dead name protecting nothing (the `[workspace]` →
+    /// `[project]` rename did exactly that).
+    #[test]
+    fn every_listed_security_root_exists_in_the_schema_or_is_a_known_alias() {
+        let root = config_schema();
+        let properties = &root
+            .schema
+            .object
+            .as_ref()
+            .expect("Config is an object schema")
+            .properties;
+        // `workspace` is the legacy spelling `config_compat` rewrites to
+        // `project` before any walk; it is kept so a caller validating a
+        // pre-normalization document is still protected.
+        const ALIASES: &[&str] = &["workspace"];
+        let dead: Vec<&&str> = SECURITY_RELEVANT_ROOTS
+            .iter()
+            .filter(|name| !properties.contains_key(**name) && !ALIASES.contains(name))
+            .collect();
+        assert!(dead.is_empty(), "dead entries protect nothing: {dead:?}");
     }
 }

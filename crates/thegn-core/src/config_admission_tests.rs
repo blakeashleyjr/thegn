@@ -1099,3 +1099,80 @@ fn the_post_processed_candidate_is_validated() {
         "the raw AND the post-processed candidate are validated: {events:?}"
     );
 }
+
+/// The per-project overlay carries accounts, hooks, sandbox mounts, both
+/// queues, ci, autopilot, the MCP scope ceiling, env bundles, git and editor.
+/// `[workspace.<slug>]` is normalized to `[project.<slug>]` BEFORE any schema
+/// walk, so the protected name is the schema's (`project`) — the legacy
+/// spelling alone protected nothing.
+#[test]
+fn project_overlay_unknown_keys_refuse_through_the_legacy_spelling_too() {
+    use crate::config_validate::is_security_relevant_path;
+    assert!(is_security_relevant_path("project.x.hooks.pre"));
+    assert!(is_security_relevant_path("project.thegn.sandbox_mount"));
+    assert!(is_security_relevant_path("workspace.x.hooks.pre"));
+
+    let env = TestEnv::default();
+    let host_snapshot = hosts();
+    // Written with the legacy spelling, as the user's live config does.
+    for body in [
+        &b"[workspace.thegn]\nsandbox_mount = [\"/etc\"]\n"[..],
+        &b"[project.thegn]\nsandbox_mount = [\"/etc\"]\n"[..],
+        &b"[workspace.thegn.mcp_serve]\nscopes_v2 = [\"all\"]\n"[..],
+    ] {
+        let result = admit(AdmissionInputs {
+            defaults: Config::default(),
+            base: SourceInput::bytes("base", false, body),
+            profile: None,
+            env: &env,
+            overrides: &[],
+            hosts: &host_snapshot,
+            paths: &path_context(),
+        });
+        assert!(
+            matches!(result, Err(ConfigAdmissionError::SchemaInvalid)),
+            "{} must refuse, not warn",
+            String::from_utf8_lossy(body)
+        );
+    }
+}
+
+/// A typo'd top-level security table ([sandboxx], [metric]) would otherwise
+/// vanish with its whole contents: the nearest-key hint the walk already
+/// computes makes it a refusal, while a genuinely new table — never within
+/// the hint's edit distance — still only warns.
+#[test]
+fn a_typoed_security_table_refuses_but_a_new_table_warns() {
+    let env = TestEnv::default();
+    let host_snapshot = hosts();
+    let admit_body = |body: &'static [u8]| {
+        admit(AdmissionInputs {
+            defaults: Config::default(),
+            base: SourceInput::bytes("base", false, body),
+            profile: None,
+            env: &env,
+            overrides: &[],
+            hosts: &host_snapshot,
+            paths: &path_context(),
+        })
+    };
+    for body in [
+        &b"[sandboxx]\nenabled = true\n"[..],
+        &b"[metric]\ninterval_secs = 5\n"[..],
+    ] {
+        assert!(
+            matches!(admit_body(body), Err(ConfigAdmissionError::SchemaInvalid)),
+            "{} is a typo of a security table",
+            String::from_utf8_lossy(body)
+        );
+    }
+    let admitted = admit_body(b"[telemetry_from_a_newer_build]\nknob = 1\n")
+        .expect("an unrecognizable new table still only warns");
+    assert!(
+        admitted
+            .trace()
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.kind == DiagnosticKind::UnknownKey)
+    );
+}
