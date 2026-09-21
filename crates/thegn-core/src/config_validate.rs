@@ -150,6 +150,10 @@ const SECURITY_RELEVANT_ROOTS: &[&str] = &[
     // autopilot, the MCP scope ceiling, env bundles, git and editor.
     "project",
     "profiles",
+    // Scalar roots, not tables: listing them has no nested effect, but it
+    // makes a TYPO of them (`worktrees_dirr`) refuse instead of silently
+    // relocating every worktree to the default root.
+    "projects_dir",
     "remote",
     "sandbox",
     "secrets",
@@ -167,6 +171,7 @@ const SECURITY_RELEVANT_ROOTS: &[&str] = &[
     "weather",
     "workspace",
     "worktree_templates",
+    "worktrees_dir",
     "zone",
 ];
 
@@ -187,10 +192,19 @@ fn path_root(path: &str) -> &str {
 
 /// Whether an unknown key must refuse: either it sits under a
 /// security-relevant table, or the walk's nearest-key hint says the user
-/// meant one. The hint is how a TYPO'd security table
-/// (`[sandboxx]`, `[metric]`) is caught without refusing a genuinely new
-/// table, which is never within the hint's two-edit distance of an existing
-/// name.
+/// meant one. The hint is how a TYPO'd security table (`[sandboxx]`,
+/// `[metric]`) is caught instead of being dropped with its whole contents.
+///
+/// The trade-off is real and irreducible, and it is deliberate: a typo and a
+/// legitimately NEW table one or two edits from a security-relevant name are
+/// the same shape, so this build also refuses a new top-level table spelled
+/// `[hosts]`, `[bundles]`, `[zones]`, `[secret]`, `[agent]`, `[stat]`, …
+/// This schema already has such neighbours — `profile` and `profiles` differ
+/// by one edit and one of them is security-relevant — so had `profiles`
+/// arrived later, an older build would refuse it. The remedy for an operator
+/// is to rename or remove the key; `docs/help/configuration.md` says so. To
+/// drop the trade-off, delete the top-level (`None`) branch below and keep
+/// only the nested rule: typos inside a security table would still refuse.
 fn unknown_key_refuses(path: &str, hint: Option<&str>) -> bool {
     if is_security_relevant_path(path) {
         return true;
@@ -1920,17 +1934,24 @@ mod security_root_rot_tests {
     use std::collections::BTreeSet;
 
     /// Field names that mean "this subtree can execute a process, hold or
-    /// select a credential, or reach a remote".
+    /// select a credential, or reach a remote". The vocabulary is drawn from
+    /// the names THIS schema actually uses for those things — `run`, `args`,
+    /// `*_bin`, bare `path`, `*_image`, `socket`, `proxy`, `*_dir` — because
+    /// a root whose exec field is spelled `run` is exactly the one a
+    /// command/argv-only vocabulary would miss.
     fn is_dangerous_field(name: &str) -> bool {
         const EXACT: &[&str] = &[
-            "command", "argv", "exec", "cmd", "script", "shell", "url", "host", "endpoint",
-            "server", "token", "secret", "api_key", "password", "key_path", "account", "accounts",
-            "identity",
+            "command", "argv", "exec", "cmd", "run", "script", "shell", "args", "bin", "path",
+            "image", "socket", "proxy", "url", "host", "endpoint", "server", "token", "secret",
+            "api_key", "password", "key_path", "account", "accounts", "identity",
         ];
         const SUFFIX: &[&str] = &[
             "_command",
             "_argv",
             "_exec",
+            "_args",
+            "_bin",
+            "_image",
             "_url",
             "_host",
             "_endpoint",
@@ -1939,6 +1960,7 @@ mod security_root_rot_tests {
             "_key",
             "_base",
             "_path",
+            "_dir",
         ];
         EXACT.contains(&name) || SUFFIX.iter().any(|suffix| name.ends_with(suffix))
     }
@@ -1993,9 +2015,17 @@ mod security_root_rot_tests {
 
     /// The denylist rots as tables are added, and the relaxation is only safe
     /// while it is complete. Derive the expectation from the generated schema:
-    /// any root whose subtree carries a command/argv, a credential, or a
+    /// any root whose subtree carries a command/argv/run, a credential, or a
     /// URL/host field must be listed. (A denylist — not an allowlist — is
     /// deliberate: a table a NEWER build adds must not brick an older one.)
+    ///
+    /// This is a LOWER BOUND, not a proof of exhaustiveness: it catches only
+    /// what the field vocabulary above names, so roots whose danger is
+    /// structural rather than lexical (`[database]`'s migration authority,
+    /// `[placement]`'s lanes, `[disk]`'s reclamation) are listed on human
+    /// judgment and are not re-derived here. Today the guard flags 39 of the
+    /// listed roots; the assertions below fail if that detection collapses,
+    /// so a schemars upgrade cannot quietly turn this test into decoration.
     #[test]
     fn security_relevant_roots_cover_every_executing_or_credential_table() {
         let root = config_schema();
@@ -2006,12 +2036,14 @@ mod security_root_rot_tests {
             .expect("Config is an object schema")
             .properties;
         let mut missing = Vec::new();
+        let mut flagged = BTreeSet::new();
         for (name, schema) in properties {
             let mut seen = BTreeSet::new();
-            if (is_dangerous_field(name) || collect(root, schema, &mut seen))
-                && !SECURITY_RELEVANT_ROOTS.contains(&name.as_str())
-            {
-                missing.push(name.clone());
+            if is_dangerous_field(name) || collect(root, schema, &mut seen) {
+                flagged.insert(name.clone());
+                if !SECURITY_RELEVANT_ROOTS.contains(&name.as_str()) {
+                    missing.push(name.clone());
+                }
             }
         }
         assert!(
@@ -2019,6 +2051,21 @@ mod security_root_rot_tests {
             "these roots execute, hold credentials or reach a remote but are \
              not in SECURITY_RELEVANT_ROOTS (add them, and mirror the list in \
              docs/help/configuration.md + docs/ARCHITECTURE.md): {missing:?}"
+        );
+        // Non-vacuous: the walk must still SEE the dangerous subtrees. Without
+        // this the test would pass if `collect` silently stopped matching.
+        for expected in ["sandbox", "project", "agents", "env", "host", "metrics"] {
+            assert!(
+                flagged.contains(expected),
+                "the schema walk no longer detects `{expected}`: the guard has \
+                 become decoration (schemars shape change?). flagged={flagged:?}"
+            );
+        }
+        assert!(
+            flagged.len() >= 30,
+            "only {} roots flagged (39 when written): detection collapsed — \
+             flagged={flagged:?}",
+            flagged.len()
         );
     }
 

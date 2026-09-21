@@ -272,8 +272,12 @@ row decoder, any other schema) keeps `UnknownKeys::Reject`; the relaxation
 is passed in at the call site, never decided inside the walk. Entries are
 SCHEMA property names: `[workspace.<slug>]` is normalized to
 `[project.<slug>]` before any walk, so `project` is the protected name. A
-typo of a security table refuses through the walk's nearest-key hint, which a
-genuinely new table can never match.
+typo of a security table refuses through the walk's nearest-key hint. That
+also refuses a legitimately new top-level table within the hint's edit
+distance of a security-relevant name (`[hosts]`, `[secret]`, `[stat]`, …) —
+a typo and a new neighbour are the same shape, so the trade-off is
+irreducible; `unknown_key_refuses` documents how to drop it (delete the
+top-level branch, keep the nested rule).
 
 Config files are read through bounded opened-file adapters. Linux admits a
 resolved regular-file symlink component-wise; on macOS/Windows a _final_

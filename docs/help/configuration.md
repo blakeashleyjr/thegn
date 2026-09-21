@@ -408,8 +408,16 @@ per-project overlay
 `[project.<slug>]` (also written `[workspace.<slug>]`, which is normalized to
 `[project.<slug>]`) — that subtree holds accounts, hooks, sandbox mounts, the
 queues, ci, autopilot, the MCP scope ceiling, env bundles, git and editor.
+The two root path keys `worktrees_dir` and `projects_dir` count as well, so a
+typo of them refuses rather than silently relocating every worktree.
 A typo of one of these tables (`[sandboxx]`, `[metric]`) refuses too: the
-nearest-key hint names what you meant. Everywhere else —
+nearest-key hint names what you meant. The cost of that is deliberate and
+worth knowing: a top-level table within about two edits of a
+security-relevant name is refused even when it is not a typo — so a table a
+newer build adds called `[hosts]`, `[bundles]`, `[zones]`, `[secret]`,
+`[agent]` or `[stat]` will stop an older build that does not know it. (The
+schema already has such neighbours: `profile` and `profiles`.) If you hit
+that, rename or remove the key, or run the build that knows it. Everywhere else —
 and for an unknown top-level table — the key is ignored with a warning, so
 one `~/.config/thegn/config.toml` shared by builds of different ages keeps
 working when a newer build adds a key. `thegn config validate` reports both,

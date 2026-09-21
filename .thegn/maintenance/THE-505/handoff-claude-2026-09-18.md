@@ -291,3 +291,54 @@ table is still owed.
   therefore load-bearing: it is what keeps `config validate`/doctor in
   agreement with startup, since the file validators alone cannot see the
   effective candidate (or the environment layer).
+
+## Approval fold-ins
+
+1. The rot guard was assert-only-empty, so a schemars shape change that made
+   `collect` stop matching would have left it passing and decorative. It now
+   also asserts the flagged set CONTAINS known members (sandbox, project,
+   agents, env, host, metrics) and has a plausible size (39 roots flagged
+   when written; the test fails below 30).
+2. `is_dangerous_field` used a command/argv-only vocabulary and so detected
+   only 39 of the 65 listed roots. It now also names what this schema
+   actually uses for the same things: `run` (`actions[].run`), `args` /
+   `*_args` (`lsp.servers[].args`, `extra_args`), `*_bin`
+   (`host_discovery.tailnet.tailscale_bin`), bare `path`
+   (`managed_tools.<k>.path`, `calendar.accounts[].path`), `*_image`
+   (`env.<k>.k8s.image`, `sidecar_image`), `socket` (`daemon.socket`),
+   `proxy` (`mcp_servers.<k>.proxy`) and `*_dir` (`disk.sccache_dir`,
+   `shared_target_dir`, `clipboard.remote_dir`). The doc comment now says
+   the guard is a LOWER BOUND: roots whose danger is structural rather than
+   lexical (`[database]` migration authority, `[placement]` lanes, `[disk]`
+   reclamation) stay listed on human judgment.
+3. The nearest-key hint comment claimed a new table is "never within that
+   edit distance". That is false for this schema — `profile` and `profiles`
+   differ by one edit and one is security-relevant — so the comment and
+   `docs/help/configuration.md` now state the trade-off plainly: a new
+   top-level table within ~two edits of a security-relevant name
+   (`[hosts]`, `[bundles]`, `[zones]`, `[secret]`, `[agent]`, `[stat]`, …)
+   is refused by a build that does not know it, and the remedy is to rename
+   or remove the key. The behaviour is unchanged and the lever to drop it is
+   isolated: delete the top-level (`None`) branch of `unknown_key_refuses`
+   and keep the nested rule.
+
+### Bench caveats (recorded at the reviewer's request)
+
+The numbers above are a floor, not the real path: they run with
+`THEGN_NO_MIGRATE=1` against an isolated EMPTY state dir, so they exclude
+both the brand migration and the host-row read a real start pays, and the
+box was fast and idle while the target machine runs agent fleets. On those
+terms the branch takes ~16 % of the first-frame budget it did not take
+before (221.6 → 257.6 ms against a 300 ms invariant), so the schemars
+build-time cut is the next lever, not an optional one. The CLI delta
+(+14.6 ms with the 292 KB example config) rides every notify-push hook and
+every bridge spawn; the user's real config is ~46 KB, about 6× smaller, so
+their hooks pay proportionally less than this table suggests.
+
+### Follow-up filed, not fixed
+
+`config_admission::rejection_detail` validates each source standalone and
+returns the FIRST error it finds, so it can name an unknown non-security key
+as the "first likely cause" of a refusal actually caused by something else.
+Switching it to the layer policy (skipping keys the layer policy only warns
+about) would tighten the hint; the refusal itself is unaffected.
