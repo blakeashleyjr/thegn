@@ -1391,6 +1391,19 @@ fn a_by_part_cross_product_is_refused_as_it_grows() {
         0,
         "refused inside one period"
     );
+    // Lower bounds, because `spend` leaves the counter untouched when it
+    // refuses: an implementation that built the whole 86,400-element product
+    // and charged once per period would record a handful of units and ZERO
+    // bytes, and would sail through the upper bounds above.
+    assert!(
+        budget.used_retained_bytes() > 0,
+        "candidates were charged as they grew"
+    );
+    assert!(
+        budget.used_recurrence_work() >= 9_000,
+        "charged per candidate, not per period: {}",
+        budget.used_recurrence_work()
+    );
 
     // Under the DEFAULT budget the same rule is refused too, and the pass's
     // peak transient stays small: candidates and expanded locals are charged
@@ -1616,23 +1629,38 @@ fn default_ceilings_admit_a_heavy_but_legitimate_month() {
     // account of them (2,000) must still fit the counted dimensions.
     let factor = 2_000 / ROWS;
     assert!(budget.used_occurrences() * factor <= MAX_EXPANSION_OCCURRENCES);
+    // Expanded locals share that ceiling and are the tighter of the two: the
+    // walk looks back by the event's own duration, so it produces a few more
+    // locals than it keeps.
+    assert!(
+        budget.used_expanded_locals() * factor <= MAX_EXPANSION_OCCURRENCES,
+        "{} locals per row",
+        budget.used_expanded_locals() / ROWS
+    );
     assert!(budget.used_bucket_entries() * factor <= MAX_EXPANSION_BUCKET_ENTRIES);
     assert!(budget.used_recurrence_work() * factor <= MAX_EXPANSION_RECURRENCE_WORK);
     assert!(budget.used_source_visits() * factor <= MAX_EXPANSION_SOURCE_VISITS);
 
-    // Bytes are the dimension meant to bind first, so the assertion is on the
-    // COST PER OCCURRENCE rather than on this month's total: `CalEvent` is a
-    // public plugin struct designed to gain fields, and a size assertion would
-    // then fail here looking like an unrelated regression. At this bound the
-    // 64 MiB ceiling still covers 65,536 occurrences — some 1,300 rows of
-    // daily recurrence, an order of magnitude past any real calendar.
+    // Bytes are the dimension meant to bind first, so they get BOTH a
+    // per-occurrence bound — `CalEvent` is a public plugin struct designed to
+    // gain fields, and a raw total would fail here looking like an unrelated
+    // regression — and the whole-account total DERIVED from that measured
+    // cost, because only the total says whether a saturated account still
+    // expands. Without it a new field can push production to "month
+    // unavailable, reminders stalled" while this test stays green.
     const BYTES_PER_OCCURRENCE: usize = 1024;
     let per = budget.used_retained_bytes() / budget.used_occurrences();
     assert!(
         per <= BYTES_PER_OCCURRENCE,
         "{per} bytes per occurrence: re-derive the byte ceiling"
     );
-    const { assert!(MAX_EXPANSION_BYTES / BYTES_PER_OCCURRENCE >= 65_536) };
+    let saturated = per * 2_000 * WIDENED_DAYS as usize;
+    assert!(
+        saturated <= MAX_EXPANSION_BYTES,
+        "a saturated account needs {saturated} bytes at {per} each, past the \
+         {MAX_EXPANSION_BYTES}-byte ceiling: raise MAX_EXPANSION_BYTES (and its \
+         derivation) rather than loosening this bound"
+    );
 }
 
 #[test]

@@ -49,22 +49,29 @@ use std::sync::Arc;
 /// The output ceilings are sized against what an admitted cache can
 /// legitimately produce, so a real calendar never hits them (a row that is
 /// merely malformed is skipped per-row instead — see
-/// [`ExpansionError::is_row_local`]). The arithmetic, pinned by
+/// [`ExpansionError::is_row_local`]). The arithmetic, measured and pinned by
 /// `default_ceilings_admit_a_heavy_but_legitimate_month`:
 ///
-/// - `[calendar] max_events` admits 2,000 rows per account; the month window
-///   is widened by a week either side, so one row yields at most ~49
-///   occurrences (a daily recurrence) — call it 50.
-/// - 2,000 rows × 50 = 100,000 occurrences for a whole account of daily
-///   recurrences, so 131,072 leaves headroom above the worst admitted single
-///   account while staying two orders of magnitude below a runaway.
+/// - `[calendar] max_events` admits 2,000 rows per account, and the month
+///   window is widened by a week either side, so the heaviest legitimate row
+///   — a daily recurrence — yields ~49 occurrences. A saturated account is
+///   therefore ~98,000 occurrences, and ~106,000 expanded locals (the walk
+///   looks back by the event's own duration, so it produces a few more locals
+///   than it materializes). Both are held to `MAX_EXPANSION_OCCURRENCES`,
+///   which leaves ~24% over the tighter of the two.
 /// - Bucket entries follow occupancy: a long occurrence occupies several
 ///   days, so four entries per occurrence.
 /// - Recurrence work is ~32 units per materialized occurrence (period +
 ///   candidate + filter passes).
-/// - Retained bytes stay the real memory bound: 64 MiB is ~500 bytes for each
-///   of ~131,072 occurrences. Whichever binds first, it binds on memory, not
-///   on an arbitrary count.
+/// - Retained bytes are the dimension that actually binds, deliberately: at
+///   the measured ~680 bytes per occurrence a saturated account costs ~66 MB
+///   against this 64 MiB ceiling — about 1% of slack. That is the contract,
+///   not an oversight: memory, rather than an arbitrary count, is what stops
+///   an expansion. Growing [`CalEvent`] eats that slack, which is why the
+///   test above asserts the whole-account total from the MEASURED
+///   per-occurrence cost. When it fails, re-derive this ceiling instead of
+///   loosening the test, or a saturated account will report its month
+///   unavailable in production while the suite stays green.
 pub const MAX_EXPANSION_WINDOW_DAYS: u64 = 3_660;
 pub const MAX_EXPANSION_SOURCE_VISITS: usize = 65_536;
 pub const MAX_EXPANSION_RECURRENCE_WORK: usize = 4_194_304;
