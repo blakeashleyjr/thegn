@@ -98,3 +98,27 @@ the aggregate before cloning.
 - Not addressed: a patch applied between a tab switch and its hydration swap
   touches only the changed files of the new root (the swap's full merge fixes
   the list, as before).
+
+## Review round 3 (re-review of 81018146)
+
+- **B1 (blocking, verified):** `VisibleTarget` records which root the visible
+  Problems list was last built for. `refresh_for` upgrades any refresh to
+  `Full` when the active root differs, so a patch after a tab switch can no
+  longer splice worktree B's `src/lib.rs` into worktree A's still-displayed
+  list; the hydration swap's own merge re-owns the list via `rebuilt`.
+  Regression: two worktrees sharing `src/lib.rs`, patch after the switch.
+- **N1 (verified):** loss marks are retained memory, so they are now
+  byte-accounted (`loss_bytes`, `MAX_LOSS_MARK_BYTES` = 1 MiB) as well as
+  count-bounded; over the bound a mark escalates to its stream (never dropped).
+  `assert_store_conserved` checks maintained vs recomputed loss bytes; a
+  4 000 × ~4 KiB-path flood is capped and released on retirement.
+- **N2:** `scan_envelope` now tolerates the legal `\/` escape in both the
+  method name and `params.uri` (`json_str_eq` / `unescape_solidus`); any other
+  escape still falls back to a stream-wide loss mark rather than a wrong path.
+- **N3:** kept — a stream-wide mark ends only with a complete publication _for
+  that stream_, which is the resync evidence available; documented at the site.
+- **N4 (not taken):** a private marker field on `DiagnosticItem` would remove
+  the source/code spoofing ambiguity but touches the panel type and all its
+  producers; out of this issue's scope. The tag is now two fields
+  (`lsp:health` + `thegn-lsp-loss`), which only narrows the ambiguity.
+- **N5/N6:** accepted as documented behaviour.

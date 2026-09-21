@@ -6654,6 +6654,10 @@ async fn event_loop<T: Terminal>(
     // diagnostics across model swaps.
     let mut lsp_supervisor = crate::lsp::LspSupervisor::from_config(keymap.config());
     let mut lsp_diags = crate::lsp::LspDiagnostics::new();
+    // Which worktree the visible Problems list currently holds: a per-slice
+    // patch is only valid for that root, so a tab switch forces a full rebuild
+    // instead of splicing the new worktree's file into the old one's list.
+    let mut lsp_visible = crate::lsp::VisibleTarget::default();
     let lsp_diag_rx = lsp_supervisor
         .take_diagnostics_rx()
         .expect("LSP diagnostics receiver is installed once at startup");
@@ -9311,10 +9315,9 @@ async fn event_loop<T: Terminal>(
                 || !pending_input.is_empty(),
                 || loop_perf.tick(crate::perf::WakeSource::Lsp),
             );
-            if !outcome.refresh.is_none() {
-                outcome
-                    .refresh
-                    .apply_to(&lsp_diags, &active_root, &mut model.panel.diagnostics);
+            let refresh = lsp_visible.refresh_for(&active_root, outcome.refresh);
+            if !refresh.is_none() {
+                refresh.apply_to(&lsp_diags, &active_root, &mut model.panel.diagnostics);
                 dirty = true;
             }
         }
@@ -10280,7 +10283,9 @@ async fn event_loop<T: Terminal>(
                     let _ = lsp.reconcile_roots(epoch, live_roots); // best-effort: released-slot count is informational
                 });
             }
-            lsp_diags.merge_into(&active_tab_path(&session), &mut model.panel.diagnostics);
+            let swapped_root = active_tab_path(&session);
+            lsp_diags.merge_into(&swapped_root, &mut model.panel.diagnostics);
+            lsp_visible.rebuilt(&swapped_root);
             // Shares live on the supervisor (loop-local), not in hydration; a
             // fresh model wouldn't carry them — re-apply for the active worktree.
             model.shares = current_share_views(&share_supervisor, &session);

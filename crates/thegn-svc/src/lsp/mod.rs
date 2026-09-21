@@ -661,11 +661,16 @@ pub fn scan_envelope(input: &[u8]) -> Envelope {
                 let end = i.min(input.len());
                 i += 1;
                 if key.is_some() {
-                    // A string value for the pending key.
+                    // A string value for the pending key. `\/` is a legal
+                    // (and, for some encoders, default) escape for `/`, so
+                    // both comparisons tolerate it.
                     if key_is(key, 1, b"method") {
                         env.publishes_diagnostics |=
-                            &input[start..end] == b"textDocument/publishDiagnostics";
-                    } else if in_params && key_is(key, 2, b"uri") && !escaped {
+                            json_str_eq(&input[start..end], b"textDocument/publishDiagnostics");
+                    } else if in_params
+                        && key_is(key, 2, b"uri")
+                        && (!escaped || unescape_solidus(&input[start..end]).is_some())
+                    {
                         env.params_uri = Some((start, end));
                     }
                     key = None;
@@ -700,6 +705,47 @@ pub fn scan_envelope(input: &[u8]) -> Envelope {
         }
     }
     env
+}
+
+/// Compare a raw JSON string body with a literal, treating `\/` as `/`
+/// (the only escape either comparand may carry).
+fn json_str_eq(raw: &[u8], plain: &[u8]) -> bool {
+    let mut i = 0usize;
+    let mut j = 0usize;
+    while i < raw.len() && j < plain.len() {
+        let byte = if raw[i] == b'\\' && raw.get(i + 1) == Some(&b'/') {
+            i += 2;
+            b'/'
+        } else {
+            i += 1;
+            raw[i - 1]
+        };
+        if byte != plain[j] {
+            return false;
+        }
+        j += 1;
+    }
+    i == raw.len() && j == plain.len()
+}
+
+/// The raw string with `\/` unescaped, or `None` when it carries any other
+/// escape (those need a real JSON decode, which the caller cannot afford).
+fn unescape_solidus(raw: &[u8]) -> Option<String> {
+    let mut out = Vec::with_capacity(raw.len());
+    let mut i = 0usize;
+    while i < raw.len() {
+        if raw[i] == b'\\' {
+            if raw.get(i + 1) != Some(&b'/') {
+                return None;
+            }
+            out.push(b'/');
+            i += 2;
+        } else {
+            out.push(raw[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
 }
 
 /// The top-level integer `id` of a JSON-RPC body (see [`scan_envelope`]).
@@ -1857,7 +1903,8 @@ fn reject_unparsed(ctx: &ReaderContext, body: &[u8], reason: &str) {
     if env.publishes_diagnostics {
         let path = env
             .params_uri
-            .and_then(|(start, end)| std::str::from_utf8(&body[start..end]).ok())
+            .and_then(|(start, end)| unescape_solidus(&body[start..end]))
+            .as_deref()
             .and_then(bounded_uri_to_path);
         ctx.diag_tx.mark_lost(
             &ctx.root,
@@ -2606,5 +2653,32 @@ mod tests {
         let uri = path_to_uri(&path);
         assert!(uri.len() > limits::MAX_IDENTITY_BYTES);
         assert_eq!(bounded_uri_to_path(&uri), Some(path));
+    }
+
+    #[test]
+    fn envelope_scan_tolerates_escaped_solidus() {
+        // `\/` is legal JSON (PHP's json_encode emits it by default).
+        let body = br#"{"method":"textDocument\/publishDiagnostics","params":{"uri":"file:\/\/\/w\/a.rs","diagnostics":[]}}"#;
+        let env = scan_envelope(body);
+        assert!(env.publishes_diagnostics);
+        let (a, b) = env.params_uri.expect("uri located");
+        assert_eq!(
+            unescape_solidus(&body[a..b]).as_deref(),
+            Some("file:///w/a.rs")
+        );
+        assert!(json_str_eq(
+            br"textDocument\/publishDiagnostics",
+            b"textDocument/publishDiagnostics"
+        ));
+        assert!(!json_str_eq(
+            br"textDocument/publish",
+            b"textDocument/publishDiagnostics"
+        ));
+        assert!(!json_str_eq(
+            br"textDocument/publishDiagnosticsX",
+            b"textDocument/publishDiagnostics"
+        ));
+        // Any other escape is not decoded here (the loss falls back to the stream).
+        assert_eq!(unescape_solidus(br"file:\u002Fx"), None);
     }
 }
