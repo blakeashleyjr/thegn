@@ -27,6 +27,73 @@ fn defaults_are_inert_but_useful() {
 }
 
 #[test]
+fn remote_calendar_urls_are_parsed_normalized_and_redacted() {
+    assert_eq!(
+        normalize_remote_calendar_url(" WEBCAL://calendar.example/a.ics?sig=secret ", true)
+            .unwrap(),
+        "https://calendar.example/a.ics?sig=secret"
+    );
+    assert!(normalize_remote_calendar_url("ftp://calendar.example/a", true).is_err());
+    assert!(normalize_remote_calendar_url("webcal://calendar.example/a", false).is_err());
+    assert!(normalize_remote_calendar_url("https://user:secret@calendar.example/a", true).is_err());
+    assert!(normalize_remote_calendar_url("https://calendar.example/a#secret", true).is_err());
+}
+
+#[test]
+fn validation_dispatches_remote_url_policy_for_each_http_provider() {
+    let cfg = CalendarConfig {
+        accounts: vec![
+            CalendarAccount {
+                provider: CalendarProviderKind::IcsUrl,
+                url: "ftp://calendar.example/feed.ics".into(),
+                ..account("ics", CalendarProviderKind::IcsUrl)
+            },
+            CalendarAccount {
+                provider: CalendarProviderKind::CalDav,
+                url: "webcal://calendar.example/dav".into(),
+                ..account("dav", CalendarProviderKind::CalDav)
+            },
+        ],
+        ..CalendarConfig::default()
+    };
+    let errors = validate_calendar(&cfg);
+    assert_eq!(errors.len(), 2, "both remote providers must validate URLs");
+    assert!(errors.iter().all(|error| error.contains("url")));
+}
+
+#[test]
+fn remote_url_validation_never_echoes_subscription_credentials() {
+    let cfg = CalendarConfig {
+        accounts: vec![CalendarAccount {
+            name: "secret-feed".into(),
+            provider: CalendarProviderKind::IcsUrl,
+            url: "ftp://user:password@example.invalid/feed?token=opaque".into(),
+            ..Default::default()
+        }],
+        ..CalendarConfig::default()
+    };
+    let diagnostics = validate_calendar(&cfg).join("\n");
+    assert!(!diagnostics.contains("password"));
+    assert!(!diagnostics.contains("opaque"));
+    assert!(diagnostics.contains("http://") && diagnostics.contains("https://"));
+}
+
+#[test]
+fn calendar_account_debug_redacts_url_userinfo_and_token() {
+    let account = CalendarAccount {
+        url: "https://calendar.example/feed?token=debug-secret".into(),
+        username: "debug-user".into(),
+        token: "debug-token".into(),
+        ..account("private", CalendarProviderKind::IcsUrl)
+    };
+    let debug = format!("{account:?}");
+    assert!(!debug.contains("debug-secret"));
+    assert!(!debug.contains("debug-user"));
+    assert!(!debug.contains("debug-token"));
+    assert!(debug.contains("<redacted>"));
+}
+
+#[test]
 fn a_misconfigured_refresh_interval_can_never_spin() {
     // THE guard: 0 and 1 must both resolve to the floor, in the accessor, so
     // every caller inherits it rather than each remembering to clamp.

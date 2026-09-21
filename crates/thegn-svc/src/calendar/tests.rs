@@ -1,5 +1,33 @@
 use super::*;
+use axum::serve::Listener;
 use thegn_core::config_calendar::{CalendarAccount, CalendarConfig, CalendarProviderKind};
+
+struct CountingListener {
+    inner: tokio::net::TcpListener,
+    accepts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl axum::serve::Listener for CountingListener {
+    type Io = tokio::net::TcpStream;
+    type Addr = std::net::SocketAddr;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        loop {
+            match self.inner.accept().await {
+                Ok((stream, address)) => {
+                    self.accepts
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    return (stream, address);
+                }
+                Err(_) => tokio::task::yield_now().await,
+            }
+        }
+    }
+
+    fn local_addr(&self) -> std::io::Result<Self::Addr> {
+        self.inner.local_addr()
+    }
+}
 
 fn account(name: &str, provider: CalendarProviderKind) -> CalendarAccount {
     CalendarAccount {
@@ -74,7 +102,23 @@ fn only_network_failures_are_transient() {
     assert!(!CalendarError::Auth("401".into()).is_transient());
     assert!(!CalendarError::Parse("bad".into()).is_transient());
     assert!(!CalendarError::NotConfigured.is_transient());
+    assert!(!CalendarError::Policy("calendar destination refused").is_transient());
     assert!(!CalendarError::Unsupported("create").is_transient());
+}
+
+#[test]
+fn dns_policy_and_network_failures_keep_distinct_calendar_classifications() {
+    assert!(matches!(
+        ics_url::map_transport_error(crate::http::CalendarHttpError::DestinationRefused),
+        CalendarError::Policy("calendar destination refused")
+    ));
+    assert!(matches!(
+        caldav::map_transport_error(crate::http::CalendarHttpError::DestinationRefused),
+        CalendarError::Policy("calendar destination refused")
+    ));
+    let network = ics_url::map_transport_error(crate::http::CalendarHttpError::Network);
+    assert!(matches!(network, CalendarError::Network(_)));
+    assert!(network.is_transient());
 }
 
 #[test]
@@ -89,6 +133,1144 @@ fn errors_render_readably() {
             .to_string()
             .contains("401")
     );
+}
+
+#[tokio::test]
+async fn every_redirect_status_is_refused_without_following_or_replaying_auth() {
+    use axum::Router;
+    use axum::body::Body;
+    use axum::extract::Request;
+    use axum::http::{HeaderValue, StatusCode};
+    use axum::response::IntoResponse;
+    use axum::routing::any;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let source_hits = Arc::new(AtomicUsize::new(0));
+    let target_hits = Arc::new(AtomicUsize::new(0));
+    let auth_hits = Arc::new(AtomicUsize::new(0));
+    let source = Arc::clone(&source_hits);
+    let target = Arc::clone(&target_hits);
+    let auth = Arc::clone(&auth_hits);
+    let absolute_target = format!("http://{address}/target?token=redirect-secret");
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new().fallback(any(move |request: Request| {
+                let source = Arc::clone(&source);
+                let target = Arc::clone(&target);
+                let auth = Arc::clone(&auth);
+                async move {
+                    if request.uri().path() == "/target" {
+                        target.fetch_add(1, Ordering::SeqCst);
+                        return (StatusCode::OK, "must not be reached").into_response();
+                    }
+                    source.fetch_add(1, Ordering::SeqCst);
+                    if request.headers().get("authorization")
+                        == Some(&HeaderValue::from_static("Bearer feed-secret"))
+                    {
+                        auth.fetch_add(1, Ordering::SeqCst);
+                    }
+                    let status = request
+                        .uri()
+                        .path()
+                        .trim_start_matches('/')
+                        .parse::<u16>()
+                        .unwrap();
+                    let location = if status % 2 == 0 {
+                        absolute_target.clone()
+                    } else {
+                        "/target?token=redirect-secret".to_owned()
+                    };
+                    let mut response =
+                        (StatusCode::from_u16(status).unwrap(), Body::empty()).into_response();
+                    response
+                        .headers_mut()
+                        .insert("location", HeaderValue::from_str(&location).unwrap());
+                    response
+                }
+            })),
+        )
+        .await
+        .unwrap();
+    });
+
+    let mut last_error = None;
+    for status in [301, 302, 303, 307, 308] {
+        let backend = ics_url::IcsUrlBackend::new(&CalendarAccount {
+            url: format!("http://{address}/{status}"),
+            token: "feed-secret".into(),
+            allow_private_network: true,
+            ..account("remote", CalendarProviderKind::IcsUrl)
+        });
+        let error = backend
+            .list_events(window().0, window().1, "sync-secret")
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            &error,
+            CalendarError::Policy("calendar redirect refused")
+        ));
+        last_error = Some(error);
+    }
+    assert_eq!(source_hits.load(Ordering::SeqCst), 5);
+    assert_eq!(target_hits.load(Ordering::SeqCst), 0);
+    assert_eq!(auth_hits.load(Ordering::SeqCst), 5);
+    assert!(!last_error.unwrap().to_string().contains("redirect-secret"));
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn caldav_redirect_never_replays_a_sync_token_body_for_any_status() {
+    use axum::Router;
+    use axum::body::{Body, to_bytes};
+    use axum::extract::Request;
+    use axum::http::{HeaderValue, StatusCode};
+    use axum::response::IntoResponse;
+    use axum::routing::any;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let target_hits = Arc::new(AtomicUsize::new(0));
+    let observed_token = Arc::new(AtomicUsize::new(0));
+    let target = Arc::clone(&target_hits);
+    let token = Arc::clone(&observed_token);
+    let absolute_target = format!("http://{address}/target?token=redirect-secret");
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new().fallback(any(move |request: Request| {
+                let target = Arc::clone(&target);
+                let token = Arc::clone(&token);
+                let absolute_target = absolute_target.clone();
+                async move {
+                    if request.uri().path() == "/target" {
+                        target.fetch_add(1, Ordering::SeqCst);
+                        return (StatusCode::OK, "unexpected target").into_response();
+                    }
+                    let path = request.uri().path().to_owned();
+                    let body = to_bytes(request.into_body(), 128 * 1024).await.unwrap();
+                    if body
+                        .windows(b"sync-secret".len())
+                        .any(|w| w == b"sync-secret")
+                    {
+                        token.fetch_add(1, Ordering::SeqCst);
+                    }
+                    let status = path
+                        .rsplit('/')
+                        .next()
+                        .and_then(|value| value.parse::<u16>().ok())
+                        .unwrap_or(307);
+                    let location = if status % 2 == 0 {
+                        absolute_target.clone()
+                    } else {
+                        "/target?token=redirect-secret".to_owned()
+                    };
+                    let mut response =
+                        (StatusCode::from_u16(status).unwrap(), Body::empty()).into_response();
+                    response
+                        .headers_mut()
+                        .insert("location", HeaderValue::from_str(&location).unwrap());
+                    response
+                }
+            })),
+        )
+        .await
+        .unwrap();
+    });
+
+    for status in [301, 302, 303, 307, 308] {
+        let backend = caldav::CalDavBackend::new(&CalendarAccount {
+            url: format!("http://{address}/report/{status}"),
+            token: "dav-secret".into(),
+            allow_private_network: true,
+            ..account("dav", CalendarProviderKind::CalDav)
+        });
+        let error = backend
+            .list_events(window().0, window().1, "sync-secret")
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            &error,
+            CalendarError::Policy("calendar redirect refused")
+        ));
+        assert!(!error.to_string().contains("redirect-secret"));
+    }
+    assert_eq!(target_hits.load(Ordering::SeqCst), 0);
+    assert_eq!(observed_token.load(Ordering::SeqCst), 5);
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn redirect_locations_are_never_followed_across_origins_or_schemes() {
+    use axum::Router;
+    use axum::body::Body;
+    use axum::extract::Request;
+    use axum::http::{HeaderValue, StatusCode};
+    use axum::response::IntoResponse;
+    use axum::routing::any;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let target_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target_address = target_listener.local_addr().unwrap();
+    let target_hits = Arc::new(AtomicUsize::new(0));
+    let observed_target_hits = Arc::clone(&target_hits);
+    let target_server = tokio::spawn(async move {
+        axum::serve(
+            target_listener,
+            Router::new().fallback(any(move |_request: Request| {
+                observed_target_hits.fetch_add(1, Ordering::SeqCst);
+                async { (StatusCode::OK, "must not be followed") }
+            })),
+        )
+        .await
+        .unwrap();
+    });
+
+    let source_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let source_address = source_listener.local_addr().unwrap();
+    let source_hits = Arc::new(AtomicUsize::new(0));
+    let observed_source_hits = Arc::clone(&source_hits);
+    let target_location = format!("http://{target_address}/cross-origin?token=redirect-secret");
+    let server = tokio::spawn(async move {
+        axum::serve(
+            source_listener,
+            Router::new().fallback(any(move |request: Request| {
+                let target_location = target_location.clone();
+                observed_source_hits.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    let location = match request.uri().path() {
+                        "/301" => "/relative?token=redirect-secret".to_owned(),
+                        "/302" => {
+                            format!("http://{source_address}/same-origin?token=redirect-secret")
+                        }
+                        "/303" | "/307" => target_location,
+                        // A Location can advertise a confidentiality downgrade;
+                        // refusing the original response means it is never opened.
+                        "/308" => {
+                            "http://downgrade.invalid/calendar?token=redirect-secret".to_owned()
+                        }
+                        _ => String::new(),
+                    };
+                    let mut response =
+                        (StatusCode::TEMPORARY_REDIRECT, Body::empty()).into_response();
+                    *response.status_mut() = match request.uri().path() {
+                        "/301" => StatusCode::MOVED_PERMANENTLY,
+                        "/302" => StatusCode::FOUND,
+                        "/303" => StatusCode::SEE_OTHER,
+                        "/307" => StatusCode::TEMPORARY_REDIRECT,
+                        _ => StatusCode::PERMANENT_REDIRECT,
+                    };
+                    response
+                        .headers_mut()
+                        .insert("location", HeaderValue::from_str(&location).unwrap());
+                    response
+                }
+            })),
+        )
+        .await
+        .unwrap();
+    });
+
+    for status in [301, 302, 303, 307, 308] {
+        let backend = ics_url::IcsUrlBackend::new(&CalendarAccount {
+            url: format!("http://{source_address}/{status}"),
+            allow_private_network: true,
+            ..account("remote", CalendarProviderKind::IcsUrl)
+        });
+        assert!(matches!(
+            backend
+                .list_events(window().0, window().1, "sync-secret")
+                .await
+                .unwrap_err(),
+            CalendarError::Policy("calendar redirect refused")
+        ));
+    }
+    assert_eq!(source_hits.load(Ordering::SeqCst), 5);
+    assert_eq!(target_hits.load(Ordering::SeqCst), 0);
+    server.abort();
+    target_server.abort();
+    let _ = server.await;
+    let _ = target_server.await;
+}
+
+#[tokio::test]
+async fn redirect_self_loops_are_refused_without_a_second_request() {
+    use axum::{Router, extract::Request, http::StatusCode, response::IntoResponse, routing::any};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&hits);
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new().fallback(any(move |_request: Request| {
+                observed.fetch_add(1, Ordering::SeqCst);
+                async {
+                    let mut response = (StatusCode::FOUND, ()).into_response();
+                    response
+                        .headers_mut()
+                        .insert("location", "/loop".parse().unwrap());
+                    response
+                }
+            })),
+        )
+        .await
+        .unwrap();
+    });
+
+    for provider in [CalendarProviderKind::IcsUrl, CalendarProviderKind::CalDav] {
+        let cfg = CalendarAccount {
+            url: format!("http://{address}/loop"),
+            allow_private_network: true,
+            ..account("loop", provider)
+        };
+        let error = match provider {
+            CalendarProviderKind::IcsUrl => ics_url::IcsUrlBackend::new(&cfg)
+                .list_events(window().0, window().1, "")
+                .await
+                .unwrap_err(),
+            CalendarProviderKind::CalDav => caldav::CalDavBackend::new(&cfg)
+                .list_events(window().0, window().1, "")
+                .await
+                .unwrap_err(),
+            _ => unreachable!(),
+        };
+        assert!(matches!(
+            error,
+            CalendarError::Policy("calendar redirect refused")
+        ));
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn caldav_token_recovery_is_one_bounded_retry_with_shared_deadline() {
+    use axum::Router;
+    use axum::body::Body;
+    use axum::body::to_bytes;
+    use axum::extract::Request;
+    use axum::http::{HeaderValue, StatusCode};
+    use axum::response::IntoResponse;
+    use axum::routing::any;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    for recovery_status in [StatusCode::CONFLICT, StatusCode::INSUFFICIENT_STORAGE] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
+        let observed = Arc::clone(&requests);
+        let recorded = Arc::clone(&bodies);
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().fallback(any(move |request: Request| {
+                    let observed = Arc::clone(&observed);
+                    let recorded = Arc::clone(&recorded);
+                    async move {
+                        let body = to_bytes(request.into_body(), 128 * 1024).await.unwrap();
+                        recorded
+                            .lock()
+                            .unwrap()
+                            .push(String::from_utf8_lossy(&body).into_owned());
+                        if observed.fetch_add(1, Ordering::SeqCst) == 0 {
+                            return (recovery_status, Body::empty()).into_response();
+                        }
+                        let mut response = (
+                            StatusCode::MULTI_STATUS,
+                            Body::from(
+                                "<multistatus><sync-token>new-token</sync-token></multistatus>",
+                            ),
+                        )
+                            .into_response();
+                        response
+                            .headers_mut()
+                            .insert("content-type", HeaderValue::from_static("application/xml"));
+                        response
+                    }
+                })),
+            )
+            .await
+            .unwrap();
+        });
+
+        let backend = caldav::CalDavBackend::new(&CalendarAccount {
+            url: format!("http://{address}/report"),
+            allow_private_network: true,
+            ..account("dav", CalendarProviderKind::CalDav)
+        });
+        let page = backend
+            .list_events(window().0, window().1, "expired-token")
+            .await
+            .unwrap();
+        assert_eq!(page.sync_token, "new-token");
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        {
+            let bodies = bodies.lock().unwrap();
+            assert!(bodies[0].contains("expired-token"));
+            assert!(!bodies[1].contains("expired-token"));
+        }
+        server.abort();
+        let _ = server.await;
+    }
+
+    for recovery_status in [StatusCode::CONFLICT, StatusCode::INSUFFICIENT_STORAGE] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&requests);
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().fallback(any(move |_request: Request| {
+                    let observed = Arc::clone(&observed);
+                    async move {
+                        let count = observed.fetch_add(1, Ordering::SeqCst);
+                        // Each response fits the operation budget separately;
+                        // together they exceed it. Resetting the deadline on
+                        // recovery would therefore make this fetch succeed.
+                        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                        if count == 0 {
+                            return (recovery_status, Body::empty()).into_response();
+                        }
+                        (
+                            StatusCode::MULTI_STATUS,
+                            [("content-type", "application/xml")],
+                            "<multistatus><sync-token>new-token</sync-token></multistatus>",
+                        )
+                            .into_response()
+                    }
+                })),
+            )
+            .await
+            .unwrap();
+        });
+        let backend = caldav::CalDavBackend::new(&CalendarAccount {
+            url: format!("http://{address}/report"),
+            allow_private_network: true,
+            ..account("dav", CalendarProviderKind::CalDav)
+        })
+        .with_timeout_for_test(std::time::Duration::from_millis(250));
+        let error = backend
+            .list_events(window().0, window().1, "expired-token")
+            .await
+            .unwrap_err();
+        assert!(matches!(error, CalendarError::Timeout(_)), "got {error:?}");
+        assert_eq!(requests.load(Ordering::SeqCst), 2, "no third REPORT");
+        server.abort();
+        let _ = server.await;
+    }
+}
+
+#[tokio::test]
+async fn oversized_chunked_and_encoded_calendar_bodies_are_rejected_before_parse() {
+    use axum::Router;
+    use axum::body::Body;
+    use axum::extract::Request;
+    use axum::http::{HeaderValue, StatusCode};
+    use axum::response::IntoResponse;
+    use axum::routing::any;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let exact_body = {
+        let prefix = "BEGIN:VCALENDAR\nX-PADDING:";
+        let suffix = "\nEND:VCALENDAR";
+        let padding = crate::http::MAX_BODY_BYTES - prefix.len() - suffix.len();
+        format!("{prefix}{}{suffix}", "x".repeat(padding))
+    };
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new().fallback(any(move |request: Request| {
+                let exact_body = exact_body.clone();
+                async move {
+                    if request.uri().path() == "/encoded" {
+                        let mut response = (StatusCode::OK, "not decoded").into_response();
+                        response
+                            .headers_mut()
+                            .insert("content-type", HeaderValue::from_static("text/calendar"));
+                        response
+                            .headers_mut()
+                            .insert("content-encoding", HeaderValue::from_static("gzip"));
+                        return response;
+                    }
+                    if request.uri().path() == "/error" {
+                        let stream = futures_util::stream::once(async {
+                            Ok::<_, std::io::Error>(vec![b'e'; (8 << 10) + 1])
+                        });
+                        let mut response = Body::from_stream(stream).into_response();
+                        *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+                        return response;
+                    }
+                    if request.uri().path() == "/exact" {
+                        let mut response = Body::from(exact_body).into_response();
+                        response
+                            .headers_mut()
+                            .insert("content-type", HeaderValue::from_static("text/calendar"));
+                        return response;
+                    }
+                    let size = (crate::http::MAX_BODY_BYTES) + 1;
+                    let stream = futures_util::stream::once(async move {
+                        Ok::<_, std::io::Error>(vec![b'x'; size])
+                    });
+                    let mut response = Body::from_stream(stream).into_response();
+                    response
+                        .headers_mut()
+                        .insert("content-type", HeaderValue::from_static("text/calendar"));
+                    response
+                }
+            })),
+        )
+        .await
+        .unwrap();
+    });
+
+    for path in ["/chunked", "/exact", "/error", "/encoded"] {
+        let backend = ics_url::IcsUrlBackend::new(&CalendarAccount {
+            url: format!("http://{address}{path}"),
+            allow_private_network: true,
+            ..account("remote", CalendarProviderKind::IcsUrl)
+        });
+        let result = backend.list_events(window().0, window().1, "").await;
+        if path == "/exact" {
+            assert!(result.is_ok(), "exactly capped body should be readable");
+            assert!(result.unwrap().events.is_empty());
+        } else if path == "/encoded" {
+            assert!(matches!(
+                result.unwrap_err(),
+                CalendarError::Policy("calendar response encoding refused")
+            ));
+        } else {
+            assert!(
+                matches!(result.unwrap_err(), CalendarError::BodyLimit(_)),
+                "{path} must fail at the application-owned limit"
+            );
+        }
+    }
+    server.abort();
+    let _ = server.await;
+}
+
+async fn raw_fixture_headers(socket: &mut tokio::net::TcpStream) -> Vec<u8> {
+    use tokio::io::AsyncReadExt;
+    let mut headers = Vec::new();
+    while !headers.ends_with(b"\r\n\r\n") {
+        assert!(headers.len() < crate::http::MAX_REQUEST_BYTES);
+        headers.push(socket.read_u8().await.unwrap());
+    }
+    headers
+}
+
+#[tokio::test]
+async fn declared_oversized_calendar_body_is_refused_without_reading_payload() {
+    use tokio::io::AsyncWriteExt;
+    for provider in [CalendarProviderKind::IcsUrl, CalendarProviderKind::CalDav] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let _request = raw_fixture_headers(&mut socket).await;
+            let (status, media) = if provider == CalendarProviderKind::CalDav {
+                ("207 Multi-Status", "application/xml")
+            } else {
+                ("200 OK", "text/calendar")
+            };
+            let headers = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: {media}\r\nContent-Length: {}\r\n\r\n",
+                crate::http::MAX_BODY_BYTES + 1
+            );
+            socket.write_all(headers.as_bytes()).await.unwrap();
+            // Never send the declared payload. Admission must reject headers
+            // immediately instead of waiting for body/idle/operation timeout.
+            std::future::pending::<()>().await;
+        });
+        let cfg = CalendarAccount {
+            url: format!("http://{address}/declared"),
+            allow_private_network: true,
+            ..account("declared", provider)
+        };
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            match provider {
+                CalendarProviderKind::IcsUrl => {
+                    ics_url::IcsUrlBackend::new(&cfg)
+                        .list_events(window().0, window().1, "")
+                        .await
+                }
+                _ => {
+                    caldav::CalDavBackend::new(&cfg)
+                        .list_events(window().0, window().1, "")
+                        .await
+                }
+            }
+        })
+        .await
+        .expect("oversized headers must refuse without reading the body");
+        assert!(
+            matches!(result, Err(CalendarError::BodyLimit(_))),
+            "{result:?}"
+        );
+        server.abort();
+        let _ = server.await;
+    }
+}
+
+#[tokio::test]
+async fn declared_oversized_error_body_is_refused_without_waiting_for_payload() {
+    use tokio::io::AsyncWriteExt;
+
+    for provider in [CalendarProviderKind::IcsUrl, CalendarProviderKind::CalDav] {
+        for status in [
+            "401 Unauthorized",
+            "403 Forbidden",
+            "409 Conflict",
+            "500 Internal Server Error",
+            "507 Insufficient Storage",
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let request = raw_fixture_headers(&mut socket).await;
+                let (media, method) = if provider == CalendarProviderKind::CalDav {
+                    ("application/xml", "REPORT")
+                } else {
+                    ("text/calendar", "GET")
+                };
+                let headers = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: {media}\r\nContent-Length: {}\r\n\r\n",
+                    crate::http::MAX_ERROR_BODY_BYTES + 1
+                );
+                assert!(
+                    std::str::from_utf8(&request)
+                        .unwrap_or_default()
+                        .starts_with(method),
+                    "backend must use the expected request method"
+                );
+                socket.write_all(headers.as_bytes()).await.unwrap();
+                // A header-only error must be rejected at the diagnostic cap; do
+                // not make the client wait for an absent body until its deadline.
+                std::future::pending::<()>().await;
+            });
+            let cfg = CalendarAccount {
+                url: format!("http://{address}/declared-error"),
+                allow_private_network: true,
+                ..account("declared-error", provider)
+            };
+            let result = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                match provider {
+                    CalendarProviderKind::IcsUrl => {
+                        ics_url::IcsUrlBackend::new(&cfg)
+                            .list_events(window().0, window().1, "prior-token")
+                            .await
+                    }
+                    _ => {
+                        caldav::CalDavBackend::new(&cfg)
+                            .list_events(window().0, window().1, "prior-token")
+                            .await
+                    }
+                }
+            })
+            .await
+            .expect("oversized error headers must refuse without reading the body");
+            assert!(
+                matches!(result, Err(CalendarError::BodyLimit(_))),
+                "{result:?}"
+            );
+            server.abort();
+            let _ = server.await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn gateway_error_media_is_discarded_without_parsing_or_disclosure() {
+    use axum::{Router, http::StatusCode, routing::any};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new().fallback(any(|| async {
+                (
+                    StatusCode::UNAUTHORIZED,
+                    [("content-type", "text/html")],
+                    "<html>secret-gateway-token</html>",
+                )
+            })),
+        )
+        .await
+        .unwrap();
+    });
+    for provider in [CalendarProviderKind::IcsUrl, CalendarProviderKind::CalDav] {
+        let cfg = CalendarAccount {
+            url: format!("http://{address}/error"),
+            allow_private_network: true,
+            ..account("gateway", provider)
+        };
+        let result = match provider {
+            CalendarProviderKind::IcsUrl => {
+                ics_url::IcsUrlBackend::new(&cfg)
+                    .list_events(window().0, window().1, "")
+                    .await
+            }
+            _ => {
+                caldav::CalDavBackend::new(&cfg)
+                    .list_events(window().0, window().1, "")
+                    .await
+            }
+        };
+        let error = result.unwrap_err();
+        assert!(matches!(error, CalendarError::Auth(_)), "{error:?}");
+        assert!(!format!("{error:?}").contains("secret-gateway-token"));
+    }
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn caldav_body_limits_cover_exact_chunked_and_error_responses() {
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let exact_prefix = b"<multistatus><sync-token>exact</sync-token><!--";
+    let exact_suffix = b"--></multistatus>";
+    let mut exact = Vec::with_capacity(crate::http::MAX_BODY_BYTES);
+    exact.extend_from_slice(exact_prefix);
+    exact.extend(std::iter::repeat_n(
+        b'x',
+        crate::http::MAX_BODY_BYTES - exact_prefix.len() - exact_suffix.len(),
+    ));
+    exact.extend_from_slice(exact_suffix);
+    let exact = Arc::new(exact);
+    let oversized = Arc::new(vec![b'x'; crate::http::MAX_BODY_BYTES + 1]);
+    let server = tokio::spawn({
+        let exact = Arc::clone(&exact);
+        let oversized = Arc::clone(&oversized);
+        async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let exact = Arc::clone(&exact);
+                let oversized = Arc::clone(&oversized);
+                tokio::spawn(async move {
+                    let request = raw_fixture_headers(&mut socket).await;
+                    // Consume the REPORT body before closing the socket.
+                    // Closing with unread request bytes can reset TCP and
+                    // truncate an otherwise exactly-sized valid response.
+                    let headers = std::str::from_utf8(&request).unwrap();
+                    let length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap_or(0);
+                    assert!(length <= crate::http::MAX_REQUEST_BYTES);
+                    let mut request_body = vec![0; length];
+                    socket.read_exact(&mut request_body).await.unwrap();
+                    let path = request
+                        .split(|byte| *byte == b' ')
+                        .nth(1)
+                        .and_then(|path| std::str::from_utf8(path).ok())
+                        .unwrap_or_default();
+                    let (status, body, chunked) = match path {
+                        "/dav-exact" => ("207 Multi-Status", exact.as_slice(), false),
+                        "/dav-error" => ("500 Internal Server Error", oversized.as_slice(), true),
+                        _ => ("207 Multi-Status", oversized.as_slice(), true),
+                    };
+                    let transfer = if chunked {
+                        "Transfer-Encoding: chunked\r\n"
+                    } else {
+                        ""
+                    };
+                    let length = if chunked {
+                        String::new()
+                    } else {
+                        format!("Content-Length: {}\r\n", body.len())
+                    };
+                    let header = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/xml\r\n{transfer}{length}Connection: close\r\n\r\n"
+                    );
+                    if socket.write_all(header.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    if chunked {
+                        for chunk in body.chunks(64 * 1024) {
+                            if socket
+                                .write_all(format!("{:x}\r\n", chunk.len()).as_bytes())
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                            if socket.write_all(chunk).await.is_err()
+                                || socket.write_all(b"\r\n").await.is_err()
+                            {
+                                return;
+                            }
+                        }
+                        let _ = socket.write_all(b"0\r\n\r\n").await;
+                    } else {
+                        let _ = socket.write_all(body).await;
+                    }
+                });
+            }
+        }
+    });
+
+    let exact_result = caldav::CalDavBackend::new(&CalendarAccount {
+        url: format!("http://{address}/dav-exact"),
+        allow_private_network: true,
+        ..account("dav-exact", CalendarProviderKind::CalDav)
+    })
+    .list_events(window().0, window().1, "")
+    .await;
+    assert!(
+        exact_result.is_ok(),
+        "exactly capped CalDAV body must parse: {exact_result:?}"
+    );
+
+    for path in ["/dav-oversized", "/dav-error"] {
+        let error = caldav::CalDavBackend::new(&CalendarAccount {
+            url: format!("http://{address}{path}"),
+            allow_private_network: true,
+            ..account("dav-limit", CalendarProviderKind::CalDav)
+        })
+        .list_events(window().0, window().1, "")
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(error, CalendarError::BodyLimit(_)),
+            "{path} must stop at the application-owned cap: {error:?}"
+        );
+    }
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn both_remote_backends_refuse_literal_non_public_addresses_before_connecting() {
+    for (provider, url) in [
+        (CalendarProviderKind::IcsUrl, "http://127.0.0.1:9/feed"),
+        (CalendarProviderKind::IcsUrl, "http://0.0.0.0:9/feed"),
+        (CalendarProviderKind::IcsUrl, "http://[::1]:9/feed"),
+        (CalendarProviderKind::IcsUrl, "http://[::]:9/feed"),
+        (
+            CalendarProviderKind::IcsUrl,
+            "http://[::ffff:127.0.0.1]:9/feed",
+        ),
+        (CalendarProviderKind::CalDav, "http://127.0.0.1:9/dav"),
+        (CalendarProviderKind::CalDav, "http://0.0.0.0:9/dav"),
+        (CalendarProviderKind::CalDav, "http://[::1]:9/dav"),
+        (CalendarProviderKind::CalDav, "http://[::]:9/dav"),
+        (
+            CalendarProviderKind::CalDav,
+            "http://[::ffff:127.0.0.1]:9/dav",
+        ),
+    ] {
+        let backend = match provider {
+            CalendarProviderKind::IcsUrl => ics_url::IcsUrlBackend::new(&CalendarAccount {
+                url: url.into(),
+                ..account("remote", provider)
+            }),
+            CalendarProviderKind::CalDav => {
+                let backend = caldav::CalDavBackend::new(&CalendarAccount {
+                    url: url.into(),
+                    ..account("remote", provider)
+                });
+                let error = backend
+                    .list_events(window().0, window().1, "")
+                    .await
+                    .unwrap_err();
+                assert!(matches!(
+                    error,
+                    CalendarError::Policy("calendar destination refused")
+                ));
+                continue;
+            }
+            _ => unreachable!(),
+        };
+        let error = backend
+            .list_events(window().0, window().1, "")
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            CalendarError::Policy("calendar destination refused")
+        ));
+    }
+}
+
+#[tokio::test]
+async fn media_encoding_and_shared_pool_policies_apply_to_real_backends() {
+    use axum::Router;
+    use axum::body::{Body, to_bytes};
+    use axum::extract::Request;
+    use axum::http::{HeaderValue, StatusCode};
+    use axum::response::IntoResponse;
+    use axum::routing::any;
+    use std::sync::{Arc, Mutex};
+
+    let records = Arc::new(Mutex::new(Vec::<(
+        String,
+        String,
+        Option<String>,
+        String,
+        bool,
+    )>::new()));
+    let observed = Arc::clone(&records);
+    let accepts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let listener = CountingListener {
+        inner: tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap(),
+        accepts: Arc::clone(&accepts),
+    };
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new().fallback(any(move |request: Request| {
+                let observed = Arc::clone(&observed);
+                async move {
+                    let path = request.uri().path().to_owned();
+                    let uri = request.uri().to_string();
+                    let auth = request
+                        .headers()
+                        .get("authorization")
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or_default()
+                        .to_owned();
+                    let etag = request
+                        .headers()
+                        .get("if-none-match")
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_owned);
+                    let cookie = request.headers().contains_key("cookie");
+                    let body = to_bytes(request.into_body(), 128 * 1024).await.unwrap();
+                    let body = String::from_utf8_lossy(&body).into_owned();
+                    observed
+                        .lock()
+                        .unwrap()
+                        .push((uri, auth, etag, body, cookie));
+                    let is_dav = path.starts_with("/dav-") || path == "/dav";
+                    let mut response = if is_dav {
+                        (
+                            StatusCode::MULTI_STATUS,
+                            Body::from(
+                                "<multistatus><sync-token>dav-new</sync-token></multistatus>",
+                            ),
+                        )
+                            .into_response()
+                    } else {
+                        (StatusCode::OK, Body::from(ONE_EVENT)).into_response()
+                    };
+                    let content_type = match path.as_str() {
+                        "/ics-application-calendar" => "application/calendar; charset=utf-8",
+                        "/ics-application-ics" => "application/ics; charset=utf-8",
+                        "/ics-text-plain" => "text/plain; charset=utf-8",
+                        "/dav-text-xml" => "text/xml; charset=utf-8",
+                        "/dav-application-dav" => "application/dav+xml; charset=utf-8",
+                        _ if is_dav => "Application/XML; charset=utf-8",
+                        _ => "TEXT/CALENDAR; charset=utf-8",
+                    };
+                    response
+                        .headers_mut()
+                        .insert("content-type", HeaderValue::from_static(content_type));
+                    if path == "/encoding" {
+                        response
+                            .headers_mut()
+                            .append("content-encoding", HeaderValue::from_static("identity"));
+                        response
+                            .headers_mut()
+                            .append("content-encoding", HeaderValue::from_static("gzip"));
+                    } else {
+                        response
+                            .headers_mut()
+                            .insert("set-cookie", HeaderValue::from_static("calendar=one"));
+                        response
+                            .headers_mut()
+                            .insert("etag", HeaderValue::from_static("next-validator"));
+                    }
+                    if path == "/repeat-content-type" {
+                        response
+                            .headers_mut()
+                            .append("content-type", HeaderValue::from_static("text/calendar"));
+                    }
+                    response
+                }
+            })),
+        )
+        .await
+        .unwrap();
+    });
+
+    let config = |first_query: &str, second_query: &str| CalendarConfig {
+        accounts: vec![
+            CalendarAccount {
+                name: "first".into(),
+                provider: CalendarProviderKind::IcsUrl,
+                url: format!("http://{address}/feed?account={first_query}"),
+                username: "first-user".into(),
+                token: "first-secret".into(),
+                allow_private_network: true,
+                ..Default::default()
+            },
+            CalendarAccount {
+                name: "second".into(),
+                provider: CalendarProviderKind::IcsUrl,
+                url: format!("http://{address}/feed?account={second_query}"),
+                username: "second-user".into(),
+                token: "second-secret".into(),
+                allow_private_network: true,
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    let tokens = std::collections::BTreeMap::from([
+        ("first".to_owned(), "first-validator".to_owned()),
+        ("second".to_owned(), "second-validator".to_owned()),
+    ]);
+    CalendarRouter::from_config(&config("first-query", "second-query"))
+        .list_events(window().0, window().1, &tokens)
+        .await;
+    // Rebuilding the router/backends must still clone the same process pool;
+    // credentials and validators remain request-local.
+    CalendarRouter::from_config(&config("first-query", "second-query"))
+        .list_events(window().0, window().1, &tokens)
+        .await;
+
+    let dav = caldav::CalDavBackend::new(&CalendarAccount {
+        url: format!("http://{address}/dav?account=dav-query"),
+        token: "dav-secret".into(),
+        allow_private_network: true,
+        ..account("dav", CalendarProviderKind::CalDav)
+    });
+    dav.list_events(window().0, window().1, "dav-sync-secret")
+        .await
+        .unwrap();
+
+    for path in [
+        "/feed",
+        "/ics-application-calendar",
+        "/ics-application-ics",
+        "/ics-text-plain",
+    ] {
+        ics_url::IcsUrlBackend::new(&CalendarAccount {
+            url: format!("http://{address}{path}"),
+            allow_private_network: true,
+            ..account("mime", CalendarProviderKind::IcsUrl)
+        })
+        .list_events(window().0, window().1, "")
+        .await
+        .unwrap();
+    }
+    for path in ["/dav", "/dav-text-xml", "/dav-application-dav"] {
+        caldav::CalDavBackend::new(&CalendarAccount {
+            url: format!("http://{address}{path}"),
+            allow_private_network: true,
+            ..account("mime-dav", CalendarProviderKind::CalDav)
+        })
+        .list_events(window().0, window().1, "")
+        .await
+        .unwrap();
+    }
+
+    let encoded = ics_url::IcsUrlBackend::new(&CalendarAccount {
+        url: format!("http://{address}/encoding"),
+        allow_private_network: true,
+        ..account("encoded", CalendarProviderKind::IcsUrl)
+    });
+    let error = encoded
+        .list_events(window().0, window().1, "")
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        CalendarError::Policy("calendar response encoding refused")
+    ));
+    let repeated = ics_url::IcsUrlBackend::new(&CalendarAccount {
+        url: format!("http://{address}/repeat-content-type"),
+        allow_private_network: true,
+        ..account("repeated", CalendarProviderKind::IcsUrl)
+    })
+    .list_events(window().0, window().1, "")
+    .await
+    .unwrap_err();
+    assert!(matches!(
+        repeated,
+        CalendarError::Policy("calendar response content type refused")
+    ));
+
+    {
+        let records = records.lock().unwrap();
+        let first_records: Vec<_> = records
+            .iter()
+            .filter(|record| record.0.contains("account=first-query"))
+            .collect();
+        let second_records: Vec<_> = records
+            .iter()
+            .filter(|record| record.0.contains("account=second-query"))
+            .collect();
+        assert_eq!(first_records.len(), 2);
+        assert_eq!(second_records.len(), 2);
+        assert!(
+            first_records
+                .iter()
+                .all(|record| record.1.starts_with("Basic "))
+        );
+        assert!(
+            second_records
+                .iter()
+                .all(|record| record.1.starts_with("Basic "))
+        );
+        assert_ne!(first_records[0].1, second_records[0].1);
+        assert!(
+            first_records
+                .iter()
+                .any(|record| record.2.as_deref() == Some("first-validator"))
+        );
+        assert!(
+            second_records
+                .iter()
+                .any(|record| record.2.as_deref() == Some("second-validator"))
+        );
+        assert!(
+            records
+                .iter()
+                .any(|record| record.0.contains("account=dav-query"))
+        );
+        assert!(
+            records
+                .iter()
+                .any(|record| record.3.contains("dav-sync-secret"))
+        );
+        assert!(
+            records.iter().all(|record| !record.4),
+            "pool must not retain cookies"
+        );
+        assert!(accepts.load(std::sync::atomic::Ordering::SeqCst) < records.len());
+    }
+    server.abort();
+    let _ = server.await;
 }
 
 // --- the ics backend --------------------------------------------------------

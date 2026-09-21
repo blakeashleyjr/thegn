@@ -152,6 +152,20 @@ color = "teal"
 | `caldav`  | a CalDAV collection — the only provider with real deltas, so deletions sync too                                  |
 | `command` | any program that prints events as JSON — see below                                                               |
 
+Remote calendar HTTP is deliberately restrictive: `ics_url` accepts HTTPS,
+HTTP, and `webcal://` (normalized to HTTPS); CalDAV accepts HTTPS or HTTP.
+Userinfo, redirects, automatic decompression, and ambient proxy settings are
+refused. Destinations must resolve to public unicast addresses by default. A
+trusted LAN calendar may set `allow_private_network = true`; that permission
+still rejects unspecified, multicast, and broadcast addresses. Query strings
+are retained for signed subscriptions but are never included in errors or
+diagnostics. Responses are streamed with a 32 MiB hard cap, and compressed
+responses are rejected rather than decompressed. Error bodies are discarded under a separate
+8 KiB cap, including a declared-length check before reading. HTML, text, or JSON
+errors from authentication gateways are accepted only for discard; their contents
+are never parsed or shown. Successful bodies must use a supported ICS or DAV
+media type.
+
 There's deliberately no Google or Outlook integration: both need an OAuth client
 registration and a consent flow, and both hand out a secret `.ics` URL that
 `ics_url` already reads. Fastmail, Nextcloud and Proton do too.

@@ -15,34 +15,53 @@ use futures_util::future::BoxFuture;
 use thegn_core::config_calendar::CalendarAccount;
 
 use super::{CalendarBackend, CalendarCaps, CalendarError, EventPage};
+use crate::http::{
+    CalendarHttpClient, CalendarHttpError, ExpectedMedia, MAX_REQUEST_BYTES, bounded_header_value,
+    discard_body, map_error, read_body, validate_encoding, validate_media,
+};
+use tokio::time::Instant;
 
-/// Refuse to buffer a calendar larger than this.
-const MAX_BODY: usize = 32 << 20;
+pub(super) fn map_transport_error(error: CalendarHttpError) -> CalendarError {
+    match error {
+        CalendarHttpError::Timeout => CalendarError::Timeout(map_error(error)),
+        CalendarHttpError::BodyLimit => CalendarError::BodyLimit(map_error(error)),
+        CalendarHttpError::DestinationRefused => CalendarError::Policy(map_error(error)),
+        other => CalendarError::Network(map_error(other).into()),
+    }
+}
 
 pub struct IcsUrlBackend {
-    url: String,
     username: String,
     token: String,
     zone: String,
     timeout: Duration,
     max_events: usize,
+    http: Option<CalendarHttpClient>,
+    init_error: Option<CalendarHttpError>,
 }
 
 impl IcsUrlBackend {
     pub fn new(a: &CalendarAccount) -> Self {
+        let configured = !a.url.trim().is_empty();
+        let (http, init_error) = if !configured {
+            (None, None)
+        } else {
+            match thegn_core::config_calendar::normalize_remote_calendar_url(&a.url, true) {
+                Ok(url) => match CalendarHttpClient::new(&url, a.allow_private_network) {
+                    Ok(client) => (Some(client), None),
+                    Err(error) => (None, Some(error)),
+                },
+                Err(_) => (None, Some(CalendarHttpError::InvalidUrl)),
+            }
+        };
         IcsUrlBackend {
-            // `webcal://` is just https with a scheme that tells the OS to hand
-            // the link to a calendar app; over the wire it is an ordinary GET.
-            url: a
-                .url
-                .trim()
-                .replacen("webcal://", "https://", 1)
-                .to_string(),
             username: a.username.clone(),
             token: thegn_core::config::expand_env_ref(&a.token).unwrap_or_default(),
             zone: String::new(),
             timeout: Duration::from_secs(a.timeout_secs.clamp(5, 120)),
             max_events: 0,
+            http,
+            init_error,
         }
     }
 
@@ -77,14 +96,17 @@ impl CalendarBackend for IcsUrlBackend {
         sync_token: &'a str,
     ) -> BoxFuture<'a, Result<EventPage, CalendarError>> {
         Box::pin(async move {
-            if self.url.is_empty() {
+            if self.http.is_none() && self.init_error.is_none() {
                 return Err(CalendarError::NotConfigured);
             }
-            let client = reqwest::Client::builder()
-                .timeout(self.timeout)
-                .build()
-                .map_err(|e| CalendarError::Network(e.to_string()))?;
-            let mut req = client.get(&self.url);
+            if let Some(error) = self.init_error {
+                return Err(CalendarError::Policy(map_error(error)));
+            }
+            if sync_token.len() > MAX_REQUEST_BYTES {
+                return Err(CalendarError::BodyLimit("calendar validator exceeds limit"));
+            }
+            let http = self.http.as_ref().expect("checked above");
+            let mut req = http.request(reqwest::Method::GET);
             if !sync_token.is_empty() {
                 req = req.header(reqwest::header::IF_NONE_MATCH, sync_token);
             }
@@ -95,10 +117,22 @@ impl CalendarBackend for IcsUrlBackend {
                     req = req.basic_auth(&self.username, Some(&self.token));
                 }
             }
-            let resp = req
-                .send()
+            let deadline = Instant::now() + self.timeout;
+            let resp = http
+                .send(req, deadline)
                 .await
-                .map_err(|e| CalendarError::Network(e.to_string()))?;
+                .map_err(map_transport_error)?;
+
+            // 304 is the one protocol-level 3xx compatibility response: it is
+            // not a redirect and preserves the existing ETag cache behavior.
+            // Every other 3xx is refused before Location is inspected.
+            if resp.status().is_redirection() && resp.status() != reqwest::StatusCode::NOT_MODIFIED
+            {
+                return Err(CalendarError::Policy(map_error(
+                    CalendarHttpError::Redirect,
+                )));
+            }
+            validate_encoding(&resp).map_err(|error| CalendarError::Policy(map_error(error)))?;
 
             if resp.status() == reqwest::StatusCode::NOT_MODIFIED {
                 // Nothing changed. Return the SAME token and `unchanged`, so the
@@ -113,31 +147,33 @@ impl CalendarBackend for IcsUrlBackend {
             if resp.status() == reqwest::StatusCode::UNAUTHORIZED
                 || resp.status() == reqwest::StatusCode::FORBIDDEN
             {
-                return Err(CalendarError::Auth(format!("HTTP {}", resp.status())));
+                let status = resp.status();
+                discard_body(resp, deadline)
+                    .await
+                    .map_err(map_transport_error)?;
+                return Err(CalendarError::Auth(format!("HTTP {status}")));
             }
             if !resp.status().is_success() {
-                return Err(CalendarError::Api(format!("HTTP {}", resp.status())));
+                let status = resp.status();
+                discard_body(resp, deadline)
+                    .await
+                    .map_err(map_transport_error)?;
+                return Err(CalendarError::Api(format!("HTTP {status}")));
             }
-            let etag = resp
-                .headers()
-                .get(reqwest::header::ETAG)
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or_default()
-                .to_string();
-            if let Some(len) = resp.content_length()
-                && len as usize > MAX_BODY
-            {
-                return Err(CalendarError::Api(format!(
-                    "calendar too large ({len} bytes)"
-                )));
-            }
-            let body = resp
-                .text()
+            validate_media(&resp, ExpectedMedia::Ics)
+                .map_err(|error| CalendarError::Policy(map_error(error)))?;
+            let etag = bounded_header_value(&resp, &reqwest::header::ETAG)
+                .map_err(|error| CalendarError::BodyLimit(map_error(error)))?
+                .unwrap_or_default();
+            let body = read_body(resp, deadline)
                 .await
-                .map_err(|e| CalendarError::Network(e.to_string()))?;
-            if body.len() > MAX_BODY {
-                return Err(CalendarError::Api("calendar too large".into()));
-            }
+                .map_err(|error| match error {
+                    CalendarHttpError::BodyLimit => CalendarError::BodyLimit(map_error(error)),
+                    CalendarHttpError::Timeout => CalendarError::Timeout(map_error(error)),
+                    other => CalendarError::Network(map_error(other).into()),
+                })?;
+            let body = String::from_utf8(body)
+                .map_err(|_| CalendarError::Parse("calendar response is not UTF-8".into()))?;
             let zone = if self.zone.is_empty() {
                 "UTC"
             } else {

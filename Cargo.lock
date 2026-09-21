@@ -8272,6 +8272,7 @@ dependencies = [
  "tree-sitter-typescript",
  "unic-langid",
  "unicode-width 0.2.2",
+ "url",
  "walkdir",
  "windows-sys 0.59.0",
 ]
@@ -8414,6 +8415,7 @@ dependencies = [
  "tower",
  "tower-http",
  "tracing",
+ "url",
  "windows-sys 0.59.0",
 ]
 

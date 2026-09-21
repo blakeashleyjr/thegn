@@ -17,30 +17,55 @@ use std::time::Duration;
 use chrono::NaiveDate;
 use futures_util::future::BoxFuture;
 use thegn_core::config_calendar::CalendarAccount;
+use tokio::time::Instant;
 
 use super::{CalendarBackend, CalendarCaps, CalendarError, EventPage};
+use crate::http::{
+    CalendarHttpClient, CalendarHttpError, ExpectedMedia, MAX_REQUEST_BYTES, discard_body,
+    map_error, read_body, validate_encoding, validate_media,
+};
 
-/// Refuse to buffer a response larger than this.
-const MAX_BODY: usize = 32 << 20;
+pub(super) fn map_transport_error(error: CalendarHttpError) -> CalendarError {
+    match error {
+        CalendarHttpError::Timeout => CalendarError::Timeout(map_error(error)),
+        CalendarHttpError::BodyLimit => CalendarError::BodyLimit(map_error(error)),
+        CalendarHttpError::DestinationRefused => CalendarError::Policy(map_error(error)),
+        other => CalendarError::Network(map_error(other).into()),
+    }
+}
 
 pub struct CalDavBackend {
-    url: String,
     username: String,
     token: String,
     zone: String,
     timeout: Duration,
     max_events: usize,
+    http: Option<CalendarHttpClient>,
+    init_error: Option<CalendarHttpError>,
 }
 
 impl CalDavBackend {
     pub fn new(a: &CalendarAccount) -> Self {
+        let configured = !a.url.trim().is_empty();
+        let (http, init_error) = if !configured {
+            (None, None)
+        } else {
+            match thegn_core::config_calendar::normalize_remote_calendar_url(&a.url, false) {
+                Ok(url) => match CalendarHttpClient::new(&url, a.allow_private_network) {
+                    Ok(client) => (Some(client), None),
+                    Err(error) => (None, Some(error)),
+                },
+                Err(_) => (None, Some(CalendarHttpError::InvalidUrl)),
+            }
+        };
         CalDavBackend {
-            url: a.url.trim().to_string(),
             username: a.username.clone(),
             token: thegn_core::config::expand_env_ref(&a.token).unwrap_or_default(),
             zone: String::new(),
             timeout: Duration::from_secs(a.timeout_secs.clamp(5, 120)),
             max_events: 0,
+            http,
+            init_error,
         }
     }
 
@@ -51,6 +76,12 @@ impl CalDavBackend {
 
     pub fn with_max_events(mut self, n: usize) -> Self {
         self.max_events = n;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_timeout_for_test(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
         self
     }
 
@@ -86,24 +117,62 @@ fn calendar_query_body(from: NaiveDate, to: NaiveDate) -> String {
     )
 }
 
-/// A `sync-collection` report resuming from `token`.
-fn sync_collection_body(token: &str) -> String {
-    format!(
-        r#"<?xml version="1.0" encoding="utf-8" ?>
+const SYNC_COLLECTION_PREFIX: &str = r#"<?xml version="1.0" encoding="utf-8" ?>
 <d:sync-collection xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
-  <d:sync-token>{}</d:sync-token>
+  <d:sync-token>"#;
+const SYNC_COLLECTION_SUFFIX: &str = r#"</d:sync-token>
   <d:sync-level>1</d:sync-level>
   <d:prop><d:getetag/><c:calendar-data/></d:prop>
-</d:sync-collection>"#,
-        xml_escape(token)
-    )
+</d:sync-collection>"#;
+
+/// A `sync-collection` report resuming from `token`.
+///
+/// The exact escaped size, including the XML envelope, is checked before any
+/// request buffer is allocated.  Escaping is then performed once into that
+/// pre-sized buffer; the old replace-chain temporarily held several large
+/// intermediate strings before applying the limit.
+fn sync_collection_body(token: &str) -> Result<String, CalendarError> {
+    let escaped_len = xml_escaped_len(token).ok_or(CalendarError::BodyLimit(
+        "calendar sync token exceeds limit",
+    ))?;
+    let size = SYNC_COLLECTION_PREFIX
+        .len()
+        .checked_add(escaped_len)
+        .and_then(|size| size.checked_add(SYNC_COLLECTION_SUFFIX.len()))
+        .ok_or(CalendarError::BodyLimit("calendar request exceeds limit"))?;
+    if size > MAX_REQUEST_BYTES {
+        return Err(CalendarError::BodyLimit("calendar request exceeds limit"));
+    }
+    let mut body = String::with_capacity(size);
+    body.push_str(SYNC_COLLECTION_PREFIX);
+    write_xml_escaped(&mut body, token);
+    body.push_str(SYNC_COLLECTION_SUFFIX);
+    debug_assert_eq!(body.len(), size);
+    Ok(body)
 }
 
-fn xml_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
+fn xml_escaped_len(s: &str) -> Option<usize> {
+    s.chars().try_fold(0usize, |size, ch| {
+        let extra = match ch {
+            '&' => 4,
+            '<' | '>' => 3,
+            '"' => 5,
+            _ => 0,
+        };
+        size.checked_add(ch.len_utf8())?.checked_add(extra)
+    })
+}
+
+fn write_xml_escaped(out: &mut String, s: &str) {
+    for ch in s.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            _ => out.push(ch),
+        }
+    }
 }
 
 fn xml_unescape(s: &str) -> String {
@@ -130,7 +199,12 @@ pub(crate) struct DavResponse {
 ///
 /// Namespace prefixes vary by server (`d:`, `D:`, none), so tags are matched on
 /// their local name.
+#[cfg(test)]
 pub(crate) fn parse_multistatus(xml: &str) -> (Vec<DavResponse>, String) {
+    parse_multistatus_checked(xml).unwrap_or_default()
+}
+
+fn parse_multistatus_checked(xml: &str) -> Result<(Vec<DavResponse>, String), CalendarError> {
     let mut out = Vec::new();
     for block in split_elements(xml, "response") {
         let href = first_element(&block, "href").unwrap_or_default();
@@ -142,6 +216,11 @@ pub(crate) fn parse_multistatus(xml: &str) -> (Vec<DavResponse>, String) {
         if href.trim().is_empty() {
             continue;
         }
+        if href.len() > MAX_REQUEST_BYTES {
+            return Err(CalendarError::BodyLimit(
+                "calendar resource href exceeds limit",
+            ));
+        }
         out.push(DavResponse {
             href: href.trim().to_string(),
             ics,
@@ -150,7 +229,12 @@ pub(crate) fn parse_multistatus(xml: &str) -> (Vec<DavResponse>, String) {
     }
     // The collection-level token sits outside any <response>.
     let token = last_element(xml, "sync-token").unwrap_or_default();
-    (out, token.trim().to_string())
+    if token.len() > MAX_REQUEST_BYTES {
+        return Err(CalendarError::BodyLimit(
+            "calendar sync token exceeds limit",
+        ));
+    }
+    Ok((out, token.trim().to_string()))
 }
 
 /// Every `<...name>…</...name>` body in `xml`, prefix-insensitive.
@@ -230,24 +314,28 @@ impl CalendarBackend for CalDavBackend {
         sync_token: &'a str,
     ) -> BoxFuture<'a, Result<EventPage, CalendarError>> {
         Box::pin(async move {
-            if self.url.is_empty() {
+            if self.http.is_none() && self.init_error.is_none() {
                 return Err(CalendarError::NotConfigured);
             }
-            let client = reqwest::Client::builder()
-                .timeout(self.timeout)
-                .build()
-                .map_err(|e| CalendarError::Network(e.to_string()))?;
+            if let Some(error) = self.init_error {
+                return Err(CalendarError::Policy(map_error(error)));
+            }
+            let http = self.http.as_ref().expect("checked above");
+            let deadline = Instant::now() + self.timeout;
 
             let incremental = !sync_token.is_empty();
             let body = if incremental {
-                sync_collection_body(sync_token)
+                sync_collection_body(sync_token)?
             } else {
                 calendar_query_body(from, to)
             };
+            if body.len() > MAX_REQUEST_BYTES {
+                return Err(CalendarError::BodyLimit("calendar request exceeds limit"));
+            }
             let method = reqwest::Method::from_bytes(b"REPORT")
-                .map_err(|e| CalendarError::Api(e.to_string()))?;
-            let req = client
-                .request(method, &self.url)
+                .map_err(|_| CalendarError::Policy("calendar REPORT method unavailable"))?;
+            let req = http
+                .request(method)
                 .header(
                     reqwest::header::CONTENT_TYPE,
                     "application/xml; charset=utf-8",
@@ -256,16 +344,27 @@ impl CalendarBackend for CalDavBackend {
                 .header("Depth", "1")
                 .body(body);
 
-            let resp = self
-                .auth(req)
-                .send()
+            let resp = self.auth(req);
+            let resp = http
+                .send(resp, deadline)
                 .await
-                .map_err(|e| CalendarError::Network(e.to_string()))?;
+                .map_err(map_transport_error)?;
+
+            if resp.status().is_redirection() {
+                return Err(CalendarError::Policy(map_error(
+                    CalendarHttpError::Redirect,
+                )));
+            }
+            validate_encoding(&resp).map_err(|error| CalendarError::Policy(map_error(error)))?;
 
             if resp.status() == reqwest::StatusCode::UNAUTHORIZED
                 || resp.status() == reqwest::StatusCode::FORBIDDEN
             {
-                return Err(CalendarError::Auth(format!("HTTP {}", resp.status())));
+                let status = resp.status();
+                discard_body(resp, deadline)
+                    .await
+                    .map_err(map_transport_error)?;
+                return Err(CalendarError::Auth(format!("HTTP {status}")));
             }
             // A server that has expired or never knew our token answers 409/507.
             // Falling back to a full fetch is the RFC 6578 recovery, and without it
@@ -281,21 +380,32 @@ impl CalendarBackend for CalDavBackend {
                     status = %resp.status(),
                     "caldav sync token rejected — falling back to a full fetch"
                 );
-                return self.list_events(from, to, "").await;
+                discard_body(resp, deadline)
+                    .await
+                    .map_err(map_transport_error)?;
+                return self.fetch_full(from, to, deadline).await;
             }
             if !resp.status().is_success() && resp.status() != reqwest::StatusCode::MULTI_STATUS {
-                return Err(CalendarError::Api(format!("HTTP {}", resp.status())));
+                let status = resp.status();
+                discard_body(resp, deadline)
+                    .await
+                    .map_err(map_transport_error)?;
+                return Err(CalendarError::Api(format!("HTTP {status}")));
             }
 
-            let text = resp
-                .text()
+            validate_media(&resp, ExpectedMedia::Dav)
+                .map_err(|error| CalendarError::Policy(map_error(error)))?;
+            let text = read_body(resp, deadline)
                 .await
-                .map_err(|e| CalendarError::Network(e.to_string()))?;
-            if text.len() > MAX_BODY {
-                return Err(CalendarError::Api("calendar too large".into()));
-            }
+                .map_err(|error| match error {
+                    CalendarHttpError::BodyLimit => CalendarError::BodyLimit(map_error(error)),
+                    CalendarHttpError::Timeout => CalendarError::Timeout(map_error(error)),
+                    other => CalendarError::Network(map_error(other).into()),
+                })?;
+            let text = String::from_utf8(text)
+                .map_err(|_| CalendarError::Parse("CalDAV response is not UTF-8".into()))?;
 
-            let (responses, token) = parse_multistatus(&text);
+            let (responses, token) = parse_multistatus_checked(&text)?;
             let zone = if self.zone.is_empty() {
                 "UTC"
             } else {
@@ -327,6 +437,90 @@ impl CalendarBackend for CalDavBackend {
     }
 }
 
+impl CalDavBackend {
+    /// A 409/507 token recovery is exactly one additional REPORT, sharing the
+    /// original absolute deadline and never recursively refreshing it.
+    async fn fetch_full(
+        &self,
+        from: NaiveDate,
+        to: NaiveDate,
+        deadline: Instant,
+    ) -> Result<EventPage, CalendarError> {
+        let http = self.http.as_ref().expect("initialized backend");
+        let body = calendar_query_body(from, to);
+        let method = reqwest::Method::from_bytes(b"REPORT")
+            .map_err(|_| CalendarError::Policy("calendar REPORT method unavailable"))?;
+        let req = self.auth(
+            http.request(method)
+                .header(
+                    reqwest::header::CONTENT_TYPE,
+                    "application/xml; charset=utf-8",
+                )
+                .header("Depth", "1")
+                .body(body),
+        );
+        let response = http
+            .send(req, deadline)
+            .await
+            .map_err(map_transport_error)?;
+        if response.status().is_redirection() {
+            return Err(CalendarError::Policy(map_error(
+                CalendarHttpError::Redirect,
+            )));
+        }
+        validate_encoding(&response).map_err(|error| CalendarError::Policy(map_error(error)))?;
+        if !response.status().is_success() && response.status() != reqwest::StatusCode::MULTI_STATUS
+        {
+            let status = response.status();
+            discard_body(response, deadline)
+                .await
+                .map_err(map_transport_error)?;
+            return Err(CalendarError::Api(format!("HTTP {status}")));
+        }
+        validate_media(&response, ExpectedMedia::Dav)
+            .map_err(|error| CalendarError::Policy(map_error(error)))?;
+        let bytes = read_body(response, deadline)
+            .await
+            .map_err(|error| match error {
+                CalendarHttpError::BodyLimit => CalendarError::BodyLimit(map_error(error)),
+                CalendarHttpError::Timeout => CalendarError::Timeout(map_error(error)),
+                other => CalendarError::Network(map_error(other).into()),
+            })?;
+        let text = String::from_utf8(bytes)
+            .map_err(|_| CalendarError::Parse("CalDAV response is not UTF-8".into()))?;
+        self.page_from_multistatus(text)
+    }
+
+    fn page_from_multistatus(&self, text: String) -> Result<EventPage, CalendarError> {
+        let (responses, token) = parse_multistatus_checked(&text)?;
+        let zone = if self.zone.is_empty() {
+            "UTC"
+        } else {
+            &self.zone
+        };
+        let mut events = Vec::new();
+        let mut deleted = Vec::new();
+        for r in responses {
+            if r.deleted {
+                deleted.push(uid_from_href(&r.href));
+            } else {
+                events.extend(thegn_core::calendar::parse_ics(&r.ics, zone));
+            }
+        }
+        let partial = self.max_events > 0 && events.len() > self.max_events;
+        if partial {
+            events.truncate(self.max_events);
+        }
+        Ok(EventPage {
+            events,
+            deleted,
+            sync_token: token,
+            partial,
+            unchanged: false,
+        })
+    }
+}
+
 /// The event uid a collection href refers to: the last path segment with its
 /// `.ics` extension removed, which is the convention every CalDAV server uses.
 pub(crate) fn uid_from_href(href: &str) -> String {
@@ -336,4 +530,37 @@ pub(crate) fn uid_from_href(href: &str) -> String {
         .unwrap_or(href)
         .trim_end_matches(".ics")
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sync_request_size_accounts_for_xml_expansion_and_envelope() {
+        let envelope = SYNC_COLLECTION_PREFIX.len() + SYNC_COLLECTION_SUFFIX.len();
+        let plain = "x".repeat(MAX_REQUEST_BYTES - envelope);
+        assert!(sync_collection_body(&plain).is_ok());
+        assert!(sync_collection_body(&format!("{plain}x")).is_err());
+
+        let expanded = "&".repeat((MAX_REQUEST_BYTES - envelope) / 5 + 1);
+        assert!(sync_collection_body(&expanded).is_err());
+    }
+
+    #[test]
+    fn sync_request_escapes_once_into_the_bounded_buffer() {
+        let body = sync_collection_body("a&<b\"").unwrap();
+        assert!(body.contains("a&amp;&lt;b&quot;"));
+        assert!(!body.contains("&amp;lt;"));
+    }
+
+    #[test]
+    fn retained_sync_tokens_are_bounded_before_publication() {
+        let oversized = "x".repeat(MAX_REQUEST_BYTES + 1);
+        let xml = format!("<multistatus><sync-token>{oversized}</sync-token></multistatus>");
+        assert!(matches!(
+            parse_multistatus_checked(&xml),
+            Err(CalendarError::BodyLimit(_))
+        ));
+    }
 }

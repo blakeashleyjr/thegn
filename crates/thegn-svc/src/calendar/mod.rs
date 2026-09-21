@@ -33,6 +33,9 @@ pub enum CalendarError {
     Api(String),
     Subprocess(String),
     Parse(String),
+    Policy(&'static str),
+    BodyLimit(&'static str),
+    Timeout(&'static str),
     Unsupported(&'static str),
     Io(String),
 }
@@ -46,6 +49,9 @@ impl std::fmt::Display for CalendarError {
             CalendarError::Api(e) => write!(f, "provider error: {e}"),
             CalendarError::Subprocess(e) => write!(f, "{e}"),
             CalendarError::Parse(e) => write!(f, "could not parse calendar: {e}"),
+            CalendarError::Policy(e) => write!(f, "calendar transport policy: {e}"),
+            CalendarError::BodyLimit(e) => write!(f, "calendar body limit: {e}"),
+            CalendarError::Timeout(e) => write!(f, "calendar timeout: {e}"),
             CalendarError::Unsupported(op) => write!(f, "{op} is not supported by this provider"),
             CalendarError::Io(e) => write!(f, "{e}"),
         }
