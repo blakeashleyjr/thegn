@@ -38,22 +38,52 @@ pub fn encode(body: &str) -> Vec<u8> {
 /// Scan and consume offsets avoid prefix rescanning and repeated whole-buffer
 /// shifts. Compaction only moves a suffix after at least as many bytes have been
 /// consumed (or when required by the hard allocation bound).
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct FrameDecoder {
     buf: Vec<u8>,
     head: usize,
     scan: usize,
     body: Option<(usize, usize)>,
     error: Option<ProtocolError>,
+    max_frame_len: usize,
     #[cfg(test)]
     scanned: usize,
     #[cfg(test)]
     moved: usize,
 }
 
+impl Default for FrameDecoder {
+    fn default() -> Self {
+        Self {
+            buf: Vec::new(),
+            head: 0,
+            scan: 0,
+            body: None,
+            error: None,
+            max_frame_len: MAX_FRAME_LEN,
+            #[cfg(test)]
+            scanned: 0,
+            #[cfg(test)]
+            moved: 0,
+        }
+    }
+}
+
 impl FrameDecoder {
     pub fn new() -> Self {
-        Self::default()
+        Self::with_limit(MAX_FRAME_LEN)
+    }
+
+    /// Construct a decoder with a caller-owned body limit.  The bridge keeps
+    /// the historical 64 MiB limit; LSP admits only its 8 MiB budget before it
+    /// starts buffering a body.  The limit is part of the decoder rather than
+    /// a post-parse check so a hostile Content-Length cannot reserve the bridge
+    /// allowance first.
+    pub fn with_limit(max_frame_len: usize) -> Self {
+        Self {
+            max_frame_len: max_frame_len.min(MAX_FRAME_LEN),
+            ..Self::default()
+        }
     }
 
     fn fail<T>(&mut self, error: ProtocolError) -> Result<T, ProtocolError> {
@@ -91,10 +121,11 @@ impl FrameDecoder {
             return Err(error);
         }
         let unread = self.buf.len() - self.head;
-        if bytes.len() > MAX_BUFFER_BYTES - unread {
+        let max_buffer_bytes = self.max_frame_len + MAX_HEADER_BYTES + READ_BYTES;
+        if bytes.len() > max_buffer_bytes - unread {
             return self.fail(ProtocolError::BufferTooLong);
         }
-        if bytes.len() > MAX_BUFFER_BYTES - self.buf.len() {
+        if bytes.len() > max_buffer_bytes - self.buf.len() {
             // A caller must drain queued messages before appending another
             // read. Moving a near-full suffix after each tiny pop would make
             // a sliding window quadratic. Only compact after enough consumed
@@ -108,7 +139,7 @@ impl FrameDecoder {
         if needed > self.buf.capacity() {
             let capacity = needed
                 .max(self.buf.capacity().saturating_mul(2))
-                .min(MAX_BUFFER_BYTES);
+                .min(max_buffer_bytes);
             self.buf.reserve_exact(capacity - self.buf.len());
         }
         self.buf.extend_from_slice(bytes);
@@ -129,7 +160,10 @@ impl FrameDecoder {
                     return self.fail(ProtocolError::HeaderTooLong);
                 }
                 if &self.buf[self.scan..self.scan + 4] == b"\r\n\r\n" {
-                    let len = match parse_content_length(&self.buf[self.head..self.scan]) {
+                    let len = match parse_content_length(
+                        &self.buf[self.head..self.scan],
+                        self.max_frame_len,
+                    ) {
                         Ok(len) => len,
                         Err(error) => return self.fail(error),
                     };
@@ -177,7 +211,7 @@ impl FrameDecoder {
     }
 }
 
-fn parse_content_length(header: &[u8]) -> Result<usize, ProtocolError> {
+fn parse_content_length(header: &[u8], max_frame_len: usize) -> Result<usize, ProtocolError> {
     let text = std::str::from_utf8(header).map_err(|_| ProtocolError::MalformedHeader)?;
     let mut length = None;
     for line in text.split("\r\n") {
@@ -196,7 +230,7 @@ fn parse_content_length(header: &[u8]) -> Result<usize, ProtocolError> {
             let len = value
                 .parse::<usize>()
                 .map_err(|_| ProtocolError::BodyTooLong)?;
-            if len > MAX_FRAME_LEN {
+            if len > max_frame_len {
                 return Err(ProtocolError::BodyTooLong);
             }
             length = Some(len);
@@ -217,9 +251,13 @@ pub struct FramedReader<R> {
 
 impl<R: Read> FramedReader<R> {
     pub fn new(reader: R) -> Self {
+        Self::with_limit(reader, MAX_FRAME_LEN)
+    }
+
+    pub fn with_limit(reader: R, max_frame_len: usize) -> Self {
         Self {
             reader,
-            decoder: FrameDecoder::new(),
+            decoder: FrameDecoder::with_limit(max_frame_len),
             turn_frames: 0,
         }
     }
@@ -343,6 +381,13 @@ mod tests {
         let mut d = FrameDecoder::new();
         d.push(&encode(&body)).unwrap();
         assert_eq!(pop(&mut d).as_deref(), Some(body.as_str()));
+    }
+
+    #[test]
+    fn caller_limit_is_checked_at_header_admission() {
+        let mut d = FrameDecoder::with_limit(8);
+        d.push(b"Content-Length: 9\r\n\r\n").unwrap();
+        assert_eq!(d.next_message(), Err(ProtocolError::BodyTooLong));
     }
 
     #[test]

@@ -2357,6 +2357,17 @@ enum SymbolsFetch {
     },
 }
 
+/// Clears an off-loop fetch's in-flight flag when the task ends — normally,
+/// on a dropped result, or by panic — so a failed fetch can never disable its
+/// action for the rest of the session.
+struct InflightGuard(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
 /// Fetch the document-symbol outline for `file` (repo-relative) off the loop:
 /// the language server when one is available, the tree-sitter entity parser
 /// otherwise. Sends a `SymbolsFetch::Outline` and pulses the waker.
@@ -2364,11 +2375,13 @@ fn spawn_outline_fetch(
     file: String,
     root: std::path::PathBuf,
     lsp: std::sync::Arc<crate::lsp::LspInner>,
-    tx: tokio_mpsc::UnboundedSender<SymbolsFetch>,
+    tx: tokio_mpsc::Sender<SymbolsFetch>,
     waker: TerminalWaker,
+    busy: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) {
     use thegn_core::semantic::Lang;
     tokio::task::spawn_blocking(move || {
+        let _inflight = InflightGuard(busy);
         // A provider exists if the file resolves to a registered server (LSP
         // tier) OR to a tree-sitter grammar. A registry-only language (no
         // grammar) still gets its LSP outline; a file that resolves to neither
@@ -2382,7 +2395,7 @@ fn spawn_outline_fetch(
         } else {
             Vec::new()
         };
-        let _ = tx.send(SymbolsFetch::Outline { file, rows }); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
+        let _ = tx.try_send(SymbolsFetch::Outline { file, rows }); // best-effort: bounded replaceable result; a full queue drops stale work
         let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
     });
 }
@@ -2398,10 +2411,12 @@ fn spawn_refs_fetch(
     label: String,
     root: std::path::PathBuf,
     lsp: std::sync::Arc<crate::lsp::LspInner>,
-    tx: tokio_mpsc::UnboundedSender<SymbolsFetch>,
+    tx: tokio_mpsc::Sender<SymbolsFetch>,
     waker: TerminalWaker,
+    busy: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) {
     tokio::task::spawn_blocking(move || {
+        let _inflight = InflightGuard(busy);
         let mut rows = Vec::new();
         if let Some(key) = lsp.resolve_key(&file)
             && let Ok(client) = lsp.client(&root, &key)
@@ -2435,7 +2450,7 @@ fn spawn_refs_fetch(
                     .collect();
             }
         }
-        let _ = tx.send(SymbolsFetch::Refs { label, rows }); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
+        let _ = tx.try_send(SymbolsFetch::Refs { label, rows }); // best-effort: bounded replaceable result; a full queue drops stale work
         let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
     });
 }
@@ -2451,10 +2466,12 @@ fn spawn_hover_fetch(
     label: String,
     root: std::path::PathBuf,
     lsp: std::sync::Arc<crate::lsp::LspInner>,
-    tx: tokio_mpsc::UnboundedSender<crate::hover::HoverPopup>,
+    tx: tokio_mpsc::Sender<crate::hover::HoverPopup>,
     waker: TerminalWaker,
+    busy: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) {
     tokio::task::spawn_blocking(move || {
+        let _inflight = InflightGuard(busy);
         let mut hover_md: Option<String> = None;
         let mut signatures: Vec<String> = Vec::new();
         let mut actions: Vec<String> = Vec::new();
@@ -2485,7 +2502,7 @@ fn spawn_hover_fetch(
         }
         let popup =
             crate::hover::HoverPopup::build(&label, hover_md.as_deref(), &signatures, &actions);
-        let _ = tx.send(popup); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
+        let _ = tx.try_send(popup); // best-effort: bounded replaceable result; a full queue drops stale work
         let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
     });
 }
@@ -6630,23 +6647,42 @@ async fn event_loop<T: Terminal>(
         );
     }
 
-    // LSP: lazy, warm language servers per worktree. Clients push diagnostics on
-    // a std channel; a bridge thread forwards them onto a loop channel and pulses
-    // the waker (svc has no waker). `lsp_diags` persists them across model swaps.
+    // LSP: lazy, warm language servers per worktree. Clients publish into a
+    // bounded latest-per-document bus; a bridge thread blocks on the bus's
+    // single wake obligation and pulses the waker (svc has no waker) — an idle
+    // bus means a blocked bridge, zero wakes. `lsp_diags` persists applied
+    // diagnostics across model swaps.
     let mut lsp_supervisor = crate::lsp::LspSupervisor::from_config(keymap.config());
     let mut lsp_diags = crate::lsp::LspDiagnostics::new();
-    let (lsp_diag_tx, mut lsp_diag_rx) =
-        tokio_mpsc::unbounded_channel::<thegn_svc::lsp::PublishedDiagnostics>();
-    if let Some(raw_rx) = lsp_supervisor.take_diagnostics_rx() {
+    // Which worktree the visible Problems list currently holds: a per-slice
+    // patch is only valid for that root, so a tab switch forces a full rebuild
+    // instead of splicing the new worktree's file into the old one's list.
+    let mut lsp_visible = crate::lsp::VisibleTarget::default();
+    let lsp_diag_rx = lsp_supervisor
+        .take_diagnostics_rx()
+        .expect("LSP diagnostics receiver is installed once at startup");
+    // Every exit path of the loop frees the bus (queued publications, marks,
+    // registrations) and releases the bridge thread.
+    let _lsp_bus_shutdown = crate::lsp::BusShutdown::new(lsp_diag_rx.clone());
+    // The worktree-root set the supervisor was last reconciled against.
+    let mut lsp_reconciled_roots: std::collections::HashSet<std::path::PathBuf> =
+        std::collections::HashSet::new();
+    // Bumped per root-set change; orders the off-loop reconcile tasks.
+    let mut lsp_reconcile_epoch: u64 = 0;
+    {
+        let wake_rx = lsp_diag_rx.clone();
         let bridge_waker = waker.clone();
-        std::thread::spawn(move || {
-            while let Ok(pd) = raw_rx.recv() {
-                if lsp_diag_tx.send(pd).is_err() {
-                    break;
+        let spawned = std::thread::Builder::new()
+            .name("thegn-lsp-bridge".into())
+            .spawn(move || {
+                crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
+                while wake_rx.wait() {
+                    let _ = bridge_waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
                 }
-                let _ = bridge_waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
-            }
-        });
+            });
+        if let Err(error) = spawned {
+            tracing::warn!(target: "thegn::lsp", %error, "LSP diagnostics bridge failed to spawn");
+        }
     }
     // Resident bridge: for a remote/provider worktree, connect a persistent in-env
     // agent (git routes through it; fs.watch becomes refreshes). fs.watch events
@@ -6663,16 +6699,23 @@ async fn event_loop<T: Terminal>(
     // Symbols section: the fetched outline / references, cached host-side so they
     // survive model-hydration swaps. The displayed list is derived each frame
     // from the active view (outline vs references) — see the pre-render block.
-    let (outline_tx, mut outline_rx) = tokio_mpsc::unbounded_channel::<SymbolsFetch>();
+    // Result queues are bounded by projection capacity as well as count: one
+    // symbol/reference result is capped at 1 MiB, so eight pending results stay
+    // within the same order of budget as the diagnostics queue.
+    let (outline_tx, mut outline_rx) = tokio_mpsc::channel::<SymbolsFetch>(8);
     let mut outline_file = String::new();
     let mut outline_syms: Vec<crate::panel::SymbolRow> = Vec::new();
     let mut outline_inflight: Option<String> = None;
+    let outline_busy = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut refs_label = String::new();
     let mut refs_rows: Vec<crate::panel::SymbolRow> = Vec::new();
     let mut refs_inflight = false;
+    let refs_busy = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     // The hover/signature/code-action preview overlay (item 532): built off-loop
     // from the language server, dismissed by any key.
-    let (hover_tx, mut hover_rx) = tokio_mpsc::unbounded_channel::<crate::hover::HoverPopup>();
+    let (hover_tx, mut hover_rx) = tokio_mpsc::channel::<crate::hover::HoverPopup>(32);
+    let mut hover_inflight = false;
+    let hover_busy = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     let (logs_tx, mut logs_rx) =
         tokio_mpsc::unbounded_channel::<Vec<thegn_core::log::parser::ParsedLog>>();
@@ -9253,15 +9296,28 @@ async fn event_loop<T: Terminal>(
         // by the worktree root stamped on each message; only the ACTIVE
         // worktree's partition is merged into the rendered list, so a warm
         // server in another workspace never bleeds into this panel.
+        //
+        // One bounded slice per iteration (8 publications / 256 KiB / 2 ms,
+        // input preempts between items); a slice that stops with work queued
+        // re-arms the bus wake, so the remainder arrives on a later iteration
+        // without any polling. The visible list is patched only for the
+        // active root's files this slice touched (no full clone + sort), so the
+        // visible update is bounded by the slice as well.
         {
-            let mut got = false;
-            while let Ok(pd) = lsp_diag_rx.try_recv() {
-                loop_perf.tick(crate::perf::WakeSource::Lsp);
-                lsp_diags.apply(pd);
-                got = true;
-            }
-            if got {
-                lsp_diags.merge_into(&active_tab_path(&session), &mut model.panel.diagnostics);
+            let active_root = active_tab_path(&session);
+            let drain_started = std::time::Instant::now();
+            let outcome = crate::lsp::drain_diagnostics(
+                &lsp_diag_rx,
+                &mut lsp_diags,
+                &active_root,
+                crate::lsp::DrainBudget::default(),
+                || drain_started.elapsed(),
+                || !pending_input.is_empty(),
+                || loop_perf.tick(crate::perf::WakeSource::Lsp),
+            );
+            let refresh = lsp_visible.refresh_for(&active_root, outcome.refresh);
+            if !refresh.is_none() {
+                refresh.apply_to(&lsp_diags, &active_root, &mut model.panel.diagnostics);
                 dirty = true;
             }
         }
@@ -10205,7 +10261,31 @@ async fn event_loop<T: Terminal>(
                     .iter()
                     .any(|g| std::path::Path::new(&g.path) == root)
             });
-            lsp_diags.merge_into(&active_tab_path(&session), &mut model.panel.diagnostics);
+            // Retire language servers whose worktree is gone: frees their
+            // registry slots and negative cache, and tears the subprocesses
+            // down. Only when the root set changed, and off-loop — the
+            // supervisor's client map can be held by a spawn in progress.
+            // The active root is included even when it is the `current_dir()`
+            // fallback (no local worktree path), so its server is not churned.
+            let mut live_roots: std::collections::HashSet<std::path::PathBuf> = session
+                .worktrees
+                .iter()
+                .filter(|g| !g.path.is_empty())
+                .map(|g| std::path::PathBuf::from(&g.path))
+                .collect();
+            live_roots.insert(active_tab_path(&session));
+            if live_roots != lsp_reconciled_roots {
+                lsp_reconciled_roots = live_roots.clone();
+                lsp_reconcile_epoch += 1;
+                let epoch = lsp_reconcile_epoch;
+                let lsp = lsp_supervisor.handle();
+                tokio::task::spawn_blocking(move || {
+                    let _ = lsp.reconcile_roots(epoch, live_roots); // best-effort: released-slot count is informational
+                });
+            }
+            let swapped_root = active_tab_path(&session);
+            lsp_diags.merge_into(&swapped_root, &mut model.panel.diagnostics);
+            lsp_visible.rebuilt(&swapped_root);
             // Shares live on the supervisor (loop-local), not in hydration; a
             // fresh model wouldn't carry them — re-apply for the active worktree.
             model.shares = current_share_views(&share_supervisor, &session);
@@ -12380,6 +12460,7 @@ async fn event_loop<T: Terminal>(
             loop_perf.tick(crate::perf::WakeSource::Outline);
             match msg {
                 SymbolsFetch::Outline { file, rows } => {
+                    outline_busy.store(false, std::sync::atomic::Ordering::Release);
                     if outline_inflight.as_deref() == Some(file.as_str()) {
                         outline_inflight = None;
                     }
@@ -12387,6 +12468,7 @@ async fn event_loop<T: Terminal>(
                     outline_syms = rows;
                 }
                 SymbolsFetch::Refs { label, rows } => {
+                    refs_busy.store(false, std::sync::atomic::Ordering::Release);
                     refs_inflight = false;
                     refs_label = label;
                     refs_rows = rows;
@@ -12396,6 +12478,8 @@ async fn event_loop<T: Terminal>(
         }
         // Hover preview: a completed fetch pops the overlay open.
         while let Ok(popup) = hover_rx.try_recv() {
+            hover_busy.store(false, std::sync::atomic::Ordering::Release);
+            hover_inflight = false;
             loop_perf.tick(crate::perf::WakeSource::Hover);
             hover_popup = Some(popup);
             dirty = true;
@@ -12422,15 +12506,18 @@ async fn event_loop<T: Terminal>(
                     .map(|c| c.path.clone());
                 if let Some(target) = &target
                     && *target != outline_file
-                    && outline_inflight.as_deref() != Some(target.as_str())
+                    && (outline_inflight.as_deref() != Some(target.as_str())
+                        || !outline_busy.load(std::sync::atomic::Ordering::Acquire))
                 {
                     outline_inflight = Some(target.clone());
+                    outline_busy.store(true, std::sync::atomic::Ordering::Release);
                     spawn_outline_fetch(
                         target.clone(),
                         active_tab_path(&session),
                         lsp_supervisor.handle(),
                         outline_tx.clone(),
                         waker.clone(),
+                        outline_busy.clone(),
                     );
                 }
                 if model.panel.symbols != outline_syms || model.panel.symbols_file != outline_file {
@@ -20004,9 +20091,11 @@ async fn event_loop<T: Terminal>(
                             if !panel_ui.symbols_show_refs
                                 && let Some(s) =
                                     model.panel.symbols.get(panel_ui.symbols_cursor).cloned()
-                                && !refs_inflight
+                                && (!refs_inflight
+                                    || !refs_busy.load(std::sync::atomic::Ordering::Acquire))
                             {
                                 refs_inflight = true;
+                                refs_busy.store(true, std::sync::atomic::Ordering::Release);
                                 refs_label = s.name.clone();
                                 refs_rows.clear();
                                 panel_ui.symbols_show_refs = true;
@@ -20022,7 +20111,13 @@ async fn event_loop<T: Terminal>(
                                     lsp_supervisor.handle(),
                                     outline_tx.clone(),
                                     waker.clone(),
+                                    refs_busy.clone(),
                                 );
+                            } else if !panel_ui.symbols_show_refs
+                                && refs_busy.load(std::sync::atomic::Ordering::Acquire)
+                            {
+                                model.status =
+                                    "References: still waiting for the language server…".into();
                             }
                             true
                         }
@@ -20033,10 +20128,14 @@ async fn event_loop<T: Terminal>(
                             true
                         }
                         (Section::Symbols, KeyCode::Char('h')) => {
-                            if current_config.lsp.hover
+                            if (!hover_inflight
+                                || !hover_busy.load(std::sync::atomic::Ordering::Acquire))
+                                && current_config.lsp.hover
                                 && let Some(s) =
                                     model.panel.symbols.get(panel_ui.symbols_cursor).cloned()
                             {
+                                hover_inflight = true;
+                                hover_busy.store(true, std::sync::atomic::Ordering::Release);
                                 model.status = format!("Hover: {}…", s.name);
                                 spawn_hover_fetch(
                                     s.file,
@@ -20047,7 +20146,13 @@ async fn event_loop<T: Terminal>(
                                     lsp_supervisor.handle(),
                                     hover_tx.clone(),
                                     waker.clone(),
+                                    hover_busy.clone(),
                                 );
+                            } else if current_config.lsp.hover
+                                && hover_busy.load(std::sync::atomic::Ordering::Acquire)
+                            {
+                                model.status =
+                                    "Hover: still waiting for the language server…".into();
                             }
                             true
                         }

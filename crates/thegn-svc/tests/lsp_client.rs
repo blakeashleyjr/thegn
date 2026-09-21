@@ -1,11 +1,11 @@
 //! End-to-end exercise of `LspClient` against the hermetic `fake_lsp` server
 //! (selected via `CARGO_BIN_EXE_fake_lsp`) — no real language server needed.
 
-use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use thegn_svc::lsp::{
-    LspClient, LspError, Position, ServerSpec, SymbolKind, framing::FrameDecoder,
+    DiagnosticsReceiver, DiagnosticsSender, LspClient, LspError, Position, PublishedDiagnostics,
+    ServerSpec, SymbolKind, diagnostics_channel, framing::FrameDecoder, limits,
 };
 
 fn spec_with(args: Vec<String>) -> ServerSpec {
@@ -17,23 +17,45 @@ fn spec_with(args: Vec<String>) -> ServerSpec {
     }
 }
 
-fn start_fake() -> (
-    LspClient,
-    mpsc::Receiver<thegn_svc::lsp::PublishedDiagnostics>,
-) {
+fn start_fake() -> (LspClient, DiagnosticsReceiver) {
     start_fake_args(vec![])
 }
 
-fn start_fake_args(
-    args: Vec<String>,
-) -> (
-    LspClient,
-    mpsc::Receiver<thegn_svc::lsp::PublishedDiagnostics>,
-) {
-    let (diag_tx, diag_rx) = mpsc::channel();
+fn start_fake_args(args: Vec<String>) -> (LspClient, DiagnosticsReceiver) {
+    let (diag_tx, diag_rx) = diagnostics_channel();
     let root = std::env::temp_dir();
     let client = LspClient::start(&spec_with(args), &root, diag_tx).expect("spawn fake server");
     (client, diag_rx)
+}
+
+fn start_on(bus: &DiagnosticsSender, root: &std::path::Path, args: &[&str]) -> LspClient {
+    let client = LspClient::start(
+        &spec_with(args.iter().map(|a| a.to_string()).collect()),
+        root,
+        bus.clone(),
+    )
+    .expect("spawn fake server");
+    client.initialize(root).expect("initialize");
+    client
+}
+
+fn recv_timeout(rx: &DiagnosticsReceiver, timeout: Duration) -> Option<PublishedDiagnostics> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Ok(pd) = rx.try_recv() {
+            return Some(pd);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn temp_root(tag: &str) -> std::path::PathBuf {
+    let root = std::env::temp_dir().join(format!("thegn-lsp-{tag}-{}", std::process::id()));
+    std::fs::create_dir_all(&root).expect("temp root");
+    root
 }
 
 #[test]
@@ -43,8 +65,7 @@ fn initialize_handshake_and_pushed_diagnostics() {
         .initialize(&std::env::temp_dir())
         .expect("initialize");
 
-    let pd = diag_rx
-        .recv_timeout(Duration::from_secs(3))
+    let pd = recv_timeout(&diag_rx, Duration::from_secs(3))
         .expect("diagnostics pushed after initialize");
     assert_eq!(pd.path, "/proj/src/lib.rs");
     assert_eq!(pd.diagnostics.len(), 1);
@@ -167,4 +188,162 @@ fn framing_smoke_for_test_helpers() {
         d.next_message().expect("valid frame decodes").as_deref(),
         Some("{\"x\":1}")
     );
+}
+
+#[test]
+fn fake_server_deep_symbol_response_fails_promptly_before_value_projection() {
+    let (diagnostics, health) = diagnostics_channel();
+    let root = std::env::temp_dir();
+    let client = LspClient::start(
+        &spec_with(vec!["--deep-symbols".to_string()]),
+        &root,
+        diagnostics,
+    )
+    .expect("spawn fake server");
+    client.initialize(&root).expect("initialize");
+    let started = Instant::now();
+    let err = client
+        .document_symbols("file:///proj/src/lib.rs")
+        .expect_err("over-depth response must not be projected");
+    assert!(
+        matches!(err, LspError::Bounded(ref reason) if reason.contains("json depth limit")),
+        "{err:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "failed at once, not at the deadline"
+    );
+    assert!(health.health().invalid >= 1);
+}
+
+#[test]
+fn fake_server_unique_document_flood_is_bounded_and_accounted() {
+    let (bus, rx) = diagnostics_channel();
+    let root = temp_root("flood");
+    let flood = 1_000;
+    let _client = start_on(&bus, &root, &["--flood", &flood.to_string()]);
+    // initialize() returned ⇒ every flood notification was dispatched.
+    let f = rx.footprint();
+    assert_eq!(f.bytes, f.recomputed_bytes);
+    assert_eq!(f.metadata_bytes, f.recomputed_metadata_bytes);
+    assert_eq!(f.documents, limits::MAX_QUEUE_DOCUMENTS);
+    assert!(f.bytes <= limits::MAX_QUEUE_BYTES);
+    // The flood (plus, racing the reply, the fixture's one post-initialize
+    // document) overflowed the queue; every eviction is counted.
+    let dropped = rx.health().dropped as usize;
+    assert!(
+        (flood - limits::MAX_QUEUE_DOCUMENTS..=flood + 1 - limits::MAX_QUEUE_DOCUMENTS)
+            .contains(&dropped),
+        "dropped={dropped}"
+    );
+    let marks = rx.take_loss_marks();
+    assert_eq!(marks.documents.len(), limits::MAX_LOSS_MARKS);
+    assert_eq!(
+        marks.streams.len(),
+        1,
+        "overflowing losses escalate to the stream"
+    );
+    // Slow consumer recovery: everything retained drains, newest documents survive.
+    let mut drained = Vec::new();
+    while let Some(pd) = recv_timeout(&rx, Duration::from_millis(200)) {
+        drained.push(pd);
+    }
+    assert!(drained.len() >= limits::MAX_QUEUE_DOCUMENTS);
+    assert!(
+        drained
+            .iter()
+            .any(|pd| pd.path == format!("/proj/flood/{}.rs", flood - 1)),
+        "the newest document is retained, the oldest were evicted"
+    );
+    let f = rx.footprint();
+    assert_eq!((f.bytes, f.documents), (0, 0));
+}
+
+#[test]
+fn fake_servers_quiet_root_progresses_beside_a_flooding_root() {
+    let (bus, rx) = diagnostics_channel();
+    let loud_root = temp_root("loud");
+    let quiet_root = temp_root("quiet");
+    let _loud = start_on(&bus, &loud_root, &["--flood", "600"]);
+    // `--flood 1` queues the quiet server's one document before its
+    // initialize reply, so both roots are ready before draining starts.
+    let _quiet = start_on(&bus, &quiet_root, &["--flood", "1"]);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut seen_quiet_at = None;
+    let mut index = 0usize;
+    while seen_quiet_at.is_none() && Instant::now() < deadline {
+        match rx.try_recv() {
+            Ok(pd) => {
+                if pd.root == quiet_root {
+                    seen_quiet_at = Some(index);
+                }
+                index += 1;
+            }
+            Err(_) => std::thread::sleep(Duration::from_millis(5)),
+        }
+    }
+    let at = seen_quiet_at.expect("quiet root delivered");
+    assert!(
+        at <= 1,
+        "round-robin serves the quiet root immediately, got {at}"
+    );
+}
+
+#[test]
+fn fake_server_update_then_complete_clear_coalesces_to_the_clear() {
+    let (bus, rx) = diagnostics_channel();
+    let root = temp_root("clear");
+    let _client = start_on(&bus, &root, &["--clear"]);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut last = None;
+    while Instant::now() < deadline {
+        if let Some(pd) = recv_timeout(&rx, Duration::from_millis(100)) {
+            let clear = pd.diagnostics.is_empty();
+            last = Some(pd);
+            if clear {
+                break;
+            }
+        }
+    }
+    let last = last.expect("publication delivered");
+    assert!(last.diagnostics.is_empty() && last.complete, "{last:?}");
+    assert!(rx.try_recv().is_err(), "nothing stale follows the clear");
+}
+
+#[test]
+fn fake_server_close_reopen_retires_only_the_old_generation() {
+    let (bus, rx) = diagnostics_channel();
+    let root = temp_root("reopen");
+    let first = start_on(&bus, &root, &[]);
+    let old = first.generation();
+    let second = start_on(&bus, &root, &[]);
+    assert!(second.generation() > old);
+    assert!(!bus.is_current(&root, "rust", old));
+    drop(first); // late close of the old generation
+    assert!(bus.is_current(&root, "rust", second.generation()));
+    let mut generations = Vec::new();
+    while let Some(pd) = recv_timeout(&rx, Duration::from_millis(300)) {
+        generations.push(pd.generation);
+    }
+    assert!(!generations.is_empty());
+    assert!(
+        generations.iter().all(|g| *g == second.generation()),
+        "{generations:?}"
+    );
+}
+
+#[test]
+fn fake_server_receives_a_did_open_larger_than_the_inbound_string_cap() {
+    let (bus, rx) = diagnostics_channel();
+    let root = temp_root("bigopen");
+    let client = start_on(&bus, &root, &["--echo-open"]);
+    // Drain the fixture's post-initialize publication.
+    while recv_timeout(&rx, Duration::from_millis(200)).is_some() {}
+    let text = "x".repeat(limits::MAX_JSON_STRING_BYTES * 2 + 17);
+    let uri = format!("file://{}/big.rs", root.display());
+    client
+        .did_open(&uri, &text)
+        .expect("our own large payload is sent");
+    let pd = recv_timeout(&rx, Duration::from_secs(5)).expect("server saw the open");
+    assert_eq!(pd.diagnostics[0].message, format!("opened {}", text.len()));
 }
