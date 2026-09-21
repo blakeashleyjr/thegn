@@ -249,6 +249,13 @@ including an instance that starts before the window (the expansion looks back by
 the event's own duration). A rule without COUNT MAY be fast-forwarded to the
 window; a COUNT rule is walked from DTSTART under the shared work budget.
 
+A defect in ONE source row — a malformed span, or a payload/child-entry
+ceiling only that row exceeds — SHALL cost that row alone: it is skipped and
+counted, the rest of the expansion stands, and the view reports itself
+incomplete. Only the shared budget dimensions, an invalid window, or an
+arithmetic failure MAY fail the whole call. (A bad row stays in the cache, so
+escalating it would blank the month and silence reminders permanently.)
+
 One expansion budget SHALL cover the whole call — source visits, recurrence
 work (every period, candidate, BY-part cross product, RDATE and EXDATE
 visited), materialized occurrences, occupied-date bucket entries, and retained
@@ -283,11 +290,17 @@ occurrence list so a multi-day event cannot duplicate notifications.
 - **THEN** the reminder cursor advances to exactly that window's end, only on
   success, and an acknowledgment for a window no longer in flight is ignored
 
-#### Scenario: A cached row cannot be decoded
+#### Scenario: A cached row cannot be decoded or is malformed
 
-- **WHEN** a cached calendar row fails to deserialize
-- **THEN** the readable events still show, the month is marked incomplete, and
-  a cache query failure is reported as unavailable rather than an empty month
+- **WHEN** a cached calendar row fails to deserialize, or its span is malformed
+- **THEN** the readable events still show, their reminders still fire, the
+  month is marked incomplete, and a cache query failure is reported as
+  unavailable rather than an empty month
+
+#### Scenario: The agenda is hidden
+
+- **WHEN** `show_agenda` is off and a month is unavailable, stale or incomplete
+- **THEN** the month grid's own header reports that state
 
 ### Requirement: Reminders are raised through the notification system
 

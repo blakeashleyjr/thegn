@@ -45,12 +45,32 @@ use std::sync::Arc;
 /// Hard ceilings for one calendar expansion. These are deliberately code
 /// constants: accepting them from configuration would make an untrusted
 /// source able to disable the admission boundary.
+///
+/// The output ceilings are sized against what an admitted cache can
+/// legitimately produce, so a real calendar never hits them (a row that is
+/// merely malformed is skipped per-row instead — see
+/// [`ExpansionError::is_row_local`]). The arithmetic, pinned by
+/// `default_ceilings_admit_a_heavy_but_legitimate_month`:
+///
+/// - `[calendar] max_events` admits 2,000 rows per account; the month window
+///   is widened by a week either side, so one row yields at most ~49
+///   occurrences (a daily recurrence) — call it 50.
+/// - 2,000 rows × 50 = 100,000 occurrences for a whole account of daily
+///   recurrences, so 131,072 leaves headroom above the worst admitted single
+///   account while staying two orders of magnitude below a runaway.
+/// - Bucket entries follow occupancy: a long occurrence occupies several
+///   days, so four entries per occurrence.
+/// - Recurrence work is ~32 units per materialized occurrence (period +
+///   candidate + filter passes).
+/// - Retained bytes stay the real memory bound: 64 MiB is ~500 bytes for each
+///   of ~131,072 occurrences. Whichever binds first, it binds on memory, not
+///   on an arbitrary count.
 pub const MAX_EXPANSION_WINDOW_DAYS: u64 = 3_660;
 pub const MAX_EXPANSION_SOURCE_VISITS: usize = 65_536;
-pub const MAX_EXPANSION_RECURRENCE_WORK: usize = 262_144;
-pub const MAX_EXPANSION_OCCURRENCES: usize = 8_192;
-pub const MAX_EXPANSION_BUCKET_ENTRIES: usize = 32_768;
-pub const MAX_EXPANSION_BYTES: usize = 32 * 1024 * 1024;
+pub const MAX_EXPANSION_RECURRENCE_WORK: usize = 4_194_304;
+pub const MAX_EXPANSION_OCCURRENCES: usize = 131_072;
+pub const MAX_EXPANSION_BUCKET_ENTRIES: usize = 524_288;
+pub const MAX_EXPANSION_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_EVENT_PAYLOAD_BYTES: usize = 1024 * 1024;
 pub const MAX_EVENT_CHILD_ENTRIES: usize = 16_384;
 
@@ -76,6 +96,28 @@ pub enum ExpansionError {
     InvalidSpan,
     Arithmetic,
     Budget(ExpansionLimit),
+}
+
+impl ExpansionError {
+    /// Whether this failure is a property of ONE source row rather than of the
+    /// call: a malformed span, or a payload/child-count ceiling that only that
+    /// row exceeded.
+    ///
+    /// Row-local failures are skipped and counted (the view reports itself
+    /// incomplete) instead of failing the whole expansion: one bad row in a
+    /// provider's cache must not be able to blank a month or — since the row
+    /// stays in the cache and every retry re-reads the same bytes — stop
+    /// reminders permanently. Everything else (the shared budget dimensions,
+    /// an invalid window, arithmetic) is a property of the call and stays a
+    /// hard failure.
+    pub fn is_row_local(&self) -> bool {
+        matches!(
+            self,
+            Self::InvalidSpan
+                | Self::Budget(ExpansionLimit::EventPayload)
+                | Self::Budget(ExpansionLimit::EventChildren)
+        )
+    }
 }
 
 impl fmt::Display for ExpansionError {
@@ -245,10 +287,14 @@ impl ExpansionBudget {
 
 /// The expanded month/reminder result. Buckets contain handles only; the
 /// unique occurrence list owns each materialized event payload once.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ExpandedCalendar {
     pub by_date: BTreeMap<NaiveDate, Vec<Arc<CalEvent>>>,
     pub occurrences: Vec<Arc<CalEvent>>,
+    /// Source rows skipped for a row-local defect (see
+    /// [`ExpansionError::is_row_local`]). Non-zero means this result is
+    /// incomplete — truthful, but not the whole calendar.
+    pub skipped: usize,
 }
 
 /// A half-open instant range, `[from, to)`.
@@ -982,10 +1028,21 @@ pub fn expand_calendar_with_budget(
     }
     let mut out: BTreeMap<NaiveDate, Vec<Arc<CalEvent>>> = BTreeMap::new();
     let mut unique = Vec::new();
+    let mut skipped = 0usize;
     for e in events {
         budget.source_visit()?;
-        let cost = source_cost(e)?;
-        for placed in e.place(from, to, home, budget, &cost)? {
+        // A row-local defect costs that row, not the call: it is skipped and
+        // counted, so the caller can report an incomplete view instead of
+        // losing the month (and the reminders) to one bad event.
+        let placed = match source_cost(e).and_then(|cost| e.place(from, to, home, budget, &cost)) {
+            Ok(placed) => placed,
+            Err(error) if error.is_row_local() => {
+                skipped = skipped.checked_add(1).ok_or(ExpansionError::Arithmetic)?;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        for placed in placed {
             for date in OccupiedDates::new(placed.first, placed.last) {
                 budget.bucket_entry()?;
                 let bucket = match out.get_mut(&date) {
@@ -1017,6 +1074,7 @@ pub fn expand_calendar_with_budget(
     Ok(ExpandedCalendar {
         by_date: out,
         occurrences: unique,
+        skipped,
     })
 }
 

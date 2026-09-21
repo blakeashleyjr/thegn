@@ -117,8 +117,9 @@ pub(crate) fn expand_month(
     match thegn_core::calendar::expand_calendar(&cached.events, from, to, home) {
         Ok(calendar) => MonthView {
             events: Some(calendar.by_date.into_iter().collect()),
-            // Undecodable rows cost only themselves, but the month says so.
-            error: (cached.skipped > 0).then_some(CalendarError::MalformedCache),
+            // An undecodable or malformed row costs only itself, but the month
+            // says so rather than passing for the whole calendar.
+            error: (cached.skipped + calendar.skipped > 0).then_some(CalendarError::MalformedCache),
         },
         Err(error) => MonthView::failed(CalendarError::Expansion(error)),
     }
@@ -694,7 +695,10 @@ pub(crate) fn due_reminders(
             window.from_ms,
             window.to_ms,
         ),
-        skipped: cached.skipped,
+        // Rows the expander skipped as malformed are counted with the ones
+        // that would not decode: both mean "these reminders are everything the
+        // cache could yield", not "the evaluation failed".
+        skipped: cached.skipped + expanded.skipped,
     })
 }
 

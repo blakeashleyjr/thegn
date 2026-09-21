@@ -313,7 +313,7 @@ pub(crate) fn hit(
                 &g.week_dates(),
                 g.week_numbers.is_some(),
                 crate::seg::cells(&g.title),
-                crate::seg::cells(&g.today_chip),
+                crate::seg::cells(g.status.as_ref().unwrap_or(&g.today_chip)),
             );
             if let Some(lay) = lay
                 && let Some(h) = layout::hit_grid(inner, &lay, x, y)

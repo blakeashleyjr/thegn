@@ -34,17 +34,38 @@
    `recur::occurrences`, host `due_reminders` compat) are removed or
    `#[cfg(test)]`.
 
-## Deliberate deviation
+## Per-row vs whole-call failure (adversarial review F1-F4)
 
-Undecodable cached rows: still skipped (existing contract: one bad row costs
-that row, not the month) but now COUNTED and surfaced — month marked
-"incomplete" (CalendarError::MalformedCache), reminder outcome
-`Incomplete` (window advances; retrying re-reads the same bytes, so holding
-the cursor would stall every reminder behind one corrupt row). Expansion
-failures remain hard failures that raise nothing.
+A defect in ONE row never fails the call. `ExpansionError::is_row_local()`
+(InvalidSpan, Budget(EventPayload), Budget(EventChildren)) makes
+`expand_calendar_with_budget` skip that row and count it in
+`ExpandedCalendar::skipped`; the host adds it to `Cached::skipped` and reports
+MalformedCache / "incomplete". The same reasoning as for undecodable rows: the
+row stays in the SQLite cache, every tick re-reads the same bytes, so
+escalating would blank the month and stop reminders for the life of the
+process. Only the shared dimensions (WindowDays, SourceVisits, RecurrenceWork,
+MaterializedOccurrences, BucketEntries, RetainedBytes), InvalidWindow and
+Arithmetic are whole-call failures.
+
+Ceilings (F3) are raised and their arithmetic is recorded above the constants
+and pinned by `default_ceilings_admit_a_heavy_but_legitimate_month`:
+occurrences 8,192 -> 131,072, bucket entries 32,768 -> 524,288, recurrence work
+262,144 -> 4,194,304, retained bytes 32 -> 64 MiB. Sized so `max_events`
+(2,000/account) worth of daily recurrences over the widened (~49-day) window
+fits, and so memory — not an arbitrary count — is what binds first.
+
+F4: the grid header carries the state (`MonthGridSection::status`, drawn where
+the today chip goes), because `show_agenda = false` never builds the agenda
+note.
 
 ## Not in scope / open
 
 - Reminder lookahead is still today±1 day (THE-460).
 - max_events admission (THE-465); transport (THE-454).
-- Month merge never clears a date bucket that became empty (pre-existing).
+- Month merge never clears a date bucket that became empty, and a failed month
+  can still show markers delivered by a neighbouring month's widened payload
+  (both pre-existing).
+- `load_cached` deserializes every matching cache row BEFORE the expansion
+  budget sees them, so the 64 MiB ceiling bounds the expansion, NOT the peak
+  memory of the read. Source-row admission is THE-465 / THE-455.
+- `expand_by_date` and `reminders::due` remain pub with no production caller.
