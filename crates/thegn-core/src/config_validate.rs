@@ -2023,9 +2023,11 @@ mod security_root_rot_tests {
     /// what the field vocabulary above names, so roots whose danger is
     /// structural rather than lexical (`[database]`'s migration authority,
     /// `[placement]`'s lanes, `[disk]`'s reclamation) are listed on human
-    /// judgment and are not re-derived here. Today the guard flags 39 of the
-    /// listed roots; the assertions below fail if that detection collapses,
-    /// so a schemars upgrade cannot quietly turn this test into decoration.
+    /// judgment and are not re-derived here. The guard flags a majority of the
+    /// listed roots; the assertions below fail if that detection collapses, so
+    /// a schemars upgrade cannot quietly turn this test into decoration. The
+    /// floor is derived from the list rather than written as a literal — a
+    /// number in a comment about rot is itself the thing that rots.
     #[test]
     fn security_relevant_roots_cover_every_executing_or_credential_table() {
         let root = config_schema();
@@ -2061,11 +2063,15 @@ mod security_root_rot_tests {
                  become decoration (schemars shape change?). flagged={flagged:?}"
             );
         }
+        // Half the list, derived: comfortably below today's detection rate and
+        // above the count a collapsed walk could reach.
+        let floor = SECURITY_RELEVANT_ROOTS.len() / 2;
         assert!(
-            flagged.len() >= 30,
-            "only {} roots flagged (39 when written): detection collapsed — \
-             flagged={flagged:?}",
-            flagged.len()
+            flagged.len() >= floor,
+            "only {} of {} listed roots flagged (floor {floor}): detection \
+             collapsed — flagged={flagged:?}",
+            flagged.len(),
+            SECURITY_RELEVANT_ROOTS.len()
         );
     }
 
