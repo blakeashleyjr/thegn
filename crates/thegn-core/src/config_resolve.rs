@@ -1441,7 +1441,13 @@ pub fn explain(
     let raw_json = serde_json::to_value(raw).map_err(|_| {
         "config source violates the configuration schema; nothing can be explained".to_string()
     })?;
-    if !crate::config_validate::validate_config_schema_value(&raw_json).is_empty() {
+    // The SAME layer policy admission uses: after the unknown-key split a
+    // config with an unknown non-security key starts and `config validate`
+    // warns, so explain must not be the one consumer that refuses it.
+    if !crate::config_validate::validate_config_layer_schema_value(&raw_json)
+        .0
+        .is_empty()
+    {
         return Err(
             "config source violates the configuration schema; nothing can be explained".into(),
         );

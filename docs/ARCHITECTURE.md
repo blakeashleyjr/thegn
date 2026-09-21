@@ -263,11 +263,17 @@ the two admitted configuration layers (main file, selected profile overlay)
 refuse an unknown key only under a security-relevant table — one that can
 execute, reach a remote, hold or select credentials, gate migrations or set
 sandbox/placement/queue policy (`SECURITY_RELEVANT_ROOTS`, mirrored in
-`docs/help/configuration.md`) — and warn elsewhere, because one
+`docs/help/configuration.md`, and kept honest by a schema-derived rot guard
+that fails when a new root carries a command/argv, a credential or a
+URL/host field) — and warn elsewhere, because one
 `~/.config/thegn/config.toml` is shared by builds of different ages. Every
 other consumer of the same walk (repo overlay, `host_definition_snapshot`'s
 row decoder, any other schema) keeps `UnknownKeys::Reject`; the relaxation
-is passed in at the call site, never decided inside the walk.
+is passed in at the call site, never decided inside the walk. Entries are
+SCHEMA property names: `[workspace.<slug>]` is normalized to
+`[project.<slug>]` before any walk, so `project` is the protected name. A
+typo of a security table refuses through the walk's nearest-key hint, which a
+genuinely new table can never match.
 
 Config files are read through bounded opened-file adapters. Linux admits a
 resolved regular-file symlink component-wise; on macOS/Windows a _final_
