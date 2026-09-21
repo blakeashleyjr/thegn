@@ -124,6 +124,44 @@ pub(crate) fn spawn_periodic_sync(
 /// changed.
 ///
 /// `force` bypasses the `ttl_secs` freshness guard (the popup's `r` key).
+/// How long an account waits after the shared admission budget refused it.
+///
+/// Nothing is written to the DB for a contention refusal — a stamp there would
+/// look like an attempt and hold the account back for `ttl_secs` — so the
+/// backoff lives here instead. Without it the popup would re-sync (and
+/// re-download) the account on every month change for as long as the
+/// contention lasts.
+const CONTENTION_BACKOFF_SECS: i64 = 60;
+
+/// Accounts refused by the shared budget, and when. Bounded by the number of
+/// configured accounts.
+fn contention_seen() -> &'static std::sync::Mutex<BTreeMap<String, i64>> {
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<BTreeMap<String, i64>>> =
+        std::sync::OnceLock::new();
+    SEEN.get_or_init(Default::default)
+}
+
+fn note_contention(account: &str, now: i64) {
+    if let Ok(mut seen) = contention_seen().lock() {
+        seen.insert(account.to_string(), now);
+    }
+}
+
+/// Whether `account` is still inside its post-contention backoff.
+fn contention_backoff(account: &str, now: i64) -> bool {
+    let Ok(mut seen) = contention_seen().lock() else {
+        return false;
+    };
+    match seen.get(account) {
+        Some(at) if now.saturating_sub(*at) < CONTENTION_BACKOFF_SECS => true,
+        Some(_) => {
+            seen.remove(account);
+            false
+        }
+        None => false,
+    }
+}
+
 /// Surface a calendar problem the user has to act on as an in-app toast.
 fn toast(tx: &tokio_mpsc::UnboundedSender<RefreshKind>, waker: &TerminalWaker, message: String) {
     if tx
@@ -164,6 +202,12 @@ fn sync_accounts(
         // Rule 1: gate the NETWORK-backed accounts only. A local file or a
         // subprocess plugin must keep working offline.
         if offline && a.is_network_backed() {
+            continue;
+        }
+        // Backed off after a shared-budget refusal: nothing was recorded for
+        // it (deliberately — see `record_failure`), so this is what stops the
+        // popup re-fetching it on every month change.
+        if !force && contention_backoff(&a.name, now) {
             continue;
         }
         let sync = db.get_calendar_sync(&a.name).ok().flatten();
@@ -220,12 +264,20 @@ fn sync_accounts(
                 return;
             }
         };
-        // The cache rows built from the page are a second copy of it; account
-        // for them under the page's lease before building them.
+        // The cache rows built from the page are a second copy of it, so they
+        // are accounted under the page's lease. Advisory on purpose: the data
+        // is already admitted and in hand, and throwing a valid page away —
+        // silently, since a pool refusal is nobody's fault — would be worse
+        // than one unaccounted copy. The pool is sized so this cannot happen
+        // to an account on its own (see `GLOBAL_MAX_BYTES`).
         let derived = page.reserved().1;
         if let Err(e) = page.reserve_derived(derived) {
-            record_failure(db, &r.account, r.provider, &e, &prior_errors, notify);
-            return;
+            tracing::debug!(
+                target: "thegn::calendar",
+                account = %r.account,
+                error = %e,
+                "cache rows exceed the shared budget — writing them anyway"
+            );
         }
         if apply_page(db, &r.account, r.provider, &page, from, to) {
             changed = true;
@@ -256,7 +308,9 @@ fn record_failure(
         // Other syncs hold the shared budget right now. Nothing is wrong with
         // this account, so nothing is recorded: without an attempt stamp the
         // next tick retries it instead of waiting out `ttl_secs`.
-        CalendarError::Admission(a) if a.is_contention() => {}
+        CalendarError::Admission(a) if a.is_contention() => {
+            note_contention(account, thegn_core::util::now());
+        }
         CalendarError::Admission(_) => {
             let message = e.to_string();
             // Tell the user once per new condition, not on every retry.

@@ -149,7 +149,9 @@ The budget MUST be enforced while a source is parsed or decoded — before the
 next event is built — and it MUST cover events, deletions, and retained bytes.
 The byte budget MUST scale with `max_events`. For whole-document sources
 (local and subscribed iCalendar), only events that can occur within the sync
-horizon MUST count toward the budget.
+horizon MUST count toward the budget; events outside it are neither admitted
+nor cached, so a month outside `horizon_past_days`/`horizon_future_days` shows
+no events for those accounts, as it already does for server-windowed sources.
 It MUST also enforce per-event size and child-count ceilings, a
 content-line ceiling, and a source-document ceiling. A process-wide budget
 MUST bound admitted records and reserved bytes across every concurrent fetch.
@@ -186,8 +188,8 @@ the account.
 
 - **WHEN** a subscribed iCalendar feed holds more past events than
   `max_events`, but few of them fall within the sync horizon
-- **THEN** only the events that can occur in the horizon are counted, and the
-  feed is admitted
+- **THEN** only the events that can occur in the horizon are counted and
+  cached, and the feed is admitted
 
 #### Scenario: An incremental delta over the budget
 
