@@ -93,6 +93,18 @@ BYHOUR×BYMINUTE×BYSECOND product. `a_by_part_cross_product_is_refused_as_it_gr
 pins the peak under the default budget and refuses inside a SINGLE period
 under a 10,000-unit ceiling (below one period's 86,400 product).
 
+## Accounting asymmetries that are bounded, not holes
+
+- `month_dates`/`year_dates` build their date vectors under the per-period
+  work charge but are not byte-charged; at the child ceiling that is ~328 KB.
+- `expand_local_bounded`'s RDATE insert is work-charged through `listed` but
+  not byte-charged (~655 KB at the child ceiling), so an RDATE-only event
+  never touches `expanded_locals` — it is bounded by `occurrence()`/`bytes()`
+  instead.
+- The budget is monotonic: a row's locals stay charged after its vector is
+  freed. That makes the locals charge read as a permanent ~8% tightening
+  rather than a peak measurement — conservative on purpose.
+
 ## Follow-ups (agreed: NOT fixed here)
 
 1. Fold `Arithmetic` into `is_row_local` — the cleaner rule is "everything
