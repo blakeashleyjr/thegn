@@ -63,11 +63,13 @@ fn read(_: &Path, _: usize) -> Result<Option<Vec<u8>>, ConfigFileReadError> {
 pub(crate) fn startup_reader() -> impl ConfigSourceReader {
     #[cfg(target_os = "linux")]
     {
-        LinuxStartupReader
+        crate::config_capture::RetryOnChange(LinuxStartupReader)
     }
     #[cfg(not(target_os = "linux"))]
     {
-        crate::config_capture::FinalLinkResolvingReader(Reader)
+        crate::config_capture::RetryOnChange(crate::config_capture::FinalLinkResolvingReader(
+            Reader,
+        ))
     }
 }
 

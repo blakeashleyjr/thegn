@@ -99,7 +99,8 @@ pub(crate) fn collect(main_path: &Path, repo_context: Option<&Path>) -> ConfigHe
     // variable or an admission-only bound, so `config validate` never says
     // "ok" for a config that startup refuses.
     let explicit = (main_path != thegn_core::config::Config::path()).then_some(main_path);
-    match crate::config_startup::check_sources(explicit, &[]) {
+    let overrides = crate::config_source::overrides();
+    match crate::config_startup::check_sources(explicit, &overrides) {
         Ok(warnings) => {
             for warning in warnings {
                 add_warning(&mut health, main_path, warning);
@@ -126,6 +127,15 @@ pub(crate) fn collect(main_path: &Path, repo_context: Option<&Path>) -> ConfigHe
 }
 
 fn validate_toml_file(health: &mut ConfigHealth, layer: Layer, path: &Path) {
+    // The trusted layers report what admission does: an unknown key outside
+    // the security-relevant tables is ignorable. The repo overlay is not a
+    // trusted layer and keeps refusing every unknown key.
+    let policy = match layer {
+        Layer::Main | Layer::Profile => {
+            thegn_core::config_validate::UnknownKeys::RejectSecurityRelevant
+        }
+        Layer::Repo => thegn_core::config_validate::UnknownKeys::Reject,
+    };
     let body = match std::fs::read_to_string(path) {
         Ok(body) => {
             if layer == Layer::Main {
@@ -148,7 +158,7 @@ fn validate_toml_file(health: &mut ConfigHealth, layer: Layer, path: &Path) {
         }
     };
 
-    for diagnostic in thegn_core::config_validate::validate_diagnostics(&body) {
+    for diagnostic in thegn_core::config_validate::validate_diagnostics_with_policy(&body, policy) {
         match diagnostic.severity {
             thegn_core::config_validate::ValidationSeverity::Warning => {
                 add_warning(health, path, diagnostic.message);
@@ -344,13 +354,26 @@ mod tests {
             clean.findings
         );
 
-        let _env =
-            thegn_core::testenv::EnvGuard::set(&[("THEGN_SANDBOX_ENABLED", "canary-not-a-bool")]);
+        // An unknown key outside the security-relevant tables is reported as
+        // an ignorable warning, not a problem: one config.toml is shared by
+        // builds of different ages.
+        std::fs::write(&path, "[ui]\nnewer_build_knob = true\n").unwrap();
+        let relaxed = collect(&path, Some(dir.path()));
+        assert_eq!(relaxed.problems(), 0, "{:?}", relaxed.findings);
+        assert!(
+            relaxed
+                .findings()
+                .any(|finding| finding.warning && finding.message.contains("unknown key")),
+            "{:?}",
+            relaxed.findings
+        );
+        // …but inside one it is a problem `config validate` must report.
+        std::fs::write(&path, "[sandbox]\nnewer_policy_knob = true\n").unwrap();
         let refused = collect(&path, Some(dir.path()));
         assert_eq!(refused.problems(), 1, "{:?}", refused.findings);
-        let message = &refused.findings().find(|f| !f.warning).unwrap().message;
-        assert!(message.contains("THEGN_SANDBOX_ENABLED"), "{message}");
-        assert!(!message.contains("canary"), "{message}");
+        // The environment layer's own refusal is covered without mutating
+        // this process (`just coverage` runs every test in ONE process) by
+        // `config_admission::tests::rejection_detail_names_source_and_key…`.
     }
 
     #[test]

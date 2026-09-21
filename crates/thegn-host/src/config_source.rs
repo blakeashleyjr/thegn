@@ -29,6 +29,16 @@ pub fn install(overrides: Vec<String>, path: Option<PathBuf>) {
     let _ = SOURCE.set(Source { overrides, path }); // best-effort: first-set-wins: later calls are ignored by design
 }
 
+/// The `--set` overrides this process was started with (empty when none was
+/// recorded). `config validate`/doctor use them so they reproduce exactly
+/// what this invocation's admission would see.
+pub fn overrides() -> Vec<String> {
+    SOURCE
+        .get()
+        .map(|src| src.overrides.clone())
+        .unwrap_or_default()
+}
+
 /// `boot` with only its agent/tool/pipeline registries refreshed from a
 /// freshly **admitted** generation.
 ///

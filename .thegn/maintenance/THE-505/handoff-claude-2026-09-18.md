@@ -156,3 +156,50 @@ config_banner` is a persistent statusbar banner while degraded/host-less.
   the same one the controller performs on main, and no authority is
   published from a failed host layer (host-less generations never
   authorize). An invalid trusted layer never reaches the DB.
+
+## Re-review round (review notes N1–N8 + the M4 user decision)
+
+- **N1** `Command::Debug` is Configured again: `debug setup` installs a
+  toolchain and `debug run/attach` exec-replace into a binary resolved from
+  the config, so it is an executing verb, not diagnostic output.
+- **N2** The host-less warning and banner now claim only what is refused:
+  "stored hosts are missing; agent and tool launches are refused and env
+  selections that relied on them will degrade". `require_launchable` still
+  has exactly one caller (`config_source::fresh`, three daemon paths);
+  extending it to the configured-verb entry stays chunk 6 work.
+- **N3** `model.config_banner` is recomputed on every hydration instead of
+  carried, so a store change from an in-process daemon launch or the
+  wizard's host-add reload cannot leave a stale or missing banner.
+- **N4** The post-processed (effective) candidate is validated again after
+  `post_process_pure`, so tilde expansion, injected default agents/tools and
+  clamps cannot produce a config the runtime uses and nothing validated.
+- **N6** `current_dir` failing is no longer a lockout: `settle_cwd` falls
+  back to the (absolute) profile root and refuses only when a relative
+  `--config` genuinely needs the cwd. The startup reader also retries once
+  on `Changed` (write-rename race).
+- **N7** `config validate`/doctor pass this process's `--set` overrides
+  (`config_source::overrides()`); the refusal detail is labelled "first
+  likely cause" because each source is validated standalone; clamp/unknown
+  warnings are selected by typed `DiagnosticKind`, not by substring.
+- **M4 (user decision) + N8** Unknown keys: refuse under a security-relevant
+  table, warn and ignore elsewhere. The policy is a per-call-site flag
+  (`config_validate::UnknownKeys`) — only the admitted layers (main file,
+  selected profile overlay, the gated typed walk, `--set` shape check) pass
+  `RejectSecurityRelevant`; the repo overlay, `host_definition_snapshot`'s
+  row decoder and every other schema consumer keep `Reject`, so a newer
+  build's host row with an unknown field still fails `InvalidDefinition`.
+  The table list lives in `SECURITY_RELEVANT_ROOTS` and is mirrored in
+  `docs/help/configuration.md` and `docs/ARCHITECTURE.md`.
+- **N5** noted, no action: first frame is at the 300 ms budget on a fast box
+  with `THEGN_NO_MIGRATE=1` and no host rows; CLI verbs now ride every
+  notify-push hook and bridge spawn. Build-time schema generation is the
+  next lever; re-measure with a populated host table.
+
+### Shared-lane incident (twice)
+
+`cargo-lane.sh` kept the lock as fd 9, and any daemon started inside the
+lane inherits that open file description: a `podman events` watcher spawned
+by a benched TUI held the whole batch lane for ~30 min, and an sccache
+server started at 19:12 held it again for ~2 h until killed. The lane script
+now runs its command with `9>&-`, and the bench script closes fd 9 and reaps
+its own leftovers.

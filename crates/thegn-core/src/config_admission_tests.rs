@@ -639,7 +639,9 @@ fn invalid_profile_env_cli_schema_and_semantics_never_publish() {
 
     let result = admit(AdmissionInputs {
         defaults: Config::default(),
-        base: SourceInput::bytes("base", false, b"typoed_key = true\n"),
+        // A typo inside a security-relevant table still refuses; the
+        // relaxed case (an unknown key elsewhere) has its own test.
+        base: SourceInput::bytes("base", false, b"[sandbox]\ntypoed_key = true\n"),
         profile: None,
         env: &env,
         overrides: &overrides,
@@ -979,5 +981,121 @@ fn rejection_detail_names_source_and_key_without_values() {
     assert_eq!(
         detail(base(b"branch_prefix = \"ok/\"\n"), &clean, &[]),
         None
+    );
+}
+
+/// One shared config.toml is read by builds of different ages. An unknown key
+/// in a security-relevant table still refuses (an ignored policy key can mean
+/// policy silently not applied); anywhere else it is an ignorable warning, so
+/// a newer build's key cannot brick an older build.
+#[test]
+fn unknown_keys_refuse_only_in_security_relevant_tables() {
+    let env = TestEnv::default();
+    let host_snapshot = hosts();
+    let admit_body = |body: &'static [u8]| {
+        admit(AdmissionInputs {
+            defaults: Config::default(),
+            base: SourceInput::bytes("base", false, body),
+            profile: None,
+            env: &env,
+            overrides: &[],
+            hosts: &host_snapshot,
+            paths: &path_context(),
+        })
+    };
+    for body in [
+        &b"[sandbox]\nunknown_policy_knob = true\n"[..],
+        &b"[merge_queue]\nunknown_gate = \"x\"\n"[..],
+        &b"[database]\nunknown_authority = \"any\"\n"[..],
+        &b"[network]\nunknown_mode = 1\n"[..],
+        &b"[[agents]]\nname = \"a\"\ncommand = \"a\"\nunknown_permission = true\n"[..],
+    ] {
+        assert!(
+            matches!(
+                admit_body(body),
+                Err(ConfigAdmissionError::SchemaInvalid | ConfigAdmissionError::SemanticInvalid)
+            ),
+            "{}: a security-relevant unknown key must refuse",
+            String::from_utf8_lossy(body)
+        );
+    }
+    for body in [
+        &b"[ui]\nnewer_build_knob = true\n"[..],
+        &b"[bars]\nnewer_build_knob = 3\n"[..],
+        &b"newer_top_level_table_from_a_newer_build = { a = 1 }\n"[..],
+    ] {
+        let admitted = admit_body(body)
+            .unwrap_or_else(|error| panic!("{}: {error}", String::from_utf8_lossy(body)));
+        assert!(
+            admitted.trace().diagnostics().iter().any(|diagnostic| {
+                diagnostic.kind == DiagnosticKind::UnknownKey
+                    && diagnostic.severity == DiagnosticSeverity::Warning
+            }),
+            "{}: must warn: {:?}",
+            String::from_utf8_lossy(body),
+            admitted.trace().diagnostics()
+        );
+    }
+}
+
+/// The security split lives at the call site: the host-row decoder and every
+/// other schema consumer still refuse every unknown key.
+#[test]
+fn only_the_configuration_layers_relax_unknown_keys() {
+    use crate::config_validate::{UnknownKeys, is_security_relevant_path, split_unknown_keys};
+    assert!(is_security_relevant_path("sandbox.knob"));
+    assert!(is_security_relevant_path("env.dev.provider.knob"));
+    assert!(is_security_relevant_path("agents[0].knob"));
+    assert!(!is_security_relevant_path("ui.knob"));
+    // A bare root key is the "newer build added a table" case.
+    assert!(!is_security_relevant_path("brand_new_table"));
+    let messages = vec![
+        "ui.knob: unknown key".to_string(),
+        "sandbox.knob: unknown key".to_string(),
+    ];
+    let (errors, warnings) = split_unknown_keys(messages.clone(), UnknownKeys::Reject);
+    assert_eq!(errors.len(), 2);
+    assert!(warnings.is_empty());
+    let (errors, warnings) = split_unknown_keys(messages, UnknownKeys::RejectSecurityRelevant);
+    assert_eq!(errors, ["sandbox.knob: unknown key"]);
+    assert_eq!(warnings.len(), 1);
+    // The strict host-row decoder is not on the relaxed path.
+    let row = serde_json::json!({"reach": "ssh", "unknown_row_field": 1});
+    assert!(
+        !crate::config_validate::validate_schema_value_with_root(
+            &row,
+            &schemars::schema_for!(crate::host_config::HostConfig),
+        )
+        .is_empty()
+    );
+}
+
+/// The EFFECTIVE (post-processed) candidate is validated too: tilde
+/// expansion, injected defaults and clamps must not produce a config the
+/// runtime uses but nothing ever validated.
+#[test]
+fn the_post_processed_candidate_is_validated() {
+    let env = TestEnv::default();
+    let host_snapshot = hosts();
+    let ((), events) = crate::config_validate::semantic_observation::capture(|| {
+        admit(AdmissionInputs {
+            defaults: Config::default(),
+            base: SourceInput::bytes("base", false, b"branch_prefix = \"safe/\"\n"),
+            profile: None,
+            env: &env,
+            overrides: &[],
+            hosts: &host_snapshot,
+            paths: &path_context(),
+        })
+        .map(|_| ())
+        .expect("valid candidate")
+    });
+    let passes = events
+        .iter()
+        .filter(|event| **event == "semantic_start")
+        .count();
+    assert!(
+        passes >= 2,
+        "the raw AND the post-processed candidate are validated: {events:?}"
     );
 }

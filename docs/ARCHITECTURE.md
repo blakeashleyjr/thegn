@@ -258,6 +258,17 @@ snapshot. Source-inspection/recovery verbs (`config show/get/validate/
 explain/edit/set`, `automations test`) keep the tolerant display projection
 so a broken file can still be diagnosed and fixed; it is never published.
 
+Unknown keys follow a per-call-site policy (`config_validate::UnknownKeys`):
+the two admitted configuration layers (main file, selected profile overlay)
+refuse an unknown key only under a security-relevant table — one that can
+execute, reach a remote, hold or select credentials, gate migrations or set
+sandbox/placement/queue policy (`SECURITY_RELEVANT_ROOTS`, mirrored in
+`docs/help/configuration.md`) — and warn elsewhere, because one
+`~/.config/thegn/config.toml` is shared by builds of different ages. Every
+other consumer of the same walk (repo overlay, `host_definition_snapshot`'s
+row decoder, any other schema) keeps `UnknownKeys::Reject`; the relaxation
+is passed in at the call site, never decided inside the walk.
+
 Config files are read through bounded opened-file adapters. Linux admits a
 resolved regular-file symlink component-wise; on macOS/Windows a _final_
 config symlink is resolved with the OS resolver, the resolved ordinary file

@@ -10012,8 +10012,12 @@ async fn event_loop<T: Terminal>(
             // pushes it), so hydration must carry it or the badge blanks on
             // every 2s tick and reappears only on the next poll.
             next_model.usage = std::mem::take(&mut model.usage);
-            // Loop-owned: set from the config store on startup/reload.
-            next_model.config_banner = model.config_banner.take();
+            // Recomputed (not carried) on every hydration: the store's health
+            // also changes outside the config channel — an in-process daemon
+            // launch refreshing through `config_source::fresh`, the wizard's
+            // host-add reload — and a stale banner would either hide a
+            // degraded store or outlive the fix.
+            next_model.config_banner = crate::config_startup::banner();
             next_model.usage_history = std::mem::take(&mut model.usage_history);
             next_model.usage_tokens = model.usage_tokens.take();
             // And the weather reading, for the same reason with a much longer

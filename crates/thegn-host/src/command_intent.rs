@@ -64,13 +64,15 @@ fn classify_command(command: &Command) -> CommandIntent<'_> {
             cmd::automations::Action::List { .. } => Configured,
         },
         // Diagnostic and recovery verbs must keep working when the config
-        // or the state store is what is broken: doctor/logs/debug report it,
+        // or the state store is what is broken: doctor/logs report it,
         // notify hooks and the in-sandbox bridges read no authority config,
         // and `host list`/`host rm` are how a bad stored host row is fixed.
         // They run on the tolerant display projection; nothing publishes it.
+        // `debug` is deliberately NOT here: it installs a toolchain and
+        // exec-replaces into a binary resolved from `[managed_tools]`, so it
+        // is an executing verb and must run on an admitted configuration.
         Command::Doctor { .. }
         | Command::Logs { .. }
-        | Command::Debug { .. }
         | Command::Notify { .. }
         | Command::Bridge
         | Command::BridgeRevtunnel { .. } => Recovery,
@@ -108,6 +110,7 @@ fn classify_command(command: &Command) -> CommandIntent<'_> {
         | Command::Zone { .. }
         | Command::Project { .. }
         | Command::Placement { .. }
+        | Command::Debug { .. }
         | Command::Mcp { .. }
         | Command::Agent { .. }
         | Command::Skills { .. }

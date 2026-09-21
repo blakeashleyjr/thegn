@@ -186,8 +186,12 @@ impl ProcessAdmission {
                     .as_deref()
                     .unwrap_or("see `thegn config validate`")
             )),
+            // Scope claim: only the daemon's per-launch refresh consults
+            // `require_launchable` today, so say exactly what degrades.
             StoreHealth::Current { .. } => notes.hosts_unavailable.as_ref().map(|reason| {
-                format!("CONFIG: host definitions unavailable, launches refused: {reason}")
+                format!(
+                    "CONFIG: stored hosts are missing; agent and tool launches are refused and env selections that relied on them will degrade: {reason}"
+                )
             }),
             StoreHealth::Empty => None,
         }
@@ -303,7 +307,7 @@ pub(crate) fn admit_process(
     }
     if let Some(reason) = hosts_note {
         thegn_core::config::config_warn(&format!(
-            "host definitions unavailable ({reason}); running without stored hosts — launches are refused until this is fixed"
+            "stored hosts are missing ({reason}); agent and tool launches are refused and env selections that relied on a stored host will degrade until this is fixed"
         ));
     }
     Ok(published)
@@ -422,7 +426,13 @@ pub(crate) fn check_sources(
         .trace()
         .diagnostics()
         .iter()
-        .filter(|diagnostic| diagnostic.message.contains("value is out of range"))
+        .filter(|diagnostic| {
+            matches!(
+                diagnostic.kind,
+                thegn_core::config_admission::DiagnosticKind::Clamped
+                    | thegn_core::config_admission::DiagnosticKind::UnknownKey
+            )
+        })
         .map(|diagnostic| diagnostic.message.clone())
         .collect())
 }
