@@ -154,11 +154,14 @@ fn resolve_inner(
             .as_deref()
             .filter(|id| !id.is_empty())
             .context("a fork launch needs a native session id")?;
-        if let Some(command) = fork_command {
+        let fork = if let Some(command) = fork_command {
             command.to_owned()
         } else {
             fork_command_for(cfg, agent, native_id)?
-        }
+        };
+        // A fork is a new process: it carries the same command-scoped grant
+        // as any other launch of this agent (THE-440).
+        format!("{fork}{}", session_grant(cfg, agent, stage)?)
     } else {
         command_for(
             cfg,
@@ -247,6 +250,7 @@ pub(crate) fn command_for(
         let cmd = harness
             .resume_command(id)
             .with_context(|| format!("agent `{agent}` does not support resume"))?;
+        let cmd = format!("{cmd}{}", session_grant(cfg, agent, stage)?);
         // A prompt alongside resume is handed over as an opening message, the
         // same way an interactive launch-with-task does.
         if prompt.trim().is_empty() {
@@ -264,6 +268,7 @@ pub(crate) fn command_for(
         let cmd = harness
             .continue_command()
             .with_context(|| format!("agent `{agent}` does not support continue"))?;
+        let cmd = format!("{cmd}{}", session_grant(cfg, agent, stage)?);
         if prompt.trim().is_empty() {
             return Ok(cmd);
         }
@@ -291,6 +296,19 @@ pub(crate) fn command_for(
         .map_err(|e| anyhow::anyhow!("no headless form for agent `{agent}`: {e}"))?;
     substitute_command(&template, prompt, &TaskVars::new())
         .map_err(|e| anyhow::anyhow!("agent command template is invalid: {e}"))
+}
+
+/// The command-scoped permission grant for the resume / continue / fork forms
+/// (the fresh forms get it through `EffectiveAgent`'s command builders). The
+/// grant is per process — a resumed session does not inherit a file some
+/// earlier launch wrote, because no launch writes one (THE-440) — so every
+/// relaunch shape must carry it or refuse. An agent the resolver cannot
+/// resolve (a bare harness id with no entry, say) has no configured list.
+fn session_grant(cfg: &Config, agent: &str, stage: Option<&str>) -> Result<String> {
+    match thegn_core::agent_task::effective_agent(cfg, agent, stage) {
+        Ok(eff) => eff.permission_args().map_err(|e| anyhow::anyhow!("{e}")),
+        Err(_) => Ok(String::new()),
+    }
 }
 
 /// The harness backing a named agent: an `[[agents]]`/`[[tools]]` entry's

@@ -65,6 +65,10 @@ impl HarnessCaps {
     /// Can fork a native session into a new native session
     /// ([`Harness::fork_command`]).
     pub const FORK: HarnessCaps = HarnessCaps(64);
+    /// Accepts a **command-scoped** tool allow-list
+    /// ([`Harness::session_permission_args`]): the grant rides the launch argv
+    /// for that one process and is never written to a settings file (THE-440).
+    pub const PERMISSIONS: HarnessCaps = HarnessCaps(128);
 
     pub const NONE: HarnessCaps = HarnessCaps(0);
 
@@ -94,6 +98,7 @@ impl HarnessCaps {
             (HarnessCaps::TEAMMATES, "teammates"),
             (HarnessCaps::CONTINUE, "continue"),
             (HarnessCaps::FORK, "fork"),
+            (HarnessCaps::PERMISSIONS, "permissions"),
         ] {
             if self.contains(bit) {
                 out.push(name);
@@ -293,6 +298,17 @@ pub trait Harness: Send + Sync {
     fn fork_command(&self, _native_session_id: &str) -> Option<String> {
         None
     }
+    /// The argv tokens (unquoted — the caller shell-quotes each one) that grant
+    /// `allow` to **this one process** (`PERMISSIONS`). The mechanism MUST be
+    /// command-scoped and documented by the vendor: nothing is written to the
+    /// worktree or any settings file, the grant dies with the process, and the
+    /// harness's own settings (deny rules, hooks, unknown keys) keep applying.
+    /// `None` when thegn cannot attest such a mechanism — a configured
+    /// `permissions` list is then refused before launch, never dropped and
+    /// never replaced by a skip-permissions mode.
+    fn session_permission_args(&self, _allow: &[String]) -> Option<Vec<String>> {
+        None
+    }
     /// Fold one transcript's token counters into a host-wide rollup (`TOKENS`).
     fn fold_transcript(
         &self,
@@ -438,7 +454,20 @@ impl Harness for Claude {
             HarnessCaps::TOKENS,
             HarnessCaps::CONTINUE,
             HarnessCaps::FORK,
+            HarnessCaps::PERMISSIONS,
         ])
+    }
+    fn session_permission_args(&self, allow: &[String]) -> Option<Vec<String>> {
+        // `claude --settings <file-or-json>` (attested from `claude --help`
+        // and code.claude.com/docs/en/settings): an inline JSON settings layer
+        // for this session only — "doesn't write to any file", sits above
+        // user/project/local and below managed settings, and list keys such as
+        // `permissions.allow` MERGE with the other scopes, so the worktree's
+        // own deny rules, hooks and unknown keys keep applying untouched.
+        // `--allowedTools` is deliberately not used: it is variadic and would
+        // swallow a following positional prompt.
+        let settings = serde_json::json!({ "permissions": { "allow": allow } });
+        Some(vec!["--settings".to_string(), settings.to_string()])
     }
     fn skill_layout(&self) -> Option<SkillLayout> {
         Some(SkillLayout {
@@ -826,6 +855,12 @@ mod tests {
                 "{}: FORK bit vs fork_command()",
                 h.id()
             );
+            assert_eq!(
+                h.session_permission_args(&["Read".to_string()]).is_some(),
+                caps.contains(HarnessCaps::PERMISSIONS),
+                "{}: PERMISSIONS bit vs session_permission_args()",
+                h.id()
+            );
             // USAGE: a non-USAGE harness never parses usage; a USAGE one is
             // exercised with a real body in its own unit test below.
             if !caps.contains(HarnessCaps::USAGE) {
@@ -835,6 +870,26 @@ mod tests {
                     h.id()
                 );
             }
+        }
+    }
+
+    /// Claude's grant is one `--settings` flag carrying a JSON object whose only
+    /// key is `permissions.allow` — the patterns verbatim, in order, as JSON
+    /// strings (never spliced into a string by hand).
+    #[test]
+    fn claude_permission_args_are_one_settings_json_layer() {
+        let allow = vec![
+            "Read".to_string(),
+            "Bash(git log:*)".to_string(),
+            "Bash(echo \"it's $(x)\")".to_string(),
+        ];
+        let args = CLAUDE.session_permission_args(&allow).unwrap();
+        assert_eq!(args.len(), 2);
+        assert_eq!(args[0], "--settings");
+        let v: serde_json::Value = serde_json::from_str(&args[1]).unwrap();
+        assert_eq!(v, serde_json::json!({ "permissions": { "allow": allow } }));
+        for h in [&CODEX as &dyn Harness, &PI, &AIDER, &ANTIGRAVITY] {
+            assert!(h.session_permission_args(&allow).is_none(), "{}", h.id());
         }
     }
 
