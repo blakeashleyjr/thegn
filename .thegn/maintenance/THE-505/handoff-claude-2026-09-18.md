@@ -203,3 +203,21 @@ by a benched TUI held the whole batch lane for ~30 min, and an sccache
 server started at 19:12 held it again for ~2 h until killed. The lane script
 now runs its command with `9>&-`, and the bench script closes fd 9 and reaps
 its own leftovers.
+
+### Round-3 validation (rebased onto main 18060ae8)
+
+`cargo clippy --workspace --all-targets -D warnings`: clean (main's
+`sidebar_mouse` unused-`mut` fix landed, so the gate is green on this branch
+for the first time). `cargo nextest` over the config/admission/provider/host
+surfaces **plus the ratchet tests** (`package(thegn-core) & test(/ratchet/)`)
+and `workspace_overlay`: 529/529 passed. `just ratchets` (static) passes.
+
+THE-515's `workspace_overlay::validate` runs inside `typed_semantic_errors`,
+so admission already enforces it; `workspace` is in the security-relevant
+root list, so an unknown key under `[workspace.<key>]` refuses.
+
+No test asserts on process-global state (`just coverage` runs one process):
+the startup tests drive `ProcessAdmission` directly instead of the process
+`OnceLock`, and the config-health test no longer mutates the environment —
+the environment-layer refusal is covered by the core `rejection_detail`
+test, which uses an injected `EnvSource`.
