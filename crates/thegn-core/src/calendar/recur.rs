@@ -530,6 +530,9 @@ fn expand_rule(
                 emitted += 1;
             }
             if dt.date() >= from && dt.date() <= to {
+                // Charged before it is held: this vector is the pass's
+                // largest transient, and it is attacker-sized.
+                budget.expanded_local()?;
                 out.push(dt);
             }
         }
@@ -666,6 +669,7 @@ fn expand_subdaily(
                 emitted += 1;
             }
             if cur.date() >= from {
+                budget.expanded_local()?;
                 out.push(cur);
             }
         }
@@ -734,9 +738,10 @@ fn period_candidates(
         for h in &hours {
             for mi in &minutes {
                 for s in &seconds {
-                    // Charged before growth: a BYHOUR×BYMINUTE×BYSECOND cross
-                    // product is refused as it grows, not after.
-                    budget.recurrence_work(1)?;
+                    // Charged before growth, in work AND bytes: a
+                    // BYHOUR×BYMINUTE×BYSECOND cross product is refused as it
+                    // grows, not after it has been built.
+                    budget.candidate()?;
                     if let Some(t) = d.and_hms_opt(*h, *mi, *s) {
                         out.push(t);
                     }

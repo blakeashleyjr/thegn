@@ -1353,8 +1353,10 @@ fn a_counted_walk_that_exceeds_the_budget_is_refused() {
 
 #[test]
 fn a_by_part_cross_product_is_refused_as_it_grows() {
-    // 24 × 60 × 60 candidate times per day: the charge lands per candidate, as
-    // the product grows, not after it has been built.
+    // 24 × 60 × 60 candidate times per period. The ceiling here is BELOW one
+    // period's product, so passing this proves the charge lands per candidate
+    // as the product grows — an implementation that built all 86,400 and
+    // charged once per period would blow through it.
     let mut rule = RRule::parse("FREQ=DAILY").unwrap();
     rule.by_hour = (0..24).collect();
     rule.by_minute = (0..60).collect();
@@ -1369,15 +1371,48 @@ fn a_by_part_cross_product_is_refused_as_it_grows() {
         rules: vec![rule],
         ..Default::default()
     });
-    let mut budget = ExpansionBudget::limited(31, 1, 100_000, 1_000, 1_000, MAX_EXPANSION_BYTES);
+    let mut budget = ExpansionBudget::limited(31, 1, 10_000, 1_000, 1_000, MAX_EXPANSION_BYTES);
     assert_eq!(
-        expand_with(&[e], d(2026, 8, 1), d(2026, 8, 31), &mut budget),
+        expand_with(
+            std::slice::from_ref(&e),
+            d(2026, 8, 1),
+            d(2026, 8, 31),
+            &mut budget
+        ),
         Err(ExpansionError::Budget(ExpansionLimit::RecurrenceWork))
     );
     assert!(
-        budget.used_recurrence_work() <= 100_000,
+        budget.used_recurrence_work() <= 10_000,
         "charged past its ceiling: {}",
         budget.used_recurrence_work()
+    );
+    assert_eq!(
+        budget.used_expanded_locals(),
+        0,
+        "refused inside one period"
+    );
+
+    // Under the DEFAULT budget the same rule is refused too, and the pass's
+    // peak transient stays small: candidates and expanded locals are charged
+    // in bytes as well as work, so the vectors holding them cannot grow to
+    // the work ceiling's worth of instants.
+    let mut budget = ExpansionBudget::default();
+    assert_eq!(
+        expand_with(
+            std::slice::from_ref(&e),
+            d(2026, 8, 1),
+            d(2026, 8, 31),
+            &mut budget
+        ),
+        Err(ExpansionError::Budget(
+            ExpansionLimit::MaterializedOccurrences
+        ))
+    );
+    assert!(budget.used_expanded_locals() <= MAX_EXPANSION_OCCURRENCES);
+    assert!(
+        budget.used_retained_bytes() < 8 * 1024 * 1024,
+        "peak transient: {} bytes",
+        budget.used_retained_bytes()
     );
 
     // A yearly BYMONTH × BYDAY list is priced before a single period is built.
@@ -1406,6 +1441,7 @@ fn a_by_part_cross_product_is_refused_as_it_grows() {
         Err(ExpansionError::Budget(ExpansionLimit::RecurrenceWork))
     );
     assert_eq!(budget.used_recurrence_work(), 0, "priced before any work");
+    assert_eq!(budget.used_retained_bytes(), 0);
 }
 
 #[test]
@@ -1433,6 +1469,8 @@ fn every_rdate_and_exdate_is_charged_even_outside_the_window() {
 
 #[test]
 fn a_sub_daily_rule_that_would_flood_the_window_is_refused() {
+    // Every second of five months: refused on the retained-instant ceiling,
+    // which is charged per instant as the walk produces them.
     let rec = Recurrence {
         rules: vec![RRule::parse("FREQ=SECONDLY").unwrap()],
         ..Default::default()
@@ -1446,7 +1484,9 @@ fn a_sub_daily_rule_that_would_flood_the_window_is_refused() {
             d(2026, 12, 31),
             &mut budget
         ),
-        Err(ExpansionError::Budget(ExpansionLimit::RecurrenceWork))
+        Err(ExpansionError::Budget(
+            ExpansionLimit::MaterializedOccurrences
+        ))
     );
 }
 
@@ -1550,7 +1590,8 @@ fn default_ceilings_admit_a_heavy_but_legitimate_month() {
     // legitimate shape is a daily recurrence, which yields one occurrence per
     // day of the widened (month + a week either side) window.
     const WIDENED_DAYS: u64 = 49;
-    let rows: Vec<CalEvent> = (0..500)
+    const ROWS: usize = 500;
+    let rows: Vec<CalEvent> = (0..ROWS)
         .map(|i| {
             let mut e = recurring(
                 zoned(2026, 1, 1, 9, 0, "UTC"),
@@ -1568,16 +1609,30 @@ fn default_ceilings_admit_a_heavy_but_legitimate_month() {
         .unwrap();
     let mut budget = ExpansionBudget::default();
     let got = expand_with(&rows, from, to, &mut budget).unwrap();
-    assert_eq!(got.occurrences.len(), 500 * WIDENED_DAYS as usize);
+    assert_eq!(got.occurrences.len(), ROWS * WIDENED_DAYS as usize);
     assert_eq!(got.skipped, 0);
+
     // 500 daily recurrences is already a heavy month; a whole admitted
-    // account of them (2,000) must still fit every dimension.
-    let factor = 4;
+    // account of them (2,000) must still fit the counted dimensions.
+    let factor = 2_000 / ROWS;
     assert!(budget.used_occurrences() * factor <= MAX_EXPANSION_OCCURRENCES);
     assert!(budget.used_bucket_entries() * factor <= MAX_EXPANSION_BUCKET_ENTRIES);
     assert!(budget.used_recurrence_work() * factor <= MAX_EXPANSION_RECURRENCE_WORK);
-    assert!(budget.used_retained_bytes() * factor <= MAX_EXPANSION_BYTES);
     assert!(budget.used_source_visits() * factor <= MAX_EXPANSION_SOURCE_VISITS);
+
+    // Bytes are the dimension meant to bind first, so the assertion is on the
+    // COST PER OCCURRENCE rather than on this month's total: `CalEvent` is a
+    // public plugin struct designed to gain fields, and a size assertion would
+    // then fail here looking like an unrelated regression. At this bound the
+    // 64 MiB ceiling still covers 65,536 occurrences — some 1,300 rows of
+    // daily recurrence, an order of magnitude past any real calendar.
+    const BYTES_PER_OCCURRENCE: usize = 1024;
+    let per = budget.used_retained_bytes() / budget.used_occurrences();
+    assert!(
+        per <= BYTES_PER_OCCURRENCE,
+        "{per} bytes per occurrence: re-derive the byte ceiling"
+    );
+    const { assert!(MAX_EXPANSION_BYTES / BYTES_PER_OCCURRENCE >= 65_536) };
 }
 
 #[test]
