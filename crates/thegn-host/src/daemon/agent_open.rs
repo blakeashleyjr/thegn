@@ -21,8 +21,8 @@
 //! already CPU-capped. A daemon-launched agent and a TUI-launched agent are the
 //! same thing by construction, not by parallel maintenance.
 //!
-//! Blocking (SQLite, sandbox preparation, a bounded direnv warm), so callers run
-//! it under `spawn_blocking`. That makes an agent-spawning `sessions.open`
+//! Blocking (SQLite and sandbox/provider preparation), so callers run it under
+//! `spawn_blocking`. That makes an agent-spawning `sessions.open`
 //! measurably slower than a raw-argv one — seconds, not milliseconds, on a cold
 //! worktree. That is the price of parity and it is worth paying.
 
@@ -67,7 +67,6 @@ pub(crate) fn resolve_tool(
         worktree,
         branch.as_deref(),
         name,
-        true,
         true,
         LaunchExtras {
             cmd_override: Some(command),
@@ -192,10 +191,6 @@ fn resolve_inner(
         &worktree,
         branch.as_deref(),
         agent,
-        // Warm direnv synchronously: we are already off the loop, and a cold
-        // worktree whose devshell has not been resolved would otherwise launch
-        // the agent into an environment missing its toolchain.
-        true,
         // Daemon-owned: drop bwrap's `--die-with-parent` so the session
         // survives the compositor, which is the entire point of spawning here.
         true,

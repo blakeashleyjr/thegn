@@ -206,12 +206,8 @@ pub struct EnvProviderConfig {
     /// Push the built devShell closure to `binary_cache_url` during provisioning
     /// (needs a signing key in the env), so later sandboxes download it. Default off.
     pub binary_cache_push: bool,
-    /// P2P devShell speedup (opt-in, default off): transfer the repo's devShell
-    /// closure — already built on the HOST (you run `nix develop`/direnv locally) —
-    /// straight into the sandbox store (host `nix copy --to file://` → fs upload →
-    /// sandbox `nix copy --from file://`), so the in-sandbox devShell is a local
-    /// store hit, not a rebuild/redownload. No hosted cache needed; the host is the
-    /// cache. No-op when the repo has no nix devShell or the host hasn't built it.
+    /// Deprecated compatibility key. Host-side devShell evaluation and closure
+    /// transfer are disabled; target-side provisioning remains the only path.
     pub push_devshell: bool,
     /// Skip the blocking devShell build during provisioning (opt-in, default off).
     /// The repo's devShell then builds lazily in-pane on first `direnv`/`nix
@@ -223,8 +219,8 @@ pub struct EnvProviderConfig {
     /// sandbox over the reverse tunnel (opt-in, default off), so an in-sandbox `nix
     /// develop`/`direnv` SUBSTITUTES prebuilt store paths from the host instead of
     /// building from source. A general substituter covering the whole host store —
-    /// strictly more capable than `push_devshell`'s one-shot devShell upload, which
-    /// it supersedes when set. Needs a provider with the resident bridge (sprites).
+    /// strictly more capable than the removed one-shot devShell upload. Needs a
+    /// provider with the resident bridge (sprites).
     pub host_cache: bool,
     /// VPS providers only: vendor region/location (e.g. Hetzner `fsn1`).
     /// Empty ⇒ the provider's default.

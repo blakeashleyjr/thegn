@@ -12,6 +12,12 @@
 
 agent_configs.rs
 agent_run.rs
+# TEST-ONLY cfg, not per-OS production code (THE-418): three launch-safety
+# regressions install executable fake `direnv`/`nix`/shell binaries (Unix mode
+# bits) and assert none of them is ever spawned. They need the agent module's
+# private fixtures (`with_temp_state`, `cfg_with`); moving them behind a
+# `platform::` helper would stop them exercising the real launch seam.
+agent_tests.rs
 clipboard.rs
 cmd/debug.rs
 daemon/mod.rs

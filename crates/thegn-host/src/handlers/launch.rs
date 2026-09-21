@@ -138,7 +138,6 @@ fn compose_choice(cfg: &Config, worktree: &str, choice: &str) -> anyhow::Result<
         worktree,
         None,
         choice,
-        true,
         daemon_persistent,
         LaunchExtras::default(),
     )
@@ -165,7 +164,6 @@ fn compose_preset_command(
         worktree,
         None,
         choice,
-        true,
         daemon_persistent,
         LaunchExtras {
             cmd_override: over.as_deref(),

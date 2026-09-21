@@ -6,7 +6,7 @@
 //! this server) and adds it as a nix substituter, so an in-sprite `nix develop`
 //! *substitutes* prebuilt store paths from the host instead of building from
 //! source. This generalizes the one-shot, per-devShell `file://` push
-//! (`agent::push_devshell_closure`) into a substituter covering the whole host
+//! (the removed host-side devShell transfer) into a substituter covering the whole host
 //! store.
 //!
 //! Trust: paths are served UNSIGNED and the sprite nix.conf sets

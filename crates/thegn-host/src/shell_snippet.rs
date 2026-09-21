@@ -73,7 +73,7 @@ pub(crate) fn oci_login_snippet() -> String {
     // `$sel` carries a `"` (`exec "$tgsh" -l`), so it is single-quoted for the
     // `-lc` argument; the selector itself uses no single quotes.
     let devshell = "if command -v direnv >/dev/null 2>&1 && [ -e .envrc ]; then \
-             direnv allow . 2>/dev/null; direnv exec . sh -lc \"$sel\" && exit; \
+             direnv exec . sh -lc \"$sel\" && exit; \
          fi; \
          if [ -e devenv.nix ] && command -v devenv >/dev/null 2>&1; then \
              devenv shell -- sh -lc \"$sel\" && exit; \
@@ -121,6 +121,10 @@ mod tests {
         assert!(
             s.contains("[ -e .envrc ]") && s.contains("direnv exec . sh -lc \"$sel\" && exit"),
             "direnv entry runs the selector: {s}"
+        );
+        assert!(
+            !s.contains("direnv allow"),
+            "generated shells never approve direnv: {s}"
         );
         assert!(
             !s.contains("eval \"$("),

@@ -55,7 +55,6 @@ crates/thegn-core/src/devcontainer.rs
 crates/thegn-core/src/devenv.rs
 crates/thegn-core/src/diagnostics.rs
 crates/thegn-core/src/diff_highlight.rs
-crates/thegn-core/src/direnv.rs
 crates/thegn-core/src/disk.rs
 crates/thegn-core/src/dns_filter.rs
 crates/thegn-core/src/envplan.rs

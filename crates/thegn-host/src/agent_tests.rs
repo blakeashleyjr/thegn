@@ -1,6 +1,679 @@
 use super::*;
 
 #[test]
+fn sandbox_resolution_does_not_authorize_implicit_host_fallback() {
+    use thegn_core::config::{SandboxBackend, SandboxConfig};
+    use thegn_core::placement::Placement;
+
+    let local = Placement::Local;
+    let mut requested = SandboxConfig {
+        enabled: true,
+        backend: SandboxBackend::Auto,
+        ..Default::default()
+    };
+    assert!(!host_fallback_allowed(&local, &requested, false));
+    assert!(host_fallback_allowed(&local, &requested, true));
+
+    requested.backend = SandboxBackend::None;
+    assert!(host_fallback_allowed(&local, &requested, false));
+    requested.enabled = false;
+    requested.backend = SandboxBackend::Auto;
+    assert!(host_fallback_allowed(&local, &requested, false));
+}
+
+#[test]
+fn on_missing_fail_refuses_the_pane_instead_of_exiting() {
+    with_temp_state("auto-host-on-missing-fail", || {
+        let mut cfg = cfg_with(&[], &[]);
+        cfg.sandbox.backend = thegn_core::config::SandboxBackend::Auto;
+        cfg.sandbox.backend_chain = vec!["host".to_string()];
+        cfg.sandbox.on_missing = thegn_core::config::OnMissing::Fail;
+        let worktree =
+            std::env::temp_dir().join(format!("tg-agent-on-missing-{}", std::process::id()));
+        // Before: `msg::die` exited the test process here.
+        let err = launch_spec(&cfg, &worktree.to_string_lossy(), None, "shell")
+            .expect_err("on_missing = fail refuses the pane");
+        assert!(format!("{err:#}").contains("on_missing"), "{err:#}");
+    });
+}
+
+#[test]
+fn automatic_prewarm_keeps_remote_native_specs() {
+    let spec = |remote| LaunchSpec {
+        argv: vec!["ssh".into()],
+        cwd: None,
+        env: Vec::new(),
+        backend: "host".into(),
+        warnings: Vec::new(),
+        degraded: false,
+        remote,
+    };
+    // A remote native pane labels itself `host` but is not a local host shell.
+    let mut remote = Ok(vec![(1, spec(true))]);
+    reject_host_prewarm(&mut remote);
+    assert!(remote.is_ok());
+    let mut local = Ok(vec![(1, spec(false))]);
+    reject_host_prewarm(&mut local);
+    assert!(matches!(
+        local,
+        Err(crate::handlers::provision::SpecError::PrewarmSkipped)
+    ));
+}
+
+#[test]
+fn only_a_configured_auto_chain_naming_the_host_lands_there() {
+    use thegn_core::config::{SandboxBackend, SandboxConfig};
+
+    let mut sb = SandboxConfig {
+        enabled: true,
+        backend: SandboxBackend::Auto,
+        ..Default::default()
+    };
+    // The default chain ends in `host`: landing there is configured, not a fallback.
+    assert!(auto_chain_names_host(&sb));
+    sb.backend_chain = vec!["none".into()];
+    assert!(auto_chain_names_host(&sb));
+    // A chain without the host must not inherit the implicit host tail.
+    sb.backend_chain = vec!["podman-rootless".into(), "bwrap".into()];
+    assert!(!auto_chain_names_host(&sb));
+    // An explicit backend is a containment request, whatever the chain says.
+    sb.backend_chain = vec!["host".into()];
+    sb.backend = SandboxBackend::Bwrap;
+    assert!(!auto_chain_names_host(&sb));
+    // Disabled is the separate explicit-host policy, not this rule.
+    sb.backend = SandboxBackend::Auto;
+    sb.enabled = false;
+    assert!(!auto_chain_names_host(&sb));
+}
+
+#[test]
+fn auto_chain_without_host_halts_instead_of_opening_a_host_shell() {
+    with_temp_state("auto-no-host", || {
+        let mut cfg = cfg_with(&[], &[]);
+        cfg.sandbox.backend = thegn_core::config::SandboxBackend::Auto;
+        // `wsl` is a reserved kind: the chain skips it outright on every OS, so
+        // no runtime is probed and only the implicit host tail remains.
+        cfg.sandbox.backend_chain = vec!["wsl".to_string()];
+        let worktree =
+            std::env::temp_dir().join(format!("tg-agent-auto-no-host-{}", std::process::id()));
+        let err = launch_spec(&cfg, &worktree.to_string_lossy(), None, "shell")
+            .expect_err("a chain that never names the host must not open a host shell");
+        assert!(
+            format!("{err:#}").contains("will not silently fall back to the host"),
+            "actionable halt: {err:#}"
+        );
+    });
+}
+
+#[test]
+fn remote_native_resolution_never_uses_the_local_none_host_fallback() {
+    with_temp_state("remote-none-resolution", || {
+        let cfg: Config = toml::from_str(
+            r#"
+[sandbox]
+backend = "none"
+
+[env.ssh]
+placement = "ssh"
+[env.ssh.ssh]
+host = "unreachable.test"
+transport = "ssh"
+
+[env.provider]
+placement = "provider"
+[env.provider.provider]
+provider = "custom"
+id = "fixture"
+exec_command = ["fixture-exec", "{id}", "--"]
+"#,
+        )
+        .unwrap();
+        let loc = GitLoc::from_db("/local/worktree", None);
+
+        // The nested `backend = none` is a valid native remote execution
+        // choice. It must return a remote spec before the final no-candidate
+        // refusal, without probing a live SSH/provider service.
+        let ssh = prepare_sandbox_env(
+            &cfg,
+            Path::new("/repo"),
+            "/local/worktree",
+            &loc,
+            None,
+            false,
+            Some("ssh"),
+        )
+        .expect("native ssh resolution does not need a host fallback");
+        assert!(ssh.spec.is_some());
+        assert!(ssh.is_remote);
+        // `Backend::None` labels itself "host"; `is_remote` (and LaunchSpec.remote)
+        // is what distinguishes it from a local host shell for prewarm.
+        assert_eq!(ssh.backend_label, "host");
+
+        // The provider fixture is likewise resolved by its injected static
+        // placement outcome; no provider API or availability probe is needed.
+        let provider = prepare_sandbox_env(
+            &cfg,
+            Path::new("/repo"),
+            "/local/worktree",
+            &loc,
+            None,
+            false,
+            Some("provider"),
+        )
+        .expect("native provider resolution does not need a host fallback");
+        assert!(provider.spec.is_some());
+        assert!(provider.is_remote);
+        assert_eq!(provider.backend_label, "host");
+
+        // A disabled remote environment still has a remote placement and must
+        // not turn a missing nested backend into a local host shell: it either
+        // halts (a disabled sandbox resolves no remote spec, so the non-local
+        // no-candidate halt fires).
+        let mut disabled = cfg.clone();
+        disabled.sandbox.enabled = false;
+        let err = prepare_sandbox_env(
+            &disabled,
+            Path::new("/repo"),
+            "/local/worktree",
+            &loc,
+            None,
+            false,
+            Some("ssh"),
+        )
+        .expect_err("a disabled remote env refuses rather than opening a local shell");
+        assert!(
+            err.downcast_ref::<crate::agent::SandboxHalt>().is_some(),
+            "{err:#}"
+        );
+    });
+}
+
+#[test]
+fn automatic_prewarm_rejects_host_specs_but_keeps_contained_specs() {
+    let mut host = Ok(vec![(
+        7,
+        LaunchSpec {
+            argv: vec!["fake-shell".into()],
+            cwd: None,
+            env: Vec::new(),
+            backend: "host".into(),
+            warnings: Vec::new(),
+            degraded: false,
+            remote: false,
+        },
+    )]);
+    reject_host_prewarm(&mut host);
+    assert!(matches!(
+        host,
+        Err(crate::handlers::provision::SpecError::PrewarmSkipped)
+    ));
+
+    let mut contained = Ok(vec![(
+        7,
+        LaunchSpec {
+            argv: vec!["fake-bwrap".into()],
+            cwd: None,
+            env: Vec::new(),
+            backend: "bwrap".into(),
+            warnings: Vec::new(),
+            degraded: false,
+            remote: false,
+        },
+    )]);
+    reject_host_prewarm(&mut contained);
+    assert!(contained.is_ok(), "contained prewarm remains eligible");
+}
+
+#[test]
+fn automatic_prewarm_rejects_host_reintroduced_by_remembered_agent_relaunch() {
+    with_temp_state("prewarm-relaunch-host", || {
+        let mut cfg = cfg_with(&[("remembered", "remembered-agent")], &[]);
+        cfg.sandbox.backend = thegn_core::config::SandboxBackend::Auto;
+        cfg.sandbox.backend_chain = vec!["host".to_string()];
+        let worktree =
+            std::env::temp_dir().join(format!("tg-prewarm-relaunch-host-{}", std::process::id()));
+        let wt = worktree.to_string_lossy().into_owned();
+        let db = thegn_core::db::Db::open().unwrap();
+        db.put_worktree("app/wt", "/x/app", &wt, "tg/wt", None, None)
+            .unwrap();
+        db.set_worktree_agent(&wt, "remembered").unwrap();
+        drop(db);
+
+        // Model the first guard's contained resolution, then the remembered
+        // agent fold that can replace its first leaf with a host spec. The
+        // second guard must inspect the post-relaunch batch, not only the
+        // result that existed before resurrection.
+        let (specs, _) = crate::handlers::prewarm::resolve_automatic_with(
+            Some(7),
+            || {
+                Ok(vec![(
+                    7,
+                    LaunchSpec {
+                        argv: vec!["fake-contained-shell".into()],
+                        cwd: None,
+                        env: Vec::new(),
+                        backend: "bwrap".into(),
+                        warnings: Vec::new(),
+                        degraded: false,
+                        remote: false,
+                    },
+                )])
+            },
+            Vec::<crate::handlers::worktree_attach::AttachTarget>::new,
+            |specs, first_leaf, attach_is_empty| {
+                crate::handlers::worktree_launch::apply_relaunch(
+                    specs,
+                    &cfg,
+                    &wt,
+                    first_leaf,
+                    attach_is_empty,
+                    false,
+                );
+                assert!(
+                    specs.as_ref().ok().expect("resolved launch specs")[0]
+                        .1
+                        .argv
+                        .join(" ")
+                        .contains("remembered-agent"),
+                    "the real prewarm batch includes the remembered-agent substitution"
+                );
+                assert_eq!(
+                    specs.as_ref().ok().expect("resolved launch specs")[0]
+                        .1
+                        .backend,
+                    "host"
+                );
+            },
+        );
+
+        assert!(matches!(
+            specs,
+            Err(crate::handlers::provision::SpecError::PrewarmSkipped)
+        ));
+    });
+}
+
+/// Positive control: a focused user launch may still choose the host backend;
+/// only the automatic prewarm route applies the host rejection policy.
+#[test]
+fn focused_host_launch_remains_an_explicit_positive_control() {
+    with_temp_state("focused-host-positive", || {
+        let mut cfg = cfg_with(&[], &[]);
+        cfg.sandbox.enabled = false;
+        cfg.sandbox.backend = thegn_core::config::SandboxBackend::None;
+        let worktree =
+            std::env::temp_dir().join(format!("tg-focused-host-positive-{}", std::process::id()));
+        let spec = crate::direnv_warm::launch_spec_synced_with(
+            &cfg,
+            &worktree.to_string_lossy(),
+            None,
+            "shell",
+            LaunchExtras::default(),
+        )
+        .expect("an explicit focused host launch remains available");
+        assert_eq!(spec.backend, "host");
+    });
+}
+
+#[cfg(unix)]
+#[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "test fixture: a blocking wait on a fake binary is the positive control"
+)]
+fn automatic_prewarm_drains_host_result_without_spawning_or_evaluating() {
+    use std::os::unix::fs::PermissionsExt;
+
+    with_temp_state("prewarm-executable-drain", || {
+        let root = std::env::temp_dir().join(format!(
+            "tg-prewarm-executable-drain-{}",
+            std::process::id()
+        ));
+        let worktree = root.join("repo");
+        let fake_bin = root.join("bin");
+        let shell_ran = root.join("shell-ran");
+        let direnv_ran = root.join("direnv-ran");
+        let nix_ran = root.join("nix-ran");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::create_dir_all(&fake_bin).unwrap();
+        std::fs::write(
+            worktree.join(".envrc"),
+            format!("printf hostile > {}\n", root.join("envrc-ran").display()),
+        )
+        .unwrap();
+        std::fs::write(worktree.join("flake.nix"), "{ outputs = _: {}; }\n").unwrap();
+        std::fs::write(worktree.join("flake.lock"), "locked\n").unwrap();
+
+        let script = |path: &std::path::Path, marker: &std::path::Path| {
+            std::fs::write(
+                path,
+                format!("#!/bin/sh\nprintf called > {}\n", marker.display()),
+            )
+            .unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        let fake_shell = fake_bin.join("shell");
+        script(&fake_shell, &shell_ran);
+        script(&fake_bin.join("direnv"), &direnv_ran);
+        script(&fake_bin.join("nix"), &nix_ran);
+        // Positive controls prove the same executable sentinels can fire.
+        for (program, marker) in [
+            (&fake_shell, &shell_ran),
+            (&fake_bin.join("direnv"), &direnv_ran),
+            (&fake_bin.join("nix"), &nix_ran),
+        ] {
+            assert!(
+                std::process::Command::new(program)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            assert!(marker.exists());
+            std::fs::remove_file(marker).unwrap();
+        }
+
+        let old_shell = std::env::var_os("SHELL");
+        let old_path = std::env::var_os("PATH");
+        let mut path = fake_bin.as_os_str().to_os_string();
+        path.push(":/usr/bin:/bin");
+        // SAFETY: with_temp_state holds ENV_LOCK for this whole test.
+        unsafe {
+            std::env::set_var("SHELL", &fake_shell);
+            std::env::set_var("PATH", &path);
+        }
+
+        let mut cfg = cfg_with(&[("remembered", "placeholder")], &[]);
+        cfg.agents[0].command = fake_bin.join("remembered-agent").display().to_string();
+        cfg.sandbox.enabled = false;
+        cfg.sandbox.backend = thegn_core::config::SandboxBackend::None;
+        cfg.sandbox.warm_direnv = thegn_core::config::WarmDirenv::Auto;
+        cfg.sandbox.inject_devshell = true;
+        let wt = worktree.to_string_lossy().into_owned();
+        let db = thegn_core::db::Db::open().unwrap();
+        db.put_worktree("app/wt", "/x/app", &wt, "tg/wt", None, None)
+            .unwrap();
+        db.set_worktree_agent(&wt, "remembered").unwrap();
+        drop(db);
+
+        // Resolve through the same automatic-prewarm helper used by the real
+        // worker. The fake evaluator executables and hostile files provide the
+        // external evidence; this test does not manufacture a skip with a
+        // separate reject call.
+        let (specs, _) = crate::handlers::prewarm::resolve_automatic_with(
+            Some(7),
+            || {
+                crate::direnv_warm::launch_spec_synced_with(
+                    &cfg,
+                    &wt,
+                    None,
+                    "shell",
+                    LaunchExtras {
+                        suppress_agent_record: true,
+                        ..Default::default()
+                    },
+                )
+                .map(|spec| {
+                    assert_eq!(spec.backend, "host", "fixture starts with a host result");
+                    vec![(7, spec)]
+                })
+                .map_err(crate::handlers::provision::spec_err)
+            },
+            Vec::<crate::handlers::worktree_attach::AttachTarget>::new,
+            |specs, first_leaf, attach_is_empty| {
+                crate::handlers::worktree_launch::apply_relaunch(
+                    specs,
+                    &cfg,
+                    &wt,
+                    first_leaf,
+                    attach_is_empty,
+                    false,
+                );
+            },
+        );
+        assert!(matches!(
+            specs,
+            Err(crate::handlers::provision::SpecError::PrewarmSkipped)
+        ));
+
+        let mut session = crate::session::Session {
+            id: "s1".into(),
+            worktrees: vec![crate::session::WorktreeGroup::new(
+                "app/wt",
+                crate::session::GroupKind::Branch,
+                wt.clone(),
+            )],
+            active: 0,
+        };
+        session.worktrees[0].tabs[0].center = crate::center::CenterTree::Leaf(7);
+        session.worktrees[0].tabs[0].focused_pane = 7;
+        let (pane_tx, _pane_rx) = tokio::sync::mpsc::channel::<crate::pane::PaneEvent>(1024);
+        let mut panes = crate::panes::Panes::new(pane_tx);
+        let mut model = crate::chrome::FrameModel::default();
+        let mut active_menu: Option<crate::menu::MenuOverlay> = None;
+        let mut loading_state = crate::loading::track::LoadingTracker::default();
+        let mut loading_remote = std::collections::HashMap::new();
+        let mut materialize_inflight = std::collections::HashSet::new();
+        let mut prewarm_inflight = std::collections::HashSet::from([("app/wt".into(), 0)]);
+        let mut materialize_failed = std::collections::HashSet::new();
+        let mut prewarm_failed = std::collections::HashSet::new();
+        let mut halt_dismissed = std::collections::HashSet::new();
+        let mut last_pool_reconcile = None;
+        let mut center_dormant = false;
+        let mut need_relayout = false;
+        let mut dirty = false;
+        let mut loop_perf = crate::perf::LoopPerf::new();
+        let (spec_tx, mut spec_rx) = tokio::sync::mpsc::unbounded_channel();
+        spec_tx
+            .send(crate::handlers::provision::SpecBatch {
+                group: "app/wt".into(),
+                worktree: wt,
+                tab: 0,
+                target_leaves: vec![7],
+                origin: crate::loading::SpecOrigin::Prewarm,
+                specs,
+                attach: Vec::new(),
+            })
+            .unwrap();
+
+        crate::handlers::provision::drain_specs(
+            &mut spec_rx,
+            &mut crate::handlers::provision::SpecDrainCtx {
+                session: &mut session,
+                panes: &mut panes,
+                model: &mut model,
+                active_menu: &mut active_menu,
+                current_config: &cfg,
+                center: crate::layout::compute(160, 40, true, true).center,
+                loading_state: &mut loading_state,
+                loading_remote: &mut loading_remote,
+                materialize_inflight: &mut materialize_inflight,
+                prewarm_inflight: &mut prewarm_inflight,
+                materialize_failed: &mut materialize_failed,
+                prewarm_failed: &mut prewarm_failed,
+                halt_dismissed: &mut halt_dismissed,
+                last_pool_reconcile: &mut last_pool_reconcile,
+                center_dormant: &mut center_dormant,
+                need_relayout: &mut need_relayout,
+                dirty: &mut dirty,
+                loop_perf: &mut loop_perf,
+            },
+        );
+
+        assert!(
+            panes.table.is_empty(),
+            "prewarm skip must not spawn a host pane"
+        );
+        assert!(
+            prewarm_inflight.is_empty(),
+            "the skipped request is settled"
+        );
+        assert!(prewarm_failed.is_empty(), "a benign skip is not a failure");
+        assert!(!dirty, "no pane was spawned or attached");
+        assert!(!root.join("envrc-ran").exists());
+        assert!(!shell_ran.exists());
+        assert!(!direnv_ran.exists());
+        assert!(!nix_ran.exists());
+
+        match old_shell {
+            Some(value) => unsafe { std::env::set_var("SHELL", value) },
+            None => unsafe { std::env::remove_var("SHELL") },
+        }
+        match old_path {
+            Some(value) => unsafe { std::env::set_var("PATH", value) },
+            None => unsafe { std::env::remove_var("PATH") },
+        }
+        std::fs::remove_dir_all(&root).unwrap();
+    });
+}
+
+#[cfg(unix)]
+#[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "test fixture: a blocking wait on a fake binary is the positive control"
+)]
+fn removed_direnv_warm_is_inert_across_launch_seams_and_cache_leaf_shapes() {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::{FileTypeExt, PermissionsExt, symlink};
+    use std::time::SystemTime;
+
+    with_temp_state("direnv-zero-exec", || {
+        let root = std::env::temp_dir().join(format!("tg-direnv-zero-exec-{}", std::process::id()));
+        let worktree = root.join("repo");
+        let fake_bin = root.join("bin");
+        let direnv_calls = root.join("direnv-calls");
+        let nix_calls = root.join("nix-calls");
+        std::fs::create_dir_all(worktree.join(".direnv")).unwrap();
+        std::fs::create_dir_all(&fake_bin).unwrap();
+        std::fs::write(
+            worktree.join(".envrc"),
+            format!("printf hostile > {}\n", root.join("envrc-ran").display()),
+        )
+        .unwrap();
+        std::fs::write(worktree.join("flake.nix"), "{ outputs = _: {}; }\n").unwrap();
+        std::fs::write(worktree.join("flake.lock"), "locked\n").unwrap();
+        for (name, marker) in [("direnv", &direnv_calls), ("nix", &nix_calls)] {
+            std::fs::write(
+                fake_bin.join(name),
+                format!("#!/bin/sh\nprintf called > {}\n", marker.display()),
+            )
+            .unwrap();
+            std::fs::set_permissions(fake_bin.join(name), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+            // Positive control: an attempted evaluator call must leave evidence.
+            assert!(
+                std::process::Command::new(fake_bin.join(name))
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            assert!(marker.exists());
+            std::fs::remove_file(marker).unwrap();
+        }
+
+        let external = root.join("external.rc");
+        let hard_target = root.join("hard-target.rc");
+        let symlink_leaf = worktree.join(".direnv/symlink.rc");
+        let hardlink_leaf = worktree.join(".direnv/hardlink.rc");
+        let fifo_leaf = worktree.join(".direnv/fifo.rc");
+        let directory_leaf = worktree.join(".direnv/directory.rc");
+        std::fs::write(&external, b"external-bytes\n").unwrap();
+        std::fs::write(&hard_target, b"hard-bytes\n").unwrap();
+        symlink(&external, &symlink_leaf).unwrap();
+        std::fs::hard_link(&hard_target, &hardlink_leaf).unwrap();
+        let fifo_name = std::ffi::CString::new(fifo_leaf.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) }, 0);
+        std::fs::create_dir(&directory_leaf).unwrap();
+        // Force stale cache targets so the removed blessing path would touch
+        // them if accidentally restored. Fresh fixture mtimes would hide it.
+        for target in [&external, &hard_target] {
+            std::fs::File::options()
+                .write(true)
+                .open(target)
+                .unwrap()
+                .set_modified(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(60))
+                .unwrap();
+        }
+        let external_bytes = std::fs::read(&external).unwrap();
+        let hard_bytes = std::fs::read(&hard_target).unwrap();
+        let external_mtime: SystemTime = std::fs::metadata(&external).unwrap().modified().unwrap();
+        let hard_mtime: SystemTime = std::fs::metadata(&hard_target).unwrap().modified().unwrap();
+
+        let old_path = std::env::var_os("PATH");
+        let mut path = fake_bin.as_os_str().to_os_string();
+        path.push(":/usr/bin:/bin");
+        // SAFETY: with_temp_state holds ENV_LOCK for this whole test.
+        unsafe { std::env::set_var("PATH", &path) };
+        let mut cfg = Config::default();
+        cfg.sandbox.backend = thegn_core::config::SandboxBackend::None;
+        cfg.sandbox.inject_devshell = false;
+        let wt = worktree.to_string_lossy().into_owned();
+        for mode in [
+            thegn_core::config::WarmDirenv::Auto,
+            thegn_core::config::WarmDirenv::AllowedOnly,
+            thegn_core::config::WarmDirenv::Off,
+        ] {
+            cfg.sandbox.warm_direnv = mode;
+            assert_eq!(thegn_core::direnv::warm_now_plan(mode), None);
+            crate::agent::launch_spec_full(
+                &cfg,
+                &wt,
+                None,
+                "shell",
+                false,
+                LaunchExtras::default(),
+            )
+            .unwrap();
+            crate::agent::launch_spec_center_with(
+                &cfg,
+                &wt,
+                None,
+                "shell",
+                LaunchExtras::default(),
+            )
+            .unwrap();
+            crate::direnv_warm::launch_spec_synced_with(
+                &cfg,
+                &wt,
+                None,
+                "shell",
+                LaunchExtras::default(),
+            )
+            .unwrap();
+            crate::agent::prewarm_spec(&cfg, &wt).unwrap();
+        }
+        match old_path {
+            Some(path) => unsafe { std::env::set_var("PATH", path) },
+            None => unsafe { std::env::remove_var("PATH") },
+        }
+
+        assert!(!root.join("envrc-ran").exists());
+        assert!(!direnv_calls.exists());
+        assert!(!nix_calls.exists());
+        assert_eq!(std::fs::read(&external).unwrap(), external_bytes);
+        assert_eq!(std::fs::read(&hard_target).unwrap(), hard_bytes);
+        assert_eq!(std::fs::read_link(&symlink_leaf).unwrap(), external);
+        assert_eq!(std::fs::read(&hardlink_leaf).unwrap(), hard_bytes);
+        assert!(
+            std::fs::symlink_metadata(&fifo_leaf)
+                .unwrap()
+                .file_type()
+                .is_fifo()
+        );
+        assert!(directory_leaf.is_dir());
+        assert_eq!(
+            std::fs::metadata(&external).unwrap().modified().unwrap(),
+            external_mtime
+        );
+        assert_eq!(
+            std::fs::metadata(&hard_target).unwrap().modified().unwrap(),
+            hard_mtime
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    });
+}
+
+#[test]
 fn resolve_personal_dotfiles_drops_nonportable_under_portable() {
     use thegn_core::config::{HomeConfig, ShellStrategy};
     let home_dir = std::env::temp_dir().join(format!("tg-home-{}", std::process::id()));
@@ -120,42 +793,6 @@ fn nix_copy_argv_builds_push_command() {
             "s3://my-cache".to_string(),
             "/nix/store/a-foo".to_string(),
             "/nix/store/b-bar".to_string(),
-        ]
-    );
-}
-
-#[test]
-fn devshell_push_argv_builders() {
-    assert_eq!(
-        nix_develop_profile_argv("/home/me/repo", "/tmp/gc", ""),
-        vec![
-            "develop",
-            "/home/me/repo",
-            "--profile",
-            "/tmp/gc",
-            "--command",
-            "true"
-        ]
-    );
-    assert_eq!(
-        nix_develop_profile_argv("/home/me/repo", "/tmp/gc", "sandbox"),
-        vec![
-            "develop",
-            "/home/me/repo#sandbox",
-            "--profile",
-            "/tmp/gc",
-            "--command",
-            "true"
-        ]
-    );
-    assert_eq!(
-        nix_copy_to_file_argv("/tmp/cache", "/tmp/gc"),
-        vec![
-            "copy",
-            "--to",
-            "file:///tmp/cache?compression=zstd",
-            "--no-check-sigs",
-            "/tmp/gc"
         ]
     );
 }
@@ -613,7 +1250,6 @@ fn shell_materialize_with_suppressed_record_leaves_the_worktrees_agent_alone() {
             None,
             "shell",
             false,
-            false,
             LaunchExtras {
                 suppress_agent_record: true,
                 ..Default::default()
@@ -725,7 +1361,6 @@ fn sandbox_argv_resolution_leaves_the_worktrees_agent_alone() {
             &wt,
             None,
             "shell",
-            false,
             false,
             LaunchExtras {
                 suppress_agent_record: true,
@@ -873,12 +1508,91 @@ fn compose_spec_host_fallback_is_login_shell() {
     );
 }
 
+#[cfg(unix)]
 #[test]
-fn invalidated_devcontainer_exec_fails_closed() {
-    let argv = blocked_devcontainer_argv();
-    assert!(argv[2].contains("launch blocked"));
-    assert!(argv[2].ends_with("exit 126"));
-    assert!(!argv[2].contains("THEGN_WORKTREE"));
+fn invalidated_devcontainer_exec_refuses_before_invoking_a_host_shell() {
+    use std::os::unix::fs::PermissionsExt;
+
+    with_temp_state("devcontainer-refusal", || {
+        let root = std::env::temp_dir().join(format!(
+            "tg-devcontainer-refusal-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let config_path = root.join("devcontainer.json");
+        std::fs::write(&config_path, br#"{"image":"trusted"}"#).unwrap();
+        let sentinel = root.join("host-shell-ran");
+        let fake_shell = root.join("fake-shell");
+        std::fs::write(
+            &fake_shell,
+            format!("#!/bin/sh\nprintf invoked > {}\n", sentinel.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_shell, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let old_shell = std::env::var_os("SHELL");
+        // SAFETY: with_temp_state holds ENV_LOCK for this whole test.
+        unsafe {
+            std::env::set_var("SHELL", fake_shell.to_str().expect("fake shell path"));
+        }
+        let worktree = root.to_string_lossy().into_owned();
+        crate::devcontainer_provider::install_failing_test_session(&worktree, &config_path)
+            .unwrap();
+
+        let cfg = Config::default();
+        let loc = GitLoc::from_db(&worktree, None);
+        let outcome = SandboxOutcome {
+            spec: None,
+            backend_label: "devcontainer".into(),
+            warnings: Vec::new(),
+            shell: String::new(),
+            is_remote: false,
+            cwd_override: None,
+            location: None,
+            degraded_from_provider: false,
+            route_ssh_target: None,
+        };
+        let error = compose_spec(
+            &cfg,
+            &worktree,
+            None,
+            "shell",
+            &loc,
+            &outcome,
+            LaunchExtras::default(),
+        )
+        .expect_err("a failed provider exec must refuse the launch");
+        assert!(
+            error.downcast_ref::<DevcontainerLaunchRefused>().is_some(),
+            "typed refusal: {error:#}"
+        );
+        assert!(
+            !sentinel.exists(),
+            "the rejected target must not be replaced by a host shell"
+        );
+        crate::devcontainer_provider::remove_test_session(&worktree);
+        let missing = compose_spec(
+            &cfg,
+            &worktree,
+            None,
+            "shell",
+            &loc,
+            &outcome,
+            LaunchExtras::default(),
+        )
+        .expect_err("a vanished provider session must not become a host launch");
+        assert!(
+            missing
+                .downcast_ref::<DevcontainerLaunchRefused>()
+                .is_some()
+        );
+        assert!(!sentinel.exists());
+        match old_shell {
+            Some(shell) => unsafe { std::env::set_var("SHELL", shell) },
+            None => unsafe { std::env::remove_var("SHELL") },
+        }
+        std::fs::remove_dir_all(&root).unwrap();
+    });
 }
 
 /// OCI shell panes emit a runtime probe chain so containers that don't have
@@ -1072,9 +1786,9 @@ fn final_host_fallback_honors_fail_closed_floor_without_a_resolved_candidate() {
     with_temp_state("floor-auto-host", || {
         let mut cfg = Config::default();
         cfg.sandbox.backend = thegn_core::config::SandboxBackend::Auto;
-        // No candidate reaches the pre-ensure floor check. The candidate builder
-        // still appends host: this used to bypass fail-closed admission entirely.
-        cfg.sandbox.backend_chain.clear();
+        // No candidate reaches the pre-ensure floor check; the chain lands on
+        // the host directly. This used to bypass fail-closed admission entirely.
+        cfg.sandbox.backend_chain = vec!["host".to_string()];
         cfg.sandbox.isolation_floor = thegn_core::config::IsolationFloor::SharedKernel;
         cfg.sandbox.on_floor_miss = thegn_core::config::OnFloorMiss::Fail;
         let loc = GitLoc::from_db("/wt/x", None);
@@ -1226,8 +1940,8 @@ fn explicit_host_pick_overrides_nonauto_config() {
 fn selected_env_with_no_table_halts_or_degrades_loudly() {
     // Regression ("machine0 silently fell back to local bwrap"): selecting an env
     // that has no `[env.<name>]` table must NOT open a silent local shell.
-    // failover = halt ⇒ Err(SandboxHalt); failover = auto ⇒ Ok but with
-    // `degraded_from_provider` set so the notification/status/sidebar marker fire.
+    // Any failover mode ⇒ Err(SandboxHalt); only an explicit host policy ⇒ Ok,
+    // with `degraded_from_provider` set so the notification/status/sidebar fire.
     with_temp_state("prep-phantom-env", || {
         let loc = GitLoc::from_db("/wt/x", None);
 
@@ -1248,9 +1962,26 @@ fn selected_env_with_no_table_halts_or_degrades_loudly() {
             .expect("the error is a SandboxHalt");
         assert_eq!(halt.env_name, "ghost");
 
-        // failover = auto ⇒ degrade, but LOUDLY (degraded flag set).
+        // failover = auto is not permission to bypass a requested env (THE-418):
+        // the dropped selection still halts rather than opening a host shell.
         let mut cfg = Config::default();
         cfg.sandbox.failover = thegn_core::config::FailoverMode::Auto;
+        let err = prepare_sandbox_env(
+            &cfg,
+            Path::new("/repo"),
+            "/wt/x",
+            &loc,
+            None,
+            false,
+            Some("ghost"),
+        )
+        .expect_err("auto failover no longer degrades a dropped selection");
+        assert!(err.downcast_ref::<crate::agent::SandboxHalt>().is_some());
+
+        // An explicit local host policy is a deliberate host decision: degrade,
+        // but LOUDLY (degraded flag set) so the notification fires.
+        let mut cfg = Config::default();
+        cfg.sandbox.backend = thegn_core::config::SandboxBackend::None;
         let out = prepare_sandbox_env(
             &cfg,
             Path::new("/repo"),
@@ -1260,7 +1991,7 @@ fn selected_env_with_no_table_halts_or_degrades_loudly() {
             false,
             Some("ghost"),
         )
-        .expect("auto failover degrades rather than halting");
+        .expect("an explicit host policy degrades rather than halting");
         assert!(
             out.degraded_from_provider,
             "the dropped selection is flagged degraded so the notification fires"
@@ -1308,6 +2039,7 @@ fn inject_devshell_host_prepends_path_and_merges_vars() {
         backend: "host".into(),
         warnings: vec![],
         degraded: false,
+        remote: false,
     };
     // `inject_devshell_host` prepends to the *process* PATH, so set a known
     // base under the env guard. Without restoring it, `/usr/bin:/bin` would

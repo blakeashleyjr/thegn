@@ -11,7 +11,7 @@ gracefully across the available container/sandbox runtimes.
 
 ### Requirement: Graceful backend selection
 
-The sandbox SHALL select an isolation backend by preference order podman -> docker -> bwrap -> none, MUST fall back to the next when a runtime is unavailable, and MUST fall back to `none` (run on the host) rather than failing to launch when no backend exists. Every fallback MUST be reported truthfully: the containment reported for a launch MUST describe what that launch actually entered, never what was requested.
+The sandbox SHALL select an isolation backend by preference order podman -> docker -> bwrap -> none, and MUST fall back to the next when a runtime is unavailable. When no backend is runnable, an `auto` selection on a LOCAL placement MUST fall back to `none` (run on the host) only when the user's configured `backend_chain` itself names `host`/`none` (the default chain does); otherwise, and for every explicit backend of a worktree pane, dropped env selection, or non-local placement, the launch MUST halt with an actionable error instead of opening a host shell. `failover = "auto"` MUST NOT authorize host execution. Every fallback MUST be reported truthfully: the containment reported for a launch MUST describe what that launch actually entered, never what was requested.
 
 #### Scenario: Preferred runtime missing
 
@@ -20,13 +20,25 @@ The sandbox SHALL select an isolation backend by preference order podman -> dock
 
 #### Scenario: No runtime available
 
-- **WHEN** none of podman, docker, or bwrap is available
+- **WHEN** none of podman, docker, or bwrap is available and `backend_chain`
+  names `host` (the default)
 - **THEN** the process runs with backend `none` on the host and the worktree is
   still usable
 
+#### Scenario: Chain without host refuses
+
+- **WHEN** no backend is runnable and the configured `backend_chain` does not name `host`
+- **THEN** the launch halts with an actionable error and no host shell is opened
+
+#### Scenario: Failover auto does not authorize the host
+
+- **WHEN** a selected env is undefined, or a provider/ssh/k8s env fails to come
+  up, and `failover = "auto"`
+- **THEN** the launch halts rather than degrading to a host shell
+
 #### Scenario: Fallback is reported, not hidden
 
-- **WHEN** an explicit backend pick cannot be honoured and the launch degrades to the host
+- **WHEN** a terminal tab's explicit backend pick cannot be honoured and the tab degrades to the host
 - **THEN** the launch is labelled `host`, is flagged as degraded, and carries a warning naming the
   backend that was unavailable
 
@@ -103,29 +115,38 @@ When a tunnel fails to come up, the `on_error` policy SHALL govern the outcome a
 - **WHEN** the tunnel fails to become ready and `on_error=fail`
 - **THEN** the worktree does not launch with direct host egress
 
-### Requirement: Resolve and inject the repo devShell env into worktree panes
+### Requirement: Never implicitly evaluate repository environments on the host
 
-When a worktree's repo exposes a flake `devShell` and `[sandbox] inject_devshell` is enabled, thegn SHALL resolve the devShell env on the host (`nix print-dev-env --json`), cache it by a `flake.lock`+`flake.nix` hash, and merge the exported variables into each worktree pane before the sandbox exec (PATH prepended, other vars set only if unset); a repo without `nix`/`devShell` MUST be a clean no-op.
+Thegn SHALL NOT evaluate a repository `.envrc` or devShell on the host during
+startup, materialization, launch, or daemon preparation. It SHALL NOT run
+`direnv allow`, start a host warm thread, write `.direnv`, or implicitly mount a
+Nix daemon because a repository has a flake. An already-existing, valid
+`inject_devshell` cache MAY be read; a cold cache MUST be a no-op until the user
+or the selected target explicitly performs environment setup. `[sandbox]
+warm_direnv` defaults to `off`; legacy values remain parseable but are inert and
+produce a bounded deprecation diagnostic.
 
-#### Scenario: Flake repo gets the toolchain
+#### Scenario: Existing cache can provide the toolchain
 
-- **WHEN** a worktree pane is spawned in a repo with a flake devShell
+- **WHEN** a worktree pane is spawned in a repo with a previously-created valid cache
 - **THEN** the pane's PATH includes the devShell tool directories
 
-#### Scenario: Non-flake repo is a no-op
+#### Scenario: Cold repository environment is not evaluated by the host
 
-- **WHEN** a worktree pane is spawned in a repo with no flake devShell
-- **THEN** no `nix` is invoked and the pane gets its ordinary environment
+- **WHEN** a worktree pane is spawned in a repo with a cold devShell or `.envrc`
+- **THEN** no host `nix` or `direnv` process is invoked, no cache is written, and
+  the pane gets its ordinary environment until target-side setup is explicit
 
-### Requirement: devShell resolution runs off the event loop
+### Requirement: Cached devShell reads do not block the event loop
 
-The devShell resolve SHALL run on a background thread that pulses the `TerminalWaker` and writes the cache, MUST NOT block pane spawn, and MUST NOT add a polling timeout; a cold pane applies the cache on a later spawn once warm.
+Reading an already-existing devShell cache MUST NOT block pane spawn or start a
+background evaluator. A cold pane remains uncached and target-side setup is
+responsible for any later environment work.
 
-#### Scenario: Cold resolve does not block
+#### Scenario: Cold cache does not start a host evaluator
 
 - **WHEN** the devShell cache is cold at pane spawn
-- **THEN** the pane spawns immediately and the resolve proceeds off-loop, applying
-  to subsequent spawns
+- **THEN** the pane spawns immediately and no host resolver proceeds in the background
 
 ### Requirement: Opt-in nix daemon mount
 
@@ -811,8 +832,8 @@ be configurable for users who want one answer every time.
 
 #### Scenario: The user has already accepted degrading
 
-- **WHEN** a dormant runtime is found but the backend is `auto`, failover is
-  `auto`, or the worktree is pinned to the host
+- **WHEN** a dormant runtime is found but the backend is `auto` or the worktree
+  is pinned to the host
 - **THEN** no prompt is raised and the launch proceeds, because that policy is a
   standing answer to the same question
 

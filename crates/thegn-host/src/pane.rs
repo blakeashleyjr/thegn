@@ -902,6 +902,29 @@ impl PtyPane {
         }
     }
 
+    /// Test-only daemon-shaped stream with an already-known session id. This
+    /// models the attach result without starting a relay or touching a socket.
+    #[cfg(test)]
+    pub(crate) fn test_daemon_stream(
+        control: tokio_mpsc::Sender<ExecControl>,
+        session: String,
+        rows: u16,
+        cols: u16,
+    ) -> Self {
+        let mut pane = Self::test_stream(control, rows, cols);
+        let control = match &pane.io {
+            PaneIo::Stream { control, .. } => control.clone(),
+            PaneIo::Pty { .. } => unreachable!("test stream is always a stream"),
+        };
+        pane.io = PaneIo::Stream {
+            control,
+            provider: "daemon".into(),
+            sandbox_id: "test-daemon".into(),
+        };
+        pane.session_cell = Some(Arc::new(Mutex::new(Some(session))));
+        pane
+    }
+
     #[allow(dead_code)]
     pub fn size(&self) -> (u16, u16) {
         (self.rows, self.cols)

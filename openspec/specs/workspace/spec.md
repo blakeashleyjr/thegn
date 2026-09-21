@@ -118,7 +118,7 @@ completes.
 - **WHEN** a worktree is created with a global
   `post_create = ["pnpm install"]`
 - **THEN** the command runs in the new worktree after the built-in
-  prepare/direnv/devshell provisioning, and the first pane does not wait for
+  prepare provisioning, and the first pane does not wait for
   it
 
 #### Scenario: Teardown accumulates across scopes

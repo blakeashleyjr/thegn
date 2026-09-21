@@ -435,6 +435,7 @@ mod tests {
                 backend: "host".into(),
                 warnings: Vec::new(),
                 degraded: false,
+                remote: false,
             };
             let mut batch: Result<Vec<(u32, LaunchSpec)>, SpecError> =
                 Ok(vec![(3, shell()), (5, shell())]);
