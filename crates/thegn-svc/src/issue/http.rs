@@ -5,6 +5,8 @@
 //! in a mutation or expansion, so a second request cannot reset either limit.
 
 use super::IssueError;
+use crate::http::{BodyReadError, read_bounded_response};
+#[cfg(test)]
 use futures_util::StreamExt;
 use reqwest::{Client, Method, RequestBuilder, Response, Url};
 use serde::{Serialize, de::DeserializeOwned};
@@ -360,20 +362,13 @@ impl TrackerHttpOperation<'_> {
 }
 
 async fn read_bounded(deadline: Instant, response: Response) -> Result<Vec<u8>, IssueError> {
-    let length = response.content_length().unwrap_or(0) as usize;
-    let mut body = Vec::with_capacity(length.min(MAX_BODY_BYTES));
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) = timeout_at(deadline, stream.next())
+    read_bounded_response(response, deadline, MAX_BODY_BYTES)
         .await
-        .map_err(|_| IssueError::Timeout("reading tracker response"))?
-    {
-        let chunk = chunk.map_err(IssueError::Network)?;
-        if body.len().saturating_add(chunk.len()) > MAX_BODY_BYTES {
-            return Err(IssueError::BodyLimit("tracker response exceeds limit"));
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Ok(body)
+        .map_err(|error| match error {
+            BodyReadError::Timeout => IssueError::Timeout("reading tracker response"),
+            BodyReadError::Network(error) => IssueError::Network(error),
+            BodyReadError::Limit => IssueError::BodyLimit("tracker response exceeds limit"),
+        })
 }
 
 struct BoundedWriter {

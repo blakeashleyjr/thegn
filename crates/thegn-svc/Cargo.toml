@@ -41,6 +41,7 @@ octocrab.workspace = true
 # `blocking` on top of the workspace features: the usage tracker's live fetches
 # (Claude /api/oauth/usage, Antigravity quota) run on a blocking gather thread.
 reqwest = { workspace = true, features = ["blocking", "stream"] }
+url.workspace = true
 tokio.workspace = true
 chrono.workspace = true
 # Plugin directory manifests (`plugins/*/plugin.toml`) — see plugin::loader.

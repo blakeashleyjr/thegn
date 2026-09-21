@@ -315,6 +315,28 @@ fn a_recorded_failure_throttles_the_next_attempt() {
 }
 
 #[test]
+fn remote_transport_failures_persist_only_redacted_calendar_diagnostics() {
+    let t = TmpDb::new("redacted-remote-error");
+    thegn_core::connectivity::report_success();
+    let cfg = CalendarConfig {
+        accounts: vec![thegn_core::config_calendar::CalendarAccount {
+            name: "remote".into(),
+            provider: thegn_core::config_calendar::CalendarProviderKind::IcsUrl,
+            url: "http://127.0.0.1/feed?subscription-secret=opaque".into(),
+            token: "sync-token-secret".into(),
+            ..Default::default()
+        }],
+        ..CalendarConfig::default()
+    };
+    let (from, to) = window();
+    assert!(!sync_accounts(&t.db, &cfg, from, to, true));
+    let sync = t.db.get_calendar_sync("remote").unwrap().unwrap();
+    assert!(sync.last_error.contains("calendar destination refused"));
+    assert!(!sync.last_error.contains("subscription-secret"));
+    assert!(!sync.last_error.contains("sync-token-secret"));
+}
+
+#[test]
 fn an_empty_full_fetch_also_throttles_its_retry() {
     // The guard records an anomaly; it must throttle too, or a provider stuck
     // returning nothing is polled every time the popup opens.
