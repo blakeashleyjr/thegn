@@ -29,7 +29,7 @@ use thegn_core::store::{CalendarRow, CalendarStore};
 use thegn_svc::calendar::{CalendarError, CalendarRouter, EventPage};
 use tokio::sync::mpsc as tokio_mpsc;
 
-use crate::calendar_docs::CalendarError;
+use crate::calendar_docs::CalendarViewError;
 use crate::hydrate::RefreshKind;
 
 /// Days of slack either side of a month window.
@@ -80,7 +80,7 @@ pub(crate) fn spawn_month_fetch(
         // show, and saying "no events" would be a lie.
         let month_view = match db.as_ref() {
             Some(db) => expand_month(db, wide_from, wide_to, home),
-            None => MonthView::failed(CalendarError::CacheUnavailable),
+            None => MonthView::failed(CalendarViewError::CacheUnavailable),
         };
         deliver(&tx, &waker, year, month, month_view);
     });
@@ -89,11 +89,11 @@ pub(crate) fn spawn_month_fetch(
 /// One month's expansion outcome, before it becomes a payload.
 pub(crate) struct MonthView {
     pub events: Option<Vec<(NaiveDate, Vec<Arc<CalEvent>>)>>,
-    pub error: Option<CalendarError>,
+    pub error: Option<CalendarViewError>,
 }
 
 impl MonthView {
-    fn failed(error: CalendarError) -> MonthView {
+    fn failed(error: CalendarViewError) -> MonthView {
         MonthView {
             events: None,
             error: Some(error),
@@ -119,9 +119,10 @@ pub(crate) fn expand_month(
             events: Some(calendar.by_date.into_iter().collect()),
             // An undecodable or malformed row costs only itself, but the month
             // says so rather than passing for the whole calendar.
-            error: (cached.skipped + calendar.skipped > 0).then_some(CalendarError::MalformedCache),
+            error: (cached.skipped + calendar.skipped > 0)
+                .then_some(CalendarViewError::MalformedCache),
         },
-        Err(error) => MonthView::failed(CalendarError::Expansion(error)),
+        Err(error) => MonthView::failed(CalendarViewError::Expansion(error)),
     }
 }
 
@@ -441,10 +442,10 @@ pub(crate) struct Cached {
 /// deserialize (a newer schema, a corrupt write) is skipped rather than
 /// losing the whole month, but counted, so the caller can say the view is
 /// incomplete instead of presenting it as complete.
-fn load_cached(db: &Db, from: NaiveDate, to: NaiveDate) -> Result<Cached, CalendarError> {
+fn load_cached(db: &Db, from: NaiveDate, to: NaiveDate) -> Result<Cached, CalendarViewError> {
     let rows = db
         .get_calendar_events(day_ms(from), day_ms(to).saturating_add(86_400_000), &[])
-        .map_err(|_| CalendarError::CacheUnavailable)?;
+        .map_err(|_| CalendarViewError::CacheUnavailable)?;
     let mut cached = Cached {
         events: Vec::with_capacity(rows.len()),
         skipped: 0,
@@ -474,9 +475,9 @@ pub(crate) enum ReminderOutcome {
     Complete,
     /// Evaluated, but some cached rows could not be decoded. Retrying reads the
     /// same bytes, so the window is still done; the gap is reported.
-    Incomplete(CalendarError),
+    Incomplete(CalendarViewError),
     /// Nothing was raised; the window stays pending for the next ticker slot.
-    Failed(CalendarError),
+    Failed(CalendarViewError),
 }
 
 /// The loop-side reminder cursor: the last successfully evaluated instant and
@@ -492,7 +493,7 @@ pub(crate) struct ReminderCursor {
     next_generation: u64,
     inflight: Option<ReminderWindow>,
     /// The last failure reported, so a persistent one logs once, not per tick.
-    reported: Option<CalendarError>,
+    reported: Option<CalendarViewError>,
 }
 
 impl ReminderCursor {
@@ -605,10 +606,10 @@ pub(crate) fn spawn_reminder_check(
             tx,
             waker: waker.clone(),
             window,
-            outcome: ReminderOutcome::Failed(CalendarError::CacheUnavailable),
+            outcome: ReminderOutcome::Failed(CalendarViewError::CacheUnavailable),
         };
         let outcome = match Db::open() {
-            Err(_) => ReminderOutcome::Failed(CalendarError::CacheUnavailable),
+            Err(_) => ReminderOutcome::Failed(CalendarViewError::CacheUnavailable),
             Ok(db) => match due_reminders(&db, &cfg, window) {
                 Ok(due) => {
                     for r in &due.reminders {
@@ -616,7 +617,7 @@ pub(crate) fn spawn_reminder_check(
                     }
                     match due.skipped {
                         0 => ReminderOutcome::Complete,
-                        _ => ReminderOutcome::Incomplete(CalendarError::MalformedCache),
+                        _ => ReminderOutcome::Incomplete(CalendarViewError::MalformedCache),
                     }
                 }
                 Err(error) => ReminderOutcome::Failed(error),
@@ -667,7 +668,7 @@ pub(crate) fn due_reminders(
     db: &Db,
     cfg: &CalendarConfig,
     window: ReminderWindow,
-) -> Result<DueReminders, CalendarError> {
+) -> Result<DueReminders, CalendarViewError> {
     if !reminders_configured(cfg) {
         return Ok(DueReminders {
             reminders: Vec::new(),
@@ -676,7 +677,7 @@ pub(crate) fn due_reminders(
     }
     let home = home_zone(cfg);
     let at = chrono::DateTime::from_timestamp_millis(window.to_ms)
-        .ok_or(CalendarError::Expansion(ExpansionError::InvalidWindow))?;
+        .ok_or(CalendarViewError::Expansion(ExpansionError::InvalidWindow))?;
     let today = at.with_timezone(&home).date_naive();
     // A day either side is plenty: no sane reminder leads by more than that,
     // and it keeps the scan small.
@@ -686,7 +687,7 @@ pub(crate) fn due_reminders(
     );
     let cached = load_cached(db, from, to)?;
     let expanded = thegn_core::calendar::expand_calendar(&cached.events, from, to, home)
-        .map_err(CalendarError::Expansion)?;
+        .map_err(CalendarViewError::Expansion)?;
     Ok(DueReminders {
         reminders: thegn_core::calendar::reminders::due_shared(
             &expanded.occurrences,

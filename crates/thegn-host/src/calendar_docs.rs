@@ -28,10 +28,12 @@ pub struct CalUiCfg {
     pub has_sources: bool,
 }
 
-/// Why a calendar month (or reminder pass) is unavailable or incomplete.
-/// Fixed labels only — never provider content — so it is safe to show and log.
+/// Why a calendar month (or reminder pass) is unavailable or incomplete —
+/// the VIEW's health, distinct from `thegn_svc::calendar::CalendarError`,
+/// which is a provider/transport failure. Fixed labels only, never provider
+/// content, so it is safe to show and log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CalendarError {
+pub enum CalendarViewError {
     /// The cache could not be opened or queried.
     CacheUnavailable,
     /// Some cached rows could not be decoded; the rest are shown.
@@ -40,7 +42,7 @@ pub enum CalendarError {
     Expansion(ExpansionError),
 }
 
-impl CalendarError {
+impl CalendarViewError {
     /// Whether the view still carries the readable data (incomplete) rather
     /// than having none at all (unavailable).
     pub fn is_partial(&self) -> bool {
@@ -48,7 +50,7 @@ impl CalendarError {
     }
 }
 
-impl std::fmt::Display for CalendarError {
+impl std::fmt::Display for CalendarViewError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::CacheUnavailable => f.write_str("calendar cache unavailable"),
@@ -68,7 +70,7 @@ impl std::fmt::Display for CalendarError {
 pub(crate) fn fold_month(
     events: &mut BTreeMap<NaiveDate, Vec<Arc<CalEvent>>>,
     loaded: &mut BTreeSet<(i32, u32)>,
-    errors: &mut BTreeMap<(i32, u32), CalendarError>,
+    errors: &mut BTreeMap<(i32, u32), CalendarViewError>,
     payload: &crate::detail::CalendarPayload,
 ) {
     if let Some(month) = &payload.events {
@@ -143,7 +145,7 @@ pub struct CalendarDocs {
     /// Expansion failures are kept separately from loaded data so a failed
     /// refresh cannot turn a first load into a successful empty calendar or
     /// erase the last valid snapshot.
-    pub errors: BTreeMap<(i32, u32), CalendarError>,
+    pub errors: BTreeMap<(i32, u32), CalendarViewError>,
 }
 
 impl Default for CalendarDocs {
@@ -244,7 +246,7 @@ mod tests {
 
     fn payload(
         events: Option<Vec<(NaiveDate, Vec<Arc<CalEvent>>)>>,
-        error: Option<CalendarError>,
+        error: Option<CalendarViewError>,
     ) -> CalendarPayload {
         CalendarPayload {
             month: (2026, 8),
@@ -257,7 +259,8 @@ mod tests {
     fn first_load_error_is_not_a_successful_empty_month() {
         let month = (2026, 8);
         let mut docs = CalendarDocs::default();
-        let error = CalendarError::Expansion(ExpansionError::Budget(ExpansionLimit::BucketEntries));
+        let error =
+            CalendarViewError::Expansion(ExpansionError::Budget(ExpansionLimit::BucketEntries));
         docs.merge(&payload(None, Some(error)));
         assert!(!docs.loaded.contains(&month));
         assert_eq!(docs.errors.get(&month), Some(&error));
@@ -272,7 +275,7 @@ mod tests {
         docs.merge(&payload(Some(vec![(date, vec![event()])]), None));
         let prior = Arc::clone(&docs.events[&date][0]);
 
-        let failed = CalendarError::Expansion(ExpansionError::InvalidSpan);
+        let failed = CalendarViewError::Expansion(ExpansionError::InvalidSpan);
         docs.merge(&payload(None, Some(failed)));
         assert!(docs.loaded.contains(&month));
         assert!(
@@ -293,14 +296,14 @@ mod tests {
         let mut docs = CalendarDocs::default();
         docs.merge(&payload(
             Some(vec![(date, vec![event()])]),
-            Some(CalendarError::MalformedCache),
+            Some(CalendarViewError::MalformedCache),
         ));
         assert!(docs.loaded.contains(&month));
         assert_eq!(docs.events[&date].len(), 1);
         assert!(docs.errors[&month].is_partial());
-        assert!(!CalendarError::CacheUnavailable.is_partial());
+        assert!(!CalendarViewError::CacheUnavailable.is_partial());
         assert_eq!(
-            CalendarError::MalformedCache.to_string(),
+            CalendarViewError::MalformedCache.to_string(),
             "calendar cache contains unreadable rows"
         );
     }

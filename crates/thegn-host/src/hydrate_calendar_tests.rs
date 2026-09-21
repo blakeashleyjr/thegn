@@ -259,7 +259,7 @@ fn an_undeserializable_row_is_skipped_not_fatal() {
     // than presented as the whole calendar.
     assert_eq!(cached.skipped, 1);
     let view = expand_month(&t.db, from, to, chrono_tz::Tz::UTC);
-    assert_eq!(view.error, Some(CalendarError::MalformedCache));
+    assert_eq!(view.error, Some(CalendarViewError::MalformedCache));
     let events = view.events.expect("the readable rows still show");
     assert_eq!(events.len(), 1);
 }
@@ -420,10 +420,7 @@ fn a_multi_day_event_raises_one_reminder_for_exactly_the_given_window() {
         &t.db,
         "work",
         "ics",
-        &EventPage {
-            events: vec![trip],
-            ..Default::default()
-        },
+        &page(vec![trip], vec![], ""),
         d(2026, 8, 1),
         d(2026, 8, 31),
     );
@@ -460,10 +457,7 @@ fn one_malformed_row_costs_itself_not_the_month_or_every_reminder() {
         &t.db,
         "work",
         "ics",
-        &EventPage {
-            events: vec![good, bad],
-            ..Default::default()
-        },
+        &page(vec![good, bad], vec![], ""),
         from,
         to,
     );
@@ -476,7 +470,7 @@ fn one_malformed_row_costs_itself_not_the_month_or_every_reminder() {
 
     // The month shows the readable events, marked incomplete — not blanked.
     let view = expand_month(&t.db, from, to, chrono_tz::Tz::UTC);
-    assert_eq!(view.error, Some(CalendarError::MalformedCache));
+    assert_eq!(view.error, Some(CalendarViewError::MalformedCache));
     let events = view.events.expect("the readable rows still show");
     assert!(
         events
@@ -499,7 +493,7 @@ fn the_reminder_cursor_advances_only_on_a_current_success() {
     assert_eq!(c.begin(3_000), None);
 
     // Failure: the cursor stays put and the SAME start is retried.
-    let failed = ReminderOutcome::Failed(CalendarError::CacheUnavailable);
+    let failed = ReminderOutcome::Failed(CalendarViewError::CacheUnavailable);
     assert!(c.finish(w, failed));
     assert_eq!(c.last_checked_ms(), 1_000);
     let retry = c.begin(3_000).unwrap();
@@ -522,7 +516,7 @@ fn the_reminder_cursor_advances_only_on_a_current_success() {
     let w = c.begin(5_000).unwrap();
     assert!(c.finish(
         w,
-        ReminderOutcome::Incomplete(CalendarError::MalformedCache)
+        ReminderOutcome::Incomplete(CalendarViewError::MalformedCache)
     ));
     assert_eq!(c.last_checked_ms(), 5_000);
 
@@ -603,6 +597,8 @@ fn an_over_budget_source_keeps_the_prior_cache_and_cursor() {
     }));
     assert_eq!(toasts.len(), 1, "{toasts:?}");
     let mut uids: Vec<_> = load_cached(&t.db, from, to)
+        .unwrap()
+        .events
         .into_iter()
         .map(|e| e.uid)
         .collect();
@@ -618,7 +614,7 @@ fn an_over_budget_source_keeps_the_prior_cache_and_cursor() {
         ..cfg
     };
     assert!(sync_accounts(&t.db, &cfg, from, to, true, &mut |_| {}));
-    assert_eq!(load_cached(&t.db, from, to).len(), 5);
+    assert_eq!(load_cached(&t.db, from, to).unwrap().events.len(), 5);
 }
 
 #[test]

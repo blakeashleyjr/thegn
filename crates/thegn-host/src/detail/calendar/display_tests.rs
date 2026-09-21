@@ -161,7 +161,7 @@ fn calendar_display_sites_keep_the_safe_projection() {
 fn status_state(
     events: BTreeMap<NaiveDate, Vec<Arc<CalEvent>>>,
     loaded: bool,
-    error: Option<crate::calendar_docs::CalendarError>,
+    error: Option<crate::calendar_docs::CalendarViewError>,
 ) -> CalState {
     let date = NaiveDate::from_ymd_opt(2026, 9, 13).unwrap();
     CalState {
@@ -207,9 +207,10 @@ fn agenda_note_of(st: &CalState) -> String {
 
 #[test]
 fn calendar_expansion_failure_is_visible_as_unavailable() {
-    use crate::calendar_docs::CalendarError;
+    use crate::calendar_docs::CalendarViewError;
     use thegn_core::calendar::{ExpansionError, ExpansionLimit};
-    let failed = CalendarError::Expansion(ExpansionError::Budget(ExpansionLimit::BucketEntries));
+    let failed =
+        CalendarViewError::Expansion(ExpansionError::Budget(ExpansionLimit::BucketEntries));
     let date = NaiveDate::from_ymd_opt(2026, 9, 13).unwrap();
     let event = Arc::new(CalEvent::new(
         "e",
@@ -241,7 +242,7 @@ fn calendar_expansion_failure_is_visible_as_unavailable() {
     let note = agenda_note_of(&status_state(
         kept,
         true,
-        Some(CalendarError::MalformedCache),
+        Some(CalendarViewError::MalformedCache),
     ));
     assert!(note.ends_with(" incomplete"), "{note}");
 }
@@ -251,9 +252,10 @@ fn a_failed_month_is_visible_without_the_agenda() {
     // `show_agenda = false` never builds the agenda note, so the grid header
     // has to carry the state — or a first-load failure paints as an ordinary
     // empty month and a stale one paints as current.
-    use crate::calendar_docs::CalendarError;
+    use crate::calendar_docs::CalendarViewError;
     use thegn_core::calendar::{ExpansionError, ExpansionLimit};
-    let failed = CalendarError::Expansion(ExpansionError::Budget(ExpansionLimit::RetainedBytes));
+    let failed =
+        CalendarViewError::Expansion(ExpansionError::Budget(ExpansionLimit::RetainedBytes));
     let date = NaiveDate::from_ymd_opt(2026, 9, 13).unwrap();
     let events = BTreeMap::from([(
         date,
@@ -295,7 +297,7 @@ fn a_failed_month_is_visible_without_the_agenda() {
         month_status_of(&hide_agenda(status_state(
             events,
             true,
-            Some(CalendarError::MalformedCache)
+            Some(CalendarViewError::MalformedCache)
         )))
         .as_deref(),
         Some("incomplete")
