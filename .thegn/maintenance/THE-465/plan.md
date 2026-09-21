@@ -36,9 +36,13 @@ traversal/determinism), THE-456 (concurrency), THE-457 (recurrence) stay open.
   above 10 000 → 10 000, with a visible `config_warn`); zero is never "unlimited".
 - Fixed code ceilings (not config): per-event retained bytes 1 MiB and child
   entries 16 384 (= THE-458's `MAX_EVENT_PAYLOAD_BYTES` / `MAX_EVENT_CHILD_ENTRIES`),
-  per-account retained bytes 32 MiB (= THE-458 retained bytes), source document
+  per-account retained bytes 32 MiB (= THE-458 retained bytes; Revision 2
+  scales this with `max_events`, 32–96 MiB), source document
   32 MiB (= THE-454 body cap), logical ICS line 1 MiB, component nesting 16,
-  global records 65 536 (= THE-458 source visits), global bytes 128 MiB.
+  global records 65 536 (= THE-458 source visits). Global bytes were 128 MiB
+  here; Revision 2 derives them instead, as
+  `2 * MAX_ACCOUNT_BYTES + MAX_SOURCE_DOCUMENT_BYTES` (224 MiB), so one
+  maximal account can never refuse itself.
 - `AdmissionPool` — process-global (`OnceLock<Arc<_>>`) or isolated (tests):
   atomic records/bytes counters, **non-blocking** `try_reserve` (CAS; never waits,
   so no deadlock/starvation — a refusal is a typed error and the account retries
@@ -111,10 +115,13 @@ traversal/determinism), THE-456 (concurrency), THE-457 (recurrence) stay open.
 
 transport body ≤ 32 MiB (THE-454) + one logical line ≤ 1 MiB + one CalDAV
 leaf/unescape ≤ 32 MiB (only if entity-escaped; else borrowed) + retained
-output ≤ 32 MiB (account) — all reserved in the global 128 MiB pool except the
-transient per-line/params scratch (≤ ~3 MiB). Command: one line (1 MiB) + its
-`Value` (bounded by the line) + retained output. Globally: ≤ 128 MiB of reserved
-body+output across every router instance, ≤ 65 536 admitted records.
+output ≤ 32 MiB per account at the default budget, ≤ 96 MiB at the maximum
+(Revision 2 scaled it with `max_events`) — all reserved in the global pool
+(224 MiB since Revision 2) except the
+transient per-line/params scratch (≤ ~3 MiB). Command: one line (1 MiB), walked
+element by element (Revision 1), + retained output. Globally: ≤ 224 MiB
+(Revision 2) of reserved body+output+derived rows across every router instance,
+≤ 65 536 admitted records.
 
 ## Tests (lane: core + svc calendar, host hydrate_calendar)
 
@@ -171,3 +178,18 @@ leaves prior cache + cursor intact and records `last_error`.
   scaled budget leaves its floor.
 - S5 A counting-allocator test over a 1 MiB plugin `events` line locks in the
   no-Value-tree property.
+
+## Revision 3 — approve fold-ins
+
+- The plugin allocation guard uses `{"a":1}` elements (an empty
+  `serde_json::Map` does not allocate, so `{}` understated the tree it exists
+  to forbid) under a 4 MiB bound, and a sibling test decodes the same line as
+  one `serde_json::Value` and asserts that it _exceeds_ that bound — so the
+  guard is proven to discriminate rather than merely to pass.
+- The stale "global bytes 128 MiB" figures in the Design and peak-memory
+  sections are corrected to the derived 224 MiB.
+- Poisoned-lock arms in the contention backoff recover the map instead of
+  silently skipping the backoff, and the DB-side contention test uses a
+  pid-scoped account name (the backoff map is process-wide and `just coverage`
+  runs the suite in one process).
+- Rebased onto main at `18060ae8` now that THE-454 has landed.

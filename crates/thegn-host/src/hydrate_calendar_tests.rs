@@ -434,26 +434,35 @@ fn a_contention_refusal_backs_the_account_off_instead_of_stamping_it() {
     ));
     // Once it lapses the account is eligible again, and the entry is dropped.
     assert!(!contention_backoff(&account, now + CONTENTION_BACKOFF_SECS));
-    assert!(!contention_seen().lock().unwrap().contains_key(&account));
+    assert!(
+        !contention_seen()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&account)
+    );
 }
 
 #[test]
 fn a_contention_refusal_leaves_the_accounts_record_untouched() {
-    let t = TmpDb::new("contention");
+    let t = TmpDb::new("contention-record");
     let (from, to) = window();
+    // A pid-scoped name: the backoff map is process-wide, and `just coverage`
+    // runs the whole suite in ONE process, so a literal name could couple this
+    // test to another if a panic skipped its cleanup.
+    let account = format!("contended-record-{}", std::process::id());
     apply_page(
         &t.db,
-        "work",
+        &account,
         "ics_url",
         &page(vec![event("e1")], vec![], "cursor-1"),
         from,
         to,
     );
-    let before = t.db.get_calendar_sync("work").unwrap().unwrap();
+    let before = t.db.get_calendar_sync(&account).unwrap().unwrap();
     let mut toasts = Vec::new();
     record_failure(
         &t.db,
-        "work",
+        &account,
         "ics_url",
         &CalendarError::Admission(thegn_core::calendar::AdmissionError::new(
             thegn_core::calendar::AdmissionLimit::GlobalBytes,
@@ -461,12 +470,11 @@ fn a_contention_refusal_leaves_the_accounts_record_untouched() {
         &BTreeMap::new(),
         &mut |m| toasts.push(m),
     );
-    let after = t.db.get_calendar_sync("work").unwrap().unwrap();
+    let after = t.db.get_calendar_sync(&account).unwrap().unwrap();
     assert_eq!(after.fetched_at, before.fetched_at, "no attempt stamp");
     assert_eq!(after.sync_token, "cursor-1");
     assert!(after.last_error.is_empty(), "{after:?}");
     assert!(toasts.is_empty(), "contention is not the user's problem");
-    assert!(contention_backoff("work", thegn_core::util::now()));
-    // Don't leave the backoff set for the other tests in this binary.
-    contention_seen().lock().unwrap().remove("work");
+    // …but the account is backed off, so the popup won't re-fetch it.
+    assert!(contention_backoff(&account, thegn_core::util::now()));
 }

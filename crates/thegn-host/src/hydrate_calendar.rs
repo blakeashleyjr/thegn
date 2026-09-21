@@ -142,16 +142,15 @@ fn contention_seen() -> &'static std::sync::Mutex<BTreeMap<String, i64>> {
 }
 
 fn note_contention(account: &str, now: i64) {
-    if let Ok(mut seen) = contention_seen().lock() {
-        seen.insert(account.to_string(), now);
-    }
+    contention_seen()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(account.to_string(), now);
 }
 
 /// Whether `account` is still inside its post-contention backoff.
 fn contention_backoff(account: &str, now: i64) -> bool {
-    let Ok(mut seen) = contention_seen().lock() else {
-        return false;
-    };
+    let mut seen = contention_seen().lock().unwrap_or_else(|e| e.into_inner());
     match seen.get(account) {
         Some(at) if now.saturating_sub(*at) < CONTENTION_BACKOFF_SECS => true,
         Some(_) => {

@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use thegn_core::calendar::AdmissionBudget;
 use thegn_core::config_calendar::{CalendarAccount, CalendarProviderKind};
 use thegn_svc::calendar::{AccountAdmission, CalendarBackend, CalendarError, command};
+use thegn_svc::plugin::proc;
 
 struct Counting;
 
@@ -37,18 +38,52 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static GLOBAL: Counting = Counting;
 
+/// Peak heap growth (over the live size at entry) while `f` runs.
+fn peak_growth<T>(f: impl FnOnce() -> T) -> (T, usize) {
+    let base = LIVE.load(Ordering::SeqCst);
+    PEAK.store(base, Ordering::SeqCst);
+    let out = f();
+    (out, PEAK.load(Ordering::SeqCst).saturating_sub(base))
+}
+
+/// The bound the streaming visitor has to stay under. Comfortably above one
+/// line's own buffers and far below what a JSON tree of the same line costs —
+/// `a_value_tree_of_the_same_line_would_blow_the_bound` pins both ends.
+const PEAK_BOUND: usize = 4 * 1024 * 1024;
+
+/// One `events` line of `n` small objects, as the plugin writes it.
+fn events_line(n: usize) -> String {
+    let mut line = String::with_capacity(n * 8 + 64);
+    line.push_str(r#"{"method":"events","params":{"events":["#);
+    for i in 0..n {
+        if i > 0 {
+            line.push(',');
+        }
+        line.push_str(r#"{"a":1}"#);
+    }
+    line.push_str("]}}");
+    line
+}
+
+const ELEMENTS: usize = 130_000;
+
 #[test]
 fn a_one_mib_events_line_is_walked_not_materialized() {
-    // ~130 000 `{}` elements in one line, built in the shell (an exec argument
-    // cannot carry a megabyte).
-    let script = r#"printf '{"method":"events","params":{"events":['
-        yes '{},' | head -n 130000 | tr -d '\n'
-        printf '{}]}}\n'"#;
+    // ~1 MiB of `{"a":1}` elements in one line, built in the shell (an exec
+    // argument cannot carry a megabyte). Not `{}`: an empty serde_json map
+    // does not allocate, so empty elements would understate the tree this
+    // test exists to rule out.
+    let script = format!(
+        r#"printf '{{"method":"events","params":{{"events":['
+           yes '{{"a":1}},' | head -n {n} | tr -d '\n'
+           printf '{{"a":1}}]}}}}\n'"#,
+        n = ELEMENTS - 1
+    );
     let backend = command::CommandBackend::new(
         &CalendarAccount {
             name: "plug".into(),
             provider: CalendarProviderKind::Command,
-            command: vec!["sh".into(), "-c".into(), script.into()],
+            command: vec!["sh".into(), "-c".into(), script],
             ..Default::default()
         },
         AccountAdmission::isolated(AdmissionBudget::default()),
@@ -60,10 +95,7 @@ fn a_one_mib_events_line_is_walked_not_materialized() {
         .build()
         .unwrap();
 
-    let base = LIVE.load(Ordering::SeqCst);
-    PEAK.store(base, Ordering::SeqCst);
-    let result = rt.block_on(backend.list_events(from, to, ""));
-    let peak = PEAK.load(Ordering::SeqCst).saturating_sub(base);
+    let (result, peak) = peak_growth(|| rt.block_on(backend.list_events(from, to, "")));
 
     // The first element has no uid, so the run fails as malformed — after one
     // element, not after a tree of 130 000.
@@ -74,5 +106,27 @@ fn a_one_mib_events_line_is_walked_not_materialized() {
     );
     // The line itself is ~1 MiB and is read into a buffer; a `Value` tree of
     // the same line costs tens of MiB.
-    assert!(peak < 8 * 1024 * 1024, "peak heap growth {peak} bytes");
+    assert!(peak < PEAK_BOUND, "peak heap growth {peak} bytes");
+}
+
+#[test]
+fn a_value_tree_of_the_same_line_would_blow_the_bound() {
+    // The guard above is only a guard if the shape it forbids actually
+    // exceeds it: decoding the same line the old way (one `serde_json::Value`
+    // for the whole message) must fail the same bound by a wide margin.
+    let line = events_line(ELEMENTS);
+    // Just under the reader's 1 MiB line cap, which is what the plugin path
+    // actually accepts in one line.
+    assert!(
+        (1_000_000..proc::MAX_LINE_BYTES).contains(&line.len()),
+        "line is {} bytes",
+        line.len()
+    );
+    let (value, peak) = peak_growth(|| serde_json::from_str::<serde_json::Value>(&line));
+    assert!(value.is_ok());
+    assert!(
+        peak > PEAK_BOUND,
+        "a whole-line Value tree peaked at {peak} bytes, so the streaming \
+         bound of {PEAK_BOUND} would not catch a regression"
+    );
 }
