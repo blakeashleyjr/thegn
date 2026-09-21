@@ -2598,8 +2598,11 @@ main_env = ""
 backend_chain = ["podman-rootless", "podman-rootful", "docker", "apple", "bwrap", "jobobject", "host"]
 
 # ── OCI image (podman / docker only) ────────────────────────────────────────
-# Empty  = thegn's built-in default (debian:stable).
-# Named  = pulled on first use (e.g. "ghcr.io/org/devenv:latest").
+# Empty  = thegn's built-in default: debian:stable, PINNED BY DIGEST so the
+#          containment boundary cannot be changed by retargeting a tag.
+# Named  = pulled on first use (e.g. "ghcr.io/org/devenv:latest"). A plain
+#          tag is yours to choose, but it is mutable: prefer
+#          "name:tag@sha256:<digest>" for anything you rely on.
 # bwrap / systemd ignore this — they use the host filesystem directly.
 image = ""
 
