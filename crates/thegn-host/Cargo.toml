@@ -46,6 +46,9 @@ dev = []
 clap = { workspace = true, features = ["derive"] }
 clap_complete.workspace = true
 thegn-core.workspace = true
+# control-grpc is REQUIRED here, not a preference: daemon/mod.rs serves
+# control::grpc unconditionally and cmd/api.rs registers Surface::Grpc in the
+# capability ledger, neither behind a cfg. See thegn-svc's feature comment.
 thegn-svc = { workspace = true, features = ["control-grpc"] }
 thegn-metrics.workspace = true
 thegn-media.workspace = true
