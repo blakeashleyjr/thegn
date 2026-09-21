@@ -82,6 +82,24 @@ pub(crate) trait ConfigSourceReader {
 #[cfg_attr(all(target_os = "linux", not(test)), allow(dead_code))]
 pub(crate) struct FinalLinkResolvingReader<R>(pub(crate) R);
 
+/// Retry a source read once when the adapter observed the file change under
+/// it. An editor's write-rename is a routine race, and a second read of a
+/// settled file is cheap; a source that keeps changing still refuses.
+pub(crate) struct RetryOnChange<R>(pub(crate) R);
+
+impl<R: ConfigSourceReader> ConfigSourceReader for RetryOnChange<R> {
+    fn read_bounded(
+        &self,
+        path: &Path,
+        limit: usize,
+    ) -> Result<Option<Vec<u8>>, ConfigFileReadError> {
+        match self.0.read_bounded(path, limit) {
+            Err(ConfigFileReadError::Changed) => self.0.read_bounded(path, limit),
+            other => other,
+        }
+    }
+}
+
 impl<R: ConfigSourceReader> ConfigSourceReader for FinalLinkResolvingReader<R> {
     fn read_bounded(
         &self,
@@ -208,7 +226,13 @@ impl std::fmt::Display for CaptureFailure {
                 return write!(f, "configuration source capture failed: {error}");
             }
             Self::Admission(error, Some(detail)) => {
-                return write!(f, "configuration admission failed: {error}: {detail}");
+                // The detail validates each source standalone, so on a
+                // cross-layer failure it names the layer that looks wrong on
+                // its own: a hint, not necessarily the resolved cause.
+                return write!(
+                    f,
+                    "configuration admission failed: {error} (first likely cause: {detail})"
+                );
             }
             Self::Admission(error, None) => {
                 return write!(f, "configuration admission failed: {error}");
@@ -387,6 +411,25 @@ impl EnvSource for FrozenEnv {
     }
 }
 
+/// The directory relative supplied paths are settled against.
+///
+/// `current_dir` fails routinely — a shell still sitting in a worktree that
+/// was removed — and the cwd is only needed for a RELATIVE supplied path, so
+/// an absent cwd falls back to the (absolute) profile root and refuses only
+/// when a relative `--config` genuinely needs it.
+pub(crate) fn settle_cwd(
+    current: Option<PathBuf>,
+    config: Option<&Path>,
+    app_root: &Path,
+) -> Result<PathBuf, CaptureInputError> {
+    match current {
+        Some(cwd) => Ok(cwd),
+        None if config.is_some_and(Path::is_relative) => Err(CaptureInputError::CwdUnavailable),
+        None if app_root.is_absolute() => Ok(app_root.to_path_buf()),
+        None => Err(CaptureInputError::CwdUnavailable),
+    }
+}
+
 fn checked_path(path: &Path) -> Result<(), CaptureInputError> {
     if path.as_os_str().as_encoded_bytes().len() > MAX_PATH_BYTES
         || path
@@ -435,13 +478,13 @@ impl ConfigCaptureSeed {
         if let Some(path) = cli.config {
             checked_path(path).map_err(CaptureFailure::Input)?;
         }
-        let cwd = std::env::current_dir()
-            .map_err(|_| CaptureFailure::Input(CaptureInputError::CwdUnavailable))?;
         // `reroot` is deliberately not called here.  A future single-threaded
         // adapter calls it before this function and its immutable result is
         // used to prevent a second reroot; tests may use the pure fallback in
         // `capture_with` before reroot.
         let active = thegn_core::profile::active();
+        let cwd = settle_cwd(std::env::current_dir().ok(), cli.config, &active.root)
+            .map_err(CaptureFailure::Input)?;
         let cli = CapturedCliInputs {
             config: cli.config,
             profile: cli.profile,

@@ -151,9 +151,23 @@ pub enum DiagnosticSeverity {
     Error,
 }
 
+/// What an admission diagnostic is about, so consumers select by type
+/// instead of matching on rendered prose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiagnosticKind {
+    /// A deprecated/compatibility spelling was normalized.
+    Compatibility,
+    /// A supplied value outside its accepted range was clamped or dropped
+    /// (the behaviour the runtime normalizer has always had).
+    Clamped,
+    /// A key this build does not know, outside the security-relevant tables.
+    UnknownKey,
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct AdmissionDiagnostic {
     pub severity: DiagnosticSeverity,
+    pub kind: DiagnosticKind,
     pub message: String,
 }
 
@@ -161,6 +175,7 @@ impl fmt::Debug for AdmissionDiagnostic {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AdmissionDiagnostic")
             .field("severity", &self.severity)
+            .field("kind", &self.kind)
             .field("message", &self.message)
             .finish()
     }
@@ -557,6 +572,7 @@ pub fn admit_layers(inputs: LayerInputs<'_>) -> Result<AdmittedLayers, ConfigAdm
             .chain(duration_warnings)
             .map(|message| AdmissionDiagnostic {
                 severity: DiagnosticSeverity::Warning,
+                kind: DiagnosticKind::Compatibility,
                 message: safe_message(&message),
             }),
     );
@@ -586,6 +602,7 @@ pub fn admit_layers(inputs: LayerInputs<'_>) -> Result<AdmittedLayers, ConfigAdm
             .into_iter()
             .map(|message| AdmissionDiagnostic {
                 severity: DiagnosticSeverity::Warning,
+                kind: DiagnosticKind::Clamped,
                 message: safe_message(&message),
             }),
     );
@@ -600,6 +617,11 @@ pub fn admit_layers(inputs: LayerInputs<'_>) -> Result<AdmittedLayers, ConfigAdm
     let supplied_runtime_values = !env_values.is_empty() || !inputs.overrides.is_empty();
     check_final_config(&cfg, supplied_runtime_values)?;
     cfg.post_process_pure(inputs.paths);
+    // The EFFECTIVE candidate — tilde expansion, injected default
+    // agents/tools/actions, clamped values, dropped metrics targets — is what
+    // the runtime uses and what `config validate` judges, so it is validated
+    // too (semantics and durations; the typed shape cannot change here).
+    check_final_config(&cfg, false)?;
     let normalized_bytes = check_normalized_candidate(&cfg)?;
     Ok(AdmittedLayers {
         config: cfg,
@@ -914,21 +936,34 @@ fn parse_layer(
         .map_err(|_| layer_error(layer, ConfigAdmissionError::Oversized))?;
     let json = serde_json::to_value(raw)
         .map_err(|_| layer_error(layer, ConfigAdmissionError::ParseInvalid))?;
-    let schema_errors = config_validate::validate_config_schema_value(&json);
+    // One shared config.toml is read by builds of different ages: an unknown
+    // key in a security-relevant table refuses (an ignored policy key can
+    // mean policy silently not applied), everywhere else it is an ignorable
+    // warning so a newer build's key cannot brick an older build.
+    let (schema_errors, unknown_keys) = config_validate::validate_config_layer_schema_value(&json);
     if !schema_errors.is_empty() {
         return Err(layer_error(layer, ConfigAdmissionError::SchemaInvalid));
     }
-    // Deserialize only after the raw schema walk has rejected unknown keys,
-    // invalid enums, and wrong shapes; serde's compatibility fallback is never
-    // allowed to become an admitted value.
+    // Deserialize only after the raw schema walk has rejected unknown
+    // security keys, invalid enums, and wrong shapes; serde's compatibility
+    // fallback is never allowed to become an admitted value.
     let _: Config = toml::from_str(&normalized.body)
         .map_err(|_| layer_error(layer, ConfigAdmissionError::SchemaInvalid))?;
-    let diagnostics = bounded_diagnostics(normalized.diagnostics.into_iter().map(|message| {
-        AdmissionDiagnostic {
-            severity: DiagnosticSeverity::Warning,
-            message: safe_message(&message),
-        }
-    }));
+    let diagnostics = bounded_diagnostics(
+        normalized
+            .diagnostics
+            .into_iter()
+            .map(|message| AdmissionDiagnostic {
+                severity: DiagnosticSeverity::Warning,
+                kind: DiagnosticKind::Compatibility,
+                message: safe_message(&message),
+            })
+            .chain(unknown_keys.into_iter().map(|message| AdmissionDiagnostic {
+                severity: DiagnosticSeverity::Warning,
+                kind: DiagnosticKind::UnknownKey,
+                message: safe_message(&message),
+            })),
+    );
     let identity = SourceIdentity {
         identity_digest: digest(
             b"thegn/config-admission/source-identity/v1",
@@ -1104,7 +1139,13 @@ fn validate_cli_override_shape(
             }
         }
     }
-    if config_validate::validate_config_schema_value(&tree).is_empty() {
+    // `--set` is a supplied value on the authority path, but it is checked
+    // against the same layer policy: an unknown non-security key is ignored
+    // by this build rather than refused.
+    if config_validate::validate_config_layer_schema_value(&tree)
+        .0
+        .is_empty()
+    {
         Ok(())
     } else {
         Err(ConfigAdmissionError::CliInvalid)
@@ -1125,7 +1166,10 @@ fn check_final_config(cfg: &Config, schema_walk: bool) -> Result<(), ConfigAdmis
         // `bounded_json_value` bounds the serialization itself; the strict
         // host structure limits are enforced by `check_normalized_candidate`.
         let value = bounded_json_value(cfg)?;
-        if !config_validate::validate_config_schema_value(&value).is_empty() {
+        if !config_validate::validate_config_layer_schema_value(&value)
+            .0
+            .is_empty()
+        {
             return Err(ConfigAdmissionError::SchemaInvalid);
         }
     }

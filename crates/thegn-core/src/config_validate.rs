@@ -54,11 +54,133 @@ pub struct ValidationDiagnostic {
     pub message: String,
 }
 
+/// How a schema walk treats a key the schema does not know.
+///
+/// One shared walk serves several callers with different stakes, so the
+/// policy is chosen PER CALL SITE (never inside the walk): the trusted
+/// configuration layers may relax, while the repo overlay, the host-row
+/// decoder and every other consumer keep refusing every unknown key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnknownKeys {
+    /// Every unknown key is an error (the default everywhere).
+    Reject,
+    /// An unknown key under a security-relevant table is an error; anywhere
+    /// else it is an ignorable warning. This is what the admitted
+    /// configuration layers use: one `~/.config/thegn/config.toml` is shared
+    /// by builds of different ages, so a key a newer build added must not
+    /// brick an older one — but a key an older build does not understand in
+    /// a table that grants authority must still refuse, because "ignored"
+    /// there can mean "policy silently not applied".
+    RejectSecurityRelevant,
+}
+
+/// Tables whose unknown keys refuse admission: anything that can execute a
+/// process, reach a remote, hold or select credentials, gate schema
+/// migrations, or set sandbox/placement/queue policy. Everything outside this
+/// list is presentation, telemetry or layout, where an unknown key is
+/// ignorable. Keep this list and `docs/ARCHITECTURE.md` in sync.
+const SECURITY_RELEVANT_ROOTS: &[&str] = &[
+    "accounts",
+    "actions",
+    "agents",
+    "apps",
+    "automations",
+    "autopilot",
+    "ci",
+    "clipboard",
+    "daemon",
+    "database",
+    "editor",
+    "env",
+    "forges",
+    "forward",
+    "git",
+    "git_commands",
+    "hooks",
+    "host",
+    "host_discovery",
+    "identities",
+    "issues",
+    "lifecycle",
+    "limits",
+    "lsp",
+    "merge_queue",
+    "metrics",
+    "model_proxy",
+    "network",
+    "notifications",
+    "pipeline",
+    "placement",
+    "plugins",
+    "pr",
+    "pr_queue",
+    "presets",
+    "profiles",
+    "remote",
+    "sandbox",
+    "serve",
+    "share",
+    "skills",
+    "tasks",
+    "toolchain",
+    "tools",
+    "watch",
+    "workspace",
+    "worktree_templates",
+];
+
+/// Whether `path` (a dotted schema path such as `sandbox.mounts[0].source`)
+/// names a security-relevant table. A bare root key (`picker`) is not one:
+/// an unknown ROOT key is exactly the "newer build added a table" case.
+pub fn is_security_relevant_path(path: &str) -> bool {
+    let root = path
+        .split(['.', '['])
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches(']');
+    !root.is_empty() && path.len() > root.len() && SECURITY_RELEVANT_ROOTS.contains(&root)
+}
+
+/// The stable marker the walk uses for an unknown key.
+const UNKNOWN_KEY: &str = ": unknown key";
+
+/// Split walk errors into (errors, ignorable warnings) under `policy`.
+pub(crate) fn split_unknown_keys(
+    messages: Vec<String>,
+    policy: UnknownKeys,
+) -> (Vec<String>, Vec<String>) {
+    if policy == UnknownKeys::Reject {
+        return (messages, Vec::new());
+    }
+    let mut errors = Vec::new();
+    let mut warnings = Vec::new();
+    for message in messages {
+        match message.split_once(UNKNOWN_KEY) {
+            Some((path, _)) if !is_security_relevant_path(path) => {
+                warnings.push(format!("{message} (ignored by this build)"));
+            }
+            _ => errors.push(message),
+        }
+    }
+    (errors, warnings)
+}
+
 /// Validate the same normalized document that runtime loading accepts, retaining
 /// advisory compatibility diagnostics separately from actual admission errors.
 /// Canonical/legacy collisions remain warnings: normalization deliberately
 /// chooses the canonical value at runtime and this API preserves that policy.
 pub fn validate_diagnostics(body: &str) -> Vec<ValidationDiagnostic> {
+    validate_diagnostics_with_policy(body, UnknownKeys::Reject)
+}
+
+/// [`validate_diagnostics`] under an explicit unknown-key policy. The trusted
+/// layers (main config, selected profile overlay) pass
+/// [`UnknownKeys::RejectSecurityRelevant`] so `config validate` reports
+/// exactly what admission does; the repo overlay keeps `Reject`.
+pub fn validate_diagnostics_with_policy(
+    body: &str,
+    policy: UnknownKeys,
+) -> Vec<ValidationDiagnostic> {
     let normalized = match crate::config_compat::normalize(body) {
         Ok(value) => value,
         Err(error) => {
@@ -76,14 +198,15 @@ pub fn validate_diagnostics(body: &str) -> Vec<ValidationDiagnostic> {
             message: message.clone(),
         })
         .collect();
-    diagnostics.extend(
-        validate_normalized(&normalized.body)
-            .into_iter()
-            .map(|message| ValidationDiagnostic {
-                severity: ValidationSeverity::Error,
-                message,
-            }),
-    );
+    let (errors, ignorable) = split_unknown_keys(validate_normalized(&normalized.body), policy);
+    diagnostics.extend(ignorable.into_iter().map(|message| ValidationDiagnostic {
+        severity: ValidationSeverity::Warning,
+        message,
+    }));
+    diagnostics.extend(errors.into_iter().map(|message| ValidationDiagnostic {
+        severity: ValidationSeverity::Error,
+        message,
+    }));
     if let Ok(cfg) = toml::from_str::<Config>(&normalized.body) {
         if let Some(message) = cfg.sandbox.warm_direnv.deprecation_warning() {
             diagnostics.push(ValidationDiagnostic {
@@ -293,6 +416,19 @@ pub(crate) fn typed_semantic_errors(cfg: &Config, mode: SemanticMode) -> Vec<Str
 /// its compatibility branches and flattened-map limitations.
 pub(crate) fn validate_config_schema_value(value: &serde_json::Value) -> Vec<String> {
     validate_schema_value_with_root(value, config_schema())
+}
+
+/// The admitted-layer walk: unknown keys outside security-relevant tables are
+/// returned as ignorable warnings instead of refusals. Only the configuration
+/// layers use this; `validate_schema_value_with_root` (repo overlay, host-row
+/// decoder, every other schema) still refuses every unknown key.
+pub(crate) fn validate_config_layer_schema_value(
+    value: &serde_json::Value,
+) -> (Vec<String>, Vec<String>) {
+    split_unknown_keys(
+        validate_schema_value_with_root(value, config_schema()),
+        UnknownKeys::RejectSecurityRelevant,
+    )
 }
 
 #[cfg(test)]

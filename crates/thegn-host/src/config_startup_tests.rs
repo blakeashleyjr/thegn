@@ -95,8 +95,10 @@ fn startup_publishes_generation_one_from_one_admission() {
 #[test]
 fn invalid_startup_config_never_reaches_the_host_store_or_publishes() {
     for body in [
-        "branch_prefix = \n",                            // parse error
-        "no_such_key = 1\n",                             // unknown key (schema)
+        "branch_prefix = \n", // parse error
+        // An unknown key in a security-relevant table still refuses; the
+        // relaxed case (unknown key elsewhere) has its own core test.
+        "[sandbox]\nno_such_key = 1\n",
         "[ui]\nsidebar_workspace_sort = \"sideways\"\n", // bad enum
     ] {
         let files = sources(body);
@@ -242,6 +244,10 @@ fn unavailable_host_layer_publishes_a_host_less_non_authoritative_generation() {
     );
     let banner = process.banner().expect("persistent banner");
     assert!(banner.contains("newer than this build"), "{banner}");
+    // The banner must claim only what is actually refused: `require_launchable`
+    // covers the daemon's per-launch refresh, not every launch route.
+    assert!(banner.contains("agent and tool launches"), "{banner}");
+    assert!(!banner.contains("launches are refused: "), "{banner}");
 
     // Reload never re-installs the migration policy.
     let ReloadOutcome::Published(_) = process.reload_with(&unavailable) else {
@@ -276,7 +282,7 @@ fn distinct_reload_failures_are_reported_and_the_banner_persists() {
     files
         .bodies
         .borrow_mut()
-        .insert(base_path(), b"no_such_key_one = 1\n".to_vec());
+        .insert(base_path(), b"[sandbox]\nno_such_key_one = 1\n".to_vec());
     assert!(matches!(
         process.reload_with(&admit),
         ReloadOutcome::Failed(_)
@@ -288,7 +294,7 @@ fn distinct_reload_failures_are_reported_and_the_banner_persists() {
     files
         .bodies
         .borrow_mut()
-        .insert(base_path(), b"no_such_key_two = 1\n".to_vec());
+        .insert(base_path(), b"[sandbox]\nno_such_key_two = 1\n".to_vec());
     assert!(
         matches!(process.reload_with(&admit), ReloadOutcome::Failed(_)),
         "a different problem of the same category is new information"
@@ -436,4 +442,63 @@ fn superseded_reload_still_delivers_the_current_generation_to_the_loop() {
         .expect("ok");
     assert_eq!(delivered.config().branch_prefix, "two/");
     assert!(loop_update(ReloadOutcome::FailedCoalesced, || process.store().display()).is_none());
+}
+
+/// A worktree removed under a live shell makes `current_dir` fail; that must
+/// not become a lockout when nothing relative needs the cwd.
+#[test]
+fn an_unavailable_cwd_is_only_fatal_for_a_relative_config_path() {
+    use crate::config_capture::{CaptureInputError, settle_cwd};
+    let root = Path::new("/home/test/.thegn");
+    assert_eq!(
+        settle_cwd(Some(PathBuf::from("/cwd")), None, root).unwrap(),
+        PathBuf::from("/cwd")
+    );
+    assert_eq!(settle_cwd(None, None, root).unwrap(), root);
+    assert_eq!(
+        settle_cwd(None, Some(Path::new("/absolute/config.toml")), root).unwrap(),
+        root
+    );
+    assert_eq!(
+        settle_cwd(None, Some(Path::new("relative.toml")), root),
+        Err(CaptureInputError::CwdUnavailable)
+    );
+    assert_eq!(
+        settle_cwd(None, None, Path::new("relative-root")),
+        Err(CaptureInputError::CwdUnavailable)
+    );
+}
+
+/// A write-rename race under the reader is retried once instead of refusing.
+#[test]
+fn a_changed_source_is_retried_once() {
+    use crate::config_capture::{ConfigSourceReader, RetryOnChange};
+    struct Flaky {
+        reads: Cell<u32>,
+    }
+    impl ConfigSourceReader for Flaky {
+        fn read_bounded(&self, _: &Path, _: usize) -> Result<Option<Vec<u8>>, ConfigFileReadError> {
+            self.reads.set(self.reads.get() + 1);
+            if self.reads.get() == 1 {
+                Err(ConfigFileReadError::Changed)
+            } else {
+                Ok(Some(b"branch_prefix = \"settled/\"\n".to_vec()))
+            }
+        }
+    }
+    let reader = RetryOnChange(Flaky {
+        reads: Cell::new(0),
+    });
+    assert!(reader.read_bounded(Path::new("/nonexistent"), 64).is_ok());
+
+    struct AlwaysChanging;
+    impl ConfigSourceReader for AlwaysChanging {
+        fn read_bounded(&self, _: &Path, _: usize) -> Result<Option<Vec<u8>>, ConfigFileReadError> {
+            Err(ConfigFileReadError::Changed)
+        }
+    }
+    assert_eq!(
+        RetryOnChange(AlwaysChanging).read_bounded(Path::new("/nonexistent"), 64),
+        Err(ConfigFileReadError::Changed)
+    );
 }

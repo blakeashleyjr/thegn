@@ -72,6 +72,9 @@ fn every_configured_top_level_variant_parses_without_static_authority() {
     case!(Command::Pair { .. }, ["pair", "list"]);
     case!(Command::Daemon { .. }, ["daemon"]);
     case!(Command::Host { .. }, ["host", "status", "fixture"]);
+    // `debug` installs a toolchain and execs a managed binary: executing, so
+    // it must be admitted like any other launch.
+    case!(Command::Debug { .. }, ["debug", "path"]);
     case!(Command::SpriteProxy { .. }, ["sprite-proxy"]);
     case!(Command::VpsSsh { .. }, ["vps-ssh", "fixture"]);
     case!(Command::Machine0Ssh { .. }, ["machine0-ssh", "fixture"]);
@@ -259,7 +262,6 @@ fn diagnostic_and_recovery_verbs_are_recovery() {
     for args in [
         &["doctor"][..],
         &["logs", "tail"],
-        &["debug", "path"],
         &["notify", "list"],
         &["bridge"],
         &["bridge-revtunnel", "12345"],
