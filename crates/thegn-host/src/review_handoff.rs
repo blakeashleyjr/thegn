@@ -77,19 +77,32 @@ pub(crate) fn target(session: &Session, panes: &Panes, cfg: &Config) -> PaneTarg
     if let Some(id) = live_agent_pane(session, panes, cfg) {
         return PaneTarget::Live(id);
     }
+    // THE-515: a refused trusted overlay never falls back to the global
+    // agent command for a NEW headless agent (a live pane the user already
+    // started is fine — nothing new is launched).
+    if session
+        .repo_root()
+        .is_some_and(|root| cfg.workspace_overlay(root).is_refused())
+    {
+        return PaneTarget::None;
+    }
     let queue = review_queue(session, cfg);
     headless_target(cfg, &queue)
 }
 
 /// Resolve the repository overlay without running git on the compositor loop.
-/// Session group names are `<workspace-slug>/<branch>`; `repo_pr_queue` needs
-/// only that slug to select the already-loaded trusted workspace overlay.
+///
+/// Every group in a session belongs to that session's workspace, so an
+/// absolute session id IS the repository root, and `repo_pr_queue` derives the
+/// overlay key from it purely (THE-515). This used to forge a path out of the
+/// group's tab-slug prefix, which made the answer depend on the process cwd
+/// (`git rev-parse` ran relative to it) and keyed by the collision-suffixed
+/// tab namespace instead of the repository. No absolute root ⇒ global policy.
 fn review_queue(session: &Session, cfg: &Config) -> thegn_core::config::PrQueueConfig {
-    let slug = session
-        .active_group()
-        .and_then(|group| group.name.split('/').next())
-        .filter(|slug| !slug.is_empty());
-    cfg.repo_pr_queue(std::path::Path::new(slug.unwrap_or("repo")))
+    match session.repo_root() {
+        Some(root) => cfg.repo_pr_queue(root),
+        None => cfg.pr_queue.clone(),
+    }
 }
 
 fn headless_target(cfg: &Config, queue: &thegn_core::config::PrQueueConfig) -> PaneTarget {
@@ -199,7 +212,14 @@ pub(crate) fn dispatch(
             model.status = "review handoff queued for verification".into();
         }
         PaneTarget::None => {
-            model.status = "no live agent pane or configured headless agent".into();
+            // Name the refusal rather than claiming nothing is configured.
+            model.status = match session
+                .repo_root()
+                .and_then(|root| cfg.workspace_overlay_refusal(root))
+            {
+                Some(refusal) => format!("review handoff refused: {refusal}"),
+                None => "no live agent pane or configured headless agent".into(),
+            };
         }
     }
 }
@@ -273,7 +293,10 @@ mod tests {
         let mut workspace = thegn_core::config::WorkspaceConfig::default();
         workspace.pr_queue.agent_command = Some("workspace-agent {prompt}".into());
         cfg.workspace.insert("widget".into(), workspace);
-        let mut session = Session::default();
+        let mut session = Session {
+            id: "/src/widget".into(),
+            ..Session::default()
+        };
         session.add_group(crate::session::WorktreeGroup::new(
             "widget/feature",
             crate::session::GroupKind::Branch,
@@ -283,6 +306,51 @@ mod tests {
         assert_eq!(
             review_queue(&session, &cfg).agent_command,
             "workspace-agent {prompt}"
+        );
+    }
+
+    #[test]
+    fn refused_overlay_never_dispatches_a_headless_reviewer() {
+        let mut cfg = Config::default();
+        cfg.pr_queue.agent_command = "global-agent {prompt}".into();
+        cfg.workspace.insert("widget".into(), Default::default());
+        cfg.workspace.insert("Widget".into(), Default::default());
+        let session = Session {
+            id: "/src/widget".into(),
+            ..Session::default()
+        };
+        let (tx, _rx) = tokio::sync::mpsc::channel::<crate::pane::PaneEvent>(16);
+        let panes = Panes::new(tx);
+        assert_eq!(target(&session, &panes, &cfg), PaneTarget::None);
+    }
+
+    #[test]
+    fn review_queue_keys_by_repository_root_not_tab_slug() {
+        // THE-515: the tab namespace of a second same-named repo is
+        // `widget-2`; its overlay must not be picked from the tab slug, and
+        // a non-path session id (legacy "default") must not resolve relative
+        // to the cwd — it gets the global policy.
+        let mut cfg = Config::default();
+        let mut workspace = thegn_core::config::WorkspaceConfig::default();
+        workspace.pr_queue.agent_command = Some("tab-slug-agent {prompt}".into());
+        cfg.workspace.insert("widget-2".into(), workspace);
+        let mut session = Session {
+            id: "/elsewhere/widget".into(),
+            ..Session::default()
+        };
+        session.add_group(crate::session::WorktreeGroup::new(
+            "widget-2/feature",
+            crate::session::GroupKind::Branch,
+            "/worktrees/widget-2-feature",
+        ));
+        assert_eq!(
+            review_queue(&session, &cfg).agent_command,
+            cfg.pr_queue.agent_command
+        );
+        session.id = "default".into();
+        assert_eq!(
+            review_queue(&session, &cfg).agent_command,
+            cfg.pr_queue.agent_command
         );
     }
 }

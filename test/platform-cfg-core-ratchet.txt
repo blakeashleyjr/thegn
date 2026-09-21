@@ -5,6 +5,12 @@
 # SHRINK-ONLY. Enforced by `platform_cfgs_are_pinned` in
 # crates/thegn-core/src/platform_ratchet_tests.rs; `just ratchet-update`.
 
+# TEST-ONLY cfg, not per-OS production code (THE-515): the overlay-identity
+# regression creates a real symlinked second spelling of one checkout to prove
+# both slugs resolve to the same repository. std::os::unix::fs::symlink has no
+# portable equivalent, and the production path is platform-free
+# (util::file_identity owns the per-OS split).
+account.rs
 activity.rs
 bundle.rs
 config_write.rs

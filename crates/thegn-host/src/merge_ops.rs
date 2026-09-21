@@ -258,7 +258,14 @@ pub(crate) fn prepare_remote_enqueue(
         "registered target repository is unavailable on this host: {}",
         registered.repo_root
     );
-    let mq = cfg.repo_merge_queue(repo_root);
+    // THE-515: the registry row is bookkeeping written by whoever registered
+    // the worktree (THE-73) and may name a symlink alias; key the trusted
+    // overlay by the resolved root like every git-derived caller does.
+    let overlay_root = std::fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+    if let Some(refusal) = cfg.workspace_overlay_refusal(&overlay_root) {
+        anyhow::bail!("{}: {refusal}", overlay_root.display());
+    }
+    let mq = cfg.repo_merge_queue(&overlay_root);
     let target = integrate::resolve_target(&mq, repo_root);
     Ok(PreparedRemoteEnqueue { registered, target })
 }
@@ -293,7 +300,9 @@ pub(crate) fn commit_remote_enqueue(
         )?,
         "registered remote worktree metadata changed while enqueueing; retry"
     );
-    let mq = cfg.repo_merge_queue(Path::new(&current.repo_root));
+    let overlay_root = std::fs::canonicalize(&current.repo_root)
+        .unwrap_or_else(|_| PathBuf::from(&current.repo_root));
+    let mq = cfg.repo_merge_queue(&overlay_root);
     crate::merge_lifecycle::apply(
         &mq,
         db,

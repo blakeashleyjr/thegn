@@ -601,7 +601,7 @@ fn resolve_editor(
     }
 
     let provider = workspace_slug
-        .and_then(|slug| cfg.workspace.get(slug))
+        .and_then(|slug| cfg.workspace_overlay_for_key(slug).overlay())
         .and_then(|workspace| workspace.editor)
         .unwrap_or(cfg.editor.provider);
     if let Some(editor) = providers::provider(provider, open_in) {

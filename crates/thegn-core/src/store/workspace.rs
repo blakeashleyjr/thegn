@@ -39,6 +39,11 @@ pub trait WorkspaceStore {
     /// stale slug if it is reopened later.
     fn del_repo_slug(&self, repo_path: &str) -> Result<()>;
 
+    /// Every registered `(repo_path, tab slug)` pair. Read by the trusted
+    /// overlay selector (THE-515) only to REFUSE authority for a synthetic
+    /// (`repo`, `-N`) or shared tab slug — never to grant it.
+    fn repo_slug_rows(&self) -> Result<Vec<(String, String)>>;
+
     /// Forget a whole workspace (no disk side effects). Removes the
     /// `workspaces` row so the sidebar stops listing it. The worktree files on
     /// disk are intentionally left untouched.

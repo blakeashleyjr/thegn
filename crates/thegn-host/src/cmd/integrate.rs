@@ -38,6 +38,11 @@ pub struct IntegrateArgs {
 pub fn run(cfg: &Config, args: &IntegrateArgs) -> Result<()> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let repo_root = integrate::main_checkout(&cwd).context("not inside a git repository")?;
+    // THE-515: an ambiguous trusted overlay is refused — never fold under the
+    // weaker global gate in its place.
+    if let Some(refusal) = cfg.workspace_overlay_refusal(&repo_root) {
+        anyhow::bail!("{}: {refusal}", repo_root.display());
+    }
     // Resolve the repo's effective `[merge_queue]` FIRST, so `enabled` (and
     // everything below) honors a `[workspace.<slug>]` refinement rather than the
     // bare global table.

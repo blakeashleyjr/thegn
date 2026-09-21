@@ -104,10 +104,30 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
     // one repo. Resolving needs a repo root; when there isn't one (not inside a
     // repo) fall back to the global table so the refusal message below still
     // beats a confusing "not inside a git repository" from the subcommand.
-    let enabled = repo_root()
-        .map(|root| cfg.repo_merge_queue(&root).enabled)
-        .unwrap_or(cfg.merge_queue.enabled);
-    if !enabled {
+    let root = repo_root().ok();
+    // THE-515: a refused (ambiguous) trusted overlay is reported as itself,
+    // not as "disabled". Read/cleanup verbs keep working so the queue can
+    // still be inspected and emptied; everything that gates, folds or lands
+    // stops here.
+    if let Some(root) = &root
+        && let Some(refusal) = cfg.workspace_overlay_refusal(root)
+    {
+        if matches!(
+            action,
+            Action::List { .. } | Action::Rm { .. } | Action::Clear | Action::Conflicts { .. }
+        ) {
+            thegn_core::msg::warn(&format!("{}: {refusal}", root.display()));
+            if !cfg.merge_queue.enabled {
+                anyhow::bail!("Merge queue disabled — set [merge_queue] enabled = true");
+            }
+        } else {
+            anyhow::bail!("{}: {refusal}", root.display());
+        }
+    } else if !root
+        .as_ref()
+        .map(|root| cfg.repo_merge_queue(root).enabled)
+        .unwrap_or(cfg.merge_queue.enabled)
+    {
         // Refusal, not success: bail so the process exits non-zero — scripts/CI
         // must be able to tell "did nothing because disabled" from "did the work".
         anyhow::bail!(

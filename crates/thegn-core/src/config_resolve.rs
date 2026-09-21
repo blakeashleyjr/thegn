@@ -1176,10 +1176,10 @@ pub fn resolve_repo_sandbox(
 
     // Per-workspace bind dirs ([workspace.<slug>] sandbox_mounts) extend the
     // global/profile/repo mounts. Workspace config is user-authored (more
-    // trusted than the repo), so this is an ungated accumulate.
-    if !cfg.workspace.is_empty()
-        && let Some(ws) = cfg.workspace.get(&crate::config::workspace_slug(repo_root))
-    {
+    // trusted than the repo), so this is an ungated accumulate — which is
+    // exactly why it goes through the one ambiguity-refusing selector
+    // (THE-515): a refused overlay adds no mounts.
+    if let Some(ws) = cfg.workspace_overlay(repo_root).overlay() {
         sb.mounts.extend(ws.sandbox_mounts.iter().cloned());
     }
     sb.mounts = sb

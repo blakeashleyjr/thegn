@@ -204,6 +204,10 @@ pub(crate) fn typed_semantic_errors(cfg: &Config, mode: SemanticMode) -> Vec<Str
     batch!(crate::config_drawer::validate_drawer_config(cfg));
     check_serve(cfg, &mut errs);
     stop!();
+    // THE-515: trusted `[workspace.<key>]` keys must be unambiguous slugs —
+    // a non-normalized or colliding key is refused by the runtime selector,
+    // so admission must refuse it visibly before any repo-scoped effect.
+    batch!(crate::workspace_overlay::validate(&cfg.workspace));
     // IANA zone names can't be a `config_enum!` (~600 of them, and the
     // list rots with each tzdb release), so `[calendar]` is checked
     // against the bundled database here instead — with a did-you-mean.

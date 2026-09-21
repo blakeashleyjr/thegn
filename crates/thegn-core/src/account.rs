@@ -261,12 +261,17 @@ pub fn active_name(
         return Some(n);
     }
     if let Some(slug) = slug {
-        if let Some(n) = cfg
-            .workspace
-            .get(slug)
-            .and_then(|w| w.accounts.get(provider_id))
-        {
-            return Some(n.clone());
+        // THE-515: the trusted overlay is selected by the one refusing
+        // resolver. `slug` is still the tab namespace until RepositoryId
+        // binding lands. A refused overlay REFUSES: no workspace pointer and
+        // no global account stand in for the block the user pinned.
+        match cfg.workspace_overlay_for_tab_slug(db, slug) {
+            crate::workspace_overlay::WorkspaceOverlay::Refused(_) => return None,
+            overlay => {
+                if let Some(n) = overlay.overlay().and_then(|w| w.accounts.get(provider_id)) {
+                    return Some(n.clone());
+                }
+            }
         }
         if let Some(n) = db
             .get_ui_state(&scope_ws(provider_id, slug), "active")
@@ -430,9 +435,119 @@ mod tests {
         );
     }
 
+    /// A live main checkout (`.git` directory) at `dir/<name>`.
+    fn checkout(dir: &std::path::Path, name: &str) -> String {
+        let path = dir.join(name);
+        std::fs::create_dir_all(path.join(".git")).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    fn foo_config() -> Config {
+        let mut cfg = Config::default();
+        cfg.workspace
+            .entry("foo".into())
+            .or_default()
+            .accounts
+            .insert("codex".into(), "work".into());
+        cfg
+    }
+
+    #[test]
+    fn two_live_same_named_checkouts_refuse_the_account_instead_of_falling_back() {
+        // THE-515: neither registration wins `[project.foo]`, and the global /
+        // pointer accounts must not stand in for the refused block.
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_memory().unwrap();
+        let a = checkout(dir.path(), "a/foo");
+        let b = checkout(dir.path(), "b/foo");
+        assert_eq!(db.slug_for_repo(&a, "foo").unwrap(), "foo");
+        assert_eq!(db.slug_for_repo(&b, "foo").unwrap(), "foo-2");
+        let cfg = foo_config();
+        set_active(&db, Bind::Global, "/wt", Some("foo"), "codex", "g").unwrap();
+        set_active(&db, Bind::Workspace, "/wt", Some("foo"), "codex", "wsp").unwrap();
+        assert_eq!(active_name(&cfg, &db, "/wt", Some("foo"), "codex"), None);
+        assert_eq!(active_name(&cfg, &db, "/wt2", Some("foo-2"), "codex"), None);
+        let refusal = cfg.workspace_overlay_for_tab_slug(&db, "foo-2");
+        let text = refusal.refusal().expect("refused").to_string();
+        assert!(text.contains("Rename or delete"), "{text}");
+        // An explicit per-worktree pin is the user's own choice and stays.
+        set_active(&db, Bind::Worktree, "/wt", Some("foo"), "codex", "pinned").unwrap();
+        assert_eq!(
+            active_name(&cfg, &db, "/wt", Some("foo"), "codex").as_deref(),
+            Some("pinned")
+        );
+    }
+
+    #[test]
+    fn stale_registry_row_does_not_lock_out_a_single_repo() {
+        // A scratch clone registered first and since deleted holds `foo`; the
+        // real repo got `foo-2`. It must still get its own block.
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_memory().unwrap();
+        let gone = dir
+            .path()
+            .join("scratch/foo")
+            .to_string_lossy()
+            .into_owned();
+        db.slug_for_repo(&gone, "foo").unwrap();
+        let real = checkout(dir.path(), "code/foo");
+        assert_eq!(db.slug_for_repo(&real, "foo").unwrap(), "foo-2");
+        // A plain dir workspace and a linked worktree named `foo` don't count.
+        let plain = dir.path().join("plain/foo");
+        std::fs::create_dir_all(&plain).unwrap();
+        db.slug_for_repo(&plain.to_string_lossy(), "foo").unwrap();
+        let linked = dir.path().join("wt/foo");
+        std::fs::create_dir_all(&linked).unwrap();
+        std::fs::write(linked.join(".git"), "gitdir: /x\n").unwrap();
+        db.slug_for_repo(&linked.to_string_lossy(), "foo").unwrap();
+        let cfg = foo_config();
+        assert_eq!(
+            active_name(&cfg, &db, "/wt", Some("foo-2"), "codex").as_deref(),
+            Some("work")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_second_spelling_is_the_same_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_memory().unwrap();
+        let real = checkout(dir.path(), "real/foo");
+        let alias = dir.path().join("alias");
+        std::fs::create_dir_all(&alias).unwrap();
+        std::os::unix::fs::symlink(&real, alias.join("foo")).unwrap();
+        db.slug_for_repo(&alias.join("foo").to_string_lossy(), "foo")
+            .unwrap();
+        assert_eq!(db.slug_for_repo(&real, "foo").unwrap(), "foo-2");
+        let cfg = foo_config();
+        for slug in ["foo", "foo-2"] {
+            assert_eq!(
+                active_name(&cfg, &db, "/wt", Some(slug), "codex").as_deref(),
+                Some("work"),
+                "{slug}"
+            );
+        }
+    }
+
+    #[test]
+    fn nameless_repository_does_not_get_the_repo_block_via_its_tab_slug() {
+        let db = Db::open_memory().unwrap();
+        assert_eq!(db.slug_for_repo("/src/日本語", "repo").unwrap(), "repo");
+        let mut cfg = Config::default();
+        cfg.workspace
+            .entry("repo".into())
+            .or_default()
+            .accounts
+            .insert("codex".into(), "work".into());
+        assert_eq!(active_name(&cfg, &db, "/wt", Some("repo"), "codex"), None);
+    }
+
     #[test]
     fn active_name_precedence() {
         let db = Db::open_memory().unwrap();
+        // The tab slug is resolved through the registry, so the scope has to
+        // be a registered repository (THE-515) — its directory name is the key.
+        db.slug_for_repo("/src/repo", "repo").unwrap();
         let mut cfg = Config::default();
         cfg.workspace.entry("repo".into()).or_default();
         // Nothing set anywhere.
