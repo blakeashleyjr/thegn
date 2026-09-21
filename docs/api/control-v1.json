@@ -63,6 +63,25 @@
       ],
       "type": "object"
     },
+    "AgentSessionsQuery": {
+      "properties": {
+        "harness": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "worktree": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
     "AttachKind": {
       "description": "How a client attaches. `Observer` never resizes the PTY and never holds the relay lease open (read-mostly thin clients); `Interactive` is the compositor/CLI case — last interactive writer wins resizes.",
       "enum": [
@@ -70,6 +89,42 @@
         "observer"
       ],
       "type": "string"
+    },
+    "AttachQuery": {
+      "properties": {
+        "client_id": {
+          "type": "string"
+        },
+        "cols": {
+          "format": "uint16",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "history": {
+          "default": true,
+          "description": "Include the scrollback history tail in the warm-attach snapshot. Defaults to true (a fresh client emulator wants the context); reconnect paths pass `false` so the tail isn't duplicated into scrollback the client already holds.",
+          "type": "boolean"
+        },
+        "observer": {
+          "default": false,
+          "type": "boolean"
+        },
+        "rows": {
+          "format": "uint16",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "client_id"
+      ],
+      "type": "object"
     },
     "AutomationOrigin": {
       "description": "Wire-safe automation ancestry shared by generated sessions and notes.",
@@ -170,6 +225,22 @@
       ],
       "type": "object"
     },
+    "CalendarQuery": {
+      "description": "`?from=2026-08-01&to=2026-08-31` — inclusive ISO dates.",
+      "properties": {
+        "from": {
+          "type": "string"
+        },
+        "to": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "from",
+        "to"
+      ],
+      "type": "object"
+    },
     "CiLogsReply": {
       "description": "One cache-first CI log projection. Entries contain only the bounded, redacted cache shape; the response metadata makes a provider fill explicit.",
       "properties": {
@@ -235,6 +306,32 @@
       ],
       "type": "object"
     },
+    "CommentBody": {
+      "properties": {
+        "body": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "body"
+      ],
+      "type": "object"
+    },
+    "CommitBody": {
+      "properties": {
+        "message": {
+          "type": "string"
+        },
+        "worktree": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "message",
+        "worktree"
+      ],
+      "type": "object"
+    },
     "ControlErrorCode": {
       "description": "The closed set of machine-readable control-plane error identifiers.",
       "enum": [
@@ -250,6 +347,17 @@
         "unavailable"
       ],
       "type": "string"
+    },
+    "DetachBody": {
+      "properties": {
+        "client_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "client_id"
+      ],
+      "type": "object"
     },
     "DispatchPutReq": {
       "description": "The `dispatches.put` verb payload (THE-57): one row appended to the roster.\n\nThe four pipeline fields (v56) are optional and default-absent, so a caller written against the three-string version keeps working unchanged. `put` carries them all: the roster gains columns, not verbs — there is deliberately no `dispatches.update`, because a mutable stage field invites thegn to become the thing that advances it.",
@@ -301,6 +409,18 @@
         "agent_name",
         "issue_id",
         "worktree_path"
+      ],
+      "type": "object"
+    },
+    "DispatchStatusBody": {
+      "properties": {
+        "status": {
+          "description": "A member of the closed dispatch-status set (snake_case).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "status"
       ],
       "type": "object"
     },
@@ -357,6 +477,32 @@
         "code",
         "error"
       ],
+      "type": "object"
+    },
+    "EventsQuery": {
+      "description": "The broadcast event feed over WebSocket: one binary message per encoded [`EventFrame`]. Read scope.",
+      "properties": {
+        "kinds": {
+          "description": "Comma-separated [`thegn_core::control_wire::OBSERVER_KINDS`].",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "session": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "signal_lag": {
+          "description": "`1`, `true`, `0`, or `false`; omitted means false.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
       "type": "object"
     },
     "FeedFilter": {
@@ -460,6 +606,98 @@
       ],
       "type": "object"
     },
+    "InputBody": {
+      "properties": {
+        "b64": {
+          "description": "Raw bytes, base64. Exactly one of `b64`/`text` must be present.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "enter": {
+          "default": false,
+          "description": "Append a carriage return (send-and-run).",
+          "type": "boolean"
+        },
+        "text": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "IssueBody": {
+      "properties": {
+        "label": {
+          "default": "",
+          "type": "string"
+        },
+        "scope": {
+          "default": "read",
+          "type": "string"
+        },
+        "ttl_secs": {
+          "description": "Code lifetime; `None` ⇒ 15 minutes.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "IssuesQuery": {
+      "description": "Query params for `issues.list` — a subset of `IssueFilter` a supervisor filters a batch by. Statuses is a comma-separated list of the snake_case status ids (`todo,in_progress`); unknown names are dropped.",
+      "properties": {
+        "limit": {
+          "default": null,
+          "format": "uint",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "project": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "query": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "MergeBody": {
+      "description": "POST body for the merge add/clear verbs — scoped to one worktree's repo.",
+      "properties": {
+        "worktree": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "worktree"
+      ],
+      "type": "object"
+    },
     "OpenSpec": {
       "description": "What to run when opening a fresh session.\n\n`Default` exists so callers can spread `..Default::default()` and pick up new optional fields without a construction-site sweep — the three added for agent launch cost exactly that sweep, and there will be more.",
       "properties": {
@@ -548,6 +786,38 @@
         "argv",
         "cols",
         "rows"
+      ],
+      "type": "object"
+    },
+    "OpenWorktreeBody": {
+      "properties": {
+        "branch": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "repo": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "repo"
+      ],
+      "type": "object"
+    },
+    "PairBody": {
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "label": {
+          "default": "",
+          "type": "string"
+        }
+      },
+      "required": [
+        "code"
       ],
       "type": "object"
     },
@@ -805,6 +1075,25 @@
       ],
       "type": "object"
     },
+    "ResizeBody": {
+      "properties": {
+        "cols": {
+          "format": "uint16",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "rows": {
+          "format": "uint16",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "cols",
+        "rows"
+      ],
+      "type": "object"
+    },
     "SessionInfo": {
       "description": "One daemon-owned session (= one PTY + emulator). The compositor's tab/pane layout stays client-side; the daemon's registry is flat.\n\n`Default` is for construction sites (mostly tests) that care about a few fields — see the note on [`OpenSpec`].",
       "properties": {
@@ -1057,6 +1346,59 @@
       ],
       "type": "object"
     },
+    "SplitBody": {
+      "properties": {
+        "argv": {
+          "default": [],
+          "description": "Program for the new pane; a login shell when empty.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "cols": {
+          "default": 0,
+          "format": "uint16",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "cwd": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "dir": {
+          "$ref": "#/definitions/SplitDir",
+          "default": "right"
+        },
+        "env": {
+          "default": [],
+          "items": {
+            "items": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "string"
+              }
+            ],
+            "maxItems": 2,
+            "minItems": 2,
+            "type": "array"
+          },
+          "type": "array"
+        },
+        "rows": {
+          "default": 0,
+          "format": "uint16",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
     "SplitDir": {
       "description": "Where a `split` places the new pane relative to the target session. Mirrors the compositor's `center::Dir`; the wire type lives here so `thegn-svc` does not depend on `thegn-host`.",
       "oneOf": [
@@ -1075,6 +1417,24 @@
           "type": "string"
         }
       ]
+    },
+    "StageBody": {
+      "properties": {
+        "paths": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "worktree": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "paths",
+        "worktree"
+      ],
+      "type": "object"
     },
     "ToolRunRequest": {
       "description": "Name-only configured-tool request. The daemon resolves the command, sandbox, environment, and resource limits from its trusted config.",
@@ -1102,6 +1462,26 @@
       },
       "required": [
         "name"
+      ],
+      "type": "object"
+    },
+    "WaitBody": {
+      "properties": {
+        "condition": {
+          "$ref": "#/definitions/WaitCondition"
+        },
+        "timeout_ms": {
+          "default": null,
+          "description": "Milliseconds before giving up (`matched=false`). Omit to wait forever.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "condition"
       ],
       "type": "object"
     },
@@ -1273,6 +1653,17 @@
         "created_at",
         "path",
         "repo_root"
+      ],
+      "type": "object"
+    },
+    "WorktreeQuery": {
+      "properties": {
+        "worktree": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "worktree"
       ],
       "type": "object"
     }
@@ -1540,8 +1931,14 @@
     }
   ],
   "types": {
+    "AgentSessionsQuery": {
+      "$ref": "#/definitions/AgentSessionsQuery"
+    },
     "AttachKind": {
       "$ref": "#/definitions/AttachKind"
+    },
+    "AttachQuery": {
+      "$ref": "#/definitions/AttachQuery"
     },
     "AutomationOrigin": {
       "$ref": "#/definitions/AutomationOrigin"
@@ -1555,20 +1952,38 @@
     "AutomationTestRequest": {
       "$ref": "#/definitions/AutomationTestRequest"
     },
+    "CalendarQuery": {
+      "$ref": "#/definitions/CalendarQuery"
+    },
     "CiLogsReply": {
       "$ref": "#/definitions/CiLogsReply"
     },
     "CiRunsReply": {
       "$ref": "#/definitions/CiRunsReply"
     },
+    "CommentBody": {
+      "$ref": "#/definitions/CommentBody"
+    },
+    "CommitBody": {
+      "$ref": "#/definitions/CommitBody"
+    },
+    "DetachBody": {
+      "$ref": "#/definitions/DetachBody"
+    },
     "DispatchPutReq": {
       "$ref": "#/definitions/DispatchPutReq"
+    },
+    "DispatchStatusBody": {
+      "$ref": "#/definitions/DispatchStatusBody"
     },
     "EditorOpenRequest": {
       "$ref": "#/definitions/EditorOpenRequest"
     },
     "ErrorBody": {
       "$ref": "#/definitions/ErrorBody"
+    },
+    "EventsQuery": {
+      "$ref": "#/definitions/EventsQuery"
     },
     "FeedFilter": {
       "$ref": "#/definitions/FeedFilter"
@@ -1579,8 +1994,26 @@
     "GitFileStatus": {
       "$ref": "#/definitions/GitFileStatus"
     },
+    "InputBody": {
+      "$ref": "#/definitions/InputBody"
+    },
+    "IssueBody": {
+      "$ref": "#/definitions/IssueBody"
+    },
+    "IssuesQuery": {
+      "$ref": "#/definitions/IssuesQuery"
+    },
+    "MergeBody": {
+      "$ref": "#/definitions/MergeBody"
+    },
     "OpenSpec": {
       "$ref": "#/definitions/OpenSpec"
+    },
+    "OpenWorktreeBody": {
+      "$ref": "#/definitions/OpenWorktreeBody"
+    },
+    "PairBody": {
+      "$ref": "#/definitions/PairBody"
     },
     "PrStatusRow": {
       "$ref": "#/definitions/PrStatusRow"
@@ -1600,6 +2033,9 @@
     "RecordStatus": {
       "$ref": "#/definitions/RecordStatus"
     },
+    "ResizeBody": {
+      "$ref": "#/definitions/ResizeBody"
+    },
     "SessionInfo": {
       "$ref": "#/definitions/SessionInfo"
     },
@@ -1612,11 +2048,20 @@
     "SkillsList": {
       "$ref": "#/definitions/SkillsList"
     },
+    "SplitBody": {
+      "$ref": "#/definitions/SplitBody"
+    },
     "SplitDir": {
       "$ref": "#/definitions/SplitDir"
     },
+    "StageBody": {
+      "$ref": "#/definitions/StageBody"
+    },
     "ToolRunRequest": {
       "$ref": "#/definitions/ToolRunRequest"
+    },
+    "WaitBody": {
+      "$ref": "#/definitions/WaitBody"
     },
     "WaitCondition": {
       "$ref": "#/definitions/WaitCondition"
@@ -1629,6 +2074,9 @@
     },
     "WorktreeInfo": {
       "$ref": "#/definitions/WorktreeInfo"
+    },
+    "WorktreeQuery": {
+      "$ref": "#/definitions/WorktreeQuery"
     }
   },
   "version": "1"
