@@ -6,10 +6,11 @@
 //! across frames, per `detail.rs`'s founding invariant.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use chrono::{NaiveDate, Weekday};
 use chrono_tz::Tz;
-use thegn_core::calendar::{CalEvent, ResolvedClock};
+use thegn_core::calendar::{CalEvent, ExpansionError, ResolvedClock};
 use thegn_core::config_calendar::CalendarConfig;
 
 /// Display settings the popup reads, already resolved out of `auto`.
@@ -25,6 +26,67 @@ pub struct CalUiCfg {
     /// Whether any event source is configured at all. With none, the agenda
     /// block is suppressed entirely rather than showing a permanent "no events".
     pub has_sources: bool,
+}
+
+/// Why a calendar month (or reminder pass) is unavailable or incomplete —
+/// the VIEW's health, distinct from `thegn_svc::calendar::CalendarError`,
+/// which is a provider/transport failure. Fixed labels only, never provider
+/// content, so it is safe to show and log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CalendarViewError {
+    /// The cache could not be opened or queried.
+    CacheUnavailable,
+    /// Some cached rows could not be decoded; the rest are shown.
+    MalformedCache,
+    /// Expansion refused (budget, invalid span/window, arithmetic).
+    Expansion(ExpansionError),
+}
+
+impl CalendarViewError {
+    /// Whether the view still carries the readable data (incomplete) rather
+    /// than having none at all (unavailable).
+    pub fn is_partial(&self) -> bool {
+        matches!(self, Self::MalformedCache)
+    }
+}
+
+impl std::fmt::Display for CalendarViewError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CacheUnavailable => f.write_str("calendar cache unavailable"),
+            Self::MalformedCache => f.write_str("calendar cache contains unreadable rows"),
+            Self::Expansion(error) => error.fmt(f),
+        }
+    }
+}
+
+/// Fold one delivered month into a snapshot (the docs cache or an open popup).
+///
+/// Events land only when the month was actually produced, and only then is
+/// it marked loaded — so a failed FIRST load stays "unavailable" instead of
+/// reading as a successful empty month, and a failed REFRESH keeps the last
+/// valid snapshot. The error is recorded alongside and cleared by the next
+/// complete delivery.
+pub(crate) fn fold_month(
+    events: &mut BTreeMap<NaiveDate, Vec<Arc<CalEvent>>>,
+    loaded: &mut BTreeSet<(i32, u32)>,
+    errors: &mut BTreeMap<(i32, u32), CalendarViewError>,
+    payload: &crate::detail::CalendarPayload,
+) {
+    if let Some(month) = &payload.events {
+        for (date, evs) in month {
+            events.insert(*date, evs.clone());
+        }
+        loaded.insert(payload.month);
+    }
+    match payload.error {
+        Some(error) => {
+            errors.insert(payload.month, error);
+        }
+        None => {
+            errors.remove(&payload.month);
+        }
+    }
 }
 
 /// The `[weather]` knobs the popup's WEATHER block needs: the two staleness
@@ -76,10 +138,14 @@ pub struct CalendarDocs {
     /// The zone day boundaries and clock deltas are measured against.
     pub home: Tz,
     /// Cached events bucketed by the date they occupy, in `home`.
-    pub events: BTreeMap<NaiveDate, Vec<CalEvent>>,
+    pub events: BTreeMap<NaiveDate, Vec<Arc<CalEvent>>>,
     /// Months whose events are known. A month outside this set still paints its
     /// grid instantly — with blank markers and a "loading" agenda.
     pub loaded: BTreeSet<(i32, u32)>,
+    /// Expansion failures are kept separately from loaded data so a failed
+    /// refresh cannot turn a first load into a successful empty calendar or
+    /// erase the last valid snapshot.
+    pub errors: BTreeMap<(i32, u32), CalendarViewError>,
 }
 
 impl Default for CalendarDocs {
@@ -90,6 +156,7 @@ impl Default for CalendarDocs {
             home: Tz::UTC,
             events: BTreeMap::new(),
             loaded: BTreeSet::new(),
+            errors: BTreeMap::new(),
         }
     }
 }
@@ -130,6 +197,7 @@ impl CalendarDocs {
             home,
             events: BTreeMap::new(),
             loaded: BTreeSet::new(),
+            errors: BTreeMap::new(),
         }
     }
 
@@ -145,11 +213,98 @@ impl CalendarDocs {
         None
     }
 
-    /// Fold a fetched month into the cache.
-    pub fn merge(&mut self, month: (i32, u32), events: &[(NaiveDate, Vec<CalEvent>)]) {
-        for (date, evs) in events {
-            self.events.insert(*date, evs.clone());
+    /// Fold a fetched month into the cache (see [`fold_month`]).
+    pub fn merge(&mut self, payload: &crate::detail::CalendarPayload) {
+        fold_month(
+            &mut self.events,
+            &mut self.loaded,
+            &mut self.errors,
+            payload,
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::detail::CalendarPayload;
+    use chrono::NaiveDate;
+    use thegn_core::calendar::{EventTime, ExpansionLimit};
+
+    fn event() -> Arc<CalEvent> {
+        Arc::new(CalEvent::new(
+            "one",
+            "One",
+            EventTime::Date {
+                date: NaiveDate::from_ymd_opt(2026, 8, 21).unwrap(),
+            },
+            EventTime::Date {
+                date: NaiveDate::from_ymd_opt(2026, 8, 22).unwrap(),
+            },
+        ))
+    }
+
+    fn payload(
+        events: Option<Vec<(NaiveDate, Vec<Arc<CalEvent>>)>>,
+        error: Option<CalendarViewError>,
+    ) -> CalendarPayload {
+        CalendarPayload {
+            month: (2026, 8),
+            events,
+            error,
         }
-        self.loaded.insert(month);
+    }
+
+    #[test]
+    fn first_load_error_is_not_a_successful_empty_month() {
+        let month = (2026, 8);
+        let mut docs = CalendarDocs::default();
+        let error =
+            CalendarViewError::Expansion(ExpansionError::Budget(ExpansionLimit::BucketEntries));
+        docs.merge(&payload(None, Some(error)));
+        assert!(!docs.loaded.contains(&month));
+        assert_eq!(docs.errors.get(&month), Some(&error));
+        assert!(docs.events.is_empty());
+    }
+
+    #[test]
+    fn failed_refresh_keeps_last_good_snapshot_and_success_clears_status() {
+        let month = (2026, 8);
+        let date = NaiveDate::from_ymd_opt(2026, 8, 21).unwrap();
+        let mut docs = CalendarDocs::default();
+        docs.merge(&payload(Some(vec![(date, vec![event()])]), None));
+        let prior = Arc::clone(&docs.events[&date][0]);
+
+        let failed = CalendarViewError::Expansion(ExpansionError::InvalidSpan);
+        docs.merge(&payload(None, Some(failed)));
+        assert!(docs.loaded.contains(&month));
+        assert!(
+            Arc::ptr_eq(&docs.events[&date][0], &prior),
+            "last good kept"
+        );
+        assert_eq!(docs.errors.get(&month), Some(&failed));
+
+        docs.merge(&payload(Some(Vec::new()), None));
+        assert!(docs.loaded.contains(&month));
+        assert!(!docs.errors.contains_key(&month));
+    }
+
+    #[test]
+    fn an_incomplete_month_is_loaded_and_flagged() {
+        let month = (2026, 8);
+        let date = NaiveDate::from_ymd_opt(2026, 8, 21).unwrap();
+        let mut docs = CalendarDocs::default();
+        docs.merge(&payload(
+            Some(vec![(date, vec![event()])]),
+            Some(CalendarViewError::MalformedCache),
+        ));
+        assert!(docs.loaded.contains(&month));
+        assert_eq!(docs.events[&date].len(), 1);
+        assert!(docs.errors[&month].is_partial());
+        assert!(!CalendarViewError::CacheUnavailable.is_partial());
+        assert_eq!(
+            CalendarViewError::MalformedCache.to_string(),
+            "calendar cache contains unreadable rows"
+        );
     }
 }

@@ -1974,12 +1974,12 @@ fn the_agenda_hit_test_still_finds_the_agenda() {
     docs.loaded.insert((today.year(), today.month()));
     docs.events.insert(
         today,
-        vec![CalEvent::new(
+        vec![std::sync::Arc::new(CalEvent::new(
             "1",
             "standup",
             EventTime::Date { date: today },
             EventTime::Date { date: today },
-        )],
+        ))],
     );
     let ctx = StatusCtx {
         cal: &docs,

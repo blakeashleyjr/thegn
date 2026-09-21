@@ -7,6 +7,7 @@
 //! for a "10 minutes before" reminder.
 
 use chrono::{DateTime, Utc};
+use std::sync::Arc;
 
 use super::{CalEvent, GapPolicy};
 
@@ -56,6 +57,44 @@ pub fn due(
     last_checked_ms: i64,
     now_ms: i64,
 ) -> Vec<DueReminder> {
+    due_refs(
+        events.iter(),
+        home,
+        default_reminders,
+        last_checked_ms,
+        now_ms,
+    )
+}
+
+/// Evaluate the unique occurrence list from [`super::ExpandedCalendar`]. The
+/// month buckets intentionally are not accepted here: a multi-day event has
+/// one reminder identity, not one identity per occupied day.
+pub fn due_shared(
+    events: &[Arc<CalEvent>],
+    home: chrono_tz::Tz,
+    default_reminders: &[super::Reminder],
+    last_checked_ms: i64,
+    now_ms: i64,
+) -> Vec<DueReminder> {
+    due_refs(
+        events.iter().map(|event| event.as_ref()),
+        home,
+        default_reminders,
+        last_checked_ms,
+        now_ms,
+    )
+}
+
+fn due_refs<'a, I>(
+    events: I,
+    home: chrono_tz::Tz,
+    default_reminders: &[super::Reminder],
+    last_checked_ms: i64,
+    now_ms: i64,
+) -> Vec<DueReminder>
+where
+    I: IntoIterator<Item = &'a CalEvent>,
+{
     // A backwards or absurd window (a suspend/resume, a wall-clock jump) would
     // otherwise replay hours of reminders at once. Clamp to one hour of
     // catch-up: anything older has stopped being worth raising.

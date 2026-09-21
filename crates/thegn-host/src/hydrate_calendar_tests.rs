@@ -150,7 +150,7 @@ fn an_incremental_page_applies_deltas_and_tombstones() {
         from,
         to,
     );
-    let cached = load_cached(&t.db, from, to);
+    let cached = load_cached(&t.db, from, to).unwrap().events;
     assert_eq!(cached.len(), 2);
 
     // A token makes it incremental: `a` is updated, `b` deleted, and the rest
@@ -165,7 +165,7 @@ fn an_incremental_page_applies_deltas_and_tombstones() {
         from,
         to,
     );
-    let cached = load_cached(&t.db, from, to);
+    let cached = load_cached(&t.db, from, to).unwrap().events;
     assert_eq!(cached.len(), 1);
     assert_eq!(cached[0].title, "renamed");
     assert_eq!(
@@ -196,7 +196,7 @@ fn a_full_fetch_replaces_rather_than_merging() {
         from,
         to,
     );
-    let cached = load_cached(&t.db, from, to);
+    let cached = load_cached(&t.db, from, to).unwrap().events;
     assert_eq!(cached.len(), 1);
     assert_eq!(cached[0].uid, "c");
 }
@@ -220,7 +220,9 @@ fn a_recurrence_master_is_flagged_so_the_range_query_keeps_it() {
     );
     // A window years away still returns the master — its old DTSTART generates
     // today's occurrences — but not the one-shot.
-    let far = load_cached(&t.db, d(2030, 1, 1), d(2030, 1, 31));
+    let far = load_cached(&t.db, d(2030, 1, 1), d(2030, 1, 31))
+        .unwrap()
+        .events;
     assert_eq!(far.len(), 1);
     assert_eq!(far[0].uid, "weekly");
 }
@@ -250,9 +252,16 @@ fn an_undeserializable_row_is_skipped_not_fatal() {
         }],
     )
     .unwrap();
-    let cached = load_cached(&t.db, from, to);
-    assert_eq!(cached.len(), 1);
-    assert_eq!(cached[0].uid, "good");
+    let cached = load_cached(&t.db, from, to).unwrap();
+    assert_eq!(cached.events.len(), 1);
+    assert_eq!(cached.events[0].uid, "good");
+    // ...but the loss is counted, so the month is flagged incomplete rather
+    // than presented as the whole calendar.
+    assert_eq!(cached.skipped, 1);
+    let view = expand_month(&t.db, from, to, chrono_tz::Tz::UTC);
+    assert_eq!(view.error, Some(CalendarViewError::MalformedCache));
+    let events = view.events.expect("the readable rows still show");
+    assert_eq!(events.len(), 1);
 }
 
 #[test]
@@ -339,17 +348,205 @@ fn an_empty_full_fetch_also_throttles_its_retry() {
     assert!(t.db.has_calendar_events("work").unwrap());
 }
 
+fn reminder_window(generation: u64, from_ms: i64, to_ms: i64) -> ReminderWindow {
+    ReminderWindow {
+        generation,
+        from_ms,
+        to_ms,
+    }
+}
+
+fn reminder_cfg() -> CalendarConfig {
+    CalendarConfig {
+        enabled: true,
+        reminders_enabled: true,
+        home_zone: "UTC".into(),
+        accounts: vec![thegn_core::config_calendar::CalendarAccount {
+            name: "work".into(),
+            provider: thegn_core::config_calendar::CalendarProviderKind::Ics,
+            enabled: true,
+            ..Default::default()
+        }],
+        ..CalendarConfig::default()
+    }
+}
+
+fn utc_ms(y: i32, m: u32, day: u32, h: u32, mi: u32) -> i64 {
+    d(y, m, day)
+        .and_hms_opt(h, mi, 0)
+        .unwrap()
+        .and_utc()
+        .timestamp_millis()
+}
+
 #[test]
 fn reminders_are_inert_without_configuration() {
     // No accounts, or the switch off, must cost nothing at all — the reminder
     // slot rides the ticker and runs unconditionally.
+    let t = TmpDb::new("rem-inert");
     let off = CalendarConfig {
         reminders_enabled: false,
-        ..CalendarConfig::default()
+        ..reminder_cfg()
     };
-    assert!(due_reminders(&off, 0).is_empty());
+    let w = reminder_window(0, 0, utc_ms(2026, 8, 21, 9, 0));
+    assert!(due_reminders(&t.db, &off, w).unwrap().reminders.is_empty());
     let no_sources = CalendarConfig::default();
-    assert!(due_reminders(&no_sources, 0).is_empty());
+    assert!(!reminders_configured(&no_sources));
+    assert!(
+        due_reminders(&t.db, &no_sources, w)
+            .unwrap()
+            .reminders
+            .is_empty()
+    );
+}
+
+#[test]
+fn a_multi_day_event_raises_one_reminder_for_exactly_the_given_window() {
+    let t = TmpDb::new("rem-multiday");
+    let mut trip = CalEvent::new(
+        "trip",
+        "Trip",
+        EventTime::Zoned {
+            local: d(2026, 8, 20).and_hms_opt(9, 0, 0).unwrap(),
+            zone: TzRef::new("UTC"),
+        },
+        EventTime::Zoned {
+            local: d(2026, 8, 22).and_hms_opt(17, 0, 0).unwrap(),
+            zone: TzRef::new("UTC"),
+        },
+    );
+    trip.reminders = vec![thegn_core::calendar::Reminder { minutes_before: 10 }];
+    apply_page(
+        &t.db,
+        "work",
+        "ics",
+        &page(vec![trip], vec![], ""),
+        d(2026, 8, 1),
+        d(2026, 8, 31),
+    );
+    let cfg = reminder_cfg();
+    // The trigger (08:50) is inside the supplied window: exactly one reminder,
+    // although the occurrence occupies three day buckets.
+    let hit = reminder_window(3, utc_ms(2026, 8, 20, 8, 49), utc_ms(2026, 8, 20, 8, 51));
+    let due = due_reminders(&t.db, &cfg, hit).unwrap();
+    assert_eq!(due.reminders.len(), 1, "{:?}", due.reminders);
+    assert_eq!(due.skipped, 0);
+    // The window's END is the one the caller supplied, not a fresh clock
+    // reading: a window ending just before the trigger raises nothing.
+    let before = reminder_window(4, utc_ms(2026, 8, 20, 8, 40), utc_ms(2026, 8, 20, 8, 49));
+    assert!(
+        due_reminders(&t.db, &cfg, before)
+            .unwrap()
+            .reminders
+            .is_empty()
+    );
+}
+
+#[test]
+fn one_malformed_row_costs_itself_not_the_month_or_every_reminder() {
+    // The bad row stays in the cache, so failing the whole evaluation would
+    // re-fail identically on every tick: reminders would stop for good.
+    let t = TmpDb::new("rem-invalid");
+    let mut bad = event("inverted");
+    std::mem::swap(&mut bad.start, &mut bad.end);
+    bad.reminders = vec![thegn_core::calendar::Reminder { minutes_before: 10 }];
+    let mut good = event("good");
+    good.reminders = vec![thegn_core::calendar::Reminder { minutes_before: 10 }];
+    let (from, to) = window();
+    apply_page(
+        &t.db,
+        "work",
+        "ics",
+        &page(vec![good, bad], vec![], ""),
+        from,
+        to,
+    );
+    let w = reminder_window(0, utc_ms(2026, 8, 21, 8, 49), utc_ms(2026, 8, 21, 8, 51));
+    let due = due_reminders(&t.db, &reminder_cfg(), w).unwrap();
+    assert_eq!(due.reminders.len(), 1, "the good event still fires");
+    // The cached row carries no SourceId (the account is the DB key).
+    assert_eq!(due.reminders[0].event_id, "/good");
+    assert_eq!(due.skipped, 1, "and the loss is reported");
+
+    // The month shows the readable events, marked incomplete — not blanked.
+    let view = expand_month(&t.db, from, to, chrono_tz::Tz::UTC);
+    assert_eq!(view.error, Some(CalendarViewError::MalformedCache));
+    let events = view.events.expect("the readable rows still show");
+    assert!(
+        events
+            .iter()
+            .any(|(_, evs)| evs.iter().any(|e| e.uid == "good"))
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|(_, evs)| evs.iter().any(|e| e.uid == "inverted"))
+    );
+}
+
+#[test]
+fn the_reminder_cursor_advances_only_on_a_current_success() {
+    let mut c = ReminderCursor::new(1_000);
+    let w = c.begin(2_000).expect("nothing in flight");
+    assert_eq!((w.from_ms, w.to_ms), (1_000, 2_000));
+    // One evaluation at a time.
+    assert_eq!(c.begin(3_000), None);
+
+    // Failure: the cursor stays put and the SAME start is retried.
+    let failed = ReminderOutcome::Failed(CalendarViewError::CacheUnavailable);
+    assert!(c.finish(w, failed));
+    assert_eq!(c.last_checked_ms(), 1_000);
+    let retry = c.begin(3_000).unwrap();
+    assert_eq!((retry.from_ms, retry.to_ms), (1_000, 3_000));
+    assert_ne!(retry.generation, w.generation);
+
+    // A stale acknowledgment for the old window neither clears the new one
+    // nor moves the cursor.
+    assert!(!c.finish(w, ReminderOutcome::Complete));
+    assert_eq!(c.last_checked_ms(), 1_000);
+    assert_eq!(c.begin(4_000), None, "the retry is still in flight");
+
+    // Success advances to exactly the acknowledged window's end.
+    assert!(c.finish(retry, ReminderOutcome::Complete));
+    assert_eq!(c.last_checked_ms(), 3_000);
+    // A replayed acknowledgment is ignored.
+    assert!(!c.finish(retry, ReminderOutcome::Complete));
+
+    // An incomplete (unreadable rows) evaluation still completes its window.
+    let w = c.begin(5_000).unwrap();
+    assert!(c.finish(
+        w,
+        ReminderOutcome::Incomplete(CalendarViewError::MalformedCache)
+    ));
+    assert_eq!(c.last_checked_ms(), 5_000);
+
+    // A completion can never move the cursor backwards (clock jump).
+    let w = c.begin(4_500).unwrap();
+    assert!(c.finish(w, ReminderOutcome::Complete));
+    assert_eq!(c.last_checked_ms(), 5_000);
+}
+
+#[test]
+fn an_undispatched_or_skipped_reminder_window_is_not_lost() {
+    let mut c = ReminderCursor::new(1_000);
+    let w = c.begin(2_000).unwrap();
+    // The lane was full: forget the window, keep the cursor.
+    c.abandon(w);
+    assert_eq!(c.last_checked_ms(), 1_000);
+    let again = c.begin(2_500).unwrap();
+    assert_eq!(again.from_ms, 1_000);
+    // A skip (nothing configured) never races an in-flight window...
+    c.skip(9_000);
+    assert_eq!(c.last_checked_ms(), 1_000);
+    c.abandon(again);
+    // ...and otherwise completes trivially.
+    c.skip(9_000);
+    assert_eq!(c.last_checked_ms(), 9_000);
+    // Abandoning a window that is not in flight is a no-op.
+    let w = c.begin(9_500).unwrap();
+    c.abandon(again);
+    assert_eq!(c.begin(9_600), None);
+    assert!(c.finish(w, ReminderOutcome::Complete));
 }
 
 #[test]
@@ -400,6 +597,8 @@ fn an_over_budget_source_keeps_the_prior_cache_and_cursor() {
     }));
     assert_eq!(toasts.len(), 1, "{toasts:?}");
     let mut uids: Vec<_> = load_cached(&t.db, from, to)
+        .unwrap()
+        .events
         .into_iter()
         .map(|e| e.uid)
         .collect();
@@ -415,7 +614,7 @@ fn an_over_budget_source_keeps_the_prior_cache_and_cursor() {
         ..cfg
     };
     assert!(sync_accounts(&t.db, &cfg, from, to, true, &mut |_| {}));
-    assert_eq!(load_cached(&t.db, from, to).len(), 5);
+    assert_eq!(load_cached(&t.db, from, to).unwrap().events.len(), 5);
 }
 
 #[test]
