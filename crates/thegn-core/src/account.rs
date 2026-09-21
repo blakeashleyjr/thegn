@@ -545,6 +545,9 @@ mod tests {
     #[test]
     fn active_name_precedence() {
         let db = Db::open_memory().unwrap();
+        // The tab slug is resolved through the registry, so the scope has to
+        // be a registered repository (THE-515) — its directory name is the key.
+        db.slug_for_repo("/src/repo", "repo").unwrap();
         let mut cfg = Config::default();
         cfg.workspace.entry("repo".into()).or_default();
         // Nothing set anywhere.

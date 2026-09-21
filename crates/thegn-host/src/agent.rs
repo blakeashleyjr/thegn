@@ -3877,7 +3877,16 @@ pub(crate) fn credential_overlay_gate(
     slug: &str,
     choice: &str,
 ) -> anyhow::Result<()> {
-    if thegn_core::account::provider_for(cfg, choice).is_none() {
+    // Every configured `[[agents]]`/`[[tools]]` entry, not only the ones whose
+    // program maps to a known account provider: `env_bundle` redirects HOME for
+    // ANY of them, which is exactly the credential the refused block pinned. A
+    // choice that is not a configured entry (a shell) always launches.
+    let configured = cfg
+        .agents
+        .iter()
+        .chain(cfg.tools.iter())
+        .any(|entry| entry.name == choice);
+    if !configured {
         return Ok(());
     }
     if let thegn_core::workspace_overlay::WorkspaceOverlay::Refused(refusal) =
@@ -3891,8 +3900,7 @@ pub(crate) fn credential_overlay_gate(
             }
             | thegn_core::workspace_overlay::OverlayRefusal::AmbiguousRepositories {
                 key, ..
-            }
-            | thegn_core::workspace_overlay::OverlayRefusal::RegistryUnavailable { key } => key,
+            } => key,
         };
         if thegn_core::workspace_overlay::candidates_carry_credentials(&cfg.workspace, key) {
             anyhow::bail!("agent launch refused: {refusal}");

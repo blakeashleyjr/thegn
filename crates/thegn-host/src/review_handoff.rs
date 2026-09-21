@@ -212,7 +212,14 @@ pub(crate) fn dispatch(
             model.status = "review handoff queued for verification".into();
         }
         PaneTarget::None => {
-            model.status = "no live agent pane or configured headless agent".into();
+            // Name the refusal rather than claiming nothing is configured.
+            model.status = match session
+                .repo_root()
+                .and_then(|root| cfg.workspace_overlay_refusal(root))
+            {
+                Some(refusal) => format!("review handoff refused: {refusal}"),
+                None => "no live agent pane or configured headless agent".into(),
+            };
         }
     }
 }

@@ -74,6 +74,32 @@ pub fn expand_tilde(p: &str) -> String {
 }
 
 /// lowercase, non-alnum -> '-', collapse repeats, trim.
+/// A filesystem IDENTITY for `path`: two spellings of the same file (symlink,
+/// bind mount, `/tmp` vs `/private/tmp`, a case-insensitive mount) share it,
+/// two different files never do. `None` when the path cannot be stat'd.
+///
+/// Canonical paths are not enough: a bind mount resolves to a different
+/// canonical path for the same inode, so identity has to come from the
+/// filesystem. Unix uses `(st_dev, st_ino)`; elsewhere the canonical path is
+/// the best available approximation.
+pub fn file_identity(path: &std::path::Path) -> Option<String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::metadata(path).ok()?;
+        Some(format!("{:x}:{:x}", meta.dev(), meta.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        Some(
+            std::fs::canonicalize(path)
+                .ok()?
+                .to_string_lossy()
+                .into_owned(),
+        )
+    }
+}
+
 pub fn slugify(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut prev_dash = false;
