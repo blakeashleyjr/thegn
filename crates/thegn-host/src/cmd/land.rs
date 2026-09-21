@@ -38,6 +38,11 @@ pub(crate) fn land_branch(
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .with_context(|| format!("{}: not on a branch (detached HEAD?)", worktree.display()))?;
+    // THE-515: a refused (ambiguous) trusted overlay must not degrade to the
+    // global gate on the one path that forces auto_land on below.
+    if let Some(refusal) = cfg.workspace_overlay_refusal(&root) {
+        anyhow::bail!("{}: {refusal}", root.display());
+    }
     // This IS the manual land, so force it on regardless of queue policy.
     let mut mq = cfg.repo_merge_queue(&root);
     mq.auto_land = true;

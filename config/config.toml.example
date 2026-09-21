@@ -1137,6 +1137,13 @@ crash_sink = ""           # RESERVED: external Sentry-protocol forwarding is not
 # Per-project overrides, keyed by repo slug (the project tab prefix). Applied
 # above [keybinds] but below a repo-root `.thegn.{toml,yaml,json}` overlay,
 # which may also carry its own [keybinds] table — the most specific layer wins.
+# The key must be the normalized slug of the repo's directory name (lowercase
+# ASCII letters/digits and single dashes: `My_Repo` -> `my-repo`). A key in any
+# other spelling, or two keys normalizing to the same slug, is a validation
+# error and the block is refused (none of it applies; that repo's merge/PR
+# queues, CI autofix and autopilot are held off) until fixed. A repo whose name
+# has no slug gets no project block. Same-named clones still share a block
+# until it is bound to the canonical repository identity (THE-515).
 # [project.my-repo.keybinds]
 # new-worktree = "Alt w"
 # [project.my-repo.ci]

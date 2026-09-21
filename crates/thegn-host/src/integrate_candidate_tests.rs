@@ -486,3 +486,46 @@ fn first_snapshot_hook_cannot_replace_later_git_identity_and_readmit_it() {
     assert_eq!(std::fs::read(original).unwrap(), gitfile_before);
     assert!(!replacement.exists());
 }
+
+#[test]
+fn ui_fold_refuses_an_ambiguous_trusted_overlay_without_landing() {
+    // THE-515: the in-app Integrate action is armed on the GLOBAL flag and
+    // this shared entry lands even with auto_land off, so the refusal must be
+    // enforced here — not only in the CLI wrapper.
+    let mut f = Fixture::new();
+    f.config.workspace.insert(
+        "repo".into(),
+        thegn_core::config::WorkspaceConfig::default(),
+    );
+    f.config.workspace.insert(
+        "Repo".into(),
+        thegn_core::config::WorkspaceConfig::default(),
+    );
+    let queued_head = git(&f.queued, &["rev-parse", "HEAD"]);
+    let main_before = git(&f.repo, &["rev-parse", "main"]);
+    let rows = f.db.list_merge_queue().unwrap();
+    let error = fold_active_repo(&f.config, &f.repo)
+        .expect_err("an ambiguous trusted overlay must refuse the fold");
+    assert!(format!("{error:#}").contains("refused"), "{error:#}");
+    assert_eq!(git(&f.queued, &["rev-parse", "HEAD"]), queued_head);
+    assert_eq!(git(&f.repo, &["rev-parse", "main"]), main_before);
+    assert_eq!(f.db.list_merge_queue().unwrap(), rows);
+}
+
+#[test]
+fn manual_land_refuses_an_ambiguous_trusted_overlay() {
+    let mut f = Fixture::new();
+    f.config.workspace.insert(
+        "repo".into(),
+        thegn_core::config::WorkspaceConfig::default(),
+    );
+    f.config.workspace.insert(
+        "REPO".into(),
+        thegn_core::config::WorkspaceConfig::default(),
+    );
+    let main_before = git(&f.repo, &["rev-parse", "main"]);
+    let error = crate::cmd::land::land_branch(&f.config, &f.queued)
+        .expect_err("an ambiguous trusted overlay must refuse the manual land");
+    assert!(format!("{error:#}").contains("refused"), "{error:#}");
+    assert_eq!(git(&f.repo, &["rev-parse", "main"]), main_before);
+}

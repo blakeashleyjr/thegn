@@ -332,5 +332,6 @@ pub mod viz;
 pub mod voice;
 pub mod weather;
 pub mod work;
+pub mod workspace_overlay;
 pub mod worktree;
 pub mod zone;

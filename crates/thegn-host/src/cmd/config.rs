@@ -198,6 +198,11 @@ fn explain(cfg: &Config, key: &str, repo: Option<String>, json: bool, path: Path
     let ws = repo_root
         .as_ref()
         .and_then(|root| workspace_layer(cfg, root, key));
+    // THE-515: an ambiguous trusted overlay is refused, never silently
+    // skipped — explain must say which block and why.
+    let refused = repo_root
+        .as_ref()
+        .and_then(|root| cfg.workspace_overlay_refusal(root));
     if json {
         let mut obj = serde_json::json!({
             "key": origin.key,
@@ -207,6 +212,9 @@ fn explain(cfg: &Config, key: &str, repo: Option<String>, json: bool, path: Path
             }),
             "cascade_value": origin.value,
         });
+        if let Some(refusal) = &refused {
+            obj["workspace_refused"] = serde_json::json!(refusal.to_string());
+        }
         if let Some(repo) = &repo {
             let (events, pending) = repo_clamp(cfg, repo, key);
             obj["clamped"] = serde_json::json!(events);
@@ -227,6 +235,9 @@ fn explain(cfg: &Config, key: &str, repo: Option<String>, json: bool, path: Path
     }
     for (layer, val) in &origin.trace {
         outln!("    {}: {val}", layer.as_str());
+    }
+    if let Some(refusal) = &refused {
+        outln!("  REFUSED {refusal}");
     }
     if let (Some((slug, v)), Some(root)) = (&ws, &repo_root) {
         outln!(
@@ -260,8 +271,13 @@ fn workspace_layer(
     repo_root: &std::path::Path,
     key: &str,
 ) -> Option<(String, serde_json::Value)> {
-    let slug = thegn_core::config::workspace_slug(repo_root);
-    let ws = cfg.workspace.get(&slug)?;
+    let thegn_core::workspace_overlay::WorkspaceOverlay::Selected {
+        key: slug,
+        overlay: ws,
+    } = cfg.workspace_overlay(repo_root)
+    else {
+        return None;
+    };
 
     // Each arm: the sub-key, whether this repo overlays that family at all, and
     // the resolved-vs-global pair to diff.
@@ -285,7 +301,7 @@ fn workspace_layer(
     };
 
     let v = resolved.get(sub)?;
-    (v != global.get(sub)?).then(|| (slug, v.clone()))
+    (v != global.get(sub)?).then(|| (slug.to_string(), v.clone()))
 }
 
 /// Repo-overlay clamp events + pending summaries filtered to a key prefix, using
@@ -622,6 +638,16 @@ mod tests {
         assert!(workspace_layer(&cfg, &repo, "pr_queue.own_prs_only").is_none());
         // ...and neither is a family outside the two carried here.
         assert!(workspace_layer(&cfg, &repo, "theme.accent").is_none());
+
+        // THE-515: a second block spelled `DataHub` makes the choice
+        // ambiguous — explain attributes nothing to either block and the
+        // refusal is reported instead of a first-match winner.
+        cfg.workspace
+            .insert("DataHub".into(), WorkspaceConfig::default());
+        assert!(workspace_layer(&cfg, &repo, "merge_queue.gate_command").is_none());
+        let refusal = cfg.workspace_overlay_refusal(&repo).expect("refused");
+        assert!(refusal.to_string().contains("`DataHub`"), "{refusal}");
+        assert!(!cfg.repo_merge_queue(&repo).enabled);
 
         let _ = std::fs::remove_dir_all(&dir); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }

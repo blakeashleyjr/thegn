@@ -3404,6 +3404,144 @@ fn repo_ci_uses_only_the_trusted_workspace_overlay() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+// --- THE-515: trusted overlay selection is unambiguous or refused ----------
+
+fn overlay_with_everything() -> WorkspaceConfig {
+    let mut ws = WorkspaceConfig {
+        merge_queue: MergeQueueOverlay {
+            gate_command: Some("overlay-gate".into()),
+            ..MergeQueueOverlay::default()
+        },
+        git: GitOverlay {
+            structural_diff: Some(StructuralDiff::Difft),
+            ..GitOverlay::default()
+        },
+        ci: CiAutofixOverlay {
+            mode: Some(CiAutofixMode::Auto),
+        },
+        sandbox_mounts: vec!["/overlay/mount".into()],
+        env_bundle: Some("overlay-bundle".into()),
+        ..WorkspaceConfig::default()
+    };
+    ws.pr_queue.enabled = Some(true);
+    ws.autopilot.enabled = Some(true);
+    ws.accounts
+        .insert("claude".into(), "overlay-account".into());
+    ws
+}
+
+#[test]
+fn overlay_key_is_pure_and_matches_the_legacy_slug_for_repo_roots() {
+    // No git, no filesystem: a root that does not exist still derives.
+    let root = std::path::Path::new("/nonexistent/thegn-515/Sage.DataHub");
+    let mut cfg = Config::default();
+    cfg.workspace
+        .insert("sage-datahub".into(), overlay_with_everything());
+    assert_eq!(cfg.repo_merge_queue(root).gate_command, "overlay-gate");
+    assert_eq!(cfg.repo_git(root).structural_diff, StructuralDiff::Difft);
+    // A bare repository's `.git` suffix is not part of the key.
+    let bare = std::path::Path::new("/nonexistent/thegn-515/sage.datahub.git");
+    assert_eq!(cfg.repo_merge_queue(bare).gate_command, "overlay-gate");
+}
+
+#[test]
+fn empty_repository_slug_no_longer_falls_back_to_the_repo_block() {
+    let mut cfg = Config::default();
+    cfg.workspace
+        .insert("repo".into(), overlay_with_everything());
+    for name in ["___", "日本語", ".git"] {
+        let root = std::path::Path::new("/nonexistent/thegn-515").join(name);
+        assert_eq!(
+            cfg.repo_merge_queue(&root).gate_command,
+            cfg.merge_queue.gate_command,
+            "{name} must not inherit [workspace.repo]"
+        );
+        assert!(cfg.workspace_overlay(&root).is_unconfigured(), "{name}");
+    }
+    // A repository literally named `repo` keeps its own block.
+    let repo = std::path::Path::new("/nonexistent/thegn-515/repo");
+    assert_eq!(cfg.repo_merge_queue(repo).gate_command, "overlay-gate");
+}
+
+#[test]
+fn ambiguous_overlay_keys_fail_closed_for_every_authority() {
+    let root = std::path::Path::new("/nonexistent/thegn-515/acme");
+    let mut cfg = Config::default();
+    cfg.merge_queue.enabled = true;
+    cfg.merge_queue.auto_land = true;
+    cfg.pr_queue.enabled = true;
+    cfg.autopilot.enabled = true;
+    cfg.ci.autofix.mode = CiAutofixMode::Suggest;
+    cfg.workspace
+        .insert("acme".into(), overlay_with_everything());
+    cfg.workspace
+        .insert("ACME".into(), overlay_with_everything());
+
+    let refusal = cfg.workspace_overlay_refusal(root).expect("ambiguous");
+    assert!(refusal.to_string().contains("`ACME`"), "{refusal}");
+
+    // Nothing from either block applies...
+    let mq = cfg.repo_merge_queue(root);
+    assert_eq!(mq.gate_command, cfg.merge_queue.gate_command);
+    assert_eq!(
+        cfg.repo_git(root).structural_diff,
+        cfg.git.structural_diff,
+        "presentation knobs stay global"
+    );
+    // Security-relevant git knobs clamp to strictest instead of loosening.
+    cfg.git.submodules = crate::config_git::SubmoduleMode::Auto;
+    cfg.git.merge_guard = false;
+    cfg.git.override_gpg = true;
+    cfg.git.auto_fetch = true;
+    let git = cfg.repo_git(root);
+    assert_eq!(git.submodules, crate::config_git::SubmoduleMode::Off);
+    assert!(git.merge_guard && !git.override_gpg && !git.auto_fetch);
+    let approvals = crate::config_resolve::Approvals::deny_all();
+    assert!(
+        !cfg.repo_sandbox_resolved(root, &approvals)
+            .sandbox
+            .mounts
+            .iter()
+            .any(|m| m.contains("/overlay/mount")),
+        "a refused overlay adds no ungated mounts"
+    );
+    assert!(cfg.workspace_overlay_for_key("acme").overlay().is_none());
+    // ...and no supervisor runs under the weaker global policy instead.
+    assert!(!mq.enabled && !mq.auto_land);
+    assert!(!cfg.repo_pr_queue(root).enabled);
+    assert!(!cfg.repo_autopilot(root).enabled);
+    assert_eq!(cfg.repo_ci(root).autofix.mode, CiAutofixMode::Off);
+
+    // Unrelated repositories are not affected by the collision.
+    let other = std::path::Path::new("/nonexistent/thegn-515/other");
+    assert!(cfg.repo_merge_queue(other).enabled);
+}
+
+#[test]
+fn non_canonical_and_colliding_overlay_keys_are_validation_errors() {
+    let errors = crate::config_validate::validate_str(
+        "[workspace.acme]\n[workspace.ACME]\n[workspace.my_repo]\n[workspace.ok]\n",
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.starts_with("project.acme:") && e.contains("`ACME`")),
+        "{errors:#?}"
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.starts_with("project.my-repo:") && e.contains("rename")),
+        "{errors:#?}"
+    );
+    assert!(!errors.iter().any(|e| e.starts_with("project.ok")));
+    assert!(
+        crate::config_validate::validate_str("[workspace.acme]\n[workspace.ok-2]\n")
+            .iter()
+            .all(|e| !e.starts_with("project.")),
+    );
+}
+
 // --- strftime validation (the render-path panic guard) ---------------------
 
 #[test]

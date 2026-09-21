@@ -96,12 +96,20 @@ fn global_binding(db: &Db) -> Option<String> {
 
 /// The bundle bound at the workspace scope: `[workspace.<slug>].env_bundle`
 /// (config) wins over the `ui_state` pointer, matching `account.rs`.
-fn workspace_binding(cfg: &Config, db: &Db, slug: Option<&str>) -> Option<String> {
-    let slug = slug?;
-    if let Some(name) = cfg.workspace.get(slug).and_then(|w| w.env_bundle.clone()) {
-        return Some(name);
+/// `Err(())` = the trusted overlay is refused (THE-515): the caller must not
+/// substitute the workspace pointer or the global binding for it.
+fn workspace_binding(cfg: &Config, db: &Db, slug: Option<&str>) -> Result<Option<String>, ()> {
+    let Some(slug) = slug else {
+        return Ok(None);
+    };
+    let overlay = cfg.workspace_overlay_for_tab_slug(db, slug);
+    if overlay.is_refused() {
+        return Err(());
     }
-    db.get_ui_state(&scope_ws(slug), "active").ok().flatten()
+    if let Some(name) = overlay.overlay().and_then(|w| w.env_bundle.clone()) {
+        return Ok(Some(name));
+    }
+    Ok(db.get_ui_state(&scope_ws(slug), "active").ok().flatten())
 }
 
 /// The bundle bound at the worktree scope (strongest single binding).
@@ -114,9 +122,14 @@ fn worktree_binding(db: &Db, worktree: &str) -> Option<String> {
 /// The single most-specific bound bundle name (worktree → workspace → global),
 /// for the switcher chip + display. `None` ⇒ no bundle bound anywhere.
 pub fn active_name(cfg: &Config, db: &Db, worktree: &str, slug: Option<&str>) -> Option<String> {
-    worktree_binding(db, worktree)
-        .or_else(|| workspace_binding(cfg, db, slug))
-        .or_else(|| global_binding(db))
+    if let Some(name) = worktree_binding(db, worktree) {
+        return Some(name);
+    }
+    match workspace_binding(cfg, db, slug) {
+        Err(()) => None,
+        Ok(Some(name)) => Some(name),
+        Ok(None) => global_binding(db),
+    }
 }
 
 /// Where an active bundle selection can be pinned. Same shape as
@@ -327,10 +340,15 @@ pub fn compose(
 pub fn active_chain(cfg: &Config, db: &Db, worktree: &str, slug: Option<&str>) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut order: Vec<String> = Vec::new();
-    if let Some(g) = global_binding(db) {
+    // THE-515: a refused trusted overlay drops the global and workspace
+    // layers; only the explicit per-worktree binding still applies.
+    let workspace = workspace_binding(cfg, db, slug);
+    if workspace.is_ok()
+        && let Some(g) = global_binding(db)
+    {
         collect_chain(cfg, &g, &mut seen, &mut order);
     }
-    if let Some(w) = workspace_binding(cfg, db, slug) {
+    if let Ok(Some(w)) = workspace {
         collect_chain(cfg, &w, &mut seen, &mut order);
     }
     if let Some(t) = worktree_binding(db, worktree) {
@@ -789,6 +807,29 @@ mod tests {
     use crate::config::{Account, Bundle, NamedCommand};
 
     #[test]
+    fn refused_overlay_drops_global_and_workspace_bundles() {
+        // THE-515: a shared `foo` key refuses the trusted env bundle, and the
+        // global binding must not stand in for it.
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_memory().unwrap();
+        for name in ["a/foo", "b/foo"] {
+            let path = dir.path().join(name);
+            std::fs::create_dir_all(path.join(".git")).unwrap();
+            db.slug_for_repo(&path.to_string_lossy(), "foo").unwrap();
+        }
+        let mut cfg = Config::default();
+        cfg.workspace.entry("foo".into()).or_default().env_bundle = Some("work".into());
+        set_active(&db, Bind::Global, "/wt", Some("foo"), "global").unwrap();
+        assert_eq!(active_name(&cfg, &db, "/wt", Some("foo")), None);
+        assert!(active_chain(&cfg, &db, "/wt", Some("foo")).is_empty());
+        set_active(&db, Bind::Worktree, "/wt", Some("foo"), "pinned").unwrap();
+        assert_eq!(
+            active_name(&cfg, &db, "/wt", Some("foo")).as_deref(),
+            Some("pinned")
+        );
+    }
+
+    #[test]
     fn secret_resolver_timeout_kills_a_hung_backend() {
         // D4: `run_resolver` bounds the secret-backend subprocess via
         // `output_with_timeout` so a wedged resolver can't freeze the loop. A
@@ -895,6 +936,7 @@ mod tests {
     #[test]
     fn workspace_config_env_bundle_beats_pointer() {
         let db = Db::open_memory().unwrap();
+        db.slug_for_repo("/src/repo", "repo").unwrap();
         let mut cfg = Config::default();
         cfg.bundle
             .insert("cfg".into(), bundle_with_env(&[("X", "cfg")]));

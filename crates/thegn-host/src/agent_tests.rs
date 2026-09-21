@@ -2223,3 +2223,37 @@ fn provider_home_mounts_ignores_relative_and_absent_entries() {
     eff.env.insert("CODEX_HOME".into(), ".codex".into());
     assert!(provider_home_mounts(Some(&eff)).is_empty());
 }
+
+#[test]
+fn credential_gate_refuses_agents_only_for_live_ambiguity() {
+    use thegn_core::store::WorkspaceStore;
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open_memory().unwrap();
+    let checkout = |name: &str| {
+        let path = dir.path().join(name);
+        std::fs::create_dir_all(path.join(".git")).unwrap();
+        path.to_string_lossy().into_owned()
+    };
+    let mut cfg = cfg_with(&[("codex", "codex")], &[]);
+    assert!(thegn_core::account::provider_for(&cfg, "codex").is_some());
+    cfg.workspace
+        .entry("foo".into())
+        .or_default()
+        .accounts
+        .insert("codex".into(), "work".into());
+    // A stale (deleted) registration holds `foo`; the real repo is `foo-2`.
+    let gone = dir.path().join("gone/foo").to_string_lossy().into_owned();
+    db.slug_for_repo(&gone, "foo").unwrap();
+    let real = checkout("code/foo");
+    assert_eq!(db.slug_for_repo(&real, "foo").unwrap(), "foo-2");
+    credential_overlay_gate(&cfg, &db, "foo-2", "codex").expect("stale row must not block");
+    // A second LIVE checkout named `foo`: agents are refused, shells are not.
+    let other = checkout("other/foo");
+    db.slug_for_repo(&other, "foo").unwrap();
+    let error = credential_overlay_gate(&cfg, &db, "foo-2", "codex").unwrap_err();
+    assert!(
+        format!("{error:#}").contains("Rename or delete"),
+        "{error:#}"
+    );
+    credential_overlay_gate(&cfg, &db, "foo-2", "shell").expect("a shell always launches");
+}

@@ -1001,11 +1001,35 @@ impl Default for MergeQueueConfig {
     }
 }
 
-/// The `[workspace.<slug>]` key for a repo.
+/// A registered path's filesystem IDENTITY iff it is a live MAIN checkout (a
+/// `.git` directory, or a bare `*.git` repository). Linked worktrees (`.git`
+/// file), plain dir workspaces and removed clones are not repositories that
+/// can make a trusted block ambiguous, and every spelling of one checkout
+/// (symlink, bind mount, case-insensitive mount) shares one identity.
 ///
-/// One definition so every consumer of the workspace layer agrees on the slug —
-/// it was previously inlined in `config_resolve::resolve_repo_sandbox`, and a
-/// second copy that drifted would silently stop matching the user's block.
+/// Metadata only — no Git subprocess — but it does `stat` a registered path,
+/// so it runs ONLY for rows that derive the same key as the repository being
+/// resolved (normally none). A dead network mount could block that stat; the
+/// probe is therefore never run just to display something.
+fn live_main_checkout(path: &str) -> Option<String> {
+    let path = Path::new(path);
+    let git_dir = path.join(".git");
+    if git_dir.is_dir() {
+        return crate::util::file_identity(&git_dir);
+    }
+    if path.extension().is_some_and(|ext| ext == "git") && path.join("HEAD").is_file() {
+        return crate::util::file_identity(path);
+    }
+    None
+}
+
+/// The legacy `[workspace.<slug>]` label for a repo, for display and UI
+/// scoping only (runs `git rev-parse --show-toplevel`, with a `"repo"`
+/// fallback).
+///
+/// **Not an authority selector.** Trusted overlay selection goes through
+/// [`Config::workspace_overlay`] / [`Config::workspace_overlay_for_key`]
+/// (THE-515), which refuse ambiguous keys and never fall back to `"repo"`.
 pub fn workspace_slug(repo_root: &Path) -> String {
     let base = crate::util::slugify(&crate::repo::repo_name(repo_root));
     if base.is_empty() {
@@ -6426,9 +6450,7 @@ impl Config {
             layers.push(p.keybinds.clone());
         }
         layers.push(self.keybinds.clone());
-        if let Some(slug) = slug
-            && let Some(ws) = self.workspace.get(slug)
-        {
+        if let Some(ws) = slug.and_then(|slug| self.workspace_overlay_for_key(slug).overlay()) {
             layers.push(ws.keybinds.clone());
         }
         if let Some(root) = repo_root
@@ -6576,15 +6598,118 @@ impl Config {
     /// reading `Config::merge_queue` directly, or the per-repo layer silently
     /// does nothing on that path. `repo_root` identifies the repo; the slug is
     /// derived the same way `[workspace.<slug>]`'s other keys are.
+    ///
+    /// A refused (ambiguous) overlay applies nothing AND disables the queue and
+    /// auto-land for this repo: the user configured *some* per-repo policy, and
+    /// silently running the weaker global gate instead would be a downgrade.
+    /// Manual entry points must additionally check
+    /// [`Self::workspace_overlay_refusal`] and bail.
     pub fn repo_merge_queue(&self, repo_root: &Path) -> MergeQueueConfig {
         let mut mq = self.merge_queue.clone();
-        if !self.workspace.is_empty()
-            && let Some(ws) = self.workspace.get(&workspace_slug(repo_root))
-            && !ws.merge_queue.is_empty()
-        {
-            ws.merge_queue.clone().apply(&mut mq);
+        match self.workspace_overlay(repo_root) {
+            crate::workspace_overlay::WorkspaceOverlay::Selected { overlay, .. }
+                if !overlay.merge_queue.is_empty() =>
+            {
+                overlay.merge_queue.clone().apply(&mut mq);
+            }
+            crate::workspace_overlay::WorkspaceOverlay::Refused(_) => {
+                mq.enabled = false;
+                mq.auto_land = false;
+                // Keep landed worktrees: the refused block may have said so.
+                mq.on_landed = OnLanded::Off;
+            }
+            _ => {}
         }
         mq
+    }
+
+    /// The trusted `[workspace.<key>]` overlay for a repository ROOT — the
+    /// single selector every repo-scoped consumer uses (THE-515). The key is
+    /// derived purely from the root path (no Git, safe on the UI loop); pass
+    /// the repository's main checkout, never a linked worktree path.
+    pub fn workspace_overlay(
+        &self,
+        repo_root: &Path,
+    ) -> crate::workspace_overlay::WorkspaceOverlay<'_> {
+        if self.workspace.is_empty() {
+            return crate::workspace_overlay::WorkspaceOverlay::Unconfigured;
+        }
+        crate::workspace_overlay::resolve(
+            &self.workspace,
+            crate::workspace_overlay::legacy_key_for_root(repo_root).as_deref(),
+        )
+    }
+
+    /// The trusted overlay for an already-derived legacy key (a tab/workspace
+    /// slug). Same refusals as [`Self::workspace_overlay`].
+    pub fn workspace_overlay_for_key(
+        &self,
+        key: &str,
+    ) -> crate::workspace_overlay::WorkspaceOverlay<'_> {
+        crate::workspace_overlay::resolve(&self.workspace, Some(key))
+    }
+
+    /// The trusted overlay for a TAB-namespace slug (`repo_slugs`, the key the
+    /// account / env-bundle consumers still carry until the RepositoryId
+    /// binding lands).
+    ///
+    /// The slug itself is never the key: the registry maps it to the
+    /// repository path it was issued for, and the overlay is selected by that
+    /// path's own legacy key — so the `repo` fallback and `-N` collision
+    /// suffixes never select a block that merely shares their spelling, and a
+    /// `-2` tab of a correctly configured repo still gets its own block. The
+    /// registry is a cache (stale rows, several spellings of one checkout), so
+    /// it is used only to REFUSE, and only when another row is a separate live
+    /// main checkout (filesystem identity, not path) deriving the same key. An
+    /// unregistered slug, an unreadable registry and a repository whose name
+    /// has no slug all select nothing rather than guessing from spelling.
+    pub fn workspace_overlay_for_tab_slug(
+        &self,
+        db: &crate::db::Db,
+        slug: &str,
+    ) -> crate::workspace_overlay::WorkspaceOverlay<'_> {
+        use crate::store::WorkspaceStore;
+        use crate::workspace_overlay::{OverlayRefusal, WorkspaceOverlay};
+
+        if self.workspace.is_empty() {
+            return WorkspaceOverlay::Unconfigured;
+        }
+        // A registry read failure (a busy SQLite, a locked cache) is transient
+        // and proves nothing about ambiguity: apply no block rather than
+        // refusing a launch over it. An unregistered slug likewise selects
+        // nothing — the slug's spelling is not a key.
+        let Ok(rows) = db.repo_slug_rows() else {
+            return WorkspaceOverlay::Unconfigured;
+        };
+        let Some(path) = crate::workspace_overlay::registered_path(slug, &rows) else {
+            return WorkspaceOverlay::Unconfigured;
+        };
+        let Some(key) = crate::workspace_overlay::legacy_key_for_root(Path::new(path)) else {
+            return WorkspaceOverlay::Unconfigured;
+        };
+        let base = self.workspace_overlay_for_key(&key);
+        if !matches!(base, WorkspaceOverlay::Selected { .. }) {
+            return base;
+        }
+        let duplicates =
+            crate::workspace_overlay::live_duplicates(&key, path, &rows, live_main_checkout);
+        if duplicates.is_empty() {
+            return base;
+        }
+        let mut repositories = duplicates;
+        repositories.push(path.to_string());
+        repositories.sort();
+        WorkspaceOverlay::Refused(OverlayRefusal::AmbiguousRepositories { key, repositories })
+    }
+
+    /// The refusal for a repository's trusted overlay, if selection is
+    /// ambiguous. Effectful manual entry points (`thegn land`, `thegn
+    /// integrate`, lifecycle hooks) bail on `Some`.
+    pub fn workspace_overlay_refusal(
+        &self,
+        repo_root: &Path,
+    ) -> Option<crate::workspace_overlay::OverlayRefusal> {
+        self.workspace_overlay(repo_root).refusal().cloned()
     }
 
     /// The effective `[git]` for a repo: the global table with that repo's
@@ -6594,11 +6719,25 @@ impl Config {
     /// layer takes effect on that path.
     pub fn repo_git(&self, repo_root: &Path) -> GitConfig {
         let mut git = self.git.clone();
-        if !self.workspace.is_empty()
-            && let Some(ws) = self.workspace.get(&workspace_slug(repo_root))
-            && !ws.git.is_empty()
-        {
-            ws.git.clone().apply(&mut git);
+        match self.workspace_overlay(repo_root) {
+            crate::workspace_overlay::WorkspaceOverlay::Selected { overlay, .. }
+                if !overlay.git.is_empty() =>
+            {
+                overlay.git.clone().apply(&mut git);
+            }
+            // Fail closed (THE-515): the refused block may have TIGHTENED
+            // git (submodules off, merge guard on, signing kept), so falling
+            // back to the global table could loosen it. Clamp every
+            // security-relevant knob to its strictest value instead;
+            // presentation knobs (backend, structural_diff) stay global.
+            crate::workspace_overlay::WorkspaceOverlay::Refused(_) => {
+                git.submodules = crate::config_git::SubmoduleMode::Off;
+                git.merge_guard = true;
+                git.override_gpg = false;
+                git.auto_fetch = false;
+                git.auto_fetch_colocated = false;
+            }
+            _ => {}
         }
         git
     }
@@ -6608,11 +6747,15 @@ impl Config {
     /// [`Self::repo_merge_queue`].
     pub fn repo_pr_queue(&self, repo_root: &Path) -> PrQueueConfig {
         let mut pq = self.pr_queue.clone();
-        if !self.workspace.is_empty()
-            && let Some(ws) = self.workspace.get(&workspace_slug(repo_root))
-            && !ws.pr_queue.is_empty()
-        {
-            ws.pr_queue.clone().apply(&mut pq);
+        match self.workspace_overlay(repo_root) {
+            crate::workspace_overlay::WorkspaceOverlay::Selected { overlay, .. }
+                if !overlay.pr_queue.is_empty() =>
+            {
+                overlay.pr_queue.clone().apply(&mut pq);
+            }
+            // Fail closed: no supervisor under the weaker global policy.
+            crate::workspace_overlay::WorkspaceOverlay::Refused(_) => pq.enabled = false,
+            _ => {}
         }
         pq
     }
@@ -6622,10 +6765,15 @@ impl Config {
     /// enable or widen this policy.
     pub fn repo_ci(&self, repo_root: &Path) -> CiConfig {
         let mut ci = self.ci.clone();
-        if !self.workspace.is_empty()
-            && let Some(ws) = self.workspace.get(&workspace_slug(repo_root))
-        {
-            ws.ci.apply(&mut ci.autofix);
+        match self.workspace_overlay(repo_root) {
+            crate::workspace_overlay::WorkspaceOverlay::Selected { overlay, .. } => {
+                overlay.ci.apply(&mut ci.autofix);
+            }
+            // Fail closed: an ambiguous overlay never lets autofix act.
+            crate::workspace_overlay::WorkspaceOverlay::Refused(_) => {
+                ci.autofix.mode = crate::config_ci::CiAutofixMode::Off;
+            }
+            crate::workspace_overlay::WorkspaceOverlay::Unconfigured => {}
         }
         ci
     }
@@ -6635,10 +6783,15 @@ impl Config {
     /// trusted user choice, not repository-controlled configuration.
     pub fn repo_autopilot(&self, repo_root: &Path) -> AutopilotConfig {
         let mut policy = self.autopilot.clone();
-        if let Some(ws) = self.workspace.get(&workspace_slug(repo_root))
-            && !ws.autopilot.is_empty()
-        {
-            ws.autopilot.clone().apply(&mut policy);
+        match self.workspace_overlay(repo_root) {
+            crate::workspace_overlay::WorkspaceOverlay::Selected { overlay, .. }
+                if !overlay.autopilot.is_empty() =>
+            {
+                overlay.autopilot.clone().apply(&mut policy);
+            }
+            // Fail closed: no issue supervisor under the global policy.
+            crate::workspace_overlay::WorkspaceOverlay::Refused(_) => policy.enabled = false,
+            _ => {}
         }
         policy
     }

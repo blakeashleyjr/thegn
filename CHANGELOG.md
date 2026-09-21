@@ -7,6 +7,33 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed — ambiguous `[project.<key>]` blocks are refused, not first-matched (THE-515)
+
+- **A trusted per-project block now applies only when it is unambiguous.** The
+  key must be the normalized slug of the repo's directory name (`My_Repo` →
+  `my-repo`). A differently spelled key, or two keys that normalize to the same
+  slug, fails `thegn config validate`, and the block is **refused**: none of it
+  applies, and that repo's merge/PR queue drains, CI autofix and autopilot stop
+  (including the in-app Integrate, drain and PR-queue ticker). `[git]` is
+  clamped to its strictest settings (submodules off, merge guard on, signing
+  kept, background fetch off), and agent launches whose refused block pins
+  accounts or an env bundle are refused. `thegn land`, `integrate`,
+  `merge drain/add/…` and `pr-queue drain/add` stop with the reason;
+  `merge/pr-queue list|rm|clear` still work. `config explain` and
+  `repo trust` print the refusal.
+- **Migration:** rename a non-normalized key to the slug the error names, and
+  keep exactly one block per slug. A repo whose name has no slug (`___`,
+  non-ASCII-only) no longer inherits `[project.repo]`, and a generated tab name
+  (`repo`, `foo-2`) never selects the block that shares its spelling: the
+  account / env-bundle block is chosen by the repository's own directory name.
+  When two separate LIVE checkouts with the same name are registered (stale
+  registrations, plain folders, linked worktrees, and every other spelling of
+  the same checkout — symlink, bind mount, case-insensitive mount — don't count), that name's accounts / env bundle are refused and agent launches
+  there stop with the reason; shells always launch. Rename or delete the other
+  checkout to recover (binding blocks to the canonical repository identity is
+  the next step). Landed-worktree sweeps and review-agent handoffs also stop
+  under a refused block instead of using the global policy.
+
 ### Fixed — a project no longer resumes in a terminal
 
 - **Switching back to a project landed you in a terminal instead of your work.**

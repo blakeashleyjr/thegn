@@ -61,11 +61,28 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
     // `[workspace.<slug>] pr_queue.enabled` can turn the queue on for one repo
     // and leave it off everywhere else. Without a repo root, fall back to the
     // global table rather than refusing outright.
-    let enabled = match repo_root() {
-        Ok(root) => cfg.repo_pr_queue(&root).enabled,
-        Err(_) => cfg.pr_queue.enabled,
-    };
-    if !enabled {
+    let root = repo_root().ok();
+    // THE-515: report a refused trusted overlay as itself; read/cleanup verbs
+    // keep working, the forge-driving ones stop.
+    if let Some(root) = &root
+        && let Some(refusal) = cfg.workspace_overlay_refusal(root)
+    {
+        if matches!(
+            action,
+            Action::List { .. } | Action::Rm { .. } | Action::Clear | Action::Status { .. }
+        ) {
+            thegn_core::msg::warn(&format!("{}: {refusal}", root.display()));
+            if !cfg.pr_queue.enabled {
+                anyhow::bail!("PR queue disabled — set [pr_queue] enabled = true");
+            }
+        } else {
+            anyhow::bail!("{}: {refusal}", root.display());
+        }
+    } else if !root
+        .as_ref()
+        .map(|root| cfg.repo_pr_queue(root).enabled)
+        .unwrap_or(cfg.pr_queue.enabled)
+    {
         anyhow::bail!(
             "PR queue is disabled — set [pr_queue] enabled = true (or \
              [workspace.<slug>.pr_queue] enabled = true for just this repo)"
