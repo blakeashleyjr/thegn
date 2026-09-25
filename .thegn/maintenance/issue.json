@@ -1,0 +1,12 @@
+{
+  "id": "THE-188",
+  "title": "Advance Observe query windows on every refresh",
+  "url": "https://linear.app/blakeashley/issue/the-188",
+  "priority": "Medium",
+  "labels": [
+    "Bug"
+  ],
+  "status": "Todo",
+  "parentId": "THE-150",
+  "description": "## Finding\n\nObserve refreshes reuse a fixed historical end time instead of advancing the requested time window. Dashboards appear live while repeatedly querying stale data.\n\n## Evidence at audited commit\n\n`crates/gtui-app/src/engine.rs:78`.\n\n## Implementation constraints\n\nRepresent relative/live windows separately from absolute historical ranges. Compute one consistent now per refresh cycle and make time controllable in tests.\n\n## Acceptance criteria\n\n- [ ] Relative windows advance on every refresh while preserving configured duration.\n- [ ] Absolute historical ranges remain fixed and do not drift.\n- [ ] All panels in one refresh share the same start/end instant.\n- [ ] Pause/resume, clock skew, and config reload behavior are defined.\n- [ ] Fake-clock tests prove successive refresh ranges and historical immutability.\n\n## Execution dependencies\n\nBlocked by THE-184 (UNLANDED). Directly blocks THE-186."
+}
