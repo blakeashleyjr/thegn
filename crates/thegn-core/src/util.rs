@@ -1664,6 +1664,18 @@ mod tests {
             cache.lock().unwrap().get("tool"),
             Some(&Some("/bin/tool".to_string()))
         );
+
+        // Once the racing threads have settled, the entry is authoritative:
+        // a further lookup is served from the cache and never probes. (The
+        // race itself may probe more than once — the lock is released between
+        // the read and the insert — which is safe because every racer computes
+        // the same value.)
+        let probes = std::sync::atomic::AtomicUsize::new(0);
+        assert!(cached_have(cache.as_ref(), "tool", |_| {
+            probes.fetch_add(1, Ordering::Relaxed);
+            None
+        }));
+        assert_eq!(probes.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -1680,8 +1692,15 @@ mod tests {
         )));
     }
 
+    /// A poison flag is sticky: `PoisonError::into_inner` hands back the data
+    /// but never clears it, so every later `lock()` also returns `Err`. If a
+    /// poisoned lock disabled the cache, ONE unrelated panic would permanently
+    /// revert `have()` to walking `PATH` on every call — the exact cost this
+    /// cache exists to remove. The only work done under this lock is `get` and
+    /// `insert` on a `HashMap<String, Option<String>>`, neither of which can
+    /// leave a logically wrong value behind, so the entries stay trustworthy.
     #[test]
-    fn poisoned_positive_cache_falls_back_to_an_uncached_probe() {
+    fn a_poisoned_cache_keeps_serving_its_positive_entries() {
         let cache = Arc::new(Mutex::new(HashMap::from([(
             "tool".to_string(),
             Some("/bin/tool".to_string()),
@@ -1692,13 +1711,21 @@ mod tests {
             panic!("poison a cache containing a positive entry");
         });
         assert!(thread.join().is_err());
+        assert!(cache.lock().is_err(), "the lock must really be poisoned");
 
+        // The cached hit is still served, and the probe is never consulted.
         let probes = std::sync::atomic::AtomicUsize::new(0);
-        assert!(!cached_have(cache.as_ref(), "tool", |_| {
+        assert!(cached_have(cache.as_ref(), "tool", |_| {
             probes.fetch_add(1, Ordering::Relaxed);
             None
         }));
-        assert_eq!(probes.load(Ordering::Relaxed), 1);
+        assert_eq!(probes.load(Ordering::Relaxed), 0);
+
+        // A miss on a poisoned cache still re-probes and can still be filled.
+        assert!(cached_have(cache.as_ref(), "other", |_| Some(
+            "/bin/other".to_string()
+        )));
+        assert!(cached_have(cache.as_ref(), "other", |_| None));
     }
 
     #[cfg(unix)]
