@@ -2,6 +2,7 @@
 //! and thin subprocess wrappers (git / generic commands).
 
 use crate::msg;
+use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -647,8 +648,52 @@ pub fn age(then: i64) -> String {
     }
 }
 
+static HAVE_CACHE: OnceLock<Mutex<HashMap<String, Option<String>>>> = OnceLock::new();
+
+fn have_cache() -> &'static Mutex<HashMap<String, Option<String>>> {
+    HAVE_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn cached_have<F>(cache: &Mutex<HashMap<String, Option<String>>>, cmd: &str, probe: F) -> bool
+where
+    F: FnOnce(&str) -> Option<String>,
+{
+    let cached = cache
+        .lock()
+        .unwrap_or_else(|poisoned| {
+            // best-effort: a poisoned probe cache must not bring down a launch;
+            // its positive entries remain safe to use after the panic.
+            poisoned.into_inner()
+        })
+        .get(cmd)
+        .is_some_and(Option::is_some);
+    if cached {
+        return true;
+    }
+
+    let found = probe(cmd);
+    let present = found.is_some();
+    if present {
+        cache
+            .lock()
+            .unwrap_or_else(|poisoned| {
+                // best-effort: recover the cache lock so a probe remains a
+                // non-fatal optimization even after an unrelated panic.
+                poisoned.into_inner()
+            })
+            .insert(cmd.to_owned(), found);
+    }
+    present
+}
+
+/// Return whether `cmd` is present on `PATH`.
+///
+/// Positive probes are stable for this process, while misses are deliberately
+/// re-probed: a live pane can install a tool with `nix develop` or `cargo
+/// install`, and the next lookup should discover it. `which_path` itself stays
+/// uncached because callers that need the path must observe current `PATH`.
 pub fn have(cmd: &str) -> bool {
-    which_path(cmd).is_some()
+    cached_have(have_cache(), cmd, which_path)
 }
 
 /// Return the absolute path of `cmd` found on `PATH`, or `None` if not found.
@@ -1559,6 +1604,81 @@ fn platform_hostname() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn have_caches_positive_probe_results() {
+        let cache = Mutex::new(HashMap::new());
+        let probes = std::sync::atomic::AtomicUsize::new(0);
+        assert!(cached_have(&cache, "tool", |_| {
+            probes.fetch_add(1, Ordering::Relaxed);
+            Some("/bin/tool".to_string())
+        }));
+        assert!(cached_have(&cache, "tool", |_| {
+            probes.fetch_add(1, Ordering::Relaxed);
+            None
+        }));
+        assert_eq!(probes.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn have_reprobes_a_miss_and_caches_a_later_hit() {
+        let cache = Mutex::new(HashMap::new());
+        let probes = std::sync::atomic::AtomicUsize::new(0);
+        assert!(!cached_have(&cache, "tool", |_| {
+            probes.fetch_add(1, Ordering::Relaxed);
+            None
+        }));
+        assert!(cached_have(&cache, "tool", |_| {
+            probes.fetch_add(1, Ordering::Relaxed);
+            Some("/bin/tool".to_string())
+        }));
+        assert!(cached_have(&cache, "tool", |_| {
+            probes.fetch_add(1, Ordering::Relaxed);
+            None
+        }));
+        assert_eq!(probes.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            cache.lock().unwrap().get("tool"),
+            Some(&Some("/bin/tool".to_string()))
+        );
+    }
+
+    #[test]
+    fn have_cache_handles_concurrent_probes() {
+        let cache = Arc::new(Mutex::new(HashMap::new()));
+        let start = Arc::new(std::sync::Barrier::new(8));
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let cache = Arc::clone(&cache);
+                let start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    start.wait();
+                    cached_have(cache.as_ref(), "tool", |_| Some("/bin/tool".to_string()))
+                })
+            })
+            .collect();
+        for thread in threads {
+            assert!(thread.join().unwrap());
+        }
+        assert_eq!(
+            cache.lock().unwrap().get("tool"),
+            Some(&Some("/bin/tool".to_string()))
+        );
+    }
+
+    #[test]
+    fn have_cache_recovers_from_a_poisoned_lock() {
+        let cache = Arc::new(Mutex::new(HashMap::new()));
+        let poisoned = Arc::clone(&cache);
+        let thread = std::thread::spawn(move || {
+            let _guard = poisoned.lock().unwrap();
+            panic!("poison the test cache");
+        });
+        assert!(thread.join().is_err());
+        assert!(cached_have(cache.as_ref(), "tool", |_| Some(
+            "/bin/tool".to_string()
+        )));
+    }
 
     #[cfg(unix)]
     #[test]
