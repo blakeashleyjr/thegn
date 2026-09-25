@@ -34,7 +34,10 @@ pub struct CalendarConfig {
     /// IANA zone to treat as "home" for day boundaries and clock deltas.
     /// Empty means the system's local zone.
     pub home_zone: String,
-    /// Show the ISO week-number gutter down the left of the grid.
+    /// Show the configured-start week-number gutter down the left of the grid.
+    /// Week 1 is the configured-start week containing January 4; Monday-first
+    /// is ISO-8601, while Sunday- and Saturday-first use their row boundary.
+    /// `auto` uses the locale-resolved `week_start` boundary.
     pub show_week_numbers: bool,
     /// Always render six week-rows, padding short months.
     ///

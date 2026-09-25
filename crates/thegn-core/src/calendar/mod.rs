@@ -7,7 +7,7 @@
 //! and what lets the popup render any month instantly without a round trip.
 //!
 //! Layout:
-//! - [`grid`] — the 7×6 month matrix (leading/trailing days, ISO week numbers).
+//! - [`grid`] — the 7×6 month matrix (leading/trailing days, configured-start week numbers).
 //! - [`cursor`] — the selection state machine (`h`/`j`/`k`/`l`, month/year paging).
 //! - [`tz`] — zone resolution and world-clock readings.
 //! - [`locale`] — resolving `week_start = "auto"` / `time_format = "auto"`.
