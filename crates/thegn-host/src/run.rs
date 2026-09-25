@@ -1092,6 +1092,11 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         );
     }
 
+    // One bounded native clipboard worker owns all helper subprocesses. It is
+    // shut down before the rest of application cleanup so no helper can outlive
+    // the UI process.
+    let mut clipboard = crate::clipboard::Clipboard::start(waker.clone());
+
     let resident_supervisor =
         thegn_svc::plugin::ResidentSupervisor::new(tokio::runtime::Handle::current());
     let result = event_loop(
@@ -1138,6 +1143,7 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         host_cache_port,
     )
     .await;
+    clipboard.shutdown();
     // Outside the UI loop, including every early/error return. All sessions
     // close together under one application deadline; reloads share this owner.
     let cleanup_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
@@ -11471,6 +11477,20 @@ async fn event_loop<T: Terminal>(
             dirty = true;
         }
 
+        // Native clipboard results: the bounded worker reports only an outcome,
+        // never the payload or helper diagnostics. Replacements are latest-wins
+        // and therefore do not produce a stale failure for the UI.
+        while let Some(outcome) = crate::clipboard::poll_outcome() {
+            loop_perf.tick(crate::perf::WakeSource::Other);
+            model.status = match outcome {
+                crate::clipboard::CopyOutcome::Succeeded => "Copied to clipboard".into(),
+                crate::clipboard::CopyOutcome::Failed => {
+                    "Clipboard copy failed (no helper completed)".into()
+                }
+            };
+            dirty = true;
+        }
+
         // Clipboard image-paste results (THE-24): the worker resolved the drop
         // and hands back the pane + path to paste, or a status message. The paste
         // is ordinary pane input (⇒ Panes damage); the status is chrome (⇒ Full).
@@ -15200,7 +15220,7 @@ async fn event_loop<T: Terminal>(
                                     // clipboard directly for terminals that
                                     // ignore OSC52. Belt and braces.
                                     writer.submit_oob(crate::copymode::osc52(&text));
-                                    crate::clipboard::copy(&text);
+                                    let copy_result = crate::clipboard::copy(&text);
                                     // Also land in the default register (persisted),
                                     // so `PasteRegister "` recalls it across restarts.
                                     store_yank(
@@ -15208,10 +15228,17 @@ async fn event_loop<T: Terminal>(
                                         thegn_core::registers::DEFAULT,
                                         text.clone(),
                                     );
-                                    toasts.success(
-                                        "Text copied to clipboard",
-                                        std::time::Instant::now(),
-                                    );
+                                    match copy_result {
+                                        Ok(()) => toasts.info(
+                                            "Copying text to clipboard…",
+                                            std::time::Instant::now(),
+                                        ),
+                                        Err(error) => toasts.info_ttl(
+                                            format!("Clipboard copy failed: {error}"),
+                                            std::time::Instant::now(),
+                                            std::time::Duration::from_secs(5),
+                                        ),
+                                    }
                                 }
                             }
                         }
@@ -18929,8 +18956,12 @@ async fn event_loop<T: Terminal>(
                                                 .and_then(|s| s.url.clone())
                                             {
                                                 writer.submit_oob(crate::copymode::osc52(&url));
-                                                crate::clipboard::copy(&url);
-                                                model.status = format!("Copied {url}");
+                                                model.status = match crate::clipboard::copy(&url) {
+                                                    Ok(()) => "Copying link to clipboard…".into(),
+                                                    Err(error) => {
+                                                        format!("Clipboard copy failed: {error}")
+                                                    }
+                                                };
                                             }
                                         }
                                         Section::Forward => {
@@ -18940,8 +18971,12 @@ async fn event_loop<T: Terminal>(
                                                     .map(str::to_owned)
                                             {
                                                 writer.submit_oob(crate::copymode::osc52(&url));
-                                                crate::clipboard::copy(&url);
-                                                model.status = format!("Copied {url}");
+                                                model.status = match crate::clipboard::copy(&url) {
+                                                    Ok(()) => "Copying link to clipboard…".into(),
+                                                    Err(error) => {
+                                                        format!("Clipboard copy failed: {error}")
+                                                    }
+                                                };
                                             }
                                         }
                                         Section::Ci => {
@@ -23053,20 +23088,23 @@ async fn event_loop<T: Terminal>(
                                     let text = crate::copymode::extract(emu, &sel);
                                     if !text.trim().is_empty() {
                                         writer.submit_oob(crate::copymode::osc52(&text));
-                                        crate::clipboard::copy(&text);
+                                        let copy_result = crate::clipboard::copy(&text);
                                         store_yank(
                                             &mut registers,
                                             thegn_core::registers::DEFAULT,
                                             text.clone(),
                                         );
-                                        toasts.success(
-                                            if mouse_sel.is_some() {
-                                                "Selection copied to clipboard"
-                                            } else {
-                                                "Pane copied to clipboard"
-                                            },
-                                            std::time::Instant::now(),
-                                        );
+                                        match copy_result {
+                                            Ok(()) => toasts.info(
+                                                "Copying text to clipboard…",
+                                                std::time::Instant::now(),
+                                            ),
+                                            Err(error) => toasts.info_ttl(
+                                                format!("Clipboard copy failed: {error}"),
+                                                std::time::Instant::now(),
+                                                std::time::Duration::from_secs(5),
+                                            ),
+                                        }
                                     }
                                 }
                             }
