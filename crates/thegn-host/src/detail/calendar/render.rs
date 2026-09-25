@@ -7,6 +7,7 @@
 
 use chrono::{Datelike, NaiveDate, Timelike};
 use termwiz::surface::Surface;
+use thegn_core::calendar::ClockFormat;
 use thegn_core::calendar::display::{DisplayText, Field};
 
 use super::layout::{self, GRID_HEADER_ROWS};
@@ -426,16 +427,32 @@ fn clocks_table(st: &CalState) -> super::super::Section {
     let rows = readings
         .iter()
         .map(|r| {
-            let time = if st.ui.twelve_hour {
-                let h = r.local.hour();
-                let h12 = if h % 12 == 0 { 12 } else { h % 12 };
-                format!(
-                    "{h12}:{:02}{}",
-                    r.local.minute(),
-                    if h < 12 { "am" } else { "pm" }
-                )
+            let time = match &r.format {
+                ClockFormat::H12 => {
+                    let h = r.local.hour();
+                    let h12 = if h % 12 == 0 { 12 } else { h % 12 };
+                    format!(
+                        "{h12}:{:02}{}",
+                        r.local.minute(),
+                        if h < 12 { "am" } else { "pm" }
+                    )
+                }
+                ClockFormat::H24 => format!("{:02}:{:02}", r.local.hour(), r.local.minute()),
+                ClockFormat::Custom(fmt) => r.local.format(fmt).to_string(),
+            };
+            let date = if r.show_date {
+                r.local.format("%Y-%m-%d").to_string()
             } else {
-                format!("{:02}:{:02}", r.local.hour(), r.local.minute())
+                r.local.format("%a").to_string()
+            };
+            let day_delta = if r.show_date {
+                String::new()
+            } else {
+                match r.day_delta {
+                    1 => "+1d".into(),
+                    -1 => "-1d".into(),
+                    _ => String::new(),
+                }
             };
             vec![
                 Cell::Text(
@@ -446,8 +463,14 @@ fn clocks_table(st: &CalState) -> super::super::Section {
                         Tok::Slot(S::Dim)
                     },
                 ),
-                Cell::Text(r.local.format("%a").to_string(), Tok::Slot(S::Faint)),
-                Cell::Text(time, Tok::Slot(S::Text)),
+                Cell::Text(
+                    DisplayText::new(&date, Field::ClockLabel).into_string(),
+                    Tok::Slot(S::Faint),
+                ),
+                Cell::Text(
+                    DisplayText::new(&time, Field::ClockLabel).into_string(),
+                    Tok::Slot(S::Text),
+                ),
                 Cell::Text(
                     DisplayText::new(&r.abbrev, Field::ClockLabel).into_string(),
                     Tok::Slot(S::Faint),
@@ -456,14 +479,7 @@ fn clocks_table(st: &CalState) -> super::super::Section {
                     thegn_core::calendar::tz::fmt_delta(r.delta_from_home_mins),
                     Tok::Hue(thegn_core::theme::Hue::Blue),
                 ),
-                Cell::Text(
-                    match r.day_delta {
-                        1 => "+1d".into(),
-                        -1 => "-1d".into(),
-                        _ => String::new(),
-                    },
-                    Tok::Hue(thegn_core::theme::Hue::Amber),
-                ),
+                Cell::Text(day_delta, Tok::Hue(thegn_core::theme::Hue::Amber)),
             ]
         })
         .collect();

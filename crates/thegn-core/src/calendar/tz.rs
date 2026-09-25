@@ -250,13 +250,43 @@ pub fn system_zone() -> Tz {
         .unwrap_or(Tz::UTC)
 }
 
+/// The effective format for one world-clock row.
+///
+/// The inherited variants are resolved before a row reaches the host so the
+/// renderer never has to look up calendar configuration. Custom formats are
+/// validated at config admission and are deliberately limited to values that
+/// remain truthful at the existing minute-resolution tick.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClockFormat {
+    H12,
+    H24,
+    Custom(String),
+}
+
+impl ClockFormat {
+    pub fn inherited(twelve_hour: bool) -> Self {
+        if twelve_hour { Self::H12 } else { Self::H24 }
+    }
+
+    pub fn custom_or_inherited(format: &str, twelve_hour: bool) -> Self {
+        if format.is_empty() {
+            Self::inherited(twelve_hour)
+        } else {
+            Self::Custom(format.to_owned())
+        }
+    }
+}
+
 /// A world clock after config resolution: a label plus a known-good zone.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedClock {
     pub label: String,
     pub zone: Tz,
-    /// Per-clock strftime override; empty means "inherit the resolved format".
-    pub format: String,
+    /// The validated, effective row format.
+    pub format: ClockFormat,
+    /// Whether this row uses its full local date instead of a weekday and
+    /// relative day marker.
+    pub show_date: bool,
     /// True for the synthesized row showing the user's own zone.
     pub is_home: bool,
 }
@@ -280,6 +310,10 @@ pub struct ClockReading {
     pub zone: Tz,
     /// Local wall time in this zone, for formatting.
     pub local: NaiveDateTime,
+    /// The resolved row format, carried with the reading for pure rendering.
+    pub format: ClockFormat,
+    /// Whether the row's date cell should show its full local date.
+    pub show_date: bool,
     /// Total UTC offset in seconds at this instant (base + any DST shift).
     pub utc_offset_secs: i32,
     /// Whether DST is in effect right now.
@@ -314,6 +348,8 @@ pub fn read_clocks(clocks: &[ResolvedClock], now: DateTime<Utc>, home: Tz) -> Ve
                 },
                 zone: c.zone,
                 local: dt.naive_local(),
+                format: c.format.clone(),
+                show_date: c.show_date,
                 utc_offset_secs: off,
                 is_dst: comps.dst_offset().num_seconds() != 0,
                 abbrev: abbrev_or_offset(c.zone, now),
