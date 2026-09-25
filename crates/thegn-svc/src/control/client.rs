@@ -2,10 +2,12 @@
 //! daemon-backed panes speak.
 //!
 //! Talks the HTTP surface ([`super::http`]) over a unix socket (local; peer
-//! credentials are the auth) or TCP (serve mode; bearer token required). One
-//! hyper connection per request — CLI verbs are one-shot and the daemon is
-//! local, so a pool would buy nothing. The warm-attach stream rides a
-//! WebSocket (`tokio-tungstenite` over the same stream types).
+//! credentials are the auth), TCP (serve mode; bearer token required), or a
+//! client-facing HTTP(S) origin. Unix/TCP unary calls remain one hyper
+//! connection per request because the daemon is local and those callers are
+//! one-shot CLI verbs. HTTP-origin calls reuse one reqwest pool. The
+//! warm-attach stream rides a WebSocket (`tokio-tungstenite` over the same
+//! stream types).
 
 use anyhow::{Context, Result, anyhow};
 use base64::Engine as _;
@@ -76,6 +78,10 @@ pub fn discover(store: &dyn ControlStore, scope: &str, now_ms: i64) -> Option<Co
 #[derive(Clone)]
 pub struct ControlClient {
     addr: ControlAddr,
+    /// Present only for [`ControlAddr::HttpOrigin`]. `reqwest::Client` is
+    /// already internally shared, so cloning `ControlClient` also shares the
+    /// connection pool without another wrapper or a global cache.
+    http_client: Option<reqwest::Client>,
 }
 
 pub(super) fn encoded_issue_path(id: &str, suffix: &str) -> Result<String> {
@@ -299,7 +305,8 @@ fn parse_session_roster(v: Value) -> Result<Vec<SessionInfo>> {
 
 impl ControlClient {
     pub fn new(addr: ControlAddr) -> Self {
-        Self { addr }
+        let http_client = matches!(&addr, ControlAddr::HttpOrigin { .. }).then(build_http_client);
+        Self { addr, http_client }
     }
 
     pub fn addr(&self) -> &ControlAddr {
@@ -331,7 +338,11 @@ impl ControlClient {
                 send_request(stream, method, path, self.token(), body).await?
             }
             ControlAddr::HttpOrigin { origin, token } => {
-                send_origin_request(origin, token, method, path, body).await?
+                let client = self
+                    .http_client
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("HTTP-origin client has no configured transport"))?;
+                send_origin_request(client, origin, token, method, path, body).await?
             }
         };
         if (200..300).contains(&status) {
@@ -1214,12 +1225,40 @@ fn websocket_url(origin: &str, path: &str) -> Result<String> {
     Ok(url.to_string())
 }
 
+/// Build the one unary HTTP transport for an HTTP-origin client.
+///
+/// Keep every reqwest transport policy here. The current contract is exactly
+/// the historical one: redirects are disabled, and no timeout or response
+/// body cap is added here. THE-273 owns those policies; when that contract is
+/// ready, this is the single construction point where it belongs.
+///
+/// `ControlClient::new` is intentionally infallible because it is used by
+/// command paths that already have an established construction contract. A
+/// malformed proxy/TLS environment can make reqwest's builder fail, so retain
+/// the previous best-effort behavior with reqwest's default client as a
+/// fallback. Normal validated configurations always take the policy-bearing
+/// path above.
+fn build_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap_or_else(|error| {
+            tracing::warn!(
+                target: "thegn::control",
+                %error,
+                "could not build policy-configured control HTTP client; using reqwest fallback"
+            );
+            reqwest::Client::new()
+        })
+}
+
 /// Send one request to the client-facing HTTP(S) origin. Redirects are
 /// explicitly disabled: a 307/308 must never replay an authenticated command
 /// body at a second origin. Reqwest supplies the normal WebPKI verification
 /// path for `https`; TLS termination remains outside thegn's plaintext loopback
 /// backend.
 async fn send_origin_request(
+    client: &reqwest::Client,
     origin: &str,
     token: &str,
     method: &str,
@@ -1229,10 +1268,6 @@ async fn send_origin_request(
     let method = reqwest::Method::from_bytes(method.as_bytes())
         .with_context(|| format!("invalid control HTTP method {method:?}"))?;
     let url = origin_request_url(origin, path)?;
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .context("build control HTTP client")?;
     let mut request = client.request(method, url).bearer_auth(token);
     if let Some(body) = body {
         request = request.json(&body);
@@ -1383,6 +1418,121 @@ mod tests {
         };
         server.await.unwrap();
         result
+    }
+
+    #[tokio::test]
+    async fn http_origin_reuses_one_connection_across_client_clones() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let accepted_by_server = Arc::clone(&accepted);
+        let server = tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                accepted_by_server.fetch_add(1, Ordering::Relaxed);
+                tokio::spawn(async move {
+                    let mut stream = BufReader::new(stream);
+                    for request_no in 0..2 {
+                        let mut line = Vec::new();
+                        loop {
+                            line.clear();
+                            if stream.read_until(b'\n', &mut line).await.unwrap() == 0 {
+                                return;
+                            }
+                            if line == b"\r\n" {
+                                break;
+                            }
+                        }
+                        let connection = if request_no == 0 {
+                            "keep-alive"
+                        } else {
+                            "close"
+                        };
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: {connection}\r\n\r\n{{}}"
+                        );
+                        stream
+                            .get_mut()
+                            .write_all(response.as_bytes())
+                            .await
+                            .unwrap();
+                    }
+                });
+            }
+        });
+
+        let client = ControlClient::new(ControlAddr::HttpOrigin {
+            origin: format!("http://{addr}"),
+            token: "pool-token".into(),
+        });
+        client.clone().health().await.unwrap();
+        client.health().await.unwrap();
+
+        assert_eq!(accepted.load(Ordering::Relaxed), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn replacing_http_origin_client_keeps_in_flight_work_on_old_client() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        async fn serve_one(listener: tokio::net::TcpListener, delay: std::time::Duration) {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut chunk = [0; 1024];
+                let n = stream.read(&mut chunk).await.unwrap();
+                assert!(n > 0, "client closed before sending request");
+                request.extend_from_slice(&chunk[..n]);
+                assert!(request.len() <= 64 * 1024, "request headers exceeded bound");
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            tokio::time::sleep(delay).await;
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                )
+                .await
+                .unwrap();
+        }
+
+        let old_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let old_addr = old_listener.local_addr().unwrap();
+        let old_server = tokio::spawn(serve_one(
+            old_listener,
+            std::time::Duration::from_millis(20),
+        ));
+        let old_client = ControlClient::new(ControlAddr::HttpOrigin {
+            origin: format!("http://{old_addr}"),
+            token: "old-token".into(),
+        });
+        let old_request = tokio::spawn({
+            let client = old_client.clone();
+            async move { client.health().await }
+        });
+        drop(old_client);
+
+        let replacement_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let replacement_addr = replacement_listener.local_addr().unwrap();
+        let replacement_server =
+            tokio::spawn(serve_one(replacement_listener, std::time::Duration::ZERO));
+        let replacement = ControlClient::new(ControlAddr::HttpOrigin {
+            origin: format!("http://{replacement_addr}"),
+            token: "new-token".into(),
+        });
+
+        replacement.health().await.unwrap();
+        old_request.await.unwrap().unwrap();
+        old_server.await.unwrap();
+        replacement_server.await.unwrap();
     }
 
     #[test]
