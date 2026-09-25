@@ -1334,6 +1334,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn request_timeout_transition_failure_is_not_reported_as_unapplied() {
+        let (result, requests) = run_update_recorded(
+            IssuePatch {
+                status: Some(IssueStatus::Done),
+                ..Default::default()
+            },
+            vec![
+                transition_fixture("done"),
+                FixtureResponse::new(StatusCode::REQUEST_TIMEOUT, "request-timeout-body"),
+                FixtureResponse::new(StatusCode::BAD_GATEWAY, "verification-body"),
+            ],
+        )
+        .await;
+
+        match result {
+            Err(IssueError::PartialUpdate {
+                applied,
+                unapplied,
+                source,
+            }) => {
+                assert!(applied.is_empty());
+                assert!(
+                    unapplied.is_empty(),
+                    "an HTTP timeout/intermediary response is ambiguous"
+                );
+                assert!(
+                    matches!(source.as_ref(), IssueError::Api(message) if message.contains("outcome unknown") && message.contains("verify before retrying"))
+                );
+            }
+            other => panic!("expected unknown transition outcome, got {other:?}"),
+        }
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request.call.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "GET /rest/api/3/issue/PROJ-1/transitions",
+                "POST /rest/api/3/issue/PROJ-1/transitions",
+                "GET /rest/api/3/issue/PROJ-1",
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn transition_lookup_http_failure_is_propagated_without_followup() {
         let (result, calls) = run_update(
             IssuePatch {
