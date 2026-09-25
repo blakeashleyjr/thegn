@@ -208,14 +208,17 @@ fn world_clock_rows_honor_mixed_formats_dates_and_safe_narrow_output() {
     };
     let mut surface = Surface::new(80, 30);
     render::render_calendar(&mut surface, inner, 0, &detail);
-    let painted: String = surface
+    let painted_rows: Vec<String> = surface
         .screen_cells()
         .iter()
         .map(|row| row.iter().map(|c| c.str().to_string()).collect::<String>())
-        .collect::<Vec<_>>()
-        .join("\n");
+        .collect();
+    let painted: String = painted_rows.join("\n");
     assert!(painted.contains("22:00"), "{painted}");
-    assert!(painted.contains("07:00 PM"), "{painted}");
+    // 2026-08-21 22:00 UTC is 2026-08-22 07:00 in Tokyo (UTC+9), so this row's
+    // `%I:%M %p` override renders AM. It also proves the per-row custom format
+    // beat the global 24-hour setting that the `home` row above still uses.
+    assert!(painted.contains("07:00 AM"), "{painted}");
     assert!(painted.contains("2026-08-22"), "{painted}");
     assert!(
         painted.contains("2026-08-21"),
@@ -225,7 +228,16 @@ fn world_clock_rows_honor_mixed_formats_dates_and_safe_narrow_output() {
         painted.contains("+1d"),
         "hidden dates retain the delta: {painted}"
     );
-    assert!(!painted.chars().any(char::is_control), "{painted}");
+    // The `kathmandu` row's format is `%H:%M%n%t`, whose `%n`/`%t` expand to a
+    // newline and a tab. They must not survive into the surface. Check the
+    // rows individually: `painted` is joined with '\n', so asserting on it
+    // would always trip on the separator rather than on rendered content.
+    for (y, row) in painted_rows.iter().enumerate() {
+        assert!(
+            !row.chars().any(char::is_control),
+            "control char in row {y}: {row:?}"
+        );
+    }
     for row in surface.screen_cells() {
         for (x, cell) in row.iter().enumerate() {
             if x < inner.x || x >= inner.x + inner.cols {

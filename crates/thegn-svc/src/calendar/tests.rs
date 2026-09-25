@@ -407,19 +407,26 @@ fn router_policy_blocks_command_plugin_before_provider_invocation() {
         }],
         ..CalendarConfig::default()
     };
-    let router = router(&cfg);
-    assert_eq!(router.caps("plugin").unwrap().create, false);
+    // Not `let router = …`: that shadows the `router()` helper for the rest of
+    // the function, and later cases in this test still need to build one.
+    let read_only_router = router(&cfg);
+    assert!(!read_only_router.caps("plugin").unwrap().create);
     let event = mutation_event();
     assert!(matches!(
-        block_on(router.create_event("plugin", &event)),
+        block_on(read_only_router.create_event("plugin", &event)),
         Err(CalendarError::ReadOnly(CalendarMutation::Create))
     ));
     assert!(matches!(
-        block_on(router.update_event("plugin", "mutation", &event, EditScope::AllInstances)),
+        block_on(read_only_router.update_event(
+            "plugin",
+            "mutation",
+            &event,
+            EditScope::AllInstances
+        )),
         Err(CalendarError::ReadOnly(CalendarMutation::Update))
     ));
     assert!(matches!(
-        block_on(router.delete_event("plugin", "mutation", EditScope::AllInstances)),
+        block_on(read_only_router.delete_event("plugin", "mutation", EditScope::AllInstances)),
         Err(CalendarError::ReadOnly(CalendarMutation::Delete))
     ));
     assert!(
@@ -430,7 +437,7 @@ fn router_policy_blocks_command_plugin_before_provider_invocation() {
     let mut writable_cfg = cfg.clone();
     writable_cfg.accounts[0].read_only = false;
     let writable_router = router(&writable_cfg);
-    assert_eq!(writable_router.caps("plugin").unwrap().create, false);
+    assert!(!writable_router.caps("plugin").unwrap().create);
     assert!(matches!(
         block_on(writable_router.create_event("plugin", &event)),
         Err(CalendarError::Unsupported("creating events"))
@@ -449,7 +456,7 @@ fn router_policy_blocks_command_plugin_before_provider_invocation() {
         Err(CalendarError::Unsupported("deleting events"))
     ));
     assert!(matches!(
-        router.caps("missing"),
+        read_only_router.caps("missing"),
         Err(CalendarError::NotConfigured)
     ));
 

@@ -208,7 +208,7 @@ mod tests {
         assert!(matches!(
             &result,
             Err(crate::forge::ForgeError::NotConfigured(message))
-                if message.to_string() == "push repository"
+                if message.as_ref() == "push repository"
         ));
     }
 

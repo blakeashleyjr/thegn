@@ -524,12 +524,28 @@ impl CalendarRouter {
         !self.accounts.is_empty()
     }
 
+    // The account-scoped mutation dispatch below. Nothing in production calls
+    // these yet — no built-in backend can write, which is exactly the situation
+    // THE-463 is about — so they are dead outside the policy tests that prove
+    // the boundary denies correctly.
+    //
+    // They are deliberately NOT `pub`: exporting a calendar mutation API that
+    // can only ever deny would recreate the untruthful-surface defect this
+    // change removes. They are equally deliberately not deleted — the boundary
+    // has to exist before a writable backend arrives, or that backend lands
+    // with no single place to enforce account policy, and `EditScope` cannot be
+    // retrofitted later without breaking the plugin wire format.
+    //
+    // Drop this allow when the first real mutation route calls through here.
+    #[allow(dead_code)]
     /// Capabilities advertised by one account-bound provider.
     pub(crate) fn caps(&self, account: &str) -> Result<CalendarCaps, CalendarError> {
         self.account(account).map(|backend| backend.inner.caps())
     }
 
     /// Create an event through the account-bound policy boundary.
+    // See the dead-code note on `caps` above.
+    #[allow(dead_code)]
     pub(crate) async fn create_event(
         &self,
         account: &str,
@@ -539,6 +555,8 @@ impl CalendarRouter {
     }
 
     /// Update an event through the account-bound policy boundary.
+    // See the dead-code note on `caps` above.
+    #[allow(dead_code)]
     pub(crate) async fn update_event(
         &self,
         account: &str,
@@ -553,6 +571,8 @@ impl CalendarRouter {
     }
 
     /// Delete an event through the account-bound policy boundary.
+    // See the dead-code note on `caps` above.
+    #[allow(dead_code)]
     pub(crate) async fn delete_event(
         &self,
         account: &str,
