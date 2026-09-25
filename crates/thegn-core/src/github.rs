@@ -385,7 +385,14 @@ mod branch_resolution_tests {
     use std::path::Path;
 
     fn git(dir: &Path, args: &[&str]) {
-        let status = crate::util::git_cmd(dir).args(args).status().unwrap();
+        // See the note in forge/checkout.rs: a fixture that inherits the
+        // developer's `commit.gpgSign = true` blocks on gpg-agent and fails
+        // ~60s later, so the suite's result depends on a cached passphrase.
+        let status = crate::util::git_cmd(dir)
+            .args(["-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false"])
+            .args(args)
+            .status()
+            .unwrap();
         assert!(status.success(), "git {args:?} failed: {status}");
     }
 

@@ -118,7 +118,16 @@ mod tests {
     use std::path::Path;
 
     fn git(dir: &Path, args: &[&str]) {
-        let status = crate::util::git_cmd(dir).args(args).status().unwrap();
+        // Never inherit the developer's signing config. With `commit.gpgSign =
+        // true` in a real ~/.gitconfig these fixtures block on gpg-agent and
+        // fail ~60s later, so the suite passes or fails depending on whether a
+        // passphrase happens to be cached — which is exactly how this reached
+        // the merge gate green from one machine and red from another.
+        let status = crate::util::git_cmd(dir)
+            .args(["-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false"])
+            .args(args)
+            .status()
+            .unwrap();
         assert!(status.success(), "git {args:?} failed: {status}");
     }
 
