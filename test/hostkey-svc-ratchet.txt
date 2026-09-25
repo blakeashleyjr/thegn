@@ -4,6 +4,7 @@
 # (vps/ssh_shim.rs, host/mod.rs iroh) routes through
 # `thegn_core::hostkey::host_key_args` — so this allowlist is EMPTY, and a new
 # literal in svc must go through the chokepoint (never be pinned here).
+# RATCHET-EMPTY
 #
 # SHRINK-ONLY. Enforced by `host_key_literals_stay_in_the_chokepoint` in
 # crates/thegn-svc/src/platform_ratchet_tests.rs (runs in `just test`);
