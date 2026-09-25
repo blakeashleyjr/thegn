@@ -1,15 +1,60 @@
-# Primary plan review: revise before implementation
+# Primary review + greenlight — THE-194
 
-The investigation establishes the bugs, but the proposed new manifest authority and blanket foreign-key rewrite are not yet approved. Git is the repository's source of truth; the DB remains a cache. Produce concrete serial implementation chunks that preserve this invariant and cover the full issue without importing unrelated features.
+Reviewing row 538's investigation (`.thegn/pipeline/THE-194/maintenance-investigate/538.md`).
 
-Decisions and constraints:
+**Verdict: APPROVED to implement.** The investigation found the real mismatch and
+the primary independently confirmed it.
 
-- Canonical repository identity comes from exact Git common-directory identity, not origin or basename. Keep path/ref bytes lossless on supported platforms and make unsupported representations a typed refusal before mutation. Display text is separate. Scope keys must not depend on DB availability.
-- Prefer versioned, bounded components using the full collision-resistant digest of length-delimited exact identity inputs, with optional bounded readable prefixes. Do not truncate hashes to six/eight hex digits or use lossy string conversions. A digest selects a candidate; authoritative reuse/removal still verifies exact Git metadata and claimant identity.
-- Reuse Git worktree administrative identity and the repository mutation lock where possible. A private journal may record incomplete rename/migration, but do not invent a competing user-facing manifest source of truth. Explain precisely which data needs persistence versus derivation/revalidation.
-- Legacy existing worktrees must remain reachable at their current paths; never mass-move existing user worktrees automatically. Migrate tab/cache identities only after unique exact matching against Git, and quarantine ambiguity before opening/routing/deleting/assigning. Eliminate LIMIT 1 selection of contested identities and basename fallback for authority. Read-only degraded display may use last-known exact mappings.
-- Define generation changes and stale-result rejection at actual creation/rename/publication boundaries. Show the data that each consumer needs. Do not implement entire downstream sandbox/drawer feature issues; update their existing identity inputs and leave no ambiguous route introduced by this fix.
-- Rename must preflight destination and membership under lock, journal the steps, revalidate exact source/destination, and recover after branch/move/DB failure. Decide explicitly if stable physical checkout paths can be preserved during a label rename; retain documented behavior unless the maintenance change is justified. Never silently report success after partial mutation.
-- Feature identities must distinguish exact names that normalize alike; preserve intentional membership and legacy project associations with explicit unambiguous mapping. Explain the minimum schema changes needed, not a blanket conversion of all caches into authority.
+## Confirmed mechanism
 
-Deliver ordered chunks with exact APIs, schema/compatibility strategy, all call-site migrations, fault-injection and acceptance tests, and first-chunk recommendation. Include THE-515 coordination: it will reuse this repository identity rather than develop another algorithm. No production changes, builds or child agents yet.
+Production at `crates/thegn-host/src/handlers/plugins.rs` does:
+
+```rust
+HostVerb::Register => serde_json::from_value::<Contribution>(params)
+```
+
+`params` **is** the `Contribution`, flat. But `examples/plugins/hello.sh:12`
+sends it nested:
+
+```json
+{"method":"register","params":{"plugin":"hello","contribution":{"id":"hello.seg", …}}}
+```
+
+`from_value::<Contribution>` on that object fails — the Contribution's own
+fields are one level down. So the shipped example cannot register against the
+current protocol, exactly as the issue claims, and the golden test hid it by
+substituting `neg.accepted_contributions[0]` at `plugin_example.rs:67-69`
+instead of parsing what the script actually sent.
+
+## What to implement
+
+1. **`examples/plugins/hello.sh`** — send the `Contribution` flat as `params`.
+   Keep `#!/usr/bin/env sh`, keep it ShellCheck-clean, and keep the teaching
+   comments accurate (the "stray echo becomes junk" demo is good — preserve it).
+2. **`crates/thegn-svc/tests/plugin_example.rs`** — parse
+   `msg.params["contribution"]`… no: parse **`msg.params` itself** as the
+   `Contribution`, mirroring production, and register that. The negotiated
+   manifest contribution must no longer be substituted. After this change the
+   script's register params are load-bearing and an invalid example fails the
+   test.
+3. **Negative contract test** — feed deliberately malformed register params and
+   assert a typed diagnostic (the `RpcErrorCode::Invalid` / "bad contribution"
+   path), so the fixed test cannot regress into accepting anything.
+4. **Drift guard** — the test must execute or byte-for-byte feed the exact
+   committed file. It already spawns the real script; keep that and do not
+   reintroduce any test-time rewriting of its content.
+
+## Constraints
+
+- Fix the **example**, not the runtime. Do not relax `from_value::<Contribution>`
+  to accept the nested shape — the flat shape is the protocol.
+- THE-166/THE-162 are unlanded and confirmed non-prerequisites. Do not implement
+  manifest enforcement or verb truthfulness here.
+- Update the example's comments/docs if the flat shape makes any of them wrong,
+  and check `docs/extending/plugin.md` + `openspec/specs/plugin-api` for the same
+  nested-shape error; if they are also wrong, fix them — that is the same defect.
+
+## Validation
+
+Do not run cargo/nextest/clippy. The primary runs the batch gate. Record the
+focused filters plus the ShellCheck invocation.
