@@ -1680,6 +1680,27 @@ mod tests {
         )));
     }
 
+    #[test]
+    fn poisoned_positive_cache_falls_back_to_an_uncached_probe() {
+        let cache = Arc::new(Mutex::new(HashMap::from([(
+            "tool".to_string(),
+            Some("/bin/tool".to_string()),
+        )])));
+        let poisoned = Arc::clone(&cache);
+        let thread = std::thread::spawn(move || {
+            let _guard = poisoned.lock().unwrap();
+            panic!("poison a cache containing a positive entry");
+        });
+        assert!(thread.join().is_err());
+
+        let probes = std::sync::atomic::AtomicUsize::new(0);
+        assert!(!cached_have(cache.as_ref(), "tool", |_| {
+            probes.fetch_add(1, Ordering::Relaxed);
+            None
+        }));
+        assert_eq!(probes.load(Ordering::Relaxed), 1);
+    }
+
     #[cfg(unix)]
     #[test]
     fn bounded_stdout_handles_idle_and_oversized_injected_children() {
