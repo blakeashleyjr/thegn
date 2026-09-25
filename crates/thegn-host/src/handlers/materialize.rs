@@ -146,7 +146,7 @@ pub(crate) fn maybe_materialize(
             }));
             f()
         };
-        let (specs, attach) = if is_terminal {
+        let (specs, attach, relaunch) = if is_terminal {
             // Prefer this session's wizard-submitted choice (registry) over the
             // DB row: a failed best-effort persist must not silently downgrade
             // what spawns in the live session.
@@ -178,11 +178,19 @@ pub(crate) fn maybe_materialize(
                     })
                     .map_err(spec_err);
             // Terminal groups host no agent sessions to attach.
-            (spec_result, Vec::new())
+            (
+                spec_result,
+                Vec::new(),
+                crate::handlers::worktree_launch::RelaunchOutcome::NotAttempted,
+            )
         } else if let Some(halt) = crate::agent::env_halt_reason(&cfg, &wt) {
             // Non-local env, failover off, known-down (token unset / exec
             // cooldown): halt rather than degrade to host.
-            (Err(SpecError::Halt(Box::new(halt))), Vec::new())
+            (
+                Err(SpecError::Halt(Box::new(halt))),
+                Vec::new(),
+                crate::handlers::worktree_launch::RelaunchOutcome::NotAttempted,
+            )
         } else {
             // FAST PATH: claim a pre-provisioned warm spare for this
             // (repo, env) — an instant hand-over (bind + branch checkout)
@@ -284,7 +292,7 @@ pub(crate) fn maybe_materialize(
             // leaf's process (resume-aware, record-preserving — see
             // `worktree_launch`). A live session still wins (never doubled);
             // a quiet split/add is a shell gesture and stays a shell.
-            crate::handlers::worktree_launch::apply_relaunch(
+            let relaunch = crate::handlers::worktree_launch::apply_relaunch(
                 &mut specs,
                 &cfg,
                 &wt,
@@ -292,7 +300,7 @@ pub(crate) fn maybe_materialize(
                 attach.is_empty(),
                 quiet,
             );
-            (specs, attach)
+            (specs, attach, relaunch)
         };
         if spec_tx
             .send(SpecBatch {
@@ -302,6 +310,7 @@ pub(crate) fn maybe_materialize(
                 target_leaves,
                 origin: SpecOrigin::Materialize,
                 specs,
+                relaunch,
                 attach,
             })
             .is_ok()
