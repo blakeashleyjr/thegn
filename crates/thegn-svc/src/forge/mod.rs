@@ -596,7 +596,7 @@ mod tests {
 
     #[test]
     fn not_configured_falls_through_to_cli() {
-        let l = ladder(Err(ForgeError::NotConfigured("no token")));
+        let l = ladder(Err(ForgeError::NotConfigured("no token".into())));
         assert_eq!(l.pr_status(&loc(), PrRef::Current).unwrap().number, 99);
         // An op only the CLI layer has: Unsupported on native falls through.
         assert!(
@@ -609,7 +609,7 @@ mod tests {
 
     #[test]
     fn authorship_falls_back_as_one_operation_and_auth_errors_remain_final() {
-        let l = ladder(Err(ForgeError::NotConfigured("no native identity")));
+        let l = ladder(Err(ForgeError::NotConfigured("no native identity".into())));
         assert!(l.caps().pr_authorship);
         let proof = l.pr_authorship(&loc(), 7).unwrap();
         assert_eq!(proof.author.id, "cli");
