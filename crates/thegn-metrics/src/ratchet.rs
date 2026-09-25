@@ -551,6 +551,9 @@ mod tests {
         assert!(!has_platform_cfg(
             "#[cfg(kani)] #[cfg(any(test, feature = \"x\"))]"
         ));
+        assert!(!has_platform_cfg(
+            "#[cfg_attr(feature = \"x\", derive(target_os))]"
+        ));
     }
 
     #[test]
