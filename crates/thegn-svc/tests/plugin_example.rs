@@ -58,6 +58,17 @@ fn hello_example_registers_and_renders_through_the_real_path() {
     )
     .expect("hello.sh runs");
     assert!(run.junk.is_empty(), "example must not print junk: {run:?}");
+    assert!(
+        !run.truncated,
+        "example output must not hit the NDJSON line cap"
+    );
+    assert_eq!(
+        run.messages.len(),
+        2,
+        "the shipped one-shot example must emit exactly register and update"
+    );
+    assert_eq!(run.messages[0].method, "register");
+    assert_eq!(run.messages[1].method, "update");
 
     // Apply its messages to the core runtime.
     let mut rt = PluginRuntime::new(neg.clone());
