@@ -368,4 +368,23 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn equivalent_floored_loc_cadences_do_not_change_the_projection() {
+        let mut low = Config::default();
+        low.loc.enabled = true;
+        low.loc.scan_interval_secs = 1;
+        let mut high = low.clone();
+        high.loc.scan_interval_secs = 2;
+
+        // `pump_slots` divides the TTL by four and floors the result at the
+        // LOC pump floor, so both values select the same worker cadence. A
+        // live reload between equivalent values must not restart the slot or
+        // bump its generation.
+        assert_eq!(
+            ScheduleConfig::from_config(&low),
+            ScheduleConfig::from_config(&high),
+            "projection must compare effective cadence, not raw LOC TTL"
+        );
+    }
 }
