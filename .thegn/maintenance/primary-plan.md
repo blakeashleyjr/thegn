@@ -1,15 +1,65 @@
-# Primary plan review: revise before implementation
+# Primary review + greenlight — THE-189
 
-The investigation establishes the bugs, but the proposed new manifest authority and blanket foreign-key rewrite are not yet approved. Git is the repository's source of truth; the DB remains a cache. Produce concrete serial implementation chunks that preserve this invariant and cover the full issue without importing unrelated features.
+Reviewing row 542's investigation (`.thegn/pipeline/THE-189/maintenance-investigate/542.md`).
 
-Decisions and constraints:
+**Verdict: APPROVED to implement, points 1-6 exactly as written.** This is the
+strongest plan in the batch. Implement it as specified; the notes below are
+emphasis, not changes.
 
-- Canonical repository identity comes from exact Git common-directory identity, not origin or basename. Keep path/ref bytes lossless on supported platforms and make unsupported representations a typed refusal before mutation. Display text is separate. Scope keys must not depend on DB availability.
-- Prefer versioned, bounded components using the full collision-resistant digest of length-delimited exact identity inputs, with optional bounded readable prefixes. Do not truncate hashes to six/eight hex digits or use lossy string conversions. A digest selects a candidate; authoritative reuse/removal still verifies exact Git metadata and claimant identity.
-- Reuse Git worktree administrative identity and the repository mutation lock where possible. A private journal may record incomplete rename/migration, but do not invent a competing user-facing manifest source of truth. Explain precisely which data needs persistence versus derivation/revalidation.
-- Legacy existing worktrees must remain reachable at their current paths; never mass-move existing user worktrees automatically. Migrate tab/cache identities only after unique exact matching against Git, and quarantine ambiguity before opening/routing/deleting/assigning. Eliminate LIMIT 1 selection of contested identities and basename fallback for authority. Read-only degraded display may use last-known exact mappings.
-- Define generation changes and stale-result rejection at actual creation/rename/publication boundaries. Show the data that each consumer needs. Do not implement entire downstream sandbox/drawer feature issues; update their existing identity inputs and leave no ambiguous route introduced by this fix.
-- Rename must preflight destination and membership under lock, journal the steps, revalidate exact source/destination, and recover after branch/move/DB failure. Decide explicitly if stable physical checkout paths can be preserved during a label rename; retain documented behavior unless the maintenance change is justified. Never silently report success after partial mutation.
-- Feature identities must distinguish exact names that normalize alike; preserve intentional membership and legacy project associations with explicit unambiguous mapping. Explain the minimum schema changes needed, not a blanket conversion of all caches into authority.
+## What the primary is specifically endorsing
 
-Deliver ordered chunks with exact APIs, schema/compatibility strategy, all call-site migrations, fault-injection and acceptance tests, and first-chunk recommendation. Include THE-515 coordination: it will reuse this repository identity rather than develop another algorithm. No production changes, builds or child agents yet.
+- **Point 1** — sibling `hydrate_schedule.rs`, nothing added to `run.rs`. This
+  was the primary's hard constraint and the plan honours it.
+- **Point 2** — one shared worker with one owned handle, **not** a timer per
+  feature. This is what protects the 0%-idle contract; do not "simplify" it
+  into per-class tasks.
+- **Point 3** — replaceable command boundary with a monotonic generation, and
+  re-arm only changed slots **at their next normal boundary**. No immediate
+  refresh on rebuild.
+- **Point 5** — the `Err` reload path does not call `reconfigure`, so an
+  invalid reload keeps the last effective schedule and its existing status
+  message. Exactly right; never fall back to defaults.
+- **Point 6** — reuse the existing `hydrate_refresh_ticker.rs` I/O adapter and
+  THE-483's reviewed arithmetic rather than duplicating it, and reuse the
+  existing `TickerIo` fake-clock fixtures. Reusing the reviewed fixtures is why
+  this lane is tractable — the primary's brief said to stop and report if a
+  fake-time seam had to be built from scratch, and it does not.
+
+## Point 4 is the best judgement in the plan — hold that line
+
+> "preserve untagged event-driven/user-forced refreshes so this change does not
+> disable legitimate on-demand work"
+
+This is the failure mode a naive generation fence would introduce: fencing
+_every_ refresh by schedule generation would silently break manual refresh and
+event-driven updates, turning a scheduling fix into a worse bug. Only
+**scheduler-originated** requests and deliveries carry the generation and are
+discardable. Add an explicit test that a user-forced refresh still lands
+immediately after a reload — that is the regression guard for this exact
+mistake.
+
+## Restated invariants (CLAUDE.md, and they bite here)
+
+- **0% idle.** The loop blocks on `poll_input(None)`. The rebuildable schedule
+  must not become a new wake source at rest. The idle-loop poll ratchet runs in
+  `just test`; design for it.
+- **Pulse the `TerminalWaker`** on every send from the off-loop worker — and
+  only for actual refresh messages, as point 3 says.
+- **No blocking I/O on the loop**, including during `reconfigure`.
+- **`render_plan::plan` stays pure** — it must not consult scheduler state.
+- New long-lived threads declare a QoS class (`platform::qos`); housekeeping is
+  `Background`, not the `Interactive` default.
+
+## Tests
+
+The ordered plan is approved. Required coverage: every ticker class named in
+the issue (clock, CI, PR, usage, weather, calendar, LOC); rapid successive
+reloads; disable while work is in flight; a stale-generation result arriving
+after reload; shutdown joins the handle; **no restart when a projection is
+unchanged**; and the user-forced-refresh guard above. Fake clock, not sleeps.
+
+## Validation
+
+Do not run cargo/nextest/clippy. The primary runs the batch gate centrally.
+Because this touches the loop wiring, list every `run.rs` line you changed so
+the primary can review the wiring diff specifically.
