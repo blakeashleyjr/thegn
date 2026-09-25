@@ -1,5 +1,5 @@
 use super::*;
-use chrono::{Datelike, NaiveDate, TimeZone, Timelike, Weekday};
+use chrono::{Datelike, Days, NaiveDate, TimeZone, Timelike, Weekday};
 use chrono_tz::Tz;
 
 fn d(y: i32, m: u32, day: u32) -> NaiveDate {
@@ -91,6 +91,114 @@ fn iso_week_numbers_are_not_hand_rolled_across_the_new_year() {
     let jan1 = g.cells().find(|c| c.date == d(2027, 1, 1)).unwrap();
     assert_eq!(jan1.iso_week, 53);
     assert_eq!(d(2027, 1, 4).iso_week().week(), 1, "the following Monday");
+}
+
+#[test]
+fn monday_week_numbers_remain_the_existing_iso_values() {
+    let jan = MonthGrid::build(2021, 1, Weekday::Mon, d(2021, 1, 1), true).unwrap();
+    let existing: Vec<_> = jan.weeks.iter().map(|week| week[0].iso_week).collect();
+    assert_eq!(jan.week_numbers(), existing);
+    assert_eq!(jan.week_numbers(), vec![53, 1, 2, 3, 4, 5]);
+
+    let dec = MonthGrid::build(2026, 12, Weekday::Mon, d(2026, 12, 1), true).unwrap();
+    let existing: Vec<_> = dec.weeks.iter().map(|week| week[0].iso_week).collect();
+    assert_eq!(dec.week_numbers(), existing);
+    assert_eq!(dec.week_numbers(), vec![49, 50, 51, 52, 53, 1]);
+}
+
+#[test]
+fn non_monday_week_numbers_follow_the_configured_row_boundary() {
+    let cases = [
+        (
+            Weekday::Mon,
+            vec![53, 1, 2, 3, 4, 5],
+            vec![49, 50, 51, 52, 53, 1],
+        ),
+        (
+            Weekday::Sun,
+            vec![53, 1, 2, 3, 4, 5],
+            vec![48, 49, 50, 51, 52, 1],
+        ),
+        (
+            Weekday::Sat,
+            vec![52, 1, 2, 3, 4, 5],
+            vec![48, 49, 50, 51, 52, 1],
+        ),
+    ];
+
+    for (week_start, january, december) in cases {
+        let jan = MonthGrid::build(2021, 1, week_start, d(2021, 1, 1), true).unwrap();
+        assert_eq!(jan.week_numbers(), january, "January with {week_start:?}");
+        assert_eq!(jan.week_numbers().len(), jan.weeks.len());
+
+        let dec = MonthGrid::build(2026, 12, week_start, d(2026, 12, 1), true).unwrap();
+        assert_eq!(dec.week_numbers(), december, "December with {week_start:?}");
+        assert_eq!(dec.week_numbers().len(), dec.weeks.len());
+    }
+}
+
+#[test]
+fn non_monday_rows_do_not_use_the_first_cell_iso_week() {
+    let sunday = MonthGrid::build(2021, 1, Weekday::Sun, d(2021, 1, 1), true).unwrap();
+    assert_eq!(sunday.weeks[1][0].date, d(2021, 1, 3));
+    assert_eq!(sunday.weeks[1][0].iso_week, 53);
+    assert_eq!(sunday.weeks[1][1].iso_week, 1);
+    assert_eq!(sunday.week_numbers()[1], 1);
+
+    let saturday = MonthGrid::build(2021, 1, Weekday::Sat, d(2021, 1, 1), true).unwrap();
+    assert_eq!(saturday.weeks[1][0].date, d(2021, 1, 2));
+    assert_eq!(saturday.weeks[1][0].iso_week, 53);
+    assert_eq!(saturday.weeks[1][2].iso_week, 1);
+    assert_eq!(saturday.week_numbers()[1], 1);
+}
+
+#[test]
+fn auto_week_start_feeds_the_truthful_row_numbering() {
+    for (locale, week_start, expected) in [
+        ("en_US.UTF-8", Weekday::Sun, 1),
+        ("ar_EG", Weekday::Sat, 1),
+        ("en_GB.UTF-8", Weekday::Mon, 1),
+    ] {
+        let resolved = resolve_week_start(None, Some(locale));
+        assert_eq!(resolved, week_start, "auto start for {locale}");
+        let grid = MonthGrid::build(2021, 1, resolved, d(2021, 1, 1), true).unwrap();
+        assert_eq!(
+            grid.week_numbers()[1],
+            expected,
+            "January crossover for {locale}"
+        );
+    }
+}
+
+#[test]
+fn week_numbering_stays_total_at_chrono_date_boundaries() {
+    let first = NaiveDate::MIN;
+    let min_grid =
+        MonthGrid::build(first.year(), first.month(), first.weekday(), first, false).unwrap();
+    assert!(!min_grid.week_numbers().is_empty());
+
+    let last = NaiveDate::MAX;
+    let last_row_start = last.checked_sub_days(Days::new(6)).unwrap();
+    let last_row = std::array::from_fn(|index| {
+        let date = last_row_start
+            .checked_add_days(Days::new(index as u64))
+            .unwrap();
+        DayCell {
+            date,
+            in_month: true,
+            is_today: false,
+            iso_week: date.iso_week().week(),
+            weekday: date.weekday(),
+        }
+    });
+    let max_grid = MonthGrid {
+        year: last.year(),
+        month: last.month(),
+        week_start: last_row_start.weekday(),
+        weeks: vec![last_row],
+    };
+    assert!(!max_grid.week_numbers().is_empty());
+    assert_eq!(max_grid.span().1, last);
 }
 
 #[test]
