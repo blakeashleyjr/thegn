@@ -804,6 +804,25 @@ mod tests {
         assert!(error.contains("loop"), "{error}");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_source_root_fails_closed_without_external_traversal() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest = tmp.path().join("crates/x");
+        let external_src = tmp.path().join("external-src");
+        std::fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&external_src).unwrap();
+        std::fs::write(external_src.join("escaped.rs"), "fn escaped() {}\n").unwrap();
+        symlink(&external_src, manifest.join("src")).unwrap();
+        let manifest = manifest.to_string_lossy().into_owned();
+
+        let error = sources_with(&RealIo, &manifest, &[]).unwrap_err();
+        assert!(error.contains("refuse symlinked source entry"), "{error}");
+        assert!(error.contains("src"), "{error}");
+    }
+
     #[test]
     fn ratchet_helper_copies_are_byte_identical() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
