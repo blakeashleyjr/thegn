@@ -401,7 +401,7 @@ fn apply_relaunch_with(
 mod tests {
     use super::*;
     use crate::testenv::EnvVarGuard;
-    use std::fmt::Write as _;
+    use std::path::PathBuf;
     use std::sync::{Arc, Mutex as StdMutex};
     use thegn_core::config::{SandboxBackend, UsageConfig};
 
@@ -424,8 +424,10 @@ mod tests {
         fn event(&self, event: &tracing::Event<'_>) {
             let mut fields = String::new();
             event.record(&mut DisplayFields(&mut fields));
+            // Display, not Debug: `Level`'s Display is the bare "WARN" the
+            // assertions match on, while its Debug is a wrapped form.
             self.0.lock().unwrap().push(format!(
-                "{} {:?} {fields}",
+                "{} {} {fields}",
                 event.metadata().target(),
                 event.metadata().level()
             ));
@@ -825,7 +827,7 @@ mod tests {
                 3,
                 LaunchSpec {
                     argv: vec![shell_launcher.display().to_string()],
-                    cwd: Some(worktree.clone()),
+                    cwd: Some(PathBuf::from(worktree.clone())),
                     env: Vec::new(),
                     backend: "host".into(),
                     warnings: Vec::new(),
@@ -911,14 +913,21 @@ mod tests {
             let cfg = cfg_with(&[("codex", false)]);
             let worktree = worktree_path("typed-refusal");
             register(&worktree, "codex");
-            let refusal = || {
+            // A fn item, not a closure: `apply_relaunch_with` takes `impl
+            // FnOnce(&Config, &str, u32) -> …` and this test passes the same
+            // refuser to two calls. A closure would be moved by the first.
+            fn refusal(
+                _: &Config,
+                _: &str,
+                _: u32,
+            ) -> Result<Option<(u32, LaunchSpec)>, RelaunchRefusal> {
                 Err(RelaunchRefusal {
                     agent: "codex".into(),
                     source: anyhow::Error::new(crate::agent::DevcontainerLaunchRefused {
                         reason: "trusted provider origin was rejected".into(),
                     }),
                 })
-            };
+            }
             let events = Arc::new(StdMutex::new(Vec::new()));
             let subscriber = CapturedEvents(events.clone());
             let mut specs = Ok(vec![(3, shell_spec())]);
