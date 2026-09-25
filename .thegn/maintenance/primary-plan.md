@@ -70,3 +70,35 @@ the primary regenerates centrally.
 
 Do not run cargo/nextest/clippy. Record the focused filters you want. Core is
 gated at 95% lines; cover every new branch, including the normalization path.
+
+---
+
+## Adversarial finding ACCEPTED and fixed by the primary (row 532)
+
+Row 532 filed a High finding: chrono's no-dot fractional directives `%3f`,
+`%6f`, `%9f` were not recognized, so both strict validation and the tolerant
+`post_process` admitted sub-minute output on a minute-resolution tick.
+
+**Confirmed and fixed.** The primary verified the mechanism directly in the
+vendored chrono source (0.4.45,
+`src/format/strftime.rs:615` → `'f' => internal_fixed(Nanosecond3NoDot)`): those
+forms become `Item::Fixed(Fixed::Internal(InternalFixed))`, whose payload is a
+**private** field. No syntactic match can name them or even distinguish them, so
+extending the match arm was not an option.
+
+Note this gap **predates** THE-477: the original `strftime_needs_seconds` had
+the same blind spot, so `[bars] clock_format = "%H:%M%3f"` was also mis-tiered
+onto the minute tick. This fix closes both.
+
+Fix: the named walk is now a _naming_ pass only, and the decision is
+behavioural — render one instant twice differing solely in seconds/nanoseconds
+and compare. Anything whose output moves is sub-minute-bearing, including
+directives chrono adds later. A malformed format short-circuits to `None` before
+formatting, since `Display` on a bad format panics and `validate_strftime` owns
+that error path. Runs at config admission only, never on the render path.
+
+Verified by the primary (not claimed, run):
+`cargo test -p thegn-core --lib strftime` → 3 passed;
+`cargo test -p thegn-core --lib clock` → 16 passed;
+`cargo test -p thegn-core --lib seconds_and_invalid_row_formats_are_rejected_or_normalized`
+→ passed, covering `%S %T %r %X %s %f %.3f %.6f %.9f %3f %6f %9f`.

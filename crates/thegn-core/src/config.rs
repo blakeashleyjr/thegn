@@ -65,9 +65,29 @@ pub fn strftime_needs_seconds(fmt: &str) -> bool {
 /// time data. The parser expands aliases such as `%T`, `%r`, and `%X`, so the
 /// returned `%S` describes the actual field rather than relying on a fragile
 /// substring search. Escaped literals such as `%%S` return `None`.
+///
+/// The named walk alone is **not** sufficient. chrono routes the no-dot
+/// fractional forms (`%3f`, `%6f`, `%9f`) through an opaque
+/// `Fixed::Internal(InternalFixed)` whose payload is private, so no syntactic
+/// match can name — or even see — them. `%H:%M%3f` therefore passed the named
+/// walk while still rendering sub-minute output on a minute-resolution tick.
+///
+/// So the named walk is a *naming* pass only, and the decision is made
+/// behaviourally: render one instant twice, differing solely in its sub-minute
+/// components, and compare. Anything whose output moves is sub-minute-bearing,
+/// including directives chrono may add later. This runs at config admission,
+/// never on the render path.
 pub fn strftime_seconds_directive(fmt: &str) -> Option<&'static str> {
+    use chrono::NaiveDate;
     use chrono::format::{Fixed, Item, Numeric, StrftimeItems};
-    StrftimeItems::new(fmt).find_map(|i| match i {
+
+    // A malformed format has no meaningful answer here, and formatting one
+    // would panic on Display. `validate_strftime` is the caller's error path.
+    if StrftimeItems::new(fmt).any(|i| matches!(i, Item::Error)) {
+        return None;
+    }
+
+    let named = StrftimeItems::new(fmt).find_map(|i| match i {
         Item::Numeric(Numeric::Timestamp, _) => Some("%s"),
         Item::Numeric(Numeric::Nanosecond, _) => Some("%f"),
         Item::Numeric(Numeric::Second, _) => Some("%S"),
@@ -76,7 +96,19 @@ pub fn strftime_seconds_directive(fmt: &str) -> Option<&'static str> {
             Fixed::Nanosecond | Fixed::Nanosecond3 | Fixed::Nanosecond6 | Fixed::Nanosecond9,
         ) => Some("%f"),
         _ => None,
-    })
+    });
+    if named.is_some() {
+        return named;
+    }
+
+    // Same date, same hour, same minute — only seconds and nanoseconds differ.
+    let at = |s: u32, nano: u32| {
+        NaiveDate::from_ymd_opt(2001, 2, 3).and_then(|d| d.and_hms_nano_opt(4, 5, s, nano))
+    };
+    let (Some(base), Some(later)) = (at(0, 0), at(30, 500_000_000)) else {
+        return None;
+    };
+    (base.format(fmt).to_string() != later.format(fmt).to_string()).then_some("%f")
 }
 
 /// Expand a config value that may be an environment-variable reference.
