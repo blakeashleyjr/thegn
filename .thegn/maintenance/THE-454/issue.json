@@ -1,0 +1,92 @@
+{
+  "id": "THE-454",
+  "uuid": "d7916c35-ed49-4478-8385-cf7b7430358a",
+  "title": "Harden remote calendar redirects, secret replay, and body limits",
+  "description": "## Finding\n\nRemote calendar sources bypass a safe shared HTTP policy and can redirect secrets or allocate an unbounded response before enforcing their advertised 32 MiB ceiling.\n\nBoth ICS URL and CalDAV construct a new default reqwest client for each fetch. The default redirect policy is enabled. CalDAV 307/308 redirects can replay the REPORT body, including the opaque sync token, to a redirect target; cross-origin header scrubbing does not protect secrets embedded in that body. Same-host redirects can retain Basic/Bearer authorization, and no policy forbids HTTPS-to-HTTP downgrade. Redirect targets are not constrained to the configured origin, scheme, or address class, creating a calendar-triggered SSRF path.\n\nThe nominal response cap is checked only after `.text().await` has buffered and decoded the full body. Content-Length is advisory and absent for chunked responses; compressed/chunked responses can exceed it after decoding. A malicious or compromised subscription endpoint can exhaust process memory. CalDAV does not even pre-check Content-Length. Error responses have no bounded diagnostic-body policy or content-type validation.\n\nRebuilding clients also discards connection pools and repeats DNS/TCP/TLS work every polling pass.\n\n## Evidence at audited commit\n\n* `crates/thegn-svc/src/calendar/ics_url.rs:19-20,83-101,127-140`: fresh default client; credentials attached before redirects; body limit enforced after `text()`.\n* `crates/thegn-svc/src/calendar/caldav.rs:23-24,236-263,290-296`: the same policy gap; REPORT carries sync-token XML and has only a post-buffer limit.\n* `crates/thegn-core/src/config_calendar.rs:264-272,392-457`: validation requires a non-empty string but does not parse or restrict URL schemes/origins.\n* `crates/thegn-host/src/hydrate_calendar.rs:125-215`: periodic synchronization repeatedly rebuilds the router and its per-request clients.\n\n## Required design\n\nCentralize remote-calendar transport in a reusable, policy-configured client. Parse URLs at validation/startup. Disable automatic redirects or implement a small explicit redirect state machine that authenticates every hop: no origin change, no downgrade, no private/special-address pivot beyond an explicitly configured destination policy, no credential/body replay, bounded hop count, and DNS/address checks consistent across connect and redirect.\n\nRead decoded bodies incrementally with a hard byte ceiling before allocation growth. Bound error bodies too. Apply connect, per-read/idle, and end-to-end deadlines; validate expected content types with documented compatibility exceptions. Reuse connection pools without allowing auth/state to bleed between accounts.\n\n## Acceptance criteria\n\n- [ ] HTTP(S)/webcal URLs are parsed and validated; unsupported schemes fail configuration validation.\n- [ ] Redirects cannot change origin, downgrade confidentiality, pivot to an unapproved address class, or replay Authorization, cookies, URL credentials, or CalDAV sync-token bodies.\n- [ ] 301/302/303/307/308, relative/absolute locations, loops, DNS rebinding, IPv4/IPv6 literals, and proxy configurations have adversarial tests.\n- [ ] Decoded success and error bodies stop at the configured hard cap while streaming, independent of Content-Length and transfer/content encoding.\n- [ ] Connect, idle/read, and total operation deadlines are distinct and tested with never-ending bodies.\n- [ ] ICS and DAV media types are validated without rejecting documented real-world variants.\n- [ ] A reusable client/pool is shared safely across polls and accounts; secrets cannot bleed through default headers.\n- [ ] Logs and errors never contain subscription URLs, credentials, sync tokens, response bodies, or redirect locations with secrets.\n- [ ] Resource-bound tests prove bounded memory under chunked/compressed oversized responses.\n\n## Dependency mapping\n\nThis is calendar-specific application of the safe-HTTP work tracked in <issue id=\"d9997311-b5e1-4d21-9657-63f77178c15e\" href=\"https://linear.app/blakeashley/issue/THE-321/centralize-safe-http-policy-for-authenticated-tracker-providers\">THE-321</issue> (provider policy), <issue id=\"3af215de-c355-4aa7-b0ff-ca69e4e926df\" href=\"https://linear.app/blakeashley/issue/THE-280/disable-authenticated-control-command-redirects-and-body-replay\">THE-280</issue> (redirect/body replay), and <issue id=\"a1743b7e-904b-47e2-851f-14b563027a2e\" href=\"https://linear.app/blakeashley/issue/THE-273/bound-control-client-deadlines-and-response-bodies-across-all\">THE-273</issue> (deadlines/body limits). Coordinate on one shared transport primitive instead of adding another ad hoc client. It can land independently of <issue id=\"37123fdd-5d17-41e6-a3d7-822c165d706f\" href=\"https://linear.app/blakeashley/issue/THE-450/separate-calendar-resource-series-and-recurrence-instance-identity\">THE-450</issue> through <issue id=\"daedc829-ba25-450a-9317-97dde1cf6e04\" href=\"https://linear.app/blakeashley/issue/THE-453/parse-caldav-multistatus-structurally-and-fail-closed\">THE-453</issue> and should precede calendar fetch concurrency work.",
+  "priority": {
+    "value": 1,
+    "name": "Urgent"
+  },
+  "url": "https://linear.app/blakeashley/issue/THE-454/harden-remote-calendar-redirects-secret-replay-and-body-limits",
+  "gitBranchName": "blake/the-454-harden-remote-calendar-redirects-secret-replay-and-body",
+  "createdAt": "2026-09-11T09:08:29.576Z",
+  "updatedAt": "2026-09-11T10:24:37.583Z",
+  "archivedAt": null,
+  "completedAt": null,
+  "startedAt": null,
+  "canceledAt": null,
+  "dueDate": null,
+  "slaStartedAt": null,
+  "slaMediumRiskAt": null,
+  "slaHighRiskAt": null,
+  "slaBreachesAt": null,
+  "status": "Backlog",
+  "statusType": "backlog",
+  "labels": [],
+  "attachments": [],
+  "documents": [],
+  "stateHistory": [
+    {
+      "state": {
+        "id": "9a141276-3d88-41f8-8437-8f170cfff494",
+        "name": "Backlog",
+        "type": "backlog"
+      },
+      "startedAt": "2026-09-11T09:08:29.576Z",
+      "endedAt": null
+    }
+  ],
+  "createdBy": "Blake Ashley",
+  "createdById": "3b7f5427-3d7f-40df-822c-6b4439a509e7",
+  "parentId": "THE-150",
+  "team": "Thegn",
+  "teamId": "6d265c7c-ac1f-40c7-9983-f919d7b5d254",
+  "relations": {
+    "blocks": [
+      {
+        "id": "THE-456",
+        "title": "Fetch and apply calendar accounts independently under bounded concurrency"
+      }
+    ],
+    "blockedBy": [],
+    "relatedTo": [
+      {
+        "id": "THE-321",
+        "title": "Centralize safe HTTP policy for authenticated tracker providers"
+      },
+      {
+        "id": "THE-273",
+        "title": "Bound control-client deadlines and response bodies across all transports"
+      },
+      {
+        "id": "THE-280",
+        "title": "Disable authenticated control-command redirects and body replay"
+      },
+      {
+        "id": "THE-453",
+        "title": "Parse CalDAV multistatus structurally and fail closed"
+      },
+      {
+        "id": "THE-450",
+        "title": "Separate calendar resource, series, and recurrence-instance identity"
+      },
+      {
+        "id": "THE-486",
+        "title": "Route calendar account secrets through the typed credential broker"
+      },
+      {
+        "id": "THE-465",
+        "title": "Enforce calendar max_events as a non-disableable admission budget"
+      },
+      {
+        "id": "THE-462",
+        "title": "Implement or remove calendar_ids CalDAV collection filtering"
+      },
+      {
+        "id": "THE-457",
+        "title": "Bound and validate recurrence expansion and reminder arithmetic"
+      }
+    ],
+    "duplicateOf": null
+  }
+}
