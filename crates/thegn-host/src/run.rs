@@ -8649,6 +8649,8 @@ async fn event_loop<T: Terminal>(
                     // THE-84: the primary missing leaf — captured before the
                     // resolve below moves `missing` into the batch.
                     let first_leaf = missing.first().copied();
+                    let mut relaunch =
+                        crate::handlers::worktree_launch::RelaunchOutcome::NotAttempted;
                     let (specs, attach) = crate::handlers::prewarm::resolve_automatic_with(
                         first_leaf,
                         || {
@@ -8705,7 +8707,7 @@ async fn event_loop<T: Terminal>(
                         },
                         |specs, first_leaf, attach_is_empty| {
                             if !is_terminal {
-                                crate::handlers::worktree_launch::apply_relaunch(
+                                relaunch = crate::handlers::worktree_launch::apply_relaunch(
                                     specs,
                                     &cfg,
                                     &wt,
@@ -8724,6 +8726,7 @@ async fn event_loop<T: Terminal>(
                             target_leaves,
                             origin: SpecOrigin::Prewarm,
                             specs,
+                            relaunch,
                             attach,
                         })
                         .is_ok()

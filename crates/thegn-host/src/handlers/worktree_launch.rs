@@ -39,42 +39,232 @@
 //!   ATTACHes to it via THE-85 instead of relaunching again. No second dedup
 //!   mechanism is added here.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
+use std::fmt;
+use std::fmt::Write as _;
+use std::hash::{Hash, Hasher};
+use std::sync::{LazyLock, Mutex};
 
+use thegn_core::calendar::display::{DisplayText, Field};
 use thegn_core::config::Config;
 use thegn_core::db::Db;
+use thegn_core::log_redact::redact_text_line;
 use thegn_core::store::WorkspaceStore;
 
 use crate::agent::LaunchSpec;
 use crate::handlers::provision::SpecError;
 
+const MAX_REFUSAL_REASON_CHARS: usize = 512;
+const MAX_REPORTED_REFUSALS: usize = 256;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum RelaunchRefusalKind {
+    ProviderOwnership,
+    Sandbox,
+    ProviderLaunch,
+}
+
+impl RelaunchRefusalKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ProviderOwnership => "provider-ownership",
+            Self::Sandbox => "sandbox",
+            Self::ProviderLaunch => "provider-launch",
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct RelaunchRefusal {
+    agent: String,
+    source: anyhow::Error,
+}
+
+#[derive(Debug, Default)]
+struct RefusalRegistry {
+    reported: HashSet<u64>,
+    order: VecDeque<u64>,
+}
+
+impl RefusalRegistry {
+    fn admit(&mut self, key: u64) -> bool {
+        if self.reported.contains(&key) {
+            return false;
+        }
+        // This is process-lifetime diagnostic state, not a ledger. Keep only a
+        // small FIFO window so long-lived hosts do not retain every worktree;
+        // an evicted refusal may be reported again, which is acceptable here.
+        if self.order.len() == MAX_REPORTED_REFUSALS
+            && let Some(evicted) = self.order.pop_front()
+        {
+            self.reported.remove(&evicted);
+        }
+        self.reported.insert(key.clone());
+        self.order.push_back(key);
+        true
+    }
+}
+
+/// Hash the identity rather than retaining caller-sized worktree/agent strings.
+/// This is a de-duplication hint, not a durable identity ledger: the tiny
+/// collision chance is preferable to retaining unbounded path/config bytes.
+fn refusal_key(worktree: &str, agent: &str, kind: RelaunchRefusalKind) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    worktree.hash(&mut hasher);
+    agent.hash(&mut hasher);
+    kind.hash(&mut hasher);
+    hasher.finish()
+}
+
+static REPORTED_REFUSALS: LazyLock<Mutex<RefusalRegistry>> =
+    LazyLock::new(|| Mutex::new(RefusalRegistry::default()));
+
+/// The relaunch fold's internal status. A refusal intentionally leaves the
+/// already-resolved shell in the successful batch, so the fail-open launch
+/// contract is unchanged while callers can distinguish refusal from success.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RelaunchOutcome {
+    NotAttempted,
+    Relaunched,
+    Refused,
+}
+
+fn refusal_kind(error: &anyhow::Error) -> RelaunchRefusalKind {
+    if error.chain().any(|source| {
+        source
+            .downcast_ref::<crate::agent::DevcontainerLaunchRefused>()
+            .is_some()
+    }) {
+        RelaunchRefusalKind::ProviderOwnership
+    } else if error
+        .chain()
+        .any(|source| source.downcast_ref::<crate::agent::SandboxHalt>().is_some())
+    {
+        RelaunchRefusalKind::Sandbox
+    } else {
+        // Keep one generic bucket for provider/launch failures so future typed
+        // refusal categories can be added without changing this call site.
+        RelaunchRefusalKind::ProviderLaunch
+    }
+}
+
+fn bounded_reason(error: &anyhow::Error) -> String {
+    let mut bounded = BoundedFormat::new(MAX_REFUSAL_REASON_CHARS);
+    match write!(&mut bounded, "{error}") {
+        Ok(()) | Err(fmt::Error) => {}
+    }
+    // Redaction deliberately runs only over the bounded formatted prefix. A
+    // provider-controlled error must not be fully materialized just to emit a
+    // 512-character diagnostic.
+    let redacted: String = redact_text_line(&bounded.text)
+        .chars()
+        .take(MAX_REFUSAL_REASON_CHARS)
+        .collect();
+    let reason = DisplayText::new(&redacted, Field::Reminder).into_string();
+    if reason.is_empty() {
+        "no safe detail available".to_string()
+    } else {
+        reason
+    }
+}
+
+struct BoundedFormat {
+    text: String,
+    remaining: usize,
+}
+
+impl BoundedFormat {
+    fn new(limit: usize) -> Self {
+        Self {
+            text: String::with_capacity(limit),
+            remaining: limit,
+        }
+    }
+}
+
+impl fmt::Write for BoundedFormat {
+    fn write_str(&mut self, value: &str) -> fmt::Result {
+        if self.remaining == 0 {
+            return Err(fmt::Error);
+        }
+        let mut chars = value.chars();
+        let prefix: String = chars.by_ref().take(self.remaining).collect();
+        let written = prefix.chars().count();
+        self.text.push_str(&prefix);
+        self.remaining -= written;
+        if chars.next().is_some() {
+            return Err(fmt::Error);
+        }
+        Ok(())
+    }
+}
+
+fn admit_refusal(worktree: &str, agent: &str, kind: RelaunchRefusalKind) -> bool {
+    let key = refusal_key(worktree, agent, kind);
+    match REPORTED_REFUSALS.lock() {
+        Ok(mut reported) => reported.admit(key),
+        Err(poisoned) => poisoned.into_inner().admit(key),
+    }
+}
+
+fn report_relaunch_refusal(refusal: RelaunchRefusal, worktree: &str) {
+    let kind = refusal_kind(&refusal.source);
+    if !admit_refusal(worktree, &refusal.agent, kind) {
+        return;
+    }
+
+    let reason = bounded_reason(&refusal.source);
+    let worktree = DisplayText::new(worktree, Field::Location);
+    let agent = DisplayText::new(&refusal.agent, Field::Title);
+    // WARN is intentional: with THEGN_LOG unset, only the always-on WARN+
+    // diagnostics ring remains available to the debug bundle and doctor.
+    tracing::warn!(
+        target: "thegn::agent",
+        worktree = %worktree.as_str(),
+        agent = %agent.as_str(),
+        refusal_kind = kind.as_str(),
+        reason = %reason,
+        "remembered agent refused; shell fallback retained; fix provider/account/sandbox configuration and reopen or retry"
+    );
+}
+
 /// When the THE-85 attach probe found NO live daemon session for `worktree`,
 /// a fresh (re)bring-up relaunches the worktree's remembered agent as
 /// `leaf`'s process — resuming its last harness session when the
 /// `[[agents]]` entry opted in (`resume = true`) and the harness advertises
-/// the RESUME capability. `None` ⇒ keep the resolved shell spec.
+/// the RESUME capability. `Ok(None)` ⇒ keep the resolved shell spec; `Err` is
+/// only the final launch-spec refusal that the caller reports before keeping
+/// that same shell.
 ///
-/// Every gate fails open to `None` (today's shell): an unremembered /
-/// `"shell"` / `"clean-shell"` / tool-drawer record, an entry that has left
-/// the config, a spec that fails to resolve — all degrade honestly.
+/// Every lookup gate fails open to `Ok(None)` (today's shell): an unremembered
+/// / `"shell"` / `"clean-shell"` / tool-drawer record, or an entry that has
+/// left the config, all remain silent and degrade honestly.
 pub(crate) fn remembered_agent_relaunch(
     cfg: &Config,
     worktree: &str,
     leaf: u32,
-) -> Option<(u32, LaunchSpec)> {
-    let db = Db::open().ok()?;
-    let name = db.worktree_agent(worktree).ok().flatten()?;
+) -> Result<Option<(u32, LaunchSpec)>, RelaunchRefusal> {
+    let db = match Db::open() {
+        Ok(db) => db,
+        Err(_) => return Ok(None),
+    };
+    let name = match db.worktree_agent(worktree) {
+        Ok(Some(name)) => name,
+        Ok(None) | Err(_) => return Ok(None),
+    };
     // The native-exec path's exclusions (`panes.rs`): a plain-shell or
     // transient `clean-shell` watchdog record — or a tool drawer
     // (yazi/lazygit/…) — is not the worktree's agent; relaunching one would
     // resurrect an overlay, not the agent the user picked.
     if name == "shell" || name == "clean-shell" || cfg.tool_command(&name).is_some() {
-        return None;
+        return Ok(None);
     }
     // Entry no longer configured (config churn): leave the stale record alone
     // — the sidebar keeps attributing until the agent is re-added — but a
     // shell pane is still the honest spawn.
-    cfg.agent_command(&name)?;
+    if cfg.agent_command(&name).is_none() {
+        return Ok(None);
+    }
     // Resolve the resume form FIRST (cheap config read): the session-store
     // walk must never run for a non-opted entry.
     let cmd_override = resume_command_override(cfg, &name, worktree, &db);
@@ -93,9 +283,14 @@ pub(crate) fn remembered_agent_relaunch(
         },
     )
     // Fail open: an unresolvable agent spec (provider down, sandbox error)
-    // degrades to the already-resolved shell, never to a failed tab.
-    .ok()
-    .map(|spec| (leaf, spec))
+    // degrades to the already-resolved shell, never to a failed tab. Preserve
+    // this error for the diagnostic seam while leaving every earlier
+    // not-applicable outcome as a silent `Ok(None)`.
+    .map(|spec| Some((leaf, spec)))
+    .map_err(|source| RelaunchRefusal {
+        agent: name,
+        source,
+    })
 }
 
 /// The resume-form command for a remembered agent, when it applies: the
@@ -149,7 +344,9 @@ fn resume_command_override(cfg: &Config, name: &str, worktree: &str, db: &Db) ->
 /// session still wins and the agent is never doubled), `quiet_split` (`true`
 /// for a split/add into a tab that already has a live pane) — and, at the
 /// prewarm site, wrap the call in `!is_terminal` (terminal groups host no
-/// agent sessions).
+/// agent sessions). The returned outcome records a refusal without changing
+/// the successful shell batch; callers that only need fail-open behavior may
+/// intentionally discard it.
 pub(crate) fn apply_relaunch(
     specs: &mut Result<Vec<(u32, LaunchSpec)>, SpecError>,
     cfg: &Config,
@@ -157,23 +354,97 @@ pub(crate) fn apply_relaunch(
     first_leaf: Option<u32>,
     attach_is_empty: bool,
     quiet_split: bool,
-) {
+) -> RelaunchOutcome {
+    apply_relaunch_with(
+        specs,
+        cfg,
+        worktree,
+        first_leaf,
+        attach_is_empty,
+        quiet_split,
+        remembered_agent_relaunch,
+    )
+}
+
+fn apply_relaunch_with(
+    specs: &mut Result<Vec<(u32, LaunchSpec)>, SpecError>,
+    cfg: &Config,
+    worktree: &str,
+    first_leaf: Option<u32>,
+    attach_is_empty: bool,
+    quiet_split: bool,
+    relaunch: impl FnOnce(&Config, &str, u32) -> Result<Option<(u32, LaunchSpec)>, RelaunchRefusal>,
+) -> RelaunchOutcome {
     if attach_is_empty
         && !quiet_split
         && let Some(first_leaf) = first_leaf
         && let Ok(resolved) = specs.as_mut()
-        && let Some((leaf, spec)) = remembered_agent_relaunch(cfg, worktree, first_leaf)
-        && let Some(slot) = resolved.iter_mut().find(|(id, _)| *id == leaf)
     {
-        slot.1 = spec;
+        match relaunch(cfg, worktree, first_leaf) {
+            Ok(Some((leaf, spec))) => {
+                if let Some(slot) = resolved.iter_mut().find(|(id, _)| *id == leaf) {
+                    slot.1 = spec;
+                    return RelaunchOutcome::Relaunched;
+                }
+            }
+            Ok(None) => {}
+            Err(refusal) => {
+                report_relaunch_refusal(refusal, worktree);
+                return RelaunchOutcome::Refused;
+            }
+        }
     }
+    RelaunchOutcome::NotAttempted
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::testenv::EnvVarGuard;
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex as StdMutex};
     use thegn_core::config::{SandboxBackend, UsageConfig};
+
+    #[derive(Clone)]
+    struct CapturedEvents(Arc<StdMutex<Vec<String>>>);
+
+    impl tracing::Subscriber for CapturedEvents {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _attrs: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut fields = String::new();
+            event.record(&mut DisplayFields(&mut fields));
+            // Display, not Debug: `Level`'s Display is the bare "WARN" the
+            // assertions match on, while its Debug is a wrapped form.
+            self.0.lock().unwrap().push(format!(
+                "{} {} {fields}",
+                event.metadata().target(),
+                event.metadata().level()
+            ));
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    struct DisplayFields<'a>(&'a mut String);
+
+    impl tracing::field::Visit for DisplayFields<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            write!(self.0, " {}={value:?}", field.name()).expect("String write cannot fail");
+        }
+    }
 
     /// A scratch state dir + isolated env — this shell often runs inside a
     /// live thegn (CLAUDE.md), and `Db::open()` reads `XDG_STATE_HOME` per
@@ -280,14 +551,14 @@ mod tests {
             let wt = worktree_path("shell-record");
             // No row at all, an empty record, and a plain-shell record all
             // stay a shell.
-            assert!(remembered_agent_relaunch(&cfg, &wt, 3).is_none());
+            assert!(remembered_agent_relaunch(&cfg, &wt, 3).unwrap().is_none());
             Db::open()
                 .unwrap()
                 .put_worktree("app/wt", "/x/app", &wt, "tg/wt", None, None)
                 .unwrap();
-            assert!(remembered_agent_relaunch(&cfg, &wt, 3).is_none());
+            assert!(remembered_agent_relaunch(&cfg, &wt, 3).unwrap().is_none());
             register(&wt, "shell");
-            assert!(remembered_agent_relaunch(&cfg, &wt, 3).is_none());
+            assert!(remembered_agent_relaunch(&cfg, &wt, 3).unwrap().is_none());
         });
     }
 
@@ -312,7 +583,7 @@ mod tests {
             let wt = worktree_path("tool-record");
             register(&wt, "yazi");
             assert!(
-                remembered_agent_relaunch(&cfg, &wt, 3).is_none(),
+                remembered_agent_relaunch(&cfg, &wt, 3).unwrap().is_none(),
                 "a remembered tool drawer is an overlay, not the worktree's agent"
             );
         });
@@ -325,7 +596,7 @@ mod tests {
             let wt = worktree_path("unconfigured");
             register(&wt, "vanished-agent");
             assert!(
-                remembered_agent_relaunch(&cfg, &wt, 3).is_none(),
+                remembered_agent_relaunch(&cfg, &wt, 3).unwrap().is_none(),
                 "a record naming an agent absent from config stays a shell"
             );
             // The stale record is left alone for the sidebar's attribution.
@@ -345,7 +616,9 @@ mod tests {
             // `resume = false` this would show in the argv.
             seed_session(&home, &wt, "0c1f-uuid");
 
-            let (leaf, spec) = remembered_agent_relaunch(&cfg, &wt, 3).expect("relaunches");
+            let (leaf, spec) = remembered_agent_relaunch(&cfg, &wt, 3)
+                .unwrap()
+                .expect("relaunches");
             assert_eq!(leaf, 3, "the relaunch pins the leaf it was asked for");
             let argv = spec.argv.join(" ");
             assert!(argv.contains("claude"), "the entry's command: {argv}");
@@ -366,7 +639,9 @@ mod tests {
             register(&wt, "claude");
             seed_session(&home, &wt, "0c1f-uuid");
 
-            let (_, spec) = remembered_agent_relaunch(&cfg, &wt, 3).expect("relaunches");
+            let (_, spec) = remembered_agent_relaunch(&cfg, &wt, 3)
+                .unwrap()
+                .expect("relaunches");
             let argv = spec.argv.join(" ");
             assert!(
                 argv.contains("--resume 0c1f-uuid"),
@@ -385,7 +660,9 @@ mod tests {
             let wt = worktree_path("resume-empty");
             register(&wt, "claude");
 
-            let (_, spec) = remembered_agent_relaunch(&cfg, &wt, 3).expect("relaunches");
+            let (_, spec) = remembered_agent_relaunch(&cfg, &wt, 3)
+                .unwrap()
+                .expect("relaunches");
             let argv = spec.argv.join(" ");
             assert!(argv.contains("claude"), "cold launch: {argv}");
             assert!(!argv.contains("--resume"), "no session to resume: {argv}");
@@ -400,7 +677,9 @@ mod tests {
             register(&wt, "claude");
             let before = remembered(&wt);
 
-            let (_, spec) = remembered_agent_relaunch(&cfg, &wt, 3).expect("relaunches");
+            let (_, spec) = remembered_agent_relaunch(&cfg, &wt, 3)
+                .unwrap()
+                .expect("relaunches");
             assert!(spec.argv.join(" ").contains("claude"));
 
             // Mirror of agent_tests' suppression test: the relaunch is not a
@@ -441,7 +720,10 @@ mod tests {
                 Ok(vec![(3, shell()), (5, shell())]);
 
             // Probe empty, not a quiet split ⇒ leaf 3 becomes the agent.
-            apply_relaunch(&mut batch, &cfg, &wt, Some(3), true, false);
+            assert_eq!(
+                apply_relaunch(&mut batch, &cfg, &wt, Some(3), true, false),
+                RelaunchOutcome::Relaunched
+            );
             let Ok(resolved) = batch.as_ref() else {
                 panic!("the batch is always Ok in this test");
             };
@@ -458,7 +740,10 @@ mod tests {
             // A live session wins: the batch is untouched.
             let mut batch: Result<Vec<(u32, LaunchSpec)>, SpecError> =
                 Ok(vec![(3, shell()), (5, shell())]);
-            apply_relaunch(&mut batch, &cfg, &wt, Some(3), false, false);
+            assert_eq!(
+                apply_relaunch(&mut batch, &cfg, &wt, Some(3), false, false),
+                RelaunchOutcome::NotAttempted
+            );
             let Ok(resolved) = batch.as_ref() else {
                 panic!("the batch is always Ok in this test");
             };
@@ -472,7 +757,10 @@ mod tests {
             // A quiet split/add is a shell gesture: the batch is untouched.
             let mut batch: Result<Vec<(u32, LaunchSpec)>, SpecError> =
                 Ok(vec![(3, shell()), (5, shell())]);
-            apply_relaunch(&mut batch, &cfg, &wt, Some(3), true, true);
+            assert_eq!(
+                apply_relaunch(&mut batch, &cfg, &wt, Some(3), true, true),
+                RelaunchOutcome::NotAttempted
+            );
             let Ok(resolved) = batch.as_ref() else {
                 panic!("the batch is always Ok in this test");
             };
@@ -483,5 +771,359 @@ mod tests {
                 "a quiet split stays a shell"
             );
         });
+    }
+
+    fn shell_spec() -> LaunchSpec {
+        LaunchSpec {
+            argv: vec![
+                "/bin/sh".into(),
+                "-lc".into(),
+                "printf shell-fallback".into(),
+            ],
+            cwd: None,
+            env: Vec::new(),
+            backend: "host".into(),
+            warnings: Vec::new(),
+            degraded: false,
+            remote: false,
+        }
+    }
+
+    #[cfg(unix)]
+    fn materialize_refused_shell(
+        tag: &str,
+        configure: impl FnOnce(&mut Config),
+        relaunch: impl FnOnce(&Config, &str, u32) -> Result<Option<(u32, LaunchSpec)>, RelaunchRefusal>,
+    ) {
+        use std::os::unix::fs::PermissionsExt;
+
+        with_state(tag, |state| {
+            let root = state.join("spawn-sentinel");
+            let worktree = root.join("worktree");
+            let shell_marker = root.join("shell-ran");
+            let agent_marker = root.join("agent-ran");
+            std::fs::create_dir_all(&worktree).unwrap();
+
+            let shell_launcher = root.join("shell-fallback");
+            let agent_launcher = root.join("codex-agent");
+            for (launcher, marker) in [
+                (&shell_launcher, &shell_marker),
+                (&agent_launcher, &agent_marker),
+            ] {
+                std::fs::write(launcher, format!("#!/bin/sh\ntouch {}\n", marker.display()))
+                    .unwrap();
+                std::fs::set_permissions(launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+
+            let mut cfg = cfg_with(&[("codex", false)]);
+            cfg.agents[0].command = agent_launcher.display().to_string();
+            cfg.sandbox.enabled = false;
+            cfg.sandbox.backend = SandboxBackend::None;
+            configure(&mut cfg);
+            let worktree = worktree.to_string_lossy().into_owned();
+            register(&worktree, "codex");
+
+            let mut specs = Ok(vec![(
+                3,
+                LaunchSpec {
+                    argv: vec![shell_launcher.display().to_string()],
+                    cwd: Some(PathBuf::from(worktree.clone())),
+                    env: Vec::new(),
+                    backend: "host".into(),
+                    warnings: Vec::new(),
+                    degraded: false,
+                    remote: false,
+                },
+            )]);
+            assert_eq!(
+                apply_relaunch_with(&mut specs, &cfg, &worktree, Some(3), true, false, relaunch),
+                RelaunchOutcome::Refused
+            );
+
+            let mut session = crate::session::Session {
+                id: "spawn-sentinel".into(),
+                worktrees: vec![crate::session::WorktreeGroup::new(
+                    "app/wt",
+                    crate::session::GroupKind::Home,
+                    worktree.clone(),
+                )],
+                active: 0,
+            };
+            session.worktrees[0].tabs[0].center = crate::center::CenterTree::Leaf(3);
+            session.worktrees[0].tabs[0].focused_pane = 3;
+            let (pane_tx, _pane_rx) = tokio::sync::mpsc::channel::<crate::pane::PaneEvent>(16);
+            let mut panes = crate::panes::Panes::new(pane_tx);
+            let center = crate::layout::compute(120, 30, true, true).center;
+            panes
+                .materialize_with_specs(
+                    &cfg,
+                    &mut session.worktrees[0].tabs[0],
+                    &worktree,
+                    specs.as_ref().unwrap(),
+                    center,
+                    &[],
+                )
+                .unwrap();
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while !shell_marker.exists() && std::time::Instant::now() < deadline {
+                std::thread::yield_now();
+            }
+            assert!(
+                shell_marker.exists(),
+                "the retained shell fallback must execute"
+            );
+            assert!(
+                !agent_marker.exists(),
+                "the refused remembered-agent command must never execute"
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn typed_refusal_materializes_shell_without_running_codex() {
+        materialize_refused_shell(
+            "typed-spawn-sentinel",
+            |_| {},
+            |_, _, _| {
+                Err(RelaunchRefusal {
+                    agent: "codex".into(),
+                    source: anyhow::Error::new(crate::agent::DevcontainerLaunchRefused {
+                        reason: "trusted provider origin was rejected".into(),
+                    }),
+                })
+            },
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ordinary_refusal_materializes_shell_without_running_codex() {
+        materialize_refused_shell(
+            "ordinary-spawn-sentinel",
+            |cfg| cfg.agents[0].permissions = vec!["Read".into()],
+            remembered_agent_relaunch,
+        );
+    }
+
+    #[test]
+    fn typed_refusal_keeps_shell_and_is_deduped() {
+        with_state("typed-refusal", |_| {
+            let cfg = cfg_with(&[("codex", false)]);
+            let worktree = worktree_path("typed-refusal");
+            register(&worktree, "codex");
+            // A fn item, not a closure: `apply_relaunch_with` takes `impl
+            // FnOnce(&Config, &str, u32) -> …` and this test passes the same
+            // refuser to two calls. A closure would be moved by the first.
+            fn refusal(
+                _: &Config,
+                _: &str,
+                _: u32,
+            ) -> Result<Option<(u32, LaunchSpec)>, RelaunchRefusal> {
+                Err(RelaunchRefusal {
+                    agent: "codex".into(),
+                    source: anyhow::Error::new(crate::agent::DevcontainerLaunchRefused {
+                        reason: "trusted provider origin was rejected".into(),
+                    }),
+                })
+            }
+            let events = Arc::new(StdMutex::new(Vec::new()));
+            let subscriber = CapturedEvents(events.clone());
+            let mut specs = Ok(vec![(3, shell_spec())]);
+            let first_outcome = tracing::subscriber::with_default(subscriber, || {
+                let first =
+                    apply_relaunch_with(&mut specs, &cfg, &worktree, Some(3), true, false, refusal);
+                let mut retry = Ok(vec![(3, shell_spec())]);
+                let second =
+                    apply_relaunch_with(&mut retry, &cfg, &worktree, Some(3), true, false, refusal);
+                (first, second, retry)
+            });
+            assert_eq!(first_outcome.0, RelaunchOutcome::Refused);
+            assert_eq!(first_outcome.1, RelaunchOutcome::Refused);
+            assert_eq!(
+                specs.as_ref().unwrap()[0].1.argv[2],
+                "printf shell-fallback"
+            );
+            assert_eq!(
+                first_outcome.2.as_ref().unwrap()[0].1.argv[2],
+                "printf shell-fallback"
+            );
+            let events = events.lock().unwrap();
+            assert_eq!(events.len(), 1, "same typed refusal must emit one WARN");
+            assert!(events[0].contains("thegn::agent WARN"));
+            assert!(events[0].contains("provider-ownership"));
+            assert!(events[0].contains("trusted provider origin was rejected"));
+            assert!(events[0].contains("shell fallback retained"));
+            assert_eq!(remembered(&worktree).as_deref(), Some("codex"));
+
+            let error = anyhow::Error::new(crate::agent::DevcontainerLaunchRefused {
+                reason: "trusted provider origin was rejected".into(),
+            });
+            assert_eq!(refusal_kind(&error), RelaunchRefusalKind::ProviderOwnership);
+            assert!(bounded_reason(&error).contains("trusted provider origin"));
+            assert!(!admit_refusal(
+                &worktree,
+                "codex",
+                RelaunchRefusalKind::ProviderOwnership
+            ));
+            assert!(admit_refusal(
+                &worktree,
+                "codex",
+                RelaunchRefusalKind::Sandbox
+            ));
+        });
+    }
+
+    #[test]
+    fn ordinary_launch_error_from_resolver_keeps_shell_and_has_a_generic_bucket() {
+        with_state("ordinary-refusal", |_| {
+            let mut cfg = cfg_with(&[("codex", false)]);
+            // Codex has no command-scoped permission mechanism. This reaches
+            // the real remembered-agent resolver and deterministically returns
+            // its ordinary launch-policy error without running a command.
+            cfg.agents[0].permissions = vec!["Read".into()];
+            let worktree = worktree_path("ordinary-refusal");
+            register(&worktree, "codex");
+
+            let refusal = remembered_agent_relaunch(&cfg, &worktree, 3)
+                .expect_err("the resolver must preserve the ordinary launch error");
+            assert_eq!(
+                refusal_kind(&refusal.source),
+                RelaunchRefusalKind::ProviderLaunch
+            );
+            assert!(bounded_reason(&refusal.source).contains("permission policy hold"));
+
+            let mut specs = Ok(vec![(3, shell_spec())]);
+            let events = Arc::new(StdMutex::new(Vec::new()));
+            let subscriber = CapturedEvents(events.clone());
+            let outcome = tracing::subscriber::with_default(subscriber, || {
+                apply_relaunch(&mut specs, &cfg, &worktree, Some(3), true, false)
+            });
+            assert_eq!(outcome, RelaunchOutcome::Refused);
+            assert_eq!(
+                specs.as_ref().unwrap()[0].1.argv[2],
+                "printf shell-fallback"
+            );
+            let events = events.lock().unwrap();
+            assert_eq!(events.len(), 1, "ordinary refusal must emit one WARN");
+            assert!(events[0].contains("thegn::agent WARN"));
+            assert!(events[0].contains("provider-launch"));
+            assert!(events[0].contains("permission policy hold"));
+            assert!(events[0].contains("shell fallback retained"));
+            assert!(!admit_refusal(
+                &worktree,
+                "codex",
+                RelaunchRefusalKind::ProviderLaunch
+            ));
+            assert!(admit_refusal(
+                &worktree,
+                "codex",
+                RelaunchRefusalKind::Sandbox
+            ));
+        });
+
+        let error = anyhow::anyhow!("provider unavailable offline");
+        assert_eq!(refusal_kind(&error), RelaunchRefusalKind::ProviderLaunch);
+        assert_eq!(bounded_reason(&error), "provider unavailable offline");
+    }
+
+    #[test]
+    fn emitted_refusal_report_is_actionable_and_deduped() {
+        let events = Arc::new(StdMutex::new(Vec::new()));
+        let subscriber = CapturedEvents(events.clone());
+        let worktree = worktree_path("observable-report");
+        let refusal = || RelaunchRefusal {
+            agent: "codex".into(),
+            source: anyhow::Error::new(crate::agent::DevcontainerLaunchRefused {
+                reason: "trusted provider origin was rejected".into(),
+            }),
+        };
+
+        tracing::subscriber::with_default(subscriber, || {
+            report_relaunch_refusal(refusal(), &worktree);
+            report_relaunch_refusal(refusal(), &worktree);
+        });
+
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 1, "same refusal must emit one report");
+        assert!(events[0].contains("thegn::agent WARN"));
+        assert!(events[0].contains("provider-ownership"));
+        assert!(events[0].contains("trusted provider origin was rejected"));
+        assert!(events[0].contains("shell fallback retained"));
+    }
+
+    #[test]
+    fn concurrent_same_refusal_is_reported_once() {
+        let events = Arc::new(StdMutex::new(Vec::new()));
+        let worktree = worktree_path("concurrent-report");
+
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let events = Arc::clone(&events);
+                let worktree = &worktree;
+                scope.spawn(move || {
+                    let subscriber = CapturedEvents(events);
+                    tracing::subscriber::with_default(subscriber, || {
+                        report_relaunch_refusal(
+                            RelaunchRefusal {
+                                agent: "codex".into(),
+                                source: anyhow::Error::new(
+                                    crate::agent::DevcontainerLaunchRefused {
+                                        reason: "trusted provider origin was rejected".into(),
+                                    },
+                                ),
+                            },
+                            worktree.as_str(),
+                        );
+                    });
+                });
+            }
+        });
+
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 1, "concurrent reports must dedupe atomically");
+    }
+
+    #[test]
+    fn refusal_detail_is_redacted_bounded_and_control_free() {
+        let error = anyhow::anyhow!(
+            "provider token=secret\n{} --api-key live-secret",
+            "x".repeat(MAX_REFUSAL_REASON_CHARS * 2)
+        );
+        let reason = bounded_reason(&error);
+        assert!(reason.chars().count() <= MAX_REFUSAL_REASON_CHARS);
+        assert!(!reason.chars().any(char::is_control));
+        assert!(reason.contains("token=***redacted***"));
+        assert!(!reason.contains("live-secret"));
+    }
+
+    #[test]
+    fn refusal_registry_evicts_oldest_entry_at_its_cap() {
+        let mut registry = RefusalRegistry::default();
+        for i in 0..MAX_REPORTED_REFUSALS {
+            assert!(registry.admit(refusal_key(
+                &format!("wt-{i}"),
+                "codex",
+                RelaunchRefusalKind::ProviderLaunch,
+            )));
+        }
+        assert_eq!(registry.reported.len(), MAX_REPORTED_REFUSALS);
+        assert!(!registry.admit(refusal_key(
+            "wt-0",
+            "codex",
+            RelaunchRefusalKind::ProviderLaunch,
+        )));
+        assert!(registry.admit(refusal_key(
+            "wt-new",
+            "codex",
+            RelaunchRefusalKind::ProviderLaunch,
+        )));
+        assert_eq!(registry.reported.len(), MAX_REPORTED_REFUSALS);
+        assert!(registry.admit(refusal_key(
+            "wt-0",
+            "codex",
+            RelaunchRefusalKind::ProviderLaunch,
+        )));
     }
 }
