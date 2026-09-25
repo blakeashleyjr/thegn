@@ -94,6 +94,65 @@ fn iso_week_numbers_are_not_hand_rolled_across_the_new_year() {
 }
 
 #[test]
+fn monday_week_numbers_remain_the_existing_iso_values() {
+    let jan = MonthGrid::build(2021, 1, Weekday::Mon, d(2021, 1, 1), true).unwrap();
+    let existing: Vec<_> = jan.weeks.iter().map(|week| week[0].iso_week).collect();
+    assert_eq!(jan.week_numbers(), existing);
+    assert_eq!(jan.week_numbers(), vec![53, 1, 2, 3, 4, 5]);
+
+    let dec = MonthGrid::build(2026, 12, Weekday::Mon, d(2026, 12, 1), true).unwrap();
+    let existing: Vec<_> = dec.weeks.iter().map(|week| week[0].iso_week).collect();
+    assert_eq!(dec.week_numbers(), existing);
+    assert_eq!(dec.week_numbers(), vec![49, 50, 51, 52, 53, 1]);
+}
+
+#[test]
+fn non_monday_week_numbers_follow_the_configured_row_boundary() {
+    let cases = [
+        (
+            Weekday::Mon,
+            vec![53, 1, 2, 3, 4, 5],
+            vec![49, 50, 51, 52, 53, 1],
+        ),
+        (
+            Weekday::Sun,
+            vec![53, 1, 2, 3, 4, 5],
+            vec![48, 49, 50, 51, 52, 1],
+        ),
+        (
+            Weekday::Sat,
+            vec![52, 1, 2, 3, 4, 5],
+            vec![48, 49, 50, 51, 52, 1],
+        ),
+    ];
+
+    for (week_start, january, december) in cases {
+        let jan = MonthGrid::build(2021, 1, week_start, d(2021, 1, 1), true).unwrap();
+        assert_eq!(jan.week_numbers(), january, "January with {week_start:?}");
+        assert_eq!(jan.week_numbers().len(), jan.weeks.len());
+
+        let dec = MonthGrid::build(2026, 12, week_start, d(2026, 12, 1), true).unwrap();
+        assert_eq!(dec.week_numbers(), december, "December with {week_start:?}");
+        assert_eq!(dec.week_numbers().len(), dec.weeks.len());
+    }
+}
+
+#[test]
+fn non_monday_rows_do_not_use_the_first_cell_iso_week() {
+    let sunday = MonthGrid::build(2021, 1, Weekday::Sun, d(2021, 1, 1), true).unwrap();
+    assert_eq!(sunday.weeks[1][0].date, d(2021, 1, 3));
+    assert_eq!(sunday.weeks[1][0].iso_week, 53);
+    assert_eq!(sunday.weeks[1][1].iso_week, 1);
+    assert_eq!(sunday.week_numbers()[1], 1);
+
+    let saturday = MonthGrid::build(2021, 1, Weekday::Sat, d(2021, 1, 1), true).unwrap();
+    assert_eq!(saturday.weeks[1][0].date, d(2021, 1, 2));
+    assert_eq!(saturday.weeks[1][0].iso_week, 53);
+    assert_eq!(saturday.weeks[1][2].iso_week, 1);
+    assert_eq!(saturday.week_numbers()[1], 1);
+}
+
+#[test]
 fn today_is_flagged_and_position_round_trips() {
     let today = d(2026, 8, 21);
     let g = MonthGrid::build(2026, 8, Weekday::Mon, today, true).unwrap();
