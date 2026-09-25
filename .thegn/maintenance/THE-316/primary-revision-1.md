@@ -57,3 +57,31 @@ Title-then-status production order stands. No raw provider bodies in errors;
 bound the context and keep credentials out. Scope stays `jira.rs`, its tests, and
 the minimum at the control boundary for the P2 fix. No cargo/nextest/clippy —
 the primary runs the gate.
+
+---
+
+## Primary resolution of the reported blocker (after row 546)
+
+Row 546 implemented the P1 ambiguous-outcome fix and **stopped** at the P2
+control-boundary criterion, reporting that it needs a control wire schema
+change. That was the correct call and the primary verified it:
+
+- `crates/thegn-svc/src/control/http.rs:150-159` builds `ErrorBody` from exactly
+  two fields (`error`, `code`).
+- `docs/api/control-v1.json` snapshots `ErrorBody` with `required: [code, error]`.
+
+`ErrorBody` is the **shared** envelope for every control error, not a
+Jira-specific one. Carrying per-field `applied`/`unapplied` data across it is a
+change to the control error model as a whole — it affects every error type and
+every client — and deserves its own issue rather than riding along in a Jira
+truthfulness fix.
+
+**Decision: the P2 control-boundary item is DEFERRED to a follow-up.** It is not
+a defect in this change. THE-316's acceptance is about Jira reporting the truth,
+and it now does: direct Rust callers receive the typed `PartialUpdate` with its
+field vectors. Exposing that structure over the control wire is separate work.
+
+Record it as a follow-up finding in the final artifact. Do not stringify a fake
+JSON payload into the existing `error` string as a workaround — that would
+reintroduce exactly the "looks machine-readable but isn't" problem this issue
+exists to remove.
