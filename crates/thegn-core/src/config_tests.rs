@@ -3615,6 +3615,11 @@ fn post_process_resets_unsafe_calendar_row_formats_to_inheritance() {
                     format: "%%S".into(),
                     ..Default::default()
                 },
+                WorldClock {
+                    zone: "UTC".into(),
+                    format: "%3f".into(),
+                    ..Default::default()
+                },
             ],
             ..CalendarConfig::default()
         },
@@ -3624,6 +3629,7 @@ fn post_process_resets_unsafe_calendar_row_formats_to_inheritance() {
     assert!(cfg.calendar.clocks[0].format.is_empty());
     assert!(cfg.calendar.clocks[1].format.is_empty());
     assert_eq!(cfg.calendar.clocks[2].format, "%%S");
+    assert!(cfg.calendar.clocks[3].format.is_empty());
 }
 
 #[path = "config_tests_coverage.rs"]
