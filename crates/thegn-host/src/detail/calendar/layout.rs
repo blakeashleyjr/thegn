@@ -15,7 +15,7 @@ pub(crate) struct GridMetrics {
     pub cell_w: usize,
     /// Cells between day columns.
     pub gap: usize,
-    /// Width of the ISO week-number gutter (0 when hidden).
+    /// Width of the configured-start week-number gutter (0 when hidden).
     pub gutter: usize,
 }
 

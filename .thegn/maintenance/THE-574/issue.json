@@ -1,0 +1,10 @@
+{
+  "id": "THE-574",
+  "title": "Surface remembered-agent launch refusals before falling back to a shell",
+  "url": "https://linear.app/blakeashley/issue/THE-574/surface-remembered-agent-launch-refusals-before-falling-back-to-a",
+  "priority": "Medium",
+  "labels": [],
+  "status": "Todo",
+  "parentId": "THE-150",
+  "description": "## Finding\n\nRead-only call-site audit found handlers/worktree_launch.rs::remembered_agent_relaunch discards launch_spec_synced_with errors through .ok(), then preserves an already-resolved plain shell. This safely avoids executing rejected agent commands, but suppresses the reason (provider failure, account-origin refusal, required sandbox ownership unavailable). THE-565 adds useful refusal categories that are hidden on this resurrection path. The remembered agent record intentionally remains, which can make an apparently agent-attributed tab contain only a shell.\n\n## Acceptance\n\nPreserve safe shell fallback and no duplicate agent/session spawn, while exposing a bounded, actionable refusal through the established worker-to-UI/log diagnostic seam. Do not put blocking work on the event loop, overwrite remembered-agent attribution, or flood repeated prewarm/materialization attempts. Tests must cover a typed ownership/origin refusal and an ordinary provider error, asserting no unsafe Codex command is run and the reason is observable.\n\n## Dependencies / disposition\n\nIndependent diagnostic debt in existing resurrection behavior, related to THE-565 guarded handoff; not evidence of a sandbox escape. Review and scoped/UI tests precede implementation landing. No fix or runtime reproduction in this issue-creation step; existing safe fallback remains unchanged."
+}

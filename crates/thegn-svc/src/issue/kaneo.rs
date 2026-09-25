@@ -600,7 +600,7 @@ impl KaneoBackend {
 }
 
 impl IssueBackend for KaneoBackend {
-    fn provider_id(&self) -> &'static str {
+    fn provider_id(&self) -> &str {
         "kaneo"
     }
 

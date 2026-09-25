@@ -90,6 +90,19 @@ A configured zone name that the database does not know MUST warn and omit that
 one clock rather than failing startup, and configuration validation MUST report
 it with a suggested correction.
 
+Each clock row MAY override the inherited `[calendar] time_format` with a
+minute-safe strftime format. An empty override MUST inherit the resolved global
+12-hour or 24-hour setting, including the locale result of `auto`. Formats
+that render seconds or fractional seconds MUST be rejected by strict
+validation and normalized to inheritance during tolerant loading, because the
+world-clock popup refreshes at minute resolution. Formatted output MUST be
+bounded and terminal-safe before it becomes a cell.
+
+When `show_date = true`, a row MUST show its local date as `YYYY-MM-DD` and
+MUST omit the redundant `+1d` / `-1d` marker. When `show_date = false`, the
+row MUST retain the weekday and existing conditional relative marker. These
+rules apply independently to each row, including the synthesized home row.
+
 #### Scenario: A zone on a sub-hour offset
 
 - **WHEN** a clock is configured for a zone offset by a fraction of an hour
@@ -106,6 +119,21 @@ it with a suggested correction.
 - **WHEN** a clock names a zone the database does not contain
 - **THEN** thegn warns, omits that clock, and continues; and configuration
   validation reports the name with a suggested correction
+
+#### Scenario: Mixed row presentation policies
+
+- **WHEN** one row inherits a 12-hour setting, another uses a 24-hour strftime
+  override, and a third sets `show_date = true`
+- **THEN** each row uses its own resolved policy; the date row shows
+  `YYYY-MM-DD` without a relative marker, while rows with `show_date = false`
+  retain the weekday and conditional marker
+
+#### Scenario: A seconds-bearing row format
+
+- **WHEN** a row format contains `%S`, `%T`, `%r`, `%X`, `%s`, or fractional
+  seconds
+- **THEN** strict validation reports the unsupported minute cadence, and a
+  tolerant runtime load falls back to the inherited calendar time format
 
 ### Requirement: Events are read from configurable sources
 

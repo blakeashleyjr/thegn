@@ -546,6 +546,11 @@ fn param_str(params: &serde_json::Value, key: &str) -> Option<String> {
     params.get(key)?.as_str().map(str::to_string)
 }
 
+fn parse_register_contribution(params: serde_json::Value) -> Result<Contribution, RpcError> {
+    serde_json::from_value::<Contribution>(params)
+        .map_err(|e| RpcError::new(RpcErrorCode::Invalid, format!("bad contribution: {e}")))
+}
+
 /// Apply one verb from a plugin. Returns whether chrome must repaint.
 fn apply_message(state: &mut PluginsState, plugin: &str, msg: RpcMessage) -> bool {
     let Some(verb) = HostVerb::ALL
@@ -594,19 +599,17 @@ fn apply_message(state: &mut PluginsState, plugin: &str, msg: RpcMessage) -> boo
     // back. Invalid params short-circuit to an Invalid error response.
     let mut repaint = false;
     let outcome: Result<serde_json::Value, RpcError> = match verb {
-        HostVerb::Register => serde_json::from_value::<Contribution>(params)
-            .map_err(|e| RpcError::new(RpcErrorCode::Invalid, format!("bad contribution: {e}")))
-            .and_then(|c| {
-                entry
-                    .runtime
-                    .register(pid.clone(), c.clone())
-                    .map_err(rpc_error_of)?;
-                if !entry.contributions.iter().any(|x| x.id == c.id) {
-                    repaint |= c.extension_point == ExtensionPoint::StatusBarSegment;
-                    entry.contributions.push(c);
-                }
-                Ok(serde_json::Value::Null)
-            }),
+        HostVerb::Register => parse_register_contribution(params).and_then(|c| {
+            entry
+                .runtime
+                .register(pid.clone(), c.clone())
+                .map_err(rpc_error_of)?;
+            if !entry.contributions.iter().any(|x| x.id == c.id) {
+                repaint |= c.extension_point == ExtensionPoint::StatusBarSegment;
+                entry.contributions.push(c);
+            }
+            Ok(serde_json::Value::Null)
+        }),
         HostVerb::Update => {
             let surface = param_str(&params, "surface");
             let view = params
@@ -1226,6 +1229,23 @@ mod tests {
             );
         }
         assert_eq!(state.plugins["p"].contributions.len(), 2);
+    }
+
+    #[test]
+    fn register_rejects_nested_params_with_typed_invalid_diagnostic() {
+        let err = parse_register_contribution(serde_json::json!({
+            "plugin": "hello",
+            "contribution": {
+                "id": "hello.seg",
+                "extension_point": "StatusBarSegment",
+                "label": "Hello",
+                "surface": "hello.segment"
+            }
+        }))
+        .expect_err("register params must be the flat Contribution object");
+
+        assert_eq!(err.code, RpcErrorCode::Invalid);
+        assert!(err.message.starts_with("bad contribution:"), "{err:?}");
     }
 
     #[test]
