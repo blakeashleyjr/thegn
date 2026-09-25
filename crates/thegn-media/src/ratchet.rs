@@ -109,7 +109,9 @@ fn read_allowlist<R: RatchetIo>(
 /// Read test/<name> relative to the workspace root (two levels above a
 /// crate's manifest dir). # lines and blanks are ignored.
 pub fn allowlist(manifest_dir: &str, name: &str) -> BTreeSet<String> {
-    read_allowlist(&RealIo, manifest_dir, name).unwrap_or_else(|error| panic!("{error}"))
+    read_allowlist(&RealIo, manifest_dir, name)
+        .map(|allowlist| allowlist.entries)
+        .unwrap_or_else(|error| panic!("{error}"))
 }
 
 fn source_key(root: &Path, path: &Path) -> Result<String, String> {
@@ -144,6 +146,15 @@ fn collect_paths<R: RatchetIo>(
     exclude: &[&str],
     out: &mut Vec<(String, PathBuf)>,
 ) -> Result<(), String> {
+    let metadata = reader
+        .metadata(dir)
+        .map_err(|error| io_failure("read source metadata", dir, error))?;
+    if metadata.file_type().is_symlink() {
+        return Err(format!(
+            "refuse symlinked source entry {}: symlinked paths are not scanned",
+            dir.display()
+        ));
+    }
     let entries = reader
         .read_dir(dir)
         .map_err(|error| io_failure("read source directory", dir, error))?;
