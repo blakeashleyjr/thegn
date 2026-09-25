@@ -689,6 +689,28 @@ mod tests {
     }
 
     #[test]
+    fn empty_allowlist_fails_closed_even_when_no_file_hits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest = tmp.path().join("crates/x");
+        std::fs::create_dir_all(manifest.join("src")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("test")).unwrap();
+        std::fs::write(manifest.join("src/a.rs"), "fn a() {}\n").unwrap();
+        std::fs::write(tmp.path().join("test/empty.txt"), "").unwrap();
+        let manifest = manifest.to_string_lossy().into_owned();
+        let error = file_ratchet_with(
+            &RealIo,
+            &manifest,
+            "empty.txt",
+            &[],
+            |_, _| false,
+            "why",
+            false,
+        )
+        .unwrap_err();
+        assert!(error.contains("empty allowlist"), "{error}");
+    }
+
+    #[test]
     fn ratchet_helper_copies_are_byte_identical() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
         let core =
