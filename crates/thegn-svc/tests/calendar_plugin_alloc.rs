@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use thegn_core::calendar::AdmissionBudget;
 use thegn_core::config_calendar::{CalendarAccount, CalendarProviderKind};
-use thegn_svc::calendar::{AccountAdmission, CalendarBackend, CalendarError, backend_from_account};
+use thegn_svc::calendar::{AccountAdmission, CalendarError, backend_from_account};
 use thegn_svc::plugin::proc;
 
 struct Counting;

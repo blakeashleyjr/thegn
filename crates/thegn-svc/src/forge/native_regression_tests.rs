@@ -232,7 +232,7 @@ fn strict_origin_identity_rejects_foreign_path_and_authority_confusion_before_to
         });
         assert!(
             matches!(&result, Err(ForgeError::NotConfigured(message))
-                if message.to_string() == "origin is not a public GitHub remote"),
+                if message.as_ref() == "origin is not a public GitHub remote"),
             "{origin:?}: {result:?}"
         );
         assert_eq!(token_calls.get(), 0, "foreign origin reached credentials");

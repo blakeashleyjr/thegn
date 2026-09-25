@@ -204,12 +204,10 @@ fn configured_week_number(row: &[DayCell; 7], week_start: Weekday) -> u32 {
 
 fn week_number_from_distance(days_from_week_one: i64) -> u32 {
     let week = days_from_week_one.div_euclid(7).saturating_add(1);
-    match u32::try_from(week) {
-        Ok(week) => week,
-        // A valid Gregorian year has at most 53 such weeks. This keeps the
-        // public Vec<u32> API total even for a malformed hand-built grid.
-        Err(_) => u32::MAX,
-    }
+    // A valid Gregorian year has at most 53 such weeks. The saturating
+    // fallback keeps the public Vec<u32> API total even for a malformed
+    // hand-built grid.
+    u32::try_from(week).unwrap_or(u32::MAX)
 }
 
 /// Weekday header labels, rotated to start at `week_start`.
