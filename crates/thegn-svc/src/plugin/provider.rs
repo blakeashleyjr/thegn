@@ -559,6 +559,55 @@ done
     }
 
     #[test]
+    fn router_replacement_keeps_dynamic_identity_on_async_route() {
+        let (_fixture, _session, bridge) = live_bridge();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+
+        let mut first = IssueRouter::from_config(&IssuesConfig::default());
+        first
+            .push_backend(
+                "first".into(),
+                Box::new(
+                    PluginIssueBackend::new(
+                        bridge.clone(),
+                        "generation-first",
+                        IssueCaps::default(),
+                    )
+                    .unwrap(),
+                ),
+            )
+            .unwrap();
+        let first_error = rt
+            .block_on(first.get_issue("plugin:generation-first:issue-1"))
+            .unwrap_err();
+        assert!(matches!(
+            first_error,
+            IssueError::Api(message) if message.contains("bad get_issue reply")
+        ));
+        drop(first);
+
+        let mut replacement = IssueRouter::from_config(&IssuesConfig::default());
+        replacement
+            .push_backend(
+                "replacement".into(),
+                Box::new(
+                    PluginIssueBackend::new(bridge, "generation-replacement", IssueCaps::default())
+                        .unwrap(),
+                ),
+            )
+            .unwrap();
+        let replacement_error = rt
+            .block_on(replacement.get_issue("plugin:generation-replacement:issue-1"))
+            .unwrap_err();
+        assert!(matches!(
+            replacement_error,
+            IssueError::Api(message) if message.contains("bad get_issue reply")
+        ));
+    }
+
+    #[test]
     fn timeout_and_dead_session_degrade_to_errors() {
         // A plugin that never answers: the call times out.
         let fixture = FixtureSupervisor::new();
