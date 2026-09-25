@@ -40,6 +40,9 @@
 //!   mechanism is added here.
 
 use std::collections::{HashSet, VecDeque};
+use std::fmt;
+use std::fmt::Write as _;
+use std::hash::{Hash, Hasher};
 use std::sync::{LazyLock, Mutex};
 
 use thegn_core::calendar::display::{DisplayText, Field};
@@ -79,12 +82,12 @@ pub(crate) struct RelaunchRefusal {
 
 #[derive(Debug, Default)]
 struct RefusalRegistry {
-    reported: HashSet<(String, String, RelaunchRefusalKind)>,
-    order: VecDeque<(String, String, RelaunchRefusalKind)>,
+    reported: HashSet<u64>,
+    order: VecDeque<u64>,
 }
 
 impl RefusalRegistry {
-    fn admit(&mut self, key: (String, String, RelaunchRefusalKind)) -> bool {
+    fn admit(&mut self, key: u64) -> bool {
         if self.reported.contains(&key) {
             return false;
         }
@@ -100,6 +103,17 @@ impl RefusalRegistry {
         self.order.push_back(key);
         true
     }
+}
+
+/// Hash the identity rather than retaining caller-sized worktree/agent strings.
+/// This is a de-duplication hint, not a durable identity ledger: the tiny
+/// collision chance is preferable to retaining unbounded path/config bytes.
+fn refusal_key(worktree: &str, agent: &str, kind: RelaunchRefusalKind) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    worktree.hash(&mut hasher);
+    agent.hash(&mut hasher);
+    kind.hash(&mut hasher);
+    hasher.finish()
 }
 
 static REPORTED_REFUSALS: LazyLock<Mutex<RefusalRegistry>> =
@@ -135,7 +149,14 @@ fn refusal_kind(error: &anyhow::Error) -> RelaunchRefusalKind {
 }
 
 fn bounded_reason(error: &anyhow::Error) -> String {
-    let redacted: String = redact_text_line(&error.to_string())
+    let mut bounded = BoundedFormat::new(MAX_REFUSAL_REASON_CHARS);
+    match write!(&mut bounded, "{error}") {
+        Ok(()) | Err(fmt::Error) => {}
+    }
+    // Redaction deliberately runs only over the bounded formatted prefix. A
+    // provider-controlled error must not be fully materialized just to emit a
+    // 512-character diagnostic.
+    let redacted: String = redact_text_line(&bounded.text)
         .chars()
         .take(MAX_REFUSAL_REASON_CHARS)
         .collect();
@@ -147,8 +168,39 @@ fn bounded_reason(error: &anyhow::Error) -> String {
     }
 }
 
+struct BoundedFormat {
+    text: String,
+    remaining: usize,
+}
+
+impl BoundedFormat {
+    fn new(limit: usize) -> Self {
+        Self {
+            text: String::with_capacity(limit),
+            remaining: limit,
+        }
+    }
+}
+
+impl fmt::Write for BoundedFormat {
+    fn write_str(&mut self, value: &str) -> fmt::Result {
+        if self.remaining == 0 {
+            return Err(fmt::Error);
+        }
+        let mut chars = value.chars();
+        let prefix: String = chars.by_ref().take(self.remaining).collect();
+        let written = prefix.chars().count();
+        self.text.push_str(&prefix);
+        self.remaining -= written;
+        if chars.next().is_some() {
+            return Err(fmt::Error);
+        }
+        Ok(())
+    }
+}
+
 fn admit_refusal(worktree: &str, agent: &str, kind: RelaunchRefusalKind) -> bool {
-    let key = (worktree.to_string(), agent.to_string(), kind);
+    let key = refusal_key(worktree, agent, kind);
     match REPORTED_REFUSALS.lock() {
         Ok(mut reported) => reported.admit(key),
         Err(poisoned) => poisoned.into_inner().admit(key),
@@ -311,7 +363,7 @@ pub(crate) fn apply_relaunch(
         attach_is_empty,
         quiet_split,
         remembered_agent_relaunch,
-    );
+    )
 }
 
 fn apply_relaunch_with(
@@ -735,6 +787,124 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    fn materialize_refused_shell(
+        tag: &str,
+        configure: impl FnOnce(&mut Config),
+        relaunch: impl FnOnce(&Config, &str, u32) -> Result<Option<(u32, LaunchSpec)>, RelaunchRefusal>,
+    ) {
+        use std::os::unix::fs::PermissionsExt;
+
+        with_state(tag, |state| {
+            let root = state.join("spawn-sentinel");
+            let worktree = root.join("worktree");
+            let shell_marker = root.join("shell-ran");
+            let agent_marker = root.join("agent-ran");
+            std::fs::create_dir_all(&worktree).unwrap();
+
+            let shell_launcher = root.join("shell-fallback");
+            let agent_launcher = root.join("codex-agent");
+            for (launcher, marker) in [
+                (&shell_launcher, &shell_marker),
+                (&agent_launcher, &agent_marker),
+            ] {
+                std::fs::write(launcher, format!("#!/bin/sh\ntouch {}\n", marker.display()))
+                    .unwrap();
+                std::fs::set_permissions(launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+
+            let mut cfg = cfg_with(&[("codex", false)]);
+            cfg.agents[0].command = agent_launcher.display().to_string();
+            cfg.sandbox.enabled = false;
+            cfg.sandbox.backend = SandboxBackend::None;
+            configure(&mut cfg);
+            let worktree = worktree.to_string_lossy().into_owned();
+            register(&worktree, "codex");
+
+            let mut specs = Ok(vec![(
+                3,
+                LaunchSpec {
+                    argv: vec![shell_launcher.display().to_string()],
+                    cwd: Some(worktree.clone()),
+                    env: Vec::new(),
+                    backend: "host".into(),
+                    warnings: Vec::new(),
+                    degraded: false,
+                    remote: false,
+                },
+            )]);
+            assert_eq!(
+                apply_relaunch_with(&mut specs, &cfg, &worktree, Some(3), true, false, relaunch),
+                RelaunchOutcome::Refused
+            );
+
+            let mut session = crate::session::Session {
+                id: "spawn-sentinel".into(),
+                worktrees: vec![crate::session::WorktreeGroup::new(
+                    "app/wt",
+                    crate::session::GroupKind::Home,
+                    worktree.clone(),
+                )],
+                active: 0,
+            };
+            session.worktrees[0].tabs[0].center = crate::center::CenterTree::Leaf(3);
+            session.worktrees[0].tabs[0].focused_pane = 3;
+            let (pane_tx, _pane_rx) = tokio::sync::mpsc::channel::<crate::pane::PaneEvent>(16);
+            let mut panes = crate::panes::Panes::new(pane_tx);
+            let center = crate::layout::compute(120, 30, true, true).center;
+            panes
+                .materialize_with_specs(
+                    &cfg,
+                    &mut session.worktrees[0].tabs[0],
+                    &worktree,
+                    specs.as_ref().unwrap(),
+                    center,
+                    &[],
+                )
+                .unwrap();
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while !shell_marker.exists() && std::time::Instant::now() < deadline {
+                std::thread::yield_now();
+            }
+            assert!(
+                shell_marker.exists(),
+                "the retained shell fallback must execute"
+            );
+            assert!(
+                !agent_marker.exists(),
+                "the refused remembered-agent command must never execute"
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn typed_refusal_materializes_shell_without_running_codex() {
+        materialize_refused_shell(
+            "typed-spawn-sentinel",
+            |_| {},
+            |_, _, _| {
+                Err(RelaunchRefusal {
+                    agent: "codex".into(),
+                    source: anyhow::Error::new(crate::agent::DevcontainerLaunchRefused {
+                        reason: "trusted provider origin was rejected".into(),
+                    }),
+                })
+            },
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ordinary_refusal_materializes_shell_without_running_codex() {
+        materialize_refused_shell(
+            "ordinary-spawn-sentinel",
+            |cfg| cfg.agents[0].permissions = vec!["Read".into()],
+            remembered_agent_relaunch,
+        );
+    }
+
     #[test]
     fn typed_refusal_keeps_shell_and_is_deduped() {
         with_state("typed-refusal", |_| {
@@ -923,28 +1093,28 @@ mod tests {
     fn refusal_registry_evicts_oldest_entry_at_its_cap() {
         let mut registry = RefusalRegistry::default();
         for i in 0..MAX_REPORTED_REFUSALS {
-            assert!(registry.admit((
-                format!("wt-{i}"),
-                "codex".into(),
-                RelaunchRefusalKind::ProviderLaunch
+            assert!(registry.admit(refusal_key(
+                &format!("wt-{i}"),
+                "codex",
+                RelaunchRefusalKind::ProviderLaunch,
             )));
         }
         assert_eq!(registry.reported.len(), MAX_REPORTED_REFUSALS);
-        assert!(!registry.admit((
-            "wt-0".into(),
-            "codex".into(),
-            RelaunchRefusalKind::ProviderLaunch
+        assert!(!registry.admit(refusal_key(
+            "wt-0",
+            "codex",
+            RelaunchRefusalKind::ProviderLaunch,
         )));
-        assert!(registry.admit((
-            "wt-new".into(),
-            "codex".into(),
-            RelaunchRefusalKind::ProviderLaunch
+        assert!(registry.admit(refusal_key(
+            "wt-new",
+            "codex",
+            RelaunchRefusalKind::ProviderLaunch,
         )));
         assert_eq!(registry.reported.len(), MAX_REPORTED_REFUSALS);
-        assert!(registry.admit((
-            "wt-0".into(),
-            "codex".into(),
-            RelaunchRefusalKind::ProviderLaunch
+        assert!(registry.admit(refusal_key(
+            "wt-0",
+            "codex",
+            RelaunchRefusalKind::ProviderLaunch,
         )));
     }
 }

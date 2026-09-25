@@ -471,6 +471,7 @@ fn automatic_prewarm_drains_host_result_without_spawning_or_evaluating() {
                 target_leaves: vec![7],
                 origin: crate::loading::SpecOrigin::Prewarm,
                 specs,
+                relaunch: crate::handlers::worktree_launch::RelaunchOutcome::NotAttempted,
                 attach: Vec::new(),
             })
             .unwrap();
