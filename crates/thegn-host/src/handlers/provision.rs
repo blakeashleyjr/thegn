@@ -6,6 +6,7 @@
 use crate::chrome::LoadStep;
 use crate::compositor::Rect;
 use crate::handlers::worktree_attach::{self, AttachTarget};
+use crate::handlers::worktree_launch::RelaunchOutcome;
 use crate::loading::{SpecOrigin, apply_spec_batch};
 use crate::menu::{self, MenuOverlay};
 use thegn_core::store::{PoolStore, WorkspaceStore};
@@ -30,6 +31,10 @@ pub(crate) struct SpecBatch {
     /// Which inflight set to clear; prewarm batches may be dropped.
     pub origin: SpecOrigin,
     pub specs: std::result::Result<Vec<(u32, crate::agent::LaunchSpec)>, SpecError>,
+    /// The remembered-agent fold's status. `Refused` is deliberately separate
+    /// from `specs: Ok`: the shell fallback remains a valid batch result, while
+    /// the worker's refusal is retained for downstream bookkeeping.
+    pub relaunch: RelaunchOutcome,
     /// Live daemon agent sessions for [`SpecBatch::worktree`], newest first
     /// ([`worktree_attach::live_for_worktree`]). Empty when the worker didn't
     /// probe (terminal groups, daemon route off, probe failure).
@@ -42,6 +47,7 @@ pub(crate) type ProvisionProgress = (String, usize, Vec<LoadStep>);
 /// Error carried over the off-thread spec-resolution channel. Preserves a
 /// [`SandboxHalt`](crate::agent::SandboxHalt) (so the receiver can raise the
 /// warning modal) and stringifies everything else.
+#[derive(Debug)]
 pub(crate) enum SpecError {
     /// Boxed: `SandboxHalt` is large and every spec closure returns this error.
     Halt(Box<crate::agent::SandboxHalt>),
@@ -442,8 +448,17 @@ pub(crate) fn drain_specs(
             target_leaves,
             origin,
             specs,
+            relaunch,
             attach: batch_attach,
         } = batch;
+        if relaunch == RelaunchOutcome::Refused {
+            tracing::debug!(
+                target: "thegn::agent",
+                group = %name,
+                tab = ti,
+                "spec batch retained shell fallback after remembered-agent refusal"
+            );
+        }
         ctx.loop_perf.tick(crate::perf::WakeSource::Spec);
         let tab_key = (name.clone(), ti);
         let Some(gi) = ctx.session.worktrees.iter().position(|g| g.name == name) else {
@@ -946,6 +961,7 @@ mod tests {
                 target_leaves: vec![leaf],
                 origin: SpecOrigin::Materialize,
                 specs: Ok(vec![(leaf, spec)]),
+                relaunch: RelaunchOutcome::NotAttempted,
                 attach: Vec::new(),
             })
             .unwrap();
@@ -1045,6 +1061,7 @@ mod tests {
                 target_leaves: vec![leaf],
                 origin: SpecOrigin::Prewarm,
                 specs: Err(SpecError::PrewarmSkipped),
+                relaunch: RelaunchOutcome::NotAttempted,
                 attach: vec![AttachTarget {
                     session: "live-session".into(),
                     program: "claude".into(),
@@ -1170,6 +1187,7 @@ mod tests {
                 target_leaves: vec![6],
                 origin: SpecOrigin::Prewarm,
                 specs: Err(SpecError::PrewarmSkipped),
+                relaunch: RelaunchOutcome::NotAttempted,
                 attach: vec![AttachTarget {
                     session: "stale-session".into(),
                     program: "claude".into(),
@@ -1295,6 +1313,7 @@ mod tests {
                 target_leaves: vec![99],
                 origin: SpecOrigin::Prewarm,
                 specs: Ok(vec![(99u32, spec)]),
+                relaunch: RelaunchOutcome::NotAttempted,
                 attach: Vec::new(),
             })
             .unwrap();
@@ -1393,6 +1412,7 @@ mod tests {
                 target_leaves: vec![6],
                 origin: SpecOrigin::Prewarm,
                 specs: Err(SpecError::PrewarmSkipped),
+                relaunch: RelaunchOutcome::NotAttempted,
                 attach: Vec::new(),
             })
             .unwrap();
@@ -1474,6 +1494,7 @@ mod tests {
                 target_leaves: vec![42],
                 origin,
                 specs: Err(SpecError::PrewarmSkipped),
+                relaunch: RelaunchOutcome::NotAttempted,
                 attach: Vec::new(),
             })
             .unwrap();
