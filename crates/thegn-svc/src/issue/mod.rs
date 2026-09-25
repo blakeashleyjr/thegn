@@ -31,6 +31,11 @@ pub enum IssueError {
     Network(reqwest::Error),
     Auth(String),
     Api(String),
+    PartialUpdate {
+        applied: Vec<&'static str>,
+        unapplied: Vec<&'static str>,
+        source: Box<IssueError>,
+    },
     Subprocess(String),
     Parse(String),
     Policy(&'static str),
@@ -46,6 +51,16 @@ impl std::fmt::Debug for IssueError {
             Self::Network(_) => f.write_str("IssueError::Network(<redacted>)"),
             Self::Auth(message) => f.debug_tuple("IssueError::Auth").field(message).finish(),
             Self::Api(message) => f.debug_tuple("IssueError::Api").field(message).finish(),
+            Self::PartialUpdate {
+                applied,
+                unapplied,
+                source,
+            } => f
+                .debug_struct("IssueError::PartialUpdate")
+                .field("applied", applied)
+                .field("unapplied", unapplied)
+                .field("source", source)
+                .finish(),
             Self::Subprocess(message) => f
                 .debug_tuple("IssueError::Subprocess")
                 .field(message)
@@ -71,6 +86,16 @@ impl std::fmt::Display for IssueError {
             IssueError::Network(_) => write!(f, "network: tracker request failed"),
             IssueError::Auth(s) => write!(f, "auth: {s}"),
             IssueError::Api(s) => write!(f, "api: {s}"),
+            IssueError::PartialUpdate {
+                applied,
+                unapplied,
+                source,
+            } => write!(
+                f,
+                "partial update (applied: {}; unapplied: {}): {source}",
+                applied.join(", "),
+                unapplied.join(", "),
+            ),
             IssueError::Subprocess(s) => write!(f, "subprocess: {s}"),
             IssueError::Parse(s) => write!(f, "parse: {s}"),
             IssueError::Policy(s) => write!(f, "tracker policy: {s}"),
@@ -80,7 +105,14 @@ impl std::fmt::Display for IssueError {
     }
 }
 
-impl std::error::Error for IssueError {}
+impl std::error::Error for IssueError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            IssueError::PartialUpdate { source, .. } => Some(source.as_ref()),
+            _ => None,
+        }
+    }
+}
 
 impl IssueError {
     /// Construct the typed error returned by an absent optional operation.
@@ -105,6 +137,7 @@ impl SeamError for IssueError {
             IssueError::Network(e) if e.is_connect() || e.is_timeout() => ErrorClass::Transient,
             IssueError::Timeout(_) => ErrorClass::Transient,
             IssueError::Network(_) => ErrorClass::Other,
+            IssueError::PartialUpdate { source, .. } => source.class(),
             IssueError::Subprocess(message)
                 if message
                     .to_ascii_lowercase()
