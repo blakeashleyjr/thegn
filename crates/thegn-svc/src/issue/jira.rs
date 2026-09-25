@@ -221,6 +221,56 @@ fn map_jira_status(status: &Option<JiraStatus>) -> IssueStatus {
     }
 }
 
+fn target_status_category(status: IssueStatus) -> &'static str {
+    match status {
+        IssueStatus::Backlog | IssueStatus::Todo => "new",
+        IssueStatus::InProgress => "indeterminate",
+        IssueStatus::Done | IssueStatus::Cancelled => "done",
+    }
+}
+
+fn jira_status_category(status: &Option<JiraStatus>) -> Option<&str> {
+    status
+        .as_ref()
+        .and_then(|status| status.status_category.as_ref())
+        .map(|category| category.key.as_str())
+}
+
+fn partial_update(
+    applied: &[&'static str],
+    unapplied: &[&'static str],
+    unverified: &[&'static str],
+    source: IssueError,
+) -> IssueError {
+    IssueError::PartialUpdate {
+        applied: applied.to_vec(),
+        unapplied: unapplied.to_vec(),
+        unverified: unverified.to_vec(),
+        source: Box::new(source),
+    }
+}
+
+fn is_definitive_transition_rejection(error: &IssueError) -> bool {
+    match error {
+        IssueError::Auth(_) => true,
+        IssueError::Api(message) => {
+            jira_http_status(message).is_some_and(|status| matches!(status, 400 | 404 | 409 | 422))
+        }
+        _ => false,
+    }
+}
+
+/// Extract the status code from the bounded HTTP diagnostic emitted by the
+/// shared tracker client. `StatusCode`'s display includes a reason phrase on
+/// current http versions, so parsing the entire suffix would misclassify a
+/// definitive rejection such as `jira HTTP 400 Bad Request` as ambiguous.
+fn jira_http_status(message: &str) -> Option<u16> {
+    message
+        .strip_prefix("jira HTTP ")
+        .and_then(|status| status.split_ascii_whitespace().next())
+        .and_then(|status| status.parse::<u16>().ok())
+}
+
 fn map_jira_priority(p: &Option<JiraPriority>) -> IssuePriority {
     match p.as_ref().map(|p| p.name.as_str()) {
         Some("Highest") => IssuePriority::Urgent,
@@ -571,47 +621,10 @@ impl IssueBackend for JiraBackend {
                 ensure_dynamic_input(title)?;
             }
 
-            // Status update via transitions.
-            if let Some(status) = patch.status {
-                let transitions: JiraTransitions =
-                    Self::get(&mut op, &jira_path(key, "/transitions")?).await?;
-                let target_cat = match status {
-                    IssueStatus::Backlog | IssueStatus::Todo => "new",
-                    IssueStatus::InProgress => "indeterminate",
-                    IssueStatus::Done | IssueStatus::Cancelled => "done",
-                };
-                let trans = transitions
-                    .transitions
-                    .iter()
-                    .find(|t| {
-                        t.to.status_category
-                            .as_ref()
-                            .map(|c| c.key == target_cat)
-                            .unwrap_or(false)
-                    })
-                    .ok_or_else(|| IssueError::Api("Jira transition target unavailable".into()))?;
+            let mut applied = Vec::new();
 
-                #[derive(Serialize)]
-                struct TransitionBody {
-                    transition: TransitionId,
-                }
-                #[derive(Serialize)]
-                struct TransitionId {
-                    id: String,
-                }
-                Self::post_empty(
-                    &mut op,
-                    &jira_path(key, "/transitions")?,
-                    &TransitionBody {
-                        transition: TransitionId {
-                            id: trans.id.clone(),
-                        },
-                    },
-                )
-                .await?;
-            }
-
-            // Title / summary update.
+            // Title is cosmetic, idempotent, and reversible, so apply it before
+            // the workflow transition. A title failure leaves status untouched.
             if let Some(title) = &patch.title {
                 #[derive(Serialize)]
                 struct UpdateBody {
@@ -631,14 +644,124 @@ impl IssueBackend for JiraBackend {
                     },
                 )
                 .await?;
+                applied.push("title");
+            }
+
+            // Status transitions can trigger irreversible workflow effects, so
+            // they are the last mutation. If this fails after a title write,
+            // retain the source error and report the field-level outcome.
+            let mut unknown_transition = None;
+            if let Some(status) = patch.status {
+                let target_cat = target_status_category(status);
+                let transitions: JiraTransitions =
+                    match Self::get(&mut op, &jira_path(key, "/transitions")?).await {
+                        Ok(transitions) => transitions,
+                        Err(error) if !applied.is_empty() => {
+                            return Err(partial_update(&applied, &["status"], &[], error));
+                        }
+                        Err(error) => return Err(error),
+                    };
+                let trans = transitions
+                    .transitions
+                    .iter()
+                    .find(|t| {
+                        t.to.status_category
+                            .as_ref()
+                            .map(|c| c.key == target_cat)
+                            .unwrap_or(false)
+                    })
+                    .ok_or_else(|| {
+                        IssueError::Api(format!(
+                            "Jira transition target unavailable for {key}: {} ({target_cat})",
+                            status.label()
+                        ))
+                    });
+                let trans = match trans {
+                    Ok(trans) => trans,
+                    Err(error) if !applied.is_empty() => {
+                        return Err(partial_update(&applied, &["status"], &[], error));
+                    }
+                    Err(error) => return Err(error),
+                };
+
+                #[derive(Serialize)]
+                struct TransitionBody {
+                    transition: TransitionId,
+                }
+                #[derive(Serialize)]
+                struct TransitionId {
+                    id: String,
+                }
+                if let Err(error) = Self::post_empty(
+                    &mut op,
+                    &jira_path(key, "/transitions")?,
+                    &TransitionBody {
+                        transition: TransitionId {
+                            id: trans.id.clone(),
+                        },
+                    },
+                )
+                .await
+                {
+                    if is_definitive_transition_rejection(&error) {
+                        if !applied.is_empty() {
+                            return Err(partial_update(&applied, &["status"], &[], error));
+                        }
+                        return Err(error);
+                    }
+                    // A network, timeout, connection-reset, 5xx, redirect,
+                    // or other intermediary failure does not prove that Jira
+                    // did not receive the POST. Keep status out of
+                    // `unapplied` until the existing final fetch disambiguates
+                    // it.
+                    unknown_transition = Some(error);
+                }
+                if unknown_transition.is_none() {
+                    applied.push("status");
+                }
             }
 
             let ji: JiraIssue = Self::get(
                 &mut op,
                 &format!("{}?fields={JIRA_FIELDS}", jira_path(key, "")?),
             )
-            .await?;
-            checked_jira_key(&ji.key)?;
+            .await
+            .map_err(|error| {
+                if let Some(post_error) = unknown_transition.take() {
+                    // The POST's typed error is the strongest signal available
+                    // for retry/backoff classification. The status is
+                    // unverified: the existing fetch failed, so the caller
+                    // must verify before retrying rather than treating status
+                    // as safely retryable.
+                    partial_update(&applied, &[], &["status"], post_error)
+                } else if applied.is_empty() {
+                    error
+                } else {
+                    partial_update(&applied, &[], &[], error)
+                }
+            })?;
+            if let Err(error) = checked_jira_key(&ji.key) {
+                return Err(if let Some(post_error) = unknown_transition.take() {
+                    partial_update(&applied, &[], &["status"], post_error)
+                } else if applied.is_empty() {
+                    error
+                } else {
+                    partial_update(&applied, &[], &[], error)
+                });
+            }
+
+            if let Some(status) = patch.status {
+                let target_cat = target_status_category(status);
+                if jira_status_category(&ji.fields.status) != Some(target_cat) {
+                    let error = IssueError::Api(format!(
+                        "Jira status verification failed for {key}: expected category {target_cat}"
+                    ));
+                    if unknown_transition.is_some() {
+                        return Err(partial_update(&applied, &["status"], &[], error));
+                    }
+                    return Err(partial_update(&applied, &[], &[], error));
+                }
+            }
             Ok(jira_issue_to_domain(ji, &self.base_url))
         })
     }
@@ -934,6 +1057,677 @@ mod tests {
         );
         assert!(backend.http().is_ok());
     }
+
+    #[derive(Clone)]
+    struct FixtureResponse {
+        status: StatusCode,
+        body: String,
+    }
+
+    impl FixtureResponse {
+        fn new(status: StatusCode, body: impl Into<String>) -> Self {
+            Self {
+                status,
+                body: body.into(),
+            }
+        }
+    }
+
+    fn transition_fixture(category: &str) -> FixtureResponse {
+        FixtureResponse::new(
+            StatusCode::OK,
+            json!({
+                "transitions": [{
+                    "id": "31",
+                    "to": {
+                        "name": "fixture status",
+                        "statusCategory": { "key": category }
+                    }
+                }]
+            })
+            .to_string(),
+        )
+    }
+
+    fn issue_fixture(summary: &str, category: &str) -> FixtureResponse {
+        FixtureResponse::new(
+            StatusCode::OK,
+            json!({
+                "id": "10001",
+                "key": "PROJ-1",
+                "self": "http://jira.example/rest/api/3/issue/10001",
+                "fields": {
+                    "summary": summary,
+                    "status": {
+                        "name": "fixture status",
+                        "statusCategory": { "key": category }
+                    }
+                }
+            })
+            .to_string(),
+        )
+    }
+
+    #[derive(Debug, Clone, PartialEq)]
+    struct RecordedRequest {
+        call: String,
+        body: serde_json::Value,
+    }
+
+    async fn run_update_recorded(
+        patch: IssuePatch,
+        responses: Vec<FixtureResponse>,
+    ) -> (Result<Issue, IssueError>, Vec<RecordedRequest>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let responses = Arc::new(responses);
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let route_responses = Arc::clone(&responses);
+        let route_calls = Arc::clone(&calls);
+        let server = tokio::spawn(async move {
+            let app = Router::new().fallback(any(move |request: Request| {
+                let route_responses = Arc::clone(&route_responses);
+                let route_calls = Arc::clone(&route_calls);
+                async move {
+                    let route = format!("{} {}", request.method(), request.uri().path());
+                    let body = axum::body::to_bytes(request.into_body(), 64 * 1024)
+                        .await
+                        .unwrap();
+                    let body = serde_json::from_slice(&body).unwrap_or_default();
+                    let call = {
+                        let mut calls = route_calls.lock().unwrap();
+                        let call = calls.len();
+                        calls.push(RecordedRequest { call: route, body });
+                        call
+                    };
+                    let fixture = route_responses.get(call).cloned().unwrap_or_else(|| {
+                        FixtureResponse::new(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "fixture response exhausted",
+                        )
+                    });
+                    let has_json = !fixture.body.is_empty();
+                    let mut response = (fixture.status, Body::from(fixture.body)).into_response();
+                    if has_json {
+                        response.headers_mut().insert(
+                            reqwest::header::CONTENT_TYPE,
+                            HeaderValue::from_static("application/json"),
+                        );
+                    }
+                    response
+                }
+            }));
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let backend = JiraBackend::new_with_budget(
+            format!("http://{address}"),
+            "user@example.test".into(),
+            "jira-secret".into(),
+            None,
+            Arc::new(TrackerHttpBudget::with_permits(1)),
+        );
+        let result = backend.update_issue("jira:PROJ-1", &patch).await;
+        server.abort();
+        let _ = server.await;
+        let calls = calls.lock().unwrap().clone();
+        (result, calls)
+    }
+
+    async fn run_update(
+        patch: IssuePatch,
+        responses: Vec<FixtureResponse>,
+    ) -> (Result<Issue, IssueError>, Vec<String>) {
+        let (result, calls) = run_update_recorded(patch, responses).await;
+        (
+            result,
+            calls.into_iter().map(|request| request.call).collect(),
+        )
+    }
+
+    #[test]
+    fn target_status_categories_preserve_domain_equivalence() {
+        assert_eq!(target_status_category(IssueStatus::Backlog), "new");
+        assert_eq!(target_status_category(IssueStatus::Todo), "new");
+        assert_eq!(
+            target_status_category(IssueStatus::InProgress),
+            "indeterminate"
+        );
+        assert_eq!(target_status_category(IssueStatus::Done), "done");
+        assert_eq!(target_status_category(IssueStatus::Cancelled), "done");
+    }
+
+    fn assert_jira_api_status(error: &IssueError, status: StatusCode) {
+        match error {
+            IssueError::Api(message) => {
+                assert_eq!(message, &format!("jira HTTP {status}"));
+            }
+            other => panic!("expected Jira API error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn title_failure_does_not_attempt_status_transition() {
+        let (result, calls) = run_update(
+            IssuePatch {
+                title: Some("new title".into()),
+                status: Some(IssueStatus::Done),
+                ..Default::default()
+            },
+            vec![FixtureResponse::new(StatusCode::BAD_GATEWAY, "secret-body")],
+        )
+        .await;
+
+        match &result {
+            Err(error) => assert_jira_api_status(error, StatusCode::BAD_GATEWAY),
+            Ok(issue) => panic!("expected title failure, got {issue:?}"),
+        }
+        assert_eq!(calls, vec!["PUT /rest/api/3/issue/PROJ-1"]);
+    }
+
+    #[tokio::test]
+    async fn title_success_then_status_http_failure_reports_partial_fields() {
+        let (result, requests) = run_update_recorded(
+            IssuePatch {
+                title: Some("new title".into()),
+                status: Some(IssueStatus::InProgress),
+                ..Default::default()
+            },
+            vec![
+                FixtureResponse::new(StatusCode::NO_CONTENT, ""),
+                transition_fixture("indeterminate"),
+                FixtureResponse::new(StatusCode::BAD_REQUEST, "secret-body"),
+            ],
+        )
+        .await;
+
+        match result {
+            Err(IssueError::PartialUpdate {
+                applied,
+                unapplied,
+                unverified,
+                source,
+            }) => {
+                assert_eq!(applied, vec!["title"]);
+                assert_eq!(unapplied, vec!["status"]);
+                assert!(unverified.is_empty());
+                let source_debug = format!("{source:?}");
+                assert_jira_api_status(source.as_ref(), StatusCode::BAD_REQUEST);
+                assert!(!source_debug.contains("secret-body"));
+            }
+            other => panic!("expected typed partial update, got {other:?}"),
+        }
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request.call.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "PUT /rest/api/3/issue/PROJ-1",
+                "GET /rest/api/3/issue/PROJ-1/transitions",
+                "POST /rest/api/3/issue/PROJ-1/transitions",
+            ]
+        );
+        assert_eq!(
+            requests[0].body,
+            json!({"fields": {"summary": "new title"}})
+        );
+        assert_eq!(requests[2].body, json!({"transition": {"id": "31"}}));
+    }
+
+    #[tokio::test]
+    async fn ambiguous_transition_failure_is_not_reported_as_unapplied() {
+        let (result, requests) = run_update_recorded(
+            IssuePatch {
+                title: Some("new title".into()),
+                status: Some(IssueStatus::InProgress),
+                ..Default::default()
+            },
+            vec![
+                FixtureResponse::new(StatusCode::NO_CONTENT, ""),
+                transition_fixture("indeterminate"),
+                FixtureResponse::new(StatusCode::SERVICE_UNAVAILABLE, "secret-body"),
+                FixtureResponse::new(StatusCode::BAD_GATEWAY, "verification-secret"),
+            ],
+        )
+        .await;
+
+        match result {
+            Err(IssueError::PartialUpdate {
+                applied,
+                unapplied,
+                unverified,
+                source,
+            }) => {
+                assert_eq!(applied, vec!["title"]);
+                assert!(unapplied.is_empty(), "unknown status must not be retryable");
+                assert_eq!(unverified, vec!["status"]);
+                assert_jira_api_status(source.as_ref(), StatusCode::SERVICE_UNAVAILABLE);
+                let source_debug = format!("{source:?}");
+                assert!(!source_debug.contains("secret-body"));
+                assert!(!source_debug.contains("verification-secret"));
+            }
+            other => panic!("expected unknown partial update, got {other:?}"),
+        }
+        assert_eq!(
+            requests,
+            vec![
+                RecordedRequest {
+                    call: "PUT /rest/api/3/issue/PROJ-1".into(),
+                    body: json!({"fields": {"summary": "new title"}}),
+                },
+                RecordedRequest {
+                    call: "GET /rest/api/3/issue/PROJ-1/transitions".into(),
+                    body: serde_json::Value::Null,
+                },
+                RecordedRequest {
+                    call: "POST /rest/api/3/issue/PROJ-1/transitions".into(),
+                    body: json!({"transition": {"id": "31"}}),
+                },
+                RecordedRequest {
+                    call: "GET /rest/api/3/issue/PROJ-1".into(),
+                    body: serde_json::Value::Null,
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn ambiguous_transition_failure_is_confirmed_by_final_fetch() {
+        let (result, requests) = run_update(
+            IssuePatch {
+                title: Some("new title".into()),
+                status: Some(IssueStatus::InProgress),
+                ..Default::default()
+            },
+            vec![
+                FixtureResponse::new(StatusCode::NO_CONTENT, ""),
+                transition_fixture("indeterminate"),
+                FixtureResponse::new(StatusCode::SERVICE_UNAVAILABLE, "secret-body"),
+                issue_fixture("new title", "indeterminate"),
+            ],
+        )
+        .await;
+
+        let issue = result.expect("verification should resolve an ambiguous transition");
+        assert_eq!(issue.title, "new title");
+        assert_eq!(issue.status, IssueStatus::InProgress);
+        assert_eq!(requests.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn request_timeout_transition_failure_is_not_reported_as_unapplied() {
+        let (result, requests) = run_update_recorded(
+            IssuePatch {
+                status: Some(IssueStatus::Done),
+                ..Default::default()
+            },
+            vec![
+                transition_fixture("done"),
+                FixtureResponse::new(StatusCode::REQUEST_TIMEOUT, "request-timeout-body"),
+                FixtureResponse::new(StatusCode::BAD_GATEWAY, "verification-body"),
+            ],
+        )
+        .await;
+
+        match result {
+            Err(IssueError::PartialUpdate {
+                applied,
+                unapplied,
+                unverified,
+                source,
+            }) => {
+                assert!(applied.is_empty());
+                assert!(
+                    unapplied.is_empty(),
+                    "an HTTP timeout/intermediary response is ambiguous"
+                );
+                assert_eq!(unverified, vec!["status"]);
+                assert_jira_api_status(source.as_ref(), StatusCode::REQUEST_TIMEOUT);
+            }
+            other => panic!("expected unknown transition outcome, got {other:?}"),
+        }
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request.call.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "GET /rest/api/3/issue/PROJ-1/transitions",
+                "POST /rest/api/3/issue/PROJ-1/transitions",
+                "GET /rest/api/3/issue/PROJ-1",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn unrecognized_transition_4xx_is_not_reported_as_unapplied() {
+        let (result, requests) = run_update_recorded(
+            IssuePatch {
+                status: Some(IssueStatus::Done),
+                ..Default::default()
+            },
+            vec![
+                transition_fixture("done"),
+                FixtureResponse::new(StatusCode::IM_A_TEAPOT, "unrecognized-4xx-body"),
+                FixtureResponse::new(StatusCode::BAD_GATEWAY, "verification-body"),
+            ],
+        )
+        .await;
+
+        match result {
+            Err(IssueError::PartialUpdate {
+                applied,
+                unapplied,
+                unverified,
+                source,
+            }) => {
+                assert!(applied.is_empty());
+                assert!(
+                    unapplied.is_empty(),
+                    "an unrecognized 4xx response is ambiguous"
+                );
+                assert_eq!(unverified, vec!["status"]);
+                assert_jira_api_status(source.as_ref(), StatusCode::IM_A_TEAPOT);
+                assert!(!format!("{source:?}").contains("unrecognized-4xx-body"));
+            }
+            other => panic!("expected unknown transition outcome, got {other:?}"),
+        }
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request.call.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "GET /rest/api/3/issue/PROJ-1/transitions",
+                "POST /rest/api/3/issue/PROJ-1/transitions",
+                "GET /rest/api/3/issue/PROJ-1",
+            ]
+        );
+    }
+
+    #[test]
+    fn partial_update_preserves_transient_source_classification() {
+        let error = partial_update(
+            &["title"],
+            &[],
+            &["status"],
+            IssueError::Timeout("tracker HTTP operation deadline exceeded"),
+        );
+
+        assert!(error.is_transient());
+        let message = format!("{error}");
+        assert!(message.contains("partial update"));
+        assert!(message.contains("unverified: status"));
+        assert!(message.contains("verify before retrying"));
+    }
+
+    #[test]
+    fn partial_update_field_outcomes_are_disjoint() {
+        let error = partial_update(
+            &["title"],
+            &["assignee"],
+            &["status"],
+            IssueError::Api("bounded source".into()),
+        );
+
+        let IssueError::PartialUpdate {
+            applied,
+            unapplied,
+            unverified,
+            ..
+        } = error
+        else {
+            panic!("expected a typed partial update");
+        };
+        let outcomes = [&applied, &unapplied, &unverified];
+        for (index, outcome) in outcomes.iter().enumerate() {
+            for other in outcomes.iter().skip(index + 1) {
+                assert!(
+                    outcome.iter().all(|field| !other.contains(field)),
+                    "field outcomes must be disjoint: {outcome:?} vs {other:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn definitive_transition_rejections_use_jira_allowlist() {
+        for status in [400, 404, 409, 422] {
+            assert!(is_definitive_transition_rejection(&IssueError::Api(
+                format!("jira HTTP {status}"),
+            )));
+            assert!(is_definitive_transition_rejection(&IssueError::Api(
+                format!("jira HTTP {status} reason phrase"),
+            )));
+        }
+        for status in [408, 418, 425, 429, 500] {
+            assert!(!is_definitive_transition_rejection(&IssueError::Api(
+                format!("jira HTTP {status}"),
+            )));
+            assert!(!is_definitive_transition_rejection(&IssueError::Api(
+                format!("jira HTTP {status} reason phrase"),
+            )));
+        }
+        assert!(is_definitive_transition_rejection(&IssueError::Auth(
+            "jira HTTP 401".into(),
+        )));
+    }
+
+    #[tokio::test]
+    async fn transition_lookup_http_failure_is_propagated_without_followup() {
+        let (result, calls) = run_update(
+            IssuePatch {
+                status: Some(IssueStatus::Done),
+                ..Default::default()
+            },
+            vec![FixtureResponse::new(StatusCode::BAD_GATEWAY, "")],
+        )
+        .await;
+
+        match &result {
+            Err(error) => assert_jira_api_status(error, StatusCode::BAD_GATEWAY),
+            Ok(issue) => panic!("expected transition lookup failure, got {issue:?}"),
+        }
+        assert_eq!(calls, vec!["GET /rest/api/3/issue/PROJ-1/transitions"]);
+    }
+
+    #[tokio::test]
+    async fn unavailable_transition_is_bounded_and_does_not_post() {
+        let (result, calls) = run_update(
+            IssuePatch {
+                status: Some(IssueStatus::InProgress),
+                ..Default::default()
+            },
+            vec![transition_fixture("new")],
+        )
+        .await;
+
+        match result {
+            Err(IssueError::Api(message)) => {
+                assert!(message.contains("In Progress"));
+                assert!(message.contains("indeterminate"));
+                assert!(!message.contains("secret-body"));
+            }
+            other => panic!("expected unavailable transition error, got {other:?}"),
+        }
+        assert_eq!(calls, vec!["GET /rest/api/3/issue/PROJ-1/transitions"]);
+    }
+
+    #[tokio::test]
+    async fn stale_transition_id_propagates_post_failure_without_final_fetch() {
+        let (result, calls) = run_update(
+            IssuePatch {
+                status: Some(IssueStatus::Done),
+                ..Default::default()
+            },
+            vec![
+                transition_fixture("done"),
+                FixtureResponse::new(StatusCode::NOT_FOUND, "stale transition body"),
+            ],
+        )
+        .await;
+
+        match &result {
+            Err(error) => assert_jira_api_status(error, StatusCode::NOT_FOUND),
+            Ok(issue) => panic!("expected stale transition failure, got {issue:?}"),
+        }
+        assert_eq!(
+            calls,
+            vec![
+                "GET /rest/api/3/issue/PROJ-1/transitions",
+                "POST /rest/api/3/issue/PROJ-1/transitions",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_transition_response_is_followed_by_verified_fetch() {
+        let (result, calls) = run_update(
+            IssuePatch {
+                status: Some(IssueStatus::Backlog),
+                ..Default::default()
+            },
+            vec![
+                transition_fixture("new"),
+                FixtureResponse::new(StatusCode::NO_CONTENT, ""),
+                issue_fixture("existing title", "new"),
+            ],
+        )
+        .await;
+
+        let issue = result.expect("verified transition should succeed");
+        assert_eq!(issue.status, IssueStatus::Todo);
+        assert_eq!(
+            calls,
+            vec![
+                "GET /rest/api/3/issue/PROJ-1/transitions",
+                "POST /rest/api/3/issue/PROJ-1/transitions",
+                "GET /rest/api/3/issue/PROJ-1",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_status_failure_can_retry_only_the_unapplied_field() {
+        let (first, _) = run_update(
+            IssuePatch {
+                title: Some("new title".into()),
+                status: Some(IssueStatus::Done),
+                ..Default::default()
+            },
+            vec![
+                FixtureResponse::new(StatusCode::NO_CONTENT, ""),
+                transition_fixture("done"),
+                FixtureResponse::new(StatusCode::BAD_REQUEST, ""),
+            ],
+        )
+        .await;
+        match &first {
+            Err(IssueError::PartialUpdate {
+                applied,
+                unapplied,
+                unverified,
+                ..
+            }) => {
+                assert_eq!(applied, &vec!["title"]);
+                assert_eq!(unapplied, &vec!["status"]);
+                assert!(unverified.is_empty());
+            }
+            other => panic!("expected retryable partial update, got {other:?}"),
+        }
+
+        let (retry, calls) = run_update(
+            IssuePatch {
+                status: Some(IssueStatus::Done),
+                ..Default::default()
+            },
+            vec![
+                transition_fixture("done"),
+                FixtureResponse::new(StatusCode::NO_CONTENT, ""),
+                issue_fixture("new title", "done"),
+            ],
+        )
+        .await;
+        assert!(
+            retry.is_ok(),
+            "the caller can retry only the unapplied field"
+        );
+        assert_eq!(
+            calls,
+            vec![
+                "GET /rest/api/3/issue/PROJ-1/transitions",
+                "POST /rest/api/3/issue/PROJ-1/transitions",
+                "GET /rest/api/3/issue/PROJ-1",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn mismatched_final_category_is_not_reported_as_success() {
+        let (result, calls) = run_update(
+            IssuePatch {
+                status: Some(IssueStatus::InProgress),
+                ..Default::default()
+            },
+            vec![
+                transition_fixture("indeterminate"),
+                FixtureResponse::new(StatusCode::NO_CONTENT, ""),
+                issue_fixture("existing title", "done"),
+            ],
+        )
+        .await;
+
+        match result {
+            Err(IssueError::PartialUpdate {
+                applied,
+                unapplied,
+                unverified,
+                source,
+            }) => {
+                assert_eq!(applied, vec!["status"]);
+                assert!(unapplied.is_empty());
+                assert!(unverified.is_empty());
+                assert!(
+                    matches!(source.as_ref(), IssueError::Api(message) if message.contains("expected category indeterminate"))
+                );
+            }
+            other => panic!("expected verification error, got {other:?}"),
+        }
+        assert_eq!(calls.len(), 3, "verification must fetch the issue");
+    }
+
+    #[tokio::test]
+    async fn title_then_status_success_returns_verified_issue() {
+        let (result, calls) = run_update(
+            IssuePatch {
+                title: Some("new title".into()),
+                status: Some(IssueStatus::Done),
+                ..Default::default()
+            },
+            vec![
+                FixtureResponse::new(StatusCode::NO_CONTENT, ""),
+                transition_fixture("done"),
+                FixtureResponse::new(StatusCode::NO_CONTENT, ""),
+                issue_fixture("new title", "done"),
+            ],
+        )
+        .await;
+
+        let issue = result.expect("title and verified status should succeed");
+        assert_eq!(issue.title, "new title");
+        assert_eq!(issue.status, IssueStatus::Done);
+        assert_eq!(
+            calls,
+            vec![
+                "PUT /rest/api/3/issue/PROJ-1",
+                "GET /rest/api/3/issue/PROJ-1/transitions",
+                "POST /rest/api/3/issue/PROJ-1/transitions",
+                "GET /rest/api/3/issue/PROJ-1",
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn create_issue_returns_budget_error_before_jira_followup() {
         use std::sync::atomic::{AtomicUsize, Ordering};
