@@ -253,12 +253,22 @@ fn partial_update(
 fn is_definitive_transition_rejection(error: &IssueError) -> bool {
     match error {
         IssueError::Auth(_) => true,
-        IssueError::Api(message) => message
-            .strip_prefix("jira HTTP ")
-            .and_then(|status| status.parse::<u16>().ok())
-            .is_some_and(|status| matches!(status, 400 | 404 | 409 | 422)),
+        IssueError::Api(message) => {
+            jira_http_status(message).is_some_and(|status| matches!(status, 400 | 404 | 409 | 422))
+        }
         _ => false,
     }
+}
+
+/// Extract the status code from the bounded HTTP diagnostic emitted by the
+/// shared tracker client. `StatusCode`'s display includes a reason phrase on
+/// current http versions, so parsing the entire suffix would misclassify a
+/// definitive rejection such as `jira HTTP 400 Bad Request` as ambiguous.
+fn jira_http_status(message: &str) -> Option<u16> {
+    message
+        .strip_prefix("jira HTTP ")
+        .and_then(|status| status.split_ascii_whitespace().next())
+        .and_then(|status| status.parse::<u16>().ok())
 }
 
 fn map_jira_priority(p: &Option<JiraPriority>) -> IssuePriority {
@@ -1187,6 +1197,15 @@ mod tests {
         assert_eq!(target_status_category(IssueStatus::Cancelled), "done");
     }
 
+    fn assert_jira_api_status(error: &IssueError, status: StatusCode) {
+        match error {
+            IssueError::Api(message) => {
+                assert_eq!(message, &format!("jira HTTP {status}"));
+            }
+            other => panic!("expected Jira API error, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn title_failure_does_not_attempt_status_transition() {
         let (result, calls) = run_update(
@@ -1199,10 +1218,10 @@ mod tests {
         )
         .await;
 
-        assert!(matches!(
-            result,
-            Err(IssueError::Api(message)) if message == "jira HTTP 502"
-        ));
+        match &result {
+            Err(error) => assert_jira_api_status(error, StatusCode::BAD_GATEWAY),
+            Ok(issue) => panic!("expected title failure, got {issue:?}"),
+        }
         assert_eq!(calls, vec!["PUT /rest/api/3/issue/PROJ-1"]);
     }
 
@@ -1233,9 +1252,7 @@ mod tests {
                 assert_eq!(unapplied, vec!["status"]);
                 assert!(unverified.is_empty());
                 let source_debug = format!("{source:?}");
-                assert!(
-                    matches!(source.as_ref(), IssueError::Api(message) if message == "jira HTTP 400")
-                );
+                assert_jira_api_status(source.as_ref(), StatusCode::BAD_REQUEST);
                 assert!(!source_debug.contains("secret-body"));
             }
             other => panic!("expected typed partial update, got {other:?}"),
@@ -1285,9 +1302,7 @@ mod tests {
                 assert_eq!(applied, vec!["title"]);
                 assert!(unapplied.is_empty(), "unknown status must not be retryable");
                 assert_eq!(unverified, vec!["status"]);
-                assert!(
-                    matches!(source.as_ref(), IssueError::Api(message) if message == "jira HTTP 503")
-                );
+                assert_jira_api_status(source.as_ref(), StatusCode::SERVICE_UNAVAILABLE);
                 let source_debug = format!("{source:?}");
                 assert!(!source_debug.contains("secret-body"));
                 assert!(!source_debug.contains("verification-secret"));
@@ -1368,9 +1383,7 @@ mod tests {
                     "an HTTP timeout/intermediary response is ambiguous"
                 );
                 assert_eq!(unverified, vec!["status"]);
-                assert!(
-                    matches!(source.as_ref(), IssueError::Api(message) if message == "jira HTTP 408")
-                );
+                assert_jira_api_status(source.as_ref(), StatusCode::REQUEST_TIMEOUT);
             }
             other => panic!("expected unknown transition outcome, got {other:?}"),
         }
@@ -1415,9 +1428,7 @@ mod tests {
                     "an unrecognized 4xx response is ambiguous"
                 );
                 assert_eq!(unverified, vec!["status"]);
-                assert!(
-                    matches!(source.as_ref(), IssueError::Api(message) if message == "jira HTTP 418")
-                );
+                assert_jira_api_status(source.as_ref(), StatusCode::IM_A_TEAPOT);
                 assert!(!format!("{source:?}").contains("unrecognized-4xx-body"));
             }
             other => panic!("expected unknown transition outcome, got {other:?}"),
@@ -1486,10 +1497,16 @@ mod tests {
             assert!(is_definitive_transition_rejection(&IssueError::Api(
                 format!("jira HTTP {status}"),
             )));
+            assert!(is_definitive_transition_rejection(&IssueError::Api(
+                format!("jira HTTP {status} reason phrase"),
+            )));
         }
         for status in [408, 418, 425, 429, 500] {
             assert!(!is_definitive_transition_rejection(&IssueError::Api(
                 format!("jira HTTP {status}"),
+            )));
+            assert!(!is_definitive_transition_rejection(&IssueError::Api(
+                format!("jira HTTP {status} reason phrase"),
             )));
         }
         assert!(is_definitive_transition_rejection(&IssueError::Auth(
@@ -1508,10 +1525,10 @@ mod tests {
         )
         .await;
 
-        assert!(matches!(
-            result,
-            Err(IssueError::Api(message)) if message == "jira HTTP 502"
-        ));
+        match &result {
+            Err(error) => assert_jira_api_status(error, StatusCode::BAD_GATEWAY),
+            Ok(issue) => panic!("expected transition lookup failure, got {issue:?}"),
+        }
         assert_eq!(calls, vec!["GET /rest/api/3/issue/PROJ-1/transitions"]);
     }
 
@@ -1551,10 +1568,10 @@ mod tests {
         )
         .await;
 
-        assert!(matches!(
-            result,
-            Err(IssueError::Api(message)) if message == "jira HTTP 404"
-        ));
+        match &result {
+            Err(error) => assert_jira_api_status(error, StatusCode::NOT_FOUND),
+            Ok(issue) => panic!("expected stale transition failure, got {issue:?}"),
+        }
         assert_eq!(
             calls,
             vec![
@@ -1606,14 +1623,19 @@ mod tests {
             ],
         )
         .await;
-        assert!(matches!(
-            first,
+        match &first {
             Err(IssueError::PartialUpdate {
                 applied,
                 unapplied,
+                unverified,
                 ..
-            }) if applied == vec!["title"] && unapplied == vec!["status"]
-        ));
+            }) => {
+                assert_eq!(applied, &vec!["title"]);
+                assert_eq!(unapplied, &vec!["status"]);
+                assert!(unverified.is_empty());
+            }
+            other => panic!("expected retryable partial update, got {other:?}"),
+        }
 
         let (retry, calls) = run_update(
             IssuePatch {
