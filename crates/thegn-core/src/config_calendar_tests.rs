@@ -15,7 +15,7 @@ fn defaults_are_inert_but_useful() {
     // nothing for the feature existing.
     assert!(c.poll_secs().is_none());
     assert!(c.active_accounts().is_empty());
-    assert!(c.active_clocks().is_empty());
+    assert!(c.active_clocks(false).is_empty());
     assert!(c.home_zone().is_none(), "empty means the system zone");
     // The grid and clocks need no provider, so the display side is on.
     assert!(c.enabled);
@@ -199,7 +199,7 @@ fn an_unknown_clock_zone_is_dropped_not_fatal() {
         ],
         ..CalendarConfig::default()
     };
-    let active = cfg.active_clocks();
+    let active = cfg.active_clocks(false);
     assert_eq!(
         active.len(),
         2,
@@ -223,7 +223,81 @@ fn a_disabled_clock_is_skipped() {
         }],
         ..CalendarConfig::default()
     };
-    assert!(cfg.active_clocks().is_empty());
+    assert!(cfg.active_clocks(false).is_empty());
+}
+
+#[test]
+fn active_clocks_resolve_mixed_formats_and_show_date() {
+    let cfg = CalendarConfig {
+        clocks: vec![
+            WorldClock {
+                zone: "UTC".into(),
+                format: String::new(),
+                show_date: true,
+                ..Default::default()
+            },
+            WorldClock {
+                zone: "Asia/Kathmandu".into(),
+                format: "%I:%M %p".into(),
+                show_date: false,
+                ..Default::default()
+            },
+        ],
+        ..CalendarConfig::default()
+    };
+    let clocks = cfg.active_clocks(true);
+    assert_eq!(clocks[0].format, ClockFormat::H12);
+    assert!(clocks[0].show_date);
+    assert_eq!(clocks[1].format, ClockFormat::Custom("%I:%M %p".into()));
+    assert!(!clocks[1].show_date);
+}
+
+#[test]
+fn seconds_and_invalid_row_formats_are_rejected_or_normalized() {
+    for format in [
+        "%S", "%T", "%r", "%X", "%s", "%f", "%.3f", "%.6f", "%.9f", "%3f", "%6f", "%9f",
+    ] {
+        let cfg = CalendarConfig {
+            clocks: vec![WorldClock {
+                zone: "UTC".into(),
+                format: format.into(),
+                ..Default::default()
+            }],
+            ..CalendarConfig::default()
+        };
+        let errors = validate_calendar(&cfg);
+        assert_eq!(errors.len(), 1, "{format}: {errors:?}");
+        assert!(errors[0].contains("configured cadence"), "{errors:?}");
+    }
+
+    let cfg = CalendarConfig {
+        clocks: vec![
+            WorldClock {
+                zone: "UTC".into(),
+                format: "%T".into(),
+                ..Default::default()
+            },
+            WorldClock {
+                zone: "UTC".into(),
+                format: "%Q".into(),
+                ..Default::default()
+            },
+            WorldClock {
+                zone: "UTC".into(),
+                format: "%%S".into(),
+                ..Default::default()
+            },
+        ],
+        ..CalendarConfig::default()
+    };
+    let errors = validate_calendar(&cfg);
+    assert_eq!(errors.len(), 2);
+    assert!(errors[0].contains("%S") && errors[0].contains("configured cadence"));
+    assert!(errors[1].contains("invalid strftime"));
+    assert_eq!(
+        cfg.active_clocks(false)[2].format,
+        ClockFormat::Custom("%%S".into())
+    );
 }
 
 #[test]

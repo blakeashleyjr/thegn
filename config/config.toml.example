@@ -342,7 +342,7 @@ clock_format = "%H:%M"
 [calendar]
 enabled = true              # false stops event fetching; grid + clocks remain
 week_start = "auto"         # "auto" (from $LC_TIME) | "monday" | "sunday" | "saturday"
-time_format = "auto"        # "auto" | "12" | "24" — agenda times and world clocks
+time_format = "auto"        # "auto" | "12" | "24" — agenda times and inherited world clocks
 home_zone = ""              # IANA zone treated as "home"; "" = the system zone
 show_week_numbers = false   # configured-start week-number gutter; week 1 contains Jan 4
 # Monday-first is ISO-8601; Sunday/Saturday (including auto-resolved starts)
@@ -376,9 +376,10 @@ reminder_default_mins = [10]
 # [[calendar.clocks]]
 # zone = "Asia/Tokyo"       # IANA name — required
 # label = "tokyo"           # "" derives one from the zone ("New_York" → "New York")
-# format = ""               # per-row strftime override; "" inherits time_format
+# format = ""               # per-row minute-safe strftime; "" inherits time_format
 # enabled = true
-# show_date = false         # always show the date, not just the ±1d marker
+# show_date = false         # YYYY-MM-DD instead of weekday/±1d for this row
+#                            # seconds-bearing formats are rejected/normalized
 
 # Where events come from. `name` is the cache key, so it must be unique and
 # renaming an account orphans its rows until the next sync.

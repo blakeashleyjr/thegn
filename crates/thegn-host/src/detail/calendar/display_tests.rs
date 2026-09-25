@@ -46,7 +46,8 @@ fn hostile_calendar_provider_values_stay_inside_popup_and_raw_values_survive() {
             clocks: vec![ResolvedClock {
                 label: raw.clone(),
                 zone: Tz::UTC,
-                format: String::new(),
+                format: ClockFormat::H24,
+                show_date: false,
                 is_home: true,
             }],
             now: date.and_hms_opt(12, 0, 0).unwrap().and_utc(),
@@ -103,7 +104,8 @@ fn calendar_width_uses_the_same_sanitized_clock_label_as_drawing() {
     docs.clocks.push(ResolvedClock {
         label: format!("\r\n{}", "界".repeat(10000)),
         zone: Tz::UTC,
-        format: String::new(),
+        format: ClockFormat::H24,
+        show_date: false,
         is_home: false,
     });
     assert_eq!(preferred_cols(&docs, 0), 94);
@@ -115,7 +117,8 @@ fn calendar_width_and_clock_readings_share_whitespace_fallback() {
     docs.clocks.push(ResolvedClock {
         label: "\n\r ".into(),
         zone: "America/Argentina/ComodRivadavia".parse().unwrap(),
-        format: String::new(),
+        format: ClockFormat::H24,
+        show_date: false,
         is_home: false,
     });
     let readings = thegn_core::calendar::read_clocks(&docs.clocks, chrono::Utc::now(), Tz::UTC);
@@ -156,6 +159,107 @@ fn calendar_display_sites_keep_the_safe_projection() {
     }
     let layout = include_str!("mod.rs");
     assert!(layout.contains("Field::ClockLabel"));
+}
+
+#[test]
+fn world_clock_rows_honor_mixed_formats_dates_and_safe_narrow_output() {
+    let date = NaiveDate::from_ymd_opt(2026, 8, 21).unwrap();
+    let mut st = status_state(BTreeMap::new(), true, None);
+    st.ui.show_agenda = false;
+    st.ui.has_sources = false;
+    st.now = date.and_hms_opt(22, 0, 0).unwrap().and_utc();
+    st.home = Tz::UTC;
+    st.clocks = vec![
+        ResolvedClock {
+            label: "home".into(),
+            zone: Tz::UTC,
+            format: ClockFormat::H24,
+            show_date: false,
+            is_home: true,
+        },
+        ResolvedClock {
+            label: "tokyo".into(),
+            zone: Tz::Asia__Tokyo,
+            format: ClockFormat::Custom("%I:%M %p".into()),
+            show_date: true,
+            is_home: false,
+        },
+        ResolvedClock {
+            label: "new york".into(),
+            zone: Tz::America__New_York,
+            format: ClockFormat::H24,
+            show_date: true,
+            is_home: false,
+        },
+        ResolvedClock {
+            label: "kathmandu".into(),
+            zone: Tz::Asia__Kathmandu,
+            format: ClockFormat::Custom("%H:%M%n%t".into()),
+            show_date: false,
+            is_home: false,
+        },
+    ];
+    let detail = CalendarDetail { st };
+    let inner = Rect {
+        x: 2,
+        y: 1,
+        cols: 52,
+        rows: 20,
+    };
+    let mut surface = Surface::new(80, 30);
+    render::render_calendar(&mut surface, inner, 0, &detail);
+    let painted: String = surface
+        .screen_cells()
+        .iter()
+        .map(|row| row.iter().map(|c| c.str().to_string()).collect::<String>())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(painted.contains("22:00"), "{painted}");
+    assert!(painted.contains("07:00 PM"), "{painted}");
+    assert!(painted.contains("2026-08-22"), "{painted}");
+    assert!(
+        painted.contains("2026-08-21"),
+        "same-day show_date: {painted}"
+    );
+    assert!(
+        painted.contains("+1d"),
+        "hidden dates retain the delta: {painted}"
+    );
+    assert!(!painted.chars().any(char::is_control), "{painted}");
+    for row in surface.screen_cells() {
+        for (x, cell) in row.iter().enumerate() {
+            if x < inner.x || x >= inner.x + inner.cols {
+                assert!(
+                    cell.str().trim().is_empty(),
+                    "outside x={x}: {:?}",
+                    cell.str()
+                );
+            }
+        }
+    }
+
+    // A genuinely narrow popup may clip columns, but it must still keep all
+    // painted cells inside the requested rectangle and free of controls.
+    let narrow = Rect {
+        x: 3,
+        y: 2,
+        cols: 20,
+        rows: 10,
+    };
+    let mut narrow_surface = Surface::new(40, 20);
+    render::render_calendar(&mut narrow_surface, narrow, 0, &detail);
+    for row in narrow_surface.screen_cells() {
+        for (x, cell) in row.iter().enumerate() {
+            assert!(!cell.str().chars().any(char::is_control));
+            if x < narrow.x || x >= narrow.x + narrow.cols {
+                assert!(
+                    cell.str().trim().is_empty(),
+                    "outside x={x}: {:?}",
+                    cell.str()
+                );
+            }
+        }
+    }
 }
 
 fn status_state(

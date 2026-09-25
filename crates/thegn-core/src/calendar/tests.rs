@@ -401,13 +401,15 @@ fn world_clock_deltas_are_computed_at_the_instant_not_stored() {
         ResolvedClock {
             label: "nyc".into(),
             zone: Tz::America__New_York,
-            format: String::new(),
+            format: ClockFormat::H24,
+            show_date: false,
             is_home: false,
         },
         ResolvedClock {
             label: "kathmandu".into(),
             zone: Tz::Asia__Kathmandu,
-            format: String::new(),
+            format: ClockFormat::H24,
+            show_date: false,
             is_home: false,
         },
     ];
@@ -433,13 +435,15 @@ fn day_delta_marks_a_clock_on_a_different_calendar_date() {
         ResolvedClock {
             label: "tokyo".into(),
             zone: Tz::Asia__Tokyo,
-            format: String::new(),
+            format: ClockFormat::H24,
+            show_date: false,
             is_home: false,
         },
         ResolvedClock {
             label: "la".into(),
             zone: Tz::America__Los_Angeles,
-            format: String::new(),
+            format: ClockFormat::H24,
+            show_date: false,
             is_home: false,
         },
     ];
@@ -453,11 +457,39 @@ fn day_delta_marks_a_clock_on_a_different_calendar_date() {
 }
 
 #[test]
+fn readings_carry_row_format_and_date_policy_without_changing_deltas() {
+    let clocks = vec![
+        ResolvedClock {
+            label: "tokyo".into(),
+            zone: Tz::Asia__Tokyo,
+            format: ClockFormat::Custom("%I:%M %p".into()),
+            show_date: true,
+            is_home: false,
+        },
+        ResolvedClock {
+            label: "kathmandu".into(),
+            zone: Tz::Asia__Kathmandu,
+            format: ClockFormat::H24,
+            show_date: false,
+            is_home: false,
+        },
+    ];
+    let readings = read_clocks(&clocks, utc(2026, 8, 21, 22, 0), Tz::UTC);
+    assert_eq!(readings[0].format, ClockFormat::Custom("%I:%M %p".into()));
+    assert!(readings[0].show_date);
+    assert_eq!(readings[0].day_delta, 1);
+    assert_eq!(readings[1].format, ClockFormat::H24);
+    assert!(!readings[1].show_date);
+    assert_eq!(readings[1].day_delta, 1);
+}
+
+#[test]
 fn an_empty_label_falls_back_to_the_zone_city() {
     let clocks = vec![ResolvedClock {
         label: String::new(),
         zone: Tz::America__New_York,
-        format: String::new(),
+        format: ClockFormat::H24,
+        show_date: false,
         is_home: false,
     }];
     let r = read_clocks(&clocks, utc(2026, 1, 15, 12, 0), Tz::UTC);
@@ -471,7 +503,8 @@ fn a_zone_without_an_abbreviation_renders_a_numeric_offset() {
     let clocks = vec![ResolvedClock {
         label: "ktm".into(),
         zone: Tz::Asia__Kathmandu,
-        format: String::new(),
+        format: ClockFormat::H24,
+        show_date: false,
         is_home: false,
     }];
     let r = read_clocks(&clocks, utc(2026, 1, 15, 12, 0), Tz::UTC);
