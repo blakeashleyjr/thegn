@@ -86,3 +86,35 @@ needs coverage. Add one test pinning the absolute-path probe from Amendment 1.
 Do not run cargo/nextest/clippy/lint/smoke. The primary runs the batch gate.
 Record the exact commands needed; the order proposed in the investigation is
 accepted.
+
+---
+
+## Amendment 2 — CLARIFIED by the primary after adversarial review (row 524)
+
+Row 524 read Amendment 2 literally and filed a blocking finding: the cache
+recovers a poisoned lock with `into_inner` but still trusts a cached positive
+entry, rather than "falling through to an uncached probe".
+
+**The primary overrules that finding. The implementation is correct; Amendment 2
+was imprecisely worded.**
+
+Reason: a poison flag is **sticky**. `PoisonError::into_inner()` returns the
+data but does not clear the flag, so every subsequent `lock()` also returns
+`Err`. Under the literal reading, a single unrelated panic anywhere that touched
+this mutex would permanently revert `have()` to walking `PATH` on every call —
+destroying the optimization this issue exists to add, and doing so invisibly.
+The only work performed under the lock is `get`/`insert` on a
+`HashMap<String, Option<String>>`; neither can leave a logically wrong value
+behind, so the cached entries remain trustworthy after a panic elsewhere.
+
+**The contract is therefore:** a poisoned lock must never propagate a panic and
+must never disable the cache. Recover with `into_inner`, keep serving positive
+entries, and keep re-probing misses.
+
+The primary replaced row 524's failing test with
+`a_poisoned_cache_keeps_serving_its_positive_entries`, which pins this contract
+(including that the lock is genuinely poisoned, that a hit does not probe, and
+that a miss still re-probes and fills).
+
+Row 524's **second** finding is accepted and fixed: the concurrency test now
+asserts a settled entry serves without probing.
