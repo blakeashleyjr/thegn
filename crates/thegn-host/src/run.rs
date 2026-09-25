@@ -12202,6 +12202,9 @@ async fn event_loop<T: Terminal>(
                 &pr_view_tx,
                 &waker,
                 &refresh_tx,
+                scheduled_pr_generation
+                    .generation()
+                    .map(|generation| (schedule.fence(), generation)),
             );
         }
         if want_calendar_sync {

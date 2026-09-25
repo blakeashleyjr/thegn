@@ -2,9 +2,8 @@
 //! for the live host and the channel-clock integration fixture.
 use super::{
     CONTAINER_DF_EVERY_TICKS, CONTAINER_REFRESH_INTERVAL, ContainerRefresh,
-    DAEMON_REFRESH_INTERVAL, DISK_PUMP_FLOOR_SECS, ISSUE_REFRESH_INTERVAL, LOC_PUMP_FLOOR_SECS,
-    PR_REFRESH_INTERVAL, RefreshKind, STARTUP_FETCH_SLOT, STARTUP_MEASURE_SLOT, StatsTick,
-    USAGE_FIRST_SLOT, WEATHER_FIRST_SLOT, weather_every_slots,
+    DAEMON_REFRESH_INTERVAL, ISSUE_REFRESH_INTERVAL, PR_REFRESH_INTERVAL, RefreshKind,
+    STARTUP_FETCH_SLOT, STARTUP_MEASURE_SLOT, StatsTick, USAGE_FIRST_SLOT, WEATHER_FIRST_SLOT,
 };
 use crate::hydrate_schedule::ScheduleConfig;
 use std::sync::{
@@ -130,31 +129,31 @@ trait TickerIo: Send + 'static {
 }
 
 struct Cadences {
-    ci_poll_secs: u64,
-    prq_poll_secs: Option<u64>,
-    auto_fetch_secs: Option<u64>,
+    ci_every_slots: u64,
+    prq_every_slots: Option<u64>,
+    auto_fetch_every_slots: Option<u64>,
     clock_period_secs: Arc<AtomicU64>,
-    calendar_poll_secs: Option<u64>,
+    calendar_every_slots: Option<u64>,
     calendar_reminders: bool,
-    disk_ttl_secs: u64,
-    loc_ttl_secs: Option<u64>,
-    usage_poll_secs: Option<u64>,
-    weather_poll_secs: Option<u64>,
+    disk_every_slots: u64,
+    loc_every_slots: Option<u64>,
+    usage_every_slots: Option<u64>,
+    weather_every_slots: Option<u64>,
 }
 
 impl Cadences {
     fn from_schedule(schedule: &ScheduleConfig) -> Self {
         Self {
-            ci_poll_secs: schedule.ci_poll_secs,
-            prq_poll_secs: schedule.prq_poll_secs,
-            auto_fetch_secs: schedule.auto_fetch_secs,
+            ci_every_slots: schedule.ci_every_slots,
+            prq_every_slots: schedule.prq_every_slots,
+            auto_fetch_every_slots: schedule.auto_fetch_every_slots,
             clock_period_secs: Arc::new(AtomicU64::new(schedule.clock_period_secs)),
-            calendar_poll_secs: schedule.calendar_poll_secs,
+            calendar_every_slots: schedule.calendar_every_slots,
             calendar_reminders: schedule.calendar_reminders,
-            disk_ttl_secs: schedule.disk_ttl_secs,
-            loc_ttl_secs: schedule.loc_ttl_secs,
-            usage_poll_secs: schedule.usage_poll_secs,
-            weather_poll_secs: schedule.weather_poll_secs,
+            disk_every_slots: schedule.disk_every_slots,
+            loc_every_slots: schedule.loc_every_slots,
+            usage_every_slots: schedule.usage_every_slots,
+            weather_every_slots: schedule.weather_every_slots,
         }
     }
 }
@@ -226,27 +225,27 @@ fn spawn_worker_inner(
             notify();
         });
         let Cadences {
-            ci_poll_secs,
-            prq_poll_secs,
-            auto_fetch_secs,
+            ci_every_slots,
+            prq_every_slots,
+            auto_fetch_every_slots,
             clock_period_secs,
-            calendar_poll_secs,
+            calendar_every_slots,
             calendar_reminders,
-            disk_ttl_secs,
-            loc_ttl_secs,
-            usage_poll_secs,
-            weather_poll_secs,
+            disk_every_slots,
+            loc_every_slots,
+            usage_every_slots,
+            weather_every_slots,
         } = cadences;
-        let mut ci_poll_secs = ci_poll_secs;
-        let mut prq_poll_secs = prq_poll_secs;
-        let mut auto_fetch_secs = auto_fetch_secs;
+        let mut ci_every_slots = ci_every_slots;
+        let mut prq_every_slots = prq_every_slots;
+        let mut auto_fetch_every_slots = auto_fetch_every_slots;
         let mut clock_period_secs = clock_period_secs;
-        let mut calendar_poll_secs = calendar_poll_secs;
+        let mut calendar_every_slots = calendar_every_slots;
         let mut calendar_reminders = calendar_reminders;
-        let mut disk_ttl_secs = disk_ttl_secs;
-        let mut loc_ttl_secs = loc_ttl_secs;
-        let mut usage_poll_secs = usage_poll_secs;
-        let mut weather_poll_secs = weather_poll_secs;
+        let mut disk_every_slots = disk_every_slots;
+        let mut loc_every_slots = loc_every_slots;
+        let mut usage_every_slots = usage_every_slots;
+        let mut weather_every_slots = weather_every_slots;
         // The 500ms refresh ticker: it only decides when to *ask* for work, and
         // every consumer is off the render path.
         io.background_qos();
@@ -257,26 +256,18 @@ fn spawn_worker_inner(
         );
         let pr_every =
             thegn_core::time_policy::cadence_millis_slots(PR_REFRESH_INTERVAL.as_millis(), 500);
-        let mut ci_every = crate::ci_refresh::ci_every_slots(ci_poll_secs);
-        let mut fetch_every = auto_fetch_secs.and_then(crate::remote_poll::fetch_every_slots);
+        let mut ci_every = ci_every_slots;
+        let mut fetch_every = auto_fetch_every_slots;
         let issue_every =
             thegn_core::time_policy::cadence_millis_slots(ISSUE_REFRESH_INTERVAL.as_millis(), 500)
                 .get();
         // Floored the same way `[pr_queue] poll_secs` is, so a misconfigured 0
         // can't spin the ticker against the forge's rate limit.
-        let mut prq_every =
-            prq_poll_secs.map(|s| thegn_core::time_policy::cadence_slots(s, 15, 500).get());
+        let mut prq_every = prq_every_slots;
         // Floored the same way, so a misconfigured 0 can't spin against a
         // provider's rate limit. (`CalendarAccount::refresh_secs` already
         // clamps; this is belt-and-braces at the one place that loops.)
-        let mut calendar_every = calendar_poll_secs.map(|s| {
-            thegn_core::time_policy::cadence_slots(
-                s,
-                thegn_core::config_calendar::MIN_REFRESH_SECS,
-                500,
-            )
-            .get()
-        });
+        let mut calendar_every = calendar_every_slots;
         // Reminders are checked on a coarse fixed cadence: worst-case 30s
         // lateness is irrelevant for a "10 minutes before" alert, and the check
         // is pure, so this is far cheaper than a per-reminder timer.
@@ -284,18 +275,15 @@ fn spawn_worker_inner(
         // `UsageConfig::effective_poll_secs` already floors this at 60; the
         // `.max(60)` here is the same belt-and-braces as the calendar slot, so
         // the one place that loops can't be made to spin from config.
-        let mut usage_every =
-            usage_poll_secs.map(|s| thegn_core::time_policy::cadence_slots(s, 60, 500).get());
-        let mut weather_every = weather_every_slots(weather_poll_secs);
+        let mut usage_every = usage_every_slots;
+        let mut weather_every = weather_every_slots;
         let container_every = thegn_core::time_policy::cadence_millis_slots(
             CONTAINER_REFRESH_INTERVAL.as_millis(),
             500,
         )
         .get();
-        let mut disk_every =
-            thegn_core::scan_sched::pump_slots(disk_ttl_secs, DISK_PUMP_FLOOR_SECS, 500);
-        let mut loc_every =
-            loc_ttl_secs.map(|s| thegn_core::scan_sched::pump_slots(s, LOC_PUMP_FLOOR_SECS, 500));
+        let mut disk_every = disk_every_slots;
+        let mut loc_every = loc_every_slots;
         let daemon_every =
             thegn_core::time_policy::cadence_millis_slots(DAEMON_REFRESH_INTERVAL.as_millis(), 500)
                 .get();
@@ -336,14 +324,14 @@ fn spawn_worker_inner(
                 }) = replacement
                 {
                     let next = Cadences::from_schedule(&schedule);
-                    let ci_changed = ci_poll_secs != next.ci_poll_secs;
-                    let prq_changed = prq_poll_secs != next.prq_poll_secs;
-                    let fetch_changed = auto_fetch_secs != next.auto_fetch_secs;
-                    let calendar_changed = calendar_poll_secs != next.calendar_poll_secs;
-                    let disk_changed = disk_ttl_secs != next.disk_ttl_secs;
-                    let loc_changed = loc_ttl_secs != next.loc_ttl_secs;
-                    let usage_changed = usage_poll_secs != next.usage_poll_secs;
-                    let weather_changed = weather_poll_secs != next.weather_poll_secs;
+                    let ci_changed = ci_every_slots != next.ci_every_slots;
+                    let prq_changed = prq_every_slots != next.prq_every_slots;
+                    let fetch_changed = auto_fetch_every_slots != next.auto_fetch_every_slots;
+                    let calendar_changed = calendar_every_slots != next.calendar_every_slots;
+                    let disk_changed = disk_every_slots != next.disk_every_slots;
+                    let loc_changed = loc_every_slots != next.loc_every_slots;
+                    let usage_changed = usage_every_slots != next.usage_every_slots;
+                    let weather_changed = weather_every_slots != next.weather_every_slots;
                     let rearm = |old: u64, new: u64, tick: u64| {
                         (old != new).then_some(tick.saturating_add(new))
                     };
@@ -352,63 +340,52 @@ fn spawn_worker_inner(
                             .then_some(new.map(|n| tick.saturating_add(n)))
                             .flatten()
                     };
-                    ci_after = rearm(ci_poll_secs, next.ci_poll_secs, ticks).unwrap_or(ci_after);
-                    prq_after =
-                        rearm_opt(prq_poll_secs, next.prq_poll_secs, ticks).unwrap_or(prq_after);
-                    fetch_after = rearm_opt(auto_fetch_secs, next.auto_fetch_secs, ticks)
-                        .unwrap_or(fetch_after);
-                    calendar_after = rearm_opt(calendar_poll_secs, next.calendar_poll_secs, ticks)
-                        .unwrap_or(calendar_after);
-                    if calendar_poll_secs != next.calendar_poll_secs
+                    ci_after =
+                        rearm(ci_every_slots, next.ci_every_slots, ticks).unwrap_or(ci_after);
+                    prq_after = rearm_opt(prq_every_slots, next.prq_every_slots, ticks)
+                        .unwrap_or(prq_after);
+                    fetch_after =
+                        rearm_opt(auto_fetch_every_slots, next.auto_fetch_every_slots, ticks)
+                            .unwrap_or(fetch_after);
+                    calendar_after =
+                        rearm_opt(calendar_every_slots, next.calendar_every_slots, ticks)
+                            .unwrap_or(calendar_after);
+                    if calendar_every_slots != next.calendar_every_slots
                         || calendar_reminders != next.calendar_reminders
                     {
                         reminder_after = next
-                            .calendar_poll_secs
+                            .calendar_every_slots
                             .map(|_| ticks.saturating_add(60))
                             .unwrap_or(0);
                     }
                     disk_after =
-                        rearm(disk_ttl_secs, next.disk_ttl_secs, ticks).unwrap_or(disk_after);
-                    loc_after =
-                        rearm_opt(loc_ttl_secs, next.loc_ttl_secs, ticks).unwrap_or(loc_after);
-                    usage_after = rearm_opt(usage_poll_secs, next.usage_poll_secs, ticks)
+                        rearm(disk_every_slots, next.disk_every_slots, ticks).unwrap_or(disk_after);
+                    loc_after = rearm_opt(loc_every_slots, next.loc_every_slots, ticks)
+                        .unwrap_or(loc_after);
+                    usage_after = rearm_opt(usage_every_slots, next.usage_every_slots, ticks)
                         .unwrap_or(usage_after);
-                    weather_after = rearm_opt(weather_poll_secs, next.weather_poll_secs, ticks)
+                    weather_after = rearm_opt(weather_every_slots, next.weather_every_slots, ticks)
                         .unwrap_or(weather_after);
-                    ci_poll_secs = next.ci_poll_secs;
-                    prq_poll_secs = next.prq_poll_secs;
-                    auto_fetch_secs = next.auto_fetch_secs;
+                    ci_every_slots = next.ci_every_slots;
+                    prq_every_slots = next.prq_every_slots;
+                    auto_fetch_every_slots = next.auto_fetch_every_slots;
                     clock_period_secs = Arc::new(AtomicU64::new(
                         next.clock_period_secs.load(Ordering::Relaxed),
                     ));
-                    calendar_poll_secs = next.calendar_poll_secs;
+                    calendar_every_slots = next.calendar_every_slots;
                     calendar_reminders = next.calendar_reminders;
-                    disk_ttl_secs = next.disk_ttl_secs;
-                    loc_ttl_secs = next.loc_ttl_secs;
-                    usage_poll_secs = next.usage_poll_secs;
-                    weather_poll_secs = next.weather_poll_secs;
-                    ci_every = crate::ci_refresh::ci_every_slots(ci_poll_secs);
-                    fetch_every = auto_fetch_secs.and_then(crate::remote_poll::fetch_every_slots);
-                    prq_every = prq_poll_secs
-                        .map(|s| thegn_core::time_policy::cadence_slots(s, 15, 500).get());
-                    calendar_every = calendar_poll_secs.map(|s| {
-                        thegn_core::time_policy::cadence_slots(
-                            s,
-                            thegn_core::config_calendar::MIN_REFRESH_SECS,
-                            500,
-                        )
-                        .get()
-                    });
-                    disk_every = thegn_core::scan_sched::pump_slots(
-                        disk_ttl_secs,
-                        DISK_PUMP_FLOOR_SECS,
-                        500,
-                    );
-                    loc_every = loc_ttl_secs
-                        .map(|s| thegn_core::scan_sched::pump_slots(s, LOC_PUMP_FLOOR_SECS, 500));
-                    usage_every = usage_poll_secs
-                        .map(|s| thegn_core::time_policy::cadence_slots(s, 60, 500).get());
-                    weather_every = weather_every_slots(weather_poll_secs);
+                    disk_every_slots = next.disk_every_slots;
+                    loc_every_slots = next.loc_every_slots;
+                    usage_every_slots = next.usage_every_slots;
+                    weather_every_slots = next.weather_every_slots;
+                    ci_every = ci_every_slots;
+                    fetch_every = auto_fetch_every_slots;
+                    prq_every = prq_every_slots;
+                    calendar_every = calendar_every_slots;
+                    disk_every = disk_every_slots;
+                    loc_every = loc_every_slots;
+                    usage_every = usage_every_slots;
+                    weather_every = weather_every_slots;
                     if ci_changed {
                         ci_after = ticks.saturating_add(ci_every);
                     }
@@ -478,7 +455,7 @@ fn spawn_worker_inner(
             // a network round trip can never sit on the launch path. After that
             // the configured cadence takes over (and sweeps the background
             // worktrees). Both are coalesced per-repo by `remote_poll`.
-            if auto_fetch_secs.is_some()
+            if auto_fetch_every_slots.is_some()
                 && ((fetch_after == 0 && ticks == STARTUP_FETCH_SLOT)
                     || fetch_every.is_some_and(|n| due(ticks, n, fetch_after)))
             {

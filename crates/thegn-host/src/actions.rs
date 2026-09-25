@@ -318,6 +318,7 @@ pub(crate) fn spawn_ci_detail(
     refresh_tx: &UnboundedSender<RefreshKind>,
     waker: &TerminalWaker,
     run: thegn_core::ci::CiRun,
+    generation: Option<crate::hydrate_schedule::ScheduleFence>,
 ) {
     use thegn_core::ci::CiState;
     let wt = active_tab_path(session);
@@ -343,8 +344,13 @@ pub(crate) fn spawn_ci_detail(
                 log_tail: Vec::new(),
                 log_entries: Vec::new(),
             };
-            if tx.send(RefreshKind::CiDetail(Box::new(payload))).is_ok() {
-                let _ = waker.wake();
+            if let Some(result) = crate::hydrate_schedule::scheduled_delivery(
+                generation.as_ref(),
+                RefreshKind::CiDetail(Box::new(payload)),
+            ) {
+                if tx.send(result).is_ok() {
+                    let _ = waker.wake();
+                }
             }
             return;
         }
@@ -394,7 +400,9 @@ pub(crate) fn spawn_ci_detail(
                         && let Some(db) = db.as_ref()
                     {
                         use thegn_core::store::CacheStore;
-                        let _ = db.put_ci_log(&entry);
+                        if crate::hydrate_schedule::generation_is_current(generation.as_ref()) {
+                            let _ = db.put_ci_log(&entry);
+                        }
                     }
                     Some(entry)
                 })
@@ -413,8 +421,13 @@ pub(crate) fn spawn_ci_detail(
             log_tail,
             log_entries,
         };
-        if tx.send(RefreshKind::CiDetail(Box::new(payload))).is_ok() {
-            let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
+        if let Some(result) = crate::hydrate_schedule::scheduled_delivery(
+            generation.as_ref(),
+            RefreshKind::CiDetail(Box::new(payload)),
+        ) {
+            if tx.send(result).is_ok() {
+                let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
+            }
         }
     });
 }
@@ -572,7 +585,10 @@ pub(crate) fn spawn_usage_with_generation(
             return;
         }
         let history = record_usage_history(&cfg, &accounts, generation_for_work.as_ref());
-        if proxy_enabled && proxy_budget.enabled {
+        if proxy_enabled
+            && proxy_budget.enabled
+            && crate::hydrate_schedule::generation_is_current(generation_for_work.as_ref())
+        {
             notify_proxy_budget_breaches(&proxy_budget);
         }
         // Proxy spend rolls up from the audit tables off-loop, on this same
@@ -889,6 +905,7 @@ pub(crate) fn spawn_pr_view_fetch(
     tx: &UnboundedSender<PrViewData>,
     waker: &TerminalWaker,
     refresh_tx: &UnboundedSender<RefreshKind>,
+    schedule_fence: Option<crate::hydrate_schedule::ScheduleFence>,
 ) {
     let tx = tx.clone();
     let waker = waker.clone();
@@ -964,13 +981,24 @@ pub(crate) fn spawn_pr_view_fetch(
                 .filter(|s| !s.branch.is_empty() && !s.head_oid.is_empty())
             && let Ok(db) = thegn_core::db::Db::open()
         {
-            let _ = db.put_pr_review_cache(&snapshot);
-            if refresh_tx.send(RefreshKind::Model).is_ok() {
-                let _ = waker.wake();
+            if crate::hydrate_schedule::generation_is_current(schedule_fence.as_ref()) {
+                let _ = db.put_pr_review_cache(&snapshot);
+                if let Some(result) = crate::hydrate_schedule::scheduled_delivery(
+                    schedule_fence.as_ref(),
+                    RefreshKind::Model,
+                ) {
+                    if refresh_tx.send(result).is_ok() {
+                        let _ = waker.wake();
+                    }
+                }
             }
         }
-        if tx.send(data).is_ok() {
-            let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
+        if let Some(data) =
+            crate::hydrate_schedule::scheduled_delivery(schedule_fence.as_ref(), data)
+        {
+            if tx.send(data).is_ok() {
+                let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
+            }
         }
     });
 }
@@ -1010,6 +1038,7 @@ pub(crate) fn open_pr_view(
             tx,
             waker,
             refresh_tx,
+            None,
         );
     }
     Some(v)
@@ -1023,6 +1052,7 @@ pub(crate) fn refetch_pr_view(
     tx: &UnboundedSender<PrViewData>,
     waker: &TerminalWaker,
     refresh_tx: &UnboundedSender<RefreshKind>,
+    schedule_fence: Option<crate::hydrate_schedule::ScheduleFence>,
 ) {
     if let Some(v) = view
         && !v.owner.is_empty()
@@ -1040,6 +1070,7 @@ pub(crate) fn refetch_pr_view(
             tx,
             waker,
             refresh_tx,
+            schedule_fence,
         );
     }
 }
@@ -1353,7 +1384,14 @@ impl CiActionCtx<'_> {
     /// the "crashed quickly" bug: it printed and exited instantly).
     fn drill_ci_detail(&mut self, run: thegn_core::ci::CiRun) {
         self.model.status = "Fetching CI run detail\u{2026}".into();
-        spawn_ci_detail(self.session, &self.cfg.ci, self.refresh_tx, self.waker, run);
+        spawn_ci_detail(
+            self.session,
+            &self.cfg.ci,
+            self.refresh_tx,
+            self.waker,
+            run,
+            None,
+        );
     }
 
     /// Force a CI run-history refetch (the `g` key): bypasses the `[ci]
