@@ -64,6 +64,133 @@ DTEND;TZID=UTC:20260821T094500
 END:VEVENT
 END:VCALENDAR";
 
+#[derive(Default)]
+struct MutationCalls {
+    list: std::sync::atomic::AtomicUsize,
+    create: std::sync::atomic::AtomicUsize,
+    update: std::sync::atomic::AtomicUsize,
+    delete: std::sync::atomic::AtomicUsize,
+}
+
+struct MutationSpy {
+    caps: CalendarCaps,
+    calls: std::sync::Arc<MutationCalls>,
+    writes_supported: bool,
+    provider: &'static str,
+}
+
+impl MutationSpy {
+    fn new(
+        caps: CalendarCaps,
+        writes_supported: bool,
+        provider: &'static str,
+    ) -> (Self, std::sync::Arc<MutationCalls>) {
+        let calls = std::sync::Arc::new(MutationCalls::default());
+        (
+            MutationSpy {
+                caps,
+                calls: calls.clone(),
+                writes_supported,
+                provider,
+            },
+            calls,
+        )
+    }
+
+    fn unsupported(operation: &'static str) -> CalendarError {
+        CalendarError::Unsupported(operation)
+    }
+}
+
+impl CalendarBackend for MutationSpy {
+    fn provider_id(&self) -> &'static str {
+        self.provider
+    }
+
+    fn caps(&self) -> CalendarCaps {
+        self.caps
+    }
+
+    fn list_events<'a>(
+        &'a self,
+        _from: chrono::NaiveDate,
+        _to: chrono::NaiveDate,
+        _sync_token: &'a str,
+    ) -> futures_util::future::BoxFuture<'a, Result<EventPage, CalendarError>> {
+        self.calls
+            .list
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Box::pin(async { EventPage::try_new(vec![], vec![], "", &adm()) })
+    }
+
+    fn create_event<'a>(
+        &'a self,
+        event: &'a thegn_core::calendar::CalEvent,
+    ) -> futures_util::future::BoxFuture<'a, Result<thegn_core::calendar::CalEvent, CalendarError>>
+    {
+        self.calls
+            .create
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if !self.writes_supported {
+            return Box::pin(async { Err(Self::unsupported("creating events")) });
+        }
+        Box::pin(async move { Ok(event.clone()) })
+    }
+
+    fn update_event<'a>(
+        &'a self,
+        _id: &'a str,
+        event: &'a thegn_core::calendar::CalEvent,
+        _scope: EditScope,
+    ) -> futures_util::future::BoxFuture<'a, Result<thegn_core::calendar::CalEvent, CalendarError>>
+    {
+        self.calls
+            .update
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if !self.writes_supported {
+            return Box::pin(async { Err(Self::unsupported("editing events")) });
+        }
+        Box::pin(async move { Ok(event.clone()) })
+    }
+
+    fn delete_event<'a>(
+        &'a self,
+        _id: &'a str,
+        _scope: EditScope,
+    ) -> futures_util::future::BoxFuture<'a, Result<(), CalendarError>> {
+        self.calls
+            .delete
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if !self.writes_supported {
+            return Box::pin(async { Err(Self::unsupported("deleting events")) });
+        }
+        Box::pin(async { Ok(()) })
+    }
+}
+
+fn mutation_event() -> thegn_core::calendar::CalEvent {
+    thegn_core::calendar::CalEvent::new(
+        "mutation",
+        "Mutation",
+        thegn_core::calendar::EventTime::Date {
+            date: chrono::NaiveDate::from_ymd_opt(2026, 8, 21).unwrap(),
+        },
+        thegn_core::calendar::EventTime::Date {
+            date: chrono::NaiveDate::from_ymd_opt(2026, 8, 22).unwrap(),
+        },
+    )
+}
+
+fn all_write_caps() -> CalendarCaps {
+    CalendarCaps {
+        create: true,
+        update: true,
+        delete: true,
+        server_expand: true,
+        incremental: true,
+    }
+}
+
 /// A temp dir that cleans up after itself.
 struct Tmp(std::path::PathBuf);
 impl Tmp {
@@ -153,6 +280,260 @@ fn errors_render_readably() {
             .to_string()
             .contains("401")
     );
+}
+
+#[test]
+fn read_only_policy_clamps_contradictory_provider_caps_and_denies_all_mutations() {
+    let account = CalendarAccount {
+        name: "private".into(),
+        read_only: true,
+        ..account("private", CalendarProviderKind::Command)
+    };
+    let (provider, calls) = MutationSpy::new(all_write_caps(), true, "plugin-spy");
+    let backend = AccountPolicyBackend::new(&account, Box::new(provider));
+
+    assert_eq!(
+        backend.caps(),
+        CalendarCaps {
+            create: false,
+            update: false,
+            delete: false,
+            server_expand: true,
+            incremental: true,
+        }
+    );
+    let event = mutation_event();
+    assert!(matches!(
+        block_on(backend.create_event(&event)),
+        Err(CalendarError::ReadOnly(CalendarMutation::Create))
+    ));
+    assert!(matches!(
+        block_on(backend.update_event("mutation", &event, EditScope::AllInstances)),
+        Err(CalendarError::ReadOnly(CalendarMutation::Update))
+    ));
+    assert!(matches!(
+        block_on(backend.delete_event("mutation", EditScope::AllInstances)),
+        Err(CalendarError::ReadOnly(CalendarMutation::Delete))
+    ));
+    assert_eq!(calls.create.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(calls.update.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(calls.delete.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[test]
+fn writable_policy_preserves_provider_caps_and_delegates_all_mutations() {
+    let account = CalendarAccount {
+        name: "editable".into(),
+        read_only: false,
+        ..account("editable", CalendarProviderKind::Command)
+    };
+    let (provider, calls) = MutationSpy::new(all_write_caps(), true, "writable-spy");
+    let backend = AccountPolicyBackend::new(&account, Box::new(provider));
+    assert_eq!(backend.caps(), all_write_caps());
+
+    let event = mutation_event();
+    assert!(block_on(backend.create_event(&event)).is_ok());
+    assert!(block_on(backend.update_event("mutation", &event, EditScope::ThisInstance)).is_ok());
+    assert!(block_on(backend.delete_event("mutation", EditScope::ThisInstance)).is_ok());
+    assert_eq!(calls.create.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(calls.update.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(calls.delete.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[test]
+fn writable_policy_keeps_provider_unsupported_distinct_from_read_only() {
+    let account = CalendarAccount {
+        name: "unsupported".into(),
+        read_only: false,
+        ..account("unsupported", CalendarProviderKind::Command)
+    };
+    let (provider, calls) = MutationSpy::new(CalendarCaps::default(), false, "read-spy");
+    let backend = AccountPolicyBackend::new(&account, Box::new(provider));
+    let event = mutation_event();
+
+    assert!(matches!(
+        block_on(backend.create_event(&event)),
+        Err(CalendarError::Unsupported("creating events"))
+    ));
+    assert!(matches!(
+        block_on(backend.update_event("mutation", &event, EditScope::AllInstances)),
+        Err(CalendarError::Unsupported("editing events"))
+    ));
+    assert!(matches!(
+        block_on(backend.delete_event("mutation", EditScope::AllInstances)),
+        Err(CalendarError::Unsupported("deleting events"))
+    ));
+    assert_eq!(calls.create.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(calls.update.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(calls.delete.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[test]
+fn read_only_policy_does_not_block_event_fetches() {
+    let account = CalendarAccount {
+        name: "readable".into(),
+        read_only: true,
+        ..account("readable", CalendarProviderKind::Command)
+    };
+    let (provider, calls) = MutationSpy::new(
+        CalendarCaps {
+            incremental: true,
+            ..CalendarCaps::default()
+        },
+        false,
+        "read-spy",
+    );
+    let backend = AccountPolicyBackend::new(&account, Box::new(provider));
+    let (from, to) = window();
+    assert!(block_on(backend.list_events(from, to, "")).is_ok());
+    assert_eq!(calls.list.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(calls.create.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[test]
+fn router_policy_blocks_command_plugin_before_provider_invocation() {
+    let marker = Tmp::new("policy-plugin").0.join("invoked");
+    let cfg = CalendarConfig {
+        accounts: vec![CalendarAccount {
+            name: "plugin".into(),
+            provider: CalendarProviderKind::Command,
+            read_only: true,
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                format!("touch {}", marker.display()),
+            ],
+            ..Default::default()
+        }],
+        ..CalendarConfig::default()
+    };
+    let router = router(&cfg);
+    assert_eq!(router.caps("plugin").unwrap().create, false);
+    let event = mutation_event();
+    assert!(matches!(
+        block_on(router.create_event("plugin", &event)),
+        Err(CalendarError::ReadOnly(CalendarMutation::Create))
+    ));
+    assert!(matches!(
+        block_on(router.update_event("plugin", "mutation", &event, EditScope::AllInstances)),
+        Err(CalendarError::ReadOnly(CalendarMutation::Update))
+    ));
+    assert!(matches!(
+        block_on(router.delete_event("plugin", "mutation", EditScope::AllInstances)),
+        Err(CalendarError::ReadOnly(CalendarMutation::Delete))
+    ));
+    assert!(
+        !marker.exists(),
+        "the plugin must not run before policy denial"
+    );
+
+    let mut writable_cfg = cfg.clone();
+    writable_cfg.accounts[0].read_only = false;
+    let writable_router = router(&writable_cfg);
+    assert_eq!(writable_router.caps("plugin").unwrap().create, false);
+    assert!(matches!(
+        block_on(writable_router.create_event("plugin", &event)),
+        Err(CalendarError::Unsupported("creating events"))
+    ));
+    assert!(matches!(
+        router.caps("missing"),
+        Err(CalendarError::NotConfigured)
+    ));
+
+    let duplicate = CalendarConfig {
+        accounts: vec![
+            CalendarAccount {
+                name: "plugin".into(),
+                provider: CalendarProviderKind::Command,
+                ..Default::default()
+            },
+            CalendarAccount {
+                name: "plugin".into(),
+                provider: CalendarProviderKind::Command,
+                ..Default::default()
+            },
+        ],
+        ..CalendarConfig::default()
+    };
+    assert!(matches!(
+        router(&duplicate).caps("plugin"),
+        Err(CalendarError::NotConfigured)
+    ));
+}
+
+#[test]
+fn read_only_denials_emit_bounded_calendar_diagnostics() {
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex};
+    use tracing::field::{Field, Visit};
+    use tracing::span;
+    use tracing::{Event, Metadata, Subscriber};
+
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<BTreeMap<String, String>>>>);
+    struct Fields(BTreeMap<String, String>);
+    impl Visit for Fields {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            self.0
+                .insert(field.name().to_string(), format!("{value:?}"));
+        }
+        fn record_str(&mut self, field: &Field, value: &str) {
+            self.0.insert(field.name().to_string(), value.to_string());
+        }
+    }
+    impl Subscriber for Captured {
+        fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+            metadata.target() == "thegn::calendar"
+        }
+        fn new_span(&self, _: &span::Attributes<'_>) -> span::Id {
+            span::Id::from_u64(1)
+        }
+        fn record(&self, _: &span::Id, _: &span::Record<'_>) {}
+        fn record_follows_from(&self, _: &span::Id, _: &span::Id) {}
+        fn event(&self, event: &Event<'_>) {
+            let mut fields = Fields(BTreeMap::new());
+            event.record(&mut fields);
+            self.0.lock().unwrap().push(fields.0);
+        }
+        fn enter(&self, _: &span::Id) {}
+        fn exit(&self, _: &span::Id) {}
+    }
+
+    let captured = Captured::default();
+    let _guard = tracing::subscriber::set_default(captured.clone());
+    let account = CalendarAccount {
+        name: "safe-account".into(),
+        url: "https://secret.example/?token=url-secret".into(),
+        token: "token-secret".into(),
+        command: vec!["secret-command".into()],
+        read_only: true,
+        ..account("safe-account", CalendarProviderKind::Command)
+    };
+    let (provider, _) = MutationSpy::new(all_write_caps(), true, "plugin-spy");
+    let backend = AccountPolicyBackend::new(&account, Box::new(provider));
+    let event = mutation_event();
+    let _ = block_on(backend.create_event(&event));
+    let _ = block_on(backend.update_event("mutation", &event, EditScope::AllInstances));
+    let _ = block_on(backend.delete_event("mutation", EditScope::AllInstances));
+
+    let records = captured.0.lock().unwrap().clone();
+    assert_eq!(records.len(), 3);
+    for record in records {
+        assert_eq!(
+            record.get("account").map(String::as_str),
+            Some("safe-account")
+        );
+        assert_eq!(
+            record.get("provider").map(String::as_str),
+            Some("plugin-spy")
+        );
+        assert!(record.contains_key("operation"));
+        let rendered = format!("{record:?}");
+        assert!(!rendered.contains("url-secret"));
+        assert!(!rendered.contains("token-secret"));
+        assert!(!rendered.contains("secret-command"));
+        assert!(!rendered.contains("Mutation"));
+    }
 }
 
 #[tokio::test]
