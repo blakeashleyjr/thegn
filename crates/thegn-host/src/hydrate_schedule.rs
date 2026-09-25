@@ -200,6 +200,38 @@ mod tests {
     }
 
     #[test]
+    fn projection_diff_covers_every_live_ticker_class() {
+        let base = ScheduleConfig::from_config(&Config::default());
+        let mut next = base.clone();
+        next.clock_period_secs += 1;
+        next.ci_poll_secs += 1;
+        next.prq_poll_secs = Some(1);
+        next.auto_fetch_secs = Some(1);
+        next.calendar_poll_secs = Some(1);
+        next.calendar_reminders = !next.calendar_reminders;
+        next.disk_ttl_secs += 1;
+        next.loc_ttl_secs = Some(1);
+        next.usage_poll_secs = Some(1);
+        next.weather_poll_secs = Some(1);
+
+        assert_eq!(
+            base.changed_slots(&next),
+            [
+                "clock",
+                "ci",
+                "pr_queue",
+                "auto_fetch",
+                "calendar",
+                "calendar_reminders",
+                "disk",
+                "loc",
+                "usage",
+                "weather",
+            ]
+        );
+    }
+
+    #[test]
     fn all_named_classes_are_in_the_effective_projection() {
         let cfg = Config::default();
         let projected = ScheduleConfig::from_config(&cfg);
