@@ -1,0 +1,5 @@
+# Primary approval for native gated merge
+
+Review511 (27136998) verifies prior F01/F03 corrections and identifies only vanished-group reservation cleanup F04. Primary fixes that exact absent-group branch: remove only the completed origin's key when no group of that name exists. Recreated groups still pass stable-leaf matching before any cleanup. The reviewer regression now runs both prewarm/materialize origins and asserts the other origin's key survives. No loading/attach/pool/render effects occur for absent groups. This narrow correction follows the adversarial finding and is source-approved subject to its runtime regression and full candidate gate; no broader lifecycle supervision claim (THE251).
+
+Calendar454 and launch418 will fold together via native queue. Gate requires exact clean candidate, two CPU quota, one Cargo job, workspace tests/contracts, source/Python suites and workspace all-target Clippy. No release build, cross/coverage/docs/smoke result is claimed by this gate. Linear closure only after native landing and worktree retirement after verified clean ancestry/session checks.
