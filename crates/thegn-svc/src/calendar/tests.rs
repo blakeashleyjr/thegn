@@ -436,6 +436,19 @@ fn router_policy_blocks_command_plugin_before_provider_invocation() {
         Err(CalendarError::Unsupported("creating events"))
     ));
     assert!(matches!(
+        block_on(writable_router.update_event(
+            "plugin",
+            "mutation",
+            &event,
+            EditScope::AllInstances
+        )),
+        Err(CalendarError::Unsupported("editing events"))
+    ));
+    assert!(matches!(
+        block_on(writable_router.delete_event("plugin", "mutation", EditScope::AllInstances)),
+        Err(CalendarError::Unsupported("deleting events"))
+    ));
+    assert!(matches!(
         router.caps("missing"),
         Err(CalendarError::NotConfigured)
     ));
