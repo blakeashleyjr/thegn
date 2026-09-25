@@ -265,11 +265,46 @@ fn hidden_index_modifications_and_filters_refuse_without_running_driver() {
     )
     .unwrap();
     std::fs::write(fixture.wt.join("tracked"), "would invoke clean\n").unwrap();
-    assert!(matches!(fixture.probe(), Err(Refusal::Unsafe(reason)) if reason.contains("filters")));
+    assert!(
+        matches!(fixture.probe(), Err(Refusal::Unsafe(reason)) if reason.contains("private")),
+        "a driver a tracked path actually selects must still refuse, and name itself"
+    );
     assert!(
         !canary.exists(),
         "a cleanup cleanliness probe must not execute filter code"
     );
+}
+
+/// THE-685: a filter driver only runs when a `filter=<name>` attribute selects
+/// it. Refusing on configuration alone meant one machine-wide `git lfs install`
+/// — which writes `filter.lfs.clean`/`.process` into `~/.gitconfig` — disabled
+/// merged-worktree cleanup in EVERY repository, including repositories with no
+/// LFS content and no `.gitattributes` at all.
+#[test]
+fn a_configured_but_unused_filter_driver_does_not_block_cleanup() {
+    let _isolation = TestIsolation::new();
+
+    // Configured exactly as `git lfs install` leaves it, but nothing selects it.
+    let fixture = Fixture::new();
+    let canary = fixture._dir.path().join("unused-filter-ran");
+    let command = format!(
+        "printf unsafe > {}; cat",
+        util::sh_quote(canary.to_str().unwrap())
+    );
+    setup_git(&fixture.wt, &["config", "filter.lfs.clean", &command]);
+    setup_git(&fixture.wt, &["config", "filter.lfs.process", &command]);
+    assert!(
+        fixture.probe().is_ok(),
+        "a driver no tracked path selects must not block cleanup"
+    );
+    assert!(!canary.exists(), "the probe must not execute filter code");
+
+    // Not covered here: an attribute that names an UNCONFIGURED driver. Any
+    // `.gitattributes` would have to be committed to avoid tripping the
+    // separate cleanliness refusal, and committing on the feature branch makes
+    // it unmerged, which `Verified::probe` then refuses for an unrelated
+    // reason. The case is safe by construction anyway — the check only ever
+    // looks up drivers that are actually configured.
 }
 
 #[test]

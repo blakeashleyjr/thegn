@@ -1,6 +1,7 @@
 //! Fail-closed identity and no-force removal for automatic merge collection.
 //! A queue row is evidence to investigate, never authority to delete a path.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use thegn_core::util;
 
@@ -269,19 +270,69 @@ fn direct_ref(root: &Path, reference: &str) -> Result<(), Refusal> {
     Ok(())
 }
 
-pub(crate) fn clean(path: &Path) -> Result<(), Refusal> {
-    // status may run clean/process drivers while refreshing index content.
-    // fsmonitor=false alone cannot make this safe. Reject configured drivers
-    // before status; config is data-only and its values are never logged.
+/// Names of filter drivers that could actually execute here, i.e. those with a
+/// `clean` or `process` command configured. `smudge`/`required` cannot run
+/// during the `status` this module performs.
+///
+/// Config is data-only: only the driver NAME (a key fragment) is retained, and
+/// no configured value is ever read into the returned set or logged.
+fn configured_filter_drivers(path: &Path) -> Result<BTreeSet<String>, Refusal> {
     let config = git(path, &["config", "--null", "--includes", "--list"])?;
-    if config.split(|b| *b == 0).any(|entry| {
+    let mut names = BTreeSet::new();
+    for entry in config.split(|b| *b == 0) {
         let key = entry.split(|b| *b == b'\n').next().unwrap_or_default();
         let key = String::from_utf8_lossy(key).to_ascii_lowercase();
-        key.starts_with("filter.") && (key.ends_with(".clean") || key.ends_with(".process"))
-    }) {
-        return Err(unsafe_reason(
-            "configured Git clean/process filters require explicit cleanup",
-        ));
+        let Some(rest) = key.strip_prefix("filter.") else {
+            continue;
+        };
+        let Some(name) = rest
+            .strip_suffix(".clean")
+            .or_else(|| rest.strip_suffix(".process"))
+        else {
+            continue;
+        };
+        if !name.is_empty() {
+            names.insert(name.to_string());
+        }
+    }
+    Ok(names)
+}
+
+pub(crate) fn clean(path: &Path) -> Result<(), Refusal> {
+    // status may run clean/process drivers while refreshing index content, and
+    // fsmonitor=false alone cannot make that safe — so an APPLICABLE driver is
+    // still a hard refusal.
+    //
+    // But a driver only runs when BOTH a `filter=<name>` attribute selects it
+    // AND that driver is configured. The old check tested configuration alone
+    // (THE-685), and `git config --list` includes global/system scope: one
+    // machine-wide git-lfs install therefore disabled merged-worktree cleanup
+    // in EVERY repository, including repositories with no LFS content at all.
+    // Measured here: 35 merged worktrees stuck, the oldest 9 days past its TTL,
+    // in a tree with no `.gitattributes` whatsoever.
+    for driver in configured_filter_drivers(path)? {
+        // The driver name is interpolated into a pathspec below, so only accept
+        // names that cannot change how that pathspec parses. Anything stranger
+        // keeps the old conservative refusal rather than being trusted.
+        if !driver
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        {
+            return Err(unsafe_reason(
+                "a Git filter driver with an unexpected name is configured; cleanup requires explicit review",
+            ));
+        }
+        // Attribute lookup only — reads the index and .gitattributes, and
+        // cannot itself invoke a driver the way `status`/`add` would.
+        let applied = git(
+            path,
+            &["ls-files", "-z", "--", &format!(":(attr:filter={driver})")],
+        )?;
+        if applied.split(|b| *b == 0).any(|entry| !entry.is_empty()) {
+            return Err(unsafe_reason(format!(
+                "tracked paths use the {driver:?} Git clean/process filter; cleanup requires explicit review"
+            )));
+        }
     }
     let flags = git(path, &["ls-files", "-v", "-z"])?;
     if flags.split(|b| *b == 0).any(|entry| {
