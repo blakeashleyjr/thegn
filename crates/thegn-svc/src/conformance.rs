@@ -374,7 +374,7 @@ mod tests {
     }
 
     impl IssueBackend for LedgerBackend {
-        fn provider_id(&self) -> &'static str {
+        fn provider_id(&self) -> &str {
             "ledger"
         }
 

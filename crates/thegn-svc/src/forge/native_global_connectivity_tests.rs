@@ -225,13 +225,13 @@ fn isolated_sdk_connectivity_child() {
             "errors-only",
             200,
             serde_json::json!({"errors":[{"message":"unknown connect/dns-tls repository"}]}),
-            Some(ForgeError::NotConfigured("GraphQL errors")),
+            Some(ForgeError::NotConfigured("GraphQL errors".into())),
         ),
         (
             "partial",
             200,
             serde_json::json!({"data":data.clone(),"errors":[{"message":"partial connect/dns-tls failure"}]}),
-            Some(ForgeError::NotConfigured("GraphQL errors")),
+            Some(ForgeError::NotConfigured("GraphQL errors".into())),
         ),
         (
             "authentication",

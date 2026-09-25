@@ -341,7 +341,7 @@ const JIRA_FIELDS: &str =
     "summary,description,status,priority,assignee,labels,updated,duedate,comment";
 
 impl IssueBackend for JiraBackend {
-    fn provider_id(&self) -> &'static str {
+    fn provider_id(&self) -> &str {
         "jira"
     }
 
