@@ -2,139 +2,464 @@
 //! architectural rule, checked both ways.
 //!
 //! A ratchet freezes existing debt and makes new debt impossible: every file
-//! whose (comment-stripped) body satisfies the `hit` predicate must be pinned
-//! in `test/<name>`, and every pinned file must still hit — so paying debt
+//! whose (comment-stripped) body satisfies the hit predicate must be pinned
+//! in test/<name>, and every pinned file must still hit — so paying debt
 //! down forces the entry to be deleted, and the list can only shrink.
 //!
-//! The same helper serves every crate: pass the crate's `CARGO_MANIFEST_DIR`
-//! (`env!` expands in the caller). Regeneration is the one sanctioned write,
-//! gated on `THEGN_RATCHET_UPDATE=1` (wired by `just ratchet-update`); it keeps
-//! the allowlist's leading `#` header block verbatim, so the reasons recorded
+//! The same helper serves every crate: pass the crate's CARGO_MANIFEST_DIR
+//! (env! expands in the caller). Regeneration is the one sanctioned write,
+//! gated on THEGN_RATCHET_UPDATE=1 (wired by just ratchet-update); it keeps
+//! the allowlist's leading # header block verbatim, so the reasons recorded
 //! there survive.
 //!
-//! `thegn-media` / `thegn-metrics` are core-free leaf crates and carry a
+//! thegn-media / thegn-metrics are core-free leaf crates and carry a
 //! verbatim private copy of this file; keep the three identical.
 
 use std::collections::BTreeSet;
+use std::io;
 use std::path::{Path, PathBuf};
 
-/// Read `test/<name>` relative to the workspace root (two levels above a
-/// crate's manifest dir). `#` lines and blanks are ignored.
-pub fn allowlist(manifest_dir: &str, name: &str) -> BTreeSet<String> {
-    std::fs::read_to_string(allowlist_path(manifest_dir, name))
-        .unwrap_or_default()
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .map(str::to_string)
-        .collect()
+trait RatchetIo {
+    fn read_dir(&self, path: &Path) -> io::Result<Vec<io::Result<PathBuf>>>;
+    fn metadata(&self, path: &Path) -> io::Result<std::fs::Metadata>;
+    fn read_to_string(&self, path: &Path) -> io::Result<String>;
+    fn write(&self, path: &Path, contents: &[u8]) -> io::Result<()>;
+}
+
+struct RealIo;
+
+impl RatchetIo for RealIo {
+    fn read_dir(&self, path: &Path) -> io::Result<Vec<io::Result<PathBuf>>> {
+        let mut entries = Vec::new();
+        for entry in std::fs::read_dir(path)? {
+            entries.push(entry.map(|entry| entry.path()));
+        }
+        Ok(entries)
+    }
+
+    fn metadata(&self, path: &Path) -> io::Result<std::fs::Metadata> {
+        std::fs::metadata(path)
+    }
+
+    fn read_to_string(&self, path: &Path) -> io::Result<String> {
+        std::fs::read_to_string(path)
+    }
+
+    fn write(&self, path: &Path, contents: &[u8]) -> io::Result<()> {
+        std::fs::write(path, contents)
+    }
+}
+
+fn io_failure(operation: &str, path: &Path, error: impl std::fmt::Display) -> String {
+    format!("{operation} {}: {error}", path.display())
 }
 
 fn allowlist_path(manifest_dir: &str, name: &str) -> PathBuf {
     PathBuf::from(manifest_dir).join("../../test").join(name)
 }
 
-/// Every `.rs` file under the crate's `src/`, as `(src-relative key, body)`,
-/// sorted. Keys under any prefix in `exclude` are skipped, as are the ratchet
+fn read_allowlist<R: RatchetIo>(
+    reader: &R,
+    manifest_dir: &str,
+    name: &str,
+) -> Result<BTreeSet<String>, String> {
+    let path = allowlist_path(manifest_dir, name);
+    let contents = reader
+        .read_to_string(&path)
+        .map_err(|error| io_failure("read allowlist", &path, error))?;
+    Ok(contents
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(str::to_string)
+        .collect())
+}
+
+/// Read test/<name> relative to the workspace root (two levels above a
+/// crate's manifest dir). # lines and blanks are ignored.
+pub fn allowlist(manifest_dir: &str, name: &str) -> BTreeSet<String> {
+    read_allowlist(&RealIo, manifest_dir, name).unwrap_or_else(|error| panic!("{error}"))
+}
+
+fn source_key(root: &Path, path: &Path) -> Result<String, String> {
+    let relative = path.strip_prefix(root).map_err(|error| {
+        format!(
+            "normalize source path {} relative to {}: {error}",
+            path.display(),
+            root.display()
+        )
+    })?;
+    let relative = relative.to_str().ok_or_else(|| {
+        format!(
+            "normalize source path {} relative to {}: path is not valid UTF-8",
+            path.display(),
+            root.display()
+        )
+    })?;
+    Ok(relative.replace('\\', "/"))
+}
+
+fn excluded(key: &str, exclude: &[&str]) -> bool {
+    key.ends_with("ratchet_tests.rs")
+        || key == "ratchet.rs"
+        || key == "test_support/ratchet.rs"
+        || exclude.iter().any(|prefix| key.starts_with(prefix))
+}
+
+fn collect_paths<R: RatchetIo>(
+    reader: &R,
+    root: &Path,
+    dir: &Path,
+    exclude: &[&str],
+    out: &mut Vec<(String, PathBuf)>,
+) -> Result<(), String> {
+    let entries = reader
+        .read_dir(dir)
+        .map_err(|error| io_failure("read source directory", dir, error))?;
+    for entry in entries {
+        let path = entry.map_err(|error| io_failure("read directory entry", dir, error))?;
+        let key = source_key(root, &path)?;
+        let is_dir = reader
+            .metadata(&path)
+            .map_err(|error| io_failure("read source metadata", &path, error))?
+            .is_dir();
+        if is_dir {
+            collect_paths(reader, root, &path, exclude, out)?;
+        } else if path.extension().is_some_and(|extension| extension == "rs")
+            && !excluded(&key, exclude)
+        {
+            out.push((key, path));
+        }
+    }
+    Ok(())
+}
+
+/// Every .rs file under the crate's src/, as (src-relative key, body),
+/// sorted. Keys under any prefix in exclude are skipped, as are the ratchet
 /// test files themselves (they name the patterns they forbid in their own
 /// assertion messages).
 pub fn sources(manifest_dir: &str, exclude: &[&str]) -> Vec<(String, String)> {
-    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-        let Ok(rd) = std::fs::read_dir(dir) else {
-            return;
-        };
-        for e in rd.flatten() {
-            let p = e.path();
-            if p.is_dir() {
-                walk(&p, out);
-            } else if p.extension().is_some_and(|x| x == "rs") {
-                out.push(p);
-            }
-        }
-    }
+    sources_with(&RealIo, manifest_dir, exclude).unwrap_or_else(|error| panic!("{error}"))
+}
+
+fn sources_with<R: RatchetIo>(
+    reader: &R,
+    manifest_dir: &str,
+    exclude: &[&str],
+) -> Result<Vec<(String, String)>, String> {
     let root = PathBuf::from(manifest_dir).join("src");
-    let mut files = Vec::new();
-    walk(&root, &mut files);
-    files.sort();
-    files
+    let mut paths = Vec::new();
+    collect_paths(reader, &root, &root, exclude, &mut paths)?;
+    paths.sort_by(|left, right| left.0.cmp(&right.0));
+    paths
         .into_iter()
-        .filter_map(|p| {
-            let key = p
-                .strip_prefix(&root)
-                .ok()?
-                .to_string_lossy()
-                .replace('\\', "/");
-            if key.ends_with("ratchet_tests.rs")
-                || key == "ratchet.rs"
-                || key == "test_support/ratchet.rs"
-                || exclude.iter().any(|x| key.starts_with(x))
-            {
-                return None;
-            }
-            let body = std::fs::read_to_string(&p).ok()?;
-            Some((key, body))
+        .map(|(key, path)| {
+            let body = reader
+                .read_to_string(&path)
+                .map_err(|error| io_failure("read source", &path, error))?;
+            Ok((key, body))
         })
         .collect()
 }
 
-/// Strip `//`-comments so prose naming a glyph, an API or a forbidden pattern
-/// doesn't trip the scan. Crude but sufficient for line comments in normal
-/// Rust source.
-pub fn code_only(body: &str) -> String {
-    body.lines()
-        .map(|l| match l.find("//") {
-            Some(i) => &l[..i],
-            None => l,
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+fn raw_string_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut index = start;
+    if bytes.get(index) == Some(&b'b') {
+        index += 1;
+    }
+    if bytes.get(index) != Some(&b'r') {
+        return None;
+    }
+    index += 1;
+    let mut hashes = 0;
+    while bytes.get(index) == Some(&b'#') {
+        hashes += 1;
+        index += 1;
+    }
+    if bytes.get(index) != Some(&b'"') {
+        return None;
+    }
+    index += 1;
+    while index < bytes.len() {
+        if bytes[index] == b'"' {
+            let mut closing = index + 1;
+            let mut closing_hashes = 0;
+            while closing_hashes < hashes && bytes.get(closing) == Some(&b'#') {
+                closing += 1;
+                closing_hashes += 1;
+            }
+            if closing_hashes == hashes {
+                return Some(closing);
+            }
+        }
+        index += 1;
+    }
+    Some(bytes.len())
 }
 
-/// Whether `body` (comment-stripped) contains a platform-conditional
-/// attribute: `#[cfg(` followed — through any `not(`/`any(`/`all(` nesting —
-/// by `unix`, `windows`, `target_os`, `target_family` or `target_env`. No
-/// regex so the core-free leaf crates can carry a copy.
-pub fn has_platform_cfg(body: &str) -> bool {
-    const KEYS: [&str; 5] = [
-        "unix",
-        "windows",
-        "target_os",
-        "target_family",
-        "target_env",
-    ];
-    let mut rest = body;
-    while let Some(i) = rest.find("#[cfg(") {
-        let mut inner = rest[i + "#[cfg(".len()..].trim_start();
-        loop {
-            let mut progressed = false;
-            for wrap in ["not(", "any(", "all("] {
-                if let Some(r) = inner.strip_prefix(wrap) {
-                    inner = r.trim_start();
-                    progressed = true;
+fn quoted_string_end(bytes: &[u8], start: usize) -> usize {
+    let mut index = start + 1;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' => index = index.saturating_add(2),
+            b'"' => return index + 1,
+            _ => index += 1,
+        }
+    }
+    bytes.len()
+}
+
+/// Strip comments while respecting ordinary, escaped, byte, and raw strings.
+/// Block comments are nested as they are in Rust. Newlines in comments remain
+/// so source locations and line-oriented diagnostics stay useful.
+pub fn code_only(body: &str) -> String {
+    let bytes = body.as_bytes();
+    let mut output = String::with_capacity(body.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if let Some(end) = raw_string_end(bytes, index) {
+            output.push_str(&body[index..end]);
+            index = end;
+            continue;
+        }
+        if bytes[index] == b'"' || (bytes[index] == b'b' && bytes.get(index + 1) == Some(&b'"')) {
+            let quote = if bytes[index] == b'"' {
+                index
+            } else {
+                index + 1
+            };
+            let end = quoted_string_end(bytes, quote);
+            output.push_str(&body[index..end]);
+            index = end;
+            continue;
+        }
+        if bytes.get(index..index + 2) == Some(b"//") {
+            index += 2;
+            while index < bytes.len() && bytes[index] != b'\n' && bytes[index] != b'\r' {
+                index += 1;
+            }
+            continue;
+        }
+        if bytes.get(index..index + 2) == Some(b"/*") {
+            index += 2;
+            let mut depth = 1;
+            while index < bytes.len() && depth > 0 {
+                if bytes.get(index..index + 2) == Some(b"/*") {
+                    depth += 1;
+                    index += 2;
+                } else if bytes.get(index..index + 2) == Some(b"*/") {
+                    depth -= 1;
+                    index += 2;
+                } else {
+                    if bytes[index] == b'\n' || bytes[index] == b'\r' {
+                        output.push(bytes[index] as char);
+                    }
+                    index += 1;
                 }
             }
-            if !progressed {
-                break;
+            continue;
+        }
+        let character = body[index..].chars().next().expect("index is in body");
+        output.push(character);
+        index += character.len_utf8();
+    }
+    output
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Token<'a> {
+    Hash,
+    OpenBracket,
+    CloseBracket,
+    OpenParen,
+    CloseParen,
+    Comma,
+    Ident(&'a str),
+    Literal,
+    Other,
+}
+
+fn lex_code<'a>(code: &'a str) -> Vec<Token<'a>> {
+    let bytes = code.as_bytes();
+    let mut tokens = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        if let Some(end) = raw_string_end(bytes, index) {
+            tokens.push(Token::Literal);
+            index = end;
+            continue;
+        }
+        if bytes[index] == b'"' || (bytes[index] == b'b' && bytes.get(index + 1) == Some(&b'"')) {
+            let quote = if bytes[index] == b'"' {
+                index
+            } else {
+                index + 1
+            };
+            tokens.push(Token::Literal);
+            index = quoted_string_end(bytes, quote);
+            continue;
+        }
+        if bytes[index].is_ascii_whitespace() {
+            index += 1;
+            continue;
+        }
+        if bytes[index].is_ascii_alphabetic() || bytes[index] == b'_' {
+            let start = index;
+            index += 1;
+            while index < bytes.len()
+                && (bytes[index].is_ascii_alphanumeric() || bytes[index] == b'_')
+            {
+                index += 1;
+            }
+            tokens.push(Token::Ident(&code[start..index]));
+            continue;
+        }
+        let token = match bytes[index] {
+            b'#' => Token::Hash,
+            b'[' => Token::OpenBracket,
+            b']' => Token::CloseBracket,
+            b'(' => Token::OpenParen,
+            b')' => Token::CloseParen,
+            b',' => Token::Comma,
+            _ => Token::Other,
+        };
+        tokens.push(token);
+        index += 1;
+    }
+    tokens
+}
+
+fn predicate(tokens: &[Token<'_>], mut index: usize) -> (bool, usize) {
+    let Some(token) = tokens.get(index) else {
+        return (false, index);
+    };
+    match token {
+        Token::Ident(name) if tokens.get(index + 1) == Some(&Token::OpenParen) => {
+            index += 2;
+            let mut found = false;
+            while index < tokens.len() && tokens[index] != Token::CloseParen {
+                let (nested, next) = predicate(tokens, index);
+                found |= nested;
+                if next == index {
+                    index += 1;
+                } else {
+                    index = next;
+                }
+                if tokens.get(index) == Some(&Token::Comma) {
+                    index += 1;
+                } else if tokens.get(index) == Some(&Token::CloseParen) {
+                    index += 1;
+                    break;
+                }
+            }
+            let _ = name;
+            (found, index)
+        }
+        Token::Ident(name) => {
+            let found = matches!(
+                *name,
+                "unix" | "windows" | "target_os" | "target_family" | "target_env"
+            );
+            index += 1;
+            let mut depth = 0;
+            while index < tokens.len() {
+                match tokens[index] {
+                    Token::OpenParen => depth += 1,
+                    Token::CloseParen if depth == 0 => break,
+                    Token::CloseParen => depth -= 1,
+                    Token::Comma if depth == 0 => break,
+                    _ => {}
+                }
+                index += 1;
+            }
+            (found, index)
+        }
+        _ => (false, index + 1),
+    }
+}
+
+/// Whether body contains a platform-conditional cfg or cfg_attr attribute.
+/// The predicate walker visits every comma-separated sibling and nested
+/// expression, so argument order cannot hide a platform leaf.
+pub fn has_platform_cfg(body: &str) -> bool {
+    let code = code_only(body);
+    let tokens = lex_code(&code);
+    let mut index = 0;
+    while index + 3 < tokens.len() {
+        if tokens[index] == Token::Hash && tokens[index + 1] == Token::OpenBracket {
+            let is_cfg = matches!(tokens[index + 2], Token::Ident("cfg" | "cfg_attr"));
+            if is_cfg && tokens[index + 3] == Token::OpenParen {
+                let (found, _) = predicate(&tokens, index + 4);
+                if found {
+                    return true;
+                }
             }
         }
-        if KEYS.iter().any(|k| {
-            inner
-                .strip_prefix(k)
-                .is_some_and(|after| !after.starts_with(|c: char| c.is_alphanumeric() || c == '_'))
-        }) {
-            return true;
-        }
-        rest = &rest[i + 1..];
+        index += 1;
     }
     false
 }
 
-/// Run one ratchet. `hit(key, code_only_body)` decides whether a file
-/// violates the rule; `why` is the one-paragraph explanation shown on a new
-/// violation (what the rule protects and how to fix the file instead of
-/// pinning it).
+fn file_ratchet_with<R: RatchetIo>(
+    reader: &R,
+    manifest_dir: &str,
+    name: &str,
+    exclude: &[&str],
+    hit: impl Fn(&str, &str) -> bool,
+    why: &str,
+    update: bool,
+) -> Result<(), String> {
+    let found: BTreeSet<String> = sources_with(reader, manifest_dir, exclude)?
+        .into_iter()
+        .filter(|(key, body)| hit(key, &code_only(body)))
+        .map(|(key, _)| key)
+        .collect();
+
+    if update {
+        let path = allowlist_path(manifest_dir, name);
+        let header: Vec<String> = reader
+            .read_to_string(&path)
+            .map_err(|error| io_failure("read allowlist header", &path, error))?
+            .lines()
+            .take_while(|line| line.trim().is_empty() || line.trim_start().starts_with('#'))
+            .map(str::to_string)
+            .collect();
+        let mut output = header;
+        if output.last().is_some_and(|line| !line.trim().is_empty()) {
+            output.push(String::new());
+        }
+        output.extend(found.iter().cloned());
+        let contents = output.join("\n") + "\n";
+        reader
+            .write(&path, contents.as_bytes())
+            .map_err(|error| io_failure("write allowlist", &path, error))?;
+        return Ok(());
+    }
+
+    let allow = read_allowlist(reader, manifest_dir, name)?;
+    let unpinned: Vec<&String> = found.difference(&allow).collect();
+    if !unpinned.is_empty() {
+        return Err(format!(
+            "ratchet test/{name}: new violation in {unpinned:?}\n{why}\n\
+             Fix the file, or — with a reason — pin it in test/{name} \
+             (the list is shrink-only: prefer fixing)."
+        ));
+    }
+    let stale: Vec<&String> = allow.difference(&found).collect();
+    if !stale.is_empty() {
+        return Err(format!(
+            "ratchet test/{name}: stale entries {stale:?} — these files no longer \
+             violate the rule; the list is shrink-only, so delete them \
+             (or run just ratchet-update)."
+        ));
+    }
+    Ok(())
+}
+
+/// Run one ratchet. hit(key, code_only_body) decides whether a file violates
+/// the rule; why is the one-paragraph explanation shown on a new violation.
 ///
-/// With `THEGN_RATCHET_UPDATE=1` the allowlist is rewritten from the current
+/// With THEGN_RATCHET_UPDATE=1 the allowlist is rewritten from the current
 /// hit set (header preserved) and the check is skipped.
 pub fn file_ratchet(
     manifest_dir: &str,
@@ -143,45 +468,9 @@ pub fn file_ratchet(
     hit: impl Fn(&str, &str) -> bool,
     why: &str,
 ) {
-    let found: BTreeSet<String> = sources(manifest_dir, exclude)
-        .into_iter()
-        .filter(|(key, body)| hit(key, &code_only(body)))
-        .map(|(key, _)| key)
-        .collect();
-
-    if std::env::var("THEGN_RATCHET_UPDATE").as_deref() == Ok("1") {
-        let path = allowlist_path(manifest_dir, name);
-        let header: Vec<String> = std::fs::read_to_string(&path)
-            .unwrap_or_default()
-            .lines()
-            .take_while(|l| l.trim().is_empty() || l.trim_start().starts_with('#'))
-            .map(str::to_string)
-            .collect();
-        let mut out = header;
-        if out.last().is_some_and(|l| !l.trim().is_empty()) {
-            out.push(String::new());
-        }
-        out.extend(found.iter().cloned());
-        std::fs::write(&path, out.join("\n") + "\n")
-            .unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
-        return;
-    }
-
-    let allow = allowlist(manifest_dir, name);
-    let unpinned: Vec<&String> = found.difference(&allow).collect();
-    assert!(
-        unpinned.is_empty(),
-        "ratchet test/{name}: new violation in {unpinned:?}\n{why}\n\
-         Fix the file, or — with a reason — pin it in test/{name} \
-         (the list is shrink-only: prefer fixing)."
-    );
-    let stale: Vec<&String> = allow.difference(&found).collect();
-    assert!(
-        stale.is_empty(),
-        "ratchet test/{name}: stale entries {stale:?} — these files no longer \
-         violate the rule; the list is shrink-only, so delete them \
-         (or run `just ratchet-update`)."
-    );
+    let update = std::env::var("THEGN_RATCHET_UPDATE").as_deref() == Ok("1");
+    file_ratchet_with(&RealIo, manifest_dir, name, exclude, hit, why, update)
+        .unwrap_or_else(|error| panic!("{error}"));
 }
 
 #[cfg(test)]
@@ -189,63 +478,224 @@ mod tests {
     use super::*;
 
     #[test]
-    fn platform_cfg_detection() {
-        assert!(has_platform_cfg("#[cfg(unix)] fn a() {}"));
-        assert!(has_platform_cfg("#[cfg(not(windows))]"));
-        assert!(has_platform_cfg("#[cfg(any(target_os = \"macos\", unix))]"));
+    fn platform_cfg_detection_walks_complete_predicates() {
         assert!(has_platform_cfg(
-            "#[cfg(all(not(target_env = \"msvc\"), feature = \"x\"))]"
+            "#[cfg(all(feature = \"profiling\", unix))] fn a() {}"
         ));
-        assert!(!has_platform_cfg("#[cfg(test)]"));
-        assert!(!has_platform_cfg("#[cfg(feature = \"dev\")]"));
-        assert!(!has_platform_cfg("#[cfg(unixy)]"));
+        assert!(has_platform_cfg(
+            "#[cfg(not(any(feature = \"x\", all(feature = \"y\", target_os = \"macos\"))))]"
+        ));
+        assert!(has_platform_cfg(
+            "#[cfg_attr(all(feature = \"x\", target_family = \"unix\"), allow(dead_code))]"
+        ));
+        assert!(has_platform_cfg(
+            "#[cfg(any(feature = \"x\", /* unix */ windows))]"
+        ));
+        assert!(!has_platform_cfg("#[cfg(feature = \"unix\")]"));
         assert!(!has_platform_cfg(
             "#[cfg(kani)] #[cfg(any(test, feature = \"x\"))]"
         ));
     }
 
     #[test]
-    fn code_only_strips_line_comments() {
-        assert_eq!(code_only("a // b\n// c\nd"), "a \n\nd");
+    fn comments_and_strings_cannot_hide_or_create_attributes() {
+        assert!(has_platform_cfg(
+            "let ordinary = \"// #[cfg(unix)]\"; #[cfg(windows)] fn a() {}"
+        ));
+        assert!(has_platform_cfg(
+            "let ordinary = \"escaped \\\" //\"; #[cfg(windows)] fn a() {}"
+        ));
+        assert!(has_platform_cfg(
+            r##"let raw = r#""// #[cfg(unix)]"#; #[cfg(target_env = "gnu")]"##
+        ));
+        assert!(has_platform_cfg(
+            "/* #[cfg(unix)] */ #[cfg(target_family = \"unix\")]"
+        ));
+        assert!(!has_platform_cfg("let ordinary = \"// #[cfg(unix)]\";"));
+        assert!(!has_platform_cfg(r##"let raw = r#""// #[cfg(unix)]"#;"##));
     }
 
     #[test]
-    fn ratchet_round_trip_in_a_temp_crate() {
+    fn code_only_strips_comments_without_touching_strings() {
+        assert_eq!(code_only("a // b\n// c\nd"), "a \n\nd");
+        assert_eq!(
+            code_only(r##"let s = ""// stays"; /* gone */ #[cfg(unix)]"##),
+            r##"let s = ""// stays";  #[cfg(unix)]"##
+        );
+        assert_eq!(
+            code_only(
+                r##"let s = r#""// stays /* too */"#; // gone
+#[cfg(unix)]"##
+            ),
+            "let s = r#\"// stays /* too */\"#; \n#[cfg(unix)]"
+        );
+    }
+
+    #[derive(Clone, Copy)]
+    enum Failure {
+        Traversal,
+        Entry,
+        Metadata,
+        Normalization,
+        SourceRead,
+        AllowlistRead,
+    }
+
+    struct FailingIo {
+        failure: Failure,
+    }
+
+    impl RatchetIo for FailingIo {
+        fn read_dir(&self, path: &Path) -> io::Result<Vec<io::Result<PathBuf>>> {
+            if matches!(self.failure, Failure::Traversal) && path.ends_with("src") {
+                return Err(io::Error::other("injected traversal failure"));
+            }
+            if matches!(self.failure, Failure::Entry) && path.ends_with("src") {
+                return Ok(vec![Err(io::Error::other("injected entry failure"))]);
+            }
+            if matches!(self.failure, Failure::Normalization) && path.ends_with("src") {
+                return Ok(vec![Ok(PathBuf::from("outside.rs"))]);
+            }
+            RealIo.read_dir(path)
+        }
+
+        fn metadata(&self, path: &Path) -> io::Result<std::fs::Metadata> {
+            if matches!(self.failure, Failure::Metadata)
+                && path.file_name().is_some_and(|x| x == "a.rs")
+            {
+                return Err(io::Error::other("injected metadata failure"));
+            }
+            RealIo.metadata(path)
+        }
+
+        fn read_to_string(&self, path: &Path) -> io::Result<String> {
+            if matches!(self.failure, Failure::SourceRead)
+                && path.file_name().is_some_and(|x| x == "a.rs")
+            {
+                return Err(io::Error::other("injected source read failure"));
+            }
+            if matches!(self.failure, Failure::AllowlistRead)
+                && path.file_name().is_some_and(|x| x == "t.txt")
+            {
+                return Err(io::Error::other("injected allowlist read failure"));
+            }
+            RealIo.read_to_string(path)
+        }
+
+        fn write(&self, path: &Path, contents: &[u8]) -> io::Result<()> {
+            RealIo.write(path, contents)
+        }
+    }
+
+    fn temp_crate() -> (tempfile::TempDir, String) {
         let tmp = tempfile::tempdir().unwrap();
         let manifest = tmp.path().join("crates").join("x");
         std::fs::create_dir_all(manifest.join("src/sub")).unwrap();
         std::fs::create_dir_all(tmp.path().join("test")).unwrap();
         std::fs::write(manifest.join("src/a.rs"), "fn a() { bad(); }").unwrap();
-        std::fs::write(manifest.join("src/sub/b.rs"), "// bad()\nfn b() {}").unwrap();
+        std::fs::write(manifest.join("src/sub/b.rs"), "// bad()\nfn b() {}\n").unwrap();
         std::fs::write(manifest.join("src/c.rs"), "fn c() { bad(); }").unwrap();
-        let md = manifest.to_string_lossy().to_string();
+        std::fs::write(tmp.path().join("test/t.txt"), "# header\n# two\n").unwrap();
+        (tmp, manifest.to_string_lossy().into_owned())
+    }
+
+    #[test]
+    fn filesystem_failures_are_not_silently_omitted() {
+        let cases = [
+            (Failure::Traversal, "read source directory", "src"),
+            (Failure::Entry, "read directory entry", "src"),
+            (Failure::Metadata, "read source metadata", "a.rs"),
+            (Failure::SourceRead, "read source", "a.rs"),
+            (
+                Failure::Normalization,
+                "normalize source path",
+                "outside.rs",
+            ),
+        ];
+        for (failure, operation, path_fragment) in cases {
+            let (tmp, manifest) = temp_crate();
+            let error = sources_with(&FailingIo { failure }, &manifest, &[]).unwrap_err();
+            assert!(error.contains(operation), "{error}");
+            assert!(error.contains(path_fragment), "{error}");
+            assert!(error.contains("injected"), "{error}");
+            drop(tmp);
+        }
+
+        let (tmp, manifest) = temp_crate();
+        let error = file_ratchet_with(
+            &FailingIo {
+                failure: Failure::AllowlistRead,
+            },
+            &manifest,
+            "t.txt",
+            &[],
+            |_, _| false,
+            "why",
+            false,
+        )
+        .unwrap_err();
+        assert!(error.contains("read allowlist"), "{error}");
+        assert!(error.contains("t.txt"), "{error}");
+        assert!(error.contains("injected"), "{error}");
+        drop(tmp);
+    }
+
+    #[test]
+    fn ratchet_round_trip_preserves_header_and_checks_both_sets() {
+        let (tmp, manifest) = temp_crate();
         let hit = |_: &str, body: &str| body.contains("bad(");
 
-        // Unpinned violation fails.
-        let r = std::panic::catch_unwind(|| file_ratchet(&md, "t.txt", &[], hit, "why"));
-        assert!(r.is_err());
+        let error =
+            file_ratchet_with(&RealIo, &manifest, "t.txt", &[], hit, "why", false).unwrap_err();
+        assert!(error.contains("new violation"));
 
-        // Regenerate, preserving a header.
-        std::fs::write(tmp.path().join("test/t.txt"), "# header\n# two\n").unwrap();
-        // SAFETY: test-local env var, single-threaded use within this test.
-        unsafe { std::env::set_var("THEGN_RATCHET_UPDATE", "1") };
-        file_ratchet(&md, "t.txt", &[], hit, "why");
-        unsafe { std::env::remove_var("THEGN_RATCHET_UPDATE") };
+        file_ratchet_with(&RealIo, &manifest, "t.txt", &[], hit, "why", true).unwrap();
         let written = std::fs::read_to_string(tmp.path().join("test/t.txt")).unwrap();
         assert_eq!(written, "# header\n# two\n\na.rs\nc.rs\n");
         assert_eq!(
-            allowlist(&md, "t.txt"),
+            allowlist(&manifest, "t.txt"),
             ["a.rs", "c.rs"].into_iter().map(String::from).collect()
         );
 
-        // Now clean. Comment-only b.rs is not a hit; excluded prefix drops c.rs.
-        file_ratchet(&md, "t.txt", &[], hit, "why");
+        file_ratchet_with(&RealIo, &manifest, "t.txt", &[], hit, "why", false).unwrap();
         std::fs::write(tmp.path().join("test/t.txt"), "a.rs\n").unwrap();
-        file_ratchet(&md, "t.txt", &["c"], hit, "why");
+        file_ratchet_with(&RealIo, &manifest, "t.txt", &["c"], hit, "why", false).unwrap();
 
-        // A stale entry fails.
         std::fs::write(tmp.path().join("test/t.txt"), "a.rs\nc.rs\nzzz.rs\n").unwrap();
-        let r = std::panic::catch_unwind(|| file_ratchet(&md, "t.txt", &[], hit, "why"));
-        assert!(r.is_err());
+        let error =
+            file_ratchet_with(&RealIo, &manifest, "t.txt", &[], hit, "why", false).unwrap_err();
+        assert!(error.contains("stale entries"));
+    }
+
+    #[test]
+    fn missing_allowlist_fails_closed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest = tmp.path().join("crates/x");
+        std::fs::create_dir_all(manifest.join("src")).unwrap();
+        std::fs::write(manifest.join("src/a.rs"), "fn a() {}\n").unwrap();
+        let manifest = manifest.to_string_lossy().into_owned();
+        let error = file_ratchet_with(
+            &RealIo,
+            &manifest,
+            "missing.txt",
+            &[],
+            |_, _| false,
+            "why",
+            false,
+        )
+        .unwrap_err();
+        assert!(error.contains("read allowlist"), "{error}");
+        assert!(error.contains("missing.txt"), "{error}");
+    }
+
+    #[test]
+    fn ratchet_helper_copies_are_byte_identical() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let core =
+            std::fs::read(root.join("crates/thegn-core/src/test_support/ratchet.rs")).unwrap();
+        let media = std::fs::read(root.join("crates/thegn-media/src/ratchet.rs")).unwrap();
+        let metrics = std::fs::read(root.join("crates/thegn-metrics/src/ratchet.rs")).unwrap();
+        assert_eq!(core, media, "core and media ratchet helpers drifted");
+        assert_eq!(core, metrics, "core and metrics ratchet helpers drifted");
     }
 }

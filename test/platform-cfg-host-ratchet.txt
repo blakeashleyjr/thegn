@@ -63,6 +63,11 @@ metrics.rs
 notify.rs
 panes.rs
 perf.rs
+# profile.rs: the profiling feature's SIGUSR2/pprof path and its no-op stubs
+# intentionally remain co-located in this small profiling seam; the unix
+# predicate gates a feature implementation, not a platform abstraction, so it
+# does not belong behind src/platform/. This is explicit shrink-only debt.
+profile.rs
 probe.rs
 # TEST-ONLY cfg: the remote enqueue credential installer regression executes a
 # real POSIX shell and inspects Unix permission bits to prove the streamed
