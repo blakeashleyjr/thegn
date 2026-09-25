@@ -34,7 +34,9 @@ pub use ics::{parse_ics, parse_ics_admitted, parse_ics_window};
 pub use locale::{resolve_time_format, resolve_week_start};
 pub use recur::{ByDay, Freq, RRule, RecurError, Recurrence};
 pub use reminders::{DueReminder, next_event};
-pub use tz::{ClockReading, GapPolicy, ResolvedClock, TzRef, read_clocks, resolve_zone};
+pub use tz::{
+    ClockFormat, ClockReading, GapPolicy, ResolvedClock, TzRef, read_clocks, resolve_zone,
+};
 
 use chrono::{DateTime, Days, NaiveDate, NaiveDateTime, Utc};
 use serde::{Deserialize, Serialize};

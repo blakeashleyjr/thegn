@@ -58,22 +58,24 @@ pub fn validate_strftime(fmt: &str) -> Result<(), String> {
 /// (`%H:%M:%S`), `%r`, `%X` and `%s` all count while the escaped literal `%%S`
 /// correctly does not.
 pub fn strftime_needs_seconds(fmt: &str) -> bool {
+    strftime_seconds_directive(fmt).is_some()
+}
+
+/// Return a representative parsed directive when a format emits sub-minute
+/// time data. The parser expands aliases such as `%T`, `%r`, and `%X`, so the
+/// returned `%S` describes the actual field rather than relying on a fragile
+/// substring search. Escaped literals such as `%%S` return `None`.
+pub fn strftime_seconds_directive(fmt: &str) -> Option<&'static str> {
     use chrono::format::{Fixed, Item, Numeric, StrftimeItems};
-    StrftimeItems::new(fmt).any(|i| {
-        matches!(
-            i,
-            Item::Numeric(
-                Numeric::Second | Numeric::Nanosecond | Numeric::Timestamp,
-                _
-            ) | Item::Fixed(
-                Fixed::Nanosecond
-                    | Fixed::Nanosecond3
-                    | Fixed::Nanosecond6
-                    | Fixed::Nanosecond9
-                    | Fixed::RFC2822
-                    | Fixed::RFC3339,
-            )
-        )
+    StrftimeItems::new(fmt).find_map(|i| match i {
+        Item::Numeric(Numeric::Timestamp, _) => Some("%s"),
+        Item::Numeric(Numeric::Nanosecond, _) => Some("%f"),
+        Item::Numeric(Numeric::Second, _) => Some("%S"),
+        Item::Fixed(Fixed::RFC2822 | Fixed::RFC3339) => Some("%+"),
+        Item::Fixed(
+            Fixed::Nanosecond | Fixed::Nanosecond3 | Fixed::Nanosecond6 | Fixed::Nanosecond9,
+        ) => Some("%f"),
+        _ => None,
     })
 }
 
@@ -6358,6 +6360,27 @@ impl Config {
             if let Err(e) = validate_strftime(fmt) {
                 config_warn(&format!("{label}: {e} — using {fallback:?}"));
                 *fmt = fallback;
+            }
+        }
+        // World-clock rows share the existing minute-resolution calendar tick.
+        // A malformed or seconds-bearing row format therefore inherits the
+        // global calendar setting instead of reaching a stale or panicking
+        // draw site. Strict validation still reports the exact row and cause.
+        for (i, clock) in self.calendar.clocks.iter_mut().enumerate() {
+            let problem = validate_strftime(&clock.format)
+                .err()
+                .or_else(|| {
+                    strftime_seconds_directive(&clock.format).map(|directive| {
+                        format!(
+                            "{directive} renders seconds, which is not supported at the configured cadence"
+                        )
+                    })
+                });
+            if let Some(problem) = problem {
+                config_warn(&format!(
+                    "calendar.clocks[{i}].format: {problem} — using inherited calendar.time_format"
+                ));
+                clock.format.clear();
             }
         }
     }
