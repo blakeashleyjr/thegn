@@ -254,7 +254,9 @@ fn active_clocks_resolve_mixed_formats_and_show_date() {
 
 #[test]
 fn seconds_and_invalid_row_formats_are_rejected_or_normalized() {
-    for format in ["%S", "%T", "%r", "%X", "%s", "%f", "%.3f", "%.6f", "%.9f"] {
+    for format in [
+        "%S", "%T", "%r", "%X", "%s", "%f", "%.3f", "%.6f", "%.9f", "%3f", "%6f", "%9f",
+    ] {
         let cfg = CalendarConfig {
             clocks: vec![WorldClock {
                 zone: "UTC".into(),

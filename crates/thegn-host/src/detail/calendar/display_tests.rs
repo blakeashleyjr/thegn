@@ -185,6 +185,13 @@ fn world_clock_rows_honor_mixed_formats_dates_and_safe_narrow_output() {
             is_home: false,
         },
         ResolvedClock {
+            label: "new york".into(),
+            zone: Tz::America__New_York,
+            format: ClockFormat::H24,
+            show_date: true,
+            is_home: false,
+        },
+        ResolvedClock {
             label: "kathmandu".into(),
             zone: Tz::Asia__Kathmandu,
             format: ClockFormat::Custom("%H:%M%n%t".into()),
@@ -210,6 +217,10 @@ fn world_clock_rows_honor_mixed_formats_dates_and_safe_narrow_output() {
     assert!(painted.contains("22:00"), "{painted}");
     assert!(painted.contains("07:00 PM"), "{painted}");
     assert!(painted.contains("2026-08-22"), "{painted}");
+    assert!(
+        painted.contains("2026-08-21"),
+        "same-day show_date: {painted}"
+    );
     assert!(
         painted.contains("+1d"),
         "hidden dates retain the delta: {painted}"
