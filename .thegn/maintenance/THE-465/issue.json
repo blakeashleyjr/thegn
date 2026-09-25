@@ -1,0 +1,96 @@
+{
+  "id": "THE-465",
+  "uuid": "8b024bad-2ff9-4c93-ab86-29d8ba91e6c3",
+  "title": "Enforce calendar max_events as a non-disableable admission budget",
+  "description": "## Finding\n\nThe documented per-account event cap is never wired into production backends. `CalendarRouter::from_config` ignores `CalendarConfig::max_events`; every backend initializes `max_events = 0`, and every enforcement site interprets zero as \u201cunlimited.\u201d Repository-wide search shows all `with_max_events` methods have no callers.\n\nEven if the setter were called, ICS URL and CalDAV parse and allocate the full response before truncation, local ICS reads/parses all selected files first, and the command adapter collects all decoded events first. The setting therefore neither limits admission nor bounds peak memory. Config validation also accepts zero and arbitrarily large values despite documenting the field as a safety cap.\n\n## Evidence at audited commit\n\n* `crates/thegn-core/src/config_calendar.rs:55-57,87-93`: public `max_events` safety setting.\n* `crates/thegn-svc/src/calendar/mod.rs:178-193`: router construction does not forward it.\n* `crates/thegn-svc/src/calendar/{ics,ics_url,caldav,command}.rs`: each constructor uses zero; `max_events > 0` gates truncation only after collection/parsing.\n* Repository-wide search finds no production call to any `with_max_events`.\n* `crates/thegn-core/src/config_calendar.rs:392-459`: calendar validation does not reject zero or unsafe upper bounds.\n\n## Impact\n\nOne source can admit far more than the advertised cap, grow cache writes and expansion cost, and exhaust memory. Adding bounded concurrency in <issue id=\"6403ec06-f70b-4631-b450-0063162f2c05\" href=\"https://linear.app/blakeashley/issue/THE-456/fetch-and-apply-calendar-accounts-independently-under-bounded\">THE-456</issue> would multiply the uncontrolled peak across accounts.\n\n## Required implementation\n\n* Define a nonzero supported minimum/default/maximum and reject or safely clamp invalid config with visible diagnostics; zero must not mean unlimited for a safety field.\n* Pass a required typed budget into every backend at construction.\n* Enforce the budget during byte framing/parsing/admission, before allocating the next full event, not by truncating an already-built vector.\n* Cover source events, deleted identities, decoded strings/extra maps, aggregate bytes, and partial-page metadata. Coordinate generated occurrence/bucket budgets with <issue id=\"967e9fbc-0223-44de-ae42-2ccda1695505\" href=\"https://linear.app/blakeashley/issue/THE-457/bound-and-validate-recurrence-expansion-and-reminder-arithmetic\">THE-457</issue>/<issue id=\"7589579b-1be4-425e-a11c-9dac78abb052\" href=\"https://linear.app/blakeashley/issue/THE-458/intersect-calendar-event-spans-before-enumerating-occupied-dates\">THE-458</issue>.\n* Preserve deterministic selection and a typed, observable overflow/partial result. Never advance a cursor or replace authoritative cache from an ambiguous truncated snapshot.\n* Budget concurrent accounts globally as well as per account.\n\n## Verification\n\nTest `max_events=0`, one, maximum, above maximum, huge local/remote/command streams, many deletions, oversized individual events, and multiple concurrent accounts. Measure bounded peak memory and prove overflow cannot advance sync state or present a complete-looking partial cache.\n\n## Dependencies\n\nDirectly blocks <issue id=\"6403ec06-f70b-4631-b450-0063162f2c05\" href=\"https://linear.app/blakeashley/issue/THE-456/fetch-and-apply-calendar-accounts-independently-under-bounded\">THE-456</issue> because bounded concurrency is unsafe until each task has enforceable per-account and aggregate admission limits. Coordinate transport/local/parser boundaries with <issue id=\"d7916c35-ed49-4478-8385-cf7b7430358a\" href=\"https://linear.app/blakeashley/issue/THE-454/harden-remote-calendar-redirects-secret-replay-and-body-limits\">THE-454</issue>, <issue id=\"0891b34e-9fcb-4d9c-8ee6-2a025d6d22c2\" href=\"https://linear.app/blakeashley/issue/THE-455/bound-and-determinize-local-ics-file-and-vdir-ingestion\">THE-455</issue>, <issue id=\"967e9fbc-0223-44de-ae42-2ccda1695505\" href=\"https://linear.app/blakeashley/issue/THE-457/bound-and-validate-recurrence-expansion-and-reminder-arithmetic\">THE-457</issue>, and <issue id=\"7589579b-1be4-425e-a11c-9dac78abb052\" href=\"https://linear.app/blakeashley/issue/THE-458/intersect-calendar-event-spans-before-enumerating-occupied-dates\">THE-458</issue>.",
+  "priority": {
+    "value": 1,
+    "name": "Urgent"
+  },
+  "url": "https://linear.app/blakeashley/issue/THE-465/enforce-calendar-max-events-as-a-non-disableable-admission-budget",
+  "gitBranchName": "blake/the-465-enforce-calendar-max_events-as-a-non-disableable-admission",
+  "createdAt": "2026-09-11T09:26:23.962Z",
+  "updatedAt": "2026-09-11T10:21:30.539Z",
+  "archivedAt": null,
+  "completedAt": null,
+  "startedAt": null,
+  "canceledAt": null,
+  "dueDate": null,
+  "slaStartedAt": null,
+  "slaMediumRiskAt": null,
+  "slaHighRiskAt": null,
+  "slaBreachesAt": null,
+  "status": "Backlog",
+  "statusType": "backlog",
+  "labels": [],
+  "attachments": [],
+  "documents": [],
+  "stateHistory": [
+    {
+      "state": {
+        "id": "9a141276-3d88-41f8-8437-8f170cfff494",
+        "name": "Backlog",
+        "type": "backlog"
+      },
+      "startedAt": "2026-09-11T09:26:23.962Z",
+      "endedAt": null
+    }
+  ],
+  "createdBy": "Blake Ashley",
+  "createdById": "3b7f5427-3d7f-40df-822c-6b4439a509e7",
+  "parentId": "THE-150",
+  "team": "Thegn",
+  "teamId": "6d265c7c-ac1f-40c7-9983-f919d7b5d254",
+  "relations": {
+    "blocks": [
+      {
+        "id": "THE-481",
+        "title": "Implement or remove the advertised calendar control API backend"
+      },
+      {
+        "id": "THE-456",
+        "title": "Fetch and apply calendar accounts independently under bounded concurrency"
+      }
+    ],
+    "blockedBy": [],
+    "relatedTo": [
+      {
+        "id": "THE-458",
+        "title": "Intersect calendar event spans before enumerating occupied dates"
+      },
+      {
+        "id": "THE-455",
+        "title": "Bound and determinize local ICS file and vdir ingestion"
+      },
+      {
+        "id": "THE-454",
+        "title": "Harden remote calendar redirects, secret replay, and body limits"
+      },
+      {
+        "id": "THE-457",
+        "title": "Bound and validate recurrence expansion and reminder arithmetic"
+      },
+      {
+        "id": "THE-485",
+        "title": "Reject invalid calendar horizons before authoritative cache replacement"
+      },
+      {
+        "id": "THE-474",
+        "title": "Validate CalEvent domain invariants at every admission seam"
+      },
+      {
+        "id": "THE-472",
+        "title": "Generation-fence and replacement-apply calendar month hydration"
+      },
+      {
+        "id": "THE-468",
+        "title": "Parse iCalendar structurally and surface partial failures"
+      },
+      {
+        "id": "THE-467",
+        "title": "Make command calendar plugin negotiation truthful and fail closed"
+      }
+    ],
+    "duplicateOf": null
+  }
+}
