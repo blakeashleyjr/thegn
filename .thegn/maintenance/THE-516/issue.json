@@ -1,0 +1,114 @@
+{
+  "id": "THE-516",
+  "uuid": "afa727c2-4dcd-4988-9ed9-25a799026b58",
+  "title": "Make worktree paths, branch tabs, and feature identities collision-proof",
+  "description": "## Finding\n\nGit branch identity is repeatedly converted through lossy `slugify` when deriving worktree directories and tab/database keys. Distinct valid branches can therefore map to the same checkout path and the same UI tab. External worktree mode additionally namespaces paths by only the repository basename, so same-named repositories share the same parent.\n\nHuman feature names are also defined as branch-name equality after lossy slugging, meaning two distinct project features can silently become one cross-repository branch identity.\n\n## Evidence at audited commit `299fc13ee53f31bdeb99bbf35609a6ad55528973`\n\n* `crates/thegn-core/src/worktree.rs:129-160` slugifies human branch labels. Ordinary single-repo creation de-duplicates only the resulting Git branch name, not collisions between an existing branch and its derived checkout/tab path under other entry points.\n* `worktree_path` at `worktree.rs:193-203` maps every exact branch to `<repo>/.worktrees/<slug>` or `<worktrees_dir>/<repo basename>/<slug>`.\n* Valid branches such as `feat/a`, `feat-a`, and `feat_a` map to one path. Two unrelated roots ending in the same repo basename also share the external worktree namespace.\n* `crates/thegn-core/src/repo.rs:111-115` maps `(repo slug, exact branch)` to the tab name `<repo-slug>/<slugify(branch)>`, which is then used in worktree registration, hydration, sidebar/tab resolution, merge lifecycle, control APIs, and issue/autopilot creation.\n* `crates/thegn-core/src/project.rs:1-25` explicitly treats literal branch-name equality as the sole cross-repository feature link but derives it from `slugify(feature)` and deliberately does not de-duplicate. Distinct feature names can therefore join the same project identity.\n* `worktree::rename` at `worktree.rs:425-475` derives the colliding destination, renames the Git branch first, and cannot roll the branch back when `git worktree move` fails; the code documents this split state.\n* CLI, wizard, daemon, tracker, and autopilot entry points independently call the same lossy path/tab helpers, so the ambiguity crosses every creation surface.\n* No ownership manifest binds a directory/tab to exact repository identity, raw branch ref, Git worktree identity, or lifecycle generation before reuse, registration, move, attach, or cleanup.\n\n## Impact\n\n* Creating or attaching one valid branch can fail against, reuse, or move into another branch's checkout path.\n* Tab/database lookups can display or mutate the wrong worktree while showing a colliding branch label.\n* Same-basename repositories can contend for or operate on the same external worktree directory.\n* Rename can leave Git metadata and filesystem/DB/UI identity split after the first mutation succeeds and the colliding move fails.\n* Distinct multi-repo features can silently become one branch federation, causing commits, merges, hooks, queue operations, and cleanup to affect the wrong project work.\n* Pipeline, issue dispatch, drawer, sandbox, share, hibernation, and merge-queue layers cannot safely build authority on an ambiguous worktree identifier.\n\n## Required remediation\n\n1. Define canonical, versioned repository, Git branch/ref, worktree, and feature identities. Preserve raw platform/Git bytes where supported; keep display labels separate.\n2. Allocate each checkout under a bounded collision-resistant repository/worktree ID plus generation, with a manifest binding exact repo identity, Git common-dir/worktree admin identity, branch ref, and owner.\n3. Key tabs and database rows by opaque worktree ID/generation. Render repo/branch text as labels only; never parse or route authority from a slugged tab string.\n4. Validate/reconcile the manifest and Git worktree metadata before attach, move, reuse, mutation, or cleanup. Refuse ambiguous/pre-existing paths.\n5. Make rename a journaled transaction across branch ref, worktree move, database/tab identity, sandbox/provider identity, and dependent state. On failure, roll back or persist a recoverable exact split state; never merely warn after partial mutation.\n6. Give project features an explicit canonical ID and persisted membership. A human feature alias may propose a branch label but cannot define federation identity by lossy equality.\n7. Serialize/claim concurrent creates and renames by canonical target identity. Revalidate immediately before destructive cleanup or promotion.\n8. Migrate legacy paths/tabs/features by enumerating Git worktree metadata and all claimants; quarantine ambiguous aliases and require explicit user mapping.\n\n## Acceptance criteria\n\n* Tests cover slash/dash/underscore/case aliases, Unicode/non-UTF-8 refs where Git/platform permit them, empty/overlong slugs, same-basename repos, symlink/relative aliases, and feature-name collisions.\n* Distinct valid branches/repositories never share a checkout directory, tab key, DB identity, sandbox/provider identity, or cleanup target.\n* All CLI, wizard, daemon, tracker, autopilot, project, merge, hydration, and rename surfaces use the same typed canonical identity.\n* Concurrent create/rename, destination pre-creation, path swap, crash at every mutation boundary, DB failure, and `git worktree move` failure leave a recoverable old or new generation with no silent split identity.\n* Project feature membership remains distinct even when proposed display/branch labels normalize alike.\n* Legacy ambiguity is reported without opening, deleting, moving, or assigning the contested worktree.\n* Downstream consumers can bind messages/operations to an immutable worktree generation and reject stale identity.\n\n## Dependency mapping\n\nThis blocks <issue id=\"39c549cb-6dbb-460d-8b88-f9388f0c5302\" href=\"https://linear.app/blakeashley/issue/THE-262/canonicalize-pipeline-issue-and-worktree-identity-before-admission\">THE-262</issue> because pipeline issue/worktree admission cannot be canonical while the underlying worktree path and tab key alias distinct Git identities. It also blocks <issue id=\"eb394a24-e763-4f15-8257-2e3d9698cbda\" href=\"https://linear.app/blakeashley/issue/THE-513/bind-sandbox-container-names-and-reuse-to-canonical-instance\">THE-513</issue> and <issue id=\"4e9789ee-35ad-46b6-adcb-a080645d20c4\" href=\"https://linear.app/blakeashley/issue/THE-514/key-drawer-state-and-pooled-panes-by-exact-worktree-identity\">THE-514</issue>, whose sandbox and drawer identities should consume this canonical worktree generation rather than inventing separate path keys. Related to <issue id=\"0073f14d-55b8-44fe-924b-216235f376a4\" href=\"https://linear.app/blakeashley/issue/THE-366/make-workspace-clone-destinations-canonical-collision-resistant-and\">THE-366</issue> (repository clone destinations), <issue id=\"092d6caa-129c-4269-bf58-ba782058be23\" href=\"https://linear.app/blakeashley/issue/THE-230/fence-queued-branchworktree-identity-before-every-fixer-dispatch\">THE-230</issue> (queued worktree fencing), <issue id=\"c82a3535-509f-4669-8e90-f2b372406c0a\" href=\"https://linear.app/blakeashley/issue/THE-237/scope-merged-worktree-sweeps-to-the-owning-repository-and-policy\">THE-237</issue> (repository-scoped sweeps), <issue id=\"51f0f02e-2dbd-4565-a052-4ea47e90a9d6\" href=\"https://linear.app/blakeashley/issue/THE-395/fence-every-queued-source-branch-tip-through-gate-and-final-target-cas\">THE-395</issue>/<issue id=\"76b4577a-8d92-4897-9494-e51c5d332297\" href=\"https://linear.app/blakeashley/issue/THE-397/gate-the-exact-candidate-tree-from-a-clean-declared-workspace\">THE-397</issue> (exact candidate/ref gating), <issue id=\"f90f2f29-bfd0-4ce1-a191-6933f74b32a2\" href=\"https://linear.app/blakeashley/issue/THE-442/make-hibernation-snapshots-collision-resistant-private-and-durably\">THE-442</issue> (hibernation identity), and <issue id=\"7db5d7b2-aff7-4154-819a-211273000933\" href=\"https://linear.app/blakeashley/issue/THE-388/bind-undo-and-redo-marks-to-exact-worktree-authority-and-reflog-events\">THE-388</issue> (undo/reflog identity).\n\n## Additional fail-open repository-slug evidence\n\nThe repository-prefix layer also abandons uniqueness exactly when the identity store is unavailable. `crates/thegn-core/src/repo.rs:78-106` documents `repo_slug` as stable and globally unique, but both `repo_slug` and `repo_slug_with` return the unsuffixed basename slug when opening the DB or calling `slug_for_repo` fails. `crates/thegn-host/src/hydrate.rs:1068-1087` intentionally synthesizes the same basename-only home tab when no DB opens, and `hydrate.rs:1331-1346` falls back to the unsuffixed base for per-workspace read errors. `crates/thegn-host/src/merge_lifecycle.rs:163-181` likewise uses the fallback while registering/file-grouping a worktree. Thus two same-basename repositories that are normally disambiguated as `repo` and `repo-2` collapse back onto one tab/sidebar prefix during DB contention/corruption, and code paths can persist or route work using a temporary ambiguous identity. The remediation must make canonical identity resolution fallible for authority-bearing operations, preserve last-known exact mappings for read-only degraded presentation, and prove DB failure cannot fabricate an unsuffixed alias or mutate/register under it.",
+  "priority": {
+    "value": 1,
+    "name": "Urgent"
+  },
+  "url": "https://linear.app/blakeashley/issue/THE-516/make-worktree-paths-branch-tabs-and-feature-identities-collision-proof",
+  "gitBranchName": "blake/the-516-make-worktree-paths-branch-tabs-and-feature-identities",
+  "createdAt": "2026-09-11T12:47:48.175Z",
+  "updatedAt": "2026-09-11T19:09:01.188Z",
+  "archivedAt": null,
+  "completedAt": null,
+  "startedAt": null,
+  "canceledAt": null,
+  "dueDate": null,
+  "slaStartedAt": null,
+  "slaMediumRiskAt": null,
+  "slaHighRiskAt": null,
+  "slaBreachesAt": null,
+  "status": "Backlog",
+  "statusType": "backlog",
+  "labels": [
+    "Bug"
+  ],
+  "attachments": [],
+  "documents": [],
+  "stateHistory": [
+    {
+      "state": {
+        "id": "9a141276-3d88-41f8-8437-8f170cfff494",
+        "name": "Backlog",
+        "type": "backlog"
+      },
+      "startedAt": "2026-09-11T12:47:48.175Z",
+      "endedAt": null
+    }
+  ],
+  "createdBy": "Blake Ashley",
+  "createdById": "3b7f5427-3d7f-40df-822c-6b4439a509e7",
+  "parentId": "THE-150",
+  "team": "Thegn",
+  "teamId": "6d265c7c-ac1f-40c7-9983-f919d7b5d254",
+  "relations": {
+    "blocks": [
+      {
+        "id": "THE-543",
+        "title": "Bind CI caches and asynchronous results to exact context and run attempts"
+      },
+      {
+        "id": "THE-520",
+        "title": "Bind devcontainer selection, references, and IDs to canonical repository identity"
+      },
+      {
+        "id": "THE-518",
+        "title": "Bind diagnostic logs and hook evidence to exact worktree/run identities"
+      },
+      {
+        "id": "THE-514",
+        "title": "Key drawer state and pooled panes by exact worktree identity"
+      },
+      {
+        "id": "THE-262",
+        "title": "Canonicalize pipeline issue and worktree identity before admission"
+      },
+      {
+        "id": "THE-513",
+        "title": "Bind sandbox container names and reuse to canonical instance generations"
+      }
+    ],
+    "blockedBy": [],
+    "relatedTo": [
+      {
+        "id": "THE-388",
+        "title": "Bind undo and redo marks to exact worktree authority and reflog events"
+      },
+      {
+        "id": "THE-397",
+        "title": "Gate the exact candidate tree from a clean declared workspace"
+      },
+      {
+        "id": "THE-237",
+        "title": "Scope merged-worktree sweeps to the owning repository and policy"
+      },
+      {
+        "id": "THE-442",
+        "title": "Make hibernation snapshots collision-resistant, private, and durably transactional"
+      },
+      {
+        "id": "THE-230",
+        "title": "Fence queued branch/worktree identity before every fixer dispatch"
+      },
+      {
+        "id": "THE-366",
+        "title": "Make workspace clone destinations canonical, collision-resistant, and transactional"
+      },
+      {
+        "id": "THE-395",
+        "title": "Fence every queued source branch tip through gate and final target CAS"
+      },
+      {
+        "id": "THE-557",
+        "title": "Automatically register pre-existing and externally created Git worktrees in the sidebar"
+      },
+      {
+        "id": "THE-528",
+        "title": "Authenticate and transactionally bind route-to-host credential generations"
+      }
+    ],
+    "duplicateOf": null
+  }
+}
