@@ -875,6 +875,38 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_same_refusal_is_reported_once() {
+        let events = Arc::new(StdMutex::new(Vec::new()));
+        let worktree = worktree_path("concurrent-report");
+
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let events = Arc::clone(&events);
+                let worktree = &worktree;
+                scope.spawn(move || {
+                    let subscriber = CapturedEvents(events);
+                    tracing::subscriber::with_default(subscriber, || {
+                        report_relaunch_refusal(
+                            RelaunchRefusal {
+                                agent: "codex".into(),
+                                source: anyhow::Error::new(
+                                    crate::agent::DevcontainerLaunchRefused {
+                                        reason: "trusted provider origin was rejected".into(),
+                                    },
+                                ),
+                            },
+                            worktree.as_str(),
+                        );
+                    });
+                });
+            }
+        });
+
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 1, "concurrent reports must dedupe atomically");
+    }
+
+    #[test]
     fn refusal_detail_is_redacted_bounded_and_control_free() {
         let error = anyhow::anyhow!(
             "provider token=secret\n{} --api-key live-secret",
