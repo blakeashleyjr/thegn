@@ -318,6 +318,7 @@ pub(crate) fn spawn_ci_detail(
     refresh_tx: &UnboundedSender<RefreshKind>,
     waker: &TerminalWaker,
     run: thegn_core::ci::CiRun,
+    generation: Option<crate::hydrate_schedule::ScheduleFence>,
 ) {
     use thegn_core::ci::CiState;
     let wt = active_tab_path(session);
@@ -343,8 +344,13 @@ pub(crate) fn spawn_ci_detail(
                 log_tail: Vec::new(),
                 log_entries: Vec::new(),
             };
-            if tx.send(RefreshKind::CiDetail(Box::new(payload))).is_ok() {
-                let _ = waker.wake();
+            if let Some(result) = crate::hydrate_schedule::scheduled_delivery(
+                generation.as_ref(),
+                RefreshKind::CiDetail(Box::new(payload)),
+            ) {
+                if tx.send(result).is_ok() {
+                    let _ = waker.wake();
+                }
             }
             return;
         }
@@ -394,7 +400,9 @@ pub(crate) fn spawn_ci_detail(
                         && let Some(db) = db.as_ref()
                     {
                         use thegn_core::store::CacheStore;
-                        let _ = db.put_ci_log(&entry);
+                        if crate::hydrate_schedule::generation_is_current(generation.as_ref()) {
+                            let _ = db.put_ci_log(&entry);
+                        }
                     }
                     Some(entry)
                 })
@@ -413,8 +421,13 @@ pub(crate) fn spawn_ci_detail(
             log_tail,
             log_entries,
         };
-        if tx.send(RefreshKind::CiDetail(Box::new(payload))).is_ok() {
-            let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
+        if let Some(result) = crate::hydrate_schedule::scheduled_delivery(
+            generation.as_ref(),
+            RefreshKind::CiDetail(Box::new(payload)),
+        ) {
+            if tx.send(result).is_ok() {
+                let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
+            }
         }
     });
 }
@@ -510,9 +523,30 @@ pub(crate) fn spawn_usage(
     proxy_enabled: bool,
     proxy_budget: thegn_core::config::BudgetConfig,
 ) {
+    spawn_usage_with_generation(
+        refresh_tx,
+        waker,
+        cfg,
+        interactive,
+        proxy_enabled,
+        proxy_budget,
+        None,
+    );
+}
+
+pub(crate) fn spawn_usage_with_generation(
+    refresh_tx: &UnboundedSender<RefreshKind>,
+    waker: &TerminalWaker,
+    cfg: thegn_core::config::UsageConfig,
+    interactive: bool,
+    proxy_enabled: bool,
+    proxy_budget: thegn_core::config::BudgetConfig,
+    generation: Option<crate::hydrate_schedule::ScheduleFence>,
+) {
     let tx = refresh_tx.clone();
     let cfg_for_rollup = cfg.clone();
     let waker_for_work = waker.clone();
+    let generation_for_work = generation.clone();
     let work = move || {
         let waker = waker_for_work;
         let started = std::time::Instant::now();
@@ -547,8 +581,14 @@ pub(crate) fn spawn_usage(
             elapsed_ms = started.elapsed().as_millis() as u64,
             "usage gather"
         );
-        let history = record_usage_history(&cfg, &accounts);
-        if proxy_enabled && proxy_budget.enabled {
+        if !crate::hydrate_schedule::generation_is_current(generation_for_work.as_ref()) {
+            return;
+        }
+        let history = record_usage_history(&cfg, &accounts, generation_for_work.as_ref());
+        if proxy_enabled
+            && proxy_budget.enabled
+            && crate::hydrate_schedule::generation_is_current(generation_for_work.as_ref())
+        {
             notify_proxy_budget_breaches(&proxy_budget);
         }
         // Proxy spend rolls up from the audit tables off-loop, on this same
@@ -559,7 +599,16 @@ pub(crate) fn spawn_usage(
             history,
             proxy_spend,
         };
-        if tx.send(RefreshKind::Usage(Box::new(payload))).is_ok() {
+        let result = RefreshKind::Usage(Box::new(payload));
+        let result = generation_for_work
+            .as_ref()
+            .map_or(result.clone(), |(_, generation)| RefreshKind::Scheduled {
+                generation: *generation,
+                kind: Box::new(result),
+            });
+        if crate::hydrate_schedule::generation_is_current(generation_for_work.as_ref())
+            && tx.send(result).is_ok()
+        {
             let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
     };
@@ -569,7 +618,7 @@ pub(crate) fn spawn_usage(
     // the whole point of the feature — waited on a scan that outlasted the
     // first minute, leaving the badge blank. Nothing the gauge shows depends on
     // it, so it must never be in front of it.
-    spawn_usage_rollup(refresh_tx, waker, cfg_for_rollup);
+    spawn_usage_rollup(refresh_tx, waker, cfg_for_rollup, generation);
 }
 
 /// Refresh the host-wide transcript token rollup, at most once per
@@ -579,6 +628,7 @@ fn spawn_usage_rollup(
     refresh_tx: &UnboundedSender<RefreshKind>,
     waker: &TerminalWaker,
     cfg: thegn_core::config::UsageConfig,
+    generation: Option<crate::hydrate_schedule::ScheduleFence>,
 ) {
     if !cfg.token_rollups || !usage_rollup_due() {
         return;
@@ -601,7 +651,16 @@ fn spawn_usage_rollup(
             rollup: r.rollup,
             skipped: r.skipped,
         };
-        if tx.send(RefreshKind::UsageTokens(Box::new(view))).is_ok() {
+        let result = RefreshKind::UsageTokens(Box::new(view));
+        let result = generation
+            .as_ref()
+            .map_or(result.clone(), |(_, generation)| RefreshKind::Scheduled {
+                generation: *generation,
+                kind: Box::new(result),
+            });
+        if crate::hydrate_schedule::generation_is_current(generation.as_ref())
+            && tx.send(result).is_ok()
+        {
             let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
     });
@@ -640,6 +699,7 @@ fn usage_rollup_due() -> bool {
 fn record_usage_history(
     cfg: &thegn_core::config::UsageConfig,
     accounts: &[thegn_core::usage::AccountUsage],
+    generation: Option<&crate::hydrate_schedule::ScheduleFence>,
 ) -> std::collections::BTreeMap<String, Vec<(i64, f32)>> {
     use thegn_core::store::{UsageSample, UsageStore};
     let mut out = std::collections::BTreeMap::new();
@@ -667,9 +727,13 @@ fn record_usage_history(
         })
         .collect();
     // best-effort: history is a nicety; a write failure must not fail the poll.
-    let _ = db.put_usage_samples(&samples);
+    if crate::hydrate_schedule::generation_is_current(generation) {
+        let _ = db.put_usage_samples(&samples);
+    }
     let since = now.saturating_sub(i64::from(cfg.history_days) * 86_400);
-    let _ = db.prune_usage_samples(since); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+    if crate::hydrate_schedule::generation_is_current(generation) {
+        let _ = db.prune_usage_samples(since); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+    }
     for s in &samples {
         let hist = db
             .usage_history(&s.account_key, &s.window, since)
@@ -841,6 +905,7 @@ pub(crate) fn spawn_pr_view_fetch(
     tx: &UnboundedSender<PrViewData>,
     waker: &TerminalWaker,
     refresh_tx: &UnboundedSender<RefreshKind>,
+    schedule_fence: Option<crate::hydrate_schedule::ScheduleFence>,
 ) {
     let tx = tx.clone();
     let waker = waker.clone();
@@ -916,12 +981,26 @@ pub(crate) fn spawn_pr_view_fetch(
                 .filter(|s| !s.branch.is_empty() && !s.head_oid.is_empty())
             && let Ok(db) = thegn_core::db::Db::open()
         {
-            let _ = db.put_pr_review_cache(&snapshot);
-            if refresh_tx.send(RefreshKind::Model).is_ok() {
-                let _ = waker.wake();
+            if crate::hydrate_schedule::generation_is_current(schedule_fence.as_ref()) {
+                let _ = db.put_pr_review_cache(&snapshot);
+                if let Some(result) = crate::hydrate_schedule::scheduled_delivery(
+                    schedule_fence.as_ref(),
+                    RefreshKind::Model,
+                ) {
+                    if refresh_tx.send(result).is_ok() {
+                        let _ = waker.wake();
+                    }
+                }
             }
         }
-        if tx.send(data).is_ok() {
+        // `data` is the PR view payload on its own channel, not a
+        // `RefreshKind`, so it is fenced by the generation check directly —
+        // `scheduled_delivery` only wraps refresh kinds. A stale scheduled
+        // fetch is dropped here rather than rendered; an untagged (manual or
+        // event-driven) fetch has no fence and always delivers.
+        if crate::hydrate_schedule::generation_is_current(schedule_fence.as_ref())
+            && tx.send(data).is_ok()
+        {
             let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
     });
@@ -962,6 +1041,7 @@ pub(crate) fn open_pr_view(
             tx,
             waker,
             refresh_tx,
+            None,
         );
     }
     Some(v)
@@ -975,6 +1055,7 @@ pub(crate) fn refetch_pr_view(
     tx: &UnboundedSender<PrViewData>,
     waker: &TerminalWaker,
     refresh_tx: &UnboundedSender<RefreshKind>,
+    schedule_fence: Option<crate::hydrate_schedule::ScheduleFence>,
 ) {
     if let Some(v) = view
         && !v.owner.is_empty()
@@ -992,6 +1073,7 @@ pub(crate) fn refetch_pr_view(
             tx,
             waker,
             refresh_tx,
+            schedule_fence,
         );
     }
 }
@@ -1305,7 +1387,14 @@ impl CiActionCtx<'_> {
     /// the "crashed quickly" bug: it printed and exited instantly).
     fn drill_ci_detail(&mut self, run: thegn_core::ci::CiRun) {
         self.model.status = "Fetching CI run detail\u{2026}".into();
-        spawn_ci_detail(self.session, &self.cfg.ci, self.refresh_tx, self.waker, run);
+        spawn_ci_detail(
+            self.session,
+            &self.cfg.ci,
+            self.refresh_tx,
+            self.waker,
+            run,
+            None,
+        );
     }
 
     /// Force a CI run-history refetch (the `g` key): bypasses the `[ci]
