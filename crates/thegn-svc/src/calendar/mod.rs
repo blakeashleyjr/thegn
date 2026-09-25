@@ -7,10 +7,10 @@
 //! **per-account** results so one failing source can never clobber another's
 //! cache.
 //!
-//! Everything here is read-only. The write methods exist so the shape is fixed
-//! before anything depends on it — `EditScope` in particular cannot be
-//! retrofitted later without breaking the plugin wire format — but every
-//! built-in returns `Unsupported`.
+//! Built-in providers are currently read-only. The write methods exist so the
+//! shape is fixed before anything depends on it — `EditScope` in particular
+//! cannot be retrofitted later without breaking the plugin wire format — and
+//! account policy is enforced before an adapter is allowed to handle them.
 
 pub mod caldav;
 pub mod command;
@@ -40,6 +40,8 @@ pub enum CalendarError {
     BodyLimit(&'static str),
     Timeout(&'static str),
     Unsupported(&'static str),
+    /// The account policy refused a mutation before the provider was called.
+    ReadOnly(CalendarMutation),
     Io(String),
     /// The source exceeded its admission budget. Nothing from it is published:
     /// the account keeps its previous cache and cursor.
@@ -65,9 +67,36 @@ impl std::fmt::Display for CalendarError {
             CalendarError::BodyLimit(e) => write!(f, "calendar body limit: {e}"),
             CalendarError::Timeout(e) => write!(f, "calendar timeout: {e}"),
             CalendarError::Unsupported(op) => write!(f, "{op} is not supported by this provider"),
+            CalendarError::ReadOnly(op) => {
+                write!(f, "calendar account is read-only; {op} is not permitted")
+            }
             CalendarError::Io(e) => write!(f, "{e}"),
             CalendarError::Admission(e) => write!(f, "{e}"),
         }
+    }
+}
+
+/// The upstream mutation guarded by an account's `read_only` policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CalendarMutation {
+    Create,
+    Update,
+    Delete,
+}
+
+impl CalendarMutation {
+    fn as_str(self) -> &'static str {
+        match self {
+            CalendarMutation::Create => "create",
+            CalendarMutation::Update => "update",
+            CalendarMutation::Delete => "delete",
+        }
+    }
+}
+
+impl std::fmt::Display for CalendarMutation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -326,7 +355,7 @@ pub trait CalendarBackend: Send + Sync {
 
 /// The built-in backend for one configured account, or `None` for a
 /// deactivated (`provider = "none"`) account.
-pub(crate) fn backend_from_account(
+fn raw_backend_from_account(
     a: &CalendarAccount,
     admission: AccountAdmission,
 ) -> Option<Box<dyn CalendarBackend>> {
@@ -336,6 +365,116 @@ pub(crate) fn backend_from_account(
         CalendarProviderKind::CalDav => Some(Box::new(caldav::CalDavBackend::new(a, admission))),
         CalendarProviderKind::Command => Some(Box::new(command::CommandBackend::new(a, admission))),
         CalendarProviderKind::None => None,
+    }
+}
+
+/// Build the account-bound backend for one configured account.
+///
+/// The concrete constructors are deliberately crate-private. Callers that
+/// have an account must come through this factory so the account policy wraps
+/// every provider, including command/plugin adapters, before any mutation can
+/// reach it.
+pub fn backend_from_account(
+    a: &CalendarAccount,
+    admission: AccountAdmission,
+) -> Option<Box<dyn CalendarBackend>> {
+    raw_backend_from_account(a, admission)
+        .map(|inner| Box::new(AccountPolicyBackend::new(a, inner)) as Box<dyn CalendarBackend>)
+}
+
+/// The single account-policy boundary for provider operations.
+struct AccountPolicyBackend {
+    account: String,
+    read_only: bool,
+    inner: Box<dyn CalendarBackend>,
+}
+
+impl AccountPolicyBackend {
+    fn new(account: &CalendarAccount, inner: Box<dyn CalendarBackend>) -> Self {
+        AccountPolicyBackend {
+            account: account.name.clone(),
+            read_only: account.read_only,
+            inner,
+        }
+    }
+
+    fn denied(&self, mutation: CalendarMutation) -> CalendarError {
+        tracing::warn!(
+            target: "thegn::calendar",
+            account = %self.account,
+            provider = self.inner.provider_id(),
+            operation = mutation.as_str(),
+            "calendar mutation refused by account read-only policy"
+        );
+        CalendarError::ReadOnly(mutation)
+    }
+
+    fn caps_for_policy(&self) -> CalendarCaps {
+        let mut caps = self.inner.caps();
+        if self.read_only {
+            caps.create = false;
+            caps.update = false;
+            caps.delete = false;
+        }
+        caps
+    }
+}
+
+impl CalendarBackend for AccountPolicyBackend {
+    fn provider_id(&self) -> &'static str {
+        self.inner.provider_id()
+    }
+
+    fn caps(&self) -> CalendarCaps {
+        self.caps_for_policy()
+    }
+
+    fn list_events<'a>(
+        &'a self,
+        from: NaiveDate,
+        to: NaiveDate,
+        sync_token: &'a str,
+    ) -> BoxFuture<'a, Result<EventPage, CalendarError>> {
+        self.inner.list_events(from, to, sync_token)
+    }
+
+    fn create_event<'a>(
+        &'a self,
+        event: &'a CalEvent,
+    ) -> BoxFuture<'a, Result<CalEvent, CalendarError>> {
+        if self.read_only {
+            return Box::pin(std::future::ready(Err(
+                self.denied(CalendarMutation::Create)
+            )));
+        }
+        self.inner.create_event(event)
+    }
+
+    fn update_event<'a>(
+        &'a self,
+        id: &'a str,
+        event: &'a CalEvent,
+        scope: EditScope,
+    ) -> BoxFuture<'a, Result<CalEvent, CalendarError>> {
+        if self.read_only {
+            return Box::pin(std::future::ready(Err(
+                self.denied(CalendarMutation::Update)
+            )));
+        }
+        self.inner.update_event(id, event, scope)
+    }
+
+    fn delete_event<'a>(
+        &'a self,
+        id: &'a str,
+        scope: EditScope,
+    ) -> BoxFuture<'a, Result<(), CalendarError>> {
+        if self.read_only {
+            return Box::pin(std::future::ready(Err(
+                self.denied(CalendarMutation::Delete)
+            )));
+        }
+        self.inner.delete_event(id, scope)
     }
 }
 
@@ -383,6 +522,75 @@ impl CalendarRouter {
 
     pub fn is_configured(&self) -> bool {
         !self.accounts.is_empty()
+    }
+
+    // The account-scoped mutation dispatch below. Nothing in production calls
+    // these yet — no built-in backend can write, which is exactly the situation
+    // THE-463 is about — so they are dead outside the policy tests that prove
+    // the boundary denies correctly.
+    //
+    // They are deliberately NOT `pub`: exporting a calendar mutation API that
+    // can only ever deny would recreate the untruthful-surface defect this
+    // change removes. They are equally deliberately not deleted — the boundary
+    // has to exist before a writable backend arrives, or that backend lands
+    // with no single place to enforce account policy, and `EditScope` cannot be
+    // retrofitted later without breaking the plugin wire format.
+    //
+    // Drop this allow when the first real mutation route calls through here.
+    #[allow(dead_code)]
+    /// Capabilities advertised by one account-bound provider.
+    pub(crate) fn caps(&self, account: &str) -> Result<CalendarCaps, CalendarError> {
+        self.account(account).map(|backend| backend.inner.caps())
+    }
+
+    /// Create an event through the account-bound policy boundary.
+    // See the dead-code note on `caps` above.
+    #[allow(dead_code)]
+    pub(crate) async fn create_event(
+        &self,
+        account: &str,
+        event: &CalEvent,
+    ) -> Result<CalEvent, CalendarError> {
+        self.account(account)?.inner.create_event(event).await
+    }
+
+    /// Update an event through the account-bound policy boundary.
+    // See the dead-code note on `caps` above.
+    #[allow(dead_code)]
+    pub(crate) async fn update_event(
+        &self,
+        account: &str,
+        id: &str,
+        event: &CalEvent,
+        scope: EditScope,
+    ) -> Result<CalEvent, CalendarError> {
+        self.account(account)?
+            .inner
+            .update_event(id, event, scope)
+            .await
+    }
+
+    /// Delete an event through the account-bound policy boundary.
+    // See the dead-code note on `caps` above.
+    #[allow(dead_code)]
+    pub(crate) async fn delete_event(
+        &self,
+        account: &str,
+        id: &str,
+        scope: EditScope,
+    ) -> Result<(), CalendarError> {
+        self.account(account)?.inner.delete_event(id, scope).await
+    }
+
+    fn account(&self, name: &str) -> Result<&AccountBackend, CalendarError> {
+        let mut matches = self.accounts.iter().filter(|account| account.name == name);
+        let account = matches.next().ok_or(CalendarError::NotConfigured)?;
+        if matches.next().is_some() {
+            // Never guess when malformed configuration names two providers
+            // alike; a mutation must not fall through to the wrong account.
+            return Err(CalendarError::NotConfigured);
+        }
+        Ok(account)
     }
 
     /// Fetch every account, handing each result to `sink` as soon as it is

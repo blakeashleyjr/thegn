@@ -30,6 +30,7 @@ pub mod model;
 use crate::remote::GitLoc;
 use crate::seam::{ErrorClass, Probe, SeamError};
 use model::*;
+use std::borrow::Cow;
 
 // ---------------------------------------------------------------------------
 // Error
@@ -44,7 +45,7 @@ pub enum ForgeError {
     NotInstalled,
     /// Nothing configured for this layer (no token, remote location for a
     /// local-only client, circuit open). A ladder falls through.
-    NotConfigured(&'static str),
+    NotConfigured(Cow<'static, str>),
     NotAuthenticated,
     /// No pull request (or target object) — a 404.
     NoPr,
@@ -635,7 +636,7 @@ mod tests {
         use crate::seam::SeamError;
         assert_eq!(ForgeError::NotInstalled.class(), ErrorClass::NotInstalled);
         assert_eq!(
-            ForgeError::NotConfigured("x").class(),
+            ForgeError::NotConfigured("x".into()).class(),
             ErrorClass::NotConfigured
         );
         assert_eq!(ForgeError::NotAuthenticated.class(), ErrorClass::Auth);
@@ -659,7 +660,7 @@ mod tests {
                 .contains("merge")
         );
         assert!(
-            ForgeError::NotConfigured("token")
+            ForgeError::NotConfigured("token".into())
                 .describe()
                 .contains("token")
         );

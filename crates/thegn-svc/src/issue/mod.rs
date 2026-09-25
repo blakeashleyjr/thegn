@@ -274,7 +274,7 @@ pub fn validate_issue_identity(issue: &Issue) -> Result<(), IssueError> {
 /// Methods return [`BoxFuture`]s (not native `async fn`) so the trait stays
 /// object-safe — the router dispatches over `Box<dyn IssueBackend>`.
 pub trait IssueBackend: Send + Sync {
-    fn provider_id(&self) -> &'static str;
+    fn provider_id(&self) -> &str;
     fn caps(&self) -> IssueCaps;
 
     fn list_issues<'a>(
@@ -487,7 +487,7 @@ impl IssueRouter {
 
     /// The provider id of the first configured backend (`"none"` when empty).
     /// Retained for callers that only need a representative id.
-    pub fn provider_id(&self) -> &'static str {
+    pub fn provider_id(&self) -> &str {
         self.inner
             .first()
             .map(|b| b.inner.provider_id())
@@ -496,7 +496,7 @@ impl IssueRouter {
 
     /// Every configured provider id, in config order (may repeat when several
     /// accounts share a provider).
-    pub fn provider_ids(&self) -> Vec<&'static str> {
+    pub fn provider_ids(&self) -> Vec<&str> {
         self.inner.iter().map(|b| b.inner.provider_id()).collect()
     }
 
@@ -548,7 +548,7 @@ impl IssueRouter {
         }
         // Order-preserving dedupe: several accounts may share a provider, and
         // naming it three times helps nobody.
-        let mut ids: Vec<&'static str> = Vec::new();
+        let mut ids: Vec<&str> = Vec::new();
         for p in self.provider_ids() {
             if !ids.contains(&p) {
                 ids.push(p);
@@ -602,7 +602,7 @@ impl IssueRouter {
     pub async fn list_per_provider(
         &self,
         filter: &IssueFilter,
-    ) -> Vec<(String, &'static str, Result<Vec<Issue>, IssueError>)> {
+    ) -> Vec<(String, &str, Result<Vec<Issue>, IssueError>)> {
         let mut out = Vec::with_capacity(self.inner.len());
         for b in &self.inner {
             let result = b.inner.list_issues(filter).await.and_then(|issues| {
@@ -851,7 +851,7 @@ mod spec {
     }
 
     impl IssueBackend for CountingBackend {
-        fn provider_id(&self) -> &'static str {
+        fn provider_id(&self) -> &str {
             "linear"
         }
 
@@ -899,12 +899,12 @@ mod spec {
     }
 
     struct PluginMarker {
-        id: &'static str,
+        id: String,
     }
 
     impl IssueBackend for PluginMarker {
-        fn provider_id(&self) -> &'static str {
-            self.id
+        fn provider_id(&self) -> &str {
+            &self.id
         }
         fn caps(&self) -> IssueCaps {
             IssueCaps::default()
@@ -944,14 +944,19 @@ mod spec {
     fn plugin_namespace_routes_by_complete_registered_prefix() {
         let mut router = IssueRouter::from_config(&IssuesConfig::default());
         router
-            .push_backend("demo".into(), Box::new(PluginMarker { id: "plugin:demo" }))
+            .push_backend(
+                "demo".into(),
+                Box::new(PluginMarker {
+                    id: "plugin:demo".into(),
+                }),
+            )
             .unwrap();
         assert!(
             router
                 .push_backend(
                     "nested".into(),
                     Box::new(PluginMarker {
-                        id: "plugin:demo:extra",
+                        id: "plugin:demo:extra".into(),
                     }),
                 )
                 .is_err()

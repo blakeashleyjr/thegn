@@ -2131,7 +2131,11 @@ fn hosts_report(cfg: &Config) {
         outln!("  {name:<16} {:<6} {state}", hc.reach.as_str());
     }
     // Local delivery abilities: what the default registry-less transfer can use.
-    let has = |bin: &str| which_ok(bin);
+    // `util::have` retains the existing core probe semantics: unlike shell
+    // `command -v`, `which_path` does not check executable bits and returns no
+    // result when PATH is unset. These are fixed bare-name diagnostics, so
+    // removing the shell process is safe within that established contract.
+    let has = |bin: &str| thegn_core::util::have(bin);
     outln!(
         "  local tools:  podman {} · skopeo {} · rsync {} (registry-less transfer wants podman or skopeo)",
         yn(has("podman")),
@@ -2361,17 +2365,6 @@ fn provider_cache_json(cfg: &Config) -> serde_json::Value {
         );
     }
     serde_json::Value::Object(map)
-}
-
-/// Cheap PATH probe (doctor is a diagnostic CLI; subprocess is fine here).
-// off-loop: doctor is a synchronous CLI verb
-#[expect(clippy::disallowed_methods)]
-fn which_ok(bin: &str) -> bool {
-    std::process::Command::new("sh")
-        .args(["-c", &format!("command -v {bin}")])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
 }
 
 /// The output of `<bin> <args…>` trimmed to one line, or `None` if the binary is

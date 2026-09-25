@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use thegn_core::calendar::AdmissionBudget;
 use thegn_core::config_calendar::{CalendarAccount, CalendarProviderKind};
-use thegn_svc::calendar::{AccountAdmission, CalendarBackend, CalendarError, command};
+use thegn_svc::calendar::{AccountAdmission, CalendarError, backend_from_account};
 use thegn_svc::plugin::proc;
 
 struct Counting;
@@ -79,7 +79,7 @@ fn a_one_mib_events_line_is_walked_not_materialized() {
            printf '{{"a":1}}]}}}}\n'"#,
         n = ELEMENTS - 1
     );
-    let backend = command::CommandBackend::new(
+    let backend = backend_from_account(
         &CalendarAccount {
             name: "plug".into(),
             provider: CalendarProviderKind::Command,
@@ -87,7 +87,8 @@ fn a_one_mib_events_line_is_walked_not_materialized() {
             ..Default::default()
         },
         AccountAdmission::isolated(AdmissionBudget::default()),
-    );
+    )
+    .expect("command account builds a backend");
     let from = chrono::NaiveDate::from_ymd_opt(2026, 8, 1).unwrap();
     let to = chrono::NaiveDate::from_ymd_opt(2026, 8, 31).unwrap();
     let rt = tokio::runtime::Builder::new_current_thread()

@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-use crate::calendar::{ResolvedClock, resolve_zone};
+use crate::calendar::{ClockFormat, ResolvedClock, resolve_zone};
 use crate::config::{config_enum, config_warn};
 
 /// The floor on any calendar refresh interval, in seconds.
@@ -34,7 +34,10 @@ pub struct CalendarConfig {
     /// IANA zone to treat as "home" for day boundaries and clock deltas.
     /// Empty means the system's local zone.
     pub home_zone: String,
-    /// Show the ISO week-number gutter down the left of the grid.
+    /// Show the configured-start week-number gutter down the left of the grid.
+    /// Week 1 is the configured-start week containing January 4; Monday-first
+    /// is ISO-8601, while Sunday- and Saturday-first use their row boundary.
+    /// `auto` uses the locale-resolved `week_start` boundary.
     pub show_week_numbers: bool,
     /// Always render six week-rows, padding short months.
     ///
@@ -144,7 +147,7 @@ impl CalendarConfig {
     /// typo costs one clock row, the same warn-and-skip contract unknown bar
     /// widget ids get. `thegn config validate` reports it properly, with a
     /// did-you-mean.
-    pub fn active_clocks(&self) -> Vec<ResolvedClock> {
+    pub fn active_clocks(&self, twelve_hour: bool) -> Vec<ResolvedClock> {
         self.clocks
             .iter()
             .filter(|c| c.enabled)
@@ -152,7 +155,8 @@ impl CalendarConfig {
                 Some(zone) => Some(ResolvedClock {
                     label: c.label.clone(),
                     zone,
-                    format: c.format.clone(),
+                    format: ClockFormat::custom_or_inherited(&c.format, twelve_hour),
+                    show_date: c.show_date,
                     is_home: false,
                 }),
                 None => {
@@ -236,11 +240,14 @@ pub struct WorldClock {
     pub label: String,
     /// IANA zone name, e.g. `"Asia/Tokyo"`. Required.
     pub zone: String,
-    /// strftime override for this row; empty inherits `[calendar] time_format`.
+    /// Minute-safe strftime override for this row; empty inherits the resolved
+    /// `[calendar] time_format`. Seconds-bearing formats are rejected by
+    /// validation and normalized to empty during tolerant loading.
     pub format: String,
     /// Show this clock? Disabled rows stay in config but are skipped.
     pub enabled: bool,
-    /// Always show the date, not just the ±1d marker when it differs from home.
+    /// Always show the local date as `YYYY-MM-DD`, not the weekday and `±1d`
+    /// marker used when this is false.
     pub show_date: bool,
 }
 
@@ -277,8 +284,12 @@ pub struct CalendarAccount {
     /// Semantic hue for this source's events (`"teal"`, `"amber"`, …). Empty
     /// picks one by position. Never an RGB value — the theme resolves it.
     pub color: String,
-    /// Refuse writes to this source. True by default; this pass has no writing
-    /// backend at all, so it is currently belt-and-braces.
+    /// Refuse upstream writes to this source. True by default, and **enforced**:
+    /// the account-policy boundary clears every write capability and turns any
+    /// create/update/delete into a typed `ReadOnly` denial before the provider
+    /// or plugin adapter is reached. This is independent of whether a backend
+    /// can write at all — a provider advertising write support does not
+    /// out-vote it. Reads and cache refresh are unaffected.
     pub read_only: bool,
     /// Seconds between syncs; `0` inherits `[calendar] refresh_interval_secs`.
     /// Always floored at [`MIN_REFRESH_SECS`].
@@ -496,10 +507,14 @@ pub fn validate_calendar(cfg: &CalendarConfig) -> Vec<String> {
                 did_you_mean(&c.zone)
             ));
         }
-        if !c.format.is_empty()
-            && let Err(e) = crate::config::validate_strftime(&c.format)
-        {
-            out.push(format!("calendar.clocks[{i}].format: {e}"));
+        if !c.format.is_empty() {
+            if let Err(e) = crate::config::validate_strftime(&c.format) {
+                out.push(format!("calendar.clocks[{i}].format: {e}"));
+            } else if let Some(directive) = crate::config::strftime_seconds_directive(&c.format) {
+                out.push(format!(
+                    "calendar.clocks[{i}].format: {directive} renders seconds, which is not supported at the configured cadence"
+                ));
+            }
         }
     }
     let mut seen: Vec<&str> = Vec::new();

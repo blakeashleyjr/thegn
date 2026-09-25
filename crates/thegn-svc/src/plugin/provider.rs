@@ -192,19 +192,19 @@ pub struct PluginIssueBackend {
     bridge: Arc<ProviderBridge>,
     caps: IssueCaps,
     /// `"plugin:<id>"` — the `Issue.provider` slug and probe id.
-    provider_id: &'static str,
+    provider_id: Arc<str>,
 }
 
 impl PluginIssueBackend {
-    /// `provider_id` is leaked once per plugin (a handful per process): the
-    /// seam wants `&'static str` ids and plugins load once per config life.
+    /// The adapter owns its immutable provider identity so router rebuilds can
+    /// release an old generation when the adapter is dropped.
     pub fn new(
         bridge: Arc<ProviderBridge>,
         plugin_id: &str,
         caps: IssueCaps,
     ) -> Result<Self, IssueError> {
         crate::issue::identity::plugin_namespace(plugin_id).map_err(IssueError::Parse)?;
-        let provider_id: &'static str = Box::leak(format!("plugin:{plugin_id}").into_boxed_str());
+        let provider_id: Arc<str> = Arc::from(format!("plugin:{plugin_id}"));
         Ok(Self {
             bridge,
             caps,
@@ -228,7 +228,7 @@ impl PluginIssueBackend {
     }
 
     fn checked_input<'a>(&self, id: &'a str) -> Result<&'a str, IssueError> {
-        let prefix = format!("{}:", self.provider_id);
+        let prefix = format!("{}:", self.provider_id.as_ref());
         let key = id.strip_prefix(&prefix).ok_or_else(|| {
             IssueError::Parse("plugin issue id does not match the exact plugin namespace".into())
         })?;
@@ -238,7 +238,7 @@ impl PluginIssueBackend {
     fn validate_issue(&self, issue: Issue) -> Result<Issue, IssueError> {
         let key = self.checked_input(&issue.id)?;
         crate::issue::identity::plugin_key(key).map_err(IssueError::Parse)?;
-        if issue.provider != self.provider_id {
+        if issue.provider != self.provider_id.as_ref() {
             return Err(IssueError::Parse(
                 "plugin issue provider does not match its bridge".into(),
             ));
@@ -254,8 +254,8 @@ impl PluginIssueBackend {
 }
 
 impl IssueBackend for PluginIssueBackend {
-    fn provider_id(&self) -> &'static str {
-        self.provider_id
+    fn provider_id(&self) -> &str {
+        self.provider_id.as_ref()
     }
 
     fn caps(&self) -> IssueCaps {
@@ -377,9 +377,11 @@ impl IssueBackend for PluginIssueBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::issue::{IssueBackend, IssueRouter};
     use crate::plugin::session::tests::FixtureSupervisor;
-    use crate::plugin::session::{ResidentSession, SessionEvent};
+    use crate::plugin::session::{ResidentSession, SessionEvent, SessionWriter};
     use std::collections::BTreeMap;
+    use thegn_core::config::IssuesConfig;
 
     fn sh(script: &str) -> Vec<String> {
         vec!["sh".into(), "-c".into(), script.into()]
@@ -514,6 +516,95 @@ done
             ..Default::default()
         };
         assert!(crate::issue::validate_issue_identity(&malformed_namespace).is_err());
+    }
+
+    #[test]
+    fn adapter_identity_churn_is_owned_and_router_replacements_route_by_generation() {
+        let bridge = ProviderBridge::new(
+            SessionWriter(super::super::session::admission::Shared::new()),
+            Duration::from_secs(1),
+        );
+        let caps = IssueCaps::default();
+
+        // Router rebuilds happen during hydration and plugin reloads. Keep the
+        // loop large enough to exercise thousands of generations while using
+        // Arc's count as a deterministic release check instead of a flaky RSS
+        // threshold.
+        for generation in 0..4_096 {
+            let plugin_id = format!("generation-{generation}");
+            let expected = format!("plugin:{plugin_id}");
+            let backend = PluginIssueBackend::new(bridge.clone(), &plugin_id, caps).unwrap();
+            let identity = backend.provider_id.clone();
+            assert_eq!(Arc::strong_count(&identity), 2);
+            assert_eq!(backend.provider_id(), expected);
+            assert!(
+                backend
+                    .checked_input(&format!("{expected}:issue-1"))
+                    .is_ok()
+            );
+
+            let mut router = IssueRouter::from_config(&IssuesConfig::default());
+            router
+                .push_backend("reload-generation".into(), Box::new(backend))
+                .unwrap();
+            assert_eq!(router.provider_id(), expected);
+            assert_eq!(router.provider_ids(), vec![expected.as_str()]);
+            drop(router);
+
+            // The router was the last adapter owner; the only remaining Arc
+            // is this test observer, so the generation's allocation is now
+            // reclaimable before the next replacement is built.
+            assert_eq!(Arc::strong_count(&identity), 1);
+        }
+    }
+
+    #[test]
+    fn router_replacement_keeps_dynamic_identity_on_async_route() {
+        let (_fixture, _session, bridge) = live_bridge();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+
+        let mut first = IssueRouter::from_config(&IssuesConfig::default());
+        first
+            .push_backend(
+                "first".into(),
+                Box::new(
+                    PluginIssueBackend::new(
+                        bridge.clone(),
+                        "generation-first",
+                        IssueCaps::default(),
+                    )
+                    .unwrap(),
+                ),
+            )
+            .unwrap();
+        let first_error = rt
+            .block_on(first.get_issue("plugin:generation-first:issue-1"))
+            .unwrap_err();
+        assert!(matches!(
+            first_error,
+            IssueError::Api(message) if message.contains("bad get_issue reply")
+        ));
+        drop(first);
+
+        let mut replacement = IssueRouter::from_config(&IssuesConfig::default());
+        replacement
+            .push_backend(
+                "replacement".into(),
+                Box::new(
+                    PluginIssueBackend::new(bridge, "generation-replacement", IssueCaps::default())
+                        .unwrap(),
+                ),
+            )
+            .unwrap();
+        let replacement_error = rt
+            .block_on(replacement.get_issue("plugin:generation-replacement:issue-1"))
+            .unwrap_err();
+        assert!(matches!(
+            replacement_error,
+            IssueError::Api(message) if message.contains("bad get_issue reply")
+        ));
     }
 
     #[test]

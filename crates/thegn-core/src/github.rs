@@ -189,20 +189,20 @@ pub fn pr_list(loc: &GitLoc, limit: usize) -> Result<Vec<PrHeader>, GhError> {
         "--limit".to_string(),
         limit,
     ];
-    let scope =
-        scope_for_identity(&origin).ok_or(GhError::NotConfigured("origin repository scope"))?;
+    let scope = scope_for_identity(&origin)
+        .ok_or(GhError::NotConfigured("origin repository scope".into()))?;
     args.extend(["--repo".to_string(), scope]);
     let argv: Vec<&str> = args.iter().map(String::as_str).collect();
     let json = gh_out(loc, &argv)?;
     let rows: Vec<PrHeader> = serde_json::from_str(&json)
-        .map_err(|_| GhError::NotConfigured("malformed gh PR list response"))?;
+        .map_err(|_| GhError::NotConfigured("malformed gh PR list response".into()))?;
     if rows.iter().any(|row| {
         row.number == 0
             || row.head_ref.is_empty()
             || repo_identity_from_pr_url(&row.url).is_none_or(|identity| !identity.matches(&origin))
     }) {
         return Err(GhError::NotConfigured(
-            "PR list response identity is malformed",
+            "PR list response identity is malformed".into(),
         ));
     }
     Ok(rows)
@@ -284,15 +284,15 @@ fn scope_for_identity(identity: &ForgeRepoIdentity) -> Option<String> {
 
 fn gh_repo_scope_origin(loc: &GitLoc) -> Result<String, GhError> {
     let identity = origin_identity(loc)?;
-    scope_for_identity(&identity).ok_or(GhError::NotConfigured("origin repository scope"))
+    scope_for_identity(&identity).ok_or(GhError::NotConfigured("origin repository scope".into()))
 }
 
 fn origin_identity(loc: &GitLoc) -> Result<ForgeRepoIdentity, GhError> {
     repo_identity_from_remote_url(
         &loc.git_out(&["remote", "get-url", "origin"])
-            .ok_or(GhError::NotConfigured("origin repository"))?,
+            .ok_or(GhError::NotConfigured("origin repository".into()))?,
     )
-    .ok_or(GhError::NotConfigured("origin repository identity"))
+    .ok_or(GhError::NotConfigured("origin repository identity".into()))
 }
 
 /// Resolve a branch through `gh pr list --head`, then use its number for all
@@ -300,8 +300,9 @@ fn origin_identity(loc: &GitLoc) -> Result<ForgeRepoIdentity, GhError> {
 /// positional `gh pr view <selector>` grammar and scopes the lookup to the
 /// origin repository.
 fn scope_for_checkout(checkout: &ForgeCheckoutScope) -> Result<String, GhError> {
-    scope_for_identity(&checkout.base)
-        .ok_or(GhError::NotConfigured("repository scope is not owner/repo"))
+    scope_for_identity(&checkout.base).ok_or(GhError::NotConfigured(
+        "repository scope is not owner/repo".into(),
+    ))
 }
 
 fn branch_pr_number(loc: &GitLoc, checkout: &ForgeCheckoutScope) -> Result<u64, GhError> {
@@ -341,10 +342,12 @@ fn branch_pr_number(loc: &GitLoc, checkout: &ForgeCheckoutScope) -> Result<u64, 
             .get("number")
             .and_then(|number| number.as_u64())
             .filter(|number| *number > 0)
-            .ok_or(GhError::NotConfigured("matched PR omitted its number")),
+            .ok_or(GhError::NotConfigured(
+                "matched PR omitted its number".into(),
+            )),
         None if complete_window => Err(GhError::NoPr),
         None => Err(GhError::NotConfigured(
-            "PR response window did not prove branch absence",
+            "PR response window did not prove branch absence".into(),
         )),
     }
 }

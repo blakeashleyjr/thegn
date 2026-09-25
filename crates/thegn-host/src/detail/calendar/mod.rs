@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Datelike, Local, NaiveDate};
 use chrono_tz::Tz;
-use thegn_core::calendar::{CalCursor, CalEvent, ResolvedClock};
+use thegn_core::calendar::{CalCursor, CalEvent, ClockFormat, ResolvedClock};
 
 use crate::calendar_docs::{CalUiCfg, CalendarDocs, CalendarViewError, WxUiCfg};
 use crate::chrome::FrameModel;
@@ -158,7 +158,7 @@ pub(super) fn open(
         // `CalendarDocs::from_config`, so "there is always at least one clock"
         // holds however the docs were built — a default-constructed
         // `CalendarDocs` would otherwise render no clock block at all.
-        clocks: with_home_clock(&docs.clocks, docs.home),
+        clocks: with_home_clock(&docs.clocks, docs.home, docs.ui.twelve_hour),
         now,
         home: docs.home,
         ui: docs.ui.clone(),
@@ -222,14 +222,15 @@ fn preferred_cols(docs: &CalendarDocs, weather_cols: usize) -> usize {
 }
 
 /// The configured clocks, guaranteed to lead with the user's own zone.
-fn with_home_clock(clocks: &[ResolvedClock], home: Tz) -> Vec<ResolvedClock> {
+fn with_home_clock(clocks: &[ResolvedClock], home: Tz, twelve_hour: bool) -> Vec<ResolvedClock> {
     if clocks.iter().any(|c| c.is_home) {
         return clocks.to_vec();
     }
     let mut out = vec![ResolvedClock {
         label: "local".into(),
         zone: home,
-        format: String::new(),
+        format: ClockFormat::inherited(twelve_hour),
+        show_date: false,
         is_home: true,
     }];
     out.extend(clocks.iter().cloned());
