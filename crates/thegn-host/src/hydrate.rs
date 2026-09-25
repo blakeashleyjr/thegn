@@ -399,11 +399,11 @@ const STARTUP_MEASURE_SLOT: u64 = 4;
 /// Floor (seconds) under the derived disk-pump cadence. `[disk]
 /// scan_interval_secs` drives the pump at a quarter of its value; this keeps a
 /// tiny configured TTL from turning the scanner into a spin loop.
-const DISK_PUMP_FLOOR_SECS: u64 = 15;
+pub(crate) const DISK_PUMP_FLOOR_SECS: u64 = 15;
 
 /// Floor (seconds) under the derived LOC-pump cadence. Higher than the disk
 /// floor because a tokei walk costs more than a `du`.
-const LOC_PUMP_FLOOR_SECS: u64 = 60;
+pub(crate) const LOC_PUMP_FLOOR_SECS: u64 = 60;
 
 /// Ticker slot of the one-shot first usage poll — 4s in. Same reasoning as
 /// [`STARTUP_FETCH_SLOT`]: the statusbar badge should fill promptly rather than
@@ -3499,6 +3499,9 @@ pub(crate) fn spawn_pr_cache_refresh_with_generation(
         }
         // Feed the app-wide connectivity holder (this CLI path is the 20s PR
         // backstop + the offline recovery probe).
+        if !crate::hydrate_schedule::generation_is_current(generation.as_ref()) {
+            return;
+        }
         crate::connectivity_gate::report_pr_panel(&panel.state);
         let Ok(json) = serde_json::to_string(&panel) else {
             return;

@@ -135,6 +135,9 @@ fn poll(
     };
     match rt.block_on(provider.fetch()) {
         Ok(snap) => {
+            if !crate::hydrate_schedule::generation_is_current(generation.as_ref()) {
+                return;
+            }
             thegn_core::connectivity::report_success();
             if let Some(db) = db.as_ref()
                 && crate::hydrate_schedule::generation_is_current(generation.as_ref())

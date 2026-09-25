@@ -37,7 +37,29 @@ impl RefreshGeneration {
 }
 
 pub(crate) fn generation_is_current(generation: Option<&ScheduleFence>) -> bool {
+    // This is a check, not a commit barrier: a reload landing between the
+    // check and the write can admit one stale row, which the next refresh
+    // corrects. Keeping the check local to each side effect avoids holding
+    // schedule state across cache writes in every hydration subsystem.
     generation.is_none_or(|(current, expected)| current.load(Ordering::Acquire) == *expected)
+}
+
+/// Admit a scheduled child result only while its parent schedule is current.
+/// Untagged work passes through unchanged, preserving manual/event-driven
+/// refreshes. The event-loop envelope repeats the generation check on receipt.
+pub(crate) fn scheduled_delivery(
+    generation: Option<&ScheduleFence>,
+    kind: crate::hydrate::RefreshKind,
+) -> Option<crate::hydrate::RefreshKind> {
+    if !generation_is_current(generation) {
+        return None;
+    }
+    Some(generation.map_or(kind.clone(), |(_, generation)| {
+        crate::hydrate::RefreshKind::Scheduled {
+            generation: *generation,
+            kind: Box::new(kind),
+        }
+    }))
 }
 
 /// The configuration that actually changes the shared hydration schedule.
@@ -46,15 +68,15 @@ pub(crate) fn generation_is_current(generation: Option<&ScheduleFence>) -> bool 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ScheduleConfig {
     pub(crate) clock_period_secs: u64,
-    pub(crate) ci_poll_secs: u64,
-    pub(crate) prq_poll_secs: Option<u64>,
-    pub(crate) auto_fetch_secs: Option<u64>,
-    pub(crate) calendar_poll_secs: Option<u64>,
+    pub(crate) ci_every_slots: u64,
+    pub(crate) prq_every_slots: Option<u64>,
+    pub(crate) auto_fetch_every_slots: Option<u64>,
+    pub(crate) calendar_every_slots: Option<u64>,
     pub(crate) calendar_reminders: bool,
-    pub(crate) disk_ttl_secs: u64,
-    pub(crate) loc_ttl_secs: Option<u64>,
-    pub(crate) usage_poll_secs: Option<u64>,
-    pub(crate) weather_poll_secs: Option<u64>,
+    pub(crate) disk_every_slots: u64,
+    pub(crate) loc_every_slots: Option<u64>,
+    pub(crate) usage_every_slots: Option<u64>,
+    pub(crate) weather_every_slots: Option<u64>,
 }
 
 impl ScheduleConfig {
@@ -67,18 +89,48 @@ impl ScheduleConfig {
             } else {
                 60
             },
-            ci_poll_secs: cfg.ci.poll_interval_secs,
-            prq_poll_secs: cfg.pr_queue.enabled.then(|| cfg.pr_queue.poll_secs()),
-            auto_fetch_secs: cfg
+            ci_every_slots: crate::ci_refresh::ci_every_slots(cfg.ci.poll_interval_secs),
+            prq_every_slots: cfg.pr_queue.enabled.then(|| {
+                thegn_core::time_policy::cadence_slots(cfg.pr_queue.poll_secs(), 15, 500).get()
+            }),
+            auto_fetch_every_slots: cfg
                 .git
                 .auto_fetch
-                .then_some(cfg.git.auto_fetch_interval_secs),
-            calendar_poll_secs: cfg.calendar.poll_secs(),
+                .then(|| crate::remote_poll::fetch_every_slots(cfg.git.auto_fetch_interval_secs))
+                .flatten(),
+            calendar_every_slots: cfg.calendar.poll_secs().map(|secs| {
+                thegn_core::time_policy::cadence_slots(
+                    secs,
+                    thegn_core::config_calendar::MIN_REFRESH_SECS,
+                    500,
+                )
+                .get()
+            }),
             calendar_reminders: cfg.calendar.reminders_enabled,
-            disk_ttl_secs: cfg.disk.scan_interval_secs,
-            loc_ttl_secs: cfg.loc.enabled.then_some(cfg.loc.scan_interval_secs),
-            usage_poll_secs: cfg.usage.enabled.then(|| cfg.usage.effective_poll_secs()),
-            weather_poll_secs: cfg.weather.poll_secs(),
+            disk_every_slots: thegn_core::scan_sched::pump_slots(
+                cfg.disk.scan_interval_secs,
+                crate::hydrate::DISK_PUMP_FLOOR_SECS,
+                500,
+            ),
+            loc_every_slots: cfg.loc.enabled.then(|| {
+                thegn_core::scan_sched::pump_slots(
+                    cfg.loc.scan_interval_secs,
+                    crate::hydrate::LOC_PUMP_FLOOR_SECS,
+                    500,
+                )
+            }),
+            usage_every_slots: cfg.usage.enabled.then(|| {
+                thegn_core::time_policy::cadence_slots(cfg.usage.effective_poll_secs(), 60, 500)
+                    .get()
+            }),
+            weather_every_slots: cfg.weather.poll_secs().map(|secs| {
+                thegn_core::time_policy::cadence_slots(
+                    secs,
+                    thegn_core::config_weather::MIN_REFRESH_SECS,
+                    500,
+                )
+                .get()
+            }),
         }
     }
 
@@ -93,15 +145,15 @@ impl ScheduleConfig {
             };
         }
         slot!("clock", clock_period_secs);
-        slot!("ci", ci_poll_secs);
-        slot!("pr_queue", prq_poll_secs);
-        slot!("auto_fetch", auto_fetch_secs);
-        slot!("calendar", calendar_poll_secs);
+        slot!("ci", ci_every_slots);
+        slot!("pr_queue", prq_every_slots);
+        slot!("auto_fetch", auto_fetch_every_slots);
+        slot!("calendar", calendar_every_slots);
         slot!("calendar_reminders", calendar_reminders);
-        slot!("disk", disk_ttl_secs);
-        slot!("loc", loc_ttl_secs);
-        slot!("usage", usage_poll_secs);
-        slot!("weather", weather_poll_secs);
+        slot!("disk", disk_every_slots);
+        slot!("loc", loc_every_slots);
+        slot!("usage", usage_every_slots);
+        slot!("weather", weather_every_slots);
         changed
     }
 }
@@ -150,7 +202,11 @@ impl ScheduleOwner {
     }
 
     pub(crate) fn reconfigure(&mut self, cfg: &Config) {
-        let next = ScheduleConfig::from_config(cfg);
+        self.reconfigure_effective(ScheduleConfig::from_config(cfg));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reconfigure_effective(&mut self, next: ScheduleConfig) {
         if next == self.effective {
             return;
         }
@@ -232,9 +288,9 @@ mod tests {
     fn projection_changes_only_the_named_schedule_slots() {
         let mut a = ScheduleConfig::from_config(&Config::default());
         let mut b = a.clone();
-        b.ci_poll_secs = b.ci_poll_secs.saturating_add(5);
-        b.loc_ttl_secs = Some(120);
-        b.weather_poll_secs = Some(600);
+        b.ci_every_slots = b.ci_every_slots.saturating_add(5);
+        b.loc_every_slots = Some(120);
+        b.weather_every_slots = Some(600);
         assert_eq!(a.changed_slots(&b), ["ci", "loc", "weather"]);
         a = b;
         assert!(a.changed_slots(&a).is_empty());
@@ -245,15 +301,15 @@ mod tests {
         let base = ScheduleConfig::from_config(&Config::default());
         let mut next = base.clone();
         next.clock_period_secs += 1;
-        next.ci_poll_secs += 1;
-        next.prq_poll_secs = Some(1);
-        next.auto_fetch_secs = Some(1);
-        next.calendar_poll_secs = Some(1);
+        next.ci_every_slots += 1;
+        next.prq_every_slots = Some(1);
+        next.auto_fetch_every_slots = Some(1);
+        next.calendar_every_slots = Some(1);
         next.calendar_reminders = !next.calendar_reminders;
-        next.disk_ttl_secs += 1;
-        next.loc_ttl_secs = Some(1);
-        next.usage_poll_secs = Some(1);
-        next.weather_poll_secs = Some(1);
+        next.disk_every_slots += 1;
+        next.loc_every_slots = Some(1);
+        next.usage_every_slots = Some(1);
+        next.weather_every_slots = Some(1);
 
         assert_eq!(
             base.changed_slots(&next),
@@ -277,16 +333,16 @@ mod tests {
         let cfg = Config::default();
         let projected = ScheduleConfig::from_config(&cfg);
         assert!(projected.clock_period_secs > 0);
-        assert!(projected.ci_poll_secs > 0);
+        assert!(projected.ci_every_slots > 0);
         let _ = (
-            projected.prq_poll_secs,
-            projected.auto_fetch_secs,
-            projected.calendar_poll_secs,
+            projected.prq_every_slots,
+            projected.auto_fetch_every_slots,
+            projected.calendar_every_slots,
             projected.calendar_reminders,
-            projected.disk_ttl_secs,
-            projected.loc_ttl_secs,
-            projected.usage_poll_secs,
-            projected.weather_poll_secs,
+            projected.disk_every_slots,
+            projected.loc_every_slots,
+            projected.usage_every_slots,
+            projected.weather_every_slots,
         );
     }
 
@@ -348,6 +404,26 @@ mod tests {
     }
 
     #[test]
+    fn reload_mid_ci_or_pr_child_delivery_drops_only_scheduled_work() {
+        let current = Arc::new(AtomicU64::new(7));
+        let fence = (current.clone(), 7);
+        let ci_detail = || {
+            crate::hydrate::RefreshKind::CiDetail(Box::new(crate::detail::CiDetailPayload {
+                run: Default::default(),
+                log_tail: Vec::new(),
+                log_entries: Vec::new(),
+            }))
+        };
+        assert!(scheduled_delivery(Some(&fence), ci_detail()).is_some());
+        assert!(scheduled_delivery(Some(&fence), crate::hydrate::RefreshKind::Model).is_some());
+
+        current.store(8, Ordering::Release);
+        assert!(scheduled_delivery(Some(&fence), ci_detail()).is_none());
+        assert!(scheduled_delivery(Some(&fence), crate::hydrate::RefreshKind::Model).is_none());
+        assert!(scheduled_delivery(None, crate::hydrate::RefreshKind::Model).is_some());
+    }
+
+    #[test]
     fn all_live_classes_can_be_coalesced_as_untagged_work() {
         for class in [
             "pr",
@@ -385,6 +461,23 @@ mod tests {
             ScheduleConfig::from_config(&low),
             ScheduleConfig::from_config(&high),
             "projection must compare effective cadence, not raw LOC TTL"
+        );
+    }
+
+    #[test]
+    fn equivalent_floored_disk_and_fetch_cadences_do_not_restart() {
+        let mut low = Config::default();
+        low.disk.scan_interval_secs = 1;
+        low.git.auto_fetch = true;
+        low.git.auto_fetch_interval_secs = 1;
+        let mut high = low.clone();
+        high.disk.scan_interval_secs = 2;
+        high.git.auto_fetch_interval_secs = 2;
+
+        assert_eq!(
+            ScheduleConfig::from_config(&low),
+            ScheduleConfig::from_config(&high),
+            "projection must compare effective disk and fetch cadence"
         );
     }
 }

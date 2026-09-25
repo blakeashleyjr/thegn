@@ -404,7 +404,9 @@ fn record_failure(
         CalendarError::Admission(_) => {
             let message = e.to_string();
             // Tell the user once per new condition, not on every retry.
-            if prior_errors.get(account) != Some(&message) {
+            if prior_errors.get(account) != Some(&message)
+                && crate::hydrate_schedule::generation_is_current(generation)
+            {
                 let name = thegn_core::calendar::display::DisplayText::new(
                     account,
                     thegn_core::calendar::display::Field::Calendar,

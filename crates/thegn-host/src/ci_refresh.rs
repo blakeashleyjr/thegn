@@ -118,10 +118,17 @@ pub(crate) fn on_ci_tick(
         full.clone(),
         Some(waker.clone()),
         force,
-        generation,
+        generation.clone(),
     );
     if let Some(run) = bar_detail.as_mut().and_then(|ov| ov.live_ci_repoll()) {
-        crate::actions::spawn_ci_detail(session, &full.ci, refresh_tx, waker, run);
+        crate::actions::spawn_ci_detail(
+            session,
+            &full.ci,
+            refresh_tx,
+            waker,
+            run,
+            generation.map(|(current, expected)| (current, expected)),
+        );
     }
 }
 
@@ -261,6 +268,9 @@ fn refresh_ci_cache_for(
             }
             record_success(&key);
             // A CI round trip got through — online evidence for the app-wide holder.
+            if !crate::hydrate_schedule::generation_is_current(generation.as_ref()) {
+                return false;
+            }
             thegn_core::connectivity::report_success();
             if let Ok(json) = serde_json::to_string(&runs) {
                 if crate::hydrate_schedule::generation_is_current(generation.as_ref()) {
@@ -272,17 +282,26 @@ fn refresh_ci_cache_for(
             );
         }
         Err(e) => {
+            if !crate::hydrate_schedule::generation_is_current(generation.as_ref()) {
+                return false;
+            }
             // The stale cache stays (better than blank), but the panel gets an
             // honest note instead of silently rendering old data as current.
             // Only a transient (network) failure is offline evidence — an
             // auth/rate-limit error means we reached the provider fine.
-            if e.is_transient() {
+            if e.is_transient()
+                && crate::hydrate_schedule::generation_is_current(generation.as_ref())
+            {
                 thegn_core::connectivity::report_failure();
             }
-            record_failure(&key, &e.message(), now, cfg.poll_interval_secs);
+            if crate::hydrate_schedule::generation_is_current(generation.as_ref()) {
+                record_failure(&key, &e.message(), now, cfg.poll_interval_secs);
+            }
         }
     }
-    if let Some(w) = waker {
+    if crate::hydrate_schedule::generation_is_current(generation.as_ref())
+        && let Some(w) = waker
+    {
         let _ = w.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
     }
     true
@@ -372,6 +391,7 @@ fn ingest_failed_logs(
             entry.head_sha = run.sha.clone();
             if crate::hydrate_schedule::generation_is_current(generation.as_ref())
                 && db.put_ci_log(&entry).is_ok()
+                && crate::hydrate_schedule::generation_is_current(generation.as_ref())
             {
                 ci_autofix::consider(full, db, &entry);
             }
