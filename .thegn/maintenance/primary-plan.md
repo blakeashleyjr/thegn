@@ -1,15 +1,68 @@
-# Primary plan review: revise before implementation
+# Primary review + greenlight — THE-488
 
-The investigation establishes the bugs, but the proposed new manifest authority and blanket foreign-key rewrite are not yet approved. Git is the repository's source of truth; the DB remains a cache. Produce concrete serial implementation chunks that preserve this invariant and cover the full issue without importing unrelated features.
+Reviewing row 534's investigation (`.thegn/pipeline/THE-488/maintenance-investigate/534.md`).
 
-Decisions and constraints:
+**Verdict: APPROVED to implement.** The three open questions are decided below.
 
-- Canonical repository identity comes from exact Git common-directory identity, not origin or basename. Keep path/ref bytes lossless on supported platforms and make unsupported representations a typed refusal before mutation. Display text is separate. Scope keys must not depend on DB availability.
-- Prefer versioned, bounded components using the full collision-resistant digest of length-delimited exact identity inputs, with optional bounded readable prefixes. Do not truncate hashes to six/eight hex digits or use lossy string conversions. A digest selects a candidate; authoritative reuse/removal still verifies exact Git metadata and claimant identity.
-- Reuse Git worktree administrative identity and the repository mutation lock where possible. A private journal may record incomplete rename/migration, but do not invent a competing user-facing manifest source of truth. Explain precisely which data needs persistence versus derivation/revalidation.
-- Legacy existing worktrees must remain reachable at their current paths; never mass-move existing user worktrees automatically. Migrate tab/cache identities only after unique exact matching against Git, and quarantine ambiguity before opening/routing/deleting/assigning. Eliminate LIMIT 1 selection of contested identities and basename fallback for authority. Read-only degraded display may use last-known exact mappings.
-- Define generation changes and stale-result rejection at actual creation/rename/publication boundaries. Show the data that each consumer needs. Do not implement entire downstream sandbox/drawer feature issues; update their existing identity inputs and leave no ambiguous route introduced by this fix.
-- Rename must preflight destination and membership under lock, journal the steps, revalidate exact source/destination, and recover after branch/move/DB failure. Decide explicitly if stable physical checkout paths can be preserved during a label rename; retain documented behavior unless the maintenance change is justified. Never silently report success after partial mutation.
-- Feature identities must distinguish exact names that normalize alike; preserve intentional membership and legacy project associations with explicit unambiguous mapping. Explain the minimum schema changes needed, not a blanket conversion of all caches into authority.
+The most useful finding is the scope of the damage: running a sound scan
+read-only, **`profile.rs` is the only newly flagged file across all five
+ratchets.** That makes the reconciliation small and this lane tractable. The
+helper copies are currently byte-identical, which makes the identity test cheap
+to add now.
 
-Deliver ordered chunks with exact APIs, schema/compatibility strategy, all call-site migrations, fault-injection and acceptance tests, and first-chunk recommendation. Include THE-515 coordination: it will reuse this repository identity rather than develop another algorithm. No production changes, builds or child agents yet.
+## Decision 1 — keep the three copies, add a byte-identity test
+
+Confirmed from the coordination brief. Do not centralize: that means a new
+cross-crate test-only dependency, which is exactly the leaf-crate boundary the
+repo guards. Add a test asserting the core/media/metrics copies are
+byte-identical so they cannot silently drift.
+
+## Decision 2 — fault injection through a seam, not the real filesystem
+
+Inject I/O failures through a small trait or closure seam in the scanner. Do
+**not** manipulate real filesystem permissions or rely on `/proc`, an unreadable
+path, or `chmod` — those are non-deterministic across CI, containers, and root.
+A closure seam keeps the helper dependency-free, keeps the tests deterministic,
+and lets you assert the exact path+error propagates.
+
+Keep the seam test-only in effect: production callers pass the real reader, so
+there is no runtime cost or behaviour change.
+
+## Decision 3 — `profile.rs` gets an allowlist entry with a written reason
+
+Do **not** move it behind `platform/`. The `#[cfg(all(feature = "profiling", unix))]`
+gate is a **feature** gate whose `unix` leaf guards a signal/flamegraph
+implementation; it is not a platform abstraction seam, which is what `platform/`
+exists for. Moving it would put feature-gated profiler internals in the platform
+module and make both worse.
+
+Add `profile.rs` to `test/platform-cfg-host-ratchet.txt` with a reason in the
+file, along the lines of: _the profiling feature's flamegraph/signal path is
+unix-only; the `unix` predicate gates a feature implementation, not a platform
+abstraction, so it does not belong behind `platform/`._ The ratchet is
+shrink-only, so this is a pinned debt entry, honestly labelled.
+
+## Restated constraints
+
+- No Rust-parser dependency. Hand-rolled, sound predicate-tree walker:
+  tokenize, walk nested `not`/`any`/`all` across commas, answer "does any leaf
+  match this term". Unit test the walker **directly**, not only through the
+  ratchets.
+- Comment stripping must respect ordinary **and raw** strings (`r"…"`,
+  `r#"…"#`) and escaped quotes.
+- Fail closed on every I/O: traversal, metadata, path normalization, source
+  reads, allowlist reads — each fails the ratchet naming the exact path and
+  error. A missing/empty allowlist is an error, not "no pins".
+- Handle `cfg_attr` as well as `cfg`.
+
+## Reporting requirement
+
+Your report must list every file the repaired scanner newly flags and what you
+did about each. Per the investigation that should be exactly one (`profile.rs`);
+if the count changes once the walker is sound, say so explicitly — that is the
+signal the primary needs.
+
+## Validation
+
+Do not run cargo/nextest/clippy. The primary runs the batch gate, which for this
+lane includes `just lint` **and** `just test` since the ratchets run in both.
