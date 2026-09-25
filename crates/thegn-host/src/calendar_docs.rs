@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use chrono::{NaiveDate, Weekday};
 use chrono_tz::Tz;
-use thegn_core::calendar::{CalEvent, ExpansionError, ResolvedClock};
+use thegn_core::calendar::{CalEvent, ClockFormat, ExpansionError, ResolvedClock};
 use thegn_core::config_calendar::CalendarConfig;
 
 /// Display settings the popup reads, already resolved out of `auto`.
@@ -170,22 +170,21 @@ impl CalendarDocs {
         let home = cfg
             .home_zone()
             .unwrap_or_else(thegn_core::calendar::tz::system_zone);
+        let twelve_hour = thegn_core::calendar::resolve_time_format(cfg.twelve_hour_pref(), locale);
         // The home row is synthesized rather than configured, so the block is
         // never empty even with no `[[calendar.clocks]]` at all.
         let mut clocks = vec![ResolvedClock {
             label: "local".into(),
             zone: home,
-            format: String::new(),
+            format: ClockFormat::inherited(twelve_hour),
+            show_date: false,
             is_home: true,
         }];
-        clocks.extend(cfg.active_clocks());
+        clocks.extend(cfg.active_clocks(twelve_hour));
         CalendarDocs {
             ui: CalUiCfg {
                 week_start: thegn_core::calendar::resolve_week_start(cfg.week_start_pref(), locale),
-                twelve_hour: thegn_core::calendar::resolve_time_format(
-                    cfg.twelve_hour_pref(),
-                    locale,
-                ),
+                twelve_hour,
                 show_week_numbers: cfg.show_week_numbers,
                 six_weeks: cfg.show_six_weeks,
                 show_agenda: cfg.show_agenda,
@@ -306,5 +305,25 @@ mod tests {
             CalendarViewError::MalformedCache.to_string(),
             "calendar cache contains unreadable rows"
         );
+    }
+
+    #[test]
+    fn from_config_resolves_home_and_mixed_clock_formats() {
+        let cfg = CalendarConfig {
+            time_format: thegn_core::config_calendar::TimeFormat::H12,
+            home_zone: "UTC".into(),
+            clocks: vec![thegn_core::config_calendar::WorldClock {
+                zone: "Asia/Tokyo".into(),
+                format: "%H:%M".into(),
+                show_date: true,
+                ..Default::default()
+            }],
+            ..CalendarConfig::default()
+        };
+        let docs = CalendarDocs::from_config(&cfg, Some("de_DE.UTF-8"));
+        assert!(docs.ui.twelve_hour);
+        assert_eq!(docs.clocks[0].format, ClockFormat::H12);
+        assert_eq!(docs.clocks[1].format, ClockFormat::Custom("%H:%M".into()));
+        assert!(docs.clocks[1].show_date);
     }
 }

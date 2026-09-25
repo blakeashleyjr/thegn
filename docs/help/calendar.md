@@ -90,7 +90,17 @@ zone = "America/New_York"
 
 Each row shows the weekday, the time, the DST-aware abbreviation (`EST` vs
 `EDT`), how far ahead or behind your zone it is, and a `+1d` / `-1d` marker when
-it's a different date there.
+it's a different date there. Set `format` on a row for a minute-safe strftime
+override; an empty value inherits `[calendar] time_format` (including its
+locale-driven `auto` choice). Set `show_date = true` to replace that row's
+weekday and relative marker with its local date as `YYYY-MM-DD`.
+
+Formats are validated before drawing and pass through the bounded calendar
+display projection, so control-producing output such as `%n` or `%t` is safe
+and clipped. Formats that render seconds (`%S`, `%T`, `%r`, `%X`, `%s`, or
+fractional seconds) are rejected by `thegn config validate` and normalized to
+inherited `time_format` during a normal load; world-clock rows keep the
+existing minute-resolution refresh cadence.
 
 Offsets are computed fresh every time, never stored, so half-hour zones
 (`Asia/Kolkata`, `Asia/Kathmandu`), Lord Howe's 30-minute DST, and the weeks

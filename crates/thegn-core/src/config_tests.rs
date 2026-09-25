@@ -3595,6 +3595,37 @@ fn strftime_needs_seconds_distinguishes_minute_from_second_clocks() {
     assert!(strftime_needs_seconds("%s"));
 }
 
+#[test]
+fn post_process_resets_unsafe_calendar_row_formats_to_inheritance() {
+    let mut cfg = Config {
+        calendar: CalendarConfig {
+            clocks: vec![
+                WorldClock {
+                    zone: "UTC".into(),
+                    format: "%H:%M:%S".into(),
+                    ..Default::default()
+                },
+                WorldClock {
+                    zone: "UTC".into(),
+                    format: "%Q".into(),
+                    ..Default::default()
+                },
+                WorldClock {
+                    zone: "UTC".into(),
+                    format: "%%S".into(),
+                    ..Default::default()
+                },
+            ],
+            ..CalendarConfig::default()
+        },
+        ..Config::default()
+    };
+    cfg.post_process();
+    assert!(cfg.calendar.clocks[0].format.is_empty());
+    assert!(cfg.calendar.clocks[1].format.is_empty());
+    assert_eq!(cfg.calendar.clocks[2].format, "%%S");
+}
+
 #[path = "config_tests_coverage.rs"]
 mod coverage;
 
