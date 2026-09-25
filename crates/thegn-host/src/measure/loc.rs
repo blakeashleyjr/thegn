@@ -96,7 +96,12 @@ pub(crate) fn spawn_scan_with_generation(
             let path = std::path::Path::new(path_s);
             // loc_scan owns the repository boundary rule: a gitlink's checked
             // out source is not part of the superproject's LOC total.
-            if apply_scan_result(&db, path_s, crate::loc_scan::scan(path)) {
+            if apply_scan_result(
+                &db,
+                path_s,
+                crate::loc_scan::scan(path),
+                generation.as_ref(),
+            ) {
                 counted += 1;
             }
         }
@@ -112,17 +117,28 @@ pub(crate) fn spawn_scan_with_generation(
 /// Apply one scan without allowing an incomplete report to advance the cache's
 /// freshness timestamp. Returns whether the visible cache changed and should
 /// wake hydration.
-fn apply_scan_result(db: &Db, path: &str, outcome: crate::loc_scan::ScanOutcome) -> bool {
+fn apply_scan_result(
+    db: &Db,
+    path: &str,
+    outcome: crate::loc_scan::ScanOutcome,
+    generation: Option<&crate::hydrate_schedule::ScheduleFence>,
+) -> bool {
     match outcome {
         crate::loc_scan::ScanOutcome::Unavailable
         | crate::loc_scan::ScanOutcome::Complete(None) => {
             // An absent root or a completed empty walk means the old count no
             // longer describes this target. Keep the prior deletion behavior.
+            if !crate::hydrate_schedule::generation_is_current(generation) {
+                return false;
+            }
             let _ = db.delete_loc_cache(path); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
             true
         }
         crate::loc_scan::ScanOutcome::Complete(Some(report)) => {
             if let Ok(json) = serde_json::to_string(&report) {
+                if !crate::hydrate_schedule::generation_is_current(generation) {
+                    return false;
+                }
                 let _ = db.put_loc_cache(path, report.total_code, &json); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                 true
             } else {
@@ -245,7 +261,8 @@ mod tests {
         assert!(apply_scan_result(
             &db,
             "/wt",
-            crate::loc_scan::ScanOutcome::Complete(Some(complete.clone()))
+            crate::loc_scan::ScanOutcome::Complete(Some(complete.clone())),
+            None,
         ));
         drop(db);
         // Move the fixture into the past so recovery must advance the stamp;
@@ -266,7 +283,8 @@ mod tests {
         assert!(!apply_scan_result(
             &db,
             "/wt",
-            crate::loc_scan::ScanOutcome::Incomplete(partial)
+            crate::loc_scan::ScanOutcome::Incomplete(partial),
+            None,
         ));
         drop(db);
         let db = Db::open_at(&db_path).unwrap();
@@ -278,7 +296,8 @@ mod tests {
         assert!(apply_scan_result(
             &db,
             "/wt",
-            crate::loc_scan::ScanOutcome::Complete(Some(recovered.clone()))
+            crate::loc_scan::ScanOutcome::Complete(Some(recovered.clone())),
+            None,
         ));
         let (recovered_json, recovered_at) = db.get_loc_cache_entry("/wt").unwrap().unwrap();
         assert_eq!(
@@ -301,7 +320,8 @@ mod tests {
         assert!(apply_scan_result(
             &db,
             "/wt",
-            crate::loc_scan::ScanOutcome::Complete(None)
+            crate::loc_scan::ScanOutcome::Complete(None),
+            None,
         ));
         assert!(db.get_loc_cache_entry("/wt").unwrap().is_none());
 
@@ -315,7 +335,8 @@ mod tests {
         assert!(apply_scan_result(
             &db,
             "/wt",
-            crate::loc_scan::ScanOutcome::Unavailable
+            crate::loc_scan::ScanOutcome::Unavailable,
+            None,
         ));
         assert!(db.get_loc_cache_entry("/wt").unwrap().is_none());
 
@@ -323,7 +344,8 @@ mod tests {
         assert!(!apply_scan_result(
             &fresh,
             "/never-cached",
-            crate::loc_scan::ScanOutcome::Incomplete(thegn_core::loc::LocReport::total_only(99),)
+            crate::loc_scan::ScanOutcome::Incomplete(thegn_core::loc::LocReport::total_only(99),),
+            None,
         ));
         assert!(
             fresh

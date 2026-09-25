@@ -256,16 +256,16 @@ fn refresh_ci_cache_for(
         .filter(|b| !b.is_empty());
     match client.runs(loc, branch.as_deref(), cfg.max_runs) {
         Ok(runs) => {
-            if generation.as_ref().is_some_and(|(current, expected)| {
-                current.load(std::sync::atomic::Ordering::Acquire) != *expected
-            }) {
+            if !crate::hydrate_schedule::generation_is_current(generation.as_ref()) {
                 return false;
             }
             record_success(&key);
             // A CI round trip got through — online evidence for the app-wide holder.
             thegn_core::connectivity::report_success();
             if let Ok(json) = serde_json::to_string(&runs) {
-                let _ = db.put_ci_cache(&key, branch.as_deref().unwrap_or(""), &json); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+                if crate::hydrate_schedule::generation_is_current(generation.as_ref()) {
+                    let _ = db.put_ci_cache(&key, branch.as_deref().unwrap_or(""), &json); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+                }
             }
             ingest_failed_logs(
                 host_path, loc, cfg, full, &db, &runs, &old_runs, waker, generation,
@@ -324,9 +324,7 @@ fn ingest_failed_logs(
         .iter()
         .filter(|r| retained.contains(&r.id) && r.state == CiState::Fail)
     {
-        if generation.as_ref().is_some_and(|(current, expected)| {
-            current.load(std::sync::atomic::Ordering::Acquire) != *expected
-        }) {
+        if !crate::hydrate_schedule::generation_is_current(generation.as_ref()) {
             return;
         }
         let Some(client) = thegn_svc::ci::provider_for(loc, cfg) else {
@@ -372,10 +370,15 @@ fn ingest_failed_logs(
             );
             entry.truncated |= log.truncated;
             entry.head_sha = run.sha.clone();
-            if db.put_ci_log(&entry).is_ok() {
+            if crate::hydrate_schedule::generation_is_current(generation.as_ref())
+                && db.put_ci_log(&entry).is_ok()
+            {
                 ci_autofix::consider(full, db, &entry);
             }
         }
+    }
+    if !crate::hydrate_schedule::generation_is_current(generation.as_ref()) {
+        return;
     }
     let keep: Vec<String> = retained.into_iter().collect();
     let _ = db.retain_ci_logs(&key, &keep);

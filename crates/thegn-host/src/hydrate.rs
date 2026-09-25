@@ -3513,7 +3513,9 @@ pub(crate) fn spawn_pr_cache_refresh_with_generation(
         // `pr_state_is_definitive` and `github.rs`'s Offline doc ("Stale cached
         // data may still be shown").
         if pr_state_is_definitive(&panel.state) {
-            let _ = db.put_pr_cache(&cache_key, &panel.branch, &json); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+            if crate::hydrate_schedule::generation_is_current(generation.as_ref()) {
+                let _ = db.put_pr_cache(&cache_key, &panel.branch, &json); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+            }
         }
 
         // Deep review data is a separate complete snapshot. Fetching either
@@ -3557,8 +3559,14 @@ pub(crate) fn spawn_pr_cache_refresh_with_generation(
                 };
                 // Complete payload only; DB failures are cache misses on the
                 // next hydrate and do not affect the primary PR refresh.
-                let _ = db.put_pr_review_cache(&snapshot);
+                if crate::hydrate_schedule::generation_is_current(generation.as_ref()) {
+                    let _ = db.put_pr_review_cache(&snapshot);
+                }
             }
+        }
+
+        if !crate::hydrate_schedule::generation_is_current(generation.as_ref()) {
+            return;
         }
 
         // Typed automation edges come from authoritative old/new forge cache
@@ -3794,7 +3802,9 @@ pub(crate) fn spawn_pr_cache_refresh_with_generation(
                     rows: thegn_core::forge::model::parse_pr_headers(&json),
                     source_repo,
                 };
-                if let Ok(stamped) = serde_json::to_string(&cache) {
+                if let Ok(stamped) = serde_json::to_string(&cache)
+                    && crate::hydrate_schedule::generation_is_current(branch_generation.as_ref())
+                {
                     let _ = db.put_pr_branch_cache(&repo_root, &stamped); // best-effort cache write
                 }
             }

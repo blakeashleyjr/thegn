@@ -527,6 +527,18 @@ fn the_reminder_cursor_advances_only_on_a_current_success() {
 }
 
 #[test]
+fn abandoning_a_stale_reminder_ack_releases_the_cursor_for_retry() {
+    let mut cursor = ReminderCursor::new(1_000);
+    let stale = cursor.begin(2_000).expect("first evaluation starts");
+    cursor.abandon(stale);
+
+    let retry = cursor
+        .begin(3_000)
+        .expect("a dropped stale envelope must not strand the cursor");
+    assert_eq!((retry.from_ms, retry.to_ms), (1_000, 3_000));
+}
+
+#[test]
 fn an_undispatched_or_skipped_reminder_window_is_not_lost() {
     let mut c = ReminderCursor::new(1_000);
     let w = c.begin(2_000).unwrap();
