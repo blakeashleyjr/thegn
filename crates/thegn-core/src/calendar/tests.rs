@@ -1,5 +1,5 @@
 use super::*;
-use chrono::{Datelike, NaiveDate, TimeZone, Timelike, Weekday};
+use chrono::{Datelike, Days, NaiveDate, TimeZone, Timelike, Weekday};
 use chrono_tz::Tz;
 
 fn d(y: i32, m: u32, day: u32) -> NaiveDate {
@@ -150,6 +150,55 @@ fn non_monday_rows_do_not_use_the_first_cell_iso_week() {
     assert_eq!(saturday.weeks[1][0].iso_week, 53);
     assert_eq!(saturday.weeks[1][2].iso_week, 1);
     assert_eq!(saturday.week_numbers()[1], 1);
+}
+
+#[test]
+fn auto_week_start_feeds_the_truthful_row_numbering() {
+    for (locale, week_start, expected) in [
+        ("en_US.UTF-8", Weekday::Sun, 1),
+        ("ar_EG", Weekday::Sat, 1),
+        ("en_GB.UTF-8", Weekday::Mon, 1),
+    ] {
+        let resolved = resolve_week_start(None, Some(locale));
+        assert_eq!(resolved, week_start, "auto start for {locale}");
+        let grid = MonthGrid::build(2021, 1, resolved, d(2021, 1, 1), true).unwrap();
+        assert_eq!(
+            grid.week_numbers()[1],
+            expected,
+            "January crossover for {locale}"
+        );
+    }
+}
+
+#[test]
+fn week_numbering_stays_total_at_chrono_date_boundaries() {
+    let first = NaiveDate::MIN;
+    let min_grid =
+        MonthGrid::build(first.year(), first.month(), first.weekday(), first, false).unwrap();
+    assert!(!min_grid.week_numbers().is_empty());
+
+    let last = NaiveDate::MAX;
+    let last_row_start = last.checked_sub_days(Days::new(6)).unwrap();
+    let last_row = std::array::from_fn(|index| {
+        let date = last_row_start
+            .checked_add_days(Days::new(index as u64))
+            .unwrap();
+        DayCell {
+            date,
+            in_month: true,
+            is_today: false,
+            iso_week: date.iso_week().week(),
+            weekday: date.weekday(),
+        }
+    });
+    let max_grid = MonthGrid {
+        year: last.year(),
+        month: last.month(),
+        week_start: last_row_start.weekday(),
+        weeks: vec![last_row],
+    };
+    assert!(!max_grid.week_numbers().is_empty());
+    assert_eq!(max_grid.span().1, last);
 }
 
 #[test]
