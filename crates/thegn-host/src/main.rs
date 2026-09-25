@@ -93,6 +93,7 @@ mod hover;
 mod hydrate;
 mod hydrate_calendar;
 mod hydrate_feed;
+mod hydrate_schedule;
 mod hydrate_semantic;
 mod hydrate_terminal;
 mod hydrate_tracker;

@@ -72,7 +72,7 @@ pub(crate) fn spawn_month_fetch(
             let today = chrono::Utc::now().with_timezone(&home).date_naive();
             let (h_from, h_to) = horizon(&cfg, today);
             sync_accounts(db, &cfg, h_from, h_to, false, &mut |m| {
-                toast(&tx, &waker, m)
+                toast(&tx, &waker, m, None)
             });
         }
 
@@ -82,7 +82,7 @@ pub(crate) fn spawn_month_fetch(
             Some(db) => expand_month(db, wide_from, wide_to, home),
             None => MonthView::failed(CalendarViewError::CacheUnavailable),
         };
-        deliver(&tx, &waker, year, month, month_view);
+        deliver(&tx, &waker, year, month, month_view, None);
     });
 }
 
@@ -128,10 +128,20 @@ pub(crate) fn expand_month(
 
 /// The periodic sync pass: refresh every account, then push the visible month
 /// back into whatever popup is open.
+#[allow(dead_code)] // retained as the untagged/event-driven entry point
 pub(crate) fn spawn_periodic_sync(
     cfg: CalendarConfig,
     tx: tokio_mpsc::UnboundedSender<RefreshKind>,
     waker: TerminalWaker,
+) {
+    spawn_periodic_sync_with_generation(cfg, tx, waker, None);
+}
+
+pub(crate) fn spawn_periodic_sync_with_generation(
+    cfg: CalendarConfig,
+    tx: tokio_mpsc::UnboundedSender<RefreshKind>,
+    waker: TerminalWaker,
+    generation: Option<u64>,
 ) {
     crate::sched::spawn_bg(move || {
         let Ok(db) = Db::open() else { return };
@@ -139,7 +149,9 @@ pub(crate) fn spawn_periodic_sync(
             .with_timezone(&home_zone(&cfg))
             .date_naive();
         let (from, to) = horizon(&cfg, today);
-        let changed = sync_accounts(&db, &cfg, from, to, false, &mut |m| toast(&tx, &waker, m));
+        let changed = sync_accounts(&db, &cfg, from, to, false, &mut |m| {
+            toast(&tx, &waker, m, generation)
+        });
         if !changed {
             return;
         }
@@ -149,7 +161,14 @@ pub(crate) fn spawn_periodic_sync(
             thegn_core::calendar::month_bounds(today.year(), today.month()).unwrap_or((from, to));
         let (wide_from, wide_to) = widen(m_from, m_to);
         let month_view = expand_month(&db, wide_from, wide_to, home_zone(&cfg));
-        deliver(&tx, &waker, today.year(), today.month(), month_view);
+        deliver(
+            &tx,
+            &waker,
+            today.year(),
+            today.month(),
+            month_view,
+            generation,
+        );
     });
 }
 
@@ -195,14 +214,21 @@ fn contention_backoff(account: &str, now: i64) -> bool {
 }
 
 /// Surface a calendar problem the user has to act on as an in-app toast.
-fn toast(tx: &tokio_mpsc::UnboundedSender<RefreshKind>, waker: &TerminalWaker, message: String) {
-    if tx
-        .send(RefreshKind::Toast {
-            message,
-            priority: thegn_core::notification::Priority::Alert,
-        })
-        .is_ok()
-    {
+fn toast(
+    tx: &tokio_mpsc::UnboundedSender<RefreshKind>,
+    waker: &TerminalWaker,
+    message: String,
+    generation: Option<u64>,
+) {
+    let result = RefreshKind::Toast {
+        message,
+        priority: thegn_core::notification::Priority::Alert,
+    };
+    let result = generation.map_or(result.clone(), |generation| RefreshKind::Scheduled {
+        generation,
+        kind: Box::new(result),
+    });
+    if tx.send(result).is_ok() {
         // best-effort: the loop may already be shutting down.
         let _ = waker.wake();
     }
@@ -581,12 +607,24 @@ impl ReminderCursor {
 ///
 /// The background permit is reserved HERE: a dispatch that silently skipped a
 /// full lane would leave its window "in flight" forever and stop reminders.
+#[allow(dead_code)] // retained as the untagged/event-driven entry point
 pub(crate) fn spawn_reminder_check(
     cursor: &mut ReminderCursor,
     now_ms: i64,
     cfg: CalendarConfig,
     tx: tokio_mpsc::UnboundedSender<RefreshKind>,
     waker: TerminalWaker,
+) {
+    spawn_reminder_check_with_generation(cursor, now_ms, cfg, tx, waker, None);
+}
+
+pub(crate) fn spawn_reminder_check_with_generation(
+    cursor: &mut ReminderCursor,
+    now_ms: i64,
+    cfg: CalendarConfig,
+    tx: tokio_mpsc::UnboundedSender<RefreshKind>,
+    waker: TerminalWaker,
+    generation: Option<u64>,
 ) {
     if !reminders_configured(&cfg) {
         cursor.skip(now_ms);
@@ -607,6 +645,7 @@ pub(crate) fn spawn_reminder_check(
             waker: waker.clone(),
             window,
             outcome: ReminderOutcome::Failed(CalendarViewError::CacheUnavailable),
+            generation,
         };
         let outcome = match Db::open() {
             Err(_) => ReminderOutcome::Failed(CalendarViewError::CacheUnavailable),
@@ -633,14 +672,22 @@ struct ReminderAck {
     waker: TerminalWaker,
     window: ReminderWindow,
     outcome: ReminderOutcome,
+    generation: Option<u64>,
 }
 
 impl Drop for ReminderAck {
     fn drop(&mut self) {
-        let sent = self.tx.send(RefreshKind::CalendarReminderResult {
+        let result = RefreshKind::CalendarReminderResult {
             window: self.window,
             outcome: self.outcome,
-        });
+        };
+        let result = self
+            .generation
+            .map_or(result.clone(), |generation| RefreshKind::Scheduled {
+                generation,
+                kind: Box::new(result),
+            });
+        let sent = self.tx.send(result);
         if sent.is_ok() {
             let _ = self.waker.wake(); // best-effort: the loop may already be shutting down
         }
@@ -742,6 +789,7 @@ fn deliver(
     year: i32,
     month: u32,
     view: MonthView,
+    generation: Option<u64>,
 ) {
     if let Some(error) = view.error {
         // A fixed label, never event content.
@@ -758,10 +806,12 @@ fn deliver(
         events: view.events,
         error: view.error,
     };
-    if tx
-        .send(RefreshKind::CalendarMonth(Box::new(payload)))
-        .is_ok()
-    {
+    let result = RefreshKind::CalendarMonth(Box::new(payload));
+    let result = generation.map_or(result.clone(), |generation| RefreshKind::Scheduled {
+        generation,
+        kind: Box::new(result),
+    });
+    if tx.send(result).is_ok() {
         // best-effort: the loop may already be shutting down.
         let _ = waker.wake();
     }

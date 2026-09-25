@@ -26,11 +26,22 @@ static INFLIGHT: AtomicBool = AtomicBool::new(false);
 /// `watch` marks a content-driven round (the diff filesystem watcher saw the
 /// active worktree change): that one path may bypass the long TTL, bounded by
 /// `[loc] watch_invalidate_secs`.
+#[allow(dead_code)] // retained as the untagged/event-driven entry point
 pub(crate) fn spawn_scan(
     cfg: thegn_core::config::LocConfig,
     active: Option<std::path::PathBuf>,
     watch: bool,
     waker: Option<TerminalWaker>,
+) {
+    spawn_scan_with_generation(cfg, active, watch, waker, None);
+}
+
+pub(crate) fn spawn_scan_with_generation(
+    cfg: thegn_core::config::LocConfig,
+    active: Option<std::path::PathBuf>,
+    watch: bool,
+    waker: Option<TerminalWaker>,
+    generation: Option<(std::sync::Arc<std::sync::atomic::AtomicU64>, u64)>,
 ) {
     tokio::task::spawn_blocking(move || {
         let Some(_round) = super::begin(&INFLIGHT, "loc") else {
@@ -77,6 +88,11 @@ pub(crate) fn spawn_scan(
 
         let mut counted = 0u32;
         for path_s in &due {
+            if generation.as_ref().is_some_and(|(current, expected)| {
+                current.load(std::sync::atomic::Ordering::Acquire) != *expected
+            }) {
+                return;
+            }
             let path = std::path::Path::new(path_s);
             // loc_scan owns the repository boundary rule: a gitlink's checked
             // out source is not part of the superproject's LOC total.

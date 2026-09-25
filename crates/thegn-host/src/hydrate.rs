@@ -202,6 +202,13 @@ pub(crate) fn merge_glyph_scan(
 // literal and the loop drains by value, so `Copy` was never relied upon.
 #[derive(Clone, Debug)]
 pub(crate) enum RefreshKind {
+    /// A request emitted by the shared scheduler. The loop rejects an older
+    /// generation before starting any off-loop work; event-driven/user-forced
+    /// requests remain untagged and therefore are never fenced out.
+    Scheduled {
+        generation: u64,
+        kind: Box<RefreshKind>,
+    },
     Model,
     Pr,
     /// The wall clock crossed a display boundary, so the `date`/`clock` bar
@@ -468,7 +475,7 @@ pub(crate) type PanePids = std::sync::Arc<std::sync::Mutex<std::sync::Arc<[(u32,
 
 #[path = "hydrate_refresh_ticker.rs"]
 mod refresh_ticker;
-pub(crate) use refresh_ticker::spawn_refresh_ticker;
+pub(crate) use refresh_ticker::{RefreshTicker, spawn_refresh_ticker};
 
 /// Drop session groups whose local worktree dir has vanished (deleted/moved
 /// outside thegn — including a merge-queue `on_landed = remove/detach` land)
@@ -3406,11 +3413,22 @@ pub(crate) fn spawn_pr_cache_refresh(
     disk_cfg: thegn_core::config::DiskConfig,
     waker: Option<TerminalWaker>,
 ) {
+    spawn_pr_cache_refresh_with_generation(cwd, cfg, disk_cfg, waker, None);
+}
+
+pub(crate) fn spawn_pr_cache_refresh_with_generation(
+    cwd: std::path::PathBuf,
+    cfg: thegn_core::config::IssuesConfig,
+    disk_cfg: thegn_core::config::DiskConfig,
+    waker: Option<TerminalWaker>,
+    generation: Option<(std::sync::Arc<std::sync::atomic::AtomicU64>, u64)>,
+) {
     // Takes the worktree path, NOT the Session: the refreshers only ever read
     // the active tab's path, and a by-value Session is a String-heavy deep
     // clone on the loop thread at every call site (4× per worktree switch).
     let branch_cwd = cwd.clone();
     let branch_waker = waker.clone();
+    let branch_generation = generation.clone();
     crate::sched::spawn_bg(move || {
         if !cwd.is_dir() {
             return;
@@ -3474,6 +3492,11 @@ pub(crate) fn spawn_pr_cache_refresh(
         ) {
             return;
         }
+        if generation.as_ref().is_some_and(|(current, expected)| {
+            current.load(std::sync::atomic::Ordering::Acquire) != *expected
+        }) {
+            return;
+        }
         // Feed the app-wide connectivity holder (this CLI path is the 20s PR
         // backstop + the offline recovery probe).
         crate::connectivity_gate::report_pr_panel(&panel.state);
@@ -3496,6 +3519,11 @@ pub(crate) fn spawn_pr_cache_refresh(
         // Deep review data is a separate complete snapshot. Fetching either
         // half failing leaves the previous snapshot untouched, so an outage
         // cannot turn a useful cached conversation into a partial one.
+        if generation.as_ref().is_some_and(|(current, expected)| {
+            current.load(std::sync::atomic::Ordering::Acquire) != *expected
+        }) {
+            return;
+        }
         if let thegn_core::forge::model::PanelState::Pr(pr) = &panel.state
             && let Some((owner, repo)) = thegn_core::forge::model::owner_repo_from_url(&pr.url)
         {
@@ -3651,6 +3679,14 @@ pub(crate) fn spawn_pr_cache_refresh(
     // runs on its own blocking thread — neither the subprocess fallback nor
     // the HTTP wait can ever touch the event loop.
     crate::sched::spawn_bg(move || {
+        if branch_generation
+            .as_ref()
+            .is_some_and(|(current, expected)| {
+                current.load(std::sync::atomic::Ordering::Acquire) != *expected
+            })
+        {
+            return;
+        }
         let cwd = branch_cwd;
         if !cwd.is_dir() {
             return;

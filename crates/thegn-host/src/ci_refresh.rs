@@ -111,8 +111,15 @@ pub(crate) fn on_ci_tick(
     waker: &TerminalWaker,
     force: bool,
     bar_detail: &mut Option<crate::detail::DetailOverlay>,
+    generation: Option<(std::sync::Arc<std::sync::atomic::AtomicU64>, u64)>,
 ) {
-    spawn_ci_cache_refresh(session.clone(), full.clone(), Some(waker.clone()), force);
+    spawn_ci_cache_refresh_with_generation(
+        session.clone(),
+        full.clone(),
+        Some(waker.clone()),
+        force,
+        generation,
+    );
     if let Some(run) = bar_detail.as_mut().and_then(|ov| ov.live_ci_repoll()) {
         crate::actions::spawn_ci_detail(session, &full.ci, refresh_tx, waker, run);
     }
@@ -132,17 +139,35 @@ pub(crate) fn spawn_ci_cache_refresh(
     waker: Option<TerminalWaker>,
     force: bool,
 ) {
+    spawn_ci_cache_refresh_with_generation(session, full, waker, force, None);
+}
+
+pub(crate) fn spawn_ci_cache_refresh_with_generation(
+    session: crate::session::Session,
+    full: thegn_core::config::Config,
+    waker: Option<TerminalWaker>,
+    force: bool,
+    generation: Option<(std::sync::Arc<std::sync::atomic::AtomicU64>, u64)>,
+) {
     crate::sched::spawn_bg(move || {
         let cfg = full.ci.clone();
         let cwd = crate::hydrate::active_tab_path(&session);
         if cwd.is_dir() {
             let loc = thegn_core::remote::GitLoc::for_worktree(&cwd);
-            refresh_ci_cache_for(&cwd, &loc, &cfg, &full, waker.as_ref(), force);
+            refresh_ci_cache_for(
+                &cwd,
+                &loc,
+                &cfg,
+                &full,
+                waker.as_ref(),
+                force,
+                generation.clone(),
+            );
         }
         // The sweep rides the same bg task so provider subprocesses stay
         // serialized (kind to rate limits) and the loop-side call stays one
         // spawn. Sweeping is never forced — the ttl guard is its rate limiter.
-        sweep_one_background(&session, &cwd, &cfg, &full, waker.as_ref());
+        sweep_one_background(&session, &cwd, &cfg, &full, waker.as_ref(), generation);
     });
 }
 
@@ -159,6 +184,7 @@ fn sweep_one_background(
     cfg: &thegn_core::config::CiConfig,
     full: &thegn_core::config::Config,
     waker: Option<&TerminalWaker>,
+    generation: Option<(std::sync::Arc<std::sync::atomic::AtomicU64>, u64)>,
 ) {
     let others: Vec<&str> = session
         .worktrees
@@ -178,7 +204,7 @@ fn sweep_one_background(
         let loc = thegn_core::remote::GitLoc::for_worktree(p);
         // First worktree that actually fetched (fresh ones are skipped by the
         // guard) ends the sweep — one provider subprocess per tick, max.
-        if refresh_ci_cache_for(p, &loc, cfg, full, waker, false) {
+        if refresh_ci_cache_for(p, &loc, cfg, full, waker, false, generation.clone()) {
             return;
         }
     }
@@ -200,6 +226,7 @@ fn refresh_ci_cache_for(
     full: &thegn_core::config::Config,
     waker: Option<&TerminalWaker>,
     force: bool,
+    generation: Option<(std::sync::Arc<std::sync::atomic::AtomicU64>, u64)>,
 ) -> bool {
     use thegn_core::store::CacheStore;
     let Ok(db) = thegn_core::db::Db::open() else {
@@ -229,13 +256,20 @@ fn refresh_ci_cache_for(
         .filter(|b| !b.is_empty());
     match client.runs(loc, branch.as_deref(), cfg.max_runs) {
         Ok(runs) => {
+            if generation.as_ref().is_some_and(|(current, expected)| {
+                current.load(std::sync::atomic::Ordering::Acquire) != *expected
+            }) {
+                return false;
+            }
             record_success(&key);
             // A CI round trip got through — online evidence for the app-wide holder.
             thegn_core::connectivity::report_success();
             if let Ok(json) = serde_json::to_string(&runs) {
                 let _ = db.put_ci_cache(&key, branch.as_deref().unwrap_or(""), &json); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
             }
-            ingest_failed_logs(host_path, loc, cfg, full, &db, &runs, &old_runs, waker);
+            ingest_failed_logs(
+                host_path, loc, cfg, full, &db, &runs, &old_runs, waker, generation,
+            );
         }
         Err(e) => {
             // The stale cache stays (better than blank), but the panel gets an
@@ -271,6 +305,7 @@ fn ingest_failed_logs(
     runs: &[thegn_core::ci::CiRun],
     old_runs: &[thegn_core::ci::CiRun],
     waker: Option<&TerminalWaker>,
+    generation: Option<(std::sync::Arc<std::sync::atomic::AtomicU64>, u64)>,
 ) {
     use thegn_core::ci::CiState;
     use thegn_core::store::CacheStore;
@@ -289,6 +324,11 @@ fn ingest_failed_logs(
         .iter()
         .filter(|r| retained.contains(&r.id) && r.state == CiState::Fail)
     {
+        if generation.as_ref().is_some_and(|(current, expected)| {
+            current.load(std::sync::atomic::Ordering::Acquire) != *expected
+        }) {
+            return;
+        }
         let Some(client) = thegn_svc::ci::provider_for(loc, cfg) else {
             break;
         };

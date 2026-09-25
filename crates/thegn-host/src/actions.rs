@@ -510,6 +510,26 @@ pub(crate) fn spawn_usage(
     proxy_enabled: bool,
     proxy_budget: thegn_core::config::BudgetConfig,
 ) {
+    spawn_usage_with_generation(
+        refresh_tx,
+        waker,
+        cfg,
+        interactive,
+        proxy_enabled,
+        proxy_budget,
+        None,
+    );
+}
+
+pub(crate) fn spawn_usage_with_generation(
+    refresh_tx: &UnboundedSender<RefreshKind>,
+    waker: &TerminalWaker,
+    cfg: thegn_core::config::UsageConfig,
+    interactive: bool,
+    proxy_enabled: bool,
+    proxy_budget: thegn_core::config::BudgetConfig,
+    generation: Option<u64>,
+) {
     let tx = refresh_tx.clone();
     let cfg_for_rollup = cfg.clone();
     let waker_for_work = waker.clone();
@@ -559,7 +579,12 @@ pub(crate) fn spawn_usage(
             history,
             proxy_spend,
         };
-        if tx.send(RefreshKind::Usage(Box::new(payload))).is_ok() {
+        let result = RefreshKind::Usage(Box::new(payload));
+        let result = generation.map_or(result.clone(), |generation| RefreshKind::Scheduled {
+            generation,
+            kind: Box::new(result),
+        });
+        if tx.send(result).is_ok() {
             let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
     };
@@ -569,7 +594,7 @@ pub(crate) fn spawn_usage(
     // the whole point of the feature — waited on a scan that outlasted the
     // first minute, leaving the badge blank. Nothing the gauge shows depends on
     // it, so it must never be in front of it.
-    spawn_usage_rollup(refresh_tx, waker, cfg_for_rollup);
+    spawn_usage_rollup(refresh_tx, waker, cfg_for_rollup, generation);
 }
 
 /// Refresh the host-wide transcript token rollup, at most once per
@@ -579,6 +604,7 @@ fn spawn_usage_rollup(
     refresh_tx: &UnboundedSender<RefreshKind>,
     waker: &TerminalWaker,
     cfg: thegn_core::config::UsageConfig,
+    generation: Option<u64>,
 ) {
     if !cfg.token_rollups || !usage_rollup_due() {
         return;
@@ -601,7 +627,12 @@ fn spawn_usage_rollup(
             rollup: r.rollup,
             skipped: r.skipped,
         };
-        if tx.send(RefreshKind::UsageTokens(Box::new(view))).is_ok() {
+        let result = RefreshKind::UsageTokens(Box::new(view));
+        let result = generation.map_or(result.clone(), |generation| RefreshKind::Scheduled {
+            generation,
+            kind: Box::new(result),
+        });
+        if tx.send(result).is_ok() {
             let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
     });
