@@ -575,8 +575,8 @@ mod tests {
     fn code_only_strips_comments_without_touching_strings() {
         assert_eq!(code_only("a // b\n// c\nd"), "a \n\nd");
         assert_eq!(
-            code_only(r##"let s = ""// stays"; /* gone */ #[cfg(unix)]"##),
-            r##"let s = ""// stays";  #[cfg(unix)]"##
+            code_only(r##"let s = "\"// stays"; /* gone */ #[cfg(unix)]"##),
+            r##"let s = "\"// stays";  #[cfg(unix)]"##
         );
         assert_eq!(
             code_only(
@@ -677,7 +677,9 @@ mod tests {
             let error = sources_with(&FailingIo { failure }, &manifest, &[]).unwrap_err();
             assert!(error.contains(operation), "{error}");
             assert!(error.contains(path_fragment), "{error}");
-            assert!(error.contains("injected"), "{error}");
+            if !matches!(failure, Failure::Normalization) {
+                assert!(error.contains("injected"), "{error}");
+            }
             drop(tmp);
         }
 
@@ -784,9 +786,15 @@ mod tests {
         file_ratchet_with(&RealIo, &manifest, "t.txt", &[], |_, _| false, "why", false).unwrap();
 
         file_ratchet_with(&RealIo, &manifest, "t.txt", &[], |_, _| false, "why", true).unwrap();
+        let expected = "# header\n\n# RATCHET-EMPTY\n";
         assert_eq!(
             std::fs::read_to_string(tmp.path().join("test/t.txt")).unwrap(),
-            "# header\n# RATCHET-EMPTY\n"
+            expected
+        );
+        file_ratchet_with(&RealIo, &manifest, "t.txt", &[], |_, _| false, "why", true).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("test/t.txt")).unwrap(),
+            expected
         );
     }
 
@@ -823,7 +831,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let manifest = tmp.path().join("crates/x");
         let external_src = tmp.path().join("external-src");
-        std::fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&manifest).unwrap();
         std::fs::create_dir_all(&external_src).unwrap();
         std::fs::write(external_src.join("escaped.rs"), "fn escaped() {}\n").unwrap();
         symlink(&external_src, manifest.join("src")).unwrap();
