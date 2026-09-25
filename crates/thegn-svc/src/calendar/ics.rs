@@ -38,7 +38,7 @@ enum ReadFailure {
 }
 
 impl IcsBackend {
-    pub fn new(a: &CalendarAccount, admission: AccountAdmission) -> Self {
+    pub(crate) fn new(a: &CalendarAccount, admission: AccountAdmission) -> Self {
         IcsBackend {
             path: thegn_core::util::expand_tilde(&a.path),
             zone: String::new(),
