@@ -254,7 +254,7 @@ fn is_definitive_transition_rejection(error: &IssueError) -> bool {
         IssueError::Api(message) => message
             .strip_prefix("jira HTTP ")
             .and_then(|status| status.parse::<u16>().ok())
-            .is_some_and(|status| (400..500).contains(&status)),
+            .is_some_and(|status| matches!(status, 400 | 404 | 409 | 422)),
         _ => false,
     }
 }
@@ -715,14 +715,13 @@ impl IssueBackend for JiraBackend {
             )
             .await
             .map_err(|error| {
-                if let Some(post_error) = unknown_transition.as_ref() {
-                    partial_update(
-                        &applied,
-                        &[],
-                        IssueError::Api(format!(
-                            "Jira transition outcome unknown for {key}; verify before retrying: transition failed ({post_error}); verification fetch failed ({error})"
-                        )),
-                    )
+                if let Some(post_error) = unknown_transition.take() {
+                    // The POST's typed error is the strongest signal available
+                    // for retry/backoff classification. The empty `unapplied`
+                    // set is deliberate: the existing fetch failed, so the
+                    // caller must verify before retrying rather than treating
+                    // status as safely retryable.
+                    partial_update(&applied, &[], post_error)
                 } else if applied.is_empty() {
                     error
                 } else {
@@ -1279,7 +1278,7 @@ mod tests {
                 assert_eq!(applied, vec!["title"]);
                 assert!(unapplied.is_empty(), "unknown status must not be retryable");
                 assert!(
-                    matches!(source.as_ref(), IssueError::Api(message) if message.contains("outcome unknown") && message.contains("verify before retrying"))
+                    matches!(source.as_ref(), IssueError::Api(message) if message == "jira HTTP 503")
                 );
                 let source_debug = format!("{source:?}");
                 assert!(!source_debug.contains("secret-body"));
@@ -1360,7 +1359,7 @@ mod tests {
                     "an HTTP timeout/intermediary response is ambiguous"
                 );
                 assert!(
-                    matches!(source.as_ref(), IssueError::Api(message) if message.contains("outcome unknown") && message.contains("verify before retrying"))
+                    matches!(source.as_ref(), IssueError::Api(message) if message == "jira HTTP 408")
                 );
             }
             other => panic!("expected unknown transition outcome, got {other:?}"),
@@ -1376,6 +1375,81 @@ mod tests {
                 "GET /rest/api/3/issue/PROJ-1",
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn unrecognized_transition_4xx_is_not_reported_as_unapplied() {
+        let (result, requests) = run_update_recorded(
+            IssuePatch {
+                status: Some(IssueStatus::Done),
+                ..Default::default()
+            },
+            vec![
+                transition_fixture("done"),
+                FixtureResponse::new(StatusCode::IM_A_TEAPOT, "unrecognized-4xx-body"),
+                FixtureResponse::new(StatusCode::BAD_GATEWAY, "verification-body"),
+            ],
+        )
+        .await;
+
+        match result {
+            Err(IssueError::PartialUpdate {
+                applied,
+                unapplied,
+                source,
+            }) => {
+                assert!(applied.is_empty());
+                assert!(
+                    unapplied.is_empty(),
+                    "an unrecognized 4xx response is ambiguous"
+                );
+                assert!(
+                    matches!(source.as_ref(), IssueError::Api(message) if message == "jira HTTP 418")
+                );
+                assert!(!format!("{source:?}").contains("unrecognized-4xx-body"));
+            }
+            other => panic!("expected unknown transition outcome, got {other:?}"),
+        }
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request.call.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "GET /rest/api/3/issue/PROJ-1/transitions",
+                "POST /rest/api/3/issue/PROJ-1/transitions",
+                "GET /rest/api/3/issue/PROJ-1",
+            ]
+        );
+    }
+
+    #[test]
+    fn partial_update_preserves_transient_source_classification() {
+        let error = partial_update(
+            &["title"],
+            &[],
+            IssueError::Timeout("tracker HTTP operation deadline exceeded"),
+        );
+
+        assert!(error.is_transient());
+        assert!(format!("{error}").contains("partial update"));
+    }
+
+    #[test]
+    fn definitive_transition_rejections_use_jira_allowlist() {
+        for status in [400, 404, 409, 422] {
+            assert!(is_definitive_transition_rejection(&IssueError::Api(
+                format!("jira HTTP {status}"),
+            )));
+        }
+        for status in [408, 418, 425, 429, 500] {
+            assert!(!is_definitive_transition_rejection(&IssueError::Api(
+                format!("jira HTTP {status}"),
+            )));
+        }
+        assert!(is_definitive_transition_rejection(&IssueError::Auth(
+            "jira HTTP 401".into(),
+        )));
     }
 
     #[tokio::test]
