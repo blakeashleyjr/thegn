@@ -10,10 +10,14 @@
 //! (env! expands in the caller). Regeneration is the one sanctioned write,
 //! gated on THEGN_RATCHET_UPDATE=1 (wired by just ratchet-update); it keeps
 //! the allowlist's leading # header block verbatim, so the reasons recorded
-//! there survive.
+//! there survive. A ratchet with no pins and no hits must carry the explicit
+//! `# RATCHET-EMPTY` marker; an unmarked empty allowlist is an error.
 //!
 //! thegn-media / thegn-metrics are core-free leaf crates and carry a
-//! verbatim private copy of this file; keep the three identical.
+//! verbatim private copy of this file; keep the three identical. The scan is
+//! not atomic with respect to concurrent working-tree edits: a scan racing an
+//! edit may reflect either version, and the next run is the correction
+//! mechanism.
 
 use std::collections::BTreeSet;
 use std::io;
@@ -28,6 +32,13 @@ trait RatchetIo {
 
 struct RealIo;
 
+const EMPTY_ALLOWLIST_MARKER: &str = "# RATCHET-EMPTY";
+
+struct Allowlist {
+    entries: BTreeSet<String>,
+    explicitly_empty: bool,
+}
+
 impl RatchetIo for RealIo {
     fn read_dir(&self, path: &Path) -> io::Result<Vec<io::Result<PathBuf>>> {
         let mut entries = Vec::new();
@@ -38,7 +49,7 @@ impl RatchetIo for RealIo {
     }
 
     fn metadata(&self, path: &Path) -> io::Result<std::fs::Metadata> {
-        std::fs::metadata(path)
+        std::fs::symlink_metadata(path)
     }
 
     fn read_to_string(&self, path: &Path) -> io::Result<String> {
@@ -62,17 +73,37 @@ fn read_allowlist<R: RatchetIo>(
     reader: &R,
     manifest_dir: &str,
     name: &str,
-) -> Result<BTreeSet<String>, String> {
+) -> Result<Allowlist, String> {
     let path = allowlist_path(manifest_dir, name);
     let contents = reader
         .read_to_string(&path)
         .map_err(|error| io_failure("read allowlist", &path, error))?;
-    Ok(contents
+    let entries: BTreeSet<String> = contents
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
         .map(str::to_string)
-        .collect())
+        .collect();
+    let explicitly_empty = contents
+        .lines()
+        .map(str::trim)
+        .any(|line| line == EMPTY_ALLOWLIST_MARKER);
+    if explicitly_empty && !entries.is_empty() {
+        return Err(format!(
+            "allowlist {}: {EMPTY_ALLOWLIST_MARKER} cannot be combined with entries",
+            path.display()
+        ));
+    }
+    if entries.is_empty() && !explicitly_empty {
+        return Err(format!(
+            "allowlist {}: empty allowlist requires {EMPTY_ALLOWLIST_MARKER}",
+            path.display()
+        ));
+    }
+    Ok(Allowlist {
+        entries,
+        explicitly_empty,
+    })
 }
 
 /// Read test/<name> relative to the workspace root (two levels above a
@@ -119,11 +150,16 @@ fn collect_paths<R: RatchetIo>(
     for entry in entries {
         let path = entry.map_err(|error| io_failure("read directory entry", dir, error))?;
         let key = source_key(root, &path)?;
-        let is_dir = reader
+        let metadata = reader
             .metadata(&path)
-            .map_err(|error| io_failure("read source metadata", &path, error))?
-            .is_dir();
-        if is_dir {
+            .map_err(|error| io_failure("read source metadata", &path, error))?;
+        if metadata.file_type().is_symlink() {
+            return Err(format!(
+                "refuse symlinked source entry {}: symlinked paths are not scanned",
+                path.display()
+            ));
+        }
+        if metadata.is_dir() {
             collect_paths(reader, root, &path, exclude, out)?;
         } else if path.extension().is_some_and(|extension| extension == "rs")
             && !excluded(&key, exclude)
@@ -137,7 +173,8 @@ fn collect_paths<R: RatchetIo>(
 /// Every .rs file under the crate's src/, as (src-relative key, body),
 /// sorted. Keys under any prefix in exclude are skipped, as are the ratchet
 /// test files themselves (they name the patterns they forbid in their own
-/// assertion messages).
+/// assertion messages). The scan is not atomic with respect to concurrent
+/// working-tree edits; a racing edit may produce either version.
 pub fn sources(manifest_dir: &str, exclude: &[&str]) -> Vec<(String, String)> {
     sources_with(&RealIo, manifest_dir, exclude).unwrap_or_else(|error| panic!("{error}"))
 }
@@ -422,13 +459,18 @@ fn file_ratchet_with<R: RatchetIo>(
             .map_err(|error| io_failure("read allowlist header", &path, error))?
             .lines()
             .take_while(|line| line.trim().is_empty() || line.trim_start().starts_with('#'))
+            .filter(|line| line.trim() != EMPTY_ALLOWLIST_MARKER)
             .map(str::to_string)
             .collect();
         let mut output = header;
         if output.last().is_some_and(|line| !line.trim().is_empty()) {
             output.push(String::new());
         }
-        output.extend(found.iter().cloned());
+        if found.is_empty() {
+            output.push(EMPTY_ALLOWLIST_MARKER.to_string());
+        } else {
+            output.extend(found.iter().cloned());
+        }
         let contents = output.join("\n") + "\n";
         reader
             .write(&path, contents.as_bytes())
@@ -437,7 +479,7 @@ fn file_ratchet_with<R: RatchetIo>(
     }
 
     let allow = read_allowlist(reader, manifest_dir, name)?;
-    let unpinned: Vec<&String> = found.difference(&allow).collect();
+    let unpinned: Vec<&String> = found.difference(&allow.entries).collect();
     if !unpinned.is_empty() {
         return Err(format!(
             "ratchet test/{name}: new violation in {unpinned:?}\n{why}\n\
@@ -445,7 +487,10 @@ fn file_ratchet_with<R: RatchetIo>(
              (the list is shrink-only: prefer fixing)."
         ));
     }
-    let stale: Vec<&String> = allow.difference(&found).collect();
+    if found.is_empty() && allow.explicitly_empty {
+        return Ok(());
+    }
+    let stale: Vec<&String> = allow.entries.difference(&found).collect();
     if !stale.is_empty() {
         return Err(format!(
             "ratchet test/{name}: stale entries {stale:?} — these files no longer \
@@ -595,7 +640,11 @@ mod tests {
         std::fs::write(manifest.join("src/a.rs"), "fn a() { bad(); }").unwrap();
         std::fs::write(manifest.join("src/sub/b.rs"), "// bad()\nfn b() {}\n").unwrap();
         std::fs::write(manifest.join("src/c.rs"), "fn c() { bad(); }").unwrap();
-        std::fs::write(tmp.path().join("test/t.txt"), "# header\n# two\n").unwrap();
+        std::fs::write(
+            tmp.path().join("test/t.txt"),
+            "# header\n# two\n# RATCHET-EMPTY\n",
+        )
+        .unwrap();
         (tmp, manifest.to_string_lossy().into_owned())
     }
 
@@ -695,19 +744,64 @@ mod tests {
         std::fs::create_dir_all(manifest.join("src")).unwrap();
         std::fs::create_dir_all(tmp.path().join("test")).unwrap();
         std::fs::write(manifest.join("src/a.rs"), "fn a() {}\n").unwrap();
-        std::fs::write(tmp.path().join("test/empty.txt"), "").unwrap();
         let manifest = manifest.to_string_lossy().into_owned();
-        let error = file_ratchet_with(
-            &RealIo,
-            &manifest,
-            "empty.txt",
-            &[],
-            |_, _| false,
-            "why",
-            false,
-        )
-        .unwrap_err();
-        assert!(error.contains("empty allowlist"), "{error}");
+        for contents in ["", "# comment-only\n"] {
+            std::fs::write(
+                PathBuf::from(&manifest).join("../../test/empty.txt"),
+                contents,
+            )
+            .unwrap();
+            let error = file_ratchet_with(
+                &RealIo,
+                &manifest,
+                "empty.txt",
+                &[],
+                |_, _| false,
+                "why",
+                false,
+            )
+            .unwrap_err();
+            assert!(error.contains("empty allowlist"), "{error}");
+            assert!(error.contains("empty.txt"), "{error}");
+        }
+    }
+
+    #[test]
+    fn explicit_empty_marker_allows_zero_hits_and_update_preserves_it() {
+        let (tmp, manifest) = temp_crate();
+        std::fs::write(tmp.path().join("test/t.txt"), "# header\n# RATCHET-EMPTY\n").unwrap();
+        file_ratchet_with(&RealIo, &manifest, "t.txt", &[], |_, _| false, "why", false).unwrap();
+
+        file_ratchet_with(&RealIo, &manifest, "t.txt", &[], |_, _| false, "why", true).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("test/t.txt")).unwrap(),
+            "# header\n# RATCHET-EMPTY\n"
+        );
+    }
+
+    #[test]
+    fn empty_current_hit_set_fails_against_nonempty_allowlist() {
+        let (tmp, manifest) = temp_crate();
+        std::fs::write(tmp.path().join("test/t.txt"), "a.rs\n").unwrap();
+        let error = file_ratchet_with(&RealIo, &manifest, "t.txt", &[], |_, _| false, "why", false)
+            .unwrap_err();
+        assert!(error.contains("stale entries"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_source_entries_fail_closed_without_recursing() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest = tmp.path().join("crates/x");
+        std::fs::create_dir_all(manifest.join("src")).unwrap();
+        std::fs::write(manifest.join("src/a.rs"), "fn a() {}\n").unwrap();
+        symlink(manifest.join("src"), manifest.join("src/loop")).unwrap();
+        let manifest = manifest.to_string_lossy().into_owned();
+        let error = sources_with(&RealIo, &manifest, &[]).unwrap_err();
+        assert!(error.contains("refuse symlinked source entry"), "{error}");
+        assert!(error.contains("loop"), "{error}");
     }
 
     #[test]
