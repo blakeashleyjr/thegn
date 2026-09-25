@@ -38,7 +38,7 @@ use crate::hydrate::{
     neighbor_worktree_paths, retarget_diff_watcher, spawn_model_hydration, spawn_panel_prefetch,
     spawn_pr_cache_refresh,
 };
-use crate::hydrate_schedule::ScheduleOwner;
+use crate::hydrate_schedule::{RefreshGeneration, ScheduleOwner};
 use crate::input::key_bytes;
 use crate::layout;
 use crate::loading::{SpecOrigin, provision_owns_tab};
@@ -11678,13 +11678,13 @@ async fn event_loop<T: Terminal>(
         let mut want_host_heal = false;
         let mut want_calendar_sync = false;
         let mut want_reminder_check = false;
-        let mut scheduled_pr_generation = None;
-        let mut scheduled_calendar_generation = None;
-        let mut scheduled_reminder_generation = None;
-        let mut scheduled_ci_generation = None;
-        let mut scheduled_loc_generation = None;
-        let mut scheduled_usage_generation = None;
-        let mut scheduled_weather_generation = None;
+        let mut scheduled_pr_generation = RefreshGeneration::default();
+        let mut scheduled_calendar_generation = RefreshGeneration::default();
+        let mut scheduled_reminder_generation = RefreshGeneration::default();
+        let mut scheduled_ci_generation = RefreshGeneration::default();
+        let mut scheduled_loc_generation = RefreshGeneration::default();
+        let mut scheduled_usage_generation = RefreshGeneration::default();
+        let mut scheduled_weather_generation = RefreshGeneration::default();
         // Fold-actor results (batch fold + agent-driven drain): toast outcomes,
         // patch queue rows in place, route settled transitions to the inbox, and
         // re-hydrate so the advanced tip and cleared dots show immediately.
@@ -11744,23 +11744,44 @@ async fn event_loop<T: Terminal>(
             let kind = match kind {
                 RefreshKind::Scheduled { generation, kind } => {
                     if !schedule.is_current(generation) {
+                        if let RefreshKind::CalendarReminderResult { window, .. } = kind.as_ref() {
+                            // A stale reminder acknowledgment is still the
+                            // completion of the cursor's in-flight window.
+                            reminder_cursor.abandon(*window);
+                        }
                         continue;
                     }
                     match kind.as_ref() {
-                        RefreshKind::Pr => scheduled_pr_generation = Some(generation),
-                        RefreshKind::Calendar => scheduled_calendar_generation = Some(generation),
-                        RefreshKind::CalendarReminders => {
-                            scheduled_reminder_generation = Some(generation)
+                        RefreshKind::Pr => scheduled_pr_generation.scheduled(generation),
+                        RefreshKind::Calendar => {
+                            scheduled_calendar_generation.scheduled(generation)
                         }
-                        RefreshKind::Ci { .. } => scheduled_ci_generation = Some(generation),
-                        RefreshKind::Loc { .. } => scheduled_loc_generation = Some(generation),
-                        RefreshKind::UsagePoll => scheduled_usage_generation = Some(generation),
-                        RefreshKind::WeatherPoll => scheduled_weather_generation = Some(generation),
+                        RefreshKind::CalendarReminders => {
+                            scheduled_reminder_generation.scheduled(generation)
+                        }
+                        RefreshKind::Ci { .. } => scheduled_ci_generation.scheduled(generation),
+                        RefreshKind::Loc { .. } => scheduled_loc_generation.scheduled(generation),
+                        RefreshKind::UsagePoll => scheduled_usage_generation.scheduled(generation),
+                        RefreshKind::WeatherPoll => {
+                            scheduled_weather_generation.scheduled(generation)
+                        }
                         _ => {}
                     }
                     *kind
                 }
-                kind => kind,
+                kind => {
+                    match &kind {
+                        RefreshKind::Pr => scheduled_pr_generation.untagged(),
+                        RefreshKind::Calendar => scheduled_calendar_generation.untagged(),
+                        RefreshKind::CalendarReminders => scheduled_reminder_generation.untagged(),
+                        RefreshKind::Ci { .. } => scheduled_ci_generation.untagged(),
+                        RefreshKind::Loc { .. } => scheduled_loc_generation.untagged(),
+                        RefreshKind::UsagePoll => scheduled_usage_generation.untagged(),
+                        RefreshKind::WeatherPoll => scheduled_weather_generation.untagged(),
+                        _ => {}
+                    }
+                    kind
+                }
             };
             // While offline, skip the network-backed refresh backstops (the
             // local sidebar hydration still runs). Read once per drained kind.
@@ -11889,7 +11910,9 @@ async fn event_loop<T: Terminal>(
                     false,
                     current_config.model_proxy.enabled,
                     current_config.model_proxy.budget.clone(),
-                    scheduled_usage_generation,
+                    scheduled_usage_generation
+                        .generation()
+                        .map(|generation| (schedule.fence(), generation)),
                 ),
                 RefreshKind::Usage(p) => {
                     let p = *p;
@@ -11960,7 +11983,9 @@ async fn event_loop<T: Terminal>(
                             crate::calendar_docs::CalendarDocs::env_locale(),
                             refresh_tx.clone(),
                             waker.clone(),
-                            scheduled_weather_generation,
+                            scheduled_weather_generation
+                                .generation()
+                                .map(|generation| (schedule.fence(), generation)),
                         );
                     }
                 }
@@ -12161,7 +12186,9 @@ async fn event_loop<T: Terminal>(
                 current_config.issues.clone(),
                 current_config.disk.clone(),
                 Some(waker.clone()),
-                scheduled_pr_generation.map(|generation| (schedule.fence(), generation)),
+                scheduled_pr_generation
+                    .generation()
+                    .map(|generation| (schedule.fence(), generation)),
             );
             // If the PR view is open, re-fetch it too (just-posted comment/review).
             crate::actions::refetch_pr_view(
@@ -12178,7 +12205,9 @@ async fn event_loop<T: Terminal>(
                 current_config.calendar.clone(),
                 refresh_tx.clone(),
                 waker.clone(),
-                scheduled_calendar_generation,
+                scheduled_calendar_generation
+                    .generation()
+                    .map(|generation| (schedule.fence(), generation)),
             );
         }
         if want_reminder_check {
@@ -12190,7 +12219,9 @@ async fn event_loop<T: Terminal>(
                 current_config.calendar.clone(),
                 refresh_tx.clone(),
                 waker.clone(),
-                scheduled_reminder_generation,
+                scheduled_reminder_generation
+                    .generation()
+                    .map(|generation| (schedule.fence(), generation)),
             );
         }
         if want_issue_refresh {
@@ -12226,7 +12257,9 @@ async fn event_loop<T: Terminal>(
                 &waker,
                 ci_refresh_force,
                 &mut bar_detail,
-                scheduled_ci_generation.map(|generation| (schedule.fence(), generation)),
+                scheduled_ci_generation
+                    .generation()
+                    .map(|generation| (schedule.fence(), generation)),
             );
         }
         // Both measurement scans carry their own inflight guard and background
@@ -12251,7 +12284,9 @@ async fn event_loop<T: Terminal>(
                 Some(active_tab_path(&session)),
                 loc_refresh_watch,
                 Some(waker.clone()),
-                scheduled_loc_generation.map(|generation| (schedule.fence(), generation)),
+                scheduled_loc_generation
+                    .generation()
+                    .map(|generation| (schedule.fence(), generation)),
             );
         }
         if want_auto_fetch {

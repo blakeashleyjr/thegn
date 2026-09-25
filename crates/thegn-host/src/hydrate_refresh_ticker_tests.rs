@@ -348,6 +348,8 @@ fn startup_and_periodic_requests_coalesce_in_the_running_shared_ticker() {
 #[test]
 fn live_replace_rearms_changed_slot_without_an_immediate_request() {
     let old = configured();
+    let mut middle = old.clone();
+    middle.ci.poll_interval_secs = 7;
     let mut new = old.clone();
     new.ci.poll_interval_secs = 10;
 
@@ -356,12 +358,12 @@ fn live_replace_rearms_changed_slot_without_an_immediate_request() {
     let (finished, completion) = mpsc::sync_channel(1);
     let (tx, mut refresh) = tokio_mpsc::unbounded_channel();
     let observed = Arc::new(Mutex::new(Observations::default()));
-    let (commands, command_rx) = mpsc::channel();
+    let commands = Arc::new(Mutex::new(None));
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let worker = spawn_worker_with_commands(
         Cadences::from_schedule(&ScheduleConfig::from_config(&old)),
         Arc::new(AtomicU64::new(1)),
-        command_rx,
+        commands.clone(),
         stop.clone(),
         tx,
         FixtureIo {
@@ -373,12 +375,18 @@ fn live_replace_rearms_changed_slot_without_an_immediate_request() {
         },
         || {},
     );
-    commands
-        .send(TickerCommand::Replace {
-            schedule: ScheduleConfig::from_config(&new),
-            generation: 2,
-        })
-        .unwrap();
+    let ticker = RefreshTicker {
+        command: commands,
+        stop,
+        worker: Some(worker),
+    };
+    let mut owner = crate::hydrate_schedule::ScheduleOwner::from_test(
+        ticker,
+        ScheduleConfig::from_config(&old),
+        Arc::new(AtomicU64::new(1)),
+    );
+    owner.reconfigure(&middle);
+    owner.reconfigure(&new);
 
     let mut ci_ticks = Vec::new();
     for tick in 1..=20 {
@@ -386,7 +394,7 @@ fn live_replace_rearms_changed_slot_without_an_immediate_request() {
         assert_eq!(receipts.recv_timeout(LIMIT).unwrap(), tick);
         while let Ok(event) = refresh.try_recv() {
             if let RefreshKind::Scheduled { generation, kind } = event
-                && generation == 2
+                && generation == 3
                 && matches!(*kind, RefreshKind::Ci { force: false })
             {
                 ci_ticks.push(tick);
@@ -400,7 +408,6 @@ fn live_replace_rearms_changed_slot_without_an_immediate_request() {
         "the replacement must wait for its next boundary"
     );
     drop(permits);
-    stop.store(true, Ordering::Release);
+    owner.shutdown();
     completion.recv_timeout(LIMIT).unwrap();
-    worker.join().unwrap();
 }

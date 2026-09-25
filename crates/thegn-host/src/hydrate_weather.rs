@@ -59,7 +59,7 @@ pub(crate) fn spawn_poll_with_generation(
     locale: Option<String>,
     tx: tokio_mpsc::UnboundedSender<RefreshKind>,
     waker: TerminalWaker,
-    generation: Option<u64>,
+    generation: Option<crate::hydrate_schedule::ScheduleFence>,
 ) {
     tokio::task::spawn_blocking(move || poll(cfg, locale, &tx, &waker, generation));
 }
@@ -70,7 +70,7 @@ fn poll(
     locale: Option<String>,
     tx: &tokio_mpsc::UnboundedSender<RefreshKind>,
     waker: &TerminalWaker,
-    generation: Option<u64>,
+    generation: Option<crate::hydrate_schedule::ScheduleFence>,
 ) {
     // Belt-and-braces: the ticker already emits no slot at all when weather is
     // inert, so this only catches a programmatically-built config.
@@ -98,7 +98,7 @@ fn poll(
     // considered, so a cold launch paints from disk.
     let cached = db.as_ref().and_then(|db| read_cache(db, &key));
     if let Some(snap) = &cached {
-        deliver(tx, waker, snap.clone(), generation);
+        deliver(tx, waker, snap.clone(), generation.as_ref());
     }
 
     let offline = thegn_core::connectivity::current() == Connectivity::Offline;
@@ -136,10 +136,12 @@ fn poll(
     match rt.block_on(provider.fetch()) {
         Ok(snap) => {
             thegn_core::connectivity::report_success();
-            if let Some(db) = db.as_ref() {
+            if let Some(db) = db.as_ref()
+                && crate::hydrate_schedule::generation_is_current(generation.as_ref())
+            {
                 write_cache(db, &key, &snap);
             }
-            deliver(tx, waker, snap, generation);
+            deliver(tx, waker, snap, generation.as_ref());
         }
         Err(e) => {
             // Only a transport failure is evidence about the link: an `Api` or a
@@ -229,11 +231,14 @@ fn deliver(
     tx: &tokio_mpsc::UnboundedSender<RefreshKind>,
     waker: &TerminalWaker,
     snap: WeatherSnapshot,
-    generation: Option<u64>,
+    generation: Option<&crate::hydrate_schedule::ScheduleFence>,
 ) {
+    if !crate::hydrate_schedule::generation_is_current(generation) {
+        return;
+    }
     let result = RefreshKind::Weather(Box::new(snap));
-    let result = generation.map_or(result.clone(), |generation| RefreshKind::Scheduled {
-        generation,
+    let result = generation.map_or(result.clone(), |(_, generation)| RefreshKind::Scheduled {
+        generation: *generation,
         kind: Box::new(result),
     });
     if tx.send(result).is_err() {

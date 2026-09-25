@@ -12,6 +12,34 @@ use std::sync::{
 
 use thegn_core::config::Config;
 
+pub(crate) type ScheduleFence = (Arc<AtomicU64>, u64);
+
+/// The drain coalesces scheduled and event-driven requests for each class.
+/// Once an untagged request joins that work, it must win over every scheduled
+/// request in the same drain, regardless of arrival order.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RefreshGeneration(Option<Option<u64>>);
+
+impl RefreshGeneration {
+    pub(crate) fn scheduled(&mut self, generation: u64) {
+        if self.0 != Some(None) {
+            self.0 = Some(Some(generation));
+        }
+    }
+
+    pub(crate) fn untagged(&mut self) {
+        self.0 = Some(None);
+    }
+
+    pub(crate) fn generation(self) -> Option<u64> {
+        self.0.flatten()
+    }
+}
+
+pub(crate) fn generation_is_current(generation: Option<&ScheduleFence>) -> bool {
+    generation.is_none_or(|(current, expected)| current.load(Ordering::Acquire) == *expected)
+}
+
 /// The configuration that actually changes the shared hydration schedule.
 /// Keeping this projection narrow means a theme or unrelated config edit does
 /// not restart a ticker.
@@ -129,6 +157,19 @@ impl ScheduleOwner {
         self.effective = next.clone();
         let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
         self.ticker.reconfigure(next, generation);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_test(
+        ticker: crate::hydrate::RefreshTicker,
+        effective: ScheduleConfig,
+        generation: Arc<AtomicU64>,
+    ) -> Self {
+        Self {
+            ticker,
+            effective,
+            generation,
+        }
     }
 
     pub(crate) fn is_current(&self, generation: u64) -> bool {
@@ -280,5 +321,51 @@ mod tests {
         }
         assert_ne!(current.load(Ordering::Acquire), 2);
         assert_eq!(current.load(Ordering::Acquire), 4);
+    }
+
+    #[test]
+    fn untagged_refresh_wins_even_when_scheduled_request_arrives_after_it() {
+        let mut request = RefreshGeneration::default();
+        request.untagged();
+        request.scheduled(9);
+        assert_eq!(request.generation(), None);
+
+        request = RefreshGeneration::default();
+        request.scheduled(8);
+        request.untagged();
+        assert_eq!(request.generation(), None);
+    }
+
+    #[test]
+    fn publication_fence_rejects_a_result_after_reload() {
+        let current = Arc::new(AtomicU64::new(7));
+        let fence = (current.clone(), 7);
+        assert!(generation_is_current(Some(&fence)));
+        current.store(8, Ordering::Release);
+        assert!(!generation_is_current(Some(&fence)));
+        // The untagged path has no fence and remains publishable.
+        assert!(generation_is_current(None));
+    }
+
+    #[test]
+    fn all_live_classes_can_be_coalesced_as_untagged_work() {
+        for class in [
+            "pr",
+            "ci",
+            "calendar",
+            "reminders",
+            "loc",
+            "usage",
+            "weather",
+        ] {
+            let mut request = RefreshGeneration::default();
+            request.scheduled(11);
+            request.untagged();
+            assert_eq!(
+                request.generation(),
+                None,
+                "{class} inherited a stale fence"
+            );
+        }
     }
 }

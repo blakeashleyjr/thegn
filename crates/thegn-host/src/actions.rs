@@ -528,11 +528,12 @@ pub(crate) fn spawn_usage_with_generation(
     interactive: bool,
     proxy_enabled: bool,
     proxy_budget: thegn_core::config::BudgetConfig,
-    generation: Option<u64>,
+    generation: Option<crate::hydrate_schedule::ScheduleFence>,
 ) {
     let tx = refresh_tx.clone();
     let cfg_for_rollup = cfg.clone();
     let waker_for_work = waker.clone();
+    let generation_for_work = generation.clone();
     let work = move || {
         let waker = waker_for_work;
         let started = std::time::Instant::now();
@@ -567,7 +568,10 @@ pub(crate) fn spawn_usage_with_generation(
             elapsed_ms = started.elapsed().as_millis() as u64,
             "usage gather"
         );
-        let history = record_usage_history(&cfg, &accounts);
+        if !crate::hydrate_schedule::generation_is_current(generation_for_work.as_ref()) {
+            return;
+        }
+        let history = record_usage_history(&cfg, &accounts, generation_for_work.as_ref());
         if proxy_enabled && proxy_budget.enabled {
             notify_proxy_budget_breaches(&proxy_budget);
         }
@@ -580,11 +584,15 @@ pub(crate) fn spawn_usage_with_generation(
             proxy_spend,
         };
         let result = RefreshKind::Usage(Box::new(payload));
-        let result = generation.map_or(result.clone(), |generation| RefreshKind::Scheduled {
-            generation,
-            kind: Box::new(result),
-        });
-        if tx.send(result).is_ok() {
+        let result = generation_for_work
+            .as_ref()
+            .map_or(result.clone(), |(_, generation)| RefreshKind::Scheduled {
+                generation: *generation,
+                kind: Box::new(result),
+            });
+        if crate::hydrate_schedule::generation_is_current(generation_for_work.as_ref())
+            && tx.send(result).is_ok()
+        {
             let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
     };
@@ -604,7 +612,7 @@ fn spawn_usage_rollup(
     refresh_tx: &UnboundedSender<RefreshKind>,
     waker: &TerminalWaker,
     cfg: thegn_core::config::UsageConfig,
-    generation: Option<u64>,
+    generation: Option<crate::hydrate_schedule::ScheduleFence>,
 ) {
     if !cfg.token_rollups || !usage_rollup_due() {
         return;
@@ -628,11 +636,15 @@ fn spawn_usage_rollup(
             skipped: r.skipped,
         };
         let result = RefreshKind::UsageTokens(Box::new(view));
-        let result = generation.map_or(result.clone(), |generation| RefreshKind::Scheduled {
-            generation,
-            kind: Box::new(result),
-        });
-        if tx.send(result).is_ok() {
+        let result = generation
+            .as_ref()
+            .map_or(result.clone(), |(_, generation)| RefreshKind::Scheduled {
+                generation: *generation,
+                kind: Box::new(result),
+            });
+        if crate::hydrate_schedule::generation_is_current(generation.as_ref())
+            && tx.send(result).is_ok()
+        {
             let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
     });
@@ -671,6 +683,7 @@ fn usage_rollup_due() -> bool {
 fn record_usage_history(
     cfg: &thegn_core::config::UsageConfig,
     accounts: &[thegn_core::usage::AccountUsage],
+    generation: Option<&crate::hydrate_schedule::ScheduleFence>,
 ) -> std::collections::BTreeMap<String, Vec<(i64, f32)>> {
     use thegn_core::store::{UsageSample, UsageStore};
     let mut out = std::collections::BTreeMap::new();
@@ -698,9 +711,13 @@ fn record_usage_history(
         })
         .collect();
     // best-effort: history is a nicety; a write failure must not fail the poll.
-    let _ = db.put_usage_samples(&samples);
+    if crate::hydrate_schedule::generation_is_current(generation) {
+        let _ = db.put_usage_samples(&samples);
+    }
     let since = now.saturating_sub(i64::from(cfg.history_days) * 86_400);
-    let _ = db.prune_usage_samples(since); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+    if crate::hydrate_schedule::generation_is_current(generation) {
+        let _ = db.prune_usage_samples(since); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+    }
     for s in &samples {
         let hist = db
             .usage_history(&s.account_key, &s.window, since)

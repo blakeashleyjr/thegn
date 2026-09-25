@@ -22,7 +22,7 @@ use tokio::sync::mpsc as tokio_mpsc;
 /// while the model/PR cadences (default 1s/20s, model tunable via
 /// `THEGN_MODEL_REFRESH_MS`) stay whole multiples of the half-tick.
 pub(crate) struct RefreshTicker {
-    command: std::sync::mpsc::Sender<TickerCommand>,
+    command: CommandSlot,
     stop: Arc<AtomicBool>,
     worker: Option<std::thread::JoinHandle<()>>,
 }
@@ -34,9 +34,19 @@ enum TickerCommand {
     },
 }
 
+type CommandSlot = Arc<std::sync::Mutex<Option<TickerCommand>>>;
+
 impl RefreshTicker {
     pub(crate) fn reconfigure(&self, schedule: ScheduleConfig, generation: u64) {
-        let _ = self.command.send(TickerCommand::Replace {
+        let mut command = self
+            .command
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Reconfiguration intentionally does not wake the worker: it observes
+        // the newest projection at its next existing 500ms boundary. In-flight
+        // provider calls are allowed to finish and are discarded at their
+        // generation fence rather than being hard-cancelled here.
+        command.replace(TickerCommand::Replace {
             schedule,
             generation,
         });
@@ -72,12 +82,12 @@ pub(crate) fn spawn_refresh_ticker(
     disk_path: std::path::PathBuf,
     waker: TerminalWaker,
 ) -> RefreshTicker {
-    let (command, commands) = std::sync::mpsc::channel();
+    let command = Arc::new(std::sync::Mutex::new(None));
     let stop = Arc::new(AtomicBool::new(false));
     let worker = spawn_worker_with_commands(
         Cadences::from_schedule(&schedule),
         generation,
-        commands,
+        command.clone(),
         stop.clone(),
         tx,
         LiveIo {
@@ -192,7 +202,7 @@ fn spawn_worker(
 fn spawn_worker_with_commands(
     cadences: Cadences,
     _generation: Arc<AtomicU64>,
-    commands: std::sync::mpsc::Receiver<TickerCommand>,
+    commands: CommandSlot,
     stop: Arc<AtomicBool>,
     tx: tokio_mpsc::UnboundedSender<RefreshKind>,
     io: impl TickerIo,
@@ -204,7 +214,7 @@ fn spawn_worker_with_commands(
 fn spawn_worker_inner(
     cadences: Cadences,
     generation: u64,
-    commands: Option<std::sync::mpsc::Receiver<TickerCommand>>,
+    commands: Option<CommandSlot>,
     stop: Option<Arc<AtomicBool>>,
     tx: tokio_mpsc::UnboundedSender<RefreshKind>,
     mut io: impl TickerIo,
@@ -316,10 +326,10 @@ fn spawn_worker_inner(
                 break;
             }
             if let Some(commands) = &commands {
-                let mut replacement = None;
-                while let Ok(command) = commands.try_recv() {
-                    replacement = Some(command);
-                }
+                let replacement = commands
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .take();
                 if let Some(TickerCommand::Replace {
                     schedule,
                     generation,

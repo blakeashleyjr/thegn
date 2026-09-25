@@ -141,7 +141,7 @@ pub(crate) fn spawn_periodic_sync_with_generation(
     cfg: CalendarConfig,
     tx: tokio_mpsc::UnboundedSender<RefreshKind>,
     waker: TerminalWaker,
-    generation: Option<u64>,
+    generation: Option<crate::hydrate_schedule::ScheduleFence>,
 ) {
     crate::sched::spawn_bg(move || {
         let Ok(db) = Db::open() else { return };
@@ -149,9 +149,15 @@ pub(crate) fn spawn_periodic_sync_with_generation(
             .with_timezone(&home_zone(&cfg))
             .date_naive();
         let (from, to) = horizon(&cfg, today);
-        let changed = sync_accounts(&db, &cfg, from, to, false, &mut |m| {
-            toast(&tx, &waker, m, generation)
-        });
+        let changed = sync_accounts_with_generation(
+            &db,
+            &cfg,
+            from,
+            to,
+            false,
+            generation.as_ref(),
+            &mut |m| toast(&tx, &waker, m, generation.clone()),
+        );
         if !changed {
             return;
         }
@@ -167,7 +173,7 @@ pub(crate) fn spawn_periodic_sync_with_generation(
             today.year(),
             today.month(),
             month_view,
-            generation,
+            generation.as_ref(),
         );
     });
 }
@@ -218,16 +224,21 @@ fn toast(
     tx: &tokio_mpsc::UnboundedSender<RefreshKind>,
     waker: &TerminalWaker,
     message: String,
-    generation: Option<u64>,
+    generation: Option<crate::hydrate_schedule::ScheduleFence>,
 ) {
     let result = RefreshKind::Toast {
         message,
         priority: thegn_core::notification::Priority::Alert,
     };
-    let result = generation.map_or(result.clone(), |generation| RefreshKind::Scheduled {
-        generation,
-        kind: Box::new(result),
-    });
+    if !crate::hydrate_schedule::generation_is_current(generation.as_ref()) {
+        return;
+    }
+    let result = generation
+        .as_ref()
+        .map_or(result.clone(), |(_, generation)| RefreshKind::Scheduled {
+            generation: *generation,
+            kind: Box::new(result),
+        });
     if tx.send(result).is_ok() {
         // best-effort: the loop may already be shutting down.
         let _ = waker.wake();
@@ -242,6 +253,18 @@ fn sync_accounts(
     from: NaiveDate,
     to: NaiveDate,
     force: bool,
+    notify: &mut dyn FnMut(String),
+) -> bool {
+    sync_accounts_with_generation(db, cfg, from, to, force, None, notify)
+}
+
+fn sync_accounts_with_generation(
+    db: &Db,
+    cfg: &CalendarConfig,
+    from: NaiveDate,
+    to: NaiveDate,
+    force: bool,
+    generation: Option<&crate::hydrate_schedule::ScheduleFence>,
     notify: &mut dyn FnMut(String),
 ) -> bool {
     let accounts = cfg.active_accounts();
@@ -318,7 +341,15 @@ fn sync_accounts(
                 if e.is_transient() {
                     thegn_core::connectivity::report_failure();
                 }
-                record_failure(db, &r.account, r.provider, &e, &prior_errors, notify);
+                record_failure(
+                    db,
+                    &r.account,
+                    r.provider,
+                    &e,
+                    &prior_errors,
+                    notify,
+                    generation,
+                );
                 return;
             }
         };
@@ -337,7 +368,7 @@ fn sync_accounts(
                 "cache rows exceed the shared budget — writing them anyway"
             );
         }
-        if apply_page(db, &r.account, r.provider, &page, from, to) {
+        if apply_page_with_generation(db, &r.account, r.provider, &page, from, to, generation) {
             changed = true;
         }
     }));
@@ -354,6 +385,7 @@ fn record_failure(
     e: &CalendarError,
     prior_errors: &BTreeMap<String, String>,
     notify: &mut dyn FnMut(String),
+    generation: Option<&crate::hydrate_schedule::ScheduleFence>,
 ) {
     tracing::warn!(
         target: "thegn::calendar",
@@ -379,10 +411,14 @@ fn record_failure(
                 );
                 notify(format!("Calendar \"{}\": {message}", name.as_str()));
             }
-            let _ = db.set_calendar_error(account, &message); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+            if crate::hydrate_schedule::generation_is_current(generation) {
+                let _ = db.set_calendar_error(account, &message); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+            }
         }
         _ => {
-            let _ = db.set_calendar_error(account, &e.to_string()); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+            if crate::hydrate_schedule::generation_is_current(generation) {
+                let _ = db.set_calendar_error(account, &e.to_string()); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+            }
         }
     }
 }
@@ -396,12 +432,26 @@ fn apply_page(
     from: NaiveDate,
     to: NaiveDate,
 ) -> bool {
+    apply_page_with_generation(db, account, provider, page, from, to, None)
+}
+
+fn apply_page_with_generation(
+    db: &Db,
+    account: &str,
+    provider: &str,
+    page: &EventPage,
+    from: NaiveDate,
+    to: NaiveDate,
+    generation: Option<&crate::hydrate_schedule::ScheduleFence>,
+) -> bool {
     let (from_ms, to_ms) = (day_ms(from), day_ms(to));
 
     // A conditional fetch that came back 304: nothing to write, but the sync
     // stamp must still advance or we would re-hit the provider every tick.
     if page.is_unchanged() {
-        let _ = db.put_calendar_sync(account, provider, page.sync_token(), from_ms, to_ms); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+        if crate::hydrate_schedule::generation_is_current(generation) {
+            let _ = db.put_calendar_sync(account, provider, page.sync_token(), from_ms, to_ms); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+        }
         return false;
     }
 
@@ -417,19 +467,31 @@ fn apply_page(
             account = %account,
             "empty full fetch — keeping the prior cache rather than erasing it"
         );
-        let _ = db.set_calendar_error(account, "provider returned an empty calendar"); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+        if crate::hydrate_schedule::generation_is_current(generation) {
+            let _ = db.set_calendar_error(account, "provider returned an empty calendar"); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+        }
         return false;
     }
 
     let rows: Vec<CalendarRow> = page.events().iter().map(row_of).collect();
+    if !crate::hydrate_schedule::generation_is_current(generation) {
+        return false;
+    }
     let wrote = if incremental {
         let put = db.put_calendar_events(account, &rows);
-        let del = db.delete_calendar_events(account, page.deleted());
+        let del = if crate::hydrate_schedule::generation_is_current(generation) {
+            db.delete_calendar_events(account, page.deleted())
+        } else {
+            return false;
+        };
         put.is_ok() && del.is_ok()
     } else {
         db.replace_calendar_account(account, &rows).is_ok()
     };
     if !wrote {
+        return false;
+    }
+    if !crate::hydrate_schedule::generation_is_current(generation) {
         return false;
     }
     let _ = db.put_calendar_sync(account, provider, page.sync_token(), from_ms, to_ms); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
@@ -624,7 +686,7 @@ pub(crate) fn spawn_reminder_check_with_generation(
     cfg: CalendarConfig,
     tx: tokio_mpsc::UnboundedSender<RefreshKind>,
     waker: TerminalWaker,
-    generation: Option<u64>,
+    generation: Option<crate::hydrate_schedule::ScheduleFence>,
 ) {
     if !reminders_configured(&cfg) {
         cursor.skip(now_ms);
@@ -652,7 +714,12 @@ pub(crate) fn spawn_reminder_check_with_generation(
             Ok(db) => match due_reminders(&db, &cfg, window) {
                 Ok(due) => {
                     for r in &due.reminders {
-                        crate::handlers::calendar::raise_reminder(r, &waker);
+                        // Fence at the notification boundary: in-flight DB
+                        // work may finish, but replaced schedules never raise
+                        // stale reminders.
+                        if crate::hydrate_schedule::generation_is_current(generation.as_ref()) {
+                            crate::handlers::calendar::raise_reminder(r, &waker);
+                        }
                     }
                     match due.skipped {
                         0 => ReminderOutcome::Complete,
@@ -672,7 +739,7 @@ struct ReminderAck {
     waker: TerminalWaker,
     window: ReminderWindow,
     outcome: ReminderOutcome,
-    generation: Option<u64>,
+    generation: Option<crate::hydrate_schedule::ScheduleFence>,
 }
 
 impl Drop for ReminderAck {
@@ -683,8 +750,9 @@ impl Drop for ReminderAck {
         };
         let result = self
             .generation
-            .map_or(result.clone(), |generation| RefreshKind::Scheduled {
-                generation,
+            .as_ref()
+            .map_or(result.clone(), |(_, generation)| RefreshKind::Scheduled {
+                generation: *generation,
                 kind: Box::new(result),
             });
         let sent = self.tx.send(result);
@@ -789,8 +857,11 @@ fn deliver(
     year: i32,
     month: u32,
     view: MonthView,
-    generation: Option<u64>,
+    generation: Option<&crate::hydrate_schedule::ScheduleFence>,
 ) {
+    if !crate::hydrate_schedule::generation_is_current(generation) {
+        return;
+    }
     if let Some(error) = view.error {
         // A fixed label, never event content.
         tracing::warn!(
@@ -807,8 +878,8 @@ fn deliver(
         error: view.error,
     };
     let result = RefreshKind::CalendarMonth(Box::new(payload));
-    let result = generation.map_or(result.clone(), |generation| RefreshKind::Scheduled {
-        generation,
+    let result = generation.map_or(result.clone(), |(_, generation)| RefreshKind::Scheduled {
+        generation: *generation,
         kind: Box::new(result),
     });
     if tx.send(result).is_ok() {
