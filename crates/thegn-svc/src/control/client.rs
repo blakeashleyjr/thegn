@@ -1194,15 +1194,10 @@ fn origin_request_url(origin: &str, path: &str) -> Result<reqwest::Url> {
 
 fn origin_authority(origin: &str) -> Result<String> {
     let url = parse_http_origin(origin)?;
-    let raw_host = url.host_str().context("control HTTP origin has no host")?;
-    let host = if raw_host.contains(':') {
-        format!("[{raw_host}]")
-    } else {
-        raw_host.to_string()
-    };
+    let host = url.host().context("control HTTP origin has no host")?;
     Ok(match url.port() {
         Some(port) => format!("{host}:{port}"),
-        None => host,
+        None => host.to_string(),
     })
 }
 
@@ -1661,6 +1656,79 @@ mod tests {
             websocket_url("http://127.0.0.1:5380", "/v1/events?kinds=exit").unwrap(),
             "ws://127.0.0.1:5380/v1/events?kinds=exit"
         );
+    }
+
+    #[test]
+    fn http_origin_authority_matches_unary_and_websocket_endpoints() {
+        for (origin, authority, request_url, websocket) in [
+            (
+                "https://[::1]:8443",
+                "[::1]:8443",
+                "https://[::1]:8443/v1/events",
+                "wss://[::1]:8443/v1/events",
+            ),
+            (
+                "https://[::1]",
+                "[::1]",
+                "https://[::1]/v1/events",
+                "wss://[::1]/v1/events",
+            ),
+            (
+                "https://[::1]:443",
+                "[::1]",
+                "https://[::1]/v1/events",
+                "wss://[::1]/v1/events",
+            ),
+            (
+                "http://127.0.0.1",
+                "127.0.0.1",
+                "http://127.0.0.1/v1/events",
+                "ws://127.0.0.1/v1/events",
+            ),
+            (
+                "http://127.0.0.1:80",
+                "127.0.0.1",
+                "http://127.0.0.1/v1/events",
+                "ws://127.0.0.1/v1/events",
+            ),
+            (
+                "http://127.0.0.1:5380",
+                "127.0.0.1:5380",
+                "http://127.0.0.1:5380/v1/events",
+                "ws://127.0.0.1:5380/v1/events",
+            ),
+            (
+                "https://control.example.test",
+                "control.example.test",
+                "https://control.example.test/v1/events",
+                "wss://control.example.test/v1/events",
+            ),
+            (
+                "https://control.example.test:8443",
+                "control.example.test:8443",
+                "https://control.example.test:8443/v1/events",
+                "wss://control.example.test:8443/v1/events",
+            ),
+        ] {
+            assert_eq!(origin_authority(origin).unwrap(), authority, "{origin}");
+            assert_eq!(
+                origin_request_url(origin, "/v1/events")
+                    .unwrap()
+                    .to_string(),
+                request_url,
+                "{origin} unary endpoint"
+            );
+            assert_eq!(
+                websocket_url(origin, "/v1/events").unwrap(),
+                websocket,
+                "{origin}"
+            );
+        }
+    }
+
+    #[test]
+    fn http_origin_rejects_scoped_ipv6_zone_ids_with_url_2_5_8() {
+        assert!(parse_http_origin("https://[fe80::1%25eth0]/").is_err());
     }
 
     #[tokio::test]
