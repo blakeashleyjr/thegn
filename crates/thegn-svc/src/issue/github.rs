@@ -293,7 +293,7 @@ fn gh_issue_to_domain_with_host(
 const GH_LIST_FIELDS: &str = "number,title,state,body,assignees,labels,url,updatedAt";
 
 impl IssueBackend for GitHubIssuesBackend {
-    fn provider_id(&self) -> &'static str {
+    fn provider_id(&self) -> &str {
         "github"
     }
 

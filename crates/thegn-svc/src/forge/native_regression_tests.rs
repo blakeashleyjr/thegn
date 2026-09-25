@@ -1,4 +1,5 @@
 use super::*;
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -33,6 +34,16 @@ pub(super) fn runtime() -> tokio::runtime::Runtime {
 }
 
 #[test]
+fn runtime_failure_keeps_dynamic_message_in_owned_not_configured_payload() {
+    let error = runtime_error("fixture runtime failure");
+    let ForgeError::NotConfigured(message) = error else {
+        panic!("runtime failure was not classified as not configured");
+    };
+    assert!(matches!(&message, Cow::Owned(_)));
+    assert_eq!(message, "no runtime: fixture runtime failure");
+}
+
+#[test]
 fn sdk_graphql_envelopes_fall_through_without_offline_evidence() {
     let rt = runtime();
     rt.block_on(async {
@@ -49,7 +60,10 @@ fn sdk_graphql_envelopes_fall_through_without_offline_evidence() {
                 &health,
             )
             .await;
-            assert_eq!(result, Err(ForgeError::NotConfigured("GraphQL errors")));
+            assert_eq!(
+                result,
+                Err(ForgeError::NotConfigured("GraphQL errors".into()))
+            );
             assert!(result.unwrap_err().falls_through());
             assert_eq!(health.failures.load(Ordering::Relaxed), 0);
         }
@@ -217,12 +231,8 @@ fn strict_origin_identity_rejects_foreign_path_and_authority_confusion_before_to
             Some("private-never-sent-token".into())
         });
         assert!(
-            matches!(
-                result,
-                Err(ForgeError::NotConfigured(
-                    "origin is not a public GitHub remote"
-                ))
-            ),
+            matches!(&result, Err(ForgeError::NotConfigured(message))
+                if message.to_string() == "origin is not a public GitHub remote"),
             "{origin:?}: {result:?}"
         );
         assert_eq!(token_calls.get(), 0, "foreign origin reached credentials");

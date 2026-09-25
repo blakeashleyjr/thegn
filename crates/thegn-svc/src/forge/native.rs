@@ -15,6 +15,7 @@
 //! runtime handle.
 
 use serde_json::Value;
+use std::borrow::Cow;
 use std::collections::HashSet;
 use thegn_core::forge::checkout::{ForgeCheckoutScope, checkout_scope};
 use thegn_core::forge::model::*;
@@ -31,6 +32,10 @@ fn github_parts(identity: &ForgeRepoIdentity) -> Option<(String, String)> {
         return None;
     }
     Some((owner.to_string(), repo.to_string()))
+}
+
+fn runtime_error(error: impl std::fmt::Display) -> ForgeError {
+    ForgeError::NotConfigured(Cow::Owned(format!("no runtime: {error}")))
 }
 
 /// Source a GitHub token for the octocrab native impl. Precedence:
@@ -95,31 +100,35 @@ fn parse_graphql_pr_list_page(resp: &Value) -> Result<(Vec<PrHeader>, Option<Str
         .and_then(Value::as_array)
         .is_some_and(|errors| !errors.is_empty())
     {
-        return Err(ForgeError::NotConfigured("GraphQL PR list response errors"));
+        return Err(ForgeError::NotConfigured(
+            "GraphQL PR list response errors".into(),
+        ));
     }
     let data = resp.get("data").unwrap_or(resp);
     let nodes = data
         .pointer("/repository/pullRequests/nodes")
         .and_then(Value::as_array)
-        .ok_or(ForgeError::NotConfigured("malformed GraphQL PR list nodes"))?;
+        .ok_or(ForgeError::NotConfigured(
+            "malformed GraphQL PR list nodes".into(),
+        ))?;
     let rows = nodes
         .iter()
         .map(|node| {
             serde_json::from_value(node.clone())
-                .map_err(|_| ForgeError::NotConfigured("malformed GraphQL PR list node"))
+                .map_err(|_| ForgeError::NotConfigured("malformed GraphQL PR list node".into()))
         })
         .collect::<Result<Vec<PrHeader>, _>>()?;
     let info = data
         .pointer("/repository/pullRequests/pageInfo")
         .and_then(Value::as_object)
         .ok_or(ForgeError::NotConfigured(
-            "malformed GraphQL PR list pageInfo",
+            "malformed GraphQL PR list pageInfo".into(),
         ))?;
     let has_next =
         info.get("hasNextPage")
             .and_then(Value::as_bool)
             .ok_or(ForgeError::NotConfigured(
-                "malformed GraphQL PR list hasNextPage",
+                "malformed GraphQL PR list hasNextPage".into(),
             ))?;
     let next = if has_next {
         Some(
@@ -127,7 +136,7 @@ fn parse_graphql_pr_list_page(resp: &Value) -> Result<(Vec<PrHeader>, Option<Str
                 .and_then(Value::as_str)
                 .filter(|cursor| !cursor.is_empty())
                 .ok_or(ForgeError::NotConfigured(
-                    "GraphQL PR list hasNextPage without cursor",
+                    "GraphQL PR list hasNextPage without cursor".into(),
                 ))?
                 .to_string(),
         )
@@ -162,7 +171,7 @@ where
         let next = next.expect("checked above");
         if !seen.insert(next.clone()) {
             return Err(ForgeError::NotConfigured(
-                "repeating GraphQL PR list cursor",
+                "repeating GraphQL PR list cursor".into(),
             ));
         }
         cursor = Some(next);
@@ -266,7 +275,7 @@ fn pick_pr_node<'a>(
     if candidates.is_empty() {
         return if missing_identity {
             Err(ForgeError::NotConfigured(
-                "PR response omitted head repository identity",
+                "PR response omitted head repository identity".into(),
             ))
         } else {
             Err(ForgeError::NoPr)
@@ -290,7 +299,7 @@ pub fn parse_graphql_pr_status(resp: &Value) -> Result<PrStatus, ForgeError> {
         .is_some_and(|errors| !errors.is_empty())
     {
         return Err(ForgeError::NotConfigured(
-            "GraphQL PR status response errors",
+            "GraphQL PR status response errors".into(),
         ));
     }
     let data = resp.get("data").unwrap_or(resp);
@@ -298,7 +307,7 @@ pub fn parse_graphql_pr_status(resp: &Value) -> Result<PrStatus, ForgeError> {
         .pointer("/repository/pullRequests/nodes")
         .and_then(Value::as_array)
         .ok_or(ForgeError::NotConfigured(
-            "malformed GraphQL PR status nodes",
+            "malformed GraphQL PR status nodes".into(),
         ))?;
     if nodes.is_empty() {
         return Err(ForgeError::NoPr);
@@ -310,14 +319,16 @@ pub fn parse_graphql_pr_status(resp: &Value) -> Result<PrStatus, ForgeError> {
         .and_then(owner_repo_from_url)
         .map(|(owner, repo)| format!("{owner}/{repo}"))
         .ok_or(ForgeError::NotConfigured(
-            "PR response omitted base identity",
+            "PR response omitted base identity".into(),
         ))?;
     let expected_branch = nodes
         .first()
         .and_then(|node| node.get("headRefName"))
         .and_then(Value::as_str)
         .filter(|branch| !branch.is_empty())
-        .ok_or(ForgeError::NotConfigured("PR response omitted head branch"))?;
+        .ok_or(ForgeError::NotConfigured(
+            "PR response omitted head branch".into(),
+        ))?;
     parse_graphql_pr_status_for(resp, &expected, expected_branch)
 }
 
@@ -332,11 +343,11 @@ fn parse_graphql_pr_status_for(
         .and_then(Value::as_array);
 
     let nodes = nodes.ok_or(ForgeError::NotConfigured(
-        "malformed GraphQL PR status nodes",
+        "malformed GraphQL PR status nodes".into(),
     ))?;
     match pick_pr_node(nodes, expected_head, expected_branch) {
         Err(ForgeError::NoPr) if nodes.len() >= 20 => Err(ForgeError::NotConfigured(
-            "PR response window did not prove branch absence",
+            "PR response window did not prove branch absence".into(),
         )),
         Err(error) => Err(error),
         Ok(node) => {
@@ -344,7 +355,9 @@ fn parse_graphql_pr_status_for(
                 .get("number")
                 .and_then(Value::as_u64)
                 .filter(|number| *number > 0)
-                .ok_or(ForgeError::NotConfigured("matched PR omitted its number"))?;
+                .ok_or(ForgeError::NotConfigured(
+                    "matched PR omitted its number".into(),
+                ))?;
             let s = |k: &str| {
                 node.get(k)
                     .and_then(Value::as_str)
@@ -502,20 +515,22 @@ impl GithubNative {
         // fixtures. Production PR operations use `gate`, which captures the
         // complete checkout scope before issuing a request.
         if loc.is_remote() {
-            return Err(ForgeError::NotConfigured("native layer is local-only"));
+            return Err(ForgeError::NotConfigured(
+                "native layer is local-only".into(),
+            ));
         }
         if circuit().is_open() {
             return Err(ForgeError::NotConfigured(
-                "circuit open after repeated failures",
+                "circuit open after repeated failures".into(),
             ));
         }
         let Some((owner, repo)) = self.owner_repo(loc) else {
             return Err(ForgeError::NotConfigured(
-                "origin is not a public GitHub remote",
+                "origin is not a public GitHub remote".into(),
             ));
         };
         let Some(token) = token() else {
-            return Err(ForgeError::NotConfigured("no GitHub token"));
+            return Err(ForgeError::NotConfigured("no GitHub token".into()));
         };
         Ok((token, owner, repo))
     }
@@ -526,47 +541,49 @@ impl GithubNative {
         token: impl FnOnce() -> Option<String>,
     ) -> Result<(String, ForgeCheckoutScope), ForgeError> {
         if loc.is_remote() {
-            return Err(ForgeError::NotConfigured("native layer is local-only"));
+            return Err(ForgeError::NotConfigured(
+                "native layer is local-only".into(),
+            ));
         }
         if circuit().is_open() {
             return Err(ForgeError::NotConfigured(
-                "circuit open after repeated failures",
+                "circuit open after repeated failures".into(),
             ));
         }
         let Some((origin_owner, origin_repo)) = self.owner_repo(loc) else {
             return Err(ForgeError::NotConfigured(
-                "origin is not a public GitHub remote",
+                "origin is not a public GitHub remote".into(),
             ));
         };
         let Some(token) = token() else {
-            return Err(ForgeError::NotConfigured("no GitHub token"));
+            return Err(ForgeError::NotConfigured("no GitHub token".into()));
         };
         let scope = checkout_scope(loc)?;
         let Some((scope_origin_owner, scope_origin_repo)) = github_parts(&scope.origin) else {
             return Err(ForgeError::NotConfigured(
-                "origin is not a public GitHub remote",
+                "origin is not a public GitHub remote".into(),
             ));
         };
         if !origin_owner.eq_ignore_ascii_case(&scope_origin_owner)
             || !origin_repo.eq_ignore_ascii_case(&scope_origin_repo)
         {
-            return Err(ForgeError::NotConfigured("origin identity changed"));
+            return Err(ForgeError::NotConfigured("origin identity changed".into()));
         }
         if github_parts(&scope.base).is_none() {
             return Err(ForgeError::NotConfigured(
-                "base is not a public GitHub remote",
+                "base is not a public GitHub remote".into(),
             ));
         };
         if github_parts(&scope.head).is_none() {
             return Err(ForgeError::NotConfigured(
-                "head is not a public GitHub remote",
+                "head is not a public GitHub remote".into(),
             ));
         }
         if !scope.origin.host.eq_ignore_ascii_case(&scope.base.host)
             || !scope.origin.host.eq_ignore_ascii_case(&scope.head.host)
         {
             return Err(ForgeError::NotConfigured(
-                "checkout repositories use different hosts",
+                "checkout repositories use different hosts".into(),
             ));
         }
         Ok((token, scope))
@@ -577,13 +594,11 @@ impl GithubNative {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .map_err(|e| {
-                ForgeError::NotConfigured(Box::leak(format!("no runtime: {e}").into_boxed_str()))
-            })?;
+            .map_err(runtime_error)?;
         let client = octocrab::OctocrabBuilder::new()
             .personal_token(token)
             .build()
-            .map_err(|_| ForgeError::NotConfigured("octocrab client build failed"))?;
+            .map_err(|_| ForgeError::NotConfigured("octocrab client build failed".into()))?;
         rt.block_on(graphql_request(
             &client,
             &body,
@@ -599,7 +614,9 @@ impl GithubNative {
 /// prove reachability even when authentication or the service itself failed.
 fn classify_error(error: &octocrab::Error) -> (ForgeError, bool) {
     match error {
-        octocrab::Error::Graphql { .. } => (ForgeError::NotConfigured("GraphQL errors"), true),
+        octocrab::Error::Graphql { .. } => {
+            (ForgeError::NotConfigured("GraphQL errors".into()), true)
+        }
         octocrab::Error::GitHub { source, .. } => {
             let code = source.status_code.as_u16();
             let error = match code {
@@ -694,7 +711,7 @@ impl Forge for GithubNative {
         }
         let (token, scope) = self.gate(loc)?;
         let (owner, repo) = github_parts(&scope.base).ok_or(ForgeError::NotConfigured(
-            "base is not a public GitHub repository",
+            "base is not a public GitHub repository".into(),
         ))?;
         let branch = scope.branch.clone();
         let body = serde_json::json!({
@@ -703,7 +720,7 @@ impl Forge for GithubNative {
         });
         let resp = self.graphql(token, body, "pr_status")?;
         let (head_owner, head_repo) = github_parts(&scope.head).ok_or(
-            ForgeError::NotConfigured("head is not a public GitHub repository"),
+            ForgeError::NotConfigured("head is not a public GitHub repository".into()),
         )?;
         let expected_head = format!("{head_owner}/{head_repo}");
         parse_graphql_pr_status_for(&resp, &expected_head, &branch)
