@@ -202,6 +202,13 @@ pub(crate) fn merge_glyph_scan(
 // literal and the loop drains by value, so `Copy` was never relied upon.
 #[derive(Clone, Debug)]
 pub(crate) enum RefreshKind {
+    /// A request emitted by the shared scheduler. The loop rejects an older
+    /// generation before starting any off-loop work; event-driven/user-forced
+    /// requests remain untagged and therefore are never fenced out.
+    Scheduled {
+        generation: u64,
+        kind: Box<RefreshKind>,
+    },
     Model,
     Pr,
     /// The wall clock crossed a display boundary, so the `date`/`clock` bar
@@ -392,11 +399,11 @@ const STARTUP_MEASURE_SLOT: u64 = 4;
 /// Floor (seconds) under the derived disk-pump cadence. `[disk]
 /// scan_interval_secs` drives the pump at a quarter of its value; this keeps a
 /// tiny configured TTL from turning the scanner into a spin loop.
-const DISK_PUMP_FLOOR_SECS: u64 = 15;
+pub(crate) const DISK_PUMP_FLOOR_SECS: u64 = 15;
 
 /// Floor (seconds) under the derived LOC-pump cadence. Higher than the disk
 /// floor because a tokei walk costs more than a `du`.
-const LOC_PUMP_FLOOR_SECS: u64 = 60;
+pub(crate) const LOC_PUMP_FLOOR_SECS: u64 = 60;
 
 /// Ticker slot of the one-shot first usage poll — 4s in. Same reasoning as
 /// [`STARTUP_FETCH_SLOT`]: the statusbar badge should fill promptly rather than
@@ -468,7 +475,7 @@ pub(crate) type PanePids = std::sync::Arc<std::sync::Mutex<std::sync::Arc<[(u32,
 
 #[path = "hydrate_refresh_ticker.rs"]
 mod refresh_ticker;
-pub(crate) use refresh_ticker::spawn_refresh_ticker;
+pub(crate) use refresh_ticker::{RefreshTicker, spawn_refresh_ticker};
 
 /// Drop session groups whose local worktree dir has vanished (deleted/moved
 /// outside thegn — including a merge-queue `on_landed = remove/detach` land)
@@ -3406,11 +3413,22 @@ pub(crate) fn spawn_pr_cache_refresh(
     disk_cfg: thegn_core::config::DiskConfig,
     waker: Option<TerminalWaker>,
 ) {
+    spawn_pr_cache_refresh_with_generation(cwd, cfg, disk_cfg, waker, None);
+}
+
+pub(crate) fn spawn_pr_cache_refresh_with_generation(
+    cwd: std::path::PathBuf,
+    cfg: thegn_core::config::IssuesConfig,
+    disk_cfg: thegn_core::config::DiskConfig,
+    waker: Option<TerminalWaker>,
+    generation: Option<(std::sync::Arc<std::sync::atomic::AtomicU64>, u64)>,
+) {
     // Takes the worktree path, NOT the Session: the refreshers only ever read
     // the active tab's path, and a by-value Session is a String-heavy deep
     // clone on the loop thread at every call site (4× per worktree switch).
     let branch_cwd = cwd.clone();
     let branch_waker = waker.clone();
+    let branch_generation = generation.clone();
     crate::sched::spawn_bg(move || {
         if !cwd.is_dir() {
             return;
@@ -3474,8 +3492,16 @@ pub(crate) fn spawn_pr_cache_refresh(
         ) {
             return;
         }
+        if generation.as_ref().is_some_and(|(current, expected)| {
+            current.load(std::sync::atomic::Ordering::Acquire) != *expected
+        }) {
+            return;
+        }
         // Feed the app-wide connectivity holder (this CLI path is the 20s PR
         // backstop + the offline recovery probe).
+        if !crate::hydrate_schedule::generation_is_current(generation.as_ref()) {
+            return;
+        }
         crate::connectivity_gate::report_pr_panel(&panel.state);
         let Ok(json) = serde_json::to_string(&panel) else {
             return;
@@ -3490,12 +3516,19 @@ pub(crate) fn spawn_pr_cache_refresh(
         // `pr_state_is_definitive` and `github.rs`'s Offline doc ("Stale cached
         // data may still be shown").
         if pr_state_is_definitive(&panel.state) {
-            let _ = db.put_pr_cache(&cache_key, &panel.branch, &json); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+            if crate::hydrate_schedule::generation_is_current(generation.as_ref()) {
+                let _ = db.put_pr_cache(&cache_key, &panel.branch, &json); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+            }
         }
 
         // Deep review data is a separate complete snapshot. Fetching either
         // half failing leaves the previous snapshot untouched, so an outage
         // cannot turn a useful cached conversation into a partial one.
+        if generation.as_ref().is_some_and(|(current, expected)| {
+            current.load(std::sync::atomic::Ordering::Acquire) != *expected
+        }) {
+            return;
+        }
         if let thegn_core::forge::model::PanelState::Pr(pr) = &panel.state
             && let Some((owner, repo)) = thegn_core::forge::model::owner_repo_from_url(&pr.url)
         {
@@ -3529,8 +3562,14 @@ pub(crate) fn spawn_pr_cache_refresh(
                 };
                 // Complete payload only; DB failures are cache misses on the
                 // next hydrate and do not affect the primary PR refresh.
-                let _ = db.put_pr_review_cache(&snapshot);
+                if crate::hydrate_schedule::generation_is_current(generation.as_ref()) {
+                    let _ = db.put_pr_review_cache(&snapshot);
+                }
             }
+        }
+
+        if !crate::hydrate_schedule::generation_is_current(generation.as_ref()) {
+            return;
         }
 
         // Typed automation edges come from authoritative old/new forge cache
@@ -3651,6 +3690,14 @@ pub(crate) fn spawn_pr_cache_refresh(
     // runs on its own blocking thread — neither the subprocess fallback nor
     // the HTTP wait can ever touch the event loop.
     crate::sched::spawn_bg(move || {
+        if branch_generation
+            .as_ref()
+            .is_some_and(|(current, expected)| {
+                current.load(std::sync::atomic::Ordering::Acquire) != *expected
+            })
+        {
+            return;
+        }
         let cwd = branch_cwd;
         if !cwd.is_dir() {
             return;
@@ -3758,7 +3805,9 @@ pub(crate) fn spawn_pr_cache_refresh(
                     rows: thegn_core::forge::model::parse_pr_headers(&json),
                     source_repo,
                 };
-                if let Ok(stamped) = serde_json::to_string(&cache) {
+                if let Ok(stamped) = serde_json::to_string(&cache)
+                    && crate::hydrate_schedule::generation_is_current(branch_generation.as_ref())
+                {
                     let _ = db.put_pr_branch_cache(&repo_root, &stamped); // best-effort cache write
                 }
             }
