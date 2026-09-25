@@ -426,6 +426,10 @@ fn record_failure(
 }
 
 /// Write one account's page into the cache. Returns whether anything changed.
+// Test-only since the scheduler refactor: production now calls the
+// generation-aware form directly, and this wrapper keeps the existing
+// unfenced regressions meaningful.
+#[cfg(test)]
 fn apply_page(
     db: &Db,
     account: &str,

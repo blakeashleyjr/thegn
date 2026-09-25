@@ -189,10 +189,14 @@ fn due(tick: u64, every: u64, after: u64) -> bool {
 
 /// This is the shared production spawner, also used by the hermetic fixture.
 /// Retaining its handle lets tests close their clock and join the actual worker.
+// Test-only since the scheduler refactor: production now calls the
+// generation-aware form directly, and this wrapper keeps the existing
+// unfenced regressions meaningful.
+#[cfg(test)]
 fn spawn_worker(
     cadences: Cadences,
     tx: tokio_mpsc::UnboundedSender<RefreshKind>,
-    mut io: impl TickerIo,
+    io: impl TickerIo,
     notify: impl Fn() + Send + 'static,
 ) -> std::thread::JoinHandle<()> {
     spawn_worker_inner(cadences, 0, None, None, tx, io, notify)

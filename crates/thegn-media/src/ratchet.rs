@@ -186,6 +186,10 @@ fn collect_paths<R: RatchetIo>(
 /// test files themselves (they name the patterns they forbid in their own
 /// assertion messages). The scan is not atomic with respect to concurrent
 /// working-tree edits; a racing edit may produce either version.
+// Used by the core ratchets; the byte-identical thegn-media / thegn-metrics
+// copies carry ratchets that do not call it, and the three files must stay
+// identical, so the allow lives here rather than only in those crates.
+#[allow(dead_code)]
 pub fn sources(manifest_dir: &str, exclude: &[&str]) -> Vec<(String, String)> {
     sources_with(&RealIo, manifest_dir, exclude).unwrap_or_else(|error| panic!("{error}"))
 }
@@ -320,12 +324,12 @@ pub fn code_only(body: &str) -> String {
             index = end;
             continue;
         }
-        if bytes[index] == b'b' {
-            if let Some(end) = char_literal_end(bytes, index + 1) {
-                output.push_str(&body[index..end]);
-                index = end;
-                continue;
-            }
+        if bytes[index] == b'b'
+            && let Some(end) = char_literal_end(bytes, index + 1)
+        {
+            output.push_str(&body[index..end]);
+            index = end;
+            continue;
         }
         if bytes[index] == b'"' || (bytes[index] == b'b' && bytes.get(index + 1) == Some(&b'"')) {
             let quote = if bytes[index] == b'"' {
@@ -399,12 +403,12 @@ fn lex_code<'a>(code: &'a str) -> Vec<Token<'a>> {
             index = end;
             continue;
         }
-        if bytes[index] == b'b' {
-            if let Some(end) = char_literal_end(bytes, index + 1) {
-                tokens.push(Token::Literal);
-                index = end;
-                continue;
-            }
+        if bytes[index] == b'b'
+            && let Some(end) = char_literal_end(bytes, index + 1)
+        {
+            tokens.push(Token::Literal);
+            index = end;
+            continue;
         }
         if bytes[index] == b'"' || (bytes[index] == b'b' && bytes.get(index + 1) == Some(&b'"')) {
             let quote = if bytes[index] == b'"' {

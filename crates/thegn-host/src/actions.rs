@@ -347,10 +347,9 @@ pub(crate) fn spawn_ci_detail(
             if let Some(result) = crate::hydrate_schedule::scheduled_delivery(
                 generation.as_ref(),
                 RefreshKind::CiDetail(Box::new(payload)),
-            ) {
-                if tx.send(result).is_ok() {
-                    let _ = waker.wake();
-                }
+            ) && tx.send(result).is_ok()
+            {
+                let _ = waker.wake();
             }
             return;
         }
@@ -424,10 +423,9 @@ pub(crate) fn spawn_ci_detail(
         if let Some(result) = crate::hydrate_schedule::scheduled_delivery(
             generation.as_ref(),
             RefreshKind::CiDetail(Box::new(payload)),
-        ) {
-            if tx.send(result).is_ok() {
-                let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
-            }
+        ) && tx.send(result).is_ok()
+        {
+            let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
     });
 }
@@ -980,17 +978,15 @@ pub(crate) fn spawn_pr_view_fetch(
                 .clone()
                 .filter(|s| !s.branch.is_empty() && !s.head_oid.is_empty())
             && let Ok(db) = thegn_core::db::Db::open()
+            && crate::hydrate_schedule::generation_is_current(schedule_fence.as_ref())
         {
-            if crate::hydrate_schedule::generation_is_current(schedule_fence.as_ref()) {
-                let _ = db.put_pr_review_cache(&snapshot);
-                if let Some(result) = crate::hydrate_schedule::scheduled_delivery(
-                    schedule_fence.as_ref(),
-                    RefreshKind::Model,
-                ) {
-                    if refresh_tx.send(result).is_ok() {
-                        let _ = waker.wake();
-                    }
-                }
+            let _ = db.put_pr_review_cache(&snapshot);
+            if let Some(result) = crate::hydrate_schedule::scheduled_delivery(
+                schedule_fence.as_ref(),
+                RefreshKind::Model,
+            ) && refresh_tx.send(result).is_ok()
+            {
+                let _ = waker.wake();
             }
         }
         // `data` is the PR view payload on its own channel, not a
