@@ -98,22 +98,9 @@ impl Fixture {
         let observed = Arc::new(Mutex::new(Observations::default()));
         let wakes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let notify = wakes.clone();
-        // Exactly the config-to-cadence projections used by run.rs startup.
-        let cadences = Cadences {
-            ci_poll_secs: cfg.ci.poll_interval_secs,
-            prq_poll_secs: cfg.pr_queue.enabled.then(|| cfg.pr_queue.poll_secs()),
-            auto_fetch_secs: cfg
-                .git
-                .auto_fetch
-                .then_some(cfg.git.auto_fetch_interval_secs),
-            clock_period_secs: Arc::new(AtomicU64::new(60)),
-            calendar_poll_secs: cfg.calendar.poll_secs(),
-            calendar_reminders: cfg.calendar.reminders_enabled,
-            disk_ttl_secs: cfg.disk.scan_interval_secs,
-            loc_ttl_secs: cfg.loc.enabled.then_some(cfg.loc.scan_interval_secs),
-            usage_poll_secs: cfg.usage.enabled.then(|| cfg.usage.effective_poll_secs()),
-            weather_poll_secs: cfg.weather.poll_secs(),
-        };
+        // Exactly the config-to-effective-cadence projection used by the live
+        // ScheduleOwner. The worker consumes slots, not raw TTLs.
+        let cadences = Cadences::from_schedule(&ScheduleConfig::from_config(cfg));
         let worker = spawn_worker(
             cadences,
             tx,
@@ -343,4 +330,182 @@ fn startup_and_periodic_requests_coalesce_in_the_running_shared_ticker() {
     assert!(!ticker.ticks("model").contains(&120));
     assert_eq!(ticker.ticks("pr"), [40, 80, 120]);
     ticker.finish();
+}
+
+fn scheduled_name(kind: &RefreshKind) -> Option<&'static str> {
+    match kind {
+        RefreshKind::ClockTick => Some("clock"),
+        RefreshKind::Ci { force: false } => Some("ci"),
+        RefreshKind::PrQueue => Some("pr_queue"),
+        RefreshKind::AutoFetch { .. } => Some("auto_fetch"),
+        RefreshKind::Calendar => Some("calendar"),
+        RefreshKind::CalendarReminders => Some("calendar_reminders"),
+        RefreshKind::Disk => Some("disk"),
+        RefreshKind::Loc { .. } => Some("loc"),
+        RefreshKind::UsagePoll => Some("usage"),
+        RefreshKind::WeatherPoll => Some("weather"),
+        _ => None,
+    }
+}
+
+#[test]
+fn live_owner_reloads_every_ticker_class_through_the_event_envelope() {
+    let old = ScheduleConfig {
+        clock_period_secs: 1,
+        ci_every_slots: 2,
+        prq_every_slots: Some(3),
+        auto_fetch_every_slots: Some(4),
+        calendar_every_slots: Some(5),
+        calendar_reminders: false,
+        disk_every_slots: 6,
+        loc_every_slots: Some(7),
+        usage_every_slots: Some(8),
+        weather_every_slots: Some(9),
+    };
+    let middle = ScheduleConfig {
+        ci_every_slots: 3,
+        calendar_reminders: true,
+        ..old.clone()
+    };
+    let new = ScheduleConfig {
+        clock_period_secs: 2,
+        ci_every_slots: 4,
+        prq_every_slots: Some(5),
+        auto_fetch_every_slots: Some(6),
+        calendar_every_slots: Some(7),
+        calendar_reminders: true,
+        disk_every_slots: 8,
+        loc_every_slots: Some(9),
+        usage_every_slots: Some(10),
+        weather_every_slots: Some(11),
+    };
+
+    let (permits, clock) = mpsc::sync_channel(1);
+    let (ack, receipts) = mpsc::sync_channel(1);
+    let (finished, completion) = mpsc::sync_channel(1);
+    let (tx, mut refresh) = tokio_mpsc::unbounded_channel();
+    let envelope_tx = tx.clone();
+    let observed = Arc::new(Mutex::new(Observations::default()));
+    let commands = Arc::new(Mutex::new(None));
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let worker = spawn_worker_with_commands(
+        Cadences::from_schedule(&old),
+        Arc::new(AtomicU64::new(1)),
+        commands.clone(),
+        stop.clone(),
+        tx,
+        FixtureIo {
+            permits: clock,
+            ack,
+            finished,
+            observed,
+            tick: 0,
+        },
+        || {},
+    );
+    let ticker = RefreshTicker {
+        command: commands,
+        stop,
+        worker: Some(worker),
+    };
+    let mut owner =
+        crate::hydrate_schedule::ScheduleOwner::from_test(ticker, old, Arc::new(AtomicU64::new(1)));
+    // Two replacements before the worker's next boundary exercise the
+    // latest-value command slot and leave only generation 3 live.
+    owner.reconfigure_effective(middle);
+    owner.reconfigure_effective(new.clone());
+    owner.reconfigure_effective(new);
+    let stale = RefreshKind::Scheduled {
+        generation: 1,
+        kind: Box::new(RefreshKind::Ci { force: false }),
+    };
+    envelope_tx.send(stale).unwrap();
+
+    let mut admitted = std::collections::BTreeSet::new();
+    let mut stale_dropped = 0;
+    for tick in 1..=100 {
+        permits.send(()).unwrap();
+        assert_eq!(receipts.recv_timeout(LIMIT).unwrap(), tick);
+        while let Ok(event) = refresh.try_recv() {
+            let RefreshKind::Scheduled { generation, kind } = event else {
+                continue;
+            };
+            if !owner.is_current(generation) {
+                stale_dropped += 1;
+                continue;
+            }
+            if let Some(name) = scheduled_name(&kind) {
+                admitted.insert(name);
+            }
+        }
+    }
+
+    // The event-loop admission rule is the same one used by run.rs: stale
+    // scheduled envelopes are discarded, while current-generation envelopes
+    // reach each of the seven named ticker consumers.
+    assert_eq!(stale_dropped, 1, "stale envelope was admitted after reload");
+    assert_eq!(
+        admitted,
+        [
+            "auto_fetch",
+            "calendar",
+            "calendar_reminders",
+            "ci",
+            "clock",
+            "disk",
+            "loc",
+            "pr_queue",
+            "usage",
+            "weather",
+        ]
+        .into_iter()
+        .collect()
+    );
+    assert!(
+        owner.is_current(3),
+        "unchanged effective schedule restarted"
+    );
+
+    // Disable all optional ticker classes while the same production worker is
+    // alive. The next command boundary must silence the old schedule without
+    // creating replacement wakeups.
+    owner.reconfigure_effective(ScheduleConfig {
+        clock_period_secs: 60,
+        ci_every_slots: 4,
+        prq_every_slots: None,
+        auto_fetch_every_slots: None,
+        calendar_every_slots: None,
+        calendar_reminders: false,
+        disk_every_slots: 8,
+        loc_every_slots: None,
+        usage_every_slots: None,
+        weather_every_slots: None,
+    });
+    let mut disabled = std::collections::BTreeSet::new();
+    for tick in 101..=140 {
+        permits.send(()).unwrap();
+        assert_eq!(receipts.recv_timeout(LIMIT).unwrap(), tick);
+        while let Ok(event) = refresh.try_recv() {
+            if let RefreshKind::Scheduled { generation, kind } = event
+                && owner.is_current(generation)
+                && let Some(name) = scheduled_name(&kind)
+            {
+                disabled.insert(name);
+            }
+        }
+    }
+    for name in [
+        "pr_queue",
+        "auto_fetch",
+        "calendar",
+        "calendar_reminders",
+        "loc",
+        "usage",
+        "weather",
+    ] {
+        assert!(!disabled.contains(name), "disabled {name} still emitted");
+    }
+    drop(permits);
+    owner.shutdown();
+    completion.recv_timeout(LIMIT).unwrap();
 }

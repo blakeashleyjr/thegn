@@ -36,8 +36,9 @@ use crate::handlers::provision::{
 use crate::hydrate::{
     RefreshKind, active_tab_path, build_initial_model, load_or_seed_session,
     neighbor_worktree_paths, retarget_diff_watcher, spawn_model_hydration, spawn_panel_prefetch,
-    spawn_pr_cache_refresh, spawn_refresh_ticker,
+    spawn_pr_cache_refresh,
 };
+use crate::hydrate_schedule::{RefreshGeneration, ScheduleOwner};
 use crate::input::key_bytes;
 use crate::layout;
 use crate::loading::{SpecOrigin, provision_owns_tab};
@@ -1003,19 +1004,6 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     ));
     // 0 = unknown, so the sampler needs no lock to read it.
     let daemon_pid_atomic = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
-    // How often the `date`/`clock` widgets change text: one second only when a
-    // configured format actually renders seconds, otherwise one minute. Derived
-    // from the formats rather than a separate key, so opting into `%S` opts into
-    // the faster tick by construction.
-    let clock_period_secs = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
-        if thegn_core::config::strftime_needs_seconds(&cfg.bars.clock_format)
-            || thegn_core::config::strftime_needs_seconds(&cfg.bars.date_format)
-        {
-            1
-        } else {
-            60
-        },
-    ));
     // Filesystem the `disk` masthead widget measures: the configured path, else
     // the one holding the worktrees dir. `disk_free_pct` climbs to an existing
     // ancestor, so a not-yet-created dir still resolves to its parent fs.
@@ -1046,7 +1034,8 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     // prompt diff updates, but a periodic tick still rehydrates non-fs state
     // (branch moves, PR cache) and bounds staleness. The loop owns the actual
     // refresh; this thread just pulses a tick + waker on the interval.
-    spawn_refresh_ticker(
+    let schedule = ScheduleOwner::spawn(
+        &cfg,
         refresh_tx.clone(),
         stats_tx,
         container_tx,
@@ -1055,29 +1044,6 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         stats_live.clone(),
         containers_live.clone(),
         disk_fs_path,
-        cfg.ci.poll_interval_secs,
-        // `None` when the PR queue is off, so a disabled queue emits no slots.
-        cfg.pr_queue.enabled.then(|| cfg.pr_queue.poll_secs()),
-        // `None` turns the remote poll off entirely (startup kick included);
-        // `Some(0)` keeps the event-driven triggers but drops the cadence.
-        cfg.git
-            .auto_fetch
-            .then_some(cfg.git.auto_fetch_interval_secs),
-        clock_period_secs.clone(),
-        // `None` when no calendar account is enabled, so the whole feature
-        // emits no ticker slot for a user who doesn't use it.
-        cfg.calendar.poll_secs(),
-        cfg.calendar.reminders_enabled,
-        cfg.disk.scan_interval_secs,
-        // `None` when `[loc] enabled = false`, so counting emits no ticker slot
-        // for a user who turned it off.
-        cfg.loc.enabled.then_some(cfg.loc.scan_interval_secs),
-        // `None` when `[usage]` is off, so a user who doesn't track AI accounts
-        // never pays a ticker slot (or an idle wake) for the feature.
-        cfg.usage.enabled.then(|| cfg.usage.effective_poll_secs()),
-        // `None` while `[weather]` is off / `none` / a reserved provider, so a
-        // user who never enables weather pays no ticker slot for it existing.
-        cfg.weather.poll_secs(),
         waker.clone(),
     );
 
@@ -1141,6 +1107,7 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         keymap,
         mode,
         config_rx,
+        schedule,
         refresh_tx,
         refresh_rx,
         fold_tx,
@@ -6110,6 +6077,7 @@ async fn event_loop<T: Terminal>(
     mut keymap: crate::keymap::KeyMap,
     mut mode: crate::keymap::Mode,
     mut config_rx: tokio_mpsc::UnboundedReceiver<Result<thegn_core::config::Config, String>>,
+    mut schedule: ScheduleOwner,
     refresh_tx: tokio_mpsc::UnboundedSender<RefreshKind>,
     mut refresh_rx: tokio_mpsc::UnboundedReceiver<RefreshKind>,
     fold_tx: tokio_mpsc::UnboundedSender<anyhow::Result<crate::integrate::FoldReport>>,
@@ -11623,6 +11591,11 @@ async fn event_loop<T: Terminal>(
                         &waker,
                     );
                     current_config = new_cfg;
+                    // Rebuild only the effective hydration schedule. This is
+                    // intentionally after successful config admission; the
+                    // Err path below therefore keeps the prior worker and
+                    // generation untouched.
+                    schedule.reconfigure(&current_config);
                     crate::automation_runtime::install(&current_config);
                     preview_supervisor.set_enabled(current_config.preview.enabled);
                     request_preview_scan(
@@ -11708,6 +11681,13 @@ async fn event_loop<T: Terminal>(
         let mut want_host_heal = false;
         let mut want_calendar_sync = false;
         let mut want_reminder_check = false;
+        let mut scheduled_pr_generation = RefreshGeneration::default();
+        let mut scheduled_calendar_generation = RefreshGeneration::default();
+        let mut scheduled_reminder_generation = RefreshGeneration::default();
+        let mut scheduled_ci_generation = RefreshGeneration::default();
+        let mut scheduled_loc_generation = RefreshGeneration::default();
+        let mut scheduled_usage_generation = RefreshGeneration::default();
+        let mut scheduled_weather_generation = RefreshGeneration::default();
         // Fold-actor results (batch fold + agent-driven drain): toast outcomes,
         // patch queue rows in place, route settled transitions to the inbox, and
         // re-hydrate so the advanced tip and cleared dots show immediately.
@@ -11764,6 +11744,48 @@ async fn event_loop<T: Terminal>(
         );
         while let Ok(kind) = refresh_rx.try_recv() {
             loop_perf.tick(crate::perf::WakeSource::Refresh);
+            let kind = match kind {
+                RefreshKind::Scheduled { generation, kind } => {
+                    if !schedule.is_current(generation) {
+                        if let RefreshKind::CalendarReminderResult { window, .. } = kind.as_ref() {
+                            // A stale reminder acknowledgment is still the
+                            // completion of the cursor's in-flight window.
+                            reminder_cursor.abandon(*window);
+                        }
+                        continue;
+                    }
+                    match kind.as_ref() {
+                        RefreshKind::Pr => scheduled_pr_generation.scheduled(generation),
+                        RefreshKind::Calendar => {
+                            scheduled_calendar_generation.scheduled(generation)
+                        }
+                        RefreshKind::CalendarReminders => {
+                            scheduled_reminder_generation.scheduled(generation)
+                        }
+                        RefreshKind::Ci { .. } => scheduled_ci_generation.scheduled(generation),
+                        RefreshKind::Loc { .. } => scheduled_loc_generation.scheduled(generation),
+                        RefreshKind::UsagePoll => scheduled_usage_generation.scheduled(generation),
+                        RefreshKind::WeatherPoll => {
+                            scheduled_weather_generation.scheduled(generation)
+                        }
+                        _ => {}
+                    }
+                    *kind
+                }
+                kind => {
+                    match &kind {
+                        RefreshKind::Pr => scheduled_pr_generation.untagged(),
+                        RefreshKind::Calendar => scheduled_calendar_generation.untagged(),
+                        RefreshKind::CalendarReminders => scheduled_reminder_generation.untagged(),
+                        RefreshKind::Ci { .. } => scheduled_ci_generation.untagged(),
+                        RefreshKind::Loc { .. } => scheduled_loc_generation.untagged(),
+                        RefreshKind::UsagePoll => scheduled_usage_generation.untagged(),
+                        RefreshKind::WeatherPoll => scheduled_weather_generation.untagged(),
+                        _ => {}
+                    }
+                    kind
+                }
+            };
             // While offline, skip the network-backed refresh backstops (the
             // local sidebar hydration still runs). Read once per drained kind.
             let skip_net = crate::connectivity_gate::should_skip_refresh(
@@ -11884,13 +11906,16 @@ async fn event_loop<T: Terminal>(
                     dirty |=
                         crate::handlers::onboarding::apply_probe(&mut onboarding, *r, &mut model)
                 }
-                RefreshKind::UsagePoll => crate::actions::spawn_usage(
+                RefreshKind::UsagePoll => crate::actions::spawn_usage_with_generation(
                     &refresh_tx,
                     &waker,
                     current_config.usage.clone(),
                     false,
                     current_config.model_proxy.enabled,
                     current_config.model_proxy.budget.clone(),
+                    scheduled_usage_generation
+                        .generation()
+                        .map(|generation| (schedule.fence(), generation)),
                 ),
                 RefreshKind::Usage(p) => {
                     let p = *p;
@@ -11956,11 +11981,14 @@ async fn event_loop<T: Terminal>(
                 // trip and nothing else.
                 RefreshKind::WeatherPoll => {
                     if !skip_net {
-                        crate::hydrate_weather::spawn_poll(
+                        crate::hydrate_weather::spawn_poll_with_generation(
                             current_config.weather.clone(),
                             crate::calendar_docs::CalendarDocs::env_locale(),
                             refresh_tx.clone(),
                             waker.clone(),
+                            scheduled_weather_generation
+                                .generation()
+                                .map(|generation| (schedule.fence(), generation)),
                         );
                     }
                 }
@@ -12055,6 +12083,10 @@ async fn event_loop<T: Terminal>(
                     );
                     dirty = true;
                 }
+                // A scheduler envelope should have been admitted and
+                // unwrapped above. Handle a nested envelope explicitly so a
+                // future producer cannot silently bypass the admission fence.
+                RefreshKind::Scheduled { .. } => {}
             }
         }
         // Fast-forward the canonical main checkout if its ref advanced (throttled ~2s, off-loop).
@@ -12156,11 +12188,14 @@ async fn event_loop<T: Terminal>(
             switch_refresh_pending = false;
         }
         if want_pr_refresh {
-            spawn_pr_cache_refresh(
+            crate::hydrate::spawn_pr_cache_refresh_with_generation(
                 active_tab_path(&session),
                 current_config.issues.clone(),
                 current_config.disk.clone(),
                 Some(waker.clone()),
+                scheduled_pr_generation
+                    .generation()
+                    .map(|generation| (schedule.fence(), generation)),
             );
             // If the PR view is open, re-fetch it too (just-posted comment/review).
             crate::actions::refetch_pr_view(
@@ -12170,24 +12205,33 @@ async fn event_loop<T: Terminal>(
                 &pr_view_tx,
                 &waker,
                 &refresh_tx,
+                scheduled_pr_generation
+                    .generation()
+                    .map(|generation| (schedule.fence(), generation)),
             );
         }
         if want_calendar_sync {
-            crate::hydrate_calendar::spawn_periodic_sync(
+            crate::hydrate_calendar::spawn_periodic_sync_with_generation(
                 current_config.calendar.clone(),
                 refresh_tx.clone(),
                 waker.clone(),
+                scheduled_calendar_generation
+                    .generation()
+                    .map(|generation| (schedule.fence(), generation)),
             );
         }
         if want_reminder_check {
             // Off the loop: the check reads the DB, and blocking I/O on the
             // loop is the one thing the event model forbids outright.
-            crate::hydrate_calendar::spawn_reminder_check(
+            crate::hydrate_calendar::spawn_reminder_check_with_generation(
                 &mut reminder_cursor,
                 chrono::Utc::now().timestamp_millis(),
                 current_config.calendar.clone(),
                 refresh_tx.clone(),
                 waker.clone(),
+                scheduled_reminder_generation
+                    .generation()
+                    .map(|generation| (schedule.fence(), generation)),
             );
         }
         if want_issue_refresh {
@@ -12223,6 +12267,9 @@ async fn event_loop<T: Terminal>(
                 &waker,
                 ci_refresh_force,
                 &mut bar_detail,
+                scheduled_ci_generation
+                    .generation()
+                    .map(|generation| (schedule.fence(), generation)),
             );
         }
         // Both measurement scans carry their own inflight guard and background
@@ -12242,11 +12289,14 @@ async fn event_loop<T: Terminal>(
             );
         }
         if want_loc_refresh {
-            crate::measure::loc::spawn_scan(
+            crate::measure::loc::spawn_scan_with_generation(
                 current_config.loc.clone(),
                 Some(active_tab_path(&session)),
                 loc_refresh_watch,
                 Some(waker.clone()),
+                scheduled_loc_generation
+                    .generation()
+                    .map(|generation| (schedule.fence(), generation)),
             );
         }
         if want_auto_fetch {
