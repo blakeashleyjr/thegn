@@ -69,3 +69,30 @@ Do not run cargo/nextest/clippy. Record the focused filters. Changing a public
 error enum or the svc surface may move `docs/api/control-v1.json`
 (`THEGN_UPDATE_SNAPSHOTS=1 cargo test -p thegn-svc --test control_schema`) —
 flag it in your report; the primary regenerates centrally.
+
+---
+
+## Blocker resolution — `calendar.ingest` (primary, after row 527)
+
+Row 527 reported a concrete blocker: the primary's test requirement "assert
+ingest still works on a read-only account" cannot be satisfied, because
+`calendar.ingest` exists only as the `ControlApi` `Unimplemented` default in
+this checkout. Implementing it to make the assertion possible would be an
+out-of-scope feature.
+
+**The coder was right to stop rather than build it. The requirement is
+withdrawn and replaced.**
+
+Replacement requirement (already satisfied by the committed wrapper): the
+policy boundary must be provably confined to the three mutation verbs. That is
+asserted structurally — `AccountPolicyBackend` delegates `list_events` and
+every non-mutation method to the inner backend unchanged, and `caps_for_policy`
+clears only `create`/`update`/`delete`, leaving `incremental` and
+`server_expand` untouched. A future `calendar.ingest` therefore cannot be
+caught by this gate, because the gate has no hook on any read path.
+
+The original intent — "a read-only account must still be able to read and
+refresh its cache" — is preserved by that confinement. When `calendar.ingest`
+is genuinely implemented, its lane owns the test.
+
+Recorded as a follow-up, not a defect in this change.
