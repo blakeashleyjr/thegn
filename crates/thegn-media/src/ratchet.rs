@@ -257,6 +257,51 @@ fn quoted_string_end(bytes: &[u8], start: usize) -> usize {
     bytes.len()
 }
 
+/// Return the end of a valid character literal, or `None` when the quote is
+/// more likely to start a lifetime. Looking for the closing quote while
+/// respecting escapes keeps a char such as `\"` from opening a string scan;
+/// requiring it within the literal's bounded shape keeps `'static` and `'a`
+/// from being mistaken for unterminated literals.
+fn char_literal_end(bytes: &[u8], start: usize) -> Option<usize> {
+    if bytes.get(start) != Some(&b'\'') {
+        return None;
+    }
+
+    let mut index = start + 1;
+    match bytes.get(index)? {
+        b'\\' => {
+            index += 1;
+            if bytes.get(index) == Some(&b'u') && bytes.get(index + 1) == Some(&b'{') {
+                index += 2;
+                let digits_start = index;
+                while bytes
+                    .get(index)
+                    .is_some_and(|byte| byte.is_ascii_hexdigit())
+                {
+                    index += 1;
+                }
+                let digits = index - digits_start;
+                if !(1..=6).contains(&digits) || bytes.get(index) != Some(&b'}') {
+                    return None;
+                }
+                index += 1;
+            } else {
+                // Rust's simple escapes consume one byte here. The scanner's
+                // job is only to keep the literal opaque, so validation of
+                // the escape's meaning belongs to rustc.
+                index += 1;
+            }
+        }
+        b'\'' => return None,
+        _ => {
+            let character = std::str::from_utf8(&bytes[index..]).ok()?.chars().next()?;
+            index += character.len_utf8();
+        }
+    }
+
+    (bytes.get(index) == Some(&b'\'')).then_some(index + 1)
+}
+
 /// Strip comments while respecting ordinary, escaped, byte, and raw strings.
 /// Block comments are nested as they are in Rust. Newlines in comments remain
 /// so source locations and line-oriented diagnostics stay useful.
@@ -269,6 +314,18 @@ pub fn code_only(body: &str) -> String {
             output.push_str(&body[index..end]);
             index = end;
             continue;
+        }
+        if let Some(end) = char_literal_end(bytes, index) {
+            output.push_str(&body[index..end]);
+            index = end;
+            continue;
+        }
+        if bytes[index] == b'b' {
+            if let Some(end) = char_literal_end(bytes, index + 1) {
+                output.push_str(&body[index..end]);
+                index = end;
+                continue;
+            }
         }
         if bytes[index] == b'"' || (bytes[index] == b'b' && bytes.get(index + 1) == Some(&b'"')) {
             let quote = if bytes[index] == b'"' {
@@ -336,6 +393,18 @@ fn lex_code<'a>(code: &'a str) -> Vec<Token<'a>> {
             tokens.push(Token::Literal);
             index = end;
             continue;
+        }
+        if let Some(end) = char_literal_end(bytes, index) {
+            tokens.push(Token::Literal);
+            index = end;
+            continue;
+        }
+        if bytes[index] == b'b' {
+            if let Some(end) = char_literal_end(bytes, index + 1) {
+                tokens.push(Token::Literal);
+                index = end;
+                continue;
+            }
         }
         if bytes[index] == b'"' || (bytes[index] == b'b' && bytes.get(index + 1) == Some(&b'"')) {
             let quote = if bytes[index] == b'"' {
@@ -591,6 +660,36 @@ mod tests {
             // the content, the second closes the literal.
             "let s = r#\"\"// stays /* too */\"#; \n#[cfg(unix)]"
         );
+    }
+
+    #[test]
+    fn char_literals_are_opaque_but_lifetimes_still_strip_comments() {
+        let source = r##"let quote = '"'; let escaped_quote = '\''; let slash = '\\';
+let newline = '\n'; let unicode = '\u{1f600}'; let byte_quote = b'"';
+&'static str // #[cfg(unix)] must be stripped
+"##;
+        let expected = concat!(
+            r##"let quote = '"'; let escaped_quote = '\''; let slash = '\\';
+let newline = '\n'; let unicode = '\u{1f600}'; let byte_quote = b'"';
+&'static str"##,
+            " \n"
+        );
+        assert_eq!(code_only(source), expected);
+        assert!(!has_platform_cfg(source));
+    }
+
+    #[test]
+    fn cfg_after_char_literal_is_not_hidden() {
+        let source = r##"let quote = '"'; // #[cfg(windows)]
+#[cfg(all(feature = "profiling", unix))] fn profiled() {}"##;
+        assert_eq!(
+            code_only(source),
+            concat!(
+                r##"let quote = '"';"##,
+                " \n#[cfg(all(feature = \"profiling\", unix))] fn profiled() {}"
+            )
+        );
+        assert!(has_platform_cfg(source));
     }
 
     #[derive(Clone, Copy)]
