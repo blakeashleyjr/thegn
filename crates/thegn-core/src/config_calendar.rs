@@ -277,8 +277,12 @@ pub struct CalendarAccount {
     /// Semantic hue for this source's events (`"teal"`, `"amber"`, …). Empty
     /// picks one by position. Never an RGB value — the theme resolves it.
     pub color: String,
-    /// Refuse writes to this source. True by default; this pass has no writing
-    /// backend at all, so it is currently belt-and-braces.
+    /// Refuse upstream writes to this source. True by default, and **enforced**:
+    /// the account-policy boundary clears every write capability and turns any
+    /// create/update/delete into a typed `ReadOnly` denial before the provider
+    /// or plugin adapter is reached. This is independent of whether a backend
+    /// can write at all — a provider advertising write support does not
+    /// out-vote it. Reads and cache refresh are unaffected.
     pub read_only: bool,
     /// Seconds between syncs; `0` inherits `[calendar] refresh_interval_secs`.
     /// Always floored at [`MIN_REFRESH_SECS`].
