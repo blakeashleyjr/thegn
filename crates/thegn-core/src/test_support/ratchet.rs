@@ -583,7 +583,10 @@ mod tests {
                 r##"let s = r#""// stays /* too */"#; // gone
 #[cfg(unix)]"##
             ),
-            "let s = r#\"// stays /* too */\"#; \n#[cfg(unix)]"
+            // The literal is `r#"…"#` whose CONTENT begins with a quote, i.e.
+            // `"// stays /* too */`. Both quotes survive: the first belongs to
+            // the content, the second closes the literal.
+            "let s = r#\"\"// stays /* too */\"#; \n#[cfg(unix)]"
         );
     }
 
