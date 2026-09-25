@@ -1266,7 +1266,7 @@ mod tests {
             },
             vec![
                 transition_fixture("new"),
-                FixtureResponse::new(StatusCode::OK, ""),
+                FixtureResponse::new(StatusCode::NO_CONTENT, ""),
                 issue_fixture("existing title", "new"),
             ],
         )
