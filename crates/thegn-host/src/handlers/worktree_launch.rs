@@ -298,7 +298,47 @@ fn apply_relaunch_with(
 mod tests {
     use super::*;
     use crate::testenv::EnvVarGuard;
+    use std::fmt::Write as _;
+    use std::sync::{Arc, Mutex as StdMutex};
     use thegn_core::config::{SandboxBackend, UsageConfig};
+
+    #[derive(Clone)]
+    struct CapturedEvents(Arc<StdMutex<Vec<String>>>);
+
+    impl tracing::Subscriber for CapturedEvents {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _attrs: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut fields = String::new();
+            event.record(&mut DisplayFields(&mut fields));
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("{} {fields}", event.metadata().target()));
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    struct DisplayFields<'a>(&'a mut String);
+
+    impl tracing::field::Visit for DisplayFields<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            let _ = write!(self.0, " {}={value:?}", field.name());
+        }
+    }
 
     /// A scratch state dir + isolated env — this shell often runs inside a
     /// live thegn (CLAUDE.md), and `Db::open()` reads `XDG_STATE_HOME` per
@@ -707,5 +747,30 @@ mod tests {
         let error = anyhow::anyhow!("provider unavailable offline");
         assert_eq!(refusal_kind(&error), RelaunchRefusalKind::ProviderLaunch);
         assert_eq!(bounded_reason(&error), "provider unavailable offline");
+    }
+
+    #[test]
+    fn emitted_refusal_report_is_actionable_and_deduped() {
+        let events = Arc::new(StdMutex::new(Vec::new()));
+        let subscriber = CapturedEvents(events.clone());
+        let worktree = worktree_path("observable-report");
+        let refusal = || RelaunchRefusal {
+            agent: "codex".into(),
+            source: anyhow::Error::new(crate::agent::DevcontainerLaunchRefused {
+                reason: "trusted provider origin was rejected".into(),
+            }),
+        };
+
+        tracing::subscriber::with_default(subscriber, || {
+            report_relaunch_refusal(refusal(), &worktree);
+            report_relaunch_refusal(refusal(), &worktree);
+        });
+
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 1, "same refusal must emit one report");
+        assert!(events[0].contains("thegn::agent"));
+        assert!(events[0].contains("provider-ownership"));
+        assert!(events[0].contains("trusted provider origin was rejected"));
+        assert!(events[0].contains("shell fallback retained"));
     }
 }
