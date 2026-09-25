@@ -378,7 +378,9 @@ fn spawn_worker_inner(
                     ci_poll_secs = next.ci_poll_secs;
                     prq_poll_secs = next.prq_poll_secs;
                     auto_fetch_secs = next.auto_fetch_secs;
-                    clock_period_secs = Arc::new(AtomicU64::new(next.clock_period_secs));
+                    clock_period_secs = Arc::new(AtomicU64::new(
+                        next.clock_period_secs.load(Ordering::Relaxed),
+                    ));
                     calendar_poll_secs = next.calendar_poll_secs;
                     calendar_reminders = next.calendar_reminders;
                     disk_ttl_secs = next.disk_ttl_secs;
