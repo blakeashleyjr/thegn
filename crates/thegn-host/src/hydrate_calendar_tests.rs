@@ -680,6 +680,7 @@ fn a_contention_refusal_leaves_the_accounts_record_untouched() {
         )),
         &BTreeMap::new(),
         &mut |m| toasts.push(m),
+        None,
     );
     let after = t.db.get_calendar_sync(&account).unwrap().unwrap();
     assert_eq!(after.fetched_at, before.fetched_at, "no attempt stamp");

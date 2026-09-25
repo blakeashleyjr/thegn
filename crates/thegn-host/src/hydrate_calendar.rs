@@ -707,7 +707,7 @@ pub(crate) fn spawn_reminder_check_with_generation(
             waker: waker.clone(),
             window,
             outcome: ReminderOutcome::Failed(CalendarViewError::CacheUnavailable),
-            generation,
+            generation: generation.clone(),
         };
         let outcome = match Db::open() {
             Err(_) => ReminderOutcome::Failed(CalendarViewError::CacheUnavailable),

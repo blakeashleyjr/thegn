@@ -12080,6 +12080,10 @@ async fn event_loop<T: Terminal>(
                     );
                     dirty = true;
                 }
+                // A scheduler envelope should have been admitted and
+                // unwrapped above. Handle a nested envelope explicitly so a
+                // future producer cannot silently bypass the admission fence.
+                RefreshKind::Scheduled { .. } => {}
             }
         }
         // Fast-forward the canonical main checkout if its ref advanced (throttled ~2s, off-loop).
