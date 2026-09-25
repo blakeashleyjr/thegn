@@ -1,0 +1,84 @@
+{
+  "id": "THE-336",
+  "uuid": "4159a9aa-807a-4ed0-bf64-2dedca889b12",
+  "title": "Bound LSP messages, recursive results, diagnostics queues, and retained UI state",
+  "description": "## Finding\n\nEven beyond frame buffering, parsed LSP values are recursively flattened and copied with no count/depth/string limits. Symbol collection recursively walks server-controlled `children` and can stack overflow. Diagnostics are sent over an unbounded channel and retained per root/file without caps; result vectors, hover markdown, signatures, actions, paths, codes, and messages are unbounded. A server can repeatedly publish large unique files faster than the UI drains.\n\n## Evidence\n\n* `crates/thegn-svc/src/lsp/mod.rs:390-444` recursively collects symbols with no depth/node bound.\n* Parsers at `445-570` clone arbitrary server strings/arrays.\n* `LspSupervisor::from_config` creates an unbounded std mpsc diagnostics channel.\n* `LspDiagnostics::apply` retains unlimited roots/files/items/string bytes.\n* The shared frame limit is 64 MiB per message, not an aggregate queue/state budget.\n\n## Impact\n\nA buggy or compromised language server can cause stack overflow, unbounded memory growth, render latency, and event-loop starvation while remaining protocol-valid.\n\n## Acceptance criteria\n\n* Define per-message, JSON depth, collection count, string/markdown/path, diagnostics-per-file, files-per-root, roots, queue, and total retained-byte caps.\n* Parse/flatten iteratively with deterministic truncation/error metadata.\n* Replace unbounded delivery with bounded latest-per-document coalescing and generation sequencing.\n* Apply work budgets per loop/frame so LSP floods cannot starve terminal/control work.\n* Sanitize control/terminal characters before UI use while preserving source data safely.\n* Expose dropped/truncated/stale health.\n* Add deep symbols, huge arrays/strings, unique-file floods, repeated replacements/clears, slow consumer, multi-root fairness, exact limits, and recovery tests.\n\n## Dependencies\n\nBlocked by <issue id=\"4e4f78e2-a342-4157-810c-73468cff3a29\" href=\"https://linear.app/blakeashley/issue/THE-310/bound-and-linearize-framed-protocol-decoding-under-hostile-streams\">THE-310</issue> for bounded linear framing. Related to <issue id=\"d64bc546-3454-4754-9c8e-ba3c321401a7\" href=\"https://linear.app/blakeashley/issue/THE-161/bound-plugin-output-resident-queues-stderr-framing-and-retained\">THE-161</issue>, <issue id=\"f4c28940-ce66-43a1-8cef-75e04775f896\" href=\"https://linear.app/blakeashley/issue/THE-184/fetch-observe-panels-concurrently-with-bounded-queues-deadlines-and\">THE-184</issue>, <issue id=\"a7d8a0fa-0c44-41e1-86fd-7cae85d11477\" href=\"https://linear.app/blakeashley/issue/THE-205/extract-typed-actors-and-damage-contracts-from-the-monolithic\">THE-205</issue>, and <issue id=\"aad09961-0e12-4754-9a7a-35ffad4d0076\" href=\"https://linear.app/blakeashley/issue/THE-276/enforce-one-bounded-control-frame-per-websocket-message-and-eliminate\">THE-276</issue>.\n\n## September 15 performance project cross-reference\n\nProject: [Interactive Performance & Runtime Fairness](<https://linear.app/blakeashley/project/interactive-performance-and-runtime-fairness-74506d6dff14>). [Full review, evidence correction and execution index](<https://linear.app/blakeashley/document/september-15-performance-review-evidence-coverage-and-execution-index-2822509847d3>).\n\nThe September 15 host review confirms the diagnostics receiver drains with while try_recv and applies all available publications before merging into the visible model. <issue id=\"9f596b1c-f4eb-45be-8ea3-6b2b1f33a973\" href=\"https://linear.app/blakeashley/issue/THE-658/coalesce-lsp-diagnostics-within-byte-bounds-and-budget-host\">THE-658</issue> is a new child of this issue covering bounded diagnostics delivery and budgeted host application. It must preserve empty-publication clears, workspace/document/server generation identity, bounded unique keys and bytes, explicit overload health and quiet-root/input fairness.\n\nParser recursion/depth, general message/string limits, sanitization and broader retained-state bounds remain on this parent. <issue id=\"905ea988-4f2a-4c46-a365-4c000476d238\" href=\"https://linear.app/blakeashley/issue/THE-657/inventory-host-event-ingress-and-define-per-source-plus-aggregate\">THE-657</issue> supplies the shared per-source plus aggregate drain contract; this child is not blocked on the entire <issue id=\"a7d8a0fa-0c44-41e1-86fd-7cae85d11477\" href=\"https://linear.app/blakeashley/issue/THE-205/extract-typed-actors-and-damage-contracts-from-the-monolithic\">THE-205</issue> extraction.\n\n### Scoped follow-through\n\n* [THE-657: Inventory host event ingress and define per-source plus aggregate drain budgets](<https://linear.app/blakeashley/issue/THE-657/inventory-host-event-ingress-and-define-per-source-plus-aggregate>)\n* [THE-658: Coalesce LSP diagnostics within byte bounds and budget host application work](<https://linear.app/blakeashley/issue/THE-658/coalesce-lsp-diagnostics-within-byte-bounds-and-budget-host>)\n\nThis update records planning and source evidence only. No implementation, benchmark run, status transition, assignment change or inherited approval/landing completion is claimed.",
+  "priority": {
+    "value": 1,
+    "name": "Urgent"
+  },
+  "url": "https://linear.app/blakeashley/issue/THE-336/bound-lsp-messages-recursive-results-diagnostics-queues-and-retained",
+  "gitBranchName": "blake/the-336-bound-lsp-messages-recursive-results-diagnostics-queues-and",
+  "createdAt": "2026-09-11T04:55:09.386Z",
+  "updatedAt": "2026-09-15T19:38:36.888Z",
+  "archivedAt": null,
+  "completedAt": null,
+  "startedAt": null,
+  "canceledAt": null,
+  "dueDate": null,
+  "slaStartedAt": null,
+  "slaMediumRiskAt": null,
+  "slaHighRiskAt": null,
+  "slaBreachesAt": null,
+  "status": "Backlog",
+  "statusType": "backlog",
+  "labels": [],
+  "attachments": [],
+  "documents": [],
+  "stateHistory": [
+    {
+      "state": {
+        "id": "9a141276-3d88-41f8-8437-8f170cfff494",
+        "name": "Backlog",
+        "type": "backlog"
+      },
+      "startedAt": "2026-09-11T04:55:09.386Z",
+      "endedAt": null
+    }
+  ],
+  "createdBy": "Blake Ashley",
+  "createdById": "3b7f5427-3d7f-40df-822c-6b4439a509e7",
+  "parentId": "THE-150",
+  "team": "Thegn",
+  "teamId": "6d265c7c-ac1f-40c7-9983-f919d7b5d254",
+  "relations": {
+    "blocks": [],
+    "blockedBy": [
+      {
+        "id": "THE-310",
+        "title": "Bound and linearize framed-protocol decoding under hostile streams"
+      }
+    ],
+    "relatedTo": [
+      {
+        "id": "THE-658",
+        "title": "Coalesce LSP diagnostics within byte bounds and budget host application work"
+      },
+      {
+        "id": "THE-276",
+        "title": "Enforce one bounded control frame per WebSocket message and eliminate attach bootstrap deadlock"
+      },
+      {
+        "id": "THE-205",
+        "title": "Extract typed actors and damage contracts from the monolithic compositor event loop"
+      },
+      {
+        "id": "THE-161",
+        "title": "Bound plugin output, resident queues, stderr framing, and retained messages"
+      },
+      {
+        "id": "THE-184",
+        "title": "Fetch Observe panels concurrently with bounded queues, deadlines, and HTTP status handling"
+      },
+      {
+        "id": "THE-668",
+        "title": "Publish integrated release before-and-after performance evidence and reconcile project closure"
+      },
+      {
+        "id": "THE-657",
+        "title": "Inventory host event ingress and define per-source plus aggregate drain budgets"
+      }
+    ],
+    "duplicateOf": null
+  }
+}
