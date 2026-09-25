@@ -6,6 +6,7 @@ use super::{
     PR_REFRESH_INTERVAL, RefreshKind, STARTUP_FETCH_SLOT, STARTUP_MEASURE_SLOT, StatsTick,
     USAGE_FIRST_SLOT, WEATHER_FIRST_SLOT, weather_every_slots,
 };
+use crate::hydrate_schedule::ScheduleConfig;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -20,8 +21,45 @@ use tokio::sync::mpsc as tokio_mpsc;
 /// for the Telemetry section's live graphs (`stats_live` set while it's open)
 /// while the model/PR cadences (default 1s/20s, model tunable via
 /// `THEGN_MODEL_REFRESH_MS`) stay whole multiples of the half-tick.
+pub(crate) struct RefreshTicker {
+    command: std::sync::mpsc::Sender<TickerCommand>,
+    stop: Arc<AtomicBool>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+enum TickerCommand {
+    Replace {
+        schedule: ScheduleConfig,
+        generation: u64,
+    },
+}
+
+impl RefreshTicker {
+    pub(crate) fn reconfigure(&self, schedule: ScheduleConfig, generation: u64) {
+        let _ = self.command.send(TickerCommand::Replace {
+            schedule,
+            generation,
+        });
+    }
+
+    pub(crate) fn shutdown(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+impl Drop for RefreshTicker {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
 #[allow(clippy::too_many_arguments)] // one-call-site startup wiring, not an API
 pub(crate) fn spawn_refresh_ticker(
+    schedule: ScheduleConfig,
+    generation: Arc<AtomicU64>,
     tx: tokio_mpsc::UnboundedSender<RefreshKind>,
     stats_tx: tokio_mpsc::UnboundedSender<StatsTick>,
     container_tx: tokio_mpsc::UnboundedSender<ContainerRefresh>,
@@ -32,57 +70,15 @@ pub(crate) fn spawn_refresh_ticker(
     // `stats --no-stream` + `system df` container enrichment.
     containers_live: std::sync::Arc<std::sync::atomic::AtomicBool>,
     disk_path: std::path::PathBuf,
-    ci_poll_secs: u64,
-    // `[pr_queue] poll_interval_secs`, or `None` when the PR queue is off — in
-    // which case no PR-queue slot is ever emitted, so the feature costs nothing.
-    prq_poll_secs: Option<u64>,
-    auto_fetch_secs: Option<u64>,
-    // Seconds per `date`/`clock` display step — 60 normally, 1 when the
-    // configured `[bars]` formats render seconds. An atomic (like
-    // `stats_interval_ms`) so a config reload retunes it live.
-    clock_period_secs: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    // Seconds between calendar syncs, or `None` when no `[[calendar.accounts]]`
-    // is enabled — in which case no calendar slot is ever emitted and the
-    // feature costs a user without one exactly nothing.
-    calendar_poll_secs: Option<u64>,
-    // Whether `[calendar] reminders_enabled` is on. Gated at the ticker rather
-    // than inside the handler so a user who turned reminders off pays no idle
-    // wake at all, instead of waking twice a minute to learn there is nothing
-    // to do.
-    calendar_reminders: bool,
-    // `[disk] scan_interval_secs` — the per-worktree size TTL, which also drives
-    // the size-scan pump (at a quarter of it, see `scan_sched::pump_slots`).
-    // Replaces a hardcoded 30s tick that paired with a 45s TTL to give a 60s
-    // effective refresh — neither of the two numbers a reader would predict.
-    disk_ttl_secs: u64,
-    // `[loc] scan_interval_secs`, or `None` when `[loc] enabled = false` — in
-    // which case no LOC slot is emitted at all, so a user who turned counting
-    // off pays no idle wake for it.
-    loc_ttl_secs: Option<u64>,
-    // Seconds between AI-account usage polls, or `None` when `[usage]` is off —
-    // in which case no usage slot is ever emitted and a user who doesn't use the
-    // feature pays no idle wake for it.
-    usage_poll_secs: Option<u64>,
-    // Seconds between weather polls (`WeatherConfig::poll_secs`), or `None` when
-    // `[weather]` is disabled / `none` / a reserved provider — in which case no
-    // weather slot is ever emitted and the feature costs a user who never turns
-    // it on exactly nothing.
-    weather_poll_secs: Option<u64>,
     waker: TerminalWaker,
-) {
-    drop(spawn_worker(
-        Cadences {
-            ci_poll_secs,
-            prq_poll_secs,
-            auto_fetch_secs,
-            clock_period_secs,
-            calendar_poll_secs,
-            calendar_reminders,
-            disk_ttl_secs,
-            loc_ttl_secs,
-            usage_poll_secs,
-            weather_poll_secs,
-        },
+) -> RefreshTicker {
+    let (command, commands) = std::sync::mpsc::channel();
+    let stop = Arc::new(AtomicBool::new(false));
+    let worker = spawn_worker_with_commands(
+        Cadences::from_schedule(&schedule),
+        generation,
+        commands,
+        stop.clone(),
         tx,
         LiveIo {
             stats_tx,
@@ -99,7 +95,12 @@ pub(crate) fn spawn_refresh_ticker(
         move || {
             drop(waker.wake());
         },
-    ));
+    );
+    RefreshTicker {
+        command,
+        stop,
+        worker: Some(worker),
+    }
 }
 
 /// Owned ambient boundaries only. All cadence conversion and event scheduling
@@ -131,6 +132,23 @@ struct Cadences {
     weather_poll_secs: Option<u64>,
 }
 
+impl Cadences {
+    fn from_schedule(schedule: &ScheduleConfig) -> Self {
+        Self {
+            ci_poll_secs: schedule.ci_poll_secs,
+            prq_poll_secs: schedule.prq_poll_secs,
+            auto_fetch_secs: schedule.auto_fetch_secs,
+            clock_period_secs: Arc::new(AtomicU64::new(schedule.clock_period_secs)),
+            calendar_poll_secs: schedule.calendar_poll_secs,
+            calendar_reminders: schedule.calendar_reminders,
+            disk_ttl_secs: schedule.disk_ttl_secs,
+            loc_ttl_secs: schedule.loc_ttl_secs,
+            usage_poll_secs: schedule.usage_poll_secs,
+            weather_poll_secs: schedule.weather_poll_secs,
+        }
+    }
+}
+
 fn clock_unit(period: &AtomicU64, now: i64) -> i64 {
     let period = thegn_core::time_policy::saturating_i64(u128::from(
         period
@@ -140,10 +158,54 @@ fn clock_unit(period: &AtomicU64, now: i64) -> i64 {
     now.div_euclid(period)
 }
 
+fn send_tick(
+    tx: &tokio_mpsc::UnboundedSender<RefreshKind>,
+    generation: u64,
+    kind: RefreshKind,
+) -> Result<(), ()> {
+    let kind = if generation == 0 {
+        kind
+    } else {
+        RefreshKind::Scheduled {
+            generation,
+            kind: Box::new(kind),
+        }
+    };
+    tx.send(kind).map_err(|_| ())
+}
+
+fn due(tick: u64, every: u64, after: u64) -> bool {
+    tick >= after && tick.is_multiple_of(every)
+}
+
 /// This is the shared production spawner, also used by the hermetic fixture.
 /// Retaining its handle lets tests close their clock and join the actual worker.
 fn spawn_worker(
     cadences: Cadences,
+    tx: tokio_mpsc::UnboundedSender<RefreshKind>,
+    mut io: impl TickerIo,
+    notify: impl Fn() + Send + 'static,
+) -> std::thread::JoinHandle<()> {
+    spawn_worker_inner(cadences, 0, None, None, tx, io, notify)
+}
+
+fn spawn_worker_with_commands(
+    cadences: Cadences,
+    _generation: Arc<AtomicU64>,
+    commands: std::sync::mpsc::Receiver<TickerCommand>,
+    stop: Arc<AtomicBool>,
+    tx: tokio_mpsc::UnboundedSender<RefreshKind>,
+    io: impl TickerIo,
+    notify: impl Fn() + Send + 'static,
+) -> std::thread::JoinHandle<()> {
+    spawn_worker_inner(cadences, 1, Some(commands), Some(stop), tx, io, notify)
+}
+
+fn spawn_worker_inner(
+    cadences: Cadences,
+    generation: u64,
+    commands: Option<std::sync::mpsc::Receiver<TickerCommand>>,
+    stop: Option<Arc<AtomicBool>>,
     tx: tokio_mpsc::UnboundedSender<RefreshKind>,
     mut io: impl TickerIo,
     notify: impl Fn() + Send + 'static,
@@ -165,6 +227,16 @@ fn spawn_worker(
             usage_poll_secs,
             weather_poll_secs,
         } = cadences;
+        let mut ci_poll_secs = ci_poll_secs;
+        let mut prq_poll_secs = prq_poll_secs;
+        let mut auto_fetch_secs = auto_fetch_secs;
+        let mut clock_period_secs = clock_period_secs;
+        let mut calendar_poll_secs = calendar_poll_secs;
+        let mut calendar_reminders = calendar_reminders;
+        let mut disk_ttl_secs = disk_ttl_secs;
+        let mut loc_ttl_secs = loc_ttl_secs;
+        let mut usage_poll_secs = usage_poll_secs;
+        let mut weather_poll_secs = weather_poll_secs;
         // The 500ms refresh ticker: it only decides when to *ask* for work, and
         // every consumer is off the render path.
         io.background_qos();
@@ -175,19 +247,19 @@ fn spawn_worker(
         );
         let pr_every =
             thegn_core::time_policy::cadence_millis_slots(PR_REFRESH_INTERVAL.as_millis(), 500);
-        let ci_every = crate::ci_refresh::ci_every_slots(ci_poll_secs);
-        let fetch_every = auto_fetch_secs.and_then(crate::remote_poll::fetch_every_slots);
+        let mut ci_every = crate::ci_refresh::ci_every_slots(ci_poll_secs);
+        let mut fetch_every = auto_fetch_secs.and_then(crate::remote_poll::fetch_every_slots);
         let issue_every =
             thegn_core::time_policy::cadence_millis_slots(ISSUE_REFRESH_INTERVAL.as_millis(), 500)
                 .get();
         // Floored the same way `[pr_queue] poll_secs` is, so a misconfigured 0
         // can't spin the ticker against the forge's rate limit.
-        let prq_every =
+        let mut prq_every =
             prq_poll_secs.map(|s| thegn_core::time_policy::cadence_slots(s, 15, 500).get());
         // Floored the same way, so a misconfigured 0 can't spin against a
         // provider's rate limit. (`CalendarAccount::refresh_secs` already
         // clamps; this is belt-and-braces at the one place that loops.)
-        let calendar_every = calendar_poll_secs.map(|s| {
+        let mut calendar_every = calendar_poll_secs.map(|s| {
             thegn_core::time_policy::cadence_slots(
                 s,
                 thegn_core::config_calendar::MIN_REFRESH_SECS,
@@ -202,23 +274,33 @@ fn spawn_worker(
         // `UsageConfig::effective_poll_secs` already floors this at 60; the
         // `.max(60)` here is the same belt-and-braces as the calendar slot, so
         // the one place that loops can't be made to spin from config.
-        let usage_every =
+        let mut usage_every =
             usage_poll_secs.map(|s| thegn_core::time_policy::cadence_slots(s, 60, 500).get());
-        let weather_every = weather_every_slots(weather_poll_secs);
+        let mut weather_every = weather_every_slots(weather_poll_secs);
         let container_every = thegn_core::time_policy::cadence_millis_slots(
             CONTAINER_REFRESH_INTERVAL.as_millis(),
             500,
         )
         .get();
-        let disk_every =
+        let mut disk_every =
             thegn_core::scan_sched::pump_slots(disk_ttl_secs, DISK_PUMP_FLOOR_SECS, 500);
-        let loc_every =
+        let mut loc_every =
             loc_ttl_secs.map(|s| thegn_core::scan_sched::pump_slots(s, LOC_PUMP_FLOOR_SECS, 500));
         let daemon_every =
             thegn_core::time_policy::cadence_millis_slots(DAEMON_REFRESH_INTERVAL.as_millis(), 500)
                 .get();
         let heal_every = 30; // 15s host-heal consideration (backoff: core::heal)
         let mut ticks: u64 = 0;
+        let mut ci_after = 0;
+        let mut prq_after = 0;
+        let mut fetch_after = 0;
+        let mut calendar_after = 0;
+        let mut reminder_after = 0;
+        let mut disk_after = 0;
+        let mut loc_after = 0;
+        let mut usage_after = 0;
+        let mut weather_after = 0;
+        let mut active_generation = generation;
         io.prime_stats();
         // Keep the initial clock observation between stats and daemon priming.
         let mut last_clock_unit = clock_unit(&clock_period_secs, io.now_secs());
@@ -227,6 +309,123 @@ fn spawn_worker(
             if !io.wait_tick(tick) {
                 break;
             }
+            if stop
+                .as_ref()
+                .is_some_and(|flag| flag.load(Ordering::Acquire))
+            {
+                break;
+            }
+            if let Some(commands) = &commands {
+                let mut replacement = None;
+                while let Ok(command) = commands.try_recv() {
+                    replacement = Some(command);
+                }
+                if let Some(TickerCommand::Replace {
+                    schedule,
+                    generation,
+                }) = replacement
+                {
+                    let next = Cadences::from_schedule(&schedule);
+                    let ci_changed = ci_poll_secs != next.ci_poll_secs;
+                    let prq_changed = prq_poll_secs != next.prq_poll_secs;
+                    let fetch_changed = auto_fetch_secs != next.auto_fetch_secs;
+                    let calendar_changed = calendar_poll_secs != next.calendar_poll_secs;
+                    let disk_changed = disk_ttl_secs != next.disk_ttl_secs;
+                    let loc_changed = loc_ttl_secs != next.loc_ttl_secs;
+                    let usage_changed = usage_poll_secs != next.usage_poll_secs;
+                    let weather_changed = weather_poll_secs != next.weather_poll_secs;
+                    let rearm = |old: u64, new: u64, tick: u64| {
+                        (old != new).then_some(tick.saturating_add(new))
+                    };
+                    let rearm_opt = |old: Option<u64>, new: Option<u64>, tick: u64| {
+                        (old != new)
+                            .then_some(new.map(|n| tick.saturating_add(n)))
+                            .flatten()
+                    };
+                    ci_after = rearm(ci_poll_secs, next.ci_poll_secs, ticks).unwrap_or(ci_after);
+                    prq_after =
+                        rearm_opt(prq_poll_secs, next.prq_poll_secs, ticks).unwrap_or(prq_after);
+                    fetch_after = rearm_opt(auto_fetch_secs, next.auto_fetch_secs, ticks)
+                        .unwrap_or(fetch_after);
+                    calendar_after = rearm_opt(calendar_poll_secs, next.calendar_poll_secs, ticks)
+                        .unwrap_or(calendar_after);
+                    if calendar_poll_secs != next.calendar_poll_secs
+                        || calendar_reminders != next.calendar_reminders
+                    {
+                        reminder_after = next
+                            .calendar_poll_secs
+                            .map(|_| ticks.saturating_add(60))
+                            .unwrap_or(0);
+                    }
+                    disk_after =
+                        rearm(disk_ttl_secs, next.disk_ttl_secs, ticks).unwrap_or(disk_after);
+                    loc_after =
+                        rearm_opt(loc_ttl_secs, next.loc_ttl_secs, ticks).unwrap_or(loc_after);
+                    usage_after = rearm_opt(usage_poll_secs, next.usage_poll_secs, ticks)
+                        .unwrap_or(usage_after);
+                    weather_after = rearm_opt(weather_poll_secs, next.weather_poll_secs, ticks)
+                        .unwrap_or(weather_after);
+                    ci_poll_secs = next.ci_poll_secs;
+                    prq_poll_secs = next.prq_poll_secs;
+                    auto_fetch_secs = next.auto_fetch_secs;
+                    clock_period_secs = Arc::new(AtomicU64::new(next.clock_period_secs));
+                    calendar_poll_secs = next.calendar_poll_secs;
+                    calendar_reminders = next.calendar_reminders;
+                    disk_ttl_secs = next.disk_ttl_secs;
+                    loc_ttl_secs = next.loc_ttl_secs;
+                    usage_poll_secs = next.usage_poll_secs;
+                    weather_poll_secs = next.weather_poll_secs;
+                    ci_every = crate::ci_refresh::ci_every_slots(ci_poll_secs);
+                    fetch_every = auto_fetch_secs.and_then(crate::remote_poll::fetch_every_slots);
+                    prq_every = prq_poll_secs
+                        .map(|s| thegn_core::time_policy::cadence_slots(s, 15, 500).get());
+                    calendar_every = calendar_poll_secs.map(|s| {
+                        thegn_core::time_policy::cadence_slots(
+                            s,
+                            thegn_core::config_calendar::MIN_REFRESH_SECS,
+                            500,
+                        )
+                        .get()
+                    });
+                    disk_every = thegn_core::scan_sched::pump_slots(
+                        disk_ttl_secs,
+                        DISK_PUMP_FLOOR_SECS,
+                        500,
+                    );
+                    loc_every = loc_ttl_secs
+                        .map(|s| thegn_core::scan_sched::pump_slots(s, LOC_PUMP_FLOOR_SECS, 500));
+                    usage_every = usage_poll_secs
+                        .map(|s| thegn_core::time_policy::cadence_slots(s, 60, 500).get());
+                    weather_every = weather_every_slots(weather_poll_secs);
+                    if ci_changed {
+                        ci_after = ticks.saturating_add(ci_every);
+                    }
+                    if prq_changed {
+                        prq_after = prq_every.map(|n| ticks.saturating_add(n)).unwrap_or(0);
+                    }
+                    if fetch_changed {
+                        fetch_after = fetch_every.map(|n| ticks.saturating_add(n)).unwrap_or(0);
+                    }
+                    if calendar_changed {
+                        calendar_after =
+                            calendar_every.map(|n| ticks.saturating_add(n)).unwrap_or(0);
+                    }
+                    if disk_changed {
+                        disk_after = ticks.saturating_add(disk_every);
+                    }
+                    if loc_changed {
+                        loc_after = loc_every.map(|n| ticks.saturating_add(n)).unwrap_or(0);
+                    }
+                    if usage_changed {
+                        usage_after = usage_every.map(|n| ticks.saturating_add(n)).unwrap_or(0);
+                    }
+                    if weather_changed {
+                        weather_after = weather_every.map(|n| ticks.saturating_add(n)).unwrap_or(0);
+                    }
+                    last_clock_unit = clock_unit(&clock_period_secs, io.now_secs());
+                    active_generation = generation;
+                }
+            }
             ticks = ticks.wrapping_add(1);
             let mut wake = false;
             if let Some(work) = crate::refresh_schedule::model_or_pr(ticks, model_every, pr_every) {
@@ -234,29 +433,29 @@ fn spawn_worker(
                     crate::refresh_schedule::ModelRefresh::Pr => RefreshKind::Pr,
                     crate::refresh_schedule::ModelRefresh::Model => RefreshKind::Model,
                 };
-                if tx.send(kind).is_err() {
+                if send_tick(&tx, active_generation, kind).is_err() {
                     break; // loop gone
                 }
                 wake = true;
             }
             // CI run-history on its own `[ci] poll_interval_secs` cadence (AV
             // group); the refresh itself further coalesces via `[ci] ttl_secs`.
-            if ticks.is_multiple_of(ci_every) {
-                if tx.send(RefreshKind::Ci { force: false }).is_err() {
+            if due(ticks, ci_every, ci_after) {
+                if send_tick(&tx, active_generation, RefreshKind::Ci { force: false }).is_err() {
                     break;
                 }
                 wake = true;
             }
             if ticks.is_multiple_of(issue_every) {
-                if tx.send(RefreshKind::Issues).is_err() {
+                if send_tick(&tx, active_generation, RefreshKind::Issues).is_err() {
                     break;
                 }
                 wake = true;
             }
             if let Some(n) = prq_every
-                && ticks.is_multiple_of(n)
+                && due(ticks, n, prq_after)
             {
-                if tx.send(RefreshKind::PrQueue).is_err() {
+                if send_tick(&tx, active_generation, RefreshKind::PrQueue).is_err() {
                     break;
                 }
                 wake = true;
@@ -268,11 +467,11 @@ fn spawn_worker(
             // the configured cadence takes over (and sweeps the background
             // worktrees). Both are coalesced per-repo by `remote_poll`.
             if auto_fetch_secs.is_some()
-                && (ticks == STARTUP_FETCH_SLOT
-                    || fetch_every.is_some_and(|n| ticks.is_multiple_of(n)))
+                && ((fetch_after == 0 && ticks == STARTUP_FETCH_SLOT)
+                    || fetch_every.is_some_and(|n| due(ticks, n, fetch_after)))
             {
                 let sweep = ticks != STARTUP_FETCH_SLOT;
-                if tx.send(RefreshKind::AutoFetch { sweep }).is_err() {
+                if send_tick(&tx, active_generation, RefreshKind::AutoFetch { sweep }).is_err() {
                     break;
                 }
                 wake = true;
@@ -282,16 +481,18 @@ fn spawn_worker(
             // pump interval. Both scans coalesce internally (a target inside its
             // TTL is planned away), so the startup slot coinciding with a pump
             // costs nothing.
-            if ticks == STARTUP_MEASURE_SLOT || ticks.is_multiple_of(disk_every) {
-                if tx.send(RefreshKind::Disk).is_err() {
+            if (disk_after == 0 && ticks == STARTUP_MEASURE_SLOT)
+                || due(ticks, disk_every, disk_after)
+            {
+                if send_tick(&tx, active_generation, RefreshKind::Disk).is_err() {
                     break;
                 }
                 wake = true;
             }
             if let Some(n) = loc_every
-                && (ticks == STARTUP_MEASURE_SLOT || ticks.is_multiple_of(n))
+                && ((loc_after == 0 && ticks == STARTUP_MEASURE_SLOT) || due(ticks, n, loc_after))
             {
-                if tx.send(RefreshKind::Loc { watch: false }).is_err() {
+                if send_tick(&tx, active_generation, RefreshKind::Loc { watch: false }).is_err() {
                     break;
                 }
                 wake = true;
@@ -300,8 +501,10 @@ fn spawn_worker(
             // than the cadence so the badge fills within seconds of launch
             // instead of after the first full interval — but deliberately not
             // at tick 0, so a network round trip is never on the launch path.
-            if usage_every.is_some_and(|n| ticks == USAGE_FIRST_SLOT || ticks.is_multiple_of(n)) {
-                if tx.send(RefreshKind::UsagePoll).is_err() {
+            if usage_every.is_some_and(|n| {
+                (usage_after == 0 && ticks == USAGE_FIRST_SLOT) || due(ticks, n, usage_after)
+            }) {
+                if send_tick(&tx, active_generation, RefreshKind::UsagePoll).is_err() {
                     break;
                 }
                 wake = true;
@@ -311,9 +514,10 @@ fn spawn_worker(
             // request at all), then the floored cadence. `weather_every` is
             // `None` while `[weather]` is off, so a disabled feature emits no
             // slot and costs no idle wake.
-            if weather_every.is_some_and(|n| ticks == WEATHER_FIRST_SLOT || ticks.is_multiple_of(n))
-            {
-                if tx.send(RefreshKind::WeatherPoll).is_err() {
+            if weather_every.is_some_and(|n| {
+                (weather_after == 0 && ticks == WEATHER_FIRST_SLOT) || due(ticks, n, weather_after)
+            }) {
+                if send_tick(&tx, active_generation, RefreshKind::WeatherPoll).is_err() {
                     break;
                 }
                 wake = true;
@@ -331,7 +535,7 @@ fn spawn_worker(
             // Host-heal consideration: O(1) send; the handler no-ops unless a
             // Failed(retryable) host exists (0%-idle invariant preserved).
             if ticks.is_multiple_of(heal_every) {
-                if tx.send(RefreshKind::HostHeal).is_err() {
+                if send_tick(&tx, active_generation, RefreshKind::HostHeal).is_err() {
                     break;
                 }
                 wake = true;
@@ -339,7 +543,7 @@ fn spawn_worker(
             // Offline recovery: only while offline, throttled. `is_offline()` is
             // a lock-free atomic — an online machine never sends.
             if io.connection_recovery_due() {
-                if tx.send(RefreshKind::ConnRecover).is_err() {
+                if send_tick(&tx, active_generation, RefreshKind::ConnRecover).is_err() {
                     break;
                 }
                 wake = true;
@@ -349,22 +553,24 @@ fn spawn_worker(
             // `packed-refs` rewrite, the watcher-retarget window, a network mount)
             // is caught here within the PR cadence. The heal itself is a cheap
             // guarded no-op when the checkout is already coherent (the common case).
-            if ticks.is_multiple_of(pr_every.get()) && tx.send(RefreshKind::MainRefMoved).is_err() {
+            if due(ticks, pr_every.get(), 0)
+                && send_tick(&tx, active_generation, RefreshKind::MainRefMoved).is_err()
+            {
                 break;
             }
             if let Some(n) = calendar_every
-                && ticks.is_multiple_of(n)
+                && due(ticks, n, calendar_after)
             {
-                if tx.send(RefreshKind::Calendar).is_err() {
+                if send_tick(&tx, active_generation, RefreshKind::Calendar).is_err() {
                     break;
                 }
                 wake = true;
             }
             if calendar_every.is_some()
                 && calendar_reminders
-                && ticks.is_multiple_of(reminder_every)
+                && due(ticks, reminder_every, reminder_after)
             {
-                if tx.send(RefreshKind::CalendarReminders).is_err() {
+                if send_tick(&tx, active_generation, RefreshKind::CalendarReminders).is_err() {
                     break;
                 }
                 wake = true;
@@ -378,7 +584,7 @@ fn spawn_worker(
                 let unit = clock_unit(&clock_period_secs, io.now_secs());
                 if unit != last_clock_unit {
                     last_clock_unit = unit;
-                    if tx.send(RefreshKind::ClockTick).is_err() {
+                    if send_tick(&tx, active_generation, RefreshKind::ClockTick).is_err() {
                         break;
                     }
                     wake = true;

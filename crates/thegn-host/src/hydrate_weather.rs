@@ -44,13 +44,24 @@ pub(crate) const CACHE_SCOPE: &str = "weather";
 /// `locale` is the environment's locale string, used only to resolve
 /// `units = "auto"`; it is read on the loop (a cheap `env::var`) and passed in
 /// so nothing here reaches for process state.
+#[allow(dead_code)] // retained as the untagged/event-driven entry point
 pub(crate) fn spawn_poll(
     cfg: WeatherConfig,
     locale: Option<String>,
     tx: tokio_mpsc::UnboundedSender<RefreshKind>,
     waker: TerminalWaker,
 ) {
-    tokio::task::spawn_blocking(move || poll(cfg, locale, &tx, &waker));
+    spawn_poll_with_generation(cfg, locale, tx, waker, None);
+}
+
+pub(crate) fn spawn_poll_with_generation(
+    cfg: WeatherConfig,
+    locale: Option<String>,
+    tx: tokio_mpsc::UnboundedSender<RefreshKind>,
+    waker: TerminalWaker,
+    generation: Option<u64>,
+) {
+    tokio::task::spawn_blocking(move || poll(cfg, locale, &tx, &waker, generation));
 }
 
 /// The pass itself, split from the spawn so the blocking body is readable.
@@ -59,6 +70,7 @@ fn poll(
     locale: Option<String>,
     tx: &tokio_mpsc::UnboundedSender<RefreshKind>,
     waker: &TerminalWaker,
+    generation: Option<u64>,
 ) {
     // Belt-and-braces: the ticker already emits no slot at all when weather is
     // inert, so this only catches a programmatically-built config.
@@ -86,7 +98,7 @@ fn poll(
     // considered, so a cold launch paints from disk.
     let cached = db.as_ref().and_then(|db| read_cache(db, &key));
     if let Some(snap) = &cached {
-        deliver(tx, waker, snap.clone());
+        deliver(tx, waker, snap.clone(), generation);
     }
 
     let offline = thegn_core::connectivity::current() == Connectivity::Offline;
@@ -127,7 +139,7 @@ fn poll(
             if let Some(db) = db.as_ref() {
                 write_cache(db, &key, &snap);
             }
-            deliver(tx, waker, snap);
+            deliver(tx, waker, snap, generation);
         }
         Err(e) => {
             // Only a transport failure is evidence about the link: an `Api` or a
@@ -217,8 +229,14 @@ fn deliver(
     tx: &tokio_mpsc::UnboundedSender<RefreshKind>,
     waker: &TerminalWaker,
     snap: WeatherSnapshot,
+    generation: Option<u64>,
 ) {
-    if tx.send(RefreshKind::Weather(Box::new(snap))).is_err() {
+    let result = RefreshKind::Weather(Box::new(snap));
+    let result = generation.map_or(result.clone(), |generation| RefreshKind::Scheduled {
+        generation,
+        kind: Box::new(result),
+    });
+    if tx.send(result).is_err() {
         // The loop is gone — there is nothing left to wake, and nothing to
         // report the failure to.
         return;
