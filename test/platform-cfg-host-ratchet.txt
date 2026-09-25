@@ -80,3 +80,10 @@ devcontainer_provider.rs
 # production mode-bit/script publication is behind `platform::`; moving these
 # fixtures there would obscure the wrapper and sandbox boundary they assert.
 build_cache.rs
+# TEST-ONLY cfg, not per-OS production code (THE-574): the refusal regressions
+# install an executable fake shell/agent launcher (Unix mode bits) and assert a
+# spawn sentinel is never touched, proving the remembered-agent refusal path
+# keeps the shell without running the agent. `remembered_agent_relaunch` and its
+# diagnostics are platform-free; the cfg gates only these fixtures, which need
+# the module's private helpers to exercise the real launch seam.
+handlers/worktree_launch.rs
