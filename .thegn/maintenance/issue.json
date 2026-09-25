@@ -1,0 +1,12 @@
+{
+  "id": "THE-195",
+  "title": "Make API coverage reporting use the same authoritative ledger as coverage tests",
+  "url": "https://linear.app/blakeashley/issue/the-195",
+  "priority": "Medium",
+  "labels": [
+    "Bug"
+  ],
+  "status": "Todo",
+  "parentId": "THE-150",
+  "description": "## Finding\n\nProduction `api coverage` reports CLI coverage as 55/92 while the test ledger reports 88/92. Separate hard-coded tables make the diagnostic untrustworthy and allow drift.\n\n## Evidence at audited commit\n\n`crates/thegn-host/src/cmd/api.rs:66` and `crates/thegn-host/src/cmd/session.rs:1945`.\n\n## Implementation constraints\n\nDerive CLI and test reporting from one route/command coverage registry; classify intentional exclusions with machine-readable reasons.\n\n## Acceptance criteria\n\n- [ ] CLI, tests, and generated docs report identical numerators/denominators for the same revision.\n- [ ] Every uncovered operation has one stable reason/category and owner or explicit non-goal.\n- [ ] Adding/removing a command or route requires updating one authority and fails drift tests otherwise.\n- [ ] Human and JSON output include revision/schema version.\n- [ ] Regression tests lock the current counts only through generated data, not duplicate literals.\n\n## Execution dependencies\n\nBlocked by THE-190 \u2014 LANDED on main, so this is unblocked. Directly blocks THE-201, THE-204, THE-203, THE-202."
+}
