@@ -8,7 +8,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use thegn_core::plugin_api::{PluginId, PluginRuntime, SurfaceId, View};
+use thegn_core::plugin_api::{Contribution, PluginId, PluginRuntime, SurfaceId, View};
 use thegn_svc::plugin::{discover, negotiate, spawn_ndjson};
 
 fn examples_dir() -> PathBuf {
@@ -62,11 +62,18 @@ fn hello_example_registers_and_renders_through_the_real_path() {
     // Apply its messages to the core runtime.
     let mut rt = PluginRuntime::new(neg.clone());
     let plugin = PluginId::new("hello");
+    let mut registered = false;
     for msg in &run.messages {
         match msg.method.as_str() {
             "register" => {
-                let c = neg.accepted_contributions[0].clone();
+                let c: Contribution = serde_json::from_value(msg.params.clone())
+                    .expect("register params are a flat Contribution");
+                assert_eq!(
+                    c, neg.accepted_contributions[0],
+                    "the example's register payload must match its manifest contribution"
+                );
                 rt.register(plugin.clone(), c).expect("register accepted");
+                registered = true;
             }
             "update" => {
                 let surface = SurfaceId::new(
@@ -83,6 +90,7 @@ fn hello_example_registers_and_renders_through_the_real_path() {
             other => panic!("unexpected verb from the example: {other}"),
         }
     }
+    assert!(registered, "the example must register its contribution");
     let view = rt
         .view(&SurfaceId::new("hello.segment"))
         .expect("the segment has a view");
