@@ -993,12 +993,15 @@ pub(crate) fn spawn_pr_view_fetch(
                 }
             }
         }
-        if let Some(data) =
-            crate::hydrate_schedule::scheduled_delivery(schedule_fence.as_ref(), data)
+        // `data` is the PR view payload on its own channel, not a
+        // `RefreshKind`, so it is fenced by the generation check directly —
+        // `scheduled_delivery` only wraps refresh kinds. A stale scheduled
+        // fetch is dropped here rather than rendered; an untagged (manual or
+        // event-driven) fetch has no fence and always delivers.
+        if crate::hydrate_schedule::generation_is_current(schedule_fence.as_ref())
+            && tx.send(data).is_ok()
         {
-            if tx.send(data).is_ok() {
-                let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
-            }
+            let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
     });
 }

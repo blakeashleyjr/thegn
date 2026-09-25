@@ -278,7 +278,15 @@ fn refresh_ci_cache_for(
                 }
             }
             ingest_failed_logs(
-                host_path, loc, cfg, full, &db, &runs, &old_runs, waker, generation,
+                host_path,
+                loc,
+                cfg,
+                full,
+                &db,
+                &runs,
+                &old_runs,
+                waker,
+                generation.clone(),
             );
         }
         Err(e) => {

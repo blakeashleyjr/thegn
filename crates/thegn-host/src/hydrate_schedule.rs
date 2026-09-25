@@ -205,7 +205,6 @@ impl ScheduleOwner {
         self.reconfigure_effective(ScheduleConfig::from_config(cfg));
     }
 
-    #[cfg(test)]
     pub(crate) fn reconfigure_effective(&mut self, next: ScheduleConfig) {
         if next == self.effective {
             return;
