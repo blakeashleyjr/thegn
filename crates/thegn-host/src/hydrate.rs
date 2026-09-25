@@ -426,6 +426,10 @@ const WEATHER_FIRST_SLOT: u64 = 10;
 /// `WeatherConfig::refresh_secs` already floors the interval; the `.max()` here
 /// is the same belt-and-braces as [`spawn_refresh_ticker`]'s calendar slot, so
 /// the one place that loops cannot be made to spin from config.
+// Test-only since the scheduler refactor: production now calls the
+// generation-aware form directly, and this wrapper keeps the existing
+// unfenced regressions meaningful.
+#[cfg(test)]
 fn weather_every_slots(poll_secs: Option<u64>) -> Option<u64> {
     poll_secs.map(|s| {
         thegn_core::time_policy::cadence_slots(s, thegn_core::config_weather::MIN_REFRESH_SECS, 500)
@@ -3515,10 +3519,10 @@ pub(crate) fn spawn_pr_cache_refresh_with_generation(
         // preserves both the displayed data and the transition diff. See
         // `pr_state_is_definitive` and `github.rs`'s Offline doc ("Stale cached
         // data may still be shown").
-        if pr_state_is_definitive(&panel.state) {
-            if crate::hydrate_schedule::generation_is_current(generation.as_ref()) {
-                let _ = db.put_pr_cache(&cache_key, &panel.branch, &json); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
-            }
+        if pr_state_is_definitive(&panel.state)
+            && crate::hydrate_schedule::generation_is_current(generation.as_ref())
+        {
+            let _ = db.put_pr_cache(&cache_key, &panel.branch, &json); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
         }
 
         // Deep review data is a separate complete snapshot. Fetching either

@@ -121,14 +121,7 @@ pub(crate) fn on_ci_tick(
         generation.clone(),
     );
     if let Some(run) = bar_detail.as_mut().and_then(|ov| ov.live_ci_repoll()) {
-        crate::actions::spawn_ci_detail(
-            session,
-            &full.ci,
-            refresh_tx,
-            waker,
-            run,
-            generation.map(|(current, expected)| (current, expected)),
-        );
+        crate::actions::spawn_ci_detail(session, &full.ci, refresh_tx, waker, run, generation);
     }
 }
 
@@ -272,10 +265,10 @@ fn refresh_ci_cache_for(
                 return false;
             }
             thegn_core::connectivity::report_success();
-            if let Ok(json) = serde_json::to_string(&runs) {
-                if crate::hydrate_schedule::generation_is_current(generation.as_ref()) {
-                    let _ = db.put_ci_cache(&key, branch.as_deref().unwrap_or(""), &json); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
-                }
+            if let Ok(json) = serde_json::to_string(&runs)
+                && crate::hydrate_schedule::generation_is_current(generation.as_ref())
+            {
+                let _ = db.put_ci_cache(&key, branch.as_deref().unwrap_or(""), &json); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
             }
             ingest_failed_logs(
                 host_path,
