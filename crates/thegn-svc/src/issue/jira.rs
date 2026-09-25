@@ -239,11 +239,13 @@ fn jira_status_category(status: &Option<JiraStatus>) -> Option<&str> {
 fn partial_update(
     applied: &[&'static str],
     unapplied: &[&'static str],
+    unverified: &[&'static str],
     source: IssueError,
 ) -> IssueError {
     IssueError::PartialUpdate {
         applied: applied.to_vec(),
         unapplied: unapplied.to_vec(),
+        unverified: unverified.to_vec(),
         source: Box::new(source),
     }
 }
@@ -645,7 +647,7 @@ impl IssueBackend for JiraBackend {
                     match Self::get(&mut op, &jira_path(key, "/transitions")?).await {
                         Ok(transitions) => transitions,
                         Err(error) if !applied.is_empty() => {
-                            return Err(partial_update(&applied, &["status"], error));
+                            return Err(partial_update(&applied, &["status"], &[], error));
                         }
                         Err(error) => return Err(error),
                     };
@@ -667,7 +669,7 @@ impl IssueBackend for JiraBackend {
                 let trans = match trans {
                     Ok(trans) => trans,
                     Err(error) if !applied.is_empty() => {
-                        return Err(partial_update(&applied, &["status"], error));
+                        return Err(partial_update(&applied, &["status"], &[], error));
                     }
                     Err(error) => return Err(error),
                 };
@@ -693,7 +695,7 @@ impl IssueBackend for JiraBackend {
                 {
                     if is_definitive_transition_rejection(&error) {
                         if !applied.is_empty() {
-                            return Err(partial_update(&applied, &["status"], error));
+                            return Err(partial_update(&applied, &["status"], &[], error));
                         }
                         return Err(error);
                     }
@@ -717,22 +719,24 @@ impl IssueBackend for JiraBackend {
             .map_err(|error| {
                 if let Some(post_error) = unknown_transition.take() {
                     // The POST's typed error is the strongest signal available
-                    // for retry/backoff classification. The empty `unapplied`
-                    // set is deliberate: the existing fetch failed, so the
-                    // caller must verify before retrying rather than treating
-                    // status as safely retryable.
-                    partial_update(&applied, &[], post_error)
+                    // for retry/backoff classification. The status is
+                    // unverified: the existing fetch failed, so the caller
+                    // must verify before retrying rather than treating status
+                    // as safely retryable.
+                    partial_update(&applied, &[], &["status"], post_error)
                 } else if applied.is_empty() {
                     error
                 } else {
-                    partial_update(&applied, &[], error)
+                    partial_update(&applied, &[], &[], error)
                 }
             })?;
             if let Err(error) = checked_jira_key(&ji.key) {
-                return Err(if applied.is_empty() {
+                return Err(if let Some(post_error) = unknown_transition.take() {
+                    partial_update(&applied, &[], &["status"], post_error)
+                } else if applied.is_empty() {
                     error
                 } else {
-                    partial_update(&applied, &[], error)
+                    partial_update(&applied, &[], &[], error)
                 });
             }
 
@@ -743,9 +747,9 @@ impl IssueBackend for JiraBackend {
                         "Jira status verification failed for {key}: expected category {target_cat}"
                     ));
                     if unknown_transition.is_some() {
-                        return Err(partial_update(&applied, &["status"], error));
+                        return Err(partial_update(&applied, &["status"], &[], error));
                     }
-                    return Err(partial_update(&applied, &[], error));
+                    return Err(partial_update(&applied, &[], &[], error));
                 }
             }
             Ok(jira_issue_to_domain(ji, &self.base_url))
@@ -1222,10 +1226,12 @@ mod tests {
             Err(IssueError::PartialUpdate {
                 applied,
                 unapplied,
+                unverified,
                 source,
             }) => {
                 assert_eq!(applied, vec!["title"]);
                 assert_eq!(unapplied, vec!["status"]);
+                assert!(unverified.is_empty());
                 let source_debug = format!("{source:?}");
                 assert!(
                     matches!(source.as_ref(), IssueError::Api(message) if message == "jira HTTP 400")
@@ -1273,10 +1279,12 @@ mod tests {
             Err(IssueError::PartialUpdate {
                 applied,
                 unapplied,
+                unverified,
                 source,
             }) => {
                 assert_eq!(applied, vec!["title"]);
                 assert!(unapplied.is_empty(), "unknown status must not be retryable");
+                assert_eq!(unverified, vec!["status"]);
                 assert!(
                     matches!(source.as_ref(), IssueError::Api(message) if message == "jira HTTP 503")
                 );
@@ -1351,6 +1359,7 @@ mod tests {
             Err(IssueError::PartialUpdate {
                 applied,
                 unapplied,
+                unverified,
                 source,
             }) => {
                 assert!(applied.is_empty());
@@ -1358,6 +1367,7 @@ mod tests {
                     unapplied.is_empty(),
                     "an HTTP timeout/intermediary response is ambiguous"
                 );
+                assert_eq!(unverified, vec!["status"]);
                 assert!(
                     matches!(source.as_ref(), IssueError::Api(message) if message == "jira HTTP 408")
                 );
@@ -1396,6 +1406,7 @@ mod tests {
             Err(IssueError::PartialUpdate {
                 applied,
                 unapplied,
+                unverified,
                 source,
             }) => {
                 assert!(applied.is_empty());
@@ -1403,6 +1414,7 @@ mod tests {
                     unapplied.is_empty(),
                     "an unrecognized 4xx response is ambiguous"
                 );
+                assert_eq!(unverified, vec!["status"]);
                 assert!(
                     matches!(source.as_ref(), IssueError::Api(message) if message == "jira HTTP 418")
                 );
@@ -1428,11 +1440,44 @@ mod tests {
         let error = partial_update(
             &["title"],
             &[],
+            &["status"],
             IssueError::Timeout("tracker HTTP operation deadline exceeded"),
         );
 
         assert!(error.is_transient());
-        assert!(format!("{error}").contains("partial update"));
+        let message = format!("{error}");
+        assert!(message.contains("partial update"));
+        assert!(message.contains("unverified: status"));
+        assert!(message.contains("verify before retrying"));
+    }
+
+    #[test]
+    fn partial_update_field_outcomes_are_disjoint() {
+        let error = partial_update(
+            &["title"],
+            &["assignee"],
+            &["status"],
+            IssueError::Api("bounded source".into()),
+        );
+
+        let IssueError::PartialUpdate {
+            applied,
+            unapplied,
+            unverified,
+            ..
+        } = error
+        else {
+            panic!("expected a typed partial update");
+        };
+        let outcomes = [&applied, &unapplied, &unverified];
+        for (index, outcome) in outcomes.iter().enumerate() {
+            for other in outcomes.iter().skip(index + 1) {
+                assert!(
+                    outcome.iter().all(|field| !other.contains(field)),
+                    "field outcomes must be disjoint: {outcome:?} vs {other:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1615,10 +1660,12 @@ mod tests {
             Err(IssueError::PartialUpdate {
                 applied,
                 unapplied,
+                unverified,
                 source,
             }) => {
                 assert_eq!(applied, vec!["status"]);
                 assert!(unapplied.is_empty());
+                assert!(unverified.is_empty());
                 assert!(
                     matches!(source.as_ref(), IssueError::Api(message) if message.contains("expected category indeterminate"))
                 );

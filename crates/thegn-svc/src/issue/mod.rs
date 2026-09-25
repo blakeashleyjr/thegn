@@ -34,6 +34,7 @@ pub enum IssueError {
     PartialUpdate {
         applied: Vec<&'static str>,
         unapplied: Vec<&'static str>,
+        unverified: Vec<&'static str>,
         source: Box<IssueError>,
     },
     Subprocess(String),
@@ -54,11 +55,13 @@ impl std::fmt::Debug for IssueError {
             Self::PartialUpdate {
                 applied,
                 unapplied,
+                unverified,
                 source,
             } => f
                 .debug_struct("IssueError::PartialUpdate")
                 .field("applied", applied)
                 .field("unapplied", unapplied)
+                .field("unverified", unverified)
                 .field("source", source)
                 .finish(),
             Self::Subprocess(message) => f
@@ -89,13 +92,21 @@ impl std::fmt::Display for IssueError {
             IssueError::PartialUpdate {
                 applied,
                 unapplied,
+                unverified,
                 source,
-            } => write!(
-                f,
-                "partial update (applied: {}; unapplied: {}): {source}",
-                applied.join(", "),
-                unapplied.join(", "),
-            ),
+            } => {
+                write!(
+                    f,
+                    "partial update (applied: {}; unapplied: {}; unverified: {})",
+                    applied.join(", "),
+                    unapplied.join(", "),
+                    unverified.join(", "),
+                )?;
+                if !unverified.is_empty() {
+                    write!(f, " — verify before retrying")?;
+                }
+                write!(f, ": {source}")
+            }
             IssueError::Subprocess(s) => write!(f, "subprocess: {s}"),
             IssueError::Parse(s) => write!(f, "parse: {s}"),
             IssueError::Policy(s) => write!(f, "tracker policy: {s}"),
