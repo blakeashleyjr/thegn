@@ -99,7 +99,7 @@ impl RefusalRegistry {
         {
             self.reported.remove(&evicted);
         }
-        self.reported.insert(key.clone());
+        self.reported.insert(key);
         self.order.push_back(key);
         true
     }
