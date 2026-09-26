@@ -151,5 +151,16 @@ pub(crate) fn add_host_from_input(
     db.put_host_def(&name, &hc, now)
         .map_err(|e| e.to_string())?;
     thegn_core::host_config::merge_db_hosts(cfg);
+    // Publish a new admitted generation that includes the stored host, so
+    // hydration (which reads the published snapshot) and later authority
+    // checks see it. Off the loop: the reload re-reads the config file and
+    // the state store.
+    std::thread::spawn(|| {
+        crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
+        if let crate::config_startup::ReloadOutcome::Failed(error) = crate::config_startup::reload()
+        {
+            tracing::warn!(target: "thegn::config", %error, "config reload after host add failed");
+        }
+    });
     Ok(name)
 }

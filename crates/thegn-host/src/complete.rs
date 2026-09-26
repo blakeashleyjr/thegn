@@ -142,8 +142,12 @@ pub fn maybe_complete() {
         // Reroot for `thegn --profile work …` BEFORE any source resolves a
         // path, so completing under a profile reads that profile's DB and
         // config overlay.
-        thegn_core::profile::reroot(profile_from_completion_argv(&lossy_argv()));
-        serve()
+        match thegn_core::profile::reroot(profile_from_completion_argv(&lossy_argv())) {
+            Ok(()) => serve(),
+            // A completion request must stay an empty successful response on
+            // selector refusal; it must never fall through into normal launch.
+            Err(_error) => false,
+        }
     })) {
         Ok(_served) => std::process::exit(0),
         Err(_panic) => std::process::exit(0),

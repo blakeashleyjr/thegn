@@ -238,6 +238,55 @@ strictly checks the main file, active profile, and selected repo overlay with
 file/key context. When candidates are shadowed, the loader warns with paths
 only.
 
+**Config admission (THE-505).** Every configured process verb, `open`, and
+the interactive launch run on one strictly admitted generation
+(`thegn-host/src/config_startup.rs` over `thegn_core::config_admission` and
+`config_admission_store`). The process inputs (selected config path, profile
+roots, the env keys the mapper reads, `--set`) are captured once; every
+non-DB layer is admitted before the state DB is opened; only then is the
+admitted `[database]` migration policy installed and the store opened (so a
+legitimate older schema still upgrades), and host definitions are captured
+strictly from the migrated store. Any failure is a typed hard error before
+authority-bearing work starts — the only default is an absent _implicit_
+config file. Runtime tuning (`[remote]`/`[network]`) is installed only after
+publication. Reload re-admits from the frozen capture off the loop and
+publishes by generation CAS; a failed reload keeps the last generation for
+display only and the store refuses to authorize any revision until a reload
+succeeds. Hydration reads the published snapshot instead of reparsing; the
+daemon's per-launch refresh refuses rather than falling back to its boot
+snapshot. Source-inspection/recovery verbs (`config show/get/validate/
+explain/edit/set`, `automations test`) keep the tolerant display projection
+so a broken file can still be diagnosed and fixed; it is never published.
+
+Unknown keys follow a per-call-site policy (`config_validate::UnknownKeys`):
+the two admitted configuration layers (main file, selected profile overlay)
+refuse an unknown key only under a security-relevant table — one that can
+execute, reach a remote, hold or select credentials, gate migrations or set
+sandbox/placement/queue policy (`SECURITY_RELEVANT_ROOTS`, mirrored in
+`docs/help/configuration.md`, and kept honest by a schema-derived rot guard
+that fails when a new root carries a command/argv, a credential or a
+URL/host field) — and warn elsewhere, because one
+`~/.config/thegn/config.toml` is shared by builds of different ages. Every
+other consumer of the same walk (repo overlay, `host_definition_snapshot`'s
+row decoder, any other schema) keeps `UnknownKeys::Reject`; the relaxation
+is passed in at the call site, never decided inside the walk. Entries are
+SCHEMA property names: `[workspace.<slug>]` is normalized to
+`[project.<slug>]` before any walk, so `project` is the protected name. A
+typo of a security table refuses through the walk's nearest-key hint. That
+also refuses a legitimately new top-level table within the hint's edit
+distance of a security-relevant name (`[hosts]`, `[secret]`, `[stat]`, …) —
+a typo and a new neighbour are the same shape, so the trade-off is
+irreducible; `unknown_key_refuses` documents how to drop it (delete the
+top-level branch, keep the nested rule).
+
+Config files are read through bounded opened-file adapters. Linux admits a
+resolved regular-file symlink component-wise; on macOS/Windows a _final_
+config symlink is resolved with the OS resolver, the resolved ordinary file
+is read through the no-follow adapter, and a retarget during the read is
+refused (`FinalLinkResolvingReader`). This is observed coherence in a stable
+owner-controlled namespace, not a hostile same-UID guarantee. The macOS and
+Windows paths are compiled-only from Linux CI.
+
 **Gate:** `tests/config_example.rs` (every key documented; example parses and
 validates clean, and the generated reference retains the documented key set),
 `tests/env_overlay_coverage.rs` (every shallow key has an env knob or is

@@ -22,11 +22,23 @@ fn static_commands_do_not_open_fifo_configuration_but_configured_siblings_do() {
         assert_eq!(fixture.snapshot(), before);
     }
     // A successful regular-file counterpart is covered separately. These are
-    // loader-bound observations plus source proof, not execution of an API call
-    // or automation. No FIFO writer is ever opened.
+    // source-proof observations, not execution of an API call or automation. No
+    // FIFO writer is ever opened.
+    //
+    // The static commands above succeeded against this same FIFO because they
+    // never consult the configuration source. Every command below does consult
+    // it — which is the property under test — but they do not agree on how:
+    // configuration admission refuses a non-regular source outright, while a
+    // command that still opens the source directly blocks on the unread FIFO.
+    // Admission is not yet uniform across the CLI, so assert what each one
+    // actually does rather than blurring the two. THE-691 makes them uniform;
+    // when it lands, collapse both loops into `assert_source_refused`.
+    for args in [&["api", "call", "worktrees.list"][..]] {
+        fixture.assert_source_refused(args, &config);
+        assert_eq!(fixture.snapshot(), before, "{args:?} mutated the root");
+    }
     for args in [
         &["config", "get", "drawer.height"][..],
-        &["api", "call", "worktrees.list"][..],
         &["automations", "test", "missing", "--event", "{}"][..],
     ] {
         fixture.assert_loader_wait(args, &config);

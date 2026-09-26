@@ -73,33 +73,18 @@ pub fn stop_body() -> serde_json::Value {
     serde_json::json!({ "signal": "SIGTERM", "timeout": "30s" })
 }
 
-/// A `template` of `image:<ref>` or a bare registry ref selects the image; unlike
-/// a VPS there is no snapshot concept (Fly speed comes from small images).
-pub fn image_ref(template: &str) -> Option<&str> {
-    let t = template.trim();
-    if t.is_empty() {
-        None
-    } else {
-        Some(t.strip_prefix("image:").map(str::trim).unwrap_or(t))
-    }
+/// Map a Fly size preset (`shared-cpu-2x`, `performance-1x`, …) to a guest
+/// `{cpu_kind, cpus, memory_mb}`. An unknown preset is a typed admission error,
+/// never a silently substituted machine size.
+pub fn guest_for_size(
+    size: &str,
+) -> Result<serde_json::Value, thegn_core::provider_admission::ProviderAdmissionError> {
+    thegn_core::provider_admission::FlySize::parse(size).map(guest)
 }
 
-/// Map a Fly size preset (`shared-cpu-2x`, `performance-1x`, …) to a guest
-/// `{cpu_kind, cpus, memory_mb}`. Unknown presets fall back to shared-cpu-1x so a
-/// typo degrades to the cheapest machine, never a create failure.
-pub fn guest_for_size(size: &str) -> serde_json::Value {
-    let s = size.trim();
-    let (kind, cpus, mem) = match s {
-        "shared-cpu-1x" => ("shared", 1, 256),
-        "shared-cpu-2x" => ("shared", 2, 512),
-        "shared-cpu-4x" => ("shared", 4, 1024),
-        "shared-cpu-8x" => ("shared", 8, 2048),
-        "performance-1x" => ("performance", 1, 2048),
-        "performance-2x" => ("performance", 2, 4096),
-        "performance-4x" => ("performance", 4, 8192),
-        _ => ("shared", 1, 256),
-    };
-    serde_json::json!({ "cpu_kind": kind, "cpus": cpus, "memory_mb": mem })
+fn guest(size: thegn_core::provider_admission::FlySize) -> serde_json::Value {
+    let (cpu_kind, cpus, memory_mb) = size.guest();
+    serde_json::json!({ "cpu_kind": cpu_kind, "cpus": cpus, "memory_mb": memory_mb })
 }
 
 /// The internal + external ssh port (per-sandbox app ⇒ a dedicated IPv4, so the
@@ -141,7 +126,7 @@ pub fn create_machine_body(
     name: &str,
     region: &str,
     image: &str,
-    size: &str,
+    size: thegn_core::provider_admission::FlySize,
     authorized_key: &str,
     metadata: &BTreeMap<String, String>,
     prebaked: bool,
@@ -154,7 +139,7 @@ pub fn create_machine_body(
     let authkeys_b64 = super::b64(authorized_key.trim().as_bytes());
     let mut config = serde_json::json!({
         "image": image,
-        "guest": guest_for_size(size),
+        "guest": guest(size),
         "metadata": meta,
         "auto_destroy": false,
         // Don't let Fly auto-restart a machine thegn parked (scale-to-zero).
@@ -383,22 +368,13 @@ mod tests {
     }
 
     #[test]
-    fn image_ref_strips_prefix() {
-        assert_eq!(image_ref("image:ubuntu:24.04"), Some("ubuntu:24.04"));
+    fn guest_maps_known_presets_and_rejects_unknown() {
+        assert_eq!(guest_for_size("shared-cpu-2x").unwrap()["memory_mb"], 512);
         assert_eq!(
-            image_ref("registry.fly.io/x:deployment-1"),
-            Some("registry.fly.io/x:deployment-1")
+            guest_for_size("performance-1x").unwrap()["cpu_kind"],
+            "performance"
         );
-        assert_eq!(image_ref("  "), None);
-    }
-
-    #[test]
-    fn guest_maps_known_presets_and_falls_back() {
-        assert_eq!(guest_for_size("shared-cpu-2x")["memory_mb"], 512);
-        assert_eq!(guest_for_size("performance-1x")["cpu_kind"], "performance");
-        // Unknown → cheapest shared machine, not a failure.
-        assert_eq!(guest_for_size("nonsense")["cpu_kind"], "shared");
-        assert_eq!(guest_for_size("nonsense")["cpus"], 1);
+        assert_eq!(guest_for_size("nonsense").unwrap_err().field, "size");
     }
 
     #[test]
@@ -410,7 +386,7 @@ mod tests {
             "tg-fly-1",
             "iad",
             "ubuntu:24.04",
-            "shared-cpu-2x",
+            thegn_core::provider_admission::FlySize::SharedCpu2x,
             "ssh-ed25519 AAAAKEY thegn",
             &meta,
             false,
@@ -455,7 +431,7 @@ mod tests {
             "tg-fly-1",
             "iad",
             "registry.fly.io/x:tg",
-            "shared-cpu-2x",
+            thegn_core::provider_admission::FlySize::SharedCpu2x,
             "ssh-ed25519 AAAAKEY thegn",
             &meta,
             true,
@@ -491,7 +467,7 @@ mod tests {
             "tg-fly-1",
             "iad",
             "registry.fly.io/x:tg",
-            "shared-cpu-2x",
+            thegn_core::provider_admission::FlySize::SharedCpu2x,
             "ssh-ed25519 AAAAKEY thegn",
             &meta,
             true,

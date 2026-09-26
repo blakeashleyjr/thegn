@@ -358,7 +358,10 @@ fn serve(
 fn explain_key(key: &str, path: PathBuf) -> String {
     use thegn_core::config::ProcessEnv;
     use thegn_core::config_resolve;
-    let origin = config_resolve::explain(&ProcessEnv, &[], Some(path), key);
+    let origin = match config_resolve::explain(&ProcessEnv, &[], Some(path), key) {
+        Ok(origin) => origin,
+        Err(error) => return format!("{key}: unadmitted configuration: {error}\n"),
+    };
     let mut s = format!(
         "{} = {}\n  set by: {}\n",
         origin.key,

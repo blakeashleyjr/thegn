@@ -22,6 +22,38 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+/// Captured inputs used by pure configuration normalization.  Admission must
+/// never reopen HOME (or another ambient source) while it is composing a
+/// candidate; legacy effectful callers capture this once at their own edge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathExpansionContext {
+    home: PathBuf,
+}
+
+impl PathExpansionContext {
+    pub fn captured() -> Self {
+        Self { home: util::home() }
+    }
+
+    pub fn from_home(home: PathBuf) -> Self {
+        Self { home }
+    }
+
+    pub(crate) fn home(&self) -> &Path {
+        &self.home
+    }
+
+    pub(crate) fn expand_tilde(&self, path: &str) -> String {
+        if path == "~" {
+            self.home.to_string_lossy().into_owned()
+        } else if let Some(rest) = path.strip_prefix("~/") {
+            self.home.join(rest).to_string_lossy().into_owned()
+        } else {
+            path.to_string()
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) use crate::config_repo::lenient_env_selector;
 pub(crate) use crate::config_repo::{RepoConfigFile, reject_overlay_command_collectors};
@@ -2321,7 +2353,7 @@ impl GitOverlay {
 /// Host keybinding overrides. The flat `[keybinds]` table remains the
 /// default/global layer for backwards compatibility; nested tables such as
 /// `[keybinds.vim_normal]` override only the native host's named modes.
-#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct KeybindConfig {
     /// Backwards-compatible flat `[keybinds] action-id = "Chord"` entries.
@@ -2336,6 +2368,33 @@ pub struct KeybindConfig {
     /// Native host emacs-mode overrides.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub emacs: BTreeMap<String, String>,
+}
+
+// Schemars 0.8 loses the flattened map's additionalProperties when it
+// coexists with named mode maps. Describe the actual serde shape explicitly.
+impl schemars::JsonSchema for KeybindConfig {
+    fn schema_name() -> String {
+        "KeybindConfig".into()
+    }
+
+    fn json_schema(generator: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
+        use schemars::schema::{InstanceType, ObjectValidation, SchemaObject};
+        let chord = generator.subschema_for::<String>();
+        let mode = generator.subschema_for::<BTreeMap<String, String>>();
+        SchemaObject {
+            instance_type: Some(InstanceType::Object.into()),
+            object: Some(Box::new(ObjectValidation {
+                properties: ["vim_normal", "vim_insert", "emacs"]
+                    .into_iter()
+                    .map(|name| (name.to_string(), mode.clone()))
+                    .collect(),
+                additional_properties: Some(Box::new(chord)),
+                ..Default::default()
+            })),
+            ..Default::default()
+        }
+        .into()
+    }
 }
 
 impl KeybindConfig {
@@ -5562,6 +5621,7 @@ pub fn env_overlay(env: &dyn EnvSource) -> ConfigOverlay {
         match raw.trim().parse::<u64>() {
             Ok(n) => Some(n),
             Err(_) => {
+                crate::config_diagnostics::supplied_error(key, "number");
                 config_warn(&format!("{key}: not a number ({raw:?}); ignoring"));
                 None
             }
@@ -5571,6 +5631,7 @@ pub fn env_overlay(env: &dyn EnvSource) -> ConfigOverlay {
         match raw.trim().parse::<f64>() {
             Ok(n) if n.is_finite() => Some(n),
             _ => {
+                crate::config_diagnostics::supplied_error(key, "finite-number");
                 config_warn(&format!("{key}: not a finite number ({raw:?}); ignoring"));
                 None
             }
@@ -5582,6 +5643,7 @@ pub fn env_overlay(env: &dyn EnvSource) -> ConfigOverlay {
         match parse(raw) {
             Ok(v) => Some(v),
             Err(e) => {
+                crate::config_diagnostics::supplied_error(key, "enum");
                 config_warn(&format!("{key}: {e}; ignoring"));
                 None
             }
@@ -5853,7 +5915,10 @@ pub fn env_overlay(env: &dyn EnvSource) -> ConfigOverlay {
     if let Some(v) = env.get("THEGN_PREVIEW_PORTS") {
         match crate::config_preview::parse_ports_env(&v) {
             Ok(ports) => o.preview.ports = Some(ports),
-            Err(error) => config_warn(&format!("THEGN_PREVIEW_PORTS: {error}; ignoring")),
+            Err(error) => {
+                crate::config_diagnostics::supplied_error("THEGN_PREVIEW_PORTS", "ports");
+                config_warn(&format!("THEGN_PREVIEW_PORTS: {error}; ignoring"));
+            }
         }
     }
     if let Some(v) = env.get("THEGN_PREVIEW_FETCH_TIMEOUT_MS") {
@@ -5958,7 +6023,7 @@ pub fn env_overlay(env: &dyn EnvSource) -> ConfigOverlay {
 /// Recursively merge `overlay` into `base` (both JSON): objects merge key-wise
 /// (recursing), any other value replaces. The primitive behind config profile
 /// overlays — a key the overlay omits keeps the base value.
-fn deep_merge_json(base: &mut serde_json::Value, overlay: serde_json::Value) {
+pub(crate) fn deep_merge_json(base: &mut serde_json::Value, overlay: serde_json::Value) {
     match (base, overlay) {
         (serde_json::Value::Object(b), serde_json::Value::Object(o)) => {
             for (k, v) in o {
@@ -5969,25 +6034,46 @@ fn deep_merge_json(base: &mut serde_json::Value, overlay: serde_json::Value) {
     }
 }
 
+/// Apply an already normalized JSON overlay. Trusted admission uses this
+/// after its one compatibility-normalization pass.
+pub(crate) fn apply_json_overlay(
+    cfg: &mut Config,
+    overlay: serde_json::Value,
+) -> Result<(), String> {
+    let mut base = serde_json::to_value(&*cfg).map_err(|e| e.to_string())?;
+    crate::config_duration::introduced(
+        &[],
+        crate::config_duration::errors_for_value::<Config>(&overlay),
+    )?;
+    deep_merge_json(&mut base, overlay);
+    *cfg = serde_json::from_value(base).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 fn parse_bool(raw: &str, key: &str) -> Option<bool> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "on" => Some(true),
         "0" | "false" | "no" | "off" => Some(false),
         other => {
+            crate::config_diagnostics::supplied_error(key, "boolean");
             config_warn(&format!("{key}: not a boolean ({other:?}); ignoring"));
             None
         }
     }
 }
 
-fn apply_env_duration_checked(cfg: &mut Config, env: &dyn EnvSource) {
-    let mut overlay = env_overlay(env);
+pub(crate) fn apply_env_overlay_checked(cfg: &mut Config, mut overlay: ConfigOverlay) {
     for error in crate::config_duration::retain_valid_env_durations(&mut overlay) {
+        crate::config_diagnostics::supplied_error("environment duration", "range");
         config_warn(&error);
     }
     // Invalid duration fields never discard unrelated explicit authority such
     // as a stronger isolation floor, disabled network, or fail-closed behavior.
     overlay.apply(cfg);
+}
+
+fn apply_env_duration_checked(cfg: &mut Config, env: &dyn EnvSource) {
+    apply_env_overlay_checked(cfg, env_overlay(env));
 }
 
 impl Config {
@@ -5996,7 +6082,9 @@ impl Config {
         util::xdg_config_home().join("thegn/config.toml")
     }
 
-    /// Load with all layers: defaults < file (`path` or the default) < env < flags.
+    /// Legacy tolerant loader retained until host callers migrate to
+    /// [`crate::config_admission::admit`]. Authority-bearing callers must not
+    /// use this fallback path; remove it after that migration.
     pub fn try_load_layered(
         env: &dyn EnvSource,
         cli_overrides: &[String],
@@ -6079,7 +6167,8 @@ impl Config {
         Ok(cfg)
     }
 
-    /// Load with all layers: defaults < file (`path` or the default) < env < flags.
+    /// Legacy tolerant loader retained for existing non-authority callers.
+    /// New admission code deliberately never calls this default-recovery path.
     pub fn load_layered(
         env: &dyn EnvSource,
         cli_overrides: &[String],
@@ -6131,14 +6220,7 @@ impl Config {
         }
         let overlay: serde_json::Value =
             toml::from_str(&normalized.body).map_err(|e| format!("{e}"))?;
-        let mut base = serde_json::to_value(&*cfg).map_err(|e| e.to_string())?;
-        crate::config_duration::introduced(
-            &[],
-            crate::config_duration::errors_for_value::<Config>(&overlay),
-        )?;
-        deep_merge_json(&mut base, overlay);
-        *cfg = serde_json::from_value(base).map_err(|e| format!("{e}"))?;
-        Ok(())
+        apply_json_overlay(cfg, overlay)
     }
 
     /// Coerce a `--set KEY=VALUE` string to the JSON type the field expects.
@@ -6149,11 +6231,13 @@ impl Config {
     /// bracketed forms because that is what the config file itself uses — a
     /// value the user can paste either way. A bare string still wins by default,
     /// so nothing that used to parse changes meaning.
-    fn coerce_override_value(val: &str) -> serde_json::Value {
+    pub(crate) fn coerce_override_value(val: &str) -> serde_json::Value {
         let t = val.trim();
         let bracketed =
             (t.starts_with('[') && t.ends_with(']')) || (t.starts_with('{') && t.ends_with('}'));
-        if bracketed
+        let quoted =
+            (t.starts_with('"') && t.ends_with('"')) || (t.starts_with('\'') && t.ends_with('\''));
+        if (bracketed || quoted)
             && let Ok(parsed) = toml::from_str::<serde_json::Value>(&format!("v = {t}"))
             && let Some(v) = parsed.get("v")
         {
@@ -6170,7 +6254,7 @@ impl Config {
 
     pub(crate) fn apply_override_str(cfg: &mut Config, key: &str, val: &str) -> Result<(), String> {
         let key = crate::config_compat::canonical_key(key);
-        if key == "apps.tab_order" {
+        if key == "apps.tab_order" && !val.trim().starts_with('[') {
             cfg.apps.tab_order = val
                 .split(',')
                 .map(str::trim)
@@ -6225,13 +6309,46 @@ impl Config {
         Ok(())
     }
 
+    /// Finish the runtime-shaped config after all trusted layers have merged.
+    /// The admission boundary calls this exactly once; it remains crate-visible
+    /// so legacy loaders and later host migration can share the same behavior.
     pub(crate) fn post_process(&mut self) {
+        let paths = PathExpansionContext::captured();
+        self.post_process_inner(true, &paths);
+    }
+
+    /// Install the process-wide runtime effects of an **already admitted**
+    /// configuration: the `[remote]`/`[network]` tuning holders plus the
+    /// advisory policy/command warnings the legacy loader emitted. Admission
+    /// itself is side-effect-free, so a rejected candidate never reaches this;
+    /// the host calls it exactly when it publishes a generation.
+    pub fn install_admitted_runtime(&self) {
         crate::config_drawer::warn_policy_issues(self);
-        crate::config_drawer::strip_agent_metadata(&mut self.agents);
-        // Install the resolved [remote] tuning into the process-global holders
-        // (ssh keepalives / control-plane retry / heal cadence); first set wins.
         self.remote.install();
-        self.network.install(); // [network] → connectivity holder (mode + thresholds)
+        self.network.install();
+        for diagnostic in crate::custom_cmd::validate_commands(&self.git_commands) {
+            config_warn(&diagnostic);
+        }
+    }
+
+    /// Normalize an admitted candidate without emitting diagnostics or
+    /// installing process-global policy.  Admission calls this before its
+    /// final checks; the legacy loader keeps the effectful wrapper above.
+    pub(crate) fn post_process_pure(&mut self, paths: &PathExpansionContext) {
+        self.post_process_inner(false, paths);
+    }
+
+    fn post_process_inner(&mut self, emit_runtime_effects: bool, paths: &PathExpansionContext) {
+        if emit_runtime_effects {
+            crate::config_drawer::warn_policy_issues(self);
+        }
+        crate::config_drawer::strip_agent_metadata(&mut self.agents);
+        if emit_runtime_effects {
+            // Install the resolved [remote] tuning into the process-global
+            // holders (ssh keepalives / control-plane retry / heal cadence).
+            self.remote.install();
+            self.network.install(); // [network] → connectivity holder
+        }
         if self.agents.is_empty() {
             self.agents = vec![
                 NamedCommand {
@@ -6325,23 +6442,25 @@ impl Config {
             ];
         }
 
-        for diagnostic in crate::custom_cmd::validate_commands(&self.git_commands) {
-            config_warn(&diagnostic);
+        if emit_runtime_effects {
+            for diagnostic in crate::custom_cmd::validate_commands(&self.git_commands) {
+                config_warn(&diagnostic);
+            }
         }
         for p in &mut self.pins {
             if let Some(cwd) = &p.cwd {
-                p.cwd = Some(util::expand_tilde(cwd));
+                p.cwd = Some(paths.expand_tilde(cwd));
             }
         }
-        self.worktrees_dir = util::expand_tilde(&self.worktrees_dir);
-        self.workspaces_dir = util::expand_tilde(&self.workspaces_dir);
+        self.worktrees_dir = paths.expand_tilde(&self.worktrees_dir);
+        self.workspaces_dir = paths.expand_tilde(&self.workspaces_dir);
         if self.repo_roots.is_empty() {
             self.repo_roots = vec![self.workspaces_dir.clone()];
         }
         self.repo_roots = self
             .repo_roots
             .iter()
-            .map(|r| util::expand_tilde(r))
+            .map(|r| paths.expand_tilde(r))
             .collect();
         self.metrics.interval_secs = self.metrics.interval_secs.max(1.0);
         self.metrics.timeout_ms = self.metrics.timeout_ms.clamp(100, 30_000);
@@ -6354,19 +6473,23 @@ impl Config {
         // and remove, rather than parade a permanently-erroring target.
         self.metrics.targets.retain(|t| match t.kind {
             MetricsTargetKind::Command if t.command_argv().is_none() => {
-                tracing::warn!(
-                    target: "thegn::config",
-                    name = %t.name,
-                    "dropping metrics command collector with empty argv"
-                );
+                if emit_runtime_effects {
+                    tracing::warn!(
+                        target: "thegn::config",
+                        name = %t.name,
+                        "dropping metrics command collector with empty argv"
+                    );
+                }
                 false
             }
             MetricsTargetKind::Prometheus if t.url.trim().is_empty() => {
-                tracing::warn!(
-                    target: "thegn::config",
-                    name = %t.name,
-                    "dropping prometheus metrics target with no url"
-                );
+                if emit_runtime_effects {
+                    tracing::warn!(
+                        target: "thegn::config",
+                        name = %t.name,
+                        "dropping prometheus metrics target with no url"
+                    );
+                }
                 false
             }
             _ => true,
@@ -6390,7 +6513,9 @@ impl Config {
             ),
         ] {
             if let Err(e) = validate_strftime(fmt) {
-                config_warn(&format!("{label}: {e} — using {fallback:?}"));
+                if emit_runtime_effects {
+                    config_warn(&format!("{label}: {e} — using {fallback:?}"));
+                }
                 *fmt = fallback;
             }
         }

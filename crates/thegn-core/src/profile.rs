@@ -34,6 +34,44 @@ pub struct ProfilePaths {
     pub root: PathBuf,
 }
 
+/// The bounded, normalized process-profile selector used before profile
+/// resolution or reroot side effects.  This is deliberately separate from
+/// [`Config::profile`](crate::config::Config::profile), which selects a
+/// keybinding profile rather than the process storage root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfileSelector {
+    /// The safe on-disk selector (`default` for an omitted/default input).
+    pub name: String,
+}
+
+/// A process-profile selector was not safe to admit.  The variants carry no
+/// raw input so callers can expose the typed reason without echoing a secret
+/// or an unbounded command-line value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProfileSelectorError {
+    /// The raw selector exceeded the bounded context budget.
+    TooLarge,
+    /// A nonempty selector contained no ASCII letters or digits after
+    /// normalization (for example, `!!!`).
+    EmptyNormalized,
+}
+
+impl std::fmt::Display for ProfileSelectorError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooLarge => f.write_str("profile selector exceeds its bounded length"),
+            Self::EmptyNormalized => f.write_str(
+                "profile selector contains no letters or numbers; choose a safe profile name or omit it for the default profile",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ProfileSelectorError {}
+
+/// Maximum raw process-profile selector size checked before slugification.
+pub const MAX_SELECTOR_BYTES: usize = crate::config_budget::MAX_CONTEXT_BYTES;
+
 impl ProfilePaths {
     /// Whether this is the in-place default profile (no reroot performed).
     pub fn is_default(&self) -> bool {
@@ -53,6 +91,41 @@ pub fn normalize_name(raw: &str) -> String {
     } else {
         util::slugify(t)
     }
+}
+
+/// Validate and normalize one process-profile selector before any path,
+/// credential, directory, or environment mutation.  Empty/whitespace input
+/// and the explicit `default` spelling preserve the legacy default profile;
+/// nonempty input that slugifies to nothing is a typed refusal.
+pub fn validate_selector(raw: Option<&str>) -> Result<ProfileSelector, ProfileSelectorError> {
+    let raw = raw.unwrap_or_default();
+    if raw.len() > MAX_SELECTOR_BYTES {
+        return Err(ProfileSelectorError::TooLarge);
+    }
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("default") {
+        return Ok(ProfileSelector {
+            name: "default".to_owned(),
+        });
+    }
+    let name = util::slugify(trimmed);
+    if name.is_empty() {
+        return Err(ProfileSelectorError::EmptyNormalized);
+    }
+    Ok(ProfileSelector { name })
+}
+
+/// Resolve CLI-over-environment precedence, then validate the selected raw
+/// process-profile selector exactly once through [`validate_selector`].
+pub fn resolve_selector(
+    cli_profile: Option<&str>,
+    env_profile: Option<&str>,
+) -> Result<ProfileSelector, ProfileSelectorError> {
+    let raw = cli_profile
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or(env_profile);
+    validate_selector(raw)
 }
 
 /// Longest profile name used for a *newly created* profile root.
@@ -87,6 +160,23 @@ pub fn profile_root(base: &std::path::Path, name: &str) -> Option<PathBuf> {
     (name != "default").then(|| base.join("profiles").join(name))
 }
 
+/// Resolve the profile selection for a source-capture adapter without changing
+/// process state.  The caller is responsible for passing the result from the
+/// single-threaded startup adapter when [`reroot`] has already run; this pure
+/// fallback is for an adapter that is capturing before reroot.  In either case
+/// CLI selection wins over the environment, the default profile keeps the
+/// legacy root, and an existing long profile name is never silently capped.
+pub fn resolve_for_capture(
+    base: &std::path::Path,
+    cli_profile: Option<&str>,
+    env_profile: Option<&str>,
+) -> Result<ProfilePaths, ProfileSelectorError> {
+    let requested = resolve_selector(cli_profile, env_profile)?.name;
+    let name = on_disk_name(base, &requested);
+    let root = profile_root(base, &name).unwrap_or_else(|| base.to_path_buf());
+    Ok(ProfilePaths { name, root })
+}
+
 /// Resolve an already-created target profile without changing process state.
 ///
 /// Migration is a two-store operation, so it must never call [`reroot`] for the
@@ -99,8 +189,8 @@ pub fn resolve_existing_target(
     source_name: &str,
     raw_target: &str,
 ) -> anyhow::Result<ProfilePaths> {
-    let source = normalize_name(source_name);
-    let requested = normalize_name(raw_target);
+    let source = validate_selector(Some(source_name))?.name;
+    let requested = validate_selector(Some(raw_target))?.name;
     if requested.is_empty() {
         anyhow::bail!("target profile name must contain at least one letter or number");
     }
@@ -177,20 +267,20 @@ fn on_disk_name(base: &std::path::Path, name: &str) -> String {
 /// # Safety
 /// Single-threaded-startup invariant as above (same contract as
 /// [`util::scrub_git_env`]).
-pub fn reroot(cli_profile: Option<&str>) {
+pub fn reroot(cli_profile: Option<&str>) -> Result<(), ProfileSelectorError> {
     if ACTIVE.get().is_some() {
-        return;
+        return Ok(());
     }
+    // Validate before capturing roots, creating directories, or changing the
+    // process environment. A malformed selector must never fall through to
+    // the default profile's state and credentials.
+    let env_profile = std::env::var("THEGN_PROFILE").ok();
+    let selector = resolve_selector(cli_profile, env_profile.as_deref())?;
     let _ = DEFAULT_STATE_HOME.set(util::xdg_state_home());
-    let raw = cli_profile
-        .map(str::to_string)
-        .filter(|s| !s.trim().is_empty())
-        .or_else(|| std::env::var("THEGN_PROFILE").ok())
-        .unwrap_or_default();
     // Bound the name for a profile being created here; an existing one keeps
     // whatever it was created as (see `on_disk_name`).
     let base = util::thegn_dir();
-    let name = on_disk_name(&base, &normalize_name(&raw));
+    let name = on_disk_name(&base, &selector.name);
 
     let paths = match profile_root(&base, &name) {
         // Named profile: reroot storage + advertise the name to children/config.
@@ -215,6 +305,7 @@ pub fn reroot(cli_profile: Option<&str>) {
         },
     };
     let _ = ACTIVE.set(paths); // best-effort: first-set-wins: the active profile is set once
+    Ok(())
 }
 
 /// The profile-scoped credential environment for a named profile's `root`:
@@ -749,6 +840,41 @@ mod tests {
         assert_eq!(normalize_name("work"), "work");
         // Named profiles are slugified into safe path components.
         assert_eq!(normalize_name("Work Laptop!"), "work-laptop");
+    }
+
+    #[test]
+    fn selector_validator_preserves_default_and_rejects_empty_slug() {
+        assert_eq!(validate_selector(None).unwrap().name, "default");
+        assert_eq!(validate_selector(Some("  ")).unwrap().name, "default");
+        assert_eq!(validate_selector(Some("default")).unwrap().name, "default");
+        assert_eq!(
+            validate_selector(Some("Work Laptop!")).unwrap().name,
+            "work-laptop"
+        );
+        assert_eq!(
+            validate_selector(Some("!!!")),
+            Err(ProfileSelectorError::EmptyNormalized)
+        );
+    }
+
+    #[test]
+    fn selector_resolution_keeps_cli_precedence_and_checks_bounds_before_slugifying() {
+        assert_eq!(
+            resolve_selector(Some("cli"), Some("environment"))
+                .unwrap()
+                .name,
+            "cli"
+        );
+        assert_eq!(
+            resolve_selector(Some("  "), Some("environment"))
+                .unwrap()
+                .name,
+            "environment"
+        );
+        assert_eq!(
+            validate_selector(Some(&"!".repeat(MAX_SELECTOR_BYTES + 1))),
+            Err(ProfileSelectorError::TooLarge)
+        );
     }
 
     #[test]
