@@ -1518,6 +1518,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_http_transport_initialization_is_fail_closed_and_typed() {
+        let client = ControlClient {
+            addr: ControlAddr::HttpOrigin {
+                origin: "http://127.0.0.1:1".into(),
+                token: "must-not-be-sent".into(),
+            },
+            http_client: Some(Err(ControlTransportError)),
+        };
+
+        let error = client
+            .health()
+            .await
+            .expect_err("a failed transport must not use a degraded client");
+        assert!(
+            error.downcast_ref::<ControlTransportError>().is_some(),
+            "transport initialization failures must remain typed: {error:#}"
+        );
+    }
+
+    #[tokio::test]
     async fn different_http_origin_clients_keep_in_flight_work_on_old_client() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
