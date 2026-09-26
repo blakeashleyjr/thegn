@@ -23,6 +23,7 @@ pub mod graphql;
 pub mod machines;
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::sync::Mutex;
 
 use anyhow::{Context, Result, anyhow};
@@ -62,7 +63,7 @@ fn app_name(sandbox: &str) -> String {
 }
 
 /// Everything needed to drive one named Fly machine.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct FlySpec {
     /// Machines API base (empty ⇒ [`machines::DEFAULT_API_BASE`]).
     pub api_base: String,
@@ -95,11 +96,31 @@ pub struct FlySpec {
     pub skip_ready_wait: bool,
 }
 
+impl fmt::Debug for FlySpec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FlySpec")
+            .field("name", &"<redacted>")
+            .field("region", &"<redacted>")
+            .field("size", &"<redacted>")
+            .field("image", &"<redacted>")
+            .field("api_base", &"<redacted>")
+            .field("graphql_url", &"<redacted>")
+            .field("org_slug", &"<redacted>")
+            .field("max_instances", &self.max_instances)
+            .field("max_lifetime_secs", &self.max_lifetime_secs)
+            .field("key_path", &"<redacted>")
+            .field("pubkey", &"<redacted>")
+            .field("iroh", &self.iroh.as_ref().map(|_| "<redacted>"))
+            .field("skip_ready_wait", &self.skip_ready_wait)
+            .finish()
+    }
+}
+
 /// The three iroh call-home values injected into a Fly machine's environment so
 /// the baked `tg-agent` (see `nix/fly-sandbox-image.nix`) can reach the
 /// compositor. The env-var *keys* come from `thegn_core::iroh_wire`; these are
 /// the per-sandbox *values* the host mints at provision time.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct IrohInject {
     /// The compositor's stable home EndpointId (the agent's dial target).
     pub home_node: String,
@@ -107,6 +128,16 @@ pub struct IrohInject {
     pub sandbox_auth: String,
     /// Which sandbox the agent serves (the home registry key).
     pub sandbox_id: String,
+}
+
+impl fmt::Debug for IrohInject {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("IrohInject")
+            .field("home_node", &"<redacted>")
+            .field("sandbox_auth", &"<redacted>")
+            .field("sandbox_id", &"<redacted>")
+            .finish()
+    }
 }
 
 impl FlySpec {
@@ -128,35 +159,6 @@ impl FlySpec {
         }
     }
 
-    fn org_slug(&self) -> &str {
-        let o = self.org_slug.trim();
-        if o.is_empty() { "personal" } else { o }
-    }
-
-    fn region(&self) -> &str {
-        let r = self.region.trim();
-        if r.is_empty() {
-            machines::DEFAULT_REGION
-        } else {
-            r
-        }
-    }
-
-    fn size(&self) -> &str {
-        let s = self.size.trim();
-        if s.is_empty() {
-            machines::DEFAULT_SIZE
-        } else {
-            s
-        }
-    }
-
-    fn image(&self) -> String {
-        machines::image_ref(&self.image)
-            .unwrap_or(machines::DEFAULT_IMAGE)
-            .to_string()
-    }
-
     fn max_instances(&self) -> usize {
         if self.max_instances == 0 {
             5
@@ -172,12 +174,45 @@ impl FlySpec {
         m
     }
 
-    /// Whether the template names a **prebaked** thegn image (`image:<ref>`)
-    /// that runs its own sshd + ships the toolchain — the fast path, booting
-    /// straight into a reachable shell with no per-VM install. A bare/empty
-    /// template is a stock distro that gets [`machines::SSHD_INIT`] instead.
-    fn is_prebaked(&self) -> bool {
-        self.image.trim().starts_with("image:")
+    /// Admit every local create input (endpoints, name, region, org, size,
+    /// image, guardrails, public key, metadata and iroh injection) through the
+    /// shared core grammar. It runs before any ledger write or request, so an
+    /// invalid value makes zero remote calls. The admitted spec resolves the
+    /// documented defaults and whether the template names a **prebaked** thegn
+    /// image (`image:<ref>`, which runs its own sshd) or a stock distro that
+    /// gets [`machines::SSHD_INIT`].
+    fn admit_static(
+        &self,
+        metadata: &BTreeMap<String, String>,
+    ) -> Result<thegn_core::provider_admission::FlyStaticSpec> {
+        let key_path = self
+            .key_path
+            .to_str()
+            .ok_or_else(|| anyhow!("fly: managed key path is not valid UTF-8"))?;
+        if key_path.is_empty() || key_path.len() > 4_096 || key_path.chars().any(char::is_control) {
+            return Err(anyhow!("fly: managed key path is invalid"));
+        }
+        thegn_core::provider_admission::admit_fly(thegn_core::provider_admission::FlyInput {
+            api_base: &self.api_base,
+            graphql_url: &self.graphql_url,
+            org_slug: &self.org_slug,
+            name: Some(&self.name),
+            region: &self.region,
+            size: &self.size,
+            image: &self.image,
+            max_instances: self.max_instances,
+            max_lifetime_secs: self.max_lifetime_secs,
+            pubkey: Some(&self.pubkey),
+            metadata: Some(metadata),
+            iroh: self.iroh.as_ref().map(|inject| {
+                thegn_core::provider_admission::IrohInjectionInput {
+                    home_node: &inject.home_node,
+                    sandbox_auth: &inject.sandbox_auth,
+                    sandbox_id: &inject.sandbox_id,
+                }
+            }),
+        })
+        .map_err(|error| anyhow!("fly: provider spec refused: {error}"))
     }
 }
 
@@ -208,13 +243,14 @@ impl FlyProvider {
             .bearer_auth(&self.spec.token)
             .send()
             .await
-            .with_context(|| format!("fly: GET {url}"))?;
+            .map_err(|error| crate::provider::redacted_transport_error("fly", "GET", &error))?;
         let status = resp.status();
-        let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
         if !status.is_success() {
-            return Err(anyhow!("fly GET {url} failed ({status}): {body}"));
+            // The remote error body is neither read nor echoed: it can reflect
+            // request values, and allocating it only to discard it is waste.
+            return Err(anyhow!("fly GET request failed ({status})"));
         }
-        Ok(body)
+        Ok(resp.json().await.unwrap_or(serde_json::Value::Null))
     }
 
     async fn post_json(&self, url: &str, body: &serde_json::Value) -> Result<serde_json::Value> {
@@ -225,13 +261,12 @@ impl FlyProvider {
             .json(body)
             .send()
             .await
-            .with_context(|| format!("fly: POST {url}"))?;
+            .map_err(|error| crate::provider::redacted_transport_error("fly", "POST", &error))?;
         let status = resp.status();
-        let out: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
         if !status.is_success() {
-            return Err(anyhow!("fly POST {url} failed ({status}): {out}"));
+            return Err(anyhow!("fly POST request failed ({status})"));
         }
-        Ok(out)
+        Ok(resp.json().await.unwrap_or(serde_json::Value::Null))
     }
 
     /// A Fly GraphQL call (IP allocation) — bearer auth, error-surfacing.
@@ -241,12 +276,12 @@ impl FlyProvider {
 
     /// Idempotently ensure the app exists (create on 404, tolerate a concurrent
     /// 409/422 uniqueness win).
-    async fn ensure_app(&self, app: &str) -> Result<()> {
+    async fn ensure_app(&self, app: &str, org_slug: &str) -> Result<()> {
         let base = self.spec.api_base();
         if self.get_json(&machines::app_url(&base, app)).await.is_ok() {
             return Ok(());
         }
-        let body = machines::create_app_body(app, self.spec.org_slug());
+        let body = machines::create_app_body(app, org_slug);
         match self.post_json(&machines::apps_url(&base), &body).await {
             Ok(_) => Ok(()),
             Err(e)
@@ -502,7 +537,9 @@ impl FlyProvider {
                 .bearer_auth(&self.spec.token)
                 .send()
                 .await
-                .context("fly: DELETE app")?;
+                .map_err(|error| {
+                    crate::provider::redacted_transport_error("fly", "DELETE", &error)
+                })?;
             let status = resp.status();
             if status.is_success() || status == reqwest::StatusCode::NOT_FOUND {
                 return Ok(());
@@ -537,10 +574,21 @@ impl FlyProvider {
 impl RemoteProvider for FlyProvider {
     fn create<'a>(&'a self) -> BoxFuture<'a, Result<SandboxHandle>> {
         Box::pin(async move {
-            let name = self.spec.name.trim().to_string();
-            if name.is_empty() {
-                return Err(anyhow!("fly: the sandbox name is empty"));
-            }
+            // Every local input is admitted, and the complete machine body is
+            // rendered, before the ledger intent, the app, or the billed IPv4.
+            let metadata = self.spec.metadata();
+            let admitted = self.spec.admit_static(&metadata)?;
+            let name = self.spec.name.clone();
+            let body = machines::create_machine_body(
+                &name,
+                &admitted.region,
+                admitted.image.resolve(machines::DEFAULT_IMAGE),
+                admitted.size,
+                &self.spec.pubkey,
+                &metadata,
+                admitted.image.is_prebaked(),
+                self.spec.iroh.as_ref(),
+            );
             // Spend guardrail (ledger-based, covers in-flight creates).
             let managed = self.ledger_names().len();
             if managed >= self.spec.max_instances() {
@@ -571,7 +619,7 @@ impl RemoteProvider for FlyProvider {
             // best-effort delete the app (cascading machine + IP) and only clear the
             // record if that delete succeeds; otherwise the record stays so destroy/
             // the reaper can reconcile the leak.
-            if let Err(e) = self.ensure_app(&app).await {
+            if let Err(e) = self.ensure_app(&app, &admitted.org_slug).await {
                 if e.to_string().contains("failed (4") {
                     registry::remove(&name);
                 }
@@ -581,21 +629,11 @@ impl RemoteProvider for FlyProvider {
             let create = async {
                 let ip = self.ensure_ipv4(&app).await?;
                 let base = self.spec.api_base();
-                let body = machines::create_machine_body(
-                    &name,
-                    self.spec.region(),
-                    &self.spec.image(),
-                    self.spec.size(),
-                    &self.spec.pubkey,
-                    &self.spec.metadata(),
-                    self.spec.is_prebaked(),
-                    self.spec.iroh.as_ref(),
-                );
                 let created = self
                     .post_json(&machines::machines_url(&base, &app), &body)
                     .await?;
                 let machine = machines::parse_machine(&created)
-                    .ok_or_else(|| anyhow!("fly: no machine in create response: {created}"))?;
+                    .ok_or_else(|| anyhow!("fly: no machine in create response"))?;
                 if !self.spec.skip_ready_wait {
                     self.wait_started(&app, &machine.id).await?;
                     self.wait_reachable(&name, &ip).await?;
@@ -779,25 +817,90 @@ mod tests {
             max_instances: 0,
             max_lifetime_secs: 0,
             key_path: "/k".into(),
-            pubkey: "ssh-ed25519 A".into(),
+            pubkey: TEST_PUBKEY.into(),
             iroh: None,
             skip_ready_wait: true,
         }
     }
+
+    /// A structurally valid (throwaway) ed25519 public key.
+    const TEST_PUBKEY: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIgVgF3FLyN2aHUalBpkk3cMVfTgD+7TrbdfTAcSvLvB thegn";
 
     #[test]
     fn spec_defaults() {
         let s = spec();
         assert_eq!(s.api_base(), machines::DEFAULT_API_BASE);
         assert_eq!(s.graphql_url(), graphql::DEFAULT_GRAPHQL_URL);
-        assert_eq!(s.org_slug(), "personal");
-        assert_eq!(s.region(), "iad");
-        assert_eq!(s.size(), "shared-cpu-2x");
-        assert_eq!(s.image(), "ubuntu:24.04");
+        let admitted = s.admit_static(&s.metadata()).unwrap();
+        assert_eq!(admitted.org_slug, "personal");
+        assert_eq!(admitted.region, machines::DEFAULT_REGION);
+        assert_eq!(admitted.size.as_str(), machines::DEFAULT_SIZE);
+        assert_eq!(
+            admitted.image.resolve(machines::DEFAULT_IMAGE),
+            "ubuntu:24.04"
+        );
+        assert!(!admitted.image.is_prebaked());
         assert_eq!(s.max_instances(), 5);
         let m = s.metadata();
         assert_eq!(m.get("managed-by").map(String::as_str), Some("thegn"));
         assert!(m.contains_key("tg-host"));
+    }
+
+    /// Neither the transport error nor anyhow's alternate/Debug chain may echo
+    /// the request URL (a canary in its query stands in for a secret).
+    #[tokio::test]
+    async fn transport_errors_never_echo_the_request_url() {
+        let provider = FlyProvider::new(spec());
+        let canary = "canary-5d1c";
+        for error in [
+            provider
+                .get_json(&format!("http://127.0.0.1:1/apps?token={canary}"))
+                .await
+                .unwrap_err(),
+            provider
+                .post_json(
+                    &format!("http://127.0.0.1:1/apps?token={canary}"),
+                    &serde_json::json!({}),
+                )
+                .await
+                .unwrap_err(),
+        ] {
+            for rendered in [
+                error.to_string(),
+                format!("{error:#}"),
+                format!("{error:?}"),
+            ] {
+                assert!(!rendered.contains(canary), "{rendered}");
+                assert!(!rendered.contains("127.0.0.1"), "{rendered}");
+            }
+        }
+    }
+
+    #[test]
+    fn iroh_injection_is_admitted_and_redacted() {
+        let token = format!("tgi_{}", "ab".repeat(24));
+        let good = FlySpec {
+            iroh: Some(IrohInject {
+                home_node: "c".repeat(64),
+                sandbox_auth: token.clone(),
+                sandbox_id: "tg-fly-1".into(),
+            }),
+            ..spec()
+        };
+        assert!(good.admit_static(&good.metadata()).is_ok());
+        let debug = format!("{good:?} {:?}", good.iroh);
+        assert!(!debug.contains(&token), "{debug}");
+        let mismatched = FlySpec {
+            iroh: Some(IrohInject {
+                home_node: "c".repeat(64),
+                sandbox_auth: token.clone(),
+                sandbox_id: "tg-fly-other".into(),
+            }),
+            ..spec()
+        };
+        let error = mismatched.admit_static(&mismatched.metadata()).unwrap_err();
+        assert!(!format!("{error:#}").contains(&token));
     }
 
     #[test]
@@ -929,9 +1032,14 @@ mod tests {
             org_slug: "acme".into(),
             ..spec()
         };
-        assert_eq!(s.image(), "registry.fly.io/x:deployment-2");
-        assert_eq!(s.size(), "performance-1x");
-        assert_eq!(s.region(), "ams");
-        assert_eq!(s.org_slug(), "acme");
+        let admitted = s.admit_static(&s.metadata()).unwrap();
+        assert_eq!(
+            admitted.image.resolve(machines::DEFAULT_IMAGE),
+            "registry.fly.io/x:deployment-2"
+        );
+        assert!(admitted.image.is_prebaked());
+        assert_eq!(admitted.size.as_str(), "performance-1x");
+        assert_eq!(admitted.region, "ams");
+        assert_eq!(admitted.org_slug, "acme");
     }
 }

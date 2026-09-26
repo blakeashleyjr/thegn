@@ -12,6 +12,34 @@ fn lines(s: &Surface) -> Vec<String> {
 }
 
 #[test]
+fn config_banner_persists_over_transient_status_until_cleared() {
+    let mut model = FrameModel {
+        config_banner: Some("CONFIG RELOAD FAILED (showing gen 1, launches refused): x".into()),
+        status: "Config reloaded".into(),
+        ..Default::default()
+    };
+    let rect = Rect {
+        x: 0,
+        y: 0,
+        cols: 80,
+        rows: 1,
+    };
+    let mut surface = Surface::new(rect.cols, rect.rows);
+    draw_statusbar(&mut surface, rect, &model);
+    let text = surface.screen_chars_to_string();
+    assert!(text.contains("CONFIG RELOAD FAILED"), "{text:?}");
+    assert!(!text.contains("Config reloaded"), "{text:?}");
+    model.config_banner = None;
+    let mut cleared = Surface::new(rect.cols, rect.rows);
+    draw_statusbar(&mut cleared, rect, &model);
+    assert!(
+        !cleared
+            .screen_chars_to_string()
+            .contains("CONFIG RELOAD FAILED")
+    );
+}
+
+#[test]
 fn schema_refusal_banner_owns_statusbar_until_compatible_hydration() {
     let mut model = FrameModel {
         state_db: StateDbAvailability::SchemaRefused {

@@ -582,7 +582,7 @@ pub(crate) fn handle_identity(file: &std::fs::File) -> std::io::Result<(u32, u32
     ))
 }
 
-fn handle_file_attributes(file: &std::fs::File) -> std::io::Result<u32> {
+pub(crate) fn handle_file_attributes(file: &std::fs::File) -> std::io::Result<u32> {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::{
         BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,

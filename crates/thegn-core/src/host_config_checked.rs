@@ -100,6 +100,14 @@ pub fn compose_host_definitions_checked(
     Ok(HostComposedConfig { config })
 }
 
+/// Prove that a borrowed candidate is within the same limits used by host
+/// composition before a caller performs a serde conversion, overlay merge, or
+/// clone.  This is intentionally only a bounds check; schema and semantic
+/// admission remain the caller's responsibility.
+pub(crate) fn check_config_bounds(config: &Config) -> Result<(), HostCompositionError> {
+    admit(config).map(|_| ())
+}
+
 fn admit(config: &Config) -> Result<Value, HostCompositionError> {
     if config.pipeline.stages.len() > MAX_PIPELINE_STAGES || config.profiles.len() > MAX_PROFILES {
         return Err(HostCompositionError::Bounds);
@@ -274,6 +282,22 @@ impl io::Write for JsonOutput {
             .filter(|next| *next <= self.limit)
             .ok_or_else(|| io::Error::other("checked configuration byte limit"))?;
         if let Some(output) = &mut self.bytes {
+            if next > output.capacity() {
+                let mut capacity = output.capacity().max(1);
+                while capacity < next {
+                    capacity = capacity.saturating_mul(2).min(self.limit);
+                    if capacity < next && capacity == self.limit {
+                        return Err(io::Error::other("checked configuration capacity limit"));
+                    }
+                }
+                let additional = capacity - output.len();
+                output
+                    .try_reserve_exact(additional)
+                    .map_err(|_| io::Error::other("checked configuration allocation"))?;
+                if output.capacity() > self.limit {
+                    return Err(io::Error::other("checked configuration capacity limit"));
+                }
+            }
             output.extend_from_slice(bytes);
         }
         self.written = next;

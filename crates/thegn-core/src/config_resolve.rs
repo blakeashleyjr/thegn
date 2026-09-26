@@ -1407,39 +1407,68 @@ fn at(cfg: &Config, ptr: &str) -> serde_json::Value {
 /// profile → env → `--set`). The Zone/Workspace/Repo layers are constraint
 /// layers handled by the clamp trace (see [`resolve_repo_sandbox`]), not this
 /// preference cascade.
+///
+/// The file and profile layers go through the same compatibility
+/// normalization as admission. An existing source that cannot be read,
+/// normalized, or parsed — or a selected profile overlay that cannot be
+/// applied — is an `Err`: explain never reports a Builtin/default origin that
+/// a hidden failure manufactured. Only a missing file is an empty layer.
 pub fn explain(
     env: &dyn EnvSource,
     cli_overrides: &[String],
     path: Option<std::path::PathBuf>,
     key: &str,
-) -> KeyOrigin {
+) -> Result<KeyOrigin, String> {
     let ptr = dotted_to_pointer(key);
 
     // L0: built-in defaults.
     let defaults = Config::default();
     // L1: file (serde fills defaults, so this is defaults+file).
     let file = path.unwrap_or_else(Config::path);
-    // Only a missing file is silently empty; an existing-but-unreadable file
-    // (EACCES/EIO/invalid-UTF-8) must warn rather than pretend every key is
-    // Builtin — matching Config::try_load_layered's read handling.
     let s = match std::fs::read_to_string(&file) {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(e) => {
-            crate::config::config_warn(&format!(
-                "cannot read {}: {e}; explaining from defaults",
-                file.display()
-            ));
-            String::new()
-        }
+        Err(_) => return Err("config source is unreadable; nothing can be explained".into()),
     };
-    let file_cfg: Config = toml::from_str(&s).unwrap_or_default();
-    // L2: + profile overlay.
-    let mut profile_cfg = file_cfg.clone();
-    if let Some(pfile) = Config::profile_overlay_path(env)
-        && let Ok(ps) = std::fs::read_to_string(&pfile)
+    let normalized = crate::config_compat::normalize(&s)
+        .map_err(|_| "config source is not valid TOML; nothing can be explained".to_string())?;
+    // The same raw schema walk admission runs, so a tolerant serde fallback
+    // (a warn-and-default enum, an ignored unknown key) cannot hide a value.
+    let raw: toml::Value = normalized
+        .body
+        .parse()
+        .map_err(|_| "config source is not valid TOML; nothing can be explained".to_string())?;
+    let raw_json = serde_json::to_value(raw).map_err(|_| {
+        "config source violates the configuration schema; nothing can be explained".to_string()
+    })?;
+    // The SAME layer policy admission uses: after the unknown-key split a
+    // config with an unknown non-security key starts and `config validate`
+    // warns, so explain must not be the one consumer that refuses it.
+    if !crate::config_validate::validate_config_layer_schema_value(&raw_json)
+        .0
+        .is_empty()
     {
-        let _ = Config::apply_toml_overlay(&mut profile_cfg, &ps);
+        return Err(
+            "config source violates the configuration schema; nothing can be explained".into(),
+        );
+    }
+    let file_cfg: Config = toml::from_str(&normalized.body).map_err(|_| {
+        "config source violates the configuration schema; nothing can be explained".to_string()
+    })?;
+    // L2: + profile overlay. A selected overlay that exists must apply.
+    let mut profile_cfg = file_cfg.clone();
+    if let Some(pfile) = Config::profile_overlay_path(env) {
+        match std::fs::read_to_string(&pfile) {
+            Ok(ps) => Config::apply_toml_overlay(&mut profile_cfg, &ps).map_err(|_| {
+                "selected profile overlay cannot be applied; nothing can be explained".to_string()
+            })?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => {
+                return Err(
+                    "selected profile overlay is unreadable; nothing can be explained".into(),
+                );
+            }
+        }
     }
     // L3: + env.
     let mut env_cfg = profile_cfg.clone();
@@ -1468,12 +1497,12 @@ pub fn explain(
         }
     }
     let value = at(&flag_cfg, &ptr);
-    KeyOrigin {
+    Ok(KeyOrigin {
         key: key.to_string(),
         value,
         origin,
         trace: stages.to_vec(),
-    }
+    })
 }
 
 impl TrustLevel {
@@ -1971,7 +2000,7 @@ mod tests {
     #[test]
     fn explain_default_key_origin_is_builtin() {
         let env = crate::config::MapEnv(Default::default());
-        let e = explain(&env, &[], Some("/no/such/file".into()), "picker");
+        let e = explain(&env, &[], Some("/no/such/file".into()), "picker").unwrap();
         assert_eq!(e.origin, TrustLevel::Builtin);
         assert_eq!(e.value, serde_json::json!("auto"));
     }
@@ -1983,10 +2012,43 @@ mod tests {
         let file = dir.join("config.toml");
         std::fs::write(&file, "picker = \"fzf\"\n").unwrap();
         let env = crate::config::MapEnv(Default::default());
-        let e = explain(&env, &[], Some(file), "picker");
+        let e = explain(&env, &[], Some(file), "picker").unwrap();
         assert_eq!(e.origin, TrustLevel::UserGlobal);
         assert_eq!(e.value, serde_json::json!("fzf"));
         let _ = std::fs::remove_dir_all(&dir); // best-effort: test cleanup: scratch removal must never fail the test
+    }
+
+    #[test]
+    fn explain_never_reports_builtin_after_a_hidden_parse_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("config.toml");
+        // A truncated save: `picker` is configured but the file is broken.
+        std::fs::write(&file, "picker = \"fz").unwrap();
+        let env = crate::config::MapEnv(Default::default());
+        let Err(error) = explain(&env, &[], Some(file.clone()), "picker") else {
+            panic!("a broken file must not be explained");
+        };
+        assert!(error.contains("not valid TOML"), "{error}");
+        // A schema-invalid value is refused too, not defaulted.
+        std::fs::write(&file, "picker = 7\n").unwrap();
+        assert!(explain(&env, &[], Some(file), "picker").is_err());
+    }
+
+    #[test]
+    fn explain_refuses_an_existing_profile_overlay_that_cannot_apply() {
+        let dir = tempfile::tempdir().unwrap();
+        let _env_guard =
+            crate::testenv::EnvGuard::set(&[("XDG_CONFIG_HOME", &dir.path().to_string_lossy())]);
+        let overlay = dir.path().join("thegn/profiles/work");
+        std::fs::create_dir_all(&overlay).unwrap();
+        std::fs::write(overlay.join("config.toml"), "picker = [").unwrap();
+        let mut vars = std::collections::BTreeMap::new();
+        vars.insert("THEGN_PROFILE".to_string(), "work".to_string());
+        let env = crate::config::MapEnv(vars);
+        let Err(error) = explain(&env, &[], Some(dir.path().join("none.toml")), "picker") else {
+            panic!("a broken selected overlay must not be explained");
+        };
+        assert!(error.contains("profile overlay"), "{error}");
     }
 
     #[test]
@@ -1997,7 +2059,8 @@ mod tests {
             &["picker=fzf".to_string()],
             Some("/no/such/file".into()),
             "picker",
-        );
+        )
+        .unwrap();
         assert_eq!(e.origin, TrustLevel::Runtime);
         assert_eq!(e.value, serde_json::json!("fzf"));
     }

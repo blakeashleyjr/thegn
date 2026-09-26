@@ -184,7 +184,8 @@ pub(crate) fn print_schema() {
 fn explain(cfg: &Config, key: &str, repo: Option<String>, json: bool, path: PathBuf) -> Result<()> {
     use thegn_core::config::ProcessEnv;
     use thegn_core::config_resolve;
-    let origin = config_resolve::explain(&ProcessEnv, &[], Some(path), key);
+    let origin = config_resolve::explain(&ProcessEnv, &[], Some(path), key)
+        .map_err(|error| anyhow::anyhow!("config explain: {error}"))?;
     // The per-repo layers are NOT part of the preference cascade `explain`
     // replays, so without this the trace confidently reported the global value
     // for a key a `[workspace.<slug>]` block had already overridden — the probe

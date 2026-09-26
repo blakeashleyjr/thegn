@@ -11,8 +11,7 @@
 //! Honest coverage contract: "every `config_enum!` reachable from `Config`'s
 //! serde tree is validated". `ShareReach` is intentionally out of scope (it
 //! has no config.toml key — CLI/runtime vocabulary only), and the flattened
-//! `[keybinds]` map is skipped (schemars 0.8 drops a flattened map's
-//! `additionalProperties`, so its free-form keys are simply not traversed).
+//! `[keybinds]` map has an explicit schema preserving free-form chord strings.
 
 use std::sync::OnceLock;
 
@@ -55,11 +54,220 @@ pub struct ValidationDiagnostic {
     pub message: String,
 }
 
+/// How a schema walk treats a key the schema does not know.
+///
+/// One shared walk serves several callers with different stakes, so the
+/// policy is chosen PER CALL SITE (never inside the walk): the trusted
+/// configuration layers may relax, while the repo overlay, the host-row
+/// decoder and every other consumer keep refusing every unknown key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnknownKeys {
+    /// Every unknown key is an error (the default everywhere).
+    Reject,
+    /// An unknown key under a security-relevant table is an error; anywhere
+    /// else it is an ignorable warning. This is what the admitted
+    /// configuration layers use: one `~/.config/thegn/config.toml` is shared
+    /// by builds of different ages, so a key a newer build added must not
+    /// brick an older one — but a key an older build does not understand in
+    /// a table that grants authority must still refuse, because "ignored"
+    /// there can mean "policy silently not applied".
+    RejectSecurityRelevant,
+}
+
+/// Tables whose unknown keys refuse admission: anything that can execute a
+/// process, reach a remote, hold or select credentials, gate schema
+/// migrations, or set sandbox/placement/queue policy. Everything outside this
+/// list is presentation, telemetry or layout, where an unknown key is
+/// ignorable.
+///
+/// This is a DENYLIST on purpose: the whole point of the relaxation is that a
+/// table a NEWER build added must not brick an older build sharing one
+/// `config.toml`, and an allowlist would refuse exactly that case. The cost
+/// is that the list rots as tables are added, so
+/// `security_relevant_roots_cover_every_executing_or_credential_table`
+/// derives the expectation from the generated schema and fails when a new
+/// root carries a command/argv, a secret ref, or a URL/host field.
+///
+/// Names are SCHEMA property names, not the spellings a user may write:
+/// `[workspace.<slug>]` is normalized to `[project.<slug>]` before any walk
+/// (`config_compat::normalize_project_tables`, `#[serde(rename = "project",
+/// alias = "workspace")]`), so the protected name here is `project`. Keep
+/// this list, `docs/ARCHITECTURE.md` and `docs/help/configuration.md` in
+/// sync.
+const SECURITY_RELEVANT_ROOTS: &[&str] = &[
+    "accounts",
+    "actions",
+    "agents",
+    "apps",
+    "automations",
+    "autopilot",
+    "bundle",
+    "calendar",
+    "ci",
+    "clipboard",
+    "credentials",
+    "daemon",
+    "database",
+    "disk",
+    // The drawer's scoped entries carry commands.
+    "drawer",
+    "editor",
+    "env",
+    "forges",
+    "forward",
+    "git",
+    "git_commands",
+    "hooks",
+    "host",
+    "host_discovery",
+    "identities",
+    "issues",
+    "lifecycle",
+    "limits",
+    "lsp",
+    "managed_tools",
+    "mcp",
+    "mcp_proxy",
+    "mcp_servers",
+    // Player control commands plus a remote library (url + token).
+    "media",
+    "merge_queue",
+    "metrics",
+    "model_proxy",
+    "network",
+    "notifications",
+    "observe",
+    "pins",
+    "pipeline",
+    "placement",
+    "plugins",
+    "pr",
+    "pr_queue",
+    "presets",
+    // The per-project overlay: the schema property is `project`; `workspace`
+    // is the legacy spelling normalization rewrites before any walk. Its
+    // subtree carries accounts, hooks, sandbox mounts, the queues, ci,
+    // autopilot, the MCP scope ceiling, env bundles, git and editor.
+    "project",
+    "profiles",
+    // Scalar roots, not tables: listing them has no nested effect, but it
+    // makes a TYPO of them (`worktrees_dirr`) refuse instead of silently
+    // relocating every worktree to the default root.
+    "projects_dir",
+    "remote",
+    "sandbox",
+    "secrets",
+    "serve",
+    "share",
+    "skills",
+    // Custom stat collectors run commands.
+    "stats",
+    "tasks",
+    "toolchain",
+    "tools",
+    "usage",
+    "voice",
+    "watch",
+    "weather",
+    "workspace",
+    "worktree_templates",
+    "worktrees_dir",
+    "zone",
+];
+
+/// Whether `path` (a dotted schema path such as `sandbox.mounts[0].source`)
+/// names a security-relevant table. A bare root key (`picker`) is not one:
+/// an unknown ROOT key is exactly the "newer build added a table" case.
+pub fn is_security_relevant_path(path: &str) -> bool {
+    let root = path_root(path);
+    !root.is_empty() && path.len() > root.len() && SECURITY_RELEVANT_ROOTS.contains(&root)
+}
+
+fn path_root(path: &str) -> &str {
+    path.split(['.', '['])
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches(']')
+}
+
+/// Whether an unknown key must refuse: either it sits under a
+/// security-relevant table, or the walk's nearest-key hint says the user
+/// meant one. The hint is how a TYPO'd security table (`[sandboxx]`,
+/// `[metric]`) is caught instead of being dropped with its whole contents.
+///
+/// The trade-off is real and irreducible, and it is deliberate: a typo and a
+/// legitimately NEW table one or two edits from a security-relevant name are
+/// the same shape, so this build also refuses a new top-level table spelled
+/// `[hosts]`, `[bundles]`, `[zones]`, `[secret]`, `[agent]`, `[stat]`, …
+/// This schema already has such neighbours — `profile` and `profiles` differ
+/// by one edit and one of them is security-relevant — so had `profiles`
+/// arrived later, an older build would refuse it. The remedy for an operator
+/// is to rename or remove the key; `docs/help/configuration.md` says so. To
+/// drop the trade-off, delete the top-level (`None`) branch below and keep
+/// only the nested rule: typos inside a security table would still refuse.
+fn unknown_key_refuses(path: &str, hint: Option<&str>) -> bool {
+    if is_security_relevant_path(path) {
+        return true;
+    }
+    let Some(hint) = hint else { return false };
+    match path.rsplit_once('.') {
+        // A nested typo: judge the corrected path.
+        Some((parent, _)) => is_security_relevant_path(&format!("{parent}.{hint}")),
+        // A top-level typo: the corrected ROOT decides.
+        None => SECURITY_RELEVANT_ROOTS.contains(&hint),
+    }
+}
+
+/// The stable marker the walk uses for an unknown key.
+const UNKNOWN_KEY: &str = ": unknown key";
+/// How the walk renders its nearest-key hint: `(did you mean \`x\`?)`.
+const HINT_PREFIX: &str = "(did you mean `";
+
+/// Split walk errors into (errors, ignorable warnings) under `policy`.
+pub(crate) fn split_unknown_keys(
+    messages: Vec<String>,
+    policy: UnknownKeys,
+) -> (Vec<String>, Vec<String>) {
+    if policy == UnknownKeys::Reject {
+        return (messages, Vec::new());
+    }
+    let mut errors = Vec::new();
+    let mut warnings = Vec::new();
+    for message in messages {
+        match message.split_once(UNKNOWN_KEY) {
+            Some((path, tail)) => {
+                let hint = tail
+                    .split_once(HINT_PREFIX)
+                    .and_then(|(_, rest)| rest.split_once('`'))
+                    .map(|(hint, _)| hint);
+                if unknown_key_refuses(path, hint) {
+                    errors.push(message);
+                } else {
+                    warnings.push(format!("{message} (ignored by this build)"));
+                }
+            }
+            None => errors.push(message),
+        }
+    }
+    (errors, warnings)
+}
+
 /// Validate the same normalized document that runtime loading accepts, retaining
 /// advisory compatibility diagnostics separately from actual admission errors.
 /// Canonical/legacy collisions remain warnings: normalization deliberately
 /// chooses the canonical value at runtime and this API preserves that policy.
 pub fn validate_diagnostics(body: &str) -> Vec<ValidationDiagnostic> {
+    validate_diagnostics_with_policy(body, UnknownKeys::Reject)
+}
+
+/// [`validate_diagnostics`] under an explicit unknown-key policy. The trusted
+/// layers (main config, selected profile overlay) pass
+/// [`UnknownKeys::RejectSecurityRelevant`] so `config validate` reports
+/// exactly what admission does; the repo overlay keeps `Reject`.
+pub fn validate_diagnostics_with_policy(
+    body: &str,
+    policy: UnknownKeys,
+) -> Vec<ValidationDiagnostic> {
     let normalized = match crate::config_compat::normalize(body) {
         Ok(value) => value,
         Err(error) => {
@@ -77,14 +285,15 @@ pub fn validate_diagnostics(body: &str) -> Vec<ValidationDiagnostic> {
             message: message.clone(),
         })
         .collect();
-    diagnostics.extend(
-        validate_normalized(&normalized.body)
-            .into_iter()
-            .map(|message| ValidationDiagnostic {
-                severity: ValidationSeverity::Error,
-                message,
-            }),
-    );
+    let (errors, ignorable) = split_unknown_keys(validate_normalized(&normalized.body), policy);
+    diagnostics.extend(ignorable.into_iter().map(|message| ValidationDiagnostic {
+        severity: ValidationSeverity::Warning,
+        message,
+    }));
+    diagnostics.extend(errors.into_iter().map(|message| ValidationDiagnostic {
+        severity: ValidationSeverity::Error,
+        message,
+    }));
     if let Ok(cfg) = toml::from_str::<Config>(&normalized.body) {
         if let Some(message) = cfg.sandbox.warm_direnv.deprecation_warning() {
             diagnostics.push(ValidationDiagnostic {
@@ -286,6 +495,7 @@ pub(crate) fn typed_semantic_errors(cfg: &Config, mode: SemanticMode) -> Vec<Str
     // providers, aliases naming real routes. Only when enabled.
     batch!(cfg.model_proxy.validate());
     batch!(cfg.ci.validate());
+    batch!(crate::provider_admission::validate_config(cfg));
     errs
 }
 
@@ -293,6 +503,19 @@ pub(crate) fn typed_semantic_errors(cfg: &Config, mode: SemanticMode) -> Vec<Str
 /// its compatibility branches and flattened-map limitations.
 pub(crate) fn validate_config_schema_value(value: &serde_json::Value) -> Vec<String> {
     validate_schema_value_with_root(value, config_schema())
+}
+
+/// The admitted-layer walk: unknown keys outside security-relevant tables are
+/// returned as ignorable warnings instead of refusals. Only the configuration
+/// layers use this; `validate_schema_value_with_root` (repo overlay, host-row
+/// decoder, every other schema) still refuses every unknown key.
+pub(crate) fn validate_config_layer_schema_value(
+    value: &serde_json::Value,
+) -> (Vec<String>, Vec<String>) {
+    split_unknown_keys(
+        validate_schema_value_with_root(value, config_schema()),
+        UnknownKeys::RejectSecurityRelevant,
+    )
 }
 
 #[cfg(test)]
@@ -1273,6 +1496,52 @@ pre_create = [
     }
 
     #[test]
+    fn provider_static_grammar_is_part_of_strict_config_validation() {
+        let cases = [
+            (
+                "[env.fly.provider]\nprovider = \"fly\"\nsize = \"shared-cpu-3x\"\n",
+                "unknown Fly guest preset",
+            ),
+            (
+                "[env.fly.provider]\nprovider = \"fly\"\ntemplate = \"snapshot:42\"\n",
+                "Fly does not support snapshot image forms",
+            ),
+            (
+                "[env.digitalocean.provider]\nprovider = \"digitalocean\"\ntemplate = \"snapshot:nope\"\n",
+                "snapshot id is malformed",
+            ),
+            (
+                "[env.hetzner.provider]\nprovider = \"hetzner\"\napi_base = \"https://user:token@example.invalid/v1\"\n",
+                "endpoint host is missing or has credentials",
+            ),
+            (
+                "[env.hetzner.provider]\nprovider = \"hetzner\"\nmax_instances = 257\n",
+                "provider safety bound",
+            ),
+        ];
+        for (body, reason) in cases {
+            let errors = validate_str(body);
+            assert!(
+                errors.iter().any(|error| error.contains(reason)),
+                "{body:?} -> {errors:?}"
+            );
+            assert!(
+                !errors.iter().any(|error| error.contains("token")),
+                "provider diagnostics must not echo endpoint credentials: {errors:?}"
+            );
+        }
+
+        let valid = r#"
+[env.fly.provider]
+provider = "fly"
+api_base = "http://127.0.0.1:8080/v1"
+size = "shared-cpu-2x"
+template = "image:registry.example/dev:1"
+"#;
+        assert!(validate_str(valid).is_empty(), "{:?}", validate_str(valid));
+    }
+
+    #[test]
     fn reserved_kinds_fail_strict_validation_by_name() {
         // Canonical spelling.
         let errs = validate_str("[ci]\nprovider = \"drone\"\n");
@@ -1632,5 +1901,200 @@ on_blocked = "escalate"
             .collect();
         assert!(values.contains(&"in_repo"), "{values:?}");
         assert!(!values.contains(&"InRepo"), "{values:?}");
+    }
+}
+
+#[cfg(test)]
+mod keybind_schema_tests {
+    #[test]
+    fn flat_and_mode_chords_preserve_strict_types() {
+        for value in [
+            serde_json::json!({"custom-action": "ctrl-x", "vim_normal": {"other": "x"}}),
+            serde_json::json!({"emacs": {}, "vim_insert": {"other": "y"}}),
+        ] {
+            assert!(
+                super::validate_schema_value::<crate::config::KeybindConfig>(&value).is_empty()
+            );
+        }
+        for value in [
+            serde_json::json!({"custom-action": 42}),
+            serde_json::json!({"vim_normal": "ctrl-x"}),
+            serde_json::json!({"vim_insert": {"other": false}}),
+        ] {
+            assert!(
+                !super::validate_schema_value::<crate::config::KeybindConfig>(&value).is_empty()
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod security_root_rot_tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    /// Field names that mean "this subtree can execute a process, hold or
+    /// select a credential, or reach a remote". The vocabulary is drawn from
+    /// the names THIS schema actually uses for those things — `run`, `args`,
+    /// `*_bin`, bare `path`, `*_image`, `socket`, `proxy`, `*_dir` — because
+    /// a root whose exec field is spelled `run` is exactly the one a
+    /// command/argv-only vocabulary would miss.
+    fn is_dangerous_field(name: &str) -> bool {
+        const EXACT: &[&str] = &[
+            "command", "argv", "exec", "cmd", "run", "script", "shell", "args", "bin", "path",
+            "image", "socket", "proxy", "url", "host", "endpoint", "server", "token", "secret",
+            "api_key", "password", "key_path", "account", "accounts", "identity",
+        ];
+        const SUFFIX: &[&str] = &[
+            "_command",
+            "_argv",
+            "_exec",
+            "_args",
+            "_bin",
+            "_image",
+            "_url",
+            "_host",
+            "_endpoint",
+            "_token",
+            "_secret",
+            "_key",
+            "_base",
+            "_path",
+            "_dir",
+        ];
+        EXACT.contains(&name) || SUFFIX.iter().any(|suffix| name.ends_with(suffix))
+    }
+
+    fn collect(root: &RootSchema, schema: &Schema, seen: &mut BTreeSet<String>) -> bool {
+        let Schema::Object(obj) = schema else {
+            return false;
+        };
+        if let Some(reference) = &obj.reference {
+            let name = ref_name(reference).to_string();
+            // Definitions recurse (plugins, providers); visit each once.
+            if !seen.insert(name.clone()) {
+                return false;
+            }
+            let found = root
+                .definitions
+                .get(&name)
+                .is_some_and(|def| collect(root, def, seen));
+            seen.remove(&name);
+            return found;
+        }
+        let mut found = false;
+        if let Some(sub) = &obj.subschemas {
+            for branch in sub
+                .all_of
+                .iter()
+                .chain(sub.any_of.iter())
+                .chain(sub.one_of.iter())
+                .flatten()
+            {
+                found |= collect(root, branch, seen);
+            }
+        }
+        if let Some(ov) = &obj.object {
+            for (name, child) in &ov.properties {
+                if is_dangerous_field(name) {
+                    found = true;
+                }
+                found |= collect(root, child, seen);
+            }
+            if let Some(additional) = &ov.additional_properties {
+                found |= collect(root, additional, seen);
+            }
+        }
+        if let Some(av) = &obj.array
+            && let Some(SingleOrVec::Single(item)) = &av.items
+        {
+            found |= collect(root, item, seen);
+        }
+        found
+    }
+
+    /// The denylist rots as tables are added, and the relaxation is only safe
+    /// while it is complete. Derive the expectation from the generated schema:
+    /// any root whose subtree carries a command/argv/run, a credential, or a
+    /// URL/host field must be listed. (A denylist — not an allowlist — is
+    /// deliberate: a table a NEWER build adds must not brick an older one.)
+    ///
+    /// This is a LOWER BOUND, not a proof of exhaustiveness: it catches only
+    /// what the field vocabulary above names, so roots whose danger is
+    /// structural rather than lexical (`[database]`'s migration authority,
+    /// `[placement]`'s lanes, `[disk]`'s reclamation) are listed on human
+    /// judgment and are not re-derived here. The guard flags a majority of the
+    /// listed roots; the assertions below fail if that detection collapses, so
+    /// a schemars upgrade cannot quietly turn this test into decoration. The
+    /// floor is derived from the list rather than written as a literal — a
+    /// number in a comment about rot is itself the thing that rots.
+    #[test]
+    fn security_relevant_roots_cover_every_executing_or_credential_table() {
+        let root = config_schema();
+        let properties = &root
+            .schema
+            .object
+            .as_ref()
+            .expect("Config is an object schema")
+            .properties;
+        let mut missing = Vec::new();
+        let mut flagged = BTreeSet::new();
+        for (name, schema) in properties {
+            let mut seen = BTreeSet::new();
+            if is_dangerous_field(name) || collect(root, schema, &mut seen) {
+                flagged.insert(name.clone());
+                if !SECURITY_RELEVANT_ROOTS.contains(&name.as_str()) {
+                    missing.push(name.clone());
+                }
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "these roots execute, hold credentials or reach a remote but are \
+             not in SECURITY_RELEVANT_ROOTS (add them, and mirror the list in \
+             docs/help/configuration.md + docs/ARCHITECTURE.md): {missing:?}"
+        );
+        // Non-vacuous: the walk must still SEE the dangerous subtrees. Without
+        // this the test would pass if `collect` silently stopped matching.
+        for expected in ["sandbox", "project", "agents", "env", "host", "metrics"] {
+            assert!(
+                flagged.contains(expected),
+                "the schema walk no longer detects `{expected}`: the guard has \
+                 become decoration (schemars shape change?). flagged={flagged:?}"
+            );
+        }
+        // Half the list, derived: comfortably below today's detection rate and
+        // above the count a collapsed walk could reach.
+        let floor = SECURITY_RELEVANT_ROOTS.len() / 2;
+        assert!(
+            flagged.len() >= floor,
+            "only {} of {} listed roots flagged (floor {floor}): detection \
+             collapsed — flagged={flagged:?}",
+            flagged.len(),
+            SECURITY_RELEVANT_ROOTS.len()
+        );
+    }
+
+    /// Every listed root must still exist in the schema, so a rename cannot
+    /// leave a dead name protecting nothing (the `[workspace]` →
+    /// `[project]` rename did exactly that).
+    #[test]
+    fn every_listed_security_root_exists_in_the_schema_or_is_a_known_alias() {
+        let root = config_schema();
+        let properties = &root
+            .schema
+            .object
+            .as_ref()
+            .expect("Config is an object schema")
+            .properties;
+        // `workspace` is the legacy spelling `config_compat` rewrites to
+        // `project` before any walk; it is kept so a caller validating a
+        // pre-normalization document is still protected.
+        const ALIASES: &[&str] = &["workspace"];
+        let dead: Vec<&&str> = SECURITY_RELEVANT_ROOTS
+            .iter()
+            .filter(|name| !properties.contains_key(**name) && !ALIASES.contains(name))
+            .collect();
+        assert!(dead.is_empty(), "dead entries protect nothing: {dead:?}");
     }
 }
