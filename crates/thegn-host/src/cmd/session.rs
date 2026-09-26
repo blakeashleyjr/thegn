@@ -2077,7 +2077,6 @@ mod resume_work_tests {
 /// of the `API_CALLS` route table — a newly routed verb becomes CLI-callable
 /// with no CLI change). DB-direct verbs (`thegn open`, `thegn wt list`)
 /// remain excused in `SURFACE_GAPS` only where no route exists.
-#[cfg(test)]
 pub fn cli_control_caps() -> Vec<&'static str> {
     let mut v: Vec<&'static str> = thegn_svc::control::routes::API_CALLS
         .iter()
