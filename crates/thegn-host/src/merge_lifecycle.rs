@@ -420,14 +420,24 @@ pub(crate) fn remove_landed_with_config(
     };
     let discarded_build_state = verified.discarded_build_state();
     let changed_during_cleanup = std::cell::Cell::new(false);
+    let dirty_during_cleanup = std::cell::Cell::new(false);
+    // A worktree that becomes dirty or changes *during* cleanup is kept, exactly
+    // as one that was already dirty at admission. Record which, so the sweep
+    // reports it in its own category rather than as a generic refusal — a
+    // `Refused` row reads as a fault, and this is the normal "you went back to
+    // it" outcome.
+    let note_refusal = |refusal: cleanup::Refusal| -> String {
+        match &refusal {
+            cleanup::Refusal::Changed => changed_during_cleanup.set(true),
+            cleanup::Refusal::Dirty => dirty_during_cleanup.set(true),
+            cleanup::Refusal::Unsafe(_) => {}
+        }
+        refusal.to_string()
+    };
     let revalidate_verified = || -> Result<(), String> {
         match verified.revalidate() {
             Ok(()) => Ok(()),
-            Err(cleanup::Refusal::Changed) => {
-                changed_during_cleanup.set(true);
-                Err(cleanup::Refusal::Changed.to_string())
-            }
-            Err(error) => Err(error.to_string()),
+            Err(refusal) => Err(note_refusal(refusal)),
         }
     };
     let unchanged_queue = || -> Result<(), String> {
@@ -481,11 +491,7 @@ pub(crate) fn remove_landed_with_config(
             unchanged_queue()?;
             match verified.remove_checked(&unchanged_queue) {
                 Ok(()) => Ok(()),
-                Err(cleanup::Refusal::Changed) => {
-                    changed_during_cleanup.set(true);
-                    Err(cleanup::Refusal::Changed.to_string())
-                }
-                Err(error) => Err(error.to_string()),
+                Err(refusal) => Err(note_refusal(refusal)),
             }
         }),
         Some(&|| resources.revalidate(db, repo_root, worktree)),
@@ -493,6 +499,9 @@ pub(crate) fn remove_landed_with_config(
     if !removed {
         if changed_during_cleanup.get() {
             return CleanupOutcome::KeptChanged;
+        }
+        if dirty_during_cleanup.get() {
+            return CleanupOutcome::KeptDirty;
         }
         return CleanupOutcome::Refused { reason: message };
     }
