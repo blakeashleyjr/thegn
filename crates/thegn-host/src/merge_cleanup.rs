@@ -97,7 +97,15 @@ impl LocalResources {
         crate::agent::automatic_cleanup_resources_absent(path)?;
         crate::bridge_sup::automatic_cleanup_resources_absent(path)?;
         crate::worktree_lifecycle::automatic_cleanup_session_absent(Path::new(path))?;
+        #[cfg(not(test))]
         let search = std::env::var_os("PATH");
+        // Under `cfg(test)` the search set is whatever the fixture chose, and it
+        // NEVER falls back to the host's PATH. Falling back made the outcome
+        // depend on whether the developer happens to have docker or podman
+        // installed — the exact coupling THE-690 exists to remove — and it broke
+        // five merge_lifecycle/merge_sweep tests on a machine that has both.
+        // Tests that mean to exercise the probe call `oci_resources_absent`
+        // directly with a shim directory.
         #[cfg(test)]
         let search = TEST_GIT_CONFIG
             .with(|slot| {
@@ -106,7 +114,7 @@ impl LocalResources {
                     .and_then(|p| p.parent())
                     .map(|p| p.as_os_str().to_owned())
             })
-            .or(search);
+            .or_else(|| Some(oci_free_test_search().as_os_str().to_owned()));
         oci_resources_absent(search.as_deref(), Path::new(path))
     }
 }
@@ -122,9 +130,19 @@ fn oci_resources_absent(search: Option<&std::ffi::OsStr>, target: &Path) -> Resu
             "OCI availability unknown: PATH must contain bounded absolute directories".into(),
         );
     }
-    let target = target.canonicalize().map_err(|error| {
-        format!("OCI ownership could not be queried: worktree path is unreadable: {error}")
-    })?;
+    let target = match target.canonicalize() {
+        Ok(target) => target,
+        // A path that does not exist cannot be held by a container, and there is
+        // nothing left for the sweep to delete either. `revalidate` legitimately
+        // runs after removal and on already-collected rows, so treating an absent
+        // target as an unknown turned a missing worktree into a hard refusal.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(format!(
+                "OCI ownership could not be queried: worktree path is unreadable: {error}"
+            ));
+        }
+    };
     let mut seen = BTreeSet::new();
     for backend in thegn_core::sandbox::Backend::all_oci() {
         let binary = backend.binary();
@@ -897,6 +915,22 @@ mod tests;
 #[cfg(test)]
 thread_local! {
     static TEST_GIT_CONFIG: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+/// An empty, absolute directory used as the default `cfg(test)` PATH so no test
+/// can discover a container runtime that merely happens to be installed on the
+/// developer's machine. Created once per test binary and intentionally left
+/// empty; a fixture that wants a runtime supplies its own shim directory.
+#[cfg(test)]
+fn oci_free_test_search() -> &'static Path {
+    static DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        tempfile::Builder::new()
+            .prefix("thegn-oci-free-")
+            .tempdir()
+            .expect("private empty OCI search directory")
+    })
+    .path()
 }
 
 /// Test-only ambient state isolation. Commands are constructed on the owning
