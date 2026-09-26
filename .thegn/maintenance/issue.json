@@ -1,0 +1,14 @@
+{
+  "id": "THE-690",
+  "title": "Merely having docker or podman on PATH blocks every merged-worktree sweep forever",
+  "url": "https://linear.app/blakeashley/issue/THE-690/merely-having-docker-or-podman-on-path-blocks-every-merged-worktree",
+  "priority": "High",
+  "labels": [
+    "Bug"
+  ],
+  "status": "Backlog",
+  "team": "Thegn",
+  "primary_file": "crates/thegn-host/src/merge_cleanup.rs",
+  "chain": "5th cause of 'merge sweep collects nothing'; THE-685/686/687/688 landed, THE-689 is a filed follow-up",
+  "affects": "all 13 kept worktrees"
+}
