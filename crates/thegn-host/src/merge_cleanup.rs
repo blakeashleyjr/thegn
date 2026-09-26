@@ -135,13 +135,15 @@ fn oci_resources_absent(search: Option<&std::ffi::OsStr>) -> Result<(), String> 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Refusal {
     Dirty,
+    Changed,
     Unsafe(String),
 }
 
 impl std::fmt::Display for Refusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Dirty => f.write_str("uncommitted, untracked or ignored files are present"),
+            Self::Dirty => f.write_str("edited since landing"),
+            Self::Changed => f.write_str("changed during cleanup"),
             Self::Unsafe(reason) => f.write_str(reason),
         }
     }
@@ -298,7 +300,34 @@ fn configured_filter_drivers(path: &Path) -> Result<BTreeSet<String>, Refusal> {
     Ok(names)
 }
 
-pub(crate) fn clean(path: &Path) -> Result<(), Refusal> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StatusObservation {
+    bytes: Vec<u8>,
+    ignored_only: bool,
+}
+
+fn observe_status(bytes: Vec<u8>) -> Result<StatusObservation, Refusal> {
+    let mut ignored_only = false;
+    for record in bytes
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty())
+    {
+        if record.len() < 4 || record[2] != b' ' || record[3..].is_empty() {
+            return Err(Refusal::Dirty);
+        }
+        if record.starts_with(b"!! ") {
+            ignored_only = true;
+        } else {
+            return Err(Refusal::Dirty);
+        }
+    }
+    Ok(StatusObservation {
+        bytes,
+        ignored_only,
+    })
+}
+
+pub(crate) fn clean(path: &Path) -> Result<StatusObservation, Refusal> {
     // status may run clean/process drivers while refreshing index content, and
     // fsmonitor=false alone cannot make that safe — so an APPLICABLE driver is
     // still a hard refusal.
@@ -353,7 +382,7 @@ pub(crate) fn clean(path: &Path) -> Result<(), Refusal> {
             "submodule worktrees require explicit cleanup",
         ));
     }
-    if git(
+    let status = git(
         path,
         &[
             "status",
@@ -363,13 +392,8 @@ pub(crate) fn clean(path: &Path) -> Result<(), Refusal> {
             "--ignored=matching",
             "--ignore-submodules=none",
         ],
-    )?
-    .is_empty()
-    {
-        Ok(())
-    } else {
-        Err(Refusal::Dirty)
-    }
+    )?;
+    observe_status(status)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -428,6 +452,7 @@ pub(crate) struct Verified {
     target: String,
     head: String,
     landed: Option<String>,
+    status: StatusObservation,
     identities: Vec<same_file::Handle>,
 }
 
@@ -513,7 +538,7 @@ impl Verified {
                 "not a verified linked-worktree metadata directory",
             ));
         }
-        clean(&path)?;
+        let status = clean(&path)?;
         let identities = [
             (&path, IdentityKind::Directory),
             (&common_dir, IdentityKind::Directory),
@@ -537,6 +562,7 @@ impl Verified {
             target: target.into(),
             head,
             landed: landed.map(str::to_owned),
+            status,
             identities,
         })
     }
@@ -554,6 +580,9 @@ impl Verified {
             &self.target,
             self.landed.as_deref(),
         )?;
+        if self.status.bytes != now.status.bytes {
+            return Err(Refusal::Changed);
+        }
         if self.common != now.common
             || self.gitdir != now.gitdir
             || self.head != now.head
@@ -562,6 +591,10 @@ impl Verified {
             return Err(unsafe_reason("worktree identity changed during cleanup"));
         }
         Ok(())
+    }
+
+    pub(crate) fn discarded_build_state(&self) -> bool {
+        self.status.ignored_only
     }
 
     pub(crate) fn verify_cached_repository(&self, path: &Path) -> Result<(), Refusal> {
