@@ -1528,22 +1528,30 @@ mod tests {
     fn unknown_plugin_and_junk_are_ignored() {
         let mut state = state_with(vec![]);
         let mut model = FrameModel::default();
-        assert!(!drain_one(
-            &mut state,
-            &mut model,
-            PluginMsg::Event {
-                plugin: "ghost".into(),
-                event: SessionEvent::Message(msg("update", serde_json::json!({}))),
-            }
-        ));
-        assert!(!drain_one(
-            &mut state,
-            &mut model,
-            PluginMsg::Event {
-                plugin: "ghost".into(),
-                event: SessionEvent::Junk("println! debris".into()),
-            }
-        ));
+        // drain_one now returns PluginDamage, not bool: an unknown plugin must
+        // produce NO damage at all, which is what keeps the loop idle.
+        assert_eq!(
+            drain_one(
+                &mut state,
+                &mut model,
+                PluginMsg::Event {
+                    plugin: "ghost".into(),
+                    event: SessionEvent::Message(msg("update", serde_json::json!({}))),
+                }
+            ),
+            PluginDamage::None
+        );
+        assert_eq!(
+            drain_one(
+                &mut state,
+                &mut model,
+                PluginMsg::Event {
+                    plugin: "ghost".into(),
+                    event: SessionEvent::Junk("println! debris".into()),
+                }
+            ),
+            PluginDamage::None
+        );
     }
 
     #[test]
