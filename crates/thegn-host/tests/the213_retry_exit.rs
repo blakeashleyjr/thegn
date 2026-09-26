@@ -38,7 +38,14 @@ impl Fixture {
         fs::write(
             &config,
             format!(
-                "[daemon]\nenabled = false\nsocket = \"{}\"\n\n[[pipeline.stages]]\nname = \"code\"\nagent = \"claude\"\nprompt = \"work {{issue_number}}\"\nconcurrency = {concurrency}\n",
+                // Configuration admission imposes two semantic rules on a stage
+                // prompt: it must reference {row}, so the worker knows which
+                // roster row it files against, and it must tell the worker to run
+                // `thegn dispatch report`, because the done-gate requires a report
+                // and a row without one can only be closed with --force. This
+                // test is about retryable exit codes, so the prompt only has to
+                // be admissible.
+                "[daemon]\nenabled = false\nsocket = \"{}\"\n\n[[pipeline.stages]]\nname = \"code\"\nagent = \"claude\"\nprompt = \"You are dispatch row {{row}}. work {{issue_number}}. When finished run `thegn dispatch report`.\"\nconcurrency = {concurrency}\n",
                 socket.display()
             ),
         )

@@ -20,6 +20,25 @@ agent_run.rs
 agent_tests.rs
 clipboard.rs
 cmd/debug.rs
+# LINT-ONLY cfg, not per-OS behaviour (THE-505): the only platform predicates
+# here are `cfg_attr(…, allow(dead_code))` on `ConfigFileReadError` variants and
+# `FinalLinkResolvingReader`, which exist identically on every platform — only
+# which one a reader *constructs* varies, and the readers themselves live in
+# src/platform/. The behaviour in this file is platform-neutral. Replacing these
+# with a blanket `#[allow(dead_code)]` would remove the entry at the cost of no
+# longer catching a variant that is dead on all platforms.
+config_capture.rs
+# TEST-ONLY cfg, not per-OS production code (THE-505): the Linux `O_PATH`
+# capture reader has filesystem-type and inode-identity behaviour that only
+# exists on Linux, so its regressions are `#[cfg(target_os = "linux")]`. They
+# need this module's private capture fixtures; the production selection of a
+# reader is already behind `platform::`.
+config_capture_tests.rs
+# TEST-ONLY cfg, not per-OS production code (THE-505): startup-admission
+# regressions build FIFO and mode-bit configuration sources to prove a
+# non-regular source is refused. Creating those needs Unix APIs; the production
+# refusal is platform-free (it reads file metadata).
+config_startup_tests.rs
 daemon/mod.rs
 # TEST-ONLY cfg, not per-OS production code: the daemon fork integration test
 # uses a real Unix PTY and Unix owner-permission bits to verify the handoff
