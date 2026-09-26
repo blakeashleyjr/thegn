@@ -174,6 +174,15 @@ pub trait WorktreeAuxStore {
         fields: &MergeStatusFields,
     ) -> Result<()>;
 
+    /// Fill a missing landed identity only when the complete observed queue
+    /// identity is still current. `true` means the row was updated; `false`
+    /// means another writer changed or revoked it.
+    fn backfill_landed_result_oid(
+        &self,
+        expected: &MergeQueueRow,
+        result_oid: &str,
+    ) -> Result<bool>;
+
     /// Re-stamp a queued row's target branch to the one a run is actually
     /// folding into.
     ///

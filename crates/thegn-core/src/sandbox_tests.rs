@@ -1682,3 +1682,71 @@ fn the_nix_daemon_socket_is_withheld_from_a_foreign_guest() {
         "a Linux guest on a non-Linux host must not receive the host's /nix: {joined}"
     );
 }
+
+// --- THE-156: the default containment image and its entrypoint -------------
+
+#[test]
+fn default_oci_image_is_digest_pinned() {
+    // A tag is a mutable pointer the registry owner can retarget; the default
+    // containment boundary must be content-addressed.
+    assert!(
+        crate::sandbox::image_is_digest_pinned(DEFAULT_OCI_IMAGE),
+        "default image is not digest-pinned: {DEFAULT_OCI_IMAGE}"
+    );
+    // The tag rides along for readability, so the reference still says what it
+    // is rather than being an opaque hash.
+    let parsed = crate::image::ImageRef::parse(DEFAULT_OCI_IMAGE).expect("parses");
+    assert_eq!(parsed.tag, "stable");
+    assert_eq!(parsed.name, "docker.io/library/debian");
+}
+
+#[test]
+fn image_is_digest_pinned_rejects_mutable_tags() {
+    assert!(!crate::sandbox::image_is_digest_pinned(
+        "docker.io/library/debian:stable"
+    ));
+    assert!(!crate::sandbox::image_is_digest_pinned("alpine"));
+    // A registry port is not a digest.
+    assert!(!crate::sandbox::image_is_digest_pinned("reg:5000/img:v1"));
+    // Truncated / malformed digests are not pins.
+    assert!(!crate::sandbox::image_is_digest_pinned("img@sha256:abc"));
+    assert!(crate::sandbox::image_is_digest_pinned(&format!(
+        "img@sha256:{}",
+        "a".repeat(64)
+    )));
+}
+
+#[test]
+fn entrypoint_override_precedes_the_image_and_names_the_workload() {
+    // The ordering is the whole point: `--entrypoint` must be a CREATE option,
+    // before the image, or the runtime treats it as a container argument.
+    let ep = crate::sandbox::entrypoint_override();
+    assert_eq!(ep, ["--entrypoint".to_string(), "sleep".to_string()]);
+
+    // Reconstruct the argv shape both run sites build, and assert an image
+    // ENTRYPOINT can no longer wrap the workload.
+    let mut argv: Vec<String> = vec!["run".into(), "-d".into()];
+    argv.extend(ep);
+    argv.push(DEFAULT_OCI_IMAGE.to_string());
+    argv.push("infinity".into());
+
+    let image_at = argv
+        .iter()
+        .position(|a| a == DEFAULT_OCI_IMAGE)
+        .expect("image present");
+    let flag_at = argv
+        .iter()
+        .position(|a| a == "--entrypoint")
+        .expect("entrypoint flag present");
+    assert!(
+        flag_at < image_at,
+        "--entrypoint must precede the image: {argv:?}"
+    );
+    // Exactly one workload is named, and it is ours.
+    assert_eq!(argv.last().map(String::as_str), Some("infinity"));
+    assert_eq!(
+        argv.iter().filter(|a| *a == "sleep").count(),
+        1,
+        "sleep is the entrypoint, not also a trailing command: {argv:?}"
+    );
+}

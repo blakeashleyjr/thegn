@@ -35,15 +35,6 @@ fn decode_worktree_record(r: &rusqlite::Row<'_>) -> rusqlite::Result<WorktreeRow
 }
 
 impl WorkspaceStore for Db {
-    fn has_persisted_worktree_session(&self, worktree: &str) -> Result<bool> {
-        self.conn()
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM tab_groups WHERE worktree=?1)",
-                [worktree],
-                |row| row.get(0),
-            )
-            .map_err(Into::into)
-    }
     // --- repo history (launcher recents) -----------------------------------
     fn touch_repo(&self, path: &str, name: &str) -> Result<()> {
         let now = util::now();
@@ -1092,6 +1083,25 @@ impl WorkspaceStore for Db {
         Ok(())
     }
 
+    fn delete_tab_groups_for_worktree_all_sessions(&self, worktree: &str) -> Result<()> {
+        // Delete children first. Callers put this pair in their surrounding
+        // transaction so a failed bookkeeping pass cannot leave half a layout
+        // behind.
+        self.conn().execute(
+            "DELETE FROM group_tabs
+             WHERE EXISTS (
+                 SELECT 1 FROM tab_groups
+                 WHERE tab_groups.session_name = group_tabs.session_name
+                   AND tab_groups.name = group_tabs.group_name
+                   AND tab_groups.worktree = ?1
+             )",
+            [worktree],
+        )?;
+        self.conn()
+            .execute("DELETE FROM tab_groups WHERE worktree=?1", [worktree])?;
+        Ok(())
+    }
+
     /// Wipe a session's whole persisted layout (groups + tabs). The host
     /// persists snapshots as clear-then-insert inside one transaction so
     /// closed/renamed entries can't linger.
@@ -1524,31 +1534,86 @@ mod tests {
     }
 
     #[test]
-    fn persisted_worktree_session_guard_preserves_unknown_query_failure() {
-        use crate::store::WorkspaceStore;
-        let db = crate::db::Db::open_memory().unwrap();
-        let store: &dyn WorkspaceStore = &db;
-        assert!(!store.has_persisted_worktree_session("private/wt").unwrap());
-        store
-            .put_tab_group(
-                "private",
-                &crate::models::TabGroupRow {
-                    name: "private/branch".into(),
-                    kind: "branch".into(),
-                    worktree: "private/wt".into(),
-                    ordinal: 0,
-                    active_tab: 0,
-                },
-            )
+    fn delete_tab_groups_for_worktree_all_sessions_keys_on_path() {
+        use crate::models::{GroupTabRow, TabGroupRow};
+        let db = Db::open_memory().unwrap();
+        let group = |name: &str, worktree: &str| TabGroupRow {
+            name: name.into(),
+            kind: "branch".into(),
+            worktree: worktree.into(),
+            ordinal: 0,
+            active_tab: 0,
+        };
+        let tab = |group_name: &str| GroupTabRow {
+            group_name: group_name.into(),
+            ordinal: 0,
+            title: "1".into(),
+            pane_tree: r#"{"leaf":0}"#.into(),
+            focused_pane: 0,
+            pane_cwds: String::new(),
+            pane_cmds: String::new(),
+            pane_sessions: String::new(),
+            scrollback_snapshot: String::new(),
+        };
+        db.put_tab_group("session-a", &group("app/a", "/wt/feature"))
             .unwrap();
-        assert!(store.has_persisted_worktree_session("private/wt").unwrap());
-        assert!(
-            !store
-                .has_persisted_worktree_session("private/other")
-                .unwrap()
+        db.put_group_tab("session-a", &tab("app/a")).unwrap();
+        db.put_tab_group("session-b", &group("other/feature", "/wt/feature"))
+            .unwrap();
+        db.put_group_tab("session-b", &tab("other/feature"))
+            .unwrap();
+        db.put_tab_group("session-a", &group("app/other", "/wt/other"))
+            .unwrap();
+        db.put_group_tab("session-a", &tab("app/other")).unwrap();
+
+        db.delete_tab_groups_for_worktree_all_sessions("/wt/feature")
+            .unwrap();
+
+        assert_eq!(db.groups_for_session("session-a").unwrap().len(), 1);
+        assert_eq!(
+            db.groups_for_session("session-a").unwrap()[0].name,
+            "app/other"
         );
-        db.conn().execute_batch("DROP TABLE tab_groups").unwrap();
-        assert!(store.has_persisted_worktree_session("private/wt").is_err());
+        assert!(db.groups_for_session("session-b").unwrap().is_empty());
+        assert_eq!(
+            db.group_tabs_for_session("session-a").unwrap()[0].group_name,
+            "app/other"
+        );
+        assert!(db.group_tabs_for_session("session-b").unwrap().is_empty());
+    }
+
+    #[test]
+    fn delete_tab_groups_for_worktree_all_sessions_rolls_back_with_bookkeeping() {
+        use crate::models::{GroupTabRow, TabGroupRow};
+        let db = Db::open_memory().unwrap();
+        let group = TabGroupRow {
+            name: "app/feature".into(),
+            kind: "branch".into(),
+            worktree: "/wt/feature".into(),
+            ordinal: 0,
+            active_tab: 0,
+        };
+        let tab = GroupTabRow {
+            group_name: "app/feature".into(),
+            ordinal: 0,
+            title: "1".into(),
+            pane_tree: r#"{"leaf":0}"#.into(),
+            focused_pane: 0,
+            pane_cwds: String::new(),
+            pane_cmds: String::new(),
+            pane_sessions: String::new(),
+            scrollback_snapshot: String::new(),
+        };
+        db.put_tab_group("session-a", &group).unwrap();
+        db.put_group_tab("session-a", &tab).unwrap();
+
+        let result: anyhow::Result<()> = db.transaction(|db| {
+            db.delete_tab_groups_for_worktree_all_sessions("/wt/feature")?;
+            anyhow::bail!("simulate queue bookkeeping failure")
+        });
+        assert!(result.is_err());
+        assert_eq!(db.groups_for_session("session-a").unwrap(), [group]);
+        assert_eq!(db.group_tabs_for_session("session-a").unwrap(), [tab]);
     }
     use crate::db::Db;
     use crate::store::WorkspaceStore;

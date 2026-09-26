@@ -1,0 +1,12 @@
+{
+  "id": "THE-159",
+  "title": "Validate stale model-proxy PID state before signaling any process or process group",
+  "url": "https://linear.app/blakeashley/issue/the-159",
+  "priority": "High",
+  "labels": [
+    "Bug"
+  ],
+  "status": "Todo",
+  "parentId": "THE-150",
+  "description": "## Finding\n\nA stale/corrupt stored `u32` PID is cast to `i32`; extreme values can become negative (including process-group or broad kill semantics), and a reused PID can target an unrelated process.\n\n## Evidence at audited commit\n\n`crates/thegn-host/src/model_proxy_daemon.rs:124` and `crates/thegn-host/src/platform/unix.rs:113,128`.\n\n## Implementation constraints\n\nTreat PID files as untrusted state. Bind them to process identity/start time or an authenticated control channel. Never signal zero, negative, out-of-range, or unverified reused identifiers.\n\n## Acceptance criteria\n\n- [ ] PID parsing rejects zero and values above the platform's safe positive range before conversion.\n- [ ] Cleanup proves the target is the expected proxy instance before TERM/KILL.\n- [ ] PID reuse and stale-file cases leave unrelated processes untouched.\n- [ ] Process-group signaling is explicit and only used for a group created/owned by the supervisor.\n- [ ] Tests exercise `u32::MAX`, negative-cast equivalents, PID reuse, malformed state, and vanished processes."
+}

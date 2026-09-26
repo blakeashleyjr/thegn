@@ -40,6 +40,10 @@ pub struct Damage {
     /// the live clock, AI metrics. Recompose just those two 1-row rects and
     /// bounded-diff them, instead of a full-chrome repaint ~1×/s while idle.
     pub bars: bool,
+    /// Only the statusbar row changed — for example, a plugin view whose
+    /// rendered width and placement stayed stable. Unlike [`Self::bars`], this
+    /// does not recompose the masthead.
+    pub statusbar: bool,
     /// Only the sidebar changed — cursor navigation, collapse/expand, multi-select
     /// (D5). The panel shows the *active* worktree (not the sidebar highlight), so
     /// it's untouched; recompose + bounded-diff just the sidebar rect (paired with
@@ -55,6 +59,7 @@ impl Damage {
             && !self.chrome
             && !self.switch
             && !self.bars
+            && !self.statusbar
             && !self.sidebar
             && self.panes.is_empty()
     }
@@ -65,6 +70,7 @@ impl Damage {
         self.chrome = false;
         self.switch = false;
         self.bars = false;
+        self.statusbar = false;
         self.sidebar = false;
         self.panes.clear();
     }
@@ -118,11 +124,13 @@ pub enum RenderPlan {
     Full,
     /// Reuse the prior frame in `scratch`; recompose + bounded-diff only the
     /// damaged regions — the named `panes` (sorted, deduped), the masthead+
-    /// statusbar `bars`, and/or the `sidebar`. The streaming-output + stats-tick +
-    /// sidebar-nav fast path. At least one of `panes`/`bars`/`sidebar` is set.
+    /// statusbar `bars`, the plugin-owned `statusbar` row, and/or the `sidebar`.
+    /// The streaming-output + stats-tick + plugin + sidebar-nav fast path. At
+    /// least one content channel is set.
     Incremental {
         panes: Vec<PaneId>,
         bars: bool,
+        statusbar: bool,
         sidebar: bool,
     },
 }
@@ -139,12 +147,13 @@ pub fn plan(damage: &Damage, overlays: &Overlays) -> RenderPlan {
     if damage.chrome || damage.switch || overlays.any() {
         return RenderPlan::Full;
     }
-    if !damage.panes.is_empty() || damage.bars || damage.sidebar {
+    if !damage.panes.is_empty() || damage.bars || damage.statusbar || damage.sidebar {
         let mut panes: Vec<PaneId> = damage.panes.iter().copied().collect();
         panes.sort_unstable();
         return RenderPlan::Incremental {
             panes,
             bars: damage.bars,
+            statusbar: damage.statusbar,
             sidebar: damage.sidebar,
         };
     }
@@ -178,6 +187,7 @@ mod tests {
             RenderPlan::Incremental {
                 panes: vec![3],
                 bars: false,
+                statusbar: false,
                 sidebar: false
             }
         );
@@ -186,6 +196,7 @@ mod tests {
             RenderPlan::Incremental {
                 panes: vec![2, 4, 7],
                 bars: false,
+                statusbar: false,
                 sidebar: false
             },
             "ids are sorted + deduped"
@@ -215,6 +226,7 @@ mod tests {
             RenderPlan::Incremental {
                 panes: vec![],
                 bars: false,
+                statusbar: false,
                 sidebar: true
             }
         );
@@ -231,6 +243,7 @@ mod tests {
             RenderPlan::Incremental {
                 panes: vec![5],
                 bars: false,
+                statusbar: false,
                 sidebar: false
             }
         );
@@ -272,6 +285,24 @@ mod tests {
             RenderPlan::Incremental {
                 panes: vec![],
                 bars: true,
+                statusbar: false,
+                sidebar: false
+            }
+        );
+    }
+
+    #[test]
+    fn statusbar_content_is_incremental_without_recomposing_masthead() {
+        let d = Damage {
+            statusbar: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            plan(&d, &Overlays::default()),
+            RenderPlan::Incremental {
+                panes: vec![],
+                bars: false,
+                statusbar: true,
                 sidebar: false
             }
         );
@@ -318,6 +349,7 @@ mod tests {
             RenderPlan::Incremental {
                 panes: vec![],
                 bars: true,
+                statusbar: false,
                 sidebar: false
             }
         );
@@ -350,6 +382,7 @@ mod tests {
             RenderPlan::Incremental {
                 panes: vec![5],
                 bars: true,
+                statusbar: false,
                 sidebar: false
             }
         );
@@ -369,6 +402,7 @@ mod tests {
             RenderPlan::Incremental {
                 panes: vec![],
                 bars: false,
+                statusbar: false,
                 sidebar: true
             }
         );
@@ -443,6 +477,10 @@ mod tests {
                 ..Default::default()
             },
             Damage {
+                statusbar: true,
+                ..Default::default()
+            },
+            Damage {
                 sidebar: true,
                 ..Default::default()
             },
@@ -483,6 +521,7 @@ mod tests {
         let mut d = panes(&[1]);
         d.chrome = true;
         d.full = true;
+        d.statusbar = true;
         assert!(!d.is_empty());
         d.clear();
         assert!(d.is_empty());
@@ -511,6 +550,7 @@ mod tests {
             RenderPlan::Incremental {
                 panes: vec![5],
                 bars: false,
+                statusbar: false,
                 sidebar: false
             }
         );

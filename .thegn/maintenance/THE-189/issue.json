@@ -1,0 +1,10 @@
+{
+  "id": "THE-189",
+  "title": "Rebuild hydration tick schedules when live configuration changes",
+  "url": "https://linear.app/blakeashley/issue/THE-189/rebuild-hydration-tick-schedules-when-live-configuration-changes",
+  "priority": "Medium",
+  "labels": ["Bug"],
+  "status": "Todo",
+  "parentId": "THE-150",
+  "description": "## Finding\n\nLive reload updates configuration but existing tickers for clock, CI, PR, usage, weather, calendar, and LOC keep their startup cadence/enabled state. The UI shows new settings that do not govern runtime behavior.\n\n## Evidence at audited commit\n\n`crates/thegn-host/src/run.rs:1023` and `crates/thegn-host/src/hydrate.rs:527`.\n\n## Implementation constraints\n\nOwn schedulers behind a versioned config update path with cancellation. Avoid duplicate tickers and immediate thundering refreshes.\n\n## Acceptance criteria\n\n- [ ] Enable/disable and interval changes take effect without restarting the app.\n- [ ] Old ticker tasks are canceled and cannot deliver stale-generation results.\n- [ ] Unchanged schedules are not restarted unnecessarily.\n- [ ] Invalid reload retains the last effective schedule and reports the mismatch.\n- [ ] Fake-time tests cover all ticker classes, rapid reloads, disable during inflight work, and shutdown.\n\n## Verification\n\nRun hydration scheduling/live-reload tests with fake time; run `just quick`.\n\n## Execution dependencies\n\n* **Blocked by:** None; dependency-ready at audit baseline."
+}

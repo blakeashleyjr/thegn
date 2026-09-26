@@ -1,0 +1,10 @@
+{
+  "id": "THE-194",
+  "title": "Make the bundled hello plugin valid and test the exact shipped script",
+  "url": "https://linear.app/blakeashley/issue/THE-194/make-the-bundled-hello-plugin-valid-and-test-the-exact-shipped-script",
+  "priority": "Medium",
+  "labels": ["Bug"],
+  "status": "Todo",
+  "parentId": "THE-150",
+  "description": "## Finding\n\nThe bundled hello plugin sends invalid registration parameters, while its golden test substitutes corrected content instead of executing the shipped example. Documentation presents a sample that does not satisfy the actual protocol.\n\n## Evidence at audited commit\n\n`examples/plugins/hello.sh:12` and `crates/thegn-svc/tests/plugin_example.rs:62`.\n\n## Implementation constraints\n\nUse the public protocol verbatim with no test-time rewriting. The fixture must be portable across supported shells or state its platform bounds.\n\n## Acceptance criteria\n\n- [ ] The committed example negotiates/registers/runs successfully unchanged.\n- [ ] The test executes or byte-for-byte feeds the exact file from `examples/plugins/hello.sh`.\n- [ ] Invalid original parameters have a negative contract test with typed diagnostics.\n- [ ] Example comments/docs match current manifest, capabilities, and lifecycle.\n- [ ] Schema/golden drift tests fail if the example becomes stale.\n\n## Verification\n\nRun plugin example integration and protocol golden tests; ShellCheck the script; run `just quick`.\n\n## Execution dependencies\n\n* **Blocked by:** THE-166, THE-162"
+}

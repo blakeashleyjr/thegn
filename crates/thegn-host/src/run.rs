@@ -36,8 +36,9 @@ use crate::handlers::provision::{
 use crate::hydrate::{
     RefreshKind, active_tab_path, build_initial_model, load_or_seed_session,
     neighbor_worktree_paths, retarget_diff_watcher, spawn_model_hydration, spawn_panel_prefetch,
-    spawn_pr_cache_refresh, spawn_refresh_ticker,
+    spawn_pr_cache_refresh,
 };
+use crate::hydrate_schedule::{RefreshGeneration, ScheduleOwner};
 use crate::input::key_bytes;
 use crate::layout;
 use crate::loading::{SpecOrigin, provision_owns_tab};
@@ -1001,19 +1002,6 @@ pub async fn main(
     ));
     // 0 = unknown, so the sampler needs no lock to read it.
     let daemon_pid_atomic = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
-    // How often the `date`/`clock` widgets change text: one second only when a
-    // configured format actually renders seconds, otherwise one minute. Derived
-    // from the formats rather than a separate key, so opting into `%S` opts into
-    // the faster tick by construction.
-    let clock_period_secs = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
-        if thegn_core::config::strftime_needs_seconds(&cfg.bars.clock_format)
-            || thegn_core::config::strftime_needs_seconds(&cfg.bars.date_format)
-        {
-            1
-        } else {
-            60
-        },
-    ));
     // Filesystem the `disk` masthead widget measures: the configured path, else
     // the one holding the worktrees dir. `disk_free_pct` climbs to an existing
     // ancestor, so a not-yet-created dir still resolves to its parent fs.
@@ -1044,7 +1032,8 @@ pub async fn main(
     // prompt diff updates, but a periodic tick still rehydrates non-fs state
     // (branch moves, PR cache) and bounds staleness. The loop owns the actual
     // refresh; this thread just pulses a tick + waker on the interval.
-    spawn_refresh_ticker(
+    let schedule = ScheduleOwner::spawn(
+        &cfg,
         refresh_tx.clone(),
         stats_tx,
         container_tx,
@@ -1053,29 +1042,6 @@ pub async fn main(
         stats_live.clone(),
         containers_live.clone(),
         disk_fs_path,
-        cfg.ci.poll_interval_secs,
-        // `None` when the PR queue is off, so a disabled queue emits no slots.
-        cfg.pr_queue.enabled.then(|| cfg.pr_queue.poll_secs()),
-        // `None` turns the remote poll off entirely (startup kick included);
-        // `Some(0)` keeps the event-driven triggers but drops the cadence.
-        cfg.git
-            .auto_fetch
-            .then_some(cfg.git.auto_fetch_interval_secs),
-        clock_period_secs.clone(),
-        // `None` when no calendar account is enabled, so the whole feature
-        // emits no ticker slot for a user who doesn't use it.
-        cfg.calendar.poll_secs(),
-        cfg.calendar.reminders_enabled,
-        cfg.disk.scan_interval_secs,
-        // `None` when `[loc] enabled = false`, so counting emits no ticker slot
-        // for a user who turned it off.
-        cfg.loc.enabled.then_some(cfg.loc.scan_interval_secs),
-        // `None` when `[usage]` is off, so a user who doesn't track AI accounts
-        // never pays a ticker slot (or an idle wake) for the feature.
-        cfg.usage.enabled.then(|| cfg.usage.effective_poll_secs()),
-        // `None` while `[weather]` is off / `none` / a reserved provider, so a
-        // user who never enables weather pays no ticker slot for it existing.
-        cfg.weather.poll_secs(),
         waker.clone(),
     );
 
@@ -1124,6 +1090,11 @@ pub async fn main(
         );
     }
 
+    // One bounded native clipboard worker owns all helper subprocesses. It is
+    // shut down before the rest of application cleanup so no helper can outlive
+    // the UI process.
+    let mut clipboard = crate::clipboard::Clipboard::start(waker.clone());
+
     let resident_supervisor =
         thegn_svc::plugin::ResidentSupervisor::new(tokio::runtime::Handle::current());
     let result = event_loop(
@@ -1139,6 +1110,7 @@ pub async fn main(
         keymap,
         mode,
         config_rx,
+        schedule,
         refresh_tx,
         refresh_rx,
         fold_tx,
@@ -1169,6 +1141,7 @@ pub async fn main(
         host_cache_port,
     )
     .await;
+    clipboard.shutdown();
     // Outside the UI loop, including every early/error return. All sessions
     // close together under one application deadline; reloads share this owner.
     let cleanup_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
@@ -6108,6 +6081,7 @@ async fn event_loop<T: Terminal>(
     mut keymap: crate::keymap::KeyMap,
     mut mode: crate::keymap::Mode,
     mut config_rx: tokio_mpsc::UnboundedReceiver<Result<thegn_core::config::Config, String>>,
+    mut schedule: ScheduleOwner,
     refresh_tx: tokio_mpsc::UnboundedSender<RefreshKind>,
     mut refresh_rx: tokio_mpsc::UnboundedReceiver<RefreshKind>,
     fold_tx: tokio_mpsc::UnboundedSender<anyhow::Result<crate::integrate::FoldReport>>,
@@ -6854,6 +6828,9 @@ async fn event_loop<T: Terminal>(
     // incremental path (recompose + bounded-diff the two 1-row bar rects) instead
     // of the master `dirty` full-chrome repaint. Cleared after flush.
     let mut bars_dirty = false;
+    // Plugin content damage: a stable-width/status placement update repaints
+    // only the bottom statusbar row, leaving the masthead on the fast path.
+    let mut statusbar_dirty = false;
     let mut sidebar_dirty = false; // D5: sidebar-only damage (nav/collapse); reset with bars_dirty
     // One zone owns the keyboard at any time; Ctrl+g toggles the keybind lock.
     // `sb.focused` / `model.panel_focused` / `model.center_focused` mirror it.
@@ -8164,10 +8141,11 @@ async fn event_loop<T: Terminal>(
         );
     }
 
-    // When reminders were last checked. The due window is half-open against
-    // this, so a reminder fires on exactly the one tick that straddles its
-    // trigger rather than on every tick from then until the meeting starts.
-    let mut last_reminder_check_ms = chrono::Utc::now().timestamp_millis();
+    // When reminders were last checked, and the one evaluation in flight. The
+    // due window is half-open against the cursor, which advances only on a
+    // worker's successful acknowledgment of that exact window.
+    let mut reminder_cursor =
+        crate::hydrate_calendar::ReminderCursor::new(chrono::Utc::now().timestamp_millis());
 
     loop_perf.take(); // loop metrics start here; startup has its own waterfall
     let mut active_clock = crate::perf_timing::ActiveClock::default();
@@ -8646,6 +8624,8 @@ async fn event_loop<T: Terminal>(
                     // THE-84: the primary missing leaf — captured before the
                     // resolve below moves `missing` into the batch.
                     let first_leaf = missing.first().copied();
+                    let mut relaunch =
+                        crate::handlers::worktree_launch::RelaunchOutcome::NotAttempted;
                     let (specs, attach) = crate::handlers::prewarm::resolve_automatic_with(
                         first_leaf,
                         || {
@@ -8702,7 +8682,7 @@ async fn event_loop<T: Terminal>(
                         },
                         |specs, first_leaf, attach_is_empty| {
                             if !is_terminal {
-                                crate::handlers::worktree_launch::apply_relaunch(
+                                relaunch = crate::handlers::worktree_launch::apply_relaunch(
                                     specs,
                                     &cfg,
                                     &wt,
@@ -8721,6 +8701,7 @@ async fn event_loop<T: Terminal>(
                             target_leaves,
                             origin: SpecOrigin::Prewarm,
                             specs,
+                            relaunch,
                             attach,
                         })
                         .is_ok()
@@ -11503,6 +11484,20 @@ async fn event_loop<T: Terminal>(
             dirty = true;
         }
 
+        // Native clipboard results: the bounded worker reports only an outcome,
+        // never the payload or helper diagnostics. Replacements are latest-wins
+        // and therefore do not produce a stale failure for the UI.
+        while let Some(outcome) = crate::clipboard::poll_outcome() {
+            loop_perf.tick(crate::perf::WakeSource::Other);
+            model.status = match outcome {
+                crate::clipboard::CopyOutcome::Succeeded => "Copied to clipboard".into(),
+                crate::clipboard::CopyOutcome::Failed => {
+                    "Clipboard copy failed (no helper completed)".into()
+                }
+            };
+            dirty = true;
+        }
+
         // Clipboard image-paste results (THE-24): the worker resolved the drop
         // and hands back the pane + path to paste, or a status message. The paste
         // is ordinary pane input (⇒ Panes damage); the status is chrome (⇒ Full).
@@ -11613,6 +11608,7 @@ async fn event_loop<T: Terminal>(
                     if panel_ui.docs.calendar.home == prev_cal.home {
                         panel_ui.docs.calendar.events = prev_cal.events;
                         panel_ui.docs.calendar.loaded = prev_cal.loaded;
+                        panel_ui.docs.calendar.errors = prev_cal.errors;
                     }
                     // The help registry embeds the effective keymap page.
                     help_registry =
@@ -11625,6 +11621,11 @@ async fn event_loop<T: Terminal>(
                         &waker,
                     );
                     current_config = new_cfg;
+                    // Rebuild only the effective hydration schedule. This is
+                    // intentionally after successful config admission; the
+                    // Err path below therefore keeps the prior worker and
+                    // generation untouched.
+                    schedule.reconfigure(&current_config);
                     crate::automation_runtime::install(&current_config);
                     preview_supervisor.set_enabled(current_config.preview.enabled);
                     request_preview_scan(
@@ -11710,6 +11711,13 @@ async fn event_loop<T: Terminal>(
         let mut want_host_heal = false;
         let mut want_calendar_sync = false;
         let mut want_reminder_check = false;
+        let mut scheduled_pr_generation = RefreshGeneration::default();
+        let mut scheduled_calendar_generation = RefreshGeneration::default();
+        let mut scheduled_reminder_generation = RefreshGeneration::default();
+        let mut scheduled_ci_generation = RefreshGeneration::default();
+        let mut scheduled_loc_generation = RefreshGeneration::default();
+        let mut scheduled_usage_generation = RefreshGeneration::default();
+        let mut scheduled_weather_generation = RefreshGeneration::default();
         // Fold-actor results (batch fold + agent-driven drain): toast outcomes,
         // patch queue rows in place, route settled transitions to the inbox, and
         // re-hydrate so the advanced tip and cleared dots show immediately.
@@ -11744,18 +11752,27 @@ async fn event_loop<T: Terminal>(
             crate::handlers::pr_queue::drain_msgs(&mut prq_rx, &mut prq_ctx);
         }
         // Plugin runtime messages: apply verbs to the per-plugin runtimes and
-        // repaint the bars when a statusbar view changed (bars-only damage —
-        // `render_plan` keeps it off the panes). Raised alerts are recorded to
-        // the inbox off-loop by `flush_alerts`.
-        if crate::handlers::plugins::drain(
+        // map the aggregate plugin damage to the narrowest compositor channel.
+        // Raised alerts are recorded to the inbox off-loop by `flush_alerts`.
+        match crate::handlers::plugins::drain(
             &mut plugin_rx,
             &mut plugins_state,
             &mut model,
             plugins_host.as_ref(),
         ) {
-            model.plugin_segments = crate::handlers::plugins::statusbar_views(&plugins_state);
-            bars_dirty = true;
-            dirty = true;
+            crate::plugin_damage::PluginDamage::None => {}
+            crate::plugin_damage::PluginDamage::StatusbarContent => {
+                model.plugin_segments = crate::handlers::plugins::statusbar_views(&plugins_state);
+                statusbar_dirty = true;
+            }
+            crate::plugin_damage::PluginDamage::Structural => {
+                model.plugin_segments = crate::handlers::plugins::statusbar_views(&plugins_state);
+                // Contribution/lifecycle or placement changes must retain the
+                // existing broad chrome path so draw_statusbar recomputes all
+                // fitting and cluster placement safely.
+                bars_dirty = true;
+                dirty = true;
+            }
         }
         crate::handlers::plugins::flush_alerts(&mut plugins_state);
         dirty |= crate::worktree_lifecycle::apply_completions(
@@ -11766,6 +11783,48 @@ async fn event_loop<T: Terminal>(
         );
         while let Ok(kind) = refresh_rx.try_recv() {
             loop_perf.tick(crate::perf::WakeSource::Refresh);
+            let kind = match kind {
+                RefreshKind::Scheduled { generation, kind } => {
+                    if !schedule.is_current(generation) {
+                        if let RefreshKind::CalendarReminderResult { window, .. } = kind.as_ref() {
+                            // A stale reminder acknowledgment is still the
+                            // completion of the cursor's in-flight window.
+                            reminder_cursor.abandon(*window);
+                        }
+                        continue;
+                    }
+                    match kind.as_ref() {
+                        RefreshKind::Pr => scheduled_pr_generation.scheduled(generation),
+                        RefreshKind::Calendar => {
+                            scheduled_calendar_generation.scheduled(generation)
+                        }
+                        RefreshKind::CalendarReminders => {
+                            scheduled_reminder_generation.scheduled(generation)
+                        }
+                        RefreshKind::Ci { .. } => scheduled_ci_generation.scheduled(generation),
+                        RefreshKind::Loc { .. } => scheduled_loc_generation.scheduled(generation),
+                        RefreshKind::UsagePoll => scheduled_usage_generation.scheduled(generation),
+                        RefreshKind::WeatherPoll => {
+                            scheduled_weather_generation.scheduled(generation)
+                        }
+                        _ => {}
+                    }
+                    *kind
+                }
+                kind => {
+                    match &kind {
+                        RefreshKind::Pr => scheduled_pr_generation.untagged(),
+                        RefreshKind::Calendar => scheduled_calendar_generation.untagged(),
+                        RefreshKind::CalendarReminders => scheduled_reminder_generation.untagged(),
+                        RefreshKind::Ci { .. } => scheduled_ci_generation.untagged(),
+                        RefreshKind::Loc { .. } => scheduled_loc_generation.untagged(),
+                        RefreshKind::UsagePoll => scheduled_usage_generation.untagged(),
+                        RefreshKind::WeatherPoll => scheduled_weather_generation.untagged(),
+                        _ => {}
+                    }
+                    kind
+                }
+            };
             // While offline, skip the network-backed refresh backstops (the
             // local sidebar hydration still runs). Read once per drained kind.
             let skip_net = crate::connectivity_gate::should_skip_refresh(
@@ -11783,11 +11842,14 @@ async fn event_loop<T: Terminal>(
                 // gates per account instead.
                 RefreshKind::Calendar => want_calendar_sync = true,
                 RefreshKind::CalendarReminders => want_reminder_check = true,
+                RefreshKind::CalendarReminderResult { window, outcome } => {
+                    reminder_cursor.finish(window, outcome);
+                }
                 // A month's events landed: fill them into the open popup (and
                 // keep them for the next open). `apply_calendar` drops a
                 // payload the user has already navigated away from.
                 RefreshKind::CalendarMonth(p) => {
-                    panel_ui.docs.calendar.merge(p.month, &p.events);
+                    panel_ui.docs.calendar.merge(&p);
                     dirty |= crate::detail::apply_calendar(&mut bar_detail, *p);
                 }
                 RefreshKind::ClockTick => {
@@ -11883,13 +11945,16 @@ async fn event_loop<T: Terminal>(
                     dirty |=
                         crate::handlers::onboarding::apply_probe(&mut onboarding, *r, &mut model)
                 }
-                RefreshKind::UsagePoll => crate::actions::spawn_usage(
+                RefreshKind::UsagePoll => crate::actions::spawn_usage_with_generation(
                     &refresh_tx,
                     &waker,
                     current_config.usage.clone(),
                     false,
                     current_config.model_proxy.enabled,
                     current_config.model_proxy.budget.clone(),
+                    scheduled_usage_generation
+                        .generation()
+                        .map(|generation| (schedule.fence(), generation)),
                 ),
                 RefreshKind::Usage(p) => {
                     let p = *p;
@@ -11955,11 +12020,14 @@ async fn event_loop<T: Terminal>(
                 // trip and nothing else.
                 RefreshKind::WeatherPoll => {
                     if !skip_net {
-                        crate::hydrate_weather::spawn_poll(
+                        crate::hydrate_weather::spawn_poll_with_generation(
                             current_config.weather.clone(),
                             crate::calendar_docs::CalendarDocs::env_locale(),
                             refresh_tx.clone(),
                             waker.clone(),
+                            scheduled_weather_generation
+                                .generation()
+                                .map(|generation| (schedule.fence(), generation)),
                         );
                     }
                 }
@@ -12054,6 +12122,10 @@ async fn event_loop<T: Terminal>(
                     );
                     dirty = true;
                 }
+                // A scheduler envelope should have been admitted and
+                // unwrapped above. Handle a nested envelope explicitly so a
+                // future producer cannot silently bypass the admission fence.
+                RefreshKind::Scheduled { .. } => {}
             }
         }
         // Fast-forward the canonical main checkout if its ref advanced (throttled ~2s, off-loop).
@@ -12155,11 +12227,14 @@ async fn event_loop<T: Terminal>(
             switch_refresh_pending = false;
         }
         if want_pr_refresh {
-            spawn_pr_cache_refresh(
+            crate::hydrate::spawn_pr_cache_refresh_with_generation(
                 active_tab_path(&session),
                 current_config.issues.clone(),
                 current_config.disk.clone(),
                 Some(waker.clone()),
+                scheduled_pr_generation
+                    .generation()
+                    .map(|generation| (schedule.fence(), generation)),
             );
             // If the PR view is open, re-fetch it too (just-posted comment/review).
             crate::actions::refetch_pr_view(
@@ -12169,29 +12244,34 @@ async fn event_loop<T: Terminal>(
                 &pr_view_tx,
                 &waker,
                 &refresh_tx,
+                scheduled_pr_generation
+                    .generation()
+                    .map(|generation| (schedule.fence(), generation)),
             );
         }
         if want_calendar_sync {
-            crate::hydrate_calendar::spawn_periodic_sync(
+            crate::hydrate_calendar::spawn_periodic_sync_with_generation(
                 current_config.calendar.clone(),
                 refresh_tx.clone(),
                 waker.clone(),
+                scheduled_calendar_generation
+                    .generation()
+                    .map(|generation| (schedule.fence(), generation)),
             );
         }
         if want_reminder_check {
             // Off the loop: the check reads the DB, and blocking I/O on the
             // loop is the one thing the event model forbids outright.
-            //
-            // The window stamp advances HERE rather than inside the task, so
-            // the next window starts where this one ended even if the task is
-            // delayed — each reminder is then still evaluated exactly once.
-            let now_ms = chrono::Utc::now().timestamp_millis();
-            crate::hydrate_calendar::spawn_reminder_check(
+            crate::hydrate_calendar::spawn_reminder_check_with_generation(
+                &mut reminder_cursor,
+                chrono::Utc::now().timestamp_millis(),
                 current_config.calendar.clone(),
-                last_reminder_check_ms,
+                refresh_tx.clone(),
                 waker.clone(),
+                scheduled_reminder_generation
+                    .generation()
+                    .map(|generation| (schedule.fence(), generation)),
             );
-            last_reminder_check_ms = now_ms;
         }
         if want_issue_refresh {
             crate::hydrate_tracker::spawn_issue_cache_refresh(
@@ -12226,6 +12306,9 @@ async fn event_loop<T: Terminal>(
                 &waker,
                 ci_refresh_force,
                 &mut bar_detail,
+                scheduled_ci_generation
+                    .generation()
+                    .map(|generation| (schedule.fence(), generation)),
             );
         }
         // Both measurement scans carry their own inflight guard and background
@@ -12245,11 +12328,14 @@ async fn event_loop<T: Terminal>(
             );
         }
         if want_loc_refresh {
-            crate::measure::loc::spawn_scan(
+            crate::measure::loc::spawn_scan_with_generation(
                 current_config.loc.clone(),
                 Some(active_tab_path(&session)),
                 loc_refresh_watch,
                 Some(waker.clone()),
+                scheduled_loc_generation
+                    .generation()
+                    .map(|generation| (schedule.fence(), generation)),
             );
         }
         if want_auto_fetch {
@@ -12748,13 +12834,18 @@ async fn event_loop<T: Terminal>(
         //    the poll timeout below guarantees the trailing flush) and defers
         //    composition past a queued-but-undispatched keystroke so one frame
         //    carries its effect.
-        let have_damage =
-            dirty || full_repaint || !dirty_panes.is_empty() || bars_dirty || sidebar_dirty;
+        let have_damage = dirty
+            || full_repaint
+            || !dirty_panes.is_empty()
+            || bars_dirty
+            || statusbar_dirty
+            || sidebar_dirty;
         let mut defer_timeout: Option<std::time::Duration> = None;
         let pane_only_damage = !dirty
             && !full_repaint
             && switch_at.is_none()
             && !bars_dirty
+            && !statusbar_dirty
             && !sidebar_dirty
             && !dirty_panes.is_empty();
         let input_queued = pending_input.iter().any(|e| {
@@ -13024,6 +13115,7 @@ async fn event_loop<T: Terminal>(
                 switch: switch_at.is_some(),
                 panes: dirty_panes.clone(),
                 bars: bars_dirty,
+                statusbar: statusbar_dirty,
                 sidebar: sidebar_dirty,
             };
             let frame_plan = crate::render_plan::plan(&damage, &overlays);
@@ -13159,6 +13251,7 @@ async fn event_loop<T: Terminal>(
             } else if let crate::render_plan::RenderPlan::Incremental {
                 panes: ref ids,
                 bars,
+                statusbar,
                 sidebar,
             } = frame_plan
             {
@@ -13243,6 +13336,11 @@ async fn event_loop<T: Terminal>(
                     crate::chrome::draw_masthead(&mut scratch, &chrome, &model);
                     crate::chrome::draw_statusbar(&mut scratch, chrome.statusbar, &model);
                     pane_diff_rects.push(chrome.masthead);
+                    pane_diff_rects.push(chrome.statusbar);
+                } else if statusbar {
+                    // Plugin content with stable rendered geometry owns only
+                    // the statusbar row; do not redraw the masthead.
+                    crate::chrome::draw_statusbar(&mut scratch, chrome.statusbar, &model);
                     pane_diff_rects.push(chrome.statusbar);
                 }
                 if sidebar && let Some(sb) = chrome.sidebar {
@@ -13792,6 +13890,7 @@ async fn event_loop<T: Terminal>(
             // Pane/bars damage is now on screen; an untouched next wake renders nothing.
             dirty_panes.clear();
             bars_dirty = false;
+            statusbar_dirty = false;
             sidebar_dirty = false;
             if muse_ready {
                 crate::frame_write::emit_muse_ready_marker(buf, &mut pending_input, &writer);
@@ -15153,7 +15252,7 @@ async fn event_loop<T: Terminal>(
                                     // clipboard directly for terminals that
                                     // ignore OSC52. Belt and braces.
                                     writer.submit_oob(crate::copymode::osc52(&text));
-                                    crate::clipboard::copy(&text);
+                                    let copy_result = crate::clipboard::copy(&text);
                                     // Also land in the default register (persisted),
                                     // so `PasteRegister "` recalls it across restarts.
                                     store_yank(
@@ -15161,10 +15260,17 @@ async fn event_loop<T: Terminal>(
                                         thegn_core::registers::DEFAULT,
                                         text.clone(),
                                     );
-                                    toasts.success(
-                                        "Text copied to clipboard",
-                                        std::time::Instant::now(),
-                                    );
+                                    match copy_result {
+                                        Ok(()) => toasts.info(
+                                            "Copying text to clipboard…",
+                                            std::time::Instant::now(),
+                                        ),
+                                        Err(error) => toasts.info_ttl(
+                                            format!("Clipboard copy failed: {error}"),
+                                            std::time::Instant::now(),
+                                            std::time::Duration::from_secs(5),
+                                        ),
+                                    }
                                 }
                             }
                         }
@@ -18882,8 +18988,12 @@ async fn event_loop<T: Terminal>(
                                                 .and_then(|s| s.url.clone())
                                             {
                                                 writer.submit_oob(crate::copymode::osc52(&url));
-                                                crate::clipboard::copy(&url);
-                                                model.status = format!("Copied {url}");
+                                                model.status = match crate::clipboard::copy(&url) {
+                                                    Ok(()) => "Copying link to clipboard…".into(),
+                                                    Err(error) => {
+                                                        format!("Clipboard copy failed: {error}")
+                                                    }
+                                                };
                                             }
                                         }
                                         Section::Forward => {
@@ -18893,8 +19003,12 @@ async fn event_loop<T: Terminal>(
                                                     .map(str::to_owned)
                                             {
                                                 writer.submit_oob(crate::copymode::osc52(&url));
-                                                crate::clipboard::copy(&url);
-                                                model.status = format!("Copied {url}");
+                                                model.status = match crate::clipboard::copy(&url) {
+                                                    Ok(()) => "Copying link to clipboard…".into(),
+                                                    Err(error) => {
+                                                        format!("Clipboard copy failed: {error}")
+                                                    }
+                                                };
                                             }
                                         }
                                         Section::Ci => {
@@ -23006,20 +23120,23 @@ async fn event_loop<T: Terminal>(
                                     let text = crate::copymode::extract(emu, &sel);
                                     if !text.trim().is_empty() {
                                         writer.submit_oob(crate::copymode::osc52(&text));
-                                        crate::clipboard::copy(&text);
+                                        let copy_result = crate::clipboard::copy(&text);
                                         store_yank(
                                             &mut registers,
                                             thegn_core::registers::DEFAULT,
                                             text.clone(),
                                         );
-                                        toasts.success(
-                                            if mouse_sel.is_some() {
-                                                "Selection copied to clipboard"
-                                            } else {
-                                                "Pane copied to clipboard"
-                                            },
-                                            std::time::Instant::now(),
-                                        );
+                                        match copy_result {
+                                            Ok(()) => toasts.info(
+                                                "Copying text to clipboard…",
+                                                std::time::Instant::now(),
+                                            ),
+                                            Err(error) => toasts.info_ttl(
+                                                format!("Clipboard copy failed: {error}"),
+                                                std::time::Instant::now(),
+                                                std::time::Duration::from_secs(5),
+                                            ),
+                                        }
                                     }
                                 }
                             }

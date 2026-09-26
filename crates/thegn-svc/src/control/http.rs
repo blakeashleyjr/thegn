@@ -498,8 +498,8 @@ The code is read from this page's URL and is never sent anywhere but the pairing
 
 // ── pairing ─────────────────────────────────────────────────────────────────
 
-#[derive(Deserialize)]
-pub(super) struct PairBody {
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct PairBody {
     code: String,
     #[serde(default)]
     label: String,
@@ -554,8 +554,8 @@ pub(super) async fn pair(
     }
 }
 
-#[derive(Deserialize)]
-pub(super) struct IssueBody {
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct IssueBody {
     #[serde(default = "default_scope")]
     scope: String,
     #[serde(default)]
@@ -839,8 +839,8 @@ pub(super) async fn snapshot(
     }
 }
 
-#[derive(Deserialize)]
-pub(super) struct InputBody {
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct InputBody {
     /// Raw bytes, base64. Exactly one of `b64`/`text` must be present.
     b64: Option<String>,
     text: Option<String>,
@@ -887,8 +887,8 @@ pub(super) async fn send_input(
     }
 }
 
-#[derive(Deserialize)]
-pub(super) struct ResizeBody {
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct ResizeBody {
     rows: u16,
     cols: u16,
 }
@@ -931,8 +931,8 @@ fn default_shell() -> String {
     std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string())
 }
 
-#[derive(Deserialize)]
-pub(super) struct WaitBody {
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct WaitBody {
     condition: WaitCondition,
     /// Milliseconds before giving up (`matched=false`). Omit to wait forever.
     #[serde(default)]
@@ -958,8 +958,8 @@ pub(super) async fn wait(
     }
 }
 
-#[derive(Deserialize)]
-pub(super) struct SplitBody {
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct SplitBody {
     #[serde(default)]
     dir: SplitDir,
     /// Program for the new pane; a login shell when empty.
@@ -1019,8 +1019,8 @@ pub(super) async fn split(
     }
 }
 
-#[derive(Deserialize)]
-pub(super) struct DetachBody {
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct DetachBody {
     client_id: String,
 }
 
@@ -1055,8 +1055,8 @@ pub(super) async fn kill(
 
 // ── worktrees / browser / git ───────────────────────────────────────────────
 
-#[derive(Deserialize)]
-pub(super) struct OpenWorktreeBody {
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct OpenWorktreeBody {
     repo: String,
     branch: Option<String>,
 }
@@ -1153,8 +1153,8 @@ pub(super) async fn create_worktree(
 /// Query params for `issues.list` — a subset of `IssueFilter` a supervisor
 /// filters a batch by. Statuses is a comma-separated list of the snake_case
 /// status ids (`todo,in_progress`); unknown names are dropped.
-#[derive(Deserialize)]
-pub(super) struct IssuesQuery {
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct IssuesQuery {
     #[serde(default)]
     status: Option<String>,
     #[serde(default)]
@@ -1240,8 +1240,8 @@ pub(super) async fn issue_update(
     }
 }
 
-#[derive(Deserialize)]
-pub(super) struct CommentBody {
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct CommentBody {
     body: String,
 }
 
@@ -1292,8 +1292,8 @@ pub(super) async fn dispatch_put(
     }
 }
 
-#[derive(Deserialize)]
-pub(super) struct DispatchStatusBody {
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct DispatchStatusBody {
     /// A member of the closed dispatch-status set (snake_case).
     status: String,
 }
@@ -1314,8 +1314,8 @@ pub(super) async fn dispatch_set_status(
     }
 }
 
-#[derive(Deserialize)]
-pub(super) struct WorktreeQuery {
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct WorktreeQuery {
     worktree: String,
 }
 
@@ -1333,8 +1333,8 @@ pub(super) async fn git_status(
     }
 }
 
-#[derive(Deserialize)]
-pub(super) struct StageBody {
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct StageBody {
     worktree: String,
     paths: Vec<String>,
 }
@@ -1353,8 +1353,8 @@ pub(super) async fn git_stage(
     }
 }
 
-#[derive(Deserialize)]
-pub(super) struct CommitBody {
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct CommitBody {
     worktree: String,
     message: String,
 }
@@ -1376,8 +1376,8 @@ pub(super) async fn git_commit(
 // ── merge queue ───────────────────────────────────────────────────────────────
 
 /// POST body for the merge add/clear verbs — scoped to one worktree's repo.
-#[derive(Deserialize)]
-pub(super) struct MergeBody {
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct MergeBody {
     worktree: String,
 }
 
@@ -1398,8 +1398,8 @@ pub(super) async fn merge_list(
 // ── calendar ──────────────────────────────────────────────────────────────────
 
 /// `?from=2026-08-01&to=2026-08-31` — inclusive ISO dates.
-#[derive(Deserialize)]
-pub(super) struct CalendarQuery {
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct CalendarQuery {
     from: String,
     to: String,
 }
@@ -1407,7 +1407,7 @@ pub(super) struct CalendarQuery {
 /// The ingest body: the same `CalEvent` shape a `command` plugin emits, so one
 /// contract serves both a polled plugin and a pushing daemon.
 #[derive(Deserialize)]
-pub(super) struct CalendarIngestBody {
+pub struct CalendarIngestBody {
     events: Vec<thegn_core::calendar::CalEvent>,
 }
 
@@ -1493,8 +1493,8 @@ pub(super) async fn pr_status(State(state): State<ControlState>, headers: Header
     }
 }
 
-#[derive(Deserialize)]
-pub(super) struct AgentSessionsQuery {
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct AgentSessionsQuery {
     #[serde(default)]
     worktree: Option<String>,
     #[serde(default)]
@@ -1641,8 +1641,8 @@ fn hello_frame(state: &ControlState, ctx: &AuthCtx) -> EventFrame {
 
 /// The broadcast event feed over WebSocket: one binary message per encoded
 /// [`EventFrame`]. Read scope.
-#[derive(Debug, Deserialize, Default)]
-pub(super) struct EventsQuery {
+#[derive(Debug, Deserialize, Default, schemars::JsonSchema)]
+pub struct EventsQuery {
     /// Comma-separated [`thegn_core::control_wire::OBSERVER_KINDS`].
     kinds: Option<String>,
     session: Option<String>,
@@ -1948,8 +1948,8 @@ mod control_events {
     }
 }
 
-#[derive(Deserialize)]
-pub(super) struct AttachQuery {
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct AttachQuery {
     client_id: String,
     #[serde(default)]
     observer: bool,

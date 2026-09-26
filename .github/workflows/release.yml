@@ -75,8 +75,8 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: taiki-e/create-gh-release-action@v1
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: taiki-e/create-gh-release-action@eba8ea96c86cca8a37f1b56e94b4d13301fba651 # v1.11.0
         with:
           # Prerelease tags (e.g. v0.1.0-alpha.1) are auto-marked prerelease.
           draft: true
@@ -105,7 +105,7 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           # On workflow_dispatch, build the tag itself — not the dispatched
           # branch tip. Empty string = default behavior on tag push.
@@ -114,7 +114,7 @@ jobs:
         if: endsWith(matrix.target, '-musl')
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - id: upload
-        uses: taiki-e/upload-rust-binary-action@v1
+        uses: taiki-e/upload-rust-binary-action@f0d45ae91ee7b8ee928de7a9d04d893a08bcbec6 # v1.30.2
         with:
           bin: thegn
           target: ${{ matrix.target }}
@@ -135,7 +135,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: Attest archive provenance
-        uses: actions/attest-build-provenance@v4
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           # `tar` is the exact local archive uploaded by the preceding action;
           # checksums remain ordinary release assets, not signing keys.
@@ -159,14 +159,18 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           # On workflow_dispatch, build the tag itself — not the dispatched
           # branch tip. Empty string = default behavior on tag push.
           ref: ${{ github.event.inputs.tag && format('refs/tags/{0}', github.event.inputs.tag) || '' }}
       # Same toolchain pin the ci.yml jobs use, rather than whatever rustup
       # version the runner image happens to ship.
-      - uses: dtolnay/rust-toolchain@stable
+      # Pinned by SHA, so the toolchain can no longer be inferred from the ref
+      # name (`@stable`) and must be named explicitly.
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
       - name: Build thegn
         run: cargo build --release --locked -p thegn-host --bin thegn
       - name: Generate completions
@@ -230,7 +234,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ github.event.inputs.tag && format('refs/tags/{0}', github.event.inputs.tag) || '' }}
       - uses: ./.github/actions/ci-setup
@@ -351,7 +355,7 @@ jobs:
             echo "::error::External publication must be dispatched from the main branch."
             exit 1
           fi
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: refs/tags/${{ inputs.tag }}
       - uses: ./.github/actions/ci-setup

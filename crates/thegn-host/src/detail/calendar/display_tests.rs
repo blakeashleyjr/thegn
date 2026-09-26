@@ -1,4 +1,5 @@
 use super::*;
+use std::sync::Arc;
 use termwiz::surface::Surface;
 use thegn_core::calendar::EventTime;
 
@@ -38,13 +39,15 @@ fn hostile_calendar_provider_values_stay_inside_popup_and_raw_values_survive() {
             today: date,
             pane: CalPane::Agenda,
             agenda_sel: 0,
-            events: BTreeMap::from([(date, vec![event])]),
+            events: BTreeMap::from([(date, vec![Arc::new(event)])]),
             loaded: BTreeSet::from([(2026, 9)]),
+            errors: BTreeMap::new(),
             pending: None,
             clocks: vec![ResolvedClock {
                 label: raw.clone(),
                 zone: Tz::UTC,
-                format: String::new(),
+                format: ClockFormat::H24,
+                show_date: false,
                 is_home: true,
             }],
             now: date.and_hms_opt(12, 0, 0).unwrap().and_utc(),
@@ -91,7 +94,7 @@ fn hostile_calendar_provider_values_stay_inside_popup_and_raw_values_survive() {
                 }
             }
         }
-        assert_eq!(&detail.st.events[&date][0], &original);
+        assert_eq!(&*detail.st.events[&date][0], &original);
     }
 }
 
@@ -101,7 +104,8 @@ fn calendar_width_uses_the_same_sanitized_clock_label_as_drawing() {
     docs.clocks.push(ResolvedClock {
         label: format!("\r\n{}", "界".repeat(10000)),
         zone: Tz::UTC,
-        format: String::new(),
+        format: ClockFormat::H24,
+        show_date: false,
         is_home: false,
     });
     assert_eq!(preferred_cols(&docs, 0), 94);
@@ -113,7 +117,8 @@ fn calendar_width_and_clock_readings_share_whitespace_fallback() {
     docs.clocks.push(ResolvedClock {
         label: "\n\r ".into(),
         zone: "America/Argentina/ComodRivadavia".parse().unwrap(),
-        format: String::new(),
+        format: ClockFormat::H24,
+        show_date: false,
         is_home: false,
     });
     let readings = thegn_core::calendar::read_clocks(&docs.clocks, chrono::Utc::now(), Tz::UTC);
@@ -154,4 +159,283 @@ fn calendar_display_sites_keep_the_safe_projection() {
     }
     let layout = include_str!("mod.rs");
     assert!(layout.contains("Field::ClockLabel"));
+}
+
+#[test]
+fn world_clock_rows_honor_mixed_formats_dates_and_safe_narrow_output() {
+    let date = NaiveDate::from_ymd_opt(2026, 8, 21).unwrap();
+    let mut st = status_state(BTreeMap::new(), true, None);
+    st.ui.show_agenda = false;
+    st.ui.has_sources = false;
+    st.now = date.and_hms_opt(22, 0, 0).unwrap().and_utc();
+    st.home = Tz::UTC;
+    st.clocks = vec![
+        ResolvedClock {
+            label: "home".into(),
+            zone: Tz::UTC,
+            format: ClockFormat::H24,
+            show_date: false,
+            is_home: true,
+        },
+        ResolvedClock {
+            label: "tokyo".into(),
+            zone: Tz::Asia__Tokyo,
+            format: ClockFormat::Custom("%I:%M %p".into()),
+            show_date: true,
+            is_home: false,
+        },
+        ResolvedClock {
+            label: "new york".into(),
+            zone: Tz::America__New_York,
+            format: ClockFormat::H24,
+            show_date: true,
+            is_home: false,
+        },
+        ResolvedClock {
+            label: "kathmandu".into(),
+            zone: Tz::Asia__Kathmandu,
+            format: ClockFormat::Custom("%H:%M%n%t".into()),
+            show_date: false,
+            is_home: false,
+        },
+    ];
+    let detail = CalendarDetail { st };
+    let inner = Rect {
+        x: 2,
+        y: 1,
+        cols: 52,
+        rows: 20,
+    };
+    let mut surface = Surface::new(80, 30);
+    render::render_calendar(&mut surface, inner, 0, &detail);
+    let painted_rows: Vec<String> = surface
+        .screen_cells()
+        .iter()
+        .map(|row| row.iter().map(|c| c.str().to_string()).collect::<String>())
+        .collect();
+    let painted: String = painted_rows.join("\n");
+    assert!(painted.contains("22:00"), "{painted}");
+    // 2026-08-21 22:00 UTC is 2026-08-22 07:00 in Tokyo (UTC+9), so this row's
+    // `%I:%M %p` override renders AM. It also proves the per-row custom format
+    // beat the global 24-hour setting that the `home` row above still uses.
+    assert!(painted.contains("07:00 AM"), "{painted}");
+    assert!(painted.contains("2026-08-22"), "{painted}");
+    assert!(
+        painted.contains("2026-08-21"),
+        "same-day show_date: {painted}"
+    );
+    assert!(
+        painted.contains("+1d"),
+        "hidden dates retain the delta: {painted}"
+    );
+    // The `kathmandu` row's format is `%H:%M%n%t`, whose `%n`/`%t` expand to a
+    // newline and a tab. They must not survive into the surface. Check the
+    // rows individually: `painted` is joined with '\n', so asserting on it
+    // would always trip on the separator rather than on rendered content.
+    for (y, row) in painted_rows.iter().enumerate() {
+        assert!(
+            !row.chars().any(char::is_control),
+            "control char in row {y}: {row:?}"
+        );
+    }
+    for row in surface.screen_cells() {
+        for (x, cell) in row.iter().enumerate() {
+            if x < inner.x || x >= inner.x + inner.cols {
+                assert!(
+                    cell.str().trim().is_empty(),
+                    "outside x={x}: {:?}",
+                    cell.str()
+                );
+            }
+        }
+    }
+
+    // A genuinely narrow popup may clip columns, but it must still keep all
+    // painted cells inside the requested rectangle and free of controls.
+    let narrow = Rect {
+        x: 3,
+        y: 2,
+        cols: 20,
+        rows: 10,
+    };
+    let mut narrow_surface = Surface::new(40, 20);
+    render::render_calendar(&mut narrow_surface, narrow, 0, &detail);
+    for row in narrow_surface.screen_cells() {
+        for (x, cell) in row.iter().enumerate() {
+            assert!(!cell.str().chars().any(char::is_control));
+            if x < narrow.x || x >= narrow.x + narrow.cols {
+                assert!(
+                    cell.str().trim().is_empty(),
+                    "outside x={x}: {:?}",
+                    cell.str()
+                );
+            }
+        }
+    }
+}
+
+fn status_state(
+    events: BTreeMap<NaiveDate, Vec<Arc<CalEvent>>>,
+    loaded: bool,
+    error: Option<crate::calendar_docs::CalendarViewError>,
+) -> CalState {
+    let date = NaiveDate::from_ymd_opt(2026, 9, 13).unwrap();
+    CalState {
+        cursor: CalCursor::new(date),
+        today: date,
+        pane: CalPane::Grid,
+        agenda_sel: 0,
+        events,
+        loaded: if loaded {
+            BTreeSet::from([(2026, 9)])
+        } else {
+            BTreeSet::new()
+        },
+        errors: error.map(|e| ((2026, 9), e)).into_iter().collect(),
+        pending: None,
+        clocks: Vec::new(),
+        now: date.and_hms_opt(12, 0, 0).unwrap().and_utc(),
+        home: Tz::UTC,
+        ui: CalUiCfg {
+            has_sources: true,
+            ..Default::default()
+        },
+        weather: None,
+        wx: WxUiCfg::default(),
+    }
+}
+
+fn month_status_of(st: &CalState) -> Option<String> {
+    let sections = render::sections_of(st);
+    let Some(crate::detail::Section::MonthGrid(grid)) = sections.first() else {
+        panic!("the month grid is always the first section")
+    };
+    grid.status.clone()
+}
+
+fn agenda_note_of(st: &CalState) -> String {
+    let sections = render::sections_of(st);
+    let Some(crate::detail::Section::Heading { note, .. }) = sections.get(2) else {
+        panic!("calendar agenda heading missing")
+    };
+    note.clone().expect("agenda heading carries a note")
+}
+
+#[test]
+fn calendar_expansion_failure_is_visible_as_unavailable() {
+    use crate::calendar_docs::CalendarViewError;
+    use thegn_core::calendar::{ExpansionError, ExpansionLimit};
+    let failed =
+        CalendarViewError::Expansion(ExpansionError::Budget(ExpansionLimit::BucketEntries));
+    let date = NaiveDate::from_ymd_opt(2026, 9, 13).unwrap();
+    let event = Arc::new(CalEvent::new(
+        "e",
+        "E",
+        EventTime::Date { date },
+        EventTime::Date {
+            date: date.succ_opt().unwrap(),
+        },
+    ));
+
+    // A complete empty month is the ONLY state that says "no events".
+    assert_eq!(
+        agenda_note_of(&status_state(BTreeMap::new(), true, None)),
+        "no events"
+    );
+    // A first-load failure is unavailable, never a successful empty month.
+    assert_eq!(
+        agenda_note_of(&status_state(BTreeMap::new(), false, Some(failed))),
+        "unavailable"
+    );
+    // A failed refresh keeps the last good events and says they are stale.
+    let kept = BTreeMap::from([(date, vec![Arc::clone(&event)])]);
+    let note = agenda_note_of(&status_state(kept.clone(), true, Some(failed)));
+    assert!(
+        note.starts_with("1 event ") && note.ends_with(" stale"),
+        "{note}"
+    );
+    // Unreadable rows: the readable events show, marked incomplete.
+    let note = agenda_note_of(&status_state(
+        kept,
+        true,
+        Some(CalendarViewError::MalformedCache),
+    ));
+    assert!(note.ends_with(" incomplete"), "{note}");
+}
+
+#[test]
+fn a_failed_month_is_visible_without_the_agenda() {
+    // `show_agenda = false` never builds the agenda note, so the grid header
+    // has to carry the state — or a first-load failure paints as an ordinary
+    // empty month and a stale one paints as current.
+    use crate::calendar_docs::CalendarViewError;
+    use thegn_core::calendar::{ExpansionError, ExpansionLimit};
+    let failed =
+        CalendarViewError::Expansion(ExpansionError::Budget(ExpansionLimit::RetainedBytes));
+    let date = NaiveDate::from_ymd_opt(2026, 9, 13).unwrap();
+    let events = BTreeMap::from([(
+        date,
+        vec![Arc::new(CalEvent::new(
+            "e",
+            "E",
+            EventTime::Date { date },
+            EventTime::Date {
+                date: date.succ_opt().unwrap(),
+            },
+        ))],
+    )]);
+    let hide_agenda = |mut st: CalState| {
+        st.ui.show_agenda = false;
+        st
+    };
+
+    let healthy = hide_agenda(status_state(events.clone(), true, None));
+    assert_eq!(month_status_of(&healthy), None, "a good month says nothing");
+    assert_eq!(
+        month_status_of(&hide_agenda(status_state(
+            BTreeMap::new(),
+            false,
+            Some(failed)
+        )))
+        .as_deref(),
+        Some("unavailable")
+    );
+    assert_eq!(
+        month_status_of(&hide_agenda(status_state(
+            events.clone(),
+            true,
+            Some(failed)
+        )))
+        .as_deref(),
+        Some("stale")
+    );
+    assert_eq!(
+        month_status_of(&hide_agenda(status_state(
+            events,
+            true,
+            Some(CalendarViewError::MalformedCache)
+        )))
+        .as_deref(),
+        Some("incomplete")
+    );
+    // And it reaches the surface: the header draws the status where the today
+    // chip would be.
+    let mut surface = Surface::new(100, 40);
+    let detail = CalendarDetail {
+        st: hide_agenda(status_state(BTreeMap::new(), false, Some(failed))),
+    };
+    let inner = Rect {
+        x: 2,
+        y: 1,
+        cols: 44,
+        rows: 20,
+    };
+    render::render_calendar(&mut surface, inner, 0, &detail);
+    let painted: String = surface
+        .screen_cells()
+        .iter()
+        .map(|row| row.iter().map(|c| c.str().to_string()).collect::<String>())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(painted.contains("unavailable"), "{painted}");
 }

@@ -47,7 +47,7 @@ pub struct CalDavBackend {
 }
 
 impl CalDavBackend {
-    pub fn new(a: &CalendarAccount, admission: AccountAdmission) -> Self {
+    pub(crate) fn new(a: &CalendarAccount, admission: AccountAdmission) -> Self {
         let configured = !a.url.trim().is_empty();
         let (http, init_error) = if !configured {
             (None, None)

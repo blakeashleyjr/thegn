@@ -818,7 +818,10 @@ check "the landed row survives as the grace-period clock" \
 # week, and an expiry that fires early is the bug the grace period exists to stop.
 check "sweep leaves a worktree that is not yet due" \
   "'$SZ' merge sweep | grep -q 'Nothing to sweep' && [[ -d '$MP' ]]"
-# --force ignores the clock, never the protection for ignored work.
+# --force ignores the clock, never real user work. Ignored build state IS
+# collected once the period is up (THE-686): the grace period exists *because*
+# the directory holds gitignored state, so refusing forever made
+# merged_ttl_secs and on_landed="expire" dead configuration.
 # This fixture is local-only. Do not let the VPN config tested above or OCI
 # tools installed on the developer's machine imply unresolved runtime custody.
 mkdir -p "$TMP/sweep-bin"
@@ -843,15 +846,23 @@ sweep_has() {
     return 1
   fi
 }
+# Untracked, NON-ignored content is real work: never swept, with or without
+# --force. This is the protection that matters, and it was previously untested —
+# the old case asserted it for ignored files instead, which is what THE-686
+# changes.
+printf 'keep-me\n' >"$MP/.smoke-sweep-untracked"
+check "sweep --force preserves untracked non-ignored work" \
+  "sweep_has 'edited since landing' --force && [[ -d '$MP' ]] \
+     && [[ \$(cat '$MP/.smoke-sweep-untracked') == keep-me ]]"
+rm -- "$MP/.smoke-sweep-untracked"
+# Ignored-only build state is discarded, and the report says so, so an operator
+# can see which worktrees lost a warm target/.
 printf '/.smoke-sweep-ignored\n' >>"$(git -C "$MP" rev-parse --git-path info/exclude)"
-printf 'keep-me\n' >"$MP/.smoke-sweep-ignored"
+printf 'build-output\n' >"$MP/.smoke-sweep-ignored"
 check "sweep fixture contains ignored work" \
   "git -C '$MP' check-ignore -q .smoke-sweep-ignored"
-check "sweep --force preserves ignored work" \
-  "sweep_has 'ignored work' --force && [[ \$(cat '$MP/.smoke-sweep-ignored') == keep-me ]]"
-rm -- "$MP/.smoke-sweep-ignored"
-check "sweep --force removes the merged worktree" \
-  "sweep_has swept --force && [[ ! -d '$MP' ]]"
+check "sweep --force discards ignored build state and removes the worktree" \
+  "sweep_has 'discarded build state' --force && [[ ! -d '$MP' ]]"
 # Physical collection deliberately retains the branch and an explicit cleanup
 # hold (THE-596); branch deletion cannot atomically prove the ref type yet.
 check "sweep --force retains the merged branch for explicit cleanup" \

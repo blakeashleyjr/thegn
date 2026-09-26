@@ -119,7 +119,7 @@ pub fn run(cfg: &Config, worktree: Option<String>) -> Result<()> {
             }
             crate::integrate::report_resyncs(&target, &resyncs);
         }
-        AttemptOutcome::UpToDate => {
+        AttemptOutcome::UpToDate { .. } => {
             let degraded = file_landed(&branch);
             outln!("{branch} already in {target}.");
             if let Some(detail) = degraded {

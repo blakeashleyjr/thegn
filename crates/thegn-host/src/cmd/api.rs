@@ -22,6 +22,11 @@ use thegn_core::config::Config;
 use thegn_core::outln;
 use thegn_svc::control::routes::api_call_for;
 
+/// The machine-readable coverage document is a local diagnostic contract,
+/// separate from the control wire schema. Increment it when its JSON shape
+/// changes incompatibly.
+pub(crate) const COVERAGE_SCHEMA_VERSION: u32 = 1;
+
 /// The committed wire schema — embedded so `schema` needs no checkout.
 const CONTROL_SCHEMA: &str = include_str!("../../../../docs/api/control-v1.json");
 
@@ -86,84 +91,99 @@ pub(crate) fn surface_ledgers() -> Vec<thegn_core::capability::SurfaceLedger> {
             &thegn_svc::control::routes::implemented_caps(),
         ),
         ledger(Surface::Grpc, thegn_svc::control::grpc::GRPC_CAPS),
-        ledger(Surface::Cli, &cli_control_caps()),
+        ledger(Surface::Cli, &super::session::cli_control_caps()),
         ledger(Surface::Mcp, thegn_core::mcp::state::MCP_STATE_CAPS),
         ledger(Surface::Plugin, &plugin_impl),
     ]
 }
 
-/// Every capability id the `thegn` CLI drives through the control API — the
-/// non-streaming rows of the `API_CALLS` route table (`thegn api call` reaches
-/// them generically), `sessions.attach` (the dedicated `thegn attach` verb),
-/// and local dispatch roster verbs which have no control route. Mirrors the
-/// catalog's CLI projection in `cmd::session::cli_control_caps`.
-fn cli_control_caps() -> Vec<&'static str> {
-    let mut v: Vec<&'static str> = thegn_svc::control::routes::API_CALLS
-        .iter()
-        .filter(|(_, method, _)| *method != "WS")
-        .map(|(cap, _, _)| *cap)
-        .collect();
-    v.push("sessions.attach");
-    v.push("events.subscribe"); // thegn events tail
-    v.extend(["dispatches.report", "dispatches.note", "dispatches.status"]);
-    v.sort_unstable();
-    v.dedup();
-    v
+/// One generated coverage snapshot shared by the API and doctor reports.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CoverageReport {
+    pub(crate) revision: String,
+    pub(crate) schema_version: u32,
+    pub(crate) surfaces: Vec<thegn_core::capability::SurfaceLedger>,
+}
+
+pub(crate) fn coverage_report() -> CoverageReport {
+    CoverageReport {
+        revision: crate::diag::build_string().unwrap_or_else(|| "unavailable".to_string()),
+        schema_version: COVERAGE_SCHEMA_VERSION,
+        surfaces: surface_ledgers(),
+    }
+}
+
+fn surface_json(ledger: &thegn_core::capability::SurfaceLedger) -> serde_json::Value {
+    serde_json::json!({
+        "surface": ledger.surface.as_str(),
+        "implemented": ledger.implemented,
+        "stub": ledger.stub,
+        "excused": ledger.excused,
+        "declared": ledger.declared,
+        "gaps": ledger.gaps.iter().map(|(id, why)| {
+            serde_json::json!({ "capability": id, "reason": why })
+        }).collect::<Vec<_>>(),
+    })
+}
+
+pub(crate) fn coverage_json(report: &CoverageReport) -> serde_json::Value {
+    serde_json::json!({
+        "revision": &report.revision,
+        "schema_version": report.schema_version,
+        "surfaces": report.surfaces.iter().map(surface_json).collect::<Vec<_>>(),
+    })
+}
+
+/// Render the human document from the same snapshot used by [`coverage_json`].
+pub(crate) fn coverage_text(report: &CoverageReport) -> String {
+    use std::fmt::Write as _;
+
+    let mut text = String::new();
+    writeln!(text, "revision: {}", report.revision).expect("writing a String cannot fail");
+    writeln!(text, "schema_version: {}", report.schema_version)
+        .expect("writing a String cannot fail");
+    writeln!(
+        text,
+        "{:<8} {:>11} {:>4} {:>7} {:>8}",
+        "surface", "implemented", "stub", "excused", "declared"
+    )
+    .expect("writing a String cannot fail");
+    for ledger in &report.surfaces {
+        writeln!(
+            text,
+            "{:<8} {:>11} {:>4} {:>7} {:>8}",
+            ledger.surface.as_str(),
+            ledger.implemented,
+            ledger.stub,
+            ledger.excused,
+            ledger.declared,
+        )
+        .expect("writing a String cannot fail");
+    }
+    let mut any = false;
+    for ledger in &report.surfaces {
+        for (id, why) in &ledger.gaps {
+            if !any {
+                text.push_str("\nexcused gaps (temporary debt):\n");
+                any = true;
+            }
+            writeln!(text, "  {:<8} {:<18} {}", ledger.surface.as_str(), id, why)
+                .expect("writing a String cannot fail");
+        }
+    }
+    if !any {
+        text.push_str("\nno excused gaps — the catalog is fully covered\n");
+    }
+    text
 }
 
 /// The per-surface coverage ledger — what `thegn api coverage` prints.
 pub(crate) fn coverage(json: bool) -> Result<()> {
-    let ledgers = surface_ledgers();
+    let report = coverage_report();
     if json {
-        let rows: Vec<serde_json::Value> = ledgers
-            .iter()
-            .map(|l| {
-                serde_json::json!({
-                    "surface": l.surface.as_str(),
-                    "implemented": l.implemented,
-                    "stub": l.stub,
-                    "excused": l.excused,
-                    "declared": l.declared,
-                    "gaps": l.gaps.iter().map(|(id, why)| {
-                        serde_json::json!({ "capability": id, "reason": why })
-                    }).collect::<Vec<_>>(),
-                })
-            })
-            .collect();
-        return super::emit_json(&serde_json::json!({ "surfaces": rows }));
+        return super::emit_json(&coverage_json(&report));
     }
-    outln!(
-        "{:<8} {:>11} {:>4} {:>7} {:>8}",
-        "surface",
-        "implemented",
-        "stub",
-        "excused",
-        "declared"
-    );
-    for l in &ledgers {
-        outln!(
-            "{:<8} {:>11} {:>4} {:>7} {:>8}",
-            l.surface.as_str(),
-            l.implemented,
-            l.stub,
-            l.excused,
-            l.declared
-        );
-    }
-    // The excused (capability, surface) cells, so the debt is legible.
-    let mut any = false;
-    for l in &ledgers {
-        for (id, why) in &l.gaps {
-            if !any {
-                outln!("\nexcused gaps (temporary debt):");
-                any = true;
-            }
-            outln!("  {:<8} {:<18} {}", l.surface.as_str(), id, why);
-        }
-    }
-    if !any {
-        outln!("\nno excused gaps — the catalog is fully covered");
-    }
+    outln!("{}", coverage_text(&report).trim_end());
     Ok(())
 }
 
@@ -278,7 +298,38 @@ mod tests {
 
     #[test]
     fn cli_ledger_includes_the_event_tail_projection() {
-        assert!(cli_control_caps().contains(&"events.subscribe"));
+        assert!(super::super::session::cli_control_caps().contains(&"events.subscribe"));
+    }
+
+    #[test]
+    fn coverage_report_uses_the_session_registry_and_one_document_shape() {
+        let report = coverage_report();
+        let expected = thegn_core::capability::ledger(
+            thegn_core::capability::Surface::Cli,
+            &super::super::session::cli_control_caps(),
+        );
+        let actual = report
+            .surfaces
+            .iter()
+            .find(|ledger| ledger.surface == thegn_core::capability::Surface::Cli)
+            .expect("coverage report includes the CLI surface");
+        assert_eq!(actual, &expected);
+
+        let json = coverage_json(&report);
+        assert!(
+            json["revision"]
+                .as_str()
+                .is_some_and(|revision| !revision.is_empty())
+        );
+        assert_eq!(
+            json["schema_version"].as_u64(),
+            Some(COVERAGE_SCHEMA_VERSION as u64)
+        );
+        assert!(coverage_text(&report).starts_with("revision: "));
+        assert!(
+            coverage_text(&report)
+                .contains(&format!("schema_version: {}", COVERAGE_SCHEMA_VERSION))
+        );
     }
 
     #[test]

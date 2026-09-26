@@ -270,7 +270,7 @@ fn automatic_prewarm_rejects_host_reintroduced_by_remembered_agent_relaunch() {
                     false,
                 );
                 assert!(
-                    specs.as_ref().ok().expect("resolved launch specs")[0]
+                    specs.as_ref().expect("resolved launch specs")[0]
                         .1
                         .argv
                         .join(" ")
@@ -278,9 +278,7 @@ fn automatic_prewarm_rejects_host_reintroduced_by_remembered_agent_relaunch() {
                     "the real prewarm batch includes the remembered-agent substitution"
                 );
                 assert_eq!(
-                    specs.as_ref().ok().expect("resolved launch specs")[0]
-                        .1
-                        .backend,
+                    specs.as_ref().expect("resolved launch specs")[0].1.backend,
                     "host"
                 );
             },
@@ -471,6 +469,7 @@ fn automatic_prewarm_drains_host_result_without_spawning_or_evaluating() {
                 target_leaves: vec![7],
                 origin: crate::loading::SpecOrigin::Prewarm,
                 specs,
+                relaunch: crate::handlers::worktree_launch::RelaunchOutcome::NotAttempted,
                 attach: Vec::new(),
             })
             .unwrap();

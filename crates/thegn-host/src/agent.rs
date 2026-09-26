@@ -2436,19 +2436,34 @@ fn store_root_of(p: &str) -> Option<String> {
     (!entry.is_empty()).then(|| format!("/nix/store/{entry}"))
 }
 
+/// Probe a shell/tool token without the old `sh -c 'command -v …'` wrapper.
+/// Absolute paths must be checked directly: `which_path` requires PATH to be
+/// set, while `command -v /absolute/path` does not. For bare names,
+/// `which_path` deliberately keeps its existing semantics — unlike shell
+/// `command -v`, it does not check executable bits and returns no result when
+/// PATH is unset.
+fn path_for_shell_token(token: &str) -> Option<String> {
+    let path = Path::new(token);
+    if path.is_absolute() {
+        return path.is_file().then(|| token.to_owned());
+    }
+    thegn_core::util::which_path(token)
+}
+
 /// Resolve the host `/nix/store` roots for the user's interactive shell + the
 /// ubiquitous prompt tools, so a host-parity p2p push carries the binaries
 /// themselves (not just what the rc sources) and they can be `nix profile
-/// install`ed by name in the sandbox. Host-only + best-effort (`command -v` →
+/// install`ed by name in the sandbox. Host-only + best-effort (path probe →
 /// canonicalize → store-root); non-store / missing tools are skipped.
 // off-loop: provisioning path — reached only via spawn_blocking / the pool thread / CLI.
-#[expect(clippy::disallowed_methods)]
 fn host_shell_store_roots() -> Vec<String> {
     let mut names: Vec<String> = Vec::new();
-    if let Ok(sh) = std::env::var("SHELL")
-        && let Some(n) = Path::new(&sh).file_name().and_then(|s| s.to_str())
-    {
-        names.push(n.to_string());
+    if let Ok(sh) = std::env::var("SHELL") {
+        if Path::new(&sh).is_absolute() {
+            names.push(sh);
+        } else if let Some(n) = Path::new(&sh).file_name().and_then(|s| s.to_str()) {
+            names.push(n.to_string());
+        }
     }
     for t in ["zsh", "starship", "atuin", "direnv", "fzf"] {
         if !names.iter().any(|s| s == t) {
@@ -2457,20 +2472,9 @@ fn host_shell_store_roots() -> Vec<String> {
     }
     let mut roots: Vec<String> = Vec::new();
     for t in names {
-        let Ok(out) = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(format!("command -v {t}"))
-            .output()
-        else {
+        let Some(path) = path_for_shell_token(&t) else {
             continue;
         };
-        if !out.status.success() {
-            continue;
-        }
-        let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if path.is_empty() {
-            continue;
-        }
         if let Ok(real) = std::fs::canonicalize(&path)
             && let Some(root) = store_root_of(&real.to_string_lossy())
             && !roots.contains(&root)
@@ -2479,6 +2483,18 @@ fn host_shell_store_roots() -> Vec<String> {
         }
     }
     roots
+}
+
+#[cfg(test)]
+mod shell_path_probe_tests {
+    use super::*;
+
+    #[test]
+    fn absolute_shell_path_does_not_depend_on_path() {
+        let executable = std::env::current_exe().expect("test executable path");
+        let token = executable.to_string_lossy().into_owned();
+        assert_eq!(path_for_shell_token(&token), Some(token));
+    }
 }
 
 /// Write a tiny no-arg wrapper script for ssh's `ProxyCommand` next to the managed

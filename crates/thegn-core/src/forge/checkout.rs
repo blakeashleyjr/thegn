@@ -27,7 +27,7 @@ pub struct ForgeCheckoutScope {
 pub fn checkout_scope(loc: &GitLoc) -> Result<ForgeCheckoutScope, ForgeError> {
     let branch = loc
         .git_out(&["rev-parse", "--abbrev-ref", "HEAD"])
-        .ok_or(ForgeError::NotConfigured("checkout branch"))?;
+        .ok_or(ForgeError::NotConfigured("checkout branch".into()))?;
     let branch = branch.trim().to_string();
     checkout_scope_for_branch(loc, &branch)
 }
@@ -60,7 +60,7 @@ pub fn checkout_scope_for_branch(
         || !origin.host.eq_ignore_ascii_case(&head.host)
     {
         return Err(ForgeError::NotConfigured(
-            "checkout repositories use different hosts",
+            "checkout repositories use different hosts".into(),
         ));
     }
 
@@ -95,15 +95,15 @@ fn remote_identity(
     what: &'static str,
 ) -> Result<ForgeRepoIdentity, ForgeError> {
     if remote.is_empty() || has_control(remote) {
-        return Err(ForgeError::NotConfigured(what));
+        return Err(ForgeError::NotConfigured(what.into()));
     }
     let url = if push {
         loc.git_out(&["remote", "get-url", "--push", remote])
     } else {
         loc.git_out(&["remote", "get-url", remote])
     }
-    .ok_or(ForgeError::NotConfigured(what))?;
-    repo_identity_from_remote_url(url.trim()).ok_or(ForgeError::NotConfigured(what))
+    .ok_or(ForgeError::NotConfigured(what.into()))?;
+    repo_identity_from_remote_url(url.trim()).ok_or(ForgeError::NotConfigured(what.into()))
 }
 
 fn has_control(value: &str) -> bool {
@@ -118,7 +118,16 @@ mod tests {
     use std::path::Path;
 
     fn git(dir: &Path, args: &[&str]) {
-        let status = crate::util::git_cmd(dir).args(args).status().unwrap();
+        // Never inherit the developer's signing config. With `commit.gpgSign =
+        // true` in a real ~/.gitconfig these fixtures block on gpg-agent and
+        // fail ~60s later, so the suite passes or fails depending on whether a
+        // passphrase happens to be cached — which is exactly how this reached
+        // the merge gate green from one machine and red from another.
+        let status = crate::util::git_cmd(dir)
+            .args(["-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false"])
+            .args(args)
+            .status()
+            .unwrap();
         assert!(status.success(), "git {args:?} failed: {status}");
     }
 
@@ -204,9 +213,11 @@ mod tests {
             dir.path(),
             &["config", "branch.topic.pushRemote", "missing"],
         );
+        let result = checkout_scope(&GitLoc::Local(dir.path().to_path_buf()));
         assert!(matches!(
-            checkout_scope(&GitLoc::Local(dir.path().to_path_buf())),
-            Err(crate::forge::ForgeError::NotConfigured("push repository"))
+            &result,
+            Err(crate::forge::ForgeError::NotConfigured(message))
+                if message.as_ref() == "push repository"
         ));
     }
 

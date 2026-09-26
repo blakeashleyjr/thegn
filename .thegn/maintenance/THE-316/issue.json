@@ -1,0 +1,10 @@
+{
+  "id": "THE-316",
+  "title": "Propagate Jira transition failures instead of returning false success",
+  "url": "https://linear.app/blakeashley/issue/THE-316/propagate-jira-transition-failures-instead-of-returning-false-success",
+  "priority": "High",
+  "labels": [],
+  "status": "Backlog",
+  "parentId": "THE-150",
+  "description": "## Finding\n\nJira status updates fetch a transition and POST it, but the POST result is converted to JSON `null` on every error. The method then fetches the issue and returns `Ok`, so a failed status mutation is indistinguishable from success. If a title update is also present, the method can partially apply one field while silently losing the other.\n\n## Evidence\n\n* `crates/thegn-svc/src/issue/jira.rs:485-526` resolves and submits the transition.\n* The transition POST ends in `.await.unwrap_or(serde_json::Value::Null)`.\n* `update_issue` then continues to title mutation and re-fetch without checking that the requested state was reached.\n\n## Impact\n\nAutomations, UI actions, and agents can proceed on a false belief that work changed state, causing duplicate dispatch, invalid pipeline decisions, or partial external mutations.\n\n## Acceptance criteria\n\n* Propagate typed transition lookup and POST failures.\n* Re-fetch and verify the issue reached the requested semantic state before success.\n* Define partial-write behavior when a patch contains several fields: transactional where the provider permits, otherwise an explicit per-field result/idempotent retry contract.\n* Preserve provider response context without unbounded/raw secret-bearing bodies.\n* Test HTTP errors, empty/204 transition responses, unavailable transitions, stale transition IDs, partial title/status failure in both orders, and retry.\n\n## Dependencies\n\nRelated to THE-126, THE-164, THE-195, and THE-319 (field-capability contract)."
+}

@@ -90,6 +90,19 @@ A configured zone name that the database does not know MUST warn and omit that
 one clock rather than failing startup, and configuration validation MUST report
 it with a suggested correction.
 
+Each clock row MAY override the inherited `[calendar] time_format` with a
+minute-safe strftime format. An empty override MUST inherit the resolved global
+12-hour or 24-hour setting, including the locale result of `auto`. Formats
+that render seconds or fractional seconds MUST be rejected by strict
+validation and normalized to inheritance during tolerant loading, because the
+world-clock popup refreshes at minute resolution. Formatted output MUST be
+bounded and terminal-safe before it becomes a cell.
+
+When `show_date = true`, a row MUST show its local date as `YYYY-MM-DD` and
+MUST omit the redundant `+1d` / `-1d` marker. When `show_date = false`, the
+row MUST retain the weekday and existing conditional relative marker. These
+rules apply independently to each row, including the synthesized home row.
+
 #### Scenario: A zone on a sub-hour offset
 
 - **WHEN** a clock is configured for a zone offset by a fraction of an hour
@@ -106,6 +119,21 @@ it with a suggested correction.
 - **WHEN** a clock names a zone the database does not contain
 - **THEN** thegn warns, omits that clock, and continues; and configuration
   validation reports the name with a suggested correction
+
+#### Scenario: Mixed row presentation policies
+
+- **WHEN** one row inherits a 12-hour setting, another uses a 24-hour strftime
+  override, and a third sets `show_date = true`
+- **THEN** each row uses its own resolved policy; the date row shows
+  `YYYY-MM-DD` without a relative marker, while rows with `show_date = false`
+  retain the weekday and conditional marker
+
+#### Scenario: A seconds-bearing row format
+
+- **WHEN** a row format contains `%S`, `%T`, `%r`, `%X`, `%s`, or fractional
+  seconds
+- **THEN** strict validation reports the unsupported minute cadence, and a
+  tolerant runtime load falls back to the inherited calendar time format
 
 ### Requirement: Events are read from configurable sources
 
@@ -231,6 +259,76 @@ no more than one with an end.
 
 - **WHEN** an unbounded recurrence is expanded over a one-month window
 - **THEN** only that month's occurrences are produced and expansion terminates
+
+### Requirement: Calendar expansion is window-intersected and budgeted
+
+Calendar expansion SHALL resolve an event's span and intersect it with the
+requested date window before enumerating occupied dates. A span wholly outside
+the window MUST require no lifetime-sized date walk, and overlap MUST be decided
+from the span's boundaries, never by materializing its dates. All-day DTEND and
+a timed end at exactly local midnight (sub-seconds included) remain exclusive,
+zero-duration events remain point events, and inverted or unrepresentable spans
+MUST produce a typed error — including a same-day inversion — rather than a
+fabricated one-day event. Date arithmetic at the representable extremes SHALL be
+checked.
+
+A recurring event SHALL include every instance whose span overlaps the window,
+including an instance that starts before the window (the expansion looks back by
+the event's own duration). A rule without COUNT MAY be fast-forwarded to the
+window; a COUNT rule is walked from DTSTART under the shared work budget.
+
+A defect in ONE source row — a malformed span, or a payload/child-entry
+ceiling only that row exceeds — SHALL cost that row alone: it is skipped and
+counted, the rest of the expansion stands, and the view reports itself
+incomplete. Only the shared budget dimensions, an invalid window, or an
+arithmetic failure MAY fail the whole call. (A bad row stays in the cache, so
+escalating it would blank the month and silence reminders permanently.)
+
+One expansion budget SHALL cover the whole call — source visits, recurrence
+work (every period, candidate, BY-part cross product, RDATE and EXDATE
+visited), materialized occurrences, occupied-date bucket entries, and retained
+bytes — across all source rows, together with a per-row payload and
+child-entry ceiling applied to every row. Retained bytes MUST be reserved
+before a payload is cloned. Exhaustion MUST return a typed error rather than a
+plausible partial calendar. Date buckets SHALL share each materialized
+occurrence's payload, and reminder evaluation SHALL consume the unique
+occurrence list so a multi-day event cannot duplicate notifications.
+
+#### Scenario: A century-scale event is queried for one day
+
+- **WHEN** an event spans centuries and the requested window contains one day
+- **THEN** expansion performs work proportional to that window and returns one
+  shared occurrence handle for the matching day
+
+#### Scenario: A long instance began before the window
+
+- **WHEN** a COUNT=1 or RDATE instance started twenty years ago and ends tomorrow
+- **THEN** today's one-day query includes it without walking the twenty years
+
+#### Scenario: Expansion exceeds its shared budget
+
+- **WHEN** source rows or recurrence candidates exhaust any expansion budget
+- **THEN** the month keeps its last valid snapshot marked stale, or shows
+  "unavailable" on first load (never "no events"), and reminders raise nothing
+  and keep their evaluation cursor for retry
+
+#### Scenario: A reminder evaluation is acknowledged
+
+- **WHEN** the off-loop reminder check finishes the window it was handed
+- **THEN** the reminder cursor advances to exactly that window's end, only on
+  success, and an acknowledgment for a window no longer in flight is ignored
+
+#### Scenario: A cached row cannot be decoded or is malformed
+
+- **WHEN** a cached calendar row fails to deserialize, or its span is malformed
+- **THEN** the readable events still show, their reminders still fire, the
+  month is marked incomplete, and a cache query failure is reported as
+  unavailable rather than an empty month
+
+#### Scenario: The agenda is hidden
+
+- **WHEN** `show_agenda` is off and a month is unavailable, stale or incomplete
+- **THEN** the month grid's own header reports that state
 
 ### Requirement: Reminders are raised through the notification system
 

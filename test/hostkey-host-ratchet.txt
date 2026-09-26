@@ -4,6 +4,7 @@
 # agent_ssh.rs, autoscale.rs) routes through
 # `thegn_core::hostkey::host_key_args` — so this allowlist is EMPTY, and a new
 # literal in the host crate must go through the chokepoint (never be pinned here).
+# RATCHET-EMPTY
 #
 # SHRINK-ONLY. Enforced by `host_key_literals_stay_in_the_chokepoint` in
 # crates/thegn-host/src/platform_ratchet_tests.rs (runs in `just test`);

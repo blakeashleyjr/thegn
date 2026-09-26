@@ -27,8 +27,9 @@ pub(crate) fn set_issue_providers(rows: Vec<Row>) {
 }
 
 /// Fresh backends over the live bridges, one per registered provider. Each
-/// call constructs new adapters (they are thin: an `Arc` clone + a leaked
-/// id), so a router built on any thread gets the current set.
+/// call constructs new adapters (they are thin: an `Arc` clone + an owned
+/// immutable id), so a router built on any thread gets the current set and
+/// dropping an old router releases its generation's identity.
 pub(crate) fn issue_backends() -> Vec<(String, Box<dyn IssueBackend>)> {
     let reg = registry().lock().unwrap_or_else(|e| e.into_inner());
     reg.iter()

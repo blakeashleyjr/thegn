@@ -68,6 +68,12 @@ fn check_output(args: &[&str], output: &Output, config: &Path, bin: &str) {
         }
         ("api", "coverage") if args.contains(&"--json") => {
             let value: serde_json::Value = serde_json::from_str(text).unwrap();
+            assert!(
+                value["revision"]
+                    .as_str()
+                    .is_some_and(|revision| !revision.is_empty())
+            );
+            assert!(value["schema_version"].is_number());
             let rows = value["surfaces"].as_array().unwrap();
             assert_eq!(rows.len(), 5);
             for (row, surface) in rows.iter().zip([
@@ -95,7 +101,9 @@ fn check_output(args: &[&str], output: &Output, config: &Path, bin: &str) {
             }
         }
         ("api", "coverage") => {
-            assert!(text.lines().next().unwrap().contains("implemented"));
+            assert!(text.lines().next().unwrap().starts_with("revision: "));
+            assert!(text.lines().nth(1).unwrap().starts_with("schema_version: "));
+            assert!(text.lines().any(|line| line.contains("implemented")));
             for name in ["http", "grpc", "cli", "mcp", "plugin"] {
                 assert!(
                     text.lines()

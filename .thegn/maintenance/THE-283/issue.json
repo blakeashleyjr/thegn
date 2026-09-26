@@ -1,0 +1,12 @@
+{
+  "id": "THE-283",
+  "title": "Reuse one policy-configured HTTP client for remote control calls",
+  "url": "https://linear.app/blakeashley/issue/the-283",
+  "priority": "Medium",
+  "labels": [
+    "Bug"
+  ],
+  "status": "Todo",
+  "parentId": "THE-150",
+  "description": "## Finding\n\n`ControlClient` stores only the address and creates a fresh reqwest client for every `HttpOrigin` request. Remote HTTPS calls therefore repeat DNS resolution, TCP/TLS setup, and connection allocation; the file's local-daemon one-connection-per-request rationale no longer applies.\n\n## Evidence\n\n* `crates/thegn-svc/src/control/client.rs:76` stores `ControlAddr` but no reusable transport client.\n* `client.rs:1126` constructs `reqwest::Client::new()` for every request.\n\nRepeated remote status/session/automation calls increase latency, CPU, FD/ephemeral-port churn, and lose one central place to enforce redirect, timeout, and body-limit policy.\n\n## Required design\n\n1. Build one cloneable policy-configured reqwest client per effective control configuration.\n2. Reuse its connection pool across unary calls.\n3. Centralize no-redirect, connect/request timeout, TLS, proxy, and response-limit policy.\n4. Rebuild only when relevant endpoint/TLS/proxy configuration changes.\n\n## Acceptance criteria\n\n* Repeated same-origin requests reuse a connection in integration tests.\n* Redirect and deadline/body-limit policies cannot differ by callsite.\n* Config reload safely replaces the client without leaking old work.\n* Local Unix/TCP behavior remains unchanged or uses an explicitly justified separate transport.\n\n## Dependency mapping\n\nBlocked by THE-273 (deadline/body-limit contract) and THE-280 (no-redirect security policy) \u2014 both landed."
+}

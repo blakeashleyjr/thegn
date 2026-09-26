@@ -460,7 +460,7 @@ fn build_get_query(identifier: &str) -> String {
 }
 
 impl IssueBackend for LinearBackend {
-    fn provider_id(&self) -> &'static str {
+    fn provider_id(&self) -> &str {
         "linear"
     }
 

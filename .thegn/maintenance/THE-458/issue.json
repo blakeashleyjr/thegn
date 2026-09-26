@@ -1,0 +1,72 @@
+{
+  "id": "THE-458",
+  "uuid": "7589579b-1be4-425e-a11c-9dac78abb052",
+  "title": "Intersect calendar event spans before enumerating occupied dates",
+  "description": "## Finding\n\nCalendar rendering and reminder expansion enumerate an event's entire lifetime before intersecting it with the requested date window. A hostile but syntactically valid event can therefore force an enormous allocation and CPU walk even when the UI requests only one month.\n\n`CalEvent::dates_in` pushes every day from `DTSTART` through `DTEND` into a new `Vec`. The non-recurring `occurrences` path calls that function merely to test overlap, discarding the vector, and `expand_by_date` calls it again for the accepted occurrence. A multi-century event can walk and allocate hundreds of thousands of dates twice; dates near Chrono's representable extrema make the bound far larger. The final bucketing clones the complete event once per occupied date.\n\n`calendar.max_events` limits source rows, not generated occurrences, occupied-date entries, aggregate bytes, or clones. Remote CalDAV/ICS URL and command sources can supply the span.\n\n## Evidence at audited commit\n\n* `crates/thegn-core/src/calendar/mod.rs:284-304`: `dates_in` allocates every date across the untrusted full span.\n* `crates/thegn-core/src/calendar/mod.rs:342-359`: non-recurring overlap detection expands that entire span.\n* `crates/thegn-core/src/calendar/mod.rs:410-430`: bucketing expands the span again and clones each materialized event per matching date.\n* `crates/thegn-core/src/config_calendar.rs:55-57`: the documented cap applies only to cached source events.\n\n## Impact\n\nA single feed record can monopolize the bounded background lane or exhaust memory, delaying calendar, tracker, Git, and other hydration work. A small requested display window does not bound the cost.\n\n## Required implementation\n\n* Test overlap by comparing resolved interval boundaries; never allocate occupied dates to decide whether an event intersects a window.\n* Add a window-aware occupied-date iterator or equivalent that clamps to `[from, to]` before iteration.\n* Use checked date/time arithmetic at representable boundaries and define malformed/inverted span behavior explicitly.\n* Enforce one end-to-end expansion budget covering occurrences, occupied-date bucket entries, clones, and aggregate bytes. Do not silently return a plausible partial calendar; expose a typed partial/error state.\n* Avoid cloning unbounded event payload strings per date where a shared occurrence representation can preserve the UI contract.\n* Apply the same boundary to month rendering and reminder evaluation.\n\n## Verification\n\nAdd adversarial tests for a one-day window intersecting century-scale and Chrono-boundary events, very large descriptions on multi-day events, events wholly outside the window, midnight-exclusive endings, inverted spans, recurrence instances with long duration, and aggregate exhaustion across many source rows. Assert work/allocation is proportional to the requested window and configured output budget.\n\n## Dependencies\n\nDependency-ready. Coordinate the common expansion budget and failure model with <issue id=\"967e9fbc-0223-44de-ae42-2ccda1695505\" href=\"https://linear.app/blakeashley/issue/THE-457/bound-and-validate-recurrence-expansion-and-reminder-arithmetic\">THE-457</issue>. Local-input byte admission remains owned by <issue id=\"0891b34e-9fcb-4d9c-8ee6-2a025d6d22c2\" href=\"https://linear.app/blakeashley/issue/THE-455/bound-and-determinize-local-ics-file-and-vdir-ingestion\">THE-455</issue>.",
+  "priority": {
+    "value": 1,
+    "name": "Urgent"
+  },
+  "url": "https://linear.app/blakeashley/issue/THE-458/intersect-calendar-event-spans-before-enumerating-occupied-dates",
+  "gitBranchName": "blake/the-458-intersect-calendar-event-spans-before-enumerating-occupied",
+  "createdAt": "2026-09-11T09:20:22.140Z",
+  "updatedAt": "2026-09-11T09:26:23.962Z",
+  "archivedAt": null,
+  "completedAt": null,
+  "startedAt": null,
+  "canceledAt": null,
+  "dueDate": null,
+  "slaStartedAt": null,
+  "slaMediumRiskAt": null,
+  "slaHighRiskAt": null,
+  "slaBreachesAt": null,
+  "status": "Backlog",
+  "statusType": "backlog",
+  "labels": [],
+  "attachments": [],
+  "documents": [],
+  "stateHistory": [
+    {
+      "state": {
+        "id": "9a141276-3d88-41f8-8437-8f170cfff494",
+        "name": "Backlog",
+        "type": "backlog"
+      },
+      "startedAt": "2026-09-11T09:20:22.140Z",
+      "endedAt": null
+    }
+  ],
+  "createdBy": "Blake Ashley",
+  "createdById": "3b7f5427-3d7f-40df-822c-6b4439a509e7",
+  "parentId": "THE-150",
+  "team": "Thegn",
+  "teamId": "6d265c7c-ac1f-40c7-9983-f919d7b5d254",
+  "relations": {
+    "blocks": [
+      {
+        "id": "THE-481",
+        "title": "Implement or remove the advertised calendar control API backend"
+      },
+      {
+        "id": "THE-460",
+        "title": "Derive calendar reminder lookahead from validated trigger offsets"
+      }
+    ],
+    "blockedBy": [],
+    "relatedTo": [
+      {
+        "id": "THE-455",
+        "title": "Bound and determinize local ICS file and vdir ingestion"
+      },
+      {
+        "id": "THE-457",
+        "title": "Bound and validate recurrence expansion and reminder arithmetic"
+      },
+      {
+        "id": "THE-465",
+        "title": "Enforce calendar max_events as a non-disableable admission budget"
+      }
+    ],
+    "duplicateOf": null
+  }
+}

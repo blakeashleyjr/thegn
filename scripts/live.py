@@ -466,6 +466,14 @@ def quiescent(paths, proc=Path("/proc")):
                     raise Refusal("Ambiguous process UID")
                 if os.getuid() not in map(int, uids):
                     continue
+                # A zombie (or dying) process has already released its address
+                # space and descriptors, so it can hold neither the database nor
+                # the install; its `exe` is unreadable, which used to veto every
+                # upgrade -- an unrelated `speech-dispatcher` leaves defunct
+                # `sd_*` children for days.
+                if any(line.split()[1:2] in (["Z"], ["X"]) for line in status_text.splitlines()
+                       if line.startswith("State:")):
+                    continue
                 try:
                     executable = base / "exe"
                     name = Path(os.readlink(executable).removesuffix(" (deleted)")).name

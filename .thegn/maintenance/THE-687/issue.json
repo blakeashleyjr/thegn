@@ -1,0 +1,14 @@
+{
+  "id": "THE-687",
+  "title": "Merged worktrees with no recorded result_oid are permanently unsweepable",
+  "url": "https://linear.app/blakeashley/issue/THE-687/merged-worktrees-with-no-recorded-result-oid-are-permanently",
+  "primary_file": "crates/thegn-host/src/merge_sweep.rs",
+  "affects": "tg/spark-radar, tg/bold-petal, tg/keen-marble, tg/bold-mango",
+  "priority": "High",
+  "labels": [
+    "Bug"
+  ],
+  "status": "Backlog",
+  "team": "Thegn",
+  "chain": "4th/3rd cause of 'merge sweep collects nothing'; THE-685 and THE-686 already landed"
+}

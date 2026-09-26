@@ -1,0 +1,12 @@
+{
+  "id": "THE-198",
+  "title": "Eliminate or formally contain the ignored RSA Marvin timing advisory",
+  "url": "https://linear.app/blakeashley/issue/the-198",
+  "priority": "Medium",
+  "labels": [
+    "Bug"
+  ],
+  "status": "Todo",
+  "parentId": "THE-150",
+  "description": "## Finding\n\nA known timing side-channel advisory is globally ignored. Current local-only use lowers exposure but the policy cannot prove that affected RSA private operations never cross a hostile timing boundary, and future feature growth can silently expand exposure.\n\n## Evidence at audited commit\n\n`deny.toml:18` ignores `RUSTSEC-2023-0071` for the RSA dependency used by local JWT/credential paths.\n\n## Implementation constraints\n\nPrefer replacing/upgrading the affected primitive. If no patched compatible release exists, narrow the exception to proven non-secret/non-attacker-observable use and add a removal trigger.\n\n## Acceptance criteria\n\n- [ ] Dependency reachability and every affected RSA operation are documented from call sites to trust boundary.\n- [ ] A patched/replacement implementation is adopted, or a time-bounded risk acceptance proves no hostile timing oracle/private-key exposure.\n- [ ] The advisory exception is package/version scoped with owner, expiry/review trigger, and explanatory link.\n- [ ] Tests prevent affected code from being enabled on remote/untrusted request paths without revisiting the policy.\n- [ ] `cargo audit`/`cargo deny` and credential/JWT tests pass with the new disposition."
+}

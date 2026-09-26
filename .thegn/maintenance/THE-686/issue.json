@@ -1,0 +1,14 @@
+{
+  "id": "THE-686",
+  "title": "Ignored files make merged worktrees permanently unsweepable, so merged_ttl_secs never expires anything",
+  "url": "https://linear.app/blakeashley/issue/THE-686/ignored-files-make-merged-worktrees-permanently-unsweepable-so-merged",
+  "priority": "High",
+  "labels": [
+    "Bug"
+  ],
+  "status": "Backlog",
+  "team": "Thegn",
+  "primary_file": "crates/thegn-host/src/merge_cleanup.rs",
+  "follows": "THE-685 (landed 0a3e3150)",
+  "note": "Primary's naive fix (dropping --ignored=matching) broke 6/18 tests and was reverted. See coordination.md."
+}

@@ -1,0 +1,10 @@
+{
+  "id": "THE-170",
+  "title": "Eliminate leaked strings in plugin provider adapter rebuilds",
+  "url": "https://linear.app/blakeashley/issue/THE-170/eliminate-leaked-strings-in-plugin-provider-adapter-rebuilds",
+  "priority": "Medium",
+  "labels": ["Bug"],
+  "status": "Todo",
+  "parentId": "THE-150",
+  "description": "## Finding\n\nProvider adapter construction leaks heap strings to synthesize long-lived names. Reload/router rebuild cycles monotonically consume memory.\n\n## Evidence at audited commit\n\n`crates/thegn-host/src/plugin_providers.rs:29` and `crates/thegn-svc/src/plugin/provider.rs:143`.\n\n## Implementation constraints\n\nUse owned or shared immutable strings with lifetimes carried by the adapter/router. Do not replace leaks with dangling references or global mutable registries.\n\n## Acceptance criteria\n\n- [ ] No `Box::leak` or equivalent permanent allocation is used for dynamic plugin/provider names.\n- [ ] Adapters own/share identity safely across router clones and asynchronous calls.\n- [ ] Reload and provider-list churn release old generation allocations.\n- [ ] Public traits use owned/Cow/Arc data where necessary without broad needless cloning.\n- [ ] A stress test rebuilds routers thousands of times with stable retained memory.\n\n## Verification\n\nRun plugin provider unit/lifecycle tests plus leak-oriented stress instrumentation; run `just quick`.\n\n## Execution dependencies\n\n* **Blocked by:** THE-165"
+}

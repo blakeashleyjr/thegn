@@ -2,10 +2,12 @@
 //! daemon-backed panes speak.
 //!
 //! Talks the HTTP surface ([`super::http`]) over a unix socket (local; peer
-//! credentials are the auth) or TCP (serve mode; bearer token required). One
-//! hyper connection per request — CLI verbs are one-shot and the daemon is
-//! local, so a pool would buy nothing. The warm-attach stream rides a
-//! WebSocket (`tokio-tungstenite` over the same stream types).
+//! credentials are the auth), TCP (serve mode; bearer token required), or a
+//! client-facing HTTP(S) origin. Unix/TCP unary calls remain one hyper
+//! connection per request because the daemon is local and those callers are
+//! one-shot CLI verbs. HTTP-origin calls reuse one reqwest pool. The
+//! warm-attach stream rides a WebSocket (`tokio-tungstenite` over the same
+//! stream types).
 
 use anyhow::{Context, Result, anyhow};
 use base64::Engine as _;
@@ -76,7 +78,30 @@ pub fn discover(store: &dyn ControlStore, scope: &str, now_ms: i64) -> Option<Co
 #[derive(Clone)]
 pub struct ControlClient {
     addr: ControlAddr,
+    /// Present only for [`ControlAddr::HttpOrigin`]. `reqwest::Client` is
+    /// already internally shared, so cloning `ControlClient` also shares the
+    /// connection pool without another wrapper or a global cache. The result
+    /// is stored so a construction failure remains fail-closed when the
+    /// request is made; it must never degrade to reqwest's policy-free
+    /// default client.
+    http_client: Option<std::result::Result<reqwest::Client, ControlTransportError>>,
 }
+
+/// A policy-configured control transport could not be initialized.
+///
+/// This deliberately carries no builder detail: the request-facing error is
+/// stable and contains no configuration or credential material. The detailed
+/// reqwest error is logged at construction time for diagnostics.
+#[derive(Debug, Clone, Copy)]
+pub struct ControlTransportError;
+
+impl std::fmt::Display for ControlTransportError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("could not initialize policy-configured control HTTP client")
+    }
+}
+
+impl std::error::Error for ControlTransportError {}
 
 pub(super) fn encoded_issue_path(id: &str, suffix: &str) -> Result<String> {
     crate::issue::validate_control_issue_id(id).map_err(|e| anyhow!(e.to_string()))?;
@@ -299,7 +324,8 @@ fn parse_session_roster(v: Value) -> Result<Vec<SessionInfo>> {
 
 impl ControlClient {
     pub fn new(addr: ControlAddr) -> Self {
-        Self { addr }
+        let http_client = matches!(&addr, ControlAddr::HttpOrigin { .. }).then(build_http_client);
+        Self { addr, http_client }
     }
 
     pub fn addr(&self) -> &ControlAddr {
@@ -331,7 +357,14 @@ impl ControlClient {
                 send_request(stream, method, path, self.token(), body).await?
             }
             ControlAddr::HttpOrigin { origin, token } => {
-                send_origin_request(origin, token, method, path, body).await?
+                let client = self
+                    .http_client
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("HTTP-origin client has no configured transport"))?;
+                let client = client
+                    .as_ref()
+                    .map_err(|error| anyhow::Error::new(*error))?;
+                send_origin_request(client, origin, token, method, path, body).await?
             }
         };
         if (200..300).contains(&status) {
@@ -1194,15 +1227,10 @@ fn origin_request_url(origin: &str, path: &str) -> Result<reqwest::Url> {
 
 fn origin_authority(origin: &str) -> Result<String> {
     let url = parse_http_origin(origin)?;
-    let raw_host = url.host_str().context("control HTTP origin has no host")?;
-    let host = if raw_host.contains(':') {
-        format!("[{raw_host}]")
-    } else {
-        raw_host.to_string()
-    };
+    let host = url.host().context("control HTTP origin has no host")?;
     Ok(match url.port() {
         Some(port) => format!("{host}:{port}"),
-        None => host,
+        None => host.to_string(),
     })
 }
 
@@ -1214,12 +1242,39 @@ fn websocket_url(origin: &str, path: &str) -> Result<String> {
     Ok(url.to_string())
 }
 
+/// Build the one unary HTTP transport for an HTTP-origin client.
+///
+/// Keep every reqwest transport policy here. The current contract is exactly
+/// the historical one: redirects are disabled, and no timeout or response
+/// body cap is added here. THE-273 owns those policies; when that contract is
+/// ready, this is the single construction point where it belongs.
+///
+/// `ControlClient::new` remains infallible for existing command paths, but a
+/// builder failure is retained as a typed error and surfaced by the first
+/// request. There is deliberately no fallback: `reqwest::Client::new()` would
+/// restore the default redirect policy and violate the control transport
+/// contract.
+fn build_http_client() -> std::result::Result<reqwest::Client, ControlTransportError> {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|error| {
+            tracing::warn!(
+                target: "thegn::control",
+                %error,
+                "could not build policy-configured control HTTP client"
+            );
+            ControlTransportError
+        })
+}
+
 /// Send one request to the client-facing HTTP(S) origin. Redirects are
 /// explicitly disabled: a 307/308 must never replay an authenticated command
 /// body at a second origin. Reqwest supplies the normal WebPKI verification
 /// path for `https`; TLS termination remains outside thegn's plaintext loopback
 /// backend.
 async fn send_origin_request(
+    client: &reqwest::Client,
     origin: &str,
     token: &str,
     method: &str,
@@ -1229,10 +1284,6 @@ async fn send_origin_request(
     let method = reqwest::Method::from_bytes(method.as_bytes())
         .with_context(|| format!("invalid control HTTP method {method:?}"))?;
     let url = origin_request_url(origin, path)?;
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .context("build control HTTP client")?;
     let mut request = client.request(method, url).bearer_auth(token);
     if let Some(body) = body {
         request = request.json(&body);
@@ -1383,6 +1434,164 @@ mod tests {
         };
         server.await.unwrap();
         result
+    }
+
+    #[tokio::test]
+    async fn http_origin_reuses_one_connection_across_client_clones() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let accepted_by_server = Arc::clone(&accepted);
+        let server = tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                accepted_by_server.fetch_add(1, Ordering::Relaxed);
+                tokio::spawn(async move {
+                    let mut stream = BufReader::new(stream);
+                    for request_no in 0..2 {
+                        let mut line = Vec::new();
+                        loop {
+                            line.clear();
+                            if stream.read_until(b'\n', &mut line).await.unwrap() == 0 {
+                                return;
+                            }
+                            if line == b"\r\n" {
+                                break;
+                            }
+                        }
+                        let connection = if request_no == 0 {
+                            "keep-alive"
+                        } else {
+                            "close"
+                        };
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: {connection}\r\n\r\n{{}}"
+                        );
+                        stream
+                            .get_mut()
+                            .write_all(response.as_bytes())
+                            .await
+                            .unwrap();
+                    }
+                });
+            }
+        });
+
+        let client = ControlClient::new(ControlAddr::HttpOrigin {
+            origin: format!("http://{addr}"),
+            token: "pool-token".into(),
+        });
+        client.clone().health().await.unwrap();
+        client.health().await.unwrap();
+
+        assert_eq!(accepted.load(Ordering::Relaxed), 1);
+        server.abort();
+    }
+
+    #[test]
+    fn only_http_origins_construct_a_reqwest_transport() {
+        let unix = ControlClient::new(ControlAddr::Unix("/tmp/thegn-control.sock".into()));
+        assert!(unix.http_client.is_none());
+
+        let tcp = ControlClient::new(ControlAddr::Tcp {
+            addr: "127.0.0.1:5380".into(),
+            token: "tcp-token".into(),
+        });
+        assert!(tcp.http_client.is_none());
+
+        let http = ControlClient::new(ControlAddr::HttpOrigin {
+            origin: "http://127.0.0.1:5380".into(),
+            token: "http-token".into(),
+        });
+        assert!(http.http_client.is_some());
+    }
+
+    #[tokio::test]
+    async fn failed_http_transport_initialization_is_fail_closed_and_typed() {
+        let client = ControlClient {
+            addr: ControlAddr::HttpOrigin {
+                origin: "http://127.0.0.1:1".into(),
+                token: "must-not-be-sent".into(),
+            },
+            http_client: Some(Err(ControlTransportError)),
+        };
+
+        let error = client
+            .health()
+            .await
+            .expect_err("a failed transport must not use a degraded client");
+        assert!(
+            error.downcast_ref::<ControlTransportError>().is_some(),
+            "transport initialization failures must remain typed: {error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn different_http_origin_clients_keep_in_flight_work_on_old_client() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        async fn serve_one(listener: tokio::net::TcpListener, delay: std::time::Duration) {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut chunk = [0; 1024];
+                let n = stream.read(&mut chunk).await.unwrap();
+                assert!(n > 0, "client closed before sending request");
+                request.extend_from_slice(&chunk[..n]);
+                assert!(request.len() <= 64 * 1024, "request headers exceeded bound");
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            tokio::time::sleep(delay).await;
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                )
+                .await
+                .unwrap();
+        }
+
+        let old_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let old_addr = old_listener.local_addr().unwrap();
+        let old_server = tokio::spawn(serve_one(
+            old_listener,
+            std::time::Duration::from_millis(20),
+        ));
+        let old_client = ControlClient::new(ControlAddr::HttpOrigin {
+            origin: format!("http://{old_addr}"),
+            token: "old-token".into(),
+        });
+        let old_request = tokio::spawn({
+            let client = old_client.clone();
+            async move { client.health().await }
+        });
+        drop(old_client);
+
+        let replacement_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let replacement_addr = replacement_listener.local_addr().unwrap();
+        let replacement_server =
+            tokio::spawn(serve_one(replacement_listener, std::time::Duration::ZERO));
+        let replacement = ControlClient::new(ControlAddr::HttpOrigin {
+            origin: format!("http://{replacement_addr}"),
+            token: "new-token".into(),
+        });
+
+        // This branch has no config-reload owner to exercise. The property
+        // established here is limited to independently constructed clients
+        // for different effective origins: replacing the caller's handle
+        // does not cancel work already using the old client.
+        assert_ne!(old_addr, replacement_addr);
+        replacement.health().await.unwrap();
+        old_request.await.unwrap().unwrap();
+        old_server.await.unwrap();
+        replacement_server.await.unwrap();
     }
 
     #[test]
@@ -1661,6 +1870,97 @@ mod tests {
             websocket_url("http://127.0.0.1:5380", "/v1/events?kinds=exit").unwrap(),
             "ws://127.0.0.1:5380/v1/events?kinds=exit"
         );
+    }
+
+    #[test]
+    fn http_origin_authority_matches_unary_and_websocket_endpoints() {
+        for (origin, authority, request_url, websocket) in [
+            (
+                "https://[::1]:8443",
+                "[::1]:8443",
+                "https://[::1]:8443/v1/events",
+                "wss://[::1]:8443/v1/events",
+            ),
+            (
+                "https://[::1]",
+                "[::1]",
+                "https://[::1]/v1/events",
+                "wss://[::1]/v1/events",
+            ),
+            (
+                "https://[::1]:443",
+                "[::1]",
+                "https://[::1]/v1/events",
+                "wss://[::1]/v1/events",
+            ),
+            (
+                "http://[::1]:8080",
+                "[::1]:8080",
+                "http://[::1]:8080/v1/events",
+                "ws://[::1]:8080/v1/events",
+            ),
+            (
+                "http://[::1]",
+                "[::1]",
+                "http://[::1]/v1/events",
+                "ws://[::1]/v1/events",
+            ),
+            (
+                "http://[::1]:80",
+                "[::1]",
+                "http://[::1]/v1/events",
+                "ws://[::1]/v1/events",
+            ),
+            (
+                "http://127.0.0.1",
+                "127.0.0.1",
+                "http://127.0.0.1/v1/events",
+                "ws://127.0.0.1/v1/events",
+            ),
+            (
+                "http://127.0.0.1:80",
+                "127.0.0.1",
+                "http://127.0.0.1/v1/events",
+                "ws://127.0.0.1/v1/events",
+            ),
+            (
+                "http://127.0.0.1:5380",
+                "127.0.0.1:5380",
+                "http://127.0.0.1:5380/v1/events",
+                "ws://127.0.0.1:5380/v1/events",
+            ),
+            (
+                "https://control.example.test",
+                "control.example.test",
+                "https://control.example.test/v1/events",
+                "wss://control.example.test/v1/events",
+            ),
+            (
+                "https://control.example.test:8443",
+                "control.example.test:8443",
+                "https://control.example.test:8443/v1/events",
+                "wss://control.example.test:8443/v1/events",
+            ),
+        ] {
+            assert_eq!(origin_authority(origin).unwrap(), authority, "{origin}");
+            assert_eq!(
+                origin_request_url(origin, "/v1/events")
+                    .unwrap()
+                    .to_string(),
+                request_url,
+                "{origin} unary endpoint"
+            );
+            assert_eq!(
+                websocket_url(origin, "/v1/events").unwrap(),
+                websocket,
+                "{origin}"
+            );
+        }
+    }
+
+    #[test]
+    fn http_origin_rejects_scoped_ipv6_zone_ids_with_url_2_5_8() {
+        assert!(parse_http_origin("https://[fe80::1%25eth0]/").is_err());
     }
 
     #[tokio::test]

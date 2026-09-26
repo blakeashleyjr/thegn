@@ -334,7 +334,7 @@ pub struct CommandBackend {
 }
 
 impl CommandBackend {
-    pub fn new(a: &CalendarAccount, admission: AccountAdmission) -> Self {
+    pub(crate) fn new(a: &CalendarAccount, admission: AccountAdmission) -> Self {
         CommandBackend {
             argv: a.command.clone(),
             cwd: thegn_core::util::expand_tilde(&a.cwd),

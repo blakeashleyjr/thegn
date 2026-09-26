@@ -1558,7 +1558,7 @@ mod tests {
             PanelState::Error { .. }
         ));
         assert!(matches!(
-            mk(Err(ForgeError::NotConfigured("t"))).state,
+            mk(Err(ForgeError::NotConfigured("t".into()))).state,
             PanelState::Error { .. }
         ));
         let ok = mk(Ok(PrStatus {

@@ -1,0 +1,12 @@
+{
+  "id": "THE-191",
+  "title": "Expose crash-disabled and generation health in plugin status/list output",
+  "url": "https://linear.app/blakeashley/issue/the-191",
+  "priority": "Medium",
+  "labels": [
+    "Bug"
+  ],
+  "status": "Todo",
+  "parentId": "THE-150",
+  "description": "## Finding\n\n`plugin list` reports configuration/install state but omits a plugin disabled after crashes or its live generation health. Operators cannot distinguish healthy, stopped, crash-loop-suppressed, or stale runtime state.\n\n## Evidence at audited commit\n\n`crates/thegn-host/src/cmd/plugin.rs:99` and resident plugin supervision state.\n\n## Implementation constraints\n\nRead a single authoritative supervisor snapshot; do not infer health from config files or process existence alone.\n\n## Acceptance criteria\n\n- [ ] CLI/control status distinguishes disabled-by-config, starting, healthy, degraded, crash-disabled, stopped, and stale generation.\n- [ ] Output includes bounded/redacted last failure and restart/backoff metadata.\n- [ ] Machine-readable and human output use stable state names and exit semantics.\n- [ ] State survives/reconciles daemon restart according to documented policy.\n- [ ] Tests drive crashes/backoff/reload/disable and assert status transitions.\n\n## Execution dependencies\n\nBlocked by THE-165 (UNLANDED)."
+}
