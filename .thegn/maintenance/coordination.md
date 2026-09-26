@@ -1,132 +1,121 @@
-# Coordination brief — THE-686
+# Coordination brief — THE-687
 
-Merged-worktree sweep still collects nothing. THE-685 fixed the _first_ refusal
-in this chain (filter drivers, landed `0a3e3150`); this is the _second_:
-ignored files are treated as dirtiness, so every worktree that was ever built
-is permanently unsweepable and `merged_ttl_secs` / `on_landed = "expire"` are
-dead configuration.
+Third cause in the merged-worktree sweep chain. THE-685 (`0a3e3150`) and THE-686
+(`2acdf364`) have both **landed and are verified gone from the live sweep**. Four
+worktrees now fail on this issue and nine on THE-688; the sweep still collects
+nothing, which is a bug the repo owner hits every day.
 
-This is a **live bug the repo owner is hitting right now** — their sidebar keeps
-every merged branch forever. Correctness matters more than speed here.
+## What the primary already verified — do not redo it, build on it
 
-## Read this before you plan: the primary already tried the obvious fix and it failed
+The evidence in the issue body was measured by the primary today against the live
+database, not copied from a stale audit. Specifically:
 
-The primary's first attempt was to drop `--ignored=matching` from the status
-probe in `crates/thegn-host/src/merge_cleanup.rs`. **It broke 6 of 18 tests in
-`merge_cleanup_tests.rs` and was reverted.** Do not re-attempt it as-is; it is a
-dead end for a reason that the design has to address head-on.
+```
+SELECT COUNT(*), SUM(result_oid IS NULL OR result_oid='')
+FROM merge_queue WHERE status='landed';        -- 33 | 4
+```
 
-The reason: **`clean()` has two callers with two different questions**, and the
-one-line change conflates them.
+All four bad rows have `updated_at` **within the same two seconds**
+(2026-09-11 21:47:24–25) while contemporaneous rows carry a real OID. That rules
+out "the column was added later" and points at **one bulk writer**.
 
-1. **Admission** — `clean()` inside the sweep decision: _is this worktree a
-   candidate at all?_ THE-686 is about this one. Here ignored-only content must
-   stop blocking.
+And this state is supposed to be impossible: `db_aux.rs:119-124` asserts
+`Landed => result_oid.is_some_and(|oid| !oid.is_empty())`, and
+`validate_merge_outcome` is called at `db_aux.rs:348`, immediately before the
+`merge_queue` upsert at `:364`. **So the guarded writer did not produce these
+rows.**
 
-2. **Final validation** — `merge_cleanup.rs:516`, `clean(&path)?` inside
-   `Verified::remove()`, a TOCTOU re-check run immediately before the directory
-   is deleted: _has anything changed since admission?_ Here emptiness is not the
-   real question, and the existing test
-   `final_validation_preserves_new_ignored_files_and_replaced_directory`
-   (`merge_cleanup_tests.rs:328`) asserts that an ignored file **appearing after
-   admission** aborts the removal.
+## Task 1 — find the writer. This is the part that needs real investigation.
 
-That second test is not obsolete and must keep passing on its merits. An ignored
-file appearing _between_ admission and deletion means something is **writing in
-that directory right now** — a build is running. Aborting is correct. That is a
-different proposition from "ignored files exist", which is merely "a build ran
-here once".
+Do not assume; the same-second timestamps are the lead. Candidates, all
+unverified:
 
-**So the design the primary expects is: make final validation compare against
-what admission observed, not against emptiness.** Carry the admission-time
-observation (the status output, or a digest of it) in the `Verified` token and
-re-compare at removal time. A _change_ still aborts; an unchanged ignored-only
-worktree proceeds. If you see a better way to separate the two questions,
-propose it — but you must explicitly say how both roles stay correct.
+- the fold-actor / `thegn land` path, already known to land via plumbing that
+  skips gates;
+- a reconcile/sync path that bulk-marks branches landed from git ancestry, where
+  no merge commit was recorded because the landing never went through the queue;
+- a writer that existed on 2026-09-11 and has since been removed — in which case
+  say so with the commit, and the fix is only the consumer half plus a
+  migration/backfill.
 
-## The other test that encodes the old semantics
+Whatever you find, the outcome is a test that fails if **any** path can write
+`status='landed'` with an empty or NULL `result_oid`.
 
-`dirty_ignored_untracked_and_unknown_status_never_mean_clean`
-(`merge_cleanup_tests.rs:227`) loops over `["tracked", "untracked", "ignored"]`
-and asserts **all three** produce `Err(Refusal::Dirty)`. Its `ignored` case is
-exactly the behaviour THE-686 changes.
+## Task 2 — the consumer is also wrong, and this half is not optional
 
-**Revise that case deliberately and rename the test to match its new meaning.**
-Do not delete the test, do not weaken the `tracked` / `untracked` cases, and do
-not "fix" it by making the fixture's ignored file untracked instead. The tracked
-and untracked cases are hard acceptance criteria and must stay exactly as
-strict — including under `--force`.
+`merge_sweep.rs:203` turns a missing cache field into a permanent refusal:
 
-## Scope
+```rust
+let Some(landed) = row.result_oid.as_deref() else {
+    report.kept.push((entry.branch.clone(), "landed commit identity is missing".into()));
+    continue;
+};
+```
 
-`Refusal::Dirty`'s Display string is `"uncommitted, untracked or ignored files
-are present"` (`merge_cleanup.rs:144`). It will no longer be accurate for the
-admission path; the issue also asks for the outcome to stay **visible** in the
-output — `swept … (discarded build state)` vs `kept … — edited since landing`.
-An operator needs to see which worktrees lost a warm `target/`, because that is
-a real cost even when it is the right call.
+CLAUDE.md is explicit that **git is the source of truth for worktrees and the
+forge for PRs; SQLite is a cache + resurrection layer.** The landed commit is
+derivable from git for any branch that genuinely merged. Derive it when the cache
+lacks it, and write the derived value back so the derivation happens once.
 
-`Refusal` is a two-variant enum (`Dirty`, `Unsafe(String)`). A third outcome
-almost certainly wants representing in the type rather than inferred at the call
-site — but check every match site before you widen it.
+Fixing only the writer leaves these four stuck forever, because the bad rows
+already exist. Fixing only the consumer lets the invariant violation recur. **Both.**
 
-In scope: the predicate split, the `Verified` token change if you take that
-route, the reporting distinction, `Refusal`/Display as needed, and tests.
+## The hard safety line
 
-Out of scope, do **not** touch:
+A missing `result_oid` must **never** weaken the merged-ness proof. The landed OID
+feeds an ancestry check; if you cannot prove the branch is merged into the target
+from git, the refusal stays. "Derive it" means _derive the real merge commit_, not
+"skip the check when the cache is empty". A sweep that deletes an unmerged
+worktree destroys work that exists nowhere else.
 
-- **The grace period / TTL logic itself.** `--force` must keep bypassing only
-  the grace period and never real work. Do not make `--force` able to discard
-  tracked or untracked-non-ignored content.
-- The THE-685 filter-driver logic that just landed (`configured_filter_drivers`
-  and the `:(attr:filter=<driver>)` pathspec check). It is correct and tested;
-  leave it alone.
-- The submodule and `skip-worktree`/`assume-unchanged` refusals — unrelated
-  safety guards, and both are `Unsafe`, not `Dirty`.
-- **The third cause in this chain**, `landed commit identity is missing`
-  (affects `tg/spark-radar`, `tg/bold-petal`, `tg/keen-marble`, `tg/bold-mango`).
-  It is a separate defect and a separate issue. If you learn something about it
-  while you are in here, **report it as a note**; do not fix it.
+`--force` bypasses the TTL clock and nothing else. Do not touch that.
 
-## Acceptance criteria (from the issue — all six)
+## Out of scope
 
-- [ ] Ignored-only merged worktree **is** swept once its TTL has elapsed.
-- [ ] Any tracked modification ⇒ never swept, with or without `--force`.
-- [ ] Any untracked non-ignored file ⇒ never swept.
-- [ ] Grace period still applies; `--force` bypasses only the grace period.
-- [ ] Output distinguishes "swept, discarded ignored state" from "kept, edited".
-- [ ] Tests cover ignored-only, tracked-modified, untracked-non-ignored, and
-      clean — **each with and without `--force`**.
+- **THE-688** — `runtime/session/dispatch ownership requires explicit cleanup`,
+  caused by a persisted `tab_groups` layout row. Separate lane, running in
+  parallel with yours; you will both touch the sweep area, so keep your diff
+  narrow and do not "fix" that predicate.
+- THE-685's filter-driver logic and THE-686's status-observation/`Refusal::Changed`
+  design — both just landed. Preserve them; do not refactor them.
+- TTL/grace arithmetic, branch-deletion holds, submodule and special-index guards.
 
-The last one is a matrix, not four tests. Do not report the row finished with
-the `--force` half missing.
+## Acceptance criteria (from the issue)
 
-## Testing traps in this file, measured
+- [ ] The writer producing `landed` + NULL/empty `result_oid` is identified and
+      fixed, with a test that fails if any path can write that pair.
+- [ ] The sweep derives the landed commit from git when the cache lacks it, and
+      refuses only when merged-ness genuinely cannot be proven.
+- [ ] A derived identity is written back to the cache.
+- [ ] The four existing rows become sweepable **without manual DB surgery.**
+- [ ] A branch not merged into the target is still never swept, with or without
+      `--force`.
+- [ ] Tests cover: cached OID present; absent but derivable; absent and not
+      derivable (still refused).
 
-- **`TestIsolation` mutates process-wide env, so these tests only isolate under
-  nextest** (a process per test). Under threaded `cargo test` they interfere:
-  the primary saw `gate_runner::unused_configured_filters_are_preserved_without_execution`
-  fail under `cargo test` and pass under `cargo nextest run`. If you are told a
-  test fails, check which runner produced that.
-- **`Fixture::probe()` verifies the branch is merged into main.** Committing on
-  the feature branch inside a fixture makes it _unmerged_, and the refusal you
-  then get is not the one you were testing. This cost the primary a full
-  round-trip on THE-685.
-- Fixture git invocations need `-c commit.gpgsign=false`; this repo has global
-  signing on and an unconfigured fixture hangs for 120s instead of failing.
+## Testing traps, measured in this area today
 
-## Line numbers
-
-Citations above were read from current `main` by the primary today, not from the
-stale audit commit — they should be accurate. Re-verify anyway and say so if
-anything has moved.
+- **Use nextest, never `cargo test`.** `TestIsolation` mutates process-wide env,
+  so threaded `cargo test` cross-contaminates — a `gate_runner` test failed under
+  `cargo test` and passed under nextest, and the primary nearly chased it as a
+  regression.
+- Fixture git commands need `-c commit.gpgsign=false`; global signing is on and
+  an unconfigured fixture hangs ~120s instead of failing.
+- `Fixture::probe()` verifies the branch is merged into main. Committing on the
+  feature branch inside a fixture makes it _unmerged_, so the refusal you get is
+  not the one you were testing.
+- **`just smoke` is a real gate here, not a formality.** THE-686's change was
+  clippy-clean and passed 9106 unit tests, and `test/smoke.sh` still caught a case
+  that encoded the old contract by name. If you change sweep behaviour or output,
+  grep `test/smoke.sh` for the strings you are changing.
 
 ## Cargo
 
 Attempt `nix develop --command cargo check -p thegn-host --all-targets` and a
-narrow `cargo nextest run -p thegn-host merge_cleanup`. **The pipeline sandbox
-mounts `/nix/store` read-only and this usually fails outright.** If it does,
-say exactly that in your report and stop — the primary runs all Rust
-validation centrally and will not hold your row against you for it. Never
-report `implementation-ready` for code you could not compile: say what you
-could not run.
+narrow `cargo nextest run -p thegn-host merge_sweep`. **The pipeline sandbox
+mounts `/nix/store` read-only and this usually fails outright** — if it does, say
+exactly that and stop. The primary runs all Rust validation, including clippy and
+smoke, centrally. Never report `implementation-ready` for code you could not
+compile; say what you could not run. Last lane's implementation did not compile
+(an ambiguous `Vec::new()` in a test) and the primary caught it — that is the
+expected division of labour, not a failing, so report honestly.

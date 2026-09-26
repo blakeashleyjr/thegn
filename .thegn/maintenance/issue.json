@@ -1,14 +1,14 @@
 {
-  "id": "THE-686",
-  "title": "Ignored files make merged worktrees permanently unsweepable, so merged_ttl_secs never expires anything",
-  "url": "https://linear.app/blakeashley/issue/THE-686/ignored-files-make-merged-worktrees-permanently-unsweepable-so-merged",
+  "id": "THE-687",
+  "title": "Merged worktrees with no recorded result_oid are permanently unsweepable",
+  "url": "https://linear.app/blakeashley/issue/THE-687/merged-worktrees-with-no-recorded-result-oid-are-permanently",
+  "primary_file": "crates/thegn-host/src/merge_sweep.rs",
+  "affects": "tg/spark-radar, tg/bold-petal, tg/keen-marble, tg/bold-mango",
   "priority": "High",
   "labels": [
     "Bug"
   ],
   "status": "Backlog",
   "team": "Thegn",
-  "primary_file": "crates/thegn-host/src/merge_cleanup.rs",
-  "follows": "THE-685 (landed 0a3e3150)",
-  "note": "Primary's naive fix (dropping --ignored=matching) broke 6/18 tests and was reverted. See coordination.md."
+  "chain": "4th/3rd cause of 'merge sweep collects nothing'; THE-685 and THE-686 already landed"
 }
