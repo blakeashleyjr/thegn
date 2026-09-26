@@ -303,8 +303,8 @@ fn drive_queue_with(
                     out.landed.push(item.branch.clone());
                     break;
                 }
-                AttemptOutcome::UpToDate => {
-                    let fields = set(db, "landed", None, Some("already merged"));
+                AttemptOutcome::UpToDate { commit } => {
+                    let fields = set(db, "landed", Some(&commit), Some("already merged"));
                     lifecycle(db, thegn_core::merge_lifecycle::LifecycleEvent::Landed);
                     progress(&DriveStep {
                         fields: &fields,

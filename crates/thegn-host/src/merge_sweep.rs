@@ -77,6 +77,28 @@ fn landed_entries(db: &Db, target: &str) -> anyhow::Result<Vec<MergeQueueRow>> {
         .collect())
 }
 
+/// Prove the branch is on the target before reconstructing the cache identity.
+/// A missing/invalid ref is a refusal, including for `--force`; derivation is
+/// metadata repair and must never become the merged-ness proof.
+fn derive_missing_landed_oid(
+    repo_root: &Path,
+    branch: &str,
+    target: &str,
+) -> anyhow::Result<String> {
+    let branch_ref = format!("refs/heads/{branch}");
+    let target_ref = format!("refs/heads/{target}");
+    let branch_tip = crate::integrate::resolve_commit_oid(repo_root, &branch_ref)?;
+    let target_tip = crate::integrate::resolve_commit_oid(repo_root, &target_ref)?;
+    anyhow::ensure!(
+        util::git_ok(
+            repo_root,
+            &["merge-base", "--is-ancestor", &branch_tip, &target_tip],
+        ),
+        "branch tip is not an ancestor of target"
+    );
+    crate::integrate::derive_landed_commit(repo_root, &branch_tip, &target_tip)
+}
+
 /// Collect every landed worktree whose grace period has elapsed.
 ///
 /// `force` ignores the clock and collects all of them — the manual "clear
@@ -194,10 +216,11 @@ fn sweep_with_db(cfg: &Config, repo_root: &Path, force: bool, db: &Db) -> SweepR
         merge_sweep::due(&entries, now, mq.merged_ttl_secs)
     };
     for entry in due {
-        let row = rows
+        let snapshot = rows
             .iter()
             .find(|r| r.worktree == entry.worktree)
             .expect("projected row");
+        let mut row = snapshot.clone();
         if !row.location.is_empty() && row.location != "local" {
             report.kept.push((
                 entry.branch.clone(),
@@ -205,10 +228,70 @@ fn sweep_with_db(cfg: &Config, repo_root: &Path, force: bool, db: &Db) -> SweepR
             ));
             continue;
         }
-        let Some(landed) = row.result_oid.as_deref() else {
+        if row.result_oid.as_deref().is_none_or(str::is_empty) {
+            let derived = match derive_missing_landed_oid(repo_root, &row.branch, &target) {
+                Ok(derived) => derived,
+                Err(error) => {
+                    report.kept.push((
+                        entry.branch.clone(),
+                        format!("landed commit identity could not be derived: {error}"),
+                    ));
+                    continue;
+                }
+            };
+            match db.backfill_landed_result_oid(&row, &derived) {
+                Ok(true) => {}
+                Ok(false) => {
+                    report.kept.push((
+                        entry.branch.clone(),
+                        "landed queue row changed during identity backfill".into(),
+                    ));
+                    continue;
+                }
+                Err(error) => {
+                    report.kept.push((
+                        entry.branch.clone(),
+                        format!("landed identity backfill failed: {error}"),
+                    ));
+                    continue;
+                }
+            }
+            let reloaded = match db.list_merge_queue() {
+                Ok(rows) => rows.into_iter().find(|candidate| {
+                    candidate.worktree == row.worktree
+                        && candidate.branch == row.branch
+                        && candidate.target_branch == row.target_branch
+                }),
+                Err(error) => {
+                    report.kept.push((
+                        entry.branch.clone(),
+                        format!("landed queue row reload failed after identity backfill: {error}"),
+                    ));
+                    continue;
+                }
+            };
+            let Some(reloaded) = reloaded else {
+                report.kept.push((
+                    entry.branch.clone(),
+                    "landed queue row unavailable after identity backfill".into(),
+                ));
+                continue;
+            };
+            if reloaded.status != "landed"
+                || reloaded.result_oid.as_deref() != Some(derived.as_str())
+            {
+                report.kept.push((
+                    entry.branch.clone(),
+                    "landed queue row changed after identity backfill".into(),
+                ));
+                continue;
+            }
+            row = reloaded;
+        }
+        let Some(landed) = row.result_oid.as_deref().filter(|oid| !oid.is_empty()) else {
             report.kept.push((
                 entry.branch.clone(),
-                "landed commit identity is missing".into(),
+                "landed commit identity is missing after backfill".into(),
             ));
             continue;
         };
@@ -220,7 +303,7 @@ fn sweep_with_db(cfg: &Config, repo_root: &Path, force: bool, db: &Db) -> SweepR
             &entry.branch,
             &target,
             Some(landed),
-            row,
+            &row,
             /* delete_branch */ true,
         ) {
             CleanupOutcome::Removed {
@@ -444,6 +527,157 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::disallowed_methods)]
+    fn missing_landed_identity_is_backfilled_from_a_plain_merge() {
+        let isolation = crate::merge_lifecycle::TestIsolation::new();
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().canonicalize().unwrap();
+        let db_path = parent.join("private.db");
+        let db = Db::open_at(&db_path).unwrap();
+        let (root, wt) = fixture(&parent, "backfill-merge", &db, &isolation);
+        let git = |path: &Path, args: &[&str]| {
+            let output = isolation
+                .git(path)
+                .args([
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        };
+        std::fs::write(wt.join("landed.txt"), "landed\n").unwrap();
+        git(&wt, &["add", "landed.txt"]);
+        git(&wt, &["commit", "-q", "-m", "landed change"]);
+        let branch_tip = git(&root, &["rev-parse", "refs/heads/feature"]);
+        git(
+            &root,
+            &["merge", "--no-ff", "-q", "-m", "plain merge", "feature"],
+        );
+        let merge_oid = git(&root, &["rev-parse", "HEAD"]);
+        assert_ne!(branch_tip, merge_oid);
+        rusqlite::Connection::open(&db_path)
+            .unwrap()
+            .execute(
+                "UPDATE merge_queue SET result_oid=NULL, queued_at=1, updated_at=1 WHERE worktree=?1",
+                [wt.to_str().unwrap()],
+            )
+            .unwrap();
+
+        let mut cfg = local_config();
+        cfg.merge_queue.on_landed = OnLanded::Expire;
+        cfg.merge_queue.target_branch = "main".into();
+        cfg.merge_queue.merged_ttl_secs = 1;
+        let report = sweep_with_db(&cfg, &root, true, &db);
+        assert_eq!(report.collected, ["feature"]);
+        assert!(report.kept.is_empty(), "{report:?}");
+        assert!(!wt.exists());
+        assert!(util::git_ok(
+            &root,
+            &["rev-parse", "--verify", "--quiet", "refs/heads/feature"],
+        ));
+        assert!(
+            db.list_merge_queue()
+                .unwrap()
+                .iter()
+                .any(|row| row.worktree == wt.to_string_lossy())
+        );
+    }
+
+    #[test]
+    #[expect(clippy::disallowed_methods)]
+    fn missing_landed_identity_stays_refused_for_unmerged_branch_even_when_forced() {
+        for force in [false, true] {
+            let isolation = crate::merge_lifecycle::TestIsolation::new();
+            let dir = tempfile::tempdir().unwrap();
+            let parent = dir.path().canonicalize().unwrap();
+            let db_path = parent.join("private.db");
+            let db = Db::open_at(&db_path).unwrap();
+            let (root, wt) = fixture(
+                &parent,
+                if force {
+                    "missing-force"
+                } else {
+                    "missing-due"
+                },
+                &db,
+                &isolation,
+            );
+            std::fs::write(wt.join("unmerged.txt"), "unmerged\n").unwrap();
+            let output = isolation
+                .git(&wt)
+                .args([
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "add",
+                    "unmerged.txt",
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let output = isolation
+                .git(&wt)
+                .args([
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "-q",
+                    "-m",
+                    "unmerged change",
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            rusqlite::Connection::open(&db_path)
+                .unwrap()
+                .execute(
+                    "UPDATE merge_queue SET result_oid=NULL, queued_at=1, updated_at=1 WHERE worktree=?1",
+                    [wt.to_str().unwrap()],
+                )
+                .unwrap();
+            let mut cfg = local_config();
+            cfg.merge_queue.on_landed = OnLanded::Expire;
+            cfg.merge_queue.target_branch = "main".into();
+            cfg.merge_queue.merged_ttl_secs = 1;
+            let report = sweep_with_db(&cfg, &root, force, &db);
+            assert!(report.collected.is_empty(), "force={force}: {report:?}");
+            assert!(
+                report
+                    .kept
+                    .iter()
+                    .any(|(_, reason)| { reason.contains("not an ancestor") })
+            );
+            assert!(wt.exists());
+            assert!(
+                db.list_merge_queue()
+                    .unwrap()
+                    .iter()
+                    .any(|row| row.worktree == wt.to_string_lossy() && row.result_oid.is_none())
+            );
+        }
+    }
+
+    #[test]
     fn refused_trusted_overlay_sweeps_nothing() {
         // THE-515: global on_landed = expire, the repo's own block would keep
         // its worktrees, and a stray alias makes that block ambiguous: the
@@ -604,6 +838,181 @@ mod tests {
                     assert_eq!(db.list_merge_queue().unwrap(), before);
                     assert!(db.worktree_record(wt.to_str().unwrap()).unwrap().is_some());
                 }
+            }
+        }
+    }
+
+    fn seed_persisted_layout(db: &Db, worktree: &str) {
+        use thegn_core::models::{GroupTabRow, TabGroupRow};
+        for (session, name) in [("layout-a", "app/feature"), ("layout-b", "other/feature")] {
+            db.put_tab_group(
+                session,
+                &TabGroupRow {
+                    name: name.into(),
+                    kind: "branch".into(),
+                    worktree: worktree.into(),
+                    ordinal: 0,
+                    active_tab: 0,
+                },
+            )
+            .unwrap();
+            db.put_group_tab(
+                session,
+                &GroupTabRow {
+                    group_name: name.into(),
+                    ordinal: 0,
+                    title: "1".into(),
+                    pane_tree: r#"{"leaf":0}"#.into(),
+                    focused_pane: 0,
+                    pane_cwds: String::new(),
+                    pane_cmds: String::new(),
+                    pane_sessions: String::new(),
+                    scrollback_snapshot: String::new(),
+                },
+            )
+            .unwrap();
+        }
+    }
+
+    fn age_landed_row(db_path: &Path, worktree: &str) {
+        rusqlite::Connection::open(db_path)
+            .unwrap()
+            .execute(
+                "UPDATE merge_queue SET queued_at=1, updated_at=1 WHERE worktree=?1",
+                [worktree],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn persisted_layout_is_deleted_for_every_session_after_collection() {
+        let isolation = crate::merge_lifecycle::TestIsolation::new();
+        for force in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let parent = dir.path().canonicalize().unwrap();
+            let db_path = parent.join("private.db");
+            let db = Db::open_at(&db_path).unwrap();
+            let (root, wt) = fixture(&parent, "layout", &db, &isolation);
+            let path = wt.to_str().unwrap();
+            seed_persisted_layout(&db, path);
+            age_landed_row(&db_path, path);
+
+            let mut cfg = local_config();
+            cfg.merge_queue.on_landed = OnLanded::Expire;
+            cfg.merge_queue.target_branch = "main".into();
+            cfg.merge_queue.merged_ttl_secs = 1;
+            let report = sweep_with_db(&cfg, &root, force, &db);
+
+            assert_eq!(report.collected, ["feature"], "force={force}");
+            assert!(!wt.exists(), "force={force}");
+            assert!(db.groups_for_session("layout-a").unwrap().is_empty());
+            assert!(db.groups_for_session("layout-b").unwrap().is_empty());
+            assert!(db.group_tabs_for_session("layout-a").unwrap().is_empty());
+            assert!(db.group_tabs_for_session("layout-b").unwrap().is_empty());
+            assert!(db.worktree_record(path).unwrap().is_none());
+            assert_eq!(db.list_merge_queue().unwrap().len(), 1);
+        }
+    }
+
+    struct SessionLatch(std::path::PathBuf);
+
+    impl Drop for SessionLatch {
+        fn drop(&mut self) {
+            crate::worktree_lifecycle::release_session_start(&self.0);
+        }
+    }
+
+    #[test]
+    fn live_session_latch_still_refuses_collection_in_both_force_modes() {
+        for force in [false, true] {
+            let isolation = crate::merge_lifecycle::TestIsolation::new();
+            let dir = tempfile::tempdir().unwrap();
+            let parent = dir.path().canonicalize().unwrap();
+            let db_path = parent.join("private.db");
+            let db = Db::open_at(&db_path).unwrap();
+            let (root, wt) = fixture(&parent, "live", &db, &isolation);
+            let path = wt.to_str().unwrap();
+            seed_persisted_layout(&db, path);
+            age_landed_row(&db_path, path);
+            assert!(
+                crate::worktree_lifecycle::session_start_once(&Config::default(), &wt, None,)
+                    .unwrap()
+            );
+            let _latch = SessionLatch(wt.clone());
+            let before = db.list_merge_queue().unwrap();
+
+            let mut cfg = local_config();
+            cfg.merge_queue.on_landed = OnLanded::Expire;
+            cfg.merge_queue.target_branch = "main".into();
+            cfg.merge_queue.merged_ttl_secs = 1;
+            let report = sweep_with_db(&cfg, &root, force, &db);
+
+            assert!(report.collected.is_empty(), "force={force}: {report:?}");
+            assert_eq!(report.kept.len(), 1, "force={force}");
+            assert!(
+                report.kept[0]
+                    .1
+                    .contains("active session requires explicit cleanup"),
+                "force={force}: {report:?}"
+            );
+            assert!(wt.exists(), "force={force}");
+            assert_eq!(db.list_merge_queue().unwrap(), before, "force={force}");
+            assert_eq!(db.groups_for_session("layout-a").unwrap().len(), 1);
+            assert_eq!(db.groups_for_session("layout-b").unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn tenancy_and_nonterminal_dispatch_still_refuse_both_force_modes() {
+        for (hold, table) in [("tenancy", "tenancy"), ("dispatch", "dispatch")] {
+            for force in [false, true] {
+                let isolation = crate::merge_lifecycle::TestIsolation::new();
+                let dir = tempfile::tempdir().unwrap();
+                let parent = dir.path().canonicalize().unwrap();
+                let db_path = parent.join("private.db");
+                let db = Db::open_at(&db_path).unwrap();
+                let (root, wt) = fixture(&parent, hold, &db, &isolation);
+                let path = wt.to_str().unwrap();
+                seed_persisted_layout(&db, path);
+                age_landed_row(&db_path, path);
+                let conn = rusqlite::Connection::open(&db_path).unwrap();
+                if table == "tenancy" {
+                    conn.execute(
+                        "INSERT INTO host_tenancy(sandbox,host_id,worktree,cpu_floor_milli,mem_floor_mb,state,reserved_at) VALUES(?1,'invalid-host-id',?1,0,0,'released',0)",
+                        [path],
+                    )
+                    .unwrap();
+                } else {
+                    conn.execute(
+                        "INSERT INTO agent_dispatches(issue_id,worktree_path,agent_name,dispatched_at_ms,status) VALUES('private',?1,'private',0,'running')",
+                        [path],
+                    )
+                    .unwrap();
+                }
+                let before = db.list_merge_queue().unwrap();
+
+                let mut cfg = local_config();
+                cfg.merge_queue.on_landed = OnLanded::Expire;
+                cfg.merge_queue.target_branch = "main".into();
+                cfg.merge_queue.merged_ttl_secs = 1;
+                let report = sweep_with_db(&cfg, &root, force, &db);
+
+                assert!(report.collected.is_empty(), "{hold}, force={force}");
+                assert_eq!(report.kept.len(), 1, "{hold}, force={force}");
+                assert!(
+                    report.kept[0]
+                        .1
+                        .contains("runtime tenancy or dispatch ownership"),
+                    "{hold}, force={force}: {report:?}"
+                );
+                assert!(wt.exists(), "{hold}, force={force}");
+                assert_eq!(
+                    db.list_merge_queue().unwrap(),
+                    before,
+                    "{hold}, force={force}"
+                );
+                assert_eq!(db.groups_for_session("layout-a").unwrap().len(), 1);
+                assert_eq!(db.groups_for_session("layout-b").unwrap().len(), 1);
             }
         }
     }
@@ -856,7 +1265,7 @@ mod tests {
             assert!(
                 report.kept[0]
                     .1
-                    .contains("runtime/session/dispatch ownership"),
+                    .contains("runtime tenancy or dispatch ownership"),
                 "{kind}: {report:?}"
             );
             assert_eq!(refs(), before_refs, "{kind}");
@@ -985,7 +1394,7 @@ mod tests {
                 assert!(
                     report.kept[0]
                         .1
-                        .contains("runtime/session/dispatch ownership"),
+                        .contains("runtime tenancy or dispatch ownership"),
                     "{report:?}"
                 );
                 assert!(

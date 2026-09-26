@@ -1099,8 +1099,8 @@ fn land_ready(cfg: &thegn_core::config::Config, wt: &str) -> DriveMsg {
                 ..DriveOutcome::default()
             })
         }
-        AttemptOutcome::UpToDate => {
-            record("landed", None, Some("already merged"));
+        AttemptOutcome::UpToDate { commit } => {
+            record("landed", Some(&commit), Some("already merged"));
             lifecycle(LifecycleEvent::Landed, &branch);
             DriveMsg::Done(DriveOutcome {
                 landed: vec![branch],
