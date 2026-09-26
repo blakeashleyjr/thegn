@@ -79,14 +79,14 @@ impl LocalResources {
         root: &Path,
         path: &str,
     ) -> Result<(), String> {
-        use thegn_core::store::{NotificationStore, PlacementStore, WorkspaceStore};
+        use thegn_core::store::{NotificationStore, PlacementStore};
         if Self::selection(db, root, path)? != self.selected {
             return Err("selected worktree/workspace environment changed during cleanup".into());
         }
         if db.has_cleanup_tenancy(path).map_err(|e| e.to_string())?
             || db.has_cleanup_dispatch(path).map_err(|e| e.to_string())?
         {
-            return Err("runtime/session/dispatch ownership requires explicit cleanup".into());
+            return Err("runtime tenancy or dispatch ownership requires explicit cleanup".into());
         }
         crate::agent::automatic_cleanup_resources_absent(path)?;
         crate::bridge_sup::automatic_cleanup_resources_absent(path)?;
