@@ -680,7 +680,7 @@ mod tests {
         }
     }
 
-    struct SessionLatch(PathBuf);
+    struct SessionLatch(std::path::PathBuf);
 
     impl Drop for SessionLatch {
         fn drop(&mut self) {
@@ -768,7 +768,7 @@ mod tests {
                 assert!(
                     report.kept[0]
                         .1
-                        .contains("runtime/session/dispatch ownership"),
+                        .contains("runtime tenancy or dispatch ownership"),
                     "{hold}, force={force}: {report:?}"
                 );
                 assert!(wt.exists(), "{hold}, force={force}");
@@ -1031,7 +1031,7 @@ mod tests {
             assert!(
                 report.kept[0]
                     .1
-                    .contains("runtime/session/dispatch ownership"),
+                    .contains("runtime tenancy or dispatch ownership"),
                 "{kind}: {report:?}"
             );
             assert_eq!(refs(), before_refs, "{kind}");
@@ -1160,7 +1160,7 @@ mod tests {
                 assert!(
                     report.kept[0]
                         .1
-                        .contains("runtime/session/dispatch ownership"),
+                        .contains("runtime tenancy or dispatch ownership"),
                     "{report:?}"
                 );
                 assert!(
