@@ -261,19 +261,32 @@ fn oci_command_refusal(name: &str, operation: &str, output: &std::process::Outpu
     }
 }
 
+/// Split output that is known to end in `\n` into its records, rejecting any
+/// blank line. Skipping blanks would be a fail-OPEN reading of truncated or
+/// mangled output — the one direction this guard must never take.
+fn oci_records(bytes: &[u8]) -> Result<Vec<&[u8]>, &'static str> {
+    if !bytes.ends_with(b"\n") {
+        return Err("output did not end with a newline");
+    }
+    let mut records = Vec::new();
+    // The element after the final `\n` is always empty and is not a record.
+    let body = &bytes[..bytes.len() - 1];
+    for record in body.split(|byte| *byte == b'\n') {
+        let record = record.strip_suffix(b"\r").unwrap_or(record);
+        if record.is_empty() {
+            return Err("output contained a blank record");
+        }
+        records.push(record);
+    }
+    Ok(records)
+}
+
 fn parse_container_ids(bytes: &[u8]) -> Result<Vec<String>, &'static str> {
     if bytes.is_empty() {
         return Ok(Vec::new());
     }
-    if !bytes.ends_with(b"\n") {
-        return Err("output did not end with a newline");
-    }
     let mut ids = Vec::new();
-    for record in bytes.split(|byte| *byte == b'\n') {
-        let record = record.strip_suffix(b"\r").unwrap_or(record);
-        if record.is_empty() {
-            continue;
-        }
+    for record in oci_records(bytes)? {
         if record.len() > 64 || !record.iter().all(u8::is_ascii_hexdigit) {
             return Err("container id was not hexadecimal");
         }
@@ -282,35 +295,40 @@ fn parse_container_ids(bytes: &[u8]) -> Result<Vec<String>, &'static str> {
     Ok(ids)
 }
 
+/// Parse the batched `inspect` output.
+///
+/// The format template runs **once per inspected container**, so a batch of N
+/// containers emits N `end` markers, each terminating that container's mount
+/// records. Treating `end` as a single terminator for the whole batch made any
+/// host with two or more containers refuse every worktree — including unrelated
+/// mounts — which would have left this issue's own symptom in place on a machine
+/// running so much as two containers.
 fn parse_mount_sources(bytes: &[u8]) -> Result<Vec<PathBuf>, &'static str> {
-    if !bytes.ends_with(b"\n") {
-        return Err("output did not end with a newline");
-    }
+    let records = oci_records(bytes)?;
     let mut sources = Vec::new();
-    let mut ended = false;
-    for record in bytes.split(|byte| *byte == b'\n') {
-        let record = record.strip_suffix(b"\r").unwrap_or(record);
-        if record.is_empty() {
-            continue;
-        }
-        if ended {
-            return Err("data followed the end marker");
-        }
-        if record == b"end" {
-            ended = true;
+    let mut containers = 0usize;
+    for record in &records {
+        if *record == b"end" {
+            containers += 1;
             continue;
         }
         let Some(source) = record.strip_prefix(b"mount:") else {
             return Err("missing mount record prefix");
         };
         if source.is_empty() {
+            // An anonymous volume has no host path, so it cannot hold the
+            // worktree. Recorded explicitly rather than silently skipped.
             continue;
         }
         let source = std::str::from_utf8(source).map_err(|_| "mount source was not UTF-8")?;
         sources.push(PathBuf::from(source));
     }
-    if !ended {
+    if containers == 0 {
         return Err("missing end marker");
+    }
+    // Every container's records must be terminated, so the batch ends with one.
+    if records.last() != Some(&b"end".as_slice()) {
+        return Err("data followed the final end marker");
     }
     Ok(sources)
 }

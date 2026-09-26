@@ -847,10 +847,20 @@ sweep_has() {
     return 1
   fi
 }
+# ttl=1, NOT 0: `merge_sweep::due` treats `merged_ttl_secs = 0` as "never sweep"
+# and returns no entries at all, so with 0 a sweep only ever selects anything
+# under --force. Any clock-only assertion would then pass or fail vacuously —
+# nothing is selected, so no message is printed. With ttl=1 a row is genuinely
+# due one second after landing, which is what `sweep_due_expired` waits for.
 sweep_fixture_due() {
   PATH="$TMP/sweep-bin" "$SZ" --set sandbox.enabled=false \
-    --set sandbox.vpn.provider=none --set merge_queue.merged_ttl_secs=0 \
+    --set sandbox.vpn.provider=none --set merge_queue.merged_ttl_secs=1 \
     merge sweep "$@"
+}
+# A sweep with no --force, on a row that really has expired.
+sweep_due_expired() {
+  sleep 2
+  sweep_due_has "$@"
 }
 sweep_due_has() {
   local pattern=$1 output="$TMP/sweep-output"
@@ -930,10 +940,34 @@ OCI_UNRELATED_MP="$(seed_sweep_case oci-unrelated)"
 check "installed Docker with unrelated mounts lets the sweep collect" \
   "THEGN_SMOKE_OCI_MODE=unrelated THEGN_SMOKE_OCI_UNRELATED='$TMP/oci-unrelated' sweep_due_has 'swept' --force && [[ ! -d '$OCI_UNRELATED_MP' ]]"
 
+# The same case WITHOUT --force, which is the one an operator actually hits: an
+# installed runtime, containers that mount something else, and a worktree long
+# past its TTL. `sweep_fixture_due` sets merged_ttl_secs=0, so the row is due on
+# the clock and needs no override. This is the assertion THE-690 exists for —
+# every other OCI case here passed --force, so none of them proved an ordinary
+# sweep collects.
+OCI_UNRELATED_DUE_MP="$(seed_sweep_case oci-unrelated-due)"
+check "installed Docker with unrelated mounts collects on the clock alone" \
+  "THEGN_SMOKE_OCI_MODE=unrelated THEGN_SMOKE_OCI_UNRELATED='$TMP/oci-unrelated' sweep_due_expired 'swept' && [[ ! -d '$OCI_UNRELATED_DUE_MP' ]]"
+
+# A query refusal must also hold without --force, not only with it.
+OCI_BAD_DUE_MP="$(seed_sweep_case oci-garbage-due)"
+check "Docker garbage output is a refusal on the clock alone" \
+  "THEGN_SMOKE_OCI_MODE=garbage THEGN_SMOKE_OCI_TARGET='$OCI_BAD_DUE_MP' sweep_due_expired 'could not be queried' && [[ -d '$OCI_BAD_DUE_MP' ]]"
+
+# And the no-runtime branch must collect on the clock alone too. `sweep_fixture_due`
+# fixes PATH internally, so hide the shim rather than trying to override it, and
+# put it back for the cases below.
+mv "$TMP/sweep-bin/docker" "$TMP/docker-shim-hidden"
+OCI_NONE_DUE_MP="$(seed_sweep_case oci-none-due)"
+check "no installed runtime collects on the clock alone" \
+  "sweep_due_expired 'swept' && [[ ! -d '$OCI_NONE_DUE_MP' ]]"
+mv "$TMP/docker-shim-hidden" "$TMP/sweep-bin/docker"
+
 OCI_OWNED_MP="$(seed_sweep_case oci-owned)"
 mkdir -p "$OCI_OWNED_MP/subdir"
 check "Docker mount at the worktree keeps it without --force" \
-  "THEGN_SMOKE_OCI_MODE=owned THEGN_SMOKE_OCI_TARGET='$OCI_OWNED_MP' sweep_due_has 'may own the worktree' && [[ -d '$OCI_OWNED_MP' ]]"
+  "THEGN_SMOKE_OCI_MODE=owned THEGN_SMOKE_OCI_TARGET='$OCI_OWNED_MP' sweep_due_expired 'may own the worktree' && [[ -d '$OCI_OWNED_MP' ]]"
 check "Docker mount at the worktree keeps it with --force" \
   "THEGN_SMOKE_OCI_MODE=owned THEGN_SMOKE_OCI_TARGET='$OCI_OWNED_MP' sweep_due_has 'may own the worktree' --force && [[ -d '$OCI_OWNED_MP' ]]"
 
