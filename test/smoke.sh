@@ -1682,8 +1682,14 @@ prompt = "row={row} artifact={artifact}; run thegn dispatch report {row} --text 
 next = "smoke-failed-open"
 
 [[pipeline.stages]]
+# The agent here must RESOLVE: configuration admission refuses a stage naming no
+# [[agents]]/[[tools]] entry, so an unknown agent can no longer reach the daemon
+# through stage config at all. The failed-open regression below supplies its
+# unknown agent with the --agent flag, which is not config-validated - the same
+# shape a roster row takes when config is edited to remove the agent it recorded.
+# (No backticks here: this heredoc is unquoted, so the shell would run them.)
 name = "smoke-failed-open"
-agent = "pipeline-smoke-agent-that-is-not-configured"
+agent = "pipeline-smoke-worker"
 concurrency = 1
 prompt = "row={row} artifact={artifact}; run thegn dispatch report {row} --text DONE"
 EOF
@@ -1996,6 +2002,7 @@ if command -v curl >/dev/null 2>&1; then
   # must name and close that row as failed rather than leaving it queued.
   set +e
   failed_stage_out="$($SZ session open --stage smoke-failed-open \
+    --agent pipeline-smoke-agent-that-is-not-configured \
     --issue linear:SMOKE-FAILED-OPEN --worktree "$R" --json 2>&1)"
   failed_stage_rc=$?
   set -e

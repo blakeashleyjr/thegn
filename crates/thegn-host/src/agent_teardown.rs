@@ -13,7 +13,7 @@ use thegn_core::store::WorkspaceStore;
 /// fire-and-forget close thread, which has only the path — so it loads config +
 /// resolves the env itself. Best-effort + off-loop; checkpoints-capable only.
 pub fn checkpoint_on_close(worktree: &str) {
-    let cfg = Config::load_layered(&thegn_core::config::ProcessEnv, &[], None);
+    let cfg = crate::config_startup::cleanup_config();
     let Ok(db) = Db::open() else {
         return;
     };

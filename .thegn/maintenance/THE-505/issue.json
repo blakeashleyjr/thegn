@@ -1,0 +1,162 @@
+{
+  "id": "THE-505",
+  "uuid": "e8182bef-6941-45bc-a276-4d6e8cccae2b",
+  "title": "Make configuration admission bounded, validated, generation-bound, and fail-closed",
+  "description": "## Finding\n\nConfiguration loading is not one authoritative admission boundary. Depending on the caller, an unreadable, malformed, oversized, or semantically invalid config is handled as defaults, last-known boot state, or a silently empty/default hydration snapshot.\n\nMost critically, `Config::load_layered` catches every `try_load_layered` error, emits a warning, rebuilds `Config::default()`, reapplies environment/CLI overrides, and continues. A single syntax/UTF-8/read failure can therefore discard the entire file's sandbox, network, credential, provider, agent, pipeline, control, and resource policy. The shipped default sandbox is not a proven fail-closed security floor (<issue id=\"48343763-7291-4a25-af4c-ca9589096fec\" href=\"https://linear.app/blakeashley/issue/THE-419/make-the-default-sandbox-non-degrading-credential-free-and-truthfully\">THE-419</issue>), so \u201cwarn and use defaults\u201d can materially increase authority.\n\n`try_load_layered` also uses unbounded `read_to_string` for the base and profile files, silently ignores an existing profile overlay that cannot be read, and only deserializes plus post-processes. It does not run the semantic/schema validation used by `config validate`, so runtime accepts unknown-key typos and invalid cross-field contracts that the validation command would reject.\n\n## Evidence at audited commit\n\n* `crates/thegn-core/src/config.rs::Config::try_load_layered` reads the base config with unbounded `std::fs::read_to_string`, normalizes, parses TOML, and deserializes.\n* The selected profile overlay is guarded by `if let Ok(ps) = read_to_string(...)`; an existing unreadable/invalid-UTF-8 overlay is silently omitted. Overlay parse/application errors only warn and the base config continues.\n* `Config::load_layered` maps every error to a fresh default config plus env/flag overrides and returns success to the caller.\n* `crates/thegn-core/src/config_validate.rs` separately performs schema walking and many semantic validators (`validate_pipeline`, sandbox/provider/calendar/weather/LSP/secret constraints, template contracts, and more), but normal runtime loading does not make that result an admission condition.\n* `crates/thegn-host/src/config_source.rs::fresh` keeps the boot snapshot on load failure, while `crates/thegn-host/src/hydrate.rs::load_hydration_config` calls `try_load_layered(...).unwrap_or_default()`, yielding a third failure policy and no surfaced error.\n* `crates/thegn-core/src/config_resolve.rs::explain` parses the raw base TOML with `unwrap_or_default` without compatibility normalization, silently ignores profile read/apply failures, and can report an origin/value chain different from the effective runtime.\n* Config hot reload keeps the old live config on a parse error, but startup and CLI paths commonly use the fallback-to-default API. Security behavior therefore depends on which consumer loaded the same bytes.\n* There is no maximum byte/line/table/array/string budget before TOML parsing, normalization, cloning, JSON overlay conversion, schema walking, or repeated per-request/hydration loads.\n\n## Impact\n\n* A typo, truncated atomicity failure, permission problem, invalid UTF-8 byte, or transient I/O error can remove restrictive policy and launch with more permissive defaults while the process continues.\n* A selected profile can retain its label/state roots while silently losing its profile-specific policy, undermining its credential-firewall claim.\n* Runtime, daemon launches, hydration/UI, config explanation, and validation can disagree about the same file, making operator evidence untrustworthy.\n* Very large configuration/profile files and unbounded collections/strings can consume excessive memory and CPU during startup, reload, daemon request handling, hydration, normalization, validation, and cloning.\n* Unknown or misspelled security-relevant keys can be ignored at runtime even though a separate command would flag them.\n* Binding a pipeline launch to an immutable config revision (<issue id=\"3d3a566c-145a-4f99-a005-3a6e739f4753\" href=\"https://linear.app/blakeashley/issue/THE-268/bind-pipeline-claim-prompt-and-sandbox-launch-to-one-immutable-config\">THE-268</issue>) is insufficient if the revision was never authoritatively and safely admitted.\n\n## Required remediation\n\n1. Introduce one typed configuration admission service/snapshot used by startup, daemon, CLI, hydration, explanation, hot reload, standalone consumers, and generated views. It must record exact source identities, compatibility normalization version, validation result, generation/digest, diagnostics, and last-known-good status.\n2. Distinguish `AbsentDefaultPath`, `ExplicitPathMissing`, `Unreadable`, `InvalidUtf8`, `Oversized`, `ParseInvalid`, `SchemaInvalid`, `SemanticInvalid`, and transient I/O failures. Only a genuinely absent implicit first-run config may intentionally select defaults; an explicit `--config` and an existing file fail closed.\n3. Never replace an existing configured policy with defaults after failure. Startup must stop before authority-bearing subsystems launch, or use a previously authenticated last-known-good snapshot under an explicit documented policy. Reload keeps the prior generation and surfaces degraded health.\n4. Apply the same compatibility normalization, unknown-key/schema checks, template checks, and cross-field semantic validators before publishing a snapshot. Classify diagnostics by severity; security/authority and structurally invalid settings are hard failures.\n5. Enforce bounded no-surprise input budgets before allocation/parsing: file bytes, line length/count, nesting/tables, arrays/maps, stages/agents/tools/plugins, strings, profiles/overlays, and total normalized/serialized size. Parsing/validation must have deterministic work limits.\n6. Treat an existing selected profile overlay's read/UTF-8/parse/validation failure according to the same fail-closed contract. Do not silently omit it while continuing under the profile identity.\n7. Make `config explain`, `config get`, schemas/docs, runtime consumers, and health/status read the exact admitted snapshot and generation rather than reparsing through divergent fallbacks.\n8. Bind authority-bearing operations to one admitted generation and re-check/CAS at publication boundaries as required by <issue id=\"3d3a566c-145a-4f99-a005-3a6e739f4753\" href=\"https://linear.app/blakeashley/issue/THE-268/bind-pipeline-claim-prompt-and-sandbox-launch-to-one-immutable-config\">THE-268</issue>/<issue id=\"70d95fef-6065-4004-92bc-30a3b606c44d\" href=\"https://linear.app/blakeashley/issue/THE-444/make-named-profiles-canonical-fail-closed-credential-firewalls\">THE-444</issue>. Never mix base/profile/env/DB-host data from different loads.\n9. Keep diagnostics bounded and redact secrets/credential-bearing values. Surface source path, typed reason, last-good generation, and safe remediation without echoing sensitive config content.\n\n## Acceptance criteria\n\n- [ ] Existing malformed, unreadable, invalid-UTF-8, oversized, schema-invalid, or semantic-invalid configs never cause authority-bearing startup/commands to continue on defaults.\n- [ ] A missing implicit default config has an explicit tested first-run/default outcome; a missing explicit `--config` is a hard error.\n- [ ] Selected profile overlay failures cannot be silently omitted, and profile-labelled execution never proceeds without its admitted profile policy.\n- [ ] Startup, daemon agent launch, hot reload, hydration, CLI, config explanation/get, standalone apps, and tests consume the same snapshot/generation and expose the same typed health.\n- [ ] Unknown/misspelled security-relevant keys and all constraints enforced by `config validate` are enforced before runtime publication.\n- [ ] Inputs at each size/collection/nesting/work boundary pass; inputs one unit over fail before large allocation or expensive normalization/clone work.\n- [ ] Reload failure preserves the prior valid generation, emits one coalesced bounded diagnostic, and never publishes a partial/default mix.\n- [ ] Concurrent file/profile/env/DB-host changes cannot create a mixed snapshot; stale generations lose at authority-bearing launch/apply boundaries.\n- [ ] `config explain` exactly reproduces the admitted normalized layer trace and cannot claim Builtin/default after a hidden parse failure.\n- [ ] Fuzz/property and fault-injection tests cover truncation during save, symlink/rename replacement, permission/EIO failures, invalid UTF-8, huge TOML structures, compatibility forms, secret redaction, and restart/reload behavior.\n\n## Verification\n\nRun config parser/schema/semantic suites, snapshot concurrency and fault-injection tests, startup/daemon/hydration/explain parity tests, sandbox/profile/pipeline authority regressions, memory/time bound tests, packaging/default-first-run smoke tests, and the trusted queue-boundary suite.\n\n## Dependency mapping\n\n* Parent: <issue id=\"9b15fdf6-b24d-4754-8f5d-fc5d7de85966\" href=\"https://linear.app/blakeashley/issue/THE-150/remediate-full-adversarial-audit-of-299fc13\">THE-150</issue>.\n* Blocks <issue id=\"3d3a566c-145a-4f99-a005-3a6e739f4753\" href=\"https://linear.app/blakeashley/issue/THE-268/bind-pipeline-claim-prompt-and-sandbox-launch-to-one-immutable-config\">THE-268</issue>, because an immutable pipeline config revision must first be an authoritatively admitted valid snapshot.\n* Blocks <issue id=\"70d95fef-6065-4004-92bc-30a3b606c44d\" href=\"https://linear.app/blakeashley/issue/THE-444/make-named-profiles-canonical-fail-closed-credential-firewalls\">THE-444</issue>, because a named profile cannot be a fail-closed credential firewall while its overlay can disappear silently.\n* Related to <issue id=\"48343763-7291-4a25-af4c-ca9589096fec\" href=\"https://linear.app/blakeashley/issue/THE-419/make-the-default-sandbox-non-degrading-credential-free-and-truthfully\">THE-419</issue> (safe default sandbox floor), <issue id=\"678b8f4f-cb1e-4dca-9a81-8d3b01aa7973\" href=\"https://linear.app/blakeashley/issue/THE-403/make-theme-driven-config-writes-generation-fenced-private-and-durable\">THE-403</issue> and <issue id=\"edd56f36-5b98-4912-952f-578c6be12ce2\" href=\"https://linear.app/blakeashley/issue/THE-435/make-backend-dogfood-config-mutation-preserving-and-transaction-safe\">THE-435</issue> (transactional config writers), <issue id=\"ec77bd48-06fc-45f0-8cf6-a06f5a1ad8b2\" href=\"https://linear.app/blakeashley/issue/THE-501/make-standalone-theme-loading-bounded-parity-complete-and-error\">THE-501</issue> (standalone config/theme parity), <issue id=\"3bf378e1-ed48-4e11-b2f8-67b00d6b7175\" href=\"https://linear.app/blakeashley/issue/THE-297/fail-closed-when-required-sandbox-mounts-cannot-be-canonicalized\">THE-297</issue>/<issue id=\"8ebffba3-e117-46ed-98b1-0c9e3f969747\" href=\"https://linear.app/blakeashley/issue/THE-250/apply-every-hardened-sandbox-policy-to-compose-services-or-refuse\">THE-250</issue>/<issue id=\"c63360fe-a7f4-4099-a9c5-5c428bbf3023\" href=\"https://linear.app/blakeashley/issue/THE-307/require-sandbox-to-control-security-regressions-to-execute-instead-of\">THE-307</issue> (fail-closed sandbox policy enforcement), <issue id=\"a9648a57-55d2-4897-b9e5-8fea29fb289d\" href=\"https://linear.app/blakeashley/issue/THE-109/enforce-delivery-state-drift-gates-across-linear-openspec-and-public\">THE-109</issue> (runtime/schema/documentation drift), and <issue id=\"b902a31d-6e57-4197-8c76-77cb137d8152\" href=\"https://linear.app/blakeashley/issue/THE-234/bound-agent-task-payloads-and-stop-duplicating-prompts-into-argv-and\">THE-234</issue> (bounded task/config-derived payloads).\n\n## Additional provider-spec admission evidence\n\nProvider settings currently reach billable side effects without a semantic admission contract:\n\n* `crates/thegn-svc/src/fly/machines.rs:87-103` silently maps every unknown Fly size string to `shared-cpu-1x`; a typo is accepted as a different resource specification rather than rejected. The unit test at lines 301-308 locks in this fail-open behavior.\n* `crates/thegn-svc/src/fly/mod.rs:242-270,483-550` creates/accepts an app and can allocate a billed dedicated IPv4 before the configured region, image, size, organization, and machine body are proven acceptable. A later machine-create rejection relies on best-effort compensating deletion.\n* `crates/thegn-svc/src/vps/mod.rs:719-762` registers or creates a vendor SSH key before the configured provider region/size/image/name combination is validated by the vendor. Invalid settings can therefore mutate the remote account even when no sandbox is successfully admitted.\n* The provider fields in `crates/thegn-core/src/config_env_tables.rs:161,229-255` are deserialized as unconstrained strings/integers, while `config_validate.rs` has no provider-specific region/size/image/organization grammar, supported Fly preset validation, or cross-field preflight.\n\nExtend the authoritative config admission work with provider-specific typed specs and bounded grammars. Unknown presets and malformed snapshot/image references must be hard validation errors, not substituted resources. Separate static syntax validation from an optional authenticated provider preflight, bind its result to the exact account/config generation, and require all purely local validation before SSH-key/app/IP/VM/snapshot or other remote side effects. Tests must prove one-unit-invalid values and unknown presets perform zero remote requests, while stale preflight generations cannot authorize launch after reload.",
+  "priority": {
+    "value": 1,
+    "name": "Urgent"
+  },
+  "url": "https://linear.app/blakeashley/issue/THE-505/make-configuration-admission-bounded-validated-generation-bound-and",
+  "gitBranchName": "blake/the-505-make-configuration-admission-bounded-validated-generation",
+  "createdAt": "2026-09-11T11:30:25.315Z",
+  "updatedAt": "2026-09-15T01:09:16.466Z",
+  "archivedAt": null,
+  "completedAt": null,
+  "startedAt": null,
+  "canceledAt": null,
+  "dueDate": null,
+  "slaStartedAt": null,
+  "slaMediumRiskAt": null,
+  "slaHighRiskAt": null,
+  "slaBreachesAt": null,
+  "status": "Backlog",
+  "statusType": "backlog",
+  "labels": [
+    "Bug"
+  ],
+  "attachments": [],
+  "documents": [],
+  "stateHistory": [
+    {
+      "state": {
+        "id": "9a141276-3d88-41f8-8437-8f170cfff494",
+        "name": "Backlog",
+        "type": "backlog"
+      },
+      "startedAt": "2026-09-11T11:30:25.315Z",
+      "endedAt": null
+    }
+  ],
+  "createdBy": "Blake Ashley",
+  "createdById": "3b7f5427-3d7f-40df-822c-6b4439a509e7",
+  "parentId": "THE-150",
+  "team": "Thegn",
+  "teamId": "6d265c7c-ac1f-40c7-9983-f919d7b5d254",
+  "relations": {
+    "blocks": [
+      {
+        "id": "THE-535",
+        "title": "Fail closed before launching noncanonical, duplicate, or invalid plugin specifications"
+      },
+      {
+        "id": "THE-534",
+        "title": "Enforce provider egress policy before sandbox admission"
+      },
+      {
+        "id": "THE-521",
+        "title": "Make synthesized Nix toolchains injection-safe, content-addressed, and transactional"
+      },
+      {
+        "id": "THE-444",
+        "title": "Make named profiles canonical fail-closed credential firewalls"
+      },
+      {
+        "id": "THE-268",
+        "title": "Bind pipeline claim, prompt, and sandbox launch to one immutable config revision"
+      }
+    ],
+    "blockedBy": [],
+    "relatedTo": [
+      {
+        "id": "THE-602",
+        "title": "Capture persisted host definitions strictly before launch-authority composition"
+      },
+      {
+        "id": "THE-250",
+        "title": "Apply every hardened sandbox policy to Compose services or refuse launch"
+      },
+      {
+        "id": "THE-435",
+        "title": "Make backend dogfood config mutation preserving and transaction-safe"
+      },
+      {
+        "id": "THE-501",
+        "title": "Make standalone theme loading bounded, parity-complete, and error-visible"
+      },
+      {
+        "id": "THE-419",
+        "title": "Make the default sandbox non-degrading, credential-free, and truthfully named"
+      },
+      {
+        "id": "THE-403",
+        "title": "Make theme-driven config writes generation-fenced, private, and durable"
+      },
+      {
+        "id": "THE-109",
+        "title": "Enforce delivery-state drift gates across Linear, OpenSpec, and public docs"
+      },
+      {
+        "id": "THE-234",
+        "title": "Bound agent task payloads and stop duplicating prompts into argv and environment"
+      },
+      {
+        "id": "THE-297",
+        "title": "Fail closed when required sandbox mounts cannot be canonicalized"
+      },
+      {
+        "id": "THE-307",
+        "title": "Require sandbox-to-control security regressions to execute instead of silently skipping"
+      },
+      {
+        "id": "THE-638",
+        "title": "Maintenance batch 03: task-manager performance and ten scoped bug acceptances"
+      },
+      {
+        "id": "THE-484",
+        "title": "Eliminate lossy signed duration casts from freshness and reaper policy"
+      },
+      {
+        "id": "THE-612",
+        "title": "Expose bounded checked database-policy and automation source projections"
+      },
+      {
+        "id": "THE-611",
+        "title": "Classify command intent and dispatch static inspection before configuration side effects"
+      },
+      {
+        "id": "THE-592",
+        "title": "Reject unsupported configured network requirements on every launch route before fallback or dispatch claims"
+      },
+      {
+        "id": "THE-569",
+        "title": "Preserve advisory severity for accepted compatibility keys in configuration validation"
+      },
+      {
+        "id": "THE-541",
+        "title": "Bind CI credentials and remote execution to the intended provider authority"
+      },
+      {
+        "id": "THE-536",
+        "title": "Run capability-gated plugins inside an enforceable least-privilege boundary"
+      },
+      {
+        "id": "THE-523",
+        "title": "Make file-backed secret custody no-follow, collision-proof, and transactional"
+      },
+      {
+        "id": "THE-520",
+        "title": "Bind devcontainer selection, references, and IDs to canonical repository identity"
+      },
+      {
+        "id": "THE-510",
+        "title": "Make managed bundle homes canonical, zone-safe, and transactional"
+      },
+      {
+        "id": "THE-506",
+        "title": "Bound and canonicalize pipeline lease identity, lifetime, and persistence"
+      }
+    ],
+    "duplicateOf": null
+  }
+}

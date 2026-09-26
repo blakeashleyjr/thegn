@@ -326,7 +326,7 @@ fn capture_failure_rolls_back_only_its_owned_transaction_without_policy_changes(
     let before = policy();
     let changes = conn.total_changes();
     assert_eq!(
-        read_with_snapshot_hook(&conn, || Err(Error::Unavailable)).unwrap_err(),
+        read_with_snapshot_hook(&conn, false, || Err(Error::Unavailable)).unwrap_err(),
         Error::Unavailable
     );
     assert!(conn.is_autocommit());
@@ -402,7 +402,7 @@ fn wal_writer_cannot_mix_new_version_schema_or_data_into_existing_snapshot() {
     put(&reader, "one", "before", Some(r#"{"reach":"local"}"#));
     let writer = Connection::open(&path).unwrap();
     let before_changes = reader.total_changes();
-    let snapshot = read_with_snapshot_hook(&reader, || {
+    let snapshot = read_with_snapshot_hook(&reader, false, || {
         // Deterministic interleaving: the first read already captured version
         // and columns. This second connection commits while it remains open.
         writer.execute_batch("BEGIN; UPDATE hosts SET name='after', config_json='{\"reach\":\"ssh\"}'; ALTER TABLE hosts ADD COLUMN later TEXT;").unwrap();
@@ -440,4 +440,25 @@ fn existing_busy_policy_is_respected_without_claiming_query_deadline() {
     assert!(reader.is_autocommit());
     writer.execute_batch("ROLLBACK").unwrap();
     assert!(read(&reader).is_ok());
+}
+
+/// The advertised `THEGN_ALLOW_SCHEMA_DOWNGRADE` override must be able to
+/// read host definitions from a newer store (structure still checked), while
+/// the default reader and older schemas stay refused.
+#[test]
+fn newer_schema_is_readable_only_through_the_downgrade_reader() {
+    let conn = fixture();
+    put(&conn, "h1", "box", Some(r#"{"reach":"ssh"}"#));
+    conn.pragma_update(None, "user_version", crate::db::SCHEMA_VERSION + 1)
+        .unwrap();
+    assert!(matches!(read(&conn), Err(Error::IncompatibleSchema { .. })));
+    let snapshot = read_allowing_newer(&conn).unwrap();
+    assert_eq!(snapshot.observed_schema(), crate::db::SCHEMA_VERSION + 1);
+    assert_eq!(snapshot.definitions().len(), 1);
+    conn.pragma_update(None, "user_version", crate::db::SCHEMA_VERSION - 1)
+        .unwrap();
+    assert!(matches!(
+        read_allowing_newer(&conn),
+        Err(Error::IncompatibleSchema { .. })
+    ));
 }

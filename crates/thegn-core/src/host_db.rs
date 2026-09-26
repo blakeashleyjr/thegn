@@ -337,7 +337,17 @@ impl HostStore for Db {
         crate::host_definition_snapshot::HostDefinitionsSnapshot,
         crate::host_definition_snapshot::HostDefinitionReadError,
     > {
-        crate::host_db_snapshot::read(self.conn())
+        // A newer-schema handle exists only under the explicit
+        // THEGN_ALLOW_SCHEMA_DOWNGRADE override (otherwise `Db::open`
+        // refuses it); that override must be able to read the hosts table.
+        if self
+            .schema_mismatch
+            .is_some_and(|observed| observed > crate::db::SCHEMA_VERSION)
+        {
+            crate::host_db_snapshot::read_allowing_newer(self.conn())
+        } else {
+            crate::host_db_snapshot::read(self.conn())
+        }
     }
 
     fn host_inventory(&self, id: &HostId) -> Result<Vec<InventoryEntry>> {

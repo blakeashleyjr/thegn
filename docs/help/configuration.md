@@ -358,10 +358,29 @@ the active profile overlay → `THEGN_<SECTION>_<KEY>` environment variables →
 `--set key=value` on the command line. A repo's selected `.thegn.*` overlays
 `[sandbox]`, `[keybinds]`, `[notifications]`, `[issues]`, the `env` selector,
 and trust-gated `[hooks]`; a metrics table is recognized for the existing
-refusal diagnostic. Every load is tolerant: a malformed value warns and the
-layer below stands, so a typo never blocks a launch. Explicit
-`thegn config validate` checks every layer it can locate and exits non-zero
-for a problem.
+refusal diagnostic.
+
+Those trusted layers are **admitted** before anything authority-bearing
+starts: a config file that exists but cannot be read, decoded, parsed or
+validated stops the launch with a typed message naming the source and the
+key, instead of silently falling back to defaults. Only a genuinely absent
+default config file is a first-run default; an explicit `--config` that is
+missing is an error. A selected profile's overlay file is optional (nothing
+creates one), but if it exists it must be admissible. Values the runtime has
+always clamped or dropped (`metrics`, `preview`, `clipboard`, `bars` display
+settings) still clamp — each named in a warning. `thegn config validate` and
+`thegn doctor` run exactly this admission, so they report what a launch
+would refuse.
+
+Diagnostic and recovery verbs deliberately stay usable when the
+configuration or the state database is what is broken: `config
+show/get/validate/explain`, `config edit`, `config set`, `doctor`, `logs`,
+`notify`, `host list`, `host rm`, the stdio bridges and `automations test`
+run on a tolerant display projection that is never published as authority.
+If the state database cannot be read (a newer schema, a refused migration, a
+damaged host row) the configuration is still admitted — without the stored
+hosts — and a statusbar banner says so; agent and tool launches are refused
+until it is fixed.
 
 Env overrides exist for the knobs a CI job or launcher would flip —
 `THEGN_BASE_BRANCH`, `THEGN_SANDBOX_BACKEND`, `THEGN_THEME_COLOR`,
@@ -370,10 +389,42 @@ set it). Not every key has one; the full list is the `env_overlay` table in
 the source, and a new key either gets a knob or is deliberately recorded as
 not having one.
 
-Unknown keys are dropped on load with a warning. `thegn config validate`
-reports them with a nearest-key hint and names the file and dotted key
+Unknown keys depend on where they are. In a **security-relevant** table they
+refuse the launch, because "ignored" there can mean a policy you wrote is
+silently not applied: `[sandbox]` (and everything nested under it),
+`[database]`, `[remote]`, `[network]`, `[merge_queue]`, `[pr_queue]`,
+`[[agents]]`, `[[tools]]`, `[actions]`, `[git_commands]`, `[accounts]`,
+`[identities]`, `[hooks]`, `[lifecycle]`, `[env.*]`, `[host.*]`,
+`[host_discovery]`, `[placement]`, `[plugins]`, `[automations]`,
+`[pipeline]`, `[autopilot]`, `[daemon]`, `[serve]`, `[share]`, `[forward]`,
+`[forges]`, `[git]`, `[editor]`, `[lsp]`, `[metrics]`, `[notifications]`,
+`[clipboard]`, `[apps]`, `[skills]`, `[tasks]`, `[toolchain]`, `[limits]`,
+`[presets]`, `[profiles]`, `[worktree_templates]`, `[watch]`, `[ci]`,
+`[pr]`, `[issues]`, `[model_proxy]`, `[mcp]`, `[mcp_proxy]`,
+`[mcp_servers.*]`, `[managed_tools.*]`, `[calendar]`, `[voice]`, `[pins]`,
+`[secrets]`, `[credentials]`, `[bundle]`, `[zone.*]`, `[observe]`,
+`[weather]`, `[usage]`, `[disk]`, `[drawer]`, `[media]`, `[stats]`, and the
+per-project overlay
+`[project.<slug>]` (also written `[workspace.<slug>]`, which is normalized to
+`[project.<slug>]`) — that subtree holds accounts, hooks, sandbox mounts, the
+queues, ci, autopilot, the MCP scope ceiling, env bundles, git and editor.
+The two root path keys `worktrees_dir` and `projects_dir` count as well, so a
+typo of them refuses rather than silently relocating every worktree.
+A typo of one of these tables (`[sandboxx]`, `[metric]`) refuses too: the
+nearest-key hint names what you meant. The cost of that is deliberate and
+worth knowing: a top-level table within about two edits of a
+security-relevant name is refused even when it is not a typo — so a table a
+newer build adds called `[hosts]`, `[bundles]`, `[zones]`, `[secret]`,
+`[agent]` or `[stat]` will stop an older build that does not know it. (The
+schema already has such neighbours: `profile` and `profiles`.) If you hit
+that, rename or remove the key, or run the build that knows it. Everywhere else —
+and for an unknown top-level table — the key is ignored with a warning, so
+one `~/.config/thegn/config.toml` shared by builds of different ages keeps
+working when a newer build adds a key. `thegn config validate` reports both,
+with a nearest-key hint and the file and dotted key
 (`sandbox.enabeld: unknown key (did you mean `enabled`?)`) — run it after
-editing by hand. It also checks the active profile and selected repo overlay
+editing by hand. A repo overlay is not a trusted layer: every unknown key
+there is still reported as a problem. It also checks the active profile and selected repo overlay
 when those files exist; missing optional layers are quiet. The generated
 config reference contains every documented key with its example value; those
 values are illustrative and are not promised to equal code defaults.

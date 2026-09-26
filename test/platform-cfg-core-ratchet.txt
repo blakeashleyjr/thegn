@@ -25,6 +25,14 @@ config_repo.rs
 # toolchain_activation.rs: one symlink-only test (#[cfg(unix)]); detection is
 # runtime-platform-neutral and rejects symlinks through file metadata.
 toolchain_activation.rs
+# TEST-ONLY cfg, not per-OS production code (THE-505): admission refuses a
+# captured HOME that is not valid UTF-8 rather than lossily collapsing two
+# distinct OS paths to one identity. Constructing such a path needs
+# std::os::unix::ffi::OsStringExt (Windows has its own, equally per-OS, API);
+# the production check is platform-free — it is `Path::to_str()` returning
+# None — so only the fixture is cfg'd.
+config_admission_tests.rs
+
 # TEST-ONLY cfg: migration-policy alias regressions create real symlink and
 # hardlink aliases around the SQLite state file. The production migration
 # authority and compatibility paths remain platform-neutral; hiding these

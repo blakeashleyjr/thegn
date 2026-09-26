@@ -553,7 +553,7 @@ pub fn spawn_worktree_destroy(
         .name("thegn-worktree-destroy".into())
         .spawn(move || {
             crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
-            let cfg = Config::load_layered(&thegn_core::config::ProcessEnv, &[], None);
+            let cfg = crate::config_startup::cleanup_config();
             let db = Db::open().ok();
             let (success, message) = thegn_core::repo::main_worktree(&worktree)
                 .map(|repo_root| {

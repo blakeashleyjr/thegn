@@ -423,6 +423,10 @@ pub struct FrameModel {
     /// A schema refusal remains on the last known-good model until a compatible
     /// hydration succeeds, and drives the persistent status-bar warning.
     pub state_db: StateDbAvailability,
+    /// Persistent configuration-admission warning (a failing reload keeping
+    /// the last generation display-only, or a host-less generation). Loop
+    /// owned: set from `config_startup::banner`, carried across hydration.
+    pub config_banner: Option<String>,
     /// The active worktree group's name ("app/feat") — the tabbar's left label.
     pub worktree: String,
     /// App-wide network connectivity (from [`thegn_core::connectivity`]). Drives
@@ -2039,6 +2043,22 @@ pub fn draw_statusbar(surface: &mut Surface, rect: Rect, model: &FrameModel) {
             rect.x + usize::from(rect.cols > 1),
             rect.y,
             &message,
+            col(S::Bg0),
+            bg,
+            rect.cols.saturating_sub(2),
+        );
+        return;
+    }
+    // A degraded configuration likewise outranks transient status: launches
+    // are being refused and a TTL'd line would hide why.
+    if let Some(message) = &model.config_banner {
+        let bg = col(S::ActivityWaiting);
+        fill(surface, rect, bg);
+        draw_text_bold(
+            surface,
+            rect.x + usize::from(rect.cols > 1),
+            rect.y,
+            message,
             col(S::Bg0),
             bg,
             rect.cols.saturating_sub(2),

@@ -125,10 +125,14 @@ fn spec(api_base: &str, tmp: &std::path::Path) -> VpsSpec {
         max_instances: 0,
         max_lifetime_secs: 0,
         key_path: tmp.join("key"),
-        pubkey: "ssh-ed25519 MOCKKEY thegn".into(),
+        pubkey: TEST_PUBKEY.into(),
         skip_ready_wait: true,
     }
 }
+
+/// A structurally valid (throwaway) ed25519 public key.
+const TEST_PUBKEY: &str =
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIgVgF3FLyN2aHUalBpkk3cMVfTgD+7TrbdfTAcSvLvB thegn";
 
 #[test]
 fn create_list_destroy_round_trip_with_ledger() {
@@ -140,6 +144,78 @@ fn create_list_destroy_round_trip_with_ledger() {
         .enable_all()
         .build()
         .unwrap();
+
+    // Drive the actual create boundary for every malformed local input
+    // category. Admission must happen before ensure_ssh_key (so no SSH-key
+    // lookup or registration), any registry read/write, or any HTTP request.
+    let over_name = "n".repeat(64);
+    type Mutation = Box<dyn Fn(&mut VpsSpec)>;
+    let cases: Vec<(&str, Mutation)> = vec![
+        (
+            "snapshot-text",
+            Box::new(|s| s.image = "snapshot:not-numeric".into()),
+        ),
+        ("snapshot-zero", Box::new(|s| s.image = "snapshot:0".into())),
+        (
+            "image-prefix",
+            Box::new(|s| s.image = "image:ubuntu-24.04".into()),
+        ),
+        ("image-slash", Box::new(|s| s.image = "ubuntu/24.04".into())),
+        (
+            "endpoint-userinfo",
+            Box::new(|s| s.api_base = "https://user:token@example.invalid/v1".into()),
+        ),
+        (
+            "endpoint-fragment",
+            Box::new(|s| s.api_base = "https://example.invalid/v1#x".into()),
+        ),
+        (
+            "endpoint-percent-host",
+            Box::new(|s| s.api_base = "http://ex%41mple.com/v1".into()),
+        ),
+        (
+            "name-space",
+            Box::new(|s| s.name = " tg-vps-invalid ".into()),
+        ),
+        ("name-query", Box::new(|s| s.name = "tg-vps?x".into())),
+        ("name-long", Box::new(move |s| s.name = over_name.clone())),
+        ("region", Box::new(|s| s.region = "FSN1".into())),
+        ("size", Box::new(|s| s.size = "cx23/../x".into())),
+        ("cap", Box::new(|s| s.max_instances = 257)),
+        ("lifetime", Box::new(|s| s.max_lifetime_secs = u64::MAX)),
+        (
+            "key-shape",
+            Box::new(|s| s.pubkey = "not-a-public-key".into()),
+        ),
+        (
+            "key-blob",
+            Box::new(|s| s.pubkey = "ssh-ed25519 MOCKKEY thegn".into()),
+        ),
+        (
+            "key-path",
+            Box::new(|s| s.key_path = std::path::PathBuf::new()),
+        ),
+    ];
+    for (label, mutate) in &cases {
+        let mut bad = spec(&base, tmp.path());
+        bad.name = format!("tg-vps-invalid-{label}");
+        mutate(&mut bad);
+        let ledger_key = bad.name.clone();
+        let error = rt
+            .block_on(VpsProvider::new(bad).create())
+            .expect_err("invalid spec must be rejected locally");
+        let rendered = format!("{error:#} {error:?}");
+        assert!(!rendered.contains("token@"), "{label}: {rendered}");
+        assert!(
+            recorded.lock().unwrap().is_empty(),
+            "invalid {label} made a request (including SSH-key lookup)"
+        );
+        assert!(
+            registry::read(&ledger_key).is_none() && registry::list().is_empty(),
+            "invalid {label} wrote a ledger row"
+        );
+    }
+
     let p = VpsProvider::new(spec(&base, tmp.path()));
 
     // --- create: registers our key (the listed one differs), posts the server,
@@ -156,7 +232,7 @@ fn create_list_destroy_round_trip_with_ledger() {
     let key_create = &reqs[1];
     assert_eq!(key_create.method, "POST");
     assert!(
-        key_create.body.contains("MOCKKEY"),
+        key_create.body.contains("TrbdfTAcSvLvB"),
         "registers OUR key: {}",
         key_create.body
     );

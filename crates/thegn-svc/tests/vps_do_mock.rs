@@ -124,7 +124,9 @@ fn spec(api_base: &str, tmp: &std::path::Path) -> VpsSpec {
         max_instances: 0,
         max_lifetime_secs: 0,
         key_path: tmp.join("key"),
-        pubkey: "ssh-ed25519 MOCKKEY thegn".into(),
+        pubkey:
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIgVgF3FLyN2aHUalBpkk3cMVfTgD+7TrbdfTAcSvLvB thegn"
+                .into(),
         skip_ready_wait: true,
     }
 }
@@ -154,7 +156,7 @@ fn create_list_destroy_round_trip_with_ledger() {
     let key_create = &reqs[1];
     assert_eq!(key_create.method, "POST");
     assert!(
-        key_create.body.contains("MOCKKEY"),
+        key_create.body.contains("TrbdfTAcSvLvB"),
         "registers OUR key: {}",
         key_create.body
     );
