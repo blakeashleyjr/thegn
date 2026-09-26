@@ -84,9 +84,6 @@ impl LocalResources {
             return Err("selected worktree/workspace environment changed during cleanup".into());
         }
         if db.has_cleanup_tenancy(path).map_err(|e| e.to_string())?
-            || db
-                .has_persisted_worktree_session(path)
-                .map_err(|e| e.to_string())?
             || db.has_cleanup_dispatch(path).map_err(|e| e.to_string())?
         {
             return Err("runtime/session/dispatch ownership requires explicit cleanup".into());
