@@ -224,9 +224,9 @@ fn rejects_foreign_main_target_mismatched_and_unregistered_paths() {
 }
 
 #[test]
-fn dirty_ignored_untracked_and_unknown_status_never_mean_clean() {
+fn tracked_and_untracked_status_never_mean_clean_but_ignored_only_is_admissible() {
     let _isolation = TestIsolation::new();
-    for path in ["tracked", "untracked", "ignored"] {
+    for path in ["tracked", "untracked"] {
         let fixture = Fixture::new();
         std::fs::write(fixture.wt.join(path), "new user work\n").unwrap();
         assert!(matches!(fixture.probe(), Err(Refusal::Dirty)), "{path}");
@@ -236,11 +236,42 @@ fn dirty_ignored_untracked_and_unknown_status_never_mean_clean() {
         );
     }
     let fixture = Fixture::new();
+    std::fs::write(fixture.wt.join("ignored"), "build output\n").unwrap();
+    let verified = fixture
+        .probe()
+        .expect("ignored-only build state is safely removable");
+    assert!(verified.discarded_build_state());
+    assert!(fixture.wt.join("ignored").exists());
+    let fixture = Fixture::new();
     let index = PathBuf::from(text(&fixture.wt, &["rev-parse", "--git-path", "index"]).unwrap());
     std::fs::write(&index, "corrupt fixture index").unwrap();
     assert!(fixture.probe().is_err());
     assert!(fixture.wt.exists());
     assert!(clean(&fixture._dir.path().join("absent")).is_err());
+}
+
+#[test]
+fn status_observation_accepts_only_well_formed_ignored_records() {
+    let empty = observe_status(Vec::new()).unwrap();
+    assert!(!empty.ignored_only);
+    assert_eq!(empty.bytes, Vec::<u8>::new());
+
+    let ignored = observe_status(b"!! target/\0!! cache/\0".to_vec()).unwrap();
+    assert!(ignored.ignored_only);
+    assert_eq!(ignored.bytes, b"!! target/\0!! cache/\0");
+
+    for status in [b" M tracked\0".as_slice(), b"?? untracked\0"] {
+        assert!(matches!(
+            observe_status(status.to_vec()),
+            Err(Refusal::Dirty)
+        ));
+    }
+    for malformed in [b"!!".as_slice(), b"!! \0", b"!x unknown\0"] {
+        assert!(matches!(
+            observe_status(malformed.to_vec()),
+            Err(Refusal::Dirty)
+        ));
+    }
 }
 
 #[test]
@@ -334,7 +365,7 @@ fn final_validation_preserves_new_ignored_files_and_replaced_directory() {
         "appeared after first validation",
     )
     .unwrap();
-    assert!(matches!(verified.remove(), Err(Refusal::Dirty)));
+    assert!(matches!(verified.remove(), Err(Refusal::Changed)));
     assert!(fixture.wt.join("ignored").exists());
     let fixture = Fixture::new();
     let verified = fixture.probe().unwrap();
