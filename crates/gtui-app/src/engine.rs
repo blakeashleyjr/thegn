@@ -266,8 +266,18 @@ mod tests {
     use gtui_core::frame::Frame;
     use tokio::runtime::Handle;
 
+    /// Recorded queries, shared with the spawned engine's data source.
+    type RecordedQueries = Arc<Mutex<Vec<Vec<Query>>>>;
+
+    /// A spawned engine plus the queries its source observed.
+    type EngineHarness = (
+        mpsc::UnboundedSender<EngineCmd>,
+        mpsc::UnboundedReceiver<PanelUpdate>,
+        RecordedQueries,
+    );
+
     struct RecordingSource {
-        queries: Arc<Mutex<Vec<Vec<Query>>>>,
+        queries: RecordedQueries,
     }
 
     impl DataSource for RecordingSource {
@@ -306,15 +316,7 @@ mod tests {
         }
     }
 
-    fn spawn_engine(
-        window: RelativeWindow,
-        clock: Clock,
-        refresh: Duration,
-    ) -> (
-        mpsc::UnboundedSender<EngineCmd>,
-        mpsc::UnboundedReceiver<PanelUpdate>,
-        Arc<Mutex<Vec<Vec<Query>>>>,
-    ) {
+    fn spawn_engine(window: RelativeWindow, clock: Clock, refresh: Duration) -> EngineHarness {
         let queries = Arc::new(Mutex::new(Vec::new()));
         let mut sources: HashMap<String, Arc<dyn DataSource>> = HashMap::new();
         sources.insert(
@@ -339,11 +341,7 @@ mod tests {
         let times = Arc::new(Mutex::new((VecDeque::from(times), None)));
         Arc::new(move || {
             let mut state = times.lock().unwrap();
-            let next = state
-                .0
-                .pop_front()
-                .or_else(|| state.1.clone())
-                .expect("empty test clock");
+            let next = state.0.pop_front().or(state.1).expect("empty test clock");
             state.1 = Some(next);
             next
         })
