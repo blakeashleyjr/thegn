@@ -4,6 +4,8 @@
 //! retained for explicit operator inspection. Pins/rechecks are not a lease
 //! against arbitrary concurrent same-UID filesystem mutation.
 
+#[cfg(test)]
+use super::gate_base_for_repo;
 use super::{GateVerdict, gate_base, tail};
 use crate::platform::gate_path::{Directory, Lock, Regular, read_regular};
 use anyhow::{Context, Result, ensure};
@@ -413,7 +415,51 @@ struct Workspace {
     checkout: Checkout,
     oid: String,
     target: Option<PathBuf>,
+    target_private: bool,
     temporary_parent: Option<PathBuf>,
+}
+
+fn verified_repository_id(repo: &Repository, common: &Directory) -> Result<String> {
+    // `common` is retained and checked by the workspace, so its filesystem
+    // identity is the confirmation. Git's own absolute common-dir resolution
+    // is the authority used for the stable key; a caller path is never hashed.
+    common.verify()?;
+    let verified = thegn_core::repo::canonical_common_dir(repo.path())
+        .map_err(|error| anyhow::anyhow!("verified Git common directory unavailable: {error}"))?;
+    ensure!(
+        verified.as_path() == common.path(),
+        "Git common directory mapping disagrees with the verified repository"
+    );
+    Ok(thegn_core::repo::repository_id(repo.path())
+        .map_err(|error| anyhow::anyhow!("repository identity unavailable: {error}"))?
+        .hex())
+}
+
+fn unique_selection(
+    config: &MergeQueueConfig,
+) -> Result<(
+    Directory,
+    Option<Lock>,
+    Option<PathBuf>,
+    Option<PathBuf>,
+    bool,
+)> {
+    // Once Git may populate the child, do not let TempDir::drop perform
+    // recursive cleanup after a failed/replaced identity check.
+    let temporary = tempfile::Builder::new()
+        .prefix("thegn-gate-")
+        .tempdir_in(std::fs::canonicalize(std::env::temp_dir())?)?;
+    let parent = Directory::open(temporary.path(), None)?;
+    let path = temporary.keep();
+    // An isolated gate must not inherit the reused/default target directory.
+    // An explicitly configured directory is an operator opt-in to sharing it.
+    let target_private = config.gate_target_dir.is_empty();
+    let target = if target_private {
+        path.join("target")
+    } else {
+        PathBuf::from(&config.gate_target_dir)
+    };
+    Ok((parent, None, Some(path), Some(target), target_private))
 }
 
 impl Workspace {
@@ -461,29 +507,52 @@ impl Workspace {
             "gate object is not the requested commit"
         );
 
-        let (parent, lock, temporary_parent, target) = if config.gate_reuse_worktree {
+        let (parent, lock, temporary_parent, target, target_private) = if config.gate_reuse_worktree
+            && crate::platform::gate_path::verified_workspace_supported()
+        {
             let state = util::xdg_state_home();
-            let base = gate_base(repo.path());
-            let parent =
-                Directory::open(&base, Some(&state)).context("gate state directory unavailable")?;
-            let lock = Lock::acquire(&base.join("wt.lock")).context("gate lock unavailable")?;
-            let target = if config.gate_target_dir.is_empty() {
-                base.join("target")
+            let identity = verified_repository_id(&repo, &common);
+            let base = identity.as_ref().ok().map(|id| gate_base(id));
+            let reused = base.as_ref().and_then(|base| {
+                (|| -> Result<_> {
+                    let parent = Directory::open(base, Some(&state))
+                        .context("gate state directory unavailable")?;
+                    let lock =
+                        Lock::acquire(&base.join("wt.lock")).context("gate lock unavailable")?;
+                    Ok((parent, lock, base.clone()))
+                })()
+                .map_err(|error| {
+                    tracing::warn!(
+                        target: "thegn::merge_gate",
+                        path = %base.display(),
+                        error = %error,
+                        "reused gate admission unavailable; selecting an isolated gate"
+                    );
+                    error
+                })
+                .ok()
+            });
+            if reused.is_none() {
+                if let Err(error) = identity {
+                    tracing::warn!(
+                        target: "thegn::merge_gate",
+                        repo = %repo.path().display(),
+                        error = %error,
+                        "reused gate identity unavailable; selecting an isolated gate"
+                    );
+                }
+                unique_selection(config)?
             } else {
-                PathBuf::from(&config.gate_target_dir)
-            };
-            (parent, Some(lock), None, Some(target))
+                let (parent, lock, base) = reused.unwrap();
+                let target = if config.gate_target_dir.is_empty() {
+                    base.join("target")
+                } else {
+                    PathBuf::from(&config.gate_target_dir)
+                };
+                (parent, Some(lock), None, Some(target), false)
+            }
         } else {
-            // Once Git may populate the child, do not let TempDir::drop perform
-            // recursive cleanup after a failed/replaced identity check.
-            let temporary = tempfile::Builder::new()
-                .prefix("thegn-gate-")
-                .tempdir_in(std::fs::canonicalize(std::env::temp_dir())?)?;
-            let parent = Directory::open(temporary.path(), None)?;
-            let path = temporary.keep();
-            let target = (!config.gate_target_dir.is_empty())
-                .then(|| PathBuf::from(&config.gate_target_dir));
-            (parent, None, Some(path), target)
+            unique_selection(config)?
         };
         let wt = parent.path().join("wt");
         parent.verify()?;
@@ -554,6 +623,7 @@ impl Workspace {
             checkout,
             oid: oid.into(),
             target,
+            target_private,
             temporary_parent,
         };
         workspace.verify()?;
@@ -641,6 +711,10 @@ impl Workspace {
         self.checkout.verify(Some(&self.oid))
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "isolated target cleanup is scoped to the unique gate parent"
+    )]
     fn cleanup(&self) -> Result<()> {
         let Some(parent) = &self.temporary_parent else {
             return Ok(());
@@ -665,17 +739,29 @@ impl Workspace {
             "temporary gate removal failed; state retained"
         );
         self.parent.verify()?;
+        if self.target_private
+            && let Some(target) = &self.target
+        {
+            match std::fs::symlink_metadata(target) {
+                Ok(_) => std::fs::remove_dir_all(target).with_context(|| {
+                    format!(
+                        "temporary gate target cleanup failed at {}",
+                        target.display()
+                    )
+                })?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
         std::fs::remove_dir(parent).context("temporary gate parent is not empty; retained")?;
         Ok(())
     }
 
     fn command_for(&self, command: &str) -> Result<std::process::Command> {
         self.verify()?;
-        let argv = thegn_core::sandbox_cpucap::wrap_background_argv(vec![
-            "sh".into(),
-            "-c".into(),
-            command.into(),
-        ]);
+        let argv = thegn_core::sandbox_cpucap::wrap_background_argv(
+            thegn_core::shellinv::run_argv(&thegn_core::util::shell(), command),
+        );
         let mut command = std::process::Command::new(&argv[0]);
         command
             .args(&argv[1..])
@@ -703,7 +789,193 @@ impl Workspace {
     }
 }
 
+/// Native unique-worktree runner used on platforms where the descriptor-
+/// relative verified state seam is unavailable. It never opens the reused
+/// state root, so unsupported locking cannot turn into shared-worktree use.
+struct NativeWorkspace {
+    repo: PathBuf,
+    parent: PathBuf,
+    worktree: PathBuf,
+    oid: String,
+    target: PathBuf,
+}
+
+impl NativeWorkspace {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the isolated gate is an off-loop worker and captures bounded Git output"
+    )]
+    fn prepare(repo: &Path, oid: &str, config: &MergeQueueConfig) -> Result<Self> {
+        let repo = std::fs::canonicalize(repo).context("gate repository unavailable")?;
+        let temporary = tempfile::Builder::new()
+            .prefix("thegn-gate-")
+            .tempdir_in(std::fs::canonicalize(std::env::temp_dir())?)?;
+        let parent = temporary.keep();
+        let worktree = parent.join("wt");
+        let output = gate_git(&repo)
+            .args([
+                "-c",
+                "core.fsmonitor=false",
+                "worktree",
+                "add",
+                "--detach",
+                worktree
+                    .to_str()
+                    .context("isolated gate path is not UTF-8")?,
+                oid,
+            ])
+            .output()
+            .context("isolated gate worktree could not be created")?;
+        ensure!(
+            output.status.success(),
+            "isolated gate worktree creation failed at {}: {}",
+            worktree.display(),
+            output_tail(&output)
+        );
+        let target = if config.gate_target_dir.is_empty() {
+            parent.join("target")
+        } else {
+            PathBuf::from(&config.gate_target_dir)
+        };
+        let this = Self {
+            repo,
+            parent,
+            worktree,
+            oid: oid.to_owned(),
+            target,
+        };
+        this.verify()?;
+        Ok(this)
+    }
+
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the isolated gate is an off-loop worker"
+    )]
+    fn verify(&self) -> Result<()> {
+        let output = gate_git(&self.worktree)
+            .args(["-c", "core.fsmonitor=false", "rev-parse", "HEAD"])
+            .output()
+            .context("isolated gate HEAD could not be inspected")?;
+        ensure!(
+            output.status.success(),
+            "isolated gate HEAD could not be inspected at {}: {}",
+            self.worktree.display(),
+            output_tail(&output)
+        );
+        let head = String::from_utf8(output.stdout).context("isolated gate HEAD was not UTF-8")?;
+        ensure!(
+            head.trim() == self.oid,
+            "isolated gate HEAD no longer matches the pinned commit at {}",
+            self.worktree.display()
+        );
+        Ok(())
+    }
+
+    fn command_for(&self, command: &str) -> Result<std::process::Command> {
+        self.verify()?;
+        let argv = thegn_core::sandbox_cpucap::wrap_background_argv(
+            thegn_core::shellinv::run_argv(&thegn_core::util::shell(), command),
+        );
+        let mut command = std::process::Command::new(&argv[0]);
+        command
+            .args(&argv[1..])
+            .current_dir(&self.worktree)
+            .env("GIT_NO_REPLACE_OBJECTS", "1")
+            .env("THEGN_GATE", "1")
+            .env("THEGN_WORKTREE", &self.worktree)
+            .env("THEGN_GATE_OID", &self.oid)
+            .env("CARGO_TARGET_DIR", &self.target);
+        for key in util::GIT_ENV_VARS {
+            command.env_remove(key);
+        }
+        Ok(command)
+    }
+
+    #[expect(clippy::disallowed_methods)]
+    fn spawn(&self, command: &str) -> Result<std::process::Output> {
+        self.command_for(command)?
+            .output()
+            .context("isolated gate command could not be started")
+    }
+
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "cleanup is scoped to the private unique gate parent after Git unregisters it"
+    )]
+    fn cleanup(&self) -> Result<()> {
+        let output = gate_git(&self.repo)
+            .args([
+                "-c",
+                "core.fsmonitor=false",
+                "worktree",
+                "remove",
+                "--force",
+                self.worktree
+                    .to_str()
+                    .context("isolated gate path is not UTF-8")?,
+            ])
+            .output()
+            .context("isolated gate worktree cleanup could not start")?;
+        ensure!(
+            output.status.success(),
+            "isolated gate cleanup failed at {}: {}",
+            self.worktree.display(),
+            output_tail(&output)
+        );
+        std::fs::remove_dir_all(&self.parent).with_context(|| {
+            format!(
+                "isolated gate private parent is not removable: {}",
+                self.parent.display()
+            )
+        })?;
+        Ok(())
+    }
+}
+
+fn run_native_isolated(repo: &Path, oid: &str, config: &MergeQueueConfig) -> Result<GateVerdict> {
+    let workspace = NativeWorkspace::prepare(repo, oid, config)
+        .with_context(|| format!("isolated gate preparation failed for {}", repo.display()))?;
+    let verdict = (|| -> Result<GateVerdict> {
+        if !config.gate_setup_command.is_empty() {
+            let output = workspace.spawn(&config.gate_setup_command)?;
+            workspace.verify()?;
+            if !output.status.success() {
+                return Ok(GateVerdict::Error {
+                    reason: format!(
+                        "gate_setup_command failed (exit {})",
+                        output
+                            .status
+                            .code()
+                            .map_or_else(|| "signal".into(), |code| code.to_string())
+                    ),
+                    log: output_tail(&output),
+                });
+            }
+        }
+        let output = workspace.spawn(&config.gate_command)?;
+        workspace.verify()?;
+        Ok(match gate::classify_exit(output.status.code(), false) {
+            gate::GateClass::Passed => GateVerdict::Passed,
+            gate::GateClass::Failed => GateVerdict::Failed {
+                log: output_tail(&output),
+            },
+            gate::GateClass::Error => GateVerdict::Error {
+                reason: gate::error_reason(output.status.code(), false).into(),
+                log: output_tail(&output),
+            },
+        })
+    })();
+    workspace.verify()?;
+    let cleanup = workspace.cleanup();
+    cleanup?;
+    verdict
+}
+
 pub(super) fn run(repo: &Path, oid: &str, config: &MergeQueueConfig) -> Result<GateVerdict> {
+    if !crate::platform::gate_path::verified_workspace_supported() {
+        return run_native_isolated(repo, oid, config);
+    }
     let workspace = Workspace::prepare(repo, oid, config)?;
     let verdict = (|| -> Result<GateVerdict> {
         if !config.gate_setup_command.is_empty() {
