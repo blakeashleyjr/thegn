@@ -306,14 +306,21 @@ pub(crate) struct StatusObservation {
     ignored_only: bool,
 }
 
+/// Classify a porcelain-v1 `-z` status. Only `!! <path>` records — ignored
+/// build state — are admissible; every tracked or untracked record is real user
+/// work, and anything that does not parse is refused as unsafe rather than as an
+/// edit, so an unexpected Git output shape is never reported as "edited".
 fn observe_status(bytes: Vec<u8>) -> Result<StatusObservation, Refusal> {
     let mut ignored_only = false;
     for record in bytes
         .split(|byte| *byte == 0)
         .filter(|record| !record.is_empty())
     {
-        if record.len() < 4 || record[2] != b' ' || record[3..].is_empty() {
-            return Err(Refusal::Dirty);
+        // `XY <path>`: two status bytes, a space, then a non-empty path. A
+        // rename's trailing bare-path field fails this and is refused too,
+        // which is correct — a rename is a tracked modification.
+        if record.len() < 4 || record[2] != b' ' {
+            return Err(unsafe_reason("unparseable git status record"));
         }
         if record.starts_with(b"!! ") {
             ignored_only = true;

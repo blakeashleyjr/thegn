@@ -544,7 +544,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::disallowed_methods)]
     fn landed_worktree_status_matrix_respects_expiry_and_force_without_discarding_edits() {
         let states = ["clean", "ignored", "tracked", "untracked"];
         for state in states {
@@ -588,9 +587,9 @@ mod tests {
                     assert_eq!(
                         report.discarded_build_state,
                         if state == "ignored" {
-                            vec!["feature".into()]
+                            vec!["feature".to_string()]
                         } else {
-                            Vec::new()
+                            Vec::<String>::new()
                         },
                         "{state}, force={force}"
                     );

@@ -260,17 +260,27 @@ fn status_observation_accepts_only_well_formed_ignored_records() {
     assert!(ignored.ignored_only);
     assert_eq!(ignored.bytes, b"!! target/\0!! cache/\0");
 
-    for status in [b" M tracked\0".as_slice(), b"?? untracked\0"] {
-        assert!(matches!(
-            observe_status(status.to_vec()),
-            Err(Refusal::Dirty)
-        ));
+    // Well-formed records that are not ignored state are real work.
+    for status in [
+        b" M tracked\0".as_slice(),
+        b"?? untracked\0",
+        b"R  new\0",
+        b"!x unknown\0",
+    ] {
+        assert!(
+            matches!(observe_status(status.to_vec()), Err(Refusal::Dirty)),
+            "{:?}",
+            String::from_utf8_lossy(status)
+        );
     }
-    for malformed in [b"!!".as_slice(), b"!! \0", b"!x unknown\0"] {
-        assert!(matches!(
-            observe_status(malformed.to_vec()),
-            Err(Refusal::Dirty)
-        ));
+    // A record that does not parse is refused as unsafe, never reported to the
+    // operator as an edit they made.
+    for malformed in [b"!!".as_slice(), b"!! \0", b"!!x\0"] {
+        assert!(
+            matches!(observe_status(malformed.to_vec()), Err(Refusal::Unsafe(_))),
+            "{:?}",
+            String::from_utf8_lossy(malformed)
+        );
     }
 }
 
