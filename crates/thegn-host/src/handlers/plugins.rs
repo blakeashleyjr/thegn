@@ -22,6 +22,7 @@ use thegn_svc::plugin::{LoadedPlugin, SessionEvent, SessionWriter};
 use tokio::sync::mpsc as tokio_mpsc;
 
 use crate::chrome::FrameModel;
+use crate::plugin_damage::PluginDamage;
 use crate::plugins::{LoadedState, PluginMsg, PluginsHost};
 
 /// One live (or dead-but-remembered) plugin on the loop side.
@@ -384,8 +385,10 @@ pub(crate) fn flush_alerts(state: &mut PluginsState) {
     }
 }
 
-/// Apply every queued [`PluginMsg`]. Returns whether chrome must repaint (a
-/// statusbar view changed, a contribution set changed, or a plugin died).
+/// Apply every queued [`PluginMsg`]. Returns the narrowest aggregate render
+/// damage (statusbar content, structural lifecycle/contribution change, or
+/// none). The before/after comparison is deliberately made around the whole
+/// drain so coalesced updates that return to their original view stay idle.
 /// `host` is the respawn/shutdown handle; `None` (tests) records restart
 /// decisions without spawning anything.
 pub(crate) fn drain(
@@ -393,8 +396,9 @@ pub(crate) fn drain(
     state: &mut PluginsState,
     model: &mut FrameModel,
     host: Option<&PluginsHost>,
-) -> bool {
-    let mut repaint = false;
+) -> PluginDamage {
+    let before_views = statusbar_views(state);
+    let mut damage = PluginDamage::None;
     while let Ok(msg) = rx.try_recv() {
         match msg {
             PluginMsg::Loaded(list) => {
@@ -405,10 +409,10 @@ pub(crate) fn drain(
                     state.plugins.insert(id, entry);
                 }
                 sync_provider_registry(state);
-                repaint = true;
+                damage.merge(PluginDamage::Structural);
             }
             PluginMsg::Event { plugin, event } => match event {
-                SessionEvent::Message(m) => repaint |= apply_message(state, &plugin, m),
+                SessionEvent::Message(m) => damage.merge(apply_message(state, &plugin, m)),
                 SessionEvent::Response(r) => {
                     // Provider replies are resolved by the owning session before
                     // enqueueing host events. Never route an old session's id
@@ -419,7 +423,7 @@ pub(crate) fn drain(
                     tracing::debug!(target: "thegn::plugin", plugin = %plugin, "junk: {line}");
                 }
                 SessionEvent::Exit { code } => {
-                    repaint |= handle_exit(state, model, host, &plugin, code);
+                    damage.merge(handle_exit(state, model, host, &plugin, code));
                 }
             },
             PluginMsg::OneShot { plugin, run } => match run {
@@ -431,7 +435,7 @@ pub(crate) fn drain(
                         tracing::warn!(target: "thegn::plugin", plugin = %plugin, "one-shot output truncated");
                     }
                     for m in run.messages {
-                        repaint |= apply_message(state, &plugin, m);
+                        damage.merge(apply_message(state, &plugin, m));
                     }
                 }
                 Err(e) => {
@@ -460,16 +464,22 @@ pub(crate) fn drain(
                         entry.writer = Some(w);
                         send_activate(entry);
                         sync_provider_registry(state);
-                        repaint = true;
+                        damage.merge(PluginDamage::Structural);
                     }
                     // The respawn itself failed: treat like another crash so
                     // the backoff keeps climbing toward the cap.
-                    None => repaint |= handle_exit(state, model, host, &plugin, None),
+                    None => damage.merge(handle_exit(state, model, host, &plugin, None)),
                 }
             }
         }
     }
-    repaint
+    if damage < PluginDamage::Structural {
+        damage.merge(crate::plugin_damage::classify(
+            &before_views,
+            &statusbar_views(state),
+        ));
+    }
+    damage
 }
 
 /// A resident session died: decide restart (backoff, capped at 3) or mark the
@@ -480,16 +490,16 @@ fn handle_exit(
     host: Option<&PluginsHost>,
     plugin: &str,
     code: Option<i32>,
-) -> bool {
+) -> PluginDamage {
     let Some(entry) = state.plugins.get_mut(plugin) else {
-        return false;
+        return PluginDamage::None;
     };
     entry.writer = None;
     entry.bridge = None;
     sync_provider_registry(state);
     let entry = state.plugins.get_mut(plugin).expect("looked up above");
     if entry.disabled {
-        return false;
+        return PluginDamage::None;
     }
     match crate::plugins::restart_delay(entry.restarts) {
         Some(delay) => {
@@ -511,7 +521,7 @@ fn handle_exit(
             model.status = format!("plugin {plugin} keeps crashing — disabled until config reload");
         }
     }
-    true
+    PluginDamage::Structural
 }
 
 /// Map a runtime error onto the wire vocabulary.
@@ -551,8 +561,9 @@ fn parse_register_contribution(params: serde_json::Value) -> Result<Contribution
         .map_err(|e| RpcError::new(RpcErrorCode::Invalid, format!("bad contribution: {e}")))
 }
 
-/// Apply one verb from a plugin. Returns whether chrome must repaint.
-fn apply_message(state: &mut PluginsState, plugin: &str, msg: RpcMessage) -> bool {
+/// Apply one verb from a plugin. Lifecycle/contribution changes are structural;
+/// view updates are classified once the entire drain has been coalesced.
+fn apply_message(state: &mut PluginsState, plugin: &str, msg: RpcMessage) -> PluginDamage {
     let Some(verb) = HostVerb::ALL
         .iter()
         .copied()
@@ -571,18 +582,18 @@ fn apply_message(state: &mut PluginsState, plugin: &str, msg: RpcMessage) -> boo
                 ),
             );
         }
-        return false;
+        return PluginDamage::None;
     };
     let Some(entry) = state.plugins.get(plugin) else {
         tracing::debug!(target: "thegn::plugin", plugin = %plugin, "message from unknown plugin");
-        return false;
+        return PluginDamage::None;
     };
     if let Err(error) = host_verb_check(&entry.plugin.spec, verb) {
         tracing::debug!(target: "thegn::plugin", plugin = %plugin, verb = verb.method_name(), error = %error.message, "verb rejected by support contract");
         if let Some(id) = msg.id {
             respond(entry, RpcResponse::err(id, error));
         }
-        return false;
+        return PluginDamage::None;
     }
     // host.call needs `&mut state` for the lazy dispatcher, so it is handled
     // before the per-entry borrow below.
@@ -597,7 +608,7 @@ fn apply_message(state: &mut PluginsState, plugin: &str, msg: RpcMessage) -> boo
     let params = msg.params;
     // The verb's effect, plus the value (if any) an id-bearing request gets
     // back. Invalid params short-circuit to an Invalid error response.
-    let mut repaint = false;
+    let mut damage = PluginDamage::None;
     let outcome: Result<serde_json::Value, RpcError> = match verb {
         HostVerb::Register => parse_register_contribution(params).and_then(|c| {
             entry
@@ -605,7 +616,9 @@ fn apply_message(state: &mut PluginsState, plugin: &str, msg: RpcMessage) -> boo
                 .register(pid.clone(), c.clone())
                 .map_err(rpc_error_of)?;
             if !entry.contributions.iter().any(|x| x.id == c.id) {
-                repaint |= c.extension_point == ExtensionPoint::StatusBarSegment;
+                if c.extension_point == ExtensionPoint::StatusBarSegment {
+                    damage.merge(PluginDamage::Structural);
+                }
                 entry.contributions.push(c);
             }
             Ok(serde_json::Value::Null)
@@ -621,10 +634,7 @@ fn apply_message(state: &mut PluginsState, plugin: &str, msg: RpcMessage) -> boo
                     .runtime
                     .update(pid.clone(), SurfaceId::new(s), v)
                     .map_err(rpc_error_of)
-                    .map(|res| {
-                        repaint |= res.changed;
-                        serde_json::Value::Null
-                    }),
+                    .map(|_| serde_json::Value::Null),
                 _ => Err(RpcError::new(
                     RpcErrorCode::Invalid,
                     "update params must be {\"surface\": \"…\", \"view\": {…}}",
@@ -736,35 +746,35 @@ fn apply_message(state: &mut PluginsState, plugin: &str, msg: RpcMessage) -> boo
     } else if let Err(e) = outcome {
         tracing::debug!(target: "thegn::plugin", plugin = %plugin, verb = verb.method_name(), error = %e.message, "verb failed");
     }
-    repaint
+    damage
 }
 
 /// `host.call`: scope-check on the loop, dispatch on the dispatcher thread,
 /// answer directly through the plugin's writer.
-fn apply_host_call(state: &mut PluginsState, plugin: &str, msg: RpcMessage) -> bool {
+fn apply_host_call(state: &mut PluginsState, plugin: &str, msg: RpcMessage) -> PluginDamage {
     let Some(entry) = state.plugins.get_mut(plugin) else {
-        return false;
+        return PluginDamage::None;
     };
     let Some(id) = msg.id else {
         tracing::debug!(target: "thegn::plugin", plugin = %plugin, "host.call without id ignored");
-        return false;
+        return PluginDamage::None;
     };
     let Some(writer) = entry.writer.clone() else {
         // One-shot plugins cannot receive replies — skip dispatch entirely.
         tracing::warn!(target: "thegn::plugin", plugin = %plugin, "host.call from a one-shot plugin skipped (no reply channel)");
-        return false;
+        return PluginDamage::None;
     };
     let Some(cap) = param_str(&msg.params, "cap") else {
         respond(
             entry,
             RpcResponse::err(id, RpcError::new(RpcErrorCode::Invalid, "missing cap")),
         );
-        return false;
+        return PluginDamage::None;
     };
     if let Err(e) = authorize_host_call(entry, &cap) {
         tracing::debug!(target: "thegn::plugin", plugin = %plugin, cap = %cap, error = %e.message, "host.call denied");
         respond(entry, RpcResponse::err(id, e));
-        return false;
+        return PluginDamage::None;
     }
     let params = msg
         .params
@@ -780,14 +790,14 @@ fn apply_host_call(state: &mut PluginsState, plugin: &str, msg: RpcMessage) -> b
             entry,
             RpcResponse::ok(id, serde_json::json!({ "subscribed": true })),
         );
-        return false;
+        return PluginDamage::None;
     }
     let cfg = state.cfg.clone();
     let dispatcher = state
         .dispatcher
         .get_or_insert_with(|| Dispatcher::spawn(cfg));
     dispatcher.dispatch(writer, id, cap, params);
-    false
+    PluginDamage::None
 }
 
 /// Start an off-loop bridge that forwards the daemon control event feed to a
@@ -1049,9 +1059,19 @@ mod tests {
         }
     }
 
-    fn drain_one(state: &mut PluginsState, model: &mut FrameModel, m: PluginMsg) -> bool {
+    fn drain_one(state: &mut PluginsState, model: &mut FrameModel, m: PluginMsg) -> PluginDamage {
+        drain_messages(state, model, [m])
+    }
+
+    fn drain_messages(
+        state: &mut PluginsState,
+        model: &mut FrameModel,
+        messages: impl IntoIterator<Item = PluginMsg>,
+    ) -> PluginDamage {
         let (tx, mut rx) = tokio_mpsc::unbounded_channel();
-        tx.send(m).unwrap();
+        for message in messages {
+            tx.send(message).unwrap();
+        }
         drop(tx);
         drain(&mut rx, state, model, None)
     }
@@ -1074,11 +1094,28 @@ mod tests {
                 )),
             },
         );
-        assert!(repaint, "changed view repaints");
+        assert_ne!(repaint, PluginDamage::None, "changed view repaints");
         let views = statusbar_views(&state);
         assert_eq!(views.len(), 1);
         assert_eq!(views[0].0, "p label");
         assert_eq!(views[0].1.text_content(), "3 mails");
+        // Equal-width content update stays on the bounded statusbar path.
+        let repaint = drain_one(
+            &mut state,
+            &mut model,
+            PluginMsg::Event {
+                plugin: "p".into(),
+                event: SessionEvent::Message(msg(
+                    "update",
+                    serde_json::json!({
+                        "surface": "p/seg",
+                        "view": {"spans": [{"text": "4 mails", "role": "Default"}]}
+                    }),
+                )),
+            },
+        );
+        assert_eq!(repaint, PluginDamage::StatusbarContent);
+
         // Identical update → no repaint (SurfaceCache reports unchanged).
         let repaint = drain_one(
             &mut state,
@@ -1089,12 +1126,46 @@ mod tests {
                     "update",
                     serde_json::json!({
                         "surface": "p/seg",
-                        "view": {"spans": [{"text": "3 mails", "role": "Default"}]}
+                        "view": {"spans": [{"text": "4 mails", "role": "Default"}]}
                     }),
                 )),
             },
         );
-        assert!(!repaint, "unchanged view is not a repaint");
+        assert_eq!(
+            repaint,
+            PluginDamage::None,
+            "unchanged view is not a repaint"
+        );
+
+        // Coalesced updates that return to the visible view before the frame
+        // boundary also emit no frame.
+        let repaint = drain_messages(
+            &mut state,
+            &mut model,
+            [
+                PluginMsg::Event {
+                    plugin: "p".into(),
+                    event: SessionEvent::Message(msg(
+                        "update",
+                        serde_json::json!({
+                            "surface": "p/seg",
+                            "view": {"spans": [{"text": "3 mails", "role": "Default"}]}
+                        }),
+                    )),
+                },
+                PluginMsg::Event {
+                    plugin: "p".into(),
+                    event: SessionEvent::Message(msg(
+                        "update",
+                        serde_json::json!({
+                            "surface": "p/seg",
+                            "view": {"spans": [{"text": "4 mails", "role": "Default"}]}
+                        }),
+                    )),
+                },
+            ],
+        );
+        assert_eq!(repaint, PluginDamage::None);
     }
 
     #[test]
@@ -1111,14 +1182,17 @@ mod tests {
             )],
             ..Default::default()
         };
-        assert!(drain_one(
-            &mut state,
-            &mut model,
-            PluginMsg::OneShot {
-                plugin: "p".into(),
-                run: Ok(run)
-            }
-        ));
+        assert_ne!(
+            drain_one(
+                &mut state,
+                &mut model,
+                PluginMsg::OneShot {
+                    plugin: "p".into(),
+                    run: Ok(run)
+                }
+            ),
+            PluginDamage::None
+        );
         assert_eq!(statusbar_views(&state)[0].1.text_content(), "ok");
     }
 

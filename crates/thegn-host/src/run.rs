@@ -6824,6 +6824,9 @@ async fn event_loop<T: Terminal>(
     // incremental path (recompose + bounded-diff the two 1-row bar rects) instead
     // of the master `dirty` full-chrome repaint. Cleared after flush.
     let mut bars_dirty = false;
+    // Plugin content damage: a stable-width/status placement update repaints
+    // only the bottom statusbar row, leaving the masthead on the fast path.
+    let mut statusbar_dirty = false;
     let mut sidebar_dirty = false; // D5: sidebar-only damage (nav/collapse); reset with bars_dirty
     // One zone owns the keyboard at any time; Ctrl+g toggles the keybind lock.
     // `sb.focused` / `model.panel_focused` / `model.center_focused` mirror it.
@@ -11722,18 +11725,27 @@ async fn event_loop<T: Terminal>(
             crate::handlers::pr_queue::drain_msgs(&mut prq_rx, &mut prq_ctx);
         }
         // Plugin runtime messages: apply verbs to the per-plugin runtimes and
-        // repaint the bars when a statusbar view changed (bars-only damage —
-        // `render_plan` keeps it off the panes). Raised alerts are recorded to
-        // the inbox off-loop by `flush_alerts`.
-        if crate::handlers::plugins::drain(
+        // map the aggregate plugin damage to the narrowest compositor channel.
+        // Raised alerts are recorded to the inbox off-loop by `flush_alerts`.
+        match crate::handlers::plugins::drain(
             &mut plugin_rx,
             &mut plugins_state,
             &mut model,
             plugins_host.as_ref(),
         ) {
-            model.plugin_segments = crate::handlers::plugins::statusbar_views(&plugins_state);
-            bars_dirty = true;
-            dirty = true;
+            crate::plugin_damage::PluginDamage::None => {}
+            crate::plugin_damage::PluginDamage::StatusbarContent => {
+                model.plugin_segments = crate::handlers::plugins::statusbar_views(&plugins_state);
+                statusbar_dirty = true;
+            }
+            crate::plugin_damage::PluginDamage::Structural => {
+                model.plugin_segments = crate::handlers::plugins::statusbar_views(&plugins_state);
+                // Contribution/lifecycle or placement changes must retain the
+                // existing broad chrome path so draw_statusbar recomputes all
+                // fitting and cluster placement safely.
+                bars_dirty = true;
+                dirty = true;
+            }
         }
         crate::handlers::plugins::flush_alerts(&mut plugins_state);
         dirty |= crate::worktree_lifecycle::apply_completions(
@@ -12795,13 +12807,18 @@ async fn event_loop<T: Terminal>(
         //    the poll timeout below guarantees the trailing flush) and defers
         //    composition past a queued-but-undispatched keystroke so one frame
         //    carries its effect.
-        let have_damage =
-            dirty || full_repaint || !dirty_panes.is_empty() || bars_dirty || sidebar_dirty;
+        let have_damage = dirty
+            || full_repaint
+            || !dirty_panes.is_empty()
+            || bars_dirty
+            || statusbar_dirty
+            || sidebar_dirty;
         let mut defer_timeout: Option<std::time::Duration> = None;
         let pane_only_damage = !dirty
             && !full_repaint
             && switch_at.is_none()
             && !bars_dirty
+            && !statusbar_dirty
             && !sidebar_dirty
             && !dirty_panes.is_empty();
         let input_queued = pending_input.iter().any(|e| {
@@ -13071,6 +13088,7 @@ async fn event_loop<T: Terminal>(
                 switch: switch_at.is_some(),
                 panes: dirty_panes.clone(),
                 bars: bars_dirty,
+                statusbar: statusbar_dirty,
                 sidebar: sidebar_dirty,
             };
             let frame_plan = crate::render_plan::plan(&damage, &overlays);
@@ -13206,6 +13224,7 @@ async fn event_loop<T: Terminal>(
             } else if let crate::render_plan::RenderPlan::Incremental {
                 panes: ref ids,
                 bars,
+                statusbar,
                 sidebar,
             } = frame_plan
             {
@@ -13290,6 +13309,11 @@ async fn event_loop<T: Terminal>(
                     crate::chrome::draw_masthead(&mut scratch, &chrome, &model);
                     crate::chrome::draw_statusbar(&mut scratch, chrome.statusbar, &model);
                     pane_diff_rects.push(chrome.masthead);
+                    pane_diff_rects.push(chrome.statusbar);
+                } else if statusbar {
+                    // Plugin content with stable rendered geometry owns only
+                    // the statusbar row; do not redraw the masthead.
+                    crate::chrome::draw_statusbar(&mut scratch, chrome.statusbar, &model);
                     pane_diff_rects.push(chrome.statusbar);
                 }
                 if sidebar && let Some(sb) = chrome.sidebar {
@@ -13839,6 +13863,7 @@ async fn event_loop<T: Terminal>(
             // Pane/bars damage is now on screen; an untouched next wake renders nothing.
             dirty_panes.clear();
             bars_dirty = false;
+            statusbar_dirty = false;
             sidebar_dirty = false;
             if muse_ready {
                 crate::frame_write::emit_muse_ready_marker(buf, &mut pending_input, &writer);
