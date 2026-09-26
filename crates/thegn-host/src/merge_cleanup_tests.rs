@@ -388,13 +388,16 @@ fn final_validation_preserves_new_ignored_files_and_replaced_directory() {
 }
 
 #[test]
-fn final_validation_classifies_new_tracked_work_as_changed_during_cleanup() {
+fn tracked_work_appearing_after_admission_is_dirty_not_merely_changed() {
     let _isolation = TestIsolation::new();
     let fixture = Fixture::new();
     let verified = fixture.probe().unwrap();
     std::fs::write(fixture.wt.join("tracked"), "appeared after admission").unwrap();
 
-    assert!(matches!(verified.remove(), Err(Refusal::Changed)));
+    // `Dirty`, not `Changed`: the operator went back to this worktree and edited
+    // it, which is the "edited since landing" fact, not a concurrency signal.
+    // The distinction is what the sweep reports, so it must not blur.
+    assert!(matches!(verified.remove(), Err(Refusal::Dirty)));
     assert!(fixture.wt.join("tracked").exists());
 }
 
@@ -414,6 +417,35 @@ fn ignored_work_appearing_after_the_last_guard_is_not_removed() {
 
     assert!(matches!(result, Err(Refusal::Changed)), "{result:?}");
     assert!(fixture.wt.join("ignored").exists());
+}
+
+/// The status predicate is not the only thing protecting real work: plain
+/// `git worktree remove` refuses a worktree with modified or untracked files,
+/// and the sweep deliberately does not pass `--force`. That is the backstop for
+/// the unavoidable window between the last status read and the removal, so it
+/// must keep holding even if the predicate is ever wrong.
+#[test]
+fn removal_never_forces_so_git_independently_refuses_real_work() {
+    let _isolation = TestIsolation::new();
+    for (path, expected_kept) in [
+        ("tracked", "edited user work"),
+        ("untracked", "new user work"),
+    ] {
+        let fixture = Fixture::new();
+        let verified = fixture.probe().unwrap();
+        // Write the work only once the guard has run, i.e. past every check the
+        // cleanup code performs. Only Git itself can still refuse here.
+        let result = verified.remove_checked(&|| {
+            std::fs::write(fixture.wt.join(path), expected_kept).map_err(|e| e.to_string())
+        });
+        assert!(result.is_err(), "{path}: {result:?}");
+        assert_eq!(
+            std::fs::read_to_string(fixture.wt.join(path)).unwrap(),
+            expected_kept,
+            "{path} must survive"
+        );
+        assert!(fixture.wt.exists(), "{path}: worktree must survive");
+    }
 }
 
 #[test]

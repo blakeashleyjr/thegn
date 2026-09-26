@@ -625,6 +625,20 @@ impl Verified {
         let _lock = self.mutation_lock()?;
         self.revalidate()?;
         final_guard().map_err(unsafe_reason)?;
+        // Re-observe as late as possible. `final_guard` re-checks the queue and
+        // can take arbitrary time, and the window between the last status read
+        // and Git's own removal is the only one in which newly written ignored
+        // state is destroyed. This cannot close the race — nothing short of a
+        // filesystem lease could — but it shrinks it to the removal call itself.
+        //
+        // Real user work is protected twice over regardless: the probe refuses
+        // it here, and `git worktree remove` WITHOUT `--force` independently
+        // refuses a worktree with modified or untracked files (verified against
+        // git 2.54: ignored-only is removed, tracked-modified and
+        // untracked-non-ignored are refused). Never add `--force` below.
+        if clean(&self.path)?.bytes != self.status.bytes {
+            return Err(Refusal::Changed);
+        }
         git(
             &self.root,
             &[
