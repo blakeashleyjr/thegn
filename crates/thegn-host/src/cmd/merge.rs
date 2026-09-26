@@ -561,13 +561,21 @@ fn sweep(cfg: &Config, force: bool) -> Result<()> {
     let report = crate::merge_sweep::sweep(cfg, &root, force);
     use crate::merge_sweep::safe_display;
     for b in &report.collected {
-        outln!("  ⌫ swept {}", safe_display(b));
+        if report
+            .discarded_build_state
+            .iter()
+            .any(|discarded| discarded == b)
+        {
+            outln!("  ⌫ swept {} (discarded build state)", safe_display(b));
+        } else {
+            outln!("  ⌫ swept {}", safe_display(b));
+        }
     }
     for b in &report.kept_dirty {
-        outln!(
-            "  • kept {} — uncommitted, untracked or ignored work",
-            safe_display(b)
-        );
+        outln!("  • kept {} — edited since landing", safe_display(b));
+    }
+    for b in &report.kept_changed {
+        outln!("  • kept {} — changed during cleanup", safe_display(b));
     }
     for (branch, reason) in &report.kept {
         outln!(

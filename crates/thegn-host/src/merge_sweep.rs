@@ -43,6 +43,10 @@ pub struct SweepReport {
     pub cleared_rows: Vec<String>,
     /// Branches left alone because their worktree had become dirty again.
     pub kept_dirty: Vec<String>,
+    /// Branches whose status snapshot changed during final cleanup validation.
+    pub kept_changed: Vec<String>,
+    /// Branches removed after admitting ignored-only build state.
+    pub discarded_build_state: Vec<String>,
     /// Refused or failed physical cleanup, with an actionable reason.
     pub kept: Vec<(String, String)>,
     /// Enumeration or post-removal bookkeeping failures, never "collected".
@@ -54,6 +58,8 @@ impl SweepReport {
         self.collected.is_empty()
             && self.cleared_rows.is_empty()
             && self.kept_dirty.is_empty()
+            && self.kept_changed.is_empty()
+            && self.discarded_build_state.is_empty()
             && self.kept.is_empty()
             && self.bookkeeping_errors.is_empty()
     }
@@ -218,17 +224,22 @@ fn sweep_with_db(cfg: &Config, repo_root: &Path, force: bool, db: &Db) -> SweepR
             /* delete_branch */ true,
         ) {
             CleanupOutcome::Removed {
+                discarded_build_state,
                 bookkeeping_errors,
                 queue_removed,
                 ..
             } => {
                 report.collected.push(entry.branch.clone());
+                if discarded_build_state {
+                    report.discarded_build_state.push(entry.branch.clone());
+                }
                 if queue_removed {
                     report.cleared_rows.push(entry.worktree.clone());
                 }
                 report.bookkeeping_errors.extend(bookkeeping_errors);
             }
             CleanupOutcome::KeptDirty => report.kept_dirty.push(entry.branch.clone()),
+            CleanupOutcome::KeptChanged => report.kept_changed.push(entry.branch.clone()),
             CleanupOutcome::Refused { reason } => report.kept.push((
                 entry.branch.clone(),
                 format!("{}: {reason}", entry.worktree),
@@ -282,7 +293,19 @@ pub fn spawn(cfg: Config, dir: std::path::PathBuf) {
         }
         for b in &report.kept_dirty {
             thegn_core::msg::warn(&format!(
-                "merge queue: {} is past its merged grace period but has uncommitted, untracked or ignored work — kept",
+                "merge queue: kept {} — edited since landing",
+                safe_display(b)
+            ));
+        }
+        for b in &report.kept_changed {
+            thegn_core::msg::warn(&format!(
+                "merge queue: kept {} — changed during cleanup",
+                safe_display(b)
+            ));
+        }
+        for b in &report.discarded_build_state {
+            thegn_core::msg::info(&format!(
+                "merge queue: swept {} (discarded build state)",
                 safe_display(b)
             ));
         }
@@ -343,7 +366,8 @@ mod tests {
         git(&["config", "user.name", "private fixture"]);
         git(&["config", "user.email", "fixture@example.invalid"]);
         std::fs::write(root.join("tracked"), "keep\n").unwrap();
-        git(&["add", "tracked"]);
+        std::fs::write(root.join(".gitignore"), "ignored\n").unwrap();
+        git(&["add", "tracked", ".gitignore"]);
         git(&["commit", "-q", "-m", "base"]);
         git(&[
             "worktree",
@@ -517,6 +541,97 @@ mod tests {
             std::fs::read_to_string(wt.join("untracked")).unwrap(),
             "private user content"
         );
+    }
+
+    #[test]
+    fn landed_worktree_status_matrix_respects_expiry_and_force_without_discarding_edits() {
+        let states = ["clean", "ignored", "tracked", "untracked"];
+        for state in states {
+            for force in [false, true] {
+                let isolation = crate::merge_lifecycle::TestIsolation::new();
+                let dir = tempfile::tempdir().unwrap();
+                let parent = dir.path().canonicalize().unwrap();
+                let db_path = parent.join("private.db");
+                let db = Db::open_at(&db_path).unwrap();
+                let name = format!("matrix-{state}-{}", if force { "force" } else { "due" });
+                let (root, wt) = fixture(&parent, &name, &db, &isolation);
+                match state {
+                    "clean" => {}
+                    "ignored" => {
+                        std::fs::write(wt.join("ignored"), "build output\n").unwrap();
+                    }
+                    "tracked" => {
+                        std::fs::write(wt.join("tracked"), "edited user work\n").unwrap();
+                    }
+                    "untracked" => {
+                        std::fs::write(wt.join("untracked"), "new user work\n").unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+                rusqlite::Connection::open(&db_path)
+                    .unwrap()
+                    .execute("UPDATE merge_queue SET queued_at=1, updated_at=1", [])
+                    .unwrap();
+                let before = db.list_merge_queue().unwrap();
+                let mut cfg = local_config();
+                cfg.merge_queue.on_landed = OnLanded::Expire;
+                cfg.merge_queue.target_branch = "main".into();
+                cfg.merge_queue.merged_ttl_secs = 1;
+                let report = sweep_with_db(&cfg, &root, force, &db);
+                let removable = matches!(state, "clean" | "ignored");
+                if removable {
+                    assert_eq!(report.collected, ["feature"], "{state}, force={force}");
+                    assert!(!wt.exists(), "{state}, force={force}");
+                    assert!(report.kept_dirty.is_empty());
+                    assert!(report.kept_changed.is_empty());
+                    assert_eq!(
+                        report.discarded_build_state,
+                        if state == "ignored" {
+                            vec!["feature".to_string()]
+                        } else {
+                            Vec::<String>::new()
+                        },
+                        "{state}, force={force}"
+                    );
+                    assert_eq!(db.list_merge_queue().unwrap().len(), 1);
+                    assert!(db.worktree_record(wt.to_str().unwrap()).unwrap().is_none());
+                } else {
+                    assert!(report.collected.is_empty(), "{state}, force={force}");
+                    assert_eq!(report.kept_dirty, ["feature"], "{state}, force={force}");
+                    assert!(report.kept_changed.is_empty());
+                    assert!(report.discarded_build_state.is_empty());
+                    assert!(wt.exists(), "{state}, force={force}");
+                    assert_eq!(db.list_merge_queue().unwrap(), before);
+                    assert!(db.worktree_record(wt.to_str().unwrap()).unwrap().is_some());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fresh_landed_row_waits_for_grace_period_but_force_bypasses_only_the_clock() {
+        let isolation = crate::merge_lifecycle::TestIsolation::new();
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().canonicalize().unwrap();
+        let db = Db::open_memory().unwrap();
+        let (root, wt) = fixture(&parent, "fresh", &db, &isolation);
+        let mut cfg = local_config();
+        cfg.merge_queue.on_landed = OnLanded::Expire;
+        cfg.merge_queue.target_branch = "main".into();
+        cfg.merge_queue.merged_ttl_secs = 3600;
+
+        let before = db.list_merge_queue().unwrap();
+        let waiting = sweep_with_db(&cfg, &root, false, &db);
+        assert!(waiting.is_empty());
+        assert!(wt.exists());
+        assert_eq!(db.list_merge_queue().unwrap(), before);
+        assert!(db.worktree_record(wt.to_str().unwrap()).unwrap().is_some());
+
+        let forced = sweep_with_db(&cfg, &root, true, &db);
+        assert_eq!(forced.collected, ["feature"]);
+        assert!(!wt.exists());
+        assert_eq!(db.list_merge_queue().unwrap().len(), 1);
+        assert!(db.worktree_record(wt.to_str().unwrap()).unwrap().is_none());
     }
 
     #[test]
