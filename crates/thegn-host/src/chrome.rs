@@ -261,8 +261,9 @@ pub fn draw_plugin_view(
         let fg = plugin_role_color(span.role, accent_rgb);
         let bg = col(S::Bg1);
         let max_cols = max_x.saturating_sub(x);
-        draw_text(surface, x, rect.y, &span.text, fg, bg, max_cols);
-        x += span.text.chars().take(max_cols).count();
+        let clipped = crate::seg::take_cols(&span.text, max_cols);
+        draw_text(surface, x, rect.y, clipped, fg, bg, max_cols);
+        x += crate::seg::cells(clipped);
     }
 }
 
@@ -2092,7 +2093,7 @@ pub fn draw_statusbar(surface: &mut Surface, rect: Rect, model: &FrameModel) {
         let mut x = rect.x + left_w + 1;
         let end = (rect.x + rect.cols).saturating_sub(right_w + usize::from(right_w > 0));
         for (_label, view) in &model.plugin_segments {
-            let w = view.text_content().chars().count();
+            let w = crate::plugin_damage::rendered_width(view);
             if w == 0 || x + w > end {
                 continue;
             }
