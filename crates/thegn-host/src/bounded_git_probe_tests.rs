@@ -134,7 +134,7 @@ fn capability_fixed_policy_refuses_invalid_limits_before_spawn() {
     for (duration, bytes, expected) in [
         (std::time::Duration::ZERO, 16, "invalid capture deadline"),
         (
-            std::time::Duration::from_secs(3),
+            std::time::Duration::from_secs(6),
             16,
             "capability capture exceeds its fixed safety policy",
         ),
