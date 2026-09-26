@@ -1581,6 +1581,40 @@ mod tests {
         );
         assert!(db.group_tabs_for_session("session-b").unwrap().is_empty());
     }
+
+    #[test]
+    fn delete_tab_groups_for_worktree_all_sessions_rolls_back_with_bookkeeping() {
+        use crate::models::{GroupTabRow, TabGroupRow};
+        let db = Db::open_memory().unwrap();
+        let group = TabGroupRow {
+            name: "app/feature".into(),
+            kind: "branch".into(),
+            worktree: "/wt/feature".into(),
+            ordinal: 0,
+            active_tab: 0,
+        };
+        let tab = GroupTabRow {
+            group_name: "app/feature".into(),
+            ordinal: 0,
+            title: "1".into(),
+            pane_tree: r#"{"leaf":0}"#.into(),
+            focused_pane: 0,
+            pane_cwds: String::new(),
+            pane_cmds: String::new(),
+            pane_sessions: String::new(),
+            scrollback_snapshot: String::new(),
+        };
+        db.put_tab_group("session-a", &group).unwrap();
+        db.put_group_tab("session-a", &tab).unwrap();
+
+        let result: anyhow::Result<()> = db.transaction(|db| {
+            db.delete_tab_groups_for_worktree_all_sessions("/wt/feature")?;
+            anyhow::bail!("simulate queue bookkeeping failure")
+        });
+        assert!(result.is_err());
+        assert_eq!(db.groups_for_session("session-a").unwrap(), [group]);
+        assert_eq!(db.group_tabs_for_session("session-a").unwrap(), [tab]);
+    }
     use crate::db::Db;
     use crate::store::WorkspaceStore;
 
