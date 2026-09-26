@@ -16,10 +16,14 @@ db-urls = ["https://github.com/rustsec/advisory-db"]
 yanked = "warn"
 # Documented exceptions — each needs a reason and an exit condition.
 ignore = [
-  # rsa Marvin timing sidechannel via jsonwebtoken←octocrab (GitHub App JWT
-  # signing in a local CLI; not a network-facing service). No fixed rsa
-  # release exists yet; drop this when rsa ships the fix.
-  "RUSTSEC-2023-0071",
+  # cargo-deny advisory ignores are keyed by advisory ID; the reason below
+  # pins the reviewed match to rsa 0.9.10. Owner: thegn maintainers. Review
+  # trigger: the first patched rsa release or THE-670 replacing octocrab;
+  # either event retires this exception. See
+  # https://rustsec.org/advisories/RUSTSEC-2023-0071.html. The accepted risk
+  # is that this exact linked operation is not invoked: native.rs uses only a
+  # personal bearer token, with no AppAuth/private-key call site.
+  { id = "RUSTSEC-2023-0071", reason = "rsa 0.9.10 only; owner: thegn maintainers; review trigger: patched rsa release or THE-670; no AppAuth/private-key call path; https://rustsec.org/advisories/RUSTSEC-2023-0071.html" },
   # tokei 15.0.0 (code-stats) dropped the clap 2 / parking_lot 0.11 legacy
   # tree that used to bring ansi_term, atty, instant, vec_map and num_cpus
   # here; those four ignores are retired (2026-09-15). term_size is still a
