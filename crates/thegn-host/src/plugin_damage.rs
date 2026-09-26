@@ -78,10 +78,10 @@ mod tests {
         let rows = changes
             .iter()
             .filter_map(|change| match change {
-                Change::CursorPosition { y, .. } => match y {
-                    Position::Absolute(y) => Some(*y),
-                    _ => None,
-                },
+                Change::CursorPosition {
+                    y: Position::Absolute(y),
+                    ..
+                } => Some(*y),
                 _ => None,
             })
             .collect::<std::collections::HashSet<_>>();
