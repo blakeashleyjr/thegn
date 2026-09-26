@@ -4,6 +4,8 @@
 //! retained for explicit operator inspection. Pins/rechecks are not a lease
 //! against arbitrary concurrent same-UID filesystem mutation.
 
+#[cfg(test)]
+use super::gate_base_for_repo;
 use super::{GateVerdict, gate_base, tail};
 use crate::platform::gate_path::{Directory, Lock, Regular, read_regular};
 use anyhow::{Context, Result, ensure};
