@@ -25,6 +25,15 @@ const LIVE_HEALTH_UNAVAILABLE: &str = "no attached compositor";
 /// Stable plugin lifecycle vocabulary. The offline CLI can authoritatively
 /// identify only `DisabledByConfig`; the remaining live states are reserved
 /// for the compositor health publication follow-up.
+///
+/// The reserved variants are therefore constructed only by the vocabulary test
+/// until that follow-up lands, which is what the `dead_code` exemption records.
+/// Deleting them would make the follow-up redesign the published contract
+/// instead of filling it in.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "reserved live states; see the doc comment")
+)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 enum PluginState {
@@ -38,6 +47,12 @@ enum PluginState {
 }
 
 impl PluginState {
+    /// Every variant, so the vocabulary test can assert one stable name per
+    /// state in both output forms. Only the test needs it today.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "exercised by the vocabulary test only")
+    )]
     const ALL: [Self; 7] = [
         Self::DisabledByConfig,
         Self::Starting,
