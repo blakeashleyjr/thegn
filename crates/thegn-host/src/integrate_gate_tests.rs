@@ -183,7 +183,7 @@ fn private_script(f: &Fixture, name: &str, contents: &str) -> String {
 }
 
 fn materialization_directories(f: &Fixture) -> Vec<PathBuf> {
-    let mut paths: Vec<_> = std::fs::read_dir(gate_base(&f.repo))
+    let mut paths: Vec<_> = std::fs::read_dir(gate_base_for_repo(&f.repo))
         .unwrap()
         .map(|entry| entry.unwrap().path())
         .filter(|path| {
@@ -324,7 +324,7 @@ fn required_filter_failure_is_static_infrastructure_and_retains_private_index() 
     assert!(held[0].join("index").is_file());
     assert_eq!(std::fs::read(admin.join("index")).unwrap(), index);
     assert_eq!(std::fs::read(f.repo.join(".git/config")).unwrap(), config);
-    Lock::acquire(&gate_base(&f.repo).join("wt.lock")).unwrap();
+    Lock::acquire(&gate_base_for_repo(&f.repo).join("wt.lock")).unwrap();
 }
 
 #[test]
@@ -356,7 +356,7 @@ fn unknown_wait_retains_whole_lease_and_poison_refuses_reuse_and_throwaway() {
         held[0].join("index").is_file(),
         "unknown state was not recursively removed"
     );
-    let lock_error = Lock::acquire(&gate_base(&f.repo).join("wt.lock"))
+    let lock_error = Lock::acquire(&gate_base_for_repo(&f.repo).join("wt.lock"))
         .err()
         .unwrap();
     assert_eq!(lock_error.kind(), std::io::ErrorKind::WouldBlock);
@@ -674,12 +674,20 @@ impl Fixture {
             return true;
         }
         let before = git(&self.repo, &["rev-parse", "HEAD"]);
+        let mut config = self.config.clone();
+        config.gate_command = match thegn_core::shellinv::flavor_of(&thegn_core::util::shell()) {
+            thegn_core::shellinv::ShellFlavor::Cmd => "exit /b 0".into(),
+            _ => "exit 0".into(),
+        };
         assert!(matches!(
-            gate_tip(&self.repo, &self.first, &self.config).unwrap(),
-            GateVerdict::Error { .. }
+            gate_tip(&self.repo, &self.first, &config).unwrap(),
+            GateVerdict::Passed
         ));
         assert_eq!(git(&self.repo, &["rev-parse", "HEAD"]), before);
-        assert!(!gate_base(&self.repo).exists());
+        assert!(
+            !gate_base_for_repo(&self.repo).exists(),
+            "Windows isolation must not create the Unix-only reused state root"
+        );
         false
     }
 
@@ -687,7 +695,7 @@ impl Fixture {
         Workspace::prepare(&self.repo, oid, &self.config).unwrap()
     }
     fn wt(&self) -> PathBuf {
-        gate_base(&self.repo).join("wt")
+        gate_base_for_repo(&self.repo).join("wt")
     }
     fn assert_error(&self, oid: &str) -> String {
         match gate_tip(&self.repo, oid, &self.config).unwrap() {
@@ -709,7 +717,7 @@ fn reused_gate_requires_lock_and_preserves_ignored_artifacts() {
     std::fs::write(f.wt().join("artifact"), "warm cache").unwrap();
     assert_eq!(git(&f.wt(), &["check-ignore", "artifact"]), "artifact");
     let start = Instant::now();
-    assert!(f.assert_error(&f.second).contains("already running"));
+    assert!(gate_tip(&f.repo, &f.second, &f.config).unwrap().passed());
     assert!(start.elapsed() < Duration::from_secs(2));
     assert_eq!(git(&f.wt(), &["rev-parse", "HEAD"]), f.first);
     drop(held);
@@ -721,18 +729,84 @@ fn reused_gate_requires_lock_and_preserves_ignored_artifacts() {
 }
 
 #[test]
-fn concurrent_distinct_oid_gate_refuses_instead_of_rechecking_out_active_tree() {
+fn lock_acquisition_failure_isolates_without_touching_reused_worktree() {
     let f = Fixture::new();
+    if !f.supported_or_refused() {
+        return;
+    }
+    let base = gate_base_for_repo(&f.repo);
+    std::fs::create_dir_all(&base).unwrap();
+    // A directory at the sidecar path deterministically makes lock admission
+    // fail before the reused `wt` is inspected or mutated.
+    std::fs::create_dir(base.join("wt.lock")).unwrap();
+    std::fs::create_dir(base.join("wt")).unwrap();
+    let sentinel = base.join("wt/sentinel");
+    std::fs::write(&sentinel, "untouched").unwrap();
+    let before = std::fs::metadata(&sentinel).unwrap().modified().unwrap();
+
+    assert!(gate_tip(&f.repo, &f.second, &f.config).unwrap().passed());
+
+    assert_eq!(std::fs::read_to_string(&sentinel).unwrap(), "untouched");
+    assert_eq!(
+        std::fs::metadata(&sentinel).unwrap().modified().unwrap(),
+        before
+    );
+}
+
+#[test]
+fn linked_and_aliased_worktrees_share_the_canonical_gate_identity() {
+    let f = Fixture::new();
+    let linked = f.root.path().join("linked");
+    git(
+        &f.repo,
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            linked.to_str().unwrap(),
+            &f.first,
+        ],
+    );
+    assert_eq!(
+        gate_base_for_repo(&f.repo),
+        gate_base_for_repo(&linked),
+        "linked worktrees must use one Git common-directory gate root"
+    );
+    // Aliasing needs a symlink, which only the platform seam creates; Windows
+    // has no equivalent alias to assert against, so that half is host-gated
+    // while the linked-worktree identity above stays platform-free.
+    if thegn_core::sandbox_backend::host_os() == thegn_core::sandbox_backend::HostOs::Windows {
+        return;
+    }
+    let alias = f.root.path().join("repo-alias");
+    crate::platform::gate_path::history_test_symlink(&f.repo, &alias).unwrap();
+    assert_eq!(
+        gate_base_for_repo(&f.repo),
+        gate_base_for_repo(&alias),
+        "filesystem aliases must use one Git common-directory gate root"
+    );
+}
+
+#[test]
+fn concurrent_distinct_oid_gates_isolate_instead_of_rechecking_out_active_tree() {
+    let mut f = Fixture::new();
     if !f.supported_or_refused() {
         return;
     }
     let ready = f.root.path().join("ready");
     let release = f.root.path().join("release");
+    let first_observed = f.root.path().join("first-oid");
+    let second_observed = f.root.path().join("second-oid");
     let mut config = f.config.clone();
     config.gate_command = format!(
-        "printf ready > {}; i=0; while test ! -e {}; do i=$((i+1)); test $i -lt 200 || exit 125; sleep 0.02; done; test \"$(git rev-parse HEAD)\" = \"$THEGN_GATE_OID\"",
+        "printf \"$THEGN_GATE_OID\" > {}; printf ready > {}; i=0; while test ! -e {}; do i=$((i+1)); test $i -lt 200 || exit 125; sleep 0.02; done; test \"$(git rev-parse HEAD)\" = \"$THEGN_GATE_OID\"",
+        util::sh_quote(first_observed.to_str().unwrap()),
         util::sh_quote(ready.to_str().unwrap()),
         util::sh_quote(release.to_str().unwrap())
+    );
+    f.config.gate_command = format!(
+        "printf \"$THEGN_GATE_OID\" > {}; test \"$(git rev-parse HEAD)\" = \"$THEGN_GATE_OID\"",
+        util::sh_quote(second_observed.to_str().unwrap())
     );
     let repo = f.repo.clone();
     let oid = f.first.clone();
@@ -767,7 +841,9 @@ fn concurrent_distinct_oid_gate_refuses_instead_of_rechecking_out_active_tree() 
     let original = original.unwrap().unwrap();
     assert!(started, "original private gate never started");
     assert!(original.passed(), "{original:?}");
-    assert!(matches!(contender, Some(Ok(GateVerdict::Error { .. }))));
+    assert!(matches!(contender, Some(Ok(GateVerdict::Passed))));
+    assert_eq!(std::fs::read_to_string(first_observed).unwrap(), f.first);
+    assert_eq!(std::fs::read_to_string(second_observed).unwrap(), f.second);
     assert_eq!(git(&f.wt(), &["rev-parse", "HEAD"]), f.first);
 }
 
@@ -876,7 +952,7 @@ fn replaced_lock_during_success_is_infrastructure_not_green() {
     if !f.supported_or_refused() {
         return;
     }
-    let path = gate_base(&f.repo).join("wt.lock");
+    let path = gate_base_for_repo(&f.repo).join("wt.lock");
     f.config.gate_command = format!(
         "mv {} {}; printf replacement > {}",
         util::sh_quote(path.to_str().unwrap()),
@@ -904,14 +980,19 @@ fn throwaway_has_owned_unique_parent_and_exact_scoped_cleanup() {
 }
 
 #[test]
-fn gate_identity_error_never_advances_or_blames_candidate() {
+fn gate_isolation_never_advances_or_blames_candidate() {
     let f = Fixture::new();
     if !f.supported_or_refused() {
         return;
     }
     let held = f.prepare(&f.first);
+    // The held reusable lock selects the private fallback. Make that isolated
+    // gate fail as infrastructure so this exercises the hold path rather than
+    // asserting that a successful isolated gate must not land.
+    let mut config = f.config.clone();
+    config.gate_command = "exit 127".into();
     let report = run_fold(
-        &f.config,
+        &config,
         &f.repo,
         vec![Branch {
             name: "candidate".into(),
@@ -936,7 +1017,7 @@ fn symlink_gate_path_is_not_followed_or_removed() {
     if !f.supported_or_refused() {
         return;
     }
-    std::fs::create_dir_all(gate_base(&f.repo)).unwrap();
+    std::fs::create_dir_all(gate_base_for_repo(&f.repo)).unwrap();
     let foreign = f.root.path().join("foreign");
     std::fs::create_dir(&foreign).unwrap();
     std::fs::write(foreign.join("sentinel"), "untouched").unwrap();
@@ -961,6 +1042,10 @@ fn root_git_mapping_is_revalidated_before_reporting_success() {
         return;
     }
     let workspace = f.prepare(&f.first);
+    // Resolve the fixture's gate path while its Git common-dir mapping is
+    // valid. The mutation below intentionally makes the production identity
+    // probe fail; the test must not turn the helper's expect into the contract.
+    let worktree = f.wt();
     // Adding this mapping would retarget subsequent root Git invocations even
     // though the root/.git directory inode itself did not move.
     std::fs::write(
@@ -969,7 +1054,7 @@ fn root_git_mapping_is_revalidated_before_reporting_success() {
     )
     .unwrap();
     assert!(format!("{:#}", workspace.verify().err().unwrap()).contains("association changed"));
-    assert!(f.wt().join("value").exists());
+    assert!(worktree.join("value").exists());
 }
 
 #[test]

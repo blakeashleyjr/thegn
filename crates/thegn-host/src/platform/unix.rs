@@ -129,17 +129,141 @@ pub(super) fn redirect_stderr_to(file: std::fs::File) -> Option<StderrGuard> {
 
 /// Is a process with this pid alive (signal-0 probe)?
 pub fn pid_alive(pid: i64) -> bool {
-    pid > 0 && nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_ok()
+    pid > 0
+        && pid <= i64::from(i32::MAX)
+        && nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_ok()
 }
 
 /// Best-effort graceful termination of a single process (`SIGTERM`).
 pub fn terminate_pid(pid: u32) {
+    let Some(pid) = checked_positive_pid(pid) else {
+        return;
+    };
     // best-effort: signal: the process may already be gone
-    nix::sys::signal::kill(
-        nix::unistd::Pid::from_raw(pid as i32),
-        nix::sys::signal::Signal::SIGTERM,
-    )
-    .ok();
+    nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGTERM).ok();
+}
+
+/// Read Linux's process-start identity (`/proc/<pid>/stat`, field 22).
+///
+/// The `comm` field is parenthesized and may contain spaces or `)`, so parse
+/// the numeric fields only after the final closing parenthesis. A missing or
+/// malformed identity is an intentional fail-closed result.
+pub fn proxy_process_start_time(pid: u32) -> Option<u64> {
+    checked_positive_pid(pid)?;
+    #[cfg(target_os = "linux")]
+    {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        parse_proc_start_time(&stat)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn parse_proc_start_time(stat: &str) -> Option<u64> {
+    // Field 3 (state) is the first token after field 2 (comm); field 22 is
+    // therefore token 19 in this suffix.
+    stat.rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .nth(19)?
+        .parse()
+        .ok()
+}
+
+// The fixture reaps (`Child::wait`) are a blocking child wait, banned in this
+// crate so the event loop can never stall on a subprocess. A unit test provably
+// never runs on the loop, and leaving a killed `sleep` unreaped would leak a
+// zombie for the rest of the test binary.
+#[expect(clippy::disallowed_methods)]
+#[cfg(all(test, target_os = "linux"))]
+mod proxy_pid_tests {
+    use super::*;
+
+    #[test]
+    fn parses_start_time_after_a_parenthesized_comm_with_spaces_and_parens() {
+        let suffix = std::iter::once("S")
+            .chain(std::iter::repeat_n("0", 18))
+            .chain(std::iter::once("987654"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(
+            parse_proc_start_time(&format!("7 (proxy ) with spaces) {suffix}")),
+            Some(987654)
+        );
+    }
+
+    #[test]
+    fn invalid_proc_stat_and_missing_identity_fail_closed() {
+        assert_eq!(parse_proc_start_time("7 (proxy) S too-short"), None);
+        assert_eq!(proxy_process_start_time(0), None);
+        assert!(!pid_alive(i64::from(u32::MAX)));
+        assert!(!terminate_proxy_pid(u32::MAX, Some(1)));
+        assert!(!terminate_proxy_pid(0, Some(1)));
+    }
+
+    #[test]
+    fn mismatched_start_time_leaves_live_fixture_untouched() {
+        let mut fixture = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn harmless fixture");
+        let pid = fixture.id();
+        let actual = proxy_process_start_time(pid).expect("fixture identity");
+        assert!(!terminate_proxy_pid(pid, Some(actual.saturating_add(1))));
+        assert!(pid_alive(i64::from(pid)));
+        let _ = fixture.kill();
+        let _ = fixture.wait();
+    }
+
+    #[test]
+    fn matching_start_time_allows_term_for_the_expected_fixture() {
+        let mut fixture = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn harmless fixture");
+        let pid = fixture.id();
+        let actual = proxy_process_start_time(pid).expect("fixture identity");
+        assert!(terminate_proxy_pid(pid, Some(actual)));
+        let _ = fixture.wait();
+    }
+
+    #[test]
+    fn vanished_fixture_is_not_signalled() {
+        let mut fixture = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn harmless fixture");
+        let pid = fixture.id();
+        let expected = proxy_process_start_time(pid).expect("fixture identity");
+        let _ = fixture.kill();
+        let _ = fixture.wait();
+        assert!(!terminate_proxy_pid(pid, Some(expected)));
+    }
+}
+
+fn checked_positive_pid(pid: u32) -> Option<nix::unistd::Pid> {
+    (pid != 0 && pid <= i32::MAX as u32).then(|| nix::unistd::Pid::from_raw(pid as i32))
+}
+
+/// Send SIGTERM only when the current process has the recorded start identity.
+/// The range check happens before the `u32 -> i32` conversion, and identity is
+/// re-read in this seam immediately before the syscall. No process-group
+/// semantics are reachable from stored state.
+pub fn terminate_proxy_pid(pid: u32, expected_start_time: Option<u64>) -> bool {
+    let raw_pid = pid;
+    let Some(pid) = checked_positive_pid(raw_pid) else {
+        return false;
+    };
+    let Some(expected) = expected_start_time else {
+        return false;
+    };
+    if proxy_process_start_time(raw_pid) != Some(expected) {
+        return false;
+    }
+    nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGTERM).is_ok()
 }
 
 /// Deliver `sig` to `pid`, surfacing the outcome. Unlike [`terminate_pid`] the
@@ -153,14 +277,14 @@ pub fn signal_pid(pid: u32, sig: super::ProcSignal) -> Result<(), String> {
     // past `i32::MAX` casts to a NEGATIVE i32 — `kill(-N, …)` signals a whole
     // process group. Neither is ever a single-process target, and a real Linux
     // pid never exceeds `i32::MAX`, so both are refused outright.
-    if pid == 0 || pid > i32::MAX as u32 {
+    let Some(pid) = checked_positive_pid(pid) else {
         return Err("invalid pid".into());
-    }
+    };
     let signal = match sig {
         super::ProcSignal::Terminate => nix::sys::signal::Signal::SIGTERM,
         super::ProcSignal::Kill => nix::sys::signal::Signal::SIGKILL,
     };
-    nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), signal).map_err(|e| match e {
+    nix::sys::signal::kill(pid, signal).map_err(|e| match e {
         Errno::ESRCH => "no such process".to_string(),
         Errno::EPERM => "permission denied".to_string(),
         other => other.to_string(),
@@ -346,6 +470,13 @@ pub fn spawn_grouped(cmd: &mut Command) -> std::io::Result<(std::process::Child,
     let child = cmd.spawn()?;
     let pgid = child.id() as i32;
     Ok((child, GroupHandle { pgid }))
+}
+
+/// Spawn a native clipboard helper in its own process group.
+pub fn spawn_clipboard_helper(
+    cmd: &mut Command,
+) -> std::io::Result<(std::process::Child, GroupHandle)> {
+    spawn_grouped(cmd)
 }
 
 /// A desktop helper together with the process-group identity created for it.
