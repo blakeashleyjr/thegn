@@ -388,9 +388,10 @@ const LAND_GUARD_FEATURES: &[SchemaFeature] = &[SchemaFeature {
     columns: &["worktree", "location"],
 }];
 
-// These are the exact named columns used by the existing WorkspaceStore calls
-// in the land-in-place lifecycle. Schema v67 adds only CI-log tables, so v66 is
-// a genuine older supported window rather than a version-stamp exemption.
+// These are the exact named columns used by the land-in-place lifecycle and
+// the manual-land final-row projection. Schema v67 adds only CI-log tables, so
+// v66 is a genuine older supported window rather than a version-stamp
+// exemption.
 const LAND_LIFECYCLE_FEATURES: &[SchemaFeature] = &[
     SchemaFeature {
         table: "worktrees",
@@ -428,6 +429,22 @@ const LAND_LIFECYCLE_FEATURES: &[SchemaFeature] = &[
     SchemaFeature {
         table: "repo_slugs",
         columns: &["repo_path", "slug"],
+    },
+    SchemaFeature {
+        table: "merge_queue",
+        columns: &[
+            "worktree",
+            "branch",
+            "target_branch",
+            "status",
+            "queued_at",
+            "updated_at",
+            "result_oid",
+            "conflict_paths",
+            "error_detail",
+            "location",
+            "agent_attempts",
+        ],
     },
 ];
 

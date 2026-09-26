@@ -13,22 +13,27 @@
 //! second path: the CLI must not depend on an instance being up.
 //!
 //! Unlike `thegn merge land`, this neither requires `[merge_queue] enabled`
-//! nor touches the queue's DB rows; it shares only the fold/gate/CAS core
-//! ([`crate::integrate::attempt_land`]).
+//! nor uses the queue to select work; it shares the fold/gate/CAS core
+//! ([`crate::integrate::attempt_land`]) and records its final landed projection
+//! so the normal sweep lifecycle can collect the worktree.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use std::path::Path;
 use thegn_core::config::Config;
 use thegn_core::db::{CompatibleDb, Db, SchemaOperation};
 use thegn_core::merge_lifecycle::{LifecycleAction, LifecycleEvent, decide};
+use thegn_core::store::{
+    MergeFinalOutcome, MergeFinalStatus, MergeOutcomeObservation, MergeOutcomeWrite,
+    WorktreeAuxStore,
+};
 use thegn_core::{outln, util};
 
 use crate::integrate::{self, AttemptOutcome};
 
 /// Fold `worktree`'s current branch onto the repo target via the fold-actor's
 /// CAS land, forcing the land regardless of the configured `auto_land`. Returns
-/// `(branch, target, outcome)`. No DB / queue side effects — callers that want
-/// queue bookkeeping (`merge land`) record it from the returned outcome.
+/// `(branch, target, outcome)`. Queue bookkeeping is intentionally left to the
+/// caller because this helper is also used by `thegn merge land`.
 pub(crate) fn land_branch(
     cfg: &Config,
     worktree: &Path,
@@ -58,12 +63,15 @@ pub fn run(cfg: &Config, worktree: Option<String>) -> Result<()> {
     let wt = super::resolve_worktree(worktree);
     let root = integrate::main_checkout(&wt).context("not inside a git repository")?;
     let mq = cfg.repo_merge_queue(&root);
-    let lifecycle_required = Path::new(&wt) != root
+    let non_root = Path::new(&wt) != root;
+    let lifecycle_required = non_root
         && !matches!(
             decide(&mq, LifecycleEvent::LandedInPlace),
             LifecycleAction::Noop
         );
-    let operation = if lifecycle_required {
+    // A manual land must record its final queue row even when sidebar filing is
+    // disabled. Root lands remain the explicit no-row path.
+    let operation = if non_root {
         SchemaOperation::LandLifecycleBookkeeping
     } else {
         SchemaOperation::LandRemoteTargetGuard
@@ -75,11 +83,24 @@ pub fn run(cfg: &Config, worktree: Option<String>) -> Result<()> {
     if let Some(msg) = crate::merge_ops::remote_target_guard(db.db(), &root)? {
         anyhow::bail!("{msg}");
     }
+    // Capture the registry/queue identity before any fold, gate, or CAS work.
+    // A later reassignment must degrade bookkeeping rather than overwrite the
+    // new owner. Root lands intentionally do not observe or write a row.
+    let observed = if non_root {
+        Some(
+            db.db()
+                .observe_merge_outcome(&wt.to_string_lossy())
+                .context("capturing merge outcome observation")?,
+        )
+    } else {
+        None
+    };
     let (branch, target, outcome) = land_branch(cfg, &wt)?;
     // On a successful land, file the worktree into the Merged folder — the same
     // destination a queue land reaches under `move`/`expire`. `thegn land` shares
     // the fold/gate/CAS core with the queue but deliberately leaves the worktree
-    // in place (no worktree/branch removal, no queue-row bookkeeping), so
+    // in place (no worktree/branch removal); its landed queue row starts the
+    // same grace-period lifecycle as a queue land, so
     // `LandedInPlace` (file, never remove) is the deliberate event: it degrades
     // the destructive `remove`/`detach` arms to a plain filing because a scripted
     // `thegn land` is typically run from *inside* the worktree being landed and
@@ -106,9 +127,22 @@ pub fn run(cfg: &Config, worktree: Option<String>) -> Result<()> {
         .err()
         .map(|error| format!("sidebar lifecycle bookkeeping unavailable: {error}"))
     };
+    let record_landed = |commit: &str| -> Option<String> {
+        if !non_root {
+            return None;
+        }
+        let Some(observed) = observed.as_ref() else {
+            return Some("landed row observation unavailable".into());
+        };
+        persist_landed_row(db.db(), observed, &wt, &branch, &root, &target, commit)
+            .err()
+            .map(|error| format!("landed-row bookkeeping unavailable: {error}"))
+    };
     match outcome {
         AttemptOutcome::Landed { commit, resyncs } => {
-            let degraded = file_landed(&branch);
+            // Persist first. If this post-CAS write is degraded, do not run the
+            // row-dependent lifecycle filing against an untrusted observation.
+            let degraded = record_landed(&commit).or_else(|| file_landed(&branch));
             outln!(
                 "✓ landed {branch} → {target} @ {}",
                 &commit[..commit.len().min(12)]
@@ -119,8 +153,10 @@ pub fn run(cfg: &Config, worktree: Option<String>) -> Result<()> {
             }
             crate::integrate::report_resyncs(&target, &resyncs);
         }
-        AttemptOutcome::UpToDate { .. } => {
-            let degraded = file_landed(&branch);
+        AttemptOutcome::UpToDate { commit } => {
+            // UpToDate has the same verified commit identity and must repair
+            // the missing-row case without refreshing an existing landed row.
+            let degraded = record_landed(&commit).or_else(|| file_landed(&branch));
             outln!("{branch} already in {target}.");
             if let Some(detail) = degraded {
                 thegn_core::msg::warn(&format!("{branch} is up to date, but {detail}"));
@@ -167,6 +203,46 @@ pub fn run(cfg: &Config, worktree: Option<String>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Persist the final landed projection for a non-root manual land. The caller
+/// has already established the Git outcome; this function only uses the
+/// validated observation-aware writer and never hand-rolls queue SQL.
+fn persist_landed_row(
+    db: &Db,
+    observed: &MergeOutcomeObservation,
+    worktree: &Path,
+    branch: &str,
+    repo_root: &Path,
+    target_branch: &str,
+    result_oid: &str,
+) -> Result<()> {
+    let worktree = worktree
+        .to_str()
+        .context("manual land worktree path is not UTF-8")?;
+    let repo_root = repo_root
+        .to_str()
+        .context("manual land repository path is not UTF-8")?;
+    let outcome = MergeFinalOutcome {
+        worktree,
+        branch,
+        repo_root,
+        target_branch,
+        location: "",
+        status: MergeFinalStatus::Landed,
+        result_oid: Some(result_oid),
+        conflict_paths: None,
+        error_detail: None,
+    };
+    match db.persist_merge_outcome(observed, &outcome)? {
+        MergeOutcomeWrite::Written => Ok(()),
+        MergeOutcomeWrite::RegistryChanged => {
+            bail!("worktree registry changed after Git land; landed row not recorded")
+        }
+        MergeOutcomeWrite::QueueChanged => {
+            bail!("merge queue changed after Git land; landed row not recorded")
+        }
+    }
 }
 
 /// Compatibility access itself never creates or migrates. On a truly fresh
@@ -254,5 +330,66 @@ error: test run failed
     fn an_empty_or_clean_log_yields_nothing_to_report() {
         assert!(gate_failure_digest("").is_empty());
         assert!(gate_failure_digest("     Summary [ 1s] 10 tests run: 10 passed\n").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod landed_row_tests {
+    use super::persist_landed_row;
+    use std::path::Path;
+    use thegn_core::db::Db;
+    use thegn_core::store::{WorkspaceStore, WorktreeAuxStore};
+
+    const ROOT: &str = "/repo";
+    const WORKTREE: &str = "/repo/feature";
+
+    fn fixture() -> Db {
+        let db = Db::open_memory().unwrap();
+        db.put_worktree("repo-feature", ROOT, WORKTREE, "feature", None, None)
+            .unwrap();
+        db
+    }
+
+    #[test]
+    fn manual_land_persists_the_exact_fold_identity_for_a_new_row() {
+        let db = fixture();
+        let observed = db.observe_merge_outcome(WORKTREE).unwrap();
+        persist_landed_row(
+            &db,
+            &observed,
+            Path::new(WORKTREE),
+            "feature",
+            Path::new(ROOT),
+            "main",
+            "folded-commit",
+        )
+        .unwrap();
+        let row = db.list_merge_queue().unwrap().pop().unwrap();
+        assert_eq!(row.status, "landed");
+        assert_eq!(row.target_branch, "main");
+        assert_eq!(row.result_oid.as_deref(), Some("folded-commit"));
+    }
+
+    #[test]
+    fn manual_land_reports_a_changed_queue_without_overwriting_it() {
+        let db = fixture();
+        let observed = db.observe_merge_outcome(WORKTREE).unwrap();
+        db.enqueue_merge(WORKTREE, "replacement", "release")
+            .unwrap();
+        let error = persist_landed_row(
+            &db,
+            &observed,
+            Path::new(WORKTREE),
+            "feature",
+            Path::new(ROOT),
+            "main",
+            "folded-commit",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("merge queue changed"));
+        let row = db.list_merge_queue().unwrap().pop().unwrap();
+        assert_eq!(row.branch, "replacement");
+        assert_eq!(row.status, "queued");
+        assert!(row.result_oid.is_none());
     }
 }
