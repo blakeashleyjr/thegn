@@ -163,6 +163,24 @@ mod tests {
     }
 
     #[test]
+    fn label_or_order_changes_are_structural_even_when_widths_match() {
+        let first = [
+            ("a".into(), view("one", StyleRole::Default)),
+            ("b".into(), view("two", StyleRole::Default)),
+        ];
+        let renamed = [
+            ("renamed".into(), view("one", StyleRole::Default)),
+            ("b".into(), view("two", StyleRole::Default)),
+        ];
+        let reordered = [
+            ("b".into(), view("two", StyleRole::Default)),
+            ("a".into(), view("one", StyleRole::Default)),
+        ];
+        assert_eq!(classify(&first, &renamed), PluginDamage::Structural);
+        assert_eq!(classify(&first, &reordered), PluginDamage::Structural);
+    }
+
+    #[test]
     fn bounded_statusbar_diff_is_smaller_than_a_structural_screen_diff() {
         let mut front = Surface::new(24, 4);
         front.add_change(Change::CursorPosition {
