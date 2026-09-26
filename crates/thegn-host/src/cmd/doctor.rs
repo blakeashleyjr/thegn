@@ -790,12 +790,15 @@ fn remote_control_transport_json(cfg: &Config) -> serde_json::Value {
 }
 
 fn control_surface_report(cfg: &Config) {
-    let ledgers = crate::cmd::api::surface_ledgers();
+    let report = crate::cmd::api::coverage_report();
+    let ledgers = &report.surfaces;
     let implemented: usize = ledgers.iter().map(|l| l.implemented + l.stub).sum();
     let declared: usize = ledgers.iter().map(|l| l.declared).sum();
     let stubs: usize = ledgers.iter().map(|l| l.stub).sum();
     let gaps: usize = ledgers.iter().map(|l| l.excused).sum();
     outln!("Control-surface coverage (see `thegn api coverage`)");
+    outln!("  revision     {}", report.revision);
+    outln!("  schema_version {}", report.schema_version);
     outln!(
         "  cells         {implemented}/{declared} implemented ({stubs} stub, {gaps} excused gap{})",
         if gaps == 1 { "" } else { "s" }
@@ -1620,6 +1623,9 @@ fn doctor_json_with_health_and_overrides(
         "remote_control": remote_control_transport_json(cfg),
         "lifecycle_hooks": lifecycle_hooks_json(cfg),
         "worktree_identity": worktree_identity_json(),
+        "control_surface_coverage": crate::cmd::api::coverage_json(
+            &crate::cmd::api::coverage_report(),
+        ),
     })
 }
 
@@ -3866,6 +3872,19 @@ mod tests {
                 | (Some("local-pipe-or-token"), Some("local-only-named-pipe"))
         ));
         assert!(local["hardening"].is_string());
+    }
+
+    #[test]
+    fn doctor_and_api_expose_the_same_coverage_document() {
+        let doctor = doctor_json(&Config::default());
+        let api = crate::cmd::api::coverage_json(&crate::cmd::api::coverage_report());
+        assert_eq!(doctor["control_surface_coverage"], api);
+        assert!(
+            api["revision"]
+                .as_str()
+                .is_some_and(|revision| !revision.is_empty())
+        );
+        assert!(api["schema_version"].is_number());
     }
 
     #[test]
