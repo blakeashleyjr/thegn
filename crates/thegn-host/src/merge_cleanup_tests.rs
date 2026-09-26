@@ -93,6 +93,22 @@ fn oci_output_parsers_reject_truncation_and_garbage() {
 }
 
 #[test]
+fn oci_inspect_parser_accepts_one_record_per_batched_container() {
+    assert_eq!(
+        parse_mount_sources(b"mount:/tmp/first\nend\nmount:/tmp/second\nend\n").unwrap(),
+        vec![PathBuf::from("/tmp/first"), PathBuf::from("/tmp/second")]
+    );
+}
+
+#[test]
+fn oci_parsers_reject_blank_records_as_malformed() {
+    assert!(parse_container_ids(b"\n").is_err());
+    assert!(parse_container_ids(b"0123456789abcdef\n\n").is_err());
+    assert!(parse_mount_sources(b"\nend\n").is_err());
+    assert!(parse_mount_sources(b"mount:/tmp/source\n\nend\n").is_err());
+}
+
+#[test]
 fn mount_source_matching_is_canonical_and_path_component_bounded() {
     let dir = tempfile::tempdir().unwrap();
     let target = dir.path().join("worktree");
