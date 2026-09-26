@@ -5,9 +5,15 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use thegn_core::util;
 
+const OCI_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const OCI_PROBE_OUTPUT_LIMIT: usize = 16 * 1024;
+const OCI_INSPECT_FORMAT: &str =
+    r#"{{range .Mounts}}{{printf "mount:%s\n" .Source}}{{end}}{{printf "end\n"}}"#;
+
 /// Settled admission for the only automatic teardown currently supported:
-/// local worktrees with no observed resource attachment and no discoverable OCI
-/// runtime. This is conservative eligibility, not global historical absence.
+/// local worktrees with no observed resource attachment and no queried OCI
+/// runtime ownership. This is conservative eligibility, not global historical
+/// absence.
 /// Never reload configuration or guess provider ownership from a worktree name.
 pub(crate) struct LocalResources {
     selected: (Option<String>, Option<String>),
@@ -101,11 +107,11 @@ impl LocalResources {
                     .map(|p| p.as_os_str().to_owned())
             })
             .or(search);
-        oci_resources_absent(search.as_deref())
+        oci_resources_absent(search.as_deref(), Path::new(path))
     }
 }
 
-fn oci_resources_absent(search: Option<&std::ffi::OsStr>) -> Result<(), String> {
+fn oci_resources_absent(search: Option<&std::ffi::OsStr>, target: &Path) -> Result<(), String> {
     let search = search.ok_or("OCI availability unknown: PATH missing")?;
     if search.len() > 64 * 1024 {
         return Err("OCI availability search exceeds bound".into());
@@ -116,18 +122,179 @@ fn oci_resources_absent(search: Option<&std::ffi::OsStr>) -> Result<(), String> 
             "OCI availability unknown: PATH must contain bounded absolute directories".into(),
         );
     }
+    let target = target.canonicalize().map_err(|error| {
+        format!("OCI ownership could not be queried: worktree path is unreadable: {error}")
+    })?;
+    let mut seen = BTreeSet::new();
     for backend in thegn_core::sandbox::Backend::all_oci() {
-        for dir in &paths {
-            for suffix in ["", ".exe", ".cmd", ".bat"] {
-                match std::fs::symlink_metadata(dir.join(format!("{}{suffix}", backend.binary()))) {
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
-                    Err(_) => return Err("OCI availability could not be proven; explicit cleanup required".into()),
-                    Ok(_) => return Err("OCI runtime discoverable; historical resource ownership requires explicit cleanup".into()),
+        let binary = backend.binary();
+        if !seen.insert(binary) {
+            continue;
+        }
+        let Some(candidate) = find_runtime(&paths, binary)? else {
+            continue;
+        };
+        if !matches!(binary, "docker" | "podman") {
+            return Err(format!(
+                "OCI runtime '{binary}' could not be queried: unsupported runtime kind"
+            ));
+        }
+        query_oci_runtime(&candidate, binary, &target)?;
+    }
+    Ok(())
+}
+
+fn find_runtime(paths: &[PathBuf], binary: &str) -> Result<Option<PathBuf>, String> {
+    for dir in paths {
+        for suffix in ["", ".exe", ".cmd", ".bat"] {
+            let candidate = dir.join(format!("{binary}{suffix}"));
+            match std::fs::symlink_metadata(&candidate) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(format!(
+                        "OCI runtime '{binary}' could not be queried: PATH entry {} is unreadable: {error}",
+                        candidate.display()
+                    ));
                 }
+                Ok(_) => return Ok(Some(candidate)),
             }
         }
     }
+    Ok(None)
+}
+
+fn query_oci_runtime(binary: &Path, name: &str, target: &Path) -> Result<(), String> {
+    let mut ps = std::process::Command::new(binary);
+    ps.args(["ps", "-a", "-q"]);
+    let output = run_oci_command(ps, name, "ps")?;
+    if !output.status.success() {
+        return Err(oci_command_refusal(name, "ps", &output));
+    }
+    let ids = parse_container_ids(&output.stdout).map_err(|reason| {
+        format!("OCI runtime '{name}' could not be queried: malformed ps output: {reason}")
+    })?;
+    if ids.is_empty() {
+        return Ok(());
+    }
+
+    let mut inspect = std::process::Command::new(binary);
+    inspect
+        .arg("inspect")
+        .args(["--format", OCI_INSPECT_FORMAT]);
+    inspect.args(&ids);
+    let output = run_oci_command(inspect, name, "inspect")?;
+    if !output.status.success() {
+        return Err(oci_command_refusal(name, "inspect", &output));
+    }
+    let sources = parse_mount_sources(&output.stdout).map_err(|reason| {
+        format!("OCI runtime '{name}' could not be queried: malformed inspect output: {reason}")
+    })?;
+    for source in sources {
+        if mount_source_may_own(&source, target) {
+            return Err(format!(
+                "OCI runtime '{name}' reports a mount source that may own the worktree"
+            ));
+        }
+    }
     Ok(())
+}
+
+fn mount_source_may_own(source: &Path, target: &Path) -> bool {
+    source.canonicalize().map_or(true, |source| {
+        source == target || source.starts_with(target)
+    })
+}
+
+fn run_oci_command(
+    command: std::process::Command,
+    name: &str,
+    operation: &str,
+) -> Result<std::process::Output, String> {
+    crate::bounded_git_probe::capture_capability(command, OCI_PROBE_TIMEOUT, OCI_PROBE_OUTPUT_LIMIT)
+        .map_err(|error| {
+            let detail = error.to_string();
+            if detail.contains("exceeded cleanup deadline") || detail.contains("timed out") {
+                format!(
+                    "OCI runtime '{name}' could not be queried: {operation} timed out after {} seconds",
+                    OCI_PROBE_TIMEOUT.as_secs()
+                )
+            } else {
+                format!("OCI runtime '{name}' could not be queried: {operation} failed: {detail}")
+            }
+        })
+}
+
+fn oci_command_refusal(name: &str, operation: &str, output: &std::process::Output) -> String {
+    let detail = String::from_utf8_lossy(&output.stderr)
+        .trim()
+        .chars()
+        .take(512)
+        .collect::<String>();
+    if detail.is_empty() {
+        format!(
+            "OCI runtime '{name}' could not be queried: {operation} exited with {}",
+            output.status
+        )
+    } else {
+        format!(
+            "OCI runtime '{name}' could not be queried: {operation} exited with {}: {detail}",
+            output.status
+        )
+    }
+}
+
+fn parse_container_ids(bytes: &[u8]) -> Result<Vec<String>, &'static str> {
+    if bytes.is_empty() {
+        return Ok(Vec::new());
+    }
+    if !bytes.ends_with(b"\n") {
+        return Err("output did not end with a newline");
+    }
+    let mut ids = Vec::new();
+    for record in bytes.split(|byte| *byte == b'\n') {
+        let record = record.strip_suffix(b"\r").unwrap_or(record);
+        if record.is_empty() {
+            continue;
+        }
+        if record.len() > 64 || !record.iter().all(u8::is_ascii_hexdigit) {
+            return Err("container id was not hexadecimal");
+        }
+        ids.push(String::from_utf8(record.to_vec()).map_err(|_| "container id was not UTF-8")?);
+    }
+    Ok(ids)
+}
+
+fn parse_mount_sources(bytes: &[u8]) -> Result<Vec<PathBuf>, &'static str> {
+    if !bytes.ends_with(b"\n") {
+        return Err("output did not end with a newline");
+    }
+    let mut sources = Vec::new();
+    let mut ended = false;
+    for record in bytes.split(|byte| *byte == b'\n') {
+        let record = record.strip_suffix(b"\r").unwrap_or(record);
+        if record.is_empty() {
+            continue;
+        }
+        if ended {
+            return Err("data followed the end marker");
+        }
+        if record == b"end" {
+            ended = true;
+            continue;
+        }
+        let Some(source) = record.strip_prefix(b"mount:") else {
+            return Err("missing mount record prefix");
+        };
+        if source.is_empty() {
+            continue;
+        }
+        let source = std::str::from_utf8(source).map_err(|_| "mount source was not UTF-8")?;
+        sources.push(PathBuf::from(source));
+    }
+    if !ended {
+        return Err("missing end marker");
+    }
+    Ok(sources)
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Refusal {

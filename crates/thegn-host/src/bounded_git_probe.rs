@@ -62,7 +62,7 @@ pub(crate) fn capture_capability(
     timeout: std::time::Duration,
     byte_limit: usize,
 ) -> Result<std::process::Output, ProbeError> {
-    if timeout > std::time::Duration::from_secs(2) || byte_limit > 16 * 1024 {
+    if timeout > std::time::Duration::from_secs(5) || byte_limit > 16 * 1024 {
         return Err(probe_error(
             "capability capture exceeds its fixed safety policy",
         ));
