@@ -153,7 +153,7 @@ pub fn proxy_process_start_time(pid: u32) -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
         let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-        return parse_proc_start_time(&stat);
+        parse_proc_start_time(&stat)
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -173,6 +173,11 @@ fn parse_proc_start_time(stat: &str) -> Option<u64> {
         .ok()
 }
 
+// The fixture reaps (`Child::wait`) are a blocking child wait, banned in this
+// crate so the event loop can never stall on a subprocess. A unit test provably
+// never runs on the loop, and leaving a killed `sleep` unreaped would leak a
+// zombie for the rest of the test binary.
+#[expect(clippy::disallowed_methods)]
 #[cfg(all(test, target_os = "linux"))]
 mod proxy_pid_tests {
     use super::*;
@@ -180,7 +185,7 @@ mod proxy_pid_tests {
     #[test]
     fn parses_start_time_after_a_parenthesized_comm_with_spaces_and_parens() {
         let suffix = std::iter::once("S")
-            .chain(std::iter::repeat("0").take(18))
+            .chain(std::iter::repeat_n("0", 18))
             .chain(std::iter::once("987654"))
             .collect::<Vec<_>>()
             .join(" ");
