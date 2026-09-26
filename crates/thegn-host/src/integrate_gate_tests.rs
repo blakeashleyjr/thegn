@@ -981,8 +981,13 @@ fn gate_isolation_never_advances_or_blames_candidate() {
         return;
     }
     let held = f.prepare(&f.first);
+    // The held reusable lock selects the private fallback. Make that isolated
+    // gate fail as infrastructure so this exercises the hold path rather than
+    // asserting that a successful isolated gate must not land.
+    let mut config = f.config.clone();
+    config.gate_command = "exit 127".into();
     let report = run_fold(
-        &f.config,
+        &config,
         &f.repo,
         vec![Branch {
             name: "candidate".into(),
@@ -992,7 +997,10 @@ fn gate_isolation_never_advances_or_blames_candidate() {
     .unwrap();
     assert!(!report.advanced);
     assert!(report.landed.is_empty());
-    assert!(matches!(report.gate, crate::integrate::GateOutcome::Passed));
+    assert!(matches!(
+        report.gate,
+        crate::integrate::GateOutcome::Errored { .. }
+    ));
     assert!(!report.deferred.iter().any(|row| row.gate_failed));
     assert_eq!(git(&f.repo, &["rev-parse", "HEAD"]), f.first);
     drop(held);
@@ -1029,6 +1037,10 @@ fn root_git_mapping_is_revalidated_before_reporting_success() {
         return;
     }
     let workspace = f.prepare(&f.first);
+    // Resolve the fixture's gate path while its Git common-dir mapping is
+    // valid. The mutation below intentionally makes the production identity
+    // probe fail; the test must not turn the helper's expect into the contract.
+    let worktree = f.wt();
     // Adding this mapping would retarget subsequent root Git invocations even
     // though the root/.git directory inode itself did not move.
     std::fs::write(
@@ -1037,7 +1049,7 @@ fn root_git_mapping_is_revalidated_before_reporting_success() {
     )
     .unwrap();
     assert!(format!("{:#}", workspace.verify().err().unwrap()).contains("association changed"));
-    assert!(f.wt().join("value").exists());
+    assert!(worktree.join("value").exists());
 }
 
 #[test]
