@@ -68,6 +68,14 @@ machine0_bridge.rs
 main.rs
 managed_tool.rs
 mem.rs
+# TEST-ONLY cfg, not per-OS production code (THE-690): the OCI ownership probe is
+# tested against shim `docker`/`podman` scripts rather than a real runtime, so the
+# fixtures need Unix mode bits to make a script executable (`PermissionsExt`) and
+# a symlink to prove a symlinked mount source is resolved before comparison. The
+# production probe is platform-neutral — it discovers a binary on PATH and
+# compares canonicalised paths — and the runtimes it queries are the same on
+# every OS.
+merge_cleanup_tests.rs
 merge_driver.rs
 # TEST-ONLY cfg, not per-OS production code: `collect_command` runs whatever
 # argv the config supplies and is platform-free; the smoke tests around it need
