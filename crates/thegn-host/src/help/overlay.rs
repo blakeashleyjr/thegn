@@ -203,8 +203,14 @@ impl HelpOverlay {
         match &link.target {
             LinkTarget::Page(id) => self.goto(id.clone(), 0),
             // External URLs can't open from a TUI portably; put the target on
-            // the clipboard instead (best-effort, like copy mode).
-            LinkTarget::Url(url) => crate::clipboard::copy(url),
+            // the bounded clipboard worker. Completion or rejection is
+            // surfaced by the event-loop outcome drain without retaining the
+            // URL in a status or diagnostic message.
+            LinkTarget::Url(url) => {
+                if let Err(error) = crate::clipboard::copy(url) {
+                    tracing::debug!(target: "thegn::clipboard", %error, "clipboard request rejected");
+                }
+            }
         }
     }
 
