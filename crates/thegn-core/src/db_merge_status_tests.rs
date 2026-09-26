@@ -222,3 +222,17 @@ fn landed_identity_backfill_is_exact_and_rejects_stale_rows() {
     );
     assert_eq!(row(&db).status, "deferred");
 }
+
+#[test]
+fn landed_identity_backfill_repairs_empty_legacy_values() {
+    let db = seeded();
+    db.conn()
+        .execute("UPDATE merge_queue SET status='landed', result_oid=''", [])
+        .unwrap();
+    let expected = row(&db);
+    assert!(
+        db.backfill_landed_result_oid(&expected, "derived-empty-oid")
+            .unwrap()
+    );
+    assert_eq!(row(&db).result_oid.as_deref(), Some("derived-empty-oid"));
+}
