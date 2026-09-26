@@ -90,6 +90,28 @@ fn final_outcomes_never_insert_or_update_queued() {
 }
 
 #[test]
+fn repeated_landed_finalization_preserves_the_existing_row_and_grace_clock() {
+    let db = Db::open_memory().unwrap();
+    let observed = db.observe_merge_outcome(WORKTREE).unwrap();
+    db.persist_merge_outcome(&observed, &outcome(MergeFinalStatus::Landed))
+        .unwrap();
+    db.conn()
+        .execute(
+            "UPDATE merge_queue SET queued_at=11, updated_at=12, result_oid='existing-commit', error_detail='keep-me'",
+            [],
+        )
+        .unwrap();
+    let before = row(&db);
+    let observed = db.observe_merge_outcome(WORKTREE).unwrap();
+    assert_eq!(
+        db.persist_merge_outcome(&observed, &outcome(MergeFinalStatus::Landed))
+            .unwrap(),
+        MergeOutcomeWrite::Written
+    );
+    assert_eq!(row(&db), before);
+}
+
+#[test]
 fn final_update_clears_nullable_fields_preserves_nomination_and_attempts() {
     let db = Db::open_memory().unwrap();
     registered(&db);

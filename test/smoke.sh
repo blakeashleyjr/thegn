@@ -901,6 +901,26 @@ check "sweep records the retained branch cleanup hold" \
 check "explicit queue dismissal clears the collected fixture hold" \
   "'$SZ' merge rm --worktree '$MP' >/dev/null && [[ \$(sqlite3 \"$XDG_STATE_HOME/thegn/thegn.db\" \"SELECT count(*) FROM merge_queue WHERE branch='$MB'\") -eq 0 ]]"
 
+# THE-692: the canonical one-shot land path must enter the same landed-row
+# lifecycle as `merge drain`, including the already-landed/UpToDate retry path.
+LM="$("$SZ" wt new smoke-manual-land --repo "$R")"
+LB="$(git -C "$LM" symbolic-ref --short HEAD)"
+printf 'manual land\n' >"$LM/manual-land.txt"
+git -C "$LM" -c commit.gpgsign=false add -A
+git -C "$LM" -c commit.gpgsign=false commit -q -m "smoke manual land"
+check "thegn land records the manual landed row" \
+  "'$SZ' land --worktree '$LM' | grep -q 'landed'"
+LM_OID="$(git -C "$R" rev-parse main)"
+check "manual land records the exact fold OID and target" \
+  "[[ \$(sqlite3 \"$XDG_STATE_HOME/thegn/thegn.db\" \"SELECT status || '|' || target_branch || '|' || result_oid FROM merge_queue WHERE branch='$LB'\") == 'landed|main|$LM_OID' ]]"
+check "manual land keeps the worktree and branch during its grace period" \
+  "[[ -d '$LM' ]] && [[ -n \$(git -C '$R' branch --list '$LB') ]]"
+LM_UPDATED_AT="$(sqlite3 "$XDG_STATE_HOME/thegn/thegn.db" "SELECT updated_at FROM merge_queue WHERE branch='$LB'")"
+check "a second manual land leaves the landed row and grace clock untouched" \
+  "'$SZ' land --worktree '$LM' | grep -q 'already in' && [[ \$(sqlite3 \"$XDG_STATE_HOME/thegn/thegn.db\" \"SELECT updated_at FROM merge_queue WHERE branch='$LB'\") == '$LM_UPDATED_AT' ]]"
+check "manual landed worktree is swept after the real TTL" \
+  "sweep_due_expired 'swept' && [[ ! -d '$LM' ]]"
+
 # THE-690: an installed Docker/Podman binary must be queried for actual mount
 # ownership, not treated as permanent evidence that every merged worktree is
 # still in use. The shim speaks the exact bounded ps/inspect dialect used by
