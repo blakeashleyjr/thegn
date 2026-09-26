@@ -80,9 +80,28 @@ pub struct ControlClient {
     addr: ControlAddr,
     /// Present only for [`ControlAddr::HttpOrigin`]. `reqwest::Client` is
     /// already internally shared, so cloning `ControlClient` also shares the
-    /// connection pool without another wrapper or a global cache.
-    http_client: Option<reqwest::Client>,
+    /// connection pool without another wrapper or a global cache. The result
+    /// is stored so a construction failure remains fail-closed when the
+    /// request is made; it must never degrade to reqwest's policy-free
+    /// default client.
+    http_client: Option<std::result::Result<reqwest::Client, ControlTransportError>>,
 }
+
+/// A policy-configured control transport could not be initialized.
+///
+/// This deliberately carries no builder detail: the request-facing error is
+/// stable and contains no configuration or credential material. The detailed
+/// reqwest error is logged at construction time for diagnostics.
+#[derive(Debug, Clone, Copy)]
+pub struct ControlTransportError;
+
+impl std::fmt::Display for ControlTransportError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("could not initialize policy-configured control HTTP client")
+    }
+}
+
+impl std::error::Error for ControlTransportError {}
 
 pub(super) fn encoded_issue_path(id: &str, suffix: &str) -> Result<String> {
     crate::issue::validate_control_issue_id(id).map_err(|e| anyhow!(e.to_string()))?;
@@ -342,6 +361,9 @@ impl ControlClient {
                     .http_client
                     .as_ref()
                     .ok_or_else(|| anyhow!("HTTP-origin client has no configured transport"))?;
+                let client = client
+                    .as_ref()
+                    .map_err(|error| anyhow::Error::new(*error))?;
                 send_origin_request(client, origin, token, method, path, body).await?
             }
         };
@@ -1232,23 +1254,22 @@ fn websocket_url(origin: &str, path: &str) -> Result<String> {
 /// body cap is added here. THE-273 owns those policies; when that contract is
 /// ready, this is the single construction point where it belongs.
 ///
-/// `ControlClient::new` is intentionally infallible because it is used by
-/// command paths that already have an established construction contract. A
-/// malformed proxy/TLS environment can make reqwest's builder fail, so retain
-/// the previous best-effort behavior with reqwest's default client as a
-/// fallback. Normal validated configurations always take the policy-bearing
-/// path above.
-fn build_http_client() -> reqwest::Client {
+/// `ControlClient::new` remains infallible for existing command paths, but a
+/// builder failure is retained as a typed error and surfaced by the first
+/// request. There is deliberately no fallback: `reqwest::Client::new()` would
+/// restore the default redirect policy and violate the control transport
+/// contract.
+fn build_http_client() -> std::result::Result<reqwest::Client, ControlTransportError> {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()
-        .unwrap_or_else(|error| {
+        .map_err(|error| {
             tracing::warn!(
                 target: "thegn::control",
                 %error,
-                "could not build policy-configured control HTTP client; using reqwest fallback"
+                "could not build policy-configured control HTTP client"
             );
-            reqwest::Client::new()
+            ControlTransportError
         })
 }
 
@@ -1497,7 +1518,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replacing_http_origin_client_keeps_in_flight_work_on_old_client() {
+    async fn different_http_origin_clients_keep_in_flight_work_on_old_client() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         async fn serve_one(listener: tokio::net::TcpListener, delay: std::time::Duration) {
@@ -1547,6 +1568,11 @@ mod tests {
             token: "new-token".into(),
         });
 
+        // This branch has no config-reload owner to exercise. The property
+        // established here is limited to independently constructed clients
+        // for different effective origins: replacing the caller's handle
+        // does not cancel work already using the old client.
+        assert_ne!(old_addr, replacement_addr);
         replacement.health().await.unwrap();
         old_request.await.unwrap().unwrap();
         old_server.await.unwrap();
