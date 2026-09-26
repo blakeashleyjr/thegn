@@ -29,6 +29,15 @@ host-call scopes, granted and missing capabilities, and every accepted or
 rejected contribution with its rejection reason. Inspection never starts the
 plugin process.
 
+`plugin list` is an offline inspection and does not attach to the compositor.
+Its stable `state` vocabulary is `disabled-by-config`, `starting`, `healthy`,
+`degraded`, `crash-disabled`, `stopped`, and `unknown`. A configured enabled
+plugin is therefore reported as `unknown` with `live_health = unavailable`;
+the command never infers health from a manifest or process absence. Failure,
+restart-count, and backoff fields are `null` when no authoritative supervisor
+snapshot is attached. Both text and `--json` retain exit-zero inspection
+semantics; `plugin check` remains the validation command with failure exits.
+
 ## Modes and rendering
 
 - `mode = "one_shot"` (default): thegn runs the command on the cadence its
