@@ -435,15 +435,19 @@ fn verified_repository_id(repo: &Repository, common: &Directory) -> Result<Strin
         .hex())
 }
 
-fn unique_selection(
-    config: &MergeQueueConfig,
-) -> Result<(
+/// A selected gate workspace: the pinned parent directory; the reuse lock, held
+/// only when the shared gate was admitted; the private path to clean up, present
+/// only when it was not; the cargo target directory; and whether that target
+/// belongs to this gate alone.
+type GateSelection = (
     Directory,
     Option<Lock>,
     Option<PathBuf>,
     Option<PathBuf>,
     bool,
-)> {
+);
+
+fn unique_selection(config: &MergeQueueConfig) -> Result<GateSelection> {
     // Once Git may populate the child, do not let TempDir::drop perform
     // recursive cleanup after a failed/replaced identity check.
     let temporary = tempfile::Builder::new()
@@ -532,24 +536,26 @@ impl Workspace {
                 })
                 .ok()
             });
-            if reused.is_none() {
-                if let Err(error) = identity {
-                    tracing::warn!(
-                        target: "thegn::merge_gate",
-                        repo = %repo.path().display(),
-                        error = %error,
-                        "reused gate identity unavailable; selecting an isolated gate"
-                    );
+            match reused {
+                Some((parent, lock, base)) => {
+                    let target = if config.gate_target_dir.is_empty() {
+                        base.join("target")
+                    } else {
+                        PathBuf::from(&config.gate_target_dir)
+                    };
+                    (parent, Some(lock), None, Some(target), false)
                 }
-                unique_selection(config)?
-            } else {
-                let (parent, lock, base) = reused.unwrap();
-                let target = if config.gate_target_dir.is_empty() {
-                    base.join("target")
-                } else {
-                    PathBuf::from(&config.gate_target_dir)
-                };
-                (parent, Some(lock), None, Some(target), false)
+                None => {
+                    if let Err(error) = identity {
+                        tracing::warn!(
+                            target: "thegn::merge_gate",
+                            repo = %repo.path().display(),
+                            error = %error,
+                            "reused gate identity unavailable; selecting an isolated gate"
+                        );
+                    }
+                    unique_selection(config)?
+                }
             }
         } else {
             unique_selection(config)?
@@ -711,10 +717,8 @@ impl Workspace {
         self.checkout.verify(Some(&self.oid))
     }
 
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "isolated target cleanup is scoped to the unique gate parent"
-    )]
+    // No `#[expect(clippy::disallowed_methods)]` here: the blocking child wait
+    // lives inside `gate_git_ok`, so this body only touches the filesystem.
     fn cleanup(&self) -> Result<()> {
         let Some(parent) = &self.temporary_parent else {
             return Ok(());
