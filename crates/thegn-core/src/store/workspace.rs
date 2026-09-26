@@ -285,10 +285,6 @@ pub trait WorkspaceStore {
     /// Insert or replace a worktree group's persisted row.
     fn put_tab_group(&self, session: &str, row: &crate::models::TabGroupRow) -> Result<()>;
 
-    /// Conservative cleanup guard: persisted sessions can retain runtime
-    /// ownership even before local session registries have been hydrated.
-    fn has_persisted_worktree_session(&self, worktree: &str) -> Result<bool>;
-
     /// Insert or replace one tab inside a worktree group.
     fn put_group_tab(&self, session: &str, row: &crate::models::GroupTabRow) -> Result<()>;
 
@@ -328,6 +324,11 @@ pub trait WorkspaceStore {
     /// worktree path but not the display group name. A stale `tab_groups` row
     /// resurrects the worktree at next launch, so removal must key on the path.
     fn delete_tab_groups_for_worktree(&self, session: &str, worktree: &str) -> Result<()>;
+
+    /// Forget every group (and its tabs), across all persisted sessions, whose
+    /// `worktree` column equals `worktree` — automatic cleanup has no session
+    /// identity and must not leave a stale layout row that can resurrect it.
+    fn delete_tab_groups_for_worktree_all_sessions(&self, worktree: &str) -> Result<()>;
 
     /// Wipe a session's whole persisted layout (groups + tabs). The host
     /// persists snapshots as clear-then-insert inside one transaction so

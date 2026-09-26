@@ -738,7 +738,7 @@ fmt-check:
 # `cargo test`. This recipe is the single source of truth shared by the CI
 # `test` job and the pre-push hook. Doctests are `test-doc` (CI-only) — see
 # the note there.
-test: contract-ratchets test-live test-build-metadata test-the429
+test: contract-ratchets test-live test-build-metadata test-the429 test-action-pins
     cargo nextest run --workspace
 
 # Doctest pass. Split out of `test` (and therefore off pre-push) because it is
@@ -1112,6 +1112,12 @@ test-live:
 # freshness without rebuilding the application.
 test-build-metadata:
     python3 -B test/build_metadata_test.py
+
+# Supply-chain policy: every external GitHub Action is pinned to an immutable
+# commit SHA, recursively through local composite actions. Pure YAML scan; no
+# Cargo, no network.
+test-action-pins:
+    python3 -B test/action_pin_test.py
 
 # Read-only checkout-hook regression; intentionally runs before the Rust suite
 # and uses only throwaway repositories, isolated Git config, and XDG state.

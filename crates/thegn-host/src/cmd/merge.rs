@@ -561,13 +561,21 @@ fn sweep(cfg: &Config, force: bool) -> Result<()> {
     let report = crate::merge_sweep::sweep(cfg, &root, force);
     use crate::merge_sweep::safe_display;
     for b in &report.collected {
-        outln!("  ⌫ swept {}", safe_display(b));
+        if report
+            .discarded_build_state
+            .iter()
+            .any(|discarded| discarded == b)
+        {
+            outln!("  ⌫ swept {} (discarded build state)", safe_display(b));
+        } else {
+            outln!("  ⌫ swept {}", safe_display(b));
+        }
     }
     for b in &report.kept_dirty {
-        outln!(
-            "  • kept {} — uncommitted, untracked or ignored work",
-            safe_display(b)
-        );
+        outln!("  • kept {} — edited since landing", safe_display(b));
+    }
+    for b in &report.kept_changed {
+        outln!("  • kept {} — changed during cleanup", safe_display(b));
     }
     for (branch, reason) in &report.kept {
         outln!(
@@ -823,8 +831,14 @@ fn land(cfg: &Config, worktree: Option<String>) -> Result<()> {
             outln!("✓ landed {branch} → {}", &commit[..commit.len().min(12)]);
             integrate::report_resyncs(&target, &resyncs);
         }
-        AttemptOutcome::UpToDate => {
-            let _ = db.update_merge_status(&wt_s, "landed", None, Some("already merged"), None); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+        AttemptOutcome::UpToDate { commit } => {
+            let _ = db.update_merge_status(
+                &wt_s,
+                "landed",
+                Some(&commit),
+                Some("already merged"),
+                None,
+            ); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
             lifecycle(LifecycleEvent::Landed);
             outln!("{branch} already merged.");
         }

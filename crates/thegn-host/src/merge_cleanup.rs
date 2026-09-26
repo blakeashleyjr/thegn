@@ -1,6 +1,7 @@
 //! Fail-closed identity and no-force removal for automatic merge collection.
 //! A queue row is evidence to investigate, never authority to delete a path.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use thegn_core::util;
 
@@ -78,17 +79,14 @@ impl LocalResources {
         root: &Path,
         path: &str,
     ) -> Result<(), String> {
-        use thegn_core::store::{NotificationStore, PlacementStore, WorkspaceStore};
+        use thegn_core::store::{NotificationStore, PlacementStore};
         if Self::selection(db, root, path)? != self.selected {
             return Err("selected worktree/workspace environment changed during cleanup".into());
         }
         if db.has_cleanup_tenancy(path).map_err(|e| e.to_string())?
-            || db
-                .has_persisted_worktree_session(path)
-                .map_err(|e| e.to_string())?
             || db.has_cleanup_dispatch(path).map_err(|e| e.to_string())?
         {
-            return Err("runtime/session/dispatch ownership requires explicit cleanup".into());
+            return Err("runtime tenancy or dispatch ownership requires explicit cleanup".into());
         }
         crate::agent::automatic_cleanup_resources_absent(path)?;
         crate::bridge_sup::automatic_cleanup_resources_absent(path)?;
@@ -134,13 +132,15 @@ fn oci_resources_absent(search: Option<&std::ffi::OsStr>) -> Result<(), String> 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Refusal {
     Dirty,
+    Changed,
     Unsafe(String),
 }
 
 impl std::fmt::Display for Refusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Dirty => f.write_str("uncommitted, untracked or ignored files are present"),
+            Self::Dirty => f.write_str("edited since landing"),
+            Self::Changed => f.write_str("changed during cleanup"),
             Self::Unsafe(reason) => f.write_str(reason),
         }
     }
@@ -269,19 +269,103 @@ fn direct_ref(root: &Path, reference: &str) -> Result<(), Refusal> {
     Ok(())
 }
 
-pub(crate) fn clean(path: &Path) -> Result<(), Refusal> {
-    // status may run clean/process drivers while refreshing index content.
-    // fsmonitor=false alone cannot make this safe. Reject configured drivers
-    // before status; config is data-only and its values are never logged.
+/// Names of filter drivers that could actually execute here, i.e. those with a
+/// `clean` or `process` command configured. `smudge`/`required` cannot run
+/// during the `status` this module performs.
+///
+/// Config is data-only: only the driver NAME (a key fragment) is retained, and
+/// no configured value is ever read into the returned set or logged.
+fn configured_filter_drivers(path: &Path) -> Result<BTreeSet<String>, Refusal> {
     let config = git(path, &["config", "--null", "--includes", "--list"])?;
-    if config.split(|b| *b == 0).any(|entry| {
+    let mut names = BTreeSet::new();
+    for entry in config.split(|b| *b == 0) {
         let key = entry.split(|b| *b == b'\n').next().unwrap_or_default();
         let key = String::from_utf8_lossy(key).to_ascii_lowercase();
-        key.starts_with("filter.") && (key.ends_with(".clean") || key.ends_with(".process"))
-    }) {
-        return Err(unsafe_reason(
-            "configured Git clean/process filters require explicit cleanup",
-        ));
+        let Some(rest) = key.strip_prefix("filter.") else {
+            continue;
+        };
+        let Some(name) = rest
+            .strip_suffix(".clean")
+            .or_else(|| rest.strip_suffix(".process"))
+        else {
+            continue;
+        };
+        if !name.is_empty() {
+            names.insert(name.to_string());
+        }
+    }
+    Ok(names)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StatusObservation {
+    bytes: Vec<u8>,
+    ignored_only: bool,
+}
+
+/// Classify a porcelain-v1 `-z` status. Only `!! <path>` records — ignored
+/// build state — are admissible; every tracked or untracked record is real user
+/// work, and anything that does not parse is refused as unsafe rather than as an
+/// edit, so an unexpected Git output shape is never reported as "edited".
+fn observe_status(bytes: Vec<u8>) -> Result<StatusObservation, Refusal> {
+    let mut ignored_only = false;
+    for record in bytes
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty())
+    {
+        // `XY <path>`: two status bytes, a space, then a non-empty path. A
+        // rename's trailing bare-path field fails this and is refused too,
+        // which is correct — a rename is a tracked modification.
+        if record.len() < 4 || record[2] != b' ' {
+            return Err(unsafe_reason("unparseable git status record"));
+        }
+        if record.starts_with(b"!! ") {
+            ignored_only = true;
+        } else {
+            return Err(Refusal::Dirty);
+        }
+    }
+    Ok(StatusObservation {
+        bytes,
+        ignored_only,
+    })
+}
+
+pub(crate) fn clean(path: &Path) -> Result<StatusObservation, Refusal> {
+    // status may run clean/process drivers while refreshing index content, and
+    // fsmonitor=false alone cannot make that safe — so an APPLICABLE driver is
+    // still a hard refusal.
+    //
+    // But a driver only runs when BOTH a `filter=<name>` attribute selects it
+    // AND that driver is configured. The old check tested configuration alone
+    // (THE-685), and `git config --list` includes global/system scope: one
+    // machine-wide git-lfs install therefore disabled merged-worktree cleanup
+    // in EVERY repository, including repositories with no LFS content at all.
+    // Measured here: 35 merged worktrees stuck, the oldest 9 days past its TTL,
+    // in a tree with no `.gitattributes` whatsoever.
+    for driver in configured_filter_drivers(path)? {
+        // The driver name is interpolated into a pathspec below, so only accept
+        // names that cannot change how that pathspec parses. Anything stranger
+        // keeps the old conservative refusal rather than being trusted.
+        if !driver
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        {
+            return Err(unsafe_reason(
+                "a Git filter driver with an unexpected name is configured; cleanup requires explicit review",
+            ));
+        }
+        // Attribute lookup only — reads the index and .gitattributes, and
+        // cannot itself invoke a driver the way `status`/`add` would.
+        let applied = git(
+            path,
+            &["ls-files", "-z", "--", &format!(":(attr:filter={driver})")],
+        )?;
+        if applied.split(|b| *b == 0).any(|entry| !entry.is_empty()) {
+            return Err(unsafe_reason(format!(
+                "tracked paths use the {driver:?} Git clean/process filter; cleanup requires explicit review"
+            )));
+        }
     }
     let flags = git(path, &["ls-files", "-v", "-z"])?;
     if flags.split(|b| *b == 0).any(|entry| {
@@ -302,7 +386,7 @@ pub(crate) fn clean(path: &Path) -> Result<(), Refusal> {
             "submodule worktrees require explicit cleanup",
         ));
     }
-    if git(
+    let status = git(
         path,
         &[
             "status",
@@ -312,13 +396,8 @@ pub(crate) fn clean(path: &Path) -> Result<(), Refusal> {
             "--ignored=matching",
             "--ignore-submodules=none",
         ],
-    )?
-    .is_empty()
-    {
-        Ok(())
-    } else {
-        Err(Refusal::Dirty)
-    }
+    )?;
+    observe_status(status)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -377,6 +456,7 @@ pub(crate) struct Verified {
     target: String,
     head: String,
     landed: Option<String>,
+    status: StatusObservation,
     identities: Vec<same_file::Handle>,
 }
 
@@ -462,7 +542,7 @@ impl Verified {
                 "not a verified linked-worktree metadata directory",
             ));
         }
-        clean(&path)?;
+        let status = clean(&path)?;
         let identities = [
             (&path, IdentityKind::Directory),
             (&common_dir, IdentityKind::Directory),
@@ -486,6 +566,7 @@ impl Verified {
             target: target.into(),
             head,
             landed: landed.map(str::to_owned),
+            status,
             identities,
         })
     }
@@ -503,6 +584,9 @@ impl Verified {
             &self.target,
             self.landed.as_deref(),
         )?;
+        if self.status.bytes != now.status.bytes {
+            return Err(Refusal::Changed);
+        }
         if self.common != now.common
             || self.gitdir != now.gitdir
             || self.head != now.head
@@ -511,6 +595,10 @@ impl Verified {
             return Err(unsafe_reason("worktree identity changed during cleanup"));
         }
         Ok(())
+    }
+
+    pub(crate) fn discarded_build_state(&self) -> bool {
+        self.status.ignored_only
     }
 
     pub(crate) fn verify_cached_repository(&self, path: &Path) -> Result<(), Refusal> {
@@ -534,6 +622,20 @@ impl Verified {
         let _lock = self.mutation_lock()?;
         self.revalidate()?;
         final_guard().map_err(unsafe_reason)?;
+        // Re-observe as late as possible. `final_guard` re-checks the queue and
+        // can take arbitrary time, and the window between the last status read
+        // and Git's own removal is the only one in which newly written ignored
+        // state is destroyed. This cannot close the race — nothing short of a
+        // filesystem lease could — but it shrinks it to the removal call itself.
+        //
+        // Real user work is protected twice over regardless: the probe refuses
+        // it here, and `git worktree remove` WITHOUT `--force` independently
+        // refuses a worktree with modified or untracked files (verified against
+        // git 2.54: ignored-only is removed, tracked-modified and
+        // untracked-non-ignored are refused). Never add `--force` below.
+        if clean(&self.path)?.bytes != self.status.bytes {
+            return Err(Refusal::Changed);
+        }
         git(
             &self.root,
             &[

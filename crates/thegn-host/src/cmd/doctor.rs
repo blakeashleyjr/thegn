@@ -790,12 +790,15 @@ fn remote_control_transport_json(cfg: &Config) -> serde_json::Value {
 }
 
 fn control_surface_report(cfg: &Config) {
-    let ledgers = crate::cmd::api::surface_ledgers();
+    let report = crate::cmd::api::coverage_report();
+    let ledgers = &report.surfaces;
     let implemented: usize = ledgers.iter().map(|l| l.implemented + l.stub).sum();
     let declared: usize = ledgers.iter().map(|l| l.declared).sum();
     let stubs: usize = ledgers.iter().map(|l| l.stub).sum();
     let gaps: usize = ledgers.iter().map(|l| l.excused).sum();
     outln!("Control-surface coverage (see `thegn api coverage`)");
+    outln!("  revision     {}", report.revision);
+    outln!("  schema_version {}", report.schema_version);
     outln!(
         "  cells         {implemented}/{declared} implemented ({stubs} stub, {gaps} excused gap{})",
         if gaps == 1 { "" } else { "s" }
@@ -1620,6 +1623,9 @@ fn doctor_json_with_health_and_overrides(
         "remote_control": remote_control_transport_json(cfg),
         "lifecycle_hooks": lifecycle_hooks_json(cfg),
         "worktree_identity": worktree_identity_json(),
+        "control_surface_coverage": crate::cmd::api::coverage_json(
+            &crate::cmd::api::coverage_report(),
+        ),
     })
 }
 
@@ -2131,7 +2137,11 @@ fn hosts_report(cfg: &Config) {
         outln!("  {name:<16} {:<6} {state}", hc.reach.as_str());
     }
     // Local delivery abilities: what the default registry-less transfer can use.
-    let has = |bin: &str| which_ok(bin);
+    // `util::have` retains the existing core probe semantics: unlike shell
+    // `command -v`, `which_path` does not check executable bits and returns no
+    // result when PATH is unset. These are fixed bare-name diagnostics, so
+    // removing the shell process is safe within that established contract.
+    let has = |bin: &str| thegn_core::util::have(bin);
     outln!(
         "  local tools:  podman {} · skopeo {} · rsync {} (registry-less transfer wants podman or skopeo)",
         yn(has("podman")),
@@ -2361,17 +2371,6 @@ fn provider_cache_json(cfg: &Config) -> serde_json::Value {
         );
     }
     serde_json::Value::Object(map)
-}
-
-/// Cheap PATH probe (doctor is a diagnostic CLI; subprocess is fine here).
-// off-loop: doctor is a synchronous CLI verb
-#[expect(clippy::disallowed_methods)]
-fn which_ok(bin: &str) -> bool {
-    std::process::Command::new("sh")
-        .args(["-c", &format!("command -v {bin}")])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
 }
 
 /// The output of `<bin> <args…>` trimmed to one line, or `None` if the binary is
@@ -3873,6 +3872,19 @@ mod tests {
                 | (Some("local-pipe-or-token"), Some("local-only-named-pipe"))
         ));
         assert!(local["hardening"].is_string());
+    }
+
+    #[test]
+    fn doctor_and_api_expose_the_same_coverage_document() {
+        let doctor = doctor_json(&Config::default());
+        let api = crate::cmd::api::coverage_json(&crate::cmd::api::coverage_report());
+        assert_eq!(doctor["control_surface_coverage"], api);
+        assert!(
+            api["revision"]
+                .as_str()
+                .is_some_and(|revision| !revision.is_empty())
+        );
+        assert!(api["schema_version"].is_number());
     }
 
     #[test]

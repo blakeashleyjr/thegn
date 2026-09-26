@@ -31,6 +31,12 @@ pub enum IssueError {
     Network(reqwest::Error),
     Auth(String),
     Api(String),
+    PartialUpdate {
+        applied: Vec<&'static str>,
+        unapplied: Vec<&'static str>,
+        unverified: Vec<&'static str>,
+        source: Box<IssueError>,
+    },
     Subprocess(String),
     Parse(String),
     Policy(&'static str),
@@ -46,6 +52,18 @@ impl std::fmt::Debug for IssueError {
             Self::Network(_) => f.write_str("IssueError::Network(<redacted>)"),
             Self::Auth(message) => f.debug_tuple("IssueError::Auth").field(message).finish(),
             Self::Api(message) => f.debug_tuple("IssueError::Api").field(message).finish(),
+            Self::PartialUpdate {
+                applied,
+                unapplied,
+                unverified,
+                source,
+            } => f
+                .debug_struct("IssueError::PartialUpdate")
+                .field("applied", applied)
+                .field("unapplied", unapplied)
+                .field("unverified", unverified)
+                .field("source", source)
+                .finish(),
             Self::Subprocess(message) => f
                 .debug_tuple("IssueError::Subprocess")
                 .field(message)
@@ -71,6 +89,24 @@ impl std::fmt::Display for IssueError {
             IssueError::Network(_) => write!(f, "network: tracker request failed"),
             IssueError::Auth(s) => write!(f, "auth: {s}"),
             IssueError::Api(s) => write!(f, "api: {s}"),
+            IssueError::PartialUpdate {
+                applied,
+                unapplied,
+                unverified,
+                source,
+            } => {
+                write!(
+                    f,
+                    "partial update (applied: {}; unapplied: {}; unverified: {})",
+                    applied.join(", "),
+                    unapplied.join(", "),
+                    unverified.join(", "),
+                )?;
+                if !unverified.is_empty() {
+                    write!(f, " — verify before retrying")?;
+                }
+                write!(f, ": {source}")
+            }
             IssueError::Subprocess(s) => write!(f, "subprocess: {s}"),
             IssueError::Parse(s) => write!(f, "parse: {s}"),
             IssueError::Policy(s) => write!(f, "tracker policy: {s}"),
@@ -80,7 +116,14 @@ impl std::fmt::Display for IssueError {
     }
 }
 
-impl std::error::Error for IssueError {}
+impl std::error::Error for IssueError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            IssueError::PartialUpdate { source, .. } => Some(source.as_ref()),
+            _ => None,
+        }
+    }
+}
 
 impl IssueError {
     /// Construct the typed error returned by an absent optional operation.
@@ -105,6 +148,7 @@ impl SeamError for IssueError {
             IssueError::Network(e) if e.is_connect() || e.is_timeout() => ErrorClass::Transient,
             IssueError::Timeout(_) => ErrorClass::Transient,
             IssueError::Network(_) => ErrorClass::Other,
+            IssueError::PartialUpdate { source, .. } => source.class(),
             IssueError::Subprocess(message)
                 if message
                     .to_ascii_lowercase()
@@ -274,7 +318,7 @@ pub fn validate_issue_identity(issue: &Issue) -> Result<(), IssueError> {
 /// Methods return [`BoxFuture`]s (not native `async fn`) so the trait stays
 /// object-safe — the router dispatches over `Box<dyn IssueBackend>`.
 pub trait IssueBackend: Send + Sync {
-    fn provider_id(&self) -> &'static str;
+    fn provider_id(&self) -> &str;
     fn caps(&self) -> IssueCaps;
 
     fn list_issues<'a>(
@@ -487,7 +531,7 @@ impl IssueRouter {
 
     /// The provider id of the first configured backend (`"none"` when empty).
     /// Retained for callers that only need a representative id.
-    pub fn provider_id(&self) -> &'static str {
+    pub fn provider_id(&self) -> &str {
         self.inner
             .first()
             .map(|b| b.inner.provider_id())
@@ -496,7 +540,7 @@ impl IssueRouter {
 
     /// Every configured provider id, in config order (may repeat when several
     /// accounts share a provider).
-    pub fn provider_ids(&self) -> Vec<&'static str> {
+    pub fn provider_ids(&self) -> Vec<&str> {
         self.inner.iter().map(|b| b.inner.provider_id()).collect()
     }
 
@@ -548,7 +592,7 @@ impl IssueRouter {
         }
         // Order-preserving dedupe: several accounts may share a provider, and
         // naming it three times helps nobody.
-        let mut ids: Vec<&'static str> = Vec::new();
+        let mut ids: Vec<&str> = Vec::new();
         for p in self.provider_ids() {
             if !ids.contains(&p) {
                 ids.push(p);
@@ -602,7 +646,7 @@ impl IssueRouter {
     pub async fn list_per_provider(
         &self,
         filter: &IssueFilter,
-    ) -> Vec<(String, &'static str, Result<Vec<Issue>, IssueError>)> {
+    ) -> Vec<(String, &str, Result<Vec<Issue>, IssueError>)> {
         let mut out = Vec::with_capacity(self.inner.len());
         for b in &self.inner {
             let result = b.inner.list_issues(filter).await.and_then(|issues| {
@@ -851,7 +895,7 @@ mod spec {
     }
 
     impl IssueBackend for CountingBackend {
-        fn provider_id(&self) -> &'static str {
+        fn provider_id(&self) -> &str {
             "linear"
         }
 
@@ -899,12 +943,12 @@ mod spec {
     }
 
     struct PluginMarker {
-        id: &'static str,
+        id: String,
     }
 
     impl IssueBackend for PluginMarker {
-        fn provider_id(&self) -> &'static str {
-            self.id
+        fn provider_id(&self) -> &str {
+            &self.id
         }
         fn caps(&self) -> IssueCaps {
             IssueCaps::default()
@@ -944,14 +988,19 @@ mod spec {
     fn plugin_namespace_routes_by_complete_registered_prefix() {
         let mut router = IssueRouter::from_config(&IssuesConfig::default());
         router
-            .push_backend("demo".into(), Box::new(PluginMarker { id: "plugin:demo" }))
+            .push_backend(
+                "demo".into(),
+                Box::new(PluginMarker {
+                    id: "plugin:demo".into(),
+                }),
+            )
             .unwrap();
         assert!(
             router
                 .push_backend(
                     "nested".into(),
                     Box::new(PluginMarker {
-                        id: "plugin:demo:extra",
+                        id: "plugin:demo:extra".into(),
                     }),
                 )
                 .is_err()

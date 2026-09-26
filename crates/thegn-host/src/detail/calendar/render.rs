@@ -7,6 +7,7 @@
 
 use chrono::{Datelike, NaiveDate, Timelike};
 use termwiz::surface::Surface;
+use thegn_core::calendar::ClockFormat;
 use thegn_core::calendar::display::{DisplayText, Field};
 
 use super::layout::{self, GRID_HEADER_ROWS};
@@ -20,6 +21,10 @@ use crate::seg::{self, Line, Tok, Under, seg};
 pub struct MonthGridSection {
     pub title: String,
     pub today_chip: String,
+    /// Set when the month is unavailable, stale or incomplete. Drawn in the
+    /// header in place of the today chip, so the state is visible even with
+    /// `show_agenda = false`, where the agenda note is never built.
+    pub status: Option<String>,
     pub dow: [String; 7],
     pub week_numbers: Option<Vec<u32>>,
     pub weeks: Vec<[DayCell; 7]>,
@@ -278,6 +283,7 @@ fn month_section(st: &CalState) -> MonthGridSection {
             st.today.format("%a %-d %b")
         ),
         dow,
+        status: month_status(st),
         week_numbers: st
             .ui
             .show_week_numbers
@@ -295,15 +301,54 @@ fn agenda_heading(st: &CalState) -> super::super::Section {
             crate::caps::active_glyphs().middot,
             sel.format("%a %-d %b")
         ),
-        note: Some(if !st.month_loaded() {
-            format!("loading{}", crate::caps::active_glyphs().ellipsis)
+        note: Some(agenda_note(st, n)),
+    }
+}
+
+/// The month's health, if it is not simply fine: the same three words the
+/// agenda note uses, on the grid header, which is drawn on every config path.
+fn month_status(st: &CalState) -> Option<String> {
+    let error = st.month_error()?;
+    Some(
+        if !st.month_loaded() {
+            "unavailable"
+        } else if error.is_partial() {
+            "incomplete"
         } else {
-            match n {
-                0 => "no events".into(),
-                1 => "1 event".into(),
-                n => format!("{n} events"),
+            "stale"
+        }
+        .into(),
+    )
+}
+
+/// The agenda status note. A failed or incomplete month is always said so:
+/// "unavailable" when nothing valid was ever loaded (never a false "no
+/// events"), otherwise the retained count marked stale/incomplete.
+fn agenda_note(st: &CalState, n: usize) -> String {
+    let loaded = st.month_loaded();
+    let error = st.month_error();
+    if !loaded {
+        return match error {
+            Some(_) => "unavailable".into(),
+            None => format!("loading{}", crate::caps::active_glyphs().ellipsis),
+        };
+    }
+    let count = match n {
+        0 => "no events".to_string(),
+        1 => "1 event".into(),
+        n => format!("{n} events"),
+    };
+    match error {
+        None => count,
+        Some(e) => format!(
+            "{count} {} {}",
+            crate::caps::active_glyphs().middot,
+            if e.is_partial() {
+                "incomplete"
+            } else {
+                "stale"
             }
-        }),
+        ),
     }
 }
 
@@ -382,16 +427,32 @@ fn clocks_table(st: &CalState) -> super::super::Section {
     let rows = readings
         .iter()
         .map(|r| {
-            let time = if st.ui.twelve_hour {
-                let h = r.local.hour();
-                let h12 = if h % 12 == 0 { 12 } else { h % 12 };
-                format!(
-                    "{h12}:{:02}{}",
-                    r.local.minute(),
-                    if h < 12 { "am" } else { "pm" }
-                )
+            let time = match &r.format {
+                ClockFormat::H12 => {
+                    let h = r.local.hour();
+                    let h12 = if h % 12 == 0 { 12 } else { h % 12 };
+                    format!(
+                        "{h12}:{:02}{}",
+                        r.local.minute(),
+                        if h < 12 { "am" } else { "pm" }
+                    )
+                }
+                ClockFormat::H24 => format!("{:02}:{:02}", r.local.hour(), r.local.minute()),
+                ClockFormat::Custom(fmt) => r.local.format(fmt).to_string(),
+            };
+            let date = if r.show_date {
+                r.local.format("%Y-%m-%d").to_string()
             } else {
-                format!("{:02}:{:02}", r.local.hour(), r.local.minute())
+                r.local.format("%a").to_string()
+            };
+            let day_delta = if r.show_date {
+                String::new()
+            } else {
+                match r.day_delta {
+                    1 => "+1d".into(),
+                    -1 => "-1d".into(),
+                    _ => String::new(),
+                }
             };
             vec![
                 Cell::Text(
@@ -402,8 +463,14 @@ fn clocks_table(st: &CalState) -> super::super::Section {
                         Tok::Slot(S::Dim)
                     },
                 ),
-                Cell::Text(r.local.format("%a").to_string(), Tok::Slot(S::Faint)),
-                Cell::Text(time, Tok::Slot(S::Text)),
+                Cell::Text(
+                    DisplayText::new(&date, Field::ClockLabel).into_string(),
+                    Tok::Slot(S::Faint),
+                ),
+                Cell::Text(
+                    DisplayText::new(&time, Field::ClockLabel).into_string(),
+                    Tok::Slot(S::Text),
+                ),
                 Cell::Text(
                     DisplayText::new(&r.abbrev, Field::ClockLabel).into_string(),
                     Tok::Slot(S::Faint),
@@ -412,14 +479,7 @@ fn clocks_table(st: &CalState) -> super::super::Section {
                     thegn_core::calendar::tz::fmt_delta(r.delta_from_home_mins),
                     Tok::Hue(thegn_core::theme::Hue::Blue),
                 ),
-                Cell::Text(
-                    match r.day_delta {
-                        1 => "+1d".into(),
-                        -1 => "-1d".into(),
-                        _ => String::new(),
-                    },
-                    Tok::Hue(thegn_core::theme::Hue::Amber),
-                ),
+                Cell::Text(day_delta, Tok::Hue(thegn_core::theme::Hue::Amber)),
             ]
         })
         .collect();
@@ -478,13 +538,20 @@ pub(crate) fn draw_month_grid(
     let glyphs = crate::caps::active_glyphs();
     let title_w = seg::cells(&g.title);
     // Below this the chip would collide with the month title; dropping it is
-    // better than truncating the title the user navigates by.
-    let today_chip = if w >= layout::TODAY_CHIP_MIN_COLS {
-        g.today_chip.as_str()
-    } else {
-        ""
+    // better than truncating the title the user navigates by. A status word
+    // takes the slot ahead of the chip: "which month am I looking at, and is
+    // it real" beats "what is today's date", and it is much shorter.
+    let today_chip = match (&g.status, w >= layout::TODAY_CHIP_MIN_COLS) {
+        (Some(status), _) => status.as_str(),
+        (None, true) => g.today_chip.as_str(),
+        (None, false) => "",
     };
     let today_w = seg::cells(today_chip);
+    let chip_tone = if g.status.is_some() {
+        Tok::Slot(S::Accent)
+    } else {
+        Tok::Slot(S::Ghost)
+    };
     let Some(lay) = layout::grid_layout(
         x,
         y0,
@@ -513,7 +580,7 @@ pub(crate) fn draw_month_grid(
                 seg(Tok::Slot(S::Text), format!(" {} ", g.title)).bold(),
                 seg::Seg::key(" l "),
             ],
-            vec![seg(Tok::Slot(S::Ghost), today_chip.to_string())],
+            vec![seg(chip_tone, today_chip.to_string())],
         ),
         super::super::panel(),
     );

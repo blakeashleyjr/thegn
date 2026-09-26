@@ -700,6 +700,19 @@ pub fn spawn_grouped(cmd: &mut Command) -> std::io::Result<(std::process::Child,
     Ok((child, GroupHandle { pid, job }))
 }
 
+/// Spawn a native clipboard helper using the existing direct-child behavior.
+///
+/// Process-tree containment for clipboard helpers is intentionally deferred to
+/// THE-274. Deadlines still apply, but this seam must not quietly expand this
+/// issue into a second Windows containment implementation.
+pub fn spawn_clipboard_helper(
+    cmd: &mut Command,
+) -> std::io::Result<(std::process::Child, GroupHandle)> {
+    let child = cmd.spawn()?;
+    let group = GroupHandle::from_pid(child.id() as i32);
+    Ok((child, group))
+}
+
 /// A desktop helper together with its owned direct child and optional Job
 /// Object. The child remains owned until process-tree cleanup and wait finish.
 pub struct DesktopChild {
