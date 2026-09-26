@@ -1,0 +1,14 @@
+{
+  "id": "THE-688",
+  "title": "A persisted tab layout is treated as live runtime ownership, so any worktree ever opened is unsweepable",
+  "url": "https://linear.app/blakeashley/issue/THE-688/a-persisted-tab-layout-is-treated-as-live-runtime-ownership-so-any",
+  "primary_file": "crates/thegn-host/src/merge_cleanup.rs",
+  "affects": "the other 9 kept worktrees",
+  "priority": "High",
+  "labels": [
+    "Bug"
+  ],
+  "status": "Backlog",
+  "team": "Thegn",
+  "chain": "4th/3rd cause of 'merge sweep collects nothing'; THE-685 and THE-686 already landed"
+}

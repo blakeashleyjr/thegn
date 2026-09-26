@@ -191,8 +191,10 @@ fn success_projects_full_oid_and_does_not_fabricate_oid_from_progress_text() {
         Some("gated green — awaiting land")
     );
     assert!(ready.conflict_paths.is_none());
-    let (already, _) = one_outcome(Ok(AttemptOutcome::UpToDate), 0);
-    assert!(already.result_oid.is_none() && already.conflict_paths.is_none());
+    let oid = "1234567890123456789012345678901234567890";
+    let (already, _) = one_outcome(Ok(AttemptOutcome::UpToDate { commit: oid.into() }), 0);
+    assert_eq!(already.result_oid.as_deref(), Some(oid));
+    assert!(already.conflict_paths.is_none());
     assert_eq!(already.error_detail.as_deref(), Some("already merged"));
 }
 

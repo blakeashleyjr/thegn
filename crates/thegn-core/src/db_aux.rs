@@ -395,7 +395,16 @@ impl WorktreeAuxStore for Db {
         status: &str,
         fields: &MergeStatusFields,
     ) -> Result<()> {
-        let changed = self.conn().execute(
+        anyhow::ensure!(
+            status != "landed"
+                || fields
+                    .result_oid
+                    .as_deref()
+                    .is_some_and(|oid| !oid.is_empty()),
+            "landed merge status requires a nonempty result OID"
+        );
+        let tx = Transaction::new_unchecked(self.conn(), TransactionBehavior::Immediate)?;
+        let changed = tx.execute(
             "UPDATE merge_queue SET status=?2, updated_at=?3, result_oid=?4, \
              conflict_paths=?5, error_detail=?6 WHERE worktree=?1",
             params![
@@ -411,6 +420,7 @@ impl WorktreeAuxStore for Db {
             changed == 1,
             "merge status replacement requires one existing row"
         );
+        tx.commit()?;
         Ok(())
     }
 
@@ -425,7 +435,33 @@ impl WorktreeAuxStore for Db {
         conflict_paths: Option<&str>,
         error_detail: Option<&str>,
     ) -> Result<()> {
-        self.conn().execute(
+        let tx = Transaction::new_unchecked(self.conn(), TransactionBehavior::Immediate)?;
+        if status == "landed" {
+            anyhow::ensure!(
+                result_oid.is_none_or(|oid| !oid.is_empty()),
+                "landed merge status requires a nonempty result OID"
+            );
+            // `result_oid` is nullable, so read it as `Option<String>`: `.optional()`
+            // only absorbs a MISSING ROW, and `row.get::<_, String>` on a NULL
+            // column is a hard rusqlite type error. Reading it as non-optional
+            // panicked on precisely the rows this guard exists for — a landed row
+            // whose OID is NULL (THE-687).
+            let existing: Option<String> = tx
+                .query_row(
+                    "SELECT result_oid FROM merge_queue WHERE worktree=?1",
+                    params![worktree],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()?
+                .flatten();
+            anyhow::ensure!(
+                result_oid
+                    .or(existing.as_deref())
+                    .is_some_and(|oid| !oid.is_empty()),
+                "landed merge status requires a nonempty result OID"
+            );
+        }
+        tx.execute(
             r#"UPDATE merge_queue SET
                  status=?2, updated_at=?3,
                  result_oid=COALESCE(?4, result_oid),
@@ -441,7 +477,35 @@ impl WorktreeAuxStore for Db {
                 error_detail
             ],
         )?;
+        tx.commit()?;
         Ok(())
+    }
+
+    fn backfill_landed_result_oid(
+        &self,
+        expected: &MergeQueueRow,
+        result_oid: &str,
+    ) -> Result<bool> {
+        anyhow::ensure!(!result_oid.is_empty(), "landed result OID cannot be empty");
+        anyhow::ensure!(
+            expected.status == "landed" && expected.result_oid.as_deref().is_none_or(str::is_empty),
+            "backfill requires a landed row with a missing result OID"
+        );
+        let changed = self.conn().execute(
+            "UPDATE merge_queue SET result_oid=?1, updated_at=?2 \
+             WHERE worktree=?3 AND branch=?4 AND target_branch=?5 \
+               AND status='landed' AND updated_at=?6 \
+               AND (result_oid IS NULL OR result_oid='')",
+            params![
+                result_oid,
+                util::now(),
+                expected.worktree,
+                expected.branch,
+                expected.target_branch,
+                expected.updated_at,
+            ],
+        )?;
+        Ok(changed == 1)
     }
 
     fn set_merge_target(&self, worktree: &str, target_branch: &str) -> Result<()> {

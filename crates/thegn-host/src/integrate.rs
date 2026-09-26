@@ -68,6 +68,97 @@ impl std::fmt::Display for SigningFailed {
 
 impl std::error::Error for SigningFailed {}
 
+/// Resolve a commit object from an explicit ref/OID without allowing Git to
+/// reinterpret a leading dash as an option.
+pub(crate) fn resolve_commit_oid(repo_root: &Path, reference: &str) -> Result<String> {
+    let spec = format!("{reference}^{{commit}}");
+    let oid = util::git_out(
+        repo_root,
+        &["rev-parse", "--verify", "--end-of-options", &spec],
+    )
+    .with_context(|| format!("could not resolve commit {reference}"))?;
+    anyhow::ensure!(
+        matches!(oid.len(), 40 | 64) && oid.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "invalid commit identity resolved for {reference}"
+    );
+    Ok(oid)
+}
+
+/// Reconstruct the landed commit identity for a branch already integrated into
+/// the target. This rebuilds **cache metadata only, never merged-ness**: the
+/// ancestry proof runs first and independently, so a failure to derive can never
+/// authorise a removal.
+///
+/// The rule, in one sentence: **the merge commit that integrated the branch tip
+/// if one exists, otherwise the branch tip itself** — which is already on the
+/// target, or the ancestry check above would have failed.
+///
+/// Two earlier definitions were wrong on real data and are recorded so they are
+/// not reintroduced:
+///
+/// * `rev-list --ancestry-path --reverse --max-count=1` returns the **newest**
+///   commit in the range, because git applies the bound *before* `--reverse`. All
+///   four affected rows derived `main`'s own tip.
+/// * The oldest commit on the ancestry path is wrong whenever the branch landed
+///   by fast-forward, or was absorbed into another branch: the oldest commit in
+///   `tip..target` is then an unrelated descendant that merely follows the tip,
+///   not the commit that carried the work in.
+///
+/// Scanning only `--merges` also keeps the materialised output small — merges are
+/// a fraction of history — and the walk runs once per swept row.
+///
+/// Measured on this repository, the rule gives: `tg/spark-radar` → `47aa962e`
+/// (an **octopus** merge, where the tip is not parent 2); `tg/bold-petal` →
+/// `a3ff446c`; `tg/bold-mango` → `24bafac7`; and `tg/keen-marble` → its own tip,
+/// since no merge has it as a parent.
+pub(crate) fn derive_landed_commit(
+    repo_root: &Path,
+    branch_tip: &str,
+    target_tip: &str,
+) -> Result<String> {
+    let branch_tip = resolve_commit_oid(repo_root, branch_tip)?;
+    let target_tip = resolve_commit_oid(repo_root, target_tip)?;
+    anyhow::ensure!(
+        util::git_ok(
+            repo_root,
+            &["merge-base", "--is-ancestor", &branch_tip, &target_tip],
+        ),
+        "branch tip is not an ancestor of target"
+    );
+    let range = format!("{branch_tip}..{target_tip}");
+    let args = [
+        "rev-list",
+        "--ancestry-path",
+        "--merges",
+        "--reverse",
+        "--parents",
+        &range,
+    ];
+    // `--parents` prints `<commit> <parent>...` per line. The first line whose
+    // parent list contains the tip — in ANY slot, so octopus merges are covered —
+    // is the merge that integrated it.
+    let integrated_by = match util::git_out(repo_root, &args) {
+        Some(history) => history.lines().find_map(|line| {
+            let mut fields = line.split_whitespace();
+            let commit = fields.next()?;
+            fields
+                .any(|parent| parent == branch_tip)
+                .then(|| commit.to_owned())
+        }),
+        None if util::git_ok(repo_root, &args) => None,
+        None => anyhow::bail!("could not walk target ancestry"),
+    };
+    let candidate = resolve_commit_oid(repo_root, &integrated_by.unwrap_or(branch_tip))?;
+    anyhow::ensure!(
+        util::git_ok(
+            repo_root,
+            &["merge-base", "--is-ancestor", &candidate, &target_tip],
+        ),
+        "derived landed commit is not an ancestor of target"
+    );
+    Ok(candidate)
+}
+
 /// Drives the pure fold engine over real git plumbing at one repo root.
 struct PlumbingAdapter {
     history: CanonicalHistory,
@@ -1369,7 +1460,7 @@ pub(crate) enum AttemptOutcome {
     /// not blamed and the fixing agent is never dispatched — it cannot help.
     GateError { reason: String, log: String },
     /// The branch tip is already an ancestor of the target — nothing to do.
-    UpToDate,
+    UpToDate { commit: String },
     /// The branch lives on another host and its tip could not be fetched into
     /// the target store (host unreachable / bundle or fetch failed). `detail`
     /// is the reason. Held (deferred) rather than dropped, so a transient
@@ -1444,7 +1535,9 @@ fn attempt_land_admitted(
         ) {
             adapter.history.revalidate()?;
             source_history.revalidate()?;
-            return Ok(AttemptOutcome::UpToDate);
+            return Ok(AttemptOutcome::UpToDate {
+                commit: derive_landed_commit(repo_root, &branch_tip, &base)?,
+            });
         }
         let branch = Branch {
             name: branch_name.to_string(),
@@ -3072,7 +3165,115 @@ mod tests {
         // A second attempt sees b1's tip already an ancestor of main.
         assert!(matches!(
             attempt_land(&cfg(""), &repo.dir, "b1", &GitLoc::Local(repo.dir.clone())).unwrap(),
-            AttemptOutcome::UpToDate
+            AttemptOutcome::UpToDate { .. }
         ));
+    }
+
+    #[test]
+    fn landed_identity_derivation_covers_merge_octopus_absorbed_and_unmerged_shapes() {
+        let repo = Repo::new("landed-identity-shapes");
+        if !repo.history_supported_or_refused() {
+            return;
+        }
+
+        // Every case below passes the MOVED-ON target tip, never the integration
+        // commit itself. With target == the expected answer, the newest and the
+        // oldest commit in the range coincide and the assertion cannot tell the
+        // approved definition apart from "return the target tip" — which is how a
+        // `--reverse --max-count=1` implementation (git applies the bound first,
+        // so it returns the newest) passed while being wrong on every real row.
+        repo.feature("plain", "plain.txt", "plain\n");
+        let plain_tip = repo.out(&["rev-parse", "refs/heads/plain"]);
+        git(
+            &repo.dir,
+            &["merge", "--no-ff", "-q", "-m", "plain merge", "plain"],
+        );
+        let plain_merge = repo.out(&["rev-parse", "HEAD"]);
+        repo.commit("after-plain.txt", "after\n", "after plain merge");
+        let moved_on = repo.out(&["rev-parse", "HEAD"]);
+        assert_ne!(moved_on, plain_merge, "the target must have moved on");
+        assert_eq!(
+            derive_landed_commit(&repo.dir, &plain_tip, &moved_on).unwrap(),
+            plain_merge
+        );
+
+        repo.feature("oct-one", "oct-one.txt", "oct-one\n");
+        repo.feature("oct-tip", "oct-tip.txt", "oct-tip\n");
+        let oct_tip = repo.out(&["rev-parse", "refs/heads/oct-tip"]);
+        git(
+            &repo.dir,
+            &[
+                "merge",
+                "--no-ff",
+                "-q",
+                "-m",
+                "octopus merge",
+                "oct-one",
+                "oct-tip",
+            ],
+        );
+        let octopus = repo.out(&["rev-parse", "HEAD"]);
+        let octopus_parents = repo.out(&["rev-list", "--parents", "-n", "1", "HEAD"]);
+        assert!(
+            octopus_parents.split_whitespace().nth(2) != Some(oct_tip.as_str()),
+            "the fixture must keep the tested tip out of parent slot 2"
+        );
+        repo.commit("after-oct.txt", "after\n", "after octopus merge");
+        let moved_on = repo.out(&["rev-parse", "HEAD"]);
+        assert_ne!(moved_on, octopus, "the target must have moved on");
+        assert_eq!(
+            derive_landed_commit(&repo.dir, &oct_tip, &moved_on).unwrap(),
+            octopus
+        );
+
+        // Absorbed: the tip is carried in by another branch, so NO commit has it
+        // as a parent. This is the shape of three of the four real rows.
+        repo.feature("absorbed", "absorbed.txt", "absorbed\n");
+        let absorbed_tip = repo.out(&["rev-parse", "refs/heads/absorbed"]);
+        git(&repo.dir, &["checkout", "-q", "-b", "carrier", "absorbed"]);
+        repo.commit("carrier.txt", "carrier\n", "carrier commit");
+        let carrier_tip = repo.out(&["rev-parse", "HEAD"]);
+        git(&repo.dir, &["checkout", "-q", "main"]);
+        git(
+            &repo.dir,
+            &["merge", "--no-ff", "-q", "-m", "carry", "carrier"],
+        );
+        let carry_merge = repo.out(&["rev-parse", "HEAD"]);
+        repo.commit("after-carry.txt", "after\n", "after carry merge");
+        let moved_on = repo.out(&["rev-parse", "HEAD"]);
+        assert_ne!(moved_on, carry_merge, "the target must have moved on");
+        // No merge has the absorbed tip as a parent — the `carry` merge's parents
+        // are main and `carrier_tip`, not the tip itself — so the identity is the
+        // tip, which is already on the target. Naming `carrier_tip` or the oldest
+        // commit on the ancestry path would attribute this branch's landing to an
+        // unrelated commit that merely follows it.
+        assert_eq!(
+            derive_landed_commit(&repo.dir, &absorbed_tip, &moved_on).unwrap(),
+            absorbed_tip
+        );
+        assert_ne!(absorbed_tip, carrier_tip);
+
+        repo.feature("unmerged", "unmerged.txt", "unmerged\n");
+        let unmerged_tip = repo.out(&["rev-parse", "refs/heads/unmerged"]);
+        let target = repo.out(&["rev-parse", "refs/heads/main"]);
+        assert!(derive_landed_commit(&repo.dir, &unmerged_tip, &target).is_err());
+    }
+
+    #[test]
+    fn landed_identity_derivation_covers_fast_forward_after_target_moves_on() {
+        let repo = Repo::new("landed-identity-fast-forward");
+        if !repo.history_supported_or_refused() {
+            return;
+        }
+        repo.feature("fast-forward", "fast-forward.txt", "fast-forward\n");
+        let branch_tip = repo.out(&["rev-parse", "refs/heads/fast-forward"]);
+        git(&repo.dir, &["merge", "--ff-only", "-q", "fast-forward"]);
+        repo.commit("after-fast-forward.txt", "after\n", "after fast-forward");
+        let target = repo.out(&["rev-parse", "HEAD"]);
+        assert_eq!(
+            derive_landed_commit(&repo.dir, &branch_tip, &target).unwrap(),
+            branch_tip,
+            "a fast-forward landing must retain the branch tip as its identity"
+        );
     }
 }
