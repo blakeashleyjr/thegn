@@ -1,14 +1,228 @@
-//! Best-effort system-clipboard writes via the platform CLI tool
+//! Bounded asynchronous system-clipboard writes via the platform CLI tool
 //! (`wl-copy` / `xclip` / `xsel` / `pbcopy` / `clip`). This complements the
 //! OSC52 escape the host also emits on copy: OSC52 carries the selection to
 //! the *outer* terminal (and works over SSH), while these tools hit the local
 //! clipboard directly — covering terminals and desktops that don't honor
 //! OSC52 (the common reason "it didn't actually copy"). The candidate
-//! selection is pure and unit-tested; the spawn is fire-and-forget on a
-//! detached thread so it never blocks the event loop.
+//! selection is pure and unit-tested. A single latest-wins worker owns helper
+//! lifetimes and cancellation so a hung tool cannot accumulate resources.
 
 use std::io::Write;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+/// Refuse rather than truncate: clipboard text can contain passwords and a
+/// partial paste is more dangerous than an explicit failure.
+pub const MAX_PAYLOAD_BYTES: usize = 1024 * 1024;
+/// Per-helper budget for process startup and closing stdin after the payload.
+const HELPER_START_WRITE_BUDGET: Duration = Duration::from_secs(2);
+/// Per-helper budget from spawn through observed exit.
+const HELPER_EXIT_BUDGET: Duration = Duration::from_secs(5);
+/// Whole-copy ceiling across all fallback candidates.
+const OPERATION_BUDGET: Duration = Duration::from_secs(10);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CopyOutcome {
+    Succeeded,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CopyError {
+    NotStarted,
+    PayloadTooLarge { bytes: usize },
+}
+
+impl std::fmt::Display for CopyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotStarted => f.write_str("clipboard worker is unavailable"),
+            Self::PayloadTooLarge { bytes } => write!(
+                f,
+                "clipboard text is {bytes} bytes; the maximum is {MAX_PAYLOAD_BYTES} bytes"
+            ),
+        }
+    }
+}
+
+struct CopyJob {
+    payload: Arc<[u8]>,
+    cancelled: Arc<AtomicBool>,
+}
+
+struct WorkerState {
+    pending: Option<CopyJob>,
+    current: Option<Arc<AtomicBool>>,
+    shutdown: bool,
+}
+
+struct ClipboardInner {
+    state: Mutex<WorkerState>,
+    wake: Condvar,
+    outcome: Mutex<Option<CopyOutcome>>,
+    waker: termwiz::terminal::TerminalWaker,
+}
+
+pub struct Clipboard {
+    inner: Arc<ClipboardInner>,
+    worker: Option<JoinHandle<()>>,
+}
+
+static ACTIVE: OnceLock<Mutex<Weak<ClipboardInner>>> = OnceLock::new();
+
+fn active_slot() -> &'static Mutex<Weak<ClipboardInner>> {
+    ACTIVE.get_or_init(|| Mutex::new(Weak::new()))
+}
+
+impl Clipboard {
+    pub fn start(waker: termwiz::terminal::TerminalWaker) -> Self {
+        let inner = Arc::new(ClipboardInner {
+            state: Mutex::new(WorkerState {
+                pending: None,
+                current: None,
+                shutdown: false,
+            }),
+            wake: Condvar::new(),
+            outcome: Mutex::new(None),
+            waker,
+        });
+        *active_slot().lock().unwrap_or_else(|e| e.into_inner()) = Arc::downgrade(&inner);
+        let worker_inner = Arc::clone(&inner);
+        let worker = std::thread::Builder::new()
+            .name("thegn-clipboard".into())
+            .spawn(move || worker_loop(worker_inner))
+            .expect("clipboard worker thread must start");
+        Self {
+            inner,
+            worker: Some(worker),
+        }
+    }
+
+    pub fn shutdown(&mut self) {
+        let should_join = {
+            let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+            if state.shutdown {
+                false
+            } else {
+                state.shutdown = true;
+                state.pending = None;
+                if let Some(cancelled) = &state.current {
+                    cancelled.store(true, Ordering::Release);
+                }
+                self.inner.wake.notify_one();
+                true
+            }
+        };
+        if should_join && let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+        let mut active = active_slot().lock().unwrap_or_else(|e| e.into_inner());
+        if active
+            .upgrade()
+            .is_some_and(|current| Arc::ptr_eq(&current, &self.inner))
+        {
+            *active = Weak::new();
+        }
+    }
+}
+
+impl Drop for Clipboard {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+/// Queue the latest clipboard value. Replacing a pending or active value
+/// cancels the older helper; cancellation is not reported as a failure.
+pub fn copy(text: &str) -> Result<(), CopyError> {
+    let bytes = text.as_bytes();
+    if bytes.len() > MAX_PAYLOAD_BYTES {
+        if let Some(inner) = active_slot()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .upgrade()
+        {
+            record_outcome(&inner, CopyOutcome::Failed);
+        }
+        return Err(CopyError::PayloadTooLarge { bytes: bytes.len() });
+    }
+    let Some(inner) = active_slot()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .upgrade()
+    else {
+        return Err(CopyError::NotStarted);
+    };
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let job = CopyJob {
+        payload: Arc::from(bytes),
+        cancelled,
+    };
+    let mut state = inner.state.lock().unwrap_or_else(|e| e.into_inner());
+    if state.shutdown {
+        return Err(CopyError::NotStarted);
+    }
+    if let Some(cancelled) = &state.current {
+        cancelled.store(true, Ordering::Release);
+    }
+    state.pending = Some(job);
+    inner.wake.notify_one();
+    Ok(())
+}
+
+/// Drain the latest completed result on the UI loop. Results contain no
+/// clipboard text, helper argv, or error output.
+pub fn poll_outcome() -> Option<CopyOutcome> {
+    let inner = active_slot()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .upgrade()?;
+    inner
+        .outcome
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+}
+
+fn record_outcome(inner: &ClipboardInner, outcome: CopyOutcome) {
+    *inner.outcome.lock().unwrap_or_else(|e| e.into_inner()) = Some(outcome);
+    let _ = inner.waker.wake(); // best-effort: completion must not fail the copy path
+}
+
+fn worker_loop(inner: Arc<ClipboardInner>) {
+    crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
+    loop {
+        let job = {
+            let mut state = inner.state.lock().unwrap_or_else(|e| e.into_inner());
+            while state.pending.is_none() && !state.shutdown {
+                state = inner.wake.wait(state).unwrap_or_else(|e| e.into_inner());
+            }
+            if state.shutdown {
+                return;
+            }
+            let job = state.pending.take().expect("pending clipboard job");
+            state.current = Some(Arc::clone(&job.cancelled));
+            job
+        };
+        let succeeded = run_job(&job, Instant::now());
+        let cancelled = job.cancelled.load(Ordering::Acquire);
+        let mut state = inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.current = None;
+        if !cancelled && !state.shutdown {
+            record_outcome(
+                &inner,
+                if succeeded {
+                    CopyOutcome::Succeeded
+                } else {
+                    CopyOutcome::Failed
+                },
+            );
+        }
+    }
+}
 
 /// Ordered clipboard-tool argv candidates for `(os, wayland)`. Pure — the
 /// caller resolves `os`/`wayland` from the environment. The first tool that
@@ -36,22 +250,6 @@ pub fn candidates(os: &str, wayland: bool) -> Vec<Vec<&'static str>> {
 fn detect() -> Vec<Vec<&'static str>> {
     let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
     candidates(std::env::consts::OS, wayland)
-}
-
-/// Fire-and-forget copy: on a detached thread, try each candidate tool and
-/// pipe `text` to the first that *succeeds*. A tool that spawns but exits
-/// non-zero (e.g. `xclip` in a session that's actually Wayland, so it can't
-/// reach X) doesn't stop the chain — the next candidate is tried. No-op when
-/// none are installed (the OSC52 path the caller also emits still covers that).
-pub fn copy(text: &str) {
-    let text = text.to_string();
-    std::thread::spawn(move || {
-        for argv in detect() {
-            if pipe_to(&argv, &text) {
-                break;
-            }
-        }
-    });
 }
 
 /// Ordered clipboard-*read* argv candidates for `(os, wayland)` — the paste
@@ -189,29 +387,110 @@ fn read_from(argv: &[&str]) -> Option<String> {
     if s.is_empty() { None } else { Some(s) }
 }
 
-/// Spawn one tool and write `text` to its stdin. Returns `true` only if the
-/// tool *exited successfully* — a tool that spawns but fails (e.g. can't reach
-/// the display server) returns `false` so the fallback chain keeps trying.
-// off-loop: only called from copy()'s detached std::thread.
+fn run_job(job: &CopyJob, started: Instant) -> bool {
+    let deadline = started + OPERATION_BUDGET;
+    for argv in detect() {
+        if job.cancelled.load(Ordering::Acquire) || Instant::now() >= deadline {
+            return false;
+        }
+        if pipe_to(&argv, Arc::clone(&job.payload), &job.cancelled, deadline) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Spawn one helper and write the payload with bounded progress. Returns
+/// `true` only if the tool exits successfully. The writer is one short-lived,
+/// joined thread for the current helper only; killing the process group closes
+/// its pipe and lets that thread settle.
 #[expect(clippy::disallowed_methods)]
-fn pipe_to(argv: &[&str], text: &str) -> bool {
+fn pipe_to(
+    argv: &[&str],
+    payload: Arc<[u8]>,
+    cancelled: &AtomicBool,
+    operation_deadline: Instant,
+) -> bool {
     let Some((cmd, args)) = argv.split_first() else {
         return false;
     };
-    let child = Command::new(cmd)
+    let attempt_started = Instant::now();
+    let mut command = Command::new(cmd);
+    command
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
-    let Ok(mut child) = child else {
+        .stderr(Stdio::null());
+    let Ok((mut child, group)) = crate::platform::spawn_clipboard_helper(&mut command) else {
         return false;
     };
-    if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(text.as_bytes()); // best-effort: stdout write: EPIPE on a closed |head pipe is normal
-        // Drop closes stdin so the tool sees EOF and stores the content.
+    let spawned = Instant::now();
+    let write_deadline = (attempt_started + HELPER_START_WRITE_BUDGET).min(operation_deadline);
+    let exit_deadline = (spawned + HELPER_EXIT_BUDGET).min(operation_deadline);
+    let Some(stdin) = child.stdin.take() else {
+        stop_attempt(child, group, None);
+        return false;
+    };
+    let (write_tx, write_rx) = std::sync::mpsc::sync_channel(1);
+    let writer = std::thread::spawn(move || {
+        let mut stdin = stdin;
+        let result = stdin.write_all(&payload);
+        drop(stdin);
+        let _ = write_tx.send(result);
+    });
+
+    loop {
+        if cancelled.load(Ordering::Acquire) || Instant::now() >= write_deadline {
+            stop_attempt(child, group, Some(writer));
+            return false;
+        }
+        match write_rx.try_recv() {
+            Ok(Ok(())) => break,
+            Ok(Err(_)) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                stop_attempt(child, group, Some(writer));
+                return false;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
     }
-    child.wait().map(|s| s.success()).unwrap_or(false)
+
+    loop {
+        if cancelled.load(Ordering::Acquire) || Instant::now() >= exit_deadline {
+            stop_attempt(child, group, Some(writer));
+            return false;
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                // The leader remains unreaped here, so its group identity is
+                // still owned while descendants are cleaned up.
+                group.kill();
+                let _ = child.wait();
+                let _ = writer.join();
+                return status.success();
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            Err(_) => {
+                stop_attempt(child, group, Some(writer));
+                return false;
+            }
+        }
+    }
+}
+
+#[expect(clippy::disallowed_methods)]
+fn stop_attempt(
+    mut child: std::process::Child,
+    group: crate::platform::GroupHandle,
+    writer: Option<JoinHandle<()>>,
+) {
+    group.kill();
+    let _ = child.kill();
+    let _ = child.wait();
+    if let Some(writer) = writer {
+        let _ = writer.join();
+    }
 }
 
 #[cfg(test)]
@@ -251,12 +530,59 @@ mod tests {
         // reach the display server) must NOT count as success, or it would
         // break the fallback chain. `/bin/false` models that; `/bin/true`
         // models a tool that actually stored the selection.
-        assert!(!pipe_to(&["false"], "x"), "nonzero exit must be a failure");
-        assert!(pipe_to(&["true"], "x"), "zero exit is success");
+        let cancelled = AtomicBool::new(false);
+        assert!(!pipe_to(
+            &["false"],
+            Arc::from(&b"x"[..]),
+            &cancelled,
+            Instant::now() + OPERATION_BUDGET,
+        ));
+        assert!(pipe_to(
+            &["true"],
+            Arc::from(&b"x"[..]),
+            &cancelled,
+            Instant::now() + OPERATION_BUDGET,
+        ));
         assert!(
-            !pipe_to(&["definitely-not-a-real-binary-xyz"], "x"),
+            !pipe_to(
+                &["definitely-not-a-real-binary-xyz"],
+                Arc::from(&b"x"[..]),
+                &cancelled,
+                Instant::now() + OPERATION_BUDGET,
+            ),
             "unspawnable tool is a failure"
         );
+    }
+
+    #[test]
+    fn oversized_payload_is_refused_without_truncation() {
+        let error = CopyError::PayloadTooLarge {
+            bytes: MAX_PAYLOAD_BYTES + 1,
+        };
+        assert_eq!(error, CopyError::PayloadTooLarge { bytes: 1_048_577 });
+        assert!(error.to_string().contains("1048577"));
+        assert!(error.to_string().contains("1048576"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn unread_stdin_is_cancelled_without_waiting_for_helper_exit() {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancel_later = Arc::clone(&cancelled);
+        let timer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(25));
+            cancel_later.store(true, Ordering::Release);
+        });
+        let started = Instant::now();
+        let result = pipe_to(
+            &["sh", "-c", "sleep 30"],
+            Arc::from(vec![b'x'; MAX_PAYLOAD_BYTES]),
+            &cancelled,
+            started + OPERATION_BUDGET,
+        );
+        let _ = timer.join();
+        assert!(!result);
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[test]

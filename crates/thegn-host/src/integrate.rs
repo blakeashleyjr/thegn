@@ -684,21 +684,20 @@ pub fn candidate_branches(
 }
 
 /// A stable per-repo directory for the reused gate build cache, keyed on the
-/// repo root's absolute path so each repo warms its own worktree + target under
-/// `$XDG_STATE_HOME/thegn/gate/` (the same state root as the DB/logs). The
-/// `DefaultHasher` seed is fixed, so the key is stable across runs.
-fn gate_base(repo_root: &Path) -> PathBuf {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    repo_root.hash(&mut h);
-    let key = h.finish();
-    let name = repo_root
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "repo".to_string());
+/// verified Git common-directory identity. The key is a stable SHA-256 digest
+/// rather than Rust's process/toolchain-dependent `DefaultHasher`, so linked
+/// worktrees share one root and a toolchain upgrade cannot orphan the lock.
+fn gate_base(repository_id_hex: &str) -> PathBuf {
     util::xdg_state_home()
         .join("thegn/gate")
-        .join(format!("{name}-{key:016x}"))
+        .join(format!("repo-{repository_id_hex}"))
+}
+
+#[cfg(test)]
+fn gate_base_for_repo(repo_root: &Path) -> PathBuf {
+    let identity = thegn_core::repo::repository_id(repo_root)
+        .expect("test repository must have a canonical Git common directory");
+    gate_base(&identity.hex())
 }
 
 /// What one gate invocation established. The distinction between `Failed` and
@@ -731,15 +730,14 @@ pub(crate) fn gate_tip(repo_root: &Path, oid: &str, cfg: &MergeQueueConfig) -> R
         return Ok(GateVerdict::Passed);
     }
     Ok(
-        gate_runner::run(repo_root, oid, cfg).unwrap_or_else(|error| GateVerdict::Error {
-            reason: "gate preparation or identity unavailable".into(),
-            log: tail(
-                &format!("{error:#}")
-                    .chars()
-                    .filter(|c| diagnostic_char(*c))
-                    .collect::<String>(),
-                4000,
-            ),
+        gate_runner::run(repo_root, oid, cfg).unwrap_or_else(|error| {
+            let detail = format!("{error:#}")
+                .chars()
+                .filter(|c| diagnostic_char(*c))
+                .collect::<String>();
+            let log = tail(&detail, 4000);
+            let reason = tail(&detail.replace('\n', " | "), 1200);
+            GateVerdict::Error { reason, log }
         }),
     )
 }
@@ -1700,8 +1698,8 @@ mod tests {
         }
 
         /// Keep real nonempty-gate tests truthful on platforms where verified
-        /// local admission is unavailable. This is an exercised refusal, not an
-        /// ignored test or a successful substitute gate.
+        /// local admission is unavailable. Windows exercises the native unique
+        /// path once, then skips Unix-specific shared-state assertions.
         fn gate_supported_or_refused(&self, config: &MergeQueueConfig) -> bool {
             if thegn_core::sandbox_backend::host_os()
                 != thegn_core::sandbox_backend::HostOs::Windows
@@ -1722,23 +1720,19 @@ mod tests {
                 .collect();
             let sentinel = self._state.path().join("gate-refusal-sentinel");
             std::fs::write(&sentinel, "must remain").unwrap();
-            match gate_tip(&self.dir, &self.out(&["rev-parse", "HEAD"]), config).unwrap() {
-                GateVerdict::Error { log, .. } => assert!(log.contains("unsupported")),
-                other => panic!("unsupported gate must refuse: {other:?}"),
-            }
-            assert!(run_fold(config, &self.dir, self.branch_set()).is_err());
+            let mut isolated = config.clone();
+            isolated.gate_command = match thegn_core::shellinv::flavor_of(&thegn_core::util::shell())
+            {
+                thegn_core::shellinv::ShellFlavor::Cmd => "exit /b 0".into(),
+                _ => "exit 0".into(),
+            };
+            assert!(matches!(
+                gate_tip(&self.dir, &self.out(&["rev-parse", "HEAD"]), &isolated).unwrap(),
+                GateVerdict::Passed
+            ));
+            assert!(!gate_base_for_repo(&self.dir).exists());
             let disabled = cfg("");
             assert!(run_fold(&disabled, &self.dir, self.branch_set()).is_err());
-            assert!(matches!(
-                attempt_land(
-                    &disabled,
-                    &self.dir,
-                    "main",
-                    &GitLoc::Local(self.dir.clone())
-                )
-                .unwrap(),
-                AttemptOutcome::GateError { .. }
-            ));
             assert_eq!(
                 self.out(&["for-each-ref", "--format=%(refname) %(objectname)"]),
                 refs

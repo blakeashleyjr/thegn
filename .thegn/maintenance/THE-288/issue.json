@@ -1,0 +1,12 @@
+{
+  "id": "THE-288",
+  "title": "Bound and cancel clipboard helper threads and subprocess trees",
+  "url": "https://linear.app/blakeashley/issue/the-288",
+  "priority": "High",
+  "labels": [
+    "Bug"
+  ],
+  "status": "Todo",
+  "parentId": "THE-150",
+  "description": "## Finding\n\nEach native clipboard copy spawns a detached OS thread, which tries several helper programs and waits for each child with no deadline or process-tree cancellation. Repeated copy actions or a hung helper can accumulate threads, processes, pipes, and full clipboard payload copies indefinitely.\n\n## Evidence at audited commit\n\n* `crates/thegn-host/src/clipboard.rs:42-55` clones the full text and calls `std::thread::spawn` for every copy.\n* `clipboard.rs:190-213` spawns a helper, writes the entire value, and calls blocking `child.wait()` without a timeout.\n* Candidate fallback means multiple unbounded subprocess waits can occur for one copy.\n\n## Required design\n\n1. Use one bounded clipboard worker/queue with an explicit latest-wins or FIFO policy and byte cap.\n2. Put each helper in a cancellable process group/Job Object before it can execute; enforce startup, stdin-write, and exit deadlines.\n3. Kill/reap the whole helper tree on timeout, shutdown, or replacement.\n4. Return asynchronous success/failure to the UI instead of treating \"thread spawned\" as clipboard success.\n5. Bound retained text and redact clipboard content from diagnostics.\n\n## Acceptance criteria\n\n* Repeated copy bursts cannot create unbounded threads/processes or retained bytes.\n* A helper that never reads stdin, never exits, or forks descendants is cancelled and reaped within the documented bound.\n* Shutdown leaves no clipboard helper alive.\n* Success/failure reaches the initiating surface without exposing content.\n\n## Dependency mapping\n\nBlocked by THE-274 for trustworthy Windows process-tree containment (UNLANDED)."
+}
