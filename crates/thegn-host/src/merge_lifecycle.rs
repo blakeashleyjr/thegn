@@ -537,6 +537,7 @@ pub(crate) fn remove_landed_with_config(
             anyhow::bail!("cleanup hold observation changed; retained for manual reconciliation");
         }
         db.del_worktree(worktree)?;
+        db.delete_tab_groups_for_worktree_all_sessions(worktree)?;
         if !delete_branch {
             db.remove_merge_entry(worktree)?;
             return Ok(true);
