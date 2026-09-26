@@ -140,4 +140,85 @@ fn missing_row_and_sql_failure_are_visible_without_other_row_changes() {
             .is_err()
     );
     assert_eq!(row(&db), before);
+    assert!(
+        db.replace_merge_status(
+            WORKTREE,
+            "landed",
+            &MergeStatusFields {
+                result_oid: Some(String::new()),
+                ..Default::default()
+            },
+        )
+        .is_err()
+    );
+    assert_eq!(row(&db), before);
+}
+
+#[test]
+fn landed_status_requires_an_effective_nonempty_result_oid() {
+    let db = seeded();
+    let before = row(&db);
+
+    assert!(
+        db.replace_merge_status(WORKTREE, "landed", &MergeStatusFields::default())
+            .is_err()
+    );
+    assert_eq!(row(&db), before);
+
+    // The legacy COALESCE form may re-stamp a landed row while preserving its
+    // existing identity, but it cannot create or overwrite one with empty text.
+    db.update_merge_status(WORKTREE, "landed", None, None, None)
+        .unwrap();
+    assert_eq!(row(&db).result_oid.as_deref(), Some("old-oid"));
+    let before_empty = row(&db);
+    assert!(
+        db.update_merge_status(WORKTREE, "landed", Some(""), None, None)
+            .is_err()
+    );
+    assert_eq!(row(&db), before_empty);
+
+    db.replace_merge_status(
+        WORKTREE,
+        "deferred",
+        &MergeStatusFields {
+            result_oid: None,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(
+        db.update_merge_status(WORKTREE, "landed", None, None, None)
+            .is_err()
+    );
+    assert_eq!(row(&db).status, "deferred");
+}
+
+#[test]
+fn landed_identity_backfill_is_exact_and_rejects_stale_rows() {
+    let db = seeded();
+    // Simulate the pre-THE-687 rows that the guarded writers can no longer
+    // create; the sweep's repair seam must still be able to recover them.
+    db.conn()
+        .execute(
+            "UPDATE merge_queue SET status='landed', result_oid=NULL",
+            [],
+        )
+        .unwrap();
+    let expected = row(&db);
+    assert!(
+        db.backfill_landed_result_oid(&expected, "derived-oid")
+            .unwrap()
+    );
+    assert_eq!(row(&db).result_oid.as_deref(), Some("derived-oid"));
+
+    db.conn()
+        .execute("UPDATE merge_queue SET result_oid=NULL", [])
+        .unwrap();
+    db.update_merge_status(WORKTREE, "deferred", None, None, None)
+        .unwrap();
+    assert!(
+        !db.backfill_landed_result_oid(&expected, "derived-again")
+            .unwrap()
+    );
+    assert_eq!(row(&db).status, "deferred");
 }
