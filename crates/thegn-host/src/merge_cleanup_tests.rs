@@ -7,7 +7,7 @@ struct Fixture {
 }
 
 #[test]
-fn local_runtime_admission_pins_workspace_selection_and_refuses_persisted_session() {
+fn local_runtime_admission_pins_workspace_selection() {
     use thegn_core::store::WorkspaceStore;
     let _isolation = TestIsolation::new();
     let fixture = Fixture::new();
@@ -36,23 +36,6 @@ fn local_runtime_admission_pins_workspace_selection_and_refuses_persisted_sessio
             .contains("environment changed")
     );
     db.set_worktree_env(path, "").unwrap();
-    db.put_tab_group(
-        "private-session",
-        &thegn_core::models::TabGroupRow {
-            name: "private/feature".into(),
-            kind: "branch".into(),
-            worktree: path.into(),
-            ordinal: 0,
-            active_tab: 0,
-        },
-    )
-    .unwrap();
-    assert!(
-        settled
-            .revalidate(&db, &fixture.root, path)
-            .unwrap_err()
-            .contains("runtime/session")
-    );
     assert!(fixture.wt.exists());
 }
 

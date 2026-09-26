@@ -608,6 +608,181 @@ mod tests {
         }
     }
 
+    fn seed_persisted_layout(db: &Db, worktree: &str) {
+        use thegn_core::models::{GroupTabRow, TabGroupRow};
+        for (session, name) in [("layout-a", "app/feature"), ("layout-b", "other/feature")] {
+            db.put_tab_group(
+                session,
+                &TabGroupRow {
+                    name: name.into(),
+                    kind: "branch".into(),
+                    worktree: worktree.into(),
+                    ordinal: 0,
+                    active_tab: 0,
+                },
+            )
+            .unwrap();
+            db.put_group_tab(
+                session,
+                &GroupTabRow {
+                    group_name: name.into(),
+                    ordinal: 0,
+                    title: "1".into(),
+                    pane_tree: r#"{"leaf":0}"#.into(),
+                    focused_pane: 0,
+                    pane_cwds: String::new(),
+                    pane_cmds: String::new(),
+                    pane_sessions: String::new(),
+                    scrollback_snapshot: String::new(),
+                },
+            )
+            .unwrap();
+        }
+    }
+
+    fn age_landed_row(db_path: &Path, worktree: &str) {
+        rusqlite::Connection::open(db_path)
+            .unwrap()
+            .execute(
+                "UPDATE merge_queue SET queued_at=1, updated_at=1 WHERE worktree=?1",
+                [worktree],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn persisted_layout_is_deleted_for_every_session_after_collection() {
+        let isolation = crate::merge_lifecycle::TestIsolation::new();
+        for force in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let parent = dir.path().canonicalize().unwrap();
+            let db_path = parent.join("private.db");
+            let db = Db::open_at(&db_path).unwrap();
+            let (root, wt) = fixture(&parent, "layout", &db, &isolation);
+            let path = wt.to_str().unwrap();
+            seed_persisted_layout(&db, path);
+            age_landed_row(&db_path, path);
+
+            let mut cfg = local_config();
+            cfg.merge_queue.on_landed = OnLanded::Expire;
+            cfg.merge_queue.target_branch = "main".into();
+            cfg.merge_queue.merged_ttl_secs = 1;
+            let report = sweep_with_db(&cfg, &root, force, &db);
+
+            assert_eq!(report.collected, ["feature"], "force={force}");
+            assert!(!wt.exists(), "force={force}");
+            assert!(db.groups_for_session("layout-a").unwrap().is_empty());
+            assert!(db.groups_for_session("layout-b").unwrap().is_empty());
+            assert!(db.group_tabs_for_session("layout-a").unwrap().is_empty());
+            assert!(db.group_tabs_for_session("layout-b").unwrap().is_empty());
+            assert!(db.worktree_record(path).unwrap().is_none());
+            assert_eq!(db.list_merge_queue().unwrap().len(), 1);
+        }
+    }
+
+    struct SessionLatch(PathBuf);
+
+    impl Drop for SessionLatch {
+        fn drop(&mut self) {
+            crate::worktree_lifecycle::release_session_start(&self.0);
+        }
+    }
+
+    #[test]
+    fn live_session_latch_still_refuses_collection_in_both_force_modes() {
+        for force in [false, true] {
+            let isolation = crate::merge_lifecycle::TestIsolation::new();
+            let dir = tempfile::tempdir().unwrap();
+            let parent = dir.path().canonicalize().unwrap();
+            let db_path = parent.join("private.db");
+            let db = Db::open_at(&db_path).unwrap();
+            let (root, wt) = fixture(&parent, "live", &db, &isolation);
+            let path = wt.to_str().unwrap();
+            seed_persisted_layout(&db, path);
+            age_landed_row(&db_path, path);
+            assert!(
+                crate::worktree_lifecycle::session_start_once(&Config::default(), &wt, None,)
+                    .unwrap()
+            );
+            let _latch = SessionLatch(wt.clone());
+            let before = db.list_merge_queue().unwrap();
+
+            let mut cfg = local_config();
+            cfg.merge_queue.on_landed = OnLanded::Expire;
+            cfg.merge_queue.target_branch = "main".into();
+            cfg.merge_queue.merged_ttl_secs = 1;
+            let report = sweep_with_db(&cfg, &root, force, &db);
+
+            assert!(report.collected.is_empty(), "force={force}: {report:?}");
+            assert_eq!(report.kept.len(), 1, "force={force}");
+            assert!(
+                report.kept[0]
+                    .1
+                    .contains("active session requires explicit cleanup"),
+                "force={force}: {report:?}"
+            );
+            assert!(wt.exists(), "force={force}");
+            assert_eq!(db.list_merge_queue().unwrap(), before, "force={force}");
+            assert_eq!(db.groups_for_session("layout-a").unwrap().len(), 1);
+            assert_eq!(db.groups_for_session("layout-b").unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn tenancy_and_nonterminal_dispatch_still_refuse_both_force_modes() {
+        for (hold, table) in [("tenancy", "tenancy"), ("dispatch", "dispatch")] {
+            for force in [false, true] {
+                let isolation = crate::merge_lifecycle::TestIsolation::new();
+                let dir = tempfile::tempdir().unwrap();
+                let parent = dir.path().canonicalize().unwrap();
+                let db_path = parent.join("private.db");
+                let db = Db::open_at(&db_path).unwrap();
+                let (root, wt) = fixture(&parent, hold, &db, &isolation);
+                let path = wt.to_str().unwrap();
+                seed_persisted_layout(&db, path);
+                age_landed_row(&db_path, path);
+                let conn = rusqlite::Connection::open(&db_path).unwrap();
+                if table == "tenancy" {
+                    conn.execute(
+                        "INSERT INTO host_tenancy(sandbox,host_id,worktree,cpu_floor_milli,mem_floor_mb,state,reserved_at) VALUES(?1,'invalid-host-id',?1,0,0,'released',0)",
+                        [path],
+                    )
+                    .unwrap();
+                } else {
+                    conn.execute(
+                        "INSERT INTO agent_dispatches(issue_id,worktree_path,agent_name,dispatched_at_ms,status) VALUES('private',?1,'private',0,'running')",
+                        [path],
+                    )
+                    .unwrap();
+                }
+                let before = db.list_merge_queue().unwrap();
+
+                let mut cfg = local_config();
+                cfg.merge_queue.on_landed = OnLanded::Expire;
+                cfg.merge_queue.target_branch = "main".into();
+                cfg.merge_queue.merged_ttl_secs = 1;
+                let report = sweep_with_db(&cfg, &root, force, &db);
+
+                assert!(report.collected.is_empty(), "{hold}, force={force}");
+                assert_eq!(report.kept.len(), 1, "{hold}, force={force}");
+                assert!(
+                    report.kept[0]
+                        .1
+                        .contains("runtime/session/dispatch ownership"),
+                    "{hold}, force={force}: {report:?}"
+                );
+                assert!(wt.exists(), "{hold}, force={force}");
+                assert_eq!(
+                    db.list_merge_queue().unwrap(),
+                    before,
+                    "{hold}, force={force}"
+                );
+                assert_eq!(db.groups_for_session("layout-a").unwrap().len(), 1);
+                assert_eq!(db.groups_for_session("layout-b").unwrap().len(), 1);
+            }
+        }
+    }
+
     #[test]
     fn fresh_landed_row_waits_for_grace_period_but_force_bypasses_only_the_clock() {
         let isolation = crate::merge_lifecycle::TestIsolation::new();
