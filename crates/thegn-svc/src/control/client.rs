@@ -1478,6 +1478,24 @@ mod tests {
         server.abort();
     }
 
+    #[test]
+    fn only_http_origins_construct_a_reqwest_transport() {
+        let unix = ControlClient::new(ControlAddr::Unix("/tmp/thegn-control.sock".into()));
+        assert!(unix.http_client.is_none());
+
+        let tcp = ControlClient::new(ControlAddr::Tcp {
+            addr: "127.0.0.1:5380".into(),
+            token: "tcp-token".into(),
+        });
+        assert!(tcp.http_client.is_none());
+
+        let http = ControlClient::new(ControlAddr::HttpOrigin {
+            origin: "http://127.0.0.1:5380".into(),
+            token: "http-token".into(),
+        });
+        assert!(http.http_client.is_some());
+    }
+
     #[tokio::test]
     async fn replacing_http_origin_client_keeps_in_flight_work_on_old_client() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
