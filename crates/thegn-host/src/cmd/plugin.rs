@@ -408,6 +408,21 @@ mod tests {
     }
 
     #[test]
+    fn json_list_row_keeps_config_and_health_fields_in_one_stable_projection() {
+        let plugin = inspected_plugin(ExtensionPoint::PaletteAction, &["surface:palette"]);
+        let json = serde_json::to_value(list_row(&plugin)).unwrap();
+        assert_eq!(json["id"], "inspect");
+        assert_eq!(json["name"], "Inspect");
+        assert_eq!(json["version"], "1.0.0");
+        assert_eq!(json["mode"], "resident");
+        assert_eq!(json["enabled"], true);
+        assert_eq!(json["status"], "ok");
+        assert_eq!(json["state"], "unknown");
+        assert_eq!(json["live_health"], "unavailable");
+        assert_eq!(json["live_health_reason"], LIVE_HEALTH_UNAVAILABLE);
+    }
+
+    #[test]
     fn config_disabled_state_is_distinct_and_exit_semantics_stay_inspection_only() {
         let health = PluginHealth::from_config(false);
         assert_eq!(health.state, PluginState::DisabledByConfig);

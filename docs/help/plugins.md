@@ -105,8 +105,12 @@ denial is audited. `tools.run` is the current exec-scoped plugin call;
 generic control route exists.
 
 Crashed resident plugins restart with backoff (three attempts, then disabled
-until config reload). Plugin processes are _not_ sandboxed — treat a plugin
-like any program you choose to run.
+until config reload). That crash/backoff state is process-lifetime supervisor
+state: it is not persisted across a daemon or compositor restart. After such a
+restart, the offline `plugin list` command cannot reconcile live state and
+reports an enabled plugin as `unknown` with `live_health = unavailable` until a
+future attached-snapshot surface exists. Plugin processes are _not sandboxed_ —
+treat a plugin like any program you choose to run.
 
 ## Writing one
 
