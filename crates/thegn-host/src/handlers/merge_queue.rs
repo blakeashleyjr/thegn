@@ -779,14 +779,16 @@ pub(crate) fn section_key(key: char, cursor: usize, ctx: MqKeyCtx) -> bool {
                     format!(", removed {} worktree(s)", swept.collected.len())
                 };
                 let kept = if swept.kept_dirty.is_empty()
+                    && swept.kept_changed.is_empty()
                     && swept.kept.is_empty()
                     && swept.bookkeeping_errors.is_empty()
                 {
                     String::new()
                 } else {
                     format!(
-                        "; retained {} dirty, {} refused; {} bookkeeping error(s)",
+                        "; retained {} edited, {} changed during cleanup, {} refused; {} bookkeeping error(s)",
                         swept.kept_dirty.len(),
+                        swept.kept_changed.len(),
                         swept.kept.len(),
                         swept.bookkeeping_errors.len()
                     )

@@ -224,9 +224,9 @@ fn rejects_foreign_main_target_mismatched_and_unregistered_paths() {
 }
 
 #[test]
-fn dirty_ignored_untracked_and_unknown_status_never_mean_clean() {
+fn tracked_and_untracked_status_never_mean_clean_but_ignored_only_is_admissible() {
     let _isolation = TestIsolation::new();
-    for path in ["tracked", "untracked", "ignored"] {
+    for path in ["tracked", "untracked"] {
         let fixture = Fixture::new();
         std::fs::write(fixture.wt.join(path), "new user work\n").unwrap();
         assert!(matches!(fixture.probe(), Err(Refusal::Dirty)), "{path}");
@@ -236,11 +236,52 @@ fn dirty_ignored_untracked_and_unknown_status_never_mean_clean() {
         );
     }
     let fixture = Fixture::new();
+    std::fs::write(fixture.wt.join("ignored"), "build output\n").unwrap();
+    let verified = fixture
+        .probe()
+        .expect("ignored-only build state is safely removable");
+    assert!(verified.discarded_build_state());
+    assert!(fixture.wt.join("ignored").exists());
+    let fixture = Fixture::new();
     let index = PathBuf::from(text(&fixture.wt, &["rev-parse", "--git-path", "index"]).unwrap());
     std::fs::write(&index, "corrupt fixture index").unwrap();
     assert!(fixture.probe().is_err());
     assert!(fixture.wt.exists());
     assert!(clean(&fixture._dir.path().join("absent")).is_err());
+}
+
+#[test]
+fn status_observation_accepts_only_well_formed_ignored_records() {
+    let empty = observe_status(Vec::new()).unwrap();
+    assert!(!empty.ignored_only);
+    assert_eq!(empty.bytes, Vec::<u8>::new());
+
+    let ignored = observe_status(b"!! target/\0!! cache/\0".to_vec()).unwrap();
+    assert!(ignored.ignored_only);
+    assert_eq!(ignored.bytes, b"!! target/\0!! cache/\0");
+
+    // Well-formed records that are not ignored state are real work.
+    for status in [
+        b" M tracked\0".as_slice(),
+        b"?? untracked\0",
+        b"R  new\0",
+        b"!x unknown\0",
+    ] {
+        assert!(
+            matches!(observe_status(status.to_vec()), Err(Refusal::Dirty)),
+            "{:?}",
+            String::from_utf8_lossy(status)
+        );
+    }
+    // A record that does not parse is refused as unsafe, never reported to the
+    // operator as an edit they made.
+    for malformed in [b"!!".as_slice(), b"!! \0", b"!!x\0"] {
+        assert!(
+            matches!(observe_status(malformed.to_vec()), Err(Refusal::Unsafe(_))),
+            "{:?}",
+            String::from_utf8_lossy(malformed)
+        );
+    }
 }
 
 #[test]
@@ -334,7 +375,7 @@ fn final_validation_preserves_new_ignored_files_and_replaced_directory() {
         "appeared after first validation",
     )
     .unwrap();
-    assert!(matches!(verified.remove(), Err(Refusal::Dirty)));
+    assert!(matches!(verified.remove(), Err(Refusal::Changed)));
     assert!(fixture.wt.join("ignored").exists());
     let fixture = Fixture::new();
     let verified = fixture.probe().unwrap();
@@ -344,6 +385,67 @@ fn final_validation_preserves_new_ignored_files_and_replaced_directory() {
     std::fs::write(fixture.wt.join("keep"), "replacement").unwrap();
     assert!(verified.remove().is_err());
     assert!(moved.join("tracked").exists() && fixture.wt.join("keep").exists());
+}
+
+#[test]
+fn tracked_work_appearing_after_admission_is_dirty_not_merely_changed() {
+    let _isolation = TestIsolation::new();
+    let fixture = Fixture::new();
+    let verified = fixture.probe().unwrap();
+    std::fs::write(fixture.wt.join("tracked"), "appeared after admission").unwrap();
+
+    // `Dirty`, not `Changed`: the operator went back to this worktree and edited
+    // it, which is the "edited since landing" fact, not a concurrency signal.
+    // The distinction is what the sweep reports, so it must not blur.
+    assert!(matches!(verified.remove(), Err(Refusal::Dirty)));
+    assert!(fixture.wt.join("tracked").exists());
+}
+
+#[test]
+fn ignored_work_appearing_after_the_last_guard_is_not_removed() {
+    let _isolation = TestIsolation::new();
+    let fixture = Fixture::new();
+    let verified = fixture.probe().unwrap();
+
+    let result = verified.remove_checked(&|| {
+        std::fs::write(
+            fixture.wt.join("ignored"),
+            "appeared after final status check",
+        )
+        .map_err(|error| error.to_string())
+    });
+
+    assert!(matches!(result, Err(Refusal::Changed)), "{result:?}");
+    assert!(fixture.wt.join("ignored").exists());
+}
+
+/// The status predicate is not the only thing protecting real work: plain
+/// `git worktree remove` refuses a worktree with modified or untracked files,
+/// and the sweep deliberately does not pass `--force`. That is the backstop for
+/// the unavoidable window between the last status read and the removal, so it
+/// must keep holding even if the predicate is ever wrong.
+#[test]
+fn removal_never_forces_so_git_independently_refuses_real_work() {
+    let _isolation = TestIsolation::new();
+    for (path, expected_kept) in [
+        ("tracked", "edited user work"),
+        ("untracked", "new user work"),
+    ] {
+        let fixture = Fixture::new();
+        let verified = fixture.probe().unwrap();
+        // Write the work only once the guard has run, i.e. past every check the
+        // cleanup code performs. Only Git itself can still refuse here.
+        let result = verified.remove_checked(&|| {
+            std::fs::write(fixture.wt.join(path), expected_kept).map_err(|e| e.to_string())
+        });
+        assert!(result.is_err(), "{path}: {result:?}");
+        assert_eq!(
+            std::fs::read_to_string(fixture.wt.join(path)).unwrap(),
+            expected_kept,
+            "{path} must survive"
+        );
+        assert!(fixture.wt.exists(), "{path}: worktree must survive");
+    }
 }
 
 #[test]

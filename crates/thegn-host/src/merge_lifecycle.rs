@@ -32,9 +32,11 @@ pub(crate) enum CleanupOutcome {
     Removed {
         branch_deleted: bool,
         queue_removed: bool,
+        discarded_build_state: bool,
         bookkeeping_errors: Vec<String>,
     },
     KeptDirty,
+    KeptChanged,
     Refused {
         reason: String,
     },
@@ -117,14 +119,26 @@ fn apply_inner(
             );
             match outcome {
                 CleanupOutcome::Removed {
-                    bookkeeping_errors, ..
+                    discarded_build_state,
+                    bookkeeping_errors,
+                    ..
                 } => {
+                    if discarded_build_state {
+                        thegn_core::msg::info(&format!(
+                            "merge cleanup: swept {} (discarded build state)",
+                            crate::merge_sweep::safe_display(branch)
+                        ));
+                    }
                     for error in bookkeeping_errors {
                         thegn_core::msg::warn(&crate::merge_sweep::safe_display(&error));
                     }
                 }
                 CleanupOutcome::KeptDirty => thegn_core::msg::warn(&format!(
-                    "merge cleanup: kept {} — uncommitted, untracked or ignored work",
+                    "merge cleanup: kept {} — edited since landing",
+                    crate::merge_sweep::safe_display(branch)
+                )),
+                CleanupOutcome::KeptChanged => thegn_core::msg::warn(&format!(
+                    "merge cleanup: kept {} — changed during cleanup",
                     crate::merge_sweep::safe_display(branch)
                 )),
                 CleanupOutcome::Refused { reason } => thegn_core::msg::warn(&format!(
@@ -404,6 +418,28 @@ pub(crate) fn remove_landed_with_config(
         Ok(resources) => resources,
         Err(reason) => return CleanupOutcome::Refused { reason },
     };
+    let discarded_build_state = verified.discarded_build_state();
+    let changed_during_cleanup = std::cell::Cell::new(false);
+    let dirty_during_cleanup = std::cell::Cell::new(false);
+    // A worktree that becomes dirty or changes *during* cleanup is kept, exactly
+    // as one that was already dirty at admission. Record which, so the sweep
+    // reports it in its own category rather than as a generic refusal — a
+    // `Refused` row reads as a fault, and this is the normal "you went back to
+    // it" outcome.
+    let note_refusal = |refusal: cleanup::Refusal| -> String {
+        match &refusal {
+            cleanup::Refusal::Changed => changed_during_cleanup.set(true),
+            cleanup::Refusal::Dirty => dirty_during_cleanup.set(true),
+            cleanup::Refusal::Unsafe(_) => {}
+        }
+        refusal.to_string()
+    };
+    let revalidate_verified = || -> Result<(), String> {
+        match verified.revalidate() {
+            Ok(()) => Ok(()),
+            Err(refusal) => Err(note_refusal(refusal)),
+        }
+    };
     let unchanged_queue = || -> Result<(), String> {
         resources.revalidate(db, repo_root, worktree)?;
         let current = db
@@ -449,17 +485,24 @@ pub(crate) fn remove_landed_with_config(
         Some(db),
         &|| {
             unchanged_queue()?;
-            verified.revalidate().map_err(|e| e.to_string())
+            revalidate_verified()
         },
         Some(&|| {
             unchanged_queue()?;
-            verified
-                .remove_checked(&unchanged_queue)
-                .map_err(|e| e.to_string())
+            match verified.remove_checked(&unchanged_queue) {
+                Ok(()) => Ok(()),
+                Err(refusal) => Err(note_refusal(refusal)),
+            }
         }),
         Some(&|| resources.revalidate(db, repo_root, worktree)),
     );
     if !removed {
+        if changed_during_cleanup.get() {
+            return CleanupOutcome::KeptChanged;
+        }
+        if dirty_during_cleanup.get() {
+            return CleanupOutcome::KeptDirty;
+        }
         return CleanupOutcome::Refused { reason: message };
     }
     if let Err(error) = verified.verify_removed() {
@@ -514,6 +557,7 @@ pub(crate) fn remove_landed_with_config(
     CleanupOutcome::Removed {
         branch_deleted,
         queue_removed,
+        discarded_build_state,
         bookkeeping_errors,
     }
 }
