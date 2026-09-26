@@ -467,6 +467,13 @@ pub fn spawn_grouped(cmd: &mut Command) -> std::io::Result<(std::process::Child,
     Ok((child, GroupHandle { pgid }))
 }
 
+/// Spawn a native clipboard helper in its own process group.
+pub fn spawn_clipboard_helper(
+    cmd: &mut Command,
+) -> std::io::Result<(std::process::Child, GroupHandle)> {
+    spawn_grouped(cmd)
+}
+
 /// A desktop helper together with the process-group identity created for it.
 /// The direct child stays owned here until group cleanup has completed and the
 /// child has been waited, so callers cannot accidentally signal a reused PGID.
