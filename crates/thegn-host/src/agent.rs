@@ -1076,7 +1076,7 @@ fn attach_vpn(spec: &mut sandbox::SandboxSpec) -> anyhow::Result<()> {
 /// config. A no-op when no VPN is configured. Ephemeral keys also auto-reap
 /// server-side once the sidecar dies, so this is an optimization, not required.
 pub(crate) fn deregister_vpn(path: &str) {
-    let cfg = Config::load_layered(&thegn_core::config::ProcessEnv, &[], None);
+    let cfg = crate::config_startup::cleanup_config();
     let sb = cfg.repo_sandbox(Path::new(path));
     if !sb.vpn.is_enabled() {
         return;
@@ -2879,7 +2879,7 @@ pub(crate) fn deprovision_sync(path: &str) {
     let Some(env_name) = env_name else {
         return;
     };
-    let cfg = Config::load_layered(&thegn_core::config::ProcessEnv, &[], None);
+    let cfg = crate::config_startup::cleanup_config();
     let Some((provider, id, workdir)) = provider_sync_target(&cfg, &env_name) else {
         return;
     };

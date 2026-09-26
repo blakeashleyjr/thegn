@@ -126,10 +126,19 @@ fn spec(base: &str, tmp: &std::path::Path) -> FlySpec {
         max_instances: 0,
         max_lifetime_secs: 0,
         key_path: tmp.join("key"),
-        pubkey: "ssh-ed25519 MOCKKEY thegn".into(),
+        pubkey: TEST_PUBKEY.into(),
         iroh: None,
         skip_ready_wait: true,
     }
+}
+
+/// A structurally valid (throwaway) ed25519 public key.
+const TEST_PUBKEY: &str =
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIgVgF3FLyN2aHUalBpkk3cMVfTgD+7TrbdfTAcSvLvB thegn";
+
+/// A well-formed minted sandbox token (`tgi_` + 48 lowercase hex).
+fn iroh_token() -> String {
+    format!("tgi_{}", "ab".repeat(24))
 }
 
 #[test]
@@ -141,6 +150,111 @@ fn create_list_destroy_with_ledger() {
         .enable_all()
         .build()
         .unwrap();
+
+    // Static admission is exercised through the real RemoteProvider::create
+    // boundary. Every invalid field category must stop before the mock sees a
+    // request and before the lifecycle ledger gets any row (checked under the
+    // mutated spec's own ledger key and as a whole-ledger emptiness check).
+    let over_name = "n".repeat(64);
+    type Mutation = Box<dyn Fn(&mut FlySpec)>;
+    let cases: Vec<(&str, Mutation)> = vec![
+        (
+            "unknown-size",
+            Box::new(|s| s.size = "shared-cpu-3x".into()),
+        ),
+        ("size-case", Box::new(|s| s.size = "SHARED-CPU-2X".into())),
+        (
+            "snapshot-image",
+            Box::new(|s| s.image = "snapshot:42".into()),
+        ),
+        (
+            "malformed-image",
+            Box::new(|s| s.image = "image:a//b".into()),
+        ),
+        ("image-query", Box::new(|s| s.image = "reg.io/a?b".into())),
+        (
+            "endpoint-userinfo",
+            Box::new(|s| s.api_base = "https://user:token@example.invalid/v1".into()),
+        ),
+        (
+            "endpoint-query",
+            Box::new(|s| s.api_base = "https://example.invalid/v1?t=1".into()),
+        ),
+        (
+            "endpoint-ipv6",
+            Box::new(|s| s.api_base = "http://[garbage]/v1".into()),
+        ),
+        (
+            "endpoint-port",
+            Box::new(|s| s.api_base = "http://[::1]80/v1".into()),
+        ),
+        (
+            "graphql-endpoint",
+            Box::new(|s| s.graphql_url = "ftp://example.invalid/graphql".into()),
+        ),
+        (
+            "name-space",
+            Box::new(|s| s.name = " tg-fly-invalid ".into()),
+        ),
+        ("name-slash", Box::new(|s| s.name = "tg/fly".into())),
+        ("name-long", Box::new(move |s| s.name = over_name.clone())),
+        ("region", Box::new(|s| s.region = "ia/d".into())),
+        ("org", Box::new(|s| s.org_slug = "Acme?".into())),
+        ("cap", Box::new(|s| s.max_instances = 257)),
+        ("lifetime", Box::new(|s| s.max_lifetime_secs = u64::MAX)),
+        (
+            "key-shape",
+            Box::new(|s| s.pubkey = "not-a-public-key".into()),
+        ),
+        (
+            "key-blob",
+            Box::new(|s| s.pubkey = "ssh-ed25519 MOCKKEY thegn".into()),
+        ),
+        (
+            "key-path",
+            Box::new(|s| s.key_path = std::path::PathBuf::new()),
+        ),
+        (
+            "iroh-token",
+            Box::new(|s| {
+                s.iroh = Some(IrohInject {
+                    home_node: "c".repeat(64),
+                    sandbox_auth: "auth-token-xyz".into(),
+                    sandbox_id: s.name.clone(),
+                })
+            }),
+        ),
+        (
+            "iroh-mismatch",
+            Box::new(|s| {
+                s.iroh = Some(IrohInject {
+                    home_node: "c".repeat(64),
+                    sandbox_auth: iroh_token(),
+                    sandbox_id: "another-sandbox".into(),
+                })
+            }),
+        ),
+    ];
+    for (label, mutate) in &cases {
+        let mut bad = spec(&base, tmp.path());
+        bad.name = format!("tg-fly-invalid-{label}");
+        mutate(&mut bad);
+        let ledger_key = bad.name.clone();
+        let error = rt
+            .block_on(FlyProvider::new(bad).create())
+            .expect_err("invalid spec must be rejected locally");
+        let rendered = format!("{error:#} {error:?}");
+        assert!(!rendered.contains("token@"), "{label}: {rendered}");
+        assert!(
+            recorded.lock().unwrap().is_empty(),
+            "invalid {label} made a request"
+        );
+        assert!(
+            registry::read(&ledger_key).is_none() && registry::list().is_empty(),
+            "invalid {label} wrote a ledger row"
+        );
+    }
+
     let p = FlyProvider::new(spec(&base, tmp.path()));
 
     // --- create: app-exists → allocate IPv4 → create machine; ledger finalized.
@@ -217,9 +331,10 @@ fn create_list_destroy_with_ledger() {
     // body-builder coverage lives in `machines::tests`.
     let mut s = spec(&base, tmp.path());
     s.name = "tg-fly-iroh".into();
+    let home_node = "c".repeat(64);
     s.iroh = Some(IrohInject {
-        home_node: "home-endpoint-id".into(),
-        sandbox_auth: "auth-token-xyz".into(),
+        home_node: home_node.clone(),
+        sandbox_auth: iroh_token(),
         sandbox_id: "tg-fly-iroh".into(),
     });
     let pi = FlyProvider::new(s);
@@ -234,8 +349,8 @@ fn create_list_destroy_with_ledger() {
         .expect("machine create POST (iroh)");
     let ibody: serde_json::Value = serde_json::from_str(&create.body).unwrap();
     let env = &ibody["config"]["env"];
-    assert_eq!(env["THEGN_HOME_NODE"], "home-endpoint-id");
-    assert_eq!(env["THEGN_SANDBOX_AUTH"], "auth-token-xyz");
+    assert_eq!(env["THEGN_HOME_NODE"], home_node.as_str());
+    assert_eq!(env["THEGN_SANDBOX_AUTH"], iroh_token().as_str());
     assert_eq!(env["THEGN_SANDBOX_ID"], "tg-fly-iroh");
     // Additive: the ssh key + service wiring is still present alongside iroh.
     assert_eq!(

@@ -23,15 +23,25 @@ pub fn data(resp: &serde_json::Value) -> Result<&serde_json::Value> {
     if let Some(errs) = resp.get("errors").and_then(|e| e.as_array())
         && !errs.is_empty()
     {
+        // Vendor-authored messages only, bounded in count and length; the raw
+        // response document is never echoed.
         let msg = errs
             .iter()
             .filter_map(|e| e.get("message").and_then(|m| m.as_str()))
+            .take(4)
+            .map(|m| {
+                let mut end = m.len().min(200);
+                while !m.is_char_boundary(end) {
+                    end -= 1;
+                }
+                &m[..end]
+            })
             .collect::<Vec<_>>()
             .join("; ");
         return Err(anyhow!("fly graphql error: {msg}"));
     }
     resp.get("data")
-        .ok_or_else(|| anyhow!("fly graphql: no data in response: {resp}"))
+        .ok_or_else(|| anyhow!("fly graphql: no data in response"))
 }
 
 const APP_IPS_QUERY: &str = "\

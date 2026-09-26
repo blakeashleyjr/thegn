@@ -29,24 +29,75 @@ pub fn install(overrides: Vec<String>, path: Option<PathBuf>) {
     let _ = SOURCE.set(Source { overrides, path }); // best-effort: first-set-wins: later calls are ignored by design
 }
 
-/// `boot` with only its agent/tool/pipeline registries refreshed from the
-/// recorded source, loaded exactly as `main` layers it (env + overrides + DB
-/// hosts + channel clamp). `None` when nothing was recorded or the file no
-/// longer loads — the caller keeps its snapshot.
+/// The `--set` overrides this process was started with (empty when none was
+/// recorded). `config validate`/doctor use them so they reproduce exactly
+/// what this invocation's admission would see.
+pub fn overrides() -> Vec<String> {
+    SOURCE
+        .get()
+        .map(|src| src.overrides.clone())
+        .unwrap_or_default()
+}
+
+/// `boot` with only its agent/tool/pipeline registries refreshed from a
+/// freshly **admitted** generation.
+///
+/// When this process performed startup admission (every configured verb,
+/// including the daemon, does), the refresh re-admits from the frozen process
+/// capture through `config_startup::reload` and uses only a generation that
+/// is current and healthy. A failed or unauthorizable reload is an `Err`: an
+/// agent launch must refuse rather than fall back to a stale boot snapshot
+/// (which stays available for display/status only).
+///
+/// `Ok(None)` only for a process with neither an admitted store nor a legacy
+/// source (unit tests), where the caller keeps its snapshot.
 /// Blocking I/O: never call on the event loop or a runtime worker.
-pub fn fresh(boot: &Config) -> Option<Config> {
-    let src = SOURCE.get()?;
-    let mut cfg = Config::try_load_layered(
+pub fn fresh(boot: &Config) -> Result<Option<Config>, String> {
+    if crate::config_startup::store().is_some() {
+        use crate::config_startup::ReloadOutcome;
+        let admitted = match crate::config_startup::reload() {
+            ReloadOutcome::Published(admitted) => admitted,
+            // Another reload published first: use whatever is current now.
+            ReloadOutcome::Superseded | ReloadOutcome::Unavailable => {
+                crate::config_startup::display().ok_or("configuration store is unavailable")?
+            }
+            ReloadOutcome::Failed(error) => return Err(error.to_string()),
+            ReloadOutcome::FailedCoalesced => {
+                return Err(crate::config_startup::banner().unwrap_or_else(|| {
+                    "configuration reload failed; the last admitted generation is display-only"
+                        .into()
+                }));
+            }
+        };
+        // A launch needs the current, healthy generation with its host
+        // layer; a host-less or superseded generation is display-only.
+        crate::config_startup::require_launchable(&admitted)?;
+        let mut cfg = admitted.config().clone();
+        // best-effort: the clamped-feature report is for `main`'s startup
+        // status note; a daemon re-load deliberately discards it.
+        let _ = cfg.clamp_to_channel(crate::channel_state::current());
+        return Ok(Some(thegn_core::pipeline_run::with_fresh_registry(
+            boot, &cfg,
+        )));
+    }
+    let Some(src) = SOURCE.get() else {
+        return Ok(None);
+    };
+    // Legacy tolerant path: reachable only in a process that never ran
+    // startup admission (no production verb), kept for existing tests.
+    let Ok(mut cfg) = Config::try_load_layered(
         &thegn_core::config::ProcessEnv,
         &src.overrides,
         src.path.clone(),
-    )
-    .ok()?;
+    ) else {
+        return Ok(None);
+    };
     thegn_core::host_config::merge_db_hosts(&mut cfg);
-    // best-effort: the clamped-feature report is for `main`'s startup status
-    // note; a daemon re-load deliberately discards it.
+    // best-effort: see above.
     let _ = cfg.clamp_to_channel(crate::channel_state::current());
-    Some(thegn_core::pipeline_run::with_fresh_registry(boot, &cfg))
+    Ok(Some(thegn_core::pipeline_run::with_fresh_registry(
+        boot, &cfg,
+    )))
 }
 
 #[cfg(test)]
@@ -55,8 +106,11 @@ mod tests {
     fn fresh_without_a_source_is_none() {
         // The test binary never installs a source; a process that did not
         // record one keeps its snapshot rather than guessing a path.
-        if super::SOURCE.get().is_none() {
-            assert!(super::fresh(&thegn_core::config::Config::default()).is_none());
+        if super::SOURCE.get().is_none() && crate::config_startup::store().is_none() {
+            assert!(matches!(
+                super::fresh(&thegn_core::config::Config::default()),
+                Ok(None)
+            ));
         }
     }
 }

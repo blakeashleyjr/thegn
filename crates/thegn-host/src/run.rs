@@ -413,7 +413,10 @@ fn sync_panel_docs(
     // subprocess per entry for a document nothing displayed.)
 }
 
-pub async fn main(cli: crate::Cli) -> Result<()> {
+pub async fn main(
+    cli: crate::Cli,
+    admitted: std::sync::Arc<thegn_core::config_admission::AdmittedConfig>,
+) -> Result<()> {
     let start = std::time::Instant::now();
 
     // Repair broken home-directory paths (e.g. ~/.gitconfig left as an empty
@@ -610,24 +613,15 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         "terminal ready (raw mode + alt screen + buffer)"
     );
 
-    // Load config BEFORE the session so `load_or_seed_session`'s reconcile knows
-    // each worktree's env PLACEMENT: a remote (ssh/k8s/provider) worktree has no
-    // host dir, so it must not be reaped as "deleted" just because its local path
-    // is absent. `merge_db_hosts`/i18n below augment this same `cfg`; env
-    // placement comes from the config file directly, so it's already correct here.
-    let mut cfg = thegn_core::config::Config::load_layered(
-        &thegn_core::config::ProcessEnv,
-        &cli.overrides,
-        cli.config.clone(),
-    );
-    // Establish schema ownership before `load_or_seed_session` (the first DB
-    // consumer). The actual open is deliberately left to the ordinary startup
-    // + hydration paths: a newer-schema refusal must reach visible chrome, not
-    // abort after the terminal has entered the alternate screen.
-    thegn_core::db::install_migration_policy(
-        &cfg.database,
-        thegn_core::db::MigrationActor::Controller,
-    )?;
+    // The config was admitted by `main` before the terminal was touched: every
+    // trusted layer (file, selected profile, env, `--set`) validated strictly,
+    // the admitted `[database]` migration policy installed, the state store
+    // opened/migrated, and host definitions composed strictly — one published
+    // generation (see `config_startup`). It is available BEFORE the session so
+    // `load_or_seed_session`'s reconcile knows each worktree's env PLACEMENT: a
+    // remote (ssh/k8s/provider) worktree has no host dir, so it must not be
+    // reaped as "deleted" just because its local path is absent.
+    let mut cfg = admitted.config().clone();
     // Off-loop hydration loads must build the SAME config (overrides + DB
     // hosts) — see `hydrate::load_hydration_config`.
     crate::hydrate::set_config_source(cli.overrides.clone(), cli.config.clone());
@@ -716,9 +710,7 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         "session loaded"
     );
 
-    // `cfg` was loaded above (before the session reconcile); augment it with
-    // DB-stored hosts now that we're past session load.
-    thegn_core::host_config::merge_db_hosts(&mut cfg);
+    // DB-stored hosts were composed into the admitted generation already.
     crate::e2e_freeze::pin_locale(&mut cfg.ui.language);
     let lc_all = std::env::var("LC_ALL").ok();
     let lang = std::env::var("LANG").ok();
@@ -833,6 +825,9 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     // First-frame orientation line (a few chords + build stamp); launch
     // warnings below take precedence. Expires like any other status message.
     model.status = crate::hydrate::startup_status_line(&cfg);
+    // Persistent (not TTL'd) when the admitted config is degraded, e.g. a
+    // host-less generation after a newer-schema store.
+    model.config_banner = crate::config_startup::banner();
     apply_mode_status(&mut model, mode, &cfg);
     // Surface keybind conflicts at launch (non-fatal — the shell always opens).
     if let Some(summary) = keybind_conflict_summary(&cfg) {
@@ -914,8 +909,6 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     let config_waker = waker.clone();
     std::thread::spawn(move || {
         if let Some(parent) = config_path.parent() {
-            let overrides_clone = cli.overrides.clone();
-            let config_clone = cli.config.clone();
             // TRAILING-edge debounce (audit run.rs:744): the notify callback only
             // *signals* an event arrived; a coalescing recv loop below waits for
             // the burst to stop before loading, so a truncate+write save (VS Code,
@@ -947,13 +940,18 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
                     // …then drain everything that lands within the debounce window,
                     // re-arming on each event so we only load once events stop.
                     while ev_rx.recv_timeout(debounce).is_ok() {}
-                    let new_cfg_res = thegn_core::config::Config::try_load_layered(
-                        &thegn_core::config::ProcessEnv,
-                        &overrides_clone,
-                        config_clone.clone(),
-                    )
-                    .map(|mut c| {
-                        thegn_core::host_config::merge_db_hosts(&mut c);
+                    // Re-admit from the frozen process capture (strict, off
+                    // the loop) and publish by CAS. A failure keeps the prior
+                    // generation (display-only) and is reported once per
+                    // distinct failure; repeats coalesce silently.
+                    let Some(update) = crate::config_startup::loop_update(
+                        crate::config_startup::reload(),
+                        crate::config_startup::display,
+                    ) else {
+                        continue;
+                    };
+                    let new_cfg_res = update.map(|admitted| {
+                        let mut c = admitted.config().clone();
                         crate::e2e_freeze::apply_to_config(&mut c);
                         c
                     });
@@ -9995,6 +9993,12 @@ async fn event_loop<T: Terminal>(
             // pushes it), so hydration must carry it or the badge blanks on
             // every 2s tick and reappears only on the next poll.
             next_model.usage = std::mem::take(&mut model.usage);
+            // Recomputed (not carried) on every hydration: the store's health
+            // also changes outside the config channel — an in-process daemon
+            // launch refreshing through `config_source::fresh`, the wizard's
+            // host-add reload — and a stale banner would either hide a
+            // degraded store or outlive the fix.
+            next_model.config_banner = crate::config_startup::banner();
             next_model.usage_history = std::mem::take(&mut model.usage_history);
             next_model.usage_tokens = model.usage_tokens.take();
             // And the weather reading, for the same reason with a much longer
@@ -11524,6 +11528,9 @@ async fn event_loop<T: Terminal>(
 
         while let Ok(cfg_res) = config_rx.try_recv() {
             loop_perf.tick(crate::perf::WakeSource::Config);
+            // The banner mirrors the store: set while a reload is failing or
+            // the host layer is unavailable, cleared once a reload publishes.
+            model.config_banner = crate::config_startup::banner();
             match cfg_res {
                 Ok(new_cfg) => {
                     keymap = rebuild_keymap(&new_cfg, &session);

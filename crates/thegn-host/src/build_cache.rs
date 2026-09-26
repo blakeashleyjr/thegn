@@ -143,14 +143,28 @@ pub(crate) fn sandbox_cache_doctor_json(
         config_path,
         "sandbox.compiler_cache",
     );
+    // An unexplainable source is reported as such, never as a Builtin origin.
+    let (origin, source_trace) = match &provenance {
+        Ok(provenance) => (
+            provenance.origin.as_str().to_string(),
+            provenance
+                .trace
+                .iter()
+                .map(|(layer, value)| {
+                    serde_json::json!({
+                        "layer": layer.as_str(),
+                        "value": value,
+                    })
+                })
+                .collect::<Vec<_>>(),
+        ),
+        Err(error) => (format!("unadmitted: {error}"), Vec::new()),
+    };
     serde_json::json!({
         "authority": "sandbox.compiler_cache",
         "mode": cfg.sandbox.compiler_cache.as_str(),
-        "origin": provenance.origin.as_str(),
-        "source_trace": provenance.trace.iter().map(|(layer, value)| serde_json::json!({
-            "layer": layer.as_str(),
-            "value": value,
-        })).collect::<Vec<_>>(),
+        "origin": origin,
+        "source_trace": source_trace,
         "candidate_inputs": {
             "disk_sccache": cfg.disk.sccache,
             "devshell_wrapper": devshell_wrapper,

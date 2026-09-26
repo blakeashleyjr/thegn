@@ -55,7 +55,8 @@ async fn machine_dials_home_and_serves_shell_over_iroh() {
     unsafe { std::env::set_var("THEGN_DIR", tmp.path()) };
     let (key_path, pubkey) = ephemeral_key(tmp.path());
     let name = format!("tg-iroh-{}", std::process::id());
-    let auth_token = format!("tgtok-{}-{}", std::process::id(), name);
+    // The minted-token shape the Fly provider admits (`tgi_` + lowercase hex).
+    let auth_token = format!("tgi_{:048x}", std::process::id());
 
     // 1) Stand up the compositor's home endpoint (real N0 relays so the machine
     //    can reach it), with a verifier that accepts our minted token.
