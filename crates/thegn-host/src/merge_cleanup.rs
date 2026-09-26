@@ -303,15 +303,34 @@ fn parse_container_ids(bytes: &[u8]) -> Result<Vec<String>, &'static str> {
 /// host with two or more containers refuse every worktree — including unrelated
 /// mounts — which would have left this issue's own symptom in place on a machine
 /// running so much as two containers.
+/// A blank line is legitimate ONLY directly after an `end` marker. Docker's
+/// docker-compat CLI emits one there as a per-container separator — measured
+/// against the real binary, which prints `…\nend\n\n` per container while
+/// podman's native CLI prints no separator at all. A blank anywhere else is
+/// truncated or mangled output and must refuse, so this cannot become the
+/// fail-open "skip every blank" reading.
 fn parse_mount_sources(bytes: &[u8]) -> Result<Vec<PathBuf>, &'static str> {
-    let records = oci_records(bytes)?;
+    if !bytes.ends_with(b"\n") {
+        return Err("output did not end with a newline");
+    }
     let mut sources = Vec::new();
     let mut containers = 0usize;
-    for record in &records {
-        if *record == b"end" {
-            containers += 1;
+    let mut after_end = false;
+    // The element after the final `\n` is always empty and is not a record.
+    for record in bytes[..bytes.len() - 1].split(|byte| *byte == b'\n') {
+        let record = record.strip_suffix(b"\r").unwrap_or(record);
+        if record.is_empty() {
+            if !after_end {
+                return Err("output contained a blank record");
+            }
             continue;
         }
+        if record == b"end" {
+            containers += 1;
+            after_end = true;
+            continue;
+        }
+        after_end = false;
         let Some(source) = record.strip_prefix(b"mount:") else {
             return Err("missing mount record prefix");
         };
@@ -327,7 +346,7 @@ fn parse_mount_sources(bytes: &[u8]) -> Result<Vec<PathBuf>, &'static str> {
         return Err("missing end marker");
     }
     // Every container's records must be terminated, so the batch ends with one.
-    if records.last() != Some(&b"end".as_slice()) {
+    if !after_end {
         return Err("data followed the final end marker");
     }
     Ok(sources)

@@ -100,6 +100,29 @@ fn oci_inspect_parser_accepts_one_record_per_batched_container() {
     );
 }
 
+/// The two real CLIs disagree about separators, and only one of them was modelled
+/// when this parser was written. Captured verbatim from the binaries on a host with
+/// two containers: podman's native CLI prints no separator, while docker's
+/// docker-compat CLI prints a blank line after every container's `end`. Rejecting
+/// that blank refused every worktree on a machine with docker installed — the live
+/// symptom this issue exists to remove, which reappeared after the end-marker fix.
+/// A blank is accepted ONLY directly after `end`.
+#[test]
+fn oci_inspect_parser_accepts_the_docker_compat_blank_separator() {
+    let podman = b"mount:/a\nmount:/b\nend\nmount:/c\nend\n".as_slice();
+    let docker = b"mount:/a\nmount:/b\nend\n\nmount:/c\nend\n\n".as_slice();
+    let expected = vec![
+        PathBuf::from("/a"),
+        PathBuf::from("/b"),
+        PathBuf::from("/c"),
+    ];
+    assert_eq!(parse_mount_sources(podman).unwrap(), expected);
+    assert_eq!(parse_mount_sources(docker).unwrap(), expected);
+    // A separator is not a licence to skip blanks anywhere else.
+    assert!(parse_mount_sources(b"mount:/a\n\nend\n").is_err());
+    assert!(parse_mount_sources(b"\nmount:/a\nend\n").is_err());
+}
+
 #[test]
 fn oci_parsers_reject_blank_records_as_malformed() {
     assert!(parse_container_ids(b"\n").is_err());
