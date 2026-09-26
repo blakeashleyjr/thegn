@@ -500,6 +500,11 @@ mod tests {
         assert_eq!(ranges[2].to, first);
         assert_eq!(ranges[4].to, forwards);
         assert!(ranges.iter().all(|range| range.from <= range.to));
+        assert!(
+            ranges
+                .iter()
+                .all(|range| range.to - range.from == ChronoDuration::minutes(1))
+        );
     }
 
     #[tokio::test]
