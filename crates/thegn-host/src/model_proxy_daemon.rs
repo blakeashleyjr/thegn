@@ -47,26 +47,31 @@ fn parse_pid_state(raw: &str) -> Option<ProxyPidState> {
     let mut start_time = None;
     let mut saw_start_time = false;
     for line in raw.lines() {
-        if let Some(value) = line.strip_prefix("pid=") {
-            if pid.is_some() {
-                return None;
+        // A line without `=`, or with any other key, is malformed: reject the
+        // whole state rather than parsing a partial identity.
+        let (key, value) = line.split_once('=')?;
+        match key {
+            "pid" => {
+                if pid.is_some() {
+                    return None;
+                }
+                let value = value.parse::<u32>().ok()?;
+                if !safe_proxy_pid(value) {
+                    return None;
+                }
+                pid = Some(value);
             }
-            let value = value.parse::<u32>().ok()?;
-            if !safe_proxy_pid(value) {
-                return None;
+            "start_time" => {
+                if saw_start_time {
+                    return None;
+                }
+                saw_start_time = true;
+                start_time = Some(match value {
+                    "unavailable" => None,
+                    value => Some(value.parse::<u64>().ok()?),
+                });
             }
-            pid = Some(value);
-        } else if let Some(value) = line.strip_prefix("start_time=") {
-            if saw_start_time {
-                return None;
-            }
-            saw_start_time = true;
-            start_time = Some(match value {
-                "unavailable" => None,
-                value => Some(value.parse::<u64>().ok()?),
-            });
-        } else {
-            return None;
+            _ => return None,
         }
     }
     Some(ProxyPidState {
@@ -206,35 +211,6 @@ pub fn stop(_cfg: &ModelProxyConfig) -> Result<bool> {
     Ok(sent)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn pid_state_rejects_malformed_and_extreme_values() {
-        for raw in [
-            "",
-            "pid=\nstart_time=1\n",
-            "pid=0\nstart_time=1\n",
-            "pid=2147483648\nstart_time=1\n",
-            "pid=4294967295\nstart_time=1\n",
-            "pid=12\n",
-            "pid=12\nstart_time=wat\n",
-            "pid=12\nstart_time=1\nextra=x\n",
-            "pid=12\npid=13\nstart_time=1\n",
-        ] {
-            assert_eq!(parse_pid_state(raw), None, "accepted {raw:?}");
-        }
-    }
-
-    #[test]
-    fn malformed_state_never_reaches_termination() {
-        for raw in ["", "pid=0\nstart_time=1\n", "pid=not-a-pid\nstart_time=1\n"] {
-            assert!(!stop_pid_state(raw));
-        }
-    }
-}
-
 /// The outcome of considering an agent/tool for proxy routing.
 pub enum ProxyEnvDecision {
     /// The entry did not opt in (`route_via_proxy` unset) — leave it alone.
@@ -343,4 +319,33 @@ pub fn spawn_supervisor(cfg: &Config) {
             // best-effort: spawn failure already warned by the inspect_err above
         })
         .ok();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pid_state_rejects_malformed_and_extreme_values() {
+        for raw in [
+            "",
+            "pid=\nstart_time=1\n",
+            "pid=0\nstart_time=1\n",
+            "pid=2147483648\nstart_time=1\n",
+            "pid=4294967295\nstart_time=1\n",
+            "pid=12\n",
+            "pid=12\nstart_time=wat\n",
+            "pid=12\nstart_time=1\nextra=x\n",
+            "pid=12\npid=13\nstart_time=1\n",
+        ] {
+            assert_eq!(parse_pid_state(raw), None, "accepted {raw:?}");
+        }
+    }
+
+    #[test]
+    fn malformed_state_never_reaches_termination() {
+        for raw in ["", "pid=0\nstart_time=1\n", "pid=not-a-pid\nstart_time=1\n"] {
+            assert!(!stop_pid_state(raw));
+        }
+    }
 }
