@@ -388,6 +388,35 @@ fn final_validation_preserves_new_ignored_files_and_replaced_directory() {
 }
 
 #[test]
+fn final_validation_classifies_new_tracked_work_as_changed_during_cleanup() {
+    let _isolation = TestIsolation::new();
+    let fixture = Fixture::new();
+    let verified = fixture.probe().unwrap();
+    std::fs::write(fixture.wt.join("tracked"), "appeared after admission").unwrap();
+
+    assert!(matches!(verified.remove(), Err(Refusal::Changed)));
+    assert!(fixture.wt.join("tracked").exists());
+}
+
+#[test]
+fn ignored_work_appearing_after_the_last_guard_is_not_removed() {
+    let _isolation = TestIsolation::new();
+    let fixture = Fixture::new();
+    let verified = fixture.probe().unwrap();
+
+    let result = verified.remove_checked(&|| {
+        std::fs::write(
+            fixture.wt.join("ignored"),
+            "appeared after final status check",
+        )
+        .map_err(|error| error.to_string())
+    });
+
+    assert!(matches!(result, Err(Refusal::Changed)), "{result:?}");
+    assert!(fixture.wt.join("ignored").exists());
+}
+
+#[test]
 fn locked_worktree_busy_repository_and_symlink_alias_are_refused() {
     let _isolation = TestIsolation::new();
     let fixture = Fixture::new();
