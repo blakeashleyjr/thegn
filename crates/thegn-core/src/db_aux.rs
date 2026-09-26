@@ -441,13 +441,19 @@ impl WorktreeAuxStore for Db {
                 result_oid.is_none_or(|oid| !oid.is_empty()),
                 "landed merge status requires a nonempty result OID"
             );
+            // `result_oid` is nullable, so read it as `Option<String>`: `.optional()`
+            // only absorbs a MISSING ROW, and `row.get::<_, String>` on a NULL
+            // column is a hard rusqlite type error. Reading it as non-optional
+            // panicked on precisely the rows this guard exists for — a landed row
+            // whose OID is NULL (THE-687).
             let existing: Option<String> = tx
                 .query_row(
                     "SELECT result_oid FROM merge_queue WHERE worktree=?1",
                     params![worktree],
-                    |row| row.get(0),
+                    |row| row.get::<_, Option<String>>(0),
                 )
-                .optional()?;
+                .optional()?
+                .flatten();
             anyhow::ensure!(
                 result_oid
                     .or(existing.as_deref())

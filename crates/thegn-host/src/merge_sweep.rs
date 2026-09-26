@@ -303,7 +303,7 @@ fn sweep_with_db(cfg: &Config, repo_root: &Path, force: bool, db: &Db) -> SweepR
             &entry.branch,
             &target,
             Some(landed),
-            row,
+            &row,
             /* delete_branch */ true,
         ) {
             CleanupOutcome::Removed {

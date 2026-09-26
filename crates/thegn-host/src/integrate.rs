@@ -86,9 +86,15 @@ pub(crate) fn resolve_commit_oid(repo_root: &Path, reference: &str) -> Result<St
 
 /// Derive the first target-side commit that carries an already-integrated tip.
 /// The ancestry proof is deliberately performed before the walk: this helper
-/// reconstructs cache metadata, never merged-ness. The walk is once per row;
-/// `--max-count=1` keeps the returned history bounded while preserving the
-/// `--ancestry-path --reverse` definition approved for THE-687.
+/// reconstructs cache metadata, never merged-ness.
+///
+/// Do NOT add `--max-count=1` to bound this. Git applies `--max-count` *before*
+/// `--reverse`, so `--reverse --max-count=1` yields the NEWEST commit in the
+/// range — the target's own tip — rather than the oldest. Measured on this repo:
+/// for `tg/keen-marble` the bounded form returned `main`'s tip while the correct
+/// definition returns `27a995ff`, the commit that actually carried the branch in.
+/// The walk runs once per swept row, and `--ancestry-path` already restricts it
+/// to the integration path, so the full reverse is what the bound would cost.
 pub(crate) fn derive_landed_commit(
     repo_root: &Path,
     branch_tip: &str,
@@ -104,13 +110,7 @@ pub(crate) fn derive_landed_commit(
         "branch tip is not an ancestor of target"
     );
     let range = format!("{branch_tip}..{target_tip}");
-    let args = [
-        "rev-list",
-        "--ancestry-path",
-        "--reverse",
-        "--max-count=1",
-        &range,
-    ];
+    let args = ["rev-list", "--ancestry-path", "--reverse", &range];
     let candidate = match util::git_out(repo_root, &args) {
         Some(history) => history
             .lines()
@@ -3149,6 +3149,12 @@ mod tests {
             return;
         }
 
+        // Every case below passes the MOVED-ON target tip, never the integration
+        // commit itself. With target == the expected answer, the newest and the
+        // oldest commit in the range coincide and the assertion cannot tell the
+        // approved definition apart from "return the target tip" — which is how a
+        // `--reverse --max-count=1` implementation (git applies the bound first,
+        // so it returns the newest) passed while being wrong on every real row.
         repo.feature("plain", "plain.txt", "plain\n");
         let plain_tip = repo.out(&["rev-parse", "refs/heads/plain"]);
         git(
@@ -3156,8 +3162,11 @@ mod tests {
             &["merge", "--no-ff", "-q", "-m", "plain merge", "plain"],
         );
         let plain_merge = repo.out(&["rev-parse", "HEAD"]);
+        repo.commit("after-plain.txt", "after\n", "after plain merge");
+        let moved_on = repo.out(&["rev-parse", "HEAD"]);
+        assert_ne!(moved_on, plain_merge, "the target must have moved on");
         assert_eq!(
-            derive_landed_commit(&repo.dir, &plain_tip, &plain_merge).unwrap(),
+            derive_landed_commit(&repo.dir, &plain_tip, &moved_on).unwrap(),
             plain_merge
         );
 
@@ -3182,21 +3191,34 @@ mod tests {
             octopus_parents.split_whitespace().nth(2) != Some(oct_tip.as_str()),
             "the fixture must keep the tested tip out of parent slot 2"
         );
+        repo.commit("after-oct.txt", "after\n", "after octopus merge");
+        let moved_on = repo.out(&["rev-parse", "HEAD"]);
+        assert_ne!(moved_on, octopus, "the target must have moved on");
         assert_eq!(
-            derive_landed_commit(&repo.dir, &oct_tip, &octopus).unwrap(),
+            derive_landed_commit(&repo.dir, &oct_tip, &moved_on).unwrap(),
             octopus
         );
 
+        // Absorbed: the tip is carried in by another branch, so NO commit has it
+        // as a parent. This is the shape of three of the four real rows.
         repo.feature("absorbed", "absorbed.txt", "absorbed\n");
         let absorbed_tip = repo.out(&["rev-parse", "refs/heads/absorbed"]);
         git(&repo.dir, &["checkout", "-q", "-b", "carrier", "absorbed"]);
         repo.commit("carrier.txt", "carrier\n", "carrier commit");
         let carrier_tip = repo.out(&["rev-parse", "HEAD"]);
         git(&repo.dir, &["checkout", "-q", "main"]);
-        git(&repo.dir, &["merge", "--ff-only", "-q", "carrier"]);
-        assert_eq!(repo.out(&["rev-parse", "HEAD"]), carrier_tip);
+        git(
+            &repo.dir,
+            &["merge", "--no-ff", "-q", "-m", "carry", "carrier"],
+        );
+        let carry_merge = repo.out(&["rev-parse", "HEAD"]);
+        repo.commit("after-carry.txt", "after\n", "after carry merge");
+        let moved_on = repo.out(&["rev-parse", "HEAD"]);
+        assert_ne!(moved_on, carry_merge, "the target must have moved on");
+        // The absorbed tip arrived with the carrier commit, which predates the
+        // merge that brought the carrier onto main.
         assert_eq!(
-            derive_landed_commit(&repo.dir, &absorbed_tip, &carrier_tip).unwrap(),
+            derive_landed_commit(&repo.dir, &absorbed_tip, &moved_on).unwrap(),
             carrier_tip
         );
 
