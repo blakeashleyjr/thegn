@@ -753,7 +753,6 @@ fn lock_acquisition_failure_isolates_without_touching_reused_worktree() {
     );
 }
 
-#[cfg(unix)]
 #[test]
 fn linked_and_aliased_worktrees_share_the_canonical_gate_identity() {
     let f = Fixture::new();
@@ -768,13 +767,19 @@ fn linked_and_aliased_worktrees_share_the_canonical_gate_identity() {
             &f.first,
         ],
     );
-    let alias = f.root.path().join("repo-alias");
-    std::os::unix::fs::symlink(&f.repo, &alias).unwrap();
     assert_eq!(
         gate_base_for_repo(&f.repo),
         gate_base_for_repo(&linked),
         "linked worktrees must use one Git common-directory gate root"
     );
+    // Aliasing needs a symlink, which only the platform seam creates; Windows
+    // has no equivalent alias to assert against, so that half is host-gated
+    // while the linked-worktree identity above stays platform-free.
+    if thegn_core::sandbox_backend::host_os() == thegn_core::sandbox_backend::HostOs::Windows {
+        return;
+    }
+    let alias = f.root.path().join("repo-alias");
+    crate::platform::gate_path::history_test_symlink(&f.repo, &alias).unwrap();
     assert_eq!(
         gate_base_for_repo(&f.repo),
         gate_base_for_repo(&alias),
