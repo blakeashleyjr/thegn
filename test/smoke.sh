@@ -822,8 +822,9 @@ check "sweep leaves a worktree that is not yet due" \
 # collected once the period is up (THE-686): the grace period exists *because*
 # the directory holds gitignored state, so refusing forever made
 # merged_ttl_secs and on_landed="expire" dead configuration.
-# This fixture is local-only. Do not let the VPN config tested above or OCI
-# tools installed on the developer's machine imply unresolved runtime custody.
+# This fixture is local-only. The minimal PATH deliberately tests the no-runtime
+# branch; it is not a workaround for an installed runtime on the developer's
+# machine. The Docker shim below covers that installed-runtime branch.
 mkdir -p "$TMP/sweep-bin"
 for tool in git sh; do
   ln -s "$(command -v "$tool")" "$TMP/sweep-bin/$tool"
@@ -838,6 +839,33 @@ sweep_has() {
   local pattern=$1 output="$TMP/sweep-output"
   shift
   if ! sweep_fixture "$@" >"$output" 2>&1; then
+    cat "$output" >&2
+    return 1
+  fi
+  if ! grep "$pattern" "$output" >/dev/null; then
+    cat "$output" >&2
+    return 1
+  fi
+}
+# ttl=1, NOT 0: `merge_sweep::due` treats `merged_ttl_secs = 0` as "never sweep"
+# and returns no entries at all, so with 0 a sweep only ever selects anything
+# under --force. Any clock-only assertion would then pass or fail vacuously —
+# nothing is selected, so no message is printed. With ttl=1 a row is genuinely
+# due one second after landing, which is what `sweep_due_expired` waits for.
+sweep_fixture_due() {
+  PATH="$TMP/sweep-bin" "$SZ" --set sandbox.enabled=false \
+    --set sandbox.vpn.provider=none --set merge_queue.merged_ttl_secs=1 \
+    merge sweep "$@"
+}
+# A sweep with no --force, on a row that really has expired.
+sweep_due_expired() {
+  sleep 2
+  sweep_due_has "$@"
+}
+sweep_due_has() {
+  local pattern=$1 output="$TMP/sweep-output"
+  shift
+  if ! sweep_fixture_due "$@" >"$output" 2>&1; then
     cat "$output" >&2
     return 1
   fi
@@ -872,6 +900,82 @@ check "sweep records the retained branch cleanup hold" \
      \"SELECT count(*) FROM merge_queue WHERE branch='$MB' AND status='landed' AND error_detail='thegn-cleanup-hold:v1:branch-retained'\") -eq 1 ]]"
 check "explicit queue dismissal clears the collected fixture hold" \
   "'$SZ' merge rm --worktree '$MP' >/dev/null && [[ \$(sqlite3 \"$XDG_STATE_HOME/thegn/thegn.db\" \"SELECT count(*) FROM merge_queue WHERE branch='$MB'\") -eq 0 ]]"
+
+# THE-690: an installed Docker/Podman binary must be queried for actual mount
+# ownership, not treated as permanent evidence that every merged worktree is
+# still in use. The shim speaks the exact bounded ps/inspect dialect used by
+# merge_cleanup and never reaches a host runtime or daemon.
+cat >"$TMP/sweep-bin/docker" <<'EOF'
+#!/bin/sh
+set -eu
+case "$1" in
+  ps) printf '%s\n' 0123456789abcdef ;;
+  inspect)
+    case "${THEGN_SMOKE_OCI_MODE:-garbage}" in
+      unrelated) printf 'mount:%s\nend\n' "${THEGN_SMOKE_OCI_UNRELATED:?}" ;;
+      owned) printf 'mount:%s/subdir\nend\n' "${THEGN_SMOKE_OCI_TARGET:?}" ;;
+      nonzero) printf '%s\n' 'fake inspect failure' >&2; exit 42 ;;
+      hang) /bin/sleep 6 ;;
+      garbage) printf '%s\n' garbage ;;
+      *) exit 64 ;;
+    esac
+    ;;
+  *) exit 64 ;;
+esac
+EOF
+chmod 755 "$TMP/sweep-bin/docker"
+mkdir -p "$TMP/oci-unrelated"
+seed_sweep_case() {
+  local name=$1 worktree
+  worktree="$("$SZ" wt new "$name" --repo "$R")"
+  printf '%s\n' "smoke-$name" >"$worktree/$name.txt"
+  git -C "$worktree" add -f -A
+  git -C "$worktree" commit -q -m "smoke $name"
+  "$SZ" merge add "$worktree" >/dev/null
+  "$SZ" merge drain >/dev/null
+  printf '%s\n' "$worktree"
+}
+
+OCI_UNRELATED_MP="$(seed_sweep_case oci-unrelated)"
+check "installed Docker with unrelated mounts lets the sweep collect" \
+  "THEGN_SMOKE_OCI_MODE=unrelated THEGN_SMOKE_OCI_UNRELATED='$TMP/oci-unrelated' sweep_due_has 'swept' --force && [[ ! -d '$OCI_UNRELATED_MP' ]]"
+
+# The same case WITHOUT --force, which is the one an operator actually hits: an
+# installed runtime, containers that mount something else, and a worktree long
+# past its TTL. `sweep_fixture_due` sets merged_ttl_secs=0, so the row is due on
+# the clock and needs no override. This is the assertion THE-690 exists for —
+# every other OCI case here passed --force, so none of them proved an ordinary
+# sweep collects.
+OCI_UNRELATED_DUE_MP="$(seed_sweep_case oci-unrelated-due)"
+check "installed Docker with unrelated mounts collects on the clock alone" \
+  "THEGN_SMOKE_OCI_MODE=unrelated THEGN_SMOKE_OCI_UNRELATED='$TMP/oci-unrelated' sweep_due_expired 'swept' && [[ ! -d '$OCI_UNRELATED_DUE_MP' ]]"
+
+# A query refusal must also hold without --force, not only with it.
+OCI_BAD_DUE_MP="$(seed_sweep_case oci-garbage-due)"
+check "Docker garbage output is a refusal on the clock alone" \
+  "THEGN_SMOKE_OCI_MODE=garbage THEGN_SMOKE_OCI_TARGET='$OCI_BAD_DUE_MP' sweep_due_expired 'could not be queried' && [[ -d '$OCI_BAD_DUE_MP' ]]"
+
+# And the no-runtime branch must collect on the clock alone too. `sweep_fixture_due`
+# fixes PATH internally, so hide the shim rather than trying to override it, and
+# put it back for the cases below.
+mv "$TMP/sweep-bin/docker" "$TMP/docker-shim-hidden"
+OCI_NONE_DUE_MP="$(seed_sweep_case oci-none-due)"
+check "no installed runtime collects on the clock alone" \
+  "sweep_due_expired 'swept' && [[ ! -d '$OCI_NONE_DUE_MP' ]]"
+mv "$TMP/docker-shim-hidden" "$TMP/sweep-bin/docker"
+
+OCI_OWNED_MP="$(seed_sweep_case oci-owned)"
+mkdir -p "$OCI_OWNED_MP/subdir"
+check "Docker mount at the worktree keeps it without --force" \
+  "THEGN_SMOKE_OCI_MODE=owned THEGN_SMOKE_OCI_TARGET='$OCI_OWNED_MP' sweep_due_expired 'may own the worktree' && [[ -d '$OCI_OWNED_MP' ]]"
+check "Docker mount at the worktree keeps it with --force" \
+  "THEGN_SMOKE_OCI_MODE=owned THEGN_SMOKE_OCI_TARGET='$OCI_OWNED_MP' sweep_due_has 'may own the worktree' --force && [[ -d '$OCI_OWNED_MP' ]]"
+
+for mode in nonzero garbage hang; do
+  OCI_BAD_MP="$(seed_sweep_case "oci-$mode")"
+  check "Docker $mode is a query refusal, not proof of no ownership" \
+    "THEGN_SMOKE_OCI_MODE='$mode' THEGN_SMOKE_OCI_TARGET='$OCI_BAD_MP' sweep_due_has 'could not be queried' --force && [[ -d '$OCI_BAD_MP' ]]"
+done
 
 # `--json` must emit EXACTLY one document on every path. The empty queue is the
 # case a cron/CI loop hits most often, and it used to print prose ("Nothing to

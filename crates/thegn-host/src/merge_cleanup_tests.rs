@@ -61,19 +61,154 @@ fn local_runtime_admission_refuses_auto_and_unknown_environment() {
 #[test]
 fn oci_discovery_is_bounded_conservative_and_never_executes_candidates() {
     let dir = tempfile::tempdir().unwrap();
-    assert!(oci_resources_absent(Some(dir.path().as_os_str())).is_ok());
-    assert!(oci_resources_absent(None).is_err());
-    assert!(oci_resources_absent(Some(std::ffi::OsStr::new("relative"))).is_err());
+    assert!(oci_resources_absent(Some(dir.path().as_os_str()), dir.path()).is_ok());
+    assert!(oci_resources_absent(None, dir.path()).is_err());
+    assert!(oci_resources_absent(Some(std::ffi::OsStr::new("relative")), dir.path()).is_err());
     std::fs::write(
         dir.path().join("docker"),
         "not an executable; must still refuse",
     )
     .unwrap();
     assert!(
-        oci_resources_absent(Some(dir.path().as_os_str()))
+        oci_resources_absent(Some(dir.path().as_os_str()), dir.path())
             .unwrap_err()
-            .contains("discoverable")
+            .contains("docker")
     );
+}
+
+#[test]
+fn oci_output_parsers_reject_truncation_and_garbage() {
+    assert_eq!(
+        parse_container_ids(b"0123456789abcdef\n").unwrap(),
+        vec!["0123456789abcdef"]
+    );
+    assert!(parse_container_ids(b"garbage\n").is_err());
+    assert!(parse_container_ids(b"0123").is_err());
+    assert_eq!(
+        parse_mount_sources(b"mount:/tmp/unrelated\nend\n").unwrap(),
+        vec![PathBuf::from("/tmp/unrelated")]
+    );
+    assert!(parse_mount_sources(b"garbage\n").is_err());
+    assert!(parse_mount_sources(b"mount:/tmp/unrelated\n").is_err());
+}
+
+#[test]
+fn oci_inspect_parser_accepts_one_record_per_batched_container() {
+    assert_eq!(
+        parse_mount_sources(b"mount:/tmp/first\nend\nmount:/tmp/second\nend\n").unwrap(),
+        vec![PathBuf::from("/tmp/first"), PathBuf::from("/tmp/second")]
+    );
+}
+
+#[test]
+fn oci_parsers_reject_blank_records_as_malformed() {
+    assert!(parse_container_ids(b"\n").is_err());
+    assert!(parse_container_ids(b"0123456789abcdef\n\n").is_err());
+    assert!(parse_mount_sources(b"\nend\n").is_err());
+    assert!(parse_mount_sources(b"mount:/tmp/source\n\nend\n").is_err());
+}
+
+#[test]
+fn mount_source_matching_is_canonical_and_path_component_bounded() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("worktree");
+    let nested = target.join("nested");
+    let sibling = dir.path().join("worktree-copy");
+    std::fs::create_dir(&target).unwrap();
+    std::fs::create_dir(&nested).unwrap();
+    std::fs::create_dir(&sibling).unwrap();
+    assert!(mount_source_may_own(&target, &target));
+    assert!(mount_source_may_own(&nested, &target));
+    assert!(!mount_source_may_own(&sibling, &target));
+    assert!(mount_source_may_own(
+        &target.join("does-not-exist"),
+        &target
+    ));
+    assert!(mount_source_may_own(
+        Path::new("thegn-the690-missing-relative-source"),
+        &target
+    ));
+    #[cfg(unix)]
+    {
+        let link = dir.path().join("nested-link");
+        std::os::unix::fs::symlink(&nested, &link).unwrap();
+        assert!(mount_source_may_own(&link, &target));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn oci_probe_queries_docker_and_podman_once_and_fails_closed() {
+    use std::os::unix::fs::PermissionsExt;
+
+    fn runtime(dir: &Path, name: &str, inspect: &str) {
+        let script = format!(
+            "#!/bin/sh\ncase \"$1\" in\n  ps) printf '%s\\n' 0123456789abcdef ;;\n  inspect) printf '%s' '{}' ;;\n  *) exit 64 ;;\nesac\n",
+            inspect
+        );
+        let path = dir.join(name);
+        std::fs::write(&path, script).unwrap();
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(path, permissions).unwrap();
+    }
+
+    let target_root = tempfile::tempdir().unwrap();
+    let target = target_root.path().join("worktree");
+    std::fs::create_dir(&target).unwrap();
+    let unrelated = target_root.path().join("unrelated");
+    std::fs::create_dir(&unrelated).unwrap();
+
+    let unrelated_bin = tempfile::tempdir().unwrap();
+    runtime(
+        unrelated_bin.path(),
+        "docker",
+        &format!("mount:{}\nend\n", unrelated.display()),
+    );
+    assert!(oci_resources_absent(Some(unrelated_bin.path().as_os_str()), &target).is_ok());
+
+    let owned_bin = tempfile::tempdir().unwrap();
+    std::fs::create_dir(target.join("nested")).unwrap();
+    runtime(
+        owned_bin.path(),
+        "docker",
+        &format!("mount:{}\nend\n", target.join("nested").display()),
+    );
+    assert!(
+        oci_resources_absent(Some(owned_bin.path().as_os_str()), &target)
+            .unwrap_err()
+            .contains("may own the worktree")
+    );
+
+    let malformed_bin = tempfile::tempdir().unwrap();
+    runtime(malformed_bin.path(), "docker", "garbage\n");
+    assert!(
+        oci_resources_absent(Some(malformed_bin.path().as_os_str()), &target)
+            .unwrap_err()
+            .contains("could not be queried")
+    );
+
+    let unknown_bin = tempfile::tempdir().unwrap();
+    runtime(unknown_bin.path(), "container", "end\n");
+    assert!(
+        oci_resources_absent(Some(unknown_bin.path().as_os_str()), &target)
+            .unwrap_err()
+            .contains("container")
+    );
+
+    let podman_bin = tempfile::tempdir().unwrap();
+    let calls = podman_bin.path().join("calls");
+    let script = format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$1\" >> '{}'\ncase \"$1\" in\n  ps) printf '%s\\n' 0123456789abcdef ;;\n  inspect) printf 'end\\n' ;;\n  *) exit 64 ;;\nesac\n",
+        calls.display()
+    );
+    let podman = podman_bin.path().join("podman");
+    std::fs::write(&podman, script).unwrap();
+    let mut permissions = std::fs::metadata(&podman).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&podman, permissions).unwrap();
+    assert!(oci_resources_absent(Some(podman_bin.path().as_os_str()), &target).is_ok());
+    assert_eq!(std::fs::read_to_string(calls).unwrap().lines().count(), 2);
 }
 
 #[test]

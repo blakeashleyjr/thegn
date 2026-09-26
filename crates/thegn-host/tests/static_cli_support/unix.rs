@@ -32,11 +32,10 @@ fn static_commands_do_not_open_fifo_configuration_but_configured_siblings_do() {
     // command that still opens the source directly blocks on the unread FIFO.
     // Admission is not yet uniform across the CLI, so assert what each one
     // actually does rather than blurring the two. THE-691 makes them uniform;
-    // when it lands, collapse both loops into `assert_source_refused`.
-    for args in [&["api", "call", "worktrees.list"][..]] {
-        fixture.assert_source_refused(args, &config);
-        assert_eq!(fixture.snapshot(), before, "{args:?} mutated the root");
-    }
+    // when it lands, move the rest into `assert_source_refused` alongside this.
+    let admitted: &[&str] = &["api", "call", "worktrees.list"];
+    fixture.assert_source_refused(admitted, &config);
+    assert_eq!(fixture.snapshot(), before, "{admitted:?} mutated the root");
     for args in [
         &["config", "get", "drawer.height"][..],
         &["automations", "test", "missing", "--event", "{}"][..],

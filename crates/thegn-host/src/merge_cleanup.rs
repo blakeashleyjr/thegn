@@ -5,9 +5,15 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use thegn_core::util;
 
+const OCI_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const OCI_PROBE_OUTPUT_LIMIT: usize = 16 * 1024;
+const OCI_INSPECT_FORMAT: &str =
+    r#"{{range .Mounts}}{{printf "mount:%s\n" .Source}}{{end}}{{printf "end\n"}}"#;
+
 /// Settled admission for the only automatic teardown currently supported:
-/// local worktrees with no observed resource attachment and no discoverable OCI
-/// runtime. This is conservative eligibility, not global historical absence.
+/// local worktrees with no observed resource attachment and no queried OCI
+/// runtime ownership. This is conservative eligibility, not global historical
+/// absence.
 /// Never reload configuration or guess provider ownership from a worktree name.
 pub(crate) struct LocalResources {
     selected: (Option<String>, Option<String>),
@@ -91,7 +97,15 @@ impl LocalResources {
         crate::agent::automatic_cleanup_resources_absent(path)?;
         crate::bridge_sup::automatic_cleanup_resources_absent(path)?;
         crate::worktree_lifecycle::automatic_cleanup_session_absent(Path::new(path))?;
+        #[cfg(not(test))]
         let search = std::env::var_os("PATH");
+        // Under `cfg(test)` the search set is whatever the fixture chose, and it
+        // NEVER falls back to the host's PATH. Falling back made the outcome
+        // depend on whether the developer happens to have docker or podman
+        // installed — the exact coupling THE-690 exists to remove — and it broke
+        // five merge_lifecycle/merge_sweep tests on a machine that has both.
+        // Tests that mean to exercise the probe call `oci_resources_absent`
+        // directly with a shim directory.
         #[cfg(test)]
         let search = TEST_GIT_CONFIG
             .with(|slot| {
@@ -100,12 +114,12 @@ impl LocalResources {
                     .and_then(|p| p.parent())
                     .map(|p| p.as_os_str().to_owned())
             })
-            .or(search);
-        oci_resources_absent(search.as_deref())
+            .or_else(|| Some(oci_free_test_search().as_os_str().to_owned()));
+        oci_resources_absent(search.as_deref(), Path::new(path))
     }
 }
 
-fn oci_resources_absent(search: Option<&std::ffi::OsStr>) -> Result<(), String> {
+fn oci_resources_absent(search: Option<&std::ffi::OsStr>, target: &Path) -> Result<(), String> {
     let search = search.ok_or("OCI availability unknown: PATH missing")?;
     if search.len() > 64 * 1024 {
         return Err("OCI availability search exceeds bound".into());
@@ -116,18 +130,207 @@ fn oci_resources_absent(search: Option<&std::ffi::OsStr>) -> Result<(), String> 
             "OCI availability unknown: PATH must contain bounded absolute directories".into(),
         );
     }
+    let target = match target.canonicalize() {
+        Ok(target) => target,
+        // A path that does not exist cannot be held by a container, and there is
+        // nothing left for the sweep to delete either. `revalidate` legitimately
+        // runs after removal and on already-collected rows, so treating an absent
+        // target as an unknown turned a missing worktree into a hard refusal.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(format!(
+                "OCI ownership could not be queried: worktree path is unreadable: {error}"
+            ));
+        }
+    };
+    let mut seen = BTreeSet::new();
     for backend in thegn_core::sandbox::Backend::all_oci() {
-        for dir in &paths {
-            for suffix in ["", ".exe", ".cmd", ".bat"] {
-                match std::fs::symlink_metadata(dir.join(format!("{}{suffix}", backend.binary()))) {
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
-                    Err(_) => return Err("OCI availability could not be proven; explicit cleanup required".into()),
-                    Ok(_) => return Err("OCI runtime discoverable; historical resource ownership requires explicit cleanup".into()),
+        let binary = backend.binary();
+        if !seen.insert(binary) {
+            continue;
+        }
+        let Some(candidate) = find_runtime(&paths, binary)? else {
+            continue;
+        };
+        if !matches!(binary, "docker" | "podman") {
+            return Err(format!(
+                "OCI runtime '{binary}' could not be queried: unsupported runtime kind"
+            ));
+        }
+        query_oci_runtime(&candidate, binary, &target)?;
+    }
+    Ok(())
+}
+
+fn find_runtime(paths: &[PathBuf], binary: &str) -> Result<Option<PathBuf>, String> {
+    for dir in paths {
+        for suffix in ["", ".exe", ".cmd", ".bat"] {
+            let candidate = dir.join(format!("{binary}{suffix}"));
+            match std::fs::symlink_metadata(&candidate) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(format!(
+                        "OCI runtime '{binary}' could not be queried: PATH entry {} is unreadable: {error}",
+                        candidate.display()
+                    ));
                 }
+                Ok(_) => return Ok(Some(candidate)),
             }
         }
     }
+    Ok(None)
+}
+
+fn query_oci_runtime(binary: &Path, name: &str, target: &Path) -> Result<(), String> {
+    let mut ps = std::process::Command::new(binary);
+    ps.args(["ps", "-a", "-q"]);
+    let output = run_oci_command(ps, name, "ps")?;
+    if !output.status.success() {
+        return Err(oci_command_refusal(name, "ps", &output));
+    }
+    let ids = parse_container_ids(&output.stdout).map_err(|reason| {
+        format!("OCI runtime '{name}' could not be queried: malformed ps output: {reason}")
+    })?;
+    if ids.is_empty() {
+        return Ok(());
+    }
+
+    let mut inspect = std::process::Command::new(binary);
+    inspect
+        .arg("inspect")
+        .args(["--format", OCI_INSPECT_FORMAT]);
+    inspect.args(&ids);
+    let output = run_oci_command(inspect, name, "inspect")?;
+    if !output.status.success() {
+        return Err(oci_command_refusal(name, "inspect", &output));
+    }
+    let sources = parse_mount_sources(&output.stdout).map_err(|reason| {
+        format!("OCI runtime '{name}' could not be queried: malformed inspect output: {reason}")
+    })?;
+    for source in sources {
+        if mount_source_may_own(&source, target) {
+            return Err(format!(
+                "OCI runtime '{name}' reports a mount source that may own the worktree"
+            ));
+        }
+    }
     Ok(())
+}
+
+fn mount_source_may_own(source: &Path, target: &Path) -> bool {
+    source.canonicalize().map_or(true, |source| {
+        source == target || source.starts_with(target)
+    })
+}
+
+fn run_oci_command(
+    command: std::process::Command,
+    name: &str,
+    operation: &str,
+) -> Result<std::process::Output, String> {
+    crate::bounded_git_probe::capture_capability(command, OCI_PROBE_TIMEOUT, OCI_PROBE_OUTPUT_LIMIT)
+        .map_err(|error| {
+            let detail = error.to_string();
+            if detail.contains("exceeded cleanup deadline") || detail.contains("timed out") {
+                format!(
+                    "OCI runtime '{name}' could not be queried: {operation} timed out after {} seconds",
+                    OCI_PROBE_TIMEOUT.as_secs()
+                )
+            } else {
+                format!("OCI runtime '{name}' could not be queried: {operation} failed: {detail}")
+            }
+        })
+}
+
+fn oci_command_refusal(name: &str, operation: &str, output: &std::process::Output) -> String {
+    let detail = String::from_utf8_lossy(&output.stderr)
+        .trim()
+        .chars()
+        .take(512)
+        .collect::<String>();
+    if detail.is_empty() {
+        format!(
+            "OCI runtime '{name}' could not be queried: {operation} exited with {}",
+            output.status
+        )
+    } else {
+        format!(
+            "OCI runtime '{name}' could not be queried: {operation} exited with {}: {detail}",
+            output.status
+        )
+    }
+}
+
+/// Split output that is known to end in `\n` into its records, rejecting any
+/// blank line. Skipping blanks would be a fail-OPEN reading of truncated or
+/// mangled output — the one direction this guard must never take.
+fn oci_records(bytes: &[u8]) -> Result<Vec<&[u8]>, &'static str> {
+    if !bytes.ends_with(b"\n") {
+        return Err("output did not end with a newline");
+    }
+    let mut records = Vec::new();
+    // The element after the final `\n` is always empty and is not a record.
+    let body = &bytes[..bytes.len() - 1];
+    for record in body.split(|byte| *byte == b'\n') {
+        let record = record.strip_suffix(b"\r").unwrap_or(record);
+        if record.is_empty() {
+            return Err("output contained a blank record");
+        }
+        records.push(record);
+    }
+    Ok(records)
+}
+
+fn parse_container_ids(bytes: &[u8]) -> Result<Vec<String>, &'static str> {
+    if bytes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut ids = Vec::new();
+    for record in oci_records(bytes)? {
+        if record.len() > 64 || !record.iter().all(u8::is_ascii_hexdigit) {
+            return Err("container id was not hexadecimal");
+        }
+        ids.push(String::from_utf8(record.to_vec()).map_err(|_| "container id was not UTF-8")?);
+    }
+    Ok(ids)
+}
+
+/// Parse the batched `inspect` output.
+///
+/// The format template runs **once per inspected container**, so a batch of N
+/// containers emits N `end` markers, each terminating that container's mount
+/// records. Treating `end` as a single terminator for the whole batch made any
+/// host with two or more containers refuse every worktree — including unrelated
+/// mounts — which would have left this issue's own symptom in place on a machine
+/// running so much as two containers.
+fn parse_mount_sources(bytes: &[u8]) -> Result<Vec<PathBuf>, &'static str> {
+    let records = oci_records(bytes)?;
+    let mut sources = Vec::new();
+    let mut containers = 0usize;
+    for record in &records {
+        if *record == b"end" {
+            containers += 1;
+            continue;
+        }
+        let Some(source) = record.strip_prefix(b"mount:") else {
+            return Err("missing mount record prefix");
+        };
+        if source.is_empty() {
+            // An anonymous volume has no host path, so it cannot hold the
+            // worktree. Recorded explicitly rather than silently skipped.
+            continue;
+        }
+        let source = std::str::from_utf8(source).map_err(|_| "mount source was not UTF-8")?;
+        sources.push(PathBuf::from(source));
+    }
+    if containers == 0 {
+        return Err("missing end marker");
+    }
+    // Every container's records must be terminated, so the batch ends with one.
+    if records.last() != Some(&b"end".as_slice()) {
+        return Err("data followed the final end marker");
+    }
+    Ok(sources)
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Refusal {
@@ -730,6 +933,22 @@ mod tests;
 #[cfg(test)]
 thread_local! {
     static TEST_GIT_CONFIG: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+/// An empty, absolute directory used as the default `cfg(test)` PATH so no test
+/// can discover a container runtime that merely happens to be installed on the
+/// developer's machine. Created once per test binary and intentionally left
+/// empty; a fixture that wants a runtime supplies its own shim directory.
+#[cfg(test)]
+fn oci_free_test_search() -> &'static Path {
+    static DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        tempfile::Builder::new()
+            .prefix("thegn-oci-free-")
+            .tempdir()
+            .expect("private empty OCI search directory")
+    })
+    .path()
 }
 
 /// Test-only ambient state isolation. Commands are constructed on the owning
