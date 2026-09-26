@@ -17,7 +17,7 @@ use anyhow::{Context, Result};
 use thegn_core::config::Config;
 use thegn_core::config_model_proxy::ModelProxyConfig;
 
-/// Directory holding the proxy's runtime files (resolved config + pid).
+/// Directory holding the proxy's runtime files (resolved config + pid state).
 pub fn runtime_dir() -> PathBuf {
     thegn_core::util::xdg_state_home().join("thegn/model_proxy")
 }
@@ -28,6 +28,72 @@ fn config_path() -> PathBuf {
 
 fn pid_path() -> PathBuf {
     runtime_dir().join("tgproxy.pid")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProxyPidState {
+    pid: u32,
+    start_time: Option<u64>,
+}
+
+fn safe_proxy_pid(pid: u32) -> bool {
+    pid != 0 && pid <= i32::MAX as u32
+}
+
+/// Parse the deliberately small, strict pid state format. Unknown, duplicate,
+/// missing, empty, zero, and non-round-tripping PID values are all rejected.
+fn parse_pid_state(raw: &str) -> Option<ProxyPidState> {
+    let mut pid = None;
+    let mut start_time = None;
+    let mut saw_start_time = false;
+    for line in raw.lines() {
+        // A line without `=`, or with any other key, is malformed: reject the
+        // whole state rather than parsing a partial identity.
+        let (key, value) = line.split_once('=')?;
+        match key {
+            "pid" => {
+                if pid.is_some() {
+                    return None;
+                }
+                let value = value.parse::<u32>().ok()?;
+                if !safe_proxy_pid(value) {
+                    return None;
+                }
+                pid = Some(value);
+            }
+            "start_time" => {
+                if saw_start_time {
+                    return None;
+                }
+                saw_start_time = true;
+                start_time = Some(match value {
+                    "unavailable" => None,
+                    value => Some(value.parse::<u64>().ok()?),
+                });
+            }
+            _ => return None,
+        }
+    }
+    Some(ProxyPidState {
+        pid: pid?,
+        start_time: if saw_start_time {
+            start_time?
+        } else {
+            return None;
+        },
+    })
+}
+
+fn encode_pid_state(pid: u32, start_time: Option<u64>) -> String {
+    let start_time = start_time.map_or_else(|| "unavailable".to_string(), |v| v.to_string());
+    format!("pid={pid}\nstart_time={start_time}\n")
+}
+
+fn stop_pid_state(raw: &str) -> bool {
+    let Some(state) = parse_pid_state(raw) else {
+        return false;
+    };
+    crate::platform::terminate_proxy_pid(state.pid, state.start_time)
 }
 
 /// Resolves the `tgproxy` executable: a sibling of the running thegn binary
@@ -82,9 +148,20 @@ pub fn spawn(cfg: &ModelProxyConfig) -> Result<bool> {
     let mut cmd = thegn_core::util::detached(program);
     cmd.args(rest);
     cmd.env("THEGN_MODEL_PROXY_CONFIG", &config_file);
-    let child = cmd.spawn().context("spawn tgproxy")?;
-    // Record the pid for graceful stop (best-effort; a stale file is harmless).
-    let _ = std::fs::write(pid_path(), child.id().to_string());
+    let mut child = cmd.spawn().context("spawn tgproxy")?;
+    let start_time = crate::platform::proxy_process_start_time(child.id());
+    if crate::platform::proxy_identity_required() && start_time.is_none() {
+        // The child is still ours here, so use its owned handle for bounded
+        // cleanup rather than publishing an unverified pid state.
+        let _ = child.kill();
+        return Err(anyhow::anyhow!("cannot establish tgproxy process identity"));
+    }
+    // Publish identity-bound state only after the child identity was captured.
+    if let Err(error) = std::fs::write(pid_path(), encode_pid_state(child.id(), start_time)) {
+        // Do not leave an untracked daemon behind if state publication fails.
+        let _ = child.kill();
+        return Err(error).with_context(|| format!("write {}", pid_path().display()));
+    }
     Ok(true)
 }
 
@@ -121,25 +198,16 @@ pub fn ensure_running(cfg: &ModelProxyConfig) -> Result<bool> {
     Ok(probe_up(cfg))
 }
 
-/// Stops the running proxy via the recorded pid. Returns `true` if a stop was
-/// signalled — i.e. the pidfile named a live process. Termination goes through
-/// the [`crate::platform`] seam (`SIGTERM` on unix, `TerminateProcess` on
-/// Windows), so this call site stays platform-free; it is best-effort and
-/// asynchronous, so the pidfile is dropped either way rather than left to name a
-/// dead process.
+/// Stops the running proxy via identity-bound recorded state. Returns `true` if
+/// a signal was delivered. Malformed, stale, reused, and vanished state is a
+/// normal no-op; the state file is removed in every case.
 pub fn stop(_cfg: &ModelProxyConfig) -> Result<bool> {
-    let Ok(pid_str) = std::fs::read_to_string(pid_path()) else {
+    let path = pid_path();
+    let Ok(pid_str) = std::fs::read_to_string(&path) else {
         return Ok(false);
     };
-    let Ok(pid) = pid_str.trim().parse::<u32>() else {
-        return Ok(false);
-    };
-    let sent = crate::platform::pid_alive(i64::from(pid));
-    if sent {
-        crate::platform::terminate_pid(pid);
-    }
-    // best-effort: the pidfile is a hint, not state we can fail the stop on.
-    let _ = std::fs::remove_file(pid_path());
+    let sent = stop_pid_state(&pid_str);
+    let _ = std::fs::remove_file(path);
     Ok(sent)
 }
 
@@ -251,4 +319,33 @@ pub fn spawn_supervisor(cfg: &Config) {
             // best-effort: spawn failure already warned by the inspect_err above
         })
         .ok();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pid_state_rejects_malformed_and_extreme_values() {
+        for raw in [
+            "",
+            "pid=\nstart_time=1\n",
+            "pid=0\nstart_time=1\n",
+            "pid=2147483648\nstart_time=1\n",
+            "pid=4294967295\nstart_time=1\n",
+            "pid=12\n",
+            "pid=12\nstart_time=wat\n",
+            "pid=12\nstart_time=1\nextra=x\n",
+            "pid=12\npid=13\nstart_time=1\n",
+        ] {
+            assert_eq!(parse_pid_state(raw), None, "accepted {raw:?}");
+        }
+    }
+
+    #[test]
+    fn malformed_state_never_reaches_termination() {
+        for raw in ["", "pid=0\nstart_time=1\n", "pid=not-a-pid\nstart_time=1\n"] {
+            assert!(!stop_pid_state(raw));
+        }
+    }
 }

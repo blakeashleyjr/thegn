@@ -1523,8 +1523,10 @@ impl CiActionCtx<'_> {
             }
             DetailAction::OpenLogPager => self.open_log_pager(),
             DetailAction::CopyLine(line) => {
-                crate::clipboard::copy(&line);
-                self.model.status = "Copied log line".into();
+                self.model.status = match crate::clipboard::copy(&line) {
+                    Ok(()) => "Copying log line to clipboard…".into(),
+                    Err(error) => format!("Clipboard copy failed: {error}"),
+                };
             }
             // ShowLog drills in place inside the overlay and never reaches the loop.
             DetailAction::ShowLog(_) => {}

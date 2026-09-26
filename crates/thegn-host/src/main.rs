@@ -176,6 +176,7 @@ mod placement_flow;
 mod platform;
 #[cfg(test)]
 mod platform_ratchet_tests;
+mod plugin_damage;
 mod plugin_providers;
 mod plugins;
 mod pr_authorship;

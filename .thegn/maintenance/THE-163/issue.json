@@ -1,0 +1,12 @@
+{
+  "id": "THE-163",
+  "title": "Avoid full-frame redraws for plugin status-only updates",
+  "url": "https://linear.app/blakeashley/issue/the-163",
+  "priority": "Medium",
+  "labels": [
+    "Bug"
+  ],
+  "status": "Todo",
+  "parentId": "THE-150",
+  "description": "## Finding\n\nPlugin status updates set broad dirty flags (`dirty` plus `bars_dirty`), forcing full-frame work even when only a bounded bar segment changed. High-frequency plugins can degrade responsiveness and output volume.\n\n## Evidence at audited commit\n\n`crates/thegn-host/src/run.rs:11347` and `crates/thegn-host/src/render_plan.rs:135`.\n\n## Implementation constraints\n\nTranslate plugin cache mutations into the narrowest render damage region while preserving layout invalidation when size/placement actually changes.\n\n## Acceptance criteria\n\n- [ ] Content-only status changes redraw only their owned bar/region.\n- [ ] Add/remove/resize/theme/layout events still trigger the necessary broader invalidation.\n- [ ] Repeated identical updates generate no frame.\n- [ ] Update frequency remains bounded by plugin policy and compositor coalescing.\n- [ ] Instrumentation tests compare damaged rows/bytes for status-only versus structural updates.\n\n## Execution dependencies\n\nBlocked by THE-165, THE-161 (both UNLANDED)."
+}

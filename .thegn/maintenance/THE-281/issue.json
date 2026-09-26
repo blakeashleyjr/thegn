@@ -1,0 +1,12 @@
+{
+  "id": "THE-281",
+  "title": "Build valid IPv6 authorities for remote control WebSocket upgrades",
+  "url": "https://linear.app/blakeashley/issue/the-281",
+  "priority": "Medium",
+  "labels": [
+    "Bug"
+  ],
+  "status": "Todo",
+  "parentId": "THE-150",
+  "description": "## Finding\n\nThe remote-control WebSocket Host/authority helper double-brackets IPv6 literals, so unary HTTP calls can work while event/attach upgrades fail.\n\n## Evidence\n\n* `crates/thegn-svc/src/control/client.rs:1091` takes `Url::host_str()` and brackets any host containing `:`.\n* Parsed URL host strings for IPv6 are already bracketed in this path, producing an invalid authority such as `[[::1]]:8443`.\n* The value is used for event and attach upgrades at `client.rs:705` and `:811`.\n\n## Required design\n\nDerive the authority from the URL/HTTP authority type rather than string heuristics. Preserve a single bracket pair for IPv6 and append only an explicit/non-default port according to HTTP rules.\n\n## Acceptance criteria\n\n* HTTP/HTTPS/WS/WSS origins with IPv4, DNS, and IPv6 (with and without explicit ports) serialize valid authorities.\n* Unary and WebSocket transports target the same endpoint.\n* Tests include `https://[::1]:8443` and scoped IPv6 forms where supported."
+}

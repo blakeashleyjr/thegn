@@ -23,6 +23,17 @@ pub(crate) struct Regular {
 
 pub(crate) struct Lock(Regular);
 
+/// Whether the descriptor-relative verified gate workspace is available.
+///
+/// The current admission implementation is intentionally Unix-only. Callers
+/// must select a private throwaway gate before touching the shared reused
+/// state when this is false; they must never interpret this as permission to
+/// continue without an exclusion mechanism. Windows verified file/directory
+/// admission remains a follow-up platform-security workstream.
+pub(crate) const fn verified_workspace_supported() -> bool {
+    cfg!(unix)
+}
+
 #[cfg(test)]
 pub(crate) fn history_test_symlink(_original: &Path, _link: &Path) -> io::Result<()> {
     #[cfg(unix)]
