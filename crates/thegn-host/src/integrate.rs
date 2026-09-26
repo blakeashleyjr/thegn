@@ -68,6 +68,70 @@ impl std::fmt::Display for SigningFailed {
 
 impl std::error::Error for SigningFailed {}
 
+/// Resolve a commit object from an explicit ref/OID without allowing Git to
+/// reinterpret a leading dash as an option.
+pub(crate) fn resolve_commit_oid(repo_root: &Path, reference: &str) -> Result<String> {
+    let spec = format!("{reference}^{{commit}}");
+    let oid = util::git_out(
+        repo_root,
+        &["rev-parse", "--verify", "--end-of-options", &spec],
+    )
+    .with_context(|| format!("could not resolve commit {reference}"))?;
+    anyhow::ensure!(
+        matches!(oid.len(), 40 | 64) && oid.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "invalid commit identity resolved for {reference}"
+    );
+    Ok(oid)
+}
+
+/// Derive the first target-side commit that carries an already-integrated tip.
+/// The ancestry proof is deliberately performed before the walk: this helper
+/// reconstructs cache metadata, never merged-ness. The walk is once per row;
+/// `--max-count=1` keeps the returned history bounded while preserving the
+/// `--ancestry-path --reverse` definition approved for THE-687.
+pub(crate) fn derive_landed_commit(
+    repo_root: &Path,
+    branch_tip: &str,
+    target_tip: &str,
+) -> Result<String> {
+    let branch_tip = resolve_commit_oid(repo_root, branch_tip)?;
+    let target_tip = resolve_commit_oid(repo_root, target_tip)?;
+    anyhow::ensure!(
+        util::git_ok(
+            repo_root,
+            &["merge-base", "--is-ancestor", &branch_tip, &target_tip],
+        ),
+        "branch tip is not an ancestor of target"
+    );
+    let range = format!("{branch_tip}..{target_tip}");
+    let args = [
+        "rev-list",
+        "--ancestry-path",
+        "--reverse",
+        "--max-count=1",
+        &range,
+    ];
+    let candidate = match util::git_out(repo_root, &args) {
+        Some(history) => history
+            .lines()
+            .next()
+            .filter(|oid| !oid.is_empty())
+            .map(str::to_owned)
+            .context("ancestry walk returned no integration commit")?,
+        None if util::git_ok(repo_root, &args) => branch_tip,
+        None => anyhow::bail!("could not walk target ancestry"),
+    };
+    let candidate = resolve_commit_oid(repo_root, &candidate)?;
+    anyhow::ensure!(
+        util::git_ok(
+            repo_root,
+            &["merge-base", "--is-ancestor", &candidate, &target_tip],
+        ),
+        "derived landed commit is not an ancestor of target"
+    );
+    Ok(candidate)
+}
+
 /// Drives the pure fold engine over real git plumbing at one repo root.
 struct PlumbingAdapter {
     history: CanonicalHistory,
@@ -1369,7 +1433,7 @@ pub(crate) enum AttemptOutcome {
     /// not blamed and the fixing agent is never dispatched — it cannot help.
     GateError { reason: String, log: String },
     /// The branch tip is already an ancestor of the target — nothing to do.
-    UpToDate,
+    UpToDate { commit: String },
     /// The branch lives on another host and its tip could not be fetched into
     /// the target store (host unreachable / bundle or fetch failed). `detail`
     /// is the reason. Held (deferred) rather than dropped, so a transient
@@ -1444,7 +1508,9 @@ fn attempt_land_admitted(
         ) {
             adapter.history.revalidate()?;
             source_history.revalidate()?;
-            return Ok(AttemptOutcome::UpToDate);
+            return Ok(AttemptOutcome::UpToDate {
+                commit: derive_landed_commit(repo_root, &branch_tip, &base)?,
+            });
         }
         let branch = Branch {
             name: branch_name.to_string(),
@@ -3072,7 +3138,71 @@ mod tests {
         // A second attempt sees b1's tip already an ancestor of main.
         assert!(matches!(
             attempt_land(&cfg(""), &repo.dir, "b1", &GitLoc::Local(repo.dir.clone())).unwrap(),
-            AttemptOutcome::UpToDate
+            AttemptOutcome::UpToDate { .. }
         ));
+    }
+
+    #[test]
+    fn landed_identity_derivation_covers_merge_octopus_absorbed_and_unmerged_shapes() {
+        let repo = Repo::new("landed-identity-shapes");
+        if !repo.history_supported_or_refused() {
+            return;
+        }
+
+        repo.feature("plain", "plain.txt", "plain\n");
+        let plain_tip = repo.out(&["rev-parse", "refs/heads/plain"]);
+        git(
+            &repo.dir,
+            &["merge", "--no-ff", "-q", "-m", "plain merge", "plain"],
+        );
+        let plain_merge = repo.out(&["rev-parse", "HEAD"]);
+        assert_eq!(
+            derive_landed_commit(&repo.dir, &plain_tip, &plain_merge).unwrap(),
+            plain_merge
+        );
+
+        repo.feature("oct-one", "oct-one.txt", "oct-one\n");
+        repo.feature("oct-tip", "oct-tip.txt", "oct-tip\n");
+        let oct_tip = repo.out(&["rev-parse", "refs/heads/oct-tip"]);
+        git(
+            &repo.dir,
+            &[
+                "merge",
+                "--no-ff",
+                "-q",
+                "-m",
+                "octopus merge",
+                "oct-one",
+                "oct-tip",
+            ],
+        );
+        let octopus = repo.out(&["rev-parse", "HEAD"]);
+        let octopus_parents = repo.out(&["rev-list", "--parents", "-n", "1", "HEAD"]);
+        assert!(
+            octopus_parents.split_whitespace().nth(2) != Some(oct_tip.as_str()),
+            "the fixture must keep the tested tip out of parent slot 2"
+        );
+        assert_eq!(
+            derive_landed_commit(&repo.dir, &oct_tip, &octopus).unwrap(),
+            octopus
+        );
+
+        repo.feature("absorbed", "absorbed.txt", "absorbed\n");
+        let absorbed_tip = repo.out(&["rev-parse", "refs/heads/absorbed"]);
+        git(&repo.dir, &["checkout", "-q", "-b", "carrier", "absorbed"]);
+        repo.commit("carrier.txt", "carrier\n", "carrier commit");
+        let carrier_tip = repo.out(&["rev-parse", "HEAD"]);
+        git(&repo.dir, &["checkout", "-q", "main"]);
+        git(&repo.dir, &["merge", "--ff-only", "-q", "carrier"]);
+        assert_eq!(repo.out(&["rev-parse", "HEAD"]), carrier_tip);
+        assert_eq!(
+            derive_landed_commit(&repo.dir, &absorbed_tip, &carrier_tip).unwrap(),
+            carrier_tip
+        );
+
+        repo.feature("unmerged", "unmerged.txt", "unmerged\n");
+        let unmerged_tip = repo.out(&["rev-parse", "refs/heads/unmerged"]);
+        let target = repo.out(&["rev-parse", "refs/heads/main"]);
+        assert!(derive_landed_commit(&repo.dir, &unmerged_tip, &target).is_err());
     }
 }

@@ -831,8 +831,14 @@ fn land(cfg: &Config, worktree: Option<String>) -> Result<()> {
             outln!("✓ landed {branch} → {}", &commit[..commit.len().min(12)]);
             integrate::report_resyncs(&target, &resyncs);
         }
-        AttemptOutcome::UpToDate => {
-            let _ = db.update_merge_status(&wt_s, "landed", None, Some("already merged"), None); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+        AttemptOutcome::UpToDate { commit } => {
+            let _ = db.update_merge_status(
+                &wt_s,
+                "landed",
+                Some(&commit),
+                Some("already merged"),
+                None,
+            ); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
             lifecycle(LifecycleEvent::Landed);
             outln!("{branch} already merged.");
         }
