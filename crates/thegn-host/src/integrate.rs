@@ -84,17 +84,33 @@ pub(crate) fn resolve_commit_oid(repo_root: &Path, reference: &str) -> Result<St
     Ok(oid)
 }
 
-/// Derive the first target-side commit that carries an already-integrated tip.
-/// The ancestry proof is deliberately performed before the walk: this helper
-/// reconstructs cache metadata, never merged-ness.
+/// Reconstruct the landed commit identity for a branch already integrated into
+/// the target. This rebuilds **cache metadata only, never merged-ness**: the
+/// ancestry proof runs first and independently, so a failure to derive can never
+/// authorise a removal.
 ///
-/// Do NOT add `--max-count=1` to bound this. Git applies `--max-count` *before*
-/// `--reverse`, so `--reverse --max-count=1` yields the NEWEST commit in the
-/// range — the target's own tip — rather than the oldest. Measured on this repo:
-/// for `tg/keen-marble` the bounded form returned `main`'s tip while the correct
-/// definition returns `27a995ff`, the commit that actually carried the branch in.
-/// The walk runs once per swept row, and `--ancestry-path` already restricts it
-/// to the integration path, so the full reverse is what the bound would cost.
+/// The rule, in one sentence: **the merge commit that integrated the branch tip
+/// if one exists, otherwise the branch tip itself** — which is already on the
+/// target, or the ancestry check above would have failed.
+///
+/// Two earlier definitions were wrong on real data and are recorded so they are
+/// not reintroduced:
+///
+/// * `rev-list --ancestry-path --reverse --max-count=1` returns the **newest**
+///   commit in the range, because git applies the bound *before* `--reverse`. All
+///   four affected rows derived `main`'s own tip.
+/// * The oldest commit on the ancestry path is wrong whenever the branch landed
+///   by fast-forward, or was absorbed into another branch: the oldest commit in
+///   `tip..target` is then an unrelated descendant that merely follows the tip,
+///   not the commit that carried the work in.
+///
+/// Scanning only `--merges` also keeps the materialised output small — merges are
+/// a fraction of history — and the walk runs once per swept row.
+///
+/// Measured on this repository, the rule gives: `tg/spark-radar` → `47aa962e`
+/// (an **octopus** merge, where the tip is not parent 2); `tg/bold-petal` →
+/// `a3ff446c`; `tg/bold-mango` → `24bafac7`; and `tg/keen-marble` → its own tip,
+/// since no merge has it as a parent.
 pub(crate) fn derive_landed_commit(
     repo_root: &Path,
     branch_tip: &str,
@@ -110,18 +126,29 @@ pub(crate) fn derive_landed_commit(
         "branch tip is not an ancestor of target"
     );
     let range = format!("{branch_tip}..{target_tip}");
-    let args = ["rev-list", "--ancestry-path", "--reverse", &range];
-    let candidate = match util::git_out(repo_root, &args) {
-        Some(history) => history
-            .lines()
-            .next()
-            .filter(|oid| !oid.is_empty())
-            .map(str::to_owned)
-            .context("ancestry walk returned no integration commit")?,
-        None if util::git_ok(repo_root, &args) => branch_tip,
+    let args = [
+        "rev-list",
+        "--ancestry-path",
+        "--merges",
+        "--reverse",
+        "--parents",
+        &range,
+    ];
+    // `--parents` prints `<commit> <parent>...` per line. The first line whose
+    // parent list contains the tip — in ANY slot, so octopus merges are covered —
+    // is the merge that integrated it.
+    let integrated_by = match util::git_out(repo_root, &args) {
+        Some(history) => history.lines().find_map(|line| {
+            let mut fields = line.split_whitespace();
+            let commit = fields.next()?;
+            fields
+                .any(|parent| parent == branch_tip)
+                .then(|| commit.to_owned())
+        }),
+        None if util::git_ok(repo_root, &args) => None,
         None => anyhow::bail!("could not walk target ancestry"),
     };
-    let candidate = resolve_commit_oid(repo_root, &candidate)?;
+    let candidate = resolve_commit_oid(repo_root, &integrated_by.unwrap_or(branch_tip))?;
     anyhow::ensure!(
         util::git_ok(
             repo_root,
@@ -3215,12 +3242,16 @@ mod tests {
         repo.commit("after-carry.txt", "after\n", "after carry merge");
         let moved_on = repo.out(&["rev-parse", "HEAD"]);
         assert_ne!(moved_on, carry_merge, "the target must have moved on");
-        // The absorbed tip arrived with the carrier commit, which predates the
-        // merge that brought the carrier onto main.
+        // No merge has the absorbed tip as a parent — the `carry` merge's parents
+        // are main and `carrier_tip`, not the tip itself — so the identity is the
+        // tip, which is already on the target. Naming `carrier_tip` or the oldest
+        // commit on the ancestry path would attribute this branch's landing to an
+        // unrelated commit that merely follows it.
         assert_eq!(
             derive_landed_commit(&repo.dir, &absorbed_tip, &moved_on).unwrap(),
-            carrier_tip
+            absorbed_tip
         );
+        assert_ne!(absorbed_tip, carrier_tip);
 
         repo.feature("unmerged", "unmerged.txt", "unmerged\n");
         let unmerged_tip = repo.out(&["rev-parse", "refs/heads/unmerged"]);
