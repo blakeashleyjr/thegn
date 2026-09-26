@@ -3227,4 +3227,22 @@ mod tests {
         let target = repo.out(&["rev-parse", "refs/heads/main"]);
         assert!(derive_landed_commit(&repo.dir, &unmerged_tip, &target).is_err());
     }
+
+    #[test]
+    fn landed_identity_derivation_covers_fast_forward_after_target_moves_on() {
+        let repo = Repo::new("landed-identity-fast-forward");
+        if !repo.history_supported_or_refused() {
+            return;
+        }
+        repo.feature("fast-forward", "fast-forward.txt", "fast-forward\n");
+        let branch_tip = repo.out(&["rev-parse", "refs/heads/fast-forward"]);
+        git(&repo.dir, &["merge", "--ff-only", "-q", "fast-forward"]);
+        repo.commit("after-fast-forward.txt", "after\n", "after fast-forward");
+        let target = repo.out(&["rev-parse", "HEAD"]);
+        assert_eq!(
+            derive_landed_commit(&repo.dir, &branch_tip, &target).unwrap(),
+            branch_tip,
+            "a fast-forward landing must retain the branch tip as its identity"
+        );
+    }
 }
