@@ -18,6 +18,56 @@ mod unix;
 #[cfg(unix)]
 pub use unix::*;
 
+/// Return the process-start identity used by the model-proxy pid state.
+///
+/// Unix implementations must return a real identity and callers must treat
+/// `None` as "do not signal". Windows deliberately remains PID-only in this
+/// lane; its equivalent start-time binding is a follow-up to THE-159.
+#[cfg(unix)]
+pub fn proxy_process_start_time(pid: u32) -> Option<u64> {
+    unix::proxy_process_start_time(pid)
+}
+
+#[cfg(not(unix))]
+pub fn proxy_process_start_time(_pid: u32) -> Option<u64> {
+    None
+}
+
+/// Whether this platform requires a process-start identity before proxy state
+/// can be published. Unix is fail-closed; Windows is intentionally deferred.
+#[cfg(unix)]
+pub fn proxy_identity_required() -> bool {
+    true
+}
+
+#[cfg(not(unix))]
+pub fn proxy_identity_required() -> bool {
+    false
+}
+
+/// Terminate the proxy only after the platform has revalidated its identity.
+/// The Windows branch is intentionally the existing PID-only behavior with
+/// the shared positive-range guard; Windows PID-reuse binding is follow-up
+/// work, not silently claimed by this fix.
+#[cfg(unix)]
+pub fn terminate_proxy_pid(pid: u32, expected_start_time: Option<u64>) -> bool {
+    unix::terminate_proxy_pid(pid, expected_start_time)
+}
+
+#[cfg(windows)]
+pub fn terminate_proxy_pid(pid: u32, _expected_start_time: Option<u64>) -> bool {
+    if pid == 0 || pid > i32::MAX as u32 || !pid_alive(i64::from(pid)) {
+        return false;
+    }
+    terminate_pid(pid);
+    true
+}
+
+#[cfg(not(any(unix, windows)))]
+pub fn terminate_proxy_pid(_pid: u32, _expected_start_time: Option<u64>) -> bool {
+    false
+}
+
 /// A signal the monitor's Processes tab can deliver to a selected pid.
 ///
 /// Two rungs only — a graceful ask, then a hard stop — matching the tab's
