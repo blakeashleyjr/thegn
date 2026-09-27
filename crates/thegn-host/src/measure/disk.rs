@@ -112,8 +112,16 @@ pub(crate) fn spawn_scan(
         }
 
         let reclaimed = reclaim(&db, &policy, &fresh, active.as_deref());
+        let awaiting = db.worktrees_with_active_dispatch().unwrap_or_default();
+        let generation_reclaimed = reap_generation_footprints(
+            &fresh,
+            active.as_deref(),
+            &awaiting,
+            cfg.generation_min_age_days,
+            thegn_core::util::now().max(0) as u64,
+        );
 
-        if (measured > 0 || reaped > 0 || reclaimed > 0)
+        if (measured > 0 || reaped > 0 || reclaimed > 0 || generation_reclaimed > 0)
             && let Some(w) = &waker
         {
             let _ = w.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
@@ -263,6 +271,316 @@ fn reclaim(
     total
 }
 
+#[derive(Debug)]
+struct GenerationFootprint {
+    package_name: String,
+    generation_id: String,
+    fingerprint: std::path::PathBuf,
+    deps: Vec<std::path::PathBuf>,
+    incremental: Vec<std::path::PathBuf>,
+    newest_mtime_secs: u64,
+    bytes: u64,
+}
+
+/// Prune only generation records in profiles measured during this scan. The
+/// lock is held from before inventory through the final unlink so Cargo cannot
+/// begin a profile build midway through pruning.
+fn reap_generation_footprints(
+    fresh: &[(String, thegn_core::disk::DiskUsage)],
+    active: Option<&str>,
+    awaiting_verification: &[String],
+    min_age_days: u32,
+    now_secs: u64,
+) -> u64 {
+    use std::fs::OpenOptions;
+    use thegn_core::disk_reclaim::{Generation, GenerationPolicy};
+
+    let mut all_removed = 0u64;
+    for (worktree, _) in fresh {
+        let worktree_path = std::path::Path::new(worktree);
+        if active == Some(worktree.as_str())
+            || awaiting_verification.iter().any(|path| path == worktree)
+            || crate::task::slot_active(worktree_path)
+            || thegn_core::util::git_out(worktree_path, &["status", "--porcelain"])
+                .is_none_or(|output| !output.trim().is_empty())
+        {
+            continue;
+        }
+        let target = worktree_path.join("target");
+        for profile in ["debug", "release"] {
+            let profile_dir = target.join(profile);
+            let lock_path = profile_dir.join(".cargo-lock");
+            // Do not create a missing Cargo lock file. No existing lock means
+            // this profile is not a Cargo profile we can safely synchronize.
+            if !safe_regular_file(&lock_path) || !safe_directory(&profile_dir) {
+                continue;
+            }
+            let Ok(lock) = OpenOptions::new().read(true).write(true).open(&lock_path) else {
+                continue;
+            };
+            if lock.try_lock().is_err() {
+                tracing::debug!(
+                    target: LOG,
+                    profile = %profile_dir.display(),
+                    planned_bytes = 0u64,
+                    removed_bytes = 0u64,
+                    failures = 1usize,
+                    "generation prune skipped: cargo lock unavailable"
+                );
+                continue;
+            }
+
+            let footprints = match generation_inventory(&profile_dir) {
+                Ok(value) => value,
+                Err(error) => {
+                    tracing::warn!(
+                        target: LOG,
+                        profile = %profile_dir.display(),
+                        error = %error,
+                        planned_bytes = 0u64,
+                        removed_bytes = 0u64,
+                        failures = 1usize,
+                        "generation inventory failed"
+                    );
+                    continue;
+                }
+            };
+            let inventory: Vec<_> = footprints
+                .iter()
+                .map(|footprint| Generation {
+                    package_name: footprint.package_name.clone(),
+                    generation_id: footprint.generation_id.clone(),
+                    newest_mtime_secs: footprint.newest_mtime_secs,
+                    bytes: footprint.bytes,
+                })
+                .collect();
+            let before_bytes = inventory.iter().map(|entry| entry.bytes).sum::<u64>();
+            let plan = thegn_core::disk_reclaim::plan_generations(
+                &inventory,
+                GenerationPolicy {
+                    min_age_secs: u64::from(min_age_days).saturating_mul(86_400),
+                },
+                now_secs,
+            );
+            let mut planned_bytes = 0u64;
+            let mut removed_bytes = 0u64;
+            let mut failures = 0usize;
+            for eviction in plan {
+                let Some(footprint) = footprints.iter().find(|candidate| {
+                    candidate.package_name == eviction.package_name
+                        && candidate.generation_id == eviction.generation_id
+                }) else {
+                    failures += 1;
+                    continue;
+                };
+                planned_bytes = planned_bytes.saturating_add(footprint.bytes);
+                // Cargo treats a missing fingerprint as stale. Delete it
+                // before artifacts: if interrupted, leftovers are rebuildable;
+                // deleting outputs first while freshness metadata survives is
+                // the unsafe ordering.
+                if remove_tree_counted(&footprint.fingerprint, &profile_dir, &mut removed_bytes)
+                    .is_err()
+                {
+                    failures += 1;
+                    continue;
+                }
+                for path in footprint.deps.iter().chain(&footprint.incremental) {
+                    if remove_tree_counted(path, &profile_dir, &mut removed_bytes).is_err() {
+                        failures += 1;
+                    }
+                }
+            }
+            // `planned_bytes` is the measured complete selection; `removed_bytes`
+            // counts only successful files actually unlinked. Keep the two
+            // metrics distinct when permission or I/O errors cause partial work.
+            tracing::info!(
+                target: LOG,
+                profile = %profile_dir.display(),
+                before_bytes,
+                planned_bytes,
+                removed_bytes,
+                after_bytes = before_bytes.saturating_sub(removed_bytes),
+                failures,
+                "Cargo generation prune"
+            );
+            all_removed = all_removed.saturating_add(removed_bytes);
+            drop(lock);
+        }
+    }
+    all_removed
+}
+
+/// Inventory `<profile>/.fingerprint/<package>-<id>` records and only associate
+/// artifacts whose filename ends in that exact opaque id. Any unreadable or
+/// symlinked path rejects the whole profile/candidate rather than guessing.
+fn generation_inventory(profile: &std::path::Path) -> std::io::Result<Vec<GenerationFootprint>> {
+    use std::fs;
+
+    fn dirs(path: &std::path::Path) -> std::io::Result<Vec<std::path::PathBuf>> {
+        let mut out = Vec::new();
+        for entry in fs::read_dir(path)? {
+            let entry = entry?;
+            let ty = entry.file_type()?;
+            if ty.is_symlink() {
+                return Err(std::io::Error::other("symlink in generation profile"));
+            }
+            if ty.is_dir() {
+                out.push(entry.path());
+            }
+        }
+        out.sort();
+        Ok(out)
+    }
+
+    let fingerprint_root = profile.join(".fingerprint");
+    let deps_root = profile.join("deps");
+    let incremental_root = profile.join("incremental");
+    if !safe_directory(profile)
+        || !safe_directory(&fingerprint_root)
+        || (deps_root.exists() && !safe_directory(&deps_root))
+        || (incremental_root.exists() && !safe_directory(&incremental_root))
+    {
+        return Err(std::io::Error::other("unsafe generation profile directory"));
+    }
+    let fingerprints = dirs(&fingerprint_root)?;
+    let deps = if deps_root.is_dir() {
+        fs::read_dir(&deps_root)?.collect::<Result<Vec<_>, _>>()?
+    } else {
+        Vec::new()
+    };
+    let incremental = if incremental_root.is_dir() {
+        dirs(&incremental_root)?
+    } else {
+        Vec::new()
+    };
+    let mut result = Vec::new();
+    for fingerprint in fingerprints {
+        let Some(dirname) = fingerprint.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Some((package_name, generation_id)) = dirname.rsplit_once('-') else {
+            continue;
+        };
+        if package_name.is_empty() || generation_id.is_empty() {
+            continue;
+        }
+        let marker = format!("-{generation_id}");
+        let mut dep_paths = Vec::new();
+        for entry in &deps {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            let stem = name.split_once('.').map_or(name, |(stem, _)| stem);
+            if !stem.ends_with(&marker) {
+                continue;
+            }
+            let ty = entry.file_type()?;
+            if ty.is_symlink() {
+                return Err(std::io::Error::other("symlink in generation deps"));
+            }
+            if ty.is_file() {
+                dep_paths.push(entry.path());
+            }
+        }
+        let incremental_paths: Vec<_> = incremental
+            .iter()
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with(&marker))
+            })
+            .cloned()
+            .collect();
+        let paths = std::iter::once(&fingerprint)
+            .chain(dep_paths.iter())
+            .chain(incremental_paths.iter());
+        let mut bytes = 0u64;
+        let mut newest = 0u64;
+        for path in paths {
+            let (path_bytes, path_newest) = measure_safe_tree(path, profile)?;
+            bytes = bytes.saturating_add(path_bytes);
+            newest = newest.max(path_newest);
+        }
+        result.push(GenerationFootprint {
+            package_name: package_name.to_string(),
+            generation_id: generation_id.to_string(),
+            fingerprint,
+            deps: dep_paths,
+            incremental: incremental_paths,
+            newest_mtime_secs: newest,
+            bytes,
+        });
+    }
+    Ok(result)
+}
+
+fn measure_safe_tree(
+    path: &std::path::Path,
+    profile: &std::path::Path,
+) -> std::io::Result<(u64, u64)> {
+    use std::fs;
+    let root = profile.canonicalize()?;
+    let mut bytes = 0u64;
+    let mut newest = 0u64;
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        let meta = fs::symlink_metadata(&current)?;
+        if meta.file_type().is_symlink() || !current.canonicalize()?.starts_with(&root) {
+            return Err(std::io::Error::other("unsafe generation footprint path"));
+        }
+        if meta.is_dir() {
+            for entry in fs::read_dir(&current)? {
+                stack.push(entry?.path());
+            }
+        } else if meta.is_file() {
+            bytes = bytes.saturating_add(meta.len());
+            if let Ok(time) = meta.modified()
+                && let Ok(time) = time.duration_since(std::time::UNIX_EPOCH)
+            {
+                newest = newest.max(time.as_secs());
+            }
+        }
+    }
+    Ok((bytes, newest))
+}
+
+fn safe_directory(path: &std::path::Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .is_ok_and(|meta| meta.is_dir() && !meta.file_type().is_symlink())
+}
+
+fn safe_regular_file(path: &std::path::Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .is_ok_and(|meta| meta.is_file() && !meta.file_type().is_symlink())
+}
+
+/// Remove a tree without following links and add only successfully unlinked
+/// file bytes to `removed`.
+fn remove_tree_counted(
+    path: &std::path::Path,
+    profile: &std::path::Path,
+    removed: &mut u64,
+) -> std::io::Result<()> {
+    use std::fs;
+    let root = profile.canonicalize()?;
+    let meta = fs::symlink_metadata(path)?;
+    if meta.file_type().is_symlink() || !path.canonicalize()?.starts_with(&root) {
+        return Err(std::io::Error::other("unsafe generation removal path"));
+    }
+    if meta.is_dir() {
+        for entry in fs::read_dir(path)? {
+            let entry = entry?;
+            remove_tree_counted(&entry.path(), profile, removed)?;
+        }
+        fs::remove_dir(path)?;
+    } else {
+        fs::remove_file(path)?;
+        *removed = (*removed).saturating_add(meta.len());
+    }
+    Ok(())
+}
+
 /// `ui_state` scope holding the last-reclaim timestamp per worktree. A
 /// `ui_state` row rather than a schema column: it is pure hysteresis bookkeeping
 /// that may be lost without consequence, so it does not earn a migration.
@@ -286,4 +604,156 @@ fn branch_of(db: &Db, path: &str) -> String {
         .find(|w| w.worktree == path)
         .map(|w| w.branch)
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod generation_tests {
+    use super::*;
+    use std::fs;
+
+    fn profile_tree() -> (std::path::PathBuf, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "thegn-generation-reclaim-{}-{}-{}",
+            std::process::id(),
+            thegn_core::util::now(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let profile = root.join("target/debug");
+        fs::create_dir_all(profile.join(".fingerprint/pkg-a")).unwrap();
+        fs::create_dir_all(profile.join(".fingerprint/pkg-z")).unwrap();
+        fs::create_dir_all(profile.join("deps")).unwrap();
+        fs::create_dir_all(profile.join("incremental/pkg-a")).unwrap();
+        fs::write(profile.join(".cargo-lock"), []).unwrap();
+        fs::write(profile.join(".fingerprint/pkg-a/lib-pkg"), b"fingerprint-a").unwrap();
+        fs::write(profile.join(".fingerprint/pkg-z/lib-pkg"), b"fingerprint-z").unwrap();
+        fs::write(profile.join("deps/libpkg-a.rlib"), b"artifact-a").unwrap();
+        fs::write(profile.join("deps/libpkg-z.rlib"), b"artifact-z").unwrap();
+        fs::write(profile.join("incremental/pkg-a/cache"), b"incremental-a").unwrap();
+        let status = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&root)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git init failed: {status}");
+        fs::write(root.join(".git/info/exclude"), "target/\n").unwrap();
+        (root, profile)
+    }
+
+    #[test]
+    fn unlocked_prune_removes_only_selected_footprint_and_records_real_bytes() {
+        let (root, profile) = profile_tree();
+        let before = fs::read_dir(profile.join(".fingerprint")).unwrap().count();
+        let usage = thegn_core::disk::DiskUsage::default();
+        let removed = reap_generation_footprints(
+            &[(root.to_string_lossy().into_owned(), usage)],
+            None,
+            &[],
+            0,
+            u64::MAX,
+        );
+        assert!(removed > 0);
+        assert!(!profile.join(".fingerprint/pkg-a").exists());
+        assert!(!profile.join("deps/libpkg-a.rlib").exists());
+        assert!(!profile.join("incremental/pkg-a").exists());
+        assert!(profile.join(".fingerprint/pkg-z").exists());
+        assert!(profile.join("deps/libpkg-z.rlib").exists());
+        assert_eq!(before, 2);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn held_profile_lock_skips_inventory_and_deletion() {
+        let (root, profile) = profile_tree();
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(profile.join(".cargo-lock"))
+            .unwrap();
+        lock.try_lock().unwrap();
+        let removed = reap_generation_footprints(
+            &[(
+                root.to_string_lossy().into_owned(),
+                thegn_core::disk::DiskUsage::default(),
+            )],
+            None,
+            &[],
+            0,
+            u64::MAX,
+        );
+        assert_eq!(removed, 0);
+        assert!(profile.join(".fingerprint/pkg-a").exists());
+        drop(lock);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn dirty_worktree_is_exempt_from_generation_pruning() {
+        let (root, profile) = profile_tree();
+        fs::write(root.join("uncommitted.txt"), b"work in progress").unwrap();
+        let removed = reap_generation_footprints(
+            &[(
+                root.to_string_lossy().into_owned(),
+                thegn_core::disk::DiskUsage::default(),
+            )],
+            None,
+            &[],
+            0,
+            u64::MAX,
+        );
+        assert_eq!(removed, 0);
+        assert!(profile.join(".fingerprint/pkg-a").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn active_worktree_is_exempt_from_generation_pruning() {
+        let (root, profile) = profile_tree();
+        let worktree = root.to_string_lossy().into_owned();
+        let removed = reap_generation_footprints(
+            &[(worktree.clone(), thegn_core::disk::DiskUsage::default())],
+            Some(&worktree),
+            &[],
+            0,
+            u64::MAX,
+        );
+        assert_eq!(removed, 0);
+        assert!(profile.join(".fingerprint/pkg-a").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_profile_inventory_does_not_suppress_a_different_profile() {
+        let (root, debug_profile) = profile_tree();
+        fs::remove_dir_all(debug_profile.join(".fingerprint")).unwrap();
+        fs::write(debug_profile.join(".fingerprint"), b"not a directory").unwrap();
+
+        let release = root.join("target/release");
+        fs::create_dir_all(release.join(".fingerprint/pkg-a")).unwrap();
+        fs::create_dir_all(release.join(".fingerprint/pkg-z")).unwrap();
+        fs::create_dir_all(release.join("deps")).unwrap();
+        fs::write(release.join(".cargo-lock"), []).unwrap();
+        fs::write(release.join(".fingerprint/pkg-a/marker"), b"a").unwrap();
+        fs::write(release.join(".fingerprint/pkg-z/marker"), b"z").unwrap();
+        fs::write(release.join("deps/libpkg-a.rlib"), b"artifact-a").unwrap();
+        fs::write(release.join("deps/libpkg-z.rlib"), b"artifact-z").unwrap();
+
+        let removed = reap_generation_footprints(
+            &[(
+                root.to_string_lossy().into_owned(),
+                thegn_core::disk::DiskUsage::default(),
+            )],
+            None,
+            &[],
+            0,
+            u64::MAX,
+        );
+        assert!(removed > 0);
+        assert!(debug_profile.join(".fingerprint").is_file());
+        assert!(!release.join(".fingerprint/pkg-a").exists());
+        assert!(release.join(".fingerprint/pkg-z").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
 }
