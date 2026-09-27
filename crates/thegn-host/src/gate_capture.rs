@@ -128,14 +128,25 @@ fn merge(out: &TailResult, err: &TailResult) -> String {
     let mut log = String::with_capacity(out.text.len() + err.text.len() + 64);
     log.push_str(&out.text);
     log.push_str(&err.text);
-    match (out.truncated, err.truncated) {
-        (false, false) => {}
-        (true, true) => log
-            .push_str("\n[stdout and stderr tails truncated; showing last 65536 bytes per stream]"),
-        (true, false) => log.push_str("\n[stdout tail truncated; showing last 65536 bytes]"),
-        (false, true) => log.push_str("\n[stderr tail truncated; showing last 65536 bytes]"),
+    if let Some(marker) = truncation_marker(out.truncated, err.truncated) {
+        log.push_str(&marker);
     }
     log
+}
+
+fn truncation_marker(stdout: bool, stderr: bool) -> Option<String> {
+    match (stdout, stderr) {
+        (false, false) => None,
+        (true, true) => Some(format!(
+            "\n[stdout and stderr tails truncated; showing last {TAIL_BYTES} bytes per stream]"
+        )),
+        (true, false) => Some(format!(
+            "\n[stdout tail truncated; showing last {TAIL_BYTES} bytes]"
+        )),
+        (false, true) => Some(format!(
+            "\n[stderr tail truncated; showing last {TAIL_BYTES} bytes]"
+        )),
+    }
 }
 
 fn poll_reader(rx: &mpsc::Receiver<io::Result<TailResult>>) -> Option<io::Result<TailResult>> {
@@ -667,12 +678,17 @@ mod tests {
         };
         assert!(status.success());
         assert!(
-            log.len() <= 8_100,
+            log.len() <= 2 * TAIL_BYTES + truncation_marker(true, true).unwrap().len(),
             "diagnostic tail exceeds its fixed bound: {}",
             log.len()
         );
-        assert!(log.contains('o') && log.contains('e'));
-        assert!(log.contains("tails truncated"));
+        let expected = format!(
+            "{}{}{}",
+            "o".repeat(TAIL_BYTES),
+            "e".repeat(TAIL_BYTES),
+            truncation_marker(true, true).unwrap()
+        );
+        assert_eq!(log, expected, "both streams must be drained and tailed");
     }
 
     #[test]
