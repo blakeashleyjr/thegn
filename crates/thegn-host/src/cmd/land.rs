@@ -407,13 +407,20 @@ mod landed_row_tests {
             "first-fold",
         )
         .unwrap();
-        db.conn()
-            .execute(
-                "UPDATE merge_queue SET queued_at=11, updated_at=12, result_oid='first-fold', error_detail='keep-me'",
-                [],
-            )
-            .unwrap();
+        // Put a THE-596-style cleanup hold on the row through the public writer.
+        // `Db::conn` is private to thegn-core, so reaching for it here did not
+        // compile. This also asserts the case that actually matters: a second land
+        // must not wipe an `error_detail` hold a previous collection recorded.
+        db.update_merge_status(
+            WORKTREE,
+            "landed",
+            Some("first-fold"),
+            None,
+            Some("keep-me"),
+        )
+        .unwrap();
         let before = db.list_merge_queue().unwrap().pop().unwrap();
+        assert_eq!(before.error_detail.as_deref(), Some("keep-me"));
 
         let observed = db.observe_merge_outcome(WORKTREE).unwrap();
         persist_landed_row(
