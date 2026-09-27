@@ -186,9 +186,41 @@ struct GithubRemote {
 /// GitHub CLI supports enterprise instances, but CI operations here require
 /// the unambiguous owner/repository path shape. The shared remote parser
 /// rejects credentials, URL decorations, encoded delimiters and traversal.
+/// Is `hostname` GitHub's apex, or a subdomain of it?
+///
+/// Used where GitHub must be *recognised* from a remote alone — you cannot infer
+/// that `ghe.example.test` is GitHub, so auto-detection accepts only the real
+/// thing. See [`impersonates_github`] for the different question a
+/// target-builder asks.
+fn is_github_host(hostname: &str) -> bool {
+    hostname == "github.com" || hostname.ends_with(".github.com")
+}
+
+fn is_gitlab_host(hostname: &str) -> bool {
+    hostname == "gitlab.com" || hostname.ends_with(".gitlab.com")
+}
+
+/// Does `hostname` dress itself up as github.com while being some other host?
+///
+/// This is deliberately NOT [`is_github_host`]'s question. Once the operator has
+/// said "this is GitHub", an **enterprise** instance has an arbitrary hostname
+/// (`ghe.example.test`), so a membership test would reject every self-hosted
+/// install. What must still be refused is a host built to read like the real one:
+/// `github.com.evil.test` carries `github.com` as its leading labels and belongs
+/// to `evil.test`. An unrelated name is fine; a name wearing github.com's is not.
+fn impersonates_github(hostname: &str) -> bool {
+    hostname.starts_with("github.com.")
+}
+
 fn parse_github_remote(raw: &str) -> Option<GithubRemote> {
     let remote = parse_gitlab_remote(raw)?;
     if remote.project.split('/').count() != 2 {
+        return None;
+    }
+    // Checking only the path shape let any authority through, so a `--repo`
+    // target could be built for a lookalike and an authenticated mutation sent
+    // to it. Enterprise hosts stay allowed; impersonations do not.
+    if impersonates_github(remote.host.split(':').next()?) {
         return None;
     }
     Some(GithubRemote {
@@ -208,18 +240,15 @@ fn github_targeted_argv(remote: &GithubRemote, args: &[&str]) -> Vec<String> {
 
 /// Map a git remote URL's host to a CI system (pure, tested).
 ///
-/// Matching is the exact apex or a subdomain of it, and deliberately NOT a
-/// `starts_with("github.")` prefix: `github.com.evil.test` begins with that
-/// prefix and is an attacker-controlled host, while a genuine self-hosted
-/// `github.mycorp.com` is structurally identical to it — no prefix rule can tell
-/// them apart. Self-hosted instances therefore need explicit configuration
-/// rather than a guess that also admits a lookalike.
+/// Host matching lives in [`is_github_host`] / [`is_gitlab_host`] — one rule, two
+/// callers, so the lookalike-host bug cannot be fixed in one place and survive in
+/// the other.
 pub fn system_from_remote_host(url: &str) -> Option<CiSystem> {
     let host = parse_gitlab_remote(url)?.host;
     let hostname = host.split(':').next()?;
-    if hostname == "github.com" || hostname.ends_with(".github.com") {
+    if is_github_host(hostname) {
         Some(CiSystem::GithubActions)
-    } else if hostname == "gitlab.com" || hostname.ends_with(".gitlab.com") {
+    } else if is_gitlab_host(hostname) {
         Some(CiSystem::GitlabCi)
     } else {
         None
@@ -869,12 +898,12 @@ impl GitlabCi {
     /// are reused for both the credential-bearing command and its endpoint.
     fn remote(&self, loc: &GitLoc) -> Result<GitlabRemote, CiError> {
         let remote = snapshot_gitlab_remote(|| origin_url(loc))?;
-        if let Some(configured_host) = &self.host {
-            if normalize_gitlab_host(configured_host).as_deref() != Some(remote.host.as_str()) {
-                return Err(CiError::Other(
-                    "GitLab remote host does not match configured host".into(),
-                ));
-            }
+        if let Some(configured_host) = &self.host
+            && normalize_gitlab_host(configured_host).as_deref() != Some(remote.host.as_str())
+        {
+            return Err(CiError::Other(
+                "GitLab remote host does not match configured host".into(),
+            ));
         }
         Ok(remote)
     }
@@ -1135,12 +1164,10 @@ fn raw_url_path_is_unambiguous(raw: &str) -> bool {
         return false;
     };
     let authority_end = authority_and_path
-        .find(|ch| matches!(ch, '/' | '?' | '#'))
+        .find(['/', '?', '#'])
         .unwrap_or(authority_and_path.len());
     let suffix = &authority_and_path[authority_end..];
-    let path_end = suffix
-        .find(|ch| matches!(ch, '?' | '#'))
-        .unwrap_or(suffix.len());
+    let path_end = suffix.find(['?', '#']).unwrap_or(suffix.len());
     let path = &suffix[..path_end];
     if !path
         .bytes()
@@ -1510,11 +1537,8 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     #[test]
     fn github_provider_argv_and_environment_ignore_ambient_target() {
-        use std::os::unix::fs::PermissionsExt;
-
         let temp = tempfile::tempdir().unwrap();
         let bin = temp.path().join("bin");
         std::fs::create_dir(&bin).unwrap();
@@ -1533,9 +1557,15 @@ esac
 "##,
         )
         .unwrap();
-        let mut permissions = std::fs::metadata(&gh).unwrap().permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&gh, permissions).unwrap();
+        // The fake `gh` is a POSIX shell script, so this fixture is Unix-only —
+        // but express that through the cross-platform seam and a RUNTIME skip
+        // rather than `#[cfg(unix)]`. `ci.rs` is not on
+        // `test/platform-cfg-svc-ratchet.txt` and that list is shrink-only, so a
+        // platform `#[cfg]` here fails the build; this also keeps the test
+        // type-checked on Windows. Same idiom as `thegn_core::github`'s fixture.
+        if thegn_core::fsperm::make_executable_for_test(&gh).is_err() {
+            return;
+        }
 
         let loc = GitLoc::Local(temp.path().to_path_buf());
         for args in [
@@ -1637,8 +1667,10 @@ esac
                 .unwrap()
                 .success()
         );
-        let mut config = CiConfig::default();
-        config.provider = CiProviderKind::Github;
+        let config = CiConfig {
+            provider: CiProviderKind::Github,
+            ..CiConfig::default()
+        };
         let unsupported_loc = GitLoc::Local(unsupported.path().to_path_buf());
         assert!(provider_for(&unsupported_loc, &config).is_none());
         assert_eq!(std::fs::metadata(&capture).unwrap().len(), before);

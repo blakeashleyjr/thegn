@@ -488,6 +488,33 @@ fn cancel(cfg: &Config, worktree: Option<String>, run_id: &str) -> Result<()> {
     Ok(())
 }
 
+fn detect(cfg: &Config, worktree: Option<String>) -> Result<()> {
+    let loc = GitLoc::for_worktree(&resolve_worktree(worktree));
+    let detected = ci::detect_ci_configs(std::path::Path::new(&loc.path()));
+    if detected.is_empty() {
+        outln!("no CI config files detected in this worktree");
+    } else {
+        outln!("detected CI configs:");
+        for c in &detected {
+            outln!("  {:<16} {}", c.system.label(), c.files.join(", "));
+        }
+    }
+    match thegn_svc::ci::resolve_system(&loc, &cfg.ci) {
+        Some(sys) => outln!("active provider: {}", sys.label()),
+        None => outln!("active provider: none"),
+    }
+    Ok(())
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let cut: String = s.chars().take(max.saturating_sub(1)).collect();
+        format!("{cut}…")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -529,32 +556,5 @@ mod tests {
 
         let trigger_result = trigger(&config, None, "--help", Vec::new());
         assert!(trigger_result.unwrap_err().to_string().contains("--help"));
-    }
-}
-
-fn detect(cfg: &Config, worktree: Option<String>) -> Result<()> {
-    let loc = GitLoc::for_worktree(&resolve_worktree(worktree));
-    let detected = ci::detect_ci_configs(std::path::Path::new(&loc.path()));
-    if detected.is_empty() {
-        outln!("no CI config files detected in this worktree");
-    } else {
-        outln!("detected CI configs:");
-        for c in &detected {
-            outln!("  {:<16} {}", c.system.label(), c.files.join(", "));
-        }
-    }
-    match thegn_svc::ci::resolve_system(&loc, &cfg.ci) {
-        Some(sys) => outln!("active provider: {}", sys.label()),
-        None => outln!("active provider: none"),
-    }
-    Ok(())
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        let cut: String = s.chars().take(max.saturating_sub(1)).collect();
-        format!("{cut}…")
     }
 }
