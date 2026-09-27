@@ -383,11 +383,12 @@ pub fn validate_branch_ref(value: &str) -> Result<&str, CiError> {
         || value.starts_with('-')
         || value.starts_with('/')
         || value.ends_with('/')
-        || value.ends_with('.')
         || value.contains("..")
         || value.contains("//")
         || value.contains("@{")
-        || value.split('/').any(|part| part.ends_with(".lock"))
+        || value
+            .split('/')
+            .any(|part| part.starts_with('.') || part.ends_with('.') || part.ends_with(".lock"))
         || bytes
             .iter()
             .any(|b| *b <= 0x20 || *b == 0x7f || b"~^:?*[\\".contains(b));
@@ -772,41 +773,31 @@ impl GitlabCi {
     /// Construct a `glab` command with credentials in the child environment,
     /// never in argv. Keeping this at one chokepoint prevents a new operation
     /// from accidentally falling back to an unaudited/config-ignored path.
-    fn command(&self, loc: &GitLoc, args: &[&str]) -> Command {
+    fn command(&self, loc: &GitLoc, remote: &GitlabRemote, args: &[&str]) -> Command {
         let mut cmd = loc.cli_command("glab", args);
         if let Some(token) = &self.token {
             cmd.env("GITLAB_TOKEN", token);
         }
-        if let Some(host) = self
-            .host
-            .as_deref()
-            .and_then(normalize_gitlab_host)
-            .or_else(|| {
-                origin_url(loc)
-                    .and_then(|url| parse_gitlab_remote(&url))
-                    .map(|remote| remote.host)
-            })
-        {
-            cmd.env("GITLAB_HOST", host);
-        }
+        cmd.env("GITLAB_HOST", &remote.host);
         cmd
     }
 
-    /// Encode each already-validated project component for the API's single
-    /// `projects/:id` path segment.
-    fn project_seg(&self, loc: &GitLoc) -> Result<String, CiError> {
-        let url = origin_url(loc).ok_or(CiError::NotConfigured)?;
-        let remote = parse_gitlab_remote(&url)
-            .ok_or_else(|| CiError::Other(format!("invalid GitLab remote {url:?}")))?;
+    /// Resolve origin once for an operation. The resulting host and project
+    /// are reused for both the credential-bearing command and its endpoint.
+    fn remote(&self, loc: &GitLoc) -> Result<GitlabRemote, CiError> {
+        let remote = snapshot_gitlab_remote(|| origin_url(loc))?;
         if let Some(configured_host) = &self.host {
             if normalize_gitlab_host(configured_host).as_deref() != Some(remote.host.as_str()) {
-                return Err(CiError::Other(format!(
-                    "GitLab remote host {:?} does not match configured host {:?}",
-                    remote.host, configured_host
-                )));
+                return Err(CiError::Other(
+                    "GitLab remote host does not match configured host".into(),
+                ));
             }
         }
-        Ok(encode_project_segment(&remote.project))
+        Ok(remote)
+    }
+
+    fn project_seg(remote: &GitlabRemote) -> String {
+        encode_project_segment(&remote.project)
     }
 }
 
@@ -815,9 +806,10 @@ impl CiProvider for GitlabCi {
         CiSystem::GitlabCi
     }
     fn runs(&self, loc: &GitLoc, branch: Option<&str>, limit: usize) -> Result<CiRunList, CiError> {
-        let project_segment = self.project_seg(loc)?;
+        let remote = self.remote(loc)?;
+        let project_segment = Self::project_seg(&remote);
         let endpoint = gitlab_pipelines_endpoint(&project_segment, branch, limit)?;
-        let json = run_cli(&mut self.command(loc, &["api", &endpoint]))?;
+        let json = run_cli(&mut self.command(loc, &remote, &["api", &endpoint]))?;
         let (runs, discarded) = parse_gitlab_pipelines_with_discarded(&json);
         if discarded > 0 {
             tracing::warn!(target: "thegn::ci", discarded_rows = discarded, "discarded malformed GitLab pipeline rows");
@@ -830,12 +822,13 @@ impl CiProvider for GitlabCi {
 
     fn run_detail(&self, loc: &GitLoc, run_id: &str) -> Result<CiRunDetail, CiError> {
         validate_ci_id(run_id)?;
-        let proj = self.project_seg(loc)?;
+        let remote = self.remote(loc)?;
+        let proj = Self::project_seg(&remote);
         // Pipeline header + its jobs (two calls; the jobs carry the states).
         let run_endpoint = gitlab_run_endpoint(&proj, run_id, "")?;
         let jobs_endpoint = gitlab_run_endpoint(&proj, run_id, "jobs")?;
-        let pipe_json = run_cli(&mut self.command(loc, &["api", &run_endpoint]))?;
-        let jobs_json = run_cli(&mut self.command(loc, &["api", &jobs_endpoint]))?;
+        let pipe_json = run_cli(&mut self.command(loc, &remote, &["api", &run_endpoint]))?;
+        let jobs_json = run_cli(&mut self.command(loc, &remote, &["api", &jobs_endpoint]))?;
         let value: serde_json::Value = serde_json::from_str(&pipe_json).map_err(|error| {
             CiError::Other(format!("invalid provider pipeline response: {error}"))
         })?;
@@ -864,9 +857,10 @@ impl CiProvider for GitlabCi {
     fn logs(&self, loc: &GitLoc, _run_id: &str, job_id: &str) -> Result<CiLog, CiError> {
         validate_ci_id(_run_id)?;
         validate_ci_id(job_id)?;
-        let proj = self.project_seg(loc)?;
+        let remote = self.remote(loc)?;
+        let proj = Self::project_seg(&remote);
         let endpoint = gitlab_job_trace_endpoint(&proj, job_id)?;
-        run_bounded_log(&mut self.command(loc, &["api", &endpoint]))
+        run_bounded_log(&mut self.command(loc, &remote, &["api", &endpoint]))
     }
 
     fn workflows(&self, _loc: &GitLoc) -> Result<Vec<CiWorkflow>, CiError> {
@@ -882,7 +876,8 @@ impl CiProvider for GitlabCi {
         inputs: &[(String, String)],
     ) -> Result<(), CiError> {
         validate_workflow_selector(workflow)?;
-        let proj = self.project_seg(loc)?;
+        let remote = self.remote(loc)?;
+        let proj = Self::project_seg(&remote);
         let mut args = vec!["api".to_string(), "-X".into(), "POST".into()];
         args.push(format!("projects/{proj}/pipeline"));
         for (k, v) in inputs {
@@ -890,23 +885,25 @@ impl CiProvider for GitlabCi {
             args.push(format!("{k}={v}"));
         }
         let argv: Vec<&str> = args.iter().map(String::as_str).collect();
-        run_cli(&mut self.command(loc, &argv)).map(|_| ())
+        run_cli(&mut self.command(loc, &remote, &argv)).map(|_| ())
     }
 
     fn rerun(&self, loc: &GitLoc, run_id: &str, _scope: RerunScope) -> Result<(), CiError> {
         validate_ci_id(run_id)?;
-        let proj = self.project_seg(loc)?;
+        let remote = self.remote(loc)?;
+        let proj = Self::project_seg(&remote);
         // GitLab: `retry` re-runs failed jobs; a fresh full run isn't a single
         // call, so both scopes map to retry (it's the closest primitive).
         let endpoint = gitlab_run_endpoint(&proj, run_id, "retry")?;
-        run_cli(&mut self.command(loc, &["api", "-X", "POST", &endpoint])).map(|_| ())
+        run_cli(&mut self.command(loc, &remote, &["api", "-X", "POST", &endpoint])).map(|_| ())
     }
 
     fn cancel(&self, loc: &GitLoc, run_id: &str) -> Result<(), CiError> {
         validate_ci_id(run_id)?;
-        let proj = self.project_seg(loc)?;
+        let remote = self.remote(loc)?;
+        let proj = Self::project_seg(&remote);
         let endpoint = gitlab_run_endpoint(&proj, run_id, "cancel")?;
-        run_cli(&mut self.command(loc, &["api", "-X", "POST", &endpoint])).map(|_| ())
+        run_cli(&mut self.command(loc, &remote, &["api", "-X", "POST", &endpoint])).map(|_| ())
     }
 
     fn caps(&self) -> CiCaps {
@@ -928,9 +925,22 @@ pub fn gitlab_project_path(url: &str) -> Option<String> {
     parse_gitlab_remote(url).map(|remote| remote.project)
 }
 
+#[derive(Debug)]
 struct GitlabRemote {
     host: String,
     project: String,
+}
+
+fn parse_gitlab_remote_checked(raw: &str) -> Result<GitlabRemote, CiError> {
+    parse_gitlab_remote(raw)
+        .ok_or_else(|| CiError::Other("invalid GitLab remote authority or project path".into()))
+}
+
+fn snapshot_gitlab_remote(
+    read_origin: impl FnOnce() -> Option<String>,
+) -> Result<GitlabRemote, CiError> {
+    let raw = read_origin().ok_or(CiError::NotConfigured)?;
+    parse_gitlab_remote_checked(&raw)
 }
 
 fn normalize_gitlab_host(raw: &str) -> Option<String> {
@@ -965,6 +975,9 @@ fn normalize_gitlab_host(raw: &str) -> Option<String> {
 fn parse_gitlab_remote(raw: &str) -> Option<GitlabRemote> {
     let raw = raw.trim();
     let (host, path) = if raw.contains("://") {
+        if !raw_url_path_is_unambiguous(raw) {
+            return None;
+        }
         let parsed = url::Url::parse(raw).ok()?;
         if !matches!(parsed.scheme(), "https" | "http" | "ssh")
             || parsed.host_str().is_none()
@@ -1029,6 +1042,32 @@ fn parse_gitlab_remote(raw: &str) -> Option<GitlabRemote> {
         host,
         project: segments.join("/"),
     })
+}
+
+/// Check path text before `url::Url` can normalize dot segments or decode its
+/// interpretation of delimiters. Encoded path bytes are rejected entirely:
+/// project components have a deliberately narrow literal grammar.
+fn raw_url_path_is_unambiguous(raw: &str) -> bool {
+    let Some((_, authority_and_path)) = raw.split_once("://") else {
+        return false;
+    };
+    let authority_end = authority_and_path
+        .find(|ch| matches!(ch, '/' | '?' | '#'))
+        .unwrap_or(authority_and_path.len());
+    let suffix = &authority_and_path[authority_end..];
+    let path_end = suffix
+        .find(|ch| matches!(ch, '?' | '#'))
+        .unwrap_or(suffix.len());
+    let path = &suffix[..path_end];
+    if !path
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-'))
+    {
+        return false;
+    }
+    path.split('/')
+        .filter(|component| !component.is_empty())
+        .all(|component| component != "." && component != "..")
 }
 
 fn encode_project_segment(project: &str) -> String {
@@ -1165,7 +1204,9 @@ mod tests {
             "https://gitlab.com/group/repo?next=other",
             "https://gitlab.com/group/repo#fragment",
             "https://user@gitlab.com/group/repo",
+            "https://user:token@gitlab.com/group/repo",
             "https://gitlab.com/group%2Frepo/sub",
+            "https://gitlab.com/group\\repo",
             // URL parsing normalizes these dot segments unless the raw path is
             // checked before parsing; remotes must not silently retarget.
             "https://gitlab.com/../group/repo",
@@ -1176,6 +1217,47 @@ mod tests {
         ] {
             assert_eq!(gitlab_project_path(invalid), None, "{invalid:?}");
         }
+    }
+
+    #[test]
+    fn gitlab_remote_errors_never_echo_credentials_or_remote_text() {
+        let secret_remote = "https://user:fixture-token@gitlab.example.test/group/repo";
+        let error = parse_gitlab_remote_checked(secret_remote)
+            .unwrap_err()
+            .to_string();
+        assert!(!error.contains("fixture-token"));
+        assert!(!error.contains("user"));
+        assert_eq!(error, "invalid GitLab remote authority or project path");
+    }
+
+    #[test]
+    fn gitlab_operation_takes_one_remote_snapshot_for_host_and_project() {
+        let mut reads = 0;
+        let remote = snapshot_gitlab_remote(|| {
+            reads += 1;
+            Some("https://gitlab.example.test/group/repo".into())
+        })
+        .unwrap();
+        assert_eq!(reads, 1);
+
+        let endpoint =
+            gitlab_pipelines_endpoint(&GitlabCi::project_seg(&remote), None, 10).unwrap();
+        let client = GitlabCi {
+            token: Some("fixture-token".into()),
+            host: None,
+        };
+        let loc = GitLoc::for_worktree(std::path::Path::new("."));
+        let command = client.command(&loc, &remote, &["api", &endpoint]);
+        assert_eq!(endpoint, "projects/group%2Frepo/pipelines?per_page=10");
+        assert_eq!(
+            command
+                .get_envs()
+                .find(|(key, _)| key == "GITLAB_HOST")
+                .and_then(|(_, value)| value)
+                .map(|value| value.to_string_lossy().into_owned())
+                .as_deref(),
+            Some("gitlab.example.test")
+        );
     }
 
     #[test]
@@ -1275,6 +1357,24 @@ mod tests {
         for invalid in [".hidden", "feature/.hidden"] {
             assert!(validate_branch_ref(invalid).is_err(), "{invalid:?}");
         }
+        for invalid in [
+            "feature/..hidden",
+            "feature/trailing./part",
+            "feature/name.lock",
+            "feature/@{upstream}",
+            "feature/name\\part",
+            "feature/name\u{7f}part",
+            "@",
+        ] {
+            assert!(validate_branch_ref(invalid).is_err(), "{invalid:?}");
+        }
+        for valid in [
+            "feature&status=success",
+            "release#candidate",
+            "percent%name",
+        ] {
+            assert_eq!(validate_branch_ref(valid), Ok(valid));
+        }
         assert_eq!(
             github_run_detail_argv("123").unwrap(),
             ["run", "view", "--json", GH_DETAIL_FIELDS, "--", "123"]
@@ -1329,7 +1429,11 @@ mod tests {
         cfg.gitlab.host = "gitlab.example.test".into();
         let client = GitlabCi::from_config(&cfg);
         let loc = GitLoc::for_worktree(std::path::Path::new("."));
-        let command = client.command(&loc, &["api", "projects/g%2Fr/pipelines"]);
+        let remote = GitlabRemote {
+            host: "gitlab.example.test".into(),
+            project: "g/r".into(),
+        };
+        let command = client.command(&loc, &remote, &["api", "projects/g%2Fr/pipelines"]);
         let args = command
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
