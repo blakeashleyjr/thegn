@@ -78,6 +78,10 @@ pub(crate) async fn spawn_session(
         forked_from: request.forked_from,
     };
     super::pty_diagnostics::record(&service.daemon_id, &request.id, pty.pid, "running", None);
+    // Capture the pid before `pty` moves into the actor below: the
+    // shutdown-refusal diagnostic still needs to name the child. Diagnostics
+    // only — nothing derives a signal target from a recorded pid.
+    let pty_pid = pty.pid;
     let live = Arc::new(Mutex::new(LiveMeta {
         rows: request.rows,
         cols: request.cols,
@@ -110,7 +114,7 @@ pub(crate) async fn spawn_session(
         super::pty_diagnostics::record(
             &service.daemon_id,
             &request.id,
-            pty.pid,
+            pty_pid,
             "open_refused_during_shutdown",
             Some("process_owner_dropped_and_reaped"),
         );
