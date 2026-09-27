@@ -471,6 +471,18 @@ pub(super) fn run(mut command: Command, timeout: Duration) -> CaptureResult {
     }
 }
 
+/// The log text for a degraded path that captured only one stream.
+///
+/// Renders through [`merge`] rather than taking `TailResult::text` directly, so
+/// the truncation marker follows the same rule everywhere — and so an
+/// untruncated tail still renders byte-identically to the historical output.
+fn recv_log(reader: Option<Reader>) -> String {
+    reader
+        .and_then(recv_tail)
+        .map(|tail| merge(&tail, &TailResult::default()))
+        .unwrap_or_default()
+}
+
 fn recv_tail(reader: Reader) -> Option<TailResult> {
     let result = reader
         .receiver
@@ -550,7 +562,7 @@ fn terminate_after_reader_failure(
     loop {
         match child.try_wait() {
             Ok(Some(_)) => {
-                let log = reader.and_then(recv_tail).unwrap_or_default();
+                let log = recv_log(reader);
                 return if group.is_empty() {
                     CaptureResult::Infrastructure {
                         reason: format!("gate output reader could not start: {error}"),
@@ -573,7 +585,7 @@ fn terminate_after_reader_failure(
             }
         }
     }
-    let log = reader.and_then(recv_tail).unwrap_or_default();
+    let log = recv_log(reader);
     let reason = failure.map_or_else(
         || format!("gate output reader could not start ({error}); child did not reap after force termination"),
         |reap| format!("gate output reader could not start ({error}) and child reap failed ({reap})"),
