@@ -506,13 +506,12 @@ impl WorktreeAuxStore for Db {
             "backfill requires a landed row with a missing result OID"
         );
         let changed = self.conn().execute(
-            "UPDATE merge_queue SET result_oid=?1, updated_at=?2 \
-             WHERE worktree=?3 AND branch=?4 AND target_branch=?5 \
-               AND status='landed' AND updated_at=?6 \
+            "UPDATE merge_queue SET result_oid=?1 \
+             WHERE worktree=?2 AND branch=?3 AND target_branch=?4 \
+               AND status='landed' AND updated_at=?5 \
                AND (result_oid IS NULL OR result_oid='')",
             params![
                 result_oid,
-                util::now(),
                 expected.worktree,
                 expected.branch,
                 expected.target_branch,
