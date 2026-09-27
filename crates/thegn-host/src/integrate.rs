@@ -785,7 +785,7 @@ fn gate_base(repository_id_hex: &str) -> PathBuf {
 }
 
 pub(crate) fn gate_quarantines() -> Vec<(PathBuf, String)> {
-    integrate_gate::poisoned_gate_workspaces()
+    gate_runner::poisoned_gate_workspaces()
 }
 
 #[cfg(test)]
