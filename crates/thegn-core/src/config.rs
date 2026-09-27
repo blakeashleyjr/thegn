@@ -828,6 +828,13 @@ pub struct MergeQueueConfig {
     /// every real package manager's install command is. Running it only on
     /// worktree creation would silently rot the moment a lockfile changed.
     pub gate_setup_command: String,
+    /// Maximum time allowed for `gate_setup_command`; zero disables the deadline.
+    /// Filesystem calls and uninterruptible process I/O cannot be preempted.
+    pub gate_setup_timeout_secs: u64,
+    /// Maximum time allowed for `gate_command`; zero disables the deadline.
+    /// The default is disabled so a legitimate long build is never blamed.
+    /// Filesystem calls and uninterruptible process I/O cannot be preempted.
+    pub gate_timeout_secs: u64,
     /// Whether to run `gate_command` at all.
     pub gate_on: bool,
     /// Reuse a stable per-repo gate worktree + `target/` between folds (warm rebuild); `false` ⇒ throwaway `/tmp` (always cold).
@@ -1016,6 +1023,8 @@ impl Default for MergeQueueConfig {
             target_branch: "auto".to_string(),
             gate_command: String::new(),
             gate_setup_command: String::new(),
+            gate_setup_timeout_secs: 0,
+            gate_timeout_secs: 0,
             gate_on: true,
             gate_reuse_worktree: true,
             gate_target_dir: String::new(),
@@ -1127,6 +1136,10 @@ pub struct MergeQueueOverlay {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gate_setup_command: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub gate_setup_timeout_secs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gate_timeout_secs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub gate_on: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gate_reuse_worktree: Option<bool>,
@@ -1228,6 +1241,8 @@ impl MergeQueueOverlay {
             && self.target_branch.is_none()
             && self.gate_command.is_none()
             && self.gate_setup_command.is_none()
+            && self.gate_setup_timeout_secs.is_none()
+            && self.gate_timeout_secs.is_none()
             && self.gate_on.is_none()
             && self.gate_reuse_worktree.is_none()
             && self.gate_target_dir.is_none()
@@ -1271,6 +1286,8 @@ impl MergeQueueOverlay {
             target_branch,
             gate_command,
             gate_setup_command,
+            gate_setup_timeout_secs,
+            gate_timeout_secs,
             gate_on,
             gate_reuse_worktree,
             gate_target_dir,
@@ -1318,6 +1335,12 @@ impl MergeQueueOverlay {
         }
         if let Some(v) = gate_setup_command {
             base.gate_setup_command = v;
+        }
+        if let Some(v) = gate_setup_timeout_secs {
+            base.gate_setup_timeout_secs = v;
+        }
+        if let Some(v) = gate_timeout_secs {
+            base.gate_timeout_secs = v;
         }
         if let Some(v) = gate_on {
             base.gate_on = v;
@@ -5446,6 +5469,8 @@ pub struct ConfigOverlay {
     pub theme_agent_glyphs: Option<AgentGlyphs>,
     #[schemars(range(max = "crate::time_policy::MAX_DURATION_SECS"))]
     pub pr_ttl_secs: Option<u64>,
+    pub merge_queue_gate_timeout_secs: Option<u64>,
+    pub merge_queue_gate_setup_timeout_secs: Option<u64>,
     #[schemars(range(max = "crate::time_policy::MAX_CADENCE_SECS"))]
     pub watch_pr_interval_secs: Option<u64>,
     #[schemars(range(max = "crate::time_policy::MAX_CADENCE_SECS"))]
@@ -5535,6 +5560,14 @@ impl ConfigOverlay {
             base.theme.colors.border = self.frame_border;
         }
         set!(base.pr.ttl_secs, self.pr_ttl_secs);
+        set!(
+            base.merge_queue.gate_timeout_secs,
+            self.merge_queue_gate_timeout_secs
+        );
+        set!(
+            base.merge_queue.gate_setup_timeout_secs,
+            self.merge_queue_gate_setup_timeout_secs
+        );
         set!(base.watch.pr_interval_secs, self.watch_pr_interval_secs);
         set!(base.metrics.interval_secs, self.metrics_interval_secs);
         set!(base.metrics.timeout_ms, self.metrics_timeout_ms);
@@ -5688,6 +5721,13 @@ pub fn env_overlay(env: &dyn EnvSource) -> ConfigOverlay {
     o.workspaces_dir = canonical_projects_dir.or(legacy_workspaces_dir);
     o.base_branch = env.get("THEGN_BASE_BRANCH");
     o.branch_prefix = env.get("THEGN_BRANCH_PREFIX");
+    if let Some(v) = env.get("THEGN_MERGE_QUEUE_GATE_TIMEOUT_SECS") {
+        o.merge_queue_gate_timeout_secs = parse_num(v, "THEGN_MERGE_QUEUE_GATE_TIMEOUT_SECS");
+    }
+    if let Some(v) = env.get("THEGN_MERGE_QUEUE_GATE_SETUP_TIMEOUT_SECS") {
+        o.merge_queue_gate_setup_timeout_secs =
+            parse_num(v, "THEGN_MERGE_QUEUE_GATE_SETUP_TIMEOUT_SECS");
+    }
     if let Some(v) = env.get("THEGN_PICKER") {
         o.picker = parse_enum_env(v.trim(), "THEGN_PICKER", Picker::from_str_validated);
     }

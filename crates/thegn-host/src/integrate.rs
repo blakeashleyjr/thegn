@@ -784,6 +784,10 @@ fn gate_base(repository_id_hex: &str) -> PathBuf {
         .join(format!("repo-{repository_id_hex}"))
 }
 
+pub(crate) fn gate_quarantines() -> Vec<(PathBuf, String)> {
+    gate_runner::poisoned_gate_workspaces()
+}
+
 #[cfg(test)]
 fn gate_base_for_repo(repo_root: &Path) -> PathBuf {
     let identity = thegn_core::repo::repository_id(repo_root)

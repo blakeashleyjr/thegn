@@ -251,7 +251,19 @@ part of the verdict:
 [merge_queue]
 gate_setup_command = "pnpm install --frozen-lockfile"
 gate_command = "pnpm test"
+gate_setup_timeout_secs = 1800
+gate_timeout_secs = 3600
 ```
+
+Both deadlines default to `0`, which explicitly disables that deadline. Set
+`gate_setup_timeout_secs` and `gate_timeout_secs` separately when setup and the
+actual test command need different limits. A timeout is an infrastructure hold
+(`gate_error`), never a red result attributed to the candidate branch. Filesystem
+operations around workspace preparation cannot be interrupted by these command
+deadlines, and a process stuck in uninterruptible OS I/O can delay reaping and
+keep its quarantined lease held. The matching environment overrides are
+`THEGN_MERGE_QUEUE_GATE_SETUP_TIMEOUT_SECS` and
+`THEGN_MERGE_QUEUE_GATE_TIMEOUT_SECS`.
 
 That split matters, because a gate can fail two different ways and only
 one of them is about your branch:
