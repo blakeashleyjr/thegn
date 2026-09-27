@@ -247,14 +247,14 @@ product except where stated.
    SQLite for frecency instead of a second embedded KV store. Retires a pinned
    nightly prerelease from the critical path.
 7. **Replace `octocrab` with the shared tracker HTTP client.** Completed in
-   THE-670: static lockfile closure measurement removes 34 of 947 reachable
-   packages (3.6%), including `jsonwebtoken` and `rsa`; no `rsa` path remains.
+   THE-670: static lockfile closure measurement removes 35 of 947 reachable
+   packages (3.7%), including `jsonwebtoken` and `rsa`; no `rsa` path remains.
    The `gh` CLI forge path remains the fallback.
 
 ### THE-670 remeasurement (2026-09-26)
 
 After replacing the native GraphQL SDK with `TrackerHttpClient`, the lockfile
-reachability closure is 913 packages, down from 947 (34 packages, 3.6%). A
+reachability closure is 912 packages, down from 947 (35 packages, 3.7%). A
 static reverse-closure walk over all workspace package roots confirmed that
 `rsa 0.9.10` was reached only by `octocrab → jsonwebtoken → rsa` and is no
 longer reachable. The removed closure also includes `jsonwebtoken`, `p256`,
