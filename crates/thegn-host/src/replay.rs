@@ -113,6 +113,14 @@ impl Recording {
         now.saturating_duration_since(self.epoch).as_millis() as u64
     }
 
+    /// The recording epoch, so a test in a sibling module can build timestamps
+    /// relative to it without a sleep. `epoch` itself stays private — this is a
+    /// read-only accessor and exists only for tests.
+    #[cfg(test)]
+    pub(crate) fn epoch(&self) -> Instant {
+        self.epoch
+    }
+
     /// Append a chunk of PTY output. `now` is read once by the caller (a vDSO
     /// read on the loop — no syscall, no wakeup).
     pub fn push_bytes(&mut self, bytes: &[u8], now: Instant) {

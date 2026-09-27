@@ -567,7 +567,7 @@ mod tests {
     #[test]
     fn playback_consumes_same_timestamp_append_at_live_tail_once() {
         let mut rec = Recording::from_config(&ReplayConfig::default(), 24, 80);
-        let epoch = rec.epoch;
+        let epoch = rec.epoch();
         rec.push_bytes(b"before\r\n", epoch);
         let mut ov = ReplayOverlay::new(1, &rec, 1000);
         rec.push_bytes(b"appended\r\n", epoch);
