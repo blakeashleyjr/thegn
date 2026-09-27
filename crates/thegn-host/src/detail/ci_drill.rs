@@ -483,20 +483,20 @@ mod tests {
         // While the first fetch is in flight, no repoll piles on.
         assert!(ov.live_ci_repoll().is_none());
         // A fill that's still running arms the live repoll…
-        ov.set_ci_detail(&running, vec![], vec![]);
+        ov.set_ci_detail(&running, 0, vec![], vec![]);
         ov.scroll = 3;
         let again = ov.live_ci_repoll().expect("running run repolls");
         assert_eq!(again.id, "7");
         assert_eq!(ov.pending_ci.as_deref(), Some("7"), "pending re-armed");
         // …a live re-fill of the same run preserves the scroll position…
-        ov.set_ci_detail(&running, vec![], vec![]);
+        ov.set_ci_detail(&running, 0, vec![], vec![]);
         assert_eq!(ov.scroll, 3);
         // …and a terminal fill stops the polling.
         let done = CiRun {
             state: CiState::Pass,
             ..running
         };
-        ov.set_ci_detail(&done, vec![], vec![]);
+        ov.set_ci_detail(&done, 0, vec![], vec![]);
         assert!(
             ov.live_ci_repoll().is_none(),
             "terminal run stops repolling"
