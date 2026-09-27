@@ -19,7 +19,7 @@ pub(super) fn client_with_delay(
     use axum::body::Body;
     use axum::extract::Request;
     use axum::http::{HeaderValue, StatusCode};
-    use axum::response::{IntoResponse, Response};
+    use axum::response::IntoResponse;
     use axum::routing::any;
 
     let body = body.to_owned();
