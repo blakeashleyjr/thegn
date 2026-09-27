@@ -41,6 +41,8 @@ struct Budget {
 /// One recorded pane event, stamped with ms since the recording epoch.
 #[derive(Debug, Clone)]
 struct Event {
+    /// Stable position in the recording, independent of timestamp resolution.
+    seq: u64,
     at_ms: u64,
     kind: EventKind,
 }
@@ -123,6 +125,7 @@ impl Recording {
         self.bytes_used += bytes.len() as u64;
         self.bytes_since_keyframe += bytes.len() as u64;
         self.events.push_back(Event {
+            seq,
             at_ms,
             kind: EventKind::Bytes(bytes.into()),
         });
@@ -134,8 +137,10 @@ impl Recording {
     /// moment.
     pub fn record_resize(&mut self, rows: u16, cols: u16, now: Instant) {
         let at_ms = self.elapsed_ms(now);
+        let seq = self.next_seq;
         self.next_seq += 1;
         self.events.push_back(Event {
+            seq,
             at_ms,
             kind: EventKind::Resize { rows, cols },
         });
@@ -211,17 +216,43 @@ impl Recording {
     /// Reconstruct the pane's grid at time `at_ms` into a fresh emulator by
     /// re-feeding the retained byte slice. Exact within the retained window.
     pub fn reconstruct(&self, at_ms: u64) -> AlacrittyEmulator {
+        self.reconstruct_with_cursor(at_ms).0
+    }
+
+    /// Rebuild inclusively and return the absolute sequence of the next event
+    /// that has not been applied. The sequence cursor preserves position inside
+    /// a timestamp group, which a millisecond cursor cannot represent.
+    pub(crate) fn reconstruct_with_cursor(&self, at_ms: u64) -> (AlacrittyEmulator, u64) {
         let mut emu = AlacrittyEmulator::new(self.base_rows, self.base_cols, REPLAY_SCROLLBACK);
-        self.feed_into(&mut emu, 0, at_ms);
-        emu
+        let cursor = self.feed_from_sequence(&mut emu, self.evicted, at_ms);
+        (emu, cursor)
     }
 
     /// Feed events with `from_exclusive < at_ms <= to_inclusive` into an existing
     /// emulator — the incremental forward-playback path (no full rebuild). Callers
     /// that jump backwards must [`reconstruct`](Self::reconstruct) from scratch.
     pub fn feed_into(&self, emu: &mut AlacrittyEmulator, from_exclusive: u64, to_inclusive: u64) {
+        let from_seq = self
+            .events
+            .iter()
+            .find(|ev| ev.at_ms > from_exclusive)
+            .map(|ev| ev.seq)
+            .unwrap_or(self.next_seq);
+        self.feed_from_sequence(emu, from_seq, to_inclusive);
+    }
+
+    /// Feed the retained suffix beginning at an absolute event sequence through
+    /// `to_inclusive`, returning the next sequence to apply. Callers rebuild if
+    /// their cursor is older than `first_sequence()` after eviction.
+    pub(crate) fn feed_from_sequence(
+        &self,
+        emu: &mut AlacrittyEmulator,
+        from_seq: u64,
+        to_inclusive: u64,
+    ) -> u64 {
+        let mut next_seq = from_seq.max(self.evicted);
         for ev in &self.events {
-            if ev.at_ms <= from_exclusive {
+            if ev.seq < next_seq {
                 continue;
             }
             if ev.at_ms > to_inclusive {
@@ -231,7 +262,13 @@ impl Recording {
                 EventKind::Bytes(b) => emu.advance(b),
                 EventKind::Resize { rows, cols } => emu.resize(*rows, *cols),
             }
+            next_seq = ev.seq + 1;
         }
+        next_seq
+    }
+
+    pub(crate) fn first_sequence(&self) -> u64 {
+        self.evicted
     }
 
     /// The next event timestamp strictly after `at_ms` (for single-step scrubbing).
@@ -271,21 +308,30 @@ impl Recording {
             return None;
         }
         let needle = needle.to_lowercase();
-        let mut emu = AlacrittyEmulator::new(self.base_rows, self.base_cols, REPLAY_SCROLLBACK);
         let mut best_before: Option<u64> = None;
-        for ev in &self.events {
-            match &ev.kind {
-                EventKind::Bytes(b) => emu.advance(b),
-                EventKind::Resize { rows, cols } => emu.resize(*rows, *cols),
+        let mut emu = AlacrittyEmulator::new(self.base_rows, self.base_cols, REPLAY_SCROLLBACK);
+        let mut events = self.events.iter().peekable();
+        while let Some(first) = events.next() {
+            let at_ms = first.at_ms;
+            for ev in std::iter::once(first).chain(std::iter::from_fn(|| {
+                (events.peek().is_some_and(|ev| ev.at_ms == at_ms))
+                    .then(|| events.next())
+                    .flatten()
+            })) {
+                match &ev.kind {
+                    EventKind::Bytes(b) => emu.advance(b),
+                    EventKind::Resize { rows, cols } => emu.resize(*rows, *cols),
+                }
             }
-            // Sample one frame per event boundary.
+            // A timestamp is one visible frame: sample only after all events at
+            // that millisecond have been applied.
             if grid_text(&emu).to_lowercase().contains(&needle) {
                 if reverse {
-                    if ev.at_ms < from_ms {
-                        best_before = Some(ev.at_ms);
+                    if at_ms < from_ms {
+                        best_before = Some(at_ms);
                     }
-                } else if ev.at_ms > from_ms {
-                    return Some(ev.at_ms);
+                } else if at_ms > from_ms {
+                    return Some(at_ms);
                 }
             }
         }
@@ -452,6 +498,64 @@ mod tests {
         let text = grid_text(&mid);
         assert!(text.contains("early"));
         assert!(!text.contains("late"));
+    }
+
+    #[test]
+    fn reconstruct_zero_includes_all_zero_time_bytes_and_resize() {
+        let mut rec = Recording::from_config(&cfg(), 24, 80);
+        let epoch = rec.epoch;
+        rec.push_bytes(b"first\r\n", epoch);
+        rec.record_resize(10, 40, epoch);
+        rec.push_bytes(b"second\r\n", epoch);
+
+        let emu = rec.reconstruct(0);
+        assert!(grid_text(&emu).contains("first"));
+        assert!(grid_text(&emu).contains("second"));
+        assert_eq!(emu.size(), (10, 40));
+    }
+
+    #[test]
+    fn repeated_sequence_feed_and_backward_rebuild_preserve_same_ms_events_once() {
+        let mut rec = Recording::from_config(&cfg(), 24, 80);
+        let epoch = rec.epoch;
+        rec.push_bytes(b"zero-a\r\n", epoch);
+        rec.push_bytes(b"zero-b\r\n", epoch);
+        rec.push_bytes(b"later\r\n", epoch + Duration::from_millis(10));
+
+        let (mut emu, cursor) = rec.reconstruct_with_cursor(0);
+        let initial = grid_text(&emu);
+        assert!(initial.contains("zero-a"));
+        assert!(initial.contains("zero-b"));
+        let cursor = rec.feed_from_sequence(&mut emu, cursor, 0);
+        assert_eq!(
+            grid_text(&emu),
+            initial,
+            "repeating the same interval adds nothing"
+        );
+        let cursor = rec.feed_from_sequence(&mut emu, cursor, 10);
+        assert!(grid_text(&emu).contains("later"));
+        let (rebuilt, rebuilt_cursor) = rec.reconstruct_with_cursor(0);
+        assert_eq!(
+            grid_text(&rebuilt),
+            initial,
+            "backward seek rebuilds inclusively"
+        );
+        let mut rebuilt = rebuilt;
+        rec.feed_from_sequence(&mut rebuilt, rebuilt_cursor, 10);
+        assert_eq!(grid_text(&rebuilt), grid_text(&emu));
+    }
+
+    #[test]
+    fn search_samples_after_timestamp_group_and_matches_reconstruction() {
+        let mut rec = Recording::from_config(&cfg(), 24, 80);
+        let epoch = rec.epoch;
+        rec.push_bytes(b"transient", epoch);
+        rec.push_bytes(b"\r\x1b[2Kfinal", epoch);
+
+        assert!(!grid_text(&rec.reconstruct(0)).contains("transient"));
+        assert!(grid_text(&rec.reconstruct(0)).contains("final"));
+        assert_eq!(rec.search_next("transient", 1, true), None);
+        assert_eq!(rec.search_next("final", 1, true), Some(0));
     }
 
     #[test]
