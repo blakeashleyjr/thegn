@@ -3368,6 +3368,11 @@ pub struct DiskConfig {
     /// an unexpected cold rebuild costs an agent mid-task real wall-clock.
     #[schemars(range(max = "crate::time_policy::MAX_DURATION_DAYS"))]
     pub idle_clean_days: u32,
+    /// Reap stale Cargo fingerprint generations only after this many untouched
+    /// days. Defaults to the same conservative two-week floor as
+    /// `idle_clean_days`; the newest footprint for each package is always kept.
+    #[schemars(range(max = "crate::time_policy::MAX_DURATION_DAYS"))]
+    pub generation_min_age_days: u32,
     /// Under genuine disk pressure, evict least-recently-touched `target/` dirs
     /// until free space is back above `[stats] disk_free_warn`.
     ///
@@ -3402,6 +3407,7 @@ impl Default for DiskConfig {
             auto_clean_on_merge: true,
             clean_on_pr_closed: false,
             idle_clean_days: 14,
+            generation_min_age_days: 14,
             reclaim_on_low_disk: true,
             sccache: false,
             sccache_dir: String::new(),
@@ -5473,6 +5479,8 @@ pub struct ConfigOverlay {
     pub disk_clean_on_pr_closed: Option<bool>,
     #[schemars(range(max = "crate::time_policy::MAX_DURATION_DAYS"))]
     pub disk_idle_clean_days: Option<u32>,
+    #[schemars(range(max = "crate::time_policy::MAX_DURATION_DAYS"))]
+    pub disk_generation_min_age_days: Option<u32>,
     pub disk_reclaim_on_low_disk: Option<bool>,
     pub disk_sccache: Option<bool>,
     pub disk_sccache_dir: Option<String>,
@@ -5569,6 +5577,10 @@ impl ConfigOverlay {
         set!(base.disk.auto_clean_on_merge, self.disk_auto_clean_on_merge);
         set!(base.disk.clean_on_pr_closed, self.disk_clean_on_pr_closed);
         set!(base.disk.idle_clean_days, self.disk_idle_clean_days);
+        set!(
+            base.disk.generation_min_age_days,
+            self.disk_generation_min_age_days
+        );
         set!(base.disk.reclaim_on_low_disk, self.disk_reclaim_on_low_disk);
         set!(base.disk.sccache, self.disk_sccache);
         set!(base.disk.sccache_dir, self.disk_sccache_dir);
@@ -5859,6 +5871,10 @@ pub fn env_overlay(env: &dyn EnvSource) -> ConfigOverlay {
     }
     if let Some(v) = env.get("THEGN_DISK_IDLE_CLEAN_DAYS") {
         o.disk_idle_clean_days = parse_num(v, "THEGN_DISK_IDLE_CLEAN_DAYS").map(|n| n as u32);
+    }
+    if let Some(v) = env.get("THEGN_DISK_GENERATION_MIN_AGE_DAYS") {
+        o.disk_generation_min_age_days =
+            parse_num(v, "THEGN_DISK_GENERATION_MIN_AGE_DAYS").map(|n| n as u32);
     }
     if let Some(v) = env.get("THEGN_DISK_RECLAIM_ON_LOW_DISK") {
         o.disk_reclaim_on_low_disk = parse_bool(&v, "THEGN_DISK_RECLAIM_ON_LOW_DISK");

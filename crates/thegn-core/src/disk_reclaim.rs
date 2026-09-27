@@ -5,8 +5,9 @@
 //! is **abandonment**: a worktree nobody opened a PR for, or one the work
 //! drifted away from, quietly holding several GiB of build output forever.
 //!
-//! Two rules close that gap, and both are pure functions of already-measured
-//! facts so the decision can be unit-tested without touching a filesystem:
+//! Two rules close that worktree-level gap, and both are pure functions of
+//! already-measured facts so the decision can be unit-tested without touching a
+//! filesystem:
 //!
 //! * **Idle TTL** ([`Policy::idle_days`]) — a worktree with no file touched
 //!   anywhere in it (source *or* `target/`) for N days has its `target/`
@@ -26,11 +27,18 @@
 //! artifacts on an otherwise-roomy disk. Free percentage adapts to the disk and
 //! stays silent while there is room.
 //!
-//! **The trade-off, stated plainly:** an unexpected cold rebuild costs an agent
-//! mid-task real wall-clock. Every guard here exists to make that impossible for
-//! a worktree anyone is actually using — the active one, one with a running
-//! build, one touched recently — and the idle default is set far enough out
-//! (two weeks) that tripping it means the worktree was abandoned, not paused.
+//! A separate generation rule limits accumulation inside an active `target/`:
+//! it requires an age floor and keeps the newest touched fingerprint footprint
+//! per package name. This is a retention invariant, not an oracle for whether
+//! Cargo will use an artifact in a future build, and it makes no bound on the
+//! resulting rebuild cost.
+//!
+//! **The worktree-level trade-off, stated plainly:** an unexpected cold rebuild
+//! costs an agent mid-task real wall-clock. Its guards keep cleanup away from a
+//! worktree anyone is using — the active one, one with a running build, one
+//! touched recently — and the idle default is set far enough out (two weeks)
+//! that tripping it means the worktree was abandoned, not paused. Generation
+//! pruning has the narrower retention guarantee documented above.
 
 /// A worktree the reclaimer may consider, as measured by the background disk
 /// scan. Everything here is already known to the caller — nothing in this module
@@ -114,6 +122,91 @@ pub struct Reclaim {
     pub bytes: u64,
     /// Which rule fired.
     pub reason: Reason,
+}
+
+/// One Cargo fingerprint generation and its measured, host-resolved footprint.
+/// `package_name` comes from the fingerprint directory name; `generation_id`
+/// is that directory's opaque suffix and is never interpreted by the policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Generation {
+    pub package_name: String,
+    pub generation_id: String,
+    pub newest_mtime_secs: u64,
+    pub bytes: u64,
+}
+
+/// Age floor for pruning generation footprints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GenerationPolicy {
+    pub min_age_secs: u64,
+}
+
+/// A selected generation footprint. The host resolves these identifiers back
+/// to the already-enumerated paths; this policy never performs I/O.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GenerationEviction {
+    pub package_name: String,
+    pub generation_id: String,
+    pub bytes: u64,
+}
+
+/// Select old generations while preserving the most recently touched footprint
+/// for every package name. Equal mtimes retain the lexically greatest ID,
+/// giving a stable newest choice when timestamps have only second precision.
+/// Duplicate package/ID rows are ignored after their first occurrence.
+pub fn plan_generations(
+    inventory: &[Generation],
+    policy: GenerationPolicy,
+    now_secs: u64,
+) -> Vec<GenerationEviction> {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let mut newest: BTreeMap<&str, (&str, u64)> = BTreeMap::new();
+    let mut seen = BTreeSet::new();
+    let mut unique = Vec::new();
+    for generation in inventory {
+        if !seen.insert((
+            generation.package_name.as_str(),
+            generation.generation_id.as_str(),
+        )) {
+            continue;
+        }
+        unique.push(generation);
+        let candidate = (
+            generation.generation_id.as_str(),
+            generation.newest_mtime_secs,
+        );
+        newest
+            .entry(&generation.package_name)
+            .and_modify(|current| {
+                if (candidate.1, candidate.0) > (current.1, current.0) {
+                    *current = candidate;
+                }
+            })
+            .or_insert(candidate);
+    }
+
+    let mut evictions: Vec<_> = unique
+        .iter()
+        .filter(|generation| {
+            let Some((newest_id, _)) = newest.get(generation.package_name.as_str()) else {
+                return false;
+            };
+            generation.generation_id.as_str() != *newest_id
+                && now_secs.saturating_sub(generation.newest_mtime_secs) >= policy.min_age_secs
+        })
+        .map(|generation| GenerationEviction {
+            package_name: generation.package_name.clone(),
+            generation_id: generation.generation_id.clone(),
+            bytes: generation.bytes,
+        })
+        .collect();
+    evictions.sort_by(|a, b| {
+        a.package_name
+            .cmp(&b.package_name)
+            .then(a.generation_id.cmp(&b.generation_id))
+    });
+    evictions
 }
 
 /// Below this a `target/` is not worth a cold rebuild: an empty or barely-warm
@@ -486,5 +579,69 @@ mod tests {
     fn reason_notes_read_as_english() {
         assert_eq!(Reason::Idle { days: 21 }.note(), "idle 21d");
         assert_eq!(Reason::LowDisk { free_pct: 7 }.note(), "low disk (7% free)");
+    }
+
+    fn generation(package_name: &str, id: &str, mtime: u64, bytes: u64) -> Generation {
+        Generation {
+            package_name: package_name.into(),
+            generation_id: id.into(),
+            newest_mtime_secs: mtime,
+            bytes,
+        }
+    }
+
+    #[test]
+    fn generation_policy_keeps_newest_per_package_and_respects_age_floor() {
+        let inventory = [
+            generation("thegn_core", "old", 10, 100),
+            generation("thegn_core", "young", 95, 200),
+            generation("thegn_core", "newest", 100, 300),
+            generation("other", "only", 1, 400),
+        ];
+        let got = plan_generations(&inventory, GenerationPolicy { min_age_secs: 10 }, 100);
+        assert_eq!(
+            got,
+            vec![GenerationEviction {
+                package_name: "thegn_core".into(),
+                generation_id: "old".into(),
+                bytes: 100
+            }]
+        );
+    }
+
+    #[test]
+    fn generation_policy_handles_floor_boundary_future_times_ties_and_duplicates() {
+        let inventory = [
+            generation("pkg", "a", 90, 11),
+            generation("pkg", "b", 90, 12),
+            generation("pkg", "future", 110, 13),
+            generation("pkg", "a", 90, 99), // duplicate identity uses first row
+        ];
+        let got = plan_generations(&inventory, GenerationPolicy { min_age_secs: 10 }, 100);
+        assert_eq!(
+            got,
+            vec![
+                GenerationEviction {
+                    package_name: "pkg".into(),
+                    generation_id: "a".into(),
+                    bytes: 11
+                },
+                GenerationEviction {
+                    package_name: "pkg".into(),
+                    generation_id: "b".into(),
+                    bytes: 12
+                }
+            ]
+        );
+        assert_eq!(got.iter().map(|entry| entry.bytes).sum::<u64>(), 23);
+        assert!(plan_generations(&[], GenerationPolicy { min_age_secs: 0 }, 100).is_empty());
+        assert!(
+            plan_generations(
+                &[generation("pkg", "", 0, 1)],
+                GenerationPolicy { min_age_secs: 0 },
+                100
+            )
+            .is_empty()
+        );
     }
 }

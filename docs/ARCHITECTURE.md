@@ -322,6 +322,19 @@ on cache writes are the sanctioned best-effort pattern and are marked
 **Gate:** `db_tests` migration ladder; `let_underscore_future = deny`;
 `test/ignored-result-ratchet.txt`.
 
+The background disk scan also prunes Cargo fingerprint generations for profiles
+measured in that round. `[disk] generation_min_age_days` defaults to 14, matching
+`idle_clean_days`; a footprint is eligible only after that age and the newest
+touched footprint for each package name is retained. Each profile's existing
+`.cargo-lock` must be acquired nonblocking and held through pruning; lock errors
+skip that profile. The host removes the fingerprint directory before its mapped
+`deps/` and `incremental/` paths. If interrupted, Cargo sees a missing
+fingerprint and rebuilds rather than treating a missing output as fresh. This
+guarantees only the retention rule; it makes no claim about the rebuild cost of
+a mistaken footprint association. Structured per-profile logs keep measured
+generation bytes, planned bytes, successfully removed bytes, remaining measured
+bytes, and failures separate from whole-`target/` reclamation.
+
 ## 10. Sandboxing
 
 A worktree's interactive process can run in a container (podman → docker →

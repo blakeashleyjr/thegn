@@ -1809,6 +1809,9 @@ command = "git diff"
 #                              #   a worktree with no PR, or one the work drifted away from.
 #                              #   Exempt: the active worktree, a running build, uncommitted
 #                              #   changes, and any target/ under 256 MiB. 0 = off.
+# generation_min_age_days = 14 # reap stale Cargo fingerprint footprints only after
+#                              #   this many untouched days, matching idle_clean_days.
+#                              #   The newest footprint per package is always retained.
 # reclaim_on_low_disk = true   # under real disk pressure evict least-recently-touched
 #                              #   target/ dirs until free space is back above
 #                              #   [stats] disk_free_warn. Engages only at/below
