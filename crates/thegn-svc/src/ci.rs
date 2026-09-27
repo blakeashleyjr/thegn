@@ -1252,7 +1252,7 @@ mod tests {
         assert_eq!(
             command
                 .get_envs()
-                .find(|(key, _)| key == "GITLAB_HOST")
+                .find(|(key, _)| *key == std::ffi::OsStr::new("GITLAB_HOST"))
                 .and_then(|(_, value)| value)
                 .map(|value| value.to_string_lossy().into_owned())
                 .as_deref(),
