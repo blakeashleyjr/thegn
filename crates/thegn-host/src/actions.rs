@@ -331,16 +331,18 @@ pub(crate) fn spawn_ci_detail(
         let db = thegn_core::db::Db::open().ok();
         let client = thegn_svc::ci::provider_for(&loc, &cfg);
         // Full run (jobs/steps); on error keep the cached run so the header stays.
-        let detail = client
+        let (detail, discarded_jobs) = client
             .as_ref()
             .and_then(|c| c.run_detail(&loc, &run.id).ok())
-            .unwrap_or(run);
+            .map(|detail| (detail.run, detail.discarded_jobs))
+            .unwrap_or((run, 0));
         // `log_cache_runs = 0` is the explicit privacy/IO opt-out: refresh
         // ingestion, CLI, and control already honor it, so the interactive
         // drill must not bypass it by fetching provider logs on a cache miss.
         if cfg.log_cache_runs == 0 {
             let payload = crate::detail::CiDetailPayload {
                 run: detail,
+                discarded_jobs,
                 log_tail: Vec::new(),
                 log_entries: Vec::new(),
             };
@@ -417,6 +419,7 @@ pub(crate) fn spawn_ci_detail(
         }
         let payload = crate::detail::CiDetailPayload {
             run: detail,
+            discarded_jobs,
             log_tail,
             log_entries,
         };

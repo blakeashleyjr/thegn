@@ -303,8 +303,11 @@ pub(crate) fn collect_attention(
         let (mut ci_failing, mut ci_running) = (false, false);
         let (mut ci_episode, mut ci_since) = (0u64, None);
         if let Ok(Some((json, _))) = db.get_ci_cache(path)
-            && let Ok(runs) = serde_json::from_str::<Vec<thegn_core::ci::CiRun>>(&json)
-            && let Some(latest) = runs.first()
+            && let Some(cache) = thegn_core::ci::decode_run_cache(&json)
+            && let Some(latest) = cache
+                .runs
+                .iter()
+                .find(|run| thegn_svc::ci::validate_ci_id(&run.id).is_ok())
         {
             ci_failing = latest.state.is_failure();
             ci_running = matches!(
@@ -668,7 +671,7 @@ mod tests {
         db.put_worktree("app/c", "/repo", "/wt/c", "c", None, None)
             .unwrap();
         let failing = serde_json::to_string(&vec![thegn_core::ci::CiRun {
-            id: "run-1".into(),
+            id: "101".into(),
             state: thegn_core::ci::CiState::Fail,
             started_at: Some("2026-06-25T10:00:00Z".into()),
             ..Default::default()
@@ -714,7 +717,7 @@ mod tests {
 
         // A genuinely NEW run is a new episode and does re-nag.
         let next_run = serde_json::to_string(&vec![thegn_core::ci::CiRun {
-            id: "run-2".into(),
+            id: "102".into(),
             state: thegn_core::ci::CiState::Fail,
             started_at: Some("2026-06-25T11:00:00Z".into()),
             ..Default::default()
@@ -737,7 +740,7 @@ mod tests {
         db.put_worktree("app/o", "/repo", "/wt/o", "o", None, None)
             .unwrap();
         let failing = serde_json::to_string(&vec![thegn_core::ci::CiRun {
-            id: "run-1".into(),
+            id: "101".into(),
             state: thegn_core::ci::CiState::Fail,
             ..Default::default()
         }])

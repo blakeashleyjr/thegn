@@ -1297,12 +1297,18 @@ impl ControlApi for DaemonService {
                 .ok()
                 .flatten();
             if let Some((json, fetched_at)) = cached
-                && let Ok(mut runs) = serde_json::from_str::<Vec<thegn_core::ci::CiRun>>(&json)
+                && let Some(mut cache) = thegn_core::ci::decode_run_cache(&json)
             {
-                runs.truncate(requested);
+                let before = cache.runs.len();
+                cache
+                    .runs
+                    .retain(|run| thegn_svc::ci::validate_ci_id(&run.id).is_ok());
+                cache.discarded_rows += before - cache.runs.len();
+                cache.runs.truncate(requested);
                 return Ok(thegn_svc::control::CiRunsReply {
                     worktree: path_string.clone(),
-                    runs: serde_json::to_value(runs).unwrap_or_default(),
+                    runs: serde_json::to_value(cache.runs).unwrap_or_default(),
+                    discarded_rows: cache.discarded_rows,
                     source: "cache".into(),
                     fetched_at,
                 });
@@ -1325,7 +1331,10 @@ impl ControlApi for DaemonService {
             .map_err(|e| ControlError::Internal(anyhow::anyhow!("CI runs task join: {e}")))?
             .map_err(ControlError::Internal)?;
             let fetched_at = thegn_core::util::now();
-            if let Ok(json) = serde_json::to_string(&fetched) {
+            if let Ok(json) = serde_json::to_string(&thegn_core::ci::CiRunCache {
+                runs: fetched.runs.clone(),
+                discarded_rows: fetched.discarded_rows,
+            }) {
                 let key_for_write = key.clone();
                 let _ = self
                     .with_db(move |db| {
@@ -1336,7 +1345,8 @@ impl ControlApi for DaemonService {
             }
             Ok(thegn_svc::control::CiRunsReply {
                 worktree: path_string,
-                runs: serde_json::to_value(fetched).unwrap_or_default(),
+                runs: serde_json::to_value(fetched.runs).unwrap_or_default(),
+                discarded_rows: fetched.discarded_rows,
                 source: "provider".into(),
                 fetched_at,
             })
@@ -1355,6 +1365,10 @@ impl ControlApi for DaemonService {
         tail_lines: Option<usize>,
     ) -> BoxFuture<'a, ControlResult<thegn_svc::control::CiLogsReply>> {
         Box::pin(async move {
+            thegn_svc::ci::validate_ci_id(run_id)
+                .map_err(|error| ControlError::InvalidArgument(error.to_string()))?;
+            thegn_svc::ci::validate_ci_id(job_id)
+                .map_err(|error| ControlError::InvalidArgument(error.to_string()))?;
             let path = if worktree.is_empty() {
                 std::env::current_dir().map_err(|e| ControlError::Internal(e.into()))?
             } else {
@@ -1381,6 +1395,12 @@ impl ControlApi for DaemonService {
             } else {
                 None
             };
+            let cached = cached.filter(|entry| {
+                entry.run_id == run_id_owned
+                    && entry.job_id == job_id_owned
+                    && thegn_svc::ci::validate_ci_id(&entry.run_id).is_ok()
+                    && thegn_svc::ci::validate_ci_id(&entry.job_id).is_ok()
+            });
             if let Some(mut entry) = cached {
                 if let Some(lines) = tail_lines {
                     let (text, truncated) = thegn_core::ci_log::bounded_tail(
@@ -1418,13 +1438,18 @@ impl ControlApi for DaemonService {
                 let client = thegn_svc::ci::provider_for(&loc, &cfg)
                     .ok_or_else(|| anyhow::anyhow!("no CI provider for this worktree"))?;
                 let detail = client.run_detail(&loc, &run_for_provider).ok();
+                if let Some(detail) = &detail
+                    && detail.discarded_jobs > 0
+                {
+                    tracing::warn!(target: "thegn::ci", discarded_rows = detail.discarded_jobs, "CI detail omitted malformed job rows");
+                }
                 let (job_name, head_sha) = detail
                     .as_ref()
-                    .and_then(|run| {
-                        run.jobs
+                    .and_then(|detail| {
+                        detail.run.jobs
                             .iter()
                             .find(|job| job.id == job_for_provider)
-                            .map(|job| (job.name.clone(), run.sha.clone()))
+                            .map(|job| (job.name.clone(), detail.run.sha.clone()))
                     })
                     .unwrap_or_default();
                 let raw = client
@@ -2012,6 +2037,23 @@ impl ControlApi for DaemonService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn ci_logs_rejects_malformed_ids_before_cache_or_provider_access() {
+        let (service, _) = service(0);
+        for (run_id, job_id) in [
+            ("--help", "1"),
+            ("01", "1"),
+            ("1", "1e5"),
+            ("1%2f2", "2"),
+            ("1", "1#fragment"),
+        ] {
+            let result = service
+                .ci_logs("/does/not/need/to/exist", run_id, job_id, None)
+                .await;
+            assert!(matches!(result, Err(ControlError::InvalidArgument(_))));
+        }
+    }
 
     /// Build a service with an in-memory DB and no live sessions — enough to
     /// exercise the lease bookkeeping glue (`on_session_idle` / `on_session_busy`)
