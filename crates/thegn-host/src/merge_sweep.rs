@@ -47,6 +47,8 @@ pub struct SweepReport {
     pub kept_changed: Vec<String>,
     /// Branches removed after admitting ignored-only build state.
     pub discarded_build_state: Vec<String>,
+    /// Branches removed after admitting exact Rust-seeded tool state.
+    pub discarded_tool_state: Vec<String>,
     /// Refused or failed physical cleanup, with an actionable reason.
     pub kept: Vec<(String, String)>,
     /// Enumeration or post-removal bookkeeping failures, never "collected".
@@ -60,6 +62,7 @@ impl SweepReport {
             && self.kept_dirty.is_empty()
             && self.kept_changed.is_empty()
             && self.discarded_build_state.is_empty()
+            && self.discarded_tool_state.is_empty()
             && self.kept.is_empty()
             && self.bookkeeping_errors.is_empty()
     }
@@ -308,6 +311,7 @@ fn sweep_with_db(cfg: &Config, repo_root: &Path, force: bool, db: &Db) -> SweepR
         ) {
             CleanupOutcome::Removed {
                 discarded_build_state,
+                discarded_tool_state,
                 bookkeeping_errors,
                 queue_removed,
                 ..
@@ -315,6 +319,9 @@ fn sweep_with_db(cfg: &Config, repo_root: &Path, force: bool, db: &Db) -> SweepR
                 report.collected.push(entry.branch.clone());
                 if discarded_build_state {
                     report.discarded_build_state.push(entry.branch.clone());
+                }
+                if discarded_tool_state {
+                    report.discarded_tool_state.push(entry.branch.clone());
                 }
                 if queue_removed {
                     report.cleared_rows.push(entry.worktree.clone());
@@ -389,6 +396,12 @@ pub fn spawn(cfg: Config, dir: std::path::PathBuf) {
         for b in &report.discarded_build_state {
             thegn_core::msg::info(&format!(
                 "merge queue: swept {} (discarded build state)",
+                safe_display(b)
+            ));
+        }
+        for b in &report.discarded_tool_state {
+            thegn_core::msg::info(&format!(
+                "merge queue: swept {} (discarded seeded tool state)",
                 safe_display(b)
             ));
         }
@@ -476,6 +489,20 @@ mod tests {
         db.update_merge_status(wt.to_str().unwrap(), "landed", Some(&oid), None, None)
             .unwrap();
         (root, wt)
+    }
+
+    fn seed_unignored(cfg: &Config, worktree: &Path) {
+        crate::skill_seed::seed(cfg, worktree, thegn_core::skills::SeedPhase::Create).unwrap();
+        let exclude = thegn_core::util::git_common_dir(worktree)
+            .join("info")
+            .join("exclude");
+        let contents = std::fs::read_to_string(&exclude).unwrap_or_default();
+        let visible = contents
+            .lines()
+            .filter(|line| !line.contains(".claude/"))
+            .map(|line| format!("{line}\n"))
+            .collect::<String>();
+        std::fs::write(exclude, visible).unwrap();
     }
 
     #[test]
@@ -779,7 +806,18 @@ mod tests {
 
     #[test]
     fn landed_worktree_status_matrix_respects_expiry_and_force_without_discarding_edits() {
-        let states = ["clean", "ignored", "tracked", "untracked"];
+        let states = [
+            "clean",
+            "ignored",
+            "seeded",
+            "seeded_ignored",
+            "seeded_modified",
+            "seeded_unknown",
+            "seeded_untracked",
+            "seeded_tracked",
+            "tracked",
+            "untracked",
+        ];
         for state in states {
             for force in [false, true] {
                 let isolation = crate::merge_lifecycle::TestIsolation::new();
@@ -789,10 +827,40 @@ mod tests {
                 let db = Db::open_at(&db_path).unwrap();
                 let name = format!("matrix-{state}-{}", if force { "force" } else { "due" });
                 let (root, wt) = fixture(&parent, &name, &db, &isolation);
+                let mut cfg = local_config();
+                cfg.merge_queue.on_landed = OnLanded::Expire;
+                cfg.merge_queue.target_branch = "main".into();
+                cfg.merge_queue.merged_ttl_secs = 1;
                 match state {
                     "clean" => {}
                     "ignored" => {
                         std::fs::write(wt.join("ignored"), "build output\n").unwrap();
+                    }
+                    "seeded" => seed_unignored(&cfg, &wt),
+                    "seeded_ignored" => {
+                        crate::skill_seed::seed(&cfg, &wt, thegn_core::skills::SeedPhase::Create)
+                            .unwrap();
+                    }
+                    "seeded_modified" => {
+                        seed_unignored(&cfg, &wt);
+                        std::fs::write(
+                            wt.join(".claude/skills/mq/SKILL.md"),
+                            "user-edited skill\n",
+                        )
+                        .unwrap();
+                    }
+                    "seeded_unknown" => {
+                        seed_unignored(&cfg, &wt);
+                        std::fs::write(wt.join(".claude/skills/mq/notes.md"), "user-owned\n")
+                            .unwrap();
+                    }
+                    "seeded_untracked" => {
+                        seed_unignored(&cfg, &wt);
+                        std::fs::write(wt.join("user-file"), "user work\n").unwrap();
+                    }
+                    "seeded_tracked" => {
+                        seed_unignored(&cfg, &wt);
+                        std::fs::write(wt.join("tracked"), "user edit\n").unwrap();
                     }
                     "tracked" => {
                         std::fs::write(wt.join("tracked"), "edited user work\n").unwrap();
@@ -807,12 +875,8 @@ mod tests {
                     .execute("UPDATE merge_queue SET queued_at=1, updated_at=1", [])
                     .unwrap();
                 let before = db.list_merge_queue().unwrap();
-                let mut cfg = local_config();
-                cfg.merge_queue.on_landed = OnLanded::Expire;
-                cfg.merge_queue.target_branch = "main".into();
-                cfg.merge_queue.merged_ttl_secs = 1;
                 let report = sweep_with_db(&cfg, &root, force, &db);
-                let removable = matches!(state, "clean" | "ignored");
+                let removable = matches!(state, "clean" | "ignored" | "seeded" | "seeded_ignored");
                 if removable {
                     assert_eq!(report.collected, ["feature"], "{state}, force={force}");
                     assert!(!wt.exists(), "{state}, force={force}");
@@ -820,7 +884,16 @@ mod tests {
                     assert!(report.kept_changed.is_empty());
                     assert_eq!(
                         report.discarded_build_state,
-                        if state == "ignored" {
+                        if matches!(state, "ignored" | "seeded_ignored") {
+                            vec!["feature".to_string()]
+                        } else {
+                            Vec::<String>::new()
+                        },
+                        "{state}, force={force}"
+                    );
+                    assert_eq!(
+                        report.discarded_tool_state,
+                        if state == "seeded" {
                             vec!["feature".to_string()]
                         } else {
                             Vec::<String>::new()
@@ -831,9 +904,20 @@ mod tests {
                     assert!(db.worktree_record(wt.to_str().unwrap()).unwrap().is_none());
                 } else {
                     assert!(report.collected.is_empty(), "{state}, force={force}");
-                    assert_eq!(report.kept_dirty, ["feature"], "{state}, force={force}");
+                    let ordinary_dirty = matches!(
+                        state,
+                        "tracked" | "untracked" | "seeded_tracked" | "seeded_untracked"
+                    );
+                    if ordinary_dirty {
+                        assert_eq!(report.kept_dirty, ["feature"], "{state}, force={force}");
+                        assert!(report.kept.is_empty(), "{state}, force={force}");
+                    } else {
+                        assert!(report.kept_dirty.is_empty(), "{state}, force={force}");
+                        assert_eq!(report.kept.len(), 1, "{state}, force={force}");
+                    }
                     assert!(report.kept_changed.is_empty());
                     assert!(report.discarded_build_state.is_empty());
+                    assert!(report.discarded_tool_state.is_empty());
                     assert!(wt.exists(), "{state}, force={force}");
                     assert_eq!(db.list_merge_queue().unwrap(), before);
                     assert!(db.worktree_record(wt.to_str().unwrap()).unwrap().is_some());
