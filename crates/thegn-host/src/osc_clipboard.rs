@@ -21,6 +21,8 @@ enum State {
 }
 
 #[derive(Debug, Default)]
+// Reset this parser only through `pty_drain::reset_terminal_streams`, which
+// also resets the query parser; register any third streaming parser there.
 pub(crate) struct Clipboard {
     state: State,
     partial: Vec<u8>,
