@@ -338,6 +338,32 @@ impl Fixture {
             None,
         )
     }
+
+    fn seed_unignored(&self, cfg: &thegn_core::config::Config) {
+        crate::skill_seed::seed(cfg, &self.wt, thegn_core::skills::SeedPhase::Create).unwrap();
+        let exclude = thegn_core::util::git_common_dir(&self.wt)
+            .join("info")
+            .join("exclude");
+        let contents = std::fs::read_to_string(&exclude).unwrap_or_default();
+        let visible = contents
+            .lines()
+            .filter(|line| !line.contains(".claude/"))
+            .map(|line| format!("{line}\n"))
+            .collect::<String>();
+        std::fs::write(exclude, visible).unwrap();
+    }
+
+    fn seeded_probe(&self, cfg: &thegn_core::config::Config) -> Result<Verified, Refusal> {
+        self.seed_unignored(cfg);
+        Verified::probe_with_config(
+            &self.root,
+            self.wt.to_str().unwrap(),
+            "feature",
+            "main",
+            None,
+            cfg,
+        )
+    }
 }
 
 #[test]
@@ -422,6 +448,201 @@ fn status_observation_accepts_only_well_formed_ignored_records() {
             "{:?}",
             String::from_utf8_lossy(malformed)
         );
+    }
+}
+
+#[test]
+fn exact_unignored_seeded_state_is_admitted_and_reported_separately() {
+    let _isolation = TestIsolation::new();
+    let fixture = Fixture::new();
+    let mut cfg = thegn_core::config::Config::default();
+    cfg.sandbox.enabled = false;
+    let verified = fixture
+        .seeded_probe(&cfg)
+        .expect("exact Rust-seeded files are removable in a non-ignoring repo");
+    assert!(verified.discarded_tool_state());
+    assert!(!verified.discarded_build_state());
+    verified.remove().unwrap();
+    assert!(!fixture.wt.exists());
+}
+
+#[test]
+fn modified_or_unknown_seeded_path_is_protected_with_an_actionable_reason() {
+    let _isolation = TestIsolation::new();
+    let fixture = Fixture::new();
+    let mut cfg = thegn_core::config::Config::default();
+    cfg.sandbox.enabled = false;
+    fixture.seed_unignored(&cfg);
+    std::fs::write(
+        fixture.wt.join(".claude/skills/mq/SKILL.md"),
+        "user-edited skill\n",
+    )
+    .unwrap();
+    assert!(matches!(
+        Verified::probe_with_config(
+            &fixture.root,
+            fixture.wt.to_str().unwrap(),
+            "feature",
+            "main",
+            None,
+            &cfg,
+        ),
+        Err(Refusal::ManagedChanged(path)) if path == ".claude/skills/mq/SKILL.md"
+    ));
+
+    let fixture = Fixture::new();
+    fixture.seed_unignored(&cfg);
+    let unknown = fixture.wt.join(".claude/skills/mq/notes.md");
+    std::fs::write(&unknown, "user-owned\n").unwrap();
+    assert!(matches!(
+        Verified::probe_with_config(
+            &fixture.root,
+            fixture.wt.to_str().unwrap(),
+            "feature",
+            "main",
+            None,
+            &cfg,
+        ),
+        Err(Refusal::UnrecognizedToolState(path)) if path == ".claude/skills/mq/notes.md"
+    ));
+    assert!(unknown.exists());
+}
+
+/// Authority is deliberately independent of today's `skills.exclude` and
+/// `[merge_queue] enabled`.
+///
+/// A file seeded before the exclusion was configured is still thegn's own
+/// output, and narrowing authority by the live config is what makes the sweep
+/// permanently refuse a worktree over state the tool itself wrote — the exact
+/// defect THE-693 exists to remove. Byte identity, not configuration, is the
+/// safety property: to be admitted here the content must match what this
+/// writer produces, and that is checked again immediately before the unlink.
+///
+/// The accepted cost is narrow: someone who excludes `mq` *and* keeps an
+/// untracked byte-identical copy of thegn's own command loses a file that is
+/// regenerable from the binary. The companion test below pins the property
+/// that actually protects real work — one edited byte and it is refused.
+#[test]
+fn excluded_raw_legacy_command_is_still_recognized_as_seeded_tool_state() {
+    let _isolation = TestIsolation::new();
+    let fixture = Fixture::new();
+    let mut cfg = thegn_core::config::Config::default();
+    cfg.sandbox.enabled = false;
+    cfg.skills.exclude = vec!["mq".into()];
+
+    let command = fixture.wt.join(".claude/commands/mq-add.md");
+    std::fs::create_dir_all(command.parent().unwrap()).unwrap();
+    std::fs::write(
+        &command,
+        include_str!("../../../extensions/commands/mq-add.md"),
+    )
+    .unwrap();
+    let authority = crate::skill_seed::managed_seed_files(&cfg).unwrap();
+
+    // Exclusion does not revoke recognition: the worktree is ADMITTED rather than
+    // refused as unrecognized user work. Admission is the whole property here —
+    // the removal itself is `Verified::remove`, covered by
+    // `exact_unignored_seeded_state_is_admitted_and_reported_separately`.
+    let result = clean_with_authority(&fixture.wt, Some(&authority));
+    assert!(
+        result.is_ok(),
+        "an exact copy of thegn's own command is tool state, not user work: {:?}",
+        result.err()
+    );
+}
+
+/// The guard that matters: one edited byte makes the same path user work, under
+/// the same configuration as the test above.
+#[test]
+fn edited_legacy_command_is_refused_even_though_the_path_is_seedable() {
+    let _isolation = TestIsolation::new();
+    let fixture = Fixture::new();
+    let mut cfg = thegn_core::config::Config::default();
+    cfg.sandbox.enabled = false;
+    cfg.skills.exclude = vec!["mq".into()];
+
+    let command = fixture.wt.join(".claude/commands/mq-add.md");
+    std::fs::create_dir_all(command.parent().unwrap()).unwrap();
+    let mut edited = include_str!("../../../extensions/commands/mq-add.md").to_string();
+    edited.push_str("\nmy own note\n");
+    std::fs::write(&command, &edited).unwrap();
+    let authority = crate::skill_seed::managed_seed_files(&cfg).unwrap();
+
+    // `ManagedChanged`, not `UnrecognizedToolState`: authority recognizes the
+    // path and the bytes do not match, which is the more specific of the two
+    // observations and the one an operator can act on.
+    let result = clean_with_authority(&fixture.wt, Some(&authority));
+    assert!(
+        matches!(
+            &result,
+            Err(Refusal::ManagedChanged(path)) if path == ".claude/commands/mq-add.md"
+        ),
+        "an edited command must be refused, got {result:?}"
+    );
+    assert!(command.exists());
+}
+
+#[test]
+fn seeded_file_replacement_between_validation_and_unlink_is_refused() {
+    let _isolation = TestIsolation::new();
+    let fixture = Fixture::new();
+    let mut cfg = thegn_core::config::Config::default();
+    cfg.sandbox.enabled = false;
+    fixture.seed_unignored(&cfg);
+
+    let relative = PathBuf::from(".claude/skills/supervise/SKILL.md");
+    let path = fixture.wt.join(&relative);
+    let original = std::fs::read(&path).unwrap();
+    let authority = crate::skill_seed::managed_seed_files(&cfg).unwrap();
+    assert!(authority.expected(&relative).is_some());
+    let replacement = b"user replacement at the validation boundary\n";
+    let result = remove_seeded_files_with_hook(
+        &fixture.wt,
+        std::slice::from_ref(&relative),
+        Some(&authority),
+        &|| {
+            std::fs::rename(&path, path.with_extension("old")).unwrap();
+            std::fs::write(&path, replacement).unwrap();
+        },
+    );
+
+    assert!(matches!(
+        result,
+        Err(Refusal::ManagedChanged(ref path))
+            if path == ".claude/skills/supervise/SKILL.md"
+    ));
+    assert_eq!(std::fs::read(&path).unwrap(), replacement);
+    assert_eq!(std::fs::read(path.with_extension("old")).unwrap(), original);
+}
+
+#[test]
+fn seeded_state_does_not_hide_a_real_user_record() {
+    let _isolation = TestIsolation::new();
+    for tracked in [false, true] {
+        let fixture = Fixture::new();
+        let mut cfg = thegn_core::config::Config::default();
+        cfg.sandbox.enabled = false;
+        fixture.seed_unignored(&cfg);
+        if tracked {
+            std::fs::write(fixture.wt.join("tracked"), "user edit\n").unwrap();
+        } else {
+            std::fs::write(fixture.wt.join("user-file"), "user work\n").unwrap();
+        }
+        assert!(
+            matches!(
+                Verified::probe_with_config(
+                    &fixture.root,
+                    fixture.wt.to_str().unwrap(),
+                    "feature",
+                    "main",
+                    None,
+                    &cfg,
+                ),
+                Err(Refusal::Dirty)
+            ),
+            "tracked={tracked}"
+        );
+        assert!(fixture.wt.exists());
     }
 }
 

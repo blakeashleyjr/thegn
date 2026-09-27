@@ -1,0 +1,15 @@
+{
+  "id": "THE-693",
+  "title": "thegn's own seeded .claude/ blocks the sweep in any repo that does not gitignore it, and reports it as operator edits",
+  "url": "https://linear.app/blakeashley/issue/THE-693/thegns-own-seeded-claude-blocks-the-sweep-in-any-repo-that-does-not",
+  "priority": "High",
+  "labels": [
+    "Bug"
+  ],
+  "status": "Backlog",
+  "team": "Thegn",
+  "primary_file": "crates/thegn-host/src/merge_cleanup.rs",
+  "chain": "7th cause of 'merge sweep collects nothing'; THE-685/686/687/688/690 landed, THE-692 in review",
+  "measured": "cms repo: 11 worktrees, 0 tracked edits, only blocker is '?? .claude/' which thegn seeds; thegn's own .gitignore:21 has .claude/* so its worktrees sweep and other repos' never do",
+  "note": "Commit 50b32ab2 on main is labelled fix(the-693) but is the UNRELATED grace-clock fix \u2014 a placeholder branch name that collided with this issue number."
+}

@@ -559,10 +559,65 @@ pub fn open_directory_nofollow(path: &std::path::Path) -> std::io::Result<std::f
     Ok(file)
 }
 
+/// Windows has no openat equivalent in the Win32 surface used by this crate.
+/// Keep the pinned parent descriptor in the operation, and open the leaf with
+/// the no-reparse seam; unlinking below acts on that validated leaf handle.
+pub(crate) fn platform_open_cleanup_file_at(
+    _parent: &std::fs::File,
+    parent_path: &std::path::Path,
+    name: &std::ffi::OsStr,
+) -> std::io::Result<std::fs::File> {
+    open_nofollow(&parent_path.join(name))
+}
+
+pub(crate) fn platform_cleanup_file_identity(
+    file: &std::fs::File,
+) -> std::io::Result<super::CleanupFileIdentity> {
+    let (device, high, low, links) = handle_identity_with_links(file)?;
+    Ok(super::CleanupFileIdentity {
+        device: u64::from(device),
+        inode: (u64::from(high) << 32) | u64::from(low),
+        links: u64::from(links),
+    })
+}
+
+pub(crate) fn platform_unlink_cleanup_file_at(
+    _parent: &std::fs::File,
+    _parent_path: &std::path::Path,
+    _name: &std::ffi::OsStr,
+    file: &std::fs::File,
+) -> std::io::Result<()> {
+    use std::mem::size_of;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_DISPOSITION_INFO, FileDispositionInfo, SetFileInformationByHandle,
+    };
+    let disposition = FILE_DISPOSITION_INFO { DeleteFile: 1 };
+    // SAFETY: `file` is our open, validated regular-file handle and the
+    // disposition structure is the documented fixed-size input for this API.
+    if unsafe {
+        SetFileInformationByHandle(
+            file.as_raw_handle(),
+            FileDispositionInfo,
+            (&disposition as *const FILE_DISPOSITION_INFO).cast(),
+            size_of::<FILE_DISPOSITION_INFO>() as u32,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// Stable handle identity for retained file/directory custody. This avoids
 /// the unstable `std::os::windows::fs::MetadataExt` by using the documented
 /// Win32 handle query already available through windows-sys 0.59.
 pub(crate) fn handle_identity(file: &std::fs::File) -> std::io::Result<(u32, u32, u32)> {
+    let (volume, high, low, _) = handle_identity_with_links(file)?;
+    Ok((volume, high, low))
+}
+
+fn handle_identity_with_links(file: &std::fs::File) -> std::io::Result<(u32, u32, u32, u32)> {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::{
         BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
@@ -579,6 +634,7 @@ pub(crate) fn handle_identity(file: &std::fs::File) -> std::io::Result<(u32, u32
         info.dwVolumeSerialNumber,
         info.nFileIndexHigh,
         info.nFileIndexLow,
+        info.nNumberOfLinks,
     ))
 }
 

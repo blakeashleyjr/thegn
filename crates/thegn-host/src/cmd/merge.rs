@@ -561,15 +561,21 @@ fn sweep(cfg: &Config, force: bool) -> Result<()> {
     let report = crate::merge_sweep::sweep(cfg, &root, force);
     use crate::merge_sweep::safe_display;
     for b in &report.collected {
-        if report
+        let discarded_build = report
             .discarded_build_state
             .iter()
-            .any(|discarded| discarded == b)
-        {
-            outln!("  ⌫ swept {} (discarded build state)", safe_display(b));
-        } else {
-            outln!("  ⌫ swept {}", safe_display(b));
-        }
+            .any(|discarded| discarded == b);
+        let discarded_tool = report
+            .discarded_tool_state
+            .iter()
+            .any(|discarded| discarded == b);
+        let reason = match (discarded_build, discarded_tool) {
+            (true, true) => " (discarded build and seeded tool state)",
+            (true, false) => " (discarded build state)",
+            (false, true) => " (discarded seeded tool state)",
+            (false, false) => "",
+        };
+        outln!("  ⌫ swept {}{}", safe_display(b), reason);
     }
     for b in &report.kept_dirty {
         outln!("  • kept {} — edited since landing", safe_display(b));

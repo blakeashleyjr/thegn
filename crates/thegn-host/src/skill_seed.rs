@@ -4,7 +4,7 @@
 //! is the only runtime boundary that discovers user packages or writes skill
 //! files into a worktree.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read as _, Write as _};
 use std::path::{Component, Path, PathBuf};
 
@@ -33,6 +33,143 @@ const MQ_COMMANDS: &[LegacyCommand] = &[
 struct LegacyCommand {
     relative: &'static str,
     body: &'static str,
+}
+
+/// Exact filesystem proof for files this module can seed into a worktree.
+///
+/// Cleanup must share this authority with the writer. A directory name alone
+/// is not ownership proof: a user may put an unrelated file below a native
+/// skill root, or edit a file thegn previously wrote. Keeping the expected
+/// bytes here also makes the legacy MQ command table part of the same contract
+/// instead of a second allowlist in merge cleanup.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ManagedSeedFiles {
+    expected: BTreeMap<PathBuf, BTreeSet<Vec<u8>>>,
+    roots: BTreeSet<PathBuf>,
+}
+
+impl ManagedSeedFiles {
+    fn add_root(&mut self, root: impl Into<PathBuf>) {
+        self.roots.insert(root.into());
+    }
+
+    fn add_file(&mut self, path: impl Into<PathBuf>, bytes: impl Into<Vec<u8>>) {
+        self.expected
+            .entry(path.into())
+            .or_default()
+            .insert(bytes.into());
+    }
+
+    pub(crate) fn expected(&self, path: &Path) -> Option<&BTreeSet<Vec<u8>>> {
+        self.expected.get(path)
+    }
+
+    pub(crate) fn is_managed_root(&self, path: &Path) -> bool {
+        self.roots.iter().any(|root| path.starts_with(root))
+    }
+}
+
+/// Build the one authority shared by Rust-owned seeders and merge cleanup.
+///
+/// Discovery failures are deliberately fatal to the authority. Cleanup refuses
+/// the candidate rather than classifying an untracked generated-looking path
+/// when the seeder could not prove which files it owns. OpenSpec/dev-shell
+/// output is intentionally absent: it is not written by this Rust seeder and
+/// therefore remains protected user work.
+pub(crate) fn managed_seed_files(cfg: &Config) -> Result<ManagedSeedFiles, String> {
+    if !cfg.skills.enabled {
+        return Ok(ManagedSeedFiles::default());
+    }
+
+    let loaded = load_registry(cfg);
+    if !loaded.complete {
+        return Err("skill registry discovery was incomplete".into());
+    }
+    let (harnesses, diagnostics) = configured_harnesses(cfg);
+    if !diagnostics.is_empty() {
+        return Err(diagnostics.join("; "));
+    }
+
+    // Authority is deliberately computed WITHOUT the current exclusions and
+    // gates. The question cleanup asks is "could this module have written these
+    // exact bytes here?", not "would it write them under today's config" — a
+    // file seeded while `[merge_queue] enabled` was true is still thegn's file
+    // after the key is flipped, and a skill added to `skills.exclude` later
+    // does not unwrite what it already seeded. Narrowing authority by the live
+    // config is the same substitution of a cheap proxy for the real question
+    // that this whole area exists to fix, and it fails in the direction that
+    // blames the operator for the tool's own state.
+    //
+    // Breadth costs nothing: every removal still requires an exact byte match
+    // against this set (`cleanup_file_matches`), so a claim can only ever
+    // authorise deleting bytes this writer is able to produce.
+    const ALL_GATES: [GateState; 4] = [
+        GateState {
+            merge_queue_open: false,
+            pipeline_open: false,
+        },
+        GateState {
+            merge_queue_open: true,
+            pipeline_open: false,
+        },
+        GateState {
+            merge_queue_open: false,
+            pipeline_open: true,
+        },
+        GateState {
+            merge_queue_open: true,
+            pipeline_open: true,
+        },
+    ];
+    let mut managed = ManagedSeedFiles::default();
+    for harness_id in harnesses {
+        let Some(harness) = thegn_core::harness::harness(&harness_id) else {
+            return Err(format!("unknown harness {harness_id:?}"));
+        };
+        let Some(layout) = harness.skill_layout() else {
+            continue;
+        };
+        let root = PathBuf::from(layout.project_root);
+        managed.add_root(root.clone());
+        // The writer applies this same pure plan at each lifecycle phase, so
+        // union every (phase, gate) combination it could have been called with.
+        // An empty survey makes `writes` the effective output bytes without
+        // inspecting or trusting the worktree.
+        for phase in [SeedPhase::Create, SeedPhase::Startup, SeedPhase::Explicit] {
+            for gates in ALL_GATES {
+                let target = thegn_core::skills::SeedTarget::new(
+                    &harness_id,
+                    phase,
+                    std::iter::empty::<String>(),
+                );
+                let plan = plan_seed(&loaded.registry, &target, &[], gates);
+                if !plan.diagnostics.is_empty() {
+                    return Err(plan.diagnostics.join("; "));
+                }
+                for operation in plan.writes {
+                    managed.add_file(root.join(operation.relative), operation.contents);
+                }
+            }
+        }
+
+        if harness_id == "claude" {
+            let command_root = PathBuf::from(".claude/commands");
+            managed.add_root(command_root);
+            for command in MQ_COMMANDS {
+                // Both forms are valid historical output from the same writer:
+                // disabled merge-queue seeding retained the raw body, while
+                // enabled seeding writes the marker-wrapped rendering. Neither
+                // is gated on today's `[merge_queue] enabled`, for the reason
+                // given at ALL_GATES.
+                managed.add_file(command.relative, command.body.as_bytes().to_vec());
+                managed.add_file(
+                    command.relative,
+                    render_managed_legacy(command.body).into_bytes(),
+                );
+            }
+        }
+    }
+    Ok(managed)
 }
 
 /// A registry plus every edge diagnostic encountered while discovering it.
