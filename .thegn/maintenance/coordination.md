@@ -1,150 +1,93 @@
-# Coordination brief — THE-692
+# Coordination brief — THE-677
 
-Sixth and **largest** cause in the merged-worktree sweep chain. Five causes are
-already fixed and landed — THE-685 (`0a3e3150`), THE-686 (`2acdf364`), THE-687 and
-THE-688 (`e1a64f61`), THE-690 (`052a4bd9` + `6b7f7cc9`) — and `thegn merge sweep`
-**now genuinely collects**: it swept 9 worktrees, the directories are gone, and a
-second run reports "Nothing to sweep."
+`target/` is 91 GiB, with 15.1 GiB in stale generations of integration-test
+binaries. The issue body is unusually good — measured numbers, an explicit
+estimate, two named traps, and three options with a recommendation. Read it
+carefully; it has done much of your work.
 
-But the repo owner's sidebar is still full, because those 9 were the minority.
+## The primary's decision on direction
 
-## What the primary already measured — build on it, do not redo it
+Take the **third** option: extend `thegn_core::disk_reclaim`. The issue's own
+reasoning is right and matches CLAUDE.md — that module already owns this policy
+as pure, tested code and already runs at the tail of the background disk scan.
+`cargo-sweep` would add a dependency and a second policy home; `clean-aux` is a
+manual recipe, not a policy.
 
-```
-worktrees: 47 ; with NO merge_queue row: 33
-```
+## Respect the two traps, they are both real
 
-All 33 are merged into `main`. They can never be swept, because
-`merge_sweep::landed_entries` selects candidates from exactly one place:
+1. **No `Cargo.lock` entry does not mean orphaned** — `tests/*.rs` integration
+   binaries legitimately have none. A naive scan flags 86 names and is wrong
+   about 85 of them.
+2. **An old mtime does not mean dead.** Cargo does not touch files on a cache
+   hit, so a 40-day-old rlib may be the live artifact. An age-based prune trades
+   disk for rebuild time, and on this machine a full rebuild is the most
+   expensive thing available.
 
-```rust
-db.list_merge_queue()?.into_iter()
-    .filter(|r| r.status == "landed" && r.target_branch == target)
-```
+So the policy cannot be "old" or "not in the lockfile". It must identify a
+**superseded generation** — a non-live artifact for a target that has a newer
+one. If you cannot determine liveness reliably, say so and propose what would
+make it determinable; do not guess and delete.
 
-and **`thegn land` never writes such a row.** `crates/thegn-host/src/cmd/land.rs`
-contains no `record_merge_outcome`, no `persist_merge_outcome`, no
-`update_merge_status`. Its only bookkeeping is
-`merge_lifecycle::apply_landed_in_place_checked`, which (at
-`merge_lifecycle.rs:162-180`) only files the worktree into a sidebar folder and
-explicitly **bails** if the lifecycle ever asks for worktree removal.
+## Hard requirements
 
-So the landing is filed as _Merged_ in the sidebar and never enters the
-grace-period lifecycle. `merged_ttl_secs` cannot apply to a row that does not
-exist.
+- Policy lives in `thegn_core::disk_reclaim`, **pure and unit-tested** like its
+  neighbours, and honours the existing exemptions: active worktree, running
+  build, uncommitted work.
+- **Never removes the live generation.** The acceptance criterion is behavioural:
+  a subsequent `just test` must not trigger a full-workspace rebuild. State how
+  your tests establish that without running a full build.
+- Report reclaimed bytes; record before/after.
+- `thegn-core` is substrate-free and gated at 95% lines — new core logic needs
+  unit tests.
 
-Re-verify these citations and report them confirmed (or moved); the primary does
-not expect them to have changed.
+## Line numbers in the issue are STALE
 
-## Why this one matters more than the other five
+Citations come from an audit commit (`299fc13` or similar), not current `main`.
+Batch 2 found three issues whose headline defect was already fixed and two whose
+file inventory was wrong. **Re-verify every citation on this branch, and report
+an already-met criterion as met, with evidence, rather than re-fixing it.**
 
-`thegn land` is the **canonical** landing path in this repo, not a side road.
-CLAUDE.md is explicit: the canonical checkout's working tree is read-only, so
-`git checkout main && git merge` fails, and `thegn land` is the documented
-one-shot fold + gate + CAS ref advance. The fold-actor uses it for every landing.
+## Cargo — attempt it, and say plainly if you cannot
 
-So the recommended way to land produces worktrees the cleanup machinery
-structurally cannot clean, while `merge add` + `merge drain` produces ones it can.
-Identical end state in git; two different lifecycle outcomes. That asymmetry is
-the bug.
+Attempt `nix develop --command cargo check -p <crate> --all-targets` and a narrow
+`cargo nextest run -p <crate> <filter>`. **The pipeline sandbox mounts
+`/nix/store` read-only, so `nix develop` usually fails outright** — if it does,
+say exactly that and stop. The primary runs clippy, the full workspace nextest
+and smoke centrally.
 
-## The identity is already in hand — no derivation needed
+**Never report `implementation-ready` for code you could not compile.** Every lane
+in the previous chain shipped something that did not build — an ambiguous
+`Vec::new()`, a by-value row where a reference was wanted, a `PathBuf` never
+imported, a `String` read of a nullable column, an unqualified function path, a
+test reaching for a private method. The primary caught each one. That division of
+labour is expected and is not held against you; an optimistic report is.
 
-`AttemptOutcome::Landed { commit, resyncs }` (`integrate.rs:1443-1446`) carries
-the fold tip now at the target ref, and `land.rs` already destructures it to print
-`✓ landed {branch} → {target} @ {commit}`. So the non-empty `result_oid` that
-THE-687 made mandatory for a landed row is available at exactly the point the row
-should be written. **Do not** reach for THE-687's `derive_landed_commit` here;
-that exists to repair rows written without an OID, and writing a fresh row that
-needs repairing would be perverse.
+## Testing traps, all measured on this machine
 
-## What to implement
-
-Record a landed merge outcome (worktree, branch, target, `commit`) on
-`AttemptOutcome::Landed`, through the **validated** writer, so a landed worktree
-enters the same grace-period lifecycle a drained one does.
-
-Hard requirements:
-
-- **Validated writer only.** THE-687 added `landed ⇒ non-empty result_oid` guards
-  to `replace_merge_status`/`update_merge_status` and the invariant in
-  `db_aux.rs:119-124`. Go through them; do not hand-roll an INSERT.
-- **No row for a land that did not land.** `Ready`, `Conflict`, gate-red and every
-  refusal path must write nothing.
-- **No row when the landed path is the repo root.** `apply_landed_in_place_checked`
-  already guards that case; match it.
-- **Keep `land`'s degraded-reporting discipline.** By this point git has already
-  landed and the ref has already advanced. A DB failure must be surfaced as
-  degraded post-land state — the file already does this for sidebar bookkeeping,
-  with a comment explaining that a non-zero exit here invites a destructive retry.
-  Follow that pattern exactly; do not turn a bookkeeping failure into a land
-  failure.
-- **The grace clock starts at the land.** `merge_sweep` reads `updated_at` as the
-  clock (`landed_at: r.updated_at`), so the row's timestamp must be the land, not
-  an earlier enqueue and not a later touch.
-
-## A trap the primary hit today, in this exact area
-
-THE-687's backfill wrote `SET result_oid=?, updated_at=?`. Because `updated_at`
-**is** the grace clock, repairing a missing OID silently **reset the grace period**
-on the four rows it fixed, pushing them out another seven days. The primary is
-fixing that separately.
-
-The lesson for you: any write to a landed row must be deliberate about
-`updated_at`. Writing a _new_ row at land time should set it to now — that is the
-clock starting. Touching an _existing_ landed row must not move it.
-
-## Out of scope
-
-- **THE-689** (accepted cleanup races) and **THE-691** (admission not uniform
-  across the CLI). Both filed, both deferred. Do not absorb them.
-- The five landed fixes in this chain. Preserve them; do not refactor.
-- The `merge add` / `merge drain` queue path, TTL arithmetic, branch-retention
-  holds (THE-596), and the OCI/tenancy/dispatch/layout guards.
-
-## Acceptance criteria
-
-- [ ] After `thegn land`, the worktree has a `merge_queue` row with
-      `status='landed'`, the right `target_branch`, and the fold commit as
-      `result_oid`.
-- [ ] That worktree is swept once `merged_ttl_secs` has elapsed, every existing
-      guard still applying.
-- [ ] `Ready`, `Conflict` and gate-failure outcomes write no landed row.
-- [ ] A land whose worktree is the repo root writes no row.
-- [ ] A DB failure after the git land is reported as degraded and the land still
-      exits zero.
-- [ ] The grace clock starts at the land.
-- [ ] Tests cover a land-then-sweep round trip and each non-landed outcome writing
-      nothing.
-
-## Testing traps, measured in this area today
-
-- **Use nextest, never `cargo test`.** `TestIsolation` mutates process-wide env, so
-  threaded `cargo test` cross-contaminates.
-- Fixture git commands need `-c commit.gpgsign=false`; global signing is on and an
+- **Use nextest, never `cargo test`.** `TestIsolation` mutates process-wide env,
+  so threaded `cargo test` cross-contaminates: one gate test failed under
+  `cargo test` and passed under nextest.
+- Fixture git commands need `-c commit.gpgsign=false`. Global signing is on and an
   unconfigured fixture hangs ~120s instead of failing.
-- **`merge_sweep::due` treats `merged_ttl_secs = 0` as "never sweep"** and returns
-  no entries. A smoke helper set 0 while being named `sweep_fixture_due`, so every
-  non-`--force` case it fed was vacuous and one was silently failing. For a
-  clock-only assertion use `ttl = 1` and wait for real expiry.
-- **`just smoke` is a real gate here.** It has caught two things in this chain that
-  clippy and 9200+ unit tests did not.
-- **A fixture written from the same mental model as the code proves nothing about
-  the real interface.** THE-690's parser passed its unit tests and its smoke shim
-  and still refused everything against the installed `docker`, because both
-  fixtures modelled the parser's own assumption. If you touch anything that reads
-  external output, capture the real thing.
+- **A new `section.key` trips THREE ratchets** (config example coverage, env
+  overlay, config validate). Name them if you add one.
+- **`#[expect(...)]` on an item used only under `cfg(test)`** becomes _unfulfilled_
+  in the test build. Use `#[cfg_attr(not(test), expect(lint, reason = ...))]`, or
+  `#[cfg(test)]` on the item if only fixtures use it.
+- **`--all-targets` dead-code warnings come from the NON-test build.** They say
+  nothing about whether fixtures use the item — do not delete on that basis.
+- **A fixture built from the same mental model as the code proves nothing about
+  the real interface.** A parser in the previous chain passed its unit tests AND
+  its own smoke shim, then refused everything against the real `docker`, because
+  both fixtures modelled the parser's own assumption. If you touch anything that
+  reads external output, capture the real thing (`cat -A`) first.
+- **A worker running a DB migration from its shell mutates the LIVE database.**
+  Use isolated fixture DBs; never point `XDG_STATE_HOME` at the live path for
+  anything but the final `dispatch report`.
 
-## Cargo
+## Scope discipline
 
-Attempt `nix develop --command cargo check -p thegn-host --all-targets` and a
-narrow `cargo nextest run -p thegn-host land`. **The pipeline sandbox mounts
-`/nix/store` read-only, so this usually fails outright** — if it does, say exactly
-that and stop. The primary runs clippy, the full workspace nextest and smoke
-centrally.
-
-Never report `implementation-ready` for code you could not compile; state what you
-could not run. Every lane in this chain shipped code that did not compile — an
-ambiguous `Vec::new()`, a by-value row where a reference was wanted, a `PathBuf`
-never imported, a `String` read of a nullable column — and the primary caught each
-one. That is the expected division of labour, so report honestly.
+No new features. If an acceptance criterion needs a design decision beyond the
+stated scope, **stop and report the blocker** rather than silently omitting it or
+inventing a boundary. Flagging an unmet criterion is a good outcome; quietly
+dropping it is the one thing that wastes a whole round.

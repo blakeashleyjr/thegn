@@ -1,14 +1,11 @@
 {
-  "id": "THE-692",
-  "title": "thegn land never records a landed merge_queue row, so a canonically-landed worktree is never swept",
-  "url": "https://linear.app/blakeashley/issue/THE-692/thegn-land-never-records-a-landed-merge-queue-row-so-a-canonically",
-  "priority": "High",
-  "labels": [
-    "Bug"
-  ],
-  "status": "Backlog",
+  "id": "THE-677",
+  "title": "Reap stale build-artifact generations: target/ is 91 GiB",
+  "url": "https://linear.app/blakeashley/issue/THE-677/reap-stale-build-artifact-generations-target-is-91-gib",
+  "priority": "Low",
+  "labels": ["Improvement"],
+  "status": "Todo",
   "team": "Thegn",
-  "primary_file": "crates/thegn-host/src/cmd/land.rs",
-  "chain": "6th and largest cause of 'merge sweep collects nothing'; THE-685/686/687/688/690 all landed and the sweep now collects for queue-landed worktrees only",
-  "measured": "33 of 47 registered worktrees have no merge_queue row at all"
+  "gitBranchName": "blake/the-677-reap-stale-build-artifact-generations-target-is-91-gib",
+  "description": "Cargo never reaps old artifact generations, and this workspace has accumulated 42 of them per test binary.\n\n**Estimate:** an hour to wire a tool; the policy decision is the real content.\n\n## Measured (2026-09-15)\n\n* `target/` total: **91 GiB**\n* **15.1 GiB** in stale generations of integration-test binaries. `iroh_fly_live` alone holds **1.53 GiB across 42 files**; `sprites_live` 935 MiB; `sprites_mock` 875 MiB; `machine0_live` 798 MiB; `vps_do_mock`, `vps_mock`, `fly_mock`, `fly_live`, `vps_live` ~700 MiB each.\n* `thegn_core` retains **19 distinct rlib hashes**, up to 121 MiB each.\n* 5.75 GiB of `target/{debug,release}/deps` is older than 30 days; 3.13 GiB older than 60.\n* Already reclaimed: 279 MB of orphaned `polars-*` rlibs (polars is in no manifest, no lockfile, and no test target - genuinely foreign).\n\n## Two traps to avoid\n\n1. **\"No `Cargo.lock` entry\" does not mean orphaned.** A naive scan flags 86 names, but most are *integration-test binaries* - `tests/*.rs` targets legitimately have no lockfile entry. Only `polars` was genuinely foreign.\n2. **An old mtime does not mean dead.** Cargo does not touch files on a cache hit, so a 40-day-old rlib may still be the live artifact for an unchanged dependency. An age-based prune therefore **trades disk for rebuild time** - it is not free, and on this machine a full rebuild is the most expensive thing available (CLAUDE.md's dev-loop policy exists for exactly this reason).\n\n## Options\n\n* `cargo-sweep` (not currently installed; available in nixpkgs) - add to `flake.nix`'s dev shell and wire a `just` recipe.\n* Extend `just clean-aux`, which already reaps the coverage/cross/doc crate graphs, to cover stale generations.\n* Extend `[disk] idle_clean_days` / `reclaim_on_low_disk`, which today evict whole `target/` dirs for idle worktrees, to prune *within* an active one.\n\nThe third is the most thegn-shaped: `thegn_core::disk_reclaim` already owns this policy as pure, tested code, and it already runs at the tail of the background disk scan.\n\n## Acceptance criteria\n\n- [ ] A documented, repeatable way to reclaim stale generations.\n- [ ] Never removes the live generation - verify a subsequent `just test` does not trigger a full-workspace rebuild.\n- [ ] If it lands in `disk_reclaim`, the policy is pure and unit-tested like its neighbours, and respects the existing exemptions (active worktree, running build, uncommitted work).\n- [ ] Reclaimed bytes reported, before/after recorded.\n\n## Context\n\nCLAUDE.md documents a prior audit finding ~101 GiB across 8 worktrees, and the three mitigations already in place (`debug = 0` for deps, `idle_clean_days`, `clean-aux`). This is the gap those three do not cover: generation churn inside one active target dir."
 }
