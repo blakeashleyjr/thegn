@@ -1011,9 +1011,20 @@ fn gate_isolation_never_advances_or_blames_candidate() {
     drop(held);
 }
 
-#[cfg(unix)]
+/// `sleep N` as a gate command is POSIX-shell-only. Skip at RUNTIME rather than
+/// with `#[cfg(unix)]`: this file is not on `test/platform-cfg-host-ratchet.txt`
+/// and the ratchet is shrink-only, so a platform `#[cfg]` here fails the build —
+/// and a test that compiles everywhere and skips is worth more than one that does
+/// not exist on Windows, because it still type-checks there.
+fn posix_shell_gate_only() -> bool {
+    thegn_core::sandbox_backend::host_os() != thegn_core::sandbox_backend::HostOs::Windows
+}
+
 #[test]
 fn timeout_is_a_public_hold_and_a_live_group_quarantines_the_reused_lease() {
+    if !posix_shell_gate_only() {
+        return;
+    }
     let f = Fixture::new();
     if !f.supported_or_refused() {
         return;
@@ -1127,9 +1138,11 @@ fn setup_failure_keeps_exit_code_and_does_not_run_gate() {
     }
 }
 
-#[cfg(unix)]
 #[test]
 fn setup_timeout_is_an_infrastructure_hold_and_does_not_run_gate() {
+    if !posix_shell_gate_only() {
+        return;
+    }
     let f = Fixture::new();
     let marker = f.root.path().join("gate-ran-after-setup-timeout");
     let mut config = f.config.clone();
