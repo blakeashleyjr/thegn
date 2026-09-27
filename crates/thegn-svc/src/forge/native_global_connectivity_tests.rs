@@ -1,6 +1,6 @@
 //! Actual SDK-to-global-state assertions run in one exact owned test child.
 //! The ordinary parent is safe alongside other tests that report connectivity.
-use super::regression_tests::{Layer, client, runtime};
+use super::regression_tests::{Layer, client, client_with_delay, runtime};
 use super::*;
 use std::fs::{self, File};
 use std::io::{Read, Write};
