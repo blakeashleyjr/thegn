@@ -113,6 +113,7 @@ pub struct PtyPane {
     /// `history` on newline or when it exceeds 4096 bytes.
     history_partial: Vec<u8>,
     pub(crate) clipboard: crate::queries::clipboard::Clipboard,
+    pub(crate) query_parser: crate::queries::QueryParser,
     /// Stateful ANSI stripper carried across PTY read chunks so sequences that
     /// arrive split at a chunk boundary are handled correctly.
     history_stripper: AnsiStripper,
@@ -388,6 +389,7 @@ impl PtyPane {
             history: HistoryBuffer::new(10_000),
             history_partial: Vec::new(),
             clipboard: crate::queries::clipboard::Clipboard::default(),
+            query_parser: crate::queries::QueryParser::default(),
             history_stripper: AnsiStripper::default(),
             pid: pty.pid,
             child_reaped: Some(pty.reaped),
@@ -472,6 +474,7 @@ impl PtyPane {
             history: HistoryBuffer::new(10_000),
             history_partial: Vec::new(),
             clipboard: crate::queries::clipboard::Clipboard::default(),
+            query_parser: crate::queries::QueryParser::default(),
             history_stripper: AnsiStripper::default(),
             pid: None,
             child_reaped: None,
@@ -884,6 +887,7 @@ impl PtyPane {
             history: HistoryBuffer::new(10_000),
             history_partial: Vec::new(),
             clipboard: crate::queries::clipboard::Clipboard::default(),
+            query_parser: crate::queries::QueryParser::default(),
             history_stripper: AnsiStripper::default(),
             pid: None,
             child_reaped: None,
@@ -1782,6 +1786,22 @@ mod tests {
         // User input stamps the input side.
         pane.write_input(b"y").unwrap();
         assert!(pane.output_stamps().1.is_some());
+    }
+
+    #[test]
+    fn host_query_reply_surfaces_full_and_closed_pane_input() {
+        let (ctrl_tx, ctrl_rx) = tokio_mpsc::channel(1);
+        let mut pane = PtyPane::test_stream(ctrl_tx, 24, 80);
+        pane.write_reply(b"first").unwrap();
+        assert!(matches!(
+            pane.write_reply(b"second"),
+            Err(StdinSendError::Full)
+        ));
+        drop(ctrl_rx);
+        assert!(matches!(
+            pane.write_reply(b"third"),
+            Err(StdinSendError::Closed)
+        ));
     }
 
     #[test]
