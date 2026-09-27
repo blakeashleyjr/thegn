@@ -1,7 +1,7 @@
 //! GitHub Issues backend via the `gh` CLI.
 //!
 //! Uses the same subprocess pattern as `thegn_core::github` — always works
-//! as long as `gh` is authenticated, even without native octocrab credentials.
+//! as long as `gh` is authenticated, even without native GitHub credentials.
 
 use serde::Deserialize;
 use std::process::Command;

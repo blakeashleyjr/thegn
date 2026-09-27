@@ -25,6 +25,12 @@ pub(crate) const MAX_BODY_BYTES: usize = 1024 * 1024;
 pub(crate) const MAX_REQUEST_BYTES: usize = 512 * 1024;
 pub(crate) const MAX_DYNAMIC_INPUT_BYTES: usize = 64 * 1024;
 
+/// A bounded JSON HTTP reply that leaves status classification to a caller.
+pub(crate) struct JsonResponseEnvelope {
+    pub(crate) status: reqwest::StatusCode,
+    pub(crate) body: Vec<u8>,
+}
+
 pub(crate) fn ensure_dynamic_input(value: &str) -> Result<(), IssueError> {
     if value.len() > MAX_DYNAMIC_INPUT_BYTES {
         Err(IssueError::BodyLimit("tracker input exceeds limit"))
@@ -74,6 +80,7 @@ pub(crate) struct TrackerHttpClient {
     authorization: String,
     provider: &'static str,
     budget: Arc<TrackerHttpBudget>,
+    operation_timeout: Duration,
 }
 
 impl TrackerHttpClient {
@@ -82,6 +89,16 @@ impl TrackerHttpClient {
         origin: &str,
         authorization: String,
         budget: Arc<TrackerHttpBudget>,
+    ) -> Result<Self, IssueError> {
+        Self::new_with_operation_timeout(provider, origin, authorization, budget, OPERATION_TIMEOUT)
+    }
+
+    pub(crate) fn new_with_operation_timeout(
+        provider: &'static str,
+        origin: &str,
+        authorization: String,
+        budget: Arc<TrackerHttpBudget>,
+        operation_timeout: Duration,
     ) -> Result<Self, IssueError> {
         let origin = parse_origin(origin)?;
         let client = Client::builder()
@@ -92,7 +109,7 @@ impl TrackerHttpClient {
             .no_zstd()
             .connect_timeout(CONNECT_TIMEOUT)
             .read_timeout(READ_IDLE_TIMEOUT)
-            .timeout(OPERATION_TIMEOUT)
+            .timeout(operation_timeout)
             .build()
             .map_err(|_| IssueError::Policy("tracker HTTP client configuration failed"))?;
         Ok(Self {
@@ -101,13 +118,14 @@ impl TrackerHttpClient {
             authorization,
             provider,
             budget,
+            operation_timeout,
         })
     }
 
     pub(crate) fn operation(&self) -> TrackerHttpOperation<'_> {
         TrackerHttpOperation {
             client: self,
-            deadline: Instant::now() + OPERATION_TIMEOUT,
+            deadline: Instant::now() + self.operation_timeout,
             permit: None,
         }
     }
@@ -237,6 +255,66 @@ impl TrackerHttpOperation<'_> {
             .body(bytes);
         let response = self.send(request).await?;
         self.decode_json(response).await
+    }
+
+    /// POST JSON and return a checked, bounded response without interpreting
+    /// non-success statuses. Callers can classify status together with body.
+    pub(crate) async fn json_envelope<B: Serialize>(
+        &mut self,
+        method: Method,
+        path: &str,
+        body: &B,
+    ) -> Result<JsonResponseEnvelope, IssueError> {
+        self.prepare().await?;
+        let bytes = serialize_bounded(body)?;
+        self.remaining()?;
+        let url = self.client.url(path)?;
+        let request = self
+            .client
+            .client
+            .request(method, url)
+            .header("Authorization", &self.client.authorization)
+            .header("Accept", "application/json")
+            .header("Content-Type", "application/json")
+            .body(bytes);
+        let response = self.send(request).await?;
+        self.check_envelope_response(&response)?;
+        let status = response.status();
+        let body = read_bounded(self.deadline, response).await?;
+        self.remaining()?;
+        #[cfg(test)]
+        self.response_consumed_for_test();
+        Ok(JsonResponseEnvelope { status, body })
+    }
+
+    fn check_envelope_response(&self, response: &Response) -> Result<(), IssueError> {
+        if response.status().is_redirection() {
+            return Err(IssueError::Policy("tracker redirect refused"));
+        }
+        if response
+            .headers()
+            .get(reqwest::header::CONTENT_ENCODING)
+            .is_some_and(|v| !v.as_bytes().eq_ignore_ascii_case(b"identity"))
+        {
+            return Err(IssueError::Policy("tracker response encoding refused"));
+        }
+        if response
+            .content_length()
+            .is_some_and(|len| len > MAX_BODY_BYTES as u64)
+        {
+            return Err(IssueError::BodyLimit("tracker response exceeds limit"));
+        }
+        let Some(content_type) = response.headers().get(reqwest::header::CONTENT_TYPE) else {
+            return Err(IssueError::Policy("tracker JSON content type missing"));
+        };
+        let content_type = content_type
+            .to_str()
+            .map_err(|_| IssueError::Policy("tracker JSON content type invalid"))?;
+        let media = content_type.split(';').next().unwrap_or("").trim();
+        if media != "application/json" && !media.ends_with("+json") {
+            return Err(IssueError::Policy("tracker JSON content type refused"));
+        }
+        Ok(())
     }
 
     pub(crate) async fn get<R>(&mut self, path: &str) -> Result<R, IssueError>
@@ -519,6 +597,11 @@ mod tests {
             "/encoding" => (StatusCode::OK, Body::from(r#"{"ok":true}"#)).into_response(),
             "/bad-mime" => (StatusCode::OK, Body::from(r#"{"ok":true}"#)).into_response(),
             "/unauthorized" => (StatusCode::UNAUTHORIZED, Body::empty()).into_response(),
+            "/rate-limit" => (
+                StatusCode::FORBIDDEN,
+                Body::from(r#"{"message":"API rate limit exceeded"}"#),
+            )
+                .into_response(),
             "/large" => {
                 (StatusCode::OK, Body::from(vec![b'x'; MAX_BODY_BYTES + 1])).into_response()
             }
@@ -532,7 +615,7 @@ mod tests {
             _ => (StatusCode::NOT_FOUND, Body::empty()).into_response(),
         };
         match request.uri().path() {
-            "/ok" | "/encoding" | "/bad-mime" | "/large" | "/chunked" => {
+            "/ok" | "/encoding" | "/bad-mime" | "/rate-limit" | "/large" | "/chunked" => {
                 response.headers_mut().insert(
                     reqwest::header::CONTENT_TYPE,
                     HeaderValue::from_static("application/json"),
@@ -581,6 +664,53 @@ mod tests {
         let mut ok = client.operation();
         let value: serde_json::Value = ok.get("/ok").await.unwrap();
         assert_eq!(value["ok"], true);
+
+        let mut envelope = client.operation();
+        let response = envelope
+            .json_envelope(
+                Method::POST,
+                "/rate-limit",
+                &serde_json::json!({"query":"fixture"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&response.body).unwrap()["message"],
+            "API rate limit exceeded"
+        );
+
+        let mut envelope_redirect = client.operation();
+        assert!(matches!(
+            envelope_redirect
+                .json_envelope(Method::POST, "/redirect", &serde_json::json!({}))
+                .await,
+            Err(IssueError::Policy("tracker redirect refused"))
+        ));
+
+        let mut envelope_encoding = client.operation();
+        assert!(matches!(
+            envelope_encoding
+                .json_envelope(Method::POST, "/encoding", &serde_json::json!({}))
+                .await,
+            Err(IssueError::Policy("tracker response encoding refused"))
+        ));
+
+        let mut envelope_mime = client.operation();
+        assert!(matches!(
+            envelope_mime
+                .json_envelope(Method::POST, "/bad-mime", &serde_json::json!({}))
+                .await,
+            Err(IssueError::Policy("tracker JSON content type refused"))
+        ));
+
+        let mut envelope_size = client.operation();
+        assert!(matches!(
+            envelope_size
+                .json_envelope(Method::POST, "/large", &serde_json::json!({}))
+                .await,
+            Err(IssueError::BodyLimit("tracker response exceeds limit"))
+        ));
 
         let mut redirect = client.operation();
         assert!(matches!(

@@ -239,7 +239,7 @@ impl Forge for Ladder<dyn Forge> {
 // Factory + routing
 // ---------------------------------------------------------------------------
 
-/// The GitHub ladder: native octocrab reads over the `gh` CLI.
+/// The GitHub ladder: native shared-HTTP reads over the `gh` CLI.
 pub fn github(enterprise: bool) -> Ladder<dyn Forge> {
     Ladder::new(
         if enterprise { "ghe" } else { "github" },

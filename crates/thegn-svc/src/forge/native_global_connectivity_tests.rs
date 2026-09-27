@@ -284,7 +284,6 @@ fn isolated_sdk_connectivity_child() {
                 &client(status, &body.to_string()),
                 &serde_json::json!({"query":"private fixture"}),
                 "fixture",
-                Duration::from_secs(1),
                 &health,
             )
             .await;
@@ -314,32 +313,33 @@ fn isolated_sdk_connectivity_child() {
             let fallback = matches!(expected_error, Some(ForgeError::NotConfigured(_)));
             assert_ladder(result.map(|value| parse_graphql_pr_list(&value)), fallback);
         }
-        for stall in [false, true] {
+        for client in [
+            {
+                let unused = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                let address = unused.local_addr().unwrap();
+                drop(unused);
+                TrackerHttpClient::new_with_operation_timeout(
+                    "github-test",
+                    &format!("http://{address}"),
+                    "Bearer fixture".into(),
+                    Arc::new(TrackerHttpBudget::with_permits(8)),
+                    Duration::from_millis(200),
+                )
+                .unwrap()
+            },
+            client_with_delay(
+                200,
+                r#"{"data":{}}"#,
+                Some(Duration::from_secs(1)),
+                Duration::from_millis(30),
+            ),
+        ] {
             seed(false);
-            let service = tower::service_fn(
-                move |_: axum::http::Request<octocrab::OctoBody>| async move {
-                    if stall {
-                        std::future::pending::<()>().await;
-                    }
-                    Err::<axum::http::Response<http_body_util::Full<axum::body::Bytes>>, _>(
-                        std::io::Error::new(
-                            std::io::ErrorKind::ConnectionRefused,
-                            "private fixture transport",
-                        ),
-                    )
-                },
-            );
-            let client = octocrab::OctocrabBuilder::new_empty()
-                .with_service(service)
-                .with_auth(octocrab::AuthState::None)
-                .build()
-                .unwrap();
             let health = GhCircuit::new();
             let result = graphql_request(
                 &client,
                 &serde_json::json!({"query":"private fixture"}),
                 "fixture",
-                Duration::from_millis(30),
                 &health,
             )
             .await;
