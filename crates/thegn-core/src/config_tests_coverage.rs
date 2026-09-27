@@ -933,11 +933,14 @@ fn effective_tab_order_dedups_and_appends_missing() {
             "bogus".into(),
             "comms".into(),
             " work ".into(),
+            "observe".into(),
+            "observe".into(),
             "work".into(),
         ],
     };
-    // unknown ids dropped, trimmed, deduped; the only built-in is `work`.
-    assert_eq!(a.effective_tab_order(), vec!["work"]);
+    // Unknown ids are filtered here for tolerant callers; config validation
+    // separately refuses them. Known ids are trimmed, deduped, and completed.
+    assert_eq!(a.effective_tab_order(), vec!["work", "observe"]);
 }
 
 #[test]
@@ -946,14 +949,14 @@ fn effective_tab_order_empty_falls_back_to_builtins() {
         default_tab: "work".into(),
         tab_order: Vec::new(),
     };
-    assert_eq!(a.effective_tab_order(), vec!["work"]);
+    assert_eq!(a.effective_tab_order(), vec!["work", "observe"]);
 }
 
 #[test]
 fn normalized_default_tab_present_and_falls_back_to_first() {
     let present = AppsConfig {
         default_tab: " work ".into(),
-        tab_order: vec!["work".into()],
+        tab_order: vec!["work".into(), "observe".into()],
     };
     assert_eq!(present.normalized_default_tab(), "work");
     // Unknown default → first of the effective order (`work`).
@@ -1229,18 +1232,25 @@ fn remote_overlay_apply_sets_each_field() {
 
 #[test]
 fn env_overlay_apps_tab_order_parses_csv() {
-    let env = map_env(&[("THEGN_APPS_TAB_ORDER", " work , foo ,, bar ")]);
+    let env = map_env(&[
+        ("THEGN_APPS_TAB_ORDER", " observe , work ,, observe "),
+        ("THEGN_APPS_DEFAULT_TAB", "observe"),
+    ]);
     let o = env_overlay(&env);
-    // parse_list trims and drops empties (validity filtering happens later
-    // in effective_tab_order).
+    // Env overlays feed the same registry-aware resolver as file config.
     assert_eq!(
         o.apps_tab_order,
         Some(vec![
+            "observe".to_string(),
             "work".to_string(),
-            "foo".to_string(),
-            "bar".to_string()
+            "observe".to_string()
         ])
     );
+    let mut cfg = Config::default();
+    o.apply(&mut cfg);
+    cfg.observe.enabled = true;
+    assert_eq!(cfg.apps.default_tab, "observe");
+    assert_eq!(cfg.apps.effective_tab_order(), ["observe", "work"]);
 }
 
 #[test]
@@ -1365,8 +1375,11 @@ fn post_process_expands_pin_cwd_tilde() {
 #[test]
 fn apply_override_str_apps_tab_order_splits_csv() {
     let mut cfg = Config::default();
-    Config::apply_override_str(&mut cfg, "apps.tab_order", " work , foo ,, bar ").unwrap();
-    assert_eq!(cfg.apps.tab_order, vec!["work", "foo", "bar"]);
+    Config::apply_override_str(&mut cfg, "apps.tab_order", " observe , work ,, observe ").unwrap();
+    assert_eq!(cfg.apps.tab_order, vec!["observe", "work", "observe"]);
+    assert_eq!(cfg.apps.effective_tab_order(), ["observe", "work"]);
+    Config::apply_override_str(&mut cfg, "apps.default_tab", "observe").unwrap();
+    assert_eq!(cfg.apps.normalized_default_tab(), "observe");
 }
 
 #[test]

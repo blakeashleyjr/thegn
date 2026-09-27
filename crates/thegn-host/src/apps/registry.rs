@@ -58,6 +58,17 @@ mod tests {
             assert_eq!(builder(b.id).map(|x| x.id), Some(b.id));
         }
         assert!(builder("nope").is_none());
+        assert_eq!(
+            thegn_core::config::AppsConfig::BUILTIN_TABS
+                .into_iter()
+                .filter(|id| *id != "work")
+                .collect::<Vec<_>>(),
+            APP_BUILDERS
+                .iter()
+                .map(|builder| builder.id)
+                .collect::<Vec<_>>(),
+            "every non-work built-in tab must have a host builder on this target"
+        );
     }
 
     #[test]

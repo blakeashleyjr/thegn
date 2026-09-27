@@ -11533,6 +11533,14 @@ async fn event_loop<T: Terminal>(
             model.config_banner = crate::config_startup::banner();
             match cfg_res {
                 Ok(new_cfg) => {
+                    // Reconcile app tabs by stable id. This is chrome state:
+                    // the successful reload below forces a full relayout, and
+                    // unchanged defaults preserve the user's current tab.
+                    app_host.reconcile(&new_cfg);
+                    let selected_app = app_host.active;
+                    let _ =
+                        ensure_app_loaded(&mut app_host, selected_app, &app_tx, &waker, &new_cfg)
+                            .await;
                     keymap = rebuild_keymap(&new_cfg, &session);
                     sb.view.workspace_sort = new_cfg.ui.sidebar_workspace_sort;
                     sb.view.terminals_section = new_cfg.ui.sidebar_terminals_section;

@@ -740,12 +740,13 @@ mode = "off"               # off | suggest | auto (uses the existing PR-queue ag
 host = ""                  # self-hosted base URL; "" = gitlab.com
 token = "env:GITLAB_TOKEN"
 
-# Top-level app tab strip. "work" (your worktree IDE) is always present; the
-# "Observe" tab appears when [observe] enabled = true (below). Unknown ids ignored.
-# Valid ids: "work".
+# Top-level app tab strip. "work" (your worktree IDE) is always present;
+# "observe" is available when [observe] enabled = true (below). Order accepts
+# both ids; omitted built-in tabs are appended. Duplicate ids are ignored.
+# Unknown ids and a disabled default are rejected by `thegn config validate`.
 [apps]
-default_tab = "work" # initial tab (THEGN_APPS_DEFAULT_TAB); "work" = your worktree
-tab_order = ["work"]
+default_tab = "work" # initial tab (THEGN_APPS_DEFAULT_TAB): "work" or enabled "observe"
+tab_order = ["work", "observe"]
 
 # The embedded "Observe" observability app tab: a Grafana-style in-terminal
 # dashboard. Off by default (additive). When enabled it shows a built-in
