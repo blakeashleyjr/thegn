@@ -328,11 +328,44 @@ mod pty_owner_tests {
 
         let a = std::thread::spawn(move || owner.terminate_and_reap());
         let b = std::thread::spawn(move || owner2.terminate_and_reap());
-        assert_eq!(a.join().expect("first teardown thread"), Some(0));
-        assert_eq!(b.join().expect("second teardown thread"), Some(0));
+        let first = a.join().expect("first teardown thread");
+        let second = b.join().expect("second teardown thread");
+        // The fixture ignores TERM, so it is force-killed — it does NOT exit 0,
+        // and pinning a particular code would pin the shell's signal-reporting
+        // convention rather than anything this code decides. The property under
+        // test is that concurrent teardowns resolve through the one owner: both
+        // observe a status, and both observe the SAME one.
+        assert!(first.is_some(), "first teardown observed no status");
+        assert_eq!(
+            first, second,
+            "concurrent teardowns disagreed on the status"
+        );
 
         assert!(!pid_alive(i64::from(pid)));
-        assert!(!pid_alive(i64::from(grandchild)));
+        // `pid_alive` is `kill(pid, 0)`, which SUCCEEDS for a zombie. SIGKILL is
+        // asynchronous, and once we reap the group leader the grandchild is
+        // reparented to init — so it lingers as a zombie until init reaps it.
+        // Asserting immediately therefore races the kernel rather than the code.
+        // Poll for the pid to disappear, with a bounded deadline: this waits for
+        // an observable state change, which is not the same as padding a test
+        // with a sleep.
+        assert!(
+            awaited_death(i64::from(grandchild)),
+            "the surviving grandchild was not reaped after the group kill"
+        );
+    }
+
+    /// Wait up to two seconds for `pid` to stop existing (not merely to stop
+    /// running — see the note at the call site about zombies).
+    fn awaited_death(pid: i64) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            if !pid_alive(pid) {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        !pid_alive(pid)
     }
 
     #[test]
