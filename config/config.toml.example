@@ -4148,6 +4148,10 @@ gate_setup_command = ""       # run in the gate worktree BEFORE gate_command, to
                               # so a broken setup can neither blame a branch nor wake the agent.
                               # Runs on every gate invocation (including an in-place refresh of a
                               # reused worktree), so keep it idempotent and cheap when warm.
+gate_setup_timeout_secs = 0   # maximum setup duration; 0 disables the deadline. A timeout is
+                              # an infrastructure hold, never a red result attributed to a branch.
+gate_timeout_secs = 0         # maximum gate duration; 0 disables the deadline. Defaults stay
+                              # disabled so long-running builds are not silently rejected.
 gate_on = true                # run gate_command before advancing main
 gate_reuse_worktree = true    # reuse a stable per-repo gate worktree + target dir between folds
                               # (warm incremental rebuild instead of a cold from-scratch compile).

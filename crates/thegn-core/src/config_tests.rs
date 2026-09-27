@@ -718,6 +718,44 @@ fn sandbox_profile_defaults_and_env_overlay() {
 }
 
 #[test]
+fn merge_gate_deadlines_default_disabled_and_accept_config_and_env_overlays() {
+    let defaults = MergeQueueConfig::default();
+    assert_eq!(
+        defaults.gate_setup_timeout_secs, 0,
+        "zero disables setup deadline"
+    );
+    assert_eq!(defaults.gate_timeout_secs, 0, "zero disables gate deadline");
+
+    let mut base = MergeQueueConfig {
+        gate_timeout_secs: 45,
+        ..MergeQueueConfig::default()
+    };
+    MergeQueueOverlay {
+        gate_setup_timeout_secs: Some(12),
+        gate_timeout_secs: Some(0),
+        ..MergeQueueOverlay::default()
+    }
+    .apply(&mut base);
+    assert_eq!(base.gate_setup_timeout_secs, 12);
+    assert_eq!(base.gate_timeout_secs, 0);
+
+    let env = map_env(&[
+        ("THEGN_MERGE_QUEUE_GATE_SETUP_TIMEOUT_SECS", "17"),
+        ("THEGN_MERGE_QUEUE_GATE_TIMEOUT_SECS", "0"),
+    ]);
+    let overlay = env_overlay(&env);
+    let mut config = Config::default();
+    overlay.apply(&mut config);
+    assert_eq!(config.merge_queue.gate_setup_timeout_secs, 17);
+    assert_eq!(config.merge_queue.gate_timeout_secs, 0);
+    assert!(
+        validate_str("[merge_queue]\ngate_setup_timeout_secs = 30\ngate_timeout_secs = 0\n")
+            .is_empty()
+    );
+    assert!(!validate_str("[merge_queue]\ngate_timeout_secs = -1\n").is_empty());
+}
+
+#[test]
 fn sandbox_compiler_cache_is_off_by_default_and_env_authoritative() {
     assert_eq!(
         SandboxConfig::default().compiler_cache,
@@ -1546,6 +1584,8 @@ fn env_overlay_covers_every_knob() {
         ("THEGN_WORKSPACES_DIR", "/ws"),
         ("THEGN_BASE_BRANCH", "develop"),
         ("THEGN_BRANCH_PREFIX", "x/"),
+        ("THEGN_MERGE_QUEUE_GATE_TIMEOUT_SECS", "60"),
+        ("THEGN_MERGE_QUEUE_GATE_SETUP_TIMEOUT_SECS", "30"),
         ("THEGN_PICKER", "fzf"),
         ("THEGN_GIT_BACKEND", "cli"),
         ("THEGN_GIT_STRUCTURAL_DIFF", "difft"),
@@ -1629,6 +1669,8 @@ fn env_overlay_covers_every_knob() {
         ("THEGN_PREVIEW_ALLOW_EXTERNAL_URLS", "yes"),
     ]);
     let c = Config::load_layered(&env, &[], None);
+    assert_eq!(c.merge_queue.gate_timeout_secs, 60);
+    assert_eq!(c.merge_queue.gate_setup_timeout_secs, 30);
     assert_eq!(c.worktrees_dir, "/wt");
     assert_eq!(c.workspaces_dir, "/ws");
     assert_eq!(c.base_branch, "develop");
