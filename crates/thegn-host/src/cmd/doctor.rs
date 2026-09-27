@@ -1604,6 +1604,10 @@ fn doctor_json_with_health_and_overrides(
         "devcontainer": devcontainer_json(cfg),
         "remote_sandbox": remote_sandbox_json(cfg),
         "provider_cache": provider_cache_json(cfg),
+        "merge_gate_quarantines": crate::integrate::gate_quarantines().iter().map(|(path, reason)| serde_json::json!({
+            "path": path.display().to_string(),
+            "reason": reason,
+        })).collect::<Vec<_>>(),
         "managed_tools": managed_tools_json(cfg),
         "mcp_servers": mcp_servers_json(cfg),
         "network": network_json(cfg),
@@ -1910,6 +1914,18 @@ pub fn run(
         outln!("  {k:<13} {}", v.as_deref().unwrap_or("(unset)"));
     };
     identification_report(cfg);
+    let gate_quarantines = crate::integrate::gate_quarantines();
+    if gate_quarantines.is_empty() {
+        outln!("Merge gate workspaces: none quarantined");
+    } else {
+        outln!(
+            "Merge gate workspaces: {} quarantined; inspect before manual cleanup:",
+            gate_quarantines.len()
+        );
+        for (path, reason) in gate_quarantines {
+            outln!("  {} — {}", path.display(), reason);
+        }
+    }
     outln!(
         "Config health: {} problem(s), {} warning(s); main {}; profile {}; repo {}; detail: `thegn config validate`",
         health.problems(),
@@ -3860,6 +3876,12 @@ mod tests {
         // Tests never own a tty, so the probe is skipped and every field is
         // null — which is exactly the "unknown ⇒ assume it works" state.
         assert!(kb["ctrl_digits_reportable"].is_null());
+    }
+
+    #[test]
+    fn doctor_json_reports_quarantined_merge_gate_workspaces() {
+        let report = doctor_json(&Config::default());
+        assert!(report["merge_gate_quarantines"].is_array());
     }
 
     #[test]

@@ -202,9 +202,9 @@ merge_queue.agent_command
 # {merge,pr}_queue.agent_sandbox / agent_isolation_floor / agent_on_floor_miss —
 # the isolation the queues' agent handoff runs under. Per-queue policy chosen
 # alongside agent_command in config (and clamped by `[sandbox]`), not a launcher
-# knob; the whole `[merge_queue]`/`[pr_queue]` surface is config-only, so these
-# follow their neighbours rather than growing the first env override in either
-# section.
+# knob; ordinary `[merge_queue]`/`[pr_queue]` policy is config-only, so these
+# follow their neighbours. Gate command deadlines have explicit environment
+# overrides because operators may bound a single launch independently.
 merge_queue.agent_isolation_floor
 merge_queue.agent_max_attempts
 merge_queue.agent_on_floor_miss

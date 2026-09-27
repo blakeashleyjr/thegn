@@ -1011,6 +1011,58 @@ fn gate_isolation_never_advances_or_blames_candidate() {
     drop(held);
 }
 
+#[cfg(unix)]
+#[test]
+fn timeout_is_a_public_hold_and_a_live_group_quarantines_the_reused_lease() {
+    let f = Fixture::new();
+    if !f.supported_or_refused() {
+        return;
+    }
+    let mut timeout = f.config.clone();
+    timeout.gate_command = "sleep 3".into();
+    timeout.gate_timeout_secs = 1;
+    let report = run_fold(
+        &timeout,
+        &f.repo,
+        vec![Branch {
+            name: "candidate".into(),
+            tip: f.second.clone(),
+        }],
+    )
+    .unwrap();
+    assert!(!report.advanced);
+    assert!(report.landed.is_empty());
+    assert!(matches!(
+        report.gate,
+        crate::integrate::GateOutcome::Errored { .. }
+    ));
+    assert!(!report.deferred.iter().any(|row| row.gate_failed));
+    assert_eq!(git(&f.repo, &["rev-parse", "HEAD"]), f.first);
+
+    let mut escaped = f.config.clone();
+    escaped.gate_command = "(sleep 2 >/dev/null 2>&1) & exit 0".into();
+    escaped.gate_timeout_secs = 1;
+    let verdict = gate_tip(&f.repo, &f.first, &escaped).unwrap();
+    assert!(
+        matches!(verdict, GateVerdict::Error { reason, log } if reason.contains("quarantined") && log.contains("outlived its leader"))
+    );
+    let old_gate = gate_base_for_repo(&f.repo).join("wt");
+    assert!(gate_base_for_repo(&f.repo).join("gate.poisoned").is_file());
+
+    let marker = f.root.path().join("selected-gate-worktree");
+    let mut retry = f.config.clone();
+    retry.gate_command = format!(
+        "printf '%s' \"$THEGN_WORKTREE\" > {}",
+        util::sh_quote(marker.to_str().unwrap())
+    );
+    assert!(gate_tip(&f.repo, &f.second, &retry).unwrap().passed());
+    assert_ne!(
+        std::fs::read_to_string(marker).unwrap(),
+        old_gate.to_string_lossy().into_owned()
+    );
+    assert_eq!(git(&old_gate, &["rev-parse", "HEAD"]), f.first);
+}
+
 #[test]
 fn symlink_gate_path_is_not_followed_or_removed() {
     let f = Fixture::new();
@@ -1073,6 +1125,26 @@ fn setup_failure_keeps_exit_code_and_does_not_run_gate() {
         }
         other => panic!("expected setup infrastructure error: {other:?}"),
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn setup_timeout_is_an_infrastructure_hold_and_does_not_run_gate() {
+    let f = Fixture::new();
+    let marker = f.root.path().join("gate-ran-after-setup-timeout");
+    let mut config = f.config.clone();
+    config.gate_setup_command = "sleep 3".into();
+    config.gate_setup_timeout_secs = 1;
+    config.gate_command = format!(
+        "printf unexpected > {}",
+        util::sh_quote(marker.to_str().unwrap())
+    );
+    assert!(matches!(
+        gate_tip(&f.repo, &f.first, &config).unwrap(),
+        GateVerdict::Error { reason, .. } if reason.contains("gate_setup_command timed out")
+    ));
+    assert!(!marker.exists());
+    assert_eq!(git(&f.repo, &["rev-parse", "HEAD"]), f.first);
 }
 
 #[test]

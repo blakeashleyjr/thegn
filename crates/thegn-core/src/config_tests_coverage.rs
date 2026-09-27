@@ -993,6 +993,8 @@ fn config_overlay_apply_sets_every_field() {
         theme_glyphs: Some(GlyphMode::Unicode),
         theme_agent_glyphs: Some(AgentGlyphs::Auto),
         pr_ttl_secs: Some(99),
+        merge_queue_gate_timeout_secs: Some(45),
+        merge_queue_gate_setup_timeout_secs: Some(23),
         watch_pr_interval_secs: Some(43),
         metrics_interval_secs: Some(11.0),
         metrics_timeout_ms: Some(1234),
@@ -1069,6 +1071,8 @@ fn config_overlay_apply_sets_every_field() {
     assert_eq!(cfg.theme.colors.border.as_deref(), Some("#333333"));
     assert_eq!(cfg.theme.agent_glyphs, AgentGlyphs::Auto);
     assert_eq!(cfg.pr.ttl_secs, 99);
+    assert_eq!(cfg.merge_queue.gate_timeout_secs, 45);
+    assert_eq!(cfg.merge_queue.gate_setup_timeout_secs, 23);
     assert_eq!(cfg.watch.pr_interval_secs, 43);
     assert_eq!(cfg.metrics.interval_secs, 11.0);
     assert_eq!(cfg.metrics.timeout_ms, 1234);

@@ -71,6 +71,43 @@ clobbering uncommitted work.
 - **THEN** the target ref is not advanced and the row is marked `ready` for a
   later explicit land
 
+### Requirement: Gate output, deadlines, and cancellation preserve infrastructure holds
+
+The merge gate SHALL stream stdout and stderr into independent fixed-capacity
+byte tails. `[merge_queue] gate_setup_timeout_secs` and `gate_timeout_secs`
+SHALL bound their respective commands; zero SHALL explicitly disable that
+deadline, and both defaults SHALL be zero. Setup failure, timeout, capture or
+reader failure, and child reap failure SHALL be infrastructure holds, never a
+red verdict or a pass. The configured shell command and argv semantics SHALL
+remain unchanged. Cancellation SHALL retain child/group ownership through
+termination and direct-child reap, and retain the workspace lease until output
+readers settle. If a descendant keeps a pipe open past a configured deadline,
+the readers SHALL be stopped and joined, the reused workspace SHALL be marked
+quarantined, and future gates SHALL allocate a fresh workspace; `thegn doctor`
+SHALL report quarantined workspaces. The gate runner SHALL NOT signal a reaped
+or reused process identity. Filesystem calls that the OS cannot interrupt and
+processes stuck in uninterruptible I/O can delay completion past the command
+deadline; their workspace lease remains quarantined while ownership is
+unresolved.
+
+#### Scenario: Zero explicitly disables the command deadlines
+
+- **WHEN** both gate timeout settings are zero
+- **THEN** neither setup nor gate command receives a deadline
+
+#### Scenario: Timed out setup or gate holds without candidate blame
+
+- **WHEN** a configured setup or gate command exceeds its nonzero deadline
+- **THEN** the result is `gate_error`, the target does not advance, and the
+  command is never classified as a red candidate gate
+
+#### Scenario: A descendant retains a reused gate pipe
+
+- **WHEN** a command's direct child exits but a descendant retains stdout or
+  stderr past the configured deadline
+- **THEN** the result is `gate_error`, the gate workspace is quarantined and
+  reported by `thegn doctor`, and a later gate does not reuse or delete it
+
 #### Scenario: An already-merged branch is a no-op
 
 - **WHEN** a queued branch's tip is already an ancestor of the target
