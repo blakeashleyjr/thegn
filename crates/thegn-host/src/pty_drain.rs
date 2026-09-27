@@ -2049,6 +2049,63 @@ mod tests {
     }
 
     #[test]
+    fn every_query_survives_every_drain_fairness_boundary_once() {
+        const QUERIES: &[&[u8]] = &[
+            b"\x1b[c",
+            b"\x1b[0c",
+            b"\x1b[>c",
+            b"\x1b[>0c",
+            b"\x1b[5n",
+            b"\x1b[6n",
+            b"\x1b[?u",
+            b"\x1b[>q",
+            b"\x1b[>0q",
+            b"\x1b[18t",
+            b"\x1b[14t",
+            b"\x1b]10;?\x07",
+            b"\x1b]11;?\x07",
+            b"\x1b]10;?\x1b\\",
+            b"\x1b]11;?\x1b\\",
+            b"\x1b_Gi=31,s=1,a=q\x1b\\",
+            b"\x1b_Ga=q\x1b\\",
+        ];
+        let colors = crate::queries::PaneColors {
+            fg: (237, 240, 248),
+            bg: (11, 14, 22),
+        };
+
+        for query in QUERIES {
+            let mut expected_parser = crate::queries::QueryParser::default();
+            let expected = expected_parser.feed(query, (4, 9), (24, 80), colors);
+            assert!(!expected.is_empty(), "fixture has no reply: {query:?}");
+            for split in 1..query.len() {
+                let mut backlog = PtyBacklog::default();
+                let mut bytes = vec![b'x'; crate::loop_policy::MAX_SLICE - split];
+                bytes.extend_from_slice(query);
+                backlog.push(7, bytes);
+                let mut parser = crate::queries::QueryParser::default();
+                let mut replies = Vec::new();
+                let mut slices = Vec::new();
+                let pass = drain_backlog_work(
+                    &mut backlog,
+                    128 * 1024,
+                    Duration::from_secs(5),
+                    Instant::now(),
+                    |_, slice, current| {
+                        assert!(current);
+                        slices.push(slice.len());
+                        replies.extend(parser.feed(slice, (4, 9), (24, 80), colors));
+                    },
+                    || false,
+                );
+                assert!(pass.fed_panes.contains(&7));
+                assert_eq!(slices.first(), Some(&crate::loop_policy::MAX_SLICE));
+                assert_eq!(replies, expected, "split {split} of {query:?}");
+            }
+        }
+    }
+
+    #[test]
     fn stale_generation_tail_cannot_complete_a_query_after_barrier() {
         let mut backlog = PtyBacklog::default();
         let mut parser = crate::queries::QueryParser::default();
