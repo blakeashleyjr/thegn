@@ -192,6 +192,7 @@ struct Subscriber {
 
 pub(crate) struct SessionActor {
     meta: SessionMeta,
+    daemon_id: String,
     live: Arc<Mutex<LiveMeta>>,
     pty: PtyHandle,
     emulator: Box<dyn PaneEmulator>,
@@ -295,6 +296,7 @@ impl SessionActor {
         db: super::service::SharedDb,
         cfg: Arc<Config>,
         fork_handoff: Option<std::path::PathBuf>,
+        daemon_id: String,
     ) -> Self {
         let has_agent = is_agent_program(&meta.program, &cfg);
         let error_signatures = AgentErrorSignatures {
@@ -332,6 +334,7 @@ impl SessionActor {
             error_signatures,
             last_published_error_active: false,
             meta,
+            daemon_id,
             live,
             pty,
         }
@@ -445,11 +448,24 @@ impl SessionActor {
         // open until the child exits — and a daemon-persistent bwrap pane no
         // longer carries `--die-with-parent`, so nothing else reaps the
         // sandbox. bwrap is PID 1 of its namespace, so terminating it collapses
-        // the whole namespace. Best-effort; skipped after a natural exit, whose
-        // pid the reader thread already reaped (avoids a pid-reuse hazard).
-        if !child_exited && let Some(pid) = self.pty.pid {
-            crate::platform::terminate_pid(pid);
+        // the whole namespace. The shared process owner serializes this with
+        // the reader's natural-exit teardown.
+        super::pty_diagnostics::record(
+            &self.daemon_id,
+            &self.meta.id,
+            self.meta.pid,
+            "terminating",
+            None,
+        );
+        if !child_exited {
+            self.pty.process.terminate_and_reap();
         }
+        drop(pane_rx);
+        self.pty.reader.join_off_runtime().await;
+        // The process tree is stopped before closing the actor's PTY writer;
+        // this releases the writer thread and its pipe before recording and
+        // persistent session state are finalized below.
+        drop(stdin_tx);
 
         // Finalize any active recording FIRST, so the tombstone can carry the
         // finished `.cast` path and `session list` reports it briefly after
@@ -503,6 +519,17 @@ impl SessionActor {
         // false-positive pass until the next session-list refresh drops it.
         super::agent_error_cache::clear(&self.meta.id);
         super::fork::cleanup_handoff(self.fork_handoff.as_deref());
+        super::pty_diagnostics::record(
+            &self.daemon_id,
+            &self.meta.id,
+            self.meta.pid,
+            "teardown_complete",
+            Some(if child_exited {
+                "natural_exit_or_already_reaped"
+            } else {
+                "shutdown_terminated_and_reaped"
+            }),
+        );
         tracing::debug!(target: "thegn::daemon", session = %self.meta.id, code = ?exit_code, "session ended");
     }
 
@@ -1398,6 +1425,7 @@ mod tests {
             db.clone(),
             Arc::new(cfg),
             None,
+            "test-daemon".into(),
         );
         if let Some(cap) = sub_cap {
             actor.set_sub_cap(cap);

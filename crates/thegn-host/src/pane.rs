@@ -121,11 +121,8 @@ pub struct PtyPane {
     /// [`crate::platform::proc::cwd_of`]) at persist time so a resurrected pane
     /// can respawn where it was.
     pid: Option<u32>,
-    /// For a PTY pane: whether the reader thread has already `wait()`ed the
-    /// child, which is what makes `pid` reusable. Read by `Drop` so an explicit
-    /// reap can never signal a recycled pid. `None` for a `Stream` pane (no
-    /// local child).
-    child_reaped: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// The PTY child's shared process/group owner. `None` for Stream panes.
+    child_process: Option<crate::pane_pty::PtyProcessOwner>,
     /// A foreground command to offer relaunching (e.g. `"nvim src/main.rs"`),
     /// shown as an overlay over the pane. Set when a resurrected pane had a
     /// captured command, or when a crashed pane is kept as a husk; cleared once
@@ -198,10 +195,8 @@ pub struct PtyPane {
 /// the child a session leader, so pgid == pid) also reaps whatever it spawned
 /// — yazi's `ueberzugpp` preview helper being the one that actually grows.
 ///
-/// Two things it deliberately does NOT do:
-/// * Signal a pid the reader thread has already `wait()`ed (`child_reaped`) —
-///   that pid belongs to the OS again and could name an unrelated process.
-/// * Touch `Stream` panes. They have no local child; whether their server-side
+/// One thing it deliberately does NOT do: touch `Stream` panes. They have no
+/// local child; whether their server-side
 ///   session is killed or detached is the relay task's business, governed by
 ///   `detach_on_drop`.
 impl Drop for PtyPane {
@@ -209,18 +204,8 @@ impl Drop for PtyPane {
         if !matches!(self.io, PaneIo::Pty { .. }) {
             return;
         }
-        let reaped = self
-            .child_reaped
-            .as_ref()
-            .is_some_and(|r| r.load(std::sync::atomic::Ordering::SeqCst));
-        if reaped {
-            return;
-        }
-        if let Some(pid) = self.pid.filter(|p| *p > 0) {
-            // best-effort: a pane teardown must never fail on an already-dead
-            // child (ESRCH) — the point is only that a live one can't outlive
-            // its pane.
-            crate::platform::GroupHandle::from_pid(pid as i32).terminate();
+        if let Some(process) = &self.child_process {
+            process.terminate_and_reap();
         }
     }
 }
@@ -390,7 +375,7 @@ impl PtyPane {
             clipboard: crate::queries::clipboard::Clipboard::default(),
             history_stripper: AnsiStripper::default(),
             pid: pty.pid,
-            child_reaped: Some(pty.reaped),
+            child_process: Some(pty.process),
             pending_relaunch: None,
             session_cell: None,
             detach_on_drop: None,
@@ -474,7 +459,7 @@ impl PtyPane {
             clipboard: crate::queries::clipboard::Clipboard::default(),
             history_stripper: AnsiStripper::default(),
             pid: None,
-            child_reaped: None,
+            child_process: None,
             pending_relaunch: None,
             session_cell: Some(session_cell),
             detach_on_drop: Some(detach_on_drop),
@@ -886,7 +871,7 @@ impl PtyPane {
             clipboard: crate::queries::clipboard::Clipboard::default(),
             history_stripper: AnsiStripper::default(),
             pid: None,
-            child_reaped: None,
+            child_process: None,
             pending_relaunch: None,
             session_cell: Some(Arc::new(Mutex::new(None))),
             detach_on_drop: Some(Arc::new(std::sync::atomic::AtomicBool::new(false))),

@@ -244,6 +244,49 @@ mod proxy_pid_tests {
     }
 }
 
+#[cfg(test)]
+mod pty_owner_tests {
+    use super::*;
+    use crate::pane_pty::PtyProcessOwner;
+    use std::os::unix::process::CommandExt;
+
+    #[test]
+    fn concurrent_teardown_reaps_only_the_owned_child_group() {
+        let dir = tempfile::tempdir().expect("fixture directory");
+        let child_pid_file = dir.path().join("grandchild.pid");
+        let script = format!(
+            "trap '' TERM; (trap '' TERM; exec sleep 60) & echo $! > {}; wait",
+            child_pid_file.display()
+        );
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", &script]).process_group(0);
+        let child = command.spawn().expect("spawn owned process group");
+        let pid = child.id();
+        assert!(pid > 0 && pid <= i32::MAX as u32);
+        let owner = PtyProcessOwner::new(Box::new(child), Some(GroupHandle::from_pid(pid as i32)));
+        let owner2 = owner.clone();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !child_pid_file.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let grandchild: u32 = std::fs::read_to_string(&child_pid_file)
+            .expect("grandchild pid published")
+            .trim()
+            .parse()
+            .expect("numeric grandchild pid");
+        assert!(pid_alive(i64::from(grandchild)));
+
+        let a = std::thread::spawn(move || owner.terminate_and_reap());
+        let b = std::thread::spawn(move || owner2.terminate_and_reap());
+        let _ = a.join().expect("first teardown thread");
+        let _ = b.join().expect("second teardown thread");
+
+        assert!(!pid_alive(i64::from(pid)));
+        assert!(!pid_alive(i64::from(grandchild)));
+    }
+}
+
 fn checked_positive_pid(pid: u32) -> Option<nix::unistd::Pid> {
     (pid != 0 && pid <= i32::MAX as u32).then(|| nix::unistd::Pid::from_raw(pid as i32))
 }

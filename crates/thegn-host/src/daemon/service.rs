@@ -60,6 +60,10 @@ pub(crate) type SharedDb = Arc<Mutex<Db>>;
 pub(crate) struct DaemonService {
     pub daemon_id: String,
     pub sessions: Arc<tokio::sync::Mutex<HashMap<String, SessionEntry>>>,
+    /// Session actor receipts are retained and joined by graceful shutdown.
+    pub actor_tasks: Arc<tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    /// Once false, no new session may be admitted.
+    pub accepting: std::sync::atomic::AtomicBool,
     /// Recently-exited sessions, kept briefly so a supervisor that polls a
     /// moment late still gets the exit code and the final screen instead of a
     /// 404. Deliberately a *separate* map from `sessions`: the idle-exit check
@@ -87,6 +91,33 @@ pub(crate) struct DaemonService {
     /// exported into every session's environment as `THEGN_CONTROL_SOCKET`
     /// so a program inside a pane can reach the daemon that owns it.
     pub endpoint: String,
+}
+
+impl DaemonService {
+    /// Stop admitting sessions, terminate the snapshot of all live actors and
+    /// join their receipts. Safe to call from RPC and from daemon signal/idle
+    /// shutdown paths; repeated calls are idempotent.
+    pub(crate) async fn shutdown_sessions(&self) {
+        self.accepting
+            .store(false, std::sync::atomic::Ordering::Release);
+        let senders = self
+            .sessions
+            .lock()
+            .await
+            .values()
+            .map(|entry| entry.msg_tx.clone())
+            .collect::<Vec<_>>();
+        for tx in senders {
+            let _ = tx.send(SessionMsg::Kill).await;
+        }
+        while !self.sessions.lock().await.is_empty() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let tasks = std::mem::take(&mut *self.actor_tasks.lock().await);
+        for task in tasks {
+            let _ = task.await;
+        }
+    }
 }
 
 /// The identity a daemon session exports to its child: its own session id
@@ -451,6 +482,9 @@ impl ControlApi for DaemonService {
 
     fn open(&self, spec: OpenSpec) -> BoxFuture<'_, ControlResult<SessionInfo>> {
         Box::pin(async move {
+            if !self.accepting.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(ControlError::Conflict("daemon is shutting down".into()));
+            }
             // Hold the same per-worktree gate a migration owns exclusively.
             // Keep it through registry insertion: an open is therefore either
             // visible to migration's first listing or refused until cleanup is
@@ -1969,6 +2003,7 @@ impl ControlApi for DaemonService {
 
     fn shutdown(&self) -> BoxFuture<'_, ()> {
         Box::pin(async move {
+            self.shutdown_sessions().await;
             self.shutdown.notify_waiters();
         })
     }
@@ -1997,6 +2032,8 @@ mod tests {
         let svc = DaemonService {
             daemon_id: "d0".into(),
             sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            actor_tasks: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            accepting: std::sync::atomic::AtomicBool::new(true),
             tombs: Arc::new(tokio::sync::Mutex::new(Graveyard::new(
                 super::super::tombstone::MAX_TOMBSTONES,
                 super::super::tombstone::TOMBSTONE_TTL_MS,
