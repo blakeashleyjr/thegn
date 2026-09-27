@@ -1,7 +1,7 @@
 //! thegn-svc — the native service layer.
 //!
 //! Each external service is a provider seam (`thegn_core::seam`): a trait with
-//! a `Native` impl where one exists (gix for git reads, octocrab for GitHub)
+//! a `Native` impl where one exists (gix for git reads, shared tracker HTTP for GitHub)
 //! and a `Cli` fallback that wraps thegn-core's already-tested subprocess code,
 //! kept permanently so a native gap degrades to "slower but works," never
 //! "broken." ssh has no native impl — the `ssh` CLI is the transport.

@@ -127,9 +127,9 @@ futures = "0.3"
 # compositor — see the host crate's emulator module.
 # Minimal feature set: the host needs a multi-thread runtime (the loop blocks on
 # `poll_input(None)`, so `spawn_blocking` work must run on other threads), the
-# `#[tokio::main]` macro, and mpsc channels. svc's octocrab brings its own
-# reqwest/hyper runtime needs. The AI metrics sidecar streams a child process's
-# stdout (`spawn_ai_sidecar`), so `process` + `io-util` are needed too.
+# `#[tokio::main]` macro, and mpsc channels. The AI metrics sidecar streams a
+# child process's stdout (`spawn_ai_sidecar`), so `process` + `io-util` are
+# needed too.
 tokio = { version = "1", features = [
   "rt-multi-thread",
   "macros",
@@ -152,7 +152,6 @@ termwiz = "0.23"
 # rustls/ring stack as reqwest (single rustls in tree).
 iroh = "1.0"
 # --- native service layer (Phase 4/5) ---
-octocrab = "0.54"
 reqwest = { version = "0.12", default-features = false, features = [
   "json",
   "rustls-tls",

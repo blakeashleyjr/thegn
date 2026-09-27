@@ -72,7 +72,7 @@ double-counted. "Refs" and "files" are in-tree call sites in `crates/*/src`.
 | `gix`        |      75 (8.5%) |   32 |     4 | 2.3                          |
 | `fff-search` |      35 (4.0%) |    6 |     1 | **5.8**                      |
 | `zbus`       |      33 (3.7%) |    7 |     1 | **4.7**                      |
-| `octocrab`   |      31 (3.5%) |   17 |     3 | 1.8                          |
+| `octocrab`   |      34 (3.6%) |   17 |     3 | 2.0                          |
 | `termwiz`    |      30 (3.4%) |  307 |   144 | 0.1 — earns its place        |
 | `tokei`      |      26 (2.9%) |    3 |     2 | **8.7**                      |
 | `image`      |              8 |   32 |    12 | 0.25                         |
@@ -246,8 +246,21 @@ product except where stated.
    walk, `neo_frizbee` (already a _direct_ dependency) for SIMD matching, and
    SQLite for frecency instead of a second embedded KV store. Retires a pinned
    nightly prerelease from the critical path.
-7. **Feature-gate `octocrab`.** −31 crates and the `rsa` Marvin ignore. The `gh`
-   CLI forge path already exists, which is what makes this cheap.
+7. **Replace `octocrab` with the shared tracker HTTP client.** Completed in
+   THE-670: static lockfile closure measurement removes 34 of 947 reachable
+   packages (3.6%), including `jsonwebtoken` and `rsa`; no `rsa` path remains.
+   The `gh` CLI forge path remains the fallback.
+
+### THE-670 remeasurement (2026-09-26)
+
+After replacing the native GraphQL SDK with `TrackerHttpClient`, the lockfile
+reachability closure is 913 packages, down from 947 (34 packages, 3.6%). A
+static reverse-closure walk over all workspace package roots confirmed that
+`rsa 0.9.10` was reached only by `octocrab → jsonwebtoken → rsa` and is no
+longer reachable. The removed closure also includes `jsonwebtoken`, `p256`,
+`p384`, and `simple_asn1`. These counts are measured from the resolved lockfile,
+not the original 31-package estimate.
+
 8. **Collapse the `zbus` duplication.** Align `secret-service`/`keyring` onto
    zbus 5, or gate media control. −33 crates for the full removal; the dedup
    alone is worth it.
