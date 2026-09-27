@@ -552,6 +552,8 @@ impl EventFrame {
 pub struct EventDecoder {
     buf: Vec<u8>,
     cursor: usize,
+    #[cfg(test)]
+    compacted_bytes: usize,
 }
 
 impl EventDecoder {
@@ -565,6 +567,10 @@ impl EventDecoder {
             self.buf.clear();
             self.cursor = 0;
         } else if self.cursor > 0 {
+            #[cfg(test)]
+            {
+                self.compacted_bytes += self.buf.len() - self.cursor;
+            }
             self.buf.drain(..self.cursor);
             self.cursor = 0;
         }
@@ -894,6 +900,38 @@ mod tests {
         }
         assert_eq!(decoded, Some(expected));
         assert_eq!(decoder.next_frame().unwrap(), None);
+    }
+
+    #[test]
+    fn streaming_decoder_compaction_is_linear_with_consumed_prefix_and_partial_tail() {
+        let first = EventFrame::Sessions.encode();
+        let large = EventFrame::Activity {
+            json: "x".repeat(64 * 1024),
+        }
+        .encode();
+        let initial_tail = 128;
+        let mut decoder = EventDecoder::new();
+        let mut initial = first.clone();
+        initial.extend_from_slice(&large[..initial_tail]);
+        decoder.push(&initial);
+        assert_eq!(decoder.next_frame().unwrap(), Some(EventFrame::Sessions));
+        assert_eq!(decoder.next_frame().unwrap(), None);
+
+        for chunk in large[initial_tail..].chunks(64) {
+            decoder.push(chunk);
+            let _ = decoder.next_frame().unwrap();
+        }
+        assert!(decoder.next_frame().unwrap().is_none());
+
+        // Each compaction shifts the still-incomplete tail. This must remain
+        // amortized linear in input size, even with a consumed prefix before
+        // a large frame arrives in small chunks.
+        assert!(
+            decoder.compacted_bytes <= (first.len() + large.len()) * 2,
+            "decoder shifted {} bytes for {} bytes of input",
+            decoder.compacted_bytes,
+            first.len() + large.len()
+        );
     }
 
     #[test]
