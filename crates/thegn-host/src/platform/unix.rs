@@ -249,6 +249,53 @@ mod pty_owner_tests {
     use super::*;
     use crate::pane_pty::PtyProcessOwner;
     use std::os::unix::process::CommandExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Clone, Debug)]
+    struct CountedChild {
+        child: std::sync::Arc<std::sync::Mutex<std::process::Child>>,
+        waits: std::sync::Arc<AtomicUsize>,
+    }
+
+    impl portable_pty::ChildKiller for CountedChild {
+        fn kill(&mut self) -> std::io::Result<()> {
+            self.child
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .kill()
+        }
+
+        fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
+            Box::new(self.clone())
+        }
+    }
+
+    impl portable_pty::Child for CountedChild {
+        fn try_wait(&mut self) -> std::io::Result<Option<portable_pty::ExitStatus>> {
+            Ok(None)
+        }
+
+        fn wait(&mut self) -> std::io::Result<portable_pty::ExitStatus> {
+            self.waits.fetch_add(1, Ordering::SeqCst);
+            let _status = self
+                .child
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .wait()?;
+            Err(std::io::Error::other(
+                "test child was reaped; portable status is intentionally unavailable",
+            ))
+        }
+
+        fn process_id(&self) -> Option<u32> {
+            Some(
+                self.child
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .id(),
+            )
+        }
+    }
 
     #[test]
     fn concurrent_teardown_reaps_only_the_owned_child_group() {
@@ -284,6 +331,57 @@ mod pty_owner_tests {
 
         assert!(!pid_alive(i64::from(pid)));
         assert!(!pid_alive(i64::from(grandchild)));
+    }
+
+    #[test]
+    fn natural_exit_racing_kill_is_owned_and_reaped_once() {
+        let dir = tempfile::tempdir().expect("fixture directory");
+        let exit_marker = dir.path().join("natural-exit.marker");
+        let script = format!(
+            "trap '' TERM; (sleep 0.15; touch {}) & wait",
+            exit_marker.display()
+        );
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", &script]).process_group(0);
+        let child = command.spawn().expect("spawn isolated race fixture");
+        let pid = child.id();
+        assert!(pid > 0 && pid <= i32::MAX as u32);
+        // The test may signal only the process group created for this fixture.
+        assert_eq!(unsafe { libc::getpgid(pid as i32) }, pid as i32);
+
+        let waits = std::sync::Arc::new(AtomicUsize::new(0));
+        let owner = PtyProcessOwner::new(
+            Box::new(CountedChild {
+                child: std::sync::Arc::new(std::sync::Mutex::new(child)),
+                waits: waits.clone(),
+            }),
+            Some(GroupHandle::from_pid(pid as i32)),
+        );
+        let killer_owner = owner.clone();
+        let exit_owner = owner.clone();
+        let start = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let killer_start = start.clone();
+        let exit_start = start.clone();
+        let killer = std::thread::spawn(move || {
+            killer_start.wait();
+            killer_owner.terminate_and_reap()
+        });
+        let marker = exit_marker.clone();
+        let natural_exit = std::thread::spawn(move || {
+            exit_start.wait();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while !marker.exists() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            assert!(marker.exists(), "fixture reached its natural-exit point");
+            exit_owner.terminate_and_reap()
+        });
+        start.wait();
+
+        let _ = killer.join().expect("Kill teardown thread");
+        let _ = natural_exit.join().expect("natural Exit teardown thread");
+        assert_eq!(waits.load(Ordering::SeqCst), 1, "child reaped exactly once");
+        assert!(!pid_alive(i64::from(pid)));
     }
 }
 
@@ -502,6 +600,31 @@ impl GroupHandle {
             nix::sys::signal::Signal::SIGKILL,
         )
         .ok();
+    }
+
+    /// Kill the group only if this owned group is still present.
+    ///
+    /// The caller keeps the direct child unreaped while using this handle. Its
+    /// pid is the group's id, and the unreaped child prevents that id from
+    /// being reused for an unrelated process group. The liveness probe and
+    /// signal are separate syscalls, so a live group can still exit between
+    /// them; in that case the signal can harmlessly find no target. The child
+    /// anchor closes the dangerous reuse window while this owner holds it.
+    pub(crate) fn kill_if_alive(&self, owner_pid: Option<u32>) -> Result<bool, nix::errno::Errno> {
+        use nix::errno::Errno;
+        if owner_pid != u32::try_from(self.pgid).ok() {
+            return Err(Errno::EINVAL);
+        }
+        let pgid = nix::unistd::Pid::from_raw(self.pgid);
+        match nix::sys::signal::killpg(pgid, None) {
+            Ok(()) => match nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL) {
+                Ok(()) => Ok(true),
+                Err(Errno::ESRCH) => Ok(false),
+                Err(error) => Err(error),
+            },
+            Err(Errno::ESRCH) => Ok(false),
+            Err(error) => Err(error),
+        }
     }
 }
 

@@ -205,6 +205,10 @@ impl Drop for PtyPane {
             return;
         }
         if let Some(process) = &self.child_process {
+            // The reader receipt is deliberately not joined on the UI thread:
+            // it can be blocked in bounded_channel::blocking_send waiting for
+            // this loop to drain events. Joining here could deadlock the loop;
+            // process teardown is serialized through the shared owner instead.
             process.terminate_and_reap();
         }
     }

@@ -81,7 +81,9 @@ impl PtyProcessOwner {
     }
 
     /// Bounded tree teardown. No wait/reap occurs until after the final group
-    /// signal, preventing a recycled pid from being used for KILL.
+    /// signal, keeping the Unix group id anchored to this child. Unix verifies
+    /// the group is live before KILL; inability to verify is recorded and
+    /// leaves the group untouched.
     pub(crate) fn terminate_and_reap(&self) -> Option<i32> {
         let mut state = self.0.lock().unwrap_or_else(|poison| poison.into_inner());
         if state.complete {
@@ -94,7 +96,10 @@ impl PtyProcessOwner {
         }
         std::thread::sleep(crate::platform::pty_term_grace());
         if let Some(group) = &state.group {
-            group.kill();
+            force_kill_group(
+                group,
+                state.child.as_ref().and_then(|child| child.process_id()),
+            );
         }
         let code = state
             .child
@@ -120,11 +125,36 @@ impl Drop for PtyProcessState {
         }
         std::thread::sleep(crate::platform::pty_term_grace());
         if let Some(group) = &self.group {
-            group.kill();
+            force_kill_group(
+                group,
+                self.child.as_ref().and_then(|child| child.process_id()),
+            );
         }
         if let Some(child) = self.child.as_mut() {
             let _ = child.wait();
         }
+    }
+}
+
+fn force_kill_group(group: &crate::platform::GroupHandle, pid: Option<u32>) {
+    #[cfg(unix)]
+    match group.kill_if_alive(pid) {
+        Ok(true) => {}
+        Ok(false) => tracing::debug!(
+            pid,
+            "PTY process group exited during TERM grace; no KILL sent"
+        ),
+        Err(error) => {
+            tracing::warn!(%error, pid, "could not verify PTY process group before force-kill; leaving it untouched")
+        }
+    }
+
+    // Windows teardown is an immediate Job Object hard kill by design; no
+    // graceful TERM interval or Unix-style process-group probe is available.
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        group.kill();
     }
 }
 
