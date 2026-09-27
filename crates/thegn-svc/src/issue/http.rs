@@ -25,6 +25,12 @@ pub(crate) const MAX_BODY_BYTES: usize = 1024 * 1024;
 pub(crate) const MAX_REQUEST_BYTES: usize = 512 * 1024;
 pub(crate) const MAX_DYNAMIC_INPUT_BYTES: usize = 64 * 1024;
 
+/// A bounded JSON HTTP reply that leaves status classification to a caller.
+pub(crate) struct JsonResponseEnvelope {
+    pub(crate) status: reqwest::StatusCode,
+    pub(crate) body: Vec<u8>,
+}
+
 pub(crate) fn ensure_dynamic_input(value: &str) -> Result<(), IssueError> {
     if value.len() > MAX_DYNAMIC_INPUT_BYTES {
         Err(IssueError::BodyLimit("tracker input exceeds limit"))
@@ -74,6 +80,7 @@ pub(crate) struct TrackerHttpClient {
     authorization: String,
     provider: &'static str,
     budget: Arc<TrackerHttpBudget>,
+    operation_timeout: Duration,
 }
 
 impl TrackerHttpClient {
@@ -82,6 +89,16 @@ impl TrackerHttpClient {
         origin: &str,
         authorization: String,
         budget: Arc<TrackerHttpBudget>,
+    ) -> Result<Self, IssueError> {
+        Self::new_with_operation_timeout(provider, origin, authorization, budget, OPERATION_TIMEOUT)
+    }
+
+    pub(crate) fn new_with_operation_timeout(
+        provider: &'static str,
+        origin: &str,
+        authorization: String,
+        budget: Arc<TrackerHttpBudget>,
+        operation_timeout: Duration,
     ) -> Result<Self, IssueError> {
         let origin = parse_origin(origin)?;
         let client = Client::builder()
@@ -92,7 +109,7 @@ impl TrackerHttpClient {
             .no_zstd()
             .connect_timeout(CONNECT_TIMEOUT)
             .read_timeout(READ_IDLE_TIMEOUT)
-            .timeout(OPERATION_TIMEOUT)
+            .timeout(operation_timeout)
             .build()
             .map_err(|_| IssueError::Policy("tracker HTTP client configuration failed"))?;
         Ok(Self {
@@ -101,13 +118,14 @@ impl TrackerHttpClient {
             authorization,
             provider,
             budget,
+            operation_timeout,
         })
     }
 
     pub(crate) fn operation(&self) -> TrackerHttpOperation<'_> {
         TrackerHttpOperation {
             client: self,
-            deadline: Instant::now() + OPERATION_TIMEOUT,
+            deadline: Instant::now() + self.operation_timeout,
             permit: None,
         }
     }
@@ -239,6 +257,71 @@ impl TrackerHttpOperation<'_> {
         self.decode_json(response).await
     }
 
+    /// POST JSON and return a checked, bounded response without interpreting
+    /// non-success statuses. Callers can classify status together with body.
+    pub(crate) async fn json_envelope<B: Serialize>(
+        &mut self,
+        method: Method,
+        path: &str,
+        body: &B,
+    ) -> Result<JsonResponseEnvelope, IssueError> {
+        self.prepare().await?;
+        let bytes = serialize_bounded(body)?;
+        self.remaining()?;
+        let url = self.client.url(path)?;
+        let request = self
+            .client
+            .client
+            .request(method, url)
+            .header("Authorization", &self.client.authorization)
+            .header("Accept", "application/json")
+            .header("Content-Type", "application/json")
+            .body(bytes);
+        let response = self.send(request).await?;
+        self.check_envelope_response(&response)?;
+        let status = response.status();
+        let body = read_bounded(self.deadline, response).await?;
+        self.remaining()?;
+        #[cfg(test)]
+        self.response_consumed_for_test();
+        Ok(JsonResponseEnvelope { status, body })
+    }
+
+    fn check_envelope_response(&self, response: &Response) -> Result<(), IssueError> {
+        if response.status().is_redirection() {
+            return Err(IssueError::Policy("tracker redirect refused"));
+        }
+        if response
+            .headers()
+            .get(reqwest::header::CONTENT_ENCODING)
+            .is_some_and(|v| !v.as_bytes().eq_ignore_ascii_case(b"identity"))
+        {
+            return Err(IssueError::Policy("tracker response encoding refused"));
+        }
+        if response
+            .content_length()
+            .is_some_and(|len| len > MAX_BODY_BYTES as u64)
+        {
+            return Err(IssueError::BodyLimit("tracker response exceeds limit"));
+        }
+        // A non-success body is an error envelope: preserve its status and raw
+        // body for the caller to classify even when a provider omitted or
+        // misstated Content-Type. Only successful bodies are parsed as JSON.
+        if response.status().is_success() {
+            let Some(content_type) = response.headers().get(reqwest::header::CONTENT_TYPE) else {
+                return Err(IssueError::Policy("tracker JSON content type refused"));
+            };
+            let content_type = content_type
+                .to_str()
+                .map_err(|_| IssueError::Policy("tracker JSON content type refused"))?;
+            let media = content_type.split(';').next().unwrap_or("").trim();
+            if media != "application/json" && !media.ends_with("+json") {
+                return Err(IssueError::Policy("tracker JSON content type refused"));
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) async fn get<R>(&mut self, path: &str) -> Result<R, IssueError>
     where
         R: DeserializeOwned,
@@ -347,11 +430,11 @@ impl TrackerHttpOperation<'_> {
         }
         if json {
             let Some(content_type) = response.headers().get(reqwest::header::CONTENT_TYPE) else {
-                return Err(IssueError::Policy("tracker JSON content type missing"));
+                return Err(IssueError::Policy("tracker JSON content type refused"));
             };
             let content_type = content_type
                 .to_str()
-                .map_err(|_| IssueError::Policy("tracker JSON content type invalid"))?;
+                .map_err(|_| IssueError::Policy("tracker JSON content type refused"))?;
             let media = content_type.split(';').next().unwrap_or("").trim();
             if media != "application/json" && !media.ends_with("+json") {
                 return Err(IssueError::Policy("tracker JSON content type refused"));
@@ -518,7 +601,21 @@ mod tests {
             "/redirect" => (StatusCode::FOUND, Body::empty()).into_response(),
             "/encoding" => (StatusCode::OK, Body::from(r#"{"ok":true}"#)).into_response(),
             "/bad-mime" => (StatusCode::OK, Body::from(r#"{"ok":true}"#)).into_response(),
+            "/legacy-no-mime" => (StatusCode::OK, Body::from(r#"{"ok":true}"#)).into_response(),
             "/unauthorized" => (StatusCode::UNAUTHORIZED, Body::empty()).into_response(),
+            "/rate-limit" => (
+                StatusCode::FORBIDDEN,
+                Body::from(r#"{"message":"API rate limit exceeded"}"#),
+            )
+                .into_response(),
+            "/envelope-bad-mime" | "/envelope-missing-mime" => {
+                (StatusCode::OK, Body::from(r#"{"ok":true}"#)).into_response()
+            }
+            "/envelope-missing-mime-error" => (
+                StatusCode::FORBIDDEN,
+                Body::from(r#"{"message":"API rate limit exceeded"}"#),
+            )
+                .into_response(),
             "/large" => {
                 (StatusCode::OK, Body::from(vec![b'x'; MAX_BODY_BYTES + 1])).into_response()
             }
@@ -532,7 +629,7 @@ mod tests {
             _ => (StatusCode::NOT_FOUND, Body::empty()).into_response(),
         };
         match request.uri().path() {
-            "/ok" | "/encoding" | "/bad-mime" | "/large" | "/chunked" => {
+            "/ok" | "/encoding" | "/bad-mime" | "/rate-limit" | "/large" | "/chunked" => {
                 response.headers_mut().insert(
                     reqwest::header::CONTENT_TYPE,
                     HeaderValue::from_static("application/json"),
@@ -551,7 +648,7 @@ mod tests {
                 HeaderValue::from_static("gzip"),
             );
         }
-        if request.uri().path() == "/bad-mime" {
+        if request.uri().path() == "/bad-mime" || request.uri().path() == "/envelope-bad-mime" {
             response.headers_mut().insert(
                 reqwest::header::CONTENT_TYPE,
                 HeaderValue::from_static("text/plain"),
@@ -582,35 +679,133 @@ mod tests {
         let value: serde_json::Value = ok.get("/ok").await.unwrap();
         assert_eq!(value["ok"], true);
 
+        drop(ok);
+        let mut envelope = client.operation();
+        let response = envelope
+            .json_envelope(
+                Method::POST,
+                "/rate-limit",
+                &serde_json::json!({"query":"fixture"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&response.body).unwrap()["message"],
+            "API rate limit exceeded"
+        );
+
+        drop(envelope);
+        let mut envelope_redirect = client.operation();
+        assert!(matches!(
+            envelope_redirect
+                .json_envelope(Method::POST, "/redirect", &serde_json::json!({}))
+                .await,
+            Err(IssueError::Policy("tracker redirect refused"))
+        ));
+
+        drop(envelope_redirect);
+        let mut envelope_encoding = client.operation();
+        assert!(matches!(
+            envelope_encoding
+                .json_envelope(Method::POST, "/encoding", &serde_json::json!({}))
+                .await,
+            Err(IssueError::Policy("tracker response encoding refused"))
+        ));
+
+        drop(envelope_encoding);
+        let mut envelope_mime = client.operation();
+        assert!(matches!(
+            envelope_mime
+                .json_envelope(Method::POST, "/envelope-bad-mime", &serde_json::json!({}))
+                .await,
+            Err(IssueError::Policy("tracker JSON content type refused"))
+        ));
+
+        drop(envelope_mime);
+        let mut envelope_missing_mime = client.operation();
+        assert!(matches!(
+            envelope_missing_mime
+                .json_envelope(
+                    Method::POST,
+                    "/envelope-missing-mime",
+                    &serde_json::json!({})
+                )
+                .await,
+            Err(IssueError::Policy("tracker JSON content type refused"))
+        ));
+
+        // Error envelopes retain the body needed for status classification;
+        // MIME is enforced only where the response will be parsed as JSON.
+        drop(envelope_missing_mime);
+        let mut error_without_mime = client.operation();
+        let response = error_without_mime
+            .json_envelope(
+                Method::POST,
+                "/envelope-missing-mime-error",
+                &serde_json::json!({}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&response.body).unwrap()["message"],
+            "API rate limit exceeded"
+        );
+
+        drop(error_without_mime);
+        let mut envelope_size = client.operation();
+        assert!(matches!(
+            envelope_size
+                .json_envelope(Method::POST, "/large", &serde_json::json!({}))
+                .await,
+            Err(IssueError::BodyLimit("tracker response exceeds limit"))
+        ));
+
+        drop(envelope_size);
         let mut redirect = client.operation();
         assert!(matches!(
             redirect.get::<serde_json::Value>("/redirect").await,
             Err(IssueError::Policy("tracker redirect refused"))
         ));
 
+        drop(redirect);
         let mut encoding = client.operation();
         assert!(matches!(
             encoding.get::<serde_json::Value>("/encoding").await,
             Err(IssueError::Policy("tracker response encoding refused"))
         ));
 
+        drop(encoding);
         let mut mime = client.operation();
         assert!(matches!(
             mime.get::<serde_json::Value>("/bad-mime").await,
             Err(IssueError::Policy("tracker JSON content type refused"))
         ));
 
+        drop(mime);
+        let mut missing_mime = client.operation();
+        assert!(matches!(
+            missing_mime
+                .get::<serde_json::Value>("/legacy-no-mime")
+                .await,
+            Err(IssueError::Policy("tracker JSON content type refused"))
+        ));
+
+        drop(missing_mime);
         let mut auth = client.operation();
         assert!(matches!(
             auth.get::<serde_json::Value>("/unauthorized").await,
             Err(IssueError::Auth(_))
         ));
 
+        drop(auth);
         let mut large = client.operation();
         assert!(matches!(
             large.get::<serde_json::Value>("/large").await,
             Err(IssueError::BodyLimit("tracker response exceeds limit"))
         ));
+        drop(large);
         let mut chunked = client.operation();
         assert!(matches!(
             chunked.get::<serde_json::Value>("/chunked").await,
@@ -618,6 +813,7 @@ mod tests {
         ));
         server.abort();
         assert!(server.await.unwrap_err().is_cancelled());
+        drop(chunked);
     }
 
     #[tokio::test]

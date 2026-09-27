@@ -1,4 +1,4 @@
-//! The native GitHub layer: octocrab GraphQL for the two hot-path reads
+//! The native GitHub layer: bounded GraphQL HTTP for the two hot-path reads
 //! (`pr_status`, `pr_list`) on local worktrees with a resolvable token.
 //!
 //! Everything else answers `Unsupported`, and any "this layer can't" condition
@@ -10,10 +10,11 @@
 //! connectivity holder.
 //!
 //! The seam is sync: each call builds a current-thread runtime and
-//! `block_on`s the octocrab request, exactly as the host used to do at its
+//! `block_on`s the shared HTTP request, exactly as the host used to do at its
 //! one call site — so callers stay on blocking threads and never need a
 //! runtime handle.
 
+use crate::issue::http::{TrackerHttpBudget, TrackerHttpClient};
 use serde_json::Value;
 use std::borrow::Cow;
 use std::collections::HashSet;
@@ -38,7 +39,7 @@ fn runtime_error(error: impl std::fmt::Display) -> ForgeError {
     ForgeError::NotConfigured(Cow::Owned(format!("no runtime: {error}")))
 }
 
-/// Source a GitHub token for the octocrab native impl. Precedence:
+/// Source a GitHub token for the native impl. Precedence:
 /// `GH_TOKEN` → `GITHUB_TOKEN` → `gh auth token` (reuses the user's existing
 /// `gh` login: keyring, refresh, enterprise hosts — we drop `gh` from the hot
 /// path, not as a dependency). Returns `None` if no token is available.
@@ -409,15 +410,15 @@ pub fn parse_owner_repo(url: &str) -> Option<(String, String)> {
     (repository.host == "github.com").then_some((repository.owner, repository.name))
 }
 
-/// Per-request timeout on octocrab GraphQL calls. A stalled TLS handshake to
+/// Per-operation timeout on GitHub GraphQL calls. A stalled TLS handshake to
 /// api.github.com blocks the refresh task for up to the reqwest default (15s)
 /// with no user feedback; cap it at 10s so the fallback kicks in promptly.
-const OCTOCRAB_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const NATIVE_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Open the circuit after this many consecutive transient failures. When open,
-/// we skip the octocrab path entirely (going straight to the CLI fallback) for
+/// we skip the native path entirely (going straight to the CLI fallback) for
 /// `CIRCUIT_OPEN_SECS` seconds so a network partition doesn't spawn a hanging
-/// octocrab task every 20s.
+/// HTTP task every refresh interval.
 const CIRCUIT_OPEN_AFTER: u32 = 3;
 const CIRCUIT_OPEN_SECS: u64 = 60;
 
@@ -438,7 +439,7 @@ impl GhCircuit {
         }
     }
 
-    /// Returns `true` if the circuit is open (skip octocrab this call).
+    /// Returns `true` if the circuit is open (skip native HTTP this call).
     fn is_open(&self) -> bool {
         let guard = self.open_until.lock().unwrap_or_else(|e| e.into_inner());
         guard.is_some_and(|until| std::time::Instant::now() < until)
@@ -470,7 +471,7 @@ impl GhCircuit {
                 target: "thegn::forge",
                 consecutive_failures = prev + 1,
                 open_secs = CIRCUIT_OPEN_SECS,
-                "GitHub API unreachable — pausing native octocrab path"
+                "GitHub API unreachable — pausing native HTTP path"
             );
         }
     }
@@ -480,7 +481,7 @@ fn circuit() -> &'static GhCircuit {
     CIRCUIT.get_or_init(GhCircuit::new)
 }
 
-/// octocrab GraphQL for `pr_status` / `pr_list`; see the module doc.
+/// GitHub GraphQL for `pr_status` / `pr_list`; see the module doc.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct GithubNative;
 
@@ -589,83 +590,91 @@ impl GithubNative {
         Ok((token, scope))
     }
 
-    /// One GraphQL round trip under the request timeout, classified.
+    /// One GraphQL round trip under the shared HTTP budget and 10-second deadline.
     fn graphql(&self, token: String, body: Value, what: &'static str) -> Result<Value, ForgeError> {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(runtime_error)?;
-        let client = octocrab::OctocrabBuilder::new()
-            .personal_token(token)
-            .build()
-            .map_err(|_| ForgeError::NotConfigured("octocrab client build failed".into()))?;
-        rt.block_on(graphql_request(
-            &client,
-            &body,
-            what,
-            OCTOCRAB_REQUEST_TIMEOUT,
-            circuit(),
-        ))
-    }
-}
-
-/// Classify the SDK's typed error, never its Display text (which can contain
-/// arbitrary repository names such as `connectivity`). HTTP/GraphQL answers
-/// prove reachability even when authentication or the service itself failed.
-fn classify_error(error: &octocrab::Error) -> (ForgeError, bool) {
-    match error {
-        octocrab::Error::Graphql { .. } => {
-            (ForgeError::NotConfigured("GraphQL errors".into()), true)
-        }
-        octocrab::Error::GitHub { source, .. } => {
-            let code = source.status_code.as_u16();
-            let error = match code {
-                429 => ForgeError::RateLimited,
-                403 if source.message.to_ascii_lowercase().contains("rate limit") => {
-                    ForgeError::RateLimited
-                }
-                401 | 403 => ForgeError::NotAuthenticated,
-                _ => ForgeError::Other(format!("GitHub API HTTP {code}: {}", source.message)),
-            };
-            (error, true)
-        }
-        octocrab::Error::Service { .. } | octocrab::Error::Hyper { .. } => {
-            (ForgeError::Offline, false)
-        }
-        _ => (ForgeError::Other(error.to_string()), false),
+        let client = TrackerHttpClient::new_with_operation_timeout(
+            "github",
+            "https://api.github.com/",
+            format!("Bearer {token}"),
+            TrackerHttpBudget::process(),
+            NATIVE_REQUEST_TIMEOUT,
+        )
+        .map_err(|_| ForgeError::NotConfigured("GitHub HTTP client build failed".into()))?;
+        rt.block_on(graphql_request(&client, &body, what, circuit()))
     }
 }
 
 async fn graphql_request(
-    client: &octocrab::Octocrab,
+    client: &TrackerHttpClient,
     body: &Value,
     what: &'static str,
-    timeout: std::time::Duration,
     health: &GhCircuit,
 ) -> Result<Value, ForgeError> {
-    match tokio::time::timeout(timeout, client.graphql::<Value>(body)).await {
-        Ok(Ok(data)) => {
-            health.record_success();
-            Ok(data)
-        }
-        Ok(Err(error)) => {
-            let (classified, reached_server) = classify_error(&error);
-            if reached_server {
-                health.record_success();
-            } else if classified == ForgeError::Offline {
-                health.record_failure();
-            }
-            tracing::warn!(target: "thegn::forge", op = what, error = %classified,
-                "octocrab request failed");
-            Err(classified)
-        }
-        Err(_) => {
+    use crate::issue::IssueError;
+    use reqwest::Method;
+
+    let mut operation = client.operation();
+    let envelope = match operation.json_envelope(Method::POST, "graphql", body).await {
+        Ok(envelope) => envelope,
+        Err(IssueError::Network(_) | IssueError::Timeout(_)) => {
             health.record_failure();
-            tracing::warn!(target: "thegn::forge", op = what, timeout_secs = timeout.as_secs(),
-                "octocrab request timed out");
-            Err(ForgeError::Offline)
+            tracing::warn!(target: "thegn::forge", op = what, "GitHub request timed out or failed");
+            return Err(ForgeError::Offline);
         }
+        Err(error) => {
+            let classified = ForgeError::Other(format!("GitHub HTTP request failed: {error:?}"));
+            tracing::warn!(target: "thegn::forge", op = what, error = %classified,
+                "GitHub request failed");
+            return Err(classified);
+        }
+    };
+    let code = envelope.status.as_u16();
+    let response: Value = match serde_json::from_slice(&envelope.body) {
+        Ok(response) => response,
+        Err(_) => {
+            let error = if envelope.status.is_success() {
+                ForgeError::Other("GitHub API returned invalid JSON".into())
+            } else {
+                ForgeError::Other(format!("GitHub API HTTP {code}: invalid JSON response"))
+            };
+            tracing::warn!(target: "thegn::forge", op = what, error = %error,
+                "GitHub response could not be decoded");
+            return Err(error);
+        }
+    };
+    if !envelope.status.is_success() {
+        let message = response
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown error");
+        let error = match code {
+            429 => ForgeError::RateLimited,
+            403 if message.to_ascii_lowercase().contains("rate limit") => ForgeError::RateLimited,
+            401 | 403 => ForgeError::NotAuthenticated,
+            _ => ForgeError::Other(format!("GitHub API HTTP {code}: {message}")),
+        };
+        health.record_success();
+        tracing::warn!(target: "thegn::forge", op = what, error = %error,
+            "GitHub API returned an error status");
+        return Err(error);
     }
+    if response
+        .get("errors")
+        .and_then(Value::as_array)
+        .is_some_and(|errors| !errors.is_empty())
+    {
+        health.record_success();
+        let error = ForgeError::NotConfigured("GraphQL errors".into());
+        tracing::warn!(target: "thegn::forge", op = what, error = %error,
+            "GitHub GraphQL returned errors");
+        return Err(error);
+    }
+    health.record_success();
+    Ok(response)
 }
 
 impl Probe for GithubNative {
@@ -685,7 +694,7 @@ impl Probe for GithubNative {
         };
         ProbeReport::new("forge", "github-native", availability)
             .with_caps(&self.caps())
-            .note("octocrab GraphQL for pr_status / pr_list on local worktrees")
+            .note("GitHub GraphQL for pr_status / pr_list on local worktrees")
     }
 }
 

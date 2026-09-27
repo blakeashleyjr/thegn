@@ -5,25 +5,66 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use thegn_core::seam::SeamError;
 
-pub(super) fn client(status: u16, body: &str) -> octocrab::Octocrab {
+pub(super) fn client(status: u16, body: &str) -> TrackerHttpClient {
+    client_with_delay(status, body, None, Duration::from_secs(2))
+}
+
+pub(super) fn client_with_delay(
+    status: u16,
+    body: &str,
+    delay: Option<Duration>,
+    timeout: Duration,
+) -> TrackerHttpClient {
+    client_with_content_type(status, body, delay, timeout, Some("application/json"))
+}
+
+fn client_with_content_type(
+    status: u16,
+    body: &str,
+    delay: Option<Duration>,
+    timeout: Duration,
+    content_type: Option<&'static str>,
+) -> TrackerHttpClient {
+    use axum::Router;
+    use axum::body::Body;
+    use axum::extract::Request;
+    use axum::http::{HeaderValue, StatusCode};
+    use axum::response::IntoResponse;
+    use axum::routing::any;
+
     let body = body.to_owned();
-    let service = tower::service_fn(move |_: axum::http::Request<octocrab::OctoBody>| {
+    let app = Router::new().fallback(any(move |_: Request| {
         let body = body.clone();
         async move {
-            Ok::<_, std::io::Error>(
-                axum::http::Response::builder()
-                    .status(status)
-                    .header("content-type", "application/json")
-                    .body(http_body_util::Full::new(axum::body::Bytes::from(body)))
-                    .unwrap(),
-            )
+            if let Some(delay) = delay {
+                tokio::time::sleep(delay).await;
+            }
+            let mut response =
+                (StatusCode::from_u16(status).unwrap(), Body::from(body)).into_response();
+            if let Some(content_type) = content_type {
+                response.headers_mut().insert(
+                    reqwest::header::CONTENT_TYPE,
+                    HeaderValue::from_static(content_type),
+                );
+            }
+            response
         }
+    }));
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
     });
-    octocrab::OctocrabBuilder::new_empty()
-        .with_service(service)
-        .with_auth(octocrab::AuthState::None)
-        .build()
-        .unwrap()
+    TrackerHttpClient::new_with_operation_timeout(
+        "github-test",
+        &format!("http://{address}"),
+        "Bearer fixture".into(),
+        Arc::new(TrackerHttpBudget::with_permits(8)),
+        timeout,
+    )
+    .unwrap()
 }
 
 pub(super) fn runtime() -> tokio::runtime::Runtime {
@@ -44,6 +85,88 @@ fn runtime_failure_keeps_dynamic_message_in_owned_not_configured_payload() {
 }
 
 #[test]
+fn graphql_http_request_preserves_method_path_auth_and_json_body() {
+    use axum::Router;
+    use axum::body::{Body, to_bytes};
+    use axum::extract::Request;
+    use axum::http::{HeaderValue, StatusCode};
+    use axum::response::IntoResponse;
+    use axum::routing::any;
+
+    let rt = runtime();
+    rt.block_on(async {
+        let (seen_tx, mut seen_rx) = tokio::sync::mpsc::unbounded_channel();
+        let app = Router::new().fallback(any(move |request: Request| {
+            let seen_tx = seen_tx.clone();
+            async move {
+                let (parts, body) = request.into_parts();
+                let body = to_bytes(body, 4096).await.expect("small GraphQL request");
+                seen_tx
+                    .send((
+                        parts.method,
+                        parts.uri.path().to_owned(),
+                        parts.headers.get("authorization").cloned(),
+                        parts.headers.get("content-type").cloned(),
+                        parts.headers.get("accept").cloned(),
+                        body,
+                    ))
+                    .expect("fixture receiver remains open");
+                (
+                    StatusCode::OK,
+                    [(reqwest::header::CONTENT_TYPE, "application/json")],
+                    Body::from(r#"{"data":{"ok":true}}"#),
+                )
+                    .into_response()
+            }
+        }));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = TrackerHttpClient::new_with_operation_timeout(
+            "github-test",
+            &format!("http://{address}"),
+            "Bearer fixture-token".into(),
+            Arc::new(TrackerHttpBudget::with_permits(1)),
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        let body = serde_json::json!({
+            "query": "query($id: Int!) { node(id: $id) { id } }",
+            "variables": { "id": 17 },
+        });
+        let health = GhCircuit::new();
+        let response = graphql_request(&client, &body, "fixture", &health)
+            .await
+            .unwrap();
+        assert_eq!(response, serde_json::json!({"data":{"ok":true}}));
+
+        let (method, path, authorization, content_type, accept, request_body) = seen_rx
+            .recv()
+            .await
+            .expect("GraphQL request reached fixture");
+        assert_eq!(method, reqwest::Method::POST);
+        assert_eq!(path, "/graphql");
+        assert_eq!(
+            authorization,
+            Some(HeaderValue::from_static("Bearer fixture-token"))
+        );
+        assert_eq!(
+            content_type,
+            Some(HeaderValue::from_static("application/json"))
+        );
+        assert_eq!(accept, Some(HeaderValue::from_static("application/json")));
+        assert_eq!(
+            serde_json::from_slice::<Value>(&request_body).unwrap(),
+            body
+        );
+    });
+}
+
+#[test]
 fn sdk_graphql_envelopes_fall_through_without_offline_evidence() {
     let rt = runtime();
     rt.block_on(async {
@@ -56,7 +179,6 @@ fn sdk_graphql_envelopes_fall_through_without_offline_evidence() {
                 &client(200, body),
                 &serde_json::json!({"query":"fixture"}),
                 "fixture",
-                Duration::from_secs(1),
                 &health,
             )
             .await;
@@ -91,7 +213,27 @@ fn typed_http_answers_are_not_global_network_failures() {
                 &client(status, &body),
                 &serde_json::json!({"query":"fixture"}),
                 "fixture",
-                Duration::from_secs(1),
+                &health,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error, expected);
+            assert!(!error.falls_through());
+            assert_eq!(health.failures.load(Ordering::Relaxed), 0);
+        }
+
+        // GitHub error responses remain classifiable from their status and
+        // body even when the server omits Content-Type.
+        for (message, expected) in [
+            ("API rate limit exceeded", ForgeError::RateLimited),
+            ("Resource not accessible", ForgeError::NotAuthenticated),
+        ] {
+            let health = GhCircuit::new();
+            let body = serde_json::json!({"message":message}).to_string();
+            let error = graphql_request(
+                &client_with_content_type(403, &body, None, Duration::from_secs(2), None),
+                &serde_json::json!({"query":"fixture"}),
+                "fixture",
                 &health,
             )
             .await
@@ -107,31 +249,29 @@ fn typed_http_answers_are_not_global_network_failures() {
 fn timeout_and_transport_failure_feed_native_circuit() {
     let rt = runtime();
     rt.block_on(async {
-        for stall in [false, true] {
-            let service = tower::service_fn(
-                move |_: axum::http::Request<octocrab::OctoBody>| async move {
-                    if stall {
-                        std::future::pending::<()>().await;
-                    }
-                    Err::<axum::http::Response<http_body_util::Full<axum::body::Bytes>>, _>(
-                        std::io::Error::new(
-                            std::io::ErrorKind::ConnectionRefused,
-                            "fixture transport",
-                        ),
-                    )
-                },
-            );
-            let client = octocrab::OctocrabBuilder::new_empty()
-                .with_service(service)
-                .with_auth(octocrab::AuthState::None)
-                .build()
-                .unwrap();
+        let unused = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = unused.local_addr().unwrap();
+        drop(unused);
+        let unreachable = TrackerHttpClient::new_with_operation_timeout(
+            "github-test",
+            &format!("http://{address}"),
+            "Bearer fixture".into(),
+            Arc::new(TrackerHttpBudget::with_permits(8)),
+            Duration::from_millis(200),
+        )
+        .unwrap();
+        let stalled = client_with_delay(
+            200,
+            r#"{"data":{}}"#,
+            Some(Duration::from_secs(1)),
+            Duration::from_millis(30),
+        );
+        for client in [&unreachable, &stalled] {
             let health = GhCircuit::new();
             let result = graphql_request(
-                &client,
+                client,
                 &serde_json::json!({"query":"fixture"}),
                 "fixture",
-                Duration::from_millis(30),
                 &health,
             )
             .await;
@@ -306,7 +446,6 @@ fn sdk_error_classification_drives_the_real_ladder() {
             &client(200, r#"{"errors":[{"message":"unknown repository"}]}"#),
             &serde_json::json!({"query":"fixture"}),
             "fixture",
-            Duration::from_secs(1),
             &GhCircuit::new(),
         )
         .await
