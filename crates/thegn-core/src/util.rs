@@ -1413,13 +1413,25 @@ fn strip_core_worktree(text: &str) -> Option<String> {
 
 /// Run `git -C <dir> <args...>`, returning trimmed stdout on success (None on
 /// failure or empty output).
+///
+/// **Empty output collapses to `None`, so this cannot distinguish "git said
+/// nothing" from "git failed".** For a command whose empty output is a
+/// meaningful answer — `status --porcelain` on a clean tree, `diff --name-only`
+/// with no changes — use [`git_out_allow_empty`] instead. Reading "clean" as
+/// "failed" inverts a guard, and doing exactly that made a background reclaim
+/// skip every worktree it was supposed to process (THE-677).
 pub fn git_out(dir: &Path, args: &[&str]) -> Option<String> {
+    git_out_allow_empty(dir, args).filter(|s| !s.is_empty())
+}
+
+/// Run `git -C <dir> <args...>`, returning trimmed stdout on success — including
+/// **empty** stdout as `Some("")`. `None` means the command could not be run or
+/// exited non-zero, which is a different fact from an empty answer.
+pub fn git_out_allow_empty(dir: &Path, args: &[&str]) -> Option<String> {
     let out = git_cmd(dir).args(args).output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if s.is_empty() { None } else { Some(s) }
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
 /// The last path component of a string (no trailing-slash handling needed
