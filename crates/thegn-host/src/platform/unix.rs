@@ -407,7 +407,66 @@ pub(crate) fn open_capability_identity(path: &std::path::Path) -> std::io::Resul
 
 /// Directory-identity opening for automatic cleanup; callers verify type.
 pub fn open_directory_nofollow(path: &std::path::Path) -> std::io::Result<std::fs::File> {
-    open_nofollow(path)
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(path)
+}
+
+/// Open a cleanup leaf through the retained directory descriptor. The name is
+/// a single component supplied by the portable caller; `openat` therefore
+/// cannot traverse a replacement parent or an intermediate path.
+pub(crate) fn platform_open_cleanup_file_at(
+    parent: &std::fs::File,
+    _parent_path: &std::path::Path,
+    name: &std::ffi::OsStr,
+) -> std::io::Result<std::fs::File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    let name = std::ffi::CString::new(name.as_bytes()).map_err(std::io::Error::other)?;
+    // SAFETY: `parent` is borrowed for the syscall and `name` is a terminated
+    // single path component. A successful descriptor is immediately owned.
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
+pub(crate) fn platform_cleanup_file_identity(
+    file: &std::fs::File,
+) -> std::io::Result<super::CleanupFileIdentity> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = file.metadata()?;
+    Ok(super::CleanupFileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        links: metadata.nlink(),
+    })
+}
+
+pub(crate) fn platform_unlink_cleanup_file_at(
+    parent: &std::fs::File,
+    _parent_path: &std::path::Path,
+    name: &std::ffi::OsStr,
+    _file: &std::fs::File,
+) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
+    let name = std::ffi::CString::new(name.as_bytes()).map_err(std::io::Error::other)?;
+    // SAFETY: `parent` is the retained directory descriptor and `name` is a
+    // single component; no pathname lookup is performed for the parent.
+    if unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
