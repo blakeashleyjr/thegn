@@ -1,112 +1,93 @@
-# Primary greenlight — THE-677 (reviewing row 630, plan-ready)
+# Primary review — THE-677 revision 1 (reviewing row 641)
 
-Chunks 1–4 are approved as written. **All three of your findings are correct, and
-two of them overturn decisions I made. Thank you for pushing back — that is what
-this stage is for.** Each is answered below, and the answer to finding 1 changes
-the policy, so read that first.
+The design is right and the core is proven: **`cargo nextest run -p thegn-core`
+on `disk_reclaim` / `config_example` / `env_overlay` is 26/26 green**, and the
+pure policy reads correctly — age floor, newest-per-package-name retention,
+lexically-greatest tie-break on equal mtimes, duplicate rows ignored. All four
+of my decisions are implemented, including the fingerprint-first deletion order
+and the non-blocking `.cargo-lock` acquisition.
 
-## Finding 1 — you are right, and the unit key is abandoned
+**Two of your own host tests fail**, and they are the ones that prove the thing
+works end to end:
 
-You are right that "newest K per unit" has no meaning until a build unit is
-defined, and that both available definitions fail: package-name grouping
-collapses distinct target/profile/feature/build-script units, while treating each
-fingerprint ID as its own unit reaps nothing. You are also right that parsing
-private Cargo JSON to recover the real key is not acceptable.
+```
+measure::disk::generation_tests::unlocked_prune_removes_only_selected_footprint_and_records_real_bytes
+  → disk.rs:657  assertion failed: removed > 0
+measure::disk::generation_tests::failed_profile_inventory_does_not_suppress_a_different_profile
+  → disk.rs:753  assertion failed: removed > 0
+```
 
-**So drop the unit key. The policy no longer needs one.**
+Both share `profile_tree()`, so it is one cause.
 
-Replace "newest K generations per unit" with:
+## What the primary has already ruled out
 
-> A generation footprint is eligible only when nothing in it has been touched for
-> at least the configured age floor, and it is never the newest footprint for its
-> package name.
+I replicated `profile_tree()` exactly outside the test and checked each gate:
 
-The age floor does the work, and it is **not** a new heuristic being smuggled in —
-it is the threshold this repo already accepts. `[disk] idle_clean_days = 14`
-reclaims an entire `target/` tree after two untouched weeks. Evicting a single
-build generation untouched for the same period is **strictly more conservative
-than what thegn already does today**, so it needs no stronger justification than
-the existing policy has.
+- **`git status --porcelain` is EMPTY** in the fixture, so the dirty-worktree
+  guard at `disk.rs:304` does not skip it.
+- **No symlinks anywhere on the path** (`readlink -f` is identity), so
+  `safe_directory` / `safe_regular_file` accept the profile dir and `.cargo-lock`.
+- **`plan_generations` would evict `pkg-a`**: `rsplit_once('-')` groups `pkg-a`
+  and `pkg-z` under package `pkg`; their mtimes are equal, so the lexically
+  greatest id `z` is retained and `a` is evicted; `u64::MAX.saturating_sub(mtime)
+  > = 0`holds. There is no zero-disables rule in the policy, so`min_age_days = 0`
+  > is not the problem.
 
-Concretely:
+So the plan is correct and the worktree-level guards pass. The eviction is being
+lost **between the plan and the unlink**, or the inventory is coming back empty.
 
-- **Default the age floor to 14 days**, explicitly documented as matching
-  `idle_clean_days`. Not the 24h I proposed — 24h was chosen to make K safe, and K
-  is gone.
-- **Keep a cheap newest-per-package-name belt**: never evict the most recently
-  touched footprint for a package name, whatever its age. This costs nothing and
-  removes the pathological case where a package legitimately untouched for months
-  loses its only generation.
-- **K is removed from the design.** One new key, not two: the age floor. That is
-  one `section.key` and its three ratchets (config example, env overlay, strict
-  validation), so chunk 2 shrinks accordingly — drop the K field, its default, its
-  overlay, its env mapping and its zero-validation.
+## What to check, in this order
 
-Chunk 1's regression list adapts cleanly: keep the age-floor cases (younger than
-the floor is retained; exactly at the floor is eligible; future timestamps
-saturate to age zero; empty inventory is a no-op; units never affect each other;
-reported bytes equal selected bytes) and drop the K cases.
+1. **`generation_inventory(&profile_dir)`** — is it returning an empty vec or an
+   `Err` for this fixture? Note the fixture's artifacts are `deps/libpkg-a.rlib`,
+   whose stem is `libpkg-a`, not `pkg-a`. If the inventory associates `deps/`
+   artifacts with a fingerprint by splitting the _artifact_ stem, `libpkg-a`
+   groups under package `libpkg` and never matches fingerprint `pkg-a`. Either the
+   association rule needs the `lib` prefix stripped, or the fixture's filenames
+   are wrong — **decide which, and say which you chose.** Real cargo writes
+   `libfoo-<hash>.rlib` for package `foo`, so the prefix almost certainly has to be
+   handled.
+2. **`lock.try_lock()` at `disk.rs:320`** — confirm what this returns on this
+   toolchain when the lock IS free. If the API yields `io::Result<bool>`, then
+   `.is_err()` is `false` both when the lock was acquired and when it would have
+   blocked, so the guard never fires and a **concurrent cargo build would not be
+   detected** — which is the whole point of decision 3. Check it and handle the
+   not-acquired case explicitly, whatever the shape.
+3. **`crate::task::slot_active(worktree_path)`** — verify it is false in a unit
+   test with no registered slots, and that it does not touch real state. This test
+   does not use `TestIsolation`; if `slot_active` or `git_out` reads
+   `XDG_STATE_HOME`, the test is not hermetic and **must** isolate it (this shell
+   often runs inside a live thegn, so a test touching the real DB is a real hazard).
 
-## Finding 2 — you are right, the cost bound was overstated
+Add a temporary diagnostic to find which gate rejects it if that is faster than
+reading — just remove it before reporting.
 
-I claimed "at most one unit recompiles; never a workspace rebuild." You correctly
-observe that a mistaken footprint association can make Cargo rebuild dependents
-and test binaries too. **Narrow the claim exactly as you propose**, to the
-retention invariant alone:
+## Required regardless of the cause
 
-> The reclaimer never removes a footprint that has been touched within the age
-> floor, and never the newest footprint for a package name. It makes no claim
-> about how much rebuilding a wrong eviction causes.
+- **The two tests must pass, not be weakened.** `removed > 0` is the assertion that
+  distinguishes "the policy selected something" from "bytes actually came back",
+  and decision 5 asks specifically for _actual_ removed bytes rather than planned.
+  Do not relax it to `>= 0`, and do not delete the test.
+- If the fixture filenames were wrong, fix the fixture **and** make sure the real
+  cargo naming (`lib<pkg>-<hash>.rlib`, `<pkg>-<hash>.d`, executables without the
+  `lib` prefix) is what the inventory actually matches. A footprint that fails to
+  associate its artifacts would silently prune only the fingerprint directory —
+  which is the **dangerous** half-deletion your own finding 3 warned about, in
+  reverse: fingerprint gone, artifacts orphaned. Worse, it would look like it
+  worked.
 
-Say that in the design and in the documentation, and do not restate the stronger
-version anywhere. Overstating a safety property is worse than not having it,
-because it stops the next reader from checking.
+## Confirmed — do not change
 
-## Finding 3 — you are right, and deletion ORDER is the answer
-
-Sequential unlinking cannot roll back, so "if any part cannot be removed, leave
-the rest" was not implementable as written. Do not build a staging protocol for
-this. **Order the deletion so that every partial state is a safe one:**
-
-1. **Remove the `.fingerprint/<pkg>-<hash>/` directory FIRST.**
-2. Then the `deps/` artifacts for that hash.
-3. Then the `incremental/` entry.
-
-A crash or failure after step 1 leaves artifacts with no fingerprint: Cargo
-considers the unit not fresh and rebuilds it. That is a wasted rebuild, which is
-the cost we already accept.
-
-The reverse order is the one that must never happen: artifacts deleted while the
-fingerprint survives leaves Cargo believing a unit is fresh when its output is
-gone. **Write that reasoning as a comment at the deletion site**, because the
-ordering looks arbitrary and someone will otherwise "tidy" it.
-
-Then report partial deletion accurately — planned bytes vs actually removed bytes,
-per profile, with failure counts — and **do not describe best-effort sequential
-deletion as all-or-nothing**, exactly as you say.
-
-## Confirmed, and the part that must not soften
-
-- **Non-blocking `.cargo-lock` acquisition per profile; a failed lock skips that
-  profile for the round.** Never block — this runs on the background scan and a
-  blocking acquire would sit behind a 20-minute compile. Hold the lock through
-  pruning.
-- **Never walk profiles unrelated to the fresh scan**, never run Cargo, never on
-  the event loop, never before the first frame.
-- Pure policy in `thegn_core::disk_reclaim` (substrate-free, 95% line gate), all
-  I/O in the host at the existing scan tail.
-- Generation-reclaimed bytes stay **separate** from the whole-`target/` figure, and
-  zero eviction reports zero rather than reusing the worktree number.
-- Do not weaken or bypass the example/env coverage gates to make a ratchet pass.
+Deletion order (fingerprint → deps → incremental) with the reasoning comment;
+`GenerationPolicy`'s shape and the single `[disk]` age-floor key with its three
+ratchets; the separate generation-vs-whole-target byte reporting; the narrowed
+retention-only guarantee with no "never removes a live generation" claim.
 
 ## Validation
 
-Attempt `nix develop --command cargo check -p <crate> --all-targets` and a narrow
-`cargo nextest run -p <crate> <filter>`. **The pipeline sandbox mounts
-`/nix/store` read-only, so this usually fails outright** — say exactly that and
-stop if it does. The primary runs clippy, the full workspace nextest and smoke
-centrally.
+Attempt `nix develop --command cargo nextest run -p thegn-host generation_tests`.
+**The pipeline sandbox mounts `/nix/store` read-only, so this usually fails
+outright** — say exactly that and stop if it does. The primary re-runs both suites
+regardless.
 
-Never report a verdict for code you could not compile; state what you could not
-run. If a further finding contradicts a decision above, say so — the last round
-proved that worth doing.
+Never report a verdict for code you could not compile or tests you could not run.
