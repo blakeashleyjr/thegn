@@ -381,6 +381,7 @@ fn finish_exit(
         p.clipboard
             .submit(|bytes| ctx.writer.try_submit_clipboard(bytes, || {}));
         p.clipboard.reset();
+        p.query_parser.reset();
     }
     if ctx.preview.pane_exit(id) {
         *ctx.dirty = true;
@@ -486,6 +487,7 @@ pub(crate) fn drain<T: Terminal>(
                 backlog.barrier(id);
                 if let Some(p) = ctx.panes.table.get_mut(&id) {
                     p.clipboard.reset();
+                    p.query_parser.reset();
                 }
                 fallbacks.push(id);
             }
@@ -493,6 +495,7 @@ pub(crate) fn drain<T: Terminal>(
                 backlog.barrier(id);
                 if let Some(p) = ctx.panes.table.get_mut(&id) {
                     p.clipboard.reset();
+                    p.query_parser.reset();
                 }
                 reattached.push(id);
             }
@@ -530,8 +533,8 @@ pub(crate) fn drain<T: Terminal>(
         budget.max_bytes,
         budget.deadline,
         started,
-        |id, merged, admit_clipboard| {
-            handle_output(ctx, id, merged, admit_clipboard);
+        |id, merged, admit_generation| {
+            handle_output(ctx, id, merged, admit_generation);
         },
         || {
             // Input preemption: a keystroke found here aborts the drain — its
@@ -628,7 +631,7 @@ pub(crate) fn prune_output_degraded(
 /// terminal queries, forward OSC passthrough, route the drawer control
 /// channel, and mark pane damage. Moved verbatim from the run.rs drain
 /// (adapted to `ctx` borrows; per-chunk work now runs once per merged buffer).
-fn handle_output(ctx: &mut DrainCtx<'_>, id: u32, b: &[u8], admit_clipboard: bool) {
+fn handle_output(ctx: &mut DrainCtx<'_>, id: u32, b: &[u8], admit_generation: bool) {
     // Associate output with the session tree before borrowing the pane mutably.
     // Parsing this bounded tail is pure CPU; a full chrome repaint is raised
     // only when discovery/status changes, never for unrelated PTY bytes.
@@ -648,7 +651,7 @@ fn handle_output(ctx: &mut DrainCtx<'_>, id: u32, b: &[u8], admit_clipboard: boo
         *ctx.dirty = true;
     }
     if let Some(p) = ctx.panes.table.get_mut(&id) {
-        if admit_clipboard {
+        if admit_generation {
             p.clipboard.feed(b);
         }
         // First real output ⇒ this worktree's shell is live; drop its loading
@@ -728,14 +731,17 @@ fn handle_output(ctx: &mut DrainCtx<'_>, id: u32, b: &[u8], admit_clipboard: boo
             });
             // DA/DSR/OSC replies + OSC52 passthrough on the graphics-stripped
             // bytes only (the kitty probe, if any, was answered by the relay).
-            if !emu_text.is_empty() {
+            if admit_generation && !emu_text.is_empty() {
                 let resp = {
                     let (fg, bg) = crate::compositor::pane_colors();
-                    let emu = p.emulator();
-                    crate::queries::query_responses(
+                    let (cursor, size) = {
+                        let emu = p.emulator();
+                        (emu.cursor(), emu.size())
+                    };
+                    p.query_parser.feed(
                         &emu_text,
-                        emu.cursor(),
-                        emu.size(),
+                        cursor,
+                        size,
                         crate::queries::PaneColors { fg, bg },
                     )
                 };
@@ -760,18 +766,24 @@ fn handle_output(ctx: &mut DrainCtx<'_>, id: u32, b: &[u8], admit_clipboard: boo
             p.feed(b);
             // Answer terminal queries (DA/DSR/OSC color, kitty probes) the app
             // just sent — without a reply, programs like yazi warn or time out.
-            let resp = {
+            let resp = if admit_generation {
                 let (fg, bg) = crate::compositor::pane_colors();
-                let emu = p.emulator();
-                crate::queries::query_responses(
-                    b,
-                    emu.cursor(),
-                    emu.size(),
-                    crate::queries::PaneColors { fg, bg },
-                )
+                let (cursor, size) = {
+                    let emu = p.emulator();
+                    (emu.cursor(), emu.size())
+                };
+                p.query_parser
+                    .feed(b, cursor, size, crate::queries::PaneColors { fg, bg })
+            } else {
+                Vec::new()
             };
             if !resp.is_empty() {
-                let _ = p.write_reply(&resp); // best-effort: reply: the pane may be gone; the reply is dropped
+                if let Err(e) = p.write_reply(&resp) {
+                    tracing::warn!(
+                        target: "thegn::pane",
+                        "dropped a terminal-query reply ({e}); an inner program may hang"
+                    );
+                }
             }
             if ctx.visible.contains(&id) {
                 // Pane-content-only damage: recompose just this pane, not the
@@ -1967,6 +1979,67 @@ mod tests {
         });
         assert_eq!(admitted, b"\x1b]52;c;eg==\x07");
         assert!(backlog.is_empty());
+    }
+
+    #[test]
+    fn drain_fairness_slice_keeps_a_split_query_and_answers_once() {
+        let mut backlog = PtyBacklog::default();
+        let mut bytes = vec![b'x'; 16 * 1024 - 1];
+        bytes.extend_from_slice(b"\x1b[5n");
+        backlog.push(7, bytes);
+        let mut parser = crate::queries::QueryParser::default();
+        let mut replies = Vec::new();
+        let pass = drain_backlog_work(
+            &mut backlog,
+            64 * 1024,
+            Duration::from_secs(5),
+            Instant::now(),
+            |_, slice, current| {
+                if current {
+                    replies.extend(parser.feed(
+                        slice,
+                        (4, 9),
+                        (24, 80),
+                        crate::queries::PaneColors {
+                            fg: (1, 2, 3),
+                            bg: (4, 5, 6),
+                        },
+                    ));
+                }
+            },
+            || false,
+        );
+        assert!(pass.fed_panes.contains(&7));
+        assert_eq!(replies, b"\x1b[0n");
+    }
+
+    #[test]
+    fn stale_generation_tail_cannot_complete_a_query_after_barrier() {
+        let mut backlog = PtyBacklog::default();
+        let mut parser = crate::queries::QueryParser::default();
+        let colors = crate::queries::PaneColors {
+            fg: (1, 2, 3),
+            bg: (4, 5, 6),
+        };
+        assert!(parser.feed(b"\x1b[", (4, 9), (24, 80), colors).is_empty());
+        backlog.push(7, b"5n".to_vec());
+        backlog.barrier(7);
+        parser.reset();
+        backlog.push(7, b"5n\x1b[5n".to_vec());
+        let mut replies = Vec::new();
+        drain_backlog_work(
+            &mut backlog,
+            64 * 1024,
+            Duration::from_secs(5),
+            Instant::now(),
+            |_, slice, current| {
+                if current {
+                    replies.extend(parser.feed(slice, (4, 9), (24, 80), colors));
+                }
+            },
+            || false,
+        );
+        assert_eq!(replies, b"\x1b[0n");
     }
 
     #[test]
