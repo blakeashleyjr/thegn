@@ -90,8 +90,37 @@ pub(crate) fn managed_seed_files(cfg: &Config) -> Result<ManagedSeedFiles, Strin
         return Err(diagnostics.join("; "));
     }
 
-    let excludes: BTreeSet<String> = cfg.skills.exclude.iter().cloned().collect();
-    let gates = gate_state(cfg);
+    // Authority is deliberately computed WITHOUT the current exclusions and
+    // gates. The question cleanup asks is "could this module have written these
+    // exact bytes here?", not "would it write them under today's config" — a
+    // file seeded while `[merge_queue] enabled` was true is still thegn's file
+    // after the key is flipped, and a skill added to `skills.exclude` later
+    // does not unwrite what it already seeded. Narrowing authority by the live
+    // config is the same substitution of a cheap proxy for the real question
+    // that this whole area exists to fix, and it fails in the direction that
+    // blames the operator for the tool's own state.
+    //
+    // Breadth costs nothing: every removal still requires an exact byte match
+    // against this set (`cleanup_file_matches`), so a claim can only ever
+    // authorise deleting bytes this writer is able to produce.
+    const ALL_GATES: [GateState; 4] = [
+        GateState {
+            merge_queue_open: false,
+            pipeline_open: false,
+        },
+        GateState {
+            merge_queue_open: true,
+            pipeline_open: false,
+        },
+        GateState {
+            merge_queue_open: false,
+            pipeline_open: true,
+        },
+        GateState {
+            merge_queue_open: true,
+            pipeline_open: true,
+        },
+    ];
     let mut managed = ManagedSeedFiles::default();
     for harness_id in harnesses {
         let Some(harness) = thegn_core::harness::harness(&harness_id) else {
@@ -102,38 +131,41 @@ pub(crate) fn managed_seed_files(cfg: &Config) -> Result<ManagedSeedFiles, Strin
         };
         let root = PathBuf::from(layout.project_root);
         managed.add_root(root.clone());
-        // The writer applies this same pure plan at each lifecycle phase.
-        // Unioning the possible phase plans keeps cleanup authoritative for a
-        // file seeded at create/startup/explicit time, while the target's
-        // exclusion and gate filters prevent claims for content this config
-        // would not seed. An empty survey makes `writes` the effective output
-        // bytes without inspecting or trusting the worktree.
+        // The writer applies this same pure plan at each lifecycle phase, so
+        // union every (phase, gate) combination it could have been called with.
+        // An empty survey makes `writes` the effective output bytes without
+        // inspecting or trusting the worktree.
         for phase in [SeedPhase::Create, SeedPhase::Startup, SeedPhase::Explicit] {
-            let target =
-                thegn_core::skills::SeedTarget::new(&harness_id, phase, excludes.iter().cloned());
-            let plan = plan_seed(&loaded.registry, &target, &[], gates);
-            if !plan.diagnostics.is_empty() {
-                return Err(plan.diagnostics.join("; "));
-            }
-            for operation in plan.writes {
-                managed.add_file(root.join(operation.relative), operation.contents);
+            for gates in ALL_GATES {
+                let target = thegn_core::skills::SeedTarget::new(
+                    &harness_id,
+                    phase,
+                    std::iter::empty::<String>(),
+                );
+                let plan = plan_seed(&loaded.registry, &target, &[], gates);
+                if !plan.diagnostics.is_empty() {
+                    return Err(plan.diagnostics.join("; "));
+                }
+                for operation in plan.writes {
+                    managed.add_file(root.join(operation.relative), operation.contents);
+                }
             }
         }
 
         if harness_id == "claude" {
             let command_root = PathBuf::from(".claude/commands");
             managed.add_root(command_root);
-            if cfg.merge_queue.enabled && !excludes.contains("mq") {
-                for command in MQ_COMMANDS {
-                    // Both forms are valid historical output from the same
-                    // enabled writer: raw bytes are migrated to the current
-                    // marker-wrapped form on the next seed.
-                    managed.add_file(command.relative, command.body.as_bytes().to_vec());
-                    managed.add_file(
-                        command.relative,
-                        render_managed_legacy(command.body).into_bytes(),
-                    );
-                }
+            for command in MQ_COMMANDS {
+                // Both forms are valid historical output from the same writer:
+                // disabled merge-queue seeding retained the raw body, while
+                // enabled seeding writes the marker-wrapped rendering. Neither
+                // is gated on today's `[merge_queue] enabled`, for the reason
+                // given at ALL_GATES.
+                managed.add_file(command.relative, command.body.as_bytes().to_vec());
+                managed.add_file(
+                    command.relative,
+                    render_managed_legacy(command.body).into_bytes(),
+                );
             }
         }
     }

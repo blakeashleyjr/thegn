@@ -797,6 +797,18 @@ fn remove_seeded_files_with_hook(
 
         crate::platform::unlink_cleanup_file_at(&parent, parent_path, name, &current)
             .map_err(|_| Refusal::ManagedChanged(relative.to_string_lossy().into_owned()))?;
+
+        // Drop every descriptor before pruning the directory they point into, so
+        // Windows is not asked to remove a directory with live handles beneath it.
+        drop(current);
+        drop(file);
+        drop(parent);
+        // best-effort: `remove_dir` only ever succeeds on an empty directory, so
+        // this reaps a seed directory we just emptied and silently declines on
+        // anything else. Keep it: without it `.claude/skills/<name>/` survives as
+        // an empty leftover, which is how a later observation comes to find
+        // "state" in a worktree the tool itself created.
+        let _ = std::fs::remove_dir(parent_path);
     }
     Ok(())
 }
