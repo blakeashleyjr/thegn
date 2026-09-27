@@ -442,7 +442,7 @@ impl Workspace {
             }
         }
         if !marked_in_reuse_root {
-            record_external_quarantine(&self.checkout.worktree.path(), reason);
+            record_external_quarantine(self.checkout.worktree.path(), reason);
         }
     }
 }

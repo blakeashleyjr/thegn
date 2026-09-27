@@ -7,8 +7,6 @@ use std::sync::atomic::AtomicBool;
 
 impl<R: std::io::Read + std::os::fd::AsRawFd> super::GatePipe for R {
     fn set_nonblocking(&self) -> io::Result<()> {
-        use std::os::fd::AsRawFd;
-
         // SAFETY: fcntl changes only the status flags on our owned pipe descriptor.
         let fd = self.as_raw_fd();
         let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
@@ -486,10 +484,10 @@ impl GroupHandle {
     /// Whether the owned process group has no live members. This is an
     /// observation only; the handle never signals by a potentially reused ID.
     pub fn is_empty(&self) -> bool {
-        match nix::sys::signal::killpg(nix::unistd::Pid::from_raw(self.pgid), None) {
-            Err(nix::errno::Errno::ESRCH) => true,
-            _ => false,
-        }
+        matches!(
+            nix::sys::signal::killpg(nix::unistd::Pid::from_raw(self.pgid), None),
+            Err(nix::errno::Errno::ESRCH)
+        )
     }
 }
 
