@@ -298,10 +298,16 @@ fn reap_generation_footprints(
     let mut all_removed = 0u64;
     for (worktree, _) in fresh {
         let worktree_path = std::path::Path::new(worktree);
+        // `git_out` collapses EMPTY stdout to `None`, and an empty
+        // `status --porcelain` is precisely "clean" — the only state we may
+        // prune in. Using it here made this guard skip every clean worktree, so
+        // the reclaim never ran at all. `git_out_allow_empty` keeps "clean"
+        // (`Some("")`) distinct from "git failed" (`None`), and a failed status
+        // read must still refuse.
         if active == Some(worktree.as_str())
             || awaiting_verification.iter().any(|path| path == worktree)
             || crate::task::slot_active(worktree_path)
-            || thegn_core::util::git_out(worktree_path, &["status", "--porcelain"])
+            || thegn_core::util::git_out_allow_empty(worktree_path, &["status", "--porcelain"])
                 .is_none_or(|output| !output.trim().is_empty())
         {
             continue;
