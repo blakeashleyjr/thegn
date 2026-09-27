@@ -223,6 +223,17 @@ impl Recording {
 
     /// Reconstruct the pane's grid at time `at_ms` into a fresh emulator by
     /// re-feeding the retained byte slice. Exact within the retained window.
+    ///
+    /// Production callers want the cursor too and use
+    /// [`reconstruct_with_cursor`](Self::reconstruct_with_cursor); this
+    /// timestamp-only form is what the tests assert against.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "timestamp-only reconstruction is asserted by the replay tests; production uses reconstruct_with_cursor"
+        )
+    )]
     pub fn reconstruct(&self, at_ms: u64) -> AlacrittyEmulator {
         self.reconstruct_with_cursor(at_ms).0
     }
@@ -236,18 +247,13 @@ impl Recording {
         (emu, cursor)
     }
 
-    /// Feed events with `from_exclusive < at_ms <= to_inclusive` into an existing
-    /// emulator — the incremental forward-playback path (no full rebuild). Callers
-    /// that jump backwards must [`reconstruct`](Self::reconstruct) from scratch.
-    pub fn feed_into(&self, emu: &mut AlacrittyEmulator, from_exclusive: u64, to_inclusive: u64) {
-        let from_seq = self
-            .events
-            .iter()
-            .find(|ev| ev.at_ms > from_exclusive)
-            .map(|ev| ev.seq)
-            .unwrap_or(self.next_seq);
-        self.feed_from_sequence(emu, from_seq, to_inclusive);
-    }
+    // The timestamp-keyed `feed_into(from_exclusive, to_inclusive)` that used to
+    // sit here is gone: a millisecond cursor cannot express a position inside a
+    // same-millisecond group, which is the defect this change fixes, so every
+    // caller now holds a sequence and calls `feed_from_sequence` directly. It was
+    // left unused by that move — restoring a timestamp entry point means mapping
+    // the timestamp to the first event with `at_ms > from_exclusive`, and doing it
+    // at the call site where the ambiguity is visible.
 
     /// Feed the retained suffix beginning at an absolute event sequence through
     /// `to_inclusive`, returning the next sequence to apply. Callers rebuild if
@@ -540,8 +546,10 @@ mod tests {
             initial,
             "repeating the same interval adds nothing"
         );
-        let cursor = rec.feed_from_sequence(&mut emu, cursor, 10);
+        // Feeding through 10ms consumes the later event and advances past it.
+        let advanced = rec.feed_from_sequence(&mut emu, cursor, 10);
         assert!(grid_text(&emu).contains("later"));
+        assert!(advanced > cursor, "consuming an event advances the cursor");
         let (rebuilt, rebuilt_cursor) = rec.reconstruct_with_cursor(0);
         assert_eq!(
             grid_text(&rebuilt),
