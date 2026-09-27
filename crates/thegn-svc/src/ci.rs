@@ -1166,6 +1166,10 @@ mod tests {
             "https://gitlab.com/group/repo#fragment",
             "https://user@gitlab.com/group/repo",
             "https://gitlab.com/group%2Frepo/sub",
+            // URL parsing normalizes these dot segments unless the raw path is
+            // checked before parsing; remotes must not silently retarget.
+            "https://gitlab.com/../group/repo",
+            "https://gitlab.com/%2e%2e/group/repo",
             "git@gitlab.com:group/../repo.git",
             "git@gitlab.com:group//repo.git",
             "git@gitlab.com:group/repo#fragment",
@@ -1266,6 +1270,11 @@ mod tests {
             "projects/group%2Fsub%2Frepo/pipelines?per_page=30&ref=feature%26status%3Dsuccess%23x%25"
         );
         assert!(gitlab_pipelines_endpoint("group%2Frepo", Some("bad ref"), 30).is_err());
+        // Match git-check-ref-format's rule that a ref component cannot start
+        // with a dot. This guards validation independently of query encoding.
+        for invalid in [".hidden", "feature/.hidden"] {
+            assert!(validate_branch_ref(invalid).is_err(), "{invalid:?}");
+        }
         assert_eq!(
             github_run_detail_argv("123").unwrap(),
             ["run", "view", "--json", GH_DETAIL_FIELDS, "--", "123"]
