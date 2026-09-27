@@ -15,13 +15,33 @@ use std::process::{Child, Command};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, STILL_ACTIVE, WAIT_OBJECT_0};
+impl<R: std::io::Read + std::os::windows::io::AsRawHandle> super::GatePipe for R {
+    fn set_nonblocking(&self) -> io::Result<()> {
+        gate_pipe_handle_nonblocking(std::os::windows::io::AsRawHandle::as_raw_handle(self))
+    }
+
+    fn read_available(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        match gate_pipe_available(std::os::windows::io::AsRawHandle::as_raw_handle(self))? {
+            0 => Err(io::ErrorKind::WouldBlock.into()),
+            _ => std::io::Read::read(self, bytes),
+        }
+    }
+}
+
+use windows_sys::Win32::Foundation::{
+    CloseHandle, HANDLE, INVALID_HANDLE_VALUE, STILL_ACTIVE, WAIT_OBJECT_0,
+};
 use windows_sys::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE, SetStdHandle};
+use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
+};
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-    SetInformationJobObject, TerminateJobObject,
+    JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    JobObjectBasicAccountingInformation, JobObjectExtendedLimitInformation,
+    QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
 };
+use windows_sys::Win32::System::Pipes::PeekNamedPipe;
 
 pub(crate) fn os_path_from_git_bytes(bytes: &[u8]) -> anyhow::Result<std::path::PathBuf> {
     let path = String::from_utf8(bytes.to_vec()).map_err(|error| {
@@ -34,7 +54,8 @@ pub(crate) fn display_git_path(path: &std::path::Path) -> String {
     path.to_string_lossy().into_owned()
 }
 use windows_sys::Win32::System::Threading::{
-    GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
+    CREATE_SUSPENDED, GetExitCodeProcess, OpenProcess, OpenThread,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, ResumeThread, THREAD_SUSPEND_RESUME,
     TerminateProcess, WaitForSingleObject,
 };
 
@@ -719,6 +740,26 @@ impl GroupHandle {
     pub fn kill(&self) {
         self.terminate();
     }
+
+    /// Whether the retained Job Object has no active processes.
+    pub fn is_empty(&self) -> bool {
+        let Some(job) = &self.job else {
+            return !pid_alive(i64::from(self.pid));
+        };
+        let mut info: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: the job handle is owned by this GroupHandle and `info` is a
+        // correctly-sized writable output structure.
+        let ok = unsafe {
+            QueryInformationJobObject(
+                job.0,
+                JobObjectBasicAccountingInformation,
+                (&mut info as *mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION).cast(),
+                std::mem::size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+                std::ptr::null_mut(),
+            )
+        } != 0;
+        ok && info.ActiveProcesses == 0
+    }
 }
 
 /// Put an already spawned PTY child in a kill-on-close Job Object while its
@@ -788,6 +829,158 @@ pub fn spawn_grouped(cmd: &mut Command) -> std::io::Result<(std::process::Child,
         }
     };
     Ok((child, GroupHandle { pid, job }))
+}
+
+/// Gate spawn is fail-closed: establish a configured kill-on-close Job Object
+/// before creating the command; create the process suspended, assign it to the
+/// job, then resume its sole startup thread. Other callers retain
+/// `spawn_grouped`'s historical degradation.
+fn resume_suspended_gate_process(pid: u32) -> io::Result<()> {
+    // SAFETY: snapshot creation takes no borrowed pointers and returns an owned
+    // kernel handle which is closed on every path below.
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    let mut entry: THREADENTRY32 = unsafe { std::mem::zeroed() };
+    entry.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
+    // SAFETY: `entry` is initialized with its required size and writable.
+    let mut found = unsafe { Thread32First(snapshot, &mut entry) } != 0;
+    let mut thread_id = None;
+    while found {
+        if entry.th32OwnerProcessID == pid {
+            if thread_id.replace(entry.th32ThreadID).is_some() {
+                unsafe { CloseHandle(snapshot) };
+                return Err(io::Error::other(
+                    "suspended gate process exposed more than one startup thread",
+                ));
+            }
+        }
+        // SAFETY: `entry` remains a correctly-sized writable THREADENTRY32.
+        found = unsafe { Thread32Next(snapshot, &mut entry) } != 0;
+    }
+    // SAFETY: release the snapshot acquired above.
+    unsafe { CloseHandle(snapshot) };
+    let thread_id =
+        thread_id.ok_or_else(|| io::Error::other("suspended gate startup thread was not found"))?;
+    // SAFETY: open the unique thread belonging to the suspended child process.
+    let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, thread_id) };
+    if thread.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: resume exactly the startup thread we opened and then close it.
+    let previous = unsafe { ResumeThread(thread) };
+    unsafe { CloseHandle(thread) };
+    if previous == u32::MAX {
+        Err(io::Error::last_os_error())
+    } else if previous != 1 {
+        Err(io::Error::other(format!(
+            "gate startup thread had unexpected suspend count {previous}"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+pub fn spawn_gate_grouped(
+    cmd: &mut Command,
+) -> std::io::Result<(std::process::Child, GroupHandle)> {
+    use std::os::windows::io::AsRawHandle;
+    // SAFETY: a fresh Job Object is owned here until transferred to JobInner.
+    let job = unsafe {
+        let handle = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+        if handle.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let configured = SetInformationJobObject(
+            handle,
+            JobObjectExtendedLimitInformation,
+            (&info as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        ) != 0;
+        if !configured {
+            let error = io::Error::last_os_error();
+            CloseHandle(handle);
+            return Err(error);
+        }
+        handle
+    };
+    use std::os::windows::process::CommandExt;
+    cmd.creation_flags(CREATE_SUSPENDED);
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            // SAFETY: release the untransferred, empty Job Object.
+            unsafe { CloseHandle(job) };
+            return Err(error);
+        }
+    };
+    // SAFETY: `child` is suspended and cannot spawn any descendants before its
+    // assignment; on success the retained JobInner owns the job handle.
+    if unsafe { AssignProcessToJobObject(job, child.as_raw_handle() as HANDLE) } == 0 {
+        let error = io::Error::last_os_error();
+        let _ = child.kill(); // best-effort: fail-closed spawn cleanup
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "failed gate containment assignment; reap the direct child before returning the spawn failure"
+        )]
+        let _ = child.wait();
+        // SAFETY: assignment failed, so this remains an empty job.
+        unsafe { CloseHandle(job) };
+        return Err(error);
+    }
+    let pid = child.id();
+    let group = GroupHandle {
+        pid,
+        job: Some(Arc::new(JobInner(job))),
+    };
+    if let Err(error) = resume_suspended_gate_process(pid) {
+        group.kill();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "failed to resume only after the suspended process was contained; reap before refusing gate spawn"
+        )]
+        let _ = child.wait();
+        return Err(error);
+    }
+    Ok((child, group))
+}
+
+/// Query available anonymous-pipe bytes so the gate reader can poll and honor
+/// cancellation even when an escaped descendant keeps the writer open.
+pub fn gate_pipe_available(handle: std::os::windows::io::RawHandle) -> io::Result<usize> {
+    let mut available = 0u32;
+    // SAFETY: PeekNamedPipe reads metadata from the owned child pipe handle and
+    // writes one DWORD to our initialized out parameter.
+    let ok = unsafe {
+        PeekNamedPipe(
+            handle as HANDLE,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            &mut available,
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(available as usize)
+    }
+}
+
+fn gate_pipe_handle_nonblocking(_handle: std::os::windows::io::RawHandle) -> io::Result<()> {
+    // Windows anonymous pipes have no nonblocking mode. Gate readers use
+    // PeekNamedPipe before each read and poll cancellation between reads.
+    Ok(())
+}
+
+/// Windows `try_wait` observes exit while the retained process and Job Object
+/// handles continue to pin ownership of the child and its descendants.
+pub fn gate_child_exited(child: &mut Child) -> io::Result<bool> {
+    child.try_wait().map(|status| status.is_some())
 }
 
 /// Spawn a native clipboard helper using the existing direct-child behavior.

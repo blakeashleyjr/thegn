@@ -419,6 +419,91 @@ struct Workspace {
     temporary_parent: Option<PathBuf>,
 }
 
+impl Workspace {
+    fn poison(&self, reason: &str) {
+        let mut marked_in_reuse_root = false;
+        if self.temporary_parent.is_none()
+            && self.parent.verify().is_ok()
+            && self.lock.as_ref().is_some_and(|lock| lock.verify().is_ok())
+        {
+            let marker = self.parent.path().join("gate.poisoned");
+            let contents = serde_json::json!({
+                "workspace": self.checkout.worktree.path().display().to_string(),
+                "reason": reason,
+            })
+            .to_string();
+            // A marker is advisory operator-visible state; the held lock and
+            // leaked Workspace are the actual no-reuse guarantee in-process.
+            match std::fs::write(marker, contents) {
+                Ok(()) => marked_in_reuse_root = true,
+                Err(error) => {
+                    tracing::error!(target: "thegn::merge_gate", error = %error, reason, "could not persist poisoned gate marker")
+                }
+            }
+        }
+        if !marked_in_reuse_root {
+            record_external_quarantine(self.checkout.worktree.path(), reason);
+        }
+    }
+}
+
+pub(super) fn poisoned_gate_workspaces() -> Vec<(PathBuf, String)> {
+    let root = util::xdg_state_home().join("thegn/gate");
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let marker = entry.path().join("gate.poisoned");
+            let contents = std::fs::read_to_string(&marker).ok()?;
+            let value = serde_json::from_str::<serde_json::Value>(&contents).ok();
+            let workspace = value
+                .as_ref()
+                .and_then(|value| value.get("workspace"))
+                .and_then(serde_json::Value::as_str)
+                .map(PathBuf::from)
+                .unwrap_or_else(|| entry.path());
+            let reason = value
+                .as_ref()
+                .and_then(|value| value.get("reason"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+                .unwrap_or(contents);
+            Some((workspace, reason))
+        })
+        .collect()
+}
+
+fn gate_path_is_quarantined(path: &Path) -> bool {
+    poisoned_gate_workspaces()
+        .iter()
+        .any(|(workspace, _)| workspace == path)
+}
+
+fn record_external_quarantine(workspace: &Path, reason: &str) {
+    let root = util::xdg_state_home().join("thegn/gate");
+    let recorded = (|| -> Result<()> {
+        std::fs::create_dir_all(&root)?;
+        let marker_dir = tempfile::Builder::new()
+            .prefix("quarantine-")
+            .tempdir_in(&root)?
+            .keep();
+        std::fs::write(
+            marker_dir.join("gate.poisoned"),
+            serde_json::json!({
+                "workspace": workspace.display().to_string(),
+                "reason": reason,
+            })
+            .to_string(),
+        )?;
+        Ok(())
+    })();
+    if let Err(error) = recorded {
+        tracing::error!(target: "thegn::merge_gate", path = %workspace.display(), error = %error, "could not persist quarantined gate workspace marker");
+    }
+}
+
 fn verified_repository_id(repo: &Repository, common: &Directory) -> Result<String> {
     // `common` is retained and checked by the workspace, so its filesystem
     // identity is the confirmation. Git's own absolute common-dir resolution
@@ -519,6 +604,11 @@ impl Workspace {
             let base = identity.as_ref().ok().map(|id| gate_base(id));
             let reused = base.as_ref().and_then(|base| {
                 (|| -> Result<_> {
+                    ensure!(
+                        !base.join("gate.poisoned").try_exists()?
+                            && !gate_path_is_quarantined(&base.join("wt")),
+                        "reused gate workspace is quarantined after unresolved workload"
+                    );
                     let parent = Directory::open(base, Some(&state))
                         .context("gate state directory unavailable")?;
                     let lock =
@@ -785,11 +875,16 @@ impl Workspace {
         Ok(command)
     }
 
-    #[expect(clippy::disallowed_methods)]
-    fn spawn(&self, command: &str) -> Result<std::process::Output> {
-        self.command_for(command)?
-            .output()
-            .context("gate command could not be started")
+    fn spawn(
+        &self,
+        command: &str,
+        timeout_secs: u64,
+    ) -> Result<super::super::gate_capture::CaptureResult> {
+        let command = self.command_for(command)?;
+        Ok(super::super::gate_capture::run(
+            command,
+            std::time::Duration::from_secs(timeout_secs),
+        ))
     }
 }
 
@@ -896,11 +991,16 @@ impl NativeWorkspace {
         Ok(command)
     }
 
-    #[expect(clippy::disallowed_methods)]
-    fn spawn(&self, command: &str) -> Result<std::process::Output> {
-        self.command_for(command)?
-            .output()
-            .context("isolated gate command could not be started")
+    fn spawn(
+        &self,
+        command: &str,
+        timeout_secs: u64,
+    ) -> Result<super::super::gate_capture::CaptureResult> {
+        let command = self.command_for(command)?;
+        Ok(super::super::gate_capture::run(
+            command,
+            std::time::Duration::from_secs(timeout_secs),
+        ))
     }
 
     #[expect(
@@ -940,36 +1040,36 @@ impl NativeWorkspace {
 fn run_native_isolated(repo: &Path, oid: &str, config: &MergeQueueConfig) -> Result<GateVerdict> {
     let workspace = NativeWorkspace::prepare(repo, oid, config)
         .with_context(|| format!("isolated gate preparation failed for {}", repo.display()))?;
+    let mut poisoned = false;
     let verdict = (|| -> Result<GateVerdict> {
         if !config.gate_setup_command.is_empty() {
-            let output = workspace.spawn(&config.gate_setup_command)?;
+            let output =
+                workspace.spawn(&config.gate_setup_command, config.gate_setup_timeout_secs)?;
+            let setup_passed = matches!(&output, super::super::gate_capture::CaptureResult::Completed { status, .. } if status.success());
+            let (setup_verdict, keep) = capture_verdict(output, true);
+            poisoned = keep;
+            if keep {
+                return Ok(setup_verdict);
+            }
             workspace.verify()?;
-            if !output.status.success() {
-                return Ok(GateVerdict::Error {
-                    reason: format!(
-                        "gate_setup_command failed (exit {})",
-                        output
-                            .status
-                            .code()
-                            .map_or_else(|| "signal".into(), |code| code.to_string())
-                    ),
-                    log: output_tail(&output),
-                });
+            if !setup_passed {
+                return Ok(setup_verdict);
             }
         }
-        let output = workspace.spawn(&config.gate_command)?;
-        workspace.verify()?;
-        Ok(match gate::classify_exit(output.status.code(), false) {
-            gate::GateClass::Passed => GateVerdict::Passed,
-            gate::GateClass::Failed => GateVerdict::Failed {
-                log: output_tail(&output),
-            },
-            gate::GateClass::Error => GateVerdict::Error {
-                reason: gate::error_reason(output.status.code(), false).into(),
-                log: output_tail(&output),
-            },
-        })
+        let output = workspace.spawn(&config.gate_command, config.gate_timeout_secs)?;
+        let (verdict, keep) = capture_verdict(output, false);
+        poisoned = keep;
+        if !keep {
+            workspace.verify()?;
+        }
+        Ok(verdict)
     })();
+    if poisoned {
+        if let Ok(GateVerdict::Error { reason, .. }) = &verdict {
+            record_external_quarantine(&workspace.worktree, reason);
+        }
+        return verdict;
+    }
     workspace.verify()?;
     let cleanup = workspace.cleanup();
     cleanup?;
@@ -981,40 +1081,94 @@ pub(super) fn run(repo: &Path, oid: &str, config: &MergeQueueConfig) -> Result<G
         return run_native_isolated(repo, oid, config);
     }
     let workspace = Workspace::prepare(repo, oid, config)?;
+    let mut poisoned = false;
     let verdict = (|| -> Result<GateVerdict> {
         if !config.gate_setup_command.is_empty() {
-            let output = workspace.spawn(&config.gate_setup_command)?;
+            let output =
+                workspace.spawn(&config.gate_setup_command, config.gate_setup_timeout_secs)?;
+            let setup_passed = matches!(&output, super::super::gate_capture::CaptureResult::Completed { status, .. } if status.success());
+            let (setup_verdict, keep) = capture_verdict(output, true);
+            poisoned = keep;
+            if keep {
+                if let GateVerdict::Error { reason, .. } = &setup_verdict {
+                    workspace.poison(reason);
+                }
+                return Ok(setup_verdict);
+            }
             workspace.verify()?;
-            if !output.status.success() {
-                return Ok(GateVerdict::Error {
-                    reason: format!(
-                        "gate_setup_command failed (exit {})",
-                        output
-                            .status
-                            .code()
-                            .map_or_else(|| "signal".into(), |code| code.to_string())
-                    ),
-                    log: output_tail(&output),
-                });
+            if !setup_passed {
+                return Ok(setup_verdict);
             }
         }
-        let output = workspace.spawn(&config.gate_command)?;
-        workspace.verify()?;
-        Ok(match gate::classify_exit(output.status.code(), false) {
-            gate::GateClass::Passed => GateVerdict::Passed,
-            gate::GateClass::Failed => GateVerdict::Failed {
-                log: output_tail(&output),
-            },
-            gate::GateClass::Error => GateVerdict::Error {
-                reason: gate::error_reason(output.status.code(), false).into(),
-                log: output_tail(&output),
-            },
-        })
+        let output = workspace.spawn(&config.gate_command, config.gate_timeout_secs)?;
+        let (verdict, keep) = capture_verdict(output, false);
+        poisoned = keep;
+        if keep {
+            if let GateVerdict::Error { reason, .. } = &verdict {
+                workspace.poison(reason);
+            }
+        } else {
+            workspace.verify()?;
+        }
+        Ok(verdict)
     })();
+    if poisoned {
+        std::mem::forget(workspace);
+        return verdict;
+    }
     // Never remove a replaced or unverified checkout, even on an error path.
     workspace.verify()?;
     workspace.cleanup()?;
     verdict
+}
+
+fn capture_verdict(
+    result: super::super::gate_capture::CaptureResult,
+    setup: bool,
+) -> (GateVerdict, bool) {
+    use super::super::gate_capture::CaptureResult as Capture;
+    match result {
+        Capture::Completed { status, log } if setup && !status.success() => (
+            GateVerdict::Error {
+                reason: format!(
+                    "gate_setup_command failed (exit {})",
+                    status
+                        .code()
+                        .map_or_else(|| "signal".into(), |code| code.to_string())
+                ),
+                log,
+            },
+            false,
+        ),
+        Capture::Completed { status, .. } if setup && status.success() => {
+            (GateVerdict::Passed, false)
+        }
+        Capture::Completed { status, log } => (
+            match gate::classify_exit(status.code(), false) {
+                gate::GateClass::Passed => GateVerdict::Passed,
+                gate::GateClass::Failed => GateVerdict::Failed { log },
+                gate::GateClass::Error => GateVerdict::Error {
+                    reason: gate::error_reason(status.code(), false).into(),
+                    log,
+                },
+            },
+            false,
+        ),
+        Capture::Timeout { log } => (
+            GateVerdict::Error {
+                reason: if setup {
+                    "gate_setup_command timed out"
+                } else {
+                    "gate_command timed out"
+                }
+                .into(),
+                log,
+            },
+            false,
+        ),
+        Capture::Infrastructure { reason, log } => (GateVerdict::Error { reason, log }, false),
+        Capture::Poisoned { reason, log } => (GateVerdict::Error { reason, log }, true),
+    }
 }
 
 fn output_tail(output: &std::process::Output) -> String {
