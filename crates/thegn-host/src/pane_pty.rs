@@ -81,9 +81,8 @@ impl PtyProcessOwner {
     }
 
     /// Bounded tree teardown. No wait/reap occurs until after the final group
-    /// signal, keeping the Unix group id anchored to this child. Unix verifies
-    /// the group is live before KILL; inability to verify is recorded and
-    /// leaves the group untouched.
+    /// signal, keeping the Unix group id anchored to this child; Windows keeps
+    /// the corresponding Job Object in the platform handle.
     pub(crate) fn terminate_and_reap(&self) -> Option<i32> {
         let mut state = self.0.lock().unwrap_or_else(|poison| poison.into_inner());
         if state.complete {
@@ -96,10 +95,7 @@ impl PtyProcessOwner {
         }
         std::thread::sleep(crate::platform::pty_term_grace());
         if let Some(group) = &state.group {
-            force_kill_group(
-                group,
-                state.child.as_ref().and_then(|child| child.process_id()),
-            );
+            force_kill_group(group);
         }
         let code = state
             .child
@@ -125,10 +121,7 @@ impl Drop for PtyProcessState {
         }
         std::thread::sleep(crate::platform::pty_term_grace());
         if let Some(group) = &self.group {
-            force_kill_group(
-                group,
-                self.child.as_ref().and_then(|child| child.process_id()),
-            );
+            force_kill_group(group);
         }
         if let Some(child) = self.child.as_mut() {
             let _ = child.wait();
@@ -136,24 +129,21 @@ impl Drop for PtyProcessState {
     }
 }
 
-fn force_kill_group(group: &crate::platform::GroupHandle, pid: Option<u32>) {
+fn force_kill_group(group: &crate::platform::GroupHandle) {
     #[cfg(unix)]
-    match group.kill_if_alive(pid) {
-        Ok(true) => {}
-        Ok(false) => tracing::debug!(
-            pid,
-            "PTY process group exited during TERM grace; no KILL sent"
-        ),
-        Err(error) => {
-            tracing::warn!(%error, pid, "could not verify PTY process group before force-kill; leaving it untouched")
-        }
+    {
+        // This group was created by us with setpgid and its leader remains
+        // unreaped until after teardown. A PGID cannot be reused while any
+        // member remains, so signaling after the leader exits is safe and is
+        // required to stop surviving descendants. Stored proxy PIDs can be
+        // reused after reaping, so terminate_proxy_pid re-verifies identity.
+        group.kill();
     }
 
     // Windows teardown is an immediate Job Object hard kill by design; no
     // graceful TERM interval or Unix-style process-group probe is available.
     #[cfg(not(unix))]
     {
-        let _ = pid;
         group.kill();
     }
 }
