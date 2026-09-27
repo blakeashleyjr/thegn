@@ -129,23 +129,22 @@ impl Drop for PtyProcessState {
     }
 }
 
+/// Force-terminate the whole owned group, unconditionally.
+///
+/// On Unix this group was created by us with `setpgid` and its leader stays
+/// unreaped until after teardown. **A PGID cannot be reused while any member
+/// remains**, so signalling it after the leader exits is safe and is exactly what
+/// stops surviving descendants — unlike a stored *PID*, which can be recycled
+/// once reaped, which is why `terminate_proxy_pid` re-verifies identity first.
+///
+/// On Windows teardown is an immediate Job Object hard kill by design: there is no
+/// graceful TERM interval and no process-group probe to make.
+///
+/// Both platforms therefore do the same thing here, so this deliberately carries
+/// no `#[cfg]` — the difference is in what `GroupHandle::kill` means per platform,
+/// which is `src/platform/`'s business, not this call site's.
 fn force_kill_group(group: &crate::platform::GroupHandle) {
-    #[cfg(unix)]
-    {
-        // This group was created by us with setpgid and its leader remains
-        // unreaped until after teardown. A PGID cannot be reused while any
-        // member remains, so signaling after the leader exits is safe and is
-        // required to stop surviving descendants. Stored proxy PIDs can be
-        // reused after reaping, so terminate_proxy_pid re-verifies identity.
-        group.kill();
-    }
-
-    // Windows teardown is an immediate Job Object hard kill by design; no
-    // graceful TERM interval or Unix-style process-group probe is available.
-    #[cfg(not(unix))]
-    {
-        group.kill();
-    }
+    group.kill();
 }
 
 /// Spawn `argv` (already composed by `sandbox::enter_argv`) in `cwd` on a fresh
