@@ -45,6 +45,42 @@ pub fn proxy_identity_required() -> bool {
     false
 }
 
+/// Stable identity captured from an opened cleanup file. The device/inode
+/// pair identifies the object and `links` detects a hard-link change before
+/// automatic unlinking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CleanupFileIdentity {
+    pub(crate) device: u64,
+    pub(crate) inode: u64,
+    pub(crate) links: u64,
+}
+
+/// Open one regular entry relative to an already-pinned parent directory.
+/// `parent_path` is used only on platforms without an openat equivalent; the
+/// caller still retains and validates the parent descriptor for the operation.
+pub(crate) fn open_cleanup_file_at(
+    parent: &std::fs::File,
+    parent_path: &std::path::Path,
+    name: &std::ffi::OsStr,
+) -> std::io::Result<std::fs::File> {
+    platform_open_cleanup_file_at(parent, parent_path, name)
+}
+
+pub(crate) fn cleanup_file_identity(file: &std::fs::File) -> std::io::Result<CleanupFileIdentity> {
+    platform_cleanup_file_identity(file)
+}
+
+/// Remove the already-revalidated entry without resolving a fresh parent
+/// pathname. Unix uses `unlinkat`; Windows deletes the validated file handle.
+pub(crate) fn unlink_cleanup_file_at(
+    parent: &std::fs::File,
+    parent_path: &std::path::Path,
+    name: &std::ffi::OsStr,
+    file: &std::fs::File,
+) -> std::io::Result<()> {
+    platform_unlink_cleanup_file_at(parent, parent_path, name, file)
+}
+
 /// Terminate the proxy only after the platform has revalidated its identity.
 /// The Windows branch is intentionally the existing PID-only behavior with
 /// the shared positive-range guard; Windows PID-reuse binding is follow-up

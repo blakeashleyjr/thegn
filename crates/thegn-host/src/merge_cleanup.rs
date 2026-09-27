@@ -735,6 +735,15 @@ fn remove_seeded_files(
     paths: &[PathBuf],
     authority: Option<&crate::skill_seed::ManagedSeedFiles>,
 ) -> Result<(), Refusal> {
+    remove_seeded_files_with_hook(root, paths, authority, &|| {})
+}
+
+fn remove_seeded_files_with_hook(
+    root: &Path,
+    paths: &[PathBuf],
+    authority: Option<&crate::skill_seed::ManagedSeedFiles>,
+    before_unlink: &dyn Fn(),
+) -> Result<(), Refusal> {
     let Some(authority) = authority else {
         return Ok(());
     };
@@ -744,22 +753,68 @@ fn remove_seeded_files(
                 relative.to_string_lossy().into_owned(),
             ));
         };
-        // Re-check the exact bytes immediately before unlinking. Git's
-        // no-force worktree removal remains the final backstop for a file that
-        // appears in the race after this check.
-        if !seeded_file_matches(root, relative, expected)? {
+        let path = root.join(relative);
+        let parent_path = path
+            .parent()
+            .ok_or_else(|| unsafe_reason("seeded path has no parent directory"))?;
+        let name = path
+            .file_name()
+            .ok_or_else(|| unsafe_reason("seeded path has no file name"))?;
+        // Pin the parent once. Unix opens and unlinks through this descriptor;
+        // Windows retains it while the validated leaf handle is deleted.
+        let parent = crate::platform::open_directory_nofollow(parent_path)
+            .map_err(|_| Refusal::ManagedChanged(relative.to_string_lossy().into_owned()))?;
+        let file = crate::platform::open_cleanup_file_at(&parent, parent_path, name)
+            .map_err(|_| Refusal::ManagedChanged(relative.to_string_lossy().into_owned()))?;
+        let identity = crate::platform::cleanup_file_identity(&file)
+            .map_err(|_| Refusal::ManagedChanged(relative.to_string_lossy().into_owned()))?;
+        if !file
+            .metadata()
+            .map(|metadata| metadata.is_file())
+            .unwrap_or(false)
+            || !cleanup_file_matches(&file, expected)?
+        {
             return Err(Refusal::ManagedChanged(
                 relative.to_string_lossy().into_owned(),
             ));
         }
-        let path = root.join(relative);
-        std::fs::remove_file(&path)
+
+        // Deterministic tests use this seam to replace the pathname here. The
+        // real operation has no callback and proceeds directly to the second
+        // descriptor-relative observation.
+        before_unlink();
+        let current = crate::platform::open_cleanup_file_at(&parent, parent_path, name)
             .map_err(|_| Refusal::ManagedChanged(relative.to_string_lossy().into_owned()))?;
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::remove_dir(parent); // best-effort: only empty seed directories are ours
+        let current_identity = crate::platform::cleanup_file_identity(&current)
+            .map_err(|_| Refusal::ManagedChanged(relative.to_string_lossy().into_owned()))?;
+        // Re-verify device, inode, link count, and exact bytes immediately
+        // before unlinking. A replacement is a refusal, never a deletion.
+        if current_identity != identity || !cleanup_file_matches(&current, expected)? {
+            return Err(Refusal::ManagedChanged(
+                relative.to_string_lossy().into_owned(),
+            ));
         }
+
+        crate::platform::unlink_cleanup_file_at(&parent, parent_path, name, &current)
+            .map_err(|_| Refusal::ManagedChanged(relative.to_string_lossy().into_owned()))?;
     }
     Ok(())
+}
+
+fn cleanup_file_matches(
+    file: &std::fs::File,
+    expected: &std::collections::BTreeSet<Vec<u8>>,
+) -> Result<bool, Refusal> {
+    let mut bytes = Vec::new();
+    file.try_clone()
+        .map_err(|_| Refusal::Changed)?
+        .take((thegn_core::skills::MAX_DOCUMENT_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|_| Refusal::Changed)?;
+    if bytes.len() > thegn_core::skills::MAX_DOCUMENT_BYTES {
+        return Ok(false);
+    }
+    Ok(expected.iter().any(|candidate| candidate == &bytes))
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1027,11 +1082,11 @@ impl Verified {
         self.revalidate()?;
         final_guard().map_err(unsafe_reason)?;
         // Re-observe as late as possible. `final_guard` re-checks the queue and
-        // can take arbitrary time, and the window between the last status read
-        // and Git's own removal is the only one in which newly written ignored
-        // or seeded state is destroyed. This cannot close the race — nothing
-        // short of a filesystem lease could — but it shrinks it to the removal
-        // call itself.
+        // can take arbitrary time. Seeded files are then removed through a
+        // pinned parent descriptor with identity and byte revalidation.
+        // A same-UID process can still replace an exact-match file inside the
+        // remaining validation-to-unlink window; closing that residual requires
+        // a filesystem lease, which this operation deliberately does not claim.
         //
         // Real user work is protected twice over regardless: the probe refuses
         // it here, exact seeded files are removed only after a final byte check,

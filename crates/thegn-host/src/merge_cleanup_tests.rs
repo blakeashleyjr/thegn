@@ -533,6 +533,39 @@ fn excluded_raw_legacy_command_is_not_admitted_as_seeded_tool_state() {
 }
 
 #[test]
+fn seeded_file_replacement_between_validation_and_unlink_is_refused() {
+    let _isolation = TestIsolation::new();
+    let fixture = Fixture::new();
+    let mut cfg = thegn_core::config::Config::default();
+    cfg.sandbox.enabled = false;
+    fixture.seed_unignored(&cfg);
+
+    let relative = PathBuf::from(".claude/skills/supervise/SKILL.md");
+    let path = fixture.wt.join(&relative);
+    let original = std::fs::read(&path).unwrap();
+    let authority = crate::skill_seed::managed_seed_files(&cfg).unwrap();
+    assert!(authority.expected(&relative).is_some());
+    let replacement = b"user replacement at the validation boundary\n";
+    let result = remove_seeded_files_with_hook(
+        &fixture.wt,
+        std::slice::from_ref(&relative),
+        Some(&authority),
+        &|| {
+            std::fs::rename(&path, path.with_extension("old")).unwrap();
+            std::fs::write(&path, replacement).unwrap();
+        },
+    );
+
+    assert!(matches!(
+        result,
+        Err(Refusal::ManagedChanged(ref path))
+            if path == ".claude/skills/supervise/SKILL.md"
+    ));
+    assert_eq!(std::fs::read(&path).unwrap(), replacement);
+    assert_eq!(std::fs::read(path.with_extension("old")).unwrap(), original);
+}
+
+#[test]
 fn seeded_state_does_not_hide_a_real_user_record() {
     let _isolation = TestIsolation::new();
     for tracked in [false, true] {

@@ -90,6 +90,8 @@ pub(crate) fn managed_seed_files(cfg: &Config) -> Result<ManagedSeedFiles, Strin
         return Err(diagnostics.join("; "));
     }
 
+    let excludes: BTreeSet<String> = cfg.skills.exclude.iter().cloned().collect();
+    let gates = gate_state(cfg);
     let mut managed = ManagedSeedFiles::default();
     for harness_id in harnesses {
         let Some(harness) = thegn_core::harness::harness(&harness_id) else {
@@ -100,29 +102,38 @@ pub(crate) fn managed_seed_files(cfg: &Config) -> Result<ManagedSeedFiles, Strin
         };
         let root = PathBuf::from(layout.project_root);
         managed.add_root(root.clone());
-        for (_, skill) in loaded.registry.iter() {
-            if skill.harnesses.contains(&harness_id) {
-                let relative = thegn_core::skills::skill_relative(&skill.name)
-                    .map_err(|error| format!("skill authority: {error}"))?;
-                managed.add_file(
-                    root.join(relative),
-                    thegn_core::skills::render_managed(skill).into_bytes(),
-                );
+        // The writer applies this same pure plan at each lifecycle phase.
+        // Unioning the possible phase plans keeps cleanup authoritative for a
+        // file seeded at create/startup/explicit time, while the target's
+        // exclusion and gate filters prevent claims for content this config
+        // would not seed. An empty survey makes `writes` the effective output
+        // bytes without inspecting or trusting the worktree.
+        for phase in [SeedPhase::Create, SeedPhase::Startup, SeedPhase::Explicit] {
+            let target =
+                thegn_core::skills::SeedTarget::new(&harness_id, phase, excludes.iter().cloned());
+            let plan = plan_seed(&loaded.registry, &target, &[], gates);
+            if !plan.diagnostics.is_empty() {
+                return Err(plan.diagnostics.join("; "));
+            }
+            for operation in plan.writes {
+                managed.add_file(root.join(operation.relative), operation.contents);
             }
         }
 
         if harness_id == "claude" {
             let command_root = PathBuf::from(".claude/commands");
             managed.add_root(command_root);
-            for command in MQ_COMMANDS {
-                // Both forms are valid historical output from the same Rust
-                // writer: disabled merge-queue seeding retained the raw body,
-                // while enabled seeding writes the marker-wrapped rendering.
-                managed.add_file(command.relative, command.body.as_bytes().to_vec());
-                managed.add_file(
-                    command.relative,
-                    render_managed_legacy(command.body).into_bytes(),
-                );
+            if cfg.merge_queue.enabled && !excludes.contains("mq") {
+                for command in MQ_COMMANDS {
+                    // Both forms are valid historical output from the same
+                    // enabled writer: raw bytes are migrated to the current
+                    // marker-wrapped form on the next seed.
+                    managed.add_file(command.relative, command.body.as_bytes().to_vec());
+                    managed.add_file(
+                        command.relative,
+                        render_managed_legacy(command.body).into_bytes(),
+                    );
+                }
             }
         }
     }
