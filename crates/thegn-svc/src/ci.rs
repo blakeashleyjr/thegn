@@ -1423,6 +1423,44 @@ mod tests {
     }
 
     #[test]
+    fn provider_entry_points_reject_bad_identifiers_before_subprocesses() {
+        let loc = GitLoc::for_worktree(std::path::Path::new("/does/not/exist"));
+        let github = GithubCi;
+        let gitlab = GitlabCi::default();
+
+        for error in [
+            github.run_detail(&loc, "--help").unwrap_err(),
+            github.logs(&loc, "1", "1e5").unwrap_err(),
+            github.rerun(&loc, "1/2", RerunScope::All).unwrap_err(),
+            github.cancel(&loc, "01").unwrap_err(),
+            gitlab.run_detail(&loc, "--help").unwrap_err(),
+            gitlab.logs(&loc, "1", "1#x").unwrap_err(),
+            gitlab.rerun(&loc, "1.0", RerunScope::All).unwrap_err(),
+            gitlab.cancel(&loc, "18446744073709551616").unwrap_err(),
+        ] {
+            assert!(
+                error.to_string().contains("invalid CI identifier"),
+                "provider entry point reached another failure before rejecting the id: {error}"
+            );
+        }
+
+        assert!(
+            github
+                .trigger(&loc, "--help", &[])
+                .unwrap_err()
+                .to_string()
+                .contains("invalid workflow selector")
+        );
+        assert!(
+            gitlab
+                .trigger(&loc, "../workflow.yml", &[])
+                .unwrap_err()
+                .to_string()
+                .contains("invalid workflow selector")
+        );
+    }
+
+    #[test]
     fn gitlab_config_token_is_in_child_environment_never_argv() {
         let mut cfg = CiConfig::default();
         cfg.gitlab.token = "fixture-secret-token".into();
