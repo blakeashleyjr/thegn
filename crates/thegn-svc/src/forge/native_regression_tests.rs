@@ -73,6 +73,88 @@ fn runtime_failure_keeps_dynamic_message_in_owned_not_configured_payload() {
 }
 
 #[test]
+fn graphql_http_request_preserves_method_path_auth_and_json_body() {
+    use axum::Router;
+    use axum::body::{Body, to_bytes};
+    use axum::extract::Request;
+    use axum::http::{HeaderValue, StatusCode};
+    use axum::response::IntoResponse;
+    use axum::routing::any;
+
+    let rt = runtime();
+    rt.block_on(async {
+        let (seen_tx, mut seen_rx) = tokio::sync::mpsc::unbounded_channel();
+        let app = Router::new().fallback(any(move |request: Request| {
+            let seen_tx = seen_tx.clone();
+            async move {
+                let (parts, body) = request.into_parts();
+                let body = to_bytes(body, 4096).await.expect("small GraphQL request");
+                seen_tx
+                    .send((
+                        parts.method,
+                        parts.uri.path().to_owned(),
+                        parts.headers.get("authorization").cloned(),
+                        parts.headers.get("content-type").cloned(),
+                        parts.headers.get("accept").cloned(),
+                        body,
+                    ))
+                    .expect("fixture receiver remains open");
+                (
+                    StatusCode::OK,
+                    [(reqwest::header::CONTENT_TYPE, "application/json")],
+                    Body::from(r#"{"data":{"ok":true}}"#),
+                )
+                    .into_response()
+            }
+        }));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = TrackerHttpClient::new_with_operation_timeout(
+            "github-test",
+            &format!("http://{address}"),
+            "Bearer fixture-token".into(),
+            Arc::new(TrackerHttpBudget::with_permits(1)),
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        let body = serde_json::json!({
+            "query": "query($id: Int!) { node(id: $id) { id } }",
+            "variables": { "id": 17 },
+        });
+        let health = GhCircuit::new();
+        let response = graphql_request(&client, &body, "fixture", &health)
+            .await
+            .unwrap();
+        assert_eq!(response, serde_json::json!({"data":{"ok":true}}));
+
+        let (method, path, authorization, content_type, accept, request_body) = seen_rx
+            .recv()
+            .await
+            .expect("GraphQL request reached fixture");
+        assert_eq!(method, reqwest::Method::POST);
+        assert_eq!(path, "/graphql");
+        assert_eq!(
+            authorization,
+            Some(HeaderValue::from_static("Bearer fixture-token"))
+        );
+        assert_eq!(
+            content_type,
+            Some(HeaderValue::from_static("application/json"))
+        );
+        assert_eq!(accept, Some(HeaderValue::from_static("application/json")));
+        assert_eq!(
+            serde_json::from_slice::<Value>(&request_body).unwrap(),
+            body
+        );
+    });
+}
+
+#[test]
 fn sdk_graphql_envelopes_fall_through_without_offline_evidence() {
     let rt = runtime();
     rt.block_on(async {
