@@ -565,6 +565,31 @@ mod tests {
     }
 
     #[test]
+    fn playback_consumes_same_timestamp_append_at_live_tail_once() {
+        let mut rec = Recording::from_config(&ReplayConfig::default(), 24, 80);
+        let epoch = rec.epoch;
+        rec.push_bytes(b"before\r\n", epoch);
+        let mut ov = ReplayOverlay::new(1, &rec, 1000);
+        rec.push_bytes(b"appended\r\n", epoch);
+
+        // The first playback clock tick has zero elapsed time. Reaching the
+        // current live tail must still consume the new sequence at cursor_ms.
+        ov.toggle_play();
+        assert!(ov.advance_clock(&rec));
+        let after_tick = grid_text(&ov.scratch);
+        assert!(after_tick.contains("before"));
+        assert!(after_tick.contains("appended"));
+        assert!(
+            !ov.is_playing(),
+            "the live tail pauses after being consumed"
+        );
+
+        // A later clock notification cannot feed the same event a second time.
+        assert!(!ov.advance_clock(&rec));
+        assert_eq!(grid_text(&ov.scratch), after_tick);
+    }
+
+    #[test]
     fn seek_rebuilds_when_eviction_overtakes_sequence_cursor() {
         let cfg = ReplayConfig {
             max_bytes_per_pane: 1,
