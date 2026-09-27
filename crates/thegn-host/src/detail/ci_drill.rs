@@ -18,6 +18,7 @@ use thegn_core::theme::Hue;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CiDetailPayload {
     pub run: thegn_core::ci::CiRun,
+    pub discarded_jobs: usize,
     pub log_tail: Vec<String>,
     /// Cache metadata for each displayed failed-job excerpt.  The text is
     /// already bounded and redacted by the producer.
@@ -146,6 +147,7 @@ impl DetailOverlay {
     pub(crate) fn set_ci_detail(
         &mut self,
         run: &thegn_core::ci::CiRun,
+        discarded_jobs: usize,
         log_tail: Vec<String>,
         log_entries: Vec<thegn_core::ci_log::CiLogEntry>,
     ) {
@@ -154,12 +156,14 @@ impl DetailOverlay {
         if run.jobs.is_empty() {
             secs.push(Section::Heading {
                 label: "no job detail".into(),
-                note: None,
+                note: (discarded_jobs > 0)
+                    .then(|| format!("{discarded_jobs} malformed job row(s) omitted")),
             });
         } else {
             secs.push(Section::Heading {
                 label: "jobs".into(),
-                note: None,
+                note: (discarded_jobs > 0)
+                    .then(|| format!("{discarded_jobs} malformed job row(s) omitted")),
             });
             for job in &run.jobs {
                 let (g, _) = ci_glyph_marker(job.state);
@@ -290,7 +294,12 @@ pub fn apply_ci_detail(slot: &mut Option<DetailOverlay>, payload: CiDetailPayloa
     if let Some(ov) = slot.as_mut()
         && ov.pending_ci.as_deref() == Some(payload.run.id.as_str())
     {
-        ov.set_ci_detail(&payload.run, payload.log_tail, payload.log_entries);
+        ov.set_ci_detail(
+            &payload.run,
+            payload.discarded_jobs,
+            payload.log_tail,
+            payload.log_entries,
+        );
         return true;
     }
     false
@@ -376,6 +385,7 @@ mod tests {
                     id: "999".into(),
                     ..run.clone()
                 },
+                discarded_jobs: 0,
                 log_tail: vec![],
                 log_entries: vec![],
             },
@@ -406,6 +416,7 @@ mod tests {
             &mut slot,
             CiDetailPayload {
                 run: filled,
+                discarded_jobs: 1,
                 log_tail: vec!["error: boom".into()],
                 log_entries: vec![thegn_core::ci_log::CiLogEntry {
                     worktree: "/wt/repo".into(),
@@ -426,6 +437,11 @@ mod tests {
         };
         // header + "jobs" + build heading + steps table + "log tail" + log table.
         assert!(d.sections.len() >= 5, "sparse fill: {}", d.sections.len());
+        assert!(d.sections.iter().any(|section| matches!(
+            section,
+            Section::Heading { label, note: Some(note) }
+                if label == "jobs" && note.contains("1 malformed job row")
+        )));
         assert_eq!(ov.pending_ci, None, "pending cleared after fill");
         assert_eq!(
             ov.handle_key(&KeyCode::Char('f'), Modifiers::NONE),

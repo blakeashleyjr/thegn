@@ -510,6 +510,9 @@ pub struct PrStatusRow {
 pub struct CiRunsReply {
     pub worktree: String,
     pub runs: serde_json::Value,
+    /// Malformed rows discarded from provider output or cached values.
+    #[serde(default)]
+    pub discarded_rows: usize,
     pub source: String,
     pub fetched_at: i64,
 }

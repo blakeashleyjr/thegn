@@ -44,11 +44,10 @@ pub trait CiProvider: thegn_core::seam::Probe + Send + Sync {
     fn system(&self) -> CiSystem;
 
     /// Recent runs (newest first), optionally filtered to `branch`.
-    fn runs(&self, loc: &GitLoc, branch: Option<&str>, limit: usize)
-    -> Result<Vec<CiRun>, CiError>;
+    fn runs(&self, loc: &GitLoc, branch: Option<&str>, limit: usize) -> Result<CiRunList, CiError>;
 
     /// One run with its jobs (and steps, where the provider exposes them).
-    fn run_detail(&self, loc: &GitLoc, run_id: &str) -> Result<CiRun, CiError>;
+    fn run_detail(&self, loc: &GitLoc, run_id: &str) -> Result<CiRunDetail, CiError>;
 
     /// A job's log text ("why did it fail"). `run_id` is needed by providers
     /// whose job ids aren't globally addressable (GitLab); GitHub ignores it.
@@ -72,6 +71,21 @@ pub trait CiProvider: thegn_core::seam::Probe + Send + Sync {
     fn cancel(&self, loc: &GitLoc, run_id: &str) -> Result<(), CiError>;
 
     fn caps(&self) -> CiCaps;
+}
+
+/// Provider run history plus rows rejected because their target identifiers
+/// were malformed. Consumers preserve this count when presenting a list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CiRunList {
+    pub runs: Vec<CiRun>,
+    pub discarded_rows: usize,
+}
+
+/// A targeted run response plus the number of malformed jobs omitted from it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CiRunDetail {
+    pub run: CiRun,
+    pub discarded_jobs: usize,
 }
 
 // === provider selection ====================================================
@@ -141,10 +155,17 @@ pub fn resolve_system(loc: &GitLoc, cfg: &CiConfig) -> Option<CiSystem> {
 
 /// Map a git remote URL's host to a CI system (pure, tested).
 pub fn system_from_remote_host(url: &str) -> Option<CiSystem> {
-    let l = url.to_ascii_lowercase();
-    if l.contains("github.") {
+    let host = parse_gitlab_remote(url)?.host;
+    let hostname = host.split(':').next()?;
+    if hostname == "github.com"
+        || hostname.ends_with(".github.com")
+        || hostname.starts_with("github.")
+    {
         Some(CiSystem::GithubActions)
-    } else if l.contains("gitlab.") || l.contains("/gitlab") {
+    } else if hostname == "gitlab.com"
+        || hostname.ends_with(".gitlab.com")
+        || hostname.starts_with("gitlab.")
+    {
         Some(CiSystem::GitlabCi)
     } else {
         None
@@ -305,13 +326,177 @@ fn nonempty(s: &serde_json::Value, key: &str) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
-/// Stringify a JSON id that may be a number or a string.
-fn id_str(v: &serde_json::Value, key: &str) -> String {
-    match v.get(key) {
-        Some(serde_json::Value::Number(n)) => n.to_string(),
-        Some(serde_json::Value::String(s)) => s.clone(),
-        _ => String::new(),
+/// Parse provider JSON identifiers as unsigned JSON integers. Provider IDs do
+/// not pass through a string grammar: serde's number representation rejects
+/// fractions, exponents, negatives and values outside u64.
+fn json_id(v: &serde_json::Value, key: &str) -> Option<String> {
+    v.get(key)
+        .and_then(serde_json::Value::as_u64)
+        .filter(|id| *id > 0)
+        .map(|id| id.to_string())
+}
+
+/// Canonical textual IDs supplied by CLI/API callers. Keep this pure so every
+/// ingress and provider boundary applies the same contract.
+pub fn validate_ci_id(value: &str) -> Result<&str, CiError> {
+    let valid = !value.is_empty()
+        && value.len() <= 20
+        && value.as_bytes()[0] != b'0'
+        && value.bytes().all(|byte| byte.is_ascii_digit())
+        && value.parse::<u64>().is_ok_and(|id| id > 0);
+    if valid {
+        Ok(value)
+    } else {
+        Err(CiError::Other(format!("invalid CI identifier {value:?}")))
     }
+}
+
+/// Workflow names and repository-relative workflow paths accepted by `gh`.
+/// Spaces are valid in names; path selectors additionally allow `/`. Leading
+/// option syntax, controls, URL syntax and dot segments are never selectors.
+pub fn validate_workflow_selector(value: &str) -> Result<&str, CiError> {
+    let valid = !value.is_empty()
+        && value.len() <= 256
+        && value.trim() == value
+        && !value.starts_with('-')
+        && value
+            .split('/')
+            .all(|part| !part.is_empty() && part != "." && part != "..")
+        && !value.chars().any(char::is_control)
+        && !value.contains('\\');
+    if valid {
+        Ok(value)
+    } else {
+        Err(CiError::Other(format!(
+            "invalid workflow selector {value:?}"
+        )))
+    }
+}
+
+/// Validate a Git branch ref using the forbidden forms from git-check-ref-format.
+/// Query-reserved characters such as `&`, `=`, `%` and `#` remain valid data.
+pub fn validate_branch_ref(value: &str) -> Result<&str, CiError> {
+    let bytes = value.as_bytes();
+    let bad = value.is_empty()
+        || value == "@"
+        || value.starts_with('-')
+        || value.starts_with('/')
+        || value.ends_with('/')
+        || value.ends_with('.')
+        || value.contains("..")
+        || value.contains("//")
+        || value.contains("@{")
+        || value.split('/').any(|part| part.ends_with(".lock"))
+        || bytes
+            .iter()
+            .any(|b| *b <= 0x20 || *b == 0x7f || b"~^:?*[\\".contains(b));
+    if bad {
+        Err(CiError::Other(format!("invalid branch ref {value:?}")))
+    } else {
+        Ok(value)
+    }
+}
+
+fn github_workflow_argv(
+    workflow: &str,
+    inputs: &[(String, String)],
+) -> Result<Vec<String>, CiError> {
+    validate_workflow_selector(workflow)?;
+    let mut args = vec!["workflow".into(), "run".into()];
+    for (key, value) in inputs {
+        args.push("-f".into());
+        args.push(format!("{key}={value}"));
+    }
+    args.extend(["--".into(), workflow.into()]);
+    Ok(args)
+}
+
+fn github_run_detail_argv(run_id: &str) -> Result<Vec<String>, CiError> {
+    validate_ci_id(run_id)?;
+    Ok(vec![
+        "run".into(),
+        "view".into(),
+        "--json".into(),
+        GH_DETAIL_FIELDS.into(),
+        "--".into(),
+        run_id.into(),
+    ])
+}
+
+fn github_rerun_argv(run_id: &str, scope: RerunScope) -> Result<Vec<String>, CiError> {
+    validate_ci_id(run_id)?;
+    let mut args = vec!["run".into(), "rerun".into()];
+    if scope == RerunScope::Failed {
+        args.push("--failed".into());
+    }
+    args.extend(["--".into(), run_id.into()]);
+    Ok(args)
+}
+
+fn github_cancel_argv(run_id: &str) -> Result<Vec<String>, CiError> {
+    validate_ci_id(run_id)?;
+    Ok(vec![
+        "run".into(),
+        "cancel".into(),
+        "--".into(),
+        run_id.into(),
+    ])
+}
+
+fn gitlab_pipelines_endpoint(
+    project_segment: &str,
+    branch: Option<&str>,
+    limit: usize,
+) -> Result<String, CiError> {
+    let mut endpoint = format!(
+        "projects/{project_segment}/pipelines?per_page={}",
+        limit.max(1)
+    );
+    if let Some(branch) = branch {
+        validate_branch_ref(branch)?;
+        let query = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("ref", branch)
+            .finish();
+        endpoint.push('&');
+        endpoint.push_str(&query);
+    }
+    Ok(endpoint)
+}
+
+fn gitlab_run_endpoint(project: &str, run_id: &str, action: &str) -> Result<String, CiError> {
+    validate_ci_id(run_id)?;
+    if !matches!(action, "" | "jobs" | "retry" | "cancel") {
+        return Err(CiError::Other(format!(
+            "invalid GitLab pipeline operation {action:?}"
+        )));
+    }
+    let suffix = if action.is_empty() {
+        String::new()
+    } else {
+        format!("/{action}")
+    };
+    Ok(format!("projects/{project}/pipelines/{run_id}{suffix}"))
+}
+
+fn gitlab_job_trace_endpoint(project: &str, job_id: &str) -> Result<String, CiError> {
+    validate_ci_id(job_id)?;
+    Ok(format!("projects/{project}/jobs/{job_id}/trace"))
+}
+
+fn parse_provider_row<T>(
+    rows: &[serde_json::Value],
+    mut parse: impl FnMut(&serde_json::Value) -> Option<T>,
+) -> (Vec<T>, usize) {
+    let mut valid = Vec::with_capacity(rows.len());
+    let mut discarded = 0;
+    for row in rows {
+        if let Some(value) = parse(row) {
+            valid.push(value);
+        } else {
+            discarded += 1;
+        }
+    }
+    (valid, discarded)
 }
 
 // === GitHub Actions (gh CLI) ==============================================
@@ -341,30 +526,58 @@ impl CiProvider for GithubCi {
     fn system(&self) -> CiSystem {
         CiSystem::GithubActions
     }
-    fn runs(
-        &self,
-        loc: &GitLoc,
-        branch: Option<&str>,
-        limit: usize,
-    ) -> Result<Vec<CiRun>, CiError> {
+    fn runs(&self, loc: &GitLoc, branch: Option<&str>, limit: usize) -> Result<CiRunList, CiError> {
         let limit_s = limit.max(1).to_string();
         let mut args = vec!["run", "list", "--limit", &limit_s, "--json", GH_RUN_FIELDS];
         if let Some(b) = branch {
+            validate_branch_ref(b)?;
             args.push("--branch");
             args.push(b);
         }
         let json = run_cli(&mut loc.gh_command(&args))?;
-        Ok(parse_gh_runs(&json))
+        let (runs, discarded_rows) = parse_gh_runs_with_discarded(&json);
+        if discarded_rows > 0 {
+            tracing::warn!(target: "thegn::ci", discarded_rows, "discarded malformed GitHub run rows");
+        }
+        Ok(CiRunList {
+            runs,
+            discarded_rows,
+        })
     }
 
-    fn run_detail(&self, loc: &GitLoc, run_id: &str) -> Result<CiRun, CiError> {
-        let json =
-            run_cli(&mut loc.gh_command(&["run", "view", run_id, "--json", GH_DETAIL_FIELDS]))?;
-        parse_gh_run_detail(&json).ok_or(CiError::NotFound)
+    fn run_detail(&self, loc: &GitLoc, run_id: &str) -> Result<CiRunDetail, CiError> {
+        let args = github_run_detail_argv(run_id)?;
+        let argv: Vec<_> = args.iter().map(String::as_str).collect();
+        let json = run_cli(&mut loc.gh_command(&argv))?;
+        let value: serde_json::Value = serde_json::from_str(&json)
+            .map_err(|error| CiError::Other(format!("invalid provider run response: {error}")))?;
+        let observed = value
+            .get("databaseId")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let run = parse_gh_run_detail(&json)
+            .ok_or_else(|| CiError::Other(format!("invalid provider run identifier {observed}")))?;
+        let discarded_jobs = gh_jobs_with_discarded(value.get("jobs")).1;
+        if discarded_jobs > 0 {
+            tracing::warn!(target: "thegn::ci", discarded_rows = discarded_jobs, "discarded malformed GitHub job rows");
+        }
+        validate_ci_id(&run.id)?;
+        if run.id != run_id {
+            return Err(CiError::Other(format!(
+                "provider returned run id {:?} for requested {run_id:?}",
+                run.id
+            )));
+        }
+        Ok(CiRunDetail {
+            run,
+            discarded_jobs,
+        })
     }
 
     fn logs(&self, loc: &GitLoc, _run_id: &str, job_id: &str) -> Result<CiLog, CiError> {
         // `gh run view --job <id> --log` (job ids are globally addressable).
+        validate_ci_id(_run_id)?;
+        validate_ci_id(job_id)?;
         run_bounded_log(&mut loc.gh_command(&["run", "view", "--job", job_id, "--log"]))
     }
 
@@ -380,25 +593,21 @@ impl CiProvider for GithubCi {
         workflow: &str,
         inputs: &[(String, String)],
     ) -> Result<(), CiError> {
-        let mut args: Vec<String> = vec!["workflow".into(), "run".into(), workflow.into()];
-        for (k, v) in inputs {
-            args.push("-f".into());
-            args.push(format!("{k}={v}"));
-        }
+        let args = github_workflow_argv(workflow, inputs)?;
         let argv: Vec<&str> = args.iter().map(String::as_str).collect();
         run_cli(&mut loc.gh_command(&argv)).map(|_| ())
     }
 
     fn rerun(&self, loc: &GitLoc, run_id: &str, scope: RerunScope) -> Result<(), CiError> {
-        let mut args = vec!["run", "rerun", run_id];
-        if scope == RerunScope::Failed {
-            args.push("--failed");
-        }
-        run_cli(&mut loc.gh_command(&args)).map(|_| ())
+        let args = github_rerun_argv(run_id, scope)?;
+        let argv: Vec<_> = args.iter().map(String::as_str).collect();
+        run_cli(&mut loc.gh_command(&argv)).map(|_| ())
     }
 
     fn cancel(&self, loc: &GitLoc, run_id: &str) -> Result<(), CiError> {
-        run_cli(&mut loc.gh_command(&["run", "cancel", run_id])).map(|_| ())
+        let args = github_cancel_argv(run_id)?;
+        let argv: Vec<_> = args.iter().map(String::as_str).collect();
+        run_cli(&mut loc.gh_command(&argv)).map(|_| ())
     }
 
     fn caps(&self) -> CiCaps {
@@ -415,11 +624,17 @@ impl CiProvider for GithubCi {
 
 /// Parse `gh run list --json …` (an array) into runs.
 pub fn parse_gh_runs(json: &str) -> Vec<CiRun> {
-    serde_json::from_str::<serde_json::Value>(json)
+    parse_gh_runs_with_discarded(json).0
+}
+
+pub fn parse_gh_runs_with_discarded(json: &str) -> (Vec<CiRun>, usize) {
+    let Some(rows) = serde_json::from_str::<serde_json::Value>(json)
         .ok()
         .and_then(|v| v.as_array().cloned())
-        .map(|arr| arr.iter().map(gh_run_from_value).collect())
-        .unwrap_or_default()
+    else {
+        return (Vec::new(), 0);
+    };
+    parse_provider_row(&rows, gh_run_from_value)
 }
 
 /// Parse `gh run view <id> --json …` (a single object, with `jobs`).
@@ -428,15 +643,16 @@ pub fn parse_gh_run_detail(json: &str) -> Option<CiRun> {
     if !v.is_object() {
         return None;
     }
-    Some(gh_run_from_value(&v))
+    gh_run_from_value(&v)
 }
 
-fn gh_run_from_value(v: &serde_json::Value) -> CiRun {
+fn gh_run_from_value(v: &serde_json::Value) -> Option<CiRun> {
+    let id = json_id(v, "databaseId")?;
     let status = nonempty(v, "status").unwrap_or_default();
     let conclusion = nonempty(v, "conclusion");
     let completed = status.eq_ignore_ascii_case("completed");
-    CiRun {
-        id: id_str(v, "databaseId"),
+    Some(CiRun {
+        id,
         name: nonempty(v, "workflowName")
             .or_else(|| nonempty(v, "name"))
             .unwrap_or_default(),
@@ -451,19 +667,23 @@ fn gh_run_from_value(v: &serde_json::Value) -> CiRun {
         run_number: v.get("number").and_then(serde_json::Value::as_u64),
         started_at: nonempty(v, "createdAt"),
         finished_at: completed.then(|| nonempty(v, "updatedAt")).flatten(),
-        jobs: v
-            .get("jobs")
-            .and_then(serde_json::Value::as_array)
-            .map(|a| a.iter().map(gh_job_from_value).collect())
-            .unwrap_or_default(),
-    }
+        jobs: gh_jobs_with_discarded(v.get("jobs")).0,
+    })
 }
 
-fn gh_job_from_value(v: &serde_json::Value) -> CiJob {
+fn gh_jobs_with_discarded(value: Option<&serde_json::Value>) -> (Vec<CiJob>, usize) {
+    value
+        .and_then(serde_json::Value::as_array)
+        .map(|rows| parse_provider_row(rows, gh_job_from_value))
+        .unwrap_or_default()
+}
+
+fn gh_job_from_value(v: &serde_json::Value) -> Option<CiJob> {
+    let id = json_id(v, "databaseId")?;
     let status = nonempty(v, "status").unwrap_or_default();
     let conclusion = nonempty(v, "conclusion");
-    CiJob {
-        id: id_str(v, "databaseId"),
+    Some(CiJob {
+        id,
         name: nonempty(v, "name").unwrap_or_default(),
         state: CiState::from_github(&status, conclusion.as_deref()),
         url: nonempty(v, "url"),
@@ -474,7 +694,7 @@ fn gh_job_from_value(v: &serde_json::Value) -> CiJob {
             .and_then(serde_json::Value::as_array)
             .map(|a| a.iter().map(gh_step_from_value).collect())
             .unwrap_or_default(),
-    }
+    })
 }
 
 fn gh_step_from_value(v: &serde_json::Value) -> CiStep {
@@ -496,18 +716,20 @@ pub fn parse_gh_workflows(json: &str) -> Vec<CiWorkflow> {
         .and_then(|v| v.as_array().cloned())
         .map(|arr| {
             arr.iter()
-                .map(|v| CiWorkflow {
-                    id: id_str(v, "id"),
-                    name: nonempty(v, "name").unwrap_or_default(),
-                    path: nonempty(v, "path").unwrap_or_default(),
-                    // `gh workflow list` doesn't expose the trigger set; treat
-                    // active workflows as dispatchable (trigger degrades with a
-                    // readable error if a given one isn't). Input prompting +
-                    // accurate dispatchability come in Phase B.
-                    dispatchable: nonempty(v, "state")
-                        .map(|s| s.eq_ignore_ascii_case("active"))
-                        .unwrap_or(true),
-                    inputs: Vec::new(),
+                .filter_map(|v| {
+                    Some(CiWorkflow {
+                        id: json_id(v, "id")?,
+                        name: nonempty(v, "name").unwrap_or_default(),
+                        path: nonempty(v, "path").unwrap_or_default(),
+                        // `gh workflow list` doesn't expose the trigger set; treat
+                        // active workflows as dispatchable (trigger degrades with a
+                        // readable error if a given one isn't). Input prompting +
+                        // accurate dispatchability come in Phase B.
+                        dispatchable: nonempty(v, "state")
+                            .map(|s| s.eq_ignore_ascii_case("active"))
+                            .unwrap_or(true),
+                        inputs: Vec::new(),
+                    })
                 })
                 .collect()
         })
@@ -554,18 +776,36 @@ impl GitlabCi {
         if let Some(token) = &self.token {
             cmd.env("GITLAB_TOKEN", token);
         }
-        if let Some(host) = &self.host {
+        if let Some(host) = self
+            .host
+            .as_deref()
+            .and_then(normalize_gitlab_host)
+            .or_else(|| {
+                origin_url(loc)
+                    .and_then(|url| parse_gitlab_remote(&url))
+                    .map(|remote| remote.host)
+            })
+        {
             cmd.env("GITLAB_HOST", host);
         }
         cmd
     }
 
-    /// URL-encode the project path (`group/sub/repo` → `group%2Fsub%2Frepo`) for
-    /// the `projects/:id` API segment. Only `/` needs encoding in project paths.
-    fn project_seg(loc: &GitLoc) -> Option<String> {
-        let url = origin_url(loc)?;
-        let path = gitlab_project_path(&url)?;
-        Some(path.replace('/', "%2F"))
+    /// Encode each already-validated project component for the API's single
+    /// `projects/:id` path segment.
+    fn project_seg(&self, loc: &GitLoc) -> Result<String, CiError> {
+        let url = origin_url(loc).ok_or(CiError::NotConfigured)?;
+        let remote = parse_gitlab_remote(&url)
+            .ok_or_else(|| CiError::Other(format!("invalid GitLab remote {url:?}")))?;
+        if let Some(configured_host) = &self.host {
+            if normalize_gitlab_host(configured_host).as_deref() != Some(remote.host.as_str()) {
+                return Err(CiError::Other(format!(
+                    "GitLab remote host {:?} does not match configured host {:?}",
+                    remote.host, configured_host
+                )));
+            }
+        }
+        Ok(encode_project_segment(&remote.project))
     }
 }
 
@@ -573,43 +813,59 @@ impl CiProvider for GitlabCi {
     fn system(&self) -> CiSystem {
         CiSystem::GitlabCi
     }
-    fn runs(
-        &self,
-        loc: &GitLoc,
-        branch: Option<&str>,
-        limit: usize,
-    ) -> Result<Vec<CiRun>, CiError> {
-        let proj = Self::project_seg(loc).ok_or(CiError::NotConfigured)?;
-        let mut endpoint = format!("projects/{proj}/pipelines?per_page={}", limit.max(1));
-        if let Some(b) = branch {
-            endpoint.push_str(&format!("&ref={b}"));
-        }
+    fn runs(&self, loc: &GitLoc, branch: Option<&str>, limit: usize) -> Result<CiRunList, CiError> {
+        let project_segment = self.project_seg(loc)?;
+        let endpoint = gitlab_pipelines_endpoint(&project_segment, branch, limit)?;
         let json = run_cli(&mut self.command(loc, &["api", &endpoint]))?;
-        Ok(parse_gitlab_pipelines(&json))
+        let (runs, discarded) = parse_gitlab_pipelines_with_discarded(&json);
+        if discarded > 0 {
+            tracing::warn!(target: "thegn::ci", discarded_rows = discarded, "discarded malformed GitLab pipeline rows");
+        }
+        Ok(CiRunList {
+            runs,
+            discarded_rows: discarded,
+        })
     }
 
-    fn run_detail(&self, loc: &GitLoc, run_id: &str) -> Result<CiRun, CiError> {
-        let proj = Self::project_seg(loc).ok_or(CiError::NotConfigured)?;
+    fn run_detail(&self, loc: &GitLoc, run_id: &str) -> Result<CiRunDetail, CiError> {
+        validate_ci_id(run_id)?;
+        let proj = self.project_seg(loc)?;
         // Pipeline header + its jobs (two calls; the jobs carry the states).
-        let pipe_json = run_cli(&mut self.command(
-            loc,
-            &["api", &format!("projects/{proj}/pipelines/{run_id}")],
-        ))?;
-        let jobs_json = run_cli(&mut self.command(
-            loc,
-            &["api", &format!("projects/{proj}/pipelines/{run_id}/jobs")],
-        ))?;
-        let mut run = parse_gitlab_pipeline_detail(&pipe_json).ok_or(CiError::NotFound)?;
-        run.jobs = parse_gitlab_jobs(&jobs_json);
-        Ok(run)
+        let run_endpoint = gitlab_run_endpoint(&proj, run_id, "")?;
+        let jobs_endpoint = gitlab_run_endpoint(&proj, run_id, "jobs")?;
+        let pipe_json = run_cli(&mut self.command(loc, &["api", &run_endpoint]))?;
+        let jobs_json = run_cli(&mut self.command(loc, &["api", &jobs_endpoint]))?;
+        let value: serde_json::Value = serde_json::from_str(&pipe_json).map_err(|error| {
+            CiError::Other(format!("invalid provider pipeline response: {error}"))
+        })?;
+        let observed = value.get("id").cloned().unwrap_or(serde_json::Value::Null);
+        let mut run = parse_gitlab_pipeline_detail(&pipe_json).ok_or_else(|| {
+            CiError::Other(format!("invalid provider pipeline identifier {observed}"))
+        })?;
+        validate_ci_id(&run.id)?;
+        if run.id != run_id {
+            return Err(CiError::Other(format!(
+                "provider returned run id {:?} for requested {run_id:?}",
+                run.id
+            )));
+        }
+        let (jobs, discarded_jobs) = parse_gitlab_jobs_with_discarded(&jobs_json);
+        if discarded_jobs > 0 {
+            tracing::warn!(target: "thegn::ci", discarded_rows = discarded_jobs, "discarded malformed GitLab job rows");
+        }
+        run.jobs = jobs;
+        Ok(CiRunDetail {
+            run,
+            discarded_jobs,
+        })
     }
 
     fn logs(&self, loc: &GitLoc, _run_id: &str, job_id: &str) -> Result<CiLog, CiError> {
-        let proj = Self::project_seg(loc).ok_or(CiError::NotConfigured)?;
-        run_bounded_log(&mut self.command(
-            loc,
-            &["api", &format!("projects/{proj}/jobs/{job_id}/trace")],
-        ))
+        validate_ci_id(_run_id)?;
+        validate_ci_id(job_id)?;
+        let proj = self.project_seg(loc)?;
+        let endpoint = gitlab_job_trace_endpoint(&proj, job_id)?;
+        run_bounded_log(&mut self.command(loc, &["api", &endpoint]))
     }
 
     fn workflows(&self, _loc: &GitLoc) -> Result<Vec<CiWorkflow>, CiError> {
@@ -621,10 +877,11 @@ impl CiProvider for GitlabCi {
     fn trigger(
         &self,
         loc: &GitLoc,
-        _workflow: &str,
+        workflow: &str,
         inputs: &[(String, String)],
     ) -> Result<(), CiError> {
-        let proj = Self::project_seg(loc).ok_or(CiError::NotConfigured)?;
+        validate_workflow_selector(workflow)?;
+        let proj = self.project_seg(loc)?;
         let mut args = vec!["api".to_string(), "-X".into(), "POST".into()];
         args.push(format!("projects/{proj}/pipeline"));
         for (k, v) in inputs {
@@ -636,16 +893,18 @@ impl CiProvider for GitlabCi {
     }
 
     fn rerun(&self, loc: &GitLoc, run_id: &str, _scope: RerunScope) -> Result<(), CiError> {
-        let proj = Self::project_seg(loc).ok_or(CiError::NotConfigured)?;
+        validate_ci_id(run_id)?;
+        let proj = self.project_seg(loc)?;
         // GitLab: `retry` re-runs failed jobs; a fresh full run isn't a single
         // call, so both scopes map to retry (it's the closest primitive).
-        let endpoint = format!("projects/{proj}/pipelines/{run_id}/retry");
+        let endpoint = gitlab_run_endpoint(&proj, run_id, "retry")?;
         run_cli(&mut self.command(loc, &["api", "-X", "POST", &endpoint])).map(|_| ())
     }
 
     fn cancel(&self, loc: &GitLoc, run_id: &str) -> Result<(), CiError> {
-        let proj = Self::project_seg(loc).ok_or(CiError::NotConfigured)?;
-        let endpoint = format!("projects/{proj}/pipelines/{run_id}/cancel");
+        validate_ci_id(run_id)?;
+        let proj = self.project_seg(loc)?;
+        let endpoint = gitlab_run_endpoint(&proj, run_id, "cancel")?;
         run_cli(&mut self.command(loc, &["api", "-X", "POST", &endpoint])).map(|_| ())
     }
 
@@ -665,40 +924,153 @@ impl CiProvider for GitlabCi {
 /// Extract a GitLab project path (`group/sub/repo`, keeping subgroups) from a
 /// git remote URL. Pure, tested.
 pub fn gitlab_project_path(url: &str) -> Option<String> {
-    let url = url.trim();
-    let path = if url.contains('@') && !url.contains("://") {
-        // git@gitlab.com:group/sub/repo.git
-        url.split_once(':').map(|(_, r)| r.to_string())?
+    parse_gitlab_remote(url).map(|remote| remote.project)
+}
+
+struct GitlabRemote {
+    host: String,
+    project: String,
+}
+
+fn normalize_gitlab_host(raw: &str) -> Option<String> {
+    if raw.contains("://") {
+        let url = url::Url::parse(raw).ok()?;
+        if !matches!(url.scheme(), "http" | "https")
+            || url.path() != "/"
+            || url.query().is_some()
+            || url.fragment().is_some()
+            || !url.username().is_empty()
+            || url.password().is_some()
+        {
+            return None;
+        }
+        let host = url.host_str()?;
+        return Some(match url.port() {
+            Some(port) => format!("{host}:{port}").to_ascii_lowercase(),
+            None => host.to_ascii_lowercase(),
+        });
+    }
+    let host = raw.trim().trim_matches('/').to_ascii_lowercase();
+    (!host.is_empty()
+        && host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b':')))
+    .then_some(host)
+}
+
+/// Accept only ordinary SSH/HTTP(S) git remotes with an unambiguous host and
+/// plain project path. Encoded paths and URL decorations are rejected before
+/// constructing an authenticated `glab api` request.
+fn parse_gitlab_remote(raw: &str) -> Option<GitlabRemote> {
+    let raw = raw.trim();
+    let (host, path) = if raw.contains("://") {
+        let parsed = url::Url::parse(raw).ok()?;
+        if !matches!(parsed.scheme(), "https" | "http" | "ssh")
+            || parsed.host_str().is_none()
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+            || (parsed.scheme() != "ssh" && !parsed.username().is_empty())
+            || (parsed.scheme() == "ssh"
+                && !parsed.username().is_empty()
+                && parsed.username() != "git")
+            || parsed.password().is_some()
+        {
+            return None;
+        }
+        let host = match parsed.port() {
+            Some(port) => format!("{}:{port}", parsed.host_str()?),
+            None => parsed.host_str()?.to_string(),
+        };
+        (
+            host.to_ascii_lowercase(),
+            parsed.path().trim_start_matches('/').to_string(),
+        )
     } else {
-        let idx = url.find("://")?;
-        let after = &url[idx + 3..];
-        after.split_once('/').map(|(_, r)| r.to_string())?
+        // SCP-like SSH: optional conventional username, a DNS/IPv4 host, and
+        // a colon before the path. IPv6 must use a real ssh:// URL.
+        let (authority, path) = raw.split_once(':')?;
+        let (username, host) = authority
+            .rsplit_once('@')
+            .map_or((None, authority), |(username, host)| (Some(username), host));
+        if username.is_some_and(|user| {
+            user.is_empty()
+                || !user
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+        }) {
+            return None;
+        }
+        if host.is_empty()
+            || !host
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-'))
+        {
+            return None;
+        }
+        (host.to_ascii_lowercase(), path.to_string())
     };
     let path = path.strip_suffix(".git").unwrap_or(&path);
-    let path = path.trim_matches('/');
-    (!path.is_empty() && path.contains('/')).then(|| path.to_string())
+    let segments: Vec<_> = path.split('/').collect();
+    if segments.len() < 2
+        || segments.iter().any(|part| {
+            part.is_empty()
+                || *part == "."
+                || *part == ".."
+                || part.starts_with('.')
+                || part
+                    .bytes()
+                    .any(|b| !b.is_ascii_alphanumeric() && !matches!(b, b'.' | b'_' | b'-'))
+        })
+    {
+        return None;
+    }
+    Some(GitlabRemote {
+        host,
+        project: segments.join("/"),
+    })
+}
+
+fn encode_project_segment(project: &str) -> String {
+    let mut encoded = String::new();
+    for byte in project.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            encoded.push(byte as char);
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
 }
 
 /// Parse `GET projects/:id/pipelines` (array) into runs.
 pub fn parse_gitlab_pipelines(json: &str) -> Vec<CiRun> {
-    serde_json::from_str::<serde_json::Value>(json)
+    parse_gitlab_pipelines_with_discarded(json).0
+}
+
+pub fn parse_gitlab_pipelines_with_discarded(json: &str) -> (Vec<CiRun>, usize) {
+    let Some(rows) = serde_json::from_str::<serde_json::Value>(json)
         .ok()
         .and_then(|v| v.as_array().cloned())
-        .map(|arr| arr.iter().map(gitlab_pipeline_from_value).collect())
-        .unwrap_or_default()
+    else {
+        return (Vec::new(), 0);
+    };
+    parse_provider_row(&rows, gitlab_pipeline_from_value)
 }
 
 /// Parse `GET projects/:id/pipelines/:id` (single object) into a run header.
 pub fn parse_gitlab_pipeline_detail(json: &str) -> Option<CiRun> {
     let v: serde_json::Value = serde_json::from_str(json).ok()?;
-    v.is_object().then(|| gitlab_pipeline_from_value(&v))
+    if !v.is_object() {
+        return None;
+    }
+    gitlab_pipeline_from_value(&v)
 }
 
-fn gitlab_pipeline_from_value(v: &serde_json::Value) -> CiRun {
+fn gitlab_pipeline_from_value(v: &serde_json::Value) -> Option<CiRun> {
+    let id = json_id(v, "id")?;
     let status = nonempty(v, "status").unwrap_or_default();
     let terminal = CiState::from_gitlab(&status).is_terminal();
-    let id = id_str(v, "id");
-    CiRun {
+    Some(CiRun {
         id: id.clone(),
         name: nonempty(v, "name").unwrap_or_else(|| format!("pipeline #{id}")),
         title: nonempty(v, "ref").unwrap_or_default(),
@@ -713,29 +1085,32 @@ fn gitlab_pipeline_from_value(v: &serde_json::Value) -> CiRun {
         started_at: nonempty(v, "created_at"),
         finished_at: terminal.then(|| nonempty(v, "updated_at")).flatten(),
         jobs: Vec::new(),
-    }
+    })
 }
 
 /// Parse `GET projects/:id/pipelines/:id/jobs` (array) into jobs.
 pub fn parse_gitlab_jobs(json: &str) -> Vec<CiJob> {
+    parse_gitlab_jobs_with_discarded(json).0
+}
+
+pub fn parse_gitlab_jobs_with_discarded(json: &str) -> (Vec<CiJob>, usize) {
     serde_json::from_str::<serde_json::Value>(json)
         .ok()
         .and_then(|v| v.as_array().cloned())
         .map(|arr| {
-            arr.iter()
-                .map(|v| {
-                    let status = nonempty(v, "status").unwrap_or_default();
-                    CiJob {
-                        id: id_str(v, "id"),
-                        name: nonempty(v, "name").unwrap_or_default(),
-                        state: CiState::from_gitlab(&status),
-                        url: nonempty(v, "web_url"),
-                        started_at: nonempty(v, "started_at"),
-                        finished_at: nonempty(v, "finished_at"),
-                        steps: Vec::new(),
-                    }
+            parse_provider_row(&arr, |v| {
+                let id = json_id(v, "id")?;
+                let status = nonempty(v, "status").unwrap_or_default();
+                Some(CiJob {
+                    id,
+                    name: nonempty(v, "name").unwrap_or_default(),
+                    state: CiState::from_gitlab(&status),
+                    url: nonempty(v, "web_url"),
+                    started_at: nonempty(v, "started_at"),
+                    finished_at: nonempty(v, "finished_at"),
+                    steps: Vec::new(),
                 })
-                .collect()
+            })
         })
         .unwrap_or_default()
 }
@@ -754,6 +1129,14 @@ mod tests {
             system_from_remote_host("https://gitlab.com/g/s/r.git"),
             Some(CiSystem::GitlabCi)
         );
+        assert_eq!(
+            system_from_remote_host("https://example.test/github.com/g/r.git"),
+            None
+        );
+        assert_eq!(
+            system_from_remote_host("https://github.com.evil.test/g/r.git"),
+            None
+        );
         assert_eq!(system_from_remote_host("git@bitbucket.org:o/r.git"), None);
     }
 
@@ -767,8 +1150,158 @@ mod tests {
             gitlab_project_path("https://gitlab.example.com/group/repo").as_deref(),
             Some("group/repo")
         );
+        assert_eq!(
+            gitlab_project_path("ssh://git@gitlab.example.com:2222/group/repo.git").as_deref(),
+            Some("group/repo")
+        );
+        let remote = parse_gitlab_remote("https://gitlab.example.com:8443/group/sub/repo.git")
+            .expect("parsed GitLab authority and project");
+        assert_eq!(remote.host, "gitlab.example.com:8443");
+        assert_eq!(remote.project, "group/sub/repo");
         // single-segment (no group) → None (GitLab projects always have a group)
         assert_eq!(gitlab_project_path("https://gitlab.com/repo.git"), None);
+        for invalid in [
+            "https://gitlab.com/group/repo?next=other",
+            "https://gitlab.com/group/repo#fragment",
+            "https://user@gitlab.com/group/repo",
+            "https://gitlab.com/group%2Frepo/sub",
+            "git@gitlab.com:group/../repo.git",
+            "git@gitlab.com:group//repo.git",
+            "git@gitlab.com:group/repo#fragment",
+        ] {
+            assert_eq!(gitlab_project_path(invalid), None, "{invalid:?}");
+        }
+    }
+
+    #[test]
+    fn ci_ids_have_one_bounded_canonical_spelling() {
+        for valid in ["1", "9", "12345678901234567890"] {
+            assert_eq!(validate_ci_id(valid), Ok(valid));
+        }
+        for invalid in [
+            "",
+            "0",
+            "01",
+            "+1",
+            "-1",
+            " 1",
+            "1 ",
+            "1.0",
+            "1e5",
+            "1/2",
+            "1..2",
+            "1%2f3",
+            "1#x",
+            "1\n",
+            "1\t",
+            "--help",
+            "18446744073709551616",
+            "123456789012345678901",
+        ] {
+            let err = validate_ci_id(invalid).unwrap_err();
+            assert!(err.to_string().contains(invalid), "{invalid:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn provider_json_ids_are_numeric_and_bad_list_rows_are_counted() {
+        let payload = r#"[
+          {"databaseId":1,"status":"completed"},
+          {"databaseId":"2","status":"completed"},
+          {"databaseId":1.0,"status":"completed"},
+          {"databaseId":-1,"status":"completed"},
+          {"databaseId":18446744073709551616,"status":"completed"}
+        ]"#;
+        let (runs, discarded) = parse_gh_runs_with_discarded(payload);
+        assert_eq!(
+            runs.iter().map(|run| run.id.as_str()).collect::<Vec<_>>(),
+            ["1"]
+        );
+        assert_eq!(discarded, 4);
+
+        let jobs = r#"[{"id":7},{"id":"8"},{"id":1e5}]"#;
+        let (jobs, discarded) = parse_gitlab_jobs_with_discarded(jobs);
+        assert_eq!(
+            jobs.iter().map(|job| job.id.as_str()).collect::<Vec<_>>(),
+            ["7"]
+        );
+        assert_eq!(discarded, 2);
+        let rows: serde_json::Value =
+            serde_json::from_str(r#"[{"databaseId":7},{"databaseId":"8"},{"databaseId":1e5}]"#)
+                .unwrap();
+        let (parsed, discarded) = gh_jobs_with_discarded(Some(&rows));
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(discarded, 2);
+    }
+
+    #[test]
+    fn workflow_argv_and_gitlab_query_preserve_target_identity() {
+        let inputs = vec![("environment".into(), "staging".into())];
+        assert_eq!(
+            github_workflow_argv("Release candidate (manual).yml", &inputs).unwrap(),
+            [
+                "workflow",
+                "run",
+                "-f",
+                "environment=staging",
+                "--",
+                "Release candidate (manual).yml"
+            ]
+        );
+        for invalid in ["--help", "../workflow.yml", "a//b", "bad\nname"] {
+            assert!(validate_workflow_selector(invalid).is_err(), "{invalid:?}");
+        }
+        assert_eq!(
+            gitlab_pipelines_endpoint("group%2Fsub%2Frepo", Some("feature&status=success#x%"), 30)
+                .unwrap(),
+            "projects/group%2Fsub%2Frepo/pipelines?per_page=30&ref=feature%26status%3Dsuccess%23x%25"
+        );
+        assert!(gitlab_pipelines_endpoint("group%2Frepo", Some("bad ref"), 30).is_err());
+        assert_eq!(
+            github_run_detail_argv("123").unwrap(),
+            ["run", "view", "--json", GH_DETAIL_FIELDS, "--", "123"]
+        );
+        assert_eq!(
+            github_rerun_argv("123", RerunScope::Failed).unwrap(),
+            ["run", "rerun", "--failed", "--", "123"]
+        );
+        assert_eq!(
+            github_cancel_argv("123").unwrap(),
+            ["run", "cancel", "--", "123"]
+        );
+    }
+
+    #[test]
+    fn rejected_identifiers_never_reach_request_construction() {
+        let mut authenticated_requests = 0;
+        for id in ["--help", "01", "1e5", "1#x", "1%2f2"] {
+            if github_cancel_argv(id).is_ok() {
+                authenticated_requests += 1;
+            }
+            assert!(github_cancel_argv(id).is_err(), "{id:?}");
+            if gitlab_run_endpoint("g%2Fr", id, "retry").is_ok() {
+                authenticated_requests += 1;
+            }
+            assert!(gitlab_run_endpoint("g%2Fr", id, "retry").is_err(), "{id:?}");
+        }
+        if gitlab_job_trace_endpoint("g%2Fr", "--help").is_ok() {
+            authenticated_requests += 1;
+        }
+        assert!(gitlab_job_trace_endpoint("g%2Fr", "--help").is_err());
+        if github_workflow_argv("--help", &[]).is_ok() {
+            authenticated_requests += 1;
+        }
+        assert!(github_workflow_argv("--help", &[]).is_err());
+        assert_eq!(authenticated_requests, 0);
+
+        assert_eq!(
+            gitlab_run_endpoint("g%2Fr", "123", "retry").unwrap(),
+            "projects/g%2Fr/pipelines/123/retry"
+        );
+        assert_eq!(
+            gitlab_job_trace_endpoint("g%2Fr", "456").unwrap(),
+            "projects/g%2Fr/jobs/456/trace"
+        );
     }
 
     #[test]

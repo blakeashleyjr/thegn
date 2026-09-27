@@ -284,8 +284,13 @@
       "type": "object"
     },
     "CiRunsReply": {
-      "description": "Cached CI run history projected through the control plane. `runs` is kept as JSON because the provider-neutral CI model intentionally belongs to `thegn-core` without a control-wire schema dependency; the response still carries the cache source and timestamp explicitly.",
+      "description": "Cached CI run history projected through the control plane. `runs` is kept as JSON because the provider-neutral CI model intentionally belongs to `thegn-core` without a control-wire schema dependency; the response carries source, timestamp and malformed-row count.",
       "properties": {
+        "discarded_rows": {
+          "description": "Malformed rows discarded from provider output or cached values.",
+          "format": "uint64",
+          "type": "integer"
+        },
         "fetched_at": {
           "format": "int64",
           "type": "integer"

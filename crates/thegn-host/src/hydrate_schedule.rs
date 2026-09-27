@@ -409,6 +409,7 @@ mod tests {
         let ci_detail = || {
             crate::hydrate::RefreshKind::CiDetail(Box::new(crate::detail::CiDetailPayload {
                 run: Default::default(),
+                discarded_jobs: 0,
                 log_tail: Vec::new(),
                 log_entries: Vec::new(),
             }))
