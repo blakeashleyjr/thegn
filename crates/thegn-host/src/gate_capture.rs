@@ -33,38 +33,54 @@ pub(super) enum CaptureResult {
 }
 
 #[derive(Default)]
-struct ByteTail(VecDeque<u8>);
+struct ByteTail {
+    bytes: VecDeque<u8>,
+    truncated: bool,
+}
 
 impl ByteTail {
     fn push(&mut self, bytes: &[u8]) {
         if bytes.len() >= TAIL_BYTES {
-            self.0.clear();
-            self.0.extend(&bytes[bytes.len() - TAIL_BYTES..]);
+            self.truncated |= !self.bytes.is_empty() || bytes.len() > TAIL_BYTES;
+            self.bytes.clear();
+            self.bytes.extend(&bytes[bytes.len() - TAIL_BYTES..]);
             return;
         }
         let excess = self
-            .0
+            .bytes
             .len()
             .saturating_add(bytes.len())
             .saturating_sub(TAIL_BYTES);
-        self.0.drain(..excess);
-        self.0.extend(bytes);
+        if excess != 0 {
+            self.truncated = true;
+            self.bytes.drain(..excess);
+        }
+        self.bytes.extend(bytes);
     }
 
-    fn text(&mut self) -> String {
-        String::from_utf8_lossy(self.0.make_contiguous()).into_owned()
+    fn result(mut self) -> TailResult {
+        TailResult {
+            text: String::from_utf8_lossy(self.bytes.make_contiguous()).into_owned(),
+            truncated: self.truncated,
+        }
     }
 }
 
+#[derive(Default)]
+struct TailResult {
+    text: String,
+    truncated: bool,
+}
+
 struct StreamResult {
-    stdout: String,
-    stderr: String,
+    stdout: TailResult,
+    stderr: TailResult,
     out_result: io::Result<()>,
     err_result: io::Result<()>,
 }
 
 struct Reader {
-    receiver: mpsc::Receiver<io::Result<String>>,
+    receiver: mpsc::Receiver<io::Result<TailResult>>,
     join: std::thread::JoinHandle<()>,
 }
 
@@ -99,22 +115,30 @@ fn spawn_reader<R: crate::platform::GatePipe + Send + 'static>(
                     Err(error) => break Err(error),
                 }
             };
-            let value = result.map(|()| tail.text());
+            let value = result.map(|()| tail.result());
             if tx.send(value).is_err() { /* receiver left after a bounded stop */ }
         })?;
     Ok(Reader { receiver: rx, join })
 }
 
-fn merge(out: &str, err: &str) -> String {
-    let tail = |text: &str| {
-        let mut chars = text.chars().rev().take(4000).collect::<Vec<_>>();
-        chars.reverse();
-        chars.into_iter().collect::<String>()
-    };
-    format!("stdout tail:\n{}\nstderr tail:\n{}", tail(out), tail(err))
+fn merge(out: &TailResult, err: &TailResult) -> String {
+    // Preserve the historical `Command::output` presentation: stdout followed
+    // by stderr, with no framing when both bounded captures fit. The marker is
+    // appended only when a per-stream byte tail actually discarded data.
+    let mut log = String::with_capacity(out.text.len() + err.text.len() + 64);
+    log.push_str(&out.text);
+    log.push_str(&err.text);
+    match (out.truncated, err.truncated) {
+        (false, false) => {}
+        (true, true) => log
+            .push_str("\n[stdout and stderr tails truncated; showing last 65536 bytes per stream]"),
+        (true, false) => log.push_str("\n[stdout tail truncated; showing last 65536 bytes]"),
+        (false, true) => log.push_str("\n[stderr tail truncated; showing last 65536 bytes]"),
+    }
+    log
 }
 
-fn poll_reader(rx: &mpsc::Receiver<io::Result<String>>) -> Option<io::Result<String>> {
+fn poll_reader(rx: &mpsc::Receiver<io::Result<TailResult>>) -> Option<io::Result<TailResult>> {
     match rx.try_recv() {
         Ok(result) => Some(result),
         Err(mpsc::TryRecvError::Disconnected) => {
@@ -129,11 +153,11 @@ fn collect_streams(
     err: Reader,
     stop: &AtomicBool,
     deadline: Option<Instant>,
-    mut out_ready: Option<io::Result<String>>,
-    mut err_ready: Option<io::Result<String>>,
-) -> Result<StreamResult, (String, String)> {
-    let receive = |rx: &mpsc::Receiver<io::Result<String>>,
-                   ready: &mut Option<io::Result<String>>| {
+    mut out_ready: Option<io::Result<TailResult>>,
+    mut err_ready: Option<io::Result<TailResult>>,
+) -> Result<StreamResult, (TailResult, TailResult)> {
+    let receive = |rx: &mpsc::Receiver<io::Result<TailResult>>,
+                   ready: &mut Option<io::Result<TailResult>>| {
         if ready.is_some() {
             return ready.take();
         }
@@ -173,12 +197,20 @@ fn collect_streams(
     let out_joined = out.join.join().is_ok();
     let err_joined = err.join.join().is_ok();
     let readers_ok = out_joined && err_joined;
-    let stdout = out_result
-        .as_ref()
-        .map_or_else(|_| String::new(), |value| value.clone());
-    let stderr = err_result
-        .as_ref()
-        .map_or_else(|_| String::new(), |value| value.clone());
+    let stdout = out_result.as_ref().map_or_else(
+        |_| empty_tail(),
+        |value| TailResult {
+            text: value.text.clone(),
+            truncated: value.truncated,
+        },
+    );
+    let stderr = err_result.as_ref().map_or_else(
+        |_| empty_tail(),
+        |value| TailResult {
+            text: value.text.clone(),
+            truncated: value.truncated,
+        },
+    );
     let reader_error = (!readers_ok).then(|| io::Error::other("reader thread panicked"));
     Ok(StreamResult {
         stdout,
@@ -188,6 +220,13 @@ fn collect_streams(
             .and_then(|_| reader_error.map_or(Ok(()), Err)),
         err_result: err_result.map(|_| ()),
     })
+}
+
+fn empty_tail() -> TailResult {
+    TailResult {
+        text: String::new(),
+        truncated: false,
+    }
 }
 
 /// Run a configured gate command with independent fixed-capacity byte tails.
@@ -432,7 +471,7 @@ pub(super) fn run(mut command: Command, timeout: Duration) -> CaptureResult {
     }
 }
 
-fn recv_tail(reader: Reader) -> Option<String> {
+fn recv_tail(reader: Reader) -> Option<TailResult> {
     let result = reader
         .receiver
         .recv_timeout(REAP_GRACE)
@@ -560,8 +599,38 @@ mod tests {
         tail.push(&vec![b'x'; TAIL_BYTES - 1]);
         tail.push(&[0xe2]);
         tail.push(&[0x82, 0xac]);
-        assert_eq!(tail.0.len(), TAIL_BYTES);
-        assert!(tail.text().ends_with('€'));
+        assert_eq!(tail.bytes.len(), TAIL_BYTES);
+        assert!(tail.result().text.ends_with('€'));
+    }
+
+    #[test]
+    fn byte_tail_marks_only_actual_clipping() {
+        let mut short = ByteTail::default();
+        short.push(b"small output");
+        assert!(!short.result().truncated);
+
+        let mut exact_capacity = ByteTail::default();
+        exact_capacity.push(&vec![b'x'; TAIL_BYTES]);
+        assert!(!exact_capacity.result().truncated);
+
+        let mut clipped = ByteTail::default();
+        clipped.push(&vec![b'x'; TAIL_BYTES + 1]);
+        let result = clipped.result();
+        assert_eq!(result.text.len(), TAIL_BYTES);
+        assert!(result.truncated);
+    }
+
+    #[test]
+    fn untruncated_log_keeps_stdout_then_stderr_without_framing() {
+        let out = TailResult {
+            text: "stdout".into(),
+            truncated: false,
+        };
+        let err = TailResult {
+            text: "stderr".into(),
+            truncated: false,
+        };
+        assert_eq!(merge(&out, &err), "stdoutstderr");
     }
 
     macro_rules! shell {
@@ -591,6 +660,7 @@ mod tests {
             log.len()
         );
         assert!(log.contains('o') && log.contains('e'));
+        assert!(log.contains("tails truncated"));
     }
 
     #[test]
