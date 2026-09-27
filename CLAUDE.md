@@ -234,6 +234,19 @@ crate graph. Three things now hold it down, and they are defaults, not knobs:
   above `disk_free_warn`. The active worktree, a running build, and (for the
   idle rule) uncommitted work are always exempt. Policy is pure and tested in
   `thegn_core::disk_reclaim`; it runs at the tail of the background disk scan.
+  **Generation pruning** also runs there for only profiles measured in that
+  round. `[disk] generation_min_age_days = 14` matches the whole-worktree idle
+  horizon: a fingerprint footprint is eligible only after the floor, and the
+  newest touched footprint for each package name is retained. Each profile must
+  grant a nonblocking `.cargo-lock`; a held or unsupported lock skips it. The
+  host removes fingerprint metadata before matching `deps/` and `incremental/`
+  paths. Artifact mapping recognizes Cargo's `lib<crate>-<id>` library names,
+  `<crate>-<id>` dep-info/executable names, and target-name suffixes, so an
+  interrupted prune leaves Cargo without the fingerprint and with rebuildable
+  leftovers. This retention rule does not bound rebuild cost if its association
+  is wrong. Per-profile logs record generation bytes before,
+  planned, actually removed, after, and failures separately from whole-`target/`
+  reclamation.
   `[disk] warn_threshold_gb` is a `thegn disk` **reporting** threshold only — an
   absolute total is permanently red on a machine like this, so nothing behaves
   off it.
