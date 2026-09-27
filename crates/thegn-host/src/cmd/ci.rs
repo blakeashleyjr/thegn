@@ -503,9 +503,29 @@ mod tests {
             true,
         );
         assert!(log_result.unwrap_err().to_string().contains("--help"));
+        let bad_job = log(
+            &config,
+            Some("/path/that/need-not-exist".into()),
+            "1",
+            "1e5",
+            true,
+        );
+        assert!(bad_job.unwrap_err().to_string().contains("1e5"));
+
+        let bad_ref = runs(
+            &config,
+            Some("/path/that/need-not-exist".into()),
+            Some("bad ref".into()),
+            None,
+            true,
+        );
+        assert!(bad_ref.unwrap_err().to_string().contains("bad ref"));
 
         let rerun_result = rerun(&config, None, "01", false);
         assert!(rerun_result.unwrap_err().to_string().contains("01"));
+
+        let cancel_result = cancel(&config, None, "--help");
+        assert!(cancel_result.unwrap_err().to_string().contains("--help"));
 
         let trigger_result = trigger(&config, None, "--help", Vec::new());
         assert!(trigger_result.unwrap_err().to_string().contains("--help"));
