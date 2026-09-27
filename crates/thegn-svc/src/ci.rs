@@ -98,7 +98,19 @@ pub struct CiRunDetail {
 /// list here: `kind_coverage` below pins that every non-reserved kind
 /// constructs a client.
 pub fn provider_for(loc: &GitLoc, cfg: &CiConfig) -> Option<CiClient> {
-    let system = resolve_system(loc, cfg)?;
+    if cfg.provider == CiProviderKind::None {
+        return None;
+    }
+    let origin = origin_url(loc);
+    let system = resolve_system_from_origin(loc, cfg, origin.as_deref())?;
+    if system == CiSystem::GithubActions {
+        // Keep the exact origin snapshot used for provider selection. The
+        // authenticated gh call must not re-read a possibly changed remote.
+        let remote = origin.as_deref().and_then(parse_github_remote)?;
+        return Some(Box::new(GithubCi {
+            remote: Some(remote),
+        }));
+    }
     client_for_system_with_config(system, cfg)
 }
 
@@ -112,7 +124,7 @@ pub fn client_for_system(system: CiSystem) -> Option<CiClient> {
 /// child environment (never argv) for every `glab` call.
 fn client_for_system_with_config(system: CiSystem, cfg: &CiConfig) -> Option<CiClient> {
     match system {
-        CiSystem::GithubActions => Some(Box::new(GithubCi)),
+        CiSystem::GithubActions => Some(Box::new(GithubCi { remote: None })),
         CiSystem::GitlabCi => Some(Box::new(GitlabCi::from_config(cfg))),
         CiSystem::Drone | CiSystem::Woodpecker | CiSystem::Jenkins | CiSystem::Argo => None,
     }
@@ -134,10 +146,22 @@ pub fn system_for_kind(kind: CiProviderKind) -> Option<CiSystem> {
 /// Resolve the active [`CiSystem`] for a worktree (pure once the remote URL is
 /// in hand). `provider == auto` sniffs the origin host, else honours the config.
 pub fn resolve_system(loc: &GitLoc, cfg: &CiConfig) -> Option<CiSystem> {
+    if cfg.provider == CiProviderKind::None {
+        return None;
+    }
+    let origin = origin_url(loc);
+    resolve_system_from_origin(loc, cfg, origin.as_deref())
+}
+
+fn resolve_system_from_origin(
+    loc: &GitLoc,
+    cfg: &CiConfig,
+    origin: Option<&str>,
+) -> Option<CiSystem> {
     match cfg.provider {
         CiProviderKind::None => None,
         CiProviderKind::Auto => {
-            if let Some(sys) = origin_url(loc).as_deref().and_then(system_from_remote_host) {
+            if let Some(sys) = origin.and_then(system_from_remote_host) {
                 return Some(sys);
             }
             // Fall back to detected CI-config files in the worktree.
@@ -151,6 +175,35 @@ pub fn resolve_system(loc: &GitLoc, cfg: &CiConfig) -> Option<CiSystem> {
         }
         explicit => system_for_kind(explicit),
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GithubRemote {
+    host: String,
+    repository: String,
+}
+
+/// GitHub CLI supports enterprise instances, but CI operations here require
+/// the unambiguous owner/repository path shape. The shared remote parser
+/// rejects credentials, URL decorations, encoded delimiters and traversal.
+fn parse_github_remote(raw: &str) -> Option<GithubRemote> {
+    let remote = parse_gitlab_remote(raw)?;
+    if remote.project.split('/').count() != 2 {
+        return None;
+    }
+    Some(GithubRemote {
+        host: remote.host,
+        repository: remote.project,
+    })
+}
+
+fn github_targeted_argv(remote: &GithubRemote, args: &[&str]) -> Vec<String> {
+    let mut targeted: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
+    let delimiter = targeted.iter().position(|arg| arg == "--");
+    let at = delimiter.unwrap_or(targeted.len());
+    let target = format!("{}/{}", remote.host, remote.repository);
+    targeted.splice(at..at, ["--repo".to_string(), target]);
+    targeted
 }
 
 /// Map a git remote URL's host to a CI system (pure, tested).
@@ -510,7 +563,36 @@ const GH_DETAIL_FIELDS: &str = "databaseId,name,displayTitle,headBranch,headSha,
 
 /// GitHub Actions via the `gh` CLI — reuses the user's existing `gh` auth
 /// (keyring, enterprise hosts) instead of threading a token.
-pub struct GithubCi;
+pub struct GithubCi {
+    // provider_for binds the same origin snapshot used to select GitHub. The
+    // unbound form is retained for the public system factory and resolves once
+    // when the operation starts.
+    remote: Option<GithubRemote>,
+}
+
+impl GithubCi {
+    fn remote(&self, loc: &GitLoc) -> Result<GithubRemote, CiError> {
+        if let Some(remote) = &self.remote {
+            return Ok(remote.clone());
+        }
+        let raw = origin_url(loc).ok_or(CiError::NotConfigured)?;
+        parse_github_remote(&raw)
+            .ok_or_else(|| CiError::Other("unsupported or ambiguous GitHub remote".into()))
+    }
+
+    fn command(&self, loc: &GitLoc, args: &[&str]) -> Result<Command, CiError> {
+        let remote = self.remote(loc)?;
+        let argv = github_targeted_argv(&remote, args);
+        let argv: Vec<_> = argv.iter().map(String::as_str).collect();
+        let mut command = loc.gh_command(&argv);
+        // `--repo HOST/OWNER/REPO` is an explicit target on every CI
+        // subcommand. Pin the environment equivalents too so inherited
+        // GH_REPO/GH_HOST cannot retarget a command on any gh version.
+        command.env("GH_REPO", format!("{}/{}", remote.host, remote.repository));
+        command.env("GH_HOST", &remote.host);
+        Ok(command)
+    }
+}
 
 impl thegn_core::seam::Probe for GithubCi {
     fn probe(&self) -> thegn_core::seam::ProbeReport {
@@ -536,7 +618,7 @@ impl CiProvider for GithubCi {
             args.push("--branch");
             args.push(b);
         }
-        let json = run_cli(&mut loc.gh_command(&args))?;
+        let json = run_cli(&mut self.command(loc, &args)?)?;
         let (runs, discarded_rows) = parse_gh_runs_with_discarded(&json);
         if discarded_rows > 0 {
             tracing::warn!(target: "thegn::ci", discarded_rows, "discarded malformed GitHub run rows");
@@ -550,7 +632,7 @@ impl CiProvider for GithubCi {
     fn run_detail(&self, loc: &GitLoc, run_id: &str) -> Result<CiRunDetail, CiError> {
         let args = github_run_detail_argv(run_id)?;
         let argv: Vec<_> = args.iter().map(String::as_str).collect();
-        let json = run_cli(&mut loc.gh_command(&argv))?;
+        let json = run_cli(&mut self.command(loc, &argv)?)?;
         let value: serde_json::Value = serde_json::from_str(&json)
             .map_err(|error| CiError::Other(format!("invalid provider run response: {error}")))?;
         let observed = value
@@ -580,12 +662,13 @@ impl CiProvider for GithubCi {
         // `gh run view --job <id> --log` (job ids are globally addressable).
         validate_ci_id(_run_id)?;
         validate_ci_id(job_id)?;
-        run_bounded_log(&mut loc.gh_command(&["run", "view", "--job", job_id, "--log"]))
+        run_bounded_log(&mut self.command(loc, &["run", "view", "--job", job_id, "--log"])?)
     }
 
     fn workflows(&self, loc: &GitLoc) -> Result<Vec<CiWorkflow>, CiError> {
-        let json =
-            run_cli(&mut loc.gh_command(&["workflow", "list", "--json", "id,name,path,state"]))?;
+        let json = run_cli(
+            &mut self.command(loc, &["workflow", "list", "--json", "id,name,path,state"])?,
+        )?;
         Ok(parse_gh_workflows(&json))
     }
 
@@ -597,19 +680,19 @@ impl CiProvider for GithubCi {
     ) -> Result<(), CiError> {
         let args = github_workflow_argv(workflow, inputs)?;
         let argv: Vec<&str> = args.iter().map(String::as_str).collect();
-        run_cli(&mut loc.gh_command(&argv)).map(|_| ())
+        run_cli(&mut self.command(loc, &argv)?).map(|_| ())
     }
 
     fn rerun(&self, loc: &GitLoc, run_id: &str, scope: RerunScope) -> Result<(), CiError> {
         let args = github_rerun_argv(run_id, scope)?;
         let argv: Vec<_> = args.iter().map(String::as_str).collect();
-        run_cli(&mut loc.gh_command(&argv)).map(|_| ())
+        run_cli(&mut self.command(loc, &argv)?).map(|_| ())
     }
 
     fn cancel(&self, loc: &GitLoc, run_id: &str) -> Result<(), CiError> {
         let args = github_cancel_argv(run_id)?;
         let argv: Vec<_> = args.iter().map(String::as_str).collect();
-        run_cli(&mut loc.gh_command(&argv)).map(|_| ())
+        run_cli(&mut self.command(loc, &argv)?).map(|_| ())
     }
 
     fn caps(&self) -> CiCaps {
@@ -1390,6 +1473,178 @@ mod tests {
     }
 
     #[test]
+    fn github_origin_parsing_and_target_argv_preserve_authority() {
+        for (raw, host) in [
+            ("git@github.com:owner/repo.git", "github.com"),
+            (
+                "ssh://git@ghe.example.test:2222/owner/repo.git",
+                "ghe.example.test:2222",
+            ),
+            ("https://ghe.example.test/owner/repo", "ghe.example.test"),
+        ] {
+            let remote = parse_github_remote(raw).expect("valid GitHub origin");
+            assert_eq!(remote.host, host);
+            assert_eq!(remote.repository, "owner/repo");
+            let target = format!("{host}/owner/repo");
+            assert_eq!(
+                github_targeted_argv(&remote, &["run", "cancel", "--", "123"]),
+                [
+                    "run".to_string(),
+                    "cancel".to_string(),
+                    "--repo".to_string(),
+                    target,
+                    "--".to_string(),
+                    "123".to_string()
+                ]
+            );
+        }
+        for raw in [
+            "https://github.com/owner/group/repo",
+            "https://github.com/owner/../repo",
+            "https://github.com/owner/repo?other=repo",
+            "https://user:token@github.com/owner/repo",
+            "https://github.com/owner%2Frepo",
+            "https://github.com.evil.test/owner/repo",
+        ] {
+            assert!(parse_github_remote(raw).is_none(), "{raw:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn github_provider_argv_and_environment_ignore_ambient_target() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let bin = temp.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let capture = temp.path().join("argv.txt");
+        let gh = bin.join("gh");
+        std::fs::write(
+            &gh,
+            r##"#!/bin/sh
+printf '%s\t' "$@" >> "$CI_CAPTURE"
+printf 'GH_REPO=%s\tGH_HOST=%s\n' "$GH_REPO" "$GH_HOST" >> "$CI_CAPTURE"
+case " $* " in
+  *" --job "*) printf 'log output\n' ;;
+  *" view "*) printf '%s\n' '{"databaseId":123,"status":"completed","jobs":[]}' ;;
+  *) printf '[]\n' ;;
+esac
+"##,
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&gh).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&gh, permissions).unwrap();
+
+        let loc = GitLoc::Local(temp.path().to_path_buf());
+        for args in [
+            vec!["init", "-q"],
+            vec![
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/owner/repo.git",
+            ],
+            vec![
+                "config",
+                "--local",
+                "remote.origin.gh-resolved",
+                "ambient/wrong",
+            ],
+        ] {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(temp.path())
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+
+        let config_dir = temp.path().join("gh-config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let capture_text = capture.to_string_lossy().into_owned();
+        let config_text = config_dir.to_string_lossy().into_owned();
+        let _env = thegn_core::testenv::EnvGuard::mutate_pairs(&[
+            ("PATH", Some(&path)),
+            ("GH_REPO", Some("ambient/override")),
+            ("GH_HOST", Some("ambient.example.test")),
+            ("GH_CONFIG_DIR", Some(&config_text)),
+            ("CI_CAPTURE", Some(&capture_text)),
+        ]);
+
+        let remote = parse_github_remote("https://github.com/owner/repo.git").unwrap();
+        let client = GithubCi {
+            remote: Some(remote),
+        };
+        client
+            .runs(&loc, Some("feature&status=success"), 7)
+            .unwrap();
+        client.run_detail(&loc, "123").unwrap();
+        client.logs(&loc, "123", "456").unwrap();
+        client.workflows(&loc).unwrap();
+        client.trigger(&loc, "release/manual.yml", &[]).unwrap();
+        client.rerun(&loc, "123", RerunScope::Failed).unwrap();
+        client.cancel(&loc, "123").unwrap();
+
+        let records = std::fs::read_to_string(&capture).unwrap();
+        let records: Vec<String> = records.lines().map(str::to_string).collect();
+        let expected = vec![
+            format!("run\tlist\t--limit\t7\t--json\t{GH_RUN_FIELDS}\t--branch\tfeature&status=success\t--repo\tgithub.com/owner/repo\tGH_REPO=github.com/owner/repo\tGH_HOST=github.com"),
+            format!("run\tview\t--json\t{GH_DETAIL_FIELDS}\t--repo\tgithub.com/owner/repo\t--\t123\tGH_REPO=github.com/owner/repo\tGH_HOST=github.com"),
+            "run\tview\t--job\t456\t--log\t--repo\tgithub.com/owner/repo\tGH_REPO=github.com/owner/repo\tGH_HOST=github.com".into(),
+            "workflow\tlist\t--json\tid,name,path,state\t--repo\tgithub.com/owner/repo\tGH_REPO=github.com/owner/repo\tGH_HOST=github.com".into(),
+            "workflow\trun\t--repo\tgithub.com/owner/repo\t--\trelease/manual.yml\tGH_REPO=github.com/owner/repo\tGH_HOST=github.com".into(),
+            "run\trerun\t--failed\t--repo\tgithub.com/owner/repo\t--\t123\tGH_REPO=github.com/owner/repo\tGH_HOST=github.com".into(),
+            "run\tcancel\t--repo\tgithub.com/owner/repo\t--\t123\tGH_REPO=github.com/owner/repo\tGH_HOST=github.com".into(),
+        ];
+        assert_eq!(records, expected);
+
+        let before = std::fs::metadata(&capture).unwrap().len();
+        assert!(client.runs(&loc, Some("bad ref"), 7).is_err());
+        assert!(client.rerun(&loc, "--help", RerunScope::All).is_err());
+        assert!(client.cancel(&loc, "01").is_err());
+        assert!(client.logs(&loc, "123", "1e5").is_err());
+        assert!(client.trigger(&loc, "--help", &[]).is_err());
+        assert_eq!(std::fs::metadata(&capture).unwrap().len(), before);
+
+        let unsupported = tempfile::tempdir().unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(unsupported.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            std::process::Command::new("git")
+                .args([
+                    "remote",
+                    "add",
+                    "origin",
+                    "https://github.com.evil.test/owner/repo"
+                ])
+                .current_dir(unsupported.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        let mut config = CiConfig::default();
+        config.provider = CiProviderKind::Github;
+        let unsupported_loc = GitLoc::Local(unsupported.path().to_path_buf());
+        assert!(provider_for(&unsupported_loc, &config).is_none());
+        assert_eq!(std::fs::metadata(&capture).unwrap().len(), before);
+    }
+
+    #[test]
     fn rejected_identifiers_never_reach_request_construction() {
         let mut authenticated_requests = 0;
         for id in ["--help", "01", "1e5", "1#x", "1%2f2"] {
@@ -1425,7 +1680,7 @@ mod tests {
     #[test]
     fn provider_entry_points_reject_bad_identifiers_before_subprocesses() {
         let loc = GitLoc::for_worktree(std::path::Path::new("/does/not/exist"));
-        let github = GithubCi;
+        let github = GithubCi { remote: None };
         let gitlab = GitlabCi::default();
 
         for error in [
@@ -1608,13 +1863,13 @@ mod tests {
 
     #[test]
     fn caps_are_set() {
-        assert!(GithubCi.caps().steps);
+        assert!(GithubCi { remote: None }.caps().steps);
         assert!(!GitlabCi::default().caps().steps);
-        assert!(GithubCi.caps().trigger);
+        assert!(GithubCi { remote: None }.caps().trigger);
         assert!(GitlabCi::default().caps().cancel);
         // GitLab's pipeline `retry` can't scope to failed jobs; offering the
         // distinction anyway would silently retry everything.
-        assert!(GithubCi.caps().rerun_failed);
+        assert!(GithubCi { remote: None }.caps().rerun_failed);
         assert!(!GitlabCi::default().caps().rerun_failed);
     }
 }
