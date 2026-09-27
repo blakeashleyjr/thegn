@@ -57,9 +57,11 @@ pub struct ReplayOverlay {
     scratch: AlacrittyEmulator,
     /// Current position in the recording (ms since its epoch).
     cursor_ms: u64,
-    /// The scratch emulator has been fed events with `at_ms <= fed_upto`; forward
-    /// playback feeds incrementally from here, a backward jump forces a rebuild.
-    fed_upto: u64,
+    /// Absolute sequence of the next event to feed into `scratch`. Timestamp
+    /// alone cannot distinguish events sharing one millisecond.
+    fed_seq: u64,
+    /// Retained front sequence used to build the current scratch emulator.
+    retained_floor_seq: u64,
     state: PlayState,
     reverse: bool,
     speed: f32,
@@ -78,11 +80,14 @@ impl ReplayOverlay {
     /// Open replay for `pane`, positioned at the recording's live tail (paused).
     pub fn new(pane: u32, rec: &Recording, idle_threshold_ms: u64) -> Self {
         let cursor_ms = rec.end_ms();
+        let (scratch, fed_seq) = rec.reconstruct_with_cursor(cursor_ms);
+        let retained_floor_seq = rec.first_sequence();
         Self {
             pane,
-            scratch: rec.reconstruct(cursor_ms),
+            scratch,
             cursor_ms,
-            fed_upto: cursor_ms,
+            fed_seq,
+            retained_floor_seq,
             state: PlayState::Paused,
             reverse: false,
             speed: 1.0,
@@ -113,16 +118,23 @@ impl ReplayOverlay {
 
     /// Reposition to an absolute time, rebuilding or extending the scratch grid.
     fn seek(&mut self, rec: &Recording, to_ms: u64) {
-        let to_ms = to_ms.clamp(rec.start_ms(), rec.end_ms());
-        if to_ms >= self.fed_upto {
-            // Forward: feed only the new slice into the existing grid.
-            rec.feed_into(&mut self.scratch, self.fed_upto, to_ms);
+        let mut to_ms = to_ms.clamp(rec.start_ms(), rec.end_ms());
+        if self.retained_floor_seq != rec.first_sequence() {
+            // Retention overtook the incremental cursor. Rebase to the retained
+            // front so no evicted state is assumed to still be available.
+            to_ms = rec.start_ms();
+            (self.scratch, self.fed_seq) = rec.reconstruct_with_cursor(to_ms);
+            self.retained_floor_seq = rec.first_sequence();
+        } else if to_ms >= self.cursor_ms {
+            // Forward: consume only unseen sequence positions, including any
+            // newly appended events in the current millisecond.
+            self.fed_seq = rec.feed_from_sequence(&mut self.scratch, self.fed_seq, to_ms);
         } else {
             // Backward: a clean rebuild from the retained front.
-            self.scratch = rec.reconstruct(to_ms);
+            (self.scratch, self.fed_seq) = rec.reconstruct_with_cursor(to_ms);
+            self.retained_floor_seq = rec.first_sequence();
         }
         self.cursor_ms = to_ms;
-        self.fed_upto = to_ms;
     }
 
     fn toggle_play(&mut self) {
@@ -502,14 +514,9 @@ mod tests {
 
     fn recording_with(script: &[(&[u8], u64)]) -> Recording {
         let mut rec = Recording::from_config(&ReplayConfig::default(), 24, 80);
+        let base = Instant::now() + Duration::from_secs(1);
         for (bytes, at) in script {
-            // Drive at explicit offsets via the public API by faking elapsed time:
-            // push_bytes stamps against Instant::now(), so we can't set arbitrary
-            // times here — instead assert via the recording's own ordering.
-            rec.push_bytes(
-                bytes,
-                std::time::Instant::now() + Duration::from_millis(*at),
-            );
+            rec.push_bytes(bytes, base + Duration::from_millis(*at));
         }
         rec
     }
@@ -523,6 +530,84 @@ mod tests {
         assert_eq!(ov.cursor_ms, rec.end_ms());
         // The scratch grid shows the tail content.
         assert!(grid_text(&ov.scratch).contains("world"));
+    }
+
+    #[test]
+    fn same_timestamp_seek_and_resume_use_sequence_cursor() {
+        let mut rec = Recording::from_config(&ReplayConfig::default(), 24, 80);
+        let base = Instant::now() + Duration::from_secs(1);
+        rec.push_bytes(b"one\r\n", base);
+        rec.push_bytes(b"two\r\n", base);
+        let zeroish = rec.start_ms();
+        let mut ov = ReplayOverlay::new(1, &rec, 1000);
+
+        ov.seek(&rec, zeroish);
+        let at_start = grid_text(&ov.scratch);
+        assert!(at_start.contains("one"));
+        assert!(at_start.contains("two"));
+        ov.seek(&rec, zeroish);
+        assert_eq!(grid_text(&ov.scratch), at_start);
+
+        // A later PTY read can append another event in the cursor's current
+        // millisecond. Advancing to that timestamp must consume its new sequence.
+        rec.push_bytes(b"resumed\r\n", base);
+        ov.seek(&rec, zeroish);
+        assert!(grid_text(&ov.scratch).contains("resumed"));
+        rec.push_bytes(b"three\r\n", base + Duration::from_millis(10));
+        ov.seek(&rec, rec.end_ms());
+        assert!(grid_text(&ov.scratch).contains("three"));
+        ov.seek(&rec, zeroish);
+        let after_backward_seek = grid_text(&ov.scratch);
+        assert!(after_backward_seek.contains("one"));
+        assert!(after_backward_seek.contains("two"));
+        assert!(after_backward_seek.contains("resumed"));
+        assert!(!after_backward_seek.contains("three"));
+    }
+
+    #[test]
+    fn playback_consumes_same_timestamp_append_at_live_tail_once() {
+        let mut rec = Recording::from_config(&ReplayConfig::default(), 24, 80);
+        let epoch = rec.epoch();
+        rec.push_bytes(b"before\r\n", epoch);
+        let mut ov = ReplayOverlay::new(1, &rec, 1000);
+        rec.push_bytes(b"appended\r\n", epoch);
+
+        // The first playback clock tick has zero elapsed time. Reaching the
+        // current live tail must still consume the new sequence at cursor_ms.
+        ov.toggle_play();
+        assert!(ov.advance_clock(&rec));
+        let after_tick = grid_text(&ov.scratch);
+        assert!(after_tick.contains("before"));
+        assert!(after_tick.contains("appended"));
+        assert!(
+            !ov.is_playing(),
+            "the live tail pauses after being consumed"
+        );
+
+        // A later clock notification cannot feed the same event a second time.
+        assert!(!ov.advance_clock(&rec));
+        assert_eq!(grid_text(&ov.scratch), after_tick);
+    }
+
+    #[test]
+    fn seek_rebuilds_when_eviction_overtakes_sequence_cursor() {
+        let cfg = ReplayConfig {
+            max_bytes_per_pane: 1,
+            ..ReplayConfig::default()
+        };
+        let mut rec = Recording::from_config(&cfg, 24, 80);
+        let base = Instant::now() + Duration::from_secs(1);
+        rec.push_bytes(b"old\r\n", base);
+        let mut ov = ReplayOverlay::new(1, &rec, 1000);
+        let old_cursor = ov.cursor_ms;
+
+        rec.push_bytes(b"new\r\n", base + Duration::from_millis(10));
+        assert!(rec.first_sequence() > ov.retained_floor_seq);
+        ov.seek(&rec, old_cursor);
+
+        assert_eq!(ov.cursor_ms, rec.start_ms());
+        assert!(grid_text(&ov.scratch).contains("new"));
+        assert!(!grid_text(&ov.scratch).contains("old"));
     }
 
     #[test]
