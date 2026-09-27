@@ -275,6 +275,10 @@ mod pty_owner_tests {
             Ok(None)
         }
 
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test double: counting the reaps of a fixture child the test spawned itself"
+        )]
         fn wait(&mut self) -> std::io::Result<portable_pty::ExitStatus> {
             self.waits.fetch_add(1, Ordering::SeqCst);
             let status = self
