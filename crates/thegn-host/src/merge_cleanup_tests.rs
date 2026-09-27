@@ -509,6 +509,30 @@ fn modified_or_unknown_seeded_path_is_protected_with_an_actionable_reason() {
 }
 
 #[test]
+fn excluded_raw_legacy_command_is_not_admitted_as_seeded_tool_state() {
+    let _isolation = TestIsolation::new();
+    let fixture = Fixture::new();
+    let mut cfg = thegn_core::config::Config::default();
+    cfg.sandbox.enabled = false;
+    cfg.skills.exclude = vec!["mq".into()];
+
+    let command = fixture.wt.join(".claude/commands/mq-add.md");
+    std::fs::create_dir_all(command.parent().unwrap()).unwrap();
+    std::fs::write(
+        &command,
+        include_str!("../../../extensions/commands/mq-add.md"),
+    )
+    .unwrap();
+    let authority = crate::skill_seed::managed_seed_files(&cfg).unwrap();
+
+    assert!(matches!(
+        clean_with_authority(&fixture.wt, Some(&authority)),
+        Err(Refusal::UnrecognizedToolState(path)) if path == ".claude/commands/mq-add.md"
+    ));
+    assert!(command.exists());
+}
+
+#[test]
 fn seeded_state_does_not_hide_a_real_user_record() {
     let _isolation = TestIsolation::new();
     for tracked in [false, true] {
