@@ -304,12 +304,11 @@ impl TrackerHttpOperation<'_> {
         {
             return Err(IssueError::BodyLimit("tracker response exceeds limit"));
         }
-        let Some(content_type) = response.headers().get(reqwest::header::CONTENT_TYPE) else {
-            return Err(IssueError::Policy("tracker JSON content type missing"));
-        };
-        let content_type = content_type
-            .to_str()
-            .map_err(|_| IssueError::Policy("tracker JSON content type invalid"))?;
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .ok_or(IssueError::Policy("tracker JSON content type refused"))?;
         let media = content_type.split(';').next().unwrap_or("").trim();
         if media != "application/json" && !media.ends_with("+json") {
             return Err(IssueError::Policy("tracker JSON content type refused"));
@@ -596,10 +595,16 @@ mod tests {
             "/redirect" => (StatusCode::FOUND, Body::empty()).into_response(),
             "/encoding" => (StatusCode::OK, Body::from(r#"{"ok":true}"#)).into_response(),
             "/bad-mime" => (StatusCode::OK, Body::from(r#"{"ok":true}"#)).into_response(),
+            "/legacy-no-mime" => (StatusCode::OK, Body::from(r#"{"ok":true}"#)).into_response(),
             "/unauthorized" => (StatusCode::UNAUTHORIZED, Body::empty()).into_response(),
             "/rate-limit" => (
                 StatusCode::FORBIDDEN,
                 Body::from(r#"{"message":"API rate limit exceeded"}"#),
+            )
+                .into_response(),
+            "/envelope-bad-mime" | "/envelope-missing-mime" => (
+                StatusCode::FORBIDDEN,
+                Body::from(r#"{"message":"fixture"}"#),
             )
                 .into_response(),
             "/large" => {
@@ -615,7 +620,8 @@ mod tests {
             _ => (StatusCode::NOT_FOUND, Body::empty()).into_response(),
         };
         match request.uri().path() {
-            "/ok" | "/encoding" | "/bad-mime" | "/rate-limit" | "/large" | "/chunked" => {
+            "/ok" | "/encoding" | "/bad-mime" | "/rate-limit" | "/large" | "/chunked"
+            | "/envelope-bad-mime" => {
                 response.headers_mut().insert(
                     reqwest::header::CONTENT_TYPE,
                     HeaderValue::from_static("application/json"),
@@ -634,7 +640,7 @@ mod tests {
                 HeaderValue::from_static("gzip"),
             );
         }
-        if request.uri().path() == "/bad-mime" {
+        if request.uri().path() == "/bad-mime" || request.uri().path() == "/envelope-bad-mime" {
             response.headers_mut().insert(
                 reqwest::header::CONTENT_TYPE,
                 HeaderValue::from_static("text/plain"),
@@ -699,9 +705,21 @@ mod tests {
         let mut envelope_mime = client.operation();
         assert!(matches!(
             envelope_mime
-                .json_envelope(Method::POST, "/bad-mime", &serde_json::json!({}))
+                .json_envelope(Method::POST, "/envelope-bad-mime", &serde_json::json!({}))
                 .await,
             Err(IssueError::Policy("tracker JSON content type refused"))
+        ));
+
+        let mut envelope_missing_mime = client.operation();
+        assert!(matches!(
+            envelope_missing_mime
+                .json_envelope(
+                    Method::POST,
+                    "/envelope-missing-mime",
+                    &serde_json::json!({})
+                )
+                .await,
+            Err(IssueError::Policy("tracker JSON content type missing"))
         ));
 
         let mut envelope_size = client.operation();
@@ -727,6 +745,14 @@ mod tests {
         let mut mime = client.operation();
         assert!(matches!(
             mime.get::<serde_json::Value>("/bad-mime").await,
+            Err(IssueError::Policy("tracker JSON content type refused"))
+        ));
+
+        let mut missing_mime = client.operation();
+        assert!(matches!(
+            missing_mime
+                .get::<serde_json::Value>("/legacy-no-mime")
+                .await,
             Err(IssueError::Policy("tracker JSON content type refused"))
         ));
 
