@@ -2697,13 +2697,25 @@ pub(crate) fn build_panel(
 
     // The CI run-history cache feeds the `Ci` section rollup (AV group), with
     // its fetch age (the summary's "Ns ago" stamp) and any fetch-health note.
+    let mut discarded_cached_ci_rows = 0;
     if let Ok(Some((json, fetched_at))) = db.get_ci_cache(&cache_key)
-        && let Ok(runs) = serde_json::from_str::<Vec<thegn_core::ci::CiRun>>(&json)
+        && let Some(mut cache) = thegn_core::ci::decode_run_cache(&json)
     {
-        panel.ci_runs = runs;
+        cache.runs.retain(|run| {
+            let valid = thegn_svc::ci::validate_ci_id(&run.id).is_ok();
+            if !valid {
+                discarded_cached_ci_rows += 1;
+            }
+            valid
+        });
+        discarded_cached_ci_rows += cache.discarded_rows;
+        panel.ci_runs = cache.runs;
         panel.ci_fetched_at = Some(fetched_at);
     }
-    panel.ci_note = crate::ci_refresh::note_for(&cache_key);
+    panel.ci_note = crate::ci_refresh::note_for(&cache_key).or_else(|| {
+        (discarded_cached_ci_rows > 0)
+            .then(|| format!("omitted {discarded_cached_ci_rows} malformed cached CI run row(s)"))
+    });
     // A cache row fetched for a *different* branch (the fetcher queries the
     // branch that was checked out at fetch time) must not read as current
     // right after a branch switch — say so until the next refresh lands.
@@ -4803,8 +4815,13 @@ fn build_across(
             w.branch.clone()
         };
         if let Ok(Some((json, _))) = db.get_ci_cache(&w.worktree)
-            && let Ok(runs) = serde_json::from_str::<Vec<thegn_core::ci::CiRun>>(&json)
+            && let Some(cache) = thegn_core::ci::decode_run_cache(&json)
         {
+            let runs = cache
+                .runs
+                .into_iter()
+                .filter(|run| thegn_svc::ci::validate_ci_id(&run.id).is_ok())
+                .collect::<Vec<_>>();
             excerpts.extend(ci_failure_excerpts(&w.worktree, &label, &runs));
         }
     }
