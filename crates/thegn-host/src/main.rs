@@ -1177,6 +1177,26 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         command_intent::classify(Some(&command)),
         command_intent::CommandIntent::Configured
     );
+    // These two source-inspection commands intentionally keep the tolerant
+    // parser so malformed regular TOML remains diagnosable. Refuse only a
+    // source kind or size that cannot be safely inspected. The shared loader
+    // also uses the bounded reader, so every other tolerant config consumer is
+    // protected from an unread FIFO without changing its recovery behavior.
+    let requires_bounded_config_source = matches!(
+        &command,
+        Command::Config {
+            action: cmd::config::Action::Get { .. }
+        } | Command::Automations {
+            action: cmd::automations::Action::Test { .. }
+        }
+    );
+    if requires_bounded_config_source {
+        thegn_core::config::Config::check_layered_source_files(
+            &thegn_core::config::ProcessEnv,
+            cli.config.clone(),
+        )
+        .map_err(|error| anyhow::anyhow!(error))?;
+    }
     let mut cfg = if authority {
         admit_configuration(cli, migration_actor)?.config().clone()
     } else {
