@@ -338,6 +338,32 @@ impl Fixture {
             None,
         )
     }
+
+    fn seed_unignored(&self, cfg: &thegn_core::config::Config) {
+        crate::skill_seed::seed(cfg, &self.wt, thegn_core::skills::SeedPhase::Create).unwrap();
+        let exclude = thegn_core::util::git_common_dir(&self.wt)
+            .join("info")
+            .join("exclude");
+        let contents = std::fs::read_to_string(&exclude).unwrap_or_default();
+        let visible = contents
+            .lines()
+            .filter(|line| !line.contains(".claude/"))
+            .map(|line| format!("{line}\n"))
+            .collect::<String>();
+        std::fs::write(exclude, visible).unwrap();
+    }
+
+    fn seeded_probe(&self, cfg: &thegn_core::config::Config) -> Result<Verified, Refusal> {
+        self.seed_unignored(cfg);
+        Verified::probe_with_config(
+            &self.root,
+            self.wt.to_str().unwrap(),
+            "feature",
+            "main",
+            None,
+            cfg,
+        )
+    }
 }
 
 #[test]
@@ -422,6 +448,94 @@ fn status_observation_accepts_only_well_formed_ignored_records() {
             "{:?}",
             String::from_utf8_lossy(malformed)
         );
+    }
+}
+
+#[test]
+fn exact_unignored_seeded_state_is_admitted_and_reported_separately() {
+    let _isolation = TestIsolation::new();
+    let fixture = Fixture::new();
+    let mut cfg = thegn_core::config::Config::default();
+    cfg.sandbox.enabled = false;
+    let verified = fixture
+        .seeded_probe(&cfg)
+        .expect("exact Rust-seeded files are removable in a non-ignoring repo");
+    assert!(verified.discarded_tool_state());
+    assert!(!verified.discarded_build_state());
+    verified.remove().unwrap();
+    assert!(!fixture.wt.exists());
+}
+
+#[test]
+fn modified_or_unknown_seeded_path_is_protected_with_an_actionable_reason() {
+    let _isolation = TestIsolation::new();
+    let fixture = Fixture::new();
+    let mut cfg = thegn_core::config::Config::default();
+    cfg.sandbox.enabled = false;
+    fixture.seed_unignored(&cfg);
+    std::fs::write(
+        fixture.wt.join(".claude/skills/mq/SKILL.md"),
+        "user-edited skill\n",
+    )
+    .unwrap();
+    assert!(matches!(
+        Verified::probe_with_config(
+            &fixture.root,
+            fixture.wt.to_str().unwrap(),
+            "feature",
+            "main",
+            None,
+            &cfg,
+        ),
+        Err(Refusal::ManagedChanged(path)) if path == ".claude/skills/mq/SKILL.md"
+    ));
+
+    let fixture = Fixture::new();
+    fixture.seed_unignored(&cfg);
+    let unknown = fixture.wt.join(".claude/skills/mq/notes.md");
+    std::fs::write(&unknown, "user-owned\n").unwrap();
+    assert!(matches!(
+        Verified::probe_with_config(
+            &fixture.root,
+            fixture.wt.to_str().unwrap(),
+            "feature",
+            "main",
+            None,
+            &cfg,
+        ),
+        Err(Refusal::UnrecognizedToolState(path)) if path == ".claude/skills/mq/notes.md"
+    ));
+    assert!(unknown.exists());
+}
+
+#[test]
+fn seeded_state_does_not_hide_a_real_user_record() {
+    let _isolation = TestIsolation::new();
+    for tracked in [false, true] {
+        let fixture = Fixture::new();
+        let mut cfg = thegn_core::config::Config::default();
+        cfg.sandbox.enabled = false;
+        fixture.seed_unignored(&cfg);
+        if tracked {
+            std::fs::write(fixture.wt.join("tracked"), "user edit\n").unwrap();
+        } else {
+            std::fs::write(fixture.wt.join("user-file"), "user work\n").unwrap();
+        }
+        assert!(
+            matches!(
+                Verified::probe_with_config(
+                    &fixture.root,
+                    fixture.wt.to_str().unwrap(),
+                    "feature",
+                    "main",
+                    None,
+                    &cfg,
+                ),
+                Err(Refusal::Dirty)
+            ),
+            "tracked={tracked}"
+        );
+        assert!(fixture.wt.exists());
     }
 }
 

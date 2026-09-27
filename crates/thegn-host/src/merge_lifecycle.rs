@@ -33,6 +33,7 @@ pub(crate) enum CleanupOutcome {
         branch_deleted: bool,
         queue_removed: bool,
         discarded_build_state: bool,
+        discarded_tool_state: bool,
         bookkeeping_errors: Vec<String>,
     },
     KeptDirty,
@@ -120,12 +121,19 @@ fn apply_inner(
             match outcome {
                 CleanupOutcome::Removed {
                     discarded_build_state,
+                    discarded_tool_state,
                     bookkeeping_errors,
                     ..
                 } => {
                     if discarded_build_state {
                         thegn_core::msg::info(&format!(
                             "merge cleanup: swept {} (discarded build state)",
+                            crate::merge_sweep::safe_display(branch)
+                        ));
+                    }
+                    if discarded_tool_state {
+                        thegn_core::msg::info(&format!(
+                            "merge cleanup: swept {} (discarded seeded tool state)",
                             crate::merge_sweep::safe_display(branch)
                         ));
                     }
@@ -365,7 +373,9 @@ pub(crate) fn remove_landed_with_config(
     // worktree the user still has work in must be left alone. It keeps its
     // lifecycle folder and its branch; the next land (or a manual `wt rm`)
     // cleans it up once the work is committed or dropped.
-    let verified = match cleanup::Verified::probe(repo_root, worktree, branch, target, landed) {
+    let verified = match cleanup::Verified::probe_with_config(
+        repo_root, worktree, branch, target, landed, cfg,
+    ) {
         Ok(verified) => verified,
         Err(cleanup::Refusal::Dirty) => return CleanupOutcome::KeptDirty,
         Err(error) => {
@@ -419,6 +429,7 @@ pub(crate) fn remove_landed_with_config(
         Err(reason) => return CleanupOutcome::Refused { reason },
     };
     let discarded_build_state = verified.discarded_build_state();
+    let discarded_tool_state = verified.discarded_tool_state();
     let changed_during_cleanup = std::cell::Cell::new(false);
     let dirty_during_cleanup = std::cell::Cell::new(false);
     // A worktree that becomes dirty or changes *during* cleanup is kept, exactly
@@ -430,6 +441,7 @@ pub(crate) fn remove_landed_with_config(
         match &refusal {
             cleanup::Refusal::Changed => changed_during_cleanup.set(true),
             cleanup::Refusal::Dirty => dirty_during_cleanup.set(true),
+            cleanup::Refusal::ManagedChanged(_) | cleanup::Refusal::UnrecognizedToolState(_) => {}
             cleanup::Refusal::Unsafe(_) => {}
         }
         refusal.to_string()
@@ -559,6 +571,7 @@ pub(crate) fn remove_landed_with_config(
         branch_deleted,
         queue_removed,
         discarded_build_state,
+        discarded_tool_state,
         bookkeeping_errors,
     }
 }

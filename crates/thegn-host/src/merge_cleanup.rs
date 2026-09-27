@@ -2,6 +2,7 @@
 //! A queue row is evidence to investigate, never authority to delete a path.
 
 use std::collections::BTreeSet;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use thegn_core::util;
 
@@ -354,6 +355,8 @@ fn parse_mount_sources(bytes: &[u8]) -> Result<Vec<PathBuf>, &'static str> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Refusal {
     Dirty,
+    ManagedChanged(String),
+    UnrecognizedToolState(String),
     Changed,
     Unsafe(String),
 }
@@ -362,6 +365,10 @@ impl std::fmt::Display for Refusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Dirty => f.write_str("edited since landing"),
+            Self::ManagedChanged(path) => write!(f, "managed tool file was modified: {path}"),
+            Self::UnrecognizedToolState(path) => {
+                write!(f, "unrecognized generated file requires review: {path}")
+            }
             Self::Changed => f.write_str("changed during cleanup"),
             Self::Unsafe(reason) => f.write_str(reason),
         }
@@ -523,14 +530,28 @@ fn configured_filter_drivers(path: &Path) -> Result<BTreeSet<String>, Refusal> {
 pub(crate) struct StatusObservation {
     bytes: Vec<u8>,
     ignored_only: bool,
+    seeded_paths: Vec<PathBuf>,
 }
 
 /// Classify a porcelain-v1 `-z` status. Only `!! <path>` records — ignored
-/// build state — are admissible; every tracked or untracked record is real user
-/// work, and anything that does not parse is refused as unsafe rather than as an
-/// edit, so an unexpected Git output shape is never reported as "edited".
+/// build state — and exact `??` records for files proven to be seeded by thegn
+/// are admissible. Every tracked record, ordinary untracked path, modified
+/// managed path, or unknown path below a managed root remains protected. The
+/// whole batch is classified before it is accepted; seeing one seeded record
+/// must never make a later user record disappear from consideration.
 fn observe_status(bytes: Vec<u8>) -> Result<StatusObservation, Refusal> {
-    let mut ignored_only = false;
+    observe_status_with_authority(bytes, Path::new("."), None)
+}
+
+fn observe_status_with_authority(
+    bytes: Vec<u8>,
+    root: &Path,
+    authority: Option<&crate::skill_seed::ManagedSeedFiles>,
+) -> Result<StatusObservation, Refusal> {
+    let mut saw_ignored = false;
+    let mut saw_seeded = false;
+    let mut seeded_paths = Vec::new();
+    let mut refusal = None;
     for record in bytes
         .split(|byte| *byte == 0)
         .filter(|record| !record.is_empty())
@@ -539,21 +560,78 @@ fn observe_status(bytes: Vec<u8>) -> Result<StatusObservation, Refusal> {
         // rename's trailing bare-path field fails this and is refused too,
         // which is correct — a rename is a tracked modification.
         if record.len() < 4 || record[2] != b' ' {
-            return Err(unsafe_reason("unparseable git status record"));
+            refusal.get_or_insert_with(|| unsafe_reason("unparseable git status record"));
+            continue;
         }
         if record.starts_with(b"!! ") {
-            ignored_only = true;
+            saw_ignored = true;
+        } else if record.starts_with(b"?? ") {
+            let relative = match crate::platform::os_path_from_git_bytes(&record[3..]) {
+                Ok(relative) => relative,
+                Err(error) => {
+                    refusal.get_or_insert_with(|| {
+                        unsafe_reason(format!("unparseable seeded path: {error}"))
+                    });
+                    continue;
+                }
+            };
+            if relative.is_absolute()
+                || relative
+                    .components()
+                    .any(|component| matches!(component, std::path::Component::ParentDir))
+            {
+                refusal.get_or_insert_with(|| unsafe_reason("unparseable seeded path"));
+                continue;
+            }
+            let Some(authority) = authority else {
+                refusal.get_or_insert(Refusal::Dirty);
+                continue;
+            };
+            if let Some(expected) = authority.expected(&relative) {
+                match seeded_file_matches(root, &relative, expected) {
+                    Ok(true) => {
+                        saw_seeded = true;
+                        seeded_paths.push(relative);
+                    }
+                    Ok(false) => {
+                        refusal.get_or_insert(Refusal::ManagedChanged(
+                            relative.to_string_lossy().into_owned(),
+                        ));
+                    }
+                    Err(error) => {
+                        refusal.get_or_insert(error);
+                    }
+                }
+            } else if authority.is_managed_root(&relative) {
+                refusal.get_or_insert(Refusal::UnrecognizedToolState(
+                    relative.to_string_lossy().into_owned(),
+                ));
+            } else {
+                refusal.get_or_insert(Refusal::Dirty);
+            }
         } else {
-            return Err(Refusal::Dirty);
+            refusal.get_or_insert(Refusal::Dirty);
         }
     }
+    if let Some(refusal) = refusal {
+        return Err(refusal);
+    }
+    let ignored_only = saw_ignored && !saw_seeded;
     Ok(StatusObservation {
         bytes,
         ignored_only,
+        seeded_paths,
     })
 }
 
 pub(crate) fn clean(path: &Path) -> Result<StatusObservation, Refusal> {
+    clean_with_authority(path, None)
+}
+
+fn clean_with_authority(
+    path: &Path,
+    authority: Option<&crate::skill_seed::ManagedSeedFiles>,
+) -> Result<StatusObservation, Refusal> {
     // status may run clean/process drivers while refreshing index content, and
     // fsmonitor=false alone cannot make that safe — so an APPLICABLE driver is
     // still a hard refusal.
@@ -619,7 +697,63 @@ pub(crate) fn clean(path: &Path) -> Result<StatusObservation, Refusal> {
             "--ignore-submodules=none",
         ],
     )?;
-    observe_status(status)
+    observe_status_with_authority(status, path, authority)
+}
+
+fn seeded_file_matches(
+    root: &Path,
+    relative: &Path,
+    expected: &std::collections::BTreeSet<Vec<u8>>,
+) -> Result<bool, Refusal> {
+    let path = root.join(relative);
+    let file = crate::platform::open_nofollow(&path)
+        .map_err(|_| Refusal::ManagedChanged(relative.to_string_lossy().into_owned()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| Refusal::ManagedChanged(relative.to_string_lossy().into_owned()))?;
+    if !metadata.is_file() {
+        return Ok(false);
+    }
+    let mut bytes = Vec::new();
+    file.take((thegn_core::skills::MAX_DOCUMENT_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|_| Refusal::ManagedChanged(relative.to_string_lossy().into_owned()))?;
+    if bytes.len() > thegn_core::skills::MAX_DOCUMENT_BYTES {
+        return Ok(false);
+    }
+    Ok(expected.iter().any(|candidate| candidate == &bytes))
+}
+
+fn remove_seeded_files(
+    root: &Path,
+    paths: &[PathBuf],
+    authority: Option<&crate::skill_seed::ManagedSeedFiles>,
+) -> Result<(), Refusal> {
+    let Some(authority) = authority else {
+        return Ok(());
+    };
+    for relative in paths {
+        let Some(expected) = authority.expected(relative) else {
+            return Err(Refusal::UnrecognizedToolState(
+                relative.to_string_lossy().into_owned(),
+            ));
+        };
+        // Re-check the exact bytes immediately before unlinking. Git's
+        // no-force worktree removal remains the final backstop for a file that
+        // appears in the race after this check.
+        if !seeded_file_matches(root, relative, expected)? {
+            return Err(Refusal::ManagedChanged(
+                relative.to_string_lossy().into_owned(),
+            ));
+        }
+        let path = root.join(relative);
+        std::fs::remove_file(&path)
+            .map_err(|_| Refusal::ManagedChanged(relative.to_string_lossy().into_owned()))?;
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::remove_dir(parent); // best-effort: only empty seed directories are ours
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -679,6 +813,7 @@ pub(crate) struct Verified {
     head: String,
     landed: Option<String>,
     status: StatusObservation,
+    managed_seed_files: Option<crate::skill_seed::ManagedSeedFiles>,
     identities: Vec<same_file::Handle>,
 }
 
@@ -689,6 +824,38 @@ impl Verified {
         branch: &str,
         target: &str,
         landed: Option<&str>,
+    ) -> Result<Self, Refusal> {
+        Self::probe_inner(root, worktree, branch, target, landed, None)
+    }
+
+    pub(crate) fn probe_with_config(
+        root: &Path,
+        worktree: &str,
+        branch: &str,
+        target: &str,
+        landed: Option<&str>,
+        cfg: &thegn_core::config::Config,
+    ) -> Result<Self, Refusal> {
+        let managed_seed_files = crate::skill_seed::managed_seed_files(cfg).map_err(|error| {
+            unsafe_reason(format!("seeded-state authority unavailable: {error}"))
+        })?;
+        Self::probe_inner(
+            root,
+            worktree,
+            branch,
+            target,
+            landed,
+            Some(managed_seed_files),
+        )
+    }
+
+    fn probe_inner(
+        root: &Path,
+        worktree: &str,
+        branch: &str,
+        target: &str,
+        landed: Option<&str>,
+        managed_seed_files: Option<crate::skill_seed::ManagedSeedFiles>,
     ) -> Result<Self, Refusal> {
         let root = canonical(root)?;
         let history = crate::canonical_history::CanonicalHistory::capture(&root)
@@ -764,7 +931,7 @@ impl Verified {
                 "not a verified linked-worktree metadata directory",
             ));
         }
-        let status = clean(&path)?;
+        let status = clean_with_authority(&path, managed_seed_files.as_ref())?;
         let identities = [
             (&path, IdentityKind::Directory),
             (&common_dir, IdentityKind::Directory),
@@ -789,6 +956,7 @@ impl Verified {
             head,
             landed: landed.map(str::to_owned),
             status,
+            managed_seed_files,
             identities,
         })
     }
@@ -797,7 +965,7 @@ impl Verified {
         self.history
             .revalidate()
             .map_err(|error| unsafe_reason(error.to_string()))?;
-        let now = Self::probe(
+        let now = Self::probe_inner(
             &self.root,
             self.path
                 .to_str()
@@ -805,6 +973,7 @@ impl Verified {
             &self.branch,
             &self.target,
             self.landed.as_deref(),
+            self.managed_seed_files.clone(),
         )?;
         if self.status.bytes != now.status.bytes {
             return Err(Refusal::Changed);
@@ -821,6 +990,10 @@ impl Verified {
 
     pub(crate) fn discarded_build_state(&self) -> bool {
         self.status.ignored_only
+    }
+
+    pub(crate) fn discarded_tool_state(&self) -> bool {
+        !self.status.seeded_paths.is_empty()
     }
 
     pub(crate) fn verify_cached_repository(&self, path: &Path) -> Result<(), Refusal> {
@@ -847,17 +1020,25 @@ impl Verified {
         // Re-observe as late as possible. `final_guard` re-checks the queue and
         // can take arbitrary time, and the window between the last status read
         // and Git's own removal is the only one in which newly written ignored
-        // state is destroyed. This cannot close the race — nothing short of a
-        // filesystem lease could — but it shrinks it to the removal call itself.
+        // or seeded state is destroyed. This cannot close the race — nothing
+        // short of a filesystem lease could — but it shrinks it to the removal
+        // call itself.
         //
         // Real user work is protected twice over regardless: the probe refuses
-        // it here, and `git worktree remove` WITHOUT `--force` independently
-        // refuses a worktree with modified or untracked files (verified against
-        // git 2.54: ignored-only is removed, tracked-modified and
-        // untracked-non-ignored are refused). Never add `--force` below.
-        if clean(&self.path)?.bytes != self.status.bytes {
+        // it here, exact seeded files are removed only after a final byte check,
+        // and `git worktree remove` WITHOUT `--force` independently refuses a
+        // worktree with modified or untracked files (verified against git 2.54:
+        // ignored-only is removed, tracked-modified and untracked-non-ignored
+        // are refused). Never add `--force` below.
+        let final_status = clean_with_authority(&self.path, self.managed_seed_files.as_ref())?;
+        if final_status.bytes != self.status.bytes {
             return Err(Refusal::Changed);
         }
+        remove_seeded_files(
+            &self.path,
+            &final_status.seeded_paths,
+            self.managed_seed_files.as_ref(),
+        )?;
         git(
             &self.root,
             &[
