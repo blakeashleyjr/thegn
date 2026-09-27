@@ -1,14 +1,14 @@
 {
-  "id": "THE-690",
-  "title": "Merely having docker or podman on PATH blocks every merged-worktree sweep forever",
-  "url": "https://linear.app/blakeashley/issue/THE-690/merely-having-docker-or-podman-on-path-blocks-every-merged-worktree",
+  "id": "THE-692",
+  "title": "thegn land never records a landed merge_queue row, so a canonically-landed worktree is never swept",
+  "url": "https://linear.app/blakeashley/issue/THE-692/thegn-land-never-records-a-landed-merge-queue-row-so-a-canonically",
   "priority": "High",
   "labels": [
     "Bug"
   ],
   "status": "Backlog",
   "team": "Thegn",
-  "primary_file": "crates/thegn-host/src/merge_cleanup.rs",
-  "chain": "5th cause of 'merge sweep collects nothing'; THE-685/686/687/688 landed, THE-689 is a filed follow-up",
-  "affects": "all 13 kept worktrees"
+  "primary_file": "crates/thegn-host/src/cmd/land.rs",
+  "chain": "6th and largest cause of 'merge sweep collects nothing'; THE-685/686/687/688/690 all landed and the sweep now collects for queue-landed worktrees only",
+  "measured": "33 of 47 registered worktrees have no merge_queue row at all"
 }

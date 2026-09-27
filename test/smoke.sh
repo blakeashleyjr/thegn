@@ -901,6 +901,43 @@ check "sweep records the retained branch cleanup hold" \
 check "explicit queue dismissal clears the collected fixture hold" \
   "'$SZ' merge rm --worktree '$MP' >/dev/null && [[ \$(sqlite3 \"$XDG_STATE_HOME/thegn/thegn.db\" \"SELECT count(*) FROM merge_queue WHERE branch='$MB'\") -eq 0 ]]"
 
+# THE-692: the canonical one-shot land path must enter the same landed-row
+# lifecycle as `merge drain`, including the already-landed/UpToDate retry path.
+LM="$("$SZ" wt new smoke-manual-land --repo "$R")"
+LB="$(git -C "$LM" symbolic-ref --short HEAD)"
+printf 'manual land\n' >"$LM/manual-land.txt"
+git -C "$LM" -c commit.gpgsign=false add -A
+git -C "$LM" -c commit.gpgsign=false commit -q -m "smoke manual land"
+check "thegn land records the manual landed row" \
+  "'$SZ' land --worktree '$LM' | grep -q 'landed'"
+LM_OID="$(git -C "$R" rev-parse main)"
+check "manual land records the exact fold OID and target" \
+  "[[ \$(sqlite3 \"$XDG_STATE_HOME/thegn/thegn.db\" \"SELECT status || '|' || target_branch || '|' || result_oid FROM merge_queue WHERE branch='$LB'\") == 'landed|main|$LM_OID' ]]"
+check "manual land keeps the worktree and branch during its grace period" \
+  "[[ -d '$LM' ]] && [[ -n \$(git -C '$R' branch --list '$LB') ]]"
+LM_UPDATED_AT="$(sqlite3 "$XDG_STATE_HOME/thegn/thegn.db" "SELECT updated_at FROM merge_queue WHERE branch='$LB'")"
+check "a second manual land leaves the landed row and grace clock untouched" \
+  "'$SZ' land --worktree '$LM' | grep -q 'already in' && [[ \$(sqlite3 \"$XDG_STATE_HOME/thegn/thegn.db\" \"SELECT updated_at FROM merge_queue WHERE branch='$LB'\") == '$LM_UPDATED_AT' ]]"
+# The case above proves UpToDate does not DISTURB an existing row. This proves
+# UpToDate CREATES a missing one, which is the only thing that can repair a
+# worktree landed before this fix existed — on the machine this issue came from,
+# 33 of 47 registered worktrees were in exactly that state. Delete the row to
+# simulate one, then land again: the branch is already in the target, so the
+# outcome is UpToDate and the row must come back with the same identity.
+sqlite3 "$XDG_STATE_HOME/thegn/thegn.db" "DELETE FROM merge_queue WHERE branch='$LB'"
+check "the pre-fix state really has no landed row" \
+  "[[ \$(sqlite3 \"$XDG_STATE_HOME/thegn/thegn.db\" \"SELECT count(*) FROM merge_queue WHERE branch='$LB'\") -eq 0 ]]"
+check "a second manual land recreates a missing landed row from UpToDate" \
+  "'$SZ' land --worktree '$LM' | grep -q 'already in' && [[ \$(sqlite3 \"$XDG_STATE_HOME/thegn/thegn.db\" \"SELECT status || '|' || target_branch || '|' || result_oid FROM merge_queue WHERE branch='$LB'\") == 'landed|main|$LM_OID' ]]"
+
+# Landing the repo root itself must never record a row: there is no worktree to
+# expire, and a row would make the sweep consider the canonical checkout.
+check "landing the repo root records no row" \
+  "'$SZ' land --worktree '$R' >/dev/null 2>&1; [[ \$(sqlite3 \"$XDG_STATE_HOME/thegn/thegn.db\" \"SELECT count(*) FROM merge_queue WHERE worktree='$R'\") -eq 0 ]]"
+
+check "manual landed worktree is swept after the real TTL" \
+  "sweep_due_expired 'swept' && [[ ! -d '$LM' ]]"
+
 # THE-690: an installed Docker/Podman binary must be queried for actual mount
 # ownership, not treated as permanent evidence that every merged worktree is
 # still in use. The shim speaks the exact bounded ps/inspect dialect used by
