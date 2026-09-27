@@ -18,7 +18,9 @@ use std::path::PathBuf;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc as tokio_mpsc;
 
-use thegn_core::control_wire::{EventDecoder, EventFrame, FeedFilter, PROTO_VERSION};
+use thegn_core::control_wire::{
+    EventDecoder, EventFrame, FeedFilter, MAX_WIRE_FRAME, PROTO_VERSION,
+};
 use thegn_core::store::{ControlStore, DaemonRow};
 
 use super::ControlErrorCode;
@@ -868,24 +870,36 @@ impl ControlClient {
                 let stream = crate::ipc::connect(&ep)
                     .await
                     .with_context(|| format!("connect control endpoint {}", ep.display()))?;
-                let (ws, _) = tokio_tungstenite::client_async(req, stream)
-                    .await
-                    .context("events websocket handshake")?;
+                let (ws, _) = tokio_tungstenite::client_async_with_config(
+                    req,
+                    stream,
+                    Some(control_ws_config()),
+                )
+                .await
+                .context("events websocket handshake")?;
                 start_attach(ws, frame_tx, ctrl_rx).await?;
             }
             ControlAddr::Tcp { addr, .. } => {
                 let stream = tokio::net::TcpStream::connect(addr)
                     .await
                     .with_context(|| format!("connect control addr {addr}"))?;
-                let (ws, _) = tokio_tungstenite::client_async(req, stream)
-                    .await
-                    .context("events websocket handshake")?;
+                let (ws, _) = tokio_tungstenite::client_async_with_config(
+                    req,
+                    stream,
+                    Some(control_ws_config()),
+                )
+                .await
+                .context("events websocket handshake")?;
                 start_attach(ws, frame_tx, ctrl_rx).await?;
             }
             ControlAddr::HttpOrigin { .. } => {
-                let (ws, _) = tokio_tungstenite::connect_async(req)
-                    .await
-                    .context("events websocket handshake")?;
+                let (ws, _) = tokio_tungstenite::connect_async_with_config(
+                    req,
+                    Some(control_ws_config()),
+                    false,
+                )
+                .await
+                .context("events websocket handshake")?;
                 start_attach(ws, frame_tx, ctrl_rx).await?;
             }
         }
@@ -975,24 +989,36 @@ impl ControlClient {
                 let stream = crate::ipc::connect(&ep)
                     .await
                     .with_context(|| format!("connect control endpoint {}", ep.display()))?;
-                let (ws, _) = tokio_tungstenite::client_async(req, stream)
-                    .await
-                    .context("attach websocket handshake")?;
+                let (ws, _) = tokio_tungstenite::client_async_with_config(
+                    req,
+                    stream,
+                    Some(control_ws_config()),
+                )
+                .await
+                .context("attach websocket handshake")?;
                 start_attach(ws, frame_tx, ctrl_rx).await?;
             }
             ControlAddr::Tcp { addr, .. } => {
                 let stream = tokio::net::TcpStream::connect(addr)
                     .await
                     .with_context(|| format!("connect control addr {addr}"))?;
-                let (ws, _) = tokio_tungstenite::client_async(req, stream)
-                    .await
-                    .context("attach websocket handshake")?;
+                let (ws, _) = tokio_tungstenite::client_async_with_config(
+                    req,
+                    stream,
+                    Some(control_ws_config()),
+                )
+                .await
+                .context("attach websocket handshake")?;
                 start_attach(ws, frame_tx, ctrl_rx).await?;
             }
             ControlAddr::HttpOrigin { .. } => {
-                let (ws, _) = tokio_tungstenite::connect_async(req)
-                    .await
-                    .context("attach websocket handshake")?;
+                let (ws, _) = tokio_tungstenite::connect_async_with_config(
+                    req,
+                    Some(control_ws_config()),
+                    false,
+                )
+                .await
+                .context("attach websocket handshake")?;
                 start_attach(ws, frame_tx, ctrl_rx).await?;
             }
         }
@@ -1051,6 +1077,15 @@ fn percent_encode(value: &str) -> String {
 
 type Ws<S> = tokio_tungstenite::WebSocketStream<S>;
 
+/// Keep transport allocations within the largest legal encoded control frame.
+/// tungstenite 0.29 measures these limits in WebSocket payload bytes (excluding
+/// the WebSocket framing header), which includes the five-byte control header.
+fn control_ws_config() -> tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+    tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
+        .max_frame_size(Some(MAX_WIRE_FRAME))
+        .max_message_size(Some(MAX_WIRE_FRAME))
+}
+
 /// Longest we wait for the daemon's greeting after the WS handshake before
 /// declaring the connect wedged. The `Hello` is sent immediately after the
 /// server-side attach succeeds, so a healthy connect never comes near this.
@@ -1074,25 +1109,26 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     use tokio_tungstenite::tungstenite::Message;
-    let mut decoder = EventDecoder::new();
     let deadline = tokio::time::Instant::now() + HELLO_TIMEOUT;
-    let first = loop {
+    let hello = loop {
         let msg = tokio::time::timeout_at(deadline, ws.next())
             .await
             .map_err(|_| anyhow!("pane daemon sent no greeting within {HELLO_TIMEOUT:?}"))?;
         match msg {
             Some(Ok(Message::Binary(bytes))) => {
-                decoder.push(&bytes);
-                let ready = decoder.drain().map_err(|e| {
+                let frame = EventDecoder::decode_message(&bytes).map_err(|e| {
                     anyhow!(
                         "undecodable greeting from the pane daemon ({e}) — likely a \
                          protocol-incompatible daemon; restart it (`thegn daemon`) or \
                          quit stale daemons"
                     )
                 })?;
-                if !ready.is_empty() {
-                    break ready;
-                }
+                let EventFrame::Hello(hello) = frame else {
+                    return Err(anyhow!(
+                        "expected Hello as the first control frame from the pane daemon"
+                    ));
+                };
+                break hello;
             }
             // The server's attach-failure envelope (a JSON text frame).
             Some(Ok(Message::Text(text))) => {
@@ -1107,27 +1143,23 @@ where
             None => return Err(anyhow!("attach stream closed before the daemon's greeting")),
         }
     };
-    if let Some(EventFrame::Hello(h)) = first.first()
-        && h.proto != PROTO_VERSION
-    {
+    if hello.proto != PROTO_VERSION {
         return Err(anyhow!(
             "pane daemon ({}) speaks control protocol v{}, this thegn speaks v{PROTO_VERSION} — \
              restart the daemon (`thegn daemon`) or quit stale daemons",
-            h.server,
-            h.proto,
+            hello.server,
+            hello.proto,
         ));
     }
-    for f in first {
-        // The channel is fresh (cap 256); the greeting burst always fits.
-        let _ = frames.send(f).await; // best-effort: fresh channel always fits (see above)
-    }
-    tokio::spawn(pump_attach_inner(ws, decoder, frames, ctrl));
+    // Publish the receiver and start draining before forwarding the validated
+    // greeting. This ordering cannot deadlock on a prefilled bootstrap queue.
+    tokio::spawn(pump_attach_inner(ws, frames.clone(), ctrl));
+    let _ = frames.send(EventFrame::Hello(hello)).await;
     Ok(())
 }
 
 async fn pump_attach_inner<S>(
     mut ws: Ws<S>,
-    mut decoder: EventDecoder,
     frames: tokio_mpsc::Sender<EventFrame>,
     mut ctrl: tokio_mpsc::Receiver<AttachControl>,
 ) where
@@ -1138,19 +1170,15 @@ async fn pump_attach_inner<S>(
         tokio::select! {
             msg = ws.next() => match msg {
                 Some(Ok(Message::Binary(bytes))) => {
-                    decoder.push(&bytes);
-                    loop {
-                        match decoder.next_frame() {
-                            Ok(Some(frame)) => {
-                                if frames.send(frame).await.is_err() {
-                                    return; // consumer gone
-                                }
+                    match EventDecoder::decode_message(&bytes) {
+                        Ok(frame) => {
+                            if frames.send(frame).await.is_err() {
+                                return; // consumer gone
                             }
-                            Ok(None) => break,
-                            Err(e) => {
-                                tracing::warn!(target: "thegn::control", "attach stream decode error: {e}");
-                                return;
-                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(target: "thegn::control", "attach stream decode error: {e}");
+                            return;
                         }
                     }
                 }
@@ -2152,6 +2180,35 @@ mod tests {
             &serde_json::json!({ "error": "failure", "code": "future_code" }),
         );
         assert_eq!(future.code(), None);
+    }
+
+    #[test]
+    fn fragmented_websocket_binary_frame_reassembles_to_one_control_frame() {
+        use std::io::Cursor;
+        use tokio_tungstenite::tungstenite::{Message, protocol::Role};
+
+        let encoded = EventFrame::Sessions.encode();
+        let split = 2;
+        // Deterministic server-to-client WebSocket frames: non-final Binary,
+        // then final Continuation. Tungstenite reassembles them as one message.
+        let mut wire = vec![0x02, split as u8];
+        wire.extend_from_slice(&encoded[..split]);
+        wire.push(0x80);
+        wire.push((encoded.len() - split) as u8);
+        wire.extend_from_slice(&encoded[split..]);
+
+        let mut ws = tokio_tungstenite::tungstenite::WebSocket::from_raw_socket(
+            Cursor::new(wire),
+            Role::Client,
+            Some(control_ws_config()),
+        );
+        let Message::Binary(message) = ws.read().unwrap() else {
+            panic!("expected reassembled binary websocket message");
+        };
+        assert_eq!(
+            EventDecoder::decode_message(&message),
+            Ok(EventFrame::Sessions)
+        );
     }
 
     fn daemon_row(id: &str, scope: &str, endpoint: &str, heartbeat_at: i64) -> DaemonRow {

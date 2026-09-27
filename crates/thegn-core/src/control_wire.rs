@@ -24,6 +24,8 @@ pub const PROTO_VERSION: u32 = 1;
 
 /// Max payload of a single frame (1 MiB), matching [`crate::iroh_wire`].
 pub const MAX_WIRE_PAYLOAD: usize = 1 << 20;
+/// Maximum encoded control frame, including its five-byte tag/length header.
+pub const MAX_WIRE_FRAME: usize = MAX_WIRE_PAYLOAD + 5;
 
 const T_HELLO: u8 = 0;
 const T_SNAPSHOT: u8 = 1;
@@ -343,6 +345,14 @@ impl FeedFilter {
 pub enum WireError {
     UnknownTag(u8),
     PayloadTooLarge(usize),
+    MessageTooLarge(usize),
+    EmptyMessage,
+    TruncatedFrame {
+        expected: usize,
+        actual: usize,
+    },
+    TrailingBytes(usize),
+    MultipleFrames,
     /// A frame's payload didn't parse. Carries the offending tag.
     BadPayload(u8),
 }
@@ -352,6 +362,18 @@ impl std::fmt::Display for WireError {
         match self {
             WireError::UnknownTag(t) => write!(f, "unknown control wire tag {t}"),
             WireError::PayloadTooLarge(n) => write!(f, "control wire payload too large: {n}"),
+            WireError::MessageTooLarge(n) => {
+                write!(f, "control websocket message too large: {n} bytes")
+            }
+            WireError::EmptyMessage => write!(f, "empty control websocket message"),
+            WireError::TruncatedFrame { expected, actual } => write!(
+                f,
+                "truncated control frame: expected {expected} bytes, received {actual}"
+            ),
+            WireError::TrailingBytes(n) => {
+                write!(f, "trailing {n} bytes after one complete control frame")
+            }
+            WireError::MultipleFrames => write!(f, "second control frame in one websocket message"),
             WireError::BadPayload(t) => write!(f, "malformed control wire payload for tag {t}"),
         }
     }
@@ -529,6 +551,9 @@ impl EventFrame {
 #[derive(Debug, Default)]
 pub struct EventDecoder {
     buf: Vec<u8>,
+    cursor: usize,
+    #[cfg(test)]
+    compacted_bytes: usize,
 }
 
 impl EventDecoder {
@@ -538,25 +563,41 @@ impl EventDecoder {
 
     /// Append freshly-read bytes. Pair with [`next_frame`](Self::next_frame).
     pub fn push(&mut self, bytes: &[u8]) {
+        if self.cursor == self.buf.len() {
+            self.buf.clear();
+            self.cursor = 0;
+        } else if self.cursor > self.buf.len() / 2 {
+            // Amortize compaction: shifting the unread suffix only after the
+            // consumed prefix is larger keeps total copied bytes linear over
+            // fragmented input while still reclaiming space in long streams.
+            #[cfg(test)]
+            {
+                self.compacted_bytes += self.buf.len() - self.cursor;
+            }
+            self.buf.drain(..self.cursor);
+            self.cursor = 0;
+        }
         self.buf.extend_from_slice(bytes);
     }
 
     /// Pop the next complete frame, or `Ok(None)` if more bytes are needed.
     pub fn next_frame(&mut self) -> Result<Option<EventFrame>, WireError> {
-        if self.buf.len() < 5 {
+        let remaining = &self.buf[self.cursor..];
+        if remaining.len() < 5 {
             return Ok(None);
         }
-        let tag = self.buf[0];
-        let len = u32::from_be_bytes([self.buf[1], self.buf[2], self.buf[3], self.buf[4]]) as usize;
+        let tag = remaining[0];
+        let len =
+            u32::from_be_bytes([remaining[1], remaining[2], remaining[3], remaining[4]]) as usize;
         if len > MAX_WIRE_PAYLOAD {
             return Err(WireError::PayloadTooLarge(len));
         }
         let total = 5 + len;
-        if self.buf.len() < total {
+        if remaining.len() < total {
             return Ok(None);
         }
-        let payload = self.buf[5..total].to_vec();
-        self.buf.drain(..total);
+        let payload = remaining[5..total].to_vec();
+        self.cursor += total;
         let frame = match tag {
             T_HELLO => EventFrame::Hello(
                 serde_json::from_slice(&payload).map_err(|_| WireError::BadPayload(T_HELLO))?,
@@ -630,6 +671,50 @@ impl EventDecoder {
             out.push(f);
         }
         Ok(out)
+    }
+
+    /// Decode a WebSocket binary message, which must contain exactly one frame.
+    /// The length check precedes the bounded decoder copy.
+    pub fn decode_message(bytes: &[u8]) -> Result<EventFrame, WireError> {
+        if bytes.is_empty() {
+            return Err(WireError::EmptyMessage);
+        }
+        if bytes.len() > MAX_WIRE_FRAME {
+            return Err(WireError::MessageTooLarge(bytes.len()));
+        }
+        let mut decoder = Self::new();
+        decoder.push(bytes);
+        let Some(frame) = decoder.next_frame()? else {
+            let expected = if bytes.len() < 5 {
+                5
+            } else {
+                let len = u32::from_be_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]) as usize;
+                if len > MAX_WIRE_PAYLOAD {
+                    return Err(WireError::PayloadTooLarge(len));
+                }
+                5 + len
+            };
+            return Err(WireError::TruncatedFrame {
+                expected,
+                actual: bytes.len(),
+            });
+        };
+        let consumed = decoder.cursor;
+        let trailing = &bytes[consumed..];
+        if !trailing.is_empty() {
+            if trailing.len() >= 5 {
+                let len = u32::from_be_bytes([trailing[1], trailing[2], trailing[3], trailing[4]])
+                    as usize;
+                if len > MAX_WIRE_PAYLOAD {
+                    return Err(WireError::PayloadTooLarge(len));
+                }
+                if len <= trailing.len().saturating_sub(5) {
+                    return Err(WireError::MultipleFrames);
+                }
+            }
+            return Err(WireError::TrailingBytes(trailing.len()));
+        }
+        Ok(frame)
     }
 }
 
@@ -724,6 +809,132 @@ mod tests {
         let mut d = EventDecoder::new();
         d.push(&bytes);
         assert_eq!(d.drain().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn websocket_message_accepts_one_frame_and_rejects_trailing_or_second_frames() {
+        let hello = EventFrame::Hello(Hello {
+            proto: PROTO_VERSION,
+            server: "test".into(),
+            scopes: vec![Scope::Read],
+        });
+        let encoded = hello.encode();
+        assert_eq!(EventDecoder::decode_message(&encoded), Ok(hello.clone()));
+
+        assert_eq!(
+            EventDecoder::decode_message(&[]),
+            Err(WireError::EmptyMessage)
+        );
+        assert_eq!(
+            EventDecoder::decode_message(&encoded[..3]),
+            Err(WireError::TruncatedFrame {
+                expected: 5,
+                actual: 3
+            })
+        );
+        let mut truncated = encoded.clone();
+        truncated.pop();
+        assert_eq!(
+            EventDecoder::decode_message(&truncated),
+            Err(WireError::TruncatedFrame {
+                expected: encoded.len(),
+                actual: truncated.len(),
+            })
+        );
+
+        let mut concatenated = encoded.clone();
+        concatenated.extend(EventFrame::Sessions.encode());
+        assert_eq!(
+            EventDecoder::decode_message(&concatenated),
+            Err(WireError::MultipleFrames)
+        );
+
+        // Reproduce the former bootstrap deadlock burst: Hello plus 256 tiny
+        // frames used to be queued before the receiver was returned.
+        let mut burst = encoded;
+        for _ in 0..256 {
+            burst.extend(EventFrame::Sessions.encode());
+        }
+        assert_eq!(
+            EventDecoder::decode_message(&burst),
+            Err(WireError::MultipleFrames)
+        );
+
+        let mut trailing = EventFrame::Sessions.encode();
+        trailing.extend_from_slice(&[1, 2, 3]);
+        assert_eq!(
+            EventDecoder::decode_message(&trailing),
+            Err(WireError::TrailingBytes(3))
+        );
+    }
+
+    #[test]
+    fn websocket_message_rejects_declared_oversize_and_large_input_before_copy() {
+        let oversized = (MAX_WIRE_PAYLOAD as u32 + 1).to_be_bytes();
+        assert_eq!(
+            EventDecoder::decode_message(&[
+                T_SESSIONS,
+                oversized[0],
+                oversized[1],
+                oversized[2],
+                oversized[3]
+            ]),
+            Err(WireError::PayloadTooLarge(MAX_WIRE_PAYLOAD + 1))
+        );
+
+        let large = vec![0; MAX_WIRE_FRAME + 1];
+        assert_eq!(
+            EventDecoder::decode_message(&large),
+            Err(WireError::MessageTooLarge(MAX_WIRE_FRAME + 1))
+        );
+    }
+
+    #[test]
+    fn streaming_decoder_handles_a_frame_one_byte_at_a_time() {
+        let expected = EventFrame::Sessions;
+        let encoded = expected.encode();
+        let mut decoder = EventDecoder::new();
+        let mut decoded = None;
+        for byte in encoded {
+            decoder.push(&[byte]);
+            if let Some(frame) = decoder.next_frame().unwrap() {
+                decoded = Some(frame);
+            }
+        }
+        assert_eq!(decoded, Some(expected));
+        assert_eq!(decoder.next_frame().unwrap(), None);
+    }
+
+    #[test]
+    fn streaming_decoder_compaction_is_linear_with_consumed_prefix_and_partial_tail() {
+        let first = EventFrame::Sessions.encode();
+        let large = EventFrame::Activity {
+            json: "x".repeat(64 * 1024),
+        }
+        .encode();
+        let initial_tail = 128;
+        let mut decoder = EventDecoder::new();
+        let mut initial = first.clone();
+        initial.extend_from_slice(&large[..initial_tail]);
+        decoder.push(&initial);
+        assert_eq!(decoder.next_frame().unwrap(), Some(EventFrame::Sessions));
+        assert_eq!(decoder.next_frame().unwrap(), None);
+
+        for chunk in large[initial_tail..].chunks(64) {
+            decoder.push(chunk);
+            let _ = decoder.next_frame().unwrap();
+        }
+        assert!(decoder.next_frame().unwrap().is_none());
+
+        // Each compaction shifts the still-incomplete tail. This must remain
+        // amortized linear in input size, even with a consumed prefix before
+        // a large frame arrives in small chunks.
+        assert!(
+            decoder.compacted_bytes <= (first.len() + large.len()) * 2,
+            "decoder shifted {} bytes for {} bytes of input",
+            decoder.compacted_bytes,
+            first.len() + large.len()
+        );
     }
 
     #[test]
