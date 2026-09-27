@@ -132,6 +132,11 @@ pub(crate) fn retain_valid_env_durations(
         MAX_DURATION_DAYS
     );
     integer!(
+        overlay.disk_generation_min_age_days,
+        "disk_generation_min_age_days",
+        MAX_DURATION_DAYS
+    );
+    integer!(
         overlay.loc_scan_interval_secs,
         "loc_scan_interval_secs",
         MAX_CADENCE_SECS
