@@ -1,14 +1,11 @@
 {
-  "id": "THE-692",
-  "title": "thegn land never records a landed merge_queue row, so a canonically-landed worktree is never swept",
-  "url": "https://linear.app/blakeashley/issue/THE-692/thegn-land-never-records-a-landed-merge-queue-row-so-a-canonically",
+  "id": "THE-284",
+  "title": "Parse terminal queries statefully across PTY fairness slices",
+  "url": "https://linear.app/blakeashley/issue/THE-284/parse-terminal-queries-statefully-across-pty-fairness-slices",
   "priority": "High",
-  "labels": [
-    "Bug"
-  ],
-  "status": "Backlog",
+  "labels": ["Bug"],
+  "status": "Todo",
   "team": "Thegn",
-  "primary_file": "crates/thegn-host/src/cmd/land.rs",
-  "chain": "6th and largest cause of 'merge sweep collects nothing'; THE-685/686/687/688/690 all landed and the sweep now collects for queue-landed worktrees only",
-  "measured": "33 of 47 registered worktrees have no merge_queue row at all"
+  "gitBranchName": "blake/the-284-parse-terminal-queries-statefully-across-pty-fairness-slices",
+  "description": "## Finding\n\nTerminal-query detection is stateless even though the PTY drain deliberately splits/coalesces output at arbitrary 16 KiB fairness boundaries. A DA/DSR/OSC color/kitty query split across reads or slices is fed to the emulator but not recognized for a reply, so inner programs can warn, time out, or disable capabilities based on scheduling.\n\n## Evidence at audited commit\n\n* `crates/thegn-host/src/pty_drain.rs:773-779,810-818` calls `queries::query_responses` independently for each delivered slice.\n* `PtyBacklog::take_slice` explicitly splits chunks at the configured maximum.\n* `queries::query_responses` scans only the supplied byte slice and retains no per-pane parser state.\n* The THE-244 OSC52 remediation demonstrates the same boundary defect for OSC passthrough but does not make DA/DSR/color/APC query parsing stateful.\n\n## Required design\n\n1. Maintain bounded per-pane, generation-scoped state for every host-answered query grammar.\n2. Preserve exact stream order across PTY reads/fairness slices and reset at the actual reattach/fallback/exit boundary.\n3. Bound incomplete CSI/OSC/APC retention and recover without interpreting suffix text as a query.\n4. Coalesce replies only where protocol semantics allow and report bounded pane-input refusal truthfully.\n\n## Acceptance criteria\n\n* Every supported query split at every byte boundary receives exactly one correct reply.\n* Multiple panes/generations cannot share or complete each other's parser state.\n* Oversize/unterminated controls remain bounded and recover at a semantic terminator.\n* Tests cover drain-created splits, generation barriers, pane-input backpressure, and normal emulator output.\n\n## Dependency mapping\n\n* Independent PTY correctness root.\n* Related to THE-244 (OSC52 streaming state), THE-175 (PTY drain budgets), and THE-152 (bounded must-deliver output)."
 }
