@@ -318,7 +318,9 @@ fn reap_generation_footprints(
             let Ok(lock) = OpenOptions::new().read(true).write(true).open(&lock_path) else {
                 continue;
             };
-            if lock.try_lock().is_err() {
+            // `File::try_lock` returns `Ok(())` only after acquiring the lock;
+            // both contention and lock errors skip this profile.
+            if !matches!(lock.try_lock(), Ok(())) {
                 tracing::debug!(
                     target: LOG,
                     profile = %profile_dir.display(),
@@ -410,9 +412,12 @@ fn reap_generation_footprints(
     all_removed
 }
 
-/// Inventory `<profile>/.fingerprint/<package>-<id>` records and only associate
-/// artifacts whose filename ends in that exact opaque id. Any unreadable or
-/// symlinked path rejects the whole profile/candidate rather than guessing.
+/// Inventory `<profile>/.fingerprint/<package>-<id>` records and associate only
+/// Cargo outputs for that package and opaque id. Cargo library outputs start
+/// with `lib`, while dep-info files and executables do not. Package/target
+/// separators admit target names without confusing `foo` with `foobar`.
+/// Any unreadable or symlinked path rejects the whole profile/candidate rather
+/// than guessing.
 fn generation_inventory(profile: &std::path::Path) -> std::io::Result<Vec<GenerationFootprint>> {
     use std::fs;
 
@@ -472,7 +477,7 @@ fn generation_inventory(profile: &std::path::Path) -> std::io::Result<Vec<Genera
                 continue;
             };
             let stem = name.split_once('.').map_or(name, |(stem, _)| stem);
-            if !stem.ends_with(&marker) {
+            if !artifact_matches_generation(stem, package_name, &marker) {
                 continue;
             }
             let ty = entry.file_type()?;
@@ -488,7 +493,7 @@ fn generation_inventory(profile: &std::path::Path) -> std::io::Result<Vec<Genera
             .filter(|path| {
                 path.file_name()
                     .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.ends_with(&marker))
+                    .is_some_and(|name| artifact_matches_generation(name, package_name, &marker))
             })
             .cloned()
             .collect();
@@ -513,6 +518,23 @@ fn generation_inventory(profile: &std::path::Path) -> std::io::Result<Vec<Genera
         });
     }
     Ok(result)
+}
+
+/// Match `<package>-<id>` and `<package>-<target>-<id>` Cargo output names,
+/// accepting the `lib` prefix used by Rust library artifacts.
+fn artifact_matches_generation(stem: &str, package_name: &str, marker: &str) -> bool {
+    let normalized_package = package_name.replace('-', "_");
+    let matches_name = |name: &str, package: &str| {
+        name.strip_suffix(marker).is_some_and(|base| {
+            base == package
+                || base
+                    .strip_prefix(package)
+                    .is_some_and(|suffix| suffix.starts_with('-') || suffix.starts_with('_'))
+        })
+    };
+    let matches_package =
+        |name: &str| matches_name(name, package_name) || matches_name(name, &normalized_package);
+    matches_package(stem) || stem.strip_prefix("lib").is_some_and(matches_package)
 }
 
 fn measure_safe_tree(
@@ -611,6 +633,16 @@ mod generation_tests {
     use super::*;
     use std::fs;
 
+    #[test]
+    fn artifact_names_match_cargo_library_dep_info_and_executable_outputs() {
+        assert!(artifact_matches_generation("libpkg-a", "pkg", "-a"));
+        assert!(artifact_matches_generation("pkg-a", "pkg", "-a"));
+        assert!(artifact_matches_generation("pkg_cli-a", "pkg", "-a"));
+        assert!(artifact_matches_generation("libmy_pkg-a", "my-pkg", "-a"));
+        assert!(!artifact_matches_generation("libpkgx-a", "pkg", "-a"));
+        assert!(!artifact_matches_generation("libpkg-b", "pkg", "-a"));
+    }
+
     fn profile_tree() -> (std::path::PathBuf, std::path::PathBuf) {
         let root = std::env::temp_dir().join(format!(
             "thegn-generation-reclaim-{}-{}-{}",
@@ -630,7 +662,14 @@ mod generation_tests {
         fs::write(profile.join(".fingerprint/pkg-a/lib-pkg"), b"fingerprint-a").unwrap();
         fs::write(profile.join(".fingerprint/pkg-z/lib-pkg"), b"fingerprint-z").unwrap();
         fs::write(profile.join("deps/libpkg-a.rlib"), b"artifact-a").unwrap();
+        fs::write(profile.join("deps/pkg-a.d"), b"dep-info-a").unwrap();
+        fs::write(profile.join("deps/pkg-a"), b"executable-a").unwrap();
         fs::write(profile.join("deps/libpkg-z.rlib"), b"artifact-z").unwrap();
+        fs::write(profile.join("deps/pkg-z.d"), b"dep-info-z").unwrap();
+        fs::write(profile.join("deps/pkg-z"), b"executable-z").unwrap();
+        // Prefix-only matching would incorrectly associate this artifact with
+        // package `pkg` when pruning the generation whose ID is `a`.
+        fs::write(profile.join("deps/libpkgx-a.rlib"), b"other-package").unwrap();
         fs::write(profile.join("incremental/pkg-a/cache"), b"incremental-a").unwrap();
         let status = std::process::Command::new("git")
             .args(["init", "-q"])
@@ -657,9 +696,14 @@ mod generation_tests {
         assert!(removed > 0);
         assert!(!profile.join(".fingerprint/pkg-a").exists());
         assert!(!profile.join("deps/libpkg-a.rlib").exists());
+        assert!(!profile.join("deps/pkg-a.d").exists());
+        assert!(!profile.join("deps/pkg-a").exists());
         assert!(!profile.join("incremental/pkg-a").exists());
         assert!(profile.join(".fingerprint/pkg-z").exists());
         assert!(profile.join("deps/libpkg-z.rlib").exists());
+        assert!(profile.join("deps/pkg-z.d").exists());
+        assert!(profile.join("deps/pkg-z").exists());
+        assert!(profile.join("deps/libpkgx-a.rlib").exists());
         assert_eq!(before, 2);
         fs::remove_dir_all(root).unwrap();
     }
@@ -712,6 +756,9 @@ mod generation_tests {
     fn active_worktree_is_exempt_from_generation_pruning() {
         let (root, profile) = profile_tree();
         let worktree = root.to_string_lossy().into_owned();
+        // `slot_active` consults only the in-process job registry; it does not
+        // open the real thegn database or depend on XDG state.
+        assert!(!crate::task::slot_active(&root));
         let removed = reap_generation_footprints(
             &[(worktree.clone(), thegn_core::disk::DiskUsage::default())],
             Some(&worktree),
