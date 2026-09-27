@@ -546,7 +546,8 @@ fn finish_reap(
 ) {
     match result {
         Ok(_) => {
-            drop(group);
+            // `group` is a plain handle with no Drop impl, so there is nothing to
+            // release here — the reap itself is what ended the group's life.
             pending.fetch_sub(1, Ordering::AcqRel);
         }
         Err(_) => {
@@ -726,10 +727,6 @@ mod tests {
     #[test]
     fn timeout_does_not_signal_an_unrelated_process_group() {
         let command = shell!("while :; do sleep 1; done");
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "test fixture process is reaped by this focused gate-capture regression"
-        )]
         let mut unrelated = shell!("exec sleep 3").spawn().unwrap();
         let output = run(command, Duration::from_millis(100));
         assert!(matches!(output, CaptureResult::Timeout { .. }));
@@ -760,7 +757,7 @@ mod tests {
     #[test]
     fn spawn_and_reader_failures_are_infrastructure_results() {
         let _ = shell!("true");
-        let mut missing = Command::new("thegn-gate-command-that-does-not-exist");
+        let missing = Command::new("thegn-gate-command-that-does-not-exist");
         assert!(matches!(
             run(missing, Duration::from_secs(1)),
             CaptureResult::Infrastructure { reason, .. } if reason.contains("could not be started")
