@@ -3702,7 +3702,7 @@ pub(crate) fn spawn_pr_cache_refresh_with_generation(
     });
     // Sibling feed: the repo's open-PR headers (`pr_branch_cache`) join onto
     // branch rows as PR badges and back the branches view's open-in-browser.
-    // The forge ladder (octocrab native → gh CLI) is a blocking seam, so it
+    // The forge ladder (native HTTP → gh CLI) is a blocking seam, so it
     // runs on its own blocking thread — neither the subprocess fallback nor
     // the HTTP wait can ever touch the event loop.
     crate::sched::spawn_bg(move || {
