@@ -3523,9 +3523,11 @@ pub use crate::config_weather::{WeatherConfig, WeatherProviderKind, WeatherUnits
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct AppsConfig {
-    /// Tab focused on startup. Valid ids: "work".
+    /// Tab focused on startup. Valid ids come from `BUILTIN_TABS`.
+    #[schemars(with = "AppTabId")]
     pub default_tab: String,
-    /// Ordered top-level tab ids. Unknown ids are ignored; missing built-ins are appended.
+    /// Ordered top-level tab ids. Missing built-in tabs are appended; duplicates are ignored.
+    #[schemars(with = "Vec<AppTabId>")]
     pub tab_order: Vec<String>,
 }
 
@@ -3539,7 +3541,36 @@ impl Default for AppsConfig {
 }
 
 impl AppsConfig {
-    pub const BUILTIN_TABS: [&'static str; 1] = ["work"];
+    /// Authoritative set of built-in app tab ids. The host registry projects
+    /// its builders from this list; config validation and the generated schema
+    /// use the same ids.
+    pub const BUILTIN_TABS: [&'static str; 2] = ["work", "observe"];
+
+    pub fn validate(&self, observe_enabled: bool) -> Vec<String> {
+        let mut errors = Vec::new();
+        let known = Self::BUILTIN_TABS.join(", ");
+        let default = self.default_tab.trim();
+        if !Self::BUILTIN_TABS.contains(&default) {
+            errors.push(format!(
+                "unknown app tab {:?}; known tabs are {known}",
+                default
+            ));
+        } else if default == "observe" && !observe_enabled {
+            errors.push(format!(
+                "apps.default_tab {:?} is disabled; enable its app in the matching config section",
+                default
+            ));
+        }
+        for (index, id) in self.tab_order.iter().enumerate() {
+            let id = id.trim();
+            if !Self::BUILTIN_TABS.contains(&id) {
+                errors.push(format!(
+                    "apps.tab_order[{index}]: unknown app tab {id:?}; known tabs are {known}"
+                ));
+            }
+        }
+        errors
+    }
 
     pub fn effective_tab_order(&self) -> Vec<String> {
         let mut out = Vec::new();
@@ -3567,6 +3598,27 @@ impl AppsConfig {
                 .next()
                 .unwrap_or_else(|| "work".into())
         }
+    }
+}
+
+/// Schema-only enum for the ids retained as strings by the public config API.
+struct AppTabId;
+
+impl schemars::JsonSchema for AppTabId {
+    fn schema_name() -> String {
+        "AppTabId".into()
+    }
+
+    fn inline_schema() -> bool {
+        true
+    }
+
+    fn json_schema(_: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
+        schemars::schema::Schema::Object(schemars::schema::SchemaObject {
+            instance_type: Some(schemars::schema::InstanceType::String.into()),
+            enum_values: Some(vec!["work".into(), "observe".into()]),
+            ..Default::default()
+        })
     }
 }
 
