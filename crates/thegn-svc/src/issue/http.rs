@@ -304,14 +304,20 @@ impl TrackerHttpOperation<'_> {
         {
             return Err(IssueError::BodyLimit("tracker response exceeds limit"));
         }
-        let content_type = response
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .ok_or(IssueError::Policy("tracker JSON content type refused"))?;
-        let media = content_type.split(';').next().unwrap_or("").trim();
-        if media != "application/json" && !media.ends_with("+json") {
-            return Err(IssueError::Policy("tracker JSON content type refused"));
+        // A non-success body is an error envelope: preserve its status and raw
+        // body for the caller to classify even when a provider omitted or
+        // misstated Content-Type. Only successful bodies are parsed as JSON.
+        if response.status().is_success() {
+            let Some(content_type) = response.headers().get(reqwest::header::CONTENT_TYPE) else {
+                return Err(IssueError::Policy("tracker JSON content type missing"));
+            };
+            let content_type = content_type
+                .to_str()
+                .map_err(|_| IssueError::Policy("tracker JSON content type invalid"))?;
+            let media = content_type.split(';').next().unwrap_or("").trim();
+            if media != "application/json" && !media.ends_with("+json") {
+                return Err(IssueError::Policy("tracker JSON content type refused"));
+            }
         }
         Ok(())
     }
@@ -602,9 +608,12 @@ mod tests {
                 Body::from(r#"{"message":"API rate limit exceeded"}"#),
             )
                 .into_response(),
-            "/envelope-bad-mime" | "/envelope-missing-mime" => (
+            "/envelope-bad-mime" | "/envelope-missing-mime" => {
+                (StatusCode::OK, Body::from(r#"{"ok":true}"#)).into_response()
+            }
+            "/envelope-missing-mime-error" => (
                 StatusCode::FORBIDDEN,
-                Body::from(r#"{"message":"fixture"}"#),
+                Body::from(r#"{"message":"API rate limit exceeded"}"#),
             )
                 .into_response(),
             "/large" => {
@@ -620,8 +629,7 @@ mod tests {
             _ => (StatusCode::NOT_FOUND, Body::empty()).into_response(),
         };
         match request.uri().path() {
-            "/ok" | "/encoding" | "/bad-mime" | "/rate-limit" | "/large" | "/chunked"
-            | "/envelope-bad-mime" => {
+            "/ok" | "/encoding" | "/bad-mime" | "/rate-limit" | "/large" | "/chunked" => {
                 response.headers_mut().insert(
                     reqwest::header::CONTENT_TYPE,
                     HeaderValue::from_static("application/json"),
@@ -721,6 +729,23 @@ mod tests {
                 .await,
             Err(IssueError::Policy("tracker JSON content type missing"))
         ));
+
+        // Error envelopes retain the body needed for status classification;
+        // MIME is enforced only where the response will be parsed as JSON.
+        let mut error_without_mime = client.operation();
+        let response = error_without_mime
+            .json_envelope(
+                Method::POST,
+                "/envelope-missing-mime-error",
+                &serde_json::json!({}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&response.body).unwrap()["message"],
+            "API rate limit exceeded"
+        );
 
         let mut envelope_size = client.operation();
         assert!(matches!(
