@@ -577,7 +577,7 @@ mod tests {
     fn large_dual_stream_capture_keeps_only_bounded_tails() {
         let output = run(
             shell!(
-                "head -c 250000 /dev/zero | tr '\\000' o; head -c 250000 /dev/zero | tr '\\000' e >&2",
+                "head -c 250000 /dev/zero | tr '\\000' o; head -c 250000 /dev/zero | tr '\\000' e >&2"
             ),
             Duration::from_secs(5),
         );
