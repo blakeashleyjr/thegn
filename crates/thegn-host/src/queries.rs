@@ -199,82 +199,11 @@ impl QueryParser {
     }
 }
 
-/// Scan `bytes` for terminal queries; produce the responses to write back.
-/// `cursor` is the emulator's current (row, col), 0-based; `size` is
-/// (rows, cols); `colors` is what OSC 10/11 report. The PTY drain uses a
-/// pane-owned [`QueryParser`] for cross-slice recognition.
-pub fn query_responses(
-    bytes: &[u8],
-    cursor: (u16, u16),
-    size: (u16, u16),
-    colors: PaneColors,
-) -> Vec<u8> {
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] != 0x1b {
-            i += 1;
-            continue;
-        }
-        let rest = &bytes[i + 1..];
-        match rest.first() {
-            Some(b'[') => {
-                let body = &rest[1..];
-                if let Some((seq, len)) = csi_seq(body) {
-                    respond_csi(seq, cursor, size, &mut out);
-                    i += 2 + len;
-                    continue;
-                }
-            }
-            Some(b']') => {
-                let body = &rest[1..];
-                if let Some((seq, len)) = osc_seq(body) {
-                    respond_osc(seq, colors, &mut out);
-                    i += 2 + len;
-                    continue;
-                }
-            }
-            Some(b'_') => {
-                // APC (kitty graphics et al): `ESC _ G ... ESC \`.
-                let body = &rest[1..];
-                if let Some(end) = find_st(body) {
-                    respond_apc(&body[..end], &mut out);
-                    i += 2 + end + 2;
-                    continue;
-                }
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    out
-}
-
-/// Slice a CSI body up to (exclusive) its final byte; returns (full seq incl.
-/// final, consumed length).
-fn csi_seq(body: &[u8]) -> Option<(&[u8], usize)> {
-    let end = body
-        .iter()
-        .position(|&b| (0x40..=0x7e).contains(&b) && !matches!(b, b'[' | b']'))?;
-    Some((&body[..=end], end + 1))
-}
-
-/// Slice an OSC body up to its BEL / ST terminator.
-fn osc_seq(body: &[u8]) -> Option<(&[u8], usize)> {
-    for (i, &b) in body.iter().enumerate() {
-        if b == 0x07 {
-            return Some((&body[..i], i + 1));
-        }
-        if b == 0x1b && body.get(i + 1) == Some(&b'\\') {
-            return Some((&body[..i], i + 2));
-        }
-    }
-    None
-}
-
-fn find_st(body: &[u8]) -> Option<usize> {
-    body.windows(2).position(|w| w == b"\x1b\\")
-}
+// The legacy whole-buffer `query_responses` and its `csi_seq` / `osc_seq` /
+// `find_st` slicing helpers lived here. `QueryParser::feed` replaces them: a
+// one-shot scan of a single buffer cannot recognise a sequence split across
+// fairness slices, which is the defect this change fixes. They survived only
+// as test helpers, so the tests now drive `feed` and assert the live path.
 
 fn respond_csi(seq: &[u8], cursor: (u16, u16), size: (u16, u16), out: &mut Vec<u8>) {
     match seq {
@@ -392,7 +321,7 @@ mod tests {
     };
 
     fn resp(bytes: &[u8]) -> Vec<u8> {
-        query_responses(bytes, (4, 9), (24, 80), COLORS)
+        QueryParser::default().feed(bytes, (4, 9), (24, 80), COLORS)
     }
 
     #[test]
@@ -428,7 +357,7 @@ mod tests {
             fg: (1, 2, 3),
             bg: (4, 5, 6),
         };
-        let out = query_responses(b"\x1b]11;?\x07", (0, 0), (24, 80), themed);
+        let out = QueryParser::default().feed(b"\x1b]11;?\x07", (0, 0), (24, 80), themed);
         assert_eq!(
             String::from_utf8(out).unwrap(),
             "\x1b]11;rgb:0404/0505/0606\x1b\\"
@@ -510,7 +439,7 @@ mod tests {
             &[(b"\x1b[", b"n"), (b"\x1b]", b"\x07"), (b"\x1b_", b"\x1b\\")];
         for (prefix, terminator) in cases {
             let mut oversized = prefix.to_vec();
-            oversized.extend(std::iter::repeat(b'x').take(MAX_QUERY_CONTROL + 20));
+            oversized.extend(std::iter::repeat_n(b'x', MAX_QUERY_CONTROL + 20));
             oversized.extend_from_slice(terminator);
             let mut parser = QueryParser::default();
             let mut out = parser.feed(&oversized, (4, 9), (24, 80), COLORS);

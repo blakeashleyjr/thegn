@@ -786,13 +786,13 @@ fn handle_output(ctx: &mut DrainCtx<'_>, id: u32, b: &[u8], admit_generation: bo
             } else {
                 Vec::new()
             };
-            if !resp.is_empty() {
-                if let Err(e) = p.write_reply(&resp) {
-                    tracing::warn!(
-                        target: "thegn::pane",
-                        "dropped a terminal-query reply ({e}); an inner program may hang"
-                    );
-                }
+            if !resp.is_empty()
+                && let Err(e) = p.write_reply(&resp)
+            {
+                tracing::warn!(
+                    target: "thegn::pane",
+                    "dropped a terminal-query reply ({e}); an inner program may hang"
+                );
             }
             if ctx.visible.contains(&id) {
                 // Pane-content-only damage: recompose just this pane, not the
