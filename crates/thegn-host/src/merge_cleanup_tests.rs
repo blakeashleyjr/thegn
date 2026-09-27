@@ -508,8 +508,22 @@ fn modified_or_unknown_seeded_path_is_protected_with_an_actionable_reason() {
     assert!(unknown.exists());
 }
 
+/// Authority is deliberately independent of today's `skills.exclude` and
+/// `[merge_queue] enabled`.
+///
+/// A file seeded before the exclusion was configured is still thegn's own
+/// output, and narrowing authority by the live config is what makes the sweep
+/// permanently refuse a worktree over state the tool itself wrote — the exact
+/// defect THE-693 exists to remove. Byte identity, not configuration, is the
+/// safety property: to be admitted here the content must match what this
+/// writer produces, and that is checked again immediately before the unlink.
+///
+/// The accepted cost is narrow: someone who excludes `mq` *and* keeps an
+/// untracked byte-identical copy of thegn's own command loses a file that is
+/// regenerable from the binary. The companion test below pins the property
+/// that actually protects real work — one edited byte and it is refused.
 #[test]
-fn excluded_raw_legacy_command_is_not_admitted_as_seeded_tool_state() {
+fn excluded_raw_legacy_command_is_still_recognized_as_seeded_tool_state() {
     let _isolation = TestIsolation::new();
     let fixture = Fixture::new();
     let mut cfg = thegn_core::config::Config::default();
@@ -525,10 +539,46 @@ fn excluded_raw_legacy_command_is_not_admitted_as_seeded_tool_state() {
     .unwrap();
     let authority = crate::skill_seed::managed_seed_files(&cfg).unwrap();
 
-    assert!(matches!(
-        clean_with_authority(&fixture.wt, Some(&authority)),
-        Err(Refusal::UnrecognizedToolState(path)) if path == ".claude/commands/mq-add.md"
-    ));
+    // Exclusion does not revoke recognition: the worktree is ADMITTED rather than
+    // refused as unrecognized user work. Admission is the whole property here —
+    // the removal itself is `Verified::remove`, covered by
+    // `exact_unignored_seeded_state_is_admitted_and_reported_separately`.
+    let result = clean_with_authority(&fixture.wt, Some(&authority));
+    assert!(
+        result.is_ok(),
+        "an exact copy of thegn's own command is tool state, not user work: {:?}",
+        result.err()
+    );
+}
+
+/// The guard that matters: one edited byte makes the same path user work, under
+/// the same configuration as the test above.
+#[test]
+fn edited_legacy_command_is_refused_even_though_the_path_is_seedable() {
+    let _isolation = TestIsolation::new();
+    let fixture = Fixture::new();
+    let mut cfg = thegn_core::config::Config::default();
+    cfg.sandbox.enabled = false;
+    cfg.skills.exclude = vec!["mq".into()];
+
+    let command = fixture.wt.join(".claude/commands/mq-add.md");
+    std::fs::create_dir_all(command.parent().unwrap()).unwrap();
+    let mut edited = include_str!("../../../extensions/commands/mq-add.md").to_string();
+    edited.push_str("\nmy own note\n");
+    std::fs::write(&command, &edited).unwrap();
+    let authority = crate::skill_seed::managed_seed_files(&cfg).unwrap();
+
+    // `ManagedChanged`, not `UnrecognizedToolState`: authority recognizes the
+    // path and the bytes do not match, which is the more specific of the two
+    // observations and the one an operator can act on.
+    let result = clean_with_authority(&fixture.wt, Some(&authority));
+    assert!(
+        matches!(
+            &result,
+            Err(Refusal::ManagedChanged(path)) if path == ".claude/commands/mq-add.md"
+        ),
+        "an edited command must be refused, got {result:?}"
+    );
     assert!(command.exists());
 }
 
