@@ -703,8 +703,9 @@ impl GroupHandle {
         }
     }
 
-    /// Terminate the whole job (hard kill — no SIGTERM window on Windows), or
-    /// just the direct child on the degraded path.
+    /// Terminate the whole job (hard kill — Windows has no graceful TERM
+    /// window in this scoped teardown), or just the direct child on the
+    /// degraded path. Graceful child shutdown on Windows remains a limitation.
     pub fn terminate(&self) {
         match &self.job {
             // SAFETY: terminating a job whose handle we own.
@@ -717,6 +718,39 @@ impl GroupHandle {
     /// Forcefully terminate the whole Job Object.
     pub fn kill(&self) {
         self.terminate();
+    }
+}
+
+/// Put an already spawned PTY child in a kill-on-close Job Object while its
+/// owning handle is still available. A failed assignment leaves teardown to
+/// the child's own process handle; it never guesses from a persisted PID.
+pub(crate) fn pty_group(child: &dyn portable_pty::Child) -> Option<GroupHandle> {
+    let pid = child.process_id()?;
+    let process = child.as_raw_handle()? as HANDLE;
+    // SAFETY: the new job is owned below and the PTY child handle is live for
+    // this call. Assignment failure closes the newly-created job.
+    unsafe {
+        let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+        if job.is_null() {
+            return None;
+        }
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let configured = SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            (&info as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        ) != 0;
+        let assigned = configured && AssignProcessToJobObject(job, process) != 0;
+        if !assigned {
+            CloseHandle(job);
+            return None;
+        }
+        Some(GroupHandle {
+            pid,
+            job: Some(Arc::new(JobInner(job))),
+        })
     }
 }
 
