@@ -132,6 +132,11 @@ pub(crate) fn retain_valid_env_durations(
         MAX_DURATION_DAYS
     );
     integer!(
+        overlay.disk_generation_min_age_days,
+        "disk_generation_min_age_days",
+        MAX_DURATION_DAYS
+    );
+    integer!(
         overlay.loc_scan_interval_secs,
         "loc_scan_interval_secs",
         MAX_CADENCE_SECS
@@ -361,6 +366,7 @@ mod tests {
                 activity_runaway_secs: Some((MAX_DURATION_SECS + extra) as f64),
                 disk_scan_interval_secs: Some(MAX_CADENCE_SECS + extra),
                 disk_idle_clean_days: Some((MAX_DURATION_DAYS + extra) as u32),
+                disk_generation_min_age_days: Some((MAX_DURATION_DAYS + extra) as u32),
                 loc_scan_interval_secs: Some(MAX_CADENCE_SECS + extra),
                 loc_watch_invalidate_secs: Some(MAX_DURATION_SECS + extra),
                 ..Default::default()
@@ -370,7 +376,7 @@ mod tests {
             let mut cfg = Config::default();
             overlay.apply(&mut cfg);
             let full = errors_for_config(&cfg);
-            assert_eq!(direct.len(), if invalid { 10 } else { 0 });
+            assert_eq!(direct.len(), if invalid { 11 } else { 0 });
             assert_eq!(direct.len(), full.len());
         }
         for value in [f64::INFINITY, f64::NEG_INFINITY, f64::NAN, -1.0] {
@@ -387,6 +393,7 @@ mod tests {
     #[test]
     fn defaults_and_zero_inheritance_have_no_duration_errors() {
         assert!(errors_for_config(&Config::default()).is_empty());
+        assert_eq!(Config::default().disk.generation_min_age_days, 14);
         for body in [
             "",
             "[calendar]\nrefresh_interval_secs=0\n",
