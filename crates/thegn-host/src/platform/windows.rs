@@ -647,8 +647,9 @@ impl GroupHandle {
         }
     }
 
-    /// Terminate the whole job (hard kill — no SIGTERM window on Windows), or
-    /// just the direct child on the degraded path.
+    /// Terminate the whole job (hard kill — Windows has no graceful TERM
+    /// window in this scoped teardown), or just the direct child on the
+    /// degraded path. Graceful child shutdown on Windows remains a limitation.
     pub fn terminate(&self) {
         match &self.job {
             // SAFETY: terminating a job whose handle we own.
