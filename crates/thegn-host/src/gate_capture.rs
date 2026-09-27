@@ -6,7 +6,7 @@
 //! preemptible.
 
 use std::collections::VecDeque;
-use std::io::{self, Read};
+use std::io;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{
     Arc, OnceLock,
@@ -68,12 +68,12 @@ struct Reader {
     join: std::thread::JoinHandle<()>,
 }
 
-fn spawn_reader<R: Read + Send + 'static>(
+fn spawn_reader<R: crate::platform::GatePipe + Send + 'static>(
     name: &'static str,
     mut pipe: R,
     stop: Arc<AtomicBool>,
 ) -> io::Result<Reader> {
-    make_nonblocking(&pipe)?;
+    crate::platform::gate_pipe_nonblocking(&pipe)?;
     let (tx, rx) = mpsc::channel();
     let join = std::thread::Builder::new()
         .name(name.into())
@@ -85,11 +85,10 @@ fn spawn_reader<R: Read + Send + 'static>(
                 if stop.load(Ordering::Acquire) {
                     break Ok(());
                 }
-                match read_chunk(&mut pipe, &mut bytes) {
+                match crate::platform::gate_pipe_read(&mut pipe, &mut bytes) {
                     Ok(0) => break Ok(()),
                     Ok(n) => tail.push(&bytes[..n]),
                     Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                    #[cfg(windows)]
                     Err(error) if error.kind() == io::ErrorKind::BrokenPipe => break Ok(()),
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                         if stop.load(Ordering::Acquire) {
@@ -104,60 +103,6 @@ fn spawn_reader<R: Read + Send + 'static>(
             if tx.send(value).is_err() { /* receiver left after a bounded stop */ }
         })?;
     Ok(Reader { receiver: rx, join })
-}
-
-#[cfg(unix)]
-fn read_chunk<R: Read>(pipe: &mut R, bytes: &mut [u8]) -> io::Result<usize> {
-    pipe.read(bytes)
-}
-
-#[cfg(windows)]
-fn read_chunk<R: Read + std::os::windows::io::AsRawHandle>(
-    pipe: &mut R,
-    bytes: &mut [u8],
-) -> io::Result<usize> {
-    match crate::platform::gate_pipe_available(pipe.as_raw_handle())? {
-        0 => Err(io::ErrorKind::WouldBlock.into()),
-        _ => pipe.read(bytes),
-    }
-}
-
-#[cfg(unix)]
-fn make_nonblocking<R: std::os::fd::AsRawFd>(pipe: &R) -> io::Result<()> {
-    // SAFETY: fcntl changes only the status flags on our owned pipe descriptor.
-    let fd = pipe.as_raw_fd();
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    if flags < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: same live descriptor; preserve existing flags and add O_NONBLOCK.
-    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-#[cfg(windows)]
-fn make_nonblocking<R: std::os::windows::io::AsRawHandle>(pipe: &R) -> io::Result<()> {
-    crate::platform::gate_pipe_nonblocking(pipe.as_raw_handle())
-}
-
-#[cfg(not(any(unix, windows)))]
-fn make_nonblocking<R>(_pipe: &R) -> io::Result<()> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "gate pipe polling is unsupported on this platform",
-    ))
-}
-
-#[cfg(unix)]
-fn child_exited(child: &mut Child) -> io::Result<bool> {
-    crate::platform::gate_child_exited(child.id())
-}
-
-#[cfg(windows)]
-fn child_exited(child: &mut Child) -> io::Result<bool> {
-    child.try_wait().map(|status| status.is_some())
 }
 
 fn merge(out: &str, err: &str) -> String {
@@ -316,7 +261,7 @@ pub(super) fn run(mut command: Command, timeout: Duration) -> CaptureResult {
         {
             break;
         }
-        match child_exited(&mut child) {
+        match crate::platform::gate_child_exited(&mut child) {
             Ok(true) => {
                 leader_exited = true;
                 break;
@@ -345,7 +290,7 @@ pub(super) fn run(mut command: Command, timeout: Duration) -> CaptureResult {
     if !leader_exited {
         let reap_until = Instant::now() + REAP_GRACE;
         while wait_error.is_none() && Instant::now() < reap_until {
-            match child_exited(&mut child) {
+            match crate::platform::gate_child_exited(&mut child) {
                 Ok(true) => {
                     leader_exited = true;
                     wait_error = None;
@@ -607,6 +552,7 @@ fn terminate_after_reader_failure(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
 
     #[test]
     fn byte_tail_is_fixed_capacity_and_preserves_split_utf8_bytes() {
@@ -618,18 +564,19 @@ mod tests {
         assert!(tail.text().ends_with('€'));
     }
 
-    #[cfg(unix)]
-    fn shell(script: &str) -> Command {
-        let mut command = Command::new("sh");
-        command.args(["-c", script]);
-        command
+    macro_rules! shell {
+        ($script:expr) => {
+            match crate::platform::gate_test_shell($script) {
+                Some(command) => command,
+                None => return,
+            }
+        };
     }
 
-    #[cfg(unix)]
     #[test]
     fn large_dual_stream_capture_keeps_only_bounded_tails() {
         let output = run(
-            shell(
+            shell!(
                 "head -c 250000 /dev/zero | tr '\\000' o; head -c 250000 /dev/zero | tr '\\000' e >&2",
             ),
             Duration::from_secs(5),
@@ -646,20 +593,18 @@ mod tests {
         assert!(log.contains('o') && log.contains('e'));
     }
 
-    #[cfg(unix)]
     #[test]
     fn production_runner_times_out_and_kills_a_term_ignoring_writer() {
         let output = run(
-            shell("trap '' TERM; while :; do printf noisy; done"),
+            shell!("trap '' TERM; while :; do printf noisy; done"),
             Duration::from_millis(120),
         );
         assert!(matches!(output, CaptureResult::Timeout { .. }));
     }
 
-    #[cfg(unix)]
     #[test]
     fn leader_exit_with_grandchild_pipe_is_infrastructure_poison() {
-        let output = run(shell("(sleep 0.6) & exit 0"), Duration::from_millis(120));
+        let output = run(shell!("(sleep 0.6) & exit 0"), Duration::from_millis(120));
         assert!(
             matches!(output, CaptureResult::Poisoned { reason, .. } if reason.contains("retained an output pipe"))
         );
@@ -668,11 +613,10 @@ mod tests {
         std::thread::sleep(Duration::from_millis(650));
     }
 
-    #[cfg(unix)]
     #[test]
     fn leader_exit_with_live_grandchild_is_not_a_pass_even_if_pipes_close() {
         let output = run(
-            shell("(sleep 0.6 >/dev/null 2>&1) & exit 0"),
+            shell!("(sleep 0.6 >/dev/null 2>&1) & exit 0"),
             Duration::from_millis(120),
         );
         assert!(
@@ -681,18 +625,15 @@ mod tests {
         std::thread::sleep(Duration::from_millis(500));
     }
 
-    #[cfg(unix)]
     #[test]
     fn timeout_does_not_signal_an_unrelated_process_group() {
+        let command = shell!("while :; do sleep 1; done");
         #[expect(
             clippy::disallowed_methods,
             reason = "test fixture process is reaped by this focused gate-capture regression"
         )]
-        let mut unrelated = Command::new("sleep").arg("3").spawn().unwrap();
-        let output = run(
-            shell("while :; do sleep 1; done"),
-            Duration::from_millis(100),
-        );
+        let mut unrelated = shell!("exec sleep 3").spawn().unwrap();
+        let output = run(command, Duration::from_millis(100));
         assert!(matches!(output, CaptureResult::Timeout { .. }));
         assert!(
             unrelated.try_wait().unwrap().is_none(),
@@ -706,51 +647,53 @@ mod tests {
         let _ = unrelated.wait();
     }
 
-    #[cfg(unix)]
     #[test]
     fn ordinary_pass_and_red_exit_keep_the_exit_classification_input() {
-        let pass = run(shell("printf pass; exit 0"), Duration::from_secs(2));
+        let pass = run(shell!("printf pass; exit 0"), Duration::from_secs(2));
         assert!(
             matches!(pass, CaptureResult::Completed { status, log } if status.success() && log.contains("pass"))
         );
-        let red = run(shell("printf red >&2; exit 7"), Duration::from_secs(2));
+        let red = run(shell!("printf red >&2; exit 7"), Duration::from_secs(2));
         assert!(
             matches!(red, CaptureResult::Completed { status, log } if status.code() == Some(7) && log.contains("red"))
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn spawn_and_reader_failures_are_infrastructure_results() {
+        let _ = shell!("true");
         let mut missing = Command::new("thegn-gate-command-that-does-not-exist");
         assert!(matches!(
             run(missing, Duration::from_secs(1)),
             CaptureResult::Infrastructure { reason, .. } if reason.contains("could not be started")
         ));
 
-        struct FailingReader(std::fs::File);
+        struct FailingReader;
         impl Read for FailingReader {
             fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
                 Err(io::Error::other("fixture reader failure"))
             }
         }
-        impl std::os::fd::AsRawFd for FailingReader {
-            fn as_raw_fd(&self) -> std::os::fd::RawFd {
-                use std::os::fd::AsRawFd;
-                self.0.as_raw_fd()
+        impl crate::platform::GatePipe for FailingReader {
+            fn set_nonblocking(&self) -> io::Result<()> {
+                Ok(())
+            }
+
+            fn read_available(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+                self.read(bytes)
             }
         }
-        let reader = FailingReader(std::fs::File::open("/dev/null").unwrap());
+        let reader = FailingReader;
         let stop = Arc::new(AtomicBool::new(false));
         let reader = spawn_reader("thegn-gate-reader-fixture", reader, stop).unwrap();
         assert!(reader.receiver.recv().unwrap().is_err());
         reader.join.join().unwrap();
     }
 
-    #[cfg(unix)]
     #[test]
     fn uncertain_reaper_result_keeps_the_gate_pending_latch_set() {
-        let (mut child, group) = crate::platform::spawn_gate_grouped(&mut shell("exit 0")).unwrap();
+        let (mut child, group) =
+            crate::platform::spawn_gate_grouped(&mut shell!("exit 0")).unwrap();
         while child.try_wait().unwrap().is_none() {
             std::thread::sleep(POLL);
         }

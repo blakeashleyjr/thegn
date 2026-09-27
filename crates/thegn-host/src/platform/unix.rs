@@ -5,6 +5,28 @@ use std::process::{Child, Command};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
+impl<R: std::io::Read + std::os::fd::AsRawFd> super::GatePipe for R {
+    fn set_nonblocking(&self) -> io::Result<()> {
+        use std::os::fd::AsRawFd;
+
+        // SAFETY: fcntl changes only the status flags on our owned pipe descriptor.
+        let fd = self.as_raw_fd();
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: same live descriptor; preserve existing flags and add O_NONBLOCK.
+        if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    fn read_available(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        std::io::Read::read(self, bytes)
+    }
+}
+
 // Run the vendored dependency's real PTY regressions in the normal host test
 // target too: Cargo cannot select a patched non-workspace dependency's tests.
 #[cfg(test)]
@@ -492,14 +514,14 @@ pub fn spawn_gate_grouped(
 /// Observe direct-child exit without reaping it. Keeping the child waitable
 /// pins its pid while a gate may still need to terminate the owned process
 /// group; the gate calls `Child::wait` only after group/output settlement.
-pub fn gate_child_exited(pid: u32) -> io::Result<bool> {
+pub fn gate_child_exited(child: &mut Child) -> io::Result<bool> {
     let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
     // SAFETY: waitid initializes siginfo on success. WNOWAIT deliberately
     // leaves the child waitable, preventing pid reuse while its group is owned.
     let rc = unsafe {
         libc::waitid(
             libc::P_PID,
-            pid as libc::id_t,
+            child.id() as libc::id_t,
             info.as_mut_ptr(),
             libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
         )

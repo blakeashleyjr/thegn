@@ -276,6 +276,65 @@ mod windows;
 #[cfg(windows)]
 pub use windows::*;
 
+/// A child output pipe with the platform operations needed by bounded gate
+/// capture. Implementations live beside the OS handle APIs so capture code
+/// does not grow platform cfgs or raw-handle bounds.
+pub(crate) trait GatePipe: std::io::Read {
+    fn set_nonblocking(&self) -> std::io::Result<()>;
+    fn read_available(&mut self, bytes: &mut [u8]) -> std::io::Result<usize>;
+}
+
+#[cfg(not(any(unix, windows)))]
+impl<R: std::io::Read> GatePipe for R {
+    fn set_nonblocking(&self) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "gate pipe polling is unsupported on this platform",
+        ))
+    }
+
+    fn read_available(&mut self, _bytes: &mut [u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "gate pipe polling is unsupported on this platform",
+        ))
+    }
+}
+
+pub(crate) fn gate_pipe_nonblocking(pipe: &(impl GatePipe + ?Sized)) -> std::io::Result<()> {
+    pipe.set_nonblocking()
+}
+
+pub(crate) fn gate_pipe_read(
+    pipe: &mut (impl GatePipe + ?Sized),
+    bytes: &mut [u8],
+) -> std::io::Result<usize> {
+    pipe.read_available(bytes)
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn gate_child_exited(_child: &mut std::process::Child) -> std::io::Result<bool> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "gate child observation is unsupported on this platform",
+    ))
+}
+
+#[cfg(test)]
+pub(crate) fn gate_test_shell(script: &str) -> Option<std::process::Command> {
+    #[cfg(unix)]
+    {
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", script]);
+        Some(command)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = script;
+        None
+    }
+}
+
 /// Placeholder for targets without a process-group/job implementation. The
 /// desktop dispatcher still drains its bounded channel there, but has no
 /// platform notifier to launch.

@@ -15,6 +15,19 @@ use std::process::{Child, Command};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
+impl<R: std::io::Read + std::os::windows::io::AsRawHandle> super::GatePipe for R {
+    fn set_nonblocking(&self) -> io::Result<()> {
+        gate_pipe_handle_nonblocking(std::os::windows::io::AsRawHandle::as_raw_handle(self))
+    }
+
+    fn read_available(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        match gate_pipe_available(std::os::windows::io::AsRawHandle::as_raw_handle(self))? {
+            0 => Err(io::ErrorKind::WouldBlock.into()),
+            _ => std::io::Read::read(self, bytes),
+        }
+    }
+}
+
 use windows_sys::Win32::Foundation::{
     CloseHandle, HANDLE, INVALID_HANDLE_VALUE, STILL_ACTIVE, WAIT_OBJECT_0,
 };
@@ -868,10 +881,16 @@ pub fn gate_pipe_available(handle: std::os::windows::io::RawHandle) -> io::Resul
     }
 }
 
-pub fn gate_pipe_nonblocking(_handle: std::os::windows::io::RawHandle) -> io::Result<()> {
+fn gate_pipe_handle_nonblocking(_handle: std::os::windows::io::RawHandle) -> io::Result<()> {
     // Windows anonymous pipes have no nonblocking mode. Gate readers use
     // PeekNamedPipe before each read and poll cancellation between reads.
     Ok(())
+}
+
+/// Windows `try_wait` observes exit while the retained process and Job Object
+/// handles continue to pin ownership of the child and its descendants.
+pub fn gate_child_exited(child: &mut Child) -> io::Result<bool> {
+    child.try_wait().map(|status| status.is_some())
 }
 
 /// Spawn a native clipboard helper using the existing direct-child behavior.
