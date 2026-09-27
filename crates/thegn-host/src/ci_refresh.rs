@@ -242,12 +242,21 @@ fn refresh_ci_cache_for(
             return false;
         }
     }
-    let old_runs = db
+    let mut old_cache = db
         .get_ci_cache(&key)
         .ok()
         .flatten()
-        .and_then(|(json, _)| serde_json::from_str::<Vec<thegn_core::ci::CiRun>>(&json).ok())
+        .and_then(|(json, _)| thegn_core::ci::decode_run_cache(&json))
         .unwrap_or_default();
+    let old_count = old_cache.runs.len();
+    old_cache
+        .runs
+        .retain(|run| thegn_svc::ci::validate_ci_id(&run.id).is_ok());
+    old_cache.discarded_rows += old_count - old_cache.runs.len();
+    if old_cache.discarded_rows > 0 {
+        tracing::warn!(target: "thegn::ci", discarded_rows = old_cache.discarded_rows, "discarded malformed cached CI run rows");
+    }
+    let old_runs = old_cache.runs;
     let Some(client) = thegn_svc::ci::provider_for(loc, cfg) else {
         return false;
     };
@@ -255,7 +264,11 @@ fn refresh_ci_cache_for(
         .git_out(&["rev-parse", "--abbrev-ref", "HEAD"])
         .filter(|b| !b.is_empty());
     match client.runs(loc, branch.as_deref(), cfg.max_runs) {
-        Ok(runs) => {
+        Ok(result) => {
+            let runs = result.runs;
+            if result.discarded_rows > 0 {
+                tracing::warn!(target: "thegn::ci", discarded_rows = result.discarded_rows, "CI provider returned an incomplete run list");
+            }
             if !crate::hydrate_schedule::generation_is_current(generation.as_ref()) {
                 return false;
             }
@@ -265,8 +278,10 @@ fn refresh_ci_cache_for(
                 return false;
             }
             thegn_core::connectivity::report_success();
-            if let Ok(json) = serde_json::to_string(&runs)
-                && crate::hydrate_schedule::generation_is_current(generation.as_ref())
+            if let Ok(json) = serde_json::to_string(&thegn_core::ci::CiRunCache {
+                runs: runs.clone(),
+                discarded_rows: result.discarded_rows,
+            }) && crate::hydrate_schedule::generation_is_current(generation.as_ref())
             {
                 let _ = db.put_ci_cache(&key, branch.as_deref().unwrap_or(""), &json); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
             }
@@ -354,6 +369,9 @@ fn ingest_failed_logs(
             Ok(detail) => detail,
             Err(_) => continue,
         };
+        if detail.discarded_jobs > 0 {
+            tracing::warn!(target: "thegn::ci", discarded_rows = detail.discarded_jobs, "CI detail omitted malformed job rows");
+        }
         // A run first seen on this refresh gets priority, while a previously
         // seen run is still expanded when its cache is cold or its head moved.
         let _new_run = !old_ids.contains(run.id.as_str());
@@ -361,6 +379,7 @@ fn ingest_failed_logs(
         // fan-out. Four-at-a-time was the old drill policy; the cache worker
         // keeps the same finite work shape with a hard per-run ceiling.
         for job in detail
+            .run
             .jobs
             .iter()
             .filter(|j| j.state == CiState::Fail)

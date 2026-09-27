@@ -126,6 +126,12 @@ fn client(cfg: &Config, worktree: Option<String>) -> Result<(GitLoc, CiClient)> 
     }
 }
 
+fn validate_id_at_cli(value: &str) -> Result<()> {
+    thegn_svc::ci::validate_ci_id(value)
+        .map(|_| ())
+        .map_err(|error| anyhow::anyhow!(error.to_string()))
+}
+
 fn glyph(s: CiState) -> &'static str {
     match s {
         CiState::Pass => "✓",
@@ -153,6 +159,10 @@ fn runs(
     limit: Option<usize>,
     json_out: bool,
 ) -> Result<()> {
+    if let Some(branch) = branch.as_deref() {
+        thegn_svc::ci::validate_branch_ref(branch)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    }
     // `runs` is a READ verb: unlike the mutation verbs, listing when no CI
     // provider resolves is graceful degradation, not an error — emit an empty
     // JSON array (valid for scripts) / a friendly note and exit 0.
@@ -170,11 +180,22 @@ fn runs(
     let limit = limit.unwrap_or(cfg.ci.max_runs);
     let branch_q = branch.as_deref();
     match client.runs(&loc, branch_q, limit) {
-        Ok(runs) => {
+        Ok(result) => {
+            let runs = result.runs;
+            if result.discarded_rows > 0 {
+                msg::warn(&format!(
+                    "CI provider omitted {} malformed run row(s)",
+                    result.discarded_rows
+                ));
+            }
             if json_out {
                 // Still warm the cache the native panel reads — same fetch.
                 if let Ok(db) = Db::open() {
-                    let json = serde_json::to_string(&runs).unwrap_or_default();
+                    let json = serde_json::to_string(&thegn_core::ci::CiRunCache {
+                        runs: runs.clone(),
+                        discarded_rows: result.discarded_rows,
+                    })
+                    .unwrap_or_default();
                     let _ = db.put_ci_cache(&cache_key, branch_q.unwrap_or(""), &json); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                 }
                 return super::emit_json(&runs);
@@ -185,7 +206,11 @@ fn runs(
             }
             // Warm the cache the native panel reads.
             if let Ok(db) = Db::open() {
-                let json = serde_json::to_string(&runs).unwrap_or_default();
+                let json = serde_json::to_string(&thegn_core::ci::CiRunCache {
+                    runs: runs.clone(),
+                    discarded_rows: result.discarded_rows,
+                })
+                .unwrap_or_default();
                 let _ = db.put_ci_cache(&cache_key, branch_q.unwrap_or(""), &json); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
             }
             for r in &runs {
@@ -216,9 +241,18 @@ fn runs(
 }
 
 fn view(cfg: &Config, worktree: Option<String>, run_id: &str) -> Result<()> {
+    validate_id_at_cli(run_id)?;
     let (loc, client) = client(cfg, worktree)?;
     match client.run_detail(&loc, run_id) {
-        Ok(run) => print_run_detail(&run),
+        Ok(detail) => {
+            if detail.discarded_jobs > 0 {
+                msg::warn(&format!(
+                    "CI provider omitted {} malformed job row(s)",
+                    detail.discarded_jobs
+                ));
+            }
+            print_run_detail(&detail.run);
+        }
         Err(e) => outln!("ci: {e}"),
     }
     Ok(())
@@ -264,6 +298,8 @@ fn log(
     job_id: &str,
     json_out: bool,
 ) -> Result<()> {
+    validate_id_at_cli(run_id)?;
+    validate_id_at_cli(job_id)?;
     let wt = resolve_worktree(worktree);
     let key = GitLoc::worktree_cache_key(&wt);
     let cached = (cfg.ci.log_cache_runs > 0)
@@ -272,7 +308,13 @@ fn log(
                 .ok()
                 .and_then(|db| db.get_ci_log(&key, run_id, job_id).ok().flatten())
         })
-        .flatten();
+        .flatten()
+        .filter(|entry| {
+            entry.run_id == run_id
+                && entry.job_id == job_id
+                && thegn_svc::ci::validate_ci_id(&entry.run_id).is_ok()
+                && thegn_svc::ci::validate_ci_id(&entry.job_id).is_ok()
+        });
     let entry = if let Some(mut entry) = cached {
         // Cache rows have already been redacted and bounded. Re-apply the
         // configured policy so a later config change cannot widen a response.
@@ -303,13 +345,23 @@ fn log(
                 Err(error) => return Err(error),
             };
             let detail = provider.run_detail(&loc, run_id).ok();
+            if let Some(detail) = &detail
+                && detail.discarded_jobs > 0
+            {
+                msg::warn(&format!(
+                    "CI provider omitted {} malformed job row(s)",
+                    detail.discarded_jobs
+                ));
+            }
             let (job_name, head_sha) = detail
                 .as_ref()
-                .and_then(|run| {
-                    run.jobs
+                .and_then(|detail| {
+                    detail
+                        .run
+                        .jobs
                         .iter()
                         .find(|job| job.id == job_id)
-                        .map(|job| (job.name.clone(), run.sha.clone()))
+                        .map(|job| (job.name.clone(), detail.run.sha.clone()))
                 })
                 .unwrap_or_default();
             let raw = match provider.logs(&loc, run_id, job_id) {
@@ -372,6 +424,7 @@ fn log(
 }
 
 fn rerun(cfg: &Config, worktree: Option<String>, run_id: &str, failed: bool) -> Result<()> {
+    validate_id_at_cli(run_id)?;
     let (loc, client) = client(cfg, worktree)?;
     if !client.caps().rerun {
         msg::die("this provider can't re-run runs");
@@ -402,6 +455,8 @@ fn trigger(
     workflow: &str,
     input: Vec<String>,
 ) -> Result<()> {
+    thegn_svc::ci::validate_workflow_selector(workflow)
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     let (loc, client) = client(cfg, worktree)?;
     if !client.caps().trigger {
         msg::die("this provider can't trigger workflows");
@@ -421,6 +476,7 @@ fn trigger(
 }
 
 fn cancel(cfg: &Config, worktree: Option<String>, run_id: &str) -> Result<()> {
+    validate_id_at_cli(run_id)?;
     let (loc, client) = client(cfg, worktree)?;
     if !client.caps().cancel {
         msg::die("this provider can't cancel runs");
@@ -430,6 +486,30 @@ fn cancel(cfg: &Config, worktree: Option<String>, run_id: &str) -> Result<()> {
         Err(e) => msg::die(&format!("ci cancel failed: {e}")),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cli_rejects_bad_ci_targets_before_cache_or_provider_access() {
+        let config = Config::default();
+        let log_result = log(
+            &config,
+            Some("/path/that/need-not-exist".into()),
+            "--help",
+            "1",
+            true,
+        );
+        assert!(log_result.unwrap_err().to_string().contains("--help"));
+
+        let rerun_result = rerun(&config, None, "01", false);
+        assert!(rerun_result.unwrap_err().to_string().contains("01"));
+
+        let trigger_result = trigger(&config, None, "--help", Vec::new());
+        assert!(trigger_result.unwrap_err().to_string().contains("--help"));
+    }
 }
 
 fn detect(cfg: &Config, worktree: Option<String>) -> Result<()> {

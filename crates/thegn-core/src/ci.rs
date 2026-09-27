@@ -79,9 +79,11 @@ impl CiState {
 // --- the run → job → step model -------------------------------------------
 
 /// A single CI run (GitHub workflow-run / GitLab pipeline / Drone build / …).
-/// All ids are stringly typed because providers disagree (u64 vs slug). Every
-/// extension field is `#[serde(default)]` so older `ci_runs_cache` rows keep
-/// deserializing after the model grows (same discipline as [`crate::github`]).
+/// IDs are normalized strings for the provider-neutral wire/cache shape;
+/// provider adapters admit numeric run/job IDs before constructing or reusing
+/// them. Every extension field is `#[serde(default)]` so older
+/// `ci_runs_cache` rows keep deserializing after the model grows (same
+/// discipline as [`crate::github`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CiRun {
     pub id: String,
@@ -115,6 +117,29 @@ pub struct CiRun {
     /// Jobs, populated on `run_detail` (empty in a history listing).
     #[serde(default)]
     pub jobs: Vec<CiJob>,
+}
+
+/// Durable representation of a CI run list. Older cache rows were bare arrays;
+/// [`decode_run_cache`] keeps those readable while new writes retain the count
+/// of provider rows rejected for malformed identifiers.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CiRunCache {
+    #[serde(default)]
+    pub runs: Vec<CiRun>,
+    #[serde(default)]
+    pub discarded_rows: usize,
+}
+
+/// Decode a current cache envelope or a legacy bare run array.
+pub fn decode_run_cache(json: &str) -> Option<CiRunCache> {
+    let value: serde_json::Value = serde_json::from_str(json).ok()?;
+    if value.is_array() {
+        return Some(CiRunCache {
+            runs: serde_json::from_value(value).ok()?,
+            discarded_rows: 0,
+        });
+    }
+    serde_json::from_value(value).ok()
 }
 
 impl CiRun {
@@ -574,6 +599,17 @@ pub fn detect_ci_configs(repo_root: &Path) -> Vec<CiConfig> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn run_cache_keeps_discard_counts_and_reads_legacy_arrays() {
+        let current = decode_run_cache(r#"{"runs":[],"discarded_rows":3}"#).unwrap();
+        assert!(current.runs.is_empty());
+        assert_eq!(current.discarded_rows, 3);
+
+        let legacy = decode_run_cache("[]").unwrap();
+        assert!(legacy.runs.is_empty());
+        assert_eq!(legacy.discarded_rows, 0);
+    }
 
     #[test]
     fn github_state_mapping() {
