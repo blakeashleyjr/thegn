@@ -38,6 +38,7 @@ pub struct CalendarSyncRow {
     /// The last error, or empty. Kept so a persistently broken source can be
     /// surfaced rather than silently showing stale data forever.
     pub last_error: String,
+    /// Resolved UTC milliseconds for the last fetched `[start, end)` horizon.
     pub horizon_from_ms: i64,
     pub horizon_to_ms: i64,
 }

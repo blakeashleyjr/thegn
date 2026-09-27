@@ -17,6 +17,7 @@ use std::time::Duration;
 
 use chrono::NaiveDate;
 use futures_util::future::BoxFuture;
+use thegn_core::calendar::CalendarWindow;
 use thegn_core::config_calendar::CalendarAccount;
 use tokio::time::Instant;
 
@@ -95,8 +96,15 @@ impl CalDavBackend {
     }
 }
 
-/// A time-bounded `calendar-query` for VEVENTs.
-fn calendar_query_body(from: NaiveDate, to: NaiveDate) -> String {
+/// A time-bounded `calendar-query` for VEVENTs. The exclusive end is the
+/// next local midnight resolved in the home zone, already represented in UTC.
+pub(super) fn calendar_query_body(window: CalendarWindow) -> String {
+    let stamp = |ms| {
+        chrono::DateTime::from_timestamp_millis(ms)
+            .expect("CalendarWindow contains representable UTC milliseconds")
+            .format("%Y%m%dT%H%M%SZ")
+            .to_string()
+    };
     format!(
         r#"<?xml version="1.0" encoding="utf-8" ?>
 <c:calendar-query xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
@@ -109,8 +117,8 @@ fn calendar_query_body(from: NaiveDate, to: NaiveDate) -> String {
     </c:comp-filter>
   </c:filter>
 </c:calendar-query>"#,
-        from.format("%Y%m%dT000000Z"),
-        to.format("%Y%m%dT235959Z"),
+        stamp(window.start_ms),
+        stamp(window.end_exclusive_ms),
     )
 }
 
@@ -402,6 +410,27 @@ impl CalendarBackend for CalDavBackend {
         to: NaiveDate,
         sync_token: &'a str,
     ) -> BoxFuture<'a, Result<EventPage, CalendarError>> {
+        let Some(window) = CalendarWindow::new(from, to, chrono_tz::Tz::UTC) else {
+            return Box::pin(async { Err(CalendarError::Api("invalid calendar window".into())) });
+        };
+        self.list_events_for_window(window, sync_token)
+    }
+
+    fn list_events_window<'a>(
+        &'a self,
+        window: &'a CalendarWindow,
+        sync_token: &'a str,
+    ) -> BoxFuture<'a, Result<EventPage, CalendarError>> {
+        self.list_events_for_window(*window, sync_token)
+    }
+}
+
+impl CalDavBackend {
+    fn list_events_for_window<'a>(
+        &'a self,
+        window: CalendarWindow,
+        sync_token: &'a str,
+    ) -> BoxFuture<'a, Result<EventPage, CalendarError>> {
         Box::pin(async move {
             if self.http.is_none() && self.init_error.is_none() {
                 return Err(CalendarError::NotConfigured);
@@ -420,7 +449,7 @@ impl CalendarBackend for CalDavBackend {
             let body = if incremental {
                 sync_collection_body(sync_token)?
             } else {
-                calendar_query_body(from, to)
+                calendar_query_body(window)
             };
             if body.len() > MAX_REQUEST_BYTES {
                 return Err(CalendarError::BodyLimit("calendar request exceeds limit"));
@@ -476,7 +505,7 @@ impl CalendarBackend for CalDavBackend {
                 discard_body(resp, deadline)
                     .await
                     .map_err(map_transport_error)?;
-                return self.fetch_full(from, to, deadline, meter).await;
+                return self.fetch_full(window, deadline, meter).await;
             }
             if !resp.status().is_success() && resp.status() != reqwest::StatusCode::MULTI_STATUS {
                 let status = resp.status();
@@ -513,7 +542,7 @@ impl CalendarBackend for CalDavBackend {
                     );
                     let mut meter = self.admission.meter();
                     meter.reserve_transient(MAX_BODY_BYTES)?;
-                    self.fetch_full(from, to, deadline, meter).await
+                    self.fetch_full(window, deadline, meter).await
                 }
                 other => other,
             }
@@ -535,13 +564,12 @@ impl CalDavBackend {
     /// reuses the first request's meter (and its body reservation).
     async fn fetch_full(
         &self,
-        from: NaiveDate,
-        to: NaiveDate,
+        window: CalendarWindow,
         deadline: Instant,
         mut meter: AdmissionMeter,
     ) -> Result<EventPage, CalendarError> {
         let http = self.http.as_ref().expect("initialized backend");
-        let body = calendar_query_body(from, to);
+        let body = calendar_query_body(window);
         let method = reqwest::Method::from_bytes(b"REPORT")
             .map_err(|_| CalendarError::Policy("calendar REPORT method unavailable"))?;
         let req = self.auth(

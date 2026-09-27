@@ -245,8 +245,13 @@ fn an_undeserializable_row_is_skipped_not_fatal() {
         &[CalendarRow {
             uid: "bad".into(),
             calendar: String::new(),
-            start_ms: day_ms(d(2026, 8, 21)),
-            end_ms: day_ms(d(2026, 8, 21)) + 3_600_000,
+            start_ms: CalendarWindow::new(d(2026, 8, 21), d(2026, 8, 21), chrono_tz::Tz::UTC)
+                .unwrap()
+                .start_ms,
+            end_ms: CalendarWindow::new(d(2026, 8, 21), d(2026, 8, 21), chrono_tz::Tz::UTC)
+                .unwrap()
+                .start_ms
+                + 3_600_000,
             recurring: false,
             json: "{ not json at all".into(),
         }],
@@ -262,6 +267,27 @@ fn an_undeserializable_row_is_skipped_not_fatal() {
     assert_eq!(view.error, Some(CalendarViewError::MalformedCache));
     let events = view.events.expect("the readable rows still show");
     assert_eq!(events.len(), 1);
+}
+
+#[test]
+fn cache_horizon_metadata_uses_the_same_home_zone_window_as_queries() {
+    let t = TmpDb::new("home-zone-range");
+    let from = d(2026, 3, 8);
+    let to = d(2026, 3, 8);
+    let zone = chrono_tz::America__New_York;
+    let range = CalendarWindow::new(from, to, zone).unwrap();
+    let loaded = page(vec![event("e1")], vec![], "token");
+
+    assert!(apply_page_with_generation(
+        &t.db, "work", "caldav", &loaded, range, None,
+    ));
+    let metadata = t.db.get_calendar_sync("work").unwrap().unwrap();
+    assert_eq!(metadata.horizon_from_ms, range.start_ms);
+    assert_eq!(metadata.horizon_to_ms, range.end_exclusive_ms);
+    assert_eq!(
+        metadata.horizon_to_ms - metadata.horizon_from_ms,
+        23 * 3_600_000
+    );
 }
 
 #[test]

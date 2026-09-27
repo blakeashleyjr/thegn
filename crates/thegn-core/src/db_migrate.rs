@@ -2184,6 +2184,36 @@ mod tests {
     }
 
     #[test]
+    fn calendar_cache_overlap_uses_half_open_boundaries() {
+        use crate::store::{CalendarRow, CalendarStore};
+        let dir = std::env::temp_dir().join(format!("thegn-cal-boundary-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Db::open_at(&dir.join("thegn.db")).unwrap();
+        let row = |uid: &str, start: i64, end: i64| CalendarRow {
+            uid: uid.into(),
+            calendar: String::new(),
+            start_ms: start,
+            end_ms: end,
+            recurring: false,
+            json: format!("{{\"uid\":\"{uid}\"}}"),
+        };
+        db.replace_calendar_account(
+            "a",
+            &[
+                row("ends-at-start", 0, 100),
+                row("overlaps", 99, 101),
+                row("starts-at-end", 200, 300),
+            ],
+        )
+        .unwrap();
+        let rows = db.get_calendar_events(100, 200, &[]).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].1.contains("overlaps"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn calendar_sync_errors_do_not_disturb_the_cached_events() {
         use crate::store::{CalendarRow, CalendarStore};
         // THE don't-clobber rule at the storage layer: recording a failure must
