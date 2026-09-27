@@ -274,7 +274,7 @@ fn cache_horizon_metadata_uses_the_same_home_zone_window_as_queries() {
     let t = TmpDb::new("home-zone-range");
     let from = d(2026, 3, 8);
     let to = d(2026, 3, 8);
-    let zone = chrono_tz::America__New_York;
+    let zone = chrono_tz::Tz::America__New_York;
     let range = CalendarWindow::new(from, to, zone).unwrap();
     let loaded = page(vec![event("e1")], vec![], "token");
 

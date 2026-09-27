@@ -659,7 +659,7 @@ impl CalendarRouter {
         tokens: &BTreeMap<String, String>,
     ) -> Vec<AccountResult> {
         let mut out = Vec::with_capacity(self.accounts.len());
-        let Some(window) = CalendarWindow::new(from, to, chrono_tz::Tz::UTC) else {
+        let Some(window) = CalendarWindow::new(from, to, thegn_core::calendar::Tz::UTC) else {
             return out;
         };
         self.list_events_each(window, tokens, |r| out.push(r)).await;

@@ -59,7 +59,9 @@ impl CalendarWindow {
             return None;
         }
         let end_date = to.succ_opt()?;
-        let midnight = |date| date.and_hms_opt(0, 0, 0)?;
+        // Annotated, and with no `?` in the body: a `?` inside a closure returns from
+        // the *closure*, which left its return type ambiguous (E0282).
+        let midnight = |date: NaiveDate| -> Option<NaiveDateTime> { date.and_hms_opt(0, 0, 0) };
         let start = tz::resolve_local(midnight(from)?, home, GapPolicy::ShiftForward)?;
         let end = tz::resolve_local(midnight(end_date)?, home, GapPolicy::ShiftForward)?;
         let start_ms = start.timestamp_millis();
@@ -72,6 +74,12 @@ impl CalendarWindow {
         })
     }
 }
+
+/// Re-exported so callers can name `CalendarWindow`'s zone parameter without
+/// taking a `chrono-tz` dependency of their own — `thegn-svc` needs the type only
+/// to call into this module, and the dependency closure is something this repo is
+/// actively cutting (THE-669).
+pub use chrono_tz::Tz;
 
 use chrono::{DateTime, Days, NaiveDate, NaiveDateTime, Utc};
 use serde::{Deserialize, Serialize};
