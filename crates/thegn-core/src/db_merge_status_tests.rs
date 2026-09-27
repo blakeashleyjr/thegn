@@ -236,3 +236,32 @@ fn landed_identity_backfill_repairs_empty_legacy_values() {
     );
     assert_eq!(row(&db).result_oid.as_deref(), Some("derived-empty-oid"));
 }
+
+#[test]
+fn landed_identity_backfill_does_not_advance_the_grace_period_clock() {
+    // merge_sweep's merged-worktree grace period reads `updated_at` as the
+    // landed timestamp (see `merge_sweep::landed_at`). A backfill that fills
+    // in a missing `result_oid` must not also re-stamp `updated_at`, or a
+    // worktree already past its TTL gets its grace period reset (THE-693).
+    let db = seeded();
+    db.conn()
+        .execute(
+            "UPDATE merge_queue SET status='landed', result_oid=NULL, updated_at=100",
+            [],
+        )
+        .unwrap();
+    let expected = row(&db);
+    assert_eq!(expected.updated_at, 100);
+
+    assert!(
+        db.backfill_landed_result_oid(&expected, "derived-oid")
+            .unwrap()
+    );
+
+    let after = row(&db);
+    assert_eq!(after.result_oid.as_deref(), Some("derived-oid"));
+    assert_eq!(
+        after.updated_at, 100,
+        "backfill must not advance the merge-sweep grace-period clock"
+    );
+}
