@@ -677,6 +677,10 @@ mod generation_tests {
         // package `pkg` when pruning the generation whose ID is `a`.
         fs::write(profile.join("deps/libpkgx-a.rlib"), b"other-package").unwrap();
         fs::write(profile.join("incremental/pkg-a/cache"), b"incremental-a").unwrap();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test fixture: a blocking wait on `git init` in a temp dir, off the event loop"
+        )]
         let status = std::process::Command::new("git")
             .args(["init", "-q"])
             .current_dir(&root)
