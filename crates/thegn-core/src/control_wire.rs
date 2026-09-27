@@ -566,7 +566,10 @@ impl EventDecoder {
         if self.cursor == self.buf.len() {
             self.buf.clear();
             self.cursor = 0;
-        } else if self.cursor > 0 {
+        } else if self.cursor > self.buf.len() / 2 {
+            // Amortize compaction: shifting the unread suffix only after the
+            // consumed prefix is larger keeps total copied bytes linear over
+            // fragmented input while still reclaiming space in long streams.
             #[cfg(test)]
             {
                 self.compacted_bytes += self.buf.len() - self.cursor;
