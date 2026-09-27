@@ -1,14 +1,11 @@
 {
-  "id": "THE-692",
-  "title": "thegn land never records a landed merge_queue row, so a canonically-landed worktree is never swept",
-  "url": "https://linear.app/blakeashley/issue/THE-692/thegn-land-never-records-a-landed-merge-queue-row-so-a-canonically",
-  "priority": "High",
+  "id": "THE-675",
+  "title": "Amortize git fork+exec with a persistent cat-file --batch process",
+  "url": "https://linear.app/blakeashley/issue/THE-675/amortize-git-forkexec-with-a-persistent-cat-file-batch-process",
+  "priority": "Medium",
   "labels": [
-    "Bug"
+    "Improvement"
   ],
-  "status": "Backlog",
-  "team": "Thegn",
-  "primary_file": "crates/thegn-host/src/cmd/land.rs",
-  "chain": "6th and largest cause of 'merge sweep collects nothing'; THE-685/686/687/688/690 all landed and the sweep now collects for queue-landed worktrees only",
-  "measured": "33 of 47 registered worktrees have no merge_queue row at all"
+  "parentId": "THE-669",
+  "description": "Every git read in thegn is a fresh `fork`+`exec`. Add process reuse behind the existing `util::git_out` chokepoint.\n\n**Payoff:** reduces spawn overhead without adding a single crate — the only shell-out reduction that does not trade dependencies for spawns.\n\n**Estimate:** 1–2 days.\n\n## Measured\n\nOn this repo, 2026-09-15 (hyperfine, `-N`, 3 warmup runs):\n\n* `git rev-parse HEAD` — **1.9 ms ± 0.2 ms** \\[user 0.6, system 1.1\\]\n* `git status --porcelain=v2 --branch` — **25.8 ms ± 1.0 ms**\n\nSo \\~1.9 ms is the **floor** for any git invocation: fork, exec, config load, repo discovery. At 16 ms frame budget, one trivial git spawn is \\~12% of a frame. A path touching N worktrees pays N × 1.9 ms before git does any useful work.\n\nA grep for `cat-file` / `--batch` across production code returns only gpg usage — **there is no process reuse anywhere today.**\n\n## Volume\n\n| Helper | Production sites | Files |\n| -- | -- | -- |\n| `util::git_out` | 77 | 39 |\n| `util::git_cmd` | 34 | 21 |\n| `util::git_ok` | 25 | 8 |\n| `GitLoc::git_command` | 14 | 10 |\n\n## Approach\n\nA long-lived `git cat-file --batch` (and/or `--batch-check`) per repo, owned behind `util::git_out`, so object reads become a pipe write + read instead of a process spawn.\n\nConstraints from CLAUDE.md that this must respect:\n\n* **Never on the event loop.** These already run off-loop; keep it that way, and do not let a stalled child block a caller.\n* **0% idle.** A parked child process must not generate wakeups. It sits on a blocking read — verify with `THEGN_PERF=1` that wake-source attribution is unchanged.\n* The process needs a lifecycle: lazy start, restart-on-crash, bounded idle lifetime, and cleanup on detach. A dead child must degrade to a plain spawn, never error.\n* **Scope honestly:** this only helps object reads (`cat-file`, `rev-parse`-shaped queries). It does **not** help `status`, `diff`, or anything porcelain — those are where the 25.8 ms lives, and they need a different fix (or `gix`, see <issue id=\"9d3b7179-5f46-47c1-ae15-fce6ec0ef9be\" href=\"https://linear.app/blakeashley/issue/THE-673/benchmark-gix-native-diff-against-the-git-cli-before-keeping-75-crates\">THE-673</issue>).\n\n## Prior art in-tree\n\nThis codebase already reduces spawns in two ways, and the new work should match those patterns rather than invent a third:\n\n* `BranchSet::load` (`thegn-core/src/worktree.rs`) — its comment notes collision checks are now \"pure lookups (the old per-candidate probing ran two subprocesses per attempt)\". N spawns → 2 spawns + an in-memory set.\n* `panel_header_cache` + `hydrate::glyph_cache` — last-known-good caches so a failed git read does not re-spawn next frame.\n\n## Acceptance criteria\n\n- [ ] Object reads go through a reused process; measured before/after on a repo with many worktrees.\n- [ ] A killed or crashed child degrades to a plain spawn with no user-visible error.\n- [ ] `THEGN_PERF=1` shows no new wake source and no idle-ratio regression.\n- [ ] No new dependency.\n- [ ] Child processes are reaped on detach — no orphans after the UI exits.\n- [ ] `cargo nextest run --workspace` green; `just lint` green.\n\n## Out of scope\n\n`GitLoc::git_command` for remote (ssh/provider) locs — batching across an ssh hop is a different problem. Local only."
 }
