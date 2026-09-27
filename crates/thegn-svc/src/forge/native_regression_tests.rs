@@ -15,6 +15,16 @@ pub(super) fn client_with_delay(
     delay: Option<Duration>,
     timeout: Duration,
 ) -> TrackerHttpClient {
+    client_with_content_type(status, body, delay, timeout, Some("application/json"))
+}
+
+fn client_with_content_type(
+    status: u16,
+    body: &str,
+    delay: Option<Duration>,
+    timeout: Duration,
+    content_type: Option<&'static str>,
+) -> TrackerHttpClient {
     use axum::Router;
     use axum::body::Body;
     use axum::extract::Request;
@@ -31,10 +41,12 @@ pub(super) fn client_with_delay(
             }
             let mut response =
                 (StatusCode::from_u16(status).unwrap(), Body::from(body)).into_response();
-            response.headers_mut().insert(
-                reqwest::header::CONTENT_TYPE,
-                HeaderValue::from_static("application/json"),
-            );
+            if let Some(content_type) = content_type {
+                response.headers_mut().insert(
+                    reqwest::header::CONTENT_TYPE,
+                    HeaderValue::from_static(content_type),
+                );
+            }
             response
         }
     }));
@@ -199,6 +211,27 @@ fn typed_http_answers_are_not_global_network_failures() {
             let body = serde_json::json!({"message":message}).to_string();
             let error = graphql_request(
                 &client(status, &body),
+                &serde_json::json!({"query":"fixture"}),
+                "fixture",
+                &health,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error, expected);
+            assert!(!error.falls_through());
+            assert_eq!(health.failures.load(Ordering::Relaxed), 0);
+        }
+
+        // GitHub error responses remain classifiable from their status and
+        // body even when the server omits Content-Type.
+        for (message, expected) in [
+            ("API rate limit exceeded", ForgeError::RateLimited),
+            ("Resource not accessible", ForgeError::NotAuthenticated),
+        ] {
+            let health = GhCircuit::new();
+            let body = serde_json::json!({"message":message}).to_string();
+            let error = graphql_request(
+                &client_with_content_type(403, &body, None, Duration::from_secs(2), None),
                 &serde_json::json!({"query":"fixture"}),
                 "fixture",
                 &health,
