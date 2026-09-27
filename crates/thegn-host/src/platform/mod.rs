@@ -18,6 +18,38 @@ mod unix;
 #[cfg(unix)]
 pub use unix::*;
 
+/// Bind a PTY child's process-tree identity before its reaper starts. Failure
+/// is represented as `None`; callers then use the child's own killer handle.
+#[cfg(unix)]
+pub(crate) fn pty_group(child: &dyn portable_pty::Child) -> Option<GroupHandle> {
+    child
+        .process_id()
+        .filter(|pid| *pid > 0 && *pid <= i32::MAX as u32)
+        .map(|pid| GroupHandle::from_pid(pid as i32))
+}
+
+#[cfg(windows)]
+pub(crate) fn pty_group(child: &dyn portable_pty::Child) -> Option<GroupHandle> {
+    windows::pty_group(child)
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn pty_group(_child: &dyn portable_pty::Child) -> Option<GroupHandle> {
+    None
+}
+
+/// Shared bounded grace interval after a PTY group receives its termination
+/// request. Windows uses an immediate Job Object terminate and needs no wait.
+#[cfg(unix)]
+pub(crate) fn pty_term_grace() -> std::time::Duration {
+    std::time::Duration::from_millis(300)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn pty_term_grace() -> std::time::Duration {
+    std::time::Duration::ZERO
+}
+
 /// Return the process-start identity used by the model-proxy pid state.
 ///
 /// Unix implementations must return a real identity and callers must treat
