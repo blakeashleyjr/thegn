@@ -354,6 +354,20 @@ impl WorktreeAuxStore for Db {
         if current.queue != observed.queue || current.queue_location != observed.queue_location {
             return Ok(MergeOutcomeWrite::QueueChanged);
         }
+        // A repeated manual land is deliberately idempotent.  Once a row is
+        // landed, its result identity and updated_at are part of the sweep's
+        // grace-period record; refreshing either would move the clock and could
+        // keep a worktree alive forever.  Other final statuses retain the
+        // queue driver's existing transition behavior.
+        if outcome.status == MergeFinalStatus::Landed
+            && current
+                .queue
+                .as_ref()
+                .is_some_and(|row| row.status == "landed")
+        {
+            tx.commit()?;
+            return Ok(MergeOutcomeWrite::Written);
+        }
         // Mirror the observed registry's exact location representation, or the
         // observed queue's when unregistered. Never canonicalize a remote descriptor.
         let location = observed
