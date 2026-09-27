@@ -620,7 +620,7 @@ fn media_config_defaults_and_enums() {
     );
 
     // Native MPD backend: alias parses, config exposes a default endpoint, and
-    // resolve_opts lowers the backend + endpoint into the leaf's ResolveOpts.
+    // resolve_opts lowers endpoint configuration; host resolves secrets later.
     assert_eq!(
         MediaBackendKind::from_str_validated("mpc").unwrap(),
         MediaBackendKind::Mpd
@@ -636,7 +636,41 @@ fn media_config_defaults_and_enums() {
     let opts = mpd_cfg.resolve_opts();
     assert_eq!(opts.backend, thegn_media::BackendKind::Mpd);
     assert_eq!(opts.mpd_socket, "music.lan:6601");
-    assert_eq!(opts.mpd_password.as_deref(), Some("hunter2"));
+    assert!(opts.mpd_password.is_none());
+    assert!(!format!("{:?}", mpd_cfg.mpd).contains("hunter2"));
+    assert!(
+        !format!("{:?}", mpd_cfg.mpd.password).contains("hunter2"),
+        "typed password references redact their own Debug output"
+    );
+    assert_eq!(
+        thegn_core::config_media::MpdSecretRef::parse(" spaced password ").expose_literal(),
+        Some(" spaced password "),
+        "legacy literals preserve their exact bytes"
+    );
+    let persisted = toml::to_string(&mpd_cfg).unwrap();
+    assert!(
+        persisted.contains("hunter2"),
+        "legacy config remains readable"
+    );
+    let restored: MediaConfig = toml::from_str(&persisted).unwrap();
+    assert_eq!(
+        restored.mpd.password.as_ref().unwrap().expose_literal(),
+        Some("hunter2")
+    );
+    mpd_cfg.mpd.password = Some("keyring:mpd-home".into());
+    let reference_toml = toml::to_string(&mpd_cfg).unwrap();
+    assert!(reference_toml.contains("keyring:mpd-home"));
+    let restored: MediaConfig = toml::from_str(&reference_toml).unwrap();
+    assert_eq!(
+        restored
+            .mpd
+            .password
+            .as_ref()
+            .unwrap()
+            .secret_ref()
+            .backend_kind(),
+        "keyring"
+    );
 
     // Default Config keeps media enabled and round-trips through TOML.
     assert!(Config::default().media.enabled);

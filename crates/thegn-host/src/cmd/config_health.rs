@@ -179,8 +179,8 @@ fn validate_toml_file(health: &mut ConfigHealth, layer: Layer, path: &Path) {
                 health,
                 path,
                 format!(
-                    "{}: holds a plaintext secret value in config. Use a `keyring:`, `env:`, or \
-                     `file:` ref, or run `thegn secret migrate` to move it into the keyring.",
+                    "{}: contains a legacy plaintext secret. Use a `keyring:`, `env:`, or \
+                     `file:` ref, or run `thegn secret migrate` for config-backed fields.",
                     literal.path
                 ),
             );

@@ -7888,6 +7888,7 @@ dependencies = [
  "tokio",
  "tracing",
  "windows 0.58.0",
+ "zeroize",
  "zbus 5.19.0",
 ]
 

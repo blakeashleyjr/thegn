@@ -54,9 +54,50 @@ pub fn resolve_for(secret_ref: &str, consumer: &str) -> Option<String> {
 /// probe deadline (see [`keyring_available`]) rather than wedging, and the audit
 /// outcome distinguishes `missing` from `unavailable`.
 pub fn resolve_ref_for(r: &SecretRef, consumer: &str) -> Option<String> {
+    resolve_ref_for_outcome(r, consumer).ok().flatten()
+}
+
+/// Resolution status for a configured reference. Errors contain only the
+/// component/outcome class; they never include the reference operand or value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecretResolveFailure {
+    Missing,
+    Unavailable,
+    Denied,
+}
+
+impl std::fmt::Display for SecretResolveFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}",
+            match self {
+                Self::Missing => "configured secret is missing",
+                Self::Unavailable => "secret backend is unavailable",
+                Self::Denied => "secret backend denied access",
+            }
+        )
+    }
+}
+
+/// Resolve with distinct missing, unavailable, and denied outcomes. An empty
+/// unconfigured reference returns `Ok(None)` without an audit event.
+pub fn resolve_ref_for_outcome(
+    r: &SecretRef,
+    consumer: &str,
+) -> Result<Option<String>, SecretResolveFailure> {
+    resolve_ref_for_outcome_with(r, consumer, keyring_get, keyring_available)
+}
+
+fn resolve_ref_for_outcome_with(
+    r: &SecretRef,
+    consumer: &str,
+    keyring_get: impl Fn(&str) -> Result<Option<String>>,
+    keyring_available: impl Fn() -> bool,
+) -> Result<Option<String>, SecretResolveFailure> {
     // An unconfigured/empty ref is "not set" — no fetch, no audit noise.
     if !r.is_configured() {
-        return None;
+        return Ok(None);
     }
     let (value, outcome) = match r {
         SecretRef::Keyring { account } => match keyring_get(account) {
@@ -85,7 +126,12 @@ pub fn resolve_ref_for(r: &SecretRef, consumer: &str) -> Option<String> {
         },
     };
     SecretAudit::new(r, consumer, outcome).record();
-    value
+    match outcome {
+        SecretOutcome::Resolved => Ok(value),
+        SecretOutcome::Missing => Err(SecretResolveFailure::Missing),
+        SecretOutcome::Unavailable => Err(SecretResolveFailure::Unavailable),
+        SecretOutcome::Denied => Err(SecretResolveFailure::Denied),
+    }
 }
 
 /// TTL-memoized PRESENCE check for the hydration path: `env_snapshots` asks
@@ -636,6 +682,89 @@ fn index_remove(account: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct AuditCapture(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for AuditCapture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn mpd_resolution_emits_one_metadata_only_audit_event() {
+        let sentinel = "mpd-audit-secret-sentinel";
+        let capture = AuditCapture::default();
+        let writer = capture.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let resolved = tracing::subscriber::with_default(subscriber, || {
+            resolve_ref_for_outcome(&SecretRef::parse(sentinel, BareAs::Literal), "media:mpd")
+                .unwrap()
+                .unwrap()
+        });
+        assert_eq!(resolved, sentinel);
+        let output = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(output.matches("secret resolve").count(), 1, "{output}");
+        assert!(output.contains("consumer=media:mpd"), "{output}");
+        assert!(output.contains("outcome=resolved"), "{output}");
+        assert!(
+            !output.contains(sentinel),
+            "audit output exposed the secret"
+        );
+    }
+
+    #[test]
+    fn typed_broker_distinguishes_missing_from_unavailable_keyring() {
+        let reference = SecretRef::Keyring {
+            account: "media-mpd-test-account".into(),
+        };
+        let missing = resolve_ref_for_outcome_with(&reference, "media:mpd", |_| Ok(None), || true);
+        let unavailable = resolve_ref_for_outcome_with(
+            &reference,
+            "media:mpd",
+            |_| Err(anyhow::anyhow!("test backend unavailable")),
+            || false,
+        );
+        assert_eq!(missing, Err(SecretResolveFailure::Missing));
+        assert_eq!(unavailable, Err(SecretResolveFailure::Unavailable));
+        assert_ne!(missing, unavailable);
+    }
+
+    #[test]
+    fn typed_broker_resolves_env_and_file_refs() {
+        // SAFETY: unique test variable is set and removed within this test.
+        unsafe { std::env::set_var("TG_MPD_SECRET_TEST", "mpd-test-value") };
+        let env = resolve_ref_for_outcome(
+            &SecretRef::parse("env:TG_MPD_SECRET_TEST", BareAs::Literal),
+            "media:mpd",
+        )
+        .unwrap();
+        unsafe { std::env::remove_var("TG_MPD_SECRET_TEST") };
+        assert_eq!(env.as_deref(), Some("mpd-test-value"));
+
+        let file = std::env::temp_dir().join(format!("tg-mpd-secret-{}.tok", std::process::id()));
+        std::fs::write(&file, "mpd-file-value").unwrap();
+        let from_file = resolve_ref_for_outcome(
+            &SecretRef::parse(&format!("file:{}", file.display()), BareAs::Literal),
+            "media:mpd",
+        )
+        .unwrap();
+        let _ = std::fs::remove_file(file); // best-effort: test cleanup after broker read
+        assert_eq!(from_file.as_deref(), Some("mpd-file-value"));
+    }
 
     #[test]
     fn resolve_env_and_bare_and_empty() {
