@@ -1,14 +1,11 @@
 {
-  "id": "THE-692",
-  "title": "thegn land never records a landed merge_queue row, so a canonically-landed worktree is never swept",
-  "url": "https://linear.app/blakeashley/issue/THE-692/thegn-land-never-records-a-landed-merge-queue-row-so-a-canonically",
-  "priority": "High",
-  "labels": [
-    "Bug"
-  ],
-  "status": "Backlog",
+  "id": "THE-552",
+  "title": "Include timestamp-zero events in replay reconstruction without duplicate forward playback",
+  "url": "https://linear.app/blakeashley/issue/THE-552/include-timestamp-zero-events-in-replay-reconstruction-without",
+  "priority": "Medium",
+  "labels": [],
+  "status": "Todo",
   "team": "Thegn",
-  "primary_file": "crates/thegn-host/src/cmd/land.rs",
-  "chain": "6th and largest cause of 'merge sweep collects nothing'; THE-685/686/687/688/690 all landed and the sweep now collects for queue-landed worktrees only",
-  "measured": "33 of 47 registered worktrees have no merge_queue row at all"
+  "gitBranchName": "blake/the-552-include-timestamp-zero-events-in-replay-reconstruction",
+  "description": "## Finding\n\nRecording retains output at elapsed millisecond zero, but reconstruct omits it. This affects normal center panes, independently of filtered corner streams.\n\n## Evidence\n\nBaseline 299fc13, crates/thegn-host/src/replay.rs:213-225. reconstruct initializes a fresh emulator then calls feed_into(emu, 0, at_ms). feed_into skips ev.at_ms <= from_exclusive, including every event during the first millisecond. search_next and export_cast include those same events.\n\nStandalone audit reproduction /tmp/thegn-audit/replay-probe/replay.rs::audit_epoch_zero_is_exported_and_searchable_but_not_reconstructed appends A at recording.epoch. The ring has one event at 0, exported cast contains A and search finds it at 0, but reconstruct(0) is blank. Root reran the four reproduction tests; all assert current broken behavior, not fixes.\n\n## Impact\n\nInitial prompt/output and initial resize events can disappear from replay. Search can select a timestamp whose reconstructed grid lacks the matched text. Tests based on immediate feed/reconstruct are timing-dependent.\n\n## Acceptance\n\n* Distinguish reconstruction from the start of retained history from forward playback strictly after an already-consumed event; timestamp 0 is a valid time, not an uninitialized sentinel.\n* Include all events at/before requested time during reconstruction, including multiple events at 0.\n* Preserve exactly-once incremental playback across same-millisecond event groups, paused seek and resumption; use event sequence identity if timestamps cannot express the cursor.\n* Deterministic tests cover bytes and resizes at 0, multiple events sharing timestamps, reconstruct(0), search/reconstruct agreement, repeated feed intervals and backward seek. No sleeps to shift events away from 0.\n\n## Dependencies\n\nIndependent baseline defect; related THE-548's center-replay regression coverage must not hide it with delays. No disk-format migration is required for the memory-only ring."
 }
