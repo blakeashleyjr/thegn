@@ -1,14 +1,11 @@
 {
-  "id": "THE-692",
-  "title": "thegn land never records a landed merge_queue row, so a canonically-landed worktree is never swept",
-  "url": "https://linear.app/blakeashley/issue/THE-692/thegn-land-never-records-a-landed-merge-queue-row-so-a-canonically",
-  "priority": "High",
-  "labels": [
-    "Bug"
-  ],
-  "status": "Backlog",
+  "id": "THE-601",
+  "title": "Bound merge-gate output capture and cancellation without losing child ownership",
+  "url": "https://linear.app/blakeashley/issue/THE-601/bound-merge-gate-output-capture-and-cancellation-without-losing-child",
+  "priority": "Medium",
+  "labels": [],
+  "status": "Todo",
   "team": "Thegn",
-  "primary_file": "crates/thegn-host/src/cmd/land.rs",
-  "chain": "6th and largest cause of 'merge sweep collects nothing'; THE-685/686/687/688/690 all landed and the sweep now collects for queue-landed worktrees only",
-  "measured": "33 of 47 registered worktrees have no merge_queue row at all"
+  "gitBranchName": "blake/the-601-bound-merge-gate-output-capture-and-cancellation-without",
+  "description": "## Source-confirmed performance/lifetime gap\n\n`crates/thegn-host/src/integrate.rs::gate_tip` runs setup and gate through `Command::output()`. Both complete stdout and stderr are buffered until exit, then copied/UTF-8 converted and tail-truncated. THE-589 bounds retained diagnostics, not this initial allocation. A noisy gate can grow host memory without bound. No gate-specific deadline was found; a child/grandchild retaining a pipe can prevent completion and keep the reusable gate lease indefinitely.\n\n## Scope\n\nIntroduce bounded streaming tail capture for both channels, explicit operator-configurable setup/gate deadlines or a documented disabled deadline, and cancellation that retains ownership through process-group termination/reaping and pipe-reader settlement. Do not signal reaped/reused PIDs or detach unbounded reader threads. OS/filesystem blocking limits must be described honestly. Preserve gate exit classification: timeout/transport/setup failures are infrastructure holds, never candidate blame or pass. Do not change the user's configured gate command or silently impose a short build deadline.\n\n## Acceptance\n\nPrivate tests with large output on both streams, split UTF-8, endless writer, child exit with grandchild-held pipes, ignored termination, cancellation, spawn/reaper failure and ordinary pass/red exit. Assert bounded memory/retained diagnostics, no transient landed outcome, no lease reuse while previous workload remains, and no unrelated process signalling. Native fixture command-level timeout is not proof of production gate cancellation.\n\n## Priority and limits\n\nSeparate follow-up, not established as THE-586 original failure cause. The configured local full test gate previously passed on an identical metadata-only tree. No production configuration mutation or live noisy-command test authorized."
 }
