@@ -410,7 +410,7 @@ impl CalendarBackend for CalDavBackend {
         to: NaiveDate,
         sync_token: &'a str,
     ) -> BoxFuture<'a, Result<EventPage, CalendarError>> {
-        let Some(window) = CalendarWindow::new(from, to, chrono_tz::Tz::UTC) else {
+        let Some(window) = CalendarWindow::new(from, to, thegn_core::calendar::Tz::UTC) else {
             return Box::pin(async { Err(CalendarError::Api("invalid calendar window".into())) });
         };
         self.list_events_for_window(window, sync_token)
