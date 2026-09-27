@@ -309,11 +309,11 @@ impl TrackerHttpOperation<'_> {
         // misstated Content-Type. Only successful bodies are parsed as JSON.
         if response.status().is_success() {
             let Some(content_type) = response.headers().get(reqwest::header::CONTENT_TYPE) else {
-                return Err(IssueError::Policy("tracker JSON content type missing"));
+                return Err(IssueError::Policy("tracker JSON content type refused"));
             };
             let content_type = content_type
                 .to_str()
-                .map_err(|_| IssueError::Policy("tracker JSON content type invalid"))?;
+                .map_err(|_| IssueError::Policy("tracker JSON content type refused"))?;
             let media = content_type.split(';').next().unwrap_or("").trim();
             if media != "application/json" && !media.ends_with("+json") {
                 return Err(IssueError::Policy("tracker JSON content type refused"));
@@ -430,11 +430,11 @@ impl TrackerHttpOperation<'_> {
         }
         if json {
             let Some(content_type) = response.headers().get(reqwest::header::CONTENT_TYPE) else {
-                return Err(IssueError::Policy("tracker JSON content type missing"));
+                return Err(IssueError::Policy("tracker JSON content type refused"));
             };
             let content_type = content_type
                 .to_str()
-                .map_err(|_| IssueError::Policy("tracker JSON content type invalid"))?;
+                .map_err(|_| IssueError::Policy("tracker JSON content type refused"))?;
             let media = content_type.split(';').next().unwrap_or("").trim();
             if media != "application/json" && !media.ends_with("+json") {
                 return Err(IssueError::Policy("tracker JSON content type refused"));
@@ -679,6 +679,7 @@ mod tests {
         let value: serde_json::Value = ok.get("/ok").await.unwrap();
         assert_eq!(value["ok"], true);
 
+        drop(ok);
         let mut envelope = client.operation();
         let response = envelope
             .json_envelope(
@@ -694,6 +695,7 @@ mod tests {
             "API rate limit exceeded"
         );
 
+        drop(envelope);
         let mut envelope_redirect = client.operation();
         assert!(matches!(
             envelope_redirect
@@ -702,6 +704,7 @@ mod tests {
             Err(IssueError::Policy("tracker redirect refused"))
         ));
 
+        drop(envelope_redirect);
         let mut envelope_encoding = client.operation();
         assert!(matches!(
             envelope_encoding
@@ -710,6 +713,7 @@ mod tests {
             Err(IssueError::Policy("tracker response encoding refused"))
         ));
 
+        drop(envelope_encoding);
         let mut envelope_mime = client.operation();
         assert!(matches!(
             envelope_mime
@@ -718,6 +722,7 @@ mod tests {
             Err(IssueError::Policy("tracker JSON content type refused"))
         ));
 
+        drop(envelope_mime);
         let mut envelope_missing_mime = client.operation();
         assert!(matches!(
             envelope_missing_mime
@@ -727,11 +732,12 @@ mod tests {
                     &serde_json::json!({})
                 )
                 .await,
-            Err(IssueError::Policy("tracker JSON content type missing"))
+            Err(IssueError::Policy("tracker JSON content type refused"))
         ));
 
         // Error envelopes retain the body needed for status classification;
         // MIME is enforced only where the response will be parsed as JSON.
+        drop(envelope_missing_mime);
         let mut error_without_mime = client.operation();
         let response = error_without_mime
             .json_envelope(
@@ -747,6 +753,7 @@ mod tests {
             "API rate limit exceeded"
         );
 
+        drop(error_without_mime);
         let mut envelope_size = client.operation();
         assert!(matches!(
             envelope_size
@@ -755,24 +762,28 @@ mod tests {
             Err(IssueError::BodyLimit("tracker response exceeds limit"))
         ));
 
+        drop(envelope_size);
         let mut redirect = client.operation();
         assert!(matches!(
             redirect.get::<serde_json::Value>("/redirect").await,
             Err(IssueError::Policy("tracker redirect refused"))
         ));
 
+        drop(redirect);
         let mut encoding = client.operation();
         assert!(matches!(
             encoding.get::<serde_json::Value>("/encoding").await,
             Err(IssueError::Policy("tracker response encoding refused"))
         ));
 
+        drop(encoding);
         let mut mime = client.operation();
         assert!(matches!(
             mime.get::<serde_json::Value>("/bad-mime").await,
             Err(IssueError::Policy("tracker JSON content type refused"))
         ));
 
+        drop(mime);
         let mut missing_mime = client.operation();
         assert!(matches!(
             missing_mime
@@ -781,17 +792,20 @@ mod tests {
             Err(IssueError::Policy("tracker JSON content type refused"))
         ));
 
+        drop(missing_mime);
         let mut auth = client.operation();
         assert!(matches!(
             auth.get::<serde_json::Value>("/unauthorized").await,
             Err(IssueError::Auth(_))
         ));
 
+        drop(auth);
         let mut large = client.operation();
         assert!(matches!(
             large.get::<serde_json::Value>("/large").await,
             Err(IssueError::BodyLimit("tracker response exceeds limit"))
         ));
+        drop(large);
         let mut chunked = client.operation();
         assert!(matches!(
             chunked.get::<serde_json::Value>("/chunked").await,
@@ -799,6 +813,7 @@ mod tests {
         ));
         server.abort();
         assert!(server.await.unwrap_err().is_cancelled());
+        drop(chunked);
     }
 
     #[tokio::test]
