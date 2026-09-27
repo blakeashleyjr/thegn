@@ -154,18 +154,19 @@ pub fn resolve_system(loc: &GitLoc, cfg: &CiConfig) -> Option<CiSystem> {
 }
 
 /// Map a git remote URL's host to a CI system (pure, tested).
+///
+/// Matching is the exact apex or a subdomain of it, and deliberately NOT a
+/// `starts_with("github.")` prefix: `github.com.evil.test` begins with that
+/// prefix and is an attacker-controlled host, while a genuine self-hosted
+/// `github.mycorp.com` is structurally identical to it — no prefix rule can tell
+/// them apart. Self-hosted instances therefore need explicit configuration
+/// rather than a guess that also admits a lookalike.
 pub fn system_from_remote_host(url: &str) -> Option<CiSystem> {
     let host = parse_gitlab_remote(url)?.host;
     let hostname = host.split(':').next()?;
-    if hostname == "github.com"
-        || hostname.ends_with(".github.com")
-        || hostname.starts_with("github.")
-    {
+    if hostname == "github.com" || hostname.ends_with(".github.com") {
         Some(CiSystem::GithubActions)
-    } else if hostname == "gitlab.com"
-        || hostname.ends_with(".gitlab.com")
-        || hostname.starts_with("gitlab.")
-    {
+    } else if hostname == "gitlab.com" || hostname.ends_with(".gitlab.com") {
         Some(CiSystem::GitlabCi)
     } else {
         None
@@ -1199,7 +1200,15 @@ mod tests {
             "123456789012345678901",
         ] {
             let err = validate_ci_id(invalid).unwrap_err();
-            assert!(err.to_string().contains(invalid), "{invalid:?}: {err}");
+            // The message quotes the input with `{:?}`, which ESCAPES control
+            // characters — deliberately, so a rejected id carrying a newline or a
+            // tab cannot inject them into a log line or a terminal. So assert the
+            // escaped spelling; asserting the raw bytes would demand the unsafe
+            // behaviour for the `"1\n"` and `"1\t"` cases.
+            assert!(
+                err.to_string().contains(&format!("{invalid:?}")),
+                "{invalid:?}: {err}"
+            );
         }
     }
 
