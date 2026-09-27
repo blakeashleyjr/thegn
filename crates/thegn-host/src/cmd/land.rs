@@ -392,4 +392,41 @@ mod landed_row_tests {
         assert_eq!(row.status, "queued");
         assert!(row.result_oid.is_none());
     }
+
+    #[test]
+    fn manual_land_projection_keeps_an_existing_landed_row_unchanged() {
+        let db = fixture();
+        let observed = db.observe_merge_outcome(WORKTREE).unwrap();
+        persist_landed_row(
+            &db,
+            &observed,
+            Path::new(WORKTREE),
+            "feature",
+            Path::new(ROOT),
+            "main",
+            "first-fold",
+        )
+        .unwrap();
+        db.conn()
+            .execute(
+                "UPDATE merge_queue SET queued_at=11, updated_at=12, result_oid='first-fold', error_detail='keep-me'",
+                [],
+            )
+            .unwrap();
+        let before = db.list_merge_queue().unwrap().pop().unwrap();
+
+        let observed = db.observe_merge_outcome(WORKTREE).unwrap();
+        persist_landed_row(
+            &db,
+            &observed,
+            Path::new(WORKTREE),
+            "feature",
+            Path::new(ROOT),
+            "main",
+            "second-fold-must-not-replace",
+        )
+        .unwrap();
+
+        assert_eq!(db.list_merge_queue().unwrap().pop().unwrap(), before);
+    }
 }
