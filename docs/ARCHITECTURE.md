@@ -328,8 +328,10 @@ measured in that round. `[disk] generation_min_age_days` defaults to 14, matchin
 touched footprint for each package name is retained. Each profile's existing
 `.cargo-lock` must be acquired nonblocking and held through pruning; lock errors
 skip that profile. The host removes the fingerprint directory before its mapped
-`deps/` and `incremental/` paths. If interrupted, Cargo sees a missing
-fingerprint and rebuilds rather than treating a missing output as fresh. This
+`deps/` and `incremental/` paths. Mapping covers `lib<crate>-<id>` library
+outputs plus `<crate>-<id>` dep-info/executable names and package target-name
+suffixes. If interrupted, Cargo sees a missing fingerprint and rebuilds rather
+than treating a missing output as fresh. This
 guarantees only the retention rule; it makes no claim about the rebuild cost of
 a mistaken footprint association. Structured per-profile logs keep measured
 generation bytes, planned bytes, successfully removed bytes, remaining measured
