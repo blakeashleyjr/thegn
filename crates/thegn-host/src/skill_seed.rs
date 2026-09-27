@@ -104,7 +104,10 @@ pub(crate) fn managed_seed_files(cfg: &Config) -> Result<ManagedSeedFiles, Strin
             if skill.harnesses.contains(&harness_id) {
                 let relative = thegn_core::skills::skill_relative(&skill.name)
                     .map_err(|error| format!("skill authority: {error}"))?;
-                managed.add_file(root.join(relative), render_managed(skill).into_bytes());
+                managed.add_file(
+                    root.join(relative),
+                    thegn_core::skills::render_managed(skill).into_bytes(),
+                );
             }
         }
 

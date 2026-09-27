@@ -539,6 +539,9 @@ pub(crate) struct StatusObservation {
 /// managed path, or unknown path below a managed root remains protected. The
 /// whole batch is classified before it is accepted; seeing one seeded record
 /// must never make a later user record disappear from consideration.
+/// Test-only convenience over [`observe_status_with_authority`] with no seeded
+/// authority. Only fixtures call it; production always passes the authority.
+#[cfg(test)]
 fn observe_status(bytes: Vec<u8>) -> Result<StatusObservation, Refusal> {
     observe_status_with_authority(bytes, Path::new("."), None)
 }
@@ -624,6 +627,9 @@ fn observe_status_with_authority(
     })
 }
 
+/// Test-only convenience over [`clean_with_authority`] with no seeded
+/// authority. Only fixtures call it; production always passes the authority.
+#[cfg(test)]
 pub(crate) fn clean(path: &Path) -> Result<StatusObservation, Refusal> {
     clean_with_authority(path, None)
 }
@@ -818,6 +824,9 @@ pub(crate) struct Verified {
 }
 
 impl Verified {
+    /// Test-only convenience over [`Self::probe_inner`] with no seeded
+    /// authority. Only fixtures call it.
+    #[cfg(test)]
     pub(crate) fn probe(
         root: &Path,
         worktree: &str,
