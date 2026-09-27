@@ -46,7 +46,9 @@ enum StreamState {
 /// the same lifecycle and discard-through-terminator contract as the OSC 52
 /// clipboard stream parser, while keeping query matching and clipboard
 /// admission separate (queries answer immediately; clipboard sets may remain
-/// pending under writer backpressure).
+/// pending under writer backpressure). Reset it only through
+/// `pty_drain::reset_terminal_streams`, which also resets the clipboard
+/// parser; register any third streaming parser there.
 #[derive(Debug, Default)]
 pub(crate) struct QueryParser {
     state: StreamState,

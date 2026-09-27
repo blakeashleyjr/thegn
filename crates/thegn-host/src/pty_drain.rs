@@ -380,8 +380,7 @@ fn finish_exit(
     if let Some(p) = ctx.panes.table.get_mut(&id) {
         p.clipboard
             .submit(|bytes| ctx.writer.try_submit_clipboard(bytes, || {}));
-        p.clipboard.reset();
-        p.query_parser.reset();
+        reset_terminal_streams(&mut p.clipboard, &mut p.query_parser);
     }
     if ctx.preview.pane_exit(id) {
         *ctx.dirty = true;
@@ -391,6 +390,18 @@ fn finish_exit(
     ctx.degraded_at.remove(&id);
     summary.left_for_materialize |= handle_exit(ctx, id, exit_code);
     summary.exited.push(id);
+}
+
+/// Reset every per-pane parser that consumes the terminal output stream.
+/// Lifecycle boundaries must use this function so the OSC 52 and query
+/// scanners cannot retain different prefixes across a pane generation.
+/// Register every future streaming parser here.
+fn reset_terminal_streams(
+    clipboard: &mut crate::queries::clipboard::Clipboard,
+    query_parser: &mut crate::queries::QueryParser,
+) {
+    clipboard.reset();
+    query_parser.reset();
 }
 
 #[derive(Default)]
@@ -486,16 +497,14 @@ pub(crate) fn drain<T: Terminal>(
             Ok(PaneEvent::SessionFallback(id)) => {
                 backlog.barrier(id);
                 if let Some(p) = ctx.panes.table.get_mut(&id) {
-                    p.clipboard.reset();
-                    p.query_parser.reset();
+                    reset_terminal_streams(&mut p.clipboard, &mut p.query_parser);
                 }
                 fallbacks.push(id);
             }
             Ok(PaneEvent::Reattached(id)) => {
                 backlog.barrier(id);
                 if let Some(p) = ctx.panes.table.get_mut(&id) {
-                    p.clipboard.reset();
-                    p.query_parser.reset();
+                    reset_terminal_streams(&mut p.clipboard, &mut p.query_parser);
                 }
                 reattached.push(id);
             }
@@ -1951,14 +1960,40 @@ mod tests {
     }
 
     #[test]
-    fn backlog_generation_barriers_preserve_bytes_without_crossing_clipboard_state() {
+    fn generation_boundary_resets_clipboard_and_query_streams_together() {
         let mut backlog = PtyBacklog::default();
         let mut clipboard = crate::queries::clipboard::Clipboard::default();
+        let mut query_parser = crate::queries::QueryParser::default();
+        let colors = crate::queries::PaneColors {
+            fg: (1, 2, 3),
+            bg: (4, 5, 6),
+        };
         clipboard.feed(b"\x1b]52;c;eA==\x07\x1b]52;c;");
         clipboard.submit(Err);
+        assert!(
+            query_parser
+                .feed(b"\x1b[", (4, 9), (24, 80), colors)
+                .is_empty()
+        );
         backlog.push(1, b"eQ==\x07".to_vec()); // old suffix waiting before fallback
         backlog.barrier(1);
-        clipboard.reset(); // receipt barrier, never grouped lifecycle callback
+        reset_terminal_streams(&mut clipboard, &mut query_parser);
+        assert!(
+            query_parser
+                .feed(b"5n", (4, 9), (24, 80), colors)
+                .is_empty()
+        );
+        assert_eq!(
+            query_parser.feed(b"\x1b[5n", (4, 9), (24, 80), colors),
+            b"\x1b[0n"
+        );
+        clipboard.feed(b"eQ==\x07");
+        let mut stale = Vec::new();
+        clipboard.submit(|bytes| {
+            stale = bytes;
+            Ok(())
+        });
+        assert!(stale.is_empty(), "OSC 52 suffix cannot cross the boundary");
         backlog.push(1, b"\x1b]52;c;eg==\x07".to_vec());
         let (old, first) = backlog.take_tagged_slice(1, usize::MAX);
         let (new, second) = backlog.take_tagged_slice(1, usize::MAX);
