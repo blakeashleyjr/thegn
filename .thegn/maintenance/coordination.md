@@ -1,143 +1,156 @@
-# Coordination brief — THE-690
+# Coordination brief — THE-693
 
-Fifth and current blocker in the merged-worktree sweep chain. Four causes are
-already fixed and landed — THE-685 (`0a3e3150`), THE-686 (`2acdf364`), THE-687 and
-THE-688 (both `e1a64f61`) — and the sweep **still collects nothing**: all thirteen
-candidates now fail on this one guard. The repo owner hits this every day.
+Seventh cause in the merged-worktree sweep chain, and the one that makes the whole
+feature work only in this repo. Six causes are landed (THE-685 `0a3e3150`,
+THE-686 `2acdf364`, THE-687 + THE-688 `e1a64f61`, THE-690 `052a4bd9`+`6b7f7cc9`;
+THE-692 is in review) and `thegn merge sweep` collects **in thegn**. Run it in any
+other workspace and it collects nothing.
 
-## What the primary already measured — build on it, do not redo it
+## NAMING TRAP — read this first
 
-`crates/thegn-host/src/merge_cleanup.rs:108-131`, `oci_resources_absent`, refuses
-when **any** OCI binary exists **anywhere on PATH**. It never asks whether a
-container references the worktree. Measured on this machine:
+Commit `50b32ab2` on main is labelled **`fix(the-693)`** and is **NOT this issue**.
+It is an unrelated grace-clock fix; `the-693` was a placeholder branch name that
+happened to collide with the number Linear later assigned here. Do not read that
+commit as prior work on `.claude/` seeding, and do not assume any of this is
+already done.
 
-- `docker` → `/run/current-system/sw/bin/docker`, `podman` →
-  `/run/current-system/sw/bin/podman`. Both live in the NixOS system profile, so
-  they are on PATH permanently and unconditionally.
-- Two containers exist, `cms-garage-1` and `cms-postgres-1`, belonging to an
-  unrelated project.
-- Inspecting every container's mounts finds **no reference to any kept worktree**.
+## What the primary already measured — build on it
 
-So the refusal is not about these worktrees at all. It fires on the mere presence
-of a tool, which makes the sweep permanently inert on essentially every
-development machine.
+In the `cms` workspace, all 11 merged worktrees refuse with **"edited since
+landing"**. The operator edited nothing. Measured on three of them:
 
-Re-verify the citation on your branch and report it confirmed (or moved); the
-primary does not expect it to have changed.
+```
+tracked edits:          0
+untracked non-ignored:  1
+    ?? .claude/
+```
 
-## This is the third instance of one pattern — name it in your report
+`.claude/` contains exactly `commands/` and `skills/` — **content thegn seeds
+itself**, per CLAUDE.md (the `.claude/` commands and skills are seeded per
+checkout, and the bundled `/pipeline` and `/supervise` skills go into every
+worktree's `.claude/skills/`).
 
-- THE-687: a **cache field** (`result_oid`) absent ⇒ permanent refusal.
-- THE-688: a **saved tab layout** row ⇒ permanent refusal.
-- THE-690: an **installed binary** ⇒ permanent refusal.
+Whether that seeded content blocks cleanup forever depends entirely on the target
+repo's ignore rules:
 
-Each substituted a cheap proxy for the question actually being asked. Yours is
-the broadest, because it does not depend on anything about the worktree. If you
-notice a fourth instance of the same shape while you are in here, **report it as a
-note** — do not fix it.
+```
+thegn:  git check-ignore -v .claude/commands  ->  .gitignore:21:.claude/*
+cms:    git check-ignore -v .claude/commands  ->  NOT ignored
+```
 
-## What to implement
+thegn ignores `.claude/*`, so THE-686 classifies its worktrees as ignored-only and
+they sweep. `cms` has no mention of `claude` in `.gitignore`, so the seeded
+directory is untracked-non-ignored, which is `Refusal::Dirty`.
 
-Ask the real question: does any container, running or stopped, have a mount whose
-source is at or under this worktree path?
+**So thegn plants the blocker and then refuses to collect the worktree because of
+it.** It can only clean its own worktrees because its own repo happens to ignore
+the files it writes. Re-verify these citations and report them confirmed.
 
-1. **No OCI runtime discoverable** ⇒ `Ok`, exactly as today.
-2. **Discoverable** ⇒ query it and refuse **only** when a container actually
-   references the path. Prefer one bounded single-shot query per runtime (e.g.
-   `ps -a` plus an `inspect` format over mount sources) rather than a query per
-   container if you can get it in one call.
-3. **Discoverable but unqueryable** — daemon down, permission denied, timeout ⇒
-   refuse conservatively, with a reason that says it could not be **queried**.
-   That is a legitimate unknown. "The binary exists" is not, and that distinction
-   is the whole issue.
+## The decision the primary needs from you — investigate both, recommend one
 
-Match at or **under** the path: a bind mount of a subdirectory still means a
-container holds part of that worktree. Compare canonicalised paths — a symlinked
-or relative mount source must not slip past — and treat a mount source you cannot
-canonicalise as a match, not a miss.
+Do **not** just pick one. The two directions have a real conflict and the
+investigation must surface it:
 
-## Hard constraints
+1. **Teach the cleanliness predicate about thegn's own seeded paths.** Classify a
+   known set as tool state, the same category THE-686 established for ignored
+   build output. Cost: the predicate that authorises **deletion** grows an
+   allowlist. Anything on that list can no longer protect a worktree, so the list
+   must be exact, and it must come from the same authority the seeder uses — two
+   drifting lists would be a deletion bug.
+2. **Make the seeded paths genuinely ignored** by writing them to
+   `.git/info/exclude` at seed time, letting THE-686's existing ignored-only logic
+   handle them with no new special case. Cost: `info/exclude` lives in the **common
+   dir**, so this mutates shared repository state — and **THE-440 ("seed agent
+   permissions without mutating repository") established the opposite principle and
+   has landed.** You must check what THE-440 actually forbids before proposing
+   this; if it rules this out, say so and recommend (1).
 
-- **The query must be bounded** — an explicit timeout and an output cap. A hung
-  container daemon must not hang a sweep; it must become the
-  "could-not-be-queried" refusal.
-- **It must never run on the event loop.** The crate bans blocking child waits
-  outside sanctioned off-loop sites; `clippy.toml` in `crates/thegn-host/`
-  explains the rule and the `#[expect(clippy::disallowed_methods)]` convention
-  with a one-line justification. Read that file before you add a subprocess call,
-  and follow the existing pattern rather than inventing one.
-- **Fail closed on every genuine unknown.** This guard authorises deleting a
-  directory; when in doubt it must refuse. What must stop is refusing when there
-  is no doubt at all.
+Report which you recommend **and why the other was rejected**, with the THE-440
+constraint quoted rather than paraphrased.
+
+## Find the real authority, do not guess the path list
+
+`.claude/commands` and `.claude/skills` are what the primary observed. They are
+almost certainly not the whole set — `.agents/` and `.pi/` were also present as
+ignored entries in a thegn worktree earlier in this chain. **Find the seeding code
+and enumerate what it actually writes**, rather than hard-coding the two paths
+observed from outside. If the seeder has no single list, that absence is itself a
+finding worth reporting: the fix needs one authority.
+
+## The second defect — the message
+
+`Refusal::Dirty` renders as **"edited since landing"**, a claim about something the
+operator did. `thegn merge sweep --help` defines the protected thing as a worktree
+"you have gone back to and edited". Tool-seeded scaffolding is not that, and an
+operator following that message goes looking for changes that do not exist.
+
+Either such a worktree sweeps, or it is refused with a reason that names what is
+actually holding it. Do not leave a refusal that misattributes thegn's own writes
+to the user.
+
+## Hard safety line
+
+This guard authorises deleting a directory.
+
+- A worktree with **genuine** tracked modifications or **genuine** untracked user
+  files must still never be swept, with or without `--force`.
+- A worktree with seeded content **and** real user work must never be swept. Test
+  the mixture explicitly — a per-path classifier that returns "clean" as soon as it
+  finds one seeded path would be a data-loss bug.
 - `--force` bypasses the TTL clock and nothing else.
 
 ## Out of scope
 
-- The other four landed fixes: THE-685's filter drivers, THE-686's
-  `StatusObservation` / `Refusal::Changed`, THE-687's `derive_landed_commit` and
-  landed-OID guards, THE-688's layout teardown. Preserve them; do not refactor.
-- **THE-689** — the accepted session-admission-lock and ghost-tab races. Filed,
-  deliberately deferred, not yours.
-- The `has_cleanup_tenancy` / `has_cleanup_dispatch` predicates, the
-  submodule/special-index guards, TTL arithmetic, branch-retention holds.
+- THE-689 (accepted cleanup races), THE-691 (admission not uniform across the CLI),
+  THE-692 (land records no landed row — in review; do not touch `cmd/land.rs`).
+- The six landed fixes in this chain. Preserve them; do not refactor.
+- Changing any repository's committed `.gitignore`. The fix belongs in thegn, not in
+  asking every project to accommodate it.
 
-## `test/smoke.sh` — read this, it is load-bearing
+## Acceptance criteria
 
-Smoke currently **works around** this bug: it builds a minimal PATH containing
-only `git` and `sh` so the guard cannot fire, with the comment _"Do not let … OCI
-tools installed on the developer's machine imply unresolved runtime custody."_
-That comment describes the defect precisely.
-
-Once the guard is correct, that workaround should no longer be needed to exercise
-a real sweep. Either remove it, or keep it deliberately and say in a comment why.
-Do not leave it there unexamined — and check whether the surrounding sweep cases
-still assert what their names claim.
-
-This matters because smoke has already caught two things in this chain that
-clippy and 9100+ unit tests did not: THE-686's inverted `"sweep --force preserves
-ignored work"` case, and it is the only place the real end-to-end sweep runs.
-
-## Acceptance criteria (from the issue)
-
-- [ ] A merged worktree with no container referencing it is swept once its TTL has
-      elapsed, **on a machine with docker and/or podman installed.**
-- [ ] A worktree bind-mounted by a container (running **or** stopped) is never
+- [ ] A merged worktree whose only non-ignored content is thegn-seeded is swept
+      once its TTL has elapsed, **in a repo that does not gitignore those paths**.
+- [ ] Genuine tracked modifications or genuine untracked user files are still never
       swept, with or without `--force`.
-- [ ] A discoverable-but-unqueryable runtime still refuses, naming that it could
-      not be queried.
-- [ ] No OCI runtime present behaves exactly as today.
-- [ ] The query is bounded (timeout and output cap) and runs off the event loop.
-- [ ] Tests cover: no runtime; runtime with an unrelated container; runtime with a
-      container mounting the worktree; runtime present but unqueryable — **each
-      with and without `--force`.**
-- [ ] The smoke workaround is removed or deliberately retained with a reason.
+- [ ] Seeded content **plus** real user work is never swept.
+- [ ] No refusal reports tool-seeded content as "edited since landing".
+- [ ] The seeded-path set has one authority shared by seeder and consumer.
+- [ ] If direction 2 is chosen, the THE-440 interaction is documented and the
+      mutation justified or avoided.
+- [ ] Tests cover: seeded-only in an ignoring repo; seeded-only in a
+      non-ignoring repo; seeded + untracked user file; seeded + tracked
+      modification — each with and without `--force`.
 
-The tests are a matrix, not four cases. Do not report the row finished with the
-`--force` half missing.
+That is a matrix, not four tests. Do not report the row finished with the `--force`
+half missing.
 
 ## Testing traps, measured in this area
 
-- **Use nextest, never `cargo test`.** `TestIsolation` mutates process-wide env,
-  so threaded `cargo test` cross-contaminates; a `gate_runner` test failed under
-  `cargo test` and passed under nextest.
+- **Use nextest, never `cargo test`.** `TestIsolation` mutates process-wide env.
 - Fixture git commands need `-c commit.gpgsign=false`; global signing is on and an
   unconfigured fixture hangs ~120s instead of failing.
-- `Fixture::probe()` verifies the branch is merged into main. Committing on the
+- `Fixture::probe()` verifies the branch is merged into main; committing on the
   feature branch inside a fixture makes it _unmerged_.
-- Tests must not depend on a container runtime being installed **or** absent on
-  the host — that is the very coupling this issue is about. Inject the PATH and
-  the query result rather than probing the real machine.
+- **`merge_sweep::due` treats `merged_ttl_secs = 0` as "never sweep"**, so a
+  clock-only assertion needs `ttl = 1` plus a real wait. A helper named
+  `sweep_fixture_due` used 0 and made several cases vacuous.
+- **`just smoke` is a real gate here** — it has caught three things in this chain
+  that clippy and 9200+ unit tests did not.
+- **A fixture built from the same mental model as the code proves nothing.**
+  THE-690's parser passed its unit tests and its own smoke shim and still refused
+  everything against the installed `docker`. Your fixture must reproduce a repo
+  that does **not** ignore `.claude/`, which is the condition thegn's own repo
+  hides.
 
 ## Cargo
 
 Attempt `nix develop --command cargo check -p thegn-host --all-targets` and a
 narrow `cargo nextest run -p thegn-host merge_cleanup`. **The pipeline sandbox
-mounts `/nix/store` read-only, so this usually fails outright** — if it does, say
-exactly that and stop. The primary runs all Rust validation, including clippy and
-smoke, centrally.
+mounts `/nix/store` read-only, so this usually fails outright** — say exactly that
+and stop if so. The primary runs clippy, the full workspace nextest and smoke
+centrally.
 
 Never report `implementation-ready` for code you could not compile; state what you
-could not run. Both previous lanes in this chain shipped code that did not compile
-— an ambiguous `Vec::new()`, a by-value row where a reference was wanted, a
-`PathBuf` that was never imported — and the primary caught each. That is the
-expected division of labour, so report honestly rather than optimistically.
+could not run. Every lane in this chain shipped something that did not compile, and
+the primary caught each. That division of labour is expected — report honestly.
