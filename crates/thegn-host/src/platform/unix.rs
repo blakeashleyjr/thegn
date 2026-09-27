@@ -244,6 +244,189 @@ mod proxy_pid_tests {
     }
 }
 
+#[cfg(test)]
+mod pty_owner_tests {
+    use super::*;
+    use crate::pane_pty::PtyProcessOwner;
+    use std::os::unix::process::CommandExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Clone, Debug)]
+    struct CountedChild {
+        child: std::sync::Arc<std::sync::Mutex<std::process::Child>>,
+        waits: std::sync::Arc<AtomicUsize>,
+    }
+
+    impl portable_pty::ChildKiller for CountedChild {
+        fn kill(&mut self) -> std::io::Result<()> {
+            self.child
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .kill()
+        }
+
+        fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
+            Box::new(self.clone())
+        }
+    }
+
+    impl portable_pty::Child for CountedChild {
+        fn try_wait(&mut self) -> std::io::Result<Option<portable_pty::ExitStatus>> {
+            Ok(None)
+        }
+
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test double: counting the reaps of a fixture child the test spawned itself"
+        )]
+        fn wait(&mut self) -> std::io::Result<portable_pty::ExitStatus> {
+            self.waits.fetch_add(1, Ordering::SeqCst);
+            let status = self
+                .child
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .wait()?;
+            Ok(portable_pty::ExitStatus::with_exit_code(
+                status.code().unwrap_or(1) as u32,
+            ))
+        }
+
+        fn process_id(&self) -> Option<u32> {
+            Some(
+                self.child
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .id(),
+            )
+        }
+    }
+
+    #[test]
+    fn concurrent_teardown_reaps_only_the_owned_child_group() {
+        let dir = tempfile::tempdir().expect("fixture directory");
+        let child_pid_file = dir.path().join("grandchild.pid");
+        let script = format!(
+            "trap '' TERM; (trap '' TERM; exec sleep 60) & echo $! > {}; wait",
+            child_pid_file.display()
+        );
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", &script]).process_group(0);
+        let child = command.spawn().expect("spawn owned process group");
+        let pid = child.id();
+        assert!(pid > 0 && pid <= i32::MAX as u32);
+        // The test may signal only the process group created for this fixture.
+        assert_eq!(unsafe { libc::getpgid(pid as i32) }, pid as i32);
+        let owner = PtyProcessOwner::new(Box::new(child), Some(GroupHandle::from_pid(pid as i32)));
+        let owner2 = owner.clone();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !child_pid_file.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let grandchild: u32 = std::fs::read_to_string(&child_pid_file)
+            .expect("grandchild pid published")
+            .trim()
+            .parse()
+            .expect("numeric grandchild pid");
+        assert!(pid_alive(i64::from(grandchild)));
+
+        let a = std::thread::spawn(move || owner.terminate_and_reap());
+        let b = std::thread::spawn(move || owner2.terminate_and_reap());
+        let first = a.join().expect("first teardown thread");
+        let second = b.join().expect("second teardown thread");
+        // The fixture ignores TERM, so it is force-killed — it does NOT exit 0,
+        // and pinning a particular code would pin the shell's signal-reporting
+        // convention rather than anything this code decides. The property under
+        // test is that concurrent teardowns resolve through the one owner: both
+        // observe a status, and both observe the SAME one.
+        assert!(first.is_some(), "first teardown observed no status");
+        assert_eq!(
+            first, second,
+            "concurrent teardowns disagreed on the status"
+        );
+
+        assert!(!pid_alive(i64::from(pid)));
+        // `pid_alive` is `kill(pid, 0)`, which SUCCEEDS for a zombie. SIGKILL is
+        // asynchronous, and once we reap the group leader the grandchild is
+        // reparented to init — so it lingers as a zombie until init reaps it.
+        // Asserting immediately therefore races the kernel rather than the code.
+        // Poll for the pid to disappear, with a bounded deadline: this waits for
+        // an observable state change, which is not the same as padding a test
+        // with a sleep.
+        assert!(
+            awaited_death(i64::from(grandchild)),
+            "the surviving grandchild was not reaped after the group kill"
+        );
+    }
+
+    /// Wait up to two seconds for `pid` to stop existing (not merely to stop
+    /// running — see the note at the call site about zombies).
+    fn awaited_death(pid: i64) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            if !pid_alive(pid) {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        !pid_alive(pid)
+    }
+
+    #[test]
+    fn natural_exit_racing_kill_is_owned_and_reaped_once() {
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", "exit 0"]).process_group(0);
+        let child = command.spawn().expect("spawn isolated race fixture");
+        let pid = child.id();
+        assert!(pid > 0 && pid <= i32::MAX as u32);
+        // The test may signal only the process group created for this fixture.
+        assert_eq!(unsafe { libc::getpgid(pid as i32) }, pid as i32);
+        // Observe natural exit without reaping: the owner must still hold the
+        // child as the process-group identity anchor until teardown completes.
+        let mut exited = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
+        let wait_result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut exited,
+                libc::WEXITED | libc::WNOWAIT,
+            )
+        };
+        assert_eq!(wait_result, 0, "fixture child reached natural exit");
+
+        let waits = std::sync::Arc::new(AtomicUsize::new(0));
+        let owner = PtyProcessOwner::new(
+            Box::new(CountedChild {
+                child: std::sync::Arc::new(std::sync::Mutex::new(child)),
+                waits: waits.clone(),
+            }),
+            Some(GroupHandle::from_pid(pid as i32)),
+        );
+        let killer_owner = owner.clone();
+        let exit_owner = owner.clone();
+        let start = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let killer_start = start.clone();
+        let exit_start = start.clone();
+        let killer = std::thread::spawn(move || {
+            killer_start.wait();
+            killer_owner.terminate_and_reap()
+        });
+        let natural_exit = std::thread::spawn(move || {
+            exit_start.wait();
+            exit_owner.terminate_and_reap()
+        });
+        start.wait();
+
+        assert_eq!(killer.join().expect("Kill teardown thread"), Some(0));
+        assert_eq!(
+            natural_exit.join().expect("natural Exit teardown thread"),
+            Some(0)
+        );
+        assert_eq!(waits.load(Ordering::SeqCst), 1, "child reaped exactly once");
+        assert!(!pid_alive(i64::from(pid)));
+    }
+}
+
 fn checked_positive_pid(pid: u32) -> Option<nix::unistd::Pid> {
     (pid != 0 && pid <= i32::MAX as u32).then(|| nix::unistd::Pid::from_raw(pid as i32))
 }

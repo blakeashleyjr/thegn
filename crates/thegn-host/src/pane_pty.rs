@@ -10,6 +10,7 @@
 use anyhow::{Context, Result};
 use portable_pty::{CommandBuilder, MasterPty, PtySize};
 use std::io::Write;
+use std::sync::{Arc, Mutex};
 use termwiz::terminal::TerminalWaker;
 use tokio::sync::mpsc as tokio_mpsc;
 
@@ -22,11 +23,128 @@ pub(crate) struct PtyHandle {
     pub master: Box<dyn MasterPty + Send>,
     pub writer: Box<dyn Write + Send>,
     pub pid: Option<u32>,
-    /// Set by the reader thread the instant `child.wait()` returns — i.e. the
-    /// instant `pid` stops identifying this child and becomes reusable by the
-    /// OS. The pane's `Drop` reads it so an explicit reap can never signal a
-    /// recycled pid. See [`crate::pane::PtyPane`]'s `Drop`.
-    pub reaped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Shared child/process-group ownership used by every teardown path.
+    pub process: PtyProcessOwner,
+    /// Join receipt for the blocking PTY reader; shared by pane/actor owners.
+    pub reader: PtyReaderJoin,
+}
+
+#[derive(Clone)]
+pub(crate) struct PtyReaderJoin(Arc<Mutex<Option<std::thread::JoinHandle<()>>>>);
+
+impl PtyReaderJoin {
+    fn new(handle: std::thread::JoinHandle<()>) -> Self {
+        Self(Arc::new(Mutex::new(Some(handle))))
+    }
+
+    pub(crate) fn join(&self) {
+        let handle = self
+            .0
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .take();
+        if let Some(handle) = handle {
+            let _ = handle.join();
+        }
+    }
+
+    pub(crate) async fn join_off_runtime(&self) {
+        let receipt = self.clone();
+        let _ = tokio::task::spawn_blocking(move || receipt.join()).await;
+    }
+}
+
+/// Serializes process-group signaling with child reaping. The child handle
+/// anchors the Unix group id until TERM/grace/KILL is complete; Windows keeps
+/// the corresponding Job Object in the platform handle.
+#[derive(Clone)]
+pub(crate) struct PtyProcessOwner(Arc<Mutex<PtyProcessState>>);
+
+struct PtyProcessState {
+    child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
+    group: Option<crate::platform::GroupHandle>,
+    complete: bool,
+    exit_code: Option<i32>,
+}
+
+impl PtyProcessOwner {
+    pub(crate) fn new(
+        child: Box<dyn portable_pty::Child + Send + Sync>,
+        group: Option<crate::platform::GroupHandle>,
+    ) -> Self {
+        Self(Arc::new(Mutex::new(PtyProcessState {
+            child: Some(child),
+            group,
+            complete: false,
+            exit_code: None,
+        })))
+    }
+
+    /// Bounded tree teardown. No wait/reap occurs until after the final group
+    /// signal, keeping the Unix group id anchored to this child; Windows keeps
+    /// the corresponding Job Object in the platform handle.
+    pub(crate) fn terminate_and_reap(&self) -> Option<i32> {
+        let mut state = self.0.lock().unwrap_or_else(|poison| poison.into_inner());
+        if state.complete {
+            return state.exit_code;
+        }
+        if let Some(group) = &state.group {
+            group.terminate();
+        } else if let Some(child) = state.child.as_mut() {
+            let _ = child.kill();
+        }
+        std::thread::sleep(crate::platform::pty_term_grace());
+        if let Some(group) = &state.group {
+            force_kill_group(group);
+        }
+        let code = state
+            .child
+            .as_mut()
+            .and_then(|child| child.wait().ok())
+            .map(|status| status.exit_code() as i32);
+        state.child.take();
+        state.exit_code = code;
+        state.complete = true;
+        code
+    }
+}
+
+impl Drop for PtyProcessState {
+    fn drop(&mut self) {
+        if self.complete {
+            return;
+        }
+        if let Some(group) = &self.group {
+            group.terminate();
+        } else if let Some(child) = self.child.as_mut() {
+            let _ = child.kill();
+        }
+        std::thread::sleep(crate::platform::pty_term_grace());
+        if let Some(group) = &self.group {
+            force_kill_group(group);
+        }
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.wait();
+        }
+    }
+}
+
+/// Force-terminate the whole owned group, unconditionally.
+///
+/// On Unix this group was created by us with `setpgid` and its leader stays
+/// unreaped until after teardown. **A PGID cannot be reused while any member
+/// remains**, so signalling it after the leader exits is safe and is exactly what
+/// stops surviving descendants — unlike a stored *PID*, which can be recycled
+/// once reaped, which is why `terminate_proxy_pid` re-verifies identity first.
+///
+/// On Windows teardown is an immediate Job Object hard kill by design: there is no
+/// graceful TERM interval and no process-group probe to make.
+///
+/// Both platforms therefore do the same thing here, so this deliberately carries
+/// no `#[cfg]` — the difference is in what `GroupHandle::kill` means per platform,
+/// which is `src/platform/`'s business, not this call site's.
+fn force_kill_group(group: &crate::platform::GroupHandle) {
+    group.kill();
 }
 
 /// Spawn `argv` (already composed by `sandbox::enter_argv`) in `cwd` on a fresh
@@ -96,10 +214,12 @@ pub(crate) fn open_pty(
     for (k, v) in env {
         cmd.env(k, v);
     }
-    let mut child = pair.slave.spawn_command(cmd).context("spawn child")?;
+    let child = pair.slave.spawn_command(cmd).context("spawn child")?;
     // Capture the pid before `child` moves into the reader thread below —
     // it's the handle we use to read the pane's live cwd for persistence.
     let pid = child.process_id();
+    let group = crate::platform::pty_group(&*child);
+    let process = PtyProcessOwner::new(child, group);
     // Drop the slave so the master sees EOF when the child exits.
     drop(pair.slave);
 
@@ -110,8 +230,7 @@ pub(crate) fn open_pty(
     // child's. Only `wait()` returning makes the pid reusable, so this flips
     // there and nowhere else — a child dropped un-waited stays a zombie, whose
     // pid is still safe to signal.
-    let reaped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let reaped_reader = std::sync::Arc::clone(&reaped);
+    let process_reader = process.clone();
 
     // Use std::thread::spawn for the reader - it doesn't require a Tokio runtime
     // but can still use blocking_send on the tokio channel. The child handle
@@ -119,7 +238,7 @@ pub(crate) fn open_pty(
     // `wait()` for the child's exit status and report its code (item 524).
     // Blocking the *reader* thread on `wait()` is safe — it's about to end
     // anyway and never touches the event loop.
-    std::thread::spawn(move || {
+    let reader = std::thread::spawn(move || {
         // Contain panics: an unwinding reader must still deliver an Exit
         // event, or the pane freezes silently and anything the thread
         // held is poisoned. A panic degrades into a normal pane exit.
@@ -163,10 +282,7 @@ pub(crate) fn open_pty(
             // Reap the child so the exit carries its real code (None if the
             // status can't be retrieved). u32 → i32 keeps the conventional
             // exit-code range; 0 == success.
-            let code = child.wait().ok().map(|s| s.exit_code() as i32);
-            // The pid is reusable from here on — tell the pane's Drop to stop
-            // treating it as this child's.
-            reaped_reader.store(true, std::sync::atomic::Ordering::SeqCst);
+            let code = process_reader.terminate_and_reap();
             let _ = tx.blocking_send(PaneEvent::Exit(id, code)); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
             if let Some(w) = &waker {
                 let _ = w.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
@@ -185,6 +301,7 @@ pub(crate) fn open_pty(
         master: pair.master,
         writer,
         pid,
-        reaped,
+        process,
+        reader: PtyReaderJoin::new(reader),
     })
 }

@@ -43,6 +43,10 @@ pub(crate) async fn spawn_session(
     service: &DaemonService,
     request: SpawnRequest,
 ) -> ControlResult<SessionInfo> {
+    if !service.accepting.load(std::sync::atomic::Ordering::Acquire) {
+        cleanup_handoff(request.handoff.as_deref());
+        return Err(ControlError::Conflict("daemon is shutting down".into()));
+    }
     if request.argv.is_empty() {
         cleanup_handoff(request.handoff.as_deref());
         return Err(ControlError::Conflict("empty argv".into()));
@@ -73,6 +77,11 @@ pub(crate) async fn spawn_session(
         pid: pty.pid,
         forked_from: request.forked_from,
     };
+    super::pty_diagnostics::record(&service.daemon_id, &request.id, pty.pid, "running", None);
+    // Capture the pid before `pty` moves into the actor below: the
+    // shutdown-refusal diagnostic still needs to name the child. Diagnostics
+    // only — nothing derives a signal target from a recorded pid.
+    let pty_pid = pty.pid;
     let live = Arc::new(Mutex::new(LiveMeta {
         rows: request.rows,
         cols: request.cols,
@@ -92,6 +101,7 @@ pub(crate) async fn spawn_session(
         service.db.clone(),
         service.config.clone(),
         request.handoff,
+        service.daemon_id.clone(),
     );
     let info = {
         let live = live.lock().expect("live meta lock");
@@ -99,7 +109,19 @@ pub(crate) async fn spawn_session(
     };
     // Insert before spawning: actor teardown removes its own entry, so an
     // instantly-exiting child must never race registration and leave a phantom.
-    service.sessions.lock().await.insert(
+    let mut sessions = service.sessions.lock().await;
+    if !service.accepting.load(std::sync::atomic::Ordering::Acquire) {
+        super::pty_diagnostics::record(
+            &service.daemon_id,
+            &request.id,
+            pty_pid,
+            "open_refused_during_shutdown",
+            Some("process_owner_dropped_and_reaped"),
+        );
+        drop(sessions);
+        return Err(ControlError::Conflict("daemon is shutting down".into()));
+    }
+    sessions.insert(
         request.id,
         SessionEntry {
             msg_tx,
@@ -108,7 +130,12 @@ pub(crate) async fn spawn_session(
             recipe: request.recipe,
         },
     );
-    tokio::spawn(actor.run(pane_rx, msg_rx));
+    drop(sessions);
+    let mut actor_tasks = service.actor_tasks.lock().await;
+    actor_tasks.retain(|task| !task.is_finished());
+    let task = tokio::spawn(actor.run(pane_rx, msg_rx));
+    actor_tasks.push(task);
+    drop(actor_tasks);
     service.emit(EventFrame::Sessions);
     Ok(info)
 }

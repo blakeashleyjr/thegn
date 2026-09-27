@@ -20,6 +20,7 @@ pub(crate) mod fork;
 pub(crate) mod inbox;
 pub(crate) mod pipeline_reaper;
 pub(crate) mod pipeline_retry;
+mod pty_diagnostics;
 pub(crate) mod record;
 pub(crate) mod service;
 pub(crate) mod session;
@@ -323,6 +324,8 @@ async fn run(
     let svc = Arc::new(DaemonService {
         daemon_id: daemon_id.clone(),
         sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        actor_tasks: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+        accepting: std::sync::atomic::AtomicBool::new(true),
         tombs: Arc::new(tokio::sync::Mutex::new(
             thegn_core::graveyard::Graveyard::new(
                 tombstone::MAX_TOMBSTONES,
@@ -523,6 +526,11 @@ async fn run(
     )
     .with_graceful_shutdown(async move { shutdown_wait.notified().await });
     let result = serve.await;
+
+    // Signal and idle-exit paths notify the listener directly; this final
+    // coordinator call ensures they share the same actor/process teardown as
+    // the shutdown RPC before registry/lease state is retired.
+    svc.shutdown_sessions().await;
 
     // Cleanup: registry row + socket file. Leases stay only if sessions do —
     // a graceful shutdown killed them, so sweep ours.
