@@ -4574,7 +4574,7 @@ poll_interval_secs = 3
 # [media.mpd]   # native MPD — picks up mpd/mpc/rmpc/ncmpcpp with no mpd-mpris bridge.
 # socket = "127.0.0.1:6600"    # host:port, or an absolute path to MPD's unix socket.
                                # $MPD_HOST / $MPD_PORT override when left at default.
-# password = "hunter2"         # only if your MPD requires one
+# password = "file:~/.config/thegn/secrets/media-mpd.token" # keyring:, env:, file: refs; bare literals remain supported but are warned/migratable
 
 # ── Experimental voice mode ─────────────────────────────────────────────────
 # Toggle-to-talk speech-to-text through two user-supplied commands. Thegn ships
