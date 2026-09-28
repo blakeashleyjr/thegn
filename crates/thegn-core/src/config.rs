@@ -7284,7 +7284,7 @@ fn read_tolerant_config_source(path: &Path) -> Result<Option<String>, String> {
         Err(error) => return Err(format!("cannot read {}: {error}", path.display())),
     };
     if !metadata.file_type().is_file() {
-        let kind = config_source_kind(&metadata);
+        let kind = util::config_source_kind(&metadata);
         return Err(format!(
             "config source is {kind}, not a regular file: {}",
             path.display()
@@ -7313,31 +7313,6 @@ fn read_tolerant_config_source(path: &Path) -> Result<Option<String>, String> {
     String::from_utf8(bytes)
         .map(Some)
         .map_err(|error| format!("cannot read {}: {error}", path.display()))
-}
-
-fn config_source_kind(metadata: &std::fs::Metadata) -> &'static str {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::FileTypeExt;
-        let kind = metadata.file_type();
-        if kind.is_fifo() {
-            return "a FIFO";
-        }
-        if kind.is_socket() {
-            return "a socket";
-        }
-        if kind.is_char_device() {
-            return "a character device";
-        }
-        if kind.is_block_device() {
-            return "a block device";
-        }
-    }
-    if metadata.is_dir() {
-        "a directory"
-    } else {
-        "a non-regular file"
-    }
 }
 
 /// Render a JSON value the way `config get` should print it: bare scalars
