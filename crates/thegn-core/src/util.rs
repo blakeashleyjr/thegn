@@ -107,6 +107,34 @@ pub fn file_identity(path: &std::path::Path) -> Option<String> {
     }
 }
 
+/// Describe why a configuration source's observed metadata is not a regular
+/// file. Keeping the platform-specific file-type vocabulary here avoids
+/// adding platform branches to the configuration module.
+pub(crate) fn config_source_kind(metadata: &std::fs::Metadata) -> &'static str {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+        let kind = metadata.file_type();
+        if kind.is_fifo() {
+            return "a FIFO";
+        }
+        if kind.is_socket() {
+            return "a socket";
+        }
+        if kind.is_char_device() {
+            return "a character device";
+        }
+        if kind.is_block_device() {
+            return "a block device";
+        }
+    }
+    if metadata.is_dir() {
+        "a directory"
+    } else {
+        "a non-regular file"
+    }
+}
+
 pub fn slugify(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut prev_dash = false;
