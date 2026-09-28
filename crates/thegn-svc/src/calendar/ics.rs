@@ -1,14 +1,13 @@
-//! Local `.ics` files.
+//! Bounded local `.ics` files and vdirs.
 //!
-//! `path` may be a single file **or a directory**, and the directory form is
-//! deliberate: one `.ics` per event in a folder is exactly the vdir layout that
-//! vdirsyncer and khal already write, so this one backend transparently serves
-//! anyone with that setup and no extra configuration.
-//!
-//! A thin shell over [`thegn_core::calendar::parse_ics`] — the parsing itself
-//! is pure and lives in core, under the coverage gate.
+//! Files are selected deterministically, opened through core's no-follow
+//! regular-file seam, and admitted whole-account. Any incomplete scan or read
+//! is an error: `EventPage` is complete-or-error, so returning a prefix would
+//! incorrectly authorize replacement of the account cache.
 
 use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use chrono::NaiveDate;
 use futures_util::future::BoxFuture;
@@ -18,22 +17,24 @@ use thegn_core::config_calendar::CalendarAccount;
 
 use super::{AccountAdmission, CalendarBackend, CalendarCaps, CalendarError, EventPage};
 
-/// Cap on files read from a vdir, so a runaway directory can't stall a sync.
-const MAX_FILES: usize = 20_000;
+/// Maximum eligible `.ics` files in one vdir.
+pub const MAX_FILES: usize = 20_000;
+/// Bounds work spent inspecting unrelated names as well as eligible entries.
+pub const MAX_DIRECTORY_ENTRIES: usize = MAX_FILES * 4;
+/// Total bytes accepted from one local source, across all files.
+pub const MAX_AGGREGATE_SOURCE_BYTES: usize = 256 << 20;
+/// Cooperative wall-clock ceiling for directory scan, reads, and parsing.
+pub const SOURCE_DEADLINE: Duration = Duration::from_secs(30);
+const READ_CHUNK_BYTES: usize = 64 * 1024;
 
 pub struct IcsBackend {
     path: String,
-    /// Zone for floating times that name no `TZID`.
     zone: String,
     admission: AccountAdmission,
 }
 
-/// Why one file could not be read.
 enum ReadFailure {
-    /// Unreadable or not UTF-8 — a vdir skips it.
     Io(std::io::Error),
-    /// Over the admission budget — never skipped, or the calendar would look
-    /// complete without it.
     Admission(AdmissionError),
 }
 
@@ -52,57 +53,88 @@ impl IcsBackend {
         self
     }
 
-    /// Read one file under the document budget, reserving the document
-    /// ceiling as transient before any byte is allocated, then parse the
-    /// events that can occur in `window` into `out`.
     fn read_one(
-        path: &std::path::Path,
+        path: &Path,
         zone: &str,
         window: (NaiveDate, NaiveDate),
         meter: &mut AdmissionMeter,
         out: &mut Vec<CalEvent>,
-    ) -> Result<(), ReadFailure> {
-        let file = std::fs::File::open(path).map_err(ReadFailure::Io)?;
-        let declared = file.metadata().map_err(ReadFailure::Io)?.len();
-        let declared = usize::try_from(declared).unwrap_or(usize::MAX);
+        remaining_bytes: usize,
+        deadline: Instant,
+    ) -> Result<usize, ReadFailure> {
+        check_deadline(deadline).map_err(ReadFailure::Io)?;
+        let file = thegn_core::fsperm::open_regular_file_nofollow(path).map_err(ReadFailure::Io)?;
+        let declared =
+            usize::try_from(file.metadata().map_err(ReadFailure::Io)?.len()).unwrap_or(usize::MAX);
         if declared > MAX_SOURCE_DOCUMENT_BYTES {
             return Err(ReadFailure::Admission(AdmissionError::new(
                 AdmissionLimit::DocumentBytes,
             )));
         }
-        // Reserve the ceiling, not the declared size: a file that grows while
-        // being read (or a pseudo-file declaring 0) is still bounded by it,
-        // and `read_capped` never allocates past it.
+        let allowance = remaining_bytes.min(MAX_SOURCE_DOCUMENT_BYTES);
+        if declared > allowance {
+            return Err(ReadFailure::Admission(AdmissionError::new(
+                if remaining_bytes < MAX_SOURCE_DOCUMENT_BYTES {
+                    AdmissionLimit::AggregateSourceBytes
+                } else {
+                    AdmissionLimit::DocumentBytes
+                },
+            )));
+        }
+        if allowance == 0 {
+            return Err(ReadFailure::Admission(AdmissionError::new(
+                AdmissionLimit::AggregateSourceBytes,
+            )));
+        }
         meter
-            .reserve_transient(MAX_SOURCE_DOCUMENT_BYTES)
+            .reserve_transient(allowance)
             .map_err(ReadFailure::Admission)?;
-        let result = match read_capped(file, declared, MAX_SOURCE_DOCUMENT_BYTES) {
+        let result = match read_capped(file, declared, allowance, deadline) {
             Err(e) => Err(ReadFailure::Io(e)),
             Ok(None) => Err(ReadFailure::Admission(AdmissionError::new(
-                AdmissionLimit::DocumentBytes,
+                if remaining_bytes < MAX_SOURCE_DOCUMENT_BYTES {
+                    AdmissionLimit::AggregateSourceBytes
+                } else {
+                    AdmissionLimit::DocumentBytes
+                },
             ))),
-            Ok(Some(body)) => match String::from_utf8(body) {
-                Err(e) => Err(ReadFailure::Io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    e.utf8_error(),
-                ))),
-                Ok(text) => {
-                    thegn_core::calendar::parse_ics_window(&text, zone, Some(window), meter, out)
-                        .map_err(ReadFailure::Admission)
+            Ok(Some(body)) => {
+                let count = body.len();
+                match String::from_utf8(body) {
+                    Err(e) => Err(ReadFailure::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        e.utf8_error(),
+                    ))),
+                    Ok(text) => {
+                        check_deadline(deadline).map_err(ReadFailure::Io)?;
+                        thegn_core::calendar::ics::parse_ics_window_checked(
+                            &text,
+                            zone,
+                            Some(window),
+                            meter,
+                            out,
+                            || {
+                                check_deadline(deadline).map_err(|_| {
+                                    AdmissionError::new(AdmissionLimit::SourceDeadline)
+                                })
+                            },
+                        )
+                        .map_err(ReadFailure::Admission)?;
+                        check_deadline(deadline).map_err(ReadFailure::Io)?;
+                        Ok(count)
+                    }
                 }
-            },
+            }
         };
-        meter.release_transient(MAX_SOURCE_DOCUMENT_BYTES);
+        meter.release_transient(allowance);
         result
     }
 
     fn read_all(&self, window: (NaiveDate, NaiveDate)) -> Result<EventPage, CalendarError> {
-        let p = std::path::Path::new(&self.path);
-        if !p.exists() {
-            // A missing file is configuration, not a blip — see
-            // `CalendarError::is_transient`.
-            return Err(CalendarError::Io(format!("no such path: {}", self.path)));
-        }
+        let p = Path::new(&self.path);
+        let metadata = std::fs::symlink_metadata(p)
+            .map_err(|e| CalendarError::Io(format!("{}: {e}", self.path)))?;
+        let deadline = Instant::now() + SOURCE_DEADLINE;
         let zone = if self.zone.is_empty() {
             "UTC"
         } else {
@@ -110,9 +142,18 @@ impl IcsBackend {
         };
         let mut meter = self.admission.meter();
         let mut out = Vec::new();
-        if p.is_file() {
-            match Self::read_one(p, zone, window, &mut meter, &mut out) {
-                Ok(()) => {}
+
+        if metadata.file_type().is_file() {
+            match Self::read_one(
+                p,
+                zone,
+                window,
+                &mut meter,
+                &mut out,
+                MAX_AGGREGATE_SOURCE_BYTES,
+                deadline,
+            ) {
+                Ok(_) => {}
                 Err(ReadFailure::Io(e)) => {
                     return Err(CalendarError::Io(format!("{}: {e}", self.path)));
                 }
@@ -120,24 +161,67 @@ impl IcsBackend {
             }
             return EventPage::from_meter(meter, out, Vec::new(), String::new());
         }
+        if !metadata.file_type().is_dir() {
+            return Err(CalendarError::Io(format!(
+                "{} is not a regular calendar file or directory",
+                self.path
+            )));
+        }
+
         let entries =
             std::fs::read_dir(p).map_err(|e| CalendarError::Io(format!("{}: {e}", self.path)))?;
-        for entry in entries.flatten().take(MAX_FILES) {
+        let mut candidates = Vec::new();
+        let mut visited = 0;
+        for entry in entries {
+            check_deadline(deadline)
+                .map_err(|e| CalendarError::Io(format!("{}: {e}", self.path)))?;
+            let entry = entry.map_err(|e| CalendarError::Io(format!("{}: {e}", self.path)))?;
+            visited += 1;
+            if visited > MAX_DIRECTORY_ENTRIES {
+                return Err(CalendarError::Io(format!(
+                    "{} has more than {MAX_DIRECTORY_ENTRIES} directory entries",
+                    self.path
+                )));
+            }
             let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("ics") {
+            if path.extension().is_none_or(|ext| ext != "ics") {
                 continue;
             }
-            match Self::read_one(&path, zone, window, &mut meter, &mut out) {
-                Ok(()) => {}
-                // One unreadable file in a vdir must not lose the other hundred.
-                Err(ReadFailure::Io(e)) => tracing::debug!(
-                    target: "thegn::calendar",
-                    file = %path.display(),
-                    error = %e,
-                    "skipping unreadable .ics"
-                ),
-                // But an over-budget one stops the whole fetch: publishing the
-                // rest would present a partial calendar as complete.
+            let meta = std::fs::symlink_metadata(&path)
+                .map_err(|e| CalendarError::Io(format!("{}: {e}", path.display())))?;
+            if meta.file_type().is_symlink() {
+                return Err(CalendarError::Io(format!(
+                    "{} is a symlink, not a regular calendar file",
+                    path.display()
+                )));
+            }
+            if !meta.file_type().is_file() {
+                return Err(CalendarError::Io(format!(
+                    "{} is not a regular calendar file",
+                    path.display()
+                )));
+            }
+            candidates.push(path);
+        }
+        candidates = select_candidates(candidates)?;
+        let mut total_bytes = 0usize;
+        for path in candidates {
+            check_deadline(deadline)
+                .map_err(|e| CalendarError::Io(format!("{}: {e}", self.path)))?;
+            let remaining = MAX_AGGREGATE_SOURCE_BYTES.saturating_sub(total_bytes);
+            match Self::read_one(
+                path.as_path(),
+                zone,
+                window,
+                &mut meter,
+                &mut out,
+                remaining,
+                deadline,
+            ) {
+                Ok(n) => total_bytes += n,
+                Err(ReadFailure::Io(e)) => {
+                    return Err(CalendarError::Io(format!("{}: {e}", path.display())));
+                }
                 Err(ReadFailure::Admission(e)) => return Err(e.into()),
             }
         }
@@ -145,21 +229,41 @@ impl IcsBackend {
     }
 }
 
-/// Read at most `limit` bytes; `Ok(None)` when the source holds more.
-///
-/// Growth is explicit and capped, so the buffer's capacity never exceeds
-/// `limit` even for a file that declared a smaller size (or none — a
-/// pseudo-file) and kept growing; `read_to_end`'s doubling could reach twice
-/// the cap.
+fn select_candidates(mut paths: Vec<PathBuf>) -> Result<Vec<PathBuf>, CalendarError> {
+    paths.sort();
+    paths.dedup();
+    if paths.len() > MAX_FILES {
+        return Err(CalendarError::Io(format!(
+            "vdir has {} eligible calendar files; limit is {MAX_FILES}",
+            paths.len()
+        )));
+    }
+    Ok(paths)
+}
+
+fn check_deadline(deadline: Instant) -> std::io::Result<()> {
+    if Instant::now() >= deadline {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "local calendar source exceeded its time budget",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+/// Capped growth avoids `read_to_end` capacity doubling past the admitted size.
 fn read_capped(
-    mut r: impl Read,
+    mut reader: impl Read,
     declared: usize,
     limit: usize,
+    deadline: Instant,
 ) -> std::io::Result<Option<Vec<u8>>> {
-    let mut body: Vec<u8> = Vec::with_capacity(declared.min(limit));
-    let mut chunk = [0u8; 64 * 1024];
+    let mut body = Vec::with_capacity(declared.min(limit));
+    let mut chunk = [0u8; READ_CHUNK_BYTES];
     loop {
-        let n = match r.read(&mut chunk) {
+        check_deadline(deadline)?;
+        let n = match reader.read(&mut chunk) {
             Ok(0) => return Ok(Some(body)),
             Ok(n) => n,
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -169,7 +273,11 @@ fn read_capped(
             return Ok(None);
         }
         if body.capacity() - body.len() < n {
-            let grown = (body.capacity().max(64 * 1024) * 2).min(limit);
+            let grown = body
+                .capacity()
+                .max(READ_CHUNK_BYTES)
+                .saturating_mul(2)
+                .min(limit);
             body.reserve_exact(grown.max(body.len() + n) - body.len());
         }
         body.extend_from_slice(&chunk[..n]);
@@ -180,7 +288,6 @@ impl CalendarBackend for IcsBackend {
     fn provider_id(&self) -> &'static str {
         "ics"
     }
-
     fn caps(&self) -> CalendarCaps {
         CalendarCaps::default()
     }
@@ -191,12 +298,28 @@ impl CalendarBackend for IcsBackend {
         to: NaiveDate,
         _sync_token: &'a str,
     ) -> BoxFuture<'a, Result<EventPage, CalendarError>> {
-        Box::pin(async move {
-            // Admits every event that can occur in the window — including
-            // recurrence masters that start far before it — and releases the
-            // provably-outside history, so `max_events` counts what the sync
-            // horizon needs. The host expands and filters.
-            self.read_all((from, to))
-        })
+        Box::pin(async move { self.read_all((from, to)) })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn candidate_selection_is_stable_and_refuses_truncation() {
+        let names = ["z.ics", "a.ics", "m.ics"];
+        let first = select_candidates(names.iter().map(PathBuf::from).collect()).unwrap();
+        let second = select_candidates(names.iter().rev().map(PathBuf::from).collect()).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first[0], PathBuf::from("a.ics"));
+        let excess = (0..=MAX_FILES)
+            .map(|n| PathBuf::from(format!("{n:05}.ics")))
+            .collect();
+        assert!(matches!(
+            select_candidates(excess),
+            Err(CalendarError::Io(_))
+        ));
+        assert_eq!(MAX_DIRECTORY_ENTRIES, MAX_FILES * 4);
     }
 }
