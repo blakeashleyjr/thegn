@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 use chrono::{Datelike, NaiveDate};
 use termwiz::terminal::TerminalWaker;
-use thegn_core::calendar::{CalEvent, ExpansionError};
+use thegn_core::calendar::{CalEvent, CalendarWindow, ExpansionError};
 use thegn_core::config_calendar::CalendarConfig;
 use thegn_core::db::Db;
 use thegn_core::store::{CalendarRow, CalendarStore};
@@ -110,7 +110,10 @@ pub(crate) fn expand_month(
     to: NaiveDate,
     home: chrono_tz::Tz,
 ) -> MonthView {
-    let cached = match load_cached(db, from, to) {
+    let Some(window) = CalendarWindow::new(from, to, home) else {
+        return MonthView::failed(CalendarViewError::InvalidWindow);
+    };
+    let cached = match load_cached_window(db, window) {
         Ok(cached) => cached,
         Err(error) => return MonthView::failed(error),
     };
@@ -267,6 +270,10 @@ fn sync_accounts_with_generation(
     generation: Option<&crate::hydrate_schedule::ScheduleFence>,
     notify: &mut dyn FnMut(String),
 ) -> bool {
+    let Some(window) = CalendarWindow::new(from, to, home_zone(cfg)) else {
+        tracing::warn!(target: "thegn::calendar", "invalid home-zone calendar window; skipping sync");
+        return false;
+    };
     let accounts = cfg.active_accounts();
     if accounts.is_empty() {
         return false;
@@ -331,7 +338,7 @@ fn sync_accounts_with_generation(
     // Each account's page is applied and dropped inside the sink, releasing its
     // share of the global admission budget before the next account is fetched.
     let mut changed = false;
-    rt.block_on(router.list_events_each(from, to, &tokens, |r| {
+    rt.block_on(router.list_events_each(window, &tokens, |r| {
         let mut page = match r.result {
             Ok(p) => {
                 thegn_core::connectivity::report_success();
@@ -368,7 +375,7 @@ fn sync_accounts_with_generation(
                 "cache rows exceed the shared budget — writing them anyway"
             );
         }
-        if apply_page_with_generation(db, &r.account, r.provider, &page, from, to, generation) {
+        if apply_page_with_generation(db, &r.account, r.provider, &page, window, generation) {
             changed = true;
         }
     }));
@@ -438,7 +445,10 @@ fn apply_page(
     from: NaiveDate,
     to: NaiveDate,
 ) -> bool {
-    apply_page_with_generation(db, account, provider, page, from, to, None)
+    let Some(window) = CalendarWindow::new(from, to, chrono_tz::Tz::UTC) else {
+        return false;
+    };
+    apply_page_with_generation(db, account, provider, page, window, None)
 }
 
 fn apply_page_with_generation(
@@ -446,11 +456,10 @@ fn apply_page_with_generation(
     account: &str,
     provider: &str,
     page: &EventPage,
-    from: NaiveDate,
-    to: NaiveDate,
+    window: CalendarWindow,
     generation: Option<&crate::hydrate_schedule::ScheduleFence>,
 ) -> bool {
-    let (from_ms, to_ms) = (day_ms(from), day_ms(to));
+    let (from_ms, to_ms) = (window.start_ms, window.end_exclusive_ms);
 
     // A conditional fetch that came back 304: nothing to write, but the sync
     // stamp must still advance or we would re-hit the provider every tick.
@@ -536,9 +545,27 @@ pub(crate) struct Cached {
 /// deserialize (a newer schema, a corrupt write) is skipped rather than
 /// losing the whole month, but counted, so the caller can say the view is
 /// incomplete instead of presenting it as complete.
+///
+/// Date-taking convenience for the cache-mechanics tests (row counts, deserialize
+/// failures). **UTC only** — production always goes through `load_cached_window`
+/// with the home-zone window, and zone behaviour is covered by the explicit-zone
+/// endpoint/DST tests rather than by this wrapper.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "date-taking cache wrapper used only by the hydrate_calendar tests"
+    )
+)]
 fn load_cached(db: &Db, from: NaiveDate, to: NaiveDate) -> Result<Cached, CalendarViewError> {
+    let window = CalendarWindow::new(from, to, chrono_tz::Tz::UTC)
+        .ok_or(CalendarViewError::InvalidWindow)?;
+    load_cached_window(db, window)
+}
+
+fn load_cached_window(db: &Db, window: CalendarWindow) -> Result<Cached, CalendarViewError> {
     let rows = db
-        .get_calendar_events(day_ms(from), day_ms(to).saturating_add(86_400_000), &[])
+        .get_calendar_events(window.start_ms, window.end_exclusive_ms, &[])
         .map_err(|_| CalendarViewError::CacheUnavailable)?;
     let mut cached = Cached {
         events: Vec::with_capacity(rows.len()),
@@ -806,7 +833,8 @@ pub(crate) fn due_reminders(
         today.pred_opt().unwrap_or(today),
         today.succ_opt().unwrap_or(today),
     );
-    let cached = load_cached(db, from, to)?;
+    let range = CalendarWindow::new(from, to, home).ok_or(CalendarViewError::InvalidWindow)?;
+    let cached = load_cached_window(db, range)?;
     let expanded = thegn_core::calendar::expand_calendar(&cached.events, from, to, home)
         .map_err(CalendarViewError::Expansion)?;
     Ok(DueReminders {
@@ -848,13 +876,6 @@ fn horizon(cfg: &CalendarConfig, today: NaiveDate) -> (NaiveDate, NaiveDate) {
 fn home_zone(cfg: &CalendarConfig) -> chrono_tz::Tz {
     cfg.home_zone()
         .unwrap_or_else(thegn_core::calendar::tz::system_zone)
-}
-
-/// Midnight UTC on `d`, in unix ms.
-fn day_ms(d: NaiveDate) -> i64 {
-    d.and_hms_opt(0, 0, 0)
-        .map(|t| t.and_utc().timestamp_millis())
-        .unwrap_or(0)
 }
 
 fn deliver(
