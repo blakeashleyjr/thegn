@@ -74,6 +74,7 @@ mod tests {
     #[test]
     fn enabled_builders_appear_in_the_host_tab_order() {
         let mut cfg = Config::default();
+        assert!(builder("observe").is_some(), "observe is a known candidate");
         assert_eq!(enabled(&cfg).count(), 0, "apps are opt-in");
         cfg.observe.enabled = true;
         let ids: Vec<&str> = enabled(&cfg).map(|b| b.id).collect();
