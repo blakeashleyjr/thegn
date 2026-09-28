@@ -1505,11 +1505,23 @@ pre_create = [
             "[observe]\nenabled = true\n[apps]\ndefault_tab = \"observe\"\ntab_order = [\"observe\", \"work\", \"observe\"]\n",
         )
         .unwrap();
-        assert_eq!(cfg.apps.effective_tab_order(), ["observe", "work"]);
+        assert_eq!(
+            cfg.apps.effective_tab_order(cfg.observe.enabled),
+            ["observe", "work"]
+        );
         assert!(validate_str(
             "[observe]\nenabled = true\n[apps]\ndefault_tab = \"observe\"\ntab_order = [\"observe\", \"work\", \"observe\"]\n"
         )
         .is_empty());
+
+        // Mentioning a known but disabled app in the order is harmless; the
+        // app's own enable flag controls membership.
+        let disabled = toml::from_str::<Config>("[apps]\ntab_order = [\"observe\"]\n").unwrap();
+        assert!(validate_str("[apps]\ntab_order = [\"observe\"]\n").is_empty());
+        assert_eq!(
+            disabled.apps.effective_tab_order(disabled.observe.enabled),
+            ["work"]
+        );
     }
 
     #[test]

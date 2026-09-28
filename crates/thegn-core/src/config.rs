@@ -3526,7 +3526,7 @@ pub struct AppsConfig {
     /// Tab focused on startup. Valid ids come from `BUILTIN_TABS`.
     #[schemars(with = "AppTabId")]
     pub default_tab: String,
-    /// Ordered top-level tab ids. Unlisted known tabs stay disabled; duplicates are ignored.
+    /// Order for `work` and enabled apps. Enabled but unlisted apps are appended; duplicates are ignored.
     #[schemars(with = "Vec<AppTabId>")]
     pub tab_order: Vec<String>,
 }
@@ -3546,14 +3546,12 @@ impl AppsConfig {
     /// generated schema. It does not answer either of the other two questions:
     /// the app builder's `enabled` predicate (through `registry::enabled` in
     /// the host) decides whether a known app is registered, while
-    /// `effective_tab_order()` resolves the configured order among known ids
-    /// and `DEFAULT_TAB_ORDER` supplies that order when config omits one. The
-    /// host reconciler applies that order to the enabled set. Keeping these
-    /// separate prevents a newly known app from silently appearing in existing
-    /// users' UI.
+    /// `<app>.enabled` decides which apps are on (off by default), and
+    /// `effective_tab_order()` orders `work` plus those enabled apps according
+    /// to `[apps]`, appending enabled but unlisted apps in catalog order.
+    /// Keeping existence, enablement, and ordering separate means adding a
+    /// known-but-disabled app does not change existing users' UI.
     pub const BUILTIN_TABS: [&'static str; 2] = ["work", "observe"];
-
-    const DEFAULT_TAB_ORDER: [&'static str; 1] = ["work"];
 
     pub fn validate(&self, observe_enabled: bool) -> Vec<String> {
         let mut errors = Vec::new();
@@ -3581,31 +3579,37 @@ impl AppsConfig {
         errors
     }
 
-    pub fn effective_tab_order(&self) -> Vec<String> {
+    pub fn effective_tab_order(&self, observe_enabled: bool) -> Vec<String> {
         let mut out = Vec::new();
         for id in &self.tab_order {
             let id = id.trim();
-            if Self::BUILTIN_TABS.contains(&id) && !out.iter().any(|existing| existing == id) {
+            if Self::BUILTIN_TABS.contains(&id)
+                && (id == "work" || (id == "observe" && observe_enabled))
+                && !out.iter().any(|existing| existing == id)
+            {
                 out.push(id.to_string());
             }
         }
-        if out.is_empty() {
-            // `BUILTIN_TABS` answers which ids are known; only the explicit
-            // default list determines which tab exists without user config.
-            out.extend(Self::DEFAULT_TAB_ORDER.iter().map(|id| (*id).to_owned()));
+        // Membership comes from `work` plus enabled apps, never from the order
+        // list. This also preserves apps added to the registry when a user's
+        // older config has no explicit `[apps]` entry for them.
+        for id in Self::BUILTIN_TABS {
+            if (id == "work" || (id == "observe" && observe_enabled))
+                && !out.iter().any(|existing| existing == id)
+            {
+                out.push(id.to_owned());
+            }
         }
         out
     }
 
-    pub fn normalized_default_tab(&self) -> String {
+    pub fn normalized_default_tab(&self, observe_enabled: bool) -> String {
         let default = self.default_tab.trim();
-        if self.effective_tab_order().iter().any(|id| id == default) {
+        let order = self.effective_tab_order(observe_enabled);
+        if order.iter().any(|id| id == default) {
             default.to_string()
         } else {
-            self.effective_tab_order()
-                .into_iter()
-                .next()
-                .unwrap_or_else(|| "work".into())
+            order.into_iter().next().unwrap_or_else(|| "work".into())
         }
     }
 }
