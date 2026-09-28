@@ -1016,6 +1016,53 @@ pub(crate) fn migrate_v69(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// v70: the supervisor's two ledgers — what validation established about a
+/// lane, and who approved which commit.
+///
+/// Additive and idempotent like every other shared-state migration here: two
+/// new tables, nothing existing altered, so a DB opened by an older build keeps
+/// working and this one re-runs harmlessly.
+///
+/// Both tables are keyed on a **commit**, which is the whole point. A
+/// validation result and an approval are statements about a specific tree; key
+/// them on the lane or the row instead and a stale result silently authorizes
+/// work on code nobody checked. The `UNIQUE` constraints encode that: one
+/// current result per (row, task, commit), one approval per (lane, stage,
+/// commit).
+pub(crate) fn migrate_v70(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS pipeline_validations (
+           id           INTEGER PRIMARY KEY AUTOINCREMENT,
+           dispatch_id  INTEGER NOT NULL,
+           task         TEXT    NOT NULL,
+           commit_sha   TEXT    NOT NULL,
+           class        TEXT    NOT NULL,
+           exit_code    INTEGER,
+           digest       TEXT    NOT NULL DEFAULT '',
+           attempts     INTEGER NOT NULL DEFAULT 1,
+           ran_at_ms    INTEGER NOT NULL,
+           UNIQUE (dispatch_id, task, commit_sha)
+         );
+         CREATE INDEX IF NOT EXISTS idx_pipeline_validations_dispatch
+           ON pipeline_validations (dispatch_id, ran_at_ms DESC);
+         CREATE TABLE IF NOT EXISTS pipeline_approvals (
+           id             INTEGER PRIMARY KEY AUTOINCREMENT,
+           issue_id       TEXT    NOT NULL,
+           stage          TEXT    NOT NULL,
+           commit_sha     TEXT    NOT NULL,
+           approver       TEXT    NOT NULL,
+           note           TEXT,
+           granted_at_ms  INTEGER NOT NULL,
+           expires_at_ms  INTEGER,
+           revoked_at_ms  INTEGER,
+           UNIQUE (issue_id, stage, commit_sha)
+         );
+         CREATE INDEX IF NOT EXISTS idx_pipeline_approvals_lane
+           ON pipeline_approvals (issue_id, stage, granted_at_ms DESC);",
+    )?;
+    Ok(())
+}
+
 /// Verify the v69 identity ledger before the schema version is stamped. A
 /// missing column/table must never look like a completed migration.
 pub(crate) fn verify_v69_schema(conn: &Connection) -> Result<()> {

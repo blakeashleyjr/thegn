@@ -94,6 +94,97 @@ pub struct PipelineStage {
     /// (`Bash(git status:*)`, `Read`, `mcp__srv__tool`). Empty = the entry's
     /// list, if any.
     pub permissions: Vec<String>,
+    /// `[[tasks]]` entry names to run against this stage's lane once its worker
+    /// exits — the compile/test/lint pass the worker could not run itself (the
+    /// pipeline sandbox mounts the Nix store read-only, so `nix develop` cannot
+    /// materialise a shell inside it, and a worker's "implementation-ready"
+    /// therefore means *source-reviewed, never built*).
+    ///
+    /// Names entries, **not shell commands** — the same closed-registry rule
+    /// [`PipelineStage::agent`] follows, and for the same reason: a stage must
+    /// not be able to introduce arbitrary command execution from config. The
+    /// named task owns its own scoping, caps and output matcher.
+    ///
+    /// Empty = this stage's output is not machine-checkable, which is the right
+    /// answer for a planning stage that produces prose.
+    pub validate: Vec<String>,
+    /// What must already be a **recorded fact** before the supervisor may
+    /// dispatch INTO this stage. A closed vocabulary — see [`Requirement`] —
+    /// checked at config-validate time rather than discovered at dispatch.
+    ///
+    /// This is where a review gate is expressed. `requires = ["approval"]` says
+    /// "a person reads the parent's output before this stage starts", and
+    /// because it is data, a chart documents its own gates instead of relying on
+    /// a supervisor's restraint.
+    ///
+    /// Empty = the supervisor may advance into this stage as soon as its parent
+    /// row is closed.
+    pub requires: Vec<String>,
+}
+
+/// A precondition a stage transition must satisfy before the supervisor may
+/// dispatch it.
+///
+/// Closed on purpose. Each variant names a fact that is **recorded** somewhere
+/// checkable — git, the roster, the validation table, the approval table — so
+/// that deciding whether a transition may happen is a lookup rather than a
+/// judgement. A requirement the supervisor could satisfy only by forming an
+/// opinion does not belong in this enum, and that line is what the whole
+/// supervisor design rests on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Requirement {
+    /// The parent row's handoff artifact exists, is committed in `HEAD`, and is
+    /// unchanged at that path — what `dispatch verify` reports.
+    ParentArtifact,
+    /// The parent row carries a worker report — what the done-gate checks.
+    ParentReport,
+    /// Every `[[tasks]]` entry in the parent stage's `validate` recorded
+    /// [`crate::pipeline_validate::ValidationClass::Green`] for the parent's
+    /// current tip. An environment error does **not** satisfy this: "the
+    /// command never ran" is not "the code passed".
+    ValidationGreen,
+    /// A live, commit-bound approval exists for the parent stage's output at the
+    /// lane's current tip (see [`crate::pipeline_approval`]).
+    Approval,
+}
+
+impl Requirement {
+    /// Every requirement, in the order they are reported.
+    pub const ALL: [Requirement; 4] = [
+        Self::ParentArtifact,
+        Self::ParentReport,
+        Self::ValidationGreen,
+        Self::Approval,
+    ];
+
+    /// The stable config spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ParentArtifact => "parent_artifact",
+            Self::ParentReport => "parent_report",
+            Self::ValidationGreen => "validation:green",
+            Self::Approval => "approval",
+        }
+    }
+
+    /// Parse a configured requirement. `None` for anything outside the set — a
+    /// typo must be an error naming the known values, never a requirement that
+    /// silently never applies, which would read as a gate present in the file
+    /// and absent in effect.
+    pub fn parse(s: &str) -> Option<Requirement> {
+        let s = s.trim();
+        Self::ALL.into_iter().find(|r| r.as_str() == s)
+    }
+
+    /// The known values, comma-separated, for an error message.
+    pub fn known_values() -> String {
+        Self::ALL
+            .iter()
+            .map(|r| r.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
 }
 
 impl Default for PipelineStage {
@@ -110,7 +201,31 @@ impl Default for PipelineStage {
             model: None,
             env: BTreeMap::new(),
             permissions: Vec::new(),
+            validate: Vec::new(),
+            requires: Vec::new(),
         }
+    }
+}
+
+impl PipelineStage {
+    /// This stage's parsed requirements, dropping anything unrecognised.
+    /// Callers that must *report* a bad value run [`Requirement::parse`] over
+    /// the raw strings instead: validation names the typo, execution ignores it
+    /// — having already refused to run a config that carries one.
+    pub fn parsed_requires(&self) -> Vec<Requirement> {
+        self.requires
+            .iter()
+            .filter_map(|r| Requirement::parse(r))
+            .collect()
+    }
+
+    /// The `[[tasks]]` names this stage validates with, trimmed and non-empty.
+    pub fn validate_tasks(&self) -> Vec<&str> {
+        self.validate
+            .iter()
+            .map(|t| t.trim())
+            .filter(|t| !t.is_empty())
+            .collect()
     }
 }
 
@@ -142,6 +257,136 @@ pub struct Pipeline {
     /// `waiting_human` + a `note` (it can park a row, never finish one), and
     /// the retry budget/backoff/lists are data an operator tunes.
     pub transport_retry: TransportRetry,
+    /// `[pipeline.supervisor]` — the mechanical half of the chart, run
+    /// durably. Off by default; see [`Supervisor`].
+    pub supervisor: Supervisor,
+}
+
+/// `[pipeline.supervisor]` — whether thegn itself performs the parts of a
+/// pipeline that are **rules rather than judgement**, and which of them.
+///
+/// # Why this does not contradict "structure, not judgment"
+///
+/// This module's header states that no thegn code path advances `next`, and
+/// that was a deliberate rejection of a native drain driver ("every driver
+/// feature hard-codes judgement the prompt should own"). The supervisor does
+/// not weaken that rule; it applies the exception the daemon's reaper already
+/// carved, which is that a transition may be applied when *"applying it is
+/// arithmetic on recorded facts, not a judgement about whether the work was any
+/// good"* (`daemon/pipeline_reaper.rs`).
+///
+/// Everything the supervisor may do is gated on facts that are already written
+/// down: an artifact committed in git, a report on the roster, a recorded
+/// validation class, a commit-bound approval. The judgement — *should this
+/// advance?* — is expressed by the operator in each stage's
+/// [`PipelineStage::requires`], in the config file, in advance. The supervisor
+/// never forms one, and in particular has no path that can create an approval:
+/// granting is an operator-scoped write on a surface the daemon does not hold.
+///
+/// With `enabled = false` (the default) nothing here runs and the pipeline
+/// behaves exactly as it did before the section existed.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct Supervisor {
+    /// Master switch. `false` (the default) = the supervisor never acts;
+    /// `thegn supervise plan` still reports what it *would* do, which is how an
+    /// operator reads the chart's behaviour before trusting it with it.
+    pub enabled: bool,
+    /// Run each stage's `validate` tasks when its worker exits, and record what
+    /// came back. The one capability that is pure observation — it writes no
+    /// roster status and dispatches nothing.
+    pub validate_on_exit: bool,
+    /// Dispatch a stage's `next` once every requirement that stage declares is
+    /// a recorded fact. `false` = validation still runs and is recorded, but
+    /// every transition stays an explicit act by a person or an agent.
+    pub advance: bool,
+    /// Enqueue a terminal stage's lane onto the merge queue once its
+    /// requirements are met. The supervisor never lands anything itself: the
+    /// queue owns serialization and the fold gate, so this is a hand-off, not a
+    /// second landing path.
+    pub land: bool,
+    /// How long a recorded approval stays valid, in seconds. `0` = no age
+    /// bound. An approval is always **also** invalidated by a new commit on the
+    /// lane, which is the bound that actually matters; this one only stops a
+    /// long-forgotten approval from authorizing work after the context around
+    /// it has moved on.
+    #[schemars(range(max = "crate::time_policy::MAX_DURATION_SECS"))]
+    pub approval_ttl_secs: u64,
+    /// How many validation runs may be in flight at once, across every lane.
+    /// `0` = follow `[limits] test_max_parallel`.
+    ///
+    /// The default of one is not timidity: a full-workspace compile is the most
+    /// expensive thing this tool does, several at once is what pins every core
+    /// and drives the box into swap, and — worse — a gate run under that
+    /// contention goes red for reasons that have nothing to do with the code,
+    /// which is precisely the false verdict [`crate::pipeline_validate`] exists
+    /// to avoid emitting.
+    pub max_validations: u32,
+    /// What must be a recorded fact about a **terminal** stage's row before its
+    /// lane may be handed to the merge queue.
+    ///
+    /// Landing is one act at the end of the chart rather than a stage, so it
+    /// carries its own gate instead of borrowing a stage's `requires`. Same
+    /// closed vocabulary ([`Requirement`]), evaluated against the terminal row
+    /// itself — the row whose output is being consumed, which for a land is the
+    /// lane's final commit.
+    ///
+    /// Defaults to requiring an approval, and that default is the point:
+    /// switching the supervisor on must not, by itself, start landing code
+    /// nobody has read.
+    pub land_requires: Vec<String>,
+}
+
+impl Supervisor {
+    /// The parsed `land_requires`, dropping anything unrecognised — validation
+    /// names the typo, execution ignores it, having already refused to run a
+    /// config that carries one.
+    pub fn parsed_land_requires(&self) -> Vec<Requirement> {
+        self.land_requires
+            .iter()
+            .filter_map(|r| Requirement::parse(r))
+            .collect()
+    }
+}
+
+impl Default for Supervisor {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            validate_on_exit: true,
+            advance: true,
+            land: true,
+            approval_ttl_secs: default_approval_ttl_secs(),
+            max_validations: 1,
+            land_requires: vec![Requirement::Approval.as_str().to_string()],
+        }
+    }
+}
+
+/// One day. Long enough that an approval survives an overnight queue, short
+/// enough that a forgotten one does not authorize work a week later.
+const fn default_approval_ttl_secs() -> u64 {
+    86_400
+}
+
+impl Supervisor {
+    /// The effective validation concurrency, resolving `0` against the
+    /// machine-wide `[limits] test_max_parallel` and never returning zero (a
+    /// ceiling of zero would mean nothing ever validates, which is a stall, not
+    /// a setting).
+    pub fn effective_max_validations(&self, limits_test_max_parallel: usize) -> usize {
+        if self.max_validations > 0 {
+            self.max_validations as usize
+        } else {
+            limits_test_max_parallel.max(1)
+        }
+    }
+
+    /// Whether any capability is switched on. A section that is `enabled` with
+    /// every capability off does nothing, which validation reports.
+    pub fn any_capability(&self) -> bool {
+        self.validate_on_exit || self.advance || self.land
+    }
 }
 
 /// `[pipeline.transport_retry]` — the daemon-side auto-retry for headless
@@ -420,6 +665,170 @@ pub fn validate_pipeline(cfg: &Config) -> Vec<String> {
     }
     out.extend(cycle_errors(stages));
     out.extend(validate_transport_retry(&cfg.pipeline.transport_retry));
+    out.extend(validate_supervisor(cfg));
+    out
+}
+
+/// `[pipeline.supervisor]` + the per-stage `validate`/`requires` it acts on.
+///
+/// Every rule here exists to make an **unsatisfiable** configuration a loud
+/// error at validate time rather than a silent stall at run time. A stage whose
+/// requirement can never be met does not "hold work back safely" — it holds it
+/// back invisibly, and the operator finds out when nothing has moved for a day.
+/// That is the same reasoning `concurrency = 0` is refused under.
+fn validate_supervisor(cfg: &Config) -> Vec<String> {
+    let stages = &cfg.pipeline.stages;
+    let sup = &cfg.pipeline.supervisor;
+    let mut out = Vec::new();
+
+    if sup.enabled && !sup.any_capability() {
+        out.push(
+            "pipeline.supervisor: enabled with validate_on_exit, advance and land all false \
+             — that configuration does nothing; set enabled = false instead"
+                .to_string(),
+        );
+    }
+
+    // `land_requires` shares `requires`' closed vocabulary. An unrecognised
+    // entry here is worse than elsewhere: it reads as a landing gate in the
+    // file and is no gate at all in effect.
+    let mut seen_land: Vec<Requirement> = Vec::new();
+    for (j, r) in sup.land_requires.iter().enumerate() {
+        match Requirement::parse(r) {
+            None => out.push(format!(
+                "pipeline.supervisor.land_requires[{j}]: {:?} is not a known requirement — \
+                 known values: {}",
+                r.trim(),
+                Requirement::known_values()
+            )),
+            Some(req) if seen_land.contains(&req) => out.push(format!(
+                "pipeline.supervisor.land_requires[{j}]: duplicate requirement {:?}",
+                req.as_str()
+            )),
+            Some(req) => seen_land.push(req),
+        }
+    }
+    // Nothing is permitted to RUN a validation, yet something requires one to
+    // have passed. The mirror of the case below, and the more dangerous of the
+    // two: in this state no writer of validation results exists at all, so
+    // every affected lane parks forever with nothing to explain it.
+    if sup.enabled && !sup.validate_on_exit {
+        let green = Requirement::ValidationGreen.as_str();
+        if seen_land.contains(&Requirement::ValidationGreen) {
+            out.push(format!(
+                "pipeline.supervisor.land_requires: {green:?} can never be satisfied while \
+                 validate_on_exit = false — nothing would ever record a validation result; \
+                 set validate_on_exit = true, or drop the requirement"
+            ));
+        }
+        for (i, st) in stages.iter().enumerate() {
+            if st.parsed_requires().contains(&Requirement::ValidationGreen) {
+                out.push(format!(
+                    "{}.requires: {green:?} can never be satisfied while \
+                     pipeline.supervisor.validate_on_exit = false — nothing would ever record \
+                     a validation result; set validate_on_exit = true, or drop the requirement",
+                    label(i, st)
+                ));
+            }
+        }
+    }
+
+    // A terminal stage must be able to satisfy a `validation:green` landing
+    // gate, or every lane parks at the end of the chart.
+    if seen_land.contains(&Requirement::ValidationGreen) {
+        for (i, s) in stages
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.next_name().is_none() && s.validate_tasks().is_empty())
+        {
+            out.push(format!(
+                "pipeline.supervisor.land_requires: {:?} requires every terminal stage to \
+                 declare `validate`, but {} declares none — nothing would ever record a green \
+                 result, so its lanes could never land",
+                Requirement::ValidationGreen.as_str(),
+                label(i, s)
+            ));
+        }
+    }
+
+    for (i, s) in stages.iter().enumerate() {
+        let label = label(i, s);
+
+        // `validate` names [[tasks]] entries, never shell commands.
+        for (j, t) in s.validate.iter().enumerate() {
+            let name = t.trim();
+            if name.is_empty() {
+                out.push(format!(
+                    "{label}.validate[{j}]: empty (a validation step names a [[tasks]] entry)"
+                ));
+            } else if !cfg.tasks.iter().any(|task| task.name.trim() == name) {
+                out.push(format!(
+                    "{label}.validate[{j}]: {name:?} names no [[tasks]] entry — a validation \
+                     step is run by name, not as a shell command (add a [[tasks]] entry called \
+                     {name:?})"
+                ));
+            } else if let Some(k) = s.validate[..j].iter().position(|q| q.trim() == name) {
+                out.push(format!("{label}.validate[{j}]: duplicate of validate[{k}]"));
+            }
+        }
+
+        // `requires` is a closed vocabulary.
+        let mut parsed: Vec<Requirement> = Vec::new();
+        for (j, r) in s.requires.iter().enumerate() {
+            match Requirement::parse(r) {
+                None => out.push(format!(
+                    "{label}.requires[{j}]: {:?} is not a known requirement — known values: {}",
+                    r.trim(),
+                    Requirement::known_values()
+                )),
+                Some(req) if parsed.contains(&req) => out.push(format!(
+                    "{label}.requires[{j}]: duplicate requirement {:?}",
+                    req.as_str()
+                )),
+                Some(req) => parsed.push(req),
+            }
+        }
+        if parsed.is_empty() {
+            continue;
+        }
+
+        // Every requirement is a statement about the PARENT's output, so a
+        // stage nothing advances into can never satisfy one. Reported per
+        // stage, naming the remedy, because the usual cause is a requirement
+        // written on the entry stage by analogy with the others.
+        let parents: Vec<&PipelineStage> = stages
+            .iter()
+            .filter(|p| p.next_name() == s.stage_name())
+            .collect();
+        if parents.is_empty() {
+            out.push(format!(
+                "{label}.requires: no configured stage has `next` pointing here, so this stage \
+                 has no parent and none of its requirements ({}) can ever be satisfied — \
+                 remove them, or give the stage a parent",
+                parsed
+                    .iter()
+                    .map(|r| r.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+            continue;
+        }
+
+        // `validation:green` is only meaningful when the parent actually
+        // declares something to validate. Otherwise the requirement is
+        // vacuously unmeetable and the lane parks forever.
+        if parsed.contains(&Requirement::ValidationGreen) {
+            for p in parents.iter().filter(|p| p.validate_tasks().is_empty()) {
+                out.push(format!(
+                    "{label}.requires: {:?} requires the parent stage {:?} to declare `validate`, \
+                     but it declares none — nothing would ever record a green result, so this \
+                     stage could never start",
+                    Requirement::ValidationGreen.as_str(),
+                    p.stage_name().unwrap_or("<unnamed>")
+                ));
+            }
+        }
+    }
     out
 }
 
@@ -1096,5 +1505,275 @@ permissions = ["Read", "Edit", "Bash(git:*)"]
         assert!(validate_pipeline(&cfg).is_empty());
         assert!(cfg.pipeline.stages[0].permissions.is_empty());
         assert_eq!(PipelineStage::default().permissions, Vec::<String>::new());
+    }
+
+    // --- the supervisor: validate / requires / [pipeline.supervisor] ---------
+
+    /// A config carrying a `nextest` task, so `validate` entries resolve.
+    fn cfg_with_task(stages: Vec<PipelineStage>) -> Config {
+        let mut cfg = cfg_with(stages);
+        cfg.tasks.push(crate::config::Task {
+            name: "nextest".into(),
+            command: "cargo".into(),
+            args: vec!["nextest".into(), "run".into()],
+            cwd: None,
+            env: Default::default(),
+            kind: crate::config::TaskKind::Test,
+            matcher: Some("nextest".into()),
+            scope: None,
+        });
+        cfg
+    }
+
+    #[test]
+    fn the_supervisor_defaults_to_off_and_to_requiring_an_approval_to_land() {
+        // The two defaults that matter: nothing runs unless asked, and asking
+        // does not by itself authorize landing unreviewed code.
+        let sup = Supervisor::default();
+        assert!(!sup.enabled);
+        assert_eq!(sup.parsed_land_requires(), vec![Requirement::Approval]);
+        // And a default config validates.
+        assert!(validate_pipeline(&Config::default()).is_empty());
+    }
+
+    #[test]
+    fn a_validate_entry_must_name_a_task_not_a_shell_command() {
+        // The closed-registry rule `agent` follows: a stage must not be able to
+        // introduce arbitrary command execution from config.
+        let mut s = stage("code", None);
+        s.validate = vec!["cargo nextest run".into()];
+        let errs = validate_pipeline(&cfg_with_task(vec![s]));
+        assert!(
+            errs.iter().any(|e| e.contains("names no [[tasks]] entry")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn a_validate_entry_naming_a_real_task_is_accepted() {
+        let mut s = stage("code", None);
+        s.validate = vec!["nextest".into()];
+        assert!(validate_pipeline(&cfg_with_task(vec![s])).is_empty());
+    }
+
+    #[test]
+    fn an_empty_or_duplicate_validate_entry_is_reported() {
+        let mut s = stage("code", None);
+        s.validate = vec!["nextest".into(), "".into(), "nextest".into()];
+        let errs = validate_pipeline(&cfg_with_task(vec![s]));
+        assert!(
+            errs.iter().any(|e| e.contains("validate[1]: empty")),
+            "{errs:?}"
+        );
+        assert!(
+            errs.iter().any(|e| e.contains("validate[2]: duplicate")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_requirement_names_the_known_values() {
+        // A typo must never become a gate that is present in the file and
+        // absent in effect.
+        let mut code = stage("code", Some("review"));
+        code.validate = vec!["nextest".into()];
+        let mut review = stage("review", None);
+        review.requires = vec!["aproval".into()];
+        let errs = validate_pipeline(&cfg_with_task(vec![code, review]));
+        let msg = errs
+            .iter()
+            .find(|e| e.contains("requires[0]"))
+            .unwrap_or_else(|| panic!("{errs:?}"));
+        assert!(msg.contains("not a known requirement"), "{msg}");
+        for known in Requirement::ALL {
+            assert!(
+                msg.contains(known.as_str()),
+                "{msg} omits {}",
+                known.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn a_duplicate_requirement_is_reported() {
+        let code = stage("code", Some("review"));
+        let mut review = stage("review", None);
+        review.requires = vec!["approval".into(), "approval".into()];
+        let errs = validate_pipeline(&cfg_with_task(vec![code, review]));
+        assert!(
+            errs.iter().any(|e| e.contains("requires[1]: duplicate")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn a_requirement_on_a_stage_with_no_parent_is_refused() {
+        // Every requirement is a statement about the PARENT's output, so a
+        // stage nothing advances into can never satisfy one. Refusing it here
+        // is the difference between a loud error and a lane that silently never
+        // moves — the same reasoning `concurrency = 0` is refused under.
+        let mut entry = stage("investigate", None);
+        entry.requires = vec!["approval".into()];
+        let errs = validate_pipeline(&cfg_with_task(vec![entry]));
+        assert!(
+            errs.iter().any(|e| e.contains("has no parent")),
+            "an unsatisfiable requirement was accepted: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn validation_green_requires_the_parent_to_declare_validate() {
+        // Otherwise nothing ever records a green result and the stage can never
+        // start — an unmeetable gate, not a strict one.
+        let code = stage("code", Some("review")); // declares no `validate`
+        let mut review = stage("review", None);
+        review.requires = vec!["validation:green".into()];
+        let errs = validate_pipeline(&cfg_with_task(vec![code, review]));
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("requires the parent stage") && e.contains("declares none")),
+            "{errs:?}"
+        );
+
+        // With the parent declaring a task, it is fine.
+        let mut code = stage("code", Some("review"));
+        code.validate = vec!["nextest".into()];
+        let mut review = stage("review", None);
+        review.requires = vec!["validation:green".into()];
+        assert!(validate_pipeline(&cfg_with_task(vec![code, review])).is_empty());
+    }
+
+    #[test]
+    fn a_land_gate_requiring_green_needs_every_terminal_stage_to_validate() {
+        let mut cfg = cfg_with_task(vec![stage("code", None)]);
+        cfg.pipeline.supervisor.land_requires = vec!["validation:green".into()];
+        let errs = validate_pipeline(&cfg);
+        assert!(errs.iter().any(|e| e.contains("land_requires")), "{errs:?}");
+
+        cfg.pipeline.stages[0].validate = vec!["nextest".into()];
+        assert!(validate_pipeline(&cfg).is_empty());
+    }
+
+    #[test]
+    fn requiring_a_green_validation_while_validation_is_off_is_refused() {
+        // The unsatisfiable configuration that survived the first pass: with
+        // `validate_on_exit = false` NOTHING writes a validation result, so a
+        // `validation:green` gate can never be met and every affected lane
+        // parks forever with no error to explain it.
+        let mut code = stage("code", Some("review"));
+        code.validate = vec!["nextest".into()];
+        let mut review = stage("review", None);
+        review.requires = vec!["validation:green".into()];
+        let mut cfg = cfg_with_task(vec![code, review]);
+        cfg.pipeline.supervisor.enabled = true;
+        cfg.pipeline.supervisor.validate_on_exit = false;
+
+        let errs = validate_pipeline(&cfg);
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("can never be satisfied") && e.contains("validate_on_exit")),
+            "{errs:?}"
+        );
+
+        // Turning validation back on makes the same chart valid.
+        cfg.pipeline.supervisor.validate_on_exit = true;
+        assert!(validate_pipeline(&cfg).is_empty());
+    }
+
+    #[test]
+    fn a_land_gate_requiring_green_while_validation_is_off_is_refused() {
+        let mut st = stage("code", None);
+        st.validate = vec!["nextest".into()];
+        let mut cfg = cfg_with_task(vec![st]);
+        cfg.pipeline.supervisor.enabled = true;
+        cfg.pipeline.supervisor.validate_on_exit = false;
+        cfg.pipeline.supervisor.land_requires = vec!["validation:green".into()];
+        let errs = validate_pipeline(&cfg);
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("land_requires") && e.contains("can never be satisfied")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn a_disabled_supervisor_does_not_police_validation_reachability() {
+        // The check is about what WILL happen, so it applies only to a
+        // supervisor that is switched on.
+        let mut code = stage("code", Some("review"));
+        code.validate = vec!["nextest".into()];
+        let mut review = stage("review", None);
+        review.requires = vec!["validation:green".into()];
+        let mut cfg = cfg_with_task(vec![code, review]);
+        cfg.pipeline.supervisor.validate_on_exit = false; // but enabled = false
+        assert!(validate_pipeline(&cfg).is_empty());
+    }
+
+    #[test]
+    fn an_unknown_land_requirement_is_refused() {
+        let mut cfg = cfg_with_task(vec![stage("code", None)]);
+        cfg.pipeline.supervisor.land_requires = vec!["rubber_stamp".into()];
+        let errs = validate_pipeline(&cfg);
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("land_requires[0]") && e.contains("not a known requirement")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn an_enabled_supervisor_with_every_capability_off_is_refused() {
+        let mut cfg = cfg_with_task(vec![stage("code", None)]);
+        cfg.pipeline.supervisor.enabled = true;
+        cfg.pipeline.supervisor.validate_on_exit = false;
+        cfg.pipeline.supervisor.advance = false;
+        cfg.pipeline.supervisor.land = false;
+        let errs = validate_pipeline(&cfg);
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("that configuration does nothing")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn every_requirement_round_trips_and_has_a_distinct_spelling() {
+        let mut spellings: Vec<&str> = Requirement::ALL.iter().map(|r| r.as_str()).collect();
+        let n = spellings.len();
+        spellings.sort_unstable();
+        spellings.dedup();
+        assert_eq!(n, spellings.len(), "two requirements share a spelling");
+        for r in Requirement::ALL {
+            assert_eq!(Requirement::parse(r.as_str()), Some(r));
+            // Tolerant of surrounding whitespace, intolerant of typos.
+            assert_eq!(Requirement::parse(&format!("  {}  ", r.as_str())), Some(r));
+        }
+        assert_eq!(Requirement::parse("approvals"), None);
+        assert_eq!(Requirement::parse(""), None);
+    }
+
+    #[test]
+    fn max_validations_resolves_zero_against_the_machine_limit_and_never_returns_zero() {
+        let mut sup = Supervisor::default();
+        assert_eq!(sup.effective_max_validations(4), 1, "explicit value wins");
+        sup.max_validations = 0;
+        assert_eq!(sup.effective_max_validations(4), 4, "zero follows [limits]");
+        // A ceiling of zero would mean nothing ever validates — a stall, not a
+        // setting — so it is clamped from both directions.
+        assert_eq!(sup.effective_max_validations(0), 1);
+    }
+
+    #[test]
+    fn a_stage_helper_ignores_blank_validate_entries() {
+        let mut s = stage("code", None);
+        s.validate = vec!["  nextest  ".into(), "   ".into()];
+        assert_eq!(s.validate_tasks(), vec!["nextest"]);
+    }
+
+    #[test]
+    fn parsed_requires_drops_what_validation_already_reported() {
+        let mut s = stage("code", None);
+        s.requires = vec!["approval".into(), "nonsense".into()];
+        assert_eq!(s.parsed_requires(), vec![Requirement::Approval]);
     }
 }
