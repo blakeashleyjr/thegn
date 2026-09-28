@@ -26,6 +26,8 @@ pub const MAX_AGGREGATE_SOURCE_BYTES: usize = 256 << 20;
 /// Cooperative wall-clock ceiling for directory scan, reads, and parsing.
 pub const SOURCE_DEADLINE: Duration = Duration::from_secs(30);
 const READ_CHUNK_BYTES: usize = 64 * 1024;
+const _: () = assert!(MAX_AGGREGATE_SOURCE_BYTES > MAX_SOURCE_DOCUMENT_BYTES);
+const _: () = assert!(MAX_DIRECTORY_ENTRIES > MAX_FILES);
 
 pub struct IcsBackend {
     path: String,
@@ -305,6 +307,40 @@ impl CalendarBackend for IcsBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capped_reader_accepts_exact_budget_and_refuses_the_first_excess_chunk() {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let exact = read_capped(std::io::Cursor::new(b"12345678"), 0, 8, deadline)
+            .unwrap()
+            .unwrap();
+        assert_eq!(exact, b"12345678");
+        assert!(exact.capacity() <= 8);
+
+        let over = read_capped(std::io::Cursor::new(b"123456789"), 0, 8, deadline).unwrap();
+        assert!(over.is_none(), "the source must be refused, not truncated");
+    }
+
+    #[test]
+    fn capped_reader_rechecks_growing_sources_before_buffer_growth() {
+        struct Growing {
+            reads: usize,
+        }
+        impl Read for Growing {
+            fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+                self.reads += 1;
+                out.fill(b'x');
+                Ok(out.len())
+            }
+        }
+
+        let mut reader = Growing { reads: 0 };
+        let result = read_capped(&mut reader, 0, 8, Instant::now() + Duration::from_secs(1));
+        assert!(matches!(result, Ok(None)));
+        // The first fixed-size chunk proves the source exceeds the limit; no
+        // second read or buffer growth is needed to decide refusal.
+        assert_eq!(reader.reads, 1);
+    }
 
     #[test]
     fn candidate_selection_is_stable_and_refuses_truncation() {
