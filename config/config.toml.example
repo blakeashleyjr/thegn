@@ -1682,6 +1682,30 @@ command = "git diff"
 #                dispatch before a roster row exists. thegn does not
 #                interpret them — they are the harness's own vocabulary.
 #                Empty = the entry's list, if any.
+#   validate     [[tasks]] entry NAMES (not shell commands) to run against this
+#                stage's lane once its worker exits — the compile/test/lint pass
+#                the worker could not run itself, because the pipeline sandbox
+#                mounts the Nix store read-only and `nix develop` cannot
+#                materialise a shell inside it. A worker's "implementation-ready"
+#                therefore means source-reviewed, never built. Only
+#                [pipeline.supervisor] acts on this. Empty = this stage's output
+#                is not machine-checkable (right for a stage producing prose).
+#   requires     what must already be a RECORDED FACT before the supervisor may
+#                dispatch INTO this stage — the review gate, as data. Closed
+#                vocabulary, checked by `config validate`:
+#                  "parent_artifact"  the parent row's artifact is committed in
+#                                     HEAD and unchanged (what `dispatch verify`
+#                                     reports)
+#                  "parent_report"    the parent row filed a worker report
+#                  "validation:green" every task in the PARENT stage's `validate`
+#                                     recorded green for the parent's current
+#                                     tip. An environment error does NOT count:
+#                                     "the command never ran" is not "it passed"
+#                  "approval"         a live, commit-bound approval exists for
+#                                     the parent's output at the lane's tip
+#                Every requirement is a statement about the parent's output, so
+#                a stage nothing points `next` at cannot carry one — that is a
+#                `config validate` error, not a silent permanent stall.
 #
 # The handoff between stages is a FILE COMMITTED ON THE BRANCH (git is the
 # source of truth) — the roster only stores a pointer to it, conventionally
@@ -1730,6 +1754,9 @@ command = "git diff"
 # permissions = ["Read", "Edit", "Bash", "Grep", "Glob"]        # replaces the entry's
 #                                # (claude only: on this pi stage a non-empty
 #                                #  list — its own or inherited — is refused)
+# validate = ["clippy", "nextest"]   # [[tasks]] NAMES; the coder cannot compile
+#                                #   in its sandbox, so this is where the code
+#                                #   is actually built and tested
 #
 # [[pipeline.stages]]
 # name = "review"
@@ -1740,7 +1767,13 @@ command = "git diff"
 # """
 # concurrency = 1
 # timeout_secs = 1800
-# on_blocked = "escalate"        # no `next`: the Lead lands via `thegn integrate`
+# on_blocked = "escalate"        # no `next`: the lane ends at the merge queue
+# requires = ["parent_artifact", "validation:green", "approval"]
+#                                # the review gate, as data: `code` must have
+#                                #   committed its artifact, its validate tasks
+#                                #   must have recorded green for the CURRENT
+#                                #   tip, and a person must have approved that
+#                                #   exact commit, before review is dispatched
 
 # Headless transport-error retry (THE-86): when a stage worker launched
 # headless dies with a nonzero exit and its final screen reads as a transport
@@ -1766,6 +1799,65 @@ command = "git diff"
 # backoff_ms = 2000
 # transport_signatures = ["connection error.", "overloaded_error", "bad gateway"]
 # limit_signatures = ["weekly limit", "rate limit", "credit balance"]
+
+# ── The supervisor ([pipeline.supervisor]) ──────────────────────────────────
+# The MECHANICAL half of the chart above, run durably — so a pipeline does not
+# stall the moment nobody is watching it.
+#
+# This does not reopen the "native drain driver" the agent-orchestration work
+# rejected. It applies the exception the daemon's reaper already carved: a
+# transition may be applied when APPLYING IT IS ARITHMETIC ON RECORDED FACTS,
+# not a judgement about whether the work was any good. Everything below is
+# gated on facts already written down — an artifact committed in git, a report
+# on the roster, a recorded validation class, a commit-bound approval — and the
+# judgement ("should this advance?") is what YOU wrote in each stage's
+# `requires`, in this file, in advance.
+#
+# Three things it structurally cannot do:
+#   * create an approval — granting is an operator-scoped write on a surface the
+#     daemon does not hold, so no code path the supervisor runs can manufacture
+#     its own authorization;
+#   * honour an approval after new commits — approvals are bound to a commit, so
+#     approve a diff, push one more commit, and the supervisor stops;
+#   * land anything itself — it hands the lane to the merge queue, which owns
+#     serialization and the fold gate.
+#
+# `thegn supervise plan` prints exactly what it would do, and why, without
+# doing any of it. Read that before setting `enabled = true`.
+#
+#   enabled            master switch (default FALSE: nothing runs, and the
+#                      pipeline behaves as it did before this section existed)
+#   validate_on_exit   run each stage's `validate` tasks when its worker exits
+#                      and record the result. Pure observation — writes no
+#                      roster status, dispatches nothing (default true)
+#   advance            dispatch a stage's `next` once every requirement that
+#                      stage declares is a recorded fact (default true)
+#   land               enqueue a terminal stage's lane onto the merge queue once
+#                      `land_requires` is satisfied (default true)
+#   land_requires      the landing gate, same closed vocabulary as a stage's
+#                      `requires`, evaluated against the terminal row itself.
+#                      Defaults to ["approval"], and that default is the point:
+#                      switching the supervisor on must not, by itself, start
+#                      landing code nobody has read
+#   approval_ttl_secs  how long a recorded approval stays valid (default 86400;
+#                      0 = no age bound). A new commit invalidates an approval
+#                      regardless — that is the bound that matters; this one
+#                      only stops a long-forgotten approval from authorising
+#                      work after the context around it has moved on
+#   max_validations    validation runs in flight at once, across every lane
+#                      (default 1; 0 = follow [limits] test_max_parallel).
+#                      One is not timidity: a full-workspace compile is the most
+#                      expensive thing this tool does, and a gate run under that
+#                      contention goes red for reasons that have nothing to do
+#                      with the code — a false verdict is worse than a slow one
+# [pipeline.supervisor]
+# enabled = false
+# validate_on_exit = true
+# advance = true
+# land = true
+# land_requires = ["approval"]
+# approval_ttl_secs = 86400
+# max_validations = 1
 
 # Resource ceilings. thegn NEVER auto-runs tests; these only cap an *explicit*
 # run/discovery so a heavy suite can't pin the machine. When `systemd-run` is
