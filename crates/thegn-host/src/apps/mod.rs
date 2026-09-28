@@ -142,10 +142,10 @@ impl AppHost {
     pub fn reconcile(&mut self, cfg: &thegn_core::config::Config) {
         let active_id = self.active_id().map(str::to_owned);
         let previous_default = self.default_tab.clone();
-        let default_id = cfg.apps.normalized_default_tab();
+        let default_id = cfg.apps.normalized_default_tab(cfg.observe.enabled);
         let enabled_ids: std::collections::HashSet<&str> =
             registry::enabled(cfg).map(|builder| builder.id).collect();
-        let tab_ids = cfg.apps.effective_tab_order();
+        let tab_ids = cfg.apps.effective_tab_order(cfg.observe.enabled);
         let wanted_slots: Vec<&str> = tab_ids
             .iter()
             .filter(|id| enabled_ids.contains(id.as_str()))
@@ -608,12 +608,14 @@ mod tests {
         let mut cfg = thegn_core::config::Config::default();
         cfg.observe.enabled = true;
         cfg.apps.default_tab = "observe".into();
-        cfg.apps.tab_order = vec!["observe".into(), "work".into()];
+        // Membership comes from `observe.enabled`; `[apps]` only orders the
+        // enabled tab set, so an omitted app still follows `work` here.
+        cfg.apps.tab_order = vec!["work".into()];
         let host = AppHost::from_config(&cfg);
 
-        assert_eq!(host.tab_labels(), vec!["Observe", "work"]);
+        assert_eq!(host.tab_labels(), vec!["work", "Observe"]);
         assert_eq!(host.active_id(), Some("observe"));
-        assert_eq!(host.active_tab_index(), 0);
+        assert_eq!(host.active_tab_index(), 1);
     }
 
     #[test]

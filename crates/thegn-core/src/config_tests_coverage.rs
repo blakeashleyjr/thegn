@@ -940,16 +940,28 @@ fn effective_tab_order_dedups_and_preserves_configured_ids() {
     };
     // Unknown ids are filtered here for tolerant callers; config validation
     // separately refuses them. Known ids are trimmed and deduped in user order.
-    assert_eq!(a.effective_tab_order(), vec!["work", "observe"]);
+    assert_eq!(a.effective_tab_order(true), vec!["work", "observe"]);
+    // A known app named in `[apps]` is omitted while disabled, but enabling it
+    // adds it even when the order list does not name it.
+    assert_eq!(a.effective_tab_order(false), vec!["work"]);
+    let enabled_but_unlisted = AppsConfig {
+        default_tab: "work".into(),
+        tab_order: vec!["work".into()],
+    };
+    assert_eq!(
+        enabled_but_unlisted.effective_tab_order(true),
+        vec!["work", "observe"]
+    );
 }
 
 #[test]
-fn effective_tab_order_empty_falls_back_to_work_only() {
+fn effective_tab_order_empty_adds_every_enabled_app_after_work() {
     let a = AppsConfig {
         default_tab: "work".into(),
         tab_order: Vec::new(),
     };
-    assert_eq!(a.effective_tab_order(), vec!["work"]);
+    assert_eq!(a.effective_tab_order(false), vec!["work"]);
+    assert_eq!(a.effective_tab_order(true), vec!["work", "observe"]);
 }
 
 #[test]
@@ -958,13 +970,18 @@ fn normalized_default_tab_present_and_falls_back_to_first() {
         default_tab: " work ".into(),
         tab_order: vec!["work".into(), "observe".into()],
     };
-    assert_eq!(present.normalized_default_tab(), "work");
+    assert_eq!(present.normalized_default_tab(true), "work");
+    let enabled_but_unlisted = AppsConfig {
+        default_tab: "observe".into(),
+        tab_order: vec!["work".into()],
+    };
+    assert_eq!(enabled_but_unlisted.normalized_default_tab(true), "observe");
     // Unknown default → first of the effective order (`work`).
     let bad = AppsConfig {
         default_tab: "nonexistent".into(),
         tab_order: vec!["comms".into(), "work".into()],
     };
-    assert_eq!(bad.normalized_default_tab(), "work");
+    assert_eq!(bad.normalized_default_tab(true), "work");
 }
 
 // ---- ConfigOverlay::apply field-by-field ----
@@ -1250,7 +1267,10 @@ fn env_overlay_apps_tab_order_parses_csv() {
     o.apply(&mut cfg);
     cfg.observe.enabled = true;
     assert_eq!(cfg.apps.default_tab, "observe");
-    assert_eq!(cfg.apps.effective_tab_order(), ["observe", "work"]);
+    assert_eq!(
+        cfg.apps.effective_tab_order(cfg.observe.enabled),
+        ["observe", "work"]
+    );
 }
 
 #[test]
@@ -1375,11 +1395,18 @@ fn post_process_expands_pin_cwd_tilde() {
 #[test]
 fn apply_override_str_apps_tab_order_splits_csv() {
     let mut cfg = Config::default();
+    cfg.observe.enabled = true;
     Config::apply_override_str(&mut cfg, "apps.tab_order", " observe , work ,, observe ").unwrap();
     assert_eq!(cfg.apps.tab_order, vec!["observe", "work", "observe"]);
-    assert_eq!(cfg.apps.effective_tab_order(), ["observe", "work"]);
+    assert_eq!(
+        cfg.apps.effective_tab_order(cfg.observe.enabled),
+        ["observe", "work"]
+    );
     Config::apply_override_str(&mut cfg, "apps.default_tab", "observe").unwrap();
-    assert_eq!(cfg.apps.normalized_default_tab(), "observe");
+    assert_eq!(
+        cfg.apps.normalized_default_tab(cfg.observe.enabled),
+        "observe"
+    );
 }
 
 #[test]

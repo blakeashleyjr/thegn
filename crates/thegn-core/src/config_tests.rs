@@ -123,15 +123,26 @@ fn provider_exec_mode_parses_and_defaults_to_auto() {
 fn app_tab_config_defaults_to_work_first_and_default() {
     let cfg = Config::default();
     assert_eq!(cfg.apps.default_tab, "work");
-    assert_eq!(cfg.apps.effective_tab_order(), vec!["work"]);
+    assert_eq!(
+        cfg.apps.effective_tab_order(cfg.observe.enabled),
+        vec!["work"]
+    );
     assert!(AppsConfig::BUILTIN_TABS.contains(&"observe"));
 }
 
 #[test]
-fn app_tab_config_includes_known_apps_only_when_named_in_order() {
+fn app_tab_config_orders_enabled_apps_without_making_them_membership_opt_in() {
     let mut cfg = Config::default();
-    cfg.apps.tab_order = vec!["work".into(), "observe".into()];
-    assert_eq!(cfg.apps.effective_tab_order(), vec!["work", "observe"]);
+    cfg.observe.enabled = true;
+    assert_eq!(
+        cfg.apps.effective_tab_order(cfg.observe.enabled),
+        vec!["work", "observe"]
+    );
+    cfg.apps.tab_order = vec!["observe".into()];
+    assert_eq!(
+        cfg.apps.effective_tab_order(cfg.observe.enabled),
+        vec!["observe", "work"]
+    );
 }
 
 #[test]
@@ -170,7 +181,10 @@ fn app_tab_config_honors_file_env_and_cli_order() {
     cfg.observe.enabled = true;
     assert!(cfg.apps.validate(cfg.observe.enabled).is_empty());
     assert_eq!(cfg.apps.default_tab, "observe");
-    assert_eq!(cfg.apps.effective_tab_order(), vec!["observe", "work"]);
+    assert_eq!(
+        cfg.apps.effective_tab_order(cfg.observe.enabled),
+        vec!["observe", "work"]
+    );
 }
 
 #[test]
