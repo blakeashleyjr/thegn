@@ -3541,11 +3541,16 @@ impl Default for AppsConfig {
 }
 
 impl AppsConfig {
-    /// Authoritative set of known built-in app tab ids. Knowing an id makes it
-    /// valid in config; it does not enable that tab. The host registry projects
-    /// its builders from this list, and config validation and the generated
-    /// schema use the same ids. Keep this separate from the default order below:
-    /// adding a known tab must not silently add it to existing users' UI.
+    /// Authoritative set of built-in app tab ids that exist. This answers only
+    /// whether a name is known, and is shared by config validation and the
+    /// generated schema. It does not answer either of the other two questions:
+    /// the app builder's `enabled` predicate (through `registry::enabled` in
+    /// the host) decides whether a known app is registered, while
+    /// `effective_tab_order()` resolves the configured order among known ids
+    /// and `DEFAULT_TAB_ORDER` supplies that order when config omits one. The
+    /// host reconciler applies that order to the enabled set. Keeping these
+    /// separate prevents a newly known app from silently appearing in existing
+    /// users' UI.
     pub const BUILTIN_TABS: [&'static str; 2] = ["work", "observe"];
 
     const DEFAULT_TAB_ORDER: [&'static str; 1] = ["work"];

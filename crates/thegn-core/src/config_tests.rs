@@ -159,16 +159,18 @@ fn log_config_from_env_applies_the_rotation_knobs() {
 #[test]
 fn app_tab_config_honors_file_env_and_cli_order() {
     let mut env = MapEnv::default();
-    // Only `work` is a built-in id today; every other requested id is
-    // filtered out.
     env.0
-        .insert("THEGN_APPS_TAB_ORDER".into(), "comms,work,dashboard".into());
+        .insert("THEGN_APPS_TAB_ORDER".into(), "observe,work,observe".into());
     env.0.insert("THEGN_APPS_DEFAULT_TAB".into(), "work".into());
-    let flags = vec!["apps.default_tab=work".to_string()];
-    let cfg = Config::load_layered(&env, &flags, None);
+    let flags = vec!["apps.default_tab=observe".to_string()];
+    let mut cfg = Config::load_layered(&env, &flags, None);
 
-    assert_eq!(cfg.apps.default_tab, "work");
-    assert_eq!(cfg.apps.effective_tab_order(), vec!["work"]);
+    // The tab preference can arrive from env/CLI overlays while the app's
+    // enable switch remains in its own config section.
+    cfg.observe.enabled = true;
+    assert!(cfg.apps.validate(cfg.observe.enabled).is_empty());
+    assert_eq!(cfg.apps.default_tab, "observe");
+    assert_eq!(cfg.apps.effective_tab_order(), vec!["observe", "work"]);
 }
 
 #[test]
