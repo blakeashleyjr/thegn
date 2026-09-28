@@ -290,6 +290,24 @@ pub struct ActiveScope {
     pub files: Vec<String>,
 }
 
+/// Scope facts read and parsed by the host before a dispatch takes SQLite's
+/// write lock. `None` means the row appeared after preparation and requires a
+/// fresh snapshot; `Err` is an active sibling whose ownership is unknown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedSiblingScope {
+    pub row: i64,
+    pub path: String,
+    pub scope: Option<Result<ChunkScope, String>>,
+}
+
+/// Filesystem-free inputs to the serialized chunk admission decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedChunkAdmission {
+    pub path: String,
+    pub scope: ChunkScope,
+    pub siblings: Vec<PreparedSiblingScope>,
+}
+
 /// The gate's decision for one new scope against the active siblings and the
 /// done set. The host turns every variant except [`ScopeVerdict::Ok`] into a
 /// refusal (with `--force` as the way out); [`ScopeVerdict::Conflict`] wins

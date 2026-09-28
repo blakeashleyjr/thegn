@@ -77,10 +77,12 @@ pub enum Action {
         #[arg(long)]
         chunk: Option<String>,
         /// Dispatch even though the chunk-scope gate refused (a scope
-        /// collision or an unmet `after:`). A forced dispatch is printed as
-        /// such, in both output modes.
+        /// collision or an unmet `after:`). Chunk overrides also require
+        /// `--force-reason`; non-chunk put keeps its historical behavior.
         #[arg(long)]
         force: bool,
+        #[arg(long, value_name = "REASON")]
+        force_reason: Option<String>,
         /// Emit the created row as JSON.
         #[arg(long)]
         json: bool,
@@ -134,6 +136,10 @@ pub enum Action {
         /// reason, which is recorded as an audit note on the new row.
         #[arg(long, value_name = "REASON")]
         allow_duplicate: Option<String>,
+        /// Explicitly authorize a chunk scope overlap. Requires and records a
+        /// non-empty reason; session open never exposes this override.
+        #[arg(long, value_name = "REASON")]
+        allow_scope_overlap: Option<String>,
         /// Emit the created row (or the refusal) as JSON.
         #[arg(long)]
         json: bool,
@@ -274,6 +280,7 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
             parent,
             chunk,
             allow_duplicate,
+            allow_scope_overlap,
             json,
         } => claim(
             cfg,
@@ -285,6 +292,7 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
             parent,
             chunk.as_deref(),
             allow_duplicate.as_deref(),
+            allow_scope_overlap.as_deref(),
             json,
         ),
         Action::Lease {
@@ -304,14 +312,59 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
             artifact,
             chunk,
             force,
+            force_reason,
             json,
         } => {
             let db = Db::open()?;
             if let Some(chunk_path) = chunk.as_deref() {
-                // The chunk-scope gate runs BEFORE the insert: a refused put
-                // must leave no row behind (a refused scope is not a
-                // dispatch, and a row stuck queued would read as un-driven).
-                chunk_gate(&db, &worktree_path, &issue_id, chunk_path, force)?;
+                if force && force_reason.as_deref().is_none_or(|s| s.trim().is_empty()) {
+                    anyhow::bail!("dispatch put --chunk --force requires --force-reason <reason>");
+                }
+                if !force && force_reason.is_some() {
+                    anyhow::bail!("--force-reason requires --force");
+                }
+                let name = stage.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("a chunk-bearing dispatch put requires --stage so admission can enforce that stage's capacity")
+                })?;
+                let limit = cfg.pipeline.stage(name).map(|s| s.concurrency).ok_or_else(|| {
+                    anyhow::anyhow!("unknown pipeline stage {name:?}; configure it before putting a chunk dispatch")
+                })?;
+                let row = claim_chunk_put(
+                    &db,
+                    NewDispatch {
+                        issue_id: &issue_id,
+                        worktree_path: &worktree_path,
+                        agent_name: &agent_name,
+                        stage: stage.as_deref(),
+                        parent_id: parent,
+                        session_id: session.as_deref(),
+                        artifact_path: artifact.as_deref(),
+                        chunk_path: Some(chunk_path),
+                    },
+                    limit,
+                    if force { force_reason.as_deref() } else { None },
+                )?;
+                if json {
+                    let mut v = serde_json::to_value(&row)?;
+                    if force {
+                        v["forced"] = serde_json::json!(true);
+                    }
+                    if let Some(reason) = force_reason {
+                        v["force_reason"] = serde_json::json!(reason);
+                    }
+                    return super::emit_json(&v);
+                }
+                if force {
+                    outln!(
+                        "dispatch {} → {} (forced: {})",
+                        row.id,
+                        row.status.as_str(),
+                        force_reason.unwrap_or_default()
+                    );
+                } else {
+                    outln!("dispatch {} → {}", row.id, row.status.as_str());
+                }
+                return Ok(());
             }
             let row = put(
                 &db,
@@ -384,27 +437,12 @@ fn put(db: &Db, new: NewDispatch<'_>) -> Result<AgentDispatch> {
         .ok_or_else(|| anyhow::anyhow!("dispatch {id} vanished after insert"))
 }
 
-/// The chunk-scope gate (THE-86): before a row carrying `--chunk` is
-/// inserted, its chunk file's `files:` frontmatter is checked against every
-/// ACTIVE sibling's scope — rows of the same issue in the same worktree,
-/// non-terminal, each with its own `chunk_path`. A scope collision is a
-/// refusal naming the colliding paths and the sibling row ids; an `after:`
-/// chunk that is not `done` is a refusal naming the chunk and its row
-/// status. Shared by `dispatch put --chunk` and `session open --chunk`
-/// (two callers, one refusal — two implementations would drift).
-///
-/// `--force` is the way out, exactly like the `set-status done --force`
-/// idiom: it overrides a refusal AND an unparseable/unreadable chunk file,
-/// and every caller reports the forced dispatch in its output. Without
-/// `--force` the gate is strict: a chunk file that cannot be read or parsed
-/// is a refusal (naming the line), because a typo'd scope must not silently
-/// opt the row out of the gate.
-///
-/// Sibling chunk files are read from each sibling's OWN recorded worktree,
-/// best-effort: an unreadable sibling contributes an empty scope (which
-/// never conflicts) rather than an error — one broken file must not wedge
-/// the whole roster's gate.
-pub(crate) fn chunk_gate(
+/// Test-only assertion helper for the existing `pipeline_chunk` overlap and
+/// `after:` semantics. Production dispatches use prepared scope facts and the
+/// transactional admission below; this helper is deliberately not a creation
+/// path.
+#[cfg(test)]
+fn chunk_gate(
     db: &Db,
     worktree: &str,
     issue_id: &str,
@@ -412,8 +450,7 @@ pub(crate) fn chunk_gate(
     force: bool,
 ) -> Result<()> {
     if force {
-        // The explicit override: no read, no parse, no verdict. The caller's
-        // output says the dispatch was forced.
+        // Mirrors the historical gate's broad override for regression tests.
         return Ok(());
     }
     let body = read_chunk_file(worktree, chunk_path).map_err(|e| {
@@ -452,16 +489,28 @@ pub(crate) fn chunk_gate(
             done.insert(name);
             continue;
         }
-        if r.status.is_terminal() {
+        if !r.status.is_active() {
             continue;
         }
-        // Read the sibling's scope from ITS worktree — best-effort (see the
-        // doc comment): unreadable means empty scope, never an error.
-        let files = read_chunk_file(&r.worktree_path, sibling_path)
-            .ok()
-            .and_then(|body| pipeline_chunk::parse_frontmatter(&body).ok())
-            .map(|s| s.files)
-            .unwrap_or_default();
+        // An active row with a chunk path must have an established scope.
+        // Failing closed gives the operator an actionable row/path instead
+        // of silently treating unknown ownership as empty.
+        let sibling_body = read_chunk_file(&r.worktree_path, sibling_path).map_err(|e| {
+            anyhow::anyhow!(
+                "active sibling row {} has unreadable scope at {}: {e}",
+                r.id,
+                sibling_path
+            )
+        })?;
+        let files = pipeline_chunk::parse_frontmatter(&sibling_body)
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "active sibling row {} has invalid scope at {}: {e}",
+                    r.id,
+                    sibling_path
+                )
+            })?
+            .files;
         active_scopes.push(pipeline_chunk::ActiveScope {
             row: r.id,
             name,
@@ -542,6 +591,134 @@ fn chunk_name(chunk_path: &str) -> &str {
         .unwrap_or("")
 }
 
+/// Read every relevant sibling before the DB writer is acquired. The prepared
+/// value carries these exact parsed facts into the atomic roster decision.
+fn prepare_chunk_admission(
+    db: &Db,
+    worktree: &str,
+    issue_id: &str,
+    chunk_path: &str,
+) -> Result<pipeline_chunk::PreparedChunkAdmission> {
+    let body = read_chunk_file(worktree, chunk_path).map_err(|e| {
+        anyhow::anyhow!("chunk file {chunk_path} is not readable in {worktree}: {e}")
+    })?;
+    let scope = pipeline_chunk::parse_frontmatter(&body)
+        .map_err(|e| anyhow::anyhow!("chunk file {chunk_path} is not a valid scope ({e})"))?;
+    let mut siblings = Vec::new();
+    for row in db.list_dispatches()? {
+        if row.issue_id != issue_id || row.worktree_path != worktree || !row.status.is_active() {
+            continue;
+        }
+        let Some(path) = row
+            .chunk_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+        else {
+            continue;
+        };
+        let parsed = read_chunk_file(&row.worktree_path, path)
+            .map_err(|e| format!("{e}"))
+            .and_then(|body| pipeline_chunk::parse_frontmatter(&body).map_err(|e| e.to_string()));
+        siblings.push(pipeline_chunk::PreparedSiblingScope {
+            row: row.id,
+            path: path.to_string(),
+            scope: Some(parsed),
+        });
+    }
+    Ok(pipeline_chunk::PreparedChunkAdmission {
+        path: chunk_path.to_string(),
+        scope,
+        siblings,
+    })
+}
+
+pub(crate) fn claim_admitted_with_refresh(
+    db: &Db,
+    new: NewDispatch<'_>,
+    limit: u32,
+    allow_duplicate: Option<&str>,
+    worktree: &str,
+    issue_id: &str,
+    chunk: Option<&str>,
+    allow_scope: Option<&str>,
+) -> Result<std::result::Result<i64, thegn_core::db::DispatchAdmissionDecision>> {
+    let mut raced_snapshot = None;
+    for _ in 0..3 {
+        let prepared = chunk
+            .map(|p| prepare_chunk_admission(db, worktree, issue_id, p))
+            .transpose()?;
+        let result = db.claim_dispatch_admitted(
+            new,
+            limit,
+            allow_duplicate,
+            prepared.as_ref(),
+            allow_scope,
+        )?;
+        match result {
+            Err(thegn_core::db::DispatchAdmissionDecision::RetryScopeSnapshot { row, path }) => {
+                raced_snapshot = Some((row, path));
+            }
+            Err(thegn_core::db::DispatchAdmissionDecision::ScopeRefused(_))
+                if raced_snapshot.is_some() =>
+            {
+                // The roster changed between preparation and the locked read;
+                // surface this attempt as retryable after refresh. The next
+                // invocation will show the stable overlap refusal directly.
+                let (row, path) = raced_snapshot.take().expect("guarded above");
+                return Ok(Err(
+                    thegn_core::db::DispatchAdmissionDecision::RetryScopeSnapshot { row, path },
+                ));
+            }
+            other => return Ok(other),
+        }
+    }
+    let (row, path) = raced_snapshot.unwrap_or((0, chunk.unwrap_or_default().to_string()));
+    Ok(Err(
+        thegn_core::db::DispatchAdmissionDecision::RetryScopeSnapshot { row, path },
+    ))
+}
+
+fn claim_chunk_put(
+    db: &Db,
+    new: NewDispatch<'_>,
+    limit: u32,
+    allow_scope: Option<&str>,
+) -> Result<AgentDispatch> {
+    if let Some(parent) = new.parent_id
+        && db.get_dispatch(parent)?.is_none()
+    {
+        anyhow::bail!("no dispatch with id {parent} to parent this row on");
+    }
+    let worktree = new.worktree_path.to_string();
+    let issue_id = new.issue_id.to_string();
+    let chunk_path = new.chunk_path.map(str::to_string);
+    let outcome = claim_admitted_with_refresh(
+        db,
+        new,
+        limit,
+        None,
+        &worktree,
+        &issue_id,
+        chunk_path.as_deref(),
+        allow_scope,
+    )?;
+    match outcome {
+        Ok(id) => db
+            .get_dispatch(id)?
+            .ok_or_else(|| anyhow::anyhow!("dispatch {id} vanished after insert")),
+        Err(thegn_core::db::DispatchAdmissionDecision::Claim(d)) => {
+            anyhow::bail!("dispatch refused: {}", d.reason())
+        }
+        Err(thegn_core::db::DispatchAdmissionDecision::ScopeRefused(s)) => anyhow::bail!("{s}"),
+        Err(thegn_core::db::DispatchAdmissionDecision::RetryScopeSnapshot { row, path }) => {
+            Err(anyhow::Error::new(crate::cmd::Retryable(anyhow::anyhow!(
+                "scope snapshot changed at row {row} ({path}); retry admission"
+            ))))
+        }
+    }
+}
+
 /// `dispatch claim` — the atomic slot check plus insert.
 ///
 /// The stage's budget comes from `[[pipeline.stages]]`, so the number enforced
@@ -558,6 +735,7 @@ fn claim(
     parent: Option<i64>,
     chunk: Option<&str>,
     allow_duplicate: Option<&str>,
+    allow_scope_overlap: Option<&str>,
     json: bool,
 ) -> Result<()> {
     let db = Db::open()?;
@@ -572,7 +750,8 @@ fn claim(
     // slot, not when the worker fails to start.
     crate::cmd::session::policy_admission(cfg, agent_name, stage)?;
     let limit = stage_config.concurrency;
-    let outcome = db.claim_dispatch(
+    let outcome = claim_admitted_with_refresh(
+        &db,
         NewDispatch {
             issue_id,
             worktree_path,
@@ -585,6 +764,10 @@ fn claim(
         },
         limit,
         allow_duplicate,
+        worktree_path,
+        issue_id,
+        chunk,
+        allow_scope_overlap,
     )?;
     match outcome {
         Ok(id) => {
@@ -597,16 +780,21 @@ fn claim(
                 if let Some(why) = allow_duplicate {
                     v["allowed_duplicate"] = serde_json::json!(why);
                 }
+                if let Some(why) = allow_scope_overlap {
+                    v["forced_scope_overlap"] = serde_json::json!({"reason": why});
+                }
                 return super::emit_json(&v);
             }
-            if allow_duplicate.is_some() {
+            if let Some(why) = allow_scope_overlap {
+                outln!("dispatch {id} claimed for stage {stage} (scope overlap forced: {why})");
+            } else if allow_duplicate.is_some() {
                 outln!("dispatch {id} claimed (duplicate explicitly authorized)");
             } else {
                 outln!("dispatch {id} claimed for stage {stage}");
             }
             Ok(())
         }
-        Err(decision) => {
+        Err(thegn_core::db::DispatchAdmissionDecision::Claim(decision)) => {
             if json {
                 super::emit_json(&serde_json::json!({
                     "granted": false,
@@ -618,6 +806,24 @@ fn claim(
             Err(anyhow::Error::new(crate::cmd::Retryable(anyhow::anyhow!(
                 "dispatch refused: {}\n(exit 2 — reconcile and retry)",
                 decision.reason()
+            ))))
+        }
+        Err(thegn_core::db::DispatchAdmissionDecision::ScopeRefused(reason)) => {
+            if json {
+                super::emit_json(
+                    &serde_json::json!({"granted":false,"reason":reason,"retryable":false}),
+                )?;
+            }
+            anyhow::bail!("{reason}");
+        }
+        Err(thegn_core::db::DispatchAdmissionDecision::RetryScopeSnapshot { row, path }) => {
+            if json {
+                super::emit_json(
+                    &serde_json::json!({"granted":false,"reason":format!("scope snapshot changed at row {row} ({path}); retry admission"),"retryable":true}),
+                )?;
+            }
+            Err(anyhow::Error::new(crate::cmd::Retryable(anyhow::anyhow!(
+                "scope snapshot changed at row {row} ({path}); retry admission"
             ))))
         }
     }
@@ -696,11 +902,9 @@ fn list(active: bool, json: bool) -> Result<()> {
         rows.retain(|d| d.status.is_active());
     }
     if json {
-        // One value per row: the stored fields plus the parsed scope. `chunk_files`
-        // (the chunk file's `files:` list) is a best-effort read at list time —
-        // the file lives in the worktree and may be gone; the key is then
-        // omitted rather than emitted empty (an empty list would read as "this
-        // chunk touches nothing", the opt-out, which is a different claim).
+        // One value per row: stored fields plus a display-time read. The
+        // `chunk_files_from_file_at_display_time` key is explicitly not the
+        // admitted ownership snapshot; no scope is persisted in this schema.
         let mut vals: Vec<serde_json::Value> = Vec::with_capacity(rows.len());
         let now_ms = thegn_core::util::now_ms();
         for d in &rows {
@@ -724,7 +928,7 @@ fn list(active: bool, json: bool) -> Result<()> {
                 .and_then(|chunk_path| read_chunk_file(&d.worktree_path, chunk_path).ok())
                 .and_then(|body| pipeline_chunk::parse_frontmatter(&body).ok())
             {
-                v["chunk_files"] = serde_json::json!(scope.files);
+                v["chunk_files_from_file_at_display_time"] = serde_json::json!(scope.files);
             }
             vals.push(v);
         }
@@ -1903,14 +2107,17 @@ mod tests {
     }
 
     #[test]
-    fn an_unreadable_sibling_file_degrades_to_an_empty_scope() {
+    fn an_unreadable_active_sibling_blocks_admission_with_row_and_path() {
         let (_d, wt) = chunk_wt(&[("c.md", "---\nfiles: [lib.rs]\n---\n")]);
         let db = db("gate-broken-sib").1;
         // The sibling row points at a chunk file that is GONE from its own
-        // worktree. Best-effort: the sibling contributes an empty scope (which
-        // never conflicts) instead of wedging every later dispatch.
-        chunk_row(&db, &wt, "missing.md");
-        chunk_gate(&db, &wt, "linear:A-1", "c.md", false).unwrap();
+        // worktree. The refusal identifies the row and path requiring action.
+        let row = chunk_row(&db, &wt, "missing.md");
+        let err = chunk_gate(&db, &wt, "linear:A-1", "c.md", false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(&format!("row {row}")), "{err}");
+        assert!(err.contains("missing.md"), "{err}");
     }
 
     #[test]
@@ -1942,6 +2149,135 @@ mod tests {
             .to_string();
         assert!(err.contains("not a valid scope"), "{err}");
         assert!(err.contains("line 2"), "{err}");
+    }
+
+    #[test]
+    fn dispatch_claim_with_chunk_cannot_bypass_scope_admission() {
+        let (_d, wt) = chunk_wt(&[
+            ("chunk-1.md", "---\nfiles: [src/shared.rs]\n---\n"),
+            ("chunk-2.md", "---\nfiles: [src/shared.rs]\n---\n"),
+        ]);
+        let db = db("claim-chunk-scope").1;
+        chunk_row(&db, &wt, "chunk-1.md");
+        let result = claim_admitted_with_refresh(
+            &db,
+            NewDispatch {
+                issue_id: "linear:A-1",
+                worktree_path: &wt,
+                agent_name: "coder",
+                stage: Some("code"),
+                parent_id: None,
+                session_id: None,
+                artifact_path: Some("second.md"),
+                chunk_path: Some("chunk-2.md"),
+            },
+            3,
+            None,
+            &wt,
+            "linear:A-1",
+            Some("chunk-2.md"),
+            None,
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                result,
+                Err(thegn_core::db::DispatchAdmissionDecision::ScopeRefused(_))
+            ),
+            "{result:?}"
+        );
+        assert_eq!(
+            db.list_dispatches().unwrap().len(),
+            1,
+            "a refusal must not leave a queued row"
+        );
+    }
+
+    #[test]
+    fn prepared_scope_survives_incoming_chunk_file_replacement() {
+        let (_d, wt) = chunk_wt(&[("chunk.md", "---\nfiles: [approved.rs]\n---\n")]);
+        let db = db("claim-chunk-replacement").1;
+        let prepared = prepare_chunk_admission(&db, &wt, "linear:A-1", "chunk.md").unwrap();
+        std::fs::write(
+            std::path::Path::new(&wt).join("chunk.md"),
+            "---\nfiles: [replacement.rs]\n---\n",
+        )
+        .unwrap();
+        let result = db
+            .claim_dispatch_admitted(
+                NewDispatch {
+                    issue_id: "linear:A-1",
+                    worktree_path: &wt,
+                    agent_name: "coder",
+                    stage: Some("code"),
+                    parent_id: None,
+                    session_id: None,
+                    artifact_path: Some("handoff.md"),
+                    chunk_path: Some("chunk.md"),
+                },
+                2,
+                None,
+                Some(&prepared),
+                None,
+            )
+            .unwrap();
+        assert!(
+            result.is_ok(),
+            "admission must use the already parsed scope facts: {result:?}"
+        );
+        assert_eq!(db.list_dispatches().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_sibling_without_a_chunk_declares_no_scope_and_does_not_block() {
+        let (_d, wt) = chunk_wt(&[("chunk.md", "---\nfiles: [src/shared.rs]\n---\n")]);
+        let db = db("claim-no-chunk-sibling").1;
+        put(&db, NewDispatch::new("linear:A-1", &wt, "legacy")).unwrap();
+        let prepared = prepare_chunk_admission(&db, &wt, "linear:A-1", "chunk.md").unwrap();
+        assert!(prepared.siblings.is_empty());
+        let result = db
+            .claim_dispatch_admitted(
+                NewDispatch {
+                    chunk_path: Some("chunk.md"),
+                    ..NewDispatch::new("linear:A-1", &wt, "coder")
+                },
+                2,
+                None,
+                Some(&prepared),
+                None,
+            )
+            .unwrap();
+        assert!(
+            result.is_ok(),
+            "legacy row without a chunk path is out of scope: {result:?}"
+        );
+    }
+
+    #[test]
+    fn retained_dispatch_put_chunk_uses_the_shared_admission_path() {
+        let (_d, wt) = chunk_wt(&[
+            ("chunk-1.md", "---\nfiles: [src/shared.rs]\n---\n"),
+            ("chunk-2.md", "---\nfiles: [src/shared.rs]\n---\n"),
+        ]);
+        let db = db("put-chunk-scope").1;
+        chunk_row(&db, &wt, "chunk-1.md");
+        let result = claim_chunk_put(
+            &db,
+            NewDispatch {
+                issue_id: "linear:A-1",
+                worktree_path: &wt,
+                agent_name: "coder",
+                stage: Some("code"),
+                parent_id: None,
+                session_id: None,
+                artifact_path: Some("put-handoff.md"),
+                chunk_path: Some("chunk-2.md"),
+            },
+            3,
+            None,
+        );
+        assert!(result.unwrap_err().to_string().contains("collides"));
+        assert_eq!(db.list_dispatches().unwrap().len(), 1);
     }
 
     // --- run-completion contract (THE-76) -----------------------------------

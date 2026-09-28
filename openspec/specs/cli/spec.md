@@ -202,6 +202,20 @@ row's stage and parent.
 - **THEN** one row is appended and emitted with its new id, its queued status,
   and all four pipeline fields
 
+#### Scenario: Atomic admission of overlapping chunk claims
+
+- **WHEN** two chunk claims with overlapping `files:` scopes contend for a
+  stage with capacity for both
+- **THEN** the serialized admission grants at most one row, the other receives
+  a retryable refusal, and no refused row is left queued
+
+#### Scenario: A forced overlap is auditable
+
+- **WHEN** `thegn dispatch claim --chunk <file> --allow-scope-overlap <reason>`
+  admits an overlapping chunk
+- **THEN** the non-empty reason is recorded on the row and is visible in the
+  claim output and roster JSON
+
 #### Scenario: A parent that does not exist
 
 - **WHEN** `thegn dispatch put … --parent <unknown-id>` runs

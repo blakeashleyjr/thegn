@@ -494,6 +494,7 @@ pub const CATALOG: &[Slot] = &[
     // chunk 3) — a path under the worktree, like `parent_artifact`, so the
     // engine's filesystem completion is the intended behavior.
     slot("dispatch put", "chunk", SourceKind::Structural),
+    slot("dispatch put", "force_reason", SourceKind::Structural),
     slot("session open", "chunk", SourceKind::Structural),
     // --- pipeline slot claim + monitor lease --------------------------------
     // `dispatch claim` takes the same operands as `dispatch put`, so it takes
@@ -512,6 +513,11 @@ pub const CATALOG: &[Slot] = &[
     ),
     // The override's justification — operator prose, like a report body.
     slot("dispatch claim", "allow_duplicate", SourceKind::Structural),
+    slot(
+        "dispatch claim",
+        "allow_scope_overlap",
+        SourceKind::Structural,
+    ),
     // The lease verbs take an action word, an owner token, a TTL and a lease
     // name: all operator-chosen strings with no enumerable source.
     slot("dispatch lease", "action", SourceKind::Structural),
