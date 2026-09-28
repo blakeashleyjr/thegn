@@ -232,7 +232,11 @@ impl Db {
              FROM pipeline_approvals ORDER BY granted_at_ms DESC, id DESC LIMIT ?1",
         )?;
         let rows = stmt
-            .query_map([limit as i64], approval_from_row)?
+            // Clamped: `usize::MAX as i64` is -1, which SQLite reads as NO limit.
+            .query_map(
+                [i64::try_from(limit).unwrap_or(i64::MAX)],
+                approval_from_row,
+            )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }

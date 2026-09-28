@@ -708,6 +708,31 @@ fn validate_supervisor(cfg: &Config) -> Vec<String> {
             Some(req) => seen_land.push(req),
         }
     }
+    // Nothing is permitted to RUN a validation, yet something requires one to
+    // have passed. The mirror of the case below, and the more dangerous of the
+    // two: in this state no writer of validation results exists at all, so
+    // every affected lane parks forever with nothing to explain it.
+    if sup.enabled && !sup.validate_on_exit {
+        let green = Requirement::ValidationGreen.as_str();
+        if seen_land.contains(&Requirement::ValidationGreen) {
+            out.push(format!(
+                "pipeline.supervisor.land_requires: {green:?} can never be satisfied while \
+                 validate_on_exit = false — nothing would ever record a validation result; \
+                 set validate_on_exit = true, or drop the requirement"
+            ));
+        }
+        for (i, st) in stages.iter().enumerate() {
+            if st.parsed_requires().contains(&Requirement::ValidationGreen) {
+                out.push(format!(
+                    "{}.requires: {green:?} can never be satisfied while \
+                     pipeline.supervisor.validate_on_exit = false — nothing would ever record \
+                     a validation result; set validate_on_exit = true, or drop the requirement",
+                    label(i, st)
+                ));
+            }
+        }
+    }
+
     // A terminal stage must be able to satisfy a `validation:green` landing
     // gate, or every lane parks at the end of the chart.
     if seen_land.contains(&Requirement::ValidationGreen) {
@@ -1626,6 +1651,61 @@ permissions = ["Read", "Edit", "Bash(git:*)"]
         assert!(errs.iter().any(|e| e.contains("land_requires")), "{errs:?}");
 
         cfg.pipeline.stages[0].validate = vec!["nextest".into()];
+        assert!(validate_pipeline(&cfg).is_empty());
+    }
+
+    #[test]
+    fn requiring_a_green_validation_while_validation_is_off_is_refused() {
+        // The unsatisfiable configuration that survived the first pass: with
+        // `validate_on_exit = false` NOTHING writes a validation result, so a
+        // `validation:green` gate can never be met and every affected lane
+        // parks forever with no error to explain it.
+        let mut code = stage("code", Some("review"));
+        code.validate = vec!["nextest".into()];
+        let mut review = stage("review", None);
+        review.requires = vec!["validation:green".into()];
+        let mut cfg = cfg_with_task(vec![code, review]);
+        cfg.pipeline.supervisor.enabled = true;
+        cfg.pipeline.supervisor.validate_on_exit = false;
+
+        let errs = validate_pipeline(&cfg);
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("can never be satisfied") && e.contains("validate_on_exit")),
+            "{errs:?}"
+        );
+
+        // Turning validation back on makes the same chart valid.
+        cfg.pipeline.supervisor.validate_on_exit = true;
+        assert!(validate_pipeline(&cfg).is_empty());
+    }
+
+    #[test]
+    fn a_land_gate_requiring_green_while_validation_is_off_is_refused() {
+        let mut st = stage("code", None);
+        st.validate = vec!["nextest".into()];
+        let mut cfg = cfg_with_task(vec![st]);
+        cfg.pipeline.supervisor.enabled = true;
+        cfg.pipeline.supervisor.validate_on_exit = false;
+        cfg.pipeline.supervisor.land_requires = vec!["validation:green".into()];
+        let errs = validate_pipeline(&cfg);
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("land_requires") && e.contains("can never be satisfied")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn a_disabled_supervisor_does_not_police_validation_reachability() {
+        // The check is about what WILL happen, so it applies only to a
+        // supervisor that is switched on.
+        let mut code = stage("code", Some("review"));
+        code.validate = vec!["nextest".into()];
+        let mut review = stage("review", None);
+        review.requires = vec!["validation:green".into()];
+        let mut cfg = cfg_with_task(vec![code, review]);
+        cfg.pipeline.supervisor.validate_on_exit = false; // but enabled = false
         assert!(validate_pipeline(&cfg).is_empty());
     }
 

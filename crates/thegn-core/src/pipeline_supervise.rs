@@ -164,6 +164,17 @@ pub enum EscalationReason {
         /// The requirement that is not met.
         missing: Requirement,
     },
+    /// A requirement asks for a passing validation result, but nothing is
+    /// permitted to produce one — `validate_on_exit` is off.
+    ///
+    /// Deliberately distinct from [`Self::HandoffIncomplete`]: the lane's
+    /// handoff may be perfect, and reporting it as broken sends the reader
+    /// looking for a fault in the work instead of at the configuration. This is
+    /// the silent-park case, so it names the remedy.
+    ValidationNotPermitted {
+        /// The stage whose output cannot be validated.
+        stage: String,
+    },
     /// The chart names a `next` stage that is not configured — config drifted
     /// under a running pipeline.
     StageMissing {
@@ -180,6 +191,7 @@ impl EscalationReason {
             Self::ValidationUnresolved { .. } => "validation-unresolved",
             Self::AwaitingApproval { .. } => "awaiting-approval",
             Self::HandoffIncomplete { .. } => "handoff-incomplete",
+            Self::ValidationNotPermitted { .. } => "validation-not-permitted",
             Self::StageMissing { .. } => "stage-missing",
         }
     }
@@ -208,6 +220,12 @@ impl EscalationReason {
             Self::HandoffIncomplete { missing } => format!(
                 "the handoff is incomplete: {} is not satisfied",
                 missing.as_str()
+            ),
+            Self::ValidationNotPermitted { stage } => format!(
+                "stage {stage} requires a passing validation result, but \
+                 [pipeline.supervisor] validate_on_exit is false so nothing will ever record \
+                 one — set validate_on_exit = true, or drop the {:?} requirement",
+                Requirement::ValidationGreen.as_str()
             ),
             Self::StageMissing { name } => {
                 format!("`next` names {name:?}, which is not a configured stage")
@@ -356,6 +374,14 @@ impl SuperviseAction {
 ///
 /// Returns exactly one action per input lane, in input order. `now_ms` is the
 /// caller's clock (approval expiry is the only time-dependent rule).
+///
+/// **This function answers the counterfactual, and never consults
+/// `[pipeline.supervisor] enabled`.** That is deliberate: `supervise plan`'s
+/// whole job is to report what *would* happen on a chart the operator has not
+/// switched on yet. Honouring `enabled` is therefore the APPLIER's
+/// responsibility, and an applier that forgets it will act on a disabled
+/// supervisor. The per-capability switches (`validate_on_exit`, `advance`,
+/// `land`) are enforced here, because they change the plan itself.
 pub fn plan(
     lanes: &[LaneFacts],
     pipeline: &Pipeline,
@@ -413,7 +439,7 @@ fn plan_one(
         AgentDispatchStatus::Failed
         | AgentDispatchStatus::Abandoned
         | AgentDispatchStatus::Merged => {
-            return hold(row, "the row reached a terminal state a person recorded");
+            return hold(row, "the row already reached a terminal state");
         }
         AgentDispatchStatus::WaitingHuman => {
             // Deliberately NOT a hold: a parked row is often parked awaiting
@@ -622,7 +648,7 @@ fn check(
             .is_live(),
         };
         if !ok {
-            return Err(unmet(lane, req));
+            return Err(unmet(lane, req, sup));
         }
         met.push(req);
     }
@@ -634,23 +660,45 @@ fn check(
 /// A missing approval is categorically different from a missing artifact: the
 /// first is the pipeline working as designed and waiting for a person, the
 /// second is a broken handoff. Only the first rings the doorbell.
-fn unmet(lane: &LaneFacts, req: Requirement) -> EscalationReason {
+fn unmet(lane: &LaneFacts, req: Requirement, sup: &Supervisor) -> EscalationReason {
     match req {
         Requirement::Approval => EscalationReason::AwaitingApproval {
             stage: lane.stage.clone(),
             commit_sha: lane.head_sha.clone(),
         },
+        // Reachable only with `validate_on_exit = false` (config validation
+        // refuses that combination, but a config can be loaded without an
+        // explicit validate pass). Calling it a broken handoff would point the
+        // reader at the work instead of at the setting.
+        Requirement::ValidationGreen if !sup.validate_on_exit => {
+            EscalationReason::ValidationNotPermitted {
+                stage: lane.stage.clone(),
+            }
+        }
         other => EscalationReason::HandoffIncomplete { missing: other },
     }
 }
 
-/// Do two commit strings name the same commit, allowing either to be an
-/// abbreviation? Same rule the approval module applies, for the same reason:
-/// a short sha from `rev-parse --short` must match a full one.
+/// Do two RECORDED commit strings name the same commit?
 ///
-/// An empty string on either side matches nothing — an unrecorded commit must
-/// never read as "matches the current tip", which would make every stale
-/// validation look current.
+/// Exact (case-insensitive) equality, deliberately **unlike**
+/// [`crate::pipeline_approval`]'s prefix-aware comparison, and the difference
+/// is the point:
+///
+/// * an **approval** may be typed by a person, who has a `rev-parse --short`
+///   sha to hand, so it must match a full tip by prefix;
+/// * a **validation record** is written by machine from the full tip, and is
+///   keyed in SQLite on exact `commit_sha` equality.
+///
+/// Matching those reads by prefix while writing them by equality is an
+/// asymmetry with a live failure mode: if any writer ever recorded an
+/// abbreviated sha, every run would insert a *new* row at `attempts = 1`, the
+/// newest would always be found, the retry budget would never be reached, and
+/// the lane would re-validate forever. Exact matching here keeps read and write
+/// keyed identically.
+///
+/// An empty or too-short string matches nothing — an unrecorded commit must
+/// never read as "matches the current tip".
 fn commit_matches(a: &str, b: &str) -> bool {
     let (a, b) = (a.trim(), b.trim());
     if a.len() < crate::pipeline_approval::MIN_SHA_PREFIX
@@ -658,10 +706,7 @@ fn commit_matches(a: &str, b: &str) -> bool {
     {
         return false;
     }
-    let (short, long) = if a.len() <= b.len() { (a, b) } else { (b, a) };
-    long.chars()
-        .zip(short.chars())
-        .all(|(l, s)| l.eq_ignore_ascii_case(&s))
+    a.eq_ignore_ascii_case(b)
 }
 
 #[cfg(test)]
@@ -1020,6 +1065,31 @@ mod tests {
     }
 
     #[test]
+    fn a_required_validation_nobody_may_run_names_the_setting_not_the_work() {
+        // With `validate_on_exit = false` nothing ever records a result, so a
+        // `validation:green` requirement is permanently unmet. Reporting that
+        // as a broken handoff points the reader at the lane's work; the fault
+        // is in the configuration, and the message has to say so.
+        let mut p = chart();
+        p.stages[1].requires = vec!["validation:green".into()];
+        let mut s = sup();
+        s.validate_on_exit = false;
+        let l = lane("code");
+        match plan(&[l], &p, &s, NOW).pop().unwrap() {
+            SuperviseAction::Escalate { why, .. } => {
+                assert_eq!(why.token(), "validation-not-permitted");
+                let msg = why.explain();
+                assert!(msg.contains("validate_on_exit"), "{msg}");
+                assert!(
+                    !msg.contains("handoff"),
+                    "blamed the work instead of the setting: {msg}"
+                );
+            }
+            other => panic!("expected Escalate, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn an_incomplete_handoff_is_reported_as_broken_not_as_awaiting_a_person() {
         let mut l = lane("code");
         l.validations = vec![green("nextest", HEAD)];
@@ -1268,11 +1338,25 @@ mod tests {
     }
 
     #[test]
-    fn a_short_sha_matches_a_full_one_in_both_directions() {
+    fn a_person_may_approve_with_a_short_sha() {
+        // Approvals are typed by people, who have `rev-parse --short` to hand.
         let mut l = lane("code");
-        l.validations = vec![green("nextest", "4babb09")];
+        l.validations = vec![green("nextest", HEAD)];
         l.approval = Some(approval("4babb09"));
         assert_eq!(one(l).token(), "advance");
+    }
+
+    #[test]
+    fn a_validation_recorded_against_a_short_sha_is_not_treated_as_current() {
+        // The opposite rule, and the reason for it: validation records are
+        // machine-written from the full tip and keyed on exact equality in
+        // SQLite. Matching them by prefix while writing them by equality would
+        // let every run insert a fresh `attempts = 1` row, so the retry budget
+        // would never be reached and the lane would re-validate forever.
+        let mut l = lane("code");
+        l.validations = vec![green("nextest", "4babb09")];
+        let action = one(l);
+        assert_eq!(action.token(), "validate");
     }
 
     #[test]
@@ -1331,6 +1415,9 @@ mod tests {
             },
             EscalationReason::HandoffIncomplete {
                 missing: Requirement::ParentReport,
+            },
+            EscalationReason::ValidationNotPermitted {
+                stage: "code".into(),
             },
             EscalationReason::StageMissing { name: "n".into() },
         ];
