@@ -276,17 +276,16 @@ fn migrate(cfg: &Config, config_path: &std::path::Path, dry_run: bool) -> Result
         .password
         .as_ref()
         .filter(|password| password.is_literal() && password.secret_ref().is_configured())
+        && let Some(value) = password.expose_literal()
     {
-        if let Some(value) = password.expose_literal() {
-            if dry_run {
-                outln!("would migrate media.mpd.password (plaintext -> 0600 file)");
-                moved += 1;
-            } else {
-                let new_ref = secret::store_file("media-mpd", value)?;
-                config_write::set_key(config_path, "media.mpd.password", &new_ref)?;
-                outln!("migrated media.mpd.password -> {new_ref}");
-                moved += 1;
-            }
+        if dry_run {
+            outln!("would migrate media.mpd.password (plaintext -> 0600 file)");
+            moved += 1;
+        } else {
+            let new_ref = secret::store_file("media-mpd", value)?;
+            config_write::set_key(config_path, "media.mpd.password", &new_ref)?;
+            outln!("migrated media.mpd.password -> {new_ref}");
+            moved += 1;
         }
     }
 
