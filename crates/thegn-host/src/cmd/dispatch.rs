@@ -1029,13 +1029,9 @@ pub(crate) fn verify_facts(row: &AgentDispatch) -> pipeline_run::VerifyFacts {
 
 /// `dispatch reap` — reconcile active rows against the daemon and git.
 ///
-/// The three-way join a supervisor otherwise performs by hand. Liveness comes
-/// from the daemon when it is reachable; when it is NOT, every session reads as
-/// absent, which is correct — a restarted daemon really has lost them — and is
-/// safe, because a row is only ever auto-closed on a committed artifact plus a
-/// filed report. The genuinely ambiguous case (artifact committed, no report)
-/// is reported and left alone.
-/// Plan a reap of every active row against `live_ids` and git.
+/// Plan a reap of every active row against the daemon's live session snapshot
+/// and durable exit stamps. Missing both is unknown and cannot trigger a row
+/// transition.
 ///
 /// Shared with the daemon's periodic self-heal
 /// (`crate::daemon::pipeline_reaper`) so the two can never disagree about what
@@ -1045,7 +1041,7 @@ pub(crate) fn verify_facts(row: &AgentDispatch) -> pipeline_run::VerifyFacts {
 ///
 /// Blocking: reads each row's worktree and shells out to `git`, so a caller on
 /// an async runtime must run this inside `spawn_blocking`.
-pub(crate) fn reap_plan(db: &Db, live_ids: &[String]) -> Result<Vec<pipeline_reap::Reap>> {
+pub(crate) fn reap_plan(db: &Db, live_ids: Option<&[String]>) -> Result<Vec<pipeline_reap::Reap>> {
     let rows: Vec<_> = db
         .list_dispatches()?
         .into_iter()
@@ -1064,15 +1060,22 @@ pub(crate) fn reap_plan(db: &Db, live_ids: &[String]) -> Result<Vec<pipeline_rea
 /// git reads for each row.
 pub(crate) fn reap_plan_rows(
     rows: &[AgentDispatch],
-    live_ids: &[String],
+    live_ids: Option<&[String]>,
 ) -> Vec<pipeline_reap::Reap> {
     pipeline_reap::plan(rows, |r| {
         let f = verify_facts(r);
         pipeline_reap::ReapFacts {
-            session_live: r
+            worker: if r
                 .session_id
                 .as_deref()
-                .is_some_and(|s| live_ids.iter().any(|l| l == s)),
+                .is_some_and(|s| live_ids.is_some_and(|ids| ids.iter().any(|live| live == s)))
+            {
+                pipeline_reap::WorkerLiveness::Live
+            } else if r.exit_code.is_some() || r.exited_at_ms.is_some() {
+                pipeline_reap::WorkerLiveness::Exited
+            } else {
+                pipeline_reap::WorkerLiveness::Unknown
+            },
             artifact_exists: f.exists,
             artifact_tracked: f.tracked,
             report_present: f.report_present,
@@ -1083,9 +1086,10 @@ pub(crate) fn reap_plan_rows(
 
 fn reap(cfg: &Config, apply: bool, json: bool) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
-    let (live_ids, daemon_up) = rt.block_on(live_session_ids(cfg));
+    let live_ids = rt.block_on(live_session_ids(cfg));
+    let daemon_up = live_ids.is_some();
     let db = Db::open()?;
-    let plan = reap_plan(&db, &live_ids)?;
+    let plan = reap_plan(&db, live_ids.as_deref())?;
     let summary = pipeline_reap::summarize(&plan);
 
     if json {
@@ -1097,7 +1101,8 @@ fn reap(cfg: &Config, apply: bool, json: bool) -> Result<()> {
                     "verdict": r.verdict.token(),
                     "why": match &r.verdict {
                         pipeline_reap::ReapVerdict::MarkFailed { why }
-                        | pipeline_reap::ReapVerdict::NeedsDecision { why } => Some(*why),
+                        | pipeline_reap::ReapVerdict::NeedsDecision { why }
+                        | pipeline_reap::ReapVerdict::Unknown { why } => Some(*why),
                         _ => None,
                     },
                 })
@@ -1109,6 +1114,7 @@ fn reap(cfg: &Config, apply: bool, json: bool) -> Result<()> {
             "rows": items,
             "summary": {
                 "live": summary.live,
+                "unknown": summary.unknown,
                 "close_done": summary.close_done,
                 "mark_failed": summary.mark_failed,
                 "needs_decision": summary.needs_decision,
@@ -1117,14 +1123,16 @@ fn reap(cfg: &Config, apply: bool, json: bool) -> Result<()> {
     } else {
         if !daemon_up {
             outln!(
-                "note: no daemon reachable — every session reads as absent. That is correct \\
-                 after a restart, and safe: nothing closes without a committed artifact AND a \\
-                 report."
+                "note: daemon liveness is unavailable — rows without a durable exit stamp stay \\
+                 unknown. Retry when the daemon is reachable, or reconcile those rows by hand."
             );
         }
         for r in &plan {
             match &r.verdict {
                 pipeline_reap::ReapVerdict::Live => outln!("  {} live", r.id),
+                pipeline_reap::ReapVerdict::Unknown { why } => {
+                    outln!("  {} unknown: {why}", r.id);
+                }
                 pipeline_reap::ReapVerdict::MarkFailed { why }
                 | pipeline_reap::ReapVerdict::NeedsDecision { why } => {
                     outln!("  {} {}: {why}", r.id, r.verdict.token());
@@ -1133,8 +1141,9 @@ fn reap(cfg: &Config, apply: bool, json: bool) -> Result<()> {
             }
         }
         outln!(
-            "\\n{} live, {} to close done, {} to mark failed, {} need a decision",
+            "\n{} live, {} unknown, {} to close done, {} to mark failed, {} need a decision",
             summary.live,
+            summary.unknown,
             summary.close_done,
             summary.mark_failed,
             summary.needs_decision
@@ -1150,7 +1159,11 @@ fn reap(cfg: &Config, apply: bool, json: bool) -> Result<()> {
     if !apply {
         return Ok(());
     }
-    for r in &plan {
+    apply_reap_plan(&db, &plan)
+}
+
+fn apply_reap_plan(db: &Db, plan: &[pipeline_reap::Reap]) -> Result<()> {
+    for r in plan {
         match &r.verdict {
             pipeline_reap::ReapVerdict::CloseDone => {
                 // Plain, gated `done`: it passes unforced precisely because the
@@ -1181,22 +1194,52 @@ fn reap(cfg: &Config, apply: bool, json: bool) -> Result<()> {
     Ok(())
 }
 
-/// Live (non-tombstone) session ids, plus whether the daemon answered at all.
-async fn live_session_ids(cfg: &Config) -> (Vec<String>, bool) {
-    let Ok(client) = crate::cmd::session::connect(cfg).await else {
-        return (Vec::new(), false);
-    };
-    let Ok(sessions) = client.sessions().await else {
-        return (Vec::new(), false);
-    };
-    (
-        sessions
-            .into_iter()
-            .filter(|s| s.exited_at_ms.is_none())
-            .map(|s| s.id)
-            .collect(),
-        true,
+/// Live (non-tombstone) session ids. `None` means liveness could not be
+/// established; an available empty list remains a real observation.
+async fn live_session_ids(cfg: &Config) -> Option<Vec<String>> {
+    const QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+    query_live_sessions(
+        QUERY_TIMEOUT,
+        || crate::cmd::session::connect(cfg),
+        |client| async move {
+            let sessions = client.sessions().await?;
+            Ok(sessions
+                .into_iter()
+                .filter(|s| s.exited_at_ms.is_none())
+                .map(|s| s.id)
+                .collect())
+        },
     )
+    .await
+}
+
+async fn query_live_sessions<C, CFut, Client, L, LFut>(
+    timeout: std::time::Duration,
+    connect: C,
+    list: L,
+) -> Option<Vec<String>>
+where
+    C: FnOnce() -> CFut,
+    CFut: std::future::Future<Output = anyhow::Result<Client>>,
+    L: FnOnce(Client) -> LFut,
+    LFut: std::future::Future<Output = anyhow::Result<Vec<String>>>,
+{
+    match tokio::time::timeout(timeout, async {
+        let client = connect().await?;
+        list(client).await
+    })
+    .await
+    {
+        Ok(Ok(ids)) => Some(ids),
+        Ok(Err(error)) => {
+            tracing::debug!(target: "thegn::pipeline", %error, "reap could not query daemon liveness");
+            None
+        }
+        Err(_) => {
+            tracing::debug!(target: "thegn::pipeline", "reap daemon liveness query timed out");
+            None
+        }
+    }
 }
 
 fn verify(id: i64, json: bool) -> Result<()> {
@@ -2305,5 +2348,77 @@ mod tests {
         let err =
             row_report_artifact_from(Err(anyhow::anyhow!("database is corrupt"))).unwrap_err();
         assert!(err.to_string().contains("database is corrupt"), "{err}");
+    }
+
+    #[test]
+    fn daemon_connect_failure_produces_unknown_liveness() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let ids = rt.block_on(query_live_sessions(
+            std::time::Duration::from_secs(1),
+            || async { Err(anyhow::anyhow!("connect refused")) },
+            |_client: ()| async { Ok(Vec::new()) },
+        ));
+        assert_eq!(ids, None, "connect failure must be unknown, not empty");
+    }
+
+    #[test]
+    fn daemon_session_list_failure_produces_unknown_liveness() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let ids = rt.block_on(query_live_sessions(
+            std::time::Duration::from_secs(1),
+            || async { Ok::<_, anyhow::Error>(()) },
+            |_client: ()| async { Err(anyhow::anyhow!("session list failed")) },
+        ));
+        assert_eq!(ids, None, "list failure must be unknown, not empty");
+    }
+
+    #[test]
+    fn daemon_session_query_timeout_produces_unknown_liveness() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let ids = rt.block_on(query_live_sessions(
+            std::time::Duration::from_millis(1),
+            || std::future::pending::<anyhow::Result<()>>(),
+            |_client: ()| async { Ok(Vec::new()) },
+        ));
+        assert_eq!(ids, None, "timeout must be unknown, not empty");
+    }
+
+    #[test]
+    fn reachable_empty_session_list_still_reaps_a_durably_exited_row() {
+        let mut row = row_in(std::path::Path::new("/unused"), None);
+        row.exit_code = Some(0);
+        row.exited_at_ms = Some(1);
+        let plan = reap_plan_rows(&[row], Some(&[]));
+        assert!(matches!(
+            &plan[0].verdict,
+            pipeline_reap::ReapVerdict::MarkFailed { .. }
+        ));
+    }
+
+    #[test]
+    fn live_worker_is_never_marked_failed_or_done_while_daemon_query_is_unavailable() {
+        use thegn_core::store::NotificationStore;
+        let (_dir, db) = db("unknown-liveness");
+        let id = put(
+            &db,
+            NewDispatch {
+                session_id: Some("possibly-live-session"),
+                ..NewDispatch::new("linear:THE-209", "/wt/209", "worker")
+            },
+        )
+        .unwrap()
+        .id;
+        db.update_dispatch_status(id, AgentDispatchStatus::Running)
+            .unwrap();
+
+        let plan = reap_plan(&db, None).unwrap();
+        assert_eq!(plan[0].verdict.token(), "unknown");
+        assert_eq!(pipeline_reap::summarize(&plan).actionable(), 0);
+        apply_reap_plan(&db, &plan).unwrap();
+        assert_eq!(
+            db.get_dispatch(id).unwrap().unwrap().status,
+            AgentDispatchStatus::Running,
+            "unavailable daemon liveness must not fail or close a possibly-live worker"
+        );
     }
 }
