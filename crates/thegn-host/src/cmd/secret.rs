@@ -222,6 +222,7 @@ fn audit(cfg: &Config, json: bool) -> Result<()> {
 /// Migrate plaintext literals into the store and rewrite the config fields.
 fn migrate(cfg: &Config, config_path: &std::path::Path, dry_run: bool) -> Result<()> {
     let mut moved = 0usize;
+    let mut embedded_mpd_host_remains = false;
 
     // Issue-tracker account tokens (bare = literal).
     for acct in &cfg.issues.issue_accounts {
@@ -267,8 +268,61 @@ fn migrate(cfg: &Config, config_path: &std::path::Path, dry_run: bool) -> Result
         }
     }
 
+    // MPD config password (bare = historical literal). The stable config key
+    // remains unchanged so existing daemon credentials continue to work.
+    if let Some(password) = cfg
+        .media
+        .mpd
+        .password
+        .as_ref()
+        .filter(|password| password.is_literal() && password.secret_ref().is_configured())
+        && let Some(value) = password.expose_literal()
+    {
+        if dry_run {
+            outln!("would migrate media.mpd.password (plaintext -> 0600 file)");
+            moved += 1;
+        } else {
+            let new_ref = secret::store_file("media-mpd", value)?;
+            config_write::set_key(config_path, "media.mpd.password", &new_ref)?;
+            outln!("migrated media.mpd.password -> {new_ref}");
+            moved += 1;
+        }
+    }
+
+    if let Ok(host) = std::env::var("MPD_HOST")
+        && let Some(reference) = secret_scan::mpd_host_secret_ref(&host)
+        && let Some(value) = reference.expose_literal()
+    {
+        let socket_uses_host_env = cfg.media.mpd.socket.trim().is_empty()
+            || cfg.media.mpd.socket.trim() == "127.0.0.1:6600";
+        if socket_uses_host_env && cfg.media.mpd.password.is_none() {
+            embedded_mpd_host_remains = true;
+            if dry_run {
+                outln!(
+                    "would migrate MPD_HOST embedded credential to media.mpd.password (plaintext -> 0600 file)"
+                );
+                moved += 1;
+            } else {
+                let new_ref = secret::store_file("media-mpd", value)?;
+                config_write::set_key(config_path, "media.mpd.password", &new_ref)?;
+                outln!("migrated MPD_HOST credential to media.mpd.password -> {new_ref}");
+                moved += 1;
+            }
+        } else {
+            embedded_mpd_host_remains = true;
+        }
+    }
+
+    if embedded_mpd_host_remains {
+        outln!(
+            "MPD_HOST still contains an embedded plaintext password; remove the password@ prefix and keep only the host"
+        );
+    }
+
     if moved == 0 {
-        outln!("no plaintext secrets to migrate — config is clean");
+        if !embedded_mpd_host_remains {
+            outln!("no plaintext secrets to migrate — config is clean");
+        }
     } else if dry_run {
         msg::info(&format!(
             "{moved} plaintext secret(s) would move; re-run without --dry-run to apply"
