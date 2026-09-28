@@ -545,6 +545,18 @@ pub(crate) struct Cached {
 /// deserialize (a newer schema, a corrupt write) is skipped rather than
 /// losing the whole month, but counted, so the caller can say the view is
 /// incomplete instead of presenting it as complete.
+///
+/// Date-taking convenience for the cache-mechanics tests (row counts, deserialize
+/// failures). **UTC only** — production always goes through `load_cached_window`
+/// with the home-zone window, and zone behaviour is covered by the explicit-zone
+/// endpoint/DST tests rather than by this wrapper.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "date-taking cache wrapper used only by the hydrate_calendar tests"
+    )
+)]
 fn load_cached(db: &Db, from: NaiveDate, to: NaiveDate) -> Result<Cached, CalendarViewError> {
     let window = CalendarWindow::new(from, to, chrono_tz::Tz::UTC)
         .ok_or(CalendarViewError::InvalidWindow)?;
