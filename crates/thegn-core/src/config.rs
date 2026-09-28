@@ -7286,7 +7286,7 @@ fn read_tolerant_config_source(path: &Path) -> Result<Option<String>, String> {
     if !metadata.file_type().is_file() {
         let kind = config_source_kind(&metadata);
         return Err(format!(
-            "config source is a {kind}, not a regular file: {}",
+            "config source is {kind}, not a regular file: {}",
             path.display()
         ));
     }
