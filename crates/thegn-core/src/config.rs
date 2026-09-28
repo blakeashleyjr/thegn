@@ -3609,8 +3609,11 @@ impl schemars::JsonSchema for AppTabId {
         "AppTabId".into()
     }
 
-    fn inline_schema() -> bool {
-        true
+    // Schemars 0.8 spells "inline me rather than emit a `$ref`" as
+    // `is_referenceable() -> false`; `inline_schema` is the 1.x name and is not a
+    // member of this trait (E0407).
+    fn is_referenceable() -> bool {
+        false
     }
 
     fn json_schema(_: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
