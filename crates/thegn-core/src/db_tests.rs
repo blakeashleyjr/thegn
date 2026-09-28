@@ -3914,6 +3914,141 @@ fn claim_allows_parallel_chunks_but_enforces_the_stage_budget() {
     assert_eq!(db.list_dispatches().unwrap().len(), 3);
 }
 
+#[test]
+fn chunk_claim_fails_closed_for_unreadable_active_scope_and_leaves_no_row() {
+    let db = Db::open_memory().unwrap();
+    let sibling = db
+        .put_agent_dispatch(crate::issue::NewDispatch {
+            chunk_path: Some("missing.md"),
+            ..crate::issue::NewDispatch::new("linear:A-1", "/wt/shared", "code")
+        })
+        .unwrap();
+    let prepared = crate::pipeline_chunk::PreparedChunkAdmission {
+        path: "incoming.md".into(),
+        scope: crate::pipeline_chunk::ChunkScope {
+            files: vec!["src/a.rs".into()],
+            ..Default::default()
+        },
+        siblings: vec![crate::pipeline_chunk::PreparedSiblingScope {
+            row: sibling,
+            path: "missing.md".into(),
+            scope: Some(Err("No such file".into())),
+        }],
+    };
+    let result = db
+        .claim_dispatch_admitted(
+            crate::issue::NewDispatch {
+                chunk_path: Some("incoming.md"),
+                ..claim_new("linear:A-1", "/wt/shared", "code", "incoming.md")
+            },
+            3,
+            None,
+            Some(&prepared),
+            None,
+        )
+        .unwrap();
+    let refusal = result.unwrap_err();
+    assert!(matches!(
+        refusal,
+        crate::db_dispatch::DispatchAdmissionDecision::ScopeRefused(_)
+    ));
+    assert!(format!("{refusal:?}").contains("missing.md"));
+    assert!(format!("{refusal:?}").contains(&sibling.to_string()));
+    assert_eq!(
+        db.list_dispatches().unwrap().len(),
+        1,
+        "refused admission must not insert a row"
+    );
+}
+
+#[test]
+fn forced_chunk_overlap_requires_and_records_a_reason() {
+    let db = Db::open_memory().unwrap();
+    db.put_agent_dispatch(crate::issue::NewDispatch {
+        chunk_path: Some("one.md"),
+        ..crate::issue::NewDispatch::new("linear:A-1", "/wt/shared", "code")
+    })
+    .unwrap();
+    let result = db
+        .claim_dispatch_admitted(
+            crate::issue::NewDispatch {
+                chunk_path: Some("two.md"),
+                ..claim_new("linear:A-1", "/wt/shared", "code", "two.md")
+            },
+            3,
+            None,
+            None,
+            Some("separate ownership reviewed"),
+        )
+        .unwrap()
+        .unwrap();
+    let row = db.get_dispatch(result).unwrap().unwrap();
+    assert!(
+        row.note
+            .unwrap_or_default()
+            .contains("separate ownership reviewed")
+    );
+    assert!(
+        db.claim_dispatch_admitted(
+            crate::issue::NewDispatch {
+                chunk_path: Some("three.md"),
+                ..claim_new("linear:A-1", "/wt/shared", "code", "three.md")
+            },
+            3,
+            None,
+            None,
+            Some(" \t"),
+        )
+        .is_err(),
+        "whitespace-only override reason must refuse"
+    );
+}
+
+#[test]
+fn after_satisfaction_is_rechecked_with_status_inside_chunk_admission() {
+    let db = Db::open_memory().unwrap();
+    let sibling = db
+        .put_agent_dispatch(crate::issue::NewDispatch {
+            chunk_path: Some("chunk-1.md"),
+            ..crate::issue::NewDispatch::new("linear:A-1", "/wt/shared", "code")
+        })
+        .unwrap();
+    let mut prepared = crate::pipeline_chunk::PreparedChunkAdmission {
+        path: "chunk-2.md".into(),
+        scope: crate::pipeline_chunk::ChunkScope {
+            after: vec!["chunk-1".into()],
+            ..Default::default()
+        },
+        siblings: vec![crate::pipeline_chunk::PreparedSiblingScope {
+            row: sibling,
+            path: "chunk-1.md".into(),
+            scope: Some(Ok(crate::pipeline_chunk::ChunkScope::default())),
+        }],
+    };
+    let new = || crate::issue::NewDispatch {
+        chunk_path: Some("chunk-2.md"),
+        ..claim_new("linear:A-1", "/wt/shared", "code", "chunk-2.md")
+    };
+    let refused = db
+        .claim_dispatch_admitted(new(), 3, None, Some(&prepared), None)
+        .unwrap()
+        .unwrap_err();
+    assert!(matches!(
+        refused,
+        crate::db_dispatch::DispatchAdmissionDecision::ScopeRefused(_)
+    ));
+    assert_eq!(db.list_dispatches().unwrap().len(), 1);
+
+    db.update_dispatch_status(sibling, crate::issue::AgentDispatchStatus::Done)
+        .unwrap();
+    prepared.siblings.clear(); // terminal rows do not participate in file scope
+    assert!(
+        db.claim_dispatch_admitted(new(), 3, None, Some(&prepared), None)
+            .unwrap()
+            .is_ok()
+    );
+}
+
 /// Race two callers against separate connections to the same file-backed DB.
 /// Opening both handles before the barrier is important: this exercises
 /// `claim_dispatch`'s `BEGIN IMMEDIATE` serialization, not database bootstrap.
@@ -4001,6 +4136,131 @@ fn simultaneous_equivalent_claims_cannot_duplicate_an_artifact() {
         "the loser sees the artifact-aware duplicate: {decisions:?}"
     );
     assert_eq!(rows.len(), 1, "the duplicate refusal must not append a row");
+}
+
+fn prepared_scope(path: &str, file: &str) -> crate::pipeline_chunk::PreparedChunkAdmission {
+    crate::pipeline_chunk::PreparedChunkAdmission {
+        path: path.into(),
+        scope: crate::pipeline_chunk::ChunkScope {
+            files: vec![file.into()],
+            ..Default::default()
+        },
+        siblings: vec![],
+    }
+}
+
+/// File-backed two-connection race for the combined scope + slot + insert
+/// decision. A loser refreshes the roster facts outside the transaction, just
+/// as the host does, then retries against the winner's normalized scope.
+fn race_chunk_admissions(
+    right_file: &'static str,
+) -> Vec<crate::db_dispatch::DispatchAdmissionDecision> {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("scope-race.db");
+    drop(Db::open_at(&path).unwrap());
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+    let handles: Vec<_> = [("chunk-1.md", "shared.rs"), ("chunk-2.md", right_file)]
+        .into_iter()
+        .map(|(chunk, file)| {
+            let path = path.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                let db = Db::open_at(&path).unwrap();
+                let mut prepared = prepared_scope(chunk, file);
+                barrier.wait();
+                let new = || crate::issue::NewDispatch {
+                    chunk_path: Some(chunk),
+                    ..claim_new("linear:A-1", "/wt/shared", "code", chunk)
+                };
+                let mut result = db
+                    .claim_dispatch_admitted(new(), 3, None, Some(&prepared), None)
+                    .unwrap();
+                let mut stale = None;
+                if let Err(crate::db_dispatch::DispatchAdmissionDecision::RetryScopeSnapshot {
+                    row,
+                    path,
+                }) = &result
+                {
+                    stale = Some((*row, path.clone()));
+                    let rows = db.list_dispatches().unwrap();
+                    prepared.siblings = rows
+                        .into_iter()
+                        .filter(|r| r.status.is_active())
+                        .map(|r| {
+                            let other = r.chunk_path.unwrap();
+                            let files = if other == "chunk-1.md" {
+                                vec!["shared.rs".into()]
+                            } else {
+                                vec![right_file.into()]
+                            };
+                            crate::pipeline_chunk::PreparedSiblingScope {
+                                row: r.id,
+                                path: other,
+                                scope: Some(Ok(crate::pipeline_chunk::ChunkScope {
+                                    files,
+                                    ..Default::default()
+                                })),
+                            }
+                        })
+                        .collect();
+                    result = db
+                        .claim_dispatch_admitted(new(), 3, None, Some(&prepared), None)
+                        .unwrap();
+                    if matches!(
+                        &result,
+                        Err(crate::db_dispatch::DispatchAdmissionDecision::ScopeRefused(
+                            _
+                        ))
+                    ) {
+                        let (row, path) = stale.take().unwrap();
+                        result = Err(
+                            crate::db_dispatch::DispatchAdmissionDecision::RetryScopeSnapshot {
+                                row,
+                                path,
+                            },
+                        );
+                    }
+                }
+                result.map_err(|d| d)
+            })
+        })
+        .collect();
+    barrier.wait();
+    let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    let rows = Db::open_at(&path).unwrap().list_dispatches().unwrap();
+    assert_eq!(rows.len(), results.iter().filter(|r| r.is_ok()).count());
+    results
+}
+
+#[test]
+fn simultaneous_overlapping_chunk_admissions_grant_exactly_one_and_refuse_the_other() {
+    let results = race_chunk_admissions("shared.rs");
+    assert_eq!(
+        results.iter().filter(|r| r.is_ok()).count(),
+        1,
+        "{results:?}"
+    );
+    assert_eq!(
+        results
+            .iter()
+            .filter(|r| matches!(
+                r,
+                Err(crate::db_dispatch::DispatchAdmissionDecision::RetryScopeSnapshot { .. })
+            ))
+            .count(),
+        1,
+        "{results:?}"
+    );
+}
+
+#[test]
+fn simultaneous_disjoint_chunk_admissions_both_fit_the_stage_budget() {
+    let results = race_chunk_admissions("other.rs");
+    assert_eq!(
+        results.iter().filter(|r| r.is_ok()).count(),
+        2,
+        "{results:?}"
+    );
 }
 
 #[test]

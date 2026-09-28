@@ -968,14 +968,8 @@ async fn open_stage(cfg: &Config, client: &ControlClient, d: StageDispatch<'_>) 
         ),
         None => None,
     };
-    // 6. The chunk-scope gate BEFORE the insert — a refused dispatch must
-    //    leave no row behind. Same helper `dispatch put --chunk` uses (two
-    //    callers, one refusal); no --force here: an intentional overlap is
-    //    declared in the chunk's `overlaps:` frontmatter, and the explicit
-    //    override lives on `dispatch put`.
-    if let Some(chunk_path) = d.chunk {
-        super::dispatch::chunk_gate(&db, &wt, d.issue, chunk_path, false)?;
-    }
+    // 6. Chunk scope is prepared before the DB lock by shared admission.
+    // Session open deliberately has no scope override.
     // 6b. Insert the roster row BEFORE opening the session (D5).
     let agent_name = d
         .agent
@@ -995,7 +989,8 @@ async fn open_stage(cfg: &Config, client: &ControlClient, d: StageDispatch<'_>) 
     // the previous attempt is unaffected — only rows still occupying a slot
     // refuse. The deliberate-duplicate escape hatch lives on `dispatch claim
     // --allow-duplicate <reason>`, which records the justification.
-    let row_id = match db.claim_dispatch(
+    let outcome = super::dispatch::claim_admitted_with_refresh(
+        &db,
         NewDispatch {
             issue_id: d.issue,
             worktree_path: &wt,
@@ -1008,9 +1003,14 @@ async fn open_stage(cfg: &Config, client: &ControlClient, d: StageDispatch<'_>) 
         },
         stage.concurrency,
         None,
-    )? {
+        &wt,
+        d.issue,
+        d.chunk,
+        None,
+    )?;
+    let row_id = match outcome {
         Ok(id) => id,
-        Err(decision) => {
+        Err(thegn_core::db::DispatchAdmissionDecision::Claim(decision)) => {
             let reason = decision.reason();
             if d.json {
                 super::emit_json(&serde_json::json!({
@@ -1021,6 +1021,24 @@ async fn open_stage(cfg: &Config, client: &ControlClient, d: StageDispatch<'_>) 
             return Err(anyhow::Error::new(crate::cmd::Retryable(anyhow::anyhow!(
                 "stage dispatch refused: {reason}\n(override with `thegn dispatch claim … \
                  --allow-duplicate <reason>` if this really is separate work)"
+            ))));
+        }
+        Err(thegn_core::db::DispatchAdmissionDecision::ScopeRefused(reason)) => {
+            if d.json {
+                super::emit_json(
+                    &serde_json::json!({"granted": false, "reason": reason, "retryable": false}),
+                )?;
+            }
+            anyhow::bail!("{reason}");
+        }
+        Err(thegn_core::db::DispatchAdmissionDecision::RetryScopeSnapshot { row, path }) => {
+            if d.json {
+                super::emit_json(
+                    &serde_json::json!({"granted": false, "reason": format!("scope snapshot changed at row {row} ({path}); retry admission"), "retryable": true}),
+                )?;
+            }
+            return Err(anyhow::Error::new(crate::cmd::Retryable(anyhow::anyhow!(
+                "scope snapshot changed at row {row} ({path}); retry admission"
             ))));
         }
     };
