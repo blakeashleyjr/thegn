@@ -1853,6 +1853,20 @@ fn caldav_reports_real_delta_support() {
     assert!(matches!(err, CalendarError::NotConfigured));
 }
 
+#[test]
+fn caldav_query_uses_resolved_utc_half_open_window() {
+    let day = chrono::NaiveDate::from_ymd_opt(2026, 1, 15).unwrap();
+    let window = thegn_core::calendar::CalendarWindow::new(
+        day,
+        day,
+        thegn_core::calendar::Tz::Asia__Kolkata,
+    )
+    .unwrap();
+    let xml = caldav::calendar_query_body(window);
+    assert!(xml.contains(r#"<c:time-range start="20260114T183000Z" end="20260115T183000Z"/>"#));
+    assert!(!xml.contains("235959Z"));
+}
+
 // --- caldav xml -------------------------------------------------------------
 
 #[test]
@@ -2278,8 +2292,10 @@ fn applying_each_page_before_the_next_fetch_prevents_starvation() {
     let pool = AdmissionPool::new(1, 64 << 20);
     let r = CalendarRouter::from_config_with_pool(&cfg, pool.clone());
     let (from, to) = window();
+    let range =
+        thegn_core::calendar::CalendarWindow::new(from, to, thegn_core::calendar::Tz::UTC).unwrap();
     let mut ok = 0;
-    block_on(r.list_events_each(from, to, &BTreeMap::new(), |res| {
+    block_on(r.list_events_each(range, &BTreeMap::new(), |res| {
         assert!(res.result.is_ok(), "{:?}", res.result.err());
         ok += 1;
     }));

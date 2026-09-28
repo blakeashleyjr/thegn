@@ -38,6 +38,49 @@ pub use tz::{
     ClockFormat, ClockReading, GapPolicy, ResolvedClock, TzRef, read_clocks, resolve_zone,
 };
 
+/// Canonical calendar query range: inclusive local dates paired with their
+/// resolved half-open UTC instant interval.
+///
+/// Construct this once for a home zone and pass it through cache and provider
+/// queries so the local-date and instant representations cannot drift.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CalendarWindow {
+    pub from: NaiveDate,
+    pub to: NaiveDate,
+    pub start_ms: i64,
+    pub end_exclusive_ms: i64,
+}
+
+impl CalendarWindow {
+    /// Resolve `[from, day after to)` in `home` using the calendar's standard
+    /// gap policy. Invalid or unrepresentable windows return `None`.
+    pub fn new(from: NaiveDate, to: NaiveDate, home: chrono_tz::Tz) -> Option<Self> {
+        if from > to {
+            return None;
+        }
+        let end_date = to.succ_opt()?;
+        // Annotated, and with no `?` in the body: a `?` inside a closure returns from
+        // the *closure*, which left its return type ambiguous (E0282).
+        let midnight = |date: NaiveDate| -> Option<NaiveDateTime> { date.and_hms_opt(0, 0, 0) };
+        let start = tz::resolve_local(midnight(from)?, home, GapPolicy::ShiftForward)?;
+        let end = tz::resolve_local(midnight(end_date)?, home, GapPolicy::ShiftForward)?;
+        let start_ms = start.timestamp_millis();
+        let end_exclusive_ms = end.timestamp_millis();
+        (start_ms < end_exclusive_ms).then_some(Self {
+            from,
+            to,
+            start_ms,
+            end_exclusive_ms,
+        })
+    }
+}
+
+/// Re-exported so callers can name `CalendarWindow`'s zone parameter without
+/// taking a `chrono-tz` dependency of their own — `thegn-svc` needs the type only
+/// to call into this module, and the dependency closure is something this repo is
+/// actively cutting (THE-669).
+pub use chrono_tz::Tz;
+
 use chrono::{DateTime, Days, NaiveDate, NaiveDateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
