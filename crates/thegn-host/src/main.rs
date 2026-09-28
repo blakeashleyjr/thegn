@@ -134,6 +134,7 @@ mod media_art;
 mod media_ctl;
 #[path = "handlers/media_panel.rs"]
 mod media_panel;
+mod media_secret;
 mod media_watch;
 mod mem;
 mod menu;
