@@ -40,6 +40,16 @@ impl FakeApi {
     fn calls(&self) -> Vec<String> {
         self.calls.lock().unwrap().clone()
     }
+    fn publish(&self, frame: EventFrame) {
+        if let Some(events) = self.events.get() {
+            let _ = events.send(Arc::new(frame));
+        }
+    }
+    fn event_receivers(&self) -> usize {
+        self.events
+            .get()
+            .map_or(0, |events| events.receiver_count())
+    }
 }
 
 impl ControlApi for FakeApi {
@@ -363,8 +373,58 @@ fn rig(local_admin: bool) -> Rig {
         require_approval: false,
         server_label: "test thegn".into(),
         cors_origins: Vec::new(),
+        event_streams: Default::default(),
     };
     Rig { api, state, db }
+}
+
+async fn event_server(r: &Rig) -> (String, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = router(r.state.clone());
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (format!("ws://{addr}/v1/events"), server)
+}
+
+async fn connect_event_stream(
+    url: &str,
+    token: &str,
+) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let mut request = url.into_client_request().unwrap();
+    request
+        .headers_mut()
+        .insert("authorization", format!("Bearer {token}").parse().unwrap());
+    tokio_tungstenite::connect_async(request).await.unwrap().0
+}
+
+async fn receive_hello(
+    stream: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+) {
+    use futures_util::StreamExt as _;
+    let message = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+        .await
+        .expect("hello deadline")
+        .expect("hello frame")
+        .unwrap();
+    assert!(matches!(
+        message,
+        tokio_tungstenite::tungstenite::Message::Binary(_)
+    ));
+}
+
+async fn wait_for_active(metrics: &super::http::EventStreamMetrics, expected: usize) {
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while metrics.active() != expected {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("event stream active counter did not settle");
 }
 
 /// Mint + persist a token with `scopes`, returning the bearer string.
@@ -823,6 +883,161 @@ async fn sse_rejects_attach_only_filters_as_bad_requests() {
 }
 
 #[tokio::test]
+async fn event_websocket_close_after_hello_releases_receiver_and_repeated_connections() {
+    use futures_util::{SinkExt as _, StreamExt as _};
+
+    let r = rig(false);
+    let token = token(&r, "read");
+    let (url, server) = event_server(&r).await;
+    let metrics = r.state.event_streams.clone();
+    for _ in 0..24 {
+        let mut stream = connect_event_stream(&url, &token).await;
+        receive_hello(&mut stream).await;
+        wait_for_active(&metrics, 1).await;
+        assert_eq!(r.api.event_receivers(), 1);
+        stream.close(None).await.unwrap();
+        let closed = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+            .await
+            .expect("server must release the closed peer promptly");
+        assert!(
+            closed.is_none()
+                || matches!(
+                    closed,
+                    Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_)))
+                )
+        );
+        wait_for_active(&metrics, 0).await;
+        assert_eq!(r.api.event_receivers(), 0);
+    }
+    assert_eq!(metrics.active(), 0);
+    assert_eq!(metrics.rejected(), 0);
+    server.abort();
+}
+
+#[tokio::test]
+async fn event_websocket_answers_ping_and_discards_client_data() {
+    use futures_util::{SinkExt as _, StreamExt as _};
+    use tokio_tungstenite::tungstenite::Message;
+
+    let r = rig(false);
+    let token = token(&r, "read");
+    let (url, server) = event_server(&r).await;
+    let mut stream = connect_event_stream(&url, &token).await;
+    receive_hello(&mut stream).await;
+    stream
+        .send(Message::Text("must be ignored".into()))
+        .await
+        .unwrap();
+    stream.send(Message::Ping(vec![7, 8].into())).await.unwrap();
+    let pong = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+        .await
+        .expect("pong deadline")
+        .expect("pong frame")
+        .unwrap();
+    assert_eq!(pong, Message::Pong(vec![7, 8].into()));
+    assert_eq!(
+        r.api.calls(),
+        [],
+        "client data must not invoke control APIs"
+    );
+
+    r.api.publish(EventFrame::Sessions);
+    let event = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+        .await
+        .expect("event delivery deadline")
+        .expect("event frame")
+        .unwrap();
+    assert!(matches!(event, Message::Binary(_)));
+    stream.close(None).await.unwrap();
+    wait_for_active(&r.state.event_streams, 0).await;
+    server.abort();
+}
+
+#[tokio::test]
+async fn event_websocket_connection_cap_rejects_with_close_and_counts_rejection() {
+    use futures_util::{SinkExt as _, StreamExt as _};
+    use tokio_tungstenite::tungstenite::Message;
+
+    let r = rig(false);
+    let token = token(&r, "read");
+    let (url, server) = event_server(&r).await;
+    let metrics = r.state.event_streams.clone();
+    let mut streams = Vec::new();
+    for _ in 0..128 {
+        let mut stream = connect_event_stream(&url, &token).await;
+        receive_hello(&mut stream).await;
+        streams.push(stream);
+    }
+    wait_for_active(&metrics, 128).await;
+
+    let mut refused = connect_event_stream(&url, &token).await;
+    let close = tokio::time::timeout(std::time::Duration::from_secs(2), refused.next())
+        .await
+        .expect("cap close deadline")
+        .expect("cap close frame")
+        .unwrap();
+    match close {
+        Message::Close(Some(frame)) => {
+            assert!(frame.reason.contains("connection limit"));
+        }
+        other => panic!("expected reasoned cap close, got {other:?}"),
+    }
+    assert_eq!(metrics.active(), 128);
+    assert_eq!(metrics.rejected(), 1);
+
+    for stream in &mut streams {
+        let _ = stream.close(None).await;
+    }
+    wait_for_active(&metrics, 0).await;
+    server.abort();
+}
+
+#[tokio::test]
+async fn slow_event_websocket_does_not_block_publication_or_healthy_consumer() {
+    use futures_util::{SinkExt as _, StreamExt as _};
+    use tokio_tungstenite::tungstenite::Message;
+
+    let r = rig(false);
+    let token = token(&r, "read");
+    let (url, server) = event_server(&r).await;
+    let mut slow = connect_event_stream(&url, &token).await;
+    receive_hello(&mut slow).await;
+    let mut healthy = connect_event_stream(&url, &token).await;
+    receive_hello(&mut healthy).await;
+
+    // The API's broadcast send is synchronous and bounded. Flooding past its
+    // capacity may lag/drop the slow receiver, but must not delay publication.
+    let started = std::time::Instant::now();
+    for n in 0..128 {
+        r.api.publish(EventFrame::SessionExit {
+            session: format!("s{n}"),
+            code: Some(n),
+        });
+    }
+    assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    let mut saw_event = false;
+    for _ in 0..16 {
+        let message = tokio::time::timeout(std::time::Duration::from_secs(2), healthy.next())
+            .await
+            .expect("healthy consumer deadline")
+            .expect("healthy consumer remains connected")
+            .unwrap();
+        if matches!(message, Message::Binary(_)) {
+            saw_event = true;
+            break;
+        }
+    }
+    assert!(
+        saw_event,
+        "healthy consumer should receive broadcast events"
+    );
+    let _ = slow.close(None).await;
+    let _ = healthy.close(None).await;
+    wait_for_active(&r.state.event_streams, 0).await;
+    server.abort();
+}
+
+#[tokio::test]
 async fn missing_revoked_and_expired_tokens_are_401() {
     let r = rig(false);
     assert_eq!(
@@ -955,6 +1170,7 @@ async fn pairing_lifecycle_publishes_feed_frames() {
         require_approval: true, // redeemed tokens park ⇒ Requested
         server_label: "test thegn".into(),
         cors_origins: Vec::new(),
+        event_streams: Default::default(),
     };
     let code = auth::mint(
         TokenKind::PairingCode,
