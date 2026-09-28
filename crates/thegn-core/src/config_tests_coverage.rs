@@ -643,7 +643,7 @@ fn media_config_defaults_and_enums() {
         "typed password references redact their own Debug output"
     );
     assert_eq!(
-        thegn_core::config_media::MpdSecretRef::parse(" spaced password ").expose_literal(),
+        crate::config_media::MpdSecretRef::parse(" spaced password ").expose_literal(),
         Some(" spaced password "),
         "legacy literals preserve their exact bytes"
     );
