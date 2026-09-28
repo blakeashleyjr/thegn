@@ -22,7 +22,7 @@ pub(crate) fn resolve_opts(
 
     let configured = cfg.mpd.password.as_ref().map(|value| value.secret_ref());
     if let Some(reference) = configured.or(embedded.as_ref()) {
-        let value = match resolve_ref_for_outcome(&reference, CONSUMER) {
+        let value = match resolve_ref_for_outcome(reference, CONSUMER) {
             Ok(Some(value)) => value,
             Ok(None) if opts.backend == thegn_media::BackendKind::Auto => {
                 let outcome = SecretResolveFailure::Missing;
@@ -132,8 +132,10 @@ mod tests {
 
     #[test]
     fn explicit_missing_ref_fails_before_mpd_client_construction() {
-        let mut cfg = MediaConfig::default();
-        cfg.backend = thegn_core::config::MediaBackendKind::Mpd;
+        let mut cfg = MediaConfig {
+            backend: thegn_core::config::MediaBackendKind::Mpd,
+            ..MediaConfig::default()
+        };
         cfg.mpd.password = Some("env:TG_MPD_SECRET_DEFINITELY_UNSET".into());
         assert!(matches!(
             resolve_opts(&cfg),
