@@ -925,7 +925,7 @@ fn sandbox_warm_direnv_and_prepare_parse() {
 // ---- AppsConfig::effective_tab_order / normalized_default_tab edges ----
 
 #[test]
-fn effective_tab_order_dedups_and_appends_missing() {
+fn effective_tab_order_dedups_and_preserves_configured_ids() {
     let a = AppsConfig {
         // duplicates, unknown ids, and a whitespace-padded built-in.
         default_tab: "work".into(),
@@ -939,17 +939,17 @@ fn effective_tab_order_dedups_and_appends_missing() {
         ],
     };
     // Unknown ids are filtered here for tolerant callers; config validation
-    // separately refuses them. Known ids are trimmed, deduped, and completed.
+    // separately refuses them. Known ids are trimmed and deduped in user order.
     assert_eq!(a.effective_tab_order(), vec!["work", "observe"]);
 }
 
 #[test]
-fn effective_tab_order_empty_falls_back_to_builtins() {
+fn effective_tab_order_empty_falls_back_to_work_only() {
     let a = AppsConfig {
         default_tab: "work".into(),
         tab_order: Vec::new(),
     };
-    assert_eq!(a.effective_tab_order(), vec!["work", "observe"]);
+    assert_eq!(a.effective_tab_order(), vec!["work"]);
 }
 
 #[test]

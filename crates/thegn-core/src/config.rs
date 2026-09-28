@@ -3526,7 +3526,7 @@ pub struct AppsConfig {
     /// Tab focused on startup. Valid ids come from `BUILTIN_TABS`.
     #[schemars(with = "AppTabId")]
     pub default_tab: String,
-    /// Ordered top-level tab ids. Missing built-in tabs are appended; duplicates are ignored.
+    /// Ordered top-level tab ids. Unlisted known tabs stay disabled; duplicates are ignored.
     #[schemars(with = "Vec<AppTabId>")]
     pub tab_order: Vec<String>,
 }
@@ -3541,10 +3541,14 @@ impl Default for AppsConfig {
 }
 
 impl AppsConfig {
-    /// Authoritative set of built-in app tab ids. The host registry projects
-    /// its builders from this list; config validation and the generated schema
-    /// use the same ids.
+    /// Authoritative set of known built-in app tab ids. Knowing an id makes it
+    /// valid in config; it does not enable that tab. The host registry projects
+    /// its builders from this list, and config validation and the generated
+    /// schema use the same ids. Keep this separate from the default order below:
+    /// adding a known tab must not silently add it to existing users' UI.
     pub const BUILTIN_TABS: [&'static str; 2] = ["work", "observe"];
+
+    const DEFAULT_TAB_ORDER: [&'static str; 1] = ["work"];
 
     pub fn validate(&self, observe_enabled: bool) -> Vec<String> {
         let mut errors = Vec::new();
@@ -3580,10 +3584,10 @@ impl AppsConfig {
                 out.push(id.to_string());
             }
         }
-        for id in Self::BUILTIN_TABS {
-            if !out.iter().any(|existing| existing == id) {
-                out.push(id.to_string());
-            }
+        if out.is_empty() {
+            // `BUILTIN_TABS` answers which ids are known; only the explicit
+            // default list determines which tab exists without user config.
+            out.extend(Self::DEFAULT_TAB_ORDER.iter().map(|id| (*id).to_owned()));
         }
         out
     }

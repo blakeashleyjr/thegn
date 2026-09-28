@@ -124,6 +124,14 @@ fn app_tab_config_defaults_to_work_first_and_default() {
     let cfg = Config::default();
     assert_eq!(cfg.apps.default_tab, "work");
     assert_eq!(cfg.apps.effective_tab_order(), vec!["work"]);
+    assert!(AppsConfig::BUILTIN_TABS.contains(&"observe"));
+}
+
+#[test]
+fn app_tab_config_includes_known_apps_only_when_named_in_order() {
+    let mut cfg = Config::default();
+    cfg.apps.tab_order = vec!["work".into(), "observe".into()];
+    assert_eq!(cfg.apps.effective_tab_order(), vec!["work", "observe"]);
 }
 
 #[test]
