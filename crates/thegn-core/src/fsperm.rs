@@ -16,73 +16,75 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// FIFO or device. Unix opens are nonblocking as well as no-follow, preventing
 /// a raced FIFO from hanging before that descriptor check.
 pub fn open_regular_file_nofollow(path: &Path) -> std::io::Result<std::fs::File> {
-    use std::fs::OpenOptions;
-
-    let mut options = OpenOptions::new();
-    options.read(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+        use nix::fcntl::{OFlag, open};
+        use nix::sys::stat::{Mode, SFlag, fstat};
+
+        let fd = open(
+            path,
+            OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|error| {
+            if error == nix::errno::Errno::ELOOP {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("{} is a symlink, not a regular file", path.display()),
+                )
+            } else {
+                std::io::Error::from_raw_os_error(error as i32)
+            }
+        })?;
+        let stat = fstat(&fd).map_err(|error| std::io::Error::from_raw_os_error(error as i32))?;
+        let file_type = SFlag::from_bits_truncate(stat.st_mode);
+        if !file_type.contains(SFlag::S_IFREG) {
+            let kind = if file_type.contains(SFlag::S_IFIFO) {
+                "FIFO"
+            } else if file_type.contains(SFlag::S_IFSOCK) {
+                "socket"
+            } else if file_type.contains(SFlag::S_IFBLK) {
+                "block device"
+            } else if file_type.contains(SFlag::S_IFCHR) {
+                "character device"
+            } else if file_type.contains(SFlag::S_IFDIR) {
+                "directory"
+            } else {
+                "non-regular file"
+            };
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("{} is a {kind}, not a regular file", path.display()),
+            ));
+        }
+        Ok(std::fs::File::from(fd))
     }
     #[cfg(windows)]
     {
+        use std::fs::OpenOptions;
         use std::os::windows::fs::OpenOptionsExt;
+        let mut options = OpenOptions::new();
+        options.read(true);
         // Open the reparse point itself; metadata below refuses it instead of
         // allowing a final-component symlink to redirect the read.
         options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
+        let file = options.open(path)?;
+        if !file.metadata()?.file_type().is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("{} is not a regular file", path.display()),
+            ));
+        }
+        Ok(file)
     }
     #[cfg(not(any(unix, windows)))]
     {
-        let _ = options;
-        return Err(std::io::Error::new(
+        let _ = path;
+        Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "no-follow regular-file opening is unavailable on this platform",
-        ));
+        ))
     }
-
-    let file = options.open(path).map_err(|error| {
-        #[cfg(unix)]
-        if error.raw_os_error() == Some(libc::ELOOP) {
-            return std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("{} is a symlink, not a regular file", path.display()),
-            );
-        }
-        error
-    })?;
-    let metadata = file.metadata()?;
-    if !metadata.file_type().is_file() {
-        let kind = if metadata.file_type().is_dir() {
-            "directory"
-        } else {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::FileTypeExt;
-                let ty = metadata.file_type();
-                if ty.is_fifo() {
-                    "FIFO"
-                } else if ty.is_socket() {
-                    "socket"
-                } else if ty.is_block_device() {
-                    "block device"
-                } else if ty.is_char_device() {
-                    "character device"
-                } else {
-                    "non-regular file"
-                }
-            }
-            #[cfg(not(unix))]
-            {
-                "non-regular file"
-            }
-        };
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("{} is a {kind}, not a regular file", path.display()),
-        ));
-    }
-    Ok(file)
 }
 
 /// Restrict a file at `path` to the owning user: `chmod 0600` on unix; on
@@ -372,10 +374,11 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let fifo = dir.join("calendar.ics");
-        use std::os::unix::ffi::OsStrExt;
-        let path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
-        // SAFETY: `path` is NUL-terminated and points to live storage.
-        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        nix::unistd::mkfifo(
+            &fifo,
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )
+        .unwrap();
         let error = open_regular_file_nofollow(&fifo).unwrap_err();
         assert!(error.to_string().contains("FIFO"), "{error}");
         let _ = std::fs::remove_dir_all(dir);
