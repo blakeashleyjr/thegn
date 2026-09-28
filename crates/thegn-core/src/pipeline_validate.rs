@@ -149,7 +149,9 @@ const COMPILE_MARKERS: &[&str] = &[
     // rustc / cargo
     "error[E",
     "could not compile",
-    // go
+    // go — the BUILD failure line only. Go's runtime also prints
+    // `fatal error: all goroutines are asleep - deadlock!` from inside a
+    // running test, so `fatal error:` is NOT a build marker here.
     "[build failed]",
     "typecheck failed",
     // typescript / babel / swc
@@ -160,26 +162,45 @@ const COMPILE_MARKERS: &[&str] = &[
     // java / kotlin / scala
     "COMPILATION ERROR",
     "compilation failed",
-    // c / c++ / clang / gcc
-    "fatal error:",
+    // c / c++ / clang / gcc — the line the driver prints when it gives up.
+    // Deliberately NOT `fatal error:` on its own: clang and gcc emit that for a
+    // missing header, but so does the Go runtime for a deadlock in a test.
+    "compilation terminated",
     // generic build drivers
     "ninja: build stopped",
-    "make: *** ",
 ];
 
 /// Lines that mean "it built and a test failed", per matcher family.
+///
+/// Every entry must be **failure-bearing**. A bare run-summary line
+/// (`tests run:`, `Tests:`, `Total tests:`, `Finished in `) is printed on a
+/// PASSING run too, and these markers are only consulted after a non-zero exit
+/// — which is not the same thing as "the tests failed" when the task is a
+/// composite command. A `[[tasks]]` entry running `just test`, where the suite
+/// passes and a later step of the recipe fails, prints
+/// `9322 tests run: 9322 passed` and would otherwise be reported as a test
+/// failure, sending an agent to fix tests that passed.
 fn test_failure_markers(matcher: Option<&str>) -> &'static [&'static str] {
     match matcher.unwrap_or("").trim() {
-        "nextest" => &["FAIL [", "tests run:", "test run failed"],
-        "cargo-test" | "libtest-json" => &["test result: FAILED", "failures:", "panicked at"],
+        "nextest" => &["FAIL [", "test run failed", " failed,"],
+        "cargo-test" | "libtest-json" => &["test result: FAILED", "panicked at"],
         "go-test" => &["--- FAIL:", "FAIL\t", "\nFAIL"],
-        "pytest" => &["FAILED ", "=== FAILURES ===", "failed,", " failed in "],
-        "jest" | "vitest" | "javascript" => &["✕ ", "Tests:", "●  ", "failed,"],
-        "rspec" | "ruby" => &["Failures:", "examples,", " failures"],
-        "junit" | "gradle" | "maven" => &["Tests run:", "FAILURES!", "There were failing tests"],
-        "dotnet" | "trx" | "nunit" => &["Failed!", "Failed  -", "Total tests:"],
+        "pytest" => &["FAILED ", "=== FAILURES ===", " failed,", " failed in "],
+        "jest" | "vitest" | "javascript" => &["✕ ", "●  ", " failed,"],
+        "rspec" | "ruby" => &["Failures:\n", "\nFailures:"],
+        "junit" | "gradle" | "maven" => &[
+            "FAILURES!",
+            "There were failing tests",
+            "<<< FAILURE!",
+            "<<< ERROR!",
+            "Failed tests:",
+        ],
+        "dotnet" | "trx" | "nunit" => &["Failed!", "Failed  -"],
         "tap" | "bats" | "prove" | "busted" | "pgtap" => &["not ok ", "# failed"],
-        "elixir" => &["test, ", " failure", "Finished in "],
+        // ExUnit's summary says `N tests, 0 failures` on a PASS, so the
+        // summary cannot be the marker. Its numbered failure blocks
+        // (`  1) test …`) and raised-exception prefix only appear on a failure.
+        "elixir" => &["Assertion with", "** (", ") test ", ") doctest "],
         "zig" => &["error: 'test.", " tests failed"],
         _ => GENERIC_TEST_MARKERS,
     }
@@ -203,21 +224,56 @@ const GENERIC_TEST_MARKERS: &[&str] = &[
 /// Lines that mean "a linter objected". Checked only after compile and test
 /// markers, so a build warning printed alongside a genuine error never
 /// downgrades the class.
-const LINT_MARKERS: &[&str] = &[
-    // clippy / rustc
+/// Lint markers for a task whose matcher says it IS a linter.
+///
+/// `warning: ` is meaningful here and nowhere else: when the operator has
+/// declared the task a linter, a warning line is the finding. For any other
+/// task it is just build chatter, which is why it is absent from
+/// [`LINT_MARKERS`].
+fn lint_markers(matcher: Option<&str>) -> &'static [&'static str] {
+    match matcher.unwrap_or("").trim() {
+        "clippy" | "eslint" | "biome" | "oxlint" | "ruff" | "flake8" | "pylint" | "shellcheck"
+        | "golangci-lint" | "staticcheck" | "vet" | "rubocop" | "swiftlint" => LINT_TASK_MARKERS,
+        _ => LINT_MARKERS,
+    }
+}
+
+/// What counts as a finding when the task is DECLARED to be a linter.
+const LINT_TASK_MARKERS: &[&str] = &[
     "warning: ",
+    "warning ",
+    "error: ",
+    "✖ ",
+    " problems (",
+    "^-- SC",
+];
+
+/// Every entry must be unambiguously a LINTER'S output.
+///
+/// The temptation is to add `warning: `, which any cargo build prints, and
+/// `lint`, which matches any path or test name containing the word. Both were
+/// here and both were wrong: this tier runs before [`ValidationClass::Inconclusive`],
+/// and [`ValidationClass::LintFinding`] reports
+/// [`ValidationClass::blames_code`] — so a permissive marker turns an
+/// unrecognised failure into a confident verdict about the code, which is
+/// exactly what the `Inconclusive` class exists to prevent.
+const LINT_MARKERS: &[&str] = &[
+    // clippy / rustc, in its denied form only — a bare `warning: ` line is
+    // printed by every ordinary build.
+    "-D warnings",
     "denied by",
+    "`#[deny(",
     // eslint / biome / oxlint
     "✖ ",
     " problems (",
     // ruff / flake8 / pylint
-    "Found ",
+    " [*] ",
+    "flake8",
     // golangci-lint / staticcheck / vet
     "level=error",
+    "golangci-lint",
     // shellcheck
     "^-- SC",
-    // generic
-    "lint",
 ];
 
 /// Classify one validation run.
@@ -255,7 +311,7 @@ pub fn classify(
     }
 
     // 4. Did a linter object?
-    if contains_any(output, LINT_MARKERS) {
+    if contains_any(output, lint_markers(matcher)) {
         return ValidationClass::LintFinding;
     }
 
@@ -302,7 +358,7 @@ pub fn digest(output: &str, class: ValidationClass, matcher: Option<&str>) -> St
     let markers: &[&str] = match class {
         ValidationClass::CompileError => COMPILE_MARKERS,
         ValidationClass::TestFailure => test_failure_markers(matcher),
-        ValidationClass::LintFinding => LINT_MARKERS,
+        ValidationClass::LintFinding => lint_markers(matcher),
         // Nothing matched (or the run never produced a verdict), so there is no
         // marker to select on: the tail is the most informative slice.
         ValidationClass::Inconclusive | ValidationClass::EnvironmentError => &[],
@@ -428,6 +484,123 @@ error: test run failed";
     }
 
     #[test]
+    fn a_go_runtime_fatal_error_is_a_test_failure_not_a_build_break() {
+        // The Go RUNTIME prints `fatal error:` from inside a running test. An
+        // earlier marker set matched it as a compile break, which sends the
+        // lane back to fix a build error that does not exist.
+        let out = "\
+--- FAIL: TestConcurrentMap (0.01s)
+fatal error: all goroutines are asleep - deadlock!";
+        assert_eq!(
+            classify(Some(2), false, Some("go-test"), out),
+            ValidationClass::TestFailure
+        );
+        for line in [
+            "fatal error: concurrent map writes",
+            "fatal error: stack overflow",
+        ] {
+            assert!(
+                !COMPILE_MARKERS.iter().any(|m| line.contains(m)),
+                "{line:?} must not read as a build break"
+            );
+        }
+    }
+
+    #[test]
+    fn a_failing_make_recipe_is_not_a_build_break() {
+        // `make: *** [Makefile:12: test] Error 1` is printed for ANY failing
+        // recipe. A `[[tasks]]` entry running `make test` with one failing test
+        // was classified as a compile error.
+        let out = "FAILED tests/test_a.py::test_b\nmake: *** [Makefile:12: test] Error 1";
+        assert_eq!(
+            classify(Some(2), false, Some("pytest"), out),
+            ValidationClass::TestFailure
+        );
+    }
+
+    #[test]
+    fn a_passing_suite_inside_a_failing_composite_task_is_not_a_test_failure() {
+        // `just test` where the suite passes and a later step of the recipe
+        // fails. A bare run-summary marker (`tests run:`) reported this as a
+        // test failure and would send an agent to fix tests that passed.
+        let out = "\
+     Summary [  71.402s] 9322 tests run: 9322 passed, 0 skipped
+error: recipe `test` failed on line 4 with exit code 1";
+        assert_ne!(
+            classify(Some(1), false, Some("nextest"), out),
+            ValidationClass::TestFailure,
+            "a passing suite was reported as a test failure"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_build_warning_does_not_become_a_lint_verdict() {
+        // `warning: ` is printed by every cargo build. As a lint marker it
+        // turned any unrecognised failure into a confident verdict about the
+        // code — the thing `Inconclusive` exists to prevent.
+        let class = classify(
+            Some(3),
+            false,
+            None,
+            "warning: unused import\nthe wind changed",
+        );
+        assert_eq!(class, ValidationClass::Inconclusive);
+        assert!(!class.blames_code());
+    }
+
+    #[test]
+    fn the_word_lint_in_a_path_is_not_a_lint_finding() {
+        let class = classify(Some(3), false, None, "running crates/lint_rules/mod.rs");
+        assert_eq!(class, ValidationClass::Inconclusive);
+    }
+
+    #[test]
+    fn a_denied_clippy_lint_is_still_recognised() {
+        let out = "warning: this `if` has identical blocks\nerror: aborting due to `-D warnings`";
+        assert_eq!(
+            classify(Some(1), false, Some("clippy"), out),
+            ValidationClass::LintFinding
+        );
+    }
+
+    #[test]
+    fn no_test_marker_appears_in_passing_output() {
+        // The invariant behind the composite-task fix: a marker that a PASSING
+        // run prints cannot be evidence of failure.
+        let passing = [
+            "     Summary [  71.402s] 9322 tests run: 9322 passed, 0 skipped",
+            "Tests:       12 passed, 12 total",
+            "Total tests: 40. Passed: 40. Failed: 0.",
+            "Finished in 0.4 seconds",
+            "Tests run: 4, Failures: 0, Errors: 0",
+            "40 examples, 0 failures",
+            "12 tests, 0 failures",
+        ];
+        for matcher in [
+            "nextest",
+            "cargo-test",
+            "go-test",
+            "pytest",
+            "jest",
+            "rspec",
+            "junit",
+            "dotnet",
+            "elixir",
+            "zig",
+            "tap",
+        ] {
+            for line in passing {
+                assert!(
+                    !test_failure_markers(Some(matcher))
+                        .iter()
+                        .any(|m| line.contains(m)),
+                    "matcher {matcher} treats passing output as failure: {line:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn a_real_compile_break_wins_over_the_test_noise_it_causes() {
         // A failing build prints BOTH a rustc error and nextest's run-failed
         // line. Compile must win, or the lane is sent back to fix a test that
@@ -462,10 +635,18 @@ error: test run failed";
             ValidationClass::CompileError
         );
 
+        // A bare warning counts as a finding only because the task's matcher
+        // DECLARES it a linter …
         let clean = "warning: unneeded `return` statement\n  --> src/a.rs:3:5";
         assert_eq!(
             classify(Some(1), false, Some("clippy"), clean),
             ValidationClass::LintFinding
+        );
+        // … and the identical output from a task that is not a linter stays
+        // unknown rather than becoming a confident verdict about the code.
+        assert_eq!(
+            classify(Some(1), false, Some("nextest"), clean),
+            ValidationClass::Inconclusive
         );
     }
 
@@ -485,10 +666,13 @@ error: test run failed";
             ("go-test", "--- FAIL: TestFoo (0.00s)"),
             ("pytest", "FAILED tests/test_a.py::test_b - assert 1 == 2"),
             ("jest", "Tests:       1 failed, 3 passed"),
-            ("rspec", "Failures:\n\n  1) Thing does"),
+            ("rspec", "\nFailures:\n\n  1) Thing does"),
             ("cargo-test", "test result: FAILED. 1 passed; 1 failed"),
             ("tap", "not ok 3 - the thing"),
-            ("junit", "Tests run: 4, Failures: 1"),
+            (
+                "junit",
+                "Tests run: 4, Failures: 1\n\nResults :\n\nFailed tests:  testThing",
+            ),
             ("dotnet", "Failed!  - Failed:     1"),
         ] {
             assert_eq!(
@@ -518,6 +702,7 @@ error: test run failed";
         let all: Vec<&str> = COMPILE_MARKERS
             .iter()
             .chain(LINT_MARKERS.iter())
+            .chain(LINT_TASK_MARKERS.iter())
             .chain(GENERIC_TEST_MARKERS.iter())
             .copied()
             .collect();

@@ -22,7 +22,7 @@
 //! `[pipeline.supervisor] enabled` defaults to false and these verbs work
 //! regardless of it.
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -123,9 +123,14 @@ fn gather(cfg: &Config, db: &Db, issue: Option<&str>, all: bool) -> Result<Vec<L
             children.entry(parent).or_default().push(stage.to_string());
         }
     }
+    // Propagated, NOT swallowed. Every other read here fails safe — an
+    // unreadable validation set looks unvalidated (=> validate), an unreadable
+    // approval looks absent (=> escalate) — but defaulting the merge queue to
+    // EMPTY means "not enqueued", which is the one direction that PERMITS a
+    // mutation. Harmless while nothing applies; a double-enqueue once it does.
     let queued: Vec<String> = db
         .list_merge_queue()
-        .unwrap_or_default()
+        .context("cannot read the merge queue; refusing to plan rather than risk a second enqueue")?
         .into_iter()
         .filter(|q| !q.status.eq_ignore_ascii_case("landed"))
         .map(|q| q.worktree)
@@ -175,7 +180,15 @@ fn gather(cfg: &Config, db: &Db, issue: Option<&str>, all: bool) -> Result<Vec<L
             merged_into_target: git.merged_into_target,
             enqueued: queued.iter().any(|w| w == &row.worktree_path),
             artifact_tracked: verify.tracked,
-            report_present: verify.report_present,
+            // Both halves, matching the done-gate this requirement's
+            // documentation claims to mirror: a report that is merely PRESENT
+            // but carries an unsupported PASS claim does not satisfy the gate,
+            // and must not satisfy `parent_report` either.
+            report_present: verify.report_present && verify.report_gate_valid,
+            // best-effort: both fail SAFE. No validations reads as unvalidated
+            // (the lane is then validated, not advanced); no approval reads as
+            // absent (the lane is then escalated, not advanced). Neither can
+            // turn a read failure into permission to act.
             validations: db.validations_for_dispatch(row.id).unwrap_or_default(),
             approval: db.latest_approval(&row.issue_id, &stage).unwrap_or(None),
             child_stages: children.get(&row.id).cloned().unwrap_or_default(),
