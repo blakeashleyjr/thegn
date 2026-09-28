@@ -11,7 +11,7 @@ fn fifo(path: &Path) {
 }
 
 #[test]
-fn static_commands_do_not_open_fifo_configuration_but_configured_siblings_do() {
+fn static_commands_skip_config_but_configured_commands_refuse_fifo_sources() {
     let mut fixture = Fixture::new();
     let config = fixture.path("blocking.toml");
     fifo(&config);
@@ -21,26 +21,96 @@ fn static_commands_do_not_open_fifo_configuration_but_configured_siblings_do() {
         check_output(args, &output, &config, "thegn");
         assert_eq!(fixture.snapshot(), before);
     }
-    // A successful regular-file counterpart is covered separately. These are
-    // source-proof observations, not execution of an API call or automation. No
-    // FIFO writer is ever opened.
-    //
-    // The static commands above succeeded against this same FIFO because they
-    // never consult the configuration source. Every command below does consult
-    // it — which is the property under test — but they do not agree on how:
-    // configuration admission refuses a non-regular source outright, while a
-    // command that still opens the source directly blocks on the unread FIFO.
-    // Admission is not yet uniform across the CLI, so assert what each one
-    // actually does rather than blurring the two. THE-691 makes them uniform;
-    // when it lands, move the rest into `assert_source_refused` alongside this.
-    let admitted: &[&str] = &["api", "call", "worktrees.list"];
-    fixture.assert_source_refused(admitted, &config);
-    assert_eq!(fixture.snapshot(), before, "{admitted:?} mutated the root");
+    // No FIFO writer is opened. All configured commands refuse the same source
+    // kind with a concrete reason, while static commands above never inspect it.
+    let configured: &[&[&str]] = &[
+        &["api", "call", "worktrees.list"],
+        &["config", "get", "drawer.height"],
+        &["automations", "test", "missing", "--event", "{}"],
+    ];
+    for args in configured {
+        fixture.assert_source_refused(args, &config);
+    }
+    assert_eq!(
+        fixture.snapshot(),
+        before,
+        "configured commands mutated root"
+    );
+    fixture.close();
+}
+
+#[test]
+fn config_get_still_inspects_malformed_regular_configuration() {
+    let mut fixture = Fixture::new();
+    let config = fixture.path("malformed.toml");
+    std::fs::write(&config, b"[drawer\nheight = ").unwrap();
+
+    let output = fixture.run(&["config", "get", "drawer.height"], Some(&config), false);
+    assert!(
+        output.status.success(),
+        "malformed regular config should remain inspectable: {}",
+        output.stderr
+    );
+    assert!(
+        output.stderr.contains("parse error"),
+        "malformed TOML should still be reported: {}",
+        output.stderr
+    );
+    fixture.close();
+}
+
+#[test]
+fn tolerant_inspection_refuses_oversized_regular_configuration() {
+    let mut fixture = Fixture::new();
+    let config = fixture.path("oversized.toml");
+    let limit = thegn_core::config_budget::MAX_SOURCE_BYTES;
+    std::fs::write(&config, vec![b' '; limit + 1]).unwrap();
+
     for args in [
         &["config", "get", "drawer.height"][..],
         &["automations", "test", "missing", "--event", "{}"][..],
     ] {
-        fixture.assert_loader_wait(args, &config);
+        let output = fixture.run(args, Some(&config), false);
+        assert!(
+            !output.status.success(),
+            "accepted oversized source: {args:?}"
+        );
+        assert!(
+            output
+                .stderr
+                .contains("exceeds its 4194304-byte tolerant read limit"),
+            "expected the bounded-source refusal for {args:?}: {}",
+            output.stderr
+        );
+    }
+    fixture.close();
+}
+
+#[test]
+fn tolerant_inspection_refuses_nonregular_profile_configuration() {
+    let mut fixture = Fixture::new();
+    let base = fixture.path("base.toml");
+    std::fs::write(&base, "").unwrap();
+    let profile_dir = fixture
+        .path("config")
+        .join("thegn/profiles/fixture-profile");
+    std::fs::create_dir_all(&profile_dir).unwrap();
+    let profile = profile_dir.join("config.toml");
+    fifo(&profile);
+
+    for args in [
+        &["config", "get", "drawer.height"][..],
+        &["automations", "test", "missing", "--event", "{}"][..],
+    ] {
+        let output = fixture.run(args, Some(&base), true);
+        assert!(!output.status.success(), "accepted profile FIFO: {args:?}");
+        assert!(
+            output
+                .stderr
+                .contains("config source is a FIFO, not a regular file"),
+            "expected a profile source-kind refusal for {args:?}: {}",
+            output.stderr
+        );
     }
     fixture.close();
 }
