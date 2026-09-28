@@ -719,7 +719,10 @@ mod tests {
         let output = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
         assert_eq!(output.matches("secret resolve").count(), 1, "{output}");
         assert!(output.contains("consumer=media:mpd"), "{output}");
-        assert!(output.contains("outcome=resolved"), "{output}");
+        // Quoted: `tracing`'s fmt layer renders a string-valued field with quotes,
+        // so this records as `outcome="resolved"`. `consumer` above is unquoted
+        // because it is recorded via `%`/Display rather than as a string.
+        assert!(output.contains(r#"outcome="resolved""#), "{output}");
         assert!(
             !output.contains(sentinel),
             "audit output exposed the secret"
