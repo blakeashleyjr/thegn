@@ -1,0 +1,19 @@
+# spawn-ownership-core-ratchet — files in crates/thegn-core/src that throw away
+# a spawned child process (`let _ = …spawn()`, `…spawn().ok();`,
+# `…spawn().is_ok()`, `drop(…spawn())`).
+#
+# `std::process::Child` does NOT wait on drop, so a discarded handle leaves a
+# zombie in the process table for the life of the process. One thegn instance
+# reached 4,408 of them in three days (process table 5,274, I/O pressure
+# `full avg10` 7.94) at zero CPU cost, which is why nothing noticed.
+#
+# SEEDED EMPTY, AND FROZEN. A census of the whole workspace found no real
+# instance — thegn's own spawn discipline is already sound; the production leaks
+# came from a dependency (THE-701) and from a thread, not a child (THE-448). So
+# there is no inherited debt here and there is no `just ratchet-update` story:
+# an entry appearing in this file is a NEW leak, and the fix is to own the child
+# (bind it and `wait()`, or hand it to a supervisor), not to pin it.
+#
+# Enforced by `spawned_children_are_owned` in
+# crates/thegn-core/src/spawn_ratchet_tests.rs. See THE-702.
+# RATCHET-EMPTY

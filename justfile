@@ -310,6 +310,17 @@ bench-idle-record: release _perf-guard
 bench-steady: release _perf-guard
     bash test/perf/cpu-sample.sh --scenario steady-workload --window-ms 6000
 
+# Resource-soak gate: the same harness over a 40-worktree fixture for a minute,
+# asserting the axes CPU sampling cannot see — unreaped children, descriptors,
+# threads and the read-syscall RATE. The incident that motivated this ran a
+# process to 4,408 zombie children and 26,063 reads/sec while its cores-used
+# looked ordinary, so `bench-idle` passing says nothing about accumulation.
+# Machine-dependent, so out of `just ci` like the rest of perf — but unlike the
+# advisory A/B recipes above this one FAILS (exit 2) on a ceiling, because a leak
+# is not a measurement, it is a defect.
+bench-soak *args: release _perf-guard
+    bash test/perf/cpu-sample.sh --scenario soak {{args}}
+
 # Switch/input latency under a multi-pane output flood (A/B only — advisory,
 # machine-dependent). Reads switch_p99/input_p99 from the perf rollup while
 # several worktree shells scroll at full speed and Alt+Down fires mid-flood.
