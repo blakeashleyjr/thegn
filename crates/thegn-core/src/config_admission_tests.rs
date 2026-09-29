@@ -738,10 +738,19 @@ fn failed_admission_never_constructs_an_admitted_config() {
 
 #[test]
 fn rejected_candidate_does_not_install_process_global_remote_policy() {
+    // The claim under test is that admission — rejected OR accepted — leaves
+    // the process-global tuning alone, so the check is simply that the value
+    // does not move across it.
+    //
+    // It deliberately does NOT plant a sentinel first. `set_ssh_tune` is
+    // first-set-wins by design (see `remote_tune::set_ssh_tune`), so under
+    // `cargo test`'s SHARED process — which is what `just coverage` runs,
+    // unlike nextest's process-per-test — planting one is a silent no-op the
+    // moment any other test has loaded a config, and so is the "restore" that
+    // used to close this test. The assertion then turned on which test ran
+    // first. Comparing before against after proves the same property and does
+    // not care.
     let before = crate::remote_tune::ssh_tune();
-    let mut changed = before;
-    changed.keepalive_interval_secs = before.keepalive_interval_secs.saturating_add(1);
-    crate::remote_tune::set_ssh_tune(changed);
 
     let env = TestEnv::default();
     let overrides = Vec::new();
@@ -760,7 +769,11 @@ fn rejected_candidate_does_not_install_process_global_remote_policy() {
         paths: &path_context(),
     });
     assert!(matches!(result, Err(ConfigAdmissionError::SemanticInvalid)));
-    assert_eq!(crate::remote_tune::ssh_tune(), changed);
+    assert_eq!(
+        crate::remote_tune::ssh_tune(),
+        before,
+        "a rejected candidate moved the process-global tuning"
+    );
 
     let valid = admit(AdmissionInputs {
         defaults: Config::default(),
@@ -773,8 +786,12 @@ fn rejected_candidate_does_not_install_process_global_remote_policy() {
     })
     .expect("pure admission of valid policy");
     assert_eq!(valid.config().remote.keepalive_interval_secs, 9);
-    assert_eq!(crate::remote_tune::ssh_tune(), changed);
-    crate::remote_tune::set_ssh_tune(before);
+    assert_eq!(
+        crate::remote_tune::ssh_tune(),
+        before,
+        "admission installed the process-global tuning; only an explicit \
+         `RemoteConfig::install` may"
+    );
 }
 
 #[cfg(unix)]

@@ -493,3 +493,5 @@ fn applescript_client(_opts: &ResolveOpts) -> Option<MediaClient> {
 mod platform_ratchet_tests;
 #[cfg(test)]
 mod ratchet;
+#[cfg(test)]
+mod spawn_ratchet_tests;

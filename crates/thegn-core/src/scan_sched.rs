@@ -114,6 +114,138 @@ pub fn plan(targets: &[ScanTarget], now: i64, ttl_secs: u64, budget: usize) -> V
     due.into_iter().map(|(_, _, p)| p.to_string()).collect()
 }
 
+/// How many pumps fire inside one per-row TTL window.
+///
+/// [`pump_slots`] deliberately runs the pump at a **quarter** of the TTL, so a
+/// budget-bounded round still sweeps the whole registry inside one TTL window.
+/// This constant is the other half of that sentence, named so the assumption can
+/// be checked instead of merely documented.
+pub const PUMPS_PER_TTL: usize = 4;
+
+/// How many rows a round may **examine** for each unit of **walk** budget.
+///
+/// A lane whose rows can be cheaply proved unchanged has two different costs,
+/// and conflating them is what kept the size lane pinned. `max_scan_per_round`
+/// exists to bound the expensive thing — one `du` over a worktree with every
+/// ignore rule off, which on a build tree is gigabytes. But once
+/// [`crate::disk::likely_unchanged_since`] landed, most rows became *skips*
+/// costing six `stat`s, and a skip still spent a whole unit of that budget.
+///
+/// Measured consequence: 83 worktrees against a capacity of
+/// `(PUMPS_PER_TTL - 1) * 4 = 12`, so 82 of 83 rows re-stamped every five
+/// minutes — the same cadence as during the incident — even though almost every
+/// one of those rounds did no real work.
+///
+/// So the two budgets are separated. `max_scan_per_round` still bounds walks.
+/// This multiplier bounds the cheap probing on top, which must stay bounded (a
+/// registry of any size would otherwise `stat` without limit) but can be far
+/// larger, because six `stat`s is not a `du`.
+///
+/// 32 puts the shipped size lane at `4 * 32 = 128` rows examined per round,
+/// covering a machine several times larger than the one this was diagnosed on
+/// while still capping a pathological registry.
+pub const EXAMINE_PER_WALK: usize = 32;
+
+/// Rows a round may examine, given its per-round **walk** budget.
+///
+/// `0` (unlimited) stays unlimited. Pass the result to [`plan`] and to
+/// [`saturation`]: it is the number that decides whether the lane can reach an
+/// idle round, because a row the round never *looks at* stays due forever.
+///
+/// A lane with no cheap skip (the LOC lane walks every row with `tokei`) must
+/// keep passing its walk budget to both — for it, examining and walking are the
+/// same act.
+pub fn examine_cap(walk_budget: usize) -> usize {
+    walk_budget.saturating_mul(EXAMINE_PER_WALK)
+}
+
+/// Whether a lane can ever finish sweeping its registry inside one TTL window.
+///
+/// # The failure this exists to name
+///
+/// Both scan lanes document the same assumption — the pump runs at a quarter of
+/// the TTL "so a budget-bounded round still sweeps every worktree inside one
+/// window". That is true only while `rows <= (PUMPS_PER_TTL - 1) * budget` —
+/// see [`saturation`] for why it is `- 1`. Past that point every row is stale
+/// again before the sweep reaches it, so [`plan`]
+/// always returns work, the lane **never reaches an idle round**, and it keeps
+/// running for the life of the process.
+///
+/// Measured consequence, on the machine this was diagnosed on: the size lane
+/// ships `max_scan_per_round = 4`, giving a ceiling of **12** worktrees. That
+/// machine had 82 — seven times over. It ran flat out for three days at 26,000 read
+/// syscalls a second — not because any single round was slow, but because there
+/// was never a round with nothing due.
+///
+/// Note what is NOT a factor: the TTL itself cancels out, because the pump
+/// cadence is derived from it. Lengthening `scan_interval_secs` does not raise
+/// the ceiling — only the per-round budget does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Saturation {
+    /// Every row can be refreshed inside one TTL window.
+    Sustainable {
+        /// How many more rows this lane could take before saturating.
+        spare_rows: usize,
+    },
+    /// The registry is larger than one TTL window's capacity, so the lane can
+    /// never idle.
+    Saturated {
+        /// Rows the lane is responsible for.
+        rows: usize,
+        /// Rows it can actually refresh inside one TTL window.
+        capacity: usize,
+    },
+}
+
+impl Saturation {
+    /// Whether this lane can ever reach a round with nothing due.
+    pub fn can_idle(self) -> bool {
+        matches!(self, Self::Sustainable { .. })
+    }
+
+    /// One operator-facing line naming the remedy, or `None` when healthy.
+    /// The remedy is always the budget — never the TTL (see [`Saturation`]).
+    pub fn warning(self) -> Option<String> {
+        match self {
+            Self::Sustainable { .. } => None,
+            Self::Saturated { rows, capacity } => Some(format!(
+                "this lane tracks {rows} rows but can only refresh {capacity} within one                  scan_interval_secs window, so it will never go idle — raise                  max_scan_per_round to at least {} (lengthening scan_interval_secs does                  NOT help: the pump cadence is derived from it)",
+                rows.div_ceil(PUMPS_PER_TTL - 1).max(1)
+            )),
+        }
+    }
+}
+
+/// Classify a lane's steady state. `budget == 0` is unlimited, so it can always
+/// idle.
+pub fn saturation(rows: usize, budget: usize) -> Saturation {
+    if budget == 0 {
+        return Saturation::Sustainable {
+            spare_rows: usize::MAX,
+        };
+    }
+    // `PUMPS_PER_TTL - 1`, not `PUMPS_PER_TTL`, and the off-by-one IS the
+    // subtlety. The sweep must COMPLETE before the first row it measured
+    // expires. A sweep of `ceil(rows/budget)` pumps finishes at
+    // `ceil(rows/budget) * (ttl/PUMPS_PER_TTL)`; for the NEXT pump to find
+    // nothing due that must be strictly less than the TTL, so
+    // `ceil(rows/budget) < PUMPS_PER_TTL` — i.e. `rows <= budget * (PUMPS_PER_TTL-1)`.
+    //
+    // At exactly `budget * PUMPS_PER_TTL` the sweep lands ON the TTL boundary
+    // and the first batch is stale again on the same tick, so the lane misses
+    // idle by one pump. Found by the control test
+    // `a_lane_within_its_budget_reaches_an_idle_round`, which failed against the
+    // naive `budget * PUMPS_PER_TTL` model.
+    let capacity = budget.saturating_mul(PUMPS_PER_TTL - 1);
+    if rows <= capacity {
+        Saturation::Sustainable {
+            spare_rows: capacity - rows,
+        }
+    } else {
+        Saturation::Saturated { rows, capacity }
+    }
+}
+
 /// Ticker slots (of `slot_ms` each) between scan pumps, for a per-row TTL of
 /// `ttl_secs`.
 ///
@@ -155,6 +287,207 @@ mod tests {
 
     const TTL: u64 = 100;
     const NOW: i64 = 1_000_000;
+
+    /// Simulate a lane: repeatedly `plan` a round, mark those rows measured, and
+    /// advance one pump. Returns the pump index at which nothing was due, or
+    /// `None` if it never idled within `max_pumps`.
+    fn pumps_until_idle(
+        rows: usize,
+        ttl_secs: u64,
+        budget: usize,
+        max_pumps: usize,
+    ) -> Option<usize> {
+        let mut targets: Vec<ScanTarget> = (0..rows)
+            .map(|i| ScanTarget::cold(format!("/wt/{i:04}")))
+            .collect();
+        let pump_secs = (ttl_secs / PUMPS_PER_TTL as u64).max(1) as i64;
+        let mut now = NOW;
+        for pump in 0..max_pumps {
+            let due = plan(&targets, now, ttl_secs, budget);
+            if due.is_empty() {
+                return Some(pump);
+            }
+            for path in &due {
+                if let Some(t) = targets.iter_mut().find(|t| &t.path == path) {
+                    t.measured_at = Some(now);
+                }
+            }
+            now += pump_secs;
+        }
+        None
+    }
+
+    #[test]
+    fn a_lane_within_its_budget_reaches_an_idle_round() {
+        // The healthy case, and the control for the test below: at or under
+        // capacity the sweep completes strictly inside one window.
+        let budget = 4;
+        let rows = (PUMPS_PER_TTL - 1) * budget; // 12 — see `saturation`
+        assert!(saturation(rows, budget).can_idle());
+        assert!(
+            pumps_until_idle(rows, 900, budget, 64).is_some(),
+            "a lane inside its budget must reach a round with nothing due"
+        );
+    }
+
+    #[test]
+    fn a_walk_budget_alone_cannot_sweep_a_realistic_registry() {
+        // WHY `EXAMINE_PER_WALK` EXISTS, as arithmetic.
+        //
+        // This test used to be named for the shipped size lane and assert that
+        // it could never idle. That claim is no longer true of the lane — it is
+        // still true of the number the lane used to pass. Keeping the assertion
+        // and renaming it is deliberate: the arithmetic below is exactly the
+        // reason the examine cap had to be introduced, and deleting it would
+        // erase the evidence for a design decision.
+        //
+        // The size lane ships max_scan_per_round = 4. Feed that straight to
+        // `saturation` as if every row cost a walk and a developer with 100
+        // worktrees is 8x over capacity: every row is stale again before the
+        // sweep reaches it, `plan` always returns work, and the lane runs
+        // forever. That is what burned 5d18h of CPU in 3 days.
+        //
+        // See `the_shipped_size_lane_idles_once_a_skip_stops_costing_a_walk`
+        // for the same defaults under the budget the lane actually uses now.
+        const SHIPPED_BUDGET: usize = 4;
+        const REALISTIC_ROWS: usize = 100;
+
+        let s = saturation(REALISTIC_ROWS, SHIPPED_BUDGET);
+        assert!(
+            !s.can_idle(),
+            "if this passes, the defaults were raised and this test should be              updated to the new ceiling rather than deleted"
+        );
+        match s {
+            Saturation::Saturated { rows, capacity } => {
+                assert_eq!(rows, REALISTIC_ROWS);
+                assert_eq!(capacity, (PUMPS_PER_TTL - 1) * SHIPPED_BUDGET);
+            }
+            Saturation::Sustainable { .. } => unreachable!("asserted above"),
+        }
+        // And the simulation agrees: it never idles, however long we wait.
+        assert!(
+            pumps_until_idle(REALISTIC_ROWS, 45, SHIPPED_BUDGET, 500).is_none(),
+            "a saturated lane must never reach an idle round — if it does, the              capacity model here is wrong"
+        );
+        // The warning names the budget, and a number that actually works.
+        let w = s.warning().expect("a saturated lane must warn");
+        assert!(w.contains("max_scan_per_round"), "{w}");
+        assert!(w.contains("never go idle"), "{w}");
+        assert!(
+            saturation(REALISTIC_ROWS, REALISTIC_ROWS.div_ceil(PUMPS_PER_TTL - 1)).can_idle(),
+            "the budget the warning recommends must actually be sufficient"
+        );
+    }
+
+    /// The fix, measured against the same defaults and the same registry size.
+    ///
+    /// Nothing about `saturation` changed — what changed is the budget the size
+    /// lane hands it. A row the round merely *examines* costs six `stat`s
+    /// (`disk::likely_unchanged_since`), not a `du`, so bounding examinations by
+    /// the walk budget priced a skip as if it were a walk. On the machine this
+    /// was diagnosed on that meant 82 of 83 rows re-stamping every five minutes
+    /// while doing essentially no work.
+    #[test]
+    fn the_shipped_size_lane_idles_once_a_skip_stops_costing_a_walk() {
+        const SHIPPED_BUDGET: usize = 4;
+        // 83 is the real registry this was measured on; 100 is the round number
+        // the sibling test uses. Both must now idle.
+        for rows in [83usize, 100] {
+            let s = saturation(rows, examine_cap(SHIPPED_BUDGET));
+            assert!(
+                s.can_idle(),
+                "the size lane must reach an idle round at {rows} rows: {s:?}"
+            );
+            assert!(
+                s.warning().is_none(),
+                "a lane that can idle must not warn ({rows} rows)"
+            );
+            // The simulation agrees — and bounding the pump count matters: an
+            // assertion that it *eventually* idles would pass for a lane that
+            // takes an hour.
+            let pumps = pumps_until_idle(rows, 45, examine_cap(SHIPPED_BUDGET), 64)
+                .expect("a sustainable lane must reach an idle round");
+            assert!(
+                pumps < PUMPS_PER_TTL,
+                "the sweep must COMPLETE inside one TTL window, took {pumps} pumps"
+            );
+        }
+        // The cap is still a cap: a pathological registry must still saturate,
+        // or the bound on cheap probing is not doing its job either.
+        let huge = examine_cap(SHIPPED_BUDGET) * PUMPS_PER_TTL;
+        assert!(
+            !saturation(huge, examine_cap(SHIPPED_BUDGET)).can_idle(),
+            "the examine cap must still bound an unbounded registry"
+        );
+    }
+
+    /// `examine_cap` must preserve `plan`'s "0 means unlimited" convention — a
+    /// lane configured with no walk budget must not silently acquire a cap of 0,
+    /// which `plan` would read as unlimited anyway but `saturation` would not.
+    #[test]
+    fn an_unlimited_walk_budget_stays_unlimited_through_the_examine_cap() {
+        assert_eq!(examine_cap(0), 0);
+        assert!(saturation(1_000_000, examine_cap(0)).can_idle());
+        // And it cannot overflow on a nonsense budget.
+        assert_eq!(examine_cap(usize::MAX), usize::MAX);
+    }
+
+    #[test]
+    fn the_capacity_boundary_is_exact_in_both_directions() {
+        // The off-by-one is the easiest thing here to get wrong, so pin both
+        // sides: at capacity the lane idles, one row over it never does. Without
+        // the upper assertion `saturation` could be quietly more pessimistic
+        // than `plan` really is, and we would recommend budgets nobody needs.
+        let budget = 4;
+        let cap = (PUMPS_PER_TTL - 1) * budget;
+        assert!(saturation(cap, budget).can_idle());
+        assert!(
+            pumps_until_idle(cap, 900, budget, 64).is_some(),
+            "a lane at exactly capacity must reach an idle round"
+        );
+        assert!(!saturation(cap + 1, budget).can_idle());
+        assert!(
+            pumps_until_idle(cap + 1, 900, budget, 400).is_none(),
+            "one row over capacity must never idle"
+        );
+    }
+
+    #[test]
+    fn lengthening_the_ttl_does_not_raise_the_ceiling() {
+        // The intuitive fix, which does not work: the pump cadence is derived
+        // from the TTL, so a longer TTL means proportionally fewer pumps and
+        // exactly the same rows-per-window. Only the budget moves the ceiling.
+        for ttl in [45_u64, 600, 3_600, 86_400] {
+            assert!(
+                pumps_until_idle(100, ttl, 4, 400).is_none(),
+                "ttl={ttl} unexpectedly let a 100-row lane idle at budget 4"
+            );
+        }
+        assert!(
+            pumps_until_idle(100, 45, 25, 400).is_some(),
+            "budget 25 should suffice"
+        );
+    }
+
+    #[test]
+    fn an_unlimited_budget_always_idles() {
+        assert!(saturation(10_000, 0).can_idle());
+        assert!(saturation(10_000, 0).warning().is_none());
+        assert_eq!(pumps_until_idle(50, 900, 0, 8), Some(1));
+    }
+
+    #[test]
+    fn saturation_reports_headroom_and_does_not_overflow() {
+        match saturation(10, 4) {
+            // capacity = (4-1)*4 = 12, so 10 rows leaves 2 spare.
+            Saturation::Sustainable { spare_rows } => assert_eq!(spare_rows, 2),
+            other => panic!("expected Sustainable, got {other:?}"),
+        }
+        // A pathological budget must not overflow into a false Saturated.
+        assert!(saturation(1, usize::MAX).can_idle());
+        // Zero rows is trivially sustainable.
+        assert!(saturation(0, 1).can_idle());
+    }
 
     #[test]
     fn never_measured_beats_stale() {

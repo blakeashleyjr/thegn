@@ -182,7 +182,7 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 /// columns on the legacy path/tab registries. Admission remains a background
 /// Git-verification responsibility; schema migration performs no Git or
 /// filesystem I/O.
-pub const SCHEMA_VERSION: i64 = 69;
+pub const SCHEMA_VERSION: i64 = 70;
 
 /// Escape hatch for [`schema_refusal`] — set to `1`/`true` to run a build older
 /// than the on-disk schema anyway (read-only, as before). Deliberately awkward:
@@ -1066,9 +1066,67 @@ pub fn session() -> String {
     std::env::var("THEGN_SESSION").unwrap_or_else(|_| "default".into())
 }
 
+/// The canonical identity of the shared database file, used as the schema-lease
+/// key — memoized, because `canonicalize` resolves and `stat`s every path
+/// component and [`Db::open`] has 401 call sites.
+///
+/// **Keyed by the requested path, not process-global.** One process routinely
+/// opens several databases: every test that isolates `XDG_STATE_HOME` gets its
+/// own, and they share a process under `cargo test`. A single `OnceLock` would
+/// hand the first database's canonical path to every later one and silently key
+/// their schema leases together.
+///
+/// **Only a successful canonicalization is cached.** On a fresh install the file
+/// does not exist yet, `canonicalize` fails, and we fall back to the
+/// uncanonicalized path; caching *that* would pin a non-canonical key, so a
+/// symlinked state directory would key its schema lease differently before and
+/// after the DB was created.
+fn shared_db_path(path: &std::path::Path) -> std::path::PathBuf {
+    use std::sync::{Mutex, OnceLock};
+    static SHARED: OnceLock<
+        Mutex<std::collections::HashMap<std::path::PathBuf, std::path::PathBuf>>,
+    > = OnceLock::new();
+    let cache = SHARED.get_or_init(Mutex::default);
+    // A poisoned lock is not worth failing an open over: fall through and pay
+    // the `canonicalize`, which is what this whole function is avoiding.
+    if let Ok(seen) = cache.lock()
+        && let Some(hit) = seen.get(path)
+    {
+        return hit.clone();
+    }
+    match std::fs::canonicalize(path) {
+        Ok(canonical) => {
+            if let Ok(mut seen) = cache.lock() {
+                // Bounded in practice by the number of distinct state dirs a
+                // process opens: one in production, one per isolated test.
+                seen.insert(path.to_path_buf(), canonical.clone());
+            }
+            canonical
+        }
+        // Deliberately uncached: see above.
+        Err(_) => path.to_path_buf(),
+    }
+}
+
 impl Db {
     pub fn open() -> Result<Db> {
+        // Timed for the loop-thread open counter (THE-179). Only opens on the
+        // render/input thread are recorded — those are the ones that can freeze
+        // a frame, since SQLite's `busy_timeout` here is 5 SECONDS. Off the loop
+        // this is one `Instant::now()` pair and a thread-id compare; in a
+        // process that never marked a loop thread it is the compare alone.
+        let started = std::time::Instant::now();
+        let out = Self::open_timed();
+        crate::db_open_stats::record_open(started.elapsed().as_micros() as u64);
+        out
+    }
+
+    fn open_timed() -> Result<Db> {
         let path = db_path();
+        // NOT memoized. Skipping this after the first open would save about four
+        // syscalls and cost correctness twice over: one process opens many state
+        // dirs (every test that isolates `XDG_STATE_HOME`), and a state dir
+        // removed underneath a running thegn would stop being recreated.
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
             // Owner-only (0700) on the state dir + 0600 on the DB file below:
@@ -1081,7 +1139,7 @@ impl Db {
             let _ = crate::fsperm::restrict_dir_to_owner(dir); // best-effort: hardening: a failed chmod must never block DB open
         }
         let conn = Self::open_connection(&path)?;
-        let shared = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        let shared = shared_db_path(&path);
         let db = Self::init_shared(conn, &shared)?;
         let _ = crate::fsperm::restrict_to_owner(&path); // best-effort: hardening: a failed chmod must never block DB open
         // The common fast-path init (user_version already current) skips the
@@ -2005,6 +2063,7 @@ impl Db {
         crate::db_migrate::migrate_v67(&conn)?;
         crate::db_control::migrate_v68(&conn)?;
         crate::db_migrate::migrate_v69(&conn)?;
+        crate::db_migrate::migrate_v70(&conn)?;
         if ver < SCHEMA_VERSION {
             crate::db_migrate::verify_v62_schema(&conn)?;
             crate::db_migrate::verify_v63_schema(&conn)?;

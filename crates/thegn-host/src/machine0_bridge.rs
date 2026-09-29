@@ -166,7 +166,9 @@ fn resolve(cfg: &Config, name: &str, wake: bool) -> Result<(String, String, Remo
         let Some(provider) = crate::provider_factory::machine0_provider_for(pc, name) else {
             continue;
         };
-        let rt = tokio::runtime::Runtime::new()?;
+        // Current-thread: one network call does not need a worker per core.
+        // See `agent::provider_runtime`.
+        let rt = crate::agent::provider_runtime()?;
         let res = if wake {
             rt.block_on(provider.resolve_endpoint(name))
         } else {

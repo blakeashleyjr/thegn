@@ -65,6 +65,121 @@ pub(crate) fn parse_spec(s: &str) -> Spec<'_> {
     Spec::Worktree { rev: s }
 }
 
+/// A diff resource cache that **reaps** its long-running filter processes when
+/// it goes out of scope, on every path including `?` and panic.
+///
+/// # Why this is RAII and not a call at the end of the function
+///
+/// A worktree diff runs in `Mode::ToGit`, i.e. it applies the *clean* filter so
+/// worktree content can be compared against the stored blob. When a repository
+/// — or the user's global config — sets `filter.lfs.process`, gix spawns
+/// `git-lfs filter-process` as a long-running driver, a direct child of this
+/// process.
+///
+/// `gix_filter::driver::State`'s own docs are explicit: *"shutdown() must be
+/// called to finalize long-running processes. Failing to do so will naturally
+/// shut them down by terminating their pipes, but finishing explicitly allows to
+/// wait for processes as well."* Without that wait the child is never reaped,
+/// and `std::process::Child` does not wait on drop — so each diff leaves a
+/// zombie.
+///
+/// Measured before this existed: **4,408** zombie `git-lfs` processes parented
+/// to a single thegn instance after three days, taking the machine's process
+/// table to 5,274 entries and making a plain `pgrep` cost 20% of a core.
+///
+/// Both diff functions below have `?` early-returns between building the cache
+/// and finishing, and a failed diff spawns the filter just the same — so a
+/// cleanup call at the happy-path exit would leak on precisely the paths that
+/// are hardest to notice. Hence `Drop`.
+///
+/// **The filter is deliberately NOT disabled instead.** That would be cheaper
+/// and it would be wrong: without the clean filter, an LFS worktree file's full
+/// content is compared against its stored pointer, producing a spurious
+/// whole-file diff on every LFS-tracked path.
+///
+/// `Drop` is the second line of defence, not the first — see
+/// [`prefer_oneshot_filters`], which stops the long-running process being
+/// spawned at all for the driver shape git-lfs actually installs.
+struct ReapingCache(gix::diff::blob::Platform);
+
+/// Route a driver that offers **both** shapes through its one-shot program
+/// instead of its long-running `process`, because gix owns the one-shot child's
+/// lifetime and leaks the persistent one.
+///
+/// git-lfs installs all three (`filter.lfs.clean`, `.smudge`, `.process`, with
+/// `required = true`), and gix prefers `process` whenever it is set. That
+/// preference is what leaks, in two separate places inside gix-filter 0.31:
+///
+/// * on the happy path the `Client` lives in `driver::State::running` until the
+///   state is dropped, and gix's own comment there asserts that *"nothing else
+///   needs to be done to clean them up after drop"* — which is false, because
+///   the pipes closing makes the child **exit**, not get **waited on**;
+/// * on an I/O error `driver::apply::handle_io_err` does
+///   `running.remove(process)` and drops the `Client` on the floor, so it never
+///   reaches `shutdown()` at all. That path is unreachable from outside gix,
+///   which is why `ReapingCache`'s `Drop` alone cannot close this.
+///
+/// The one-shot path has no such gap: gix keeps the child as
+/// `driver.required.then_some((child, command))` and `wait()`s it when the
+/// reader hits EOF. So the reroute is only safe for a `required` driver — for a
+/// non-required one gix discards the one-shot child unwaited too, which would
+/// trade one leak per *diff* for one leak per *blob*.
+///
+/// Correctness is unchanged: this is exactly what git itself does when a driver
+/// configures `clean` but no `process`, and `git-lfs clean` computes the pointer
+/// from local content with no network round-trip. What is lost is the protocol's
+/// `delay` batching, which matters when filtering a whole checkout and not when
+/// diffing the handful of paths that differ from HEAD.
+fn prefer_oneshot_filters(cache: &mut gix::diff::blob::Platform) {
+    for driver in &mut cache.filter.worktree_filter.options_mut().drivers {
+        // Both caches below convert `Mode::ToGit`, so `clean` is the one-shot
+        // program that has to exist for the reroute to preserve behaviour.
+        if driver.required && driver.clean.is_some() {
+            driver.process = None;
+        }
+    }
+}
+
+impl std::ops::Deref for ReapingCache {
+    type Target = gix::diff::blob::Platform;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for ReapingCache {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Drop for ReapingCache {
+    fn drop(&mut self) {
+        // `gix::filter::plumbing` is gix's re-export of the `gix-filter` crate
+        // (`pub use gix_filter as plumbing`), so this needs no new dependency.
+        use gix::filter::plumbing::driver::shutdown::Mode;
+        // `shutdown` consumes the state and `State: Default`, so take it and
+        // leave a fresh one behind; we are being dropped anyway.
+        let state = std::mem::take(self.0.filter.worktree_filter.driver_state_mut());
+        if let Err(error) = state.shutdown(Mode::WaitForProcesses) {
+            // best-effort: the diff itself already succeeded; a filter we could
+            // not wait for is worth a line, not a failure.
+            tracing::debug!(
+                target: "thegn::git",
+                %error,
+                "could not wait for a diff filter process"
+            );
+        }
+    }
+}
+
+/// The only way a diff cache is built here: wrapped so it reaps, and rerouted so
+/// there is normally nothing left to reap.
+fn new_cache(mut platform: gix::diff::blob::Platform) -> ReapingCache {
+    prefer_oneshot_filters(&mut platform);
+    ReapingCache(platform)
+}
+
 /// Resolve a revspec to its commit's tree.
 fn tree_of<'r>(repo: &'r gix::Repository, rev: &str) -> Result<gix::Tree<'r>> {
     let id = repo
@@ -137,10 +252,11 @@ pub(crate) fn totals(path: impl AsRef<std::path::Path>, spec: &str) -> Result<(u
 /// reports renames as a delete plus an add unless `-M` is passed, and the CLI
 /// path here never passed it.
 fn tree_to_tree(old: &gix::Tree<'_>, new: &gix::Tree<'_>) -> Result<Vec<DiffEntry>> {
-    let mut cache = old
-        .repo
-        .diff_resource_cache_for_tree_diff()
-        .context("gix diff resource cache")?;
+    let mut cache = new_cache(
+        old.repo
+            .diff_resource_cache_for_tree_diff()
+            .context("gix diff resource cache")?,
+    );
     let mut out: Vec<DiffEntry> = Vec::new();
     let mut changes = old.changes().context("gix tree changes")?;
     changes.options(|o| {
@@ -193,15 +309,16 @@ fn tree_to_worktree(repo: &gix::Repository, rev: &str) -> Result<Vec<DiffEntry>>
         .to_owned();
     let old_tree = tree_of(repo, rev)?;
 
-    let mut cache = repo
-        .diff_resource_cache(
+    let mut cache = new_cache(
+        repo.diff_resource_cache(
             gix::diff::blob::pipeline::Mode::ToGit,
             gix::diff::blob::pipeline::WorktreeRoots {
                 old_root: None,
                 new_root: Some(workdir),
             },
         )
-        .context("gix worktree diff resource cache")?;
+        .context("gix worktree diff resource cache")?,
+    );
 
     // Enumerate the paths that differ from HEAD — staged and unstaged both,
     // which together are exactly what `git diff HEAD` reports.
@@ -287,6 +404,137 @@ fn tree_to_worktree(repo: &gix::Repository, rev: &str) -> Result<Vec<DiffEntry>>
 mod tests {
     use super::*;
     use crate::git::testutil::TestRepo;
+
+    /// Our own child processes as `(state, comm)` — naming them, because
+    /// "5 children leaked" does not say which spawn site to fix.
+    ///
+    /// A runtime probe rather than a compile-time platform gate: this crate's
+    /// platform ratchet keeps per-OS compilation out of service logic, and where
+    /// `/proc` is absent there is simply nothing to count.
+    fn own_children() -> Vec<(String, String)> {
+        let me = std::process::id();
+        let Ok(entries) = std::fs::read_dir("/proc") else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for e in entries.filter_map(Result::ok) {
+            let Ok(stat) = std::fs::read_to_string(e.path().join("stat")) else {
+                continue;
+            };
+            // comm can contain spaces and parens, so split on the LAST ')'.
+            let Some((head, rest)) = stat.rsplit_once(") ") else {
+                continue;
+            };
+            let comm = head.split_once(" (").map(|(_, c)| c).unwrap_or("?");
+            let mut f = rest.split_whitespace();
+            let state = f.next().unwrap_or("?");
+            if f.next().and_then(|p| p.parse::<u32>().ok()) == Some(me) {
+                out.push((state.to_string(), comm.to_string()));
+            }
+        }
+        out
+    }
+
+    /// A repo whose `tracked.txt` goes through a long-running `process` filter
+    /// (`cat`, the stand-in for `git-lfs filter-process`) and whose worktree is
+    /// dirty, so any content comparison must actually run that filter.
+    fn filtered_dirty_repo(name: &str) -> TestRepo {
+        let repo = TestRepo::new(name);
+        repo.commit_file("tracked.txt", "one\ntwo\n", "seed");
+        // git-lfs's own shape: all three programs, and `required`. `cat` is a
+        // faithful stand-in — as a one-shot it is an identity clean filter, and
+        // as a `process` it fails the long-running handshake, which is the
+        // gix-filter path that drops the child without waiting.
+        let ran = repo.dir.join("clean-ran");
+        repo.out(&[
+            "config",
+            "filter.tgtest.clean",
+            &format!("tee -a {}", ran.display()),
+        ]);
+        repo.out(&["config", "filter.tgtest.smudge", "cat"]);
+        repo.out(&["config", "filter.tgtest.process", "cat"]);
+        repo.out(&["config", "filter.tgtest.required", "true"]);
+        std::fs::write(
+            repo.dir.join(".gitattributes"),
+            "tracked.txt filter=tgtest\n",
+        )
+        .unwrap();
+        std::fs::write(repo.dir.join("tracked.txt"), "one\ntwo\nthree\n").unwrap();
+        repo
+    }
+
+    /// Which of the two calls in `tree_to_worktree` spawns the filter: the diff
+    /// resource cache we reap, or the `gix` status walk that finds the paths.
+    /// Run alone, the status walk should leave nothing behind.
+    #[test]
+    fn a_status_walk_leaves_no_unreaped_filter_process() {
+        // No procfs, no observation — see `own_children`.
+        if !std::path::Path::new("/proc/self/stat").exists() {
+            return;
+        }
+
+        let repo = filtered_dirty_repo("reap-filters-status");
+        let before = own_children().len();
+        for _ in 0..5 {
+            let gr = gix::discover(&repo.dir).unwrap();
+            let iter = gr
+                .status(gix::progress::Discard)
+                .unwrap()
+                .untracked_files(gix::status::UntrackedFiles::None)
+                .into_iter(None)
+                .unwrap();
+            for item in iter {
+                let _ = item.unwrap();
+            }
+        }
+        let after = own_children();
+        assert!(
+            after.len() <= before,
+            "a gix status walk left {} unreaped child process(es) behind \
+             (before={before}, after={}): {after:?}",
+            after.len().saturating_sub(before),
+            after.len()
+        );
+    }
+
+    /// A worktree diff against a repo configured with a long-running
+    /// `filter.*.process` driver must leave **no** unreaped child behind.
+    ///
+    /// This is the 4,408-zombie regression. Counting real children rather than
+    /// mocking: the defect was that `std::process::Child` is not waited on at
+    /// drop, and only the process table can show that.
+    #[test]
+    fn a_worktree_diff_leaves_no_unreaped_filter_process() {
+        // No procfs, no observation — see `own_children`.
+        if !std::path::Path::new("/proc/self/stat").exists() {
+            return;
+        }
+
+        let repo = filtered_dirty_repo("reap-filters");
+        let before = own_children().len();
+        // Several diffs: one leak per call is what produced thousands.
+        for _ in 0..5 {
+            let entries = diff_entries(&repo.dir, "HEAD").expect("worktree diff");
+            // Guard against passing for the wrong reason: a diff that silently
+            // stopped filtering would also leave no children behind.
+            assert!(
+                entries.iter().any(|e| e.path == "tracked.txt"),
+                "the filtered path dropped out of the diff: {entries:?}"
+            );
+        }
+        assert!(
+            repo.dir.join("clean-ran").exists(),
+            "the clean filter never ran, so this proves nothing about reaping it"
+        );
+        let after = own_children();
+        assert!(
+            after.len() <= before,
+            "a worktree diff left {} unreaped child process(es) behind \
+             (before={before}, after={}): {after:?}",
+            after.len().saturating_sub(before),
+            after.len()
+        );
+    }
 
     /// `commit_file` writes with `fs::write`, which does not create parents;
     /// these cases deliberately use nested paths, so make the directory first.
