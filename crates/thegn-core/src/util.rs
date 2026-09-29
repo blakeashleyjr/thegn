@@ -1482,19 +1482,13 @@ pub fn shell() -> String {
         .unwrap_or_else(|| std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".into()))
 }
 
-/// Spawn `cmd` via the login shell, fully detached (no controlling pane, output
-/// discarded). For GUI apps launched from a pane that is about to close.
-pub fn spawn_detached(cmd: &str, cwd: &Path) {
-    use std::process::Stdio;
-    // best-effort: detached GUI launch: failure is not actionable
-    let _ = Command::new(shell())
-        .args(["-lc", cmd])
-        .current_dir(cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
-}
+// `spawn_detached` lived here and leaked: it did `let _ = Command::…spawn()`, and
+// `std::process::Child` does not wait on drop, so every detached launch left a
+// zombie. It had **no callers** — everything real goes through
+// `thegn_host::actions::spawn_detached_reaped`, which owns the child — and being
+// `pub` is why dead-code analysis never flagged it. Removed rather than fixed: a
+// second detached-spawn helper with the more inviting name is how the leak comes
+// back. Found by `spawn_ratchet_tests` (THE-702).
 
 /// Set the terminal (pane) window title via OSC. Any program run afterwards
 /// (vim, lazygit, …) overrides it as usual, so this just seeds a sensible

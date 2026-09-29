@@ -245,6 +245,8 @@ pub mod provider_admission;
 pub mod proxy;
 pub mod pull_progress;
 pub mod rebase_todo;
+#[cfg(test)]
+mod spawn_ratchet_tests;
 // The canonical secret-redaction seam: one sensitive-key predicate + JSON
 // masker shared by every leak surface (MCP docs, crash reporter, doctor, the
 // typed SecretRef). See the module docs — new surfaces import from here.
