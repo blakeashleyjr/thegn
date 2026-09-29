@@ -804,6 +804,13 @@
       "changes": [
         "stabilize-process-monitor-refresh"
       ]
+    },
+    {
+      "issue": "THE-703",
+      "project": "Alpha Reliability & State Compatibility",
+      "changes": [
+        "add-pipeline-supervisor-policy"
+      ]
     }
   ]
 }

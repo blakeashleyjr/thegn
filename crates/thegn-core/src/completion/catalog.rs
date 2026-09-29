@@ -490,6 +490,25 @@ pub const CATALOG: &[Slot] = &[
         "resume_work",
         SourceKind::Reserved(Reserved::DispatchRow),
     ),
+    // --- pipeline supervisor -------------------------------------------------
+    // The read-only supervisor verbs narrow by the same two things the roster is
+    // keyed on, so they reuse the roster's own reserved sources rather than
+    // introducing a third vocabulary for values that already have one.
+    slot(
+        "supervise plan",
+        "issue",
+        SourceKind::Reserved(Reserved::Issue),
+    ),
+    slot(
+        "supervise status",
+        "issue",
+        SourceKind::Reserved(Reserved::Issue),
+    ),
+    slot(
+        "supervise validations",
+        "row",
+        SourceKind::Reserved(Reserved::DispatchRow),
+    ),
     // `--chunk <path>` records the chunk file a row dispatches under (THE-86
     // chunk 3) — a path under the worktree, like `parent_artifact`, so the
     // engine's filesystem completion is the intended behavior.

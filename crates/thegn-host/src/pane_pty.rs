@@ -270,7 +270,20 @@ pub(crate) fn open_pty(
                             .blocking_send(PaneEvent::Output(id, buf[..n].to_vec()))
                             .is_err()
                         {
-                            return; // consumer gone — don't bother reaping
+                            // Consumer gone ⇒ the session is over, which is
+                            // exactly when this child must be reaped. `break`,
+                            // not `return`: returning here skipped the
+                            // `terminate_and_reap()` below and leaked the pane's
+                            // shell as a zombie for the life of the process.
+                            //
+                            // The daemon is what made that unbounded — it holds
+                            // the `PtyProcessOwner` so a detached session
+                            // survives UI detach, so `PtyProcessState::drop`
+                            // (which does kill and wait) never ran either.
+                            // Measured: 28 `bash`/`bwrap` zombies parented to one
+                            // daemon over three days, every zombie on the
+                            // machine. See THE-704.
+                            break;
                         }
                         if let Some(w) = &waker {
                             let _ = w.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
@@ -304,4 +317,93 @@ pub(crate) fn open_pty(
         process,
         reader: PtyReaderJoin::new(reader),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Our own child processes, in any state. A leaked child is a leak whether
+    /// it is still running or already a zombie, so this counts both.
+    ///
+    /// A runtime probe rather than a compile-time platform gate: the host crate's
+    /// platform ratchet keeps per-OS compilation out of call sites, and where
+    /// `/proc` is absent there is nothing to count.
+    fn own_children() -> Vec<(String, String)> {
+        let me = std::process::id();
+        let Ok(entries) = std::fs::read_dir("/proc") else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for entry in entries.filter_map(Result::ok) {
+            let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+                continue;
+            };
+            // comm can hold spaces and parens, so split on the LAST ") ".
+            let Some((head, rest)) = stat.rsplit_once(") ") else {
+                continue;
+            };
+            let comm = head.split_once(" (").map(|(_, c)| c).unwrap_or("?");
+            let mut fields = rest.split_whitespace();
+            let state = fields.next().unwrap_or("?");
+            if fields.next().and_then(|p| p.parse::<u32>().ok()) == Some(me) {
+                out.push((state.to_string(), comm.to_string()));
+            }
+        }
+        out
+    }
+
+    /// A pane whose consumer goes away must still have its child reaped.
+    ///
+    /// This is THE-704. The reader used to `return` on a failed send — "consumer
+    /// gone, don't bother reaping" — which skipped the `terminate_and_reap()`
+    /// below the loop. The daemon holds the `PtyProcessOwner` so a detached
+    /// session outlives its UI, so `PtyProcessState::drop` never ran either, and
+    /// the pane's shell was left unwaited for the life of the process. Measured
+    /// on the live daemon: 28 orphans in three days, every zombie on the machine.
+    ///
+    /// Counting real `/proc` children rather than mocking, because the defect is
+    /// precisely that a handle was never waited on — only the process table shows
+    /// that.
+    #[test]
+    fn a_pane_whose_consumer_vanishes_leaves_no_child_behind() {
+        // No procfs, no observation.
+        if !std::path::Path::new("/proc/self/stat").exists() {
+            return;
+        }
+        let before = own_children().len();
+
+        // Bounded output, then a short sleep: enough writes to fill the channel
+        // and force a failed send, and — if the fix regresses — a child that
+        // expires on its own rather than a runaway the test suite inherits.
+        let argv: Vec<String> = [
+            "sh",
+            "-c",
+            "i=0; while [ $i -lt 5000 ]; do echo xxxxxxxx; i=$((i+1)); done; sleep 10",
+        ]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+
+        // Capacity 1: the reader blocks on the second send, so dropping the
+        // receiver reliably lands us on the failed-send path under test.
+        let (tx, rx) = tokio_mpsc::channel(1);
+        let handle = open_pty(1, &argv, None, &[], 24, 80, tx, None, None).expect("open pty");
+
+        // Let the child produce and the reader fill the channel.
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        drop(rx); // the consumer goes away, exactly as a UI detach does
+
+        // The reader observes the failed send and must reap before it ends.
+        handle.reader.join();
+
+        let after = own_children();
+        assert!(
+            after.len() <= before,
+            "a pane whose consumer vanished left {} child process(es) behind \
+             (before={before}, after={}): {after:?}",
+            after.len().saturating_sub(before),
+            after.len()
+        );
+    }
 }

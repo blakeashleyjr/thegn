@@ -59,6 +59,7 @@ pub mod session_move;
 pub mod share;
 pub mod skills;
 pub mod skills_doctor;
+pub mod supervise;
 pub mod target;
 pub mod theme;
 pub mod wt;

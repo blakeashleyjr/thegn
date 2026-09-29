@@ -95,6 +95,19 @@ sandboxing — each with the gate that enforces it. Behavioural contracts are
   `THEGN_BENCH_RUN_MS`), criterion micro-benches (`just bench-micro`), a live
   Telemetry "LOOP" overlay, and an in-process flame-graph profiler (`just profile`,
   SIGUSR2, `profiling` feature). All free when off; none in `ci` (machine-dependent).
+- **CPU is not the only axis, and it was the only one gated.** `just bench-soak`
+  (`cpu-sample.sh --scenario soak`) samples what a windowed CPU measurement
+  structurally cannot see — unreaped **children** (zombies counted separately),
+  **fds** by class, **thread** high-water, and the **read-syscall rate** — and,
+  unlike the advisory A/B perf recipes, it **fails** on a ceiling. It exists
+  because an instance ran three days to 4,408 zombie `git-lfs` children and
+  26,063 reads/sec, taking the machine to load 10–13 with `top` showing 45% idle,
+  while its cores-used looked ordinary: **4,408 zombies consume zero CPU.** The
+  ceilings are fixed, never baseline-derived, so a regressed baseline cannot
+  raise the bar on a leak. **Anything that spawns a child owns its lifetime** —
+  `std::process::Child` does not wait on drop, so a dropped handle is a zombie.
+  That class has now been found in production three times (THE-605, THE-448,
+  THE-701); THE-702 tracks the ratchet that should make a fourth impossible.
 - Expensive setup belongs off-thread (see the diff fs-watcher: recursive
   inotify registration is ~1s on large worktrees and is done on a background
   thread, handed back over a channel). **That number is Linux-specific** —
@@ -155,6 +168,7 @@ just smoke           # hermetic end-to-end CLI test
 just lint            # clippy -D warnings + shellcheck + yamllint + taplo
 just coverage        # cargo llvm-cov, gated at 95% lines on the core
 just bench           # startup benchmarks (hyperfine; not part of ci)
+just bench-soak      # resource-soak gate: children/fds/threads/syscall rate (not in ci)
 just start name=dev  # run the host with an isolated XDG_STATE_HOME
 just ci              # lint (fmt + ratchets) + deps-audit + build + cross/feature/msrv checks + test + coverage + smoke + term-check + nix-build (no e2e)
 just ci-local        # ci + e2e
