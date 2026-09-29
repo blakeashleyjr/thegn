@@ -71,6 +71,7 @@ pub(crate) fn spawn_scan_with_generation(
         if watch {
             expire_watched(&mut targets, now, cfg.watch_invalidate_secs);
         }
+        super::warn_if_saturated("loc", targets.len(), cfg.max_scan_per_round as usize);
         let due = scan_sched::plan(
             &targets,
             now,
