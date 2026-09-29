@@ -140,7 +140,7 @@ pub(crate) fn spawn_media_op(
     use thegn_core::media::LoopMode;
     let generation = generation.current();
     tokio::spawn(async move {
-        let Some(client) = thegn_media::client_for(&cfg.resolve_opts()).await else {
+        let Some(client) = crate::media_secret::client_for(&cfg).await else {
             return;
         };
         let cur = snapshot_or_log(&client, "preflight").await;
@@ -220,7 +220,7 @@ pub(crate) fn spawn_media_playlist(
 ) {
     let generation = generation.current();
     tokio::spawn(async move {
-        if let Some(client) = thegn_media::client_for(&cfg.resolve_opts()).await {
+        if let Some(client) = crate::media_secret::client_for(&cfg).await {
             if let Err(e) = client.activate_playlist(&id).await {
                 tracing::warn!(target: "thegn::media", error = %e, "playlist {id} activation failed");
             }
@@ -241,7 +241,7 @@ pub(crate) fn spawn_media_pick(
     waker: TerminalWaker,
 ) {
     tokio::spawn(async move {
-        let Some(client) = thegn_media::client_for(&cfg.resolve_opts()).await else {
+        let Some(client) = crate::media_secret::client_for(&cfg).await else {
             return;
         };
         let pick = if players {
@@ -262,7 +262,7 @@ pub(crate) fn spawn_media_queue(
     waker: TerminalWaker,
 ) {
     tokio::spawn(async move {
-        let Some(client) = thegn_media::client_for(&cfg.resolve_opts()).await else {
+        let Some(client) = crate::media_secret::client_for(&cfg).await else {
             return;
         };
         let q = match client.queue().await {
@@ -287,7 +287,7 @@ pub(crate) fn spawn_media_sources(
     waker: TerminalWaker,
 ) {
     tokio::spawn(async move {
-        let Some(client) = thegn_media::client_for(&cfg.resolve_opts()).await else {
+        let Some(client) = crate::media_secret::client_for(&cfg).await else {
             return;
         };
         let sources = client.players().await;

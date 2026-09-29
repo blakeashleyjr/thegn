@@ -499,6 +499,66 @@ fn predicate(tokens: &[Token<'_>], mut index: usize) -> (bool, usize) {
     }
 }
 
+/// Whether body throws away a spawned child process.
+///
+/// `std::process::Child` does **not** wait on drop, so a discarded handle leaves
+/// a zombie in the process table for the life of the process. One thegn instance
+/// reached 4,408 of them in three days, taking the machine's process table to
+/// 5,274 entries and its I/O pressure `full avg10` to 7.94 — at zero CPU cost,
+/// which is why nothing noticed.
+///
+/// `Command::spawn()` takes no arguments, so the empty parens distinguish a
+/// process spawn from a thread or task spawn (both of which always take a
+/// closure). The shapes flagged are the ones that drop the handle:
+///
+/// * `let _ = …spawn();`
+/// * `…spawn().ok();` — but **not** `…spawn().ok()?`, which unwraps and keeps it
+/// * `…spawn().is_ok()` — the handle reduced to a bool
+/// * `drop(…spawn())`
+///
+/// Anything that binds the child, or chains into `wait`/`wait_with_output`/
+/// `and_then`, is ownership and passes. The allowlist for this rule is seeded
+/// **empty**: the census found no real instance in the tree, so there is no debt
+/// to pin, and an addition is a regression rather than inherited history.
+pub fn discards_spawned_child(body: &str) -> bool {
+    let code = code_only(body);
+    code.match_indices(".spawn()").any(|(at, _)| {
+        let after = code[at + ".spawn()".len()..].trim_start();
+        // `.ok()?` / `.is_ok()` are distinguished by what follows the call.
+        let discarded_tail = if let Some(rest) = after.strip_prefix(".ok()") {
+            !rest.trim_start().starts_with('?')
+        } else {
+            after.starts_with(".is_ok()")
+        };
+        if discarded_tail {
+            return true;
+        }
+        // `let _ = …spawn()` / `drop(…spawn())`: look back to the start of the
+        // statement, since the receiver expression may be arbitrarily long.
+        let before = &code[..at];
+        let stmt = before
+            .rfind([';', '{', '}'])
+            .map_or(before, |cut| &before[cut + 1..]);
+        stmt.contains("let _ =") || calls_fn(stmt, "drop")
+    })
+}
+
+/// Whether `hay` calls a function named exactly `name`.
+///
+/// A plain `contains("drop(")` also matches `kill_on_drop(` — which is
+/// `tokio::process::Command`'s *ownership* setting, the opposite of a leak — so
+/// the preceding character must not be part of an identifier.
+fn calls_fn(hay: &str, name: &str) -> bool {
+    let needle = format!("{name}(");
+    hay.match_indices(&needle).any(|(at, _)| {
+        at == 0
+            || !hay[..at]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_alphanumeric() || c == '_')
+    })
+}
+
 /// Whether body contains a platform-conditional cfg or cfg_attr attribute.
 /// The predicate walker visits every comma-separated sibling and nested
 /// expression, so argument order cannot hide a platform leaf.
@@ -605,6 +665,67 @@ pub fn file_ratchet(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discard_detection_separates_a_dropped_child_from_an_owned_one() {
+        // Dropped: the four shapes that leave a zombie.
+        assert!(discards_spawned_child(
+            "fn a() { let _ = Command::new(\"x\").arg(\"y\").spawn(); }"
+        ));
+        assert!(discards_spawned_child("fn b() { c.spawn().ok(); }"));
+        assert!(discards_spawned_child("fn c() { if c.spawn().is_ok() {} }"));
+        assert!(discards_spawned_child(
+            "fn d() { drop(Command::new(\"x\").spawn()); }"
+        ));
+
+        // Owned: `.ok()?` unwraps and keeps the child — the one real `.spawn().ok()`
+        // in the tree (`forge/native.rs`) is this shape, and flagging it would have
+        // seeded the allowlist with a file that has no defect.
+        assert!(!discards_spawned_child(
+            "fn keep() -> Option<Child> { Some(cmd.spawn().ok()?) }"
+        ));
+        assert!(!discards_spawned_child(
+            "fn w() { cmd.spawn().and_then(|mut c| c.wait()).ok(); }"
+        ));
+        assert!(!discards_spawned_child(
+            "fn b() { let child = cmd.spawn()?; }"
+        ));
+        assert!(!discards_spawned_child(
+            "fn f() { self.child = Some(cmd.spawn()?); }"
+        ));
+        // `kill_on_drop(true)` is tokio's OWNERSHIP setting and contains the
+        // substring `drop(`. A naive `contains` flagged `vps/ssh_shim.rs`, whose
+        // child is bound and `wait_with_output()`-ed — the exact false positive
+        // that would have seeded this allowlist with a clean file.
+        assert!(!discards_spawned_child(
+            "fn s() { let mut child = Command::new(\"x\").kill_on_drop(true).spawn()?; }"
+        ));
+        assert!(discards_spawned_child(
+            "fn s() { drop(Command::new(\"x\").kill_on_drop(true).spawn()); }"
+        ));
+
+        // A thread or task spawn always takes a closure, so it never matches — the
+        // rule is about process children, and THE-448's thread leak is a different
+        // defect with a different fix.
+        assert!(!discards_spawned_child(
+            "fn t() { let _ = std::thread::Builder::new().spawn(move || {}); }"
+        ));
+        assert!(!discards_spawned_child(
+            "fn t() { let _ = tokio::spawn(fut); }"
+        ));
+
+        // A `let _ =` earlier in the SAME statement is what counts; one in a
+        // previous statement must not taint an owned spawn after it.
+        assert!(!discards_spawned_child(
+            "fn m() { let _ = other(); let child = cmd.spawn()?; }"
+        ));
+
+        // Comments and strings are stripped before matching (`code_only`), so
+        // prose about the rule cannot trip it.
+        assert!(!discards_spawned_child(
+            "// never write `let _ = cmd.spawn();` here\nfn ok() { let c = cmd.spawn()?; }"
+        ));
+    }
 
     #[test]
     fn platform_cfg_detection_walks_complete_predicates() {

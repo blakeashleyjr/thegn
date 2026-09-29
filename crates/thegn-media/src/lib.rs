@@ -280,7 +280,6 @@ pub enum BackendKind {
 
 /// The owned backend-resolution input. Core builds this from `[media]` config;
 /// the leaf never sees `MediaConfig`.
-#[derive(Debug, Clone)]
 pub struct ResolveOpts {
     pub backend: BackendKind,
     /// Preferred players (bus-name tails); first match wins.
@@ -291,7 +290,22 @@ pub struct ResolveOpts {
     /// the MPD backend and by `auto`). Empty ⇒ MPD source is skipped.
     pub mpd_socket: String,
     /// Optional MPD password.
-    pub mpd_password: Option<String>,
+    pub mpd_password: Option<MpdPassword>,
+}
+
+/// A resolved MPD credential with one owner, no printable representation, and
+/// zeroization when its authentication attempt releases it.
+pub struct MpdPassword(zeroize::Zeroizing<String>);
+
+impl MpdPassword {
+    /// Move resolved credential material into the media backend.
+    pub fn new(value: String) -> Self {
+        Self(zeroize::Zeroizing::new(value))
+    }
+
+    pub(crate) fn expose(&self) -> &str {
+        self.0.as_str()
+    }
 }
 
 /// The resolved media backend for this session: a boxed [`MediaBackend`] trait
@@ -303,15 +317,15 @@ pub type MediaClient = Box<dyn MediaBackend>;
 /// backend is `none`/unimplemented, the chosen backend isn't available on this
 /// OS, or its transport can't be reached (the caller then shows nothing — the
 /// feature is silently inert).
-pub async fn client_for(opts: &ResolveOpts) -> Option<MediaClient> {
+pub async fn client_for(mut opts: ResolveOpts) -> Option<MediaClient> {
     match opts.backend {
         BackendKind::None => None,
-        BackendKind::Auto => auto_client(opts).await,
-        BackendKind::Mpris => mpris_client(opts).await,
-        BackendKind::Mpv => mpv_client(opts),
-        BackendKind::Mpd => mpd_client(opts).await,
-        BackendKind::Smtc => smtc_client(opts).await,
-        BackendKind::AppleScript => applescript_client(opts),
+        BackendKind::Auto => auto_client(&mut opts).await,
+        BackendKind::Mpris => mpris_client(&opts).await,
+        BackendKind::Mpv => mpv_client(&opts),
+        BackendKind::Mpd => mpd_client(&mut opts).await,
+        BackendKind::Smtc => smtc_client(&opts).await,
+        BackendKind::AppleScript => applescript_client(&opts),
         BackendKind::Spotify => {
             tracing::debug!(target: "thegn::media", "spotify backend reserved; use MPRIS/SMTC/AppleScript for desktop control");
             None
@@ -328,7 +342,7 @@ pub async fn client_for(opts: &ResolveOpts) -> Option<MediaClient> {
 /// [`aggregate::Aggregate`] so anything actually playing shows up out of the box;
 /// with a single source it returns that source directly. Windows/macOS keep one
 /// universal backend (SMTC / MediaRemote→AppleScript).
-async fn auto_client(opts: &ResolveOpts) -> Option<MediaClient> {
+async fn auto_client(opts: &mut ResolveOpts) -> Option<MediaClient> {
     #[cfg(target_os = "linux")]
     return linux_auto_client(opts).await;
     #[cfg(windows)]
@@ -347,7 +361,7 @@ async fn auto_client(opts: &ResolveOpts) -> Option<MediaClient> {
 /// exists on disk (so we never poll a dead default path). One source ⇒ that
 /// source alone; several ⇒ an [`aggregate::Aggregate`].
 #[cfg(target_os = "linux")]
-async fn linux_auto_client(opts: &ResolveOpts) -> Option<MediaClient> {
+async fn linux_auto_client(opts: &mut ResolveOpts) -> Option<MediaClient> {
     let mut sources: Vec<MediaClient> = Vec::new();
     if let Some(c) = mpris_client(opts).await {
         sources.push(c);
@@ -438,8 +452,11 @@ fn mpv_client(opts: &ResolveOpts) -> Option<MediaClient> {
 
 /// Build the native MPD backend, probing that the daemon actually answers so a
 /// dead endpoint doesn't sit in the aggregator. `None` when unreachable.
-async fn mpd_client(opts: &ResolveOpts) -> Option<MediaClient> {
-    let endpoint = mpd::MpdEndpoint::resolve(&opts.mpd_socket, opts.mpd_password.clone());
+async fn mpd_client(opts: &mut ResolveOpts) -> Option<MediaClient> {
+    if opts.mpd_socket.is_empty() {
+        return None;
+    }
+    let endpoint = mpd::MpdEndpoint::resolve(&opts.mpd_socket, opts.mpd_password.take());
     match mpd::Mpd::connect(endpoint).await {
         Ok(m) => {
             tracing::debug!(target: "thegn::media", "media backend: native MPD");
@@ -476,3 +493,5 @@ fn applescript_client(_opts: &ResolveOpts) -> Option<MediaClient> {
 mod platform_ratchet_tests;
 #[cfg(test)]
 mod ratchet;
+#[cfg(test)]
+mod spawn_ratchet_tests;

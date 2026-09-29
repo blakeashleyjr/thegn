@@ -119,6 +119,30 @@ fn candidate_paths(db: &Db) -> Vec<String> {
 }
 
 /// [`candidate_paths`] joined with a cache's fetch stamps and the on-screen
+/// Warn once per lane when its registry is larger than one TTL window's
+/// capacity, so a lane that can never go idle says so instead of being
+/// discovered days later by a melted machine.
+///
+/// Once per process, not per round: a saturated lane pumps forever, so warning
+/// every round would be its own log storm — the exact shape of problem being
+/// reported.
+pub(crate) fn warn_if_saturated(lane: &'static str, rows: usize, budget: usize) {
+    use std::sync::Mutex;
+    use std::sync::OnceLock;
+    static WARNED: OnceLock<Mutex<std::collections::BTreeSet<&'static str>>> = OnceLock::new();
+    let Some(message) = thegn_core::scan_sched::saturation(rows, budget).warning() else {
+        return;
+    };
+    let seen = WARNED.get_or_init(|| Mutex::new(std::collections::BTreeSet::new()));
+    let Ok(mut seen) = seen.lock() else {
+        return; // best-effort: diagnostics only; a poisoned latch must not break a scan
+    };
+    if !seen.insert(lane) {
+        return;
+    }
+    tracing::warn!(target: LOG, scan = lane, rows, "{message}");
+}
+
 /// worktree, ready for [`thegn_core::scan_sched::plan`].
 fn targets(
     db: &Db,

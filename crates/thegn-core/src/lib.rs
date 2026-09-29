@@ -105,6 +105,8 @@ mod db_iroh;
 pub mod db_migrate;
 mod db_model_proxy;
 mod db_notification;
+pub mod db_open_stats;
+pub mod db_pipeline_supervise;
 pub mod db_placement;
 mod db_pool;
 mod db_projects;
@@ -218,6 +220,7 @@ pub mod output_match;
 pub mod paste_drop;
 pub mod patch;
 pub mod picker;
+pub mod pipeline_approval;
 pub mod pipeline_chunk;
 pub mod pipeline_claim;
 pub mod pipeline_exit;
@@ -225,6 +228,8 @@ pub mod pipeline_reap;
 pub mod pipeline_report;
 pub mod pipeline_resume;
 pub mod pipeline_run;
+pub mod pipeline_supervise;
+pub mod pipeline_validate;
 pub mod placement;
 #[cfg(test)]
 mod platform_ratchet_tests;
@@ -241,6 +246,8 @@ pub mod provider_admission;
 pub mod proxy;
 pub mod pull_progress;
 pub mod rebase_todo;
+#[cfg(test)]
+mod spawn_ratchet_tests;
 // The canonical secret-redaction seam: one sensitive-key predicate + JSON
 // masker shared by every leak surface (MCP docs, crash reporter, doctor, the
 // typed SecretRef). See the module docs — new surfaces import from here.

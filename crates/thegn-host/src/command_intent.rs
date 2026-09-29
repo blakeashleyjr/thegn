@@ -84,6 +84,7 @@ fn classify_command(command: &Command) -> CommandIntent<'_> {
         | Command::Issue { .. }
         | Command::Kaneo { .. }
         | Command::Dispatch { .. }
+        | Command::Supervise { .. }
         | Command::Autopilot { .. }
         | Command::Ci { .. }
         | Command::Search(..)

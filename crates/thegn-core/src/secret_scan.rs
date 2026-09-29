@@ -6,8 +6,9 @@
 //! plaintext-secret warning, and `thegn doctor`'s per-ref presence rows all
 //! read the same list instead of re-deriving it.
 //!
-//! Pure: it builds typed [`SecretRef`]s; it resolves nothing (that is the
-//! broker's job, host-side).
+//! It builds typed [`SecretRef`]s; it resolves nothing (that is the broker's
+//! job, host-side). The one process environment field with credential syntax,
+//! `MPD_HOST`, is inventoried alongside config-backed fields.
 
 use crate::config::Config;
 use crate::config::VpnConfig;
@@ -27,7 +28,7 @@ pub struct SecretFieldRef {
 
 /// Every configured secret field across the config, in a stable order.
 ///
-/// Covers provider, issue, CI, VPN, snapshot, and MCP upstream fields. The
+/// Covers provider, issue, CI, VPN, snapshot, MCP upstream, and MPD fields. The
 /// field-specific bare-string meaning is explicit at every insertion.
 pub fn secret_refs(cfg: &Config) -> Vec<SecretFieldRef> {
     let mut out = Vec::new();
@@ -109,7 +110,38 @@ pub fn secret_refs(cfg: &Config) -> Vec<SecretFieldRef> {
         }
     }
 
+    if let Some(password) = cfg
+        .media
+        .mpd
+        .password
+        .as_ref()
+        .filter(|value| value.secret_ref().is_configured())
+    {
+        out.push(SecretFieldRef {
+            path: "media.mpd.password".to_string(),
+            reference: password.secret_ref().clone(),
+            consumer: "media:mpd".to_string(),
+        });
+    }
+    if let Ok(value) = std::env::var("MPD_HOST")
+        && let Some(reference) = mpd_host_secret_ref(&value)
+    {
+        out.push(SecretFieldRef {
+            path: "MPD_HOST.password".to_string(),
+            reference,
+            consumer: "media:mpd".to_string(),
+        });
+    }
+
     out
+}
+
+/// Extract the legacy `password@host` spelling into a redacted typed ref.
+/// A leading `@host` is a host address, not an empty credential.
+pub fn mpd_host_secret_ref(value: &str) -> Option<SecretRef> {
+    let (password, _) = value.trim().split_once('@')?;
+    (!password.is_empty())
+        .then(|| SecretRef::Literal(crate::secretref::LiteralSecret::new(password.to_string())))
 }
 
 fn scan_vpn(out: &mut Vec<SecretFieldRef>, prefix: &str, vpn: &VpnConfig) {
@@ -161,7 +193,10 @@ pub fn literal_refs(cfg: &Config) -> Vec<SecretFieldRef> {
         .into_iter()
         .filter(|s| {
             s.reference.is_literal()
-                && (s.path.starts_with("issues.issue_accounts[") || s.path == "ci.gitlab.token")
+                && (s.path.starts_with("issues.issue_accounts[")
+                    || s.path == "ci.gitlab.token"
+                    || s.path == "media.mpd.password"
+                    || s.path == "MPD_HOST.password")
         })
         .collect()
 }
@@ -171,6 +206,53 @@ mod tests {
     use super::*;
     use crate::config::{Config, EnvConfig, ProfileConfig, VpnConfig, VpnProviderKind};
     use crate::config_issues::IssueAccount;
+
+    #[test]
+    fn scans_mpd_password_refs_and_legacy_literals() {
+        let mut cfg = Config::default();
+        cfg.media.mpd.password = Some("legacy-mpd-sentinel".into());
+        let refs = secret_refs(&cfg);
+        let mpd: Vec<_> = refs
+            .iter()
+            .filter(|row| row.path == "media.mpd.password")
+            .collect();
+        assert_eq!(mpd.len(), 1);
+        assert_eq!(mpd[0].consumer, "media:mpd");
+        assert!(mpd[0].reference.is_literal());
+        assert!(
+            literal_refs(&cfg)
+                .iter()
+                .any(|row| row.path == "media.mpd.password")
+        );
+        assert!(!format!("{:?}", mpd[0]).contains("legacy-mpd-sentinel"));
+
+        for (input, backend) in [
+            ("keyring:mpd", "keyring"),
+            ("env:MPD_PASSWORD", "env"),
+            ("file:/run/mpd", "file"),
+        ] {
+            cfg.media.mpd.password = Some(input.into());
+            let row = secret_refs(&cfg)
+                .into_iter()
+                .find(|row| row.path == "media.mpd.password")
+                .unwrap();
+            assert_eq!(row.reference.backend_kind(), backend);
+            assert!(
+                !literal_refs(&cfg)
+                    .iter()
+                    .any(|literal| literal.path == "media.mpd.password")
+            );
+        }
+    }
+
+    #[test]
+    fn mpd_host_embedded_password_is_redacted_and_leading_at_is_not_a_secret() {
+        let reference = mpd_host_secret_ref("host-env-sentinel@music.example").unwrap();
+        assert!(reference.is_literal());
+        assert!(!format!("{reference:?}").contains("host-env-sentinel"));
+        assert!(mpd_host_secret_ref("@music.example").is_none());
+        assert!(mpd_host_secret_ref("music.example").is_none());
+    }
 
     #[test]
     fn scans_provider_issue_and_ci_tokens_with_right_bare_semantics() {
