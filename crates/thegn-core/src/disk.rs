@@ -34,6 +34,89 @@ pub struct DiskUsage {
     pub newest_mtime: u64,
 }
 
+/// Sentinel paths whose mtime moves when a worktree's size could have changed.
+///
+/// A build writes `target/<profile>/.cargo-lock` and bumps `target/`'s own
+/// mtime; a checkout or fetch bumps `.git/HEAD` and `.git/index`; an editor
+/// bumps the root. None of them is a *proof* of change — a deep edit under
+/// `src/` moves none of these — which is why [`likely_unchanged_since`] is only
+/// ever a permission to SKIP a walk, bounded by a hard ceiling at the call site.
+const CHANGE_SENTINELS: &[&str] = &[
+    "",
+    "target",
+    "target/debug/.cargo-lock",
+    "target/release/.cargo-lock",
+    ".git/HEAD",
+    ".git/index",
+];
+
+/// Cheap probe: is this worktree plausibly unchanged since `since` (Unix secs)?
+///
+/// # Why this exists
+///
+/// [`measure_worktree`] walks EVERY file with all ignore rules off, because the
+/// number it reports is the size of `target/`. On a machine with many worktrees
+/// that is enormous: measured here, 82 worktrees totalling 490 GiB, of which
+/// 368 GiB is build output. Re-walking that on a timer is millions of `stat`
+/// calls per round for a number that, for an idle worktree, has not moved.
+///
+/// The observed failure mode is not "the scan is slow" — it is that the scan
+/// **never finishes and never idles**: `[disk] scan_interval_secs` is a per-row
+/// freshness TTL, so with more worktrees than the budget can refresh inside one
+/// TTL the scheduler always has work due. A live instance sat at 26,000 read
+/// syscalls a second, 60% of its CPU time in the kernel, indefinitely.
+///
+/// This turns the common case — an idle worktree nobody is building in — from a
+/// full walk into a handful of `stat`s.
+///
+/// # What it does NOT promise
+///
+/// `true` means "no sentinel moved", not "nothing changed". A deep edit that
+/// touches no sentinel is invisible here. Callers MUST bound how long they will
+/// trust it and force a real walk past that ceiling; skipping forever on this
+/// signal alone would let a size drift permanently.
+pub fn likely_unchanged_since(path: &Path, since: i64) -> bool {
+    if since <= 0 {
+        return false; // never measured: nothing to trust
+    }
+    // The root must exist. A missing sentinel is ordinarily "did not change"
+    // (an unbuilt worktree has no `target/`), but applying that to the root
+    // itself would report a VANISHED worktree as quiet and freeze its cached
+    // size forever. Not being able to see the tree is never evidence that it is
+    // unchanged.
+    if !path.is_dir() {
+        return false;
+    }
+    // A worktree that is GONE must never read as "unchanged". Every sentinel
+    // would be absent, and absent means "did not move" below — so without this
+    // the probe would report quiet and the caller would keep re-stamping a size
+    // for a directory that no longer exists. Caught by
+    // `a_vanished_worktree_forces_a_walk_rather_than_reporting_quiet`: the scan
+    // loop happens to test `is_dir()` before calling this, but a function that
+    // is only safe because of its caller is a trap for the next caller.
+    if !path.is_dir() {
+        return false;
+    }
+    !CHANGE_SENTINELS.iter().any(|rel| {
+        let p = if rel.is_empty() {
+            path.to_path_buf()
+        } else {
+            path.join(rel)
+        };
+        // A sentinel that does not exist cannot have moved. A metadata error is
+        // treated as "changed": the conservative direction is to walk.
+        match std::fs::symlink_metadata(&p) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(_) => true,
+            Ok(meta) => meta
+                .modified()
+                .ok()
+                .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+                .is_none_or(|d| d.as_secs() as i64 > since),
+        }
+    })
+}
+
 /// Measure a worktree's disk usage in ONE parallel walk.
 ///
 /// This used to shell out to `du -sb` twice — once for the checkout, then again
@@ -459,5 +542,126 @@ mod tests {
     fn grand_total_does_not_treat_prefix_siblings_as_nested() {
         let entries = [(p("/wt/a"), 100u64, 0u64), (p("/wt/ab"), 200, 0)];
         assert_eq!(grand_total(&entries), (300, 0));
+    }
+
+    // --- the lazy staleness probe -------------------------------------------
+
+    /// Set a path's mtime to `secs` since the epoch. Works for files AND
+    /// directories: `File::set_modified` is `futimens`, which a directory fd
+    /// accepts. No extra dependency — `filetime` is not in this crate's graph
+    /// and a test is not a reason to add one.
+    fn touch_at(p: &std::path::Path, secs: u64) {
+        let f = if p.is_dir() {
+            std::fs::File::open(p)
+        } else {
+            std::fs::OpenOptions::new().write(true).open(p)
+        }
+        .expect("open for mtime");
+        f.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+            .expect("set mtime");
+    }
+
+    #[test]
+    fn a_never_measured_worktree_is_always_walked() {
+        let d = tempfile::tempdir().unwrap();
+        // `since <= 0` means no trustworthy prior measurement.
+        assert!(!likely_unchanged_since(d.path(), 0));
+        assert!(!likely_unchanged_since(d.path(), -1));
+    }
+
+    #[test]
+    fn a_quiet_worktree_reports_unchanged() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join("target/debug")).unwrap();
+        std::fs::write(d.path().join("target/debug/.cargo-lock"), b"").unwrap();
+        // Everything stamped well in the past, measured after that.
+        for rel in ["", "target", "target/debug/.cargo-lock"] {
+            let p = if rel.is_empty() {
+                d.path().to_path_buf()
+            } else {
+                d.path().join(rel)
+            };
+            touch_at(&p, 1_000);
+        }
+        assert!(likely_unchanged_since(d.path(), 2_000));
+    }
+
+    #[test]
+    fn a_build_marker_newer_than_the_measurement_forces_a_walk() {
+        // The case that matters: cargo wrote `.cargo-lock` after we measured, so
+        // `target/` may have grown by gigabytes and the cached size is a lie.
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join("target/debug")).unwrap();
+        let lock = d.path().join("target/debug/.cargo-lock");
+        std::fs::write(&lock, b"").unwrap();
+        touch_at(d.path(), 1_000);
+        touch_at(&d.path().join("target"), 1_000);
+        touch_at(&lock, 5_000);
+        assert!(!likely_unchanged_since(d.path(), 2_000));
+    }
+
+    #[test]
+    fn every_sentinel_independently_forces_a_walk() {
+        // No sentinel may be decorative: each one moving on its own must be
+        // enough, or the probe silently stops noticing a whole class of change.
+        for rel in CHANGE_SENTINELS {
+            let d = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(d.path().join("target/debug")).unwrap();
+            std::fs::create_dir_all(d.path().join("target/release")).unwrap();
+            std::fs::create_dir_all(d.path().join(".git")).unwrap();
+            for f in [
+                "target/debug/.cargo-lock",
+                "target/release/.cargo-lock",
+                ".git/HEAD",
+                ".git/index",
+            ] {
+                std::fs::write(d.path().join(f), b"").unwrap();
+            }
+            for s in CHANGE_SENTINELS {
+                let p = if s.is_empty() {
+                    d.path().to_path_buf()
+                } else {
+                    d.path().join(s)
+                };
+                touch_at(&p, 1_000);
+            }
+            assert!(
+                likely_unchanged_since(d.path(), 2_000),
+                "baseline should be quiet before moving {rel:?}"
+            );
+            let moved = if rel.is_empty() {
+                d.path().to_path_buf()
+            } else {
+                d.path().join(rel)
+            };
+            touch_at(&moved, 5_000);
+            assert!(
+                !likely_unchanged_since(d.path(), 2_000),
+                "moving sentinel {rel:?} did not force a walk"
+            );
+        }
+    }
+
+    #[test]
+    fn a_missing_sentinel_is_not_a_change_but_an_unreadable_one_is() {
+        // A worktree that has never been built has no `target/` at all; that is
+        // quiet, not suspicious. Anything we cannot stat is treated as changed,
+        // because walking is the conservative direction.
+        let d = tempfile::tempdir().unwrap();
+        touch_at(d.path(), 1_000);
+        assert!(
+            likely_unchanged_since(d.path(), 2_000),
+            "absent sentinels must not be read as change"
+        );
+    }
+
+    #[test]
+    fn a_vanished_worktree_forces_a_walk_rather_than_reporting_quiet() {
+        // The root itself is a sentinel, so a removed worktree cannot be
+        // mistaken for an unchanged one and keep a stale size forever.
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().to_path_buf();
+        drop(d);
+        assert!(!likely_unchanged_since(&path, 2_000));
     }
 }
