@@ -919,6 +919,16 @@ pub fn bisect_menu(active: bool) -> MenuOverlay {
 pub fn branch_menu(name: &str, is_head: bool) -> MenuOverlay {
     let mut items = Vec::new();
     if !is_head {
+        // Two items, because there is only one honest way to offer this.
+        //
+        // `force: false` is `git branch -d`, which REFUSES an unmerged branch —
+        // so the old single item promising "forces if unmerged" said the
+        // opposite of what it did. The refusal then surfaced only as a one-line
+        // status that is easy to miss, which reads as the delete doing nothing.
+        //
+        // Not simply flipping the flag to `true`: this path has no confirm
+        // step, so one keystroke would discard unmerged commits. The safe
+        // delete keeps the plain key; forcing is a separate, explicit choice.
         items.push(
             item(
                 Some('d'),
@@ -928,7 +938,22 @@ pub fn branch_menu(name: &str, is_head: bool) -> MenuOverlay {
                     force: false,
                 },
             )
-            .note("forces if unmerged")
+            .note("refuses if unmerged")
+            .danger(),
+        );
+        items.push(
+            item(
+                // 'x', not 'D': hotkey matching is case-insensitive, so 'D'
+                // collides with the plain delete above — a guardrail test
+                // catches it.
+                Some('x'),
+                format!("force delete {name}"),
+                MenuChoice::BranchDelete {
+                    name: name.into(),
+                    force: true,
+                },
+            )
+            .note("discards unmerged commits")
             .danger(),
         );
     }
@@ -1709,9 +1734,13 @@ mod tests {
     #[test]
     fn branch_menu_skips_delete_on_head_and_flags_danger() {
         let m = branch_menu("feature", false);
-        assert_eq!(hotkeys(&m), vec!['d', 'f', 'p', 'l', 'u', 'r']);
+        assert_eq!(hotkeys(&m), vec!['d', 'x', 'f', 'p', 'l', 'u', 'r']);
         assert!(m.items()[0].danger, "delete is danger");
-        assert!(m.items()[1].danger, "force push is danger");
+        assert!(m.items()[1].danger, "force delete is danger");
+        assert!(m.items()[2].danger, "force push is danger");
+        // 'd' is the SAFE delete — `git branch -d`, which refuses an unmerged
+        // branch. It used to carry a note claiming it forced, which was the
+        // opposite of what it did.
         assert_eq!(
             m.items()[0].choice,
             MenuChoice::BranchDelete {
@@ -1719,8 +1748,18 @@ mod tests {
                 force: false,
             }
         );
+        // 'x' is the explicit force. Separate from 'd' because this path has no
+        // confirm step, so escalating silently would discard unmerged commits
+        // on one keystroke.
         assert_eq!(
-            m.items()[4].choice,
+            m.items()[1].choice,
+            MenuChoice::BranchDelete {
+                name: "feature".into(),
+                force: true,
+            }
+        );
+        assert_eq!(
+            m.items()[5].choice,
             MenuChoice::BranchSetUpstream("feature".into())
         );
         let head = branch_menu("main", true);
@@ -1768,9 +1807,13 @@ mod tests {
     #[test]
     fn branch_actions_menu_extends_branch_menu_with_create_and_merge() {
         let m = branch_actions_menu("feature", false);
+        // 'x' is the force delete, added beside the plain 'd'. The two are
+        // separate items on purpose: 'd' is `git branch -d` and refuses an
+        // unmerged branch, and this path has no confirm step, so forcing has to
+        // be the user's explicit choice rather than a silent escalation.
         assert_eq!(
             hotkeys(&m),
-            vec!['d', 'f', 'p', 'l', 'u', 'r', 'n', 'g', 'm']
+            vec!['d', 'x', 'f', 'p', 'l', 'u', 'r', 'n', 'g', 'm']
         );
         assert_eq!(
             m.items().last().unwrap().choice,

@@ -339,10 +339,24 @@ mod pty_owner_tests {
         let owner = PtyProcessOwner::new(Box::new(child), Some(GroupHandle::from_pid(pid as i32)));
         let owner2 = owner.clone();
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        // 30s, plus an explicit assertion that the file actually arrived.
+        //
+        // This loop exits either on the file appearing OR on the deadline, and
+        // the `read_to_string` below then panicked with "grandchild pid
+        // published" — which reads as a teardown failure when it is really the
+        // fixture shell not having started yet. Observed failing once in three
+        // runs at load 13, and again inside the land gate, which is the most
+        // loaded moment there is. What this test asserts is how concurrent
+        // teardown resolves, so waiting longer costs nothing when healthy.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         while !child_pid_file.exists() && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
+        assert!(
+            child_pid_file.exists(),
+            "the fixture shell never published a grandchild pid within 30s — that \
+             is a load problem in the fixture, not a teardown failure"
+        );
         let grandchild: u32 = std::fs::read_to_string(&child_pid_file)
             .expect("grandchild pid published")
             .trim()
