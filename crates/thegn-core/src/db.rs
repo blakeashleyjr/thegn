@@ -1110,6 +1110,18 @@ fn shared_db_path(path: &std::path::Path) -> std::path::PathBuf {
 
 impl Db {
     pub fn open() -> Result<Db> {
+        // Timed for the loop-thread open counter (THE-179). Only opens on the
+        // render/input thread are recorded — those are the ones that can freeze
+        // a frame, since SQLite's `busy_timeout` here is 5 SECONDS. Off the loop
+        // this is one `Instant::now()` pair and a thread-id compare; in a
+        // process that never marked a loop thread it is the compare alone.
+        let started = std::time::Instant::now();
+        let out = Self::open_timed();
+        crate::db_open_stats::record_open(started.elapsed().as_micros() as u64);
+        out
+    }
+
+    fn open_timed() -> Result<Db> {
         let path = db_path();
         // NOT memoized. Skipping this after the first open would save about four
         // syscalls and cost correctness twice over: one process opens many state
