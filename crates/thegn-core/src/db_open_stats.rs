@@ -78,11 +78,7 @@ pub struct OpenStats {
 impl OpenStats {
     /// Mean cost of a loop-thread open, or 0 when there have been none.
     pub fn mean_us(self) -> u64 {
-        if self.calls == 0 {
-            0
-        } else {
-            self.total_us / self.calls
-        }
+        self.total_us.checked_div(self.calls).unwrap_or(0)
     }
 }
 
