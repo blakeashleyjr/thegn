@@ -4934,3 +4934,40 @@ fn ambiguous_legacy_tab_is_refused_not_first_wins() {
         Some("/wt/one")
     );
 }
+
+/// The shared-identity memo must be keyed by the requested path.
+///
+/// One process routinely opens several databases — every test that isolates
+/// `XDG_STATE_HOME` gets its own, and they share a process under `cargo test`.
+/// A process-global `OnceLock` handed the *first* database's canonical path to
+/// every later one, silently keying unrelated schema leases together; and the
+/// matching `create_dir_all` memo skipped directory prep for a second state dir
+/// entirely, which is how three `canonical_history` tests failed with
+/// "unable to open database file".
+#[test]
+fn two_state_dirs_in_one_process_get_distinct_shared_identities() {
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    let (pa, pb) = (a.path().join("thegn.db"), b.path().join("thegn.db"));
+    std::fs::write(&pa, b"").unwrap();
+    std::fs::write(&pb, b"").unwrap();
+
+    let ia = super::shared_db_path(&pa);
+    let ib = super::shared_db_path(&pb);
+    assert_ne!(ia, ib, "two databases must not share one schema-lease key");
+    // Stable across calls: the memo returns the same identity, not a fresh one.
+    assert_eq!(ia, super::shared_db_path(&pa));
+    assert_eq!(ib, super::shared_db_path(&pb));
+
+    // A path that does not exist yet cannot be canonicalized, and that answer is
+    // deliberately NOT cached — otherwise a fresh install would pin a
+    // non-canonical key for the life of the process.
+    let missing = a.path().join("not-created-yet.db");
+    assert_eq!(super::shared_db_path(&missing), missing);
+    std::fs::write(&missing, b"").unwrap();
+    assert_eq!(
+        super::shared_db_path(&missing),
+        std::fs::canonicalize(&missing).unwrap(),
+        "the failed lookup was cached, so the real identity is unreachable"
+    );
+}
