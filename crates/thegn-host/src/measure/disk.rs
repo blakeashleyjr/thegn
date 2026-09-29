@@ -79,12 +79,25 @@ pub(crate) fn spawn_scan(
         let stamps = db.all_worktree_disk_stamps().unwrap_or_default();
         let active = super::active_key(active.as_deref());
         let targets = super::targets(&db, &stamps, active.as_deref());
-        super::warn_if_saturated("disk", targets.len(), cfg.max_scan_per_round as usize);
+        // TWO budgets, because this lane has two costs. `max_scan_per_round`
+        // bounds the `du` below — the expensive thing. The examine cap bounds
+        // how many rows the round may *look at*, which after the lazy gate is
+        // mostly six `stat`s apiece. Spending a whole unit of walk budget on a
+        // skip is what kept this lane pinned: 83 worktrees against a capacity of
+        // 12 meant 82 of 83 rows re-stamped every five minutes while doing
+        // almost no real work. See `scan_sched::EXAMINE_PER_WALK`.
+        let walk_budget = cfg.max_scan_per_round as usize;
+        let examine_cap = scan_sched::examine_cap(walk_budget);
+        // Saturation is judged on the EXAMINE cap: a row the round never looks
+        // at stays due forever. Walk-budget pressure is a different condition
+        // and self-limiting — it means several worktrees are genuinely dirty at
+        // once, and bounding that is precisely what the walk budget is for.
+        super::warn_if_saturated("disk", targets.len(), examine_cap);
         let due = scan_sched::plan(
             &targets,
             thegn_core::util::now(),
             cfg.scan_interval_secs,
-            cfg.max_scan_per_round as usize,
+            examine_cap,
         );
         tracing::debug!(
             target: LOG,
@@ -102,9 +115,17 @@ pub(crate) fn spawn_scan(
         let mut measured = 0u32;
         // Rows re-stamped from cache without walking (the lazy gate below).
         let mut skipped = 0u32;
+        // Walks actually performed. This — not the row count — is what
+        // `max_scan_per_round` bounds, so that a round of cheap skips can drain
+        // the whole due list and the lane can reach an idle round.
+        let mut walked = 0usize;
         // Freshly measured this round, for the reclaim pass below.
         let mut fresh: Vec<(String, thegn_core::disk::DiskUsage)> = Vec::new();
         for path_s in &due {
+            // `0` means unlimited, matching `plan`'s budget convention.
+            if walk_budget > 0 && walked >= walk_budget {
+                break;
+            }
             let path = std::path::Path::new(path_s);
             if !path.is_dir() {
                 // Vanished since the registry row was written — drop any stale
@@ -154,6 +175,7 @@ pub(crate) fn spawn_scan(
             let _ = db.put_worktree_disk(path_s, total as i64, usage.target_bytes as i64); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
             fresh.push((path_s.clone(), usage));
             measured += 1;
+            walked += 1;
         }
 
         let reclaimed = reclaim(&db, &policy, &fresh, active.as_deref());
@@ -175,6 +197,8 @@ pub(crate) fn spawn_scan(
             scan = "disk",
             measured,
             skipped,
+            walked,
+            walk_budget,
             reclaimed,
             "round complete"
         );
