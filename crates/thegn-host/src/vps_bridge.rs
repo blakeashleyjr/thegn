@@ -29,7 +29,9 @@ fn resolve_ip(cfg: &Config, name: &str) -> Result<String> {
         let Some(provider) = crate::provider_factory::vps_provider_for(pc, name) else {
             continue;
         };
-        let rt = tokio::runtime::Runtime::new()?;
+        // Current-thread: one network call does not need a worker per core.
+        // See `agent::provider_runtime`.
+        let rt = crate::agent::provider_runtime()?;
         if let Ok(ip) = rt.block_on(provider.resolve_ip(name)) {
             return Ok(ip);
         }

@@ -13,6 +13,22 @@ use super::LOG;
 
 static INFLIGHT: AtomicBool = AtomicBool::new(false);
 
+/// Walk a worktree unconditionally once this long has passed since its last
+/// real measurement, however quiet its change sentinels look.
+///
+/// This is the bound on [`thegn_core::disk::likely_unchanged_since`]'s
+/// imprecision: that probe can miss an edit that moves no sentinel, so trusting
+/// it forever would let a reported size drift permanently.
+///
+/// A day, not an hour. The sentinels already catch the case that actually moves
+/// these numbers — every `cargo` invocation touches
+/// `target/<profile>/.cargo-lock` — so the ceiling exists only for the residual
+/// deep-edit case, where being a day stale costs a slightly wrong badge. An
+/// hourly ceiling would instead re-walk every worktree every hour whatever
+/// happened: on the machine this was diagnosed on that is 490 GiB, 368 GiB of it
+/// build output, which is the cost this whole gate exists to remove.
+const FORCE_WALK_AFTER_SECS: i64 = 86_400;
+
 /// Background per-worktree disk scan.
 ///
 /// Ordered by [`scan_sched::plan`], so the ACTIVE worktree and any
@@ -63,11 +79,25 @@ pub(crate) fn spawn_scan(
         let stamps = db.all_worktree_disk_stamps().unwrap_or_default();
         let active = super::active_key(active.as_deref());
         let targets = super::targets(&db, &stamps, active.as_deref());
+        // TWO budgets, because this lane has two costs. `max_scan_per_round`
+        // bounds the `du` below — the expensive thing. The examine cap bounds
+        // how many rows the round may *look at*, which after the lazy gate is
+        // mostly six `stat`s apiece. Spending a whole unit of walk budget on a
+        // skip is what kept this lane pinned: 83 worktrees against a capacity of
+        // 12 meant 82 of 83 rows re-stamped every five minutes while doing
+        // almost no real work. See `scan_sched::EXAMINE_PER_WALK`.
+        let walk_budget = cfg.max_scan_per_round as usize;
+        let examine_cap = scan_sched::examine_cap(walk_budget);
+        // Saturation is judged on the EXAMINE cap: a row the round never looks
+        // at stays due forever. Walk-budget pressure is a different condition
+        // and self-limiting — it means several worktrees are genuinely dirty at
+        // once, and bounding that is precisely what the walk budget is for.
+        super::warn_if_saturated("disk", targets.len(), examine_cap);
         let due = scan_sched::plan(
             &targets,
             thegn_core::util::now(),
             cfg.scan_interval_secs,
-            cfg.max_scan_per_round as usize,
+            examine_cap,
         );
         tracing::debug!(
             target: LOG,
@@ -78,16 +108,52 @@ pub(crate) fn spawn_scan(
             "planned round"
         );
 
+        let now = thegn_core::util::now();
+        // One bulk read for the lazy gate below, so a skipped row costs a map
+        // lookup rather than a query.
+        let cached_all = db.all_worktree_disk().unwrap_or_default();
         let mut measured = 0u32;
+        // Rows re-stamped from cache without walking (the lazy gate below).
+        let mut skipped = 0u32;
+        // Walks actually performed. This — not the row count — is what
+        // `max_scan_per_round` bounds, so that a round of cheap skips can drain
+        // the whole due list and the lane can reach an idle round.
+        let mut walked = 0usize;
         // Freshly measured this round, for the reclaim pass below.
         let mut fresh: Vec<(String, thegn_core::disk::DiskUsage)> = Vec::new();
         for path_s in &due {
+            // `0` means unlimited, matching `plan`'s budget convention.
+            if walk_budget > 0 && walked >= walk_budget {
+                break;
+            }
             let path = std::path::Path::new(path_s);
             if !path.is_dir() {
                 // Vanished since the registry row was written — drop any stale
                 // size so the badge clears instead of freezing at its last value.
                 let _ = db.delete_worktree_disk(path_s); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                 measured += 1;
+                continue;
+            }
+            // LAZY GATE. The walk below is the expensive thing in this file:
+            // all ignore rules off, so it recurses through every build artifact
+            // on purpose. For an idle worktree it re-derives a number that has
+            // not moved.
+            //
+            // Skip it when no change sentinel has moved since the cached
+            // measurement — but only up to `FORCE_WALK_AFTER_SECS`, because the
+            // sentinels can miss a deep edit and a size must not be allowed to
+            // drift indefinitely. Past the ceiling we always walk.
+            let cached_at = stamps.get(path_s.as_str()).copied().unwrap_or(0);
+            let ceiling_passed =
+                cached_at <= 0 || now.saturating_sub(cached_at) >= FORCE_WALK_AFTER_SECS;
+            if !ceiling_passed
+                && thegn_core::disk::likely_unchanged_since(path, cached_at)
+                && let Some(&(total, target)) = cached_all.get(path_s.as_str())
+            {
+                // Re-stamp so the scheduler treats the row as fresh; without
+                // this it stays due forever and the round never idles.
+                let _ = db.put_worktree_disk(path_s, total, target); // best-effort: cache write: the DB is a cache
+                skipped += 1;
                 continue;
             }
             let usage = thegn_core::disk::measure_worktree(path);
@@ -109,6 +175,7 @@ pub(crate) fn spawn_scan(
             let _ = db.put_worktree_disk(path_s, total as i64, usage.target_bytes as i64); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
             fresh.push((path_s.clone(), usage));
             measured += 1;
+            walked += 1;
         }
 
         let reclaimed = reclaim(&db, &policy, &fresh, active.as_deref());
@@ -119,6 +186,21 @@ pub(crate) fn spawn_scan(
             &awaiting,
             cfg.generation_min_age_days,
             thegn_core::util::now().max(0) as u64,
+        );
+
+        // `skipped` is the whole point of the lazy gate, so make it visible:
+        // a healthy steady state is a round that is nearly all skips. A round
+        // that is nearly all walks on a quiet machine means the sentinels are
+        // not catching something, which is what you would want to see here.
+        tracing::debug!(
+            target: LOG,
+            scan = "disk",
+            measured,
+            skipped,
+            walked,
+            walk_budget,
+            reclaimed,
+            "round complete"
         );
 
         if (measured > 0 || reaped > 0 || reclaimed > 0 || generation_reclaimed > 0)

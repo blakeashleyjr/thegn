@@ -175,25 +175,123 @@ pub(crate) fn dispatch_drawer_command(
     }
 }
 
-/// Spawn `cmd` fully detached and hand its `Child` to a reaper thread that
-/// `wait()`s on it (audit run.rs:13296). thegn is long-lived; without the wait,
-/// every short-lived helper (xdg-open, external editor, profile window) that
-/// exits would leave a `<defunct>` zombie for the rest of the session, since
-/// Rust drops `Child` without reaping and the host installs no global SIGCHLD
+/// The single background reaper. Send it a `Child` and it is waited on.
+///
+/// **One thread for the whole process, not one per child** (THE-448). The
+/// previous version spawned a thread that blocked in `child.wait()` for the
+/// child's entire lifetime — fine for `xdg-open`, which exits in milliseconds,
+/// and a permanently parked thread for anything that does not, such as a browser
+/// or an editor window left open all session.
+///
+/// It must also cost nothing when there is nothing to reap, which is why it
+/// **blocks on `recv()` while it holds no children** rather than polling a timer
+/// forever. Only once it is holding something does it poll, and it backs off as
+/// it waits: helpers overwhelmingly exit at once, so the first short poll
+/// catches almost everything, and the backoff keeps a long-lived child from
+/// costing a wake every interval for hours.
+///
+/// Not a `SIGCHLD` handler: that would reap children other code is waiting on
+/// (the PTY panes in `pane_pty`, the gate subprocesses in `integrate`), turning
+/// their `wait()` into an error.
+fn reaper() -> &'static std::sync::mpsc::Sender<std::process::Child> {
+    /// First poll after a child arrives. Short, because `xdg-open`/`open` hand
+    /// off and exit immediately.
+    const POLL_MIN: std::time::Duration = std::time::Duration::from_millis(100);
+    /// Ceiling for the backoff. A browser window open all afternoon costs two
+    /// wakes a minute, not one every tenth of a second.
+    const POLL_MAX: std::time::Duration = std::time::Duration::from_secs(30);
+
+    static TX: std::sync::OnceLock<std::sync::mpsc::Sender<std::process::Child>> =
+        std::sync::OnceLock::new();
+    TX.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<std::process::Child>();
+        let spawned = std::thread::Builder::new()
+            .name("thegn-reaper".into())
+            .spawn(move || {
+                // Housekeeping, so it stays off the performance cores on Apple
+                // silicon (CLAUDE.md: a new long-lived thread must declare one).
+                crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
+                let mut held: Vec<std::process::Child> = Vec::new();
+                let mut poll = POLL_MIN;
+                loop {
+                    if held.is_empty() {
+                        // Nothing owed: block. No timer, no wake, no cost.
+                        match rx.recv() {
+                            Ok(child) => {
+                                held.push(child);
+                                poll = POLL_MIN;
+                            }
+                            // Sender is 'static, so this only happens at
+                            // teardown; nothing is held, so just stop.
+                            Err(_) => return,
+                        }
+                    } else {
+                        match rx.recv_timeout(poll) {
+                            Ok(child) => {
+                                held.push(child);
+                                poll = POLL_MIN;
+                            }
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                            // No more work can arrive, but what we hold is still
+                            // owed a wait — keep reaping until it is all gone.
+                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                                while !held.is_empty() {
+                                    held.retain_mut(|c| {
+                                        !matches!(c.try_wait(), Ok(Some(_)) | Err(_))
+                                    });
+                                    if !held.is_empty() {
+                                        std::thread::sleep(poll);
+                                    }
+                                }
+                                return;
+                            }
+                        }
+                        let before = held.len();
+                        // `Err` drops the handle too: a child we cannot query is
+                        // one we can never reap, and holding it forever would
+                        // leak the slot instead of the process.
+                        held.retain_mut(|c| !matches!(c.try_wait(), Ok(Some(_)) | Err(_)));
+                        // Back off only while nothing is happening; any reap or
+                        // arrival means more is likely imminent.
+                        poll = if held.len() == before {
+                            (poll * 2).min(POLL_MAX)
+                        } else {
+                            POLL_MIN
+                        };
+                    }
+                }
+            })
+            .is_ok();
+        if !spawned {
+            tracing::warn!(
+                target: "thegn::actions",
+                "could not start the child reaper; detached helpers will not be waited on"
+            );
+        }
+        tx
+    })
+}
+
+/// Spawn `cmd` fully detached and hand its `Child` to the shared reaper
+/// (audit run.rs:13296). thegn is long-lived; without the wait, every
+/// short-lived helper (xdg-open, external editor, profile window) that exits
+/// would leave a `<defunct>` zombie for the rest of the session, since Rust
+/// drops `Child` without reaping and the host installs no global SIGCHLD
 /// handler. Returns whether the spawn itself succeeded.
-pub(crate) fn spawn_detached_reaped(mut cmd: std::process::Command) -> bool {
+pub(crate) fn spawn_detached_reaped(cmd: std::process::Command) -> bool {
+    spawn_detached_reaped_with(cmd, reaper())
+}
+
+/// Testable core: the reaper channel is a parameter so a test can own one.
+fn spawn_detached_reaped_with(
+    mut cmd: std::process::Command,
+    reaper: &std::sync::mpsc::Sender<std::process::Child>,
+) -> bool {
     match cmd.spawn() {
-        Ok(mut child) => {
-            // best-effort reap: the thread lives only until the child exits.
-            std::thread::spawn(move || {
-                // off-loop: this runs on a dedicated reaper thread, never the
-                // event loop — the whole point is to reap the zombie async.
-                #[expect(
-                    clippy::disallowed_methods,
-                    reason = "reaper thread, off the event loop"
-                )]
-                let _ = child.wait(); // best-effort: teardown: the child may already have exited or been reaped
-            });
+        Ok(child) => {
+            // best-effort: a gone reaper means the thread failed to start, which
+            // is already warned about; the spawn itself still succeeded.
+            let _ = reaper.send(child);
             true
         }
         Err(_) => false,
@@ -1820,5 +1918,90 @@ mod tests {
             &panel,
             &remote_named_snapshot
         ));
+    }
+
+    /// The shared reaper must actually reap, and must not park a thread per
+    /// child (THE-448).
+    ///
+    /// Drives `spawn_detached_reaped_with` against a reaper channel this test
+    /// owns, so it asserts the real handoff rather than a stand-in — and counts
+    /// live `/proc` children, because the defect is precisely that a handle was
+    /// never waited on.
+    #[test]
+    fn detached_children_are_reaped_without_a_thread_each() {
+        // No procfs, no observation.
+        if !std::path::Path::new("/proc/self/stat").exists() {
+            return;
+        }
+        fn own_children() -> usize {
+            let me = std::process::id();
+            let Ok(entries) = std::fs::read_dir("/proc") else {
+                return 0;
+            };
+            entries
+                .filter_map(Result::ok)
+                .filter(|e| {
+                    std::fs::read_to_string(e.path().join("stat"))
+                        .ok()
+                        .and_then(|st| {
+                            let (_, rest) = st.rsplit_once(") ")?;
+                            rest.split_whitespace().nth(1)?.parse::<u32>().ok()
+                        })
+                        == Some(me)
+                })
+                .count()
+        }
+
+        let threads_before = std::fs::read_dir("/proc/self/task")
+            .map(|d| d.count())
+            .unwrap_or(0);
+        let children_before = own_children();
+
+        // A private reaper with the same loop shape as the shared one: block
+        // when empty, poll while holding.
+        let (tx, rx) = std::sync::mpsc::channel::<std::process::Child>();
+        let worker = std::thread::spawn(move || {
+            let mut held: Vec<std::process::Child> = Vec::new();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                match rx.recv_timeout(std::time::Duration::from_millis(50)) {
+                    Ok(c) => held.push(c),
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) if held.is_empty() => {
+                        return;
+                    }
+                    Err(_) => {}
+                }
+                held.retain_mut(|c| !matches!(c.try_wait(), Ok(Some(_)) | Err(_)));
+                if held.is_empty() && std::time::Instant::now() > deadline {
+                    return;
+                }
+            }
+        });
+
+        // Several short-lived children at once: the old implementation would
+        // have parked one thread per child.
+        for _ in 0..5 {
+            let mut cmd = std::process::Command::new("true");
+            cmd.stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            assert!(super::spawn_detached_reaped_with(cmd, &tx), "spawn failed");
+        }
+        drop(tx);
+        worker.join().expect("reaper thread");
+
+        let children_after = own_children();
+        assert!(
+            children_after <= children_before,
+            "detached children were not reaped (before={children_before}, after={children_after})"
+        );
+        let threads_after = std::fs::read_dir("/proc/self/task")
+            .map(|d| d.count())
+            .unwrap_or(0);
+        assert!(
+            threads_after <= threads_before + 1,
+            "reaping 5 children should cost at most ONE thread, not one each \
+             (before={threads_before}, after={threads_after})"
+        );
     }
 }

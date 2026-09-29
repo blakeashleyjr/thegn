@@ -419,6 +419,11 @@ pub async fn main(
 ) -> Result<()> {
     let start = std::time::Instant::now();
 
+    // Name this thread as the loop so `Db::open` can tell a frame-freezing open
+    // from a harmless background one (THE-179). Before anything else touches the
+    // database, or the earliest opens go uncounted.
+    thegn_core::db_open_stats::mark_loop_thread();
+
     // Repair broken home-directory paths (e.g. ~/.gitconfig left as an empty
     // directory by AI coding-tool sandboxes) before the first git operation.
     // See `thegn_core::startup` for the full rationale.

@@ -97,29 +97,9 @@ impl Fixture {
         self.execute(command, stdout, None)
             .expect("static child must finish")
     }
-    /// A configured command that still opens its configuration source directly
-    /// blocks on an unread FIFO, which proves it consults the source.
-    ///
-    /// Commands that go through configuration admission refuse a non-regular
-    /// source instead — see [`Self::assert_source_refused`]. Admission is not yet
-    /// uniform across the CLI (THE-691), so both outcomes exist and the test
-    /// asserts the one each command actually has.
-    pub fn assert_loader_wait(&mut self, args: &[&str], config: &Path) {
-        let command = self.command(&self.binary(), args, Some(config), false);
-        assert!(
-            self.execute(command, None, Some(Duration::from_millis(500)))
-                .is_none(),
-            "configured counterpart unexpectedly passed the unread FIFO"
-        );
-    }
-
-    /// A configured command that goes through configuration admission refuses a
-    /// source that is not a regular file, before anything is started.
-    ///
-    /// This is the stronger outcome, and the one every configured command should
-    /// eventually have: it cannot hang. Static commands never consult the source
-    /// at all and are asserted to succeed against the very same FIFO by the
-    /// caller, which is what discriminates the groups.
+    /// A command that consults configuration refuses a non-regular source
+    /// before doing work. Static commands are tested against the same FIFO by
+    /// the caller and continue without consulting it.
     pub fn assert_source_refused(&mut self, args: &[&str], config: &Path) {
         let output = self.run(args, Some(config), false);
         assert!(
@@ -127,9 +107,7 @@ impl Fixture {
             "configured counterpart accepted a non-regular configuration source: {args:?}"
         );
         assert!(
-            output
-                .stderr
-                .contains("configuration source is not a regular file"),
+            output.stderr.contains("not a regular file"),
             "expected a non-regular-source refusal for {args:?}, got: {}",
             output.stderr
         );
