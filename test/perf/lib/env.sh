@@ -20,9 +20,20 @@ perf_make_tmp() {
   export XDG_CONFIG_HOME="$PERF_TMP/config"
   export XDG_STATE_HOME="$PERF_TMP/state"
   export XDG_CACHE_HOME="$PERF_TMP/cache"
+  # ALSO the runtime dir, and this one is not cosmetic. The pane daemon's
+  # control socket resolves to `$XDG_RUNTIME_DIR/thegn/daemon.sock` FIRST and
+  # only falls back to the isolated `$XDG_STATE_HOME/thegn/run/` when that is
+  # unset. Leaving the developer's real `/run/user/<uid>` in place means a
+  # daemon-enabled scenario binds — or worse, attaches to — the daemon owning
+  # their live session's panes. Harmless while every scenario passed
+  # THEGN_NO_DAEMON=1; a trap the moment one does not (see `soak-daemon`).
+  export XDG_RUNTIME_DIR="$PERF_TMP/run"
   export GIT_CONFIG_GLOBAL="$PERF_TMP/gitconfig"
   export GIT_CONFIG_SYSTEM=/dev/null
   mkdir -p "$HOME" "$XDG_CONFIG_HOME" "$XDG_STATE_HOME" "$XDG_CACHE_HOME"
+  # 0700 to match the real run dir: the daemon rejects a lax one.
+  mkdir -p "$XDG_RUNTIME_DIR"
+  chmod 700 "$XDG_RUNTIME_DIR"
   # ~/.gitconfig is masked as a *directory* in some sandboxes; GIT_CONFIG_GLOBAL
   # points git at this file unconditionally.
   printf '[user]\n\tname = perf\n\temail = perf@example.invalid\n[init]\n\tdefaultBranch = main\n' \
