@@ -321,6 +321,15 @@ bench-steady: release _perf-guard
 bench-soak *args: release _perf-guard
     bash test/perf/cpu-sample.sh --scenario soak {{args}}
 
+# The same soak with the pane DAEMON left running, and both processes asserted.
+# Separate from `bench-soak` because it is the only scenario that starts a
+# daemon: every other one passes THEGN_NO_DAEMON=1, which is exactly why the
+# daemon's own per-pane child leak (THE-704) went unnoticed for three days while
+# `bench-idle` and `bench-soak` stayed green. The daemon is the longest-lived
+# process thegn runs, so it is where a per-event leak compounds.
+bench-soak-daemon *args: release _perf-guard
+    bash test/perf/cpu-sample.sh --scenario soak-daemon {{args}}
+
 # Switch/input latency under a multi-pane output flood (A/B only — advisory,
 # machine-dependent). Reads switch_p99/input_p99 from the perf rollup while
 # several worktree shells scroll at full speed and Alt+Down fires mid-flood.

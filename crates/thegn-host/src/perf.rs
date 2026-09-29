@@ -1006,6 +1006,11 @@ impl LoopPerf {
             cpu_ms,
         };
 
+        // Cumulative since process start, not per-interval: the worst open is a
+        // high-water mark, and resetting it every rollup would discard the one
+        // observation the counter exists to catch.
+        let db_open = thegn_core::db_open_stats::snapshot();
+
         tracing::info!(
             target: "thegn::perf",
             metric_version = 2,
@@ -1035,6 +1040,12 @@ impl LoopPerf {
             render_skips_per_s = snap.render_skips_per_s,
             render_p50_us = snap.render_p50_us,
             render_p99_us = snap.render_p99_us,
+            // Loop-thread `Db::open` (THE-179). `max` is the number to read:
+            // SQLite's busy_timeout here is 5s, so one contended open on the
+            // loop is a five-second freeze that a mean would hide entirely.
+            db_open_loop_calls = db_open.calls,
+            db_open_loop_mean_us = db_open.mean_us(),
+            db_open_loop_max_us = db_open.max_us,
             render_full_p50_us = snap.render_full_p50_us,
             render_full_p99_us = snap.render_full_p99_us,
             render_incr_p50_us = snap.render_incr_p50_us,

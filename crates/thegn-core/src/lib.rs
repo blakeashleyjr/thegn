@@ -105,6 +105,7 @@ mod db_iroh;
 pub mod db_migrate;
 mod db_model_proxy;
 mod db_notification;
+pub mod db_open_stats;
 pub mod db_pipeline_supervise;
 pub mod db_placement;
 mod db_pool;

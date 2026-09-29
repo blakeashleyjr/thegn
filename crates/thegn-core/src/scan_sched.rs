@@ -122,6 +122,43 @@ pub fn plan(targets: &[ScanTarget], now: i64, ttl_secs: u64, budget: usize) -> V
 /// be checked instead of merely documented.
 pub const PUMPS_PER_TTL: usize = 4;
 
+/// How many rows a round may **examine** for each unit of **walk** budget.
+///
+/// A lane whose rows can be cheaply proved unchanged has two different costs,
+/// and conflating them is what kept the size lane pinned. `max_scan_per_round`
+/// exists to bound the expensive thing — one `du` over a worktree with every
+/// ignore rule off, which on a build tree is gigabytes. But once
+/// [`crate::disk::likely_unchanged_since`] landed, most rows became *skips*
+/// costing six `stat`s, and a skip still spent a whole unit of that budget.
+///
+/// Measured consequence: 83 worktrees against a capacity of
+/// `(PUMPS_PER_TTL - 1) * 4 = 12`, so 82 of 83 rows re-stamped every five
+/// minutes — the same cadence as during the incident — even though almost every
+/// one of those rounds did no real work.
+///
+/// So the two budgets are separated. `max_scan_per_round` still bounds walks.
+/// This multiplier bounds the cheap probing on top, which must stay bounded (a
+/// registry of any size would otherwise `stat` without limit) but can be far
+/// larger, because six `stat`s is not a `du`.
+///
+/// 32 puts the shipped size lane at `4 * 32 = 128` rows examined per round,
+/// covering a machine several times larger than the one this was diagnosed on
+/// while still capping a pathological registry.
+pub const EXAMINE_PER_WALK: usize = 32;
+
+/// Rows a round may examine, given its per-round **walk** budget.
+///
+/// `0` (unlimited) stays unlimited. Pass the result to [`plan`] and to
+/// [`saturation`]: it is the number that decides whether the lane can reach an
+/// idle round, because a row the round never *looks at* stays due forever.
+///
+/// A lane with no cheap skip (the LOC lane walks every row with `tokei`) must
+/// keep passing its walk budget to both — for it, examining and walking are the
+/// same act.
+pub fn examine_cap(walk_budget: usize) -> usize {
+    walk_budget.saturating_mul(EXAMINE_PER_WALK)
+}
+
 /// Whether a lane can ever finish sweeping its registry inside one TTL window.
 ///
 /// # The failure this exists to name
@@ -294,12 +331,24 @@ mod tests {
     }
 
     #[test]
-    fn the_shipped_size_lane_defaults_saturate_at_a_realistic_worktree_count() {
-        // THE BUG, as arithmetic. The size lane ships max_scan_per_round = 4,
-        // so it can refresh 16 rows per TTL window. A developer with 100
-        // worktrees is therefore 6x over capacity: every row is stale again
-        // before the sweep reaches it, `plan` always returns work, and the lane
-        // runs forever. This is what burned 5d18h of CPU in 3 days.
+    fn a_walk_budget_alone_cannot_sweep_a_realistic_registry() {
+        // WHY `EXAMINE_PER_WALK` EXISTS, as arithmetic.
+        //
+        // This test used to be named for the shipped size lane and assert that
+        // it could never idle. That claim is no longer true of the lane — it is
+        // still true of the number the lane used to pass. Keeping the assertion
+        // and renaming it is deliberate: the arithmetic below is exactly the
+        // reason the examine cap had to be introduced, and deleting it would
+        // erase the evidence for a design decision.
+        //
+        // The size lane ships max_scan_per_round = 4. Feed that straight to
+        // `saturation` as if every row cost a walk and a developer with 100
+        // worktrees is 8x over capacity: every row is stale again before the
+        // sweep reaches it, `plan` always returns work, and the lane runs
+        // forever. That is what burned 5d18h of CPU in 3 days.
+        //
+        // See `the_shipped_size_lane_idles_once_a_skip_stops_costing_a_walk`
+        // for the same defaults under the budget the lane actually uses now.
         const SHIPPED_BUDGET: usize = 4;
         const REALISTIC_ROWS: usize = 100;
 
@@ -328,6 +377,59 @@ mod tests {
             saturation(REALISTIC_ROWS, REALISTIC_ROWS.div_ceil(PUMPS_PER_TTL - 1)).can_idle(),
             "the budget the warning recommends must actually be sufficient"
         );
+    }
+
+    /// The fix, measured against the same defaults and the same registry size.
+    ///
+    /// Nothing about `saturation` changed — what changed is the budget the size
+    /// lane hands it. A row the round merely *examines* costs six `stat`s
+    /// (`disk::likely_unchanged_since`), not a `du`, so bounding examinations by
+    /// the walk budget priced a skip as if it were a walk. On the machine this
+    /// was diagnosed on that meant 82 of 83 rows re-stamping every five minutes
+    /// while doing essentially no work.
+    #[test]
+    fn the_shipped_size_lane_idles_once_a_skip_stops_costing_a_walk() {
+        const SHIPPED_BUDGET: usize = 4;
+        // 83 is the real registry this was measured on; 100 is the round number
+        // the sibling test uses. Both must now idle.
+        for rows in [83usize, 100] {
+            let s = saturation(rows, examine_cap(SHIPPED_BUDGET));
+            assert!(
+                s.can_idle(),
+                "the size lane must reach an idle round at {rows} rows: {s:?}"
+            );
+            assert!(
+                s.warning().is_none(),
+                "a lane that can idle must not warn ({rows} rows)"
+            );
+            // The simulation agrees — and bounding the pump count matters: an
+            // assertion that it *eventually* idles would pass for a lane that
+            // takes an hour.
+            let pumps = pumps_until_idle(rows, 45, examine_cap(SHIPPED_BUDGET), 64)
+                .expect("a sustainable lane must reach an idle round");
+            assert!(
+                pumps < PUMPS_PER_TTL,
+                "the sweep must COMPLETE inside one TTL window, took {pumps} pumps"
+            );
+        }
+        // The cap is still a cap: a pathological registry must still saturate,
+        // or the bound on cheap probing is not doing its job either.
+        let huge = examine_cap(SHIPPED_BUDGET) * PUMPS_PER_TTL;
+        assert!(
+            !saturation(huge, examine_cap(SHIPPED_BUDGET)).can_idle(),
+            "the examine cap must still bound an unbounded registry"
+        );
+    }
+
+    /// `examine_cap` must preserve `plan`'s "0 means unlimited" convention — a
+    /// lane configured with no walk budget must not silently acquire a cap of 0,
+    /// which `plan` would read as unlimited anyway but `saturation` would not.
+    #[test]
+    fn an_unlimited_walk_budget_stays_unlimited_through_the_examine_cap() {
+        assert_eq!(examine_cap(0), 0);
+        assert!(saturation(1_000_000, examine_cap(0)).can_idle());
+        // And it cannot overflow on a nonsense budget.
+        assert_eq!(examine_cap(usize::MAX), usize::MAX);
     }
 
     #[test]

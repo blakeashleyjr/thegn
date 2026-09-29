@@ -16,7 +16,7 @@
 # are invisible to a windowed CPU measurement, so they get their own ceilings.
 #
 # Usage:
-#   cpu-sample.sh [--scenario idle|steady-workload|soak] [--bin PATH]
+#   cpu-sample.sh [--scenario idle|steady-workload|soak|soak-daemon] [--bin PATH]
 #                 [--worktrees N] [--dirty N] [--settle-ms MS] [--window-ms MS]
 #                 [--ceiling CORES] [--record] [--json] [--baseline-dir DIR]
 #                 [--zombie-ceiling N] [--child-growth-ceiling N]
@@ -170,7 +170,7 @@ done
 # deltas, so a leak of one child per diff is only visible if enough diffs happen
 # and enough worktrees exist to keep the scan lanes busy. Scenario defaults apply
 # only where the caller did not ask for a value, so an explicit flag always wins.
-if [ "$SCENARIO" = soak ]; then
+if [ "$SCENARIO" = soak ] || [ "$SCENARIO" = soak-daemon ]; then
   [ "$WORKTREES" = "${TG_PERF_WORKTREES:-14}" ] && WORKTREES=40
   [ "$WINDOW_MS" = 8000 ] && WINDOW_MS=60000
 fi
@@ -218,9 +218,20 @@ DEADLINE_S=$(((RUN_MS / 1000) + 10)) # hard safety net
 # ("illegal option -- e"), which is how this harness reported "thegn did not
 # start" on a Mac when the real failure was its own launch line. `just bench`
 # already routes through the same helpers.
+# `soak-daemon` is the one scenario that LEAVES the daemon enabled, because the
+# daemon is the process the other scenarios structurally cannot see — and it is
+# the one that lives for days, so a per-event leak there is the worst kind. It
+# is safe to enable only because `perf_make_tmp` now isolates XDG_RUNTIME_DIR;
+# without that the daemon socket resolves into the developer's real
+# /run/user/<uid> and this would attach to their live session's daemon.
+if [ "$SCENARIO" = soak-daemon ]; then
+  NO_DAEMON=""
+else
+  NO_DAEMON="THEGN_NO_DAEMON=1"
+fi
 printf -v INNER \
-  'cd %q; stty rows 50 cols 200; env THEGN_BENCH_RUN_MS=%q THEGN_NO_DAEMON=1 %q & echo $! > %q; wait' \
-  "$REPO" "$RUN_MS" "$BIN_ABS" "$PIDFILE"
+  'cd %q; stty rows 50 cols 200; env THEGN_BENCH_RUN_MS=%q %s %q & echo $! > %q; wait' \
+  "$REPO" "$RUN_MS" "$NO_DAEMON" "$BIN_ABS" "$PIDFILE"
 TIMEOUT_BIN="$(pty_timeout_bin)"
 # Single quotes are deliberate: $0/$1 are the INNER bash's positionals, bound by
 # the two arguments below, not this shell's. (Same idiom as flood.sh.)
@@ -234,6 +245,41 @@ else
   bash -c 'source "$0"; pty_run "$1"' "$HERE/../lib/pty.sh" "$INNER" >/dev/null 2>&1 &
 fi
 LAUNCHER=$!
+
+# `soak-daemon` starts the daemon ITSELF rather than waiting for the UI to spawn
+# one lazily.
+#
+# The lazy path needs a pane attach, and attaching a pane in this headless
+# fixture is not solved: the shared workload keystrokes are sidebar navigation
+# only, and `new-pane` needs UI context this harness does not set up. Feeding
+# keys until something opens would be tuning a gate until it passes, which is
+# how you get one that measures nothing.
+#
+# So the scope is stated instead of fudged. This scenario watches the DAEMON
+# PROCESS — its fds, threads, children and zombies over a settled window — which
+# is real coverage of the longest-lived process thegn runs, and coverage no other
+# scenario has. It does NOT exercise pane teardown; the specific regression there
+# (THE-704, a pane child left unreaped when its consumer goes away) is pinned by
+# `pane_pty::tests::a_pane_whose_consumer_vanishes_leaves_no_child_behind`, which
+# has a verified failing control. Wiring headless pane sessions in here would
+# extend this scenario to that path too.
+DAEMON_LAUNCHER=""
+if [ "$SCENARIO" = soak-daemon ]; then
+  # `--socket` explicitly, even though the env already resolves to this path:
+  # `find_daemon_pid` matches on the isolated runtime dir appearing in ARGV, so
+  # that it can never pick up the developer's live daemon. A daemon started
+  # without the flag inherits the path from the environment and is invisible to
+  # that match — which is exactly how this scenario first reported "not found"
+  # while its own daemon was running.
+  mkdir -p "$XDG_RUNTIME_DIR/thegn"
+  "$BIN_ABS" daemon --socket "$XDG_RUNTIME_DIR/thegn/daemon.sock" >/dev/null 2>&1 &
+  DAEMON_LAUNCHER=$!
+  # The socket is the readiness signal; the UI attaches to the same path.
+  for _ in $(seq 1 100); do
+    [ -S "$XDG_RUNTIME_DIR/thegn/daemon.sock" ] && break
+    sleep 0.1
+  done
+fi
 
 # Wait for the PID file (thegn up).
 for _ in $(seq 1 100); do
@@ -304,13 +350,40 @@ proc_syscr() { # $1 = pid -> cumulative read syscalls
   awk '/^syscr:/ { print $2; found = 1 } END { if (!found) print 0 }' "/proc/$1/io" 2>/dev/null || echo 0
 }
 
+# The pane daemon this run started, or empty.
+#
+# Matched on OUR isolated runtime dir appearing in the process's argv — not on
+# the name `thegn daemon`, which would also match the developer's live daemon
+# and turn this gate into a reading of whatever their session happens to be
+# doing. `perf_make_tmp` makes `$XDG_RUNTIME_DIR` unique per run, and the UI
+# passes the resolved socket path to the daemon it spawns, so the match is exact.
+find_daemon_pid() {
+  local d
+  for d in /proc/[0-9]*; do
+    [ -r "$d/cmdline" ] || continue
+    # NUL-separated argv; translate so a plain grep works.
+    if tr '\0' ' ' <"$d/cmdline" 2>/dev/null | grep -q -- "$XDG_RUNTIME_DIR"; then
+      printf '%s' "${d##*/}"
+      return 0
+    fi
+  done
+  return 1
+}
+
 res_sample() { # $1 = pid -> "children zombies fdtotal fddb fdproc fdsock fdpipe threads syscr"
   printf '%s %s %s %s' \
     "$(proc_children "$1")" "$(proc_fds "$1")" "$(proc_threads "$1")" "$(proc_syscr "$1")"
 }
 
-if [ "$SCENARIO" = steady-workload ] || [ "$SCENARIO" = soak ]; then
+if [ "$SCENARIO" = steady-workload ] || [ "$SCENARIO" = soak ] || [ "$SCENARIO" = soak-daemon ]; then
+  # `soak-daemon` needs its own keystrokes. The shared workload file is sidebar
+  # navigation only — arrows and a Tab — so it never attaches a pane, and the
+  # daemon is spawned LAZILY on the first attach. With the navigation keys the
+  # scenario found no daemon and (correctly) failed rather than reporting a
+  # clean run. These open panes instead, and leave them open so the daemon has
+  # live sessions to hold for the whole sample window.
   KEYS="$HERE/scenarios/steady-workload.keys"
+  [ "$SCENARIO" = soak-daemon ] && KEYS="$HERE/scenarios/soak-daemon.keys"
   # The pty master is only reachable through /proc on Linux; on darwin the
   # scenario degrades to plain idle rather than silently claiming a workload.
   if [ "$SAMPLER" = proc ] && [ -f "$KEYS" ]; then
@@ -362,16 +435,35 @@ if [ "$SAMPLER" = proc ]; then
   # Resources at window start — AFTER the settle, so hydration and the lazy opens
   # it triggers are already accounted and any growth from here is accumulation.
   read -r C0 Z0 FD0 FDDB0 FDPR0 FDSK0 FDPI0 TH0 SR0 <<<"$(res_sample "$PID")"
-  declare -A T0 TN
+  # The daemon, when this scenario started one. Sampled on the SAME axes: it is
+  # the longest-lived process thegn runs, so it is the one where a per-event
+  # leak compounds — and the one every other scenario is blind to.
+  DPID="$(find_daemon_pid || true)"
+  if [ -n "$DPID" ]; then
+    read -r DC0 DZ0 DFD0 _ _ _ _ DTH0 _ <<<"$(res_sample "$DPID")"
+  fi
+  # Per-thread CPU **and** per-thread reads. Both, because they answer different
+  # questions and the second one is what settled this investigation: the
+  # process-wide counter read 5,000-12,000 reads/s and looked alarming, while
+  # per-thread showed 3.6/s on the event loop — the no-blocking-I/O invariant
+  # intact — and named the real consumer. Attribution needs the per-thread file;
+  # total cost needs the process one, because the process counter RETAINS the
+  # reads of threads that have since exited (which is also why the two never
+  # reconcile, and why neither alone is enough).
+  declare -A T0 TN TR0
   for tid_dir in "/proc/$PID/task"/*; do
     [ -e "$tid_dir" ] || continue # glob stays literal if the process vanished
     tid="${tid_dir##*/}"
     T0[$tid]="$(awk '{ s=$0; sub(/^.*\) /,"",s); split(s,a," "); print a[12]+a[13] }' "/proc/$PID/task/$tid/stat" 2>/dev/null || echo 0)"
     TN[$tid]="$(cat "/proc/$PID/task/$tid/comm" 2>/dev/null || echo '?')"
+    TR0[$tid]="$(awk '/^syscr:/ { print $2 }' "/proc/$PID/task/$tid/io" 2>/dev/null || echo 0)"
   done
   sleep "$WINDOW_S"
   J1="$(proc_jiffies "$PID")"
   read -r C1 Z1 FD1 FDDB1 FDPR1 FDSK1 FDPI1 TH1 SR1 <<<"$(res_sample "$PID")"
+  if [ -n "${DPID:-}" ] && [ -d "/proc/$DPID" ]; then
+    read -r DC1 DZ1 DFD1 _ _ _ _ DTH1 _ <<<"$(res_sample "$DPID")"
+  fi
   CORES_TOTAL="$(awk "BEGIN{printf \"%.4f\", ($J1-$J0)/($CLK_TCK*$WINDOW_S)}")"
   SYSCR_RATE="$(awk "BEGIN{printf \"%.1f\", ($SR1-$SR0)/$WINDOW_S}")"
   # High-water, not end-of-window: a child reaped just before the second sample
@@ -395,13 +487,26 @@ if [ "$SAMPLER" = proc ]; then
   # array for the result. Read t1 BEFORE thegn exits (we're still inside the window
   # tail). Done set -e-safe — a vanished tid just contributes nothing.
   THREAD_JSON=""
+  READ_TABLE=""
+  LOOP_READS_PER_S=0
   for tid in "${!T0[@]}"; do
     t1="$(awk '{ s=$0; sub(/^.*\) /,"",s); split(s,a," "); print a[12]+a[13] }' "/proc/$PID/task/$tid/stat" 2>/dev/null || true)"
     [ -n "$t1" ] || t1="${T0[$tid]}"
+    r1="$(awk '/^syscr:/ { print $2 }' "/proc/$PID/task/$tid/io" 2>/dev/null || true)"
+    [ -n "$r1" ] || r1="${TR0[$tid]}"
+    dr=$((r1 - ${TR0[$tid]}))
+    rps="$(awk "BEGIN{printf \"%.1f\", $dr/$WINDOW_S}")"
+    # A thread whose tid equals the pid is the process's FIRST thread — the
+    # render/input loop. Called out by name because "no blocking I/O on the
+    # loop" is a hard invariant, and this is the one number that checks it.
+    if [ "$tid" = "$PID" ]; then
+      LOOP_READS_PER_S="$rps"
+    fi
+    [ "$dr" -gt 0 ] && READ_TABLE="$READ_TABLE$rps ${TN[$tid]} (tid $tid)"$'\n'
     dj=$((t1 - ${T0[$tid]}))
     [ "$dj" -gt 0 ] || continue
     c="$(awk "BEGIN{printf \"%.4f\", $dj/($CLK_TCK*$WINDOW_S)}")"
-    THREAD_JSON="$THREAD_JSON{\"tid\":$tid,\"comm\":\"${TN[$tid]}\",\"cores\":$c},"
+    THREAD_JSON="$THREAD_JSON{\"tid\":$tid,\"comm\":\"${TN[$tid]}\",\"cores\":$c,\"reads_per_s\":$rps},"
     THREAD_TABLE="$THREAD_TABLE$c ${TN[$tid]} (tid $tid)"$'\n'
   done
   THREAD_JSON="[${THREAD_JSON%,}]"
@@ -424,6 +529,13 @@ fi
 
 # Let thegn exit on its own (bench window), then reap the launcher.
 wait "$LAUNCHER" 2>/dev/null || true
+# Stop the daemon this run started. It lives in an isolated state dir, so a
+# leaked one would not corrupt anything — but it WOULD sit on a socket under a
+# temp dir the EXIT trap is about to delete, and outlive every future run.
+if [ -n "${DAEMON_LAUNCHER:-}" ]; then
+  "$BIN_ABS" daemon stop >/dev/null 2>&1 || kill "$DAEMON_LAUNCHER" 2>/dev/null || true
+  wait "$DAEMON_LAUNCHER" 2>/dev/null || true
+fi
 
 RESULT="{\"scenario\":\"$SCENARIO\",\"build\":\"$BUILD\",\"worktrees\":$WORKTREES,\"window_ms\":$WINDOW_MS,\"settle_used_ms\":${SETTLE_USED_MS:-$SETTLE_MS},\"cores_total\":$CORES_TOTAL,\"threads\":$THREAD_JSON,\"resources\":$RES_JSON,\"git_sha\":\"$GIT_SHA\",\"host_tag\":\"$HOST_TAG\"}"
 
@@ -445,6 +557,11 @@ else
   else
     echo "  (no per-thread CPU captured)"
   fi
+  if [ -n "${READ_TABLE:-}" ]; then
+    echo "top threads by reads/s (the process total also counts threads that have since exited):"
+    printf '%s' "$READ_TABLE" | sort -rn | head -6 | sed 's/^/  /'
+    echo "  event loop (tid $PID): ${LOOP_READS_PER_S}/s"
+  fi
   if [ "$RES_JSON" != "null" ]; then
     echo "resources (start -> end, peak):"
     echo "  children=$C0 -> $C1 (peak $CHILD_PEAK)   of which zombies=$Z0 -> $Z1 (peak $ZOMBIE_PEAK)"
@@ -452,6 +569,11 @@ else
     echo "    db=$FDDB0 -> $FDDB1   procfs=$FDPR0 -> $FDPR1   sock=$FDSK0 -> $FDSK1   pipe=$FDPI0 -> $FDPI1"
     echo "  threads=$TH0 -> $TH1 (peak $THREAD_PEAK)"
     echo "  read syscalls=${SYSCR_RATE}/s"
+    if [ -n "${DPID:-}" ]; then
+      echo "  daemon pid=$DPID: children=${DC0:-?} -> ${DC1:-?}   zombies=${DZ0:-?} -> ${DZ1:-?}   fds=${DFD0:-?} -> ${DFD1:-?}   threads=${DTH0:-?} -> ${DTH1:-?}"
+    elif [ "$SCENARIO" = soak-daemon ]; then
+      echo "  daemon: NOT FOUND (see the check below)"
+    fi
   else
     echo "resources: not measured on $(uname -s)"
   fi
@@ -491,6 +613,25 @@ if [ "$RES_JSON" != "null" ] && [ "$BUILD" = release ]; then
     "threads accumulating across a settled window (THE-448 leaks one per launch)"
   if awk "BEGIN{exit !($SYSCR_RATE > $SYSCR_RATE_CEILING)}"; then
     echo "FAIL: syscr_per_s=$SYSCR_RATE exceeds ceiling=$SYSCR_RATE_CEILING — a scan lane is probably saturated" >&2
+    RES_FAIL=1
+  fi
+  # The daemon, on the same axes. A zombie here is THE-704's signature: the pane
+  # reader used to skip its reap when the consumer went away, so a UI detach left
+  # the pane's shell unwaited for the life of the daemon.
+  if [ -n "${DPID:-}" ] && [ -n "${DC1:-}" ]; then
+    res_check daemon_zombies "${DZ1:-0}" "$ZOMBIE_CEILING" \
+      "the pane daemon left a child unreaped (THE-704)"
+    res_check daemon_child_growth "$((${DC1:-0} - ${DC0:-0}))" "$CHILD_GROWTH_CEILING" \
+      "daemon children accumulating across a settled window"
+    res_check daemon_fd_growth "$((${DFD1:-0} - ${DFD0:-0}))" "$FD_GROWTH_CEILING" \
+      "daemon descriptors accumulating across a settled window"
+    res_check daemon_thread_growth "$((${DTH1:-0} - ${DTH0:-0}))" "$THREAD_GROWTH_CEILING" \
+      "daemon threads accumulating across a settled window"
+  elif [ "$SCENARIO" = soak-daemon ]; then
+    # A gate that silently measures nothing is worse than no gate: this scenario
+    # exists ONLY to watch the daemon, so not finding one is a failure of the
+    # harness, and saying so beats reporting a clean run.
+    echo "FAIL: soak-daemon found no daemon to sample — the scenario measured nothing" >&2
     RES_FAIL=1
   fi
   [ "$RES_FAIL" = 0 ] || exit 2
