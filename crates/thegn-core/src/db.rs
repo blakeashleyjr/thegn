@@ -1066,9 +1066,55 @@ pub fn session() -> String {
     std::env::var("THEGN_SESSION").unwrap_or_else(|_| "default".into())
 }
 
+/// The canonical identity of the shared database file, used as the schema-lease
+/// key — memoized, because `canonicalize` resolves and `stat`s every path
+/// component and [`Db::open`] has 401 call sites.
+///
+/// **Keyed by the requested path, not process-global.** One process routinely
+/// opens several databases: every test that isolates `XDG_STATE_HOME` gets its
+/// own, and they share a process under `cargo test`. A single `OnceLock` would
+/// hand the first database's canonical path to every later one and silently key
+/// their schema leases together.
+///
+/// **Only a successful canonicalization is cached.** On a fresh install the file
+/// does not exist yet, `canonicalize` fails, and we fall back to the
+/// uncanonicalized path; caching *that* would pin a non-canonical key, so a
+/// symlinked state directory would key its schema lease differently before and
+/// after the DB was created.
+fn shared_db_path(path: &std::path::Path) -> std::path::PathBuf {
+    use std::sync::{Mutex, OnceLock};
+    static SHARED: OnceLock<
+        Mutex<std::collections::HashMap<std::path::PathBuf, std::path::PathBuf>>,
+    > = OnceLock::new();
+    let cache = SHARED.get_or_init(Mutex::default);
+    // A poisoned lock is not worth failing an open over: fall through and pay
+    // the `canonicalize`, which is what this whole function is avoiding.
+    if let Ok(seen) = cache.lock()
+        && let Some(hit) = seen.get(path)
+    {
+        return hit.clone();
+    }
+    match std::fs::canonicalize(path) {
+        Ok(canonical) => {
+            if let Ok(mut seen) = cache.lock() {
+                // Bounded in practice by the number of distinct state dirs a
+                // process opens: one in production, one per isolated test.
+                seen.insert(path.to_path_buf(), canonical.clone());
+            }
+            canonical
+        }
+        // Deliberately uncached: see above.
+        Err(_) => path.to_path_buf(),
+    }
+}
+
 impl Db {
     pub fn open() -> Result<Db> {
         let path = db_path();
+        // NOT memoized. Skipping this after the first open would save about four
+        // syscalls and cost correctness twice over: one process opens many state
+        // dirs (every test that isolates `XDG_STATE_HOME`), and a state dir
+        // removed underneath a running thegn would stop being recreated.
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
             // Owner-only (0700) on the state dir + 0600 on the DB file below:
@@ -1081,7 +1127,7 @@ impl Db {
             let _ = crate::fsperm::restrict_dir_to_owner(dir); // best-effort: hardening: a failed chmod must never block DB open
         }
         let conn = Self::open_connection(&path)?;
-        let shared = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        let shared = shared_db_path(&path);
         let db = Self::init_shared(conn, &shared)?;
         let _ = crate::fsperm::restrict_to_owner(&path); // best-effort: hardening: a failed chmod must never block DB open
         // The common fast-path init (user_version already current) skips the

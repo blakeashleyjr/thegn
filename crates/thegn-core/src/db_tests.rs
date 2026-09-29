@@ -4189,9 +4189,11 @@ fn schema_refusal_blocks_an_older_build_against_a_newer_database() {
 fn opening_a_newer_database_fails_with_the_actionable_error() {
     // End-to-end over a real file: stamp a user_version past this build and
     // prove `Db::open_at` refuses rather than returning a tolerant handle.
-    let dir = std::env::temp_dir().join(format!("thegn-newerdb-{}", std::process::id()));
-    // best-effort: test cleanup: scratch removal must never fail the test
-    let _ = std::fs::remove_dir_all(&dir);
+    // A unique scratch dir per test: a PID-derived one is SHARED under
+    // `cargo test`, where every test runs in one process, and these two
+    // tests then delete each other's database mid-run.
+    let scratch = tempfile::tempdir().unwrap();
+    let dir = scratch.path().to_path_buf();
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("thegn.db");
     {
@@ -4271,9 +4273,11 @@ fn newer_db_takes_the_tolerant_read_only_path() {
     // - take the tolerant fast path (no migration or open-time write)
     // - serve reads while refusing writes from this older build
     // - report `schema_mismatch() == Some(on_disk_version)` on every open
-    let dir = std::env::temp_dir().join(format!("thegn-newerdb-{}", std::process::id()));
-    // best-effort: test cleanup: scratch removal must never fail the test
-    let _ = std::fs::remove_dir_all(&dir);
+    // A unique scratch dir per test: a PID-derived one is SHARED under
+    // `cargo test`, where every test runs in one process, and these two
+    // tests then delete each other's database mid-run.
+    let scratch = tempfile::tempdir().unwrap();
+    let dir = scratch.path().to_path_buf();
     let path = dir.join("thegn.db");
 
     // First open: runs full init, stamps SCHEMA_VERSION.
@@ -4932,5 +4936,42 @@ fn ambiguous_legacy_tab_is_refused_not_first_wins() {
             .unwrap()
             .as_deref(),
         Some("/wt/one")
+    );
+}
+
+/// The shared-identity memo must be keyed by the requested path.
+///
+/// One process routinely opens several databases — every test that isolates
+/// `XDG_STATE_HOME` gets its own, and they share a process under `cargo test`.
+/// A process-global `OnceLock` handed the *first* database's canonical path to
+/// every later one, silently keying unrelated schema leases together; and the
+/// matching `create_dir_all` memo skipped directory prep for a second state dir
+/// entirely, which is how three `canonical_history` tests failed with
+/// "unable to open database file".
+#[test]
+fn two_state_dirs_in_one_process_get_distinct_shared_identities() {
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    let (pa, pb) = (a.path().join("thegn.db"), b.path().join("thegn.db"));
+    std::fs::write(&pa, b"").unwrap();
+    std::fs::write(&pb, b"").unwrap();
+
+    let ia = super::shared_db_path(&pa);
+    let ib = super::shared_db_path(&pb);
+    assert_ne!(ia, ib, "two databases must not share one schema-lease key");
+    // Stable across calls: the memo returns the same identity, not a fresh one.
+    assert_eq!(ia, super::shared_db_path(&pa));
+    assert_eq!(ib, super::shared_db_path(&pb));
+
+    // A path that does not exist yet cannot be canonicalized, and that answer is
+    // deliberately NOT cached — otherwise a fresh install would pin a
+    // non-canonical key for the life of the process.
+    let missing = a.path().join("not-created-yet.db");
+    assert_eq!(super::shared_db_path(&missing), missing);
+    std::fs::write(&missing, b"").unwrap();
+    assert_eq!(
+        super::shared_db_path(&missing),
+        std::fs::canonicalize(&missing).unwrap(),
+        "the failed lookup was cached, so the real identity is unreachable"
     );
 }
