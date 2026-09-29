@@ -2801,8 +2801,29 @@ fn enqueue_git_op(
     let tx = tx.clone();
     let wk = waker.clone();
     tokio::task::spawn_blocking(move || {
+        // CATCH, so a completion is always delivered. `git.pending` is a
+        // single slot: while it is set, `enqueue_git_op` refuses every other
+        // git operation with "git busy". It is cleared ONLY by a `GitOpDone`
+        // arriving, so a task that panics here leaves the slot occupied for the
+        // life of the worktree — every later commit, push, pull or delete
+        // silently does nothing, and the only escape is switching worktrees
+        // (which resets the whole `GitUi`) or restarting.
+        //
+        // `AssertUnwindSafe` because `op` and `loc` are consumed by the call and
+        // nothing observable outlives a panic here — the panic becomes an error
+        // result, which is what the UI is already built to render.
         let loc = thegn_core::remote::GitLoc::for_worktree(&wt);
-        let result = crate::gitmut::execute(op, &loc, override_gpg);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::gitmut::execute(op, &loc, override_gpg)
+        }))
+        .unwrap_or_else(|_| {
+            tracing::error!(
+                target: "thegn::git",
+                op = %label,
+                "git operation panicked; reporting it as a failure so the pending slot clears"
+            );
+            GitOpResult::Err(format!("{label} panicked — see the log"))
+        });
         if tx
             .send(GitOpDone {
                 generation,
