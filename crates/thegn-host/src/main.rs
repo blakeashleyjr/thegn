@@ -134,6 +134,7 @@ mod media_art;
 mod media_ctl;
 #[path = "handlers/media_panel.rs"]
 mod media_panel;
+mod media_secret;
 mod media_watch;
 mod mem;
 mod menu;
@@ -250,6 +251,8 @@ mod sidebar_pipeline;
 mod sidebar_view;
 mod skill_seed;
 mod snapshot;
+#[cfg(test)]
+mod spawn_ratchet_tests;
 mod sprite_bridge;
 mod ssh_shim;
 mod stage_prompt;
@@ -347,6 +350,12 @@ pub enum Command {
     Dispatch {
         #[command(subcommand)]
         action: cmd::dispatch::Action,
+    },
+    /// Pipeline supervisor: the mechanical half of a `[[pipeline.stages]]` chart
+    /// — what it would validate, advance or land, and why. Read-only.
+    Supervise {
+        #[command(subcommand)]
+        action: cmd::supervise::Action,
     },
     /// Opt-in issue-to-PR supervisor; `status` is read-only and never starts work.
     Autopilot {
@@ -1177,6 +1186,26 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         command_intent::classify(Some(&command)),
         command_intent::CommandIntent::Configured
     );
+    // These two source-inspection commands intentionally keep the tolerant
+    // parser so malformed regular TOML remains diagnosable. Refuse only a
+    // source kind or size that cannot be safely inspected. The shared loader
+    // also uses the bounded reader, so every other tolerant config consumer is
+    // protected from an unread FIFO without changing its recovery behavior.
+    let requires_bounded_config_source = matches!(
+        &command,
+        Command::Config {
+            action: cmd::config::Action::Get { .. }
+        } | Command::Automations {
+            action: cmd::automations::Action::Test { .. }
+        }
+    );
+    if requires_bounded_config_source {
+        thegn_core::config::Config::check_layered_source_files(
+            &thegn_core::config::ProcessEnv,
+            cli.config.clone(),
+        )
+        .map_err(|error| anyhow::anyhow!(error))?;
+    }
     let mut cfg = if authority {
         admit_configuration(cli, migration_actor)?.config().clone()
     } else {
@@ -1267,6 +1296,7 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         Command::Issue { action } => cmd::issue::run(&cfg, action),
         Command::Kaneo { action } => cmd::kaneo::run(&cfg, action),
         Command::Dispatch { action } => cmd::dispatch::run(&cfg, action),
+        Command::Supervise { action } => cmd::supervise::run(&cfg, action),
         Command::Autopilot { action } => cmd::autopilot::run(&cfg, action),
         Command::Ci { action } => cmd::ci::run(&cfg, action),
         Command::Search(args) => cmd::search::run(&cfg, args),

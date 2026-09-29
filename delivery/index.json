@@ -237,6 +237,19 @@
       "summary": "Produce reproducible release artifacts, metadata, attestations, and publication rehearsal."
     },
     {
+      "change": "add-pipeline-supervisor-policy",
+      "lifecycle": "delivered-awaiting-archive",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-703",
+          "project": "Alpha Reliability & State Compatibility"
+        }
+      ],
+      "summary": "Give the pipeline a policy layer that classifies, approves and plans without hard-coding judgement.",
+      "delivered_at": "2026-09-28"
+    },
+    {
       "change": "add-pr-review-viewed-stacked",
       "lifecycle": "proposed",
       "disposition": "strategic-unstarted",

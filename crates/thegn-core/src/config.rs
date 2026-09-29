@@ -6206,6 +6206,22 @@ impl Config {
         util::xdg_config_home().join("thegn/config.toml")
     }
 
+    /// Check the trusted files used by the tolerant display projection without
+    /// parsing them. Source inspection commands use this to refuse special
+    /// files and oversized inputs while still allowing malformed regular TOML
+    /// to be diagnosed through the normal tolerant loader.
+    pub fn check_layered_source_files(
+        env: &dyn EnvSource,
+        path: Option<PathBuf>,
+    ) -> Result<(), String> {
+        let file = path.unwrap_or_else(Self::path);
+        let _ = read_tolerant_config_source(&file)?;
+        if let Some(profile) = Self::profile_overlay_path(env) {
+            let _ = read_tolerant_config_source(&profile)?;
+        }
+        Ok(())
+    }
+
     /// Legacy tolerant loader retained until host callers migrate to
     /// [`crate::config_admission::admit`]. Authority-bearing callers must not
     /// use this fallback path; remove it after that migration.
@@ -6220,10 +6236,10 @@ impl Config {
         // file (EACCES/EIO/invalid-UTF-8) must NOT masquerade as absent — return
         // Err so load_layered's warn-and-default path fires instead of silently
         // running on defaults with no signal to the user.
-        let s = match std::fs::read_to_string(&file) {
-            Ok(s) => s,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-            Err(e) => return Err(format!("cannot read {}: {e}", file.display())),
+        let s = match read_tolerant_config_source(&file) {
+            Ok(Some(s)) => s,
+            Ok(None) => String::new(),
+            Err(e) => return Err(e),
         };
         let _diagnostic_source = crate::config_diagnostics::source(&file, &s);
         let normalized = crate::config_compat::normalize(&s)?;
@@ -6263,7 +6279,7 @@ impl Config {
         // config home — `XDG_CONFIG_HOME` is deliberately NOT rerooted, so the
         // shared base still loads while the profile refines it. Below env/`--set`.
         if let Some(pfile) = Self::profile_overlay_path(env)
-            && let Ok(ps) = std::fs::read_to_string(&pfile)
+            && let Ok(Some(ps)) = read_tolerant_config_source(&pfile)
             && let Err(e) = {
                 let _profile_source = crate::config_diagnostics::source(&pfile, &ps);
                 Self::apply_toml_overlay(&mut cfg, &ps)
@@ -7320,6 +7336,51 @@ impl Config {
         let ptr = crate::config_resolve::dotted_to_pointer(&key);
         serde_json::to_value(self).ok()?.pointer(&ptr).cloned()
     }
+}
+
+/// Read a tolerant configuration source with the same source-size ceiling as
+/// strict admission. The metadata check happens before opening, so FIFOs,
+/// devices, sockets, and directories are refused without entering a blocking
+/// read. Reading through `take(limit + 1)` also catches a file that grows after
+/// its metadata was observed.
+fn read_tolerant_config_source(path: &Path) -> Result<Option<String>, String> {
+    use std::io::Read;
+
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("cannot read {}: {error}", path.display())),
+    };
+    if !metadata.file_type().is_file() {
+        let kind = util::config_source_kind(&metadata);
+        return Err(format!(
+            "config source is {kind}, not a regular file: {}",
+            path.display()
+        ));
+    }
+
+    let limit = crate::config_budget::MAX_SOURCE_BYTES;
+    if metadata.len() > limit as u64 {
+        return Err(format!(
+            "config source exceeds its {limit}-byte tolerant read limit: {}",
+            path.display()
+        ));
+    }
+    let file = std::fs::File::open(path)
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(limit as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    if bytes.len() > limit {
+        return Err(format!(
+            "config source exceeds its {limit}-byte tolerant read limit: {}",
+            path.display()
+        ));
+    }
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))
 }
 
 /// Render a JSON value the way `config get` should print it: bare scalars
