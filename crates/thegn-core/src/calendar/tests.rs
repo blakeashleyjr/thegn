@@ -10,6 +10,70 @@ fn utc(y: i32, m: u32, day: u32, h: u32, min: u32) -> DateTime<Utc> {
     Utc.with_ymd_and_hms(y, m, day, h, min, 0).unwrap()
 }
 
+#[test]
+fn calendar_windows_resolve_explicit_home_zone_half_open_instants() {
+    let day = d(2026, 1, 15);
+    let cases = [
+        (Tz::UTC, utc(2026, 1, 15, 0, 0), utc(2026, 1, 16, 0, 0)),
+        (
+            Tz::Asia__Tokyo,
+            utc(2026, 1, 14, 15, 0),
+            utc(2026, 1, 15, 15, 0),
+        ),
+        (
+            Tz::America__Los_Angeles,
+            utc(2026, 1, 15, 8, 0),
+            utc(2026, 1, 16, 8, 0),
+        ),
+        (
+            Tz::Asia__Kolkata,
+            utc(2026, 1, 14, 18, 30),
+            utc(2026, 1, 15, 18, 30),
+        ),
+        (
+            Tz::Asia__Kathmandu,
+            utc(2026, 1, 14, 18, 15),
+            utc(2026, 1, 15, 18, 15),
+        ),
+    ];
+    for (zone, start, end) in cases {
+        let window = CalendarWindow::new(day, day, zone).unwrap();
+        assert_eq!(
+            (window.start_ms, window.end_exclusive_ms),
+            (start.timestamp_millis(), end.timestamp_millis()),
+            "zone {zone}"
+        );
+        assert_eq!(
+            window.end_exclusive_ms - window.start_ms,
+            86_400_000,
+            "zone {zone}"
+        );
+    }
+
+    let spring = CalendarWindow::new(d(2026, 3, 8), d(2026, 3, 8), Tz::America__New_York).unwrap();
+    assert_eq!(
+        (spring.start_ms, spring.end_exclusive_ms),
+        (
+            utc(2026, 3, 8, 5, 0).timestamp_millis(),
+            utc(2026, 3, 9, 4, 0).timestamp_millis()
+        )
+    );
+    assert_eq!(spring.end_exclusive_ms - spring.start_ms, 23 * 3_600_000);
+
+    let fall = CalendarWindow::new(d(2026, 11, 1), d(2026, 11, 1), Tz::America__New_York).unwrap();
+    assert_eq!(
+        (fall.start_ms, fall.end_exclusive_ms),
+        (
+            utc(2026, 11, 1, 4, 0).timestamp_millis(),
+            utc(2026, 11, 2, 5, 0).timestamp_millis()
+        )
+    );
+    assert_eq!(fall.end_exclusive_ms - fall.start_ms, 25 * 3_600_000);
+
+    assert!(CalendarWindow::new(d(2026, 1, 2), d(2026, 1, 1), Tz::UTC).is_none());
+    assert!(CalendarWindow::new(NaiveDate::MAX, NaiveDate::MAX, Tz::UTC).is_none());
+}
+
 // --- grid -------------------------------------------------------------------
 
 #[test]

@@ -36,6 +36,8 @@ pub struct CalUiCfg {
 pub enum CalendarViewError {
     /// The cache could not be opened or queried.
     CacheUnavailable,
+    /// The requested local-date range cannot be represented in the home zone.
+    InvalidWindow,
     /// Some cached rows could not be decoded; the rest are shown.
     MalformedCache,
     /// Expansion refused (budget, invalid span/window, arithmetic).
@@ -54,6 +56,7 @@ impl std::fmt::Display for CalendarViewError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::CacheUnavailable => f.write_str("calendar cache unavailable"),
+            Self::InvalidWindow => f.write_str("invalid calendar window"),
             Self::MalformedCache => f.write_str("calendar cache contains unreadable rows"),
             Self::Expansion(error) => error.fmt(f),
         }

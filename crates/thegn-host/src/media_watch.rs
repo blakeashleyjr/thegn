@@ -159,7 +159,7 @@ async fn run(
     let mut backoff = std::time::Duration::from_secs(1);
 
     loop {
-        let Some(client) = thegn_media::client_for(&cfg.resolve_opts()).await else {
+        let Some(client) = crate::media_secret::client_for(&cfg).await else {
             // No backend yet (bus down, playerctl absent). Retry with backoff so
             // media appears once the transport comes up, rather than never.
             tracing::debug!(target: "thegn::media", "media backend unavailable; retrying");

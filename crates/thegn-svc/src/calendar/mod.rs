@@ -24,6 +24,7 @@ use chrono::NaiveDate;
 use futures_util::future::BoxFuture;
 use thegn_core::calendar::{
     AdmissionBudget, AdmissionError, AdmissionLease, AdmissionMeter, AdmissionPool, CalEvent,
+    CalendarWindow,
 };
 use thegn_core::config_calendar::{CalendarAccount, CalendarConfig, CalendarProviderKind};
 
@@ -318,7 +319,8 @@ pub trait CalendarBackend: Send + Sync {
     fn provider_id(&self) -> &'static str;
     fn caps(&self) -> CalendarCaps;
 
-    /// Events overlapping `[from, to]`.
+    /// Events selected by the provider's date-oriented adapter. The router
+    /// passes the canonical resolved range through `list_events_window`.
     ///
     /// A provider that cannot expand recurrence returns the masters with their
     /// `recurrence` intact and the host expands; one that can sets
@@ -329,6 +331,16 @@ pub trait CalendarBackend: Send + Sync {
         to: NaiveDate,
         sync_token: &'a str,
     ) -> BoxFuture<'a, Result<EventPage, CalendarError>>;
+
+    /// Window-aware listing. Date-oriented providers inherit this adapter;
+    /// providers that query instants (CalDAV) consume the canonical bounds.
+    fn list_events_window<'a>(
+        &'a self,
+        window: &'a CalendarWindow,
+        sync_token: &'a str,
+    ) -> BoxFuture<'a, Result<EventPage, CalendarError>> {
+        self.list_events(window.from, window.to, sync_token)
+    }
 
     fn create_event<'a>(
         &'a self,
@@ -436,6 +448,14 @@ impl CalendarBackend for AccountPolicyBackend {
         sync_token: &'a str,
     ) -> BoxFuture<'a, Result<EventPage, CalendarError>> {
         self.inner.list_events(from, to, sync_token)
+    }
+
+    fn list_events_window<'a>(
+        &'a self,
+        window: &'a CalendarWindow,
+        sync_token: &'a str,
+    ) -> BoxFuture<'a, Result<EventPage, CalendarError>> {
+        self.inner.list_events_window(window, sync_token)
     }
 
     fn create_event<'a>(
@@ -602,14 +622,13 @@ impl CalendarRouter {
     /// early account cannot starve a later one of the shared budget.
     pub async fn list_events_each(
         &self,
-        from: NaiveDate,
-        to: NaiveDate,
+        window: CalendarWindow,
         tokens: &BTreeMap<String, String>,
         mut sink: impl FnMut(AccountResult),
     ) {
         for a in &self.accounts {
             let token = tokens.get(&a.name).map(String::as_str).unwrap_or("");
-            let mut result = a.inner.list_events(from, to, token).await;
+            let mut result = a.inner.list_events_window(&window, token).await;
             // Stamp identity onto every event so ids are globally unique and the
             // UI can color by source.
             if let Ok(page) = result.as_mut() {
@@ -640,8 +659,10 @@ impl CalendarRouter {
         tokens: &BTreeMap<String, String>,
     ) -> Vec<AccountResult> {
         let mut out = Vec::with_capacity(self.accounts.len());
-        self.list_events_each(from, to, tokens, |r| out.push(r))
-            .await;
+        let Some(window) = CalendarWindow::new(from, to, thegn_core::calendar::Tz::UTC) else {
+            return out;
+        };
+        self.list_events_each(window, tokens, |r| out.push(r)).await;
         out
     }
 }

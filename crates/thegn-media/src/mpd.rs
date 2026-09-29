@@ -24,10 +24,18 @@ trait Duplex: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
 impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> Duplex for T {}
 
 /// Where the MPD daemon lives, plus an optional password.
-#[derive(Debug, Clone)]
 pub struct MpdEndpoint {
     kind: EndpointKind,
-    password: Option<String>,
+    password: Option<crate::MpdPassword>,
+}
+
+impl std::fmt::Debug for MpdEndpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MpdEndpoint")
+            .field("kind", &self.kind)
+            .field("password", &self.password.as_ref().map(|_| "[REDACTED]"))
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -41,42 +49,10 @@ enum EndpointKind {
 }
 
 impl MpdEndpoint {
-    /// Resolve a `[media.mpd] socket` string into an endpoint. A leading `/`
-    /// (unix) is a socket path; otherwise `host:port` (default port 6600). When
-    /// `socket` is empty or the default `127.0.0.1:6600`, `$MPD_HOST`/`$MPD_PORT`
-    /// override — matching how every MPD client resolves its connection.
-    pub fn resolve(socket: &str, password: Option<String>) -> MpdEndpoint {
+    /// Resolve a sanitized host-side socket into an endpoint. A leading `/`
+    /// (unix) is a socket path; otherwise `host:port` (default port 6600).
+    pub fn resolve(socket: &str, password: Option<crate::MpdPassword>) -> MpdEndpoint {
         let trimmed = socket.trim();
-        let is_default = trimmed.is_empty() || trimmed == "127.0.0.1:6600";
-        let mut password = password;
-
-        if is_default
-            && let Ok(host) = std::env::var("MPD_HOST")
-            && !host.is_empty()
-        {
-            // `MPD_HOST` may carry a `password@host` prefix.
-            let (pw, host) = match host.split_once('@') {
-                // Leading `@host` = abstract socket, not a password.
-                Some((maybe_pw, rest)) if !maybe_pw.is_empty() => {
-                    (Some(maybe_pw.to_string()), rest.to_string())
-                }
-                _ => (None, host.clone()),
-            };
-            if password.is_none() {
-                password = pw;
-            }
-            let kind = if host.starts_with('/') {
-                EndpointKind::Unix(host)
-            } else {
-                let port = std::env::var("MPD_PORT")
-                    .ok()
-                    .and_then(|p| p.trim().parse().ok())
-                    .unwrap_or(6600);
-                EndpointKind::Tcp { host, port }
-            };
-            return MpdEndpoint { kind, password };
-        }
-
         let kind = if trimmed.starts_with('/') {
             EndpointKind::Unix(trimmed.to_string())
         } else {
@@ -142,7 +118,9 @@ impl MpdConn {
         }
         if let Some(pw) = &ep.password {
             // Best-effort auth; a rejection surfaces on the first real command.
-            conn.command(&format!("password {}", quote(pw))).await?;
+            let mut auth_command = zeroize::Zeroizing::new(String::from("password "));
+            quote_into(&mut auth_command, pw.expose());
+            conn.command(&auth_command).await?;
         }
         Ok(conn)
     }
@@ -150,7 +128,7 @@ impl MpdConn {
     /// Run one command and collect its `key: value` reply up to the terminating
     /// `OK` (an `ACK …` line becomes a [`MediaError::Backend`]).
     async fn command(&mut self, cmd: &str) -> Result<Vec<Pair>, MediaError> {
-        let line = format!("{cmd}\n");
+        let line = zeroize::Zeroizing::new(format!("{cmd}\n"));
         self.io
             .get_mut()
             .write_all(line.as_bytes())
@@ -197,6 +175,7 @@ async fn dial_unix(_path: &str) -> Result<Box<dyn Duplex>, MediaError> {
 }
 
 /// Quote a value for a single MPD command argument (only `"`/`\` need escaping).
+#[cfg(test)]
 fn quote(s: &str) -> String {
     if s.chars().any(|c| c == ' ' || c == '"' || c == '\\') {
         let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
@@ -206,7 +185,24 @@ fn quote(s: &str) -> String {
     }
 }
 
-/// The native MPD backend. Cloneable endpoint; dials per read.
+fn quote_into(out: &mut String, s: &str) {
+    if s.bytes()
+        .any(|b| b.is_ascii_whitespace() || b == b'"' || b == b'\\')
+    {
+        out.push('"');
+        for ch in s.chars() {
+            if ch == '"' || ch == '\\' {
+                out.push('\\');
+            }
+            out.push(ch);
+        }
+        out.push('"');
+    } else {
+        out.push_str(s);
+    }
+}
+
+/// The native MPD backend. Owns one credential-bearing endpoint and dials per read.
 pub struct Mpd {
     ep: MpdEndpoint,
 }
@@ -422,17 +418,27 @@ mod tests {
 
     #[test]
     fn resolve_defaults_to_localhost_tcp() {
-        // Env-free default. (MPD_HOST may exist in a dev shell; guard the assert.)
-        if std::env::var_os("MPD_HOST").is_none() {
-            let ep = MpdEndpoint::resolve("127.0.0.1:6600", None);
-            match ep.kind {
-                EndpointKind::Tcp { host, port } => {
-                    assert_eq!(host, "127.0.0.1");
-                    assert_eq!(port, 6600);
-                }
-                _ => panic!("expected tcp"),
+        // Environment parsing belongs to the audited host boundary.
+        let ep = MpdEndpoint::resolve("127.0.0.1:6600", None);
+        match ep.kind {
+            EndpointKind::Tcp { host, port } => {
+                assert_eq!(host, "127.0.0.1");
+                assert_eq!(port, 6600);
             }
+            _ => panic!("expected tcp"),
         }
+    }
+
+    #[test]
+    fn endpoint_debug_redacts_password() {
+        let sentinel = "mpd-debug-secret-sentinel";
+        let endpoint = MpdEndpoint::resolve(
+            "music.lan:6601",
+            Some(crate::MpdPassword::new(sentinel.to_string())),
+        );
+        let rendered = format!("{endpoint:?}");
+        assert!(!rendered.contains(sentinel));
+        assert!(rendered.contains("REDACTED"));
     }
 
     #[test]

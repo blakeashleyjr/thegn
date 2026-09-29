@@ -2835,6 +2835,30 @@ fn provider_sync_target(
     Some((provider, id, workdir))
 }
 
+/// A runtime for one short-lived, blocking provider call.
+///
+/// **Current-thread, deliberately.** `Runtime::new()` builds a *multi-threaded*
+/// runtime with one worker per core — 24 on the machine this was measured on —
+/// which is a lot of thread creation and teardown to run a single network call.
+/// Measured live: ~7 `thegn-rt` threads born per minute at idle, from exactly
+/// these call sites.
+///
+/// Nothing here needs CPU parallelism. Provider work is network-bound, and the
+/// one call site that fans out (`agent_configs`'s `join_all` upload batch) wants
+/// **concurrency**, which a current-thread runtime provides — those futures
+/// interleave at their await points just as well; they simply do not occupy
+/// separate cores, which for an SSH upload is not a cost. `spawn_blocking` still
+/// works, on the blocking pool, exactly as before.
+///
+/// `enable_all` because these futures use both the I/O driver and timers
+/// (`tokio::time::timeout` in the upload batch).
+pub(crate) fn provider_runtime() -> anyhow::Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| anyhow::anyhow!("tokio runtime: {e}"))
+}
+
 /// Run an async provider call to completion on a fresh OS thread with its own
 /// tokio runtime — safe to call from any context (no nested-runtime panic), and
 /// blocking from the caller's view (used on the off-loop prepare/close paths).
@@ -2845,8 +2869,7 @@ where
 {
     std::thread::scope(|s| {
         s.spawn(|| {
-            let rt = tokio::runtime::Runtime::new()
-                .map_err(|e| anyhow::anyhow!("tokio runtime: {e}"))?;
+            let rt = provider_runtime()?;
             rt.block_on(f())
         })
         .join()
