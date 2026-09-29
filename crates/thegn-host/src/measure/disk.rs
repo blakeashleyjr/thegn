@@ -79,6 +79,7 @@ pub(crate) fn spawn_scan(
         let stamps = db.all_worktree_disk_stamps().unwrap_or_default();
         let active = super::active_key(active.as_deref());
         let targets = super::targets(&db, &stamps, active.as_deref());
+        super::warn_if_saturated("disk", targets.len(), cfg.max_scan_per_round as usize);
         let due = scan_sched::plan(
             &targets,
             thegn_core::util::now(),
