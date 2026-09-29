@@ -38,7 +38,9 @@ pub fn run(cfg: &Config, id: &str, cmd: &[String]) -> Result<()> {
         .ok_or_else(|| {
             anyhow!("sprite-exec: no WSS-native env with a resolvable API token for id {id:?}")
         })?;
-    let rt = tokio::runtime::Runtime::new()?;
+    // Current-thread: one network call does not need a worker per core.
+    // See `agent::provider_runtime`.
+    let rt = crate::agent::provider_runtime()?;
     let (code, out) = rt.block_on(async { provider.run_exec(id, &argv, None, &[]).await })?;
     use std::io::Write;
     let mut stdout = std::io::stdout();
