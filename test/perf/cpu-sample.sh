@@ -7,12 +7,23 @@
 # and reports cores-used with a per-thread breakdown. This finally measures the
 # steady-state cost the launch→first-frame `just bench` never sees.
 #
+# It also samples RESOURCE ACCUMULATION — children (zombies counted
+# separately), fds by class, thread high-water and the read-syscall rate. CPU was
+# the only axis gated here, and the incident that motivated this consumed **zero**
+# CPU in the thing that broke the machine: 4,408 unreaped `git-lfs` children took
+# the process table to 5,274 entries and I/O pressure `full avg10` to 7.94, while
+# the same instance's cores-used looked unremarkable. Counters that only ever grow
+# are invisible to a windowed CPU measurement, so they get their own ceilings.
+#
 # Usage:
-#   cpu-sample.sh [--scenario idle|steady-workload] [--bin PATH]
+#   cpu-sample.sh [--scenario idle|steady-workload|soak] [--bin PATH]
 #                 [--worktrees N] [--dirty N] [--settle-ms MS] [--window-ms MS]
 #                 [--ceiling CORES] [--record] [--json] [--baseline-dir DIR]
+#                 [--zombie-ceiling N] [--child-growth-ceiling N]
+#                 [--fd-growth-ceiling N] [--thread-growth-ceiling N]
+#                 [--syscr-rate-ceiling N]
 #
-# Exit status: 0 ok; 2 over the idle ceiling; 1 harness error.
+# Exit status: 0 ok; 2 over a ceiling (CPU or resource); 1 harness error.
 
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -58,6 +69,30 @@ WINDOW_MS=8000 # long enough to average the dashboard's 4s sysinfo cadence
 # pre-warmed dashboard collector; a true event-loop spin regression would be
 # 0.5-1.5 cores, far past this. Tighten once the dashboard poll is visibility-gated.
 CEILING=0.12
+# Resource ceilings. FIXED guards like CEILING, never baseline-derived: a
+# regressed baseline must not be able to raise the bar on a leak.
+#
+# A zombie child is a defect by definition — the process exited and nobody called
+# `wait()` — so that ceiling is 0 and is not scenario-dependent. The growth
+# ceilings are deltas across the sample window on an already-settled process:
+# hydration and lazy opens happen during the settle, so a settled window that
+# keeps adding children, fds or threads is accumulating, not warming up. They are
+# small rather than zero because the ticker and the sysinfo collector legitimately
+# open and close things mid-window.
+ZOMBIE_CEILING=0
+# Live children legitimately fluctuate — measured 0 -> 2 across a 45s idle window
+# as the pane/git helpers come and go — so this is a coarse backstop, not the
+# leak signal. ZOMBIE_CEILING is the leak signal: a zombie is never legitimate.
+CHILD_GROWTH_CEILING=4
+# Measured on a 14-worktree fixture: +2 over an 8s window, +1 over 45s — churn,
+# not accumulation (a real leak would scale with the window, not shrink).
+FD_GROWTH_CEILING=8
+THREAD_GROWTH_CEILING=2
+# Reads per second. The incident sustained 26,063/s from the disk-size walk.
+# Measured idle here: ~900/s over a 45s window, ~2,100/s over 8s — the cost is
+# front-loaded just after the settle, so the ceiling has to clear the short-window
+# case. 5,000 does, and still catches the incident by 5x.
+SYSCR_RATE_CEILING=5000
 RECORD=0
 JSON_ONLY=0
 BASELINE_DIR="$HERE/baselines"
@@ -92,6 +127,26 @@ while [ $# -gt 0 ]; do
     CEILING="$2"
     shift 2
     ;;
+  --zombie-ceiling)
+    ZOMBIE_CEILING="$2"
+    shift 2
+    ;;
+  --child-growth-ceiling)
+    CHILD_GROWTH_CEILING="$2"
+    shift 2
+    ;;
+  --fd-growth-ceiling)
+    FD_GROWTH_CEILING="$2"
+    shift 2
+    ;;
+  --thread-growth-ceiling)
+    THREAD_GROWTH_CEILING="$2"
+    shift 2
+    ;;
+  --syscr-rate-ceiling)
+    SYSCR_RATE_CEILING="$2"
+    shift 2
+    ;;
   --record)
     RECORD=1
     shift
@@ -110,6 +165,15 @@ while [ $# -gt 0 ]; do
     ;;
   esac
 done
+
+# `soak` is `steady-workload` given room to accumulate: the resource counters are
+# deltas, so a leak of one child per diff is only visible if enough diffs happen
+# and enough worktrees exist to keep the scan lanes busy. Scenario defaults apply
+# only where the caller did not ask for a value, so an explicit flag always wins.
+if [ "$SCENARIO" = soak ]; then
+  [ "$WORKTREES" = "${TG_PERF_WORKTREES:-14}" ] && WORKTREES=40
+  [ "$WINDOW_MS" = 8000 ] && WINDOW_MS=60000
+fi
 
 BIN_ABS="$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")"
 [ -x "$BIN_ABS" ] || {
@@ -136,8 +200,11 @@ command -v script >/dev/null 2>&1 || {
 }
 
 PIDFILE="$PERF_TMP/thegn.pid"
-RUN_MS=$((SETTLE_MS + WINDOW_MS + 1500)) # generous tail past the sample window
-DEADLINE_S=$(((RUN_MS / 1000) + 10))     # hard safety net
+# The adaptive settle can extend to SETTLE_CAP_MS (20s), so the run window has to
+# cover the cap rather than the requested settle — otherwise thegn exits mid-sample
+# on exactly the slow-hydration runs the adaptive settle exists for.
+RUN_MS=$((20000 + WINDOW_MS + 1500)) # generous tail past the sample window
+DEADLINE_S=$(((RUN_MS / 1000) + 10)) # hard safety net
 
 # Launch thegn under a PTY (termwiz refuses to start without one); the inner
 # shell backgrounds thegn and records its PID so the sampler can find it.
@@ -186,7 +253,63 @@ proc_jiffies() { # $1 = pid -> utime+stime
   awk '{ s=$0; sub(/^.*\) /,"",s); split(s,a," "); print a[12]+a[13] }' "/proc/$1/stat" 2>/dev/null || echo 0
 }
 
-if [ "$SCENARIO" = steady-workload ]; then
+# --- resource accumulation --------------------------------------------------
+# One awk pass over the whole process table rather than a `cat` per pid: this runs
+# with ~900 processes live and is called at both ends of the window.
+#
+# `sub(/^[0-9]+ \(.*\) /)` is deliberately greedy — a comm can contain both spaces
+# and parens, so only the LAST ") " is the real delimiter. After it, field 1 is the
+# state and field 2 the ppid.
+proc_children() { # $1 = pid -> "children zombies"
+  awk -v target="$1" '
+    FNR == 1 {
+      s = $0; sub(/^[0-9]+ \(.*\) /, "", s); split(s, a, " ")
+      if (a[2] == target) { c++; if (a[1] == "Z") z++ }
+    }
+    END { printf "%d %d", c + 0, z + 0 }
+  ' /proc/[0-9]*/stat 2>/dev/null || printf '0 0'
+}
+
+# fds by class, because "47 fds" says nothing about which subsystem is leaking.
+# `thegn.db` is called out by name: the incident held 64 connections to it.
+proc_fds() { # $1 = pid -> "total db procfs sock pipe"
+  local total=0 db=0 pr=0 sk=0 pi=0 link target
+  for link in "/proc/$1/fd"/*; do
+    [ -e "$link" ] || continue # glob stays literal if the process vanished
+    total=$((total + 1))
+    target="$(readlink "$link" 2>/dev/null)" || continue
+    case "$target" in
+    *thegn.db*) db=$((db + 1)) ;;
+    /proc/*) pr=$((pr + 1)) ;;
+    socket:*) sk=$((sk + 1)) ;;
+    pipe:*) pi=$((pi + 1)) ;;
+    esac
+  done
+  printf '%d %d %d %d %d' "$total" "$db" "$pr" "$sk" "$pi"
+}
+
+proc_threads() { # $1 = pid -> live thread count
+  local n=0 d
+  for d in "/proc/$1/task"/*; do
+    [ -e "$d" ] || continue
+    n=$((n + 1))
+  done
+  printf '%d' "$n"
+}
+
+# Read-syscall COUNT, not bytes. The runaway instance had made 4.5 TB of `rchar`
+# against 0.6 MB/s of real disk — i.e. it was re-reading the page cache, which
+# shows up in the syscall count and not in any I/O-bytes metric.
+proc_syscr() { # $1 = pid -> cumulative read syscalls
+  awk '/^syscr:/ { print $2; found = 1 } END { if (!found) print 0 }' "/proc/$1/io" 2>/dev/null || echo 0
+}
+
+res_sample() { # $1 = pid -> "children zombies fdtotal fddb fdproc fdsock fdpipe threads syscr"
+  printf '%s %s %s %s' \
+    "$(proc_children "$1")" "$(proc_fds "$1")" "$(proc_threads "$1")" "$(proc_syscr "$1")"
+}
+
+if [ "$SCENARIO" = steady-workload ] || [ "$SCENARIO" = soak ]; then
   KEYS="$HERE/scenarios/steady-workload.keys"
   # The pty master is only reachable through /proc on Linux; on darwin the
   # scenario degrades to plain idle rather than silently claiming a workload.
@@ -200,12 +323,45 @@ fi
 WINDOW_S="$(awk "BEGIN{print $WINDOW_MS/1000}")"
 THREAD_JSON="[]"
 THREAD_TABLE=""
+# Absent on darwin: none of these counters has a procfs-free equivalent, and
+# reporting an invented zero would read as "no leak" rather than "not measured".
+RES_JSON="null"
 
 if [ "$SAMPLER" = proc ]; then
   # Settle, then capture the process + per-thread baseline at the SAME instant
   # (window start), sleep the window, and diff.
   sleep "$(awk "BEGIN{print $SETTLE_MS/1000}")"
+
+  # ADAPTIVE SETTLE. A fixed 2500ms was not enough and it made the repo's hardest
+  # contract report a false failure: on this box, same binary and fixture,
+  # cores_total measured 0.334 at settle=2500ms, 0.068 at 6000ms and 0.035 at
+  # 12000ms — the last better than the recorded 0.0488 baseline. The cost is
+  # unfinished hydration landing inside the window, not idle spin, and a loaded
+  # box makes hydration longer so more of it lands there.
+  #
+  # So wait for quiescence instead of guessing it: poll one-second CPU deltas
+  # until one comes in under half the ceiling. Bounded, because a genuine spin
+  # would never quiesce and must still be measured rather than waited on forever.
+  #
+  # `settle_used_ms` is REPORTED, so hydration getting slower stays visible
+  # instead of being silently absorbed — this separates "idle costs too much"
+  # (this gate) from "startup takes too long" (`just bench`), which is the split
+  # the fixed settle was conflating.
+  SETTLE_CAP_MS=20000
+  QUIESCENT_CORES="$(awk "BEGIN{print $CEILING/2}")"
+  SETTLE_USED_MS="$SETTLE_MS"
+  while [ "$SETTLE_USED_MS" -lt "$SETTLE_CAP_MS" ]; do
+    Q0="$(proc_jiffies "$PID")"
+    sleep 1
+    Q1="$(proc_jiffies "$PID")"
+    SETTLE_USED_MS=$((SETTLE_USED_MS + 1000))
+    awk "BEGIN{exit !(($Q1-$Q0)/$CLK_TCK <= $QUIESCENT_CORES)}" && break
+  done
+
   J0="$(proc_jiffies "$PID")"
+  # Resources at window start — AFTER the settle, so hydration and the lazy opens
+  # it triggers are already accounted and any growth from here is accumulation.
+  read -r C0 Z0 FD0 FDDB0 FDPR0 FDSK0 FDPI0 TH0 SR0 <<<"$(res_sample "$PID")"
   declare -A T0 TN
   for tid_dir in "/proc/$PID/task"/*; do
     [ -e "$tid_dir" ] || continue # glob stays literal if the process vanished
@@ -215,7 +371,25 @@ if [ "$SAMPLER" = proc ]; then
   done
   sleep "$WINDOW_S"
   J1="$(proc_jiffies "$PID")"
+  read -r C1 Z1 FD1 FDDB1 FDPR1 FDSK1 FDPI1 TH1 SR1 <<<"$(res_sample "$PID")"
   CORES_TOTAL="$(awk "BEGIN{printf \"%.4f\", ($J1-$J0)/($CLK_TCK*$WINDOW_S)}")"
+  SYSCR_RATE="$(awk "BEGIN{printf \"%.1f\", ($SR1-$SR0)/$WINDOW_S}")"
+  # High-water, not end-of-window: a child reaped just before the second sample
+  # still happened, and the peak is what sizes the process table.
+  CHILD_PEAK=$((C1 > C0 ? C1 : C0))
+  ZOMBIE_PEAK=$((Z1 > Z0 ? Z1 : Z0))
+  FD_PEAK=$((FD1 > FD0 ? FD1 : FD0))
+  THREAD_PEAK=$((TH1 > TH0 ? TH1 : TH0))
+  CHILD_GROWTH=$((C1 - C0))
+  FD_GROWTH=$((FD1 - FD0))
+  THREAD_GROWTH=$((TH1 - TH0))
+  RES_JSON="{\"children\":{\"start\":$C0,\"end\":$C1,\"peak\":$CHILD_PEAK},\
+\"zombies\":{\"start\":$Z0,\"end\":$Z1,\"peak\":$ZOMBIE_PEAK},\
+\"fds\":{\"start\":$FD0,\"end\":$FD1,\"peak\":$FD_PEAK,\
+\"db\":{\"start\":$FDDB0,\"end\":$FDDB1},\"procfs\":{\"start\":$FDPR0,\"end\":$FDPR1},\
+\"sock\":{\"start\":$FDSK0,\"end\":$FDSK1},\"pipe\":{\"start\":$FDPI0,\"end\":$FDPI1}},\
+\"threads\":{\"start\":$TH0,\"end\":$TH1,\"peak\":$THREAD_PEAK},\
+\"syscr_per_s\":$SYSCR_RATE}"
 
   # Per-thread deltas. Capture a sorted "comm cores" table for display and a JSON
   # array for the result. Read t1 BEFORE thegn exits (we're still inside the window
@@ -251,7 +425,7 @@ fi
 # Let thegn exit on its own (bench window), then reap the launcher.
 wait "$LAUNCHER" 2>/dev/null || true
 
-RESULT="{\"scenario\":\"$SCENARIO\",\"build\":\"$BUILD\",\"worktrees\":$WORKTREES,\"window_ms\":$WINDOW_MS,\"cores_total\":$CORES_TOTAL,\"threads\":$THREAD_JSON,\"git_sha\":\"$GIT_SHA\",\"host_tag\":\"$HOST_TAG\"}"
+RESULT="{\"scenario\":\"$SCENARIO\",\"build\":\"$BUILD\",\"worktrees\":$WORKTREES,\"window_ms\":$WINDOW_MS,\"settle_used_ms\":${SETTLE_USED_MS:-$SETTLE_MS},\"cores_total\":$CORES_TOTAL,\"threads\":$THREAD_JSON,\"resources\":$RES_JSON,\"git_sha\":\"$GIT_SHA\",\"host_tag\":\"$HOST_TAG\"}"
 
 BASELINE="$BASELINE_DIR/$HOST_TAG.$SCENARIO.json"
 if [ "$RECORD" = 1 ]; then
@@ -262,7 +436,7 @@ fi
 if [ "$JSON_ONLY" = 1 ]; then
   printf '%s\n' "$RESULT"
 else
-  echo "scenario=$SCENARIO build=$BUILD worktrees=$WORKTREES window=${WINDOW_MS}ms"
+  echo "scenario=$SCENARIO build=$BUILD worktrees=$WORKTREES window=${WINDOW_MS}ms settle=${SETTLE_USED_MS:-$SETTLE_MS}ms"
   echo "binary=$BIN_ABS"
   echo "cores_total=$CORES_TOTAL  (host=$HOST_TAG sha=$GIT_SHA)"
   echo "top threads (cores comm tid):"
@@ -270,6 +444,16 @@ else
     printf '%s' "$THREAD_TABLE" | sort -rn | head -8 | sed 's/^/  /'
   else
     echo "  (no per-thread CPU captured)"
+  fi
+  if [ "$RES_JSON" != "null" ]; then
+    echo "resources (start -> end, peak):"
+    echo "  children=$C0 -> $C1 (peak $CHILD_PEAK)   of which zombies=$Z0 -> $Z1 (peak $ZOMBIE_PEAK)"
+    echo "  fds=$FD0 -> $FD1 (peak $FD_PEAK)"
+    echo "    db=$FDDB0 -> $FDDB1   procfs=$FDPR0 -> $FDPR1   sock=$FDSK0 -> $FDSK1   pipe=$FDPI0 -> $FDPI1"
+    echo "  threads=$TH0 -> $TH1 (peak $THREAD_PEAK)"
+    echo "  read syscalls=${SYSCR_RATE}/s"
+  else
+    echo "resources: not measured on $(uname -s)"
   fi
   if [ -f "$BASELINE" ]; then
     BASE_CORES="$(grep -o '"cores_total":[0-9.]*' "$BASELINE" | cut -d: -f2)"
@@ -284,4 +468,30 @@ if [ "$SCENARIO" = idle ] && [ "$BUILD" = release ]; then
     echo "FAIL: idle cores_total=$CORES_TOTAL exceeds ceiling=$CEILING cores" >&2
     exit 2
   fi
+fi
+
+# Resource ceilings. These assert on every procfs scenario, not just `idle`: a
+# leak under a workload is still a leak, and `steady-workload` is where the diff
+# path — the one that leaked 4,408 children — actually runs.
+if [ "$RES_JSON" != "null" ] && [ "$BUILD" = release ]; then
+  RES_FAIL=0
+  res_check() { # $1 = label, $2 = measured, $3 = ceiling, $4 = why it matters
+    if [ "$2" -gt "$3" ]; then
+      echo "FAIL: $1=$2 exceeds ceiling=$3 — $4" >&2
+      RES_FAIL=1
+    fi
+  }
+  res_check zombie_peak "$ZOMBIE_PEAK" "$ZOMBIE_CEILING" \
+    "a zombie child exited and nobody called wait() (see THE-701, THE-702)"
+  res_check child_growth "$CHILD_GROWTH" "$CHILD_GROWTH_CEILING" \
+    "children accumulating across a settled window"
+  res_check fd_growth "$FD_GROWTH" "$FD_GROWTH_CEILING" \
+    "descriptors accumulating across a settled window (db $FDDB0->$FDDB1, procfs $FDPR0->$FDPR1, sock $FDSK0->$FDSK1, pipe $FDPI0->$FDPI1)"
+  res_check thread_growth "$THREAD_GROWTH" "$THREAD_GROWTH_CEILING" \
+    "threads accumulating across a settled window (THE-448 leaks one per launch)"
+  if awk "BEGIN{exit !($SYSCR_RATE > $SYSCR_RATE_CEILING)}"; then
+    echo "FAIL: syscr_per_s=$SYSCR_RATE exceeds ceiling=$SYSCR_RATE_CEILING — a scan lane is probably saturated" >&2
+    RES_FAIL=1
+  fi
+  [ "$RES_FAIL" = 0 ] || exit 2
 fi
