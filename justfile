@@ -615,7 +615,25 @@ coverage-html:
 #
 # The Rust-side ratchets (platform-cfg, hostkey, surface-gaps, completion-slot,
 # help) are Rust tests and run in `just test`.
-ratchets: delivery-check
+#
+# `delivery-check` is deliberately NOT a dependency here, and moved to the END of
+# `just lint` instead. Two reasons, the first of which this recipe's own docstring
+# already states:
+#
+#   - Its verdict does NOT depend on the code alone. It fails on the OpenSpec
+#     archive backlog and on the CALENDAR — "exceeded the 7-day archive
+#     reconciliation window" — so an unchanged tree passes one day and fails the
+#     next. That is the opposite of the property the comment above claims for
+#     everything in this target, and it is why this target is the one recommended
+#     for `[merge_queue] gate_command`.
+#   - Running first, it ABORTED the chain. `just lint` depends on `ratchets`, so
+#     18 stale bookkeeping rows meant `cargo clippy` never ran at all — nobody
+#     had seen the full lint output for weeks while the gate reported red for an
+#     unrelated reason. A gate that hides the thing it is supposed to check is
+#     worse than no gate.
+#
+# It still gates: `just lint` runs it last, and `just ci` depends on `just lint`.
+ratchets:
     # Guardrail: all git must route through util::git_cmd / GitLoc so GIT_ENV_VARS
     # is scrubbed (the core.worktree-pollution class). Only the builder in util.rs
     # may call `git` directly; raw `Command::new("git")` anywhere else is rejected.
@@ -698,6 +716,11 @@ lint: ratchets
     # .direnv/flake-inputs (i.e. nixpkgs) and target/ — 122 files, almost none
     # of them ours.
     git ls-files -z '*.toml' | xargs -0 taplo lint
+    # LAST, not first. Bookkeeping, not code: it fails on the OpenSpec archive
+    # backlog and on the calendar, so putting it ahead of clippy meant a stale
+    # archive row masked every real lint finding. Still a gate — just no longer
+    # one that can hide the others. See the note on `ratchets`.
+    just delivery-check
 
 # Explicit developer repair only (never a checkout hook): strip a stray
 # `core.worktree` that an external

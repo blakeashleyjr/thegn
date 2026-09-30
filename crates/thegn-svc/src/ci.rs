@@ -1584,9 +1584,11 @@ esac
             ],
         ] {
             assert!(
-                std::process::Command::new("git")
+                // `git_cmd` scrubs GIT_ENV_VARS; this test can run inside a live
+                // thegn worktree whose inherited GIT_DIR would otherwise redirect
+                // these commands out of the temp repo.
+                thegn_core::util::git_cmd(temp.path())
                     .args(args)
-                    .current_dir(temp.path())
                     .status()
                     .unwrap()
                     .success()
@@ -1647,22 +1649,20 @@ esac
 
         let unsupported = tempfile::tempdir().unwrap();
         assert!(
-            std::process::Command::new("git")
+            thegn_core::util::git_cmd(unsupported.path())
                 .args(["init", "-q"])
-                .current_dir(unsupported.path())
                 .status()
                 .unwrap()
                 .success()
         );
         assert!(
-            std::process::Command::new("git")
+            thegn_core::util::git_cmd(unsupported.path())
                 .args([
                     "remote",
                     "add",
                     "origin",
                     "https://github.com.evil.test/owner/repo"
                 ])
-                .current_dir(unsupported.path())
                 .status()
                 .unwrap()
                 .success()
