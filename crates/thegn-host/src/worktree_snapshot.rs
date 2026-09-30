@@ -79,12 +79,6 @@ pub(crate) fn join_snapshot(
         .collect()
 }
 
-pub(crate) fn branch_for_path(row: &WorktreeRow, snapshot: &[WorktreeInfo]) -> Option<String> {
-    join_snapshot(std::slice::from_ref(row), snapshot)
-        .remove(&row.worktree)
-        .and_then(|observation| observation.branch().map(str::to_owned))
-}
-
 /// Take one Git worktree-list snapshot per local repository, and one direct
 /// branch read for each remote row. Called only from an existing worker.
 pub(crate) fn observe_rows(

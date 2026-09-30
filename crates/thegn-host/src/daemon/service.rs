@@ -1659,11 +1659,11 @@ impl ControlApi for DaemonService {
             let name = request.name.clone();
             let worktree_for_resolve = worktree.clone();
             let launch = self
-                .with_db(move |db| {
+                .with_db(move |_db| {
                     let fresh = crate::config_source::fresh(&snapshot)
                         .map_err(|error| anyhow::anyhow!("configuration refused: {error}"))?;
                     let cfg = fresh.as_ref().unwrap_or(&snapshot);
-                    super::agent_open::resolve_tool(cfg, db, &worktree_for_resolve, &name)
+                    super::agent_open::resolve_tool(cfg, &worktree_for_resolve, &name)
                 })
                 .await
                 .map_err(|error| ControlError::Conflict(error.to_string()))?;

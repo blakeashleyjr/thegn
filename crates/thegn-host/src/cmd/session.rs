@@ -14,7 +14,7 @@ use thegn_core::issue::{AgentDispatchStatus, DispatchRunPublishOutcome, NewDispa
 use thegn_core::outln;
 use thegn_core::pipeline_resume;
 use thegn_core::pipeline_run;
-use thegn_core::store::{NotificationStore, WorkspaceStore};
+use thegn_core::store::NotificationStore;
 use thegn_core::util::git_out;
 use thegn_svc::control::client::{AttachControl, ControlAddr, ControlClient};
 // NOTE: stage `permissions` ride the daemon's launch command (the harness's
