@@ -484,7 +484,9 @@ mod tests {
                 .into_iter(None)
                 .unwrap();
             for item in iter {
-                let _ = item.unwrap();
+                // `unwrap()` already panics on an error, so nothing is being
+                // swallowed here — a bare statement drops the item just the same.
+                item.unwrap();
             }
         }
         let after = own_children();

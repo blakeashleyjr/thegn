@@ -763,9 +763,11 @@ mod generation_tests {
             clippy::disallowed_methods,
             reason = "test fixture: a blocking wait on `git init` in a temp dir, off the event loop"
         )]
-        let status = std::process::Command::new("git")
+        // `git_cmd` rather than a bare `Command`: it scrubs GIT_ENV_VARS, and this
+        // test can run inside a live thegn worktree whose inherited GIT_DIR would
+        // otherwise point `git init` somewhere other than this temp dir.
+        let status = thegn_core::util::git_cmd(&root)
             .args(["init", "-q"])
-            .current_dir(&root)
             .status()
             .unwrap();
         assert!(status.success(), "git init failed: {status}");
