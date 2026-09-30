@@ -40,7 +40,11 @@ static MAX_US: AtomicU64 = AtomicU64::new(0);
 /// host, before the loop starts. First call wins; later calls are ignored, so a
 /// test that marks a thread cannot corrupt a real process's accounting.
 pub fn mark_loop_thread() {
-    let _ = LOOP_THREAD.set(std::thread::current().id());
+    // `get_or_init`, not `set`: first call wins, which is the behaviour we want,
+    // and there is no Result to swallow. A later call must not retarget the
+    // accounting mid-run — a test that marked a thread would otherwise make every
+    // later test in the same process record.
+    LOOP_THREAD.get_or_init(|| std::thread::current().id());
 }
 
 /// Whether the calling thread is the one marked as the loop.

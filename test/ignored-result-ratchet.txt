@@ -11,6 +11,40 @@
 # subset — `let _ = <future>`, which never runs — is a clippy error regardless
 # (`let_underscore_future` in Cargo.toml [workspace.lints]).
 #
+# `issue/jira.rs` was added 2026-09-30 and is a correct ignore, not debt: the test
+# does `server.abort(); let _ = server.await;`, and after an abort the join ALWAYS
+# yields `Cancelled` — asserting on it would assert on the abort. It only appears
+# now because `delivery-check` used to abort `just lint` before any ratchet ran,
+# so this rule had not executed in weeks.
+#
+# --- added 2026-09-30, all newly VISIBLE rather than newly written ---------
+#
+# `delivery-check` used to abort `just lint` before any ratchet ran, so this rule
+# had not executed in weeks. Reordering it to the end surfaced nine files at once.
+# Each is pinned with its own reason, because a blanket pin is how a rule stops
+# meaning anything:
+#
+#   control/tests.rs     test scaffolding: a broadcast send with no receiver, the
+#                        server task's result at shutdown, and three socket closes
+#   test_support/ratchet.rs, thegn-media/ratchet.rs, thegn-metrics/ratchet.rs
+#                        NOT ignores at all — these hold `let _ = …spawn()` as TEST
+#                        DATA for `discards_spawned_child`, the spawn-ownership
+#                        predicate. A rule about the pattern trips the rule for the
+#                        pattern. The three files are byte-identical copies that
+#                        `ratchet_helper_copies_are_byte_identical` enforces.
+#   gate_capture.rs      teardown: thread joins, `try_recv().ok()` drains, and a
+#                        kill/wait on a process that is already going away
+#   hydrate_refresh_ticker.rs, merge_cleanup.rs
+#                        shutdown: a worker join, and a best-effort `remove_dir`
+#   hydrate_schedule.rs  a `let _ = (…)` tuple silencing unused test bindings
+#
+# Two are FALSE POSITIVES of this rule's own pattern and are the first candidates
+# for shrinking the list — neither swallows anything:
+#   integrate_gate.rs    `let value = …ok();` ASSIGNS the Option; the pattern only
+#                        matches because the line ends in `.ok();`
+#   control_wire.rs      `let _ = decoder.next_frame().unwrap();` — `unwrap` already
+#                        panics, so the binding just drops a value
+#
 # SHRINK-ONLY. Enforced by `test/ratchet.sh ignored-result` in `just lint`;
 # regenerate with `just ratchet-update`.
 #
@@ -37,6 +71,7 @@ crates/thegn-core/src/config_tests_coverage.rs
 crates/thegn-core/src/config_tests.rs
 crates/thegn-core/src/config_write.rs
 crates/thegn-core/src/connectivity.rs
+crates/thegn-core/src/control_wire.rs
 crates/thegn-core/src/db_aux.rs
 crates/thegn-core/src/db_cache.rs
 crates/thegn-core/src/db_calendar.rs
@@ -92,6 +127,7 @@ crates/thegn-core/src/semantic.rs
 crates/thegn-core/src/ssh_creds.rs
 crates/thegn-core/src/startup.rs
 crates/thegn-core/src/termcaps.rs
+crates/thegn-core/src/test_support/ratchet.rs
 crates/thegn-core/src/util.rs
 crates/thegn-core/src/worktree.rs
 crates/thegn-core/src/zone.rs
@@ -169,6 +205,7 @@ crates/thegn-host/src/forge_handle.rs
 crates/thegn-host/src/forward.rs
 crates/thegn-host/src/frame_writer.rs
 crates/thegn-host/src/frame_write.rs
+crates/thegn-host/src/gate_capture.rs
 crates/thegn-host/src/git_handle.rs
 crates/thegn-host/src/gitmut.rs
 crates/thegn-host/src/git_watch.rs
@@ -221,10 +258,13 @@ crates/thegn-host/src/hydrate_calendar.rs
 crates/thegn-host/src/hydrate_calendar_tests.rs
 crates/thegn-host/src/hydrate_feed.rs
 crates/thegn-host/src/hydrate.rs
+crates/thegn-host/src/hydrate_refresh_ticker.rs
+crates/thegn-host/src/hydrate_schedule.rs
 crates/thegn-host/src/hydrate_semantic.rs
 crates/thegn-host/src/hydrate_tests.rs
 crates/thegn-host/src/hydrate_tracker.rs
 crates/thegn-host/src/integrate.rs
+crates/thegn-host/src/integrate_gate.rs
 crates/thegn-host/src/iroh_home.rs
 crates/thegn-host/src/keymap.rs
 crates/thegn-host/src/layout_spec.rs
@@ -241,6 +281,7 @@ crates/thegn-host/src/media_art.rs
 crates/thegn-host/src/media_ctl.rs
 crates/thegn-host/src/media_watch.rs
 crates/thegn-host/src/menu.rs
+crates/thegn-host/src/merge_cleanup.rs
 crates/thegn-host/src/merge_driver.rs
 crates/thegn-host/src/merge_lifecycle.rs
 crates/thegn-host/src/metrics.rs
@@ -309,9 +350,11 @@ crates/thegn-host/src/workspace_create.rs
 crates/thegn-host/src/workspace_picker.rs
 crates/thegn-media/src/lib.rs
 crates/thegn-media/src/mediaremote.rs
+crates/thegn-media/src/ratchet.rs
 crates/thegn-media/src/smtc.rs
 crates/thegn-metrics/src/battery.rs
 crates/thegn-metrics/src/lib.rs
+crates/thegn-metrics/src/ratchet.rs
 crates/thegn-proxy/src/lib.rs
 crates/thegn-proxy/src/main.rs
 crates/thegn-proxy/src/relay.rs
@@ -322,6 +365,7 @@ crates/thegn-svc/src/calendar/tests.rs
 crates/thegn-svc/src/control/client.rs
 crates/thegn-svc/src/control/grpc.rs
 crates/thegn-svc/src/control/http.rs
+crates/thegn-svc/src/control/tests.rs
 crates/thegn-svc/src/fly/mod.rs
 crates/thegn-svc/src/git/branch.rs
 crates/thegn-svc/src/git/mod.rs
@@ -334,6 +378,7 @@ crates/thegn-svc/src/host/mod.rs
 crates/thegn-svc/src/host/retry.rs
 crates/thegn-svc/src/ipc.rs
 crates/thegn-svc/src/iroh_reach.rs
+crates/thegn-svc/src/issue/jira.rs
 crates/thegn-svc/src/log/provider.rs
 crates/thegn-svc/src/lsp/mod.rs
 crates/thegn-svc/src/machine0/mcp.rs

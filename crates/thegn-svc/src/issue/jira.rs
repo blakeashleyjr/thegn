@@ -1169,7 +1169,7 @@ mod tests {
         );
         let result = backend.update_issue("jira:PROJ-1", &patch).await;
         server.abort();
-        let _ = server.await;
+        let _ = server.await; // best-effort: reaping an aborted task; the join always yields Cancelled
         let calls = calls.lock().unwrap().clone();
         (result, calls)
     }
