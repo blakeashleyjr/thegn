@@ -584,6 +584,9 @@ fn read_chunk_file(worktree: &str, chunk_path: &str) -> std::io::Result<String> 
 /// The chunk NAME a `files:`/`overlaps:`/`after:` reference resolves to: the
 /// chunk file's basename without extension (`…/code/chunk-2.md` →
 /// `chunk-2`). The architect's frontmatter names siblings by this stem.
+// Only the test-only `chunk_gate` uses this; gated to match it so non-test
+// builds do not trip `dead_code` (THE-212).
+#[cfg(test)]
 fn chunk_name(chunk_path: &str) -> &str {
     std::path::Path::new(chunk_path)
         .file_stem()
@@ -633,6 +636,7 @@ fn prepare_chunk_admission(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn claim_admitted_with_refresh(
     db: &Db,
     new: NewDispatch<'_>,
@@ -2713,7 +2717,7 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let ids = rt.block_on(query_live_sessions(
             std::time::Duration::from_millis(1),
-            || std::future::pending::<anyhow::Result<()>>(),
+            std::future::pending::<anyhow::Result<()>>,
             |_client: ()| async { Ok(Vec::new()) },
         ));
         assert_eq!(ids, None, "timeout must be unknown, not empty");

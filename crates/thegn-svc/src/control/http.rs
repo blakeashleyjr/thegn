@@ -19,7 +19,7 @@ use axum::{
     response::{IntoResponse, Response, sse},
 };
 use base64::Engine as _;
-use futures_util::StreamExt;
+use futures_util::{SinkExt as _, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1782,7 +1782,18 @@ async fn pump_events(mut socket: WebSocket, state: ControlState, ctx: AuthCtx, f
     loop {
         tokio::select! {
             incoming = socket.next() => match incoming {
-                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => return,
+                Some(Ok(Message::Close(_))) => {
+                    // COMPLETE the handshake before dropping the socket.
+                    // tungstenite does not write the Close echo when it reads
+                    // the peer's Close — it only QUEUES it, and the queue is
+                    // flushed by the next read/write/flush. Returning here drops
+                    // the socket with the echo unsent, so a peer sitting in
+                    // `ClosedByUs` sees EOF and reports
+                    // `ResetWithoutClosingHandshake` rather than a clean close.
+                    let _ = socket.close().await; // best-effort: the peer already asked to close; a failed echo changes nothing
+                    return;
+                }
+                None | Some(Err(_)) => return,
                 Some(Ok(Message::Ping(payload))) => {
                     if socket.send(Message::Pong(payload)).await.is_err() {
                         return;

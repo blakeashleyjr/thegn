@@ -417,9 +417,20 @@ fn cli_schema_is_checked_before_lenient_override_deserialization() {
     let host_snapshot = hosts();
     let cases = [
         ("picker=\"not-a-picker\"", ConfigAdmissionError::CliInvalid),
+        // SemanticInvalid, not CliInvalid — and the difference is only about
+        // WHICH check speaks first; both refuse the override.
+        // `typed_semantic_errors` runs ahead of the schema walk in
+        // `config_validate`, so now that `AppsConfig::validate` knows the tab
+        // registry it rejects an unknown id before the schema enum is reached.
+        // That is the better of the two errors: it can say the id is unknown (or
+        // that `observe` is disabled) where a schema mismatch only says the value
+        // is not in an enum.
+        //
+        // The ordering this test is NAMED for is still pinned by the
+        // `picker="not-a-picker"` case above, which no semantic check claims.
         (
             "apps.tab_order=[\"work\",\"observe-2\"]",
-            ConfigAdmissionError::CliInvalid,
+            ConfigAdmissionError::SemanticInvalid,
         ),
     ];
     for (override_value, expected) in cases {

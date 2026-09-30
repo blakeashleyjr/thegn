@@ -884,7 +884,7 @@ async fn sse_rejects_attach_only_filters_as_bad_requests() {
 
 #[tokio::test]
 async fn event_websocket_close_after_hello_releases_receiver_and_repeated_connections() {
-    use futures_util::{SinkExt as _, StreamExt as _};
+    use futures_util::StreamExt as _;
 
     let r = rig(false);
     let token = token(&r, "read");
@@ -935,9 +935,11 @@ async fn event_websocket_answers_ping_and_discards_client_data() {
         .expect("pong frame")
         .unwrap();
     assert_eq!(pong, Message::Pong(vec![7, 8].into()));
+    // `Vec::<String>::new()`, not `[]`: an empty array literal leaves the
+    // element type uninferable (E0282). This is the file's own idiom elsewhere.
     assert_eq!(
         r.api.calls(),
-        [],
+        Vec::<String>::new(),
         "client data must not invoke control APIs"
     );
 
@@ -955,7 +957,7 @@ async fn event_websocket_answers_ping_and_discards_client_data() {
 
 #[tokio::test]
 async fn event_websocket_connection_cap_rejects_with_close_and_counts_rejection() {
-    use futures_util::{SinkExt as _, StreamExt as _};
+    use futures_util::StreamExt as _;
     use tokio_tungstenite::tungstenite::Message;
 
     let r = rig(false);
@@ -994,7 +996,7 @@ async fn event_websocket_connection_cap_rejects_with_close_and_counts_rejection(
 
 #[tokio::test]
 async fn slow_event_websocket_does_not_block_publication_or_healthy_consumer() {
-    use futures_util::{SinkExt as _, StreamExt as _};
+    use futures_util::StreamExt as _;
     use tokio_tungstenite::tungstenite::Message;
 
     let r = rig(false);

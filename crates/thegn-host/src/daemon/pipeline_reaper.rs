@@ -146,7 +146,15 @@ fn reap_pass(db: &super::service::SharedDb, live_ids: &[String]) {
                 }
             }
             // A human's call, or nothing to do.
-            ReapVerdict::NeedsDecision { .. } | ReapVerdict::Live | ReapVerdict::Closed => {}
+            // `Unknown` belongs with the do-nothing arms, not the reaping
+            // ones: it means liveness could not be established, and this
+            // reaper's doctrine is that it may park a row but never finish one.
+            // Acting on an unknown row is the guess the fail-closed change
+            // exists to prevent.
+            ReapVerdict::NeedsDecision { .. }
+            | ReapVerdict::Unknown { .. }
+            | ReapVerdict::Live
+            | ReapVerdict::Closed => {}
         }
     }
 }
