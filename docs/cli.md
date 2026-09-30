@@ -31,15 +31,19 @@ Use `--scrollback` for a bounded handoff, `--tab` for a new tab, and
 `--fork-worktree` to create a separate worktree first. `--json` includes the
 child's `forked_from` lineage without exposing the launch recipe.
 
-`dispatch put --chunk <file>` / `session open --chunk <file>` (THE-86) record
-the chunk file a row dispatches under and run its scope gate before the row is
-written: the file's `files:` frontmatter (globs: `*` within a segment, `**`
-across) is checked against every ACTIVE sibling row's scope, and an overlap or
-an unmet `after:` is refused with the colliding paths and row ids named —
-`--force` (on `dispatch put`) is the explicit override. Scope display:
+`session open --stage --chunk`, `dispatch claim --chunk`, and
+`dispatch put --chunk <file>` record the chunk a row dispatches under through
+one atomic admission decision. The file's `files:` frontmatter (globs: `*`
+within a segment, `**` across) is checked against every active sibling scope
+for that issue and worktree;
+overlaps and unmet `after:` dependencies refuse without leaving a row. Active
+siblings whose scope cannot be read or parsed also refuse with the row and path
+named. `dispatch claim --allow-scope-overlap <reason>` and
+`dispatch put --force --force-reason <reason>` are explicit, audited overrides;
+`session open` has no override. Scope display:
 `dispatch list` carries a `chunk` column (the file's basename), and JSON rows
-carry `chunk_path` plus `chunk_files` (the parsed `files:` list, omitted when
-the file is unreadable at list time).
+carry `chunk_path` plus `chunk_files_from_file_at_display_time` (the parsed
+`files:` list read at display time, not a claim of admitted ownership).
 
 The legacy bare verbs (`list`, `diff`, `disk`, `clean`, `repos`, `recent`)
 keep working forever with byte-identical output; they are merely hidden from
