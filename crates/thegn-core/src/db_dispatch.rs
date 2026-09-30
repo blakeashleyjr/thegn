@@ -9,6 +9,16 @@ use crate::util;
 use anyhow::Result;
 use rusqlite::OptionalExtension as _;
 
+/// Combined stage and file-scope admission result. Scope snapshot races are
+/// distinct from ordinary policy refusals so the host can refresh filesystem
+/// facts without ever doing I/O while SQLite holds its write lock.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DispatchAdmissionDecision {
+    Claim(crate::pipeline_claim::ClaimDecision),
+    ScopeRefused(String),
+    RetryScopeSnapshot { row: i64, path: String },
+}
+
 /// The source row's verdict changed after the resume caller read it but
 /// before the atomic claim could reconcile it. This is a contention result,
 /// rather than a database failure: the newer verdict must be preserved and a
@@ -314,10 +324,38 @@ impl Db {
         limit: u32,
         allow_duplicate: Option<&str>,
     ) -> Result<std::result::Result<i64, crate::pipeline_claim::ClaimDecision>> {
+        match self.claim_dispatch_admitted(new, limit, allow_duplicate, None, None)? {
+            Ok(id) => Ok(Ok(id)),
+            Err(DispatchAdmissionDecision::Claim(d)) => Ok(Err(d)),
+            Err(DispatchAdmissionDecision::ScopeRefused(s)) => anyhow::bail!(s),
+            Err(DispatchAdmissionDecision::RetryScopeSnapshot { row, path }) => {
+                anyhow::bail!("scope snapshot changed at row {row} ({path}); retry admission")
+            }
+        }
+    }
+
+    /// Admit a chunk-bearing row against pre-read scope facts while holding
+    /// the same write transaction that rechecks capacity, duplicates and the
+    /// roster and inserts the row.
+    pub fn claim_dispatch_admitted(
+        &self,
+        new: crate::issue::NewDispatch<'_>,
+        limit: u32,
+        allow_duplicate: Option<&str>,
+        prepared: Option<&crate::pipeline_chunk::PreparedChunkAdmission>,
+        allow_scope: Option<&str>,
+    ) -> Result<std::result::Result<i64, DispatchAdmissionDecision>> {
         use crate::pipeline_claim::{ClaimRequest, decide_allowing_duplicate};
         let allow_duplicate = allow_duplicate.map(str::trim);
         if allow_duplicate.is_some_and(str::is_empty) {
             anyhow::bail!("--allow-duplicate requires a non-empty reason");
+        }
+        let allow_scope = allow_scope.map(str::trim);
+        if allow_scope.is_some_and(str::is_empty) {
+            anyhow::bail!("--force requires a non-empty reason when used with --chunk");
+        }
+        if allow_scope.is_some() && new.chunk_path.is_none() {
+            anyhow::bail!("a scope override requires --chunk");
         }
         let req = ClaimRequest {
             issue_id: new.issue_id.to_string(),
@@ -330,29 +368,141 @@ impl Db {
         // interleaved with another claimant's insert.
         let conn = self.conn();
         conn.execute_batch("BEGIN IMMEDIATE")?;
-        let result =
-            (|| -> Result<std::result::Result<i64, crate::pipeline_claim::ClaimDecision>> {
-                let rows = self.list_dispatches()?;
-                let decision =
-                    decide_allowing_duplicate(&rows, &req, limit, allow_duplicate.is_some());
-                if !decision.granted() {
-                    return Ok(Err(decision));
+        let result = (|| -> Result<std::result::Result<i64, DispatchAdmissionDecision>> {
+            let rows = self.list_dispatches()?;
+            if new.chunk_path.is_some() && allow_scope.is_none() {
+                let Some(prepared) = prepared else {
+                    return Ok(Err(DispatchAdmissionDecision::ScopeRefused(
+                        "chunk scope was not prepared before admission".into(),
+                    )));
+                };
+                if prepared.path != new.chunk_path.unwrap_or_default() {
+                    return Ok(Err(DispatchAdmissionDecision::ScopeRefused(
+                        "prepared chunk scope does not match the claimed chunk path".into(),
+                    )));
                 }
-                let id = self.put_agent_dispatch(new)?;
-                // The override's audit trail is written INSIDE the transaction,
-                // so an authorized duplicate and the record of who authorized it
-                // commit together. A duplicate row with no note would be
-                // indistinguishable from a runaway one — exactly the ambiguity
-                // this whole change exists to remove — so it must not be
-                // best-effort.
-                if let Some(why) = allow_duplicate {
-                    self.append_dispatch_note(
-                        id,
-                        &format!("duplicate dispatch explicitly authorized: {why}"),
-                    )?;
+                use crate::issue::AgentDispatchStatus as Status;
+                let mut active = Vec::new();
+                let mut done = std::collections::HashSet::new();
+                for row in &rows {
+                    if row.issue_id != new.issue_id || row.worktree_path != new.worktree_path {
+                        continue;
+                    }
+                    let Some(path) = row
+                        .chunk_path
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|p| !p.is_empty())
+                    else {
+                        continue;
+                    };
+                    let name = std::path::Path::new(path)
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if row.status == Status::Done {
+                        done.insert(name);
+                        continue;
+                    }
+                    if !row.status.is_active() {
+                        continue;
+                    }
+                    let Some(snapshot) = prepared.siblings.iter().find(|s| s.row == row.id) else {
+                        return Ok(Err(DispatchAdmissionDecision::RetryScopeSnapshot {
+                            row: row.id,
+                            path: path.to_string(),
+                        }));
+                    };
+                    if snapshot.path != path {
+                        return Ok(Err(DispatchAdmissionDecision::RetryScopeSnapshot {
+                            row: row.id,
+                            path: path.to_string(),
+                        }));
+                    }
+                    let Some(Ok(scope)) = &snapshot.scope else {
+                        let reason = match &snapshot.scope {
+                            Some(Err(e)) => format!(
+                                "active sibling row {} has unreadable scope at {}: {e}",
+                                row.id, snapshot.path
+                            ),
+                            _ => format!(
+                                "active sibling row {} scope snapshot is unavailable at {}",
+                                row.id, snapshot.path
+                            ),
+                        };
+                        return Ok(Err(DispatchAdmissionDecision::ScopeRefused(reason)));
+                    };
+                    active.push(crate::pipeline_chunk::ActiveScope {
+                        row: row.id,
+                        name,
+                        files: scope.files.clone(),
+                    });
                 }
-                Ok(Ok(id))
-            })();
+                let verdict = crate::pipeline_chunk::verdict(&prepared.scope, &active, &done);
+                let mut reasons = Vec::new();
+                if let crate::pipeline_chunk::ScopeVerdict::Conflict { overlaps } = verdict {
+                    for (i, pairs) in overlaps {
+                        let sibling = &active[i];
+                        for (mine, theirs) in pairs {
+                            reasons.push(format!(
+                                "{} vs {}: {mine} collides with {theirs} (active row {})",
+                                prepared.path, sibling.name, sibling.row
+                            ));
+                        }
+                    }
+                }
+                for name in crate::pipeline_chunk::after_unmet(&prepared.scope.after, &done) {
+                    let holder = rows.iter().find(|r| {
+                        r.issue_id == new.issue_id
+                            && r.worktree_path == new.worktree_path
+                            && r.chunk_path.as_deref().is_some_and(|p| {
+                                std::path::Path::new(p).file_stem().and_then(|s| s.to_str())
+                                    == Some(name.as_str())
+                            })
+                    });
+                    reasons.push(match holder {
+                        Some(r) => format!(
+                            "after {name} is not done (row {}: {})",
+                            r.id,
+                            r.status.as_str()
+                        ),
+                        None => format!("after {name} is not done (no dispatch row for it)"),
+                    });
+                }
+                if !reasons.is_empty() {
+                    return Ok(Err(DispatchAdmissionDecision::ScopeRefused(format!(
+                        "chunk scope gate refused {}:\n  - {}",
+                        prepared.path,
+                        reasons.join("\n  - ")
+                    ))));
+                }
+            }
+            let decision = decide_allowing_duplicate(&rows, &req, limit, allow_duplicate.is_some());
+            if !decision.granted() {
+                return Ok(Err(DispatchAdmissionDecision::Claim(decision)));
+            }
+            let id = self.put_agent_dispatch(new)?;
+            // The override's audit trail is written INSIDE the transaction,
+            // so an authorized duplicate and the record of who authorized it
+            // commit together. A duplicate row with no note would be
+            // indistinguishable from a runaway one — exactly the ambiguity
+            // this whole change exists to remove — so it must not be
+            // best-effort.
+            if let Some(why) = allow_duplicate {
+                self.append_dispatch_note(
+                    id,
+                    &format!("duplicate dispatch explicitly authorized: {why}"),
+                )?;
+            }
+            if let Some(why) = allow_scope {
+                self.append_dispatch_note(
+                    id,
+                    &format!("chunk scope override explicitly authorized: {why}"),
+                )?;
+            }
+            Ok(Ok(id))
+        })();
         match &result {
             Ok(Ok(_)) => conn.execute_batch("COMMIT")?,
             // Nothing was written on a refusal, but the transaction still has to
