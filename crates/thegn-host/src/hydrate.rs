@@ -1145,6 +1145,11 @@ pub(crate) fn row_is_git_listed(
 
 /// Worktrees registered in the DB, ready for the sidebar's cross-workspace
 /// rows: one entry per registry row whose dir still exists (or is remote).
+///
+/// Only the tests want the rows without the branch snapshot; production takes
+/// both from [`db_worktree_list_with_snapshot`] so one git observation serves
+/// the display and the decision paths alike.
+#[cfg(test)]
 pub(crate) fn db_worktree_list(
     db: &thegn_core::db::Db,
     cfg: &thegn_core::config::Config,
@@ -1529,7 +1534,7 @@ fn collect_sidebar_status(
                 status.pr_numbers.insert(wt.worktree.clone(), num);
             }
         }
-        if !observed_branch.is_empty() {
+        if let Some(observed_branch) = observed_branch.filter(|branch| !branch.is_empty()) {
             status
                 .branches
                 .insert(wt.worktree.clone(), observed_branch.to_string());

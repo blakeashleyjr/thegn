@@ -585,10 +585,23 @@ fn rm(cfg: &Config, target: &str, delete_branch: bool, force: bool) -> Result<()
             }
         }
     }
+    // Join once per repo root, not once per row: `join_snapshot` canonicalizes
+    // every path in the snapshot, so calling it per row is quadratic in
+    // (rows x worktrees) filesystem lookups.
+    let joined: std::collections::HashMap<&str, _> = snapshots
+        .iter()
+        .map(|(root, snapshot)| {
+            (
+                *root,
+                crate::worktree_snapshot::join_snapshot(&rows, snapshot),
+            )
+        })
+        .collect();
     let live_branch = |row: &thegn_core::models::WorktreeRow| {
-        snapshots
+        joined
             .get(row.repo_root.as_str())
-            .and_then(|snapshot| crate::worktree_snapshot::branch_for_path(row, snapshot))
+            .and_then(|observations| observations.get(&row.worktree))
+            .and_then(|observation| observation.branch().map(str::to_owned))
     };
     let matches: Vec<_> = path_match.map(|row| vec![row]).unwrap_or_else(|| {
         rows.iter()

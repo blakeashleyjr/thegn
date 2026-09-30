@@ -46,12 +46,9 @@ pub(crate) fn resolve(
 
 /// Resolve `tools.run` exclusively through a fresh trusted `[[tools]]` entry.
 /// An agent or bare harness with the same name is intentionally invisible.
-pub(crate) fn resolve_tool(
-    cfg: &Config,
-    db: &Db,
-    worktree: &str,
-    name: &str,
-) -> Result<LaunchSpec> {
+/// Takes no `Db`: the branch is now read from git, not the registry, so the
+/// resolver has no reason to touch the database at all.
+pub(crate) fn resolve_tool(cfg: &Config, worktree: &str, name: &str) -> Result<LaunchSpec> {
     let command = configured_tool_command(cfg, name)?;
     let branch = crate::worktree_snapshot::current_branch(std::path::Path::new(worktree));
     crate::agent::launch_spec_full(
