@@ -213,6 +213,13 @@ mod tests {
         assert_eq!(BranchObservation::Unborn.display_branch("cached"), None);
     }
 
+    // `Command::status` is a blocking child wait, disallowed so it can never
+    // reach the render/input loop. A `#[cfg(test)]` fixture building a throwaway
+    // repo is the sanctioned off-loop case.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test fixture: blocking git in a temp repo, never on the event loop"
+    )]
     #[test]
     fn external_checkout_reconciles_against_git_worktree_list() {
         use std::process::Command;
