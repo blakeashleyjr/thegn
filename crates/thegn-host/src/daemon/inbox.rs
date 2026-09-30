@@ -103,6 +103,7 @@ pub fn spawn(
         // Not an HTTP server: the inbox dispatches in-process, so there is no
         // browser origin to allow (same as the other non-HTTP ControlStates).
         cors_origins: Vec::new(),
+        event_streams: Default::default(),
     };
 
     let (raw_tx, raw_rx) = mpsc::channel::<String>(RAW_BUFFER);

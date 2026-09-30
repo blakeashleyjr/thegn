@@ -2341,6 +2341,7 @@ mod tests {
                 require_approval: false,
                 server_label: "test thegn".into(),
                 cors_origins: Vec::new(),
+                event_streams: Default::default(),
             };
             let app = thegn_svc::control::http::router(state);
             let server = tokio::spawn(async move { axum::serve(listener, app).await });
@@ -3179,6 +3180,7 @@ mod tests {
             require_approval: false,
             server_label: "test thegn".into(),
             cors_origins: Vec::new(),
+            event_streams: Default::default(),
         };
         let app = thegn_svc::control::http::router(state);
         let server = tokio::spawn(async move {

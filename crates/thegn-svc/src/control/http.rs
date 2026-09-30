@@ -22,6 +22,7 @@ use base64::Engine as _;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use thegn_core::control::{ScopeSet, TokenKind, Verb, required_scope};
@@ -55,6 +56,59 @@ pub struct ControlState {
     /// from. Empty = no cross-origin access (the default). Applied as a CORS
     /// layer on the TCP listener only.
     pub cors_origins: Vec<String>,
+    /// Per-listener WebSocket event-stream admission and lifecycle counters.
+    pub event_streams: EventStreamMetrics,
+}
+
+/// Test-visible lifecycle counters shared by clones of one control listener.
+#[derive(Clone, Default)]
+pub struct EventStreamMetrics(Arc<EventStreamCounts>);
+
+#[derive(Default)]
+struct EventStreamCounts {
+    active: AtomicUsize,
+    rejected: AtomicUsize,
+}
+
+impl EventStreamMetrics {
+    pub fn active(&self) -> usize {
+        self.0.active.load(Ordering::Relaxed)
+    }
+
+    pub fn rejected(&self) -> usize {
+        self.0.rejected.load(Ordering::Relaxed)
+    }
+
+    fn try_admit(&self) -> Option<EventStreamGuard> {
+        let mut active = self.0.active.load(Ordering::Relaxed);
+        loop {
+            if active >= EVENT_STREAM_CONNECTION_CAP {
+                self.0.rejected.fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
+            match self.0.active.compare_exchange_weak(
+                active,
+                active + 1,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(EventStreamGuard(self.clone())),
+                Err(observed) => active = observed,
+            }
+        }
+    }
+}
+
+// 128 concurrent feeds leaves ample room for local monitoring clients while
+// bounding per-connection sockets, tasks, and broadcast receivers on a listener.
+const EVENT_STREAM_CONNECTION_CAP: usize = 128;
+
+struct EventStreamGuard(EventStreamMetrics);
+
+impl Drop for EventStreamGuard {
+    fn drop(&mut self) {
+        self.0.0.active.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 /// Authentication inputs extracted from transport-owned request extensions
@@ -1690,6 +1744,28 @@ pub(super) async fn events_ws(
 }
 
 async fn pump_events(mut socket: WebSocket, state: ControlState, ctx: AuthCtx, filter: FeedFilter) {
+    let Some(_connection) = state.event_streams.try_admit() else {
+        tracing::warn!(
+            target: "thegn::control::events",
+            pairing_id = %ctx.pairing_id,
+            active = state.event_streams.active(),
+            rejected = state.event_streams.rejected(),
+            "event stream rejected at connection cap"
+        );
+        let _ = socket
+            .send(Message::Close(Some(axum::extract::ws::CloseFrame {
+                code: axum::extract::ws::close_code::POLICY,
+                reason: "event stream connection limit reached".into(),
+            })))
+            .await;
+        return;
+    };
+    tracing::info!(
+        target: "thegn::control::events",
+        pairing_id = %ctx.pairing_id,
+        active = state.event_streams.active(),
+        "event stream admitted"
+    );
     // Register before the awaited hello write. Otherwise a slow/buffering
     // client can observe its hello yet lose an arbitrary interval of events
     // before the receiver exists. Hello still goes out first; any intervening
@@ -1704,32 +1780,38 @@ async fn pump_events(mut socket: WebSocket, state: ControlState, ctx: AuthCtx, f
         return;
     }
     loop {
-        match rx.recv().await {
-            Ok(frame) => {
-                if filter.matches(&frame)
-                    && socket
-                        .send(Message::Binary(frame.encode().into()))
-                        .await
-                        .is_err()
-                {
-                    return;
+        tokio::select! {
+            incoming = socket.next() => match incoming {
+                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => return,
+                Some(Ok(Message::Ping(payload))) => {
+                    if socket.send(Message::Pong(payload)).await.is_err() {
+                        return;
+                    }
                 }
-            }
-            // Slow consumer skipped `n` events — that's fine for a monitor
-            // feed (pane bytes ride attach streams, not this one).
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
-                if filter.signal_lag {
-                    let frame = EventFrame::Lagged { missed };
-                    if socket
-                        .send(Message::Binary(frame.encode().into()))
-                        .await
-                        .is_err()
+                // This endpoint is strictly read-only. Data frames are
+                // consumed only to keep the peer's receive side drained.
+                Some(Ok(Message::Text(_) | Message::Binary(_) | Message::Pong(_))) => {}
+            },
+            received = rx.recv() => match received {
+                Ok(frame) => {
+                    if filter.matches(&frame)
+                        && socket.send(Message::Binary(frame.encode().into())).await.is_err()
                     {
                         return;
                     }
                 }
+                // The bounded broadcast drops lagging receivers without
+                // blocking publication to other listeners or consumers.
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
+                    if filter.signal_lag {
+                        let frame = EventFrame::Lagged { missed };
+                        if socket.send(Message::Binary(frame.encode().into())).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
             }
-            Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
         }
     }
 }
