@@ -904,24 +904,11 @@ async fn gather_issue_facts(
     })
 }
 
-/// The branch a worktree is on: the registered worktree row's branch, else
-/// `git rev-parse --abbrev-ref HEAD` — the same two-tier lookup a
-/// daemon-launched agent uses. Empty is acceptable (a detached or unborn
-/// HEAD). Factored out of `open_stage` so `--resume-work` resolves the
-/// branch identically.
-fn resolve_branch(db: &Db, wt: &str) -> String {
-    let registered = db
-        .worktrees()
-        .ok()
-        .and_then(|rows| {
-            rows.into_iter()
-                .find(|r| r.worktree == wt)
-                .map(|r| r.branch)
-        })
-        .filter(|b| !b.is_empty());
-    registered.unwrap_or_else(|| {
-        git_out(Path::new(wt), &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap_or_default()
-    })
+/// The live branch a worktree is on. Empty is acceptable (detached, unborn,
+/// or unavailable HEAD); the creation-time registry branch is never context.
+/// Factored out of `open_stage` so `--resume-work` resolves identically.
+fn resolve_branch(wt: &str) -> String {
+    crate::worktree_snapshot::current_branch(Path::new(wt)).unwrap_or_default()
 }
 
 /// The `--stage` dispatch: the Lead's hand-rolled loop, performed in one call
@@ -948,9 +935,9 @@ async fn open_stage(cfg: &Config, client: &ControlClient, d: StageDispatch<'_>) 
         .to_string_lossy()
         .into_owned();
     let db = Db::open()?;
-    // 3. Branch: the registered worktree row, else `git rev-parse` — the same
-    //    two-tier lookup a daemon-launched agent uses. Empty is acceptable.
-    let branch = resolve_branch(&db, &wt);
+    // 3. Branch from live Git HEAD. Empty is acceptable for detached,
+    //    unborn, or unavailable HEAD.
+    let branch = resolve_branch(&wt);
     // 4. Issue facts. The tracker is consulted only when the prompt reads it:
     //    `{issue_number}` is local (the id with its provider prefix stripped),
     //    the other three need the daemon's tracker door. When the template
@@ -1444,7 +1431,7 @@ async fn resume_work(
     let wt = crate::cmd::resolve_worktree(Some(row.worktree_path.clone()))
         .to_string_lossy()
         .into_owned();
-    let branch = resolve_branch(&db, &wt);
+    let branch = resolve_branch(&wt);
     // 4. Gather everything that belongs to the source attempt before claiming
     //    the finisher: its artifact state and final screen are recovery
     //    context, never the new row's completion target.

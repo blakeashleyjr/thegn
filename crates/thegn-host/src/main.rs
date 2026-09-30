@@ -289,6 +289,7 @@ mod workspace_create;
 mod workspace_picker;
 mod workspace_pool;
 mod worktree_lifecycle;
+mod worktree_snapshot;
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;

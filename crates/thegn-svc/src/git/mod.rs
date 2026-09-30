@@ -79,7 +79,16 @@ pub struct Branch {
 #[derive(Debug, Clone)]
 pub struct WorktreeInfo {
     pub path: String,
-    pub branch: Option<String>,
+    pub head: WorktreeHead,
+}
+
+/// Git's observed HEAD state for a linked worktree. `Unavailable` is used by
+/// consumers when no matching worktree-list entry exists or the batch failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorktreeHead {
+    Branch(String),
+    Detached,
+    Unborn,
 }
 
 /// What kind of multi-step operation the repo is in the middle of.
@@ -1326,12 +1335,16 @@ impl GitBackend for CliGit {
                 }
                 cur = Some(WorktreeInfo {
                     path: p.to_string(),
-                    branch: None,
+                    head: WorktreeHead::Unborn,
                 });
             } else if let Some(b) = line.strip_prefix("branch ")
                 && let Some(w) = cur.as_mut()
             {
-                w.branch = Some(b.trim_start_matches("refs/heads/").to_string());
+                w.head = WorktreeHead::Branch(b.trim_start_matches("refs/heads/").to_string());
+            } else if line == "detached"
+                && let Some(w) = cur.as_mut()
+            {
+                w.head = WorktreeHead::Detached;
             }
         }
         if let Some(w) = cur.take() {
@@ -1360,7 +1373,10 @@ impl GitBackend for CliGit {
                                 .map(|c| c == want)
                                 .unwrap_or_else(|_| Path::new(&w.path) == path)
                         })
-                        .and_then(|w| w.branch)
+                        .and_then(|w| match w.head {
+                            WorktreeHead::Branch(branch) => Some(branch),
+                            WorktreeHead::Detached | WorktreeHead::Unborn => None,
+                        })
                 })
             })
             .flatten();

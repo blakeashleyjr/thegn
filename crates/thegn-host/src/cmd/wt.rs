@@ -550,20 +550,65 @@ fn rm(cfg: &Config, target: &str, delete_branch: bool, force: bool) -> Result<()
     let db = Db::open()?;
     let rows = db.worktrees()?;
 
-    // Resolve by exact path first, then unique branch name.
+    // Resolve by exact path first, then by Git's current worktree snapshot.
+    // `WorktreeRow.branch` is creation metadata and must not select a target.
     let target_path = std::fs::canonicalize(target)
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| target.to_string());
-    let matches: Vec<_> = rows
-        .iter()
-        .filter(|w| w.worktree == target_path || w.branch == target)
-        .collect();
+    let path_match = rows.iter().find(|row| {
+        std::fs::canonicalize(&row.worktree)
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| row.worktree.clone())
+            == target_path
+    });
+    let mut snapshots = std::collections::HashMap::new();
+    let relevant_roots = path_match
+        .map(|row| vec![row.repo_root.as_str()])
+        .unwrap_or_else(|| rows.iter().map(|row| row.repo_root.as_str()).collect());
+    for root in relevant_roots
+        .into_iter()
+        .filter(|r| !r.is_empty())
+        .collect::<std::collections::HashSet<_>>()
+    {
+        let snapshot = thegn_svc::git::GitBackend::worktrees(
+            &*crate::git_handle::get(),
+            std::path::Path::new(root),
+        );
+        match snapshot {
+            Ok(snapshot) => {
+                snapshots.insert(root, snapshot);
+            }
+            Err(_) if path_match.is_some() && !delete_branch => {}
+            Err(error) => {
+                anyhow::bail!("cannot resolve live worktree branches for {root}: {error}")
+            }
+        }
+    }
+    let live_branch = |row: &thegn_core::models::WorktreeRow| {
+        snapshots
+            .get(row.repo_root.as_str())
+            .and_then(|snapshot| crate::worktree_snapshot::branch_for_path(row, snapshot))
+    };
+    let matches: Vec<_> = path_match.map(|row| vec![row]).unwrap_or_else(|| {
+        rows.iter()
+            .filter(|row| live_branch(row).as_deref() == Some(target))
+            .collect()
+    });
     let (path, branch, repo_root) = match matches.as_slice() {
-        [w] => (
-            w.worktree.clone(),
-            w.branch.clone(),
-            (!w.repo_root.is_empty()).then(|| w.repo_root.clone()),
-        ),
+        [w] => {
+            let branch = live_branch(w);
+            if delete_branch && branch.is_none() {
+                anyhow::bail!(
+                    "cannot delete branch for {target_path}: Git did not provide a live branch"
+                );
+            }
+            (
+                w.worktree.clone(),
+                branch.unwrap_or_default(),
+                (!w.repo_root.is_empty()).then(|| w.repo_root.clone()),
+            )
+        }
         [] => {
             // Not registered — accept a live linked worktree by path (the DB
             // is a cache; git is the source of truth).

@@ -1149,6 +1149,16 @@ pub(crate) fn db_worktree_list(
     db: &thegn_core::db::Db,
     cfg: &thegn_core::config::Config,
 ) -> Vec<crate::sidebar::DbWorktree> {
+    db_worktree_list_with_snapshot(db, cfg).0
+}
+
+fn db_worktree_list_with_snapshot(
+    db: &thegn_core::db::Db,
+    cfg: &thegn_core::config::Config,
+) -> (
+    Vec<crate::sidebar::DbWorktree>,
+    std::collections::HashMap<String, crate::worktree_snapshot::BranchObservation>,
+) {
     let mut out = Vec::new();
     let mut ambient_cache = std::collections::HashMap::new();
     let mut git_cache = std::collections::HashMap::new();
@@ -1164,6 +1174,8 @@ pub(crate) fn db_worktree_list(
             Vec::new()
         }
     };
+    let branch_observations =
+        crate::worktree_snapshot::observe_rows(&*crate::git_handle::get(), &rows);
     // THE-516: legacy slugged tab names can alias distinct worktrees
     // (`feat/a` and `feat-a` both registered as `app/feat-a`). Such a tab is
     // quarantined: neither claimant is surfaced for tab-keyed routing, and the
@@ -1236,9 +1248,17 @@ pub(crate) fn db_worktree_list(
                 continue;
             }
         }
-        let Some((slug, branch)) = crate::sidebar::split_tab(&w.tab_name) else {
+        let Some((slug, registry_branch)) = crate::sidebar::split_tab(&w.tab_name) else {
             continue;
         };
+        // The tab name remains stable identity. Its branch projection follows
+        // Git when available, with registry metadata used only as a display
+        // fallback if the snapshot could not be read.
+        let branch = branch_observations
+            .get(&w.worktree)
+            .and_then(|observation| observation.display_branch(&registry_branch))
+            .unwrap_or_default()
+            .to_string();
         // Degraded pin: the worktree is pinned to a managed-PROVIDER env but its
         // content resolved local (empty `location` — never provisioned, or healed
         // back after a failover). The `«env»` badge then reads `«env ✗»` so the
@@ -1275,7 +1295,7 @@ pub(crate) fn db_worktree_list(
             env_degraded,
         });
     }
-    out
+    (out, branch_observations)
 }
 
 /// The reason string stamped on registry rows whose legacy tab name is
@@ -1315,6 +1335,10 @@ fn collect_sidebar_status(
     // idle bridges so sandboxes suspend) and gates remote git-glyph scans so a
     // suspended sandbox is never woken just to refresh the sidebar.
     lifecycle: &thegn_core::config::LifecycleConfig,
+    branch_observations: &std::collections::HashMap<
+        String,
+        crate::worktree_snapshot::BranchObservation,
+    >,
 ) -> crate::sidebar::SidebarStatus {
     use thegn_core::remote::GitLoc;
     let mut status = crate::sidebar::SidebarStatus::default();
@@ -1486,21 +1510,29 @@ fn collect_sidebar_status(
         if !wt.agent.is_empty() && app_cfg.tool_command(&wt.agent).is_none() {
             status.agent.insert(wt.worktree.clone(), wt.agent.clone());
         }
-        if !wt.branch.is_empty()
+        let observed_branch = branch_observations
+            .get(&wt.worktree)
+            .and_then(|observation| observation.display_branch(&wt.branch));
+        if let Some(observed_branch) = observed_branch.filter(|branch| !branch.is_empty())
             && !wt.repo_root.is_empty()
             && let Some((counts, numbers)) = pr_maps
                 .entry(wt.repo_root.clone())
                 .or_insert_with(|| scoped_open_pr_maps(db, &wt.repo_root))
                 .as_ref()
-            && let Some(&n) = counts.get(&wt.branch)
+            && let Some(&n) = counts.get(observed_branch)
             && n > 0
         {
             status.pr_counts.insert(wt.worktree.clone(), n);
             // The compact `⬡N` chip: the branch's single open PR number
             // (ambiguous multi-PR branches stay count-only).
-            if let Some(&num) = numbers.get(&wt.branch) {
+            if let Some(&num) = numbers.get(observed_branch) {
                 status.pr_numbers.insert(wt.worktree.clone(), num);
             }
+        }
+        if !observed_branch.is_empty() {
+            status
+                .branches
+                .insert(wt.worktree.clone(), observed_branch.to_string());
         }
     }
 
@@ -1751,6 +1783,27 @@ fn collect_sidebar_status(
         &mut status.branches,
         all_wt_paths.iter().cloned(),
     );
+    // The batched worktree-list snapshot covers dormant and gated rows too.
+    // It wins over cached glyph branches; only an unavailable snapshot may use
+    // the creation-time value as a display fallback.
+    for wt in &db_worktrees {
+        match branch_observations.get(&wt.worktree) {
+            Some(crate::worktree_snapshot::BranchObservation::Branch(branch)) => {
+                status.branches.insert(wt.worktree.clone(), branch.clone());
+            }
+            Some(crate::worktree_snapshot::BranchObservation::Detached)
+            | Some(crate::worktree_snapshot::BranchObservation::Unborn) => {
+                status.branches.remove(&wt.worktree);
+            }
+            Some(crate::worktree_snapshot::BranchObservation::Unavailable) | None => {
+                if !wt.branch.is_empty() {
+                    status
+                        .branches
+                        .insert(wt.worktree.clone(), wt.branch.clone());
+                }
+            }
+        }
+    }
 
     // Attention scores + hysteresis-stable ranks (pure DB/snapshot reads; the
     // branching lives in core). After the git pass so `dirty` is fresh.
@@ -2194,7 +2247,7 @@ pub(crate) fn build_model(
 
     let sidebar_t0 = crate::perf::enabled().then(std::time::Instant::now);
     let mut sidebar_workspaces = workspace_list(session, Some(db));
-    let sidebar_db_worktrees = db_worktree_list(db, &app_cfg);
+    let (sidebar_db_worktrees, branch_observations) = db_worktree_list_with_snapshot(db, &app_cfg);
     // Recover lost repo paths before querying folders: folder rows are keyed by
     // the same repo root and otherwise remain hidden for this pass.
     heal_workspace_paths(&mut sidebar_workspaces, &sidebar_db_worktrees, session);
@@ -2226,6 +2279,7 @@ pub(crate) fn build_model(
         &alert_kinds,
         &counted_kinds,
         &app_cfg.lifecycle,
+        &branch_observations,
     );
     let sidebar_us = sidebar_t0.map(|t| t.elapsed().as_micros() as u64);
     // Self-throttled housekeeping (network/DB on own threads): VPS leak reaper
@@ -2870,6 +2924,31 @@ pub(crate) fn build_panel(
     if want_branches {
         let badges = panel.open_prs.clone();
         let head_branch = panel.branch.clone();
+        let current_path = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+        let holders: std::collections::HashMap<String, Vec<String>> = repo_root
+            .as_deref()
+            .and_then(|root| {
+                thegn_svc::git::GitBackend::worktrees(&*crate::git_handle::get(), root).ok()
+            })
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|wt| {
+                let branch = match wt.head {
+                    thegn_svc::git::WorktreeHead::Branch(branch) => branch,
+                    thegn_svc::git::WorktreeHead::Detached
+                    | thegn_svc::git::WorktreeHead::Unborn => return None,
+                };
+                let path = std::path::PathBuf::from(&wt.path);
+                let path = std::fs::canonicalize(&path).unwrap_or(path);
+                (path != current_path).then_some((branch, wt.path))
+            })
+            .fold(
+                std::collections::HashMap::new(),
+                |mut map, (branch, path)| {
+                    map.entry(branch).or_insert_with(Vec::new).push(path);
+                    map
+                },
+            );
         panel.branches =
             branches_raw
                 .into_iter()
@@ -2887,6 +2966,7 @@ pub(crate) fn build_panel(
                         // cached list is repo-global and its `is_head` reflects
                         // whichever worktree last fetched it.
                         is_head: b.name == head_branch,
+                        held_by: holders.get(&b.name).cloned().unwrap_or_default(),
                         name: b.name,
                         upstream: b.upstream,
                         ahead: b.ahead,
@@ -4062,13 +4142,20 @@ fn maybe_clean_merged_worktrees_with_state(
     let Ok(rows) = db.worktrees() else {
         return;
     };
+    let live_branches = crate::worktree_snapshot::observe_rows(&*crate::git_handle::get(), &rows);
     let active = active.to_string_lossy();
     for row in rows {
-        if row.repo_root != repo_root || row.branch.is_empty() {
+        let Some(branch) = live_branches
+            .get(&row.worktree)
+            .and_then(crate::worktree_snapshot::BranchObservation::branch)
+        else {
+            continue;
+        };
+        if row.repo_root != repo_root || branch.is_empty() {
             continue;
         }
         // Dropped out of the open set since last round?
-        if !prev_open.contains(&row.branch) || open_now.contains(row.branch.as_str()) {
+        if !prev_open.contains(branch) || open_now.contains(branch) {
             continue;
         }
         let path = std::path::PathBuf::from(&row.worktree);
@@ -4085,10 +4172,10 @@ fn maybe_clean_merged_worktrees_with_state(
         let Ok(target_scope) = thegn_core::forge::checkout::checkout_scope(&target_loc) else {
             continue;
         };
-        if !target_scope.origin.matches(source_repo) || target_scope.branch != row.branch {
+        if !target_scope.origin.matches(source_repo) || target_scope.branch != branch {
             continue;
         }
-        let state = resolve_state(&target_loc, &row.branch);
+        let state = resolve_state(&target_loc, branch);
         let (merged, should) = pr_clean_decision(state.as_deref(), cfg);
         if !should
             || thegn_core::forge::checkout::checkout_scope(&target_loc)
@@ -4108,13 +4195,7 @@ fn maybe_clean_merged_worktrees_with_state(
                 verb,
                 thegn_core::disk::human(reclaimed)
             );
-            let _ = crate::automation_events::emit(
-                db,
-                "disk_cleaned",
-                &row.branch,
-                &msg,
-                &row.worktree,
-            ); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+            let _ = crate::automation_events::emit(db, "disk_cleaned", branch, &msg, &row.worktree); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
         }
     }
 }

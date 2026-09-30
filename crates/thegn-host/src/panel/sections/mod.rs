@@ -1005,6 +1005,7 @@ mod spec {
         m.panel.branches = vec![crate::panel::BranchRow {
             name: "feat/views".into(),
             is_head: true,
+            held_by: vec![],
             upstream: Some("origin/feat/views".into()),
             ahead: 2,
             behind: 1,
