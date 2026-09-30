@@ -93,6 +93,10 @@ pub enum AdmissionLimit {
     Nesting,
     /// One source document exceeds [`MAX_SOURCE_DOCUMENT_BYTES`].
     DocumentBytes,
+    /// Local source documents together exceed their aggregate byte ceiling.
+    AggregateSourceBytes,
+    /// Cooperative parser deadline expired while admitting a source.
+    SourceDeadline,
     /// A plugin sent more messages than one run may.
     Messages,
     /// The process-wide record ceiling is in use by other fetches.
@@ -152,6 +156,10 @@ impl std::fmt::Display for AdmissionError {
             AdmissionLimit::LineBytes => "a calendar content line exceeds the size budget",
             AdmissionLimit::Nesting => "calendar components are nested too deeply",
             AdmissionLimit::DocumentBytes => "a calendar document exceeds the size budget",
+            AdmissionLimit::AggregateSourceBytes => {
+                "local calendar files exceed the aggregate source size budget"
+            }
+            AdmissionLimit::SourceDeadline => "calendar source exceeded its time budget",
             AdmissionLimit::Messages => "calendar plugin sent too many messages",
             AdmissionLimit::GlobalRecords | AdmissionLimit::GlobalBytes => {
                 "calendar sync budget is in use by other accounts; will retry"
