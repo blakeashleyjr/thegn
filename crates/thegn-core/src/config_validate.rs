@@ -407,6 +407,10 @@ pub(crate) fn typed_semantic_errors(cfg: &Config, mode: SemanticMode) -> Vec<Str
     // model must land on a harness with a model flag, env keys must be
     // exportable names.
     batch!(crate::agent_task::validate_agent_models(cfg));
+    // `[apps]` ids are a public cross-surface registry. Keep the diagnostic
+    // actionable here, where the typed config (including enable switches) is
+    // available.
+    batch!(cfg.apps.validate(cfg.observe.enabled));
     // Skill names and directory-list syntax are a config-boundary
     // concern. Directory existence/discovery stays at the host edge.
     batch!(cfg.skills.validate());
@@ -1462,6 +1466,61 @@ pre_create = [
         assert!(
             errs[0].contains("expected one of: string or table/object, got integer"),
             "{errs:#?}"
+        );
+    }
+
+    #[test]
+    fn app_tabs_are_schema_listed_and_unknown_ids_are_actionable() {
+        let schema = serde_json::to_value(schemars::schema_for!(Config)).unwrap();
+        let apps = &schema["definitions"]["AppsConfig"];
+        assert_eq!(
+            apps["properties"]["default_tab"]["enum"],
+            serde_json::json!(["work", "observe"])
+        );
+        assert_eq!(
+            apps["properties"]["tab_order"]["items"]["enum"],
+            serde_json::json!(["work", "observe"])
+        );
+
+        let errors = validate_str("[apps]\ntab_order = [\"work\", \"observe-2\"]\n");
+        assert!(
+            errors.iter().any(|error| {
+                error.contains("observe-2") && error.contains("known tabs are work, observe")
+            }),
+            "{errors:#?}"
+        );
+    }
+
+    #[test]
+    fn app_default_must_be_enabled_and_duplicate_order_is_deduplicated() {
+        let errors = validate_str("[apps]\ndefault_tab = \"observe\"\n");
+        assert!(
+            errors
+                .iter()
+                .any(|error| { error.contains("apps.default_tab") && error.contains("disabled") }),
+            "{errors:#?}"
+        );
+
+        let cfg = toml::from_str::<Config>(
+            "[observe]\nenabled = true\n[apps]\ndefault_tab = \"observe\"\ntab_order = [\"observe\", \"work\", \"observe\"]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.apps.effective_tab_order(cfg.observe.enabled),
+            ["observe", "work"]
+        );
+        assert!(validate_str(
+            "[observe]\nenabled = true\n[apps]\ndefault_tab = \"observe\"\ntab_order = [\"observe\", \"work\", \"observe\"]\n"
+        )
+        .is_empty());
+
+        // Mentioning a known but disabled app in the order is harmless; the
+        // app's own enable flag controls membership.
+        let disabled = toml::from_str::<Config>("[apps]\ntab_order = [\"observe\"]\n").unwrap();
+        assert!(validate_str("[apps]\ntab_order = [\"observe\"]\n").is_empty());
+        assert_eq!(
+            disabled.apps.effective_tab_order(disabled.observe.enabled),
+            ["work"]
         );
     }
 

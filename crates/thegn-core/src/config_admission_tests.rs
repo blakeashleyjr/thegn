@@ -415,7 +415,13 @@ fn captured_path_context_is_part_of_deterministic_admission_revision() {
 fn cli_schema_is_checked_before_lenient_override_deserialization() {
     let env = TestEnv::default();
     let host_snapshot = hosts();
-    let cases = [("picker=\"not-a-picker\"", ConfigAdmissionError::CliInvalid)];
+    let cases = [
+        ("picker=\"not-a-picker\"", ConfigAdmissionError::CliInvalid),
+        (
+            "apps.tab_order=[\"work\",\"observe-2\"]",
+            ConfigAdmissionError::CliInvalid,
+        ),
+    ];
     for (override_value, expected) in cases {
         let overrides = vec![override_value.to_string()];
         let result = admit(AdmissionInputs {
@@ -449,7 +455,7 @@ fn cli_schema_is_checked_before_lenient_override_deserialization() {
         Some(&"ctrl-x".to_string())
     );
 
-    let overrides = vec!["apps.tab_order=[\"work\",\"shell\"]".to_string()];
+    let overrides = vec!["apps.tab_order=[\"work\",\"observe\"]".to_string()];
     let admitted = admit(AdmissionInputs {
         defaults: Config::default(),
         base: SourceInput::bytes("base", false, b"branch_prefix = \"safe/\"\n"),
@@ -462,7 +468,7 @@ fn cli_schema_is_checked_before_lenient_override_deserialization() {
     .expect("valid array override");
     assert_eq!(
         admitted.config().apps.tab_order,
-        vec!["work".to_string(), "shell".to_string()]
+        vec!["work".to_string(), "observe".to_string()]
     );
 }
 
