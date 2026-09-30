@@ -567,7 +567,7 @@
     },
     {
       "change": "bound-duration-and-refresh-policy",
-      "lifecycle": "delivered-awaiting-archive",
+      "lifecycle": "archived",
       "disposition": "alpha-delivery",
       "owners": [
         {
@@ -580,11 +580,11 @@
         }
       ],
       "summary": "Bound duration and cadence conversion while retaining security policy and quarantining unknown destructive ages.",
-      "delivered_at": "2026-09-14"
+      "archive_path": "openspec/changes/archive/2026-09-30-bound-duration-and-refresh-policy/"
     },
     {
       "change": "bound-public-share-output",
-      "lifecycle": "delivered-awaiting-archive",
+      "lifecycle": "archived",
       "disposition": "residual-split",
       "owners": [
         {
@@ -593,7 +593,7 @@
         }
       ],
       "summary": "Bounded public-share output and redacted diagnostics passed scoped strict lint and 35 isolated share tests. This subtask is delivered; full THE-325 credential isolation remains open.",
-      "delivered_at": "2026-09-15"
+      "archive_path": "openspec/changes/archive/2026-09-30-bound-public-share-output/"
     },
     {
       "change": "bound-shared-framed-protocols",
@@ -609,7 +609,7 @@
     },
     {
       "change": "cache-demanded-devcontainer-probes",
-      "lifecycle": "delivered-awaiting-archive",
+      "lifecycle": "archived",
       "disposition": "verification-gated",
       "owners": [
         {
@@ -618,11 +618,11 @@
         }
       ],
       "summary": "Reviewed demand-gated capability probes and bounded coherent cache landed locally at ea6c2635. Nineteen exact native selectors, qualified 1/8/32-worktree probe-count evidence, strict lint and source gates passed; platform and timing limits are recorded in the audit.",
-      "delivered_at": "2026-09-15"
+      "archive_path": "openspec/changes/archive/2026-09-30-cache-demanded-devcontainer-probes/"
     },
     {
       "change": "centralize-tracker-http-policy",
-      "lifecycle": "delivered-awaiting-archive",
+      "lifecycle": "archived",
       "disposition": "alpha-delivery",
       "owners": [
         {
@@ -631,7 +631,7 @@
         }
       ],
       "summary": "Centralize authenticated Linear, Jira, and Kaneo HTTP policy with shared operation budgets, origin pinning, bounded bodies, and redirect/encoding refusal. Reviewed and verified with 107 distinct native tests and a 24-case redirect supplement; source/artifact mapping and limitations are in the maintenance08 audit.",
-      "delivered_at": "2026-09-15"
+      "archive_path": "openspec/changes/archive/2026-09-30-centralize-tracker-http-policy/"
     },
     {
       "change": "complete-devcontainer-support",
@@ -731,7 +731,7 @@
     },
     {
       "change": "fix-static-cli-startup",
-      "lifecycle": "delivered-awaiting-archive",
+      "lifecycle": "archived",
       "disposition": "alpha-delivery",
       "owners": [
         {
@@ -740,11 +740,11 @@
         }
       ],
       "summary": "Static CLI startup boundary delivered on local main c0d3d860a22db0a7fddafb3d338bf40b25248ade with scoped native/counterfactual and strict lint/source evidence. Checked admission/source workers remain separate.",
-      "delivered_at": "2026-09-14"
+      "archive_path": "openspec/changes/archive/2026-09-30-fix-static-cli-startup/"
     },
     {
       "change": "harden-live-diagnostics-and-forge",
-      "lifecycle": "delivered-awaiting-archive",
+      "lifecycle": "archived",
       "disposition": "alpha-delivery",
       "owners": [
         {
@@ -777,7 +777,7 @@
         }
       ],
       "summary": "Preserve input privacy, connectivity and host-correct bounded forge behavior across reloads.",
-      "delivered_at": "2026-09-14"
+      "archive_path": "openspec/changes/archive/2026-09-30-harden-live-diagnostics-and-forge/"
     },
     {
       "change": "harden-live-upgrades",
@@ -793,7 +793,7 @@
     },
     {
       "change": "isolate-maintenance-regression-fixtures",
-      "lifecycle": "delivered-awaiting-archive",
+      "lifecycle": "archived",
       "disposition": "alpha-delivery",
       "owners": [
         {
@@ -806,7 +806,7 @@
         }
       ],
       "summary": "Keep watchdog and Git regression work in owned private fixtures with explicit backend, branch and identity inputs.",
-      "delivered_at": "2026-09-14"
+      "archive_path": "openspec/changes/archive/2026-09-30-isolate-maintenance-regression-fixtures/"
     },
     {
       "change": "make-sidebar-mode-visible",
@@ -925,7 +925,7 @@
     },
     {
       "change": "preserve-winning-host-environment",
-      "lifecycle": "delivered-awaiting-archive",
+      "lifecycle": "archived",
       "disposition": "alpha-delivery",
       "owners": [
         {
@@ -934,12 +934,11 @@
         }
       ],
       "summary": "Winning-host environment synthesis delivered on local main c0d3d860a22db0a7fddafb3d338bf40b25248ade with native precedence/compatibility, rebuilt counterfactual and strict lint/source evidence. Strict capture and launch composition remain separate.",
-      "delivered_at": "2026-09-14"
+      "archive_path": "openspec/changes/archive/2026-09-30-preserve-winning-host-environment/"
     },
     {
       "change": "reduce-process-monitor-idle-work",
-      "lifecycle": "delivered-awaiting-archive",
-      "delivered_at": "2026-09-16",
+      "lifecycle": "archived",
       "disposition": "alpha-delivery",
       "owners": [
         {
@@ -955,7 +954,8 @@
           "project": "Workspace Product & Observability"
         }
       ],
-      "summary": "Existing parked process sampler, relevant monitor invalidation cache, stable Processes columns and render allocation repair; current-source native/UI and measured-cost evidence recorded with explicit tail and inherited-warning qualifications; native queue receipt supplies final gate/landing status."
+      "summary": "Existing parked process sampler, relevant monitor invalidation cache, stable Processes columns and render allocation repair; current-source native/UI and measured-cost evidence recorded with explicit tail and inherited-warning qualifications; native queue receipt supplies final gate/landing status.",
+      "archive_path": "openspec/changes/archive/2026-09-30-reduce-process-monitor-idle-work/"
     },
     {
       "change": "repair-kitty-stream-parser",
@@ -1027,7 +1027,7 @@
     },
     {
       "change": "require-canonical-merge-history",
-      "lifecycle": "delivered-awaiting-archive",
+      "lifecycle": "archived",
       "disposition": "alpha-delivery",
       "owners": [
         {
@@ -1036,7 +1036,7 @@
         }
       ],
       "summary": "Require verified local canonical history across fold evidence and automatic cleanup; source review and focused/native gates remain pending.",
-      "delivered_at": "2026-09-14"
+      "archive_path": "openspec/changes/archive/2026-09-30-require-canonical-merge-history/"
     },
     {
       "change": "resolve-build-git-identity",
@@ -1064,7 +1064,7 @@
     },
     {
       "change": "retain-devcontainer-startup-custody",
-      "lifecycle": "delivered-awaiting-archive",
+      "lifecycle": "archived",
       "disposition": "alpha-delivery",
       "owners": [
         {
@@ -1073,7 +1073,7 @@
         }
       ],
       "summary": "Reviewed bounded startup capture and retained child/session custody landed locally at491320b7; all23 exact positive selectors and three intended counterfactual failures verified, strict lint/source gates passed. Controller-lifetime and platform limits remain explicit in the audit.",
-      "delivered_at": "2026-09-15"
+      "archive_path": "openspec/changes/archive/2026-09-30-retain-devcontainer-startup-custody/"
     },
     {
       "change": "rework-shell-completions",
@@ -1141,7 +1141,7 @@
     },
     {
       "change": "secure-merge-bundle-custody",
-      "lifecycle": "delivered-awaiting-archive",
+      "lifecycle": "archived",
       "disposition": "alpha-delivery",
       "owners": [
         {
@@ -1150,7 +1150,7 @@
         }
       ],
       "summary": "Private exclusive merge-bundle custody verified by strict lint, focused Linux native tests, and five two-process hostile-entry cases. Windows source reviewed; native proof unavailable. See maintenance07 audit for observation limits and sibling residuals.",
-      "delivered_at": "2026-09-15"
+      "archive_path": "openspec/changes/archive/2026-09-30-secure-merge-bundle-custody/"
     },
     {
       "change": "select-before-snapshot",
@@ -1166,7 +1166,7 @@
     },
     {
       "change": "serialize-validate-frp-configuration",
-      "lifecycle": "delivered-awaiting-archive",
+      "lifecycle": "archived",
       "disposition": "alpha-delivery",
       "owners": [
         {
@@ -1175,7 +1175,7 @@
         }
       ],
       "summary": "Typed FRP serialization, validation before secret resolution, strict reparse and equality verified by 16 focused FRP tests plus strict all-target lint. Credential transport and filesystem custody remain THE-325/THE-328.",
-      "delivered_at": "2026-09-15"
+      "archive_path": "openspec/changes/archive/2026-09-30-serialize-validate-frp-configuration/"
     },
     {
       "change": "stabilize-process-monitor-refresh",
@@ -1195,7 +1195,7 @@
     },
     {
       "change": "strict-host-definition-snapshots",
-      "lifecycle": "delivered-awaiting-archive",
+      "lifecycle": "archived",
       "disposition": "residual-split",
       "owners": [
         {
@@ -1204,11 +1204,11 @@
         }
       ],
       "summary": "THE-602 strict persisted capture and bounded checked composition delivered on local main a0f97308 after root and independent review. All 15 changed source/schema/env files match full05 tested source; original failures and corrected native/strict-lint evidence retained. THE-592 launch integration and THE-603/THE-604 remain separate.",
-      "delivered_at": "2026-09-15"
+      "archive_path": "openspec/changes/archive/2026-09-30-strict-host-definition-snapshots/"
     },
     {
       "change": "strict-state-host-capture",
-      "lifecycle": "delivered-awaiting-archive",
+      "lifecycle": "archived",
       "disposition": "alpha-delivery",
       "owners": [
         {
@@ -1217,11 +1217,11 @@
         }
       ],
       "summary": "THE-603 additive strict WAL capture and Linux stable-namespace admission delivered on local main c6191b2a after root and independent review, source-bound positive/strict-lint evidence and two isolated counterfactual failures. THE-592/THE-607 integration remains separate.",
-      "delivered_at": "2026-09-15"
+      "archive_path": "openspec/changes/archive/2026-09-30-strict-state-host-capture/"
     },
     {
       "change": "validate-sandbox-volume-sources",
-      "lifecycle": "delivered-awaiting-archive",
+      "lifecycle": "archived",
       "disposition": "alpha-delivery",
       "owners": [
         {
@@ -1230,11 +1230,11 @@
         }
       ],
       "summary": "Named-volume source grammar and typed pre-resolution/final-composed refusal gates verified by strict all-target lint and focused Linux native tests. See maintenance07 audit for exact selectors and Linux-only scope.",
-      "delivered_at": "2026-09-15"
+      "archive_path": "openspec/changes/archive/2026-09-30-validate-sandbox-volume-sources/"
     },
     {
       "change": "validate-tracker-identifiers",
-      "lifecycle": "delivered-awaiting-archive",
+      "lifecycle": "archived",
       "disposition": "verification-gated",
       "owners": [
         {
@@ -1243,7 +1243,7 @@
         }
       ],
       "summary": "Admit bounded tracker identities before provider paths, options, caches, and control transport. Reviewed and verified with 107 distinct native tests and a 24-case redirect supplement; source/artifact mapping and limitations are in the maintenance08 audit.",
-      "delivered_at": "2026-09-15"
+      "archive_path": "openspec/changes/archive/2026-09-30-validate-tracker-identifiers/"
     },
     {
       "change": "verify-gate-workspace",
@@ -1259,7 +1259,7 @@
     },
     {
       "change": "verify-native-forge-connectivity",
-      "lifecycle": "delivered-awaiting-archive",
+      "lifecycle": "archived",
       "disposition": "alpha-delivery",
       "owners": [
         {
@@ -1268,7 +1268,7 @@
         }
       ],
       "summary": "Test-only SDK global connectivity and fallback acceptance delivered to local main at 7c05e3a4 after primary and independent review, native controls, scoped counterfactual and strict lint; no provider or live restart.",
-      "delivered_at": "2026-09-15"
+      "archive_path": "openspec/changes/archive/2026-09-30-verify-native-forge-connectivity/"
     },
     {
       "change": "verify-sandbox-mounts",
