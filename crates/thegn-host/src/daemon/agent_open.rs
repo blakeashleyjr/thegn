@@ -53,15 +53,7 @@ pub(crate) fn resolve_tool(
     name: &str,
 ) -> Result<LaunchSpec> {
     let command = configured_tool_command(cfg, name)?;
-    let branch = db
-        .worktrees()
-        .ok()
-        .and_then(|rows| {
-            rows.into_iter()
-                .find(|row| row.worktree == worktree)
-                .map(|row| row.branch)
-        })
-        .filter(|branch| !branch.is_empty());
+    let branch = crate::worktree_snapshot::current_branch(std::path::Path::new(worktree));
     crate::agent::launch_spec_full(
         cfg,
         worktree,
@@ -174,17 +166,9 @@ fn resolve_inner(
         )?
     };
 
-    // The branch is the worktree's registered one; a worktree thegn does not
-    // know about still launches, just without the branch in its environment.
-    let branch = db
-        .worktrees()
-        .ok()
-        .and_then(|rows| {
-            rows.into_iter()
-                .find(|r| r.worktree == worktree)
-                .map(|r| r.branch)
-        })
-        .filter(|b| !b.is_empty());
+    // Agent context follows live Git HEAD; an unavailable or detached HEAD
+    // intentionally supplies no branch context.
+    let branch = crate::worktree_snapshot::current_branch(std::path::Path::new(&worktree));
 
     // The one call that does everything: sandbox preparation, bundle/identity
     // env, credential directories, build-cache mounts, the CPU cap, and the

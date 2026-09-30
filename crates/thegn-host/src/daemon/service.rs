@@ -1065,16 +1065,27 @@ impl ControlApi for DaemonService {
                     db.worktrees()
                 })
                 .await?;
-            Ok(rows
-                .into_iter()
-                .map(|r| thegn_svc::control::WorktreeInfo {
-                    path: r.worktree,
-                    branch: r.branch,
-                    repo_root: r.repo_root,
-                    location: r.location,
-                    created_at: r.created_at,
-                })
-                .collect())
+            tokio::task::spawn_blocking(move || {
+                let observations =
+                    crate::worktree_snapshot::observe_rows(&*crate::git_handle::get(), &rows);
+                rows.into_iter()
+                    .map(|r| thegn_svc::control::WorktreeInfo {
+                        path: r.worktree.clone(),
+                        branch: observations
+                            .get(&r.worktree)
+                            .map(|observation| observation.display_branch(&r.branch).unwrap_or(""))
+                            .unwrap_or(&r.branch)
+                            .to_string(),
+                        repo_root: r.repo_root,
+                        location: r.location,
+                        created_at: r.created_at,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .await
+            .map_err(|e| {
+                ControlError::Internal(anyhow::anyhow!("worktree snapshot task join: {e}"))
+            })
         })
     }
 

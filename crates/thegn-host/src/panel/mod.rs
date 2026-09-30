@@ -555,6 +555,8 @@ pub struct PrBadge {
 pub struct BranchRow {
     pub name: String,
     pub is_head: bool,
+    /// Other Git worktrees currently holding this branch (host paths).
+    pub held_by: Vec<String>,
     pub upstream: Option<String>,
     pub ahead: usize,
     pub behind: usize,

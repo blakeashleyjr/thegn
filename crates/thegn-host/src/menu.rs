@@ -917,8 +917,12 @@ pub fn bisect_menu(active: bool) -> MenuOverlay {
 
 /// Actions on branch `name`; delete is omitted for the checked-out branch.
 pub fn branch_menu(name: &str, is_head: bool) -> MenuOverlay {
+    branch_menu_held(name, is_head, false)
+}
+
+fn branch_menu_held(name: &str, is_head: bool, held_by_sibling: bool) -> MenuOverlay {
     let mut items = Vec::new();
-    if !is_head {
+    if !is_head && !held_by_sibling {
         // Two items, because there is only one honest way to offer this.
         //
         // `force: false` is `git branch -d`, which REFUSES an unmerged branch —
@@ -1079,9 +1083,13 @@ pub fn create_project_menu(path: String) -> MenuOverlay {
 }
 
 /// Branch actions including create + merge (the full `m`/`n` menu); merge
-/// and delete are omitted for the checked-out branch.
+/// and delete are omitted for the checked-out or sibling-held branch.
 pub fn branch_actions_menu(name: &str, is_head: bool) -> MenuOverlay {
-    let mut m = branch_menu(name, is_head);
+    branch_actions_menu_held(name, is_head, false)
+}
+
+pub fn branch_actions_menu_held(name: &str, is_head: bool, held_by_sibling: bool) -> MenuOverlay {
+    let mut m = branch_menu_held(name, is_head, held_by_sibling);
     m.items
         .push(item(Some('n'), "new branch", MenuChoice::BranchCreate));
     m.items.push(item(
@@ -1089,7 +1097,7 @@ pub fn branch_actions_menu(name: &str, is_head: bool) -> MenuOverlay {
         "fetch all remotes (--prune)",
         MenuChoice::BranchFetch,
     ));
-    if !is_head {
+    if !is_head && !held_by_sibling {
         m.items.push(item(
             Some('m'),
             format!("merge {name} into checked-out"),
@@ -1764,6 +1772,26 @@ mod tests {
         );
         let head = branch_menu("main", true);
         assert_eq!(hotkeys(&head), vec!['f', 'p', 'l', 'u', 'r']);
+    }
+
+    #[test]
+    fn sibling_held_branch_menu_omits_delete_and_merge() {
+        let held = branch_actions_menu_held("feature", false, true);
+        assert!(!held.items().iter().any(|item| matches!(
+            &item.choice,
+            MenuChoice::BranchDelete { .. } | MenuChoice::BranchMerge(_)
+        )));
+        let free = branch_actions_menu_held("feature", false, false);
+        assert!(
+            free.items()
+                .iter()
+                .any(|item| matches!(&item.choice, MenuChoice::BranchDelete { .. }))
+        );
+        let current = branch_actions_menu_held("main", true, false);
+        assert!(!current.items().iter().any(|item| matches!(
+            &item.choice,
+            MenuChoice::BranchDelete { .. } | MenuChoice::BranchMerge(_)
+        )));
     }
 
     #[test]
