@@ -337,15 +337,21 @@ fn create_and_register(
         };
         return Err(anyhow::anyhow!(message));
     }
+    // A filing failure does NOT roll back the worktree. Registration failing
+    // above leaves it untracked and unusable, so unwinding that is right — but a
+    // folder is a sidebar label, and destroying a real worktree (and its branch)
+    // over one is a far worse outcome than an unfiled row. The env pin below is
+    // best-effort for the same reason, and the note under it says warn-only
+    // failures "do not roll back a real worktree". This still fails loudly, so a
+    // caller that asked for filing never wrongly believes it happened.
     if let Some(folder_name) = folder
         && let Err(e) = file_registered_worktree(db, &root_s, &path_s, folder_name)
     {
-        let _ = db.del_worktree(&path_s);
-        let message = match crate::worktree_lifecycle::rollback_remove(cfg, root, &path, branch) {
-            Ok(()) => e.to_string(),
-            Err(cleanup) => format!("{e}; rollback failed: {cleanup}"),
-        };
-        return Err(anyhow::anyhow!(message));
+        return Err(anyhow::anyhow!(
+            "{e}; the worktree at {path_s} was created and registered but NOT filed \
+             into {folder_name:?}. It is usable as-is; \
+             `thegn wt folder {path_s} {folder_name}` retries the filing."
+        ));
     }
     // Pin the env only when it differs from the ambient default this worktree
     // would inherit anyway (same rule as the wizard: a matching choice stays
@@ -403,6 +409,30 @@ fn file_registered_worktree(
     folder_name: &str,
 ) -> Result<()> {
     let folder_name = validate_folder_name(folder_name)?;
+    // `folders.repo_path` REFERENCES `workspaces(repo_path)`, and that row is
+    // otherwise only ever written by the compositor's hydration — so filing from
+    // the CLI against a repo that has never been opened in the TUI would fail
+    // with a raw `FOREIGN KEY constraint failed`. Register it first, mirroring
+    // hydrate's name/kind rule. A workspace the user explicitly removed is
+    // tombstoned: honour that instead of resurrecting it as a side effect of
+    // filing a folder.
+    let repo = std::path::Path::new(repo_path);
+    if db.workspace_tombstoned(repo_path).unwrap_or(false) {
+        anyhow::bail!(
+            "workspace {repo_path} was removed from thegn; re-add it before filing \
+             its worktrees into a folder"
+        );
+    }
+    let workspace_name = repo
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "workspace".into());
+    let kind = if thegn_core::repo::main_worktree(repo).is_some() {
+        "repo"
+    } else {
+        "dir"
+    };
+    db.put_workspace(repo_path, &workspace_name, kind)?;
     let folder_id = db.ensure_folder(repo_path, &folder_name)?;
     let folder = db
         .folders_for_workspace(repo_path)?
@@ -757,7 +787,7 @@ mod folder_tests {
         register_and_file_worktree(&db, "/repo", "/repo/new", "new", "Pipeline").unwrap();
 
         let row = db.worktree_record("/repo/new").unwrap().unwrap();
-        assert_eq!(row.repo_path, "/repo");
+        assert_eq!(row.repo_root, "/repo");
         assert!(row.folder_id.is_some());
     }
 
