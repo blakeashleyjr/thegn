@@ -288,6 +288,8 @@ fn errors_are_value_free_and_distinguish_contention() {
         AdmissionLimit::LineBytes,
         AdmissionLimit::Nesting,
         AdmissionLimit::DocumentBytes,
+        AdmissionLimit::AggregateSourceBytes,
+        AdmissionLimit::SourceDeadline,
         AdmissionLimit::Messages,
         AdmissionLimit::GlobalRecords,
         AdmissionLimit::GlobalBytes,

@@ -9,6 +9,84 @@ use std::io::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// Open an existing regular file without following its final path component.
+///
+/// The returned descriptor is checked after opening, so callers can safely
+/// read from it without a metadata/open race changing a regular file into a
+/// FIFO or device. Unix opens are nonblocking as well as no-follow, preventing
+/// a raced FIFO from hanging before that descriptor check.
+pub fn open_regular_file_nofollow(path: &Path) -> std::io::Result<std::fs::File> {
+    #[cfg(unix)]
+    {
+        use nix::fcntl::{OFlag, open};
+        use nix::sys::stat::{Mode, SFlag, fstat};
+
+        let fd = open(
+            path,
+            OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|error| {
+            if error == nix::errno::Errno::ELOOP {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("{} is a symlink, not a regular file", path.display()),
+                )
+            } else {
+                std::io::Error::from_raw_os_error(error as i32)
+            }
+        })?;
+        let stat = fstat(&fd).map_err(|error| std::io::Error::from_raw_os_error(error as i32))?;
+        let file_type = SFlag::from_bits_truncate(stat.st_mode);
+        if !file_type.contains(SFlag::S_IFREG) {
+            let kind = if file_type.contains(SFlag::S_IFIFO) {
+                "FIFO"
+            } else if file_type.contains(SFlag::S_IFSOCK) {
+                "socket"
+            } else if file_type.contains(SFlag::S_IFBLK) {
+                "block device"
+            } else if file_type.contains(SFlag::S_IFCHR) {
+                "character device"
+            } else if file_type.contains(SFlag::S_IFDIR) {
+                "directory"
+            } else {
+                "non-regular file"
+            };
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("{} is a {kind}, not a regular file", path.display()),
+            ));
+        }
+        Ok(std::fs::File::from(fd))
+    }
+    #[cfg(windows)]
+    {
+        use std::fs::OpenOptions;
+        use std::os::windows::fs::OpenOptionsExt;
+        let mut options = OpenOptions::new();
+        options.read(true);
+        // Open the reparse point itself; metadata below refuses it instead of
+        // allowing a final-component symlink to redirect the read.
+        options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
+        let file = options.open(path)?;
+        if !file.metadata()?.file_type().is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("{} is not a regular file", path.display()),
+            ));
+        }
+        Ok(file)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "no-follow regular-file opening is unavailable on this platform",
+        ))
+    }
+}
+
 /// Restrict a file at `path` to the owning user: `chmod 0600` on unix; on
 /// Windows strip inherited ACEs and grant only the current user full control
 /// (a protected DACL containing only the current user with full control).
@@ -261,6 +339,49 @@ mod tests {
         assert_eq!(mode_bits(&p).unwrap(), Some(0o600));
         let _ = std::fs::remove_file(&p); // best-effort: test cleanup: scratch removal must never fail the test
         assert!(mode_bits(&p).is_err(), "a missing path is an error");
+    }
+
+    #[test]
+    fn nofollow_reader_accepts_regular_files_and_refuses_symlinks() {
+        use std::io::Read;
+        let dir = std::env::temp_dir().join(format!(
+            "thegn-fsperm-nofollow-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("target");
+        let link = dir.join("link");
+        std::fs::write(&target, b"calendar").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let mut bytes = Vec::new();
+        open_regular_file_nofollow(&target)
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+        assert_eq!(bytes, b"calendar");
+        let error = open_regular_file_nofollow(&link).unwrap_err();
+        assert!(error.to_string().contains("symlink"), "{error}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn nofollow_reader_opens_fifos_nonblocking_then_rejects_by_descriptor() {
+        let dir = std::env::temp_dir().join(format!(
+            "thegn-fsperm-fifo-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fifo = dir.join("calendar.ics");
+        nix::unistd::mkfifo(
+            &fifo,
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )
+        .unwrap();
+        let error = open_regular_file_nofollow(&fifo).unwrap_err();
+        assert!(error.to_string().contains("FIFO"), "{error}");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

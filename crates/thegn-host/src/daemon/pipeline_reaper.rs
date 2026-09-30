@@ -102,7 +102,7 @@ fn reap_pass(db: &super::service::SharedDb, live_ids: &[String]) {
         },
         Err(_) => return,
     };
-    let plan = crate::cmd::dispatch::reap_plan_rows(&rows, live_ids);
+    let plan = crate::cmd::dispatch::reap_plan_rows(&rows, Some(live_ids));
     for r in &plan {
         let db = match db.lock() {
             Ok(db) => db,
@@ -146,7 +146,15 @@ fn reap_pass(db: &super::service::SharedDb, live_ids: &[String]) {
                 }
             }
             // A human's call, or nothing to do.
-            ReapVerdict::NeedsDecision { .. } | ReapVerdict::Live | ReapVerdict::Closed => {}
+            // `Unknown` belongs with the do-nothing arms, not the reaping
+            // ones: it means liveness could not be established, and this
+            // reaper's doctrine is that it may park a row but never finish one.
+            // Acting on an unknown row is the guess the fail-closed change
+            // exists to prevent.
+            ReapVerdict::NeedsDecision { .. }
+            | ReapVerdict::Unknown { .. }
+            | ReapVerdict::Live
+            | ReapVerdict::Closed => {}
         }
     }
 }
@@ -210,6 +218,7 @@ mod tests {
             .unwrap();
         db.update_dispatch_status(id, AgentDispatchStatus::Running)
             .unwrap();
+        db.stamp_dispatch_exit(id, Some(0)).unwrap();
         id
     }
 
@@ -273,6 +282,72 @@ mod tests {
                 .unwrap()
                 .status,
             AgentDispatchStatus::Done
+        );
+    }
+
+    #[test]
+    fn daemon_restart_without_exit_stamp_leaves_row_active_and_slot_occupying() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = Db::open_at(&dir.path().join("thegn.db")).unwrap();
+        let wt = dir.path().join("wt");
+        std::fs::create_dir(&wt).unwrap();
+        let id = db
+            .put_agent_dispatch(NewDispatch {
+                issue_id: "linear:THE-209",
+                worktree_path: wt.to_str().unwrap(),
+                agent_name: "worker",
+                stage: Some("code"),
+                parent_id: None,
+                session_id: Some("unobserved-session"),
+                artifact_path: Some("handoff.md"),
+                chunk_path: None,
+            })
+            .unwrap();
+        db.update_dispatch_status(id, AgentDispatchStatus::Running)
+            .unwrap();
+        let shared = Arc::new(Mutex::new(db));
+
+        // After restart, the session map can be empty while this row has no
+        // durable exit stamp. The daemon and CLI both leave that ambiguous row.
+        reap_pass(&shared, &[]);
+        let db = shared.lock().unwrap();
+        let row = db.get_dispatch(id).unwrap().unwrap();
+        assert_eq!(row.status, AgentDispatchStatus::Running);
+        assert!(row.exit_code.is_none() && row.exited_at_ms.is_none());
+    }
+
+    #[test]
+    fn production_pass_still_recognizes_a_live_session_as_live() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = Db::open_at(&dir.path().join("thegn.db")).unwrap();
+        let wt = dir.path().join("wt");
+        std::fs::create_dir(&wt).unwrap();
+        let id = db
+            .put_agent_dispatch(NewDispatch {
+                issue_id: "linear:THE-209",
+                worktree_path: wt.to_str().unwrap(),
+                agent_name: "worker",
+                stage: Some("code"),
+                parent_id: None,
+                session_id: Some("live-session"),
+                artifact_path: Some("handoff.md"),
+                chunk_path: None,
+            })
+            .unwrap();
+        db.update_dispatch_status(id, AgentDispatchStatus::Running)
+            .unwrap();
+        let shared = Arc::new(Mutex::new(db));
+
+        reap_pass(&shared, &["live-session".to_string()]);
+        assert_eq!(
+            shared
+                .lock()
+                .unwrap()
+                .get_dispatch(id)
+                .unwrap()
+                .unwrap()
+                .status,
+            AgentDispatchStatus::Running
         );
     }
 }

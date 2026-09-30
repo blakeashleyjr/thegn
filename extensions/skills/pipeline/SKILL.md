@@ -206,9 +206,13 @@ sibling's own worktree) and **refuses the dispatch** when the new scope collides
 with an active sibling's — the refusal names the colliding paths and the row
 ids — or when an `after:` chunk is not `done` yet. Intentional sharing is
 declared in the chunk file itself (`overlaps: [chunk-2]`), not argued past the
-gate. The explicit override is `thegn dispatch put … --chunk <path> --force`,
-which records the row and reports `(forced)`; a forced row is a decision you
-made, and the output says so in both human and JSON form.
+gate. A chunk-bearing `put` requires `--stage <name>` (a configured stage): the
+scope gate, that stage's capacity and duplicate-artifact refusal are all applied
+atomically in one transaction. The explicit override is
+`thegn dispatch put … --stage <name> --chunk <path> --force --force-reason "<why>"`;
+`--force` without a non-empty `--force-reason` is refused. It records the row and
+reports `(forced: <reason>)`; a forced row is a decision you made, and the output
+says so in both human and JSON form.
 
 ## 4. The monitor owns the watch loop
 

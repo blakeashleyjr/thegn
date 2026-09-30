@@ -109,6 +109,7 @@ pub struct AppHost {
     pub slots: Vec<AppSlot>,
     pub active: ActiveApp,
     tab_order: Vec<ActiveApp>,
+    default_tab: String,
 }
 
 impl AppHost {
@@ -123,54 +124,121 @@ impl AppHost {
             slots,
             active: ActiveApp::Work,
             tab_order,
+            default_tab: "work".into(),
         }
     }
 
     pub fn from_config(cfg: &thegn_core::config::Config) -> AppHost {
-        let tab_ids = cfg.apps.effective_tab_order();
-        // Registered app tabs (`registry::APP_BUILDERS`). Each is gated on
-        // its own `enabled` predicate so the AI-free shell stays a single
-        // `work` tab unless opted in.
-        let slots: Vec<AppSlot> = registry::enabled(cfg)
-            .map(|b| AppSlot::new(b.id, b.label))
+        let mut host = AppHost::new(Vec::new());
+        host.reconcile(cfg);
+        host
+    }
+
+    /// Reconcile config against stable app ids. Existing enabled slots (and
+    /// their live tiles) survive reorder; removed slots are dropped, and new
+    /// slots remain lazy. An unchanged default preserves the user's selection.
+    /// When the configured default changes, it takes effect immediately. If
+    /// the active tile is removed or disabled, the configured default wins.
+    pub fn reconcile(&mut self, cfg: &thegn_core::config::Config) {
+        let active_id = self.active_id().map(str::to_owned);
+        let previous_default = self.default_tab.clone();
+        let default_id = cfg.apps.normalized_default_tab(cfg.observe.enabled);
+        let enabled_ids: std::collections::HashSet<&str> =
+            registry::enabled(cfg).map(|builder| builder.id).collect();
+        let tab_ids = cfg.apps.effective_tab_order(cfg.observe.enabled);
+        let wanted_slots: Vec<&str> = tab_ids
+            .iter()
+            .filter(|id| enabled_ids.contains(id.as_str()))
+            .filter_map(|id| registry::builder(id).map(|builder| builder.id))
             .collect();
+        let wanted_order: Vec<&str> = tab_ids
+            .iter()
+            .filter_map(|id| {
+                if id.as_str() == "work" {
+                    Some("work")
+                } else if enabled_ids.contains(id.as_str()) && registry::builder(id).is_some() {
+                    Some(id.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let current_slots: Vec<&str> = self.slots.iter().map(|slot| slot.id).collect();
+        let current_order: Vec<&str> = self
+            .tab_order
+            .iter()
+            .filter_map(|target| match target {
+                ActiveApp::Work => Some("work"),
+                ActiveApp::Tile(index) => self.slots.get(*index).map(|slot| slot.id),
+            })
+            .collect();
+        if default_id == previous_default
+            && current_slots == wanted_slots
+            && current_order == wanted_order
+        {
+            return;
+        }
 
-        let mut tab_order = Vec::new();
-        for id in tab_ids {
+        let mut old_slots: std::collections::HashMap<&'static str, AppSlot> =
+            self.slots.drain(..).map(|slot| (slot.id, slot)).collect();
+        let mut slots = Vec::new();
+        for id in &tab_ids {
+            if !enabled_ids.contains(id.as_str()) {
+                continue;
+            }
+            let Some(builder) = registry::builder(id) else {
+                continue;
+            };
+            slots.push(
+                old_slots
+                    .remove(builder.id)
+                    .unwrap_or_else(|| AppSlot::new(builder.id, builder.label)),
+            );
+        }
+        self.slots = slots;
+        self.tab_order = tab_ids
+            .iter()
+            .filter_map(|id| {
+                if id.as_str() == "work" {
+                    Some(ActiveApp::Work)
+                } else {
+                    self.slots
+                        .iter()
+                        .position(|slot| slot.id == id.as_str())
+                        .map(ActiveApp::Tile)
+                }
+            })
+            .collect();
+        if self.tab_order.is_empty() {
+            self.tab_order.push(ActiveApp::Work);
+        }
+        let target_for = |id: &str, slots: &[AppSlot]| {
             if id == "work" {
-                tab_order.push(ActiveApp::Work);
-            } else if let Some(idx) = slots.iter().position(|slot| slot.id == id) {
-                tab_order.push(ActiveApp::Tile(idx));
+                Some(ActiveApp::Work)
+            } else {
+                slots
+                    .iter()
+                    .position(|slot| slot.id == id)
+                    .map(ActiveApp::Tile)
             }
-        }
-        // Append any registered app slots the `[apps]` order didn't place (the
-        // common case: `[apps]` only lists `work`, app tabs opt in via their own
-        // section) so an enabled tab is always reachable.
-        for idx in 0..slots.len() {
-            let target = ActiveApp::Tile(idx);
-            if !tab_order.contains(&target) {
-                tab_order.push(target);
-            }
-        }
-        if tab_order.is_empty() {
-            tab_order.push(ActiveApp::Work);
-        }
-
-        let default_id = cfg.apps.normalized_default_tab();
-        let active = if default_id == "work" {
-            ActiveApp::Work
-        } else {
-            slots
-                .iter()
-                .position(|slot| slot.id == default_id)
-                .map(ActiveApp::Tile)
-                .unwrap_or(tab_order[0])
         };
+        let selected = if default_id != previous_default {
+            target_for(&default_id, &self.slots)
+        } else {
+            active_id
+                .as_deref()
+                .and_then(|id| target_for(id, &self.slots))
+        };
+        self.active = selected
+            .or_else(|| target_for(&default_id, &self.slots))
+            .unwrap_or(ActiveApp::Work);
+        self.default_tab = default_id;
+    }
 
-        AppHost {
-            slots,
-            active,
-            tab_order,
+    pub fn active_id(&self) -> Option<&str> {
+        match self.active {
+            ActiveApp::Work => Some("work"),
+            ActiveApp::Tile(index) => self.slots.get(index).map(|slot| slot.id),
         }
     }
 
@@ -273,7 +341,10 @@ pub fn start_slot_tile(
 
 /// A tile's [`ChangeHook`](tg_kit::ChangeHook): fired off-thread when the tile
 /// has new data, it posts the slot index on the app channel and pulses the
-/// terminal waker so the loop drains `app_rx` → `pump_all()` → repaint.
+/// terminal waker so the loop drains `app_rx` → `pump_all()` → repaint. The
+/// receiver treats the index only as a wake signal and pumps the current slot
+/// set, so a late callback after reconciliation cannot address a new tile by
+/// its old vector index.
 fn app_change_hook(
     app_tx: &tokio::sync::mpsc::UnboundedSender<usize>,
     idx: usize,
@@ -463,6 +534,7 @@ mod tests {
             slots: Vec::new(),
             active: ActiveApp::Work,
             tab_order: vec![ActiveApp::Work, ActiveApp::Tile(0), ActiveApp::Tile(1)],
+            default_tab: "work".into(),
         };
         let delta = |k: char| match tab_chord(Modifiers::ALT, &KeyCode::Char(k), host.tab_count()) {
             Some(TabChord::Cycle(d)) => d,
@@ -529,5 +601,73 @@ mod tests {
         // The observe tile is reachable as the second tab.
         assert_eq!(host.tab_target(1), Some(ActiveApp::Tile(0)));
         assert_eq!(host.cycle(ActiveApp::Work, 1), ActiveApp::Tile(0));
+    }
+
+    #[test]
+    fn configured_observe_order_and_default_are_honored() {
+        let mut cfg = thegn_core::config::Config::default();
+        cfg.observe.enabled = true;
+        cfg.apps.default_tab = "observe".into();
+        // Membership comes from `observe.enabled`; `[apps]` only orders the
+        // enabled tab set, so an omitted app still follows `work` here.
+        cfg.apps.tab_order = vec!["work".into()];
+        let host = AppHost::from_config(&cfg);
+
+        assert_eq!(host.tab_labels(), vec!["work", "Observe"]);
+        assert_eq!(host.active_id(), Some("observe"));
+        assert_eq!(host.active_tab_index(), 1);
+    }
+
+    #[test]
+    fn reload_reconciles_by_id_and_preserves_selection_until_default_changes() {
+        let mut cfg = thegn_core::config::Config::default();
+        cfg.observe.enabled = true;
+        cfg.apps.default_tab = "observe".into();
+        cfg.apps.tab_order = vec!["observe".into(), "work".into()];
+        let mut host = AppHost::from_config(&cfg);
+        host.slots[0].state = SlotState::Failed("retained".into());
+
+        // Same default with a changed order retains both selection and slot
+        // lifecycle state by id, instead of interpreting the old vector index.
+        cfg.apps.tab_order = vec!["work".into(), "observe".into()];
+        host.reconcile(&cfg);
+        assert_eq!(host.active_id(), Some("observe"));
+        assert_eq!(host.tab_labels(), vec!["work", "Observe"]);
+        assert!(matches!(host.slots[0].state, SlotState::Failed(_)));
+        let slot_address = &host.slots[0] as *const AppSlot;
+        host.reconcile(&cfg);
+        assert_eq!(
+            &host.slots[0] as *const AppSlot, slot_address,
+            "unchanged config should not rebuild the slot collection"
+        );
+
+        // A changed default is applied immediately; if the active app is later
+        // disabled, the configured default remains the deterministic fallback.
+        cfg.apps.default_tab = "work".into();
+        host.reconcile(&cfg);
+        assert_eq!(host.active_id(), Some("work"));
+        host.active = ActiveApp::Tile(0);
+        cfg.observe.enabled = false;
+        host.reconcile(&cfg);
+        assert_eq!(host.active_id(), Some("work"));
+        assert!(host.slots.is_empty());
+    }
+
+    #[test]
+    fn reload_can_enable_a_lazy_app_and_select_it_as_the_new_default() {
+        let mut cfg = thegn_core::config::Config::default();
+        let mut host = AppHost::from_config(&cfg);
+        assert!(host.slots.is_empty());
+
+        cfg.observe.enabled = true;
+        host.reconcile(&cfg);
+        assert_eq!(host.tab_labels(), vec!["work", "Observe"]);
+        assert_eq!(host.active_id(), Some("work"));
+        assert!(matches!(host.slots[0].state, SlotState::Unloaded));
+
+        cfg.apps.default_tab = "observe".into();
+        host.reconcile(&cfg);
+        assert_eq!(host.active_id(), Some("observe"));
+        assert_eq!(host.active_tab_index(), 1);
     }
 }
