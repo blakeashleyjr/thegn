@@ -32,17 +32,12 @@ use crate::issue::AgentDispatch;
 
 /// What the caller has already established about one row's world.
 ///
-/// The two facts a roster row cannot answer about itself: whether its worker is
+/// The facts a roster row cannot answer about itself: whether its worker is
 /// still alive, and whether its promised artifact actually exists in git.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReapFacts {
-    /// The row's `session_id` is present in the daemon's live set.
-    ///
-    /// **A daemon restart makes every prior session absent**, so this being
-    /// false does not prove the worker crashed — only that nothing is running
-    /// under that id now. That is precisely why the artifact facts below are
-    /// consulted before any row is called finished or failed.
-    pub session_live: bool,
+    /// Whether the worker's liveness is positively known.
+    pub worker: WorkerLiveness,
     /// The row's artifact exists under its worktree.
     pub artifact_exists: bool,
     /// The artifact is committed in `HEAD` and unchanged at that path.
@@ -53,11 +48,29 @@ pub struct ReapFacts {
     pub report_gate_valid: bool,
 }
 
+/// What the caller can establish about a worker from the daemon and durable
+/// exit stamp. Missing evidence is unknown, never proof of exit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkerLiveness {
+    /// The row's session is present in the daemon's live set.
+    Live,
+    /// The row has a durable exit stamp.
+    Exited,
+    /// Neither liveness nor an exit stamp could be established.
+    Unknown,
+}
+
 /// What the row should become.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReapVerdict {
     /// A worker is still running here. Leave it alone.
     Live,
+    /// Liveness is unavailable or has no durable exit evidence. Leave the
+    /// row occupying its slot and ask the operator to retry or reconcile it.
+    Unknown {
+        /// Operator-facing explanation and next step.
+        why: &'static str,
+    },
     /// The row is already terminal; nothing to reap.
     Closed,
     /// Worker gone, artifact committed, report filed. The handoff is complete
@@ -92,6 +105,7 @@ impl ReapVerdict {
     pub fn token(&self) -> &'static str {
         match self {
             Self::Live => "live",
+            Self::Unknown { .. } => "unknown",
             Self::Closed => "closed",
             Self::CloseDone => "close-done",
             Self::MarkFailed { .. } => "mark-failed",
@@ -112,8 +126,9 @@ pub struct Reap {
 
 /// Classify one row.
 ///
-/// Order matters: a terminal row is never reaped, a live worker is never
-/// touched, and only then do the artifact facts decide. `artifact_exists`
+/// Order matters: a terminal row is never reaped, a live or unknown worker is
+/// never touched, and only a positively exited worker reaches artifact
+/// classification. `artifact_exists`
 /// without `artifact_tracked` counts as *no handoff* — an uncommitted file is
 /// exactly the state a worker leaves behind when it dies mid-stage, and it is
 /// also what a worker leaves when its sandbox forbade the commit (THE-91), so
@@ -125,8 +140,15 @@ pub fn classify(row: &AgentDispatch, facts: &ReapFacts) -> ReapVerdict {
     ) {
         return ReapVerdict::Closed;
     }
-    if facts.session_live {
-        return ReapVerdict::Live;
+    match facts.worker {
+        WorkerLiveness::Live => return ReapVerdict::Live,
+        WorkerLiveness::Unknown => {
+            return ReapVerdict::Unknown {
+                why: "worker liveness could not be established and there is no durable exit stamp; \
+                     retry when the daemon is reachable, or reconcile this row by hand",
+            };
+        }
+        WorkerLiveness::Exited => {}
     }
     match (
         facts.artifact_tracked,
@@ -174,6 +196,7 @@ pub fn summarize(reaps: &[Reap]) -> ReapSummary {
     for r in reaps {
         match r.verdict {
             ReapVerdict::Live => s.live += 1,
+            ReapVerdict::Unknown { .. } => s.unknown += 1,
             ReapVerdict::Closed => s.closed += 1,
             ReapVerdict::CloseDone => s.close_done += 1,
             ReapVerdict::MarkFailed { .. } => s.mark_failed += 1,
@@ -187,6 +210,7 @@ pub fn summarize(reaps: &[Reap]) -> ReapSummary {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ReapSummary {
     pub live: usize,
+    pub unknown: usize,
     pub closed: usize,
     pub close_done: usize,
     pub mark_failed: usize,
@@ -226,7 +250,7 @@ mod tests {
     }
 
     const GONE_COMMITTED_REPORTED: ReapFacts = ReapFacts {
-        session_live: false,
+        worker: WorkerLiveness::Exited,
         artifact_exists: true,
         artifact_tracked: true,
         report_present: true,
@@ -236,7 +260,7 @@ mod tests {
     #[test]
     fn a_live_worker_is_never_reaped() {
         let f = ReapFacts {
-            session_live: true,
+            worker: WorkerLiveness::Live,
             ..GONE_COMMITTED_REPORTED
         };
         assert_eq!(classify(&row(1, S::Running), &f), ReapVerdict::Live);
@@ -295,7 +319,7 @@ mod tests {
         // THE-91: a worker whose sandbox forbade `git commit` leaves the file
         // on disk and untracked. That must read as failure, never success.
         let f = ReapFacts {
-            session_live: false,
+            worker: WorkerLiveness::Exited,
             artifact_exists: true,
             artifact_tracked: false,
             report_present: false,
@@ -316,7 +340,7 @@ mod tests {
     #[test]
     fn gone_with_no_artifact_at_all_is_a_plain_failure() {
         let f = ReapFacts {
-            session_live: false,
+            worker: WorkerLiveness::Exited,
             artifact_exists: false,
             artifact_tracked: false,
             report_present: false,
@@ -333,7 +357,7 @@ mod tests {
         // A worker that reported success but never committed has not handed
         // anything off; the report alone must not rescue it.
         let f = ReapFacts {
-            session_live: false,
+            worker: WorkerLiveness::Exited,
             artifact_exists: true,
             artifact_tracked: false,
             report_present: true,
@@ -356,7 +380,7 @@ mod tests {
         ];
         let out = plan(&rows, |r| match r.id {
             1 => ReapFacts {
-                session_live: true,
+                worker: WorkerLiveness::Live,
                 ..GONE_COMMITTED_REPORTED
             },
             2 => GONE_COMMITTED_REPORTED,
@@ -366,7 +390,7 @@ mod tests {
                 ..GONE_COMMITTED_REPORTED
             },
             _ => ReapFacts {
-                session_live: false,
+                worker: WorkerLiveness::Exited,
                 artifact_exists: false,
                 artifact_tracked: false,
                 report_present: false,
@@ -377,6 +401,7 @@ mod tests {
         assert_eq!(out[0].id, 1);
         let s = summarize(&out);
         assert_eq!(s.live, 1);
+        assert_eq!(s.unknown, 0);
         assert_eq!(s.close_done, 1);
         assert_eq!(s.needs_decision, 1);
         assert_eq!(s.mark_failed, 1);
@@ -386,5 +411,34 @@ mod tests {
             2,
             "only close-done and mark-failed change rows"
         );
+    }
+
+    #[test]
+    fn unknown_liveness_never_reaps_even_a_complete_handoff() {
+        for status in [S::Spawning, S::Running] {
+            let facts = ReapFacts {
+                worker: WorkerLiveness::Unknown,
+                ..GONE_COMMITTED_REPORTED
+            };
+            let verdict = classify(&row(1, status), &facts);
+            let ReapVerdict::Unknown { why } = &verdict else {
+                panic!("unknown worker must remain unreaped, got {verdict:?}");
+            };
+            assert!(!verdict.is_actionable());
+            assert!(why.contains("retry"), "{why}");
+            assert!(why.contains("reconcile"), "{why}");
+            assert_eq!(verdict.token(), "unknown");
+        }
+    }
+
+    #[test]
+    fn unknown_liveness_is_counted_and_never_actionable() {
+        let reaps = plan(&[row(1, S::Running)], |_| ReapFacts {
+            worker: WorkerLiveness::Unknown,
+            ..GONE_COMMITTED_REPORTED
+        });
+        let summary = summarize(&reaps);
+        assert_eq!(summary.unknown, 1);
+        assert_eq!(summary.actionable(), 0);
     }
 }

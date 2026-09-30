@@ -414,6 +414,44 @@ mod tests {
     }
 
     #[test]
+    fn unknown_liveness_rows_still_block_duplicate_claims_and_occupy_slots() {
+        // No exit stamp means worker liveness is unknown. Reaping must not
+        // terminally rewrite this row: it continues to block duplicate work
+        // and consumes the stage budget until a human reconciles it.
+        let mut spawning = row(41, "linear:THE-209", "code", "/wt/209", Some("handoff.md"));
+        spawning.status = S::Spawning;
+        spawning.exit_code = None;
+        spawning.exited_at_ms = None;
+        let running = row(42, "linear:THE-210", "code", "/wt/210", Some("other.md"));
+        let duplicate = decide(
+            &[spawning.clone()],
+            &req("linear:THE-209", "code", "/wt/209", Some("handoff.md")),
+            3,
+        );
+        assert_eq!(
+            duplicate,
+            ClaimDecision::DuplicateOf {
+                id: 41,
+                exited: false
+            }
+        );
+
+        let at_capacity = decide(
+            &[spawning, running],
+            &req("linear:THE-211", "code", "/wt/211", Some("next.md")),
+            2,
+        );
+        assert_eq!(
+            at_capacity,
+            ClaimDecision::AtCapacity {
+                occupied: 2,
+                limit: 2,
+                stale: 0,
+            }
+        );
+    }
+
+    #[test]
     fn capacity_is_counted_per_stage_not_across_the_roster() {
         let rows = vec![
             row(1, "linear:A-1", "architect", "/wt/a", Some("d.md")),
