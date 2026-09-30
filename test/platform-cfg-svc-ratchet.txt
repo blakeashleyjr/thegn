@@ -3,9 +3,21 @@
 # runner is the one process-control seam: Unix isolates/kills a process group,
 # while other platforms kill and reap the direct Git child. The rest is debt.
 #
+# The three `*/tests.rs` entries are a distinct, narrower case: they assert
+# filesystem SEMANTICS that only exist on one platform, so the `#[cfg]` is in
+# the test rather than in service logic. `calendar/tests.rs` needs
+# `std::os::unix::fs::symlink` to build the symlinked-ICS source it refuses —
+# there is no cross-platform way to create one without the deprecated
+# `fs::soft_link`, and the production code's Windows arm
+# (`FILE_FLAG_OPEN_REPARSE_POINT`) cannot be exercised from Linux regardless.
+# Prefer a runtime probe over a `#[cfg]` wherever the API is portable and only
+# the environment differs — that is how the same problem was avoided in
+# `thegn-svc/src/git/native_diff.rs`, which probes for `/proc` instead.
+#
 # SHRINK-ONLY. Enforced by `platform_cfgs_are_pinned` in
 # crates/thegn-svc/src/platform_ratchet_tests.rs; `just ratchet-update`.
 
+calendar/tests.rs
 git/background_commit.rs
 git/commit.rs
 ipc.rs

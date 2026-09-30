@@ -3523,9 +3523,11 @@ pub use crate::config_weather::{WeatherConfig, WeatherProviderKind, WeatherUnits
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct AppsConfig {
-    /// Tab focused on startup. Valid ids: "work".
+    /// Tab focused on startup. Valid ids come from `BUILTIN_TABS`.
+    #[schemars(with = "AppTabId")]
     pub default_tab: String,
-    /// Ordered top-level tab ids. Unknown ids are ignored; missing built-ins are appended.
+    /// Order for `work` and enabled apps. Enabled but unlisted apps are appended; duplicates are ignored.
+    #[schemars(with = "Vec<AppTabId>")]
     pub tab_order: Vec<String>,
 }
 
@@ -3539,34 +3541,100 @@ impl Default for AppsConfig {
 }
 
 impl AppsConfig {
-    pub const BUILTIN_TABS: [&'static str; 1] = ["work"];
+    /// Authoritative set of built-in app tab ids that exist. This answers only
+    /// whether a name is known, and is shared by config validation and the
+    /// generated schema. It does not answer either of the other two questions:
+    /// the app builder's `enabled` predicate (through `registry::enabled` in
+    /// the host) decides whether a known app is registered, while
+    /// `<app>.enabled` decides which apps are on (off by default), and
+    /// `effective_tab_order()` orders `work` plus those enabled apps according
+    /// to `[apps]`, appending enabled but unlisted apps in catalog order.
+    /// Keeping existence, enablement, and ordering separate means adding a
+    /// known-but-disabled app does not change existing users' UI.
+    pub const BUILTIN_TABS: [&'static str; 2] = ["work", "observe"];
 
-    pub fn effective_tab_order(&self) -> Vec<String> {
+    pub fn validate(&self, observe_enabled: bool) -> Vec<String> {
+        let mut errors = Vec::new();
+        let known = Self::BUILTIN_TABS.join(", ");
+        let default = self.default_tab.trim();
+        if !Self::BUILTIN_TABS.contains(&default) {
+            errors.push(format!(
+                "unknown app tab {:?}; known tabs are {known}",
+                default
+            ));
+        } else if default == "observe" && !observe_enabled {
+            errors.push(format!(
+                "apps.default_tab {:?} is disabled; enable its app in the matching config section",
+                default
+            ));
+        }
+        for (index, id) in self.tab_order.iter().enumerate() {
+            let id = id.trim();
+            if !Self::BUILTIN_TABS.contains(&id) {
+                errors.push(format!(
+                    "apps.tab_order[{index}]: unknown app tab {id:?}; known tabs are {known}"
+                ));
+            }
+        }
+        errors
+    }
+
+    pub fn effective_tab_order(&self, observe_enabled: bool) -> Vec<String> {
         let mut out = Vec::new();
         for id in &self.tab_order {
             let id = id.trim();
-            if Self::BUILTIN_TABS.contains(&id) && !out.iter().any(|existing| existing == id) {
+            if Self::BUILTIN_TABS.contains(&id)
+                && (id == "work" || (id == "observe" && observe_enabled))
+                && !out.iter().any(|existing| existing == id)
+            {
                 out.push(id.to_string());
             }
         }
+        // Membership comes from `work` plus enabled apps, never from the order
+        // list. This also preserves apps added to the registry when a user's
+        // older config has no explicit `[apps]` entry for them.
         for id in Self::BUILTIN_TABS {
-            if !out.iter().any(|existing| existing == id) {
-                out.push(id.to_string());
+            if (id == "work" || (id == "observe" && observe_enabled))
+                && !out.iter().any(|existing| existing == id)
+            {
+                out.push(id.to_owned());
             }
         }
         out
     }
 
-    pub fn normalized_default_tab(&self) -> String {
+    pub fn normalized_default_tab(&self, observe_enabled: bool) -> String {
         let default = self.default_tab.trim();
-        if self.effective_tab_order().iter().any(|id| id == default) {
+        let order = self.effective_tab_order(observe_enabled);
+        if order.iter().any(|id| id == default) {
             default.to_string()
         } else {
-            self.effective_tab_order()
-                .into_iter()
-                .next()
-                .unwrap_or_else(|| "work".into())
+            order.into_iter().next().unwrap_or_else(|| "work".into())
         }
+    }
+}
+
+/// Schema-only enum for the ids retained as strings by the public config API.
+struct AppTabId;
+
+impl schemars::JsonSchema for AppTabId {
+    fn schema_name() -> String {
+        "AppTabId".into()
+    }
+
+    // Schemars 0.8 spells "inline me rather than emit a `$ref`" as
+    // `is_referenceable() -> false`; `inline_schema` is the 1.x name and is not a
+    // member of this trait (E0407).
+    fn is_referenceable() -> bool {
+        false
+    }
+
+    fn json_schema(_: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
+        schemars::schema::Schema::Object(schemars::schema::SchemaObject {
+            instance_type: Some(schemars::schema::InstanceType::String.into()),
+            enum_values: Some(vec!["work".into(), "observe".into()]),
+            ..Default::default()
+        })
     }
 }
 
