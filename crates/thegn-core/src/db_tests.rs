@@ -3982,11 +3982,25 @@ fn forced_chunk_overlap_requires_and_records_a_reason() {
         )
         .unwrap()
         .unwrap();
-    let row = db.get_dispatch(result).unwrap().unwrap();
+    // The reason lands in the dispatch NOTES QUEUE, not in the row's own `note`
+    // column. `append_dispatch_note` inserts into `agent_dispatch_notes`, which
+    // is read back with `dispatch_notes` — `row.note` is an unrelated field and
+    // is correctly empty here. The implementation is right; this assertion was
+    // reading the wrong place, and it is the branch's own new test, so it had
+    // never passed.
+    let notes = db.dispatch_notes(result, None, 0).unwrap();
     assert!(
-        row.note
-            .unwrap_or_default()
-            .contains("separate ownership reviewed")
+        notes
+            .iter()
+            .any(|n| n.text.contains("separate ownership reviewed")),
+        "the override reason must be recorded on the row's note queue: {notes:?}"
+    );
+    // And it says WHY it is there, not just the operator's words.
+    assert!(
+        notes.iter().any(|n| n
+            .text
+            .contains("chunk scope override explicitly authorized")),
+        "the note must name the override it records: {notes:?}"
     );
     assert!(
         db.claim_dispatch_admitted(
@@ -4154,7 +4168,7 @@ fn prepared_scope(path: &str, file: &str) -> crate::pipeline_chunk::PreparedChun
 /// as the host does, then retries against the winner's normalized scope.
 fn race_chunk_admissions(
     right_file: &'static str,
-) -> Vec<crate::db_dispatch::DispatchAdmissionDecision> {
+) -> Vec<std::result::Result<i64, crate::db_dispatch::DispatchAdmissionDecision>> {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("scope-race.db");
     drop(Db::open_at(&path).unwrap());
@@ -4175,13 +4189,12 @@ fn race_chunk_admissions(
                 let mut result = db
                     .claim_dispatch_admitted(new(), 3, None, Some(&prepared), None)
                     .unwrap();
-                let mut stale = None;
                 if let Err(crate::db_dispatch::DispatchAdmissionDecision::RetryScopeSnapshot {
                     row,
                     path,
                 }) = &result
                 {
-                    stale = Some((*row, path.clone()));
+                    let (stale_row, stale_path) = (*row, path.clone());
                     let rows = db.list_dispatches().unwrap();
                     prepared.siblings = rows
                         .into_iter()
@@ -4212,16 +4225,15 @@ fn race_chunk_admissions(
                             _
                         ))
                     ) {
-                        let (row, path) = stale.take().unwrap();
                         result = Err(
                             crate::db_dispatch::DispatchAdmissionDecision::RetryScopeSnapshot {
-                                row,
-                                path,
+                                row: stale_row,
+                                path: stale_path,
                             },
                         );
                     }
                 }
-                result.map_err(|d| d)
+                result
             })
         })
         .collect();
