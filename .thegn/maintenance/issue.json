@@ -1,9 +1,0 @@
-{
-  "id": "THE-709",
-  "title": "Ratchet: enforce that every GitHub Actions `uses:` ref stays SHA-pinned",
-  "url": "https://linear.app/blakeashley/issue/THE-709/ratchet-enforce-that-every-github-actions-uses-ref-stays-sha-pinned",
-  "status": "Backlog",
-  "priority": "No priority",
-  "team": "Thegn",
-  "description": "Follow-up to THE-157. Every `uses:` in `.github/workflows/*.yml` is currently a 40-hex SHA, but nothing enforces it: a future edit can reintroduce a mutable tag, and the local `./.github/actions/ci-setup` is unpinned. Add a ratchet/CI check (in `just lint`) that fails on any non-SHA external action ref, with an explicit, reasoned allowlist for local `./` actions."
-}
