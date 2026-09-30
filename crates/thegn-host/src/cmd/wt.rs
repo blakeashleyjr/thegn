@@ -504,6 +504,9 @@ fn folder(target: &str, name: Option<&str>, clear: bool) -> Result<()> {
 /// never rolls back siblings, and a re-run attaches (reports `exists`) members
 /// that already have the branch — so retry-after-partial-failure completes the
 /// set. Exits non-zero if any member failed.
+// One call site, and every argument is a distinct CLI flag forwarded verbatim —
+// a struct would only rename the same fields. Same judgement as `config_write`.
+#[allow(clippy::too_many_arguments)]
 fn new_batched(
     cfg: &Config,
     name: Option<String>,
@@ -685,6 +688,146 @@ fn new_batched(
     Ok(())
 }
 
+/// Resolve the branch a `--from-issue` worktree should take: fetch the issue
+/// from the configured tracker, derive the seed branch ([`thegn_core::issue::issue_branch_seed`]),
+/// then de-duplicate against the repo's existing branches — exactly the `D` key
+/// / `worktrees.create` derivation, so the doors cannot drift.
+fn resolve_issue_branch(cfg: &Config, root: &std::path::Path, issue_id: &str) -> Result<String> {
+    let router = thegn_svc::issue::IssueRouter::from_config(&cfg.issues);
+    if !router.is_configured() {
+        anyhow::bail!("no issue tracker configured (set [issues] providers/accounts)");
+    }
+    let rt = tokio::runtime::Runtime::new()?;
+    let detail = rt
+        .block_on(router.get_issue(issue_id))
+        .map_err(|e| anyhow::anyhow!("fetch issue {issue_id}: {e}"))?;
+    let seed = thegn_core::issue::issue_branch_seed(
+        detail.issue.branch_hint.as_deref(),
+        &detail.issue.number,
+    );
+    let taken = worktree::BranchSet::load(root);
+    Ok(worktree::dedupe(&seed, &taken))
+}
+
+/// `wt rm` — the TUI's `delete_groups` pipeline, synchronous: resolve →
+/// confirm → provider/sandbox teardown → `git worktree remove` → DB cleanup.
+fn rm(cfg: &Config, target: &str, delete_branch: bool, force: bool) -> Result<()> {
+    let db = Db::open()?;
+    let rows = db.worktrees()?;
+
+    // Resolve by exact path first, then unique branch name.
+    let target_path = std::fs::canonicalize(target)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| target.to_string());
+    let matches: Vec<_> = rows
+        .iter()
+        .filter(|w| w.worktree == target_path || w.branch == target)
+        .collect();
+    let (path, branch, repo_root) = match matches.as_slice() {
+        [w] => (
+            w.worktree.clone(),
+            w.branch.clone(),
+            (!w.repo_root.is_empty()).then(|| w.repo_root.clone()),
+        ),
+        [] => {
+            // Not registered — accept a live linked worktree by path (the DB
+            // is a cache; git is the source of truth).
+            let p = std::path::Path::new(&target_path);
+            match thegn_core::repo::main_worktree(p) {
+                Some(r) if p.is_dir() && p.join(".git").is_file() => {
+                    let b = util::git_out(p, &["symbolic-ref", "--quiet", "--short", "HEAD"])
+                        .unwrap_or_default();
+                    (
+                        target_path.clone(),
+                        b,
+                        Some(r.to_string_lossy().into_owned()),
+                    )
+                }
+                _ => {
+                    let mut known: Vec<&str> = rows.iter().map(|w| w.branch.as_str()).collect();
+                    known.sort_unstable();
+                    return Err(anyhow::Error::new(super::NotFound(format!(
+                        "no worktree matches '{target}' (known branches: {})",
+                        if known.is_empty() {
+                            "none".into()
+                        } else {
+                            known.join(", ")
+                        }
+                    ))));
+                }
+            }
+        }
+        many => {
+            let paths: Vec<&str> = many.iter().map(|w| w.worktree.as_str()).collect();
+            anyhow::bail!(
+                "'{target}' is ambiguous — pass a path instead: {}",
+                paths.join(", ")
+            );
+        }
+    };
+
+    let root_s = repo_root
+        .or_else(|| {
+            thegn_core::repo::main_worktree(std::path::Path::new(&path))
+                .map(|p| p.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| path.clone());
+    let root = std::path::PathBuf::from(&root_s);
+    if root_s == path {
+        anyhow::bail!("refusing to remove the main worktree: {path}");
+    }
+    if !force {
+        let prompt = format!(
+            "remove worktree {path} (branch {branch}{})?",
+            if delete_branch {
+                ", branch deleted"
+            } else {
+                ""
+            }
+        );
+        // Without a TTY there's no way to answer the prompt — refuse (non-zero)
+        // rather than silently no-op on a piped/scripted invocation that forgot
+        // --force; an interactive decline is a clean abort.
+        if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+            anyhow::bail!("{prompt} refusing without a TTY — pass --force to confirm");
+        }
+        if !super::confirm(&prompt) {
+            outln!("aborted");
+            return Ok(());
+        }
+    }
+
+    let workspace = thegn_core::repo::repo_slug(&root);
+    // Keep the CLI and TUI on the same transaction. This is synchronous so a
+    // CLI exit cannot orphan provider resources, while `--force` selects the
+    // explicit non-blocking hook policy.
+    let (removed, message) = crate::worktree_lifecycle::destroy_one(
+        cfg,
+        &root,
+        std::path::Path::new(&path),
+        &branch,
+        &workspace,
+        false,
+        delete_branch,
+        crate::worktree_lifecycle::mode_for_user(force, false),
+        Some(&db),
+    );
+    if !removed {
+        anyhow::bail!("{message}; retry with --force");
+    }
+
+    // DB cleanup (best-effort: the DB is a cache; git above was the truth).
+    let tab = thegn_core::repo::branch_tab(&thegn_core::repo::repo_slug(&root), &branch);
+    let _ = db.del_worktree(&path); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+    let _ = db.del_worktree_for_tab(&root_s, &tab); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+    // Session id == the workspace repo path; key tab-group rows by worktree
+    // path so a renamed display group can't leave a resurrecting row behind.
+    let _ = db.delete_tab_groups_for_worktree(&root_s, &path); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+
+    outln!("removed {path}");
+    Ok(())
+}
+
 #[cfg(test)]
 mod folder_tests {
     use super::{file_registered_worktree, register_and_file_worktree, validate_folder_name};
@@ -844,144 +987,4 @@ mod folder_tests {
             None
         );
     }
-}
-
-/// Resolve the branch a `--from-issue` worktree should take: fetch the issue
-/// from the configured tracker, derive the seed branch ([`thegn_core::issue::issue_branch_seed`]),
-/// then de-duplicate against the repo's existing branches — exactly the `D` key
-/// / `worktrees.create` derivation, so the doors cannot drift.
-fn resolve_issue_branch(cfg: &Config, root: &std::path::Path, issue_id: &str) -> Result<String> {
-    let router = thegn_svc::issue::IssueRouter::from_config(&cfg.issues);
-    if !router.is_configured() {
-        anyhow::bail!("no issue tracker configured (set [issues] providers/accounts)");
-    }
-    let rt = tokio::runtime::Runtime::new()?;
-    let detail = rt
-        .block_on(router.get_issue(issue_id))
-        .map_err(|e| anyhow::anyhow!("fetch issue {issue_id}: {e}"))?;
-    let seed = thegn_core::issue::issue_branch_seed(
-        detail.issue.branch_hint.as_deref(),
-        &detail.issue.number,
-    );
-    let taken = worktree::BranchSet::load(root);
-    Ok(worktree::dedupe(&seed, &taken))
-}
-
-/// `wt rm` — the TUI's `delete_groups` pipeline, synchronous: resolve →
-/// confirm → provider/sandbox teardown → `git worktree remove` → DB cleanup.
-fn rm(cfg: &Config, target: &str, delete_branch: bool, force: bool) -> Result<()> {
-    let db = Db::open()?;
-    let rows = db.worktrees()?;
-
-    // Resolve by exact path first, then unique branch name.
-    let target_path = std::fs::canonicalize(target)
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| target.to_string());
-    let matches: Vec<_> = rows
-        .iter()
-        .filter(|w| w.worktree == target_path || w.branch == target)
-        .collect();
-    let (path, branch, repo_root) = match matches.as_slice() {
-        [w] => (
-            w.worktree.clone(),
-            w.branch.clone(),
-            (!w.repo_root.is_empty()).then(|| w.repo_root.clone()),
-        ),
-        [] => {
-            // Not registered — accept a live linked worktree by path (the DB
-            // is a cache; git is the source of truth).
-            let p = std::path::Path::new(&target_path);
-            match thegn_core::repo::main_worktree(p) {
-                Some(r) if p.is_dir() && p.join(".git").is_file() => {
-                    let b = util::git_out(p, &["symbolic-ref", "--quiet", "--short", "HEAD"])
-                        .unwrap_or_default();
-                    (
-                        target_path.clone(),
-                        b,
-                        Some(r.to_string_lossy().into_owned()),
-                    )
-                }
-                _ => {
-                    let mut known: Vec<&str> = rows.iter().map(|w| w.branch.as_str()).collect();
-                    known.sort_unstable();
-                    return Err(anyhow::Error::new(super::NotFound(format!(
-                        "no worktree matches '{target}' (known branches: {})",
-                        if known.is_empty() {
-                            "none".into()
-                        } else {
-                            known.join(", ")
-                        }
-                    ))));
-                }
-            }
-        }
-        many => {
-            let paths: Vec<&str> = many.iter().map(|w| w.worktree.as_str()).collect();
-            anyhow::bail!(
-                "'{target}' is ambiguous — pass a path instead: {}",
-                paths.join(", ")
-            );
-        }
-    };
-
-    let root_s = repo_root
-        .or_else(|| {
-            thegn_core::repo::main_worktree(std::path::Path::new(&path))
-                .map(|p| p.to_string_lossy().into_owned())
-        })
-        .unwrap_or_else(|| path.clone());
-    let root = std::path::PathBuf::from(&root_s);
-    if root_s == path {
-        anyhow::bail!("refusing to remove the main worktree: {path}");
-    }
-    if !force {
-        let prompt = format!(
-            "remove worktree {path} (branch {branch}{})?",
-            if delete_branch {
-                ", branch deleted"
-            } else {
-                ""
-            }
-        );
-        // Without a TTY there's no way to answer the prompt — refuse (non-zero)
-        // rather than silently no-op on a piped/scripted invocation that forgot
-        // --force; an interactive decline is a clean abort.
-        if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-            anyhow::bail!("{prompt} refusing without a TTY — pass --force to confirm");
-        }
-        if !super::confirm(&prompt) {
-            outln!("aborted");
-            return Ok(());
-        }
-    }
-
-    let workspace = thegn_core::repo::repo_slug(&root);
-    // Keep the CLI and TUI on the same transaction. This is synchronous so a
-    // CLI exit cannot orphan provider resources, while `--force` selects the
-    // explicit non-blocking hook policy.
-    let (removed, message) = crate::worktree_lifecycle::destroy_one(
-        cfg,
-        &root,
-        std::path::Path::new(&path),
-        &branch,
-        &workspace,
-        false,
-        delete_branch,
-        crate::worktree_lifecycle::mode_for_user(force, false),
-        Some(&db),
-    );
-    if !removed {
-        anyhow::bail!("{message}; retry with --force");
-    }
-
-    // DB cleanup (best-effort: the DB is a cache; git above was the truth).
-    let tab = thegn_core::repo::branch_tab(&thegn_core::repo::repo_slug(&root), &branch);
-    let _ = db.del_worktree(&path); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
-    let _ = db.del_worktree_for_tab(&root_s, &tab); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
-    // Session id == the workspace repo path; key tab-group rows by worktree
-    // path so a renamed display group can't leave a resurrecting row behind.
-    let _ = db.delete_tab_groups_for_worktree(&root_s, &path); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
-
-    outln!("removed {path}");
-    Ok(())
 }
