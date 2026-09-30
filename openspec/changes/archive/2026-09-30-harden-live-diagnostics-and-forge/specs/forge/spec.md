@@ -17,7 +17,7 @@ use a host-aware implementation rather than a same-name public repository.
 - **THEN** native admission rejects it before token lookup, using the same strict parse for authority and repository identity
 - **AND** supported HTTPS, SSH URL and SCP GitHub origins retain their exact owner and repository identity
 
-### Requirement: SDK error types determine fallback and connectivity
+### Requirement: Native client error classes determine fallback and connectivity
 
 GraphQL error envelopes, including partial responses with errors, SHALL use the
 intended CLI fallback. Server error text SHALL NOT be interpreted as transport
