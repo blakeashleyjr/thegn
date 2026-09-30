@@ -50,6 +50,24 @@ fn parses_a_realistic_event_end_to_end() {
 }
 
 #[test]
+fn checked_parser_stops_between_content_lines_on_deadline() {
+    let mut meter = AdmissionMeter::isolated(AdmissionBudget::default());
+    let mut out = Vec::new();
+    let mut checks = 0;
+    let result = parse_ics_window_checked(SAMPLE, "UTC", None, &mut meter, &mut out, || {
+        checks += 1;
+        if checks == 4 {
+            Err(AdmissionError::new(AdmissionLimit::SourceDeadline))
+        } else {
+            Ok(())
+        }
+    });
+    assert_eq!(result.unwrap_err().limit, AdmissionLimit::SourceDeadline);
+    assert_eq!(checks, 4);
+    assert!(out.is_empty());
+}
+
+#[test]
 fn line_folding_is_unfolded_before_anything_else() {
     // Feeds wrap at 75 octets mid-word; without unfolding the summary is cut.
     let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:1\r\nSUMMARY:A very long summ\r\n ary that was folded\r\nDTSTART:20260821T090000Z\r\nEND:VEVENT\r\nEND:VCALENDAR";

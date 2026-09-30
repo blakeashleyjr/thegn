@@ -329,6 +329,20 @@ pub fn parse_ics_window(
     meter: &mut AdmissionMeter,
     out: &mut Vec<CalEvent>,
 ) -> Result<(), AdmissionError> {
+    parse_ics_window_checked(input, default_zone, window, meter, out, || Ok(()))
+}
+
+/// The windowed parser with a cooperative check between logical content
+/// lines. Blocking sources use this to enforce their total deadline even for
+/// one large document; ordinary callers use [`parse_ics_window`].
+pub fn parse_ics_window_checked(
+    input: &str,
+    default_zone: &str,
+    window: Option<(NaiveDate, NaiveDate)>,
+    meter: &mut AdmissionMeter,
+    out: &mut Vec<CalEvent>,
+    mut check: impl FnMut() -> Result<(), AdmissionError>,
+) -> Result<(), AdmissionError> {
     let mut cur: Option<Builder> = None;
     // Nested non-VEVENT components inside the event being built (notably
     // VALARM, and VTIMEZONE's STANDARD/DAYLIGHT), so their properties don't
@@ -338,6 +352,7 @@ pub fn parse_ics_window(
     let mut cal_name = String::new();
 
     for raw in LogicalLines::new(input) {
+        check()?;
         if raw.len() > MAX_LINE_BYTES {
             // Classify from the first physical line without unfolding.
             let hint = raw.name_hint();

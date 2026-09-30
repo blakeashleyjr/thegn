@@ -1752,6 +1752,32 @@ fn an_ics_file_is_parsed() {
     assert_eq!(page.events()[0].title, "Standup");
 }
 
+#[cfg(unix)]
+#[test]
+fn local_ics_symlinks_are_refused_as_incomplete_sources() {
+    let t = Tmp::new("ics-symlink");
+    let target = t.0.join("target.ics");
+    let link = t.0.join("calendar.ics");
+    std::fs::write(&target, ONE_EVENT).unwrap();
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let (from, to) = window();
+    let err =
+        block_on(ics_backend(&link.display().to_string()).list_events(from, to, "")).unwrap_err();
+    assert!(matches!(err, CalendarError::Io(_)), "{err:?}");
+    assert!(err.to_string().contains("symlink"), "{err}");
+}
+
+#[test]
+fn local_ics_invalid_utf8_fails_the_whole_account() {
+    let t = Tmp::new("ics-utf8");
+    let path = t.0.join("calendar.ics");
+    std::fs::write(&path, b"BEGIN:VCALENDAR\n\xff\nEND:VCALENDAR\n").unwrap();
+    let (from, to) = window();
+    let err =
+        block_on(ics_backend(&path.display().to_string()).list_events(from, to, "")).unwrap_err();
+    assert!(matches!(err, CalendarError::Io(_)), "{err:?}");
+}
+
 #[test]
 fn a_directory_of_ics_files_is_read_as_one_calendar() {
     // This is the vdir layout vdirsyncer and khal write, so supporting it means
