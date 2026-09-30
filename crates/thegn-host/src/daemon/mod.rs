@@ -402,6 +402,7 @@ async fn run(
         // The unix-socket listener is local-only; browsers never dial it, so no
         // CORS is applied here (the allowlist rides the TCP listener below).
         cors_origins: Vec::new(),
+        event_streams: Default::default(),
     };
     let local_grpc = thegn_svc::control::grpc::GrpcControl {
         api: svc.clone(),
@@ -451,6 +452,7 @@ async fn run(
             // (empty = no cross-origin access; a wildcard is refused at config
             // validation).
             cors_origins: cfg.serve.cors_origins.clone(),
+            event_streams: Default::default(),
         };
         let grpc = thegn_svc::control::grpc::GrpcControl {
             api: svc.clone(),
