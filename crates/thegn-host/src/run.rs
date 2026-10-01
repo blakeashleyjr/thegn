@@ -12596,6 +12596,13 @@ async fn event_loop<T: Terminal>(
             container_demand_now.signal(),
             std::sync::atomic::Ordering::Relaxed,
         );
+        // With no consumer the worker stops listing, so the snapshot we hold
+        // can go arbitrarily stale. Forget that it was ever listed: a later
+        // monitor open then treats Containers as "not yet listed" and keeps a
+        // persisted Containers tab instead of hiding it on an old empty list.
+        if container_demand_now == crate::hydrate::ContainerDemand::None {
+            model.containers_listed = false;
+        }
         // On open, force perf accounting on (saving the prior state) so the
         // "Loop" sub-block has data; on close, restore — a `THEGN_PERF=1`
         // user keeps accounting, a default user goes back to free.
