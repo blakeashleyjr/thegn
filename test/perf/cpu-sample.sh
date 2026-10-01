@@ -93,6 +93,9 @@ THREAD_GROWTH_CEILING=2
 # front-loaded just after the settle, so the ceiling has to clear the short-window
 # case. 5,000 does, and still catches the incident by 5x.
 SYSCR_RATE_CEILING=5000
+# Idle process starts are forbidden in the soak window. This ceiling is fixed
+# by doctrine, not measured from a baseline, and is deliberately not a CLI knob.
+SPAWN_RATE_CEILING=0
 RECORD=0
 JSON_ONLY=0
 BASELINE_DIR="$HERE/baselines"
@@ -166,6 +169,28 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+SPAWN_ENABLED=0
+SPAWN_JSON="null"
+SPAWN_FAIL=0
+if [ "$SCENARIO" = soak ] || [ "$SCENARIO" = soak-daemon ]; then
+  SPAWN_ENABLED=1
+  case "$SAMPLER" in
+  top)
+    SPAWN_JSON='{"status":"unsupported","method":"unsupported","count":null,"ceiling":0,"offenders":[]}'
+    ;;
+  proc)
+    if ! command -v strace >/dev/null 2>&1; then
+      echo 'FAIL: spawn-rate axis requires strace; re-enter nix develop after the devShell change' >&2
+      if [ "$JSON_ONLY" = 1 ]; then
+        printf '%s\n' '{"spawn_rate":{"status":"failed","method":"strace","count":null,"ceiling":0,"offenders":[],"error":"strace missing"}}'
+      fi
+      exit 2
+    fi
+    STRACE_BIN="$(command -v strace)"
+    ;;
+  esac
+fi
+
 # `soak` is `steady-workload` given room to accumulate: the resource counters are
 # deltas, so a leak of one child per diff is only visible if enough diffs happen
 # and enough worktrees exist to keep the scan lanes busy. Scenario defaults apply
@@ -200,6 +225,8 @@ command -v script >/dev/null 2>&1 || {
 }
 
 PIDFILE="$PERF_TMP/thegn.pid"
+TRACE_UI_FILE="$PERF_TMP/ui.execve"
+TRACE_UI_PIDFILE="$PERF_TMP/ui.strace.pid"
 # The adaptive settle can extend to SETTLE_CAP_MS (20s), so the run window has to
 # cover the cap rather than the requested settle — otherwise thegn exits mid-sample
 # on exactly the slow-hydration runs the adaptive settle exists for.
@@ -229,9 +256,17 @@ if [ "$SCENARIO" = soak-daemon ]; then
 else
   NO_DAEMON="THEGN_NO_DAEMON=1"
 fi
-printf -v INNER \
-  'cd %q; stty rows 50 cols 200; env THEGN_BENCH_RUN_MS=%q %s %q & echo $! > %q; wait' \
-  "$REPO" "$RUN_MS" "$NO_DAEMON" "$BIN_ABS" "$PIDFILE"
+if [ "$SPAWN_ENABLED" = 1 ] && [ "$SAMPLER" = proc ]; then
+  # `$1`/`$@` are the bash -c positionals passed after `$0`, not outer values.
+  # shellcheck disable=SC2016
+  printf -v INNER \
+    'cd %q; stty rows 50 cols 200; env THEGN_BENCH_RUN_MS=%q %s %q -f -qq --seccomp-bpf -ttt -e trace=execve -o %q bash -c '\''echo $$ > "$1"; shift; exec "$@"'\'' _ %q %q & echo $! > %q; wait' \
+    "$REPO" "$RUN_MS" "$NO_DAEMON" "$STRACE_BIN" "$TRACE_UI_FILE" "$PIDFILE" "$BIN_ABS" "$TRACE_UI_PIDFILE"
+else
+  printf -v INNER \
+    'cd %q; stty rows 50 cols 200; env THEGN_BENCH_RUN_MS=%q %s %q & echo $! > %q; wait' \
+    "$REPO" "$RUN_MS" "$NO_DAEMON" "$BIN_ABS" "$PIDFILE"
+fi
 TIMEOUT_BIN="$(pty_timeout_bin)"
 # Single quotes are deliberate: $0/$1 are the INNER bash's positionals, bound by
 # the two arguments below, not this shell's. (Same idiom as flood.sh.)
@@ -272,7 +307,13 @@ if [ "$SCENARIO" = soak-daemon ]; then
   # that match — which is exactly how this scenario first reported "not found"
   # while its own daemon was running.
   mkdir -p "$XDG_RUNTIME_DIR/thegn"
-  "$BIN_ABS" daemon --socket "$XDG_RUNTIME_DIR/thegn/daemon.sock" >/dev/null 2>&1 &
+  if [ "$SPAWN_ENABLED" = 1 ] && [ "$SAMPLER" = proc ]; then
+    TRACE_DAEMON_FILE="$PERF_TMP/daemon.execve"
+    "$STRACE_BIN" -f -qq --seccomp-bpf -ttt -e trace=execve -o "$TRACE_DAEMON_FILE" \
+      "$BIN_ABS" daemon --socket "$XDG_RUNTIME_DIR/thegn/daemon.sock" >/dev/null 2>&1 &
+  else
+    "$BIN_ABS" daemon --socket "$XDG_RUNTIME_DIR/thegn/daemon.sock" >/dev/null 2>&1 &
+  fi
   DAEMON_LAUNCHER=$!
   # The socket is the readiness signal; the UI attaches to the same path.
   for _ in $(seq 1 100); do
@@ -288,8 +329,16 @@ for _ in $(seq 1 100); do
 done
 PID="$(cat "$PIDFILE" 2>/dev/null || true)"
 if [ -z "$PID" ] || ! kill -0 "$PID" 2>/dev/null; then
-  echo "cpu-sample: thegn did not start" >&2
+  if [ "$SPAWN_ENABLED" = 1 ] && [ "$SAMPLER" = proc ]; then
+    echo 'FAIL: spawn-rate UI tracer failed to start thegn' >&2
+    if [ "$JSON_ONLY" = 1 ]; then
+      printf '%s\n' '{"spawn_rate":{"status":"failed","method":"strace","count":null,"ceiling":0,"offenders":[],"roots":1,"error":"tracer failed to start target"}}'
+    fi
+  else
+    echo "cpu-sample: thegn did not start" >&2
+  fi
   kill "$LAUNCHER" 2>/dev/null || true
+  [ "$SPAWN_ENABLED" = 1 ] && exit 2
   exit 1
 fi
 
@@ -297,6 +346,13 @@ fi
 # may contain spaces/parens, so split on the LAST ')'.
 proc_jiffies() { # $1 = pid -> utime+stime
   awk '{ s=$0; sub(/^.*\) /,"",s); split(s,a," "); print a[12]+a[13] }' "/proc/$1/stat" 2>/dev/null || echo 0
+}
+
+proc_running() { # true only for a live, non-zombie process
+  local state
+  kill -0 "$1" 2>/dev/null || return 1
+  state="$(awk '{ s=$0; sub(/^.*\) /,"",s); split(s,a," "); print a[1] }' "/proc/$1/stat" 2>/dev/null || true)"
+  [ -n "$state" ] && [ "$state" != Z ]
 }
 
 # --- resource accumulation --------------------------------------------------
@@ -458,7 +514,34 @@ if [ "$SAMPLER" = proc ]; then
     TN[$tid]="$(cat "/proc/$PID/task/$tid/comm" 2>/dev/null || echo '?')"
     TR0[$tid]="$(awk '/^syscr:/ { print $2 }' "/proc/$PID/task/$tid/io" 2>/dev/null || echo 0)"
   done
+  if [ "$SPAWN_ENABLED" = 1 ]; then
+    TRACE_UI_PID="$(cat "$TRACE_UI_PIDFILE" 2>/dev/null || true)"
+    if [ -z "$TRACE_UI_PID" ] || ! proc_running "$TRACE_UI_PID"; then
+      echo 'FAIL: spawn-rate UI strace exited before the idle window' >&2
+      SPAWN_FAIL=1
+    fi
+    if [ "$SCENARIO" = soak-daemon ] && ! proc_running "${DAEMON_LAUNCHER:-0}"; then
+      echo 'FAIL: spawn-rate daemon strace exited before the idle window' >&2
+      SPAWN_FAIL=1
+    fi
+    SPAWN_START_EPOCH="$(date +%s.%N)"
+  fi
   sleep "$WINDOW_S"
+  if [ "$SPAWN_ENABLED" = 1 ]; then
+    SPAWN_END_EPOCH="$(date +%s.%N)"
+    if ! proc_running "$PID"; then
+      echo 'FAIL: thegn exited before the spawn-rate idle window ended' >&2
+      SPAWN_FAIL=1
+    fi
+    if [ -z "${TRACE_UI_PID:-}" ] || ! proc_running "$TRACE_UI_PID"; then
+      echo 'FAIL: spawn-rate UI strace exited before the idle window ended' >&2
+      SPAWN_FAIL=1
+    fi
+    if [ "$SCENARIO" = soak-daemon ] && ! proc_running "${DAEMON_LAUNCHER:-0}"; then
+      echo 'FAIL: spawn-rate daemon strace exited before the idle window ended' >&2
+      SPAWN_FAIL=1
+    fi
+  fi
   J1="$(proc_jiffies "$PID")"
   read -r C1 Z1 FD1 FDDB1 FDPR1 FDSK1 FDPI1 TH1 SR1 <<<"$(res_sample "$PID")"
   if [ -n "${DPID:-}" ] && [ -d "/proc/$DPID" ]; then
@@ -537,7 +620,31 @@ if [ -n "${DAEMON_LAUNCHER:-}" ]; then
   wait "$DAEMON_LAUNCHER" 2>/dev/null || true
 fi
 
-RESULT="{\"scenario\":\"$SCENARIO\",\"build\":\"$BUILD\",\"worktrees\":$WORKTREES,\"window_ms\":$WINDOW_MS,\"settle_used_ms\":${SETTLE_USED_MS:-$SETTLE_MS},\"cores_total\":$CORES_TOTAL,\"threads\":$THREAD_JSON,\"resources\":$RES_JSON,\"git_sha\":\"$GIT_SHA\",\"host_tag\":\"$HOST_TAG\"}"
+if [ "$SPAWN_ENABLED" = 1 ] && [ "$SAMPLER" = proc ]; then
+  TRACE_FILES=("$TRACE_UI_FILE")
+  if [ "$SCENARIO" = soak-daemon ]; then
+    TRACE_FILES+=("$TRACE_DAEMON_FILE")
+  fi
+  if SPAWN_RESULT="$(python3 "$HERE/lib/spawn-trace.py" "$SPAWN_START_EPOCH" "$SPAWN_END_EPOCH" "${TRACE_FILES[@]}" 2>"$PERF_TMP/spawn-trace.err")"; then
+    SPAWN_JSON="${SPAWN_RESULT%\}} ,\"roots\":${#TRACE_FILES[@]}}"
+    SPAWN_COUNT="$(printf '%s' "$SPAWN_RESULT" | python3 -c 'import json,sys; print(json.load(sys.stdin)["count"])')"
+    if [ "$BUILD" = release ] && [ "$SPAWN_COUNT" -gt "$SPAWN_RATE_CEILING" ]; then
+      echo "FAIL: spawn_rate=$SPAWN_COUNT exceeds fixed ceiling=$SPAWN_RATE_CEILING" >&2
+      SPAWN_FAIL=1
+      SPAWN_JSON="$(printf '%s' "$SPAWN_JSON" | python3 -c 'import json,sys; d=json.load(sys.stdin); d["status"]="failed"; d["error"]="ceiling exceeded"; print(json.dumps(d,separators=(",",":")))')"
+    fi
+  else
+    SPAWN_ERROR="$(cat "$PERF_TMP/spawn-trace.err")"
+    echo "FAIL: spawn-rate trace invalid: ${SPAWN_ERROR:-unknown parser failure}" >&2
+    SPAWN_JSON='{"status":"failed","method":"strace","count":null,"ceiling":0,"offenders":[],"roots":1,"error":"trace invalid"}'
+    SPAWN_FAIL=1
+  fi
+  if [ "$SPAWN_FAIL" != 0 ]; then
+    SPAWN_JSON="$(printf '%s' "$SPAWN_JSON" | python3 -c 'import json,sys; d=json.load(sys.stdin); d["status"]="failed"; d["roots"]=d.get("roots", int(sys.argv[1])); d.setdefault("error", "tracer or target exited before window end"); print(json.dumps(d,separators=(",",":")))' "${#TRACE_FILES[@]}")"
+  fi
+fi
+
+RESULT="{\"scenario\":\"$SCENARIO\",\"build\":\"$BUILD\",\"worktrees\":$WORKTREES,\"window_ms\":$WINDOW_MS,\"settle_used_ms\":${SETTLE_USED_MS:-$SETTLE_MS},\"cores_total\":$CORES_TOTAL,\"threads\":$THREAD_JSON,\"resources\":$RES_JSON,\"spawn_rate\":$SPAWN_JSON,\"git_sha\":\"$GIT_SHA\",\"host_tag\":\"$HOST_TAG\"}"
 
 BASELINE="$BASELINE_DIR/$HOST_TAG.$SCENARIO.json"
 if [ "$RECORD" = 1 ]; then
@@ -576,6 +683,14 @@ else
     fi
   else
     echo "resources: not measured on $(uname -s)"
+  fi
+  if [ "$SPAWN_ENABLED" = 1 ]; then
+    if [ "$SAMPLER" = top ]; then
+      echo 'spawn rate: unsupported on macOS (no Linux strace axis in this lane)'
+    elif [ "$SPAWN_JSON" != 'null' ]; then
+      echo "spawn rate: status=$(printf '%s' "$SPAWN_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["status"])') method=strace count=${SPAWN_COUNT:-unavailable} ceiling=$SPAWN_RATE_CEILING roots=${#TRACE_FILES[@]}"
+      printf '%s' "$SPAWN_JSON" | python3 -c 'import json,sys; d=json.load(sys.stdin); [print("  %s x%d" % (x["command"],x["count"])) for x in d.get("offenders",[])]'
+    fi
   fi
   if [ -f "$BASELINE" ]; then
     BASE_CORES="$(grep -o '"cores_total":[0-9.]*' "$BASELINE" | cut -d: -f2)"
@@ -634,5 +749,10 @@ if [ "$RES_JSON" != "null" ] && [ "$BUILD" = release ]; then
     echo "FAIL: soak-daemon found no daemon to sample — the scenario measured nothing" >&2
     RES_FAIL=1
   fi
+  [ "$SPAWN_FAIL" = 0 ] || RES_FAIL=1
   [ "$RES_FAIL" = 0 ] || exit 2
+fi
+
+if [ "$SPAWN_FAIL" != 0 ]; then
+  exit 2
 fi
