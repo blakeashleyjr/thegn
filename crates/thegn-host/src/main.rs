@@ -1004,12 +1004,13 @@ fn run_main() -> anyhow::Result<()> {
             let mut cfg = admitted.config().clone();
             let channel = crate::channel_state::resolve_and_install();
             crate::diag::register_identity(channel.as_str());
-            thegn_core::log_trace::install(thegn_core::log_trace::Role::Cli, &cfg.log);
-            let clamped = crate::channel_state::clamp_and_record(&mut cfg, channel);
-            if !clamped.is_empty() {
-                tracing::warn!(channel = channel.as_str(), clamped = ?clamped,
-                    "release channel neutralised configured experimental features");
-            }
+            // Deliberately NO `log_trace::install(Role::Cli)` here: `open` may
+            // fall through to the interactive launch, whose `install(Role::Host)`
+            // would then lose the global-subscriber race (log lines to stderr
+            // over the TUI, no log file / startup waterfall). Record the clamp
+            // silently; the TUI's `apply_startup_channel` logs it after the
+            // Host install.
+            let _clamped = crate::channel_state::clamp_and_record(&mut cfg, channel);
             match cmd::open::run(&cfg, &repo, no_launch, preset.as_deref()) {
                 Ok(cmd::open::OpenOutcome::Delivered) => Ok(()),
                 Ok(cmd::open::OpenOutcome::LaunchTui) => Err(None), // fall through

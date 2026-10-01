@@ -1875,7 +1875,28 @@ impl ControlApi for DaemonService {
             let seed = match (&req.branch, &issue) {
                 (Some(b), _) if !b.trim().is_empty() => b.trim().to_string(),
                 (_, Some(id)) => {
-                    let router = thegn_svc::issue::IssueRouter::from_config(&cfg.issues);
+                    // Repo-resolved issues, so the repo overlay's restrictions
+                    // and pins (account filter, team id) apply. The overlay can
+                    // only narrow, never add accounts. (Git + file reads, so
+                    // off the async runtime thread.)
+                    let (cfg2, hint) = (cfg.clone(), req.repo.clone());
+                    let issues_cfg = tokio::task::spawn_blocking(move || {
+                        let root = hint
+                            .as_deref()
+                            .filter(|s| !s.is_empty())
+                            .and_then(|p| thegn_core::repo::main_worktree(std::path::Path::new(p)))
+                            .or_else(|| {
+                                std::env::current_dir()
+                                    .ok()
+                                    .and_then(|c| thegn_core::repo::main_worktree(&c))
+                            });
+                        cfg2.repo_issues(root.as_deref())
+                    })
+                    .await
+                    .map_err(|e| {
+                        ControlError::Internal(anyhow::anyhow!("worktrees.create: {e}"))
+                    })?;
+                    let router = thegn_svc::issue::IssueRouter::from_config(&issues_cfg);
                     let detail = router.get_issue(id).await.map_err(|e| {
                         ControlError::Internal(anyhow::anyhow!("worktrees.create {id}: {e}"))
                     })?;

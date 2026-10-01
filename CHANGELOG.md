@@ -7,6 +7,18 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed — issue trackers are stable-channel; config output redacts secrets (THE-695)
+
+- **Linear, Jira and Kaneo issue trackers are now available on the stable
+  release channel.** Their configuration is no longer stripped by the channel
+  clamp, and `wt new --from-issue` now honours the repo `.thegn.toml`'s
+  `[issues]` restrictions and pins (account filter, team/project) — a repo
+  overlay can only narrow, never add accounts or tokens.
+- **`thegn config get`, `config show` and `config explain` redact secrets.**
+  Tracker, forge and model-proxy credentials (including arrays such as
+  `api_keys`) print as `***redacted***` in text and `--json`; `*_env` names,
+  `project_key`, `binary_cache_key` and numeric/bool values are left intact.
+
 ### Changed — ambiguous `[project.<key>]` blocks are refused, not first-matched (THE-515)
 
 - **A trusted per-project block now applies only when it is unambiguous.** The
