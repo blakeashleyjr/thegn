@@ -668,7 +668,7 @@ if [ "$SPAWN_ENABLED" = 1 ] && [ "$SAMPLER" = proc ]; then
   if [ "$SCENARIO" = soak-daemon ]; then
     TRACE_FILES+=("$TRACE_DAEMON_FILE")
   fi
-  if SPAWN_RESULT="$(python3 "$HERE/lib/spawn-trace.py" "$SPAWN_START_EPOCH" "$SPAWN_END_EPOCH" "${TRACE_FILES[@]}" 2>"$PERF_TMP/spawn-trace.err")"; then
+  if SPAWN_RESULT="$(python3 "$HERE/lib/spawn-trace.py" --pane-shell "$PERF_PANE_SHELL" "$SPAWN_START_EPOCH" "$SPAWN_END_EPOCH" "${TRACE_FILES[@]}" 2>"$PERF_TMP/spawn-trace.err")"; then
     SPAWN_JSON="${SPAWN_RESULT%\}} ,\"roots\":${#TRACE_FILES[@]}}"
     SPAWN_COUNT="$(printf '%s' "$SPAWN_RESULT" | python3 -c 'import json,sys; print(json.load(sys.stdin)["count"])')"
     if [ "$BUILD" = release ] && [ "$SPAWN_COUNT" -gt "$SPAWN_RATE_CEILING" ]; then
