@@ -1276,7 +1276,7 @@ pub fn parse_docker_ps(ndjson: &str) -> Vec<ContainerInfo> {
 /// OCI runtime is installed.
 ///
 /// This is the cheap ambient listing (names, image, status/health) the Sandbox
-/// panel section and container chip need on their 5s cadence. The expensive
+/// panel section and monitor rows need on their visible demand cadence. The expensive
 /// `stats --no-stream` enrichment is [`running_containers_with_stats`], run only
 /// while a surface that displays per-container CPU/mem is visible (the monitor's
 /// Containers tab, or the Sandbox section's expanded stats) — see the host's
@@ -1294,39 +1294,49 @@ pub fn running_containers_with_stats() -> Vec<ContainerInfo> {
 }
 
 fn running_containers_impl(with_stats: bool) -> Vec<ContainerInfo> {
+    running_containers_with(
+        with_stats,
+        |backend| crate::sandbox_backend::cached_available(&Placement::Local, backend),
+        |backend, args| run_local_output(&backend_prefix(backend), args),
+        |backend| oci_stats(backend),
+    )
+}
+
+fn running_containers_with(
+    with_stats: bool,
+    mut available: impl FnMut(Backend) -> Option<RuntimeProbe>,
+    mut run: impl FnMut(Backend, &[&str]) -> Option<String>,
+    mut stats: impl FnMut(Backend) -> std::collections::HashMap<String, ContainerStat>,
+) -> Vec<ContainerInfo> {
     let mut out = Vec::new();
-    if let Some(stdout) = run_local_output(
-        &backend_prefix(Backend::Podman),
-        &["ps", "--format", "json"],
-    ) {
+    if available(Backend::Podman) == Some(RuntimeProbe::Present)
+        && let Some(stdout) = run(Backend::Podman, &["ps", "--format", "json"])
+    {
         let mut rows = parse_podman_ps(&stdout);
         if with_stats {
-            apply_stats(&mut rows, &oci_stats(Backend::Podman));
+            apply_stats(&mut rows, &stats(Backend::Podman));
         }
         out.extend(rows);
     }
-    if let Some(stdout) = run_local_output(
-        &backend_prefix(Backend::PodmanRootful),
-        &["ps", "--format", "json"],
-    ) {
+    if available(Backend::PodmanRootful) == Some(RuntimeProbe::Present)
+        && let Some(stdout) = run(Backend::PodmanRootful, &["ps", "--format", "json"])
+    {
         let mut rows = parse_podman_ps(&stdout);
         for r in &mut rows {
             r.backend = "podman-rootful".into();
         }
         if with_stats {
-            apply_stats(&mut rows, &oci_stats(Backend::PodmanRootful));
+            apply_stats(&mut rows, &stats(Backend::PodmanRootful));
         }
         out.extend(rows);
     }
     if out.is_empty()
-        && let Some(stdout) = run_local_output(
-            &backend_prefix(Backend::Docker),
-            &["ps", "--format", "{{json .}}"],
-        )
+        && available(Backend::Docker) == Some(RuntimeProbe::Present)
+        && let Some(stdout) = run(Backend::Docker, &["ps", "--format", "{{json .}}"])
     {
         let mut rows = parse_docker_ps(&stdout);
         if with_stats {
-            apply_stats(&mut rows, &oci_stats(Backend::Docker));
+            apply_stats(&mut rows, &stats(Backend::Docker));
         }
         out.extend(rows);
     }

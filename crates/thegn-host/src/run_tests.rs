@@ -31,6 +31,30 @@ use crate::naming::issue_branch_tail;
 use crate::session::{GroupKind, Session, WorktreeGroup};
 
 #[test]
+fn container_health_recomputes_for_active_worktree_from_cached_rows() {
+    let rows = vec![thegn_core::sandbox::ContainerInfo {
+        name: "thegn-next".into(),
+        image: "image".into(),
+        status: "Exited (0)".into(),
+        ours: true,
+        backend: "docker".into(),
+        cpu: String::new(),
+        mem: String::new(),
+        net: String::new(),
+        containment: "worktree+caches".into(),
+        mounts: String::new(),
+    }];
+    assert_eq!(
+        container_health_for("thegn-next", &rows),
+        crate::chrome::ContainerHealth::Degraded("Exited (0)".into())
+    );
+    assert_eq!(
+        container_health_for("thegn-other", &rows),
+        crate::chrome::ContainerHealth::Unknown
+    );
+}
+
+#[test]
 fn schema_refusal_is_sticky_and_retains_the_last_good_model_until_recovery() {
     use crate::chrome::StateDbAvailability;
 
