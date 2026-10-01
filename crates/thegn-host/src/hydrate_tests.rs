@@ -1952,3 +1952,91 @@ fn db_worktree_list_omits_only_contested_rows_and_stamps_them() {
     // best-effort: test cleanup
     let _ = std::fs::remove_dir_all(&scratch);
 }
+
+/// THE-706 regression guard. `build_model` runs on every hydration, including
+/// the 5 s safety-net ticker while the TUI is idle, and the file's standing
+/// rule is that the steady state spawns NO subprocess. Reconciling the
+/// registry's stale `branch` column against git must therefore be an in-process
+/// read: this fails if `db_worktree_list_with_snapshot` shells out (the first
+/// cut ran one `git worktree list` per repo root every tick). A remote row must
+/// not exec ssh either: it has no bridge here, so it is `Unavailable`.
+/// Run under nextest: `git_spawn_count` is process-global.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "test fixture: blocking git in a temp repo, never on the event loop"
+)]
+#[test]
+fn warm_hydration_of_local_rows_spawns_no_git_subprocess() {
+    use thegn_core::store::WorkspaceStore;
+    let temp = tempfile::TempDir::new().unwrap();
+    let repo = temp.path().join("repo");
+    let linked = temp.path().join("linked");
+    std::fs::create_dir_all(&repo).unwrap();
+    let git = |dir: &std::path::Path, args: &[&str]| {
+        let out = thegn_core::util::git_cmd(dir).args(args).output().unwrap();
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+    };
+    git(&repo, &["init", "-q", "-b", "main"]);
+    git(&repo, &["config", "user.name", "Test"]);
+    git(&repo, &["config", "user.email", "test@example.invalid"]);
+    std::fs::write(repo.join("f"), "x\n").unwrap();
+    git(&repo, &["add", "f"]);
+    git(
+        &repo,
+        &["-c", "commit.gpgsign=false", "commit", "-q", "-m", "init"],
+    );
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "created",
+            linked.to_str().unwrap(),
+        ],
+    );
+    // The branch moved after creation; the registry still says `created`.
+    git(&linked, &["checkout", "-q", "-b", "moved"]);
+
+    let db = thegn_core::db::Db::open_memory().unwrap();
+    let repo_s = repo.to_string_lossy().into_owned();
+    let linked_s = linked.to_string_lossy().into_owned();
+    db.put_worktree("app/created", &repo_s, &linked_s, "created", None, None)
+        .unwrap();
+    // A remote row (unreachable host): hydration must never exec ssh for it.
+    let remote_path = "/srv/remote-wt";
+    let location =
+        thegn_core::remote::GitLoc::remote_db_string("nonexistent.invalid", 22, false, remote_path);
+    db.put_worktree(
+        "app/remote",
+        &repo_s,
+        remote_path,
+        "remote-reg",
+        Some(&location),
+        None,
+    )
+    .unwrap();
+
+    let before = thegn_svc::git::git_spawn_count();
+    let (listed, observed) =
+        super::db_worktree_list_with_snapshot(&db, &thegn_core::config::Config::default());
+    let after = thegn_svc::git::git_spawn_count();
+    assert_eq!(
+        after - before,
+        0,
+        "hydration spawned a git subprocess in the steady state"
+    );
+    assert_eq!(
+        observed[&linked_s],
+        crate::worktree_snapshot::BranchObservation::Branch("moved".into()),
+        "the stale registry branch must be reconciled in-process"
+    );
+    let shown = listed.iter().find(|w| w.path == linked_s).unwrap();
+    assert_eq!(shown.branch, "moved");
+    assert_eq!(
+        observed[remote_path],
+        crate::worktree_snapshot::BranchObservation::Unavailable,
+        "an un-bridged remote row is never read from hydration"
+    );
+}

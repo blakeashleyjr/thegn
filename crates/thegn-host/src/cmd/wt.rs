@@ -544,6 +544,64 @@ fn resolve_issue_branch(cfg: &Config, root: &std::path::Path, issue_id: &str) ->
     Ok(worktree::dedupe(&seed, &taken))
 }
 
+fn unreadable_note(unreadable_roots: &[String]) -> String {
+    if unreadable_roots.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " (could not read repositories: {})",
+            unreadable_roots.join(", ")
+        )
+    }
+}
+
+/// The NotFound text. It lists the LIVE branches Git reported — registry
+/// branches are creation metadata and can no longer match — and names any repo
+/// root that could not be read, since the target may live there.
+fn no_match_message(target: &str, live_branches: &[String], unreadable_roots: &[String]) -> String {
+    let mut known: Vec<&str> = live_branches.iter().map(String::as_str).collect();
+    known.sort_unstable();
+    known.dedup();
+    format!(
+        "no worktree matches '{target}' (live branches: {}){}",
+        if known.is_empty() {
+            "none".into()
+        } else {
+            known.join(", ")
+        },
+        unreadable_note(unreadable_roots)
+    )
+}
+
+/// `--delete-branch` runs `git branch -D` (force, no merged check) on the LIVE
+/// branch, so it is refused unless that is provably the branch this worktree
+/// was created for, and never for the repository's default branch or the one
+/// the main worktree has checked out.
+fn check_branch_deletable(
+    live: &str,
+    recorded: Option<&str>,
+    default_branch: Option<&str>,
+    main_checked_out: Option<&str>,
+) -> Result<()> {
+    if live.is_empty() {
+        return Ok(());
+    }
+    if let Some(recorded) = recorded.filter(|r| !r.is_empty() && *r != live) {
+        anyhow::bail!(
+            "refusing --delete-branch: the worktree was created on branch '{recorded}' but \
+             currently has '{live}' checked out. Check out '{recorded}' and rerun, or delete \
+             the branch by hand"
+        );
+    }
+    if default_branch == Some(live) || main_checked_out == Some(live) {
+        anyhow::bail!(
+            "refusing --delete-branch: '{live}' is the repository's default / main-worktree \
+             branch; delete it by hand if you really mean to"
+        );
+    }
+    Ok(())
+}
+
 /// `wt rm` — the TUI's `delete_groups` pipeline, synchronous: resolve →
 /// confirm → provider/sandbox teardown → `git worktree remove` → DB cleanup.
 fn rm(cfg: &Config, target: &str, delete_branch: bool, force: bool) -> Result<()> {
@@ -562,45 +620,58 @@ fn rm(cfg: &Config, target: &str, delete_branch: bool, force: bool) -> Result<()
             .unwrap_or_else(|| row.worktree.clone())
             == target_path
     });
-    let mut snapshots = std::collections::HashMap::new();
-    let relevant_roots = path_match
-        .map(|row| vec![row.repo_root.as_str()])
-        .unwrap_or_else(|| rows.iter().map(|row| row.repo_root.as_str()).collect());
-    for root in relevant_roots
-        .into_iter()
-        .filter(|r| !r.is_empty())
-        .collect::<std::collections::HashSet<_>>()
-    {
-        let snapshot = thegn_svc::git::GitBackend::worktrees(
-            &*crate::git_handle::get(),
-            std::path::Path::new(root),
-        );
-        match snapshot {
-            Ok(snapshot) => {
-                snapshots.insert(root, snapshot);
-            }
-            Err(_) if path_match.is_some() && !delete_branch => {}
-            Err(error) => {
-                anyhow::bail!("cannot resolve live worktree branches for {root}: {error}")
-            }
+    // Observe live branches. A repo root git cannot read (stale rows whose repo
+    // is gone) must not sink the whole command: its rows become `Unavailable`
+    // and we only fail if the final match is empty or ambiguous, naming the
+    // roots we could not read. Remote rows never appear in a local `git worktree
+    // list`, so they are read through their location; this is an explicit CLI
+    // verb (not hydration), so one live read per remote row is acceptable.
+    let candidates: Vec<&thegn_core::models::WorktreeRow> = match path_match {
+        Some(row) => vec![row],
+        None => rows.iter().collect(),
+    };
+    let is_remote = |row: &thegn_core::models::WorktreeRow| {
+        thegn_core::remote::GitLoc::from_db(&row.worktree, Some(&row.location)).is_remote()
+    };
+    let mut observations: std::collections::HashMap<
+        String,
+        crate::worktree_snapshot::BranchObservation,
+    > = std::collections::HashMap::new();
+    let mut unreadable_roots: Vec<String> = Vec::new();
+    let mut local_by_root: std::collections::BTreeMap<&str, Vec<thegn_core::models::WorktreeRow>> =
+        Default::default();
+    let mut remote_rows: Vec<thegn_core::models::WorktreeRow> = Vec::new();
+    for row in &candidates {
+        if is_remote(row) {
+            remote_rows.push((*row).clone());
+        } else if !row.repo_root.is_empty() {
+            local_by_root
+                .entry(row.repo_root.as_str())
+                .or_default()
+                .push((*row).clone());
         }
     }
-    // Join once per repo root, not once per row: `join_snapshot` canonicalizes
-    // every path in the snapshot, so calling it per row is quadratic in
-    // (rows x worktrees) filesystem lookups.
-    let joined: std::collections::HashMap<&str, _> = snapshots
-        .iter()
-        .map(|(root, snapshot)| {
-            (
-                *root,
-                crate::worktree_snapshot::join_snapshot(&rows, snapshot),
-            )
-        })
-        .collect();
+    for (root, root_rows) in local_by_root {
+        match thegn_svc::git::GitBackend::worktrees(
+            &*crate::git_handle::get(),
+            std::path::Path::new(root),
+        ) {
+            Ok(snapshot) => observations.extend(crate::worktree_snapshot::join_snapshot(
+                &root_rows, &snapshot,
+            )),
+            Err(_) => unreadable_roots.push(root.to_string()),
+        }
+    }
+    if !remote_rows.is_empty() {
+        observations.extend(crate::worktree_snapshot::observe_rows(
+            &*crate::git_handle::get(),
+            &remote_rows,
+            crate::worktree_snapshot::RemoteRead::Live,
+        ));
+    }
     let live_branch = |row: &thegn_core::models::WorktreeRow| {
-        joined
-            .get(row.repo_root.as_str())
-            .and_then(|observations| observations.get(&row.worktree))
+        observations
+            .get(&row.worktree)
             .and_then(|observation| observation.branch().map(str::to_owned))
     };
     let matches: Vec<_> = path_match.map(|row| vec![row]).unwrap_or_else(|| {
@@ -608,7 +679,8 @@ fn rm(cfg: &Config, target: &str, delete_branch: bool, force: bool) -> Result<()
             .filter(|row| live_branch(row).as_deref() == Some(target))
             .collect()
     });
-    let (path, branch, repo_root) = match matches.as_slice() {
+    // (path, live branch, repo root, the matched row's own tab, recorded branch)
+    let (path, branch, repo_root, row_tab, recorded_branch) = match matches.as_slice() {
         [w] => {
             let branch = live_branch(w);
             if delete_branch && branch.is_none() {
@@ -620,6 +692,8 @@ fn rm(cfg: &Config, target: &str, delete_branch: bool, force: bool) -> Result<()
                 w.worktree.clone(),
                 branch.unwrap_or_default(),
                 (!w.repo_root.is_empty()).then(|| w.repo_root.clone()),
+                Some(w.tab_name.clone()).filter(|t| !t.is_empty()),
+                Some(w.branch.clone()),
             )
         }
         [] => {
@@ -634,18 +708,18 @@ fn rm(cfg: &Config, target: &str, delete_branch: bool, force: bool) -> Result<()
                         target_path.clone(),
                         b,
                         Some(r.to_string_lossy().into_owned()),
+                        None,
+                        None,
                     )
                 }
                 _ => {
-                    let mut known: Vec<&str> = rows.iter().map(|w| w.branch.as_str()).collect();
-                    known.sort_unstable();
-                    return Err(anyhow::Error::new(super::NotFound(format!(
-                        "no worktree matches '{target}' (known branches: {})",
-                        if known.is_empty() {
-                            "none".into()
-                        } else {
-                            known.join(", ")
-                        }
+                    return Err(anyhow::Error::new(super::NotFound(no_match_message(
+                        target,
+                        &candidates
+                            .iter()
+                            .filter_map(|row| live_branch(row))
+                            .collect::<Vec<_>>(),
+                        &unreadable_roots,
                     ))));
                 }
             }
@@ -653,11 +727,32 @@ fn rm(cfg: &Config, target: &str, delete_branch: bool, force: bool) -> Result<()
         many => {
             let paths: Vec<&str> = many.iter().map(|w| w.worktree.as_str()).collect();
             anyhow::bail!(
-                "'{target}' is ambiguous — pass a path instead: {}",
-                paths.join(", ")
+                "'{target}' is ambiguous — pass a path instead: {}{}",
+                paths.join(", "),
+                unreadable_note(&unreadable_roots)
             );
         }
     };
+
+    if delete_branch {
+        let root_path = repo_root
+            .as_deref()
+            .map(std::path::PathBuf::from)
+            .or_else(|| thegn_core::repo::main_worktree(std::path::Path::new(&path)));
+        let (default_branch, main_checked_out) = match &root_path {
+            Some(root) => (
+                Some(worktree::default_branch(root)),
+                util::git_out(root, &["symbolic-ref", "--quiet", "--short", "HEAD"]),
+            ),
+            None => (None, None),
+        };
+        check_branch_deletable(
+            &branch,
+            recorded_branch.as_deref(),
+            default_branch.as_deref(),
+            main_checked_out.as_deref(),
+        )?;
+    }
 
     let root_s = repo_root
         .or_else(|| {
@@ -710,13 +805,53 @@ fn rm(cfg: &Config, target: &str, delete_branch: bool, force: bool) -> Result<()
     }
 
     // DB cleanup (best-effort: the DB is a cache; git above was the truth).
-    let tab = thegn_core::repo::branch_tab(&thegn_core::repo::repo_slug(&root), &branch);
+    // The matched row's OWN tab, never one rebuilt from the live branch: a
+    // sibling worktree created as `feat-b` and later checked out elsewhere
+    // still owns tab `app/feat-b`, and a branch-derived name would delete it.
     let _ = db.del_worktree(&path); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
-    let _ = db.del_worktree_for_tab(&root_s, &tab); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+    if let Some(tab) = &row_tab {
+        let _ = db.del_worktree_for_tab(&root_s, tab); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+    }
     // Session id == the workspace repo path; key tab-group rows by worktree
     // path so a renamed display group can't leave a resurrecting row behind.
     let _ = db.delete_tab_groups_for_worktree(&root_s, &path); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
 
     outln!("removed {path}");
     Ok(())
+}
+
+#[cfg(test)]
+mod rm_tests {
+    use super::*;
+
+    #[test]
+    fn delete_branch_refuses_when_live_branch_differs_from_recorded() {
+        let err = check_branch_deletable("main", Some("tg/x"), Some("main"), None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("tg/x") && err.contains("main"), "{err}");
+        assert!(err.contains("refusing --delete-branch"), "{err}");
+    }
+
+    #[test]
+    fn delete_branch_never_touches_default_or_main_worktree_branch() {
+        // Even when recorded == live (or unrecorded), the default branch and
+        // the branch the main worktree holds are never force-deleted here.
+        assert!(check_branch_deletable("main", Some("main"), Some("main"), None).is_err());
+        assert!(check_branch_deletable("trunk", None, Some("main"), Some("trunk")).is_err());
+        assert!(check_branch_deletable("tg/x", Some("tg/x"), Some("main"), Some("main")).is_ok());
+        assert!(check_branch_deletable("tg/x", None, None, None).is_ok());
+    }
+
+    #[test]
+    fn no_match_message_lists_live_branches_and_unreadable_roots() {
+        let msg = no_match_message(
+            "feat-x",
+            &["b".into(), "a".into(), "a".into()],
+            &["/gone".into()],
+        );
+        assert!(msg.contains("live branches: a, b"), "{msg}");
+        assert!(msg.contains("could not read repositories: /gone"), "{msg}");
+        assert!(no_match_message("t", &[], &[]).contains("none"));
+    }
 }
