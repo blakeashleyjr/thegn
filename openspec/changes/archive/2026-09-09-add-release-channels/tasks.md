@@ -3,7 +3,7 @@
 ## 1. Capability registry (thegn-core)
 
 - [x] 1.1 `channel.rs`: `Channel { Stable, Dev }`, `Stability`, `Feature`
-      (`Remote`/`Providers`/`Ai`/`Observe`/`Placement`), pure
+      (`Remote`/`Providers`/`Ai`/`Observe`/`Placement`/`Trackers`), pure
       `stability`/`allowed_in` + `Channel::parse`; exported from `lib.rs`.
 - [x] 1.2 Unit tests: experimental set is dev-only, `ALL` exhaustive, ids
       unique, parse aliases (`release`→stable, `experimental`→dev).
