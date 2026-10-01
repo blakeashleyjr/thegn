@@ -184,8 +184,11 @@ pub(crate) fn print_schema() {
 fn explain(cfg: &Config, key: &str, repo: Option<String>, json: bool, path: PathBuf) -> Result<()> {
     use thegn_core::config::ProcessEnv;
     use thegn_core::config_resolve;
-    let origin = config_resolve::explain(&ProcessEnv, &[], Some(path), key)
+    let mut origin = config_resolve::explain(&ProcessEnv, &[], Some(path), key)
         .map_err(|error| anyhow::anyhow!("config explain: {error}"))?;
+    // Every value this verb prints (effective, each trace layer, the workspace
+    // layer) is redacted by the same policy as `config get`.
+    redact_origin(&mut origin);
     // The per-repo layers are NOT part of the preference cascade `explain`
     // replays, so without this the trace confidently reported the global value
     // for a key a `[workspace.<slug>]` block had already overridden — the probe
@@ -198,7 +201,8 @@ fn explain(cfg: &Config, key: &str, repo: Option<String>, json: bool, path: Path
         .and_then(|p| thegn_core::repo::main_worktree(&p));
     let ws = repo_root
         .as_ref()
-        .and_then(|root| workspace_layer(cfg, root, key));
+        .and_then(|root| workspace_layer(cfg, root, key))
+        .map(|(slug, v)| (slug, redact_at(&origin.key, v)));
     // THE-515: an ambiguous trusted overlay is refused, never silently
     // skipped — explain must say which block and why.
     let refused = repo_root
@@ -333,12 +337,79 @@ fn repo_clamp(cfg: &Config, repo: &str, key: &str) -> (Vec<String>, Vec<String>)
 }
 
 fn show(cfg: &Config, json: bool) -> Result<()> {
-    if json {
-        outln!("{}", serde_json::to_string_pretty(cfg)?);
-    } else {
-        thegn_core::out!("{}", toml::to_string_pretty(cfg)?);
-    }
+    thegn_core::out!("{}", show_text(cfg, json)?);
     Ok(())
+}
+
+/// The effective config as printed by `config show`, with every secret masked
+/// by the canonical redactor (tracker / forge / model-proxy credentials all
+/// survive into the effective config, so this must never serialize `cfg`
+/// directly).
+fn show_text(cfg: &Config, json: bool) -> Result<String> {
+    if json {
+        let mut value = serde_json::to_value(cfg)?;
+        thegn_core::redact::redact_json(&mut value);
+        return Ok(format!("{}\n", serde_json::to_string_pretty(&value)?));
+    }
+    // TOML text is redacted on the toml_edit tree (not via a JSON round-trip)
+    // so the typed `Config`'s field order — which the maps in serde_json /
+    // toml::Value would sort alphabetically — is preserved.
+    let mut doc: toml_edit::DocumentMut = toml::to_string_pretty(cfg)?.parse()?;
+    redact_toml_table(doc.as_table_mut());
+    Ok(doc.to_string())
+}
+
+/// The same policy as [`thegn_core::redact::redact_json`] (strings and arrays
+/// of strings under a sensitive key become the placeholder; tables recurse),
+/// using the canonical `is_sensitive` predicate.
+fn redact_toml_table(table: &mut toml_edit::Table) {
+    for (key, item) in table.iter_mut() {
+        redact_toml_item(item, thegn_core::redact::is_sensitive(key.get()));
+    }
+}
+
+fn redact_toml_item(item: &mut toml_edit::Item, masked: bool) {
+    match item {
+        toml_edit::Item::Table(t) => redact_toml_table(t),
+        toml_edit::Item::ArrayOfTables(a) => a.iter_mut().for_each(redact_toml_table),
+        toml_edit::Item::Value(v) => redact_toml_value(v, masked),
+        toml_edit::Item::None => {}
+    }
+}
+
+fn redact_toml_value(value: &mut toml_edit::Value, masked: bool) {
+    match value {
+        toml_edit::Value::String(_) if masked => {
+            *value = toml_edit::Value::from(thegn_core::redact::PLACEHOLDER);
+        }
+        toml_edit::Value::Array(a) => a.iter_mut().for_each(|v| redact_toml_value(v, masked)),
+        toml_edit::Value::InlineTable(t) => {
+            for (key, v) in t.iter_mut() {
+                redact_toml_value(v, thegn_core::redact::is_sensitive(key.get()));
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Mask `value` as the value of config key `key`: a sensitive final segment
+/// masks the strings under it; objects are recursed.
+fn redact_at(key: &str, value: serde_json::Value) -> serde_json::Value {
+    let last = key.rsplit('.').next().unwrap_or(key);
+    let mut wrapped = serde_json::json!({ last: value });
+    thegn_core::redact::redact_json(&mut wrapped);
+    wrapped
+        .get_mut(last)
+        .map(serde_json::Value::take)
+        .unwrap_or(serde_json::Value::Null)
+}
+
+fn redact_origin(origin: &mut thegn_core::config_resolve::KeyOrigin) {
+    let key = origin.key.clone();
+    origin.value = redact_at(&key, origin.value.take());
+    for (_, v) in &mut origin.trace {
+        *v = redact_at(&key, v.take());
+    }
 }
 
 fn get(cfg: &Config, key: &str, json: bool, path: &Path) -> Result<()> {
@@ -360,17 +431,7 @@ fn get(cfg: &Config, key: &str, json: bool, path: &Path) -> Result<()> {
             ),
         };
     }
-    let plain = if key == "issues" || key.starts_with("issues.issue_accounts") {
-        redacted_value_at(cfg, key).map(render_config_value)
-    } else if key
-        .rsplit('.')
-        .next()
-        .is_some_and(thegn_core::redact::is_sensitive)
-    {
-        Some(thegn_core::redact::PLACEHOLDER.to_string())
-    } else {
-        cfg.get_dotted(key)
-    };
+    let plain = get_text(cfg, key);
     match plain {
         Some(v) => {
             outln!("{v}");
@@ -383,20 +444,43 @@ fn get(cfg: &Config, key: &str, json: bool, path: &Path) -> Result<()> {
     }
 }
 
+/// The text-mode rendering of `config get <key>`. Anything structured (a table
+/// or array) and anything under a sensitive key goes through the redactor; the
+/// hand-mapped `get_dotted` renderer (display-form enums, `repo_roots` joins,
+/// computed defaults such as `log.dir`) is used only for non-sensitive scalars
+/// and for keys the JSON tree does not carry.
+fn get_text(cfg: &Config, key: &str) -> Option<String> {
+    let canonical = thegn_core::config_compat::canonical_key(key);
+    match redacted_value_at(cfg, &canonical) {
+        Some(v @ (serde_json::Value::Object(_) | serde_json::Value::Array(_))) => {
+            Some(render_config_value(v))
+        }
+        Some(v) => {
+            let last = canonical.rsplit('.').next().unwrap_or(&canonical);
+            if thegn_core::redact::is_sensitive(last) {
+                Some(render_config_value(v))
+            } else {
+                cfg.get_dotted(&canonical)
+                    .or_else(|| Some(render_config_value(v)))
+            }
+        }
+        None => {
+            let last = canonical.rsplit('.').next().unwrap_or(&canonical);
+            if thegn_core::redact::is_sensitive(last) {
+                None
+            } else {
+                cfg.get_dotted(&canonical)
+            }
+        }
+    }
+}
+
 /// Resolve a config value for user-facing output and mask secret-bearing keys.
 /// Redact the selected subtree (for `config get issues`) and also inspect the
 /// final dotted key (for `config get issues.issue_accounts.0.token`).
 fn redacted_value_at(cfg: &Config, key: &str) -> Option<serde_json::Value> {
-    let mut value = cfg.value_at(key)?;
-    thegn_core::redact::redact_json(&mut value);
-    if key
-        .rsplit('.')
-        .next()
-        .is_some_and(thegn_core::redact::is_sensitive)
-    {
-        value = serde_json::json!(thegn_core::redact::PLACEHOLDER);
-    }
-    Some(value)
+    let canonical = thegn_core::config_compat::canonical_key(key);
+    Some(redact_at(&canonical, cfg.value_at(key)?))
 }
 
 fn render_config_value(value: serde_json::Value) -> String {
@@ -755,5 +839,190 @@ mod tests {
         assert!(!cfg.repo_merge_queue(&repo).enabled);
 
         let _ = std::fs::remove_dir_all(&dir); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
+    }
+
+    // ---- secret-leak regression tests (synthetic canaries only) -----------
+
+    const CANARIES: &[&str] = &[
+        "CANARY-LINEAR-KEY",
+        "CANARY-JIRA-TOKEN",
+        "CANARY-KANEO-KEY",
+        "CANARY-ACCT-TOKEN",
+        "CANARY-MP-KEY-1",
+        "CANARY-MP-KEY-2",
+        "CANARY-MP-KEY",
+        "CANARY-GH-TOKEN",
+    ];
+
+    fn canary_config() -> Config {
+        toml::from_str(
+            r#"
+[issues.linear]
+api_key = "CANARY-LINEAR-KEY"
+team_id = "TEAM1"
+
+[issues.jira]
+base_url = "https://jira.example.test"
+api_token = "CANARY-JIRA-TOKEN"
+project_key = "PROJ"
+
+[issues.kaneo]
+base_url = "https://kaneo.example.test"
+api_key = "CANARY-KANEO-KEY"
+
+[[issues.issue_accounts]]
+name = "work"
+provider = "linear"
+token = "CANARY-ACCT-TOKEN"
+
+[[forges]]
+name = "ghe"
+token = "CANARY-GH-TOKEN"
+
+[[model_proxy.providers]]
+name = "p1"
+api_key = "CANARY-MP-KEY"
+api_keys = ["CANARY-MP-KEY-1", "CANARY-MP-KEY-2"]
+
+[[model_proxy.routes]]
+name = "small"
+auto_max_tokens = 4096
+
+[env.e1.provider]
+provider = "daytona"
+api_key_env = "DAYTONA_API_KEY"
+binary_cache_key = "cache.example.test-1:PUBLICKEY"
+"#,
+        )
+        .expect("canary config parses")
+    }
+
+    fn assert_clean(label: &str, out: &str) {
+        for c in CANARIES {
+            assert!(!out.contains(c), "{label} leaked {c}:\n{out}");
+        }
+    }
+
+    #[test]
+    fn config_get_never_prints_a_secret() {
+        let cfg = canary_config();
+        for key in [
+            "issues",
+            "issues.linear",
+            "issues.jira",
+            "issues.kaneo",
+            "issues.issue_accounts",
+            "issues.issue_accounts.0",
+            "issues.linear.api_key",
+            "issues.jira.api_token",
+            "forges",
+            "forges.0",
+            "forges.0.token",
+            "model_proxy",
+            "model_proxy.providers",
+            "model_proxy.providers.0.api_keys",
+        ] {
+            let text = get_text(&cfg, key).unwrap_or_else(|| panic!("{key} should resolve"));
+            assert_clean(&format!("get {key}"), &text);
+            let json = redacted_value_at(&cfg, key).expect(key).to_string();
+            assert_clean(&format!("get --json {key}"), &json);
+        }
+        // The secret leaf itself is the placeholder, not empty.
+        assert_eq!(
+            get_text(&cfg, "issues.linear.api_key").as_deref(),
+            Some(thegn_core::redact::PLACEHOLDER)
+        );
+    }
+
+    #[test]
+    fn config_get_keeps_hand_mapped_scalars_and_non_secrets() {
+        let cfg = canary_config();
+        // get_dotted-rendered scalar still works.
+        assert_eq!(
+            get_text(&cfg, "picker"),
+            Config::default().get_dotted("picker")
+        );
+        assert!(get_text(&cfg, "no.such.key").is_none());
+        assert_eq!(
+            get_text(&cfg, "issues.jira.project_key").as_deref(),
+            Some("PROJ")
+        );
+        assert_eq!(
+            get_text(&cfg, "env.e1.provider.api_key_env").as_deref(),
+            Some("DAYTONA_API_KEY")
+        );
+        assert_eq!(
+            redacted_value_at(&cfg, "model_proxy.routes.0.auto_max_tokens"),
+            Some(serde_json::json!(4096))
+        );
+    }
+
+    #[test]
+    fn config_show_never_prints_a_secret_and_keeps_non_secrets() {
+        let cfg = canary_config();
+        let toml_out = show_text(&cfg, false).expect("toml");
+        let json_out = show_text(&cfg, true).expect("json");
+        assert_clean("show", &toml_out);
+        assert_clean("show --json", &json_out);
+        assert!(toml_out.contains("PROJ"), "{toml_out}");
+        assert!(toml_out.contains("DAYTONA_API_KEY"));
+        assert!(toml_out.contains("cache.example.test-1:PUBLICKEY"));
+        assert!(toml_out.contains(thegn_core::redact::PLACEHOLDER));
+        let parsed: serde_json::Value = serde_json::from_str(&json_out).expect("valid json");
+        assert_eq!(parsed["issues"]["jira"]["project_key"], "PROJ");
+        assert_eq!(
+            parsed["env"]["e1"]["provider"]["api_key_env"],
+            "DAYTONA_API_KEY"
+        );
+        assert_eq!(
+            parsed["env"]["e1"]["provider"]["binary_cache_key"],
+            "cache.example.test-1:PUBLICKEY"
+        );
+        assert_eq!(
+            parsed["model_proxy"]["routes"][0]["auto_max_tokens"],
+            serde_json::json!(4096),
+            "a number must stay a number"
+        );
+        assert_eq!(
+            parsed["model_proxy"]["providers"][0]["api_keys"][0],
+            thegn_core::redact::PLACEHOLDER
+        );
+        // Struct field order is preserved (test/smoke.sh greps `[observe]`
+        // followed by its first key).
+        let observe: Vec<&str> = toml_out
+            .lines()
+            .skip_while(|l| *l != "[observe]")
+            .take(2)
+            .collect();
+        assert!(
+            observe.get(1).is_some_and(|l| l.starts_with("enabled = ")),
+            "{observe:?}"
+        );
+        // The TOML rendering is itself valid TOML.
+        toml_out.parse::<toml::Table>().expect("valid toml");
+    }
+
+    #[test]
+    fn config_explain_never_prints_a_secret() {
+        use thegn_core::config::ProcessEnv;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[issues.linear]\napi_key = \"CANARY-LINEAR-KEY\"\n[issues.jira]\napi_token = \"CANARY-JIRA-TOKEN\"\n",
+        )
+        .unwrap();
+        for key in ["issues.linear.api_key", "issues.linear", "issues"] {
+            let mut origin =
+                thegn_core::config_resolve::explain(&ProcessEnv, &[], Some(path.clone()), key)
+                    .expect("explain");
+            // Precondition: the raw origin does carry the canary (so the test
+            // would fail if redaction were removed).
+            let raw = format!("{} {:?}", origin.value, origin.trace);
+            assert!(raw.contains("CANARY-LINEAR-KEY"), "{key}: precondition");
+            redact_origin(&mut origin);
+            let shown = format!("{} {:?}", origin.value, origin.trace);
+            assert_clean(&format!("explain {key}"), &shown);
+        }
     }
 }

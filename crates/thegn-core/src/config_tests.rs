@@ -3138,16 +3138,19 @@ fn stable_layered_config_keeps_linear_trackers_across_base_profile_and_repo_over
     std::fs::create_dir_all(config_home.join("thegn/profiles/work")).unwrap();
     std::fs::create_dir_all(&repo).unwrap();
 
+    // Base sets the legacy provider; the PROFILE (trusted, user-owned) adds the
+    // provider list and the account with its token; the repo `.thegn.toml`
+    // can only RESTRICT (by account name) and pin the team.
     let base = dir.path().join("base.toml");
     std::fs::write(&base, "[issues]\nprovider = \"linear\"\n").unwrap();
     std::fs::write(
         config_home.join("thegn/profiles/work/config.toml"),
-        "[issues]\nproviders = [\"linear\"]\n",
+        "[issues]\nproviders = [\"linear\"]\n\n[[issues.issue_accounts]]\nname = \"linear-work\"\nprovider = \"linear\"\ntoken = \"THE695_SYNTHETIC_CANARY\"\n",
     )
     .unwrap();
     std::fs::write(
         repo.join(".thegn.toml"),
-        "[[issues.issue_accounts]]\nname = \"linear-work\"\nprovider = \"linear\"\ntoken = \"THE695_SYNTHETIC_CANARY\"\n",
+        "[issues]\naccounts = [\"linear-work\"]\n\n[issues.linear]\nteam_id = \"TEAM-PIN\"\n",
     )
     .unwrap();
 
@@ -3163,8 +3166,35 @@ fn stable_layered_config_keeps_linear_trackers_across_base_profile_and_repo_over
     assert_eq!(issues.provider, IssueProviderKind::Linear);
     assert_eq!(issues.providers, vec![IssueProviderKind::Linear]);
     assert_eq!(issues.issue_accounts.len(), 1);
+    assert_eq!(issues.issue_accounts[0].name, "linear-work");
     assert_eq!(issues.issue_accounts[0].provider, IssueProviderKind::Linear);
     assert_eq!(issues.issue_accounts[0].token, "THE695_SYNTHETIC_CANARY");
+    assert_eq!(issues.linear.team_id, "TEAM-PIN");
+}
+
+#[test]
+fn repo_overlay_cannot_inject_tracker_accounts() {
+    // Security: a cloned repo's `.thegn.toml` must never be able to add a
+    // tracker account (or a token) — `[issues]` there is a restriction-only
+    // overlay.
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(
+        repo.join(".thegn.toml"),
+        "[[issues.issue_accounts]]\nname = \"evil\"\nprovider = \"linear\"\ntoken = \"THE695_REPO_CANARY\"\n\n[issues.linear]\napi_key = \"THE695_REPO_CANARY\"\n",
+    )
+    .unwrap();
+
+    let cfg = Config::default();
+    let issues = cfg.repo_issues(Some(&repo));
+    assert!(
+        issues.issue_accounts.is_empty(),
+        "{:?}",
+        issues.issue_accounts
+    );
+    let dump = serde_json::to_string(&issues).unwrap();
+    assert!(!dump.contains("THE695_REPO_CANARY"), "{dump}");
 }
 
 #[test]
