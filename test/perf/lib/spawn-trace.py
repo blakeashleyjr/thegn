@@ -24,14 +24,19 @@ What counts as ONE spawn
 
 What is NOT thegn's spawn
   * `-f` also follows pane shells (the daemon's panes, or in-process panes under
-    THEGN_NO_DAEMON) and whatever their rc files and prompt hooks exec. Using the
-    clone/fork/vfork results we build a pid->parent map; an interactive shell
-    (a shell binary with no `-c`) exec'd by a process that is not itself already
-    inside a pane marks the root of a pane subtree, and every exec in that
-    subtree is reported separately as `excluded` (informational, never counted).
-    thegn's own `sh -c ...` helpers are therefore still counted. Residual
-    limitation: a pane started as a non-shell command is counted (it is still a
-    thegn spawn, and idle thegn does not start panes).
+    THEGN_NO_DAEMON) and whatever their rc files and prompt hooks exec. thegn
+    spawns a pane shell from `$SHELL` verbatim (panes.rs `pane_shell_argv`), and
+    the harness points `$SHELL` at a uniquely named symlink (`--pane-shell`).
+    Using the clone/fork/vfork results we build a pid->parent map; an exec whose
+    argv[0] is EXACTLY that marker path marks the root of a pane subtree, and
+    every exec in the subtree is reported separately as `excluded` (informational,
+    never counted). Nothing else is ever excluded -- argv shape (`bash --version`,
+    `sh -s`, `sh script.sh`) proves nothing -- and with no `--pane-shell` given
+    nothing is excluded at all. Residual limitation: a pane started as a
+    non-shell command is counted (it is still a thegn spawn, and idle thegn does
+    not start panes).
+  * Per-pid exec state is reset when clone/fork/vfork hands out that pid, so pid
+    reuse cannot inherit an earlier process's history.
 """
 
 import json
@@ -41,15 +46,15 @@ from collections import Counter
 from pathlib import Path
 
 
-LINE = re.compile(r"^(?:\[pid\s+(?P<bpid>\d+)\]|(?P<pid>\d+))?\s*(?P<time>\d+\.\d+)\s+(?P<body>.*)$")
+# The pid prefix is MANDATORY (`-f` always prints it). Were it optional, a line
+# `1790000000.5 execve(...)` would backtrack into pid `179000000`, time `0.5`.
+LINE = re.compile(r"^(?:\[pid\s+(?P<bpid>\d+)\]|(?P<pid>\d+))\s+(?P<time>\d+\.\d+)\s+(?P<body>.*)$")
 RESUMED = re.compile(r"^<\.\.\. (?P<name>\w+|\?\?\?) resumed>(?P<rest>.*)$")
 CALL = re.compile(r"^(?P<name>\w+|\?\?\?)\((?P<args>.*)$")
 RESULT = re.compile(r"\)\s*=\s*(-?\d+|\?)")
 UNFINISHED = " <unfinished ...>"
 SPAWN_CALLS = {"clone", "clone3", "fork", "vfork"}
-SHELLS = {"sh", "bash", "dash", "zsh", "fish", "ksh", "tcsh", "csh", "nu", "elvish", "xonsh"}
 UNREADABLE = "<unreadable execve"
-COMMAND_FLAG = re.compile(r"^-[A-Za-z]*c[A-Za-z]*$")
 
 
 class TraceError(ValueError):
@@ -158,7 +163,7 @@ def read_events(path: Path) -> list[tuple[float, int, str, str, str]]:
                 if line.startswith("strace:"):
                     continue  # tracer diagnostics ("Process N attached")
                 raise TraceError("unrecognised line")
-            pid = int(match.group("pid") or match.group("bpid") or 0)
+            pid = int(match.group("pid") or match.group("bpid"))
             stamp = float(match.group("time"))
             text = match.group("body")
             if text.startswith(("---", "+++")) or text.endswith("<detached ...>"):
@@ -188,12 +193,21 @@ def read_events(path: Path) -> list[tuple[float, int, str, str, str]]:
     return events
 
 
-def collapse_execs(events) -> list[tuple[float, int, list[str]]]:
-    """One entry per logical spawn: see the module docstring."""
+def collapse_execs(events, start: float = float("-inf"), end: float = float("inf")) -> list[tuple[float, int, list[str]]]:
+    """One entry per logical spawn: see the module docstring.
+
+    Per-pid exec state is cleared whenever a clone/fork/vfork returns that pid
+    as a child, so a reused pid never inherits its predecessor's history."""
     spawns = []
     failed: dict[int, dict[tuple, float]] = {}
-    execed: set[int] = set()
-    for stamp, pid, name, args, result in events:
+    execed: dict[int, float] = {}  # pid -> stamp of its latest READABLE successful exec
+    for stamp, pid, name, args, result in sorted(events, key=lambda event: event[0]):
+        if name in SPAWN_CALLS:
+            if result.isdigit() and int(result) > 0:
+                child = int(result)
+                execed.pop(child, None)
+                spawns.extend((first, child, list(key)) for key, first in failed.pop(child, {}).items())
+            continue
         if name != "execve":
             continue
         try:
@@ -204,12 +218,16 @@ def collapse_execs(events) -> list[tuple[float, int, list[str]]]:
         if result.startswith("-"):
             failed.setdefault(pid, {}).setdefault(key, stamp)
             continue
-        if argv[0].startswith(UNREADABLE) and pid in execed:
+        unreadable = argv[0].startswith(UNREADABLE)
+        if unreadable and pid in execed and start <= execed[pid] <= end:
             # A pid's second exec with unreadable args is the setuid/wrapper
             # hand-off of the SAME spawn (`/run/wrappers/bin/sudo` re-exec'ing the
-            # real binary); the spawn was already counted by its first exec.
+            # real binary); that spawn was already counted by its first exec --
+            # but only when that first exec is itself inside the window. Anything
+            # else (earlier exec out of window, reused pid) is a new spawn.
             continue
-        execed.add(pid)
+        if not unreadable:
+            execed[pid] = stamp
         pending = failed.pop(pid, {})
         pending.pop(key, None)  # PATH-search misses of this very spawn
         spawns.extend((first, pid, list(other)) for other, first in pending.items())
@@ -220,18 +238,12 @@ def collapse_execs(events) -> list[tuple[float, int, list[str]]]:
     return spawns
 
 
-def is_pane_shell(argv: list[str]) -> bool:
-    if Path(argv[0].lstrip("-")).name not in SHELLS:
-        return False
-    return not any(COMMAND_FLAG.match(arg) for arg in argv[1:])
-
-
 def label_of(argv: list[str]) -> str:
     command = Path(argv[0]).name or argv[0]
     return " ".join([command, *argv[1:4]])
 
 
-def parse_traces(paths: list[Path], start: float, end: float) -> dict:
+def parse_traces(paths: list[Path], start: float, end: float, pane_shell: str | None = None) -> dict:
     counted = Counter()
     excluded = Counter()
     total_execs = 0
@@ -241,7 +253,7 @@ def parse_traces(paths: list[Path], start: float, end: float) -> dict:
         for _, pid, name, _, result in events:
             if name in SPAWN_CALLS and result.isdigit() and int(result) > 0:
                 parent[int(result)] = pid
-        spawns = collapse_execs(events)
+        spawns = collapse_execs(events, start, end)
         if not spawns:
             raise TraceError(f"trace contains no execve events: {path}")
         total_execs += len(spawns)
@@ -258,7 +270,7 @@ def parse_traces(paths: list[Path], start: float, end: float) -> dict:
 
         for stamp, pid, argv in spawns:
             skip = in_pane(pid)
-            if not skip and is_pane_shell(argv) and parent.get(pid):
+            if not skip and pane_shell is not None and argv[0] == pane_shell and parent.get(pid):
                 panes.add(pid)
                 skip = True
             if start <= stamp <= end:
@@ -322,7 +334,7 @@ def self_test() -> None:
     text = concurrent.read_text()
     assert "<unfinished ...>" in text and "resumed>" in text and "ENOENT" in text
     first = float(text.split()[1])
-    result = parse_traces([concurrent], first + 0.001, 1e12)  # skip the root's own exec
+    result = parse_traces([concurrent], first + 0.001, 1e12, pane_shell="bash")  # skip the root's own exec
     counted = {o["command"]: o["count"] for o in result["offenders"]}
     argv4 = 'a "quoted" \\ value\nnewline é'
     assert argv_from_args(
@@ -388,6 +400,67 @@ def self_test() -> None:
         )
         assert parse_traces([trace], 0.0, 9.0)["count"] == 1
         cases += 1
+        # readable exec BEFORE the window + unreadable exec inside it: counted
+        trace.write_text(
+            '7 1.0 execve("/bin/helper", ["helper"], 0x1) = 0\n'
+            '7 25.0 execve(0x40c148, 0x7ffe, 0x7ffe) = 0\n',
+            encoding="utf-8",
+        )
+        assert parse_traces([trace], 20.0, 30.0)["count"] == 1
+        cases += 1
+        # pid reuse: first exec of the reused pid is unreadable -> counted
+        trace.write_text(
+            '100 1.0 clone(child_stack=NULL) = 7\n'
+            '7 21.0 execve("/bin/helper", ["helper"], 0x1) = 0\n'
+            '100 25.0 vfork() = 7\n'
+            '7 25.5 execve(0x40c148, 0x7ffe, 0x7ffe) = 0\n',
+            encoding="utf-8",
+        )
+        assert parse_traces([trace], 20.0, 30.0)["count"] == 2
+        cases += 1
+        # unprefixed line (no pid) is fatal, not mis-timed
+        expect_fatal(directory, '1790000000.500000 execve("/bin/git", ["git", "status"], 0x1) = 0\n')
+        cases += 1
+        # shell-shaped execs are NOT pane roots; only the marker path is
+        marker = "/tmp/x/bin/thegn-perf-pane-shell"
+        thegn = '100 1.0 execve("/bin/thegn", ["thegn"], 0x1) = 0\n'
+        for name, body in (
+            ("bash --version", ["bash", "--version"]),
+            ("sh script.sh", ["sh", "/path/script.sh"]),
+        ):
+            trace.write_text(
+                thegn + '100 5.0 clone(child_stack=NULL) = 101\n'
+                f'101 5.1 execve("/bin/{body[0]}", {json.dumps(body)}, 0x1) = 0\n',
+                encoding="utf-8",
+            )
+            result = parse_traces([trace], 2.0, 9.0, pane_shell=marker)
+            assert result["count"] == 1 and result["excluded"] == [], (name, result)
+            cases += 1
+        trace.write_text(
+            thegn + '100 5.0 clone(child_stack=NULL) = 101\n'
+            '101 5.1 execve("/bin/sh", ["sh", "-s"], 0x1) = 0\n'
+            '101 5.2 clone(child_stack=NULL) = 102\n'
+            '102 5.3 execve("/bin/podman", ["podman", "ps"], 0x1) = 0\n',
+            encoding="utf-8",
+        )
+        result = parse_traces([trace], 2.0, 9.0, pane_shell=marker)
+        assert result["count"] == 2 and result["excluded"] == [], result
+        cases += 1
+        trace.write_text(
+            thegn + '100 5.0 clone(child_stack=NULL) = 101\n'
+            f'101 5.1 execve("{marker}", ["{marker}"], 0x1) = 0\n'
+            '101 5.2 clone(child_stack=NULL) = 102\n'
+            '102 5.3 execve("/bin/podman", ["podman", "ps"], 0x1) = 0\n'
+            '100 6.0 clone(child_stack=NULL) = 103\n'
+            '103 6.1 execve("/bin/git", ["git", "status"], 0x1) = 0\n',
+            encoding="utf-8",
+        )
+        result = parse_traces([trace], 2.0, 9.0, pane_shell=marker)
+        assert result["count"] == 1 and result["offenders"][0]["command"] == "git status", result
+        assert sum(o["count"] for o in result["excluded"]) == 2, result
+        # with no marker given, nothing is ever excluded
+        assert parse_traces([trace], 2.0, 9.0)["count"] == 3
+        cases += 1
         # window boundary
         trace.write_text('90 19.999999 execve("/bin/true", ["true"], 0x1) = 0\n', encoding="utf-8")
         assert parse_traces([trace], 20.0, 30.0)["count"] == 0
@@ -402,14 +475,18 @@ def self_test() -> None:
 
 
 def main() -> int:
-    if sys.argv[1:] == ["--self-test"]:
+    args = sys.argv[1:]
+    if args == ["--self-test"]:
         self_test()
         return 0
-    if len(sys.argv) < 4:
-        print("usage: spawn-trace.py START_EPOCH END_EPOCH TRACE [TRACE ...]", file=sys.stderr)
+    pane_shell = None
+    if len(args) >= 2 and args[0] == "--pane-shell":
+        pane_shell, args = args[1], args[2:]
+    if len(args) < 3:
+        print("usage: spawn-trace.py [--pane-shell PATH] START_EPOCH END_EPOCH TRACE [TRACE ...]", file=sys.stderr)
         return 1
     try:
-        result = parse_traces([Path(path) for path in sys.argv[3:]], float(sys.argv[1]), float(sys.argv[2]))
+        result = parse_traces([Path(path) for path in args[2:]], float(args[0]), float(args[1]), pane_shell)
     except (TraceError, ValueError) as error:
         print(f"spawn-rate trace invalid: {error}", file=sys.stderr)
         return 2
