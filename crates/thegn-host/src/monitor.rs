@@ -481,7 +481,7 @@ impl MonitorOverlay {
         let (cols, rows) = Self::dims(ctx.screen);
         let tabs = MonitorTab::visible_for(
             &model.stats,
-            !model.containers.is_empty(),
+            !model.containers.is_empty() || !model.containers_listed,
             model.notification_delivery_configured || model.notification_delivery.visible(),
         );
         // Opening at a tab this machine can't show would present an empty box;
@@ -751,7 +751,7 @@ impl MonitorOverlay {
         self.resize(ctx.screen);
         let tabs = MonitorTab::visible_for(
             &model.stats,
-            !model.containers.is_empty(),
+            !model.containers.is_empty() || !model.containers_listed,
             model.notification_delivery_configured || model.notification_delivery.visible(),
         );
         let tabs_changed = tabs != self.tabs;

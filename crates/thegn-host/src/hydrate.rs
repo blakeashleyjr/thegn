@@ -397,6 +397,23 @@ impl ContainerDemand {
         }
     }
 
+    /// The demand a set of visible surfaces implies. Detail: the monitor, or
+    /// the Sandbox section (its expanded per-container rows/stats). Summary:
+    /// the panel is open. None: nothing consumes the listing.
+    pub(crate) fn resolve(
+        panel_open: bool,
+        monitor_open: bool,
+        sandbox_section_open: bool,
+    ) -> Self {
+        if monitor_open || sandbox_section_open {
+            Self::Detail
+        } else if panel_open {
+            Self::Summary
+        } else {
+            Self::None
+        }
+    }
+
     pub(crate) fn interval(self) -> Duration {
         match self {
             Self::None => CONTAINER_NONE_REFRESH_INTERVAL,

@@ -72,8 +72,10 @@ impl TickerIo for FixtureIo {
     fn container_demand(&self) -> ContainerDemand {
         ContainerDemand::from_signal(self.demand.load(Ordering::Relaxed))
     }
-    fn send_containers(&mut self, ticks: u64, _every: u64, demand_rise: bool) -> Result<bool, ()> {
-        let changed = demand_rise || self.container_changed.swap(false, Ordering::Relaxed);
+    fn send_containers(&mut self, ticks: u64, demand_rise: bool) -> Result<bool, ()> {
+        // Evaluate the swap first: a demand rise consumes the pending change.
+        let pending = self.container_changed.swap(false, Ordering::Relaxed);
+        let changed = demand_rise || pending;
         let mut observed = self.observed.lock().unwrap();
         observed.containers.push(ticks);
         observed.container_wakes.push(changed);
@@ -266,18 +268,101 @@ fn summary_container_equality_ignores_metrics_but_detail_equality_includes_them(
     let mut metrics_changed = row.clone();
     metrics_changed.cpu = "8%".into();
     assert!(container_snapshot_equal(
-        &[row.clone()],
-        &[metrics_changed.clone()],
+        std::slice::from_ref(&row),
+        std::slice::from_ref(&metrics_changed),
         false
     ));
     assert!(!container_snapshot_equal(
-        &[row.clone()],
+        std::slice::from_ref(&row),
         &[metrics_changed],
         true
     ));
     let mut image_changed = row.clone();
     image_changed.image = "image:v2".into();
     assert!(!container_snapshot_equal(&[row], &[image_changed], false));
+}
+
+fn sample_container(name: &str) -> thegn_core::sandbox::ContainerInfo {
+    thegn_core::sandbox::ContainerInfo {
+        name: name.into(),
+        image: "image:v1".into(),
+        status: "Up 5 seconds".into(),
+        ours: true,
+        backend: "docker".into(),
+        cpu: "1%".into(),
+        mem: "2MiB".into(),
+        net: "3KB".into(),
+        containment: "worktree+caches".into(),
+        mounts: String::new(),
+    }
+}
+
+#[test]
+fn container_delivery_gates_on_set_and_footprint_change() {
+    let mut delivery = ContainerDelivery::default();
+    let refresh = |rows: Vec<_>| ContainerRefresh {
+        containers: rows,
+        footprint: None,
+    };
+    // Initial snapshot is always delivered (even if empty).
+    assert!(delivery.filter(refresh(vec![]), false, true).is_some());
+    // Identical set without a demand rise: dropped (no send, no wake).
+    assert!(delivery.filter(refresh(vec![]), false, false).is_none());
+    // Demand rise re-delivers an identical set.
+    assert!(delivery.filter(refresh(vec![]), false, true).is_some());
+    // A changed set is delivered; repeating it is not.
+    let one = vec![sample_container("a")];
+    assert!(
+        delivery
+            .filter(refresh(one.clone()), false, false)
+            .is_some()
+    );
+    assert!(
+        delivery
+            .filter(refresh(one.clone()), false, false)
+            .is_none()
+    );
+    // Metrics only matter while detailed.
+    let mut hot = one.clone();
+    hot[0].cpu = "90%".into();
+    assert!(
+        delivery
+            .filter(refresh(hot.clone()), false, false)
+            .is_none()
+    );
+    // (the snapshot is remembered even when dropped, so change it again)
+    let mut hotter = hot;
+    hotter[0].cpu = "95%".into();
+    assert!(delivery.filter(refresh(hotter), true, false).is_some());
+    // A footprint-only change is delivered; an identical one is stripped/dropped.
+    let fp = thegn_core::sandbox_manage::ContainerFootprint::default();
+    let with_fp = |fp: &thegn_core::sandbox_manage::ContainerFootprint| ContainerRefresh {
+        containers: vec![sample_container("a")],
+        footprint: Some(*fp),
+    };
+    let sent = delivery.filter(with_fp(&fp), true, false);
+    assert!(sent.is_some_and(|r| r.footprint.is_some()));
+    assert!(delivery.filter(with_fp(&fp), true, false).is_none());
+}
+
+#[test]
+fn container_demand_resolves_from_visible_surfaces() {
+    use ContainerDemand::{Detail, None as Nothing, Summary};
+    // (panel, monitor, sandbox section) -> demand
+    assert_eq!(ContainerDemand::resolve(false, false, false), Nothing);
+    assert_eq!(ContainerDemand::resolve(true, false, false), Summary);
+    assert_eq!(ContainerDemand::resolve(true, true, false), Detail);
+    assert_eq!(ContainerDemand::resolve(false, true, false), Detail);
+    // The Sandbox section's per-container rows/stats need the 5 s cadence.
+    assert_eq!(ContainerDemand::resolve(true, false, true), Detail);
+}
+
+#[test]
+fn sandbox_section_demand_lists_at_the_detail_cadence() {
+    let mut fixture = Fixture::start(&configured());
+    fixture.set_demand(ContainerDemand::resolve(true, false, true));
+    fixture.advance_to(11);
+    assert_eq!(fixture.observed.lock().unwrap().containers, vec![1, 11]);
 }
 
 #[test]
@@ -291,6 +376,16 @@ fn no_container_demand_never_lists_or_wakes_for_container_slots() {
         observed.containers
     );
     assert!(observed.container_wakes.is_empty());
+    // Every wake must be attributable to some other slot (a scheduled refresh
+    // event or the daemon send); none is left over for the container slot.
+    let mut other: std::collections::BTreeSet<u64> =
+        fixture.events.iter().map(|(tick, _)| *tick).collect();
+    other.extend(observed.daemon.iter().copied());
+    assert_eq!(
+        fixture.wakes.load(Ordering::Relaxed),
+        other.len(),
+        "a wake with no non-container cause means the container slot woke the loop"
+    );
 }
 
 #[test]
@@ -505,6 +600,8 @@ fn live_owner_reloads_every_ticker_class_through_the_event_envelope() {
             ack,
             finished,
             observed,
+            demand: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            container_changed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tick: 0,
         },
         || {},

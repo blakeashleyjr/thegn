@@ -6108,7 +6108,7 @@ fn reconcile_process_view_transition(
     }
 }
 
-fn container_health_for(
+pub(crate) fn container_health_for(
     active_name: &str,
     containers: &[thegn_core::sandbox::ContainerInfo],
 ) -> crate::chrome::ContainerHealth {
@@ -10208,6 +10208,7 @@ async fn event_loop<T: Terminal>(
             // The container snapshot is worker-owned. Recompute active health
             // below from this cached list when hydration changes worktrees.
             let containers = std::mem::take(&mut model.containers);
+            let containers_listed = model.containers_listed;
             // Same contract for the pipeline roster: it is owned by the
             // board's off-loop sample (`RefreshKind::Dispatches`), and
             // `build_model` always carries the empty default — dropping it here
@@ -10258,6 +10259,7 @@ async fn event_loop<T: Terminal>(
                 model.sidebar_workspaces = workspaces;
             }
             model.containers = containers;
+            model.containers_listed = containers_listed;
             model.container_health =
                 container_health_for(&model.active_container_name, &model.containers);
             if let Some(orphans) = STARTUP_ORPHANS_REMOVED.get() {
@@ -10837,6 +10839,10 @@ async fn event_loop<T: Terminal>(
                 dirty = true;
             }
             loop_perf.tick(crate::perf::WakeSource::Container);
+            if !model.containers_listed {
+                model.containers_listed = true;
+                dirty = true;
+            }
             // Derive health from the new snapshot. Hydration also recomputes
             // against this cached list when the active worktree changes.
             let health = container_health_for(&model.active_container_name, &containers);
@@ -12579,13 +12585,11 @@ async fn event_loop<T: Terminal>(
             crate::monitor::wants_container_stats(monitor.as_ref(), sandbox_section_now),
             std::sync::atomic::Ordering::Relaxed,
         );
-        let container_demand_now = if monitor.is_some() {
-            crate::hydrate::ContainerDemand::Detail
-        } else if chrome.panel.is_some() {
-            crate::hydrate::ContainerDemand::Summary
-        } else {
-            crate::hydrate::ContainerDemand::None
-        };
+        let container_demand_now = crate::hydrate::ContainerDemand::resolve(
+            chrome.panel.is_some(),
+            monitor.is_some(),
+            sandbox_section_now,
+        );
         container_demand.store(
             container_demand_now.signal(),
             std::sync::atomic::Ordering::Relaxed,
