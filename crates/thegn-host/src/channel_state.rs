@@ -20,6 +20,56 @@ use thegn_core::config::EnvSource;
 
 // 0 = Stable (also the safe pre-install default), 1 = Dev.
 static CHANNEL: AtomicU8 = AtomicU8::new(0);
+// One bit per feature in `Feature::ALL`. Clamp results are cumulative for the
+// lifetime of this process because later config refreshes must not erase the
+// explanation for the config generation already in use.
+static CLAMPED: AtomicU8 = AtomicU8::new(0);
+
+const fn feature_bit(feature: Feature) -> u8 {
+    match feature {
+        Feature::Remote => 1 << 0,
+        Feature::Providers => 1 << 1,
+        Feature::Observe => 1 << 2,
+        Feature::Placement => 1 << 3,
+        Feature::Trackers => 1 << 4,
+        Feature::Voice => 1 << 5,
+    }
+}
+
+fn record_into(cell: &AtomicU8, features: &[Feature]) {
+    let bits = features
+        .iter()
+        .fold(0, |bits, feature| bits | feature_bit(*feature));
+    cell.fetch_or(bits, Ordering::Relaxed);
+}
+
+/// Record the features neutralised by a config clamp. The process-wide set is
+/// cumulative so a daemon refresh cannot hide a clamp observed at startup.
+pub fn record_clamped(features: &[Feature]) {
+    record_into(&CLAMPED, features);
+}
+
+/// Whether this process has clamped `feature` in any loaded config generation.
+pub fn clamped(feature: Feature) -> bool {
+    CLAMPED.load(Ordering::Relaxed) & feature_bit(feature) != 0
+}
+
+/// Clamp a config and retain the result for later refusal/config diagnostics.
+pub fn clamp_and_record(cfg: &mut thegn_core::config::Config, channel: Channel) -> Vec<Feature> {
+    let features = cfg.clamp_to_channel(channel);
+    record_clamped(&features);
+    features
+}
+
+/// Message used by tracker-dependent CLI doors when the config was neutralised
+/// by the release-channel policy. Kept pure for focused command tests.
+pub fn tracker_unconfigured_message(trackers_clamped: bool) -> &'static str {
+    if trackers_clamped {
+        "configured issue tracker is experimental and disabled on the stable channel; set THEGN_CHANNEL=dev to enable it"
+    } else {
+        "no issue tracker configured (set [issues] providers/accounts)"
+    }
+}
 
 const fn to_u8(c: Channel) -> u8 {
     match c {
@@ -72,7 +122,7 @@ pub fn install(channel: Channel) {
 /// startup waterfall. Keeps the compositor's startup path (run.rs) to one call.
 pub fn apply_startup_channel(cfg: &mut thegn_core::config::Config) -> Option<String> {
     let channel = resolve_and_install();
-    let clamped = cfg.clamp_to_channel(channel);
+    let clamped = clamp_and_record(cfg, channel);
     if clamped.is_empty() {
         return None;
     }
@@ -81,14 +131,14 @@ pub fn apply_startup_channel(cfg: &mut thegn_core::config::Config) -> Option<Str
         .map(|f| f.id())
         .collect::<Vec<_>>()
         .join(", ");
-    tracing::info!(
+    tracing::warn!(
         target: "thegn::startup",
         channel = channel.as_str(),
         clamped = %feats,
-        "stable channel: experimental features disabled ({feats}) — run the dev build to enable"
+        "release channel disabled configured experimental features ({feats}); set THEGN_CHANNEL=dev to enable"
     );
     Some(format!(
-        "stable channel: disabled {feats} (use the dev build to enable)"
+        "stable channel: disabled {feats} (set THEGN_CHANNEL=dev to enable)"
     ))
 }
 
@@ -140,5 +190,41 @@ mod tests {
         install(Channel::Stable);
         assert_eq!(current(), Channel::Stable);
         assert!(!allows(Feature::Remote));
+    }
+
+    #[test]
+    fn clamp_outcome_records_linear_but_not_github_trackers() {
+        use thegn_core::config_issues::IssueProviderKind as K;
+        let observed = AtomicU8::new(0);
+        let mut linear = thegn_core::config::Config::default();
+        linear.issues.provider = K::Linear;
+        let removed = linear.clamp_to_channel(Channel::Stable);
+        record_into(&observed, &removed);
+        assert_ne!(
+            observed.load(Ordering::Relaxed) & feature_bit(Feature::Trackers),
+            0
+        );
+
+        let observed_github = AtomicU8::new(0);
+        let mut github = thegn_core::config::Config::default();
+        github.issues.provider = K::Github;
+        let removed = github.clamp_to_channel(Channel::Stable);
+        record_into(&observed_github, &removed);
+        assert_eq!(
+            observed_github.load(Ordering::Relaxed) & feature_bit(Feature::Trackers),
+            0
+        );
+    }
+
+    #[test]
+    fn tracker_refusal_explains_a_channel_clamp_without_changing_empty_config_advice() {
+        let clamped = tracker_unconfigured_message(true);
+        assert!(clamped.contains("stable channel"));
+        assert!(clamped.contains("THEGN_CHANNEL=dev"));
+        assert!(!clamped.contains("set [issues] providers/accounts"));
+        assert_eq!(
+            tracker_unconfigured_message(false),
+            "no issue tracker configured (set [issues] providers/accounts)"
+        );
     }
 }

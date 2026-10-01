@@ -145,7 +145,9 @@ fn list_tracker_issues(
 ) -> Result<()> {
     let router = thegn_svc::issue::IssueRouter::from_config(&cfg.issues);
     if !router.is_configured() {
-        msg::die("no issue tracker configured (set [issues] providers/accounts)");
+        msg::die(crate::channel_state::tracker_unconfigured_message(
+            crate::channel_state::clamped(thegn_core::channel::Feature::Trackers),
+        ));
     }
     let statuses = status
         .as_deref()

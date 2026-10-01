@@ -1732,7 +1732,11 @@ impl ControlApi for DaemonService {
         Box::pin(async move {
             let router = thegn_svc::issue::IssueRouter::from_config(&self.config.issues);
             if !router.is_configured() {
-                return Err(ControlError::Unimplemented("no issue tracker configured"));
+                return Err(ControlError::Unimplemented(
+                    crate::channel_state::tracker_unconfigured_message(
+                        crate::channel_state::clamped(thegn_core::channel::Feature::Trackers),
+                    ),
+                ));
             }
             // `list_issues` swallows every per-account error into a
             // `tracing::warn!` and always answers `Ok` — over the control API
