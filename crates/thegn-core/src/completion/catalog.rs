@@ -80,6 +80,11 @@ pub enum Reserved {
     /// Agent-dispatch roster row ids (`agent_dispatches.id`). The roster is
     /// local SQLite, so a real source is implementable; nothing serves it yet.
     DispatchRow,
+    /// Sidebar folder names (`folders.name`, per workspace). Local SQLite, so a
+    /// real source is implementable; nothing serves it yet. Not `Freeform` —
+    /// these are enumerable rows, and saying otherwise would be a lie on the
+    /// record.
+    Folder,
     /// Free-form scalars — a millisecond count, a duration — with no
     /// enumerable source. The engine's default (filenames) is the terminal
     /// answer; declared here so that is a decision on the record.
@@ -93,6 +98,7 @@ impl Reserved {
         Reserved::Pr,
         Reserved::Issue,
         Reserved::DispatchRow,
+        Reserved::Folder,
         Reserved::Freeform,
     ];
 
@@ -103,6 +109,7 @@ impl Reserved {
             Reserved::Pr => "pr",
             Reserved::Issue => "issue",
             Reserved::DispatchRow => "dispatch-row",
+            Reserved::Folder => "folder",
             Reserved::Freeform => "freeform",
         }
     }
@@ -119,6 +126,11 @@ impl Reserved {
             Reserved::DispatchRow => {
                 "the roster is local SQLite — a real source once the \
                  completion engine can read it without a full config load"
+            }
+            Reserved::Folder => {
+                "folder names are local SQLite, scoped per workspace — a real \
+                 source once the completion engine can read the state DB \
+                 without a full config load, exactly as for the roster"
             }
             Reserved::Freeform => {
                 "no enumerable source — a count or duration; the engine's \
@@ -153,6 +165,7 @@ impl SourceKind {
         SourceKind::Reserved(Reserved::Pr),
         SourceKind::Reserved(Reserved::Issue),
         SourceKind::Reserved(Reserved::DispatchRow),
+        SourceKind::Reserved(Reserved::Folder),
         SourceKind::Reserved(Reserved::Freeform),
     ];
 
@@ -366,6 +379,7 @@ pub const CATALOG: &[Slot] = &[
     slot("wt diff", "worktree", SourceKind::Worktree),
     slot("wt disk", "worktree", SourceKind::Worktree),
     // "Worktree path or branch name" — the source offers both.
+    slot("wt folder", "worktree", SourceKind::Worktree),
     slot("wt rm", "target", SourceKind::Worktree),
     // --- repo -------------------------------------------------------------
     slot("autopilot status", "repo", SourceKind::Repo),
@@ -634,6 +648,8 @@ pub const CATALOG: &[Slot] = &[
     slot("pr create", "base", SourceKind::Reserved(Reserved::Branch)),
     slot("wt diff", "base", SourceKind::Reserved(Reserved::Branch)),
     slot("wt new", "base", SourceKind::Reserved(Reserved::Branch)),
+    slot("wt folder", "name", SourceKind::Reserved(Reserved::Folder)),
+    slot("wt new", "folder", SourceKind::Reserved(Reserved::Folder)),
     slot(
         "automations test",
         "event",
