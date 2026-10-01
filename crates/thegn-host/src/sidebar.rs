@@ -544,7 +544,7 @@ pub struct DbWorktree {
     pub env_name: Option<String>,
     /// The env is a managed PROVIDER but the worktree's content resolved local
     /// (degraded to the host / never provisioned) — renders the `«env»` badge as
-    /// `«env ✗»`. Computed in [`crate::hydrate::db_worktree_list`].
+    /// `«env ✗»`. Computed in `hydrate::db_worktree_list_with_snapshot`.
     pub env_degraded: bool,
 }
 

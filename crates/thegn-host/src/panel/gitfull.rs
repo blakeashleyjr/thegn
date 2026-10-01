@@ -1291,6 +1291,7 @@ mod tests {
             BranchRow {
                 name: "feat/full".into(),
                 is_head: true,
+                held_by: vec![],
                 upstream: Some("origin/feat/full".into()),
                 ahead: 2,
                 behind: 1,
@@ -1308,6 +1309,7 @@ mod tests {
             BranchRow {
                 name: "main".into(),
                 is_head: false,
+                held_by: vec![],
                 upstream: Some("origin/main".into()),
                 ahead: 0,
                 behind: 0,

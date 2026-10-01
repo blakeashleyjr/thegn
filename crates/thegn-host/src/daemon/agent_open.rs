@@ -34,34 +34,52 @@ use thegn_svc::control::{AgentLaunch, OpenSpec};
 
 use crate::agent::{LaunchExtras, LaunchSpec};
 
+/// The worktree an [`OpenSpec`] launches in (`worktree`, else `cwd`).
+pub(crate) fn spec_worktree(spec: &OpenSpec) -> Option<String> {
+    spec.worktree
+        .clone()
+        .or_else(|| spec.cwd.clone())
+        .filter(|w| !w.is_empty())
+}
+
+/// Read a worktree's live branch for launch context, off the runtime's worker
+/// threads. Callers do this BEFORE entering `with_db`: the daemon has a single
+/// DB mutex, and a remote read can take up to `git_read_timeout`, so holding
+/// the lock across it would stall every other DB call.
+pub(crate) async fn read_branch(worktree: Option<String>) -> Option<String> {
+    let worktree = worktree?;
+    tokio::task::spawn_blocking(move || {
+        crate::worktree_snapshot::current_branch(std::path::Path::new(&worktree))
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
 /// Resolve an agent launch into the same `LaunchSpec` an interactive pane gets.
+/// `branch` is the live branch, read by the caller outside the DB lock
+/// ([`read_branch`]).
 pub(crate) fn resolve(
     cfg: &Config,
     db: &Db,
     spec: &OpenSpec,
     launch: &AgentLaunch,
+    branch: Option<String>,
 ) -> Result<LaunchSpec> {
-    resolve_inner(cfg, db, spec, launch, None)
+    resolve_inner(cfg, db, spec, launch, None, branch)
 }
 
 /// Resolve `tools.run` exclusively through a fresh trusted `[[tools]]` entry.
 /// An agent or bare harness with the same name is intentionally invisible.
+/// Takes no `Db`: the branch is read from git by the caller ([`read_branch`]),
+/// not the registry.
 pub(crate) fn resolve_tool(
     cfg: &Config,
-    db: &Db,
     worktree: &str,
     name: &str,
+    branch: Option<String>,
 ) -> Result<LaunchSpec> {
     let command = configured_tool_command(cfg, name)?;
-    let branch = db
-        .worktrees()
-        .ok()
-        .and_then(|rows| {
-            rows.into_iter()
-                .find(|row| row.worktree == worktree)
-                .map(|row| row.branch)
-        })
-        .filter(|branch| !branch.is_empty());
     crate::agent::launch_spec_full(
         cfg,
         worktree,
@@ -99,9 +117,10 @@ pub(crate) fn resolve_fork(
     launch: &AgentLaunch,
     source_harness: &str,
     source_command: &str,
+    branch: Option<String>,
 ) -> Result<LaunchSpec> {
     validate_fork_harness(cfg, &launch.agent, source_harness)?;
-    resolve_inner(cfg, db, spec, launch, Some(source_command))
+    resolve_inner(cfg, db, spec, launch, Some(source_command), branch)
 }
 
 fn validate_fork_harness(cfg: &Config, agent: &str, source_harness: &str) -> Result<()> {
@@ -122,6 +141,7 @@ fn resolve_inner(
     spec: &OpenSpec,
     launch: &AgentLaunch,
     fork_command: Option<&str>,
+    branch: Option<String>,
 ) -> Result<LaunchSpec> {
     // NOTE: `cfg` already carries the per-request agent/tool/pipeline registry:
     // `service.rs` re-loads the recorded config source, narrowly overlays those
@@ -174,17 +194,8 @@ fn resolve_inner(
         )?
     };
 
-    // The branch is the worktree's registered one; a worktree thegn does not
-    // know about still launches, just without the branch in its environment.
-    let branch = db
-        .worktrees()
-        .ok()
-        .and_then(|rows| {
-            rows.into_iter()
-                .find(|r| r.worktree == worktree)
-                .map(|r| r.branch)
-        })
-        .filter(|b| !b.is_empty());
+    // Agent context follows live Git HEAD (read by the caller); an unavailable
+    // or detached HEAD intentionally supplies no branch context.
 
     // The one call that does everything: sandbox preparation, bundle/identity
     // env, credential directories, build-cache mounts, the CPU cap, and the
@@ -625,7 +636,7 @@ mod tests {
             native_session_id: None,
         };
         let db = Db::open_memory().expect("in-memory db");
-        let err = resolve(&cfg(), &db, &spec, &launch).expect_err("should refuse");
+        let err = resolve(&cfg(), &db, &spec, &launch, None).expect_err("should refuse");
         assert!(err.to_string().contains("worktree"), "got {err}");
     }
 
@@ -699,7 +710,7 @@ mod tests {
             native_session_id: Some("native-codex".into()),
         };
         let source_command = "source-harness-command --native native-codex";
-        let resolved = resolve_fork(&c, &db, &spec, &launch, "codex", source_command)
+        let resolved = resolve_fork(&c, &db, &spec, &launch, "codex", source_command, None)
             .expect("matching provider resolves");
 
         assert!(
