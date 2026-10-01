@@ -371,20 +371,6 @@
       ]
     },
     {
-      "issue": "THE-222",
-      "project": "Runtime Security & Host Architecture",
-      "changes": [
-        "secure-merge-bundle-custody"
-      ]
-    },
-    {
-      "issue": "THE-247",
-      "project": "Runtime Security & Host Architecture",
-      "changes": [
-        "validate-sandbox-volume-sources"
-      ]
-    },
-    {
       "issue": "THE-286",
       "project": "Alpha Reliability & State Compatibility",
       "changes": [
@@ -399,32 +385,10 @@
       ]
     },
     {
-      "issue": "THE-321",
-      "project": "Alpha Reliability & State Compatibility",
-      "changes": [
-        "centralize-tracker-http-policy"
-      ]
-    },
-    {
-      "issue": "THE-322",
-      "project": "Client API & Remote Access",
-      "changes": [
-        "validate-tracker-identifiers"
-      ]
-    },
-    {
       "issue": "THE-325",
       "project": "Client API & Remote Access",
-      "changes": [
-        "bound-public-share-output"
-      ]
-    },
-    {
-      "issue": "THE-326",
-      "project": "Client API & Remote Access",
-      "changes": [
-        "serialize-validate-frp-configuration"
-      ]
+      "changes": [],
+      "no_spec_rationale": "The delivered subtask (bounded public-share output and redacted diagnostics) archived as bound-public-share-output. The remaining credential-isolation work \u2014 keeping secrets out of public-share client argv \u2014 is still In Progress and has no proposal yet."
     },
     {
       "issue": "THE-343",
@@ -445,20 +409,6 @@
       "project": "Workspace Product & Observability",
       "changes": [
         "sanitize-calendar-display-text"
-      ]
-    },
-    {
-      "issue": "THE-483",
-      "project": "Alpha Reliability & State Compatibility",
-      "changes": [
-        "bound-duration-and-refresh-policy"
-      ]
-    },
-    {
-      "issue": "THE-484",
-      "project": "Runtime Security & Host Architecture",
-      "changes": [
-        "bound-duration-and-refresh-policy"
       ]
     },
     {
@@ -574,38 +524,10 @@
       ]
     },
     {
-      "issue": "THE-598",
-      "project": "Runtime Security & Host Architecture",
-      "changes": [
-        "preserve-winning-host-environment"
-      ]
-    },
-    {
       "issue": "THE-600",
       "project": "Runtime Security & Host Architecture",
       "changes": [
         "safe-merged-worktree-cleanup"
-      ]
-    },
-    {
-      "issue": "THE-602",
-      "project": "Runtime Security & Host Architecture",
-      "changes": [
-        "strict-host-definition-snapshots"
-      ]
-    },
-    {
-      "issue": "THE-603",
-      "project": "Runtime Security & Host Architecture",
-      "changes": [
-        "strict-state-host-capture"
-      ]
-    },
-    {
-      "issue": "THE-606",
-      "project": "Runtime Security & Host Architecture",
-      "changes": [
-        "require-canonical-merge-history"
       ]
     },
     {
@@ -620,13 +542,6 @@
       "project": "Runtime Security & Host Architecture",
       "changes": [
         "preserve-merge-drain-diagnostics"
-      ]
-    },
-    {
-      "issue": "THE-611",
-      "project": "Runtime Security & Host Architecture",
-      "changes": [
-        "fix-static-cli-startup"
       ]
     },
     {
@@ -665,49 +580,6 @@
       ]
     },
     {
-      "issue": "THE-619",
-      "project": "Runtime Security & Host Architecture",
-      "changes": [
-        "harden-live-diagnostics-and-forge"
-      ]
-    },
-    {
-      "issue": "THE-620",
-      "project": "Alpha Reliability & State Compatibility",
-      "changes": [
-        "harden-live-diagnostics-and-forge"
-      ]
-    },
-    {
-      "issue": "THE-621",
-      "project": "Alpha Reliability & State Compatibility",
-      "changes": [
-        "harden-live-diagnostics-and-forge"
-      ]
-    },
-    {
-      "issue": "THE-622",
-      "project": "Alpha Reliability & State Compatibility",
-      "changes": [
-        "harden-live-diagnostics-and-forge",
-        "verify-native-forge-connectivity"
-      ]
-    },
-    {
-      "issue": "THE-623",
-      "project": "Alpha Reliability & State Compatibility",
-      "changes": [
-        "harden-live-diagnostics-and-forge"
-      ]
-    },
-    {
-      "issue": "THE-624",
-      "project": "Workspace Product & Observability",
-      "changes": [
-        "harden-live-diagnostics-and-forge"
-      ]
-    },
-    {
       "issue": "THE-625",
       "project": "Workspace Product & Observability",
       "changes": [
@@ -736,66 +608,10 @@
       ]
     },
     {
-      "issue": "THE-630",
-      "project": "Workspace Product & Observability",
-      "changes": [
-        "reduce-process-monitor-idle-work"
-      ]
-    },
-    {
-      "issue": "THE-631",
-      "project": "Workspace Product & Observability",
-      "changes": [
-        "reduce-process-monitor-idle-work"
-      ]
-    },
-    {
-      "issue": "THE-632",
-      "project": "Workspace Product & Observability",
-      "changes": [
-        "reduce-process-monitor-idle-work"
-      ]
-    },
-    {
-      "issue": "THE-633",
-      "project": "Workspace Product & Observability",
-      "changes": [
-        "cache-demanded-devcontainer-probes"
-      ]
-    },
-    {
       "issue": "THE-634",
       "project": "Runtime Security & Host Architecture",
       "changes": [
         "authenticate-pr-agent-authorship"
-      ]
-    },
-    {
-      "issue": "THE-635",
-      "project": "Workspace Product & Observability",
-      "changes": [
-        "harden-live-diagnostics-and-forge"
-      ]
-    },
-    {
-      "issue": "THE-636",
-      "project": "Alpha Reliability & State Compatibility",
-      "changes": [
-        "isolate-maintenance-regression-fixtures"
-      ]
-    },
-    {
-      "issue": "THE-637",
-      "project": "Alpha Reliability & State Compatibility",
-      "changes": [
-        "isolate-maintenance-regression-fixtures"
-      ]
-    },
-    {
-      "issue": "THE-639",
-      "project": "Runtime Security & Host Architecture",
-      "changes": [
-        "retain-devcontainer-startup-custody"
       ]
     },
     {
