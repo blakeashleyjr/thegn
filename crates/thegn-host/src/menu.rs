@@ -1083,7 +1083,7 @@ pub fn create_project_menu(path: String) -> MenuOverlay {
 }
 
 /// Branch actions including create + merge (the full `m`/`n` menu); merge
-/// and delete are omitted for the checked-out or sibling-held branch.
+/// is omitted for the checked-out branch and delete also for a sibling-held one.
 pub fn branch_actions_menu(name: &str, is_head: bool) -> MenuOverlay {
     branch_actions_menu_held(name, is_head, false)
 }
@@ -1097,7 +1097,10 @@ pub fn branch_actions_menu_held(name: &str, is_head: bool, held_by_sibling: bool
         "fetch all remotes (--prune)",
         MenuChoice::BranchFetch,
     ));
-    if !is_head && !held_by_sibling {
+    // Merging a branch another worktree has checked out is valid Git (the merge
+    // reads the ref), and in thegn most branches are some worktree's: only
+    // DELETE is gated on `held_by_sibling`.
+    if !is_head {
         m.items.push(item(
             Some('m'),
             format!("merge {name} into checked-out"),
@@ -1775,12 +1778,20 @@ mod tests {
     }
 
     #[test]
-    fn sibling_held_branch_menu_omits_delete_and_merge() {
+    fn sibling_held_branch_menu_omits_delete_but_keeps_merge() {
         let held = branch_actions_menu_held("feature", false, true);
-        assert!(!held.items().iter().any(|item| matches!(
-            &item.choice,
-            MenuChoice::BranchDelete { .. } | MenuChoice::BranchMerge(_)
-        )));
+        assert!(
+            !held
+                .items()
+                .iter()
+                .any(|item| matches!(&item.choice, MenuChoice::BranchDelete { .. }))
+        );
+        assert!(
+            held.items()
+                .iter()
+                .any(|item| matches!(&item.choice, MenuChoice::BranchMerge(_))),
+            "merging a sibling-held branch is valid git"
+        );
         let free = branch_actions_menu_held("feature", false, false);
         assert!(
             free.items()

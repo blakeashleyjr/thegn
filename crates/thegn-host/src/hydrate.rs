@@ -1179,8 +1179,7 @@ fn db_worktree_list_with_snapshot(
             Vec::new()
         }
     };
-    let branch_observations =
-        crate::worktree_snapshot::observe_rows(&*crate::git_handle::get(), &rows);
+    let branch_observations = observe_rows_warm(&rows);
     // THE-516: legacy slugged tab names can alias distinct worktrees
     // (`feat/a` and `feat-a` both registered as `app/feat-a`). Such a tab is
     // quarantined: neither claimant is surfaced for tab-keyed routing, and the
@@ -1301,6 +1300,26 @@ fn db_worktree_list_with_snapshot(
         });
     }
     (out, branch_observations)
+}
+
+/// Spawn-free branch observation for the ambient (hydration / sweep) paths:
+/// the glyph cache's last real read first, an in-process gix read for a local
+/// row with no entry, a live-bridge read only for a remote one. See
+/// [`crate::worktree_snapshot::observe_rows_cheap`]. The cache lock is held
+/// only to copy the (few) branch names out.
+fn observe_rows_warm(
+    rows: &[thegn_core::models::WorktreeRow],
+) -> std::collections::HashMap<String, crate::worktree_snapshot::BranchObservation> {
+    let cached: std::collections::HashMap<String, String> = {
+        let cache = glyph_cache().lock().unwrap();
+        rows.iter()
+            .filter_map(|row| {
+                let branch = cache.get(&row.worktree)?.0.branch.clone()?;
+                Some((row.worktree.clone(), branch))
+            })
+            .collect()
+    };
+    crate::worktree_snapshot::observe_rows_cheap(rows, |path| cached.get(path).cloned())
 }
 
 /// The reason string stamped on registry rows whose legacy tab name is
@@ -1533,11 +1552,6 @@ fn collect_sidebar_status(
             if let Some(&num) = numbers.get(observed_branch) {
                 status.pr_numbers.insert(wt.worktree.clone(), num);
             }
-        }
-        if let Some(observed_branch) = observed_branch.filter(|branch| !branch.is_empty()) {
-            status
-                .branches
-                .insert(wt.worktree.clone(), observed_branch.to_string());
         }
     }
 
@@ -1788,23 +1802,26 @@ fn collect_sidebar_status(
         &mut status.branches,
         all_wt_paths.iter().cloned(),
     );
-    // The batched worktree-list snapshot covers dormant and gated rows too.
-    // It wins over cached glyph branches; only an unavailable snapshot may use
-    // the creation-time value as a display fallback.
+    // Rows the glyph scan / cache did not cover (dormant, gated, never
+    // scanned) fall back to the spawn-free observation; a fresher glyph branch
+    // is never overwritten. Only an `Unavailable` observation may use the
+    // creation-time value, and only as a last-resort display fallback.
     for wt in &db_worktrees {
         match branch_observations.get(&wt.worktree) {
             Some(crate::worktree_snapshot::BranchObservation::Branch(branch)) => {
-                status.branches.insert(wt.worktree.clone(), branch.clone());
+                status
+                    .branches
+                    .entry(wt.worktree.clone())
+                    .or_insert_with(|| branch.clone());
             }
             Some(crate::worktree_snapshot::BranchObservation::Detached)
-            | Some(crate::worktree_snapshot::BranchObservation::Unborn) => {
-                status.branches.remove(&wt.worktree);
-            }
+            | Some(crate::worktree_snapshot::BranchObservation::Unborn) => {}
             Some(crate::worktree_snapshot::BranchObservation::Unavailable) | None => {
                 if !wt.branch.is_empty() {
                     status
                         .branches
-                        .insert(wt.worktree.clone(), wt.branch.clone());
+                        .entry(wt.worktree.clone())
+                        .or_insert_with(|| wt.branch.clone());
                 }
             }
         }
@@ -2929,9 +2946,15 @@ pub(crate) fn build_panel(
     if want_branches {
         let badges = panel.open_prs.clone();
         let head_branch = panel.branch.clone();
-        let current_path = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+        // Sibling holders feed only the OPEN branch list (merge/delete gating),
+        // so the `git worktree list` runs only then, never on the ticker's warm
+        // pass that merely wants the closed summary's count and PR badges.
+        // Git prints realpaths, so compare against the raw and the (once)
+        // canonicalised cwd rather than canonicalising every entry.
+        let current_canon = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
         let holders: std::collections::HashMap<String, Vec<String>> = repo_root
             .as_deref()
+            .filter(|_| branches_open)
             .and_then(|root| {
                 thegn_svc::git::GitBackend::worktrees(&*crate::git_handle::get(), root).ok()
             })
@@ -2943,9 +2966,8 @@ pub(crate) fn build_panel(
                     thegn_svc::git::WorktreeHead::Detached
                     | thegn_svc::git::WorktreeHead::Unborn => return None,
                 };
-                let path = std::path::PathBuf::from(&wt.path);
-                let path = std::fs::canonicalize(&path).unwrap_or(path);
-                (path != current_path).then_some((branch, wt.path))
+                let path = std::path::Path::new(&wt.path);
+                (path != cwd && path != current_canon).then_some((branch, wt.path))
             })
             .fold(
                 std::collections::HashMap::new(),
@@ -4147,16 +4169,29 @@ fn maybe_clean_merged_worktrees_with_state(
     let Ok(rows) = db.worktrees() else {
         return;
     };
-    let live_branches = crate::worktree_snapshot::observe_rows(&*crate::git_handle::get(), &rows);
+    // This repo's rows only, observed spawn-free. The observation merely widens
+    // recall (a worktree whose checkout moved onto the merged branch); the
+    // decision itself is re-verified against the live checkout below
+    // (`checkout_scope`), so an unreadable observation falls back to the
+    // registry's recorded branch rather than skipping the row.
+    let rows: Vec<_> = rows
+        .into_iter()
+        .filter(|row| row.repo_root == repo_root)
+        .collect();
+    let live_branches = observe_rows_warm(&rows);
     let active = active.to_string_lossy();
     for row in rows {
-        let Some(branch) = live_branches
-            .get(&row.worktree)
-            .and_then(crate::worktree_snapshot::BranchObservation::branch)
-        else {
-            continue;
+        let branch = match live_branches.get(&row.worktree) {
+            Some(crate::worktree_snapshot::BranchObservation::Branch(branch)) => branch.as_str(),
+            Some(crate::worktree_snapshot::BranchObservation::Unavailable) | None => {
+                row.branch.as_str()
+            }
+            Some(
+                crate::worktree_snapshot::BranchObservation::Detached
+                | crate::worktree_snapshot::BranchObservation::Unborn,
+            ) => continue,
         };
-        if row.repo_root != repo_root || branch.is_empty() {
+        if branch.is_empty() {
             continue;
         }
         // Dropped out of the open set since last round?

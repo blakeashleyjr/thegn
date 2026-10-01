@@ -273,6 +273,8 @@ pub(crate) fn run<'a>(
                 let launch = open.agent.as_ref().expect("fork agent").clone();
                 let source_harness = harness.clone();
                 let source_command = command.clone();
+                let fork_branch =
+                    super::agent_open::read_branch(super::agent_open::spec_worktree(&open)).await;
                 let resolved = service
                     .with_db(move |db| {
                         let fresh = crate::config_source::fresh(&snapshot)
@@ -285,6 +287,7 @@ pub(crate) fn run<'a>(
                             &launch,
                             &source_harness,
                             &source_command,
+                            fork_branch,
                         )
                     })
                     .await

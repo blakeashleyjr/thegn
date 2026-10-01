@@ -511,6 +511,10 @@ impl ControlApi for DaemonService {
                     let snapshot = (*self.config).clone();
                     let launch = launch.clone();
                     let spec2 = spec.clone();
+                    // Live branch read happens before the DB lock is taken.
+                    let branch =
+                        super::agent_open::read_branch(super::agent_open::spec_worktree(&spec2))
+                            .await;
                     self.with_db(move |db| {
                         // Per-request config: a `[[agents]]` entry added or
                         // retuned since the daemon started is honoured now,
@@ -522,7 +526,8 @@ impl ControlApi for DaemonService {
                         let cfg = fresh.as_ref().unwrap_or(&snapshot);
                         super::agent_open::ensure_configured_agent(cfg, &launch.agent)?;
                         let recipe = super::fork::agent_recipe(cfg, &launch, &spec2);
-                        let resolved = super::agent_open::resolve(cfg, db, &spec2, &launch)?;
+                        let resolved =
+                            super::agent_open::resolve(cfg, db, &spec2, &launch, branch)?;
                         Ok((recipe, Some(resolved)))
                     })
                     .await
@@ -1066,8 +1071,12 @@ impl ControlApi for DaemonService {
                 })
                 .await?;
             tokio::task::spawn_blocking(move || {
-                let observations =
-                    crate::worktree_snapshot::observe_rows(&*crate::git_handle::get(), &rows);
+                let observations = crate::worktree_snapshot::observe_rows(
+                    &*crate::git_handle::get(),
+                    &rows,
+                    // A control-API listing must not wake a suspended sandbox.
+                    crate::worktree_snapshot::RemoteRead::BridgedOnly,
+                );
                 rows.into_iter()
                     .map(|r| thegn_svc::control::WorktreeInfo {
                         path: r.worktree.clone(),
@@ -1658,12 +1667,13 @@ impl ControlApi for DaemonService {
             let snapshot = (*self.config).clone();
             let name = request.name.clone();
             let worktree_for_resolve = worktree.clone();
+            let branch = super::agent_open::read_branch(Some(worktree.clone())).await;
             let launch = self
                 .with_db(move |_db| {
                     let fresh = crate::config_source::fresh(&snapshot)
                         .map_err(|error| anyhow::anyhow!("configuration refused: {error}"))?;
                     let cfg = fresh.as_ref().unwrap_or(&snapshot);
-                    super::agent_open::resolve_tool(cfg, &worktree_for_resolve, &name)
+                    super::agent_open::resolve_tool(cfg, &worktree_for_resolve, &name, branch)
                 })
                 .await
                 .map_err(|error| ControlError::Conflict(error.to_string()))?;
