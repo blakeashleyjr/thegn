@@ -296,11 +296,7 @@ fn full_view(ctx: &SectionCtx) -> Vec<PanelRow> {
     let issues = sorted_issues(ctx);
 
     // Header bar
-    let provider_label = if !data.issues_configured
-        && crate::channel_state::clamped(thegn_core::channel::Feature::Trackers)
-    {
-        "issue tracker disabled on stable channel (set THEGN_CHANNEL=dev)".to_string()
-    } else if !data.issues_configured {
+    let provider_label = if !data.issues_configured {
         "no issue tracker configured".to_string()
     } else if data.tracker_issues.is_empty() {
         "no open issues".to_string()
@@ -476,12 +472,6 @@ fn empty_rows(configured: bool) -> Vec<PanelRow> {
         return vec![PanelRow::plain(Line::segs(vec![seg(
             g2(),
             "no open issues".to_string(),
-        )]))];
-    }
-    if crate::channel_state::clamped(thegn_core::channel::Feature::Trackers) {
-        return vec![PanelRow::plain(Line::segs(vec![seg(
-            g2(),
-            "configured tracker is experimental; set THEGN_CHANNEL=dev to enable".to_string(),
         )]))];
     }
     // No tracker configured — say so, and point at how to enable it.

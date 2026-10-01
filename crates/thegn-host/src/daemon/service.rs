@@ -1733,9 +1733,7 @@ impl ControlApi for DaemonService {
             let router = thegn_svc::issue::IssueRouter::from_config(&self.config.issues);
             if !router.is_configured() {
                 return Err(ControlError::Unimplemented(
-                    crate::channel_state::tracker_unconfigured_message(
-                        crate::channel_state::clamped(thegn_core::channel::Feature::Trackers),
-                    ),
+                    "no issue tracker configured (set [issues] providers/accounts)",
                 ));
             }
             // `list_issues` swallows every per-account error into a

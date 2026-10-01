@@ -34,11 +34,11 @@ In the `stable` channel thegn SHALL neutralise every experimental subsystem at
 config load so an experimental key left in a user's config is inert rather than
 half-active. The gated set is: remote worktrees (`[sandbox.remote]`), execution
 providers (`[host.*]`), the LLM proxy (`[llm_proxy]`), the Observe dashboards
-(`[observe]`), the placement engine (`[placement]`), and the non-GitHub issue
-trackers (`[issues]`: Linear/Jira/Kaneo). GitHub PR/issue viewing MUST remain
-available in both channels, and the `[[agents]]` launcher list (which includes
-the plain-shell entry) MUST NOT be cleared. In the `dev` channel the clamp MUST
-be a no-op.
+(`[observe]`), the placement engine (`[placement]`), and voice mode (`[voice]`).
+Issue trackers (`[issues]`: Linear/Jira/Kaneo/GitHub) and GitHub PR/issue
+viewing MUST remain available in both channels, and the `[[agents]]` launcher
+list (which includes the plain-shell entry) MUST NOT be cleared. In the `dev`
+channel the clamp MUST be a no-op.
 
 #### Scenario: Stable clamps experimental toggles
 
@@ -53,10 +53,10 @@ be a no-op.
 - **WHEN** a dev binary (or `THEGN_CHANNEL=dev`) loads that same config
 - **THEN** every toggle is honoured unchanged
 
-#### Scenario: GitHub trackers survive the tracker clamp
+#### Scenario: Linear trackers remain available in stable
 
 - **WHEN** a stable binary loads `[issues] providers = ["linear", "github", "kaneo"]`
-- **THEN** the resolved providers are `["github"]`
+- **THEN** the resolved providers remain `["linear", "github", "kaneo"]`
 
 ### Requirement: The channel and its allowances are inspectable
 
