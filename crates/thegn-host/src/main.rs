@@ -1002,7 +1002,15 @@ fn run_main() -> anyhow::Result<()> {
             // then reuses this same published generation.
             let admitted = admit_configuration(&cli, thegn_core::db::MigrationActor::Controller)?;
             let mut cfg = admitted.config().clone();
-            let _ = cfg.clamp_to_channel(crate::channel_state::resolve_and_install());
+            let channel = crate::channel_state::resolve_and_install();
+            crate::diag::register_identity(channel.as_str());
+            // Deliberately NO `log_trace::install(Role::Cli)` here: `open` may
+            // fall through to the interactive launch, whose `install(Role::Host)`
+            // would then lose the global-subscriber race (log lines to stderr
+            // over the TUI, no log file / startup waterfall). Record the clamp
+            // silently; the TUI's `apply_startup_channel` logs it after the
+            // Host install.
+            let _clamped = crate::channel_state::clamp_and_record(&mut cfg, channel);
             match cmd::open::run(&cfg, &repo, no_launch, preset.as_deref()) {
                 Ok(cmd::open::OpenOutcome::Delivered) => Ok(()),
                 Ok(cmd::open::OpenOutcome::LaunchTui) => Err(None), // fall through
@@ -1129,7 +1137,6 @@ fn experimental_command(command: &Command) -> Option<(&'static str, thegn_core::
     Some(match command {
         Command::Host { .. } => ("host", Feature::Providers),
         Command::Placement { .. } => ("placement", Feature::Placement),
-        Command::Kaneo { .. } => ("kaneo", Feature::Trackers),
         _ => return None,
     })
 }
@@ -1240,9 +1247,6 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         // Display projection only: best-effort host merge, as before.
         thegn_core::host_config::merge_db_hosts(&mut cfg);
     }
-    // Neutralise experimental toggles a stable build doesn't ship (see run.rs).
-    let _ = cfg.clamp_to_channel(channel);
-    let cfg = cfg;
     // Diagnostics for plain CLI verbs: the WARN+ in-memory ring is installed
     // unconditionally (cheap, zero I/O) so a crash still writes a report; a
     // stderr tracing layer is added only when `THEGN_LOG` is set, so
@@ -1253,6 +1257,16 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         crate::diag::register_identity(channel.as_str());
         thegn_core::log_trace::install(thegn_core::log_trace::Role::Cli, &cfg.log);
     }
+    // Neutralise experimental toggles a stable build doesn't ship (see run.rs).
+    // Keep the outcome for actionable tracker refusals and config inspection;
+    // the WARN reaches the always-on diagnostics ring and optional THEGN_LOG
+    // sink without adding per-invocation stderr output.
+    let clamped = crate::channel_state::clamp_and_record(&mut cfg, channel);
+    if !clamped.is_empty() {
+        tracing::warn!(channel = channel.as_str(), clamped = ?clamped,
+            "release channel neutralised configured experimental features");
+    }
+    let cfg = cfg;
     // Best-effort `[[presets]]` warnings (duplicate names, unknown template
     // refs) — soft, never blocking; hard errors surface in `config validate`.
     for w in thegn_core::config_presets::preset_warnings(&cfg) {

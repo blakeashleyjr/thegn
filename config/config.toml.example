@@ -10,9 +10,9 @@
 # workspace shell — git/worktrees/panes/sidebar/panel, the command palette,
 # sessions, sandboxing, and the CLI merge/land/integrate queue. Several
 # subsystems are still experimental and are DISABLED in the stable build even if
-# the keys below are set: remotes ([sandbox.remote]), the Observe dashboards
-# ([observe]), the placement engine ([placement]), and the non-GitHub issue
-# trackers ([issues]: Linear / Jira / Kaneo). GitHub PR/issue viewing stays available in both channels.
+# the keys below are set: remotes ([sandbox.remote]), cloud execution providers
+# ([host.*]), the Observe dashboards ([observe]), the placement engine
+# ([placement]), and voice mode ([voice]). Issue trackers ([issues]) are stable.
 # To enable the experimental subsystems, run the dev build (`nix run .#dev`,
 # installed as `thegn-dev`) or set THEGN_CHANNEL=dev for one run. `thegn doctor`
 # prints the resolved channel and which features it allows. There is no config
