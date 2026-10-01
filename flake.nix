@@ -755,6 +755,8 @@
           # below. Linux-only in nixpkgs — gate it so the shell evaluates on
           # macOS (where the default ld64 is used instead).
           ++ pkgs.lib.optionals pkgs.stdenv.isLinux [pkgs.mold]
+          # Exact idle child-process counting for the Linux soak harness.
+          ++ pkgs.lib.optionals pkgs.stdenv.isLinux [pkgs.strace]
           # prek + the hook binaries (see `preCommit` above). ONLY the default
           # shell installs git hooks — sandbox/sprite panes run inside a
           # read-only /nix with PREK_ALLOW_NO_CONFIG already injected, and must
