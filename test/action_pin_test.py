@@ -201,7 +201,10 @@ def self_test() -> int:
     script = Path(__file__).resolve()
 
     def fixture(
-        base: Path, workflow_uses: str, action_uses: str | None = None
+        base: Path,
+        workflow_uses: str,
+        action_uses: str | None = None,
+        action_dir: str = ".github/actions/fixture",
     ) -> Path:
         (base / ".github" / "workflows").mkdir(parents=True)
         (base / "test").mkdir()
@@ -212,7 +215,7 @@ def self_test() -> int:
         )
         (base / ".github" / "workflows" / "ci.yml").write_text(workflow)
         if action_uses is not None:
-            action = base / ".github" / "actions" / "fixture" / "action.yml"
+            action = base / action_dir / "action.yml"
             action.parent.mkdir(parents=True)
             action.write_text(
                 "name: fixture\nruns:\n  using: composite\n  steps:\n"
@@ -258,10 +261,16 @@ def self_test() -> int:
             )
             return 1
 
+        # The callee lives OUTSIDE `.github/`, so `validate`'s direct
+        # `rglob("action.yml")` pass cannot reach it: the only way the mutable
+        # ref is found is by recursing through the workflow's `./` reference.
+        # (Inside `.github/` the direct pass would catch it even with broken
+        # recursion, making this case vacuous.)
         transitive = fixture(
             root / "transitive",
-            "./.github/actions/fixture",
+            "./callee",
             "actions/checkout@v4",
+            action_dir="callee",
         )
         _, problems = validate(transitive)
         if not any("actions/checkout@v4" in problem for problem in problems):
