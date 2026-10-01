@@ -45,7 +45,9 @@ Enforcement happens at the edges, never by compiling code out:
 
 - Config toggles for a disallowed feature are **neutralised at load**, so
   a stray `[observe]` block in a stable run is inert rather than an error.
-- The matching UI and CLI surfaces are hidden.
+- Dev-only verbs and UI surfaces are hidden; commands that depend on configured
+  Linear/Jira/Kaneo trackers explain that the stable channel disabled them and
+  point to `THEGN_CHANNEL=dev`.
 
 That means switching channels needs no reinstall and no config
 migration — the same config file behaves correctly in both.

@@ -746,7 +746,9 @@ fn new_batched(
 fn resolve_issue_branch(cfg: &Config, root: &std::path::Path, issue_id: &str) -> Result<String> {
     let router = thegn_svc::issue::IssueRouter::from_config(&cfg.issues);
     if !router.is_configured() {
-        anyhow::bail!("no issue tracker configured (set [issues] providers/accounts)");
+        anyhow::bail!(crate::channel_state::tracker_unconfigured_message(
+            crate::channel_state::clamped(thegn_core::channel::Feature::Trackers),
+        ));
     }
     let rt = tokio::runtime::Runtime::new()?;
     let detail = rt

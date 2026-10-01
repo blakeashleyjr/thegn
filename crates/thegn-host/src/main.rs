@@ -1002,7 +1002,14 @@ fn run_main() -> anyhow::Result<()> {
             // then reuses this same published generation.
             let admitted = admit_configuration(&cli, thegn_core::db::MigrationActor::Controller)?;
             let mut cfg = admitted.config().clone();
-            let _ = cfg.clamp_to_channel(crate::channel_state::resolve_and_install());
+            let channel = crate::channel_state::resolve_and_install();
+            crate::diag::register_identity(channel.as_str());
+            thegn_core::log_trace::install(thegn_core::log_trace::Role::Cli, &cfg.log);
+            let clamped = crate::channel_state::clamp_and_record(&mut cfg, channel);
+            if !clamped.is_empty() {
+                tracing::warn!(channel = channel.as_str(), clamped = ?clamped,
+                    "release channel neutralised configured experimental features");
+            }
             match cmd::open::run(&cfg, &repo, no_launch, preset.as_deref()) {
                 Ok(cmd::open::OpenOutcome::Delivered) => Ok(()),
                 Ok(cmd::open::OpenOutcome::LaunchTui) => Err(None), // fall through
@@ -1240,9 +1247,6 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         // Display projection only: best-effort host merge, as before.
         thegn_core::host_config::merge_db_hosts(&mut cfg);
     }
-    // Neutralise experimental toggles a stable build doesn't ship (see run.rs).
-    let _ = cfg.clamp_to_channel(channel);
-    let cfg = cfg;
     // Diagnostics for plain CLI verbs: the WARN+ in-memory ring is installed
     // unconditionally (cheap, zero I/O) so a crash still writes a report; a
     // stderr tracing layer is added only when `THEGN_LOG` is set, so
@@ -1253,6 +1257,16 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         crate::diag::register_identity(channel.as_str());
         thegn_core::log_trace::install(thegn_core::log_trace::Role::Cli, &cfg.log);
     }
+    // Neutralise experimental toggles a stable build doesn't ship (see run.rs).
+    // Keep the outcome for actionable tracker refusals and config inspection;
+    // the WARN reaches the always-on diagnostics ring and optional THEGN_LOG
+    // sink without adding per-invocation stderr output.
+    let clamped = crate::channel_state::clamp_and_record(&mut cfg, channel);
+    if !clamped.is_empty() {
+        tracing::warn!(channel = channel.as_str(), clamped = ?clamped,
+            "release channel neutralised configured experimental features");
+    }
+    let cfg = cfg;
     // Best-effort `[[presets]]` warnings (duplicate names, unknown template
     // refs) — soft, never blocking; hard errors surface in `config validate`.
     for w in thegn_core::config_presets::preset_warnings(&cfg) {

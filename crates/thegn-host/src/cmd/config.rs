@@ -342,6 +342,13 @@ fn show(cfg: &Config, json: bool) -> Result<()> {
 }
 
 fn get(cfg: &Config, key: &str, json: bool, path: &Path) -> Result<()> {
+    if let Some(notice) = clamp_notice(
+        key,
+        crate::channel_state::clamped(thegn_core::channel::Feature::Trackers),
+    ) {
+        // Keep stdout machine-readable: this notice is intentionally stderr-only.
+        msg::warn(notice);
+    }
     if json {
         // Emit the value's REAL type (number, bool, array, table) rather than a
         // stringified scalar, so `config get --json` composes with `jq`.
@@ -366,6 +373,13 @@ fn get(cfg: &Config, key: &str, json: bool, path: &Path) -> Result<()> {
             path.display()
         ),
     }
+}
+
+fn clamp_notice(key: &str, trackers_clamped: bool) -> Option<&'static str> {
+    (key.split('.').next() == Some("issues") && trackers_clamped)
+    .then_some(
+        "[issues] tracker settings were disabled because trackers are experimental on the stable channel; set THEGN_CHANNEL=dev to enable",
+    )
 }
 
 fn edit(cfg: &Config, path: &PathBuf) -> Result<()> {
@@ -525,6 +539,20 @@ mod tests {
                 "config get --json {key}"
             );
         }
+    }
+
+    #[test]
+    fn config_get_notice_is_section_scoped_and_keeps_json_value_shape() {
+        // The caller emits this notice through msg::warn (stderr); the value
+        // continues through the existing serializer unchanged on stdout.
+        assert!(clamp_notice("issues.provider", true).is_some());
+        assert!(clamp_notice("issues.issue_accounts.0.provider", true).is_some());
+        assert_eq!(clamp_notice("ui.language", true), None);
+        assert_eq!(clamp_notice("issues.provider", false), None);
+        let cfg = Config::default();
+        let json = serde_json::to_value(cfg.value_at("issues").unwrap()).unwrap();
+        assert!(json.is_object());
+        assert_eq!(json["provider"], "none");
     }
 
     /// The pipeline org chart is read WHOLE by the supervising agent
