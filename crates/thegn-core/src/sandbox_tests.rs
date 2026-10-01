@@ -2,14 +2,13 @@ use super::*;
 use crate::sandbox_mounts::host_toolchain_mounts;
 
 #[test]
-fn ambient_container_listing_runs_ps_only_for_cached_present_backends() {
+fn ambient_container_listing_runs_ps_only_for_present_backends() {
     let mut calls = Vec::new();
     let containers = running_containers_with(
         false,
         |backend| match backend {
-            Backend::Podman => Some(RuntimeProbe::Absent),
-            Backend::PodmanRootful => None,
-            Backend::Docker => Some(RuntimeProbe::Present),
+            Backend::Podman | Backend::PodmanRootful => RuntimeProbe::Absent,
+            Backend::Docker => RuntimeProbe::Present,
             _ => unreachable!(),
         },
         |backend, _| {
@@ -24,11 +23,11 @@ fn ambient_container_listing_runs_ps_only_for_cached_present_backends() {
 }
 
 #[test]
-fn ambient_container_listing_with_no_present_cache_is_empty_without_ps() {
+fn ambient_container_listing_with_no_present_backend_is_empty_without_ps() {
     let mut calls = Vec::new();
     let containers = running_containers_with(
         false,
-        |_| Some(RuntimeProbe::Absent),
+        |_| RuntimeProbe::Absent,
         |backend, _| {
             calls.push(backend);
             None

@@ -276,6 +276,49 @@ fn opening_at_a_hidden_tab_falls_back_to_a_real_one() {
 }
 
 #[test]
+fn containers_tab_is_kept_until_listed_then_hidden_when_empty() {
+    let hist = history(10, NOW_MS);
+    let ctx = ctx_at(&hist, Rect::full(120, 40));
+    let mut model = model_with(full_snap());
+    model.containers.clear();
+    // Never listed (the listing is demand-gated and arrives after open): a
+    // persisted Containers tab is honoured rather than dropped to the first tab.
+    model.containers_listed = false;
+    let mut ov = MonitorOverlay::open(
+        MonitorTab::Containers,
+        MonitorPrefs::default(),
+        &model,
+        &ctx,
+    );
+    assert_eq!(ov.tab, MonitorTab::Containers);
+    // Listed and genuinely empty: the tab goes away like any absent device.
+    model.containers_listed = true;
+    ov.refresh(&model, &ctx);
+    assert_ne!(ov.tab, MonitorTab::Containers);
+    assert!(!ov.tabs.contains(&MonitorTab::Containers));
+    // Listed with a container: opens on it.
+    model.containers = vec![thegn_core::sandbox::ContainerInfo {
+        name: "thegn-x".into(),
+        image: "i".into(),
+        status: "Up".into(),
+        ours: true,
+        backend: "docker".into(),
+        cpu: String::new(),
+        mem: String::new(),
+        net: String::new(),
+        containment: String::new(),
+        mounts: String::new(),
+    }];
+    let ov = MonitorOverlay::open(
+        MonitorTab::Containers,
+        MonitorPrefs::default(),
+        &model,
+        &ctx,
+    );
+    assert_eq!(ov.tab, MonitorTab::Containers);
+}
+
+#[test]
 fn a_tab_vanishing_under_the_user_re_homes_the_cursor() {
     // Unplug the GPU / pop the battery mid-session: the modal must not be left
     // pointing at a tab that no longer exists.

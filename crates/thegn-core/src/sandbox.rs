@@ -1296,20 +1296,20 @@ pub fn running_containers_with_stats() -> Vec<ContainerInfo> {
 fn running_containers_impl(with_stats: bool) -> Vec<ContainerInfo> {
     running_containers_with(
         with_stats,
-        |backend| crate::sandbox_backend::cached_available(&Placement::Local, backend),
+        crate::sandbox_backend::available_for_listing,
         |backend, args| run_local_output(&backend_prefix(backend), args),
-        |backend| oci_stats(backend),
+        oci_stats,
     )
 }
 
 fn running_containers_with(
     with_stats: bool,
-    mut available: impl FnMut(Backend) -> Option<RuntimeProbe>,
+    mut available: impl FnMut(Backend) -> RuntimeProbe,
     mut run: impl FnMut(Backend, &[&str]) -> Option<String>,
     mut stats: impl FnMut(Backend) -> std::collections::HashMap<String, ContainerStat>,
 ) -> Vec<ContainerInfo> {
     let mut out = Vec::new();
-    if available(Backend::Podman) == Some(RuntimeProbe::Present)
+    if available(Backend::Podman) == RuntimeProbe::Present
         && let Some(stdout) = run(Backend::Podman, &["ps", "--format", "json"])
     {
         let mut rows = parse_podman_ps(&stdout);
@@ -1318,7 +1318,7 @@ fn running_containers_with(
         }
         out.extend(rows);
     }
-    if available(Backend::PodmanRootful) == Some(RuntimeProbe::Present)
+    if available(Backend::PodmanRootful) == RuntimeProbe::Present
         && let Some(stdout) = run(Backend::PodmanRootful, &["ps", "--format", "json"])
     {
         let mut rows = parse_podman_ps(&stdout);
@@ -1331,7 +1331,7 @@ fn running_containers_with(
         out.extend(rows);
     }
     if out.is_empty()
-        && available(Backend::Docker) == Some(RuntimeProbe::Present)
+        && available(Backend::Docker) == RuntimeProbe::Present
         && let Some(stdout) = run(Backend::Docker, &["ps", "--format", "{{json .}}"])
     {
         let mut rows = parse_docker_ps(&stdout);

@@ -102,8 +102,7 @@ pub(crate) fn spawn_refresh_ticker(
             sampler: None,
             last_stats: None,
             daemon_scope: None,
-            last_containers: None,
-            last_footprint: None,
+            delivery: ContainerDelivery::default(),
             last_footprint_tick: None,
         },
         move || {
@@ -130,7 +129,7 @@ trait TickerIo: Send + 'static {
     fn connection_recovery_due(&self) -> bool;
     fn send_stats_if_due(&mut self) -> Result<bool, ()>;
     fn container_demand(&self) -> ContainerDemand;
-    fn send_containers(&mut self, ticks: u64, every: u64, demand_rise: bool) -> Result<bool, ()>;
+    fn send_containers(&mut self, ticks: u64, demand_rise: bool) -> Result<bool, ()>;
     fn tick_complete(&mut self, _tick: u64) {}
 }
 
@@ -606,7 +605,7 @@ fn spawn_worker_inner(
                 if demand_rise
                     || container_last_sent.is_none_or(|last| ticks.saturating_sub(last) >= every)
                 {
-                    match io.send_containers(ticks, every, demand_rise) {
+                    match io.send_containers(ticks, demand_rise) {
                         Ok(changed) => {
                             wake |= changed;
                             container_last_sent = Some(ticks);
@@ -638,9 +637,44 @@ struct LiveIo {
     sampler: Option<thegn_metrics::StatsSampler>,
     last_stats: Option<Instant>,
     daemon_scope: Option<String>,
+    delivery: ContainerDelivery,
+    last_footprint_tick: Option<u64>,
+}
+
+/// Change gate for container deliveries: remembers the last snapshot and
+/// footprint so an identical refresh is dropped (no send, no loop wake).
+#[derive(Default)]
+struct ContainerDelivery {
     last_containers: Option<Vec<thegn_core::sandbox::ContainerInfo>>,
     last_footprint: Option<thegn_core::sandbox_manage::ContainerFootprint>,
-    last_footprint_tick: Option<u64>,
+}
+
+impl ContainerDelivery {
+    /// `Some(refresh)` when it must be sent (initial/demand-rise, changed set,
+    /// or changed footprint); `None` when nothing the views show changed.
+    fn filter(
+        &mut self,
+        mut refresh: ContainerRefresh,
+        detailed: bool,
+        demand_rise: bool,
+    ) -> Option<ContainerRefresh> {
+        let set_changed = demand_rise
+            || !self
+                .last_containers
+                .as_ref()
+                .is_some_and(|last| container_snapshot_equal(last, &refresh.containers, detailed));
+        self.last_containers = Some(refresh.containers.clone());
+        let footprint_changed = refresh
+            .footprint
+            .as_ref()
+            .is_some_and(|footprint| self.last_footprint.as_ref() != Some(footprint));
+        if footprint_changed {
+            self.last_footprint = refresh.footprint;
+        } else {
+            refresh.footprint = None;
+        }
+        (set_changed || footprint_changed).then_some(refresh)
+    }
 }
 
 fn container_snapshot_equal(
@@ -655,6 +689,7 @@ fn container_snapshot_equal(
                 && a.image == b.image
                 && a.status == b.status
                 && a.ours == b.ours
+                && a.mounts == b.mounts
                 && (!detailed || (a.cpu == b.cpu && a.mem == b.mem && a.net == b.net))
         })
 }
@@ -762,7 +797,7 @@ impl TickerIo for LiveIo {
         ContainerDemand::from_signal(self.container_demand.load(Ordering::Relaxed))
     }
 
-    fn send_containers(&mut self, ticks: u64, _every: u64, demand_rise: bool) -> Result<bool, ()> {
+    fn send_containers(&mut self, ticks: u64, demand_rise: bool) -> Result<bool, ()> {
         let live = self.containers_live.load(Ordering::Relaxed);
         let df_every = thegn_core::time_policy::cadence_millis_slots(
             super::CONTAINER_DETAIL_REFRESH_INTERVAL.as_millis(),
@@ -777,7 +812,7 @@ impl TickerIo for LiveIo {
         if footprint_due {
             self.last_footprint_tick = Some(ticks);
         }
-        let mut refresh = {
+        let refresh = {
             let _guard = crate::perf::measure(crate::perf::Subsys::Container);
             let containers = if live {
                 thegn_core::sandbox::running_containers_with_stats()
@@ -790,24 +825,9 @@ impl TickerIo for LiveIo {
                 footprint,
             }
         };
-        let set_changed = demand_rise
-            || !self
-                .last_containers
-                .as_ref()
-                .is_some_and(|last| container_snapshot_equal(last, &refresh.containers, live));
-        self.last_containers = Some(refresh.containers.clone());
-        let footprint_changed = refresh
-            .footprint
-            .as_ref()
-            .is_some_and(|footprint| self.last_footprint.as_ref() != Some(footprint));
-        if footprint_changed {
-            self.last_footprint = refresh.footprint.clone();
-        } else {
-            refresh.footprint = None;
-        }
-        if !set_changed && !footprint_changed {
+        let Some(refresh) = self.delivery.filter(refresh, live, demand_rise) else {
             return Ok(false);
-        }
+        };
         self.container_tx.send(refresh).map_err(|_| ())?;
         Ok(true)
     }
