@@ -91,9 +91,6 @@ pub enum Feature {
     Observe,
     /// The multi-host placement / host-as-resource engine (`[placement]`).
     Placement,
-    /// Multi-tier project-management trackers — Linear / Jira / Kaneo
-    /// (`[issues]`). GitHub PR/issue *viewing* is stable and not gated here.
-    Trackers,
     /// Experimental command-backed voice mode (`[voice]`).
     Voice,
 }
@@ -101,12 +98,11 @@ pub enum Feature {
 impl Feature {
     /// Every gated feature, for exhaustive iteration (e.g. the `doctor` table
     /// and the config clamp). Order is stable and display-friendly.
-    pub const ALL: [Feature; 6] = [
+    pub const ALL: [Feature; 5] = [
         Feature::Remote,
         Feature::Providers,
         Feature::Observe,
         Feature::Placement,
-        Feature::Trackers,
         Feature::Voice,
     ];
 
@@ -117,7 +113,6 @@ impl Feature {
             Feature::Providers => "providers",
             Feature::Observe => "observe",
             Feature::Placement => "placement",
-            Feature::Trackers => "trackers",
             Feature::Voice => "voice",
         }
     }
@@ -131,7 +126,6 @@ impl Feature {
             | Feature::Providers
             | Feature::Observe
             | Feature::Placement
-            | Feature::Trackers
             | Feature::Voice => Stability::Experimental,
         }
     }
@@ -189,7 +183,7 @@ mod tests {
         // ALL must cover every variant so the clamp/doctor never miss one.
         // (Compile-time exhaustiveness is enforced by `stability`'s match; this
         // guards ALL against drift.)
-        assert_eq!(Feature::ALL.len(), 6);
+        assert_eq!(Feature::ALL.len(), 5);
         let mut ids: Vec<&str> = Feature::ALL.iter().map(|f| f.id()).collect();
         ids.sort_unstable();
         ids.dedup();

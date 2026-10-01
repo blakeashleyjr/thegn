@@ -342,17 +342,14 @@ fn show(cfg: &Config, json: bool) -> Result<()> {
 }
 
 fn get(cfg: &Config, key: &str, json: bool, path: &Path) -> Result<()> {
-    if let Some(notice) = clamp_notice(
-        key,
-        crate::channel_state::clamped(thegn_core::channel::Feature::Trackers),
-    ) {
+    if let Some(notice) = clamp_notice(key, &crate::channel_state::clamped_features()) {
         // Keep stdout machine-readable: this notice is intentionally stderr-only.
-        msg::warn(notice);
+        msg::warn(&notice);
     }
     if json {
         // Emit the value's REAL type (number, bool, array, table) rather than a
         // stringified scalar, so `config get --json` composes with `jq`.
-        return match cfg.value_at(key) {
+        return match redacted_value_at(cfg, key) {
             Some(v) => {
                 outln!("{}", serde_json::to_string(&v)?);
                 Ok(())
@@ -363,7 +360,18 @@ fn get(cfg: &Config, key: &str, json: bool, path: &Path) -> Result<()> {
             ),
         };
     }
-    match cfg.get_dotted(key) {
+    let plain = if key == "issues" || key.starts_with("issues.issue_accounts") {
+        redacted_value_at(cfg, key).map(render_config_value)
+    } else if key
+        .rsplit('.')
+        .next()
+        .is_some_and(thegn_core::redact::is_sensitive)
+    {
+        Some(thegn_core::redact::PLACEHOLDER.to_string())
+    } else {
+        cfg.get_dotted(key)
+    };
+    match plain {
         Some(v) => {
             outln!("{v}");
             Ok(())
@@ -375,11 +383,54 @@ fn get(cfg: &Config, key: &str, json: bool, path: &Path) -> Result<()> {
     }
 }
 
-fn clamp_notice(key: &str, trackers_clamped: bool) -> Option<&'static str> {
-    (key.split('.').next() == Some("issues") && trackers_clamped)
-    .then_some(
-        "[issues] tracker settings were disabled because trackers are experimental on the stable channel; set THEGN_CHANNEL=dev to enable",
-    )
+/// Resolve a config value for user-facing output and mask secret-bearing keys.
+/// Redact the selected subtree (for `config get issues`) and also inspect the
+/// final dotted key (for `config get issues.issue_accounts.0.token`).
+fn redacted_value_at(cfg: &Config, key: &str) -> Option<serde_json::Value> {
+    let mut value = cfg.value_at(key)?;
+    thegn_core::redact::redact_json(&mut value);
+    if key
+        .rsplit('.')
+        .next()
+        .is_some_and(thegn_core::redact::is_sensitive)
+    {
+        value = serde_json::json!(thegn_core::redact::PLACEHOLDER);
+    }
+    Some(value)
+}
+
+fn render_config_value(value: serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(value) => value,
+        serde_json::Value::Null => String::new(),
+        serde_json::Value::Array(values) => values
+            .into_iter()
+            .map(render_config_value)
+            .collect::<Vec<_>>()
+            .join("\n"),
+        other => other.to_string(),
+    }
+}
+
+fn clamp_notice(key: &str, clamped: &[thegn_core::channel::Feature]) -> Option<String> {
+    use thegn_core::channel::Feature;
+    let mut parts = key.split('.');
+    let root = parts.next()?;
+    let feature = match (root, parts.next()) {
+        ("sandbox", Some("remote")) => Feature::Remote,
+        ("host", _) => Feature::Providers,
+        ("observe", _) => Feature::Observe,
+        ("placement", _) => Feature::Placement,
+        ("voice", _) => Feature::Voice,
+        _ => return None,
+    };
+    clamped.contains(&feature).then(|| {
+        format!(
+            "configuration for [{}] was disabled by the stable channel; set THEGN_CHANNEL=dev to enable {}",
+            if feature == Feature::Remote { "sandbox.remote" } else { root },
+            feature.id()
+        )
+    })
 }
 
 fn edit(cfg: &Config, path: &PathBuf) -> Result<()> {
@@ -545,14 +596,39 @@ mod tests {
     fn config_get_notice_is_section_scoped_and_keeps_json_value_shape() {
         // The caller emits this notice through msg::warn (stderr); the value
         // continues through the existing serializer unchanged on stdout.
-        assert!(clamp_notice("issues.provider", true).is_some());
-        assert!(clamp_notice("issues.issue_accounts.0.provider", true).is_some());
-        assert_eq!(clamp_notice("ui.language", true), None);
-        assert_eq!(clamp_notice("issues.provider", false), None);
+        use thegn_core::channel::Feature;
+        let clamped = [Feature::Remote, Feature::Providers];
+        assert!(clamp_notice("host.gpu.command", &clamped).is_some());
+        assert!(clamp_notice("sandbox.remote.host", &clamped).is_some());
+        assert_eq!(clamp_notice("ui.language", &clamped), None);
+        assert_eq!(clamp_notice("issues.provider", &clamped), None);
         let cfg = Config::default();
         let json = serde_json::to_value(cfg.value_at("issues").unwrap()).unwrap();
         assert!(json.is_object());
         assert_eq!(json["provider"], "none");
+    }
+
+    #[test]
+    fn config_get_redacts_issue_account_tokens_in_nested_and_direct_values() {
+        let mut cfg = Config::default();
+        cfg.issues
+            .issue_accounts
+            .push(thegn_core::config::IssueAccount {
+                name: "linear-work".into(),
+                provider: thegn_core::config::IssueProviderKind::Linear,
+                token: "THE695_SYNTHETIC_CANARY".into(),
+                ..Default::default()
+            });
+        let issues = redacted_value_at(&cfg, "issues").unwrap();
+        assert_eq!(
+            issues["issue_accounts"][0]["token"],
+            thegn_core::redact::PLACEHOLDER
+        );
+        assert!(!issues.to_string().contains("THE695_SYNTHETIC_CANARY"));
+
+        let token = redacted_value_at(&cfg, "issues.issue_accounts.0.token").unwrap();
+        assert_eq!(token, thegn_core::redact::PLACEHOLDER);
+        assert!(!token.to_string().contains("THE695_SYNTHETIC_CANARY"));
     }
 
     /// The pipeline org chart is read WHOLE by the supervising agent

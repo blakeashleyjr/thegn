@@ -1136,7 +1136,6 @@ fn experimental_command(command: &Command) -> Option<(&'static str, thegn_core::
     Some(match command {
         Command::Host { .. } => ("host", Feature::Providers),
         Command::Placement { .. } => ("placement", Feature::Placement),
-        Command::Kaneo { .. } => ("kaneo", Feature::Trackers),
         _ => return None,
     })
 }
