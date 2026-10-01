@@ -104,7 +104,10 @@ sandboxing — each with the gate that enforces it. Behavioural contracts are
   26,063 reads/sec, taking the machine to load 10–13 with `top` showing 45% idle,
   while its cores-used looked ordinary: **4,408 zombies consume zero CPU.** The
   ceilings are fixed, never baseline-derived, so a regressed baseline cannot
-  raise the bar on a leak. **Anything that spawns a child owns its lifetime** —
+  raise the bar on a leak. The soak also counts exact `execve` starts during its
+  idle window: THE-706 and THE-716 showed that correctly reaped process churn
+  passed every gate because nothing counted spawns. **Anything that spawns a
+  child owns its lifetime** —
   `std::process::Child` does not wait on drop, so a dropped handle is a zombie.
   That class has now been found in production three times (THE-605, THE-448,
   THE-701); THE-702 tracks the ratchet that should make a fourth impossible.
