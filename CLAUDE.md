@@ -105,9 +105,13 @@ sandboxing — each with the gate that enforces it. Behavioural contracts are
   while its cores-used looked ordinary: **4,408 zombies consume zero CPU.** The
   ceilings are fixed, never baseline-derived, so a regressed baseline cannot
   raise the bar on a leak. The soak also counts exact `execve` starts during its
-  idle window: THE-706 and THE-716 showed that correctly reaped process churn
-  passed every gate because nothing counted spawns. **Anything that spawns a
-  child owns its lifetime** —
+  idle window (strace, fixed ceiling 0, Linux only; macOS reports `unsupported`):
+  THE-706 and THE-716 showed that correctly reaped process churn passed every
+  gate because nothing counted spawns. Pane-shell subtrees (rc files, prompt
+  hooks) are reported but not counted. **The tracer limits what it sees:**
+  ptrace neutralises setuid, so `sudo -n podman` fails under it and rootful
+  podman is cached Absent — the soak under-counts production spawns, and green
+  is a floor, not a proof. **Anything that spawns a child owns its lifetime** —
   `std::process::Child` does not wait on drop, so a dropped handle is a zombie.
   That class has now been found in production three times (THE-605, THE-448,
   THE-701); THE-702 tracks the ratchet that should make a fourth impossible.

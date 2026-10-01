@@ -96,6 +96,23 @@ SYSCR_RATE_CEILING=5000
 # Idle process starts are forbidden in the soak window. This ceiling is fixed
 # by doctrine, not measured from a baseline, and is deliberately not a CLI knob.
 SPAWN_RATE_CEILING=0
+# One strace recipe for both processes. Every flag is load-bearing:
+#   -f                follow forks (git/podman/... are children of thegn)
+#   -qq               silence "Process N attached/exited" tracer chatter
+#   --seccomp-bpf     only the filtered syscalls stop; idle cost stays ~zero
+#   -ttt              epoch timestamps, comparable with the window's `date +%s.%N`
+#   -s 4096           NO string truncation: the default 32-char limit turns the
+#                     trampoline's long paths into `"..."...`
+#   -e signal=none    `-qq` does NOT suppress `--- SIGCHLD ---` lines; this does
+#   -e trace=...      execve = the spawn; clone/clone3/fork/vfork give the
+#                     pid->parent map that separates pane-shell subtrees (rc files,
+#                     prompt hooks) from thegn's own spawns -- see spawn-trace.py
+# KNOWN LIMITATION: ptrace neutralises setuid, so `sudo -n podman` (the rootful
+# probe) fails under the tracer, rootful podman is cached Absent, and the run
+# under-counts the spawns a production (untraced) thegn makes. Rootless
+# `podman ps` / `docker ps` are still seen; a green result here is therefore a
+# floor, not proof that no setuid helper is ever spawned.
+SPAWN_STRACE_FLAGS="-f -qq --seccomp-bpf -ttt -s 4096 -e signal=none -e trace=execve,clone,clone3,fork,vfork"
 RECORD=0
 JSON_ONLY=0
 BASELINE_DIR="$HERE/baselines"
@@ -260,8 +277,8 @@ if [ "$SPAWN_ENABLED" = 1 ] && [ "$SAMPLER" = proc ]; then
   # `$1`/`$@` are the bash -c positionals passed after `$0`, not outer values.
   # shellcheck disable=SC2016
   printf -v INNER \
-    'cd %q; stty rows 50 cols 200; env THEGN_BENCH_RUN_MS=%q %s %q -f -qq --seccomp-bpf -ttt -e trace=execve -o %q bash -c '\''echo $$ > "$1"; shift; exec "$@"'\'' _ %q %q & echo $! > %q; wait' \
-    "$REPO" "$RUN_MS" "$NO_DAEMON" "$STRACE_BIN" "$TRACE_UI_FILE" "$PIDFILE" "$BIN_ABS" "$TRACE_UI_PIDFILE"
+    'cd %q; stty rows 50 cols 200; env THEGN_BENCH_RUN_MS=%q %s %q %s -o %q bash -c '\''echo $$ > "$1"; shift; exec "$@"'\'' _ %q %q & echo $! > %q; wait' \
+    "$REPO" "$RUN_MS" "$NO_DAEMON" "$STRACE_BIN" "$SPAWN_STRACE_FLAGS" "$TRACE_UI_FILE" "$PIDFILE" "$BIN_ABS" "$TRACE_UI_PIDFILE"
 else
   printf -v INNER \
     'cd %q; stty rows 50 cols 200; env THEGN_BENCH_RUN_MS=%q %s %q & echo $! > %q; wait' \
@@ -309,9 +326,17 @@ if [ "$SCENARIO" = soak-daemon ]; then
   mkdir -p "$XDG_RUNTIME_DIR/thegn"
   if [ "$SPAWN_ENABLED" = 1 ] && [ "$SAMPLER" = proc ]; then
     TRACE_DAEMON_FILE="$PERF_TMP/daemon.execve"
-    "$STRACE_BIN" -f -qq --seccomp-bpf -ttt -e trace=execve -o "$TRACE_DAEMON_FILE" \
+    DAEMON_PIDFILE="$PERF_TMP/daemon.pid"
+    # The tracer's argv ALSO contains the isolated socket path, so matching argv
+    # (find_daemon_pid) would pick up strace -- and strace has 1 child, 0 zombies
+    # and 1 thread, passing every ceiling the daemon exists to be held to. Same
+    # trampoline as the UI: the daemon records its OWN pid, then exec()s into it.
+    # shellcheck disable=SC2016,SC2086
+    "$STRACE_BIN" $SPAWN_STRACE_FLAGS -o "$TRACE_DAEMON_FILE" \
+      bash -c 'echo $$ > "$1"; shift; exec "$@"' _ "$DAEMON_PIDFILE" \
       "$BIN_ABS" daemon --socket "$XDG_RUNTIME_DIR/thegn/daemon.sock" >/dev/null 2>&1 &
   else
+    DAEMON_PIDFILE=""
     "$BIN_ABS" daemon --socket "$XDG_RUNTIME_DIR/thegn/daemon.sock" >/dev/null 2>&1 &
   fi
   DAEMON_LAUNCHER=$!
@@ -494,7 +519,20 @@ if [ "$SAMPLER" = proc ]; then
   # The daemon, when this scenario started one. Sampled on the SAME axes: it is
   # the longest-lived process thegn runs, so it is the one where a per-event
   # leak compounds — and the one every other scenario is blind to.
-  DPID="$(find_daemon_pid || true)"
+  if [ -n "${DAEMON_PIDFILE:-}" ]; then
+    DPID="$(cat "$DAEMON_PIDFILE" 2>/dev/null || true)"
+  else
+    DPID="$(find_daemon_pid || true)"
+  fi
+  # Never sample the wrong process. A tracer wrapper (or anything that is not the
+  # thegn binary) here would make every daemon ceiling vacuous.
+  if [ -n "$DPID" ]; then
+    DCOMM="$(cat "/proc/$DPID/comm" 2>/dev/null || true)"
+    if [ "$DCOMM" = strace ] || [ "$DCOMM" != "$(basename "$BIN_ABS" | cut -c1-15)" ]; then
+      echo "FAIL: soak-daemon would sample pid $DPID comm='$DCOMM', not the thegn daemon" >&2
+      DAEMON_WRONG_PID=1
+    fi
+  fi
   if [ -n "$DPID" ]; then
     read -r DC0 DZ0 DFD0 _ _ _ _ DTH0 _ <<<"$(res_sample "$DPID")"
   fi
@@ -636,6 +674,11 @@ if [ "$SPAWN_ENABLED" = 1 ] && [ "$SAMPLER" = proc ]; then
   else
     SPAWN_ERROR="$(cat "$PERF_TMP/spawn-trace.err")"
     echo "FAIL: spawn-rate trace invalid: ${SPAWN_ERROR:-unknown parser failure}" >&2
+    # The temp dir is deleted on exit; keep the evidence a parser failure needs.
+    for f in "${TRACE_FILES[@]}"; do
+      cp "$f" "${TMPDIR:-/tmp}/thegn-invalid-$(basename "$f")" 2>/dev/null &&
+        echo "  kept invalid trace: ${TMPDIR:-/tmp}/thegn-invalid-$(basename "$f")" >&2
+    done
     SPAWN_JSON='{"status":"failed","method":"strace","count":null,"ceiling":0,"offenders":[],"roots":1,"error":"trace invalid"}'
     SPAWN_FAIL=1
   fi
@@ -677,7 +720,7 @@ else
     echo "  threads=$TH0 -> $TH1 (peak $THREAD_PEAK)"
     echo "  read syscalls=${SYSCR_RATE}/s"
     if [ -n "${DPID:-}" ]; then
-      echo "  daemon pid=$DPID: children=${DC0:-?} -> ${DC1:-?}   zombies=${DZ0:-?} -> ${DZ1:-?}   fds=${DFD0:-?} -> ${DFD1:-?}   threads=${DTH0:-?} -> ${DTH1:-?}"
+      echo "  daemon pid=$DPID comm=${DCOMM:-?}: children=${DC0:-?} -> ${DC1:-?}   zombies=${DZ0:-?} -> ${DZ1:-?}   fds=${DFD0:-?} -> ${DFD1:-?}   threads=${DTH0:-?} -> ${DTH1:-?}"
     elif [ "$SCENARIO" = soak-daemon ]; then
       echo "  daemon: NOT FOUND (see the check below)"
     fi
@@ -689,7 +732,7 @@ else
       echo 'spawn rate: unsupported on macOS (no Linux strace axis in this lane)'
     elif [ "$SPAWN_JSON" != 'null' ]; then
       echo "spawn rate: status=$(printf '%s' "$SPAWN_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["status"])') method=strace count=${SPAWN_COUNT:-unavailable} ceiling=$SPAWN_RATE_CEILING roots=${#TRACE_FILES[@]}"
-      printf '%s' "$SPAWN_JSON" | python3 -c 'import json,sys; d=json.load(sys.stdin); [print("  %s x%d" % (x["command"],x["count"])) for x in d.get("offenders",[])]'
+      printf '%s' "$SPAWN_JSON" | python3 -c 'import json,sys; d=json.load(sys.stdin); [print("  %s x%d" % (x["command"],x["count"])) for x in d.get("offenders",[])]; [print("  (pane subtree, not counted) %s x%d" % (x["command"],x["count"])) for x in d.get("excluded",[])]'
     fi
   fi
   if [ -f "$BASELINE" ]; then
@@ -750,6 +793,7 @@ if [ "$RES_JSON" != "null" ] && [ "$BUILD" = release ]; then
     RES_FAIL=1
   fi
   [ "$SPAWN_FAIL" = 0 ] || RES_FAIL=1
+  [ "${DAEMON_WRONG_PID:-0}" = 0 ] || RES_FAIL=1
   [ "$RES_FAIL" = 0 ] || exit 2
 fi
 
