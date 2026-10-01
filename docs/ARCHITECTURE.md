@@ -11,7 +11,7 @@ no gate is a wish, not an architecture.
 ```
 thegn-host  ── compositor: tokio runtime, portable-pty, termwiz Surface, chrome,
    │           daemon client/server, CLI verbs, the forge/git handles
-   ├─► thegn-svc ── service seams: git (gix → CLI), forge (octocrab → gh),
+   ├─► thegn-svc ── service seams: git (gix → CLI), forge (native GraphQL → gh),
    │      │         CI, issue trackers, calendar, control API adapters,
    │      │         providers, plugin transport
    │      └─► thegn-core ── substrate-agnostic domain logic: config, DB,
@@ -28,7 +28,7 @@ thegn-proxy ── OPT-IN model-proxy daemon (binary `tgproxy`): the axum I/O sh
 ```
 
 Rules: `thegn-core` never depends on a substrate (tokio, termwiz, portable-pty,
-reqwest, octocrab, axum, alacritty_terminal, gix); each substrate has exactly
+reqwest, axum, alacritty_terminal, gix); each substrate has exactly
 the owner crates listed in `crates/thegn-core/tests/crate_boundaries.rs`.
 `vt100` and `russh` are banned outright (`deny.toml`) — both are names from
 plans that never landed.

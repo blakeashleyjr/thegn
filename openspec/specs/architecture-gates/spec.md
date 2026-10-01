@@ -27,7 +27,7 @@ Every architectural invariant the project documents SHALL have a named gate that
 
 ### Requirement: Crate dependency boundaries are enforced
 
-A test over every workspace member's manifest SHALL assert that `tokio`, `termwiz`, `portable-pty`, `reqwest`, `octocrab`, `axum` and `alacritty_terminal` are direct dependencies only of their declared owner crates, that `thegn-core` carries none of them, and `cargo deny` SHALL ban `vt100` and `russh` outright.
+A test over every workspace member's manifest SHALL assert that `tokio`, `termwiz`, `portable-pty`, `reqwest`, `axum`, `alacritty_terminal` and `gix` are direct dependencies only of their declared owner crates, that `thegn-core` carries none of them, and `cargo deny` SHALL ban `vt100` and `russh` outright.
 
 #### Scenario: Core gains a runtime dependency
 
