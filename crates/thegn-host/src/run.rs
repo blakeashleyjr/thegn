@@ -4245,7 +4245,11 @@ fn handle_git_msg(
             }
             gitui::MenuKind::BranchActions => {
                 if let Some(b) = sel_branch(panel_ui, model) {
-                    *ov.menu = Some(menu::branch_actions_menu(&b.name, b.is_head));
+                    *ov.menu = Some(menu::branch_actions_menu_held(
+                        &b.name,
+                        b.is_head,
+                        !b.held_by.is_empty(),
+                    ));
                 }
             }
             gitui::MenuKind::CustomCommands => {
@@ -4329,6 +4333,12 @@ fn handle_git_msg(
             if let Some(b) = sel_branch(panel_ui, model) {
                 if b.is_head {
                     model.status = "cannot delete the checked-out branch".into();
+                } else if !b.held_by.is_empty() {
+                    model.status = format!(
+                        "cannot delete {}: checked out in {}",
+                        b.name,
+                        b.held_by.join(", ")
+                    );
                 } else {
                     confirm_git_op(
                         ov,

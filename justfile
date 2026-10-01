@@ -680,6 +680,10 @@ ratchets:
     # one timed site that consumes `idle_poll::poll_timeout` (tested pure).
     bash test/idle-poll-guard.sh --self-test
     bash test/idle-poll-guard.sh
+    # Supply-chain policy: prove the checker rejects mutable refs and recursively
+    # scans local actions, then enforce it against the checked-in workflows.
+    python3 -B test/action_pin_test.py --self-test
+    python3 -B test/action_pin_test.py
     # Guardrail: the terminal emulator owns the tty winsize (we never
     # TIOCSWINSZ ourselves back into a SIGWINCH), and every window-size
     # adoption funnels through the one `adopt_window_size!` site.
