@@ -2,7 +2,10 @@
 
 ## Purpose
 
-TBD - created by archiving change harden-live-diagnostics-and-forge. Update Purpose after archive.
+Governs how thegn renders its own diagnostics (log files and CLI stderr events).
+Currently this covers the field formatter's color policy: plain output carries no
+formatter-generated ANSI styling, while explicit terminal color and JSON output
+keep their existing behavior.
 
 ## Requirements
 
