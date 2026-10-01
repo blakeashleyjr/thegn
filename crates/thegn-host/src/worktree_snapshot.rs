@@ -3,6 +3,8 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use thegn_core::models::WorktreeRow;
 use thegn_svc::git::{GitBackend, WorktreeHead, WorktreeInfo};
@@ -141,18 +143,93 @@ pub(crate) fn observe_rows_cheap(
     cached: impl Fn(&str) -> Option<String>,
 ) -> HashMap<String, BranchObservation> {
     let gix = thegn_svc::git::GixGit::new();
+    observe_rows_cheap_in(
+        head_read_cache(),
+        HEAD_READ_TTL,
+        rows,
+        cached,
+        &gix,
+        |loc| gix.current_branch(loc),
+    )
+}
+
+/// How long an in-process HEAD read is trusted. Rows reach the gix read only
+/// when the glyph cache has no entry (a workspace not visited this session, or
+/// a glyph read that errored), and each read is a repository open (~0.2-1 ms
+/// of CPU plus a dozen file reads) repeated on every 5 s idle hydration. A
+/// minute bounds that to ~1/12 of the ticks; staleness is bounded by the TTL
+/// and by [`invalidate_head_reads`], which the ref-move signal
+/// ([`crate::branch_cache::invalidate_all`]) calls.
+pub(crate) const HEAD_READ_TTL: Duration = Duration::from_secs(60);
+
+/// Hard bound on the map; past it the whole map is dropped (it is a cache).
+const HEAD_READ_CAP: usize = 4096;
+
+/// Path-keyed memo of local `current_branch` answers, including failures and
+/// detached/unborn results so a broken row does not re-read every tick.
+#[derive(Default)]
+pub(crate) struct HeadReadCache {
+    map: Mutex<HashMap<String, (BranchObservation, Instant)>>,
+}
+
+impl HeadReadCache {
+    fn get(&self, path: &str, ttl: Duration) -> Option<BranchObservation> {
+        let map = self.map.lock().unwrap();
+        map.get(path)
+            .filter(|(_, at)| at.elapsed() < ttl)
+            .map(|(obs, _)| obs.clone())
+    }
+
+    fn put(&self, path: &str, obs: BranchObservation, ttl: Duration) {
+        let mut map = self.map.lock().unwrap();
+        if map.len() >= HEAD_READ_CAP {
+            map.clear();
+        } else if map.len() >= 64 {
+            // Amortised prune of expired entries, only once the map is non-tiny.
+            map.retain(|_, (_, at)| at.elapsed() < ttl);
+        }
+        map.insert(path.to_string(), (obs, Instant::now()));
+    }
+
+    pub(crate) fn clear(&self) {
+        self.map.lock().unwrap().clear();
+    }
+}
+
+fn head_read_cache() -> &'static HeadReadCache {
+    static CACHE: OnceLock<HeadReadCache> = OnceLock::new();
+    CACHE.get_or_init(HeadReadCache::default)
+}
+
+/// Drop every memoised HEAD read (a ref moved). No I/O.
+pub(crate) fn invalidate_head_reads() {
+    head_read_cache().clear();
+}
+
+fn observe_rows_cheap_in(
+    memo: &HeadReadCache,
+    ttl: Duration,
+    rows: &[WorktreeRow],
+    cached: impl Fn(&str) -> Option<String>,
+    gix: &(impl GitBackend + ?Sized),
+    read_local: impl Fn(&thegn_core::remote::GitLoc) -> anyhow::Result<String>,
+) -> HashMap<String, BranchObservation> {
     rows.iter()
         .map(|row| {
             let loc = thegn_core::remote::GitLoc::from_db(&row.worktree, Some(&row.location));
             let observed = if let Some(branch) = cached(&row.worktree) {
                 from_branch_name(&branch)
             } else if loc.is_remote() {
-                remote_observation(&gix, &loc, RemoteRead::BridgedOnly)
+                remote_observation(gix, &loc, RemoteRead::BridgedOnly)
+            } else if let Some(hit) = memo.get(&row.worktree, ttl) {
+                hit
             } else {
-                gix.current_branch(&loc)
+                let obs = read_local(&loc)
                     .ok()
                     .map(|branch| from_branch_name(&branch))
-                    .unwrap_or(BranchObservation::Unavailable)
+                    .unwrap_or(BranchObservation::Unavailable);
+                memo.put(&row.worktree, obs.clone(), ttl);
+                obs
             };
             (row.worktree.clone(), observed)
         })
@@ -372,5 +449,49 @@ mod tests {
             detached["/definitely/not/on/disk"],
             BranchObservation::Detached
         );
+    }
+
+    #[test]
+    fn head_read_is_memoised_within_ttl_and_reread_after() {
+        use std::cell::Cell;
+        let memo = HeadReadCache::default();
+        let gix = thegn_svc::git::GixGit::new();
+        let rows = [row("/not/on/disk", "registry")];
+        let reads = Cell::new(0);
+        let read = |_: &thegn_core::remote::GitLoc| {
+            reads.set(reads.get() + 1);
+            Ok("feature/x".to_string())
+        };
+        let ttl = Duration::from_secs(60);
+        let a = observe_rows_cheap_in(&memo, ttl, &rows, |_| None, &gix, read);
+        let b = observe_rows_cheap_in(&memo, ttl, &rows, |_| None, &gix, read);
+        assert_eq!(a, b);
+        assert_eq!(reads.get(), 1, "second observation inside the TTL re-read");
+        // An expired entry re-reads.
+        observe_rows_cheap_in(&memo, Duration::ZERO, &rows, |_| None, &gix, read);
+        assert_eq!(reads.get(), 2);
+        // Invalidation re-reads.
+        memo.clear();
+        observe_rows_cheap_in(&memo, ttl, &rows, |_| None, &gix, read);
+        assert_eq!(reads.get(), 3);
+    }
+
+    #[test]
+    fn failed_reads_are_memoised_too() {
+        use std::cell::Cell;
+        let memo = HeadReadCache::default();
+        let gix = thegn_svc::git::GixGit::new();
+        let rows = [row("/not/on/disk", "registry")];
+        let reads = Cell::new(0);
+        let read = |_: &thegn_core::remote::GitLoc| {
+            reads.set(reads.get() + 1);
+            Err(anyhow::anyhow!("broken"))
+        };
+        let ttl = Duration::from_secs(60);
+        for _ in 0..3 {
+            let got = observe_rows_cheap_in(&memo, ttl, &rows, |_| None, &gix, read);
+            assert_eq!(got["/not/on/disk"], BranchObservation::Unavailable);
+        }
+        assert_eq!(reads.get(), 1);
     }
 }

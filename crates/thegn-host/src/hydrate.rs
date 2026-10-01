@@ -2952,22 +2952,44 @@ pub(crate) fn build_panel(
         // Git prints realpaths, so compare against the raw and the (once)
         // canonicalised cwd rather than canonicalising every entry.
         let current_canon = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
-        let holders: std::collections::HashMap<String, Vec<String>> = repo_root
-            .as_deref()
-            .filter(|_| branches_open)
-            .and_then(|root| {
-                thegn_svc::git::GitBackend::worktrees(&*crate::git_handle::get(), root).ok()
-            })
-            .unwrap_or_default()
+        // Cached per repo with the branch list's TTL/invalidation: the
+        // `git worktree list` runs only when the section is open AND the cache
+        // is cold or past `BRANCH_CACHE_TTL`, not on every hydration.
+        let all_holders: crate::branch_cache::Holders =
+            match repo_root.as_deref().filter(|_| branches_open) {
+                None => Vec::new(),
+                Some(root) => {
+                    let cached = crate::branch_cache::get_holders(root);
+                    if crate::branch_cache::should_refetch(
+                        cached.as_ref().map(|(_, age)| *age),
+                        crate::branch_cache::BRANCH_CACHE_TTL,
+                    ) {
+                        let fresh: crate::branch_cache::Holders =
+                            thegn_svc::git::GitBackend::worktrees(&*crate::git_handle::get(), root)
+                                .map(|list| {
+                                    list.into_iter()
+                                        .filter_map(|wt| match wt.head {
+                                            thegn_svc::git::WorktreeHead::Branch(branch) => {
+                                                Some((branch, wt.path))
+                                            }
+                                            thegn_svc::git::WorktreeHead::Detached
+                                            | thegn_svc::git::WorktreeHead::Unborn => None,
+                                        })
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                        crate::branch_cache::put_holders(root, fresh.clone());
+                        fresh
+                    } else {
+                        cached.map(|(h, _)| h).unwrap_or_default()
+                    }
+                }
+            };
+        let holders: std::collections::HashMap<String, Vec<String>> = all_holders
             .into_iter()
-            .filter_map(|wt| {
-                let branch = match wt.head {
-                    thegn_svc::git::WorktreeHead::Branch(branch) => branch,
-                    thegn_svc::git::WorktreeHead::Detached
-                    | thegn_svc::git::WorktreeHead::Unborn => return None,
-                };
-                let path = std::path::Path::new(&wt.path);
-                (path != cwd && path != current_canon).then_some((branch, wt.path))
+            .filter(|(_, path)| {
+                let path = std::path::Path::new(path);
+                path != cwd && path != current_canon
             })
             .fold(
                 std::collections::HashMap::new(),
