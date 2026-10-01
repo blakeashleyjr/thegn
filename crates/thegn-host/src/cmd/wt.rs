@@ -235,7 +235,7 @@ fn new(
     }
 
     let db = Db::open()?;
-    let path_s = create_and_register(
+    let (path_s, filing_error) = create_and_register(
         cfg,
         &root,
         &branch,
@@ -261,15 +261,21 @@ fn new(
             root: &'a str,
             base: &'a str,
         }
-        return super::emit_json(&Created {
+        super::emit_json(&Created {
             branch: &branch,
             path: &path_s,
             root: &root_s,
             base: &base,
-        });
+        })?;
+    } else {
+        outln!("{path_s}");
     }
-    outln!("{path_s}");
-    Ok(())
+    // The worktree exists and is fully set up; only the folder label failed.
+    // Report the path first so a caller still learns where it is, then fail.
+    match filing_error {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 /// Create + register one worktree for an ALREADY-resolved branch name and a
@@ -277,7 +283,11 @@ fn new(
 /// path so both run the identical pipeline (`git worktree add` → seed mq assets
 /// → DB register → env pin) and cannot drift. Rolls the speculative checkout
 /// back on any failure so a failed create leaves nothing. Returns the created
-/// worktree's absolute path.
+/// worktree's absolute path plus a HELD folder-filing error: filing is the last
+/// step (after the env pin and PostCreate hooks) and a failure there must not
+/// skip any setup, so the caller reports the path and then surfaces the error.
+/// Everything about filing that can be known up front is checked before the
+/// worktree is created (`check_folder_fileable`).
 fn create_and_register(
     cfg: &Config,
     root: &std::path::Path,
@@ -286,7 +296,13 @@ fn create_and_register(
     env: Option<&str>,
     folder: Option<&str>,
     db: &Db,
-) -> Result<String> {
+) -> Result<(String, Option<anyhow::Error>)> {
+    // A creation that is going to fail filing for a knowable reason (bad name,
+    // removed workspace) must not create anything.
+    let folder = match folder {
+        Some(name) => Some(check_folder_fileable(db, &root.to_string_lossy(), name)?),
+        None => None,
+    };
     // THE-516: fallible identity resolution — never a basename/slug alias.
     // The slug comes from the caller's OWN handle (`db`), not a second
     // connection: authority must not depend on a duplicate open.
@@ -337,22 +353,6 @@ fn create_and_register(
         };
         return Err(anyhow::anyhow!(message));
     }
-    // A filing failure does NOT roll back the worktree. Registration failing
-    // above leaves it untracked and unusable, so unwinding that is right — but a
-    // folder is a sidebar label, and destroying a real worktree (and its branch)
-    // over one is a far worse outcome than an unfiled row. The env pin below is
-    // best-effort for the same reason, and the note under it says warn-only
-    // failures "do not roll back a real worktree". This still fails loudly, so a
-    // caller that asked for filing never wrongly believes it happened.
-    if let Some(folder_name) = folder
-        && let Err(e) = file_registered_worktree(db, &root_s, &path_s, folder_name)
-    {
-        return Err(anyhow::anyhow!(
-            "{e}; the worktree at {path_s} was created and registered but NOT filed \
-             into {folder_name:?}. It is usable as-is; \
-             `thegn wt folder {path_s} {folder_name}` retries the filing."
-        ));
-    }
     // Pin the env only when it differs from the ambient default this worktree
     // would inherit anyway (same rule as the wizard: a matching choice stays
     // NULL for a clean inherit).
@@ -386,7 +386,22 @@ fn create_and_register(
         let _ = db.del_worktree(&path_s);
         return Err(anyhow::anyhow!(message));
     }
-    Ok(path_s)
+    // File last. A filing failure does NOT roll back the worktree: registration
+    // failing above leaves it untracked and unusable, so unwinding that is
+    // right, but a folder is a sidebar label and destroying a real worktree (and
+    // its branch) over one is far worse than an unfiled row. The error is held
+    // so the env pin and hooks above have already run.
+    let filing_error = folder.and_then(|folder_name| {
+        file_registered_worktree(db, &root_s, &path_s, &folder_name)
+            .err()
+            .map(|e| {
+                anyhow::anyhow!(
+                    "{e}; the worktree at {path_s} was created, registered and set up, \
+                     but NOT filed into {folder_name:?}"
+                )
+            })
+    });
+    Ok((path_s, filing_error))
 }
 
 /// Validate before touching the folder table: `ensure_folder` intentionally
@@ -399,6 +414,22 @@ fn validate_folder_name(name: &str) -> Result<String> {
     Ok(name.to_string())
 }
 
+/// Everything about filing that is knowable before a worktree exists: the name
+/// is valid, and the workspace has not been explicitly removed (a tombstoned
+/// workspace is honoured rather than resurrected by filing, and the refusal
+/// persists, so creating a worktree first would strand it unfiled). Returns the
+/// trimmed folder name.
+fn check_folder_fileable(db: &Db, repo_path: &str, folder_name: &str) -> Result<String> {
+    let folder_name = validate_folder_name(folder_name)?;
+    if db.workspace_tombstoned(repo_path).unwrap_or(false) {
+        anyhow::bail!(
+            "workspace {repo_path} was removed from thegn; re-add it before filing \
+             its worktrees into a folder"
+        );
+    }
+    Ok(folder_name)
+}
+
 /// Find or create the repo-scoped folder, then use the identity-checked write.
 /// Reading the row back is required because the DB match is trimmed and
 /// case-insensitive while the identity guard deliberately compares exactly.
@@ -408,7 +439,7 @@ fn file_registered_worktree(
     worktree_path: &str,
     folder_name: &str,
 ) -> Result<()> {
-    let folder_name = validate_folder_name(folder_name)?;
+    let folder_name = check_folder_fileable(db, repo_path, folder_name)?;
     // `folders.repo_path` REFERENCES `workspaces(repo_path)`, and that row is
     // otherwise only ever written by the compositor's hydration — so filing from
     // the CLI against a repo that has never been opened in the TUI would fail
@@ -417,12 +448,6 @@ fn file_registered_worktree(
     // tombstoned: honour that instead of resurrecting it as a side effect of
     // filing a folder.
     let repo = std::path::Path::new(repo_path);
-    if db.workspace_tombstoned(repo_path).unwrap_or(false) {
-        anyhow::bail!(
-            "workspace {repo_path} was removed from thegn; re-add it before filing \
-             its worktrees into a folder"
-        );
-    }
     let workspace_name = repo
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
@@ -445,8 +470,11 @@ fn file_registered_worktree(
     Ok(())
 }
 
-/// Register first so filing also works for a worktree not yet present in the
-/// sidebar cache. The caller supplies identity discovered from Git.
+/// Register only when the row is genuinely absent, so filing also works for a
+/// worktree not yet in the sidebar cache. An existing row keeps its identity:
+/// `put_worktree` rewrites `tab_name`/`branch` from the live branch, which would
+/// rename a drifted worktree's tab (and can trip the THE-516 ambiguity check
+/// against a stale sibling). The caller supplies identity discovered from Git.
 fn register_and_file_worktree(
     db: &Db,
     repo_path: &str,
@@ -454,10 +482,22 @@ fn register_and_file_worktree(
     branch: &str,
     folder_name: &str,
 ) -> Result<()> {
-    let slug = thegn_core::repo::repo_slug_with_checked(db, std::path::Path::new(repo_path))?;
-    let tab = thegn_core::repo::branch_tab(&slug, branch);
-    db.put_worktree(&tab, repo_path, worktree_path, branch, None, None)?;
+    if db.worktree_record(worktree_path)?.is_none() {
+        let slug = thegn_core::repo::repo_slug_with_checked(db, std::path::Path::new(repo_path))?;
+        let tab = thegn_core::repo::branch_tab(&slug, branch);
+        db.put_worktree(&tab, repo_path, worktree_path, branch, None, None)?;
+    }
     file_registered_worktree(db, repo_path, worktree_path, folder_name)
+}
+
+/// `--clear`: unfile an existing row without ever creating one. Returns whether
+/// a row existed.
+fn clear_folder_if_registered(db: &Db, worktree_path: &str) -> Result<bool> {
+    if db.worktree_record(worktree_path)?.is_none() {
+        return Ok(false);
+    }
+    db.set_worktree_folder(worktree_path, None)?;
+    Ok(true)
 }
 
 /// Resolve the supplied directory through Git and file/unfile that actual
@@ -487,11 +527,12 @@ fn folder(target: &str, name: Option<&str>, clear: bool) -> Result<()> {
         register_and_file_worktree(&db, &repo_path, &worktree_path, &branch, &folder_name)?;
         outln!("Filed {worktree_path} into folder \"{folder_name}\"");
     } else {
-        let slug = thegn_core::repo::repo_slug_with_checked(&db, &repo_root)?;
-        let tab = thegn_core::repo::branch_tab(&slug, &branch);
-        db.put_worktree(&tab, &repo_path, &worktree_path, &branch, None, None)?;
-        db.set_worktree_folder(&worktree_path, None)?;
-        outln!("Unfiled {worktree_path}");
+        // Never register on --clear: an unregistered worktree has no folder.
+        if clear_folder_if_registered(&db, &worktree_path)? {
+            outln!("Unfiled {worktree_path}");
+        } else {
+            outln!("Nothing to clear: {worktree_path} is not registered, so it is in no folder");
+        }
     }
     Ok(())
 }
@@ -626,11 +667,19 @@ fn new_batched(
                     folder.as_deref(),
                     &db,
                 ) {
-                    Ok(path) => outcomes.push(MemberOutcome {
+                    Ok((path, None)) => outcomes.push(MemberOutcome {
                         repo: m.repo_name.clone(),
                         status: "created",
                         path: Some(path),
                         error: None,
+                    }),
+                    // Only the filing step failed: the worktree is real, so
+                    // report where it is rather than hiding it.
+                    Ok((path, Some(e))) => outcomes.push(MemberOutcome {
+                        repo: m.repo_name.clone(),
+                        status: "failed",
+                        path: Some(path),
+                        error: Some(e.to_string()),
                     }),
                     Err(e) => outcomes.push(MemberOutcome {
                         repo: m.repo_name.clone(),
@@ -671,6 +720,7 @@ fn new_batched(
             match (o.status, &o.path, &o.error) {
                 ("created", Some(p), _) => outln!("  {} created  {}", o.repo, p),
                 ("exists", ..) => outln!("  {} exists   (attached)", o.repo),
+                ("failed", Some(p), Some(e)) => outln!("  {} FAILED   {} ({})", o.repo, e, p),
                 ("failed", _, Some(e)) => outln!("  {} FAILED   {}", o.repo, e),
                 _ => outln!("  {} {}", o.repo, o.status),
             }
@@ -830,7 +880,10 @@ fn rm(cfg: &Config, target: &str, delete_branch: bool, force: bool) -> Result<()
 
 #[cfg(test)]
 mod folder_tests {
-    use super::{file_registered_worktree, register_and_file_worktree, validate_folder_name};
+    use super::{
+        check_folder_fileable, clear_folder_if_registered, file_registered_worktree,
+        register_and_file_worktree, validate_folder_name,
+    };
     use thegn_core::db::Db;
     use thegn_core::store::WorkspaceStore;
 
@@ -972,6 +1025,51 @@ mod folder_tests {
             None
         );
         assert_eq!(db.folders_for_workspace("/repo").unwrap(), vec![folder]);
+    }
+
+    #[test]
+    fn filing_an_existing_row_leaves_its_identity_untouched() {
+        let db = db();
+        db.put_workspace("/repo", "repo", "repo").unwrap();
+        db.put_worktree("repo/orig", "/repo", "/repo/wt", "orig", None, None)
+            .unwrap();
+        // The live branch has drifted; a stale sibling holds the drifted tab.
+        register_and_file_worktree(&db, "/repo", "/repo/wt", "drifted", "Agents").unwrap();
+        let row = db.worktree_record("/repo/wt").unwrap().unwrap();
+        assert_eq!(row.branch, "orig");
+        assert_eq!(row.tab_name, "repo/orig");
+        assert!(row.folder_id.is_some());
+    }
+
+    #[test]
+    fn clearing_an_unregistered_path_creates_no_row() {
+        let db = db();
+        assert!(!clear_folder_if_registered(&db, "/repo/ghost").unwrap());
+        assert!(db.worktree_record("/repo/ghost").unwrap().is_none());
+
+        register_and_file_worktree(&db, "/repo", "/repo/wt", "feature", "Pipeline").unwrap();
+        assert!(clear_folder_if_registered(&db, "/repo/wt").unwrap());
+        assert_eq!(
+            db.worktree_record("/repo/wt").unwrap().unwrap().folder_id,
+            None
+        );
+    }
+
+    #[test]
+    fn precheck_refuses_a_tombstoned_workspace_and_bad_names_before_creation() {
+        let db = db();
+        assert_eq!(
+            check_folder_fileable(&db, "/repo", "  Agents ").unwrap(),
+            "Agents"
+        );
+        assert!(check_folder_fileable(&db, "/repo", "  ").is_err());
+
+        db.tombstone_workspace("/gone").unwrap();
+        assert!(db.workspace_tombstoned("/gone").unwrap());
+        let err = check_folder_fileable(&db, "/gone", "Agents").unwrap_err();
+        assert!(err.to_string().contains("was removed from thegn"));
+        // Refusing must not have written anything.
+        assert!(db.folders_for_workspace("/gone").unwrap().is_empty());
     }
 
     #[test]
