@@ -37,6 +37,9 @@ pub const SENSITIVE: &[&str] = &[
     "passwd",
     "credential",
     "private_key",
+    // OpenVPN `user\npass` credentials (`sandbox.vpn.openvpn`); the only
+    // `*pass*` credential field that neither "password" nor `_key` catches.
+    "auth_user_pass",
 ];
 
 /// Exact key names that the substring / `*_key` rules match but which hold
