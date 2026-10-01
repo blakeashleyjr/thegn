@@ -247,8 +247,13 @@ TRACE_UI_PIDFILE="$PERF_TMP/ui.strace.pid"
 # The adaptive settle can extend to SETTLE_CAP_MS (20s), so the run window has to
 # cover the cap rather than the requested settle — otherwise thegn exits mid-sample
 # on exactly the slow-hydration runs the adaptive settle exists for.
-RUN_MS=$((20000 + WINDOW_MS + 1500)) # generous tail past the sample window
-DEADLINE_S=$(((RUN_MS / 1000) + 10)) # hard safety net
+# Total settle is max(SETTLE_MS, 20000): the adaptive loop starts its count at
+# SETTLE_MS and only runs while under the 20 s cap, so an explicit --settle-ms
+# past the cap is used as-is. Ignoring SETTLE_MS here made any --settle-ms above
+# ~20 s exit thegn mid-measurement.
+SETTLE_MAX_MS=$((SETTLE_MS > 20000 ? SETTLE_MS : 20000))
+RUN_MS=$((SETTLE_MAX_MS + WINDOW_MS + 1500)) # generous tail past the sample window
+DEADLINE_S=$(((RUN_MS / 1000) + 10))         # hard safety net
 
 # Launch thegn under a PTY (termwiz refuses to start without one); the inner
 # shell backgrounds thegn and records its PID so the sampler can find it.
