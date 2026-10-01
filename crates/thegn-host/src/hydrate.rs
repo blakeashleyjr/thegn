@@ -399,15 +399,19 @@ impl ContainerDemand {
 
     /// The demand a set of visible surfaces implies. Detail: the monitor, or
     /// the Sandbox section (its expanded per-container rows/stats). Summary:
-    /// the panel is open. None: nothing consumes the listing.
+    /// the panel is open AND the active worktree is OCI-backed (the collapsed
+    /// summary chip only looks for the active worktree's own container; other
+    /// backends need no listing). The machine-global rows live in the Sandbox
+    /// section body, which is the Detail case. None: nothing consumes it.
     pub(crate) fn resolve(
         panel_open: bool,
         monitor_open: bool,
         sandbox_section_open: bool,
+        active_oci: bool,
     ) -> Self {
         if monitor_open || sandbox_section_open {
             Self::Detail
-        } else if panel_open {
+        } else if panel_open && active_oci {
             Self::Summary
         } else {
             Self::None

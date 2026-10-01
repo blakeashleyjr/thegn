@@ -12589,6 +12589,8 @@ async fn event_loop<T: Terminal>(
             chrome.panel.is_some(),
             monitor.is_some(),
             sandbox_section_now,
+            thegn_core::sandbox::Backend::parse(&model.active_sandbox_backend)
+                .is_some_and(|b| b.is_oci()),
         );
         container_demand.store(
             container_demand_now.signal(),
