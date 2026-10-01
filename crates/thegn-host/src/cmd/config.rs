@@ -116,16 +116,18 @@ pub fn run(
                 }
                 if let Some(e) = parse_err {
                     anyhow::bail!(
-                        "{}: {key} = {value:?} would make the config unparseable ({e}); not written",
-                        path.display()
+                        "{}: {key} = {:?} would make the config unparseable ({e}); not written",
+                        path.display(),
+                        shown_value(&key, &value)
                     );
                 }
                 for e in &new_enum_errs {
                     msg::error(&format!("{}: {e}", path.display()));
                 }
                 anyhow::bail!(
-                    "{}: {key} = {value:?} is invalid ({} problem(s)); not written",
+                    "{}: {key} = {:?} is invalid ({} problem(s)); not written",
                     path.display(),
+                    shown_value(&key, &value),
                     new_enum_errs.len(),
                 );
             }
@@ -147,7 +149,15 @@ pub fn run(
                         .then(|| v.trim().to_string())
                 })
                 .unwrap_or_else(|| format!("{value:?}"));
-            outln!("set {key} = {written_value} in {}", path.display());
+            // Never echo a secret back (the value was just typed, but it lands
+            // in scrollback / CI logs). NOTE: the echo above is found by a
+            // reverse line scan on the last key segment, so with two tables
+            // sharing a key name it can show the other table's value.
+            outln!(
+                "set {key} = {} in {}",
+                shown_value(&key, &written_value),
+                path.display()
+            );
             // The write is valid, but the file still carries pre-existing bad
             // values in other keys — surface them so they don't linger unnoticed
             // (they were already warn-defaulting on every load; not the fault of
@@ -394,14 +404,31 @@ fn redact_toml_value(value: &mut toml_edit::Value, masked: bool) {
 
 /// Mask `value` as the value of config key `key`: a sensitive final segment
 /// masks the strings under it; objects are recursed.
+///
+/// A sensitive PARENT segment counts too (`api_keys.0`, `issue_accounts.0.token`
+/// style paths): indexing into a secret container must not unmask it.
 fn redact_at(key: &str, value: serde_json::Value) -> serde_json::Value {
-    let last = key.rsplit('.').next().unwrap_or(key);
+    let last = sensitive_segment(key).unwrap_or_else(|| key.rsplit('.').next().unwrap_or(key));
     let mut wrapped = serde_json::json!({ last: value });
     thegn_core::redact::redact_json(&mut wrapped);
     wrapped
         .get_mut(last)
         .map(serde_json::Value::take)
         .unwrap_or(serde_json::Value::Null)
+}
+
+/// The first segment of a dotted key that names a secret, if any.
+fn sensitive_segment(key: &str) -> Option<&str> {
+    key.split('.').find(|s| thegn_core::redact::is_sensitive(s))
+}
+
+/// A value for echoing back to the user, masked when `key` is secret-bearing.
+fn shown_value(key: &str, value: &str) -> String {
+    if sensitive_segment(key).is_some() {
+        thegn_core::redact::PLACEHOLDER.to_string()
+    } else {
+        value.to_string()
+    }
 }
 
 fn redact_origin(origin: &mut thegn_core::config_resolve::KeyOrigin) {
@@ -456,8 +483,7 @@ fn get_text(cfg: &Config, key: &str) -> Option<String> {
             Some(render_config_value(v))
         }
         Some(v) => {
-            let last = canonical.rsplit('.').next().unwrap_or(&canonical);
-            if thegn_core::redact::is_sensitive(last) {
+            if sensitive_segment(&canonical).is_some() {
                 Some(render_config_value(v))
             } else {
                 cfg.get_dotted(&canonical)
@@ -465,8 +491,7 @@ fn get_text(cfg: &Config, key: &str) -> Option<String> {
             }
         }
         None => {
-            let last = canonical.rsplit('.').next().unwrap_or(&canonical);
-            if thegn_core::redact::is_sensitive(last) {
+            if sensitive_segment(&canonical).is_some() {
                 None
             } else {
                 cfg.get_dotted(&canonical)
@@ -852,6 +877,7 @@ mod tests {
         "CANARY-MP-KEY-2",
         "CANARY-MP-KEY",
         "CANARY-GH-TOKEN",
+        "CANARY-VPN-PASS",
     ];
 
     fn canary_config() -> Config {
@@ -883,6 +909,9 @@ token = "CANARY-GH-TOKEN"
 name = "p1"
 api_key = "CANARY-MP-KEY"
 api_keys = ["CANARY-MP-KEY-1", "CANARY-MP-KEY-2"]
+
+[sandbox.vpn.openvpn]
+auth_user_pass = "CANARY-VPN-PASS"
 
 [[model_proxy.routes]]
 name = "small"
@@ -921,12 +950,24 @@ binary_cache_key = "cache.example.test-1:PUBLICKEY"
             "model_proxy",
             "model_proxy.providers",
             "model_proxy.providers.0.api_keys",
+            "model_proxy.providers.0.api_keys.0",
+            "model_proxy.providers.0.api_keys.1",
+            "sandbox.vpn.openvpn.auth_user_pass",
         ] {
             let text = get_text(&cfg, key).unwrap_or_else(|| panic!("{key} should resolve"));
             assert_clean(&format!("get {key}"), &text);
             let json = redacted_value_at(&cfg, key).expect(key).to_string();
             assert_clean(&format!("get --json {key}"), &json);
         }
+        assert_eq!(
+            get_text(&cfg, "model_proxy.providers.0.api_keys.1").as_deref(),
+            Some(thegn_core::redact::PLACEHOLDER)
+        );
+        assert_eq!(
+            shown_value("issues.linear.api_key", "S"),
+            thegn_core::redact::PLACEHOLDER
+        );
+        assert_eq!(shown_value("picker", "fzf"), "fzf");
         // The secret leaf itself is the placeholder, not empty.
         assert_eq!(
             get_text(&cfg, "issues.linear.api_key").as_deref(),
@@ -1009,17 +1050,25 @@ binary_cache_key = "cache.example.test-1:PUBLICKEY"
         let path = dir.path().join("config.toml");
         std::fs::write(
             &path,
-            "[issues.linear]\napi_key = \"CANARY-LINEAR-KEY\"\n[issues.jira]\napi_token = \"CANARY-JIRA-TOKEN\"\n",
+            "[[model_proxy.providers]]\nname = \"p\"\napi_keys = [\"CANARY-MP-KEY-1\"]\n[issues.linear]\napi_key = \"CANARY-LINEAR-KEY\"\n[issues.jira]\napi_token = \"CANARY-JIRA-TOKEN\"\n",
         )
         .unwrap();
-        for key in ["issues.linear.api_key", "issues.linear", "issues"] {
+        for key in [
+            "issues.linear.api_key",
+            "issues.linear",
+            "issues",
+            "model_proxy.providers.0.api_keys.0",
+        ] {
             let mut origin =
                 thegn_core::config_resolve::explain(&ProcessEnv, &[], Some(path.clone()), key)
                     .expect("explain");
             // Precondition: the raw origin does carry the canary (so the test
             // would fail if redaction were removed).
             let raw = format!("{} {:?}", origin.value, origin.trace);
-            assert!(raw.contains("CANARY-LINEAR-KEY"), "{key}: precondition");
+            assert!(
+                raw.contains("CANARY-LINEAR-KEY") || raw.contains("CANARY-MP-KEY-1"),
+                "{key}: precondition"
+            );
             redact_origin(&mut origin);
             let shown = format!("{} {:?}", origin.value, origin.trace);
             assert_clean(&format!("explain {key}"), &shown);
