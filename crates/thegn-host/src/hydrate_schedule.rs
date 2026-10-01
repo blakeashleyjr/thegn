@@ -176,6 +176,7 @@ impl ScheduleOwner {
         stats_interval_ms: Arc<AtomicU64>,
         stats_live: Arc<std::sync::atomic::AtomicBool>,
         containers_live: Arc<std::sync::atomic::AtomicBool>,
+        container_demand: Arc<std::sync::atomic::AtomicU8>,
         disk_path: std::path::PathBuf,
         waker: termwiz::terminal::TerminalWaker,
     ) -> Self {
@@ -191,6 +192,7 @@ impl ScheduleOwner {
             stats_interval_ms,
             stats_live,
             containers_live,
+            container_demand,
             disk_path,
             waker,
         );

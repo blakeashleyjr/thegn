@@ -744,7 +744,9 @@ fn new_batched(
 /// then de-duplicate against the repo's existing branches — exactly the `D` key
 /// / `worktrees.create` derivation, so the doors cannot drift.
 fn resolve_issue_branch(cfg: &Config, root: &std::path::Path, issue_id: &str) -> Result<String> {
-    let router = thegn_svc::issue::IssueRouter::from_config(&cfg.issues);
+    // Repo-resolved so the repo overlay's restrictions/pins (account filter,
+    // team id) apply; the overlay can only narrow, never add accounts.
+    let router = thegn_svc::issue::IssueRouter::from_config(&cfg.repo_issues(Some(root)));
     if !router.is_configured() {
         anyhow::bail!("no issue tracker configured (set [issues] providers/accounts)");
     }

@@ -27,10 +27,10 @@ this is why:
 | `providers` | cloud execution (Fly / DO / VPS / Machine0 / Daytona) and the managed pool | `[host.*]`         |
 | `observe`   | the Observe dashboards and fleet-view tab                                  | `[observe]`        |
 | `placement` | the multi-host placement engine                                            | `[placement]`      |
-| `trackers`  | Linear / Jira / Kaneo issue trackers                                       | `[issues]`         |
+| `voice`     | command-backed voice mode                                                  | `[voice]`          |
 
-GitHub PR and issue **viewing** is stable and is not gated — only the
-multi-tier trackers are. See [[review-a-pr]].
+Issue trackers including Linear, Jira, Kaneo, and GitHub are available in both
+channels. GitHub PR viewing is also stable. See [[review-a-pr]].
 
 ## What stable guarantees
 
@@ -45,7 +45,8 @@ Enforcement happens at the edges, never by compiling code out:
 
 - Config toggles for a disallowed feature are **neutralised at load**, so
   a stray `[observe]` block in a stable run is inert rather than an error.
-- The matching UI and CLI surfaces are hidden.
+- Dev-only verbs and UI surfaces are hidden. Tracker commands remain available
+  in both channels when an issue provider is configured.
 
 That means switching channels needs no reinstall and no config
 migration — the same config file behaves correctly in both.

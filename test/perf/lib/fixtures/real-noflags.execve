@@ -1,0 +1,7 @@
+806782 1790878475.455975 execve("/nix/store/v8llyqw71lygr2llhmcc8ya5bdlzq45v-bash-5.3p9/bin/bash", ["bash", "-c", "echo $$ > \"$1\"; shift; exec \"$@\"", "_", "/tmp/f717/a-very-long-directory-"..., "bash", "-c", "sleep 0.1 & sleep 0.2; /no/such/"...], 0x7ffffffe2988 /* 304 vars */) = 0
+806782 1790878475.459958 execve("/nix/store/v8llyqw71lygr2llhmcc8ya5bdlzq45v-bash-5.3p9/bin/bash", ["bash", "-c", "sleep 0.1 & sleep 0.2; /no/such/"...], 0x5555556e48e0 /* 303 vars */) = 0
+806784 1790878475.463604 execve("/nix/store/cp7wjv1pl4wapfk48svvizxd089v9h0a-coreutils-9.11/bin/sleep", ["sleep", "0.2"], 0x5555556cfca0 /* 304 vars */) = 0
+806783 1790878475.464038 execve("/nix/store/cp7wjv1pl4wapfk48svvizxd089v9h0a-coreutils-9.11/bin/sleep", ["sleep", "0.1"], 0x5555556cfca0 /* 304 vars */) = 0
+806782 1790878475.668459 --- SIGCHLD {si_signo=SIGCHLD, si_code=CLD_EXITED, si_pid=806783, si_uid=1000, si_status=0, si_utime=0, si_stime=0} ---
+806821 1790878475.669652 execve("/no/such/binary", ["/no/such/binary"], 0x5555556cfca0 /* 304 vars */) = -1 ENOENT (No such file or directory)
+806782 1790878475.670205 --- SIGCHLD {si_signo=SIGCHLD, si_code=CLD_EXITED, si_pid=806821, si_uid=1000, si_status=127, si_utime=0, si_stime=0} ---

@@ -1,9 +1,9 @@
 //! Shared refresh worker and its owned I/O boundary. Scheduling is identical
 //! for the live host and the channel-clock integration fixture.
 use super::{
-    CONTAINER_DF_EVERY_TICKS, CONTAINER_REFRESH_INTERVAL, ContainerRefresh,
-    DAEMON_REFRESH_INTERVAL, ISSUE_REFRESH_INTERVAL, PR_REFRESH_INTERVAL, RefreshKind,
-    STARTUP_FETCH_SLOT, STARTUP_MEASURE_SLOT, StatsTick, USAGE_FIRST_SLOT, WEATHER_FIRST_SLOT,
+    CONTAINER_DF_EVERY_TICKS, ContainerDemand, ContainerRefresh, DAEMON_REFRESH_INTERVAL,
+    ISSUE_REFRESH_INTERVAL, PR_REFRESH_INTERVAL, RefreshKind, STARTUP_FETCH_SLOT,
+    STARTUP_MEASURE_SLOT, StatsTick, USAGE_FIRST_SLOT, WEATHER_FIRST_SLOT,
 };
 use crate::hydrate_schedule::ScheduleConfig;
 use std::sync::{
@@ -78,6 +78,7 @@ pub(crate) fn spawn_refresh_ticker(
     // Set while a per-container-stats surface is visible; gates the expensive
     // `stats --no-stream` + `system df` container enrichment.
     containers_live: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    container_demand: std::sync::Arc<std::sync::atomic::AtomicU8>,
     disk_path: std::path::PathBuf,
     waker: TerminalWaker,
 ) -> RefreshTicker {
@@ -96,10 +97,13 @@ pub(crate) fn spawn_refresh_ticker(
             stats_interval_ms,
             stats_live,
             containers_live,
+            container_demand,
             disk_path: Some(disk_path),
             sampler: None,
             last_stats: None,
             daemon_scope: None,
+            delivery: ContainerDelivery::default(),
+            last_footprint_tick: None,
         },
         move || {
             drop(waker.wake());
@@ -124,7 +128,8 @@ trait TickerIo: Send + 'static {
     fn send_daemon(&mut self) -> Result<bool, ()>;
     fn connection_recovery_due(&self) -> bool;
     fn send_stats_if_due(&mut self) -> Result<bool, ()>;
-    fn send_containers(&mut self, ticks: u64, every: u64) -> Result<(), ()>;
+    fn container_demand(&self) -> ContainerDemand;
+    fn send_containers(&mut self, ticks: u64, demand_rise: bool) -> Result<bool, ()>;
     fn tick_complete(&mut self, _tick: u64) {}
 }
 
@@ -281,11 +286,9 @@ fn spawn_worker_inner(
         // the one place that loops can't be made to spin from config.
         let mut usage_every = usage_every_slots;
         let mut weather_every = weather_every_slots;
-        let container_every = thegn_core::time_policy::cadence_millis_slots(
-            CONTAINER_REFRESH_INTERVAL.as_millis(),
-            500,
-        )
-        .get();
+        let container_every = |demand: ContainerDemand| {
+            thegn_core::time_policy::cadence_millis_slots(demand.interval().as_millis(), 500).get()
+        };
         let mut disk_every = disk_every_slots;
         let mut loc_every = loc_every_slots;
         let daemon_every =
@@ -303,6 +306,8 @@ fn spawn_worker_inner(
         let mut usage_after = 0;
         let mut weather_after = 0;
         let mut active_generation = generation;
+        let mut last_container_demand = ContainerDemand::None;
+        let mut container_last_sent = None;
         io.prime_stats();
         // Keep the initial clock observation between stats and daemon priming.
         let mut last_clock_unit = clock_unit(&clock_period_secs, io.now_secs());
@@ -587,19 +592,28 @@ fn spawn_worker_inner(
                 Ok(sent) => wake |= sent,
                 Err(()) => break,
             }
-            // Container list refresh: runs OCI `ps` subprocesses, so keep it on
-            // its own cadence (5s) rather than tying it to the fast stats tick.
-            // The cheap `ps` always runs; the expensive `stats --no-stream`
-            // enrichment (and the `system df` footprint) runs ONLY while a
-            // per-container-stats surface is visible (`containers_live`) — the
-            // gate that removes the standing stats cost. All under the
-            // `Subsys::Container` CPU attribution so the perf rollup shows a
-            // closed monitor pays nothing.
-            if ticks.is_multiple_of(container_every) {
-                if io.send_containers(ticks, container_every).is_err() {
-                    break;
+            // No consumer means no listing, backend discovery, or wake. Demand
+            // rises are served immediately; otherwise each visible tier keeps
+            // its own cadence.
+            let demand = io.container_demand();
+            if demand == ContainerDemand::None {
+                last_container_demand = ContainerDemand::None;
+                container_last_sent = None;
+            } else {
+                let demand_rise = demand > last_container_demand;
+                let every = container_every(demand);
+                if demand_rise
+                    || container_last_sent.is_none_or(|last| ticks.saturating_sub(last) >= every)
+                {
+                    match io.send_containers(ticks, demand_rise) {
+                        Ok(changed) => {
+                            wake |= changed;
+                            container_last_sent = Some(ticks);
+                        }
+                        Err(()) => break,
+                    }
                 }
-                wake = true;
+                last_container_demand = demand;
             }
             if wake {
                 notify();
@@ -618,10 +632,66 @@ struct LiveIo {
     stats_interval_ms: Arc<AtomicU64>,
     stats_live: Arc<AtomicBool>,
     containers_live: Arc<AtomicBool>,
+    container_demand: Arc<std::sync::atomic::AtomicU8>,
     disk_path: Option<std::path::PathBuf>,
     sampler: Option<thegn_metrics::StatsSampler>,
     last_stats: Option<Instant>,
     daemon_scope: Option<String>,
+    delivery: ContainerDelivery,
+    last_footprint_tick: Option<u64>,
+}
+
+/// Change gate for container deliveries: remembers the last snapshot and
+/// footprint so an identical refresh is dropped (no send, no loop wake).
+#[derive(Default)]
+struct ContainerDelivery {
+    last_containers: Option<Vec<thegn_core::sandbox::ContainerInfo>>,
+    last_footprint: Option<thegn_core::sandbox_manage::ContainerFootprint>,
+}
+
+impl ContainerDelivery {
+    /// `Some(refresh)` when it must be sent (initial/demand-rise, changed set,
+    /// or changed footprint); `None` when nothing the views show changed.
+    fn filter(
+        &mut self,
+        mut refresh: ContainerRefresh,
+        detailed: bool,
+        demand_rise: bool,
+    ) -> Option<ContainerRefresh> {
+        let set_changed = demand_rise
+            || !self
+                .last_containers
+                .as_ref()
+                .is_some_and(|last| container_snapshot_equal(last, &refresh.containers, detailed));
+        self.last_containers = Some(refresh.containers.clone());
+        let footprint_changed = refresh
+            .footprint
+            .as_ref()
+            .is_some_and(|footprint| self.last_footprint.as_ref() != Some(footprint));
+        if footprint_changed {
+            self.last_footprint = refresh.footprint;
+        } else {
+            refresh.footprint = None;
+        }
+        (set_changed || footprint_changed).then_some(refresh)
+    }
+}
+
+fn container_snapshot_equal(
+    left: &[thegn_core::sandbox::ContainerInfo],
+    right: &[thegn_core::sandbox::ContainerInfo],
+    detailed: bool,
+) -> bool {
+    left.len() == right.len()
+        && left.iter().zip(right).all(|(a, b)| {
+            a.name == b.name
+                && a.backend == b.backend
+                && a.image == b.image
+                && a.status == b.status
+                && a.ours == b.ours
+                && a.mounts == b.mounts
+                && (!detailed || (a.cpu == b.cpu && a.mem == b.mem && a.net == b.net))
+        })
 }
 
 impl LiveIo {
@@ -723,8 +793,25 @@ impl TickerIo for LiveIo {
         Ok(true)
     }
 
-    fn send_containers(&mut self, ticks: u64, every: u64) -> Result<(), ()> {
+    fn container_demand(&self) -> ContainerDemand {
+        ContainerDemand::from_signal(self.container_demand.load(Ordering::Relaxed))
+    }
+
+    fn send_containers(&mut self, ticks: u64, demand_rise: bool) -> Result<bool, ()> {
         let live = self.containers_live.load(Ordering::Relaxed);
+        let df_every = thegn_core::time_policy::cadence_millis_slots(
+            super::CONTAINER_DETAIL_REFRESH_INTERVAL.as_millis(),
+            500,
+        )
+        .get()
+            * CONTAINER_DF_EVERY_TICKS;
+        let footprint_due = live
+            && self
+                .last_footprint_tick
+                .is_none_or(|last| ticks.saturating_sub(last) >= df_every);
+        if footprint_due {
+            self.last_footprint_tick = Some(ticks);
+        }
         let refresh = {
             let _guard = crate::perf::measure(crate::perf::Subsys::Container);
             let containers = if live {
@@ -732,14 +819,17 @@ impl TickerIo for LiveIo {
             } else {
                 thegn_core::sandbox::running_containers()
             };
-            let footprint = (live && ticks.is_multiple_of(every * CONTAINER_DF_EVERY_TICKS))
-                .then(thegn_core::sandbox::container_footprint);
+            let footprint = footprint_due.then(thegn_core::sandbox::container_footprint);
             ContainerRefresh {
                 containers,
                 footprint,
             }
         };
-        self.container_tx.send(refresh).map_err(|_| ())
+        let Some(refresh) = self.delivery.filter(refresh, live, demand_rise) else {
+            return Ok(false);
+        };
+        self.container_tx.send(refresh).map_err(|_| ())?;
+        Ok(true)
     }
 }
 

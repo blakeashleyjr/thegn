@@ -1071,8 +1071,7 @@ impl Config {
     /// channel is resolved. In the stable channel this forces every dev-only
     /// feature's master toggle off — mirroring the repo-overlay clamp above —
     /// so an experimental key left in a user's config is inert rather than
-    /// silently half-active. Trackers keep stable GitHub Issues and drop
-    /// only Linear/Jira/Kaneo. Returns the features actually changed, so the
+    /// silently half-active. Returns the features actually changed, so the
     /// caller can surface a one-line status note.
     pub fn clamp_to_channel(
         &mut self,
@@ -1103,22 +1102,6 @@ impl Config {
                 Feature::Placement => {
                     let was = self.placement.enabled;
                     self.placement.enabled = false;
-                    was
-                }
-                Feature::Trackers => {
-                    // Keep stable GitHub Issues; drop the experimental trackers.
-                    use crate::config_issues::IssueProviderKind as K;
-                    let is_exp = |k: K| !matches!(k, K::None | K::Github);
-                    let mut was = is_exp(self.issues.provider);
-                    if is_exp(self.issues.provider) {
-                        self.issues.provider = K::None;
-                    }
-                    let before = self.issues.providers.len();
-                    self.issues.providers.retain(|k| !is_exp(*k));
-                    was |= self.issues.providers.len() != before;
-                    let before = self.issues.issue_accounts.len();
-                    self.issues.issue_accounts.retain(|a| !is_exp(a.provider));
-                    was |= self.issues.issue_accounts.len() != before;
                     was
                 }
                 Feature::Voice => {

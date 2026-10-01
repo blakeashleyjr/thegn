@@ -11,6 +11,7 @@ struct Observations {
     priming: Vec<&'static str>,
     daemon: Vec<u64>,
     containers: Vec<u64>,
+    container_wakes: Vec<bool>,
 }
 
 struct FixtureIo {
@@ -18,6 +19,8 @@ struct FixtureIo {
     ack: mpsc::SyncSender<u64>,
     finished: mpsc::SyncSender<()>,
     observed: Arc<Mutex<Observations>>,
+    demand: Arc<std::sync::atomic::AtomicU8>,
+    container_changed: Arc<std::sync::atomic::AtomicBool>,
     tick: u64,
 }
 impl Drop for FixtureIo {
@@ -66,9 +69,17 @@ impl TickerIo for FixtureIo {
     fn send_stats_if_due(&mut self) -> Result<bool, ()> {
         Ok(false)
     }
-    fn send_containers(&mut self, ticks: u64, _every: u64) -> Result<(), ()> {
-        self.observed.lock().unwrap().containers.push(ticks);
-        Ok(())
+    fn container_demand(&self) -> ContainerDemand {
+        ContainerDemand::from_signal(self.demand.load(Ordering::Relaxed))
+    }
+    fn send_containers(&mut self, ticks: u64, demand_rise: bool) -> Result<bool, ()> {
+        // Evaluate the swap first: a demand rise consumes the pending change.
+        let pending = self.container_changed.swap(false, Ordering::Relaxed);
+        let changed = demand_rise || pending;
+        let mut observed = self.observed.lock().unwrap();
+        observed.containers.push(ticks);
+        observed.container_wakes.push(changed);
+        Ok(changed)
     }
     fn tick_complete(&mut self, tick: u64) {
         assert_eq!(tick, self.tick);
@@ -86,6 +97,8 @@ struct Fixture {
     refresh: tokio_mpsc::UnboundedReceiver<RefreshKind>,
     observed: Arc<Mutex<Observations>>,
     wakes: Arc<std::sync::atomic::AtomicUsize>,
+    demand: Arc<std::sync::atomic::AtomicU8>,
+    container_changed: Arc<std::sync::atomic::AtomicBool>,
     events: Vec<(u64, &'static str)>,
     tick: u64,
 }
@@ -97,6 +110,8 @@ impl Fixture {
         let (tx, refresh) = tokio_mpsc::unbounded_channel();
         let observed = Arc::new(Mutex::new(Observations::default()));
         let wakes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let demand = Arc::new(std::sync::atomic::AtomicU8::new(0));
+        let container_changed = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let notify = wakes.clone();
         // Exactly the config-to-effective-cadence projection used by the live
         // ScheduleOwner. The worker consumes slots, not raw TTLs.
@@ -109,6 +124,8 @@ impl Fixture {
                 ack,
                 finished,
                 observed: observed.clone(),
+                demand: demand.clone(),
+                container_changed: container_changed.clone(),
                 tick: 0,
             },
             move || {
@@ -123,6 +140,8 @@ impl Fixture {
             refresh,
             observed,
             wakes,
+            demand,
+            container_changed,
             events: Vec::new(),
             tick: 0,
         }
@@ -177,6 +196,10 @@ impl Fixture {
             .collect()
     }
 
+    fn set_demand(&self, demand: ContainerDemand) {
+        self.demand.store(demand.signal(), Ordering::Relaxed);
+    }
+
     fn finish(&mut self) {
         // Disconnecting the fixture clock releases a parked worker, including
         // on assertion unwinding. No producer can leave another slot pending.
@@ -226,6 +249,200 @@ fn configured() -> Config {
     cfg.git.auto_fetch = false;
     cfg.loc.enabled = false;
     cfg
+}
+
+#[test]
+fn summary_container_equality_ignores_metrics_but_detail_equality_includes_them() {
+    let row = thegn_core::sandbox::ContainerInfo {
+        name: "thegn-wt".into(),
+        image: "image:v1".into(),
+        status: "Up 5 seconds (healthy)".into(),
+        ours: true,
+        backend: "docker".into(),
+        cpu: "1%".into(),
+        mem: "2MiB".into(),
+        net: "3KB".into(),
+        containment: "worktree+caches".into(),
+        mounts: String::new(),
+    };
+    let mut metrics_changed = row.clone();
+    metrics_changed.cpu = "8%".into();
+    assert!(container_snapshot_equal(
+        std::slice::from_ref(&row),
+        std::slice::from_ref(&metrics_changed),
+        false
+    ));
+    assert!(!container_snapshot_equal(
+        std::slice::from_ref(&row),
+        &[metrics_changed],
+        true
+    ));
+    let mut image_changed = row.clone();
+    image_changed.image = "image:v2".into();
+    assert!(!container_snapshot_equal(&[row], &[image_changed], false));
+}
+
+fn sample_container(name: &str) -> thegn_core::sandbox::ContainerInfo {
+    thegn_core::sandbox::ContainerInfo {
+        name: name.into(),
+        image: "image:v1".into(),
+        status: "Up 5 seconds".into(),
+        ours: true,
+        backend: "docker".into(),
+        cpu: "1%".into(),
+        mem: "2MiB".into(),
+        net: "3KB".into(),
+        containment: "worktree+caches".into(),
+        mounts: String::new(),
+    }
+}
+
+#[test]
+fn container_delivery_gates_on_set_and_footprint_change() {
+    let mut delivery = ContainerDelivery::default();
+    let refresh = |rows: Vec<_>| ContainerRefresh {
+        containers: rows,
+        footprint: None,
+    };
+    // Initial snapshot is always delivered (even if empty).
+    assert!(delivery.filter(refresh(vec![]), false, true).is_some());
+    // Identical set without a demand rise: dropped (no send, no wake).
+    assert!(delivery.filter(refresh(vec![]), false, false).is_none());
+    // Demand rise re-delivers an identical set.
+    assert!(delivery.filter(refresh(vec![]), false, true).is_some());
+    // A changed set is delivered; repeating it is not.
+    let one = vec![sample_container("a")];
+    assert!(
+        delivery
+            .filter(refresh(one.clone()), false, false)
+            .is_some()
+    );
+    assert!(
+        delivery
+            .filter(refresh(one.clone()), false, false)
+            .is_none()
+    );
+    // Metrics only matter while detailed.
+    let mut hot = one.clone();
+    hot[0].cpu = "90%".into();
+    assert!(
+        delivery
+            .filter(refresh(hot.clone()), false, false)
+            .is_none()
+    );
+    // (the snapshot is remembered even when dropped, so change it again)
+    let mut hotter = hot;
+    hotter[0].cpu = "95%".into();
+    assert!(delivery.filter(refresh(hotter), true, false).is_some());
+    // A footprint-only change is delivered; an identical one is stripped/dropped.
+    let fp = thegn_core::sandbox_manage::ContainerFootprint::default();
+    let with_fp = |fp: &thegn_core::sandbox_manage::ContainerFootprint| ContainerRefresh {
+        containers: vec![sample_container("a")],
+        footprint: Some(*fp),
+    };
+    let sent = delivery.filter(with_fp(&fp), true, false);
+    assert!(sent.is_some_and(|r| r.footprint.is_some()));
+    assert!(delivery.filter(with_fp(&fp), true, false).is_none());
+}
+
+#[test]
+fn container_demand_resolves_from_visible_surfaces() {
+    use ContainerDemand::{Detail, None as Nothing, Summary};
+    // (panel, monitor, sandbox section, active worktree OCI-backed) -> demand
+    assert_eq!(ContainerDemand::resolve(false, false, false, true), Nothing);
+    assert_eq!(ContainerDemand::resolve(true, false, false, true), Summary);
+    // Panel open but the active worktree is not container-backed: no listing.
+    assert_eq!(ContainerDemand::resolve(true, false, false, false), Nothing);
+    assert_eq!(ContainerDemand::resolve(true, true, false, false), Detail);
+    assert_eq!(ContainerDemand::resolve(false, true, false, false), Detail);
+    // The Sandbox section body (machine-global rows) needs 5 s, any backend.
+    assert_eq!(ContainerDemand::resolve(true, false, true, false), Detail);
+    assert_eq!(ContainerDemand::resolve(true, false, true, true), Detail);
+}
+
+#[test]
+fn switching_to_an_oci_worktree_with_the_panel_open_lists_promptly() {
+    let mut fixture = Fixture::start(&configured());
+    // Non-OCI active worktree, panel open: nothing listed.
+    fixture.set_demand(ContainerDemand::resolve(true, false, false, false));
+    fixture.advance_to(35);
+    assert!(fixture.observed.lock().unwrap().containers.is_empty());
+    // Switch to an OCI-backed worktree: prompt listing on the next slot.
+    fixture.set_demand(ContainerDemand::resolve(true, false, false, true));
+    fixture.advance_to(36);
+    assert_eq!(fixture.observed.lock().unwrap().containers, vec![36]);
+}
+
+#[test]
+fn sandbox_section_demand_lists_at_the_detail_cadence() {
+    let mut fixture = Fixture::start(&configured());
+    fixture.set_demand(ContainerDemand::resolve(true, false, true, false));
+    fixture.advance_to(11);
+    assert_eq!(fixture.observed.lock().unwrap().containers, vec![1, 11]);
+}
+
+#[test]
+fn no_container_demand_never_lists_or_wakes_for_container_slots() {
+    let mut fixture = Fixture::start(&configured());
+    fixture.advance_to(40);
+    let observed = fixture.observed.lock().unwrap();
+    assert!(
+        observed.containers.is_empty(),
+        "unexpected listings: {:?}",
+        observed.containers
+    );
+    assert!(observed.container_wakes.is_empty());
+    // Every wake must be attributable to some other slot (a scheduled refresh
+    // event or the daemon send); none is left over for the container slot.
+    let mut other: std::collections::BTreeSet<u64> =
+        fixture.events.iter().map(|(tick, _)| *tick).collect();
+    other.extend(observed.daemon.iter().copied());
+    assert_eq!(
+        fixture.wakes.load(Ordering::Relaxed),
+        other.len(),
+        "a wake with no non-container cause means the container slot woke the loop"
+    );
+}
+
+#[test]
+fn summary_demand_uses_sixty_second_cadence() {
+    let mut fixture = Fixture::start(&configured());
+    fixture.set_demand(ContainerDemand::Summary);
+    fixture.advance_to(120);
+    assert_eq!(fixture.observed.lock().unwrap().containers, vec![1]);
+    fixture.advance_to(121);
+    assert_eq!(fixture.observed.lock().unwrap().containers, vec![1, 121]);
+}
+
+#[test]
+fn detail_demand_uses_five_second_cadence() {
+    let mut fixture = Fixture::start(&configured());
+    fixture.set_demand(ContainerDemand::Detail);
+    fixture.advance_to(11);
+    assert_eq!(fixture.observed.lock().unwrap().containers, vec![1, 11]);
+}
+
+#[test]
+fn rising_container_demand_lists_immediately() {
+    let mut fixture = Fixture::start(&configured());
+    fixture.set_demand(ContainerDemand::Summary);
+    fixture.advance_to(1);
+    fixture.advance_to(35);
+    fixture.set_demand(ContainerDemand::Detail);
+    fixture.advance_to(36);
+    assert_eq!(fixture.observed.lock().unwrap().containers, vec![1, 36]);
+}
+
+#[test]
+fn identical_container_snapshot_does_not_wake_but_a_change_does() {
+    let mut fixture = Fixture::start(&configured());
+    fixture.set_demand(ContainerDemand::Detail);
+    fixture.advance_to(1);
+    fixture.advance_to(11);
+    fixture.container_changed.store(true, Ordering::Relaxed);
+    fixture.advance_to(21);
+    let observed = fixture.observed.lock().unwrap();
+    assert_eq!(observed.container_wakes, vec![true, false, true]);
 }
 
 #[test]
@@ -399,6 +616,8 @@ fn live_owner_reloads_every_ticker_class_through_the_event_envelope() {
             ack,
             finished,
             observed,
+            demand: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            container_changed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tick: 0,
         },
         || {},

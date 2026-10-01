@@ -82,6 +82,11 @@ impl WorktreeSlice {
         model.active_worktree_disk = self.disk;
         model.container_events = self.container_events.clone();
         model.timeline = self.timeline.clone();
+        // Health is derived from the cached listing + the active container
+        // name; the name just changed, so recompute rather than show the
+        // previous worktree's container state until the next listing.
+        model.container_health =
+            crate::run::container_health_for(&model.active_container_name, &model.containers);
     }
 
     /// Cache miss: blank the per-worktree fields rather than leaving the
@@ -258,6 +263,45 @@ mod tests {
             active_worktree_disk: disk,
             ..Default::default()
         }
+    }
+
+    fn container(name: &str, status: &str) -> thegn_core::sandbox::ContainerInfo {
+        thegn_core::sandbox::ContainerInfo {
+            name: name.into(),
+            image: "img".into(),
+            status: status.into(),
+            ours: true,
+            backend: "docker".into(),
+            cpu: String::new(),
+            mem: String::new(),
+            net: String::new(),
+            containment: String::new(),
+            mounts: String::new(),
+        }
+    }
+
+    #[test]
+    fn apply_and_clear_recompute_container_health_for_the_new_worktree() {
+        use crate::chrome::ContainerHealth;
+        let mut src = model_with("podman", None, None);
+        src.active_container_name = "thegn-b".into();
+        let slice = WorktreeSlice::seed_from(&src);
+
+        let mut model = model_with("podman", None, None);
+        model.containers = vec![
+            container("thegn-a", "Up 1 hour"),
+            container("thegn-b", "Exited (1)"),
+        ];
+        model.active_container_name = "thegn-a".into();
+        model.container_health = ContainerHealth::Healthy;
+        slice.apply(&mut model);
+        assert_eq!(
+            model.container_health,
+            ContainerHealth::Degraded("Exited (1)".into()),
+            "health must follow the newly active container, not the previous one"
+        );
+        WorktreeSlice::clear(&mut model);
+        assert_eq!(model.container_health, ContainerHealth::Unknown);
     }
 
     #[test]

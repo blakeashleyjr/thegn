@@ -519,6 +519,55 @@ pub(crate) fn available(placement: &Placement, backend: Backend) -> RuntimeProbe
     v
 }
 
+/// How long a local `Absent` is trusted by the ambient container listing before
+/// it is re-probed. `cache_is_fresh` caches a local `Absent` forever (right for
+/// backend selection), but a user who starts podman/docker after launch must
+/// see their containers appear; the listing only runs while a surface that
+/// shows it is visible, so this re-probe costs nothing when nothing is shown.
+pub(crate) const LISTING_ABSENT_REPROBE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Pure policy: may the listing reuse a cached answer of this `age`?
+fn listing_cache_usable(v: RuntimeProbe, age: std::time::Duration) -> bool {
+    match v {
+        RuntimeProbe::Present => true,
+        RuntimeProbe::Absent => age < LISTING_ABSENT_REPROBE,
+        RuntimeProbe::Unreachable => false,
+    }
+}
+
+/// Availability of a local `backend` for the ambient container listing. Probes
+/// once on a cold miss (and again once an `Absent` is older than
+/// [`LISTING_ABSENT_REPROBE`]), then answers from the shared memo. Callers must
+/// only reach this while the listing is demanded, so an idle TUI never probes.
+pub(crate) fn available_for_listing(backend: Backend) -> RuntimeProbe {
+    let cache =
+        avail_cache().get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    listing_availability(cache, backend, || {
+        available_probe(&Placement::Local, backend)
+    })
+}
+
+fn listing_availability(
+    cache: &AvailCache,
+    backend: Backend,
+    probe: impl FnOnce() -> RuntimeProbe,
+) -> RuntimeProbe {
+    let key = (format!("{:?}", Placement::Local), backend);
+    if let Some(&(v, at)) = cache.lock().unwrap().get(&key)
+        && listing_cache_usable(v, at.elapsed())
+    {
+        return v;
+    }
+    let v = probe();
+    if avail_cacheable(v) {
+        cache
+            .lock()
+            .unwrap()
+            .insert(key, (v, std::time::Instant::now()));
+    }
+    v
+}
+
 /// Retry an `Unreachable` probe per the policy before accepting it; a definite
 /// `Present`/`Absent` returns immediately. Pure loop over injected closures —
 /// the sleep is the only side effect (unit-tested with a recording sleeper).
@@ -622,6 +671,71 @@ pub(crate) fn backend_installed_locally(backend: Backend) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn empty_cache() -> AvailCache {
+        std::sync::Mutex::new(std::collections::HashMap::new())
+    }
+
+    #[test]
+    fn listing_cold_cache_probes_once_then_reuses_present() {
+        let cache = empty_cache();
+        let mut probes = 0;
+        for _ in 0..3 {
+            let v = listing_availability(&cache, Backend::Docker, || {
+                probes += 1;
+                RuntimeProbe::Present
+            });
+            assert_eq!(v, RuntimeProbe::Present);
+        }
+        assert_eq!(probes, 1, "a cold miss probes exactly once");
+    }
+
+    #[test]
+    fn listing_absent_is_reused_until_the_reprobe_ttl_then_reprobed() {
+        let cache = empty_cache();
+        let probes = std::cell::Cell::new(0);
+        let ask = |cache: &AvailCache| {
+            listing_availability(cache, Backend::Podman, || {
+                probes.set(probes.get() + 1);
+                RuntimeProbe::Absent
+            })
+        };
+        assert_eq!(ask(&cache), RuntimeProbe::Absent);
+        assert_eq!(ask(&cache), RuntimeProbe::Absent);
+        assert_eq!(probes.get(), 1, "fresh Absent is not re-probed");
+        // Age the entry past the TTL.
+        let key = (format!("{:?}", Placement::Local), Backend::Podman);
+        let old = std::time::Instant::now()
+            .checked_sub(LISTING_ABSENT_REPROBE + std::time::Duration::from_secs(1))
+            .unwrap();
+        cache
+            .lock()
+            .unwrap()
+            .insert(key, (RuntimeProbe::Absent, old));
+        assert_eq!(ask(&cache), RuntimeProbe::Absent);
+        assert_eq!(probes.get(), 2, "stale Absent is re-probed");
+    }
+
+    #[test]
+    fn listing_cache_policy_present_forever_absent_for_ttl() {
+        use std::time::Duration;
+        assert!(listing_cache_usable(
+            RuntimeProbe::Present,
+            Duration::from_secs(10_000)
+        ));
+        assert!(listing_cache_usable(
+            RuntimeProbe::Absent,
+            LISTING_ABSENT_REPROBE - Duration::from_secs(1)
+        ));
+        assert!(!listing_cache_usable(
+            RuntimeProbe::Absent,
+            LISTING_ABSENT_REPROBE
+        ));
+        assert!(!listing_cache_usable(
+            RuntimeProbe::Unreachable,
+            Duration::ZERO
+        ));
+    }
 
     #[test]
     fn pass_memo_dedupes_within_scope_and_clears_after() {

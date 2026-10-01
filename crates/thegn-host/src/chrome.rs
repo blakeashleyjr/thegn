@@ -723,6 +723,10 @@ pub struct FrameModel {
     pub active_placement_label: Option<String>,
     /// Running containers (thegn-owned first) for the SANDBOXES section.
     pub containers: Vec<thegn_core::sandbox::ContainerInfo>,
+    /// False until the container worker has delivered a first listing. The
+    /// listing is demand-gated, so "empty" and "never listed" differ: the
+    /// monitor keeps a requested Containers tab while this is false.
+    pub containers_listed: bool,
     /// Aggregate thegn container footprint (owned counts + engine disk usage)
     /// for the monitor's Containers-tab header. Populated only while a
     /// per-container-stats surface is visible (the visibility gate); `None`
