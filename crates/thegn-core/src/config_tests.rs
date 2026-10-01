@@ -3107,7 +3107,6 @@ fn validate_str_catches_wholesale_type_error() {
 #[test]
 fn clamp_to_channel_neutralises_experimental_in_stable() {
     use crate::channel::{Channel, Feature};
-    use crate::config_issues::IssueProviderKind as K;
 
     let mut cfg = Config::default();
     // Turn on every experimental toggle the way a user's config might.
@@ -3115,8 +3114,6 @@ fn clamp_to_channel_neutralises_experimental_in_stable() {
     cfg.placement.enabled = true;
     cfg.sandbox.remote.host = "box.example".into();
     cfg.host.insert("gpu".into(), Default::default());
-    cfg.issues.provider = K::Linear;
-    cfg.issues.providers = vec![K::Linear, K::Github, K::Kaneo];
     cfg.voice.enabled = true;
 
     let clamped = cfg.clamp_to_channel(Channel::Stable);
@@ -3126,12 +3123,78 @@ fn clamp_to_channel_neutralises_experimental_in_stable() {
     assert!(!cfg.placement.enabled);
     assert!(cfg.sandbox.remote.host.is_empty());
     assert!(cfg.host.is_empty());
-    // Trackers: GitHub survives, Linear/Kaneo are dropped.
-    assert_eq!(cfg.issues.provider, K::None);
-    assert_eq!(cfg.issues.providers, vec![K::Github]);
     assert!(!cfg.voice.enabled);
     // Every gated feature reports as clamped.
     assert_eq!(clamped.len(), Feature::ALL.len());
+}
+
+#[test]
+fn stable_layered_config_keeps_linear_trackers_across_base_profile_and_repo_overlay() {
+    use crate::channel::Channel;
+
+    let dir = tempfile::tempdir().unwrap();
+    let config_home = dir.path().join("config-home");
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(config_home.join("thegn/profiles/work")).unwrap();
+    std::fs::create_dir_all(&repo).unwrap();
+
+    // Base sets the legacy provider; the PROFILE (trusted, user-owned) adds the
+    // provider list and the account with its token; the repo `.thegn.toml`
+    // can only RESTRICT (by account name) and pin the team.
+    let base = dir.path().join("base.toml");
+    std::fs::write(&base, "[issues]\nprovider = \"linear\"\n").unwrap();
+    std::fs::write(
+        config_home.join("thegn/profiles/work/config.toml"),
+        "[issues]\nproviders = [\"linear\"]\n\n[[issues.issue_accounts]]\nname = \"linear-work\"\nprovider = \"linear\"\ntoken = \"THE695_SYNTHETIC_CANARY\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join(".thegn.toml"),
+        "[issues]\naccounts = [\"linear-work\"]\n\n[issues.linear]\nteam_id = \"TEAM-PIN\"\n",
+    )
+    .unwrap();
+
+    let _env = crate::testenv::EnvGuard::set(&[("XDG_CONFIG_HOME", config_home.to_str().unwrap())]);
+    let env = MapEnv(BTreeMap::from([(
+        "THEGN_PROFILE".to_string(),
+        "work".to_string(),
+    )]));
+    let mut cfg = Config::load_layered(&env, &[], Some(base));
+    assert!(cfg.clamp_to_channel(Channel::Stable).is_empty());
+
+    let issues = cfg.repo_issues(Some(&repo));
+    assert_eq!(issues.provider, IssueProviderKind::Linear);
+    assert_eq!(issues.providers, vec![IssueProviderKind::Linear]);
+    assert_eq!(issues.issue_accounts.len(), 1);
+    assert_eq!(issues.issue_accounts[0].name, "linear-work");
+    assert_eq!(issues.issue_accounts[0].provider, IssueProviderKind::Linear);
+    assert_eq!(issues.issue_accounts[0].token, "THE695_SYNTHETIC_CANARY");
+    assert_eq!(issues.linear.team_id, "TEAM-PIN");
+}
+
+#[test]
+fn repo_overlay_cannot_inject_tracker_accounts() {
+    // Security: a cloned repo's `.thegn.toml` must never be able to add a
+    // tracker account (or a token) — `[issues]` there is a restriction-only
+    // overlay.
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(
+        repo.join(".thegn.toml"),
+        "[[issues.issue_accounts]]\nname = \"evil\"\nprovider = \"linear\"\ntoken = \"THE695_REPO_CANARY\"\n\n[issues.linear]\napi_key = \"THE695_REPO_CANARY\"\n",
+    )
+    .unwrap();
+
+    let cfg = Config::default();
+    let issues = cfg.repo_issues(Some(&repo));
+    assert!(
+        issues.issue_accounts.is_empty(),
+        "{:?}",
+        issues.issue_accounts
+    );
+    let dump = serde_json::to_string(&issues).unwrap();
+    assert!(!dump.contains("THE695_REPO_CANARY"), "{dump}");
 }
 
 #[test]

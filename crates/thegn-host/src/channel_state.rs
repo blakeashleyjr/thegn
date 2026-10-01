@@ -20,6 +20,54 @@ use thegn_core::config::EnvSource;
 
 // 0 = Stable (also the safe pre-install default), 1 = Dev.
 static CHANNEL: AtomicU8 = AtomicU8::new(0);
+// One bit per feature in `Feature::ALL`. Clamp results are cumulative for the
+// lifetime of this process because later config refreshes must not erase the
+// explanation for the config generation already in use.
+static CLAMPED: AtomicU8 = AtomicU8::new(0);
+
+const fn feature_bit(feature: Feature) -> u8 {
+    match feature {
+        Feature::Remote => 1 << 0,
+        Feature::Providers => 1 << 1,
+        Feature::Observe => 1 << 2,
+        Feature::Placement => 1 << 3,
+        Feature::Voice => 1 << 4,
+    }
+}
+
+fn record_into(cell: &AtomicU8, features: &[Feature]) {
+    let bits = features
+        .iter()
+        .fold(0, |bits, feature| bits | feature_bit(*feature));
+    cell.fetch_or(bits, Ordering::Relaxed);
+}
+
+/// Record the features neutralised by a config clamp. The process-wide set is
+/// cumulative so a daemon refresh cannot hide a clamp observed at startup.
+pub fn record_clamped(features: &[Feature]) {
+    record_into(&CLAMPED, features);
+}
+
+/// Whether this process has clamped `feature` in any loaded config generation.
+pub fn clamped(feature: Feature) -> bool {
+    CLAMPED.load(Ordering::Relaxed) & feature_bit(feature) != 0
+}
+
+/// The process-wide set of features that any loaded config generation had to
+/// neutralise. Used by generic config inspection diagnostics.
+pub fn clamped_features() -> Vec<Feature> {
+    Feature::ALL
+        .into_iter()
+        .filter(|feature| clamped(*feature))
+        .collect()
+}
+
+/// Clamp a config and retain the result for later refusal/config diagnostics.
+pub fn clamp_and_record(cfg: &mut thegn_core::config::Config, channel: Channel) -> Vec<Feature> {
+    let features = cfg.clamp_to_channel(channel);
+    record_clamped(&features);
+    features
+}
 
 const fn to_u8(c: Channel) -> u8 {
     match c {
@@ -72,7 +120,7 @@ pub fn install(channel: Channel) {
 /// startup waterfall. Keeps the compositor's startup path (run.rs) to one call.
 pub fn apply_startup_channel(cfg: &mut thegn_core::config::Config) -> Option<String> {
     let channel = resolve_and_install();
-    let clamped = cfg.clamp_to_channel(channel);
+    let clamped = clamp_and_record(cfg, channel);
     if clamped.is_empty() {
         return None;
     }
@@ -81,14 +129,14 @@ pub fn apply_startup_channel(cfg: &mut thegn_core::config::Config) -> Option<Str
         .map(|f| f.id())
         .collect::<Vec<_>>()
         .join(", ");
-    tracing::info!(
+    tracing::warn!(
         target: "thegn::startup",
         channel = channel.as_str(),
         clamped = %feats,
-        "stable channel: experimental features disabled ({feats}) — run the dev build to enable"
+        "release channel disabled configured experimental features ({feats}); set THEGN_CHANNEL=dev to enable"
     );
     Some(format!(
-        "stable channel: disabled {feats} (use the dev build to enable)"
+        "stable channel: disabled {feats} (set THEGN_CHANNEL=dev to enable)"
     ))
 }
 

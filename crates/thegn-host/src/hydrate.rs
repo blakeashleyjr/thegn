@@ -365,14 +365,74 @@ pub(crate) enum RefreshKind {
     },
 }
 
-const CONTAINER_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+/// No periodic container work while no surface consumes the listing.
+const CONTAINER_NONE_REFRESH_INTERVAL: Duration = Duration::ZERO;
+/// The panel's summary row is informational, so one minute is sufficient.
+const CONTAINER_SUMMARY_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+/// Detail surfaces show per-container rows and retain the existing 5s cadence.
+const CONTAINER_DETAIL_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum ContainerDemand {
+    #[default]
+    None,
+    Summary,
+    Detail,
+}
+
+impl ContainerDemand {
+    pub(crate) fn from_signal(signal: u8) -> Self {
+        match signal {
+            1 => Self::Summary,
+            2.. => Self::Detail,
+            _ => Self::None,
+        }
+    }
+
+    pub(crate) fn signal(self) -> u8 {
+        match self {
+            Self::None => 0,
+            Self::Summary => 1,
+            Self::Detail => 2,
+        }
+    }
+
+    /// The demand a set of visible surfaces implies. Detail: the monitor, or
+    /// the Sandbox section (its expanded per-container rows/stats). Summary:
+    /// the panel is open AND the active worktree is OCI-backed (the collapsed
+    /// summary chip only looks for the active worktree's own container; other
+    /// backends need no listing). The machine-global rows live in the Sandbox
+    /// section body, which is the Detail case. None: nothing consumes it.
+    pub(crate) fn resolve(
+        panel_open: bool,
+        monitor_open: bool,
+        sandbox_section_open: bool,
+        active_oci: bool,
+    ) -> Self {
+        if monitor_open || sandbox_section_open {
+            Self::Detail
+        } else if panel_open && active_oci {
+            Self::Summary
+        } else {
+            Self::None
+        }
+    }
+
+    pub(crate) fn interval(self) -> Duration {
+        match self {
+            Self::None => CONTAINER_NONE_REFRESH_INTERVAL,
+            Self::Summary => CONTAINER_SUMMARY_REFRESH_INTERVAL,
+            Self::Detail => CONTAINER_DETAIL_REFRESH_INTERVAL,
+        }
+    }
+}
 
 /// How many container ticks between aggregate-footprint (`df`) refreshes while
 /// the Containers tab stays open — the most expensive op (`docker system df`
 /// walks the layer stores), so it runs at a slow ~60s cadence, not every 5s.
 const CONTAINER_DF_EVERY_TICKS: u64 = 12;
 
-/// The container tick's payload: the always-cheap `ps` listing, and — only on a
+/// The container tick's payload: a demand-gated `ps` listing, and — only on a
 /// gated slow-cadence tick — the aggregate footprint. `footprint: None` means
 /// "no update this tick" (the model keeps its last value), so a closed
 /// stats-surface never blanks the header and never pays the `df` cost.

@@ -75,7 +75,7 @@ pub fn fresh(boot: &Config) -> Result<Option<Config>, String> {
         let mut cfg = admitted.config().clone();
         // best-effort: the clamped-feature report is for `main`'s startup
         // status note; a daemon re-load deliberately discards it.
-        let _ = cfg.clamp_to_channel(crate::channel_state::current());
+        let _ = crate::channel_state::clamp_and_record(&mut cfg, crate::channel_state::current());
         return Ok(Some(thegn_core::pipeline_run::with_fresh_registry(
             boot, &cfg,
         )));
@@ -94,7 +94,7 @@ pub fn fresh(boot: &Config) -> Result<Option<Config>, String> {
     };
     thegn_core::host_config::merge_db_hosts(&mut cfg);
     // best-effort: see above.
-    let _ = cfg.clamp_to_channel(crate::channel_state::current());
+    let _ = crate::channel_state::clamp_and_record(&mut cfg, crate::channel_state::current());
     Ok(Some(thegn_core::pipeline_run::with_fresh_registry(
         boot, &cfg,
     )))
