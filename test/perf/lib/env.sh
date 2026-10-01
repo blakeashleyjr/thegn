@@ -30,6 +30,15 @@ perf_make_tmp() {
   export XDG_RUNTIME_DIR="$PERF_TMP/run"
   export GIT_CONFIG_GLOBAL="$PERF_TMP/gitconfig"
   export GIT_CONFIG_SYSTEM=/dev/null
+  # thegn spawns pane shells from `$SHELL` verbatim (panes.rs pane_shell_argv).
+  # Point it at a uniquely named symlink to the real bash so the spawn-rate
+  # parser can recognise ONLY the harness-owned pane shell by exact path
+  # (PERF_PANE_SHELL) instead of guessing from argv shape.
+  PERF_PANE_SHELL="$PERF_TMP/bin/thegn-perf-pane-shell"
+  mkdir -p "$PERF_TMP/bin"
+  ln -s "$(command -v bash)" "$PERF_PANE_SHELL"
+  export PERF_PANE_SHELL
+  export SHELL="$PERF_PANE_SHELL"
   mkdir -p "$HOME" "$XDG_CONFIG_HOME" "$XDG_STATE_HOME" "$XDG_CACHE_HOME"
   # 0700 to match the real run dir: the daemon rejects a lax one.
   mkdir -p "$XDG_RUNTIME_DIR"

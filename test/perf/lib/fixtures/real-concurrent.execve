@@ -1,0 +1,56 @@
+808431 1790878489.459659 execve("/nix/store/jxyrvv4gbpnp3ap5iy7wxwl1sg4x2x88-python3-3.14.6/bin/python3", ["python3", "/tmp/claude-1000/-home-blake-code-thegn/ac06503d-62e6-45d7-9c7f-1f43e9a53654/scratchpad/spawner.py", "/tmp/f717"], 0x7ffffffe29b0 /* 304 vars */) = 0
+808431 1790878489.501706 clone3({flags=CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD|CLONE_SYSVSEM|CLONE_SETTLS|CLONE_PARENT_SETTID|CLONE_CHILD_CLEARTID, child_tid=0x7ffff6c2a990, parent_tid=0x7ffff6c2a990, exit_signal=0, stack=0x7ffff5c2a000, stack_size=0xffff40, tls=0x7ffff6c2a6c0} => {parent_tid=[808432]}, 88) = 808432
+808431 1790878489.502521 clone3({flags=CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD|CLONE_SYSVSEM|CLONE_SETTLS|CLONE_PARENT_SETTID|CLONE_CHILD_CLEARTID, child_tid=0x7ffff5c29990, parent_tid=0x7ffff5c29990, exit_signal=0, stack=0x7ffff4c29000, stack_size=0xffff40, tls=0x7ffff5c296c0} => {parent_tid=[808433]}, 88) = 808433
+808432 1790878489.503709 vfork( <unfinished ...>
+808431 1790878489.504032 clone3({flags=CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD|CLONE_SYSVSEM|CLONE_SETTLS|CLONE_PARENT_SETTID|CLONE_CHILD_CLEARTID, child_tid=0x7fffeffff990, parent_tid=0x7fffeffff990, exit_signal=0, stack=0x7fffeefff000, stack_size=0xffff40, tls=0x7fffeffff6c0} => {parent_tid=[808435]}, 88) = 808435
+808434 1790878489.504714 execve("/tmp/f717/nope1/podman", ["podman", "ps", "--format", "a \"quoted\" \\ value\nnewline \303\251"], 0x7ffff00101d0 /* 304 vars */) = -1 ENOENT (No such file or directory)
+808434 1790878489.504856 execve("/tmp/f717/nope2/podman", ["podman", "ps", "--format", "a \"quoted\" \\ value\nnewline \303\251"], 0x7ffff00101d0 /* 304 vars */) = -1 ENOENT (No such file or directory)
+808434 1790878489.504894 execve("/tmp/f717/bin/podman", ["podman", "ps", "--format", "a \"quoted\" \\ value\nnewline \303\251"], 0x7ffff00101d0 /* 304 vars */ <unfinished ...>
+808433 1790878489.505021 vfork( <unfinished ...>
+808432 1790878489.505181 <... vfork resumed>) = 808434
+808431 1790878489.505265 clone3({flags=CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD|CLONE_SYSVSEM|CLONE_SETTLS|CLONE_PARENT_SETTID|CLONE_CHILD_CLEARTID, child_tid=0x7fffeeffe990, parent_tid=0x7fffeeffe990, exit_signal=0, stack=0x7fffedffe000, stack_size=0xffff40, tls=0x7fffeeffe6c0} => {parent_tid=[808437]}, 88) = 808437
+808434 1790878489.505335 <... execve resumed>) = 0
+808436 1790878489.505948 execve("/tmp/f717/nope1/podman", ["podman", "ps", "--format", "a \"quoted\" \\ value\nnewline \303\251"], 0x7fffe80101d0 /* 304 vars */) = -1 ENOENT (No such file or directory)
+808436 1790878489.505994 execve("/tmp/f717/nope2/podman", ["podman", "ps", "--format", "a \"quoted\" \\ value\nnewline \303\251"], 0x7fffe80101d0 /* 304 vars */) = -1 ENOENT (No such file or directory)
+808436 1790878489.506028 execve("/tmp/f717/bin/podman", ["podman", "ps", "--format", "a \"quoted\" \\ value\nnewline \303\251"], 0x7fffe80101d0 /* 304 vars */ <unfinished ...>
+808435 1790878489.506169 vfork( <unfinished ...>
+808433 1790878489.506266 <... vfork resumed>) = 808436
+808436 1790878489.506394 <... execve resumed>) = 0
+808431 1790878489.506532 clone3({flags=CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD|CLONE_SYSVSEM|CLONE_SETTLS|CLONE_PARENT_SETTID|CLONE_CHILD_CLEARTID, child_tid=0x7fffedffd990, parent_tid=0x7fffedffd990, exit_signal=0, stack=0x7fffecffd000, stack_size=0xffff40, tls=0x7fffedffd6c0} => {parent_tid=[808439]}, 88) = 808439
+808438 1790878489.507071 execve("/tmp/f717/nope1/podman", ["podman", "ps", "--format", "a \"quoted\" \\ value\nnewline \303\251"], 0x7fffe40101d0 /* 304 vars */) = -1 ENOENT (No such file or directory)
+808438 1790878489.507115 execve("/tmp/f717/nope2/podman", ["podman", "ps", "--format", "a \"quoted\" \\ value\nnewline \303\251"], 0x7fffe40101d0 /* 304 vars */) = -1 ENOENT (No such file or directory)
+808438 1790878489.507147 execve("/tmp/f717/bin/podman", ["podman", "ps", "--format", "a \"quoted\" \\ value\nnewline \303\251"], 0x7fffe40101d0 /* 304 vars */ <unfinished ...>
+808435 1790878489.507372 <... vfork resumed>) = 808438
+808437 1790878489.507401 vfork( <unfinished ...>
+808438 1790878489.507514 <... execve resumed>) = 0
+808440 1790878489.508374 execve("/tmp/f717/nope1/podman", ["podman", "ps", "--format", "a \"quoted\" \\ value\nnewline \303\251"], 0x7fffdc0101d0 /* 304 vars */) = -1 ENOENT (No such file or directory)
+808439 1790878489.508436 vfork( <unfinished ...>
+808440 1790878489.508448 execve("/tmp/f717/nope2/podman", ["podman", "ps", "--format", "a \"quoted\" \\ value\nnewline \303\251"], 0x7fffdc0101d0 /* 304 vars */) = -1 ENOENT (No such file or directory)
+808440 1790878489.508484 execve("/tmp/f717/bin/podman", ["podman", "ps", "--format", "a \"quoted\" \\ value\nnewline \303\251"], 0x7fffdc0101d0 /* 304 vars */ <unfinished ...>
+808437 1790878489.508719 <... vfork resumed>) = 808440
+808440 1790878489.508835 <... execve resumed>) = 0
+808441 1790878489.509236 execve("/tmp/f717/nope1/no-such-binary-anywhere", ["no-such-binary-anywhere", "x"], 0x7fffe00101d0 /* 304 vars */) = -1 ENOENT (No such file or directory)
+808441 1790878489.509277 execve("/tmp/f717/nope2/no-such-binary-anywhere", ["no-such-binary-anywhere", "x"], 0x7fffe00101d0 /* 304 vars */) = -1 ENOENT (No such file or directory)
+808441 1790878489.509310 execve("/tmp/f717/bin/no-such-binary-anywhere", ["no-such-binary-anywhere", "x"], 0x7fffe00101d0 /* 304 vars */) = -1 ENOENT (No such file or directory)
+808441 1790878489.509341 execve("/nix/store/cp7wjv1pl4wapfk48svvizxd089v9h0a-coreutils-9.11/bin/no-such-binary-anywhere", ["no-such-binary-anywhere", "x"], 0x7fffe00101d0 /* 304 vars */) = -1 ENOENT (No such file or directory)
+808441 1790878489.509400 execve("/nix/store/v8llyqw71lygr2llhmcc8ya5bdlzq45v-bash-5.3p9/bin/no-such-binary-anywhere", ["no-such-binary-anywhere", "x"], 0x7fffe00101d0 /* 304 vars */) = -1 ENOENT (No such file or directory)
+808439 1790878489.509516 <... vfork resumed>) = 808441
+808431 1790878489.513275 vfork( <unfinished ...>
+808442 1790878489.514153 execve("/tmp/f717/nope1/bash", ["bash", "--norc"], 0x5555557f64c0 /* 304 vars */) = -1 ENOENT (No such file or directory)
+808442 1790878489.514218 execve("/tmp/f717/nope2/bash", ["bash", "--norc"], 0x5555557f64c0 /* 304 vars */) = -1 ENOENT (No such file or directory)
+808442 1790878489.514251 execve("/tmp/f717/bin/bash", ["bash", "--norc"], 0x5555557f64c0 /* 304 vars */) = -1 ENOENT (No such file or directory)
+808442 1790878489.514282 execve("/nix/store/cp7wjv1pl4wapfk48svvizxd089v9h0a-coreutils-9.11/bin/bash", ["bash", "--norc"], 0x5555557f64c0 /* 304 vars */) = -1 ENOENT (No such file or directory)
+808442 1790878489.514318 execve("/nix/store/v8llyqw71lygr2llhmcc8ya5bdlzq45v-bash-5.3p9/bin/bash", ["bash", "--norc"], 0x5555557f64c0 /* 304 vars */ <unfinished ...>
+808431 1790878489.514544 <... vfork resumed>) = 808442
+808442 1790878489.514639 <... execve resumed>) = 0
+808442 1790878489.518010 clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|CLONE_CHILD_SETTID|SIGCHLD, child_tidptr=0x7ffff7fb2a50) = 808443
+808443 1790878489.518387 execve("/nix/store/cp7wjv1pl4wapfk48svvizxd089v9h0a-coreutils-9.11/bin/sleep", ["sleep", "0.01"], 0x5555556c93f0 /* 304 vars */) = 0
+808431 1790878489.532692 vfork( <unfinished ...>
+808444 1790878489.533530 execve("/tmp/f717/nope1/sh", ["sh", "-c", "podman ps"], 0x5555557d64b0 /* 304 vars */) = -1 ENOENT (No such file or directory)
+808444 1790878489.533584 execve("/tmp/f717/nope2/sh", ["sh", "-c", "podman ps"], 0x5555557d64b0 /* 304 vars */) = -1 ENOENT (No such file or directory)
+808444 1790878489.533616 execve("/tmp/f717/bin/sh", ["sh", "-c", "podman ps"], 0x5555557d64b0 /* 304 vars */) = -1 ENOENT (No such file or directory)
+808444 1790878489.533648 execve("/nix/store/cp7wjv1pl4wapfk48svvizxd089v9h0a-coreutils-9.11/bin/sh", ["sh", "-c", "podman ps"], 0x5555557d64b0 /* 304 vars */) = -1 ENOENT (No such file or directory)
+808444 1790878489.533686 execve("/nix/store/v8llyqw71lygr2llhmcc8ya5bdlzq45v-bash-5.3p9/bin/sh", ["sh", "-c", "podman ps"], 0x5555557d64b0 /* 304 vars */ <unfinished ...>
+808431 1790878489.533928 <... vfork resumed>) = 808444
+808444 1790878489.534028 <... execve resumed>) = 0
+808444 1790878489.537193 execve("/tmp/f717/bin/podman", ["podman", "ps"], 0x5555556de2e0 /* 304 vars */) = 0
