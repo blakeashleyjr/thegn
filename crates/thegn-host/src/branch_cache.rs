@@ -34,6 +34,33 @@ fn cache() -> &'static Mutex<HashMap<PathBuf, (Vec<BranchInfo>, Instant)>> {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// `(branch, worktree path)` for every worktree of a repo holding a branch
+/// (detached / unborn omitted). Unfiltered by cwd: the per-worktree exclusion
+/// of "this" checkout is applied by the reader, so one entry serves every tab.
+pub(crate) type Holders = Vec<(String, String)>;
+
+#[allow(clippy::type_complexity)]
+fn holders_cache() -> &'static Mutex<HashMap<PathBuf, (Holders, Instant)>> {
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, (Holders, Instant)>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The cached branch holders for `repo_root` plus their age, if present. Same
+/// TTL and invalidation as the branch list, so the `git worktree list` behind
+/// them is not re-run on every hydration while the Branches section is open.
+pub(crate) fn get_holders(repo_root: &Path) -> Option<(Holders, Duration)> {
+    let map = holders_cache().lock().unwrap();
+    map.get(repo_root)
+        .map(|(holders, at)| (holders.clone(), at.elapsed()))
+}
+
+pub(crate) fn put_holders(repo_root: &Path, holders: Holders) {
+    holders_cache()
+        .lock()
+        .unwrap()
+        .insert(repo_root.to_path_buf(), (holders, Instant::now()));
+}
+
 /// The cached branch list for `repo_root` plus its age, if present.
 pub(crate) fn get(repo_root: &Path) -> Option<(Vec<BranchInfo>, Duration)> {
     let map = cache().lock().unwrap();
@@ -56,6 +83,9 @@ pub(crate) fn put(repo_root: &Path, branches: Vec<BranchInfo>) {
 /// (tiny, in-memory) map instead. Cheap — no I/O.
 pub(crate) fn invalidate_all() {
     cache().lock().unwrap().clear();
+    holders_cache().lock().unwrap().clear();
+    // The memoised in-process HEAD reads share the same ref-move signal.
+    crate::worktree_snapshot::invalidate_head_reads();
 }
 
 /// A branch ref under `refs/heads/*` moved (create/delete/commit/fetch, or the

@@ -397,7 +397,8 @@ fn create_and_register(
             .map(|e| {
                 anyhow::anyhow!(
                     "{e}; the worktree at {path_s} was created, registered and set up, \
-                     but NOT filed into {folder_name:?}"
+                     but NOT filed into {folder_name:?}; retry the filing with \
+                     `thegn wt folder {path_s:?} {folder_name:?}` once the cause above is fixed"
                 )
             })
     });
@@ -877,7 +878,20 @@ fn rm(cfg: &Config, target: &str, delete_branch: bool, force: bool) -> Result<()
             Err(_) => unreadable_roots.push(root.to_string()),
         }
     }
-    if !remote_rows.is_empty() {
+    // Local rows are resolved first. A local match short-circuits the remote
+    // reads: each is an ssh/provider exec bounded only by `git_read_timeout`
+    // (60 s), so a dead host would otherwise stall removing a LOCAL worktree.
+    // Skipping them means a remote worktree holding the same branch name is not
+    // weighed against the local match; that is acceptable because removal needs
+    // an unambiguous match and a local one the user can see is still unique
+    // among local rows (the ambiguity check below stays exact for those), while
+    // the remote row stays addressable by path.
+    let local_hit = path_match.is_some()
+        || candidates.iter().any(|row| {
+            !is_remote(row)
+                && observations.get(&row.worktree).and_then(|o| o.branch()) == Some(target)
+        });
+    if !local_hit && !remote_rows.is_empty() {
         observations.extend(crate::worktree_snapshot::observe_rows(
             &*crate::git_handle::get(),
             &remote_rows,
