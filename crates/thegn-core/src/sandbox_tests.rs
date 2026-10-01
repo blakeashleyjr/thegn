@@ -2,6 +2,44 @@ use super::*;
 use crate::sandbox_mounts::host_toolchain_mounts;
 
 #[test]
+fn ambient_container_listing_runs_ps_only_for_cached_present_backends() {
+    let mut calls = Vec::new();
+    let containers = running_containers_with(
+        false,
+        |backend| match backend {
+            Backend::Podman => Some(RuntimeProbe::Absent),
+            Backend::PodmanRootful => None,
+            Backend::Docker => Some(RuntimeProbe::Present),
+            _ => unreachable!(),
+        },
+        |backend, _| {
+            calls.push(backend);
+            Some(r#"{"Names":"foreign","Image":"alpine","Status":"Up 2 seconds"}"#.into())
+        },
+        |_| std::collections::HashMap::new(),
+    );
+    assert_eq!(calls, vec![Backend::Docker]);
+    assert_eq!(containers.len(), 1);
+    assert_eq!(containers[0].backend, "docker");
+}
+
+#[test]
+fn ambient_container_listing_with_no_present_cache_is_empty_without_ps() {
+    let mut calls = Vec::new();
+    let containers = running_containers_with(
+        false,
+        |_| Some(RuntimeProbe::Absent),
+        |backend, _| {
+            calls.push(backend);
+            None
+        },
+        |_| std::collections::HashMap::new(),
+    );
+    assert!(containers.is_empty());
+    assert!(calls.is_empty());
+}
+
+#[test]
 fn none_backend_skips_cd_for_unretargeted_remote_worktree() {
     // A bare remote shell whose worktree was NOT retargeted (local path) must
     // NOT `cd <local-path>` on the remote — it would fail "cd: can't cd to …".

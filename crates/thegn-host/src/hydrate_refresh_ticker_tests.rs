@@ -11,6 +11,7 @@ struct Observations {
     priming: Vec<&'static str>,
     daemon: Vec<u64>,
     containers: Vec<u64>,
+    container_wakes: Vec<bool>,
 }
 
 struct FixtureIo {
@@ -18,6 +19,8 @@ struct FixtureIo {
     ack: mpsc::SyncSender<u64>,
     finished: mpsc::SyncSender<()>,
     observed: Arc<Mutex<Observations>>,
+    demand: Arc<std::sync::atomic::AtomicU8>,
+    container_changed: Arc<std::sync::atomic::AtomicBool>,
     tick: u64,
 }
 impl Drop for FixtureIo {
@@ -66,9 +69,15 @@ impl TickerIo for FixtureIo {
     fn send_stats_if_due(&mut self) -> Result<bool, ()> {
         Ok(false)
     }
-    fn send_containers(&mut self, ticks: u64, _every: u64) -> Result<(), ()> {
-        self.observed.lock().unwrap().containers.push(ticks);
-        Ok(())
+    fn container_demand(&self) -> ContainerDemand {
+        ContainerDemand::from_signal(self.demand.load(Ordering::Relaxed))
+    }
+    fn send_containers(&mut self, ticks: u64, _every: u64, demand_rise: bool) -> Result<bool, ()> {
+        let changed = demand_rise || self.container_changed.swap(false, Ordering::Relaxed);
+        let mut observed = self.observed.lock().unwrap();
+        observed.containers.push(ticks);
+        observed.container_wakes.push(changed);
+        Ok(changed)
     }
     fn tick_complete(&mut self, tick: u64) {
         assert_eq!(tick, self.tick);
@@ -86,6 +95,8 @@ struct Fixture {
     refresh: tokio_mpsc::UnboundedReceiver<RefreshKind>,
     observed: Arc<Mutex<Observations>>,
     wakes: Arc<std::sync::atomic::AtomicUsize>,
+    demand: Arc<std::sync::atomic::AtomicU8>,
+    container_changed: Arc<std::sync::atomic::AtomicBool>,
     events: Vec<(u64, &'static str)>,
     tick: u64,
 }
@@ -97,6 +108,8 @@ impl Fixture {
         let (tx, refresh) = tokio_mpsc::unbounded_channel();
         let observed = Arc::new(Mutex::new(Observations::default()));
         let wakes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let demand = Arc::new(std::sync::atomic::AtomicU8::new(0));
+        let container_changed = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let notify = wakes.clone();
         // Exactly the config-to-effective-cadence projection used by the live
         // ScheduleOwner. The worker consumes slots, not raw TTLs.
@@ -109,6 +122,8 @@ impl Fixture {
                 ack,
                 finished,
                 observed: observed.clone(),
+                demand: demand.clone(),
+                container_changed: container_changed.clone(),
                 tick: 0,
             },
             move || {
@@ -123,6 +138,8 @@ impl Fixture {
             refresh,
             observed,
             wakes,
+            demand,
+            container_changed,
             events: Vec::new(),
             tick: 0,
         }
@@ -177,6 +194,10 @@ impl Fixture {
             .collect()
     }
 
+    fn set_demand(&self, demand: ContainerDemand) {
+        self.demand.store(demand.signal(), Ordering::Relaxed);
+    }
+
     fn finish(&mut self) {
         // Disconnecting the fixture clock releases a parked worker, including
         // on assertion unwinding. No producer can leave another slot pending.
@@ -226,6 +247,91 @@ fn configured() -> Config {
     cfg.git.auto_fetch = false;
     cfg.loc.enabled = false;
     cfg
+}
+
+#[test]
+fn summary_container_equality_ignores_metrics_but_detail_equality_includes_them() {
+    let row = thegn_core::sandbox::ContainerInfo {
+        name: "thegn-wt".into(),
+        image: "image:v1".into(),
+        status: "Up 5 seconds (healthy)".into(),
+        ours: true,
+        backend: "docker".into(),
+        cpu: "1%".into(),
+        mem: "2MiB".into(),
+        net: "3KB".into(),
+        containment: "worktree+caches".into(),
+        mounts: String::new(),
+    };
+    let mut metrics_changed = row.clone();
+    metrics_changed.cpu = "8%".into();
+    assert!(container_snapshot_equal(
+        &[row.clone()],
+        &[metrics_changed.clone()],
+        false
+    ));
+    assert!(!container_snapshot_equal(
+        &[row.clone()],
+        &[metrics_changed],
+        true
+    ));
+    let mut image_changed = row.clone();
+    image_changed.image = "image:v2".into();
+    assert!(!container_snapshot_equal(&[row], &[image_changed], false));
+}
+
+#[test]
+fn no_container_demand_never_lists_or_wakes_for_container_slots() {
+    let mut fixture = Fixture::start(&configured());
+    fixture.advance_to(40);
+    let observed = fixture.observed.lock().unwrap();
+    assert!(
+        observed.containers.is_empty(),
+        "unexpected listings: {:?}",
+        observed.containers
+    );
+    assert!(observed.container_wakes.is_empty());
+}
+
+#[test]
+fn summary_demand_uses_sixty_second_cadence() {
+    let mut fixture = Fixture::start(&configured());
+    fixture.set_demand(ContainerDemand::Summary);
+    fixture.advance_to(120);
+    assert_eq!(fixture.observed.lock().unwrap().containers, vec![1]);
+    fixture.advance_to(121);
+    assert_eq!(fixture.observed.lock().unwrap().containers, vec![1, 121]);
+}
+
+#[test]
+fn detail_demand_uses_five_second_cadence() {
+    let mut fixture = Fixture::start(&configured());
+    fixture.set_demand(ContainerDemand::Detail);
+    fixture.advance_to(11);
+    assert_eq!(fixture.observed.lock().unwrap().containers, vec![1, 11]);
+}
+
+#[test]
+fn rising_container_demand_lists_immediately() {
+    let mut fixture = Fixture::start(&configured());
+    fixture.set_demand(ContainerDemand::Summary);
+    fixture.advance_to(1);
+    fixture.advance_to(35);
+    fixture.set_demand(ContainerDemand::Detail);
+    fixture.advance_to(36);
+    assert_eq!(fixture.observed.lock().unwrap().containers, vec![1, 36]);
+}
+
+#[test]
+fn identical_container_snapshot_does_not_wake_but_a_change_does() {
+    let mut fixture = Fixture::start(&configured());
+    fixture.set_demand(ContainerDemand::Detail);
+    fixture.advance_to(1);
+    fixture.advance_to(11);
+    fixture.container_changed.store(true, Ordering::Relaxed);
+    fixture.advance_to(21);
+    let observed = fixture.observed.lock().unwrap();
+    assert_eq!(observed.container_wakes, vec![true, false, true]);
 }
 
 #[test]

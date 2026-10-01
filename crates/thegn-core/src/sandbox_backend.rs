@@ -519,6 +519,16 @@ pub(crate) fn available(placement: &Placement, backend: Backend) -> RuntimeProbe
     v
 }
 
+/// Return a still-valid memoized answer without initiating a probe. Ambient
+/// container listings use this so they never turn an idle display refresh into
+/// a new backend discovery subprocess.
+pub(crate) fn cached_available(placement: &Placement, backend: Backend) -> Option<RuntimeProbe> {
+    let cache = avail_cache().get()?;
+    let key = (format!("{placement:?}"), backend);
+    let &(result, at) = cache.lock().unwrap().get(&key)?;
+    cache_is_fresh(result, at, placement.is_local()).then_some(result)
+}
+
 /// Retry an `Unreachable` probe per the policy before accepting it; a definite
 /// `Present`/`Absent` returns immediately. Pure loop over injected closures —
 /// the sleep is the only side effect (unit-tested with a recording sleeper).

@@ -1000,6 +1000,9 @@ pub async fn main(
     // closed surface runs only the cheap `ps` — the always-on stats cost this
     // change removes.
     let containers_live = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Basic container listing demand is separate from `containers_live`, which
+    // continues to control only stats/df enrichment.
+    let container_demand = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0));
     // Pane PIDs for process attribution. The inner `Arc` is swapped wholesale so
     // the sampler thread's read is one pointer clone under a briefly-held lock.
     let pane_pids: crate::hydrate::PanePids = std::sync::Arc::new(std::sync::Mutex::new(
@@ -1046,6 +1049,7 @@ pub async fn main(
         stats_interval_ms.clone(),
         stats_live.clone(),
         containers_live.clone(),
+        container_demand.clone(),
         disk_fs_path,
         waker.clone(),
     );
@@ -1135,6 +1139,7 @@ pub async fn main(
             .as_ref()
             .map(crate::proc_worker::ProcessWorker::control),
         containers_live,
+        container_demand,
         pane_pids,
         daemon_pid_atomic,
         waker,
@@ -6103,6 +6108,22 @@ fn reconcile_process_view_transition(
     }
 }
 
+fn container_health_for(
+    active_name: &str,
+    containers: &[thegn_core::sandbox::ContainerInfo],
+) -> crate::chrome::ContainerHealth {
+    if active_name.is_empty() {
+        return crate::chrome::ContainerHealth::Unknown;
+    }
+    match containers.iter().find(|c| c.name == active_name) {
+        None => crate::chrome::ContainerHealth::Unknown,
+        Some(c) if c.status.to_lowercase().starts_with("up") => {
+            crate::chrome::ContainerHealth::Healthy
+        }
+        Some(c) => crate::chrome::ContainerHealth::Degraded(c.status.clone()),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn event_loop<T: Terminal>(
     resident_supervisor: thegn_svc::plugin::ResidentSupervisor,
@@ -6135,6 +6156,7 @@ async fn event_loop<T: Terminal>(
     stats_live: std::sync::Arc<std::sync::atomic::AtomicBool>,
     process_control: Option<crate::proc_worker::Control>,
     containers_live: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    container_demand: std::sync::Arc<std::sync::atomic::AtomicU8>,
     pane_pids: crate::hydrate::PanePids,
     daemon_pid_atomic: std::sync::Arc<std::sync::atomic::AtomicU32>,
     waker: TerminalWaker,
@@ -10183,15 +10205,9 @@ async fn event_loop<T: Terminal>(
                         std::mem::take(&mut model.sidebar_workspaces),
                     )
                 });
-            // The container list + derived health are owned by the 5s ticker
-            // (`container_rx` drain) — hydration always carries empty
-            // defaults, and dropping them here made the Sandbox section read
-            // "not sandboxed" for ~5s out of every 5s.
+            // The container snapshot is worker-owned. Recompute active health
+            // below from this cached list when hydration changes worktrees.
             let containers = std::mem::take(&mut model.containers);
-            let container_health = std::mem::replace(
-                &mut model.container_health,
-                crate::chrome::ContainerHealth::Unknown,
-            );
             // Same contract for the pipeline roster: it is owned by the
             // board's off-loop sample (`RefreshKind::Dispatches`), and
             // `build_model` always carries the empty default — dropping it here
@@ -10242,7 +10258,8 @@ async fn event_loop<T: Terminal>(
                 model.sidebar_workspaces = workspaces;
             }
             model.containers = containers;
-            model.container_health = container_health;
+            model.container_health =
+                container_health_for(&model.active_container_name, &model.containers);
             if let Some(orphans) = STARTUP_ORPHANS_REMOVED.get() {
                 model.startup_orphans_removed = orphans.clone();
             }
@@ -10806,7 +10823,7 @@ async fn event_loop<T: Terminal>(
             }
         }
 
-        // Container list from the 5s ticker — replaces the old inline call
+        // Container list from the demand-tiered ticker — replaces the old inline call
         // inside model hydration so `podman ps` never blocks the hydrate path.
         while let Ok(refresh) = container_rx.try_recv() {
             let containers = refresh.containers;
@@ -10820,27 +10837,9 @@ async fn event_loop<T: Terminal>(
                 dirty = true;
             }
             loop_perf.tick(crate::perf::WakeSource::Container);
-            // Derive container health for the active worktree from the
-            // snapshot: if the named container is present and running →
-            // Healthy; present but not running → Degraded; absent →
-            // Unknown (non-OCI backends also land here). Recomputed on EVERY
-            // tick, not only when the list changed: the active container name
-            // changes on worktree switch while the list stays identical, and
-            // gating on list-equality left a dead container reading "running".
-            let health = if model.active_container_name.is_empty() {
-                crate::chrome::ContainerHealth::Unknown
-            } else {
-                match containers
-                    .iter()
-                    .find(|c| c.name == model.active_container_name)
-                {
-                    None => crate::chrome::ContainerHealth::Unknown,
-                    Some(c) if c.status.to_lowercase().starts_with("up") => {
-                        crate::chrome::ContainerHealth::Healthy
-                    }
-                    Some(c) => crate::chrome::ContainerHealth::Degraded(c.status.clone()),
-                }
-            };
+            // Derive health from the new snapshot. Hydration also recomputes
+            // against this cached list when the active worktree changes.
+            let health = container_health_for(&model.active_container_name, &containers);
             if model.container_health != health || model.containers != containers {
                 model.container_health = health;
                 model.containers = containers;
@@ -12578,6 +12577,17 @@ async fn event_loop<T: Terminal>(
             chrome.panel.is_some() && panel_ui.open == crate::panel::Section::Sandbox;
         containers_live.store(
             crate::monitor::wants_container_stats(monitor.as_ref(), sandbox_section_now),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        let container_demand_now = if monitor.is_some() {
+            crate::hydrate::ContainerDemand::Detail
+        } else if chrome.panel.is_some() {
+            crate::hydrate::ContainerDemand::Summary
+        } else {
+            crate::hydrate::ContainerDemand::None
+        };
+        container_demand.store(
+            container_demand_now.signal(),
             std::sync::atomic::Ordering::Relaxed,
         );
         // On open, force perf accounting on (saving the prior state) so the
