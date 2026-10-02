@@ -926,13 +926,11 @@ mod tests {
         // NOT the mutating ones. This is the deliberate split this change
         // introduces (see `every_state_cap_maps_to_the_scope_it_documents`
         // in thegn-core for the scope-table half of this pin).
-        for csv in ["read", "read,git"] {
-            assert_eq!(
-                sorted(allowed_state_caps(ScopeSet::parse(csv), false)),
-                sorted(READ_CAPS.to_vec()),
-                "--scopes {csv}"
-            );
-        }
+        assert_eq!(
+            sorted(allowed_state_caps(ScopeSet::parse("read"), false)),
+            sorted(READ_CAPS.to_vec()),
+            "--scopes read"
+        );
     }
 
     #[test]
@@ -978,7 +976,7 @@ mod tests {
     #[test]
     fn mcp_scope_mapping_write_and_flag_covers_every_implemented_cap() {
         assert_eq!(
-            sorted(allowed_state_caps(ScopeSet::parse("write,exec"), true)),
+            sorted(allowed_state_caps(ScopeSet::parse("write,git,exec"), true)),
             sorted(thegn_core::mcp::state::MCP_STATE_CAPS.to_vec()),
         );
     }
