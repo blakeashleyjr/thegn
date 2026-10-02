@@ -80,19 +80,16 @@ fn run_unix_bounded(
         let timed_out = Instant::now() >= execution_deadline;
         match crate::platform::gate_child_exited(&mut child) {
             Ok(true) => {
-                // The leader has exited. Reap it, then let the rest of its
-                // group drain until the execution deadline (a command such as
-                // `afplay x.wav &` must still play). POSIX never reuses a pid
-                // that is still a live process-group id, so reaping the leader
-                // first does not make the group kill unsafe.
-                let status = match child.wait() {
-                    Ok(status) => status,
-                    Err(error) => {
-                        group.kill();
-                        return SoundProcessOutcome::Reap(error);
-                    }
-                };
-                return drain_group(&group, status, cancellation, execution_deadline, deadline);
+                // The leader has exited but is deliberately NOT reaped: the
+                // unreaped zombie pins the pid/pgid so the group kill below can
+                // never hit a recycled, unrelated group. It is reaped last.
+                return drain_group(
+                    &mut child,
+                    &group,
+                    cancellation,
+                    execution_deadline,
+                    deadline,
+                );
             }
             Ok(false) if cancelled || timed_out => {
                 group.kill();
@@ -124,22 +121,68 @@ fn run_unix_bounded(
     }
 }
 
-/// After the leader exited: wait for its group to empty on its own, killing it
-/// at the execution deadline or on cancellation. Cancellation shortens the
-/// post-kill settle to `CLEANUP_GRACE` so shutdown is not held for the rest of
-/// the deadline.
+/// Whether any non-zombie process other than the (zombie) leader remains in
+/// the group. A zombie leader still answers `killpg(.., 0)`, so liveness needs
+/// a process table scan; where none is available we conservatively report
+/// "members remain", which only means the drain runs to the deadline.
 #[cfg(unix)]
+fn live_members(_group: &crate::platform::GroupHandle, _pgid: i32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let pgid = _pgid;
+        let Ok(dir) = std::fs::read_dir("/proc") else {
+            return true;
+        };
+        for entry in dir.flatten() {
+            let name = entry.file_name();
+            if !name.to_string_lossy().bytes().all(|b| b.is_ascii_digit()) {
+                continue;
+            }
+            // A process vanishing mid-scan is simply not a member any more.
+            let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+                continue;
+            };
+            let Some(rest) = stat.rsplit_once(')').map(|(_, rest)| rest) else {
+                continue;
+            };
+            let mut fields = rest.split_whitespace();
+            let state = fields.next();
+            let _ppid = fields.next();
+            let pgrp = fields.next().and_then(|f| f.parse::<i32>().ok());
+            if pgrp == Some(pgid) && state != Some("Z") {
+                return true;
+            }
+        }
+        false
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        !_group.is_empty()
+    }
+}
+
+/// After the leader exited (still unreaped): wait for the rest of its group to
+/// drain on its own, killing it at the execution deadline or on cancellation
+/// (cancellation shortens the post-kill settle to `CLEANUP_GRACE`). The leader
+/// is reaped last and its status is the outcome.
+#[cfg(unix)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the leader has already exited; this wait only reaps the zombie"
+)]
 fn drain_group(
+    child: &mut std::process::Child,
     group: &crate::platform::GroupHandle,
-    status: std::process::ExitStatus,
     cancellation: &std::sync::atomic::AtomicBool,
     execution_deadline: Instant,
     deadline: Instant,
 ) -> SoundProcessOutcome {
     use std::sync::atomic::Ordering;
+    let pgid = child.id() as i32;
+    let mut settled = Ok(());
     loop {
-        if group.is_empty() {
-            return SoundProcessOutcome::Exited(status);
+        if !live_members(group, pgid) {
+            break;
         }
         let cancelled = cancellation.load(Ordering::Acquire);
         if cancelled || Instant::now() >= execution_deadline {
@@ -149,12 +192,21 @@ fn drain_group(
             } else {
                 deadline
             };
-            return match settle_group(group, settle_deadline) {
-                Ok(()) => SoundProcessOutcome::Exited(status),
-                Err(()) => SoundProcessOutcome::DescendantsRemain,
-            };
+            while live_members(group, pgid) {
+                if Instant::now() >= settle_deadline {
+                    settled = Err(());
+                    break;
+                }
+                std::thread::sleep(POLL_INTERVAL);
+            }
+            break;
         }
         std::thread::sleep(POLL_INTERVAL);
+    }
+    match (child.wait(), settled) {
+        (Err(error), _) => SoundProcessOutcome::Reap(error),
+        (Ok(_), Err(())) => SoundProcessOutcome::DescendantsRemain,
+        (Ok(status), Ok(())) => SoundProcessOutcome::Exited(status),
     }
 }
 
@@ -209,6 +261,52 @@ mod tests {
         );
         assert!(matches!(result, SoundProcessOutcome::Exited(status) if status.success()));
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn leader_stays_an_unreaped_zombie_until_its_group_is_drained() {
+        let dir = helper("echo $$ > \"$1\"; sleep 1 & exit 0");
+        let pid_file = dir.path().join("pid");
+        let script = dir.path().join("helper.sh").to_str().unwrap().to_string();
+        let args = vec![pid_file.display().to_string()];
+        let runner = std::thread::spawn(move || {
+            run_unix_bounded(
+                &script,
+                &args,
+                &AtomicBool::new(false),
+                Duration::from_secs(5),
+            )
+        });
+        let started = Instant::now();
+        let pid = loop {
+            if let Some(pid) = std::fs::read_to_string(&pid_file)
+                .ok()
+                .and_then(|s| s.trim().parse::<i32>().ok())
+            {
+                break pid;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "helper never started"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        // The leader exits immediately; the backgrounded `sleep` keeps the group alive.
+        std::thread::sleep(Duration::from_millis(400));
+        let state = test_support::proc_state(pid);
+        if test_support::HAS_PROC {
+            assert_eq!(
+                state,
+                Some('Z'),
+                "leader must stay an unreaped zombie while its group drains"
+            );
+        }
+        let result = runner.join().unwrap();
+        assert!(matches!(result, SoundProcessOutcome::Exited(status) if status.success()));
+        assert!(
+            test_support::pid_gone(pid),
+            "leader must be reaped at the end"
+        );
     }
 
     #[test]
@@ -334,6 +432,7 @@ pub(crate) fn run_bounded(
 #[cfg(test)]
 pub(crate) mod test_support {
     pub(crate) const UNIX: bool = cfg!(unix);
+    pub(crate) const HAS_PROC: bool = cfg!(target_os = "linux");
 
     /// A real terminal waker (backed by a pty); the other ends must outlive it.
     #[cfg(unix)]
@@ -372,6 +471,19 @@ pub(crate) mod test_support {
     #[cfg(not(unix))]
     pub(crate) fn test_waker() -> (termwiz::terminal::TerminalWaker, (), ()) {
         unreachable!("callers return early when !UNIX")
+    }
+
+    /// The `/proc` state letter of `pid` (Linux only; `None` elsewhere or if gone).
+    pub(crate) fn proc_state(_pid: i32) -> Option<char> {
+        #[cfg(target_os = "linux")]
+        {
+            let stat = std::fs::read_to_string(format!("/proc/{_pid}/stat")).ok()?;
+            stat.rsplit_once(')')?.1.trim_start().chars().next()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            None
+        }
     }
 
     /// True when `pid` no longer exists at all (a zombie still answers signal 0).
