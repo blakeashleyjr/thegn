@@ -43,6 +43,10 @@ pub(crate) fn run_bounded(
 }
 
 #[cfg(unix)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "every wait follows a confirmed exit or a group kill, on the dedicated sound worker thread"
+)]
 fn run_unix_bounded(
     program: &str,
     args: &[String],
