@@ -53,8 +53,6 @@ pub enum SlotState {
     /// Live and drivable.
     Running(Box<dyn AppTile>),
     /// Construction or the connection failed; carries a user-facing reason.
-    // `build_observe_tile` is infallible, so no caller reports a failure yet.
-    #[allow(dead_code)]
     Failed(String),
 }
 
@@ -99,6 +97,7 @@ impl AppSlot {
         match &self.state {
             SlotState::Running(t) => t.title(),
             SlotState::Starting => format!("{}…", self.label),
+            SlotState::Failed(_) => format!("{} (failed)", self.label),
             _ => self.label.clone(),
         }
     }
@@ -331,12 +330,26 @@ pub fn start_slot_tile(
     match registry::builder(slot.id) {
         Some(b) => {
             let hook = app_change_hook(app_tx, idx, waker);
-            let tile = (b.build)(hook, cfg, tokio::runtime::Handle::current());
-            slot.state = SlotState::Running(tile);
-            true
+            record_build_result(
+                slot,
+                (b.build)(hook, cfg, tokio::runtime::Handle::current()),
+            )
         }
         None => false,
     }
+}
+
+fn record_build_result(slot: &mut AppSlot, result: Result<Box<dyn AppTile>, String>) -> bool {
+    match result {
+        Ok(tile) => {
+            slot.state = SlotState::Running(tile);
+        }
+        Err(error) => {
+            tracing::warn!(target: "thegn::apps", app = slot.id, %error, "app construction failed");
+            slot.state = SlotState::Failed(error);
+        }
+    }
+    true
 }
 
 /// A tile's [`ChangeHook`](tg_kit::ChangeHook): fired off-thread when the tile
@@ -363,8 +376,11 @@ pub fn build_observe_tile(
     hook: tg_kit::ChangeHook,
     cfg: &thegn_core::config_observe::ObserveConfig,
     rt: tokio::runtime::Handle,
-) -> Box<dyn AppTile> {
-    Box::new(gtui_embed::embed::ObserveTile::new(hook, cfg, rt))
+    sampler_thread_start: impl FnOnce() + Send + 'static,
+) -> Result<Box<dyn AppTile>, String> {
+    let tile = gtui_embed::embed::ObserveTile::new(hook, cfg, rt, sampler_thread_start)
+        .map_err(|error| error.to_string())?;
+    Ok(Box::new(tile))
 }
 
 /// Parse a `Palette` `"R;G;B"` fragment to an sRGB triple (missing channels → 0).
@@ -601,6 +617,19 @@ mod tests {
         // The observe tile is reachable as the second tab.
         assert_eq!(host.tab_target(1), Some(ActiveApp::Tile(0)));
         assert_eq!(host.cycle(ActiveApp::Work, 1), ActiveApp::Tile(0));
+    }
+
+    #[test]
+    fn app_construction_error_is_retained_as_a_visible_failed_slot() {
+        let mut slot = AppSlot::new("observe", "Observe");
+        assert!(record_build_result(
+            &mut slot,
+            Err("injected spawn failure".into())
+        ));
+        assert!(
+            matches!(slot.state, SlotState::Failed(ref error) if error == "injected spawn failure")
+        );
+        assert_eq!(slot.chip_label(), "Observe (failed)");
     }
 
     #[test]
