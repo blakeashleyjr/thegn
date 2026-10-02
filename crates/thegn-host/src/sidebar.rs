@@ -2800,7 +2800,7 @@ mod tests {
         let mut branch_home = db_row("app", "home");
         branch_home.tab_name = "app/home~".into();
         branch_home.path = "/wt/branch-home".into();
-        let rows = vec![home, branch_home];
+        let rows = [home, branch_home];
         let row_refs: Vec<_> = rows.iter().collect();
         let db_by_slug = std::collections::HashMap::from([("app", row_refs)]);
         let groups = gather_groups(
