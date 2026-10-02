@@ -591,8 +591,13 @@ mod tests {
 
     #[test]
     fn seek_rebuilds_when_eviction_overtakes_sequence_cursor() {
+        // Each retained event/keyframe is charged a logical overhead (64 bytes
+        // each), so the first chunk costs ~133 and a second pushes past 160:
+        // the budget holds exactly one chunk, forcing the second push to evict
+        // the first. (A budget of 1 now holds nothing, so the recording would
+        // already be empty when the overlay opens.)
         let cfg = ReplayConfig {
-            max_bytes_per_pane: 1,
+            max_bytes_per_pane: 160,
             ..ReplayConfig::default()
         };
         let mut rec = Recording::from_config(&cfg, 24, 80);
