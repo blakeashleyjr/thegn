@@ -98,24 +98,120 @@ pub(crate) fn ref_moved(want_main_sync: &mut bool) {
     invalidate_all();
 }
 
-/// The change print at which the last `MainRefMoved` was acted on.
-static REF_MOVED_SEEN: crate::diff_watch::Seen = crate::diff_watch::Seen::new();
+/// Decides when a `MainRefMoved` request may be dropped, and remembers what a
+/// heal that ACTUALLY RAN saw. Two senders feed the request: the fs-watcher (a
+/// ref moved) and the coarse 20 s backstop ticker (a missed event). While a live
+/// watcher vouches for the active worktree, a request at a print the last
+/// SPAWNED heal already saw is the backstop firing with nothing to catch.
+///
+/// The record is made when the heal is spawned ([`HealGate::spawned`]), NOT when
+/// the request is handled: the loop's 2 s heal throttle can drop a request after
+/// it was accepted, and marking at acceptance would then suppress the backstop
+/// forever while the main checkout stays stale.
+pub(crate) struct HealGate {
+    seen: crate::diff_watch::Seen,
+    pending: std::sync::Mutex<Option<PendingHeal>>,
+    ref_seen: std::sync::Mutex<Option<std::collections::HashMap<std::path::PathBuf, u64>>>,
+}
 
-/// [`ref_moved`] for the loop's `MainRefMoved` arm, which two senders feed: the
-/// fs-watcher (a ref really moved) and the coarse 20 s backstop ticker (a missed
-/// event). Both used to run the heal + a full branch/commit/default-base
-/// re-read (`for-each-ref`, `log`, `symbolic-ref`, `show-ref`, `diff-index`, ...
-/// ~10 forks per tick, THE-718). While a live watcher vouches for `active`, a
-/// request at a print the last one already saw is the backstop firing with
-/// nothing to catch (the watcher's own sends move the print BEFORE they send, so
-/// a real ref move never matches) and is dropped. No live print => as before.
-pub(crate) fn ref_moved_unless_unchanged(want_main_sync: &mut bool, active: &std::path::Path) {
-    let (print, unchanged) = REF_MOVED_SEEN.check(active);
-    if unchanged {
-        return;
+struct PendingHeal {
+    path: std::path::PathBuf,
+    print: Option<crate::diff_watch::WatchPrint>,
+    ref_gen: Option<u64>,
+}
+
+impl HealGate {
+    pub(crate) const fn new() -> Self {
+        Self {
+            seen: crate::diff_watch::Seen::new(),
+            pending: std::sync::Mutex::new(None),
+            ref_seen: std::sync::Mutex::new(None),
+        }
     }
-    REF_MOVED_SEEN.mark(active, print);
-    ref_moved(want_main_sync);
+
+    /// Whether a request for `path` at `print` / `ref_gen` should be acted on.
+    /// Acting on it parks what was seen until [`spawned`](Self::spawned).
+    pub(crate) fn request(
+        &self,
+        path: &std::path::Path,
+        print: Option<crate::diff_watch::WatchPrint>,
+        ref_gen: Option<u64>,
+    ) -> bool {
+        if self.seen.matches(path, print) {
+            return false;
+        }
+        *self.pending.lock().unwrap_or_else(|e| e.into_inner()) = Some(PendingHeal {
+            path: path.to_path_buf(),
+            print,
+            ref_gen,
+        });
+        true
+    }
+
+    /// The heal for the last accepted request was actually spawned: record it.
+    pub(crate) fn spawned(&self) {
+        let Some(p) = self
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        else {
+            return;
+        };
+        self.seen.mark(&p.path, p.print);
+        if let Some(g) = p.ref_gen {
+            self.ref_seen
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get_or_insert_with(Default::default)
+                .insert(p.path, g);
+        }
+    }
+
+    /// A ref moved since the last SPAWNED heal for `path` (O(1)): the trailing
+    /// edge for events the 500 ms refresh throttle swallowed.
+    pub(crate) fn ref_moved_since(&self, path: &std::path::Path, ref_gen: Option<u64>) -> bool {
+        ref_gen.is_some_and(|g| {
+            self.ref_seen
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .and_then(|m| m.get(path))
+                != Some(&g)
+        })
+    }
+}
+
+static HEAL_GATE: HealGate = HealGate::new();
+
+/// [`ref_moved`] for the loop's `MainRefMoved` arm; see [`HealGate`].
+pub(crate) fn ref_moved_unless_unchanged(want_main_sync: &mut bool, active: &std::path::Path) {
+    let print = crate::diff_watch::current_print(active);
+    let ref_gen = crate::diff_watch::current_ref_generation(active);
+    if HEAL_GATE.request(active, print, ref_gen) {
+        ref_moved(want_main_sync);
+    }
+}
+
+/// Called on the loop's model tick: if a ref moved since the last heal that
+/// actually ran, request one now. O(1); no timer. Covers events whose own
+/// `MainRefMoved` the refresh throttle dropped (trailing edge <= one tick).
+pub(crate) fn ref_gen_tick(want_main_sync: &mut bool, active: &std::path::Path) {
+    let ref_gen = crate::diff_watch::current_ref_generation(active);
+    if HEAL_GATE.ref_moved_since(active, ref_gen) {
+        let print = crate::diff_watch::current_print(active);
+        *HEAL_GATE.pending.lock().unwrap_or_else(|e| e.into_inner()) = Some(PendingHeal {
+            path: active.to_path_buf(),
+            print,
+            ref_gen,
+        });
+        ref_moved(want_main_sync);
+    }
+}
+
+/// The loop spawned the heal: record what it saw.
+pub(crate) fn heal_spawned() {
+    HEAL_GATE.spawned();
 }
 
 /// Whether the branch list must be re-fetched now, or can be served from cache.
@@ -134,6 +230,44 @@ pub(crate) fn should_refetch(cached_age: Option<Duration>, ttl: Duration) -> boo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn wp(g: u64) -> Option<crate::diff_watch::WatchPrint> {
+        Some(crate::diff_watch::WatchPrint::for_test(g, 0))
+    }
+
+    #[test]
+    fn a_throttled_heal_never_suppresses_the_backstop() {
+        let gate = HealGate::new();
+        let p = std::path::Path::new("/tmp/tg-heal-gate/a");
+        // First request at print 1 is accepted...
+        assert!(gate.request(p, wp(1), Some(1)));
+        // ...but the loop's 2 s throttle dropped it: `spawned` never ran. The
+        // backstop firing at the SAME print must still be acted on.
+        assert!(gate.request(p, wp(1), Some(1)), "unmarked => still due");
+        // Once a heal really spawns, the same print is a no-op backstop...
+        gate.spawned();
+        assert!(!gate.request(p, wp(1), Some(1)));
+        // ...a moved print is acted on, and no live print never skips.
+        assert!(gate.request(p, wp(2), Some(2)));
+        gate.spawned();
+        assert!(gate.request(p, None, None));
+    }
+
+    #[test]
+    fn a_ref_move_since_the_last_spawned_heal_is_noticed_in_o1() {
+        let gate = HealGate::new();
+        let p = std::path::Path::new("/tmp/tg-heal-gate/b");
+        assert!(!gate.ref_moved_since(p, None), "no watcher: nothing to say");
+        assert!(
+            gate.ref_moved_since(p, Some(5)),
+            "never healed under a claim"
+        );
+        assert!(gate.request(p, wp(1), Some(5)));
+        assert!(gate.ref_moved_since(p, Some(5)), "accepted but not spawned");
+        gate.spawned();
+        assert!(!gate.ref_moved_since(p, Some(5)));
+        assert!(gate.ref_moved_since(p, Some(6)), "a later ref move");
+    }
 
     #[test]
     fn missing_entry_refetches() {

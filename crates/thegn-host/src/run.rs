@@ -11881,7 +11881,15 @@ async fn event_loop<T: Terminal>(
                 thegn_core::connectivity::current(),
             );
             match kind {
-                RefreshKind::Model => want_model_refresh = true,
+                RefreshKind::Model => {
+                    want_model_refresh = true;
+                    // O(1): a ref moved since the last heal that ran (its own
+                    // MainRefMoved may have been lost to the refresh throttle).
+                    crate::branch_cache::ref_gen_tick(
+                        &mut want_main_sync,
+                        &active_tab_path(&session),
+                    );
+                }
                 // The wall clock crossed a display boundary. Bars-only damage:
                 // `render_plan` turns this into a two-1-row-rect recompose, so
                 // a minute rollover never costs a chrome repaint.
@@ -12190,6 +12198,9 @@ async fn event_loop<T: Terminal>(
                 refresh_tx.clone(),
                 waker.clone(),
             );
+            // Record what the heal saw only now that it really runs (a request the
+            // throttle dropped must stay due).
+            crate::branch_cache::heal_spawned();
         }
         dirty |= want_host_heal
             && crate::handlers::host_heal::on_heal_tick(

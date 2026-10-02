@@ -80,6 +80,28 @@ pub fn expand_tilde(p: &str) -> String {
     }
 }
 
+/// `(inode, ctime in ns)` of a stat result: the part of a change fingerprint that
+/// survives a same-size, same-mtime rewrite (an atomic rename-over gets a new
+/// inode; an in-place edit moves ctime even when mtime was reset). `(0, 0)` where
+/// the platform has no such notion, which only weakens a stamp to mtime+len.
+pub fn meta_identity(meta: &std::fs::Metadata) -> (u64, i64) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        (
+            meta.ino(),
+            meta.ctime()
+                .saturating_mul(1_000_000_000)
+                .saturating_add(meta.ctime_nsec()),
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        (0, 0)
+    }
+}
+
 /// lowercase, non-alnum -> '-', collapse repeats, trim.
 /// A filesystem IDENTITY for `path`: two spellings of the same file (symlink,
 /// bind mount, `/tmp` vs `/private/tmp`, a case-insensitive mount) share it,

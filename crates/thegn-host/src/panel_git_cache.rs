@@ -20,6 +20,11 @@ use thegn_svc::git::{DiffEntry, FileStatus};
 
 use crate::diff_watch::WatchPrint;
 
+/// What a snapshot is valid for: the watcher's print for the repo AND a hash of
+/// the global layer the watcher cannot see (system/global config, global
+/// excludes file; see `git_memo::global_git_print`).
+pub(crate) type PanelKey = (WatchPrint, u64);
+
 /// The three reads a snapshot stands in for.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct GitReads {
@@ -33,29 +38,29 @@ pub(crate) struct GitReads {
 /// across rapid switching); the bound just keeps a pathological session honest.
 const CAP: usize = 8;
 
-fn cache() -> &'static Mutex<HashMap<PathBuf, (WatchPrint, GitReads)>> {
-    static CACHE: std::sync::OnceLock<Mutex<HashMap<PathBuf, (WatchPrint, GitReads)>>> =
+fn cache() -> &'static Mutex<HashMap<PathBuf, (PanelKey, GitReads)>> {
+    static CACHE: std::sync::OnceLock<Mutex<HashMap<PathBuf, (PanelKey, GitReads)>>> =
         std::sync::OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// The stored reads for `path` iff they were taken at exactly `print`.
-pub(crate) fn get(path: &Path, print: WatchPrint) -> Option<GitReads> {
+/// The stored reads for `path` iff they were taken at exactly `key`.
+pub(crate) fn get(path: &Path, key: PanelKey) -> Option<GitReads> {
     cache()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get(path)
-        .filter(|(p, _)| *p == print)
+        .filter(|(k, _)| *k == key)
         .map(|(_, r)| r.clone())
 }
 
-/// Store `reads`, taken at `print` (read BEFORE the reads ran).
-pub(crate) fn put(path: &Path, print: WatchPrint, reads: GitReads) {
+/// Store `reads`, taken at `key` (read BEFORE the reads ran).
+pub(crate) fn put(path: &Path, key: PanelKey, reads: GitReads) {
     let mut c = cache().lock().unwrap_or_else(|e| e.into_inner());
     if c.len() >= CAP && !c.contains_key(path) {
         c.clear();
     }
-    c.insert(path.to_path_buf(), (print, reads));
+    c.insert(path.to_path_buf(), (key, reads));
 }
 
 #[cfg(test)]
@@ -72,17 +77,24 @@ mod tests {
     #[test]
     fn a_snapshot_is_returned_only_for_the_exact_print() {
         let p = Path::new("/tmp/tg-panel-git-cache/a");
-        let print = WatchPrint::for_test(1, 1);
+        let print = (WatchPrint::for_test(1, 1), 7);
         assert!(get(p, print).is_none());
         put(p, print, reads(3));
         assert_eq!(get(p, print).map(|r| r.stash_count), Some(3));
         assert!(
-            get(p, WatchPrint::for_test(2, 1)).is_none(),
+            get(p, (WatchPrint::for_test(2, 1), 7)).is_none(),
             "generation moved"
         );
-        assert!(get(p, WatchPrint::for_test(1, 2)).is_none(), "in-app write");
+        assert!(
+            get(p, (WatchPrint::for_test(1, 2), 7)).is_none(),
+            "in-app write"
+        );
+        assert!(
+            get(p, (WatchPrint::for_test(1, 1), 8)).is_none(),
+            "the global layer (config / excludes) changed"
+        );
         assert!(get(Path::new("/tmp/tg-panel-git-cache/b"), print).is_none());
-        put(p, WatchPrint::for_test(2, 1), reads(4));
+        put(p, (WatchPrint::for_test(2, 1), 7), reads(4));
         assert!(get(p, print).is_none(), "overwritten by the newer print");
     }
 
@@ -91,7 +103,7 @@ mod tests {
         for i in 0..(CAP + 3) {
             put(
                 Path::new(&format!("/tmp/tg-panel-git-cache/bound{i}")),
-                WatchPrint::for_test(9, 9),
+                (WatchPrint::for_test(9, 9), 0),
                 reads(i),
             );
         }

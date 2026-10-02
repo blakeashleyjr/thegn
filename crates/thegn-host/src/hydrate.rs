@@ -2637,10 +2637,14 @@ pub(crate) fn build_panel(
     // them leaves the stored snapshot stale and the next pass re-derives it.
     // No watcher for the path (background warm, remote loc, incomplete or
     // withdrawn registration) means no print and exactly today's behaviour.
+    // The watcher covers the repo, not `$HOME`: the global layer (system/global
+    // config, the global excludes file) is folded into the key, and a layer that
+    // cannot be fingerprinted means no snapshot at all.
     let watch_print = matches!(loc, GitLoc::Local(_))
         .then(|| crate::diff_watch::current_print(cwd))
-        .flatten();
-    let cached_reads = watch_print.and_then(|p| crate::panel_git_cache::get(cwd, p));
+        .flatten()
+        .zip(thegn_core::git_memo::global_git_print());
+    let cached_reads = watch_print.and_then(|k| crate::panel_git_cache::get(cwd, k));
     let reads_ok = std::sync::atomic::AtomicBool::new(true);
 
     // Fan the independent, read-only git reads out across scoped threads: each
