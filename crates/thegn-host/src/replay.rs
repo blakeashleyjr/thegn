@@ -9,9 +9,11 @@
 //! Seeking to a time T reconstructs the pane's grid by spinning up a **fresh**
 //! [`AlacrittyEmulator`] and re-feeding the retained byte slice up to T — the
 //! same bytes through the same parser, so the grid is exact within the retained
-//! window (no [`PaneEmulator`] trait changes, no grid serialization). The ring is
-//! bounded by both a byte and a duration budget; eviction drops oldest events and
-//! any keyframe whose byte range no longer exists.
+//! window when chunks remain whole (no [`PaneEmulator`] trait changes, no grid
+//! serialization). The ring is bounded by both a logical byte and duration
+//! budget; eviction drops oldest events and any keyframe whose byte range no
+//! longer exists. The retained front is a fidelity boundary: replay does not
+//! preserve parser/grid context from before it, including when a chunk is cut.
 //!
 //! When `[replay] enabled = false` no [`Recording`] is allocated and `feed` does
 //! a single null check — recording is free when off. This is distinct from the
@@ -28,6 +30,11 @@ use crate::emulator::{AlacrittyEmulator, PaneEmulator};
 /// Scrollback the reconstruction emulator is built with. Replay re-feeds from the
 /// retained front, so this only affects how far a paused scrub can scroll up.
 const REPLAY_SCROLLBACK: usize = 10_000;
+
+/// Conservative logical charge for each retained event or keyframe slot,
+/// including fixed allocation overhead. This enforces a logical replay budget;
+/// it is not a measured RSS guarantee and does not account for Vec capacity.
+const REPLAY_ENTRY_OVERHEAD_BYTES: u64 = 64;
 
 /// The two ways the recorder bounds a pane's ring, plus the keyframe cadence.
 #[derive(Debug, Clone, Copy)]
@@ -77,6 +84,9 @@ pub struct Recording {
     /// index). Also the next sequence number to assign.
     evicted: u64,
     next_seq: u64,
+    /// Payload portion of the logical budget, tracked separately for clarity.
+    payload_bytes_used: u64,
+    /// Total logical charge: payload bytes plus event and keyframe overhead.
     bytes_used: u64,
     bytes_since_keyframe: u64,
     last_keyframe_ms: u64,
@@ -101,6 +111,7 @@ impl Recording {
             },
             evicted: 0,
             next_seq: 0,
+            payload_bytes_used: 0,
             bytes_used: 0,
             bytes_since_keyframe: 0,
             last_keyframe_ms: 0,
@@ -127,17 +138,41 @@ impl Recording {
         if bytes.is_empty() {
             return;
         }
+        // A truncated incoming chunk is the same fidelity boundary as evicting
+        // older output: reconstruction starts mid-stream and cannot restore
+        // parser/grid context from before it. Keep the newest suffix that can
+        // fit beside this event and any due keyframe marker's logical overhead.
         let at_ms = self.elapsed_ms(now);
+        let incoming_len = bytes.len() as u64;
+        let marker_due = self.keyframes.is_empty()
+            || at_ms.saturating_sub(self.last_keyframe_ms) >= self.budget.keyframe_interval_ms
+            || self.bytes_since_keyframe.saturating_add(incoming_len)
+                >= self.budget.keyframe_interval_bytes;
+        let overhead = REPLAY_ENTRY_OVERHEAD_BYTES.saturating_mul(if marker_due { 2 } else { 1 });
+        let max_payload = self
+            .budget
+            .max_bytes
+            .saturating_sub(overhead)
+            .min(usize::MAX as u64) as usize;
+        let bytes = &bytes[bytes.len().saturating_sub(max_payload)..];
+        if bytes.is_empty() {
+            return;
+        }
         let seq = self.next_seq;
         self.next_seq += 1;
-        self.bytes_used += bytes.len() as u64;
-        self.bytes_since_keyframe += bytes.len() as u64;
+        let payload_len = bytes.len() as u64;
+        self.payload_bytes_used = self.payload_bytes_used.saturating_add(payload_len);
+        self.bytes_used = self
+            .bytes_used
+            .saturating_add(REPLAY_ENTRY_OVERHEAD_BYTES)
+            .saturating_add(payload_len);
+        self.bytes_since_keyframe = self.bytes_since_keyframe.saturating_add(payload_len);
         self.events.push_back(Event {
             seq,
             at_ms,
             kind: EventKind::Bytes(bytes.into()),
         });
-        self.maybe_keyframe(at_ms, seq);
+        self.maybe_keyframe(at_ms, seq, marker_due);
         self.evict(at_ms);
     }
 
@@ -152,18 +187,17 @@ impl Recording {
             at_ms,
             kind: EventKind::Resize { rows, cols },
         });
+        self.bytes_used = self.bytes_used.saturating_add(REPLAY_ENTRY_OVERHEAD_BYTES);
         self.evict(at_ms);
     }
 
-    fn maybe_keyframe(&mut self, at_ms: u64, seq: u64) {
-        let due_time = self.keyframes.is_empty()
-            || at_ms.saturating_sub(self.last_keyframe_ms) >= self.budget.keyframe_interval_ms;
-        let due_bytes = self.bytes_since_keyframe >= self.budget.keyframe_interval_bytes;
-        if due_time || due_bytes {
+    fn maybe_keyframe(&mut self, at_ms: u64, seq: u64, due: bool) {
+        if due {
             self.keyframes.push(Keyframe {
                 at_ms,
                 event_seq: seq,
             });
+            self.bytes_used = self.bytes_used.saturating_add(REPLAY_ENTRY_OVERHEAD_BYTES);
             self.last_keyframe_ms = at_ms;
             self.bytes_since_keyframe = 0;
         }
@@ -171,14 +205,12 @@ impl Recording {
 
     /// Evict oldest events until both budgets are satisfied, then drop any
     /// keyframe whose event fell off the front (its byte range no longer exists).
-    /// Never evicts the last remaining event.
     fn evict(&mut self, now_ms: u64) {
         loop {
-            if self.events.len() <= 1 {
-                break;
-            }
             let over_bytes = self.bytes_used > self.budget.max_bytes;
-            let front_ms = self.events.front().map(|e| e.at_ms).unwrap_or(0);
+            let Some(front_ms) = self.events.front().map(|e| e.at_ms) else {
+                break;
+            };
             let over_time = self.budget.max_duration_ms > 0
                 && now_ms.saturating_sub(front_ms) > self.budget.max_duration_ms;
             if !over_bytes && !over_time {
@@ -187,11 +219,19 @@ impl Recording {
             if let Some(ev) = self.events.pop_front() {
                 match ev.kind {
                     EventKind::Bytes(b) => {
-                        self.bytes_used = self.bytes_used.saturating_sub(b.len() as u64);
+                        let payload_len = b.len() as u64;
+                        self.payload_bytes_used =
+                            self.payload_bytes_used.saturating_sub(payload_len);
+                        self.bytes_used = self
+                            .bytes_used
+                            .saturating_sub(REPLAY_ENTRY_OVERHEAD_BYTES)
+                            .saturating_sub(payload_len);
                     }
                     // The evicted resize is now the baseline geometry a
                     // reconstruction starts from.
                     EventKind::Resize { rows, cols } => {
+                        self.bytes_used =
+                            self.bytes_used.saturating_sub(REPLAY_ENTRY_OVERHEAD_BYTES);
                         self.base_rows = rows.max(1);
                         self.base_cols = cols.max(1);
                     }
@@ -202,7 +242,12 @@ impl Recording {
         // Drop keyframes orphaned by eviction (their event is gone).
         if self.evicted > 0 {
             let floor = self.evicted;
+            let keyframes_before = self.keyframes.len();
             self.keyframes.retain(|k| k.event_seq >= floor);
+            let removed = keyframes_before - self.keyframes.len();
+            self.bytes_used = self
+                .bytes_used
+                .saturating_sub((removed as u64).saturating_mul(REPLAY_ENTRY_OVERHEAD_BYTES));
         }
     }
 
@@ -477,10 +522,25 @@ mod tests {
 
     fn small_budget_cfg() -> ReplayConfig {
         ReplayConfig {
-            max_bytes_per_pane: 64,
+            max_bytes_per_pane: 256,
             keyframe_interval_bytes: 16,
             ..ReplayConfig::default()
         }
+    }
+
+    fn replay_cfg(max_bytes_per_pane: u64) -> ReplayConfig {
+        ReplayConfig {
+            max_bytes_per_pane,
+            max_duration_secs: 0,
+            keyframe_interval_ms: u64::MAX,
+            keyframe_interval_bytes: u64::MAX,
+            ..ReplayConfig::default()
+        }
+    }
+
+    fn expected_logical_charge(rec: &Recording) -> u64 {
+        rec.payload_bytes_used
+            + (rec.events.len() as u64 + rec.keyframes.len() as u64) * REPLAY_ENTRY_OVERHEAD_BYTES
     }
 
     #[test]
@@ -578,7 +638,7 @@ mod tests {
     fn budget_eviction_drops_oldest_and_orphaned_keyframes() {
         let mut rec = Recording::from_config(&small_budget_cfg(), 24, 80);
         let epoch = rec.epoch;
-        // Push well past the 64-byte budget in 16-byte chunks.
+        // Push well past the 256-byte budget in 16-byte chunks.
         for i in 0..20u64 {
             let chunk = [b'x'; 16];
             rec.push_bytes(&chunk, epoch + Duration::from_millis(i + 1));
@@ -587,6 +647,7 @@ mod tests {
             rec.bytes_used <= rec.budget.max_bytes,
             "byte budget enforced"
         );
+        assert_eq!(rec.bytes_used, expected_logical_charge(&rec));
         assert!(rec.evicted > 0, "some events evicted");
         // Every surviving keyframe must still point at a retained event.
         for k in &rec.keyframes {
@@ -595,6 +656,93 @@ mod tests {
                 "orphaned keyframe survived eviction"
             );
         }
+    }
+
+    #[test]
+    fn resize_flood_is_charged_even_at_one_timestamp() {
+        let mut rec = Recording::from_config(&replay_cfg(512), 24, 80);
+        let epoch = rec.epoch;
+        for i in 0..1000 {
+            rec.record_resize(10 + (i % 10) as u16, 40, epoch);
+            assert!(rec.bytes_used <= rec.budget.max_bytes);
+            assert_eq!(rec.bytes_used, expected_logical_charge(&rec));
+        }
+        assert!(rec.evicted > 0, "resize-only events consume the budget");
+        assert!(rec.events.len() <= 512 / REPLAY_ENTRY_OVERHEAD_BYTES as usize);
+        assert_eq!(rec.payload_bytes_used, 0);
+    }
+
+    #[test]
+    fn oversized_chunk_keeps_its_newest_suffix_within_budget() {
+        let mut rec = Recording::from_config(&replay_cfg(256), 24, 80);
+        let epoch = rec.epoch;
+        let chunk: Vec<u8> = (0..600).map(|n| (n % 251) as u8).collect();
+        rec.push_bytes(&chunk, epoch);
+
+        let retained = rec.events.back().expect("suffix retained");
+        let EventKind::Bytes(retained) = &retained.kind else {
+            panic!("byte event retained");
+        };
+        let payload_budget = 256 - 2 * REPLAY_ENTRY_OVERHEAD_BYTES as usize;
+        assert_eq!(retained.as_ref(), &chunk[chunk.len() - payload_budget..]);
+        assert_eq!(rec.payload_bytes_used, payload_budget as u64);
+        assert!(rec.bytes_used <= rec.budget.max_bytes);
+        assert_eq!(rec.bytes_used, expected_logical_charge(&rec));
+    }
+
+    #[test]
+    fn keyframe_markers_are_charged_and_released_with_their_events() {
+        let mut rec = Recording::from_config(
+            &ReplayConfig {
+                keyframe_interval_bytes: 1,
+                ..replay_cfg(512)
+            },
+            24,
+            80,
+        );
+        let epoch = rec.epoch;
+        rec.push_bytes(b"x", epoch);
+        assert_eq!(rec.keyframes.len(), 1);
+        assert_eq!(
+            rec.bytes_used,
+            1 + 2 * REPLAY_ENTRY_OVERHEAD_BYTES,
+            "one event and its marker each carry overhead"
+        );
+
+        rec.budget.max_bytes = 0;
+        rec.evict(0);
+        assert!(rec.events.is_empty());
+        assert!(rec.keyframes.is_empty());
+        assert_eq!(rec.payload_bytes_used, 0);
+        assert_eq!(rec.bytes_used, 0);
+    }
+
+    #[test]
+    fn event_is_evicted_when_even_its_overhead_cannot_fit() {
+        let mut rec = Recording::from_config(&replay_cfg(0), 24, 80);
+        let epoch = rec.epoch;
+        rec.record_resize(10, 40, epoch);
+        assert!(rec.is_empty(), "zero-byte budget may retain no event");
+        assert_eq!(rec.bytes_used, 0);
+        assert_eq!(rec.evicted, 1);
+    }
+
+    #[test]
+    fn zero_duration_disables_time_eviction_but_not_byte_accounting() {
+        let mut rec = Recording::from_config(
+            &ReplayConfig {
+                max_duration_secs: 0,
+                ..replay_cfg(1024)
+            },
+            24,
+            80,
+        );
+        let epoch = rec.epoch;
+        rec.record_resize(10, 40, epoch);
+        rec.record_resize(20, 80, epoch + Duration::from_secs(10_000));
+        assert_eq!(rec.evicted, 0);
+        assert_eq!(rec.events.len(), 2);
+        assert_eq!(rec.bytes_used, 2 * REPLAY_ENTRY_OVERHEAD_BYTES);
     }
 
     #[test]
