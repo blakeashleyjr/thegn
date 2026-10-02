@@ -3,8 +3,9 @@
 use std::collections::BinaryHeap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, mpsc};
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 use notify::{Event, EventKind, RecursiveMode, Watcher, recommended_watcher};
@@ -40,6 +41,7 @@ enum Request {
 enum Work {
     Request(Box<Request>),
     Changed,
+    Shutdown,
 }
 
 #[derive(Debug)]
@@ -54,31 +56,81 @@ pub(crate) enum ThemeStoreResult {
 }
 
 pub(crate) struct ThemeStore {
-    request: mpsc::Sender<Work>,
+    request: Option<mpsc::Sender<Work>>,
     results: tokio_mpsc::UnboundedReceiver<ThemeStoreResult>,
+    shutdown: Arc<AtomicBool>,
+    worker: Option<JoinHandle<()>>,
 }
 
 impl ThemeStore {
     pub(crate) fn spawn(waker: TerminalWaker, config_path: PathBuf) -> Self {
+        let themes_dir = thegn_core::util::xdg_config_home().join("thegn/themes");
+        Self::start(Some(waker), themes_dir, config_path)
+    }
+
+    fn start(waker: Option<TerminalWaker>, themes_dir: PathBuf, config_path: PathBuf) -> Self {
         let (request, request_rx) = mpsc::channel();
         let (result_tx, results) = tokio_mpsc::unbounded_channel();
-        let themes_dir = thegn_core::util::xdg_config_home().join("thegn/themes");
+        let shutdown = Arc::new(AtomicBool::new(false));
         let watcher_tx = request.clone();
-        std::thread::Builder::new()
+        let worker_shutdown = Arc::clone(&shutdown);
+        let worker = std::thread::Builder::new()
             .name("theme-store".into())
             .spawn(move || {
                 crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
                 worker(
                     request_rx,
                     result_tx,
-                    Some(waker),
+                    waker,
                     themes_dir,
                     config_path,
                     watcher_tx,
+                    worker_shutdown,
                 )
-            })
-            .expect("theme store worker thread");
-        Self { request, results }
+            });
+        Self::from_worker_spawn(worker, request, results, shutdown)
+    }
+
+    fn from_worker_spawn(
+        worker: std::io::Result<JoinHandle<()>>,
+        request: mpsc::Sender<Work>,
+        results: tokio_mpsc::UnboundedReceiver<ThemeStoreResult>,
+        shutdown: Arc<AtomicBool>,
+    ) -> Self {
+        match worker {
+            Ok(worker) => Self::new_running(request, results, shutdown, worker),
+            Err(error) => {
+                tracing::warn!(target: "thegn::theme", error = %error, "theme store worker unavailable");
+                drop(request);
+                Self::new_degraded(results, shutdown)
+            }
+        }
+    }
+
+    fn new_running(
+        request: mpsc::Sender<Work>,
+        results: tokio_mpsc::UnboundedReceiver<ThemeStoreResult>,
+        shutdown: Arc<AtomicBool>,
+        worker: JoinHandle<()>,
+    ) -> Self {
+        Self {
+            request: Some(request),
+            results,
+            shutdown,
+            worker: Some(worker),
+        }
+    }
+
+    fn new_degraded(
+        results: tokio_mpsc::UnboundedReceiver<ThemeStoreResult>,
+        shutdown: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            request: None,
+            results,
+            shutdown,
+            worker: None,
+        }
     }
 
     pub(crate) fn scan(&self) -> Result<(), String> {
@@ -129,8 +181,27 @@ impl ThemeStore {
 
     fn send(&self, request: Request) -> Result<(), String> {
         self.request
+            .as_ref()
+            .ok_or_else(|| "theme store worker is unavailable".to_string())?
             .send(Work::Request(Box::new(request)))
             .map_err(|_| "theme store worker is unavailable".to_string())
+    }
+}
+
+impl Drop for ThemeStore {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Release);
+        if let Some(request) = &self.request {
+            // best-effort: worker may already have exited; the flag alone ends it
+            let _ = request.send(Work::Shutdown);
+        }
+        if let Some(worker) = self.worker.take() {
+            // Shutdown completes after the current filesystem operation and
+            // every user mutation accepted before Drop; watcher work is dropped.
+            if worker.join().is_err() {
+                tracing::warn!(target: "thegn::theme", "theme store worker panicked");
+            }
+        }
     }
 }
 
@@ -141,11 +212,16 @@ fn worker(
     themes_dir: PathBuf,
     config_path: PathBuf,
     watcher_tx: mpsc::Sender<Work>,
+    shutdown: Arc<AtomicBool>,
 ) {
     if let Err(error) = std::fs::create_dir_all(&themes_dir) {
         tracing::warn!(target: "thegn::theme", error = %error, "theme directory unavailable");
     }
-    let mut watcher = recommended_watcher(move |result: notify::Result<Event>| {
+    let watcher_shutdown = Arc::clone(&shutdown);
+    let watcher_result = recommended_watcher(move |result: notify::Result<Event>| {
+        if watcher_shutdown.load(Ordering::Acquire) {
+            return;
+        }
         if result.is_ok_and(|event| {
             matches!(
                 event.kind,
@@ -154,14 +230,35 @@ fn worker(
         }) {
             let _ = watcher_tx.send(Work::Changed);
         }
-    })
-    .ok();
-    if let Some(w) = watcher.as_mut() {
-        let _ = w.watch(&themes_dir, RecursiveMode::NonRecursive);
+    });
+    let mut watcher = match watcher_result {
+        Ok(watcher) => Some(watcher),
+        Err(error) => {
+            tracing::warn!(target: "thegn::theme", error = %error, "theme watcher unavailable");
+            None
+        }
+    };
+    if let Some(w) = watcher.as_mut()
+        && let Err(error) = w.watch(&themes_dir, RecursiveMode::NonRecursive)
+    {
+        tracing::warn!(target: "thegn::theme", error = %error, "theme directory watch unavailable");
     }
 
     publish_catalog(&themes_dir, &result_tx, waker.as_ref());
-    while let Ok(work) = request_rx.recv() {
+    'run: while let Ok(work) = request_rx.recv() {
+        if shutdown.load(Ordering::Acquire) {
+            finish_shutdown(
+                Some(work),
+                Vec::new(),
+                &mut watcher,
+                &request_rx,
+                &themes_dir,
+                &config_path,
+                &result_tx,
+                waker.as_ref(),
+            );
+            break;
+        }
         match work {
             Work::Changed => {
                 // Only watcher notifications are coalesced. User requests are
@@ -172,15 +269,56 @@ fn worker(
                 while let Some(remaining) =
                     deadline.checked_duration_since(std::time::Instant::now())
                 {
+                    if shutdown.load(Ordering::Acquire) {
+                        finish_shutdown(
+                            None,
+                            deferred,
+                            &mut watcher,
+                            &request_rx,
+                            &themes_dir,
+                            &config_path,
+                            &result_tx,
+                            waker.as_ref(),
+                        );
+                        break 'run;
+                    }
                     match request_rx.recv_timeout(remaining) {
                         Ok(Work::Changed) => {}
+                        Ok(Work::Shutdown) => {}
                         Ok(request) => deferred.push(request),
                         Err(mpsc::RecvTimeoutError::Timeout) => break,
                         Err(mpsc::RecvTimeoutError::Disconnected) => break,
                     }
                 }
+                if shutdown.load(Ordering::Acquire) {
+                    finish_shutdown(
+                        None,
+                        deferred,
+                        &mut watcher,
+                        &request_rx,
+                        &themes_dir,
+                        &config_path,
+                        &result_tx,
+                        waker.as_ref(),
+                    );
+                    break 'run;
+                }
                 publish_catalog(&themes_dir, &result_tx, waker.as_ref());
-                for request in deferred {
+                let mut deferred = deferred.into_iter();
+                while let Some(request) = deferred.next() {
+                    if shutdown.load(Ordering::Acquire) {
+                        finish_shutdown(
+                            Some(request),
+                            deferred.collect(),
+                            &mut watcher,
+                            &request_rx,
+                            &themes_dir,
+                            &config_path,
+                            &result_tx,
+                            waker.as_ref(),
+                        );
+                        break 'run;
+                    }
                     process_request(
                         request,
                         &themes_dir,
@@ -197,8 +335,68 @@ fn worker(
                 &result_tx,
                 waker.as_ref(),
             ),
+            Work::Shutdown => {
+                finish_shutdown(
+                    None,
+                    Vec::new(),
+                    &mut watcher,
+                    &request_rx,
+                    &themes_dir,
+                    &config_path,
+                    &result_tx,
+                    waker.as_ref(),
+                );
+                break;
+            }
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_shutdown(
+    first: Option<Work>,
+    deferred: Vec<Work>,
+    watcher: &mut Option<notify::RecommendedWatcher>,
+    request_rx: &mpsc::Receiver<Work>,
+    themes_dir: &Path,
+    config_path: &Path,
+    result_tx: &tokio_mpsc::UnboundedSender<ThemeStoreResult>,
+    waker: Option<&TerminalWaker>,
+) {
+    // Stop notifications before draining, so an event storm cannot keep the
+    // queue nonempty. Accepted user mutations remain lossless through shutdown.
+    drop(watcher.take());
+    if let Some(work) = first {
+        process_shutdown_work(work, themes_dir, config_path, result_tx, waker);
+    }
+    for work in deferred {
+        process_shutdown_work(work, themes_dir, config_path, result_tx, waker);
+    }
+    while let Ok(work) = request_rx.try_recv() {
+        process_shutdown_work(work, themes_dir, config_path, result_tx, waker);
+    }
+}
+
+fn process_shutdown_work(
+    work: Work,
+    themes_dir: &Path,
+    config_path: &Path,
+    result_tx: &tokio_mpsc::UnboundedSender<ThemeStoreResult>,
+    waker: Option<&TerminalWaker>,
+) {
+    let Work::Request(request) = work else {
+        return;
+    };
+    if matches!(request.as_ref(), Request::Scan) {
+        return;
+    }
+    process_request(
+        Work::Request(request),
+        themes_dir,
+        config_path,
+        result_tx,
+        waker,
+    );
 }
 
 fn process_request(
@@ -603,6 +801,8 @@ mod tests {
         let (request_tx, request_rx) = mpsc::channel();
         let (watcher_tx, _watcher_rx) = mpsc::channel();
         let (result_tx, mut result_rx) = tokio_mpsc::unbounded_channel();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let worker_shutdown = Arc::clone(&shutdown);
         let saved = theme("saved");
         let applied = theme("applied");
         let worker = std::thread::spawn(move || {
@@ -613,6 +813,7 @@ mod tests {
                 themes_dir,
                 config_path,
                 watcher_tx,
+                worker_shutdown,
             );
         });
         request_tx.send(Work::Changed).unwrap();
@@ -764,11 +965,89 @@ mod tests {
         let (request, request_rx) = mpsc::channel();
         drop(request_rx);
         let (_result_tx, results) = tokio_mpsc::unbounded_channel();
-        let store = ThemeStore { request, results };
+        let store = ThemeStore {
+            request: Some(request),
+            results,
+            shutdown: Arc::new(AtomicBool::new(false)),
+            worker: None,
+        };
 
         assert_eq!(
             store.save(theme("unavailable")).unwrap_err(),
             "theme store worker is unavailable"
         );
+    }
+
+    fn drop_with_timeout(store: ThemeStore) {
+        let (done_tx, done_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            drop(store);
+            let _ = done_tx.send(());
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("theme store did not stop within three seconds");
+    }
+
+    #[test]
+    fn dropping_store_joins_worker_and_releases_watcher() {
+        let dir = temp_dir("drop-joins");
+        for cycle in 0..8 {
+            let themes = dir.join(format!("themes-{cycle}"));
+            let store = ThemeStore::start(None, themes, dir.join("config.toml"));
+            let probe = store.request.clone().unwrap();
+            drop_with_timeout(store);
+            // The worker owns the only receiver; a failed send proves it exited.
+            assert!(probe.send(Work::Changed).is_err());
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn shutdown_discards_a_large_watcher_backlog() {
+        let dir = temp_dir("drop-backlog");
+        let themes = dir.join("themes");
+        let store = ThemeStore::start(None, themes, dir.join("config.toml"));
+        for _ in 0..50_000 {
+            store.request.as_ref().unwrap().send(Work::Changed).unwrap();
+        }
+        drop_with_timeout(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn accepted_save_is_written_before_shutdown_returns() {
+        let dir = temp_dir("drop-save");
+        let themes = dir.join("themes");
+        let store = ThemeStore::start(None, themes.clone(), dir.join("config.toml"));
+        store.save(theme("saved-at-shutdown")).unwrap();
+        drop_with_timeout(store);
+        assert!(themes.join("saved-at-shutdown.toml").is_file());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn failed_worker_start_degrades_without_hanging_startup_catalog() {
+        let (request, _request_rx) = mpsc::channel();
+        let (result_tx, results) = tokio_mpsc::unbounded_channel();
+        drop(result_tx);
+        let store = ThemeStore::from_worker_spawn(
+            Err(std::io::Error::other("simulated spawn failure")),
+            request,
+            results,
+            Arc::new(AtomicBool::new(false)),
+        );
+        assert_eq!(
+            store.save(theme("unavailable")).unwrap_err(),
+            "theme store worker is unavailable"
+        );
+
+        let mut store = store;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let (themes, warnings) = runtime.block_on(store.initial_catalog());
+        assert!(themes.is_empty());
+        assert!(warnings.iter().any(|warning| warning.contains("stopped")));
     }
 }

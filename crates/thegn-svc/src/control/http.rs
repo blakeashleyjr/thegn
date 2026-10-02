@@ -1202,11 +1202,32 @@ pub(super) async fn create_worktree(
     }
 }
 
+/// `folders.assign` (git scope): assign or clear a worktree's repo-local
+/// sidebar folder.
+pub(super) async fn assign_worktree_folder(
+    State(state): State<ControlState>,
+    headers: HeaderMap,
+    body: axum::Json<super::FolderAssignReq>,
+) -> Response {
+    if let Err(r) = authed(&state, &headers, Verb::FolderAssign) {
+        return r;
+    }
+    if let Err(e) = body.0.action() {
+        return e.into_response();
+    }
+    match state.api.folder_assign(body.0).await {
+        Ok(()) => axum::Json(json!({"ok": true})).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
 // ── agent orchestration: issues (THE-57) ─────────────────────────────────────
 
 /// Query params for `issues.list` — a subset of `IssueFilter` a supervisor
-/// filters a batch by. Statuses is a comma-separated list of the snake_case
-/// status ids (`todo,in_progress`); unknown names are dropped.
+/// filters a batch by, plus optional repo context. Statuses is a
+/// comma-separated list of the snake_case status ids (`todo,in_progress`);
+/// unknown names are dropped. `repo`, when present, applies that repository's
+/// `[issues]` overlay (a filesystem path on the daemon host).
 #[derive(Deserialize, schemars::JsonSchema)]
 pub struct IssuesQuery {
     #[serde(default)]
@@ -1217,6 +1238,19 @@ pub struct IssuesQuery {
     project: Option<String>,
     #[serde(default)]
     query: Option<String>,
+    /// Filesystem path on the daemon host used to apply a repo's `[issues]` overlay.
+    #[serde(default)]
+    repo: Option<String>,
+}
+
+/// Repo context alone, for `issues.get` / `update` / `comment` — they take no
+/// status/limit/project/query filters, so those must not even parse.
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct IssueRepoQuery {
+    /// Filesystem path on the daemon host used to apply a repo's `[issues]` overlay.
+    #[serde(default)]
+    repo: Option<String>,
 }
 
 /// Parse a comma-separated status list into `IssueStatus`es (unknowns dropped).
@@ -1253,7 +1287,7 @@ pub(super) async fn issues_list(
         limit: q.limit.unwrap_or(0),
         ..Default::default()
     };
-    match state.api.issues_list(&filter).await {
+    match state.api.issues_list(&filter, q.repo.as_deref()).await {
         Ok(issues) => axum::Json(json!({ "issues": issues })).into_response(),
         Err(e) => e.into_response(),
     }
@@ -1263,6 +1297,7 @@ pub(super) async fn issue_get(
     State(state): State<ControlState>,
     headers: HeaderMap,
     Path(id): Path<String>,
+    Query(q): Query<IssueRepoQuery>,
 ) -> Response {
     if let Err(r) = authed(&state, &headers, Verb::IssuesGet) {
         return r;
@@ -1270,7 +1305,7 @@ pub(super) async fn issue_get(
     if let Err(error) = crate::issue::validate_control_issue_id(&id) {
         return ControlError::InvalidArgument(error.to_string()).into_response();
     }
-    match state.api.issues_get(&id).await {
+    match state.api.issues_get(&id, q.repo.as_deref()).await {
         Ok(detail) => axum::Json(detail).into_response(),
         Err(e) => e.into_response(),
     }
@@ -1280,6 +1315,7 @@ pub(super) async fn issue_update(
     State(state): State<ControlState>,
     headers: HeaderMap,
     Path(id): Path<String>,
+    Query(q): Query<IssueRepoQuery>,
     body: axum::Json<thegn_core::issue::IssuePatch>,
 ) -> Response {
     if let Err(r) = authed(&state, &headers, Verb::IssuesUpdate) {
@@ -1288,7 +1324,11 @@ pub(super) async fn issue_update(
     if let Err(error) = crate::issue::validate_control_issue_id(&id) {
         return ControlError::InvalidArgument(error.to_string()).into_response();
     }
-    match state.api.issues_update(&id, &body.0).await {
+    match state
+        .api
+        .issues_update(&id, &body.0, q.repo.as_deref())
+        .await
+    {
         Ok(issue) => axum::Json(issue).into_response(),
         Err(e) => e.into_response(),
     }
@@ -1303,6 +1343,7 @@ pub(super) async fn issue_comment(
     State(state): State<ControlState>,
     headers: HeaderMap,
     Path(id): Path<String>,
+    Query(q): Query<IssueRepoQuery>,
     body: axum::Json<CommentBody>,
 ) -> Response {
     if let Err(r) = authed(&state, &headers, Verb::IssuesComment) {
@@ -1311,7 +1352,11 @@ pub(super) async fn issue_comment(
     if let Err(error) = crate::issue::validate_control_issue_id(&id) {
         return ControlError::InvalidArgument(error.to_string()).into_response();
     }
-    match state.api.issues_comment(&id, &body.0.body).await {
+    match state
+        .api
+        .issues_comment(&id, &body.0.body, q.repo.as_deref())
+        .await
+    {
         Ok(()) => axum::Json(json!({ "commented": id })).into_response(),
         Err(e) => e.into_response(),
     }

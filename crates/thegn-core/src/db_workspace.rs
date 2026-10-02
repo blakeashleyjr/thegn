@@ -738,14 +738,38 @@ impl WorkspaceStore for Db {
     /// (case-insensitive, trimmed) and return its id, creating it if absent.
     /// This is the find-or-create primitive behind the "file worktree into
     /// folder" actions, so repeated firing never spawns duplicate folders.
-    fn ensure_folder(&self, repo_path: &str, name: &str) -> Result<i64> {
+    fn ensure_folder(
+        &self,
+        repo_path: &str,
+        name: &str,
+        workspace_name: &str,
+        workspace_kind: &str,
+    ) -> Result<i64> {
         let want = name.trim();
-        for f in self.folders_for_workspace(repo_path)? {
-            if f.name.trim().eq_ignore_ascii_case(want) {
-                return Ok(f.folder_id);
+        self.transaction(|db| {
+            // A failed tombstone read propagates through `?`: uncertainty must
+            // never be treated as permission to resurrect a removed workspace.
+            if db.workspace_tombstoned(repo_path)? {
+                return Err(crate::store::WorkspaceTombstonedError {
+                    repo_path: repo_path.to_string(),
+                }
+                .into());
             }
-        }
-        self.create_folder(repo_path, want)
+            // Insert-if-absent: folder bookkeeping must never modify an
+            // existing workspace row (name, kind, position, last_active).
+            db.conn().execute(
+                r#"INSERT INTO workspaces(repo_path,name,created_at,last_active,kind,position)
+                   VALUES(?1,?2,?3,?3,?4,(SELECT COALESCE(MAX(position),-1)+1 FROM workspaces))
+                   ON CONFLICT(repo_path) DO NOTHING"#,
+                params![repo_path, workspace_name, util::now(), workspace_kind],
+            )?;
+            for folder in db.folders_for_workspace(repo_path)? {
+                if folder.name.trim().eq_ignore_ascii_case(want) {
+                    return Ok(folder.folder_id);
+                }
+            }
+            db.create_folder(repo_path, want)
+        })
     }
 
     /// File (or unfile, with `None`) a single worktree into a folder.

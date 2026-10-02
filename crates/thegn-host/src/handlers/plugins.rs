@@ -1323,6 +1323,21 @@ mod tests {
     }
 
     #[test]
+    fn folder_assignment_needs_the_git_scope_for_plugins() {
+        let bare = seg_spec("p");
+        let err = host_call_check(&bare, "folders.assign").unwrap_err();
+        assert_eq!(err.code, RpcErrorCode::Denied);
+        assert!(err.message.contains("Git"), "{err:?}");
+        let git = spec("p", Vec::new(), vec![Scope::Git]);
+        let read = spec("p", Vec::new(), vec![Scope::Read, Scope::Write]);
+        assert_eq!(
+            host_call_check(&read, "folders.assign").unwrap_err().code,
+            RpcErrorCode::Denied
+        );
+        assert!(host_call_check(&git, "folders.assign").is_ok());
+    }
+
+    #[test]
     fn scope_check_denies_dispatches_and_flags_unknown_caps() {
         // No scopes → Denied.
         let bare = seg_spec("p");

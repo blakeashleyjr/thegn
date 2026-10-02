@@ -81,6 +81,9 @@ pub static ROUTES: &[Route] = &[
     route("/v1/worktrees/open", &["worktrees.open"], || {
         post(http::open_worktree)
     }),
+    route("/v1/worktrees/folder", &["folders.assign"], || {
+        post(http::assign_worktree_folder)
+    }),
     route("/v1/editor/open", &["editor.open"], || {
         post(http::open_editor)
     }),
@@ -182,6 +185,7 @@ pub static API_CALLS: &[(&str, &str, &str)] = &[
     ("leases.list", "GET", "/v1/leases"),
     ("worktrees.list", "GET", "/v1/worktrees"),
     ("worktrees.create", "POST", "/v1/worktrees"),
+    ("folders.assign", "POST", "/v1/worktrees/folder"),
     ("worktrees.open", "POST", "/v1/worktrees/open"),
     ("skills.list", "GET", "/v1/skills"),
     ("editor.open", "POST", "/v1/editor/open"),
