@@ -2060,7 +2060,15 @@ fn ensure_folder_preserves_existing_workspace_kind_and_position() {
 
     let workspace = db.workspaces().unwrap().pop().unwrap();
     assert_eq!(workspace.kind, "dir");
-    assert_eq!(workspace.position, 17);
+    let position: i64 = db
+        .conn()
+        .query_row(
+            "SELECT position FROM workspaces WHERE repo_path='/x/app'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(position, 17);
 }
 
 #[test]
