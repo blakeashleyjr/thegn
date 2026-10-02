@@ -346,19 +346,16 @@ fn default_folder_config_and_env_precedence() {
 }
 
 #[test]
-fn default_folder_env_preserves_an_explicit_empty_value_for_validation() {
+fn default_folder_env_blank_means_unset_like_every_env_key() {
+    // Env layer semantics: a blank value is "unset" for every THEGN_* key, so
+    // it falls through to the file/default rather than reaching validation.
     let env = map_env(&[("THEGN_DEFAULT_FOLDER", "  ")]);
-    let mut cfg = Config::default();
+    let mut cfg = Config {
+        default_folder: Some("From file".into()),
+        ..Config::default()
+    };
     env_overlay(&env).apply(&mut cfg);
-    assert_eq!(cfg.default_folder.as_deref(), Some("  "));
-    assert!(
-        crate::config_validate::typed_semantic_errors(
-            &cfg,
-            crate::config_validate::SemanticMode::AllDiagnostics
-        )
-        .iter()
-        .any(|error| error.contains("default_folder"))
-    );
+    assert_eq!(cfg.default_folder.as_deref(), Some("From file"));
 }
 
 #[test]

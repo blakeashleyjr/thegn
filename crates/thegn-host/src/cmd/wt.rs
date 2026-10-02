@@ -1101,6 +1101,7 @@ mod folder_tests {
         check_folder_fileable, clear_folder_if_registered, create_and_register, effective_folder,
         file_registered_worktree, register_and_file_worktree, validate_folder_name,
     };
+    use thegn_core::config::Config;
     use thegn_core::db::Db;
     use thegn_core::store::WorkspaceStore;
 
@@ -1123,13 +1124,7 @@ mod folder_tests {
             &["config", "commit.gpgsign", "false"],
             &["commit", "--allow-empty", "-q", "-m", "init"],
         ] {
-            assert!(
-                thegn_core::util::git_cmd(&repo)
-                    .args(args)
-                    .status()
-                    .unwrap()
-                    .success()
-            );
+            assert!(thegn_core::util::git_ok(&repo, args));
         }
         repo
     }
@@ -1221,9 +1216,11 @@ mod folder_tests {
             .unwrap();
         db.put_workspace(&second_repo.to_string_lossy(), "second", "repo")
             .unwrap();
-        let mut cfg = Config::default();
-        cfg.default_folder = Some("Agents".into());
-        cfg.worktrees_dir = scratch.join("checkouts").to_string_lossy().into_owned();
+        let cfg = Config {
+            default_folder: Some("Agents".into()),
+            worktrees_dir: scratch.join("checkouts").to_string_lossy().into_owned(),
+            ..Config::default()
+        };
 
         let create = |root: &std::path::Path, branch: &str, folder: Option<&str>| {
             create_and_register(&cfg, root, branch, "main", None, folder, &db).unwrap()
