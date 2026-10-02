@@ -2661,21 +2661,21 @@ pub(crate) fn build_panel(
             let _cpu = crate::perf::measure(crate::perf::Subsys::HydrateChild);
             crate::git_handle::get().ahead_behind(&loc).map_err(|_| ())
         });
-        let h_merge = s.spawn(|| {
-            let _cpu = crate::perf::measure(crate::perf::Subsys::HydrateChild);
-            crate::git_handle::get().merge_state(&loc).map_err(|_| ())
-        });
         // While a merge/rebase is live, the working tree/index carries the whole
         // incoming diff staged, so the changes list is dominated by files the
         // *merge* brings in, not the user's own edits. Compute the incoming path
         // set (files that differ on the incoming side since the merge base:
         // `git diff HEAD...<HEAD-ref>`) so `build_change_rows` can tag and group
-        // them apart. Empty (and near-free) outside a merge.
-        let h_incoming = s.spawn(|| {
+        // them apart. Empty (and near-free) outside a merge. One `merge_state`
+        // probe feeds both the banner and the incoming set (THE-718: it used to
+        // run twice per hydration).
+        let h_merge = s.spawn(|| {
             let _cpu = crate::perf::measure(crate::perf::Subsys::HydrateChild);
-            crate::git_handle::get()
-                .merge_state(&loc)
+            let merge = crate::git_handle::get().merge_state(&loc);
+            let incoming = merge
+                .as_ref()
                 .ok()
+                .cloned()
                 .flatten()
                 .map(|mi| {
                     crate::git_handle::get()
@@ -2685,7 +2685,8 @@ pub(crate) fn build_panel(
                         .map(|d| d.path)
                         .collect::<std::collections::HashSet<String>>()
                 })
-                .unwrap_or_default()
+                .unwrap_or_default();
+            (merge.map_err(|_| ()), incoming)
         });
         let h_stash_count = s.spawn(|| {
             let _cpu = crate::perf::measure(crate::perf::Subsys::HydrateChild);
@@ -2742,19 +2743,20 @@ pub(crate) fn build_panel(
         });
 
         let (diff_entries, entities) = h_diff.join().unwrap();
+        let (merge_res, incoming_set) = h_merge.join().unwrap();
         (
             h_branch.join().unwrap(),
             diff_entries,
             entities,
             h_status.join().unwrap(),
             h_ahead.join().unwrap(),
-            h_merge.join().unwrap(),
+            merge_res,
             h_stash_count.join().unwrap(),
             h_log.map(|h| h.join().unwrap()).unwrap_or_default(),
             h_branches.map(|h| h.join().unwrap()).unwrap_or_default(),
             h_stashes.map(|h| h.join().unwrap()).unwrap_or_default(),
             h_ls.and_then(|h| h.join().unwrap()),
-            h_incoming.join().unwrap(),
+            incoming_set,
         )
     });
     tracing::debug!(

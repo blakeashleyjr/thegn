@@ -333,7 +333,21 @@ pub trait GitBackend: thegn_core::seam::Probe + Send + Sync {
         // Route through the persistent bridge when connected, so each probe is a
         // cheap RPC on the live connection rather than a per-op `sprite exec`/ssh
         // spawn (a merge/rebase banner probe was up to 5 spawns per refresh).
+        // A plain local worktree answers all four probes with `stat`s of the
+        // per-worktree git dir (THE-718: these were 5 forks per hydration, run
+        // twice). Pseudo-refs are plain files under both ref backends. Anything
+        // not resolvable in-process (remote/provider loc, bridged, no `.git`
+        // at the path) keeps the CLI probes below.
+        let local_gitdir = match loc {
+            thegn_core::remote::GitLoc::Local(p) if crate::bridge::for_loc(loc).is_none() => {
+                thegn_core::git_memo::git_dir(p)
+            }
+            _ => None,
+        };
         let exists = |what: &str| -> bool {
+            if let Some(gd) = &local_gitdir {
+                return gd.join(what).is_file();
+            }
             run_status(loc, &["rev-parse", "-q", "--verify", what])
                 .map(|(exit, _)| exit == 0)
                 .unwrap_or(false)
@@ -358,7 +372,9 @@ pub trait GitBackend: thegn_core::seam::Probe + Send + Sync {
         // exec` spawns per refresh — the exact per-op cost the bridge routing
         // exists to kill, and unbounded so a stalled connection pins hydration).
         // On a local loc keep the cheap `std::fs` read.
-        let rebasing = if crate::bridge::for_loc(loc).is_some() {
+        let rebasing = if let Some(gd) = &local_gitdir {
+            gd.join("rebase-merge/onto").is_file() || gd.join("rebase-apply/onto").is_file()
+        } else if crate::bridge::for_loc(loc).is_some() {
             bridged_rebase_in_progress(loc)
         } else {
             loc.read_git_path("rebase-merge/onto").is_some()
