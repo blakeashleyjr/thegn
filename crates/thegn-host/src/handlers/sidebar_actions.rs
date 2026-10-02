@@ -113,6 +113,11 @@ pub(crate) fn create_empty_folder(
 
     let repo_path = repo_path.to_string();
     let name_owned = name.to_string();
+    let known_kind = model
+        .sidebar_workspaces
+        .iter()
+        .find(|(_, _, _, path)| path == &repo_path)
+        .map(|(_, _, kind, _)| kind.clone());
     let refresh_tx = refresh_tx.clone();
     let waker = waker.clone();
     tokio::task::spawn_blocking(move || {
@@ -120,7 +125,14 @@ pub(crate) fn create_empty_folder(
         // row visibly VANISHES on the deferred refresh — log why.
         match thegn_core::db::Db::open() {
             Ok(db) => {
-                if let Err(e) = db.ensure_folder(&repo_path, &name_owned) {
+                let (workspace_name, workspace_kind) =
+                    crate::workspace_identity::workspace_identity(
+                        &repo_path,
+                        known_kind.as_deref(),
+                    );
+                if let Err(e) =
+                    db.ensure_folder(&repo_path, &name_owned, &workspace_name, workspace_kind)
+                {
                     tracing::warn!(target: "thegn::sidebar", error = %e, "folder create not persisted");
                 }
             }

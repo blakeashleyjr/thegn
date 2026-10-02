@@ -261,7 +261,9 @@ fn file_into(db: &Db, repo_root: &Path, worktree: &str, branch: &str, folder: &s
     // external tool, a trailing slash, a symlinked path) yields no header and the
     // filed worktree is orphaned. Resolve to the workspace's own string.
     let repo_path = workspace_repo_path(db, repo_root, recorded.as_deref())?;
-    let fid = db.ensure_folder(&repo_path, folder)?;
+    let (workspace_name, workspace_kind) =
+        crate::workspace_identity::workspace_identity(&repo_path, Some("repo"));
+    let fid = db.ensure_folder(&repo_path, folder, &workspace_name, workspace_kind)?;
     if recorded.is_some() {
         // Row already cached: a narrow update that leaves every other column intact.
         db.set_worktree_folder(worktree, Some(fid))?;
@@ -857,6 +859,43 @@ mod tests {
     }
 
     #[test]
+    fn enqueue_registers_unopened_workspace_and_files_merging_folder() {
+        let _isolation = TestIsolation::new();
+        let db = Db::open_memory().unwrap();
+        let (root, feat) = repo_with_feat(&db, "unopened-workspace");
+        let (root_s, feat_s) = (
+            root.to_string_lossy().to_string(),
+            feat.to_string_lossy().to_string(),
+        );
+        db.del_workspace(&root_s).unwrap();
+        assert!(
+            db.workspaces()
+                .unwrap()
+                .iter()
+                .all(|row| row.repo_path != root_s)
+        );
+
+        apply(
+            &cfg(OnLanded::Move),
+            &db,
+            &root,
+            &feat_s,
+            "feat",
+            LifecycleEvent::Enqueued,
+        );
+
+        assert!(
+            db.workspaces()
+                .unwrap()
+                .iter()
+                .any(|row| row.repo_path == root_s)
+        );
+        assert_eq!(folder_of(&db, &root_s, &feat_s).as_deref(), Some("Merging"));
+        let _ = std::fs::remove_dir_all(&root); // best-effort cleanup
+        let _ = std::fs::remove_dir_all(&feat); // best-effort cleanup
+    }
+
+    #[test]
     fn enqueue_registers_unpersisted_worktree_and_files_it() {
         let _isolation = TestIsolation::new();
         let db = Db::open_memory().unwrap();
@@ -1030,7 +1069,9 @@ mod tests {
         let bogus = root.with_extension("bogus");
         std::fs::create_dir_all(&bogus).unwrap();
         let bogus_s = bogus.to_string_lossy().to_string();
-        let fid = db.ensure_folder(&root_s, "Merging").unwrap();
+        let fid = db
+            .ensure_folder(&root_s, "Merging", "repo", "repo")
+            .unwrap();
         db.put_worktree("bogus", &root_s, &bogus_s, "bogus", None, Some(fid))
             .unwrap();
         db.enqueue_merge(&bogus_s, "bogus", "main").unwrap();
@@ -1171,7 +1212,9 @@ mod tests {
             "un-filed from Merging under off"
         );
         // A user folder survives a land-in-place under off.
-        let fid = db.ensure_folder(&root_s, "My stuff").unwrap();
+        let fid = db
+            .ensure_folder(&root_s, "My stuff", "repo", "repo")
+            .unwrap();
         db.set_worktree_folder(&feat_s, Some(fid)).unwrap();
         apply(
             &c,
@@ -1264,7 +1307,9 @@ mod tests {
             root.to_string_lossy().to_string(),
             feat.to_string_lossy().to_string(),
         );
-        let fid = db.ensure_folder(&root_s, "My stuff").unwrap();
+        let fid = db
+            .ensure_folder(&root_s, "My stuff", "repo", "repo")
+            .unwrap();
         db.set_worktree_folder(&feat_s, Some(fid)).unwrap();
         apply(
             &cfg(OnLanded::Move),
