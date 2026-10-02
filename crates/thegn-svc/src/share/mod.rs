@@ -813,7 +813,8 @@ const MAX_DEST_BYTES: usize = 200;
 
 /// Pure check that `dest` is exactly one plain, non-empty path component: no
 /// absolute/prefix/root forms, no `.`/`..`, no `/` or `\`, no control
-/// characters, not overlong. Run for every file before any filesystem change.
+/// characters, no `:`, no trailing `.`/space, no Windows reserved device
+/// stems (CON, NUL, COM1..9, ...), not overlong. Run for every file before any filesystem change.
 fn validate_dest(dest: &str) -> Result<()> {
     let bad = |why: &str| anyhow::anyhow!("share: invalid file destination {dest:?}: {why}");
     if dest.is_empty() {
@@ -830,6 +831,20 @@ fn validate_dest(dest: &str) -> Result<()> {
         .any(|c| c == '/' || c == '\\' || c.is_control())
     {
         return Err(bad("contains a separator or control character"));
+    }
+    if dest.contains(':') {
+        return Err(bad("contains ':' (alternate data stream / drive form)"));
+    }
+    if dest.ends_with('.') || dest.ends_with(' ') {
+        return Err(bad("ends with '.' or space"));
+    }
+    let stem = dest.split('.').next().unwrap_or(dest).to_ascii_uppercase();
+    let reserved = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || ((stem.starts_with("COM") || stem.starts_with("LPT"))
+            && matches!(stem.as_bytes().get(3), Some(b'1'..=b'9'))
+            && stem.len() == 4);
+    if reserved {
+        return Err(bad("reserved device name"));
     }
     let mut comps = std::path::Path::new(dest).components();
     match (comps.next(), comps.next()) {
@@ -863,6 +878,8 @@ fn materialize_files(plan: &SharePlan, statedir: &std::path::Path) -> Result<()>
     }
     thegn_core::fsperm::ensure_private_dir(statedir)
         .with_context(|| format!("share: state dir {}", statedir.display()))?;
+    // Precheck EVERY destination before writing the first, so a bad later
+    // entry aborts without leaving earlier credential files behind.
     for f in &plan.files {
         let path = statedir.join(&f.dest);
         match std::fs::symlink_metadata(&path) {
@@ -876,6 +893,9 @@ fn materialize_files(plan: &SharePlan, statedir: &std::path::Path) -> Result<()>
                 return Err(e).with_context(|| format!("share: stat {}", path.display()));
             }
         }
+    }
+    for f in &plan.files {
+        let path = statedir.join(&f.dest);
         thegn_core::fsperm::write_owner_only_atomic(&path, f.contents.as_bytes())
             .with_context(|| format!("share: write {}", path.display()))?;
     }

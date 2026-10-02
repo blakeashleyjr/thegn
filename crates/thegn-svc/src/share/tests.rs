@@ -828,6 +828,17 @@ fn materialize_rejects_invalid_dest_and_creates_nothing() {
         "x\0y",
         "x\ny",
         long.as_str(),
+        "a:b",
+        "frpc.toml:stream",
+        "name.",
+        "name ",
+        "CON",
+        "con",
+        "NUL.txt",
+        "aux.toml",
+        "Prn",
+        "COM1",
+        "lpt9.log",
     ];
     for dest in cases {
         let tmp = tempfile::tempdir().unwrap();
@@ -892,7 +903,6 @@ fn materialize_writes_content_mode_0600_and_replaces_atomically() {
 #[cfg(unix)]
 #[test]
 fn materialize_failure_aborts_before_spawn_and_leaves_no_temp() {
-    use std::os::unix::fs::PermissionsExt;
     let tmp = tempfile::tempdir().unwrap();
     let sd = tmp.path().join("state");
     std::fs::create_dir(&sd).unwrap();
@@ -905,19 +915,20 @@ fn materialize_failure_aborts_before_spawn_and_leaves_no_temp() {
         vec!["-c".into(), format!("touch {}", marker.display())],
     );
     assert!(start(&plan, &sd, Duration::from_secs(2)).is_err());
-    assert!(!marker.exists());
-
-    // Rename/creation failure: read-only state dir (skip when root ignores modes).
-    let ro = tmp.path().join("ro");
-    std::fs::create_dir(&ro).unwrap();
-    std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o500)).unwrap();
-    let plan = file_plan(vec![("a.toml", "CANARY")], "true", vec![]);
-    let res = materialize_files(&plan, &ro);
-    let leftovers = std::fs::read_dir(&ro).unwrap().count();
-    std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o700)).unwrap();
-    if res.is_err() {
-        assert_eq!(leftovers, 0, "no temp file left behind");
-    }
+    assert!(!marker.exists(), "provider must not be spawned");
+    assert!(
+        !sd.join("a.toml").exists(),
+        "earlier file must not be written when a later destination is refused"
+    );
+    let leftovers: Vec<_> = std::fs::read_dir(&sd)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(
+        leftovers.len(),
+        1,
+        "only the planted dir remains: {leftovers:?}"
+    );
 }
 
 #[cfg(unix)]
