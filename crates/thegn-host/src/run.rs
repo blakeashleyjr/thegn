@@ -7216,6 +7216,16 @@ async fn event_loop<T: Terminal>(
         waker.clone(),
     );
     crate::worktree_lifecycle::install_notify_state(notify_state.clone());
+    // Stop + join the bounded sound workers on EVERY exit from this function
+    // (each `return`, `?`, or fall-through); `shutdown` is idempotent and adds
+    // no timer or wake source.
+    struct SoundShutdownGuard(std::sync::Arc<crate::notify::NotifyState>);
+    impl Drop for SoundShutdownGuard {
+        fn drop(&mut self) {
+            self.0.shutdown_sound();
+        }
+    }
+    let _sound_shutdown = SoundShutdownGuard(std::sync::Arc::clone(&notify_state));
     // Let routed notifications project a transient in-app toast via the loop's
     // refresh channel (the single funnel; fires only when routing authorizes it).
     notify_state.set_toast_tx(refresh_tx.clone());
