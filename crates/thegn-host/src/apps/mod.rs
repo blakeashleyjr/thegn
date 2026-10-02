@@ -97,7 +97,11 @@ impl AppSlot {
         match &self.state {
             SlotState::Running(t) => t.title(),
             SlotState::Starting => format!("{}…", self.label),
-            SlotState::Failed(_) => format!("{} (failed)", self.label),
+            SlotState::Failed(error) => {
+                let short: String = error.chars().take(32).collect();
+                let ellipsis = if short.len() < error.len() { "…" } else { "" };
+                format!("{} (failed: {short}{ellipsis})", self.label)
+            }
             _ => self.label.clone(),
         }
     }
@@ -629,7 +633,10 @@ mod tests {
         assert!(
             matches!(slot.state, SlotState::Failed(ref error) if error == "injected spawn failure")
         );
-        assert_eq!(slot.chip_label(), "Observe (failed)");
+        assert_eq!(
+            slot.chip_label(),
+            "Observe (failed: injected spawn failure)"
+        );
     }
 
     #[test]
@@ -661,7 +668,11 @@ mod tests {
         cfg.apps.tab_order = vec!["work".into(), "observe".into()];
         host.reconcile(&cfg);
         assert_eq!(host.active_id(), Some("observe"));
-        assert_eq!(host.tab_labels(), vec!["work", "Observe"]);
+        // The retained Failed slot keeps its visible failure chip.
+        assert_eq!(
+            host.tab_labels(),
+            vec!["work", "Observe (failed: retained)"]
+        );
         assert!(matches!(host.slots[0].state, SlotState::Failed(_)));
         let slot_address = &host.slots[0] as *const AppSlot;
         host.reconcile(&cfg);
