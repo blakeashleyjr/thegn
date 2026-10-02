@@ -541,11 +541,17 @@
       "type": "object"
     },
     "FolderAssignReq": {
-      "description": "Assign or clear a worktree's repo-local sidebar folder (`folders.assign`). A name is resolved within the worktree's own repository; `None` clears the assignment without deleting the folder.",
+      "additionalProperties": false,
+      "description": "Assign or clear a worktree's repo-local sidebar folder (`folders.assign`). A name is resolved within the worktree's own repository. Clearing is always explicit (`clear: true`) and never deletes the folder; supplying neither or both of `folder` / `clear` is an invalid argument, so a malformed request can never silently unfile a worktree.",
       "properties": {
+        "clear": {
+          "default": false,
+          "description": "`true` to unfile the worktree (the folder itself is kept). Mutually exclusive with `folder`.",
+          "type": "boolean"
+        },
         "folder": {
           "default": null,
-          "description": "Folder name to assign, or absent/null to clear.",
+          "description": "Folder name to assign. Mutually exclusive with `clear`.",
           "type": [
             "string",
             "null"

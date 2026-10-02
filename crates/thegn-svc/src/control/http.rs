@@ -1212,6 +1212,9 @@ pub(super) async fn assign_worktree_folder(
     if let Err(r) = authed(&state, &headers, Verb::FolderAssign) {
         return r;
     }
+    if let Err(e) = body.0.action() {
+        return e.into_response();
+    }
     match state.api.folder_assign(body.0).await {
         Ok(()) => axum::Json(json!({"ok": true})).into_response(),
         Err(e) => e.into_response(),

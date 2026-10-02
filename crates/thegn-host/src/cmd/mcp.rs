@@ -117,7 +117,7 @@ pub enum Action {
         /// (`sessions_list`, `worktrees_list`, `leases_list`, `me`,
         /// `agent_sessions`, `sessions_wait`, `semantic_map`,
         /// `semantic_blast_radius`); the mutating tools (`sessions_open`,
-        /// `sessions_input`, `sessions_kill`) additionally need `write`. Pass
+        /// `sessions_input`, `sessions_kill`) additionally need `write`, and `folders_assign` needs `git`. Pass
         /// `none` (or any empty/unknown set) to serve docs tools only.
         #[arg(long, value_delimiter = ',')]
         scopes: Option<Vec<String>>,
@@ -449,6 +449,10 @@ async fn fetch_state(
                     .ok_or("missing `worktree`")?
                     .to_string(),
                 folder: str_arg(args, "folder").map(str::to_string),
+                clear: args
+                    .get("clear")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
             };
             c.folder_assign(&request).await.map_err(|e| e.to_string())?;
             Ok(json!({ "ok": true }))
@@ -948,8 +952,26 @@ mod tests {
     }
 
     #[test]
+    fn read_plus_git_adds_exactly_folder_assignment() {
+        let mut expected = READ_CAPS.to_vec();
+        expected.push("folders.assign");
+        assert_eq!(
+            sorted(allowed_state_caps(ScopeSet::parse("read,git"), false)),
+            sorted(expected),
+            "--scopes read,git"
+        );
+    }
+
+    #[test]
     fn folder_assignment_is_git_scoped_on_mcp() {
-        assert!(!allowed_state_caps(ScopeSet::parse("read"), false).contains(&"folders.assign"));
+        for csv in ["read", "write"] {
+            for flag in [false, true] {
+                assert!(
+                    !allowed_state_caps(ScopeSet::parse(csv), flag).contains(&"folders.assign"),
+                    "--scopes {csv} (input flag {flag}) must not grant folders.assign"
+                );
+            }
+        }
         assert!(allowed_state_caps(ScopeSet::parse("git"), false).contains(&"folders.assign"));
     }
 

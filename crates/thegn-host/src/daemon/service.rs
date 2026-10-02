@@ -284,6 +284,28 @@ pub(crate) fn fresh_id() -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Map a folder-assignment failure onto the control taxonomy by downcasting the
+/// typed [`crate::cmd::wt::FolderAssignError`]; anything untyped is internal.
+fn map_folder_assign_error(error: anyhow::Error) -> ControlError {
+    use crate::cmd::wt::FolderAssignError;
+    match error.downcast_ref::<FolderAssignError>() {
+        Some(FolderAssignError::NotFound(m)) => ControlError::NotFound(m.clone()),
+        Some(FolderAssignError::NotWorktree(m) | FolderAssignError::InvalidName(m)) => {
+            ControlError::InvalidArgument(m.clone())
+        }
+        Some(FolderAssignError::Conflict(m)) => ControlError::Conflict(m.clone()),
+        None => {
+            let message = error.to_string();
+            // TODO(THE-719 integration): downcast WorkspaceTombstonedError.
+            if message.contains("workspace ") && message.contains("was removed") {
+                ControlError::FailedPrecondition(message)
+            } else {
+                ControlError::Internal(error)
+            }
+        }
+    }
+}
+
 impl DaemonService {
     /// Run `f` against the shared DB on a blocking thread.
     pub(crate) async fn with_db<T, F>(&self, f: F) -> ControlResult<T>
@@ -2007,6 +2029,9 @@ impl ControlApi for DaemonService {
         req: thegn_svc::control::FolderAssignReq,
     ) -> BoxFuture<'_, ControlResult<()>> {
         Box::pin(async move {
+            use crate::cmd::wt::{self, FolderAssignError};
+            use thegn_svc::control::FolderAction;
+
             if req.worktree.trim().is_empty() {
                 return Err(ControlError::InvalidArgument(
                     "folders.assign requires a worktree path".into(),
@@ -2017,45 +2042,48 @@ impl ControlApi for DaemonService {
                     "folders.assign worktree path must be absolute".into(),
                 ));
             }
-            self.with_db(move |db| {
-                if let Some(folder) = req.folder.as_deref() {
-                    crate::cmd::wt::assign_folder_to_target(db, &req.worktree, folder)?;
-                    Ok(())
+            // Cheap, DB-free validation first, so a bad request never pays for
+            // (or is slowed by) the git resolution below.
+            let action = req.action()?;
+            let folder = match action {
+                FolderAction::Assign(name) => {
+                    Some(wt::validate_folder_name(name).map_err(map_folder_assign_error)?)
+                }
+                FolderAction::Clear => None,
+            };
+            // Resolve the worktree through git on its own blocking task — the
+            // daemon DB mutex must never be held across a git subprocess.
+            let worktree = req.worktree.clone();
+            let assigning = folder.is_some();
+            let resolved = tokio::task::spawn_blocking(move || {
+                let path = std::path::Path::new(&worktree);
+                if assigning {
+                    wt::resolve_folder_target(path).map(Ok)
                 } else {
-                    let target = std::path::Path::new(&req.worktree);
-                    let root =
-                        thegn_core::repo::worktree_root_for_cwd(target).ok_or_else(|| {
-                            anyhow::anyhow!("not a git worktree: {}", target.display())
-                        })?;
-                    let worktree = root.to_string_lossy().into_owned();
-                    if crate::cmd::wt::clear_folder_if_registered(db, &worktree)? {
-                        Ok(())
-                    } else {
-                        anyhow::bail!("worktree is not registered: {worktree}");
-                    }
+                    wt::resolve_worktree_root(path).map(Err)
                 }
             })
             .await
-            .map_err(|error| {
-                let message = error.to_string();
-                if message.contains("not a git worktree")
-                    || message.contains("folder name")
-                    || message.contains("worktree is not registered")
-                {
-                    if message.contains("worktree is not registered") {
-                        ControlError::NotFound(message)
+            .map_err(|e| ControlError::Internal(anyhow::anyhow!("git task join: {e}")))?
+            .map_err(map_folder_assign_error)?;
+            self.with_db(move |db| match (resolved, folder) {
+                (Ok(target), Some(name)) => wt::file_folder_target(db, &target, &name).map(drop),
+                (Err(root), _) => {
+                    let worktree = root.to_string_lossy().into_owned();
+                    if wt::clear_folder_if_registered(db, &worktree)? {
+                        Ok(())
                     } else {
-                        ControlError::InvalidArgument(message)
+                        Err(anyhow::Error::new(FolderAssignError::NotFound(format!(
+                            "worktree is not registered: {worktree}"
+                        ))))
                     }
-                } else if message.contains("identity changed")
-                    || message.contains("folder disappeared")
-                {
-                    ControlError::Conflict(message)
-                } else if message.contains("workspace ") && message.contains("was removed") {
-                    ControlError::FailedPrecondition(message)
-                } else {
-                    ControlError::Internal(anyhow::anyhow!(message))
                 }
+                (Ok(_), None) => unreachable!("clear resolves a worktree root only"),
+            })
+            .await
+            .map_err(|error| match error {
+                ControlError::Internal(e) => map_folder_assign_error(e),
+                other => other,
             })
         })
     }
@@ -2196,6 +2224,143 @@ mod tests {
             endpoint: "/run/test.sock".into(),
         };
         (svc, rx)
+    }
+
+    fn folder_req(
+        worktree: &std::path::Path,
+        folder: Option<&str>,
+        clear: bool,
+    ) -> thegn_svc::control::FolderAssignReq {
+        thegn_svc::control::FolderAssignReq {
+            worktree: worktree.to_string_lossy().into_owned(),
+            folder: folder.map(str::to_string),
+            clear,
+        }
+    }
+
+    /// A real git worktree (canonical path, so macOS `/private/var` aliasing
+    /// cannot skew comparisons).
+    fn git_worktree() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().canonicalize().unwrap();
+        assert!(thegn_core::util::git_ok(
+            &path,
+            &["init", "--initial-branch=main"]
+        ));
+        (dir, path)
+    }
+
+    #[tokio::test]
+    async fn folder_assign_clear_on_unregistered_worktree_is_not_found() {
+        let (service, _) = service(0);
+        let (_dir, path) = git_worktree();
+        let error = service
+            .folder_assign(folder_req(&path, None, true))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ControlError::NotFound(_)), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn folder_assign_blank_name_is_invalid_and_registers_nothing() {
+        use thegn_core::store::WorkspaceStore;
+        let (service, _) = service(0);
+        let (_dir, path) = git_worktree();
+        for bad in ["   ", "a\nb", &"x".repeat(65)] {
+            let error = service
+                .folder_assign(folder_req(&path, Some(bad), false))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, ControlError::InvalidArgument(_)),
+                "{error:?}"
+            );
+        }
+        assert!(service.db.lock().unwrap().worktrees().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn folder_assign_requires_exactly_one_of_folder_or_clear() {
+        let (service, _) = service(0);
+        let (_dir, path) = git_worktree();
+        for (folder, clear) in [(None, false), (Some("A"), true)] {
+            let error = service
+                .folder_assign(folder_req(&path, folder, clear))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, ControlError::InvalidArgument(_)),
+                "{error:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn folder_assign_then_clear_keeps_the_folder() {
+        use thegn_core::store::WorkspaceStore;
+        let (service, _) = service(0);
+        let (_dir, path) = git_worktree();
+        service
+            .folder_assign(folder_req(&path, Some("  Agents "), false))
+            .await
+            .unwrap();
+        let key = path.to_string_lossy().into_owned();
+        {
+            let db = service.db.lock().unwrap();
+            assert!(
+                db.worktree_record(&key)
+                    .unwrap()
+                    .unwrap()
+                    .folder_id
+                    .is_some()
+            );
+        }
+        service
+            .folder_assign(folder_req(&path, None, true))
+            .await
+            .unwrap();
+        let db = service.db.lock().unwrap();
+        assert_eq!(db.worktree_record(&key).unwrap().unwrap().folder_id, None);
+        assert_eq!(db.folders_for_workspace(&key).unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn folder_assign_identity_race_is_a_conflict() {
+        use thegn_core::store::WorkspaceStore;
+        let (service, _) = service(0);
+        let (_dir, path) = git_worktree();
+        let key = path.to_string_lossy().into_owned();
+        // A row for this worktree already exists under a FOREIGN repo: the
+        // identity-checked write matches nothing.
+        service
+            .db
+            .lock()
+            .unwrap()
+            .put_worktree("other/main", "/some/other/repo", &key, "main", None, None)
+            .unwrap();
+        let error = service
+            .folder_assign(folder_req(&path, Some("Agents"), false))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ControlError::Conflict(_)), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn folder_assign_non_worktree_is_invalid() {
+        let (service, _) = service(0);
+        let dir = tempfile::tempdir().unwrap();
+        let error = service
+            .folder_assign(folder_req(
+                &dir.path().canonicalize().unwrap(),
+                Some("A"),
+                false,
+            ))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, ControlError::InvalidArgument(_)),
+            "{error:?}"
+        );
     }
 
     #[test]

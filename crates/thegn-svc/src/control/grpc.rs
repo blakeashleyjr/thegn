@@ -518,13 +518,13 @@ impl Control for GrpcControl {
     ) -> Result<Response<proto::Empty>, Status> {
         self.authed(&req, Verb::FolderAssign)?;
         let req = req.into_inner();
-        self.api
-            .folder_assign(super::FolderAssignReq {
-                worktree: req.worktree,
-                folder: req.folder,
-            })
-            .await
-            .map_err(Status::from)?;
+        let req = super::FolderAssignReq {
+            worktree: req.worktree,
+            folder: req.folder,
+            clear: req.clear,
+        };
+        req.action().map_err(Status::from)?;
+        self.api.folder_assign(req).await.map_err(Status::from)?;
         Ok(Response::new(proto::Empty {}))
     }
 

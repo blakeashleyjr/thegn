@@ -405,12 +405,53 @@ fn create_and_register(
     Ok((path_s, filing_error))
 }
 
+/// Longest accepted folder name, in characters (after trimming).
+pub(crate) const MAX_FOLDER_NAME_CHARS: usize = 64;
+
+/// Typed failures of the shared folder-assignment path, attached to the
+/// `anyhow::Error` so the control mapper downcasts instead of matching message
+/// text. The `Display` strings are the CLI's user-facing messages.
+#[derive(Debug)]
+pub(crate) enum FolderAssignError {
+    /// The path is not a git worktree.
+    NotWorktree(String),
+    /// The worktree has no registered row (clear only).
+    NotFound(String),
+    /// The folder name is blank, over-long or contains control characters.
+    InvalidName(String),
+    /// The worktree/folder identity changed between lookup and write.
+    Conflict(String),
+}
+
+impl std::fmt::Display for FolderAssignError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotWorktree(m) | Self::NotFound(m) | Self::InvalidName(m) | Self::Conflict(m) => {
+                f.write_str(m)
+            }
+        }
+    }
+}
+
+impl std::error::Error for FolderAssignError {}
+
 /// Validate before touching the folder table: `ensure_folder` intentionally
 /// accepts empty strings for its lower-level callers.
-fn validate_folder_name(name: &str) -> Result<String> {
+pub(crate) fn validate_folder_name(name: &str) -> Result<String> {
     let name = name.trim();
+    let invalid = |m: String| anyhow::Error::new(FolderAssignError::InvalidName(m));
     if name.is_empty() {
-        anyhow::bail!("folder name must not be empty");
+        return Err(invalid("folder name must not be empty".into()));
+    }
+    if name.chars().any(char::is_control) {
+        return Err(invalid(
+            "folder name must not contain control characters".into(),
+        ));
+    }
+    if name.chars().count() > MAX_FOLDER_NAME_CHARS {
+        return Err(invalid(format!(
+            "folder name must be at most {MAX_FOLDER_NAME_CHARS} characters"
+        )));
     }
     Ok(name.to_string())
 }
@@ -422,6 +463,8 @@ fn validate_folder_name(name: &str) -> Result<String> {
 /// trimmed folder name.
 fn check_folder_fileable(db: &Db, repo_path: &str, folder_name: &str) -> Result<String> {
     let folder_name = validate_folder_name(folder_name)?;
+    // TODO(THE-719 integration): downcast WorkspaceTombstonedError instead of the
+    // message match the control mapper keeps for this case.
     if db.workspace_tombstoned(repo_path).unwrap_or(false) {
         anyhow::bail!(
             "workspace {repo_path} was removed from thegn; re-add it before filing \
@@ -464,9 +507,15 @@ fn file_registered_worktree(
         .folders_for_workspace(repo_path)?
         .into_iter()
         .find(|folder| folder.folder_id == folder_id && folder.repo_path == repo_path)
-        .ok_or_else(|| anyhow::anyhow!("folder disappeared before worktree filing"))?;
+        .ok_or_else(|| {
+            anyhow::Error::new(FolderAssignError::Conflict(
+                "folder disappeared before worktree filing".into(),
+            ))
+        })?;
     if !db.set_worktree_folder_if_identity(worktree_path, repo_path, folder_id, &folder.name)? {
-        anyhow::bail!("worktree or folder identity changed before filing");
+        return Err(anyhow::Error::new(FolderAssignError::Conflict(
+            "worktree or folder identity changed before filing".into(),
+        )));
     }
     Ok(())
 }
@@ -501,25 +550,69 @@ pub(crate) fn clear_folder_if_registered(db: &Db, worktree_path: &str) -> Result
     Ok(true)
 }
 
-/// Shared CLI/control assignment entry point. Resolve the path to its actual
-/// worktree root and repo, derive the live branch identity, then use the same
-/// register-and-file helper as `thegn wt folder`.
-pub(crate) fn assign_folder_to_target(db: &Db, target: &str, folder_name: &str) -> Result<String> {
-    let target = std::path::Path::new(target);
-    let worktree_root = thegn_core::repo::worktree_root_for_cwd(target)
-        .ok_or_else(|| anyhow::anyhow!("not a git worktree: {}", target.display()))?;
-    let repo_root = thegn_core::repo::main_worktree(&worktree_root)
-        .ok_or_else(|| anyhow::anyhow!("not a git worktree: {}", target.display()))?;
+/// A path resolved (through git) to its actual worktree: everything the filing
+/// write needs, gathered without touching the DB.
+pub(crate) struct FolderTarget {
+    pub repo_path: String,
+    pub worktree_path: String,
+    pub branch: String,
+}
+
+fn not_worktree(target: &std::path::Path) -> anyhow::Error {
+    anyhow::Error::new(FolderAssignError::NotWorktree(format!(
+        "not a git worktree: {}",
+        target.display()
+    )))
+}
+
+/// Resolve a path to its worktree root (git subprocesses; never call while
+/// holding the daemon DB lock).
+pub(crate) fn resolve_worktree_root(target: &std::path::Path) -> Result<std::path::PathBuf> {
+    thegn_core::repo::worktree_root_for_cwd(target).ok_or_else(|| not_worktree(target))
+}
+
+/// Resolve a path to worktree root, repo and live branch identity (git
+/// subprocesses; never call while holding the daemon DB lock).
+pub(crate) fn resolve_folder_target(target: &std::path::Path) -> Result<FolderTarget> {
+    let worktree_root = resolve_worktree_root(target)?;
+    let repo_root =
+        thegn_core::repo::main_worktree(&worktree_root).ok_or_else(|| not_worktree(target))?;
     let branch = util::git_out(&worktree_root, &["symbolic-ref", "--short", "-q", "HEAD"])
         .or_else(|| {
             util::git_out(&worktree_root, &["rev-parse", "--short", "HEAD"])
                 .map(|commit| format!("detached-{commit}"))
         })
         .ok_or_else(|| anyhow::anyhow!("could not determine worktree identity"))?;
-    let repo_path = repo_root.to_string_lossy().into_owned();
-    let worktree_path = worktree_root.to_string_lossy().into_owned();
-    register_and_file_worktree(db, &repo_path, &worktree_path, &branch, folder_name)?;
-    Ok(worktree_path)
+    Ok(FolderTarget {
+        repo_path: repo_root.to_string_lossy().into_owned(),
+        worktree_path: worktree_root.to_string_lossy().into_owned(),
+        branch,
+    })
+}
+
+/// File a resolved target into `folder_name`. Everything knowable up front is
+/// validated BEFORE the first write, so a rejected call never registers the
+/// worktree row as a side effect. Returns the worktree path.
+pub(crate) fn file_folder_target(
+    db: &Db,
+    target: &FolderTarget,
+    folder_name: &str,
+) -> Result<String> {
+    let folder_name = check_folder_fileable(db, &target.repo_path, folder_name)?;
+    register_and_file_worktree(
+        db,
+        &target.repo_path,
+        &target.worktree_path,
+        &target.branch,
+        &folder_name,
+    )?;
+    Ok(target.worktree_path.clone())
+}
+
+/// Shared CLI/control assignment entry point: resolve, validate, then file.
+pub(crate) fn assign_folder_to_target(db: &Db, target: &str, folder_name: &str) -> Result<String> {
+    let resolved = resolve_folder_target(std::path::Path::new(target))?;
+    file_folder_target(db, &resolved, folder_name)
 }
 
 /// Resolve the supplied directory through Git and file/unfile that actual
@@ -530,25 +623,14 @@ fn folder(target: &str, name: Option<&str>, clear: bool) -> Result<()> {
     }
     let folder_name = name.map(validate_folder_name).transpose()?;
     let target = super::resolve_worktree(Some(target.to_string()));
-    let Some(worktree_root) = thegn_core::repo::worktree_root_for_cwd(&target) else {
-        anyhow::bail!("not a git worktree: {}", target.display());
-    };
-    let Some(repo_root) = thegn_core::repo::main_worktree(&worktree_root) else {
-        anyhow::bail!("not a git worktree: {}", target.display());
-    };
-    let repo_path = repo_root.to_string_lossy().into_owned();
-    let worktree_path = worktree_root.to_string_lossy().into_owned();
-    let branch = util::git_out(&worktree_root, &["symbolic-ref", "--short", "-q", "HEAD"])
-        .or_else(|| {
-            util::git_out(&worktree_root, &["rev-parse", "--short", "HEAD"])
-                .map(|commit| format!("detached-{commit}"))
-        })
-        .ok_or_else(|| anyhow::anyhow!("could not determine worktree identity"))?;
     let db = Db::open()?;
     if let Some(folder_name) = folder_name {
-        register_and_file_worktree(&db, &repo_path, &worktree_path, &branch, &folder_name)?;
+        let worktree_path = assign_folder_to_target(&db, &target.to_string_lossy(), &folder_name)?;
         outln!("Filed {worktree_path} into folder \"{folder_name}\"");
     } else {
+        let worktree_path = resolve_worktree_root(&target)?
+            .to_string_lossy()
+            .into_owned();
         // Never register on --clear: an unregistered worktree has no folder.
         if clear_folder_if_registered(&db, &worktree_path)? {
             outln!("Unfiled {worktree_path}");
@@ -1225,7 +1307,13 @@ mod folder_tests {
             &["init", "--initial-branch=main"]
         ));
         let db = db();
-        let path = repo.path().to_string_lossy().into_owned();
+        // Canonical: macOS tempdirs live under the `/private/var` alias.
+        let path = repo
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
         assert!(db.worktree_record(&path).unwrap().is_none());
 
         assign_folder_to_target(&db, &path, "  Agents ").unwrap();
@@ -1234,6 +1322,32 @@ mod folder_tests {
         assert_eq!(row.repo_root, path);
         assert!(row.folder_id.is_some());
         assert_eq!(db.folders_for_workspace(&path).unwrap()[0].name, "Agents");
+    }
+
+    #[test]
+    fn rejected_assignment_does_not_register_the_worktree() {
+        let repo = tempfile::tempdir().unwrap();
+        assert!(thegn_core::util::git_ok(
+            repo.path(),
+            &["init", "--initial-branch=main"]
+        ));
+        let db = db();
+        let path = repo.path().canonicalize().unwrap();
+        let error = assign_folder_to_target(&db, &path.to_string_lossy(), "   ").unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<super::FolderAssignError>(),
+            Some(super::FolderAssignError::InvalidName(_))
+        ));
+        assert!(db.worktrees().unwrap().is_empty());
+    }
+
+    #[test]
+    fn folder_names_reject_control_characters_and_overlong_names() {
+        assert!(validate_folder_name("a\tb").is_err());
+        assert!(validate_folder_name("a\u{7}").is_err());
+        let max = "é".repeat(super::MAX_FOLDER_NAME_CHARS);
+        assert_eq!(validate_folder_name(&max).unwrap(), max);
+        assert!(validate_folder_name(&format!("{max}x")).is_err());
     }
 
     #[test]

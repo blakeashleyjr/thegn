@@ -144,7 +144,8 @@ message ListWorktreesRequest {}
 message ListWorktreesReply { repeated WorktreeInfo worktrees = 1; }
 message AssignWorktreeFolderRequest {
   string worktree = 1;
-  optional string folder = 2; // absent = clear
+  optional string folder = 2; // name to assign; exclusive with `clear`
+  bool clear = 3;             // true = unfile; exclusive with `folder`
 }
 message WorktreeInfo {
   string path = 1;
