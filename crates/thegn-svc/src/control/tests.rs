@@ -72,9 +72,9 @@ impl ControlApi for FakeApi {
     fn issues_get<'a>(
         &'a self,
         id: &'a str,
-        _repo: Option<&'a str>,
+        repo: Option<&'a str>,
     ) -> BoxFuture<'a, ControlResult<thegn_core::issue::IssueDetail>> {
-        self.record(&_repo.map_or_else(
+        self.record(&repo.map_or_else(
             || format!("issues_get:{id}"),
             |repo| format!("issues_get:{id}:repo={repo}"),
         ));
@@ -89,9 +89,9 @@ impl ControlApi for FakeApi {
         &'a self,
         id: &'a str,
         _patch: &'a thegn_core::issue::IssuePatch,
-        _repo: Option<&'a str>,
+        repo: Option<&'a str>,
     ) -> BoxFuture<'a, ControlResult<thegn_core::issue::Issue>> {
-        self.record(&_repo.map_or_else(
+        self.record(&repo.map_or_else(
             || format!("issues_update:{id}"),
             |repo| format!("issues_update:{id}:repo={repo}"),
         ));
@@ -106,9 +106,9 @@ impl ControlApi for FakeApi {
         &'a self,
         id: &'a str,
         _body: &'a str,
-        _repo: Option<&'a str>,
+        repo: Option<&'a str>,
     ) -> BoxFuture<'a, ControlResult<()>> {
-        self.record(&_repo.map_or_else(
+        self.record(&repo.map_or_else(
             || format!("issues_comment:{id}"),
             |repo| format!("issues_comment:{id}:repo={repo}"),
         ));

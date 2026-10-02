@@ -1204,10 +1204,11 @@ pub(super) async fn create_worktree(
 
 // ── agent orchestration: issues (THE-57) ─────────────────────────────────────
 
-/// Query params for `issues.list` and repo context for all issue operations.
-/// Statuses is a comma-separated list of snake_case status ids; unknown names
-/// are dropped. `repo`, when present, applies that repository's `[issues]`
-/// overlay using a filesystem path on the daemon host.
+/// Query params for `issues.list` — a subset of `IssueFilter` a supervisor
+/// filters a batch by, plus optional repo context. Statuses is a
+/// comma-separated list of the snake_case status ids (`todo,in_progress`);
+/// unknown names are dropped. `repo`, when present, applies that repository's
+/// `[issues]` overlay (a filesystem path on the daemon host).
 #[derive(Deserialize, schemars::JsonSchema)]
 pub struct IssuesQuery {
     #[serde(default)]
@@ -1218,6 +1219,15 @@ pub struct IssuesQuery {
     project: Option<String>,
     #[serde(default)]
     query: Option<String>,
+    /// Filesystem path on the daemon host used to apply a repo's `[issues]` overlay.
+    #[serde(default)]
+    repo: Option<String>,
+}
+
+/// Repo context alone, for `issues.get` / `update` / `comment` — they take no
+/// status/limit/project/query filters, so those must not even parse.
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct IssueRepoQuery {
     /// Filesystem path on the daemon host used to apply a repo's `[issues]` overlay.
     #[serde(default)]
     repo: Option<String>,
@@ -1267,7 +1277,7 @@ pub(super) async fn issue_get(
     State(state): State<ControlState>,
     headers: HeaderMap,
     Path(id): Path<String>,
-    Query(q): Query<IssuesQuery>,
+    Query(q): Query<IssueRepoQuery>,
 ) -> Response {
     if let Err(r) = authed(&state, &headers, Verb::IssuesGet) {
         return r;
@@ -1285,7 +1295,7 @@ pub(super) async fn issue_update(
     State(state): State<ControlState>,
     headers: HeaderMap,
     Path(id): Path<String>,
-    Query(q): Query<IssuesQuery>,
+    Query(q): Query<IssueRepoQuery>,
     body: axum::Json<thegn_core::issue::IssuePatch>,
 ) -> Response {
     if let Err(r) = authed(&state, &headers, Verb::IssuesUpdate) {
@@ -1313,7 +1323,7 @@ pub(super) async fn issue_comment(
     State(state): State<ControlState>,
     headers: HeaderMap,
     Path(id): Path<String>,
-    Query(q): Query<IssuesQuery>,
+    Query(q): Query<IssueRepoQuery>,
     body: axum::Json<CommentBody>,
 ) -> Response {
     if let Err(r) = authed(&state, &headers, Verb::IssuesComment) {
