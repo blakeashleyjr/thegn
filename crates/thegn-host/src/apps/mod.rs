@@ -58,7 +58,7 @@ pub enum SlotState {
             not(test),
             expect(
                 dead_code,
-                reason = "cause is surfaced via msg::warn + tracing at build time; the stored copy is only read by tests"
+                reason = "cause is logged at build time; the stored copy is only read by tests"
             )
         )]
         String,
@@ -357,8 +357,6 @@ fn record_build_result(slot: &mut AppSlot, result: Result<Box<dyn AppTile>, Stri
         }
         Err(error) => {
             tracing::warn!(target: "thegn::apps", app = slot.id, %error, "app construction failed");
-            // Visible even when THEGN_LOG is unset; the tab chip stays terse.
-            thegn_core::msg::warn(&format!("{} failed to start: {error}", slot.id));
             slot.state = SlotState::Failed(error);
         }
     }
