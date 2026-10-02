@@ -545,40 +545,7 @@ mod tests {
         assert_ne!(generation.load(Ordering::Acquire), 1);
     }
 
-    /// A real terminal waker for constructing a `SoundRuntime`; the pty ends
-    /// are returned so they outlive the runtime.
-    #[cfg(unix)]
-    fn test_waker() -> (
-        TerminalWaker,
-        std::fs::File,
-        termwiz::terminal::UnixTerminal,
-    ) {
-        use std::os::fd::FromRawFd;
-        use termwiz::terminal::{Terminal, UnixTerminal};
-        let mut master = -1;
-        let mut slave = -1;
-        assert_eq!(
-            // SAFETY: out-pointers are valid; null name/termios/winsize are allowed.
-            unsafe {
-                libc::openpty(
-                    &mut master,
-                    &mut slave,
-                    std::ptr::null_mut(),
-                    std::ptr::null(),
-                    std::ptr::null(),
-                )
-            },
-            0
-        );
-        // SAFETY: openpty returned two fresh fds that we now own.
-        let master = unsafe { std::fs::File::from_raw_fd(master) };
-        let slave = unsafe { std::fs::File::from_raw_fd(slave) };
-        let caps =
-            termwiz::caps::Capabilities::new_with_hints(termwiz::caps::ProbeHints::default())
-                .unwrap();
-        let terminal = UnixTerminal::new_with(caps, &slave, &slave).unwrap();
-        (terminal.waker(), master, terminal)
-    }
+    use crate::platform::sound_process::test_support::{UNIX, pid_gone, test_waker};
 
     fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
         let started = std::time::Instant::now();
@@ -591,9 +558,11 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     #[test]
     fn reload_storm_runs_one_build_at_a_time_and_the_latest_config_wins() {
+        if !UNIX {
+            return;
+        }
         use std::sync::atomic::AtomicUsize;
         let (waker, _master, _terminal) = test_waker();
         let active = Arc::new(AtomicUsize::new(0));
@@ -630,9 +599,11 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn shutdown_is_bounded_with_a_hung_helper_and_a_hung_pending_reload() {
+        if !UNIX {
+            return;
+        }
         let (waker, _master, _terminal) = test_waker();
         let building = Arc::new(AtomicBool::new(false));
         // An uncooperative build (a hung `read_dir`): ignores `stopping`.
@@ -678,12 +649,9 @@ mod tests {
         assert!(runtime.reload_worker.lock().unwrap().is_none());
         // The helper was killed AND reaped: its pid no longer exists (a zombie
         // would still answer signal 0).
-        // SAFETY: signal 0 only probes for existence.
-        let probe = unsafe { libc::kill(pid, 0) };
-        assert_eq!(probe, -1, "helper {pid} still exists (running or zombie)");
-        assert_eq!(
-            std::io::Error::last_os_error().raw_os_error(),
-            Some(libc::ESRCH)
+        assert!(
+            pid_gone(pid),
+            "helper {pid} still exists (running or zombie)"
         );
     }
 
