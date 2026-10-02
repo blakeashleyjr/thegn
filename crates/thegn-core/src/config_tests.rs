@@ -342,7 +342,7 @@ fn default_folder_config_and_env_precedence() {
         Config::default().get_dotted("default_folder").as_deref(),
         Some("")
     );
-    let _ = std::fs::remove_dir_all(dir);
+    let _ = std::fs::remove_dir_all(dir); // best-effort: test tmp cleanup
 }
 
 #[test]
@@ -1932,6 +1932,7 @@ fn get_dotted_covers_all_keys() {
         "workspaces_dir",
         "base_branch",
         "branch_prefix",
+        "default_folder",
         "picker",
         "worktree_mode",
         "name_scheme",

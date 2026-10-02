@@ -298,11 +298,27 @@ fn create_and_register(
     db: &Db,
 ) -> Result<(String, Option<anyhow::Error>)> {
     let folder = effective_folder(folder, cfg.default_folder.as_deref());
-    // A creation that is going to fail filing for a knowable reason (bad name,
-    // removed workspace) must not create anything.
-    let folder = match folder {
-        Some(name) => Some(check_folder_fileable(db, &root.to_string_lossy(), name)?),
-        None => None,
+    // An EXPLICIT folder that is going to fail filing for a knowable reason (bad
+    // name, removed workspace) must not create anything. A folder that only
+    // comes from the configured default is a convenience, never a reason to
+    // refuse creation: warn and create the worktree unfiled.
+    let (folder, folder_source) = match folder {
+        Some((name, FolderSource::Explicit)) => (
+            Some(check_folder_fileable(db, &root.to_string_lossy(), name)?),
+            FolderSource::Explicit,
+        ),
+        Some((name, FolderSource::Configured)) => {
+            match check_folder_fileable(db, &root.to_string_lossy(), name) {
+                Ok(name) => (Some(name), FolderSource::Configured),
+                Err(e) => {
+                    msg::warn(&format!(
+                        "default_folder {name:?} not applied: {e}; creating the worktree unfiled"
+                    ));
+                    (None, FolderSource::Configured)
+                }
+            }
+        }
+        None => (None, FolderSource::Explicit),
     };
     // THE-516: fallible identity resolution — never a basename/slug alias.
     // The slug comes from the caller's OWN handle (`db`), not a second
@@ -395,12 +411,20 @@ fn create_and_register(
     let filing_error = folder.and_then(|folder_name| {
         file_registered_worktree(db, &root_s, &path_s, &folder_name)
             .err()
-            .map(|e| {
-                anyhow::anyhow!(
+            .and_then(|e| {
+                let err = anyhow::anyhow!(
                     "{e}; the worktree at {path_s} was created, registered and set up, \
                      but NOT filed into {folder_name:?}; retry the filing with \
                      `thegn wt folder {path_s:?} {folder_name:?}` once the cause above is fixed"
-                )
+                );
+                // A configured default never fails the command: surface it as
+                // a warning and let the caller print the path and exit 0.
+                if folder_source == FolderSource::Configured {
+                    msg::warn(&err.to_string());
+                    None
+                } else {
+                    Some(err)
+                }
             })
     });
     Ok((path_s, filing_error))
@@ -409,8 +433,22 @@ fn create_and_register(
 /// Select the command-line folder when supplied, otherwise the configured
 /// default. Kept at the shared creation boundary so single and batched paths
 /// apply the same policy.
-fn effective_folder<'a>(explicit: Option<&'a str>, configured: Option<&'a str>) -> Option<&'a str> {
-    explicit.or(configured)
+fn effective_folder<'a>(
+    explicit: Option<&'a str>,
+    configured: Option<&'a str>,
+) -> Option<(&'a str, FolderSource)> {
+    explicit
+        .map(|name| (name, FolderSource::Explicit))
+        .or(configured.map(|name| (name, FolderSource::Configured)))
+}
+
+/// Where the folder for a new worktree came from. An explicit `--folder` is
+/// strict (any filing problem is an error); the configured default is
+/// best-effort and can only ever produce warnings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FolderSource {
+    Explicit,
+    Configured,
 }
 
 /// Validate before touching the folder table: `ensure_folder` intentionally
@@ -1098,8 +1136,9 @@ mod rm_tests {
 #[cfg(test)]
 mod folder_tests {
     use super::{
-        check_folder_fileable, clear_folder_if_registered, create_and_register, effective_folder,
-        file_registered_worktree, register_and_file_worktree, validate_folder_name,
+        FolderSource, check_folder_fileable, clear_folder_if_registered, create_and_register,
+        effective_folder, file_registered_worktree, register_and_file_worktree,
+        validate_folder_name,
     };
     use thegn_core::config::Config;
     use thegn_core::db::Db;
@@ -1196,10 +1235,13 @@ mod folder_tests {
     #[test]
     fn creation_folder_prefers_explicit_then_uses_configured_default() {
         assert_eq!(effective_folder(None, None), None);
-        assert_eq!(effective_folder(None, Some("Agents")), Some("Agents"));
+        assert_eq!(
+            effective_folder(None, Some("Agents")),
+            Some(("Agents", FolderSource::Configured))
+        );
         assert_eq!(
             effective_folder(Some("Review"), Some("Agents")),
-            Some("Review")
+            Some(("Review", FolderSource::Explicit))
         );
     }
 
@@ -1207,7 +1249,7 @@ mod folder_tests {
     fn create_and_register_applies_default_override_reuse_and_repo_scope() {
         let scratch =
             std::env::temp_dir().join(format!("tg-wt-default-folder-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&scratch);
+        let _ = std::fs::remove_dir_all(&scratch); // best-effort: test tmp cleanup
         std::fs::create_dir_all(&scratch).unwrap();
         let first_repo = temp_repo(&scratch, "first");
         let second_repo = temp_repo(&scratch, "second");
@@ -1284,7 +1326,48 @@ mod folder_tests {
             None
         );
 
-        let _ = std::fs::remove_dir_all(scratch);
+        let _ = std::fs::remove_dir_all(scratch); // best-effort: test tmp cleanup
+    }
+
+    #[test]
+    fn configured_default_never_fails_creation_but_explicit_folder_does() {
+        let scratch =
+            std::env::temp_dir().join(format!("tg-wt-default-tomb-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scratch); // best-effort: test tmp cleanup
+        std::fs::create_dir_all(&scratch).unwrap();
+        let repo = temp_repo(&scratch, "gone");
+        let db = db();
+        db.put_workspace(&repo.to_string_lossy(), "gone", "repo")
+            .unwrap();
+        db.tombstone_workspace(&repo.to_string_lossy()).unwrap();
+        let cfg = Config {
+            default_folder: Some("Agents".into()),
+            worktrees_dir: scratch.join("checkouts").to_string_lossy().into_owned(),
+            ..Config::default()
+        };
+
+        // Configured default + tombstoned workspace: created, unfiled, success
+        // (also the `--program` member path, which reads the same tuple).
+        let (path, filing_error) =
+            create_and_register(&cfg, &repo, "tg/cfg-default", "main", None, None, &db).unwrap();
+        assert!(filing_error.is_none(), "{filing_error:?}");
+        assert!(std::path::Path::new(&path).exists());
+        assert_eq!(db.worktree_record(&path).unwrap().unwrap().folder_id, None);
+
+        // Explicit --folder + tombstoned workspace: still refused up front.
+        let err = create_and_register(
+            &cfg,
+            &repo,
+            "tg/explicit-refused",
+            "main",
+            None,
+            Some("Review"),
+            &db,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("was removed from thegn"), "{err}");
+
+        let _ = std::fs::remove_dir_all(scratch); // best-effort: test tmp cleanup
     }
 
     #[test]
