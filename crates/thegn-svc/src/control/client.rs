@@ -730,6 +730,7 @@ impl ControlClient {
         &self,
         statuses: &[thegn_core::issue::IssueStatus],
         limit: usize,
+        repo: Option<&str>,
     ) -> Result<Vec<thegn_core::issue::Issue>> {
         let mut path = String::from("/v1/issues");
         let mut params: Vec<String> = Vec::new();
@@ -744,6 +745,9 @@ impl ControlClient {
         if limit > 0 {
             params.push(format!("limit={limit}"));
         }
+        if let Some(repo) = repo {
+            params.push(format!("repo={}", percent_encode(repo)));
+        }
         if !params.is_empty() {
             path.push('?');
             path.push_str(&params.join("&"));
@@ -755,8 +759,12 @@ impl ControlClient {
     }
 
     /// `GET /v1/issues/{id}` — one issue with detail/comments.
-    pub async fn issue_get(&self, id: &str) -> Result<thegn_core::issue::IssueDetail> {
-        let path = encoded_issue_path(id, "")?;
+    pub async fn issue_get(
+        &self,
+        id: &str,
+        repo: Option<&str>,
+    ) -> Result<thegn_core::issue::IssueDetail> {
+        let path = with_repo_query(encoded_issue_path(id, "")?, repo);
         let v = self.request("GET", &path, None).await?;
         Ok(serde_json::from_value(v)?)
     }
@@ -766,8 +774,9 @@ impl ControlClient {
         &self,
         id: &str,
         patch: &thegn_core::issue::IssuePatch,
+        repo: Option<&str>,
     ) -> Result<thegn_core::issue::Issue> {
-        let path = encoded_issue_path(id, "")?;
+        let path = with_repo_query(encoded_issue_path(id, "")?, repo);
         let v = self
             .request("POST", &path, Some(serde_json::to_value(patch)?))
             .await?;
@@ -775,8 +784,8 @@ impl ControlClient {
     }
 
     /// `POST /v1/issues/{id}/comment` — add a comment.
-    pub async fn issue_comment(&self, id: &str, body: &str) -> Result<()> {
-        let path = encoded_issue_path(id, "/comment")?;
+    pub async fn issue_comment(&self, id: &str, body: &str, repo: Option<&str>) -> Result<()> {
+        let path = with_repo_query(encoded_issue_path(id, "/comment")?, repo);
         self.request("POST", &path, Some(json!({ "body": body })))
             .await
             .map(|_| ())
@@ -1084,6 +1093,15 @@ fn percent_encode(value: &str) -> String {
         }
     }
     out
+}
+
+fn with_repo_query(mut path: String, repo: Option<&str>) -> String {
+    if let Some(repo) = repo {
+        path.push('?');
+        path.push_str("repo=");
+        path.push_str(&percent_encode(repo));
+    }
+    path
 }
 
 type Ws<S> = tokio_tungstenite::WebSocketStream<S>;
@@ -1410,6 +1428,16 @@ mod tests {
     use super::*;
     use thegn_core::db::Db;
 
+    #[test]
+    fn issue_repo_context_is_encoded_as_a_distinct_query_parameter() {
+        let path = encoded_issue_path("linear:TEAM-1", "").unwrap();
+        assert_eq!(
+            with_repo_query(path, Some("/repo with space")),
+            "/v1/issues/linear%3ATEAM-1?repo=%2Frepo%20with%20space"
+        );
+        assert_eq!(with_repo_query("/v1/issues".into(), None), "/v1/issues");
+    }
+
     async fn one_response_client(
         origin: bool,
         content_type: Option<&str>,
@@ -1464,7 +1492,10 @@ mod tests {
             "/v1/worktrees" => client.worktrees().await.map(|_| Value::Bool(true)),
             "/v1/pr/status" => client.pr_status().await.map(|_| Value::Bool(true)),
             "/v1/automations" => client.automations_list().await.map(|_| Value::Bool(true)),
-            "/v1/issues" => client.issues_list(&[], 0).await.map(|_| Value::Bool(true)),
+            "/v1/issues" => client
+                .issues_list(&[], 0, None)
+                .await
+                .map(|_| Value::Bool(true)),
             "/v1/dispatches" => client.dispatches_list().await.map(|_| Value::Bool(true)),
             path if path.ends_with("/snapshot") => {
                 client.snapshot("s1").await.map(|_| Value::Bool(true))

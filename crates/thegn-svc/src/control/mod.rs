@@ -1106,6 +1106,7 @@ pub trait ControlApi: Send + Sync + 'static {
     fn issues_list<'a>(
         &'a self,
         _filter: &'a thegn_core::issue::IssueFilter,
+        _repo: Option<&'a str>,
     ) -> BoxFuture<'a, ControlResult<Vec<thegn_core::issue::Issue>>> {
         Box::pin(async { Err(ControlError::Unimplemented("no issue tracker configured")) })
     }
@@ -1114,6 +1115,7 @@ pub trait ControlApi: Send + Sync + 'static {
     fn issues_get<'a>(
         &'a self,
         _id: &'a str,
+        _repo: Option<&'a str>,
     ) -> BoxFuture<'a, ControlResult<thegn_core::issue::IssueDetail>> {
         Box::pin(async { Err(ControlError::Unimplemented("no issue tracker configured")) })
     }
@@ -1123,6 +1125,7 @@ pub trait ControlApi: Send + Sync + 'static {
         &'a self,
         _id: &'a str,
         _patch: &'a thegn_core::issue::IssuePatch,
+        _repo: Option<&'a str>,
     ) -> BoxFuture<'a, ControlResult<thegn_core::issue::Issue>> {
         Box::pin(async { Err(ControlError::Unimplemented("no issue tracker configured")) })
     }
@@ -1132,6 +1135,7 @@ pub trait ControlApi: Send + Sync + 'static {
         &'a self,
         _id: &'a str,
         _body: &'a str,
+        _repo: Option<&'a str>,
     ) -> BoxFuture<'a, ControlResult<()>> {
         Box::pin(async { Err(ControlError::Unimplemented("no issue tracker configured")) })
     }
