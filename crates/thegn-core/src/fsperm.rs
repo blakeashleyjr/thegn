@@ -359,6 +359,64 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
+    fn atomic_write_rename_failure_errors_and_leaves_no_temp() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("target");
+        // A non-empty directory at the destination makes rename fail.
+        std::fs::create_dir(&dest).unwrap();
+        std::fs::write(dest.join("inner"), b"x").unwrap();
+        let res = write_owner_only_atomic(&dest, b"CANARY");
+        assert!(res.is_err(), "rename onto a non-empty dir must fail");
+        let names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["target".to_string()], "no temp left: {names:?}");
+    }
+
+    #[test]
+    fn ensure_private_dir_refuses_symlink() {
+        let t = tempfile::tempdir().unwrap();
+        let real = t.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = t.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(ensure_private_dir(&link).is_err());
+    }
+
+    #[test]
+    fn ensure_private_dir_refuses_file() {
+        let t = tempfile::tempdir().unwrap();
+        let f = t.path().join("file");
+        std::fs::write(&f, b"x").unwrap();
+        assert!(ensure_private_dir(&f).is_err());
+    }
+
+    #[test]
+    fn ensure_private_dir_tightens_existing_dir() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path().join("d");
+        std::fs::create_dir(&d).unwrap();
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o755)).unwrap();
+        ensure_private_dir(&d).unwrap();
+        assert_eq!(
+            std::fs::metadata(&d).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+
+    #[test]
+    fn ensure_private_dir_creates_fresh_path_0700() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path().join("fresh");
+        ensure_private_dir(&d).unwrap();
+        assert!(d.is_dir());
+        assert_eq!(
+            std::fs::metadata(&d).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+    #[test]
     fn restricts_to_0600_on_unix() {
         let p = std::env::temp_dir().join(format!("thegn-fsperm-{}", std::process::id()));
         std::fs::write(&p, b"secret").unwrap();
