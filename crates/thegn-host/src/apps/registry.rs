@@ -11,6 +11,10 @@
 use tg_kit::AppTile;
 use thegn_core::config::Config;
 
+/// Tile constructor; `Err` is a user-facing reason that becomes a `Failed` slot.
+pub type BuildFn =
+    fn(tg_kit::ChangeHook, &Config, tokio::runtime::Handle) -> Result<Box<dyn AppTile>, String>;
+
 /// One registrable app tab.
 pub struct AppBuilder {
     /// Stable tab id (`[apps] tab_order` / `default_tab` name it).
@@ -24,8 +28,7 @@ pub struct AppBuilder {
     /// slow must go off-thread and report back through the [`ChangeHook`].
     ///
     /// [`ChangeHook`]: tg_kit::ChangeHook
-    pub build:
-        fn(tg_kit::ChangeHook, &Config, tokio::runtime::Handle) -> Result<Box<dyn AppTile>, String>,
+    pub build: BuildFn,
 }
 
 pub static APP_BUILDERS: &[AppBuilder] = &[AppBuilder {
@@ -36,7 +39,6 @@ pub static APP_BUILDERS: &[AppBuilder] = &[AppBuilder {
         super::build_observe_tile(hook, &cfg.observe, rt, || {
             crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
         })
-        .map_err(|error| error.to_string())
     },
 }];
 
