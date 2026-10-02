@@ -333,17 +333,11 @@ pub trait GitBackend: thegn_core::seam::Probe + Send + Sync {
         // Route through the persistent bridge when connected, so each probe is a
         // cheap RPC on the live connection rather than a per-op `sprite exec`/ssh
         // spawn (a merge/rebase banner probe was up to 5 spawns per refresh).
-        // A plain local worktree answers all four probes with `stat`s of the
-        // per-worktree git dir (THE-718: these were 5 forks per hydration, run
-        // twice). Pseudo-refs are plain files under both ref backends. Anything
-        // not resolvable in-process (remote/provider loc, bridged, no `.git`
-        // at the path) keeps the CLI probes below.
-        let local_gitdir = match loc {
-            thegn_core::remote::GitLoc::Local(p) if crate::bridge::for_loc(loc).is_none() => {
-                thegn_core::git_memo::git_dir(p)
-            }
-            _ => None,
-        };
+        // A plain local worktree on the FILES ref backend answers all four
+        // probes with `stat`s of the per-worktree git dir (THE-718: these were 5
+        // forks per hydration, run twice). Anything else keeps the CLI probes
+        // below (see [`stat_gitdir`]).
+        let local_gitdir = stat_gitdir(loc);
         let exists = |what: &str| -> bool {
             if let Some(gd) = &local_gitdir {
                 return gd.join(what).is_file();
@@ -988,6 +982,22 @@ fn base_entry_valid(now: &BaseKey, stored: &BaseKey, age: std::time::Duration) -
     match (now, stored) {
         (Some(a), Some(b)) => a == b,
         _ => !should_reprobe_base(Some(age), GLYPH_BASE_TTL),
+    }
+}
+
+/// The per-worktree git dir whose pseudo-ref FILES answer `merge_state` by
+/// `stat`, or `None` when they cannot be trusted to: a remote/provider/bridged
+/// loc, no resolvable `.git`, or the reftable backend (MERGE_HEAD,
+/// CHERRY_PICK_HEAD and REVERT_HEAD live in the table there, so a missing file
+/// would read as "nothing in progress").
+fn stat_gitdir(loc: &GitLoc) -> Option<std::path::PathBuf> {
+    match loc {
+        GitLoc::Local(p)
+            if crate::bridge::for_loc(loc).is_none() && !thegn_core::git_memo::is_reftable(p) =>
+        {
+            thegn_core::git_memo::git_dir(p)
+        }
+        _ => None,
     }
 }
 
@@ -1956,6 +1966,19 @@ mod tests {
         // a ref named "".
         assert_eq!(base_from_probe(Some(""), |_| false), None);
         assert_eq!(base_from_probe(Some("  \n"), |_| false), None);
+    }
+
+    #[test]
+    fn merge_state_never_stats_a_reftable_repo() {
+        let dir = std::env::temp_dir().join(format!("tg-reftable-{}", std::process::id()));
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        let loc = GitLoc::Local(dir.clone());
+        assert!(stat_gitdir(&loc).is_some(), "files backend: stat path");
+        std::fs::create_dir_all(dir.join(".git/reftable")).unwrap();
+        assert!(stat_gitdir(&loc).is_none(), "reftable: CLI probes");
     }
 
     #[test]

@@ -583,7 +583,6 @@ if [ "$SAMPLER" = proc ]; then
   if ! proc_running "$PID"; then
     echo 'FAIL: thegn exited before the sample window ended — the numbers below are not a measurement' >&2
     SPAWN_FAIL=1
-    RES_FAIL=1
   fi
   if [ "$SPAWN_ENABLED" = 1 ]; then
     SPAWN_END_EPOCH="$(date +%s.%N)"
@@ -665,6 +664,12 @@ else
     -pid "$PID" -stats cpu 2>/dev/null |
     awk '/^%CPU/ { seen = 1; next } seen && NF { last = $1 } END { print last }')"
   [ -n "$PCT" ] || PCT=0
+  # Same rule as the /proc path: a process that died inside the window measured
+  # nothing (top prints a stale/zero sample), so fail rather than report it.
+  if ! proc_running "$PID"; then
+    echo 'FAIL: thegn exited before the sample window ended — the numbers below are not a measurement' >&2
+    SPAWN_FAIL=1
+  fi
   CORES_TOTAL="$(awk "BEGIN{printf \"%.4f\", $PCT/100}")"
 fi
 

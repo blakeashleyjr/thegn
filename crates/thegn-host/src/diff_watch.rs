@@ -41,13 +41,43 @@ static NEXT_GEN: AtomicU64 = AtomicU64::new(1);
 /// One watcher's claim to cover its worktree.
 pub(crate) struct Coverage {
     generation: AtomicU64,
+    /// Bumped only by branch/tag/packed-refs moves: lets the loop notice, in O(1)
+    /// on its existing model tick, that a ref moved even when the event's own
+    /// `MainRefMoved` was lost to the 500 ms refresh throttle.
+    ref_generation: AtomicU64,
     live: AtomicBool,
+}
+
+/// What the event classifier needs to know about the registration.
+pub(crate) struct Rules {
+    /// Non-recursively watched directories (plan entries + git roots): a
+    /// directory appearing directly under one is never registered.
+    nonrec: std::collections::HashSet<PathBuf>,
+    /// Paths whose removal/rename means the watched identity itself is gone or
+    /// replaced: the worktree root, every plan entry, every git root.
+    protected: std::collections::HashSet<PathBuf>,
+    ignore: ignore::gitignore::Gitignore,
+    /// Canonical git dir + common dir.
+    roots: Vec<PathBuf>,
+}
+
+/// Directories git creates directly under a git dir during ordinary operations
+/// (sequencer state, rerere) that nothing gated on the generation reads, so
+/// their appearance must not withdraw the claim for the rest of the watcher's
+/// life. `logs/`, `refs/`, `info/`, `modules/` and anything unknown still do.
+const EXEMPT_GIT_DIR_CHILDREN: &[&str] = &["rebase-merge", "rebase-apply", "sequencer", "rr-cache"];
+
+impl Rules {
+    fn is_git_root(&self, p: &Path) -> bool {
+        self.roots.iter().any(|r| r == p) || p.file_name().is_some_and(|n| n == ".git")
+    }
 }
 
 impl Coverage {
     fn new() -> Self {
         Self {
             generation: AtomicU64::new(NEXT_GEN.fetch_add(1, Ordering::SeqCst)),
+            ref_generation: AtomicU64::new(NEXT_GEN.fetch_add(1, Ordering::SeqCst)),
             live: AtomicBool::new(false),
         }
     }
@@ -57,28 +87,38 @@ impl Coverage {
             .store(NEXT_GEN.fetch_add(1, Ordering::SeqCst), Ordering::SeqCst);
     }
 
+    fn bump_refs(&self) {
+        self.ref_generation
+            .store(NEXT_GEN.fetch_add(1, Ordering::SeqCst), Ordering::SeqCst);
+    }
+
     fn withdraw(&self) {
         self.live.store(false, Ordering::SeqCst);
     }
 
-    /// Classify one watcher callback result; see the module docs.
-    fn observe(
-        &self,
-        res: &notify::Result<Event>,
-        nonrec: &std::collections::HashSet<PathBuf>,
-        ignore: &ignore::gitignore::Gitignore,
-        roots: &[PathBuf],
-    ) {
+    /// Classify one watcher callback result; see the module docs. Anything the
+    /// watcher cannot PROVE it saw completely withdraws the claim.
+    fn observe(&self, res: &notify::Result<Event>, rules: &Rules) {
         use notify::EventKind;
+        use notify::event::{ModifyKind, RenameMode};
         let ev = match res {
             Ok(ev) => ev,
             Err(_) => {
-                self.bump(); // the backend lost track of something
+                // A backend error (inotify watch limit, a failed watch on a new
+                // dir) means events may be missing from now on.
+                self.bump();
+                self.withdraw();
                 return;
             }
         };
         if matches!(ev.kind, EventKind::Access(_)) {
             return; // opens/closes without a write cannot change any answer
+        }
+        if ev.need_rescan() {
+            // Queue overflow: events were dropped, so nothing can be vouched for.
+            self.bump();
+            self.withdraw();
+            return;
         }
         // Two kinds of git-dir file change nothing thegn reads:
         // - `FETCH_HEAD`, the write-only record of the last fetch: git rewrites
@@ -88,10 +128,17 @@ impl Coverage {
         //   target's own event bumps) or deletes it unused (no state change; an
         //   up-to-date fetch does exactly that to `refs/remotes/origin/HEAD.lock`).
         // Only inside a git dir: `Cargo.lock` in the tree is a real edit.
-        if !ev.paths.is_empty() && ev.paths.iter().all(|p| is_git_bookkeeping(p, roots)) {
+        if !ev.paths.is_empty() && ev.paths.iter().all(|p| is_git_bookkeeping(p, &rules.roots)) {
             return;
         }
         self.bump();
+        if ev
+            .paths
+            .iter()
+            .any(|p| crate::git_watch::is_ref_move_path(p))
+        {
+            self.bump_refs();
+        }
         // Free when off (a cached-interest check): `THEGN_LOG=thegn::watch=debug`
         // names what moved the generation, which is the first question whenever
         // an idle backstop fires.
@@ -101,10 +148,36 @@ impl Coverage {
             path = ?ev.paths.first(),
             "change generation bumped"
         );
-        if matches!(ev.kind, EventKind::Create(_)) {
+        let name_event = matches!(ev.kind, EventKind::Modify(ModifyKind::Name(_)));
+        let arrives = matches!(ev.kind, EventKind::Create(_))
+            || matches!(
+                ev.kind,
+                EventKind::Modify(ModifyKind::Name(
+                    RenameMode::To | RenameMode::Both | RenameMode::Any | RenameMode::Other
+                ))
+            );
+        // The watched identity itself removed or replaced (worktree deleted and
+        // recreated at the same path, a git dir swapped): the watches are on the
+        // OLD inodes.
+        if (matches!(ev.kind, EventKind::Remove(_)) || name_event)
+            && ev.paths.iter().any(|p| rules.protected.contains(p))
+        {
+            self.withdraw();
+        }
+        if arrives {
             for p in &ev.paths {
-                let parent_unrecursed = p.parent().is_some_and(|d| nonrec.contains(d));
-                if parent_unrecursed && p.is_dir() && !crate::git_watch::prune_dir(p, ignore) {
+                let parent_unrecursed = p.parent().is_some_and(|d| rules.nonrec.contains(d));
+                if !parent_unrecursed || !p.is_dir() {
+                    continue;
+                }
+                if crate::git_watch::prune_dir(p, &rules.ignore) {
+                    continue;
+                }
+                let exempt = p.parent().is_some_and(|d| rules.is_git_root(d))
+                    && p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| EXEMPT_GIT_DIR_CHILDREN.contains(&n));
+                if !exempt {
                     // A new directory under a non-recursive watch is never
                     // registered, so edits inside it would go unseen.
                     self.withdraw();
@@ -205,6 +278,18 @@ pub(crate) fn current_print(path: &Path) -> Option<WatchPrint> {
     })
 }
 
+/// The ref-move generation for `path` while a live watcher vouches for it.
+pub(crate) fn current_ref_generation(path: &Path) -> Option<u64> {
+    let cov = registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(path)
+        .cloned()?;
+    cov.live
+        .load(Ordering::SeqCst)
+        .then(|| cov.ref_generation.load(Ordering::SeqCst))
+}
+
 /// A consumer's record of the print at which it last COMPLETED a pass over a
 /// path, so a periodic backstop can skip a pass when nothing has changed since
 /// (the generation is monotonic and covers every event, so equal prints mean an
@@ -223,15 +308,20 @@ impl Seen {
     /// [`mark`]: Seen::mark
     pub(crate) fn check(&self, path: &Path) -> (Option<WatchPrint>, bool) {
         let now = current_print(path);
-        let unchanged = now.is_some_and(|p| {
+        (now, self.matches(path, now))
+    }
+
+    /// Whether the last completed pass over `path` saw exactly `now` (a live
+    /// print). Split from [`check`](Seen::check) so callers can inject the print.
+    pub(crate) fn matches(&self, path: &Path, now: Option<WatchPrint>) -> bool {
+        now.is_some_and(|p| {
             self.0
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .as_ref()
                 .and_then(|m| m.get(path))
                 .is_some_and(|seen| *seen == p)
-        });
-        (now, unchanged)
+        })
     }
 
     /// Whether any pass over `path` has completed under a live print yet. A
@@ -258,6 +348,32 @@ impl Seen {
         }
         m.insert(path.to_path_buf(), print);
     }
+}
+
+/// After the watches are registered: every directory directly under a
+/// non-recursively watched plan entry is itself a plan entry or pruned. One that
+/// is neither appeared between the plan walk and registration, so it is
+/// unwatched, and the claim must not be made.
+fn plan_children_covered(
+    plan: &[crate::git_watch::WatchPlanEntry],
+    ignore: &ignore::gitignore::Gitignore,
+) -> bool {
+    let planned: std::collections::HashSet<&Path> = plan.iter().map(|e| e.path.as_path()).collect();
+    for entry in plan.iter().filter(|e| !e.recursive) {
+        let Ok(rd) = std::fs::read_dir(&entry.path) else {
+            return false;
+        };
+        for child in rd.flatten() {
+            if !child.file_type().is_ok_and(|t| t.is_dir()) {
+                continue;
+            }
+            let p = child.path();
+            if !planned.contains(p.as_path()) && !crate::git_watch::prune_dir(&p, ignore) {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 /// No tracked file matches an ignore rule (`git ls-files -ci`). Any failure to
@@ -353,6 +469,22 @@ pub(crate) fn build_diff_watcher(cwd: &Path, sink: RefreshSink) -> Option<Recomm
         .map(|e| e.path.clone())
         .chain(git_roots.iter().cloned())
         .collect();
+    let protected: std::collections::HashSet<PathBuf> = plan
+        .iter()
+        .map(|e| e.path.clone())
+        .chain(git_roots.iter().cloned())
+        .chain(std::iter::once(crate::git_watch::watch_canonical(&cwd)))
+        .collect();
+    // After registration: every directory directly under a non-recursively
+    // watched one must be a plan entry or pruned, else it appeared between the
+    // plan walk and the watches and is unwatched.
+    let ignore_check = ignore.clone();
+    let rules = Rules {
+        nonrec,
+        protected,
+        ignore,
+        roots,
+    };
     let kick_tx = tx.clone();
     let kick_wake = wake.clone();
     let cov = Arc::new(Coverage::new());
@@ -361,7 +493,7 @@ pub(crate) fn build_diff_watcher(cwd: &Path, sink: RefreshSink) -> Option<Recomm
         path: cwd.clone(),
     };
     let new_watcher = recommended_watcher(move |res: notify::Result<Event>| {
-        guard.cov.observe(&res, &nonrec, &ignore, &roots);
+        guard.cov.observe(&res, &rules);
         if let Ok(ev) = res
             && matches!(
                 ev.kind,
@@ -379,7 +511,7 @@ pub(crate) fn build_diff_watcher(cwd: &Path, sink: RefreshSink) -> Option<Recomm
             // as a freeze — from coming back.
             && (ev.paths.is_empty()
                 || ev.paths.iter().any(|p| {
-                    crate::git_watch::watcher_path_triggers_refresh(p, &roots, &ignore)
+                    crate::git_watch::watcher_path_triggers_refresh(p, &rules.roots, &rules.ignore)
                 }))
             && last_send.elapsed() > Duration::from_millis(500)
         {
@@ -538,13 +670,39 @@ pub(crate) fn build_diff_watcher(cwd: &Path, sink: RefreshSink) -> Option<Recomm
     // and common dir resolved, and no TRACKED file sits under a gitignore
     // pattern (the plan prunes ignored subtrees, so an edit to a force-added
     // file there would be invisible).
-    if recursive_ok
-        && registered == plan.len()
-        && external_ok
-        && git_dir.is_some()
-        && common_dir.is_some()
-        && no_tracked_ignored(&cwd)
+    // Beyond registration, the claim also needs: the plan to have been complete
+    // when the watches landed; an event source that can be trusted on this
+    // filesystem; a ref backend whose changes are files; and no submodules (their
+    // gitdirs under `<gitdir>/modules` are not watched).
+    let unwatched_reason = if !recursive_ok || registered != plan.len() || !external_ok {
+        Some("registration incomplete")
+    } else if git_dir.is_none() || common_dir.is_none() {
+        Some("git dirs unresolved")
+    } else if !plan_children_covered(&plan, &ignore_check) {
+        Some("a directory appeared between the plan walk and registration")
+    } else if crate::platform::fs_kind::unwatchable(&cwd)
+        || git_roots
+            .iter()
+            .any(|r| crate::platform::fs_kind::unwatchable(r))
     {
+        Some("network/userspace filesystem")
+    } else if thegn_core::git_memo::is_reftable(&cwd) {
+        Some("reftable ref backend")
+    } else if cwd.join(".gitmodules").exists() {
+        Some("submodules")
+    } else if !no_tracked_ignored(&cwd) {
+        Some("tracked file under an ignore rule")
+    } else {
+        None
+    };
+    if let Some(reason) = unwatched_reason {
+        tracing::debug!(
+            target: "thegn::watch",
+            worktree = %cwd.display(),
+            reason,
+            "no change-generation claim"
+        );
+    } else {
         publish(&cwd, &cov);
         // Registration completing is an EVENT: everything before it was seen by
         // pre-watcher passes (startup heal, crawl, commit refresh) and anything
@@ -902,7 +1060,13 @@ mod tests {
             let at = settle(&r);
             let p = crate::hydrate::build_panel(&r, &db, &hints, &cfg);
             // The snapshot the build stored is exactly the one a repeat uses.
-            let again = crate::panel_git_cache::get(&r, at);
+            let again = crate::panel_git_cache::get(
+                &r,
+                (
+                    at,
+                    thegn_core::git_memo::global_git_print().expect("global layer"),
+                ),
+            );
             assert!(
                 again.is_some(),
                 "{why}: build stored a snapshot at the settled print"
@@ -1065,6 +1229,209 @@ mod tests {
         assert!(!seen.marked(p), "a print-less pass is not a marked one");
         seen.mark(p, Some(WatchPrint::for_test(1, 1)));
         assert!(seen.marked(p));
+    }
+
+    // ---- classifier: staleness proofs (pure; no inotify) -------------------
+
+    fn live_cov() -> Coverage {
+        let c = Coverage::new();
+        c.live.store(true, Ordering::SeqCst);
+        c
+    }
+
+    fn rules_for(base: &Path) -> Rules {
+        let root = base.join("wt");
+        let gitdir = root.join(".git");
+        std::fs::create_dir_all(&gitdir).unwrap();
+        let nonrec: std::collections::HashSet<PathBuf> =
+            [root.clone(), gitdir.clone()].into_iter().collect();
+        let protected: std::collections::HashSet<PathBuf> = [
+            root.clone(),
+            gitdir.clone(),
+            gitdir.join("refs"),
+            root.join("src"),
+        ]
+        .into_iter()
+        .collect();
+        Rules {
+            nonrec,
+            protected,
+            ignore: ignore::gitignore::Gitignore::empty(),
+            roots: vec![gitdir],
+        }
+    }
+
+    fn ev(kind: notify::EventKind, paths: &[&Path]) -> notify::Result<notify::Event> {
+        let mut e = notify::Event::new(kind);
+        for p in paths {
+            e = e.add_path(p.to_path_buf());
+        }
+        Ok(e)
+    }
+
+    #[test]
+    fn a_backend_error_or_overflow_withdraws_the_claim() {
+        let base = scratch("cls-err");
+        let rules = rules_for(&base);
+        let c = live_cov();
+        c.observe(&Err(notify::Error::generic("inotify watch limit")), &rules);
+        assert!(!c.live.load(Ordering::SeqCst), "error must withdraw");
+        let c = live_cov();
+        let overflow =
+            notify::Event::new(notify::EventKind::Other).set_flag(notify::event::Flag::Rescan);
+        c.observe(&Ok(overflow), &rules);
+        assert!(!c.live.load(Ordering::SeqCst), "Q_OVERFLOW must withdraw");
+    }
+
+    #[test]
+    fn a_directory_renamed_into_a_non_recursive_parent_withdraws() {
+        use notify::EventKind::Modify;
+        use notify::event::{ModifyKind::Name, RenameMode};
+        let base = scratch("cls-rename");
+        let rules = rules_for(&base);
+        let root = base.join("wt");
+        let moved = root.join("moved_in");
+        std::fs::create_dir_all(&moved).unwrap();
+        let file = root.join("f.txt");
+        std::fs::write(&file, "x").unwrap();
+        for mode in [RenameMode::To, RenameMode::Both, RenameMode::Any] {
+            let c = live_cov();
+            let paths: Vec<&Path> = if mode == RenameMode::Both {
+                vec![Path::new("/elsewhere/old"), moved.as_path()]
+            } else {
+                vec![moved.as_path()]
+            };
+            c.observe(&ev(Modify(Name(mode)), &paths), &rules);
+            assert!(
+                !c.live.load(Ordering::SeqCst),
+                "{mode:?} of a dir must withdraw"
+            );
+        }
+        // A FILE moved in is an ordinary edit.
+        let c = live_cov();
+        c.observe(&ev(Modify(Name(RenameMode::To)), &[&file]), &rules);
+        assert!(c.live.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn removing_or_replacing_a_watched_root_withdraws() {
+        use notify::EventKind::{Modify, Remove};
+        use notify::event::{ModifyKind::Name, RemoveKind, RenameMode};
+        let base = scratch("cls-remove");
+        let rules = rules_for(&base);
+        let root = base.join("wt");
+        for gone in [
+            root.clone(),
+            root.join(".git"),
+            root.join(".git/refs"),
+            root.join("src"),
+        ] {
+            let c = live_cov();
+            c.observe(&ev(Remove(RemoveKind::Folder), &[&gone]), &rules);
+            assert!(!c.live.load(Ordering::SeqCst), "remove {gone:?}");
+            let c = live_cov();
+            c.observe(&ev(Modify(Name(RenameMode::From)), &[&gone]), &rules);
+            assert!(!c.live.load(Ordering::SeqCst), "rename-from {gone:?}");
+        }
+        // An unrelated file removed is just a change.
+        let c = live_cov();
+        c.observe(
+            &ev(Remove(RemoveKind::File), &[&root.join("other.txt")]),
+            &rules,
+        );
+        assert!(c.live.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn sequencer_dirs_under_a_git_dir_do_not_withdraw_but_logs_refs_modules_do() {
+        use notify::EventKind::Create;
+        use notify::event::CreateKind;
+        let base = scratch("cls-exempt");
+        let rules = rules_for(&base);
+        let gitdir = base.join("wt/.git");
+        for ok in ["rebase-merge", "rebase-apply", "sequencer", "rr-cache"] {
+            let d = gitdir.join(ok);
+            std::fs::create_dir_all(&d).unwrap();
+            let c = live_cov();
+            c.observe(&ev(Create(CreateKind::Folder), &[&d]), &rules);
+            assert!(c.live.load(Ordering::SeqCst), "{ok} must not withdraw");
+        }
+        for bad in ["logs", "refs2", "info", "modules", "mystery"] {
+            let d = gitdir.join(bad);
+            std::fs::create_dir_all(&d).unwrap();
+            let c = live_cov();
+            c.observe(&ev(Create(CreateKind::Folder), &[&d]), &rules);
+            assert!(!c.live.load(Ordering::SeqCst), "{bad} must withdraw");
+        }
+    }
+
+    #[test]
+    fn only_ref_moves_advance_the_ref_generation() {
+        use notify::EventKind::Modify;
+        use notify::event::{DataChange, ModifyKind::Data};
+        let base = scratch("cls-refgen");
+        let rules = rules_for(&base);
+        let c = live_cov();
+        let r0 = c.ref_generation.load(Ordering::SeqCst);
+        let g0 = c.generation.load(Ordering::SeqCst);
+        let edit = Modify(Data(DataChange::Any));
+        c.observe(&ev(edit, &[&base.join("wt/src/main.rs")]), &rules);
+        assert_ne!(g0, c.generation.load(Ordering::SeqCst));
+        assert_eq!(
+            r0,
+            c.ref_generation.load(Ordering::SeqCst),
+            "an edit is no ref move"
+        );
+        c.observe(&ev(edit, &[&base.join("wt/.git/refs/heads/x")]), &rules);
+        assert_ne!(r0, c.ref_generation.load(Ordering::SeqCst));
+        let r1 = c.ref_generation.load(Ordering::SeqCst);
+        c.observe(&ev(edit, &[&base.join("wt/.git/packed-refs")]), &rules);
+        assert_ne!(r1, c.ref_generation.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn a_directory_that_appeared_after_the_plan_walk_is_not_covered() {
+        let base = scratch("cls-plancover");
+        let root = base.join("wt");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("target")).unwrap();
+        let ignore = {
+            let mut b = ignore::gitignore::GitignoreBuilder::new(&root);
+            b.add_line(None, "target/").unwrap();
+            b.build().unwrap()
+        };
+        let plan = vec![
+            crate::git_watch::WatchPlanEntry {
+                path: root.clone(),
+                recursive: false,
+            },
+            crate::git_watch::WatchPlanEntry {
+                path: root.join("src"),
+                recursive: true,
+            },
+        ];
+        assert!(
+            plan_children_covered(&plan, &ignore),
+            "src planned, target pruned"
+        );
+        std::fs::create_dir_all(root.join("late")).unwrap();
+        assert!(
+            !plan_children_covered(&plan, &ignore),
+            "`late` is neither planned nor pruned"
+        );
+    }
+
+    #[test]
+    fn submodules_and_reftable_withhold_the_claim() {
+        let base = scratch("withhold");
+        let a = repo(&base, "sub", false);
+        std::fs::write(a.join(".gitmodules"), "[submodule \"x\"]\n").unwrap();
+        let _wa = watch(&a);
+        assert_eq!(print(&a), None, "submodule gitdirs are not watched");
+        let b = repo(&base, "rt", false);
+        std::fs::create_dir_all(b.join(".git/reftable")).unwrap();
+        let _wb = watch(&b);
+        assert_eq!(print(&b), None, "reftable refs are not files");
     }
 
     #[test]

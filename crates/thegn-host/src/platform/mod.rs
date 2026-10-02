@@ -161,6 +161,9 @@ pub(crate) mod qos;
 
 pub(crate) mod sound;
 
+/// Network/userspace filesystem classification (can a watch be trusted here?).
+pub(crate) mod fs_kind;
+
 // THE-505 opened config-source adapter; intentionally unwired until review.
 #[allow(dead_code)]
 pub(crate) mod config_file_capture;

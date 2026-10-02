@@ -17,16 +17,36 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::SystemTime;
 
-/// mtime + length of one file or directory; `None` stands for "absent".
+/// mtime + length + kind + inode + ctime of one file or directory; `None`
+/// stands for "absent". Inode and ctime catch a same-size rewrite whose mtime
+/// did not move (a restored timestamp, a coarse-granularity filesystem).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Stamp(Option<(Option<SystemTime>, u64, bool)>);
+pub struct Stamp(Option<(Option<SystemTime>, u64, bool, u64, i64)>);
 
 fn stamp(path: &Path) -> Stamp {
-    Stamp(
-        std::fs::metadata(path)
-            .ok()
-            .map(|m| (m.modified().ok(), m.len(), m.is_dir())),
-    )
+    Stamp(std::fs::metadata(path).ok().map(|m| {
+        let (ino, ctime) = crate::util::meta_identity(&m);
+        (m.modified().ok(), m.len(), m.is_dir(), ino, ctime)
+    }))
+}
+
+/// Whether the repo uses the reftable ref backend (`<common>/reftable`): refs
+/// then live in tables, not files, so no file stamp or stat can see them.
+pub fn is_reftable(dir: &Path) -> bool {
+    crate::util::git_common_dir(dir).join("reftable").exists()
+}
+
+fn hash_text(s: &str) -> (usize, u64) {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut h);
+    (s.len(), h.finish())
+}
+
+/// Git's boolean parse for environment/config values.
+fn git_bool(v: &str) -> bool {
+    let v = v.trim().to_ascii_lowercase();
+    matches!(v.as_str(), "1" | "true" | "yes" | "on") || v.parse::<i64>().is_ok_and(|n| n != 0)
 }
 
 /// What a worktree's repo-identity answer was derived from.
@@ -136,7 +156,9 @@ const MAX_INCLUDE_DEPTH: usize = 8;
 /// environment.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OriginInputs {
-    files: Vec<(PathBuf, Option<String>)>,
+    // Content is folded in as (len, hash), not stored: a large global config
+    // would otherwise be held in every memo entry.
+    files: Vec<(PathBuf, Option<(usize, u64)>)>,
     env: Vec<(String, String)>,
 }
 
@@ -182,16 +204,38 @@ fn key_value(line: &str, key: &str) -> Option<String> {
         return None;
     }
     let rest = l[key.len()..].trim_start();
-    let v = rest.strip_prefix('=')?.trim();
-    let v = v.trim_matches('"');
-    (!v.is_empty()).then(|| v.to_string())
+    let v = config_value(rest.strip_prefix('=')?);
+    (!v.is_empty()).then_some(v)
+}
+
+/// A git config value: surrounding/inner double quotes dropped, backslash
+/// escapes kept literally, and an UNQUOTED `#` or `;` starts a comment.
+fn config_value(raw: &str) -> String {
+    let mut out = String::new();
+    let mut in_quote = false;
+    let mut escaped = false;
+    for c in raw.trim().chars() {
+        if escaped {
+            out.push(c);
+            escaped = false;
+        } else if c == '\\' {
+            escaped = true;
+        } else if c == '"' {
+            in_quote = !in_quote;
+        } else if !in_quote && (c == '#' || c == ';') {
+            break;
+        } else {
+            out.push(c);
+        }
+    }
+    out.trim().to_string()
 }
 
 fn push_config(
     path: PathBuf,
     home: Option<&Path>,
     depth: usize,
-    files: &mut Vec<(PathBuf, Option<String>)>,
+    files: &mut Vec<(PathBuf, Option<(usize, u64)>)>,
 ) -> Option<()> {
     if files.iter().any(|(p, _)| *p == path) {
         return Some(());
@@ -201,8 +245,16 @@ fn push_config(
     if content.is_none() && path.exists() {
         return None;
     }
+    // `includeIf "onbranch:..."` depends on the CURRENT branch, which the
+    // over-approximation by file list cannot model: bypass.
+    if content
+        .as_deref()
+        .is_some_and(|c| c.to_ascii_lowercase().contains("onbranch:"))
+    {
+        return None;
+    }
     let includes = content.as_deref().map(include_paths).unwrap_or_default();
-    files.push((path.clone(), content));
+    files.push((path.clone(), content.as_deref().map(hash_text)));
     if includes.is_empty() {
         return Some(());
     }
@@ -224,6 +276,101 @@ fn push_config(
     Some(())
 }
 
+/// The system config path git uses, asked of git itself ONCE (`git var
+/// GIT_CONFIG_SYSTEM`) rather than assumed to be `/etc/gitconfig` (nix, homebrew
+/// and `$PREFIX` builds differ). `None` = git could not say, so no print.
+fn system_config_path() -> Option<PathBuf> {
+    static PATH: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    PATH.get_or_init(|| {
+        crate::util::git_out(&std::env::temp_dir(), &["var", "GIT_CONFIG_SYSTEM"])
+            .map(PathBuf::from)
+    })
+    .clone()
+}
+
+/// System + global config files (and their includes) into `files`.
+fn global_config_files(
+    env: &dyn Fn(&str) -> Option<String>,
+    home: Option<&Path>,
+    files: &mut Vec<(PathBuf, Option<(usize, u64)>)>,
+) -> Option<()> {
+    if !env("GIT_CONFIG_NOSYSTEM").is_some_and(|v| git_bool(&v)) {
+        let sys = match env("GIT_CONFIG_SYSTEM") {
+            Some(s) => PathBuf::from(s),
+            None => system_config_path()?,
+        };
+        push_config(sys, home, 0, files)?;
+    }
+    match env("GIT_CONFIG_GLOBAL") {
+        Some(g) => push_config(PathBuf::from(g), home, 0, files)?,
+        None => {
+            if let Some(h) = home {
+                push_config(h.join(".gitconfig"), home, 0, files)?;
+            }
+            let xdg = env("XDG_CONFIG_HOME")
+                .map(PathBuf::from)
+                .or_else(|| home.map(|h| h.join(".config")));
+            if let Some(x) = xdg {
+                push_config(x.join("git/config"), home, 0, files)?;
+            }
+        }
+    }
+    Some(())
+}
+
+/// A hash of what the GLOBAL layer contributes to `status`/`diff`/`stash`
+/// besides the repo's own files: the system and global configs (and includes),
+/// and the global excludes file -- `core.excludesFile` from those configs, else
+/// the default `$XDG_CONFIG_HOME/git/ignore`. The fs-watcher covers the repo, not
+/// `$HOME`, so a snapshot cache keys on this too. `None` = cannot be computed
+/// completely, in which case callers must not serve a snapshot.
+pub fn global_git_print() -> Option<u64> {
+    global_git_print_with(&|k| std::env::var(k).ok())
+}
+
+/// [`global_git_print`] with an injectable environment.
+pub fn global_git_print_with(env: &dyn Fn(&str) -> Option<String>) -> Option<u64> {
+    use std::hash::{Hash, Hasher};
+    let home = env("HOME").map(PathBuf::from);
+    let mut files = Vec::new();
+    global_config_files(env, home.as_deref(), &mut files)?;
+    let mut excludes: Option<PathBuf> = None;
+    for (path, _) in &files {
+        let Some(text) = read_config(path) else {
+            continue;
+        };
+        for line in text.lines() {
+            if let Some(v) = key_value(line, "excludesfile") {
+                excludes = Some(match v.strip_prefix("~/") {
+                    Some(rest) => home.as_ref()?.join(rest),
+                    None => PathBuf::from(v),
+                });
+            }
+        }
+    }
+    let excludes = excludes.or_else(|| {
+        env("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .or_else(|| home.as_ref().map(|h| h.join(".config")))
+            .map(|x| x.join("git/ignore"))
+    });
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    files.hash(&mut h);
+    if let Some(e) = &excludes {
+        e.hash(&mut h);
+        // Content (small, capped), not just a stamp.
+        read_config(e).as_deref().map(hash_text).hash(&mut h);
+    }
+    for k in [
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_CONFIG_GLOBAL",
+    ] {
+        env(k).hash(&mut h);
+    }
+    Some(h.finish())
+}
+
 /// Compute the [`OriginInputs`] for `dir`, reading the environment through
 /// `env` (injectable for tests). `None` = cannot be fingerprinted completely.
 pub fn origin_inputs(dir: &Path, env: &dyn Fn(&str) -> Option<String>) -> Option<OriginInputs> {
@@ -236,28 +383,7 @@ pub fn origin_inputs(dir: &Path, env: &dyn Fn(&str) -> Option<String>) -> Option
     let home = env("HOME").map(PathBuf::from);
     let common = crate::util::git_common_dir(dir);
     let mut files = Vec::new();
-    // system
-    if env("GIT_CONFIG_NOSYSTEM").is_none() {
-        let sys = env("GIT_CONFIG_SYSTEM")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("/etc/gitconfig"));
-        push_config(sys, home.as_deref(), 0, &mut files)?;
-    }
-    // global
-    match env("GIT_CONFIG_GLOBAL") {
-        Some(g) => push_config(PathBuf::from(g), home.as_deref(), 0, &mut files)?,
-        None => {
-            if let Some(h) = &home {
-                push_config(h.join(".gitconfig"), home.as_deref(), 0, &mut files)?;
-            }
-            let xdg = env("XDG_CONFIG_HOME")
-                .map(PathBuf::from)
-                .or_else(|| home.as_ref().map(|h| h.join(".config")));
-            if let Some(x) = xdg {
-                push_config(x.join("git/config"), home.as_deref(), 0, &mut files)?;
-            }
-        }
-    }
+    global_config_files(env, home.as_deref(), &mut files)?;
     // repo: shared config, per-worktree config, legacy remotes file
     push_config(common.join("config"), home.as_deref(), 0, &mut files)?;
     push_config(
@@ -892,6 +1018,136 @@ mod tests {
         assert_eq!(run(false), 1);
         assert_eq!(run(true), 2, "the transient answer was not remembered");
         assert_eq!(run(true), 2, "a cacheable one is");
+    }
+
+    #[test]
+    fn nosystem_is_a_git_boolean_and_the_system_file_is_folded_in_otherwise() {
+        let base = tmp("nosystem");
+        let repo = repo_with_config(&base, "");
+        let sys = base.join("sysconfig");
+        std::fs::write(&sys, "[core]\n\tx = 1\n").unwrap();
+        let (h, s) = (base.to_str().unwrap(), sys.to_str().unwrap());
+        let env = |nosys: &'static str| {
+            env_of(&[
+                ("HOME", h),
+                ("GIT_CONFIG_SYSTEM", s),
+                ("GIT_CONFIG_NOSYSTEM", nosys),
+            ])
+        };
+        for falsy in ["0", "false", "no", "off", ""] {
+            let a = origin_fingerprint(&repo, &env(falsy)).unwrap();
+            std::fs::write(&sys, format!("[core]\n\tx = {falsy}2\n")).unwrap();
+            assert_ne!(
+                a,
+                origin_fingerprint(&repo, &env(falsy)).unwrap(),
+                "NOSYSTEM={falsy:?} still reads the system config"
+            );
+        }
+        for truthy in ["1", "true", "yes", "on", "2"] {
+            let a = origin_fingerprint(&repo, &env(truthy)).unwrap();
+            std::fs::write(&sys, format!("[core]\n\tx = {truthy}3\n")).unwrap();
+            let b = origin_fingerprint(&repo, &env(truthy)).unwrap();
+            assert_eq!(a, b, "NOSYSTEM={truthy:?} ignores it");
+        }
+    }
+
+    #[test]
+    fn include_path_comments_are_stripped_and_onbranch_bypasses() {
+        assert_eq!(config_value(" ~/x.cfg # work"), "~/x.cfg");
+        assert_eq!(config_value("a;b"), "a");
+        assert_eq!(config_value("\"a b#c\" ; tail"), "a b#c");
+        assert_eq!(config_value("a\\#b"), "a#b");
+        let base = tmp("includecomment");
+        let home = base.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            home.join(".gitconfig"),
+            "[include]\n\tpath = extra.cfg # note\n",
+        )
+        .unwrap();
+        std::fs::write(home.join("extra.cfg"), "[core]\n\ta = 1\n").unwrap();
+        let repo = repo_with_config(&base, "");
+        let env = env_of(&[
+            ("HOME", home.to_str().unwrap()),
+            ("GIT_CONFIG_NOSYSTEM", "1"),
+        ]);
+        let a = origin_fingerprint(&repo, &env).unwrap();
+        std::fs::write(home.join("extra.cfg"), "[core]\n\ta = 22\n").unwrap();
+        assert_ne!(
+            a,
+            origin_fingerprint(&repo, &env).unwrap(),
+            "the commented include is followed"
+        );
+        std::fs::write(
+            home.join(".gitconfig"),
+            "[includeIf \"onbranch:main\"]\n\tpath = extra.cfg\n",
+        )
+        .unwrap();
+        assert_eq!(
+            origin_fingerprint(&repo, &env),
+            None,
+            "branch-conditional include"
+        );
+    }
+
+    #[test]
+    fn global_print_follows_global_config_and_the_excludes_file() {
+        let base = tmp("globalprint");
+        let home = base.join("home");
+        std::fs::create_dir_all(home.join(".config/git")).unwrap();
+        let h = home.to_str().unwrap();
+        let env = env_of(&[("HOME", h), ("GIT_CONFIG_NOSYSTEM", "1")]);
+        let a = global_git_print_with(&env).expect("computable");
+        assert_eq!(a, global_git_print_with(&env).unwrap());
+        // The default excludes file.
+        std::fs::write(home.join(".config/git/ignore"), "*.tmp\n").unwrap();
+        let b = global_git_print_with(&env).unwrap();
+        assert_ne!(a, b);
+        // Global config edit.
+        std::fs::write(home.join(".gitconfig"), "[user]\n\tname = x\n").unwrap();
+        let c = global_git_print_with(&env).unwrap();
+        assert_ne!(b, c);
+        // core.excludesFile redirects the excludes file; its content then counts.
+        let ex = home.join("myignore");
+        std::fs::write(&ex, "a\n").unwrap();
+        std::fs::write(
+            home.join(".gitconfig"),
+            format!("[core]\n\texcludesFile = {}\n", ex.display()),
+        )
+        .unwrap();
+        let d = global_git_print_with(&env).unwrap();
+        std::fs::write(&ex, "b\n").unwrap();
+        assert_ne!(d, global_git_print_with(&env).unwrap(), "excludes content");
+    }
+
+    #[test]
+    fn a_stamp_sees_a_same_size_rewrite_whose_mtime_was_restored() {
+        let base = tmp("stamp");
+        let f = base.join("f");
+        std::fs::write(&f, "aaaa").unwrap();
+        let t = std::fs::metadata(&f).unwrap().modified().unwrap();
+        let before = stamp(&f);
+        // Replace with same-length content, atomically, and restore the mtime.
+        let tmpf = base.join("f.new");
+        std::fs::write(&tmpf, "bbbb").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&tmpf)
+            .unwrap()
+            .set_modified(t)
+            .unwrap();
+        std::fs::rename(&tmpf, &f).unwrap();
+        assert_eq!(std::fs::metadata(&f).unwrap().modified().unwrap(), t);
+        assert_ne!(before, stamp(&f), "inode/ctime must move the stamp");
+    }
+
+    #[test]
+    fn reftable_is_detected_from_the_common_dir() {
+        let base = tmp("reftable");
+        let repo = repo_with_config(&base, "");
+        assert!(!is_reftable(&repo));
+        std::fs::create_dir_all(repo.join(".git/reftable")).unwrap();
+        assert!(is_reftable(&repo));
     }
 
     #[test]
