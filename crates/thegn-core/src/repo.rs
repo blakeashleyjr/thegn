@@ -80,26 +80,48 @@ pub fn worktree_root_for_cwd(cwd: &Path) -> Option<PathBuf> {
 /// repo) cannot be fingerprinted and still spawns every call, as before.
 pub fn main_worktree(dir: &Path) -> Option<PathBuf> {
     static MEMO: Mutex<Option<git_memo::Memo<Option<PathBuf>>>> = Mutex::new(None);
-    git_memo::memoised(&MEMO, MAIN_WORKTREE_MEMO_CAP, dir, || {
-        main_worktree_uncached(dir)
-    })
+    git_memo::memoised_checked(
+        &MEMO,
+        MAIN_WORKTREE_MEMO_CAP,
+        dir,
+        git_memo::fingerprint(dir),
+        || main_worktree_checked(dir),
+    )
 }
 
 const MAIN_WORKTREE_MEMO_CAP: usize = 512;
 
-fn main_worktree_uncached(dir: &Path) -> Option<PathBuf> {
-    let common = util::git_out(
-        dir,
-        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-    )?;
+/// The subprocess answer plus whether it is memoisable: a git that could not be
+/// spawned is transient (EAGAIN/EMFILE under load) and must not be remembered;
+/// a non-zero exit is deterministic for the fingerprinted inputs and may be.
+fn main_worktree_checked(dir: &Path) -> (Option<PathBuf>, bool) {
+    let out = util::git_cmd(dir)
+        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .output();
+    let Ok(out) = out else {
+        return (None, false);
+    };
+    if !out.status.success() {
+        return (None, true);
+    }
+    let common = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if common.is_empty() {
+        return (None, true);
+    }
     let common = PathBuf::from(common);
     // Normal repo: ".../.git" -> parent is the main worktree.
     // Bare repo: the common dir is the repo itself.
-    if common.file_name().map(|n| n == ".git").unwrap_or(false) {
+    let root = if common.file_name().map(|n| n == ".git").unwrap_or(false) {
         common.parent().map(|p| p.to_path_buf())
     } else {
         Some(common)
-    }
+    };
+    (root, true)
+}
+
+#[cfg(test)]
+fn main_worktree_uncached(dir: &Path) -> Option<PathBuf> {
+    main_worktree_checked(dir).0
 }
 
 pub fn is_bare(dir: &Path) -> bool {

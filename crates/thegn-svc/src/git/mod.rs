@@ -873,10 +873,12 @@ const GLYPH_BASE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 /// on the hot path. Mirrors the shape of the host's `branch_cache`.
 #[allow(clippy::type_complexity)]
 fn base_cache() -> &'static std::sync::Mutex<
-    std::collections::HashMap<String, (Option<String>, std::time::Instant)>,
+    std::collections::HashMap<String, (Option<String>, std::time::Instant, BaseKey)>,
 > {
     static CACHE: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<String, (Option<String>, std::time::Instant)>>,
+        std::sync::Mutex<
+            std::collections::HashMap<String, (Option<String>, std::time::Instant, BaseKey)>,
+        >,
     > = std::sync::OnceLock::new();
     CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
@@ -928,10 +930,21 @@ fn base_from_probe(origin_head: Option<&str>, has_local: impl Fn(&str) -> bool) 
 /// scan is hot.
 fn glyph_base(loc: &GitLoc) -> Option<String> {
     let key = loc.path();
+    // A plain local worktree is validated by what the probe reads (the
+    // `origin/HEAD` symref, the candidate loose heads, packed-refs) instead of a
+    // clock: an unchanged print means the probe answers the same, so the 60 s
+    // re-probe (two forks per active worktree per minute, THE-718) is skipped.
+    // No print (remote/bridged loc, reftable, no resolvable git dir) keeps the TTL.
+    let print = match loc {
+        GitLoc::Local(p) if crate::bridge::for_loc(loc).is_none() => {
+            thegn_core::git_memo::base_refs_print(p)
+        }
+        _ => None,
+    };
     {
         let cache = base_cache().lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((base, at)) = cache.get(&key)
-            && !should_reprobe_base(Some(at.elapsed()), GLYPH_BASE_TTL)
+        if let Some((base, at, stored)) = cache.get(&key)
+            && base_entry_valid(&print, stored, at.elapsed())
         {
             return base.clone();
         }
@@ -962,8 +975,20 @@ fn glyph_base(loc: &GitLoc) -> Option<String> {
     base_cache()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .insert(key, (base.clone(), std::time::Instant::now()));
+        .insert(key, (base.clone(), std::time::Instant::now(), print));
     base
+}
+
+/// What a cached default-base resolution was validated by when stored.
+type BaseKey = Option<thegn_core::git_memo::BaseRefsPrint>;
+
+/// Whether a cached resolution may be served: by an equal refs print when both
+/// sides have one, otherwise by the TTL. Pure.
+fn base_entry_valid(now: &BaseKey, stored: &BaseKey, age: std::time::Duration) -> bool {
+    match (now, stored) {
+        (Some(a), Some(b)) => a == b,
+        _ => !should_reprobe_base(Some(age), GLYPH_BASE_TTL),
+    }
 }
 
 /// The bridged half of [`GitBackend::glyph_reads`]: for a **bridged** loc the
@@ -1931,6 +1956,32 @@ mod tests {
         // a ref named "".
         assert_eq!(base_from_probe(Some(""), |_| false), None);
         assert_eq!(base_from_probe(Some("  \n"), |_| false), None);
+    }
+
+    #[test]
+    fn base_entry_is_validated_by_the_refs_print_not_the_clock() {
+        let dir = std::env::temp_dir().join(format!("tg-baseprint-{}", std::process::id()));
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+        std::fs::create_dir_all(dir.join(".git/refs/heads")).unwrap();
+        std::fs::write(dir.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        let a = thegn_core::git_memo::base_refs_print(&dir);
+        assert!(a.is_some());
+        let old = GLYPH_BASE_TTL * 10;
+        // Equal prints: valid however old the entry is.
+        assert!(base_entry_valid(&a, &a, old));
+        // A moved print: invalid even when brand new.
+        std::fs::write(dir.join(".git/refs/heads/main"), "0\n").unwrap();
+        let b = thegn_core::git_memo::base_refs_print(&dir);
+        assert!(!base_entry_valid(&b, &a, std::time::Duration::ZERO));
+        // No print on either side: the TTL decides, as before.
+        assert!(base_entry_valid(&None, &None, std::time::Duration::ZERO));
+        assert!(!base_entry_valid(&None, &None, old));
+        assert!(
+            !base_entry_valid(&a, &None, old),
+            "mixed falls back to the TTL"
+        );
     }
 
     #[test]
