@@ -227,7 +227,7 @@ fn unsupported(what: &str) -> io::Error {
 }
 
 #[derive(Debug)]
-#[allow(dead_code)] // Unix socket error context; Unix-only production call sites.
+#[cfg_attr(not(unix), allow(dead_code))] // Unix-only production call sites.
 struct IoPathContext {
     operation: &'static str,
     path: PathBuf,
@@ -247,12 +247,14 @@ impl std::fmt::Display for IoPathContext {
 }
 
 impl std::error::Error for IoPathContext {
+    // `Display` already renders the cause; exposing it again as `source()`
+    // makes anyhow's chain print it twice.
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.source)
+        None
     }
 }
 
-#[allow(dead_code)] // Unix socket error context; Unix-only production call sites.
+#[cfg_attr(not(unix), allow(dead_code))] // Unix-only production call sites.
 fn io_error_with_path_context(
     source: io::Error,
     operation: &'static str,
@@ -292,6 +294,7 @@ fn bind_lock(sock: &Path) -> Option<std::fs::File> {
     Some(file)
 }
 
+#[cfg_attr(not(unix), allow(dead_code))] // Unix-only production call site.
 fn require_live_endpoint(
     bind_error: io::Error,
     probe: io::Result<()>,
@@ -762,15 +765,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir); // best-effort: test tmp cleanup
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     #[allow(
         clippy::permissions_set_readonly_false,
         reason = "restores a private temp dir only so the test can delete it"
     )]
     async fn failed_stale_socket_removal_is_a_contextual_startup_error() {
-        if !cfg!(unix) {
-            return;
-        }
         let dir =
             std::env::temp_dir().join(format!("thegn-ipc-unremovable-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir); // best-effort: test tmp cleanup
@@ -802,7 +803,9 @@ mod tests {
 
         let error = match IpcListener::bind_exclusive(&ep).await {
             Ok(BindOutcome::AlreadyRunning) => panic!("an unremovable path is not a live daemon"),
-            Ok(BindOutcome::Bound(_)) => panic!("a directory cannot be bound as a socket"),
+            Ok(BindOutcome::Bound(_)) => {
+                panic!("a stale socket in a read-only directory must not bind")
+            }
             Err(error) => error,
         };
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
@@ -827,7 +830,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir); // best-effort: test tmp cleanup
         std::fs::create_dir_all(&dir).unwrap();
         let sock = dir.join("d.sock");
-        std::fs::write(&sock, b"not a listener").unwrap();
 
         assert!(
             require_live_endpoint(
