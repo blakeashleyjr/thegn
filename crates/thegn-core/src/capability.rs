@@ -743,6 +743,12 @@ pub const CATALOG: &[HostCapability] = &[
         SurfaceSet::ALL,
         "Create a worktree, optionally from an issue (branch from its hint, link it)",
     ),
+    cap(
+        "folders.assign",
+        Verb::FolderAssign,
+        SurfaceSet::ALL,
+        "Assign or clear a worktree's repo-local sidebar folder",
+    ),
     // --- workspace search & replace (THE-5) ---------------------------------
     // Driven by the local `thegn search` CLI verb (in-process against the
     // worktree filesystem, like `thegn open`/`wt list`), not the control API —

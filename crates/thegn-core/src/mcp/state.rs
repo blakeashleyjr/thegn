@@ -109,6 +109,34 @@ pub const STATE_TOOLS: &[StateToolSpec] = &[
         args: &[],
     },
     StateToolSpec {
+        cap: "folders.assign",
+        description: "Assign a repo-local sidebar folder to a Git worktree, or clear its folder. \
+                      Folder names are trimmed and matched case-insensitively within that \
+                      worktree's repository. Pass exactly one of `folder` (assign) or \
+                      `clear: true` (unfile); clearing never deletes the folder. \
+                      Git-scoped; requires a running daemon.",
+        args: &[
+            ArgSpec {
+                name: "worktree",
+                kind: ArgKind::String,
+                required: true,
+                description: "Path inside the Git worktree",
+            },
+            ArgSpec {
+                name: "folder",
+                kind: ArgKind::String,
+                required: false,
+                description: "Folder name to assign; exclusive with `clear`",
+            },
+            ArgSpec {
+                name: "clear",
+                kind: ArgKind::Boolean,
+                required: false,
+                description: "true to unfile the worktree; exclusive with `folder`",
+            },
+        ],
+    },
+    StateToolSpec {
         cap: "editor.open",
         description: "Queue a worktree or one of its relative files for handoff to the owning \
                       compositor's locally configured editor. The request never selects an \
@@ -567,6 +595,7 @@ pub const STATE_TOOLS: &[StateToolSpec] = &[
 pub const MCP_STATE_CAPS: &[&str] = &[
     "sessions.list",
     "worktrees.list",
+    "folders.assign",
     "editor.open",
     "preview.fetch",
     "leases.list",
@@ -858,6 +887,38 @@ mod tests {
     }
 
     #[test]
+    fn folder_assignment_exposes_optional_folder_and_routes_the_mutation() {
+        let r = StateRouter::new(vec!["folders.assign"], |cap, args| {
+            Ok(json!({ "cap": cap, "args": args }))
+        });
+        let entries = r.tool_entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["name"], "folders_assign");
+        assert_eq!(entries[0]["inputSchema"]["required"], json!(["worktree"]));
+        assert_eq!(
+            entries[0]["inputSchema"]["properties"]["folder"]["type"],
+            "string"
+        );
+        assert_eq!(
+            entries[0]["inputSchema"]["properties"]["clear"]["type"],
+            "boolean"
+        );
+        let result = r
+            .call(
+                "folders_assign",
+                &json!({ "worktree": "/repo/wt", "folder": " Agents " }),
+            )
+            .unwrap()
+            .unwrap();
+        assert!(
+            result["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("folders.assign")
+        );
+    }
+
+    #[test]
     fn tool_entries_string_array_declares_items() {
         let r = StateRouter::new(vec!["sessions.open"], |_, _| Ok(json!(null)));
         let entries = r.tool_entries();
@@ -996,6 +1057,8 @@ mod tests {
             "sessions.input",
             "sessions.kill",
         ];
+        // Folder assignment is a repo-local worktree metadata mutation: Git.
+        let git = ["folders.assign"];
         let exec = ["tools.run"];
         for cap in read {
             let c = lookup(cap).expect("state cap in catalog");
@@ -1005,6 +1068,10 @@ mod tests {
             let c = lookup(cap).expect("state cap in catalog");
             assert_eq!(scope_of(c), Scope::Write, "{cap}");
         }
+        for cap in git {
+            let c = lookup(cap).expect("state cap in catalog");
+            assert_eq!(scope_of(c), Scope::Git, "{cap}");
+        }
         for cap in exec {
             let c = lookup(cap).expect("state cap in catalog");
             assert_eq!(scope_of(c), Scope::Exec, "{cap}");
@@ -1013,6 +1080,7 @@ mod tests {
         let mut grouped: Vec<&str> = read
             .iter()
             .chain(write.iter())
+            .chain(git.iter())
             .chain(exec.iter())
             .copied()
             .collect();

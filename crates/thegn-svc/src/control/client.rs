@@ -714,6 +714,17 @@ impl ControlClient {
         Ok(serde_json::from_value(v)?)
     }
 
+    /// `POST /v1/worktrees/folder` — assign or clear a repo-local folder.
+    pub async fn folder_assign(&self, req: &super::FolderAssignReq) -> Result<()> {
+        self.request(
+            "POST",
+            "/v1/worktrees/folder",
+            Some(serde_json::to_value(req)?),
+        )
+        .await?;
+        Ok(())
+    }
+
     /// `GET /v1/issues` — tracker issues, filtered by status/limit.
     pub async fn issues_list(
         &self,
