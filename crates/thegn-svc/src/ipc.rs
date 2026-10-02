@@ -763,6 +763,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(
+        clippy::permissions_set_readonly_false,
+        reason = "restores a private temp dir only so the test can delete it"
+    )]
     async fn failed_stale_socket_removal_is_a_contextual_startup_error() {
         if !cfg!(unix) {
             return;
