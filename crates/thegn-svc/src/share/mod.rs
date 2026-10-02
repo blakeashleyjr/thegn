@@ -807,19 +807,77 @@ fn abort_child(mut child: Child) {
     let _ = child.wait();
 }
 
-/// Write each plan file into `statedir` with 0600 perms (dir 0700).
+/// Longest accepted `SharePlanFile::dest`, in bytes. Well under the common
+/// 255-byte NAME_MAX so the sibling temp name (`.<dest>.tmp-…`) also fits.
+const MAX_DEST_BYTES: usize = 200;
+
+/// Pure check that `dest` is exactly one plain, non-empty path component: no
+/// absolute/prefix/root forms, no `.`/`..`, no `/` or `\`, no control
+/// characters, not overlong. Run for every file before any filesystem change.
+fn validate_dest(dest: &str) -> Result<()> {
+    let bad = |why: &str| anyhow::anyhow!("share: invalid file destination {dest:?}: {why}");
+    if dest.is_empty() {
+        return Err(bad("empty"));
+    }
+    if dest.len() > MAX_DEST_BYTES {
+        return Err(bad("too long"));
+    }
+    if dest == "." || dest == ".." {
+        return Err(bad("not a plain name"));
+    }
+    if dest
+        .chars()
+        .any(|c| c == '/' || c == '\\' || c.is_control())
+    {
+        return Err(bad("contains a separator or control character"));
+    }
+    let mut comps = std::path::Path::new(dest).components();
+    match (comps.next(), comps.next()) {
+        (Some(std::path::Component::Normal(_)), None) => Ok(()),
+        _ => Err(bad("not a single plain component")),
+    }
+}
+
+/// Write each plan file into `statedir` owner-only (dir 0700, files 0600).
+///
+/// Every failure is fatal and happens before the provider is spawned; errors
+/// name paths only, never file contents.
+///
+/// Race contract: safety comes from the write mechanism, not from checks.
+/// Each file is created as a temp sibling with exclusive creation
+/// (`O_CREAT|O_EXCL`, which never follows a symlink), owner-only mode applied
+/// at creation, written and fsynced, then `rename`d onto the destination.
+/// `rename` replaces a final-component symlink instead of following it, so a
+/// symlink planted at the destination, even after the `symlink_metadata`
+/// precheck below, is never written THROUGH. The precheck is only a tamper
+/// signal (policy) and may race harmlessly.
+///
+/// Out of scope (THE-327 / share-generation ownership): ancestors of
+/// `statedir`, hardlink policy, collisions between starts, cleanup on stop.
 fn materialize_files(plan: &SharePlan, statedir: &std::path::Path) -> Result<()> {
     if plan.files.is_empty() {
         return Ok(());
     }
-    std::fs::create_dir_all(statedir)
-        .with_context(|| format!("share: mkdir {}", statedir.display()))?;
+    for f in &plan.files {
+        validate_dest(&f.dest)?;
+    }
+    thegn_core::fsperm::ensure_private_dir(statedir)
+        .with_context(|| format!("share: state dir {}", statedir.display()))?;
     for f in &plan.files {
         let path = statedir.join(&f.dest);
-        std::fs::write(&path, &f.contents)
+        match std::fs::symlink_metadata(&path) {
+            Ok(m) if m.file_type().is_file() => {}
+            Ok(_) => anyhow::bail!(
+                "share: refusing {}: existing entry is a symlink or not a regular file",
+                path.display()
+            ),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(e).with_context(|| format!("share: stat {}", path.display()));
+            }
+        }
+        thegn_core::fsperm::write_owner_only_atomic(&path, f.contents.as_bytes())
             .with_context(|| format!("share: write {}", path.display()))?;
-        // best-effort: shared-credential files are owner-only everywhere.
-        let _ = thegn_core::fsperm::restrict_to_owner(&path); // best-effort: shared-credential files are owner-only everywhere (see above)
     }
     Ok(())
 }

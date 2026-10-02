@@ -795,3 +795,140 @@ fn bounded_lossy_output_stays_within_byte_limit() {
     assert!(text.len() <= super::MAX_PROVIDER_LINE);
     assert_eq!(text, "�".repeat(super::MAX_PROVIDER_LINE / 3));
 }
+
+// ---- THE-328: credential materialization (synthetic canary contents only) ----
+
+fn file_plan(files: Vec<(&str, &str)>, program: &str, args: Vec<String>) -> SharePlan {
+    SharePlan {
+        program: program.into(),
+        args,
+        env: vec![],
+        files: files
+            .into_iter()
+            .map(|(d, c)| SharePlanFile {
+                dest: d.into(),
+                contents: c.into(),
+            })
+            .collect(),
+        url_rule: UrlRule::Fixed("http://fixed.example".into()),
+    }
+}
+
+#[test]
+fn materialize_rejects_invalid_dest_and_creates_nothing() {
+    let long = "a".repeat(MAX_DEST_BYTES + 1);
+    let cases = [
+        "",
+        ".",
+        "..",
+        "/abs",
+        "a/b",
+        "../x",
+        "a\\b",
+        "x\0y",
+        "x\ny",
+        long.as_str(),
+    ];
+    for dest in cases {
+        let tmp = tempfile::tempdir().unwrap();
+        let sd = tmp.path().join("state");
+        let plan = file_plan(
+            vec![("ok.toml", "CANARY"), (dest, "CANARY")],
+            "true",
+            vec![],
+        );
+        assert!(materialize_files(&plan, &sd).is_err(), "{dest:?}");
+        assert!(!sd.exists(), "nothing created for {dest:?}");
+    }
+    validate_dest("frpc.toml").unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn materialize_symlink_at_dest_is_refused_and_provider_not_spawned() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sd = tmp.path().join("state");
+    std::fs::create_dir(&sd).unwrap();
+    let canary = tmp.path().join("canary");
+    std::fs::write(&canary, "ORIGINAL").unwrap();
+    std::os::unix::fs::symlink(&canary, sd.join("frpc.toml")).unwrap();
+    let marker = tmp.path().join("spawned");
+    let plan = file_plan(
+        vec![("frpc.toml", "NEW-CANARY")],
+        "sh",
+        vec!["-c".into(), format!("touch {}", marker.display())],
+    );
+    assert!(start(&plan, &sd, Duration::from_secs(2)).is_err());
+    assert_eq!(std::fs::read_to_string(&canary).unwrap(), "ORIGINAL");
+    assert!(!marker.exists(), "provider must not be spawned");
+}
+
+#[cfg(unix)]
+#[test]
+fn materialize_writes_content_mode_0600_and_replaces_atomically() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sd = tmp.path().join("state");
+    let plan = file_plan(vec![("frpc.toml", "CANARY-1")], "true", vec![]);
+    materialize_files(&plan, &sd).unwrap();
+    let p = sd.join("frpc.toml");
+    assert_eq!(std::fs::read_to_string(&p).unwrap(), "CANARY-1");
+    assert_eq!(thegn_core::fsperm::mode_bits(&p).unwrap(), Some(0o600));
+    assert_eq!(thegn_core::fsperm::mode_bits(&sd).unwrap(), Some(0o700));
+    let old_inode = std::fs::metadata(&p).unwrap();
+
+    // Replacement is rename-based: a new inode, new content, no temp left.
+    let plan = file_plan(vec![("frpc.toml", "CANARY-2")], "true", vec![]);
+    materialize_files(&plan, &sd).unwrap();
+    assert_eq!(std::fs::read_to_string(&p).unwrap(), "CANARY-2");
+    use std::os::unix::fs::MetadataExt;
+    assert_ne!(old_inode.ino(), std::fs::metadata(&p).unwrap().ino());
+    let names: Vec<_> = std::fs::read_dir(&sd)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(names.len(), 1, "no leftover temp: {names:?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn materialize_failure_aborts_before_spawn_and_leaves_no_temp() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let sd = tmp.path().join("state");
+    std::fs::create_dir(&sd).unwrap();
+    // A directory at the destination: precheck refuses (non-regular file).
+    std::fs::create_dir(sd.join("frpc.toml")).unwrap();
+    let marker = tmp.path().join("spawned");
+    let plan = file_plan(
+        vec![("a.toml", "CANARY"), ("frpc.toml", "CANARY")],
+        "sh",
+        vec!["-c".into(), format!("touch {}", marker.display())],
+    );
+    assert!(start(&plan, &sd, Duration::from_secs(2)).is_err());
+    assert!(!marker.exists());
+
+    // Rename/creation failure: read-only state dir (skip when root ignores modes).
+    let ro = tmp.path().join("ro");
+    std::fs::create_dir(&ro).unwrap();
+    std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let plan = file_plan(vec![("a.toml", "CANARY")], "true", vec![]);
+    let res = materialize_files(&plan, &ro);
+    let leftovers = std::fs::read_dir(&ro).unwrap().count();
+    std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o700)).unwrap();
+    if res.is_err() {
+        assert_eq!(leftovers, 0, "no temp file left behind");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn materialize_refuses_symlinked_state_dir() {
+    let tmp = tempfile::tempdir().unwrap();
+    let real = tmp.path().join("real");
+    std::fs::create_dir(&real).unwrap();
+    let sd = tmp.path().join("state");
+    std::os::unix::fs::symlink(&real, &sd).unwrap();
+    let plan = file_plan(vec![("frpc.toml", "CANARY")], "true", vec![]);
+    assert!(materialize_files(&plan, &sd).is_err());
+    assert_eq!(std::fs::read_dir(&real).unwrap().count(), 0);
+}
