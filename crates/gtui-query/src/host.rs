@@ -81,15 +81,13 @@ impl HostSource {
             while !stop_bg.load(Ordering::Acquire) {
                 let snap = sampler.sample();
                 let ts = now_secs();
-                // Cancellation can arrive during sample(); never publish its
-                // result once shutdown has begun.
+                // Cancellation can arrive during sample(); skip publishing a
+                // sample taken after shutdown began (one post-sample check;
+                // a stop landing after it can still let one sample through).
                 if stop_bg.load(Ordering::Acquire) {
                     break;
                 }
                 if let Ok(mut r) = ring_bg.lock() {
-                    if stop_bg.load(Ordering::Acquire) {
-                        break;
-                    }
                     r.push_back((ts, snap));
                     while r.len() > RING_CAP {
                         r.pop_front();
@@ -139,10 +137,34 @@ impl Drop for HostSource {
         self.stop.store(true, Ordering::Release);
         if let Some(worker) = self.worker.take() {
             worker.thread().unpark();
-            if worker.join().is_err() {
-                tracing::warn!(target: "gtui::host", "host metrics sampler panicked");
+            // The last owner often drops on a tokio runtime worker, and the
+            // sampler can be mid-`sample()` (spawning nvidia-smi/ioreg), so
+            // joining here could block that worker for 100s of ms. Hand the
+            // join to a short-lived reaper thread; if even that cannot be
+            // spawned, join inline rather than leak the handle silently.
+            let slot = Arc::new(Mutex::new(Some(worker)));
+            let reaper_slot = slot.clone();
+            let spawned = std::thread::Builder::new()
+                .name("gtui-host-reaper".into())
+                .spawn(move || {
+                    let w = reaper_slot.lock().ok().and_then(|mut g| g.take());
+                    if let Some(w) = w {
+                        reap(w);
+                    }
+                });
+            if spawned.is_err() {
+                let w = slot.lock().ok().and_then(|mut g| g.take());
+                if let Some(w) = w {
+                    reap(w);
+                }
             }
         }
+    }
+}
+
+fn reap(worker: JoinHandle<()>) {
+    if worker.join().is_err() {
+        tracing::warn!(target: "gtui::host", "host metrics sampler panicked");
     }
 }
 
@@ -244,11 +266,19 @@ mod tests {
             "sampler never published"
         );
 
+        // The worker holds a clone of the ring; it is released only when the
+        // worker exits. Without stop+unpark the worker stays parked for 1s
+        // per cycle and never exits, so the ring would stay alive.
+        let weak = Arc::downgrade(&source.ring);
         let start = std::time::Instant::now();
         drop(source);
+        // Join happens on a reaper thread, so wait (bounded) for release.
+        while weak.upgrade().is_some() && start.elapsed() < Duration::from_secs(2) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
         assert!(
-            start.elapsed() < Duration::from_millis(500),
-            "idle sampler drop waited for the one-second polling period"
+            weak.upgrade().is_none(),
+            "sampler worker did not exit promptly after drop"
         );
     }
 
@@ -262,6 +292,11 @@ mod tests {
             })
             .unwrap();
             drop(source);
+        }
+        // Joins now happen on reaper threads; wait (bounded) for all 8 workers.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while starts.load(Ordering::SeqCst) < 8 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
         }
         assert_eq!(starts.load(Ordering::SeqCst), 8);
     }
