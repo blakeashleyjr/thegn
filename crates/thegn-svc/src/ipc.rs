@@ -226,6 +226,51 @@ fn unsupported(what: &str) -> io::Error {
     io::Error::new(io::ErrorKind::Unsupported, what.to_string())
 }
 
+#[derive(Debug)]
+#[cfg_attr(not(unix), allow(dead_code))] // Unix-only production call sites.
+struct IoPathContext {
+    operation: &'static str,
+    path: PathBuf,
+    source: io::Error,
+}
+
+impl std::fmt::Display for IoPathContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} {}: {}",
+            self.operation,
+            self.path.display(),
+            self.source
+        )
+    }
+}
+
+impl std::error::Error for IoPathContext {
+    // `Display` already renders the cause; exposing it again as `source()`
+    // makes anyhow's chain print it twice.
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        None
+    }
+}
+
+#[cfg_attr(not(unix), allow(dead_code))] // Unix-only production call sites.
+fn io_error_with_path_context(
+    source: io::Error,
+    operation: &'static str,
+    path: &Path,
+) -> io::Error {
+    let kind = source.kind();
+    io::Error::new(
+        kind,
+        IoPathContext {
+            operation,
+            path: path.to_path_buf(),
+            source,
+        },
+    )
+}
+
 /// Take the advisory lock serializing [`IpcListener::bind_exclusive`]'s
 /// probe→unlink→bind critical section for `sock`. The sidecar `<sock>.lock`
 /// is created once and NEVER unlinked (unlinking it would resurrect the very
@@ -247,6 +292,22 @@ fn bind_lock(sock: &Path) -> Option<std::fs::File> {
         .ok()?;
     file.lock().ok()?;
     Some(file)
+}
+
+#[cfg_attr(not(unix), allow(dead_code))] // Unix-only production call site.
+fn require_live_endpoint(
+    bind_error: io::Error,
+    probe: io::Result<()>,
+    sock: &Path,
+) -> io::Result<()> {
+    match probe {
+        Ok(()) => Ok(()),
+        Err(_) => Err(io_error_with_path_context(
+            bind_error,
+            "bind control socket",
+            sock,
+        )),
+    }
 }
 
 /// Outcome of [`IpcListener::bind_exclusive`]: the caller either *is* the
@@ -309,8 +370,16 @@ impl IpcListener {
                         if sock.exists() {
                             match std::os::unix::net::UnixStream::connect(&sock) {
                                 Ok(_) => return Ok(UnixBind::AlreadyRunning),
-                                Err(_) => {
-                                    let _ = std::fs::remove_file(&sock); // best-effort: stale-socket cleanup; next bind re-reports
+                                Err(_) => match std::fs::remove_file(&sock) {
+                                    Ok(()) => {}
+                                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                                    Err(error) => {
+                                        return Err(io_error_with_path_context(
+                                            error,
+                                            "remove stale control socket",
+                                            &sock,
+                                        ));
+                                    }
                                 }
                             }
                         }
@@ -334,7 +403,14 @@ impl IpcListener {
                                 Ok(UnixBind::Bound(l))
                             }
                             Err(e) if e.kind() == io::ErrorKind::AddrInUse => {
-                                Ok(UnixBind::AlreadyRunning)
+                                match require_live_endpoint(
+                                    e,
+                                    std::os::unix::net::UnixStream::connect(&sock).map(|_| ()),
+                                    &sock,
+                                ) {
+                                    Ok(()) => Ok(UnixBind::AlreadyRunning),
+                                    Err(error) => Err(error),
+                                }
                             }
                             Err(e) => Err(e),
                         }
@@ -686,6 +762,100 @@ mod tests {
             IpcListener::bind_exclusive(&ep).await.unwrap(),
             BindOutcome::Bound(_)
         ));
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: test tmp cleanup
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(
+        clippy::permissions_set_readonly_false,
+        reason = "restores a private temp dir only so the test can delete it"
+    )]
+    async fn failed_stale_socket_removal_is_a_contextual_startup_error() {
+        let dir =
+            std::env::temp_dir().join(format!("thegn-ipc-unremovable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: test tmp cleanup
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("d.sock");
+        let ep = IpcEndpoint::for_socket_path(&sock);
+        let listener = match IpcListener::bind_exclusive(&ep).await.unwrap() {
+            BindOutcome::Bound(listener) => listener,
+            BindOutcome::AlreadyRunning => panic!("fresh path must bind"),
+        };
+        drop(listener); // leave a genuine stale socket at the endpoint
+
+        let mut permissions = std::fs::metadata(&dir).unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&dir, permissions).unwrap();
+        // Root and some unusual filesystems can still unlink from a read-only
+        // directory. Skip there; the check ensures this test really exercises
+        // an undeletable stale socket wherever it runs.
+        match std::fs::remove_file(&sock) {
+            Ok(()) => {
+                let mut permissions = std::fs::metadata(&dir).unwrap().permissions();
+                permissions.set_readonly(false);
+                std::fs::set_permissions(&dir, permissions).unwrap();
+                let _ = std::fs::remove_dir_all(&dir); // best-effort: test tmp cleanup
+                return;
+            }
+            Err(error) => assert_eq!(error.kind(), io::ErrorKind::PermissionDenied),
+        }
+
+        let error = match IpcListener::bind_exclusive(&ep).await {
+            Ok(BindOutcome::AlreadyRunning) => panic!("an unremovable path is not a live daemon"),
+            Ok(BindOutcome::Bound(_)) => {
+                panic!("a stale socket in a read-only directory must not bind")
+            }
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("remove stale control socket"));
+        assert!(error.to_string().contains(&sock.display().to_string()));
+        let source = error
+            .get_ref()
+            .and_then(|context| context.downcast_ref::<IoPathContext>())
+            .expect("context wrapper preserves the filesystem error as its source");
+        assert_eq!(source.source.kind(), io::ErrorKind::PermissionDenied);
+
+        let mut permissions = std::fs::metadata(&dir).unwrap().permissions();
+        permissions.set_readonly(false);
+        std::fs::set_permissions(&dir, permissions).unwrap();
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: test tmp cleanup
+    }
+
+    #[test]
+    fn addr_in_use_without_a_connectable_listener_preserves_the_bind_error() {
+        let dir =
+            std::env::temp_dir().join(format!("thegn-ipc-no-listener-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: test tmp cleanup
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("d.sock");
+
+        assert!(
+            require_live_endpoint(
+                io::Error::new(io::ErrorKind::AddrInUse, "original bind failure"),
+                Ok(()),
+                &sock,
+            )
+            .is_ok()
+        );
+
+        let error = require_live_endpoint(
+            io::Error::new(io::ErrorKind::AddrInUse, "original bind failure"),
+            Err(io::Error::new(io::ErrorKind::NotFound, "no listener")),
+            &sock,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+        assert!(error.to_string().contains("bind control socket"));
+        assert!(error.to_string().contains(&sock.display().to_string()));
+        let source = error
+            .get_ref()
+            .and_then(|context| context.downcast_ref::<IoPathContext>())
+            .expect("context wrapper preserves the bind error as its source");
+        assert_eq!(source.source.kind(), io::ErrorKind::AddrInUse);
+        assert_eq!(source.source.to_string(), "original bind failure");
+
         let _ = std::fs::remove_dir_all(&dir); // best-effort: test tmp cleanup
     }
 
