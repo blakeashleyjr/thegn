@@ -84,6 +84,14 @@ pub enum Action {
 }
 
 pub fn run(cfg: &Config, action: Action) -> Result<()> {
+    run_in(cfg, action, std::env::current_dir().ok().as_deref())
+}
+
+/// [`run`] with the directory repo scoping resolves from made explicit.
+/// `login`/`logout`/`status` stay global (credential management); the
+/// provider-backed project/board/task verbs use the repo-resolved config.
+fn run_in(cfg: &Config, action: Action, dir: Option<&std::path::Path>) -> Result<()> {
+    let scoped = || crate::repo_issues::config_for_dir(cfg, dir);
     match action {
         Action::Login {
             base_url,
@@ -91,21 +99,21 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
         } => login(cfg, base_url, client_id),
         Action::Logout { base_url } => logout(cfg, base_url),
         Action::Status { base_url } => status(cfg, base_url),
-        Action::Projects { json } => projects(cfg, json),
-        Action::Board { project, json } => board(cfg, project, json),
+        Action::Projects { json } => projects(&scoped(), json),
+        Action::Board { project, json } => board(&scoped(), project, json),
         Action::Create {
             project,
             title,
             body,
             priority,
-        } => create(cfg, project, title, body, priority),
-        Action::Comment { task, body } => comment(cfg, task, body),
-        Action::Label { task, name, remove } => label(cfg, task, name, remove),
+        } => create(&scoped(), project, title, body, priority),
+        Action::Comment { task, body } => comment(&scoped(), task, body),
+        Action::Label { task, name, remove } => label(&scoped(), task, name, remove),
         Action::Move {
             task,
             project,
             status,
-        } => move_task(cfg, task, project, status),
+        } => move_task(&scoped(), task, project, status),
     }
 }
 
@@ -419,6 +427,26 @@ fn age_secs(fetched_at_ms: i64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::repo_issues::test_support::{overlay_repo, two_account_config};
+
+    /// The config `run_in` hands the provider verbs resolves the default
+    /// project from the repo overlay inside a repo, and from the global
+    /// config outside one.
+    #[test]
+    fn default_project_resolves_from_repo_overlay_inside_and_global_outside() {
+        let repo = overlay_repo();
+        let cfg = two_account_config();
+        let inside = crate::repo_issues::config_for_dir(&cfg, Some(repo.path()));
+        assert_eq!(resolve_project(&inside, None).unwrap(), "PROJECT-PIN");
+        assert_eq!(inside.issues.issue_accounts.len(), 1);
+        let outside = tempfile::tempdir().unwrap();
+        let global = crate::repo_issues::config_for_dir(&cfg, Some(outside.path()));
+        assert_eq!(resolve_project(&global, None).unwrap(), "PROJECT-GLOBAL");
+        assert_eq!(global.issues.issue_accounts.len(), 2);
+        // An explicit project always wins.
+        assert_eq!(resolve_project(&inside, Some("X".into())).unwrap(), "X");
+    }
+
     use thegn_core::db::Db;
     use thegn_core::store::CacheStore;
 

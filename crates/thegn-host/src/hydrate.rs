@@ -3604,17 +3604,15 @@ pub(crate) fn spawn_panel_prefetch(
 
 pub(crate) fn spawn_pr_cache_refresh(
     cwd: std::path::PathBuf,
-    cfg: thegn_core::config::IssuesConfig,
-    disk_cfg: thegn_core::config::DiskConfig,
+    cfg: thegn_core::config::Config,
     waker: Option<TerminalWaker>,
 ) {
-    spawn_pr_cache_refresh_with_generation(cwd, cfg, disk_cfg, waker, None);
+    spawn_pr_cache_refresh_with_generation(cwd, cfg, waker, None);
 }
 
 pub(crate) fn spawn_pr_cache_refresh_with_generation(
     cwd: std::path::PathBuf,
-    cfg: thegn_core::config::IssuesConfig,
-    disk_cfg: thegn_core::config::DiskConfig,
+    cfg: thegn_core::config::Config,
     waker: Option<TerminalWaker>,
     generation: Option<(std::sync::Arc<std::sync::atomic::AtomicU64>, u64)>,
 ) {
@@ -3624,6 +3622,7 @@ pub(crate) fn spawn_pr_cache_refresh_with_generation(
     let branch_cwd = cwd.clone();
     let branch_waker = waker.clone();
     let branch_generation = generation.clone();
+    let disk_cfg = cfg.disk.clone();
     crate::sched::spawn_bg(move || {
         if !cwd.is_dir() {
             return;
@@ -3847,12 +3846,15 @@ pub(crate) fn spawn_pr_cache_refresh_with_generation(
 
             // Lifecycle automation: on merge, move this worktree's linked
             // issue(s) to Done on their tracker (opt-in via `[issues].move_on_merge`).
-            if cfg.move_on_merge
+            if cfg.issues.move_on_merge
                 && pr.state == "MERGED"
                 && let Ok(linked) = db.linked_issues(&wt)
                 && !linked.is_empty()
             {
-                let mut router = thegn_svc::issue::IssueRouter::from_config(&cfg);
+                let local_cwd =
+                    matches!(loc, thegn_core::remote::GitLoc::Local(_)).then_some(cwd.as_path());
+                let issues_cfg = crate::repo_issues::for_merge_refresh(&cfg, local_cwd);
+                let mut router = thegn_svc::issue::IssueRouter::from_config(&issues_cfg);
                 // Provider-as-plugin: append live plugin issue providers.
                 crate::plugin_providers::extend_issue_router(&mut router);
                 if router.is_configured()

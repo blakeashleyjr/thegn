@@ -684,8 +684,23 @@
       },
       "type": "object"
     },
+    "IssueRepoQuery": {
+      "additionalProperties": false,
+      "description": "Repo context alone, for `issues.get` / `update` / `comment` — they take no status/limit/project/query filters, so those must not even parse.",
+      "properties": {
+        "repo": {
+          "default": null,
+          "description": "Filesystem path on the daemon host used to apply a repo's `[issues]` overlay.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
     "IssuesQuery": {
-      "description": "Query params for `issues.list` — a subset of `IssueFilter` a supervisor filters a batch by. Statuses is a comma-separated list of the snake_case status ids (`todo,in_progress`); unknown names are dropped.",
+      "description": "Query params for `issues.list` — a subset of `IssueFilter` a supervisor filters a batch by, plus optional repo context. Statuses is a comma-separated list of the snake_case status ids (`todo,in_progress`); unknown names are dropped. `repo`, when present, applies that repository's `[issues]` overlay (a filesystem path on the daemon host).",
       "properties": {
         "limit": {
           "default": null,
@@ -705,6 +720,14 @@
         },
         "query": {
           "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "repo": {
+          "default": null,
+          "description": "Filesystem path on the daemon host used to apply a repo's `[issues]` overlay.",
           "type": [
             "string",
             "null"
@@ -2041,6 +2064,9 @@
     },
     "IssueBody": {
       "$ref": "#/definitions/IssueBody"
+    },
+    "IssueRepoQuery": {
+      "$ref": "#/definitions/IssueRepoQuery"
     },
     "IssuesQuery": {
       "$ref": "#/definitions/IssuesQuery"
