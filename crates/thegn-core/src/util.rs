@@ -1347,6 +1347,7 @@ pub fn git_write_epoch() -> u64 {
 
 /// Advance [`git_write_epoch`] by one.
 pub fn note_git_write() {
+    tracing::debug!(target: "thegn::watch", "git write epoch advanced");
     GIT_WRITE_EPOCH.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 }
 

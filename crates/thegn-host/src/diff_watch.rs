@@ -92,6 +92,15 @@ impl Coverage {
             return;
         }
         self.bump();
+        // Free when off (a cached-interest check): `THEGN_LOG=thegn::watch=debug`
+        // names what moved the generation, which is the first question whenever
+        // an idle backstop fires.
+        tracing::debug!(
+            target: "thegn::watch",
+            kind = ?ev.kind,
+            path = ?ev.paths.first(),
+            "change generation bumped"
+        );
         if matches!(ev.kind, EventKind::Create(_)) {
             for p in &ev.paths {
                 let parent_unrecursed = p.parent().is_some_and(|d| nonrec.contains(d));
@@ -547,6 +556,11 @@ pub(crate) fn build_diff_watcher(cwd: &Path, sink: RefreshSink) -> Option<Recomm
         // actually enqueued.
         let sent_ref = kick_tx.send(RefreshKind::MainRefMoved).is_ok(); // best-effort: send: the consumer may be gone
         let sent_model = kick_tx.send(RefreshKind::Model).is_ok(); // best-effort: send: the consumer may be gone
+        tracing::debug!(
+            target: "thegn::watch",
+            worktree = %cwd.display(),
+            "claim published; catch-up passes requested"
+        );
         if sent_ref || sent_model {
             kick_wake();
         }
