@@ -24,14 +24,20 @@ pub struct AppBuilder {
     /// slow must go off-thread and report back through the [`ChangeHook`].
     ///
     /// [`ChangeHook`]: tg_kit::ChangeHook
-    pub build: fn(tg_kit::ChangeHook, &Config, tokio::runtime::Handle) -> Box<dyn AppTile>,
+    pub build:
+        fn(tg_kit::ChangeHook, &Config, tokio::runtime::Handle) -> Result<Box<dyn AppTile>, String>,
 }
 
 pub static APP_BUILDERS: &[AppBuilder] = &[AppBuilder {
     id: "observe",
     label: "Observe",
     enabled: |cfg| cfg.observe.enabled,
-    build: |hook, cfg, rt| super::build_observe_tile(hook, &cfg.observe, rt),
+    build: |hook, cfg, rt| {
+        super::build_observe_tile(hook, &cfg.observe, rt, || {
+            crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
+        })
+        .map_err(|error| error.to_string())
+    },
 }];
 
 /// The registered builder for a tab id.
