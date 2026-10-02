@@ -750,7 +750,7 @@ impl WorkspaceStore for Db {
             // A failed tombstone read propagates through `?`: uncertainty must
             // never be treated as permission to resurrect a removed workspace.
             if db.workspace_tombstoned(repo_path)? {
-                return Err(crate::store::workspace::WorkspaceTombstonedError {
+                return Err(crate::store::WorkspaceTombstonedError {
                     repo_path: repo_path.to_string(),
                 }
                 .into());

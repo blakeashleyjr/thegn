@@ -8,11 +8,22 @@ use crate::models::{WorkspaceRow, WorktreeRow};
 use anyhow::Result;
 
 /// Typed refusal returned when folder bookkeeping targets a removed workspace.
-#[derive(Debug, thiserror::Error)]
-#[error("workspace {repo_path} was removed from thegn; re-add the workspace before filing folders")]
+#[derive(Debug)]
 pub struct WorkspaceTombstonedError {
     pub repo_path: String,
 }
+
+impl std::fmt::Display for WorkspaceTombstonedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "workspace {} was removed from thegn; re-add the workspace before filing folders",
+            self.repo_path
+        )
+    }
+}
+
+impl std::error::Error for WorkspaceTombstonedError {}
 
 /// `ui_state` scope holding workspace removal tombstones (keyed by `repo_path`).
 /// See [`WorkspaceStore::tombstone_workspace`].
