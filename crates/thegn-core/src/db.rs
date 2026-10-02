@@ -431,6 +431,10 @@ const LAND_LIFECYCLE_FEATURES: &[SchemaFeature] = &[
         columns: &["repo_path", "slug"],
     },
     SchemaFeature {
+        table: "ui_state",
+        columns: &["scope", "key", "value"],
+    },
+    SchemaFeature {
         table: "merge_queue",
         columns: &[
             "worktree",

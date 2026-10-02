@@ -322,7 +322,7 @@ mod tests {
             db.put_workspace(repo.to_str().unwrap(), "fixture", "dir")
                 .unwrap();
             let original_folder = db
-                .ensure_folder(repo.to_str().unwrap(), "Original")
+                .ensure_folder(repo.to_str().unwrap(), "Original", "fixture", "repo")
                 .unwrap();
             db.put_worktree(
                 "fixture/b1",

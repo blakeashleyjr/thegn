@@ -7,6 +7,24 @@
 use crate::models::{WorkspaceRow, WorktreeRow};
 use anyhow::Result;
 
+/// Typed refusal returned when folder bookkeeping targets a removed workspace.
+#[derive(Debug)]
+pub struct WorkspaceTombstonedError {
+    pub repo_path: String,
+}
+
+impl std::fmt::Display for WorkspaceTombstonedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "workspace {} was removed from thegn; re-add the workspace before filing folders",
+            self.repo_path
+        )
+    }
+}
+
+impl std::error::Error for WorkspaceTombstonedError {}
+
 /// `ui_state` scope holding workspace removal tombstones (keyed by `repo_path`).
 /// See [`WorkspaceStore::tombstone_workspace`].
 pub const WORKSPACE_TOMBSTONE_SCOPE: &str = "workspace_tombstone";
@@ -229,11 +247,18 @@ pub trait WorkspaceStore {
 
     fn del_folder(&self, folder_id: i64) -> Result<()>;
 
-    /// Find a folder in `repo_path` whose name matches `name`
+    /// Register `repo_path` (unless tombstoned), then find or create a folder
+    /// whose name matches `name`.
     /// (case-insensitive, trimmed) and return its id, creating it if absent.
     /// This is the find-or-create primitive behind the "file worktree into
     /// folder" actions, so repeated firing never spawns duplicate folders.
-    fn ensure_folder(&self, repo_path: &str, name: &str) -> Result<i64>;
+    fn ensure_folder(
+        &self,
+        repo_path: &str,
+        name: &str,
+        workspace_name: &str,
+        workspace_kind: &str,
+    ) -> Result<i64>;
 
     /// File (or unfile, with `None`) a single worktree into a folder.
     fn set_worktree_folder(&self, worktree: &str, folder_id: Option<i64>) -> Result<()>;

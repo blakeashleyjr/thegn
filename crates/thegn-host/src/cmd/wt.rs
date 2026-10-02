@@ -422,7 +422,7 @@ fn validate_folder_name(name: &str) -> Result<String> {
 /// trimmed folder name.
 fn check_folder_fileable(db: &Db, repo_path: &str, folder_name: &str) -> Result<String> {
     let folder_name = validate_folder_name(folder_name)?;
-    if db.workspace_tombstoned(repo_path).unwrap_or(false) {
+    if db.workspace_tombstoned(repo_path)? {
         anyhow::bail!(
             "workspace {repo_path} was removed from thegn; re-add it before filing \
              its worktrees into a folder"
@@ -448,18 +448,9 @@ fn file_registered_worktree(
     // hydrate's name/kind rule. A workspace the user explicitly removed is
     // tombstoned: honour that instead of resurrecting it as a side effect of
     // filing a folder.
-    let repo = std::path::Path::new(repo_path);
-    let workspace_name = repo
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "workspace".into());
-    let kind = if thegn_core::repo::main_worktree(repo).is_some() {
-        "repo"
-    } else {
-        "dir"
-    };
-    db.put_workspace(repo_path, &workspace_name, kind)?;
-    let folder_id = db.ensure_folder(repo_path, &folder_name)?;
+    let (workspace_name, workspace_kind) =
+        crate::workspace_identity::workspace_identity(repo_path, Some("repo"));
+    let folder_id = db.ensure_folder(repo_path, &folder_name, &workspace_name, workspace_kind)?;
     let folder = db
         .folders_for_workspace(repo_path)?
         .into_iter()
