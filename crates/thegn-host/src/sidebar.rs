@@ -1555,7 +1555,11 @@ fn gather_groups(
                 continue;
             }
             groups.push(Group {
-                label: w.branch.clone(),
+                // The tab, not the branch, is the identity — the live path
+                // labels the same worktree by `split_tab` too, so a branch
+                // named `home` (tab `{slug}/home~`) never claims the home
+                // row's label, pin key, or sort tier.
+                label: split_tab(&w.tab_name).map_or_else(|| w.branch.clone(), |(_, b)| b),
                 gi: next_gi,
                 manual_rank: rank_by_tab.get(w.tab_name.as_str()).copied(),
                 path: w.path.clone(),
@@ -2837,6 +2841,19 @@ mod tests {
                 ) && group.path == "/wt/branch-home"
             }),
             "an ordinary worktree on branch `home` must remain visible"
+        );
+        let branch_home = groups
+            .iter()
+            .find(|group| group.path == "/wt/branch-home")
+            .expect("branch-home row");
+        assert_eq!(
+            branch_home.label, "home~",
+            "the branch named `home` keeps its tab identity, not the home label"
+        );
+        assert_eq!(
+            groups.iter().filter(|group| group.label == "home").count(),
+            1,
+            "exactly one row in the workspace may carry the home label"
         );
     }
 
