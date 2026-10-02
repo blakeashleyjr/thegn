@@ -3055,6 +3055,16 @@ pub(crate) fn build_panel(
             && COMMITS_SEEN.check(cwd).1
         {
             panel.commits_loading = false;
+        } else if !panel.commits_loading
+            && crate::diff_watch::current_print(cwd).is_some()
+            && !COMMITS_SEEN.marked(cwd)
+            && cached.as_ref().is_some_and(|(json, _)| {
+                serde_json::from_str::<Vec<crate::panel::CommitRow>>(json).is_ok()
+            })
+        {
+            // First refresh under a live print: catch-up for the print-less
+            // startup refresh, whatever the TTL says (see `Seen::marked`).
+            panel.commits_loading = true;
         }
     }
     // The per-repo open-PR cache: the `pr` section's OPEN PRS block, and the

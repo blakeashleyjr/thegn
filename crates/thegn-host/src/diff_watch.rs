@@ -225,6 +225,18 @@ impl Seen {
         (now, unchanged)
     }
 
+    /// Whether any pass over `path` has completed under a live print yet. A
+    /// consumer's FIRST pass under a print is a catch-up for everything that
+    /// changed between its earlier print-less pass (startup, before the watcher
+    /// registered) and the registration, so it must not be skipped or debounced.
+    pub(crate) fn marked(&self, path: &Path) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_some_and(|m| m.contains_key(path))
+    }
+
     /// Record that a pass over `path` COMPLETED having started at `print`.
     pub(crate) fn mark(&self, path: &Path, print: Option<WatchPrint>) {
         let Some(print) = print else {
@@ -332,6 +344,8 @@ pub(crate) fn build_diff_watcher(cwd: &Path, sink: RefreshSink) -> Option<Recomm
         .map(|e| e.path.clone())
         .chain(git_roots.iter().cloned())
         .collect();
+    let kick_tx = tx.clone();
+    let kick_wake = wake.clone();
     let cov = Arc::new(Coverage::new());
     let guard = CoverGuard {
         cov: cov.clone(),
@@ -523,6 +537,19 @@ pub(crate) fn build_diff_watcher(cwd: &Path, sink: RefreshSink) -> Option<Recomm
         && no_tracked_ignored(&cwd)
     {
         publish(&cwd, &cov);
+        // Registration completing is an EVENT: everything before it was seen by
+        // pre-watcher passes (startup heal, crawl, commit refresh) and anything
+        // that changed between those passes and now went unobserved. Ask for the
+        // catch-up passes once, now, through the same requests a real change
+        // sends (the loop's MainRefMoved arm + a model refresh whose crawl and
+        // commit-cache gates treat "first pass under a print" as due), instead
+        // of leaving them to the 20 s backstop. One wake, only because work was
+        // actually enqueued.
+        let sent_ref = kick_tx.send(RefreshKind::MainRefMoved).is_ok(); // best-effort: send: the consumer may be gone
+        let sent_model = kick_tx.send(RefreshKind::Model).is_ok(); // best-effort: send: the consumer may be gone
+        if sent_ref || sent_model {
+            kick_wake();
+        }
     }
     Some(nw)
 }
@@ -965,6 +992,65 @@ mod tests {
         assert!(seen.check(&r).1);
         drop(thegn_core::util::GitWriteScope::begin());
         assert!(!seen.check(&r).1);
+    }
+
+    /// Registration completing kicks the catch-up passes once (and only when a
+    /// claim was published): MainRefMoved + a model refresh, with one wake.
+    #[test]
+    fn a_published_claim_kicks_the_catch_up_passes_once() {
+        let base = scratch("kick");
+        let r = repo(&base, "r", false);
+        let (tx, mut rx) = tokio_mpsc::unbounded_channel();
+        let wakes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let w2 = wakes.clone();
+        let _w = build_diff_watcher(
+            &r,
+            RefreshSink {
+                tx,
+                wake: Arc::new(move || {
+                    w2.fetch_add(1, Ordering::SeqCst);
+                }),
+            },
+        )
+        .expect("registers");
+        assert!(print(&r).is_some());
+        let mut kinds = Vec::new();
+        while let Ok(k) = rx.try_recv() {
+            kinds.push(format!("{k:?}"));
+        }
+        assert_eq!(kinds, ["MainRefMoved", "Model"], "exactly the two requests");
+        assert_eq!(wakes.load(Ordering::SeqCst), 1, "one wake for the kick");
+        // No claim (tracked file under an ignore rule) => no kick, no wake.
+        let r2 = repo(&base, "r2", true);
+        std::fs::write(r2.join("target/f.txt"), "f").unwrap();
+        git(&r2, &["add", "-f", "target/f.txt"]);
+        git(&r2, &["commit", "-q", "-m", "f"]);
+        let (tx2, mut rx2) = tokio_mpsc::unbounded_channel();
+        let wakes2 = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let w3 = wakes2.clone();
+        let _w2 = build_diff_watcher(
+            &r2,
+            RefreshSink {
+                tx: tx2,
+                wake: Arc::new(move || {
+                    w3.fetch_add(1, Ordering::SeqCst);
+                }),
+            },
+        );
+        assert!(print(&r2).is_none());
+        assert!(rx2.try_recv().is_err());
+        assert_eq!(wakes2.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn seen_marked_reports_a_completed_pass() {
+        let seen = Seen::new();
+        let p = Path::new("/tmp/tg-seen-marked");
+        assert!(!seen.marked(p));
+        seen.mark(p, None);
+        assert!(!seen.marked(p), "a print-less pass is not a marked one");
+        seen.mark(p, Some(WatchPrint::for_test(1, 1)));
+        assert!(seen.marked(p));
     }
 
     #[test]
