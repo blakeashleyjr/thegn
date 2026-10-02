@@ -96,6 +96,7 @@ nix = { version = "0.31", default-features = false, features = [
   "fs",
   "time",
   "signal",
+  "user",
   "process",
 ] }
 tracing = "0.1"
