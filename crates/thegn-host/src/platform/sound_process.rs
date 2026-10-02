@@ -6,10 +6,18 @@
 
 use std::time::{Duration, Instant};
 
-/// Complete sound-helper deadline, including the process-group cleanup grace.
+/// Sound-helper execution deadline plus the process-group cleanup grace. After
+/// the execution part the whole process group is killed, so a command that
+/// backgrounds work (`afplay x.wav &`) may keep playing until then.
 pub(crate) const SOUND_HELPER_DEADLINE: Duration = Duration::from_secs(5);
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const CLEANUP_GRACE: Duration = Duration::from_millis(250);
+/// How long runtime shutdown waits for a worker to finish before detaching it.
+/// A cancelled helper needs at most `CLEANUP_GRACE` to be killed and settled;
+/// the margin covers scheduling. A worker stuck in uninterruptible I/O (a child
+/// in D state, a hung pack directory, an unbounded Windows `status()`) cannot
+/// be bounded from outside, so shutdown logs and detaches it past this point.
+pub(crate) const SHUTDOWN_JOIN_BOUND: Duration = Duration::from_millis(500);
 
 #[derive(Debug)]
 pub(crate) enum SoundProcessOutcome {
@@ -72,16 +80,19 @@ fn run_unix_bounded(
         let timed_out = Instant::now() >= execution_deadline;
         match crate::platform::gate_child_exited(&mut child) {
             Ok(true) => {
-                // Retain the leader as a waitable zombie until its group is
-                // stopped, preventing its pid/pgid from being reused first.
-                group.kill();
-                let status = child.wait();
-                let settled = settle_group(&group, deadline);
-                return match (status, settled) {
-                    (Ok(status), Ok(())) => SoundProcessOutcome::Exited(status),
-                    (Err(error), _) => SoundProcessOutcome::Reap(error),
-                    (_, Err(())) => SoundProcessOutcome::DescendantsRemain,
+                // The leader has exited. Reap it, then let the rest of its
+                // group drain until the execution deadline (a command such as
+                // `afplay x.wav &` must still play). POSIX never reuses a pid
+                // that is still a live process-group id, so reaping the leader
+                // first does not make the group kill unsafe.
+                let status = match child.wait() {
+                    Ok(status) => status,
+                    Err(error) => {
+                        group.kill();
+                        return SoundProcessOutcome::Reap(error);
+                    }
                 };
+                return drain_group(&group, status, cancellation, execution_deadline, deadline);
             }
             Ok(false) if cancelled || timed_out => {
                 group.kill();
@@ -110,6 +121,40 @@ fn run_unix_bounded(
                 };
             }
         }
+    }
+}
+
+/// After the leader exited: wait for its group to empty on its own, killing it
+/// at the execution deadline or on cancellation. Cancellation shortens the
+/// post-kill settle to `CLEANUP_GRACE` so shutdown is not held for the rest of
+/// the deadline.
+#[cfg(unix)]
+fn drain_group(
+    group: &crate::platform::GroupHandle,
+    status: std::process::ExitStatus,
+    cancellation: &std::sync::atomic::AtomicBool,
+    execution_deadline: Instant,
+    deadline: Instant,
+) -> SoundProcessOutcome {
+    use std::sync::atomic::Ordering;
+    loop {
+        if group.is_empty() {
+            return SoundProcessOutcome::Exited(status);
+        }
+        let cancelled = cancellation.load(Ordering::Acquire);
+        if cancelled || Instant::now() >= execution_deadline {
+            group.kill();
+            let settle_deadline = if cancelled {
+                (Instant::now() + CLEANUP_GRACE).min(deadline)
+            } else {
+                deadline
+            };
+            return match settle_group(group, settle_deadline) {
+                Ok(()) => SoundProcessOutcome::Exited(status),
+                Err(()) => SoundProcessOutcome::DescendantsRemain,
+            };
+        }
+        std::thread::sleep(POLL_INTERVAL);
     }
 }
 
@@ -147,21 +192,40 @@ mod tests {
             dir.path().join("helper.sh").to_str().unwrap(),
             &[],
             &AtomicBool::new(false),
-            Duration::from_millis(500),
+            Duration::from_secs(2),
         );
         assert!(matches!(result, SoundProcessOutcome::Timeout));
     }
 
     #[test]
-    fn early_parent_exit_does_not_leave_its_grandchild() {
+    fn early_parent_exit_kills_its_grandchild_at_the_deadline() {
         let dir = helper("sleep 30 & exit 0");
+        let started = Instant::now();
         let result = run_unix_bounded(
             dir.path().join("helper.sh").to_str().unwrap(),
             &[],
             &AtomicBool::new(false),
-            Duration::from_secs(2),
+            Duration::from_millis(600),
         );
         assert!(matches!(result, SoundProcessOutcome::Exited(status) if status.success()));
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn leader_exit_lets_the_group_drain_before_the_deadline() {
+        let dir = helper("(sleep 0.3; touch \"$1\") & exit 0");
+        let marker = dir.path().join("played");
+        let result = run_unix_bounded(
+            dir.path().join("helper.sh").to_str().unwrap(),
+            &[marker.display().to_string()],
+            &AtomicBool::new(false),
+            Duration::from_secs(5),
+        );
+        assert!(matches!(result, SoundProcessOutcome::Exited(status) if status.success()));
+        assert!(
+            marker.exists(),
+            "backgrounded work must be allowed to finish"
+        );
     }
 
     #[test]
@@ -185,7 +249,7 @@ mod tests {
             hanging.path().join("helper.sh").to_str().unwrap(),
             &[],
             &AtomicBool::new(false),
-            Duration::from_millis(500),
+            Duration::from_secs(2),
         );
         assert!(matches!(first, SoundProcessOutcome::Timeout));
         let second = run_unix_bounded(
@@ -246,13 +310,17 @@ pub(crate) fn run_bounded(
         match child.try_wait() {
             Ok(Some(status)) => return SoundProcessOutcome::Exited(status),
             Ok(None) if Instant::now() >= deadline => {
-                let _ = child.kill();
+                if let Err(error) = child.kill() {
+                    tracing::debug!(target: "thegn::notify_sound", %error, "sound helper kill failed");
+                }
                 std::thread::spawn(move || {
                     #[expect(
                         clippy::disallowed_methods,
                         reason = "preserves monitor-action fallback on platforms without process-group ownership"
                     )]
-                    let _ = child.wait(); // best-effort: teardown: a failed kill may leave the child running
+                    if let Err(error) = child.wait() {
+                        tracing::debug!(target: "thegn::notify_sound", %error, "sound helper reap failed");
+                    }
                 });
                 return SoundProcessOutcome::Timeout;
             }

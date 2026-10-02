@@ -132,6 +132,9 @@ The host selects an available provider using fixed argument vectors and plays
 files on a bounded off-loop worker. On Unix, each helper runs in its own process
 group and is stopped and reaped within a five-second lifecycle deadline; this
 lets the worker continue with later queued requests after a hung helper.
+Sound commands are bounded by that execution deadline, and their whole process
+group is killed after it (a command that backgrounds work keeps running until
+then).
 Windows currently retains direct-child helper behavior pending atomic Job
 Object containment. Providers report supported formats and
 whether they honor volume. Use `thegn doctor` to see the provider id and

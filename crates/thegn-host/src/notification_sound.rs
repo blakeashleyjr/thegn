@@ -56,25 +56,51 @@ impl PlaybackSnapshot {
     }
 }
 
+/// A joinable worker plus a completion channel. The worker signals on `done`
+/// as its last act (a drop guard, so a panic signals too); shutdown waits on it
+/// with a timeout instead of joining unconditionally.
+struct Worker {
+    join: std::thread::JoinHandle<()>,
+    done: std::sync::mpsc::Receiver<()>,
+}
+
+struct SignalDone(std::sync::mpsc::Sender<()>);
+
+impl Drop for SignalDone {
+    fn drop(&mut self) {
+        // best-effort: shutdown may already have timed out and detached us
+        let _ = self.0.send(());
+    }
+}
+
+type SnapshotBuilder = dyn Fn(&SoundConfig, &AtomicBool) -> Option<PlaybackSnapshot> + Send + Sync;
+
 /// Immutable-at-use-time provider and pack state shared by producers and the
 /// worker. Replacing the `Arc` under the short mutex never makes a producer
 /// inspect the filesystem.
 pub(crate) struct SoundRuntime {
     snapshot: Mutex<Arc<PlaybackSnapshot>>,
     queue: Mutex<Option<std::sync::mpsc::SyncSender<SoundJob>>>,
-    worker: Mutex<Option<std::thread::JoinHandle<()>>>,
+    worker: Mutex<Option<Worker>>,
     reload_slot: Arc<(Mutex<Option<ReloadRequest>>, std::sync::Condvar)>,
-    reload_worker: Mutex<Option<std::thread::JoinHandle<()>>>,
+    reload_worker: Mutex<Option<Worker>>,
     reload_generation: AtomicU64,
     dropped: AtomicU64,
     fallback_bell: AtomicBool,
-    stopping: AtomicBool,
+    /// Shared with the reload worker so its wait predicate can observe it
+    /// without upgrading the weak runtime reference.
+    stopping: Arc<AtomicBool>,
+    builder: Arc<SnapshotBuilder>,
     cancellation: AtomicBool,
     waker: TerminalWaker,
 }
 
 impl SoundRuntime {
     pub(crate) fn new(waker: TerminalWaker) -> Arc<Self> {
+        Self::with_builder(waker, Arc::new(build_snapshot_cancellable))
+    }
+
+    fn with_builder(waker: TerminalWaker, builder: Arc<SnapshotBuilder>) -> Arc<Self> {
         let runtime = Arc::new(Self {
             snapshot: Mutex::new(Arc::new(PlaybackSnapshot::empty())),
             queue: Mutex::new(None),
@@ -84,7 +110,8 @@ impl SoundRuntime {
             reload_generation: AtomicU64::new(0),
             dropped: AtomicU64::new(0),
             fallback_bell: AtomicBool::new(false),
-            stopping: AtomicBool::new(false),
+            stopping: Arc::new(AtomicBool::new(false)),
+            builder,
             cancellation: AtomicBool::new(false),
             waker,
         });
@@ -94,20 +121,22 @@ impl SoundRuntime {
 
     fn start_reload_worker(self: &Arc<Self>) {
         let slot = Arc::clone(&self.reload_slot);
+        let stopping = Arc::clone(&self.stopping);
         let runtime = Arc::downgrade(self);
-        let handle = std::thread::Builder::new()
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let spawned = std::thread::Builder::new()
             .name("notify-sound-config".into())
             .spawn(move || {
+                let _done = SignalDone(done_tx);
                 crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
                 loop {
                     let request = {
                         let (pending, changed) = &*slot;
                         let mut pending = pending.lock().unwrap();
-                        while pending.is_none()
-                            && runtime
-                                .upgrade()
-                                .is_some_and(|runtime| !runtime.stopping.load(Ordering::Acquire))
-                        {
+                        // Never upgrade `runtime` while this guard is held: if
+                        // the temporary Arc were the last reference, its Drop
+                        // would run `shutdown()` and re-lock this mutex.
+                        while pending.is_none() && !stopping.load(Ordering::Acquire) {
                             pending = changed.wait(pending).unwrap();
                         }
                         pending.take()
@@ -119,8 +148,7 @@ impl SoundRuntime {
                     if runtime.stopping.load(Ordering::Acquire) {
                         break;
                     }
-                    let Some(snapshot) =
-                        build_snapshot_cancellable(&request.config, &runtime.stopping)
+                    let Some(snapshot) = (runtime.builder)(&request.config, &runtime.stopping)
                     else {
                         break;
                     };
@@ -134,8 +162,12 @@ impl SoundRuntime {
                 }
             })
             // best-effort: an unavailable reload worker leaves the empty snapshot in place
-            .ok();
-        *self.reload_worker.lock().unwrap() = handle;
+            .ok()
+            .map(|join| Worker {
+                join,
+                done: done_rx,
+            });
+        *self.reload_worker.lock().unwrap() = spawned;
     }
 
     /// Build a fresh snapshot off the compositor loop, then swap it atomically.
@@ -208,14 +240,21 @@ impl SoundRuntime {
             return None;
         }
         let mut queue = self.queue.lock().unwrap();
+        // Re-check under the lock: `shutdown` sets `stopping` before taking it,
+        // so no worker can be spawned (and orphaned) after shutdown began.
+        if self.stopping.load(Ordering::Acquire) {
+            return None;
+        }
         if let Some(tx) = queue.as_ref() {
             return Some(tx.clone());
         }
         let (tx, rx) = std::sync::mpsc::sync_channel(QUEUE_DEPTH);
         let runtime = Arc::downgrade(self);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
         let spawned = std::thread::Builder::new()
             .name("notify-sound".into())
             .spawn(move || {
+                let _done = SignalDone(done_tx);
                 crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
                 while let Ok(job) = rx.recv() {
                     let Some(runtime) = runtime.upgrade() else { break };
@@ -252,13 +291,22 @@ impl SoundRuntime {
                     }
                 }
             });
-        *self.worker.lock().unwrap() = Some(spawned.ok()?);
+        *self.worker.lock().unwrap() = Some(Worker {
+            join: spawned.ok()?,
+            done: done_rx,
+        });
         *queue = Some(tx.clone());
         Some(tx)
     }
 
     /// Stop accepting sound work, cancel active helper playback, discard the
-    /// coalesced reload request, and join both owned workers.
+    /// coalesced reload request, and wait for both owned workers.
+    ///
+    /// The wait is bounded by [`SHUTDOWN_JOIN_BOUND`] in total. A worker that
+    /// has not finished by then (a child in uninterruptible I/O, a hung pack
+    /// directory, an unbounded Windows `status()`) is logged and detached
+    /// rather than blocking exit; it holds only a weak runtime reference and
+    /// observes `stopping`, so it winds down on its own if it ever unblocks.
     pub(crate) fn shutdown(&self) {
         if self.stopping.swap(true, Ordering::AcqRel) {
             return;
@@ -268,20 +316,13 @@ impl SoundRuntime {
         let (pending, changed) = &*self.reload_slot;
         pending.lock().unwrap().take();
         changed.notify_all();
-        if let Some(worker) = self.worker.lock().unwrap().take() {
-            if worker.thread().id() == std::thread::current().id() {
-                // Drop can run on a worker if its temporary weak upgrade was
-                // the final strong reference. That thread is already exiting.
-                drop(worker);
-            } else if worker.join().is_err() {
-                tracing::error!(target: "thegn::notify_sound", "sound playback worker panicked during shutdown");
-            }
-        }
-        if let Some(worker) = self.reload_worker.lock().unwrap().take() {
-            if worker.thread().id() == std::thread::current().id() {
-                drop(worker);
-            } else if worker.join().is_err() {
-                tracing::error!(target: "thegn::notify_sound", "sound snapshot worker panicked during shutdown");
+        let deadline =
+            std::time::Instant::now() + crate::platform::sound_process::SHUTDOWN_JOIN_BOUND;
+        let playback = self.worker.lock().unwrap().take();
+        let reload = self.reload_worker.lock().unwrap().take();
+        for (name, worker) in [("playback", playback), ("snapshot", reload)] {
+            if let Some(worker) = worker {
+                join_bounded(name, worker, deadline);
             }
         }
     }
@@ -314,6 +355,30 @@ impl SoundRuntime {
 impl Drop for SoundRuntime {
     fn drop(&mut self) {
         self.shutdown();
+    }
+}
+
+fn join_bounded(name: &str, worker: Worker, deadline: std::time::Instant) {
+    if worker.join.thread().id() == std::thread::current().id() {
+        // Drop can run on a worker if its temporary weak upgrade was the final
+        // strong reference. That thread is already exiting; just detach.
+        return;
+    }
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    // Both a `()` and a disconnect mean the worker is finished.
+    if matches!(
+        worker.done.recv_timeout(remaining),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    ) {
+        tracing::warn!(
+            target: "thegn::notify_sound",
+            worker = name,
+            "sound worker did not stop within the shutdown bound; detaching it"
+        );
+        return;
+    }
+    if worker.join.join().is_err() {
+        tracing::error!(target: "thegn::notify_sound", worker = name, "sound worker panicked during shutdown");
     }
 }
 
@@ -480,25 +545,146 @@ mod tests {
         assert_ne!(generation.load(Ordering::Acquire), 1);
     }
 
-    #[test]
-    fn reload_storm_keeps_only_the_latest_pending_generation() {
-        let mut pending = None;
-        for generation in 1..=100 {
-            replace_pending_reload(
-                &mut pending,
-                ReloadRequest {
-                    generation,
-                    config: SoundConfig {
-                        pack: format!("pack-{generation}"),
-                        ..SoundConfig::default()
-                    },
-                },
+    /// A real terminal waker for constructing a `SoundRuntime`; the pty ends
+    /// are returned so they outlive the runtime.
+    #[cfg(unix)]
+    fn test_waker() -> (
+        TerminalWaker,
+        std::fs::File,
+        termwiz::terminal::UnixTerminal,
+    ) {
+        use std::os::fd::FromRawFd;
+        use termwiz::terminal::{Terminal, UnixTerminal};
+        let mut master = -1;
+        let mut slave = -1;
+        assert_eq!(
+            // SAFETY: out-pointers are valid; null name/termios/winsize are allowed.
+            unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                )
+            },
+            0
+        );
+        // SAFETY: openpty returned two fresh fds that we now own.
+        let master = unsafe { std::fs::File::from_raw_fd(master) };
+        let slave = unsafe { std::fs::File::from_raw_fd(slave) };
+        let caps =
+            termwiz::caps::Capabilities::new_with_hints(termwiz::caps::ProbeHints::default())
+                .unwrap();
+        let terminal = UnixTerminal::new_with(caps, &slave, &slave).unwrap();
+        (terminal.waker(), master, terminal)
+    }
+
+    fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
+        let started = std::time::Instant::now();
+        while !cond() {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(5),
+                "timed out waiting for {what}"
             );
+            std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        let latest = pending.take().unwrap();
-        assert_eq!(latest.generation, 100);
-        assert_eq!(latest.config.pack, "pack-100");
-        assert!(pending.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reload_storm_runs_one_build_at_a_time_and_the_latest_config_wins() {
+        use std::sync::atomic::AtomicUsize;
+        let (waker, _master, _terminal) = test_waker();
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let builds = Arc::new(AtomicUsize::new(0));
+        let builder: Arc<SnapshotBuilder> = {
+            let (active, max_active, builds) = (active.clone(), max_active.clone(), builds.clone());
+            Arc::new(move |cfg: &SoundConfig, _stopping: &AtomicBool| {
+                let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                max_active.fetch_max(now, Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                builds.fetch_add(1, Ordering::SeqCst);
+                active.fetch_sub(1, Ordering::SeqCst);
+                let mut snapshot = PlaybackSnapshot::empty();
+                snapshot.fallback = Some(cfg.pack.clone());
+                Some(snapshot)
+            })
+        };
+        let runtime = SoundRuntime::with_builder(waker, builder);
+        for generation in 1..=100 {
+            runtime.reload(SoundConfig {
+                pack: format!("pack-{generation}"),
+                ..SoundConfig::default()
+            });
+        }
+        wait_until("the latest config to be published", || {
+            runtime.snapshot.lock().unwrap().fallback.as_deref() == Some("pack-100")
+        });
+        runtime.shutdown();
+        assert_eq!(max_active.load(Ordering::SeqCst), 1, "builds overlapped");
+        assert!(
+            builds.load(Ordering::SeqCst) < 100,
+            "the storm was not coalesced"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_is_bounded_with_a_hung_helper_and_a_hung_pending_reload() {
+        let (waker, _master, _terminal) = test_waker();
+        let building = Arc::new(AtomicBool::new(false));
+        // An uncooperative build (a hung `read_dir`): ignores `stopping`.
+        let builder: Arc<SnapshotBuilder> = {
+            let building = building.clone();
+            Arc::new(move |_cfg: &SoundConfig, _stopping: &AtomicBool| {
+                building.store(true, Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_secs(3));
+                None
+            })
+        };
+        let runtime = SoundRuntime::with_builder(waker, builder);
+        runtime.reload(SoundConfig::default());
+        wait_until("the build to start", || building.load(Ordering::SeqCst));
+        runtime.reload(SoundConfig {
+            pack: "pending".into(),
+            ..SoundConfig::default()
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("pid");
+        runtime.enqueue(&SoundEmit::Command(format!(
+            "echo $$ > '{}'; sleep 30 & wait",
+            pid_file.display()
+        )));
+        wait_until("the helper to start", || {
+            std::fs::read_to_string(&pid_file).is_ok_and(|s| s.trim().parse::<i32>().is_ok())
+        });
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        runtime.shutdown();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "shutdown took {:?}",
+            started.elapsed()
+        );
+        assert!(runtime.worker.lock().unwrap().is_none());
+        assert!(runtime.reload_worker.lock().unwrap().is_none());
+        // The helper was killed AND reaped: its pid no longer exists (a zombie
+        // would still answer signal 0).
+        // SAFETY: signal 0 only probes for existence.
+        let probe = unsafe { libc::kill(pid, 0) };
+        assert_eq!(probe, -1, "helper {pid} still exists (running or zombie)");
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
     }
 
     #[test]
