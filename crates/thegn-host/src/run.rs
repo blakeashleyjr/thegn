@@ -12137,7 +12137,10 @@ async fn event_loop<T: Terminal>(
                     );
                 }
                 // Branch ref moved: heal the checkout off-loop + drop the cache.
-                RefreshKind::MainRefMoved => crate::branch_cache::ref_moved(&mut want_main_sync),
+                RefreshKind::MainRefMoved => crate::branch_cache::ref_moved_unless_unchanged(
+                    &mut want_main_sync,
+                    &active_tab_path(&session),
+                ),
                 RefreshKind::HostHeal => want_host_heal = true,
                 // Offline recovery re-probe (ticker emits only while offline).
                 RefreshKind::ConnRecover => crate::connectivity_gate::spawn_recovery_probe(

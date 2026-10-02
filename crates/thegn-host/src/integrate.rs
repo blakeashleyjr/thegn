@@ -631,10 +631,40 @@ pub struct Candidates {
 /// The main checkout (first `git worktree list` entry) reachable from any path
 /// inside the repo. The fold advances the repo's target branch, so it operates
 /// from the main checkout regardless of which worktree the caller is in.
+///
+/// The first entry is derived from the repo's common dir alone, so a local path
+/// with a `.git` entry is answered from a memo keyed on that entry
+/// ([`thegn_core::git_memo`]) instead of forking `git worktree list` on every
+/// merge-queue membership test (THE-718). A path with no `.git` entry (a
+/// subdirectory, a bare repo) cannot be fingerprinted and still asks git.
 pub fn main_checkout(start: &Path) -> Option<PathBuf> {
-    let porc = util::git_out(start, &["worktree", "list", "--porcelain"])?;
-    porc.lines()
-        .find_map(|l| l.strip_prefix("worktree ").map(PathBuf::from))
+    static MEMO: std::sync::Mutex<Option<thegn_core::git_memo::Memo<Option<PathBuf>>>> =
+        std::sync::Mutex::new(None);
+    thegn_core::git_memo::memoised_checked(
+        &MEMO,
+        512,
+        start,
+        thegn_core::git_memo::fingerprint(start),
+        || {
+            // off-loop: callers are merge-queue / CLI paths already off the loop
+            // (this was `util::git_out`, which the lint cannot see through).
+            #[expect(clippy::disallowed_methods)]
+            let out = util::git_cmd(start)
+                .args(["worktree", "list", "--porcelain"])
+                .output();
+            let Ok(out) = out else {
+                return (None, false); // could not spawn git: transient, never memoised
+            };
+            let porc = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            let first = (out.status.success() && !porc.is_empty())
+                .then(|| {
+                    porc.lines()
+                        .find_map(|l| l.strip_prefix("worktree ").map(PathBuf::from))
+                })
+                .flatten();
+            (first, true)
+        },
+    )
 }
 
 /// One-shot fold of the repo containing `any_path`: resolve the main checkout +

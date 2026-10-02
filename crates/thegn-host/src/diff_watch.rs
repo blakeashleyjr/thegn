@@ -67,6 +67,7 @@ impl Coverage {
         res: &notify::Result<Event>,
         nonrec: &std::collections::HashSet<PathBuf>,
         ignore: &ignore::gitignore::Gitignore,
+        roots: &[PathBuf],
     ) {
         use notify::EventKind;
         let ev = match res {
@@ -78,6 +79,17 @@ impl Coverage {
         };
         if matches!(ev.kind, EventKind::Access(_)) {
             return; // opens/closes without a write cannot change any answer
+        }
+        // Two kinds of git-dir file change nothing thegn reads:
+        // - `FETCH_HEAD`, the write-only record of the last fetch: git rewrites
+        //   it on EVERY fetch, changed refs or not (a fetch that moves a ref also
+        //   writes that ref, which does bump);
+        // - `*.lock` files: git creates one, then RENAMES it onto the target (the
+        //   target's own event bumps) or deletes it unused (no state change; an
+        //   up-to-date fetch does exactly that to `refs/remotes/origin/HEAD.lock`).
+        // Only inside a git dir: `Cargo.lock` in the tree is a real edit.
+        if !ev.paths.is_empty() && ev.paths.iter().all(|p| is_git_bookkeeping(p, roots)) {
+            return;
         }
         self.bump();
         if matches!(ev.kind, EventKind::Create(_)) {
@@ -101,6 +113,16 @@ impl Coverage {
             self.withdraw();
         }
     }
+}
+
+/// A file under a git dir whose change cannot alter any read (see
+/// [`Coverage::observe`]): the fetch record and transient `*.lock` files.
+fn is_git_bookkeeping(p: &Path, roots: &[PathBuf]) -> bool {
+    let in_git_dir = crate::git_watch::in_dot_git(p) || roots.iter().any(|r| p.starts_with(r));
+    in_git_dir
+        && p.file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n == "FETCH_HEAD" || n.ends_with(".lock"))
 }
 
 /// Dropped with the watcher's event closure: when the watcher goes away its
@@ -172,6 +194,49 @@ pub(crate) fn current_print(path: &Path) -> Option<WatchPrint> {
         generation: cov.generation.load(Ordering::SeqCst),
         write_epoch: thegn_core::util::git_write_epoch(),
     })
+}
+
+/// A consumer's record of the print at which it last COMPLETED a pass over a
+/// path, so a periodic backstop can skip a pass when nothing has changed since
+/// (the generation is monotonic and covers every event, so equal prints mean an
+/// identical tree and git dir). No live print => never skips: callers fall back
+/// to their old cadence exactly.
+pub(crate) struct Seen(Mutex<Option<HashMap<PathBuf, WatchPrint>>>);
+
+impl Seen {
+    pub(crate) const fn new() -> Self {
+        Self(Mutex::new(None))
+    }
+
+    /// The current print for `path` and whether the last completed pass already
+    /// saw exactly it. Take the print BEFORE the pass and hand it to [`mark`].
+    ///
+    /// [`mark`]: Seen::mark
+    pub(crate) fn check(&self, path: &Path) -> (Option<WatchPrint>, bool) {
+        let now = current_print(path);
+        let unchanged = now.is_some_and(|p| {
+            self.0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .and_then(|m| m.get(path))
+                .is_some_and(|seen| *seen == p)
+        });
+        (now, unchanged)
+    }
+
+    /// Record that a pass over `path` COMPLETED having started at `print`.
+    pub(crate) fn mark(&self, path: &Path, print: Option<WatchPrint>) {
+        let Some(print) = print else {
+            return;
+        };
+        let mut m = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let m = m.get_or_insert_with(HashMap::new);
+        if m.len() >= 16 && !m.contains_key(path) {
+            m.clear();
+        }
+        m.insert(path.to_path_buf(), print);
+    }
 }
 
 /// No tracked file matches an ignore rule (`git ls-files -ci`). Any failure to
@@ -273,7 +338,7 @@ pub(crate) fn build_diff_watcher(cwd: &Path, sink: RefreshSink) -> Option<Recomm
         path: cwd.clone(),
     };
     let new_watcher = recommended_watcher(move |res: notify::Result<Event>| {
-        guard.cov.observe(&res, &nonrec, &ignore);
+        guard.cov.observe(&res, &nonrec, &ignore, &roots);
         if let Ok(ev) = res
             && matches!(
                 ev.kind,
@@ -488,6 +553,18 @@ mod tests {
         );
     }
 
+    // test code: fixture setup, never on the event loop.
+    #[expect(clippy::disallowed_methods)]
+    fn git_succeeds(dir: &Path, args: &[&str]) -> bool {
+        thegn_core::util::git_cmd(dir)
+            .args(["-c", "commit.gpgsign=false"])
+            .args(args)
+            .output()
+            .unwrap()
+            .status
+            .success()
+    }
+
     fn scratch(name: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!("tg-diffwatch-{}-{name}", std::process::id()));
         if p.exists() {
@@ -647,6 +724,54 @@ mod tests {
         });
     }
 
+    /// A no-op fetch only rewrites FETCH_HEAD (the startup auto-fetch on an
+    /// up-to-date repo): that must not re-arm every backstop; a fetch that moves
+    /// a ref must.
+    #[test]
+    fn fetch_head_alone_is_not_a_change_but_a_moved_ref_is() {
+        let base = scratch("fetch");
+        let origin = repo(&base, "origin", false);
+        let r = base.join("clone");
+        git(
+            &base,
+            &["clone", "-q", origin.to_str().unwrap(), r.to_str().unwrap()],
+        );
+        let _w = watch(&r);
+        assert!(print(&r).is_some());
+        let before = settle(&r);
+        git(&r, &["fetch", "-q", "origin"]);
+        std::thread::sleep(Duration::from_millis(600));
+        assert_eq!(
+            print(&r),
+            Some(before),
+            "an up-to-date fetch (FETCH_HEAD only) advanced the generation"
+        );
+        std::fs::write(origin.join("b.txt"), "b\n").unwrap();
+        git(&origin, &["add", "."]);
+        git(&origin, &["commit", "-q", "-m", "more"]);
+        advances(&r, "a fetch that moves refs/remotes", || {
+            git(&r, &["fetch", "-q", "origin"])
+        });
+    }
+
+    #[test]
+    fn bookkeeping_is_only_git_dir_lock_and_fetch_files() {
+        let roots = vec![PathBuf::from("/elsewhere/gitdir")];
+        let b = |p: &str| is_git_bookkeeping(Path::new(p), &roots);
+        assert!(b("/r/.git/FETCH_HEAD"));
+        assert!(b("/r/.git/index.lock"));
+        assert!(b("/r/.git/refs/remotes/origin/HEAD.lock"));
+        assert!(b("/r/.git/worktrees/w/FETCH_HEAD"));
+        assert!(b("/elsewhere/gitdir/refs/heads/x.lock"), "relocated gitdir");
+        // The rename target and ordinary files are state.
+        assert!(!b("/r/.git/index"));
+        assert!(!b("/r/.git/HEAD"));
+        assert!(!b("/r/.git/refs/heads/main"));
+        // A tracked `Cargo.lock` (or a FETCH_HEAD in the tree) is a real edit.
+        assert!(!b("/r/Cargo.lock"));
+        assert!(!b("/r/src/FETCH_HEAD"));
+    }
+
     #[test]
     fn an_in_app_git_write_advances_the_print_without_any_fs_event() {
         let base = scratch("epoch");
@@ -781,18 +906,20 @@ mod tests {
         git(&r, &["checkout", "-q", "main"]);
         std::fs::write(r.join("a.txt"), "main\n").unwrap();
         git(&r, &["commit", "-qam", "main"]);
-        let merged = thegn_core::util::git_cmd(&r)
-            .args([
-                "-c",
-                "user.name=t",
-                "-c",
-                "user.email=t@t.t",
-                "merge",
-                "left",
-            ])
-            .output()
-            .unwrap();
-        assert!(!merged.status.success(), "the merge must conflict");
+        assert!(
+            !git_succeeds(
+                &r,
+                &[
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t.t",
+                    "merge",
+                    "left"
+                ],
+            ),
+            "the merge must conflict"
+        );
         let p = panel("conflict");
         assert_eq!(row(&p, "a.txt"), Some(Stage::Conflict), "conflict appears");
         assert!(p.merge.is_some(), "merge banner appears");
@@ -805,6 +932,39 @@ mod tests {
         // The branch switch is visible too.
         git(&r, &["checkout", "-q", "left"]);
         assert_eq!(panel("switched").branch, "left");
+    }
+
+    #[test]
+    fn seen_skips_only_an_unchanged_live_print_and_only_after_a_completed_pass() {
+        let base = scratch("seen");
+        let r = repo(&base, "r", false);
+        let seen = Seen::new();
+        // No watcher: never skips, nothing to mark.
+        assert_eq!(seen.check(&r), (None, false));
+        let _w = watch(&r);
+        let (p0, unchanged) = seen.check(&r);
+        assert!(p0.is_some() && !unchanged, "no pass completed yet");
+        let p0 = settle(&r);
+        let (p1, unchanged) = seen.check(&r);
+        assert_eq!(p1, Some(p0));
+        assert!(!unchanged, "a pass that has not completed never skips");
+        seen.mark(&r, p1);
+        assert!(
+            seen.check(&r).1,
+            "a completed pass at this print skips the next"
+        );
+        advances(&r, "an edit", || {
+            std::fs::write(r.join("a.txt"), "changed\n").unwrap();
+        });
+        assert!(!seen.check(&r).1, "a change re-arms the pass");
+        // An in-app git write re-arms it without any fs event.
+        let (p, _) = seen.check(&r);
+        seen.mark(&r, p);
+        let settled = settle(&r);
+        seen.mark(&r, Some(settled));
+        assert!(seen.check(&r).1);
+        drop(thegn_core::util::GitWriteScope::begin());
+        assert!(!seen.check(&r).1);
     }
 
     #[test]

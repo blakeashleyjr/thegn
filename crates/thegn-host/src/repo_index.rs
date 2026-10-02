@@ -49,22 +49,33 @@ pub struct CrawlOutcome {
     pub indexed: usize,
     /// The listing exceeded the cap: the index is honestly partial.
     pub partial: bool,
+    /// `git ls-files` ran (even if it listed nothing): the pass is complete, as
+    /// opposed to a git that could not be run, which must be retried.
+    pub listed: bool,
 }
 
 /// The git-listed, tree-sitter-served files under `root`, as paths relative to
 /// it. Tracked files only (`git ls-files`), so `.gitignore`d / vendored trees
 /// are excluded by construction — the "walk the git listing, never readdir"
-/// contract. NUL-separated so paths with spaces need no unquoting.
-fn git_ts_files(root: &Path) -> Vec<PathBuf> {
+/// contract. NUL-separated so paths with spaces need no unquoting. `None` only
+/// when git could not be run at all; an empty or failed listing is `Some(empty)`
+/// (a deterministic answer for the current index).
+fn git_ts_files(root: &Path) -> Option<Vec<PathBuf>> {
     let loc = GitLoc::for_worktree(root);
-    let Some(out) = loc.git_out(&["ls-files", "-z"]) else {
-        return Vec::new();
-    };
-    out.split('\0')
-        .filter(|s| !s.is_empty())
-        .filter(|rel| Lang::from_path(rel).is_some())
-        .map(PathBuf::from)
-        .collect()
+    // off-loop: callers are the crawl's blocking task and CLI/MCP processes.
+    #[expect(clippy::disallowed_methods)]
+    let out = loc.git_command(&["ls-files", "-z"]).output().ok()?;
+    if !out.status.success() {
+        return Some(Vec::new());
+    }
+    Some(
+        String::from_utf8_lossy(&out.stdout)
+            .split('\0')
+            .filter(|s| !s.is_empty())
+            .filter(|rel| Lang::from_path(rel).is_some())
+            .map(PathBuf::from)
+            .collect(),
+    )
 }
 
 /// Crawl `root`'s git-listed tree-sitter files into the entity index, capped at
@@ -74,7 +85,9 @@ fn git_ts_files(root: &Path) -> Vec<PathBuf> {
 pub fn crawl_worktree(root: &Path, cap: usize, db: &Db) -> CrawlOutcome {
     let cap = cap.max(1);
     let root_s = root.to_string_lossy().into_owned();
-    let files = git_ts_files(root);
+    let listing = git_ts_files(root);
+    let listed = listing.is_some();
+    let files = listing.unwrap_or_default();
     let ts_files = files.len();
     let partial = ts_files > cap;
 
@@ -83,6 +96,7 @@ pub fn crawl_worktree(root: &Path, cap: usize, db: &Db) -> CrawlOutcome {
         ts_files,
         indexed: 0,
         partial,
+        listed,
     };
 
     for rel in files.into_iter().take(cap) {
@@ -141,7 +155,7 @@ pub fn load_repo_map(root: &Path, cap: usize, db: &Db, file_filter: Option<&str>
 
     // Inline first-use crawl when the index is empty for this worktree.
     let mut rows = db.entities_under(&root_s).unwrap_or_default();
-    let mut ts_files = git_ts_files(root).len();
+    let mut ts_files = git_ts_files(root).map_or(0, |f| f.len());
     if rows.is_empty() && ts_files > 0 {
         let outcome = crawl_worktree(root, cap, db);
         ts_files = outcome.ts_files;
@@ -205,11 +219,20 @@ thread_local! {
         std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
+/// The change print at which each root's crawl last COMPLETED. The crawl reads
+/// the git file listing and every indexed file's content, so its inputs are
+/// exactly what the watcher's generation covers (index writes, file edits): an
+/// unchanged print needs no crawl, however long ago the last one was. Without a
+/// live watcher the 20 s debounce is the only gate, as before.
+static CRAWLED: crate::diff_watch::Seen = crate::diff_watch::Seen::new();
+
 /// Whether the active root is due for a crawl: never crawled this session, or
-/// its debounce elapsed. Records the decision (marks it crawled now) so the same
-/// tick's repeat refreshes don't re-trigger.
-fn due(root: &Path) -> bool {
-    LAST_CRAWL.with(|m| {
+/// its debounce elapsed (and, under a live watcher, something changed since the
+/// last completed crawl). Records the decision (marks it crawled now) so the same
+/// tick's repeat refreshes don't re-trigger. Returns the print to record once
+/// the crawl completes.
+fn due(root: &Path) -> Option<Option<crate::diff_watch::WatchPrint>> {
+    let due_by_clock = LAST_CRAWL.with(|m| {
         let mut m = m.borrow_mut();
         let now = std::time::Instant::now();
         match m.get(root) {
@@ -219,7 +242,12 @@ fn due(root: &Path) -> bool {
                 true
             }
         }
-    })
+    });
+    if !due_by_clock {
+        return None;
+    }
+    let (print, unchanged) = CRAWLED.check(root);
+    (!unchanged).then_some(print)
 }
 
 /// Loop-side trigger: crawl the active worktree's entity index off the event
@@ -240,16 +268,22 @@ pub(crate) fn maybe_spawn_crawl(
     let Some(cwd) = cwd else {
         return;
     };
-    if !due(&cwd) {
+    let Some(print) = due(&cwd) else {
         return;
-    }
+    };
     let waker = waker.clone();
     tokio::task::spawn_blocking(move || {
         crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
         let Ok(db) = Db::open() else {
             return;
         };
-        if crawl_worktree(&cwd, cap, &db).changed {
+        let outcome = crawl_worktree(&cwd, cap, &db);
+        // A listing that could not be read yields an empty pass, which is not a
+        // completed crawl: leave it unrecorded so the next due tick retries.
+        if outcome.listed {
+            CRAWLED.mark(&cwd, print);
+        }
+        if outcome.changed {
             let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
     });

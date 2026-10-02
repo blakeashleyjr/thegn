@@ -52,6 +52,12 @@ pub enum Fingerprint {
         base: Box<Fingerprint>,
         inputs: OriginInputs,
     },
+    /// A forge checkout scope: everything the origin print covers, plus what
+    /// `rev-parse --abbrev-ref HEAD` reads (see [`HeadInputs`]).
+    Checkout {
+        origin: Box<Fingerprint>,
+        head: HeadInputs,
+    },
 }
 
 /// Per-worktree git dir named by a `.git` file's `gitdir:` line.
@@ -296,6 +302,117 @@ pub fn origin_inputs(dir: &Path, env: &dyn Fn(&str) -> Option<String>) -> Option
     Some(OriginInputs { files, env: envs })
 }
 
+/// What `git rev-parse --abbrev-ref HEAD` is derived from: the worktree's HEAD,
+/// and -- for a symbolic HEAD -- the existence of every ref its short name could
+/// be ambiguous with (git prints `heads/x` when `x` is also a tag, a remote, ...)
+/// or that must exist for it to resolve at all. Loose refs by stamp, packed ones
+/// through the `packed-refs` stamp. The reftable backend keeps refs outside
+/// files, so it is not modelled (no print).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HeadInputs {
+    head: String,
+    loose: Vec<(PathBuf, Stamp)>,
+    packed: Stamp,
+}
+
+/// Compute [`HeadInputs`] for `dir`; `None` = cannot be modelled completely.
+pub fn head_inputs(dir: &Path) -> Option<HeadInputs> {
+    let gitdir = git_dir(dir)?;
+    let common = crate::util::git_common_dir(dir);
+    if common.join("reftable").exists() {
+        return None;
+    }
+    let head = std::fs::read_to_string(gitdir.join("HEAD")).ok()?;
+    let mut loose = Vec::new();
+    if let Some(name) = head.trim().strip_prefix("ref: refs/heads/") {
+        if name.is_empty() || name.split('/').any(|c| c == ".." || c == ".") {
+            return None;
+        }
+        // git's ref_rev_parse_rules, minus the rule that names the ref itself
+        // (which must exist for HEAD to resolve), plus that ref.
+        for base in [&gitdir, &common] {
+            loose.push((base.join(name), stamp(&base.join(name))));
+        }
+        for rel in [
+            format!("refs/{name}"),
+            format!("refs/tags/{name}"),
+            format!("refs/heads/{name}"),
+            format!("refs/remotes/{name}"),
+            format!("refs/remotes/{name}/HEAD"),
+        ] {
+            let p = common.join(&rel);
+            let s = stamp(&p);
+            loose.push((p, s));
+        }
+    }
+    Some(HeadInputs {
+        head,
+        loose,
+        packed: stamp(&common.join("packed-refs")),
+    })
+}
+
+/// Fingerprint for a forge checkout scope (branch + origin/base/push remote
+/// identities) of a local worktree; `None` = bypass the memo.
+pub fn checkout_fingerprint(
+    dir: &Path,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Option<Fingerprint> {
+    let origin = origin_fingerprint(dir, env)?;
+    if origin == Fingerprint::Missing {
+        return Some(origin);
+    }
+    Some(Fingerprint::Checkout {
+        origin: Box::new(origin),
+        head: head_inputs(dir)?,
+    })
+}
+
+/// Inputs of the default-base probe (`symbolic-ref origin/HEAD`, then
+/// `show-ref --verify refs/heads/<b>` for the candidates): the `origin/HEAD`
+/// symref file by content, the loose heads that could be the answer, and the
+/// packed-refs stamp. Cheap stats; equal prints mean the probe answers the same.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BaseRefsPrint {
+    origin_head: Option<String>,
+    loose: Vec<(PathBuf, Stamp)>,
+    packed: Stamp,
+}
+
+/// Compute [`BaseRefsPrint`] for a local worktree, or `None` when it cannot be
+/// modelled (no resolvable git dir, reftable).
+pub fn base_refs_print(dir: &Path) -> Option<BaseRefsPrint> {
+    git_dir(dir)?;
+    let common = crate::util::git_common_dir(dir);
+    if common.join("reftable").exists() {
+        return None;
+    }
+    // `None` for an absent symref (no origin/HEAD) and for an oversized/unreadable one.
+    let origin_head = read_config(&common.join("refs/remotes/origin/HEAD"));
+    let mut names: Vec<String> = vec!["main".into(), "master".into()];
+    if let Some(target) = origin_head
+        .as_deref()
+        .and_then(|c| c.trim().strip_prefix("ref: refs/remotes/origin/"))
+        && !target.is_empty()
+        && !target.split('/').any(|c| c == ".." || c == ".")
+    {
+        names.push(target.to_string());
+    }
+    let loose = names
+        .into_iter()
+        .map(|n| {
+            let p = common.join("refs/heads").join(n);
+            let s = stamp(&p);
+            (p, s)
+        })
+        .collect();
+    Some(BaseRefsPrint {
+        origin_head,
+        loose,
+        packed: stamp(&common.join("packed-refs")),
+    })
+}
+
 /// A bounded path -> (fingerprint, value) memo; the oldest entry is evicted.
 pub struct Memo<V: Clone> {
     cap: usize,
@@ -362,8 +479,24 @@ pub fn memoised_with<V: Clone>(
     fp: Option<Fingerprint>,
     compute: impl FnOnce() -> V,
 ) -> V {
+    memoised_checked(memo, cap, dir, fp, || (compute(), true))
+}
+
+/// [`memoised_with`] for a computation that can tell a deterministic answer
+/// from a transient failure: `compute` returns `(value, cacheable)`, and an
+/// uncacheable value (a `git` that could not even be spawned -- EAGAIN, EMFILE
+/// under load) is returned but never stored, so it cannot outlive the moment.
+/// A non-zero exit from git is deterministic given the fingerprinted inputs and
+/// IS cacheable; only "could not run it at all" is not.
+pub fn memoised_checked<V: Clone>(
+    memo: &Mutex<Option<Memo<V>>>,
+    cap: usize,
+    dir: &Path,
+    fp: Option<Fingerprint>,
+    compute: impl FnOnce() -> (V, bool),
+) -> V {
     let Some(fp) = fp else {
-        return compute();
+        return compute().0;
     };
     {
         let guard = memo.lock().unwrap_or_else(|e| e.into_inner());
@@ -371,11 +504,13 @@ pub fn memoised_with<V: Clone>(
             return v;
         }
     }
-    let v = compute();
-    memo.lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get_or_insert_with(|| Memo::new(cap))
-        .put(dir, fp, v.clone());
+    let (v, cacheable) = compute();
+    if cacheable {
+        memo.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert_with(|| Memo::new(cap))
+            .put(dir, fp, v.clone());
+    }
     v
 }
 
@@ -399,10 +534,10 @@ const ORIGIN_MEMO_CAP: usize = 512;
 /// [`origin_fingerprint`] (THE-718: 45 forks/min on an idle one-repo session).
 /// `compute` is the subprocess; it runs only on a miss or when the inputs
 /// cannot be fingerprinted completely.
-pub fn origin_url(dir: &Path, compute: impl FnOnce() -> Option<String>) -> Option<String> {
+pub fn origin_url(dir: &Path, compute: impl FnOnce() -> (Option<String>, bool)) -> Option<String> {
     static MEMO: Mutex<Option<Memo<Option<String>>>> = Mutex::new(None);
     let fp = origin_fingerprint(dir, &|k| std::env::var(k).ok());
-    memoised_with(&MEMO, ORIGIN_MEMO_CAP, dir, fp, compute)
+    memoised_checked(&MEMO, ORIGIN_MEMO_CAP, dir, fp, compute)
 }
 
 #[cfg(test)]
@@ -618,7 +753,10 @@ mod tests {
         let run = || {
             origin_url(&repo, || {
                 spawns.set(spawns.get() + 1);
-                crate::util::git_out(&repo, &["remote", "get-url", "origin"])
+                (
+                    crate::util::git_out(&repo, &["remote", "get-url", "origin"]),
+                    true,
+                )
             })
         };
         assert_eq!(run().as_deref(), Some("https://example.test/a/b.git"));
@@ -635,6 +773,125 @@ mod tests {
         assert_eq!(run().as_deref(), Some("https://example.test/c/d.git"));
         git(&["remote", "remove", "origin"]);
         assert_eq!(run(), None, "removal is seen, not served from the memo");
+    }
+
+    #[test]
+    fn head_inputs_see_ambiguity_and_head_moves() {
+        let base = tmp("head-inputs");
+        let repo = repo_with_config(&base, "");
+        let a = head_inputs(&repo).expect("modelled");
+        assert_eq!(a, head_inputs(&repo).unwrap());
+        // A tag appearing with the branch's short name makes `--abbrev-ref`
+        // print `heads/main`: the print must move.
+        std::fs::create_dir_all(repo.join(".git/refs/tags")).unwrap();
+        std::fs::write(repo.join(".git/refs/tags/main"), "0\n").unwrap();
+        let b = head_inputs(&repo).unwrap();
+        assert_ne!(a, b);
+        // HEAD pointing elsewhere.
+        std::fs::write(repo.join(".git/HEAD"), "ref: refs/heads/other\n").unwrap();
+        assert_ne!(b, head_inputs(&repo).unwrap());
+        // Detached HEAD carries no ref candidates, just the content.
+        std::fs::write(
+            repo.join(".git/HEAD"),
+            "0123456789012345678901234567890123456789\n",
+        )
+        .unwrap();
+        assert!(head_inputs(&repo).unwrap().loose.is_empty());
+        // packed-refs appearing moves it.
+        let c = head_inputs(&repo).unwrap();
+        std::fs::write(repo.join(".git/packed-refs"), "# pack-refs\n").unwrap();
+        assert_ne!(c, head_inputs(&repo).unwrap());
+        // Not modelled: reftable, a path traversal in the branch name, no gitdir.
+        std::fs::write(repo.join(".git/HEAD"), "ref: refs/heads/../x\n").unwrap();
+        assert!(head_inputs(&repo).is_none());
+        std::fs::write(repo.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::create_dir_all(repo.join(".git/reftable")).unwrap();
+        assert!(head_inputs(&repo).is_none());
+        assert!(head_inputs(&base.join("nothing")).is_none());
+    }
+
+    #[test]
+    fn checkout_fingerprint_combines_config_and_head_inputs() {
+        let base = tmp("checkout-fp");
+        let repo = repo_with_config(&base, "[remote \"origin\"]\n\turl = https://x/r\n");
+        let h = base.to_str().unwrap();
+        let env = env_of(&[("HOME", h), ("GIT_CONFIG_NOSYSTEM", "1")]);
+        let a = checkout_fingerprint(&repo, &env).expect("complete");
+        assert!(matches!(a, Fingerprint::Checkout { .. }));
+        std::fs::write(repo.join(".git/HEAD"), "ref: refs/heads/side\n").unwrap();
+        assert_ne!(
+            a,
+            checkout_fingerprint(&repo, &env).unwrap(),
+            "branch switch"
+        );
+        let b = checkout_fingerprint(&repo, &env).unwrap();
+        std::fs::write(
+            repo.join(".git/config"),
+            "[remote \"origin\"]\n\turl = https://y/r\n",
+        )
+        .unwrap();
+        assert_ne!(
+            b,
+            checkout_fingerprint(&repo, &env).unwrap(),
+            "remote retarget"
+        );
+        assert_eq!(
+            checkout_fingerprint(&base.join("gone"), &env),
+            Some(Fingerprint::Missing)
+        );
+        let bypass = env_of(&[("HOME", h), ("GIT_DIR", "/x")]);
+        assert_eq!(checkout_fingerprint(&repo, &bypass), None);
+    }
+
+    #[test]
+    fn base_refs_print_tracks_origin_head_and_candidate_heads() {
+        let base = tmp("base-refs");
+        let repo = repo_with_config(&base, "");
+        let a = base_refs_print(&repo).expect("modelled");
+        assert_eq!(a, base_refs_print(&repo).unwrap());
+        std::fs::create_dir_all(repo.join(".git/refs/remotes/origin")).unwrap();
+        std::fs::write(
+            repo.join(".git/refs/remotes/origin/HEAD"),
+            "ref: refs/remotes/origin/trunk\n",
+        )
+        .unwrap();
+        let b = base_refs_print(&repo).unwrap();
+        assert_ne!(a, b, "origin/HEAD appearing");
+        // The symref's target is now a candidate: a local `trunk` branch moves it.
+        std::fs::create_dir_all(repo.join(".git/refs/heads")).unwrap();
+        std::fs::write(repo.join(".git/refs/heads/trunk"), "0\n").unwrap();
+        let c = base_refs_print(&repo).unwrap();
+        assert_ne!(b, c);
+        std::fs::write(repo.join(".git/refs/heads/main"), "0\n").unwrap();
+        assert_ne!(c, base_refs_print(&repo).unwrap(), "main appearing");
+        std::fs::write(repo.join(".git/packed-refs"), "# pack-refs\n").unwrap();
+        let d = base_refs_print(&repo).unwrap();
+        std::fs::write(
+            repo.join(".git/packed-refs"),
+            "# pack-refs\n0 refs/heads/master\n",
+        )
+        .unwrap();
+        assert_ne!(d, base_refs_print(&repo).unwrap(), "packed-refs rewrite");
+        std::fs::create_dir_all(repo.join(".git/reftable")).unwrap();
+        assert!(base_refs_print(&repo).is_none());
+        assert!(base_refs_print(&base.join("nothing")).is_none());
+    }
+
+    #[test]
+    fn memoised_checked_never_stores_an_uncacheable_answer() {
+        let base = tmp("checked");
+        let dir = base.join("gone");
+        let memo: Mutex<Option<Memo<u32>>> = Mutex::new(None);
+        let calls = std::cell::Cell::new(0);
+        let run = |cacheable: bool| {
+            memoised_checked(&memo, 4, &dir, fingerprint(&dir), || {
+                calls.set(calls.get() + 1);
+                (calls.get(), cacheable)
+            })
+        };
+        assert_eq!(run(false), 1);
+        assert_eq!(run(true), 2, "the transient answer was not remembered");
+        assert_eq!(run(true), 2, "a cacheable one is");
     }
 
     #[test]

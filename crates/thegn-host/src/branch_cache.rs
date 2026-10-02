@@ -98,6 +98,26 @@ pub(crate) fn ref_moved(want_main_sync: &mut bool) {
     invalidate_all();
 }
 
+/// The change print at which the last `MainRefMoved` was acted on.
+static REF_MOVED_SEEN: crate::diff_watch::Seen = crate::diff_watch::Seen::new();
+
+/// [`ref_moved`] for the loop's `MainRefMoved` arm, which two senders feed: the
+/// fs-watcher (a ref really moved) and the coarse 20 s backstop ticker (a missed
+/// event). Both used to run the heal + a full branch/commit/default-base
+/// re-read (`for-each-ref`, `log`, `symbolic-ref`, `show-ref`, `diff-index`, ...
+/// ~10 forks per tick, THE-718). While a live watcher vouches for `active`, a
+/// request at a print the last one already saw is the backstop firing with
+/// nothing to catch (the watcher's own sends move the print BEFORE they send, so
+/// a real ref move never matches) and is dropped. No live print => as before.
+pub(crate) fn ref_moved_unless_unchanged(want_main_sync: &mut bool, active: &std::path::Path) {
+    let (print, unchanged) = REF_MOVED_SEEN.check(active);
+    if unchanged {
+        return;
+    }
+    REF_MOVED_SEEN.mark(active, print);
+    ref_moved(want_main_sync);
+}
+
 /// Whether the branch list must be re-fetched now, or can be served from cache.
 /// Pure, so it is unit-tested. A missing entry always fetches; a present entry
 /// fetches only once it is at least `ttl` old. There is deliberately no

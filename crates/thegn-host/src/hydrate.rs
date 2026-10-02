@@ -2093,7 +2093,23 @@ fn branch_fetch_needed(
     }
 }
 
+/// The change print at which each worktree's commit cache last refreshed (see
+/// the gate in `build_panel`).
+static COMMITS_SEEN: crate::diff_watch::Seen = crate::diff_watch::Seen::new();
+
 fn refresh_commit_cache(db: &thegn_core::db::Db, session: &crate::session::Session) -> bool {
+    let cwd = active_tab_path(session);
+    // Read BEFORE the `git log`: an event during it leaves the mark stale, so the
+    // next pass refreshes again.
+    let print = crate::diff_watch::current_print(&cwd);
+    let refreshed = refresh_commit_cache_inner(db, session);
+    if refreshed {
+        COMMITS_SEEN.mark(&cwd, print);
+    }
+    refreshed
+}
+
+fn refresh_commit_cache_inner(db: &thegn_core::db::Db, session: &crate::session::Session) -> bool {
     use thegn_core::remote::GitLoc;
     use thegn_svc::git::{CliGit, GitBackend};
 
@@ -3028,6 +3044,18 @@ pub(crate) fn build_panel(
         // Open section: refresh on the TTL. Warm-only (closed summary):
         // refresh on a cold miss or the (longer) summary TTL.
         panel.commits_loading = commit_load_needed(commits_open, cached.as_ref());
+        // THE-718: ...unless a live watcher says nothing under the worktree or
+        // its git dir moved since the last completed refresh, in which case the
+        // cached list is current whatever its age. A missing or unparseable
+        // cache is never excused.
+        if panel.commits_loading
+            && cached.as_ref().is_some_and(|(json, _)| {
+                serde_json::from_str::<Vec<crate::panel::CommitRow>>(json).is_ok()
+            })
+            && COMMITS_SEEN.check(cwd).1
+        {
+            panel.commits_loading = false;
+        }
     }
     // The per-repo open-PR cache: the `pr` section's OPEN PRS block, and the
     // branch-row badges (joined by head ref). The cache is keyed by the REPO

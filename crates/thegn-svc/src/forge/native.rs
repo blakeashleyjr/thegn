@@ -491,14 +491,7 @@ impl GithubNative {
     }
 
     fn owner_repo(&self, loc: &GitLoc) -> Option<(String, String)> {
-        let out = loc
-            .git_command(&["remote", "get-url", "origin"])
-            .output()
-            .ok()?;
-        out.status
-            .success()
-            .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
-            .and_then(|u| parse_owner_repo(&u))
+        loc.origin_url().and_then(|u| parse_owner_repo(&u))
     }
 
     /// The gate every native op runs first: local loc, closed circuit, token,

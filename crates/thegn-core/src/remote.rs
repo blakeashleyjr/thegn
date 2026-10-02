@@ -673,7 +673,19 @@ impl GitLoc {
     pub fn origin_url(&self) -> Option<String> {
         const ARGS: &[&str] = &["remote", "get-url", "origin"];
         match self {
-            GitLoc::Local(p) => crate::git_memo::origin_url(p, || self.git_out(ARGS)),
+            GitLoc::Local(p) => crate::git_memo::origin_url(p, || {
+                match self.git_command(ARGS).output() {
+                    // Could not even spawn git: transient, never memoised.
+                    Err(_) => (None, false),
+                    Ok(out) => {
+                        let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                        (
+                            (out.status.success() && !url.is_empty()).then_some(url),
+                            true,
+                        )
+                    }
+                }
+            }),
             _ => self.git_out(ARGS),
         }
     }
