@@ -1437,7 +1437,10 @@ pub struct ReplayConfig {
     /// Master switch. Off ⇒ no recording ring, zero allocation.
     pub enabled: bool,
     /// Per-pane byte budget for the ring; oldest events (and any keyframe whose
-    /// byte range no longer exists) are evicted past this.
+    /// byte range no longer exists) are evicted past this. Each entry and each
+    /// keyframe marker is charged 64 bytes of overhead on top of its payload, and
+    /// the first chunk always needs a marker, so budgets below 2x that overhead
+    /// (128 bytes) record nothing.
     pub max_bytes_per_pane: u64,
     /// Per-pane duration budget in seconds; events older than this are evicted.
     #[schemars(range(max = "crate::time_policy::MAX_DURATION_SECS"))]
