@@ -1570,8 +1570,8 @@ mod folder_tests {
         // New 65-char name: refused before anything is created.
         assert!(pre(&db, ["/a", "/b"], &"N".repeat(65)).is_err());
         // Existing in every target repo: accepted as-is.
-        db.ensure_folder("/a", &long).unwrap();
-        db.ensure_folder("/b", &long).unwrap();
+        db.ensure_folder("/a", &long, "a", "dir").unwrap();
+        db.ensure_folder("/b", &long, "b", "dir").unwrap();
         assert!(pre(&db, ["/a", "/b"], &long).is_ok());
         // Existing in only one repo: the other would CREATE it, so refused.
         db.put_workspace("/c", "c", "dir").unwrap();
@@ -1637,7 +1637,7 @@ mod folder_tests {
         let long = "L".repeat(80);
         // Created elsewhere (TUI has no cap).
         db.put_workspace("/repo", "repo", "dir").unwrap();
-        db.ensure_folder("/repo", &long).unwrap();
+        db.ensure_folder("/repo", &long, "repo", "dir").unwrap();
         assert_eq!(
             check_folder_fileable(&db, "/repo", &format!(" {} ", long.to_lowercase())).unwrap(),
             long.to_lowercase()
