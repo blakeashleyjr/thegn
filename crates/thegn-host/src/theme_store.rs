@@ -235,10 +235,10 @@ fn worker(
             None
         }
     };
-    if let Some(w) = watcher.as_mut() {
-        if let Err(error) = w.watch(&themes_dir, RecursiveMode::NonRecursive) {
-            tracing::warn!(target: "thegn::theme", error = %error, "theme directory watch unavailable");
-        }
+    if let Some(w) = watcher.as_mut()
+        && let Err(error) = w.watch(&themes_dir, RecursiveMode::NonRecursive)
+    {
+        tracing::warn!(target: "thegn::theme", error = %error, "theme directory watch unavailable");
     }
 
     publish_catalog(&themes_dir, &result_tx, waker.as_ref());
@@ -349,6 +349,7 @@ fn worker(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn finish_shutdown(
     first: Option<Work>,
     deferred: Vec<Work>,
