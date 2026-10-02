@@ -1334,6 +1334,39 @@ pub fn git_common_dir(worktree: &Path) -> PathBuf {
     dot_git
 }
 
+static GIT_WRITE_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A process-wide counter that advances every time thegn finishes a git
+/// MUTATION it ran itself (see [`GitWriteScope`], [`GitLock`]). Snapshot-style
+/// caches of git reads (THE-718) key on it next to the fs-watcher's change
+/// generation, so a refresh requested right after an in-app write can never be
+/// served a pre-write snapshot while the asynchronous fs event is in flight.
+pub fn git_write_epoch() -> u64 {
+    GIT_WRITE_EPOCH.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Advance [`git_write_epoch`] by one.
+pub fn note_git_write() {
+    GIT_WRITE_EPOCH.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// RAII marker around a git mutation: advances [`git_write_epoch`] when it
+/// drops (success or failure, a half-applied write still changed state).
+#[must_use = "the epoch advances when the scope drops, so hold it across the write"]
+pub struct GitWriteScope(());
+
+impl GitWriteScope {
+    pub fn begin() -> Self {
+        Self(())
+    }
+}
+
+impl Drop for GitWriteScope {
+    fn drop(&mut self) {
+        note_git_write();
+    }
+}
+
 /// A held cross-process advisory lock around git MUTATIONS on a shared repo.
 /// Multiple thegn/agent processes operating on the same canonical `.git` would
 /// otherwise race it (concurrent `worktree add`/commit/rebase clobbering the
@@ -1396,6 +1429,7 @@ pub fn lock_git_mutations(worktree: &Path) -> Option<GitLock> {
 impl Drop for GitLock {
     #[allow(deprecated)] // see lock_git_mutations — migrate to fcntl::Flock together
     fn drop(&mut self) {
+        note_git_write();
         // best-effort: closing the fd releases the lock anyway.
         let _ = self.0.unlock();
     }
@@ -1404,6 +1438,7 @@ impl Drop for GitLock {
 #[cfg(windows)]
 impl Drop for GitLock {
     fn drop(&mut self) {
+        note_git_write();
         // Just closing the file releases the share mode lock on Windows.
     }
 }
@@ -1638,6 +1673,25 @@ fn platform_hostname() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn git_write_epoch_advances_on_scope_drop_and_lock_release() {
+        let before = git_write_epoch();
+        {
+            let _w = GitWriteScope::begin();
+            assert_eq!(git_write_epoch(), before, "advances on drop, not begin");
+        }
+        assert!(git_write_epoch() > before);
+        let tmp = std::env::temp_dir().join(format!("tg-epoch-{}", std::process::id()));
+        // best-effort: test cleanup: scratch removal must never fail the test
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join(".git")).unwrap();
+        let mid = git_write_epoch();
+        drop(lock_git_mutations(&tmp));
+        assert!(git_write_epoch() > mid, "releasing the lock marks a write");
+        // best-effort: test cleanup: scratch removal must never fail the test
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 
     #[test]
     fn have_caches_positive_probe_results() {

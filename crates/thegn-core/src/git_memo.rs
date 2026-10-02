@@ -411,8 +411,9 @@ mod tests {
 
     fn tmp(name: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!("tg-gmemo-{}-{}", std::process::id(), name));
-        // best-effort: test cleanup: scratch removal must never fail the test
-        let _ = std::fs::remove_dir_all(&p);
+        if p.exists() {
+            std::fs::remove_dir_all(&p).unwrap();
+        }
         std::fs::create_dir_all(&p).unwrap();
         p
     }

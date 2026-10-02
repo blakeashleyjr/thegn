@@ -1190,6 +1190,9 @@ pub(crate) fn run_w(loc: &GitLoc, envs: &[(&str, &str)], args: &[&str]) -> Resul
     let _lock = (!loc.is_remote())
         .then(|| thegn_core::util::lock_git_mutations(std::path::Path::new(&loc.path())))
         .flatten();
+    // Marks the write for snapshot caches of git reads (THE-718); dropped
+    // (advancing the epoch) after the subprocess and its lock are done.
+    let _epoch = thegn_core::util::GitWriteScope::begin();
     let mut env: Vec<(&str, &str)> = vec![("GIT_TERMINAL_PROMPT", "0")];
     env.extend_from_slice(envs);
     let out = loc
@@ -1222,6 +1225,7 @@ pub(crate) fn run_stdin(
     let _lock = (!loc.is_remote())
         .then(|| thegn_core::util::lock_git_mutations(std::path::Path::new(&loc.path())))
         .flatten();
+    let _epoch = thegn_core::util::GitWriteScope::begin();
     let mut env: Vec<(&str, &str)> = vec![("GIT_TERMINAL_PROMPT", "0")];
     env.extend_from_slice(envs);
     let out = loc
