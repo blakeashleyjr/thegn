@@ -1514,14 +1514,16 @@ fn gather_groups(
             .get(repo_slug)
             .map(Vec::as_slice)
             .unwrap_or_default();
-        let db_home = slug_rows.iter().find(|w| w.branch == "home");
+        let db_home = slug_rows
+            .iter()
+            .find(|w| is_home_tab(repo_slug, &w.tab_name));
         // `gi` is a sort tie-break only (see [`Group::gi`]). Live groups hold
         // real session indices, so the appended rows are numbered after the
         // highest of them — an appended row then sorts after its live siblings
         // under `SortMode::Manual`. With no live groups this is the historical
         // dormant numbering, unchanged: `home` = 0, then 1, 2, ….
         let mut next_gi = groups.iter().map(|g| g.gi).max().map_or(0, |m| m + 1);
-        let home_tab = format!("{repo_slug}/home");
+        let home_tab = thegn_core::repo::home_tab(repo_slug);
         if !live_tabs.contains(home_tab.as_str()) {
             groups.push(Group {
                 label: "home".into(),
@@ -1543,14 +1545,21 @@ fn gather_groups(
             });
             next_gi += 1;
         }
-        for w in slug_rows.iter().filter(|w| w.branch != "home") {
+        for w in slug_rows
+            .iter()
+            .filter(|w| !is_home_tab(repo_slug, &w.tab_name))
+        {
             if live_tabs.contains(w.tab_name.as_str())
                 || (!w.path.is_empty() && live_paths.contains(w.path.as_str()))
             {
                 continue;
             }
             groups.push(Group {
-                label: w.branch.clone(),
+                // The tab, not the branch, is the identity — the live path
+                // labels the same worktree by `split_tab` too, so a branch
+                // named `home` (tab `{slug}/home~`) never claims the home
+                // row's label, pin key, or sort tier.
+                label: split_tab(&w.tab_name).map_or_else(|| w.branch.clone(), |(_, b)| b),
                 gi: next_gi,
                 manual_rank: rank_by_tab.get(w.tab_name.as_str()).copied(),
                 path: w.path.clone(),
@@ -1572,6 +1581,13 @@ fn gather_groups(
         }
     }
     groups
+}
+
+/// Whether a registry tab carries the workspace's stable home identity.
+/// Branch names are mutable checkout state, while the canonical home tab is
+/// fixed for the workspace and cannot alias a real branch named `home`.
+pub(crate) fn is_home_tab(repo_slug: &str, tab_name: &str) -> bool {
+    tab_name == thegn_core::repo::home_tab(repo_slug)
 }
 
 /// Fill a worktree `SidebarRow` from a `Group` + hydrated status. Shared by the
@@ -2778,6 +2794,67 @@ mod tests {
             env_name: None,
             env_degraded: false,
         }
+    }
+
+    #[test]
+    fn dormant_groups_use_tab_identity_for_home_and_branch_named_home() {
+        let mut home = db_row("app", "main");
+        home.tab_name = "app/home".into();
+        home.path = "/wt/home-main".into();
+        let mut branch_home = db_row("app", "home");
+        branch_home.tab_name = "app/home~".into();
+        branch_home.path = "/wt/branch-home".into();
+        let rows = [home, branch_home];
+        let row_refs: Vec<_> = rows.iter().collect();
+        let db_by_slug = std::collections::HashMap::from([("app", row_refs)]);
+        let groups = gather_groups(
+            &Session {
+                id: "s".into(),
+                worktrees: Vec::new(),
+                active: 0,
+            },
+            "app",
+            "/repos/app",
+            &std::collections::BTreeMap::new(),
+            &std::collections::HashMap::new(),
+            &db_by_slug,
+        );
+
+        assert_eq!(
+            groups
+                .iter()
+                .filter(|group| {
+                    matches!(
+                        &group.target,
+                        RowTarget::Workspace { group: Some(tab), .. } if tab == "app/home"
+                    )
+                })
+                .count(),
+            1,
+            "the home checkout on main must produce one canonical home row"
+        );
+        assert!(
+            groups.iter().any(|group| {
+                matches!(
+                    &group.target,
+                    RowTarget::Workspace { group: Some(tab), .. } if tab == "app/home~"
+                ) && group.path == "/wt/branch-home"
+            }),
+            "an ordinary worktree on branch `home` must remain visible"
+        );
+        let branch_home = groups
+            .iter()
+            .find(|group| group.path == "/wt/branch-home")
+            .expect("branch-home row");
+        assert_eq!(
+            branch_home.label, "home~",
+            "the branch named `home` keeps its tab identity, not the home label"
+        );
+        assert_eq!(
+            groups.iter().filter(|group| group.label == "home").count(),
+            1,
+            "exactly one row in the workspace may carry the home label"
+        );
     }
 
     /// The registry order `a, b, c`, and a workspace that owns it.

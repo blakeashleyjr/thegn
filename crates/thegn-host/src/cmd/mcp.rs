@@ -117,7 +117,7 @@ pub enum Action {
         /// (`sessions_list`, `worktrees_list`, `leases_list`, `me`,
         /// `agent_sessions`, `sessions_wait`, `semantic_map`,
         /// `semantic_blast_radius`); the mutating tools (`sessions_open`,
-        /// `sessions_input`, `sessions_kill`) additionally need `write`. Pass
+        /// `sessions_input`, `sessions_kill`) additionally need `write`, and `folders_assign` needs `git`. Pass
         /// `none` (or any empty/unknown set) to serve docs tools only.
         #[arg(long, value_delimiter = ',')]
         scopes: Option<Vec<String>>,
@@ -442,6 +442,22 @@ async fn fetch_state(
                 .map(|wts| json!({ "source": "db-cache", "worktrees": wts }))
                 .map_err(|db_err| format!("{NO_DAEMON}; DB cache also failed: {db_err}")),
         },
+        "folders.assign" => {
+            let c = client.map_err(|_| NO_DAEMON.to_string())?;
+            let request = thegn_svc::control::FolderAssignReq {
+                worktree: str_arg(args, "worktree")
+                    .ok_or("missing `worktree`")?
+                    .to_string(),
+                folder: str_arg(args, "folder").map(str::to_string),
+                clear: match args.get("clear") {
+                    None | Some(serde_json::Value::Null) => false,
+                    Some(serde_json::Value::Bool(b)) => *b,
+                    Some(_) => return Err("`clear` must be a boolean".into()),
+                },
+            };
+            c.folder_assign(&request).await.map_err(|e| e.to_string())?;
+            Ok(json!({ "ok": true }))
+        }
         "sessions.list" => {
             let c = client.map_err(|_| NO_DAEMON.to_string())?;
             let sessions = c.sessions().await.map_err(|e| e.to_string())?;
@@ -915,13 +931,11 @@ mod tests {
         // NOT the mutating ones. This is the deliberate split this change
         // introduces (see `every_state_cap_maps_to_the_scope_it_documents`
         // in thegn-core for the scope-table half of this pin).
-        for csv in ["read", "read,git"] {
-            assert_eq!(
-                sorted(allowed_state_caps(ScopeSet::parse(csv), false)),
-                sorted(READ_CAPS.to_vec()),
-                "--scopes {csv}"
-            );
-        }
+        assert_eq!(
+            sorted(allowed_state_caps(ScopeSet::parse("read"), false)),
+            sorted(READ_CAPS.to_vec()),
+            "--scopes read"
+        );
     }
 
     #[test]
@@ -936,6 +950,30 @@ mod tests {
         for cap in READ_CAPS {
             assert!(allowed.contains(cap), "{allowed:?} missing {cap}");
         }
+    }
+
+    #[test]
+    fn read_plus_git_adds_exactly_folder_assignment() {
+        let mut expected = READ_CAPS.to_vec();
+        expected.push("folders.assign");
+        assert_eq!(
+            sorted(allowed_state_caps(ScopeSet::parse("read,git"), false)),
+            sorted(expected),
+            "--scopes read,git"
+        );
+    }
+
+    #[test]
+    fn folder_assignment_is_git_scoped_on_mcp() {
+        for csv in ["read", "write"] {
+            for flag in [false, true] {
+                assert!(
+                    !allowed_state_caps(ScopeSet::parse(csv), flag).contains(&"folders.assign"),
+                    "--scopes {csv} (input flag {flag}) must not grant folders.assign"
+                );
+            }
+        }
+        assert!(allowed_state_caps(ScopeSet::parse("git"), false).contains(&"folders.assign"));
     }
 
     #[test]
@@ -961,7 +999,7 @@ mod tests {
     #[test]
     fn mcp_scope_mapping_write_and_flag_covers_every_implemented_cap() {
         assert_eq!(
-            sorted(allowed_state_caps(ScopeSet::parse("write,exec"), true)),
+            sorted(allowed_state_caps(ScopeSet::parse("write,git,exec"), true)),
             sorted(thegn_core::mcp::state::MCP_STATE_CAPS.to_vec()),
         );
     }

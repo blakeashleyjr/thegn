@@ -548,7 +548,10 @@ fn compatible_write_op_updates_declared_v66_shape_without_migrating() {
     let db = Db::open_compatible_at(&path, SchemaOperation::LandLifecycleBookkeeping)
         .unwrap()
         .expect("v66 supports land lifecycle writes");
-    let folder = db.db().ensure_folder("/repo", "Merged").unwrap();
+    let folder = db
+        .db()
+        .ensure_folder("/repo", "Merged", "repo", "repo")
+        .unwrap();
     db.db().set_worktree_folder("/repo", Some(folder)).unwrap();
     assert_eq!(
         db.db()
@@ -2008,18 +2011,101 @@ fn folder_crud() {
 #[test]
 fn ensure_folder_creates_then_reuses() {
     let db = db();
-    db.put_workspace("/x/app", "app", "repo").unwrap();
 
-    let a = db.ensure_folder("/x/app", "Ready to merge").unwrap();
+    let a = db
+        .ensure_folder("/x/app", "Ready to merge", "app", "repo")
+        .unwrap();
+    let workspace = db.workspaces().unwrap().pop().unwrap();
+    assert_eq!(workspace.repo_path, "/x/app");
+    assert_eq!(workspace.name, "app");
+    assert_eq!(workspace.kind, "repo");
     // Same name (case/whitespace-insensitive) reuses the row, never dups.
-    let b = db.ensure_folder("/x/app", "  ready TO merge ").unwrap();
+    let b = db
+        .ensure_folder("/x/app", "  ready TO merge ", "app", "repo")
+        .unwrap();
     assert_eq!(a, b);
     assert_eq!(db.folders_for_workspace("/x/app").unwrap().len(), 1);
 
     // A different name creates a second folder.
-    let c = db.ensure_folder("/x/app", "PRing").unwrap();
+    let c = db.ensure_folder("/x/app", "PRing", "app", "repo").unwrap();
     assert_ne!(a, c);
     assert_eq!(db.folders_for_workspace("/x/app").unwrap().len(), 2);
+}
+
+#[test]
+fn ensure_folder_refuses_tombstoned_workspace_without_writes() {
+    let db = db();
+    db.tombstone_workspace("/x/removed").unwrap();
+
+    let error = db
+        .ensure_folder("/x/removed", "Merging", "removed", "repo")
+        .unwrap_err();
+    assert!(
+        error
+            .downcast_ref::<crate::store::WorkspaceTombstonedError>()
+            .is_some()
+    );
+    assert!(db.workspaces().unwrap().is_empty());
+    assert!(db.folders_for_workspace("/x/removed").unwrap().is_empty());
+}
+
+#[test]
+fn ensure_folder_preserves_existing_workspace_kind_and_position() {
+    let db = db();
+    db.put_workspace("/x/app", "original", "dir").unwrap();
+    db.set_workspace_position("/x/app", 17).unwrap();
+
+    db.ensure_folder("/x/app", "Merging", "app", "repo")
+        .unwrap();
+
+    let workspace = db.workspaces().unwrap().pop().unwrap();
+    assert_eq!(workspace.kind, "dir");
+    let position: i64 = db
+        .conn()
+        .query_row(
+            "SELECT position FROM workspaces WHERE repo_path='/x/app'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(position, 17);
+}
+
+#[test]
+fn ensure_folder_never_modifies_existing_workspace_and_creates_absent_one() {
+    let db = db();
+    db.put_workspace("/x/app", "original", "dir").unwrap();
+    db.conn()
+        .execute(
+            "UPDATE workspaces SET last_active=12345 WHERE repo_path='/x/app'",
+            [],
+        )
+        .unwrap();
+
+    db.ensure_folder("/x/app", "Merging", "app", "repo")
+        .unwrap();
+    let (name, last_active): (String, i64) = db
+        .conn()
+        .query_row(
+            "SELECT name, last_active FROM workspaces WHERE repo_path='/x/app'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(name, "original");
+    assert_eq!(last_active, 12345);
+
+    db.ensure_folder("/x/new", "Merging", "new", "repo")
+        .unwrap();
+    let name: String = db
+        .conn()
+        .query_row(
+            "SELECT name FROM workspaces WHERE repo_path='/x/new'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(name, "new");
 }
 
 #[test]
@@ -2028,7 +2114,9 @@ fn set_worktree_folder_round_trips() {
     db.put_workspace("/x/app", "app", "repo").unwrap();
     db.put_worktree("app/feat", "/x/app", "/wt/feat", "tg/feat", None, None)
         .unwrap();
-    let fid = db.ensure_folder("/x/app", "Ready to merge").unwrap();
+    let fid = db
+        .ensure_folder("/x/app", "Ready to merge", "app", "repo")
+        .unwrap();
 
     db.set_worktree_folder("/wt/feat", Some(fid)).unwrap();
     let row = db
@@ -2056,7 +2144,9 @@ fn creation_folder_identity_update_refuses_deleted_folder_without_recreation() {
     db.put_workspace("/x/app", "app", "repo").unwrap();
     db.put_worktree("app/feat", "/x/app", "/wt/feat", "tg/feat", None, None)
         .unwrap();
-    let folder = db.ensure_folder("/x/app", "Waiting").unwrap();
+    let folder = db
+        .ensure_folder("/x/app", "Waiting", "app", "repo")
+        .unwrap();
     db.del_folder(folder).unwrap();
 
     assert!(
@@ -2073,7 +2163,9 @@ fn creation_folder_identity_update_accepts_current_name() {
     db.put_workspace("/x/app", "app", "repo").unwrap();
     db.put_worktree("app/feat", "/x/app", "/wt/feat", "tg/feat", None, None)
         .unwrap();
-    let folder = db.ensure_folder("/x/app", "Waiting").unwrap();
+    let folder = db
+        .ensure_folder("/x/app", "Waiting", "app", "repo")
+        .unwrap();
     db.rename_folder(folder, "In progress").unwrap();
 
     assert!(
@@ -2093,7 +2185,9 @@ fn creation_folder_identity_update_refuses_worktree_from_another_repo() {
     db.put_workspace("/x/app", "app", "repo").unwrap();
     db.put_worktree("other/feat", "/x/other", "/wt/feat", "tg/feat", None, None)
         .unwrap();
-    let folder = db.ensure_folder("/x/app", "Waiting").unwrap();
+    let folder = db
+        .ensure_folder("/x/app", "Waiting", "app", "repo")
+        .unwrap();
 
     assert!(
         !db.set_worktree_folder_if_identity("/wt/feat", "/x/app", folder, "Waiting")
@@ -5084,9 +5178,13 @@ fn creation_folder_update_rejects_reused_id_with_a_different_name() {
     db.put_workspace("/x/app", "app", "repo").unwrap();
     db.put_worktree("app/feat", "/x/app", "/wt/feat", "tg/feat", None, None)
         .unwrap();
-    let folder = db.ensure_folder("/x/app", "Waiting").unwrap();
+    let folder = db
+        .ensure_folder("/x/app", "Waiting", "app", "repo")
+        .unwrap();
     db.del_folder(folder).unwrap();
-    let replacement = db.ensure_folder("/x/app", "Other work").unwrap();
+    let replacement = db
+        .ensure_folder("/x/app", "Other work", "app", "repo")
+        .unwrap();
     assert_eq!(replacement, folder, "exercise SQLite row ID reuse");
     assert!(
         !db.set_worktree_folder_if_identity("/wt/feat", "/x/app", folder, "Waiting")
@@ -5102,7 +5200,9 @@ fn creation_folder_update_refuses_rename_after_dispatch() {
     db.put_workspace("/x/app", "app", "repo").unwrap();
     db.put_worktree("app/feat", "/x/app", "/wt/feat", "tg/feat", None, None)
         .unwrap();
-    let folder = db.ensure_folder("/x/app", "Waiting").unwrap();
+    let folder = db
+        .ensure_folder("/x/app", "Waiting", "app", "repo")
+        .unwrap();
     db.rename_folder(folder, "Renamed").unwrap();
     assert!(
         !db.set_worktree_folder_if_identity("/wt/feat", "/x/app", folder, "Waiting")

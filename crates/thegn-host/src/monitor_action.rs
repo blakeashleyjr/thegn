@@ -12,7 +12,7 @@
 //! request naming a container thegn does not own produces no command at all.
 
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::actions::open_command_pane;
 use crate::compositor::Rect;
@@ -194,31 +194,20 @@ fn spawn_control(argv: Vec<String>, label: String, waker: TerminalWaker) {
 /// clean exit; `None` when it had to be killed.
 fn run_bounded(argv: &[String], timeout: Duration) -> Option<bool> {
     let (bin, rest) = argv.split_first()?;
-    let mut child = std::process::Command::new(bin)
-        .args(rest)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .ok()?;
-    let deadline = Instant::now() + timeout;
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => return Some(status.success()),
-            Ok(None) if Instant::now() >= deadline => {
-                let _ = child.kill(); // best-effort: teardown: the child may already have exited or been reaped
-                // Reap off-thread so a wedged runtime can't block this worker.
-                std::thread::spawn(move || {
-                    #[expect(
-                        clippy::disallowed_methods,
-                        reason = "off-loop reap of a killed child on its own thread; never the event loop"
-                    )]
-                    let _ = child.wait(); // best-effort: teardown: the child may already have exited or been reaped
-                });
-                return None;
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
-            Err(_) => return None,
+    let outcome = crate::platform::sound_process::run_bounded(
+        bin,
+        rest,
+        &std::sync::atomic::AtomicBool::new(false),
+        timeout,
+    );
+    match outcome {
+        crate::platform::sound_process::SoundProcessOutcome::Exited(status) => {
+            Some(status.success())
         }
+        crate::platform::sound_process::SoundProcessOutcome::Timeout
+        | crate::platform::sound_process::SoundProcessOutcome::Cancelled
+        | crate::platform::sound_process::SoundProcessOutcome::Spawn(_)
+        | crate::platform::sound_process::SoundProcessOutcome::Reap(_)
+        | crate::platform::sound_process::SoundProcessOutcome::DescendantsRemain => None,
     }
 }

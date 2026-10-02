@@ -950,7 +950,8 @@
     "dispatches.list",
     "dispatches.put",
     "dispatches.set_status",
-    "worktrees.create"
+    "worktrees.create",
+    "folders.assign"
   ],
   "x-thegn-host-verb-support": [
     {

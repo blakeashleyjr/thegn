@@ -160,6 +160,7 @@ pub(crate) mod proc;
 pub(crate) mod qos;
 
 pub(crate) mod sound;
+pub(crate) mod sound_process;
 
 /// Network/userspace filesystem classification (can a watch be trusted here?).
 pub(crate) mod fs_kind;

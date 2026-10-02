@@ -18,6 +18,10 @@ pub(crate) struct SoundCaps {
 pub(crate) enum SoundError {
     Spawn(std::io::Error),
     Failed,
+    Timeout,
+    Cancelled,
+    Reap(std::io::Error),
+    DescendantsRemain,
 }
 
 impl std::fmt::Display for SoundError {
@@ -25,6 +29,14 @@ impl std::fmt::Display for SoundError {
         match self {
             Self::Spawn(e) => write!(f, "sound player failed to start: {e}"),
             Self::Failed => f.write_str("sound player returned a failure status"),
+            Self::Timeout => write!(
+                f,
+                "sound player exceeded {:?}",
+                super::sound_process::SOUND_HELPER_DEADLINE
+            ),
+            Self::Cancelled => f.write_str("sound player was cancelled during shutdown"),
+            Self::Reap(e) => write!(f, "sound player could not be reaped: {e}"),
+            Self::DescendantsRemain => f.write_str("sound player descendants did not settle"),
         }
     }
 }
@@ -36,7 +48,12 @@ pub(crate) trait SoundPlayer: Send + Sync {
     fn id(&self) -> &'static str;
     fn caps(&self) -> SoundCaps;
     fn probe(&self) -> ProbeReport;
-    fn play(&self, path: &Path, volume: f32) -> Result<(), SoundError>;
+    fn play(
+        &self,
+        path: &Path,
+        volume: f32,
+        cancellation: &std::sync::atomic::AtomicBool,
+    ) -> Result<(), SoundError>;
 }
 
 struct Player {
@@ -110,17 +127,22 @@ impl SoundPlayer for Player {
             ))
     }
 
-    #[expect(clippy::disallowed_methods)]
-    fn play(&self, path: &Path, volume: f32) -> Result<(), SoundError> {
-        let mut command = std::process::Command::new(self.program);
-        command.args(self.argv(path, volume));
-        let status = command
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map_err(SoundError::Spawn)?;
-        status.success().then_some(()).ok_or(SoundError::Failed)
+    fn play(
+        &self,
+        path: &Path,
+        volume: f32,
+        cancellation: &std::sync::atomic::AtomicBool,
+    ) -> Result<(), SoundError> {
+        use super::sound_process::{SoundProcessOutcome as Outcome, run};
+        match run(self.program, &self.argv(path, volume), cancellation) {
+            Outcome::Exited(status) if status.success() => Ok(()),
+            Outcome::Exited(_) => Err(SoundError::Failed),
+            Outcome::Spawn(error) => Err(SoundError::Spawn(error)),
+            Outcome::Timeout => Err(SoundError::Timeout),
+            Outcome::Cancelled => Err(SoundError::Cancelled),
+            Outcome::Reap(error) => Err(SoundError::Reap(error)),
+            Outcome::DescendantsRemain => Err(SoundError::DescendantsRemain),
+        }
     }
 }
 
