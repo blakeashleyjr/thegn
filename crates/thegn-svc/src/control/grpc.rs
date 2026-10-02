@@ -512,6 +512,22 @@ impl Control for GrpcControl {
         }))
     }
 
+    async fn assign_worktree_folder(
+        &self,
+        req: Request<proto::AssignWorktreeFolderRequest>,
+    ) -> Result<Response<proto::Empty>, Status> {
+        self.authed(&req, Verb::FolderAssign)?;
+        let req = req.into_inner();
+        let req = super::FolderAssignReq {
+            worktree: req.worktree,
+            folder: req.folder,
+            clear: req.clear,
+        };
+        req.action().map_err(Status::from)?;
+        self.api.folder_assign(req).await.map_err(Status::from)?;
+        Ok(Response::new(proto::Empty {}))
+    }
+
     async fn wait(
         &self,
         req: Request<proto::WaitRequest>,
@@ -954,6 +970,7 @@ pub const GRPC_CAPS: &[&str] = &[
     "sessions.wait",
     "sessions.split",
     "worktrees.list",
+    "folders.assign",
     "worktrees.open",
     "editor.open",
     "preview.fetch",

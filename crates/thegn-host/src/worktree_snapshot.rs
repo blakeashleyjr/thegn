@@ -142,14 +142,16 @@ pub(crate) fn observe_rows_cheap(
     rows: &[WorktreeRow],
     cached: impl Fn(&str) -> Option<String>,
 ) -> HashMap<String, BranchObservation> {
-    let gix = thegn_svc::git::GixGit::new();
+    // The read engine is config-selected (gix by default); never construct
+    // one here — see the justfile `GixGit::new()` guard.
+    let git = crate::git_handle::get();
     observe_rows_cheap_in(
         head_read_cache(),
         HEAD_READ_TTL,
         rows,
         cached,
-        &gix,
-        |loc| gix.current_branch(loc),
+        &*git,
+        |loc| git.current_branch(loc),
     )
 }
 
@@ -455,7 +457,7 @@ mod tests {
     fn head_read_is_memoised_within_ttl_and_reread_after() {
         use std::cell::Cell;
         let memo = HeadReadCache::default();
-        let gix = thegn_svc::git::GixGit::new();
+        let gix = crate::git_handle::get();
         let rows = [row("/not/on/disk", "registry")];
         let reads = Cell::new(0);
         let read = |_: &thegn_core::remote::GitLoc| {
@@ -463,16 +465,16 @@ mod tests {
             Ok("feature/x".to_string())
         };
         let ttl = Duration::from_secs(60);
-        let a = observe_rows_cheap_in(&memo, ttl, &rows, |_| None, &gix, read);
-        let b = observe_rows_cheap_in(&memo, ttl, &rows, |_| None, &gix, read);
+        let a = observe_rows_cheap_in(&memo, ttl, &rows, |_| None, &*gix, read);
+        let b = observe_rows_cheap_in(&memo, ttl, &rows, |_| None, &*gix, read);
         assert_eq!(a, b);
         assert_eq!(reads.get(), 1, "second observation inside the TTL re-read");
         // An expired entry re-reads.
-        observe_rows_cheap_in(&memo, Duration::ZERO, &rows, |_| None, &gix, read);
+        observe_rows_cheap_in(&memo, Duration::ZERO, &rows, |_| None, &*gix, read);
         assert_eq!(reads.get(), 2);
         // Invalidation re-reads.
         memo.clear();
-        observe_rows_cheap_in(&memo, ttl, &rows, |_| None, &gix, read);
+        observe_rows_cheap_in(&memo, ttl, &rows, |_| None, &*gix, read);
         assert_eq!(reads.get(), 3);
     }
 
@@ -480,7 +482,7 @@ mod tests {
     fn failed_reads_are_memoised_too() {
         use std::cell::Cell;
         let memo = HeadReadCache::default();
-        let gix = thegn_svc::git::GixGit::new();
+        let gix = crate::git_handle::get();
         let rows = [row("/not/on/disk", "registry")];
         let reads = Cell::new(0);
         let read = |_: &thegn_core::remote::GitLoc| {
@@ -489,7 +491,7 @@ mod tests {
         };
         let ttl = Duration::from_secs(60);
         for _ in 0..3 {
-            let got = observe_rows_cheap_in(&memo, ttl, &rows, |_| None, &gix, read);
+            let got = observe_rows_cheap_in(&memo, ttl, &rows, |_| None, &*gix, read);
             assert_eq!(got["/not/on/disk"], BranchObservation::Unavailable);
         }
         assert_eq!(reads.get(), 1);

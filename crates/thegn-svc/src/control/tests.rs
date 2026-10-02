@@ -53,11 +53,31 @@ impl FakeApi {
 }
 
 impl ControlApi for FakeApi {
+    fn issues_list<'a>(
+        &'a self,
+        _filter: &'a thegn_core::issue::IssueFilter,
+        repo: Option<&'a str>,
+    ) -> BoxFuture<'a, ControlResult<Vec<thegn_core::issue::Issue>>> {
+        self.record(&repo.map_or_else(
+            || "issues_list".to_string(),
+            |repo| format!("issues_list:repo={repo}"),
+        ));
+        Box::pin(async {
+            Err(super::ControlError::Unimplemented(
+                "recording issue fixture",
+            ))
+        })
+    }
+
     fn issues_get<'a>(
         &'a self,
         id: &'a str,
+        repo: Option<&'a str>,
     ) -> BoxFuture<'a, ControlResult<thegn_core::issue::IssueDetail>> {
-        self.record(&format!("issues_get:{id}"));
+        self.record(&repo.map_or_else(
+            || format!("issues_get:{id}"),
+            |repo| format!("issues_get:{id}:repo={repo}"),
+        ));
         Box::pin(async {
             Err(super::ControlError::Unimplemented(
                 "recording issue fixture",
@@ -69,8 +89,12 @@ impl ControlApi for FakeApi {
         &'a self,
         id: &'a str,
         _patch: &'a thegn_core::issue::IssuePatch,
+        repo: Option<&'a str>,
     ) -> BoxFuture<'a, ControlResult<thegn_core::issue::Issue>> {
-        self.record(&format!("issues_update:{id}"));
+        self.record(&repo.map_or_else(
+            || format!("issues_update:{id}"),
+            |repo| format!("issues_update:{id}:repo={repo}"),
+        ));
         Box::pin(async {
             Err(super::ControlError::Unimplemented(
                 "recording issue fixture",
@@ -82,8 +106,12 @@ impl ControlApi for FakeApi {
         &'a self,
         id: &'a str,
         _body: &'a str,
+        repo: Option<&'a str>,
     ) -> BoxFuture<'a, ControlResult<()>> {
-        self.record(&format!("issues_comment:{id}"));
+        self.record(&repo.map_or_else(
+            || format!("issues_comment:{id}"),
+            |repo| format!("issues_comment:{id}:repo={repo}"),
+        ));
         Box::pin(async {
             Err(super::ControlError::Unimplemented(
                 "recording issue fixture",
@@ -106,6 +134,10 @@ impl ControlApi for FakeApi {
                 created_at: 0,
             }])
         })
+    }
+    fn folder_assign(&self, req: super::FolderAssignReq) -> BoxFuture<'_, ControlResult<()>> {
+        self.record(&format!("folder_assign:{}:{:?}", req.worktree, req.folder));
+        Box::pin(async { Ok(()) })
     }
     fn list_skills(&self) -> BoxFuture<'_, ControlResult<super::SkillsList>> {
         self.record("list_skills");
@@ -527,6 +559,8 @@ fn default_body(path: &str) -> &'static str {
         r#"{"client_id":"c"}"#
     } else if path.contains("/worktrees/open") {
         r#"{"repo":"r"}"#
+    } else if path.contains("/worktrees/folder") {
+        r#"{"worktree":"/w","folder":"Agents"}"#
     } else if path.contains("/preview/fetch") {
         r#"{"url":"http://localhost:3000/"}"#
     } else if path.contains("/git/stage") {
@@ -669,6 +703,114 @@ async fn worktrees_list_needs_read_and_is_rejected_before_the_api() {
         StatusCode::OK
     );
     assert_eq!(r.api.calls(), vec!["list_worktrees".to_string()]);
+}
+
+#[tokio::test]
+async fn folder_assignment_requires_git_scope_and_reaches_the_control_api() {
+    let r = rig(false);
+    let read = token(&r, "read");
+    assert_eq!(
+        call(&r, "POST", "/v1/worktrees/folder", Some(&read)).await,
+        StatusCode::FORBIDDEN
+    );
+    assert!(
+        r.api.calls().is_empty(),
+        "scope denial must precede the API"
+    );
+
+    let git = token(&r, "git");
+    assert_eq!(
+        call(&r, "POST", "/v1/worktrees/folder", Some(&git)).await,
+        StatusCode::OK
+    );
+    assert_eq!(r.api.calls(), ["folder_assign:/w:Some(\"Agents\")"]);
+
+    // A write token alone is not enough: folder assignment is Git-scoped.
+    let write = token(&r, "write");
+    assert_eq!(
+        call(&r, "POST", "/v1/worktrees/folder", Some(&write)).await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(r.api.calls().len(), 1, "write token must not reach the API");
+}
+
+async fn post_folder(r: &Rig, bearer: &str, body: &'static str) -> StatusCode {
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/worktrees/folder")
+        .header("authorization", format!("Bearer {bearer}"))
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap();
+    router(r.state.clone()).oneshot(req).await.unwrap().status()
+}
+
+#[tokio::test]
+async fn folder_assignment_shape_is_strict_and_clearing_is_explicit() {
+    let r = rig(false);
+    let git = token(&r, "git");
+    // Misspelled field, empty body, neither, both: all rejected before the API.
+    for body in [
+        r#"{"worktree":"/w","folder":"A","clera":true}"#,
+        r#"{}"#,
+        r#"{"worktree":"/w"}"#,
+        r#"{"worktree":"/w","folder":"A","clear":true}"#,
+    ] {
+        let status = post_folder(&r, &git, body).await;
+        assert!(status.is_client_error(), "{body} -> {status}");
+    }
+    assert!(r.api.calls().is_empty());
+    assert_eq!(
+        post_folder(&r, &git, r#"{"worktree":"/w","clear":true}"#).await,
+        StatusCode::OK
+    );
+    assert_eq!(r.api.calls(), ["folder_assign:/w:None"]);
+}
+
+#[cfg(feature = "control-grpc")]
+#[tokio::test]
+async fn grpc_folder_assignment_requires_git_scope() {
+    use super::grpc::{GrpcControl, proto};
+    use proto::control_server::Control;
+    use thegn_core::store::ControlStore;
+
+    let r = rig(false);
+    let grpc = GrpcControl {
+        api: r.api.clone(),
+        store: r.db.clone() as Arc<Mutex<dyn ControlStore + Send>>,
+        local_admin: false,
+        daemon_euid: None,
+        server_label: "test thegn".into(),
+    };
+    let req = |scope: &str, clear: bool, folder: Option<&str>| {
+        let token = token(&r, scope);
+        let mut request = tonic::Request::new(proto::AssignWorktreeFolderRequest {
+            worktree: "/w".into(),
+            folder: folder.map(str::to_string),
+            clear,
+        });
+        request
+            .metadata_mut()
+            .insert("authorization", format!("Bearer {token}").parse().unwrap());
+        request
+    };
+    for scope in ["read", "write"] {
+        let error = grpc
+            .assign_worktree_folder(req(scope, true, None))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::PermissionDenied, "{scope}");
+    }
+    assert!(r.api.calls().is_empty(), "denial must not reach the API");
+    let error = grpc
+        .assign_worktree_folder(req("git", false, None))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    grpc.assign_worktree_folder(req("git", true, None))
+        .await
+        .unwrap();
+    assert_eq!(r.api.calls(), ["folder_assign:/w:None"]);
 }
 
 #[tokio::test]
@@ -1739,6 +1881,67 @@ async fn issue_identity_roundtrips_client_encoding_through_real_router() {
             assert_eq!(r.api.calls(), vec![format!("{operation}:{id}")]);
         }
     }
+}
+
+#[tokio::test]
+async fn issue_routes_forward_optional_repo_context() {
+    let encoded_repo = "%2Ftmp%2Frepo%20with%20space";
+    let cases = [
+        ("GET", "/v1/issues".to_string(), "", "issues_list"),
+        (
+            "GET",
+            format!("/v1/issues?repo={encoded_repo}"),
+            "",
+            "issues_list:repo=/tmp/repo with space",
+        ),
+        (
+            "GET",
+            format!("/v1/issues/ABC?repo={encoded_repo}"),
+            "",
+            "issues_get:ABC:repo=/tmp/repo with space",
+        ),
+        (
+            "POST",
+            format!("/v1/issues/ABC?repo={encoded_repo}"),
+            "{}",
+            "issues_update:ABC:repo=/tmp/repo with space",
+        ),
+        (
+            "POST",
+            format!("/v1/issues/ABC/comment?repo={encoded_repo}"),
+            r#"{"body":"fixture"}"#,
+            "issues_comment:ABC:repo=/tmp/repo with space",
+        ),
+    ];
+    for (method, path, body, call) in cases {
+        let r = rig(false);
+        let admin = token(&r, "admin");
+        let request = Request::builder()
+            .method(method)
+            .uri(path)
+            .header("authorization", format!("Bearer {admin}"))
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let response = router(r.state.clone()).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(r.api.calls(), vec![call.to_string()]);
+    }
+}
+
+#[tokio::test]
+async fn issue_get_rejects_list_filters_with_400() {
+    let r = rig(false);
+    let admin = token(&r, "admin");
+    let request = Request::builder()
+        .method("GET")
+        .uri("/v1/issues/ABC?status=open")
+        .header("authorization", format!("Bearer {admin}"))
+        .body(Body::empty())
+        .unwrap();
+    let response = router(r.state.clone()).oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(r.api.calls().is_empty());
 }
 
 #[tokio::test]

@@ -37,14 +37,22 @@ impl ObserveTile {
     /// Build the tile. `hook` wakes the host loop when the engine has new data;
     /// `cfg` supplies the dashboard source + refresh cadence; `rt` is the host's
     /// tokio runtime handle the query engine runs on.
-    pub fn new(hook: ChangeHook, cfg: &ObserveConfig, rt: tokio::runtime::Handle) -> Self {
+    pub fn new(
+        hook: ChangeHook,
+        cfg: &ObserveConfig,
+        rt: tokio::runtime::Handle,
+        sampler_thread_start: impl FnOnce() + Send + 'static,
+    ) -> Result<Self, gtui_query::host::HostSourceSpawnError> {
         let dashboard = load_dashboard(cfg);
 
         // The built-in host datasource is always present (local metrics, zero
         // config). Prometheus/Loki register only when an endpoint is configured;
         // tokens resolve through thegn's `env:`/`file:` indirection.
         let mut sources: HashMap<String, Arc<dyn DataSource>> = HashMap::new();
-        sources.insert("host".to_string(), Arc::new(HostSource::new()));
+        sources.insert(
+            "host".to_string(),
+            Arc::new(HostSource::try_new_with(sampler_thread_start)?),
+        );
         if !cfg.prometheus.base_url.trim().is_empty() {
             let token =
                 thegn_core::config::expand_env_ref(&cfg.prometheus.token).unwrap_or_default();
@@ -72,11 +80,11 @@ impl ObserveTile {
         let refresh = Duration::from_secs(cfg.refresh_interval_secs.max(1));
 
         let app = ObserveApp::new(rt, dashboard, sources, time_range, refresh, hook);
-        Self {
+        Ok(Self {
             app,
             is_panicked: false,
             needs_redraw: true,
-        }
+        })
     }
 
     /// Scale the query window by `factor` (ending now), clamped to [1m, 24h].

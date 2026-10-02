@@ -412,6 +412,28 @@ fn captured_path_context_is_part_of_deterministic_admission_revision() {
 }
 
 #[test]
+fn blank_default_folder_override_is_semantically_invalid() {
+    let env = TestEnv::default();
+    let host_snapshot = hosts();
+    for value in ["default_folder=''", "default_folder='   '"] {
+        let overrides = vec![value.to_string()];
+        let result = admit(AdmissionInputs {
+            defaults: Config::default(),
+            base: SourceInput::bytes("base", false, b"branch_prefix = \"safe/\"\n"),
+            profile: None,
+            env: &env,
+            overrides: &overrides,
+            hosts: &host_snapshot,
+            paths: &path_context(),
+        });
+        assert!(
+            matches!(&result, Err(ConfigAdmissionError::SemanticInvalid)),
+            "override {value}: {result:?}"
+        );
+    }
+}
+
+#[test]
 fn cli_schema_is_checked_before_lenient_override_deserialization() {
     let env = TestEnv::default();
     let host_snapshot = hosts();

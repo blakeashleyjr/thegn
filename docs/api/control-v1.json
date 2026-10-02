@@ -540,6 +540,33 @@
       },
       "type": "object"
     },
+    "FolderAssignReq": {
+      "additionalProperties": false,
+      "description": "Assign or clear a worktree's repo-local sidebar folder (`folders.assign`). A name is resolved within the worktree's own repository. Clearing is always explicit (`clear: true`) and never deletes the folder; supplying neither or both of `folder` / `clear` is an invalid argument, so a malformed request can never silently unfile a worktree.",
+      "properties": {
+        "clear": {
+          "default": false,
+          "description": "`true` to unfile the worktree (the folder itself is kept). Mutually exclusive with `folder`.",
+          "type": "boolean"
+        },
+        "folder": {
+          "default": null,
+          "description": "Folder name to assign. Mutually exclusive with `clear`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "worktree": {
+          "description": "Absolute path to a Git worktree.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "worktree"
+      ],
+      "type": "object"
+    },
     "ForkSpec": {
       "description": "Intent for creating a new session from a live daemon or recorded harness session. `harness` discriminates the source: absent means `session` is a live daemon id; present means it is a native id discovered from `agent.sessions`. No process recipe, environment, prompt, or transcript data crosses the control boundary.",
       "properties": {
@@ -657,8 +684,23 @@
       },
       "type": "object"
     },
+    "IssueRepoQuery": {
+      "additionalProperties": false,
+      "description": "Repo context alone, for `issues.get` / `update` / `comment` — they take no status/limit/project/query filters, so those must not even parse.",
+      "properties": {
+        "repo": {
+          "default": null,
+          "description": "Filesystem path on the daemon host used to apply a repo's `[issues]` overlay.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
     "IssuesQuery": {
-      "description": "Query params for `issues.list` — a subset of `IssueFilter` a supervisor filters a batch by. Statuses is a comma-separated list of the snake_case status ids (`todo,in_progress`); unknown names are dropped.",
+      "description": "Query params for `issues.list` — a subset of `IssueFilter` a supervisor filters a batch by, plus optional repo context. Statuses is a comma-separated list of the snake_case status ids (`todo,in_progress`); unknown names are dropped. `repo`, when present, applies that repository's `[issues]` overlay (a filesystem path on the daemon host).",
       "properties": {
         "limit": {
           "default": null,
@@ -678,6 +720,14 @@
         },
         "query": {
           "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "repo": {
+          "default": null,
+          "description": "Filesystem path on the daemon host used to apply a repo's `[issues]` overlay.",
           "type": [
             "string",
             "null"
@@ -1762,6 +1812,11 @@
       "path": "/v1/worktrees"
     },
     {
+      "cap": "folders.assign",
+      "method": "POST",
+      "path": "/v1/worktrees/folder"
+    },
+    {
       "cap": "worktrees.open",
       "method": "POST",
       "path": "/v1/worktrees/open"
@@ -1995,6 +2050,9 @@
     "FeedFilter": {
       "$ref": "#/definitions/FeedFilter"
     },
+    "FolderAssignReq": {
+      "$ref": "#/definitions/FolderAssignReq"
+    },
     "ForkSpec": {
       "$ref": "#/definitions/ForkSpec"
     },
@@ -2006,6 +2064,9 @@
     },
     "IssueBody": {
       "$ref": "#/definitions/IssueBody"
+    },
+    "IssueRepoQuery": {
+      "$ref": "#/definitions/IssueRepoQuery"
     },
     "IssuesQuery": {
       "$ref": "#/definitions/IssuesQuery"

@@ -120,3 +120,9 @@ existing `worktrees.create` control operation. Those doors use the shared
 `pre_create`/`post_create` lifecycle, and the same `pre_destroy`/
 `post_destroy` hooks apply when the worktree is later removed. There is no
 pipeline-specific hook configuration.
+
+`thegn wt folder <worktree> <name>` assigns a repo-local sidebar folder;
+`thegn wt folder <worktree> --clear` unfiles it without deleting the folder.
+Control clients use the Git-scoped `folders.assign` capability: pass exactly one
+of `folder` (a name) or `clear: true`; neither, or both, is rejected. Over MCP
+the `folders_assign` tool needs `--scopes git`.
