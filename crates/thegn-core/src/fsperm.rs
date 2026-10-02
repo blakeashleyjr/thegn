@@ -150,6 +150,43 @@ pub fn write_owner_only_new(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Make `path` a private (owner-only) real directory, creating it if absent.
+///
+/// Refuses a symlink or non-directory at `path` (checked with
+/// `symlink_metadata` after creation, so a symlink that `create_dir_all`
+/// followed is still caught) and, on Unix, a directory owned by another user.
+/// A directory we own is tightened to 0700 (Windows: owner-only DACL). Only
+/// `path` itself is vetted: ancestors, hardlinks and later replacement of the
+/// directory are out of scope (the caller's threat model is a hostile entry
+/// inside the directory, not a hostile parent).
+pub fn ensure_private_dir(path: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(path)?;
+    let meta = std::fs::symlink_metadata(path)?;
+    if meta.file_type().is_symlink() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} is a symlink, not a directory", path.display()),
+        ));
+    }
+    if !meta.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} is not a directory", path.display()),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if meta.uid() != nix::unistd::geteuid().as_raw() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("{} is owned by another user", path.display()),
+            ));
+        }
+    }
+    restrict_dir_to_owner(path)
+}
+
 /// Atomically replace `path` with owner-only contents.
 ///
 /// The temporary file is created in the destination directory with the strict
