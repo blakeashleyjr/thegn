@@ -6,7 +6,6 @@
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use notify::{Event, RecursiveMode, Watcher, recommended_watcher};
 use tokio::sync::mpsc as tokio_mpsc;
 use tokio::task;
 
@@ -2614,6 +2613,20 @@ pub(crate) fn build_panel(
         crate::branch_cache::BRANCH_CACHE_TTL,
     );
 
+    // THE-718: `status`, `diff HEAD` (+ its entity summary) and the stash count
+    // are a pure function of the worktree and its git dir. While a live diff
+    // watcher vouches for this path (`diff_watch::current_print`), the last
+    // snapshot is reused until its change print moves instead of forking git on
+    // every tick. The print is read BEFORE the reads, so an event landing during
+    // them leaves the stored snapshot stale and the next pass re-derives it.
+    // No watcher for the path (background warm, remote loc, incomplete or
+    // withdrawn registration) means no print and exactly today's behaviour.
+    let watch_print = matches!(loc, GitLoc::Local(_))
+        .then(|| crate::diff_watch::current_print(cwd))
+        .flatten();
+    let cached_reads = watch_print.and_then(|p| crate::panel_git_cache::get(cwd, p));
+    let reads_ok = std::sync::atomic::AtomicBool::new(true);
+
     // Fan the independent, read-only git reads out across scoped threads: each
     // clones the shared read-engine handle, borrows `&loc` (read-only; `git -C` so
     // no chdir hazard) and applies the SAME error fallback inline, so a join
@@ -2646,16 +2659,28 @@ pub(crate) fn build_panel(
         // diff + the semantic entity summary share the diff result and need only
         // `loc`, so they ride one thread (entity parsing is CPU, kept off the rest).
         let h_diff = s.spawn(|| {
+            if let Some(c) = &cached_reads {
+                return (c.diff_entries.clone(), c.entities.clone());
+            }
             let _cpu = crate::perf::measure(crate::perf::Subsys::HydrateChild);
-            let entries = crate::git_handle::get()
-                .diff_files(&loc, "HEAD")
-                .unwrap_or_default();
+            let diff = crate::git_handle::get().diff_files(&loc, "HEAD");
+            if diff.is_err() {
+                reads_ok.store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+            let entries = diff.unwrap_or_default();
             let entities = crate::hydrate_semantic::compute_entity_summary(&loc, &entries);
             (entries, entities)
         });
         let h_status = s.spawn(|| {
+            if let Some(c) = &cached_reads {
+                return c.status.clone();
+            }
             let _cpu = crate::perf::measure(crate::perf::Subsys::HydrateChild);
-            crate::git_handle::get().status(&loc).unwrap_or_default()
+            let status = crate::git_handle::get().status(&loc);
+            if status.is_err() {
+                reads_ok.store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+            status.unwrap_or_default()
         });
         let h_ahead = s.spawn(|| {
             let _cpu = crate::perf::measure(crate::perf::Subsys::HydrateChild);
@@ -2689,8 +2714,15 @@ pub(crate) fn build_panel(
             (merge.map_err(|_| ()), incoming)
         });
         let h_stash_count = s.spawn(|| {
+            if let Some(c) = &cached_reads {
+                return c.stash_count;
+            }
             let _cpu = crate::perf::measure(crate::perf::Subsys::HydrateChild);
-            crate::git_handle::get().stash_count(&loc).unwrap_or(0)
+            let count = crate::git_handle::get().stash_count(&loc);
+            if count.is_err() {
+                reads_ok.store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+            count.unwrap_or(0)
         });
         // Section-gated heavy reads: spawned only when their section is open, so
         // an idle panel pays nothing. The branch PR-badge join is DB-backed and
@@ -2762,8 +2794,27 @@ pub(crate) fn build_panel(
     tracing::debug!(
         target: "thegn::hydrate",
         panel_git_ms = t_git.elapsed().as_millis() as u64,
+        reused_snapshot = cached_reads.is_some(),
         "panel git fan-out done"
     );
+    // Remember a fully successful read set under the print taken before it. A
+    // partial failure is never stored: it would pin an empty answer until the
+    // next change.
+    if let Some(print) = watch_print
+        && cached_reads.is_none()
+        && reads_ok.load(std::sync::atomic::Ordering::Relaxed)
+    {
+        crate::panel_git_cache::put(
+            cwd,
+            print,
+            crate::panel_git_cache::GitReads {
+                diff_entries: diff_entries.clone(),
+                entities: entities.clone(),
+                status: status.clone(),
+                stash_count,
+            },
+        );
+    }
 
     // Resolve the branch list: a fresh fetch refreshes the shared repo cache;
     // otherwise reuse the warm entry populated by this (or a sibling) worktree.
@@ -4757,229 +4808,18 @@ pub(crate) fn retarget_diff_watcher(
         // this lands — so it has no claim on a performance core.
         crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
         drop(old);
-
-        // Resolve this worktree's gitdir + common dir. For a *linked* worktree
-        // `<cwd>/.git` is a file pointer, so the HEAD / reflog / refs that
-        // signal a commit live OUTSIDE the watched tree (in the main repo's
-        // `.git/worktrees/<name>` + shared `.git`); we must watch those too or
-        // pane-driven commits never reach the panel. For the main checkout both
-        // resolve back under `cwd` and the recursive root watch already covers
-        // them. `git rev-parse` runs here, off the event loop.
-        let git_dir =
-            thegn_core::util::git_out(&cwd, &["rev-parse", "--path-format=absolute", "--git-dir"])
-                .map(std::path::PathBuf::from);
-        let common_dir = thegn_core::util::git_out(
-            &cwd,
-            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-        )
-        .map(std::path::PathBuf::from);
-        // Roots used by the event filter to recognise git-internal paths even
-        // for bare/relocated gitdirs whose path has no literal `.git` component.
-        // Canonicalized because the filter compares them against *event* paths,
-        // which FSEvents always reports fully resolved — see `watch_canonical`.
-        let git_roots: Vec<std::path::PathBuf> = [git_dir.clone(), common_dir.clone()]
-            .into_iter()
-            .flatten()
-            .map(|p| crate::git_watch::watch_canonical(&p))
-            .collect();
-
-        let mut last_send = Instant::now()
-            .checked_sub(Duration::from_secs(1))
-            .unwrap_or_else(Instant::now);
-        let wake = w.clone();
-        let roots = git_roots.clone();
-        // Drop watcher events for gitignored paths (`target/`, `node_modules/`,
-        // build outputs): a change to an ignored file can never alter
-        // `git diff HEAD`, so firing a model rebuild for it is pure waste — yet a
-        // cargo/sccache/agent running inside the worktree churns these constantly,
-        // which was the dominant source of redundant ~Hz hydrations. Built once
-        // per retarget from the worktree's root `.gitignore` (nested `.gitignore`s
-        // are rare for the high-churn dirs we care about; revisit only if
-        // profiling shows residual churn). A missing/unreadable `.gitignore`
-        // yields an empty matcher → every path passes → unchanged behavior, so
-        // remote/provider worktrees with no local `.gitignore` are unaffected.
-        // NOTE: a force-added (`git add -f`) or negate-pattern (`!keep`) ignored
-        // file *can* appear in the diff and would be dropped here; that's rare,
-        // and the safety-net ticker still rebuilds the panel within a few seconds.
-        // The matcher's ROOT must be canonical (it is matched against event
-        // paths) while the `.gitignore` it reads is addressed from the real cwd —
-        // on macOS those differ under any symlinked prefix, and a matcher rooted
-        // at `/tmp/wt` matches nothing FSEvents delivers from `/private/tmp/wt`.
-        let ignore = {
-            let mut b =
-                ignore::gitignore::GitignoreBuilder::new(crate::git_watch::watch_canonical(&cwd));
-            let _ = b.add(cwd.join(".gitignore")); // best-effort: a malformed/missing .gitignore just means fewer ignores; the scan below still works
-            b.build()
-                .unwrap_or_else(|_| ignore::gitignore::Gitignore::empty())
+        let wake = {
+            let w = w.clone();
+            std::sync::Arc::new(move || {
+                let _ = w.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
+            })
         };
-        // Plan the registration BEFORE the matcher moves into the event closure.
-        // This is the filesystem walk the old blanket `RecursiveMode::Recursive`
-        // did internally — same shape, minus the gitignored subtrees, so it is
-        // strictly cheaper than what it replaces.
-        let plan =
-            crate::git_watch::plan_watches(&crate::git_watch::watch_canonical(&cwd), &ignore);
-        let new_watcher = recommended_watcher(move |res: notify::Result<Event>| {
-            if let Ok(ev) = res
-                && matches!(
-                    ev.kind,
-                    notify::EventKind::Modify(_)
-                        | notify::EventKind::Create(_)
-                        | notify::EventKind::Remove(_)
-                )
-                // React to real worktree edits (the diffs this watcher exists to
-                // track) AND to git-state changes — commits, checkouts, branch
-                // moves, rebase/merge progress — wherever they land. The latter
-                // are gated through `is_git_state_path` so the index stat-cache
-                // that hydration's own `git` reads rewrite (and the object-store
-                // churn on commit/gc) never match: that allowlist is what keeps
-                // the old self-sustaining ~2 Hz refresh loop — which once read
-                // as a freeze — from coming back.
-                && (ev.paths.is_empty()
-                    || ev.paths.iter().any(|p| {
-                        crate::git_watch::watcher_path_triggers_refresh(p, &roots, &ignore)
-                    }))
-                && last_send.elapsed() > Duration::from_millis(500)
-            {
-                if tx.send(RefreshKind::Model).is_ok() {
-                    let _ = wake.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
-                }
-                // The tree just changed under the ACTIVE worktree, so its line
-                // count is the one that can actually be wrong. `watch: true`
-                // lets the scan bypass the long `[loc] scan_interval_secs` for
-                // that single path — bounded by `watch_invalidate_secs`, so a
-                // save storm still recounts at most once per window.
-                let _ = tx.send(RefreshKind::Loc { watch: true }); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
-                // A branch-ref move also kicks the guarded main-checkout self-heal
-                // so a checkout sitting on that branch fast-forwards its own tree
-                // (external `update-ref` / a fold-actor CAS land elsewhere) without
-                // waiting for a tab switch or restart.
-                if ev
-                    .paths
-                    .iter()
-                    .any(|p| crate::git_watch::is_ref_move_path(p))
-                {
-                    let _ = tx.send(RefreshKind::MainRefMoved); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
-                }
-                // A checkout changed the branch: the PR cache row is the OLD
-                // branch's, so look the new one up now.
-                if ev
-                    .paths
-                    .iter()
-                    .any(|p| crate::git_watch::is_head_move_path(p))
-                {
-                    let _ = tx.send(RefreshKind::Pr); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
-                }
-                // A remote-tracking ref moved — the local signature of a push
-                // (or fetch): kick the PR + CI caches now so the just-pushed
-                // branch's checks appear without waiting for the tickers.
-                // Non-forced, so `[ci] ttl_secs` still bounds subprocess churn.
-                if ev
-                    .paths
-                    .iter()
-                    .any(|p| crate::git_watch::is_remote_ref_path(p))
-                {
-                    let _ = tx.send(RefreshKind::Pr); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
-                    let _ = tx.send(RefreshKind::Ci { force: false }); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
-                    // The PR queue cares about exactly this event: a push is
-                    // what unblocks a PR (or is the teammate the queue must not
-                    // race), so re-evaluate now rather than up to a minute later.
-                    // Inert when the queue is off — the pass finds no rows.
-                    let _ = tx.send(RefreshKind::PrQueue); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
-                }
-                last_send = Instant::now();
-            }
-        });
-        let Ok(mut nw) = new_watcher else {
-            tracing::warn!(
-                target: "thegn::hydrate",
-                worktree = %cwd.display(),
-                "failed to construct diff fs-watcher — diff panel falls back to the 2s ticker"
-            );
-            return;
-        };
-        // Register the root watch, pruning gitignored subtrees rather than
-        // taking one blanket recursive watch (see `git_watch::plan_watches` for
-        // why: `notify`'s recursion is one inotify watch per directory, so the
-        // old blanket watch registered every `target/` and `.claude/worktrees/`
-        // directory — 114,701 watches on this repo — and then paid a gitignore
-        // match per rustc write to discard the event it should never have
-        // subscribed to).
-        //
-        // The plan was walked from the CANONICAL root: the matcher is rooted
-        // there (`watch_canonical` above), and on macOS an un-canonicalized walk
-        // would match nothing and prune nothing.
-        let mut registered = 0usize;
-        for entry in &plan {
-            let mode = if entry.recursive {
-                RecursiveMode::Recursive
-            } else {
-                RecursiveMode::NonRecursive
-            };
-            if nw.watch(&entry.path, mode).is_ok() {
-                registered += 1;
-            }
-        }
-        tracing::debug!(
-            target: "thegn::hydrate",
-            worktree = %cwd.display(),
-            planned = plan.len(),
-            registered,
-            "diff fs-watch registered (gitignored subtrees pruned)"
-        );
-        // Every registration failing is the ENOSPC case: on a Linux machine whose
-        // `fs.inotify.max_user_watches` is exhausted (large monorepos, many
-        // instances) `watch` fails with ENOSPC — previously the thread just exited
-        // silently, and `retarget`'s guard suppressed every retry, so the active
-        // worktree lost sub-second diff/ref-move/push detection for the rest of
-        // the session with no diagnostic. Fall back to a NON-recursive watch on
-        // the worktree root (one watch, not thousands): coarser (top-level edits
-        // + git-state paths under it still fire) but keeps the ref-move / push
-        // kicks working, and — crucially — still sends a watcher back so the loop
-        // adopts it (a later retarget away-and-back re-attempts the full plan).
-        let recursive_ok = registered > 0;
-        if !recursive_ok {
-            let fallback_ok = nw.watch(&cwd, RecursiveMode::NonRecursive).is_ok();
-            // The likely cause is OS-specific, and naming the wrong mechanism
-            // sends the reader down a dead end: `notify` rides inotify on Linux
-            // but FSEvents on macOS (which has no per-watch quota to exhaust —
-            // there, a failure is a path/permission problem).
-            let hint = if cfg!(target_os = "linux") {
-                "inotify watches exhausted?"
-            } else {
-                "path unreadable or unwatchable?"
-            };
-            tracing::warn!(
-                target: "thegn::hydrate",
-                worktree = %cwd.display(),
-                fallback_ok,
-                "recursive diff fs-watch registration failed ({hint}) — \
-                 fell back to a non-recursive root watch"
-            );
-            if !fallback_ok {
-                // Nothing attached at all — don't ship a dead watcher; the 2s
-                // safety-net ticker covers diff refresh until the next retarget.
-                return;
-            }
-        }
-        // Linked worktree: add targeted watches on the external gitdir's
-        // state-bearing subtrees. Non-recursive on the gitdir roots (so we
-        // never descend into `objects/`, which floods on every commit/gc);
-        // `logs/` (reflog) and `refs/` are small and never written by
-        // hydration's read-only git, so a recursive watch there is storm-
-        // safe. Any root already under `cwd` is skipped — the recursive
-        // root watch above covers the main checkout.
-        for root in [git_dir.as_ref(), common_dir.as_ref()]
-            .into_iter()
-            .flatten()
+        // Registration, event filtering and the change generation live in
+        // `diff_watch` (moved out of this file, THE-718).
+        if let Some(nw) =
+            crate::diff_watch::build_diff_watcher(&cwd, crate::diff_watch::RefreshSink { tx, wake })
+            && wtx.send((cwd, nw)).is_ok()
         {
-            if root.starts_with(&cwd) {
-                continue;
-            }
-            let _ = nw.watch(root, RecursiveMode::NonRecursive); // best-effort: watch registration: a missed root just delays fs-triggered hydration until another event
-            let _ = nw.watch(&root.join("logs"), RecursiveMode::Recursive); // best-effort: watch registration: a missed root just delays fs-triggered hydration until another event
-            let _ = nw.watch(&root.join("refs"), RecursiveMode::Recursive); // best-effort: watch registration: a missed root just delays fs-triggered hydration until another event
-        }
-        if wtx.send((cwd, nw)).is_ok() {
             let _ = w.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
     });

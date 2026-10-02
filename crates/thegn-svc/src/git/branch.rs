@@ -303,21 +303,8 @@ mod tests {
             ],
         );
         let loc = GitLoc::Local(wt.clone());
-        let cli_has = |what: &str| {
-            std::process::Command::new("git")
-                .args([
-                    "-C",
-                    wt.to_str().unwrap(),
-                    "rev-parse",
-                    "-q",
-                    "--verify",
-                    what,
-                ])
-                .output()
-                .unwrap()
-                .status
-                .success()
-        };
+        let cli_has =
+            |what: &str| thegn_core::util::git_ok(&wt, &["rev-parse", "-q", "--verify", what]);
         assert!(CliGit.merge_state(&loc).unwrap().is_none());
         assert!(!cli_has("MERGE_HEAD"));
         let _ = CliGit.merge(&loc, "feat"); // best-effort: conflicting merge fails by design; state asserted below

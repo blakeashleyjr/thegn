@@ -159,7 +159,7 @@ pub(crate) struct WatchPlanEntry {
 /// gitignored build output (case 2 of [`watcher_path_triggers_refresh`]), and
 /// the object store, which [`is_git_state_path`]'s allowlist never matches and
 /// which floods on every commit/gc.
-fn prune_dir(p: &std::path::Path, ignore: &ignore::gitignore::Gitignore) -> bool {
+pub(crate) fn prune_dir(p: &std::path::Path, ignore: &ignore::gitignore::Gitignore) -> bool {
     // `.git/objects` — the same subtree the linked-worktree gitdir watches
     // already refuse to descend into, applied to the main checkout too.
     if p.file_name().and_then(|s| s.to_str()) == Some("objects") && in_dot_git(p) {
