@@ -112,8 +112,9 @@ pub const STATE_TOOLS: &[StateToolSpec] = &[
         cap: "folders.assign",
         description: "Assign a repo-local sidebar folder to a Git worktree, or clear its folder. \
                       Folder names are trimmed and matched case-insensitively within that \
-                      worktree's repository. Clearing never deletes the folder. Git-scoped; \
-                      requires a running daemon.",
+                      worktree's repository. Pass exactly one of `folder` (assign) or \
+                      `clear: true` (unfile); clearing never deletes the folder. \
+                      Git-scoped; requires a running daemon.",
         args: &[
             ArgSpec {
                 name: "worktree",
@@ -125,7 +126,13 @@ pub const STATE_TOOLS: &[StateToolSpec] = &[
                 name: "folder",
                 kind: ArgKind::String,
                 required: false,
-                description: "Folder name to assign; omit to clear",
+                description: "Folder name to assign; exclusive with `clear`",
+            },
+            ArgSpec {
+                name: "clear",
+                kind: ArgKind::Boolean,
+                required: false,
+                description: "true to unfile the worktree; exclusive with `folder`",
             },
         ],
     },
@@ -891,6 +898,10 @@ mod tests {
         assert_eq!(
             entries[0]["inputSchema"]["properties"]["folder"]["type"],
             "string"
+        );
+        assert_eq!(
+            entries[0]["inputSchema"]["properties"]["clear"]["type"],
+            "boolean"
         );
         let result = r
             .call(

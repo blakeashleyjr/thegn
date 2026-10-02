@@ -696,6 +696,93 @@ async fn folder_assignment_requires_git_scope_and_reaches_the_control_api() {
         StatusCode::OK
     );
     assert_eq!(r.api.calls(), ["folder_assign:/w:Some(\"Agents\")"]);
+
+    // A write token alone is not enough: folder assignment is Git-scoped.
+    let write = token(&r, "write");
+    assert_eq!(
+        call(&r, "POST", "/v1/worktrees/folder", Some(&write)).await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(r.api.calls().len(), 1, "write token must not reach the API");
+}
+
+async fn post_folder(r: &Rig, bearer: &str, body: &'static str) -> StatusCode {
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/worktrees/folder")
+        .header("authorization", format!("Bearer {bearer}"))
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap();
+    router(r.state.clone()).oneshot(req).await.unwrap().status()
+}
+
+#[tokio::test]
+async fn folder_assignment_shape_is_strict_and_clearing_is_explicit() {
+    let r = rig(false);
+    let git = token(&r, "git");
+    // Misspelled field, empty body, neither, both: all rejected before the API.
+    for body in [
+        r#"{"worktree":"/w","folder":"A","clera":true}"#,
+        r#"{}"#,
+        r#"{"worktree":"/w"}"#,
+        r#"{"worktree":"/w","folder":"A","clear":true}"#,
+    ] {
+        let status = post_folder(&r, &git, body).await;
+        assert!(status.is_client_error(), "{body} -> {status}");
+    }
+    assert!(r.api.calls().is_empty());
+    assert_eq!(
+        post_folder(&r, &git, r#"{"worktree":"/w","clear":true}"#).await,
+        StatusCode::OK
+    );
+    assert_eq!(r.api.calls(), ["folder_assign:/w:None"]);
+}
+
+#[cfg(feature = "control-grpc")]
+#[tokio::test]
+async fn grpc_folder_assignment_requires_git_scope() {
+    use super::grpc::{GrpcControl, proto};
+    use proto::control_server::Control;
+    use thegn_core::store::ControlStore;
+
+    let r = rig(false);
+    let grpc = GrpcControl {
+        api: r.api.clone(),
+        store: r.db.clone() as Arc<Mutex<dyn ControlStore + Send>>,
+        local_admin: false,
+        daemon_euid: None,
+        server_label: "test thegn".into(),
+    };
+    let req = |scope: &str, clear: bool, folder: Option<&str>| {
+        let token = token(&r, scope);
+        let mut request = tonic::Request::new(proto::AssignWorktreeFolderRequest {
+            worktree: "/w".into(),
+            folder: folder.map(str::to_string),
+            clear,
+        });
+        request
+            .metadata_mut()
+            .insert("authorization", format!("Bearer {token}").parse().unwrap());
+        request
+    };
+    for scope in ["read", "write"] {
+        let error = grpc
+            .assign_worktree_folder(req(scope, true, None))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::PermissionDenied, "{scope}");
+    }
+    assert!(r.api.calls().is_empty(), "denial must not reach the API");
+    let error = grpc
+        .assign_worktree_folder(req("git", false, None))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    grpc.assign_worktree_folder(req("git", true, None))
+        .await
+        .unwrap();
+    assert_eq!(r.api.calls(), ["folder_assign:/w:None"]);
 }
 
 #[tokio::test]

@@ -40,7 +40,8 @@ capability (scope, surfaces), `api schema` the control wire contract, and
 `api call <cap> --params '{…}'` performs any routed capability over the
 control socket — a newly routed verb is callable with no CLI change.
 For example, `folders.assign` assigns or clears a worktree's repo-local sidebar
-folder through `api call` (Git scope), HTTP, gRPC, MCP, or plugin `host.call`.
+folder (`folder` name, or `clear: true`) through `api call` (Git scope), HTTP,
+gRPC, MCP (`folders_assign`, needs `--scopes git`), or plugin `host.call`.
 `thegn plugin list|check` inspects the configured [[plugins]].
 
 The multi-repo group commands use the canonical `thegn program` namespace.
