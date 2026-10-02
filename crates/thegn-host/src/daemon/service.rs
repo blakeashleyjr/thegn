@@ -293,6 +293,7 @@ fn map_folder_assign_error(error: anyhow::Error) -> ControlError {
         Some(FolderAssignError::NotWorktree(m) | FolderAssignError::InvalidName(m)) => {
             ControlError::InvalidArgument(m.clone())
         }
+        Some(FolderAssignError::RepoMismatch(m)) => ControlError::FailedPrecondition(m.clone()),
         Some(FolderAssignError::Conflict(m)) => ControlError::Conflict(m.clone()),
         None => {
             let message = error.to_string();
@@ -2053,22 +2054,28 @@ impl ControlApi for DaemonService {
             };
             // Resolve the worktree through git on its own blocking task — the
             // daemon DB mutex must never be held across a git subprocess.
+            enum Resolved {
+                Assign(wt::FolderTarget, String),
+                Clear(std::path::PathBuf),
+            }
             let worktree = req.worktree.clone();
-            let assigning = folder.is_some();
             let resolved = tokio::task::spawn_blocking(move || {
                 let path = std::path::Path::new(&worktree);
-                if assigning {
-                    wt::resolve_folder_target(path).map(Ok)
-                } else {
-                    wt::resolve_worktree_root(path).map(Err)
+                match folder {
+                    Some(name) => {
+                        wt::resolve_folder_target(path).map(|target| Resolved::Assign(target, name))
+                    }
+                    None => wt::resolve_worktree_root(path).map(Resolved::Clear),
                 }
             })
             .await
             .map_err(|e| ControlError::Internal(anyhow::anyhow!("git task join: {e}")))?
             .map_err(map_folder_assign_error)?;
-            self.with_db(move |db| match (resolved, folder) {
-                (Ok(target), Some(name)) => wt::file_folder_target(db, &target, &name).map(drop),
-                (Err(root), _) => {
+            self.with_db(move |db| match resolved {
+                Resolved::Assign(target, name) => {
+                    wt::file_folder_target(db, &target, &name).map(drop)
+                }
+                Resolved::Clear(root) => {
                     let worktree = root.to_string_lossy().into_owned();
                     if wt::clear_folder_if_registered(db, &worktree)? {
                         Ok(())
@@ -2078,7 +2085,6 @@ impl ControlApi for DaemonService {
                         ))))
                     }
                 }
-                (Ok(_), None) => unreachable!("clear resolves a worktree root only"),
             })
             .await
             .map_err(|error| match error {
@@ -2280,6 +2286,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn folder_assign_accepts_an_existing_overlong_folder_but_not_a_new_one() {
+        use thegn_core::store::WorkspaceStore;
+        let (service, _) = service(0);
+        let (_dir, path) = git_worktree();
+        let key = path.to_string_lossy().into_owned();
+        let long = "L".repeat(80);
+        {
+            let db = service.db.lock().unwrap();
+            db.put_workspace(&key, "repo", "repo").unwrap();
+            db.ensure_folder(&key, &long).unwrap();
+        }
+        service
+            .folder_assign(folder_req(&path, Some(&long), false))
+            .await
+            .unwrap();
+        let error = service
+            .folder_assign(folder_req(&path, Some(&"N".repeat(80)), false))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, ControlError::InvalidArgument(_)),
+            "{error:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn folder_assign_requires_exactly_one_of_folder_or_clear() {
         let (service, _) = service(0);
         let (_dir, path) = git_worktree();
@@ -2325,13 +2357,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn folder_assign_identity_race_is_a_conflict() {
+    async fn folder_assign_repo_mismatch_is_a_failed_precondition_and_writes_nothing() {
         use thegn_core::store::WorkspaceStore;
         let (service, _) = service(0);
         let (_dir, path) = git_worktree();
         let key = path.to_string_lossy().into_owned();
         // A row for this worktree already exists under a FOREIGN repo: the
-        // identity-checked write matches nothing.
+        // assignment is refused before any write.
         service
             .db
             .lock()
@@ -2342,7 +2374,14 @@ mod tests {
             .folder_assign(folder_req(&path, Some("Agents"), false))
             .await
             .unwrap_err();
-        assert!(matches!(error, ControlError::Conflict(_)), "{error:?}");
+        assert!(
+            matches!(error, ControlError::FailedPrecondition(_)),
+            "{error:?}"
+        );
+        let db = service.db.lock().unwrap();
+        assert_eq!(db.worktrees().unwrap().len(), 1, "no new worktree row");
+        assert!(db.folders_for_workspace(&key).unwrap().is_empty());
+        assert!(db.workspaces().unwrap().is_empty(), "no workspace row");
     }
 
     #[tokio::test]

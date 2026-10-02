@@ -449,10 +449,11 @@ async fn fetch_state(
                     .ok_or("missing `worktree`")?
                     .to_string(),
                 folder: str_arg(args, "folder").map(str::to_string),
-                clear: args
-                    .get("clear")
-                    .and_then(serde_json::Value::as_bool)
-                    .unwrap_or(false),
+                clear: match args.get("clear") {
+                    None | Some(serde_json::Value::Null) => false,
+                    Some(serde_json::Value::Bool(b)) => *b,
+                    Some(_) => return Err("`clear` must be a boolean".into()),
+                },
             };
             c.folder_assign(&request).await.map_err(|e| e.to_string())?;
             Ok(json!({ "ok": true }))
