@@ -682,6 +682,18 @@ pub struct WorktreeCreateReq {
     pub branch: Option<String>,
 }
 
+/// Assign or clear a worktree's repo-local sidebar folder (`folders.assign`).
+/// A name is resolved within the worktree's own repository; `None` clears the
+/// assignment without deleting the folder.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct FolderAssignReq {
+    /// Absolute path to a Git worktree.
+    pub worktree: String,
+    /// Folder name to assign, or absent/null to clear.
+    #[serde(default)]
+    pub folder: Option<String>,
+}
+
 /// The `dispatches.put` verb payload (THE-57): one row appended to the roster.
 ///
 /// The four pipeline fields (v56) are optional and default-absent, so a caller
@@ -1126,6 +1138,15 @@ pub trait ControlApi: Send + Sync + 'static {
         Box::pin(async {
             Err(ControlError::Unimplemented(
                 "worktree creation is not available",
+            ))
+        })
+    }
+
+    /// Assign or clear a worktree's sidebar folder (`folders.assign`).
+    fn folder_assign(&self, _req: FolderAssignReq) -> BoxFuture<'_, ControlResult<()>> {
+        Box::pin(async {
+            Err(ControlError::Unimplemented(
+                "worktree folder assignment is not available",
             ))
         })
     }

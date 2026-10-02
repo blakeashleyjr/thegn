@@ -107,6 +107,10 @@ impl ControlApi for FakeApi {
             }])
         })
     }
+    fn folder_assign(&self, req: super::FolderAssignReq) -> BoxFuture<'_, ControlResult<()>> {
+        self.record(&format!("folder_assign:{}:{:?}", req.worktree, req.folder));
+        Box::pin(async { Ok(()) })
+    }
     fn list_skills(&self) -> BoxFuture<'_, ControlResult<super::SkillsList>> {
         self.record("list_skills");
         Box::pin(async {
@@ -527,6 +531,8 @@ fn default_body(path: &str) -> &'static str {
         r#"{"client_id":"c"}"#
     } else if path.contains("/worktrees/open") {
         r#"{"repo":"r"}"#
+    } else if path.contains("/worktrees/folder") {
+        r#"{"worktree":"/w","folder":"Agents"}"#
     } else if path.contains("/preview/fetch") {
         r#"{"url":"http://localhost:3000/"}"#
     } else if path.contains("/git/stage") {
@@ -669,6 +675,27 @@ async fn worktrees_list_needs_read_and_is_rejected_before_the_api() {
         StatusCode::OK
     );
     assert_eq!(r.api.calls(), vec!["list_worktrees".to_string()]);
+}
+
+#[tokio::test]
+async fn folder_assignment_requires_git_scope_and_reaches_the_control_api() {
+    let r = rig(false);
+    let read = token(&r, "read");
+    assert_eq!(
+        call(&r, "POST", "/v1/worktrees/folder", Some(&read)).await,
+        StatusCode::FORBIDDEN
+    );
+    assert!(
+        r.api.calls().is_empty(),
+        "scope denial must precede the API"
+    );
+
+    let git = token(&r, "git");
+    assert_eq!(
+        call(&r, "POST", "/v1/worktrees/folder", Some(&git)).await,
+        StatusCode::OK
+    );
+    assert_eq!(r.api.calls(), ["folder_assign:/w:Some(\"Agents\")"]);
 }
 
 #[tokio::test]

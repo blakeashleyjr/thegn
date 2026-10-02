@@ -442,6 +442,17 @@ async fn fetch_state(
                 .map(|wts| json!({ "source": "db-cache", "worktrees": wts }))
                 .map_err(|db_err| format!("{NO_DAEMON}; DB cache also failed: {db_err}")),
         },
+        "folders.assign" => {
+            let c = client.map_err(|_| NO_DAEMON.to_string())?;
+            let request = thegn_svc::control::FolderAssignReq {
+                worktree: str_arg(args, "worktree")
+                    .ok_or("missing `worktree`")?
+                    .to_string(),
+                folder: str_arg(args, "folder").map(str::to_string),
+            };
+            c.folder_assign(&request).await.map_err(|e| e.to_string())?;
+            Ok(json!({ "ok": true }))
+        }
         "sessions.list" => {
             let c = client.map_err(|_| NO_DAEMON.to_string())?;
             let sessions = c.sessions().await.map_err(|e| e.to_string())?;
@@ -936,6 +947,12 @@ mod tests {
         for cap in READ_CAPS {
             assert!(allowed.contains(cap), "{allowed:?} missing {cap}");
         }
+    }
+
+    #[test]
+    fn folder_assignment_is_git_scoped_on_mcp() {
+        assert!(!allowed_state_caps(ScopeSet::parse("read"), false).contains(&"folders.assign"));
+        assert!(allowed_state_caps(ScopeSet::parse("git"), false).contains(&"folders.assign"));
     }
 
     #[test]

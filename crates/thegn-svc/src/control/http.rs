@@ -1202,6 +1202,22 @@ pub(super) async fn create_worktree(
     }
 }
 
+/// `folders.assign` (git scope): assign or clear a worktree's repo-local
+/// sidebar folder.
+pub(super) async fn assign_worktree_folder(
+    State(state): State<ControlState>,
+    headers: HeaderMap,
+    body: axum::Json<super::FolderAssignReq>,
+) -> Response {
+    if let Err(r) = authed(&state, &headers, Verb::FolderAssign) {
+        return r;
+    }
+    match state.api.folder_assign(body.0).await {
+        Ok(()) => axum::Json(json!({"ok": true})).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
 // ── agent orchestration: issues (THE-57) ─────────────────────────────────────
 
 /// Query params for `issues.list` — a subset of `IssueFilter` a supervisor

@@ -540,6 +540,27 @@
       },
       "type": "object"
     },
+    "FolderAssignReq": {
+      "description": "Assign or clear a worktree's repo-local sidebar folder (`folders.assign`). A name is resolved within the worktree's own repository; `None` clears the assignment without deleting the folder.",
+      "properties": {
+        "folder": {
+          "default": null,
+          "description": "Folder name to assign, or absent/null to clear.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "worktree": {
+          "description": "Absolute path to a Git worktree.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "worktree"
+      ],
+      "type": "object"
+    },
     "ForkSpec": {
       "description": "Intent for creating a new session from a live daemon or recorded harness session. `harness` discriminates the source: absent means `session` is a live daemon id; present means it is a native id discovered from `agent.sessions`. No process recipe, environment, prompt, or transcript data crosses the control boundary.",
       "properties": {
@@ -1762,6 +1783,11 @@
       "path": "/v1/worktrees"
     },
     {
+      "cap": "folders.assign",
+      "method": "POST",
+      "path": "/v1/worktrees/folder"
+    },
+    {
       "cap": "worktrees.open",
       "method": "POST",
       "path": "/v1/worktrees/open"
@@ -1994,6 +2020,9 @@
     },
     "FeedFilter": {
       "$ref": "#/definitions/FeedFilter"
+    },
+    "FolderAssignReq": {
+      "$ref": "#/definitions/FolderAssignReq"
     },
     "ForkSpec": {
       "$ref": "#/definitions/ForkSpec"
