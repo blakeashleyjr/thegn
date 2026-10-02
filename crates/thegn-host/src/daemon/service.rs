@@ -445,6 +445,24 @@ impl DaemonService {
     }
 }
 
+async fn issue_config_for_repo(
+    config: std::sync::Arc<thegn_core::config::Config>,
+    repo: Option<String>,
+) -> ControlResult<thegn_core::config::IssuesConfig> {
+    let Some(repo) = repo else {
+        return Ok(config.issues.clone());
+    };
+    tokio::task::spawn_blocking(move || {
+        let path = std::path::PathBuf::from(&repo);
+        let root = thegn_core::repo::main_worktree(&path).ok_or_else(|| {
+            ControlError::InvalidArgument(format!("repo path is not a git repository: {repo}"))
+        })?;
+        Ok(config.repo_issues(Some(&root)))
+    })
+    .await
+    .map_err(|e| ControlError::Internal(anyhow::anyhow!("issues repo resolution: {e}")))?
+}
+
 impl ControlApi for DaemonService {
     fn list_sessions(&self) -> BoxFuture<'_, ControlResult<Vec<SessionInfo>>> {
         Box::pin(async move {
@@ -1728,9 +1746,12 @@ impl ControlApi for DaemonService {
     fn issues_list<'a>(
         &'a self,
         filter: &'a thegn_core::issue::IssueFilter,
+        repo: Option<&'a str>,
     ) -> BoxFuture<'a, ControlResult<Vec<thegn_core::issue::Issue>>> {
         Box::pin(async move {
-            let router = thegn_svc::issue::IssueRouter::from_config(&self.config.issues);
+            let issues_cfg =
+                issue_config_for_repo(self.config.clone(), repo.map(str::to_owned)).await?;
+            let router = thegn_svc::issue::IssueRouter::from_config(&issues_cfg);
             if !router.is_configured() {
                 return Err(ControlError::Unimplemented(
                     "no issue tracker configured (set [issues] providers/accounts)",
@@ -1770,10 +1791,13 @@ impl ControlApi for DaemonService {
     fn issues_get<'a>(
         &'a self,
         id: &'a str,
+        repo: Option<&'a str>,
     ) -> BoxFuture<'a, ControlResult<thegn_core::issue::IssueDetail>> {
         Box::pin(async move {
             let shown_id: String = id.chars().take(256).collect();
-            let router = thegn_svc::issue::IssueRouter::from_config(&self.config.issues);
+            let issues_cfg =
+                issue_config_for_repo(self.config.clone(), repo.map(str::to_owned)).await?;
+            let router = thegn_svc::issue::IssueRouter::from_config(&issues_cfg);
             router
                 .get_issue(id)
                 .await
@@ -1785,10 +1809,13 @@ impl ControlApi for DaemonService {
         &'a self,
         id: &'a str,
         patch: &'a thegn_core::issue::IssuePatch,
+        repo: Option<&'a str>,
     ) -> BoxFuture<'a, ControlResult<thegn_core::issue::Issue>> {
         Box::pin(async move {
             let shown_id: String = id.chars().take(256).collect();
-            let router = thegn_svc::issue::IssueRouter::from_config(&self.config.issues);
+            let issues_cfg =
+                issue_config_for_repo(self.config.clone(), repo.map(str::to_owned)).await?;
+            let router = thegn_svc::issue::IssueRouter::from_config(&issues_cfg);
             router.update_issue(id, patch).await.map_err(|e| {
                 ControlError::Internal(anyhow::anyhow!("issues.update {shown_id}: {e}"))
             })
@@ -1799,10 +1826,13 @@ impl ControlApi for DaemonService {
         &'a self,
         id: &'a str,
         body: &'a str,
+        repo: Option<&'a str>,
     ) -> BoxFuture<'a, ControlResult<()>> {
         Box::pin(async move {
             let shown_id: String = id.chars().take(256).collect();
-            let router = thegn_svc::issue::IssueRouter::from_config(&self.config.issues);
+            let issues_cfg =
+                issue_config_for_repo(self.config.clone(), repo.map(str::to_owned)).await?;
+            let router = thegn_svc::issue::IssueRouter::from_config(&issues_cfg);
             router.add_comment(id, body).await.map_err(|e| {
                 ControlError::Internal(anyhow::anyhow!("issues.comment {shown_id}: {e}"))
             })
@@ -2081,6 +2111,42 @@ impl ControlApi for DaemonService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn explicit_issue_repo_resolves_overlay_and_rejects_invalid_path() {
+        let repo = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(repo.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        std::fs::write(
+            repo.path().join(".thegn.toml"),
+            "[issues]\nproviders = [\"linear\"]\naccounts = []\n\n[issues.linear]\nteam_id = \"TEAM-PIN\"\n",
+        )
+        .unwrap();
+        let config = std::sync::Arc::new(thegn_core::config::Config::default());
+
+        let scoped = issue_config_for_repo(config.clone(), Some(repo.path().display().to_string()))
+            .await
+            .unwrap();
+        assert_eq!(
+            scoped.providers,
+            vec![thegn_core::config::IssueProviderKind::Linear]
+        );
+        assert!(scoped.accounts_restricted);
+        assert!(scoped.issue_accounts.is_empty());
+        assert_eq!(scoped.linear.team_id, "TEAM-PIN");
+        let unscoped = issue_config_for_repo(config.clone(), None).await.unwrap();
+        assert_eq!(unscoped.providers, config.issues.providers);
+
+        let outside = tempfile::tempdir().unwrap();
+        let error = issue_config_for_repo(config, Some(outside.path().display().to_string()))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ControlError::InvalidArgument(_)));
+    }
 
     #[tokio::test]
     async fn ci_logs_rejects_malformed_ids_before_cache_or_provider_access() {
@@ -2837,7 +2903,7 @@ mod tests {
         let (svc, _rx) = service(0);
         let filter = thegn_core::issue::IssueFilter::default();
         assert!(matches!(
-            svc.issues_list(&filter).await,
+            svc.issues_list(&filter, None).await,
             Err(ControlError::Unimplemented(_))
         ));
     }

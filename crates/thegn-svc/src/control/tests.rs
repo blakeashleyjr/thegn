@@ -53,11 +53,31 @@ impl FakeApi {
 }
 
 impl ControlApi for FakeApi {
+    fn issues_list<'a>(
+        &'a self,
+        _filter: &'a thegn_core::issue::IssueFilter,
+        repo: Option<&'a str>,
+    ) -> BoxFuture<'a, ControlResult<Vec<thegn_core::issue::Issue>>> {
+        self.record(&repo.map_or_else(
+            || "issues_list".to_string(),
+            |repo| format!("issues_list:repo={repo}"),
+        ));
+        Box::pin(async {
+            Err(super::ControlError::Unimplemented(
+                "recording issue fixture",
+            ))
+        })
+    }
+
     fn issues_get<'a>(
         &'a self,
         id: &'a str,
+        _repo: Option<&'a str>,
     ) -> BoxFuture<'a, ControlResult<thegn_core::issue::IssueDetail>> {
-        self.record(&format!("issues_get:{id}"));
+        self.record(&_repo.map_or_else(
+            || format!("issues_get:{id}"),
+            |repo| format!("issues_get:{id}:repo={repo}"),
+        ));
         Box::pin(async {
             Err(super::ControlError::Unimplemented(
                 "recording issue fixture",
@@ -69,8 +89,12 @@ impl ControlApi for FakeApi {
         &'a self,
         id: &'a str,
         _patch: &'a thegn_core::issue::IssuePatch,
+        _repo: Option<&'a str>,
     ) -> BoxFuture<'a, ControlResult<thegn_core::issue::Issue>> {
-        self.record(&format!("issues_update:{id}"));
+        self.record(&_repo.map_or_else(
+            || format!("issues_update:{id}"),
+            |repo| format!("issues_update:{id}:repo={repo}"),
+        ));
         Box::pin(async {
             Err(super::ControlError::Unimplemented(
                 "recording issue fixture",
@@ -82,8 +106,12 @@ impl ControlApi for FakeApi {
         &'a self,
         id: &'a str,
         _body: &'a str,
+        _repo: Option<&'a str>,
     ) -> BoxFuture<'a, ControlResult<()>> {
-        self.record(&format!("issues_comment:{id}"));
+        self.record(&_repo.map_or_else(
+            || format!("issues_comment:{id}"),
+            |repo| format!("issues_comment:{id}:repo={repo}"),
+        ));
         Box::pin(async {
             Err(super::ControlError::Unimplemented(
                 "recording issue fixture",
@@ -1738,6 +1766,52 @@ async fn issue_identity_roundtrips_client_encoding_through_real_router() {
             assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
             assert_eq!(r.api.calls(), vec![format!("{operation}:{id}")]);
         }
+    }
+}
+
+#[tokio::test]
+async fn issue_routes_forward_optional_repo_context() {
+    let encoded_repo = "%2Ftmp%2Frepo%20with%20space";
+    let cases = [
+        ("GET", "/v1/issues".to_string(), "", "issues_list"),
+        (
+            "GET",
+            format!("/v1/issues?repo={encoded_repo}"),
+            "",
+            "issues_list:repo=/tmp/repo with space",
+        ),
+        (
+            "GET",
+            format!("/v1/issues/ABC?repo={encoded_repo}"),
+            "",
+            "issues_get:ABC:repo=/tmp/repo with space",
+        ),
+        (
+            "POST",
+            format!("/v1/issues/ABC?repo={encoded_repo}"),
+            "{}",
+            "issues_update:ABC:repo=/tmp/repo with space",
+        ),
+        (
+            "POST",
+            format!("/v1/issues/ABC/comment?repo={encoded_repo}"),
+            r#"{"body":"fixture"}"#,
+            "issues_comment:ABC:repo=/tmp/repo with space",
+        ),
+    ];
+    for (method, path, body, call) in cases {
+        let r = rig(false);
+        let admin = token(&r, "admin");
+        let request = Request::builder()
+            .method(method)
+            .uri(path)
+            .header("authorization", format!("Bearer {admin}"))
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let response = router(r.state.clone()).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(r.api.calls(), vec![call.to_string()]);
     }
 }
 

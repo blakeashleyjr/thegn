@@ -3614,17 +3614,15 @@ pub(crate) fn spawn_panel_prefetch(
 
 pub(crate) fn spawn_pr_cache_refresh(
     cwd: std::path::PathBuf,
-    cfg: thegn_core::config::IssuesConfig,
-    disk_cfg: thegn_core::config::DiskConfig,
+    cfg: thegn_core::config::Config,
     waker: Option<TerminalWaker>,
 ) {
-    spawn_pr_cache_refresh_with_generation(cwd, cfg, disk_cfg, waker, None);
+    spawn_pr_cache_refresh_with_generation(cwd, cfg, waker, None);
 }
 
 pub(crate) fn spawn_pr_cache_refresh_with_generation(
     cwd: std::path::PathBuf,
-    cfg: thegn_core::config::IssuesConfig,
-    disk_cfg: thegn_core::config::DiskConfig,
+    cfg: thegn_core::config::Config,
     waker: Option<TerminalWaker>,
     generation: Option<(std::sync::Arc<std::sync::atomic::AtomicU64>, u64)>,
 ) {
@@ -3638,6 +3636,7 @@ pub(crate) fn spawn_pr_cache_refresh_with_generation(
         if !cwd.is_dir() {
             return;
         }
+        let disk_cfg = cfg.disk.clone();
         let loc = thegn_core::remote::GitLoc::for_worktree(&cwd);
         let Ok(db) = thegn_core::db::Db::open() else {
             return;
@@ -3857,28 +3856,32 @@ pub(crate) fn spawn_pr_cache_refresh_with_generation(
 
             // Lifecycle automation: on merge, move this worktree's linked
             // issue(s) to Done on their tracker (opt-in via `[issues].move_on_merge`).
-            if cfg.move_on_merge
+            if cfg.issues.move_on_merge
                 && pr.state == "MERGED"
                 && let Ok(linked) = db.linked_issues(&wt)
                 && !linked.is_empty()
             {
-                let mut router = thegn_svc::issue::IssueRouter::from_config(&cfg);
-                // Provider-as-plugin: append live plugin issue providers.
-                crate::plugin_providers::extend_issue_router(&mut router);
-                if router.is_configured()
-                    && let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                {
-                    let patch = thegn_core::issue::IssuePatch {
-                        status: Some(thegn_core::issue::IssueStatus::Done),
-                        ..Default::default()
-                    };
-                    for id in &linked {
-                        if let Err(e) = rt.block_on(router.update_issue(id, &patch)) {
-                            tracing::warn!(target: "thegn::issues", error = %e, "failed to move linked issue {id} to Done on merge");
+                if let Ok(issues_cfg) = crate::repo_issues::for_path(&cfg, &cwd) {
+                    let mut router = thegn_svc::issue::IssueRouter::from_config(&issues_cfg);
+                    // Provider-as-plugin: append live plugin issue providers.
+                    crate::plugin_providers::extend_issue_router(&mut router);
+                    if router.is_configured()
+                        && let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                    {
+                        let patch = thegn_core::issue::IssuePatch {
+                            status: Some(thegn_core::issue::IssueStatus::Done),
+                            ..Default::default()
+                        };
+                        for id in &linked {
+                            if let Err(e) = rt.block_on(router.update_issue(id, &patch)) {
+                                tracing::warn!(target: "thegn::issues", error = %e, "failed to move linked issue {id} to Done on merge");
+                            }
                         }
                     }
+                } else {
+                    tracing::warn!(target: "thegn::issues", worktree = %cwd.display(), "cannot resolve repo for move_on_merge; skipping linked issue updates");
                 }
             }
         }

@@ -8607,8 +8607,7 @@ async fn event_loop<T: Terminal>(
             }
             spawn_pr_cache_refresh(
                 current_worktree.clone(),
-                current_config.issues.clone(),
-                current_config.disk.clone(),
+                current_config.clone(),
                 Some(waker.clone()),
             );
             crate::hydrate_tracker::spawn_issue_cache_refresh(
@@ -12278,8 +12277,7 @@ async fn event_loop<T: Terminal>(
         if want_pr_refresh {
             crate::hydrate::spawn_pr_cache_refresh_with_generation(
                 active_tab_path(&session),
-                current_config.issues.clone(),
-                current_config.disk.clone(),
+                current_config.clone(),
                 Some(waker.clone()),
                 scheduled_pr_generation
                     .generation()
