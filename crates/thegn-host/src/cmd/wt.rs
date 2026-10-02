@@ -645,12 +645,24 @@ pub(crate) fn file_folder_target(
     Ok(target.worktree_path.clone())
 }
 
-/// Resolve, validate, then file in one call (the CLI and the daemon use the two
-/// halves separately so git runs before the DB is opened or locked).
-#[cfg(test)]
-pub(crate) fn assign_folder_to_target(db: &Db, target: &str, folder_name: &str) -> Result<String> {
-    let resolved = resolve_folder_target(std::path::Path::new(target))?;
-    file_folder_target(db, &resolved, folder_name)
+/// Refuse, before ANY worktree exists, a folder name the batch would have to
+/// CREATE in some target repo but that fails the new-name rules. A repo that
+/// already has a matching folder accepts the name as-is (read-only lookup).
+fn preflight_new_folder_name<'a>(
+    db: &Db,
+    repo_roots: impl IntoIterator<Item = &'a str>,
+    folder_name: &str,
+) -> Result<()> {
+    for repo in repo_roots {
+        let exists = db
+            .folders_for_workspace(repo)?
+            .iter()
+            .any(|f| f.name.trim().eq_ignore_ascii_case(folder_name.trim()));
+        if !exists {
+            validate_new_folder_name(folder_name)?;
+        }
+    }
+    Ok(())
 }
 
 /// Resolve the supplied directory through Git and file/unfile that actual
@@ -766,6 +778,17 @@ fn new_batched(
             .collect()
     });
     let plan = project::plan_batched_create(&branch, &states, repos_filter.as_deref());
+
+    if let Some(name) = folder.as_deref() {
+        preflight_new_folder_name(
+            &db,
+            plan.members
+                .iter()
+                .filter(|m| matches!(m.plan, MemberPlan::Create))
+                .map(|m| m.repo_root.as_str()),
+            name,
+        )?;
+    }
 
     // Execute member by member — each independent, no rollback of siblings.
     #[derive(serde::Serialize)]
@@ -1235,8 +1258,8 @@ mod rm_tests {
 #[cfg(test)]
 mod folder_tests {
     use super::{
-        assign_folder_to_target, check_folder_fileable, clear_folder_if_registered,
-        file_registered_worktree, register_and_file_worktree, validate_folder_name,
+        check_folder_fileable, clear_folder_if_registered, file_registered_worktree,
+        register_and_file_worktree, validate_folder_name,
     };
     use thegn_core::db::Db;
     use thegn_core::store::WorkspaceStore;
@@ -1341,6 +1364,30 @@ mod folder_tests {
         assert!(row.folder_id.is_some());
     }
 
+    /// The real production halves, in the order the CLI and daemon run them.
+    fn assign(db: &Db, target: &str, name: &str) -> anyhow::Result<String> {
+        let resolved = super::resolve_folder_target(std::path::Path::new(target))?;
+        super::file_folder_target(db, &resolved, name)
+    }
+
+    #[test]
+    fn batched_preflight_refuses_a_bad_new_name_but_accepts_an_existing_one() {
+        use super::preflight_new_folder_name as pre;
+        let db = db();
+        db.put_workspace("/a", "a", "dir").unwrap();
+        db.put_workspace("/b", "b", "dir").unwrap();
+        let long = "L".repeat(80);
+        // New 65-char name: refused before anything is created.
+        assert!(pre(&db, ["/a", "/b"], &"N".repeat(65)).is_err());
+        // Existing in every target repo: accepted as-is.
+        db.ensure_folder("/a", &long).unwrap();
+        db.ensure_folder("/b", &long).unwrap();
+        assert!(pre(&db, ["/a", "/b"], &long).is_ok());
+        // Existing in only one repo: the other would CREATE it, so refused.
+        db.put_workspace("/c", "c", "dir").unwrap();
+        assert!(pre(&db, ["/a", "/c"], &long).is_err());
+    }
+
     #[test]
     fn control_assignment_registers_an_absent_row_for_a_real_git_worktree() {
         let repo = tempfile::tempdir().unwrap();
@@ -1358,7 +1405,7 @@ mod folder_tests {
             .into_owned();
         assert!(db.worktree_record(&path).unwrap().is_none());
 
-        assign_folder_to_target(&db, &path, "  Agents ").unwrap();
+        assign(&db, &path, "  Agents ").unwrap();
 
         let row = db.worktree_record(&path).unwrap().unwrap();
         assert_eq!(row.repo_root, path);
@@ -1375,7 +1422,7 @@ mod folder_tests {
         ));
         let db = db();
         let path = repo.path().canonicalize().unwrap();
-        let error = assign_folder_to_target(&db, &path.to_string_lossy(), "   ").unwrap_err();
+        let error = assign(&db, &path.to_string_lossy(), "   ").unwrap_err();
         assert!(matches!(
             error.downcast_ref::<super::FolderAssignError>(),
             Some(super::FolderAssignError::InvalidName(_))
@@ -1433,7 +1480,7 @@ mod folder_tests {
     fn control_assignment_rejects_a_plain_directory() {
         let dir = tempfile::tempdir().unwrap();
         let db = db();
-        let error = assign_folder_to_target(&db, &dir.path().to_string_lossy(), "Agents")
+        let error = assign(&db, &dir.path().to_string_lossy(), "Agents")
             .unwrap_err()
             .to_string();
         assert!(error.contains("not a git worktree"), "{error}");
