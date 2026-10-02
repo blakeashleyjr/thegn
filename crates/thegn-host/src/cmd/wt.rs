@@ -419,6 +419,9 @@ pub(crate) enum FolderAssignError {
     NotFound(String),
     /// The folder name is blank, over-long or contains control characters.
     InvalidName(String),
+    /// The worktree is already registered under a different repo — a
+    /// persistent condition, not a race.
+    RepoMismatch(String),
     /// The worktree/folder identity changed between lookup and write.
     Conflict(String),
 }
@@ -426,9 +429,11 @@ pub(crate) enum FolderAssignError {
 impl std::fmt::Display for FolderAssignError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::NotWorktree(m) | Self::NotFound(m) | Self::InvalidName(m) | Self::Conflict(m) => {
-                f.write_str(m)
-            }
+            Self::NotWorktree(m)
+            | Self::NotFound(m)
+            | Self::InvalidName(m)
+            | Self::RepoMismatch(m)
+            | Self::Conflict(m) => f.write_str(m),
         }
     }
 }
@@ -436,13 +441,24 @@ impl std::fmt::Display for FolderAssignError {
 impl std::error::Error for FolderAssignError {}
 
 /// Validate before touching the folder table: `ensure_folder` intentionally
-/// accepts empty strings for its lower-level callers.
+/// accepts empty strings for its lower-level callers. Blank is always refused;
+/// hygiene limits apply only to NEW names ([`validate_new_folder_name`]), so a
+/// folder created elsewhere (the TUI has no cap) stays assignable.
 pub(crate) fn validate_folder_name(name: &str) -> Result<String> {
     let name = name.trim();
-    let invalid = |m: String| anyhow::Error::new(FolderAssignError::InvalidName(m));
     if name.is_empty() {
-        return Err(invalid("folder name must not be empty".into()));
+        return Err(anyhow::Error::new(FolderAssignError::InvalidName(
+            "folder name must not be empty".into(),
+        )));
     }
+    Ok(name.to_string())
+}
+
+/// Hygiene for a name that would CREATE a folder: no control characters, at
+/// most [`MAX_FOLDER_NAME_CHARS`] characters.
+pub(crate) fn validate_new_folder_name(name: &str) -> Result<String> {
+    let name = validate_folder_name(name)?;
+    let invalid = |m: String| anyhow::Error::new(FolderAssignError::InvalidName(m));
     if name.chars().any(char::is_control) {
         return Err(invalid(
             "folder name must not contain control characters".into(),
@@ -463,6 +479,14 @@ pub(crate) fn validate_folder_name(name: &str) -> Result<String> {
 /// trimmed folder name.
 fn check_folder_fileable(db: &Db, repo_path: &str, folder_name: &str) -> Result<String> {
     let folder_name = validate_folder_name(folder_name)?;
+    // Same matching `ensure_folder` uses: an existing folder is accepted as-is.
+    let exists = db
+        .folders_for_workspace(repo_path)?
+        .iter()
+        .any(|f| f.name.trim().eq_ignore_ascii_case(&folder_name));
+    if !exists {
+        validate_new_folder_name(&folder_name)?;
+    }
     // TODO(THE-719 integration): downcast WorkspaceTombstonedError instead of the
     // message match the control mapper keeps for this case.
     if db.workspace_tombstoned(repo_path).unwrap_or(false) {
@@ -484,6 +508,18 @@ fn file_registered_worktree(
     folder_name: &str,
 ) -> Result<()> {
     let folder_name = check_folder_fileable(db, repo_path, folder_name)?;
+    // A row registered under a different repo can never be filed here: refuse
+    // before any write (workspace row, folder) so a rejected call leaves nothing.
+    if let Some(row) = db.worktree_record(worktree_path)?
+        && row.repo_root != repo_path
+    {
+        return Err(anyhow::Error::new(FolderAssignError::RepoMismatch(
+            format!(
+                "worktree {worktree_path} is registered under a different repository ({})",
+                row.repo_root
+            ),
+        )));
+    }
     // `folders.repo_path` REFERENCES `workspaces(repo_path)`, and that row is
     // otherwise only ever written by the compositor's hydration — so filing from
     // the CLI against a repo that has never been opened in the TUI would fail
@@ -609,7 +645,9 @@ pub(crate) fn file_folder_target(
     Ok(target.worktree_path.clone())
 }
 
-/// Shared CLI/control assignment entry point: resolve, validate, then file.
+/// Resolve, validate, then file in one call (the CLI and the daemon use the two
+/// halves separately so git runs before the DB is opened or locked).
+#[cfg(test)]
 pub(crate) fn assign_folder_to_target(db: &Db, target: &str, folder_name: &str) -> Result<String> {
     let resolved = resolve_folder_target(std::path::Path::new(target))?;
     file_folder_target(db, &resolved, folder_name)
@@ -623,14 +661,18 @@ fn folder(target: &str, name: Option<&str>, clear: bool) -> Result<()> {
     }
     let folder_name = name.map(validate_folder_name).transpose()?;
     let target = super::resolve_worktree(Some(target.to_string()));
-    let db = Db::open()?;
+    // Resolve through git BEFORE opening the DB: a non-git path must fail
+    // without opening (or creating) it.
     if let Some(folder_name) = folder_name {
-        let worktree_path = assign_folder_to_target(&db, &target.to_string_lossy(), &folder_name)?;
+        let resolved = resolve_folder_target(&target)?;
+        let db = Db::open()?;
+        let worktree_path = file_folder_target(&db, &resolved, &folder_name)?;
         outln!("Filed {worktree_path} into folder \"{folder_name}\"");
     } else {
         let worktree_path = resolve_worktree_root(&target)?
             .to_string_lossy()
             .into_owned();
+        let db = Db::open()?;
         // Never register on --clear: an unregistered worktree has no folder.
         if clear_folder_if_registered(&db, &worktree_path)? {
             outln!("Unfiled {worktree_path}");
@@ -1343,11 +1385,48 @@ mod folder_tests {
 
     #[test]
     fn folder_names_reject_control_characters_and_overlong_names() {
-        assert!(validate_folder_name("a\tb").is_err());
-        assert!(validate_folder_name("a\u{7}").is_err());
+        use super::validate_new_folder_name as new_name;
+        assert!(new_name("a\tb").is_err());
+        assert!(new_name("a\u{7}").is_err());
         let max = "é".repeat(super::MAX_FOLDER_NAME_CHARS);
-        assert_eq!(validate_folder_name(&max).unwrap(), max);
-        assert!(validate_folder_name(&format!("{max}x")).is_err());
+        assert_eq!(new_name(&max).unwrap(), max);
+        assert!(new_name(&format!("{max}x")).is_err());
+        assert!(validate_folder_name("   ").is_err());
+    }
+
+    #[test]
+    fn existing_overlong_folder_stays_assignable_but_a_new_one_is_rejected() {
+        let db = db();
+        let long = "L".repeat(80);
+        // Created elsewhere (TUI has no cap).
+        db.put_workspace("/repo", "repo", "dir").unwrap();
+        db.ensure_folder("/repo", &long).unwrap();
+        assert_eq!(
+            check_folder_fileable(&db, "/repo", &format!(" {} ", long.to_lowercase())).unwrap(),
+            long.to_lowercase()
+        );
+        assert!(check_folder_fileable(&db, "/repo", &"M".repeat(80)).is_err());
+        assert!(check_folder_fileable(&db, "/repo", "  ").is_err());
+    }
+
+    #[test]
+    fn repo_mismatch_writes_nothing() {
+        let db = db();
+        db.put_worktree("o/main", "/other", "/repo/wt", "main", None, None)
+            .unwrap();
+        let err =
+            register_and_file_worktree(&db, "/repo", "/repo/wt", "main", "Agents").unwrap_err();
+        assert!(matches!(
+            err.downcast_ref::<super::FolderAssignError>(),
+            Some(super::FolderAssignError::RepoMismatch(_))
+        ));
+        assert!(db.folders_for_workspace("/repo").unwrap().is_empty());
+        assert!(
+            !db.workspaces()
+                .unwrap()
+                .iter()
+                .any(|w| w.repo_path == "/repo")
+        );
     }
 
     #[test]
