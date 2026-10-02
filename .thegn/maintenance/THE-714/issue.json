@@ -1,0 +1,9 @@
+{
+  "id": "THE-714",
+  "title": "Headless worktree creation has no config path for a default sidebar folder",
+  "url": "https://linear.app/blakeashley/issue/THE-714",
+  "status": "Backlog",
+  "priority": "No priority",
+  "team": "Thegn",
+  "description": "Split out of THE-696 (2026-09-29). THE-696 delivered `thegn wt folder <worktree> <name>` and `thegn wt new --folder <name>`, but no config default.\n\nTHE-696 originally asked for `[[worktree_templates]].folder`. That would be dead config: `WorktreeTemplate` is not referenced anywhere under `crates/thegn-host/src/cmd/`; headless creation has no template selection.\n\nThis issue is the remaining convenience: a default so a caller that does not pass `--folder` still gets its worktree filed.\n\nOptions considered:\n1. A plain key (e.g. a `default_folder` key in the table `wt new` already reads its defaults from) that headless creation reads directly. Simplest; needs no template selection.\n2. `[[worktree_templates]].folder` \u2014 requires first defining how `wt new` selects a template.\n3. A pipeline-level default \u2014 note `session open --stage` does not create a worktree.\n\n## Acceptance criteria\n- A worktree created headlessly with no `--folder` is filed according to the configured default.\n- An explicit `--folder` overrides the default.\n- Repo-scoped like folders; find-or-create still yields one folder across repeated runs.\n- An empty/whitespace-only configured name is refused at config validation, not at creation time.\n- The new key is covered by the config ratchets (`config.toml.example` key coverage, the env overlay, the completion slot)."
+}
