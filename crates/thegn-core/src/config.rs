@@ -5612,7 +5612,9 @@ impl ConfigOverlay {
         set!(base.base_branch, self.base_branch);
         set!(base.window_margin, self.window_margin);
         set!(base.branch_prefix, self.branch_prefix);
-        set!(base.default_folder, self.default_folder);
+        if let Some(v) = self.default_folder {
+            base.default_folder = Some(v);
+        }
         set!(base.picker, self.picker);
         set!(base.git.backend, self.git_backend);
         set!(base.git.structural_diff, self.git_structural_diff);
