@@ -24,7 +24,7 @@ fn request_args(repository: &GithubRepository, number: u64) -> Vec<String> {
 
 pub(super) fn fetch(loc: &GitLoc, provider: &str, number: u64) -> Result<PrAuthorship, GhError> {
     let origin = loc
-        .git_out(&["remote", "get-url", "origin"])
+        .origin_url()
         .ok_or(GhError::NotConfigured("PR origin unavailable".into()))?;
     let repository = GithubRepository::from_origin(&origin).ok_or(GhError::NotConfigured(
         "PR origin has an unsupported authority form".into(),
