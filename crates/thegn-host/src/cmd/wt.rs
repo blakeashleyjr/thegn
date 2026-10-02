@@ -493,12 +493,33 @@ fn register_and_file_worktree(
 
 /// `--clear`: unfile an existing row without ever creating one. Returns whether
 /// a row existed.
-fn clear_folder_if_registered(db: &Db, worktree_path: &str) -> Result<bool> {
+pub(crate) fn clear_folder_if_registered(db: &Db, worktree_path: &str) -> Result<bool> {
     if db.worktree_record(worktree_path)?.is_none() {
         return Ok(false);
     }
     db.set_worktree_folder(worktree_path, None)?;
     Ok(true)
+}
+
+/// Shared CLI/control assignment entry point. Resolve the path to its actual
+/// worktree root and repo, derive the live branch identity, then use the same
+/// register-and-file helper as `thegn wt folder`.
+pub(crate) fn assign_folder_to_target(db: &Db, target: &str, folder_name: &str) -> Result<String> {
+    let target = std::path::Path::new(target);
+    let worktree_root = thegn_core::repo::worktree_root_for_cwd(target)
+        .ok_or_else(|| anyhow::anyhow!("not a git worktree: {}", target.display()))?;
+    let repo_root = thegn_core::repo::main_worktree(&worktree_root)
+        .ok_or_else(|| anyhow::anyhow!("not a git worktree: {}", target.display()))?;
+    let branch = util::git_out(&worktree_root, &["symbolic-ref", "--short", "-q", "HEAD"])
+        .or_else(|| {
+            util::git_out(&worktree_root, &["rev-parse", "--short", "HEAD"])
+                .map(|commit| format!("detached-{commit}"))
+        })
+        .ok_or_else(|| anyhow::anyhow!("could not determine worktree identity"))?;
+    let repo_path = repo_root.to_string_lossy().into_owned();
+    let worktree_path = worktree_root.to_string_lossy().into_owned();
+    register_and_file_worktree(db, &repo_path, &worktree_path, &branch, folder_name)?;
+    Ok(worktree_path)
 }
 
 /// Resolve the supplied directory through Git and file/unfile that actual
@@ -1090,8 +1111,8 @@ mod rm_tests {
 #[cfg(test)]
 mod folder_tests {
     use super::{
-        check_folder_fileable, clear_folder_if_registered, file_registered_worktree,
-        register_and_file_worktree, validate_folder_name,
+        assign_folder_to_target, check_folder_fileable, clear_folder_if_registered,
+        file_registered_worktree, register_and_file_worktree, validate_folder_name,
     };
     use thegn_core::db::Db;
     use thegn_core::store::WorkspaceStore;
@@ -1197,6 +1218,42 @@ mod folder_tests {
     }
 
     #[test]
+    fn control_assignment_registers_an_absent_row_for_a_real_git_worktree() {
+        let repo = tempfile::tempdir().unwrap();
+        let init = std::process::Command::new("git")
+            .args(["init", "--initial-branch=main"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        assert!(
+            init.status.success(),
+            "{}",
+            String::from_utf8_lossy(&init.stderr)
+        );
+        let db = db();
+        let path = repo.path().to_string_lossy().into_owned();
+        assert!(db.worktree_record(&path).unwrap().is_none());
+
+        assign_folder_to_target(&db, &path, "  Agents ").unwrap();
+
+        let row = db.worktree_record(&path).unwrap().unwrap();
+        assert_eq!(row.repo_root, path);
+        assert!(row.folder_id.is_some());
+        assert_eq!(db.folders_for_workspace(&path).unwrap()[0].name, "Agents");
+    }
+
+    #[test]
+    fn control_assignment_rejects_a_plain_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = db();
+        let error = assign_folder_to_target(&db, &dir.path().to_string_lossy(), "Agents")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not a git worktree"), "{error}");
+        assert!(db.worktrees().unwrap().is_empty());
+    }
+
+    #[test]
     fn folders_are_repo_scoped_and_foreign_identity_is_rejected() {
         let db = db();
         register_and_file_worktree(&db, "/repo/a", "/repo/a/wt", "same", "Pipeline").unwrap();
@@ -1223,11 +1280,59 @@ mod folder_tests {
     }
 
     #[test]
-    fn clearing_unfiles_without_deleting_the_folder() {
+    fn renamed_folder_identity_race_is_rejected() {
         let db = db();
         register_and_file_worktree(&db, "/repo", "/repo/wt", "feature", "Pipeline").unwrap();
         let folder = db.folders_for_workspace("/repo").unwrap().remove(0);
         db.set_worktree_folder("/repo/wt", None).unwrap();
+        db.rename_folder(folder.folder_id, "Renamed").unwrap();
+
+        assert!(
+            !db.set_worktree_folder_if_identity(
+                "/repo/wt",
+                "/repo",
+                folder.folder_id,
+                &folder.name,
+            )
+            .unwrap(),
+            "a rename between lookup and the identity-checked write must fail"
+        );
+        assert_eq!(
+            db.worktree_record("/repo/wt").unwrap().unwrap().folder_id,
+            None,
+            "a stale identity must not file the worktree"
+        );
+    }
+
+    #[test]
+    fn deleted_folder_identity_race_is_rejected() {
+        let db = db();
+        register_and_file_worktree(&db, "/repo", "/repo/wt", "feature", "Pipeline").unwrap();
+        let folder = db.folders_for_workspace("/repo").unwrap().remove(0);
+        db.set_worktree_folder("/repo/wt", None).unwrap();
+        db.del_folder(folder.folder_id).unwrap();
+
+        assert!(
+            !db.set_worktree_folder_if_identity(
+                "/repo/wt",
+                "/repo",
+                folder.folder_id,
+                &folder.name,
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            db.worktree_record("/repo/wt").unwrap().unwrap().folder_id,
+            None
+        );
+    }
+
+    #[test]
+    fn clearing_unfiles_without_deleting_the_folder() {
+        let db = db();
+        register_and_file_worktree(&db, "/repo", "/repo/wt", "feature", "Pipeline").unwrap();
+        let folder = db.folders_for_workspace("/repo").unwrap().remove(0);
+        assert!(clear_folder_if_registered(&db, "/repo/wt").unwrap());
 
         assert_eq!(
             db.worktree_record("/repo/wt").unwrap().unwrap().folder_id,

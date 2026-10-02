@@ -60,6 +60,7 @@ fn wire_schema() -> serde_json::Value {
         AutomationTestReply,
         ToolRunRequest,
         WorktreeCreateReq,
+        FolderAssignReq,
         DispatchPutReq,
         SessionRecord,
         ErrorBody,

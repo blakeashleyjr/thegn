@@ -109,6 +109,27 @@ pub const STATE_TOOLS: &[StateToolSpec] = &[
         args: &[],
     },
     StateToolSpec {
+        cap: "folders.assign",
+        description: "Assign a repo-local sidebar folder to a Git worktree, or clear its folder. \
+                      Folder names are trimmed and matched case-insensitively within that \
+                      worktree's repository. Clearing never deletes the folder. Git-scoped; \
+                      requires a running daemon.",
+        args: &[
+            ArgSpec {
+                name: "worktree",
+                kind: ArgKind::String,
+                required: true,
+                description: "Path inside the Git worktree",
+            },
+            ArgSpec {
+                name: "folder",
+                kind: ArgKind::String,
+                required: false,
+                description: "Folder name to assign; omit to clear",
+            },
+        ],
+    },
+    StateToolSpec {
         cap: "editor.open",
         description: "Queue a worktree or one of its relative files for handoff to the owning \
                       compositor's locally configured editor. The request never selects an \
@@ -567,6 +588,7 @@ pub const STATE_TOOLS: &[StateToolSpec] = &[
 pub const MCP_STATE_CAPS: &[&str] = &[
     "sessions.list",
     "worktrees.list",
+    "folders.assign",
     "editor.open",
     "preview.fetch",
     "leases.list",
@@ -855,6 +877,34 @@ mod tests {
         assert_eq!(names, ["col", "line", "path", "worktree"]);
         assert_eq!(schema["required"], json!(["worktree"]));
         assert_eq!(schema["additionalProperties"], json!(false));
+    }
+
+    #[test]
+    fn folder_assignment_exposes_optional_folder_and_routes_the_mutation() {
+        let r = StateRouter::new(vec!["folders.assign"], |cap, args| {
+            Ok(json!({ "cap": cap, "args": args }))
+        });
+        let entries = r.tool_entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["name"], "folders_assign");
+        assert_eq!(entries[0]["inputSchema"]["required"], json!(["worktree"]));
+        assert_eq!(
+            entries[0]["inputSchema"]["properties"]["folder"]["type"],
+            "string"
+        );
+        let result = r
+            .call(
+                "folders_assign",
+                &json!({ "worktree": "/repo/wt", "folder": " Agents " }),
+            )
+            .unwrap()
+            .unwrap();
+        assert!(
+            result["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("folders.assign")
+        );
     }
 
     #[test]

@@ -2002,6 +2002,64 @@ impl ControlApi for DaemonService {
         })
     }
 
+    fn folder_assign(
+        &self,
+        req: thegn_svc::control::FolderAssignReq,
+    ) -> BoxFuture<'_, ControlResult<()>> {
+        Box::pin(async move {
+            if req.worktree.trim().is_empty() {
+                return Err(ControlError::InvalidArgument(
+                    "folders.assign requires a worktree path".into(),
+                ));
+            }
+            if !std::path::Path::new(&req.worktree).is_absolute() {
+                return Err(ControlError::InvalidArgument(
+                    "folders.assign worktree path must be absolute".into(),
+                ));
+            }
+            self.with_db(move |db| {
+                if let Some(folder) = req.folder.as_deref() {
+                    crate::cmd::wt::assign_folder_to_target(db, &req.worktree, folder)?;
+                    Ok(())
+                } else {
+                    let target = std::path::Path::new(&req.worktree);
+                    let root =
+                        thegn_core::repo::worktree_root_for_cwd(target).ok_or_else(|| {
+                            anyhow::anyhow!("not a git worktree: {}", target.display())
+                        })?;
+                    let worktree = root.to_string_lossy().into_owned();
+                    if crate::cmd::wt::clear_folder_if_registered(db, &worktree)? {
+                        Ok(())
+                    } else {
+                        anyhow::bail!("worktree is not registered: {worktree}");
+                    }
+                }
+            })
+            .await
+            .map_err(|error| {
+                let message = error.to_string();
+                if message.contains("not a git worktree")
+                    || message.contains("folder name")
+                    || message.contains("worktree is not registered")
+                {
+                    if message.contains("worktree is not registered") {
+                        ControlError::NotFound(message)
+                    } else {
+                        ControlError::InvalidArgument(message)
+                    }
+                } else if message.contains("identity changed")
+                    || message.contains("folder disappeared")
+                {
+                    ControlError::Conflict(message)
+                } else if message.contains("workspace ") && message.contains("was removed") {
+                    ControlError::FailedPrecondition(message)
+                } else {
+                    ControlError::Internal(anyhow::anyhow!(message))
+                }
+            })
+        })
+    }
+
     /// `agent.sessions`: a bounded filesystem scan of each harness's local
     /// session store. Off the runtime's worker threads (`spawn_blocking`) — it
     /// reads potentially many transcript heads. The DB supplies the tracked

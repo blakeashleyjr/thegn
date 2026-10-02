@@ -22,6 +22,8 @@ service Control {
   rpc OpenEditor(OpenEditorRequest) returns (OpenEditorReply);
   // Worktrees registered with thegn (path, branch, repo root, location).
   rpc ListWorktrees(ListWorktreesRequest) returns (ListWorktreesReply);
+  // Assign or clear a repo-local sidebar folder for a worktree.
+  rpc AssignWorktreeFolder(AssignWorktreeFolderRequest) returns (Empty);
   // Bounded, credential-free preview HTTP GET.
   rpc PreviewFetch(PreviewFetchRequest) returns (PreviewFetchReply);
   // Block until a session reaches a state (idle, exit, pattern) — observes only.
@@ -140,6 +142,10 @@ message OpenEditorReply { bool queued = 1; }
 
 message ListWorktreesRequest {}
 message ListWorktreesReply { repeated WorktreeInfo worktrees = 1; }
+message AssignWorktreeFolderRequest {
+  string worktree = 1;
+  optional string folder = 2; // absent = clear
+}
 message WorktreeInfo {
   string path = 1;
   string branch = 2;
