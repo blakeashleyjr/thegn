@@ -109,6 +109,10 @@ impl NotifyState {
         self.delivery.clone()
     }
 
+    pub(crate) fn shutdown_sound(&self) {
+        self.sound_runtime.shutdown();
+    }
+
     /// Atomically publish a reloaded notification config and its matching push
     /// sender. Producers lock these same fields in this order, so a reload
     /// cannot expose new sink names/flavors with the previous worker (or the
