@@ -2315,7 +2315,7 @@ mod tests {
         {
             let db = service.db.lock().unwrap();
             db.put_workspace(&key, "repo", "repo").unwrap();
-            db.ensure_folder(&key, &long).unwrap();
+            db.ensure_folder(&key, &long, "repo", "repo").unwrap();
         }
         service
             .folder_assign(folder_req(&path, Some(&long), false))
