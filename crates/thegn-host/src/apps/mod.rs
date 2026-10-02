@@ -53,7 +53,16 @@ pub enum SlotState {
     /// Live and drivable.
     Running(Box<dyn AppTile>),
     /// Construction or the connection failed; carries a user-facing reason.
-    Failed(String),
+    Failed(
+        #[cfg_attr(
+            not(test),
+            expect(
+                dead_code,
+                reason = "cause is logged at build; retained for tests and Debug"
+            )
+        )]
+        String,
+    ),
 }
 
 impl SlotState {
@@ -97,11 +106,9 @@ impl AppSlot {
         match &self.state {
             SlotState::Running(t) => t.title(),
             SlotState::Starting => format!("{}…", self.label),
-            SlotState::Failed(error) => {
-                let short: String = error.chars().take(32).collect();
-                let ellipsis = if short.len() < error.len() { "…" } else { "" };
-                format!("{} (failed: {short}{ellipsis})", self.label)
-            }
+            // The cause is logged when the build fails; a tab chip has no
+            // room for it.
+            SlotState::Failed(_) => format!("{} (failed)", self.label),
             _ => self.label.clone(),
         }
     }
@@ -633,10 +640,7 @@ mod tests {
         assert!(
             matches!(slot.state, SlotState::Failed(ref error) if error == "injected spawn failure")
         );
-        assert_eq!(
-            slot.chip_label(),
-            "Observe (failed: injected spawn failure)"
-        );
+        assert_eq!(slot.chip_label(), "Observe (failed)");
     }
 
     #[test]
@@ -669,10 +673,7 @@ mod tests {
         host.reconcile(&cfg);
         assert_eq!(host.active_id(), Some("observe"));
         // The retained Failed slot keeps its visible failure chip.
-        assert_eq!(
-            host.tab_labels(),
-            vec!["work", "Observe (failed: retained)"]
-        );
+        assert_eq!(host.tab_labels(), vec!["work", "Observe (failed)"]);
         assert!(matches!(host.slots[0].state, SlotState::Failed(_)));
         let slot_address = &host.slots[0] as *const AppSlot;
         host.reconcile(&cfg);
