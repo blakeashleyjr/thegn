@@ -738,14 +738,31 @@ impl WorkspaceStore for Db {
     /// (case-insensitive, trimmed) and return its id, creating it if absent.
     /// This is the find-or-create primitive behind the "file worktree into
     /// folder" actions, so repeated firing never spawns duplicate folders.
-    fn ensure_folder(&self, repo_path: &str, name: &str) -> Result<i64> {
+    fn ensure_folder(
+        &self,
+        repo_path: &str,
+        name: &str,
+        workspace_name: &str,
+        workspace_kind: &str,
+    ) -> Result<i64> {
         let want = name.trim();
-        for f in self.folders_for_workspace(repo_path)? {
-            if f.name.trim().eq_ignore_ascii_case(want) {
-                return Ok(f.folder_id);
+        self.transaction(|db| {
+            // A failed tombstone read propagates through `?`: uncertainty must
+            // never be treated as permission to resurrect a removed workspace.
+            if db.workspace_tombstoned(repo_path)? {
+                return Err(crate::store::workspace::WorkspaceTombstonedError {
+                    repo_path: repo_path.to_string(),
+                }
+                .into());
             }
-        }
-        self.create_folder(repo_path, want)
+            db.put_workspace(repo_path, workspace_name, workspace_kind)?;
+            for folder in db.folders_for_workspace(repo_path)? {
+                if folder.name.trim().eq_ignore_ascii_case(want) {
+                    return Ok(folder.folder_id);
+                }
+            }
+            db.create_folder(repo_path, want)
+        })
     }
 
     /// File (or unfile, with `None`) a single worktree into a folder.

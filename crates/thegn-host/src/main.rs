@@ -286,6 +286,7 @@ mod wire;
 mod wizard;
 mod worker_failure;
 mod workspace_create;
+mod workspace_identity;
 mod workspace_picker;
 mod workspace_pool;
 mod worktree_lifecycle;
