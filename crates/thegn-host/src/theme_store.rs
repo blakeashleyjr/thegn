@@ -192,12 +192,15 @@ impl Drop for ThemeStore {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Release);
         if let Some(request) = &self.request {
+            // best-effort: worker may already have exited; the flag alone ends it
             let _ = request.send(Work::Shutdown);
         }
         if let Some(worker) = self.worker.take() {
             // Shutdown completes after the current filesystem operation and
             // every user mutation accepted before Drop; watcher work is dropped.
-            let _ = worker.join();
+            if worker.join().is_err() {
+                tracing::warn!(target: "thegn::theme", "theme store worker panicked");
+            }
         }
     }
 }
@@ -827,8 +830,6 @@ mod tests {
                 overrides: None,
             })))
             .unwrap();
-        shutdown.store(true, Ordering::Release);
-        request_tx.send(Work::Shutdown).unwrap();
         drop(request_tx);
         worker.join().unwrap();
 
@@ -994,9 +995,11 @@ mod tests {
         for cycle in 0..8 {
             let themes = dir.join(format!("themes-{cycle}"));
             let store = ThemeStore::start(None, themes, dir.join("config.toml"));
+            let probe = store.request.clone().unwrap();
             drop_with_timeout(store);
+            // The worker owns the only receiver; a failed send proves it exited.
+            assert!(probe.send(Work::Changed).is_err());
         }
-        // Each joined owner has dropped its watcher before the next cycle starts.
         let _ = std::fs::remove_dir_all(dir);
     }
 
