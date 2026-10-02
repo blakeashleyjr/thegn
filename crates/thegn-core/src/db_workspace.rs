@@ -755,7 +755,14 @@ impl WorkspaceStore for Db {
                 }
                 .into());
             }
-            db.put_workspace(repo_path, workspace_name, workspace_kind)?;
+            // Insert-if-absent: folder bookkeeping must never modify an
+            // existing workspace row (name, kind, position, last_active).
+            db.conn().execute(
+                r#"INSERT INTO workspaces(repo_path,name,created_at,last_active,kind,position)
+                   VALUES(?1,?2,?3,?3,?4,(SELECT COALESCE(MAX(position),-1)+1 FROM workspaces))
+                   ON CONFLICT(repo_path) DO NOTHING"#,
+                params![repo_path, workspace_name, util::now(), workspace_kind],
+            )?;
             for folder in db.folders_for_workspace(repo_path)? {
                 if folder.name.trim().eq_ignore_ascii_case(want) {
                     return Ok(folder.folder_id);

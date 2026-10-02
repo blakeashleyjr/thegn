@@ -2072,6 +2072,43 @@ fn ensure_folder_preserves_existing_workspace_kind_and_position() {
 }
 
 #[test]
+fn ensure_folder_never_modifies_existing_workspace_and_creates_absent_one() {
+    let db = db();
+    db.put_workspace("/x/app", "original", "dir").unwrap();
+    db.conn()
+        .execute(
+            "UPDATE workspaces SET last_active=12345 WHERE repo_path='/x/app'",
+            [],
+        )
+        .unwrap();
+
+    db.ensure_folder("/x/app", "Merging", "app", "repo")
+        .unwrap();
+    let (name, last_active): (String, i64) = db
+        .conn()
+        .query_row(
+            "SELECT name, last_active FROM workspaces WHERE repo_path='/x/app'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(name, "original");
+    assert_eq!(last_active, 12345);
+
+    db.ensure_folder("/x/new", "Merging", "new", "repo")
+        .unwrap();
+    let name: String = db
+        .conn()
+        .query_row(
+            "SELECT name FROM workspaces WHERE repo_path='/x/new'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(name, "new");
+}
+
+#[test]
 fn set_worktree_folder_round_trips() {
     let db = db();
     db.put_workspace("/x/app", "app", "repo").unwrap();
