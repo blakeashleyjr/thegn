@@ -1227,6 +1227,7 @@ pub struct IssuesQuery {
 /// Repo context alone, for `issues.get` / `update` / `comment` — they take no
 /// status/limit/project/query filters, so those must not even parse.
 #[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct IssueRepoQuery {
     /// Filesystem path on the daemon host used to apply a repo's `[issues]` overlay.
     #[serde(default)]
