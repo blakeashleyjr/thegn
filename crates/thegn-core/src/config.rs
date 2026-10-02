@@ -5113,6 +5113,9 @@ pub struct Config {
     pub base_branch: String,
     pub window_margin: usize,
     pub branch_prefix: String,
+    /// Folder assigned to headlessly created worktrees when `wt new --folder`
+    /// is omitted. `None` preserves the unfiled default.
+    pub default_folder: Option<String>,
     pub picker: Picker,
     pub worktree_mode: WorktreeMode,
     pub name_scheme: NameScheme,
@@ -5386,6 +5389,7 @@ impl Default for Config {
             base_branch: "auto".into(),
             window_margin: 0,
             branch_prefix: "tg/".into(),
+            default_folder: None,
             picker: Picker::Auto,
             worktree_mode: WorktreeMode::Global,
             name_scheme: NameScheme::Words,
@@ -5520,6 +5524,7 @@ pub struct ConfigOverlay {
     pub base_branch: Option<String>,
     pub window_margin: Option<usize>,
     pub branch_prefix: Option<String>,
+    pub default_folder: Option<String>,
     pub picker: Option<Picker>,
     pub git_backend: Option<GitBackendKind>,
     pub git_structural_diff: Option<StructuralDiff>,
@@ -5610,6 +5615,9 @@ impl ConfigOverlay {
         set!(base.base_branch, self.base_branch);
         set!(base.window_margin, self.window_margin);
         set!(base.branch_prefix, self.branch_prefix);
+        if let Some(v) = self.default_folder {
+            base.default_folder = Some(v);
+        }
         set!(base.picker, self.picker);
         set!(base.git.backend, self.git_backend);
         set!(base.git.structural_diff, self.git_structural_diff);
@@ -5792,6 +5800,7 @@ pub fn env_overlay(env: &dyn EnvSource) -> ConfigOverlay {
     o.workspaces_dir = canonical_projects_dir.or(legacy_workspaces_dir);
     o.base_branch = env.get("THEGN_BASE_BRANCH");
     o.branch_prefix = env.get("THEGN_BRANCH_PREFIX");
+    o.default_folder = env.get("THEGN_DEFAULT_FOLDER");
     if let Some(v) = env.get("THEGN_MERGE_QUEUE_GATE_TIMEOUT_SECS") {
         o.merge_queue_gate_timeout_secs = parse_num(v, "THEGN_MERGE_QUEUE_GATE_TIMEOUT_SECS");
     }
@@ -7246,6 +7255,7 @@ impl Config {
             "projects_dir" => self.workspaces_dir.clone(),
             "base_branch" => self.base_branch.clone(),
             "branch_prefix" => self.branch_prefix.clone(),
+            "default_folder" => self.default_folder.clone().unwrap_or_default(),
             "picker" => self.picker.to_string(),
             "worktree_mode" => self.worktree_mode.to_string(),
             "name_scheme" => self.name_scheme.to_string(),
