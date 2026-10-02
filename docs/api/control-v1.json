@@ -658,6 +658,7 @@
       "type": "object"
     },
     "IssueRepoQuery": {
+      "additionalProperties": false,
       "description": "Repo context alone, for `issues.get` / `update` / `comment` — they take no status/limit/project/query filters, so those must not even parse.",
       "properties": {
         "repo": {

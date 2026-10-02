@@ -1816,6 +1816,21 @@ async fn issue_routes_forward_optional_repo_context() {
 }
 
 #[tokio::test]
+async fn issue_get_rejects_list_filters_with_400() {
+    let r = rig(false);
+    let admin = token(&r, "admin");
+    let request = Request::builder()
+        .method("GET")
+        .uri("/v1/issues/ABC?status=open")
+        .header("authorization", format!("Bearer {admin}"))
+        .body(Body::empty())
+        .unwrap();
+    let response = router(r.state.clone()).oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(r.api.calls().is_empty());
+}
+
+#[tokio::test]
 async fn malformed_issue_identity_reaches_no_control_api_operation() {
     for encoded in [
         "linear%3Abad%20key",

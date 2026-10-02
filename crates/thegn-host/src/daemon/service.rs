@@ -462,49 +462,65 @@ fn issue_repo_unregistered(repo: &str) -> ControlError {
     ))
 }
 
-/// Resolve an issues `repo` context to a REGISTERED repo root. `requested` must
-/// be a registered workspace root or a registered worktree path; the root
-/// returned is the registry's own (a worktree's `repo_root`), so no git is run
-/// on a caller-supplied path. Local rows tolerate canonical aliases (same rule
-/// as [`registered_worktree_matches`]); remote rows match only exactly.
+/// Where an issues `repo` context resolves to.
+#[derive(Debug, PartialEq, Eq)]
+enum IssueRoot {
+    /// A registered local repo root whose overlay applies.
+    Repo(std::path::PathBuf),
+    /// Registered but non-local (remote/provider): never touch the host
+    /// filesystem for it, so the global config applies.
+    Global,
+}
+
+/// Resolve an issues `repo` context to a REGISTERED location. `requested` must
+/// be a registered workspace root or a registered worktree path. No git is run;
+/// the only filesystem access is `canonicalize` for the alias fallback (done
+/// outside the DB lock), never on an exact match and never for remote rows —
+/// an exact match to a remote row is registered but yields [`IssueRoot::Global`].
+/// The root returned is the registry's own, never the caller's string.
 fn registered_issue_root<F>(
     workspaces: &[thegn_core::models::WorkspaceRow],
     worktrees: &[thegn_core::models::WorktreeRow],
     requested: &str,
     canonicalize: F,
-) -> Option<std::path::PathBuf>
+) -> Option<IssueRoot>
 where
     F: Fn(&str) -> std::path::PathBuf,
 {
+    let is_local = |row: &thegn_core::models::WorktreeRow| {
+        let location = row.location.trim();
+        location.is_empty() || location == "local"
+    };
     if let Some(w) = workspaces.iter().find(|w| w.repo_path == requested) {
-        return Some(std::path::PathBuf::from(&w.repo_path));
+        return Some(IssueRoot::Repo(std::path::PathBuf::from(&w.repo_path)));
     }
     if let Some(row) = worktrees.iter().find(|r| r.worktree == requested) {
-        return Some(std::path::PathBuf::from(&row.repo_root));
+        return Some(if is_local(row) {
+            IssueRoot::Repo(std::path::PathBuf::from(&row.repo_root))
+        } else {
+            IssueRoot::Global
+        });
     }
     let want = canonicalize(requested);
     if let Some(w) = workspaces
         .iter()
         .find(|w| canonicalize(&w.repo_path) == want)
     {
-        return Some(std::path::PathBuf::from(&w.repo_path));
+        return Some(IssueRoot::Repo(std::path::PathBuf::from(&w.repo_path)));
     }
     worktrees
         .iter()
-        .filter(|row| {
-            let location = row.location.trim();
-            location.is_empty() || location == "local"
-        })
+        .filter(|row| is_local(row))
         .find(|row| canonicalize(&row.worktree) == want)
-        .map(|row| std::path::PathBuf::from(&row.repo_root))
+        .map(|row| IssueRoot::Repo(std::path::PathBuf::from(&row.repo_root)))
 }
 
 impl DaemonService {
     /// The `[issues]` config for an issues verb. `None` keeps the global
     /// config unchanged. An explicit `repo` is validated (non-empty, absolute)
-    /// and CONFINED to the registry BEFORE any git or file access — a
+    /// and CONFINED to the registry before any overlay file is read — a
     /// token-holding remote client must not make the daemon read an arbitrary
-    /// path — then the repo's restrict-only overlay is applied.
+    /// path. Matching runs no git and canonicalizes only outside the DB lock.
     async fn issue_config_for_repo(
         &self,
         repo: Option<&str>,
@@ -518,28 +534,27 @@ impl DaemonService {
                 shown_path(repo)
             )));
         }
-        let requested = repo.to_string();
-        let root = self
-            .with_db(move |db| {
+        // Copy the candidate rows out under the lock; match without it.
+        let (workspaces, worktrees) = self
+            .with_db(|db| {
                 use thegn_core::store::WorkspaceStore;
-                let workspaces = db.workspaces()?;
-                let worktrees = db.worktrees()?;
-                Ok(registered_issue_root(
-                    &workspaces,
-                    &worktrees,
-                    &requested,
-                    |path| {
-                        std::fs::canonicalize(path)
-                            .unwrap_or_else(|_| std::path::PathBuf::from(path))
-                    },
-                ))
+                Ok((db.workspaces()?, db.worktrees()?))
             })
-            .await?
-            .ok_or_else(|| issue_repo_unregistered(repo))?;
+            .await?;
+        let requested = repo.to_string();
         let config = self.config.clone();
-        tokio::task::spawn_blocking(move || config.repo_issues(Some(&root)))
-            .await
-            .map_err(|e| ControlError::Internal(anyhow::anyhow!("issues repo resolution: {e}")))
+        let resolved = tokio::task::spawn_blocking(move || {
+            registered_issue_root(&workspaces, &worktrees, &requested, |path| {
+                std::fs::canonicalize(path).unwrap_or_else(|_| std::path::PathBuf::from(path))
+            })
+            .map(|root| match root {
+                IssueRoot::Repo(root) => config.repo_issues(Some(&root)),
+                IssueRoot::Global => config.issues.clone(),
+            })
+        })
+        .await
+        .map_err(|e| ControlError::Internal(anyhow::anyhow!("issues repo resolution: {e}")))?;
+        resolved.ok_or_else(|| issue_repo_unregistered(repo))
     }
 }
 
@@ -2216,6 +2231,61 @@ mod tests {
         }
     }
 
+    fn ws(path: &str) -> thegn_core::models::WorkspaceRow {
+        thegn_core::models::WorkspaceRow {
+            repo_path: path.into(),
+            name: "w".into(),
+            created_at: 0,
+            last_active: 0,
+            kind: "repo".into(),
+        }
+    }
+
+    fn wt_row(path: &str, root: &str, location: &str) -> thegn_core::models::WorktreeRow {
+        use thegn_core::store::WorkspaceStore;
+        let db = Db::open_memory().unwrap();
+        db.put_worktree("t", root, path, "b", Some(location), None)
+            .unwrap();
+        db.worktrees().unwrap().remove(0)
+    }
+
+    #[test]
+    fn registered_issue_root_matching_rules() {
+        use std::path::PathBuf;
+        let workspaces = [ws("/r")];
+        let local = wt_row("/r-wt", "/r", "local");
+        let remote = wt_row("/prov/wt", "/r", r#"{"kind":"provider"}"#);
+        let rows = [local, remote];
+        let panics =
+            |_: &str| -> PathBuf { panic!("canonicalizer must not run on an exact match") };
+        // exact workspace + exact local worktree: registry root, no canonicalize
+        assert_eq!(
+            registered_issue_root(&workspaces, &rows, "/r", panics),
+            Some(IssueRoot::Repo("/r".into()))
+        );
+        assert_eq!(
+            registered_issue_root(&workspaces, &rows, "/r-wt", panics),
+            Some(IssueRoot::Repo("/r".into()))
+        );
+        // exact remote match: registered, global, no canonicalize
+        assert_eq!(
+            registered_issue_root(&workspaces, &rows, "/prov/wt", panics),
+            Some(IssueRoot::Global)
+        );
+        // alias of a local worktree matches and returns the registry root
+        let alias = |p: &str| PathBuf::from(p.replace("/alias", "/r-wt"));
+        assert_eq!(
+            registered_issue_root(&workspaces, &rows, "/alias", alias),
+            Some(IssueRoot::Repo("/r".into()))
+        );
+        // a path that canonicalizes equal to a REMOTE row is not alias-matched
+        let to_remote = |p: &str| PathBuf::from(p.replace("/alias", "/prov/wt"));
+        assert_eq!(
+            registered_issue_root(&workspaces, &rows, "/alias", to_remote),
+            None
+        );
+    }
+
     #[tokio::test]
     async fn issue_repo_context_applies_overlay_for_registered_root_and_worktree() {
         use crate::repo_issues::test_support::{overlay_repo, two_account_config};
@@ -2250,8 +2320,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn issue_repo_context_miss_is_uniform_and_runs_no_git() {
-        use crate::repo_issues::test_support::{git_repo, overlay_repo};
+    async fn issue_repo_context_miss_is_uniform() {
+        use crate::repo_issues::test_support::overlay_repo;
         let registered = overlay_repo();
         let svc = service_with_registered(registered.path(), registered.path()).await;
         // A real, perfectly good git repo that is NOT registered.
@@ -2259,7 +2329,6 @@ mod tests {
         // An existing non-repo directory and a path that does not exist.
         let non_repo = tempfile::tempdir().unwrap();
         let missing = non_repo.path().join("does-not-exist");
-        let _plain = git_repo();
         let mut errors = Vec::new();
         for p in [unregistered.path(), non_repo.path(), missing.as_path()] {
             let shown = p.display().to_string();

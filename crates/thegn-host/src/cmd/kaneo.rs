@@ -426,6 +426,7 @@ fn age_secs(fetched_at_ms: i64) -> i64 {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::repo_issues::test_support::{overlay_repo, two_account_config};
 
     /// The config `run_in` hands the provider verbs resolves the default
@@ -446,7 +447,6 @@ mod tests {
         assert_eq!(resolve_project(&inside, Some("X".into())).unwrap(), "X");
     }
 
-    use super::*;
     use thegn_core::db::Db;
     use thegn_core::store::CacheStore;
 
