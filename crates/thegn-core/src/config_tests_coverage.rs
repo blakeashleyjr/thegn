@@ -1028,6 +1028,7 @@ fn config_overlay_apply_sets_every_field() {
         base_branch: Some("main".into()),
         window_margin: Some(1),
         branch_prefix: Some("pfx/".into()),
+        default_folder: Some("Agents".into()),
         picker: Some(Picker::Fzf),
         git_backend: Some(GitBackendKind::Cli),
         git_structural_diff: Some(StructuralDiff::Difft),
@@ -1109,6 +1110,7 @@ fn config_overlay_apply_sets_every_field() {
     assert_eq!(cfg.base_branch, "main");
     assert_eq!(cfg.window_margin, 1);
     assert_eq!(cfg.branch_prefix, "pfx/");
+    assert_eq!(cfg.default_folder.as_deref(), Some("Agents"));
     assert_eq!(cfg.picker, Picker::Fzf);
     assert_eq!(cfg.git.backend, GitBackendKind::Cli);
     assert_eq!(cfg.git.structural_diff, StructuralDiff::Difft);

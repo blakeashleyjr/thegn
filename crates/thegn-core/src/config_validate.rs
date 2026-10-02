@@ -383,6 +383,12 @@ pub(crate) fn typed_semantic_errors(cfg: &Config, mode: SemanticMode) -> Vec<Str
     }
     check_templates(cfg, &mut errs);
     stop!();
+    if let Some(name) = cfg.default_folder.as_deref()
+        && name.trim().is_empty()
+    {
+        errs.push("default_folder must not be empty or whitespace-only".into());
+        stop!();
+    }
     batch!(crate::custom_cmd::validate_commands(&cfg.git_commands));
     batch!(cfg.autopilot.validate("autopilot"));
     for (slug, ws) in &cfg.workspace {

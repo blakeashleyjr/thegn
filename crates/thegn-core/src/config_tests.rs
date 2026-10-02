@@ -321,6 +321,60 @@ name = "minimal"
 }
 
 #[test]
+fn default_folder_config_and_env_precedence() {
+    assert_eq!(Config::default().default_folder, None);
+    let parsed: Config = toml::from_str("default_folder = 'From file'\n").unwrap();
+    assert_eq!(parsed.default_folder.as_deref(), Some("From file"));
+
+    let dir = tmpdir("default-folder-precedence");
+    let file = dir.join("config.toml");
+    std::fs::write(&file, "default_folder = 'From file'\n").unwrap();
+    let env = map_env(&[("THEGN_DEFAULT_FOLDER", "From env")]);
+    let cfg = Config::load_layered(&env, &[], Some(file));
+    assert_eq!(cfg.default_folder.as_deref(), Some("From env"));
+    let cli = Config::load_layered(
+        &env,
+        &["default_folder='From CLI'".into()],
+        Some(dir.join("config.toml")),
+    );
+    assert_eq!(cli.default_folder.as_deref(), Some("From CLI"));
+    assert_eq!(
+        Config::default().get_dotted("default_folder").as_deref(),
+        Some("")
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn default_folder_env_preserves_an_explicit_empty_value_for_validation() {
+    let env = map_env(&[("THEGN_DEFAULT_FOLDER", "  ")]);
+    let mut cfg = Config::default();
+    env_overlay(&env).apply(&mut cfg);
+    assert_eq!(cfg.default_folder.as_deref(), Some("  "));
+    assert!(
+        crate::config_validate::typed_semantic_errors(
+            &cfg,
+            crate::config_validate::SemanticMode::AllDiagnostics
+        )
+        .iter()
+        .any(|error| error.contains("default_folder"))
+    );
+}
+
+#[test]
+fn strict_validation_rejects_empty_default_folder_but_allows_none() {
+    assert!(crate::config_validate::validate_str("").is_empty());
+    for value in ["\"\"", "\"  \""] {
+        let errors = crate::config_validate::validate_str(&format!("default_folder = {value}\n"));
+        assert!(
+            errors.iter().any(|error| error.contains("default_folder")),
+            "{value}: {errors:?}"
+        );
+    }
+    assert!(crate::config_validate::validate_str("default_folder = \" Agents \"\n").is_empty());
+}
+
+#[test]
 fn monitor_defaults() {
     let m = MonitorConfig::default();
     assert_eq!(m.system, "btm");
@@ -1608,6 +1662,7 @@ fn env_overlay_covers_every_knob() {
         ("THEGN_WORKSPACES_DIR", "/ws"),
         ("THEGN_BASE_BRANCH", "develop"),
         ("THEGN_BRANCH_PREFIX", "x/"),
+        ("THEGN_DEFAULT_FOLDER", "Agents"),
         ("THEGN_MERGE_QUEUE_GATE_TIMEOUT_SECS", "60"),
         ("THEGN_MERGE_QUEUE_GATE_SETUP_TIMEOUT_SECS", "30"),
         ("THEGN_PICKER", "fzf"),
@@ -1700,6 +1755,7 @@ fn env_overlay_covers_every_knob() {
     assert_eq!(c.workspaces_dir, "/ws");
     assert_eq!(c.base_branch, "develop");
     assert_eq!(c.branch_prefix, "x/");
+    assert_eq!(c.default_folder.as_deref(), Some("Agents"));
     assert_eq!(c.git.backend, GitBackendKind::Cli);
     assert_eq!(c.git.structural_diff, StructuralDiff::Difft);
     assert_eq!(c.git.submodules, SubmoduleMode::Off);

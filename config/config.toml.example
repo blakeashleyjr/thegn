@@ -62,6 +62,9 @@ repo_scan_depth = 5
 base_branch = "auto"
 window_margin = 0
 branch_prefix = "tg/"
+# Optional sidebar folder for headlessly created worktrees (`wt new`).
+# An explicit `wt new --folder` takes precedence; omit this to leave them unfiled.
+# default_folder = "Agents"
 
 # Picker UI: "auto" | "gum" | "fzf" | "select"
 picker = "auto"

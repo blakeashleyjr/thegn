@@ -297,6 +297,7 @@ fn create_and_register(
     folder: Option<&str>,
     db: &Db,
 ) -> Result<(String, Option<anyhow::Error>)> {
+    let folder = effective_folder(folder, cfg.default_folder.as_deref());
     // A creation that is going to fail filing for a knowable reason (bad name,
     // removed workspace) must not create anything.
     let folder = match folder {
@@ -403,6 +404,13 @@ fn create_and_register(
             })
     });
     Ok((path_s, filing_error))
+}
+
+/// Select the command-line folder when supplied, otherwise the configured
+/// default. Kept at the shared creation boundary so single and batched paths
+/// apply the same policy.
+fn effective_folder<'a>(explicit: Option<&'a str>, configured: Option<&'a str>) -> Option<&'a str> {
+    explicit.or(configured)
 }
 
 /// Validate before touching the folder table: `ensure_folder` intentionally
@@ -1090,8 +1098,8 @@ mod rm_tests {
 #[cfg(test)]
 mod folder_tests {
     use super::{
-        check_folder_fileable, clear_folder_if_registered, file_registered_worktree,
-        register_and_file_worktree, validate_folder_name,
+        check_folder_fileable, clear_folder_if_registered, create_and_register, effective_folder,
+        file_registered_worktree, register_and_file_worktree, validate_folder_name,
     };
     use thegn_core::db::Db;
     use thegn_core::store::WorkspaceStore;
@@ -1103,6 +1111,27 @@ mod folder_tests {
 
     fn db() -> Db {
         Db::open_memory().unwrap()
+    }
+
+    fn temp_repo(parent: &std::path::Path, name: &str) -> std::path::PathBuf {
+        let repo = parent.join(name);
+        std::fs::create_dir_all(&repo).unwrap();
+        for args in [
+            &["init", "-q", "-b", "main"][..],
+            &["config", "user.email", "test@example.invalid"],
+            &["config", "user.name", "test"],
+            &["config", "commit.gpgsign", "false"],
+            &["commit", "--allow-empty", "-q", "-m", "init"],
+        ] {
+            assert!(
+                thegn_core::util::git_cmd(&repo)
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        repo
     }
 
     #[test]
@@ -1167,6 +1196,98 @@ mod folder_tests {
                 }) if name == "Pipeline"
             ));
         }
+    }
+
+    #[test]
+    fn creation_folder_prefers_explicit_then_uses_configured_default() {
+        assert_eq!(effective_folder(None, None), None);
+        assert_eq!(effective_folder(None, Some("Agents")), Some("Agents"));
+        assert_eq!(
+            effective_folder(Some("Review"), Some("Agents")),
+            Some("Review")
+        );
+    }
+
+    #[test]
+    fn create_and_register_applies_default_override_reuse_and_repo_scope() {
+        let scratch =
+            std::env::temp_dir().join(format!("tg-wt-default-folder-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scratch);
+        std::fs::create_dir_all(&scratch).unwrap();
+        let first_repo = temp_repo(&scratch, "first");
+        let second_repo = temp_repo(&scratch, "second");
+        let db = db();
+        db.put_workspace(&first_repo.to_string_lossy(), "first", "repo")
+            .unwrap();
+        db.put_workspace(&second_repo.to_string_lossy(), "second", "repo")
+            .unwrap();
+        let mut cfg = Config::default();
+        cfg.default_folder = Some("Agents".into());
+        cfg.worktrees_dir = scratch.join("checkouts").to_string_lossy().into_owned();
+
+        let create = |root: &std::path::Path, branch: &str, folder: Option<&str>| {
+            create_and_register(&cfg, root, branch, "main", None, folder, &db).unwrap()
+        };
+        let (first_path, filing_error) = create(&first_repo, "tg/default-one", None);
+        assert!(filing_error.is_none());
+        let first_record = db.worktree_record(&first_path).unwrap().unwrap();
+        let first_folder_id = first_record.folder_id.expect("configured default applied");
+
+        let (repeat_path, filing_error) = create(&first_repo, "tg/default-two", None);
+        assert!(filing_error.is_none());
+        let repeat_record = db.worktree_record(&repeat_path).unwrap().unwrap();
+        assert_eq!(repeat_record.folder_id, Some(first_folder_id));
+        assert_eq!(
+            db.folders_for_workspace(&first_repo.to_string_lossy())
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let (override_path, filing_error) = create(&first_repo, "tg/explicit", Some("Review"));
+        assert!(filing_error.is_none());
+        let override_record = db.worktree_record(&override_path).unwrap().unwrap();
+        let override_folder_id = override_record.folder_id.expect("explicit folder applied");
+        assert_ne!(override_folder_id, first_folder_id);
+
+        let (second_path, filing_error) = create(&second_repo, "tg/default", None);
+        assert!(filing_error.is_none());
+        let second_record = db.worktree_record(&second_path).unwrap().unwrap();
+        let second_folder_id = second_record
+            .folder_id
+            .expect("second repo default applied");
+        assert_ne!(second_folder_id, first_folder_id);
+        assert_eq!(
+            db.folders_for_workspace(&second_repo.to_string_lossy())
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let no_default_cfg = Config {
+            default_folder: None,
+            ..cfg.clone()
+        };
+        let (unfiled_path, filing_error) = create_and_register(
+            &no_default_cfg,
+            &first_repo,
+            "tg/unfiled",
+            "main",
+            None,
+            None,
+            &db,
+        )
+        .unwrap();
+        assert!(filing_error.is_none());
+        assert_eq!(
+            db.worktree_record(&unfiled_path)
+                .unwrap()
+                .unwrap()
+                .folder_id,
+            None
+        );
+
+        let _ = std::fs::remove_dir_all(scratch);
     }
 
     #[test]
