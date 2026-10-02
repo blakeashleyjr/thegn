@@ -1152,6 +1152,7 @@ pub async fn main(
     )
     .await;
     clipboard.shutdown();
+    notify_state.shutdown_sound();
     // Outside the UI loop, including every early/error return. All sessions
     // close together under one application deadline; reloads share this owner.
     let cleanup_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
