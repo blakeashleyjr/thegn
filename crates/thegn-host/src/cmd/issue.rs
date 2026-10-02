@@ -143,7 +143,8 @@ fn list_tracker_issues(
     limit: usize,
     json: bool,
 ) -> Result<()> {
-    let router = thegn_svc::issue::IssueRouter::from_config(&cfg.issues);
+    let issues_cfg = crate::repo_issues::for_cwd(cfg);
+    let router = thegn_svc::issue::IssueRouter::from_config(&issues_cfg);
     if !router.is_configured() {
         msg::die("no issue tracker configured (set [issues] providers/accounts)");
     }

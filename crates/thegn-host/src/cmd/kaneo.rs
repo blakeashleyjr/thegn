@@ -91,21 +91,38 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
         } => login(cfg, base_url, client_id),
         Action::Logout { base_url } => logout(cfg, base_url),
         Action::Status { base_url } => status(cfg, base_url),
-        Action::Projects { json } => projects(cfg, json),
-        Action::Board { project, json } => board(cfg, project, json),
+        Action::Projects { json } => projects(&crate::repo_issues::config_for_cwd(cfg), json),
+        Action::Board { project, json } => {
+            board(&crate::repo_issues::config_for_cwd(cfg), project, json)
+        }
         Action::Create {
             project,
             title,
             body,
             priority,
-        } => create(cfg, project, title, body, priority),
-        Action::Comment { task, body } => comment(cfg, task, body),
-        Action::Label { task, name, remove } => label(cfg, task, name, remove),
+        } => create(
+            &crate::repo_issues::config_for_cwd(cfg),
+            project,
+            title,
+            body,
+            priority,
+        ),
+        Action::Comment { task, body } => {
+            comment(&crate::repo_issues::config_for_cwd(cfg), task, body)
+        }
+        Action::Label { task, name, remove } => {
+            label(&crate::repo_issues::config_for_cwd(cfg), task, name, remove)
+        }
         Action::Move {
             task,
             project,
             status,
-        } => move_task(cfg, task, project, status),
+        } => move_task(
+            &crate::repo_issues::config_for_cwd(cfg),
+            task,
+            project,
+            status,
+        ),
     }
 }
 

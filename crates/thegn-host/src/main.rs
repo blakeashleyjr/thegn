@@ -219,6 +219,7 @@ mod render_plan;
 mod replay;
 mod replay_overlay;
 mod repo_index;
+mod repo_issues;
 mod review_handoff;
 mod review_rows;
 mod review_task_handoff;
