@@ -46,6 +46,12 @@ pub enum Fingerprint {
         commondir: Stamp,
         commondir_content: Option<String>,
     },
+    /// `git remote get-url origin`: the worktree's `.git` print plus every
+    /// config input (see [`OriginInputs`]).
+    Origin {
+        base: Box<Fingerprint>,
+        inputs: OriginInputs,
+    },
 }
 
 /// Per-worktree git dir named by a `.git` file's `gitdir:` line.
@@ -106,6 +112,190 @@ pub fn fingerprint(dir: &Path) -> Option<Fingerprint> {
     })
 }
 
+// ---------------------------------------------------------------------------
+// `git remote get-url origin` memo (THE-718 chunk 3)
+// ---------------------------------------------------------------------------
+
+/// Upper bound on a config file we are willing to fold into a fingerprint.
+const MAX_CONFIG_BYTES: usize = 1 << 20;
+/// How many `include.path` hops are followed before giving up.
+const MAX_INCLUDE_DEPTH: usize = 8;
+
+/// The inputs `git remote get-url origin` is derived from, besides the
+/// worktree's `.git` entry: every config file git would read (system, global,
+/// the repo's shared config, a per-worktree config), every file those pull in
+/// through `include`/`includeIf` (over-approximated: ALL referenced files are
+/// folded in, whether or not the condition holds, so a change to any of them
+/// invalidates), the legacy `remotes/origin` file, and the config-bearing
+/// environment.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OriginInputs {
+    files: Vec<(PathBuf, Option<String>)>,
+    env: Vec<(String, String)>,
+}
+
+fn read_config(path: &Path) -> Option<String> {
+    use std::io::Read;
+    let f = std::fs::File::open(path).ok()?;
+    let mut buf = Vec::new();
+    f.take(MAX_CONFIG_BYTES as u64 + 1)
+        .read_to_end(&mut buf)
+        .ok()?;
+    if buf.len() > MAX_CONFIG_BYTES {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// `path = <value>` lines of `[include]` / `[includeIf "..."]` sections.
+fn include_paths(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut in_include = false;
+    for line in text.lines() {
+        let l = line.trim();
+        if l.starts_with('[') {
+            let head = l.trim_start_matches('[').to_ascii_lowercase();
+            in_include = head.starts_with("include");
+            // `[include] path = x` on one line.
+            if in_include
+                && let Some((_, rest)) = l.split_once(']')
+                && let Some(v) = key_value(rest, "path")
+            {
+                out.push(v);
+            }
+        } else if in_include && let Some(v) = key_value(l, "path") {
+            out.push(v);
+        }
+    }
+    out
+}
+
+fn key_value(line: &str, key: &str) -> Option<String> {
+    let l = line.trim();
+    if l.len() < key.len() || !l[..key.len()].eq_ignore_ascii_case(key) {
+        return None;
+    }
+    let rest = l[key.len()..].trim_start();
+    let v = rest.strip_prefix('=')?.trim();
+    let v = v.trim_matches('"');
+    (!v.is_empty()).then(|| v.to_string())
+}
+
+fn push_config(
+    path: PathBuf,
+    home: Option<&Path>,
+    depth: usize,
+    files: &mut Vec<(PathBuf, Option<String>)>,
+) -> Option<()> {
+    if files.iter().any(|(p, _)| *p == path) {
+        return Some(());
+    }
+    let content = read_config(&path);
+    // Present but unreadable/oversized is not a complete print.
+    if content.is_none() && path.exists() {
+        return None;
+    }
+    let includes = content.as_deref().map(include_paths).unwrap_or_default();
+    files.push((path.clone(), content));
+    if includes.is_empty() {
+        return Some(());
+    }
+    if depth >= MAX_INCLUDE_DEPTH {
+        return None;
+    }
+    for inc in includes {
+        let target = if let Some(rest) = inc.strip_prefix("~/") {
+            home?.join(rest)
+        } else if inc.starts_with('~') {
+            return None; // `~user/…`: not modelled
+        } else if Path::new(&inc).is_absolute() {
+            PathBuf::from(&inc)
+        } else {
+            path.parent()?.join(&inc)
+        };
+        push_config(target, home, depth + 1, files)?;
+    }
+    Some(())
+}
+
+/// Compute the [`OriginInputs`] for `dir`, reading the environment through
+/// `env` (injectable for tests). `None` = cannot be fingerprinted completely.
+pub fn origin_inputs(dir: &Path, env: &dyn Fn(&str) -> Option<String>) -> Option<OriginInputs> {
+    // These redirect git's own discovery; we cannot model them.
+    for k in ["GIT_DIR", "GIT_COMMON_DIR", "GIT_WORK_TREE", "GIT_CONFIG"] {
+        if env(k).is_some() {
+            return None;
+        }
+    }
+    let home = env("HOME").map(PathBuf::from);
+    let common = crate::util::git_common_dir(dir);
+    let mut files = Vec::new();
+    // system
+    if env("GIT_CONFIG_NOSYSTEM").is_none() {
+        let sys = env("GIT_CONFIG_SYSTEM")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/etc/gitconfig"));
+        push_config(sys, home.as_deref(), 0, &mut files)?;
+    }
+    // global
+    match env("GIT_CONFIG_GLOBAL") {
+        Some(g) => push_config(PathBuf::from(g), home.as_deref(), 0, &mut files)?,
+        None => {
+            if let Some(h) = &home {
+                push_config(h.join(".gitconfig"), home.as_deref(), 0, &mut files)?;
+            }
+            let xdg = env("XDG_CONFIG_HOME")
+                .map(PathBuf::from)
+                .or_else(|| home.as_ref().map(|h| h.join(".config")));
+            if let Some(x) = xdg {
+                push_config(x.join("git/config"), home.as_deref(), 0, &mut files)?;
+            }
+        }
+    }
+    // repo: shared config, per-worktree config, legacy remotes file
+    push_config(common.join("config"), home.as_deref(), 0, &mut files)?;
+    push_config(
+        common.join("config.worktree"),
+        home.as_deref(),
+        0,
+        &mut files,
+    )?;
+    if let Some(gd) = git_dir(dir) {
+        push_config(gd.join("config.worktree"), home.as_deref(), 0, &mut files)?;
+    }
+    push_config(
+        common.join("remotes/origin"),
+        home.as_deref(),
+        0,
+        &mut files,
+    )?;
+    let mut envs: Vec<(String, String)> = [
+        "HOME",
+        "XDG_CONFIG_HOME",
+        "GIT_CONFIG_GLOBAL",
+        "GIT_CONFIG_SYSTEM",
+        "GIT_CONFIG_NOSYSTEM",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_PARAMETERS",
+    ]
+    .into_iter()
+    .filter_map(|k| env(k).map(|v| (k.to_string(), v)))
+    .collect();
+    // GIT_CONFIG_KEY_<n> / GIT_CONFIG_VALUE_<n> are open-ended: fold in as many
+    // as COUNT announces.
+    if let Some(n) = env("GIT_CONFIG_COUNT").and_then(|c| c.parse::<usize>().ok()) {
+        for i in 0..n.min(256) {
+            for p in ["GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"] {
+                let k = format!("{p}{i}");
+                if let Some(v) = env(&k) {
+                    envs.push((k, v));
+                }
+            }
+        }
+    }
+    Some(OriginInputs { files, env: envs })
+}
+
 /// A bounded path -> (fingerprint, value) memo; the oldest entry is evicted.
 pub struct Memo<V: Clone> {
     cap: usize,
@@ -152,7 +342,7 @@ impl<V: Clone> Memo<V> {
     }
 }
 
-/// Memoise `compute()` for `dir` under its [`fingerprint`]. The fingerprint is
+/// Memoise `compute()` for `dir` under its [`fingerprint`] (see [`memoised_with`]). The fingerprint is
 /// taken BEFORE `compute` runs, so a change racing the computation is stored
 /// under the old fingerprint and re-derived on the next call (never stale).
 pub fn memoised<V: Clone>(
@@ -161,7 +351,18 @@ pub fn memoised<V: Clone>(
     dir: &Path,
     compute: impl FnOnce() -> V,
 ) -> V {
-    let Some(fp) = fingerprint(dir) else {
+    memoised_with(memo, cap, dir, fingerprint(dir), compute)
+}
+
+/// [`memoised`] with a caller-computed fingerprint (`None` = bypass).
+pub fn memoised_with<V: Clone>(
+    memo: &Mutex<Option<Memo<V>>>,
+    cap: usize,
+    dir: &Path,
+    fp: Option<Fingerprint>,
+    compute: impl FnOnce() -> V,
+) -> V {
+    let Some(fp) = fp else {
         return compute();
     };
     {
@@ -176,6 +377,32 @@ pub fn memoised<V: Clone>(
         .get_or_insert_with(|| Memo::new(cap))
         .put(dir, fp, v.clone());
     v
+}
+
+/// The fingerprint for the origin URL of `dir`; `None` = bypass the memo.
+pub fn origin_fingerprint(dir: &Path, env: &dyn Fn(&str) -> Option<String>) -> Option<Fingerprint> {
+    let base = fingerprint(dir)?;
+    // A missing path has no config to read; the Missing print alone keys it.
+    if base == Fingerprint::Missing {
+        return Some(base);
+    }
+    let inputs = origin_inputs(dir, env)?;
+    Some(Fingerprint::Origin {
+        base: Box::new(base),
+        inputs,
+    })
+}
+
+const ORIGIN_MEMO_CAP: usize = 512;
+
+/// `git remote get-url origin` for a LOCAL worktree, memoised under
+/// [`origin_fingerprint`] (THE-718: 45 forks/min on an idle one-repo session).
+/// `compute` is the subprocess; it runs only on a miss or when the inputs
+/// cannot be fingerprinted completely.
+pub fn origin_url(dir: &Path, compute: impl FnOnce() -> Option<String>) -> Option<String> {
+    static MEMO: Mutex<Option<Memo<Option<String>>>> = Mutex::new(None);
+    let fp = origin_fingerprint(dir, &|k| std::env::var(k).ok());
+    memoised_with(&MEMO, ORIGIN_MEMO_CAP, dir, fp, compute)
 }
 
 #[cfg(test)]
@@ -260,6 +487,153 @@ mod tests {
         assert_eq!(git_dir(&base.join("nope")), None);
         std::fs::write(wt.join(".git"), "junk").unwrap();
         assert_eq!(git_dir(&wt), None);
+    }
+
+    fn env_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> + use<> {
+        let m: std::collections::HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |k| m.get(k).cloned()
+    }
+
+    fn repo_with_config(base: &Path, config: &str) -> PathBuf {
+        let repo = base.join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::write(repo.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(repo.join(".git/config"), config).unwrap();
+        repo
+    }
+
+    #[test]
+    fn include_paths_reads_include_and_includeif_only() {
+        let text = "[user]\n\tpath = no\n[include]\n\tpath = ~/a.cfg\n\
+                    [includeIf \"gitdir:~/w/\"]\n\tPath = \"b.cfg\"\n[core]\n\tpath = no\n";
+        assert_eq!(include_paths(text), vec!["~/a.cfg", "b.cfg"]);
+        assert_eq!(include_paths("[include] path = c.cfg\n"), vec!["c.cfg"]);
+        assert!(include_paths("[remote \"origin\"]\n\turl = x\n").is_empty());
+    }
+
+    #[test]
+    fn origin_inputs_change_with_repo_global_and_included_config() {
+        let base = tmp("origin-inputs");
+        let home = base.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join(".gitconfig"), "[include]\n\tpath = extra.cfg\n").unwrap();
+        std::fs::write(
+            home.join("extra.cfg"),
+            "[url \"ssh://x/\"]\n\tinsteadOf = https://x/\n",
+        )
+        .unwrap();
+        let repo = repo_with_config(&base, "[remote \"origin\"]\n\turl = https://x/r\n");
+        let h = home.to_str().unwrap();
+        let env = env_of(&[("HOME", h), ("GIT_CONFIG_NOSYSTEM", "1")]);
+        let a = origin_fingerprint(&repo, &env).expect("complete print");
+        assert_eq!(a, origin_fingerprint(&repo, &env).unwrap());
+
+        // Repo config edit.
+        std::fs::write(
+            repo.join(".git/config"),
+            "[remote \"origin\"]\n\turl = https://y/r\n",
+        )
+        .unwrap();
+        let b = origin_fingerprint(&repo, &env).unwrap();
+        assert_ne!(a, b);
+        // A file pulled in by the global config's include (the insteadOf rewrite).
+        std::fs::write(
+            home.join("extra.cfg"),
+            "[url \"ssh://z/\"]\n\tinsteadOf = https://y/\n",
+        )
+        .unwrap();
+        let c = origin_fingerprint(&repo, &env).unwrap();
+        assert_ne!(b, c);
+        // Global config edit.
+        std::fs::write(
+            home.join(".gitconfig"),
+            "[include]\n\tpath = extra.cfg\n# x\n",
+        )
+        .unwrap();
+        assert_ne!(c, origin_fingerprint(&repo, &env).unwrap());
+        // Per-worktree config appearing.
+        let d = origin_fingerprint(&repo, &env).unwrap();
+        std::fs::write(repo.join(".git/config.worktree"), "[remote \"origin\"]\n").unwrap();
+        assert_ne!(d, origin_fingerprint(&repo, &env).unwrap());
+        // Env knobs that change what git reads change the print too.
+        let env2 = env_of(&[
+            ("HOME", h),
+            ("GIT_CONFIG_NOSYSTEM", "1"),
+            ("GIT_CONFIG_COUNT", "0"),
+        ]);
+        assert_ne!(
+            origin_fingerprint(&repo, &env).unwrap(),
+            origin_fingerprint(&repo, &env2).unwrap()
+        );
+    }
+
+    #[test]
+    fn origin_inputs_bypass_when_not_modelled() {
+        let base = tmp("origin-bypass");
+        let repo = repo_with_config(&base, "");
+        let h = base.to_str().unwrap();
+        for k in ["GIT_DIR", "GIT_COMMON_DIR", "GIT_WORK_TREE", "GIT_CONFIG"] {
+            let env = env_of(&[("HOME", h), (k, "/x")]);
+            assert_eq!(origin_fingerprint(&repo, &env), None, "{k}");
+        }
+        // `~user/` include, an include cycle past the depth cap, and a config
+        // that is present but unreadable as a file are not complete prints.
+        std::fs::write(base.join(".gitconfig"), "[include]\n\tpath = ~bob/x\n").unwrap();
+        let env = env_of(&[("HOME", h), ("GIT_CONFIG_NOSYSTEM", "1")]);
+        assert_eq!(origin_fingerprint(&repo, &env), None);
+        std::fs::write(base.join(".gitconfig"), "[include]\n\tpath = loop.cfg\n").unwrap();
+        std::fs::write(base.join("loop.cfg"), "[include]\n\tpath = loop.cfg\n").unwrap();
+        // Self-include is deduplicated, so it terminates with a complete print.
+        assert!(origin_fingerprint(&repo, &env).is_some());
+        // Not a worktree at all.
+        assert_eq!(
+            origin_fingerprint(&base.join("nothing-here"), &env),
+            Some(Fingerprint::Missing)
+        );
+        assert_eq!(origin_fingerprint(&base, &env), None);
+    }
+
+    #[test]
+    fn origin_url_memoises_and_follows_set_url() {
+        let base = tmp("origin-url");
+        let repo = base.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |args: &[&str]| {
+            assert!(
+                crate::util::git_cmd(&repo)
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "git {args:?}"
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["remote", "add", "origin", "https://example.test/a/b.git"]);
+        let spawns = std::cell::Cell::new(0);
+        let run = || {
+            origin_url(&repo, || {
+                spawns.set(spawns.get() + 1);
+                crate::util::git_out(&repo, &["remote", "get-url", "origin"])
+            })
+        };
+        assert_eq!(run().as_deref(), Some("https://example.test/a/b.git"));
+        assert_eq!(run().as_deref(), Some("https://example.test/a/b.git"));
+        if origin_fingerprint(&repo, &|k| std::env::var(k).ok()).is_some() {
+            assert_eq!(spawns.get(), 1, "second call is a memo hit");
+        }
+        git(&[
+            "remote",
+            "set-url",
+            "origin",
+            "https://example.test/c/d.git",
+        ]);
+        assert_eq!(run().as_deref(), Some("https://example.test/c/d.git"));
+        git(&["remote", "remove", "origin"]);
+        assert_eq!(run(), None, "removal is seen, not served from the memo");
     }
 
     #[test]

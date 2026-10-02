@@ -666,6 +666,18 @@ impl GitLoc {
         (!s.is_empty()).then_some(s)
     }
 
+    /// `git remote get-url origin`, trimmed; `None` when unset or unreadable.
+    /// A local worktree answers from a memo keyed on every config input (see
+    /// [`crate::git_memo::origin_url`]) instead of forking git per call; remote
+    /// and provider locs always ask the far side.
+    pub fn origin_url(&self) -> Option<String> {
+        const ARGS: &[&str] = &["remote", "get-url", "origin"];
+        match self {
+            GitLoc::Local(p) => crate::git_memo::origin_url(p, || self.git_out(ARGS)),
+            _ => self.git_out(ARGS),
+        }
+    }
+
     /// Run a git command for its exit status (output discarded).
     pub fn git_ok(&self, args: &[&str]) -> bool {
         self.git_command(args)

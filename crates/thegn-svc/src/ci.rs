@@ -256,14 +256,7 @@ pub fn system_from_remote_host(url: &str) -> Option<CiSystem> {
 }
 
 fn origin_url(loc: &GitLoc) -> Option<String> {
-    let out = loc
-        .git_command(&["remote", "get-url", "origin"])
-        .output()
-        .ok()?;
-    out.status
-        .success()
-        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
-        .filter(|s| !s.is_empty())
+    loc.origin_url()
 }
 
 /// The selected CI backend. Object-safe, so routing is a `Box<dyn>` and a

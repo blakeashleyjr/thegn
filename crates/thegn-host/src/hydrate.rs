@@ -2796,8 +2796,7 @@ pub(crate) fn build_panel(
     // whatever origin was at the time; a changed remote must not keep showing
     // the old repo's PRs (those rows never expire and survive failed refreshes).
     let origin_repo = thegn_core::forge::model::repo_identity_from_remote_url(
-        &loc.git_out(&["remote", "get-url", "origin"])
-            .unwrap_or_default(),
+        &loc.origin_url().unwrap_or_default(),
     );
 
     let checkout_scope = thegn_core::forge::checkout::checkout_scope(&loc).ok();
@@ -3917,15 +3916,13 @@ pub(crate) fn spawn_pr_cache_refresh_with_generation(
         let forges = crate::forge_handle::get();
         let forge = forges.for_loc(&loc);
         let origin_before = thegn_core::forge::model::repo_identity_from_remote_url(
-            &loc.git_out(&["remote", "get-url", "origin"])
-                .unwrap_or_default(),
+            &loc.origin_url().unwrap_or_default(),
         );
         // Newest-first, paged: a repo with more open PRs than one page (100)
         // used to be silently truncated to an arbitrary 100.
         let prs = forge.pr_list(&loc, 300);
         let origin_after = thegn_core::forge::model::repo_identity_from_remote_url(
-            &loc.git_out(&["remote", "get-url", "origin"])
-                .unwrap_or_default(),
+            &loc.origin_url().unwrap_or_default(),
         );
         if let Ok(prs) = prs
             && origin_before.is_some()
@@ -4147,9 +4144,7 @@ fn scoped_open_pr_maps(db: &thegn_core::db::Db, repo_root: &str) -> Option<OpenP
     let (cached, rows) = thegn_core::forge::model::parse_pr_branch_cache(&json);
     let cached = cached?;
     let loc = thegn_core::remote::GitLoc::Local(std::path::PathBuf::from(repo_root));
-    let expected = thegn_core::forge::model::repo_identity_from_remote_url(
-        &loc.git_out(&["remote", "get-url", "origin"])?,
-    )?;
+    let expected = thegn_core::forge::model::repo_identity_from_remote_url(&loc.origin_url()?)?;
     if !cached.matches(&expected) {
         return None;
     }
@@ -4426,8 +4421,7 @@ pub(crate) fn spawn_my_work_refresh(
         let loc = thegn_core::remote::GitLoc::for_worktree(&cwd);
         let repo_root = thegn_core::repo::main_worktree(&cwd).unwrap_or_else(|| cwd.clone());
         let origin_before = thegn_core::forge::model::repo_identity_from_remote_url(
-            &loc.git_out(&["remote", "get-url", "origin"])
-                .unwrap_or_default(),
+            &loc.origin_url().unwrap_or_default(),
         );
         // Repo scope (unless `all`): `owner/repo` for GitHub, the repo `[issues]`
         // overlay for Linear/Jira, and the cache key.
@@ -4563,8 +4557,7 @@ pub(crate) fn spawn_my_work_refresh(
         let source_repo_after = (!all)
             .then(|| {
                 thegn_core::forge::model::repo_identity_from_remote_url(
-                    &loc.git_out(&["remote", "get-url", "origin"])
-                        .unwrap_or_default(),
+                    &loc.origin_url().unwrap_or_default(),
                 )
             })
             .flatten();
