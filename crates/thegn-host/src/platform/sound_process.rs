@@ -329,3 +329,62 @@ pub(crate) fn run_bounded(
         }
     }
 }
+
+/// Test-only helpers so callers' tests stay free of platform `#[cfg]`.
+#[cfg(test)]
+pub(crate) mod test_support {
+    pub(crate) const UNIX: bool = cfg!(unix);
+
+    /// A real terminal waker (backed by a pty); the other ends must outlive it.
+    #[cfg(unix)]
+    pub(crate) fn test_waker() -> (
+        termwiz::terminal::TerminalWaker,
+        std::fs::File,
+        termwiz::terminal::UnixTerminal,
+    ) {
+        use std::os::fd::FromRawFd;
+        use termwiz::terminal::{Terminal, UnixTerminal};
+        let mut master = -1;
+        let mut slave = -1;
+        assert_eq!(
+            // SAFETY: out-pointers are valid; null name/termios/winsize are allowed.
+            unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                )
+            },
+            0
+        );
+        // SAFETY: openpty returned two fresh fds that we now own.
+        let master = unsafe { std::fs::File::from_raw_fd(master) };
+        let slave = unsafe { std::fs::File::from_raw_fd(slave) };
+        let caps =
+            termwiz::caps::Capabilities::new_with_hints(termwiz::caps::ProbeHints::default())
+                .unwrap();
+        let terminal = UnixTerminal::new_with(caps, &slave, &slave).unwrap();
+        (terminal.waker(), master, terminal)
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn test_waker() -> (termwiz::terminal::TerminalWaker, (), ()) {
+        unreachable!("callers return early when !UNIX")
+    }
+
+    /// True when `pid` no longer exists at all (a zombie still answers signal 0).
+    #[cfg(unix)]
+    pub(crate) fn pid_gone(pid: i32) -> bool {
+        // SAFETY: signal 0 only probes for existence.
+        let rc = unsafe { libc::kill(pid, 0) };
+        let errno = std::io::Error::last_os_error().raw_os_error();
+        rc == -1 && errno == Some(libc::ESRCH)
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn pid_gone(_pid: i32) -> bool {
+        true
+    }
+}
