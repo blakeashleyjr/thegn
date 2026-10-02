@@ -207,7 +207,16 @@ impl Recording {
     /// keyframe whose event fell off the front (its byte range no longer exists).
     fn evict(&mut self, now_ms: u64) {
         loop {
-            let over_bytes = self.bytes_used > self.budget.max_bytes;
+            // A keyframe whose event is already popped is orphaned and about to
+            // be dropped below, so its marker no longer counts against the
+            // budget — otherwise eviction over-shoots and eats the newest suffix.
+            let orphaned = self
+                .keyframes
+                .partition_point(|k| k.event_seq < self.evicted) as u64;
+            let live_bytes = self
+                .bytes_used
+                .saturating_sub(orphaned.saturating_mul(REPLAY_ENTRY_OVERHEAD_BYTES));
+            let over_bytes = live_bytes > self.budget.max_bytes;
             let Some(front_ms) = self.events.front().map(|e| e.at_ms) else {
                 break;
             };
@@ -686,6 +695,29 @@ mod tests {
         let payload_budget = 256 - 2 * REPLAY_ENTRY_OVERHEAD_BYTES as usize;
         assert_eq!(retained.as_ref(), &chunk[chunk.len() - payload_budget..]);
         assert_eq!(rec.payload_bytes_used, payload_budget as u64);
+        assert!(rec.bytes_used <= rec.budget.max_bytes);
+        assert_eq!(rec.bytes_used, expected_logical_charge(&rec));
+    }
+
+    #[test]
+    fn oversized_chunk_after_small_one_keeps_newest_suffix() {
+        // The first chunk's keyframe marker is refunded as its event is popped,
+        // so evicting "a" alone must satisfy the budget; the freshly admitted
+        // (truncated) suffix must not be evicted with it.
+        let mut rec = Recording::from_config(&replay_cfg(256), 24, 80);
+        let epoch = rec.epoch;
+        rec.push_bytes(b"a", epoch);
+        rec.push_bytes(&[0u8; 600], epoch);
+
+        assert_eq!(rec.events.len(), 1, "newest suffix retained");
+        let Some(Event {
+            kind: EventKind::Bytes(b),
+            ..
+        }) = rec.events.back()
+        else {
+            panic!("byte event retained");
+        };
+        assert_eq!(b.len(), 192);
         assert!(rec.bytes_used <= rec.budget.max_bytes);
         assert_eq!(rec.bytes_used, expected_logical_charge(&rec));
     }
