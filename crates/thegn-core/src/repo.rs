@@ -3,10 +3,12 @@
 //! resurrection (git is the source of truth; the DB is only a cache).
 
 use crate::config::Config;
+use crate::git_memo;
 use crate::identity::{ExactPath, IdentityError, RepositoryId};
 use crate::store::WorkspaceStore;
 use crate::util;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use walkdir::WalkDir;
 
 const MAX_GIT_IDENTITY_OUTPUT: usize = 16 * 1024;
@@ -70,7 +72,22 @@ pub fn worktree_root_for_cwd(cwd: &Path) -> Option<PathBuf> {
 
 /// The MAIN worktree root for `dir`'s repo — climb out of any linked worktree
 /// so we never create worktrees-of-worktrees. None if `dir` isn't in a repo.
+///
+/// Memoised per path under a stat fingerprint of `<dir>/.git` (and, for a
+/// linked worktree, the `commondir` file it points through), so the idle
+/// hydration tick does not fork `git rev-parse` for an answer that cannot have
+/// changed (THE-718). A path with no `.git` entry (a subdirectory, a bare
+/// repo) cannot be fingerprinted and still spawns every call, as before.
 pub fn main_worktree(dir: &Path) -> Option<PathBuf> {
+    static MEMO: Mutex<Option<git_memo::Memo<Option<PathBuf>>>> = Mutex::new(None);
+    git_memo::memoised(&MEMO, MAIN_WORKTREE_MEMO_CAP, dir, || {
+        main_worktree_uncached(dir)
+    })
+}
+
+const MAIN_WORKTREE_MEMO_CAP: usize = 512;
+
+fn main_worktree_uncached(dir: &Path) -> Option<PathBuf> {
     let common = util::git_out(
         dir,
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],
@@ -264,6 +281,96 @@ mod tests {
 
     fn tmp(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("tg-repo-{}-{}", std::process::id(), name))
+    }
+
+    fn git_ok(dir: &Path, args: &[&str]) {
+        assert!(
+            util::git_cmd(dir)
+                .args([
+                    "-c",
+                    "commit.gpgsign=false",
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t"
+                ])
+                .args(args)
+                .status()
+                .unwrap()
+                .success(),
+            "git {args:?}"
+        );
+    }
+
+    #[test]
+    fn main_worktree_memo_hit_skips_the_subprocess() {
+        let root = tmp("mw-hit");
+        // best-effort: test cleanup: scratch removal must never fail the test
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        git_ok(&root, &["init", "-q"]);
+        let memo = Mutex::new(None);
+        let spawns = std::cell::Cell::new(0);
+        let run = || {
+            git_memo::memoised(&memo, 4, &root, || {
+                spawns.set(spawns.get() + 1);
+                main_worktree_uncached(&root)
+            })
+        };
+        let first = run().expect("repo resolves");
+        assert_eq!(run(), Some(first.clone()));
+        assert_eq!(run(), Some(first));
+        assert_eq!(spawns.get(), 1, "two hits must not spawn git");
+        // best-effort: test cleanup: scratch removal must never fail the test
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn main_worktree_linked_worktree_and_reuse_for_another_repo() {
+        let base = tmp("mw-linked");
+        // best-effort: test cleanup: scratch removal must never fail the test
+        let _ = std::fs::remove_dir_all(&base);
+        let a = base.join("a");
+        let b = base.join("b");
+        for d in [&a, &b] {
+            std::fs::create_dir_all(d).unwrap();
+            git_ok(d, &["init", "-q"]);
+            git_ok(d, &["commit", "-q", "--allow-empty", "-m", "i"]);
+        }
+        let wt = base.join("wt");
+        git_ok(
+            &a,
+            &["worktree", "add", "-q", "-b", "x", wt.to_str().unwrap()],
+        );
+        let canon = |p: PathBuf| std::fs::canonicalize(p).unwrap();
+        assert_eq!(canon(main_worktree(&wt).unwrap()), canon(a.clone()));
+        assert_eq!(canon(main_worktree(&wt).unwrap()), canon(a.clone()));
+        // Remove the linked worktree and reuse its path for a different repo's
+        // worktree: the answer must follow.
+        git_ok(&a, &["worktree", "remove", "--force", wt.to_str().unwrap()]);
+        assert_eq!(main_worktree(&wt), None, "gone path resolves to nothing");
+        git_ok(
+            &b,
+            &["worktree", "add", "-q", "-b", "y", wt.to_str().unwrap()],
+        );
+        assert_eq!(canon(main_worktree(&wt).unwrap()), canon(b.clone()));
+        // best-effort: test cleanup: scratch removal must never fail the test
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn main_worktree_missing_path_is_retried_when_it_appears() {
+        let base = tmp("mw-missing");
+        // best-effort: test cleanup: scratch removal must never fail the test
+        let _ = std::fs::remove_dir_all(&base);
+        let p = base.join("later");
+        assert_eq!(main_worktree(&p), None);
+        assert_eq!(main_worktree(&p), None);
+        std::fs::create_dir_all(&p).unwrap();
+        git_ok(&p, &["init", "-q"]);
+        assert!(main_worktree(&p).is_some(), "retried once the path exists");
+        // best-effort: test cleanup: scratch removal must never fail the test
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
