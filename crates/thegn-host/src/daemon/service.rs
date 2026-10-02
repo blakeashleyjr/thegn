@@ -445,22 +445,102 @@ impl DaemonService {
     }
 }
 
-async fn issue_config_for_repo(
-    config: std::sync::Arc<thegn_core::config::Config>,
-    repo: Option<String>,
-) -> ControlResult<thegn_core::config::IssuesConfig> {
-    let Some(repo) = repo else {
-        return Ok(config.issues.clone());
-    };
-    tokio::task::spawn_blocking(move || {
-        let path = std::path::PathBuf::from(&repo);
-        let root = thegn_core::repo::main_worktree(&path).ok_or_else(|| {
-            ControlError::InvalidArgument(format!("repo path is not a git repository: {repo}"))
-        })?;
-        Ok(config.repo_issues(Some(&root)))
-    })
-    .await
-    .map_err(|e| ControlError::Internal(anyhow::anyhow!("issues repo resolution: {e}")))?
+/// Cap on a client-supplied path echoed back in an error.
+const SHOWN_PATH_MAX: usize = 256;
+
+fn shown_path(path: &str) -> String {
+    path.chars().take(SHOWN_PATH_MAX).collect()
+}
+
+/// The uniform miss for an issues `repo` context: identical for a nonexistent
+/// path, a non-repo and an unregistered repo (no existence oracle), and the
+/// same variant/wording a confined read-verb returns for an unknown path.
+fn issue_repo_unregistered(repo: &str) -> ControlError {
+    ControlError::NotFound(format!(
+        "worktree not registered with thegn: {}",
+        shown_path(repo)
+    ))
+}
+
+/// Resolve an issues `repo` context to a REGISTERED repo root. `requested` must
+/// be a registered workspace root or a registered worktree path; the root
+/// returned is the registry's own (a worktree's `repo_root`), so no git is run
+/// on a caller-supplied path. Local rows tolerate canonical aliases (same rule
+/// as [`registered_worktree_matches`]); remote rows match only exactly.
+fn registered_issue_root<F>(
+    workspaces: &[thegn_core::models::WorkspaceRow],
+    worktrees: &[thegn_core::models::WorktreeRow],
+    requested: &str,
+    canonicalize: F,
+) -> Option<std::path::PathBuf>
+where
+    F: Fn(&str) -> std::path::PathBuf,
+{
+    if let Some(w) = workspaces.iter().find(|w| w.repo_path == requested) {
+        return Some(std::path::PathBuf::from(&w.repo_path));
+    }
+    if let Some(row) = worktrees.iter().find(|r| r.worktree == requested) {
+        return Some(std::path::PathBuf::from(&row.repo_root));
+    }
+    let want = canonicalize(requested);
+    if let Some(w) = workspaces
+        .iter()
+        .find(|w| canonicalize(&w.repo_path) == want)
+    {
+        return Some(std::path::PathBuf::from(&w.repo_path));
+    }
+    worktrees
+        .iter()
+        .filter(|row| {
+            let location = row.location.trim();
+            location.is_empty() || location == "local"
+        })
+        .find(|row| canonicalize(&row.worktree) == want)
+        .map(|row| std::path::PathBuf::from(&row.repo_root))
+}
+
+impl DaemonService {
+    /// The `[issues]` config for an issues verb. `None` keeps the global
+    /// config unchanged. An explicit `repo` is validated (non-empty, absolute)
+    /// and CONFINED to the registry BEFORE any git or file access — a
+    /// token-holding remote client must not make the daemon read an arbitrary
+    /// path — then the repo's restrict-only overlay is applied.
+    async fn issue_config_for_repo(
+        &self,
+        repo: Option<&str>,
+    ) -> ControlResult<thegn_core::config::IssuesConfig> {
+        let Some(repo) = repo else {
+            return Ok(self.config.issues.clone());
+        };
+        if repo.is_empty() || !std::path::Path::new(repo).is_absolute() {
+            return Err(ControlError::InvalidArgument(format!(
+                "repo must be an absolute path: {}",
+                shown_path(repo)
+            )));
+        }
+        let requested = repo.to_string();
+        let root = self
+            .with_db(move |db| {
+                use thegn_core::store::WorkspaceStore;
+                let workspaces = db.workspaces()?;
+                let worktrees = db.worktrees()?;
+                Ok(registered_issue_root(
+                    &workspaces,
+                    &worktrees,
+                    &requested,
+                    |path| {
+                        std::fs::canonicalize(path)
+                            .unwrap_or_else(|_| std::path::PathBuf::from(path))
+                    },
+                ))
+            })
+            .await?
+            .ok_or_else(|| issue_repo_unregistered(repo))?;
+        let config = self.config.clone();
+        tokio::task::spawn_blocking(move || config.repo_issues(Some(&root)))
+            .await
+            .map_err(|e| ControlError::Internal(anyhow::anyhow!("issues repo resolution: {e}")))
+    }
 }
 
 impl ControlApi for DaemonService {
@@ -1749,8 +1829,7 @@ impl ControlApi for DaemonService {
         repo: Option<&'a str>,
     ) -> BoxFuture<'a, ControlResult<Vec<thegn_core::issue::Issue>>> {
         Box::pin(async move {
-            let issues_cfg =
-                issue_config_for_repo(self.config.clone(), repo.map(str::to_owned)).await?;
+            let issues_cfg = self.issue_config_for_repo(repo).await?;
             let router = thegn_svc::issue::IssueRouter::from_config(&issues_cfg);
             if !router.is_configured() {
                 return Err(ControlError::Unimplemented(
@@ -1795,8 +1874,7 @@ impl ControlApi for DaemonService {
     ) -> BoxFuture<'a, ControlResult<thegn_core::issue::IssueDetail>> {
         Box::pin(async move {
             let shown_id: String = id.chars().take(256).collect();
-            let issues_cfg =
-                issue_config_for_repo(self.config.clone(), repo.map(str::to_owned)).await?;
+            let issues_cfg = self.issue_config_for_repo(repo).await?;
             let router = thegn_svc::issue::IssueRouter::from_config(&issues_cfg);
             router
                 .get_issue(id)
@@ -1813,8 +1891,7 @@ impl ControlApi for DaemonService {
     ) -> BoxFuture<'a, ControlResult<thegn_core::issue::Issue>> {
         Box::pin(async move {
             let shown_id: String = id.chars().take(256).collect();
-            let issues_cfg =
-                issue_config_for_repo(self.config.clone(), repo.map(str::to_owned)).await?;
+            let issues_cfg = self.issue_config_for_repo(repo).await?;
             let router = thegn_svc::issue::IssueRouter::from_config(&issues_cfg);
             router.update_issue(id, patch).await.map_err(|e| {
                 ControlError::Internal(anyhow::anyhow!("issues.update {shown_id}: {e}"))
@@ -1830,8 +1907,7 @@ impl ControlApi for DaemonService {
     ) -> BoxFuture<'a, ControlResult<()>> {
         Box::pin(async move {
             let shown_id: String = id.chars().take(256).collect();
-            let issues_cfg =
-                issue_config_for_repo(self.config.clone(), repo.map(str::to_owned)).await?;
+            let issues_cfg = self.issue_config_for_repo(repo).await?;
             let router = thegn_svc::issue::IssueRouter::from_config(&issues_cfg);
             router.add_comment(id, body).await.map_err(|e| {
                 ControlError::Internal(anyhow::anyhow!("issues.comment {shown_id}: {e}"))
@@ -2112,40 +2188,166 @@ impl ControlApi for DaemonService {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    #[expect(clippy::disallowed_methods)] // deterministic real-Git fixture, test only
-    async fn explicit_issue_repo_resolves_overlay_and_rejects_invalid_path() {
-        let repo = tempfile::tempdir().unwrap();
-        let out = thegn_core::util::git_cmd(repo.path())
-            .args(["init", "-q"])
-            .output()
-            .unwrap();
-        assert!(out.status.success());
-        std::fs::write(
-            repo.path().join(".thegn.toml"),
-            "[issues]\nproviders = [\"linear\"]\naccounts = []\n\n[issues.linear]\nteam_id = \"TEAM-PIN\"\n",
-        )
+    /// A service whose registry holds `repo` as a workspace root and `wt` as a
+    /// registered worktree of it.
+    async fn service_with_registered(
+        repo: &std::path::Path,
+        wt: &std::path::Path,
+    ) -> DaemonService {
+        let (svc, _rx) = service(0);
+        let (repo, wt) = (repo.display().to_string(), wt.display().to_string());
+        svc.with_db(move |db| {
+            use thegn_core::store::WorkspaceStore;
+            db.put_workspace(&repo, "repo", "repo")?;
+            db.put_worktree("repo/feature", &repo, &wt, "feature", None, None)?;
+            Ok(())
+        })
+        .await
         .unwrap();
-        let config = std::sync::Arc::new(thegn_core::config::Config::default());
+        svc
+    }
 
-        let scoped = issue_config_for_repo(config.clone(), Some(repo.path().display().to_string()))
-            .await
-            .unwrap();
-        assert_eq!(
-            scoped.providers,
-            vec![thegn_core::config::IssueProviderKind::Linear]
+    fn assert_uniform_miss(e: &ControlError, shown: &str) {
+        match e {
+            ControlError::NotFound(m) => {
+                assert_eq!(m, &format!("worktree not registered with thegn: {shown}"));
+            }
+            other => panic!("expected uniform NotFound, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn issue_repo_context_applies_overlay_for_registered_root_and_worktree() {
+        use crate::repo_issues::test_support::{overlay_repo, two_account_config};
+        let repo = overlay_repo();
+        let wt = tempfile::tempdir().unwrap();
+        let (svc, _rx) = service_with_config(0, two_account_config());
+        let (r, w) = (
+            repo.path().display().to_string(),
+            wt.path().display().to_string(),
         );
-        assert!(scoped.accounts_restricted);
-        assert!(scoped.issue_accounts.is_empty());
-        assert_eq!(scoped.linear.team_id, "TEAM-PIN");
-        let unscoped = issue_config_for_repo(config.clone(), None).await.unwrap();
-        assert_eq!(unscoped.providers, config.issues.providers);
+        svc.with_db(move |db| {
+            use thegn_core::store::WorkspaceStore;
+            db.put_workspace(&r, "repo", "repo")?;
+            db.put_worktree("repo/feature", &r, &w, "feature", None, None)?;
+            Ok(())
+        })
+        .await
+        .unwrap();
 
-        let outside = tempfile::tempdir().unwrap();
-        let error = issue_config_for_repo(config, Some(outside.path().display().to_string()))
-            .await
-            .unwrap_err();
-        assert!(matches!(error, ControlError::InvalidArgument(_)));
+        for path in [repo.path(), wt.path()] {
+            let scoped = svc
+                .issue_config_for_repo(Some(&path.display().to_string()))
+                .await
+                .unwrap();
+            assert_eq!(scoped.issue_accounts.len(), 1, "{path:?}");
+            assert_eq!(scoped.linear.team_id, "TEAM-PIN");
+            assert_eq!(scoped.kaneo.project_id, "PROJECT-PIN");
+        }
+        let global = svc.issue_config_for_repo(None).await.unwrap();
+        assert_eq!(global.issue_accounts.len(), 2);
+        assert_eq!(global.linear.team_id, svc.config.issues.linear.team_id);
+    }
+
+    #[tokio::test]
+    async fn issue_repo_context_miss_is_uniform_and_runs_no_git() {
+        use crate::repo_issues::test_support::{git_repo, overlay_repo};
+        let registered = overlay_repo();
+        let svc = service_with_registered(registered.path(), registered.path()).await;
+        // A real, perfectly good git repo that is NOT registered.
+        let unregistered = overlay_repo();
+        // An existing non-repo directory and a path that does not exist.
+        let non_repo = tempfile::tempdir().unwrap();
+        let missing = non_repo.path().join("does-not-exist");
+        let _plain = git_repo();
+        let mut errors = Vec::new();
+        for p in [unregistered.path(), non_repo.path(), missing.as_path()] {
+            let shown = p.display().to_string();
+            let e = svc.issue_config_for_repo(Some(&shown)).await.unwrap_err();
+            assert_uniform_miss(&e, &shown);
+            errors.push(e.to_string().replace(&shown, "<p>"));
+        }
+        assert!(
+            errors.windows(2).all(|w| w[0] == w[1]),
+            "miss errors must be identical modulo the echoed path: {errors:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn issue_repo_context_rejects_empty_and_relative_before_anything_else() {
+        let (svc, _rx) = service(0);
+        for bad in ["", ".", "foo"] {
+            let e = svc.issue_config_for_repo(Some(bad)).await.unwrap_err();
+            assert!(
+                matches!(e, ControlError::InvalidArgument(_)),
+                "{bad:?}: {e:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn issue_repo_context_truncates_echoed_path() {
+        let (svc, _rx) = service(0);
+        let long = format!("/{}", "a".repeat(5000));
+        let e = svc.issue_config_for_repo(Some(&long)).await.unwrap_err();
+        assert!(e.to_string().len() < 400, "{}", e.to_string().len());
+        let rel = "b".repeat(5000);
+        let e = svc.issue_config_for_repo(Some(&rel)).await.unwrap_err();
+        assert!(e.to_string().len() < 400);
+    }
+
+    /// Each of the four `issues_*` methods threads `Some(repo)` through the
+    /// confinement: an unregistered repo is refused before any tracker call.
+    #[tokio::test]
+    async fn every_issues_method_confines_an_explicit_repo() {
+        let (svc, _rx) = service(0);
+        let repo = Some("/not/registered");
+        let filter = thegn_core::issue::IssueFilter::default();
+        let patch = thegn_core::issue::IssuePatch::default();
+        let results = [
+            svc.issues_list(&filter, repo).await.map(|_| ()),
+            svc.issues_get("linear:T-1", repo).await.map(|_| ()),
+            svc.issues_update("linear:T-1", &patch, repo)
+                .await
+                .map(|_| ()),
+            svc.issues_comment("linear:T-1", "hi", repo).await,
+        ];
+        for r in results {
+            assert_uniform_miss(&r.unwrap_err(), "/not/registered");
+        }
+    }
+
+    /// With a registered repo whose overlay yields NO tracker, every method
+    /// gets past confinement and reaches the router (so `Some(repo)` is
+    /// actually consumed, not just validated).
+    #[tokio::test]
+    async fn every_issues_method_applies_a_registered_repo_context() {
+        let repo = crate::repo_issues::test_support::git_repo();
+        let svc = service_with_registered(repo.path(), repo.path()).await;
+        let r = Some(repo.path().to_str().unwrap());
+        let filter = thegn_core::issue::IssueFilter::default();
+        let patch = thegn_core::issue::IssuePatch::default();
+        // The default config configures no tracker.
+        assert!(matches!(
+            svc.issues_list(&filter, r).await,
+            Err(ControlError::Unimplemented(_))
+        ));
+        for e in [
+            svc.issues_get("linear:T-1", r)
+                .await
+                .map(|_| ())
+                .unwrap_err(),
+            svc.issues_update("linear:T-1", &patch, r)
+                .await
+                .map(|_| ())
+                .unwrap_err(),
+            svc.issues_comment("linear:T-1", "hi", r).await.unwrap_err(),
+        ] {
+            assert!(
+                !matches!(e, ControlError::NotFound(ref m) if m.contains("not registered")),
+                "registered repo must pass confinement: {e:?}"
+            );
+        }
     }
 
     #[tokio::test]

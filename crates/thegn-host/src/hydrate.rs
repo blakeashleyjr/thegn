@@ -3861,27 +3861,26 @@ pub(crate) fn spawn_pr_cache_refresh_with_generation(
                 && let Ok(linked) = db.linked_issues(&wt)
                 && !linked.is_empty()
             {
-                if let Ok(issues_cfg) = crate::repo_issues::for_path(&cfg, &cwd) {
-                    let mut router = thegn_svc::issue::IssueRouter::from_config(&issues_cfg);
-                    // Provider-as-plugin: append live plugin issue providers.
-                    crate::plugin_providers::extend_issue_router(&mut router);
-                    if router.is_configured()
-                        && let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-                            .enable_all()
-                            .build()
-                    {
-                        let patch = thegn_core::issue::IssuePatch {
-                            status: Some(thegn_core::issue::IssueStatus::Done),
-                            ..Default::default()
-                        };
-                        for id in &linked {
-                            if let Err(e) = rt.block_on(router.update_issue(id, &patch)) {
-                                tracing::warn!(target: "thegn::issues", error = %e, "failed to move linked issue {id} to Done on merge");
-                            }
+                let local_cwd =
+                    matches!(loc, thegn_core::remote::GitLoc::Local(_)).then_some(cwd.as_path());
+                let issues_cfg = crate::repo_issues::for_merge_refresh(&cfg, local_cwd);
+                let mut router = thegn_svc::issue::IssueRouter::from_config(&issues_cfg);
+                // Provider-as-plugin: append live plugin issue providers.
+                crate::plugin_providers::extend_issue_router(&mut router);
+                if router.is_configured()
+                    && let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                {
+                    let patch = thegn_core::issue::IssuePatch {
+                        status: Some(thegn_core::issue::IssueStatus::Done),
+                        ..Default::default()
+                    };
+                    for id in &linked {
+                        if let Err(e) = rt.block_on(router.update_issue(id, &patch)) {
+                            tracing::warn!(target: "thegn::issues", error = %e, "failed to move linked issue {id} to Done on merge");
                         }
                     }
-                } else {
-                    tracing::warn!(target: "thegn::issues", worktree = %cwd.display(), "cannot resolve repo for move_on_merge; skipping linked issue updates");
                 }
             }
         }
