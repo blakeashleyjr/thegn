@@ -1220,16 +1220,10 @@ mod folder_tests {
     #[test]
     fn control_assignment_registers_an_absent_row_for_a_real_git_worktree() {
         let repo = tempfile::tempdir().unwrap();
-        let init = std::process::Command::new("git")
-            .args(["init", "--initial-branch=main"])
-            .current_dir(repo.path())
-            .output()
-            .unwrap();
-        assert!(
-            init.status.success(),
-            "{}",
-            String::from_utf8_lossy(&init.stderr)
-        );
+        assert!(thegn_core::util::git_ok(
+            repo.path(),
+            &["init", "--initial-branch=main"]
+        ));
         let db = db();
         let path = repo.path().to_string_lossy().into_owned();
         assert!(db.worktree_record(&path).unwrap().is_none());

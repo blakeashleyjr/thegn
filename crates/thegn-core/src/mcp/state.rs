@@ -1046,6 +1046,8 @@ mod tests {
             "sessions.input",
             "sessions.kill",
         ];
+        // Folder assignment is a repo-local worktree metadata mutation: Git.
+        let git = ["folders.assign"];
         let exec = ["tools.run"];
         for cap in read {
             let c = lookup(cap).expect("state cap in catalog");
@@ -1055,6 +1057,10 @@ mod tests {
             let c = lookup(cap).expect("state cap in catalog");
             assert_eq!(scope_of(c), Scope::Write, "{cap}");
         }
+        for cap in git {
+            let c = lookup(cap).expect("state cap in catalog");
+            assert_eq!(scope_of(c), Scope::Git, "{cap}");
+        }
         for cap in exec {
             let c = lookup(cap).expect("state cap in catalog");
             assert_eq!(scope_of(c), Scope::Exec, "{cap}");
@@ -1063,6 +1069,7 @@ mod tests {
         let mut grouped: Vec<&str> = read
             .iter()
             .chain(write.iter())
+            .chain(git.iter())
             .chain(exec.iter())
             .copied()
             .collect();
