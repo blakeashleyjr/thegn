@@ -74,7 +74,13 @@ pub fn run(cfg: &thegn_core::config::Config, action: Action) -> Result<()> {
             // `--status`/`--limit` select the tracker path; otherwise the
             // historical forge (`gh`) listing.
             if status.is_some() || limit.is_some() {
-                list_tracker_issues(cfg, status, limit.unwrap_or(0), json)
+                list_tracker_issues(
+                    cfg,
+                    std::env::current_dir().ok().as_deref(),
+                    status,
+                    limit.unwrap_or(0),
+                    json,
+                )
             } else {
                 list_issues(target.worktree, state, json)
             }
@@ -139,11 +145,12 @@ fn list_issues(worktree: Option<String>, state: String, json: bool) -> Result<()
 /// still goes to stdout alone, so piping keeps working.
 fn list_tracker_issues(
     cfg: &thegn_core::config::Config,
+    dir: Option<&std::path::Path>,
     status: Option<String>,
     limit: usize,
     json: bool,
 ) -> Result<()> {
-    let router = thegn_svc::issue::IssueRouter::from_config(&cfg.issues);
+    let router = tracker_router(cfg, dir);
     if !router.is_configured() {
         msg::die("no issue tracker configured (set [issues] providers/accounts)");
     }
@@ -188,6 +195,16 @@ fn list_tracker_issues(
         }
     }
     Ok(())
+}
+
+/// The router `issue list` queries: built from the `[issues]` config as
+/// narrowed by the repo containing `dir` (global when `dir` is not in a repo).
+fn tracker_router(
+    cfg: &thegn_core::config::Config,
+    dir: Option<&std::path::Path>,
+) -> thegn_svc::issue::IssueRouter {
+    let issues_cfg = crate::repo_issues::for_dir(cfg, dir);
+    thegn_svc::issue::IssueRouter::from_config(&issues_cfg)
 }
 
 /// Parse a comma-separated tracker status list (unknown names dropped).
@@ -285,4 +302,27 @@ fn comment_issue(worktree: Option<String>, number: u64, body: String) -> Result<
         Err(e) => msg::die(&format!("comment failed: {e}")),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod repo_scope_tests {
+    use super::*;
+    use crate::repo_issues::test_support::{overlay_repo, two_account_config};
+
+    #[test]
+    fn issue_list_router_honours_repo_overlay_inside_and_global_outside() {
+        let repo = overlay_repo();
+        let cfg = two_account_config();
+        let global = tracker_router(&cfg, None).provider_ids().len();
+        assert_eq!(global, 2, "global config exposes both accounts");
+        let inside = tracker_router(&cfg, Some(repo.path())).provider_ids().len();
+        assert_eq!(inside, 1, "overlay restricts to the pinned account");
+        let outside = tempfile::tempdir().unwrap();
+        assert_eq!(
+            tracker_router(&cfg, Some(outside.path()))
+                .provider_ids()
+                .len(),
+            global
+        );
+    }
 }

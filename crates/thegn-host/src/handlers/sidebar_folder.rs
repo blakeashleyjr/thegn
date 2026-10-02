@@ -83,6 +83,11 @@ pub(crate) fn file_worktree_path(
     let folder_owned = folder.to_string();
     let wt_path = wt_path.to_string();
     let repo_path = repo_path.to_string();
+    let known_kind = model
+        .sidebar_workspaces
+        .iter()
+        .find(|(_, _, _, path)| path == &repo_path)
+        .map(|(_, _, kind, _)| kind.clone());
     let refresh_tx = refresh_tx.clone();
     let waker = waker.clone();
     tokio::task::spawn_blocking(move || {
@@ -91,16 +96,23 @@ pub(crate) fn file_worktree_path(
         // entirely AFTER the toast said "Filed…", and the next hydration
         // visibly un-filed the row with no explanation.
         match thegn_core::db::Db::open() {
-            Ok(db) => match db.ensure_folder(&repo_path, &folder_owned) {
-                Ok(real_fid) => {
-                    if let Err(e) = db.set_worktree_folder(&wt_path, Some(real_fid)) {
-                        tracing::warn!(target: "thegn::sidebar", error = %e, "filing not persisted");
+            Ok(db) => {
+                let (workspace_name, workspace_kind) =
+                    crate::workspace_identity::workspace_identity(
+                        &repo_path,
+                        known_kind.as_deref(),
+                    );
+                match db.ensure_folder(&repo_path, &folder_owned, &workspace_name, workspace_kind) {
+                    Ok(real_fid) => {
+                        if let Err(e) = db.set_worktree_folder(&wt_path, Some(real_fid)) {
+                            tracing::warn!(target: "thegn::sidebar", error = %e, "filing not persisted");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(target: "thegn::sidebar", error = %e, "folder not created; filing not persisted");
                     }
                 }
-                Err(e) => {
-                    tracing::warn!(target: "thegn::sidebar", error = %e, "folder not created; filing not persisted");
-                }
-            },
+            }
             Err(e) => {
                 tracing::warn!(target: "thegn::sidebar", error = %e, "filing not persisted: DB unavailable");
             }

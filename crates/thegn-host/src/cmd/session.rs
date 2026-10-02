@@ -886,7 +886,7 @@ async fn gather_issue_facts(
         .iter()
         .any(|v| referenced.iter().any(|r| r == v));
     Ok(if needs_tracker {
-        let detail = client.issue_get(issue_id).await?;
+        let detail = client.issue_get(issue_id, None).await?;
         let issue = detail.issue;
         IssueFacts {
             number: pipeline_run::issue_key(issue_id),

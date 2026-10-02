@@ -284,6 +284,30 @@ pub(crate) fn fresh_id() -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Map a folder-assignment failure onto the control taxonomy by downcasting the
+/// typed [`crate::cmd::wt::FolderAssignError`]; anything untyped is internal.
+fn map_folder_assign_error(error: anyhow::Error) -> ControlError {
+    use crate::cmd::wt::FolderAssignError;
+    match error.downcast_ref::<FolderAssignError>() {
+        Some(FolderAssignError::NotFound(m)) => ControlError::NotFound(m.clone()),
+        Some(FolderAssignError::NotWorktree(m) | FolderAssignError::InvalidName(m)) => {
+            ControlError::InvalidArgument(m.clone())
+        }
+        Some(FolderAssignError::RepoMismatch(m)) => ControlError::FailedPrecondition(m.clone()),
+        Some(FolderAssignError::Conflict(m)) => ControlError::Conflict(m.clone()),
+        None => {
+            if error
+                .downcast_ref::<thegn_core::store::WorkspaceTombstonedError>()
+                .is_some()
+            {
+                ControlError::FailedPrecondition(error.to_string())
+            } else {
+                ControlError::Internal(error)
+            }
+        }
+    }
+}
+
 impl DaemonService {
     /// Run `f` against the shared DB on a blocking thread.
     pub(crate) async fn with_db<T, F>(&self, f: F) -> ControlResult<T>
@@ -442,6 +466,119 @@ impl DaemonService {
                 expires_at: None,
             });
         }
+    }
+}
+
+/// Cap on a client-supplied path echoed back in an error.
+const SHOWN_PATH_MAX: usize = 256;
+
+fn shown_path(path: &str) -> String {
+    path.chars().take(SHOWN_PATH_MAX).collect()
+}
+
+/// The uniform miss for an issues `repo` context: identical for a nonexistent
+/// path, a non-repo and an unregistered repo (no existence oracle), and the
+/// same variant/wording a confined read-verb returns for an unknown path.
+fn issue_repo_unregistered(repo: &str) -> ControlError {
+    ControlError::NotFound(format!(
+        "worktree not registered with thegn: {}",
+        shown_path(repo)
+    ))
+}
+
+/// Where an issues `repo` context resolves to.
+#[derive(Debug, PartialEq, Eq)]
+enum IssueRoot {
+    /// A registered local repo root whose overlay applies.
+    Repo(std::path::PathBuf),
+    /// Registered but non-local (remote/provider): never touch the host
+    /// filesystem for it, so the global config applies.
+    Global,
+}
+
+/// Resolve an issues `repo` context to a REGISTERED location. `requested` must
+/// be a registered workspace root or a registered worktree path. No git is run;
+/// the only filesystem access is `canonicalize` for the alias fallback (done
+/// outside the DB lock), never on an exact match and never for remote rows —
+/// an exact match to a remote row is registered but yields [`IssueRoot::Global`].
+/// The root returned is the registry's own, never the caller's string.
+fn registered_issue_root<F>(
+    workspaces: &[thegn_core::models::WorkspaceRow],
+    worktrees: &[thegn_core::models::WorktreeRow],
+    requested: &str,
+    canonicalize: F,
+) -> Option<IssueRoot>
+where
+    F: Fn(&str) -> std::path::PathBuf,
+{
+    let is_local = |row: &thegn_core::models::WorktreeRow| {
+        let location = row.location.trim();
+        location.is_empty() || location == "local"
+    };
+    if let Some(w) = workspaces.iter().find(|w| w.repo_path == requested) {
+        return Some(IssueRoot::Repo(std::path::PathBuf::from(&w.repo_path)));
+    }
+    if let Some(row) = worktrees.iter().find(|r| r.worktree == requested) {
+        return Some(if is_local(row) {
+            IssueRoot::Repo(std::path::PathBuf::from(&row.repo_root))
+        } else {
+            IssueRoot::Global
+        });
+    }
+    let want = canonicalize(requested);
+    if let Some(w) = workspaces
+        .iter()
+        .find(|w| canonicalize(&w.repo_path) == want)
+    {
+        return Some(IssueRoot::Repo(std::path::PathBuf::from(&w.repo_path)));
+    }
+    worktrees
+        .iter()
+        .filter(|row| is_local(row))
+        .find(|row| canonicalize(&row.worktree) == want)
+        .map(|row| IssueRoot::Repo(std::path::PathBuf::from(&row.repo_root)))
+}
+
+impl DaemonService {
+    /// The `[issues]` config for an issues verb. `None` keeps the global
+    /// config unchanged. An explicit `repo` is validated (non-empty, absolute)
+    /// and CONFINED to the registry before any overlay file is read — a
+    /// token-holding remote client must not make the daemon read an arbitrary
+    /// path. Matching runs no git and canonicalizes only outside the DB lock.
+    async fn issue_config_for_repo(
+        &self,
+        repo: Option<&str>,
+    ) -> ControlResult<thegn_core::config::IssuesConfig> {
+        let Some(repo) = repo else {
+            return Ok(self.config.issues.clone());
+        };
+        if repo.is_empty() || !std::path::Path::new(repo).is_absolute() {
+            return Err(ControlError::InvalidArgument(format!(
+                "repo must be an absolute path: {}",
+                shown_path(repo)
+            )));
+        }
+        // Copy the candidate rows out under the lock; match without it.
+        let (workspaces, worktrees) = self
+            .with_db(|db| {
+                use thegn_core::store::WorkspaceStore;
+                Ok((db.workspaces()?, db.worktrees()?))
+            })
+            .await?;
+        let requested = repo.to_string();
+        let config = self.config.clone();
+        let resolved = tokio::task::spawn_blocking(move || {
+            registered_issue_root(&workspaces, &worktrees, &requested, |path| {
+                std::fs::canonicalize(path).unwrap_or_else(|_| std::path::PathBuf::from(path))
+            })
+            .map(|root| match root {
+                IssueRoot::Repo(root) => config.repo_issues(Some(&root)),
+                IssueRoot::Global => config.issues.clone(),
+            })
+        })
+        .await
+        .map_err(|e| ControlError::Internal(anyhow::anyhow!("issues repo resolution: {e}")))?;
+        resolved.ok_or_else(|| issue_repo_unregistered(repo))
     }
 }
 
@@ -1728,9 +1865,11 @@ impl ControlApi for DaemonService {
     fn issues_list<'a>(
         &'a self,
         filter: &'a thegn_core::issue::IssueFilter,
+        repo: Option<&'a str>,
     ) -> BoxFuture<'a, ControlResult<Vec<thegn_core::issue::Issue>>> {
         Box::pin(async move {
-            let router = thegn_svc::issue::IssueRouter::from_config(&self.config.issues);
+            let issues_cfg = self.issue_config_for_repo(repo).await?;
+            let router = thegn_svc::issue::IssueRouter::from_config(&issues_cfg);
             if !router.is_configured() {
                 return Err(ControlError::Unimplemented(
                     "no issue tracker configured (set [issues] providers/accounts)",
@@ -1770,10 +1909,12 @@ impl ControlApi for DaemonService {
     fn issues_get<'a>(
         &'a self,
         id: &'a str,
+        repo: Option<&'a str>,
     ) -> BoxFuture<'a, ControlResult<thegn_core::issue::IssueDetail>> {
         Box::pin(async move {
             let shown_id: String = id.chars().take(256).collect();
-            let router = thegn_svc::issue::IssueRouter::from_config(&self.config.issues);
+            let issues_cfg = self.issue_config_for_repo(repo).await?;
+            let router = thegn_svc::issue::IssueRouter::from_config(&issues_cfg);
             router
                 .get_issue(id)
                 .await
@@ -1785,10 +1926,12 @@ impl ControlApi for DaemonService {
         &'a self,
         id: &'a str,
         patch: &'a thegn_core::issue::IssuePatch,
+        repo: Option<&'a str>,
     ) -> BoxFuture<'a, ControlResult<thegn_core::issue::Issue>> {
         Box::pin(async move {
             let shown_id: String = id.chars().take(256).collect();
-            let router = thegn_svc::issue::IssueRouter::from_config(&self.config.issues);
+            let issues_cfg = self.issue_config_for_repo(repo).await?;
+            let router = thegn_svc::issue::IssueRouter::from_config(&issues_cfg);
             router.update_issue(id, patch).await.map_err(|e| {
                 ControlError::Internal(anyhow::anyhow!("issues.update {shown_id}: {e}"))
             })
@@ -1799,10 +1942,12 @@ impl ControlApi for DaemonService {
         &'a self,
         id: &'a str,
         body: &'a str,
+        repo: Option<&'a str>,
     ) -> BoxFuture<'a, ControlResult<()>> {
         Box::pin(async move {
             let shown_id: String = id.chars().take(256).collect();
-            let router = thegn_svc::issue::IssueRouter::from_config(&self.config.issues);
+            let issues_cfg = self.issue_config_for_repo(repo).await?;
+            let router = thegn_svc::issue::IssueRouter::from_config(&issues_cfg);
             router.add_comment(id, body).await.map_err(|e| {
                 ControlError::Internal(anyhow::anyhow!("issues.comment {shown_id}: {e}"))
             })
@@ -2002,6 +2147,75 @@ impl ControlApi for DaemonService {
         })
     }
 
+    fn folder_assign(
+        &self,
+        req: thegn_svc::control::FolderAssignReq,
+    ) -> BoxFuture<'_, ControlResult<()>> {
+        Box::pin(async move {
+            use crate::cmd::wt::{self, FolderAssignError};
+            use thegn_svc::control::FolderAction;
+
+            if req.worktree.trim().is_empty() {
+                return Err(ControlError::InvalidArgument(
+                    "folders.assign requires a worktree path".into(),
+                ));
+            }
+            if !std::path::Path::new(&req.worktree).is_absolute() {
+                return Err(ControlError::InvalidArgument(
+                    "folders.assign worktree path must be absolute".into(),
+                ));
+            }
+            // Cheap, DB-free validation first, so a bad request never pays for
+            // (or is slowed by) the git resolution below.
+            let action = req.action()?;
+            let folder = match action {
+                FolderAction::Assign(name) => {
+                    Some(wt::validate_folder_name(name).map_err(map_folder_assign_error)?)
+                }
+                FolderAction::Clear => None,
+            };
+            // Resolve the worktree through git on its own blocking task — the
+            // daemon DB mutex must never be held across a git subprocess.
+            enum Resolved {
+                Assign(wt::FolderTarget, String),
+                Clear(std::path::PathBuf),
+            }
+            let worktree = req.worktree.clone();
+            let resolved = tokio::task::spawn_blocking(move || {
+                let path = std::path::Path::new(&worktree);
+                match folder {
+                    Some(name) => {
+                        wt::resolve_folder_target(path).map(|target| Resolved::Assign(target, name))
+                    }
+                    None => wt::resolve_worktree_root(path).map(Resolved::Clear),
+                }
+            })
+            .await
+            .map_err(|e| ControlError::Internal(anyhow::anyhow!("git task join: {e}")))?
+            .map_err(map_folder_assign_error)?;
+            self.with_db(move |db| match resolved {
+                Resolved::Assign(target, name) => {
+                    wt::file_folder_target(db, &target, &name).map(drop)
+                }
+                Resolved::Clear(root) => {
+                    let worktree = root.to_string_lossy().into_owned();
+                    if wt::clear_folder_if_registered(db, &worktree)? {
+                        Ok(())
+                    } else {
+                        Err(anyhow::Error::new(FolderAssignError::NotFound(format!(
+                            "worktree is not registered: {worktree}"
+                        ))))
+                    }
+                }
+            })
+            .await
+            .map_err(|error| match error {
+                ControlError::Internal(e) => map_folder_assign_error(e),
+                other => other,
+            })
+        })
+    }
+
     /// `agent.sessions`: a bounded filesystem scan of each harness's local
     /// session store. Off the runtime's worker threads (`spawn_blocking`) — it
     /// reads potentially many transcript heads. The DB supplies the tracked
@@ -2082,6 +2296,241 @@ impl ControlApi for DaemonService {
 mod tests {
     use super::*;
 
+    #[test]
+    fn tombstoned_workspace_maps_to_failed_precondition_and_untyped_stays_internal() {
+        let typed = anyhow::Error::new(thegn_core::store::WorkspaceTombstonedError {
+            repo_path: "/gone".into(),
+        });
+        match map_folder_assign_error(typed) {
+            ControlError::FailedPrecondition(m) => {
+                assert!(m.contains("/gone") && m.contains("was removed"), "{m}");
+            }
+            other => panic!("expected FailedPrecondition, got {other:?}"),
+        }
+        // A look-alike message without the typed error is NOT classified by text.
+        let lookalike = anyhow::anyhow!("workspace /x was removed");
+        assert!(matches!(
+            map_folder_assign_error(lookalike),
+            ControlError::Internal(_)
+        ));
+    }
+
+    /// A service whose registry holds `repo` as a workspace root and `wt` as a
+    /// registered worktree of it.
+    async fn service_with_registered(
+        repo: &std::path::Path,
+        wt: &std::path::Path,
+    ) -> DaemonService {
+        let (svc, _rx) = service(0);
+        let (repo, wt) = (repo.display().to_string(), wt.display().to_string());
+        svc.with_db(move |db| {
+            use thegn_core::store::WorkspaceStore;
+            db.put_workspace(&repo, "repo", "repo")?;
+            db.put_worktree("repo/feature", &repo, &wt, "feature", None, None)?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        svc
+    }
+
+    fn assert_uniform_miss(e: &ControlError, shown: &str) {
+        match e {
+            ControlError::NotFound(m) => {
+                assert_eq!(m, &format!("worktree not registered with thegn: {shown}"));
+            }
+            other => panic!("expected uniform NotFound, got {other:?}"),
+        }
+    }
+
+    fn ws(path: &str) -> thegn_core::models::WorkspaceRow {
+        thegn_core::models::WorkspaceRow {
+            repo_path: path.into(),
+            name: "w".into(),
+            created_at: 0,
+            last_active: 0,
+            kind: "repo".into(),
+        }
+    }
+
+    fn wt_row(path: &str, root: &str, location: &str) -> thegn_core::models::WorktreeRow {
+        use thegn_core::store::WorkspaceStore;
+        let db = Db::open_memory().unwrap();
+        db.put_worktree("t", root, path, "b", Some(location), None)
+            .unwrap();
+        db.worktrees().unwrap().remove(0)
+    }
+
+    #[test]
+    fn registered_issue_root_matching_rules() {
+        use std::path::PathBuf;
+        let workspaces = [ws("/r")];
+        let local = wt_row("/r-wt", "/r", "local");
+        let remote = wt_row("/prov/wt", "/r", r#"{"kind":"provider"}"#);
+        let rows = [local, remote];
+        let panics =
+            |_: &str| -> PathBuf { panic!("canonicalizer must not run on an exact match") };
+        // exact workspace + exact local worktree: registry root, no canonicalize
+        assert_eq!(
+            registered_issue_root(&workspaces, &rows, "/r", panics),
+            Some(IssueRoot::Repo("/r".into()))
+        );
+        assert_eq!(
+            registered_issue_root(&workspaces, &rows, "/r-wt", panics),
+            Some(IssueRoot::Repo("/r".into()))
+        );
+        // exact remote match: registered, global, no canonicalize
+        assert_eq!(
+            registered_issue_root(&workspaces, &rows, "/prov/wt", panics),
+            Some(IssueRoot::Global)
+        );
+        // alias of a local worktree matches and returns the registry root
+        let alias = |p: &str| PathBuf::from(p.replace("/alias", "/r-wt"));
+        assert_eq!(
+            registered_issue_root(&workspaces, &rows, "/alias", alias),
+            Some(IssueRoot::Repo("/r".into()))
+        );
+        // a path that canonicalizes equal to a REMOTE row is not alias-matched
+        let to_remote = |p: &str| PathBuf::from(p.replace("/alias", "/prov/wt"));
+        assert_eq!(
+            registered_issue_root(&workspaces, &rows, "/alias", to_remote),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn issue_repo_context_applies_overlay_for_registered_root_and_worktree() {
+        use crate::repo_issues::test_support::{overlay_repo, two_account_config};
+        let repo = overlay_repo();
+        let wt = tempfile::tempdir().unwrap();
+        let (svc, _rx) = service_with_config(0, two_account_config());
+        let (r, w) = (
+            repo.path().display().to_string(),
+            wt.path().display().to_string(),
+        );
+        svc.with_db(move |db| {
+            use thegn_core::store::WorkspaceStore;
+            db.put_workspace(&r, "repo", "repo")?;
+            db.put_worktree("repo/feature", &r, &w, "feature", None, None)?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        for path in [repo.path(), wt.path()] {
+            let scoped = svc
+                .issue_config_for_repo(Some(&path.display().to_string()))
+                .await
+                .unwrap();
+            assert_eq!(scoped.issue_accounts.len(), 1, "{path:?}");
+            assert_eq!(scoped.linear.team_id, "TEAM-PIN");
+            assert_eq!(scoped.kaneo.project_id, "PROJECT-PIN");
+        }
+        let global = svc.issue_config_for_repo(None).await.unwrap();
+        assert_eq!(global.issue_accounts.len(), 2);
+        assert_eq!(global.linear.team_id, svc.config.issues.linear.team_id);
+    }
+
+    #[tokio::test]
+    async fn issue_repo_context_miss_is_uniform() {
+        use crate::repo_issues::test_support::overlay_repo;
+        let registered = overlay_repo();
+        let svc = service_with_registered(registered.path(), registered.path()).await;
+        // A real, perfectly good git repo that is NOT registered.
+        let unregistered = overlay_repo();
+        // An existing non-repo directory and a path that does not exist.
+        let non_repo = tempfile::tempdir().unwrap();
+        let missing = non_repo.path().join("does-not-exist");
+        let mut errors = Vec::new();
+        for p in [unregistered.path(), non_repo.path(), missing.as_path()] {
+            let shown = p.display().to_string();
+            let e = svc.issue_config_for_repo(Some(&shown)).await.unwrap_err();
+            assert_uniform_miss(&e, &shown);
+            errors.push(e.to_string().replace(&shown, "<p>"));
+        }
+        assert!(
+            errors.windows(2).all(|w| w[0] == w[1]),
+            "miss errors must be identical modulo the echoed path: {errors:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn issue_repo_context_rejects_empty_and_relative_before_anything_else() {
+        let (svc, _rx) = service(0);
+        for bad in ["", ".", "foo"] {
+            let e = svc.issue_config_for_repo(Some(bad)).await.unwrap_err();
+            assert!(
+                matches!(e, ControlError::InvalidArgument(_)),
+                "{bad:?}: {e:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn issue_repo_context_truncates_echoed_path() {
+        let (svc, _rx) = service(0);
+        let long = format!("/{}", "a".repeat(5000));
+        let e = svc.issue_config_for_repo(Some(&long)).await.unwrap_err();
+        assert!(e.to_string().len() < 400, "{}", e.to_string().len());
+        let rel = "b".repeat(5000);
+        let e = svc.issue_config_for_repo(Some(&rel)).await.unwrap_err();
+        assert!(e.to_string().len() < 400);
+    }
+
+    /// Each of the four `issues_*` methods threads `Some(repo)` through the
+    /// confinement: an unregistered repo is refused before any tracker call.
+    #[tokio::test]
+    async fn every_issues_method_confines_an_explicit_repo() {
+        let (svc, _rx) = service(0);
+        let repo = Some("/not/registered");
+        let filter = thegn_core::issue::IssueFilter::default();
+        let patch = thegn_core::issue::IssuePatch::default();
+        let results = [
+            svc.issues_list(&filter, repo).await.map(|_| ()),
+            svc.issues_get("linear:T-1", repo).await.map(|_| ()),
+            svc.issues_update("linear:T-1", &patch, repo)
+                .await
+                .map(|_| ()),
+            svc.issues_comment("linear:T-1", "hi", repo).await,
+        ];
+        for r in results {
+            assert_uniform_miss(&r.unwrap_err(), "/not/registered");
+        }
+    }
+
+    /// With a registered repo whose overlay yields NO tracker, every method
+    /// gets past confinement and reaches the router (so `Some(repo)` is
+    /// actually consumed, not just validated).
+    #[tokio::test]
+    async fn every_issues_method_applies_a_registered_repo_context() {
+        let repo = crate::repo_issues::test_support::git_repo();
+        let svc = service_with_registered(repo.path(), repo.path()).await;
+        let r = Some(repo.path().to_str().unwrap());
+        let filter = thegn_core::issue::IssueFilter::default();
+        let patch = thegn_core::issue::IssuePatch::default();
+        // The default config configures no tracker.
+        assert!(matches!(
+            svc.issues_list(&filter, r).await,
+            Err(ControlError::Unimplemented(_))
+        ));
+        for e in [
+            svc.issues_get("linear:T-1", r)
+                .await
+                .map(|_| ())
+                .unwrap_err(),
+            svc.issues_update("linear:T-1", &patch, r)
+                .await
+                .map(|_| ())
+                .unwrap_err(),
+            svc.issues_comment("linear:T-1", "hi", r).await.unwrap_err(),
+        ] {
+            assert!(
+                !matches!(e, ControlError::NotFound(ref m) if m.contains("not registered")),
+                "registered repo must pass confinement: {e:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn ci_logs_rejects_malformed_ids_before_cache_or_provider_access() {
         let (service, _) = service(0);
@@ -2138,6 +2587,176 @@ mod tests {
             endpoint: "/run/test.sock".into(),
         };
         (svc, rx)
+    }
+
+    fn folder_req(
+        worktree: &std::path::Path,
+        folder: Option<&str>,
+        clear: bool,
+    ) -> thegn_svc::control::FolderAssignReq {
+        thegn_svc::control::FolderAssignReq {
+            worktree: worktree.to_string_lossy().into_owned(),
+            folder: folder.map(str::to_string),
+            clear,
+        }
+    }
+
+    /// A real git worktree (canonical path, so macOS `/private/var` aliasing
+    /// cannot skew comparisons).
+    fn git_worktree() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().canonicalize().unwrap();
+        assert!(thegn_core::util::git_ok(
+            &path,
+            &["init", "--initial-branch=main"]
+        ));
+        (dir, path)
+    }
+
+    #[tokio::test]
+    async fn folder_assign_clear_on_unregistered_worktree_is_not_found() {
+        let (service, _) = service(0);
+        let (_dir, path) = git_worktree();
+        let error = service
+            .folder_assign(folder_req(&path, None, true))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ControlError::NotFound(_)), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn folder_assign_blank_name_is_invalid_and_registers_nothing() {
+        use thegn_core::store::WorkspaceStore;
+        let (service, _) = service(0);
+        let (_dir, path) = git_worktree();
+        for bad in ["   ", "a\nb", &"x".repeat(65)] {
+            let error = service
+                .folder_assign(folder_req(&path, Some(bad), false))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, ControlError::InvalidArgument(_)),
+                "{error:?}"
+            );
+        }
+        assert!(service.db.lock().unwrap().worktrees().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn folder_assign_accepts_an_existing_overlong_folder_but_not_a_new_one() {
+        use thegn_core::store::WorkspaceStore;
+        let (service, _) = service(0);
+        let (_dir, path) = git_worktree();
+        let key = path.to_string_lossy().into_owned();
+        let long = "L".repeat(80);
+        {
+            let db = service.db.lock().unwrap();
+            db.put_workspace(&key, "repo", "repo").unwrap();
+            db.ensure_folder(&key, &long, "repo", "repo").unwrap();
+        }
+        service
+            .folder_assign(folder_req(&path, Some(&long), false))
+            .await
+            .unwrap();
+        let error = service
+            .folder_assign(folder_req(&path, Some(&"N".repeat(80)), false))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, ControlError::InvalidArgument(_)),
+            "{error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn folder_assign_requires_exactly_one_of_folder_or_clear() {
+        let (service, _) = service(0);
+        let (_dir, path) = git_worktree();
+        for (folder, clear) in [(None, false), (Some("A"), true)] {
+            let error = service
+                .folder_assign(folder_req(&path, folder, clear))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, ControlError::InvalidArgument(_)),
+                "{error:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn folder_assign_then_clear_keeps_the_folder() {
+        use thegn_core::store::WorkspaceStore;
+        let (service, _) = service(0);
+        let (_dir, path) = git_worktree();
+        service
+            .folder_assign(folder_req(&path, Some("  Agents "), false))
+            .await
+            .unwrap();
+        let key = path.to_string_lossy().into_owned();
+        {
+            let db = service.db.lock().unwrap();
+            assert!(
+                db.worktree_record(&key)
+                    .unwrap()
+                    .unwrap()
+                    .folder_id
+                    .is_some()
+            );
+        }
+        service
+            .folder_assign(folder_req(&path, None, true))
+            .await
+            .unwrap();
+        let db = service.db.lock().unwrap();
+        assert_eq!(db.worktree_record(&key).unwrap().unwrap().folder_id, None);
+        assert_eq!(db.folders_for_workspace(&key).unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn folder_assign_repo_mismatch_is_a_failed_precondition_and_writes_nothing() {
+        use thegn_core::store::WorkspaceStore;
+        let (service, _) = service(0);
+        let (_dir, path) = git_worktree();
+        let key = path.to_string_lossy().into_owned();
+        // A row for this worktree already exists under a FOREIGN repo: the
+        // assignment is refused before any write.
+        service
+            .db
+            .lock()
+            .unwrap()
+            .put_worktree("other/main", "/some/other/repo", &key, "main", None, None)
+            .unwrap();
+        let error = service
+            .folder_assign(folder_req(&path, Some("Agents"), false))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, ControlError::FailedPrecondition(_)),
+            "{error:?}"
+        );
+        let db = service.db.lock().unwrap();
+        assert_eq!(db.worktrees().unwrap().len(), 1, "no new worktree row");
+        assert!(db.folders_for_workspace(&key).unwrap().is_empty());
+        assert!(db.workspaces().unwrap().is_empty(), "no workspace row");
+    }
+
+    #[tokio::test]
+    async fn folder_assign_non_worktree_is_invalid() {
+        let (service, _) = service(0);
+        let dir = tempfile::tempdir().unwrap();
+        let error = service
+            .folder_assign(folder_req(
+                &dir.path().canonicalize().unwrap(),
+                Some("A"),
+                false,
+            ))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, ControlError::InvalidArgument(_)),
+            "{error:?}"
+        );
     }
 
     #[test]
@@ -2837,7 +3456,7 @@ mod tests {
         let (svc, _rx) = service(0);
         let filter = thegn_core::issue::IssueFilter::default();
         assert!(matches!(
-            svc.issues_list(&filter).await,
+            svc.issues_list(&filter, None).await,
             Err(ControlError::Unimplemented(_))
         ));
     }

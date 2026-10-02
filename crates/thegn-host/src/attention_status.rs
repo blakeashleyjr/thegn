@@ -119,11 +119,12 @@ pub(crate) fn collect_attention(
             .split_once('/')
             .map(|(s, _)| s.to_string())
             .unwrap_or_default();
+        let is_home = crate::sidebar::is_home_tab(&slug, &wt.tab_name);
         meta.insert(
             wt.worktree.clone(),
             Meta {
                 slug,
-                is_home: wt.branch == "home",
+                is_home,
                 position: wt.position,
                 repo: wt.repo_root.clone(),
             },
@@ -133,10 +134,10 @@ pub(crate) fn collect_attention(
         if g.path.is_empty() {
             continue;
         }
-        let (slug, branch) = crate::sidebar::split_tab(&g.name).unwrap_or_default();
+        let (slug, _) = crate::sidebar::split_tab(&g.name).unwrap_or_default();
         meta.entry(g.path.clone()).or_insert_with(|| Meta {
             slug,
-            is_home: branch == "home",
+            is_home: g.kind == crate::session::GroupKind::Home,
             position: gi as i64,
             // Session-only groups (freshly created, not yet persisted) aren't in
             // the registry, so resolve their repo the same way the registry rows
@@ -859,5 +860,49 @@ mod tests {
             thegn_core::attention::AttentionTier::Blocked
         );
         assert!(status.attention["/wt/q"].needs_user());
+    }
+
+    #[test]
+    fn attention_home_tiebreak_uses_tab_identity_and_session_kind() {
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        // The ordinary worktree is on a branch literally named `home`; its
+        // escaped tab is not the workspace's home identity. The actual home
+        // checkout is on main, but keeps the canonical home tab.
+        db.put_worktree("app/home~", "/repo", "/wt/branch-home", "home", None, None)
+            .unwrap();
+        db.put_worktree("app/home", "/repo", "/wt/home", "main", None, None)
+            .unwrap();
+        let mut status = crate::sidebar::SidebarStatus::default();
+        order_memo().lock().unwrap().clear();
+        collect_attention(&session_with(&[]), &db, &mut status);
+        assert!(status.attention_ranks["/wt/home"] < status.attention_ranks["/wt/branch-home"]);
+
+        // A session-only Home group has authoritative kind even when the
+        // branch-shaped part of its name is not `home`.
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        db.put_worktree(
+            "app/ordinary",
+            "/repo",
+            "/wt/a-ordinary",
+            "ordinary",
+            None,
+            None,
+        )
+        .unwrap();
+        let session = Session {
+            id: "s".into(),
+            worktrees: vec![WorktreeGroup::new(
+                "app/session-branch-name",
+                GroupKind::Home,
+                "/wt/z-session-home",
+            )],
+            active: 0,
+        };
+        let mut status = crate::sidebar::SidebarStatus::default();
+        order_memo().lock().unwrap().clear();
+        collect_attention(&session, &db, &mut status);
+        assert!(
+            status.attention_ranks["/wt/z-session-home"] < status.attention_ranks["/wt/a-ordinary"]
+        );
     }
 }

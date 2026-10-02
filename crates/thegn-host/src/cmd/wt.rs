@@ -297,11 +297,28 @@ fn create_and_register(
     folder: Option<&str>,
     db: &Db,
 ) -> Result<(String, Option<anyhow::Error>)> {
-    // A creation that is going to fail filing for a knowable reason (bad name,
-    // removed workspace) must not create anything.
-    let folder = match folder {
-        Some(name) => Some(check_folder_fileable(db, &root.to_string_lossy(), name)?),
-        None => None,
+    let folder = effective_folder(folder, cfg.default_folder.as_deref());
+    // An EXPLICIT folder that is going to fail filing for a knowable reason (bad
+    // name, removed workspace) must not create anything. A folder that only
+    // comes from the configured default is a convenience, never a reason to
+    // refuse creation: warn and create the worktree unfiled.
+    let (folder, folder_source) = match folder {
+        Some((name, FolderSource::Explicit)) => (
+            Some(check_folder_fileable(db, &root.to_string_lossy(), name)?),
+            FolderSource::Explicit,
+        ),
+        Some((name, FolderSource::Configured)) => {
+            match check_folder_fileable(db, &root.to_string_lossy(), name) {
+                Ok(name) => (Some(name), FolderSource::Configured),
+                Err(e) => {
+                    msg::warn(&format!(
+                        "default_folder {name:?} not applied: {e}; creating the worktree unfiled"
+                    ));
+                    (None, FolderSource::Configured)
+                }
+            }
+        }
+        None => (None, FolderSource::Explicit),
     };
     // THE-516: fallible identity resolution — never a basename/slug alias.
     // The slug comes from the caller's OWN handle (`db`), not a second
@@ -394,23 +411,109 @@ fn create_and_register(
     let filing_error = folder.and_then(|folder_name| {
         file_registered_worktree(db, &root_s, &path_s, &folder_name)
             .err()
-            .map(|e| {
-                anyhow::anyhow!(
+            .and_then(|e| {
+                let err = anyhow::anyhow!(
                     "{e}; the worktree at {path_s} was created, registered and set up, \
                      but NOT filed into {folder_name:?}; retry the filing with \
                      `thegn wt folder {path_s:?} {folder_name:?}` once the cause above is fixed"
-                )
+                );
+                // A configured default never fails the command: surface it as
+                // a warning and let the caller print the path and exit 0.
+                if folder_source == FolderSource::Configured {
+                    msg::warn(&err.to_string());
+                    None
+                } else {
+                    Some(err)
+                }
             })
     });
     Ok((path_s, filing_error))
 }
 
+/// Select the command-line folder when supplied, otherwise the configured
+/// default. Kept at the shared creation boundary so single and batched paths
+/// apply the same policy.
+fn effective_folder<'a>(
+    explicit: Option<&'a str>,
+    configured: Option<&'a str>,
+) -> Option<(&'a str, FolderSource)> {
+    explicit
+        .map(|name| (name, FolderSource::Explicit))
+        .or(configured.map(|name| (name, FolderSource::Configured)))
+}
+
+/// Where the folder for a new worktree came from. An explicit `--folder` is
+/// strict (any filing problem is an error); the configured default is
+/// best-effort and can only ever produce warnings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FolderSource {
+    Explicit,
+    Configured,
+}
+
+/// Longest accepted folder name, in characters (after trimming).
+pub(crate) const MAX_FOLDER_NAME_CHARS: usize = 64;
+
+/// Typed failures of the shared folder-assignment path, attached to the
+/// `anyhow::Error` so the control mapper downcasts instead of matching message
+/// text. The `Display` strings are the CLI's user-facing messages.
+#[derive(Debug)]
+pub(crate) enum FolderAssignError {
+    /// The path is not a git worktree.
+    NotWorktree(String),
+    /// The worktree has no registered row (clear only).
+    NotFound(String),
+    /// The folder name is blank, over-long or contains control characters.
+    InvalidName(String),
+    /// The worktree is already registered under a different repo — a
+    /// persistent condition, not a race.
+    RepoMismatch(String),
+    /// The worktree/folder identity changed between lookup and write.
+    Conflict(String),
+}
+
+impl std::fmt::Display for FolderAssignError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotWorktree(m)
+            | Self::NotFound(m)
+            | Self::InvalidName(m)
+            | Self::RepoMismatch(m)
+            | Self::Conflict(m) => f.write_str(m),
+        }
+    }
+}
+
+impl std::error::Error for FolderAssignError {}
+
 /// Validate before touching the folder table: `ensure_folder` intentionally
-/// accepts empty strings for its lower-level callers.
-fn validate_folder_name(name: &str) -> Result<String> {
+/// accepts empty strings for its lower-level callers. Blank is always refused;
+/// hygiene limits apply only to NEW names ([`validate_new_folder_name`]), so a
+/// folder created elsewhere (the TUI has no cap) stays assignable.
+pub(crate) fn validate_folder_name(name: &str) -> Result<String> {
     let name = name.trim();
     if name.is_empty() {
-        anyhow::bail!("folder name must not be empty");
+        return Err(anyhow::Error::new(FolderAssignError::InvalidName(
+            "folder name must not be empty".into(),
+        )));
+    }
+    Ok(name.to_string())
+}
+
+/// Hygiene for a name that would CREATE a folder: no control characters, at
+/// most [`MAX_FOLDER_NAME_CHARS`] characters.
+pub(crate) fn validate_new_folder_name(name: &str) -> Result<String> {
+    let name = validate_folder_name(name)?;
+    let invalid = |m: String| anyhow::Error::new(FolderAssignError::InvalidName(m));
+    if name.chars().any(char::is_control) {
+        return Err(invalid(
+            "folder name must not contain control characters".into(),
+        ));
+    }
+    if name.chars().count() > MAX_FOLDER_NAME_CHARS {
+        return Err(invalid(format!(
+            "folder name must be at most {MAX_FOLDER_NAME_CHARS} characters"
+        )));
     }
     Ok(name.to_string())
 }
@@ -422,11 +525,19 @@ fn validate_folder_name(name: &str) -> Result<String> {
 /// trimmed folder name.
 fn check_folder_fileable(db: &Db, repo_path: &str, folder_name: &str) -> Result<String> {
     let folder_name = validate_folder_name(folder_name)?;
-    if db.workspace_tombstoned(repo_path).unwrap_or(false) {
-        anyhow::bail!(
-            "workspace {repo_path} was removed from thegn; re-add it before filing \
-             its worktrees into a folder"
-        );
+    // Same matching `ensure_folder` uses: an existing folder is accepted as-is.
+    let exists = db
+        .folders_for_workspace(repo_path)?
+        .iter()
+        .any(|f| f.name.trim().eq_ignore_ascii_case(&folder_name));
+    if !exists {
+        validate_new_folder_name(&folder_name)?;
+    }
+    if db.workspace_tombstoned(repo_path)? {
+        return Err(thegn_core::store::WorkspaceTombstonedError {
+            repo_path: repo_path.to_string(),
+        }
+        .into());
     }
     Ok(folder_name)
 }
@@ -441,6 +552,18 @@ fn file_registered_worktree(
     folder_name: &str,
 ) -> Result<()> {
     let folder_name = check_folder_fileable(db, repo_path, folder_name)?;
+    // A row registered under a different repo can never be filed here: refuse
+    // before any write (workspace row, folder) so a rejected call leaves nothing.
+    if let Some(row) = db.worktree_record(worktree_path)?
+        && row.repo_root != repo_path
+    {
+        return Err(anyhow::Error::new(FolderAssignError::RepoMismatch(
+            format!(
+                "worktree {worktree_path} is registered under a different repository ({})",
+                row.repo_root
+            ),
+        )));
+    }
     // `folders.repo_path` REFERENCES `workspaces(repo_path)`, and that row is
     // otherwise only ever written by the compositor's hydration — so filing from
     // the CLI against a repo that has never been opened in the TUI would fail
@@ -448,25 +571,22 @@ fn file_registered_worktree(
     // hydrate's name/kind rule. A workspace the user explicitly removed is
     // tombstoned: honour that instead of resurrecting it as a side effect of
     // filing a folder.
-    let repo = std::path::Path::new(repo_path);
-    let workspace_name = repo
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "workspace".into());
-    let kind = if thegn_core::repo::main_worktree(repo).is_some() {
-        "repo"
-    } else {
-        "dir"
-    };
-    db.put_workspace(repo_path, &workspace_name, kind)?;
-    let folder_id = db.ensure_folder(repo_path, &folder_name)?;
+    let (workspace_name, workspace_kind) =
+        crate::workspace_identity::workspace_identity(repo_path, Some("repo"));
+    let folder_id = db.ensure_folder(repo_path, &folder_name, &workspace_name, workspace_kind)?;
     let folder = db
         .folders_for_workspace(repo_path)?
         .into_iter()
         .find(|folder| folder.folder_id == folder_id && folder.repo_path == repo_path)
-        .ok_or_else(|| anyhow::anyhow!("folder disappeared before worktree filing"))?;
+        .ok_or_else(|| {
+            anyhow::Error::new(FolderAssignError::Conflict(
+                "folder disappeared before worktree filing".into(),
+            ))
+        })?;
     if !db.set_worktree_folder_if_identity(worktree_path, repo_path, folder_id, &folder.name)? {
-        anyhow::bail!("worktree or folder identity changed before filing");
+        return Err(anyhow::Error::new(FolderAssignError::Conflict(
+            "worktree or folder identity changed before filing".into(),
+        )));
     }
     Ok(())
 }
@@ -493,12 +613,91 @@ fn register_and_file_worktree(
 
 /// `--clear`: unfile an existing row without ever creating one. Returns whether
 /// a row existed.
-fn clear_folder_if_registered(db: &Db, worktree_path: &str) -> Result<bool> {
+pub(crate) fn clear_folder_if_registered(db: &Db, worktree_path: &str) -> Result<bool> {
     if db.worktree_record(worktree_path)?.is_none() {
         return Ok(false);
     }
     db.set_worktree_folder(worktree_path, None)?;
     Ok(true)
+}
+
+/// A path resolved (through git) to its actual worktree: everything the filing
+/// write needs, gathered without touching the DB.
+pub(crate) struct FolderTarget {
+    pub repo_path: String,
+    pub worktree_path: String,
+    pub branch: String,
+}
+
+fn not_worktree(target: &std::path::Path) -> anyhow::Error {
+    anyhow::Error::new(FolderAssignError::NotWorktree(format!(
+        "not a git worktree: {}",
+        target.display()
+    )))
+}
+
+/// Resolve a path to its worktree root (git subprocesses; never call while
+/// holding the daemon DB lock).
+pub(crate) fn resolve_worktree_root(target: &std::path::Path) -> Result<std::path::PathBuf> {
+    thegn_core::repo::worktree_root_for_cwd(target).ok_or_else(|| not_worktree(target))
+}
+
+/// Resolve a path to worktree root, repo and live branch identity (git
+/// subprocesses; never call while holding the daemon DB lock).
+pub(crate) fn resolve_folder_target(target: &std::path::Path) -> Result<FolderTarget> {
+    let worktree_root = resolve_worktree_root(target)?;
+    let repo_root =
+        thegn_core::repo::main_worktree(&worktree_root).ok_or_else(|| not_worktree(target))?;
+    let branch = util::git_out(&worktree_root, &["symbolic-ref", "--short", "-q", "HEAD"])
+        .or_else(|| {
+            util::git_out(&worktree_root, &["rev-parse", "--short", "HEAD"])
+                .map(|commit| format!("detached-{commit}"))
+        })
+        .ok_or_else(|| anyhow::anyhow!("could not determine worktree identity"))?;
+    Ok(FolderTarget {
+        repo_path: repo_root.to_string_lossy().into_owned(),
+        worktree_path: worktree_root.to_string_lossy().into_owned(),
+        branch,
+    })
+}
+
+/// File a resolved target into `folder_name`. Everything knowable up front is
+/// validated BEFORE the first write, so a rejected call never registers the
+/// worktree row as a side effect. Returns the worktree path.
+pub(crate) fn file_folder_target(
+    db: &Db,
+    target: &FolderTarget,
+    folder_name: &str,
+) -> Result<String> {
+    let folder_name = check_folder_fileable(db, &target.repo_path, folder_name)?;
+    register_and_file_worktree(
+        db,
+        &target.repo_path,
+        &target.worktree_path,
+        &target.branch,
+        &folder_name,
+    )?;
+    Ok(target.worktree_path.clone())
+}
+
+/// Refuse, before ANY worktree exists, a folder name the batch would have to
+/// CREATE in some target repo but that fails the new-name rules. A repo that
+/// already has a matching folder accepts the name as-is (read-only lookup).
+fn preflight_new_folder_name<'a>(
+    db: &Db,
+    repo_roots: impl IntoIterator<Item = &'a str>,
+    folder_name: &str,
+) -> Result<()> {
+    for repo in repo_roots {
+        let exists = db
+            .folders_for_workspace(repo)?
+            .iter()
+            .any(|f| f.name.trim().eq_ignore_ascii_case(folder_name.trim()));
+        if !exists {
+            validate_new_folder_name(folder_name)?;
+        }
+    }
+    Ok(())
 }
 
 /// Resolve the supplied directory through Git and file/unfile that actual
@@ -509,25 +708,18 @@ fn folder(target: &str, name: Option<&str>, clear: bool) -> Result<()> {
     }
     let folder_name = name.map(validate_folder_name).transpose()?;
     let target = super::resolve_worktree(Some(target.to_string()));
-    let Some(worktree_root) = thegn_core::repo::worktree_root_for_cwd(&target) else {
-        anyhow::bail!("not a git worktree: {}", target.display());
-    };
-    let Some(repo_root) = thegn_core::repo::main_worktree(&worktree_root) else {
-        anyhow::bail!("not a git worktree: {}", target.display());
-    };
-    let repo_path = repo_root.to_string_lossy().into_owned();
-    let worktree_path = worktree_root.to_string_lossy().into_owned();
-    let branch = util::git_out(&worktree_root, &["symbolic-ref", "--short", "-q", "HEAD"])
-        .or_else(|| {
-            util::git_out(&worktree_root, &["rev-parse", "--short", "HEAD"])
-                .map(|commit| format!("detached-{commit}"))
-        })
-        .ok_or_else(|| anyhow::anyhow!("could not determine worktree identity"))?;
-    let db = Db::open()?;
+    // Resolve through git BEFORE opening the DB: a non-git path must fail
+    // without opening (or creating) it.
     if let Some(folder_name) = folder_name {
-        register_and_file_worktree(&db, &repo_path, &worktree_path, &branch, &folder_name)?;
+        let resolved = resolve_folder_target(&target)?;
+        let db = Db::open()?;
+        let worktree_path = file_folder_target(&db, &resolved, &folder_name)?;
         outln!("Filed {worktree_path} into folder \"{folder_name}\"");
     } else {
+        let worktree_path = resolve_worktree_root(&target)?
+            .to_string_lossy()
+            .into_owned();
+        let db = Db::open()?;
         // Never register on --clear: an unregistered worktree has no folder.
         if clear_folder_if_registered(&db, &worktree_path)? {
             outln!("Unfiled {worktree_path}");
@@ -621,6 +813,17 @@ fn new_batched(
             .collect()
     });
     let plan = project::plan_batched_create(&branch, &states, repos_filter.as_deref());
+
+    if let Some(name) = folder.as_deref() {
+        preflight_new_folder_name(
+            &db,
+            plan.members
+                .iter()
+                .filter(|m| matches!(m.plan, MemberPlan::Create))
+                .map(|m| m.repo_root.as_str()),
+            name,
+        )?;
+    }
 
     // Execute member by member — each independent, no rollback of siblings.
     #[derive(serde::Serialize)]
@@ -1090,9 +1293,11 @@ mod rm_tests {
 #[cfg(test)]
 mod folder_tests {
     use super::{
-        check_folder_fileable, clear_folder_if_registered, file_registered_worktree,
-        register_and_file_worktree, validate_folder_name,
+        FolderSource, check_folder_fileable, clear_folder_if_registered, create_and_register,
+        effective_folder, file_registered_worktree, register_and_file_worktree,
+        validate_folder_name,
     };
+    use thegn_core::config::Config;
     use thegn_core::db::Db;
     use thegn_core::store::WorkspaceStore;
 
@@ -1103,6 +1308,21 @@ mod folder_tests {
 
     fn db() -> Db {
         Db::open_memory().unwrap()
+    }
+
+    fn temp_repo(parent: &std::path::Path, name: &str) -> std::path::PathBuf {
+        let repo = parent.join(name);
+        std::fs::create_dir_all(&repo).unwrap();
+        for args in [
+            &["init", "-q", "-b", "main"][..],
+            &["config", "user.email", "test@example.invalid"],
+            &["config", "user.name", "test"],
+            &["config", "commit.gpgsign", "false"],
+            &["commit", "--allow-empty", "-q", "-m", "init"],
+        ] {
+            assert!(thegn_core::util::git_ok(&repo, args));
+        }
+        repo
     }
 
     #[test]
@@ -1170,6 +1390,144 @@ mod folder_tests {
     }
 
     #[test]
+    fn creation_folder_prefers_explicit_then_uses_configured_default() {
+        assert_eq!(effective_folder(None, None), None);
+        assert_eq!(
+            effective_folder(None, Some("Agents")),
+            Some(("Agents", FolderSource::Configured))
+        );
+        assert_eq!(
+            effective_folder(Some("Review"), Some("Agents")),
+            Some(("Review", FolderSource::Explicit))
+        );
+    }
+
+    #[test]
+    fn create_and_register_applies_default_override_reuse_and_repo_scope() {
+        let scratch =
+            std::env::temp_dir().join(format!("tg-wt-default-folder-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scratch); // best-effort: test tmp cleanup
+        std::fs::create_dir_all(&scratch).unwrap();
+        let first_repo = temp_repo(&scratch, "first");
+        let second_repo = temp_repo(&scratch, "second");
+        let db = db();
+        db.put_workspace(&first_repo.to_string_lossy(), "first", "repo")
+            .unwrap();
+        db.put_workspace(&second_repo.to_string_lossy(), "second", "repo")
+            .unwrap();
+        let cfg = Config {
+            default_folder: Some("Agents".into()),
+            worktrees_dir: scratch.join("checkouts").to_string_lossy().into_owned(),
+            ..Config::default()
+        };
+
+        let create = |root: &std::path::Path, branch: &str, folder: Option<&str>| {
+            create_and_register(&cfg, root, branch, "main", None, folder, &db).unwrap()
+        };
+        let (first_path, filing_error) = create(&first_repo, "tg/default-one", None);
+        assert!(filing_error.is_none());
+        let first_record = db.worktree_record(&first_path).unwrap().unwrap();
+        let first_folder_id = first_record.folder_id.expect("configured default applied");
+
+        let (repeat_path, filing_error) = create(&first_repo, "tg/default-two", None);
+        assert!(filing_error.is_none());
+        let repeat_record = db.worktree_record(&repeat_path).unwrap().unwrap();
+        assert_eq!(repeat_record.folder_id, Some(first_folder_id));
+        assert_eq!(
+            db.folders_for_workspace(&first_repo.to_string_lossy())
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let (override_path, filing_error) = create(&first_repo, "tg/explicit", Some("Review"));
+        assert!(filing_error.is_none());
+        let override_record = db.worktree_record(&override_path).unwrap().unwrap();
+        let override_folder_id = override_record.folder_id.expect("explicit folder applied");
+        assert_ne!(override_folder_id, first_folder_id);
+
+        let (second_path, filing_error) = create(&second_repo, "tg/default", None);
+        assert!(filing_error.is_none());
+        let second_record = db.worktree_record(&second_path).unwrap().unwrap();
+        let second_folder_id = second_record
+            .folder_id
+            .expect("second repo default applied");
+        assert_ne!(second_folder_id, first_folder_id);
+        assert_eq!(
+            db.folders_for_workspace(&second_repo.to_string_lossy())
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let no_default_cfg = Config {
+            default_folder: None,
+            ..cfg.clone()
+        };
+        let (unfiled_path, filing_error) = create_and_register(
+            &no_default_cfg,
+            &first_repo,
+            "tg/unfiled",
+            "main",
+            None,
+            None,
+            &db,
+        )
+        .unwrap();
+        assert!(filing_error.is_none());
+        assert_eq!(
+            db.worktree_record(&unfiled_path)
+                .unwrap()
+                .unwrap()
+                .folder_id,
+            None
+        );
+
+        let _ = std::fs::remove_dir_all(scratch); // best-effort: test tmp cleanup
+    }
+
+    #[test]
+    fn configured_default_never_fails_creation_but_explicit_folder_does() {
+        let scratch =
+            std::env::temp_dir().join(format!("tg-wt-default-tomb-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scratch); // best-effort: test tmp cleanup
+        std::fs::create_dir_all(&scratch).unwrap();
+        let repo = temp_repo(&scratch, "gone");
+        let db = db();
+        db.put_workspace(&repo.to_string_lossy(), "gone", "repo")
+            .unwrap();
+        db.tombstone_workspace(&repo.to_string_lossy()).unwrap();
+        let cfg = Config {
+            default_folder: Some("Agents".into()),
+            worktrees_dir: scratch.join("checkouts").to_string_lossy().into_owned(),
+            ..Config::default()
+        };
+
+        // Configured default + tombstoned workspace: created, unfiled, success
+        // (also the `--program` member path, which reads the same tuple).
+        let (path, filing_error) =
+            create_and_register(&cfg, &repo, "tg/cfg-default", "main", None, None, &db).unwrap();
+        assert!(filing_error.is_none(), "{filing_error:?}");
+        assert!(std::path::Path::new(&path).exists());
+        assert_eq!(db.worktree_record(&path).unwrap().unwrap().folder_id, None);
+
+        // Explicit --folder + tombstoned workspace: still refused up front.
+        let err = create_and_register(
+            &cfg,
+            &repo,
+            "tg/explicit-refused",
+            "main",
+            None,
+            Some("Review"),
+            &db,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("was removed from thegn"), "{err}");
+
+        let _ = std::fs::remove_dir_all(scratch); // best-effort: test tmp cleanup
+    }
+
+    #[test]
     fn repeated_filing_is_case_insensitive_and_trimmed() {
         let db = db();
         register_and_file_worktree(&db, "/repo", "/repo/wt", "feature", "  Agents ").unwrap();
@@ -1194,6 +1552,129 @@ mod folder_tests {
         let row = db.worktree_record("/repo/new").unwrap().unwrap();
         assert_eq!(row.repo_root, "/repo");
         assert!(row.folder_id.is_some());
+    }
+
+    /// The real production halves, in the order the CLI and daemon run them.
+    fn assign(db: &Db, target: &str, name: &str) -> anyhow::Result<String> {
+        let resolved = super::resolve_folder_target(std::path::Path::new(target))?;
+        super::file_folder_target(db, &resolved, name)
+    }
+
+    #[test]
+    fn batched_preflight_refuses_a_bad_new_name_but_accepts_an_existing_one() {
+        use super::preflight_new_folder_name as pre;
+        let db = db();
+        db.put_workspace("/a", "a", "dir").unwrap();
+        db.put_workspace("/b", "b", "dir").unwrap();
+        let long = "L".repeat(80);
+        // New 65-char name: refused before anything is created.
+        assert!(pre(&db, ["/a", "/b"], &"N".repeat(65)).is_err());
+        // Existing in every target repo: accepted as-is.
+        db.ensure_folder("/a", &long, "a", "dir").unwrap();
+        db.ensure_folder("/b", &long, "b", "dir").unwrap();
+        assert!(pre(&db, ["/a", "/b"], &long).is_ok());
+        // Existing in only one repo: the other would CREATE it, so refused.
+        db.put_workspace("/c", "c", "dir").unwrap();
+        assert!(pre(&db, ["/a", "/c"], &long).is_err());
+    }
+
+    #[test]
+    fn control_assignment_registers_an_absent_row_for_a_real_git_worktree() {
+        let repo = tempfile::tempdir().unwrap();
+        assert!(thegn_core::util::git_ok(
+            repo.path(),
+            &["init", "--initial-branch=main"]
+        ));
+        let db = db();
+        // Canonical: macOS tempdirs live under the `/private/var` alias.
+        let path = repo
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert!(db.worktree_record(&path).unwrap().is_none());
+
+        assign(&db, &path, "  Agents ").unwrap();
+
+        let row = db.worktree_record(&path).unwrap().unwrap();
+        assert_eq!(row.repo_root, path);
+        assert!(row.folder_id.is_some());
+        assert_eq!(db.folders_for_workspace(&path).unwrap()[0].name, "Agents");
+    }
+
+    #[test]
+    fn rejected_assignment_does_not_register_the_worktree() {
+        let repo = tempfile::tempdir().unwrap();
+        assert!(thegn_core::util::git_ok(
+            repo.path(),
+            &["init", "--initial-branch=main"]
+        ));
+        let db = db();
+        let path = repo.path().canonicalize().unwrap();
+        let error = assign(&db, &path.to_string_lossy(), "   ").unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<super::FolderAssignError>(),
+            Some(super::FolderAssignError::InvalidName(_))
+        ));
+        assert!(db.worktrees().unwrap().is_empty());
+    }
+
+    #[test]
+    fn folder_names_reject_control_characters_and_overlong_names() {
+        use super::validate_new_folder_name as new_name;
+        assert!(new_name("a\tb").is_err());
+        assert!(new_name("a\u{7}").is_err());
+        let max = "é".repeat(super::MAX_FOLDER_NAME_CHARS);
+        assert_eq!(new_name(&max).unwrap(), max);
+        assert!(new_name(&format!("{max}x")).is_err());
+        assert!(validate_folder_name("   ").is_err());
+    }
+
+    #[test]
+    fn existing_overlong_folder_stays_assignable_but_a_new_one_is_rejected() {
+        let db = db();
+        let long = "L".repeat(80);
+        // Created elsewhere (TUI has no cap).
+        db.put_workspace("/repo", "repo", "dir").unwrap();
+        db.ensure_folder("/repo", &long, "repo", "dir").unwrap();
+        assert_eq!(
+            check_folder_fileable(&db, "/repo", &format!(" {} ", long.to_lowercase())).unwrap(),
+            long.to_lowercase()
+        );
+        assert!(check_folder_fileable(&db, "/repo", &"M".repeat(80)).is_err());
+        assert!(check_folder_fileable(&db, "/repo", "  ").is_err());
+    }
+
+    #[test]
+    fn repo_mismatch_writes_nothing() {
+        let db = db();
+        db.put_worktree("o/main", "/other", "/repo/wt", "main", None, None)
+            .unwrap();
+        let err =
+            register_and_file_worktree(&db, "/repo", "/repo/wt", "main", "Agents").unwrap_err();
+        assert!(matches!(
+            err.downcast_ref::<super::FolderAssignError>(),
+            Some(super::FolderAssignError::RepoMismatch(_))
+        ));
+        assert!(db.folders_for_workspace("/repo").unwrap().is_empty());
+        assert!(
+            !db.workspaces()
+                .unwrap()
+                .iter()
+                .any(|w| w.repo_path == "/repo")
+        );
+    }
+
+    #[test]
+    fn control_assignment_rejects_a_plain_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = db();
+        let error = assign(&db, &dir.path().to_string_lossy(), "Agents")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not a git worktree"), "{error}");
+        assert!(db.worktrees().unwrap().is_empty());
     }
 
     #[test]
@@ -1223,11 +1704,59 @@ mod folder_tests {
     }
 
     #[test]
-    fn clearing_unfiles_without_deleting_the_folder() {
+    fn renamed_folder_identity_race_is_rejected() {
         let db = db();
         register_and_file_worktree(&db, "/repo", "/repo/wt", "feature", "Pipeline").unwrap();
         let folder = db.folders_for_workspace("/repo").unwrap().remove(0);
         db.set_worktree_folder("/repo/wt", None).unwrap();
+        db.rename_folder(folder.folder_id, "Renamed").unwrap();
+
+        assert!(
+            !db.set_worktree_folder_if_identity(
+                "/repo/wt",
+                "/repo",
+                folder.folder_id,
+                &folder.name,
+            )
+            .unwrap(),
+            "a rename between lookup and the identity-checked write must fail"
+        );
+        assert_eq!(
+            db.worktree_record("/repo/wt").unwrap().unwrap().folder_id,
+            None,
+            "a stale identity must not file the worktree"
+        );
+    }
+
+    #[test]
+    fn deleted_folder_identity_race_is_rejected() {
+        let db = db();
+        register_and_file_worktree(&db, "/repo", "/repo/wt", "feature", "Pipeline").unwrap();
+        let folder = db.folders_for_workspace("/repo").unwrap().remove(0);
+        db.set_worktree_folder("/repo/wt", None).unwrap();
+        db.del_folder(folder.folder_id).unwrap();
+
+        assert!(
+            !db.set_worktree_folder_if_identity(
+                "/repo/wt",
+                "/repo",
+                folder.folder_id,
+                &folder.name,
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            db.worktree_record("/repo/wt").unwrap().unwrap().folder_id,
+            None
+        );
+    }
+
+    #[test]
+    fn clearing_unfiles_without_deleting_the_folder() {
+        let db = db();
+        register_and_file_worktree(&db, "/repo", "/repo/wt", "feature", "Pipeline").unwrap();
+        let folder = db.folders_for_workspace("/repo").unwrap().remove(0);
+        assert!(clear_folder_if_registered(&db, "/repo/wt").unwrap());
 
         assert_eq!(
             db.worktree_record("/repo/wt").unwrap().unwrap().folder_id,

@@ -1,0 +1,9 @@
+{
+  "id": "THE-720",
+  "title": "Tracker call sites ignore the repo's [issues] restrictions: daemon issue endpoints, `issue list`, `kaneo`",
+  "url": "https://linear.app/blakeashley/issue/THE-720",
+  "status": "Backlog",
+  "priority": "No priority",
+  "team": "Thegn",
+  "description": "Follow-up from THE-695 (landed 2026-10-01, main @ d96c73fbb).\n\nA repo's `.thegn.toml` `[issues]` is an `IssuesOverlay` (`crates/thegn-core/src/config_issues.rs:329`) that can only NARROW: `providers`, `accounts` (by name), and pins like `[issues.linear] team_id`. `Config::repo_issues(Some(root))` (`config.rs` ~:6881) applies it. (It cannot ADD accounts or tokens \u2014 pinned by `repo_overlay_cannot_inject_tracker_accounts`.)\n\nTHE-695 switched `wt new --from-issue` and the daemon's `worktrees.create` to `repo_issues`. These still use the GLOBAL `cfg.issues`:\n- `crates/thegn-host/src/daemon/service.rs` ~:1733 `issues_list`, and `issues_get` / `issues_update` / `issues_comment` (~:1776, :1791, :1805) \u2014 control-API requests carry no repo context today.\n- `crates/thegn-host/src/cmd/issue.rs` ~:146 \u2014 CLI verb; a cwd repo is available.\n- `crates/thegn-host/src/cmd/kaneo.rs` ~:113 \u2014 CLI verb; a cwd repo is available.\n- `crates/thegn-host/src/hydrate.rs` ~:3805 \u2014 check whether it should be repo-scoped.\n(Already correct: `autopilot_driver.rs`, `hydrate_tracker.rs`, `hydrate.rs` ~:4393, `handlers/tracker.rs` use `from_config_at`.)\n\nConsequence: in a repo that pins accounts or a team, `issue list` and the control API act across ALL accounts/teams. Not a credential leak, but it defeats the scoping.\n\n## Acceptance criteria\n- `thegn issue list` and `thegn kaneo \u2026` inside a repo honour its `[issues]` restrictions and pins; outside a repo, unchanged.\n- Control-API issue endpoints can be scoped to a repo, defaulting to today's behaviour when unscoped.\n- Tests for a repo that restricts accounts and pins a team, on each surface."
+}

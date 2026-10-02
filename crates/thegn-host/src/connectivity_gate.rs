@@ -36,7 +36,7 @@ pub(crate) fn spawn_recovery_probe(
     cfg: &thegn_core::config::Config,
     waker: Option<TerminalWaker>,
 ) {
-    crate::hydrate::spawn_pr_cache_refresh(cwd, cfg.issues.clone(), cfg.disk.clone(), waker);
+    crate::hydrate::spawn_pr_cache_refresh(cwd, cfg.clone(), waker);
 }
 
 /// Feed the connectivity holder from a PR-panel fetch result. The CLI PR path

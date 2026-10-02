@@ -682,6 +682,48 @@ pub struct WorktreeCreateReq {
     pub branch: Option<String>,
 }
 
+/// Assign or clear a worktree's repo-local sidebar folder (`folders.assign`).
+/// A name is resolved within the worktree's own repository. Clearing is always
+/// explicit (`clear: true`) and never deletes the folder; supplying neither or
+/// both of `folder` / `clear` is an invalid argument, so a malformed request can
+/// never silently unfile a worktree.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FolderAssignReq {
+    /// Absolute path to a Git worktree.
+    pub worktree: String,
+    /// Folder name to assign. Mutually exclusive with `clear`.
+    #[serde(default)]
+    pub folder: Option<String>,
+    /// `true` to unfile the worktree (the folder itself is kept). Mutually
+    /// exclusive with `folder`.
+    #[serde(default)]
+    pub clear: bool,
+}
+
+/// The validated intent of a [`FolderAssignReq`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FolderAction<'a> {
+    Assign(&'a str),
+    Clear,
+}
+
+impl FolderAssignReq {
+    /// Exactly one of `{folder: Some, clear: true}` is valid.
+    pub fn action(&self) -> ControlResult<FolderAction<'_>> {
+        match (self.folder.as_deref(), self.clear) {
+            (Some(name), false) => Ok(FolderAction::Assign(name)),
+            (None, true) => Ok(FolderAction::Clear),
+            (Some(_), true) => Err(ControlError::InvalidArgument(
+                "folders.assign takes either `folder` or `clear: true`, not both".into(),
+            )),
+            (None, false) => Err(ControlError::InvalidArgument(
+                "folders.assign needs `folder` (assign) or `clear: true` (unfile)".into(),
+            )),
+        }
+    }
+}
+
 /// The `dispatches.put` verb payload (THE-57): one row appended to the roster.
 ///
 /// The four pipeline fields (v56) are optional and default-absent, so a caller
@@ -1064,6 +1106,7 @@ pub trait ControlApi: Send + Sync + 'static {
     fn issues_list<'a>(
         &'a self,
         _filter: &'a thegn_core::issue::IssueFilter,
+        _repo: Option<&'a str>,
     ) -> BoxFuture<'a, ControlResult<Vec<thegn_core::issue::Issue>>> {
         Box::pin(async { Err(ControlError::Unimplemented("no issue tracker configured")) })
     }
@@ -1072,6 +1115,7 @@ pub trait ControlApi: Send + Sync + 'static {
     fn issues_get<'a>(
         &'a self,
         _id: &'a str,
+        _repo: Option<&'a str>,
     ) -> BoxFuture<'a, ControlResult<thegn_core::issue::IssueDetail>> {
         Box::pin(async { Err(ControlError::Unimplemented("no issue tracker configured")) })
     }
@@ -1081,6 +1125,7 @@ pub trait ControlApi: Send + Sync + 'static {
         &'a self,
         _id: &'a str,
         _patch: &'a thegn_core::issue::IssuePatch,
+        _repo: Option<&'a str>,
     ) -> BoxFuture<'a, ControlResult<thegn_core::issue::Issue>> {
         Box::pin(async { Err(ControlError::Unimplemented("no issue tracker configured")) })
     }
@@ -1090,6 +1135,7 @@ pub trait ControlApi: Send + Sync + 'static {
         &'a self,
         _id: &'a str,
         _body: &'a str,
+        _repo: Option<&'a str>,
     ) -> BoxFuture<'a, ControlResult<()>> {
         Box::pin(async { Err(ControlError::Unimplemented("no issue tracker configured")) })
     }
@@ -1126,6 +1172,15 @@ pub trait ControlApi: Send + Sync + 'static {
         Box::pin(async {
             Err(ControlError::Unimplemented(
                 "worktree creation is not available",
+            ))
+        })
+    }
+
+    /// Assign or clear a worktree's sidebar folder (`folders.assign`).
+    fn folder_assign(&self, _req: FolderAssignReq) -> BoxFuture<'_, ControlResult<()>> {
+        Box::pin(async {
+            Err(ControlError::Unimplemented(
+                "worktree folder assignment is not available",
             ))
         })
     }

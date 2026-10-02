@@ -439,6 +439,8 @@ pub enum Verb {
     DispatchesStatus,
     /// Create a worktree (optionally from an issue) — writes to git + the fs.
     WorktreeCreate,
+    /// Assign or clear a worktree's repo-local sidebar folder.
+    FolderAssign,
     /// Run a workspace text/structural search (read-only; `thegn search`).
     SearchQuery,
     /// Apply a workspace search-and-replace through the guarded write path
@@ -563,6 +565,7 @@ impl Verb {
         Verb::DispatchesNote,
         Verb::DispatchesStatus,
         Verb::WorktreeCreate,
+        Verb::FolderAssign,
         Verb::SearchQuery,
         Verb::SearchReplace,
         Verb::HostDiscover,
@@ -668,7 +671,11 @@ pub fn required_scope(verb: Verb) -> Scope {
         | Verb::Split
         | Verb::RecordSession
         | Verb::SkillsSeed => Scope::Write,
-        Verb::GitStage | Verb::GitCommit | Verb::MergeClear | Verb::WorktreeCreate => Scope::Git,
+        Verb::GitStage
+        | Verb::GitCommit
+        | Verb::MergeClear
+        | Verb::WorktreeCreate
+        | Verb::FolderAssign => Scope::Git,
         Verb::MergeAdd => Scope::MergeAdd,
         // Executing configured commands is a strictly bigger power than focusing
         // a workspace — its own exec-level scope, never `open`'s / `write`'s.
@@ -1130,7 +1137,13 @@ mod tests {
             ContainersControl,
             SkillsSeed,
         ];
-        let git = [GitStage, GitCommit, MergeClear, WorktreeCreate];
+        let git = [
+            GitStage,
+            GitCommit,
+            MergeClear,
+            WorktreeCreate,
+            FolderAssign,
+        ];
         let merge_add = [MergeAdd];
         let exec = [LaunchPreset, ToolsRun];
         let admin = [

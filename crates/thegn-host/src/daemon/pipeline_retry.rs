@@ -411,7 +411,7 @@ async fn cold_stage_prompt(svc: &DaemonService, row: &AgentDispatch) -> anyhow::
 
     let facts = if crate::stage_prompt::needs_tracker(&stage.prompt) {
         let detail = svc
-            .issues_get(&row.issue_id)
+            .issues_get(&row.issue_id, None)
             .await
             .map_err(|e| anyhow::anyhow!("tracker lookup for {}: {e}", row.issue_id))?;
         crate::stage_prompt::IssueFacts {

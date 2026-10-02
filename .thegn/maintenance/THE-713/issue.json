@@ -1,0 +1,9 @@
+{
+  "id": "THE-713",
+  "title": "Home-worktree identity is derived from the mutable branch string, so a home worktree on any other branch stops being home",
+  "url": "https://linear.app/blakeashley/issue/THE-713",
+  "status": "Backlog",
+  "priority": "No priority",
+  "team": "Thegn",
+  "description": "Found during the THE-706 reader audit (2026-09-29); deliberately excluded from that issue because reconciling it against git would make it worse.\n\n`crates/thegn-host/src/attention_status.rs` (~:126):\n```rust\nmeta.insert(wt.worktree.clone(), Meta { slug, is_home: wt.branch == \"home\", position: wt.position, repo: wt.repo_root.clone() });\n```\nWhether a worktree is the HOME worktree is decided by string-comparing the registry's `branch` column to the literal \"home\".\n\nTHE-706 made `worktrees.branch` reconcile against git. Applied here, a home worktree checked out on `main` (the normal case) would reconcile to `main` and stop satisfying `== \"home\"`. The bug is that a BRANCH NAME is used as a durable IDENTITY.\n\nConsequences: `is_home` feeds attention/notification classification. A home worktree on any branch other than literal `home` is classified as ordinary, and any ordinary worktree on a branch named `home` is classified as home.\n\n## Suggested direction\nUse a stable identity, not a branch string. The row carries `tab_name`, `position`, `repo_root`, and the home worktree is a distinct concept in the workspace model \u2014 one of those (or an explicit flag) is the right source. Pick the authoritative one rather than adding a second heuristic. Also grep for other `branch == \"home\"`-style identity checks.\n\n## Acceptance criteria\n- Home-worktree classification does not read `worktrees.branch`.\n- A home worktree checked out on `main` (or any branch) is still classified as home.\n- An ordinary worktree on a branch named `home` is not classified as home.\n- A test covers both directions."
+}
