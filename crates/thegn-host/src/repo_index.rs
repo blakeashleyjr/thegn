@@ -232,6 +232,13 @@ static CRAWLED: crate::diff_watch::Seen = crate::diff_watch::Seen::new();
 /// tick's repeat refreshes don't re-trigger. Returns the print to record once
 /// the crawl completes.
 fn due(root: &Path) -> Option<Option<crate::diff_watch::WatchPrint>> {
+    let (print, unchanged) = CRAWLED.check(root);
+    if unchanged {
+        return None;
+    }
+    // The first crawl under a live print is the catch-up for the print-less
+    // startup crawl (see `Seen::marked`): due now, whatever the debounce says.
+    let catch_up = print.is_some() && !CRAWLED.marked(root);
     let due_by_clock = LAST_CRAWL.with(|m| {
         let mut m = m.borrow_mut();
         let now = std::time::Instant::now();
@@ -243,11 +250,16 @@ fn due(root: &Path) -> Option<Option<crate::diff_watch::WatchPrint>> {
             }
         }
     });
-    if !due_by_clock {
+    if !due_by_clock && !catch_up {
         return None;
     }
-    let (print, unchanged) = CRAWLED.check(root);
-    (!unchanged).then_some(print)
+    if !due_by_clock {
+        LAST_CRAWL.with(|m| {
+            m.borrow_mut()
+                .insert(root.to_path_buf(), std::time::Instant::now());
+        });
+    }
+    Some(print)
 }
 
 /// Loop-side trigger: crawl the active worktree's entity index off the event
