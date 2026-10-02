@@ -243,16 +243,44 @@ def label_of(argv: list[str]) -> str:
     return " ".join([command, *argv[1:4]])
 
 
-def parse_traces(paths: list[Path], start: float, end: float, pane_shell: str | None = None) -> dict:
+# Per-run fixture paths -> stable tokens, so the same command run against
+# different worktrees groups together under --full-argv. Longest/most specific
+# first. `wt-N` also names the fixture's branches, hence the bare-name rule.
+NORMALISERS = [
+    (re.compile(r"/[^\s\"']*?/tg-perf\.\w+/worktrees/wt-\d+"), "<wt>"),
+    (re.compile(r"/[^\s\"']*?/tg-perf\.\w+/repo\b"), "<repo>"),
+    (re.compile(r"/[^\s\"']*?/tg-perf\.\w+/origin\.git\b"), "<origin>"),
+    (re.compile(r"/[^\s\"']*?/tg-perf\.\w+"), "<tmp>"),
+    (re.compile(r"\bwt-\d+\b"), "wt-N"),
+]
+
+
+def normalise(text: str) -> str:
+    for pattern, token in NORMALISERS:
+        text = pattern.sub(token, text)
+    return text
+
+
+def full_label(argv: list[str]) -> str:
+    return normalise(" ".join([Path(argv[0]).name or argv[0], *argv[1:]]))
+
+
+def parse_traces(
+    paths: list[Path], start: float, end: float, pane_shell: str | None = None, full_argv: bool = False
+) -> dict:
     counted = Counter()
     excluded = Counter()
+    groups: dict[str, dict] = {}
     total_execs = 0
     for path in paths:
         events = read_events(path)
         parent = {}
-        for _, pid, name, _, result in events:
+        tgid = {}  # tid -> thread-group leader (strace -f shows TIDs, not TGIDs)
+        for _, pid, name, call_args, result in sorted(events, key=lambda event: event[0]):
             if name in SPAWN_CALLS and result.isdigit() and int(result) > 0:
                 parent[int(result)] = pid
+                tgid[int(result)] = tgid.get(pid, pid) if "CLONE_THREAD" in call_args else int(result)
+        proc_argv: dict[int, str] = {}  # process -> argv[0] basename of its latest exec
         spawns = collapse_execs(events, start, end)
         if not spawns:
             raise TraceError(f"trace contains no execve events: {path}")
@@ -275,6 +303,18 @@ def parse_traces(paths: list[Path], start: float, end: float, pane_shell: str | 
                 skip = True
             if start <= stamp <= end:
                 (excluded if skip else counted)[label_of(argv)] += 1
+                if full_argv:
+                    forker = parent.get(pid, 0)
+                    owner = tgid.get(forker, forker)
+                    group = groups.setdefault(
+                        ("pane: " if skip else "") + full_label(argv),
+                        {"count": 0, "parents": Counter(), "threads": Counter()},
+                    )
+                    group["count"] += 1
+                    group["parents"][proc_argv.get(owner, "?")] += 1
+                    group["threads"][forker] += 1
+            if not argv[0].startswith(UNREADABLE):
+                proc_argv[tgid.get(pid, pid)] = Path(argv[0]).name or argv[0]
     if total_execs == 0:
         raise TraceError("trace contains no execve events")
 
@@ -284,6 +324,21 @@ def parse_traces(paths: list[Path], start: float, end: float, pane_shell: str | 
             for command, count in sorted(counter.items(), key=lambda item: (-item[1], item[0]))
         ]
 
+    if full_argv:
+        return {
+            "status": "measured",
+            "method": "strace",
+            "count": sum(counted.values()),
+            "groups": [
+                {
+                    "count": group["count"],
+                    "argv": label,
+                    "parents": dict(group["parents"].most_common()),
+                    "forking_tids": dict(group["threads"].most_common()),
+                }
+                for label, group in sorted(groups.items(), key=lambda item: (-item[1]["count"], item[0]))
+            ],
+        }
     return {
         "status": "measured",
         "method": "strace",
@@ -471,6 +526,29 @@ def self_test() -> None:
                     '5 1.0 --- SIGCHLD ---\n'):
             expect_fatal(directory, bad)
             cases += 1
+    # --full-argv: complete argv, fixture paths normalised, parent = the exec'ing
+    # PROCESS (threads resolved to their group leader via CLONE_THREAD).
+    with tempfile.TemporaryDirectory() as tmp:
+        trace = Path(tmp) / "f"
+        trace.write_text(
+            '100 1.0 execve("/bin/thegn", ["thegn"], 0x1) = 0\n'
+            '100 2.0 clone(child_stack=NULL, flags=CLONE_VM|CLONE_THREAD|SIGCHLD) = 110\n'
+            '110 3.0 clone(child_stack=NULL, flags=CLONE_VM|SIGCHLD) = 120\n'
+            '120 3.1 execve("/usr/bin/git", ["git", "-C", "/t/tg-perf.AbC1/worktrees/wt-7", "rev-parse", "wt-7"], 0x1) = 0\n'
+            '110 4.0 clone(child_stack=NULL, flags=CLONE_VM|SIGCHLD) = 121\n'
+            '121 4.1 execve("/usr/bin/git", ["git", "-C", "/t/tg-perf.AbC1/worktrees/wt-9", "rev-parse", "wt-9"], 0x1) = 0\n'
+            '120 5.0 clone(child_stack=NULL, flags=SIGCHLD) = 130\n'
+            '130 5.1 execve("/usr/bin/git", ["git", "maintenance", "run", "--auto"], 0x1) = 0\n',
+            encoding="utf-8",
+        )
+        full = parse_traces([trace], 2.5, 9.0, full_argv=True)
+        assert full["count"] == 3, full
+        top = full["groups"][0]
+        assert top["argv"] == "git -C <wt> rev-parse wt-N" and top["count"] == 2, top
+        assert top["parents"] == {"thegn": 2} and top["forking_tids"] == {110: 2}, top
+        assert full["groups"][1]["parents"] == {"git": 1}, full
+        cases += 1
+
     print(f"spawn-trace self-test: {cases} cases passed")
 
 
@@ -480,13 +558,16 @@ def main() -> int:
         self_test()
         return 0
     pane_shell = None
+    full_argv = False
+    if args[:1] == ["--full-argv"]:
+        full_argv, args = True, args[1:]
     if len(args) >= 2 and args[0] == "--pane-shell":
         pane_shell, args = args[1], args[2:]
     if len(args) < 3:
-        print("usage: spawn-trace.py [--pane-shell PATH] START_EPOCH END_EPOCH TRACE [TRACE ...]", file=sys.stderr)
+        print("usage: spawn-trace.py [--full-argv] [--pane-shell PATH] START_EPOCH END_EPOCH TRACE [TRACE ...]", file=sys.stderr)
         return 1
     try:
-        result = parse_traces([Path(path) for path in args[2:]], float(args[0]), float(args[1]), pane_shell)
+        result = parse_traces([Path(path) for path in args[2:]], float(args[0]), float(args[1]), pane_shell, full_argv)
     except (TraceError, ValueError) as error:
         print(f"spawn-rate trace invalid: {error}", file=sys.stderr)
         return 2
