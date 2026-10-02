@@ -668,6 +668,20 @@ if [ "$SPAWN_ENABLED" = 1 ] && [ "$SAMPLER" = proc ]; then
   if [ "$SCENARIO" = soak-daemon ]; then
     TRACE_FILES+=("$TRACE_DAEMON_FILE")
   fi
+  # Opt-in forensics (default behaviour unchanged): TG_PERF_KEEP_TRACE=1 keeps the
+  # raw strace files, the window epochs, a full-argv grouping (complete argv,
+  # fixture paths normalised, parent process per group) and the isolated state
+  # dir (DB + config) in TG_PERF_KEEP_DIR (default $TMPDIR/thegn-perf-trace).
+  if [ "${TG_PERF_KEEP_TRACE:-}" = 1 ]; then
+    KEEP_DIR="${TG_PERF_KEEP_DIR:-${TMPDIR:-/tmp}/thegn-perf-trace}"
+    mkdir -p "$KEEP_DIR"
+    cp "${TRACE_FILES[@]}" "$KEEP_DIR/"
+    printf '{"start":%s,"end":%s}\n' "$SPAWN_START_EPOCH" "$SPAWN_END_EPOCH" >"$KEEP_DIR/window.json"
+    python3 "$HERE/lib/spawn-trace.py" --full-argv --pane-shell "$PERF_PANE_SHELL" "$SPAWN_START_EPOCH" "$SPAWN_END_EPOCH" "${TRACE_FILES[@]}" >"$KEEP_DIR/full-argv.json" 2>"$KEEP_DIR/full-argv.err" || true # best-effort: forensics only
+    cp -r "$XDG_STATE_HOME" "$KEEP_DIR/state" 2>/dev/null || true                                                                                                                                              # best-effort: forensics only
+    cp -r "$XDG_CONFIG_HOME" "$KEEP_DIR/config" 2>/dev/null || true                                                                                                                                            # best-effort: forensics only
+    echo "kept spawn trace + full-argv grouping in $KEEP_DIR" >&2
+  fi
   if SPAWN_RESULT="$(python3 "$HERE/lib/spawn-trace.py" --pane-shell "$PERF_PANE_SHELL" "$SPAWN_START_EPOCH" "$SPAWN_END_EPOCH" "${TRACE_FILES[@]}" 2>"$PERF_TMP/spawn-trace.err")"; then
     SPAWN_JSON="${SPAWN_RESULT%\}} ,\"roots\":${#TRACE_FILES[@]}}"
     SPAWN_COUNT="$(printf '%s' "$SPAWN_RESULT" | python3 -c 'import json,sys; print(json.load(sys.stdin)["count"])')"
