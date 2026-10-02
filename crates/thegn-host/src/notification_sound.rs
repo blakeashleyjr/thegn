@@ -17,6 +17,11 @@ use thegn_core::seam::ProbeReport;
 
 pub(crate) const QUEUE_DEPTH: usize = 32;
 
+struct ReloadRequest {
+    generation: u64,
+    config: SoundConfig,
+}
+
 #[derive(Debug)]
 enum SoundJob {
     File { path: PathBuf, volume: f32 },
@@ -57,51 +62,108 @@ impl PlaybackSnapshot {
 pub(crate) struct SoundRuntime {
     snapshot: Mutex<Arc<PlaybackSnapshot>>,
     queue: Mutex<Option<std::sync::mpsc::SyncSender<SoundJob>>>,
+    worker: Mutex<Option<std::thread::JoinHandle<()>>>,
+    reload_slot: Arc<(Mutex<Option<ReloadRequest>>, std::sync::Condvar)>,
+    reload_worker: Mutex<Option<std::thread::JoinHandle<()>>>,
     reload_generation: AtomicU64,
     dropped: AtomicU64,
     fallback_bell: AtomicBool,
+    stopping: AtomicBool,
+    cancellation: AtomicBool,
     waker: TerminalWaker,
 }
 
 impl SoundRuntime {
     pub(crate) fn new(waker: TerminalWaker) -> Arc<Self> {
-        Arc::new(Self {
+        let runtime = Arc::new(Self {
             snapshot: Mutex::new(Arc::new(PlaybackSnapshot::empty())),
             queue: Mutex::new(None),
+            worker: Mutex::new(None),
+            reload_slot: Arc::new((Mutex::new(None), std::sync::Condvar::new())),
+            reload_worker: Mutex::new(None),
             reload_generation: AtomicU64::new(0),
             dropped: AtomicU64::new(0),
             fallback_bell: AtomicBool::new(false),
+            stopping: AtomicBool::new(false),
+            cancellation: AtomicBool::new(false),
             waker,
-        })
+        });
+        runtime.start_reload_worker();
+        runtime
+    }
+
+    fn start_reload_worker(self: &Arc<Self>) {
+        let slot = Arc::clone(&self.reload_slot);
+        let runtime = Arc::downgrade(self);
+        let handle = std::thread::Builder::new()
+            .name("notify-sound-config".into())
+            .spawn(move || {
+                crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
+                loop {
+                    let request = {
+                        let (pending, changed) = &*slot;
+                        let mut pending = pending.lock().unwrap();
+                        while pending.is_none()
+                            && runtime
+                                .upgrade()
+                                .is_some_and(|runtime| !runtime.stopping.load(Ordering::Acquire))
+                        {
+                            pending = changed.wait(pending).unwrap();
+                        }
+                        pending.take()
+                    };
+                    let Some(request) = request else { break };
+                    let Some(runtime) = runtime.upgrade() else {
+                        break;
+                    };
+                    if runtime.stopping.load(Ordering::Acquire) {
+                        break;
+                    }
+                    let Some(snapshot) =
+                        build_snapshot_cancellable(&request.config, &runtime.stopping)
+                    else {
+                        break;
+                    };
+                    let snapshot = Arc::new(snapshot);
+                    let mut current = runtime.snapshot.lock().unwrap();
+                    if !runtime.stopping.load(Ordering::Acquire)
+                        && runtime.reload_generation.load(Ordering::Acquire) == request.generation
+                    {
+                        *current = snapshot;
+                    }
+                }
+            })
+            // best-effort: an unavailable reload worker leaves the empty snapshot in place
+            .ok();
+        *self.reload_worker.lock().unwrap() = handle;
     }
 
     /// Build a fresh snapshot off the compositor loop, then swap it atomically.
     pub(crate) fn reload(self: &Arc<Self>, cfg: SoundConfig) {
-        // Linearize the generation bump with snapshot installation. Otherwise a
-        // worker can pass its generation check just before a newer reload bumps
-        // the counter and then install the stale snapshot afterward.
-        let generation = {
-            let _snapshot = self.snapshot.lock().unwrap();
-            self.reload_generation
-                .fetch_add(1, Ordering::Relaxed)
-                .wrapping_add(1)
-        };
-        let runtime = Arc::clone(self);
-        std::thread::Builder::new()
-            .name("notify-sound-config".into())
-            .spawn(move || {
-                crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
-                let snapshot = Arc::new(build_snapshot(&cfg));
-                // Config reloads may overlap while pack/provider inspection is
-                // in flight. Never let a slower, older build roll back a
-                // snapshot from a newer config.
-                let mut current = runtime.snapshot.lock().unwrap();
-                if runtime.reload_generation.load(Ordering::Acquire) == generation {
-                    *current = snapshot;
-                }
-            })
-            // best-effort: a failed config worker leaves the last snapshot in place
-            .ok();
+        if self.stopping.load(Ordering::Acquire) {
+            return;
+        }
+        // Keep request replacement linearized with publication: if generation
+        // advancement and mailbox replacement were separate, concurrent
+        // reload callers could leave an older request in the one-slot mailbox.
+        let _snapshot = self.snapshot.lock().unwrap();
+        let generation = self
+            .reload_generation
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
+        let (pending, changed) = &*self.reload_slot;
+        let mut pending = pending.lock().unwrap();
+        if self.stopping.load(Ordering::Acquire) {
+            return;
+        }
+        replace_pending_reload(
+            &mut pending,
+            ReloadRequest {
+                generation,
+                config: cfg,
+            },
+        );
+        changed.notify_one();
     }
 
     pub(crate) fn enqueue(self: &Arc<Self>, emit: &SoundEmit) {
@@ -142,17 +204,24 @@ impl SoundRuntime {
     }
 
     fn ensure_worker(self: &Arc<Self>) -> Option<std::sync::mpsc::SyncSender<SoundJob>> {
+        if self.stopping.load(Ordering::Acquire) {
+            return None;
+        }
         let mut queue = self.queue.lock().unwrap();
         if let Some(tx) = queue.as_ref() {
             return Some(tx.clone());
         }
         let (tx, rx) = std::sync::mpsc::sync_channel(QUEUE_DEPTH);
-        let runtime = Arc::clone(self);
+        let runtime = Arc::downgrade(self);
         let spawned = std::thread::Builder::new()
             .name("notify-sound".into())
             .spawn(move || {
                 crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
                 while let Ok(job) = rx.recv() {
+                    let Some(runtime) = runtime.upgrade() else { break };
+                    if runtime.stopping.load(Ordering::Acquire) {
+                        break;
+                    }
                     match job {
                         SoundJob::File { path, volume } => {
                             let snapshot = runtime.snapshot.lock().unwrap().clone();
@@ -164,13 +233,15 @@ impl SoundRuntime {
                                 runtime.request_fallback("sound file format is unsupported");
                                 continue;
                             }
-                            if let Err(error) = provider.play(&path, volume) {
+                            if let Err(error) =
+                                provider.play(&path, volume, &runtime.cancellation)
+                            {
                                 tracing::debug!(target: "thegn::notify_sound", %error, "audio provider failed");
                                 runtime.request_fallback("audio provider failed");
                             }
                         }
                         SoundJob::Command(command) => {
-                            if let Err(error) = run_command(&command) {
+                            if let Err(error) = run_command(&command, &runtime.cancellation) {
                                 tracing::debug!(
                                     target: "thegn::notify_sound",
                                     %error,
@@ -181,9 +252,38 @@ impl SoundRuntime {
                     }
                 }
             });
-        spawned.ok()?;
+        *self.worker.lock().unwrap() = Some(spawned.ok()?);
         *queue = Some(tx.clone());
         Some(tx)
+    }
+
+    /// Stop accepting sound work, cancel active helper playback, discard the
+    /// coalesced reload request, and join both owned workers.
+    pub(crate) fn shutdown(&self) {
+        if self.stopping.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.cancellation.store(true, Ordering::Release);
+        self.queue.lock().unwrap().take();
+        let (pending, changed) = &*self.reload_slot;
+        pending.lock().unwrap().take();
+        changed.notify_all();
+        if let Some(worker) = self.worker.lock().unwrap().take() {
+            if worker.thread().id() == std::thread::current().id() {
+                // Drop can run on a worker if its temporary weak upgrade was
+                // the final strong reference. That thread is already exiting.
+                drop(worker);
+            } else if worker.join().is_err() {
+                tracing::error!(target: "thegn::notify_sound", "sound playback worker panicked during shutdown");
+            }
+        }
+        if let Some(worker) = self.reload_worker.lock().unwrap().take() {
+            if worker.thread().id() == std::thread::current().id() {
+                drop(worker);
+            } else if worker.join().is_err() {
+                tracing::error!(target: "thegn::notify_sound", "sound snapshot worker panicked during shutdown");
+            }
+        }
     }
 
     fn request_fallback(&self, reason: &str) {
@@ -211,13 +311,33 @@ impl SoundRuntime {
     }
 }
 
+impl Drop for SoundRuntime {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
 fn request_fallback_raw(flag: &AtomicBool, waker: &TerminalWaker, reason: &str) {
     tracing::debug!(target: "thegn::notify_sound", reason, "sound degraded to terminal bell");
     flag.store(true, Ordering::Relaxed);
     let _ = waker.wake(); // best-effort: a fallback cue must not fail its producer
 }
 
+fn replace_pending_reload(pending: &mut Option<ReloadRequest>, latest: ReloadRequest) {
+    *pending = Some(latest);
+}
+
 fn build_snapshot(cfg: &SoundConfig) -> PlaybackSnapshot {
+    build_snapshot_cancellable(cfg, &AtomicBool::new(false)).unwrap()
+}
+
+fn build_snapshot_cancellable(
+    cfg: &SoundConfig,
+    stopping: &AtomicBool,
+) -> Option<PlaybackSnapshot> {
+    if stopping.load(Ordering::Acquire) {
+        return None;
+    }
     let provider = crate::platform::sound::provider();
     let provider_report = provider
         .as_ref()
@@ -232,6 +352,9 @@ fn build_snapshot(cfg: &SoundConfig) -> PlaybackSnapshot {
         match std::fs::read_dir(dir) {
             Ok(read_dir) => {
                 for item in read_dir.flatten() {
+                    if stopping.load(Ordering::Acquire) {
+                        return None;
+                    }
                     let path = item.path();
                     if !path.is_file() {
                         continue;
@@ -259,6 +382,9 @@ fn build_snapshot(cfg: &SoundConfig) -> PlaybackSnapshot {
         .values()
         .chain(std::iter::once(&cfg.chime_file))
     {
+        if stopping.load(Ordering::Acquire) {
+            return None;
+        }
         let Ok(SoundRef::File(path)) = SoundRef::parse(raw) else {
             continue;
         };
@@ -269,7 +395,7 @@ fn build_snapshot(cfg: &SoundConfig) -> PlaybackSnapshot {
             fallback.get_or_insert_with(|| "a configured sound file is missing".into());
         }
     }
-    PlaybackSnapshot {
+    Some(PlaybackSnapshot {
         provider,
         pack,
         entries,
@@ -277,7 +403,7 @@ fn build_snapshot(cfg: &SoundConfig) -> PlaybackSnapshot {
         files,
         provider_report,
         fallback,
-    }
+    })
 }
 
 fn resolve(sound_ref: &SoundRef, snapshot: &PlaybackSnapshot) -> Option<PathBuf> {
@@ -295,19 +421,19 @@ fn supported_format(path: &Path, formats: &[&str]) -> bool {
     formats.iter().any(|f| f.eq_ignore_ascii_case(ext))
 }
 
-#[expect(clippy::disallowed_methods)]
-fn run_command(command: &str) -> Result<(), String> {
-    let status = std::process::Command::new("sh")
-        .args(["-c", command])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map_err(|error| format!("could not start legacy sound command: {error}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("legacy sound command exited with {status}"))
+fn run_command(
+    command: &str,
+    cancellation: &AtomicBool,
+) -> Result<(), crate::platform::sound::SoundError> {
+    use crate::platform::sound_process::{SoundProcessOutcome as Outcome, run};
+    match run("sh", &["-c".into(), command.into()], cancellation) {
+        Outcome::Exited(status) if status.success() => Ok(()),
+        Outcome::Exited(_) => Err(crate::platform::sound::SoundError::Failed),
+        Outcome::Spawn(error) => Err(crate::platform::sound::SoundError::Spawn(error)),
+        Outcome::Timeout => Err(crate::platform::sound::SoundError::Timeout),
+        Outcome::Cancelled => Err(crate::platform::sound::SoundError::Cancelled),
+        Outcome::Reap(error) => Err(crate::platform::sound::SoundError::Reap(error)),
+        Outcome::DescendantsRemain => Err(crate::platform::sound::SoundError::DescendantsRemain),
     }
 }
 
@@ -355,8 +481,29 @@ mod tests {
     }
 
     #[test]
+    fn reload_storm_keeps_only_the_latest_pending_generation() {
+        let mut pending = None;
+        for generation in 1..=100 {
+            replace_pending_reload(
+                &mut pending,
+                ReloadRequest {
+                    generation,
+                    config: SoundConfig {
+                        pack: format!("pack-{generation}"),
+                        ..SoundConfig::default()
+                    },
+                },
+            );
+        }
+        let latest = pending.take().unwrap();
+        assert_eq!(latest.generation, 100);
+        assert_eq!(latest.config.pack, "pack-100");
+        assert!(pending.is_none());
+    }
+
+    #[test]
     fn legacy_command_failure_is_reported() {
-        assert!(run_command("exit 7").is_err());
+        assert!(run_command("exit 7", &AtomicBool::new(false)).is_err());
     }
 
     fn needs_worker(cfg: &SoundConfig) -> bool {

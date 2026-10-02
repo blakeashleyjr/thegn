@@ -129,7 +129,11 @@ matching rule's `sound`, `per_kind`, legacy `per_priority`, then the generic
 only quiet-hours schedule, and no sound control command or action is added.
 
 The host selects an available provider using fixed argument vectors and plays
-files on a bounded off-loop worker. Providers report supported formats and
+files on a bounded off-loop worker. On Unix, each helper runs in its own process
+group and is stopped and reaped within a five-second lifecycle deadline; this
+lets the worker continue with later queued requests after a hung helper.
+Windows currently retains direct-child helper behavior pending atomic Job
+Object containment. Providers report supported formats and
 whether they honor volume. Use `thegn doctor` to see the provider id and
 availability, supported formats, volume capability, selected pack path, pack
 entry count, and any fallback reason. Optional players and packs are

@@ -160,6 +160,7 @@ pub(crate) mod proc;
 pub(crate) mod qos;
 
 pub(crate) mod sound;
+pub(crate) mod sound_process;
 
 // THE-505 opened config-source adapter; intentionally unwired until review.
 #[allow(dead_code)]
