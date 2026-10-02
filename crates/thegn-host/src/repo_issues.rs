@@ -31,17 +31,16 @@ pub fn config_for_cwd(cfg: &Config) -> Config {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Command;
     use thegn_core::config::{IssueAccount, IssueProviderKind};
 
+    #[expect(clippy::disallowed_methods)] // deterministic real-Git fixture, test only
     fn git_repo() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
-        let status = Command::new("git")
+        let out = thegn_core::util::git_cmd(dir.path())
             .args(["init", "-q"])
-            .current_dir(dir.path())
-            .status()
+            .output()
             .unwrap();
-        assert!(status.success());
+        assert!(out.status.success());
         dir
     }
 

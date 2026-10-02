@@ -3632,11 +3632,11 @@ pub(crate) fn spawn_pr_cache_refresh_with_generation(
     let branch_cwd = cwd.clone();
     let branch_waker = waker.clone();
     let branch_generation = generation.clone();
+    let disk_cfg = cfg.disk.clone();
     crate::sched::spawn_bg(move || {
         if !cwd.is_dir() {
             return;
         }
-        let disk_cfg = cfg.disk.clone();
         let loc = thegn_core::remote::GitLoc::for_worktree(&cwd);
         let Ok(db) = thegn_core::db::Db::open() else {
             return;

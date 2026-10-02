@@ -685,7 +685,7 @@
         },
         "repo": {
           "default": null,
-          "description": "Filesystem path on the daemon host used to apply the repo's [issues] overlay.",
+          "description": "Filesystem path on the daemon host used to apply a repo's `[issues]` overlay.",
           "type": [
             "string",
             "null"

@@ -2113,14 +2113,14 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    #[expect(clippy::disallowed_methods)] // deterministic real-Git fixture, test only
     async fn explicit_issue_repo_resolves_overlay_and_rejects_invalid_path() {
         let repo = tempfile::tempdir().unwrap();
-        let status = std::process::Command::new("git")
+        let out = thegn_core::util::git_cmd(repo.path())
             .args(["init", "-q"])
-            .current_dir(repo.path())
-            .status()
+            .output()
             .unwrap();
-        assert!(status.success());
+        assert!(out.status.success());
         std::fs::write(
             repo.path().join(".thegn.toml"),
             "[issues]\nproviders = [\"linear\"]\naccounts = []\n\n[issues.linear]\nteam_id = \"TEAM-PIN\"\n",
