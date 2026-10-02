@@ -11,6 +11,12 @@ use std::time::{Duration, Instant};
 /// backgrounds work (`afplay x.wav &`) may keep playing until then.
 pub(crate) const SOUND_HELPER_DEADLINE: Duration = Duration::from_secs(5);
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
+/// Ceiling for the group-drain poll interval. Each drain check is a full
+/// `/proc` scan on Linux (~1000 stat reads), so the wait backs off from
+/// `POLL_INTERVAL` to this cap instead of scanning every 10ms for the whole
+/// life of a backgrounded player. It also bounds how late a cancellation (a
+/// plain flag, which cannot wake a sleeper) is noticed.
+const DRAIN_BACKOFF_CAP: Duration = Duration::from_millis(250);
 const CLEANUP_GRACE: Duration = Duration::from_millis(250);
 /// How long runtime shutdown waits for a worker to finish before detaching it.
 /// A cancelled helper needs at most `CLEANUP_GRACE` to be killed and settled;
@@ -180,34 +186,51 @@ fn drain_group(
     use std::sync::atomic::Ordering;
     let pgid = child.id() as i32;
     let mut settled = Ok(());
+    let mut backoff = POLL_INTERVAL;
     loop {
         if !live_members(group, pgid) {
             break;
         }
         let cancelled = cancellation.load(Ordering::Acquire);
-        if cancelled || Instant::now() >= execution_deadline {
+        let now = Instant::now();
+        if cancelled || now >= execution_deadline {
             group.kill();
             let settle_deadline = if cancelled {
-                (Instant::now() + CLEANUP_GRACE).min(deadline)
+                (now + CLEANUP_GRACE).min(deadline)
             } else {
                 deadline
             };
+            let mut settle_wait = POLL_INTERVAL;
             while live_members(group, pgid) {
-                if Instant::now() >= settle_deadline {
+                let remaining = settle_deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
                     settled = Err(());
                     break;
                 }
-                std::thread::sleep(POLL_INTERVAL);
+                std::thread::sleep(settle_wait.min(remaining));
+                settle_wait = next_backoff(settle_wait, remaining);
             }
             break;
         }
-        std::thread::sleep(POLL_INTERVAL);
+        let remaining = execution_deadline.saturating_duration_since(now);
+        std::thread::sleep(backoff.min(remaining));
+        backoff = next_backoff(backoff, remaining);
     }
     match (child.wait(), settled) {
         (Err(error), _) => SoundProcessOutcome::Reap(error),
         (Ok(_), Err(())) => SoundProcessOutcome::DescendantsRemain,
         (Ok(status), Ok(())) => SoundProcessOutcome::Exited(status),
     }
+}
+
+/// Next drain-poll interval: doubles, never exceeds `DRAIN_BACKOFF_CAP`, and
+/// never sleeps past `remaining` (time left to the governing deadline).
+#[cfg(unix)]
+fn next_backoff(current: Duration, remaining: Duration) -> Duration {
+    current
+        .saturating_mul(2)
+        .min(DRAIN_BACKOFF_CAP)
+        .min(remaining)
 }
 
 #[cfg(unix)]
@@ -261,6 +284,37 @@ mod tests {
         );
         assert!(matches!(result, SoundProcessOutcome::Exited(status) if status.success()));
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn backoff_doubles_caps_and_never_overshoots_the_deadline() {
+        let far = Duration::from_secs(60);
+        assert_eq!(
+            next_backoff(Duration::from_millis(10), far),
+            Duration::from_millis(20)
+        );
+        assert_eq!(
+            next_backoff(Duration::from_millis(160), far),
+            DRAIN_BACKOFF_CAP
+        );
+        assert_eq!(next_backoff(DRAIN_BACKOFF_CAP, far), DRAIN_BACKOFF_CAP);
+        assert_eq!(
+            next_backoff(Duration::from_millis(100), Duration::from_millis(30)),
+            Duration::from_millis(30)
+        );
+        assert_eq!(
+            next_backoff(Duration::from_millis(10), Duration::ZERO),
+            Duration::ZERO
+        );
+        let mut wait = POLL_INTERVAL;
+        let schedule: Vec<u128> = (0..7)
+            .map(|_| {
+                let current = wait;
+                wait = next_backoff(wait, far);
+                current.as_millis()
+            })
+            .collect();
+        assert_eq!(schedule, [10, 20, 40, 80, 160, 250, 250]);
     }
 
     #[test]
