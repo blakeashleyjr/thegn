@@ -533,13 +533,11 @@ fn check_folder_fileable(db: &Db, repo_path: &str, folder_name: &str) -> Result<
     if !exists {
         validate_new_folder_name(&folder_name)?;
     }
-    // TODO(THE-719 integration): downcast WorkspaceTombstonedError instead of the
-    // message match the control mapper keeps for this case.
     if db.workspace_tombstoned(repo_path)? {
-        anyhow::bail!(
-            "workspace {repo_path} was removed from thegn; re-add it before filing \
-             its worktrees into a folder"
-        );
+        return Err(thegn_core::store::WorkspaceTombstonedError {
+            repo_path: repo_path.to_string(),
+        }
+        .into());
     }
     Ok(folder_name)
 }

@@ -296,10 +296,11 @@ fn map_folder_assign_error(error: anyhow::Error) -> ControlError {
         Some(FolderAssignError::RepoMismatch(m)) => ControlError::FailedPrecondition(m.clone()),
         Some(FolderAssignError::Conflict(m)) => ControlError::Conflict(m.clone()),
         None => {
-            let message = error.to_string();
-            // TODO(THE-719 integration): downcast WorkspaceTombstonedError.
-            if message.contains("workspace ") && message.contains("was removed") {
-                ControlError::FailedPrecondition(message)
+            if error
+                .downcast_ref::<thegn_core::store::WorkspaceTombstonedError>()
+                .is_some()
+            {
+                ControlError::FailedPrecondition(error.to_string())
             } else {
                 ControlError::Internal(error)
             }
@@ -2173,6 +2174,25 @@ impl ControlApi for DaemonService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tombstoned_workspace_maps_to_failed_precondition_and_untyped_stays_internal() {
+        let typed = anyhow::Error::new(thegn_core::store::WorkspaceTombstonedError {
+            repo_path: "/gone".into(),
+        });
+        match map_folder_assign_error(typed) {
+            ControlError::FailedPrecondition(m) => {
+                assert!(m.contains("/gone") && m.contains("was removed"), "{m}");
+            }
+            other => panic!("expected FailedPrecondition, got {other:?}"),
+        }
+        // A look-alike message without the typed error is NOT classified by text.
+        let lookalike = anyhow::anyhow!("workspace /x was removed");
+        assert!(matches!(
+            map_folder_assign_error(lookalike),
+            ControlError::Internal(_)
+        ));
+    }
 
     #[tokio::test]
     async fn ci_logs_rejects_malformed_ids_before_cache_or_provider_access() {
