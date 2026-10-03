@@ -272,6 +272,55 @@ mod tests {
         );
     }
 
+    /// THE-718: `merge_state` answers from `stat`s of the per-worktree git dir
+    /// (no subprocess). In a LINKED worktree — whose `.git` is a redirect file —
+    /// it must still agree with what the CLI says, in both directions.
+    #[test]
+    fn merge_state_in_a_linked_worktree_matches_the_cli() {
+        let repo = TestRepo::new("br-merge-linked");
+        ident(&repo.dir);
+        repo.commit_file("f.txt", "base\n", "c0");
+        git_in(&repo.dir, &["checkout", "-q", "-b", "feat"]);
+        repo.commit_file("f.txt", "feat\n", "feat edit");
+        git_in(&repo.dir, &["checkout", "-q", "main"]);
+        repo.commit_file("f.txt", "main\n", "main edit");
+        let wt = repo.dir.with_file_name(format!(
+            "{}-linked",
+            repo.dir.file_name().unwrap().to_string_lossy()
+        ));
+        // best-effort: test cleanup: scratch removal must never fail the test
+        let _ = std::fs::remove_dir_all(&wt);
+        git_in(
+            &repo.dir,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "side",
+                wt.to_str().unwrap(),
+                "main",
+            ],
+        );
+        let loc = GitLoc::Local(wt.clone());
+        let cli_has =
+            |what: &str| thegn_core::util::git_ok(&wt, &["rev-parse", "-q", "--verify", what]);
+        assert!(CliGit.merge_state(&loc).unwrap().is_none());
+        assert!(!cli_has("MERGE_HEAD"));
+        let _ = CliGit.merge(&loc, "feat"); // best-effort: conflicting merge fails by design; state asserted below
+        assert!(cli_has("MERGE_HEAD"));
+        let st = CliGit
+            .merge_state(&loc)
+            .unwrap()
+            .expect("merge in progress");
+        assert_eq!(st.kind, MergeKind::Merge);
+        CliGit.merge_abort(&loc).unwrap();
+        assert!(!cli_has("MERGE_HEAD"));
+        assert!(CliGit.merge_state(&loc).unwrap().is_none());
+        // best-effort: test cleanup: scratch removal must never fail the test
+        let _ = std::fs::remove_dir_all(&wt);
+    }
+
     #[test]
     fn fast_forward_non_current_branch_via_fetch_refspec() {
         let repo = TestRepo::new("br-ff");

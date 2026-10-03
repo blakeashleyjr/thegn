@@ -298,9 +298,7 @@ impl ForgeSet {
         if self.entries.is_empty() {
             return self.default.as_ref();
         }
-        let host = loc
-            .git_out(&["remote", "get-url", "origin"])
-            .and_then(|u| remote_host(&u));
+        let host = loc.origin_url().and_then(|u| remote_host(&u));
         match host {
             Some(h) => self
                 .entries
