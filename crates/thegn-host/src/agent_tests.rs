@@ -1030,6 +1030,7 @@ fn sandbox_with_invalid_volume() -> thegn_core::sandbox::SandboxSpec {
         oci_host: None,
         oci_runtime: None,
         daemon_persistent: false,
+        seal_home: None,
     }
 }
 
@@ -1060,8 +1061,8 @@ fn compose_spec_propagates_volume_refusal_without_host_fallback() {
     .expect_err("invalid volume must prevent LaunchSpec construction");
     assert!(error.chain().any(|source| {
         source
-            .downcast_ref::<thegn_core::sandbox::VolumeAdmissionError>()
-            .is_some()
+            .downcast_ref::<thegn_core::sandbox::EnterError>()
+            .is_some_and(|e| matches!(e, thegn_core::sandbox::EnterError::Volume(_)))
     }));
     assert!(!error.to_string().contains("/tmp/state"));
 }

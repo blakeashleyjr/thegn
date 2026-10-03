@@ -809,6 +809,7 @@ mod tests {
             oci_host: None,
             oci_runtime: None,
             daemon_persistent: false,
+            seal_home: None,
         }
     }
 

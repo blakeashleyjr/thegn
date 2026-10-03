@@ -609,6 +609,9 @@ fn sealed_autopilot_sandbox(
     // Windows entries currently launch a plain shell and only add process
     // lifetime scoping. Do not let an explicit backend chain turn Sealed into
     // a misleading label; fail closed and let the caller journal the run.
+    if let Some(miss) = thegn_core::sandbox_floor::home_gate(&spec) {
+        return Err(miss);
+    }
     if !autopilot_backend_is_isolated(spec.backend) {
         return Err(format!(
             "sandbox backend '{}' cannot provide sealed filesystem isolation for autopilot",
@@ -641,6 +644,7 @@ fn autopilot_backend_is_isolated(backend: thegn_core::sandbox::Backend) -> bool 
     !matches!(
         backend,
         thegn_core::sandbox::Backend::Systemd
+            | thegn_core::sandbox::Backend::Wsl
             | thegn_core::sandbox::Backend::WinAppContainer
             | thegn_core::sandbox::Backend::WinJobObject
     )
@@ -786,5 +790,6 @@ mod tests {
         assert!(!autopilot_backend_is_isolated(Backend::Systemd));
         assert!(!autopilot_backend_is_isolated(Backend::WinAppContainer));
         assert!(!autopilot_backend_is_isolated(Backend::WinJobObject));
+        assert!(!autopilot_backend_is_isolated(Backend::Wsl));
     }
 }

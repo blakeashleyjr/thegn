@@ -27,17 +27,84 @@ per repo via a `.thegn.toml` overlay, or per run with
 | `hardened` | **default.** read-only root, no-new-privileges, a process cap; network and capabilities intact |
 | `sealed`   | full lockdown: `network=none`, drop ALL caps, tighter pids cap. For untrusted work             |
 
-Under `hardened` or `sealed`, **everything outside the worktree is
-read-only — including your `$HOME`**, so a sandboxed agent cannot `cd`
-out and modify host files.
+Under `hardened`, **everything outside the worktree is read-only —
+including your `$HOME`**, so a sandboxed agent cannot `cd` out and modify
+host files. That is _integrity_ isolation only: the whole `$HOME` stays
+**readable**, credentials included (`~/.ssh`, `~/.aws`, `~/.gnupg`,
+`~/.config/gh`, thegn state). `open` leaves `$HOME` readable and writable.
 
-Writable carve-outs: the worktree and its git dir, build caches, `/tmp`,
-and a narrow set of `$HOME` paths for shell state (`~/tmp`,
-`~/.local/state`, `~/.local/share`, `~/.zsh_history`, `~/.bash_history`).
-Agent config dirs (`CLAUDE_CONFIG_DIR` / `CODEX_HOME`, or the `~/.claude`
-/ `~/.codex` defaults) are writable for every non-sealed pane, so an
-agent CLI you run by hand can persist its state instead of dying on a
-read-only filesystem.
+`sealed` / `sealed-tunnel` add _confidentiality_: the host `$HOME` is
+**hidden**. The pane sees a private, empty `$HOME` (tmpfs; systemd uses
+`ProtectHome=tmpfs`, containers never mount it) with only a reviewed
+read-only allowlist of **single files** bound in — `~/.gitconfig`,
+`~/.config/git/{config,ignore,attributes,allowed_signers}`, the zsh and
+bash rc files (`~/.zshrc`, `~/.config/zsh/.zshrc`, …), `~/.profile`,
+`~/.inputrc`, `~/.config/starship.toml` — plus the worktree and build
+caches. No directory is bound from the allowlist (`~/.config/git` and
+`~/.config/zsh` hold `credentials` and `.zsh_history`). Each entry is
+resolved through symlinks and bound from its real target, which must be a
+regular file under `$HOME`, `/nix/store`, `/usr` or `/etc`.
+
+The deny list (matched against resolved paths, for `$HOME` and the passwd
+home of `$USER` — read from `/etc/passwd` only, so NSS/LDAP users get just
+the `$HOME` spelling) covers `~/.ssh`, `~/.aws`, `~/.azure`, `~/.gnupg`,
+`~/.secrets`, `~/.netrc`, `~/.git-credentials`, `~/.npmrc`, `~/.pypirc`,
+`~/.cargo/credentials*`, `~/.vault-token`, `~/.docker`, `~/.kube`,
+`~/.config/{gh,gcloud,rclone,git/credentials,…}`, `~/.terraform.d`,
+keyrings, browser profiles, `~/.claude*`, `~/.codex`, thegn's state dir,
+`/run/agenix`, `/run/secrets`, `/run/user` and `/root`.
+
+**One chokepoint enforces it.** Every launcher (panes, agents, queue
+agents, autopilot, cache probes) builds its command through
+`sandbox::enter_argv` (and `ensure` for containers; queue agents only when
+the queue's sandbox opt-in is on), which — for a sealed
+spec — drops every mount whose host path or destination lies inside the
+deny list, whoever added it: `[sandbox] mounts` (the default `~/.gnupg:rw`
+included), a bound identity's git ssh key / `GH_CONFIG_DIR` / `GNUPGHOME`,
+the profile credential mounts, or an agent provider home. A mount whose
+host path is, or contains, a protected path (the worktree being `$HOME`
+itself, a `~` mount) refuses the launch. A compose-backed spec is refused
+too ("sealed profile cannot verify compose volumes"), since compose-file
+volumes never appear in the mount list. A kept container is reused only
+if it carries the matching `thegn.seal_home` label and, when sealed, binds
+exactly the required mounts; otherwise it is recreated. Dropped `[sandbox] mounts` are
+listed by `thegn doctor`; a user-authored one also warns once per path.
+The ssh identity-key mounts and the `~/.local/{state,share}` write
+carve-outs are not applied. Extend the allowlist with `[sandbox] mounts`
+(paths outside the deny list only).
+
+**Sealed agent panes need a managed account.** The only exception to the
+deny list is the _managed_ per-account credential dir thegn creates under
+its own state (`$XDG_STATE_HOME/thegn/accounts/<provider>/<name>`), which
+is mounted read-write. The ambient `~/.claude` / `~/.codex` fallback and
+adopted account dirs are never mounted into a sealed pane, so without a
+managed account the agent runs without host auth.
+
+The automatic build caches (`~/.cargo/registry`, sccache, nix, `~/.m2`,
+gradle) stay writable: that is an _integrity_ exposure (a sealed pane could
+poison a shared cache), not a confidentiality one. The allowlist and every
+mount are re-validated when the command line is built; a swap in the
+instant between that check and the runtime starting remains possible.
+
+A sealed launch that cannot hide `$HOME` is **refused**, never run with a
+weaker `sealed` and never downgraded to a host shell: a backend with no
+filesystem boundary (`none`/host, Windows, WSL), `file_access = "all"`, no
+backend producing a sandbox at all, an unset or unresolvable `$HOME`, a
+systemd launch whose `$HOME` is outside `/home`, `/root` and `/run/user`
+(where `ProtectHome=tmpfs` does not reach), a systemd or container mount
+path containing whitespace, a quote, a backslash or `:`, or a terminal
+anchored at `$HOME` itself. Setting `[sandbox] enabled = false` is your
+explicit choice and is not overridden: the profile is then simply not
+enforced, and `thegn doctor` says so. `thegn doctor` prints
+`home  hidden | read-only | writable` for the configured profile.
+
+Writable carve-outs (non-sealed): the worktree and its git dir, build
+caches, `/tmp`, and a narrow set of `$HOME` paths for shell state
+(`~/tmp`, `~/.local/state`, `~/.local/share`, `~/.zsh_history`,
+`~/.bash_history`). Agent config dirs (`CLAUDE_CONFIG_DIR` /
+`CODEX_HOME`, or the `~/.claude` / `~/.codex` defaults) are writable for
+every non-sealed pane, so an agent CLI you run by hand can persist its
+state instead of dying on a read-only filesystem.
 
 > `~/.keychain` is carved writable for `hardened` panes but **not** for
 > `sealed` ones: it holds scripts your host login shells later _source_,

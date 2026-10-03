@@ -110,6 +110,72 @@ pub fn decide(
     }
 }
 
+/// The `$HOME` confidentiality gate (THE-215). A sealed profile promises the host
+/// `$HOME` is not readable; a launch whose resolved spec would expose it — a
+/// backend with no filesystem boundary (host process, Windows), `file_access =
+/// "all"`/`"host"`, or a `[sandbox] mounts` entry covering `$HOME` — must be
+/// **refused**, never run with a quietly weaker `sealed`. Returns the miss
+/// message, or `None` when the spec is not sealed or hides `$HOME`.
+pub fn home_gate(spec: &crate::sandbox::SandboxSpec) -> Option<String> {
+    use crate::sandbox::BackendFamily;
+    use crate::sandbox_mounts::{HomeView, home_view};
+    let home = spec.seal_home.as_deref()?;
+    // An unset/empty/relative/unresolvable `$HOME` cannot be hidden or checked:
+    // refuse rather than silently disable sealing.
+    let home_path = std::path::Path::new(home);
+    if home.is_empty() || !home_path.is_absolute() || home_path.canonicalize().is_err() {
+        return Some(
+            "sealed profile requires a resolvable absolute $HOME to hide, but $HOME is \
+             unset, empty, relative or does not exist"
+                .to_string(),
+        );
+    }
+    // systemd takes mounts as `BindPaths=host:dest` property strings with no
+    // quoting: a path containing whitespace or `:` would be parsed as extra
+    // fields (or a different destination). Refuse the sealed launch instead.
+    if spec.backend.profile().family == BackendFamily::Systemd {
+        let bad = crate::sandbox_mounts::mount_path_unsafe;
+        if let Some(m) = spec
+            .mounts
+            .iter()
+            .find(|m| home_path_under(&m.dest, home_path) && (bad(&m.host) || bad(&m.dest)))
+        {
+            return Some(format!(
+                "sealed systemd launch refused: mount `{}` contains whitespace, a quote, a \
+                 backslash or ':' which systemd BindPaths cannot express safely",
+                m.dest
+            ));
+        }
+    }
+    // A mount whose host path is (or contains) a protected path — the worktree
+    // being `$HOME` itself, a `~` mount — would expose the secrets inside it.
+    if let Some(m) = spec
+        .mounts
+        .iter()
+        .find(|m| crate::sandbox_mounts::sealed_mount_covers_deny(m, home_path))
+    {
+        return Some(format!(
+            "sealed profile refused: mount `{}` contains protected $HOME paths (credentials, \
+             keys, thegn state); mount something narrower or use a non-sealed profile",
+            m.host
+        ));
+    }
+    let view = home_view(spec, home_path);
+    (view != HomeView::Hidden).then(|| {
+        format!(
+            "sealed profile requires a hidden $HOME, but the `{}` launch would leave it {} — \
+             use a bwrap/systemd/OCI backend, `file_access = \"worktree\"`, and no `[sandbox] \
+             mounts` entry covering $HOME (see `thegn doctor`)",
+            spec.backend.label(),
+            view.as_str(),
+        )
+    })
+}
+
+fn home_path_under(dest: &str, home: &std::path::Path) -> bool {
+    std::path::Path::new(dest).starts_with(home)
+}
+
 /// How an opt-in agent/queue task's floor decision maps onto queue-entry state.
 /// The load-bearing rule (the merge-guard doctrine): a fail-closed floor miss or
 /// a sandbox setup failure is an **infrastructure** failure — the entry is

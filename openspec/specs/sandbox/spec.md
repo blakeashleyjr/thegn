@@ -77,6 +77,54 @@ A sandboxed worktree process SHALL see the shared `<git-common>/config` mounted 
   shared config
 - **THEN** the write fails by design
 
+### Requirement: Sealed profiles hide the host HOME
+
+The `sealed` and `sealed-tunnel` profiles SHALL NOT expose the ambient host
+`$HOME` to the sandbox, even read-only: they SHALL present a private `$HOME`
+containing only a reviewed read-only allowlist of non-secret single files (each
+resolved through symlinks, required to be a regular file under an approved root,
+and rejected if the target is a denied credential location or a parent of one),
+the worktree, and build caches. `hardened` (read-only `$HOME`) and `open`
+(writable) are integrity profiles and are unchanged.
+
+The deny list SHALL be enforced at the single launch chokepoint
+(`sandbox::enter_argv`, and `ensure` for containers): for a sealed spec every
+mount whose host path or destination lies inside the deny list SHALL be dropped
+regardless of who added it (`[sandbox] mounts` including the defaults, bound
+identities, profile credential mounts, agent provider homes, cache injectors),
+and a mount whose host path is or contains a protected path SHALL refuse the
+launch. A sealed compose-backed spec SHALL be refused (compose volumes cannot be
+verified). A kept OCI container SHALL be reused for a sealed spec only when it
+carries `thegn.seal_home=1` and binds exactly the required mounts, and a
+non-sealed spec SHALL NOT reuse a sealed container. The only exception is the managed per-account credential dir under
+thegn's own state; the ambient `~/.claude` / `~/.codex` SHALL NOT be mounted.
+Dropped `[sandbox] mounts` entries SHALL be listed by `thegn doctor`.
+
+A sealed launch SHALL be refused, never run weaker and never downgraded to the
+host, when the backend/config would leave `$HOME` visible or no sandbox is
+produced: no filesystem boundary (host, Windows, WSL), `file_access = "all"`,
+an unset or unresolvable `$HOME`, a systemd `$HOME` outside `/home`, `/root` and
+`/run/user`, a systemd or OCI mount path containing whitespace, a quote, a
+backslash or `:`, and a pane anchored at `$HOME`. With `[sandbox] enabled =
+false` (the user's explicit choice) the profile is not enforced and `thegn
+doctor` SHALL say so. The read-write automatic caches remain an integrity (not
+confidentiality) exposure.
+
+#### Scenario: Credentials are unreadable in a sealed bwrap sandbox
+
+- **WHEN** a sealed bwrap sandbox runs with canary files under `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.config/gh` and thegn state
+- **THEN** none are readable or copyable into the worktree, while the allowlisted `~/.gitconfig`, the worktree and git still work
+
+#### Scenario: A backend that cannot hide HOME is refused
+
+- **WHEN** a sealed profile resolves to the host process, a Windows backend, `file_access = "all"`, or a mount covering `$HOME`
+- **THEN** the launch fails closed and `thegn doctor` reports `home` as not hidden
+
+#### Scenario: Mounts added after resolution are filtered
+
+- **WHEN** a sealed spec gains a bound identity's ssh key, `GH_CONFIG_DIR`, `GNUPGHOME` or an ambient agent home after resolution
+- **THEN** none of those paths appear in the launch argv
+
 ### Requirement: Per-worktree tunnel via a sidecar leaves the host untouched
 
 A worktree MAY attach to its own overlay network through a per-worktree sidecar container whose network namespace the worktree joins (`--network container:<sidecar>`); thegn MUST NOT embed a tunnel datapath, and the host's networking (including any host `tailscaled`) MUST remain unchanged.
