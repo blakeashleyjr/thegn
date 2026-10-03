@@ -46,7 +46,8 @@ resolved through symlinks and bound from its real target, which must be a
 regular file under `$HOME`, `/nix/store`, `/usr` or `/etc`.
 
 The deny list (matched against resolved paths, for `$HOME` and the passwd
-home of `$USER`) covers `~/.ssh`, `~/.aws`, `~/.azure`, `~/.gnupg`,
+home of `$USER` — read from `/etc/passwd` only, so NSS/LDAP users get just
+the `$HOME` spelling) covers `~/.ssh`, `~/.aws`, `~/.azure`, `~/.gnupg`,
 `~/.secrets`, `~/.netrc`, `~/.git-credentials`, `~/.npmrc`, `~/.pypirc`,
 `~/.cargo/credentials*`, `~/.vault-token`, `~/.docker`, `~/.kube`,
 `~/.config/{gh,gcloud,rclone,git/credentials,…}`, `~/.terraform.d`,
@@ -55,13 +56,18 @@ keyrings, browser profiles, `~/.claude*`, `~/.codex`, thegn's state dir,
 
 **One chokepoint enforces it.** Every launcher (panes, agents, queue
 agents, autopilot, cache probes) builds its command through
-`sandbox::enter_argv` (and `ensure` for containers), which — for a sealed
+`sandbox::enter_argv` (and `ensure` for containers; queue agents only when
+the queue's sandbox opt-in is on), which — for a sealed
 spec — drops every mount whose host path or destination lies inside the
 deny list, whoever added it: `[sandbox] mounts` (the default `~/.gnupg:rw`
 included), a bound identity's git ssh key / `GH_CONFIG_DIR` / `GNUPGHOME`,
 the profile credential mounts, or an agent provider home. A mount whose
 host path is, or contains, a protected path (the worktree being `$HOME`
-itself, a `~` mount) refuses the launch. Dropped `[sandbox] mounts` are
+itself, a `~` mount) refuses the launch. A compose-backed spec is refused
+too ("sealed profile cannot verify compose volumes"), since compose-file
+volumes never appear in the mount list. A kept container is reused only
+if it carries the matching `thegn.seal_home` label and, when sealed, binds
+exactly the required mounts; otherwise it is recreated. Dropped `[sandbox] mounts` are
 listed by `thegn doctor`; a user-authored one also warns once per path.
 The ssh identity-key mounts and the `~/.local/{state,share}` write
 carve-outs are not applied. Extend the allowlist with `[sandbox] mounts`

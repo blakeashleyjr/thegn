@@ -760,11 +760,31 @@ pub fn sealed_mount_still_ok(m: &Mount, home: &Path) -> bool {
     if sealed_mount_inside_deny(m, home) {
         return false;
     }
-    if m.ro && !m.cache && Path::new(&m.dest).starts_with(home) {
+    // Only mounts that ORIGINATE from `sealed_home_allowlist` (read-only, destined
+    // for one of its fixed `$HOME`-relative paths) must resolve into an approved
+    // root; a user entry such as `/srv/data:~/data:ro` is the user's own choice.
+    let from_allowlist = m.ro
+        && !m.cache
+        && SEALED_HOME_ALLOW
+            .iter()
+            .any(|rel| Path::new(&m.dest) == home.join(rel));
+    if from_allowlist {
         let canon_home = home.canonicalize().unwrap_or_else(|_| home.to_path_buf());
         return sealed_target_ok(&resolve_lenient(Path::new(&m.host)), &canon_home);
     }
     true
+}
+
+/// Whether `host` is one of the built-in agent config dirs (`~/.claude`,
+/// `~/.codex`, or the env-selected `CLAUDE_CONFIG_DIR`/`CODEX_HOME`) that a sealed
+/// launch always drops — dropping those is expected, not worth a warning.
+pub fn is_builtin_agent_carve(host: &str) -> bool {
+    let h = Path::new(host);
+    let home = std::env::var("HOME").unwrap_or_default();
+    crate::account::providers().iter().any(|p| {
+        crate::account::effective_config_dir(p).is_some_and(|d| Path::new(&d) == h)
+            || (!home.is_empty() && Path::new(&home).join(p.default_dir) == h)
+    })
 }
 
 /// The read-only `$HOME` allowlist for a sealed sandbox, resolved against the

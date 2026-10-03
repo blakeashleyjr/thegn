@@ -642,14 +642,12 @@ pub fn sealed_view(spec: &SandboxSpec) -> std::borrow::Cow<'_, SandboxSpec> {
         return std::borrow::Cow::Borrowed(spec);
     };
     let home = std::path::Path::new(home);
+    // Warn once per path per process, and never for the built-in agent-config
+    // carve (`~/.claude`/`~/.codex`), which a sealed launch always drops.
     let ok = |m: &Mount| {
         let keep = crate::sandbox_mounts::sealed_mount_still_ok(m, home);
-        if !keep {
-            tracing::warn!(
-                target: "thegn::sandbox",
-                path = %m.host,
-                "sealed profile: mount reaches a protected path; omitted from the launch"
-            );
+        if !keep && !crate::sandbox_mounts::is_builtin_agent_carve(&m.host) {
+            warn_dropped_mount_once(&m.host, &m.host);
         }
         keep
     };
@@ -669,6 +667,15 @@ pub fn sealed_view(spec: &SandboxSpec) -> std::borrow::Cow<'_, SandboxSpec> {
 /// `$HOME` gate, and the OCI `-v` path syntax check.
 fn launchable(spec: &SandboxSpec) -> Result<std::borrow::Cow<'_, SandboxSpec>, EnterError> {
     admit_volumes(spec)?;
+    // Compose-file volumes never enter `spec.mounts`, so the deny filter and the
+    // `$HOME` gate cannot see them: a sealed spec refuses compose outright.
+    if spec.seal_home.is_some() && spec.compose_spec().is_some() {
+        return Err(EnterError::Refused(
+            "sealed profile cannot verify compose volumes; remove the compose config or use a \
+             non-sealed profile"
+                .into(),
+        ));
+    }
     let view = sealed_view(spec);
     if let Some(m) = crate::sandbox_floor::home_gate(&view) {
         return Err(EnterError::Refused(m));
@@ -1765,6 +1772,47 @@ fn oci_emits_mount(m: &Mount) -> bool {
     !matches!(m.dest.as_str(), "/etc/resolv.conf" | "/etc/hosts")
 }
 
+/// Label stamped at create recording whether the container was built for a
+/// sealed (`$HOME`-hiding) spec. The container name is per worktree, NOT per
+/// profile, so reuse must compare it or a `hardened` container (ro `$HOME`,
+/// `~/.gnupg` rw) would be reused by a later `sealed` launch.
+const SEAL_LABEL: &str = "thegn.seal_home";
+
+/// Whether a running container's bind sources satisfy the spec. Non-sealed: the
+/// required set must be a subset (historic behaviour). Sealed: the live set must
+/// EQUAL the required one — an extra bind could be `~/.ssh` — apart from the
+/// `/nix` bind `oci_create_opts` adds itself for devenv.
+fn mounts_match(
+    required: &std::collections::HashSet<&str>,
+    active: &std::collections::HashSet<&str>,
+    sealed: bool,
+) -> bool {
+    if !required.iter().all(|r| active.contains(r)) {
+        return false;
+    }
+    !sealed || active.iter().all(|a| required.contains(a) || *a == "/nix")
+}
+
+/// Judge `inspect` output in thegn's probe format: line 1 `RUNNING` (or empty),
+/// line 2 the [`SEAL_LABEL`] value (empty when absent), then one bind source per
+/// line. Returns `(running, reusable)`. Reusable also requires the seal label to
+/// match the spec: `1` for sealed, absent-or-`0` for non-sealed; an absent label
+/// on a sealed spec means a pre-label container and is recreated.
+fn judge_inspect(
+    stdout: &str,
+    required: &std::collections::HashSet<&str>,
+    sealed: bool,
+) -> (bool, bool) {
+    let mut lines = stdout.lines();
+    if lines.next() != Some("RUNNING") {
+        return (false, false);
+    }
+    let label = lines.next().unwrap_or("").trim();
+    let label_ok = if sealed { label == "1" } else { label != "1" };
+    let active: std::collections::HashSet<&str> = lines.filter(|l| !l.is_empty()).collect();
+    (true, label_ok && mounts_match(required, &active, sealed))
+}
+
 /// `(running, mounts_ok)` parsed from Apple `container inspect`'s JSON.
 ///
 /// Apple's CLI diverges from docker/podman on both halves of the probe, and
@@ -1779,7 +1827,14 @@ fn oci_emits_mount(m: &Mount) -> bool {
 ///
 /// Shape (verified against `container` 1.2.2):
 /// `[{ "status": { "state": "running" }, "configuration": { "mounts": [ { "source": … } ] } }]`
+#[cfg(test)]
 pub(crate) fn parse_apple_inspect(stdout: &str, required: &[&str]) -> (bool, bool) {
+    parse_apple_inspect_sealed(stdout, required, false)
+}
+
+/// Apple has no verified `--label`, so a sealed spec is judged on mounts alone
+/// (and, because it never receives host mounts, equality is cheap and strict).
+fn parse_apple_inspect_sealed(stdout: &str, required: &[&str], sealed: bool) -> (bool, bool) {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(stdout) else {
         return (false, false);
     };
@@ -1804,8 +1859,8 @@ pub(crate) fn parse_apple_inspect(stdout: &str, required: &[&str]) -> (bool, boo
                 .collect()
         })
         .unwrap_or_default();
-    let mounts_ok = required.iter().all(|r| active.contains(*r));
-    (true, mounts_ok)
+    let req: std::collections::HashSet<&str> = required.iter().copied().collect();
+    (true, mounts_match(&req, &active, sealed))
 }
 
 /// Force-remove this spec's container on the SAME daemon `run -d` creates it on.
@@ -1827,6 +1882,7 @@ pub(crate) fn remove_container(spec: &SandboxSpec) {
 }
 
 fn container_status(spec: &SandboxSpec) -> (bool, bool) {
+    let sealed = spec.seal_home.is_some();
     let required: std::collections::HashSet<&str> = spec
         .mounts
         .iter()
@@ -1837,7 +1893,7 @@ fn container_status(spec: &SandboxSpec) -> (bool, bool) {
     // Emit "RUNNING" if actually running (not "created"/"exited"), then one
     // bind-mount source per line. A container in "created" state passes inspect
     // but cannot accept exec sessions — we must not treat it as healthy.
-    let fmt = "{{if .State.Running}}RUNNING{{end}}\n{{range .Mounts}}{{if eq .Type \"bind\"}}{{.Source}}\n{{end}}{{end}}";
+    let fmt = "{{if .State.Running}}RUNNING{{end}}\n{{index .Config.Labels \"thegn.seal_home\"}}\n{{range .Mounts}}{{if eq .Type \"bind\"}}{{.Source}}\n{{end}}{{end}}";
     let mut argv = oci_prefix(spec);
     // For remote worktrees the transport wraps the argv; for local we call
     // podman/docker directly. run_control_t_owned gives us the timeout but
@@ -1855,7 +1911,7 @@ fn container_status(spec: &SandboxSpec) -> (bool, bool) {
                 return (false, false); // container doesn't exist
             }
             let req: Vec<&str> = required.iter().copied().collect();
-            return parse_apple_inspect(&stdout, &req);
+            return parse_apple_inspect_sealed(&stdout, &req, sealed);
         }
         argv.extend([
             "container".into(),
@@ -1871,14 +1927,8 @@ fn container_status(spec: &SandboxSpec) -> (bool, bool) {
         if !ok && stdout.is_empty() {
             return (false, false); // container doesn't exist
         }
-        let mut lines = stdout.lines();
         // First line must be "RUNNING" — "CREATED" / "EXITED" / missing → not usable.
-        if lines.next() != Some("RUNNING") {
-            return (false, false);
-        }
-        let active: std::collections::HashSet<&str> = lines.filter(|l| !l.is_empty()).collect();
-        let mounts_ok = required.iter().all(|r| active.contains(r));
-        (true, mounts_ok)
+        judge_inspect(&stdout, &required, sealed)
     } else {
         // Remote: run the same inspect command over SSH to verify mounts.
         let mut remote_argv = oci_prefix(spec);
@@ -1892,13 +1942,7 @@ fn container_status(spec: &SandboxSpec) -> (bool, bool) {
         let Some((_, stdout)) = output_control_owned(spec, &remote_argv, PROBE_TIMEOUT) else {
             return (false, false);
         };
-        let mut lines = stdout.lines();
-        if lines.next() != Some("RUNNING") {
-            return (false, false);
-        }
-        let active: std::collections::HashSet<&str> = lines.filter(|l| !l.is_empty()).collect();
-        let mounts_ok = required.iter().all(|r| active.contains(r));
-        (true, mounts_ok)
+        judge_inspect(&stdout, &required, sealed)
     }
 }
 
@@ -2587,6 +2631,10 @@ fn oci_create_opts(spec: &SandboxSpec) -> Result<Vec<String>, VolumeAdmissionErr
     // their `thegn-` name, which is what management uses for them anyway.
     if spec.backend != Backend::Apple {
         v.extend(["--label".into(), crate::sandbox_manage::OWNED_LABEL.into()]);
+        v.extend([
+            "--label".into(),
+            format!("{SEAL_LABEL}={}", u8::from(spec.seal_home.is_some())),
+        ]);
     }
     // Run under a specific OCI runtime (gVisor's `runsc`, libkrun's `krun`, …)
     // when requested. podman/docker persist the runtime in the container config,

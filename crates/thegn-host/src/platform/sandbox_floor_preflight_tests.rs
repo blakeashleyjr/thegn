@@ -9,7 +9,7 @@ use thegn_core::remote::GitLoc;
 
 const IMAGE: &str = "fixture.invalid/the617:inert";
 const PREFLIGHT_FAILURE: &str = "THE617_OWNED_EXEC_PREFLIGHT_FAILURE";
-const INSPECT_FORMAT: &str = "{{if .State.Running}}RUNNING{{end}}\n{{range .Mounts}}{{if eq .Type \"bind\"}}{{.Source}}\n{{end}}{{end}}";
+const INSPECT_FORMAT: &str = "{{if .State.Running}}RUNNING{{end}}\n{{index .Config.Labels \"thegn.seal_home\"}}\n{{range .Mounts}}{{if eq .Type \"bind\"}}{{.Source}}\n{{end}}{{end}}";
 
 /// Availability caches otherwise outlive PATH restoration. Clear both sides of
 /// the private invocation while the existing environment guard is held.
