@@ -45,28 +45,53 @@ pub fn spawn_fetch(
     waker: termwiz::terminal::TerminalWaker,
     kitty: bool,
 ) {
-    crate::preview_jobs::global().submit(move |ctx| {
-        let (text, raster) = route_and_render(&abs, kitty, ctx.cancelled());
+    // On a panic the fallback still answers this generation, so the preview
+    // shows an error instead of sticking at "loading".
+    let fb_tx = text_tx.clone();
+    let fb_rel = rel.clone();
+    let fb_waker = waker.clone();
+    let fallback = move |ctx: &crate::preview_jobs::JobCtx| {
         let delivered = ctx.deliver(|| {
-            let mut delivered = false;
-            if let Some((r, w, h)) = raster {
-                delivered |= img_tx
-                    .try_send((rel.clone(), Raster { rgba: r, w, h }))
-                    .is_ok();
-            }
-            delivered |= text_tx.try_send((rel, text)).is_ok();
-            delivered
+            fb_tx
+                .try_send((fb_rel, Err("preview failed unexpectedly".to_string())))
+                .is_ok()
         });
         if delivered {
-            let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
+            let _ = fb_waker.wake(); // best-effort: waker pulse
         }
-    });
+    };
+    crate::preview_jobs::global().submit_guarded(
+        move |ctx| {
+            let (text, raster) = route_and_render(&abs, kitty, ctx.cancelled());
+            let delivered = ctx.deliver(|| {
+                let mut delivered = false;
+                if let Some((r, w, h)) = raster {
+                    delivered |= img_tx
+                        .try_send((rel.clone(), Raster { rgba: r, w, h }))
+                        .is_ok();
+                }
+                delivered |= text_tx.try_send((rel, text)).is_ok();
+                delivered
+            });
+            if delivered {
+                let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
+            }
+        },
+        fallback,
+    );
 }
 
 /// The preview was closed or replaced by something that is not a file preview:
 /// drop queued work and kill the active job's renderers.
 pub fn cancel_fetches() {
     crate::preview_jobs::global().cancel_all();
+}
+
+/// Close the inline file preview AND cancel its in-flight fetch: the one place
+/// the loop drops `file_preview`, so a renderer can never outlive its pane.
+pub fn close_file_preview(panel_ui: &mut crate::panel::PanelUi) {
+    panel_ui.file_preview = None;
+    cancel_fetches();
 }
 
 /// Route `abs` and produce `(text_lines, optional_raster)`. Pure-ish (does file
@@ -109,10 +134,11 @@ fn route_and_render(
             kitty,
             || crate::rasterize::pdf_page1(abs, cancel),
             || {
-                // Fallback: extracted text, or a clear note when no extractor exists.
-                Ok(crate::rasterize::pdf_text(abs, cancel)
-                    .map(|t| t.lines().map(str::to_string).collect())
-                    .unwrap_or_else(|| vec!["(PDF — no text extractor available)".to_string()]))
+                // Fallback: extracted text, or a truthful note on why there is none.
+                Ok(match crate::rasterize::pdf_text(abs, cancel) {
+                    Ok(t) => t.lines().map(str::to_string).collect(),
+                    Err(why) => vec![format!("(PDF — {why})")],
+                })
             },
         ),
         PreviewRoute::Unknown => (Err("binary file".to_string()), None),

@@ -831,6 +831,13 @@ pub fn spawn_grouped(cmd: &mut Command) -> std::io::Result<(std::process::Child,
     Ok((child, GroupHandle { pid, job }))
 }
 
+/// Windows' kill-on-close Job Object already ends the tree with thegn.
+pub fn spawn_grouped_die_with_parent(
+    cmd: &mut Command,
+) -> std::io::Result<(std::process::Child, GroupHandle)> {
+    spawn_grouped(cmd)
+}
+
 /// Gate spawn is fail-closed: establish a configured kill-on-close Job Object
 /// before creating the command; create the process suspended, assign it to the
 /// job, then resume its sole startup thread. Other callers retain

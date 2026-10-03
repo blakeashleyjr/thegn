@@ -8,6 +8,9 @@
 //!   idle, and the tokio blocking pool is never occupied by a hung renderer).
 //! * A job delivers through [`JobCtx::deliver`], which checks the generation
 //!   under the same lock `submit` takes, so a superseded job can never send.
+//! * A job that panics (or cannot get a worker thread) runs its fallback, which
+//!   delivers an error result for that generation, so a preview never sticks at
+//!   "loading".
 //! * Memory: rasters are capped (`rasterize::MAX_DIM`) and only the current
 //!   generation is ever delivered, so queued + completed bytes are bounded by
 //!   one active + one pending job plus the one result the loop has yet to drain.
@@ -18,14 +21,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-/// Total wall-clock budget for one external renderer, kill grace included.
+/// Wall-clock budget for one external renderer. On expiry the whole process
+/// group is SIGKILLed immediately (there is no grace period) and reaped.
 pub(crate) const RENDERER_DEADLINE: Duration = Duration::from_secs(15);
 /// Max stdout bytes kept from a renderer (a 96 dpi page PNG is far smaller).
 pub(crate) const RENDERER_MAX_OUTPUT: usize = 32 * 1024 * 1024;
 const POLL: Duration = Duration::from_millis(10);
 const READER_GRACE: Duration = Duration::from_millis(500);
 
-/// Exact observable counters.
+/// Exact observable counters (test-only: nothing in production reads them).
+#[cfg(test)]
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct PreviewJobStats {
     pub submitted: u64,
@@ -37,20 +42,35 @@ pub struct PreviewJobStats {
     pub delivered: u64,
     /// Deliveries refused because the generation moved on.
     pub stale_dropped: u64,
-    /// External renderers killed on deadline.
-    pub renderer_timeouts: u64,
-    /// Renderer output truncated at the byte cap.
-    pub renderer_output_capped: u64,
+}
+
+/// Bump a test-only counter; compiles to nothing outside `test`.
+macro_rules! bump {
+    ($st:expr, $field:ident) => {
+        #[cfg(test)]
+        {
+            $st.stats.$field += 1;
+        }
+    };
 }
 
 type Work = Box<dyn FnOnce(&JobCtx) + Send>;
+/// Runs instead of the result a job failed to produce (panic / no worker).
+type Fallback = Box<dyn FnOnce(&JobCtx) + Send>;
+
+struct Pending {
+    generation: u64,
+    work: Work,
+    fallback: Option<Fallback>,
+}
 
 #[derive(Default)]
 struct State {
     generation: u64,
-    pending: Option<(u64, Work)>,
+    pending: Option<Pending>,
     active: Option<Arc<AtomicBool>>,
     worker_running: bool,
+    #[cfg(test)]
     stats: PreviewJobStats,
 }
 
@@ -75,14 +95,15 @@ impl JobCtx {
     /// Run `send` only if this job is still the newest generation. The check
     /// and the send are atomic with respect to `submit`/`cancel_all`.
     pub fn deliver(&self, send: impl FnOnce() -> bool) -> bool {
+        #[allow(unused_mut)] // only the test-only counters mutate it
         let mut st = lock(&self.state);
         if st.generation != self.generation {
-            st.stats.stale_dropped += 1;
+            bump!(st, stale_dropped);
             return false;
         }
         let sent = send();
         if sent {
-            st.stats.delivered += 1;
+            bump!(st, delivered);
         }
         sent
     }
@@ -92,21 +113,50 @@ fn lock(state: &Mutex<State>) -> std::sync::MutexGuard<'_, State> {
     state.lock().unwrap_or_else(|p| p.into_inner())
 }
 
+/// Run a fallback, containing a panic in it.
+fn run_fallback(fallback: Option<Fallback>, ctx: &JobCtx) {
+    if let Some(fb) = fallback
+        && std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| fb(ctx))).is_err()
+    {
+        tracing::warn!(target: "thegn::preview", "preview fallback panicked");
+    }
+}
+
 impl PreviewSupervisor {
+    #[cfg(test)]
     pub fn submit(&self, work: impl FnOnce(&JobCtx) + Send + 'static) {
+        self.submit_inner(Box::new(work), None);
+    }
+
+    /// [`submit`](Self::submit) plus a `fallback` that runs (and should deliver
+    /// an error for this generation) if `work` panics or no worker thread could
+    /// be started.
+    pub fn submit_guarded(
+        &self,
+        work: impl FnOnce(&JobCtx) + Send + 'static,
+        fallback: impl FnOnce(&JobCtx) + Send + 'static,
+    ) {
+        self.submit_inner(Box::new(work), Some(Box::new(fallback)));
+    }
+
+    fn submit_inner(&self, work: Work, fallback: Option<Fallback>) {
         let spawn = {
             let mut st = lock(&self.state);
             st.generation = st.generation.wrapping_add(1);
-            st.stats.submitted += 1;
+            bump!(st, submitted);
             if st.pending.take().is_some() {
-                st.stats.superseded_queued += 1;
+                bump!(st, superseded_queued);
             }
             if let Some(active) = st.active.as_ref() {
                 active.store(true, Ordering::Release);
-                st.stats.cancelled_active += 1;
+                bump!(st, cancelled_active);
             }
             let generation = st.generation;
-            st.pending = Some((generation, Box::new(work)));
+            st.pending = Some(Pending {
+                generation,
+                work,
+                fallback,
+            });
             !std::mem::replace(&mut st.worker_running, true)
         };
         if spawn {
@@ -117,22 +167,44 @@ impl PreviewSupervisor {
                     crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
                     worker(&state);
                 });
-            if spawned.is_err() {
-                let mut st = lock(&self.state);
-                st.worker_running = false;
-                st.pending = None;
+            if let Err(e) = spawned {
+                tracing::warn!(target: "thegn::preview", error = %e, "preview worker spawn failed");
+                let pending = {
+                    let mut st = lock(&self.state);
+                    st.worker_running = false;
+                    st.pending.take()
+                };
+                if let Some(p) = pending {
+                    let ctx = JobCtx {
+                        generation: p.generation,
+                        cancel: Arc::new(AtomicBool::new(false)),
+                        state: Arc::clone(&self.state),
+                    };
+                    run_fallback(p.fallback, &ctx);
+                }
             }
         }
     }
 
     /// Drop pending work and cancel the active job (preview closed/replaced).
     pub fn cancel_all(&self) {
+        #[allow(unused_mut)] // only the test-only counters mutate it
         let mut st = lock(&self.state);
         st.generation = st.generation.wrapping_add(1);
         st.pending = None;
         if let Some(active) = st.active.as_ref() {
             active.store(true, Ordering::Release);
-            st.stats.cancelled_active += 1;
+            bump!(st, cancelled_active);
+        }
+    }
+
+    /// Cancel everything and wait up to `wait` for the worker to finish, so a
+    /// renderer's process group is killed and reaped before thegn exits.
+    pub fn shutdown(&self, wait: Duration) {
+        self.cancel_all();
+        let until = Instant::now() + wait;
+        while lock(&self.state).worker_running && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(2));
         }
     }
 
@@ -151,32 +223,49 @@ impl PreviewSupervisor {
 
 fn worker(state: &Arc<Mutex<State>>) {
     loop {
-        let (generation, work, cancel) = {
+        let (pending, cancel) = {
             let mut st = lock(state);
-            let Some((generation, work)) = st.pending.take() else {
+            let Some(pending) = st.pending.take() else {
                 st.worker_running = false;
                 return;
             };
             let cancel = Arc::new(AtomicBool::new(false));
             st.active = Some(Arc::clone(&cancel));
-            st.stats.started += 1;
-            (generation, work, cancel)
+            bump!(st, started);
+            (pending, cancel)
         };
         let ctx = JobCtx {
-            generation,
+            generation: pending.generation,
             cancel,
             state: Arc::clone(state),
         };
-        // A panicking job must not wedge the slot.
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(&ctx))); // best-effort: a panicking decoder must not kill the worker
+        // A panicking job must not wedge the slot, nor leave its preview stuck
+        // at "loading": deliver the fallback's error for this generation.
+        let Pending { work, fallback, .. } = pending;
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(&ctx))).is_err() {
+            tracing::warn!(target: "thegn::preview", "preview job panicked");
+            run_fallback(fallback, &ctx);
+        }
         lock(state).active = None;
     }
 }
 
+fn global_slot() -> &'static OnceLock<PreviewSupervisor> {
+    static G: OnceLock<PreviewSupervisor> = OnceLock::new();
+    &G
+}
+
 /// The process-wide preview slot.
 pub fn global() -> &'static PreviewSupervisor {
-    static G: OnceLock<PreviewSupervisor> = OnceLock::new();
-    G.get_or_init(PreviewSupervisor::default)
+    global_slot().get_or_init(PreviewSupervisor::default)
+}
+
+/// Loop shutdown: cancel the global slot and wait briefly for its renderer
+/// tree to be killed and reaped. A no-op when no preview ever ran.
+pub fn shutdown_global(wait: Duration) {
+    if let Some(sup) = global_slot().get() {
+        sup.shutdown(wait);
+    }
 }
 
 #[derive(Debug)]
@@ -185,52 +274,95 @@ pub enum CaptureError {
     Cancelled,
     Timeout,
     Failed,
+    /// Stdout reached the byte cap; carries the truncated output. The renderer
+    /// was killed, so the data is incomplete (usable for text, not for a PNG).
+    Capped(Vec<u8>),
 }
 
 /// Run `cmd` in its own process group, capture at most `max_out` stdout bytes,
 /// and bound it by `deadline` and `cancel`. On every exit path the whole group
 /// is killed and the leader reaped; the stdout reader is waited for only a
 /// bounded grace (a descendant that escaped the group cannot hang the worker).
-#[expect(
-    clippy::disallowed_methods,
-    reason = "the wait follows a confirmed exit or a group kill, on the dedicated preview worker"
-)]
 pub fn bounded_capture(
     cmd: &mut Command,
     cancel: &AtomicBool,
     deadline: Duration,
     max_out: usize,
-    stats: Option<&PreviewSupervisor>,
+) -> Result<Vec<u8>, CaptureError> {
+    capture(cmd, cancel, deadline, Some(max_out))
+}
+
+/// Like [`bounded_capture`] for a renderer whose output goes to a file: stdout
+/// is `/dev/null` and there is no reader, so a descendant (a browser) can never
+/// hold a pipe open.
+pub fn bounded_run(
+    cmd: &mut Command,
+    cancel: &AtomicBool,
+    deadline: Duration,
+) -> Result<(), CaptureError> {
+    capture(cmd, cancel, deadline, None).map(|_| ())
+}
+
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the wait follows a confirmed exit or a group kill, on the dedicated preview worker"
+)]
+fn capture(
+    cmd: &mut Command,
+    cancel: &AtomicBool,
+    deadline: Duration,
+    max_out: Option<usize>,
 ) -> Result<Vec<u8>, CaptureError> {
     cmd.stdin(Stdio::null())
-        .stdout(Stdio::piped())
+        .stdout(if max_out.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stderr(Stdio::null());
-    let (mut child, group) = crate::platform::spawn_grouped(cmd).map_err(CaptureError::Spawn)?;
-    let mut stdout = child.stdout.take();
-    let (tx, rx) = std::sync::mpsc::channel::<(Vec<u8>, bool)>();
-    let reader = std::thread::Builder::new()
-        .name("thegn-preview-io".into())
-        .spawn(move || {
-            let mut buf = Vec::new();
-            let mut capped = false;
-            if let Some(out) = stdout.as_mut() {
-                let mut chunk = [0u8; 64 * 1024];
-                loop {
-                    match out.read(&mut chunk) {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => {
-                            let room = max_out.saturating_sub(buf.len());
-                            buf.extend_from_slice(&chunk[..n.min(room)]);
-                            if n > room {
-                                capped = true;
-                                break;
+    let (mut child, group) =
+        crate::platform::spawn_grouped_die_with_parent(cmd).map_err(CaptureError::Spawn)?;
+    let capped = Arc::new(AtomicBool::new(false));
+    let mut reader_rx = None;
+    if let Some(max_out) = max_out {
+        let mut stdout = child.stdout.take();
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let capped = Arc::clone(&capped);
+        let spawned = std::thread::Builder::new()
+            .name("thegn-preview-io".into())
+            .spawn(move || {
+                crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
+                let mut buf = Vec::new();
+                if let Some(out) = stdout.as_mut() {
+                    let mut chunk = [0u8; 64 * 1024];
+                    loop {
+                        match out.read(&mut chunk) {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                let room = max_out.saturating_sub(buf.len());
+                                buf.extend_from_slice(&chunk[..n.min(room)]);
+                                if n > room {
+                                    capped.store(true, Ordering::Release);
+                                    break;
+                                }
                             }
                         }
                     }
                 }
+                if tx.send(buf).is_err() {
+                    // the waiter timed out and dropped the receiver
+                }
+            });
+        if let Err(e) = spawned {
+            tracing::warn!(target: "thegn::preview", error = %e, "preview reader spawn failed");
+            group.kill();
+            if let Err(e) = child.wait() {
+                tracing::warn!(target: "thegn::preview", error = %e, "renderer reap failed");
             }
-            let _ = tx.send((buf, capped)); // best-effort: the waiter may have timed out
-        });
+            return Err(CaptureError::Failed);
+        }
+        reader_rx = Some(rx);
+    }
     let started = Instant::now();
     let outcome = loop {
         if cancel.load(Ordering::Acquire) {
@@ -239,14 +371,14 @@ pub fn bounded_capture(
         if started.elapsed() >= deadline {
             break Err(CaptureError::Timeout);
         }
+        // Output cap reached: stop the renderer too.
+        if capped.load(Ordering::Acquire) {
+            break Err(CaptureError::Capped(Vec::new()));
+        }
         match crate::platform::gate_child_exited(&mut child) {
             Ok(true) => break Ok(()),
             Ok(false) => {}
             Err(_) => break Err(CaptureError::Failed),
-        }
-        // Output cap reached: the reader stopped, stop the renderer too.
-        if reader.is_err() {
-            break Err(CaptureError::Failed);
         }
         std::thread::sleep(POLL);
     };
@@ -254,40 +386,35 @@ pub fn bounded_capture(
     // the unreaped leader pins the pgid against reuse.
     group.kill();
     let status = child.wait();
-    let (bytes, capped) = rx.recv_timeout(READER_GRACE).unwrap_or_default();
-    if let Some(sup) = stats {
-        let mut st = lock(&sup.state);
-        if matches!(outcome, Err(CaptureError::Timeout)) {
-            st.stats.renderer_timeouts += 1;
-        }
-        if capped {
-            st.stats.renderer_output_capped += 1;
-        }
+    let bytes = reader_rx
+        .and_then(|rx| rx.recv_timeout(READER_GRACE).ok())
+        .unwrap_or_default();
+    match outcome {
+        Err(CaptureError::Capped(_)) => return Err(CaptureError::Capped(bytes)),
+        Err(e) => return Err(e),
+        Ok(()) => {}
     }
-    outcome?;
+    // The renderer exited on its own right at the cap: still truncated.
+    if capped.load(Ordering::Acquire) {
+        return Err(CaptureError::Capped(bytes));
+    }
     match status {
         Ok(s) if s.success() => Ok(bytes),
         _ => Err(CaptureError::Failed),
     }
 }
 
-/// Run `bounded_capture` with the global stats and the standard budgets.
+/// Run `bounded_capture` with the standard budgets.
 pub fn run_renderer(cmd: &mut Command, cancel: &AtomicBool) -> Result<Vec<u8>, CaptureError> {
-    bounded_capture(
-        cmd,
-        cancel,
-        RENDERER_DEADLINE,
-        RENDERER_MAX_OUTPUT,
-        Some(global()),
-    )
+    bounded_capture(cmd, cancel, RENDERER_DEADLINE, RENDERER_MAX_OUTPUT)
 }
 
 /// Spawn-and-wait for a renderer that writes a file instead of stdout.
 pub fn run_renderer_quiet(cmd: &mut Command, cancel: &AtomicBool) -> Result<(), CaptureError> {
-    run_renderer(cmd, cancel).map(|_| ())
+    bounded_run(cmd, cancel, RENDERER_DEADLINE)
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::mpsc;
@@ -383,13 +510,34 @@ mod tests {
     }
 
     #[test]
-    fn panicking_job_does_not_wedge_the_slot() {
+    fn panicking_job_does_not_wedge_the_slot_and_delivers_its_fallback() {
         let sup = PreviewSupervisor::default();
-        sup.submit(|_| panic!("boom"));
+        let (etx, erx) = mpsc::channel::<&'static str>();
+        sup.submit_guarded(
+            |_| panic!("boom"),
+            move |ctx| {
+                ctx.deliver(|| etx.send("error").is_ok());
+            },
+        );
+        assert_eq!(erx.recv_timeout(Duration::from_secs(5)).unwrap(), "error");
         let (tx, rx) = mpsc::channel::<()>();
-        std::thread::sleep(Duration::from_millis(50));
         sup.submit(move |_| tx.send(()).unwrap());
         rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    }
+
+    #[test]
+    fn shutdown_cancels_and_waits_for_the_worker() {
+        let sup = PreviewSupervisor::default();
+        let (started_tx, started_rx) = mpsc::channel::<()>();
+        sup.submit(move |ctx| {
+            started_tx.send(()).unwrap();
+            while !ctx.cancelled().load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        });
+        started_rx.recv().unwrap();
+        sup.shutdown(Duration::from_secs(5));
+        assert_eq!(sup.in_flight(), 0);
     }
 
     fn pid_alive(pid: i32) -> bool {
@@ -408,20 +556,21 @@ mod tests {
         let pidf = dir.path().join("pid");
         let script = format!("sleep 60 & echo $! > {}; wait", pidf.display());
         let t = Instant::now();
+        // A 2s deadline leaves ample time for the shell to record the pid on a
+        // loaded box; the whole run must still end far below the 60s sleep.
         let r = bounded_capture(
             &mut sh(&script),
             &AtomicBool::new(false),
-            Duration::from_millis(400),
+            Duration::from_secs(2),
             1024,
-            None,
         );
         assert!(matches!(r, Err(CaptureError::Timeout)));
-        assert!(t.elapsed() < Duration::from_secs(3));
+        assert!(t.elapsed() < Duration::from_secs(5));
         let pid: i32 = std::fs::read_to_string(&pidf)
-            .unwrap()
+            .expect("renderer recorded the descendant pid within the deadline")
             .trim()
             .parse()
-            .unwrap();
+            .expect("pid file holds a pid");
         std::thread::sleep(Duration::from_millis(100));
         assert!(!pid_alive(pid), "descendant must be killed");
     }
@@ -440,7 +589,6 @@ mod tests {
             &cancel,
             Duration::from_secs(30),
             1024,
-            None,
         );
         assert!(matches!(r, Err(CaptureError::Cancelled)));
         assert!(t.elapsed() < Duration::from_secs(3));
@@ -453,7 +601,6 @@ mod tests {
             &AtomicBool::new(false),
             Duration::from_secs(5),
             1024,
-            None,
         )
         .unwrap();
         assert_eq!(ok, b"hello");
@@ -462,10 +609,23 @@ mod tests {
             &AtomicBool::new(false),
             Duration::from_secs(5),
             4096,
-            None,
         );
-        // Output was truncated at the cap; the killed/early-exit renderer never hangs us.
-        assert!(big.is_ok() || matches!(big, Err(CaptureError::Failed)));
+        match big {
+            Err(CaptureError::Capped(bytes)) => assert_eq!(bytes.len(), 4096),
+            other => panic!("expected the capped outcome, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn quiet_runner_has_no_stdout_pipe() {
+        // The renderer's stdout is /dev/null: output is neither captured nor
+        // able to block the run.
+        let r = bounded_run(
+            &mut sh("head -c 1000000 /dev/zero"),
+            &AtomicBool::new(false),
+            Duration::from_secs(5),
+        );
+        assert!(r.is_ok(), "{r:?}");
     }
 
     #[test]
@@ -475,7 +635,6 @@ mod tests {
             &AtomicBool::new(false),
             Duration::from_secs(5),
             16,
-            None,
         );
         assert!(matches!(r, Err(CaptureError::Failed)));
     }
