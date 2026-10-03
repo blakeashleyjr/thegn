@@ -855,6 +855,24 @@ pub fn prepare_sandbox_env(
         }
         .into());
     }
+    // THE-215: a sealed profile never lands on the host. No spec, a `none`
+    // backend, or an unreachable runtime all end here — refuse, regardless of
+    // failover mode. (`sandbox.enabled = false` is the user's explicit choice and
+    // never enters the candidate walk; doctor says the profile is not enforced.)
+    if sb.enabled && hardening.hides_home() {
+        return Err(SandboxHalt {
+            env_name: env_name.clone(),
+            placement: placement_label.clone(),
+            reason: format!(
+                "profile `{}` requires a sandbox that hides $HOME, but no backend produced one \
+                 for {worktree}; refusing to open a host shell (see `thegn doctor`)",
+                hardening.as_str()
+            ),
+            ask,
+            dormant: None,
+        }
+        .into());
+    }
     // Reaching here means no candidate produced a runnable sandbox. A requested
     // sandbox must halt with the existing actionable error instead of becoming a
     // host login shell, regardless of failover mode — unless this is a local

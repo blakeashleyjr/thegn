@@ -439,7 +439,15 @@ fn systemd_protect_home_covers(home: &Path) -> bool {
 pub fn planned_home_view(profile: SandboxProfile, backend: Backend) -> HomeView {
     let family = backend.profile().family;
     if profile.hides_home() && backend_can_hide_home(backend) {
-        return HomeView::Hidden;
+        // `ProtectHome=tmpfs` only reaches /home, /root and /run/user: a systemd
+        // launch from a `$HOME` elsewhere is refused, so it is not "hidden".
+        let systemd_misses_home = family == BackendFamily::Systemd
+            && std::env::var_os("HOME")
+                .map(|h| !systemd_protect_home_covers(Path::new(&h)))
+                .unwrap_or(true);
+        if !systemd_misses_home {
+            return HomeView::Hidden;
+        }
     }
     match family {
         BackendFamily::Oci | BackendFamily::Bwrap | BackendFamily::Systemd
@@ -478,6 +486,9 @@ pub fn home_view(spec: &SandboxSpec, home: &Path) -> HomeView {
             if spec.seal_home.is_some() {
                 if let Some(v) = covering {
                     v
+                } else if !spec.read_only_root {
+                    // `ProtectHome=tmpfs` is only emitted under read_only_root.
+                    HomeView::Writable
                 } else if systemd_protect_home_covers(home) {
                     HomeView::Hidden
                 } else if spec.read_only_root {
@@ -537,6 +548,16 @@ const SEALED_HOME_DENY: &[&str] = &[
     ".claude-profiles",
     ".codex",
     ".gemini",
+    ".git-credentials",
+    ".config/git/credentials",
+    ".npmrc",
+    ".pypirc",
+    ".cargo/credentials",
+    ".cargo/credentials.toml",
+    ".vault-token",
+    ".config/rclone",
+    ".terraform.d",
+    ".docker/config.json",
 ];
 
 /// Absolute roots that are secret by convention wherever they are linked from.
@@ -552,7 +573,8 @@ const SEALED_ABS_APPROVED: &[&str] = &["/nix/store", "/usr", "/etc"];
 ///
 /// Single **files** only for `git` and `zsh` config dirs: those directories hold
 /// credentials by convention (`~/.config/git/credentials`, `~/.zsh_history`),
-/// so they are never bound wholesale.
+/// so they are never bound wholesale. The allowlist binds **files only**
+/// (`is_file()` after canonicalization); there is no directory entry.
 const SEALED_HOME_ALLOW: &[&str] = &[
     ".gitconfig",
     ".config/git/config",
@@ -574,7 +596,6 @@ const SEALED_HOME_ALLOW: &[&str] = &[
     ".profile",
     ".inputrc",
     ".config/starship.toml",
-    ".terminfo",
 ];
 
 /// Whether the resolved `target` may be exposed in a sealed `$HOME`: under an
@@ -582,18 +603,87 @@ const SEALED_HOME_ALLOW: &[&str] = &[
 /// store / `/usr` / `/etc`), not under a denied path, and not an *ancestor* of
 /// one (a link to `~/.config` would drag `~/.config/gh` in with it).
 fn sealed_target_ok(target: &Path, home: &Path) -> bool {
-    !sealed_deny_hit(target, &[home.to_path_buf()])
+    !sealed_deny_hit(target, &deny_homes(home))
         && (target.starts_with(home) || SEALED_ABS_APPROVED.iter().any(|r| target.starts_with(r)))
 }
 
-/// Whether `target` is, is under, or is an ancestor of anything on the deny
-/// lists (resolved against every given spelling of `$HOME`).
-fn sealed_deny_hit(target: &Path, homes: &[PathBuf]) -> bool {
+/// Home directories the deny list is resolved against: `$HOME` (both spellings)
+/// plus the account's passwd home when it differs. The passwd home is read from
+/// `/etc/passwd` for `$USER`/`$LOGNAME` (no libc/cfg; best-effort, absent where
+/// there is no passwd file).
+fn deny_homes(home: &Path) -> Vec<PathBuf> {
+    let mut homes = vec![home.to_path_buf()];
+    if let Ok(c) = home.canonicalize() {
+        homes.push(c);
+    }
+    let names: Vec<String> = ["USER", "LOGNAME"]
+        .iter()
+        .filter_map(|k| std::env::var(k).ok())
+        .filter(|v| !v.is_empty())
+        .collect();
+    if let Ok(passwd) = std::fs::read_to_string("/etc/passwd") {
+        for line in passwd.lines() {
+            let f: Vec<&str> = line.split(':').collect();
+            if f.len() >= 6 && names.iter().any(|n| n == f[0]) && f[5].starts_with('/') {
+                let p = PathBuf::from(f[5]);
+                if let Ok(c) = p.canonicalize()
+                    && !homes.contains(&c)
+                {
+                    homes.push(c);
+                }
+                if !homes.contains(&p) {
+                    homes.push(p);
+                }
+            }
+        }
+    }
+    homes
+}
+
+/// Every deny entry (absolute) for the given home spellings, including thegn's
+/// own state dir wherever `XDG_STATE_HOME` puts it.
+fn deny_entries(homes: &[PathBuf]) -> Vec<PathBuf> {
     homes
         .iter()
         .flat_map(|h| SEALED_HOME_DENY.iter().map(move |d| h.join(d)))
         .chain(SEALED_ABS_DENY.iter().map(PathBuf::from))
-        .any(|d| target.starts_with(&d) || d.starts_with(target))
+        .chain(std::iter::once(crate::util::xdg_state_home().join("thegn")))
+        .collect()
+}
+
+/// The one named exception to the deny list: the MANAGED per-account credential
+/// dirs thegn itself creates (`$XDG_STATE_HOME/thegn/accounts/<provider>/<slug>`)
+/// — strictly below the root, never the root, never the ambient `~/.claude` /
+/// `~/.codex` fallback or an adopted account dir.
+fn managed_account_exempt(target: &Path) -> bool {
+    let root = crate::account::managed_root();
+    let mut roots = vec![root.clone()];
+    if let Ok(c) = root.canonicalize() {
+        roots.push(c);
+    }
+    roots.iter().any(|r| target != r && target.starts_with(r))
+}
+
+/// `target` is, or is under, a deny entry.
+fn deny_inside(target: &Path, entries: &[PathBuf]) -> bool {
+    !managed_account_exempt(target) && entries.iter().any(|d| target.starts_with(d))
+}
+
+/// `target` is, or is an ancestor of, a deny entry (it would drag it in).
+fn deny_covers(target: &Path, entries: &[PathBuf]) -> bool {
+    !managed_account_exempt(target) && entries.iter().any(|d| d.starts_with(target))
+}
+
+fn sealed_deny_hit(target: &Path, homes: &[PathBuf]) -> bool {
+    let e = deny_entries(homes);
+    deny_inside(target, &e) || deny_covers(target, &e)
+}
+
+/// Whether a path would be unsafe in a systemd `BindPaths=`/OCI `-v` spec, which
+/// are unquoted `a:b[:opts]` strings.
+pub fn mount_path_unsafe(p: &str) -> bool {
+    p.chars()
+        .any(|c| c.is_whitespace() || c.is_control() || matches!(c, ':' | '"' | '\'' | '\\'))
 }
 
 /// Canonicalize `p`, tolerating a missing tail (canonicalize the deepest
@@ -617,19 +707,38 @@ fn resolve_lenient(p: &Path) -> PathBuf {
     p.to_path_buf()
 }
 
+/// Each spelling of a mount path (lexical and canonicalized) for deny checks.
+fn spellings(p: &str) -> [PathBuf; 2] {
+    let raw = PathBuf::from(p);
+    let resolved = resolve_lenient(&raw);
+    [raw, resolved]
+}
+
 /// Whether a user/default `[sandbox] mounts` entry (host path AND destination,
-/// lexically and canonicalized) reaches the sealed deny list. Sealed panes drop
-/// such entries: `mounts` is the extension point for the allowlist, never a way
-/// to bring `~/.gnupg` or `~/.ssh` back.
+/// lexically and canonicalized) reaches the sealed deny list — inside it OR as
+/// an ancestor of it. Sealed panes drop such entries: `mounts` is the extension
+/// point for the allowlist, never a way to bring `~/.gnupg` or `~/.ssh` back.
 pub fn sealed_denies_mount(m: &Mount, home: &Path) -> bool {
-    let mut homes = vec![home.to_path_buf()];
-    if let Ok(c) = home.canonicalize() {
-        homes.push(c);
-    }
-    [&m.host, &m.dest].iter().any(|p| {
-        let raw = Path::new(p.as_str());
-        sealed_deny_hit(raw, &homes) || sealed_deny_hit(&resolve_lenient(raw), &homes)
-    })
+    let homes = deny_homes(home);
+    [&m.host, &m.dest]
+        .iter()
+        .any(|p| spellings(p).iter().any(|s| sealed_deny_hit(s, &homes)))
+}
+
+/// A mount whose host path or destination lies inside the deny list (the final
+/// argv builders drop these).
+pub fn sealed_mount_inside_deny(m: &Mount, home: &Path) -> bool {
+    let e = deny_entries(&deny_homes(home));
+    [&m.host, &m.dest]
+        .iter()
+        .any(|p| spellings(p).iter().any(|s| deny_inside(s, &e)))
+}
+
+/// A mount whose HOST path is, or is an ancestor of, a deny entry — the whole
+/// tree (secrets included) would be exposed. The gate refuses these launches.
+pub fn sealed_mount_covers_deny(m: &Mount, home: &Path) -> bool {
+    let e = deny_entries(&deny_homes(home));
+    spellings(&m.host).iter().any(|s| deny_covers(s, &e))
 }
 
 /// The `[sandbox] mounts` entries a sealed launch drops, as host paths (never
@@ -644,14 +753,18 @@ pub fn sealed_dropped_cfg_mounts(cfg_mounts: &[String], home: &Path) -> Vec<Stri
 }
 
 /// Defence against a symlink swapped in after resolution: re-check, just before
-/// the argv is built, that a mount destined for the sealed `$HOME` still
-/// resolves outside the deny list. Fail-safe (the mount is omitted).
+/// the argv is built, that a mount still resolves outside the deny list, and
+/// that an allowlist-shaped mount (read-only, destined under the sealed `$HOME`)
+/// still resolves into an approved root. Fail-safe (the mount is omitted).
 pub fn sealed_mount_still_ok(m: &Mount, home: &Path) -> bool {
-    let mut homes = vec![home.to_path_buf()];
-    if let Ok(c) = home.canonicalize() {
-        homes.push(c);
+    if sealed_mount_inside_deny(m, home) {
+        return false;
     }
-    !sealed_deny_hit(&resolve_lenient(Path::new(&m.host)), &homes)
+    if m.ro && !m.cache && Path::new(&m.dest).starts_with(home) {
+        let canon_home = home.canonicalize().unwrap_or_else(|_| home.to_path_buf());
+        return sealed_target_ok(&resolve_lenient(Path::new(&m.host)), &canon_home);
+    }
+    true
 }
 
 /// The read-only `$HOME` allowlist for a sealed sandbox, resolved against the
@@ -667,7 +780,7 @@ pub fn sealed_home_allowlist(home: &Path) -> Vec<Mount> {
         .iter()
         .filter_map(|rel| {
             let target = home.join(rel).canonicalize().ok()?;
-            sealed_target_ok(&target, &canon_home).then(|| Mount {
+            (target.is_file() && sealed_target_ok(&target, &canon_home)).then(|| Mount {
                 host: target.to_string_lossy().into_owned(),
                 dest: home.join(rel).to_string_lossy().into_owned(),
                 ro: true,

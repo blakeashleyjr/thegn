@@ -747,6 +747,43 @@ fn named_volume_admission_accepts_existing_names_and_rejects_paths() {
 }
 
 #[test]
+fn sealed_systemd_argv_uses_protecthome_tmpfs_and_binds_back_only_the_allowlist() {
+    // `/home/...` is where `ProtectHome=tmpfs` reaches; `backend_enter_argv` is
+    // used directly because the gate (correctly) needs a real, resolvable HOME.
+    let mut s = spec(Backend::Systemd);
+    s.read_only_root = true;
+    s.seal_home = Some("/home/synthetic-user".into());
+    s.mounts = vec![
+        Mount {
+            host: "/nix/store/x-zshrc".into(),
+            dest: "/home/synthetic-user/.zshrc".into(),
+            ro: true,
+            cache: false,
+        },
+        Mount {
+            host: "/home/synthetic-user/wt".into(),
+            dest: "/home/synthetic-user/wt".into(),
+            ro: false,
+            cache: false,
+        },
+    ];
+    let j = backend_enter_argv(&s, "true").join(" ");
+    assert!(j.contains("ProtectHome=tmpfs"), "{j}");
+    assert!(
+        j.contains("BindReadOnlyPaths=/nix/store/x-zshrc:/home/synthetic-user/.zshrc"),
+        "{j}"
+    );
+    assert!(
+        j.contains("BindPaths=/home/synthetic-user/wt:/home/synthetic-user/wt"),
+        "{j}"
+    );
+    assert!(
+        !j.contains(".local/state") && !j.contains(".local/share"),
+        "{j}"
+    );
+}
+
+#[test]
 fn named_volume_admission_reports_pair_index_without_host_fallback() {
     let mut s = spec(Backend::Podman);
     s.volumes = vec![
@@ -757,7 +794,7 @@ fn named_volume_admission_reports_pair_index_without_host_fallback() {
     assert_eq!(error.pair_index, 1);
     assert_eq!(error.name_len, "/tmp/state".len());
     let fallible = enter_argv(&s, "true").expect_err("direct entry must refuse");
-    assert_eq!(fallible, error);
+    assert_eq!(fallible, EnterError::Volume(error));
     assert!(!fallible.to_string().contains("/tmp/state"));
     assert!(oci_create_opts_with_keep_id(&s, false).is_err());
 }

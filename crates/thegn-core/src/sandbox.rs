@@ -605,6 +605,89 @@ impl std::fmt::Display for VolumeAdmissionError {
 
 impl std::error::Error for VolumeAdmissionError {}
 
+/// Why [`enter_argv`] refused to build a launch command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnterError {
+    /// A named volume failed admission.
+    Volume(VolumeAdmissionError),
+    /// A sealed or OCI launch was refused (message names paths, never contents).
+    Refused(String),
+}
+
+impl std::fmt::Display for EnterError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EnterError::Volume(e) => e.fmt(f),
+            EnterError::Refused(m) => f.write_str(m),
+        }
+    }
+}
+
+impl std::error::Error for EnterError {}
+
+impl From<VolumeAdmissionError> for EnterError {
+    fn from(e: VolumeAdmissionError) -> Self {
+        EnterError::Volume(e)
+    }
+}
+
+/// The spec as it will actually be launched. For a sealed spec this drops every
+/// mount whose host path or destination lies inside the credential deny list
+/// (or whose allowlist target was retargeted since resolution) — whoever added
+/// it and whenever: bundle identities, agent provider homes, cache injectors all
+/// run AFTER the resolver, so this is the single chokepoint every launcher goes
+/// through. The managed per-account dirs are the only named exception.
+pub fn sealed_view(spec: &SandboxSpec) -> std::borrow::Cow<'_, SandboxSpec> {
+    let Some(home) = spec.seal_home.as_deref().filter(|h| !h.is_empty()) else {
+        return std::borrow::Cow::Borrowed(spec);
+    };
+    let home = std::path::Path::new(home);
+    let ok = |m: &Mount| {
+        let keep = crate::sandbox_mounts::sealed_mount_still_ok(m, home);
+        if !keep {
+            tracing::warn!(
+                target: "thegn::sandbox",
+                path = %m.host,
+                "sealed profile: mount reaches a protected path; omitted from the launch"
+            );
+        }
+        keep
+    };
+    if spec
+        .mounts
+        .iter()
+        .all(|m| crate::sandbox_mounts::sealed_mount_still_ok(m, home))
+    {
+        return std::borrow::Cow::Borrowed(spec);
+    }
+    let mut v = spec.clone();
+    v.mounts.retain(|m| ok(m));
+    std::borrow::Cow::Owned(v)
+}
+
+/// Every launch gate in one place: volume admission, the sealed deny filter and
+/// `$HOME` gate, and the OCI `-v` path syntax check.
+fn launchable(spec: &SandboxSpec) -> Result<std::borrow::Cow<'_, SandboxSpec>, EnterError> {
+    admit_volumes(spec)?;
+    let view = sealed_view(spec);
+    if let Some(m) = crate::sandbox_floor::home_gate(&view) {
+        return Err(EnterError::Refused(m));
+    }
+    if view.backend.profile().family == BackendFamily::Oci
+        && let Some(m) = view.mounts.iter().find(|m| {
+            crate::sandbox_mounts::mount_path_unsafe(&m.host)
+                || crate::sandbox_mounts::mount_path_unsafe(&m.dest)
+        })
+    {
+        return Err(EnterError::Refused(format!(
+            "OCI mount `{}` contains whitespace, a quote, a backslash or ':' which a `-v` \
+             spec cannot express safely",
+            m.dest
+        )));
+    }
+    Ok(view)
+}
+
 /// The portable Thegn named-volume lexical policy. A source must begin with
 /// ASCII alphanumeric, be at least two bytes, and contain only ASCII letters,
 /// digits, `_`, `-`, or `.`. This rejects bind/path and option syntax without
@@ -809,6 +892,29 @@ pub fn resolve_placed_exact(
     resolve_placed_with(cfg, loc, name, profile, placement, Fallthrough::Exact)
 }
 
+/// Warn (once per path per process) about a USER-authored `[sandbox] mounts` entry
+/// a sealed launch drops. The built-in defaults (`~/.gnupg:rw` …) are always
+/// dropped and would warn on every resolve; `thegn doctor` lists those.
+fn warn_dropped_mount_once(raw: &str, host: &str) {
+    use std::sync::{Mutex, OnceLock};
+    if SandboxConfig::default().mounts.iter().any(|d| d == raw) {
+        return;
+    }
+    static SEEN: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(Default::default);
+    let first = seen
+        .lock()
+        .map(|mut s| s.insert(host.to_string()))
+        .unwrap_or(false);
+    if first {
+        tracing::warn!(
+            target: "thegn::sandbox",
+            path = %host,
+            "sealed profile: dropping [sandbox] mounts entry that reaches a protected $HOME path"
+        );
+    }
+}
+
 fn resolve_placed_with(
     cfg: &SandboxConfig,
     loc: &GitLoc,
@@ -984,8 +1090,8 @@ fn resolve_placed_with(
     // its sealed `$HOME` allowlist is added here; `ProtectHome=tmpfs` hides the
     // rest and the argv builder binds these back in.
     if let Some(home) = &seal_home
+        && !home.is_empty()
         && backend.profile().family == BackendFamily::Systemd
-        && cfg.auto_caches
         && matches!(
             cfg.file_access,
             FileAccess::Worktree | FileAccess::WorktreePlusCaches
@@ -1005,11 +1111,7 @@ fn resolve_placed_with(
             && !home.is_empty()
             && crate::sandbox_mounts::sealed_denies_mount(&parsed, std::path::Path::new(home))
         {
-            tracing::warn!(
-                target: "thegn::sandbox",
-                path = %parsed.host,
-                "sealed profile: dropping [sandbox] mounts entry that reaches a protected $HOME path"
-            );
+            warn_dropped_mount_once(m, &parsed.host);
             continue;
         }
         // Skip mounts whose source doesn't exist — silently, since config
@@ -1804,6 +1906,10 @@ fn container_status(spec: &SandboxSpec) -> (bool, bool) {
 /// into). No-op for host-toolchain backends and `none`.
 pub fn ensure(spec: &SandboxSpec) -> anyhow::Result<()> {
     admit_volumes(spec)?;
+    let spec = &*launchable(spec).map_err(|e| match e {
+        EnterError::Volume(v) => anyhow::Error::new(v),
+        EnterError::Refused(m) => anyhow::anyhow!(m),
+    })?;
     if !spec.backend.is_oci() {
         return Ok(());
     }
@@ -2062,8 +2168,8 @@ pub fn run_prepare(worktree: &std::path::Path, cmds: &[String]) {
 /// string, e.g. `${SHELL:-/bin/sh} -l` or `claude`). Callers must propagate a
 /// volume refusal; it must never become host fallback or a shell shim. The
 /// backend invocation is wrapped in mosh/ssh when the placement is remote.
-pub fn enter_argv(spec: &SandboxSpec, inner: &str) -> Result<Vec<String>, VolumeAdmissionError> {
-    admit_volumes(spec)?;
+pub fn enter_argv(spec: &SandboxSpec, inner: &str) -> Result<Vec<String>, EnterError> {
+    let spec = &*launchable(spec)?;
     let script = wrap_script(spec, inner);
     // A compose-backed spec with a named service attaches through
     // `docker compose exec <service>` — no container-name guessing.
@@ -2208,26 +2314,7 @@ fn backend_enter_argv(spec: &SandboxSpec, script: &str) -> Vec<String> {
             {
                 v.extend(["--tmpfs".into(), home.clone()]);
             }
-            let sealed_tmpfs_home = spec
-                .seal_home
-                .as_deref()
-                .filter(|_| !matches!(spec.file_access, FileAccess::All | FileAccess::Host))
-                .map(std::path::Path::new);
             for m in &spec.mounts {
-                // TOCTOU: a symlink in the allowlist may have been retargeted
-                // since resolution. Re-validate right before the argv is built;
-                // omit (fail safe) any mount now resolving into the deny list.
-                if let Some(home) = sealed_tmpfs_home
-                    && std::path::Path::new(&m.dest).starts_with(home)
-                    && !crate::sandbox_mounts::sealed_mount_still_ok(m, home)
-                {
-                    tracing::warn!(
-                        target: "thegn::sandbox",
-                        path = %m.host,
-                        "sealed profile: mount now resolves into a protected path; omitted"
-                    );
-                    continue;
-                }
                 // Skip mounts already covered by a hardcoded parent — bwrap
                 // cannot create a mount-point inside a read-only bind.
                 let covered = hardcoded_parents
@@ -2485,6 +2572,7 @@ fn write_secret_env_file(name: &str, secret: &[(&String, &String)]) -> Option<Pa
 /// and uid mapping so bind-mounted files stay host-owned.
 fn oci_create_opts(spec: &SandboxSpec) -> Result<Vec<String>, VolumeAdmissionError> {
     admit_volumes(spec)?;
+    let spec = &*sealed_view(spec);
     let mut v = Vec::new();
     // Ownership marker: every container thegn creates carries `thegn.managed`,
     // so container-management (the Containers tab, `sandbox prune`) has one label

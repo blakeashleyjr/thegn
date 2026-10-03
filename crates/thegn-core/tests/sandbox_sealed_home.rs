@@ -222,31 +222,16 @@ fn bwrap_hardened_is_unchanged_no_tmpfs_home() {
 }
 
 #[test]
-fn systemd_sealed_uses_protecthome_tmpfs_and_binds_back_only_the_allowlist() {
+fn systemd_sealed_with_a_home_outside_protecthome_roots_is_refused() {
+    // Argv shape is covered in-crate (`sandbox_tests`, needs a /home path); here
+    // the synthetic tempdir HOME is outside /home, /root and /run/user, where
+    // `ProtectHome=tmpfs` does not reach: enter_argv must refuse.
     let td = fixture();
     let h = td.path();
     let mut mounts = sealed_home_allowlist(h);
     mounts.push(rw(&h.join("wt")));
-    let j = enter_argv(&spec(Backend::Systemd, h, mounts, true), "true")
-        .unwrap()
-        .join(" ");
-    assert!(j.contains("ProtectHome=tmpfs"), "{j}");
-    assert!(!j.contains("ProtectHome=read-only"), "{j}");
-    let wt = h.join("wt");
-    assert!(
-        j.contains(&format!("BindPaths={0}:{0}", wt.display())),
-        "worktree must be bound back writable: {j}"
-    );
-    let gc = h.join(".gitconfig");
-    assert!(
-        j.contains(&format!("BindReadOnlyPaths={0}:{0}", gc.display())),
-        "allowlist bound back read-only: {j}"
-    );
-    // The `.local/{state,share}` carve-outs hold the credentials we hide.
-    assert!(
-        !j.contains(".local/state") && !j.contains(".local/share"),
-        "{j}"
-    );
+    let err = enter_argv(&spec(Backend::Systemd, h, mounts, true), "true").unwrap_err();
+    assert!(err.to_string().contains("sealed"), "{err}");
 }
 
 #[test]
@@ -303,7 +288,7 @@ fn home_view_and_gate_per_backend() {
     exposed.insert(0, ro_home);
     let s = spec(Backend::Podman, h, exposed, true);
     assert_eq!(home_view(&s, h), HomeView::ReadOnly);
-    assert!(home_gate(&s).unwrap().contains("read-only"));
+    assert!(home_gate(&s).is_some(), "a mount covering $HOME is refused");
     // Non-sealed profiles are not gated.
     assert_eq!(home_gate(&spec(Backend::None, h, vec![], false)), None);
 }
@@ -542,7 +527,13 @@ fn systemd_home_view_sees_covering_mounts_and_unprotected_homes() {
 fn systemd_sealed_refuses_whitespace_or_colon_in_bind_paths() {
     let td = fixture();
     let h = td.path();
-    for bad in ["with space", "with:colon"] {
+    for bad in [
+        "with space",
+        "with:colon",
+        "with\"quote",
+        "with'quote",
+        "with\\slash",
+    ] {
         let p = h.join(bad);
         let s = spec(Backend::Systemd, h, vec![rw(&p)], true);
         let msg = home_gate(&s).unwrap_or_else(|| panic!("{bad} must be refused"));
@@ -583,4 +574,146 @@ fn bwrap_omits_an_allowlist_mount_retargeted_into_a_secret_after_resolution() {
         .unwrap()
         .join(" ");
     assert!(!j.contains(".ssh"), "{j}");
+}
+
+// ── round 3: the chokepoint, B2, and the minor fixes ─────────────────────────
+
+fn bwrap_argv(h: &Path, mounts: Vec<Mount>) -> Result<String, thegn_core::sandbox::EnterError> {
+    enter_argv(&spec(Backend::Bwrap, h, mounts, true), "true").map(|a| a.join(" "))
+}
+
+#[test]
+fn identity_and_agent_mounts_added_after_resolution_never_reach_a_sealed_argv() {
+    let td = fixture();
+    let h = td.path();
+    std::fs::create_dir_all(h.join("wt")).unwrap();
+    let mut mounts = sealed_home_allowlist(h);
+    mounts.push(rw(&h.join("wt")));
+    // What `bundle::fold_identity`, `provider_home_mounts` and the credential
+    // mounts append AFTER the resolver: ssh key, gh dir, gnupg home, ambient
+    // agent homes.
+    std::fs::create_dir_all(h.join(".claude")).unwrap();
+    std::fs::create_dir_all(h.join(".codex")).unwrap();
+    for p in [".ssh/id_test", ".config/gh", ".gnupg", ".claude", ".codex"] {
+        mounts.push(rw(&h.join(p)));
+    }
+    let j = bwrap_argv(h, mounts).unwrap();
+    for secret in [".ssh", ".config/gh", ".gnupg", ".claude", ".codex"] {
+        assert!(!j.contains(secret), "{secret} reached the sealed argv: {j}");
+    }
+    assert!(
+        j.contains(&format!("{}/wt", h.display())),
+        "worktree kept: {j}"
+    );
+}
+
+#[test]
+fn only_the_managed_account_dir_is_exempt_from_the_deny_list() {
+    let td = fixture();
+    let h = td.path().canonicalize().unwrap();
+    let state = h.join("xdg-state");
+    // SAFETY: nextest runs each test in its own process.
+    unsafe { std::env::set_var("XDG_STATE_HOME", &state) };
+    let managed = state.join("thegn/accounts/claude/work");
+    std::fs::create_dir_all(&managed).unwrap();
+    std::fs::create_dir_all(state.join("thegn/other")).unwrap();
+    std::fs::create_dir_all(h.join(".claude")).unwrap();
+    let mounts = vec![
+        rw(&managed),
+        rw(&state.join("thegn/other")),
+        rw(&h.join(".claude")),
+    ];
+    let j = bwrap_argv(&h, mounts).unwrap();
+    assert!(
+        j.contains(managed.to_str().unwrap()),
+        "managed dir kept: {j}"
+    );
+    assert!(!j.contains("thegn/other"), "{j}");
+    assert!(!j.contains(&format!("{}/.claude", h.display())), "{j}");
+}
+
+#[test]
+fn a_worktree_that_is_home_itself_or_covers_secrets_is_refused() {
+    let td = fixture();
+    let h = td.path();
+    let err = bwrap_argv(h, vec![rw(h)]).unwrap_err();
+    assert!(err.to_string().contains("protected"), "{err}");
+    let err = bwrap_argv(h, vec![rw(&h.join(".config"))]).unwrap_err();
+    assert!(err.to_string().contains("protected"), "{err}");
+}
+
+#[test]
+fn oci_mount_paths_with_unsafe_syntax_are_refused() {
+    let td = fixture();
+    let h = td.path();
+    for bad in ["a:b", "a b", "a\"b", "a'b", "a\\b"] {
+        let mut s = spec(Backend::Podman, h, vec![rw(&h.join(bad))], false);
+        s.seal_home = None;
+        let err = enter_argv(&s, "true").unwrap_err();
+        assert!(err.to_string().contains("-v"), "{bad}: {err}");
+    }
+}
+
+#[test]
+fn allowlist_binds_files_only_and_new_credential_names_are_denied() {
+    let td = fixture();
+    let h = td.path();
+    std::fs::create_dir_all(h.join(".inputrc")).unwrap(); // a directory, not a file
+    std::fs::create_dir_all(h.join(".terminfo")).unwrap();
+    std::fs::write(h.join(".npmrc"), CANARY).unwrap();
+    std::fs::create_dir_all(h.join(".cargo")).unwrap();
+    std::fs::write(h.join(".cargo/credentials.toml"), CANARY).unwrap();
+    symlink(h.join(".npmrc"), h.join(".zprofile")).unwrap();
+    symlink(h.join(".cargo/credentials.toml"), h.join(".zlogin")).unwrap();
+    let al = sealed_home_allowlist(h);
+    let d = dests(&al);
+    for not in [".inputrc", ".terminfo", ".zprofile", ".zlogin"] {
+        assert!(!d.contains(&h.join(not).to_str().unwrap()), "{not}: {d:?}");
+    }
+    assert!(al.iter().all(|m| Path::new(&m.host).is_file()), "{al:?}");
+}
+
+#[test]
+fn systemd_sealed_without_read_only_root_fails_closed() {
+    let td = fixture();
+    let h = Path::new("/home/synthetic-user");
+    let mut s = spec(Backend::Systemd, td.path(), vec![], true);
+    s.seal_home = Some(h.to_string_lossy().into_owned());
+    s.read_only_root = false;
+    assert_eq!(home_view(&s, h), HomeView::Writable);
+}
+
+#[test]
+fn sealed_systemd_allowlist_survives_auto_caches_off() {
+    if !thegn_core::util::have("systemd-run") {
+        return;
+    }
+    let td = fixture();
+    let h = td.path().canonicalize().unwrap();
+    std::fs::create_dir_all(h.join("wt")).unwrap();
+    // SAFETY: nextest runs each test in its own process.
+    unsafe { std::env::set_var("HOME", &h) };
+    let cfg = thegn_core::config::SandboxConfig {
+        enabled: true,
+        backend: thegn_core::config::SandboxBackend::Systemd,
+        auto_caches: false,
+        ..Default::default()
+    };
+    let loc = thegn_core::remote::GitLoc::Local(h.join("wt"));
+    let Some(spec) = thegn_core::sandbox::resolve_placed(
+        &cfg,
+        &loc,
+        "t",
+        SandboxProfile::Sealed,
+        Placement::Local,
+    ) else {
+        return;
+    };
+    assert!(
+        spec.mounts
+            .iter()
+            .any(|m| m.dest == h.join(".zshrc").to_str().unwrap()),
+        "{:?}",
+        spec.mounts
+    );
 }

@@ -134,21 +134,31 @@ pub fn home_gate(spec: &crate::sandbox::SandboxSpec) -> Option<String> {
     // quoting: a path containing whitespace or `:` would be parsed as extra
     // fields (or a different destination). Refuse the sealed launch instead.
     if spec.backend.profile().family == BackendFamily::Systemd {
-        let bad = |p: &str| {
-            p.chars()
-                .any(|c| c.is_whitespace() || c == ':' || c.is_control())
-        };
+        let bad = crate::sandbox_mounts::mount_path_unsafe;
         if let Some(m) = spec
             .mounts
             .iter()
             .find(|m| home_path_under(&m.dest, home_path) && (bad(&m.host) || bad(&m.dest)))
         {
             return Some(format!(
-                "sealed systemd launch refused: mount `{}` contains whitespace or ':' which \
-                 systemd BindPaths cannot express safely",
+                "sealed systemd launch refused: mount `{}` contains whitespace, a quote, a \
+                 backslash or ':' which systemd BindPaths cannot express safely",
                 m.dest
             ));
         }
+    }
+    // A mount whose host path is (or contains) a protected path — the worktree
+    // being `$HOME` itself, a `~` mount — would expose the secrets inside it.
+    if let Some(m) = spec
+        .mounts
+        .iter()
+        .find(|m| crate::sandbox_mounts::sealed_mount_covers_deny(m, home_path))
+    {
+        return Some(format!(
+            "sealed profile refused: mount `{}` contains protected $HOME paths (credentials, \
+             keys, thegn state); mount something narrower or use a non-sealed profile",
+            m.host
+        ));
     }
     let view = home_view(spec, home_path);
     (view != HomeView::Hidden).then(|| {
