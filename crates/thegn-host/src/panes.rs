@@ -191,6 +191,15 @@ pub(crate) fn terminal_launch_spec(
                 remote: false,
             });
         }
+        // THE-215: a sealed terminal that came back uncontained is refused, not
+        // downgraded to a labelled host shell.
+        if cfg.sandbox.profile.hides_home() {
+            anyhow::bail!(
+                "profile `{}` requires a sandbox that hides $HOME, but the launch degraded to \
+                 the host; refusing",
+                cfg.sandbox.profile.as_str()
+            );
+        }
         // Containment was asked for and not delivered: fall through to the plain
         // host shell, labelled `host`, carrying the reason so the pane can say so.
         if let Some(w) = truth.warning.as_deref() {
@@ -258,11 +267,25 @@ fn sandbox_wrap_shell(
     // Invalid configured sources remain a refusal even when HOME or the
     // requested backend is unavailable; neither may produce a host fallback.
     thegn_core::sandbox::admit_volume_sources(cfg.sandbox.volumes.keys().map(String::as_str))?;
+    // THE-215: a sealed profile never degrades to a host shell. Every
+    // "no sandbox" outcome below becomes a visible refusal instead.
+    let sealed = cfg.sandbox.profile.hides_home();
+    let refuse = |why: &str| -> anyhow::Result<Option<Vec<String>>> {
+        anyhow::bail!(
+            "profile `{}` requires a sandbox that hides $HOME, but {why}; refusing a host shell",
+            cfg.sandbox.profile.as_str()
+        )
+    };
     let Ok(be) = thegn_core::config::SandboxBackend::from_str_validated(backend) else {
-        return Ok(None);
+        return if sealed {
+            refuse("the requested backend is unknown")
+        } else {
+            Ok(None)
+        };
     };
     let home = match std::env::var("HOME").ok().filter(|h| !h.is_empty()) {
         Some(home) => home,
+        None if sealed => return refuse("$HOME is unset"),
         None => return Ok(None),
     };
     let mut sb = cfg.sandbox.clone();
@@ -277,7 +300,11 @@ fn sandbox_wrap_shell(
         sb.profile,
         thegn_core::placement::Placement::Local,
     ) else {
-        return Ok(None);
+        return if sealed {
+            refuse("no usable backend resolved")
+        } else {
+            Ok(None)
+        };
     };
     // Terminal-connection tabs are center panes routed through the pane daemon,
     // so a local bwrap terminal must drop `--die-with-parent` to survive UI

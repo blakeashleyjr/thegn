@@ -3368,7 +3368,12 @@ fn home_report(cfg: &Config) {
         HomeView::Writable => "whole host $HOME readable AND writable",
     };
     outln!("  home          {} — {note}", view.as_str());
-    if profile.hides_home() && view != HomeView::Hidden {
+    if profile.hides_home() && !cfg.sandbox.enabled {
+        outln!(
+            "                NOT ENFORCED: [sandbox] enabled = false — profile `{}` is not applied, panes run on the host with the whole $HOME",
+            profile.as_str()
+        );
+    } else if profile.hides_home() && view != HomeView::Hidden {
         outln!(
             "                MISSED: profile `{}` demands a hidden $HOME; this host would refuse to launch it",
             profile.as_str()

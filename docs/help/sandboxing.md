@@ -36,41 +36,61 @@ host files. That is _integrity_ isolation only: the whole `$HOME` stays
 `sealed` / `sealed-tunnel` add _confidentiality_: the host `$HOME` is
 **hidden**. The pane sees a private, empty `$HOME` (tmpfs; systemd uses
 `ProtectHome=tmpfs`, containers never mount it) with only a reviewed
-read-only allowlist bound in — `~/.gitconfig`, the single files
+read-only allowlist of **single files** bound in — `~/.gitconfig`,
 `~/.config/git/{config,ignore,attributes,allowed_signers}`, the zsh and
 bash rc files (`~/.zshrc`, `~/.config/zsh/.zshrc`, …), `~/.profile`,
-`~/.inputrc`, `~/.config/starship.toml`, `~/.terminfo` — plus the worktree
-and build caches. `~/.config/git` and `~/.config/zsh` are never bound as
-directories (they hold `credentials` and `.zsh_history`).
-Each entry is resolved through symlinks and bound from its real target;
-one that resolves into a denied location (`~/.ssh`, `~/.aws`, `~/.gnupg`,
-`~/.secrets`, `~/.config/gh`, keyrings, thegn state, agent auth homes,
-`/run/agenix`) or that links to a parent of one is dropped. The ssh
-identity-key mounts, the profile credential mounts (gh config, gnupg) and
-the `~/.local/{state,share}` write carve-outs are not applied.
+`~/.inputrc`, `~/.config/starship.toml` — plus the worktree and build
+caches. No directory is bound from the allowlist (`~/.config/git` and
+`~/.config/zsh` hold `credentials` and `.zsh_history`). Each entry is
+resolved through symlinks and bound from its real target, which must be a
+regular file under `$HOME`, `/nix/store`, `/usr` or `/etc`.
 
-Extend the allowlist with `[sandbox] mounts`, but **every entry — the
-default `~/.gnupg:rw` included — is checked against the same deny list**
-(host path and destination, canonicalized). A sealed launch drops a denied
-entry with a warning naming the path, and `thegn doctor` lists each
-dropped mount. An agent's own provider auth home (for example `~/.codex`)
-is still mounted read-write when that agent runs, since the harness cannot
-work without its login. The automatic build caches (`~/.cargo/registry`,
-sccache, nix, `~/.m2`, gradle) stay writable: that is an _integrity_
-exposure (a sealed pane could poison a shared cache), not a
-confidentiality one. Allowlist symlinks are re-validated when the bwrap
-command line is built; a swap in the instant between that check and
-`bwrap` starting remains possible.
+The deny list (matched against resolved paths, for `$HOME` and the passwd
+home of `$USER`) covers `~/.ssh`, `~/.aws`, `~/.azure`, `~/.gnupg`,
+`~/.secrets`, `~/.netrc`, `~/.git-credentials`, `~/.npmrc`, `~/.pypirc`,
+`~/.cargo/credentials*`, `~/.vault-token`, `~/.docker`, `~/.kube`,
+`~/.config/{gh,gcloud,rclone,git/credentials,…}`, `~/.terraform.d`,
+keyrings, browser profiles, `~/.claude*`, `~/.codex`, thegn's state dir,
+`/run/agenix`, `/run/secrets`, `/run/user` and `/root`.
 
-A sealed launch that cannot hide `$HOME` — a backend with no filesystem
-boundary (`none`/host, Windows, WSL), `file_access = "all"`, a
-`[sandbox] mounts` entry covering `$HOME`, an unset or unresolvable
-`$HOME`, a systemd launch whose `$HOME` is outside `/home`, `/root` and
-`/run/user` (where `ProtectHome=tmpfs` does not reach), a systemd path
-containing whitespace or `:`, or a terminal anchored at `$HOME` itself —
-is **refused**, not run with
-a weaker `sealed`. `thegn doctor` prints `home  hidden | read-only |
-writable` for the configured profile.
+**One chokepoint enforces it.** Every launcher (panes, agents, queue
+agents, autopilot, cache probes) builds its command through
+`sandbox::enter_argv` (and `ensure` for containers), which — for a sealed
+spec — drops every mount whose host path or destination lies inside the
+deny list, whoever added it: `[sandbox] mounts` (the default `~/.gnupg:rw`
+included), a bound identity's git ssh key / `GH_CONFIG_DIR` / `GNUPGHOME`,
+the profile credential mounts, or an agent provider home. A mount whose
+host path is, or contains, a protected path (the worktree being `$HOME`
+itself, a `~` mount) refuses the launch. Dropped `[sandbox] mounts` are
+listed by `thegn doctor`; a user-authored one also warns once per path.
+The ssh identity-key mounts and the `~/.local/{state,share}` write
+carve-outs are not applied. Extend the allowlist with `[sandbox] mounts`
+(paths outside the deny list only).
+
+**Sealed agent panes need a managed account.** The only exception to the
+deny list is the _managed_ per-account credential dir thegn creates under
+its own state (`$XDG_STATE_HOME/thegn/accounts/<provider>/<name>`), which
+is mounted read-write. The ambient `~/.claude` / `~/.codex` fallback and
+adopted account dirs are never mounted into a sealed pane, so without a
+managed account the agent runs without host auth.
+
+The automatic build caches (`~/.cargo/registry`, sccache, nix, `~/.m2`,
+gradle) stay writable: that is an _integrity_ exposure (a sealed pane could
+poison a shared cache), not a confidentiality one. The allowlist and every
+mount are re-validated when the command line is built; a swap in the
+instant between that check and the runtime starting remains possible.
+
+A sealed launch that cannot hide `$HOME` is **refused**, never run with a
+weaker `sealed` and never downgraded to a host shell: a backend with no
+filesystem boundary (`none`/host, Windows, WSL), `file_access = "all"`, no
+backend producing a sandbox at all, an unset or unresolvable `$HOME`, a
+systemd launch whose `$HOME` is outside `/home`, `/root` and `/run/user`
+(where `ProtectHome=tmpfs` does not reach), a systemd or container mount
+path containing whitespace, a quote, a backslash or `:`, or a terminal
+anchored at `$HOME` itself. Setting `[sandbox] enabled = false` is your
+explicit choice and is not overridden: the profile is then simply not
+enforced, and `thegn doctor` says so. `thegn doctor` prints
+`home  hidden | read-only | writable` for the configured profile.
 
 Writable carve-outs (non-sealed): the worktree and its git dir, build
 caches, `/tmp`, and a narrow set of `$HOME` paths for shell state

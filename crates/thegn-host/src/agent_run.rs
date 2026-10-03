@@ -89,6 +89,15 @@ pub(crate) fn agent_floor_gate(
     // `None` ⇒ the sandbox couldn't be established (disabled, or the chain
     // resolved to the host) — a broken boundary under a demanded floor.
     let spec = thegn_core::sandbox::resolve(&full.sandbox, &loc, name);
+    // THE-215: a sealed profile whose sandbox could not be established must not
+    // run the agent on the host — no spec skips the home gate below, so refuse.
+    if spec.is_none() && full.sandbox.profile.hides_home() {
+        return AgentDispatch::InfraHold(format!(
+            "profile `{}` requires a sandbox that hides $HOME, but none could be established \
+             for {worktree}",
+            full.sandbox.profile.as_str()
+        ));
+    }
     // THE-215: a sealed launch that would expose the host `$HOME` is an
     // infrastructure failure under a demanded floor, same as a missed floor.
     if let Some(miss) = spec.as_ref().and_then(thegn_core::sandbox_floor::home_gate) {
