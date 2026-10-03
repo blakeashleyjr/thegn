@@ -844,16 +844,24 @@ pub(crate) fn destroy_one_checked(
                 false
             }
         }
-    } else if thegn_core::worktree::remove(
-        repo_root,
-        worktree,
-        if delete_branch { branch } else { "" },
-        delete_branch,
-    ) {
-        thegn_core::worktree::purge_worktree_files(worktree);
-        !worktree.exists()
     } else {
-        false
+        match thegn_core::worktree::remove_detailed(
+            repo_root,
+            worktree,
+            if delete_branch { branch } else { "" },
+            delete_branch,
+        ) {
+            Ok(()) => {
+                thegn_core::worktree::purge_worktree_files(worktree);
+                !worktree.exists()
+            }
+            Err(why) => {
+                return (
+                    false,
+                    format!("could not remove worktree at {}: {why}", worktree.display()),
+                );
+            }
+        }
     };
     if !removed {
         return (
