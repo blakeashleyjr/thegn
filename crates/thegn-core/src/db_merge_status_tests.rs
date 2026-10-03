@@ -1,4 +1,5 @@
 use super::*;
+use crate::store::WorkspaceStore;
 
 const WORKTREE: &str = "/private/status-only";
 
@@ -264,4 +265,70 @@ fn landed_identity_backfill_does_not_advance_the_grace_period_clock() {
         after.updated_at, 100,
         "backfill must not advance the merge-sweep grace-period clock"
     );
+}
+
+fn assert_fresh_row(r: &MergeQueueRow) {
+    assert_eq!(r.status, "queued");
+    assert_eq!(r.agent_attempts, 0, "re-enqueue must refill the budget");
+    assert_eq!(r.result_oid, None);
+    assert_eq!(r.conflict_paths, None);
+    assert_eq!(r.error_detail, None);
+}
+
+#[test]
+fn local_re_enqueue_resets_attempt_budget_and_prior_detail() {
+    let db = seeded();
+    assert_eq!(row(&db).agent_attempts, 2);
+    db.enqueue_merge(WORKTREE, "feature", "target").unwrap();
+    assert_fresh_row(&row(&db));
+}
+
+#[test]
+fn remote_re_enqueue_resets_attempt_budget_and_prior_detail() {
+    let db = Db::open_memory().unwrap();
+    db.put_worktree(
+        "repo-f",
+        "/repos/p",
+        WORKTREE,
+        "feature",
+        Some("loc-v1"),
+        None,
+    )
+    .unwrap();
+    db.enqueue_merge(WORKTREE, "feature", "target").unwrap();
+    db.set_merge_agent_attempts(WORKTREE, 3).unwrap();
+    db.update_merge_status(WORKTREE, "needs_human", Some("o"), Some("p"), Some("e"))
+        .unwrap();
+    assert!(
+        db.enqueue_merge_if_worktree_matches(WORKTREE, "feature", "/repos/p", "loc-v1", "target")
+            .unwrap()
+    );
+    assert_fresh_row(&row(&db));
+}
+
+#[test]
+fn re_enqueue_keeps_budget_of_an_active_row_and_resets_finished_rows() {
+    for status in ["queued", "folding", "verifying", "agent_running"] {
+        let db = seeded();
+        db.update_merge_status(WORKTREE, status, None, None, None)
+            .unwrap();
+        db.enqueue_merge(WORKTREE, "feature", "target").unwrap();
+        let r = row(&db);
+        assert_eq!(r.status, "queued");
+        assert_eq!(r.agent_attempts, 2, "active {status} keeps its budget");
+    }
+    for status in [
+        "deferred",
+        "gate_failed",
+        "gate_error",
+        "needs_human",
+        "ready",
+        "landed",
+    ] {
+        let db = seeded();
+        db.update_merge_status(WORKTREE, status, Some("o"), Some("p"), Some("e"))
+            .unwrap();
+        db.enqueue_merge(WORKTREE, "feature", "target").unwrap();
+        assert_fresh_row(&row(&db));
+    }
 }
