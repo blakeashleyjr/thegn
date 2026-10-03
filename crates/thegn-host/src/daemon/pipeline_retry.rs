@@ -425,7 +425,9 @@ async fn cold_stage_prompt(svc: &DaemonService, row: &AgentDispatch) -> anyhow::
     };
 
     // Branch: the registered worktree row. A worktree the registry has lost
-    // still relaunches, just without `{branch}` in its prompt.
+    // still relaunches, just without `{branch}` in its prompt. (The tracker
+    // lookup above is different: it is scoped to the worktree's repo overlay
+    // and fails closed for an unregistered worktree — no global fallback.)
     let wt = row.worktree_path.clone();
     let branch = svc
         .with_db(move |db| {
