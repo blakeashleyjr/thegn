@@ -5,6 +5,8 @@
 
 use serde::Deserialize;
 use std::process::Command;
+
+use super::gh_run::{self, Limits, RunError};
 use thegn_core::issue::{
     Issue, IssueComment, IssueDetail, IssueDraft, IssueFilter, IssuePatch, IssuePriority,
     IssueStatus,
@@ -20,6 +22,9 @@ pub struct GitHubIssuesBackend {
     /// for the whole session — so callers should anchor the backend to the
     /// worktree they're fetching for.
     dir: Option<std::path::PathBuf>,
+    /// CLI to run; `gh` unless a test substitutes a fake.
+    program: std::ffi::OsString,
+    limits: Limits,
 }
 
 impl GitHubIssuesBackend {
@@ -27,6 +32,8 @@ impl GitHubIssuesBackend {
         GitHubIssuesBackend {
             extra_flags,
             dir: None,
+            program: "gh".into(),
+            limits: Limits::default(),
         }
     }
 
@@ -35,20 +42,95 @@ impl GitHubIssuesBackend {
         self.dir = dir;
     }
 
-    fn gh(&self, args: &[&str]) -> Result<String, IssueError> {
-        let mut cmd = Command::new("gh");
+    /// Run `gh` on the bounded blocking runner (deadline, byte caps, process
+    /// group kill, concurrency bound); errors are classified and redacted.
+    async fn gh(&self, args: &[&str]) -> Result<String, IssueError> {
+        let mut cmd = Command::new(&self.program);
         cmd.args(args);
         if let Some(dir) = &self.dir {
             cmd.current_dir(dir);
         }
-        let out = cmd
-            .output()
-            .map_err(|e| IssueError::Subprocess(e.to_string()))?;
-        if !out.status.success() {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            return Err(IssueError::Subprocess(stderr.into_owned()));
+        match gh_run::run(cmd, self.limits).await {
+            Ok(out) => Ok(out),
+            Err(RunError::NotInstalled) => Err(IssueError::Subprocess(
+                "gh is not installed or not on PATH".into(),
+            )),
+            Err(RunError::Io(e)) => Err(IssueError::Subprocess(gh_run::redact(&e))),
+            Err(RunError::Timeout) => Err(IssueError::Timeout("gh did not finish in time")),
+            Err(RunError::Truncated) => {
+                Err(IssueError::BodyLimit("gh output exceeded the size cap"))
+            }
+            Err(RunError::Cancelled) => Err(IssueError::Subprocess("gh call cancelled".into())),
+            Err(RunError::Exit { code, stderr }) => {
+                let msg = gh_run::redact(&stderr);
+                let lower = stderr.to_ascii_lowercase();
+                if lower.contains("gh auth login")
+                    || lower.contains("http 401")
+                    || lower.contains("authentication")
+                    || lower.contains("not logged in")
+                {
+                    Err(IssueError::Auth(msg))
+                } else {
+                    let code = code.map_or_else(|| "signal".to_owned(), |c| c.to_string());
+                    Err(IssueError::Api(format!("gh exited {code}: {msg}")))
+                }
+            }
         }
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
+    /// The single `--repo` the configured flags select, if any. Repeated flags
+    /// that disagree are rejected rather than silently letting the last win.
+    fn configured_repo(&self) -> Result<Option<String>, IssueError> {
+        self.validate_extra_flags()?;
+        let mut found: Option<String> = None;
+        let mut flags = self.extra_flags.iter();
+        while let Some(flag) = flags.next() {
+            let repo = if let Some(r) = flag
+                .strip_prefix("--repo=")
+                .or_else(|| flag.strip_prefix("-R="))
+            {
+                r.to_owned()
+            } else if flag == "--repo" || flag == "-R" {
+                // validate_extra_flags guaranteed a value follows
+                flags.next().cloned().unwrap_or_default()
+            } else {
+                continue;
+            };
+            match &found {
+                Some(prev) if !prev.eq_ignore_ascii_case(&repo) => {
+                    return Err(IssueError::Parse(
+                        "conflicting GitHub --repo flags in configuration".into(),
+                    ));
+                }
+                _ => found = Some(repo),
+            }
+        }
+        Ok(found)
+    }
+
+    /// Resolve the repository one operation targets: explicit (draft override
+    /// or issue identity) > configured `--repo` > worktree inference (`dir`).
+    /// A mutation with none of these fails closed instead of resolving against
+    /// the process cwd.
+    fn resolve_scope(
+        &self,
+        explicit: Option<&str>,
+        mutation: bool,
+    ) -> Result<Option<String>, IssueError> {
+        let configured = self.configured_repo()?;
+        let repo = match explicit.filter(|r| !r.is_empty()) {
+            Some(r) => {
+                super::identity::github_repo(r).map_err(IssueError::Parse)?;
+                Some(r.to_owned())
+            }
+            None => configured,
+        };
+        if repo.is_none() && self.dir.is_none() && mutation {
+            return Err(IssueError::Policy(
+                "GitHub mutation has no repository scope (set a repo or anchor a worktree)",
+            ));
+        }
+        Ok(repo)
     }
 
     fn validate_extra_flags(&self) -> Result<(), IssueError> {
@@ -331,7 +413,7 @@ impl IssueBackend for GitHubIssuesBackend {
             let extra: Vec<&str> = self.extra_flags.iter().map(|s| s.as_str()).collect();
             args.extend(extra);
 
-            let json = self.gh(&args)?;
+            let json = self.gh(&args).await?;
             let issues: Vec<GhIssue> =
                 serde_json::from_str(&json).map_err(|e| IssueError::Parse(e.to_string()))?;
             issues
@@ -343,7 +425,9 @@ impl IssueBackend for GitHubIssuesBackend {
 
     fn get_issue<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<IssueDetail, IssueError>> {
         Box::pin(async move {
-            let (repo, number) = split_id(id)?;
+            let (id_repo, number) = split_id(id)?;
+            let scoped = self.resolve_scope(id_repo, false)?;
+            let repo = scoped.as_deref();
             let expected_host = self.host_for_repo(repo)?;
             let mut args: Vec<&str> = vec![
                 "issue",
@@ -355,7 +439,7 @@ impl IssueBackend for GitHubIssuesBackend {
             if let Some(repo) = repo {
                 args.extend(["--repo", repo]);
             }
-            let json = self.gh(&args)?;
+            let json = self.gh(&args).await?;
             #[derive(Deserialize)]
             #[serde(rename_all = "camelCase")]
             struct GhIssueDetail {
@@ -390,7 +474,8 @@ impl IssueBackend for GitHubIssuesBackend {
         draft: &'a IssueDraft,
     ) -> BoxFuture<'a, Result<Issue, IssueError>> {
         Box::pin(async move {
-            let expected_host = self.host_for_repo(None)?;
+            let scope = self.resolve_scope(draft.project_id.as_deref(), true)?;
+            let expected_host = self.host_for_repo(scope.as_deref())?;
             let mut args = vec!["issue", "create", "--title", &draft.title];
             let body_val;
             if let Some(body) = &draft.body {
@@ -399,21 +484,34 @@ impl IssueBackend for GitHubIssuesBackend {
             } else {
                 args.extend(["--body", ""]);
             }
-            // Creation currently follows gh's anchored-directory contract;
-            // account/draft repository precedence is tracked by THE-315.
-            // Validate the printed URL and retain its exact repository for
-            // the follow-up view, with no malformed-output cwd fallback.
-            let url = self.gh(&args)?.trim().to_string();
+            // Only the repository scope is forwarded: other configured flags
+            // are list filters (`--state`, `--label`…) that `create` rejects.
+            if let Some(repo) = scope.as_deref() {
+                args.extend(["--repo", repo]);
+            }
+            // Parse the printed URL, verify it landed in the requested repo,
+            // and re-fetch with that exact scope (no cwd fallback).
+            let url = self.gh(&args).await?.trim().to_string();
             let (repo, number) = validated_repo_number_from_url(&url, expected_host.as_deref())?;
-            let json = self.gh(&[
-                "issue",
-                "view",
-                &number,
-                "--repo",
-                &repo,
-                "--json",
-                GH_LIST_FIELDS,
-            ])?;
+            if let Some(want) = scope.as_deref() {
+                let tail = |r: &str| r.rsplit('/').take(2).collect::<Vec<_>>().join("/");
+                if !tail(want).eq_ignore_ascii_case(&tail(&repo)) {
+                    return Err(IssueError::Parse(
+                        "created GitHub issue is not in the requested repository".into(),
+                    ));
+                }
+            }
+            let json = self
+                .gh(&[
+                    "issue",
+                    "view",
+                    &number,
+                    "--repo",
+                    &repo,
+                    "--json",
+                    GH_LIST_FIELDS,
+                ])
+                .await?;
             let gi: GhIssue =
                 serde_json::from_str(&json).map_err(|e| IssueError::Parse(e.to_string()))?;
             gh_issue_to_domain_with_host(gi, expected_host.as_deref())
@@ -426,7 +524,9 @@ impl IssueBackend for GitHubIssuesBackend {
         patch: &'a IssuePatch,
     ) -> BoxFuture<'a, Result<Issue, IssueError>> {
         Box::pin(async move {
-            let (repo, number) = split_id(id)?;
+            let (id_repo, number) = split_id(id)?;
+            let scoped = self.resolve_scope(id_repo, true)?;
+            let repo = scoped.as_deref();
             let expected_host = self.host_for_repo(repo)?;
             // Scope every mutation to the issue's own repo — without `--repo`, `gh`
             // resolves against the process cwd and can close/edit the wrong repo's
@@ -444,20 +544,20 @@ impl IssueBackend for GitHubIssuesBackend {
                 };
                 let mut args = vec!["issue", sub, number];
                 args.extend_from_slice(&repo_flag);
-                self.gh(&args)?;
+                self.gh(&args).await?;
             }
 
             // Handle title update.
             if let Some(title) = &patch.title {
                 let mut args = vec!["issue", "edit", number, "--title", title];
                 args.extend_from_slice(&repo_flag);
-                self.gh(&args)?;
+                self.gh(&args).await?;
             }
 
             // Re-fetch the updated issue.
             let mut args = vec!["issue", "view", number, "--json", GH_LIST_FIELDS];
             args.extend_from_slice(&repo_flag);
-            let json = self.gh(&args)?;
+            let json = self.gh(&args).await?;
             let gi: GhIssue =
                 serde_json::from_str(&json).map_err(|e| IssueError::Parse(e.to_string()))?;
             gh_issue_to_domain_with_host(gi, expected_host.as_deref())
@@ -487,7 +587,7 @@ impl IssueBackend for GitHubIssuesBackend {
             self.validate_extra_flags()?;
             let extra: Vec<&str> = self.extra_flags.iter().map(|s| s.as_str()).collect();
             args.extend(extra);
-            let json = self.gh(&args)?;
+            let json = self.gh(&args).await?;
             let issues: Vec<GhIssue> =
                 serde_json::from_str(&json).map_err(|e| IssueError::Parse(e.to_string()))?;
             issues
@@ -695,5 +795,187 @@ mod tests {
         assert!(issue.assignees.is_empty());
         assert!(issue.labels.is_empty());
         assert_eq!(issue.updated_at_ms, 0, "missing updatedAt ⇒ 0");
+    }
+
+    // ---- fake-`gh` driven scope/bounds tests (no real gh, no network) -----
+
+    fn make_exec(path: &std::path::Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(path, body).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// Fake gh: logs argv (one line per call) and answers `create` with
+    /// `create_url`; `view` echoes the repo it was asked for so a wrong scope
+    /// is visible in the result.
+    fn fake_gh(dir: &std::path::Path, create_url: &str) -> std::path::PathBuf {
+        let script = dir.join("gh");
+        let log = dir.join("argv.log");
+        let body = format!(
+            r#"#!/bin/sh
+echo "$*" >> {log}
+case "$2" in
+  create) echo {create_url} ;;
+  view|close|reopen|edit)
+    repo=""; num="$3"
+    while [ $# -gt 0 ]; do [ "$1" = "--repo" ] && repo="$2"; shift; done
+    [ -z "$repo" ] && repo="cwd/default"
+    echo '{{"number":'"$num"',"title":"t","state":"OPEN","url":"https://github.com/'"$repo"'/issues/'"$num"'"}}' ;;
+  *) echo '[]' ;;
+esac
+"#,
+            log = log.display()
+        );
+        make_exec(&script, &body);
+        script
+    }
+
+    fn backend(
+        dir: &std::path::Path,
+        gh: std::path::PathBuf,
+        flags: &[&str],
+        anchored: bool,
+    ) -> GitHubIssuesBackend {
+        let mut b = GitHubIssuesBackend::new(flags.iter().map(|s| s.to_string()).collect());
+        b.program = gh.into_os_string();
+        if anchored {
+            b.set_dir(Some(dir.to_path_buf()));
+        }
+        b
+    }
+
+    fn calls(dir: &std::path::Path) -> Vec<String> {
+        std::fs::read_to_string(dir.join("argv.log"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    fn draft(project: Option<&str>) -> IssueDraft {
+        IssueDraft {
+            title: "t".into(),
+            project_id: project.map(str::to_owned),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn create_draft_override_scopes_create_and_view() {
+        let d = tempfile::tempdir().unwrap();
+        let gh = fake_gh(d.path(), "https://github.com/drafted/repo/issues/5");
+        let b = backend(d.path(), gh, &["--repo", "configured/repo"], true);
+        let issue = b.create_issue(&draft(Some("drafted/repo"))).await.unwrap();
+        assert_eq!(issue.id, "github:drafted/repo#5");
+        let c = calls(d.path());
+        assert!(c[0].contains("--repo drafted/repo"), "{c:?}");
+        assert!(!c[0].contains("configured/repo"), "{c:?}");
+        assert!(c[1].contains("--repo drafted/repo"), "{c:?}");
+    }
+
+    #[tokio::test]
+    async fn create_uses_configured_repo_and_rejects_foreign_result() {
+        let d = tempfile::tempdir().unwrap();
+        let gh = fake_gh(d.path(), "https://github.com/other/repo/issues/9");
+        let b = backend(d.path(), gh, &["--repo", "configured/repo"], true);
+        let err = b.create_issue(&draft(None)).await.unwrap_err();
+        assert!(matches!(err, IssueError::Parse(_)), "{err:?}");
+        assert!(calls(d.path())[0].contains("--repo configured/repo"));
+        assert_eq!(calls(d.path()).len(), 1, "no follow-up view on mismatch");
+    }
+
+    #[tokio::test]
+    async fn mutations_without_any_scope_fail_closed() {
+        let d = tempfile::tempdir().unwrap();
+        let gh = fake_gh(d.path(), "https://github.com/o/r/issues/1");
+        let b = backend(d.path(), gh, &[], false);
+        assert!(matches!(
+            b.create_issue(&draft(None)).await,
+            Err(IssueError::Policy(_))
+        ));
+        let patch = IssuePatch {
+            title: Some("x".into()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            b.update_issue("github:7", &patch).await,
+            Err(IssueError::Policy(_))
+        ));
+        assert!(calls(d.path()).is_empty(), "gh never invoked");
+    }
+
+    #[tokio::test]
+    async fn same_number_issues_stay_in_their_repo() {
+        let d = tempfile::tempdir().unwrap();
+        let gh = fake_gh(d.path(), "");
+        let b = backend(d.path(), gh, &["--repo", "acct/default"], true);
+        // scoped id wins over the account default
+        let a = b.get_issue("github:a/one#3").await.unwrap();
+        assert_eq!(a.issue.id, "github:a/one#3");
+        // legacy bare id picks up the configured repo, not cwd
+        let l = b.get_issue("github:3").await.unwrap();
+        assert_eq!(l.issue.id, "github:acct/default#3");
+        let p = IssuePatch {
+            status: Some(IssueStatus::Done),
+            ..Default::default()
+        };
+        let u = b.update_issue("3", &p).await.unwrap();
+        assert_eq!(u.id, "github:acct/default#3");
+        assert!(calls(d.path()).iter().all(|c| c.contains("--repo")));
+    }
+
+    #[tokio::test]
+    async fn conflicting_or_malformed_repo_flags_are_rejected() {
+        let d = tempfile::tempdir().unwrap();
+        let gh = fake_gh(d.path(), "");
+        let b = backend(d.path(), gh.clone(), &["--repo", "a/b", "-R", "c/d"], true);
+        assert!(matches!(
+            b.create_issue(&draft(None)).await,
+            Err(IssueError::Parse(_))
+        ));
+        let b = backend(d.path(), gh, &[], true);
+        assert!(matches!(
+            b.create_issue(&draft(Some("../evil"))).await,
+            Err(IssueError::Parse(_))
+        ));
+        assert!(calls(d.path()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn gh_errors_are_classified_and_redacted() {
+        let d = tempfile::tempdir().unwrap();
+        let script = d.path().join("gh");
+        make_exec(
+            &script,
+            "#!/bin/sh\necho 'HTTP 500 token ghp_SECRET123 failed' >&2\nexit 1\n",
+        );
+        let b = backend(d.path(), script, &["--repo", "o/r"], true);
+        let e = b.get_issue("github:o/r#1").await.unwrap_err();
+        assert!(matches!(e, IssueError::Api(_)), "{e:?}");
+        assert!(!e.to_string().contains("ghp_SECRET"), "{e}");
+
+        let script = d.path().join("gh2");
+        make_exec(&script, "#!/bin/sh\necho 'run gh auth login' >&2\nexit 4\n");
+        let b = backend(d.path(), script, &["--repo", "o/r"], true);
+        assert!(matches!(
+            b.get_issue("github:o/r#1").await,
+            Err(IssueError::Auth(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn hung_gh_times_out_and_missing_gh_is_reported() {
+        let d = tempfile::tempdir().unwrap();
+        let script = d.path().join("gh");
+        make_exec(&script, "#!/bin/sh\nsleep 30\n");
+        let mut b = backend(d.path(), script, &[], true);
+        b.limits.timeout = std::time::Duration::from_millis(150);
+        assert!(matches!(
+            b.get_issue("github:o/r#1").await,
+            Err(IssueError::Timeout(_))
+        ));
+        b.program = d.path().join("nope").into_os_string();
+        let e = b.get_issue("github:o/r#1").await.unwrap_err();
+        assert!(e.to_string().contains("not installed"), "{e}");
     }
 }
