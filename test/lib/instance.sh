@@ -22,7 +22,7 @@ inst_gen() {
     # best-effort: a vanished process just yields an empty generation.
     sed -e 's/^.*) //' "/proc/$_ig_pid/stat" 2>/dev/null | awk '{print $20}'
   else
-    ps -o lstart= -p "$_ig_pid" 2>/dev/null | tr -s ' ' '_' | sed 's/^_//;s/_$//'
+    LC_ALL=C TZ=UTC ps -o lstart= -p "$_ig_pid" 2>/dev/null | tr -s ' ' '_' | sed 's/^_//;s/_$//'
   fi
 }
 
@@ -96,12 +96,51 @@ inst_stop_gen() {
   fi
 }
 
+# Reads NUL-split env lines on stdin; true if XDG_STATE_HOME is exactly $1.
+# (awk consumes all input, so the writer never takes SIGPIPE mid-read.)
+inst_has_state() {
+  awk -v want="XDG_STATE_HOME=$1" '$0 == want { f = 1 } END { exit !f }'
+}
+
+# True when PID is a thegn of state root STATE (Linux /proc only; elsewhere it
+# cannot verify and says no).
+inst_is_ours() {
+  _io_pid=$1
+  _io_state=$2
+  [ -n "$_io_state" ] && [ -d /proc/self ] || return 1
+  _io_argv0=$(tr '\0' '\n' <"/proc/$_io_pid/cmdline" 2>/dev/null | sed -n 1p) || return 1
+  case ${_io_argv0##*/} in thegn | tg) ;; *) return 1 ;; esac
+  tr '\0' '\n' <"/proc/$_io_pid/environ" 2>/dev/null | inst_has_state "$_io_state"
+}
+
 # Stop the generation recorded in PIDFILE. Stale state (pid gone or reused) is
-# removed only after proving it is not the recorded generation; malformed
-# state is left untouched and never signalled.
+# removed only after proving it is not the recorded generation. A legacy bare
+# `<pid>` file is honoured only if that process is verifiably thegn of STATE
+# (third arg); any other malformed file naming a LIVE process refuses the
+# launch so a second instance never starts on the same state root.
 inst_stop() {
   [ -e "$1" ] || [ -L "$1" ] || return 0
   if ! inst_parse_meta "$1"; then
+    _is_tok=
+    if [ -f "$1" ] && [ ! -L "$1" ]; then
+      _is_tok=$(head -c 64 "$1" 2>/dev/null | tr ' ' '\n' | sed -n 1p)
+    fi
+    case $_is_tok in
+    '' | *[!0-9]* | 0*) ;;
+    *)
+      if [ ${#_is_tok} -le 7 ] && kill -0 "$_is_tok" 2>/dev/null; then
+        _is_lines=$(wc -l <"$1" | tr -d ' ')
+        _is_words=$(wc -w <"$1" | tr -d ' ')
+        if [ "$_is_lines" -le 1 ] && [ "$_is_words" -eq 1 ] && inst_is_ours "$_is_tok" "${3:-${INST_STATE:-}}"; then
+          inst_stop_gen "$_is_tok" "$(inst_gen "$_is_tok")" "${2:-5}" || return 1
+          kill -0 "$_is_tok" 2>/dev/null || rm -f "$1"
+          return 0
+        fi
+        echo "instance: $1 is malformed and names live pid $_is_tok that is not verifiably this state root's thegn; refusing to launch (stop it manually and rm $1)" >&2
+        return 1
+      fi
+      ;;
+    esac
     echo "instance: ignoring malformed pidfile $1 (not signalling)" >&2
     return 0
   fi
@@ -109,46 +148,72 @@ inst_stop() {
   inst_same "$INST_PID" "$INST_GEN" || rm -f "$1"
 }
 
-# Serialize launchers of the same state root around stop (+ optional record of
-# pid WRITEPID). The lock fd is confined to the subshell so the exec'd instance
-# never inherits it.
-inst_restart() {
-  _ir_file=$1
-  _ir_write=${2:-}
-  _ir_lock="$_ir_file.lock"
+# Run COMMAND... under the launch lock of PIDFILE (no-op lock without flock).
+# The fd is confined to the subshell so an exec'd instance never inherits it.
+inst_locked() {
+  _il_lock="$1.lock"
+  shift
   (
     if command -v flock >/dev/null 2>&1; then
-      exec 9>"$_ir_lock"
+      exec 9>"$_il_lock"
       flock -w 15 9 || {
-        echo "instance: another launcher holds $_ir_lock" >&2
+        echo "instance: another launcher holds $_il_lock" >&2
         exit 1
       }
     fi
-    inst_stop "$_ir_file" || exit 1
-    if [ -n "$_ir_write" ]; then inst_write_meta "$_ir_file" "$_ir_write"; fi
+    "$@"
   )
 }
 
-# Stop this state root's release daemon and detached dtach pane shells (the
-# "reattaches OLD-binary pane sessions" trap) without touching any other
-# checkout, fixture or differently named instance. Linux /proc only; elsewhere
-# it refuses to guess.
+# Record PID's generation under the launch lock; loud on failure.
+inst_record() {
+  inst_locked "$1" inst_write_meta "$1" "$2" || {
+    echo "instance: could not record pidfile $1" >&2
+    return 1
+  }
+}
+
+# Serialize launchers of the same state root around stop (+ optional record of
+# pid WRITEPID). INST_STATE (the state root) enables legacy-file verification.
+inst_restart() {
+  inst_locked "$1" inst_restart_locked "$1" "${2:-}"
+}
+inst_restart_locked() {
+  inst_stop "$1" 5 "${INST_STATE:-}" || return 1
+  if [ -n "$2" ]; then inst_write_meta "$1" "$2"; fi
+}
+
+# Stop this state root's release daemon (the "reattaches OLD-binary pane
+# sessions" trap) without touching any other checkout, fixture or differently
+# named instance. Matches `thegn daemon` by argv[0], or by /proc/PID/exe for
+# daemons respawned via /proc/self/exe (util::self_exe after a rebuild-in-place,
+# exe reads `.../thegn (deleted)`). dtach is deliberately not matched: it only
+# runs on remote hosts (placement.rs), never under this local state root.
+# Linux /proc only; elsewhere it refuses to guess.
 inst_rotate_scoped() {
   _ir_state=$1
   [ -d /proc/self ] || {
     echo "instance: scoped rotation needs /proc; skipping" >&2
     return 0
   }
-  for _ir_d in /proc/[0-9]*; do
+  # One grep prunes to processes with a `daemon` argument; only those pay for
+  # the per-process reads below.
+  # shellcheck disable=SC2013 # /proc paths never contain whitespace
+  for _ir_c in $(grep -alF daemon /proc/[0-9]*/cmdline 2>/dev/null); do
+    _ir_d=${_ir_c%/cmdline}
     _ir_p=${_ir_d#/proc/}
     [ "$_ir_p" != "$$" ] || continue
-    _ir_cmd=$({ cat "$_ir_d/cmdline" 2>/dev/null || true; } | tr '\0' ' ')
-    case $_ir_cmd in
-    */thegn\ daemon* | thegn\ daemon* | */tg\ daemon* | tg\ daemon*) ;;
-    dtach\ -A\ */tg-socket-* | */dtach\ -A\ */tg-socket-*) ;;
-    *) continue ;;
+    _ir_argv=$(tr '\0' '\n' <"$_ir_c" 2>/dev/null | sed -n '1,2p') || continue
+    _ir_a0=$(printf '%s\n' "$_ir_argv" | sed -n 1p)
+    _ir_a1=$(printf '%s\n' "$_ir_argv" | sed -n 2p)
+    [ "$_ir_a1" = daemon ] || continue
+    _ir_exe=$(readlink "$_ir_d/exe" 2>/dev/null || true)
+    _ir_exe=${_ir_exe% (deleted)}
+    case ${_ir_a0##*/} in thegn | tg) ;; *)
+      case ${_ir_exe##*/} in thegn | tg) ;; *) continue ;; esac
+      ;;
     esac
-    { cat "$_ir_d/environ" 2>/dev/null || true; } | tr '\0' '\n' | grep -qxF "XDG_STATE_HOME=$_ir_state" || continue
+    tr '\0' '\n' <"$_ir_d/environ" 2>/dev/null | inst_has_state "$_ir_state" || continue
     _ir_gen=$(inst_gen "$_ir_p")
     [ -n "$_ir_gen" ] || continue
     inst_stop_gen "$_ir_p" "$_ir_gen" 5 || true
