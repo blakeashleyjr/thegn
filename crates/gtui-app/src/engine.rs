@@ -29,7 +29,7 @@ pub type Waker = Arc<dyn Fn() + Send + Sync>;
 ///
 /// * `visible` is flipped synchronously by the UI thread, so a result that
 ///   completes after the tab was hidden never wakes the host loop (the engine
-///   only learns of the hide via its command queue, between panels).
+///   only learns of the hide via its command queue, between cycles).
 /// * `pending` coalesces wakes: at most one host wake is outstanding until the
 ///   UI side drains ([`WakeGate::drained`]). Producers that find it already set
 ///   skip the callback, because the pending drain will see their result too.
@@ -257,7 +257,7 @@ impl QueryEngine {
                             self.hidden = false;
                             self.set_sources_active(true);
                             // Restart the cadence from now and refresh at once,
-                            // so showing the tab never presents stale data.
+                            // so a shown tab is at most one refresh period stale.
                             ticker.reset();
                             self.query_all().await;
                         }
