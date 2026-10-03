@@ -5,8 +5,8 @@
 //! `FilePreview` pane (the plain-text route plus CSV tables, Jupyter cells,
 //! PDF-extracted text, and Mermaid source) and, on a graphics-capable terminal,
 //! a decoded raster ([`crate::rasterize::Raster`]) that [`crate::preview_gfx`]
-//! draws over the panel via the kitty path. Every fetch runs on `spawn_blocking`
-//! and pulses the waker; nothing here touches the loop or the AI layer.
+//! draws over the panel via the kitty path. Every fetch runs on the bounded preview supervisor
+//! worker and pulses the waker; nothing here touches the loop or the AI layer.
 
 use tokio::sync::mpsc as tokio_mpsc;
 
@@ -23,35 +23,60 @@ pub type ImageMsg = (String, Raster);
 /// `(rgba, w, h)` for the graphics path. Kept as a tuple to stay `Send`-simple.
 type Rendered = (Result<Vec<String>, String>, Option<(Vec<u8>, u32, u32)>);
 
+/// Capacity of each result channel. The supervisor delivers at most one result
+/// per generation (one text + one image message) and only the newest
+/// generation, so a handful of slots is never exceeded while the loop drains.
+pub const RESULT_CAP: usize = 4;
+
 /// Read a file off the loop for the inline Files preview and route it by
 /// content type, sending text lines (always) and — when `kitty` and the route
 /// is graphical — a decoded raster. `rel` tags both results so a fast
 /// esc/reopen drops strays. Pulses the waker on delivery.
+///
+/// Jobs go through the process-wide [`crate::preview_jobs`] supervisor: one
+/// active job plus the latest pending one; a newer fetch cancels the active
+/// job's renderers and replaces the pending one, and a superseded job can never
+/// deliver.
 pub fn spawn_fetch(
     rel: String,
     abs: std::path::PathBuf,
-    text_tx: tokio_mpsc::UnboundedSender<TextMsg>,
-    img_tx: tokio_mpsc::UnboundedSender<ImageMsg>,
+    text_tx: tokio_mpsc::Sender<TextMsg>,
+    img_tx: tokio_mpsc::Sender<ImageMsg>,
     waker: termwiz::terminal::TerminalWaker,
     kitty: bool,
 ) {
-    tokio::task::spawn_blocking(move || {
-        let (text, raster) = route_and_render(&abs, kitty);
-        let mut delivered = false;
-        if let Some((r, w, h)) = raster {
-            delivered |= img_tx.send((rel.clone(), Raster { rgba: r, w, h })).is_ok();
-        }
-        delivered |= text_tx.send((rel, text)).is_ok();
+    crate::preview_jobs::global().submit(move |ctx| {
+        let (text, raster) = route_and_render(&abs, kitty, ctx.cancelled());
+        let delivered = ctx.deliver(|| {
+            let mut delivered = false;
+            if let Some((r, w, h)) = raster {
+                delivered |= img_tx
+                    .try_send((rel.clone(), Raster { rgba: r, w, h }))
+                    .is_ok();
+            }
+            delivered |= text_tx.try_send((rel, text)).is_ok();
+            delivered
+        });
         if delivered {
             let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
     });
 }
 
+/// The preview was closed or replaced by something that is not a file preview:
+/// drop queued work and kill the active job's renderers.
+pub fn cancel_fetches() {
+    crate::preview_jobs::global().cancel_all();
+}
+
 /// Route `abs` and produce `(text_lines, optional_raster)`. Pure-ish (does file
 /// I/O + optional subprocess rasterization); split out so it stays readable.
 /// The raster is returned as `(rgba, w, h)` to keep the return `Send`-simple.
-fn route_and_render(abs: &std::path::Path, kitty: bool) -> Rendered {
+fn route_and_render(
+    abs: &std::path::Path,
+    kitty: bool,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Rendered {
     match route(abs) {
         PreviewRoute::Text => (read_text(abs), None),
         PreviewRoute::Csv => (
@@ -73,7 +98,7 @@ fn route_and_render(abs: &std::path::Path, kitty: bool) -> Rendered {
         PreviewRoute::Mermaid => graphical(
             abs,
             kitty,
-            || crate::rasterize::mermaid(abs),
+            || crate::rasterize::mermaid(abs, cancel),
             || {
                 // Fallback: show the Mermaid source as text.
                 read_capped(abs).map(|s| s.lines().map(str::to_string).collect())
@@ -82,10 +107,10 @@ fn route_and_render(abs: &std::path::Path, kitty: bool) -> Rendered {
         PreviewRoute::Pdf => graphical(
             abs,
             kitty,
-            || crate::rasterize::pdf_page1(abs),
+            || crate::rasterize::pdf_page1(abs, cancel),
             || {
                 // Fallback: extracted text, or a clear note when no extractor exists.
-                Ok(crate::rasterize::pdf_text(abs)
+                Ok(crate::rasterize::pdf_text(abs, cancel)
                     .map(|t| t.lines().map(str::to_string).collect())
                     .unwrap_or_else(|| vec!["(PDF — no text extractor available)".to_string()]))
             },
