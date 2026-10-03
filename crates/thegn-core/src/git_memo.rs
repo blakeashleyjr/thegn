@@ -358,8 +358,8 @@ fn core_values(text: &str, key: &str) -> Vec<String> {
     let mut in_core = false;
     for line in text.lines() {
         let l = line.trim();
-        if l.starts_with('[') {
-            let name: String = l[1..]
+        if let Some(after) = l.strip_prefix('[') {
+            let name: String = after
                 .chars()
                 .take_while(|c| !c.is_whitespace() && *c != ']' && *c != '"')
                 .collect();
@@ -413,7 +413,7 @@ fn read_strict(path: &Path) -> Result<Option<String>, ()> {
 /// not reads.
 pub fn global_git_print(dir: &Path) -> Option<u64> {
     static CACHE: GlobalPrintCache = Mutex::new(None);
-    let env = |k: &str| std::env::var(k).ok();
+    let env = |k: &str| std::env::var_os(k).and_then(|v| v.into_string().ok());
     let sig = env_signature(&env);
     stamp_memoised(&CACHE, (dir.to_path_buf(), sig), || {
         global_git_print_inner(Some(dir), &env)
