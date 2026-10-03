@@ -3074,24 +3074,36 @@ fn dispatch_for_exit_prefers_the_session_id_over_the_worktree() {
     // The ARCHITECT's pane exits. Its session id names its row, even though the
     // coder's row is the more recent one for that worktree.
     assert_eq!(
-        db.dispatch_for_exit("/wt/one", Some("sess-arch")).unwrap(),
+        exit_row(db.dispatch_for_exit("/wt/one", Some("sess-arch")).unwrap()),
         Some((architect, "linear:C-1".to_string()))
     );
     assert_eq!(
-        db.dispatch_for_exit("/wt/one", Some("sess-code")).unwrap(),
+        exit_row(db.dispatch_for_exit("/wt/one", Some("sess-code")).unwrap()),
         Some((coder, "linear:C-1".to_string()))
     );
-    // A session id nobody recorded falls back to the worktree rule (most recent
-    // active row) rather than resolving to nothing.
+    // THE-238: a session id nobody recorded is Stale — it fails closed and
+    // NEVER falls back to "the newest active row in this worktree" (that is
+    // how a replaced run's late exit used to stamp the run that replaced it).
     assert_eq!(
         db.dispatch_for_exit("/wt/one", Some("sess-ghost")).unwrap(),
-        Some((coder, "linear:C-1".to_string()))
+        crate::issue::ExitAttribution::Stale
     );
-    // An empty session id is "no session", not a value to match on.
+    // An empty session id is "no session", not a value to match on — and with
+    // two active rows in the worktree an identity-less exit is Ambiguous.
     assert_eq!(
         db.dispatch_for_exit("/wt/one", Some("")).unwrap(),
-        Some((coder, "linear:C-1".to_string()))
+        crate::issue::ExitAttribution::Ambiguous
     );
+}
+
+/// The matched run of an exit attribution as `(row id, issue id)`; `None` for
+/// every non-matching outcome.
+fn exit_row(attribution: crate::issue::ExitAttribution) -> Option<(i64, String)> {
+    use crate::issue::ExitAttribution;
+    match attribution {
+        ExitAttribution::Exact(run) | ExitAttribution::Legacy(run) => Some((run.id, run.issue_id)),
+        ExitAttribution::Stale | ExitAttribution::Ambiguous | ExitAttribution::NoRow => None,
+    }
 }
 
 #[test]
@@ -3109,7 +3121,7 @@ fn dispatch_for_exit_skips_terminal_rows() {
     db.update_dispatch_status(live, S::Done).unwrap();
     db.update_dispatch_status(old, S::Running).unwrap();
     assert_eq!(
-        db.dispatch_for_exit("/wt/two", None).unwrap(),
+        exit_row(db.dispatch_for_exit("/wt/two", None).unwrap()),
         Some((old, "linear:D-1".to_string()))
     );
 
@@ -3117,7 +3129,10 @@ fn dispatch_for_exit_skips_terminal_rows() {
     // later in an ex-agent worktree is not an agent pane, and must not re-fire
     // "agent finished" for work that ended days ago.
     db.update_dispatch_status(old, S::Abandoned).unwrap();
-    assert_eq!(db.dispatch_for_exit("/wt/two", None).unwrap(), None);
+    assert_eq!(
+        db.dispatch_for_exit("/wt/two", None).unwrap(),
+        crate::issue::ExitAttribution::NoRow
+    );
     // ... whereas the legacy path still resolves it, which is why the exit
     // handler no longer uses that one.
     assert!(db.dispatch_info_for_worktree("/wt/two").unwrap().is_some());
@@ -3130,9 +3145,15 @@ fn dispatch_for_exit_skips_terminal_rows() {
             rusqlite::params![old],
         )
         .unwrap();
-    assert_eq!(db.dispatch_for_exit("/wt/two", None).unwrap(), None);
+    assert_eq!(
+        db.dispatch_for_exit("/wt/two", None).unwrap(),
+        crate::issue::ExitAttribution::NoRow
+    );
     // And an unknown worktree resolves to nothing at all.
-    assert_eq!(db.dispatch_for_exit("/wt/nope", None).unwrap(), None);
+    assert_eq!(
+        db.dispatch_for_exit("/wt/nope", None).unwrap(),
+        crate::issue::ExitAttribution::NoRow
+    );
 }
 
 #[test]
@@ -4380,7 +4401,7 @@ fn an_exited_unclosed_row_keeps_holding_its_slot_across_a_monitor_restart() {
         .claim_dispatch(claim_new("linear:A-1", "/wt/a", "code", "c1.md"), 1, None)
         .unwrap()
         .unwrap();
-    db.stamp_dispatch_exit(id, Some(0)).unwrap();
+    stamp_current(&db, id, Some(0));
     let d = db
         .claim_dispatch(claim_new("linear:A-1", "/wt/a", "code", "c1.md"), 1, None)
         .unwrap()
@@ -4473,7 +4494,7 @@ fn stamping_an_exit_makes_a_running_row_read_as_exited_unverified() {
         crate::pipeline_run::row_liveness(&row, crate::util::now_ms()),
         crate::pipeline_run::RowLiveness::Live
     );
-    db.stamp_dispatch_exit(id, Some(0)).unwrap();
+    stamp_current(&db, id, Some(0));
     let row = db.get_dispatch(id).unwrap().unwrap();
     assert_eq!(row.exit_code, Some(0));
     assert!(row.exited_at_ms.is_some());
@@ -4493,12 +4514,76 @@ fn duplicate_exit_observers_preserve_the_first_exit_fact() {
         .claim_dispatch(claim_new("linear:A-1", "/wt/a", "code", "c1.md"), 3, None)
         .unwrap()
         .unwrap();
-    db.stamp_dispatch_exit(id, Some(0)).unwrap();
+    assert_eq!(
+        stamp_current(&db, id, Some(0)),
+        crate::issue::ExitStamp::Stamped
+    );
     let first = db.get_dispatch(id).unwrap().unwrap();
-    db.stamp_dispatch_exit(id, Some(9)).unwrap();
+    assert_eq!(
+        stamp_current(&db, id, Some(9)),
+        crate::issue::ExitStamp::AlreadyStamped
+    );
     let repeated = db.get_dispatch(id).unwrap().unwrap();
     assert_eq!(repeated.exit_code, Some(0));
     assert_eq!(repeated.exited_at_ms, first.exited_at_ms);
+}
+
+/// Stamp the exit of a row's CURRENT run (test convenience: production
+/// callers stamp the run they resolved, never "whatever is current").
+fn stamp_current(db: &Db, id: i64, code: Option<i64>) -> crate::issue::ExitStamp {
+    let run = db.dispatch_run_ref(id).unwrap().expect("row exists");
+    db.stamp_dispatch_exit(&run, code).unwrap()
+}
+
+#[test]
+fn identity_less_exit_is_ambiguous_with_two_active_rows_and_never_stamps() {
+    use crate::issue::{ExitAttribution, NewDispatch};
+    let db = Db::open_memory().unwrap();
+    let a = db
+        .put_agent_dispatch(NewDispatch::new("linear:E-1", "/wt/shared", "claude"))
+        .unwrap();
+    let b = db
+        .put_agent_dispatch(NewDispatch::new("linear:E-2", "/wt/shared", "claude"))
+        .unwrap();
+    db.update_dispatch_status(a, crate::issue::AgentDispatchStatus::Running)
+        .unwrap();
+    db.update_dispatch_status(b, crate::issue::AgentDispatchStatus::Running)
+        .unwrap();
+    assert_eq!(
+        db.dispatch_for_exit("/wt/shared", None).unwrap(),
+        ExitAttribution::Ambiguous
+    );
+    // Closing one makes the other the single unambiguous candidate.
+    db.update_dispatch_status(b, crate::issue::AgentDispatchStatus::Done)
+        .unwrap();
+    assert!(matches!(
+        db.dispatch_for_exit("/wt/shared", None).unwrap(),
+        ExitAttribution::Legacy(run) if run.id == a
+    ));
+}
+
+#[test]
+fn a_replaced_sessions_exit_is_stale_even_when_the_worktree_has_a_live_row() {
+    use crate::issue::{AgentDispatchStatus as S, ExitAttribution, NewDispatch};
+    let db = Db::open_memory().unwrap();
+    let id = db
+        .put_agent_dispatch(NewDispatch {
+            session_id: Some("sess-old"),
+            ..NewDispatch::new("linear:F-1", "/wt/f", "claude")
+        })
+        .unwrap();
+    db.update_dispatch_status(id, S::Running).unwrap();
+    // A retry republishes the row under a new session.
+    db.stamp_dispatch_run(id, "sess-new", "f.md").unwrap();
+    // The old session's exit names no row: Stale — not the live row in /wt/f.
+    assert_eq!(
+        db.dispatch_for_exit("/wt/f", Some("sess-old")).unwrap(),
+        ExitAttribution::Stale
+    );
+    assert!(matches!(
+        db.dispatch_for_exit("/wt/f", Some("sess-new")).unwrap(),
+        ExitAttribution::Exact(run) if run.id == id && run.session_id == "sess-new"
+    ));
 }
 
 #[test]
@@ -4526,7 +4611,7 @@ fn worktrees_with_active_dispatch_lists_only_unclosed_work() {
     assert_eq!(got, vec!["/wt/open".to_string()], "{got:?}");
     // An exited-but-open row still counts — that is the whole point of the
     // disk reclaimer's exemption.
-    db.stamp_dispatch_exit(open, Some(0)).unwrap();
+    stamp_current(&db, open, Some(0));
     assert_eq!(db.worktrees_with_active_dispatch().unwrap().len(), 1);
 }
 

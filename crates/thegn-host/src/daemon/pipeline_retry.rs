@@ -142,11 +142,27 @@ pub(crate) async fn stamp_dispatch_exit(
 
     for attempt in 0..LOOKUP_ATTEMPTS {
         let sid = session.clone();
-        let row = svc.with_db(move |db| db.dispatch_by_session(&sid)).await?;
-        if let Some(row) = row {
-            let id = row.id;
-            svc.with_db(move |db| db.stamp_dispatch_exit(id, code.map(i64::from)))
+        // Session identity only (THE-238): the worktree argument is unused on
+        // the session path, and a miss is Stale — usually the publication race
+        // this loop exists for, so it retries rather than falling back.
+        let attribution = svc
+            .with_db(move |db| db.dispatch_for_exit("", Some(&sid)))
+            .await?;
+        if let thegn_core::issue::ExitAttribution::Exact(run) = attribution {
+            let outcome = svc
+                .with_db(move |db| db.stamp_dispatch_exit(&run, code.map(i64::from)))
                 .await?;
+            if matches!(
+                outcome,
+                thegn_core::issue::ExitStamp::Stale | thegn_core::issue::ExitStamp::Missing
+            ) {
+                tracing::warn!(
+                    target: "thegn::daemon",
+                    session = %session,
+                    ?outcome,
+                    "session exit did not stamp its run"
+                );
+            }
             return Ok(());
         }
         if attempt + 1 < LOOKUP_ATTEMPTS {
