@@ -335,6 +335,7 @@ pub mod toolchain;
 pub mod toolchain_activation;
 pub mod transport_error;
 pub mod trust_class;
+pub mod url_launch;
 pub mod usage;
 pub mod usage_alert;
 pub mod usage_tokens;
