@@ -4894,6 +4894,19 @@ fn drain_key_repeats(
     )
 }
 
+/// Rows scrolled per wheel notch.
+const WHEEL_ROWS_PER_TICK: usize = 5;
+/// Ceiling on ticks applied per coalesced gesture. Coalescing is for latency
+/// (one render per burst), not for multiplying distance: a terminal that
+/// reports many events per notch, or a backlog queued behind a slow frame,
+/// must not fling the viewport (THE-699). Excess ticks are dropped.
+const WHEEL_MAX_TICKS: usize = 8;
+
+/// Rows to scroll for `ticks` coalesced wheel events (pure, bounded).
+fn wheel_delta_rows(ticks: usize) -> usize {
+    ticks.clamp(1, WHEEL_MAX_TICKS) * WHEEL_ROWS_PER_TICK
+}
+
 /// Drain immediately-available wheel events that match `up` direction.
 /// Returns `(tick_count, leftover)` — the opposite-direction wheel or any
 /// non-wheel event is returned as leftover so the caller can requeueit.
@@ -6868,6 +6881,12 @@ async fn event_loop<T: Terminal>(
     // chrome + sibling-pane recompose). `scroll_pane` names the pane to repaint.
     let mut scroll_only = false;
     let mut scroll_pane: Option<u32> = None;
+    // The wheel's own damage channel. A wheel scroll must NOT set the shared
+    // chrome `dirty` bit: the scroll fast path needs to tell "only the wheel
+    // moved" from "the wheel plus something else is stale" (THE-699), and
+    // `dirty` alone cannot say. Folded into `Damage::chrome` whenever the fast
+    // path is not provably clean.
+    let mut scroll_dirty = false;
     // Last frame's fullscreen-splash state (see `chrome::center_shows_splash`).
     // The splash true→false edge (splash retires because a pane went live while
     // `load_steps` was already empty) sets no chrome `dirty`, so the incremental
@@ -12914,7 +12933,8 @@ async fn event_loop<T: Terminal>(
             || !dirty_panes.is_empty()
             || bars_dirty
             || statusbar_dirty
-            || sidebar_dirty;
+            || sidebar_dirty
+            || scroll_dirty;
         let mut defer_timeout: Option<std::time::Duration> = None;
         let pane_only_damage = !dirty
             && !full_repaint
@@ -13108,7 +13128,23 @@ async fn event_loop<T: Terminal>(
             // A live drawer overlays the center band (recomposing a pane behind
             // it would paint over the drawer), and an active selection would be
             // dropped, so both fall through to a full frame.
+            let damage = crate::render_plan::Damage {
+                full: full_repaint,
+                chrome: dirty,
+                // The live switch stamp doubles as the damage bit: set on the
+                // switch action, taken by the first flushed frame.
+                switch: switch_at.is_some(),
+                panes: dirty_panes.clone(),
+                bars: bars_dirty,
+                statusbar: statusbar_dirty,
+                sidebar: sidebar_dirty,
+            };
+            // The fast path reuses the prior frame, so it is only sound when the
+            // wheel is the SOLE damage: anything else pending (another pane's
+            // output, bars, sidebar, a chrome change) would be skipped and then
+            // cleared below, leaving stale cells until a layout change (THE-699).
             let scroll_fast = scroll_only
+                && crate::render_plan::wheel_is_sole_damage(&damage)
                 && !fast_select
                 && !full_repaint
                 && !clear_on_next_frame
@@ -13182,17 +13218,9 @@ async fn event_loop<T: Terminal>(
                 selection: mouse_sel.is_some(),
                 replay: replay.is_some(),
             };
-            let damage = crate::render_plan::Damage {
-                full: full_repaint,
-                chrome: dirty,
-                // The live switch stamp doubles as the damage bit: set on the
-                // switch action, taken by the first flushed frame.
-                switch: switch_at.is_some(),
-                panes: dirty_panes.clone(),
-                bars: bars_dirty,
-                statusbar: statusbar_dirty,
-                sidebar: sidebar_dirty,
-            };
+            // A wheel scroll whose fast path was refused is plain chrome damage.
+            let mut damage = damage;
+            damage.chrome |= scroll_dirty && !scroll_fast;
             let frame_plan = crate::render_plan::plan(&damage, &overlays);
             // Caret bookkeeping is per FULL frame only: the incremental paths
             // deliberately skip the overlay stack, so they must inherit the last
@@ -13962,6 +13990,7 @@ async fn event_loop<T: Terminal>(
             // Consumed: the next frame is full unless another drag/scroll re-arms it.
             selection_only = false;
             scroll_only = false;
+            scroll_dirty = false;
             // Pane/bars damage is now on screen; an untouched next wake renders nothing.
             dirty_panes.clear();
             bars_dirty = false;
@@ -14533,18 +14562,24 @@ async fn event_loop<T: Terminal>(
                             // Front, not back: the leftover precedes whatever is still queued.
                             pending_input.push_front(ev);
                         }
-                        // 5 rows per tick (was 3) — snappier single-tick response.
-                        let delta = ticks * 5;
+                        let delta = wheel_delta_rows(ticks);
                         if let Some(p) = panes.table.get_mut(&id) {
                             if up {
                                 p.scroll_up(delta);
                             } else {
                                 p.scroll_down(delta);
                             }
-                            dirty = true;
+                            // Own channel, not `dirty`: see `scroll_dirty`.
+                            scroll_dirty = true;
                             // Only this pane's content moved — arm the partial
                             // recompose (the render gate re-checks that no overlay
-                            // is up before taking the fast path).
+                            // is up and nothing else is damaged). A second pane
+                            // scrolled before the frame can't share the single
+                            // `scroll_pane` slot: the first would be dropped, so
+                            // that case is a full frame.
+                            if scroll_pane.is_some_and(|prev| prev != id) {
+                                dirty = true;
+                            }
                             scroll_only = true;
                             scroll_pane = Some(id);
                         }

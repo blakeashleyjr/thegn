@@ -160,6 +160,14 @@ pub fn plan(damage: &Damage, overlays: &Overlays) -> RenderPlan {
     RenderPlan::Skip
 }
 
+/// True when the only damage this frame is the wheel scroll the caller armed:
+/// nothing else is stale, so the single-pane scroll fast path (which reuses the
+/// prior frame and then clears every damage channel) cannot drop anything.
+/// `chrome` here is the shared `dirty` bit, which the wheel itself no longer sets.
+pub fn wheel_is_sole_damage(damage: &Damage) -> bool {
+    damage.is_empty()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -572,6 +580,51 @@ mod tests {
         // they map to Full, the sanctioned path for overlay changes.
         let d = Damage {
             chrome: true,
+            ..Default::default()
+        };
+        assert_eq!(plan(&d, &Overlays::default()), RenderPlan::Full);
+    }
+
+    #[test]
+    fn wheel_fast_path_only_when_sole_damage() {
+        assert!(wheel_is_sole_damage(&Damage::default()));
+        for d in [
+            Damage {
+                chrome: true,
+                ..Default::default()
+            },
+            Damage {
+                full: true,
+                ..Default::default()
+            },
+            Damage {
+                switch: true,
+                ..Default::default()
+            },
+            Damage {
+                bars: true,
+                ..Default::default()
+            },
+            Damage {
+                statusbar: true,
+                ..Default::default()
+            },
+            Damage {
+                sidebar: true,
+                ..Default::default()
+            },
+            panes(&[2]),
+        ] {
+            assert!(!wheel_is_sole_damage(&d), "{d:?}");
+        }
+    }
+
+    #[test]
+    fn refused_wheel_fast_path_plans_full_not_skip() {
+        // run.rs folds a refused wheel into `chrome`; that must be Full.
+        let d = Damage {
+            chrome: true,
+            panes: [3].into_iter().collect(),
             ..Default::default()
         };
         assert_eq!(plan(&d, &Overlays::default()), RenderPlan::Full);
