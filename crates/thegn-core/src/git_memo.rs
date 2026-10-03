@@ -276,48 +276,35 @@ fn push_config(
     Some(())
 }
 
-/// The system config path git uses, asked of git itself ONCE rather than assumed
-/// to be `/etc/gitconfig` (nix, homebrew and `$PREFIX` builds differ). `git var
-/// GIT_CONFIG_SYSTEM` needs git >= 2.42; older gits get the path derived the way
-/// git itself builds it, from `git --exec-path`. `None` = git could not say, so
-/// no print.
+/// The system config path git uses, asked of git itself ONCE: `git var
+/// GIT_CONFIG_SYSTEM` (git >= 2.42). It is NOT derivable from the install layout:
+/// nixpkgs reports `/etc/gitconfig` with `--exec-path` in `/nix/store`, Homebrew
+/// uses `$HOMEBREW_PREFIX/etc/gitconfig`, and so on. When git cannot say, the
+/// answer is `None`, which means no print and so no panel snapshot: the
+/// optimisation is simply unavailable on older gits.
 fn system_config_path() -> Option<PathBuf> {
     static PATH: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
     PATH.get_or_init(|| {
-        let tmp = std::env::temp_dir();
-        if let Some(p) = crate::util::git_out(&tmp, &["var", "GIT_CONFIG_SYSTEM"]) {
-            return Some(PathBuf::from(p));
+        let asked = crate::util::git_out(&std::env::temp_dir(), &["var", "GIT_CONFIG_SYSTEM"]);
+        let path = system_config_from(asked);
+        if path.is_none() {
+            tracing::debug!(
+                target: "thegn::watch",
+                "git var GIT_CONFIG_SYSTEM unavailable; no global-layer print, no panel snapshot"
+            );
         }
-        let derived = crate::util::git_out(&tmp, &["--exec-path"])
-            .and_then(|e| derive_system_config(Path::new(&e)));
-        tracing::debug!(
-            target: "thegn::watch",
-            ?derived,
-            "git var GIT_CONFIG_SYSTEM unavailable; derived the system config from --exec-path"
-        );
-        derived
+        path
     })
     .clone()
 }
 
-/// git's own derivation of the system config path: `<prefix>/etc/gitconfig`,
-/// where the prefix is the parent of `libexec/git-core` (or `lib/git-core`); a
-/// `/usr` prefix uses `/etc/gitconfig`. `None` for an exec path of another shape.
-pub fn derive_system_config(exec_path: &Path) -> Option<PathBuf> {
-    if exec_path.file_name()? != "git-core" {
-        return None;
-    }
-    let libdir = exec_path.parent()?;
-    let lib = libdir.file_name()?.to_str()?;
-    if !matches!(lib, "libexec" | "lib" | "lib64") {
-        return None;
-    }
-    let prefix = libdir.parent()?;
-    Some(if prefix == Path::new("/usr") || prefix == Path::new("/") {
-        PathBuf::from("/etc/gitconfig")
-    } else {
-        prefix.join("etc/gitconfig")
-    })
+/// The system config path from `git var GIT_CONFIG_SYSTEM`'s output; unavailable
+/// (git too old, spawn failure, empty) is `None`.
+fn system_config_from(var_output: Option<String>) -> Option<PathBuf> {
+    var_output
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from)
 }
 
 /// System + global config files (and their includes) into `files`, in git's
@@ -455,6 +442,19 @@ fn stamp_memoised(
     key: (PathBuf, u64),
     compute: impl FnOnce() -> Option<(u64, Vec<PathBuf>)>,
 ) -> Option<u64> {
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(i64::MIN, |d| d.as_nanos() as i64);
+    stamp_memoised_at(cache, key, now_ns, compute)
+}
+
+/// [`stamp_memoised`] with the clock injected (wall time in ns since the epoch).
+fn stamp_memoised_at(
+    cache: &GlobalPrintCache,
+    key: (PathBuf, u64),
+    now_ns: i64,
+    compute: impl FnOnce() -> Option<(u64, Vec<PathBuf>)>,
+) -> Option<u64> {
     {
         let g = cache.lock().unwrap_or_else(|e| e.into_inner());
         if let Some((stamps, v)) = g.as_ref().and_then(|m| m.get(&key))
@@ -463,15 +463,12 @@ fn stamp_memoised(
             return *v;
         }
     }
-    // Filesystem timestamps come from a coarse kernel clock that can lag the wall
-    // clock by several ms, so "not touched since before we started" needs a
-    // margin: anything modified within SETTLE_MARGIN of the start is distrusted.
-    const SETTLE_MARGIN_NS: i64 = 50_000_000;
-    let started = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(i64::MIN, |d| {
-            (d.as_nanos() as i64).saturating_sub(SETTLE_MARGIN_NS)
-        });
+    // Filesystem timestamps are coarse: 1 s on HFS+ and ext3/ext4 with 128-byte
+    // inodes, 2 s on FAT, plus kernel clock lag. "Not touched since before we
+    // started" therefore needs a margin of 3 s: anything modified within it of
+    // the start is distrusted.
+    const SETTLE_MARGIN_NS: i64 = 3_000_000_000;
+    let started = now_ns.saturating_sub(SETTLE_MARGIN_NS);
     let (v, paths) = compute()?;
     let stamps: Vec<(PathBuf, Stamp)> = paths
         .into_iter()
@@ -503,6 +500,14 @@ fn global_git_print_inner(
     env: &dyn Fn(&str) -> Option<String>,
 ) -> Option<(u64, Vec<PathBuf>)> {
     use std::hash::{Hash, Hasher};
+    // Config injected through the environment can name excludes/attributes files
+    // we have no way to see: no print.
+    if ["GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT"]
+        .iter()
+        .any(|k| env(k).is_some_and(|v| !v.trim().is_empty()))
+    {
+        return None;
+    }
     let home = env("HOME").map(PathBuf::from);
     let mut files = Vec::new();
     global_config_files(env, home.as_deref(), &mut files)?;
@@ -536,6 +541,11 @@ fn global_git_print_inner(
             for v in core_values(&text, key) {
                 candidates.push(match v.strip_prefix("~/") {
                     Some(rest) => home.as_ref()?.join(rest),
+                    // `~user/`, `%(prefix)/...` and relative paths (resolved
+                    // against a cwd we do not know) cannot be resolved here: no
+                    // print rather than a guess.
+                    None if v.starts_with('~') || v.starts_with('%') => return None,
+                    None if !Path::new(&v).is_absolute() => return None,
                     None => PathBuf::from(v),
                 });
             }
@@ -1339,26 +1349,13 @@ mod tests {
     }
 
     #[test]
-    fn system_config_is_derived_like_git_does() {
-        let d = |p: &str| derive_system_config(Path::new(p));
+    fn an_unavailable_system_config_path_is_none_never_a_guess() {
+        assert_eq!(system_config_from(None), None);
+        assert_eq!(system_config_from(Some("  \n".into())), None);
         assert_eq!(
-            d("/usr/libexec/git-core"),
+            system_config_from(Some("/etc/gitconfig\n".into())),
             Some(PathBuf::from("/etc/gitconfig"))
         );
-        assert_eq!(
-            d("/usr/lib/git-core"),
-            Some(PathBuf::from("/etc/gitconfig"))
-        );
-        assert_eq!(
-            d("/nix/store/abc-git-2.40/libexec/git-core"),
-            Some(PathBuf::from("/nix/store/abc-git-2.40/etc/gitconfig"))
-        );
-        assert_eq!(
-            d("/opt/homebrew/Cellar/git/2.40/libexec/git-core"),
-            Some(PathBuf::from("/opt/homebrew/Cellar/git/2.40/etc/gitconfig"))
-        );
-        assert_eq!(d("/weird/place"), None);
-        assert_eq!(d("/usr/share/git-core"), None);
     }
 
     #[test]
@@ -1433,44 +1430,79 @@ mod tests {
     }
 
     #[test]
-    fn stamp_memo_serves_stats_not_reads_and_refuses_a_racing_write() {
+    fn stamp_memo_serves_stats_not_reads_and_distrusts_recent_files() {
         let base = tmp("stampmemo");
         let f = base.join("cfg");
         std::fs::write(&f, "one\n").unwrap();
-        // Let the file's ctime fall strictly before the memo's start.
-        std::thread::sleep(std::time::Duration::from_millis(120));
-        let cache: GlobalPrintCache = Mutex::new(None);
+        let ctime = stamp(&f).0.unwrap().4;
+        let s = 1_000_000_000i64;
         let key = (base.clone(), 1u64);
         let computes = std::cell::Cell::new(0);
-        let run = |cache: &GlobalPrintCache| {
-            stamp_memoised(cache, key.clone(), || {
+        let run = |cache: &GlobalPrintCache, now_ns: i64| {
+            stamp_memoised_at(cache, key.clone(), now_ns, || {
                 computes.set(computes.get() + 1);
                 Some((computes.get() as u64, vec![f.clone()]))
             })
         };
-        assert_eq!(run(&cache), Some(1));
-        assert_eq!(run(&cache), Some(1), "second call is a stat-only hit");
+        // The clock is injected: no sleeping, fully deterministic.
+        // 4 s after the file's ctime: settled, cached, then served by stat alone.
+        let cache: GlobalPrintCache = Mutex::new(None);
+        assert_eq!(run(&cache, ctime + 4 * s), Some(1));
+        assert_eq!(run(&cache, ctime + 5 * s), Some(1), "stat-only hit");
         assert_eq!(computes.get(), 1);
-        std::thread::sleep(std::time::Duration::from_millis(120));
-        std::fs::write(&f, "two!\n").unwrap();
-        assert_eq!(run(&cache), Some(2), "a changed file recomputes");
-        // A file written DURING the compute is never cached.
-        let cache2: GlobalPrintCache = Mutex::new(None);
-        let n = std::cell::Cell::new(0);
-        let racing = |c: &GlobalPrintCache| {
-            stamp_memoised(c, key.clone(), || {
-                n.set(n.get() + 1);
-                std::fs::write(&f, format!("w{}", n.get())).unwrap();
-                Some((n.get() as u64, vec![f.clone()]))
-            })
-        };
-        racing(&cache2);
-        racing(&cache2);
-        assert_eq!(
-            n.get(),
-            2,
-            "uncached because the file moved during the read"
-        );
+        // A changed file (different length) recomputes.
+        std::fs::write(&f, "two!!\n").unwrap();
+        let ctime2 = stamp(&f).0.unwrap().4;
+        assert_eq!(run(&cache, ctime2 + 10 * s), Some(2));
+        // Within the 3 s margin the value is returned but NEVER cached, so a
+        // write racing the read (or a coarse 1-2 s timestamp) cannot stick.
+        let fresh: GlobalPrintCache = Mutex::new(None);
+        let before = computes.get();
+        run(&fresh, ctime2 + s);
+        run(&fresh, ctime2 + 2 * s);
+        assert_eq!(computes.get(), before + 2, "uncached inside the margin");
+        run(&fresh, ctime2 + 4 * s);
+        run(&fresh, ctime2 + 4 * s);
+        assert_eq!(computes.get(), before + 3, "cached once outside it");
+    }
+
+    #[test]
+    fn unprovable_excludes_and_attributes_values_give_no_print() {
+        let base = tmp("unprovable");
+        let home = base.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let h = home.to_str().unwrap();
+        let env = env_of(&[("HOME", h), ("GIT_CONFIG_NOSYSTEM", "1")]);
+        for (key, val) in [
+            ("excludesFile", "relative/ignore"),
+            ("attributesFile", "relative/attrs"),
+            ("excludesFile", "~bob/ignore"),
+            ("attributesFile", "%(prefix)/etc/attrs"),
+        ] {
+            std::fs::write(
+                home.join(".gitconfig"),
+                format!("[core]\n\t{key} = {val}\n"),
+            )
+            .unwrap();
+            assert_eq!(
+                global_git_print_with(None, &env),
+                None,
+                "{key} = {val} cannot be resolved, so no snapshot"
+            );
+        }
+        // An absolute path and ~/ are fine.
+        std::fs::write(home.join(".gitconfig"), "[core]\n\texcludesFile = ~/ig\n").unwrap();
+        assert!(global_git_print_with(None, &env).is_some());
+        // Config smuggled through the environment cannot be fingerprinted.
+        std::fs::write(home.join(".gitconfig"), "").unwrap();
+        for k in ["GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT"] {
+            let env2 = env_of(&[
+                ("HOME", h),
+                ("GIT_CONFIG_NOSYSTEM", "1"),
+                (k, "'core.excludesfile=x'"),
+            ]);
+            assert_eq!(global_git_print_with(None, &env2), None, "{k}");
+        }
     }
 
     #[test]
