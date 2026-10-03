@@ -3895,3 +3895,22 @@ fn wheel_delta_rows_is_bounded_and_proportional() {
         WHEEL_MAX_TICKS * WHEEL_ROWS_PER_TICK
     );
 }
+
+#[test]
+fn drain_wheel_ticks_stops_at_cap_and_leaves_rest_queued() {
+    use termwiz::input::{MouseButtons, MouseEvent};
+    let ev = || {
+        InputEvent::Mouse(MouseEvent {
+            x: 0,
+            y: 0,
+            mouse_buttons: MouseButtons::VERT_WHEEL | MouseButtons::WHEEL_POSITIVE,
+            modifiers: termwiz::input::Modifiers::NONE,
+        })
+    };
+    let mut q: std::collections::VecDeque<InputEvent> =
+        (0..WHEEL_MAX_TICKS + 5).map(|_| ev()).collect();
+    let (n, leftover) = drain_wheel_ticks(true, || q.pop_front());
+    assert_eq!(n, WHEEL_MAX_TICKS);
+    assert!(leftover.is_none());
+    assert_eq!(q.len(), 6, "ticks past the cap stay queued");
+}

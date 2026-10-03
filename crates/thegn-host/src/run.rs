@@ -4896,10 +4896,10 @@ fn drain_key_repeats(
 
 /// Rows scrolled per wheel notch.
 const WHEEL_ROWS_PER_TICK: usize = 5;
-/// Ceiling on ticks applied per coalesced gesture. Coalescing is for latency
-/// (one render per burst), not for multiplying distance: a terminal that
-/// reports many events per notch, or a backlog queued behind a slow frame,
-/// must not fling the viewport (THE-699). Excess ticks are dropped.
+/// Ceiling on ticks applied per frame. Coalescing is for latency (one render
+/// per burst), not for multiplying distance: a backlog queued behind a slow
+/// frame must not fling the viewport in one jump (THE-699). Ticks past the cap
+/// stay queued and are applied by the next frame, so distance is preserved.
 const WHEEL_MAX_TICKS: usize = 8;
 
 /// Rows to scroll for `ticks` coalesced wheel events (pure, bounded).
@@ -4916,20 +4916,28 @@ fn wheel_delta_rows(ticks: usize) -> usize {
 /// because the spin loop keeps pulling until the kernel returns nothing.
 fn drain_wheel_ticks(
     up: bool,
-    next: impl FnMut() -> Option<InputEvent>,
+    mut next: impl FnMut() -> Option<InputEvent>,
 ) -> (usize, Option<InputEvent>) {
     use termwiz::input::MouseButtons;
-    drain_event_repeats(
-        move |ev| {
-            matches!(
-                ev,
-                InputEvent::Mouse(m)
-                    if m.mouse_buttons.contains(MouseButtons::VERT_WHEEL)
-                        && m.mouse_buttons.contains(MouseButtons::WHEEL_POSITIVE) == up
-            )
-        },
-        next,
-    )
+    let is_repeat = |ev: &InputEvent| {
+        matches!(
+            ev,
+            InputEvent::Mouse(m)
+                if m.mouse_buttons.contains(MouseButtons::VERT_WHEEL)
+                    && m.mouse_buttons.contains(MouseButtons::WHEEL_POSITIVE) == up
+        )
+    };
+    let mut count = 1usize;
+    // Stop pulling at the cap and leave the rest queued: a fast flick keeps its
+    // distance, spread over successive frames, while each jump stays bounded.
+    while count < WHEEL_MAX_TICKS {
+        match next() {
+            Some(ev) if is_repeat(&ev) => count += 1,
+            Some(other) => return (count, Some(other)),
+            None => return (count, None),
+        }
+    }
+    (count, None)
 }
 
 /// Coalesce a left-drag's backlog: keep pulling queued left-button mouse
@@ -13143,28 +13151,30 @@ async fn event_loop<T: Terminal>(
             // wheel is the SOLE damage: anything else pending (another pane's
             // output, bars, sidebar, a chrome change) would be skipped and then
             // cleared below, leaving stale cells until a layout change (THE-699).
-            let scroll_fast = scroll_only
-                && crate::render_plan::wheel_is_sole_damage(&damage)
-                && !fast_select
-                && !full_repaint
-                && !clear_on_next_frame
-                && !app_tile_active
-                && drawer.is_none()
-                && mouse_sel.is_none()
-                && palette.is_none()
-                && theme_builder.is_none()
-                && monitor.is_none()
-                && board.is_none()
-                && active_menu.is_none()
-                && git_input.is_none()
-                && host_input.is_none()
-                && wizard_ui.is_none()
-                && workspace_picker.is_none()
-                && hover_popup.is_none()
-                && search.is_none()
-                && bar_detail.is_none()
-                && which_key.is_empty()
-                && toasts.is_empty();
+            let scroll_fast = crate::render_plan::scroll_fast_ok(
+                scroll_only,
+                &damage,
+                !fast_select
+                    && !full_repaint
+                    && !clear_on_next_frame
+                    && !app_tile_active
+                    && drawer.is_none()
+                    && mouse_sel.is_none()
+                    && palette.is_none()
+                    && theme_builder.is_none()
+                    && monitor.is_none()
+                    && board.is_none()
+                    && active_menu.is_none()
+                    && git_input.is_none()
+                    && host_input.is_none()
+                    && wizard_ui.is_none()
+                    && workspace_picker.is_none()
+                    && hover_popup.is_none()
+                    && search.is_none()
+                    && bar_detail.is_none()
+                    && which_key.is_empty()
+                    && toasts.is_empty(),
+            );
             // Demand-driven git docs for the expanded frame's stash/branches
             // main regions: on a dirty frame that is about to render one of
             // them, make sure the SELECTED row's document is fetched
@@ -13220,7 +13230,7 @@ async fn event_loop<T: Terminal>(
             };
             // A wheel scroll whose fast path was refused is plain chrome damage.
             let mut damage = damage;
-            damage.chrome |= scroll_dirty && !scroll_fast;
+            crate::render_plan::fold_refused_wheel(&mut damage, scroll_dirty, scroll_fast);
             let frame_plan = crate::render_plan::plan(&damage, &overlays);
             // Caret bookkeeping is per FULL frame only: the incremental paths
             // deliberately skip the overlay stack, so they must inherit the last
@@ -13240,6 +13250,7 @@ async fn event_loop<T: Terminal>(
                 tracing::debug!(
                     target: "thegn::frame",
                     full = damage.full,
+                    scroll = scroll_only,
                     chrome = damage.chrome,
                     switch = damage.switch,
                     bars = damage.bars,
@@ -13990,6 +14001,7 @@ async fn event_loop<T: Terminal>(
             // Consumed: the next frame is full unless another drag/scroll re-arms it.
             selection_only = false;
             scroll_only = false;
+            scroll_pane = None;
             scroll_dirty = false;
             // Pane/bars damage is now on screen; an untouched next wake renders nothing.
             dirty_panes.clear();
