@@ -1078,7 +1078,25 @@ mod tests {
         let base = scratch("panel");
         let state = base.join("state");
         std::fs::create_dir_all(state.join("thegn")).unwrap();
-        let _env = crate::testenv::EnvVarGuard::set(&[("XDG_STATE_HOME", state.to_str().unwrap())]);
+        // Hermetic git global layer: never read the real ~/.gitconfig, system
+        // config, or injected GIT_CONFIG_* of the machine running the test.
+        let ghome = base.join("ghome");
+        std::fs::create_dir_all(&ghome).unwrap();
+        let gsys = base.join("gitconfig-system");
+        std::fs::write(&gsys, "").unwrap();
+        let _env = crate::testenv::EnvVarGuard::set(&[
+            ("XDG_STATE_HOME", state.to_str().unwrap()),
+            ("HOME", ghome.to_str().unwrap()),
+            ("XDG_CONFIG_HOME", ghome.join("xdg").to_str().unwrap()),
+            (
+                "GIT_CONFIG_GLOBAL",
+                ghome.join(".gitconfig").to_str().unwrap(),
+            ),
+            ("GIT_CONFIG_SYSTEM", gsys.to_str().unwrap()),
+            ("GIT_CONFIG_NOSYSTEM", "0"),
+            ("GIT_CONFIG_COUNT", "0"),
+            ("GIT_CONFIG_PARAMETERS", ""),
+        ]);
         let db = thegn_core::db::Db::open_at(&state.join("thegn/thegn.db")).unwrap();
         let cfg = thegn_core::config::Config::default();
         let hints = crate::hydrate::HydrateHints::default();

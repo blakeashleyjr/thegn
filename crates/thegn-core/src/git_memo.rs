@@ -264,8 +264,13 @@ fn push_config(
     for inc in includes {
         let target = if let Some(rest) = inc.strip_prefix("~/") {
             home?.join(rest)
-        } else if inc.starts_with('~') {
-            return None; // `~user/…`: not modelled
+        } else if inc.starts_with('~')
+            || inc.starts_with("%(prefix)")
+            || inc.to_ascii_lowercase().starts_with(":(optional)")
+        {
+            // `~user/…`, `%(prefix)/…`, `:(optional)…`: not modelled; a relative
+            // reading would make a real include look absent.
+            return None;
         } else if Path::new(&inc).is_absolute() {
             PathBuf::from(&inc)
         } else {
@@ -502,9 +507,14 @@ fn global_git_print_inner(
     use std::hash::{Hash, Hasher};
     // Config injected through the environment can name excludes/attributes files
     // we have no way to see: no print.
+    // `GIT_CONFIG_COUNT=0` (thegn sets it for its own children) injects nothing.
+    let injected = |k: &str, v: String| {
+        let v = v.trim();
+        !v.is_empty() && !(k == "GIT_CONFIG_COUNT" && v.parse::<usize>() == Ok(0))
+    };
     if ["GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT"]
         .iter()
-        .any(|k| env(k).is_some_and(|v| !v.trim().is_empty()))
+        .any(|k| env(k).is_some_and(|v| injected(k, v)))
     {
         return None;
     }
@@ -1493,6 +1503,12 @@ mod tests {
         // An absolute path and ~/ are fine.
         std::fs::write(home.join(".gitconfig"), "[core]\n\texcludesFile = ~/ig\n").unwrap();
         assert!(global_git_print_with(None, &env).is_some());
+        let abs = format!(
+            "[core]\n\texcludesFile = {}\n",
+            home.join("abs-ignore").display()
+        );
+        std::fs::write(home.join(".gitconfig"), abs).unwrap();
+        assert!(global_git_print_with(None, &env).is_some());
         // Config smuggled through the environment cannot be fingerprinted.
         std::fs::write(home.join(".gitconfig"), "").unwrap();
         for k in ["GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT"] {
@@ -1502,6 +1518,28 @@ mod tests {
                 (k, "'core.excludesfile=x'"),
             ]);
             assert_eq!(global_git_print_with(None, &env2), None, "{k}");
+        }
+        // COUNT=0 is the explicit "nothing injected" form thegn sets itself.
+        let zero = env_of(&[
+            ("HOME", h),
+            ("GIT_CONFIG_NOSYSTEM", "1"),
+            ("GIT_CONFIG_COUNT", "0"),
+        ]);
+        assert!(global_git_print_with(None, &zero).is_some());
+        let two = env_of(&[
+            ("HOME", h),
+            ("GIT_CONFIG_NOSYSTEM", "1"),
+            ("GIT_CONFIG_COUNT", "2"),
+        ]);
+        assert_eq!(global_git_print_with(None, &two), None);
+        // Includes that cannot be resolved fail closed instead of reading as absent.
+        for inc in ["%(prefix)/etc/extra", ":(optional)extra", "~bob/extra"] {
+            std::fs::write(
+                home.join(".gitconfig"),
+                format!("[include]\n\tpath = {inc}\n"),
+            )
+            .unwrap();
+            assert_eq!(global_git_print_with(None, &env), None, "include {inc}");
         }
     }
 
