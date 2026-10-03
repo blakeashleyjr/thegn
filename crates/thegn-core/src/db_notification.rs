@@ -373,7 +373,7 @@ impl NotificationStore for Db {
     fn stamp_dispatch_run(&self, id: i64, session_id: &str, artifact_path: &str) -> Result<()> {
         self.conn().execute(
             "UPDATE agent_dispatches SET session_id=?1, artifact_path=?2, \
-             run_gen=run_gen+1 WHERE id=?3",
+             run_gen=run_gen+1, exit_code=NULL, exited_at_ms=NULL WHERE id=?3",
             params![session_id, artifact_path, id],
         )?;
         Ok(())
@@ -507,11 +507,17 @@ impl NotificationStore for Db {
                     },
                 )
                 .optional()?;
-            return Ok(match hit {
-                Some(run) => ExitAttribution::Exact(run),
-                None => ExitAttribution::Stale,
-            });
+            if let Some(run) = hit {
+                return Ok(ExitAttribution::Exact(run));
+            }
         }
+        // A non-empty session id that matches no row is Stale UNLESS the
+        // worktree has an ACTIVE session-less row: rows dispatched without a
+        // session (UI tracker dispatch, `dispatch put` without --session) run
+        // in daemon panes that still report a daemon session id on exit. A
+        // replaced run's row always carries a non-null session, so that case
+        // still falls through to Stale and the THE-238 fence holds.
+        let sid_missed = session_id.is_some_and(|s| !s.is_empty());
         // Rule 2 — identity-less: exactly one ACTIVE row for the worktree. The
         // active test runs through the typed status (never a SQL string list),
         // so `Unknown` is neither active nor terminal and a corrupt row can't
@@ -529,18 +535,23 @@ impl NotificationStore for Db {
             if !status.is_active() {
                 continue;
             }
+            let row_sid: String = r.get(3)?;
+            if sid_missed && !row_sid.is_empty() {
+                continue;
+            }
             if found.is_some() {
                 return Ok(ExitAttribution::Ambiguous);
             }
             found = Some(DispatchRunRef {
                 id: r.get(0)?,
                 issue_id: r.get(1)?,
-                session_id: r.get(3)?,
+                session_id: row_sid,
                 run_gen: r.get(4)?,
             });
         }
         Ok(match found {
             Some(run) => ExitAttribution::Legacy(run),
+            None if sid_missed => ExitAttribution::Stale,
             None => ExitAttribution::NoRow,
         })
     }

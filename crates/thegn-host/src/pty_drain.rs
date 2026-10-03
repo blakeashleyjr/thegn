@@ -1203,7 +1203,10 @@ fn handle_exit(ctx: &mut DrainCtx<'_>, id: u32, exit_code: Option<i32>) -> bool 
                     // Stale, never "the newest row in this worktree" (that
                     // fallback is how an old run's late exit stamped the retry
                     // that replaced it). Identity-less panes resolve only when
-                    // exactly one active row exists. Stale/Ambiguous/NoRow fall
+                    // exactly one active row exists; so does a session id that
+                    // matches no row when exactly one active SESSION-LESS row
+                    // exists (UI/`dispatch put` rows run in daemon panes that
+                    // still report a session id). Stale/Ambiguous/NoRow fall
                     // through to ordinary process routing: in daemon mode every
                     // pane has a session id, so a plain shell later opened in an
                     // ex-agent worktree is Stale here and must keep its process
@@ -1240,17 +1243,11 @@ fn handle_exit(ctx: &mut DrainCtx<'_>, id: u32, exit_code: Option<i32>) -> bool 
                     if let Some(run) = run {
                         let dispatch_id = run.id;
                         let issue_id = run.issue_id.clone();
-                        let kind = if failed { "agent_failed" } else { "agent_done" };
-                        let base = thegn_core::util::basename(&wt);
-                        let msg = format!(
-                            "agent {} in {base}",
-                            if failed { "crashed" } else { "finished" }
-                        );
-                        // Routing gate: a rule may drop this from the inbox; a
-                        // sound fires per the decision (agent panes have no
-                        // desktop event, matching prior behavior).
-                        let (_dec, _) =
-                            crate::notify::record(&db, &nstate, kind, &issue_id, &msg, &wt);
+                        // Resolve the row first: an already-terminal row is
+                        // finished work, so a re-observed exit must neither
+                        // re-notify nor move its status.
+                        let row = db.get_dispatch(dispatch_id).ok().flatten();
+                        let already_terminal = row.as_ref().is_some_and(|r| r.status.is_terminal());
                         // Write the roster status through the TYPED enum, not a
                         // free string: the old `"failed"`/`"done"` string writes
                         // were not members of the parseable set a supervisor
@@ -1264,12 +1261,15 @@ fn handle_exit(ctx: &mut DrainCtx<'_>, id: u32, exit_code: Option<i32>) -> bool 
                         // pipeline/artifact row for the supervisor's verified
                         // `set-status done`; only plain dispatches retain the
                         // legacy automatic Done stamp.
-                        let auto_status = match db.get_dispatch(dispatch_id) {
-                            Ok(Some(row)) => automatic_dispatch_exit_status(
-                                failed,
-                                row.stage.is_some() || row.artifact_path.is_some(),
-                            ),
-                            Ok(None) | Err(_) => None,
+                        let auto_status = if already_terminal {
+                            None
+                        } else {
+                            row.as_ref().and_then(|row| {
+                                automatic_dispatch_exit_status(
+                                    failed,
+                                    row.stage.is_some() || row.artifact_path.is_some(),
+                                )
+                            })
                         };
                         // Stamp the exit on the row REGARDLESS of whether the
                         // status moves (v63). A pipeline row deliberately keeps
@@ -1305,6 +1305,23 @@ fn handle_exit(ctx: &mut DrainCtx<'_>, id: u32, exit_code: Option<i32>) -> bool 
                                 row = dispatch_id,
                                 "exit stamp: {e:#}"
                             ),
+                        }
+                        // Stamp first, notify only for a run this exit really
+                        // closed (the daemon observer does not notify). An
+                        // already-terminal row is finished work: no
+                        // re-notification.
+                        if !already_terminal {
+                            let kind = if failed { "agent_failed" } else { "agent_done" };
+                            let base = thegn_core::util::basename(&wt);
+                            let msg = format!(
+                                "agent {} in {base}",
+                                if failed { "crashed" } else { "finished" }
+                            );
+                            // Routing gate: a rule may drop this from the inbox;
+                            // a sound fires per the decision (agent panes have
+                            // no desktop event, matching prior behavior).
+                            let (_dec, _) =
+                                crate::notify::record(&db, &nstate, kind, &issue_id, &msg, &wt);
                         }
                         if let Some(status) = auto_status {
                             // best-effort: cache write: the DB is a cache; git/forge stays the source of truth

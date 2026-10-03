@@ -79,7 +79,7 @@ impl Db {
         let tx = conn.unchecked_transaction()?;
         let changed = tx.execute(
             "UPDATE agent_dispatches SET session_id=?1, artifact_path=?2, status=?3, \
-             run_gen=run_gen+1 WHERE id=?4 AND status IN (?5, ?6)",
+             run_gen=run_gen+1, exit_code=NULL, exited_at_ms=NULL WHERE id=?4 AND status IN (?5, ?6)",
             rusqlite::params![
                 session_id,
                 artifact_path,
