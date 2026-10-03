@@ -55,6 +55,8 @@ pub fn normalize_url(raw: &str) -> Result<String, UrlRejection> {
     if !u.username().is_empty() || u.password().is_some() {
         return Err(UrlRejection::Credentials);
     }
+    // Defence in depth: `url` already rejects empty hosts for http/https, so
+    // no test input reaches this branch; kept in case that parser changes.
     if u.host_str().is_none_or(str::is_empty) {
         return Err(UrlRejection::NoHost);
     }
@@ -123,6 +125,9 @@ fn split_words(s: &str) -> Result<Vec<String>, TemplateError> {
 /// argv template that may contain `%s` for the URL. Blank entries are skipped;
 /// a spec with no usable entry yields `Ok(vec![])` so callers fall through to
 /// the OS opener.
+///
+/// Note: the spec is split on ':' BEFORE quotes are considered, so a quoted
+/// `$BROWSER` path that itself contains ':' is not supported.
 pub fn parse_candidates(spec: &str) -> Result<Vec<Vec<String>>, TemplateError> {
     if spec.len() > MAX_TEMPLATE_LEN {
         return Err(TemplateError::TooLong);

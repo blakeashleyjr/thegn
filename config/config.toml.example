@@ -3361,8 +3361,10 @@ ignore = []            # container ports never to forward, e.g. [5432, 22]
 only = []              # if non-empty, ONLY forward these container ports
 bind = "127.0.0.1"     # host interface to bind forwards on (loopback = host-local)
 poll_secs = 2          # how often the sandbox is scanned for new listening ports
-browser = ""           # "open in browser" command; "" = $BROWSER, then xdg-open/open
-open_on_detect = false # auto-open the browser when a new forward comes up
+browser = ""           # argv template, quoted args, `%s` = URL (appended if absent), no shell, e.g. "firefox --new-window %s".
+                       # An explicit value is final (no fallback). "" = $BROWSER (':'-separated fallback list), then the OS opener.
+                       # Also used by open_on_detect. Only http/https URLs are opened.
+open_on_detect = false # auto-open the browser (via `browser` above) when a new forward comes up
 # Conflict handling: if a detected port's own number is already bound on the host,
 # the forward is remapped to the next free port in `range` and a notification shows
 # the real URL (e.g. "port 3000 in use → forwarded at localhost:8001").
