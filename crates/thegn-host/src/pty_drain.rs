@@ -1198,21 +1198,48 @@ fn handle_exit(ctx: &mut DrainCtx<'_>, id: u32, exit_code: Option<i32>) -> bool 
                     // Agent panes keep their dedicated agent_done/failed path;
                     // everything else routes through item-524 process attention.
                     //
-                    // Which row: `dispatch_for_exit` resolves by daemon session
-                    // id first and only then falls back to the most recent
-                    // ACTIVE row for the worktree — never a terminal one. So a
-                    // shell opened later in an ex-agent worktree no longer
-                    // re-stamps (and re-notifies) work that finished days ago,
-                    // and two stages sharing a worktree each get their own row.
+                    // Which run (THE-238): a non-empty daemon session id is the
+                    // identity and fails closed — it names a row exactly or is
+                    // Stale, never "the newest row in this worktree" (that
+                    // fallback is how an old run's late exit stamped the retry
+                    // that replaced it). Identity-less panes resolve only when
+                    // exactly one active row exists. Stale/Ambiguous/NoRow fall
+                    // through to ordinary process routing: in daemon mode every
+                    // pane has a session id, so a plain shell later opened in an
+                    // ex-agent worktree is Stale here and must keep its process
+                    // notification.
                     //
                     // DIVISION OF LABOUR: this handler stamps dispatches whose
                     // worker is an adopted *pane*. The daemon's SessionExit
                     // observer stamps headless workers. Both can observe an
-                    // adopted session; the DB stamp is first-writer-wins for a
-                    // run, so the duplicate observation is harmless.
-                    if let Ok(Some((dispatch_id, issue_id))) =
-                        db.dispatch_for_exit(&wt, exited_session.as_deref())
-                    {
+                    // adopted session; the stamp is a CAS on (row, session,
+                    // run_gen), first writer wins, so the duplicate is harmless.
+                    let attribution = db.dispatch_for_exit(&wt, exited_session.as_deref());
+                    let run = match attribution {
+                        Ok(
+                            thegn_core::issue::ExitAttribution::Exact(run)
+                            | thegn_core::issue::ExitAttribution::Legacy(run),
+                        ) => Some(run),
+                        Ok(thegn_core::issue::ExitAttribution::Ambiguous) => {
+                            tracing::warn!(
+                                target: "thegn::dispatch",
+                                worktree = %wt,
+                                "identity-less pane exit matches several active dispatch rows; not stamping"
+                            );
+                            None
+                        }
+                        Ok(
+                            thegn_core::issue::ExitAttribution::Stale
+                            | thegn_core::issue::ExitAttribution::NoRow,
+                        ) => None,
+                        Err(e) => {
+                            tracing::warn!(target: "thegn::dispatch", worktree = %wt, "exit attribution: {e:#}");
+                            None
+                        }
+                    };
+                    if let Some(run) = run {
+                        let dispatch_id = run.id;
+                        let issue_id = run.issue_id.clone();
                         let kind = if failed { "agent_failed" } else { "agent_done" };
                         let base = thegn_core::util::basename(&wt);
                         let msg = format!(
@@ -1251,8 +1278,34 @@ fn handle_exit(ctx: &mut DrainCtx<'_>, id: u32, exit_code: Option<i32>) -> bool 
                         // row whose worker is gone with nothing to say so. The
                         // stamp is what makes it read as `exited-unverified`
                         // instead of masquerading as a live worker.
-                        // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
-                        let _ = db.stamp_dispatch_exit(dispatch_id, exit_code.map(i64::from));
+                        match db.stamp_dispatch_exit(&run, exit_code.map(i64::from)) {
+                            Ok(
+                                thegn_core::issue::ExitStamp::Stamped
+                                | thegn_core::issue::ExitStamp::AlreadyStamped,
+                            ) => {}
+                            Ok(
+                                outcome @ (thegn_core::issue::ExitStamp::Stale
+                                | thegn_core::issue::ExitStamp::Missing),
+                            ) => {
+                                // The run moved on (a relaunch) or the row
+                                // vanished between attribution and stamp: this
+                                // exit belongs to no live run. Don't move status.
+                                tracing::warn!(
+                                    target: "thegn::dispatch",
+                                    row = dispatch_id,
+                                    ?outcome,
+                                    "pane exit did not stamp its run"
+                                );
+                                crate::monitor_pipeline::mark_roster_dirty();
+                                return;
+                            }
+                            // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+                            Err(e) => tracing::debug!(
+                                target: "thegn::dispatch",
+                                row = dispatch_id,
+                                "exit stamp: {e:#}"
+                            ),
+                        }
                         if let Some(status) = auto_status {
                             // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                             let _ = db.update_dispatch_status(dispatch_id, status);

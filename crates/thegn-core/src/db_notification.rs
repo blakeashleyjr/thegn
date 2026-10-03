@@ -372,7 +372,8 @@ impl NotificationStore for Db {
     /// cache-side ledger, and there is nothing to surface for it.
     fn stamp_dispatch_run(&self, id: i64, session_id: &str, artifact_path: &str) -> Result<()> {
         self.conn().execute(
-            "UPDATE agent_dispatches SET session_id=?1, artifact_path=?2 WHERE id=?3",
+            "UPDATE agent_dispatches SET session_id=?1, artifact_path=?2, \
+             run_gen=run_gen+1 WHERE id=?3",
             params![session_id, artifact_path, id],
         )?;
         Ok(())
@@ -483,42 +484,65 @@ impl NotificationStore for Db {
         &self,
         worktree_path: &str,
         session_id: Option<&str>,
-    ) -> Result<Option<(i64, String)>> {
-        // Rule 1 — identity. The session id is matched on its own, NOT scoped to
-        // the worktree: a daemon session id is unique, and the pane's path can
-        // legitimately differ from the recorded one (symlinked / non-canonical
-        // checkout), so scoping it would only add a way to miss the right row.
+    ) -> Result<crate::issue::ExitAttribution> {
+        use crate::issue::{DispatchRunRef, ExitAttribution};
+        // Rule 1 — identity, fail closed. Matched on its own, NOT scoped to the
+        // worktree: a daemon session id is unique per launch, and the pane's
+        // path can legitimately differ from the recorded one (symlinked /
+        // non-canonical checkout). A miss is Stale, never a path fallback.
         if let Some(sid) = session_id.filter(|s| !s.is_empty()) {
             let hit = self
                 .conn()
                 .query_row(
-                    "SELECT id, issue_id FROM agent_dispatches WHERE session_id=?1 \
+                    "SELECT id, issue_id, run_gen FROM agent_dispatches WHERE session_id=?1 \
                      ORDER BY dispatched_at_ms DESC, id DESC LIMIT 1",
                     params![sid],
-                    |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+                    |r| {
+                        Ok(DispatchRunRef {
+                            id: r.get(0)?,
+                            issue_id: r.get(1)?,
+                            session_id: sid.to_string(),
+                            run_gen: r.get(2)?,
+                        })
+                    },
                 )
                 .optional()?;
-            if hit.is_some() {
-                return Ok(hit);
-            }
+            return Ok(match hit {
+                Some(run) => ExitAttribution::Exact(run),
+                None => ExitAttribution::Stale,
+            });
         }
-        // Rule 2 — most recent ACTIVE row for the worktree. The active test runs
-        // through the typed status (never a SQL string list), so the closed set
-        // has exactly one definition; `Unknown` is neither active nor terminal,
-        // so a corrupt row can't steal the stamp either.
+        // Rule 2 — identity-less: exactly one ACTIVE row for the worktree. The
+        // active test runs through the typed status (never a SQL string list),
+        // so `Unknown` is neither active nor terminal and a corrupt row can't
+        // steal the stamp either.
         let conn = self.conn();
         let mut stmt = conn.prepare(
-            "SELECT id, issue_id, status FROM agent_dispatches WHERE worktree_path=?1 \
+            "SELECT id, issue_id, status, COALESCE(session_id,''), run_gen \
+             FROM agent_dispatches WHERE worktree_path=?1 \
              ORDER BY dispatched_at_ms DESC, id DESC",
         )?;
         let mut rows = stmt.query(params![worktree_path])?;
+        let mut found: Option<DispatchRunRef> = None;
         while let Some(r) = rows.next()? {
             let status = crate::issue::AgentDispatchStatus::parse(&r.get::<_, String>(2)?);
-            if status.is_active() {
-                return Ok(Some((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)));
+            if !status.is_active() {
+                continue;
             }
+            if found.is_some() {
+                return Ok(ExitAttribution::Ambiguous);
+            }
+            found = Some(DispatchRunRef {
+                id: r.get(0)?,
+                issue_id: r.get(1)?,
+                session_id: r.get(3)?,
+                run_gen: r.get(4)?,
+            });
         }
-        Ok(None)
+        Ok(match found {
+            Some(run) => ExitAttribution::Legacy(run),
+            None => ExitAttribution::NoRow,
+        })
     }
 }
 
