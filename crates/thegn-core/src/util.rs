@@ -1649,6 +1649,22 @@ pub fn git_ok(dir: &Path, args: &[&str]) -> bool {
         .unwrap_or(false)
 }
 
+/// Typed `git merge-base --is-ancestor`: `Some(true)` on exit 0, `Some(false)`
+/// on exit 1 (the one valid negative), `None` for anything else (spawn
+/// failure, bad object, repository/permission error). Callers choosing a
+/// destructive branch must treat `None` as unknown, never as "not an ancestor".
+pub fn git_is_ancestor(dir: &Path, ancestor: &str, descendant: &str) -> Option<bool> {
+    let out = git_cmd(dir)
+        .args(["merge-base", "--is-ancestor", ancestor, descendant])
+        .output()
+        .ok()?;
+    match out.status.code() {
+        Some(0) => Some(true),
+        Some(1) => Some(false),
+        _ => None,
+    }
+}
+
 /// The machine's hostname, used for host identity in pairing tickets and
 /// daemon server labels.
 ///
@@ -1714,6 +1730,40 @@ mod tests {
         assert!(git_write_epoch() > mid, "releasing the lock marks a write");
         // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn git_is_ancestor_is_tri_state() {
+        let td = tempfile::tempdir().unwrap();
+        let d = td.path();
+        let g = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .arg("-C")
+                .arg(d)
+                .args([
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@e",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "{args:?}");
+        };
+        g(&["init", "-q", "-b", "main"]);
+        g(&["commit", "-q", "--allow-empty", "-m", "a"]);
+        g(&["branch", "a"]);
+        g(&["commit", "-q", "--allow-empty", "-m", "b"]);
+        assert_eq!(git_is_ancestor(d, "a", "HEAD"), Some(true));
+        assert_eq!(git_is_ancestor(d, "HEAD", "a"), Some(false));
+        // Unknown objects and non-repositories are Unknown, never "No".
+        assert_eq!(git_is_ancestor(d, "nosuchref", "HEAD"), None);
+        let plain = tempfile::tempdir().unwrap();
+        assert_eq!(git_is_ancestor(plain.path(), "a", "HEAD"), None);
     }
 
     #[test]

@@ -7,7 +7,7 @@
 //! re-hydrates (lazygit behavior).
 
 use super::{GitBackend, run_stdin, run_w};
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use thegn_core::patch::{Selection, parse_patch, transform};
 use thegn_core::remote::GitLoc;
 
@@ -76,17 +76,58 @@ pub trait StageOps: GitBackend {
     /// "unrecoverable", the op reported success, and nothing changed.
     fn discard_file(&self, loc: &GitLoc, path: &str, untracked: bool) -> Result<()> {
         if untracked {
-            return run_w(loc, &[], &["clean", "-f", "--", path]).map(|_| ());
+            return run_w(
+                loc,
+                &[("GIT_LITERAL_PATHSPECS", "1")],
+                &["clean", "-f", "--", path],
+            )
+            .map(|_| ());
         }
         // A staged-NEW file has no HEAD version to restore — discarding it
         // means removing it (index + worktree), same net effect as `clean` on
         // its untracked form. Probe HEAD first so a genuine checkout failure
         // is never "recovered" by deleting the file.
-        let in_head = run_w(loc, &[], &["cat-file", "-e", &format!("HEAD:{path}")]).is_ok();
+        // Only a successful read that finds nothing selects removal; any
+        // execution/repository/object error refuses (fail closed). `ls-tree`
+        // exits 0 with empty output for an absent path, unlike `cat-file -e`
+        // whose exit 128 is shared by a missing path and a broken repository.
+        // Every path argument below is a LITERAL file name, but `rm`, `checkout`
+        // and `clean` expand pathspec globs by default: discarding a file named
+        // `*.txt` would otherwise delete/restore every `*.txt`.
+        const LIT: &[(&str, &str)] = &[("GIT_LITERAL_PATHSPECS", "1")];
+        let head_ok = run_w(
+            loc,
+            LIT,
+            &["rev-parse", "--verify", "--quiet", "HEAD^{commit}"],
+        );
+        let in_head = match head_ok {
+            Ok(_) => !run_w(loc, LIT, &["ls-tree", "-z", "HEAD", "--", path])
+                .context("could not read HEAD tree; refusing discard")?
+                .is_empty(),
+            Err(e) => {
+                // Unborn HEAD (fresh repo): HEAD names a branch whose ref does
+                // not exist yet, so nothing is in HEAD. Any other failure
+                // still refuses.
+                let unborn = run_w(loc, LIT, &["symbolic-ref", "-q", "HEAD"])
+                    .ok()
+                    .map(|t| t.trim().to_string())
+                    .filter(|t| !t.is_empty())
+                    .and_then(|target| {
+                        run_w(loc, LIT, &["for-each-ref", "--format=%(refname)", &target])
+                            .ok()
+                            .map(|o| !o.lines().any(|l| l.trim() == target))
+                    })
+                    .unwrap_or(false);
+                if !unborn {
+                    return Err(e.context("HEAD unreadable; refusing discard"));
+                }
+                false
+            }
+        };
         if in_head {
-            run_w(loc, &[], &["checkout", "HEAD", "--", path]).map(|_| ())
+            run_w(loc, LIT, &["checkout", "HEAD", "--", path]).map(|_| ())
         } else {
-            run_w(loc, &[], &["rm", "-f", "--", path]).map(|_| ())
+            run_w(loc, LIT, &["rm", "-f", "--", path]).map(|_| ())
         }
     }
 
@@ -322,6 +363,98 @@ mod tests {
         CliGit.discard_file(&loc, "u.txt", true).unwrap();
         assert!(!repo.dir.join("u.txt").exists());
         assert!(CliGit.status(&loc).unwrap().is_empty());
+    }
+
+    #[test]
+    fn discard_file_refuses_when_head_is_unreadable() {
+        let repo = TestRepo::new("discard-unknown");
+        repo.commit_file("t.txt", "original\n", "base");
+        std::fs::write(repo.dir.join("t.txt"), "precious\n").unwrap();
+        // Break HEAD's tree object: the probe now errors instead of reporting
+        // "absent", which used to select `git rm -f` and delete the file.
+        let tree = repo.out(&["rev-parse", "HEAD^{tree}"]);
+        let tree = tree.trim();
+        let obj = repo
+            .dir
+            .join(".git/objects")
+            .join(&tree[..2])
+            .join(&tree[2..]);
+        let mut perm = std::fs::metadata(&obj).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        perm.set_readonly(false);
+        std::fs::set_permissions(&obj, perm).unwrap();
+        std::fs::remove_file(&obj).unwrap();
+        let loc = repo.loc();
+        assert!(CliGit.discard_file(&loc, "t.txt", false).is_err());
+        assert_eq!(
+            std::fs::read_to_string(repo.dir.join("t.txt")).unwrap(),
+            "precious\n"
+        );
+    }
+
+    #[test]
+    fn discard_file_removes_a_staged_new_file() {
+        let repo = TestRepo::new("discard-staged-new");
+        repo.commit_file("t.txt", "x\n", "base");
+        std::fs::write(repo.dir.join("n.txt"), "new\n").unwrap();
+        repo.out(&["add", "n.txt"]);
+        let loc = repo.loc();
+        CliGit.discard_file(&loc, "n.txt", false).unwrap();
+        assert!(!repo.dir.join("n.txt").exists());
+        assert!(CliGit.status(&loc).unwrap().is_empty());
+    }
+
+    #[test]
+    fn discard_file_treats_the_path_literally() {
+        let repo = TestRepo::new("discard-glob");
+        repo.commit_file("a.txt", "orig\n", "base");
+        std::fs::write(repo.dir.join("a.txt"), "edited\n").unwrap();
+        std::fs::write(repo.dir.join("*.txt"), "new\n").unwrap();
+        repo.out(&["add", "--", "*.txt"]);
+        let loc = repo.loc();
+        CliGit.discard_file(&loc, "*.txt", false).unwrap();
+        assert!(!repo.dir.join("*.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(repo.dir.join("a.txt")).unwrap(),
+            "edited\n",
+            "a glob must not discard other files"
+        );
+    }
+
+    #[test]
+    fn discard_untracked_file_treats_the_path_literally() {
+        let repo = TestRepo::new("discard-glob-untracked");
+        repo.commit_file("a.txt", "orig\n", "base");
+        std::fs::write(repo.dir.join("keep.txt"), "keep\n").unwrap();
+        std::fs::write(repo.dir.join("*.txt"), "new\n").unwrap();
+        let loc = repo.loc();
+        CliGit.discard_file(&loc, "*.txt", true).unwrap();
+        assert!(!repo.dir.join("*.txt").exists());
+        assert!(repo.dir.join("keep.txt").exists());
+    }
+
+    #[test]
+    fn discard_file_in_an_unborn_repo_removes_the_staged_file() {
+        let repo = TestRepo::new("discard-unborn");
+        std::fs::write(repo.dir.join("n.txt"), "new\n").unwrap();
+        repo.out(&["add", "n.txt"]);
+        let loc = repo.loc();
+        CliGit.discard_file(&loc, "n.txt", false).unwrap();
+        assert!(!repo.dir.join("n.txt").exists());
+    }
+
+    #[test]
+    fn discard_file_still_refuses_when_head_is_unreadable() {
+        let repo = TestRepo::new("discard-badhead");
+        repo.commit_file("t.txt", "x\n", "base");
+        std::fs::write(repo.dir.join("t.txt"), "precious\n").unwrap();
+        let loc = repo.loc();
+        std::fs::write(repo.dir.join(".git/HEAD"), "garbage\n").unwrap();
+        assert!(CliGit.discard_file(&loc, "t.txt", false).is_err());
+        assert_eq!(
+            std::fs::read_to_string(repo.dir.join("t.txt")).unwrap(),
+            "precious\n"
+        );
     }
 
     #[test]
