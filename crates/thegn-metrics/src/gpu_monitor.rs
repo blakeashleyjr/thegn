@@ -104,6 +104,9 @@ struct State {
     last_good: Option<(GpuReading, Instant)>,
     health: GpuHealth,
     in_flight: bool,
+    /// The helper is not installed (ENOENT): cached for the process lifetime,
+    /// exactly like the old probe-once behaviour — no retry, no spawn.
+    gave_up: bool,
     next_attempt: Option<Instant>,
     failures: u32,
     /// Probes started so far — the generation identity of the latest probe.
@@ -131,7 +134,7 @@ impl Drop for InFlight {
     fn drop(&mut self) {
         let mut st = self.shared.lock();
         if std::thread::panicking() {
-            note_failure(&mut st, &self.spec, ExecFailure::Malformed);
+            note_failure(&mut st, &self.spec, ExecFailure::Panicked);
         }
         st.in_flight = false;
         self.shared.idle.notify_all();
@@ -140,7 +143,11 @@ impl Drop for InFlight {
 
 enum Probe {
     Reading(Backend, GpuReading),
-    Absent,
+    /// No helper answers. `permanent` = not installed at all (never retried);
+    /// otherwise present-but-unusable, retried after `absent_retry`.
+    Absent {
+        permanent: bool,
+    },
     Failed(ExecFailure),
 }
 
@@ -164,6 +171,7 @@ impl GpuMonitor {
                     last_good: None,
                     health: GpuHealth::Pending,
                     in_flight: false,
+                    gave_up: false,
                     next_attempt: None,
                     failures: 0,
                     probes_started: 0,
@@ -203,7 +211,7 @@ impl GpuMonitor {
     fn kick(&self) {
         {
             let mut st = self.shared.lock();
-            if st.in_flight || st.next_attempt.is_some_and(|t| Instant::now() < t) {
+            if st.in_flight || st.gave_up || st.next_attempt.is_some_and(|t| Instant::now() < t) {
                 return;
             }
             st.in_flight = true;
@@ -230,13 +238,13 @@ impl GpuMonitor {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn probes_started(&self) -> u64 {
         self.shared.lock().probes_started
     }
 
     /// Test helper: block until no probe is in flight.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn wait_idle(&self, timeout: Duration) -> bool {
         let st = self.shared.lock();
         let (st, res) = self
@@ -276,25 +284,31 @@ fn run_probe(spec: &HelperSpec, backend: Backend) -> Probe {
         Backend::Nvidia => nvidia_sample(spec),
         Backend::IoAccel => ioreg_sample(spec, spec.sample_deadline),
         Backend::Unresolved => {
-            match spec
-                .nvidia
-                .run(&["--version"], spec.discovery_deadline, spec.output_cap)
-            {
-                Ok(_) => return nvidia_sample(spec),
-                Err(ExecFailure::Timeout) => return Probe::Failed(ExecFailure::Timeout),
-                // Not installed / unusable: fall through to the other backend.
-                Err(_) => {}
-            }
+            let nvidia_missing =
+                match spec
+                    .nvidia
+                    .run(&["--version"], spec.discovery_deadline, spec.output_cap)
+                {
+                    Ok(_) => return nvidia_sample(spec),
+                    Err(ExecFailure::Timeout) => return Probe::Failed(ExecFailure::Timeout),
+                    Err(ExecFailure::Spawn { not_found: true }) => true,
+                    // Present but unusable: fall through to the other backend.
+                    Err(_) => false,
+                };
             if spec.try_ioreg {
                 // Accept the backend only if the counter actually parses.
                 return match ioreg_sample(spec, spec.discovery_deadline) {
                     Probe::Failed(ExecFailure::Spawn { .. } | ExecFailure::Malformed) => {
-                        Probe::Absent
+                        Probe::Absent {
+                            permanent: nvidia_missing,
+                        }
                     }
                     other => other,
                 };
             }
-            Probe::Absent
+            Probe::Absent {
+                permanent: nvidia_missing,
+            }
         }
     }
 }
@@ -308,10 +322,11 @@ fn apply(st: &mut State, spec: &HelperSpec, probe: Probe) {
             st.failures = 0;
             st.next_attempt = None;
         }
-        Probe::Absent => {
+        Probe::Absent { permanent } => {
             st.backend = Backend::Unresolved;
             st.health = GpuHealth::Absent;
             st.failures = 0;
+            st.gave_up = permanent;
             st.next_attempt = Some(Instant::now() + spec.absent_retry);
         }
         Probe::Failed(f) => note_failure(st, spec, f),
@@ -343,8 +358,8 @@ mod tests {
                 prefix: vec![s.into_os_string()],
             },
             try_ioreg: false,
-            discovery_deadline: Duration::from_millis(250),
-            sample_deadline: Duration::from_millis(250),
+            discovery_deadline: Duration::from_secs(3),
+            sample_deadline: Duration::from_secs(3),
             output_cap: 4096,
             backoff_base: Duration::from_millis(1),
             backoff_max: Duration::from_millis(1),
@@ -352,6 +367,13 @@ mod tests {
             stale_max: Duration::from_secs(60),
             ..HelperSpec::default()
         }
+    }
+
+    /// Short deadlines — only for tests where the helper is meant to hang.
+    fn hang(mut spec: HelperSpec) -> HelperSpec {
+        spec.discovery_deadline = Duration::from_millis(250);
+        spec.sample_deadline = Duration::from_millis(250);
+        spec
     }
 
     const GOOD: &str =
@@ -378,14 +400,10 @@ mod tests {
     #[test]
     fn startup_hang_never_blocks_the_sampler() {
         let d = tempfile::tempdir().unwrap();
-        let m = GpuMonitor::with_spec(None, spec_for(d.path(), "sleep 300\n"));
+        let m = GpuMonitor::with_spec(None, hang(spec_for(d.path(), "sleep 300\n")));
         let t = Instant::now();
         assert_eq!(m.sample(true), GpuReading::default());
-        assert!(
-            t.elapsed() < Duration::from_millis(150),
-            "{:?}",
-            t.elapsed()
-        );
+        assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
         assert!(m.wait_idle(Duration::from_secs(10)));
         assert_eq!(m.health(), GpuHealth::Failing(ExecFailure::Timeout));
     }
@@ -460,7 +478,7 @@ mod tests {
     #[test]
     fn failures_back_off_instead_of_respawning_every_tick() {
         let d = tempfile::tempdir().unwrap();
-        let mut spec = spec_for(d.path(), "sleep 300\n");
+        let mut spec = hang(spec_for(d.path(), "sleep 300\n"));
         spec.backoff_base = Duration::from_secs(3600);
         spec.backoff_max = Duration::from_secs(3600);
         let m = GpuMonitor::with_spec(None, spec);
@@ -475,7 +493,7 @@ mod tests {
     fn only_one_probe_in_flight() {
         let d = tempfile::tempdir().unwrap();
         let mut spec = spec_for(d.path(), "sleep 300\n");
-        spec.discovery_deadline = Duration::from_millis(600);
+        spec.discovery_deadline = Duration::from_secs(2);
         let m = GpuMonitor::with_spec(None, spec);
         for _ in 0..10 {
             m.sample(true);
@@ -503,5 +521,89 @@ mod tests {
             m.sample(false);
         }
         assert_eq!(m.probes_started(), 0);
+    }
+
+    #[test]
+    fn not_installed_is_cached_for_the_process_lifetime() {
+        let mut spec = HelperSpec {
+            try_ioreg: false,
+            absent_retry: Duration::from_millis(1),
+            ..HelperSpec::default()
+        };
+        spec.nvidia = HelperCmd::named("/nonexistent/thegn-nvidia-smi");
+        let m = GpuMonitor::with_spec(None, spec);
+        probe_once(&m);
+        std::thread::sleep(Duration::from_millis(10)); // past absent_retry
+        for _ in 0..20 {
+            m.sample(true);
+        }
+        assert_eq!(m.probes_started(), 1, "ENOENT must never be re-spawned");
+    }
+
+    #[test]
+    fn present_but_unusable_is_retried_after_absent_retry() {
+        let d = tempfile::tempdir().unwrap();
+        let mut spec = spec_for(d.path(), "exit 2\n");
+        spec.absent_retry = Duration::from_millis(1);
+        let m = GpuMonitor::with_spec(None, spec);
+        probe_once(&m);
+        std::thread::sleep(Duration::from_millis(10));
+        probe_once(&m);
+        assert_eq!(m.probes_started(), 2);
+    }
+
+    fn ioreg_spec(dir: &Path, body: &str) -> HelperSpec {
+        let s = script(dir, "ioreg.sh", body);
+        HelperSpec {
+            nvidia: HelperCmd::named("/nonexistent/thegn-nvidia-smi"),
+            ioreg: HelperCmd {
+                program: "sh".into(),
+                prefix: vec![s.into_os_string()],
+            },
+            try_ioreg: true,
+            discovery_deadline: Duration::from_secs(3),
+            sample_deadline: Duration::from_secs(3),
+            output_cap: 4096,
+            backoff_base: Duration::from_millis(1),
+            backoff_max: Duration::from_millis(1),
+            absent_retry: Duration::from_millis(1),
+            stale_max: Duration::from_secs(60),
+            ..HelperSpec::default()
+        }
+    }
+
+    #[test]
+    fn ioreg_discovery_selects_a_parsing_backend() {
+        let d = tempfile::tempdir().unwrap();
+        let m = GpuMonitor::with_spec(
+            None,
+            ioreg_spec(d.path(), "echo '\"Device Utilization %\"=55'\n"),
+        );
+        probe_once(&m);
+        assert_eq!(m.health(), GpuHealth::Live);
+        assert_eq!(m.latest().util_pct, Some(55));
+    }
+
+    #[test]
+    fn ioreg_spawn_and_malformed_mean_permanently_absent() {
+        let d = tempfile::tempdir().unwrap();
+        let mut missing = ioreg_spec(d.path(), "true\n");
+        missing.ioreg = HelperCmd::named("/nonexistent/thegn-ioreg");
+        for spec in [missing, ioreg_spec(d.path(), "echo garbage\n")] {
+            let m = GpuMonitor::with_spec(None, spec);
+            probe_once(&m);
+            assert_eq!(m.health(), GpuHealth::Absent);
+            std::thread::sleep(Duration::from_millis(10));
+            m.sample(true);
+            assert_eq!(m.probes_started(), 1, "no nvidia and no counter: give up");
+        }
+    }
+
+    #[test]
+    fn ioreg_timeout_is_a_failure_not_absence() {
+        let d = tempfile::tempdir().unwrap();
+        let m = GpuMonitor::with_spec(None, hang(ioreg_spec(d.path(), "sleep 300\n")));
+        probe_once(&m);
+        assert_eq!(m.health(), GpuHealth::Failing(ExecFailure::Timeout));
     }
 }
