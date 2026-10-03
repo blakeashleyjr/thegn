@@ -4587,6 +4587,88 @@ fn a_replaced_sessions_exit_is_stale_even_when_the_worktree_has_a_live_row() {
 }
 
 #[test]
+fn daemon_sid_exit_falls_back_to_the_one_active_sessionless_row() {
+    use crate::issue::{AgentDispatchStatus as S, ExitAttribution, ExitStamp, NewDispatch};
+    let db = Db::open_memory().unwrap();
+    let id = db
+        .put_agent_dispatch(NewDispatch::new("linear:G-1", "/wt/g", "claude"))
+        .unwrap();
+    db.update_dispatch_status(id, S::Running).unwrap();
+    let ExitAttribution::Legacy(run) = db.dispatch_for_exit("/wt/g", Some("daemon-1")).unwrap()
+    else {
+        panic!("a sid miss with one session-less active row must be Legacy");
+    };
+    assert_eq!((run.id, run.session_id.as_str()), (id, ""));
+    assert_eq!(
+        db.stamp_dispatch_exit(&run, Some(0)).unwrap(),
+        ExitStamp::Stamped
+    );
+    // Two session-less active rows: Ambiguous.
+    let id2 = db
+        .put_agent_dispatch(NewDispatch::new("linear:G-2", "/wt/g", "claude"))
+        .unwrap();
+    db.update_dispatch_status(id2, S::Running).unwrap();
+    db.update_dispatch_status(id, S::Running).unwrap();
+    assert_eq!(
+        db.dispatch_for_exit("/wt/g", Some("daemon-1")).unwrap(),
+        ExitAttribution::Ambiguous
+    );
+}
+
+#[test]
+fn sid_miss_never_matches_a_replaced_or_terminal_row() {
+    use crate::issue::{AgentDispatchStatus as S, ExitAttribution, NewDispatch};
+    let db = Db::open_memory().unwrap();
+    // Replaced run: the row now carries a different non-null session.
+    let id = db
+        .put_agent_dispatch(NewDispatch {
+            session_id: Some("sess-old"),
+            ..NewDispatch::new("linear:H-1", "/wt/h", "claude")
+        })
+        .unwrap();
+    db.update_dispatch_status(id, S::Running).unwrap();
+    db.stamp_dispatch_run(id, "sess-new", "h.md").unwrap();
+    assert_eq!(
+        db.dispatch_for_exit("/wt/h", Some("sess-old")).unwrap(),
+        ExitAttribution::Stale
+    );
+    // Session-less TERMINAL row: not re-stamped.
+    let done = db
+        .put_agent_dispatch(NewDispatch::new("linear:H-2", "/wt/h2", "claude"))
+        .unwrap();
+    db.update_dispatch_status(done, S::Done).unwrap();
+    assert_eq!(
+        db.dispatch_for_exit("/wt/h2", Some("daemon-9")).unwrap(),
+        ExitAttribution::Stale
+    );
+}
+
+#[test]
+fn republishing_a_run_clears_the_previous_generations_exit_fact() {
+    use crate::issue::{AgentDispatchStatus as S, ExitStamp, NewDispatch};
+    let db = Db::open_memory().unwrap();
+    let id = db
+        .put_agent_dispatch(NewDispatch::new("linear:J-1", "/wt/j", "claude"))
+        .unwrap();
+    db.update_dispatch_status(id, S::Spawning).unwrap();
+    db.conn()
+        .execute(
+            "UPDATE agent_dispatches SET exit_code=1, exited_at_ms=5 WHERE id=?1",
+            [id],
+        )
+        .unwrap();
+    db.publish_dispatch_run(id, "sess-j", "j.md").unwrap();
+    let row = db.get_dispatch(id).unwrap().unwrap();
+    assert_eq!((row.exit_code, row.exited_at_ms), (None, None));
+    assert_eq!(stamp_current(&db, id, Some(0)), ExitStamp::Stamped);
+    // stamp_dispatch_run clears it too.
+    db.stamp_dispatch_run(id, "sess-j2", "j.md").unwrap();
+    let row = db.get_dispatch(id).unwrap().unwrap();
+    assert_eq!((row.exit_code, row.exited_at_ms), (None, None));
+    assert_eq!(stamp_current(&db, id, Some(2)), ExitStamp::Stamped);
+}
+
+#[test]
 fn worktrees_with_active_dispatch_lists_only_unclosed_work() {
     let db = Db::open_memory().unwrap();
     let open = db

@@ -231,6 +231,12 @@ pub trait NotificationStore {
     ///    retry replaces the session on the same row, so falling back to "the
     ///    newest row in this worktree" is how an old run's late exit used to
     ///    stamp the run that replaced it.
+    ///    **Exception:** a non-empty id that matches no row falls back to the
+    ///    identity-less rule restricted to ACTIVE rows with no recorded session
+    ///    for the worktree (UI tracker dispatch and `dispatch put` without
+    ///    `--session` run in daemon panes that report a daemon session id). One
+    ///    such row is `Legacy`, several `Ambiguous`, none `Stale`. A replaced
+    ///    run's row always carries a non-null session, so it never qualifies.
     /// 2. **Identity-less events** (the `D` key, a hand-run agent pane) resolve
     ///    by worktree only when exactly ONE active row exists
     ///    ([`Legacy`](crate::issue::ExitAttribution::Legacy)); several are
