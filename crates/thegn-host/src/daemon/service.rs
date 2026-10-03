@@ -2116,6 +2116,15 @@ impl ControlApi for DaemonService {
                 if let Some(id) = &issue {
                     let _ = db.link_issue(&wt_str, id); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                 }
+                // THE-723: soft-apply `default_folder`, same semantics as `wt new`.
+                if let Some(warning) = crate::cmd::wt::file_configured_default(
+                    db,
+                    cfg.default_folder.as_deref(),
+                    &root_s,
+                    &wt_str,
+                ) {
+                    tracing::warn!(target: "thegn::worktree_create", "{warning}");
+                }
                 if let Err(report) = crate::worktree_lifecycle::schedule_post_create(
                     &cfg,
                     &root,
