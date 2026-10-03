@@ -879,6 +879,7 @@ async fn gather_issue_facts(
     client: &ControlClient,
     stage: &thegn_core::config_pipeline::PipelineStage,
     issue_id: &str,
+    repo: Option<&str>,
 ) -> Result<IssueFacts> {
     let referenced = template_vars(&stage.prompt)
         .map_err(|e| anyhow::anyhow!("stage '{}' prompt template is invalid: {e}", stage.name))?;
@@ -886,7 +887,7 @@ async fn gather_issue_facts(
         .iter()
         .any(|v| referenced.iter().any(|r| r == v));
     Ok(if needs_tracker {
-        let detail = client.issue_get(issue_id, None).await?;
+        let detail = client.issue_get(issue_id, repo).await?;
         let issue = detail.issue;
         IssueFacts {
             number: pipeline_run::issue_key(issue_id),
@@ -944,7 +945,7 @@ async fn open_stage(cfg: &Config, client: &ControlClient, d: StageDispatch<'_>) 
     //    references one of them and the lookup fails, the tracker's own error
     //    propagates — a prompt with a silently empty issue body is how a
     //    worker ends up implementing nothing.
-    let facts = gather_issue_facts(client, stage, d.issue).await?;
+    let facts = gather_issue_facts(client, stage, d.issue, Some(&wt)).await?;
     // 5. A parent must exist — the same rule `dispatch put` enforces; restated
     //    here (rather than imported) so the two verbs stay uncoupled. The row
     //    is kept: its own `artifact_path` is `{parent_artifact}`'s default.
@@ -1435,7 +1436,7 @@ async fn resume_work(
     // 4. Gather everything that belongs to the source attempt before claiming
     //    the finisher: its artifact state and final screen are recovery
     //    context, never the new row's completion target.
-    let facts = gather_issue_facts(client, stage, &row.issue_id).await?;
+    let facts = gather_issue_facts(client, stage, &row.issue_id, Some(&wt)).await?;
     // 5. Finisher facts: the source row's artifact state (the same filesystem/git
     //    read the done gate applies), the worktree's git state, and the
     //    previous session's final screen.
