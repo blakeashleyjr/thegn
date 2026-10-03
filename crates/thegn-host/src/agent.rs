@@ -630,6 +630,8 @@ pub fn prepare_sandbox_env(
     // so the loop can try a stronger backend first, and surfaced as a halt below
     // only if none of them meets the floor.
     let mut floor_miss: Option<thegn_core::sandbox_floor::FloorMiss> = None;
+    // Same, for a sealed profile whose `$HOME` confidentiality no candidate met.
+    let mut home_miss: Option<String> = None;
     for candidate in sandbox_candidates(&sb) {
         // `resolve_placed_exact`, not `resolve_placed`: `sandbox_candidates` has
         // ALREADY expanded the chain into one explicit candidate per entry, so a
@@ -750,6 +752,16 @@ pub fn prepare_sandbox_env(
                     }
                 }
             }
+            // THE-215: a sealed launch must hide the host $HOME. Fail closed on a
+            // backend/config that would expose it — same doctrine as the floor.
+            if let Some(m) = thegn_core::sandbox_floor::home_gate(&spec) {
+                if explicit_choice {
+                    anyhow::bail!("{m} for {worktree}");
+                }
+                thegn_core::msg::warn(&format!("{m} for {worktree}; trying next backend"));
+                home_miss = Some(m);
+                continue;
+            }
             // Say which hardening knobs this runtime can't express, rather than
             // shipping a quietly weaker profile than the config asked for.
             let dropped = thegn_core::sandbox::unsupported_hardening(&spec);
@@ -823,11 +835,39 @@ pub fn prepare_sandbox_env(
     // A fail-closed isolation floor that NO reachable backend could meet: refuse
     // to launch rather than drop to the host (the VPN `on_error = "fail"`
     // doctrine). This fires for local and remote alike — nothing has spawned.
+    if let Some(m) = home_miss {
+        return Err(SandboxHalt {
+            env_name: env_name.clone(),
+            placement: placement_label.clone(),
+            reason: m,
+            ask,
+            dormant: None,
+        }
+        .into());
+    }
     if let Some(m) = floor_miss {
         return Err(SandboxHalt {
             env_name: env_name.clone(),
             placement: placement_label.clone(),
             reason: m.message(),
+            ask,
+            dormant: None,
+        }
+        .into());
+    }
+    // THE-215: a sealed profile never lands on the host. No spec, a `none`
+    // backend, or an unreachable runtime all end here — refuse, regardless of
+    // failover mode. (`sandbox.enabled = false` is the user's explicit choice and
+    // never enters the candidate walk; doctor says the profile is not enforced.)
+    if sb.enabled && hardening.hides_home() {
+        return Err(SandboxHalt {
+            env_name: env_name.clone(),
+            placement: placement_label.clone(),
+            reason: format!(
+                "profile `{}` requires a sandbox that hides $HOME, but no backend produced one \
+                 for {worktree}; refusing to open a host shell (see `thegn doctor`)",
+                hardening.as_str()
+            ),
             ask,
             dormant: None,
         }
@@ -3431,8 +3471,17 @@ pub fn launch_spec_full(
         // Profile credential firewall (H): mount the active profile's git/gh/gpg
         // config dirs path-preservingly so the container sees the profile
         // identity its rerooted GIT_CONFIG_GLOBAL/GH_CONFIG_DIR env points at.
-        // No-op on the default profile.
-        for (host, ro) in thegn_core::profile::sandbox_cred_mounts() {
+        // No-op on the default profile. SKIPPED for a sealed launch
+        // (`seal_home`): these are the profile's gh config and gnupg dirs, i.e.
+        // exactly the credentials the sealed `$HOME` exists to hide (THE-215).
+        // (The agent's own provider auth home, `provider_home_mounts` below, is
+        // intentionally mounted: the harness cannot run without its own login.)
+        let cred_mounts = if spec.seal_home.is_some() {
+            Vec::new()
+        } else {
+            thegn_core::profile::sandbox_cred_mounts()
+        };
+        for (host, ro) in cred_mounts {
             if !spec.mounts.iter().any(|m| m.dest == host) {
                 spec.mounts.push(sandbox::Mount {
                     dest: host.clone(),

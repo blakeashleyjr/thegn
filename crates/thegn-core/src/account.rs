@@ -120,14 +120,15 @@ pub fn provider_for(cfg: &Config, choice: &str) -> Option<&'static Provider> {
     infer_provider(&nc.command)
 }
 
+/// Root of every thegn-managed account dir (`$XDG_STATE_HOME/thegn/accounts`).
+pub fn managed_root() -> PathBuf {
+    util::xdg_state_home().join("thegn").join("accounts")
+}
+
 /// The managed credential-home dir for an account thegn owns
 /// (`$XDG_STATE_HOME/thegn/accounts/<provider>/<slug>/`).
 pub fn managed_dir(provider_id: &str, name: &str) -> PathBuf {
-    util::xdg_state_home()
-        .join("thegn")
-        .join("accounts")
-        .join(provider_id)
-        .join(util::slugify(name))
+    managed_root().join(provider_id).join(util::slugify(name))
 }
 
 /// One resolved account: where its creds live and whether it is logged in.

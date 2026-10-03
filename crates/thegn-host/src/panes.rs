@@ -160,7 +160,7 @@ pub(crate) fn terminal_launch_spec(
     let backend = sandbox_backend.trim();
     if connection.is_empty() && !backend.is_empty() && backend != "host" && backend != "none" {
         let wrapped = match sandbox_wrap_shell(cfg, backend, &argv) {
-            Err(error) => return Err(anyhow::Error::new(error).context("sandbox entry refused")),
+            Err(error) => return Err(error.context("sandbox entry refused")),
             Ok(Some(wrapped)) => wrapped,
             Ok(None) => {
                 return Ok(crate::agent::LaunchSpec {
@@ -190,6 +190,15 @@ pub(crate) fn terminal_launch_spec(
                 degraded: false,
                 remote: false,
             });
+        }
+        // THE-215: a sealed terminal that came back uncontained is refused, not
+        // downgraded to a labelled host shell.
+        if cfg.sandbox.profile.hides_home() {
+            anyhow::bail!(
+                "profile `{}` requires a sandbox that hides $HOME, but the launch degraded to \
+                 the host; refusing",
+                cfg.sandbox.profile.as_str()
+            );
         }
         // Containment was asked for and not delivered: fall through to the plain
         // host shell, labelled `host`, carrying the reason so the pane can say so.
@@ -254,15 +263,29 @@ fn sandbox_wrap_shell(
     cfg: &thegn_core::config::Config,
     backend: &str,
     shell_argv: &[String],
-) -> Result<Option<Vec<String>>, thegn_core::sandbox::VolumeAdmissionError> {
+) -> anyhow::Result<Option<Vec<String>>> {
     // Invalid configured sources remain a refusal even when HOME or the
     // requested backend is unavailable; neither may produce a host fallback.
     thegn_core::sandbox::admit_volume_sources(cfg.sandbox.volumes.keys().map(String::as_str))?;
+    // THE-215: a sealed profile never degrades to a host shell. Every
+    // "no sandbox" outcome below becomes a visible refusal instead.
+    let sealed = cfg.sandbox.profile.hides_home();
+    let refuse = |why: &str| -> anyhow::Result<Option<Vec<String>>> {
+        anyhow::bail!(
+            "profile `{}` requires a sandbox that hides $HOME, but {why}; refusing a host shell",
+            cfg.sandbox.profile.as_str()
+        )
+    };
     let Ok(be) = thegn_core::config::SandboxBackend::from_str_validated(backend) else {
-        return Ok(None);
+        return if sealed {
+            refuse("the requested backend is unknown")
+        } else {
+            Ok(None)
+        };
     };
     let home = match std::env::var("HOME").ok().filter(|h| !h.is_empty()) {
         Some(home) => home,
+        None if sealed => return refuse("$HOME is unset"),
         None => return Ok(None),
     };
     let mut sb = cfg.sandbox.clone();
@@ -277,12 +300,22 @@ fn sandbox_wrap_shell(
         sb.profile,
         thegn_core::placement::Placement::Local,
     ) else {
-        return Ok(None);
+        return if sealed {
+            refuse("no usable backend resolved")
+        } else {
+            Ok(None)
+        };
     };
     // Terminal-connection tabs are center panes routed through the pane daemon,
     // so a local bwrap terminal must drop `--die-with-parent` to survive UI
     // detach (see the daemon-persistent gate in `sandbox::enter_argv`).
     spec.daemon_persistent = crate::handlers::startup::daemon_active(cfg);
+    // THE-215: a sealed terminal must hide the host `$HOME`. This pane is
+    // anchored AT `$HOME`, so the worktree mount would bind it wholesale — the
+    // gate sees that (and any other exposure) and the launch is refused visibly.
+    if let Some(miss) = thegn_core::sandbox_floor::home_gate(&spec) {
+        anyhow::bail!("{miss}");
+    }
     // `enter_argv` execs `inner` as the pane's foreground program; the shell
     // argv (path + login flags) is the interactive shell that owns the pane.
     let inner = shell_words_join(shell_argv);
@@ -1430,6 +1463,9 @@ mod tests {
             .insert("/tmp/state".into(), "/mnt/state".into());
         let error = sandbox_wrap_shell(&cfg, "bwrap", &["/bin/sh".into()])
             .expect_err("invalid configured volume must refuse before resolution");
+        let error = error
+            .downcast_ref::<thegn_core::sandbox::VolumeAdmissionError>()
+            .expect("volume admission error");
         assert_eq!(error.name_len, "/tmp/state".len());
         assert!(!error.to_string().contains("/tmp/state"));
     }

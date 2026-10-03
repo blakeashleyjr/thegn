@@ -622,6 +622,13 @@ impl SandboxProfile {
     pub fn seals_agent_socket(self) -> bool {
         matches!(self, SandboxProfile::Sealed | SandboxProfile::SealedTunnel)
     }
+    /// Whether this profile hides the host `$HOME` (THE-215): sealed tiers get a
+    /// private tmpfs `$HOME` holding only an allowlist; `hardened` keeps the
+    /// read-only ambient view (integrity, not confidentiality); `open` is
+    /// writable. Confidentiality is a property of the sealed tiers alone.
+    pub fn hides_home(self) -> bool {
+        matches!(self, SandboxProfile::Sealed | SandboxProfile::SealedTunnel)
+    }
 }
 config_enum! {
     /// What to do when no sandbox backend is available.
