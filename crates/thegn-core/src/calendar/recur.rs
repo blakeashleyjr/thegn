@@ -69,6 +69,8 @@ pub struct ByDay {
 /// Every `BY*` part is stored even when the expander doesn't act on it, so a
 /// rule round-trips losslessly through the cache and the plugin wire rather
 /// than being silently simplified.
+/// Wire form is the RFC 5545 `RRULE` value string (`FREQ=WEEKLY;BYDAY=MO`),
+/// see the manual serde impls below.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RRule {
     pub freq: Freq,
@@ -131,6 +133,19 @@ impl std::fmt::Display for RecurError {
 /// The plugin wire format and the cache both carry `"FREQ=WEEKLY;BYDAY=MO"` —
 /// the spelling every calendar tool already speaks, and one a shell plugin can
 /// emit by hand. A JSON object with twelve `by_*` arrays would be neither.
+impl schemars::JsonSchema for RRule {
+    fn schema_name() -> String {
+        "RRule".to_string()
+    }
+    fn json_schema(generator: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
+        // Serialized as the RFC 5545 string, not as the struct's fields.
+        let mut schema = generator.subschema_for::<String>().into_object();
+        schema.metadata().description =
+            Some("RFC 5545 RRULE value, e.g. `FREQ=WEEKLY;BYDAY=MO`".to_string());
+        schemars::schema::Schema::Object(schema)
+    }
+}
+
 impl serde::Serialize for RRule {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         s.serialize_str(&self.to_rrule())
@@ -145,7 +160,9 @@ impl<'de> serde::Deserialize<'de> for RRule {
 }
 
 /// The full recurrence description attached to an event.
-#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
 #[serde(default)]
 pub struct Recurrence {
     pub rules: Vec<RRule>,
