@@ -225,6 +225,141 @@
       ],
       "type": "object"
     },
+    "Busy": {
+      "description": "Free/busy transparency.",
+      "enum": [
+        "busy",
+        "free"
+      ],
+      "type": "string"
+    },
+    "CalEvent": {
+      "description": "One calendar event, as cached and as sent over the plugin wire.\n\n**This struct is the plugin API.** Every field but the four essentials is `#[serde(default)]`, so a plugin emitting only `{uid, title, start, end}` works, and adding a field later breaks no existing plugin. Deliberately no `deny_unknown_fields` — unknown keys are ignored so a *newer* plugin can talk to an older thegn, and [`CalEvent::extra`] carries anything a provider wants to round-trip explicitly.",
+      "properties": {
+        "busy": {
+          "$ref": "#/definitions/Busy",
+          "default": "busy"
+        },
+        "calendar": {
+          "default": "",
+          "description": "Which calendar within the account (a CalDAV collection, an ICS `X-WR-CALNAME`), for display and filtering.",
+          "type": "string"
+        },
+        "category": {
+          "default": "",
+          "type": "string"
+        },
+        "color": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Hue"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "A *semantic* hue, never RGB — the host resolves it against the active theme, following the `StyleRole` precedent in [`crate::plugin_api`]."
+        },
+        "description": {
+          "default": "",
+          "type": "string"
+        },
+        "end": {
+          "$ref": "#/definitions/EventTime"
+        },
+        "etag": {
+          "default": "",
+          "description": "Provider validator for conditional fetches (an ICS `ETag`).",
+          "type": "string"
+        },
+        "extra": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {},
+          "description": "Provider passthrough. Explicit, so round-tripping unknown data is a deliberate act rather than an accident of the serde config.",
+          "type": "object"
+        },
+        "location": {
+          "default": "",
+          "type": "string"
+        },
+        "organizer": {
+          "default": "",
+          "type": "string"
+        },
+        "recurrence": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Recurrence"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The repeat rule, if any. Parsed in full — including `BY*` parts the expander may not act on — so a rule round-trips losslessly."
+        },
+        "reminders": {
+          "default": [],
+          "items": {
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "type": "array"
+        },
+        "source": {
+          "default": "",
+          "type": "string"
+        },
+        "start": {
+          "$ref": "#/definitions/EventTime"
+        },
+        "status": {
+          "$ref": "#/definitions/EventStatus",
+          "default": "confirmed"
+        },
+        "title": {
+          "type": "string"
+        },
+        "uid": {
+          "description": "The provider's native UID. Unique within a source, not globally.",
+          "type": "string"
+        },
+        "updated_at_ms": {
+          "default": 0,
+          "format": "int64",
+          "type": "integer"
+        },
+        "url": {
+          "default": "",
+          "type": "string"
+        }
+      },
+      "required": [
+        "end",
+        "start",
+        "title",
+        "uid"
+      ],
+      "type": "object"
+    },
+    "CalendarIngestBody": {
+      "description": "The ingest body: the same `CalEvent` shape a `command` plugin emits, so one contract serves both a polled plugin and a pushing daemon.",
+      "properties": {
+        "events": {
+          "items": {
+            "$ref": "#/definitions/CalEvent"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "events"
+      ],
+      "type": "object"
+    },
     "CalendarQuery": {
       "description": "`?from=2026-08-01&to=2026-08-31` — inclusive ISO dates.",
       "properties": {
@@ -486,6 +621,81 @@
       ],
       "type": "object"
     },
+    "EventStatus": {
+      "description": "RFC 5545 participation status, kept as data even though this pass never writes it back — dropping it would make the cache lossy.",
+      "enum": [
+        "confirmed",
+        "tentative",
+        "cancelled"
+      ],
+      "type": "string"
+    },
+    "EventTime": {
+      "description": "When an event happens.\n\nThree-valued deliberately — collapsing these into one timestamp is *the* classic calendar bug:\n\n- [`EventTime::Date`] is a floating calendar date with no time and no zone (an all-day event; \"Christmas\" is Dec 25 everywhere, not an instant). - [`EventTime::Zoned`] is a wall-clock time in a named zone. This is what recurring events store, so that a weekly 09:00 stays 09:00 across a DST boundary rather than drifting to 08:00 or 10:00. - [`EventTime::Instant`] is a fixed point on the timeline, for providers that hand back an absolute timestamp.",
+      "oneOf": [
+        {
+          "description": "`date` is an ISO 8601 calendar date (`2026-12-25`).",
+          "properties": {
+            "date": {
+              "type": "string"
+            },
+            "kind": {
+              "enum": [
+                "date"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "date",
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "`local` is an ISO 8601 date-time with no offset (`2026-12-25T09:00:00`).",
+          "properties": {
+            "kind": {
+              "enum": [
+                "zoned"
+              ],
+              "type": "string"
+            },
+            "local": {
+              "type": "string"
+            },
+            "zone": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "local",
+            "zone"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "`at` is an RFC 3339 timestamp (`2026-12-25T14:00:00Z`).",
+          "properties": {
+            "at": {
+              "type": "string"
+            },
+            "kind": {
+              "enum": [
+                "instant"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "at",
+            "kind"
+          ],
+          "type": "object"
+        }
+      ]
+    },
     "EventsQuery": {
       "description": "The broadcast event feed over WebSocket: one binary message per encoded [`EventFrame`]. Read scope.",
       "properties": {
@@ -639,6 +849,20 @@
         "path"
       ],
       "type": "object"
+    },
+    "Hue": {
+      "description": "The eight semantic hues, addressable by name. Chrome code uses these for status/identity coloring instead of hardcoding RGB.\n\nSerde'd as the lowercase name (`\"teal\"`), so a cached calendar event or a plugin payload names a *role* the active theme resolves — never an RGB value, which would ignore the user's palette and break light mode.",
+      "enum": [
+        "teal",
+        "magenta",
+        "purple",
+        "green",
+        "amber",
+        "red",
+        "blue",
+        "orange"
+      ],
+      "type": "string"
     },
     "InputBody": {
       "properties": {
@@ -1043,6 +1267,10 @@
       ],
       "type": "object"
     },
+    "RRule": {
+      "description": "RFC 5545 RRULE value, e.g. `FREQ=WEEKLY;BYDAY=MO`",
+      "type": "string"
+    },
     "RecordSpec": {
       "description": "The `sessions.record` request: what to do with a session's recording. The daemon owns the file, so a start returns the path but the caller never receives contents over the wire.",
       "oneOf": [
@@ -1130,6 +1358,35 @@
         "capped",
         "recording"
       ],
+      "type": "object"
+    },
+    "Recurrence": {
+      "description": "The full recurrence description attached to an event.",
+      "properties": {
+        "exdates": {
+          "default": [],
+          "description": "Dates to exclude. Matched on the *local* recurrence-id, per RFC 5545.",
+          "items": {
+            "$ref": "#/definitions/EventTime"
+          },
+          "type": "array"
+        },
+        "rdates": {
+          "default": [],
+          "description": "Extra dates to include beyond the rules.",
+          "items": {
+            "$ref": "#/definitions/EventTime"
+          },
+          "type": "array"
+        },
+        "rules": {
+          "default": [],
+          "items": {
+            "$ref": "#/definitions/RRule"
+          },
+          "type": "array"
+        }
+      },
       "type": "object"
     },
     "ResizeBody": {
@@ -2013,6 +2270,9 @@
     },
     "AutomationTestRequest": {
       "$ref": "#/definitions/AutomationTestRequest"
+    },
+    "CalendarIngestBody": {
+      "$ref": "#/definitions/CalendarIngestBody"
     },
     "CalendarQuery": {
       "$ref": "#/definitions/CalendarQuery"
