@@ -1825,3 +1825,68 @@ fn entrypoint_override_precedes_the_image_and_names_the_workload() {
         "sleep is the entrypoint, not also a trailing command: {argv:?}"
     );
 }
+
+#[test]
+fn sealed_container_reuse_requires_exact_mounts_and_a_matching_seal_label() {
+    let required: std::collections::HashSet<&str> = ["/wt", "/nix/store"].into_iter().collect();
+    // Probe format: RUNNING, seal label, then bind sources.
+    let exact = "RUNNING\n1\n/wt\n/nix/store\n";
+    assert_eq!(judge_inspect(exact, &required, true), (true, true));
+    // (a) a superset (a hardened container that also binds ~/.gnupg) is refused
+    // for a sealed spec, though it is fine for a non-sealed one.
+    let superset = "RUNNING\n1\n/wt\n/nix/store\n/home/u/.gnupg\n";
+    assert_eq!(judge_inspect(superset, &required, true), (true, false));
+    assert_eq!(
+        judge_inspect(
+            "RUNNING\n\n/wt\n/nix/store\n/home/u/.gnupg\n",
+            &required,
+            false
+        ),
+        (true, true)
+    );
+    // devenv's own `/nix` bind is not an extra.
+    assert_eq!(
+        judge_inspect("RUNNING\n1\n/wt\n/nix/store\n/nix\n", &required, true),
+        (true, true)
+    );
+    // (b) label mismatch forces recreate, both directions; a missing label on a
+    // sealed spec is a pre-label container and is recreated.
+    assert_eq!(
+        judge_inspect("RUNNING\n0\n/wt\n/nix/store\n", &required, true),
+        (true, false)
+    );
+    assert_eq!(
+        judge_inspect("RUNNING\n\n/wt\n/nix/store\n", &required, true),
+        (true, false)
+    );
+    assert_eq!(
+        judge_inspect("RUNNING\n1\n/wt\n/nix/store\n", &required, false),
+        (true, false)
+    );
+    assert_eq!(
+        judge_inspect("RUNNING\n0\n/wt\n/nix/store\n", &required, false),
+        (true, true)
+    );
+    assert_eq!(
+        judge_inspect("EXITED\n1\n/wt\n", &required, true),
+        (false, false)
+    );
+}
+
+#[test]
+fn oci_create_stamps_the_seal_label() {
+    let mut s = spec(Backend::Podman);
+    assert!(
+        oci_create_opts(&s)
+            .unwrap()
+            .join(" ")
+            .contains("--label thegn.seal_home=0")
+    );
+    s.seal_home = Some("/home/u".into());
+    assert!(
+        oci_create_opts(&s)
+            .unwrap()
+            .join(" ")
+            .contains("--label thegn.seal_home=1")
+    );
+}

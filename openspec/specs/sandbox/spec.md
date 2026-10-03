@@ -93,7 +93,10 @@ mount whose host path or destination lies inside the deny list SHALL be dropped
 regardless of who added it (`[sandbox] mounts` including the defaults, bound
 identities, profile credential mounts, agent provider homes, cache injectors),
 and a mount whose host path is or contains a protected path SHALL refuse the
-launch. The only exception is the managed per-account credential dir under
+launch. A sealed compose-backed spec SHALL be refused (compose volumes cannot be
+verified). A kept OCI container SHALL be reused for a sealed spec only when it
+carries `thegn.seal_home=1` and binds exactly the required mounts, and a
+non-sealed spec SHALL NOT reuse a sealed container. The only exception is the managed per-account credential dir under
 thegn's own state; the ambient `~/.claude` / `~/.codex` SHALL NOT be mounted.
 Dropped `[sandbox] mounts` entries SHALL be listed by `thegn doctor`.
 

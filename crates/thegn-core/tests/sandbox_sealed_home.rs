@@ -717,3 +717,28 @@ fn sealed_systemd_allowlist_survives_auto_caches_off() {
         spec.mounts
     );
 }
+
+#[test]
+fn sealed_launch_refuses_compose_backed_specs() {
+    let td = fixture();
+    let h = td.path();
+    let mut s = spec(Backend::Podman, h, vec![], true);
+    s.compose = Some("docker-compose.yml".to_string());
+    let err = enter_argv(&s, "true").unwrap_err();
+    assert!(err.to_string().contains("compose volumes"), "{err}");
+    // Non-sealed compose is unaffected by this gate.
+    s.seal_home = None;
+    assert!(enter_argv(&s, "true").is_ok());
+}
+
+#[test]
+fn a_legitimate_user_ro_mount_under_home_survives_the_sealed_filter() {
+    let td = fixture();
+    let h = td.path();
+    let data = tempfile::tempdir().unwrap(); // outside $HOME and the approved roots
+    let mut m = rw(&h.join("data"));
+    m.host = data.path().to_string_lossy().into_owned();
+    m.ro = true;
+    let j = bwrap_argv(h, vec![m]).unwrap();
+    assert!(j.contains(data.path().to_str().unwrap()), "{j}");
+}
