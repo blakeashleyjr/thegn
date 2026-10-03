@@ -2135,6 +2135,17 @@ impl ControlApi for DaemonService {
                     let _ = db.del_worktree(&wt_str);
                     anyhow::bail!("worktrees.create: {message}");
                 }
+                // THE-723: soft-apply `default_folder`, same semantics as `wt new`.
+                // Filed last, after post_create: a blocking hook rolls the worktree back
+                // and must not leave a folder/workspace row behind.
+                if let Some(warning) = crate::cmd::wt::file_configured_default(
+                    db,
+                    cfg.default_folder.as_deref(),
+                    &root_s,
+                    &wt_str,
+                ) {
+                    tracing::warn!(target: "thegn::worktree_create", "{warning}");
+                }
                 Ok(thegn_svc::control::WorktreeInfo {
                     path: wt_str,
                     branch,

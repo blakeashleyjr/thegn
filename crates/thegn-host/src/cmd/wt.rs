@@ -430,6 +430,24 @@ fn create_and_register(
     Ok((path_s, filing_error))
 }
 
+/// Soft-file a freshly registered worktree into the configured `default_folder`
+/// for the control-API / session-fork creation path (no explicit folder field
+/// there). A configured default never fails creation: any problem is returned
+/// as a warning string for the caller to log, and the worktree stays unfiled.
+/// Returns `None` when nothing was configured or filing succeeded.
+pub(crate) fn file_configured_default(
+    db: &Db,
+    configured: Option<&str>,
+    repo_path: &str,
+    worktree_path: &str,
+) -> Option<String> {
+    let (name, _) = effective_folder(None, configured)?;
+    let filed = file_registered_worktree(db, repo_path, worktree_path, name);
+    filed.err().map(|e| {
+        format!("default_folder {name:?} not applied to {worktree_path}: {e}; left unfiled")
+    })
+}
+
 /// Select the command-line folder when supplied, otherwise the configured
 /// default. Kept at the shared creation boundary so single and batched paths
 /// apply the same policy.
@@ -1808,6 +1826,37 @@ mod folder_tests {
         assert!(err.to_string().contains("was removed from thegn"));
         // Refusing must not have written anything.
         assert!(db.folders_for_workspace("/gone").unwrap().is_empty());
+    }
+
+    #[test]
+    fn configured_default_files_softly_for_control_creation() {
+        let db = db();
+        db.put_worktree("repo/feature", "/repo", "/repo/wt", "feature", None, None)
+            .unwrap();
+        assert!(super::file_configured_default(&db, None, "/repo", "/repo/wt").is_none());
+        assert_eq!(
+            db.worktree_record("/repo/wt").unwrap().unwrap().folder_id,
+            None
+        );
+        assert!(super::file_configured_default(&db, Some("Agents"), "/repo", "/repo/wt").is_none());
+        assert!(
+            db.worktree_record("/repo/wt")
+                .unwrap()
+                .unwrap()
+                .folder_id
+                .is_some()
+        );
+        // Tombstoned workspace and an invalid name: warning, never an error, unfiled.
+        db.put_worktree("gone/f", "/gone", "/gone/wt", "f", None, None)
+            .unwrap();
+        db.tombstone_workspace("/gone").unwrap();
+        let w = super::file_configured_default(&db, Some("Agents"), "/gone", "/gone/wt").unwrap();
+        assert!(w.contains("left unfiled"), "{w}");
+        assert_eq!(
+            db.worktree_record("/gone/wt").unwrap().unwrap().folder_id,
+            None
+        );
+        assert!(super::file_configured_default(&db, Some("  "), "/repo", "/repo/wt").is_some());
     }
 
     #[test]
