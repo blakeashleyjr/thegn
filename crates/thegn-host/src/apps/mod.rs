@@ -760,6 +760,31 @@ mod tests {
     }
 
     #[test]
+    fn reconcile_that_changes_active_is_followed_by_a_visibility_sync() {
+        let mut cfg = thegn_core::config::Config::default();
+        cfg.observe.enabled = true;
+        cfg.apps.default_tab = "work".into();
+        let mut host = AppHost::from_config(&cfg);
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        host.slots[0].state = SlotState::Running(Box::new(VisTile(log.clone())));
+        host.sync_visibility();
+        assert_eq!(*log.lock().unwrap(), vec![false]);
+
+        // A config reload moves the default to the (already running) tile.
+        cfg.apps.default_tab = "observe".into();
+        host.reconcile(&cfg);
+        assert_eq!(host.active, ActiveApp::Tile(0));
+        host.sync_visibility();
+        assert_eq!(*log.lock().unwrap(), vec![false, true]);
+
+        // And back: the tile is parked again.
+        cfg.apps.default_tab = "work".into();
+        host.reconcile(&cfg);
+        host.sync_visibility();
+        assert_eq!(*log.lock().unwrap(), vec![false, true, false]);
+    }
+
+    #[test]
     fn reload_can_enable_a_lazy_app_and_select_it_as_the_new_default() {
         let mut cfg = thegn_core::config::Config::default();
         let mut host = AppHost::from_config(&cfg);
