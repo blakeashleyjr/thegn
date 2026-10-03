@@ -228,6 +228,7 @@ impl SoundRuntime {
                     dropped_total = dropped,
                     "sound queue full — dropped an audio job"
                 );
+                self.request_fallback("sound queue full");
             }
             Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
                 self.request_fallback("notify-sound worker exited");
@@ -276,7 +277,7 @@ impl SoundRuntime {
                                 provider.play(&path, volume, &runtime.cancellation)
                             {
                                 tracing::debug!(target: "thegn::notify_sound", %error, "audio provider failed");
-                                runtime.request_fallback("audio provider failed");
+                                runtime.request_fallback_for(&error);
                             }
                         }
                         SoundJob::Command(command) => {
@@ -286,6 +287,7 @@ impl SoundRuntime {
                                     %error,
                                     "legacy sound command failed"
                                 );
+                                runtime.request_fallback_for(&error);
                             }
                         }
                     }
@@ -330,6 +332,14 @@ impl SoundRuntime {
     fn request_fallback(&self, reason: &str) {
         tracing::debug!(target: "thegn::notify_sound", reason, "falling back to terminal bell");
         request_fallback_raw(&self.fallback_bell, &self.waker, reason);
+    }
+
+    /// Latch the fallback for a failed helper, except a shutdown cancellation
+    /// (the app is exiting; no cue was lost to a fault).
+    fn request_fallback_for(&self, error: &crate::platform::sound::SoundError) {
+        if error_wants_fallback(error) {
+            self.request_fallback("sound helper failed or timed out");
+        }
     }
 
     pub(crate) fn take_fallback_bell(&self) -> bool {
@@ -380,6 +390,10 @@ fn join_bounded(name: &str, worker: Worker, deadline: std::time::Instant) {
     if worker.join.join().is_err() {
         tracing::error!(target: "thegn::notify_sound", worker = name, "sound worker panicked during shutdown");
     }
+}
+
+fn error_wants_fallback(error: &crate::platform::sound::SoundError) -> bool {
+    !matches!(error, crate::platform::sound::SoundError::Cancelled)
 }
 
 fn request_fallback_raw(flag: &AtomicBool, waker: &TerminalWaker, reason: &str) {
@@ -653,6 +667,53 @@ mod tests {
             pid_gone(pid),
             "helper {pid} still exists (running or zombie)"
         );
+    }
+
+    #[test]
+    fn every_helper_failure_kind_but_cancellation_wants_the_fallback() {
+        use crate::platform::sound::SoundError as E;
+        let io = || std::io::Error::other("x");
+        for e in [
+            E::Spawn(io()),
+            E::Failed,
+            E::Timeout,
+            E::Reap(io()),
+            E::DescendantsRemain,
+        ] {
+            assert!(error_wants_fallback(&e), "{e}");
+        }
+        assert!(!error_wants_fallback(&E::Cancelled));
+    }
+
+    #[test]
+    fn failed_command_latches_the_fallback_bell() {
+        if !UNIX {
+            return;
+        }
+        let (waker, _master, _terminal) = test_waker();
+        let runtime = SoundRuntime::with_builder(waker, Arc::new(|_, _| None));
+        assert!(!runtime.take_fallback_bell());
+        runtime.enqueue(&SoundEmit::Command("exit 7".into()));
+        wait_until("the fallback latch", || runtime.take_fallback_bell());
+        runtime.shutdown();
+    }
+
+    #[test]
+    fn full_queue_latches_the_fallback_bell_once() {
+        if !UNIX {
+            return;
+        }
+        let (waker, _master, _terminal) = test_waker();
+        let runtime = SoundRuntime::with_builder(waker, Arc::new(|_, _| None));
+        // Wedge the worker, then overfill the bounded queue.
+        for _ in 0..=(QUEUE_DEPTH + 2) {
+            runtime.enqueue(&SoundEmit::Command("sleep 30".into()));
+        }
+        assert!(runtime.dropped.load(Ordering::Relaxed) >= 1);
+        assert!(runtime.take_fallback_bell());
+        // Coalesced: one latch, consumed once.
+        assert!(!runtime.take_fallback_bell());
+        runtime.shutdown();
     }
 
     #[test]
