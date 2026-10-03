@@ -6254,11 +6254,11 @@ async fn event_loop<T: Terminal>(
         tokio_mpsc::unbounded_channel::<crate::handlers::switch_cache::PrefetchResult>();
     // The inline Files preview reader: `(rel_path, Ok(lines) | Err(reason))`.
     let (file_preview_tx, mut file_preview_rx) =
-        tokio_mpsc::unbounded_channel::<crate::preview_pane::TextMsg>();
+        tokio_mpsc::channel::<crate::preview_pane::TextMsg>(crate::preview_pane::RESULT_CAP);
     // The document-viewer graphics path: a rasterized preview image (image /
     // Mermaid / PDF page) drawn over the panel via kitty (`crate::preview_gfx`).
     let (preview_img_tx, mut preview_img_rx) =
-        tokio_mpsc::unbounded_channel::<crate::preview_pane::ImageMsg>();
+        tokio_mpsc::channel::<crate::preview_pane::ImageMsg>(crate::preview_pane::RESULT_CAP);
     let mut preview_gfx = crate::preview_gfx::PreviewGfx::new();
     // The git mutation runner + the line-cursor document fetches (staging
     // diff, drilled-commit files, patch doc). Results are tagged with
@@ -8515,6 +8515,7 @@ async fn event_loop<T: Terminal>(
             panel_ui.impact_open = false;
             // The preview is per-worktree (paths don't carry over).
             panel_ui.file_preview = None;
+            crate::preview_pane::cancel_fetches();
             panel_ui.hunks_gen = hydration_gen;
             // Git interaction state is per-worktree: cursors, flows, marks
             // and fetched docs all reset; `op_gen` bumps so in-flight op/doc
@@ -18449,6 +18450,7 @@ async fn event_loop<T: Terminal>(
                                 // esc or q closes (q for pager muscle memory).
                                 KeyCode::Escape | KeyCode::Char('q') => {
                                     panel_ui.file_preview = None;
+                                    crate::preview_pane::cancel_fetches();
                                 }
                                 KeyCode::Char('g') => fp.scroll = 0,
                                 KeyCode::Char('G') => fp.scroll = fp.max_scroll(viewport),
