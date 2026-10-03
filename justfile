@@ -838,6 +838,7 @@ sprites-live-recycle:
 smoke: build
     ./test/install-plan.sh
     ./test/dev-tui-plan.sh
+    ./test/instance-lifecycle.sh
     ./test/smoke.sh {{bin}}
     ./test/pty-smoke.sh {{bin}}
 
@@ -892,8 +893,7 @@ run *args: build
 # Build and run the native host locally in an isolated state root.
 start name="dev": build
     state="$HOME/.thegn-{{name}}/state"; run="$HOME/.thegn-{{name}}/run"; pidfile="$run/thegn.pid"; mkdir -p "$state" "$run"; \
-      if [ -s "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then kill "$(cat "$pidfile")" 2>/dev/null || true; fi; \
-      echo $$ > "$pidfile"; exec env \
+      . "$PWD/test/lib/instance.sh"; inst_restart "$pidfile" $$ || exit 1; exec env \
       "THEGN_ALACRITTY_CONFIG=$PWD/config/alacritty.toml" \
       "XDG_STATE_HOME=$state" \
       "XDG_RUNTIME_DIR=$run" \
@@ -930,8 +930,7 @@ install-clean-sweep:
 # via the runtime override — no separate binary needed. `just start-dev name=x`.
 start-dev name="dev": build
     state="$HOME/.thegn-{{name}}/state"; run="$HOME/.thegn-{{name}}/run"; pidfile="$run/thegn.pid"; mkdir -p "$state" "$run"; \
-      if [ -s "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then kill "$(cat "$pidfile")" 2>/dev/null || true; fi; \
-      echo $$ > "$pidfile"; exec env \
+      . "$PWD/test/lib/instance.sh"; inst_restart "$pidfile" $$ || exit 1; exec env \
       "THEGN_ALACRITTY_CONFIG=$PWD/config/alacritty.toml" \
       "XDG_STATE_HOME=$state" \
       "XDG_RUNTIME_DIR=$run" \
@@ -1031,8 +1030,7 @@ _apply-backend backend="":
 # ~5s after an agent finishes. Override the gate with `gate='just test'` etc.
 start-mq name="dev" gate="cargo build --workspace": build
     state="$HOME/.thegn-{{name}}/state"; run="$HOME/.thegn-{{name}}/run"; pidfile="$run/thegn.pid"; mkdir -p "$state" "$run"; \
-      if [ -s "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then kill "$(cat "$pidfile")" 2>/dev/null || true; fi; \
-      echo $$ > "$pidfile"; exec env \
+      . "$PWD/test/lib/instance.sh"; inst_restart "$pidfile" $$ || exit 1; exec env \
       "THEGN_ALACRITTY_CONFIG=$PWD/config/alacritty.toml" \
       "XDG_STATE_HOME=$state" \
       "XDG_RUNTIME_DIR=$run" \
@@ -1062,15 +1060,15 @@ start-mq name="dev" gate="cargo build --workspace": build
 start-term name="dev" backend="": build-profiling (_apply-backend backend)
     state="$HOME/.thegn-{{name}}/state"; run="$HOME/.thegn-{{name}}/run"; pidfile="$run/thegn.pid"; mkdir -p "$state" "$run"; \
       if [ -f "$PWD/.envrc.local" ]; then set -a; . "$PWD/.envrc.local"; set +a; fi; \
-      if [ -s "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then kill "$(cat "$pidfile")" 2>/dev/null || true; fi; \
+      . "$PWD/test/lib/instance.sh"; inst_restart "$pidfile" || exit 1; \
       echo "profiler: 'kill -USR2 \$(pgrep -n thegn)' to start sampling, again to dump → $state/thegn/profiles/"; \
       echo "logs: $state/thegn/logs/thegn.log (startup waterfall + frame/hydrate/perf)"; \
       echo "bridge: $([ -x "$PWD/target/debug/thegn-musl" ] && echo "present (reverse tunnel :8484 live)" || echo "MISSING — run 'just bridge'; the nix-cache :8484 tunnel is disabled")"; \
       {{ _detach }} \
       command -v ghostty >/dev/null 2>&1 || { echo "start-term needs 'ghostty' on PATH (this recipe launches a dedicated window; use 'just start' for the current terminal)" >&2; exit 1; }; \
       _detach ghostty --config-default-files=false --config-file="$PWD/config/ghostty.config" -e sh -lc \
-      'pidfile="$1"; shift; echo $$ > "$pidfile"; exec env "$@"' \
-      sh "$pidfile" \
+      'pidfile="$1"; lib="$2"; shift 2; . "$lib"; inst_write_meta "$pidfile" $$ || exit 1; exec env "$@"' \
+      sh "$pidfile" "$PWD/test/lib/instance.sh" \
       "XDG_STATE_HOME=$state" \
       "SPRITES_TOKEN=${SPRITES_TOKEN:-}" \
       "THEGN_LOG=info,thegn::frame=debug,thegn::hydrate=debug,thegn::perf=debug" \
@@ -1098,11 +1096,9 @@ start-term name="dev" backend="": build-profiling (_apply-backend backend)
 start-term-release name="dev" backend="": release-profiling (_apply-backend backend)
     state="$HOME/.thegn-{{name}}/state"; run="$HOME/.thegn-{{name}}/run"; pidfile="$run/thegn.pid"; logs="$state/thegn/logs"; mkdir -p "$state" "$run" "$logs"; \
       if [ -f "$PWD/.envrc.local" ]; then set -a; . "$PWD/.envrc.local"; set +a; fi; \
-      if [ -s "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then kill "$(cat "$pidfile")" 2>/dev/null || true; fi; \
+      . "$PWD/test/lib/instance.sh"; inst_restart "$pidfile" || exit 1; \
       : "ROTATE the release daemon + detached pane shells before relaunch — otherwise the persisted daemon reattaches OLD-binary pane sessions and a rebuild is never reflected (the 'restarted but still bwrap/sh-5.3' trap)."; \
-      pkill -f "release/thegn[ ]daemon" 2>/dev/null || true; \
-      pkill -f "dtach[ ]-A[ ][^ ]*/tg-socket-" 2>/dev/null || true; \
-      sleep 0.3; \
+      inst_rotate_scoped "$state"; \
       echo "profiler: 'kill -USR2 \$(pgrep -n thegn)' to start sampling, again to dump → $state/thegn/profiles/"; \
       echo "logs: $logs/thegn.log (full trace: startup/frame/hydrate/perf + every crate) + $logs/stderr.log (panic message + full backtrace)"; \
       echo "sprites token: $([ -n "${SPRITES_TOKEN:-}" ] && echo "loaded (len ${#SPRITES_TOKEN})" || echo "NOT set — sprites envs will halt; put SPRITES_TOKEN in .envrc.local")"; \
@@ -1110,8 +1106,8 @@ start-term-release name="dev" backend="": release-profiling (_apply-backend back
       {{ _detach }} \
       command -v ghostty >/dev/null 2>&1 || { echo "start-term-release needs 'ghostty' on PATH (this recipe launches a dedicated window; use 'just start' for the current terminal)" >&2; exit 1; }; \
       _detach ghostty --config-default-files=false --config-file="$PWD/config/ghostty.config" -e sh -lc \
-      'pidfile="$1"; errlog="$2"; shift 2; echo $$ > "$pidfile"; exec env "$@" 2>"$errlog"' \
-      sh "$pidfile" "$logs/stderr.log" \
+      'pidfile="$1"; errlog="$2"; lib="$3"; shift 3; . "$lib"; inst_write_meta "$pidfile" $$ || exit 1; exec env "$@" 2>"$errlog"' \
+      sh "$pidfile" "$logs/stderr.log" "$PWD/test/lib/instance.sh" \
       "XDG_STATE_HOME=$state" \
       "SPRITES_TOKEN=${SPRITES_TOKEN:-}" \
       "RUST_BACKTRACE=full" \
