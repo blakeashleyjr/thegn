@@ -1030,6 +1030,7 @@ fn sandbox_with_invalid_volume() -> thegn_core::sandbox::SandboxSpec {
         oci_host: None,
         oci_runtime: None,
         daemon_persistent: false,
+        seal_home: None,
     }
 }
 

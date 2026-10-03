@@ -9,7 +9,8 @@
 //! read-write carve-outs so shell/tool state keeps working.
 
 use crate::config::SandboxProfile;
-use crate::sandbox::Mount;
+use crate::sandbox::{Backend, BackendFamily, Mount, SandboxSpec};
+use std::path::{Path, PathBuf};
 
 /// Mounts that bring the host toolchain into an OCI container so the user's
 /// real shell, dotfiles, and tools work identically inside the sandbox.
@@ -30,6 +31,26 @@ pub fn host_toolchain_mounts() -> Vec<Mount> {
 }
 
 pub fn host_toolchain_mounts_ro_home(ro_home: bool) -> Vec<Mount> {
+    host_toolchain_mounts_for_home(Some(ro_home))
+}
+
+/// The host-toolchain substrate with a sealed (private) `$HOME`: everything
+/// [`host_toolchain_mounts_ro_home`] emits **except** the ambient `$HOME`, plus
+/// the reviewed [`sealed_home_allowlist`] entries. The caller pairs this with a
+/// tmpfs `$HOME` (bwrap `--tmpfs`, systemd `ProtectHome=tmpfs`; OCI never
+/// mounted it) so nothing outside the allowlist exists in the guest.
+pub fn host_toolchain_mounts_sealed_home() -> Vec<Mount> {
+    let mut mounts = host_toolchain_mounts_for_home(None);
+    let home = std::env::var("HOME").unwrap_or_default();
+    if !home.is_empty() {
+        mounts.extend(sealed_home_allowlist(Path::new(&home)));
+    }
+    mounts
+}
+
+/// `home_ro`: `Some(ro)` mounts the ambient `$HOME` (read-only or read-write);
+/// `None` withholds it entirely (sealed tiers).
+fn host_toolchain_mounts_for_home(home_ro: Option<bool>) -> Vec<Mount> {
     let mut mounts = Vec::new();
     let home = std::env::var("HOME").unwrap_or_default();
 
@@ -125,7 +146,10 @@ pub fn host_toolchain_mounts_ro_home(ro_home: bool) -> Vec<Mount> {
     //     `default_writable_carveouts()` (and by `[sandbox] mounts`).
     //   bwrap under `profile = "open"` — rw: the escape hatch, full host-parity
     //     writable $HOME.
-    if !home.is_empty() && exists(&home) {
+    if let Some(ro_home) = home_ro
+        && !home.is_empty()
+        && exists(&home)
+    {
         mounts.push(Mount {
             host: home.clone(),
             dest: home,
@@ -655,4 +679,194 @@ mod tests {
         };
         assert!(!keep_cfg_mount(existing, &ghost));
     }
+}
+
+/// How much of the host `$HOME` a resolved sandbox can see. Reported by
+/// `thegn doctor`; **confidentiality is its own property** — a read-only
+/// `$HOME` protects integrity only, every readable file is still exfiltratable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HomeView {
+    /// Host `$HOME` is not visible (private tmpfs / never mounted); only an
+    /// explicit allowlist is bound in.
+    Hidden,
+    /// The whole host `$HOME` is readable, not writable (`hardened`).
+    ReadOnly,
+    /// The whole host `$HOME` is readable and writable (`open`, host process).
+    Writable,
+}
+
+impl HomeView {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HomeView::Hidden => "hidden",
+            HomeView::ReadOnly => "read-only",
+            HomeView::Writable => "writable",
+        }
+    }
+}
+
+/// Backends that can hide `$HOME` for a sealed profile.
+fn family_can_hide_home(family: BackendFamily) -> bool {
+    matches!(
+        family,
+        BackendFamily::Oci | BackendFamily::Bwrap | BackendFamily::Systemd
+    )
+}
+
+/// What a *planned* launch under `profile` on `backend` shows of `$HOME` (doctor,
+/// before any spec exists). Mirrors [`home_view`], which answers for a real spec.
+pub fn planned_home_view(profile: SandboxProfile, backend: Backend) -> HomeView {
+    let family = backend.profile().family;
+    if profile.hides_home() && family_can_hide_home(family) {
+        return HomeView::Hidden;
+    }
+    match family {
+        BackendFamily::Oci | BackendFamily::Bwrap | BackendFamily::Systemd
+            if profile.read_only_root() =>
+        {
+            HomeView::ReadOnly
+        }
+        _ => HomeView::Writable,
+    }
+}
+
+/// What the resolved `spec` actually shows of `home` — derived from the mounts
+/// it will emit, not from the profile, so a stray `[sandbox] mounts = ["~"]` or
+/// `file_access = "all"` is reported as the exposure it is.
+pub fn home_view(spec: &SandboxSpec, home: &Path) -> HomeView {
+    let family = spec.backend.profile().family;
+    match family {
+        BackendFamily::Systemd => {
+            if spec.seal_home.is_some() {
+                HomeView::Hidden
+            } else if spec.read_only_root {
+                HomeView::ReadOnly
+            } else {
+                HomeView::Writable
+            }
+        }
+        BackendFamily::Oci | BackendFamily::Bwrap => {
+            if family == BackendFamily::Bwrap
+                && matches!(
+                    spec.file_access,
+                    crate::config::FileAccess::All | crate::config::FileAccess::Host
+                )
+            {
+                return HomeView::Writable;
+            }
+            // The tightest mount that is an ancestor-or-equal of `$HOME`.
+            let covering = spec
+                .mounts
+                .iter()
+                .filter(|m| home.starts_with(&m.dest))
+                .max_by_key(|m| m.dest.len());
+            match covering {
+                Some(m) if m.ro => HomeView::ReadOnly,
+                Some(_) => HomeView::Writable,
+                None => HomeView::Hidden,
+            }
+        }
+        _ => HomeView::Writable,
+    }
+}
+
+/// `$HOME`-relative paths that must never reach a sealed sandbox, directly or
+/// through a symlink. Matched against the *resolved* target.
+const SEALED_HOME_DENY: &[&str] = &[
+    ".ssh",
+    ".gnupg",
+    ".aws",
+    ".azure",
+    ".secrets",
+    ".password-store",
+    ".netrc",
+    ".docker",
+    ".kube",
+    ".config/gh",
+    ".config/gcloud",
+    ".config/doctl",
+    ".config/op",
+    ".config/sops",
+    ".config/age",
+    ".config/BraveSoftware",
+    ".config/google-chrome",
+    ".config/chromium",
+    ".mozilla",
+    ".local/share/keyrings",
+    ".local/share/atuin",
+    ".local/state/thegn",
+    ".local/share/thegn",
+    ".claude",
+    ".claude-profiles",
+    ".codex",
+    ".gemini",
+];
+
+/// Absolute roots that are secret by convention wherever they are linked from.
+const SEALED_ABS_DENY: &[&str] = &["/run/agenix", "/run/secrets", "/run/user", "/root"];
+
+/// Absolute roots a resolved allowlist target may live under besides `$HOME`
+/// itself (home-manager and similar link dotfiles into the Nix store).
+const SEALED_ABS_APPROVED: &[&str] = &["/nix/store", "/usr", "/etc"];
+
+/// Dotfiles/config a sealed pane keeps read-only so the user's real shell, git
+/// identity and prompt work. Reviewed list — adding a credential-bearing path
+/// here is a security change. Extend per-user via `[sandbox] mounts`.
+const SEALED_HOME_ALLOW: &[&str] = &[
+    ".gitconfig",
+    ".config/git",
+    ".zshenv",
+    ".zshrc",
+    ".zprofile",
+    ".zlogin",
+    ".zlogout",
+    ".config/zsh",
+    ".bashrc",
+    ".bash_profile",
+    ".profile",
+    ".inputrc",
+    ".config/starship.toml",
+    ".terminfo",
+];
+
+/// Whether the resolved `target` may be exposed in a sealed `$HOME`: under an
+/// approved non-secret root (the home itself minus the deny list, or the Nix
+/// store / `/usr` / `/etc`), not under a denied path, and not an *ancestor* of
+/// one (a link to `~/.config` would drag `~/.config/gh` in with it).
+fn sealed_target_ok(target: &Path, home: &Path) -> bool {
+    let denied: Vec<PathBuf> = SEALED_HOME_DENY
+        .iter()
+        .map(|d| home.join(d))
+        .chain(SEALED_ABS_DENY.iter().map(PathBuf::from))
+        .collect();
+    if denied
+        .iter()
+        .any(|d| target.starts_with(d) || d.starts_with(target))
+    {
+        return false;
+    }
+    target.starts_with(home) || SEALED_ABS_APPROVED.iter().any(|r| target.starts_with(r))
+}
+
+/// The read-only `$HOME` allowlist for a sealed sandbox, resolved against the
+/// real filesystem under `home`. Each entry is bound from its **canonical
+/// target** (so a dotfile symlink needs no in-guest link target) at its
+/// `$HOME`-relative destination; an entry that is missing, dangling, or whose
+/// target resolves into a denied/unapproved location is dropped silently.
+pub fn sealed_home_allowlist(home: &Path) -> Vec<Mount> {
+    let Ok(canon_home) = home.canonicalize() else {
+        return Vec::new();
+    };
+    SEALED_HOME_ALLOW
+        .iter()
+        .filter_map(|rel| {
+            let target = home.join(rel).canonicalize().ok()?;
+            sealed_target_ok(&target, &canon_home).then(|| Mount {
+                host: target.to_string_lossy().into_owned(),
+                dest: home.join(rel).to_string_lossy().into_owned(),
+                ro: true,
+                cache: false,
+            })
+        })
+        .collect()
 }

@@ -77,6 +77,27 @@ A sandboxed worktree process SHALL see the shared `<git-common>/config` mounted 
   shared config
 - **THEN** the write fails by design
 
+### Requirement: Sealed profiles hide the host HOME
+
+The `sealed` and `sealed-tunnel` profiles SHALL NOT expose the ambient host
+`$HOME` to the sandbox, even read-only: they SHALL present a private `$HOME`
+containing only a reviewed read-only allowlist of non-secret dotfiles (each
+resolved through symlinks and rejected if the target is a denied credential
+location or a parent of one), the worktree, and build caches. `hardened`
+(read-only `$HOME`) and `open` (writable) are integrity profiles and are
+unchanged. A sealed launch whose backend/config would leave `$HOME` visible
+SHALL be refused rather than run weaker.
+
+#### Scenario: Credentials are unreadable in a sealed bwrap sandbox
+
+- **WHEN** a sealed bwrap sandbox runs with canary files under `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.config/gh` and thegn state
+- **THEN** none are readable or copyable into the worktree, while the allowlisted `~/.gitconfig`, the worktree and git still work
+
+#### Scenario: A backend that cannot hide HOME is refused
+
+- **WHEN** a sealed profile resolves to the host process, a Windows backend, `file_access = "all"`, or a mount covering `$HOME`
+- **THEN** the launch fails closed and `thegn doctor` reports `home` as not hidden
+
 ### Requirement: Per-worktree tunnel via a sidecar leaves the host untouched
 
 A worktree MAY attach to its own overlay network through a per-worktree sidecar container whose network namespace the worktree joins (`--network container:<sidecar>`); thegn MUST NOT embed a tunnel datapath, and the host's networking (including any host `tailscaled`) MUST remain unchanged.
