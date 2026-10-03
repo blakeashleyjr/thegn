@@ -167,6 +167,9 @@ impl Db {
                      branch=?2, target_branch=?3, status='queued',
                      queued_at=?4, updated_at=?4,
                      result_oid=NULL, conflict_paths=NULL, error_detail=NULL,
+                     agent_attempts=CASE WHEN merge_queue.status IN
+                       ('queued','folding','verifying','agent_running')
+                     THEN merge_queue.agent_attempts ELSE 0 END,
                      location=?5"#,
                 params![worktree, branch, target_branch, now, location],
             )?;
