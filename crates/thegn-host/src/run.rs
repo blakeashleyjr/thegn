@@ -1178,6 +1178,9 @@ pub async fn main(
             "process sampler cleanup did not settle successfully"
         )))
     };
+    // Renderers run in their own process group, so nothing would signal them
+    // when we exit: kill and reap the preview tree before the process goes.
+    crate::preview_jobs::shutdown_global(std::time::Duration::from_millis(200));
     for (plugin, outcome) in &resident_report.outcomes {
         tracing::debug!(target: "thegn::plugin", plugin = %plugin, ?outcome, "resident lifecycle receipt; descendant containment remains unproven");
     }
@@ -2579,7 +2582,7 @@ fn open_panel_section(
     panel_ui.symbols_show_refs = false;
     panel_ui.chg_sel = None;
     panel_ui.impact_open = false;
-    panel_ui.file_preview = None;
+    crate::preview_pane::close_file_preview(panel_ui);
     panel_ui.scroll = 0;
     persist_panel_state(panel_ui);
     *hydration_gen += 1;
@@ -8514,8 +8517,7 @@ async fn event_loop<T: Terminal>(
             panel_ui.chg_sel = None;
             panel_ui.impact_open = false;
             // The preview is per-worktree (paths don't carry over).
-            panel_ui.file_preview = None;
-            crate::preview_pane::cancel_fetches();
+            crate::preview_pane::close_file_preview(&mut panel_ui);
             panel_ui.hunks_gen = hydration_gen;
             // Git interaction state is per-worktree: cursors, flows, marks
             // and fetched docs all reset; `op_gen` bumps so in-flight op/doc
@@ -18449,8 +18451,7 @@ async fn event_loop<T: Terminal>(
                             match k.key {
                                 // esc or q closes (q for pager muscle memory).
                                 KeyCode::Escape | KeyCode::Char('q') => {
-                                    panel_ui.file_preview = None;
-                                    crate::preview_pane::cancel_fetches();
+                                    crate::preview_pane::close_file_preview(&mut panel_ui);
                                 }
                                 KeyCode::Char('g') => fp.scroll = 0,
                                 KeyCode::Char('G') => fp.scroll = fp.max_scroll(viewport),

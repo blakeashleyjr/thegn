@@ -64,13 +64,18 @@ pub fn pdf_page1(path: &Path, cancel: &AtomicBool) -> Result<Raster, String> {
     decode_and_fit(&out)
 }
 
-/// Extract a PDF's text via `pdftotext` (the no-graphics fallback). `None` when
-/// the tool is absent, fails, times out or is cancelled. Blocking.
-pub fn pdf_text(path: &Path, cancel: &AtomicBool) -> Option<String> {
+/// Extract a PDF's text via `pdftotext` (the no-graphics fallback). Output cut
+/// at the byte cap is returned truncated (fine for text); `Err` carries a
+/// truthful reason (absent tool, failure, timeout, cancel). Blocking.
+pub fn pdf_text(path: &Path, cancel: &AtomicBool) -> Result<String, String> {
+    use crate::preview_jobs::CaptureError as C;
     let mut cmd = Command::new("pdftotext");
     cmd.arg(path).arg("-"); // text to stdout
-    let out = crate::preview_jobs::run_renderer(&mut cmd, cancel).ok()?;
-    Some(String::from_utf8_lossy(&out).into_owned())
+    match crate::preview_jobs::run_renderer(&mut cmd, cancel) {
+        Ok(out) | Err(C::Capped(out)) => Ok(String::from_utf8_lossy(&out).into_owned()),
+        Err(C::Spawn(_)) => Err("no text extractor available".to_string()),
+        Err(e) => Err(format!("text extraction {}", capture_err(&e))),
+    }
 }
 
 /// Render a Mermaid file via `mmdc` (mermaid-cli) → PNG → RGBA. Errs (→ source
@@ -103,6 +108,7 @@ fn capture_err(e: &crate::preview_jobs::CaptureError) -> String {
         C::Cancelled => "cancelled".to_string(),
         C::Timeout => "timed out".to_string(),
         C::Failed => "failed".to_string(),
+        C::Capped(_) => "output exceeded the size cap".to_string(),
     }
 }
 
