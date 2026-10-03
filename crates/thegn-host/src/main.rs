@@ -193,6 +193,7 @@ mod predict;
 mod preview;
 mod preview_fetch;
 mod preview_gfx;
+mod preview_jobs;
 mod preview_pane;
 mod preview_render;
 mod preview_watch;

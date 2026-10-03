@@ -757,6 +757,38 @@ pub fn spawn_grouped(cmd: &mut Command) -> std::io::Result<(std::process::Child,
     Ok((child, GroupHandle { pgid }))
 }
 
+/// [`spawn_grouped`] for a helper that must not outlive thegn: on Linux the
+/// child also asks the kernel to SIGKILL it when its parent dies
+/// (`PR_SET_PDEATHSIG`). A process group is not signalled when its parent
+/// exits, so without this a renderer would be orphaned by a crash or a
+/// shutdown that never reached the supervisor. The signal is keyed to the
+/// forking *thread*, so the caller must keep that thread alive until the child
+/// is reaped (the preview worker does). Elsewhere this is [`spawn_grouped`].
+pub fn spawn_grouped_die_with_parent(
+    cmd: &mut Command,
+) -> std::io::Result<(std::process::Child, GroupHandle)> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: the pre_exec closure only calls async-signal-safe prctl and
+        // getppid and allocates nothing.
+        unsafe {
+            let parent = libc::getpid();
+            cmd.pre_exec(move || {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                // The parent may have died before the prctl took effect.
+                if libc::getppid() != parent {
+                    libc::_exit(1);
+                }
+                Ok(())
+            });
+        }
+    }
+    spawn_grouped(cmd)
+}
+
 /// Gate-only spelling keeps this call site explicit about its containment
 /// requirement while reusing Unix's owned process-group setup.
 pub fn spawn_gate_grouped(
