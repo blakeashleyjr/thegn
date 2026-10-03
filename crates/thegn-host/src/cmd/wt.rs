@@ -442,8 +442,7 @@ pub(crate) fn file_configured_default(
     worktree_path: &str,
 ) -> Option<String> {
     let (name, _) = effective_folder(None, configured)?;
-    let filed = check_folder_fileable(db, repo_path, name)
-        .and_then(|n| file_registered_worktree(db, repo_path, worktree_path, &n));
+    let filed = file_registered_worktree(db, repo_path, worktree_path, name);
     filed.err().map(|e| {
         format!("default_folder {name:?} not applied to {worktree_path}: {e}; left unfiled")
     })
