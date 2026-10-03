@@ -4362,8 +4362,9 @@ fn handle_git_msg(
         GitMsg::OpenPrInBrowser => {
             match sel_branch(panel_ui, model).and_then(|b| b.pr.map(|p| p.url)) {
                 Some(url) => {
-                    open_url_detached(&url);
-                    model.status = "opened PR in the browser".into();
+                    model.status = crate::actions::open_status(open_url_detached(&url), || {
+                        "opened PR in the browser".into()
+                    });
                 }
                 None => model.status = "no PR for this branch".into(),
             }
@@ -12826,7 +12827,17 @@ async fn event_loop<T: Terminal>(
                                     format!("Forwarding port {container_port} → {}", started.url)
                                 };
                                 if current_config.forward.open_on_detect {
-                                    open_url_detached(&started.url);
+                                    // Forward surface: honours `[forward] browser`.
+                                    if let Err(e) = crate::actions::open_url_with(
+                                        &started.url,
+                                        &current_config.forward.browser,
+                                    ) {
+                                        tracing::warn!(
+                                            target: "thegn::actions",
+                                            "open_on_detect: {}",
+                                            e.label()
+                                        );
+                                    }
                                 }
                                 model.forwards =
                                     current_forward_views(&forward_supervisor, &session);
@@ -18923,9 +18934,10 @@ async fn event_loop<T: Terminal>(
                                             if let Some(row) = rows.get(panel_ui.cursor)
                                                 && !row.url.is_empty()
                                             {
-                                                open_url_detached(&row.url);
-                                                model.status =
-                                                    format!("Opened {} in browser", row.number);
+                                                model.status = crate::actions::open_status(
+                                                    open_url_detached(&row.url),
+                                                    || format!("Opened {} in browser", row.number),
+                                                );
                                             }
                                         }
                                         Section::Issues => {
@@ -19804,18 +19816,13 @@ async fn event_loop<T: Terminal>(
                             if let Some(url) =
                                 forward_url_at(&model, panel_ui.cursor).map(str::to_owned)
                             {
-                                let cmd = current_config.forward.browser.trim();
-                                if cmd.is_empty() {
-                                    open_url_detached(&url);
-                                } else {
-                                    let mut c = std::process::Command::new(cmd);
-                                    c.arg(&url)
-                                        .stdin(std::process::Stdio::null())
-                                        .stdout(std::process::Stdio::null())
-                                        .stderr(std::process::Stdio::null());
-                                    crate::actions::spawn_detached_reaped(c);
-                                }
-                                model.status = format!("Opened {url} in browser");
+                                model.status = crate::actions::open_status(
+                                    crate::actions::open_url_with(
+                                        &url,
+                                        &current_config.forward.browser,
+                                    ),
+                                    || format!("Opened {url} in browser"),
+                                );
                             } else {
                                 model.status = "No preview selected".into();
                             }
@@ -19829,8 +19836,10 @@ async fn event_loop<T: Terminal>(
                                 .and_then(|s| s.url.clone())
                             {
                                 Some(url) => {
-                                    open_url_detached(&url);
-                                    model.status = format!("Opened {url} in browser");
+                                    model.status = crate::actions::open_status(
+                                        open_url_detached(&url),
+                                        || format!("Opened {url} in browser"),
+                                    );
                                 }
                                 None => model.status = "No share URL to open".into(),
                             }
@@ -19867,8 +19876,10 @@ async fn event_loop<T: Terminal>(
                             if let Some(row) = rows.get(panel_ui.cursor)
                                 && !row.url.is_empty()
                             {
-                                open_url_detached(&row.url);
-                                model.status = format!("Opened {} in browser", row.number);
+                                model.status = crate::actions::open_status(
+                                    open_url_detached(&row.url),
+                                    || format!("Opened {} in browser", row.number),
+                                );
                             }
                             true
                         }
