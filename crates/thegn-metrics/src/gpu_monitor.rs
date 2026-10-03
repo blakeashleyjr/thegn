@@ -568,7 +568,6 @@ mod tests {
             backoff_max: Duration::from_millis(1),
             absent_retry: Duration::from_millis(1),
             stale_max: Duration::from_secs(60),
-            ..HelperSpec::default()
         }
     }
 
