@@ -566,10 +566,15 @@ impl Session {
     pub fn write_layout(db: &Db, snap: &LayoutSnapshot) -> Result<()> {
         db.transaction(|db| {
             db.clear_session_layout(&snap.session)?;
-            for row in &snap.groups {
+            // Evaluated after the clear has taken the write lock: a cleanup
+            // that removed a worktree has already published its tombstone, so
+            // a stale snapshot cannot re-create the deleted rows (THE-689).
+            let (groups, tabs) =
+                crate::worktree_lifecycle::drop_removed_worktrees(&snap.groups, &snap.tabs);
+            for row in &groups {
                 db.put_tab_group(&snap.session, row)?;
             }
-            for row in &snap.tabs {
+            for row in &tabs {
                 db.put_group_tab(&snap.session, row)?;
             }
             if let Some(active) = &snap.active {

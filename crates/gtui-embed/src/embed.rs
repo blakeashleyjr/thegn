@@ -143,6 +143,13 @@ impl AppTile for ObserveTile {
         }
     }
 
+    fn on_visible(&mut self, visible: bool) {
+        self.app.set_visible(visible);
+        if visible {
+            self.needs_redraw = true;
+        }
+    }
+
     fn wants_redraw(&self) -> bool {
         self.needs_redraw
     }

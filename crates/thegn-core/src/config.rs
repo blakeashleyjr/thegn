@@ -622,6 +622,13 @@ impl SandboxProfile {
     pub fn seals_agent_socket(self) -> bool {
         matches!(self, SandboxProfile::Sealed | SandboxProfile::SealedTunnel)
     }
+    /// Whether this profile hides the host `$HOME` (THE-215): sealed tiers get a
+    /// private tmpfs `$HOME` holding only an allowlist; `hardened` keeps the
+    /// read-only ambient view (integrity, not confidentiality); `open` is
+    /// writable. Confidentiality is a property of the sealed tiers alone.
+    pub fn hides_home(self) -> bool {
+        matches!(self, SandboxProfile::Sealed | SandboxProfile::SealedTunnel)
+    }
 }
 config_enum! {
     /// What to do when no sandbox backend is available.
@@ -890,7 +897,7 @@ pub struct MergeQueueConfig {
     pub auto_land: bool,
     /// Agent-dispatch → re-fold cycles per branch before it's `needs_human`.
     pub agent_max_attempts: u32,
-    /// Watchdog (seconds) for one agent invocation. 0 disables it.
+    /// Watchdog (seconds) for one agent invocation. 0 means the 6-hour ceiling, not unbounded; values over 30 days clamp to 30 days. After the agent process exits, its leftover group members get 15 s before being terminated.
     #[schemars(range(max = "crate::time_policy::MAX_DURATION_SECS"))]
     pub agent_timeout_secs: u64,
     /// Opt in to running the fixing agent INSIDE the resolved sandbox (the
@@ -4051,8 +4058,11 @@ pub struct ForwardConfig {
     /// newly-bound listening ports).
     #[schemars(range(max = "crate::time_policy::MAX_CADENCE_SECS"))]
     pub poll_secs: u64,
-    /// Browser command for the "open in browser" action. Empty ⇒ `$BROWSER`,
-    /// then `xdg-open`/`open`.
+    /// Browser command for the "open in browser" action and `open_on_detect`:
+    /// an argv template with quoted args and a `%s` placeholder (the URL is
+    /// appended if absent); no shell. An explicit value is final (no fallback).
+    /// Empty ⇒ `$BROWSER` (a ':'-separated fallback list), then the OS opener
+    /// (`xdg-open`/`open`/`rundll32`). Only http/https URLs are opened.
     pub browser: String,
     /// Open the browser automatically when a new forward comes up.
     pub open_on_detect: bool,
@@ -6896,7 +6906,8 @@ impl Config {
             && let Some(overlay) = load_repo_overlay(root)
             && !overlay.issues.is_empty()
         {
-            overlay.issues.apply(&mut issues);
+            let refused = overlay.issues.apply(&mut issues);
+            crate::config_issues::warn_refusals_once(root, &refused);
         }
         issues
     }

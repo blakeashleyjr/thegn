@@ -252,8 +252,15 @@ TRACE_UI_PIDFILE="$PERF_TMP/ui.strace.pid"
 # past the cap is used as-is. Ignoring SETTLE_MS here made any --settle-ms above
 # ~20 s exit thegn mid-measurement.
 SETTLE_MAX_MS=$((SETTLE_MS > 20000 ? SETTLE_MS : 20000))
-RUN_MS=$((SETTLE_MAX_MS + WINDOW_MS + 1500)) # generous tail past the sample window
-DEADLINE_S=$(((RUN_MS / 1000) + 10))         # hard safety net
+# THEGN_BENCH_RUN_MS counts from thegn's OWN start, but the harness's clock also
+# carries launch/attach lag, the adaptive settle's whole-second overshoot past the
+# cap (it exits at 20.5 s, not 20 s), and per-sample overhead under load. The old
+# 1.5 s tail was smaller than that, so thegn self-exited a little before the
+# window ended ("thegn exited before the spawn-rate idle window ended") and every
+# number from that run under-measured. The harness SIGTERMs thegn when done, so a
+# long tail costs nothing; 30 s covers any observed lag with room to spare.
+RUN_MS=$((SETTLE_MAX_MS + 1000 + WINDOW_MS + 30000))
+DEADLINE_S=$(((RUN_MS / 1000) + 10)) # hard safety net
 
 # Launch thegn under a PTY (termwiz refuses to start without one); the inner
 # shell backgrounds thegn and records its PID so the sampler can find it.
@@ -381,8 +388,14 @@ proc_jiffies() { # $1 = pid -> utime+stime
 proc_running() { # true only for a live, non-zombie process
   local state
   kill -0 "$1" 2>/dev/null || return 1
-  state="$(awk '{ s=$0; sub(/^.*\) /,"",s); split(s,a," "); print a[1] }' "/proc/$1/stat" 2>/dev/null || true)"
-  [ -n "$state" ] && [ "$state" != Z ]
+  if [ -r "/proc/$1/stat" ]; then
+    state="$(awk '{ s=$0; sub(/^.*\) /,"",s); split(s,a," "); print a[1] }' "/proc/$1/stat" 2>/dev/null || true)"
+    [ -n "$state" ] && [ "$state" != Z ]
+  else
+    # No /proc (macOS): ask ps, and reject a zombie (state starts with Z).
+    state="$(ps -o stat= -p "$1" 2>/dev/null | tr -d ' ' || true)"
+    [ -n "$state" ] && [ "${state#Z}" = "$state" ]
+  fi
 }
 
 # --- resource accumulation --------------------------------------------------
@@ -570,6 +583,13 @@ if [ "$SAMPLER" = proc ]; then
     SPAWN_START_EPOCH="$(date +%s.%N)"
   fi
   sleep "$WINDOW_S"
+  # A process that died inside the window measured nothing: its counters read
+  # back as zero/negative and would pass every ceiling. Fail every scenario, not
+  # only the spawn-rate one.
+  if ! proc_running "$PID"; then
+    echo 'FAIL: thegn exited before the sample window ended — the numbers below are not a measurement' >&2
+    SPAWN_FAIL=1
+  fi
   if [ "$SPAWN_ENABLED" = 1 ]; then
     SPAWN_END_EPOCH="$(date +%s.%N)"
     if ! proc_running "$PID"; then
@@ -650,10 +670,20 @@ else
     -pid "$PID" -stats cpu 2>/dev/null |
     awk '/^%CPU/ { seen = 1; next } seen && NF { last = $1 } END { print last }')"
   [ -n "$PCT" ] || PCT=0
+  # Same rule as the /proc path: a process that died inside the window measured
+  # nothing (top prints a stale/zero sample), so fail rather than report it.
+  if ! proc_running "$PID"; then
+    echo 'FAIL: thegn exited before the sample window ended — the numbers below are not a measurement' >&2
+    SPAWN_FAIL=1
+  fi
   CORES_TOTAL="$(awk "BEGIN{printf \"%.4f\", $PCT/100}")"
 fi
 
-# Let thegn exit on its own (bench window), then reap the launcher.
+# Every measurement is taken. Stop thegn now instead of waiting out the bench
+# window's (deliberately generous) tail, then reap the launcher.
+if [ "$SAMPLER" = proc ] && [ -n "${PID:-}" ]; then
+  kill "$PID" 2>/dev/null || true
+fi
 wait "$LAUNCHER" 2>/dev/null || true
 # Stop the daemon this run started. It lives in an isolated state dir, so a
 # leaked one would not corrupt anything — but it WOULD sit on a socket under a
@@ -667,6 +697,20 @@ if [ "$SPAWN_ENABLED" = 1 ] && [ "$SAMPLER" = proc ]; then
   TRACE_FILES=("$TRACE_UI_FILE")
   if [ "$SCENARIO" = soak-daemon ]; then
     TRACE_FILES+=("$TRACE_DAEMON_FILE")
+  fi
+  # Opt-in forensics (default behaviour unchanged): TG_PERF_KEEP_TRACE=1 keeps the
+  # raw strace files, the window epochs, a full-argv grouping (complete argv,
+  # fixture paths normalised, parent process per group) and the isolated state
+  # dir (DB + config) in TG_PERF_KEEP_DIR (default $TMPDIR/thegn-perf-trace).
+  if [ "${TG_PERF_KEEP_TRACE:-}" = 1 ]; then
+    KEEP_DIR="${TG_PERF_KEEP_DIR:-${TMPDIR:-/tmp}/thegn-perf-trace}"
+    mkdir -p "$KEEP_DIR"
+    cp "${TRACE_FILES[@]}" "$KEEP_DIR/"
+    printf '{"start":%s,"end":%s}\n' "$SPAWN_START_EPOCH" "$SPAWN_END_EPOCH" >"$KEEP_DIR/window.json"
+    python3 "$HERE/lib/spawn-trace.py" --full-argv --pane-shell "$PERF_PANE_SHELL" "$SPAWN_START_EPOCH" "$SPAWN_END_EPOCH" "${TRACE_FILES[@]}" >"$KEEP_DIR/full-argv.json" 2>"$KEEP_DIR/full-argv.err" || true # best-effort: forensics only
+    cp -r "$XDG_STATE_HOME" "$KEEP_DIR/state" 2>/dev/null || true                                                                                                                                              # best-effort: forensics only
+    cp -r "$XDG_CONFIG_HOME" "$KEEP_DIR/config" 2>/dev/null || true                                                                                                                                            # best-effort: forensics only
+    echo "kept spawn trace + full-argv grouping in $KEEP_DIR" >&2
   fi
   if SPAWN_RESULT="$(python3 "$HERE/lib/spawn-trace.py" --pane-shell "$PERF_PANE_SHELL" "$SPAWN_START_EPOCH" "$SPAWN_END_EPOCH" "${TRACE_FILES[@]}" 2>"$PERF_TMP/spawn-trace.err")"; then
     SPAWN_JSON="${SPAWN_RESULT%\}} ,\"roots\":${#TRACE_FILES[@]}}"

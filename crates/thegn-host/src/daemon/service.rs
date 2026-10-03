@@ -2135,6 +2135,17 @@ impl ControlApi for DaemonService {
                     let _ = db.del_worktree(&wt_str);
                     anyhow::bail!("worktrees.create: {message}");
                 }
+                // THE-723: soft-apply `default_folder`, same semantics as `wt new`.
+                // Filed last, after post_create: a blocking hook rolls the worktree back
+                // and must not leave a folder/workspace row behind.
+                if let Some(warning) = crate::cmd::wt::file_configured_default(
+                    db,
+                    cfg.default_folder.as_deref(),
+                    &root_s,
+                    &wt_str,
+                ) {
+                    tracing::warn!(target: "thegn::worktree_create", "{warning}");
+                }
                 Ok(thegn_svc::control::WorktreeInfo {
                     path: wt_str,
                     branch,
@@ -4273,11 +4284,14 @@ mod tests {
 
         // Model the adopted-pane observer seeing the same event after the
         // daemon observer. The first observation is the durable exit fact.
-        svc.db
-            .lock()
-            .unwrap()
-            .stamp_dispatch_exit(row_id, Some(9))
-            .unwrap();
+        {
+            let db = svc.db.lock().unwrap();
+            let run = db.dispatch_run_ref(row_id).unwrap().unwrap();
+            assert_eq!(
+                db.stamp_dispatch_exit(&run, Some(9)).unwrap(),
+                thegn_core::issue::ExitStamp::AlreadyStamped
+            );
+        }
         let repeated = svc
             .db
             .lock()

@@ -10,10 +10,16 @@ start_plan="$(just --dry-run start-term dev 2>&1)"
   echo "$start_plan" >&2
   exit 1
 }
-# shellcheck disable=SC2016 # the single quotes match a LITERAL `$(cat …)` in the plan
-[[ $start_plan == *'thegn.pid'* && $start_plan == *'kill "$(cat "$pidfile")"'* ]] || {
-  echo "start-term should stop the prior named thegn before relaunching" >&2
+# Ownership, not raw text: the plan must go through the generation-checked
+# lifecycle helper and never signal a pid read straight from the pid file.
+[[ $start_plan == *'thegn.pid'* && $start_plan == *'inst_restart'* && $start_plan == *'test/lib/instance.sh'* ]] || {
+  echo "start-term should stop the prior named thegn via the identity-checked helper" >&2
   echo "$start_plan" >&2
+  exit 1
+}
+# shellcheck disable=SC2016 # literal match of the forbidden shell text
+[[ $start_plan != *'kill "$(cat'* && $start_plan != *'pkill'* ]] || {
+  echo "launch plans must not kill a raw pid-file integer or pkill -f" >&2
   exit 1
 }
 [[ $start_plan != *$'\nsetsid -f'* ]] || {
@@ -37,10 +43,34 @@ start_plan="$(just --dry-run start-term dev 2>&1)"
 }
 
 inline_plan="$(just --dry-run start term 2>&1)"
-# shellcheck disable=SC2016 # the single quotes match a LITERAL `$(cat …)` in the plan
-[[ $inline_plan == *'thegn.pid'* && $inline_plan == *'kill "$(cat "$pidfile")"'* && $inline_plan == *'exec env'* ]] || {
-  echo "start name should also restart the prior named thegn before execing inline" >&2
+# shellcheck disable=SC2016 # literal match
+[[ $inline_plan == *'thegn.pid'* && $inline_plan == *'inst_restart "$pidfile" $$'* && $inline_plan == *'exec env'* ]] || {
+  echo "start name should restart the prior named thegn (identity-checked) before execing inline" >&2
   echo "$inline_plan" >&2
+  exit 1
+}
+# shellcheck disable=SC2016 # literal match
+[[ $start_plan == *'inst_record "$pidfile"'* ]] || {
+  echo "start-term's ghostty child must record its generation via inst_record" >&2
+  exit 1
+}
+for recipe in start-dev start-mq; do
+  r_plan="$(just --dry-run "$recipe" dev 2>&1)"
+  # shellcheck disable=SC2016 # literal match
+  [[ $r_plan == *'inst_restart "$pidfile" $$'* && $r_plan != *'kill "$(cat'* && $r_plan != *pkill* ]] || {
+    echo "$recipe must restart via the identity-checked helper" >&2
+    exit 1
+  }
+done
+release_plan="$(just --dry-run start-term-release dev 2>&1)"
+# shellcheck disable=SC2016 # literal match
+[[ $release_plan == *'inst_record "$pidfile"'* ]] || {
+  echo "start-term-release's ghostty child must record its generation via inst_record" >&2
+  exit 1
+}
+# shellcheck disable=SC2016 # literal match of the forbidden shell text
+[[ $release_plan != *pkill* && $release_plan == *'inst_rotate_scoped "$state"'* ]] || {
+  echo "start-term-release must rotate daemons scoped to its state root, not pkill -f" >&2
   exit 1
 }
 

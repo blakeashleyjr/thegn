@@ -80,6 +80,28 @@ pub fn expand_tilde(p: &str) -> String {
     }
 }
 
+/// `(inode, ctime in ns)` of a stat result: the part of a change fingerprint that
+/// survives a same-size, same-mtime rewrite (an atomic rename-over gets a new
+/// inode; an in-place edit moves ctime even when mtime was reset). `(0, 0)` where
+/// the platform has no such notion, which only weakens a stamp to mtime+len.
+pub fn meta_identity(meta: &std::fs::Metadata) -> (u64, i64) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        (
+            meta.ino(),
+            meta.ctime()
+                .saturating_mul(1_000_000_000)
+                .saturating_add(meta.ctime_nsec()),
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        (0, 0)
+    }
+}
+
 /// lowercase, non-alnum -> '-', collapse repeats, trim.
 /// A filesystem IDENTITY for `path`: two spellings of the same file (symlink,
 /// bind mount, `/tmp` vs `/private/tmp`, a case-insensitive mount) share it,
@@ -1334,6 +1356,40 @@ pub fn git_common_dir(worktree: &Path) -> PathBuf {
     dot_git
 }
 
+static GIT_WRITE_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A process-wide counter that advances every time thegn finishes a git
+/// MUTATION it ran itself (see [`GitWriteScope`], [`GitLock`]). Snapshot-style
+/// caches of git reads (THE-718) key on it next to the fs-watcher's change
+/// generation, so a refresh requested right after an in-app write can never be
+/// served a pre-write snapshot while the asynchronous fs event is in flight.
+pub fn git_write_epoch() -> u64 {
+    GIT_WRITE_EPOCH.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Advance [`git_write_epoch`] by one.
+pub fn note_git_write() {
+    tracing::debug!(target: "thegn::watch", "git write epoch advanced");
+    GIT_WRITE_EPOCH.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// RAII marker around a git mutation: advances [`git_write_epoch`] when it
+/// drops (success or failure, a half-applied write still changed state).
+#[must_use = "the epoch advances when the scope drops, so hold it across the write"]
+pub struct GitWriteScope(());
+
+impl GitWriteScope {
+    pub fn begin() -> Self {
+        Self(())
+    }
+}
+
+impl Drop for GitWriteScope {
+    fn drop(&mut self) {
+        note_git_write();
+    }
+}
+
 /// A held cross-process advisory lock around git MUTATIONS on a shared repo.
 /// Multiple thegn/agent processes operating on the same canonical `.git` would
 /// otherwise race it (concurrent `worktree add`/commit/rebase clobbering the
@@ -1396,6 +1452,7 @@ pub fn lock_git_mutations(worktree: &Path) -> Option<GitLock> {
 impl Drop for GitLock {
     #[allow(deprecated)] // see lock_git_mutations — migrate to fcntl::Flock together
     fn drop(&mut self) {
+        note_git_write();
         // best-effort: closing the fd releases the lock anyway.
         let _ = self.0.unlock();
     }
@@ -1404,6 +1461,7 @@ impl Drop for GitLock {
 #[cfg(windows)]
 impl Drop for GitLock {
     fn drop(&mut self) {
+        note_git_write();
         // Just closing the file releases the share mode lock on Windows.
     }
 }
@@ -1591,6 +1649,22 @@ pub fn git_ok(dir: &Path, args: &[&str]) -> bool {
         .unwrap_or(false)
 }
 
+/// Typed `git merge-base --is-ancestor`: `Some(true)` on exit 0, `Some(false)`
+/// on exit 1 (the one valid negative), `None` for anything else (spawn
+/// failure, bad object, repository/permission error). Callers choosing a
+/// destructive branch must treat `None` as unknown, never as "not an ancestor".
+pub fn git_is_ancestor(dir: &Path, ancestor: &str, descendant: &str) -> Option<bool> {
+    let out = git_cmd(dir)
+        .args(["merge-base", "--is-ancestor", ancestor, descendant])
+        .output()
+        .ok()?;
+    match out.status.code() {
+        Some(0) => Some(true),
+        Some(1) => Some(false),
+        _ => None,
+    }
+}
+
 /// The machine's hostname, used for host identity in pairing tickets and
 /// daemon server labels.
 ///
@@ -1638,6 +1712,59 @@ fn platform_hostname() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn git_write_epoch_advances_on_scope_drop_and_lock_release() {
+        let before = git_write_epoch();
+        {
+            let _w = GitWriteScope::begin();
+            assert_eq!(git_write_epoch(), before, "advances on drop, not begin");
+        }
+        assert!(git_write_epoch() > before);
+        let tmp = std::env::temp_dir().join(format!("tg-epoch-{}", std::process::id()));
+        // best-effort: test cleanup: scratch removal must never fail the test
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join(".git")).unwrap();
+        let mid = git_write_epoch();
+        drop(lock_git_mutations(&tmp));
+        assert!(git_write_epoch() > mid, "releasing the lock marks a write");
+        // best-effort: test cleanup: scratch removal must never fail the test
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn git_is_ancestor_is_tri_state() {
+        let td = tempfile::tempdir().unwrap();
+        let d = td.path();
+        let g = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .arg("-C")
+                .arg(d)
+                .args([
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@e",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "{args:?}");
+        };
+        g(&["init", "-q", "-b", "main"]);
+        g(&["commit", "-q", "--allow-empty", "-m", "a"]);
+        g(&["branch", "a"]);
+        g(&["commit", "-q", "--allow-empty", "-m", "b"]);
+        assert_eq!(git_is_ancestor(d, "a", "HEAD"), Some(true));
+        assert_eq!(git_is_ancestor(d, "HEAD", "a"), Some(false));
+        // Unknown objects and non-repositories are Unknown, never "No".
+        assert_eq!(git_is_ancestor(d, "nosuchref", "HEAD"), None);
+        let plain = tempfile::tempdir().unwrap();
+        assert_eq!(git_is_ancestor(plain.path(), "a", "HEAD"), None);
+    }
 
     #[test]
     fn have_caches_positive_probe_results() {

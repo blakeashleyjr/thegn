@@ -1178,6 +1178,9 @@ pub async fn main(
             "process sampler cleanup did not settle successfully"
         )))
     };
+    // Renderers run in their own process group, so nothing would signal them
+    // when we exit: kill and reap the preview tree before the process goes.
+    crate::preview_jobs::shutdown_global(std::time::Duration::from_millis(200));
     for (plugin, outcome) in &resident_report.outcomes {
         tracing::debug!(target: "thegn::plugin", plugin = %plugin, ?outcome, "resident lifecycle receipt; descendant containment remains unproven");
     }
@@ -2579,7 +2582,7 @@ fn open_panel_section(
     panel_ui.symbols_show_refs = false;
     panel_ui.chg_sel = None;
     panel_ui.impact_open = false;
-    panel_ui.file_preview = None;
+    crate::preview_pane::close_file_preview(panel_ui);
     panel_ui.scroll = 0;
     persist_panel_state(panel_ui);
     *hydration_gen += 1;
@@ -4362,8 +4365,9 @@ fn handle_git_msg(
         GitMsg::OpenPrInBrowser => {
             match sel_branch(panel_ui, model).and_then(|b| b.pr.map(|p| p.url)) {
                 Some(url) => {
-                    open_url_detached(&url);
-                    model.status = "opened PR in the browser".into();
+                    model.status = crate::actions::open_status(open_url_detached(&url), || {
+                        "opened PR in the browser".into()
+                    });
                 }
                 None => model.status = "no PR for this branch".into(),
             }
@@ -4894,6 +4898,19 @@ fn drain_key_repeats(
     )
 }
 
+/// Rows scrolled per wheel notch.
+const WHEEL_ROWS_PER_TICK: usize = 5;
+/// Ceiling on ticks applied per frame. Coalescing is for latency (one render
+/// per burst), not for multiplying distance: a backlog queued behind a slow
+/// frame must not fling the viewport in one jump (THE-699). Ticks past the cap
+/// stay queued and are applied by the next frame, so distance is preserved.
+const WHEEL_MAX_TICKS: usize = 8;
+
+/// Rows to scroll for `ticks` coalesced wheel events (pure, bounded).
+fn wheel_delta_rows(ticks: usize) -> usize {
+    ticks.clamp(1, WHEEL_MAX_TICKS) * WHEEL_ROWS_PER_TICK
+}
+
 /// Drain immediately-available wheel events that match `up` direction.
 /// Returns `(tick_count, leftover)` — the opposite-direction wheel or any
 /// non-wheel event is returned as leftover so the caller can requeueit.
@@ -4903,20 +4920,28 @@ fn drain_key_repeats(
 /// because the spin loop keeps pulling until the kernel returns nothing.
 fn drain_wheel_ticks(
     up: bool,
-    next: impl FnMut() -> Option<InputEvent>,
+    mut next: impl FnMut() -> Option<InputEvent>,
 ) -> (usize, Option<InputEvent>) {
     use termwiz::input::MouseButtons;
-    drain_event_repeats(
-        move |ev| {
-            matches!(
-                ev,
-                InputEvent::Mouse(m)
-                    if m.mouse_buttons.contains(MouseButtons::VERT_WHEEL)
-                        && m.mouse_buttons.contains(MouseButtons::WHEEL_POSITIVE) == up
-            )
-        },
-        next,
-    )
+    let is_repeat = |ev: &InputEvent| {
+        matches!(
+            ev,
+            InputEvent::Mouse(m)
+                if m.mouse_buttons.contains(MouseButtons::VERT_WHEEL)
+                    && m.mouse_buttons.contains(MouseButtons::WHEEL_POSITIVE) == up
+        )
+    };
+    let mut count = 1usize;
+    // Stop pulling at the cap and leave the rest queued: a fast flick keeps its
+    // distance, spread over successive frames, while each jump stays bounded.
+    while count < WHEEL_MAX_TICKS {
+        match next() {
+            Some(ev) if is_repeat(&ev) => count += 1,
+            Some(other) => return (count, Some(other)),
+            None => return (count, None),
+        }
+    }
+    (count, None)
 }
 
 /// Coalesce a left-drag's backlog: keep pulling queued left-button mouse
@@ -6254,11 +6279,11 @@ async fn event_loop<T: Terminal>(
         tokio_mpsc::unbounded_channel::<crate::handlers::switch_cache::PrefetchResult>();
     // The inline Files preview reader: `(rel_path, Ok(lines) | Err(reason))`.
     let (file_preview_tx, mut file_preview_rx) =
-        tokio_mpsc::unbounded_channel::<crate::preview_pane::TextMsg>();
+        tokio_mpsc::channel::<crate::preview_pane::TextMsg>(crate::preview_pane::RESULT_CAP);
     // The document-viewer graphics path: a rasterized preview image (image /
     // Mermaid / PDF page) drawn over the panel via kitty (`crate::preview_gfx`).
     let (preview_img_tx, mut preview_img_rx) =
-        tokio_mpsc::unbounded_channel::<crate::preview_pane::ImageMsg>();
+        tokio_mpsc::channel::<crate::preview_pane::ImageMsg>(crate::preview_pane::RESULT_CAP);
     let mut preview_gfx = crate::preview_gfx::PreviewGfx::new();
     // The git mutation runner + the line-cursor document fetches (staging
     // diff, drilled-commit files, patch doc). Results are tagged with
@@ -6868,6 +6893,12 @@ async fn event_loop<T: Terminal>(
     // chrome + sibling-pane recompose). `scroll_pane` names the pane to repaint.
     let mut scroll_only = false;
     let mut scroll_pane: Option<u32> = None;
+    // The wheel's own damage channel. A wheel scroll must NOT set the shared
+    // chrome `dirty` bit: the scroll fast path needs to tell "only the wheel
+    // moved" from "the wheel plus something else is stale" (THE-699), and
+    // `dirty` alone cannot say. Folded into `Damage::chrome` whenever the fast
+    // path is not provably clean.
+    let mut scroll_dirty = false;
     // Last frame's fullscreen-splash state (see `chrome::center_shows_splash`).
     // The splash true→false edge (splash retires because a pane went live while
     // `load_steps` was already empty) sets no chrome `dirty`, so the incremental
@@ -8514,7 +8545,7 @@ async fn event_loop<T: Terminal>(
             panel_ui.chg_sel = None;
             panel_ui.impact_open = false;
             // The preview is per-worktree (paths don't carry over).
-            panel_ui.file_preview = None;
+            crate::preview_pane::close_file_preview(&mut panel_ui);
             panel_ui.hunks_gen = hydration_gen;
             // Git interaction state is per-worktree: cursors, flows, marks
             // and fetched docs all reset; `op_gen` bumps so in-flight op/doc
@@ -11890,7 +11921,15 @@ async fn event_loop<T: Terminal>(
                 thegn_core::connectivity::current(),
             );
             match kind {
-                RefreshKind::Model => want_model_refresh = true,
+                RefreshKind::Model => {
+                    want_model_refresh = true;
+                    // O(1): a ref moved since the last heal that ran (its own
+                    // MainRefMoved may have been lost to the refresh throttle).
+                    crate::branch_cache::ref_gen_tick(
+                        &mut want_main_sync,
+                        &active_tab_path(&session),
+                    );
+                }
                 // The wall clock crossed a display boundary. Bars-only damage:
                 // `render_plan` turns this into a two-1-row-rect recompose, so
                 // a minute rollover never costs a chrome repaint.
@@ -12146,7 +12185,10 @@ async fn event_loop<T: Terminal>(
                     );
                 }
                 // Branch ref moved: heal the checkout off-loop + drop the cache.
-                RefreshKind::MainRefMoved => crate::branch_cache::ref_moved(&mut want_main_sync),
+                RefreshKind::MainRefMoved => crate::branch_cache::ref_moved_unless_unchanged(
+                    &mut want_main_sync,
+                    &active_tab_path(&session),
+                ),
                 RefreshKind::HostHeal => want_host_heal = true,
                 // Offline recovery re-probe (ticker emits only while offline).
                 RefreshKind::ConnRecover => crate::connectivity_gate::spawn_recovery_probe(
@@ -12186,17 +12228,16 @@ async fn event_loop<T: Terminal>(
                 RefreshKind::Scheduled { .. } => {}
             }
         }
-        // Fast-forward the canonical main checkout if its ref advanced (throttled ~2s, off-loop).
-        if want_main_sync
-            && last_main_heal.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(2))
-        {
-            last_main_heal = Some(std::time::Instant::now());
+        // Fast-forward the canonical main checkout if its ref advanced (throttled ~2s,
+        // off-loop). What the heal saw is recorded only if it really spawns (a
+        // request the throttle drops must stay due); see `maybe_spawn_heal`.
+        crate::branch_cache::maybe_spawn_heal(want_main_sync, &mut last_main_heal, || {
             crate::git_watch::spawn_main_checkout_heal(
                 active_tab_path(&session),
                 refresh_tx.clone(),
                 waker.clone(),
             );
-        }
+        });
         dirty |= want_host_heal
             && crate::handlers::host_heal::on_heal_tick(
                 &mut host_heal,
@@ -12826,7 +12867,17 @@ async fn event_loop<T: Terminal>(
                                     format!("Forwarding port {container_port} → {}", started.url)
                                 };
                                 if current_config.forward.open_on_detect {
-                                    open_url_detached(&started.url);
+                                    // Forward surface: honours `[forward] browser`.
+                                    if let Err(e) = crate::actions::open_url_with(
+                                        &started.url,
+                                        &current_config.forward.browser,
+                                    ) {
+                                        tracing::warn!(
+                                            target: "thegn::actions",
+                                            "open_on_detect: {}",
+                                            e.label()
+                                        );
+                                    }
                                 }
                                 model.forwards =
                                     current_forward_views(&forward_supervisor, &session);
@@ -12914,7 +12965,8 @@ async fn event_loop<T: Terminal>(
             || !dirty_panes.is_empty()
             || bars_dirty
             || statusbar_dirty
-            || sidebar_dirty;
+            || sidebar_dirty
+            || scroll_dirty;
         let mut defer_timeout: Option<std::time::Duration> = None;
         let pane_only_damage = !dirty
             && !full_repaint
@@ -13074,6 +13126,10 @@ async fn event_loop<T: Terminal>(
                 full_repaint = true;
             }
             prev_splash = splash_now;
+            // Tab switches (any path that assigns `active`, config reload
+            // included) park/resume hidden tiles. Here, after every drain, so
+            // the tile being rendered has been told it is visible.
+            app_host.sync_visibility();
             let app_tile_active = app_host.active_tile_mut().is_some();
             // FAST PATH: a pure selection-drag move only changes the highlighted
             // cells. Reuse the last full frame already in `scratch` (skip the
@@ -13108,27 +13164,45 @@ async fn event_loop<T: Terminal>(
             // A live drawer overlays the center band (recomposing a pane behind
             // it would paint over the drawer), and an active selection would be
             // dropped, so both fall through to a full frame.
-            let scroll_fast = scroll_only
-                && !fast_select
-                && !full_repaint
-                && !clear_on_next_frame
-                && !app_tile_active
-                && drawer.is_none()
-                && mouse_sel.is_none()
-                && palette.is_none()
-                && theme_builder.is_none()
-                && monitor.is_none()
-                && board.is_none()
-                && active_menu.is_none()
-                && git_input.is_none()
-                && host_input.is_none()
-                && wizard_ui.is_none()
-                && workspace_picker.is_none()
-                && hover_popup.is_none()
-                && search.is_none()
-                && bar_detail.is_none()
-                && which_key.is_empty()
-                && toasts.is_empty();
+            let damage = crate::render_plan::Damage {
+                full: full_repaint,
+                chrome: dirty,
+                // The live switch stamp doubles as the damage bit: set on the
+                // switch action, taken by the first flushed frame.
+                switch: switch_at.is_some(),
+                panes: dirty_panes.clone(),
+                bars: bars_dirty,
+                statusbar: statusbar_dirty,
+                sidebar: sidebar_dirty,
+            };
+            // The fast path reuses the prior frame, so it is only sound when the
+            // wheel is the SOLE damage: anything else pending (another pane's
+            // output, bars, sidebar, a chrome change) would be skipped and then
+            // cleared below, leaving stale cells until a layout change (THE-699).
+            let scroll_fast = crate::render_plan::scroll_fast_ok(
+                scroll_only,
+                &damage,
+                !fast_select
+                    && !full_repaint
+                    && !clear_on_next_frame
+                    && !app_tile_active
+                    && drawer.is_none()
+                    && mouse_sel.is_none()
+                    && palette.is_none()
+                    && theme_builder.is_none()
+                    && monitor.is_none()
+                    && board.is_none()
+                    && active_menu.is_none()
+                    && git_input.is_none()
+                    && host_input.is_none()
+                    && wizard_ui.is_none()
+                    && workspace_picker.is_none()
+                    && hover_popup.is_none()
+                    && search.is_none()
+                    && bar_detail.is_none()
+                    && which_key.is_empty()
+                    && toasts.is_empty(),
+            );
             // Demand-driven git docs for the expanded frame's stash/branches
             // main regions: on a dirty frame that is about to render one of
             // them, make sure the SELECTED row's document is fetched
@@ -13182,17 +13256,9 @@ async fn event_loop<T: Terminal>(
                 selection: mouse_sel.is_some(),
                 replay: replay.is_some(),
             };
-            let damage = crate::render_plan::Damage {
-                full: full_repaint,
-                chrome: dirty,
-                // The live switch stamp doubles as the damage bit: set on the
-                // switch action, taken by the first flushed frame.
-                switch: switch_at.is_some(),
-                panes: dirty_panes.clone(),
-                bars: bars_dirty,
-                statusbar: statusbar_dirty,
-                sidebar: sidebar_dirty,
-            };
+            // A wheel scroll whose fast path was refused is plain chrome damage.
+            let mut damage = damage;
+            crate::render_plan::fold_refused_wheel(&mut damage, scroll_dirty, scroll_fast);
             let frame_plan = crate::render_plan::plan(&damage, &overlays);
             // Caret bookkeeping is per FULL frame only: the incremental paths
             // deliberately skip the overlay stack, so they must inherit the last
@@ -13212,6 +13278,7 @@ async fn event_loop<T: Terminal>(
                 tracing::debug!(
                     target: "thegn::frame",
                     full = damage.full,
+                    scroll = scroll_only,
                     chrome = damage.chrome,
                     switch = damage.switch,
                     bars = damage.bars,
@@ -13962,6 +14029,8 @@ async fn event_loop<T: Terminal>(
             // Consumed: the next frame is full unless another drag/scroll re-arms it.
             selection_only = false;
             scroll_only = false;
+            scroll_pane = None;
+            scroll_dirty = false;
             // Pane/bars damage is now on screen; an untouched next wake renders nothing.
             dirty_panes.clear();
             bars_dirty = false;
@@ -14533,18 +14602,24 @@ async fn event_loop<T: Terminal>(
                             // Front, not back: the leftover precedes whatever is still queued.
                             pending_input.push_front(ev);
                         }
-                        // 5 rows per tick (was 3) — snappier single-tick response.
-                        let delta = ticks * 5;
+                        let delta = wheel_delta_rows(ticks);
                         if let Some(p) = panes.table.get_mut(&id) {
                             if up {
                                 p.scroll_up(delta);
                             } else {
                                 p.scroll_down(delta);
                             }
-                            dirty = true;
+                            // Own channel, not `dirty`: see `scroll_dirty`.
+                            scroll_dirty = true;
                             // Only this pane's content moved — arm the partial
                             // recompose (the render gate re-checks that no overlay
-                            // is up before taking the fast path).
+                            // is up and nothing else is damaged). A second pane
+                            // scrolled before the frame can't share the single
+                            // `scroll_pane` slot: the first would be dropped, so
+                            // that case is a full frame.
+                            if scroll_pane.is_some_and(|prev| prev != id) {
+                                dirty = true;
+                            }
                             scroll_only = true;
                             scroll_pane = Some(id);
                         }
@@ -18448,7 +18523,7 @@ async fn event_loop<T: Terminal>(
                             match k.key {
                                 // esc or q closes (q for pager muscle memory).
                                 KeyCode::Escape | KeyCode::Char('q') => {
-                                    panel_ui.file_preview = None;
+                                    crate::preview_pane::close_file_preview(&mut panel_ui);
                                 }
                                 KeyCode::Char('g') => fp.scroll = 0,
                                 KeyCode::Char('G') => fp.scroll = fp.max_scroll(viewport),
@@ -18923,9 +18998,10 @@ async fn event_loop<T: Terminal>(
                                             if let Some(row) = rows.get(panel_ui.cursor)
                                                 && !row.url.is_empty()
                                             {
-                                                open_url_detached(&row.url);
-                                                model.status =
-                                                    format!("Opened {} in browser", row.number);
+                                                model.status = crate::actions::open_status(
+                                                    open_url_detached(&row.url),
+                                                    || format!("Opened {} in browser", row.number),
+                                                );
                                             }
                                         }
                                         Section::Issues => {
@@ -19804,18 +19880,13 @@ async fn event_loop<T: Terminal>(
                             if let Some(url) =
                                 forward_url_at(&model, panel_ui.cursor).map(str::to_owned)
                             {
-                                let cmd = current_config.forward.browser.trim();
-                                if cmd.is_empty() {
-                                    open_url_detached(&url);
-                                } else {
-                                    let mut c = std::process::Command::new(cmd);
-                                    c.arg(&url)
-                                        .stdin(std::process::Stdio::null())
-                                        .stdout(std::process::Stdio::null())
-                                        .stderr(std::process::Stdio::null());
-                                    crate::actions::spawn_detached_reaped(c);
-                                }
-                                model.status = format!("Opened {url} in browser");
+                                model.status = crate::actions::open_status(
+                                    crate::actions::open_url_with(
+                                        &url,
+                                        &current_config.forward.browser,
+                                    ),
+                                    || "Opened preview in browser".to_string(),
+                                );
                             } else {
                                 model.status = "No preview selected".into();
                             }
@@ -19829,8 +19900,10 @@ async fn event_loop<T: Terminal>(
                                 .and_then(|s| s.url.clone())
                             {
                                 Some(url) => {
-                                    open_url_detached(&url);
-                                    model.status = format!("Opened {url} in browser");
+                                    model.status = crate::actions::open_status(
+                                        open_url_detached(&url),
+                                        || "Opened share link in browser".to_string(),
+                                    );
                                 }
                                 None => model.status = "No share URL to open".into(),
                             }
@@ -19867,8 +19940,10 @@ async fn event_loop<T: Terminal>(
                             if let Some(row) = rows.get(panel_ui.cursor)
                                 && !row.url.is_empty()
                             {
-                                open_url_detached(&row.url);
-                                model.status = format!("Opened {} in browser", row.number);
+                                model.status = crate::actions::open_status(
+                                    open_url_detached(&row.url),
+                                    || format!("Opened {} in browser", row.number),
+                                );
                             }
                             true
                         }

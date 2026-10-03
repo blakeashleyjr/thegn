@@ -36,4 +36,9 @@ pub trait DataSource: Send + Sync {
         &self,
         queries: Vec<Query>,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<Frame>, QueryError>> + Send>>;
+
+    /// The consuming view became visible (`true`) or hidden (`false`). A source
+    /// that samples in the background parks while hidden so a hidden tab costs
+    /// no wakes or spawns. Must not block. Default: stateless, ignore.
+    fn set_active(&self, _active: bool) {}
 }

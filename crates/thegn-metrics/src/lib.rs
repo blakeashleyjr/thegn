@@ -14,6 +14,8 @@
 mod battery;
 mod coverage;
 mod gpu;
+mod gpu_exec;
+mod gpu_monitor;
 mod procs;
 mod sample;
 mod thermal;

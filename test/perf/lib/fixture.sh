@@ -53,5 +53,14 @@ perf_build_fixture() {
     printf 'scratch\n' >"$PERF_TMP/worktrees/wt-$i/UNCOMMITTED.txt"
   done
 
+  # Pack the refs now. thegn's startup auto-fetch runs git's auto-maintenance,
+  # which packs 40+ loose refs on the first fetch: packed-refs is rewritten and
+  # every loose ref unlinked a few seconds into the session. That is a real
+  # (storage) change the change-generation correctly reports, and its consequences
+  # (heal / branch re-read / commit refresh) then trail into the idle window --
+  # startup transient, not idle cost. A fixture that models a repo whose refs are
+  # already packed (gc'd) keeps the window an idle window.
+  git -C "$root" pack-refs --all
+
   echo "$root"
 }

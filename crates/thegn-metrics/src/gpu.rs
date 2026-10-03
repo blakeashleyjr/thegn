@@ -1,8 +1,8 @@
 //! GPU utilization — the one metric sysinfo does not provide. Linux exposes it
 //! via sysfs (`amdgpu`/`i915`: `gpu_busy_percent`) or `nvidia-smi`; macOS via
 //! IOKit accelerator statistics, read with `ioreg` (no root, unlike
-//! `powermetrics`). Where none of those answer, [`GpuProbe::probe`] resolves to
-//! [`GpuProbe::None`] and the widget hides — the same behaviour as a Linux box
+//! `powermetrics`). Where none of those answer, the monitor
+//! ([`crate::gpu_monitor`]) reports no reading and the widget hides — the same behaviour as a Linux box
 //! with no detectable GPU.
 //!
 //! Utilization is the only field every backend fills. VRAM comes from sysfs and
@@ -25,120 +25,53 @@ pub(crate) struct GpuReading {
     pub power_w: Option<f32>,
 }
 
-/// How GPU state is read (probed once at startup).
-pub(crate) enum GpuProbe {
-    /// amdgpu/i915 expose a percent file in sysfs; `.0` is
-    /// `.../device/gpu_busy_percent`, whose parent holds the VRAM counters.
-    Sysfs(std::path::PathBuf),
-    /// NVIDIA via nvidia-smi.
-    NvidiaSmi,
-    /// macOS: IOKit accelerator statistics via `ioreg`. Not `cfg`-gated so the
-    /// parser stays compiled — and therefore tested — on every platform; only
-    /// [`GpuProbe::probe`] restricts *selecting* it to macOS.
-    IoAccel,
-    None,
+/// The `ioreg` query behind the macOS backend: one accelerator node, one level
+/// deep, which is where `PerformanceStatistics` lives.
+pub(crate) const IOREG_ARGS: [&str; 5] = ["-r", "-d", "1", "-c", "IOAccelerator"];
+
+/// `nvidia-smi` query for every field at once (one spawn per sample).
+pub(crate) const NVIDIA_QUERY_ARGS: [&str; 2] = [
+    "--query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw",
+    "--format=csv,noheader,nounits",
+];
+
+/// The amdgpu/i915 `gpu_busy_percent` file, if any card exposes one. Two
+/// directory reads, no subprocess — safe on the caller's thread.
+pub(crate) fn find_sysfs() -> Option<std::path::PathBuf> {
+    let cards = std::fs::read_dir("/sys/class/drm").ok()?;
+    cards
+        .flatten()
+        .map(|c| c.path().join("device/gpu_busy_percent"))
+        .find(|p| p.is_file())
 }
 
-/// The `ioreg` query behind [`GpuProbe::IoAccel`]: one accelerator node, one
-/// level deep, which is where `PerformanceStatistics` lives.
-const IOREG_ARGS: [&str; 5] = ["-r", "-d", "1", "-c", "IOAccelerator"];
-
-impl GpuProbe {
-    pub(crate) fn probe() -> GpuProbe {
-        // Sysfs first (AMD/Intel — no subprocess per sample).
-        if let Ok(cards) = std::fs::read_dir("/sys/class/drm") {
-            for card in cards.flatten() {
-                let p = card.path().join("device/gpu_busy_percent");
-                if p.is_file() {
-                    return GpuProbe::Sysfs(p);
-                }
-            }
-        }
-        let nvidia = std::process::Command::new("nvidia-smi")
-            .arg("--version")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if nvidia {
-            return GpuProbe::NvidiaSmi;
-        }
-        // macOS: accept this backend only if the counter actually parses. A Mac
-        // whose accelerator omits it stays `None` (widget hidden, today's
-        // behaviour) rather than selecting a backend that always yields nothing.
-        if cfg!(target_os = "macos") && read_ioaccel().is_some() {
-            return GpuProbe::IoAccel;
-        }
-        GpuProbe::None
+/// Read a sample from sysfs: a handful of cheap file reads.
+pub(crate) fn read_sysfs(path: &std::path::Path) -> GpuReading {
+    let util_pct = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|v| v.trim().parse::<u8>().ok());
+    // VRAM counters live beside gpu_busy_percent in the device dir, in bytes;
+    // convert to MiB. temp/power would need hwmon walking, which sysfs lays out
+    // inconsistently, so leave them absent.
+    let dev = path.parent();
+    let vram = |name: &str| -> Option<u64> {
+        let d = dev?;
+        std::fs::read_to_string(d.join(name))
+            .ok()?
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .map(|b| b / (1024 * 1024))
+    };
+    let mem_mib = match (vram("mem_info_vram_used"), vram("mem_info_vram_total")) {
+        (Some(u), Some(t)) if t > 0 => Some((u, t)),
+        _ => None,
+    };
+    GpuReading {
+        util_pct,
+        mem_mib,
+        ..Default::default()
     }
-
-    /// Whether reading a sample costs a subprocess.
-    ///
-    /// The sampler charges these to its slow tier: `sysfs` is a couple of file
-    /// reads and can run every tick, but `nvidia-smi` and `ioreg` are process
-    /// spawns (`ioreg` measured at 30–40ms), and paying that on every ~2s tick
-    /// is real background CPU in a program whose headline invariant is ~0% idle.
-    pub(crate) fn is_subprocess(&self) -> bool {
-        matches!(self, GpuProbe::NvidiaSmi | GpuProbe::IoAccel)
-    }
-
-    /// Read a full GPU sample. The sysfs path is a handful of cheap file reads;
-    /// the NVIDIA path spawns one `nvidia-smi` querying every field at once
-    /// (ticker-thread only — no extra subprocess vs. reading util alone).
-    pub(crate) fn read(&self) -> GpuReading {
-        match self {
-            GpuProbe::Sysfs(path) => {
-                let util_pct = std::fs::read_to_string(path)
-                    .ok()
-                    .and_then(|v| v.trim().parse::<u8>().ok());
-                // VRAM counters live beside gpu_busy_percent in the device dir,
-                // in bytes; convert to MiB. temp/power would need hwmon walking,
-                // which sysfs lays out inconsistently, so leave them absent.
-                let dev = path.parent();
-                let vram = |name: &str| -> Option<u64> {
-                    let d = dev?;
-                    std::fs::read_to_string(d.join(name))
-                        .ok()?
-                        .trim()
-                        .parse::<u64>()
-                        .ok()
-                        .map(|b| b / (1024 * 1024))
-                };
-                let mem_mib = match (vram("mem_info_vram_used"), vram("mem_info_vram_total")) {
-                    (Some(u), Some(t)) if t > 0 => Some((u, t)),
-                    _ => None,
-                };
-                GpuReading {
-                    util_pct,
-                    mem_mib,
-                    ..Default::default()
-                }
-            }
-            GpuProbe::NvidiaSmi => std::process::Command::new("nvidia-smi")
-                .args([
-                    "--query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw",
-                    "--format=csv,noheader,nounits",
-                ])
-                .output()
-                .ok()
-                .and_then(|o| parse_nvidia(&String::from_utf8_lossy(&o.stdout)))
-                .unwrap_or_default(),
-            GpuProbe::IoAccel => read_ioaccel().unwrap_or_default(),
-            GpuProbe::None => GpuReading::default(),
-        }
-    }
-}
-
-/// Run the `ioreg` accelerator query and parse it. `None` when the command is
-/// missing/fails or the output carries no utilization counter.
-fn read_ioaccel() -> Option<GpuReading> {
-    let out = std::process::Command::new("ioreg")
-        .args(IOREG_ARGS)
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()?;
-    parse_ioaccel(&String::from_utf8_lossy(&out.stdout))
 }
 
 /// Parse `Device Utilization %` out of `ioreg -c IOAccelerator` output.
@@ -159,7 +92,7 @@ fn read_ioaccel() -> Option<GpuReading> {
 /// unified memory (the block's `In use system memory` is ~28 GB of ~31 GB
 /// `Alloc`, which as a used/total pair would show a permanently ~90%-full GPU),
 /// and temperature/power need `powermetrics`, which needs root.
-fn parse_ioaccel(out: &str) -> Option<GpuReading> {
+pub(crate) fn parse_ioaccel(out: &str) -> Option<GpuReading> {
     const KEY: &str = "\"Device Utilization %\"=";
     let util = out
         .match_indices(KEY)
@@ -182,7 +115,7 @@ fn parse_ioaccel(out: &str) -> Option<GpuReading> {
 /// Parse the first CSV row of the `nvidia-smi` query into a [`GpuReading`].
 /// Fields are `util%, mem_used_MiB, mem_total_MiB, temp_C, power_W`; any that
 /// nvidia-smi reports as `[N/A]` (unsupported) parse to `None` individually.
-fn parse_nvidia(out: &str) -> Option<GpuReading> {
+pub(crate) fn parse_nvidia(out: &str) -> Option<GpuReading> {
     let line = out.lines().next()?;
     let f: Vec<&str> = line.split(',').map(|s| s.trim()).collect();
     let u8f = |i: usize| f.get(i).and_then(|v| v.parse::<u8>().ok());
@@ -192,8 +125,12 @@ fn parse_nvidia(out: &str) -> Option<GpuReading> {
         (Some(u), Some(t)) if t > 0 => Some((u, t)),
         _ => None,
     };
+    // Utilization is the one field every backend must supply; a row without it
+    // is not a GPU sample (driver banner, error text) and must not overwrite
+    // the last good reading.
+    let util_pct = u8f(0)?;
     Some(GpuReading {
-        util_pct: u8f(0),
+        util_pct: Some(util_pct),
         mem_mib,
         temp_c: f32f(3),
         power_w: f32f(4),
@@ -275,34 +212,24 @@ mod tests {
         );
     }
 
-    #[test]
-    fn subprocess_backends_are_flagged_for_the_slow_tier() {
-        assert!(GpuProbe::NvidiaSmi.is_subprocess());
-        assert!(GpuProbe::IoAccel.is_subprocess());
-        // sysfs is a couple of file reads — cheap enough for every tick.
-        assert!(!GpuProbe::Sysfs(std::path::PathBuf::from("/x")).is_subprocess());
-        assert!(!GpuProbe::None.is_subprocess());
-    }
-
-    /// The live path on real hardware: `ioreg` runs, parses, and yields a value
-    /// in range. Asserts no particular number — the GPU's load is whatever the
-    /// machine happens to be doing — but catches the failures that matter: the
-    /// command missing, the key renamed, or the probe declining on a Mac that
-    /// does have an accelerator.
+    /// The live path on real hardware: the monitor discovers `ioreg`, parses, and
+    /// yields a value in range. Asserts no particular number — the GPU's load is
+    /// whatever the machine is doing — but catches the failures that matter: the
+    /// command missing, the key renamed, or the probe declining on a Mac that has
+    /// an accelerator.
     #[cfg(target_os = "macos")]
     #[test]
     fn ioaccel_reads_this_mac() {
-        let r = read_ioaccel().expect("every Mac has an IOAccelerator with the counter");
-        let util = r
+        use crate::gpu_monitor::{GpuHealth, GpuMonitor};
+        let m = GpuMonitor::new();
+        m.sample(true);
+        assert!(m.wait_idle(std::time::Duration::from_secs(10)));
+        assert_eq!(m.health(), GpuHealth::Live, "probe must select IoAccel");
+        let util = m
+            .sample(false)
             .util_pct
-            .expect("a parsed reading always carries utilization");
+            .expect("a live reading carries utilization");
         assert!(util <= 100, "utilization out of range: {util}");
-        // …and the probe actually selects it here, rather than falling to None
-        // and hiding the widget.
-        assert!(
-            matches!(GpuProbe::probe(), GpuProbe::IoAccel),
-            "probe must pick IoAccel on macOS when the counter parses"
-        );
     }
 
     #[test]
@@ -314,5 +241,12 @@ mod tests {
         assert_eq!(r.mem_mib, Some((512, 4096)));
         // A zero total suppresses the VRAM pair rather than dividing by zero.
         assert_eq!(parse_nvidia("5, 0, 0, 45, 10").unwrap().mem_mib, None);
+    }
+
+    #[test]
+    fn parse_nvidia_rejects_rows_without_utilization() {
+        assert!(parse_nvidia("").is_none());
+        assert!(parse_nvidia("NVIDIA-SMI has failed because it couldn't communicate").is_none());
+        assert!(parse_nvidia("[N/A], 1, 2, 3, 4").is_none());
     }
 }

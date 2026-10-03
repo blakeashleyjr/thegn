@@ -11,7 +11,7 @@ use sysinfo::{
     ProcessesToUpdate, RefreshKind, System,
 };
 
-use crate::gpu::GpuProbe;
+use crate::gpu_monitor::GpuMonitor;
 use crate::thermal::ThermalProbe;
 use crate::{
     ChildGroup, DiskInfo, DiskKind, StatsSnapshot, disk_space, read_battery, read_battery_power,
@@ -50,13 +50,10 @@ pub struct StatsSampler {
     nets: Networks,
     disks: Disks,
     comps: Components,
-    gpu: GpuProbe,
+    gpu: GpuMonitor,
     /// How temperatures are read. `Components` on Linux/Intel; the Apple-vendor
     /// HID sensors on Apple silicon, where `Components` is empty.
     thermal: ThermalProbe,
-    /// Last GPU sample, for the subprocess-backed probes that only refresh on
-    /// the slow tier (see the read site). `Sysfs` never uses this.
-    last_gpu: crate::gpu::GpuReading,
     disk_path: std::path::PathBuf,
     tick: u64,
     /// CPU usage needs a delta; the first sample only primes it.
@@ -121,9 +118,8 @@ impl StatsSampler {
             nets: Networks::new_with_refreshed_list(),
             disks: Disks::new_with_refreshed_list(),
             comps: Components::new_with_refreshed_list(),
-            gpu: GpuProbe::probe(),
+            gpu: GpuMonitor::new(),
             thermal: ThermalProbe::probe(),
-            last_gpu: crate::gpu::GpuReading::default(),
             disk_path,
             tick: 0,
             cpu_primed: false,
@@ -250,21 +246,15 @@ impl StatsSampler {
         // the backend: sysfs is two file reads, but `nvidia-smi` and `ioreg` are
         // process spawns (ioreg measured at 30-40ms), and paying that every ~2s
         // tick is real background CPU against the ~0%-idle invariant. Charge
-        // those to the slow tier and reuse the cached reading in between — the
-        // same treatment frequency/temps/disks already get below. (The
+        // those to the slow tier, run off-thread and bounded by `GpuMonitor`, which
+        // serves the latest good reading: a wedged helper cannot stall this
+        // shared ticker. (The
         // subprocess cost predates macOS: the nvidia arm has always spawned one
         // per tick.)
         let psu = std::path::Path::new("/sys/class/power_supply");
         snap.battery = read_battery(psu);
         (snap.battery_power_w, snap.battery_eta_secs) = read_battery_power(psu);
-        let gpu = if self.gpu.is_subprocess() {
-            if slow {
-                self.last_gpu = self.gpu.read();
-            }
-            self.last_gpu.clone()
-        } else {
-            self.gpu.read()
-        };
+        let gpu = self.gpu.sample(slow);
         snap.gpu_pct = gpu.util_pct;
         snap.gpu_mem_mib = gpu.mem_mib;
         snap.gpu_temp_c = gpu.temp_c;

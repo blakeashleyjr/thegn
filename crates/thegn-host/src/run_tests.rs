@@ -3879,3 +3879,38 @@ fn pending_folder_intent_refuses_a_changed_name_before_completion() {
         "do not resurrect stale intent on a later event"
     );
 }
+
+#[test]
+fn wheel_delta_rows_is_bounded_and_proportional() {
+    assert_eq!(wheel_delta_rows(0), WHEEL_ROWS_PER_TICK);
+    assert_eq!(wheel_delta_rows(1), WHEEL_ROWS_PER_TICK);
+    assert_eq!(wheel_delta_rows(3), 3 * WHEEL_ROWS_PER_TICK);
+    assert_eq!(
+        wheel_delta_rows(WHEEL_MAX_TICKS),
+        WHEEL_MAX_TICKS * WHEEL_ROWS_PER_TICK
+    );
+    // A huge backlog never jumps past the ceiling.
+    assert_eq!(
+        wheel_delta_rows(10_000),
+        WHEEL_MAX_TICKS * WHEEL_ROWS_PER_TICK
+    );
+}
+
+#[test]
+fn drain_wheel_ticks_stops_at_cap_and_leaves_rest_queued() {
+    use termwiz::input::{MouseButtons, MouseEvent};
+    let ev = || {
+        InputEvent::Mouse(MouseEvent {
+            x: 0,
+            y: 0,
+            mouse_buttons: MouseButtons::VERT_WHEEL | MouseButtons::WHEEL_POSITIVE,
+            modifiers: termwiz::input::Modifiers::NONE,
+        })
+    };
+    let mut q: std::collections::VecDeque<InputEvent> =
+        (0..WHEEL_MAX_TICKS + 5).map(|_| ev()).collect();
+    let (n, leftover) = drain_wheel_ticks(true, || q.pop_front());
+    assert_eq!(n, WHEEL_MAX_TICKS);
+    assert!(leftover.is_none());
+    assert_eq!(q.len(), 6, "ticks past the cap stay queued");
+}

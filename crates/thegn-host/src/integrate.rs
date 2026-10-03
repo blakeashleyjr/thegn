@@ -631,10 +631,40 @@ pub struct Candidates {
 /// The main checkout (first `git worktree list` entry) reachable from any path
 /// inside the repo. The fold advances the repo's target branch, so it operates
 /// from the main checkout regardless of which worktree the caller is in.
+///
+/// The first entry is derived from the repo's common dir alone, so a local path
+/// with a `.git` entry is answered from a memo keyed on that entry
+/// ([`thegn_core::git_memo`]) instead of forking `git worktree list` on every
+/// merge-queue membership test (THE-718). A path with no `.git` entry (a
+/// subdirectory, a bare repo) cannot be fingerprinted and still asks git.
 pub fn main_checkout(start: &Path) -> Option<PathBuf> {
-    let porc = util::git_out(start, &["worktree", "list", "--porcelain"])?;
-    porc.lines()
-        .find_map(|l| l.strip_prefix("worktree ").map(PathBuf::from))
+    static MEMO: std::sync::Mutex<Option<thegn_core::git_memo::Memo<Option<PathBuf>>>> =
+        std::sync::Mutex::new(None);
+    thegn_core::git_memo::memoised_checked(
+        &MEMO,
+        512,
+        start,
+        thegn_core::git_memo::fingerprint(start),
+        || {
+            // off-loop: callers are merge-queue / CLI paths already off the loop
+            // (this was `util::git_out`, which the lint cannot see through).
+            #[expect(clippy::disallowed_methods)]
+            let out = util::git_cmd(start)
+                .args(["worktree", "list", "--porcelain"])
+                .output();
+            let Ok(out) = out else {
+                return (None, false); // could not spawn git: transient, never memoised
+            };
+            let porc = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            let first = (out.status.success() && !porc.is_empty())
+                .then(|| {
+                    porc.lines()
+                        .find_map(|l| l.strip_prefix("worktree ").map(PathBuf::from))
+                })
+                .flatten();
+            (first, true)
+        },
+    )
 }
 
 /// One-shot fold of the repo containing `any_path`: resolve the main checkout +
@@ -1152,14 +1182,22 @@ fn run_fold_admitted(
         }
         // Re-read the tip each round so a CAS retry folds onto the moved branch.
         let base = CliGit.rev_parse(&loc, &target_ref)?;
-        let to_fold: Vec<Branch> = candidates
-            .iter()
-            // Skip branches bisect held back, and ones already in the target
-            // (an already-merged tip would otherwise produce a no-op merge commit).
-            .filter(|b| !excluded.contains(&b.name))
-            .filter(|b| !util::git_ok(repo_root, &["merge-base", "--is-ancestor", &b.tip, &base]))
-            .cloned()
-            .collect();
+        // Skip branches bisect held back, and ones already in the target
+        // (an already-merged tip would otherwise produce a no-op merge commit).
+        // An unknown ancestry probe aborts before any fold: it is neither "in"
+        // nor "not in" the target.
+        let mut to_fold: Vec<Branch> = Vec::new();
+        for b in candidates.iter().filter(|b| !excluded.contains(&b.name)) {
+            match util::git_is_ancestor(repo_root, &b.tip, &base) {
+                Some(true) => {}
+                Some(false) => to_fold.push(b.clone()),
+                None => anyhow::bail!(
+                    "ancestry of candidate branch {} (tip {}) is unknown; nothing folded",
+                    b.name,
+                    b.tip
+                ),
+            }
+        }
         let attempted: Vec<String> = to_fold.iter().map(|branch| branch.name.clone()).collect();
         let plan = match fold::fold(&adapter, &base, to_fold, &cfg.regenerate_paths, &opts) {
             Ok(p) => p,
@@ -1533,10 +1571,13 @@ fn attempt_land_admitted(
         source_history.revalidate()?;
         let base = CliGit.rev_parse(&loc, &target_ref)?;
         let branch_tip = CliGit.rev_parse(&loc, &branch_ref)?;
-        if util::git_ok(
-            repo_root,
-            &["merge-base", "--is-ancestor", &branch_tip, &base],
-        ) {
+        let already_landed =
+            util::git_is_ancestor(repo_root, &branch_tip, &base).with_context(|| {
+                format!(
+                    "ancestry of branch {branch_name} (tip {branch_tip}) is unknown; nothing folded"
+                )
+            })?;
+        if already_landed {
             adapter.history.revalidate()?;
             source_history.revalidate()?;
             return Ok(AttemptOutcome::UpToDate {
@@ -1882,6 +1923,57 @@ mod tests {
             gate_reuse_worktree: false,
             ..MergeQueueConfig::default()
         }
+    }
+
+    #[test]
+    fn run_fold_bails_without_moving_main_when_a_candidate_tip_is_unknown() {
+        let repo = Repo::new("anc-unknown-fold");
+        if !repo.history_supported_or_refused() {
+            return;
+        }
+        repo.feature("b1", "a.txt", "a\n");
+        let mut branches = repo.branch_set();
+        let bogus = "1234567890123456789012345678901234567890".to_string();
+        branches[0].tip = bogus.clone();
+        let before = repo.out(&["rev-parse", "main"]);
+        let err = run_fold(&cfg(""), &repo.dir, branches).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("is unknown"), "{msg}");
+        assert!(msg.contains("b1") && msg.contains(&bogus), "{msg}");
+        assert_eq!(repo.out(&["rev-parse", "main"]), before, "target unmoved");
+    }
+
+    #[test]
+    fn attempt_land_bails_without_moving_main_when_the_branch_tip_object_is_gone() {
+        let repo = Repo::new("anc-unknown-land");
+        if !repo.history_supported_or_refused() {
+            return;
+        }
+        repo.feature("b1", "a.txt", "a\n");
+        let tip = repo.out(&["rev-parse", "refs/heads/b1"]);
+        // Remove the tip commit's loose object: the ref still resolves but the
+        // commit cannot be read.
+        let obj = repo
+            .dir
+            .join(".git/objects")
+            .join(&tip[..2])
+            .join(&tip[2..]);
+        // best-effort: loose objects are read-only; unlinking needs only the dir.
+        let _ = std::fs::remove_file(&obj);
+        assert!(!obj.exists(), "tip object removed");
+        let before = repo.out(&["rev-parse", "main"]);
+        let c = cfg("");
+        // `attempt_land` reports a failed precondition as a GateError (never a
+        // landed/held verdict), carrying the bail message in `log`.
+        let out = attempt_land(&c, &repo.dir, "b1", &GitLoc::Local(repo.dir.clone())).unwrap();
+        match out {
+            AttemptOutcome::GateError { log, .. } => {
+                assert!(log.contains("is unknown"), "{log}");
+                assert!(log.contains("b1") && log.contains(&tip), "{log}");
+            }
+            _ => panic!("an unknown ancestry must bail as a GateError"),
+        }
+        assert_eq!(repo.out(&["rev-parse", "main"]), before, "target unmoved");
     }
 
     #[test]

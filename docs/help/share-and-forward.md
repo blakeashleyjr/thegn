@@ -44,7 +44,7 @@ source, URL, and one of three honest states: `up` means a live pane/provider
 event proves reachability, `down` means that watched process or forward ended,
 and `unknown` means the runtime has no event source. `unknown` is not treated as
 a failure: `↵` still copies the URL and `o` still opens it in the configured
-external browser. The active worktree also gets a compact preview token in the
+external browser (`[forward] browser`: an argv template with `%s` for the URL, no shell; an explicit value is final, otherwise `$BROWSER`, then the OS opener; only http/https URLs are opened; also used by `open_on_detect`). The active worktree also gets a compact preview token in the
 sidebar.
 
 An in-terminal browser is an optional drawer runtime occupant named `preview`.
