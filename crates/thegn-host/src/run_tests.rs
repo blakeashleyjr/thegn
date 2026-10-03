@@ -3879,3 +3879,19 @@ fn pending_folder_intent_refuses_a_changed_name_before_completion() {
         "do not resurrect stale intent on a later event"
     );
 }
+
+#[test]
+fn wheel_delta_rows_is_bounded_and_proportional() {
+    assert_eq!(wheel_delta_rows(0), WHEEL_ROWS_PER_TICK);
+    assert_eq!(wheel_delta_rows(1), WHEEL_ROWS_PER_TICK);
+    assert_eq!(wheel_delta_rows(3), 3 * WHEEL_ROWS_PER_TICK);
+    assert_eq!(
+        wheel_delta_rows(WHEEL_MAX_TICKS),
+        WHEEL_MAX_TICKS * WHEEL_ROWS_PER_TICK
+    );
+    // A huge backlog never jumps past the ceiling.
+    assert_eq!(
+        wheel_delta_rows(10_000),
+        WHEEL_MAX_TICKS * WHEEL_ROWS_PER_TICK
+    );
+}
