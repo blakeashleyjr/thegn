@@ -21,7 +21,7 @@
 //! would produce a binary that will not launch at all. A private symbol is worth
 //! using only if its absence is survivable.
 //!
-//! Structure mirrors [`crate::gpu::GpuProbe`]: probe once, verify the backend
+//! Structure mirrors [`crate::gpu_monitor::GpuMonitor`]'s ioreg discovery: probe once, verify the backend
 //! actually yields a value before selecting it, and charge sampling to the slow
 //! tier.
 
@@ -47,7 +47,7 @@ impl ThermalProbe {
         // Only select the HID backend if it actually produced a reading — a Mac
         // (or a future macOS) where the symbols or the sensors are gone must
         // fall through rather than select a backend that always yields nothing.
-        // Same rule as `GpuProbe::probe`'s `read_ioaccel().is_some()` check.
+        // Same rule as `GpuMonitor`'s ioreg discovery (the counter must parse).
         #[cfg(target_os = "macos")]
         if !apple_hid::read().is_empty() {
             return ThermalProbe::AppleHid;

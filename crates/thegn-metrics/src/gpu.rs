@@ -212,6 +212,26 @@ mod tests {
         );
     }
 
+    /// The live path on real hardware: the monitor discovers `ioreg`, parses, and
+    /// yields a value in range. Asserts no particular number — the GPU's load is
+    /// whatever the machine is doing — but catches the failures that matter: the
+    /// command missing, the key renamed, or the probe declining on a Mac that has
+    /// an accelerator.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ioaccel_reads_this_mac() {
+        use crate::gpu_monitor::{GpuHealth, GpuMonitor};
+        let m = GpuMonitor::new();
+        m.sample(true);
+        assert!(m.wait_idle(std::time::Duration::from_secs(10)));
+        assert_eq!(m.health(), GpuHealth::Live, "probe must select IoAccel");
+        let util = m
+            .sample(false)
+            .util_pct
+            .expect("a live reading carries utilization");
+        assert!(util <= 100, "utilization out of range: {util}");
+    }
+
     #[test]
     fn parse_nvidia_tolerates_na_columns() {
         // Laptop dGPUs commonly report power.draw as "[N/A]".
