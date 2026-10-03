@@ -12197,20 +12197,16 @@ async fn event_loop<T: Terminal>(
                 RefreshKind::Scheduled { .. } => {}
             }
         }
-        // Fast-forward the canonical main checkout if its ref advanced (throttled ~2s, off-loop).
-        if want_main_sync
-            && last_main_heal.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(2))
-        {
-            last_main_heal = Some(std::time::Instant::now());
+        // Fast-forward the canonical main checkout if its ref advanced (throttled ~2s,
+        // off-loop). What the heal saw is recorded only if it really spawns (a
+        // request the throttle drops must stay due); see `maybe_spawn_heal`.
+        crate::branch_cache::maybe_spawn_heal(want_main_sync, &mut last_main_heal, || {
             crate::git_watch::spawn_main_checkout_heal(
                 active_tab_path(&session),
                 refresh_tx.clone(),
                 waker.clone(),
             );
-            // Record what the heal saw only now that it really runs (a request the
-            // throttle dropped must stay due).
-            crate::branch_cache::heal_spawned();
-        }
+        });
         dirty |= want_host_heal
             && crate::handlers::host_heal::on_heal_tick(
                 &mut host_heal,

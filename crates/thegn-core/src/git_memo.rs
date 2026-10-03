@@ -276,19 +276,53 @@ fn push_config(
     Some(())
 }
 
-/// The system config path git uses, asked of git itself ONCE (`git var
-/// GIT_CONFIG_SYSTEM`) rather than assumed to be `/etc/gitconfig` (nix, homebrew
-/// and `$PREFIX` builds differ). `None` = git could not say, so no print.
+/// The system config path git uses, asked of git itself ONCE rather than assumed
+/// to be `/etc/gitconfig` (nix, homebrew and `$PREFIX` builds differ). `git var
+/// GIT_CONFIG_SYSTEM` needs git >= 2.42; older gits get the path derived the way
+/// git itself builds it, from `git --exec-path`. `None` = git could not say, so
+/// no print.
 fn system_config_path() -> Option<PathBuf> {
     static PATH: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
     PATH.get_or_init(|| {
-        crate::util::git_out(&std::env::temp_dir(), &["var", "GIT_CONFIG_SYSTEM"])
-            .map(PathBuf::from)
+        let tmp = std::env::temp_dir();
+        if let Some(p) = crate::util::git_out(&tmp, &["var", "GIT_CONFIG_SYSTEM"]) {
+            return Some(PathBuf::from(p));
+        }
+        let derived = crate::util::git_out(&tmp, &["--exec-path"])
+            .and_then(|e| derive_system_config(Path::new(&e)));
+        tracing::debug!(
+            target: "thegn::watch",
+            ?derived,
+            "git var GIT_CONFIG_SYSTEM unavailable; derived the system config from --exec-path"
+        );
+        derived
     })
     .clone()
 }
 
-/// System + global config files (and their includes) into `files`.
+/// git's own derivation of the system config path: `<prefix>/etc/gitconfig`,
+/// where the prefix is the parent of `libexec/git-core` (or `lib/git-core`); a
+/// `/usr` prefix uses `/etc/gitconfig`. `None` for an exec path of another shape.
+pub fn derive_system_config(exec_path: &Path) -> Option<PathBuf> {
+    if exec_path.file_name()? != "git-core" {
+        return None;
+    }
+    let libdir = exec_path.parent()?;
+    let lib = libdir.file_name()?.to_str()?;
+    if !matches!(lib, "libexec" | "lib" | "lib64") {
+        return None;
+    }
+    let prefix = libdir.parent()?;
+    Some(if prefix == Path::new("/usr") || prefix == Path::new("/") {
+        PathBuf::from("/etc/gitconfig")
+    } else {
+        prefix.join("etc/gitconfig")
+    })
+}
+
+/// System + global config files (and their includes) into `files`, in git's
+/// precedence order: system, then `$XDG_CONFIG_HOME/git/config`, then
+/// `~/.gitconfig` (later wins).
 fn global_config_files(
     env: &dyn Fn(&str) -> Option<String>,
     home: Option<&Path>,
@@ -304,71 +338,221 @@ fn global_config_files(
     match env("GIT_CONFIG_GLOBAL") {
         Some(g) => push_config(PathBuf::from(g), home, 0, files)?,
         None => {
-            if let Some(h) = home {
-                push_config(h.join(".gitconfig"), home, 0, files)?;
-            }
             let xdg = env("XDG_CONFIG_HOME")
                 .map(PathBuf::from)
                 .or_else(|| home.map(|h| h.join(".config")));
             if let Some(x) = xdg {
                 push_config(x.join("git/config"), home, 0, files)?;
             }
+            if let Some(h) = home {
+                push_config(h.join(".gitconfig"), home, 0, files)?;
+            }
         }
     }
     Some(())
 }
 
-/// A hash of what the GLOBAL layer contributes to `status`/`diff`/`stash`
-/// besides the repo's own files: the system and global configs (and includes),
-/// and the global excludes file -- `core.excludesFile` from those configs, else
-/// the default `$XDG_CONFIG_HOME/git/ignore`. The fs-watcher covers the repo, not
-/// `$HOME`, so a snapshot cache keys on this too. `None` = cannot be computed
-/// completely, in which case callers must not serve a snapshot.
-pub fn global_git_print() -> Option<u64> {
-    global_git_print_with(&|k| std::env::var(k).ok())
+/// Values of `[core] <key>` in `text`, in file order.
+fn core_values(text: &str, key: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut in_core = false;
+    for line in text.lines() {
+        let l = line.trim();
+        if l.starts_with('[') {
+            let name: String = l[1..]
+                .chars()
+                .take_while(|c| !c.is_whitespace() && *c != ']' && *c != '"')
+                .collect();
+            in_core = name.eq_ignore_ascii_case("core");
+            if in_core
+                && let Some((_, rest)) = l.split_once(']')
+                && let Some(v) = key_value(rest, key)
+            {
+                out.push(v);
+            }
+        } else if in_core && let Some(v) = key_value(l, key) {
+            out.push(v);
+        }
+    }
+    out
 }
 
-/// [`global_git_print`] with an injectable environment.
-pub fn global_git_print_with(env: &dyn Fn(&str) -> Option<String>) -> Option<u64> {
+/// Read a file that may legitimately not exist: `Ok(None)` when absent,
+/// `Err(())` when it exists but cannot be read completely (unreadable, or over
+/// the size cap) -- the caller must then fail closed.
+fn read_strict(path: &Path) -> Result<Option<String>, ()> {
+    use std::io::Read;
+    let f = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(()),
+    };
+    let mut buf = Vec::new();
+    f.take(MAX_CONFIG_BYTES as u64 + 1)
+        .read_to_end(&mut buf)
+        .map_err(|_| ())?;
+    if buf.len() > MAX_CONFIG_BYTES {
+        return Err(());
+    }
+    Ok(Some(String::from_utf8_lossy(&buf).into_owned()))
+}
+
+/// A hash of what the GLOBAL layer contributes to `status`/`diff`/`stash`
+/// besides the repo's own files, which the fs-watcher cannot see (it covers the
+/// repo, not `$HOME`): the system and global configs (and includes), the repo's
+/// own configs (which may name files OUTSIDE the repo), and every excludes and
+/// attributes file any of them names (`core.excludesFile`, `core.attributesFile`)
+/// plus the defaults `$XDG_CONFIG_HOME/git/{ignore,attributes}`.
+///
+/// Every candidate is folded in rather than resolving git's precedence: a
+/// superset can only over-invalidate. `None` = cannot be computed completely
+/// (an unfingerprintable config, or a named file that exists but is unreadable
+/// or over 1 MiB); callers must not serve a snapshot then.
+///
+/// Memoised on the stamps of every file it read, so an idle tick costs stats,
+/// not reads.
+pub fn global_git_print(dir: &Path) -> Option<u64> {
+    static CACHE: GlobalPrintCache = Mutex::new(None);
+    let env = |k: &str| std::env::var(k).ok();
+    let sig = env_signature(&env);
+    stamp_memoised(&CACHE, (dir.to_path_buf(), sig), || {
+        global_git_print_inner(Some(dir), &env)
+    })
+}
+
+/// [`global_git_print`] without the memo and with an injectable environment.
+pub fn global_git_print_with(
+    dir: Option<&Path>,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Option<u64> {
+    global_git_print_inner(dir, env).map(|(h, _)| h)
+}
+
+type GlobalPrintCache =
+    Mutex<Option<HashMap<(PathBuf, u64), (Vec<(PathBuf, Stamp)>, Option<u64>)>>>;
+
+fn env_signature(env: &dyn Fn(&str) -> Option<String>) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for k in [
+        "HOME",
+        "XDG_CONFIG_HOME",
+        "GIT_CONFIG_GLOBAL",
+        "GIT_CONFIG_SYSTEM",
+        "GIT_CONFIG_NOSYSTEM",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_PARAMETERS",
+    ] {
+        env(k).hash(&mut h);
+    }
+    h.finish()
+}
+
+/// Serve `compute`'s value while the stamps of every file it examined are
+/// unchanged. Bounded (16 keys). A `None` result is never cached.
+fn stamp_memoised(
+    cache: &GlobalPrintCache,
+    key: (PathBuf, u64),
+    compute: impl FnOnce() -> Option<(u64, Vec<PathBuf>)>,
+) -> Option<u64> {
+    {
+        let g = cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((stamps, v)) = g.as_ref().and_then(|m| m.get(&key))
+            && stamps.iter().all(|(p, s)| stamp(p) == *s)
+        {
+            return *v;
+        }
+    }
+    // Filesystem timestamps come from a coarse kernel clock that can lag the wall
+    // clock by several ms, so "not touched since before we started" needs a
+    // margin: anything modified within SETTLE_MARGIN of the start is distrusted.
+    const SETTLE_MARGIN_NS: i64 = 50_000_000;
+    let started = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(i64::MIN, |d| {
+            (d.as_nanos() as i64).saturating_sub(SETTLE_MARGIN_NS)
+        });
+    let (v, paths) = compute()?;
+    let stamps: Vec<(PathBuf, Stamp)> = paths
+        .into_iter()
+        .map(|p| {
+            let s = stamp(&p);
+            (p, s)
+        })
+        .collect();
+    // Stamps are taken after the reads, so only a file NOT touched since before
+    // the reads began may vouch for the value: any ctime at or after `started`
+    // (or an unknown ctime) means a write could have raced the read, and the
+    // value is returned uncached -- the next call recomputes.
+    let settled = stamps
+        .iter()
+        .all(|(_, s)| s.0.as_ref().is_none_or(|t| t.4 != 0 && t.4 < started));
+    if settled {
+        let mut g = cache.lock().unwrap_or_else(|e| e.into_inner());
+        let m = g.get_or_insert_with(HashMap::new);
+        if m.len() >= 16 && !m.contains_key(&key) {
+            m.clear();
+        }
+        m.insert(key, (stamps, Some(v)));
+    }
+    Some(v)
+}
+
+fn global_git_print_inner(
+    dir: Option<&Path>,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Option<(u64, Vec<PathBuf>)> {
     use std::hash::{Hash, Hasher};
     let home = env("HOME").map(PathBuf::from);
     let mut files = Vec::new();
     global_config_files(env, home.as_deref(), &mut files)?;
-    let mut excludes: Option<PathBuf> = None;
+    // The repo's own configs can name files outside the repo.
+    if let Some(dir) = dir {
+        let common = crate::util::git_common_dir(dir);
+        push_config(common.join("config"), home.as_deref(), 0, &mut files)?;
+        push_config(
+            common.join("config.worktree"),
+            home.as_deref(),
+            0,
+            &mut files,
+        )?;
+        if let Some(gd) = git_dir(dir) {
+            push_config(gd.join("config.worktree"), home.as_deref(), 0, &mut files)?;
+        }
+    }
+    let xdg = env("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| home.as_ref().map(|h| h.join(".config")));
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(x) = &xdg {
+        candidates.push(x.join("git/ignore"));
+        candidates.push(x.join("git/attributes"));
+    }
     for (path, _) in &files {
         let Some(text) = read_config(path) else {
             continue;
         };
-        for line in text.lines() {
-            if let Some(v) = key_value(line, "excludesfile") {
-                excludes = Some(match v.strip_prefix("~/") {
+        for key in ["excludesfile", "attributesfile"] {
+            for v in core_values(&text, key) {
+                candidates.push(match v.strip_prefix("~/") {
                     Some(rest) => home.as_ref()?.join(rest),
                     None => PathBuf::from(v),
                 });
             }
         }
     }
-    let excludes = excludes.or_else(|| {
-        env("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .or_else(|| home.as_ref().map(|h| h.join(".config")))
-            .map(|x| x.join("git/ignore"))
-    });
+    candidates.sort();
+    candidates.dedup();
     let mut h = std::collections::hash_map::DefaultHasher::new();
     files.hash(&mut h);
-    if let Some(e) = &excludes {
-        e.hash(&mut h);
-        // Content (small, capped), not just a stamp.
-        read_config(e).as_deref().map(hash_text).hash(&mut h);
+    for c in &candidates {
+        c.hash(&mut h);
+        read_strict(c).ok()?.as_deref().map(hash_text).hash(&mut h);
     }
-    for k in [
-        "GIT_CONFIG_COUNT",
-        "GIT_CONFIG_PARAMETERS",
-        "GIT_CONFIG_GLOBAL",
-    ] {
-        env(k).hash(&mut h);
-    }
-    Some(h.finish())
+    env_signature(env).hash(&mut h);
+    let mut touched: Vec<PathBuf> = files.into_iter().map(|(p, _)| p).collect();
+    touched.extend(candidates);
+    Some((h.finish(), touched))
 }
 
 /// Compute the [`OriginInputs`] for `dir`, reading the environment through
@@ -1097,15 +1281,15 @@ mod tests {
         std::fs::create_dir_all(home.join(".config/git")).unwrap();
         let h = home.to_str().unwrap();
         let env = env_of(&[("HOME", h), ("GIT_CONFIG_NOSYSTEM", "1")]);
-        let a = global_git_print_with(&env).expect("computable");
-        assert_eq!(a, global_git_print_with(&env).unwrap());
+        let a = global_git_print_with(None, &env).expect("computable");
+        assert_eq!(a, global_git_print_with(None, &env).unwrap());
         // The default excludes file.
         std::fs::write(home.join(".config/git/ignore"), "*.tmp\n").unwrap();
-        let b = global_git_print_with(&env).unwrap();
+        let b = global_git_print_with(None, &env).unwrap();
         assert_ne!(a, b);
         // Global config edit.
         std::fs::write(home.join(".gitconfig"), "[user]\n\tname = x\n").unwrap();
-        let c = global_git_print_with(&env).unwrap();
+        let c = global_git_print_with(None, &env).unwrap();
         assert_ne!(b, c);
         // core.excludesFile redirects the excludes file; its content then counts.
         let ex = home.join("myignore");
@@ -1115,9 +1299,13 @@ mod tests {
             format!("[core]\n\texcludesFile = {}\n", ex.display()),
         )
         .unwrap();
-        let d = global_git_print_with(&env).unwrap();
+        let d = global_git_print_with(None, &env).unwrap();
         std::fs::write(&ex, "b\n").unwrap();
-        assert_ne!(d, global_git_print_with(&env).unwrap(), "excludes content");
+        assert_ne!(
+            d,
+            global_git_print_with(None, &env).unwrap(),
+            "excludes content"
+        );
     }
 
     #[test]
@@ -1148,6 +1336,141 @@ mod tests {
         assert!(!is_reftable(&repo));
         std::fs::create_dir_all(repo.join(".git/reftable")).unwrap();
         assert!(is_reftable(&repo));
+    }
+
+    #[test]
+    fn system_config_is_derived_like_git_does() {
+        let d = |p: &str| derive_system_config(Path::new(p));
+        assert_eq!(
+            d("/usr/libexec/git-core"),
+            Some(PathBuf::from("/etc/gitconfig"))
+        );
+        assert_eq!(
+            d("/usr/lib/git-core"),
+            Some(PathBuf::from("/etc/gitconfig"))
+        );
+        assert_eq!(
+            d("/nix/store/abc-git-2.40/libexec/git-core"),
+            Some(PathBuf::from("/nix/store/abc-git-2.40/etc/gitconfig"))
+        );
+        assert_eq!(
+            d("/opt/homebrew/Cellar/git/2.40/libexec/git-core"),
+            Some(PathBuf::from("/opt/homebrew/Cellar/git/2.40/etc/gitconfig"))
+        );
+        assert_eq!(d("/weird/place"), None);
+        assert_eq!(d("/usr/share/git-core"), None);
+    }
+
+    #[test]
+    fn global_print_covers_attributes_repo_config_excludes_and_fails_closed() {
+        let base = tmp("globalprint2");
+        let home = base.join("home");
+        std::fs::create_dir_all(home.join(".config/git")).unwrap();
+        let outside = base.join("outside-ignore");
+        std::fs::write(&outside, "a\n").unwrap();
+        let repo = repo_with_config(
+            &base,
+            &format!("[core]\n\texcludesFile = {}\n", outside.display()),
+        );
+        let env = env_of(&[
+            ("HOME", home.to_str().unwrap()),
+            ("GIT_CONFIG_NOSYSTEM", "1"),
+        ]);
+        let a = global_git_print_with(Some(&repo), &env).expect("computable");
+        // A core.excludesFile named by the REPO config, outside the repo.
+        std::fs::write(&outside, "b\n").unwrap();
+        let b = global_git_print_with(Some(&repo), &env).unwrap();
+        assert_ne!(a, b, "repo-config excludes file content");
+        // The default attributes file.
+        std::fs::write(home.join(".config/git/attributes"), "*.x diff=y\n").unwrap();
+        let c = global_git_print_with(Some(&repo), &env).unwrap();
+        assert_ne!(b, c, "default attributes file");
+        // core.attributesFile from the global config.
+        let attrs = home.join("attrs");
+        std::fs::write(&attrs, "p\n").unwrap();
+        std::fs::write(
+            home.join(".gitconfig"),
+            format!("[core]\n\tattributesFile = {}\n", attrs.display()),
+        )
+        .unwrap();
+        let d = global_git_print_with(Some(&repo), &env).unwrap();
+        std::fs::write(&attrs, "q\n").unwrap();
+        assert_ne!(d, global_git_print_with(Some(&repo), &env).unwrap());
+        // Fail closed: an oversized named file => no print at all.
+        std::fs::write(&attrs, vec![b'x'; MAX_CONFIG_BYTES + 1]).unwrap();
+        assert_eq!(global_git_print_with(Some(&repo), &env), None);
+        std::fs::write(&attrs, "ok\n").unwrap();
+        assert!(global_git_print_with(Some(&repo), &env).is_some());
+        // core_values only reads [core].
+        assert_eq!(
+            core_values(
+                "[user]\n\texcludesfile = no\n[Core]\n\tExcludesFile = yes # c\n",
+                "excludesfile"
+            ),
+            vec!["yes"]
+        );
+    }
+
+    #[test]
+    fn global_print_precedence_orders_xdg_before_home() {
+        let base = tmp("precedence");
+        let home = base.join("home");
+        std::fs::create_dir_all(home.join(".config/git")).unwrap();
+        std::fs::write(home.join(".config/git/config"), "[core]\n\tx = xdg\n").unwrap();
+        std::fs::write(home.join(".gitconfig"), "[core]\n\tx = home\n").unwrap();
+        let env = env_of(&[
+            ("HOME", home.to_str().unwrap()),
+            ("GIT_CONFIG_NOSYSTEM", "1"),
+        ]);
+        let mut files = Vec::new();
+        global_config_files(&env, Some(&home), &mut files).unwrap();
+        let order: Vec<_> = files.iter().map(|(p, _)| p.clone()).collect();
+        assert_eq!(
+            order,
+            vec![home.join(".config/git/config"), home.join(".gitconfig")],
+            "XDG first, ~/.gitconfig later (and so winning)"
+        );
+    }
+
+    #[test]
+    fn stamp_memo_serves_stats_not_reads_and_refuses_a_racing_write() {
+        let base = tmp("stampmemo");
+        let f = base.join("cfg");
+        std::fs::write(&f, "one\n").unwrap();
+        // Let the file's ctime fall strictly before the memo's start.
+        std::thread::sleep(std::time::Duration::from_millis(120));
+        let cache: GlobalPrintCache = Mutex::new(None);
+        let key = (base.clone(), 1u64);
+        let computes = std::cell::Cell::new(0);
+        let run = |cache: &GlobalPrintCache| {
+            stamp_memoised(cache, key.clone(), || {
+                computes.set(computes.get() + 1);
+                Some((computes.get() as u64, vec![f.clone()]))
+            })
+        };
+        assert_eq!(run(&cache), Some(1));
+        assert_eq!(run(&cache), Some(1), "second call is a stat-only hit");
+        assert_eq!(computes.get(), 1);
+        std::thread::sleep(std::time::Duration::from_millis(120));
+        std::fs::write(&f, "two!\n").unwrap();
+        assert_eq!(run(&cache), Some(2), "a changed file recomputes");
+        // A file written DURING the compute is never cached.
+        let cache2: GlobalPrintCache = Mutex::new(None);
+        let n = std::cell::Cell::new(0);
+        let racing = |c: &GlobalPrintCache| {
+            stamp_memoised(c, key.clone(), || {
+                n.set(n.get() + 1);
+                std::fs::write(&f, format!("w{}", n.get())).unwrap();
+                Some((n.get() as u64, vec![f.clone()]))
+            })
+        };
+        racing(&cache2);
+        racing(&cache2);
+        assert_eq!(
+            n.get(),
+            2,
+            "uncached because the file moved during the read"
+        );
     }
 
     #[test]

@@ -2633,7 +2633,7 @@ pub(crate) fn build_panel(
     let watch_print = matches!(loc, GitLoc::Local(_))
         .then(|| crate::diff_watch::current_print(cwd))
         .flatten()
-        .zip(thegn_core::git_memo::global_git_print());
+        .zip(thegn_core::git_memo::global_git_print(cwd));
     let cached_reads = watch_print.and_then(|k| crate::panel_git_cache::get(cwd, k));
     let reads_ok = std::sync::atomic::AtomicBool::new(true);
 
