@@ -176,7 +176,8 @@ pub struct IssueAccount {
     pub token: String,
     /// Linear: restrict to a single team id (`""` = all teams).
     pub team_id: String,
-    /// Linear: workspace slug (used for URLs; inferred if empty).
+    /// Linear: workspace slug. Only affects issue URLs (inferred if empty); it
+    /// is not a scope or access boundary.
     pub workspace_slug: String,
     /// Jira / Kaneo: instance base URL, e.g. `"https://myorg.atlassian.net"` or
     /// `"https://kaneo.example.com"`.
@@ -239,7 +240,8 @@ pub struct LinearConfig {
     pub api_key: String,
     /// Restrict to a single team id. `""` = all teams.
     pub team_id: String,
-    /// Optional workspace slug (used for URLs; inferred if empty).
+    /// Optional workspace slug. Only affects issue URLs (inferred if empty); it
+    /// is not a scope or access boundary.
     pub workspace_slug: String,
 }
 
@@ -425,7 +427,14 @@ impl IssuesOverlay {
         if let Some(p) = self.providers {
             // "Enabled" is the legacy provider set plus the providers of the
             // active explicit accounts (accounts mode).
-            let mut enabled = base.active_providers();
+            // In accounts mode (`issue_accounts` non-empty) only the accounts'
+            // providers count: legacy providers there have no active account.
+            let accounts_mode = !base.issue_accounts.is_empty();
+            let mut enabled = if accounts_mode {
+                Vec::new()
+            } else {
+                base.active_providers()
+            };
             for a in base.active_accounts() {
                 if !enabled.contains(&a.provider) {
                     enabled.push(a.provider);
@@ -447,6 +456,11 @@ impl IssuesOverlay {
             base.provider = IssueProviderKind::None;
             // In accounts mode the intersected set also filters the accounts.
             base.issue_accounts.retain(|a| kept.contains(&a.provider));
+            if accounts_mode {
+                // An emptied list must mean NO accounts, never a re-synthesis
+                // of legacy accounts (and their sub-table tokens).
+                base.accounts_restricted = true;
+            }
             base.providers = kept;
         }
         if let Some(names) = self.accounts {
@@ -517,6 +531,31 @@ impl IssuesOverlay {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repo_providers_cannot_activate_unused_legacy_credential() {
+        let mut base = IssuesConfig {
+            jira: JiraConfig {
+                api_token: "LEGACY_JIRA_CANARY".into(),
+                ..Default::default()
+            },
+            provider: IssueProviderKind::Jira,
+            issue_accounts: vec![IssueAccount {
+                name: "lin".into(),
+                provider: IssueProviderKind::Linear,
+                token: "LIN_CANARY".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let refused = IssuesOverlay {
+            providers: Some(vec![IssueProviderKind::Jira]),
+            ..Default::default()
+        }
+        .apply(&mut base);
+        assert_eq!(refused.len(), 1);
+        assert!(base.active_accounts().is_empty());
+    }
 
     #[test]
     fn active_accounts_empty_by_default() {

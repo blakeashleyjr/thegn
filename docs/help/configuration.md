@@ -23,7 +23,8 @@ global scope, including choosing the default destination for user-initiated
 creates, but never widen it: `providers` is intersected with the globally
 enabled set, and a Linear team, Jira project, or Kaneo workspace/project pinned
 in your own config is a ceiling the repo can only restate. Refused values are
-ignored and logged once per repo.
+ignored and logged once per repo. `linear.workspace_slug` is not a scope: it
+only affects issue URLs.
 
 CI autofix is only permitted in trusted user configuration:
 `[project.<slug>.ci] mode = "suggest"` or `"auto"`; a repo-authored file

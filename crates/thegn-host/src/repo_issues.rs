@@ -80,6 +80,15 @@ mod tests {
     }
 
     #[test]
+    fn pinned_global_kaneo_project_is_not_overridden_by_overlay() {
+        let repo = overlay_repo();
+        let mut cfg = two_account_config();
+        cfg.issues.kaneo.project_id = "PROJECT-GLOBAL".into();
+        let scoped = for_path(&cfg, repo.path()).unwrap();
+        assert_eq!(scoped.kaneo.project_id, "PROJECT-GLOBAL");
+    }
+
+    #[test]
     fn explicit_non_repository_is_rejected() {
         let dir = tempfile::tempdir().unwrap();
         assert!(for_path(&Config::default(), dir.path()).is_err());
@@ -168,7 +177,6 @@ pub(crate) mod test_support {
     pub(crate) fn two_account_config() -> Config {
         let mut cfg = Config::default();
         cfg.issues.providers = vec![IssueProviderKind::Linear];
-        cfg.issues.kaneo.project_id = "PROJECT-GLOBAL".into();
         cfg.issues.issue_accounts = vec![
             IssueAccount {
                 name: "work-linear".into(),

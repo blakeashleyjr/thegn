@@ -441,7 +441,10 @@ mod tests {
         assert_eq!(inside.issues.issue_accounts.len(), 1);
         let outside = tempfile::tempdir().unwrap();
         let global = crate::repo_issues::config_for_dir(&cfg, Some(outside.path()));
-        assert_eq!(resolve_project(&global, None).unwrap(), "PROJECT-GLOBAL");
+        assert!(
+            resolve_project(&global, None).is_err(),
+            "unpinned global has no default"
+        );
         assert_eq!(global.issues.issue_accounts.len(), 2);
         // An explicit project always wins.
         assert_eq!(resolve_project(&inside, Some("X".into())).unwrap(), "X");
