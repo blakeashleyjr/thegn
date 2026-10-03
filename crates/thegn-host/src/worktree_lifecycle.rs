@@ -400,6 +400,8 @@ pub fn schedule_post_create(
     db: Option<&Db>,
     waker: Option<termwiz::terminal::TerminalWaker>,
 ) -> Result<(), LifecycleReport> {
+    // A freshly created/registered worktree may reuse a once-removed path.
+    forget_removed_worktree(worktree);
     let policy = resolve(cfg, repo_root, db);
     let waits_for_pane = policy
         .entries(HookEvent::PostCreate)
@@ -785,6 +787,14 @@ pub(crate) fn destroy_one_checked(
             "physical worktree cleanup is already in progress".into(),
         );
     };
+    // Remote/provider worktrees are never tombstoned: their local path is not
+    // authoritative, and a later worktree at that path must not be dropped.
+    let is_remote = db
+        .and_then(|d| d.location_for(&worktree.to_string_lossy()).ok().flatten())
+        .is_some_and(|loc| {
+            let loc = loc.trim();
+            !loc.is_empty() && loc != "local"
+        });
     if let Err(error) = guard() {
         return (false, error);
     }
@@ -861,7 +871,9 @@ pub(crate) fn destroy_one_checked(
             format!("could not remove worktree at {}", worktree.display()),
         );
     }
-    note_worktree_removed(worktree);
+    if !is_remote {
+        note_worktree_removed(worktree);
+    }
 
     let post = run_event_with_db(
         cfg,
@@ -1200,6 +1212,15 @@ fn try_physical_destroy_path(path: &Path) -> Option<PhysicalDestroyClaim> {
         .then(|| PhysicalDestroyClaim(key))
 }
 
+fn physical_destroy_claims_exist() -> bool {
+    PHYSICAL_DESTROY_CLAIMS.get().is_some_and(|claims| {
+        !claims
+            .lock()
+            .expect("physical claim mutex poisoned")
+            .is_empty()
+    })
+}
+
 fn physical_destroy_in_progress(key: &Path) -> bool {
     PHYSICAL_DESTROY_CLAIMS.get().is_some_and(|claims| {
         claims
@@ -1209,24 +1230,59 @@ fn physical_destroy_in_progress(key: &Path) -> bool {
     })
 }
 
-static REMOVED_WORKTREES: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+/// Bound on remembered removals; the oldest entry is dropped first.
+const REMOVED_WORKTREES_CAP: usize = 1024;
 
-/// Remember a worktree path that this process physically removed, so a layout
-/// snapshot captured before the removal cannot recreate its tab rows after the
-/// cleanup deleted them (THE-689 race 2).
+static REMOVED_WORKTREES: OnceLock<Mutex<std::collections::VecDeque<String>>> = OnceLock::new();
+
+/// Remember a LOCAL worktree path that this process physically removed, so a
+/// layout snapshot captured before the removal cannot recreate its tab rows
+/// after the cleanup deleted them (THE-689 race 2). Per-process only: a removal
+/// made by another process (e.g. the CLI landing) is not covered.
 fn note_worktree_removed(worktree: &Path) {
+    // Resolve the canonical alias BEFORE taking the mutex (filesystem work).
+    let raw = worktree.to_string_lossy().into_owned();
+    let canonical = destroy_key(worktree).to_string_lossy().into_owned();
     let mut set = REMOVED_WORKTREES
-        .get_or_init(|| Mutex::new(HashSet::new()))
+        .get_or_init(|| Mutex::new(std::collections::VecDeque::new()))
         .lock()
         .expect("removed worktree mutex poisoned");
-    set.insert(worktree.to_string_lossy().into_owned());
-    set.insert(destroy_key(worktree).to_string_lossy().into_owned());
+    for key in [raw, canonical] {
+        if !set.contains(&key) {
+            if set.len() >= REMOVED_WORKTREES_CAP {
+                set.pop_front();
+            }
+            set.push_back(key);
+        }
+    }
+}
+
+/// A worktree exists at `worktree` again (created, registered, or a session
+/// started in it): it is no longer a removal tombstone.
+pub(crate) fn forget_removed_worktree(worktree: &Path) {
+    let Some(set) = REMOVED_WORKTREES.get() else {
+        return;
+    };
+    let mut set = set.lock().expect("removed worktree mutex poisoned");
+    if set.is_empty() {
+        return;
+    }
+    let raw = worktree.to_string_lossy();
+    set.retain(|k| k.as_str() != raw);
+    drop(set);
+    // Canonical alias: only resolved when something is actually remembered.
+    let canonical = destroy_key(worktree).to_string_lossy().into_owned();
+    if let Some(set) = REMOVED_WORKTREES.get() {
+        set.lock()
+            .expect("removed worktree mutex poisoned")
+            .retain(|k| *k != canonical);
+    }
 }
 
 /// Drop snapshot groups (and their tabs) for worktrees this process removed and
-/// whose directory is still absent. A re-created directory is not filtered, and
-/// a path never removed here (a transiently missing registry row, a remote
-/// worktree) is never touched.
+/// whose directory is still absent. A re-created directory is not filtered (and
+/// its entry is pruned), and a path never removed here (a transiently missing
+/// registry row, a remote worktree) is never touched.
 pub(crate) fn drop_removed_worktrees(
     groups: &[thegn_core::models::TabGroupRow],
     tabs: &[thegn_core::models::GroupTabRow],
@@ -1234,19 +1290,27 @@ pub(crate) fn drop_removed_worktrees(
     Vec<thegn_core::models::TabGroupRow>,
     Vec<thegn_core::models::GroupTabRow>,
 ) {
-    let removed: HashSet<String> = match REMOVED_WORKTREES.get() {
-        Some(set) => set.lock().expect("removed worktree mutex poisoned").clone(),
-        None => HashSet::new(),
-    };
-    if removed.is_empty() {
+    let Some(set) = REMOVED_WORKTREES.get() else {
         return (groups.to_vec(), tabs.to_vec());
+    };
+    let mut dead: HashSet<&str> = HashSet::new();
+    {
+        let mut set = set.lock().expect("removed worktree mutex poisoned");
+        if set.is_empty() {
+            return (groups.to_vec(), tabs.to_vec());
+        }
+        for g in groups {
+            if g.worktree.is_empty() || !set.iter().any(|k| *k == g.worktree) {
+                continue;
+            }
+            if Path::new(&g.worktree).exists() {
+                // Re-created: prune the stale tombstone.
+                set.retain(|k| *k != g.worktree);
+            } else {
+                dead.insert(g.name.as_str());
+            }
+        }
     }
-    let dead: HashSet<&str> = groups
-        .iter()
-        .filter(|g| !g.worktree.is_empty() && removed.contains(&g.worktree))
-        .filter(|g| !Path::new(&g.worktree).exists())
-        .map(|g| g.name.as_str())
-        .collect();
     (
         groups
             .iter()
@@ -1318,6 +1382,10 @@ fn release_destroy_path(path: &Path) {
 
 /// Schedule `session_start` once for the current host session and worktree.
 /// The latch is process-local and intentionally not persisted in SQLite.
+///
+/// THE-689 scope: this admission closes the destroy race for shell panes only
+/// (other pane kinds do not go through here), and both it and the removal
+/// tombstone are per-process; a cross-process removal is not covered.
 pub fn session_start_once(
     cfg: &Config,
     worktree: &Path,
@@ -1327,26 +1395,36 @@ pub fn session_start_once(
         return Ok(false);
     }
     let key = session_key(worktree);
-    // Admission (THE-689): a worktree under a physical destroy claim must not
-    // gain a session. Resolve the claim key BEFORE taking the runtime lock (it
-    // touches the filesystem), then check the claim and insert the latch under
-    // that one lock. Destroy takes its claim first and reads the latch in its
-    // guards afterwards, so every interleaving is refused on one side: start
-    // sees the claim, or the destroy guard sees the latch.
-    let claim_key = destroy_key(worktree);
-    {
+    // Admission (THE-689, shell panes only; per-process). Destroy takes its
+    // physical claim first and its guards read the latch afterwards, so under
+    // this one lock either start sees the claim or the destroy guard sees the
+    // latch. The common case (no destroy in flight) never touches the
+    // filesystem: only when a claim exists do we release the lock, resolve the
+    // canonical claim key, and retry.
+    let mut claim_key: Option<PathBuf> = None;
+    loop {
         let mut runtime = session_runtime()
             .lock()
             .expect("session runtime mutex poisoned");
-        if physical_destroy_in_progress(&claim_key) {
-            return Err(std::io::Error::other(
-                "worktree is being cleaned up; session not started",
-            ));
+        if physical_destroy_claims_exist() {
+            let Some(resolved) = claim_key.as_ref() else {
+                drop(runtime);
+                claim_key = Some(destroy_key(worktree));
+                continue;
+            };
+            if physical_destroy_in_progress(resolved) {
+                return Err(std::io::Error::other(
+                    "worktree is being cleaned up; session not started",
+                ));
+            }
         }
         if !runtime.latches.insert(key.clone()) {
             return Ok(false);
         }
+        break;
     }
+    // A live session means a live worktree: never a removal tombstone.
+    forget_removed_worktree(worktree);
     let spawned = spawn_session_event(
         cfg.clone(),
         worktree.to_path_buf(),
@@ -1434,11 +1512,34 @@ fn claim_session_end(key: &SessionKey) -> Option<SessionEndGuard> {
 /// Automatic collection must not take over an active/in-flight session hook.
 pub(crate) fn automatic_cleanup_session_absent(worktree: &Path) -> Result<(), String> {
     let key = session_key(worktree);
-    let runtime = session_runtime()
-        .lock()
-        .map_err(|_| "session registry unavailable")?;
-    if runtime.latches.contains(&key) || runtime.ending.contains_key(&key) {
-        return Err("active session requires explicit cleanup".into());
+    let pid = key.1.clone();
+    let candidates: Vec<String> = {
+        let runtime = session_runtime()
+            .lock()
+            .map_err(|_| "session registry unavailable")?;
+        if runtime.latches.contains(&key) || runtime.ending.contains_key(&key) {
+            return Err("active session requires explicit cleanup".into());
+        }
+        runtime
+            .latches
+            .iter()
+            .chain(runtime.ending.keys())
+            .filter(|(path, p)| *p == pid && !path.is_empty())
+            .map(|(path, _)| path.clone())
+            .collect()
+    };
+    // Path aliases: a session latched under a different spelling of this
+    // directory (symlink) must also veto. Resolved outside the lock; a start
+    // that races past this snapshot began after our destroy claim and is
+    // refused by admission instead.
+    if !candidates.is_empty() {
+        let target = destroy_key(worktree);
+        if candidates
+            .iter()
+            .any(|path| destroy_key(Path::new(path)) == target)
+        {
+            return Err("active session requires explicit cleanup".into());
+        }
     }
     Ok(())
 }
@@ -1803,17 +1904,16 @@ mod tests {
         release_destroy_path(&path);
     }
 
-    fn unique_tmp(tag: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "tg-689-{tag}-{}-{}",
-            std::process::id(),
-            thegn_core::util::now()
-        ))
+    /// A fresh directory inside a self-cleaning tempdir. Returns the guard too.
+    fn unique_tmp(tag: &str) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(tag);
+        (dir, path)
     }
 
     #[test]
     fn session_start_is_refused_while_a_physical_destroy_claim_is_held() {
-        let worktree = unique_tmp("admit");
+        let (_td, worktree) = unique_tmp("admit");
         std::fs::create_dir_all(&worktree).unwrap();
         let claim = try_physical_destroy_path(&worktree).unwrap();
         let err = session_start_once(&Config::default(), &worktree, None).unwrap_err();
@@ -1823,18 +1923,16 @@ mod tests {
         drop(claim);
         assert!(session_start_once(&Config::default(), &worktree, None).unwrap());
         release_session_start(&worktree);
-        std::fs::remove_dir_all(&worktree).ok();
     }
 
     #[test]
     fn destroy_guard_sees_a_session_started_before_the_claim() {
-        let worktree = unique_tmp("guard");
+        let (_td, worktree) = unique_tmp("guard");
         std::fs::create_dir_all(&worktree).unwrap();
         assert!(session_start_once(&Config::default(), &worktree, None).unwrap());
         let _claim = try_physical_destroy_path(&worktree).unwrap();
         assert!(automatic_cleanup_session_absent(&worktree).is_err());
         release_session_start(&worktree);
-        std::fs::remove_dir_all(&worktree).ok();
     }
 
     fn layout_rows(
@@ -1869,8 +1967,9 @@ mod tests {
     #[test]
     fn stale_layout_snapshot_cannot_resurrect_a_removed_worktree() {
         use thegn_core::store::WorkspaceStore;
-        let gone = unique_tmp("gone");
-        let kept = unique_tmp("kept");
+        let (_td, base) = unique_tmp("base");
+        let gone = base.join("gone");
+        let kept = base.join("kept");
         std::fs::create_dir_all(&gone).unwrap();
         std::fs::create_dir_all(&kept).unwrap();
         let (g1, t1) = layout_rows(&gone.to_string_lossy(), "app/gone");
@@ -1900,8 +1999,6 @@ mod tests {
         std::fs::create_dir_all(&gone).unwrap();
         crate::session::Session::write_layout(&db, &snap).unwrap();
         assert_eq!(db.groups_for_session("s689").unwrap().len(), 2);
-        std::fs::remove_dir_all(&gone).ok();
-        std::fs::remove_dir_all(&kept).ok();
     }
 
     #[test]
@@ -1918,6 +2015,40 @@ mod tests {
         let db = Db::open_memory().unwrap();
         crate::session::Session::write_layout(&db, &snap).unwrap();
         assert_eq!(db.groups_for_session("s689b").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn re_registering_a_removed_path_clears_its_tombstone() {
+        use thegn_core::store::WorkspaceStore;
+        let (_td, path) = unique_tmp("reuse");
+        let p = path.to_string_lossy().into_owned();
+        note_worktree_removed(&path);
+        forget_removed_worktree(&path);
+        let (g, t) = layout_rows(&p, "app/reuse");
+        let snap = crate::session::LayoutSnapshot {
+            session: "s689c".into(),
+            groups: vec![g],
+            tabs: vec![t],
+            active: None,
+            now: 1,
+        };
+        let db = Db::open_memory().unwrap();
+        // Directory transiently absent, but the path was re-registered.
+        crate::session::Session::write_layout(&db, &snap).unwrap();
+        assert_eq!(db.groups_for_session("s689c").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn destroy_guard_vetoes_a_session_latched_under_a_path_alias() {
+        let (_td, base) = unique_tmp("alias");
+        let real = base.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(session_start_once(&Config::default(), &link, None).unwrap());
+        assert!(automatic_cleanup_session_absent(&real).is_err());
+        release_session_start(&link);
+        assert!(automatic_cleanup_session_absent(&real).is_ok());
     }
 
     #[test]
