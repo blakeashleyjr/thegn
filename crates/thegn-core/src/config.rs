@@ -6896,12 +6896,8 @@ impl Config {
             && let Some(overlay) = load_repo_overlay(root)
             && !overlay.issues.is_empty()
         {
-            for why in overlay.issues.apply(&mut issues) {
-                tracing::warn!(
-                    repo = %root.display(),
-                    "repo [issues] overlay refused (restrict-only): {why}"
-                );
-            }
+            let refused = overlay.issues.apply(&mut issues);
+            crate::config_issues::warn_refusals_once(root, &refused);
         }
         issues
     }

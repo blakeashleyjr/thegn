@@ -324,6 +324,13 @@ impl Default for KaneoConfig {
 /// team / Jira project that scopes its "My Work" feed (GitHub is auto-scoped to
 /// the repo's remote and needs no config). Same Option-field shape as
 /// `SandboxOverlay`.
+///
+/// The overlay is restrict-only: a repo may narrow an UNPINNED global scope
+/// (including choosing the default destination for user-initiated creates) but
+/// never widen it — providers are intersected with the globally enabled set and
+/// a non-empty global pin is a ceiling. Pins are applied to the legacy
+/// single-provider sub-tables only; in accounts mode (`[[issue_accounts]]`)
+/// each account carries its own scope and repo pins are not applied to it.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct IssuesOverlay {
@@ -374,6 +381,39 @@ fn narrow_pin(field: &str, global: &mut String, repo: String, refused: &mut Vec<
     }
 }
 
+/// Bounded per-process set of already-logged `(repo root, message)` refusals.
+static LOGGED_REFUSALS: std::sync::Mutex<Vec<(std::path::PathBuf, String)>> =
+    std::sync::Mutex::new(Vec::new());
+const LOGGED_REFUSALS_CAP: usize = 256;
+
+/// True the first time `(root, msg)` is seen in this process (bounded: the set
+/// is cleared when it reaches the cap, so a flood can only cause re-logging).
+fn first_refusal(root: &std::path::Path, msg: &str) -> bool {
+    let Ok(mut seen) = LOGGED_REFUSALS.lock() else {
+        return true;
+    };
+    if seen.iter().any(|(r, m)| r == root && m == msg) {
+        return false;
+    }
+    if seen.len() >= LOGGED_REFUSALS_CAP {
+        seen.clear();
+    }
+    seen.push((root.to_path_buf(), msg.to_string()));
+    true
+}
+
+/// Warn about refused overlay widening, once per `(repo root, message)`.
+pub(crate) fn warn_refusals_once(root: &std::path::Path, refused: &[String]) {
+    for why in refused {
+        if first_refusal(root, why) {
+            tracing::warn!(
+                repo = %root.display(),
+                "repo [issues] overlay refused (restrict-only): {why}"
+            );
+        }
+    }
+}
+
 impl IssuesOverlay {
     /// Field-merge present keys into a base [`IssuesConfig`] (absent inherit).
     ///
@@ -383,7 +423,14 @@ impl IssuesOverlay {
     pub(crate) fn apply(self, base: &mut IssuesConfig) -> Vec<String> {
         let mut refused = Vec::new();
         if let Some(p) = self.providers {
-            let enabled = base.active_providers();
+            // "Enabled" is the legacy provider set plus the providers of the
+            // active explicit accounts (accounts mode).
+            let mut enabled = base.active_providers();
+            for a in base.active_accounts() {
+                if !enabled.contains(&a.provider) {
+                    enabled.push(a.provider);
+                }
+            }
             let mut kept: Vec<IssueProviderKind> = Vec::new();
             for k in p {
                 if enabled.contains(&k) {
@@ -398,6 +445,8 @@ impl IssuesOverlay {
             // single `provider` so `providers = []` resolves to *none* instead of
             // falling back to the legacy provider in `active_providers`.
             base.provider = IssueProviderKind::None;
+            // In accounts mode the intersected set also filters the accounts.
+            base.issue_accounts.retain(|a| kept.contains(&a.provider));
             base.providers = kept;
         }
         if let Some(names) = self.accounts {
@@ -420,21 +469,35 @@ impl IssuesOverlay {
                 &mut refused,
             );
         }
+        // Kaneo workspace + project are ONE nested ceiling: a project may live in
+        // another workspace and the config layer cannot verify membership.
+        let (g_ws, g_proj) = (
+            base.kaneo.workspace_id.clone(),
+            base.kaneo.project_id.clone(),
+        );
         if let Some(w) = self.kaneo.workspace_id {
-            narrow_pin(
-                "kaneo.workspace_id",
-                &mut base.kaneo.workspace_id,
-                w,
-                &mut refused,
-            );
+            if g_ws.is_empty() && !g_proj.is_empty() && w != g_ws {
+                refused.push("kaneo.workspace_id pin is outside the global scope".into());
+            } else {
+                narrow_pin(
+                    "kaneo.workspace_id",
+                    &mut base.kaneo.workspace_id,
+                    w,
+                    &mut refused,
+                );
+            }
         }
         if let Some(p) = self.kaneo.project_id {
-            narrow_pin(
-                "kaneo.project_id",
-                &mut base.kaneo.project_id,
-                p,
-                &mut refused,
-            );
+            if g_proj.is_empty() && !g_ws.is_empty() && !p.is_empty() {
+                refused.push("kaneo.project_id pin is outside the global scope".into());
+            } else {
+                narrow_pin(
+                    "kaneo.project_id",
+                    &mut base.kaneo.project_id,
+                    p,
+                    &mut refused,
+                );
+            }
         }
         refused
     }
@@ -768,5 +831,77 @@ mod tests {
         assert_eq!(base.jira.project_key, "J");
         assert_eq!(base.kaneo.workspace_id, "w");
         assert_eq!(base.kaneo.project_id, "p");
+    }
+
+    #[test]
+    fn kaneo_pins_are_one_nested_ceiling() {
+        let kaneo = |ws: &str, proj: &str| IssuesConfig {
+            provider: IssueProviderKind::Kaneo,
+            kaneo: KaneoConfig {
+                workspace_id: ws.into(),
+                project_id: proj.into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let ov = |ws: Option<&str>, proj: Option<&str>| IssuesOverlay {
+            kaneo: KaneoOverlay {
+                workspace_id: ws.map(Into::into),
+                project_id: proj.map(Into::into),
+            },
+            ..Default::default()
+        };
+        // Global workspace pinned, project not: a repo project is refused.
+        let mut b = kaneo("w", "");
+        assert_eq!(ov(None, Some("p")).apply(&mut b).len(), 1);
+        assert_eq!(b.kaneo.project_id, "");
+        // Global project pinned, workspace not: a repo workspace is refused.
+        let mut b = kaneo("", "p");
+        assert_eq!(ov(Some("w"), None).apply(&mut b).len(), 1);
+        assert_eq!(b.kaneo.workspace_id, "");
+        // Neither pinned: both accepted.
+        let mut b = kaneo("", "");
+        assert!(ov(Some("w"), Some("p")).apply(&mut b).is_empty());
+        assert_eq!(
+            (b.kaneo.workspace_id.as_str(), b.kaneo.project_id.as_str()),
+            ("w", "p")
+        );
+    }
+
+    #[test]
+    fn overlay_providers_filter_accounts_in_accounts_mode() {
+        let acct = |n: &str, p| IssueAccount {
+            name: n.into(),
+            provider: p,
+            enabled: true,
+            ..Default::default()
+        };
+        let mut base = IssuesConfig {
+            issue_accounts: vec![
+                acct("l", IssueProviderKind::Linear),
+                acct("j", IssueProviderKind::Jira),
+            ],
+            ..Default::default()
+        };
+        let refused = IssuesOverlay {
+            providers: Some(vec![IssueProviderKind::Jira, IssueProviderKind::Github]),
+            ..Default::default()
+        }
+        .apply(&mut base);
+        // Jira is enabled via an account (no diagnostic); github is not.
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert!(refused[0].contains("github"));
+        let names: Vec<_> = base.active_accounts().into_iter().map(|a| a.name).collect();
+        assert_eq!(names, vec!["j".to_string()]);
+    }
+
+    #[test]
+    fn refusal_is_logged_once_per_root_and_message() {
+        let r1 = std::path::Path::new("/tmp/the724-a");
+        let r2 = std::path::Path::new("/tmp/the724-b");
+        assert!(first_refusal(r1, "m"));
+        assert!(!first_refusal(r1, "m"));
+        assert!(first_refusal(r1, "other"));
+        assert!(first_refusal(r2, "m"));
     }
 }

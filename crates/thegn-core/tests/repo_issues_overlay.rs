@@ -35,10 +35,13 @@ fn repo_issues_overlay_scopes_linear_and_jira() {
         vec![IssueProviderKind::Linear, IssueProviderKind::Jira]
     );
     // No repo_root ⇒ global config verbatim (no overlay applied).
-    assert_eq!(cfg.repo_issues(None).linear.team_id, "");
+    assert_eq!(cfg.repo_issues(None).providers, cfg.issues.providers);
     // A repo with no [issues] overlay inherits the global config.
     let empty = tmpdir("empty");
-    assert_eq!(cfg.repo_issues(Some(&empty)).jira.project_key, "");
+    assert_eq!(
+        cfg.repo_issues(Some(&empty)).providers,
+        cfg.issues.providers
+    );
     // best-effort: test cleanup: scratch removal must never fail the test
     let _ = std::fs::remove_dir_all(&dir);
     // best-effort: test cleanup: scratch removal must never fail the test
