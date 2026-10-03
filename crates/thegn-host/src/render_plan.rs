@@ -160,6 +160,21 @@ pub fn plan(damage: &Damage, overlays: &Overlays) -> RenderPlan {
     RenderPlan::Skip
 }
 
+/// Whether a wheel scroll may take the single-pane fast path. It reuses the
+/// prior frame and then every damage channel is cleared, so it is sound only
+/// when the wheel is the SOLE damage (`damage` is empty: the wheel has its own
+/// channel) and the caller's overlay/interaction `guards_clear` all hold.
+/// Main skipped the damage check and dropped any other pending damage (THE-699).
+pub fn scroll_fast_ok(scroll_only: bool, damage: &Damage, guards_clear: bool) -> bool {
+    scroll_only && guards_clear && damage.is_empty()
+}
+
+/// A wheel scroll whose fast path was refused is plain chrome damage: fold it
+/// in so [`plan`] returns `Full` instead of `Skip`.
+pub fn fold_refused_wheel(damage: &mut Damage, scroll_dirty: bool, scroll_fast: bool) {
+    damage.chrome |= scroll_dirty && !scroll_fast;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -575,5 +590,59 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(plan(&d, &Overlays::default()), RenderPlan::Full);
+    }
+
+    #[test]
+    fn scroll_with_empty_damage_takes_fast_path() {
+        assert!(scroll_fast_ok(true, &Damage::default(), true));
+        assert!(!scroll_fast_ok(false, &Damage::default(), true));
+        assert!(!scroll_fast_ok(true, &Damage::default(), false));
+    }
+
+    #[test]
+    fn scroll_plus_other_damage_is_refused_and_plans_full() {
+        for d in [
+            Damage {
+                chrome: true,
+                ..Default::default()
+            },
+            Damage {
+                full: true,
+                ..Default::default()
+            },
+            Damage {
+                switch: true,
+                ..Default::default()
+            },
+            Damage {
+                bars: true,
+                ..Default::default()
+            },
+            Damage {
+                statusbar: true,
+                ..Default::default()
+            },
+            Damage {
+                sidebar: true,
+                ..Default::default()
+            },
+            // Another pane's output next to the wheel: the bug main had.
+            panes(&[2]),
+        ] {
+            assert!(!scroll_fast_ok(true, &d, true), "{d:?}");
+            let mut d = d;
+            fold_refused_wheel(&mut d, true, false);
+            assert_eq!(plan(&d, &Overlays::default()), RenderPlan::Full);
+        }
+    }
+
+    #[test]
+    fn refused_wheel_alone_is_full_never_skip() {
+        let mut d = Damage::default();
+        fold_refused_wheel(&mut d, true, false);
+        assert_eq!(plan(&d, &Overlays::default()), RenderPlan::Full);
+        let mut d = Damage::default();
+        fold_refused_wheel(&mut d, true, true);
+        assert_eq!(plan(&d, &Overlays::default()), RenderPlan::Skip);
     }
 }
