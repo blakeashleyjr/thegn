@@ -155,8 +155,10 @@ pub(crate) fn issues_key(key: char, ctx: &mut TrackerCtx) -> bool {
     match key {
         'o' => {
             if let Some(issue) = cursor_issue(ctx) {
-                open_url_detached(&issue.url);
-                ctx.model.status = format!("Opened {} in browser", issue.number);
+                ctx.model.status =
+                    crate::actions::open_status(open_url_detached(&issue.url), || {
+                        format!("Opened {} in browser", issue.number)
+                    });
             }
             true
         }
