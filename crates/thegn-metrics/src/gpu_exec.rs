@@ -181,7 +181,7 @@ fn capture(stdout: ChildStdout, end: Instant, cap: usize) -> Capture {
         .spawn(move || {
             let mut buf = Vec::new();
             // best-effort: partial output is judged by its length below
-            let _ = stdout.take(limit).read_to_end(&mut buf);
+            let _ = stdout.take(limit).read_to_end(&mut buf); // best-effort: a short read yields a partial or empty sample
             let _ = tx.send(buf); // best-effort: receiver may have timed out
         });
     if spawned.is_err() {
