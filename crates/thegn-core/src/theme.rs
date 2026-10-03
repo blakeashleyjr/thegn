@@ -95,7 +95,17 @@ pub const RESET: &str = "\u{1b}[0m";
 /// Serde'd as the lowercase name (`"teal"`), so a cached calendar event or a
 /// plugin payload names a *role* the active theme resolves — never an RGB
 /// value, which would ignore the user's palette and break light mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+    schemars::JsonSchema,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum Hue {
     Teal,

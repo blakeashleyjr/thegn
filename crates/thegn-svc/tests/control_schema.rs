@@ -16,9 +16,10 @@ use thegn_svc::control::*;
 // Named explicitly rather than glob-imported so a collision with an existing
 // wire type is a compile error here instead of silently shadowing one.
 use thegn_svc::control::http::{
-    AgentSessionsQuery, AttachQuery, CalendarQuery, CommentBody, CommitBody, DetachBody,
-    DispatchStatusBody, EventsQuery, InputBody, IssueBody, IssueRepoQuery, IssuesQuery, MergeBody,
-    OpenWorktreeBody, PairBody, ResizeBody, SplitBody, StageBody, WaitBody, WorktreeQuery,
+    AgentSessionsQuery, AttachQuery, CalendarIngestBody, CalendarQuery, CommentBody, CommitBody,
+    DetachBody, DispatchStatusBody, EventsQuery, InputBody, IssueBody, IssueRepoQuery, IssuesQuery,
+    MergeBody, OpenWorktreeBody, PairBody, ResizeBody, SplitBody, StageBody, WaitBody,
+    WorktreeQuery,
 };
 
 fn wire_schema() -> serde_json::Value {
@@ -88,6 +89,7 @@ fn wire_schema() -> serde_json::Value {
         CommitBody,
         MergeBody,
         CalendarQuery,
+        CalendarIngestBody,
         AgentSessionsQuery,
         EventsQuery,
         AttachQuery,
@@ -158,17 +160,9 @@ fn removed_browser_drive_is_absent_from_generated_contract_inputs() {
 /// the route list plus the snapshot, not here.
 #[test]
 fn http_dtos_are_all_registered_in_the_published_schema() {
-    // Recorded, reviewed exclusions. An entry is NOT "we chose not to publish
-    // this" — it is a representability defect with a named cause, and the list
-    // should shrink to nothing.
-    //
-    // CalendarIngestBody holds `Vec<thegn_core::calendar::CalEvent>`, whose
-    // type graph (EventTime -> NaiveDate / NaiveDateTime / DateTime<Utc> /
-    // TzRef, plus Recurrence, Reminder and theme::Hue) derives no JsonSchema
-    // and would need schemars' chrono support threaded through thegn-core.
-    // That is its own change; until then this endpoint's request shape is
-    // undocumented and callers must read the handler.
-    const UNREPRESENTABLE: &[&str] = &["CalendarIngestBody"];
+    // Recorded, reviewed exclusions: a representability defect with a named
+    // cause. Empty on purpose; the list should stay empty.
+    const UNREPRESENTABLE: &[&str] = &[];
 
     let source = include_str!("../src/control/http.rs");
     let schema = wire_schema();
