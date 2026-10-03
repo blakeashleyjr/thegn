@@ -10,6 +10,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use tokio::runtime::Handle;
@@ -23,6 +24,50 @@ use gtui_core::frame::Frame;
 /// Wake callback fired off-thread after new data lands (posts the slot index +
 /// pulses the terminal waker in the host).
 pub type Waker = Arc<dyn Fn() + Send + Sync>;
+
+/// Shared wake state between the UI-side view-model and the engine task.
+///
+/// * `visible` is flipped synchronously by the UI thread, so a result that
+///   completes after the tab was hidden never wakes the host loop (the engine
+///   only learns of the hide via its command queue, between panels).
+/// * `pending` coalesces wakes: at most one host wake is outstanding until the
+///   UI side drains ([`WakeGate::drained`]). Producers that find it already set
+///   skip the callback, because the pending drain will see their result too.
+#[derive(Debug)]
+pub struct WakeGate {
+    visible: AtomicBool,
+    pending: AtomicBool,
+}
+
+impl WakeGate {
+    pub fn new(visible: bool) -> Arc<Self> {
+        Arc::new(Self {
+            visible: AtomicBool::new(visible),
+            pending: AtomicBool::new(false),
+        })
+    }
+
+    pub fn set_visible(&self, visible: bool) {
+        self.visible.store(visible, Ordering::Release);
+    }
+
+    pub fn is_visible(&self) -> bool {
+        self.visible.load(Ordering::Acquire)
+    }
+
+    /// Fire `waker` unless hidden or a wake is already pending.
+    fn wake(&self, waker: &Waker) {
+        if self.is_visible() && !self.pending.swap(true, Ordering::AcqRel) {
+            waker();
+        }
+    }
+
+    /// The UI side is about to drain: clear the pending flag *before* reading
+    /// the queue so a result landing mid-drain schedules a fresh wake.
+    pub fn drained(&self) {
+        self.pending.store(false, Ordering::Release);
+    }
+}
 
 /// A clock seam for resolving relative query windows.
 ///
@@ -78,6 +123,9 @@ pub enum EngineCmd {
     Pause,
     /// Resume scheduled refreshes; the next query resolves against the clock.
     Resume,
+    /// The tab was shown (`true`, refreshes immediately) or hidden (`false`,
+    /// parks the refresh ticker and every datasource's background sampling).
+    Visible(bool),
 }
 
 /// One panel's query result, delivered to the view-model.
@@ -93,9 +141,11 @@ pub struct QueryEngine {
     clock: Clock,
     last_relative_to: Option<DateTime<Utc>>,
     paused: bool,
+    hidden: bool,
     refresh: Duration,
     frames_tx: mpsc::UnboundedSender<PanelUpdate>,
     waker: Waker,
+    gate: Arc<WakeGate>,
 }
 
 impl QueryEngine {
@@ -108,6 +158,7 @@ impl QueryEngine {
         time_range: TimeRange,
         refresh: Duration,
         waker: Waker,
+        gate: Arc<WakeGate>,
     ) -> (
         mpsc::UnboundedSender<EngineCmd>,
         mpsc::UnboundedReceiver<PanelUpdate>,
@@ -120,6 +171,7 @@ impl QueryEngine {
             refresh,
             Arc::new(Utc::now),
             waker,
+            gate,
         )
     }
 
@@ -134,6 +186,7 @@ impl QueryEngine {
         refresh: Duration,
         clock: Clock,
         waker: Waker,
+        gate: Arc<WakeGate>,
     ) -> (
         mpsc::UnboundedSender<EngineCmd>,
         mpsc::UnboundedReceiver<PanelUpdate>,
@@ -147,9 +200,11 @@ impl QueryEngine {
             clock,
             last_relative_to: None,
             paused: false,
+            hidden: !gate.is_visible(),
             refresh,
             frames_tx,
             waker,
+            gate,
         };
         rt.spawn(engine.run(cmd_rx));
         (cmd_tx, frames_rx)
@@ -160,28 +215,63 @@ impl QueryEngine {
         // `interval` fires immediately on the first tick (initial load), then on
         // the cadence; skip catch-up bursts if the machine was asleep.
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        if self.hidden {
+            self.set_sources_active(false);
+        }
         loop {
             tokio::select! {
-                _ = ticker.tick() => {
+                // Disabled while hidden: the branch future is not polled, so a
+                // hidden tab holds no armed timer and takes no wakes.
+                _ = ticker.tick(), if !self.hidden => {
                     if !self.paused {
                         self.query_all().await;
                     }
                 },
                 cmd = cmd_rx.recv() => match cmd {
-                    Some(EngineCmd::Requery) => self.query_all().await,
+                    Some(EngineCmd::Requery) => {
+                        if !self.hidden {
+                            self.query_all().await;
+                        }
+                    }
                     Some(EngineCmd::SetTimeRange(tr)) => {
                         self.window = RelativeWindow::from_range(&tr);
-                        self.query_all().await;
+                        if !self.hidden {
+                            self.query_all().await;
+                        }
                     }
                     Some(EngineCmd::Pause) => self.paused = true,
                     Some(EngineCmd::Resume) => {
                         self.paused = false;
-                        self.query_all().await;
+                        if !self.hidden {
+                            self.query_all().await;
+                        }
                     }
-                    // Every sender dropped ⇒ the view-model (and tab) is gone.
+                    Some(EngineCmd::Visible(false)) => {
+                        if !self.hidden {
+                            self.hidden = true;
+                            self.set_sources_active(false);
+                        }
+                    }
+                    Some(EngineCmd::Visible(true)) => {
+                        if self.hidden {
+                            self.hidden = false;
+                            self.set_sources_active(true);
+                            // Restart the cadence from now and refresh at once,
+                            // so showing the tab never presents stale data.
+                            ticker.reset();
+                            self.query_all().await;
+                        }
+                    }
+                    // Every sender dropped => the view-model (and tab) is gone.
                     None => break,
                 }
             }
+        }
+    }
+
+    fn set_sources_active(&self, active: bool) {
+        for source in self.sources.values() {
+            source.set_active(active);
         }
     }
 
@@ -217,7 +307,7 @@ impl QueryEngine {
                 panel_id: panel.id,
                 result,
             });
-            (self.waker)();
+            self.gate.wake(&self.waker);
         }
     }
 
@@ -333,8 +423,46 @@ mod tests {
             refresh,
             clock,
             Arc::new(|| {}),
+            WakeGate::new(true),
         );
         (cmd_tx, frames_rx, queries)
+    }
+
+    /// Spawn an engine over a counting source with an observable waker + gate.
+    fn spawn_counting(
+        panels: usize,
+        refresh: Duration,
+    ) -> (
+        mpsc::UnboundedSender<EngineCmd>,
+        mpsc::UnboundedReceiver<PanelUpdate>,
+        RecordedQueries,
+        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<WakeGate>,
+    ) {
+        let queries = Arc::new(Mutex::new(Vec::new()));
+        let mut sources: HashMap<String, Arc<dyn DataSource>> = HashMap::new();
+        sources.insert(
+            "test".to_string(),
+            Arc::new(RecordingSource {
+                queries: queries.clone(),
+            }),
+        );
+        let wakes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let wakes_cb = wakes.clone();
+        let gate = WakeGate::new(true);
+        let (cmd_tx, frames_rx) = QueryEngine::spawn_with_window(
+            Handle::current(),
+            dashboard(panels),
+            sources,
+            RelativeWindow::new(std::time::Duration::from_secs(60)),
+            refresh,
+            Arc::new(Utc::now),
+            Arc::new(move || {
+                wakes_cb.fetch_add(1, Ordering::SeqCst);
+            }),
+            gate.clone(),
+        );
+        (cmd_tx, frames_rx, queries, wakes, gate)
     }
 
     fn clock(times: Vec<DateTime<Utc>>) -> Clock {
@@ -476,6 +604,61 @@ mod tests {
         assert_eq!(ranges[0].to, first);
         assert_eq!(ranges[2].to, first);
         assert_eq!(ranges[4].to, second);
+        drop(cmd_tx);
+    }
+
+    #[tokio::test]
+    async fn hidden_tile_produces_no_wakes_or_queries_and_resumes_with_an_immediate_refresh() {
+        let (cmd_tx, mut frames_rx, queries, wakes, gate) =
+            spawn_counting(2, Duration::from_millis(10));
+        receive_updates(&mut frames_rx, 2).await;
+
+        // Hide: the UI thread flips the gate synchronously, then tells the engine.
+        gate.set_visible(false);
+        cmd_tx.send(EngineCmd::Visible(false)).unwrap();
+        // Let any in-flight cycle finish, drain, then measure a quiet window
+        // spanning many refresh periods.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        while frames_rx.try_recv().is_ok() {}
+        gate.drained();
+        let wakes_before = wakes.load(Ordering::SeqCst);
+        let queries_before = queries.lock().unwrap().len();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(
+            wakes.load(Ordering::SeqCst),
+            wakes_before,
+            "hidden tile woke the host"
+        );
+        assert_eq!(
+            queries.lock().unwrap().len(),
+            queries_before,
+            "hidden tile kept querying"
+        );
+        assert!(
+            frames_rx.try_recv().is_err(),
+            "hidden tile delivered results"
+        );
+
+        // Show: an immediate refresh lands without waiting a refresh period.
+        gate.set_visible(true);
+        cmd_tx.send(EngineCmd::Visible(true)).unwrap();
+        receive_updates(&mut frames_rx, 2).await;
+        assert!(wakes.load(Ordering::SeqCst) > wakes_before);
+        drop(cmd_tx);
+    }
+
+    #[tokio::test]
+    async fn wakes_coalesce_to_one_pending_until_the_ui_drains() {
+        let (cmd_tx, mut frames_rx, _queries, wakes, gate) =
+            spawn_counting(5, Duration::from_secs(3600));
+        receive_updates(&mut frames_rx, 5).await;
+        // Five panels completed with no drain in between: one wake, not five.
+        assert_eq!(wakes.load(Ordering::SeqCst), 1);
+        // After the UI drains, the next result wakes again.
+        gate.drained();
+        cmd_tx.send(EngineCmd::Requery).unwrap();
+        receive_updates(&mut frames_rx, 5).await;
+        assert_eq!(wakes.load(Ordering::SeqCst), 2);
         drop(cmd_tx);
     }
 }

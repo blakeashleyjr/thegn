@@ -27,6 +27,9 @@ type Ring = Arc<Mutex<VecDeque<(f64, StatsSnapshot)>>>;
 pub struct HostSource {
     ring: Ring,
     stop: Arc<AtomicBool>,
+    /// Set while the consuming tab is hidden: the sampler parks (no sampling,
+    /// no `nvidia-smi`/`ioreg` spawns, no timer) until [`DataSource::set_active`].
+    parked: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
 }
 
@@ -71,6 +74,8 @@ impl HostSource {
         let stop = Arc::new(AtomicBool::new(false));
         let ring_bg = ring.clone();
         let stop_bg = stop.clone();
+        let parked = Arc::new(AtomicBool::new(false));
+        let parked_bg = parked.clone();
         // Dedicated sampler thread: `StatsSampler::sample()` blocks (refreshes
         // sysinfo) and needs a warm-up read to prime the CPU delta, so it lives
         // off the UI thread and off the tokio runtime entirely.
@@ -79,6 +84,12 @@ impl HostSource {
             let disk_path = std::env::current_dir().unwrap_or_else(|_| "/".into());
             let mut sampler = StatsSampler::new(disk_path);
             while !stop_bg.load(Ordering::Acquire) {
+                if parked_bg.load(Ordering::Acquire) {
+                    // Hidden: block untimed. `set_active(true)` and shutdown
+                    // both `unpark`; a spurious wake just re-checks the flags.
+                    std::thread::park();
+                    continue;
+                }
                 let snap = sampler.sample();
                 let ts = now_secs();
                 // Cancellation can arrive during sample(); skip publishing a
@@ -102,6 +113,7 @@ impl HostSource {
         Ok(Self {
             ring,
             stop,
+            parked,
             worker: Some(worker),
         })
     }
@@ -169,6 +181,13 @@ fn reap(worker: JoinHandle<()>) {
 }
 
 impl DataSource for HostSource {
+    fn set_active(&self, active: bool) {
+        self.parked.store(!active, Ordering::Release);
+        if active && let Some(worker) = &self.worker {
+            worker.thread().unpark();
+        }
+    }
+
     fn query(
         &self,
         queries: Vec<Query>,
@@ -325,5 +344,38 @@ mod tests {
     fn clock_before_epoch_uses_the_existing_zero_fallback() {
         let before_epoch = UNIX_EPOCH - Duration::from_secs(1);
         assert_eq!(timestamp_secs(before_epoch), 0.0);
+    }
+
+    #[test]
+    fn a_parked_sampler_stops_sampling_and_resumes_on_activation() {
+        let source = HostSource::try_new().unwrap();
+        let len = || source.ring.lock().unwrap().len();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while len() == 0 {
+            assert!(std::time::Instant::now() < deadline, "no first sample");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        source.set_active(false);
+        // Let a sample already in flight land, then span more than one period.
+        std::thread::sleep(Duration::from_millis(500));
+        let parked_len = len();
+        std::thread::sleep(Duration::from_millis(2300));
+        assert_eq!(len(), parked_len, "parked sampler kept sampling");
+        source.set_active(true);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while len() == parked_len {
+            assert!(std::time::Instant::now() < deadline, "did not resume");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn dropping_a_parked_sampler_still_joins_promptly() {
+        let source = HostSource::try_new().unwrap();
+        source.set_active(false);
+        std::thread::sleep(Duration::from_millis(300));
+        let start = std::time::Instant::now();
+        drop(source);
+        assert!(start.elapsed() < Duration::from_millis(500));
     }
 }

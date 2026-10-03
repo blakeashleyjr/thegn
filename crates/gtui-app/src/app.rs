@@ -18,7 +18,7 @@ use gtui_core::dashboard::Dashboard;
 use gtui_core::datasource::{DataSource, TimeRange};
 use gtui_core::frame::Frame;
 
-use crate::engine::{EngineCmd, PanelUpdate, QueryEngine, Waker};
+use crate::engine::{EngineCmd, PanelUpdate, QueryEngine, WakeGate, Waker};
 
 /// The latest state of a single panel.
 #[derive(Debug, Clone)]
@@ -39,6 +39,7 @@ pub struct ObserveApp {
     panels: HashMap<u32, PanelState>,
     frames_rx: mpsc::UnboundedReceiver<PanelUpdate>,
     cmd_tx: mpsc::UnboundedSender<EngineCmd>,
+    gate: Arc<WakeGate>,
 }
 
 impl ObserveApp {
@@ -57,6 +58,8 @@ impl ObserveApp {
             .iter()
             .map(|p| (p.id, PanelState::Loading))
             .collect();
+        // Built because the tab is being shown, so it starts visible.
+        let gate = WakeGate::new(true);
         let (cmd_tx, frames_rx) = QueryEngine::spawn(
             rt,
             dashboard.clone(),
@@ -64,6 +67,7 @@ impl ObserveApp {
             time_range.clone(),
             refresh,
             waker,
+            gate.clone(),
         );
         Self {
             dashboard,
@@ -72,13 +76,29 @@ impl ObserveApp {
             panels,
             frames_rx,
             cmd_tx,
+            gate,
         }
+    }
+
+    /// The tab was shown or hidden. Hidden parks the engine's refresh and the
+    /// datasources' background sampling and silences wakes; shown refreshes
+    /// immediately. Non-blocking best-effort.
+    pub fn set_visible(&self, visible: bool) {
+        if self.gate.is_visible() == visible {
+            return;
+        }
+        // The gate flips first so a result completing right now cannot wake.
+        self.gate.set_visible(visible);
+        let _ = self.cmd_tx.send(EngineCmd::Visible(visible)); // best-effort: engine may be shutting down
     }
 
     /// Drain every pending engine update into the panel map. Returns whether
     /// anything changed (so the tile can report a redraw). Non-blocking.
     pub fn tick(&mut self) -> bool {
         let mut changed = false;
+        // Clear the coalesced-wake flag before draining: a result landing after
+        // this point re-arms a wake instead of being swallowed by a stale flag.
+        self.gate.drained();
         while let Ok(update) = self.frames_rx.try_recv() {
             let state = match update.result {
                 Ok(frames) => PanelState::Ready(frames),

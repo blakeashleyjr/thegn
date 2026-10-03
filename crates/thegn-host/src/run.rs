@@ -10876,6 +10876,8 @@ async fn event_loop<T: Terminal>(
         // App-tab change-hooks fired (async results landed in a tile). Drain the
         // signals, fold every running tile's messages, and repaint — the chip
         // badges track unfocused tiles, the active tile shows its new state.
+        // Tab switches (any path that assigns `active`) park/resume hidden tiles.
+        app_host.sync_visibility();
         let mut app_signalled = false;
         while app_rx.try_recv().is_ok() {
             loop_perf.tick(crate::perf::WakeSource::App);

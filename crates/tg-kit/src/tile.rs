@@ -67,6 +67,13 @@ pub trait AppTile {
     /// Focus gained/lost. Default: ignore.
     fn on_focus(&mut self, _focused: bool) {}
 
+    /// The tile became the visible app tab (`true`) or was hidden behind
+    /// another tab (`false`). A hidden tile must stop periodic work (timers,
+    /// samplers, wake hooks): the host's 0%-idle contract has no exception for
+    /// tabs the user is not looking at. On `true`, refresh immediately so the
+    /// tab is never stale when shown. Must not block. Default: ignore.
+    fn on_visible(&mut self, _visible: bool) {}
+
     /// The tile's draw area changed size. Default: ignore (most tiles relayout
     /// from `area` in [`render`]).
     ///
