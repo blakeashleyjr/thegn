@@ -11918,7 +11918,15 @@ async fn event_loop<T: Terminal>(
                 thegn_core::connectivity::current(),
             );
             match kind {
-                RefreshKind::Model => want_model_refresh = true,
+                RefreshKind::Model => {
+                    want_model_refresh = true;
+                    // O(1): a ref moved since the last heal that ran (its own
+                    // MainRefMoved may have been lost to the refresh throttle).
+                    crate::branch_cache::ref_gen_tick(
+                        &mut want_main_sync,
+                        &active_tab_path(&session),
+                    );
+                }
                 // The wall clock crossed a display boundary. Bars-only damage:
                 // `render_plan` turns this into a two-1-row-rect recompose, so
                 // a minute rollover never costs a chrome repaint.
@@ -12174,7 +12182,10 @@ async fn event_loop<T: Terminal>(
                     );
                 }
                 // Branch ref moved: heal the checkout off-loop + drop the cache.
-                RefreshKind::MainRefMoved => crate::branch_cache::ref_moved(&mut want_main_sync),
+                RefreshKind::MainRefMoved => crate::branch_cache::ref_moved_unless_unchanged(
+                    &mut want_main_sync,
+                    &active_tab_path(&session),
+                ),
                 RefreshKind::HostHeal => want_host_heal = true,
                 // Offline recovery re-probe (ticker emits only while offline).
                 RefreshKind::ConnRecover => crate::connectivity_gate::spawn_recovery_probe(
@@ -12214,17 +12225,16 @@ async fn event_loop<T: Terminal>(
                 RefreshKind::Scheduled { .. } => {}
             }
         }
-        // Fast-forward the canonical main checkout if its ref advanced (throttled ~2s, off-loop).
-        if want_main_sync
-            && last_main_heal.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(2))
-        {
-            last_main_heal = Some(std::time::Instant::now());
+        // Fast-forward the canonical main checkout if its ref advanced (throttled ~2s,
+        // off-loop). What the heal saw is recorded only if it really spawns (a
+        // request the throttle drops must stay due); see `maybe_spawn_heal`.
+        crate::branch_cache::maybe_spawn_heal(want_main_sync, &mut last_main_heal, || {
             crate::git_watch::spawn_main_checkout_heal(
                 active_tab_path(&session),
                 refresh_tx.clone(),
                 waker.clone(),
             );
-        }
+        });
         dirty |= want_host_heal
             && crate::handlers::host_heal::on_heal_tick(
                 &mut host_heal,

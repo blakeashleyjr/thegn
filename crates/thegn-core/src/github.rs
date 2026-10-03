@@ -260,15 +260,7 @@ pub fn search_prs(
 /// when there is no origin or it is not a recognizable forge URL. Used to scope
 /// the "My Work" feed / PR search to the current repository.
 pub fn origin_nwo(loc: &GitLoc) -> Option<String> {
-    let out = loc
-        .git_command(&["remote", "get-url", "origin"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    nwo_from_remote_url(&url)
+    nwo_from_remote_url(&loc.origin_url()?)
 }
 
 fn scope_for_identity(identity: &ForgeRepoIdentity) -> Option<String> {
@@ -289,7 +281,7 @@ fn gh_repo_scope_origin(loc: &GitLoc) -> Result<String, GhError> {
 
 fn origin_identity(loc: &GitLoc) -> Result<ForgeRepoIdentity, GhError> {
     repo_identity_from_remote_url(
-        &loc.git_out(&["remote", "get-url", "origin"])
+        &loc.origin_url()
             .ok_or(GhError::NotConfigured("origin repository".into()))?,
     )
     .ok_or(GhError::NotConfigured("origin repository identity".into()))

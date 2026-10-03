@@ -51,6 +51,13 @@ thread_local! {
     static LAST_BUILD: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
 }
 
+/// The change print at which each worktree's graph last finished building. The
+/// build is a pure function of the tree (`git diff HEAD` + file contents, with
+/// unchanged sources skipped), so an unchanged print needs no new build; the
+/// loop's per-tick trigger used to fork `git diff HEAD` every 5 s regardless
+/// (THE-718). A path with no live watcher never skips.
+static BUILT: crate::diff_watch::Seen = crate::diff_watch::Seen::new();
+
 /// Loop-side trigger: rebuild the active worktree's graph off the event loop
 /// when `should` (LSP enabled ∧ its diff refreshed), throttled. Kept out of
 /// `run.rs` (god-file ratchet); the loop calls this in one statement.
@@ -72,8 +79,12 @@ pub(crate) fn maybe_spawn_build(
     let Some(cwd) = cwd else {
         return;
     };
+    let (print, unchanged) = BUILT.check(&cwd);
+    if unchanged {
+        return;
+    }
     LAST_BUILD.set(Some(std::time::Instant::now()));
-    spawn_graph_build(cwd, lsp, waker.clone());
+    spawn_graph_build(cwd, lsp, waker.clone(), print);
 }
 
 /// Spawn an off-loop build of the worktree's blast-radius graph. Best-effort:
@@ -82,13 +93,19 @@ pub(crate) fn spawn_graph_build(
     root: std::path::PathBuf,
     lsp: std::sync::Arc<LspInner>,
     waker: TerminalWaker,
+    print: Option<crate::diff_watch::WatchPrint>,
 ) {
     tokio::task::spawn_blocking(move || {
         let Ok(db) = Db::open() else {
             return;
         };
-        if build_graph(&root, &lsp, &db) {
-            let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
+        // `None` = the diff could not be read: not a completed pass, so it is
+        // not recorded and the next tick retries.
+        if let Some(changed) = build_graph(&root, &lsp, &db) {
+            BUILT.mark(&root, print);
+            if changed {
+                let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
+            }
         }
     });
 }
@@ -101,26 +118,38 @@ struct FileParse {
 }
 
 /// Build (incrementally) the worktree's blast-radius graph from `git diff HEAD`.
-/// Returns `true` if any edges were (re)written.
-fn build_graph(root: &Path, lsp: &LspInner, db: &Db) -> bool {
+/// Returns `Some(true)` if any edges were (re)written, `Some(false)` for a
+/// completed pass that wrote none, and `None` when the diff could not be read.
+fn build_graph(root: &Path, lsp: &LspInner, db: &Db) -> Option<bool> {
     let loc = GitLoc::for_worktree(root);
     let root_s = root.to_string_lossy().into_owned();
     // Same sanitized flags the semantic footer uses so the patch parses cleanly.
-    let Some(diff) = loc.git_out(&[
-        "-c",
-        "diff.noprefix=false",
-        "diff",
-        "--no-color",
-        "--no-ext-diff",
-        "--no-renames",
-        "-U3",
-        "HEAD",
-    ]) else {
-        return false;
+    // `output()` (not `git_out`) so a CLEAN tree -- empty stdout -- is a completed
+    // pass with nothing to do, distinct from a git that could not be run.
+    // off-loop: this runs inside `spawn_graph_build`'s blocking task.
+    #[expect(clippy::disallowed_methods)]
+    let out = loc
+        .git_command(&[
+            "-c",
+            "diff.noprefix=false",
+            "diff",
+            "--no-color",
+            "--no-ext-diff",
+            "--no-renames",
+            "-U3",
+            "HEAD",
+        ])
+        .output()
+        .ok()?;
+    let diff = if out.status.success() {
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    } else {
+        // e.g. an unborn HEAD: deterministic until the next commit (an event).
+        String::new()
     };
     let files = thegn_core::patch::parse_patch(&diff);
     if files.is_empty() || files.len() > MAX_CHANGED_FILES {
-        return false;
+        return Some(false);
     }
 
     // Per-file parse cache, keyed by absolute path (caller files are re-used
@@ -241,7 +270,7 @@ fn build_graph(root: &Path, lsp: &LspInner, db: &Db) -> bool {
         changed_any = true;
     }
 
-    changed_any
+    Some(changed_any)
 }
 
 /// Ensure `abs` (an absolute path) is parsed into the cache. Best-effort: an
