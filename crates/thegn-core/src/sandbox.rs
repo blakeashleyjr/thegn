@@ -919,10 +919,13 @@ fn resolve_placed_with(
     // tmpfs $HOME (bwrap `--tmpfs`, systemd `ProtectHome=tmpfs`; OCI simply
     // never mounts it) plus a reviewed read-only allowlist — read-only is
     // integrity isolation, not confidentiality, so it is not enough here.
+    //
+    // An unset/empty/unresolvable `$HOME` does NOT disable sealing: the spec
+    // still carries `seal_home = Some(..)` so `sandbox_floor::home_gate` REFUSES
+    // the launch instead of quietly running with an unhidden home.
     let seal_home: Option<String> = profile
         .hides_home()
-        .then(|| std::env::var("HOME").unwrap_or_default())
-        .filter(|h| !h.is_empty());
+        .then(|| std::env::var("HOME").unwrap_or_default());
     let host_toolchain = || {
         if seal_home.is_some() {
             crate::sandbox_mounts::host_toolchain_mounts_sealed_home()
@@ -995,6 +998,20 @@ fn resolve_placed_with(
 
     for m in &cfg.mounts {
         let parsed = parse_mount(m);
+        // THE-215: a sealed launch never honors a mount (host path or dest,
+        // canonicalized) that reaches the credential deny list — this covers the
+        // DEFAULT `~/.gnupg:rw` as much as a user entry. Drop and name the path.
+        if let Some(home) = &seal_home
+            && !home.is_empty()
+            && crate::sandbox_mounts::sealed_denies_mount(&parsed, std::path::Path::new(home))
+        {
+            tracing::warn!(
+                target: "thegn::sandbox",
+                path = %parsed.host,
+                "sealed profile: dropping [sandbox] mounts entry that reaches a protected $HOME path"
+            );
+            continue;
+        }
         // Skip mounts whose source doesn't exist — silently, since config
         // defaults like ~/.gitconfig may not be present on every machine.
         if !std::path::Path::new(&parsed.host).exists() {
@@ -2191,7 +2208,26 @@ fn backend_enter_argv(spec: &SandboxSpec, script: &str) -> Vec<String> {
             {
                 v.extend(["--tmpfs".into(), home.clone()]);
             }
+            let sealed_tmpfs_home = spec
+                .seal_home
+                .as_deref()
+                .filter(|_| !matches!(spec.file_access, FileAccess::All | FileAccess::Host))
+                .map(std::path::Path::new);
             for m in &spec.mounts {
+                // TOCTOU: a symlink in the allowlist may have been retargeted
+                // since resolution. Re-validate right before the argv is built;
+                // omit (fail safe) any mount now resolving into the deny list.
+                if let Some(home) = sealed_tmpfs_home
+                    && std::path::Path::new(&m.dest).starts_with(home)
+                    && !crate::sandbox_mounts::sealed_mount_still_ok(m, home)
+                {
+                    tracing::warn!(
+                        target: "thegn::sandbox",
+                        path = %m.host,
+                        "sealed profile: mount now resolves into a protected path; omitted"
+                    );
+                    continue;
+                }
                 // Skip mounts already covered by a hardcoded parent — bwrap
                 // cannot create a mount-point inside a read-only bind.
                 let covered = hardcoded_parents

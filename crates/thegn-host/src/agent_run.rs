@@ -89,6 +89,11 @@ pub(crate) fn agent_floor_gate(
     // `None` ⇒ the sandbox couldn't be established (disabled, or the chain
     // resolved to the host) — a broken boundary under a demanded floor.
     let spec = thegn_core::sandbox::resolve(&full.sandbox, &loc, name);
+    // THE-215: a sealed launch that would expose the host `$HOME` is an
+    // infrastructure failure under a demanded floor, same as a missed floor.
+    if let Some(miss) = spec.as_ref().and_then(thegn_core::sandbox_floor::home_gate) {
+        return AgentDispatch::InfraHold(miss);
+    }
     let resolved = spec.as_ref().map(|s| s.capabilities().isolation);
     let best = resolved.unwrap_or(IsolationClass::HostProcess);
     match agent_task_gate(true, floor, on_miss, resolved, best) {

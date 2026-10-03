@@ -52,3 +52,11 @@ dotfile visibility in hardened; larger blast radius.
 - backend argv tests for bwrap/OCI/systemd; floor test for unsupported backend.
 - real bwrap integration test with synthetic HOME sentinels (skips if bwrap missing).
 - doctor line + capability field; docs + help page.
+
+## Residual window (review fixes)
+
+Allowlist symlink targets are re-validated when the bwrap argv is built
+(`sandbox_mounts::sealed_mount_still_ok`, fail-safe omit). A retarget between that
+check and bwrap's own mount setup remains possible (no fd-based bind); OCI/systemd
+validate at resolution only. Accepted: it requires an attacker already writing the
+user's HOME dotfile symlinks.

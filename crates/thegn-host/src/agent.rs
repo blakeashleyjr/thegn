@@ -3453,8 +3453,17 @@ pub fn launch_spec_full(
         // Profile credential firewall (H): mount the active profile's git/gh/gpg
         // config dirs path-preservingly so the container sees the profile
         // identity its rerooted GIT_CONFIG_GLOBAL/GH_CONFIG_DIR env points at.
-        // No-op on the default profile.
-        for (host, ro) in thegn_core::profile::sandbox_cred_mounts() {
+        // No-op on the default profile. SKIPPED for a sealed launch
+        // (`seal_home`): these are the profile's gh config and gnupg dirs, i.e.
+        // exactly the credentials the sealed `$HOME` exists to hide (THE-215).
+        // (The agent's own provider auth home, `provider_home_mounts` below, is
+        // intentionally mounted: the harness cannot run without its own login.)
+        let cred_mounts = if spec.seal_home.is_some() {
+            Vec::new()
+        } else {
+            thegn_core::profile::sandbox_cred_mounts()
+        };
+        for (host, ro) in cred_mounts {
             if !spec.mounts.iter().any(|m| m.dest == host) {
                 spec.mounts.push(sandbox::Mount {
                     dest: host.clone(),
