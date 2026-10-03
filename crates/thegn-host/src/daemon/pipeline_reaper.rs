@@ -218,7 +218,8 @@ mod tests {
             .unwrap();
         db.update_dispatch_status(id, AgentDispatchStatus::Running)
             .unwrap();
-        db.stamp_dispatch_exit(id, Some(0)).unwrap();
+        let run = db.dispatch_run_ref(id).unwrap().unwrap();
+        db.stamp_dispatch_exit(&run, Some(0)).unwrap();
         id
     }
 

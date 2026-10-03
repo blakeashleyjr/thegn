@@ -4284,11 +4284,14 @@ mod tests {
 
         // Model the adopted-pane observer seeing the same event after the
         // daemon observer. The first observation is the durable exit fact.
-        svc.db
-            .lock()
-            .unwrap()
-            .stamp_dispatch_exit(row_id, Some(9))
-            .unwrap();
+        {
+            let db = svc.db.lock().unwrap();
+            let run = db.dispatch_run_ref(row_id).unwrap().unwrap();
+            assert_eq!(
+                db.stamp_dispatch_exit(&run, Some(9)).unwrap(),
+                thegn_core::issue::ExitStamp::AlreadyStamped
+            );
+        }
         let repeated = svc
             .db
             .lock()

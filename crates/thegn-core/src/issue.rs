@@ -449,6 +449,55 @@ pub enum DispatchRunPublishOutcome {
     },
 }
 
+/// The exact run a worker exit belongs to: roster row, the session that
+/// launched it, and the row's launch generation (`run_gen`, v71). An exit stamp
+/// is a CAS on all three, so an event from a replaced run matches nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DispatchRunRef {
+    /// Roster row id.
+    pub id: i64,
+    /// The originating issue id (for notifications).
+    pub issue_id: String,
+    /// The session recorded on the row when it was resolved; empty when the
+    /// row has none (a legacy / hand-run pane).
+    pub session_id: String,
+    /// The row's launch generation when it was resolved.
+    pub run_gen: i64,
+}
+
+/// Which roster run a pane or daemon exit event is attributed to.
+///
+/// A non-empty session identity fails closed: it either names a row exactly or
+/// is [`Self::Stale`]. Worktree-path attribution exists only for identity-less
+/// legacy events and only when it is unambiguous.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExitAttribution {
+    /// The event's session id exactly matches a row's recorded session.
+    Exact(DispatchRunRef),
+    /// An identity-less event with exactly one active row in the worktree.
+    Legacy(DispatchRunRef),
+    /// A non-empty session id that matches no row: a replaced, unknown or
+    /// foreign session. Never degrades to path attribution.
+    Stale,
+    /// An identity-less event with several active rows in the worktree.
+    Ambiguous,
+    /// An identity-less event and no active row: not an agent pane.
+    NoRow,
+}
+
+/// Result of the one CAS that records a worker exit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExitStamp {
+    /// This call recorded the exit.
+    Stamped,
+    /// The run was already stamped (a duplicate observer); nothing changed.
+    AlreadyStamped,
+    /// The row exists but its session or generation moved on; nothing changed.
+    Stale,
+    /// The row does not exist; nothing changed.
+    Missing,
+}
+
 impl AgentDispatchStatus {
     pub fn as_str(self) -> &'static str {
         match self {

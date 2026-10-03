@@ -219,27 +219,38 @@ pub trait NotificationStore {
     /// Find the dispatch id and originating issue id for a worktree path.
     fn dispatch_info_for_worktree(&self, worktree_path: &str) -> Result<Option<(i64, String)>>;
 
-    /// Resolve the dispatch row a finished worker belonged to — `(id, issue_id)`
-    /// — for the pane-exit handler that stamps `Done`/`Failed`.
+    /// Resolve the exact run a finished worker belonged to, for the pane-exit
+    /// handler that stamps `Done`/`Failed` (THE-238).
     ///
-    /// Two rules, in order:
+    /// 1. **A non-empty `session_id` is the identity, and it fails closed.** A
+    ///    dispatch launched through `sessions.open` records the daemon session
+    ///    running it. The event either names that row exactly
+    ///    ([`ExitAttribution::Exact`](crate::issue::ExitAttribution::Exact)) or
+    ///    is [`Stale`](crate::issue::ExitAttribution::Stale) — a replaced,
+    ///    unknown or foreign session. It never degrades to path attribution: a
+    ///    retry replaces the session on the same row, so falling back to "the
+    ///    newest row in this worktree" is how an old run's late exit used to
+    ///    stamp the run that replaced it.
+    ///    **Exception:** a non-empty id that matches no row falls back to the
+    ///    identity-less rule restricted to ACTIVE rows with no recorded session
+    ///    for the worktree (UI tracker dispatch and `dispatch put` without
+    ///    `--session` run in daemon panes that report a daemon session id). One
+    ///    such row is `Legacy`, several `Ambiguous`, none `Stale`. A replaced
+    ///    run's row always carries a non-null session, so it never qualifies.
+    /// 2. **Identity-less events** (the `D` key, a hand-run agent pane) resolve
+    ///    by worktree only when exactly ONE active row exists
+    ///    ([`Legacy`](crate::issue::ExitAttribution::Legacy)); several are
+    ///    [`Ambiguous`](crate::issue::ExitAttribution::Ambiguous). Terminal rows
+    ///    are never candidates, so a shell opened later in an ex-agent worktree
+    ///    cannot overwrite a finished outcome.
     ///
-    /// 1. **`session_id` exact match.** A dispatch launched through
-    ///    `sessions.open` records the daemon session running it, and that is the
-    ///    row's identity. Once a pipeline runs several stages in ONE worktree,
-    ///    the path alone cannot say which row just died.
-    /// 2. **Most recent *active* row for the worktree**, for a worker with no
-    ///    recorded session (the `D` key, a hand-run agent pane). Terminal rows
-    ///    (`done`/`failed`/`merged`/`abandoned`) are SKIPPED: re-stamping a
-    ///    finished row is how a plain shell opened later in an ex-agent worktree
-    ///    used to overwrite the outcome — and re-fire an "agent finished"
-    ///    notification — for work that ended days ago.
-    ///
-    /// `None` when neither rule matches, which the caller must treat as "not an
-    /// agent pane" rather than as an error.
+    /// [`NoRow`](crate::issue::ExitAttribution::NoRow) means "not an agent
+    /// pane", not an error. The resolved run carries the row's `run_gen`, which
+    /// the caller passes to the exit CAS so a relaunch between resolution and
+    /// stamp is fenced too.
     fn dispatch_for_exit(
         &self,
         worktree_path: &str,
         session_id: Option<&str>,
-    ) -> Result<Option<(i64, String)>>;
+    ) -> Result<crate::issue::ExitAttribution>;
 }
