@@ -298,45 +298,108 @@ fn spawn_detached_reaped_with(
     }
 }
 
-/// The platform's "open this URL with whatever handles it" command.
-///
-/// `$BROWSER` first (the POSIX convention, and what `[forward] browser`'s docs
-/// promise as the fallback), then the OS opener: `open` on macOS, `xdg-open` on
-/// Linux/BSD. `$BROWSER` may hold a colon-separated list — take the first entry,
-/// which is what every other consumer of the variable does.
-fn url_opener() -> String {
-    if let Some(b) = std::env::var_os("BROWSER") {
-        let b = b.to_string_lossy();
-        let first = b.split(':').next().unwrap_or("").trim();
-        if !first.is_empty() {
-            return first.to_string();
+/// Why an external URL was not opened. Carries no URL text (status lines are
+/// shown and logged; a URL may embed a token).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OpenError {
+    Url(thegn_core::url_launch::UrlRejection),
+    Template(thegn_core::url_launch::TemplateError),
+    /// Every candidate command failed to spawn.
+    Spawn,
+}
+
+impl OpenError {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Url(r) => r.label(),
+            Self::Template(e) => e.label(),
+            Self::Spawn => "could not start a browser",
         }
-    }
-    if cfg!(target_os = "macos") {
-        "open".to_string()
-    } else if cfg!(target_os = "windows") {
-        // Windows has no `xdg-open`. `explorer <url>` hands the URL to the
-        // registered protocol handler and takes exactly one argument like the
-        // other two, so `open_url_detached` needs no special case. (`cmd /c
-        // start` would need an extra empty-title argument to avoid swallowing
-        // a quoted URL as the window title.)
-        "explorer".to_string()
-    } else {
-        "xdg-open".to_string()
     }
 }
 
+/// The OS "open this URL" argv template (URL appended by `build_argv`): `open`
+/// on macOS, `rundll32 url.dll,FileProtocolHandler` on Windows (the URL is one
+/// argv element; `explorer` parses commas in its argument as switch
+/// separators, which an untrusted URL could abuse), `xdg-open` elsewhere.
+fn os_opener() -> Vec<String> {
+    os_opener_for(if cfg!(target_os = "macos") {
+        "macos"
+    } else if cfg!(target_os = "windows") {
+        "windows"
+    } else {
+        "other"
+    })
+}
+
+/// Pure argv builder behind [`os_opener`], keyed by a platform tag.
+fn os_opener_for(platform: &str) -> Vec<String> {
+    let argv: &[&str] = match platform {
+        "macos" => &["open"],
+        "windows" => &["rundll32", "url.dll,FileProtocolHandler"],
+        _ => &["xdg-open"],
+    };
+    argv.iter().map(|s| (*s).to_string()).collect()
+}
+
+/// Ordered argv templates to try. An explicit `browser` (`[forward] browser`)
+/// is one command and is final; otherwise `$BROWSER` (colon-separated fallbacks,
+/// `%s` placeholder, arguments, no shell), then the OS opener.
+fn opener_candidates(
+    browser: &str,
+    env_browser: Option<&str>,
+) -> Result<Vec<Vec<String>>, OpenError> {
+    use thegn_core::url_launch as ul;
+    let browser = browser.trim();
+    if !browser.is_empty() {
+        return Ok(vec![
+            ul::parse_single(browser).map_err(OpenError::Template)?,
+        ]);
+    }
+    let mut c = match env_browser {
+        Some(b) => ul::parse_candidates(b).map_err(OpenError::Template)?,
+        None => Vec::new(),
+    };
+    c.push(os_opener());
+    Ok(c)
+}
+
+/// Open `url` (validated: bounded http/https only) with the explicit `browser`
+/// command, or `$BROWSER`/the OS opener when it is empty. Returns `Ok` only once
+/// a child has actually been spawned; callers must not report "Opened" otherwise.
+pub(crate) fn open_url_with(url: &str, browser: &str) -> Result<(), OpenError> {
+    let url = thegn_core::url_launch::normalize_url(url).map_err(OpenError::Url)?;
+    let env = std::env::var("BROWSER").ok();
+    for tpl in opener_candidates(browser, env.as_deref())? {
+        let argv = thegn_core::url_launch::build_argv(&tpl, &url);
+        let Some((prog, args)) = argv.split_first() else {
+            continue;
+        };
+        let mut cmd = std::process::Command::new(prog);
+        cmd.args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        if spawn_detached_reaped(cmd) {
+            return Ok(());
+        }
+    }
+    Err(OpenError::Spawn)
+}
+
 /// Open a URL in the system browser, fully detached (no `gh`/toolchain needed).
-///
-/// Callers that want an explicit command use `[forward] browser`; this is the
-/// path taken when that key is empty.
-pub(crate) fn open_url_detached(url: &str) {
-    let mut cmd = std::process::Command::new(url_opener());
-    cmd.arg(url)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    spawn_detached_reaped(cmd);
+/// `[forward] browser` applies only to the forward surfaces (`open_url_with`).
+pub(crate) fn open_url_detached(url: &str) -> Result<(), OpenError> {
+    open_url_with(url, "")
+}
+
+/// Status line for an open attempt: `ok` on success, the truthful failure
+/// otherwise.
+pub(crate) fn open_status(result: Result<(), OpenError>, ok: impl FnOnce() -> String) -> String {
+    match result {
+        Ok(()) => ok(),
+        Err(e) => format!("Could not open link: {}", e.label()),
+    }
 }
 
 /// Run a CI mutation (rerun / cancel) off the loop, then pulse a CI refresh so
@@ -863,8 +926,7 @@ pub(crate) fn run_pr_view_action(
     use thegn_core::forge::{ForgeError, LineComment, PrRef, RepoRef};
 
     if let A::OpenUrl(url) = &action {
-        open_url_detached(url);
-        model.status = "Opened PR in the browser".into();
+        model.status = open_status(open_url_detached(url), || "Opened PR in the browser".into());
         return;
     }
     let (label, status): (&'static str, &'static str) = match &action {
@@ -1574,8 +1636,9 @@ impl CiActionCtx<'_> {
         let keep = action.keeps_overlay();
         match action {
             DetailAction::OpenUrl(u) => {
-                open_url_detached(&u);
-                self.model.status = "Opened CI run in the browser".into();
+                self.model.status = open_status(open_url_detached(&u), || {
+                    "Opened CI run in the browser".into()
+                });
             }
             // Intercepted by the loop's Act arm, which owns the monitor slot
             // and the saved prefs this needs. Unreachable here.
@@ -1785,8 +1848,9 @@ impl CiActionCtx<'_> {
                     .map(|r| r.url.clone())
                     && !url.is_empty()
                 {
-                    open_url_detached(&url);
-                    self.model.status = "Opened CI run in the browser".into();
+                    self.model.status = open_status(open_url_detached(&url), || {
+                        "Opened CI run in the browser".into()
+                    });
                 }
                 true
             }
@@ -1815,29 +1879,67 @@ mod tests {
     use super::*;
 
     #[test]
-    fn url_opener_prefers_browser_then_the_os_default() {
-        // $BROWSER wins outright.
-        {
-            let _env = crate::testenv::EnvVarGuard::set(&[("BROWSER", "firefox")]);
-            assert_eq!(url_opener(), "firefox");
+    fn windows_opener_uses_fileprotocolhandler_with_url_as_one_arg() {
+        let tpl = os_opener_for("windows");
+        assert_eq!(tpl, vec!["rundll32", "url.dll,FileProtocolHandler"]);
+        let argv = thegn_core::url_launch::build_argv(&tpl, "https://a.test/x?a=1,2");
+        assert_eq!(argv.len(), 3);
+        assert_eq!(argv[2], "https://a.test/x?a=1,2");
+        assert_eq!(os_opener_for("macos"), vec!["open"]);
+        assert_eq!(os_opener_for("linux"), vec!["xdg-open"]);
+    }
+
+    #[test]
+    fn opener_candidates_follow_the_documented_order() {
+        let sv = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        // Explicit config is one command, with args, and final (no fallback).
+        assert_eq!(
+            opener_candidates(" firefox --new-window %s ", Some("w3m")).unwrap(),
+            vec![sv(&["firefox", "--new-window", "%s"])]
+        );
+        // $BROWSER fallbacks in order, then the OS opener.
+        let c = opener_candidates("", Some("w3m -dump:lynx")).unwrap();
+        assert_eq!(c.len(), 3);
+        assert_eq!(c[0], sv(&["w3m", "-dump"]));
+        assert_eq!(c[1], sv(&["lynx"]));
+        assert_eq!(c[2], os_opener());
+        // Blank or unset $BROWSER is just the OS opener.
+        assert_eq!(
+            opener_candidates("", Some("  ")).unwrap(),
+            vec![os_opener()]
+        );
+        assert_eq!(opener_candidates("", None).unwrap(), vec![os_opener()]);
+        // Malformed template is refused, not guessed at.
+        assert!(matches!(
+            opener_candidates("ff 'x", None),
+            Err(OpenError::Template(_))
+        ));
+    }
+
+    #[test]
+    fn open_url_refuses_bad_urls_and_reports_spawn_failure() {
+        assert!(matches!(
+            open_url_with("file:///etc/passwd", "true"),
+            Err(OpenError::Url(_))
+        ));
+        // A missing executable is a failure, never a silent "Opened".
+        let r = open_url_with("https://example.com/", "/nonexistent/thegn-no-such-browser");
+        assert_eq!(r, Err(OpenError::Spawn));
+        assert!(open_status(r, || "Opened".into()).starts_with("Could not open link"));
+        assert_eq!(open_status(Ok(()), || "Opened".into()), "Opened");
+        // Path with spaces + placeholder, no shell: spawn of a missing path fails.
+        assert_eq!(
+            open_url_with("https://example.com/", "'/no such dir/br' --u=%s"),
+            Err(OpenError::Spawn)
+        );
+        if cfg!(unix) {
+            assert_eq!(open_url_with("https://example.com/", "true"), Ok(()));
         }
-        // A colon-separated list takes its first entry (the POSIX convention).
-        {
-            let _env = crate::testenv::EnvVarGuard::set(&[("BROWSER", "w3m:lynx")]);
-            assert_eq!(url_opener(), "w3m");
-        }
-        // Empty/whitespace $BROWSER falls through to the OS opener rather than
-        // trying to spawn "".
-        {
-            let _env = crate::testenv::EnvVarGuard::set(&[("BROWSER", "  ")]);
-            let expect = if cfg!(target_os = "macos") {
-                "open"
-            } else if cfg!(target_os = "windows") {
-                "explorer"
-            } else {
-                "xdg-open"
-            };
-            assert_eq!(url_opener(), expect);
+        for e in [
+            OpenError::Spawn,
+            OpenError::Url(thegn_core::url_launch::UrlRejection::Scheme),
+        ] {
+            assert!(!e.label().is_empty());
         }
     }
 

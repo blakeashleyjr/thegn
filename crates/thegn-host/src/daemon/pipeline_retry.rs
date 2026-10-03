@@ -142,11 +142,27 @@ pub(crate) async fn stamp_dispatch_exit(
 
     for attempt in 0..LOOKUP_ATTEMPTS {
         let sid = session.clone();
-        let row = svc.with_db(move |db| db.dispatch_by_session(&sid)).await?;
-        if let Some(row) = row {
-            let id = row.id;
-            svc.with_db(move |db| db.stamp_dispatch_exit(id, code.map(i64::from)))
+        // Session identity only (THE-238): the worktree argument is unused on
+        // the session path, and a miss is Stale — usually the publication race
+        // this loop exists for, so it retries rather than falling back.
+        let attribution = svc
+            .with_db(move |db| db.dispatch_for_exit("", Some(&sid)))
+            .await?;
+        if let thegn_core::issue::ExitAttribution::Exact(run) = attribution {
+            let outcome = svc
+                .with_db(move |db| db.stamp_dispatch_exit(&run, code.map(i64::from)))
                 .await?;
+            if matches!(
+                outcome,
+                thegn_core::issue::ExitStamp::Stale | thegn_core::issue::ExitStamp::Missing
+            ) {
+                tracing::warn!(
+                    target: "thegn::daemon",
+                    session = %session,
+                    ?outcome,
+                    "session exit did not stamp its run"
+                );
+            }
             return Ok(());
         }
         if attempt + 1 < LOOKUP_ATTEMPTS {
@@ -411,7 +427,7 @@ async fn cold_stage_prompt(svc: &DaemonService, row: &AgentDispatch) -> anyhow::
 
     let facts = if crate::stage_prompt::needs_tracker(&stage.prompt) {
         let detail = svc
-            .issues_get(&row.issue_id, None)
+            .issues_get(&row.issue_id, Some(row.worktree_path.as_str()))
             .await
             .map_err(|e| anyhow::anyhow!("tracker lookup for {}: {e}", row.issue_id))?;
         crate::stage_prompt::IssueFacts {
@@ -425,7 +441,9 @@ async fn cold_stage_prompt(svc: &DaemonService, row: &AgentDispatch) -> anyhow::
     };
 
     // Branch: the registered worktree row. A worktree the registry has lost
-    // still relaunches, just without `{branch}` in its prompt.
+    // still relaunches, just without `{branch}` in its prompt. (The tracker
+    // lookup above is different: it is scoped to the worktree's repo overlay
+    // and fails closed for an unregistered worktree — no global fallback.)
     let wt = row.worktree_path.clone();
     let branch = svc
         .with_db(move |db| {

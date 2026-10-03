@@ -78,8 +78,8 @@ impl Db {
         let conn = self.conn();
         let tx = conn.unchecked_transaction()?;
         let changed = tx.execute(
-            "UPDATE agent_dispatches SET session_id=?1, artifact_path=?2, status=?3 \
-             WHERE id=?4 AND status IN (?5, ?6)",
+            "UPDATE agent_dispatches SET session_id=?1, artifact_path=?2, status=?3, \
+             run_gen=run_gen+1, exit_code=NULL, exited_at_ms=NULL WHERE id=?4 AND status IN (?5, ?6)",
             rusqlite::params![
                 session_id,
                 artifact_path,
@@ -203,7 +203,7 @@ impl Db {
     ) -> Result<bool> {
         Ok(self.conn().execute(
             "UPDATE agent_dispatches SET status=?1, session_id=?2, artifact_path=?3, \
-             exit_code=NULL, exited_at_ms=NULL \
+             exit_code=NULL, exited_at_ms=NULL, run_gen=run_gen+1 \
              WHERE id=?4 AND status=?5",
             rusqlite::params![
                 AgentDispatchStatus::Running.as_str(),
@@ -593,25 +593,88 @@ impl Db {
         result
     }
 
-    /// Stamp a row's worker exit (v63): the exit code, if it was reaped, and
-    /// when. First writer wins for one run, so the daemon event observer and the
-    /// adopted-pane drain can safely see the same exit without moving its time
-    /// or changing its code. A retry clears the pair when it publishes the new
-    /// session, allowing that later run to be stamped in turn.
+    /// The row's current run identity — session and launch generation — for a
+    /// caller that already knows the row id and must stamp exactly the run it
+    /// observed. `None` when the row does not exist.
+    pub fn dispatch_run_ref(&self, id: i64) -> Result<Option<crate::issue::DispatchRunRef>> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT id, issue_id, COALESCE(session_id,''), run_gen \
+                 FROM agent_dispatches WHERE id=?1",
+                [id],
+                |r| {
+                    Ok(crate::issue::DispatchRunRef {
+                        id: r.get(0)?,
+                        issue_id: r.get(1)?,
+                        session_id: r.get(2)?,
+                        run_gen: r.get(3)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// Stamp a run's worker exit (v63, fenced by v71): the exit code, if it was
+    /// reaped, and when.
     ///
-    /// This is the write that makes `running` mean something again: without it
-    /// a supervisor cannot tell a live worker from one that exited into a row
+    /// One CAS on (row, session, `run_gen`, not-yet-exited). First writer wins
+    /// for one run, so the daemon event observer and the adopted-pane drain can
+    /// both see the same exit without moving its time or changing its code
+    /// ([`ExitStamp::AlreadyStamped`](crate::issue::ExitStamp::AlreadyStamped)).
+    /// A retry publishes a new session and bumps `run_gen` in the same UPDATE
+    /// that clears the exit pair, so a late exit from the replaced run matches
+    /// nothing ([`Stale`](crate::issue::ExitStamp::Stale)) instead of closing
+    /// the live one. The follow-up read only classifies a miss; it never writes.
+    ///
+    /// This is the write that makes `running` mean something: without it a
+    /// supervisor cannot tell a live worker from one that exited into a row
     /// nobody closed, and counts the latter as free capacity.
-    pub fn stamp_dispatch_exit(&self, id: i64, exit_code: Option<i64>) -> Result<()> {
-        if self.get_dispatch(id)?.is_none() {
-            anyhow::bail!("roster row {id} does not exist");
-        }
-        self.conn().execute(
+    pub fn stamp_dispatch_exit(
+        &self,
+        run: &crate::issue::DispatchRunRef,
+        exit_code: Option<i64>,
+    ) -> Result<crate::issue::ExitStamp> {
+        use crate::issue::ExitStamp;
+        let conn = self.conn();
+        let changed = conn.execute(
             "UPDATE agent_dispatches SET exit_code=?1, exited_at_ms=?2 \
-             WHERE id=?3 AND exited_at_ms IS NULL",
-            rusqlite::params![exit_code, util::now_ms(), id],
+             WHERE id=?3 AND COALESCE(session_id,'')=?4 AND run_gen=?5 \
+             AND exited_at_ms IS NULL",
+            rusqlite::params![
+                exit_code,
+                util::now_ms(),
+                run.id,
+                run.session_id,
+                run.run_gen
+            ],
         )?;
-        Ok(())
+        if changed != 0 {
+            return Ok(ExitStamp::Stamped);
+        }
+        let current = conn
+            .query_row(
+                "SELECT COALESCE(session_id,''), run_gen, exited_at_ms IS NOT NULL \
+                 FROM agent_dispatches WHERE id=?1",
+                [run.id],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, bool>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        Ok(match current {
+            None => ExitStamp::Missing,
+            Some((session, generation, true))
+                if session == run.session_id && generation == run.run_gen =>
+            {
+                ExitStamp::AlreadyStamped
+            }
+            Some(_) => ExitStamp::Stale,
+        })
     }
 
     /// Worktrees carrying at least one dispatch row that still occupies a slot.
@@ -699,6 +762,8 @@ fn map_note(r: &rusqlite::Row<'_>) -> rusqlite::Result<DispatchNote> {
 mod tests {
     use super::*;
     use crate::db::Db;
+    use crate::issue::ExitStamp;
+    use crate::store::NotificationStore;
 
     fn temp_db() -> (Db, tempfile::TempDir) {
         let dir = tempfile::TempDir::new().unwrap();
@@ -879,12 +944,7 @@ mod tests {
                 .to_string()
                 .contains("roster row 99999 does not exist")
         );
-        let error = db.stamp_dispatch_exit(99_999, Some(1)).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("roster row 99999 does not exist")
-        );
+        assert!(db.dispatch_run_ref(99_999).unwrap().is_none());
     }
 
     #[test]
@@ -1126,7 +1186,11 @@ mod tests {
         let id = put_row(&db, "linear:X-9", "/wt/x");
         db.update_dispatch_status(id, AgentDispatchStatus::Running)
             .unwrap();
-        db.stamp_dispatch_exit(id, Some(7)).unwrap();
+        let first_run = db.dispatch_run_ref(id).unwrap().unwrap();
+        assert_eq!(
+            db.stamp_dispatch_exit(&first_run, Some(7)).unwrap(),
+            ExitStamp::Stamped
+        );
         assert!(
             db.compare_and_set_dispatch_retry_park(
                 id,
@@ -1157,6 +1221,56 @@ mod tests {
         assert_eq!(relaunched.status, AgentDispatchStatus::Running);
         assert_eq!(relaunched.exit_code, None);
         assert_eq!(relaunched.exited_at_ms, None);
+
+        // THE-238: the replaced run's exit, delivered late (a duplicate
+        // observer, or an event reordered behind the retry publication), must
+        // not close the run that replaced it.
+        let second_run = db.dispatch_run_ref(id).unwrap().unwrap();
+        assert_eq!(second_run.session_id, "replacement");
+        assert!(second_run.run_gen > first_run.run_gen);
+        assert_eq!(
+            db.stamp_dispatch_exit(&first_run, Some(7)).unwrap(),
+            ExitStamp::Stale
+        );
+        let still_live = db.get_dispatch(id).unwrap().unwrap();
+        assert_eq!(still_live.exit_code, None);
+        assert_eq!(still_live.exited_at_ms, None);
+        // The live run stamps once; a duplicate observation changes nothing.
+        assert_eq!(
+            db.stamp_dispatch_exit(&second_run, Some(0)).unwrap(),
+            ExitStamp::Stamped
+        );
+        let stamped_at = db.get_dispatch(id).unwrap().unwrap().exited_at_ms;
+        assert_eq!(
+            db.stamp_dispatch_exit(&second_run, Some(9)).unwrap(),
+            ExitStamp::AlreadyStamped
+        );
+        let after = db.get_dispatch(id).unwrap().unwrap();
+        assert_eq!(after.exit_code, Some(0));
+        assert_eq!(after.exited_at_ms, stamped_at);
+    }
+
+    #[test]
+    fn exit_stamp_is_fenced_by_generation_even_with_the_same_session() {
+        // A relaunch that republishes the SAME session id still bumps run_gen,
+        // so a run resolved before the relaunch cannot stamp the one after.
+        let (db, _dir) = temp_db();
+        let id = put_row(&db, "linear:X-10", "/wt/x");
+        db.stamp_dispatch_run(id, "sess-same", "a.md").unwrap();
+        let before = db.dispatch_run_ref(id).unwrap().unwrap();
+        db.stamp_dispatch_run(id, "sess-same", "a.md").unwrap();
+        assert_eq!(
+            db.stamp_dispatch_exit(&before, Some(0)).unwrap(),
+            ExitStamp::Stale
+        );
+        let gone = crate::issue::DispatchRunRef {
+            id: 99_999,
+            ..before
+        };
+        assert_eq!(
+            db.stamp_dispatch_exit(&gone, Some(1)).unwrap(),
+            ExitStamp::Missing
+        );
     }
 
     #[test]

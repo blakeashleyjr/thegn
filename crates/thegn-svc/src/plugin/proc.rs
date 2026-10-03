@@ -282,6 +282,37 @@ pub(crate) const fn bounded_group_termination_supported() -> bool {
     cfg!(unix)
 }
 
+/// Whether the (direct, still-unreaped) child `pid` has exited, observed with
+/// `WNOWAIT` so it stays waitable: its zombie pins the pid/pgid, so a group
+/// kill issued before the reap can never hit a recycled, unrelated group.
+#[cfg(unix)]
+pub(crate) fn leader_exited_nowait(pid: u32) -> std::io::Result<bool> {
+    let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+    // SAFETY: waitid initializes siginfo on success; WNOWAIT leaves the child
+    // waitable.
+    let rc = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            info.as_mut_ptr(),
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: successful waitid initialized the siginfo structure.
+    Ok(unsafe { info.assume_init().si_pid() } != 0)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn leader_exited_nowait(_pid: u32) -> std::io::Result<bool> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "no-wait child observation needs Unix",
+    ))
+}
+
 #[cfg(unix)]
 pub(crate) fn kill_group(pid: u32) {
     // Negative pid targets the whole group.

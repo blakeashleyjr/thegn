@@ -411,12 +411,25 @@ impl DateRange {
 ///   boundary rather than drifting to 08:00 or 10:00.
 /// - [`EventTime::Instant`] is a fixed point on the timeline, for providers
 ///   that hand back an absolute timestamp.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum EventTime {
-    Date { date: NaiveDate },
-    Zoned { local: NaiveDateTime, zone: TzRef },
-    Instant { at: DateTime<Utc> },
+    /// `date` is an ISO 8601 calendar date (`2026-12-25`).
+    Date {
+        #[schemars(with = "String")]
+        date: NaiveDate,
+    },
+    /// `local` is an ISO 8601 date-time with no offset (`2026-12-25T09:00:00`).
+    Zoned {
+        #[schemars(with = "String")]
+        local: NaiveDateTime,
+        zone: TzRef,
+    },
+    /// `at` is an RFC 3339 timestamp (`2026-12-25T14:00:00Z`).
+    Instant {
+        #[schemars(with = "String")]
+        at: DateTime<Utc>,
+    },
 }
 
 impl EventTime {
@@ -462,7 +475,9 @@ impl EventTime {
 }
 
 /// A globally unique event id, `"<source>/<uid>"`.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, schemars::JsonSchema,
+)]
 #[serde(transparent)]
 pub struct EventId(pub String);
 
@@ -482,7 +497,19 @@ impl std::fmt::Display for EventId {
 }
 
 /// Which configured account an event came from (`"<provider>:<account>"`).
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Default,
+    Serialize,
+    Deserialize,
+    schemars::JsonSchema,
+)]
 #[serde(transparent)]
 pub struct SourceId(pub String);
 
@@ -494,7 +521,9 @@ impl SourceId {
 
 /// RFC 5545 participation status, kept as data even though this pass never
 /// writes it back — dropping it would make the cache lossy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum EventStatus {
     #[default]
@@ -504,7 +533,9 @@ pub enum EventStatus {
 }
 
 /// Free/busy transparency.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum Busy {
     #[default]
@@ -513,7 +544,9 @@ pub enum Busy {
 }
 
 /// A reminder offset, in minutes *before* the occurrence start.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, schemars::JsonSchema,
+)]
 #[serde(transparent)]
 pub struct Reminder {
     pub minutes_before: u32,
@@ -527,7 +560,7 @@ pub struct Reminder {
 /// `deny_unknown_fields` — unknown keys are ignored so a *newer* plugin can
 /// talk to an older thegn, and [`CalEvent::extra`] carries anything a provider
 /// wants to round-trip explicitly.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct CalEvent {
     /// The provider's native UID. Unique within a source, not globally.
     pub uid: String,

@@ -728,11 +728,71 @@ pub fn purge_worktree_files(path: &Path) {
 /// lost; absence of a `.git` marker is not proof of ownership. An already
 /// absent path still counts as removed.
 pub fn remove(root: &Path, path: &Path, branch: &str, delete_branch: bool) -> bool {
+    remove_detailed(root, path, branch, delete_branch).is_ok()
+}
+
+/// Whether git's stderr says the command lost a lock race (transient) rather
+/// than being refused for a real reason (unmerged branch, missing ref, ...).
+pub fn is_lock_contention(stderr: &str) -> bool {
+    let s = stderr.to_ascii_lowercase();
+    s.contains("cannot lock ref")
+        || s.contains("unable to create '") && s.contains(".lock'")
+        || s.contains("another git process seems to be running")
+        || s.contains("could not lock")
+}
+
+/// Bounded retry budget for lock contention: 6 tries, 40ms doubling to a 320ms
+/// cap (about 1.3s worst case). Non-contention failures are never retried.
+const LOCK_RETRY_ATTEMPTS: u32 = 6;
+
+/// Run a destructive git command, keeping stderr so a failure carries its
+/// reason, and retry within a bound only when it lost a lock race.
+fn git_destructive(root: &Path, args: &[&str]) -> Result<(), String> {
+    let mut delay = std::time::Duration::from_millis(40);
+    let mut attempt = 1;
+    loop {
+        let out = util::git_cmd(root)
+            .args(args)
+            .output()
+            .map_err(|e| format!("could not run git {}: {e}", args.join(" ")))?;
+        if out.status.success() {
+            return Ok(());
+        }
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        if attempt >= LOCK_RETRY_ATTEMPTS || !is_lock_contention(&stderr) {
+            return Err(stderr);
+        }
+        std::thread::sleep(delay);
+        delay = (delay * 2).min(std::time::Duration::from_millis(320));
+        attempt += 1;
+    }
+}
+
+/// [`remove`], but a failure says why (git's own stderr or the ownership
+/// reason) so a multi-target delete can report each target that did not go.
+/// A failed branch delete after a successful removal is a warning, not an
+/// error: the worktree is gone.
+pub fn remove_detailed(
+    root: &Path,
+    path: &Path,
+    branch: &str,
+    delete_branch: bool,
+) -> Result<(), String> {
     let _lock = util::lock_git_mutations(root);
     let path_s = path.to_string_lossy();
-    let mut removed = util::git_ok(root, &["worktree", "remove", &path_s])
-        || util::git_ok(root, &["worktree", "remove", "--force", &path_s]);
+    let mut failure = None;
+    let mut removed = true;
+    if let Err(first) = git_destructive(root, &["worktree", "remove", &path_s]) {
+        match git_destructive(root, &["worktree", "remove", "--force", &path_s]) {
+            Ok(()) => {}
+            Err(forced) => {
+                removed = false;
+                failure = Some(if forced.is_empty() { first } else { forced });
+            }
+        }
+    }
     if !removed {
+        let why = failure.take().unwrap_or_default();
         match git_worktree_registration(root, path) {
             Some(false) if !path.exists() && !worktree_paths_equal(root, path) => {
                 removed = true;
@@ -741,18 +801,30 @@ pub fn remove(root: &Path, path: &Path, branch: &str, delete_branch: bool) -> bo
                     path.display()
                 ));
             }
-            Some(false) => msg::warn(&format!(
-                "kept Git-unregistered path at {}: Git can no longer prove that this directory belongs to the worktree",
-                path.display()
-            )),
-            Some(true) => msg::warn(&format!(
-                "could not remove registered worktree at {} (uncommitted changes or read-only mount?)",
-                path.display()
-            )),
-            None => msg::warn(&format!(
-                "could not remove worktree at {} (could not verify Git worktree registry)",
-                path.display()
-            )),
+            Some(false) => {
+                let m = format!(
+                    "kept Git-unregistered path at {}: Git can no longer prove that this directory belongs to the worktree",
+                    path.display()
+                );
+                msg::warn(&m);
+                failure = Some(m);
+            }
+            Some(true) => {
+                let m = format!(
+                    "could not remove registered worktree at {} (uncommitted changes or read-only mount?): {why}",
+                    path.display()
+                );
+                msg::warn(&m);
+                failure = Some(m);
+            }
+            None => {
+                let m = format!(
+                    "could not remove worktree at {} (could not verify Git worktree registry): {why}",
+                    path.display()
+                );
+                msg::warn(&m);
+                failure = Some(m);
+            }
         }
     }
     // The branch delete is gated on the removal having ACTUALLY happened. It
@@ -766,11 +838,15 @@ pub fn remove(root: &Path, path: &Path, branch: &str, delete_branch: bool) -> bo
                 "kept branch {branch}: its worktree at {} is still on disk",
                 path.display()
             ));
-        } else if !util::git_ok(root, &["branch", "-D", branch]) {
-            msg::warn(&format!("could not delete branch {branch}"));
+        } else if let Err(why) = git_destructive(root, &["branch", "-D", branch]) {
+            msg::warn(&format!("could not delete branch {branch}: {why}"));
         }
     }
-    removed
+    if removed {
+        Ok(())
+    } else {
+        Err(failure.unwrap_or_else(|| format!("could not remove worktree at {}", path.display())))
+    }
 }
 
 /// Ask Git whether `path` is one of the repository's registered worktrees.
@@ -1034,6 +1110,109 @@ mod tests {
         assert!(!error.branch_created);
         assert!(branch_exists(&repo, "main"));
         assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn lock_contention_is_told_apart_from_real_refusals() {
+        assert!(is_lock_contention(
+            "error: cannot lock ref 'refs/heads/x': Unable to create '/r/.git/refs/heads/x.lock': File exists."
+        ));
+        assert!(is_lock_contention(
+            "fatal: Unable to create '/r/.git/packed-refs.lock': File exists."
+        ));
+        assert!(!is_lock_contention(
+            "error: the branch 'x' is not fully merged"
+        ));
+        assert!(!is_lock_contention("error: branch 'x' not found."));
+    }
+
+    #[test]
+    fn branch_delete_retries_a_held_ref_lock_then_succeeds() {
+        let repo = temp_repo("retry-lock");
+        let path = repo.join(".wt-locked");
+        assert!(util::git_ok(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "locked",
+                &path.to_string_lossy()
+            ]
+        ));
+        let lock = repo.join(".git/refs/heads/locked.lock");
+        std::fs::write(&lock, "").unwrap();
+        let release = lock.clone();
+        let t = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(120));
+            let _ = std::fs::remove_file(release); // best-effort: test helper
+        });
+        assert!(remove_detailed(&repo, &path, "locked", true).is_ok());
+        t.join().unwrap();
+        assert!(
+            !branch_exists(&repo, "locked"),
+            "retry must land the delete"
+        );
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn non_contention_failure_is_not_retried_and_carries_git_reason() {
+        let repo = temp_repo("no-retry");
+        let started = std::time::Instant::now();
+        let err = git_destructive(&repo, &["branch", "-D", "nope"]).unwrap_err();
+        assert!(err.contains("nope"), "git's own reason is kept: {err}");
+        assert!(started.elapsed() < std::time::Duration::from_millis(300));
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn concurrent_removals_in_one_repo_all_land() {
+        let repo = temp_repo("concurrent");
+        let mut jobs = Vec::new();
+        for i in 0..4 {
+            let path = repo.join(format!(".wt-c{i}"));
+            let branch = format!("c{i}");
+            assert!(util::git_ok(
+                &repo,
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    &branch,
+                    &path.to_string_lossy()
+                ]
+            ));
+            jobs.push((path, branch));
+        }
+        let handles: Vec<_> = jobs
+            .iter()
+            .cloned()
+            .map(|(path, branch)| {
+                let repo = repo.clone();
+                std::thread::spawn(move || remove_detailed(&repo, &path, &branch, true))
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap().expect("every removal lands");
+        }
+        for (path, branch) in &jobs {
+            assert!(!path.exists());
+            assert!(!branch_exists(&repo, branch));
+        }
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn remove_detailed_reports_why_for_an_unowned_directory() {
+        let repo = temp_repo("why");
+        let path = repo.join(".wt-orphan2");
+        std::fs::create_dir_all(&path).unwrap();
+        let err = remove_detailed(&repo, &path, "", false).unwrap_err();
+        assert!(err.contains("Git-unregistered"), "{err}");
         let _ = std::fs::remove_dir_all(&repo);
     }
 

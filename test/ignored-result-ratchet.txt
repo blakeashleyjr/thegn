@@ -196,6 +196,10 @@ crates/thegn-host/src/daemon/session.rs
 crates/thegn-host/src/db_task.rs
 crates/thegn-host/src/desktop_notify.rs
 crates/thegn-host/src/detail/usage_dash.rs
+# diff fs-watcher event closure + registration, MOVED VERBATIM from hydrate.rs
+# (THE-718): channel sends to a possibly-gone consumer and optional-watch
+# registration, each annotated `// best-effort:` in-file.
+crates/thegn-host/src/diff_watch.rs
 crates/thegn-host/src/drawer_state.rs
 crates/thegn-host/src/emulator.rs
 crates/thegn-host/src/env_ui.rs
@@ -353,6 +357,7 @@ crates/thegn-media/src/mediaremote.rs
 crates/thegn-media/src/ratchet.rs
 crates/thegn-media/src/smtc.rs
 crates/thegn-metrics/src/battery.rs
+crates/thegn-metrics/src/gpu_exec.rs
 crates/thegn-metrics/src/lib.rs
 crates/thegn-metrics/src/ratchet.rs
 crates/thegn-proxy/src/lib.rs

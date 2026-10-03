@@ -167,6 +167,9 @@ impl Db {
                      branch=?2, target_branch=?3, status='queued',
                      queued_at=?4, updated_at=?4,
                      result_oid=NULL, conflict_paths=NULL, error_detail=NULL,
+                     agent_attempts=CASE WHEN merge_queue.status IN
+                       ('queued','folding','verifying','agent_running')
+                     THEN merge_queue.agent_attempts ELSE 0 END,
                      location=?5"#,
                 params![worktree, branch, target_branch, now, location],
             )?;
@@ -309,8 +312,14 @@ impl WorktreeAuxStore for Db {
     }
 
     /// Enqueue (or re-enqueue) a worktree branch for the next fold. Re-enqueueing
-    /// resets the row to `queued` and clears any prior result/conflict/error, so
-    /// a branch that was deferred and then rebased starts fresh.
+    /// resets the row to `queued`, clears any prior result/conflict/error and
+    /// zeroes `agent_attempts` in the same upsert (only when the existing row is
+    /// finished, never for an active queued/folding/verifying/agent_running row,
+    /// so a periodic re-add cannot refill an in-flight budget), so a branch that was deferred
+    /// and then rebased starts fresh with a full agent budget (same as `merge
+    /// retry`). Every caller is a deliberate user/API enqueue; internal outcome
+    /// persistence goes through `persist_merge_outcome`, which preserves the
+    /// counter.
     fn enqueue_merge(&self, worktree: &str, branch: &str, target_branch: &str) -> Result<()> {
         let now = util::now();
         // `location` mirrors `worktrees.location` at enqueue time via a
@@ -327,6 +336,9 @@ impl WorktreeAuxStore for Db {
                  branch=?2, target_branch=?3, status='queued',
                  queued_at=?4, updated_at=?4,
                  result_oid=NULL, conflict_paths=NULL, error_detail=NULL,
+                 agent_attempts=CASE WHEN merge_queue.status IN
+                       ('queued','folding','verifying','agent_running')
+                     THEN merge_queue.agent_attempts ELSE 0 END,
                  location=(SELECT location FROM worktrees WHERE worktree=?1)"#,
             params![worktree, branch, target_branch, now],
         )?;

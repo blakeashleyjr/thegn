@@ -3344,6 +3344,54 @@ fn enforcement_matrix_report(cfg: &Config) {
         );
     }
     floor_report(cfg);
+    home_report(cfg);
+}
+
+/// The `$HOME` confidentiality line (THE-215): whether the host `$HOME` is hidden,
+/// read-only-visible, or writable for the launch this host would pick under the
+/// configured profile. Read-only is NOT confidential — only `hidden` is.
+fn home_report(cfg: &Config) {
+    use thegn_core::sandbox_mounts::{HomeView, planned_home_view};
+    let report = thegn_core::sandbox_support::support_report(
+        &shell_chain(cfg),
+        &Placement::Local,
+        cfg_oci_runtime(cfg),
+    );
+    let backend = thegn_core::sandbox_support::first_ready(&report)
+        .map(|r| r.backend)
+        .unwrap_or(Backend::None);
+    let profile = cfg.sandbox.profile;
+    let view = planned_home_view(profile, backend);
+    let note = match view {
+        HomeView::Hidden => "private tmpfs + reviewed read-only allowlist",
+        HomeView::ReadOnly => "whole host $HOME readable (integrity only, not confidential)",
+        HomeView::Writable => "whole host $HOME readable AND writable",
+    };
+    outln!("  home          {} — {note}", view.as_str());
+    if profile.hides_home() && !cfg.sandbox.enabled {
+        outln!(
+            "                NOT ENFORCED: [sandbox] enabled = false — profile `{}` is not applied, panes run on the host with the whole $HOME",
+            profile.as_str()
+        );
+    } else if profile.hides_home() && view != HomeView::Hidden {
+        outln!(
+            "                MISSED: profile `{}` demands a hidden $HOME; this host would refuse to launch it",
+            profile.as_str()
+        );
+    }
+    // Sealed tiers drop any `[sandbox] mounts` entry reaching the credential deny
+    // list (the default `~/.gnupg:rw` included). Say which, by path only.
+    if profile.hides_home()
+        && let Ok(home) = std::env::var("HOME")
+        && !home.is_empty()
+    {
+        for p in thegn_core::sandbox_mounts::sealed_dropped_cfg_mounts(
+            &cfg.sandbox.mounts,
+            std::path::Path::new(&home),
+        ) {
+            outln!("                dropped mount {p} (reaches a protected $HOME path)");
+        }
+    }
 }
 
 /// The isolation floor line: the demanded minimum, the miss policy, and whether

@@ -176,7 +176,8 @@ pub struct IssueAccount {
     pub token: String,
     /// Linear: restrict to a single team id (`""` = all teams).
     pub team_id: String,
-    /// Linear: workspace slug (used for URLs; inferred if empty).
+    /// Linear: workspace slug. Only affects issue URLs (inferred if empty); it
+    /// is not a scope or access boundary.
     pub workspace_slug: String,
     /// Jira / Kaneo: instance base URL, e.g. `"https://myorg.atlassian.net"` or
     /// `"https://kaneo.example.com"`.
@@ -239,7 +240,8 @@ pub struct LinearConfig {
     pub api_key: String,
     /// Restrict to a single team id. `""` = all teams.
     pub team_id: String,
-    /// Optional workspace slug (used for URLs; inferred if empty).
+    /// Optional workspace slug. Only affects issue URLs (inferred if empty); it
+    /// is not a scope or access boundary.
     pub workspace_slug: String,
 }
 
@@ -324,6 +326,13 @@ impl Default for KaneoConfig {
 /// team / Jira project that scopes its "My Work" feed (GitHub is auto-scoped to
 /// the repo's remote and needs no config). Same Option-field shape as
 /// `SandboxOverlay`.
+///
+/// The overlay is restrict-only: a repo may narrow an UNPINNED global scope
+/// (including choosing the default destination for user-initiated creates) but
+/// never widen it — providers are intersected with the globally enabled set and
+/// a non-empty global pin is a ceiling. Pins are applied to the legacy
+/// single-provider sub-tables only; in accounts mode (`[[issue_accounts]]`)
+/// each account carries its own scope and repo pins are not applied to it.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct IssuesOverlay {
@@ -363,15 +372,96 @@ pub struct KaneoOverlay {
     pub project_id: Option<String>,
 }
 
+/// A repo pin may only narrow a global pin: an empty global pin means "all", so
+/// any repo pin is within it; a non-empty global pin is a ceiling the repo can
+/// only restate. Anything else is refused (the global pin stays) and reported.
+fn narrow_pin(field: &str, global: &mut String, repo: String, refused: &mut Vec<String>) {
+    if global.is_empty() || *global == repo {
+        *global = repo;
+    } else {
+        refused.push(format!("{field} pin is outside the global scope"));
+    }
+}
+
+/// Bounded per-process set of already-logged `(repo root, message)` refusals.
+static LOGGED_REFUSALS: std::sync::Mutex<Vec<(std::path::PathBuf, String)>> =
+    std::sync::Mutex::new(Vec::new());
+const LOGGED_REFUSALS_CAP: usize = 256;
+
+/// True the first time `(root, msg)` is seen in this process (bounded: the set
+/// is cleared when it reaches the cap, so a flood can only cause re-logging).
+fn first_refusal(root: &std::path::Path, msg: &str) -> bool {
+    let Ok(mut seen) = LOGGED_REFUSALS.lock() else {
+        return true;
+    };
+    if seen.iter().any(|(r, m)| r == root && m == msg) {
+        return false;
+    }
+    if seen.len() >= LOGGED_REFUSALS_CAP {
+        seen.clear();
+    }
+    seen.push((root.to_path_buf(), msg.to_string()));
+    true
+}
+
+/// Warn about refused overlay widening, once per `(repo root, message)`.
+pub(crate) fn warn_refusals_once(root: &std::path::Path, refused: &[String]) {
+    for why in refused {
+        if first_refusal(root, why) {
+            tracing::warn!(
+                repo = %root.display(),
+                "repo [issues] overlay refused (restrict-only): {why}"
+            );
+        }
+    }
+}
+
 impl IssuesOverlay {
     /// Field-merge present keys into a base [`IssuesConfig`] (absent inherit).
-    pub(crate) fn apply(self, base: &mut IssuesConfig) {
+    ///
+    /// The overlay is RESTRICT-ONLY: providers are intersected with the globally
+    /// enabled set and pins may only narrow a global pin. Returns a diagnostic
+    /// per refused widening attempt (the value is never applied).
+    pub(crate) fn apply(self, base: &mut IssuesConfig) -> Vec<String> {
+        let mut refused = Vec::new();
         if let Some(p) = self.providers {
+            // "Enabled" is the legacy provider set plus the providers of the
+            // active explicit accounts (accounts mode).
+            // In accounts mode (`issue_accounts` non-empty) only the accounts'
+            // providers count: legacy providers there have no active account.
+            let accounts_mode = !base.issue_accounts.is_empty();
+            let mut enabled = if accounts_mode {
+                Vec::new()
+            } else {
+                base.active_providers()
+            };
+            for a in base.active_accounts() {
+                if !enabled.contains(&a.provider) {
+                    enabled.push(a.provider);
+                }
+            }
+            let mut kept: Vec<IssueProviderKind> = Vec::new();
+            for k in p {
+                if enabled.contains(&k) {
+                    if !kept.contains(&k) {
+                        kept.push(k);
+                    }
+                } else if k != IssueProviderKind::None {
+                    refused.push(format!("provider {} is not enabled globally", k.as_str()));
+                }
+            }
             // An explicit restriction is authoritative: also clear the legacy
             // single `provider` so `providers = []` resolves to *none* instead of
             // falling back to the legacy provider in `active_providers`.
             base.provider = IssueProviderKind::None;
-            base.providers = p;
+            // In accounts mode the intersected set also filters the accounts.
+            base.issue_accounts.retain(|a| kept.contains(&a.provider));
+            if accounts_mode {
+                // An emptied list must mean NO accounts, never a re-synthesis
+                // of legacy accounts (and their sub-table tokens).
+                base.accounts_restricted = true;
+            }
+            base.providers = kept;
         }
         if let Some(names) = self.accounts {
             base.issue_accounts.retain(|a| names.contains(&a.name));
@@ -380,20 +470,50 @@ impl IssuesOverlay {
             base.accounts_restricted = true;
         }
         if let Some(t) = self.linear.team_id {
-            base.linear.team_id = t;
+            narrow_pin("linear.team_id", &mut base.linear.team_id, t, &mut refused);
         }
         if let Some(w) = self.linear.workspace_slug {
             base.linear.workspace_slug = w;
         }
         if let Some(k) = self.jira.project_key {
-            base.jira.project_key = k;
+            narrow_pin(
+                "jira.project_key",
+                &mut base.jira.project_key,
+                k,
+                &mut refused,
+            );
         }
+        // Kaneo workspace + project are ONE nested ceiling: a project may live in
+        // another workspace and the config layer cannot verify membership.
+        let (g_ws, g_proj) = (
+            base.kaneo.workspace_id.clone(),
+            base.kaneo.project_id.clone(),
+        );
         if let Some(w) = self.kaneo.workspace_id {
-            base.kaneo.workspace_id = w;
+            if g_ws.is_empty() && !g_proj.is_empty() && w != g_ws {
+                refused.push("kaneo.workspace_id pin is outside the global scope".into());
+            } else {
+                narrow_pin(
+                    "kaneo.workspace_id",
+                    &mut base.kaneo.workspace_id,
+                    w,
+                    &mut refused,
+                );
+            }
         }
         if let Some(p) = self.kaneo.project_id {
-            base.kaneo.project_id = p;
+            if g_proj.is_empty() && !g_ws.is_empty() && !p.is_empty() {
+                refused.push("kaneo.project_id pin is outside the global scope".into());
+            } else {
+                narrow_pin(
+                    "kaneo.project_id",
+                    &mut base.kaneo.project_id,
+                    p,
+                    &mut refused,
+                );
+            }
         }
+        refused
     }
 
     /// Whether the overlay carries no overrides (skip applying it).
@@ -411,6 +531,31 @@ impl IssuesOverlay {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repo_providers_cannot_activate_unused_legacy_credential() {
+        let mut base = IssuesConfig {
+            jira: JiraConfig {
+                api_token: "LEGACY_JIRA_CANARY".into(),
+                ..Default::default()
+            },
+            provider: IssueProviderKind::Jira,
+            issue_accounts: vec![IssueAccount {
+                name: "lin".into(),
+                provider: IssueProviderKind::Linear,
+                token: "LIN_CANARY".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let refused = IssuesOverlay {
+            providers: Some(vec![IssueProviderKind::Jira]),
+            ..Default::default()
+        }
+        .apply(&mut base);
+        assert_eq!(refused.len(), 1);
+        assert!(base.active_accounts().is_empty());
+    }
 
     #[test]
     fn active_accounts_empty_by_default() {
@@ -678,5 +823,124 @@ mod tests {
             base.active_accounts().is_empty(),
             "a typo'd account restriction must yield zero accounts, not legacy"
         );
+    }
+
+    #[test]
+    fn overlay_apply_reports_each_refused_widening() {
+        let mut base = IssuesConfig {
+            providers: vec![IssueProviderKind::Linear],
+            linear: LinearConfig {
+                team_id: "G".into(),
+                ..Default::default()
+            },
+            kaneo: KaneoConfig {
+                workspace_id: "w".into(),
+                project_id: "p".into(),
+                ..Default::default()
+            },
+            jira: JiraConfig {
+                project_key: "J".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let refused = IssuesOverlay {
+            providers: Some(vec![
+                IssueProviderKind::Linear,
+                IssueProviderKind::Jira,
+                IssueProviderKind::None,
+            ]),
+            linear: LinearOverlay {
+                team_id: Some("X".into()),
+                workspace_slug: None,
+            },
+            jira: JiraOverlay {
+                project_key: Some("Y".into()),
+            },
+            kaneo: KaneoOverlay {
+                workspace_id: Some("w2".into()),
+                project_id: Some("p2".into()),
+            },
+            ..Default::default()
+        }
+        .apply(&mut base);
+        assert_eq!(refused.len(), 5, "{refused:?}");
+        assert_eq!(base.active_providers(), vec![IssueProviderKind::Linear]);
+        assert_eq!(base.linear.team_id, "G");
+        assert_eq!(base.jira.project_key, "J");
+        assert_eq!(base.kaneo.workspace_id, "w");
+        assert_eq!(base.kaneo.project_id, "p");
+    }
+
+    #[test]
+    fn kaneo_pins_are_one_nested_ceiling() {
+        let kaneo = |ws: &str, proj: &str| IssuesConfig {
+            provider: IssueProviderKind::Kaneo,
+            kaneo: KaneoConfig {
+                workspace_id: ws.into(),
+                project_id: proj.into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let ov = |ws: Option<&str>, proj: Option<&str>| IssuesOverlay {
+            kaneo: KaneoOverlay {
+                workspace_id: ws.map(Into::into),
+                project_id: proj.map(Into::into),
+            },
+            ..Default::default()
+        };
+        // Global workspace pinned, project not: a repo project is refused.
+        let mut b = kaneo("w", "");
+        assert_eq!(ov(None, Some("p")).apply(&mut b).len(), 1);
+        assert_eq!(b.kaneo.project_id, "");
+        // Global project pinned, workspace not: a repo workspace is refused.
+        let mut b = kaneo("", "p");
+        assert_eq!(ov(Some("w"), None).apply(&mut b).len(), 1);
+        assert_eq!(b.kaneo.workspace_id, "");
+        // Neither pinned: both accepted.
+        let mut b = kaneo("", "");
+        assert!(ov(Some("w"), Some("p")).apply(&mut b).is_empty());
+        assert_eq!(
+            (b.kaneo.workspace_id.as_str(), b.kaneo.project_id.as_str()),
+            ("w", "p")
+        );
+    }
+
+    #[test]
+    fn overlay_providers_filter_accounts_in_accounts_mode() {
+        let acct = |n: &str, p| IssueAccount {
+            name: n.into(),
+            provider: p,
+            enabled: true,
+            ..Default::default()
+        };
+        let mut base = IssuesConfig {
+            issue_accounts: vec![
+                acct("l", IssueProviderKind::Linear),
+                acct("j", IssueProviderKind::Jira),
+            ],
+            ..Default::default()
+        };
+        let refused = IssuesOverlay {
+            providers: Some(vec![IssueProviderKind::Jira, IssueProviderKind::Github]),
+            ..Default::default()
+        }
+        .apply(&mut base);
+        // Jira is enabled via an account (no diagnostic); github is not.
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert!(refused[0].contains("github"));
+        let names: Vec<_> = base.active_accounts().into_iter().map(|a| a.name).collect();
+        assert_eq!(names, vec!["j".to_string()]);
+    }
+
+    #[test]
+    fn refusal_is_logged_once_per_root_and_message() {
+        let r1 = std::path::Path::new("/tmp/the724-a");
+        let r2 = std::path::Path::new("/tmp/the724-b");
+        assert!(first_refusal(r1, "m"));
+        assert!(!first_refusal(r1, "m"));
+        assert!(first_refusal(r1, "other"));
+        assert!(first_refusal(r2, "m"));
     }
 }

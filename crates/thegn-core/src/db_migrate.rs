@@ -1063,6 +1063,34 @@ pub(crate) fn migrate_v70(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// v71: `agent_dispatches.run_gen`, the per-row launch (fencing) generation.
+///
+/// A retry replaces `session_id` and clears the exit pair on the SAME row, so
+/// "row id + not yet exited" cannot tell the run that exited from the run that
+/// replaced it. Every launch publication bumps this counter in the same UPDATE
+/// that writes the new session, and an exit stamp is a CAS on (row, session,
+/// generation): a late exit from a previous run matches nothing.
+///
+/// Additive and idempotent: existing rows read 0, keep their status, and no
+/// exit fact is manufactured for them.
+pub(crate) fn migrate_v71(conn: &Connection) -> Result<()> {
+    if !has_column(conn, "agent_dispatches", "run_gen") {
+        conn.execute(
+            "ALTER TABLE agent_dispatches ADD COLUMN run_gen INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+/// Verify the v71 generation column before the version stamp.
+pub(crate) fn verify_v71_schema(conn: &Connection) -> Result<()> {
+    if !has_column(conn, "agent_dispatches", "run_gen") {
+        bail!("schema v71 migration did not add agent_dispatches.run_gen");
+    }
+    Ok(())
+}
+
 /// Verify the v69 identity ledger before the schema version is stamped. A
 /// missing column/table must never look like a completed migration.
 pub(crate) fn verify_v69_schema(conn: &Connection) -> Result<()> {
@@ -1513,6 +1541,35 @@ mod tests {
     use rusqlite::{Connection, params};
 
     #[test]
+    fn v71_adds_run_gen_idempotently_and_preserves_active_rows() {
+        // A pre-v71 roster table with an active, un-exited row.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE agent_dispatches (
+                 id INTEGER PRIMARY KEY, issue_id TEXT NOT NULL, status TEXT NOT NULL,
+                 session_id TEXT, exit_code INTEGER, exited_at_ms INTEGER);
+             INSERT INTO agent_dispatches (issue_id, status, session_id)
+                 VALUES ('linear:G-1', 'running', 'sess-g');",
+        )
+        .unwrap();
+        assert!(super::verify_v71_schema(&conn).is_err());
+        super::migrate_v71(&conn).unwrap();
+        super::migrate_v71(&conn).unwrap(); // a second pass is a no-op
+        super::verify_v71_schema(&conn).unwrap();
+        assert!(has_column(&conn, "agent_dispatches", "run_gen"));
+        let (status, run_gen, exited): (String, i64, Option<i64>) = conn
+            .query_row(
+                "SELECT status, run_gen, exited_at_ms FROM agent_dispatches",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "running");
+        assert_eq!(run_gen, 0);
+        assert_eq!(exited, None, "no exit fact is manufactured");
+    }
+
+    #[test]
     fn detect_newer_schema_flags_only_a_newer_db() {
         // Older / equal on-disk versions are fine; only a strictly-newer DB
         // (written by a different-schema branch build) is flagged.
@@ -1874,10 +1931,11 @@ mod tests {
         assert_eq!(rows[0].artifact_path, None);
         // A legacy row still answers the exit lookup (it is active), and the
         // new columns are writable on a fresh row.
-        assert_eq!(
+        assert!(matches!(
             db.dispatch_for_exit("/wt/old", None).unwrap(),
-            Some((rows[0].id, "linear:OLD-1".to_string()))
-        );
+            crate::issue::ExitAttribution::Legacy(run)
+                if run.id == rows[0].id && run.issue_id == "linear:OLD-1" && run.run_gen == 0
+        ));
         let id = db
             .put_agent_dispatch(NewDispatch {
                 stage: Some("review"),

@@ -3361,8 +3361,10 @@ ignore = []            # container ports never to forward, e.g. [5432, 22]
 only = []              # if non-empty, ONLY forward these container ports
 bind = "127.0.0.1"     # host interface to bind forwards on (loopback = host-local)
 poll_secs = 2          # how often the sandbox is scanned for new listening ports
-browser = ""           # "open in browser" command; "" = $BROWSER, then xdg-open/open
-open_on_detect = false # auto-open the browser when a new forward comes up
+browser = ""           # argv template, quoted args, `%s` = URL (appended if absent), no shell, e.g. "firefox --new-window %s".
+                       # An explicit value is final (no fallback). "" = $BROWSER (':'-separated fallback list), then the OS opener.
+                       # Also used by open_on_detect. Only http/https URLs are opened.
+open_on_detect = false # auto-open the browser (via `browser` above) when a new forward comes up
 # Conflict handling: if a detected port's own number is already bound on the host,
 # the forward is remapped to the next free port in `range` and a notification shows
 # the real URL (e.g. "port 3000 in use → forwarded at localhost:8001").
@@ -4333,7 +4335,7 @@ rerere = false                # enable git rerere in the reused gate worktree an
 agent_max_attempts = 2        # agent-dispatch → re-fold cycles before marking a branch "needs_human".
                               # The budget belongs to the BRANCH and is persisted, so a later drain
                               # doesn't spend it again; `thegn merge retry` re-arms a row.
-agent_timeout_secs = 900      # watchdog per agent invocation; 0 disables
+agent_timeout_secs = 900      # watchdog per agent invocation; 0 = 6-hour ceiling (not unbounded), >30 days clamps
 #
 # Run the fixing agent INSIDE the resolved sandbox (default: host + the shared
 # resource slice, so it keeps host credentials/keychains). A queue handoff runs a
@@ -4452,7 +4454,7 @@ watch = ["ci", "conflict", "review"]   # which blocker classes may wake the agen
 agent = ""                    # e.g. "claude" — an [[agents]] name
 agent_command = ""            # e.g. 'claude -p {prompt}'; overrides `agent`
 agent_max_attempts = 2        # agent-dispatch cycles per PR before it is marked "needs_human"
-agent_timeout_secs = 900      # watchdog per agent invocation; 0 disables
+agent_timeout_secs = 900      # watchdog per agent invocation; 0 = 6-hour ceiling (not unbounded), >30 days clamps
 #
 # Run the fixing agent INSIDE the resolved sandbox (default: host + the shared
 # resource slice, so it keeps host credentials/keychains — a forge token, an ssh

@@ -14,9 +14,11 @@ fn tmpdir(tag: &str) -> std::path::PathBuf {
 #[test]
 fn repo_issues_overlay_scopes_linear_and_jira() {
     let mut cfg = Config::default();
-    cfg.issues.linear.team_id = "GLOBAL".into();
-    cfg.issues.jira.project_key = "GLOB".into();
-    cfg.issues.providers = vec![IssueProviderKind::Github];
+    cfg.issues.providers = vec![
+        IssueProviderKind::Github,
+        IssueProviderKind::Linear,
+        IssueProviderKind::Jira,
+    ];
     let dir = tmpdir("overlay");
     std::fs::write(
         dir.join(".thegn.toml"),
@@ -33,10 +35,13 @@ fn repo_issues_overlay_scopes_linear_and_jira() {
         vec![IssueProviderKind::Linear, IssueProviderKind::Jira]
     );
     // No repo_root ⇒ global config verbatim (no overlay applied).
-    assert_eq!(cfg.repo_issues(None).linear.team_id, "GLOBAL");
+    assert_eq!(cfg.repo_issues(None).providers, cfg.issues.providers);
     // A repo with no [issues] overlay inherits the global config.
     let empty = tmpdir("empty");
-    assert_eq!(cfg.repo_issues(Some(&empty)).jira.project_key, "GLOB");
+    assert_eq!(
+        cfg.repo_issues(Some(&empty)).providers,
+        cfg.issues.providers
+    );
     // best-effort: test cleanup: scratch removal must never fail the test
     let _ = std::fs::remove_dir_all(&dir);
     // best-effort: test cleanup: scratch removal must never fail the test

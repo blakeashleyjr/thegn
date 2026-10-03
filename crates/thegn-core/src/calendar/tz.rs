@@ -29,7 +29,19 @@ pub enum GapPolicy {
 /// bundled database does not know still round-trips through the cache and the
 /// plugin wire instead of failing deserialization and poisoning the whole
 /// payload. Resolution happens at use time via [`TzRef::resolve`].
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Default,
+    Serialize,
+    Deserialize,
+    schemars::JsonSchema,
+)]
 #[serde(transparent)]
 pub struct TzRef(pub String);
 

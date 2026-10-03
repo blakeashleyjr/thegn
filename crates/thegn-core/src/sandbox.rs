@@ -555,6 +555,12 @@ pub struct SandboxSpec {
     /// ephemeral in-process chrome panes (pins/drawer) leave it `false` so they
     /// still die with the compositor. Only affects the bwrap backend.
     pub daemon_persistent: bool,
+    /// `Some(home)` when the profile demands a **confidential** `$HOME` (sealed
+    /// tiers, THE-215), holding the host `$HOME` path to hide: it is replaced by a private tmpfs holding only an explicit
+    /// read-only allowlist ([`crate::sandbox_mounts::sealed_home_allowlist`]),
+    /// never mounted wholesale. A backend that cannot honor this is refused by
+    /// [`crate::sandbox_floor::home_gate`] rather than silently exposing `$HOME`.
+    pub seal_home: Option<String>,
 }
 
 /// Why a programmatic/configured named volume was refused. The error carries
@@ -598,6 +604,96 @@ impl std::fmt::Display for VolumeAdmissionError {
 }
 
 impl std::error::Error for VolumeAdmissionError {}
+
+/// Why [`enter_argv`] refused to build a launch command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnterError {
+    /// A named volume failed admission.
+    Volume(VolumeAdmissionError),
+    /// A sealed or OCI launch was refused (message names paths, never contents).
+    Refused(String),
+}
+
+impl std::fmt::Display for EnterError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EnterError::Volume(e) => e.fmt(f),
+            EnterError::Refused(m) => f.write_str(m),
+        }
+    }
+}
+
+impl std::error::Error for EnterError {}
+
+impl From<VolumeAdmissionError> for EnterError {
+    fn from(e: VolumeAdmissionError) -> Self {
+        EnterError::Volume(e)
+    }
+}
+
+/// The spec as it will actually be launched. For a sealed spec this drops every
+/// mount whose host path or destination lies inside the credential deny list
+/// (or whose allowlist target was retargeted since resolution) — whoever added
+/// it and whenever: bundle identities, agent provider homes, cache injectors all
+/// run AFTER the resolver, so this is the single chokepoint every launcher goes
+/// through. The managed per-account dirs are the only named exception.
+pub fn sealed_view(spec: &SandboxSpec) -> std::borrow::Cow<'_, SandboxSpec> {
+    let Some(home) = spec.seal_home.as_deref().filter(|h| !h.is_empty()) else {
+        return std::borrow::Cow::Borrowed(spec);
+    };
+    let home = std::path::Path::new(home);
+    // Warn once per path per process, and never for the built-in agent-config
+    // carve (`~/.claude`/`~/.codex`), which a sealed launch always drops.
+    let ok = |m: &Mount| {
+        let keep = crate::sandbox_mounts::sealed_mount_still_ok(m, home);
+        if !keep && !crate::sandbox_mounts::is_builtin_agent_carve(&m.host) {
+            warn_dropped_mount_once(&m.host, &m.host);
+        }
+        keep
+    };
+    if spec
+        .mounts
+        .iter()
+        .all(|m| crate::sandbox_mounts::sealed_mount_still_ok(m, home))
+    {
+        return std::borrow::Cow::Borrowed(spec);
+    }
+    let mut v = spec.clone();
+    v.mounts.retain(|m| ok(m));
+    std::borrow::Cow::Owned(v)
+}
+
+/// Every launch gate in one place: volume admission, the sealed deny filter and
+/// `$HOME` gate, and the OCI `-v` path syntax check.
+fn launchable(spec: &SandboxSpec) -> Result<std::borrow::Cow<'_, SandboxSpec>, EnterError> {
+    admit_volumes(spec)?;
+    // Compose-file volumes never enter `spec.mounts`, so the deny filter and the
+    // `$HOME` gate cannot see them: a sealed spec refuses compose outright.
+    if spec.seal_home.is_some() && spec.compose_spec().is_some() {
+        return Err(EnterError::Refused(
+            "sealed profile cannot verify compose volumes; remove the compose config or use a \
+             non-sealed profile"
+                .into(),
+        ));
+    }
+    let view = sealed_view(spec);
+    if let Some(m) = crate::sandbox_floor::home_gate(&view) {
+        return Err(EnterError::Refused(m));
+    }
+    if view.backend.profile().family == BackendFamily::Oci
+        && let Some(m) = view.mounts.iter().find(|m| {
+            crate::sandbox_mounts::mount_path_unsafe(&m.host)
+                || crate::sandbox_mounts::mount_path_unsafe(&m.dest)
+        })
+    {
+        return Err(EnterError::Refused(format!(
+            "OCI mount `{}` contains whitespace, a quote, a backslash or ':' which a `-v` \
+             spec cannot express safely",
+            m.dest
+        )));
+    }
+    Ok(view)
+}
 
 /// The portable Thegn named-volume lexical policy. A source must begin with
 /// ASCII alphanumeric, be at least two bytes, and contain only ASCII letters,
@@ -803,6 +899,29 @@ pub fn resolve_placed_exact(
     resolve_placed_with(cfg, loc, name, profile, placement, Fallthrough::Exact)
 }
 
+/// Warn (once per path per process) about a USER-authored `[sandbox] mounts` entry
+/// a sealed launch drops. The built-in defaults (`~/.gnupg:rw` …) are always
+/// dropped and would warn on every resolve; `thegn doctor` lists those.
+fn warn_dropped_mount_once(raw: &str, host: &str) {
+    use std::sync::{Mutex, OnceLock};
+    if SandboxConfig::default().mounts.iter().any(|d| d == raw) {
+        return;
+    }
+    static SEEN: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(Default::default);
+    let first = seen
+        .lock()
+        .map(|mut s| s.insert(host.to_string()))
+        .unwrap_or(false);
+    if first {
+        tracing::warn!(
+            target: "thegn::sandbox",
+            path = %host,
+            "sealed profile: dropping [sandbox] mounts entry that reaches a protected $HOME path"
+        );
+    }
+}
+
 fn resolve_placed_with(
     cfg: &SandboxConfig,
     loc: &GitLoc,
@@ -909,6 +1028,24 @@ fn resolve_placed_with(
     // `profile = "open"` → rw $HOME as the escape hatch. Writes tools genuinely
     // need (zsh history, zoxide, atuin) are carved back narrowly below.
     let home_ro = backend.is_oci() || profile.read_only_root();
+    // THE-215: sealed tiers never see the ambient $HOME. They get a private
+    // tmpfs $HOME (bwrap `--tmpfs`, systemd `ProtectHome=tmpfs`; OCI simply
+    // never mounts it) plus a reviewed read-only allowlist — read-only is
+    // integrity isolation, not confidentiality, so it is not enough here.
+    //
+    // An unset/empty/unresolvable `$HOME` does NOT disable sealing: the spec
+    // still carries `seal_home = Some(..)` so `sandbox_floor::home_gate` REFUSES
+    // the launch instead of quietly running with an unhidden home.
+    let seal_home: Option<String> = profile
+        .hides_home()
+        .then(|| std::env::var("HOME").unwrap_or_default());
+    let host_toolchain = || {
+        if seal_home.is_some() {
+            crate::sandbox_mounts::host_toolchain_mounts_sealed_home()
+        } else {
+            host_toolchain_mounts_ro_home(home_ro)
+        }
+    };
 
     // Emit the host-toolchain substrate (ro $HOME) BEFORE the worktree/caches so
     // the read-write worktree, git dir, and caches — which live *under* $HOME —
@@ -925,13 +1062,13 @@ fn resolve_placed_with(
         }
         FileAccess::Worktree => {
             if inject_host_toolchain {
-                mounts.extend(host_toolchain_mounts_ro_home(home_ro));
+                mounts.extend(host_toolchain());
             }
             add_worktree_mounts(&mut mounts);
         }
         FileAccess::WorktreePlusCaches => {
             if inject_host_toolchain {
-                mounts.extend(host_toolchain_mounts_ro_home(home_ro));
+                mounts.extend(host_toolchain());
             }
             add_worktree_mounts(&mut mounts);
             if cfg.auto_caches {
@@ -946,7 +1083,9 @@ fn resolve_placed_with(
     // state (history, zoxide, atuin) and a personal scratch dir keep working.
     // Only when $HOME was actually injected read-only: `all`/`host` are already
     // fully writable, and `custom`/`none` withhold $HOME entirely.
-    if inject_host_toolchain && home_ro {
+    // Sealed: `$HOME` is a private tmpfs, so there is no host state to carve
+    // back (and `.local/{state,share}` hold the credentials we are hiding).
+    if inject_host_toolchain && home_ro && seal_home.is_none() {
         for cv in default_writable_carveouts(profile) {
             if keep_cfg_mount(&mounts, &cv) {
                 mounts.push(cv);
@@ -954,8 +1093,34 @@ fn resolve_placed_with(
         }
     }
 
+    // systemd does not consume the toolchain substrate (it sees the host fs), so
+    // its sealed `$HOME` allowlist is added here; `ProtectHome=tmpfs` hides the
+    // rest and the argv builder binds these back in.
+    if let Some(home) = &seal_home
+        && !home.is_empty()
+        && backend.profile().family == BackendFamily::Systemd
+        && matches!(
+            cfg.file_access,
+            FileAccess::Worktree | FileAccess::WorktreePlusCaches
+        )
+    {
+        mounts.extend(crate::sandbox_mounts::sealed_home_allowlist(
+            std::path::Path::new(home),
+        ));
+    }
+
     for m in &cfg.mounts {
         let parsed = parse_mount(m);
+        // THE-215: a sealed launch never honors a mount (host path or dest,
+        // canonicalized) that reaches the credential deny list — this covers the
+        // DEFAULT `~/.gnupg:rw` as much as a user entry. Drop and name the path.
+        if let Some(home) = &seal_home
+            && !home.is_empty()
+            && crate::sandbox_mounts::sealed_denies_mount(&parsed, std::path::Path::new(home))
+        {
+            warn_dropped_mount_once(m, &parsed.host);
+            continue;
+        }
         // Skip mounts whose source doesn't exist — silently, since config
         // defaults like ~/.gitconfig may not be present on every machine.
         if !std::path::Path::new(&parsed.host).exists() {
@@ -977,7 +1142,7 @@ fn resolve_placed_with(
     // read-only at their symlink-target paths so the $HOME-mounted symlinks
     // resolve in-sandbox. Local placements only (paths are probed on this
     // host); gated exactly like the toolchain mounts that expose $HOME.
-    if inject_host_toolchain && placement.is_local() {
+    if inject_host_toolchain && placement.is_local() && seal_home.is_none() {
         let mut covered: Vec<String> = mounts.iter().map(|m| m.dest.clone()).collect();
         if backend == Backend::Bwrap {
             covered.extend(BWRAP_SUBSTRATE.iter().map(|s| s.to_string()));
@@ -1137,6 +1302,7 @@ fn resolve_placed_with(
         // daemon-routed center tab or an ephemeral chrome pane. The pane owner
         // (the host's launch-spec builder) flips it on for daemon-backed panes.
         daemon_persistent: false,
+        seal_home,
     })
 }
 
@@ -1606,6 +1772,47 @@ fn oci_emits_mount(m: &Mount) -> bool {
     !matches!(m.dest.as_str(), "/etc/resolv.conf" | "/etc/hosts")
 }
 
+/// Label stamped at create recording whether the container was built for a
+/// sealed (`$HOME`-hiding) spec. The container name is per worktree, NOT per
+/// profile, so reuse must compare it or a `hardened` container (ro `$HOME`,
+/// `~/.gnupg` rw) would be reused by a later `sealed` launch.
+const SEAL_LABEL: &str = "thegn.seal_home";
+
+/// Whether a running container's bind sources satisfy the spec. Non-sealed: the
+/// required set must be a subset (historic behaviour). Sealed: the live set must
+/// EQUAL the required one — an extra bind could be `~/.ssh` — apart from the
+/// `/nix` bind `oci_create_opts` adds itself for devenv.
+fn mounts_match(
+    required: &std::collections::HashSet<&str>,
+    active: &std::collections::HashSet<&str>,
+    sealed: bool,
+) -> bool {
+    if !required.iter().all(|r| active.contains(r)) {
+        return false;
+    }
+    !sealed || active.iter().all(|a| required.contains(a) || *a == "/nix")
+}
+
+/// Judge `inspect` output in thegn's probe format: line 1 `RUNNING` (or empty),
+/// line 2 the [`SEAL_LABEL`] value (empty when absent), then one bind source per
+/// line. Returns `(running, reusable)`. Reusable also requires the seal label to
+/// match the spec: `1` for sealed, absent-or-`0` for non-sealed; an absent label
+/// on a sealed spec means a pre-label container and is recreated.
+fn judge_inspect(
+    stdout: &str,
+    required: &std::collections::HashSet<&str>,
+    sealed: bool,
+) -> (bool, bool) {
+    let mut lines = stdout.lines();
+    if lines.next() != Some("RUNNING") {
+        return (false, false);
+    }
+    let label = lines.next().unwrap_or("").trim();
+    let label_ok = if sealed { label == "1" } else { label != "1" };
+    let active: std::collections::HashSet<&str> = lines.filter(|l| !l.is_empty()).collect();
+    (true, label_ok && mounts_match(required, &active, sealed))
+}
+
 /// `(running, mounts_ok)` parsed from Apple `container inspect`'s JSON.
 ///
 /// Apple's CLI diverges from docker/podman on both halves of the probe, and
@@ -1620,7 +1827,14 @@ fn oci_emits_mount(m: &Mount) -> bool {
 ///
 /// Shape (verified against `container` 1.2.2):
 /// `[{ "status": { "state": "running" }, "configuration": { "mounts": [ { "source": … } ] } }]`
+#[cfg(test)]
 pub(crate) fn parse_apple_inspect(stdout: &str, required: &[&str]) -> (bool, bool) {
+    parse_apple_inspect_sealed(stdout, required, false)
+}
+
+/// Apple has no verified `--label`, so a sealed spec is judged on mounts alone
+/// (and, because it never receives host mounts, equality is cheap and strict).
+fn parse_apple_inspect_sealed(stdout: &str, required: &[&str], sealed: bool) -> (bool, bool) {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(stdout) else {
         return (false, false);
     };
@@ -1645,8 +1859,8 @@ pub(crate) fn parse_apple_inspect(stdout: &str, required: &[&str]) -> (bool, boo
                 .collect()
         })
         .unwrap_or_default();
-    let mounts_ok = required.iter().all(|r| active.contains(*r));
-    (true, mounts_ok)
+    let req: std::collections::HashSet<&str> = required.iter().copied().collect();
+    (true, mounts_match(&req, &active, sealed))
 }
 
 /// Force-remove this spec's container on the SAME daemon `run -d` creates it on.
@@ -1668,6 +1882,7 @@ pub(crate) fn remove_container(spec: &SandboxSpec) {
 }
 
 fn container_status(spec: &SandboxSpec) -> (bool, bool) {
+    let sealed = spec.seal_home.is_some();
     let required: std::collections::HashSet<&str> = spec
         .mounts
         .iter()
@@ -1678,7 +1893,7 @@ fn container_status(spec: &SandboxSpec) -> (bool, bool) {
     // Emit "RUNNING" if actually running (not "created"/"exited"), then one
     // bind-mount source per line. A container in "created" state passes inspect
     // but cannot accept exec sessions — we must not treat it as healthy.
-    let fmt = "{{if .State.Running}}RUNNING{{end}}\n{{range .Mounts}}{{if eq .Type \"bind\"}}{{.Source}}\n{{end}}{{end}}";
+    let fmt = "{{if .State.Running}}RUNNING{{end}}\n{{index .Config.Labels \"thegn.seal_home\"}}\n{{range .Mounts}}{{if eq .Type \"bind\"}}{{.Source}}\n{{end}}{{end}}";
     let mut argv = oci_prefix(spec);
     // For remote worktrees the transport wraps the argv; for local we call
     // podman/docker directly. run_control_t_owned gives us the timeout but
@@ -1696,7 +1911,7 @@ fn container_status(spec: &SandboxSpec) -> (bool, bool) {
                 return (false, false); // container doesn't exist
             }
             let req: Vec<&str> = required.iter().copied().collect();
-            return parse_apple_inspect(&stdout, &req);
+            return parse_apple_inspect_sealed(&stdout, &req, sealed);
         }
         argv.extend([
             "container".into(),
@@ -1712,14 +1927,8 @@ fn container_status(spec: &SandboxSpec) -> (bool, bool) {
         if !ok && stdout.is_empty() {
             return (false, false); // container doesn't exist
         }
-        let mut lines = stdout.lines();
         // First line must be "RUNNING" — "CREATED" / "EXITED" / missing → not usable.
-        if lines.next() != Some("RUNNING") {
-            return (false, false);
-        }
-        let active: std::collections::HashSet<&str> = lines.filter(|l| !l.is_empty()).collect();
-        let mounts_ok = required.iter().all(|r| active.contains(r));
-        (true, mounts_ok)
+        judge_inspect(&stdout, &required, sealed)
     } else {
         // Remote: run the same inspect command over SSH to verify mounts.
         let mut remote_argv = oci_prefix(spec);
@@ -1733,13 +1942,7 @@ fn container_status(spec: &SandboxSpec) -> (bool, bool) {
         let Some((_, stdout)) = output_control_owned(spec, &remote_argv, PROBE_TIMEOUT) else {
             return (false, false);
         };
-        let mut lines = stdout.lines();
-        if lines.next() != Some("RUNNING") {
-            return (false, false);
-        }
-        let active: std::collections::HashSet<&str> = lines.filter(|l| !l.is_empty()).collect();
-        let mounts_ok = required.iter().all(|r| active.contains(r));
-        (true, mounts_ok)
+        judge_inspect(&stdout, &required, sealed)
     }
 }
 
@@ -1747,6 +1950,10 @@ fn container_status(spec: &SandboxSpec) -> (bool, bool) {
 /// into). No-op for host-toolchain backends and `none`.
 pub fn ensure(spec: &SandboxSpec) -> anyhow::Result<()> {
     admit_volumes(spec)?;
+    let spec = &*launchable(spec).map_err(|e| match e {
+        EnterError::Volume(v) => anyhow::Error::new(v),
+        EnterError::Refused(m) => anyhow::anyhow!(m),
+    })?;
     if !spec.backend.is_oci() {
         return Ok(());
     }
@@ -2005,8 +2212,8 @@ pub fn run_prepare(worktree: &std::path::Path, cmds: &[String]) {
 /// string, e.g. `${SHELL:-/bin/sh} -l` or `claude`). Callers must propagate a
 /// volume refusal; it must never become host fallback or a shell shim. The
 /// backend invocation is wrapped in mosh/ssh when the placement is remote.
-pub fn enter_argv(spec: &SandboxSpec, inner: &str) -> Result<Vec<String>, VolumeAdmissionError> {
-    admit_volumes(spec)?;
+pub fn enter_argv(spec: &SandboxSpec, inner: &str) -> Result<Vec<String>, EnterError> {
+    let spec = &*launchable(spec)?;
     let script = wrap_script(spec, inner);
     // A compose-backed spec with a named service attaches through
     // `docker compose exec <service>` — no container-name guessing.
@@ -2143,6 +2350,14 @@ fn backend_enter_argv(spec: &SandboxSpec, script: &str) -> Vec<String> {
             if spec.file_access != FileAccess::None {
                 v.extend(["--chdir".into(), wt]);
             }
+            // Sealed: a private tmpfs `$HOME` BEFORE any mount, so the allowlist,
+            // worktree and caches (all path-preserving, mostly under `$HOME`)
+            // land inside it and nothing else of the host `$HOME` exists.
+            if let Some(home) = &spec.seal_home
+                && !matches!(spec.file_access, FileAccess::All | FileAccess::Host)
+            {
+                v.extend(["--tmpfs".into(), home.clone()]);
+            }
             for m in &spec.mounts {
                 // Skip mounts already covered by a hardcoded parent — bwrap
                 // cannot create a mount-point inside a read-only bind.
@@ -2233,9 +2448,25 @@ fn backend_enter_argv(spec: &SandboxSpec, script: &str) -> Vec<String> {
             // PrivateTmp=yes already gives a writable /tmp.
             if spec.read_only_root {
                 v.extend(["-p".into(), "ProtectSystem=yes".into()]);
-                v.extend(["-p".into(), "ProtectHome=read-only".into()]);
+                let sealed_home = spec.seal_home.is_some();
+                let under_home = |dest: &str| {
+                    spec.seal_home
+                        .as_deref()
+                        .is_some_and(|h| std::path::Path::new(dest).starts_with(h))
+                };
+                // Sealed: `ProtectHome=tmpfs` leaves an empty `$HOME`; the
+                // allowlist, worktree and caches are bound back in below.
+                let protect_home = if sealed_home { "tmpfs" } else { "read-only" };
+                v.extend(["-p".into(), format!("ProtectHome={protect_home}")]);
                 for m in &spec.mounts {
-                    if !m.ro {
+                    if under_home(&m.dest) {
+                        let flag = if m.ro {
+                            "BindReadOnlyPaths"
+                        } else {
+                            "BindPaths"
+                        };
+                        v.extend(["-p".into(), format!("{flag}={}:{}", m.host, m.dest)]);
+                    } else if !m.ro {
                         v.extend(["-p".into(), format!("ReadWritePaths={}", m.dest)]);
                     }
                 }
@@ -2252,8 +2483,10 @@ fn backend_enter_argv(spec: &SandboxSpec, script: &str) -> Vec<String> {
                 } else {
                     SandboxProfile::Hardened
                 };
-                for cv in default_writable_carveouts(carve_profile) {
-                    v.extend(["-p".into(), format!("ReadWritePaths={}", cv.dest)]);
+                if !sealed_home {
+                    for cv in default_writable_carveouts(carve_profile) {
+                        v.extend(["-p".into(), format!("ReadWritePaths={}", cv.dest)]);
+                    }
                 }
             }
             if spec.no_new_privileges {
@@ -2383,6 +2616,7 @@ fn write_secret_env_file(name: &str, secret: &[(&String, &String)]) -> Option<Pa
 /// and uid mapping so bind-mounted files stay host-owned.
 fn oci_create_opts(spec: &SandboxSpec) -> Result<Vec<String>, VolumeAdmissionError> {
     admit_volumes(spec)?;
+    let spec = &*sealed_view(spec);
     let mut v = Vec::new();
     // Ownership marker: every container thegn creates carries `thegn.managed`,
     // so container-management (the Containers tab, `sandbox prune`) has one label
@@ -2397,6 +2631,10 @@ fn oci_create_opts(spec: &SandboxSpec) -> Result<Vec<String>, VolumeAdmissionErr
     // their `thegn-` name, which is what management uses for them anyway.
     if spec.backend != Backend::Apple {
         v.extend(["--label".into(), crate::sandbox_manage::OWNED_LABEL.into()]);
+        v.extend([
+            "--label".into(),
+            format!("{SEAL_LABEL}={}", u8::from(spec.seal_home.is_some())),
+        ]);
     }
     // Run under a specific OCI runtime (gVisor's `runsc`, libkrun's `krun`, …)
     // when requested. podman/docker persist the runtime in the container config,

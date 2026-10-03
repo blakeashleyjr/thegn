@@ -9,7 +9,7 @@
 
 use std::path::Path;
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// A decoded raster ready for [`crate::graphics::kitty_image`].
 pub struct Raster {
@@ -51,58 +51,65 @@ pub fn image_bytes(bytes: &[u8]) -> Result<Raster, String> {
 }
 
 /// Rasterize page 1 of a PDF via `pdftoppm` (poppler) → PNG on stdout → RGBA.
-/// Errs (→ text fallback) when the tool is absent or fails. Blocking.
-#[expect(clippy::disallowed_methods)] // off-loop: called from spawn_blocking
-pub fn pdf_page1(path: &Path) -> Result<Raster, String> {
-    let out = Command::new("pdftoppm")
-        .args(["-png", "-f", "1", "-l", "1", "-singlefile", "-r", "96"])
+/// Errs (→ text fallback) when the tool is absent, fails, exceeds the renderer
+/// deadline or `cancel` is raised; the whole process group is killed and
+/// reaped on every path. Blocking.
+pub fn pdf_page1(path: &Path, cancel: &AtomicBool) -> Result<Raster, String> {
+    let mut cmd = Command::new("pdftoppm");
+    cmd.args(["-png", "-f", "1", "-l", "1", "-singlefile", "-r", "96"])
         .arg(path)
-        .arg("-") // write PNG to stdout
-        .output()
-        .map_err(|e| format!("pdftoppm unavailable: {e}"))?;
-    if !out.status.success() {
-        return Err("pdftoppm failed".to_string());
-    }
-    decode_and_fit(&out.stdout)
+        .arg("-"); // write PNG to stdout
+    let out = crate::preview_jobs::run_renderer(&mut cmd, cancel)
+        .map_err(|e| format!("pdftoppm: {}", capture_err(&e)))?;
+    decode_and_fit(&out)
 }
 
-/// Extract a PDF's text via `pdftotext` (the no-graphics fallback). `None` when
-/// the tool is absent or fails. Blocking.
-#[expect(clippy::disallowed_methods)] // off-loop: called from spawn_blocking
-pub fn pdf_text(path: &Path) -> Option<String> {
-    let out = Command::new("pdftotext")
-        .arg(path)
-        .arg("-") // text to stdout
-        .output()
-        .ok()?;
-    out.status
-        .success()
-        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+/// Extract a PDF's text via `pdftotext` (the no-graphics fallback). Output cut
+/// at the byte cap is returned truncated (fine for text); `Err` carries a
+/// truthful reason (absent tool, failure, timeout, cancel). Blocking.
+pub fn pdf_text(path: &Path, cancel: &AtomicBool) -> Result<String, String> {
+    use crate::preview_jobs::CaptureError as C;
+    let mut cmd = Command::new("pdftotext");
+    cmd.arg(path).arg("-"); // text to stdout
+    match crate::preview_jobs::run_renderer(&mut cmd, cancel) {
+        Ok(out) | Err(C::Capped(out)) => Ok(String::from_utf8_lossy(&out).into_owned()),
+        Err(C::Spawn(_)) => Err("no text extractor available".to_string()),
+        Err(e) => Err(format!("text extraction {}", capture_err(&e))),
+    }
 }
 
 /// Render a Mermaid file via `mmdc` (mermaid-cli) → PNG → RGBA. Errs (→ source
-/// fallback) when the tool is absent or fails. Blocking.
-#[expect(clippy::disallowed_methods)] // off-loop: called from spawn_blocking
-pub fn mermaid(path: &Path) -> Result<Raster, String> {
+/// fallback) when the tool is absent, fails, times out or is cancelled; the
+/// renderer's whole process tree (mmdc spawns a browser) is killed and reaped.
+/// Blocking.
+pub fn mermaid(path: &Path, cancel: &AtomicBool) -> Result<Raster, String> {
     let tmp = unique_temp("mmd", "png");
-    let status = Command::new("mmdc")
-        .arg("-i")
+    let mut cmd = Command::new("mmdc");
+    cmd.arg("-i")
         .arg(path)
         .arg("-o")
         .arg(&tmp)
         .arg("-b")
-        .arg("transparent")
-        .status()
-        .map_err(|e| format!("mmdc unavailable: {e}"))?;
-    let result = if status.success() {
-        std::fs::read(&tmp)
+        .arg("transparent");
+    let result = match crate::preview_jobs::run_renderer_quiet(&mut cmd, cancel) {
+        Ok(()) => std::fs::read(&tmp)
             .map_err(|e| format!("mmdc output read failed: {e}"))
-            .and_then(|bytes| decode_and_fit(&bytes))
-    } else {
-        Err("mmdc failed".to_string())
+            .and_then(|bytes| decode_and_fit(&bytes)),
+        Err(e) => Err(format!("mmdc: {}", capture_err(&e))),
     };
     let _ = std::fs::remove_file(&tmp); // best-effort: temp cleanup
     result
+}
+
+fn capture_err(e: &crate::preview_jobs::CaptureError) -> String {
+    use crate::preview_jobs::CaptureError as C;
+    match e {
+        C::Spawn(err) => format!("unavailable: {err}"),
+        C::Cancelled => "cancelled".to_string(),
+        C::Timeout => "timed out".to_string(),
+        C::Failed => "failed".to_string(),
+        C::Capped(_) => "output exceeded the size cap".to_string(),
+    }
 }
 
 /// A process-unique temp path `<tmpdir>/thegn-<pid>-<n>.<ext>`. Avoids a

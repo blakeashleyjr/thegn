@@ -82,6 +82,9 @@ pub struct AppSlot {
     /// `title()` takes over, badges included).
     pub label: String,
     pub state: SlotState,
+    /// The last visibility told to the tile (`None` until first told), so
+    /// [`AppHost::sync_visibility`] only calls `on_visible` on a change.
+    visible_told: Option<bool>,
     /// The last rendered buffer, re-blitted on frames where the tile reported
     /// no change.
     // Not read yet: the run loop re-renders the focused tile every frame rather
@@ -96,6 +99,7 @@ impl AppSlot {
             id,
             label: label.into(),
             state: SlotState::Unloaded,
+            visible_told: None,
             last_buf: None,
         }
     }
@@ -302,6 +306,25 @@ impl AppHost {
         match self.active {
             ActiveApp::Tile(i) => self.slots.get_mut(i).and_then(|s| s.state.tile_mut()),
             ActiveApp::Work => None,
+        }
+    }
+
+    /// Tell each running tile whether it is the visible tab, on change only.
+    /// Hidden tiles must stop periodic work (see `AppTile::on_visible`). Cheap
+    /// (a flag compare per slot), so the loop calls it every iteration rather
+    /// than hooking each place `active` is assigned.
+    pub fn sync_visibility(&mut self) {
+        let active = self.active;
+        for (i, slot) in self.slots.iter_mut().enumerate() {
+            let SlotState::Running(tile) = &mut slot.state else {
+                slot.visible_told = None;
+                continue;
+            };
+            let visible = active == ActiveApp::Tile(i);
+            if slot.visible_told != Some(visible) {
+                slot.visible_told = Some(visible);
+                tile.on_visible(visible);
+            }
         }
     }
 
@@ -630,6 +653,48 @@ mod tests {
         assert_eq!(host.cycle(ActiveApp::Work, 1), ActiveApp::Tile(0));
     }
 
+    struct VisTile(std::sync::Arc<std::sync::Mutex<Vec<bool>>>);
+
+    impl AppTile for VisTile {
+        fn id(&self) -> &'static str {
+            "observe"
+        }
+        fn title(&self) -> String {
+            "Observe".into()
+        }
+        fn pump(&mut self) -> bool {
+            false
+        }
+        fn wants_redraw(&self) -> bool {
+            false
+        }
+        fn handle_input(&mut self, _ev: tg_kit::InputEvent) -> tg_kit::InputResult {
+            tg_kit::InputResult::Ignored
+        }
+        fn render(&mut self, _area: tg_kit::ratatui::layout::Rect, _buf: &mut Buffer) {}
+        fn on_visible(&mut self, visible: bool) {
+            self.0.lock().unwrap().push(visible);
+        }
+    }
+
+    #[test]
+    fn sync_visibility_tells_a_tile_only_on_change() {
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut slot = AppSlot::new("observe", "Observe");
+        slot.state = SlotState::Running(Box::new(VisTile(log.clone())));
+        let mut host = AppHost::new(vec![slot]);
+
+        // Built but the user is on Work: told hidden once, not repeatedly.
+        host.sync_visibility();
+        host.sync_visibility();
+        host.active = ActiveApp::Tile(0);
+        host.sync_visibility();
+        host.sync_visibility();
+        host.active = ActiveApp::Work;
+        host.sync_visibility();
+        assert_eq!(*log.lock().unwrap(), vec![false, true, false]);
+    }
+
     #[test]
     fn app_construction_error_is_retained_as_a_visible_failed_slot() {
         let mut slot = AppSlot::new("observe", "Observe");
@@ -692,6 +757,31 @@ mod tests {
         host.reconcile(&cfg);
         assert_eq!(host.active_id(), Some("work"));
         assert!(host.slots.is_empty());
+    }
+
+    #[test]
+    fn reconcile_that_changes_active_is_followed_by_a_visibility_sync() {
+        let mut cfg = thegn_core::config::Config::default();
+        cfg.observe.enabled = true;
+        cfg.apps.default_tab = "work".into();
+        let mut host = AppHost::from_config(&cfg);
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        host.slots[0].state = SlotState::Running(Box::new(VisTile(log.clone())));
+        host.sync_visibility();
+        assert_eq!(*log.lock().unwrap(), vec![false]);
+
+        // A config reload moves the default to the (already running) tile.
+        cfg.apps.default_tab = "observe".into();
+        host.reconcile(&cfg);
+        assert_eq!(host.active, ActiveApp::Tile(0));
+        host.sync_visibility();
+        assert_eq!(*log.lock().unwrap(), vec![false, true]);
+
+        // And back: the tile is parked again.
+        cfg.apps.default_tab = "work".into();
+        host.reconcile(&cfg);
+        host.sync_visibility();
+        assert_eq!(*log.lock().unwrap(), vec![false, true, false]);
     }
 
     #[test]
