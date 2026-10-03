@@ -13074,6 +13074,10 @@ async fn event_loop<T: Terminal>(
                 full_repaint = true;
             }
             prev_splash = splash_now;
+            // Tab switches (any path that assigns `active`, config reload
+            // included) park/resume hidden tiles. Here, after every drain, so
+            // the tile being rendered has been told it is visible.
+            app_host.sync_visibility();
             let app_tile_active = app_host.active_tile_mut().is_some();
             // FAST PATH: a pure selection-drag move only changes the highlighted
             // cells. Reuse the last full frame already in `scratch` (skip the
