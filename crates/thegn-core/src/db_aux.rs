@@ -636,9 +636,7 @@ impl WorktreeAuxStore for Db {
                status='watching',
                blocker=NULL,
                detail=NULL,
-               agent_attempts=CASE WHEN merge_queue.status IN
-                       ('queued','folding','verifying','agent_running')
-                     THEN merge_queue.agent_attempts ELSE 0 END,
+               agent_attempts=0,
                updated_at=excluded.updated_at",
             // SQLite integers are signed; a PR number never approaches i64::MAX.
             params![
