@@ -83,10 +83,18 @@ The `sealed` and `sealed-tunnel` profiles SHALL NOT expose the ambient host
 `$HOME` to the sandbox, even read-only: they SHALL present a private `$HOME`
 containing only a reviewed read-only allowlist of non-secret dotfiles (each
 resolved through symlinks and rejected if the target is a denied credential
-location or a parent of one), the worktree, and build caches. `hardened`
+location or a parent of one), the worktree, and build caches. Every
+`[sandbox] mounts` entry (including the defaults) SHALL be checked against the
+same deny list by host path and destination, canonicalized; a denied entry is
+dropped with a warning naming the path and listed by `thegn doctor`. Profile
+credential mounts (gh config, gnupg) SHALL NOT be applied to a sealed launch.
+The read-write automatic caches remain an integrity (not confidentiality)
+exposure. `hardened`
 (read-only `$HOME`) and `open` (writable) are integrity profiles and are
 unchanged. A sealed launch whose backend/config would leave `$HOME` visible
-SHALL be refused rather than run weaker.
+SHALL be refused rather than run weaker, including an unset or unresolvable
+`$HOME`, WSL, a systemd `$HOME` outside `/home`, `/root` and `/run/user`, a
+systemd bind path containing whitespace or `:`, and a pane anchored at `$HOME`.
 
 #### Scenario: Credentials are unreadable in a sealed bwrap sandbox
 

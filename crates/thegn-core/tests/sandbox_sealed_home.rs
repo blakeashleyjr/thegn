@@ -143,7 +143,9 @@ fn symlinked_dir_that_is_an_ancestor_of_a_secret_is_rejected() {
     let td = fixture();
     let h = td.path();
     // ~/.config/git -> ~/.config (which contains ~/.config/gh)
-    std::fs::remove_dir_all(h.join(".config/git")).ok();
+    if let Err(e) = std::fs::remove_dir_all(h.join(".config/git")) {
+        assert_eq!(e.kind(), std::io::ErrorKind::NotFound, "{e}");
+    }
     symlink(h.join(".config"), h.join(".config/git")).unwrap();
     let al = sealed_home_allowlist(h);
     assert!(
@@ -188,7 +190,10 @@ fn bwrap_sealed_hides_home_behind_a_tmpfs_before_any_bind() {
         .expect("sealed bwrap must mount a private tmpfs $HOME");
     let first_home_bind = argv
         .iter()
-        .position(|a| a.starts_with(home) && a != home)
+        .enumerate()
+        .position(|(i, a)| {
+            i > 0 && matches!(argv[i - 1].as_str(), "--ro-bind" | "--bind") && a.starts_with(home)
+        })
         .expect("allowlist/worktree binds");
     assert!(tmpfs < first_home_bind, "tmpfs must precede home binds");
     let j = argv.join(" ");
@@ -262,13 +267,13 @@ fn home_view_and_gate_per_backend() {
     let mut mounts = sealed_home_allowlist(h);
     mounts.push(rw(&h.join("wt")));
 
-    // Hidden: bwrap, systemd, OCI (no mount covers $HOME).
-    for b in [
-        Backend::Bwrap,
-        Backend::Systemd,
-        Backend::Podman,
-        Backend::Docker,
-    ] {
+    // Hidden: bwrap, OCI (no mount covers $HOME). systemd only hides a `$HOME`
+    // under /home, /root or /run/user (see the dedicated test below); this
+    // tempdir home is outside them, so it fails closed.
+    let sd = spec(Backend::Systemd, h, mounts.clone(), true);
+    assert_eq!(home_view(&sd, h), HomeView::ReadOnly);
+    assert!(home_gate(&sd).is_some());
+    for b in [Backend::Bwrap, Backend::Podman, Backend::Docker] {
         let s = spec(b, h, mounts.clone(), true);
         assert_eq!(home_view(&s, h), HomeView::Hidden, "{b:?}");
         assert_eq!(home_gate(&s), None, "{b:?}");
@@ -369,12 +374,14 @@ fn real_bwrap_sealed_cannot_read_canaries_but_worktree_and_git_work() {
         h = h.display()
     );
     let Some((_, out)) = run_sealed(&h, &script) else {
-        eprintln!("bwrap unavailable; skipping");
+        // skipped: no usable bwrap here
         return;
     };
     assert!(!out.contains(CANARY), "canary leaked: {out}");
     assert!(!h.join("wt/stolen").exists(), "canary copied into worktree");
-    let (listing, rest) = out.split_once("---").expect("script ran: {out}");
+    let (listing, rest) = out
+        .split_once("---")
+        .unwrap_or_else(|| panic!("script ran: {out}"));
     for hidden in [".ssh", ".aws", ".gnupg", ".secrets", ".local"] {
         assert!(
             !listing.lines().any(|l| l == hidden),
@@ -389,4 +396,191 @@ fn real_bwrap_sealed_cannot_read_canaries_but_worktree_and_git_work() {
         rest.contains("ok") && rest.contains("gitok"),
         "worktree+git: {rest}"
     );
+}
+
+// ── review fixes: mounts deny filter, doctor listing, gate edge cases ────────
+
+#[test]
+fn default_config_mounts_never_bring_gnupg_into_a_sealed_argv() {
+    if !thegn_core::util::have("bwrap") {
+        // skipped: no usable bwrap here
+        return;
+    }
+    let td = fixture();
+    let h = td.path().canonicalize().unwrap();
+    std::fs::create_dir_all(h.join("wt")).unwrap();
+    // SAFETY: nextest runs each test in its own process; nothing else reads HOME.
+    unsafe { std::env::set_var("HOME", &h) };
+    let mut cfg = thegn_core::config::SandboxConfig {
+        enabled: true,
+        backend: thegn_core::config::SandboxBackend::Bwrap,
+        ..Default::default()
+    };
+    assert!(
+        cfg.mounts.iter().any(|m| m.contains(".gnupg")),
+        "default mounts should still carry ~/.gnupg (the case under test)"
+    );
+    cfg.mounts.push("~/.ssh:ro".into());
+    cfg.mounts
+        .push(format!("{}:/ssh-alias:ro", h.join(".ssh").display()));
+    let loc = thegn_core::remote::GitLoc::Local(h.join("wt"));
+    let Some(spec) = thegn_core::sandbox::resolve_placed(
+        &cfg,
+        &loc,
+        "t",
+        SandboxProfile::Sealed,
+        Placement::Local,
+    ) else {
+        // skipped: no usable bwrap here
+        return;
+    };
+    assert_eq!(spec.seal_home.as_deref(), h.to_str());
+    let joined = enter_argv(&spec, "true").unwrap().join(" ");
+    for secret in [".gnupg", ".ssh", "ssh-alias"] {
+        assert!(
+            !joined.contains(secret),
+            "{secret} in sealed argv: {joined}"
+        );
+    }
+    assert!(
+        spec.mounts.iter().all(|m| !m.host.contains(".gnupg")),
+        "{:?}",
+        spec.mounts
+    );
+    // Doctor lists what was dropped.
+    let dropped = thegn_core::sandbox_mounts::sealed_dropped_cfg_mounts(&cfg.mounts, &h);
+    assert!(dropped.iter().any(|p| p.ends_with(".gnupg")), "{dropped:?}");
+    assert!(dropped.iter().any(|p| p.ends_with(".ssh")), "{dropped:?}");
+}
+
+#[test]
+fn mount_deny_follows_symlinks_on_host_and_dest() {
+    use thegn_core::sandbox_mounts::sealed_denies_mount;
+    let td = fixture();
+    let h = td.path();
+    symlink(h.join(".gnupg"), h.join("innocent")).unwrap();
+    let m = |host: &Path, dest: &str| Mount {
+        host: host.to_string_lossy().into_owned(),
+        dest: dest.into(),
+        ro: false,
+        cache: false,
+    };
+    assert!(sealed_denies_mount(&m(&h.join("innocent"), "/x"), h));
+    assert!(sealed_denies_mount(
+        &m(&h.join("wt"), &h.join(".ssh/new").to_string_lossy()),
+        h
+    ));
+    assert!(
+        sealed_denies_mount(&m(h, &h.to_string_lossy()), h),
+        "$HOME is an ancestor"
+    );
+    assert!(!sealed_denies_mount(
+        &m(
+            &h.join(".gitconfig"),
+            &h.join(".gitconfig").to_string_lossy()
+        ),
+        h
+    ));
+}
+
+#[test]
+fn allowlist_never_binds_git_or_zsh_dirs_wholesale() {
+    let td = fixture();
+    let h = td.path();
+    for d in [".config/git", ".config/zsh"] {
+        std::fs::create_dir_all(h.join(d)).unwrap();
+    }
+    std::fs::write(h.join(".config/git/config"), "[user]\n").unwrap();
+    std::fs::write(h.join(".config/git/credentials"), CANARY).unwrap();
+    std::fs::write(h.join(".config/zsh/.zshrc"), "#\n").unwrap();
+    std::fs::write(h.join(".config/zsh/.zsh_history"), CANARY).unwrap();
+    let al = sealed_home_allowlist(h);
+    let d = dests(&al);
+    assert!(d.contains(&h.join(".config/git/config").to_str().unwrap()));
+    assert!(d.contains(&h.join(".config/zsh/.zshrc").to_str().unwrap()));
+    for m in &al {
+        for bad in [".config/git", ".config/zsh"] {
+            assert_ne!(Path::new(&m.dest), h.join(bad), "{bad} bound wholesale");
+        }
+        assert!(!m.dest.contains("credentials") && !m.dest.contains("zsh_history"));
+    }
+}
+
+#[test]
+fn systemd_home_view_sees_covering_mounts_and_unprotected_homes() {
+    let td = fixture();
+    let h = td.path(); // /tmp/..: NOT under /home, /root or /run/user
+    let s = spec(Backend::Systemd, h, vec![], true);
+    assert_ne!(
+        home_view(&s, h),
+        HomeView::Hidden,
+        "ProtectHome=tmpfs misses this $HOME"
+    );
+    assert!(home_gate(&s).is_some());
+    let mut ro_home = rw(h);
+    ro_home.ro = true;
+    let hp = Path::new("/home/synthetic-user");
+    let mut s2 = spec(Backend::Systemd, hp, vec![ro_home.clone()], true);
+    s2.seal_home = Some(hp.to_string_lossy().into_owned());
+    let covering = Mount {
+        host: "/home".into(),
+        dest: "/home".into(),
+        ro: true,
+        cache: false,
+    };
+    s2.mounts = vec![covering];
+    assert_eq!(home_view(&s2, hp), HomeView::ReadOnly);
+    s2.mounts = vec![];
+    assert_eq!(
+        home_view(&s2, hp),
+        HomeView::Hidden,
+        "/home is covered by ProtectHome=tmpfs"
+    );
+}
+
+#[test]
+fn systemd_sealed_refuses_whitespace_or_colon_in_bind_paths() {
+    let td = fixture();
+    let h = td.path();
+    for bad in ["with space", "with:colon"] {
+        let p = h.join(bad);
+        let s = spec(Backend::Systemd, h, vec![rw(&p)], true);
+        let msg = home_gate(&s).unwrap_or_else(|| panic!("{bad} must be refused"));
+        assert!(msg.contains("systemd"), "{msg}");
+    }
+}
+
+#[test]
+fn unusable_home_and_wsl_fail_the_sealed_gate() {
+    let td = fixture();
+    let h = td.path();
+    let mut s = spec(Backend::Bwrap, h, vec![], true);
+    s.seal_home = Some(String::new());
+    assert!(home_gate(&s).unwrap().contains("resolvable"));
+    s.seal_home = Some("relative/home".into());
+    assert!(home_gate(&s).is_some());
+    s.seal_home = Some("/nonexistent/synthetic-home".into());
+    assert!(home_gate(&s).is_some());
+    let wsl = spec(Backend::Wsl, h, vec![], true);
+    assert!(home_gate(&wsl).is_some(), "WSL cannot hide $HOME");
+    assert_eq!(
+        planned_home_view(SandboxProfile::Sealed, Backend::Wsl),
+        HomeView::ReadOnly
+    );
+}
+
+#[test]
+fn bwrap_omits_an_allowlist_mount_retargeted_into_a_secret_after_resolution() {
+    let td = fixture();
+    let h = td.path();
+    let rc = h.join(".zshrc");
+    let mut mounts = sealed_home_allowlist(h);
+    mounts.push(rw(&h.join("wt")));
+    // Retarget the symlinked dotfile AFTER the allowlist was resolved.
+    std::fs::remove_file(&rc).unwrap();
+    symlink(h.join(".ssh/id_test"), &rc).unwrap();
+    let j = enter_argv(&spec(Backend::Bwrap, h, mounts, true), "true")
+        .unwrap()
+        .join(" ");
+    assert!(!j.contains(".ssh"), "{j}");
 }

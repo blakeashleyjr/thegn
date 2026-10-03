@@ -117,9 +117,40 @@ pub fn decide(
 /// **refused**, never run with a quietly weaker `sealed`. Returns the miss
 /// message, or `None` when the spec is not sealed or hides `$HOME`.
 pub fn home_gate(spec: &crate::sandbox::SandboxSpec) -> Option<String> {
+    use crate::sandbox::BackendFamily;
     use crate::sandbox_mounts::{HomeView, home_view};
     let home = spec.seal_home.as_deref()?;
-    let view = home_view(spec, std::path::Path::new(home));
+    // An unset/empty/relative/unresolvable `$HOME` cannot be hidden or checked:
+    // refuse rather than silently disable sealing.
+    let home_path = std::path::Path::new(home);
+    if home.is_empty() || !home_path.is_absolute() || home_path.canonicalize().is_err() {
+        return Some(
+            "sealed profile requires a resolvable absolute $HOME to hide, but $HOME is \
+             unset, empty, relative or does not exist"
+                .to_string(),
+        );
+    }
+    // systemd takes mounts as `BindPaths=host:dest` property strings with no
+    // quoting: a path containing whitespace or `:` would be parsed as extra
+    // fields (or a different destination). Refuse the sealed launch instead.
+    if spec.backend.profile().family == BackendFamily::Systemd {
+        let bad = |p: &str| {
+            p.chars()
+                .any(|c| c.is_whitespace() || c == ':' || c.is_control())
+        };
+        if let Some(m) = spec
+            .mounts
+            .iter()
+            .find(|m| home_path_under(&m.dest, home_path) && (bad(&m.host) || bad(&m.dest)))
+        {
+            return Some(format!(
+                "sealed systemd launch refused: mount `{}` contains whitespace or ':' which \
+                 systemd BindPaths cannot express safely",
+                m.dest
+            ));
+        }
+    }
+    let view = home_view(spec, home_path);
     (view != HomeView::Hidden).then(|| {
         format!(
             "sealed profile requires a hidden $HOME, but the `{}` launch would leave it {} — \
@@ -129,6 +160,10 @@ pub fn home_gate(spec: &crate::sandbox::SandboxSpec) -> Option<String> {
             view.as_str(),
         )
     })
+}
+
+fn home_path_under(dest: &str, home: &std::path::Path) -> bool {
+    std::path::Path::new(dest).starts_with(home)
 }
 
 /// How an opt-in agent/queue task's floor decision maps onto queue-entry state.

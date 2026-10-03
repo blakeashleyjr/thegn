@@ -36,19 +36,39 @@ host files. That is _integrity_ isolation only: the whole `$HOME` stays
 `sealed` / `sealed-tunnel` add _confidentiality_: the host `$HOME` is
 **hidden**. The pane sees a private, empty `$HOME` (tmpfs; systemd uses
 `ProtectHome=tmpfs`, containers never mount it) with only a reviewed
-read-only allowlist bound in — `~/.gitconfig`, `~/.config/git`, the zsh
-and bash rc files, `~/.profile`, `~/.inputrc`, `~/.config/starship.toml`,
-`~/.config/zsh`, `~/.terminfo` — plus the worktree and build caches.
+read-only allowlist bound in — `~/.gitconfig`, the single files
+`~/.config/git/{config,ignore,attributes,allowed_signers}`, the zsh and
+bash rc files (`~/.zshrc`, `~/.config/zsh/.zshrc`, …), `~/.profile`,
+`~/.inputrc`, `~/.config/starship.toml`, `~/.terminfo` — plus the worktree
+and build caches. `~/.config/git` and `~/.config/zsh` are never bound as
+directories (they hold `credentials` and `.zsh_history`).
 Each entry is resolved through symlinks and bound from its real target;
 one that resolves into a denied location (`~/.ssh`, `~/.aws`, `~/.gnupg`,
 `~/.secrets`, `~/.config/gh`, keyrings, thegn state, agent auth homes,
 `/run/agenix`) or that links to a parent of one is dropped. The ssh
-identity-key mounts and the `~/.local/{state,share}` write carve-outs are
-not applied. Add your own read-only paths with `[sandbox] mounts`.
+identity-key mounts, the profile credential mounts (gh config, gnupg) and
+the `~/.local/{state,share}` write carve-outs are not applied.
+
+Extend the allowlist with `[sandbox] mounts`, but **every entry — the
+default `~/.gnupg:rw` included — is checked against the same deny list**
+(host path and destination, canonicalized). A sealed launch drops a denied
+entry with a warning naming the path, and `thegn doctor` lists each
+dropped mount. An agent's own provider auth home (for example `~/.codex`)
+is still mounted read-write when that agent runs, since the harness cannot
+work without its login. The automatic build caches (`~/.cargo/registry`,
+sccache, nix, `~/.m2`, gradle) stay writable: that is an _integrity_
+exposure (a sealed pane could poison a shared cache), not a
+confidentiality one. Allowlist symlinks are re-validated when the bwrap
+command line is built; a swap in the instant between that check and
+`bwrap` starting remains possible.
 
 A sealed launch that cannot hide `$HOME` — a backend with no filesystem
-boundary (`none`/host, Windows), `file_access = "all"`, or a
-`[sandbox] mounts` entry covering `$HOME` — is **refused**, not run with
+boundary (`none`/host, Windows, WSL), `file_access = "all"`, a
+`[sandbox] mounts` entry covering `$HOME`, an unset or unresolvable
+`$HOME`, a systemd launch whose `$HOME` is outside `/home`, `/root` and
+`/run/user` (where `ProtectHome=tmpfs` does not reach), a systemd path
+containing whitespace or `:`, or a terminal anchored at `$HOME` itself —
+is **refused**, not run with
 a weaker `sealed`. `thegn doctor` prints `home  hidden | read-only |
 writable` for the configured profile.
 

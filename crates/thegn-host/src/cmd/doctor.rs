@@ -3374,6 +3374,19 @@ fn home_report(cfg: &Config) {
             profile.as_str()
         );
     }
+    // Sealed tiers drop any `[sandbox] mounts` entry reaching the credential deny
+    // list (the default `~/.gnupg:rw` included). Say which, by path only.
+    if profile.hides_home()
+        && let Ok(home) = std::env::var("HOME")
+        && !home.is_empty()
+    {
+        for p in thegn_core::sandbox_mounts::sealed_dropped_cfg_mounts(
+            &cfg.sandbox.mounts,
+            std::path::Path::new(&home),
+        ) {
+            outln!("                dropped mount {p} (reaches a protected $HOME path)");
+        }
+    }
 }
 
 /// The isolation floor line: the demanded minimum, the miss policy, and whether
