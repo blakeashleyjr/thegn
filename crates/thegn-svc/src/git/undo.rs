@@ -31,23 +31,39 @@ pub trait UndoOps: GitBackend {
                 Ok(None)
             }
             UndoPlan::HardResetTo { sha, .. } => {
-                // Unknown dirtiness must never read as clean: that would skip the
-                // requested autostash and let `reset --hard` discard the work.
-                let dirty = self
-                    .is_dirty(loc)
-                    .context("worktree state unknown; refusing hard reset")?;
-                if dirty && autostash {
+                let unknown = || {
+                    format!(
+                        "worktree state unknown \u{2014} nothing was changed; run `git status` in {} to diagnose",
+                        loc.path()
+                    )
+                };
+                // With autostash the dirty probe is racy (edits can land after
+                // it), so always attempt the push; `stash push` is a no-op
+                // when there is nothing to save, and the ref comparison below
+                // is what tells us whether it saved anything. Without
+                // autostash, unknown dirtiness must never read as clean.
+                let pushed = if autostash {
+                    let before = stash_top(loc).with_context(unknown)?;
                     run_w(
                         loc,
                         &[],
                         &["stash", "push", "-u", "-m", "[thegn] undo autostash"],
-                    )?;
-                }
+                    )
+                    .with_context(unknown)?;
+                    let after = stash_top(loc).with_context(unknown)?;
+                    // exit 0 with "No local changes to save" leaves the ref
+                    // alone; popping then would apply an unrelated older stash.
+                    if after != before { after } else { None }
+                } else {
+                    self.is_dirty(loc).with_context(unknown)?;
+                    None
+                };
                 let reset = run_w(loc, &[], &["reset", "--hard", sha]);
-                if dirty && autostash {
+                if let Some(entry) = pushed {
                     // Pop even when the reset failed; a pop conflict surfaces
-                    // through the normal conflict UX.
-                    if let Err(pop) = run_w(loc, &[], &["stash", "pop"]) {
+                    // through the normal conflict UX. Pop exactly our entry.
+                    let pop = pop_entry(loc, &entry);
+                    if let Err(pop) = pop {
                         // The stash is kept; say so rather than losing track of it.
                         return match reset {
                             Err(e) => Err(e.context(format!(
@@ -64,6 +80,31 @@ pub trait UndoOps: GitBackend {
             }
         }
     }
+}
+
+/// Object id at `refs/stash`, `None` when there is no stash. A read failure is
+/// an error (not "no stash").
+fn stash_top(loc: &GitLoc) -> Result<Option<String>> {
+    let out = run_w(
+        loc,
+        &[],
+        &["for-each-ref", "--format=%(objectname)", "refs/stash"],
+    )?;
+    Ok(out
+        .lines()
+        .next()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty()))
+}
+
+/// Pop the stash entry whose commit is `entry`, wherever it sits in the list.
+fn pop_entry(loc: &GitLoc, entry: &str) -> Result<()> {
+    let list = run_w(loc, &[], &["stash", "list", "--format=%H"])?;
+    let idx = list
+        .lines()
+        .position(|l| l.trim() == entry)
+        .ok_or_else(|| anyhow::anyhow!("autostash entry {entry} not found in the stash list"))?;
+    run_w(loc, &[], &["stash", "pop", &format!("stash@{{{idx}}}")]).map(|_| ())
 }
 
 impl<T: GitBackend + ?Sized> UndoOps for T {}
@@ -186,11 +227,37 @@ mod tests {
         let loc = repo.loc();
         let plan = CliGit.undo_plan(&loc, &OurMarks::default()).unwrap();
         let head = repo.head();
-        // A corrupt index makes the status read fail; that must not read as clean.
+        // A corrupt index makes the status read fail; that must not read as
+        // clean. Without autostash `reset --hard` would succeed here (it
+        // rewrites the index), so only the refusal protects the file.
+        std::fs::write(repo.dir.join(".git/index"), b"garbage").unwrap();
+        assert!(CliGit.status(&loc).is_err(), "precondition: status fails");
+        let err = CliGit.undo_apply(&loc, &plan, false).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("worktree state unknown"), "{msg}");
+        assert!(msg.contains("nothing was changed"), "{msg}");
+        assert!(msg.contains("git status"), "{msg}");
+        assert_eq!(repo.head(), head, "no reset ran");
+        assert_eq!(
+            std::fs::read_to_string(repo.dir.join("f.txt")).unwrap(),
+            "precious\n"
+        );
+    }
+
+    #[test]
+    fn undo_apply_autostash_refuses_when_the_stash_cannot_be_made() {
+        let repo = TestRepo::new("un-unknown-autostash");
+        ident(&repo.dir);
+        repo.commit_file("f.txt", "one\n", "c1");
+        repo.commit_file("f.txt", "two\n", "c2");
+        std::fs::write(repo.dir.join("f.txt"), "precious\n").unwrap();
+        let loc = repo.loc();
+        let plan = CliGit.undo_plan(&loc, &OurMarks::default()).unwrap();
+        let head = repo.head();
         std::fs::write(repo.dir.join(".git/index"), b"garbage").unwrap();
         let err = CliGit.undo_apply(&loc, &plan, true).unwrap_err();
         assert!(
-            format!("{err:#}").contains("refusing hard reset"),
+            format!("{err:#}").contains("worktree state unknown"),
             "{err:#}"
         );
         assert_eq!(repo.head(), head, "no reset ran");
@@ -198,6 +265,49 @@ mod tests {
             std::fs::read_to_string(repo.dir.join("f.txt")).unwrap(),
             "precious\n"
         );
+    }
+
+    #[test]
+    fn autostash_with_nothing_to_save_leaves_a_preexisting_stash_alone() {
+        let repo = TestRepo::new("un-stash-survives");
+        ident(&repo.dir);
+        repo.commit_file("f.txt", "one\n", "c1");
+        repo.commit_file("g.txt", "g\n", "c2");
+        let loc = repo.loc();
+        let plan = CliGit.undo_plan(&loc, &OurMarks::default()).unwrap();
+        // A user stash from before the undo (planned first: stash writes the reflog).
+        std::fs::write(repo.dir.join("f.txt"), "user stash\n").unwrap();
+        repo.out(&["stash", "push", "-m", "mine"]);
+        let before = repo.out(&["rev-parse", "refs/stash"]);
+        // Clean tree: push saves nothing and exits 0.
+        CliGit.undo_apply(&loc, &plan, true).unwrap();
+        assert_eq!(repo.subjects(), vec!["c1"], "the reset happened");
+        assert_eq!(repo.out(&["rev-parse", "refs/stash"]), before);
+        assert_eq!(
+            std::fs::read_to_string(repo.dir.join("f.txt")).unwrap(),
+            "one\n",
+            "the unrelated stash was not applied"
+        );
+    }
+
+    #[test]
+    fn autostash_pops_only_its_own_entry_above_an_older_stash() {
+        let repo = TestRepo::new("un-stash-own");
+        ident(&repo.dir);
+        repo.commit_file("f.txt", "one\n", "c1");
+        repo.commit_file("g.txt", "g\n", "c2");
+        std::fs::write(repo.dir.join("f.txt"), "user stash\n").unwrap();
+        let loc = repo.loc();
+        let plan = CliGit.undo_plan(&loc, &OurMarks::default()).unwrap();
+        repo.out(&["stash", "push", "-m", "mine"]);
+        std::fs::write(repo.dir.join("f.txt"), "dirty\n").unwrap();
+        let older = repo.out(&["rev-parse", "refs/stash"]);
+        CliGit.undo_apply(&loc, &plan, true).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(repo.dir.join("f.txt")).unwrap(),
+            "dirty\n"
+        );
+        assert_eq!(repo.out(&["rev-parse", "refs/stash"]), older);
     }
 
     #[test]
