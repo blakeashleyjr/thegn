@@ -357,6 +357,7 @@ crates/thegn-media/src/mediaremote.rs
 crates/thegn-media/src/ratchet.rs
 crates/thegn-media/src/smtc.rs
 crates/thegn-metrics/src/battery.rs
+crates/thegn-metrics/src/gpu_exec.rs
 crates/thegn-metrics/src/lib.rs
 crates/thegn-metrics/src/ratchet.rs
 crates/thegn-proxy/src/lib.rs
