@@ -861,6 +861,7 @@ pub(crate) fn destroy_one_checked(
             format!("could not remove worktree at {}", worktree.display()),
         );
     }
+    note_worktree_removed(worktree);
 
     let post = run_event_with_db(
         cfg,
@@ -1199,6 +1200,66 @@ fn try_physical_destroy_path(path: &Path) -> Option<PhysicalDestroyClaim> {
         .then(|| PhysicalDestroyClaim(key))
 }
 
+fn physical_destroy_in_progress(key: &Path) -> bool {
+    PHYSICAL_DESTROY_CLAIMS.get().is_some_and(|claims| {
+        claims
+            .lock()
+            .expect("physical claim mutex poisoned")
+            .contains(key)
+    })
+}
+
+static REMOVED_WORKTREES: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+/// Remember a worktree path that this process physically removed, so a layout
+/// snapshot captured before the removal cannot recreate its tab rows after the
+/// cleanup deleted them (THE-689 race 2).
+fn note_worktree_removed(worktree: &Path) {
+    let mut set = REMOVED_WORKTREES
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .expect("removed worktree mutex poisoned");
+    set.insert(worktree.to_string_lossy().into_owned());
+    set.insert(destroy_key(worktree).to_string_lossy().into_owned());
+}
+
+/// Drop snapshot groups (and their tabs) for worktrees this process removed and
+/// whose directory is still absent. A re-created directory is not filtered, and
+/// a path never removed here (a transiently missing registry row, a remote
+/// worktree) is never touched.
+pub(crate) fn drop_removed_worktrees(
+    groups: &[thegn_core::models::TabGroupRow],
+    tabs: &[thegn_core::models::GroupTabRow],
+) -> (
+    Vec<thegn_core::models::TabGroupRow>,
+    Vec<thegn_core::models::GroupTabRow>,
+) {
+    let removed: HashSet<String> = match REMOVED_WORKTREES.get() {
+        Some(set) => set.lock().expect("removed worktree mutex poisoned").clone(),
+        None => HashSet::new(),
+    };
+    if removed.is_empty() {
+        return (groups.to_vec(), tabs.to_vec());
+    }
+    let dead: HashSet<&str> = groups
+        .iter()
+        .filter(|g| !g.worktree.is_empty() && removed.contains(&g.worktree))
+        .filter(|g| !Path::new(&g.worktree).exists())
+        .map(|g| g.name.as_str())
+        .collect();
+    (
+        groups
+            .iter()
+            .filter(|g| !dead.contains(g.name.as_str()))
+            .cloned()
+            .collect(),
+        tabs.iter()
+            .filter(|t| !dead.contains(t.group_name.as_str()))
+            .cloned()
+            .collect(),
+    )
+}
+
 /// Process-local ownership for a synchronous destroy transaction. Async UI
 /// workers keep their manual claim until the compositor consumes completion;
 /// synchronous callers use this guard so every return path releases ownership.
@@ -1266,13 +1327,25 @@ pub fn session_start_once(
         return Ok(false);
     }
     let key = session_key(worktree);
-    if !session_runtime()
-        .lock()
-        .expect("session runtime mutex poisoned")
-        .latches
-        .insert(key.clone())
+    // Admission (THE-689): a worktree under a physical destroy claim must not
+    // gain a session. Resolve the claim key BEFORE taking the runtime lock (it
+    // touches the filesystem), then check the claim and insert the latch under
+    // that one lock. Destroy takes its claim first and reads the latch in its
+    // guards afterwards, so every interleaving is refused on one side: start
+    // sees the claim, or the destroy guard sees the latch.
+    let claim_key = destroy_key(worktree);
     {
-        return Ok(false);
+        let mut runtime = session_runtime()
+            .lock()
+            .expect("session runtime mutex poisoned");
+        if physical_destroy_in_progress(&claim_key) {
+            return Err(std::io::Error::other(
+                "worktree is being cleaned up; session not started",
+            ));
+        }
+        if !runtime.latches.insert(key.clone()) {
+            return Ok(false);
+        }
     }
     let spawned = spawn_session_event(
         cfg.clone(),
@@ -1728,6 +1801,123 @@ mod tests {
         ));
         assert!(try_claim_destroy_path(&path));
         release_destroy_path(&path);
+    }
+
+    fn unique_tmp(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "tg-689-{tag}-{}-{}",
+            std::process::id(),
+            thegn_core::util::now()
+        ))
+    }
+
+    #[test]
+    fn session_start_is_refused_while_a_physical_destroy_claim_is_held() {
+        let worktree = unique_tmp("admit");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let claim = try_physical_destroy_path(&worktree).unwrap();
+        let err = session_start_once(&Config::default(), &worktree, None).unwrap_err();
+        assert!(err.to_string().contains("being cleaned up"));
+        // The refused start must not leave a latch the destroy guard would trip on.
+        assert!(automatic_cleanup_session_absent(&worktree).is_ok());
+        drop(claim);
+        assert!(session_start_once(&Config::default(), &worktree, None).unwrap());
+        release_session_start(&worktree);
+        std::fs::remove_dir_all(&worktree).ok();
+    }
+
+    #[test]
+    fn destroy_guard_sees_a_session_started_before_the_claim() {
+        let worktree = unique_tmp("guard");
+        std::fs::create_dir_all(&worktree).unwrap();
+        assert!(session_start_once(&Config::default(), &worktree, None).unwrap());
+        let _claim = try_physical_destroy_path(&worktree).unwrap();
+        assert!(automatic_cleanup_session_absent(&worktree).is_err());
+        release_session_start(&worktree);
+        std::fs::remove_dir_all(&worktree).ok();
+    }
+
+    fn layout_rows(
+        worktree: &str,
+        name: &str,
+    ) -> (
+        thegn_core::models::TabGroupRow,
+        thegn_core::models::GroupTabRow,
+    ) {
+        (
+            thegn_core::models::TabGroupRow {
+                name: name.into(),
+                kind: "branch".into(),
+                worktree: worktree.into(),
+                ordinal: 0,
+                active_tab: 0,
+            },
+            thegn_core::models::GroupTabRow {
+                group_name: name.into(),
+                ordinal: 0,
+                title: "1".into(),
+                pane_tree: r#"{"leaf":0}"#.into(),
+                focused_pane: 0,
+                pane_cwds: String::new(),
+                pane_cmds: String::new(),
+                pane_sessions: String::new(),
+                scrollback_snapshot: String::new(),
+            },
+        )
+    }
+
+    #[test]
+    fn stale_layout_snapshot_cannot_resurrect_a_removed_worktree() {
+        use thegn_core::store::WorkspaceStore;
+        let gone = unique_tmp("gone");
+        let kept = unique_tmp("kept");
+        std::fs::create_dir_all(&gone).unwrap();
+        std::fs::create_dir_all(&kept).unwrap();
+        let (g1, t1) = layout_rows(&gone.to_string_lossy(), "app/gone");
+        let (g2, t2) = layout_rows(&kept.to_string_lossy(), "app/kept");
+        // Snapshot captured while both worktrees were live.
+        let snap = crate::session::LayoutSnapshot {
+            session: "s689".into(),
+            groups: vec![g1, g2],
+            tabs: vec![t1, t2],
+            active: None,
+            now: 1,
+        };
+        // Sweep removes one worktree, then the queued snapshot is written.
+        std::fs::remove_dir_all(&gone).unwrap();
+        note_worktree_removed(&gone);
+        let db = Db::open_memory().unwrap();
+        crate::session::Session::write_layout(&db, &snap).unwrap();
+        let groups = db.groups_for_session("s689").unwrap();
+        assert_eq!(
+            groups.iter().map(|g| g.name.as_str()).collect::<Vec<_>>(),
+            vec!["app/kept"],
+            "only the swept worktree's group is dropped"
+        );
+        let tabs = db.group_tabs_for_session("s689").unwrap();
+        assert!(tabs.iter().all(|t| t.group_name == "app/kept"));
+        // A re-created directory is a live worktree again: no filtering.
+        std::fs::create_dir_all(&gone).unwrap();
+        crate::session::Session::write_layout(&db, &snap).unwrap();
+        assert_eq!(db.groups_for_session("s689").unwrap().len(), 2);
+        std::fs::remove_dir_all(&gone).ok();
+        std::fs::remove_dir_all(&kept).ok();
+    }
+
+    #[test]
+    fn missing_directory_never_removed_here_keeps_its_layout() {
+        use thegn_core::store::WorkspaceStore;
+        let (g, t) = layout_rows("/nonexistent/tg-689-remote", "app/remote");
+        let snap = crate::session::LayoutSnapshot {
+            session: "s689b".into(),
+            groups: vec![g],
+            tabs: vec![t],
+            active: None,
+            now: 1,
+        };
+        let db = Db::open_memory().unwrap();
+        crate::session::Session::write_layout(&db, &snap).unwrap();
+        assert_eq!(db.groups_for_session("s689b").unwrap().len(), 1);
     }
 
     #[test]
