@@ -310,7 +310,9 @@ impl WorktreeAuxStore for Db {
 
     /// Enqueue (or re-enqueue) a worktree branch for the next fold. Re-enqueueing
     /// resets the row to `queued`, clears any prior result/conflict/error and
-    /// zeroes `agent_attempts` in the same upsert, so a branch that was deferred
+    /// zeroes `agent_attempts` in the same upsert (only when the existing row is
+    /// finished, never for an active queued/folding/verifying/agent_running row,
+    /// so a periodic re-add cannot refill an in-flight budget), so a branch that was deferred
     /// and then rebased starts fresh with a full agent budget (same as `merge
     /// retry`). Every caller is a deliberate user/API enqueue; internal outcome
     /// persistence goes through `persist_merge_outcome`, which preserves the
@@ -331,7 +333,9 @@ impl WorktreeAuxStore for Db {
                  branch=?2, target_branch=?3, status='queued',
                  queued_at=?4, updated_at=?4,
                  result_oid=NULL, conflict_paths=NULL, error_detail=NULL,
-                 agent_attempts=0,
+                 agent_attempts=CASE WHEN merge_queue.status IN
+                       ('queued','folding','verifying','agent_running')
+                     THEN merge_queue.agent_attempts ELSE 0 END,
                  location=(SELECT location FROM worktrees WHERE worktree=?1)"#,
             params![worktree, branch, target_branch, now],
         )?;
@@ -629,7 +633,9 @@ impl WorktreeAuxStore for Db {
                status='watching',
                blocker=NULL,
                detail=NULL,
-               agent_attempts=0,
+               agent_attempts=CASE WHEN merge_queue.status IN
+                       ('queued','folding','verifying','agent_running')
+                     THEN merge_queue.agent_attempts ELSE 0 END,
                updated_at=excluded.updated_at",
             // SQLite integers are signed; a PR number never approaches i64::MAX.
             params![

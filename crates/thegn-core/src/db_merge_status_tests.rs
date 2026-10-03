@@ -305,3 +305,30 @@ fn remote_re_enqueue_resets_attempt_budget_and_prior_detail() {
     );
     assert_fresh_row(&row(&db));
 }
+
+#[test]
+fn re_enqueue_keeps_budget_of_an_active_row_and_resets_finished_rows() {
+    for status in ["queued", "folding", "verifying", "agent_running"] {
+        let db = seeded();
+        db.update_merge_status(WORKTREE, status, None, None, None)
+            .unwrap();
+        db.enqueue_merge(WORKTREE, "feature", "target").unwrap();
+        let r = row(&db);
+        assert_eq!(r.status, "queued");
+        assert_eq!(r.agent_attempts, 2, "active {status} keeps its budget");
+    }
+    for status in [
+        "deferred",
+        "gate_failed",
+        "gate_error",
+        "needs_human",
+        "ready",
+        "landed",
+    ] {
+        let db = seeded();
+        db.update_merge_status(WORKTREE, status, Some("o"), Some("p"), Some("e"))
+            .unwrap();
+        db.enqueue_merge(WORKTREE, "feature", "target").unwrap();
+        assert_fresh_row(&row(&db));
+    }
+}
