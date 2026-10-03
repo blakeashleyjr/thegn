@@ -6899,7 +6899,8 @@ impl Config {
             && let Some(overlay) = load_repo_overlay(root)
             && !overlay.issues.is_empty()
         {
-            overlay.issues.apply(&mut issues);
+            let refused = overlay.issues.apply(&mut issues);
+            crate::config_issues::warn_refusals_once(root, &refused);
         }
         issues
     }

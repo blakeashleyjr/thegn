@@ -427,7 +427,7 @@ async fn cold_stage_prompt(svc: &DaemonService, row: &AgentDispatch) -> anyhow::
 
     let facts = if crate::stage_prompt::needs_tracker(&stage.prompt) {
         let detail = svc
-            .issues_get(&row.issue_id, None)
+            .issues_get(&row.issue_id, Some(row.worktree_path.as_str()))
             .await
             .map_err(|e| anyhow::anyhow!("tracker lookup for {}: {e}", row.issue_id))?;
         crate::stage_prompt::IssueFacts {
@@ -441,7 +441,9 @@ async fn cold_stage_prompt(svc: &DaemonService, row: &AgentDispatch) -> anyhow::
     };
 
     // Branch: the registered worktree row. A worktree the registry has lost
-    // still relaunches, just without `{branch}` in its prompt.
+    // still relaunches, just without `{branch}` in its prompt. (The tracker
+    // lookup above is different: it is scoped to the worktree's repo overlay
+    // and fails closed for an unregistered worktree — no global fallback.)
     let wt = row.worktree_path.clone();
     let branch = svc
         .with_db(move |db| {

@@ -3251,6 +3251,76 @@ fn repo_overlay_cannot_inject_tracker_accounts() {
     assert!(!dump.contains("THE695_REPO_CANARY"), "{dump}");
 }
 
+fn issues_with_repo_overlay(global: IssuesConfig, overlay_toml: &str) -> IssuesConfig {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join(".thegn.toml"), overlay_toml).unwrap();
+    let cfg = Config {
+        issues: global,
+        ..Config::default()
+    };
+    cfg.repo_issues(Some(dir.path()))
+}
+
+#[test]
+fn repo_overlay_cannot_widen_providers() {
+    // Linear is disabled globally but has a legacy token; a repo naming it must
+    // not resurrect it (synth_legacy_account would use the token).
+    let global = IssuesConfig {
+        providers: vec![IssueProviderKind::Github],
+        linear: LinearConfig {
+            api_key: "THE724_CANARY".into(),
+            ..LinearConfig::default()
+        },
+        ..IssuesConfig::default()
+    };
+    let eff = issues_with_repo_overlay(global, "[issues]\nproviders = [\"linear\", \"github\"]\n");
+    assert_eq!(eff.active_providers(), vec![IssueProviderKind::Github]);
+    assert!(
+        eff.active_accounts()
+            .iter()
+            .all(|a| a.provider != IssueProviderKind::Linear)
+    );
+}
+
+#[test]
+fn repo_overlay_pins_cannot_replace_a_global_pin() {
+    let global = IssuesConfig {
+        providers: vec![IssueProviderKind::Linear, IssueProviderKind::Jira],
+        linear: LinearConfig {
+            team_id: "GLOBAL-TEAM".into(),
+            ..LinearConfig::default()
+        },
+        jira: JiraConfig {
+            project_key: "GLOB".into(),
+            ..JiraConfig::default()
+        },
+        ..IssuesConfig::default()
+    };
+    let eff = issues_with_repo_overlay(
+        global.clone(),
+        "[issues.linear]\nteam_id = \"OTHER\"\n[issues.jira]\nproject_key = \"\"\n",
+    );
+    assert_eq!(eff.linear.team_id, "GLOBAL-TEAM");
+    assert_eq!(eff.jira.project_key, "GLOB", "clearing a pin also widens");
+    // Restating the same pin is fine.
+    let same = issues_with_repo_overlay(global, "[issues.linear]\nteam_id = \"GLOBAL-TEAM\"\n");
+    assert_eq!(same.linear.team_id, "GLOBAL-TEAM");
+}
+
+#[test]
+fn repo_overlay_may_narrow_an_unpinned_global_scope() {
+    let global = IssuesConfig {
+        providers: vec![IssueProviderKind::Linear, IssueProviderKind::Jira],
+        ..IssuesConfig::default()
+    };
+    let eff = issues_with_repo_overlay(
+        global,
+        "[issues]\nproviders = [\"jira\"]\n[issues.jira]\nproject_key = \"ACME\"\n",
+    );
+    assert_eq!(eff.active_providers(), vec![IssueProviderKind::Jira]);
+    assert_eq!(eff.jira.project_key, "ACME");
+}
+
 #[test]
 fn clamp_to_channel_is_a_noop_in_dev() {
     use crate::channel::Channel;
