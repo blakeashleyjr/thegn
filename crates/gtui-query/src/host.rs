@@ -30,6 +30,10 @@ pub struct HostSource {
     /// Set while the consuming tab is hidden: the sampler parks (no sampling,
     /// no `nvidia-smi`/`ioreg` spawns, no timer) until [`DataSource::set_active`].
     parked: Arc<AtomicBool>,
+    /// Set by the worker while it is blocked in its parked wait (test seam).
+    in_park: Arc<AtomicBool>,
+    /// Set by the worker as its last act (test seam for prompt shutdown).
+    exited: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
 }
 
@@ -76,6 +80,10 @@ impl HostSource {
         let stop_bg = stop.clone();
         let parked = Arc::new(AtomicBool::new(false));
         let parked_bg = parked.clone();
+        let in_park = Arc::new(AtomicBool::new(false));
+        let in_park_bg = in_park.clone();
+        let exited = Arc::new(AtomicBool::new(false));
+        let exited_bg = exited.clone();
         // Dedicated sampler thread: `StatsSampler::sample()` blocks (refreshes
         // sysinfo) and needs a warm-up read to prime the CPU delta, so it lives
         // off the UI thread and off the tokio runtime entirely.
@@ -83,11 +91,25 @@ impl HostSource {
             on_thread_start();
             let disk_path = std::env::current_dir().unwrap_or_else(|_| "/".into());
             let mut sampler = StatsSampler::new(disk_path);
+            let mut was_parked = false;
             while !stop_bg.load(Ordering::Acquire) {
                 if parked_bg.load(Ordering::Acquire) {
                     // Hidden: block untimed. `set_active(true)` and shutdown
                     // both `unpark`; a spurious wake just re-checks the flags.
+                    was_parked = true;
+                    in_park_bg.store(true, Ordering::Release);
                     std::thread::park();
+                    in_park_bg.store(false, Ordering::Release);
+                    continue;
+                }
+                if was_parked {
+                    was_parked = false;
+                    // The CPU delta spans everything since the last read, so
+                    // the first reading after a long park would be one bogus
+                    // average. Take a discarded priming read, let the delta
+                    // window open, then sample normally.
+                    let _ = sampler.sample();
+                    std::thread::park_timeout(Duration::from_millis(300));
                     continue;
                 }
                 let snap = sampler.sample();
@@ -108,12 +130,15 @@ impl HostSource {
                 // while making idle shutdown immediate.
                 std::thread::park_timeout(Duration::from_secs(1));
             }
+            exited_bg.store(true, Ordering::Release);
         }))
         .map_err(HostSourceSpawnError)?;
         Ok(Self {
             ring,
             stop,
             parked,
+            in_park,
+            exited,
             worker: Some(worker),
         })
     }
@@ -346,36 +371,37 @@ mod tests {
         assert_eq!(timestamp_secs(before_epoch), 0.0);
     }
 
-    #[test]
-    fn a_parked_sampler_stops_sampling_and_resumes_on_activation() {
-        let source = HostSource::try_new().unwrap();
-        let len = || source.ring.lock().unwrap().len();
+    fn wait_for(what: &str, cond: impl Fn() -> bool) {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while len() == 0 {
-            assert!(std::time::Instant::now() < deadline, "no first sample");
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        source.set_active(false);
-        // Let a sample already in flight land, then span more than one period.
-        std::thread::sleep(Duration::from_millis(500));
-        let parked_len = len();
-        std::thread::sleep(Duration::from_millis(2300));
-        assert_eq!(len(), parked_len, "parked sampler kept sampling");
-        source.set_active(true);
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while len() == parked_len {
-            assert!(std::time::Instant::now() < deadline, "did not resume");
-            std::thread::sleep(Duration::from_millis(20));
+        while !cond() {
+            assert!(std::time::Instant::now() < deadline, "timed out: {what}");
+            std::thread::sleep(Duration::from_millis(10));
         }
     }
 
     #[test]
-    fn dropping_a_parked_sampler_still_joins_promptly() {
+    fn a_parked_sampler_stops_sampling_and_resumes_on_activation() {
+        let source = HostSource::try_new().unwrap();
+        let len = || source.ring.lock().unwrap().len();
+        wait_for("first sample", || len() > 0);
+        source.set_active(false);
+        // The worker signals once it is blocked in the parked wait; nothing
+        // after that point may publish a sample.
+        wait_for("worker parked", || source.in_park.load(Ordering::Acquire));
+        let parked_len = len();
+        std::thread::sleep(Duration::from_millis(1300));
+        assert_eq!(len(), parked_len, "parked sampler kept sampling");
+        source.set_active(true);
+        wait_for("sampling resumed", || len() > parked_len);
+    }
+
+    #[test]
+    fn dropping_a_parked_sampler_actually_exits_the_worker_promptly() {
         let source = HostSource::try_new().unwrap();
         source.set_active(false);
-        std::thread::sleep(Duration::from_millis(300));
-        let start = std::time::Instant::now();
+        wait_for("worker parked", || source.in_park.load(Ordering::Acquire));
+        let exited = source.exited.clone();
         drop(source);
-        assert!(start.elapsed() < Duration::from_millis(500));
+        wait_for("worker exit", || exited.load(Ordering::Acquire));
     }
 }
