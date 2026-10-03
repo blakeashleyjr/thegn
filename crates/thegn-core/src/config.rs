@@ -890,7 +890,7 @@ pub struct MergeQueueConfig {
     pub auto_land: bool,
     /// Agent-dispatch → re-fold cycles per branch before it's `needs_human`.
     pub agent_max_attempts: u32,
-    /// Watchdog (seconds) for one agent invocation. 0 disables it.
+    /// Watchdog (seconds) for one agent invocation. 0 means the 6-hour ceiling, not unbounded; values over 30 days clamp to 30 days. After the agent process exits, its leftover group members get 15 s before being terminated.
     #[schemars(range(max = "crate::time_policy::MAX_DURATION_SECS"))]
     pub agent_timeout_secs: u64,
     /// Opt in to running the fixing agent INSIDE the resolved sandbox (the

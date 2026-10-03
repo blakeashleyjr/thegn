@@ -10,13 +10,13 @@ use std::time::{Duration, Instant};
 /// the execution part the whole process group is killed, so a command that
 /// backgrounds work (`afplay x.wav &`) may keep playing until then.
 pub(crate) const SOUND_HELPER_DEADLINE: Duration = Duration::from_secs(5);
-const POLL_INTERVAL: Duration = Duration::from_millis(10);
+pub(crate) const POLL_INTERVAL: Duration = Duration::from_millis(10);
 /// Ceiling for the group-drain poll interval. Each drain check is a full
 /// `/proc` scan on Linux (~1000 stat reads), so the wait backs off from
 /// `POLL_INTERVAL` to this cap instead of scanning every 10ms for the whole
 /// life of a backgrounded player. It also bounds how late a cancellation (a
 /// plain flag, which cannot wake a sleeper) is noticed.
-const DRAIN_BACKOFF_CAP: Duration = Duration::from_millis(250);
+pub(crate) const DRAIN_BACKOFF_CAP: Duration = Duration::from_millis(250);
 const CLEANUP_GRACE: Duration = Duration::from_millis(250);
 /// How long runtime shutdown waits for a worker to finish before detaching it.
 /// A cancelled helper needs at most `CLEANUP_GRACE` to be killed and settled;
@@ -132,7 +132,7 @@ fn run_unix_bounded(
 /// a process table scan; where none is available we conservatively report
 /// "members remain", which only means the drain runs to the deadline.
 #[cfg(unix)]
-fn live_members(_group: &crate::platform::GroupHandle, _pgid: i32) -> bool {
+pub(crate) fn live_members(_group: &crate::platform::GroupHandle, _pgid: i32) -> bool {
     #[cfg(target_os = "linux")]
     {
         let pgid = _pgid;
@@ -226,7 +226,7 @@ fn drain_group(
 /// Next drain-poll interval: doubles, never exceeds `DRAIN_BACKOFF_CAP`, and
 /// never sleeps past `remaining` (time left to the governing deadline).
 #[cfg(unix)]
-fn next_backoff(current: Duration, remaining: Duration) -> Duration {
+pub(crate) fn next_backoff(current: Duration, remaining: Duration) -> Duration {
     current
         .saturating_mul(2)
         .min(DRAIN_BACKOFF_CAP)
