@@ -31,8 +31,10 @@ pub struct HostSource {
     /// no `nvidia-smi`/`ioreg` spawns, no timer) until [`DataSource::set_active`].
     parked: Arc<AtomicBool>,
     /// Set by the worker while it is blocked in its parked wait (test seam).
+    #[cfg_attr(not(test), expect(dead_code, reason = "read only by tests"))]
     in_park: Arc<AtomicBool>,
     /// Set by the worker as its last act (test seam for prompt shutdown).
+    #[cfg_attr(not(test), expect(dead_code, reason = "read only by tests"))]
     exited: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
 }
@@ -108,7 +110,7 @@ impl HostSource {
                     // the first reading after a long park would be one bogus
                     // average. Take a discarded priming read, let the delta
                     // window open, then sample normally.
-                    let _ = sampler.sample();
+                    let _priming = sampler.sample();
                     std::thread::park_timeout(Duration::from_millis(300));
                     continue;
                 }

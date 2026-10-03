@@ -178,6 +178,7 @@ impl QueryEngine {
     /// Spawn an engine with an explicit relative window and clock.
     /// Production uses [`Utc::now`] through the default [`Self::spawn`] adapter;
     /// tests and deterministic callers can provide a fake clock here.
+    #[allow(clippy::too_many_arguments)] // the full injection seam; `spawn` is the short form
     pub fn spawn_with_window(
         rt: Handle,
         dashboard: Dashboard,
