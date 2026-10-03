@@ -1505,7 +1505,7 @@ pub struct CalendarQuery {
 
 /// The ingest body: the same `CalEvent` shape a `command` plugin emits, so one
 /// contract serves both a polled plugin and a pushing daemon.
-#[derive(Deserialize)]
+#[derive(Deserialize, schemars::JsonSchema)]
 pub struct CalendarIngestBody {
     events: Vec<thegn_core::calendar::CalEvent>,
 }
