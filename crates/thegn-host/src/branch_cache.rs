@@ -160,11 +160,12 @@ impl HealGate {
         };
         self.seen.mark(&p.path, p.print);
         if let Some(g) = p.ref_gen {
-            self.ref_seen
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get_or_insert_with(Default::default)
-                .insert(p.path, g);
+            let mut m = self.ref_seen.lock().unwrap_or_else(|e| e.into_inner());
+            let m = m.get_or_insert_with(Default::default);
+            if m.len() >= 16 && !m.contains_key(&p.path) {
+                m.clear(); // bounded like `Seen`: a cache, not a ledger
+            }
+            m.insert(p.path, g);
         }
     }
 
@@ -209,9 +210,32 @@ pub(crate) fn ref_gen_tick(want_main_sync: &mut bool, active: &std::path::Path) 
     }
 }
 
-/// The loop spawned the heal: record what it saw.
-pub(crate) fn heal_spawned() {
-    HEAL_GATE.spawned();
+/// The loop's heal decision, extracted so the wiring is testable: when a heal is
+/// wanted AND the 2 s throttle allows, run `spawn` and ONLY THEN record on `gate`
+/// what it saw. A throttled request records nothing, so it stays due.
+pub(crate) fn maybe_spawn_heal_with(
+    gate: &HealGate,
+    want: bool,
+    last: &mut Option<std::time::Instant>,
+    spawn: impl FnOnce(),
+) -> bool {
+    if want && last.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(2)) {
+        *last = Some(std::time::Instant::now());
+        spawn();
+        gate.spawned();
+        true
+    } else {
+        false
+    }
+}
+
+/// [`maybe_spawn_heal_with`] on the process-wide gate (the loop's call).
+pub(crate) fn maybe_spawn_heal(
+    want: bool,
+    last: &mut Option<std::time::Instant>,
+    spawn: impl FnOnce(),
+) -> bool {
+    maybe_spawn_heal_with(&HEAL_GATE, want, last, spawn)
 }
 
 /// Whether the branch list must be re-fetched now, or can be served from cache.
@@ -251,6 +275,45 @@ mod tests {
         assert!(gate.request(p, wp(2), Some(2)));
         gate.spawned();
         assert!(gate.request(p, None, None));
+    }
+
+    #[test]
+    fn the_loop_records_a_heal_only_when_it_really_spawns() {
+        let gate = HealGate::new();
+        let p = std::path::Path::new("/tmp/tg-heal-gate/c");
+        let mut last = None;
+        let mut spawns = 0;
+        assert!(gate.request(p, wp(1), Some(1)));
+        assert!(maybe_spawn_heal_with(&gate, true, &mut last, || spawns += 1));
+        assert!(!gate.request(p, wp(1), Some(1)), "spawned => recorded");
+        // A second accepted request inside the 2 s throttle is DROPPED...
+        assert!(gate.request(p, wp(2), Some(2)));
+        assert!(!maybe_spawn_heal_with(&gate, true, &mut last, || spawns += 1));
+        assert_eq!(spawns, 1);
+        // ...and must stay due (not recorded) for the next backstop.
+        assert!(gate.request(p, wp(2), Some(2)));
+        // No heal wanted: nothing spawned, nothing recorded.
+        assert!(!maybe_spawn_heal_with(&gate, false, &mut None, || {
+            spawns += 1
+        }));
+        assert_eq!(spawns, 1);
+    }
+
+    #[test]
+    fn the_ref_seen_ledger_is_bounded() {
+        let gate = HealGate::new();
+        for i in 0..40 {
+            let p = std::path::PathBuf::from(format!("/tmp/tg-heal-gate/n{i}"));
+            assert!(gate.request(&p, wp(1), Some(1)));
+            gate.spawned();
+        }
+        let n = gate
+            .ref_seen
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map_or(0, |m| m.len());
+        assert!(n <= 16, "{n} entries");
     }
 
     #[test]

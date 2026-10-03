@@ -388,8 +388,14 @@ proc_jiffies() { # $1 = pid -> utime+stime
 proc_running() { # true only for a live, non-zombie process
   local state
   kill -0 "$1" 2>/dev/null || return 1
-  state="$(awk '{ s=$0; sub(/^.*\) /,"",s); split(s,a," "); print a[1] }' "/proc/$1/stat" 2>/dev/null || true)"
-  [ -n "$state" ] && [ "$state" != Z ]
+  if [ -r "/proc/$1/stat" ]; then
+    state="$(awk '{ s=$0; sub(/^.*\) /,"",s); split(s,a," "); print a[1] }' "/proc/$1/stat" 2>/dev/null || true)"
+    [ -n "$state" ] && [ "$state" != Z ]
+  else
+    # No /proc (macOS): ask ps, and reject a zombie (state starts with Z).
+    state="$(ps -o stat= -p "$1" 2>/dev/null | tr -d ' ' || true)"
+    [ -n "$state" ] && [ "${state#Z}" = "$state" ]
+  fi
 }
 
 # --- resource accumulation --------------------------------------------------

@@ -46,6 +46,9 @@ pub(crate) struct Coverage {
     /// `MainRefMoved` was lost to the 500 ms refresh throttle.
     ref_generation: AtomicU64,
     live: AtomicBool,
+    /// Sticky: set by the first withdrawal and never cleared. A withdrawal seen
+    /// DURING registration (before [`publish`]) must survive publication.
+    withdrawn: AtomicBool,
 }
 
 /// What the event classifier needs to know about the registration.
@@ -67,6 +70,21 @@ pub(crate) struct Rules {
 /// life. `logs/`, `refs/`, `info/`, `modules/` and anything unknown still do.
 const EXEMPT_GIT_DIR_CHILDREN: &[&str] = &["rebase-merge", "rebase-apply", "sequencer", "rr-cache"];
 
+/// A directory directly under a git root that git creates/removes as part of
+/// ordinary operations. `on_removal` also exempts `worktrees/` (a linked worktree
+/// being pruned), which on creation still withdraws.
+fn is_exempt_git_child(p: &Path, rules: &Rules, on_removal: bool) -> bool {
+    p.parent().is_some_and(|d| rules.is_git_root(d))
+        && p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+            EXEMPT_GIT_DIR_CHILDREN.contains(&n) || (on_removal && n == "worktrees")
+        })
+}
+
+/// Whether `p` lies inside a git dir (a `.git` component or under a git root).
+fn in_git_dir(p: &Path, roots: &[PathBuf]) -> bool {
+    crate::git_watch::in_dot_git(p) || roots.iter().any(|r| p.starts_with(r))
+}
+
 impl Rules {
     fn is_git_root(&self, p: &Path) -> bool {
         self.roots.iter().any(|r| r == p) || p.file_name().is_some_and(|n| n == ".git")
@@ -79,6 +97,7 @@ impl Coverage {
             generation: AtomicU64::new(NEXT_GEN.fetch_add(1, Ordering::SeqCst)),
             ref_generation: AtomicU64::new(NEXT_GEN.fetch_add(1, Ordering::SeqCst)),
             live: AtomicBool::new(false),
+            withdrawn: AtomicBool::new(false),
         }
     }
 
@@ -93,7 +112,13 @@ impl Coverage {
     }
 
     fn withdraw(&self) {
+        self.withdrawn.store(true, Ordering::SeqCst);
         self.live.store(false, Ordering::SeqCst);
+    }
+
+    /// Whether this claim may be relied on right now.
+    fn vouches(&self) -> bool {
+        self.live.load(Ordering::SeqCst) && !self.withdrawn.load(Ordering::SeqCst)
     }
 
     /// Classify one watcher callback result; see the module docs. Anything the
@@ -132,10 +157,11 @@ impl Coverage {
             return;
         }
         self.bump();
+        // Only INSIDE a git dir: `src/refs/x.rs` in the tree is not a ref move.
         if ev
             .paths
             .iter()
-            .any(|p| crate::git_watch::is_ref_move_path(p))
+            .any(|p| in_git_dir(p, &rules.roots) && crate::git_watch::is_ref_move_path(p))
         {
             self.bump_refs();
         }
@@ -159,8 +185,14 @@ impl Coverage {
         // The watched identity itself removed or replaced (worktree deleted and
         // recreated at the same path, a git dir swapped): the watches are on the
         // OLD inodes.
+        // The sequencer/rerere/worktrees dirs git creates and removes in the course
+        // of ordinary work are exempt in BOTH directions: a pre-existing one is a
+        // plan entry, and its removal must not withdraw the claim for good.
         if (matches!(ev.kind, EventKind::Remove(_)) || name_event)
-            && ev.paths.iter().any(|p| rules.protected.contains(p))
+            && ev
+                .paths
+                .iter()
+                .any(|p| rules.protected.contains(p) && !is_exempt_git_child(p, rules, true))
         {
             self.withdraw();
         }
@@ -173,11 +205,7 @@ impl Coverage {
                 if crate::git_watch::prune_dir(p, &rules.ignore) {
                     continue;
                 }
-                let exempt = p.parent().is_some_and(|d| rules.is_git_root(d))
-                    && p.file_name()
-                        .and_then(|n| n.to_str())
-                        .is_some_and(|n| EXEMPT_GIT_DIR_CHILDREN.contains(&n));
-                if !exempt {
+                if !is_exempt_git_child(p, rules, false) {
                     // A new directory under a non-recursive watch is never
                     // registered, so edits inside it would go unseen.
                     self.withdraw();
@@ -200,8 +228,7 @@ impl Coverage {
 /// A file under a git dir whose change cannot alter any read (see
 /// [`Coverage::observe`]): the fetch record and transient `*.lock` files.
 fn is_git_bookkeeping(p: &Path, roots: &[PathBuf]) -> bool {
-    let in_git_dir = crate::git_watch::in_dot_git(p) || roots.iter().any(|r| p.starts_with(r));
-    in_git_dir
+    in_git_dir(p, roots)
         && p.file_name()
             .and_then(|n| n.to_str())
             .is_some_and(|n| n == "FETCH_HEAD" || n.ends_with(".lock"))
@@ -235,6 +262,10 @@ fn registry() -> &'static Mutex<HashMap<PathBuf, Arc<Coverage>>> {
 
 fn publish(path: &Path, cov: &Arc<Coverage>) {
     cov.live.store(true, Ordering::SeqCst);
+    // A withdrawal racing the store above (or seen during registration) wins.
+    if cov.withdrawn.load(Ordering::SeqCst) {
+        cov.live.store(false, Ordering::SeqCst);
+    }
     registry()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -269,7 +300,7 @@ pub(crate) fn current_print(path: &Path) -> Option<WatchPrint> {
         .unwrap_or_else(|e| e.into_inner())
         .get(path)
         .cloned()?;
-    if !cov.live.load(Ordering::SeqCst) {
+    if !cov.vouches() {
         return None;
     }
     Some(WatchPrint {
@@ -285,8 +316,7 @@ pub(crate) fn current_ref_generation(path: &Path) -> Option<u64> {
         .unwrap_or_else(|e| e.into_inner())
         .get(path)
         .cloned()?;
-    cov.live
-        .load(Ordering::SeqCst)
+    cov.vouches()
         .then(|| cov.ref_generation.load(Ordering::SeqCst))
 }
 
@@ -1064,7 +1094,7 @@ mod tests {
                 &r,
                 (
                     at,
-                    thegn_core::git_memo::global_git_print().expect("global layer"),
+                    thegn_core::git_memo::global_git_print(&r).expect("global layer"),
                 ),
             );
             assert!(
@@ -1432,6 +1462,70 @@ mod tests {
         std::fs::create_dir_all(b.join(".git/reftable")).unwrap();
         let _wb = watch(&b);
         assert_eq!(print(&b), None, "reftable refs are not files");
+    }
+
+    #[test]
+    fn a_withdrawal_during_registration_survives_publication() {
+        let base = scratch("cls-publish");
+        let rules = rules_for(&base);
+        let path = base.join("wt");
+        for early in 0..3 {
+            let c = Arc::new(Coverage::new());
+            match early {
+                0 => c.observe(&Err(notify::Error::generic("limit")), &rules),
+                1 => c.observe(
+                    &Ok(notify::Event::new(notify::EventKind::Other)
+                        .set_flag(notify::event::Flag::Rescan)),
+                    &rules,
+                ),
+                _ => c.observe(
+                    &ev(
+                        notify::EventKind::Remove(notify::event::RemoveKind::Folder),
+                        &[&path],
+                    ),
+                    &rules,
+                ),
+            }
+            publish(&path, &c);
+            assert_eq!(
+                current_print(&path),
+                None,
+                "case {early}: published an unproven claim"
+            );
+            assert_eq!(current_ref_generation(&path), None, "case {early}");
+        }
+    }
+
+    #[test]
+    fn removing_git_managed_dirs_does_not_withdraw_but_a_tree_refs_file_is_no_ref_move() {
+        use notify::EventKind::{Modify, Remove};
+        use notify::event::{DataChange, ModifyKind::Data, RemoveKind};
+        let base = scratch("cls-l2");
+        let mut rules = rules_for(&base);
+        let gitdir = base.join("wt/.git");
+        for n in ["rebase-merge", "sequencer", "worktrees"] {
+            rules.protected.insert(gitdir.join(n));
+            let c = live_cov();
+            c.observe(&ev(Remove(RemoveKind::Folder), &[&gitdir.join(n)]), &rules);
+            assert!(
+                c.live.load(Ordering::SeqCst),
+                "removing {n} must not withdraw"
+            );
+        }
+        let c = live_cov();
+        let r0 = c.ref_generation.load(Ordering::SeqCst);
+        c.observe(
+            &ev(
+                Modify(Data(DataChange::Any)),
+                &[&base.join("wt/src/refs/x.rs")],
+            ),
+            &rules,
+        );
+        assert_eq!(
+            r0,
+            c.ref_generation.load(Ordering::SeqCst),
+            "tree path, not a ref"
+        );
     }
 
     #[test]

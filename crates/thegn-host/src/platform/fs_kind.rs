@@ -4,7 +4,8 @@
 //! Network and userspace filesystems (NFS, SMB/CIFS, FUSE, 9p, AFP, WebDAV)
 //! deliver no events for changes made by other clients or behind the kernel's
 //! back, so a change generation built on them would stay put while the tree
-//! moves. [`unwatchable`] says "do not claim coverage here".
+//! moves. [`unwatchable`] says "do not claim coverage here". It is an
+//! ALLOWLIST of known-local filesystems: an unlisted type is unwatchable.
 //!
 //! Fail toward today's behaviour: anything it cannot positively classify as a
 //! local filesystem -- a `statfs` failure, a platform without this seam -- is
@@ -27,22 +28,23 @@ pub(crate) fn unwatchable(path: &Path) -> bool {
         return true;
     }
     // Bit-widths of f_type differ across arches; compare as u64.
-    is_unwatchable_magic(st.f_type as u64)
+    !is_local_magic(st.f_type as u64)
 }
 
-/// Linux `f_type` magics of filesystems with untrustworthy change events.
+/// Linux `f_type` magics of LOCAL filesystems whose change events can be trusted.
+/// An allowlist: anything not listed (network, FUSE, 9p, unknown) is unwatchable.
 #[cfg(any(target_os = "linux", test))]
-pub(crate) fn is_unwatchable_magic(magic: u64) -> bool {
+pub(crate) fn is_local_magic(magic: u64) -> bool {
     matches!(
         magic & 0xFFFF_FFFF,
-        0x6969          // NFS
-        | 0x517B        // SMB
-        | 0xFF53_4D42   // CIFS
-        | 0xFE53_4D42   // SMB2
-        | 0x6573_5546   // FUSE
-        | 0x0102_1997   // 9p
-        | 0x5346_414F   // AFS
-        | 0x7375_7245 // Coda
+        0xEF53          // ext2/3/4
+        | 0x5846_5342   // xfs
+        | 0x9123_683E   // btrfs
+        | 0x0102_1994   // tmpfs
+        | 0x794C_7630   // overlayfs
+        | 0x2FC1_2FC1   // zfs
+        | 0xF2F5_2010   // f2fs
+        | 0xCA45_1A4E // bcachefs
     )
 }
 
@@ -63,16 +65,13 @@ pub(crate) fn unwatchable(path: &Path) -> bool {
         .take_while(|&&b| b != 0)
         .map(|&b| b as u8)
         .collect();
-    is_unwatchable_fstype(&String::from_utf8_lossy(&name))
+    !is_local_fstype(&String::from_utf8_lossy(&name))
 }
 
-/// macOS `f_fstypename` values of network/userspace filesystems.
+/// macOS `f_fstypename` values of local filesystems (allowlist).
 #[cfg(any(target_os = "macos", test))]
-pub(crate) fn is_unwatchable_fstype(name: &str) -> bool {
-    let n = name.to_ascii_lowercase();
-    matches!(n.as_str(), "nfs" | "smbfs" | "afpfs" | "webdav" | "cifs")
-        || n.contains("fuse")
-        || n.starts_with("osxfuse")
+pub(crate) fn is_local_fstype(name: &str) -> bool {
+    matches!(name.to_ascii_lowercase().as_str(), "apfs" | "hfs")
 }
 
 /// No classification available: never claim coverage.
@@ -86,7 +85,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn network_and_fuse_magics_are_unwatchable_and_local_ones_are_not() {
+    fn only_listed_local_filesystems_are_watchable() {
+        // ext4 / xfs / btrfs / tmpfs / overlayfs / zfs / f2fs / bcachefs.
+        for m in [
+            0xEF53u64,
+            0x5846_5342,
+            0x9123_683E,
+            0x0102_1994,
+            0x794C_7630,
+            0x2FC1_2FC1,
+            0xF2F5_2010,
+            0xCA45_1A4E,
+        ] {
+            assert!(is_local_magic(m), "{m:#x}");
+        }
+        // NFS, SMB, CIFS, SMB2, FUSE, 9p, AFS, Coda and any unknown magic.
         for m in [
             0x6969u64,
             0x517B,
@@ -94,22 +107,14 @@ mod tests {
             0xFE53_4D42,
             0x6573_5546,
             0x0102_1997,
+            0x5346_414F,
+            0x7375_7245,
+            0xDEAD_BEEF,
         ] {
-            assert!(is_unwatchable_magic(m), "{m:#x}");
+            assert!(!is_local_magic(m), "{m:#x}");
         }
-        // ext4 / xfs / btrfs / tmpfs / overlayfs: local.
-        for m in [
-            0xEF53u64,
-            0x5846_5342,
-            0x9123_683E,
-            0x0102_1994,
-            0x794C_7630,
-        ] {
-            assert!(!is_unwatchable_magic(m), "{m:#x}");
-        }
-        assert!(is_unwatchable_fstype("nfs"));
-        assert!(is_unwatchable_fstype("macfuse"));
-        assert!(!is_unwatchable_fstype("apfs"));
+        assert!(is_local_fstype("apfs") && is_local_fstype("HFS"));
+        assert!(!is_local_fstype("nfs") && !is_local_fstype("macfuse") && !is_local_fstype("?"));
     }
 
     #[cfg(target_os = "linux")]
