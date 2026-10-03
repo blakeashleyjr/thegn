@@ -7,7 +7,7 @@
 //! panel always has something to render.
 
 pub mod capabilities;
-pub mod gh_run;
+pub(crate) mod gh_run;
 pub mod github;
 pub(crate) mod http;
 pub(crate) mod identity;

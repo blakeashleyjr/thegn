@@ -11,11 +11,14 @@ use std::io::Read;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use tokio::sync::Semaphore;
 
-use crate::plugin::proc::{kill_group, set_process_group};
+use crate::plugin::proc::{
+    bounded_group_termination_supported, kill_group, leader_exited_nowait, set_process_group,
+};
 
 /// Limits for one run.
 #[derive(Debug, Clone, Copy)]
@@ -23,7 +26,8 @@ pub struct Limits {
     pub timeout: Duration,
     /// Cap on captured stdout bytes.
     pub max_stdout: usize,
-    /// Cap on captured stderr bytes (stderr beyond it is dropped, not an error).
+    /// Cap on captured stderr bytes (stderr beyond it is read and discarded,
+    /// not an error).
     pub max_stderr: usize,
 }
 
@@ -51,10 +55,13 @@ pub enum RunError {
     NotInstalled,
     /// Any other spawn/IO failure.
     Io(String),
-    /// Deadline passed; the process group was killed.
+    /// Deadline passed; the process group was killed (or, if a descendant
+    /// escaped the group and holds the pipes, the readers were detached).
     Timeout,
     /// Stdout exceeded its cap; the process group was killed.
     Truncated,
+    /// Output pipes stayed open past the deadline (a descendant escaped the
+    /// process group); the readers were detached.
     /// The awaiting future was dropped before the run finished.
     Cancelled,
     /// Non-zero exit. `stderr` is raw (callers redact it).
@@ -77,7 +84,7 @@ pub async fn run(cmd: Command, limits: Limits) -> Result<String, RunError> {
     }
     let _guard = Guard(cancel.clone());
     // The permit stays held until the blocking task finishes even if this
-    // future is dropped: move a clone into the task.
+    // future is dropped: the permit itself moves into the task.
     let task_permit = _permit;
     tokio::task::spawn_blocking(move || {
         let _permit = task_permit;
@@ -87,6 +94,9 @@ pub async fn run(cmd: Command, limits: Limits) -> Result<String, RunError> {
     .map_err(|e| RunError::Io(e.to_string()))?
 }
 
+/// Read to EOF, keeping at most `cap` bytes. Bytes past the cap are still
+/// read and discarded so the child never sees a closed pipe (EPIPE/SIGPIPE);
+/// `over` is set when anything was dropped.
 fn read_capped(mut r: impl Read, cap: usize, over: &AtomicBool) -> Vec<u8> {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 8192];
@@ -94,24 +104,30 @@ fn read_capped(mut r: impl Read, cap: usize, over: &AtomicBool) -> Vec<u8> {
         match r.read(&mut chunk) {
             Ok(0) | Err(_) => break,
             Ok(n) => {
-                if buf.len() + n > cap {
-                    let room = cap - buf.len();
-                    buf.extend_from_slice(&chunk[..room]);
+                let room = cap.saturating_sub(buf.len());
+                if n > room {
                     over.store(true, Ordering::Relaxed);
-                    break;
                 }
-                buf.extend_from_slice(&chunk[..n]);
+                buf.extend_from_slice(&chunk[..n.min(room)]);
             }
         }
     }
     buf
 }
 
+/// How long the readers get to hit EOF once the process group is dead.
+const READER_GRACE: Duration = Duration::from_millis(500);
+
 pub(crate) fn run_blocking(
     mut cmd: Command,
     limits: Limits,
     cancel: &AtomicBool,
 ) -> Result<String, RunError> {
+    if !bounded_group_termination_supported() {
+        return Err(RunError::Io(
+            "bounded subprocess execution is not supported on this platform".into(),
+        ));
+    }
     if cancel.load(Ordering::Relaxed) {
         return Err(RunError::Cancelled);
     }
@@ -132,54 +148,77 @@ pub(crate) fn run_blocking(
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     let (cap_out, cap_err) = (limits.max_stdout, limits.max_stderr);
+    let (tx, rx) = mpsc::channel::<(bool, Vec<u8>)>();
     let o = out_over.clone();
-    let out_t =
-        std::thread::spawn(move || stdout.map_or_else(Vec::new, |s| read_capped(s, cap_out, &o)));
-    let err_t = std::thread::spawn(move || {
-        stderr.map_or_else(Vec::new, |s| read_capped(s, cap_err, &err_over))
+    let tx_out = tx.clone();
+    std::thread::spawn(move || {
+        let buf = stdout.map_or_else(Vec::new, |s| read_capped(s, cap_out, &o));
+        if tx_out.send((true, buf)).is_err() {
+            tracing::debug!("gh stdout reader detached: run already gave up");
+        }
+    });
+    std::thread::spawn(move || {
+        let buf = stderr.map_or_else(Vec::new, |s| read_capped(s, cap_err, &err_over));
+        if tx.send((false, buf)).is_err() {
+            tracing::debug!("gh stderr reader detached: run already gave up");
+        }
     });
 
     let deadline = Instant::now() + limits.timeout;
     let mut failure: Option<RunError> = None;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(st)) => break Some(st),
-            Ok(None) => {}
+    // The leader is observed with WNOWAIT and reaped only after the group kill,
+    // so its unreaped zombie pins the pid/pgid against reuse.
+    let mut pinned = true;
+    loop {
+        match leader_exited_nowait(pid) {
+            Ok(true) => break,
+            Ok(false) => {}
             Err(e) => {
                 failure = Some(RunError::Io(e.to_string()));
-                break None;
+                pinned = false;
+                break;
             }
         }
         if cancel.load(Ordering::Relaxed) {
             failure = Some(RunError::Cancelled);
-            break None;
+            break;
         }
         if out_over.load(Ordering::Relaxed) {
             failure = Some(RunError::Truncated);
-            break None;
+            break;
         }
         if Instant::now() >= deadline {
             failure = Some(RunError::Timeout);
-            break None;
+            break;
         }
         std::thread::sleep(Duration::from_millis(5));
-    };
-    // Whole tree goes in every case: on success it reaps stragglers that kept
-    // the pipes open, which would otherwise wedge the reader joins.
-    kill_group(pid);
-    if status.is_none() {
-        // best-effort: the child is already SIGKILLed; wait only reaps it
-        child.kill().ok();
     }
-    let status = match status {
-        Some(s) => Some(s),
-        None => child.wait().ok(),
+    // Whole tree goes in every case: on success it reaps stragglers that kept
+    // the pipes open. Skipped only when we lost track of the leader.
+    if pinned {
+        kill_group(pid);
+    }
+    let status = if pinned {
+        child.wait().ok()
+    } else {
+        child.try_wait().ok().flatten()
     };
-    let stdout = out_t.join().unwrap_or_default();
-    let stderr = err_t.join().unwrap_or_default();
     if let Some(f) = failure {
         return Err(f);
     }
+    // Bounded collection: a descendant that escaped the group (setsid) can
+    // hold the pipes open forever; detach the readers instead of joining.
+    let drain_by = Instant::now() + READER_GRACE;
+    let (mut stdout, mut stderr) = (None, None);
+    while stdout.is_none() || stderr.is_none() {
+        let left = drain_by.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(left) {
+            Ok((true, b)) => stdout = Some(b),
+            Ok((false, b)) => stderr = Some(b),
+            Err(_) => return Err(RunError::Timeout),
+        }
+    }
+    let (stdout, stderr) = (stdout.unwrap_or_default(), stderr.unwrap_or_default());
     if out_over.load(Ordering::Relaxed) {
         return Err(RunError::Truncated);
     }
@@ -206,16 +245,7 @@ pub fn redact(stderr: &str) -> String {
         let cleaned: Vec<String> = line
             .split_whitespace()
             .map(|w| {
-                let t = w.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_');
-                let secret = t.starts_with("ghp_")
-                    || t.starts_with("gho_")
-                    || t.starts_with("ghs_")
-                    || t.starts_with("ghu_")
-                    || t.starts_with("ghr_")
-                    || t.starts_with("github_pat_")
-                    || w.contains("://") && w.contains('@')
-                    || w.to_ascii_lowercase().starts_with("token=");
-                if secret {
+                if word_is_secret(w) {
                     "<redacted>".to_owned()
                 } else {
                     w.to_owned()
@@ -241,94 +271,28 @@ pub fn redact(stderr: &str) -> String {
     out
 }
 
+/// A whitespace-delimited word that carries credential material anywhere in
+/// it: a GitHub token prefix (`GH_TOKEN=ghp_x`, `token:ghp_x`, JSON
+/// `"token":"ghp_x"`), `token=`, or `user:pass@host` credentials with or
+/// without a scheme.
+fn word_is_secret(w: &str) -> bool {
+    const PREFIXES: [&str; 6] = ["ghp_", "gho_", "ghs_", "ghu_", "ghr_", "github_pat_"];
+    let lower = w.to_ascii_lowercase();
+    if PREFIXES.iter().any(|p| lower.contains(p)) || lower.starts_with("token=") {
+        return true;
+    }
+    match w.find('@') {
+        Some(at) => w.contains("://") || w[..at].contains(':'),
+        None => false,
+    }
+}
+
+#[cfg(all(test, unix))]
+mod unix_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn sh(script: &str) -> Command {
-        let mut c = Command::new("sh");
-        c.args(["-c", script]);
-        c
-    }
-
-    fn lim(ms: u64) -> Limits {
-        Limits {
-            timeout: Duration::from_millis(ms),
-            max_stdout: 1024,
-            max_stderr: 64,
-        }
-    }
-
-    #[tokio::test]
-    async fn ok_captures_stdout() {
-        assert_eq!(run(sh("printf hi"), lim(5000)).await.unwrap(), "hi");
-    }
-
-    #[tokio::test]
-    async fn hung_process_times_out_and_group_dies() {
-        let t = Instant::now();
-        let r = run(sh("sleep 30 & sleep 30"), lim(150)).await;
-        assert!(matches!(r, Err(RunError::Timeout)), "{r:?}");
-        assert!(t.elapsed() < Duration::from_secs(5));
-    }
-
-    #[tokio::test]
-    async fn oversized_stdout_is_truncated_error() {
-        let r = run(sh("yes x | head -c 100000; sleep 30"), lim(10_000)).await;
-        assert!(matches!(r, Err(RunError::Truncated)), "{r:?}");
-    }
-
-    #[tokio::test]
-    async fn nonzero_exit_carries_capped_stderr() {
-        let r = run(sh("yes e | head -c 5000 >&2; exit 3"), lim(5000)).await;
-        match r {
-            Err(RunError::Exit { code, stderr }) => {
-                assert_eq!(code, Some(3));
-                assert!(stderr.len() <= 64);
-            }
-            other => panic!("{other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn missing_program_is_not_installed() {
-        let r = run(Command::new("definitely-not-a-real-gh-binary"), lim(1000)).await;
-        assert!(matches!(r, Err(RunError::NotInstalled)), "{r:?}");
-    }
-
-    #[test]
-    fn cancel_flag_kills_run() {
-        let cancel = Arc::new(AtomicBool::new(false));
-        let c2 = cancel.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(100));
-            c2.store(true, Ordering::Relaxed);
-        });
-        let t = Instant::now();
-        let r = run_blocking(sh("sleep 30"), lim(20_000), &cancel);
-        assert!(matches!(r, Err(RunError::Cancelled)), "{r:?}");
-        assert!(t.elapsed() < Duration::from_secs(5));
-    }
-
-    #[tokio::test]
-    async fn concurrency_is_bounded() {
-        let dir = tempfile::tempdir().unwrap();
-        let log = dir.path().join("log");
-        let script = format!("echo s >> {p}; sleep 0.3; echo e >> {p}", p = log.display());
-        let mut hs = vec![];
-        for _ in 0..(MAX_CONCURRENT * 2) {
-            hs.push(tokio::spawn(run(sh(&script), lim(10_000))));
-        }
-        for h in hs {
-            h.await.unwrap().unwrap();
-        }
-        let (mut live, mut peak) = (0i32, 0i32);
-        for l in std::fs::read_to_string(&log).unwrap().lines() {
-            live += if l == "s" { 1 } else { -1 };
-            peak = peak.max(live);
-        }
-        assert!(peak <= MAX_CONCURRENT as i32, "peak {peak}");
-    }
 
     #[test]
     fn redact_strips_tokens_and_caps() {
@@ -340,5 +304,31 @@ mod tests {
         );
         assert!(r.contains("error using"));
         assert!(redact(&"a ".repeat(1000)).chars().count() <= 401);
+    }
+
+    #[test]
+    fn redact_covers_embedded_and_schemeless_shapes() {
+        for bad in [
+            "GH_TOKEN=ghp_secret1",
+            "token:ghp_secret2",
+            "{\"token\":\"ghp_secret3\"}",
+            "x-access-token:ghs_secret4@github.com",
+            "user:hunter2@host.example",
+            "see github_pat_secret5.",
+            "ghr_secret6,",
+            "(gho_secret7)",
+            "TOKEN=plain",
+        ] {
+            let r = redact(&format!("failed {bad} now"));
+            assert!(r.contains("<redacted>"), "{bad} -> {r}");
+            assert!(
+                !r.contains("secret") && !r.contains("hunter2") && !r.contains("plain"),
+                "{bad} -> {r}"
+            );
+            assert!(r.contains("failed") && r.contains("now"), "{r}");
+        }
+        // Not credentials.
+        let ok = redact("git@github.com: permission denied for o/r");
+        assert!(!ok.contains("<redacted>"), "{ok}");
     }
 }
