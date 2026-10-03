@@ -4051,8 +4051,11 @@ pub struct ForwardConfig {
     /// newly-bound listening ports).
     #[schemars(range(max = "crate::time_policy::MAX_CADENCE_SECS"))]
     pub poll_secs: u64,
-    /// Browser command for the "open in browser" action. Empty ⇒ `$BROWSER`,
-    /// then `xdg-open`/`open`.
+    /// Browser command for the "open in browser" action and `open_on_detect`:
+    /// an argv template with quoted args and a `%s` placeholder (the URL is
+    /// appended if absent); no shell. An explicit value is final (no fallback).
+    /// Empty ⇒ `$BROWSER` (a ':'-separated fallback list), then the OS opener
+    /// (`xdg-open`/`open`/`rundll32`). Only http/https URLs are opened.
     pub browser: String,
     /// Open the browser automatically when a new forward comes up.
     pub open_on_detect: bool,

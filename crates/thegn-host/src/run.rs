@@ -19821,7 +19821,7 @@ async fn event_loop<T: Terminal>(
                                         &url,
                                         &current_config.forward.browser,
                                     ),
-                                    || format!("Opened {url} in browser"),
+                                    || "Opened preview in browser".to_string(),
                                 );
                             } else {
                                 model.status = "No preview selected".into();
@@ -19838,7 +19838,7 @@ async fn event_loop<T: Terminal>(
                                 Some(url) => {
                                     model.status = crate::actions::open_status(
                                         open_url_detached(&url),
-                                        || format!("Opened {url} in browser"),
+                                        || "Opened share link in browser".to_string(),
                                     );
                                 }
                                 None => model.status = "No share URL to open".into(),

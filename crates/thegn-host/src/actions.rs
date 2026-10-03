@@ -318,18 +318,28 @@ impl OpenError {
     }
 }
 
-/// The OS "open this URL" command: `open` on macOS, `explorer` on Windows (one
-/// argument, hands the URL to the protocol handler; `cmd /c start` would need an
-/// empty title argument), `xdg-open` elsewhere.
+/// The OS "open this URL" argv template (URL appended by `build_argv`): `open`
+/// on macOS, `rundll32 url.dll,FileProtocolHandler` on Windows (the URL is one
+/// argv element; `explorer` parses commas in its argument as switch
+/// separators, which an untrusted URL could abuse), `xdg-open` elsewhere.
 fn os_opener() -> Vec<String> {
-    let bin = if cfg!(target_os = "macos") {
-        "open"
+    os_opener_for(if cfg!(target_os = "macos") {
+        "macos"
     } else if cfg!(target_os = "windows") {
-        "explorer"
+        "windows"
     } else {
-        "xdg-open"
+        "other"
+    })
+}
+
+/// Pure argv builder behind [`os_opener`], keyed by a platform tag.
+fn os_opener_for(platform: &str) -> Vec<String> {
+    let argv: &[&str] = match platform {
+        "macos" => &["open"],
+        "windows" => &["rundll32", "url.dll,FileProtocolHandler"],
+        _ => &["xdg-open"],
     };
-    vec![bin.to_string()]
+    argv.iter().map(|s| (*s).to_string()).collect()
 }
 
 /// Ordered argv templates to try. An explicit `browser` (`[forward] browser`)
@@ -1867,6 +1877,17 @@ impl CiActionCtx<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn windows_opener_uses_fileprotocolhandler_with_url_as_one_arg() {
+        let tpl = os_opener_for("windows");
+        assert_eq!(tpl, vec!["rundll32", "url.dll,FileProtocolHandler"]);
+        let argv = thegn_core::url_launch::build_argv(&tpl, "https://a.test/x?a=1,2");
+        assert_eq!(argv.len(), 3);
+        assert_eq!(argv[2], "https://a.test/x?a=1,2");
+        assert_eq!(os_opener_for("macos"), vec!["open"]);
+        assert_eq!(os_opener_for("linux"), vec!["xdg-open"]);
+    }
 
     #[test]
     fn opener_candidates_follow_the_documented_order() {
