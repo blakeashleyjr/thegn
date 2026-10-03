@@ -17,10 +17,16 @@
 # SHRINK-ONLY. Enforced by `platform_cfgs_are_pinned` in
 # crates/thegn-svc/src/platform_ratchet_tests.rs; `just ratchet-update`.
 
+# issue/gh_run.rs and issue/github.rs: each carries a single
+# `#[cfg(all(test, unix))] mod …;` that gates the fake-`gh`/`sh` test modules
+# (they need `sh`, executable bits and process groups). No production logic
+# is cfg'd; the runner itself calls plugin/proc.rs for the per-OS parts.
 calendar/tests.rs
 git/background_commit.rs
 git/commit.rs
 ipc.rs
+issue/gh_run.rs
+issue/github.rs
 plugin/proc.rs
 share/tests.rs
 vpn/tests.rs
