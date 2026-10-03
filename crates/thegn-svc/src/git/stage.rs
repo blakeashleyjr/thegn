@@ -7,7 +7,7 @@
 //! re-hydrates (lazygit behavior).
 
 use super::{GitBackend, run_stdin, run_w};
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use thegn_core::patch::{Selection, parse_patch, transform};
 use thegn_core::remote::GitLoc;
 
@@ -82,7 +82,19 @@ pub trait StageOps: GitBackend {
         // means removing it (index + worktree), same net effect as `clean` on
         // its untracked form. Probe HEAD first so a genuine checkout failure
         // is never "recovered" by deleting the file.
-        let in_head = run_w(loc, &[], &["cat-file", "-e", &format!("HEAD:{path}")]).is_ok();
+        // Only a successful read that finds nothing selects removal; any
+        // execution/repository/object error refuses (fail closed). `ls-tree`
+        // exits 0 with empty output for an absent path, unlike `cat-file -e`
+        // whose exit 128 is shared by a missing path and a broken repository.
+        run_w(
+            loc,
+            &[],
+            &["rev-parse", "--verify", "--quiet", "HEAD^{commit}"],
+        )
+        .context("HEAD unreadable; refusing discard")?;
+        let in_head = !run_w(loc, &[], &["ls-tree", "-z", "HEAD", "--", path])
+            .context("could not read HEAD tree; refusing discard")?
+            .is_empty();
         if in_head {
             run_w(loc, &[], &["checkout", "HEAD", "--", path]).map(|_| ())
         } else {
@@ -321,6 +333,45 @@ mod tests {
         );
         CliGit.discard_file(&loc, "u.txt", true).unwrap();
         assert!(!repo.dir.join("u.txt").exists());
+        assert!(CliGit.status(&loc).unwrap().is_empty());
+    }
+
+    #[test]
+    fn discard_file_refuses_when_head_is_unreadable() {
+        let repo = TestRepo::new("discard-unknown");
+        repo.commit_file("t.txt", "original\n", "base");
+        std::fs::write(repo.dir.join("t.txt"), "precious\n").unwrap();
+        // Break HEAD's tree object: the probe now errors instead of reporting
+        // "absent", which used to select `git rm -f` and delete the file.
+        let tree = repo.out(&["rev-parse", "HEAD^{tree}"]);
+        let tree = tree.trim();
+        let obj = repo
+            .dir
+            .join(".git/objects")
+            .join(&tree[..2])
+            .join(&tree[2..]);
+        let mut perm = std::fs::metadata(&obj).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        perm.set_readonly(false);
+        std::fs::set_permissions(&obj, perm).unwrap();
+        std::fs::remove_file(&obj).unwrap();
+        let loc = repo.loc();
+        assert!(CliGit.discard_file(&loc, "t.txt", false).is_err());
+        assert_eq!(
+            std::fs::read_to_string(repo.dir.join("t.txt")).unwrap(),
+            "precious\n"
+        );
+    }
+
+    #[test]
+    fn discard_file_removes_a_staged_new_file() {
+        let repo = TestRepo::new("discard-staged-new");
+        repo.commit_file("t.txt", "x\n", "base");
+        std::fs::write(repo.dir.join("n.txt"), "new\n").unwrap();
+        repo.out(&["add", "n.txt"]);
+        let loc = repo.loc();
+        CliGit.discard_file(&loc, "n.txt", false).unwrap();
+        assert!(!repo.dir.join("n.txt").exists());
         assert!(CliGit.status(&loc).unwrap().is_empty());
     }
 

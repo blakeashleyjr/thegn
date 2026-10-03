@@ -1152,14 +1152,18 @@ fn run_fold_admitted(
         }
         // Re-read the tip each round so a CAS retry folds onto the moved branch.
         let base = CliGit.rev_parse(&loc, &target_ref)?;
-        let to_fold: Vec<Branch> = candidates
-            .iter()
-            // Skip branches bisect held back, and ones already in the target
-            // (an already-merged tip would otherwise produce a no-op merge commit).
-            .filter(|b| !excluded.contains(&b.name))
-            .filter(|b| !util::git_ok(repo_root, &["merge-base", "--is-ancestor", &b.tip, &base]))
-            .cloned()
-            .collect();
+        // Skip branches bisect held back, and ones already in the target
+        // (an already-merged tip would otherwise produce a no-op merge commit).
+        // An unknown ancestry probe aborts before any fold: it is neither "in"
+        // nor "not in" the target.
+        let mut to_fold: Vec<Branch> = Vec::new();
+        for b in candidates.iter().filter(|b| !excluded.contains(&b.name)) {
+            match util::git_is_ancestor(repo_root, &b.tip, &base) {
+                Some(true) => {}
+                Some(false) => to_fold.push(b.clone()),
+                None => anyhow::bail!("ancestry of a candidate branch is unknown; nothing folded"),
+            }
+        }
         let attempted: Vec<String> = to_fold.iter().map(|branch| branch.name.clone()).collect();
         let plan = match fold::fold(&adapter, &base, to_fold, &cfg.regenerate_paths, &opts) {
             Ok(p) => p,
@@ -1533,10 +1537,9 @@ fn attempt_land_admitted(
         source_history.revalidate()?;
         let base = CliGit.rev_parse(&loc, &target_ref)?;
         let branch_tip = CliGit.rev_parse(&loc, &branch_ref)?;
-        if util::git_ok(
-            repo_root,
-            &["merge-base", "--is-ancestor", &branch_tip, &base],
-        ) {
+        let already_landed = util::git_is_ancestor(repo_root, &branch_tip, &base)
+            .context("ancestry of the branch is unknown; nothing folded")?;
+        if already_landed {
             adapter.history.revalidate()?;
             source_history.revalidate()?;
             return Ok(AttemptOutcome::UpToDate {
