@@ -4,7 +4,7 @@
 //! before applying.
 
 use super::{GitBackend, run_w};
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use thegn_core::reflog::{OurMarks, UndoPlan, plan_redo, plan_undo};
 use thegn_core::remote::GitLoc;
 
@@ -31,7 +31,11 @@ pub trait UndoOps: GitBackend {
                 Ok(None)
             }
             UndoPlan::HardResetTo { sha, .. } => {
-                let dirty = self.is_dirty(loc).unwrap_or(false);
+                // Unknown dirtiness must never read as clean: that would skip the
+                // requested autostash and let `reset --hard` discard the work.
+                let dirty = self
+                    .is_dirty(loc)
+                    .context("worktree state unknown; refusing hard reset")?;
                 if dirty && autostash {
                     run_w(
                         loc,
@@ -43,7 +47,17 @@ pub trait UndoOps: GitBackend {
                 if dirty && autostash {
                     // Pop even when the reset failed; a pop conflict surfaces
                     // through the normal conflict UX.
-                    let _ = run_w(loc, &[], &["stash", "pop"]); // best-effort: pop may conflict; the caller owns the outcome
+                    if let Err(pop) = run_w(loc, &[], &["stash", "pop"]) {
+                        // The stash is kept; say so rather than losing track of it.
+                        return match reset {
+                            Err(e) => Err(e.context(format!(
+                                "stash pop also failed ({pop}); your changes remain in the stash"
+                            ))),
+                            Ok(_) => Err(pop.context(
+                                "reset succeeded but stash pop failed; your changes remain in the stash",
+                            )),
+                        };
+                    }
                 }
                 reset?;
                 Ok(Some(sha.clone()))
@@ -159,6 +173,30 @@ mod tests {
         assert!(
             CliGit.stash_list(&loc).unwrap().is_empty(),
             "the autostash was popped, not left behind"
+        );
+    }
+
+    #[test]
+    fn undo_apply_refuses_when_dirtiness_is_unknown() {
+        let repo = TestRepo::new("un-unknown-dirty");
+        ident(&repo.dir);
+        repo.commit_file("f.txt", "one\n", "c1");
+        repo.commit_file("f.txt", "two\n", "c2");
+        std::fs::write(repo.dir.join("f.txt"), "precious\n").unwrap();
+        let loc = repo.loc();
+        let plan = CliGit.undo_plan(&loc, &OurMarks::default()).unwrap();
+        let head = repo.head();
+        // A corrupt index makes the status read fail; that must not read as clean.
+        std::fs::write(repo.dir.join(".git/index"), b"garbage").unwrap();
+        let err = CliGit.undo_apply(&loc, &plan, true).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("refusing hard reset"),
+            "{err:#}"
+        );
+        assert_eq!(repo.head(), head, "no reset ran");
+        assert_eq!(
+            std::fs::read_to_string(repo.dir.join("f.txt")).unwrap(),
+            "precious\n"
         );
     }
 
