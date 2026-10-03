@@ -110,6 +110,27 @@ pub fn decide(
     }
 }
 
+/// The `$HOME` confidentiality gate (THE-215). A sealed profile promises the host
+/// `$HOME` is not readable; a launch whose resolved spec would expose it — a
+/// backend with no filesystem boundary (host process, Windows), `file_access =
+/// "all"`/`"host"`, or a `[sandbox] mounts` entry covering `$HOME` — must be
+/// **refused**, never run with a quietly weaker `sealed`. Returns the miss
+/// message, or `None` when the spec is not sealed or hides `$HOME`.
+pub fn home_gate(spec: &crate::sandbox::SandboxSpec) -> Option<String> {
+    use crate::sandbox_mounts::{HomeView, home_view};
+    let home = spec.seal_home.as_deref()?;
+    let view = home_view(spec, std::path::Path::new(home));
+    (view != HomeView::Hidden).then(|| {
+        format!(
+            "sealed profile requires a hidden $HOME, but the `{}` launch would leave it {} — \
+             use a bwrap/systemd/OCI backend, `file_access = \"worktree\"`, and no `[sandbox] \
+             mounts` entry covering $HOME (see `thegn doctor`)",
+            spec.backend.label(),
+            view.as_str(),
+        )
+    })
+}
+
 /// How an opt-in agent/queue task's floor decision maps onto queue-entry state.
 /// The load-bearing rule (the merge-guard doctrine): a fail-closed floor miss or
 /// a sandbox setup failure is an **infrastructure** failure — the entry is

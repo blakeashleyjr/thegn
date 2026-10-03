@@ -3344,6 +3344,36 @@ fn enforcement_matrix_report(cfg: &Config) {
         );
     }
     floor_report(cfg);
+    home_report(cfg);
+}
+
+/// The `$HOME` confidentiality line (THE-215): whether the host `$HOME` is hidden,
+/// read-only-visible, or writable for the launch this host would pick under the
+/// configured profile. Read-only is NOT confidential — only `hidden` is.
+fn home_report(cfg: &Config) {
+    use thegn_core::sandbox_mounts::{HomeView, planned_home_view};
+    let report = thegn_core::sandbox_support::support_report(
+        &shell_chain(cfg),
+        &Placement::Local,
+        cfg_oci_runtime(cfg),
+    );
+    let backend = thegn_core::sandbox_support::first_ready(&report)
+        .map(|r| r.backend)
+        .unwrap_or(Backend::None);
+    let profile = cfg.sandbox.profile;
+    let view = planned_home_view(profile, backend);
+    let note = match view {
+        HomeView::Hidden => "private tmpfs + reviewed read-only allowlist",
+        HomeView::ReadOnly => "whole host $HOME readable (integrity only, not confidential)",
+        HomeView::Writable => "whole host $HOME readable AND writable",
+    };
+    outln!("  home          {} — {note}", view.as_str());
+    if profile.hides_home() && view != HomeView::Hidden {
+        outln!(
+            "                MISSED: profile `{}` demands a hidden $HOME; this host would refuse to launch it",
+            profile.as_str()
+        );
+    }
 }
 
 /// The isolation floor line: the demanded minimum, the miss policy, and whether

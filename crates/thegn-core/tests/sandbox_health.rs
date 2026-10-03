@@ -55,6 +55,7 @@ fn base_spec(name: &str) -> SandboxSpec {
         oci_host: None,
         oci_runtime: None,
         daemon_persistent: false,
+        seal_home: None,
     }
 }
 

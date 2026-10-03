@@ -555,6 +555,12 @@ pub struct SandboxSpec {
     /// ephemeral in-process chrome panes (pins/drawer) leave it `false` so they
     /// still die with the compositor. Only affects the bwrap backend.
     pub daemon_persistent: bool,
+    /// `Some(home)` when the profile demands a **confidential** `$HOME` (sealed
+    /// tiers, THE-215), holding the host `$HOME` path to hide: it is replaced by a private tmpfs holding only an explicit
+    /// read-only allowlist ([`crate::sandbox_mounts::sealed_home_allowlist`]),
+    /// never mounted wholesale. A backend that cannot honor this is refused by
+    /// [`crate::sandbox_floor::home_gate`] rather than silently exposing `$HOME`.
+    pub seal_home: Option<String>,
 }
 
 /// Why a programmatic/configured named volume was refused. The error carries
@@ -909,6 +915,21 @@ fn resolve_placed_with(
     // `profile = "open"` → rw $HOME as the escape hatch. Writes tools genuinely
     // need (zsh history, zoxide, atuin) are carved back narrowly below.
     let home_ro = backend.is_oci() || profile.read_only_root();
+    // THE-215: sealed tiers never see the ambient $HOME. They get a private
+    // tmpfs $HOME (bwrap `--tmpfs`, systemd `ProtectHome=tmpfs`; OCI simply
+    // never mounts it) plus a reviewed read-only allowlist — read-only is
+    // integrity isolation, not confidentiality, so it is not enough here.
+    let seal_home: Option<String> = profile
+        .hides_home()
+        .then(|| std::env::var("HOME").unwrap_or_default())
+        .filter(|h| !h.is_empty());
+    let host_toolchain = || {
+        if seal_home.is_some() {
+            crate::sandbox_mounts::host_toolchain_mounts_sealed_home()
+        } else {
+            host_toolchain_mounts_ro_home(home_ro)
+        }
+    };
 
     // Emit the host-toolchain substrate (ro $HOME) BEFORE the worktree/caches so
     // the read-write worktree, git dir, and caches — which live *under* $HOME —
@@ -925,13 +946,13 @@ fn resolve_placed_with(
         }
         FileAccess::Worktree => {
             if inject_host_toolchain {
-                mounts.extend(host_toolchain_mounts_ro_home(home_ro));
+                mounts.extend(host_toolchain());
             }
             add_worktree_mounts(&mut mounts);
         }
         FileAccess::WorktreePlusCaches => {
             if inject_host_toolchain {
-                mounts.extend(host_toolchain_mounts_ro_home(home_ro));
+                mounts.extend(host_toolchain());
             }
             add_worktree_mounts(&mut mounts);
             if cfg.auto_caches {
@@ -946,12 +967,30 @@ fn resolve_placed_with(
     // state (history, zoxide, atuin) and a personal scratch dir keep working.
     // Only when $HOME was actually injected read-only: `all`/`host` are already
     // fully writable, and `custom`/`none` withhold $HOME entirely.
-    if inject_host_toolchain && home_ro {
+    // Sealed: `$HOME` is a private tmpfs, so there is no host state to carve
+    // back (and `.local/{state,share}` hold the credentials we are hiding).
+    if inject_host_toolchain && home_ro && seal_home.is_none() {
         for cv in default_writable_carveouts(profile) {
             if keep_cfg_mount(&mounts, &cv) {
                 mounts.push(cv);
             }
         }
+    }
+
+    // systemd does not consume the toolchain substrate (it sees the host fs), so
+    // its sealed `$HOME` allowlist is added here; `ProtectHome=tmpfs` hides the
+    // rest and the argv builder binds these back in.
+    if let Some(home) = &seal_home
+        && backend.profile().family == BackendFamily::Systemd
+        && cfg.auto_caches
+        && matches!(
+            cfg.file_access,
+            FileAccess::Worktree | FileAccess::WorktreePlusCaches
+        )
+    {
+        mounts.extend(crate::sandbox_mounts::sealed_home_allowlist(
+            std::path::Path::new(home),
+        ));
     }
 
     for m in &cfg.mounts {
@@ -977,7 +1016,7 @@ fn resolve_placed_with(
     // read-only at their symlink-target paths so the $HOME-mounted symlinks
     // resolve in-sandbox. Local placements only (paths are probed on this
     // host); gated exactly like the toolchain mounts that expose $HOME.
-    if inject_host_toolchain && placement.is_local() {
+    if inject_host_toolchain && placement.is_local() && seal_home.is_none() {
         let mut covered: Vec<String> = mounts.iter().map(|m| m.dest.clone()).collect();
         if backend == Backend::Bwrap {
             covered.extend(BWRAP_SUBSTRATE.iter().map(|s| s.to_string()));
@@ -1137,6 +1176,7 @@ fn resolve_placed_with(
         // daemon-routed center tab or an ephemeral chrome pane. The pane owner
         // (the host's launch-spec builder) flips it on for daemon-backed panes.
         daemon_persistent: false,
+        seal_home,
     })
 }
 
@@ -2143,6 +2183,14 @@ fn backend_enter_argv(spec: &SandboxSpec, script: &str) -> Vec<String> {
             if spec.file_access != FileAccess::None {
                 v.extend(["--chdir".into(), wt]);
             }
+            // Sealed: a private tmpfs `$HOME` BEFORE any mount, so the allowlist,
+            // worktree and caches (all path-preserving, mostly under `$HOME`)
+            // land inside it and nothing else of the host `$HOME` exists.
+            if let Some(home) = &spec.seal_home
+                && !matches!(spec.file_access, FileAccess::All | FileAccess::Host)
+            {
+                v.extend(["--tmpfs".into(), home.clone()]);
+            }
             for m in &spec.mounts {
                 // Skip mounts already covered by a hardcoded parent — bwrap
                 // cannot create a mount-point inside a read-only bind.
@@ -2233,9 +2281,25 @@ fn backend_enter_argv(spec: &SandboxSpec, script: &str) -> Vec<String> {
             // PrivateTmp=yes already gives a writable /tmp.
             if spec.read_only_root {
                 v.extend(["-p".into(), "ProtectSystem=yes".into()]);
-                v.extend(["-p".into(), "ProtectHome=read-only".into()]);
+                let sealed_home = spec.seal_home.is_some();
+                let under_home = |dest: &str| {
+                    spec.seal_home
+                        .as_deref()
+                        .is_some_and(|h| std::path::Path::new(dest).starts_with(h))
+                };
+                // Sealed: `ProtectHome=tmpfs` leaves an empty `$HOME`; the
+                // allowlist, worktree and caches are bound back in below.
+                let protect_home = if sealed_home { "tmpfs" } else { "read-only" };
+                v.extend(["-p".into(), format!("ProtectHome={protect_home}")]);
                 for m in &spec.mounts {
-                    if !m.ro {
+                    if under_home(&m.dest) {
+                        let flag = if m.ro {
+                            "BindReadOnlyPaths"
+                        } else {
+                            "BindPaths"
+                        };
+                        v.extend(["-p".into(), format!("{flag}={}:{}", m.host, m.dest)]);
+                    } else if !m.ro {
                         v.extend(["-p".into(), format!("ReadWritePaths={}", m.dest)]);
                     }
                 }
@@ -2252,8 +2316,10 @@ fn backend_enter_argv(spec: &SandboxSpec, script: &str) -> Vec<String> {
                 } else {
                     SandboxProfile::Hardened
                 };
-                for cv in default_writable_carveouts(carve_profile) {
-                    v.extend(["-p".into(), format!("ReadWritePaths={}", cv.dest)]);
+                if !sealed_home {
+                    for cv in default_writable_carveouts(carve_profile) {
+                        v.extend(["-p".into(), format!("ReadWritePaths={}", cv.dest)]);
+                    }
                 }
             }
             if spec.no_new_privileges {
