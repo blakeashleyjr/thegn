@@ -49,7 +49,25 @@ inline_plan="$(just --dry-run start term 2>&1)"
   echo "$inline_plan" >&2
   exit 1
 }
+# shellcheck disable=SC2016 # literal match
+[[ $start_plan == *'inst_record "$pidfile"'* ]] || {
+  echo "start-term's ghostty child must record its generation via inst_record" >&2
+  exit 1
+}
+for recipe in start-dev start-mq; do
+  r_plan="$(just --dry-run "$recipe" dev 2>&1)"
+  # shellcheck disable=SC2016 # literal match
+  [[ $r_plan == *'inst_restart "$pidfile" $$'* && $r_plan != *'kill "$(cat'* && $r_plan != *pkill* ]] || {
+    echo "$recipe must restart via the identity-checked helper" >&2
+    exit 1
+  }
+done
 release_plan="$(just --dry-run start-term-release dev 2>&1)"
+# shellcheck disable=SC2016 # literal match
+[[ $release_plan == *'inst_record "$pidfile"'* ]] || {
+  echo "start-term-release's ghostty child must record its generation via inst_record" >&2
+  exit 1
+}
 # shellcheck disable=SC2016 # literal match of the forbidden shell text
 [[ $release_plan != *pkill* && $release_plan == *'inst_rotate_scoped "$state"'* ]] || {
   echo "start-term-release must rotate daemons scoped to its state root, not pkill -f" >&2
