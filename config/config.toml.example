@@ -4333,7 +4333,7 @@ rerere = false                # enable git rerere in the reused gate worktree an
 agent_max_attempts = 2        # agent-dispatch → re-fold cycles before marking a branch "needs_human".
                               # The budget belongs to the BRANCH and is persisted, so a later drain
                               # doesn't spend it again; `thegn merge retry` re-arms a row.
-agent_timeout_secs = 900      # watchdog per agent invocation; 0 disables
+agent_timeout_secs = 900      # watchdog per agent invocation; 0 = 6-hour ceiling (not unbounded), >30 days clamps
 #
 # Run the fixing agent INSIDE the resolved sandbox (default: host + the shared
 # resource slice, so it keeps host credentials/keychains). A queue handoff runs a
@@ -4452,7 +4452,7 @@ watch = ["ci", "conflict", "review"]   # which blocker classes may wake the agen
 agent = ""                    # e.g. "claude" — an [[agents]] name
 agent_command = ""            # e.g. 'claude -p {prompt}'; overrides `agent`
 agent_max_attempts = 2        # agent-dispatch cycles per PR before it is marked "needs_human"
-agent_timeout_secs = 900      # watchdog per agent invocation; 0 disables
+agent_timeout_secs = 900      # watchdog per agent invocation; 0 = 6-hour ceiling (not unbounded), >30 days clamps
 #
 # Run the fixing agent INSIDE the resolved sandbox (default: host + the shared
 # resource slice, so it keeps host credentials/keychains — a forge token, an ssh

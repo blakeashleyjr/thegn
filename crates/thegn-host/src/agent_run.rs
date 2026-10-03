@@ -9,7 +9,7 @@
 //! * a login shell, so an npm-global `claude` is on PATH with the user's creds,
 //!   exactly like an interactive agent pane;
 //! * its own process group/job, so completion is defined over the agent's whole
-//!   tree and the deadline reaps it ([`bounded`]);
+//!   tree and the deadline reaps it (`bounded`, unix only);
 //! * stdout/stderr drained to EOF on threads (a chatty agent must not deadlock
 //!   or SIGPIPE on a full pipe), only a bounded tail retained — this runs off
 //!   the compositor;
@@ -174,16 +174,47 @@ pub(crate) fn run(task: &AgentTaskRun<'_>) -> bool {
         bounded::effective_timeout(task.timeout_secs),
         &NEVER,
     );
-    match &result.outcome {
-        bounded::AgentRunOutcome::Exited(_) => {}
-        other => tracing::warn!(
+    let stderr_tail = {
+        let t = &result.stderr.tail;
+        let from = t.len().saturating_sub(2048);
+        String::from_utf8_lossy(&t[from..]).into_owned()
+    };
+    let outcome = &result.outcome;
+    let error = match outcome {
+        bounded::AgentRunOutcome::Spawn(e) | bounded::AgentRunOutcome::Reap(e) => {
+            Some(e.to_string())
+        }
+        _ => None,
+    };
+    match outcome {
+        bounded::AgentRunOutcome::TimedOut
+        | bounded::AgentRunOutcome::Unsettled
+        | bounded::AgentRunOutcome::Spawn(_)
+        | bounded::AgentRunOutcome::Reap(_) => tracing::warn!(
             target: "thegn::agent",
             kind = %task.kind,
-            outcome = ?other,
-            infrastructure = other.is_infrastructure(),
+            outcome = ?outcome,
+            error = error.as_deref().unwrap_or(""),
+            infrastructure = outcome.is_infrastructure(),
             stdout_bytes = result.stdout.total,
+            stdout_truncated = result.stdout.truncated,
             stderr_bytes = result.stderr.total,
+            stderr_truncated = result.stderr.truncated,
+            stderr_tail = %stderr_tail,
             "agent run did not complete cleanly"
+        ),
+        _ => tracing::debug!(
+            target: "thegn::agent",
+            kind = %task.kind,
+            outcome = ?outcome,
+            error = error.as_deref().unwrap_or(""),
+            infrastructure = outcome.is_infrastructure(),
+            stdout_bytes = result.stdout.total,
+            stdout_truncated = result.stdout.truncated,
+            stderr_bytes = result.stderr.total,
+            stderr_truncated = result.stderr.truncated,
+            stderr_tail = %stderr_tail,
+            "agent run finished"
         ),
     }
     result.outcome.success()
@@ -214,6 +245,12 @@ pub(crate) mod bounded {
     pub(crate) const AGENT_CEILING: Duration = Duration::from_secs(6 * 60 * 60);
     /// No configured deadline may exceed this (also keeps `Instant` math safe).
     const MAX_TIMEOUT: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+    /// After the LEADER exits, how long the rest of its group may keep running
+    /// before it is terminated: a leftover sccache server / watcher / fsmonitor
+    /// must not hold the queue claim for the whole timeout. Capped by the
+    /// overall deadline. (Non-Linux `live_members` falls back to
+    /// `!group.is_empty()`, so there the full window always elapses first.)
+    pub(crate) const QUIESCE_AFTER_LEADER: Duration = Duration::from_secs(15);
     /// SIGTERM-to-SIGKILL grace for the group at the deadline.
     const TERM_GRACE: Duration = Duration::from_secs(2);
     /// How long to wait for the group (and the leader) to settle after SIGKILL.
@@ -383,15 +420,26 @@ pub(crate) mod bounded {
     }
 
     /// Spawn `cmd` in its own group and run it to a bounded, fully reaped end.
-    /// Wall clock is at most `timeout` plus the fixed cleanup bound
-    /// (`TERM_GRACE + KILL_SETTLE + READER_GRACE`, ~3.5s).
+    /// Wall clock is at most `timeout` plus the cleanup bound: the group
+    /// TERM/KILL phases (`TERM_GRACE + KILL_SETTLE`), the leader reap
+    /// (`KILL_SETTLE`), `READER_GRACE`, and /proc scan polling; realistically
+    /// about 5s worst case.
+    pub(crate) fn run_bounded(
+        cmd: &mut Command,
+        timeout: Duration,
+        cancel: &AtomicBool,
+    ) -> AgentRun {
+        run_bounded_with(cmd, timeout, QUIESCE_AFTER_LEADER, cancel)
+    }
+
     #[expect(
         clippy::disallowed_methods,
         reason = "every wait follows a confirmed exit or a group kill"
     )]
-    pub(crate) fn run_bounded(
+    fn run_bounded_with(
         cmd: &mut Command,
         timeout: Duration,
+        quiesce: Duration,
         cancel: &AtomicBool,
     ) -> AgentRun {
         let (mut child, group) = match crate::platform::spawn_grouped(cmd) {
@@ -437,8 +485,9 @@ pub(crate) mod bounded {
         match &stop {
             Stop::LeaderExited => {
                 let mut backoff = POLL_INTERVAL;
+                let drain_deadline = exec_deadline.min(Instant::now() + quiesce);
                 while live_members(&group, pgid) {
-                    let remaining = exec_deadline.saturating_duration_since(Instant::now());
+                    let remaining = drain_deadline.saturating_duration_since(Instant::now());
                     if cancel.load(Ordering::Acquire) {
                         cancelled_late = true;
                     }
@@ -454,7 +503,10 @@ pub(crate) mod bounded {
                     backoff = next_backoff(backoff, remaining);
                 }
             }
-            _ => settled = terminate_group(&group, pgid),
+            // Waiting on the leader failed (ECHILD etc.): the pgid is no longer
+            // pinned, so do NOT signal the group; just report the outcome.
+            Stop::Supervise(_) => {}
+            Stop::Timeout | Stop::Cancelled => settled = terminate_group(&group, pgid),
         }
 
         // Reap the leader last. After a group SIGKILL it exits promptly; if it
@@ -491,13 +543,13 @@ pub(crate) mod bounded {
         fit_aggregate(&mut stdout, &mut stderr);
 
         let outcome = match (status, stop) {
+            (_, Stop::Supervise(e)) => AgentRunOutcome::Reap(e),
             (None, _) => AgentRunOutcome::Unsettled,
             (Some(Err(e)), _) => AgentRunOutcome::Reap(e),
             (Some(Ok(_)), Stop::Cancelled) => AgentRunOutcome::Cancelled,
             (Some(Ok(_)), Stop::LeaderExited) if cancelled_late => AgentRunOutcome::Cancelled,
             (Some(Ok(_)), Stop::Timeout) if settled => AgentRunOutcome::TimedOut,
             (Some(Ok(_)), Stop::Timeout) => AgentRunOutcome::Unsettled,
-            (Some(Ok(_)), Stop::Supervise(e)) => AgentRunOutcome::Reap(e),
             (Some(Ok(s)), Stop::LeaderExited) => AgentRunOutcome::Exited(s),
         };
         AgentRun {
@@ -606,13 +658,40 @@ pub(crate) mod bounded {
             let dir = tempfile::tempdir().unwrap();
             let pidf = dir.path().join("pid");
             let started = Instant::now();
-            let r = run(
-                &format!("sleep 300 & echo $! > {}; exit 0", pidf.display()),
-                Duration::from_millis(800),
+            let r = run_bounded_with(
+                &mut sh(&format!("sleep 300 & echo $! > {}; exit 0", pidf.display())),
+                Duration::from_secs(60),
+                Duration::from_secs(1),
+                &AtomicBool::new(false),
             );
             assert!(matches!(r.outcome, AgentRunOutcome::Exited(s) if s.success()));
-            assert!(started.elapsed() < Duration::from_secs(8));
+            assert!(started.elapsed() < Duration::from_secs(1) + Duration::from_secs(6));
             assert!(!alive(pid_from(&pidf)), "descendant survived the run");
+        }
+
+        #[test]
+        fn leftover_background_child_is_killed_after_the_quiesce_window() {
+            let dir = tempfile::tempdir().unwrap();
+            let pidf = dir.path().join("pid");
+            let started = Instant::now();
+            let r = run(
+                &format!("sleep 300 & echo $! > {}; exit 0", pidf.display()),
+                Duration::from_secs(120),
+            );
+            assert!(matches!(r.outcome, AgentRunOutcome::Exited(s) if s.success()));
+            let took = started.elapsed();
+            assert!(
+                took >= QUIESCE_AFTER_LEADER - Duration::from_secs(1),
+                "{took:?}"
+            );
+            assert!(
+                took < QUIESCE_AFTER_LEADER + Duration::from_secs(6),
+                "{took:?}"
+            );
+            assert!(
+                !alive(pid_from(&pidf)),
+                "sleeper survived and was not reaped"
+            );
         }
 
         #[test]
@@ -620,15 +699,17 @@ pub(crate) mod bounded {
             let dir = tempfile::tempdir().unwrap();
             let pidf = dir.path().join("pid");
             let started = Instant::now();
-            let r = run(
-                &format!(
+            let r = run_bounded_with(
+                &mut sh(&format!(
                     "(trap '' TERM; while :; do sleep 1; done) & echo $! > {}; exit 0",
                     pidf.display()
-                ),
-                Duration::from_millis(300),
+                )),
+                Duration::from_secs(60),
+                Duration::from_secs(1),
+                &AtomicBool::new(false),
             );
             assert!(matches!(r.outcome, AgentRunOutcome::Exited(_)));
-            assert!(started.elapsed() < Duration::from_secs(10));
+            assert!(started.elapsed() < Duration::from_secs(1) + Duration::from_secs(8));
             assert!(!alive(pid_from(&pidf)));
         }
 
