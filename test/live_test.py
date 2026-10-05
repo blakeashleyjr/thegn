@@ -387,9 +387,12 @@ class LiveTests(unittest.TestCase):
             self.assertIn("--locked", argv)
             self.assertEqual(cwd, self.repo)
             output = Path(env["CARGO_TARGET_DIR"])
-            self.assertEqual(Path(env["CARGO_BUILD_BUILD_DIR"]).parent, output.parent)
-            self.assertNotEqual(output, self.repo / "target")
-            (output / "release").mkdir(parents=True)
+            # One persistent private cache, reused across runs, never the
+            # shared target/ (whose release/thegn IS the installation).
+            self.assertEqual(output, self.repo / "target" / live.LIVE_CACHE)
+            self.assertEqual(Path(env["CARGO_BUILD_BUILD_DIR"]).parent, output)
+            self.assertEqual(env["CARGO_BUILD_JOBS"], str(os.cpu_count() or 1))
+            (output / "release").mkdir(parents=True, exist_ok=True)
             shutil.copy2(self.binary, output / "release/thegn")
 
         with patch.object(live.subprocess, "run", side_effect=build), patch.object(live, "source_revision", side_effect=["a" * 40, "b" * 40]):
@@ -404,12 +407,16 @@ class LiveTests(unittest.TestCase):
 
         def build(argv, cwd, env, check):
             output = Path(env["CARGO_TARGET_DIR"]) / "release/thegn"
-            output.parent.mkdir(parents=True)
+            output.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(self.binary, output)
 
         with patch.object(live, "source_revision", return_value="a" * 40), patch.object(live.subprocess, "run", side_effect=build):
             stage, binary, record = live.build_stage(self.paths, self.env)
             self.assertEqual(record["sha256"], live.digest(binary))
+            # The admitted artifact is a copy in the stage, not the cache's
+            # binary that the next build overwrites.
+            self.assertEqual(binary, stage / "output/release/thegn")
+            self.assertEqual(binary.read_bytes(), b"new executable")
             self.assertEqual(json.loads((stage / "build.json").read_text()), record)
             self.assertEqual(record["observed_revision"], "a" * 40)
             self.assertEqual(record["schema"], 3)
@@ -419,23 +426,6 @@ class LiveTests(unittest.TestCase):
         failed = max((path for path in (self.repo / "target").glob(live.LIVE_STAGE_PREFIX + "*")), key=lambda path: path.lstat().st_mtime_ns)
         self.assertEqual((failed / live.LIVE_STAGE_MARKER).read_bytes(), b"thegn-live-build-v1\n")
         self.assertEqual(self.target.read_bytes(), b"old executable")
-
-    def test_prebuild_preflight_rechecks_and_releases_schema_lease(self):
-        schema_lock = Path(str(self.db) + ".schema.lock")
-        observations = []
-
-        def observe(*_args):
-            observations.append(True)
-            if len(observations) == 2:
-                with self.assertRaisesRegex(live.Refusal, "busy"):
-                    with live.locked(schema_lock, schema=True):
-                        self.fail("Schema lease was not held during the final preflight observation")
-
-        with patch.object(live, "source_revision", return_value="a" * 40), patch.object(live, "quiescent", side_effect=observe):
-            live.prebuild_preflight(self.paths, self.env)
-        self.assertEqual(len(observations), 2)
-        with live.locked(schema_lock, schema=True):
-            pass
 
     def _staged_fixture(self, name, age, marker=True):
         stage = self.repo / "target" / name
@@ -535,8 +525,8 @@ class LiveTests(unittest.TestCase):
         self.assertTrue(swap.exists())
         self.assertTrue(swap.with_name("legacy-stage-replacement").exists())
 
-    def test_plan_and_confirmation_have_no_install_effects(self):
-        with self.private_quiescence(), patch.object(live, "settings", return_value=self.paths), patch.object(live, "source_revision", return_value="a" * 40), patch.object(live, "build_stage") as build:
+    def test_plan_and_refusals_have_no_install_effects(self):
+        with self.private_quiescence(), patch.object(live, "settings", return_value=self.paths), patch.object(live, "source_revision", return_value="a" * 40), patch.object(live, "build_stage") as build, patch.object(live, "thegn_ancestor", return_value=None):
             before = set(self.root.rglob("*"))
             with contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(live.main(["--plan", "--repo", str(self.repo)]), 0)
@@ -545,11 +535,106 @@ class LiveTests(unittest.TestCase):
             with patch.object(live.sys.stdin, "isatty", return_value=False), self.assertRaisesRegex(live.Refusal, "terminal"):
                 live.main(["--repo", str(self.repo)])
             build.assert_not_called()
+            # A new build that rejects the config stops the upgrade before
+            # anything running is touched.
             build.return_value = (self.root, self.binary, self.record)
-            with patch.object(live.sys.stdin, "isatty", return_value=True), patch.object(live.sys.stdout, "isatty", return_value=True), patch("builtins.input", return_value="no"):
-                with self.assertRaisesRegex(live.Refusal, "Not confirmed"):
+            with contextlib.redirect_stdout(io.StringIO()), patch.object(live.sys.stdin, "isatty", return_value=True), patch.object(live.sys.stdout, "isatty", return_value=True), patch.object(live, "validate_config", side_effect=live.Refusal("rejects the configuration")), patch.object(live, "stop_running") as stop:
+                with self.assertRaisesRegex(live.Refusal, "rejects the configuration"):
                     live.main(["--repo", str(self.repo)])
+            stop.assert_not_called()
             self.assertEqual(self.target.read_bytes(), b"old executable")
+
+    def test_inside_thegn_relaunches_instead_of_stopping_itself(self):
+        with patch.object(live, "settings", return_value=self.paths), patch.object(live, "source_revision", return_value="a" * 40), patch.object(live, "thegn_ancestor", return_value=1234), patch.object(live, "relaunch_outside") as relaunch, patch.object(live, "build_stage") as build, patch.object(live, "stop_running") as stop, contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(live.main(["--repo", str(self.repo), "--level", "info"]), 0)
+        relaunch.assert_called_once()
+        self.assertEqual(relaunch.call_args[0][0], ["--repo", str(self.repo), "--level", "info"])
+        build.assert_not_called()
+        stop.assert_not_called()
+
+    def _fake_proc(self, processes):
+        """processes: {pid: (name, ppid, exe or None, argv)}"""
+        proc = self.root / "fake-proc"
+        proc.mkdir(mode=0o700)
+        for pid, (name, ppid, exe, argv) in processes.items():
+            base = proc / str(pid)
+            base.mkdir()
+            (base / "status").write_text(f"Name:\t{name}\nState:\tS (sleeping)\nPPid:\t{ppid}\nUid:\t{os.getuid()}\t{os.getuid()}\t{os.getuid()}\t{os.getuid()}\n")
+            if exe is not None:
+                (base / "exe").symlink_to(exe)
+            (base / "cmdline").write_bytes(b"\0".join(argv) + b"\0")
+        return proc
+
+    def test_thegn_ancestor_walks_the_parent_chain(self):
+        proc = self._fake_proc({40: ("bash", 30, None, [b"bash"]), 30: ("just", 20, None, [b"just"]),
+                                20: ("thegn", 1, None, [b"thegn", b"daemon"]), 50: ("bash", 1, None, [b"bash"])})
+        self.assertEqual(live.thegn_ancestor(proc, start=40), 20)
+        self.assertIsNone(live.thegn_ancestor(proc, start=50))
+        self.assertIsNone(live.thegn_ancestor(proc, start=999))
+
+    def test_target_processes_select_only_this_installations_binary(self):
+        other = self.root / "other-checkout-thegn"
+        other.write_bytes(b"other")
+        other.chmod(0o755)
+        proc = self._fake_proc({11: ("thegn", 1, self.target, [str(self.target).encode()]),
+                                12: ("thegn", 1, self.target, [str(self.target).encode(), b"daemon", b"--socket", b"s"]),
+                                13: ("thegn", 1, other, [str(other).encode()]),
+                                14: ("bash", 1, None, [b"bash"])})
+        self.assertEqual(sorted(live.target_processes(self.target, proc)), [(11, False), (12, True)])
+
+    def test_stop_quits_controllers_first_then_the_daemon(self):
+        alive = {11: False, 12: True}  # pid -> is_daemon
+        events = []
+
+        def scan(*_args):
+            return sorted(alive.items())
+
+        def kill(pid, sig):
+            events.append(("signal", pid, sig))
+            if sig in (live.signal.SIGTERM, live.signal.SIGKILL):
+                alive.pop(pid, None)
+
+        def run(argv, **_kwargs):
+            events.append(("run", argv[1:]))
+            alive.pop(12, None)
+            return subprocess.CompletedProcess(argv, 0, b"pane daemon shutting down\n")
+
+        quiet = lambda paths: None if not alive else (_ for _ in ()).throw(live.Refusal("busy"))
+        with patch.object(live, "target_processes", side_effect=scan), patch.object(live, "quiescent", side_effect=quiet), contextlib.redirect_stdout(io.StringIO()):
+            live.stop_running(self.paths, self.env, sleep=lambda _s: None, run=run, kill=kill)
+        self.assertEqual(events, [("signal", 11, live.signal.SIGTERM), ("run", ["daemon", "stop"])])
+
+    def test_stop_escalates_only_on_target_and_names_foreign_blockers(self):
+        clock = [0.0]
+        signalled = []
+
+        def sleep(seconds):
+            clock[0] += seconds
+
+        def kill(pid, sig):
+            signalled.append((pid, sig))
+
+        def run(argv, **_kwargs):
+            return subprocess.CompletedProcess(argv, 1, b"")
+
+        # The target daemon ignores everything, and the scan keeps refusing:
+        # escalation reaches SIGKILL for the target pid only, then the
+        # refusal names the blocker instead of widening what gets signalled.
+        with patch.object(live, "target_processes", return_value=[(12, True)]), patch.object(live, "quiescent", side_effect=live.Refusal("A controller/daemon is still running (pid 77)")), contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(live.Refusal, "pid 77.*staged build is kept"):
+                live.stop_running(self.paths, self.env, sleep=sleep, now=lambda: clock[0], run=run, kill=kill)
+        self.assertEqual(signalled, [(12, live.signal.SIGTERM), (12, live.signal.SIGKILL)])
+
+    def test_validate_config_refuses_on_nonzero_exit(self):
+        def run(argv, **_kwargs):
+            self.assertEqual(argv[1:], ["config", "validate"])
+            return subprocess.CompletedProcess(argv, 2, b"thegn: config: noise\nconfig.toml: unknown key `bogus`\n")
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), self.assertRaisesRegex(live.Refusal, "nothing was stopped"):
+            live.validate_config(self.binary, self.env, run=run)
+        self.assertIn("unknown key", out.getvalue())
+        self.assertNotIn("noise", out.getvalue())
 
     def test_supervisor_retains_launcher_but_releases_schema_lock(self):
         recovery = self.state / "private-recovery"
@@ -582,7 +667,7 @@ class LiveTests(unittest.TestCase):
                         self.fail("An install lock was not held")
             return recovery
 
-        with self.private_quiescence(), patch.object(live, "settings", return_value=self.paths), patch.object(live, "source_revision", return_value="a" * 40), patch.object(live, "build_stage", return_value=(self.root, self.binary, self.record)), patch.object(live, "install", side_effect=install), patch.object(live.sys.stdin, "isatty", return_value=True), patch.object(live.sys.stdout, "isatty", return_value=True), patch("builtins.input", return_value="INSTALL AND LAUNCH"), patch.object(live.subprocess, "Popen", side_effect=spawn):
+        with contextlib.redirect_stdout(io.StringIO()), self.private_quiescence(), patch.object(live, "settings", return_value=self.paths), patch.object(live, "source_revision", return_value="a" * 40), patch.object(live, "build_stage", return_value=(self.root, self.binary, self.record)), patch.object(live, "install", side_effect=install), patch.object(live.sys.stdin, "isatty", return_value=True), patch.object(live.sys.stdout, "isatty", return_value=True), patch.object(live, "thegn_ancestor", return_value=None), patch.object(live, "validate_config"), patch.object(live, "stop_running"), patch.object(live, "doctor_later"), patch.object(live, "countdown"), patch.object(live.subprocess, "Popen", side_effect=spawn):
             for expected_pin in (None, str(self.target)):
                 # Keep HOME unchanged; test only captured migration override.
                 env = dict(os.environ, **self.env)
