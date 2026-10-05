@@ -312,7 +312,9 @@ pub struct CalendarAccount {
     /// security boundary; unspecified, multicast, and broadcast destinations
     /// remain refused, and ambient proxies are never used.
     pub allow_private_network: bool,
-    /// `caldav`: restrict to specific collections; empty means all.
+    /// `caldav`: restrict to specific collections; empty means all. An id
+    /// matches a resource's parent collection by its name or trailing path
+    /// (`work` or `cals/work`); resources elsewhere are skipped.
     pub calendar_ids: Vec<String>,
 
     /// `command`: argv of the plugin to run. Argv, not a shell string, so no
