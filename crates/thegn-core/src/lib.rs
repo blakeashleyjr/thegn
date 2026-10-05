@@ -146,6 +146,7 @@ pub mod frecency;
 pub mod fsperm;
 pub mod gate;
 pub mod git_memo;
+pub mod git_operand;
 pub mod github;
 pub mod gitrefs;
 pub mod gitviz;
