@@ -96,7 +96,10 @@ and a mount whose host path is or contains a protected path SHALL refuse the
 launch. A sealed compose-backed spec SHALL be refused (compose volumes cannot be
 verified). A kept OCI container SHALL be reused for a sealed spec only when it
 carries `thegn.seal_home=1` and binds exactly the required mounts, and a
-non-sealed spec SHALL NOT reuse a sealed container. The only exception is the managed per-account credential dir under
+non-sealed spec SHALL NOT reuse a sealed container. The devenv `/nix` bind SHALL
+be tolerated only when the current spec would itself emit it. Apple containers
+carry no label, so their reuse is judged on mounts alone, and a sealed Apple
+container whose inspect output lacks a mounts array SHALL NOT be reused. The only exception is the managed per-account credential dir under
 thegn's own state; the ambient `~/.claude` / `~/.codex` SHALL NOT be mounted.
 Dropped `[sandbox] mounts` entries SHALL be listed by `thegn doctor`.
 
