@@ -63,9 +63,12 @@ pub struct PipelineStage {
     /// (a stage that can never run is a typo, not a way to disable one).
     pub concurrency: u32,
     /// How long the Lead should wait on this stage's session before treating it
-    /// as blocked, in seconds. **Advisory — thegn never fires this timer**; the
-    /// Lead passes it to `thegn session wait --timeout` (milliseconds), which is
-    /// the only watchdog that exists.
+    /// as blocked, in seconds. Must be between 1 and
+    /// [`crate::time_policy::MAX_DURATION_SECS`] (`config validate` refuses `0`:
+    /// the monitor always passes a bounded wait). **Advisory — thegn never fires
+    /// this timer**; the monitor passes [`PipelineStage::wait_timeout_millis`]
+    /// to `thegn dispatch wait --timeout` (milliseconds), which is the only
+    /// watchdog that exists.
     #[schemars(range(max = "crate::time_policy::MAX_DURATION_SECS"))]
     pub timeout_secs: u64,
     /// The stage the Lead advances to when this one finishes. Unset = terminal.
@@ -217,6 +220,17 @@ impl PipelineStage {
             .iter()
             .filter_map(|r| Requirement::parse(r))
             .collect()
+    }
+
+    /// `timeout_secs` as the positive millisecond argument of `thegn dispatch
+    /// wait --timeout` (a signed `i64`). `None` for a value outside
+    /// `1..=MAX_DURATION_SECS` — exactly what [`validate_pipeline`] refuses, so
+    /// every accepted stage yields `Some`.
+    pub fn wait_timeout_millis(&self) -> Option<i64> {
+        if self.timeout_secs == 0 || self.timeout_secs > crate::time_policy::MAX_DURATION_SECS {
+            return None;
+        }
+        i64::try_from(self.timeout_secs.checked_mul(1000)?).ok()
     }
 
     /// The `[[tasks]]` names this stage validates with, trimmed and non-empty.
@@ -638,6 +652,13 @@ pub fn validate_pipeline(cfg: &Config) -> Vec<String> {
                  typo — delete the stage to remove it)"
             ));
         }
+        if s.wait_timeout_millis().is_none() {
+            out.push(format!(
+                "{label}.timeout_secs: must be between 1 and {} seconds (the monitor \
+                 passes it as a bounded `thegn dispatch wait --timeout` in milliseconds)",
+                crate::time_policy::MAX_DURATION_SECS
+            ));
+        }
         if let Some(nx) = s.next_name()
             && index_of(stages, nx).is_none()
         {
@@ -1010,6 +1031,35 @@ mod tests {
         assert_eq!(s.stage_name(), None);
         assert!(Pipeline::default().stages.is_empty());
         assert!(Pipeline::default().entry().is_none());
+    }
+
+    #[test]
+    fn timeout_secs_contract_matches_dispatch_wait() {
+        use crate::time_policy::MAX_DURATION_SECS as MAX;
+        let with = |t: u64| {
+            let mut st = stage("a", None);
+            st.timeout_secs = t;
+            st
+        };
+        let errs = |t: u64| validate_pipeline(&cfg_with(vec![with(t)]));
+        // Default round-trips and is accepted.
+        assert_eq!(PipelineStage::default().wait_timeout_millis(), Some(3_600_000));
+        assert!(errs(3600).is_empty());
+        assert!(errs(1).is_empty());
+        assert_eq!(with(1).wait_timeout_millis(), Some(1000));
+        // Largest accepted value converts without overflow or sign change.
+        assert!(errs(MAX).is_empty());
+        assert_eq!(with(MAX).wait_timeout_millis(), Some(MAX as i64 * 1000));
+        // Zero and the first overflow-side value are rejected.
+        for bad in [0, MAX + 1, u64::MAX] {
+            let e = errs(bad);
+            assert!(e.iter().any(|m| m.contains("timeout_secs")), "{bad}: {e:?}");
+            assert_eq!(with(bad).wait_timeout_millis(), None);
+        }
+        // Serialization round trip preserves the value.
+        let json = serde_json::to_string(&with(MAX)).unwrap();
+        let back: PipelineStage = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.timeout_secs, MAX);
     }
 
     // --- [pipeline.transport_retry] (THE-86) ----------------------------------
