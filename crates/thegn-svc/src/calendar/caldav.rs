@@ -41,6 +41,7 @@ pub struct CalDavBackend {
     username: String,
     token: String,
     zone: String,
+    calendar_ids: Vec<String>,
     timeout: Duration,
     admission: AccountAdmission,
     http: Option<CalendarHttpClient>,
@@ -65,6 +66,12 @@ impl CalDavBackend {
             username: a.username.clone(),
             token: thegn_core::config::expand_env_ref(&a.token).unwrap_or_default(),
             zone: String::new(),
+            calendar_ids: a
+                .calendar_ids
+                .iter()
+                .map(|id| id.trim().trim_matches('/').to_string())
+                .filter(|id| !id.is_empty())
+                .collect(),
             timeout: Duration::from_secs(a.timeout_secs.clamp(5, 120)),
             admission,
             http,
@@ -318,11 +325,18 @@ fn walk_multistatus<'a>(
 fn page_from_multistatus(
     text: &str,
     zone: &str,
+    calendar_ids: &[String],
     mut meter: AdmissionMeter,
 ) -> Result<EventPage, CalendarError> {
     let mut events = Vec::new();
     let mut deleted = Vec::new();
     let token = walk_multistatus(text, |r| {
+        // `calendar_ids` restricts to named collections; a resource outside
+        // them is skipped before it is admitted or parsed. Tombstones are
+        // filtered the same way, so a deletion elsewhere never reaches us.
+        if !href_in_collections(&r.href, calendar_ids) {
+            return Ok(());
+        }
         if r.deleted {
             // The href is all a tombstone carries, so it has to be the id.
             // `uid_from_href` mirrors what the fetch path stores.
@@ -527,7 +541,7 @@ impl CalDavBackend {
             meter.release_transient(MAX_BODY_BYTES - text.capacity().min(MAX_BODY_BYTES));
             let text = String::from_utf8(text)
                 .map_err(|_| CalendarError::Parse("CalDAV response is not UTF-8".into()))?;
-            match page_from_multistatus(&text, self.zone(), meter) {
+            match page_from_multistatus(&text, self.zone(), &self.calendar_ids, meter) {
                 // A delta over the account's own budget (a bulk delete, a
                 // server re-stamping everything) would be refused again on
                 // every tick, because the cursor is — correctly — not
@@ -611,8 +625,38 @@ impl CalDavBackend {
         meter.release_transient(MAX_BODY_BYTES - bytes.capacity().min(MAX_BODY_BYTES));
         let text = String::from_utf8(bytes)
             .map_err(|_| CalendarError::Parse("CalDAV response is not UTF-8".into()))?;
-        page_from_multistatus(&text, self.zone(), meter)
+        page_from_multistatus(&text, self.zone(), &self.calendar_ids, meter)
     }
+}
+
+/// Whether a resource href lives in one of `ids` (already trimmed of
+/// slashes). An empty list means every collection. An id matches the
+/// resource's parent collection when it equals that collection's path or is a
+/// trailing run of its path segments, so both `work` and `/dav/cals/work/`
+/// select `/dav/cals/work/e1.ics`. Fails closed: a non-empty filter never
+/// admits a href with no parent collection.
+pub(crate) fn href_in_collections(href: &str, ids: &[String]) -> bool {
+    if ids.is_empty() {
+        return true;
+    }
+    let path = match href.find("://") {
+        Some(i) => href[i + 3..].find('/').map_or("", |j| &href[i + 3 + j..]),
+        None => href,
+    };
+    let path = path.split(['?', '#']).next().unwrap_or(path);
+    let Some((parent, _)) = path.trim_end_matches('/').rsplit_once('/') else {
+        return false;
+    };
+    let parent = parent.trim_matches('/');
+    if parent.is_empty() {
+        return false;
+    }
+    ids.iter().any(|id| {
+        parent == id
+            || parent
+                .strip_suffix(id.as_str())
+                .is_some_and(|rest| rest.ends_with('/'))
+    })
 }
 
 /// The event uid a collection href refers to: the last path segment with its
@@ -656,5 +700,54 @@ mod tests {
             walk_multistatus(&xml, |_| Ok(())),
             Err(CalendarError::BodyLimit(_))
         ));
+    }
+
+    fn multistatus() -> String {
+        let one = |href: &str, uid: &str| {
+            format!(
+                "<d:response><d:href>{href}</d:href><d:propstat><d:prop><c:calendar-data>BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:{uid}\nSUMMARY:{uid}\nDTSTART:20300101T100000Z\nDTEND:20300101T110000Z\nEND:VEVENT\nEND:VCALENDAR</c:calendar-data></d:prop></d:propstat></d:response>"
+            )
+        };
+        format!(
+            "<d:multistatus xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\">{}{}<d:response><d:href>/dav/personal/gone.ics</d:href><d:status>HTTP/1.1 404 Not Found</d:status></d:response><d:sync-token>t1</d:sync-token></d:multistatus>",
+            one("/dav/work/a.ics", "work-a"),
+            one("https://x.example/dav/personal/b.ics", "personal-b"),
+        )
+    }
+
+    fn page(ids: &[&str]) -> EventPage {
+        let ids: Vec<String> = ids.iter().map(|s| (*s).to_string()).collect();
+        let meter = AccountAdmission::isolated(Default::default()).meter();
+        page_from_multistatus(&multistatus(), "UTC", &ids, meter).unwrap()
+    }
+
+    #[test]
+    fn empty_calendar_ids_admit_every_collection() {
+        let p = page(&[]);
+        assert_eq!(p.events.len(), 2);
+        assert_eq!(p.deleted, vec!["gone".to_string()]);
+    }
+
+    #[test]
+    fn calendar_ids_restrict_events_and_tombstones_to_named_collections() {
+        let p = page(&["work"]);
+        assert_eq!(p.events.len(), 1);
+        assert!(p.events.iter().all(|e| e.title == "work-a"));
+        assert!(p.deleted.is_empty());
+        let p = page(&["personal"]);
+        assert_eq!(p.events.len(), 1);
+        assert_eq!(p.deleted, vec!["gone".to_string()]);
+        assert_eq!(page(&["nope"]).events.len(), 0);
+    }
+
+    #[test]
+    fn collection_matching_is_segment_aligned_and_fails_closed() {
+        let ids = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(href_in_collections("/dav/cals/work/e.ics", &ids(&["work"])));
+        assert!(href_in_collections("/dav/cals/work/e.ics", &ids(&["cals/work"])));
+        assert!(href_in_collections("/dav/cals/work/e.ics", &ids(&["dav/cals/work"])));
+        assert!(!href_in_collections("/dav/cals/homework/e.ics", &ids(&["work"])));
+        assert!(!href_in_collections("e.ics", &ids(&["work"])));
+        assert!(!href_in_collections("/e.ics", &ids(&["work"])));
     }
 }
