@@ -5991,10 +5991,8 @@ fn attach_agent_pane(
     tab_name: &str,
     spec: &crate::agent::LaunchSpec,
     center: Rect,
-) -> bool {
-    let Some(gi) = session.worktrees.iter().position(|g| g.name == tab_name) else {
-        return false;
-    };
+) -> Option<u32> {
+    let gi = session.worktrees.iter().position(|g| g.name == tab_name)?;
     let cwd = spec.cwd.clone();
     let env = spec.env.clone();
     let argv = spec.argv.clone();
@@ -6004,19 +6002,17 @@ fn attach_agent_pane(
             // with the agent pane.
             let g = &mut session.worktrees[gi];
             let ti = g.active_tab.min(g.tabs.len().saturating_sub(1));
-            let Some(tab) = g.tabs.get_mut(ti) else {
-                return false;
-            };
+            let tab = g.tabs.get_mut(ti)?;
             for old in tab.center.pane_ids() {
                 panes.table.remove(&old);
             }
             tab.center = crate::center::CenterTree::Leaf(id);
             tab.focused_pane = id;
-            true
+            Some(id)
         }
         Err(e) => {
             thegn_core::msg::warn(&format!("agent launch failed: {e}"));
-            false
+            None
         }
     }
 }
@@ -11174,14 +11170,23 @@ async fn event_loop<T: Terminal>(
                     // tab with the agent over the native exec.
                     let native_provider =
                         crate::agent::native_shell_exec(keymap.config(), &payload.path).is_some();
-                    let attached = !native_provider
-                        && attach_agent_pane(
+                    let agent_pane = if native_provider {
+                        None
+                    } else {
+                        attach_agent_pane(
                             &mut session,
                             &mut panes,
                             &payload.tab,
                             &payload.spec,
                             chrome.center,
-                        );
+                        )
+                    };
+                    // THE-733: remember which row this pane runs, so its exit
+                    // binds the daemon session to it instead of guessing.
+                    if let (Some(pane_id), Some(dispatch_id)) = (agent_pane, payload.dispatch_id) {
+                        panes.dispatch_panes.insert(pane_id, dispatch_id);
+                    }
+                    let attached = agent_pane.is_some();
                     if attached || native_provider {
                         // Only pull focus to the new pane when its tab is active
                         // (jump-to-create default, user not since navigated away).

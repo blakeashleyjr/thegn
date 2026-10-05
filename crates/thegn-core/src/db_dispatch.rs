@@ -64,6 +64,38 @@ impl std::fmt::Display for ResumeDispatchConflict {
 impl std::error::Error for ResumeDispatchConflict {}
 
 impl Db {
+    /// Bind a daemon session id to a dispatch row that was recorded without one
+    /// (a UI tracker dispatch launching into a daemon pane, THE-733). Only an
+    /// ACTIVE, session-less row is bound, so a relaunch that already published
+    /// its own identity is never overwritten. Bumps `run_gen` like every other
+    /// run publication. Returns whether a row was bound.
+    pub fn bind_dispatch_session(&self, id: i64, session_id: &str) -> Result<bool> {
+        if session_id.is_empty() {
+            return Ok(false);
+        }
+        let (status, sid): (String, Option<String>) = match self
+            .conn()
+            .query_row(
+                "SELECT status, session_id FROM agent_dispatches WHERE id=?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?
+        {
+            Some(row) => row,
+            None => return Ok(false),
+        };
+        if !AgentDispatchStatus::parse(&status).is_active() || sid.is_some_and(|s| !s.is_empty()) {
+            return Ok(false);
+        }
+        let changed = self.conn().execute(
+            "UPDATE agent_dispatches SET session_id=?1, run_gen=run_gen+1 \
+             WHERE id=?2 AND status=?3 AND COALESCE(session_id,'')=''",
+            rusqlite::params![session_id, id, status],
+        )?;
+        Ok(changed != 0)
+    }
+
     /// Atomically publish the server-generated identity of an opened worker and
     /// move its reserved row to `running`. Only `queued`/`spawning` are
     /// admissible: a concurrent terminal or parked verdict wins and is never
