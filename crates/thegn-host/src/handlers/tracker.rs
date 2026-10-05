@@ -416,13 +416,16 @@ fn dispatch_agent(ctx: &mut TrackerCtx) {
                 thegn_core::msg::warn(&message);
                 return;
             }
+            let mut dispatch_id: Option<i64> = None;
             {
                 // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
-                let _ = db.put_agent_dispatch(thegn_core::issue::NewDispatch::new(
-                    &issue_id,
-                    &wt_str,
-                    &agent_name,
-                ));
+                dispatch_id = db
+                    .put_agent_dispatch(thegn_core::issue::NewDispatch::new(
+                        &issue_id,
+                        &wt_str,
+                        &agent_name,
+                    ))
+                    .ok();
                 let _ = db.link_issue(&wt_str, &issue_id); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                 if let Err(report) = crate::worktree_lifecycle::schedule_post_create(
                     &cfg2,
@@ -454,6 +457,7 @@ fn dispatch_agent(ctx: &mut TrackerCtx) {
                 agent: agent_name.clone(),
                 spec,
                 env,
+                dispatch_id,
             };
             // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
             let _ = tx2.send(crate::wizard::CreateEvent::Done {

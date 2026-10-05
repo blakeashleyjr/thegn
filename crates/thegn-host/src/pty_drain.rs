@@ -891,6 +891,8 @@ fn handle_exit(ctx: &mut DrainCtx<'_>, id: u32, exit_code: Option<i32>) -> bool 
     // row just died. `None` for a plain local PTY pane, which falls back to the
     // most-recent-active row for the worktree.
     let exited_session = ctx.panes.table.get(&id).and_then(|p| p.session_id());
+    // The row a tracker dispatch launched into this pane (THE-733), if any.
+    let exited_dispatch = ctx.panes.dispatch_panes.remove(&id);
     // Grab the dying pane's last output BEFORE it leaves the table — a
     // sandbox/exec failure writes its error here, and a fast crash would
     // otherwise discard it (the pane just vanishes).
@@ -1203,10 +1205,10 @@ fn handle_exit(ctx: &mut DrainCtx<'_>, id: u32, exit_code: Option<i32>) -> bool 
                     // Stale, never "the newest row in this worktree" (that
                     // fallback is how an old run's late exit stamped the retry
                     // that replaced it). Identity-less panes resolve only when
-                    // exactly one active row exists; so does a session id that
-                    // matches no row when exactly one active SESSION-LESS row
-                    // exists (UI/`dispatch put` rows run in daemon panes that
-                    // still report a session id). Stale/Ambiguous/NoRow fall
+                    // exactly one active row exists. A session-less UI dispatch
+                    // row is bound to its pane's session just below (THE-733),
+                    // so a session id that matches no row is always Stale.
+                    // Stale/Ambiguous/NoRow fall
                     // through to ordinary process routing: in daemon mode every
                     // pane has a session id, so a plain shell later opened in an
                     // ex-agent worktree is Stale here and must keep its process
@@ -1217,6 +1219,15 @@ fn handle_exit(ctx: &mut DrainCtx<'_>, id: u32, exit_code: Option<i32>) -> bool 
                     // observer stamps headless workers. Both can observe an
                     // adopted session; the stamp is a CAS on (row, session,
                     // run_gen), first writer wins, so the duplicate is harmless.
+                    // THE-733: the pane the UI launched for a dispatch row binds
+                    // its announced daemon session to that row first, so
+                    // attribution below is Exact. A plain shell never has a
+                    // binding, so its exit cannot reach the agent's row.
+                    if let (Some(row), Some(sid)) = (exited_dispatch, exited_session.as_deref())
+                        && let Err(e) = db.bind_dispatch_session(row, sid)
+                    {
+                        tracing::warn!(target: "thegn::dispatch", worktree = %wt, "bind dispatch session: {e:#}");
+                    }
                     let attribution = db.dispatch_for_exit(&wt, exited_session.as_deref());
                     let run = match attribution {
                         Ok(
