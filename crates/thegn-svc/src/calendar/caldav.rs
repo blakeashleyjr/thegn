@@ -396,12 +396,9 @@ impl CalendarBackend for CalDavBackend {
     }
 
     fn caps(&self) -> CalendarCaps {
-        CalendarCaps {
-            // `sync-collection` gives real deltas AND tombstones — the only
-            // provider here that can, which is why `EventPage::deleted` exists.
-            incremental: true,
-            ..Default::default()
-        }
+        // No write support yet. Incremental sync is not a capability: the page
+        // itself carries the token and tombstones (`EventPage::deleted`).
+        CalendarCaps::default()
     }
 
     fn list_events<'a>(
