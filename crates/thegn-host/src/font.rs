@@ -1,6 +1,10 @@
 use crate::palette::PaletteItem;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 const RECOMMENDED_FONTS: &[&str] = &[
     "VictorMono Nerd Font",
@@ -20,45 +24,314 @@ pub struct FontRow {
     pub label: String,
 }
 
-pub fn font_palette_items() -> Result<Vec<PaletteItem>, String> {
-    let rows = match fc_list_rows() {
-        Ok(rows) => rows,
-        // Stock macOS has no fontconfig, so `fc-list` is simply absent and the
-        // picker used to dead-end on "fc-list failed: No such file". Fall back to
-        // the standard font directories there; elsewhere, surface the real error.
-        Err(e) if cfg!(target_os = "macos") => {
-            let rows = font_rows_from_dirs(&macos_font_dirs());
-            if rows.is_empty() {
-                return Err(format!("{e}; no fonts found under ~/Library/Fonts"));
-            }
-            rows
-        }
-        Err(e) => return Err(e),
-    };
-    Ok(rows
-        .into_iter()
-        .map(|row| PaletteItem::new(format!("font:{}", row.family), row.label))
-        .collect())
+/// Total wall-clock budget for the `fc-list` helper.
+const FC_DEADLINE: Duration = Duration::from_secs(3);
+/// Stdout byte cap for the helper; the helper is killed when it is reached.
+const FC_MAX_OUTPUT: usize = 4 * 1024 * 1024;
+/// Wall-clock budget for the directory fallback.
+const SCAN_DEADLINE: Duration = Duration::from_secs(2);
+/// Directory entries the fallback may inspect, across all roots.
+const SCAN_MAX_ENTRIES: usize = 100_000;
+/// Total bytes of entry names the fallback may inspect.
+const SCAN_MAX_NAME_BYTES: usize = 8 * 1024 * 1024;
+/// Families surfaced to the palette.
+const MAX_RESULTS: usize = 5_000;
+/// A single entry name longer than this is not a font file name.
+const MAX_NAME_BYTES: usize = 512;
+
+/// Why a discovery result is partial.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Truncation {
+    /// `fc-list` produced more than [`FC_MAX_OUTPUT`] bytes.
+    HelperOutput,
+    /// The scan hit its entry or name-byte budget.
+    ScanBudget,
+    /// More than [`MAX_RESULTS`] families were found.
+    Results,
 }
 
-/// Enumerate families via fontconfig. `Err` when `fc-list` is missing or fails.
-fn fc_list_rows() -> Result<Vec<FontRow>, String> {
-    // Accepted on-loop subprocess: `fc-list` is ms-scale and only runs on the
-    // explicit SwitchFont action. Revisit if font enumeration ever grows.
-    #[expect(clippy::disallowed_methods)]
-    let output = std::process::Command::new("fc-list")
-        .args([":", "family"])
-        .output()
-        .map_err(|e| format!("fc-list failed: {e}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "fc-list exited with {}",
-            output.status.code().unwrap_or_default()
-        ));
+/// The typed outcome of one discovery run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DiscoveryStatus {
+    Complete,
+    Truncated(Truncation),
+    /// No source could enumerate fonts; carries the actionable reason.
+    Unavailable(String),
+    TimedOut,
+    Canceled,
+}
+
+/// Families plus how trustworthy the list is. `source_errors` names every source
+/// that failed or was skipped, so a successful-looking list is never silently
+/// incomplete.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Discovery {
+    pub rows: Vec<FontRow>,
+    pub status: DiscoveryStatus,
+    pub source_errors: Vec<String>,
+}
+
+impl Discovery {
+    fn bare(status: DiscoveryStatus, source_errors: Vec<String>) -> Self {
+        Self {
+            rows: Vec::new(),
+            status,
+            source_errors,
+        }
     }
-    Ok(font_rows_from_fc_list(&String::from_utf8_lossy(
-        &output.stdout,
-    )))
+
+    /// Palette rows for the discovered families.
+    pub fn items(&self) -> Vec<PaletteItem> {
+        self.rows
+            .iter()
+            .map(|row| PaletteItem::new(format!("font:{}", row.family), row.label.clone()))
+            .collect()
+    }
+
+    /// One status line when the list is unusable or partial; `None` when a
+    /// complete list should simply open.
+    pub fn notice(&self) -> Option<String> {
+        let errs = if self.source_errors.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", self.source_errors.join("; "))
+        };
+        match &self.status {
+            DiscoveryStatus::Complete if self.rows.is_empty() => {
+                Some(format!("No fonts found{errs}"))
+            }
+            DiscoveryStatus::Complete => None,
+            DiscoveryStatus::Truncated(t) => Some(format!(
+                "Font list truncated ({}){errs}",
+                match t {
+                    Truncation::HelperOutput => "fc-list output cap",
+                    Truncation::ScanBudget => "directory scan budget",
+                    Truncation::Results => "result cap",
+                }
+            )),
+            DiscoveryStatus::Unavailable(why) => Some(format!("Font list failed: {why}{errs}")),
+            DiscoveryStatus::TimedOut => Some(format!("Font list timed out{errs}")),
+            DiscoveryStatus::Canceled => Some("Font list canceled".into()),
+        }
+    }
+
+    /// Whether the picker should open with whatever rows exist.
+    pub fn usable(&self) -> bool {
+        !self.rows.is_empty()
+            && matches!(
+                self.status,
+                DiscoveryStatus::Complete | DiscoveryStatus::Truncated(_)
+            )
+    }
+}
+
+/// Run one bounded discovery. Blocking: call only from a worker thread.
+pub fn discover(cancel: &AtomicBool) -> Discovery {
+    let exe = resolve_fc_list(&fc_list_search_dirs());
+    discover_with(exe.as_deref(), cancel, &macos_font_dirs())
+}
+
+fn discover_with(fc_list: Option<&Path>, cancel: &AtomicBool, dirs: &[PathBuf]) -> Discovery {
+    let mut errors = Vec::new();
+    match fc_list {
+        Some(exe) => {
+            let mut cmd = Command::new(exe);
+            cmd.args([":", "family"]);
+            match crate::preview_jobs::bounded_capture(&mut cmd, cancel, FC_DEADLINE, FC_MAX_OUTPUT)
+            {
+                Ok(bytes) => return finish_rows(&bytes, false, errors),
+                Err(crate::preview_jobs::CaptureError::Capped(bytes)) => {
+                    return finish_rows(&bytes, true, errors);
+                }
+                Err(crate::preview_jobs::CaptureError::Cancelled) => {
+                    return Discovery::bare(DiscoveryStatus::Canceled, errors);
+                }
+                Err(crate::preview_jobs::CaptureError::Timeout) => {
+                    errors.push("fc-list exceeded its deadline".into());
+                }
+                Err(crate::preview_jobs::CaptureError::Spawn(e)) => {
+                    errors.push(format!("fc-list failed to start: {e}"));
+                }
+                Err(crate::preview_jobs::CaptureError::Failed) => {
+                    errors.push("fc-list failed".into());
+                }
+            }
+        }
+        None => errors.push("fc-list not found in an admitted system directory".into()),
+    }
+    // Stock macOS has no fontconfig: fall back to the standard font directories.
+    // Elsewhere there is nothing to fall back to, so surface the real reason.
+    if cfg!(target_os = "macos") {
+        let scan = font_rows_from_dirs(dirs, cancel);
+        errors.extend(scan.errors);
+        return match scan.stop {
+            ScanStop::Canceled => Discovery::bare(DiscoveryStatus::Canceled, errors),
+            ScanStop::Deadline => Discovery::bare(DiscoveryStatus::TimedOut, errors),
+            ScanStop::Budget | ScanStop::Done => {
+                let truncated = scan.stop == ScanStop::Budget;
+                if scan.rows.is_empty() {
+                    Discovery::bare(
+                        DiscoveryStatus::Unavailable("no fonts found under ~/Library/Fonts".into()),
+                        errors,
+                    )
+                } else {
+                    cap_results(scan.rows, truncated.then_some(Truncation::ScanBudget), errors)
+                }
+            }
+        };
+    }
+    let timed_out = errors.iter().any(|e| e.contains("deadline"));
+    if timed_out {
+        return Discovery::bare(DiscoveryStatus::TimedOut, errors);
+    }
+    let why = errors.first().cloned().unwrap_or_default();
+    Discovery::bare(DiscoveryStatus::Unavailable(why), errors)
+}
+
+fn finish_rows(stdout: &[u8], output_capped: bool, errors: Vec<String>) -> Discovery {
+    let mut text = String::from_utf8_lossy(stdout).into_owned();
+    if output_capped {
+        // The cut may land mid-line; drop the partial tail rather than list a
+        // truncated family name.
+        if let Some(i) = text.rfind('\n') {
+            text.truncate(i);
+        }
+    }
+    let rows = font_rows_from_fc_list(&text);
+    cap_results(rows, output_capped.then_some(Truncation::HelperOutput), errors)
+}
+
+fn cap_results(
+    mut rows: Vec<FontRow>,
+    truncation: Option<Truncation>,
+    source_errors: Vec<String>,
+) -> Discovery {
+    let mut truncation = truncation;
+    if rows.len() > MAX_RESULTS {
+        rows.truncate(MAX_RESULTS);
+        truncation.get_or_insert(Truncation::Results);
+    }
+    Discovery {
+        rows,
+        status: truncation.map_or(DiscoveryStatus::Complete, DiscoveryStatus::Truncated),
+        source_errors,
+    }
+}
+
+/// Fixed system directories `fc-list` may be resolved from. The ambient `PATH`
+/// is deliberately not consulted: a writable directory early on it would let any
+/// file named `fc-list` run as the user on a keypress.
+fn fc_list_search_dirs() -> Vec<PathBuf> {
+    let mut dirs = vec![PathBuf::from("/run/current-system/sw/bin")];
+    if let Some(home) = std::env::var_os("HOME") {
+        dirs.push(PathBuf::from(home).join(".nix-profile/bin"));
+    }
+    for d in [
+        "/usr/bin",
+        "/usr/local/bin",
+        "/opt/homebrew/bin",
+        "/opt/local/bin",
+        "/bin",
+    ] {
+        dirs.push(PathBuf::from(d));
+    }
+    dirs
+}
+
+/// First `fc-list` in `dirs` that passes the executable-identity admission.
+fn resolve_fc_list(dirs: &[PathBuf]) -> Option<PathBuf> {
+    dirs.iter()
+        .map(|d| d.join("fc-list"))
+        .find(|p| crate::platform::exe_admitted(p))
+}
+
+/// Single-flight owner of font discovery. One worker at a time; a request made
+/// while one is running coalesces into it. Dropping the owner cancels the run.
+pub struct DiscoveryOwner {
+    generation: u64,
+    in_flight: bool,
+    cancel: Arc<AtomicBool>,
+}
+
+/// A finished run, tagged with the generation that requested it.
+pub struct DiscoveryResult {
+    pub generation: u64,
+    pub discovery: Discovery,
+}
+
+impl Default for DiscoveryOwner {
+    fn default() -> Self {
+        Self {
+            generation: 0,
+            in_flight: false,
+            cancel: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+impl DiscoveryOwner {
+    /// Start a run unless one is already in flight. Returns whether a new worker
+    /// was started (`false` means the request coalesced).
+    pub fn request(
+        &mut self,
+        tx: tokio::sync::mpsc::UnboundedSender<DiscoveryResult>,
+        waker: termwiz::terminal::TerminalWaker,
+    ) -> bool {
+        if !self.begin() {
+            return false;
+        }
+        let generation = self.generation;
+        let cancel = Arc::clone(&self.cancel);
+        let spawned = std::thread::Builder::new()
+            .name("thegn-font-discovery".into())
+            .spawn(move || {
+                crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
+                let discovery = discover(&cancel);
+                if tx
+                    .send(DiscoveryResult {
+                        generation,
+                        discovery,
+                    })
+                    .is_ok()
+                {
+                    let _ = waker.wake(); // best-effort: waker pulse: a nudge must never fail the worker
+                }
+            });
+        if spawned.is_err() {
+            self.in_flight = false;
+        }
+        spawned.is_ok()
+    }
+
+    fn begin(&mut self) -> bool {
+        if self.in_flight {
+            return false;
+        }
+        self.generation += 1;
+        self.in_flight = true;
+        self.cancel = Arc::new(AtomicBool::new(false));
+        true
+    }
+
+    /// Accept a result only for the current in-flight generation.
+    pub fn accept(&mut self, generation: u64) -> bool {
+        if self.in_flight && generation == self.generation {
+            self.in_flight = false;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn in_flight(&self) -> bool {
+        self.in_flight
+    }
+}
+
+impl Drop for DiscoveryOwner {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Release);
+    }
 }
 
 /// The three directories macOS resolves fonts from, user-first.
@@ -92,7 +365,7 @@ fn macos_font_dirs() -> Vec<PathBuf> {
 const FONT_SCAN_DEPTH: usize = 8;
 
 /// Derive families from font FILENAMES under `dirs` — the fontconfig-free
-/// fallback. Descends [`FONT_SCAN_DEPTH`] levels; see there for why flat was wrong.
+/// fallback, bounded by entry, name-byte, time and cancel budgets. Descends [`FONT_SCAN_DEPTH`] levels; see there for why flat was wrong.
 ///
 /// Reading real family names would mean parsing each font's `name` table; the
 /// filename is a good enough key here because the only consumer writes the
@@ -100,31 +373,124 @@ const FONT_SCAN_DEPTH: usize = 8;
 /// distributions name their files after the family they register. A style suffix
 /// (`-Regular`, ` Bold Italic`) is stripped so all faces of a family collapse to
 /// one entry, matching what `fc-list : family` yields.
-fn font_rows_from_dirs(dirs: &[PathBuf]) -> Vec<FontRow> {
-    let mut families = BTreeSet::new();
-    for dir in dirs {
-        collect_font_families(dir, FONT_SCAN_DEPTH, &mut families);
-    }
-    rank_families(families)
+fn font_rows_from_dirs(dirs: &[PathBuf], cancel: &AtomicBool) -> Scan {
+    let mut st = ScanState {
+        families: BTreeSet::new(),
+        errors: Vec::new(),
+        entries: 0,
+        name_bytes: 0,
+        started: Instant::now(),
+        deadline: SCAN_DEADLINE,
+        max_entries: SCAN_MAX_ENTRIES,
+        stop: ScanStop::Done,
+    };
+    font_rows_from_dirs_in(dirs, cancel, &mut st)
 }
 
-/// Add every font family found in `dir` to `families`, descending at most
-/// `depth` more levels. An unreadable directory is skipped — `/Library/Fonts`
-/// may not exist, and a font dir we can't read is not an error worth surfacing
-/// in a picker.
-fn collect_font_families(dir: &Path, depth: usize, families: &mut BTreeSet<String>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
+fn font_rows_from_dirs_in(dirs: &[PathBuf], cancel: &AtomicBool, st: &mut ScanState) -> Scan {
+    for dir in dirs {
+        collect_font_families(dir, FONT_SCAN_DEPTH, cancel, st);
+        if st.stop != ScanStop::Done {
+            break;
+        }
+    }
+    Scan {
+        rows: rank_families(std::mem::take(&mut st.families)),
+        errors: std::mem::take(&mut st.errors),
+        stop: st.stop,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScanStop {
+    Done,
+    Budget,
+    Deadline,
+    Canceled,
+}
+
+struct Scan {
+    rows: Vec<FontRow>,
+    errors: Vec<String>,
+    stop: ScanStop,
+}
+
+struct ScanState {
+    families: BTreeSet<String>,
+    errors: Vec<String>,
+    entries: usize,
+    name_bytes: usize,
+    started: Instant,
+    deadline: Duration,
+    max_entries: usize,
+    stop: ScanStop,
+}
+
+impl ScanState {
+    /// Charge one entry against every budget; `false` stops the walk.
+    fn admit(&mut self, name_len: usize, cancel: &AtomicBool) -> bool {
+        if self.stop != ScanStop::Done {
+            return false;
+        }
+        if cancel.load(Ordering::Acquire) {
+            self.stop = ScanStop::Canceled;
+        } else if self.started.elapsed() >= self.deadline {
+            self.stop = ScanStop::Deadline;
+        } else {
+            self.entries += 1;
+            self.name_bytes += name_len;
+            if self.entries > self.max_entries || self.name_bytes > SCAN_MAX_NAME_BYTES {
+                self.stop = ScanStop::Budget;
+            }
+        }
+        self.stop == ScanStop::Done
+    }
+
+    fn note_unreadable(&mut self, dir: &Path, e: &std::io::Error) {
+        // A standard font directory that simply does not exist is normal.
+        if e.kind() != std::io::ErrorKind::NotFound && self.errors.len() < 8 {
+            self.errors.push(format!("{}: {e}", dir.display()));
+        }
+    }
+}
+
+/// Add every font family found in `dir` to the state, descending at most
+/// `depth` more levels and within the entry, name-byte, time and cancel budgets.
+/// A missing directory is skipped silently; any other read failure is recorded
+/// in `st.errors` so the picker can say the list may be incomplete.
+fn collect_font_families(dir: &Path, depth: usize, cancel: &AtomicBool, st: &mut ScanState) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            st.note_unreadable(dir, &e);
+            return;
+        }
     };
-    for ent in entries.flatten() {
+    for ent in entries {
+        let ent = match ent {
+            Ok(ent) => ent,
+            Err(e) => {
+                st.note_unreadable(dir, &e);
+                continue;
+            }
+        };
         let name = ent.file_name();
         let name = name.to_string_lossy();
+        if !st.admit(name.len(), cancel) {
+            return;
+        }
+        if name.len() > MAX_NAME_BYTES {
+            continue;
+        }
         // `file_type` avoids a stat per entry on the common (file) path and,
         // unlike `is_dir`, does not follow symlinks — a font dir that links to
         // itself must not send this into a loop.
         if ent.file_type().is_ok_and(|t| t.is_dir()) {
             if depth > 0 {
-                collect_font_families(&ent.path(), depth - 1, families);
+                collect_font_families(&ent.path(), depth - 1, cancel, st);
+                if st.stop != ScanStop::Done {
+                    return;
+                }
             }
             continue;
         }
@@ -139,7 +505,7 @@ fn collect_font_families(dir: &Path, depth: usize, families: &mut BTreeSet<Strin
         }
         let family = family_from_font_filename(stem);
         if !family.is_empty() && !is_short_nerd_font_alias(&family) {
-            families.insert(family);
+            st.families.insert(family);
         }
     }
 }
@@ -626,6 +992,168 @@ mod tests {
         assert_eq!(out.trim(), "font_family Iosevka Nerd Font");
     }
 
+    fn sh(script: &str) -> Command {
+        let mut c = Command::new("sh");
+        c.args(["-c", script]);
+        c
+    }
+
+    fn run_helper(script: &str, cancel: &AtomicBool, deadline: Duration, cap: usize) -> Discovery {
+        // Mirrors `discover_with`'s helper arm so the same primitive is exercised
+        // with a fake helper (the real resolver only admits system directories).
+        let mut cmd = sh(script);
+        match crate::preview_jobs::bounded_capture(&mut cmd, cancel, deadline, cap) {
+            Ok(b) => finish_rows(&b, false, vec![]),
+            Err(crate::preview_jobs::CaptureError::Capped(b)) => finish_rows(&b, true, vec![]),
+            Err(crate::preview_jobs::CaptureError::Timeout) => {
+                Discovery::bare(DiscoveryStatus::TimedOut, vec![])
+            }
+            Err(crate::preview_jobs::CaptureError::Cancelled) => {
+                Discovery::bare(DiscoveryStatus::Canceled, vec![])
+            }
+            Err(e) => Discovery::bare(DiscoveryStatus::Unavailable(format!("{e:?}")), vec![]),
+        }
+    }
+
+    #[test]
+    fn hung_helper_with_descendant_times_out_promptly() {
+        let started = Instant::now();
+        let d = run_helper(
+            "sleep 30 & sleep 30",
+            &AtomicBool::new(false),
+            Duration::from_millis(200),
+            1024,
+        );
+        assert_eq!(d.status, DiscoveryStatus::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn output_flood_is_capped_and_marked_truncated() {
+        let d = run_helper(
+            "yes 'Flood Family' | head -c 5000000",
+            &AtomicBool::new(false),
+            Duration::from_secs(10),
+            64 * 1024,
+        );
+        assert_eq!(d.status, DiscoveryStatus::Truncated(Truncation::HelperOutput));
+        assert!(d.notice().unwrap().contains("truncated"));
+    }
+
+    #[test]
+    fn cancel_stops_a_running_helper() {
+        let cancel = AtomicBool::new(true);
+        let started = Instant::now();
+        let d = run_helper("sleep 30", &cancel, Duration::from_secs(10), 1024);
+        assert_eq!(d.status, DiscoveryStatus::Canceled);
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn result_cap_truncates_with_typed_status() {
+        let text: String = (0..MAX_RESULTS + 10)
+            .map(|i| format!("Family{i}\n"))
+            .collect();
+        let d = finish_rows(text.as_bytes(), false, vec![]);
+        assert_eq!(d.rows.len(), MAX_RESULTS);
+        assert_eq!(d.status, DiscoveryStatus::Truncated(Truncation::Results));
+    }
+
+    #[test]
+    fn scan_breadth_budget_stops_with_truncation() {
+        let tmp = tempfile::tempdir().unwrap();
+        for i in 0..20 {
+            std::fs::write(tmp.path().join(format!("Fam{i}-Regular.ttf")), b"").unwrap();
+        }
+        let mut st = ScanState {
+            families: BTreeSet::new(),
+            errors: vec![],
+            entries: 0,
+            name_bytes: 0,
+            started: Instant::now(),
+            deadline: Duration::from_secs(5),
+            max_entries: 5,
+            stop: ScanStop::Done,
+        };
+        let scan = font_rows_from_dirs_in(&[tmp.path().to_path_buf()], &AtomicBool::new(false), &mut st);
+        assert_eq!(scan.stop, ScanStop::Budget);
+        assert!(scan.rows.len() <= 5);
+    }
+
+    #[test]
+    fn scan_deadline_and_cancel_stop_the_walk() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("A-Regular.ttf"), b"").unwrap();
+        let mk = |deadline| ScanState {
+            families: BTreeSet::new(),
+            errors: vec![],
+            entries: 0,
+            name_bytes: 0,
+            started: Instant::now(),
+            deadline,
+            max_entries: 100,
+            stop: ScanStop::Done,
+        };
+        let dirs = [tmp.path().to_path_buf()];
+        let s = font_rows_from_dirs_in(&dirs, &AtomicBool::new(false), &mut mk(Duration::ZERO));
+        assert_eq!(s.stop, ScanStop::Deadline);
+        let s = font_rows_from_dirs_in(&dirs, &AtomicBool::new(true), &mut mk(Duration::from_secs(5)));
+        assert_eq!(s.stop, ScanStop::Canceled);
+    }
+
+    #[test]
+    fn unreadable_source_is_reported_not_swallowed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("not-a-dir");
+        std::fs::write(&file, b"").unwrap();
+        let scan = font_rows_from_dirs(&[file], &AtomicBool::new(false));
+        assert_eq!(scan.errors.len(), 1, "{:?}", scan.errors);
+    }
+
+    #[test]
+    fn helper_resolution_ignores_ambient_path_and_untrusted_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        // A non-executable file named fc-list is not an admitted identity.
+        std::fs::write(tmp.path().join("fc-list"), b"#!/bin/sh\n").unwrap();
+        assert_eq!(resolve_fc_list(&[tmp.path().to_path_buf()]), None);
+        // The search list is fixed system directories, never `$PATH` entries.
+        let dirs = fc_list_search_dirs();
+        assert!(dirs.iter().all(|d| d.is_absolute()));
+        assert!(!dirs.contains(&tmp.path().to_path_buf()));
+    }
+
+    #[test]
+    fn owner_coalesces_and_rejects_stale_generations() {
+        let mut o = DiscoveryOwner::default();
+        assert!(o.begin());
+        assert!(!o.begin(), "second request coalesces while in flight");
+        assert!(!o.accept(o.generation + 1), "wrong generation is stale");
+        assert!(o.in_flight());
+        let g = o.generation;
+        assert!(o.accept(g));
+        assert!(!o.accept(g), "a result is accepted once");
+        assert!(o.begin());
+        assert!(!o.accept(g), "the previous generation can never apply");
+    }
+
+    #[test]
+    fn dropping_the_owner_cancels_the_run() {
+        let o = DiscoveryOwner::default();
+        let flag = Arc::clone(&o.cancel);
+        drop(o);
+        assert!(flag.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn notices_distinguish_every_outcome() {
+        let mk = |status| Discovery::bare(status, vec!["src: boom".into()]);
+        assert!(mk(DiscoveryStatus::TimedOut).notice().unwrap().contains("timed out"));
+        assert!(mk(DiscoveryStatus::Canceled).notice().unwrap().contains("canceled"));
+        let n = mk(DiscoveryStatus::Unavailable("x".into())).notice().unwrap();
+        assert!(n.contains("x") && n.contains("src: boom"));
+        assert!(mk(DiscoveryStatus::Complete).notice().unwrap().contains("No fonts"));
+    }
+
     #[test]
     fn dir_enumeration_finds_fonts_macos_actually_installs() {
         // The three real layouts a flat `read_dir` missed, at their real depths
@@ -661,7 +1189,8 @@ mod tests {
         std::fs::create_dir_all(&deep).unwrap();
         std::fs::write(deep.join("Unreachable-Regular.ttf"), b"").unwrap();
 
-        let families: Vec<String> = font_rows_from_dirs(&[root.to_path_buf()])
+        let families: Vec<String> = font_rows_from_dirs(&[root.to_path_buf()], &AtomicBool::new(false))
+            .rows
             .into_iter()
             .map(|r| r.family)
             .collect();
@@ -699,14 +1228,16 @@ mod tests {
         ] {
             std::fs::write(dir.join(f), b"").expect("write");
         }
-        let rows = font_rows_from_dirs(std::slice::from_ref(&dir));
+        let rows = font_rows_from_dirs(std::slice::from_ref(&dir), &AtomicBool::new(false)).rows;
         let families: Vec<&str> = rows.iter().map(|r| r.family.as_str()).collect();
         assert_eq!(families.len(), 2, "rows: {families:?}");
         assert!(families.contains(&"Menlo"));
         assert!(families.contains(&"JetBrainsMonoNerdFont"));
         let _ = std::fs::remove_dir_all(&dir); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
         // A missing directory is skipped, not an error.
-        assert!(font_rows_from_dirs(&[PathBuf::from("/no/such/dir")]).is_empty());
+        let missing = font_rows_from_dirs(&[PathBuf::from("/no/such/dir")], &AtomicBool::new(false));
+        assert!(missing.rows.is_empty());
+        assert!(missing.errors.is_empty(), "absence is not an error");
     }
 
     #[test]
