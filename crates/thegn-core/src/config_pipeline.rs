@@ -626,9 +626,15 @@ pub fn validate_pipeline(cfg: &Config) -> Vec<String> {
                  roster rows record it and `next` points at it)"
             )),
             Some(n) => {
-                if seen.contains(&n) {
+                if let Some(why) = stage_name_problem(&s.name) {
+                    out.push(format!("pipeline.stages[{i}].name: {why}"));
+                }
+                // Case-insensitive: the name is also an artifact directory, and
+                // `Code`/`code` are one directory on a case-folding filesystem.
+                if seen.iter().any(|o| o.eq_ignore_ascii_case(n)) {
                     out.push(format!(
-                        "{label}: duplicate stage name — every stage name must be unique"
+                        "{label}: duplicate stage name — every stage name must be unique \
+                         (compared case-insensitively)"
                     ));
                 } else {
                     seen.push(n);
@@ -688,6 +694,60 @@ pub fn validate_pipeline(cfg: &Config) -> Vec<String> {
     out.extend(validate_transport_retry(&cfg.pipeline.transport_retry));
     out.extend(validate_supervisor(cfg));
     out
+}
+
+/// Longest accepted stage name, in bytes (ASCII only, so also characters).
+pub const MAX_STAGE_NAME_LEN: usize = 64;
+
+/// Stage names that mean something else on a protocol or display surface. The
+/// dispatch board files a row with no stage under `unstaged`, so a configured
+/// stage of that name would be conflated with non-pipeline dispatches.
+pub const RESERVED_STAGE_NAMES: &[&str] = &["unstaged"];
+
+/// Why `raw` is not a canonical stage identifier, or `None` when it is.
+///
+/// The grammar is `[A-Za-z0-9][A-Za-z0-9._-]*`, at most
+/// [`MAX_STAGE_NAME_LEN`] bytes, not ending in `.`. It is exactly the alphabet
+/// `pipeline_run::artifact_path` keeps, so distinct accepted names never
+/// collapse to the same directory component (case aside, which uniqueness
+/// checks case-insensitively). Surrounding whitespace and control characters
+/// are refused rather than trimmed, so the stored name and the looked-up name
+/// cannot differ.
+pub fn stage_name_problem(raw: &str) -> Option<String> {
+    if raw.len() > MAX_STAGE_NAME_LEN {
+        return Some(format!(
+            "longer than {MAX_STAGE_NAME_LEN} bytes ({} given)",
+            raw.len()
+        ));
+    }
+    if raw.trim() != raw {
+        return Some("has leading or trailing whitespace".to_string());
+    }
+    if raw.chars().any(char::is_control) {
+        return Some("contains a control character".to_string());
+    }
+    let mut chars = raw.chars();
+    if !chars.next().is_some_and(|c| c.is_ascii_alphanumeric()) {
+        return Some("must start with an ASCII letter or digit".to_string());
+    }
+    if let Some(c) = raw
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')))
+    {
+        return Some(format!(
+            "contains {c:?}; use only ASCII letters, digits, `.`, `_` and `-`"
+        ));
+    }
+    if raw.ends_with('.') {
+        return Some("must not end with `.`".to_string());
+    }
+    if RESERVED_STAGE_NAMES
+        .iter()
+        .any(|r| r.eq_ignore_ascii_case(raw))
+    {
+        return Some(format!("{raw:?} is a reserved name"));
+    }
+    None
 }
 
 /// `[pipeline.supervisor]` + the per-stage `validate`/`requires` it acts on.
@@ -1031,6 +1091,56 @@ mod tests {
         assert_eq!(s.stage_name(), None);
         assert!(Pipeline::default().stages.is_empty());
         assert!(Pipeline::default().entry().is_none());
+    }
+
+    #[test]
+    fn stage_names_are_canonical_bounded_and_unreserved() {
+        let errs = |names: &[&str]| {
+            validate_pipeline(&cfg_with(names.iter().map(|n| stage(n, None)).collect()))
+                .into_iter()
+                .filter(|e| e.contains(".name:") || e.contains("duplicate"))
+                .collect::<Vec<_>>()
+        };
+        for ok in [
+            "code",
+            "maintenance-investigate",
+            "maintenance-plan-revision",
+            "maintenance-code",
+            "maintenance-adversarial",
+            "v1.2_x",
+            "7",
+            &"a".repeat(MAX_STAGE_NAME_LEN),
+        ] {
+            assert!(errs(&[ok]).is_empty(), "{ok:?} should be accepted");
+        }
+        for bad in [
+            "unstaged",
+            "Unstaged",
+            " code",
+            "code ",
+            "co de",
+            "co\u{1b}de",
+            "co\nde",
+            "-code",
+            ".hidden",
+            "code.",
+            "caf\u{e9}",
+            "a/b",
+            "..",
+            &"a".repeat(MAX_STAGE_NAME_LEN + 1),
+        ] {
+            assert!(
+                errs(&[bad]).iter().any(|e| e.contains(".name:")),
+                "{bad:?} should be rejected"
+            );
+        }
+        // Names that sanitize to one directory are not both accepted.
+        assert!(!errs(&["Code", "code"]).is_empty());
+        assert!(stage_name_problem("x y").is_some());
+        assert!(stage_name_problem("").is_some());
+        // `next` must name a configured (hence canonical) stage.
+        let cfg = cfg_with(vec![stage("a", Some("unstaged"))]);
+        assert!(validate_pipeline(&cfg).iter().any(|e| e.contains(".next:")));
     }
 
     #[test]
