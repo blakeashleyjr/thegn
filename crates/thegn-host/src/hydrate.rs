@@ -1691,44 +1691,66 @@ fn collect_sidebar_status(
     // keys the repo-wide `pr_branch_cache` (item 28). `clean` is false when any
     // read errored (and reused its prior value) — those rows must not overwrite
     // the cache. See `merge_glyph_scan`.
-    let prior_for_scan = &prior_for_scan;
-    let scanned: Vec<(String, GlyphRow, bool)> = std::thread::scope(|s| {
-        let handles: Vec<_> = to_scan
-            .iter()
-            .map(|p| {
-                s.spawn(move || {
-                    let wt = std::path::Path::new(p);
-                    let loc = GitLoc::for_worktree(wt);
-                    let repo_root =
-                        thegn_core::repo::main_worktree(wt).unwrap_or_else(|| wt.to_path_buf());
-                    let include_submodules = app_cfg.repo_git(&repo_root).submodules
-                        != thegn_core::config::SubmoduleMode::Off;
-                    // One batched round-trip for a bridged loc (status + ahead/
-                    // behind + branch), gix/CLI reads for a local one.
-                    let reads = crate::git_handle::get()
-                        .glyph_reads_with_submodules(&loc, include_submodules);
-                    let dirty = reads.dirty.map_err(|_| ());
-                    let ahead_behind = reads.ahead_behind.map_err(|_| ());
-                    let branch = reads.branch.map(Some).map_err(|_| ());
-                    let uncommitted = reads.uncommitted.map_err(|_| ());
-                    let branch_diff = reads.branch_diff.map_err(|_| ());
-                    let submodule_dirty = reads.submodule_dirty.map_err(|_| ());
-                    let (row, clean) = merge_glyph_scan(
-                        prior_for_scan.get(p),
-                        dirty,
-                        ahead_behind,
-                        branch,
-                        repo_root.to_string_lossy().into_owned(),
-                        uncommitted,
-                        branch_diff,
-                        submodule_dirty,
-                    );
-                    (p.clone(), row, clean)
-                })
-            })
-            .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
-    });
+    // Bounded: every scan runs on the shared `scan_pool` (THE-652), never one
+    // native thread per worktree. Job inputs are resolved here (cheap) so the
+    // jobs are `'static`; the active worktree is admitted first.
+    let jobs: Vec<(bool, Box<dyn FnOnce() -> (GlyphRow, bool) + Send + 'static>)> = to_scan
+        .iter()
+        .map(|p| {
+            let wt = std::path::Path::new(p);
+            let repo_root = thegn_core::repo::main_worktree(wt).unwrap_or_else(|| wt.to_path_buf());
+            let include_submodules = app_cfg.repo_git(&repo_root).submodules
+                != thegn_core::config::SubmoduleMode::Off;
+            let prior = prior_for_scan.get(p).cloned();
+            let urgent = active_path.as_deref() == Some(p.as_str());
+            let path = p.clone();
+            let job: Box<dyn FnOnce() -> (GlyphRow, bool) + Send + 'static> = Box::new(move || {
+                let loc = GitLoc::for_worktree(std::path::Path::new(&path));
+                // One batched round-trip for a bridged loc (status + ahead/
+                // behind + branch), gix/CLI reads for a local one.
+                let reads =
+                    crate::git_handle::get().glyph_reads_with_submodules(&loc, include_submodules);
+                merge_glyph_scan(
+                    prior.as_ref(),
+                    reads.dirty.map_err(|_| ()),
+                    reads.ahead_behind.map_err(|_| ()),
+                    reads.branch.map(Some).map_err(|_| ()),
+                    repo_root.to_string_lossy().into_owned(),
+                    reads.uncommitted.map_err(|_| ()),
+                    reads.branch_diff.map_err(|_| ()),
+                    reads.submodule_dirty.map_err(|_| ()),
+                )
+            });
+            (urgent, job)
+        })
+        .collect();
+    // (path, GlyphRow, clean) — git only, no DB access. `clean` is false when
+    // any read errored (and reused its prior value) — those rows must not
+    // overwrite the cache. A scan that panicked or got no worker is an explicit
+    // degraded outcome: every read errored, so it keeps the last-known row (or
+    // stays absent), never a fabricated clean one.
+    let outcomes = crate::scan_pool::ScanPool::global().run(jobs);
+    let scanned: Vec<(String, GlyphRow, bool)> = to_scan
+        .iter()
+        .zip(outcomes)
+        .map(|(p, out)| {
+            let (row, clean) = out.unwrap_or_else(|| {
+                let wt = std::path::Path::new(p);
+                let repo_root = thegn_core::repo::main_worktree(wt).unwrap_or_else(|| wt.to_path_buf());
+                merge_glyph_scan(
+                    prior_for_scan.get(p),
+                    Err(()),
+                    Err(()),
+                    Err(()),
+                    repo_root.to_string_lossy().into_owned(),
+                    Err(()),
+                    Err(()),
+                    Err(()),
+                )
+            });
+            (p.clone(), row, clean)
+        })
+        .collect();
 
     // Refresh the cache with the fresh rows and drop entries for worktrees that
     // are no longer present (bounds growth across the process lifetime). A
