@@ -1135,9 +1135,16 @@ start-term-release name="dev" backend="": release-profiling (_apply-backend back
 # What the host did NOT honour until now was the rotation/dir knobs: it passed
 # hardcoded defaults, pinning the ceiling at 5 MB x 5 whatever you configured.
 #
-# Linux/default profile: stage a build, then confirm backup/install/launch.
-# Close existing controllers and daemons yourself when prompted. Never kills
-# processes or overrides database migration authority. See docs/live-upgrades.md.
+# Linux/default profile, six unattended steps: preflight, build (the running
+# instance keeps working; all cores, persistent target/live-cache so only what
+# changed recompiles), validate config with the NEW build, stop this
+# installation's controllers then its pane daemon (5 s Ctrl-C window), back up
+# DB + binary and install, launch (the DB migrates on first start; `thegn
+# doctor` is captured to the recovery dir). Run from inside thegn it reopens
+# itself in a fresh ghostty window, since stopping thegn would kill this pane.
+# Only processes running this exact binary are signalled; anything else named
+# thegn blocks with its pid. Never overrides migration authority. See
+# docs/live-upgrades.md.
 [positional-arguments]
 live level="debug" size_mb="20" files="5":
     python3 -B scripts/live.py --level "$1" --size-mb "$2" --files "$3"

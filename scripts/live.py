@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-"""Operator-supervised Linux upgrade; never a shutdown or readiness protocol.
+"""Stepped Linux upgrade of the real instance: build, validate, stop, back up,
+install, launch. Never a readiness protocol.
 
 Assumes a stable current-user namespace, not hostile same-UID/root processes.
 /proc observations and cooperative flocks cannot exclude legacy restarts. SQLite
 backup deadlines are checked between backup steps, not cancellation of kernel I/O.
+Only processes whose live executable IS the installation target are signalled;
+other `thegn`/`tg` processes block the upgrade and are named, never touched.
 """
 
 import argparse
@@ -13,11 +16,14 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
+import signal
 import sqlite3
 import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import tomllib
 
@@ -28,10 +34,18 @@ MAX_CONFIG = 1024 * 1024
 BACKUP_SECONDS = 60
 BUILD = ["cargo", "build", "--locked", "--release", "--features", "profiling", "-p", "thegn-host", "--bin", "thegn"]
 LIVE_STAGE_PREFIX = ".thegn-live-build-"
+LIVE_CACHE = "live-cache"
 LIVE_STAGE_MARKER = ".thegn-live-build.marker"
 LIVE_STAGE_LOCK = ".thegn-live-build.lock"
 MAX_RETAINED_LIVE_STAGES = 2
 MAX_STAGE_ENTRIES = 100_000
+STOP_COUNTDOWN = 5          # seconds to Ctrl-C before anything is stopped
+CONTROLLER_GRACE = 10       # SIGTERM'd UI controllers persist their session and exit
+DAEMON_STOP_SECONDS = 20    # `thegn daemon stop` round-trip bound
+DAEMON_GRACE = 15           # daemon drains its panes after the shutdown request
+KILL_GRACE = 5              # after SIGKILL of the exact-target leftovers
+DOCTOR_DELAY = 20           # let the new controller finish startup/migration first
+STEPS = 6
 
 
 class Refusal(Exception):
@@ -392,12 +406,192 @@ def retain_live_stages(paths, current=None):
             os.close(target_fd)
 
 
-def prebuild_preflight(paths, env):
-    """Recheck source and quiescence, then briefly reserve the schema lease."""
-    source_revision(paths["repo"], env)
-    quiescent(paths)
-    with locked(Path(str(paths["database"]) + ".schema.lock"), schema=True):
-        quiescent(paths)
+def step(number, text):
+    print(f"\n==> [{number}/{STEPS}] {text}", flush=True)
+
+
+def _status_field(status_text, field):
+    for line in status_text.splitlines():
+        if line.startswith(field + ":"):
+            parts = line.split(maxsplit=1)
+            return parts[1].strip() if len(parts) == 2 else ""
+    return ""
+
+
+def thegn_ancestor(proc=Path("/proc"), start=None):
+    """The pid of a `thegn`/`tg` ancestor of this process, or None.
+
+    Stopping the instance would kill a shell running inside one of its panes,
+    and with it this upgrade halfway through.
+    """
+    pid = os.getppid() if start is None else start
+    for _ in range(64):
+        if pid <= 1:
+            return None
+        try:
+            status_text = read_small(proc / str(pid) / "status", 65536).decode("ascii", "replace")
+        except (OSError, Refusal):
+            return None
+        if comm(status_text) in ("thegn", "tg"):
+            return pid
+        try:
+            pid = int(_status_field(status_text, "PPid"))
+        except ValueError:
+            return None
+    return None
+
+
+def relaunch_outside(argv, env, repo):
+    """Re-run this upgrade in a fresh terminal that does not belong to thegn.
+
+    The new window gets its own session (setsid) and, where available, its own
+    systemd scope, so neither the pane's process group nor its cgroup takes it
+    down when the daemon stops.
+    """
+    terminal = shutil.which("ghostty", path=env.get("PATH"))
+    if terminal is None:
+        raise Refusal("This shell runs inside thegn, which the upgrade must stop; run `just live` "
+                      "from a terminal outside thegn (ghostty was not found to open one)")
+    child_env = {key: value for key, value in env.items() if key not in ("THEGN_SESSION_ID", "THEGN_CONTROL_SOCKET")}
+    command = [terminal, "--config-default-files=false", f"--config-file={repo / 'config/ghostty.config'}",
+               "--wait-after-command=true", "-e", sys.executable, "-B", str(Path(__file__).resolve()), *argv]
+    systemd_run = shutil.which("systemd-run", path=env.get("PATH"))
+    if systemd_run is not None:
+        command = [systemd_run, "--user", "--scope", "--collect", "--quiet", *command]
+    subprocess.Popen(command, cwd=repo, env=child_env, start_new_session=True,
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    print("This shell runs inside thegn, which the upgrade has to stop.")
+    print("Continuing in a new terminal window; this one can be closed.")
+
+
+def validate_config(binary, env, run=subprocess.run):
+    """Fail before anything is stopped if the NEW build rejects the config."""
+    try:
+        result = run([str(binary), "config", "validate"], env=env, stdout=subprocess.PIPE,
+                     stderr=subprocess.STDOUT, timeout=60)
+    except (OSError, subprocess.SubprocessError) as error:
+        raise Refusal(f"Could not run the new build's config validation: {error}") from None
+    lines = [line for line in result.stdout.decode("utf-8", "replace").splitlines()
+             if line.strip() and not line.startswith(("thegn: config:", "WARN "))]
+    for line in lines[-10:]:
+        print(f"  {line}")
+    if result.returncode != 0:
+        raise Refusal("The new build rejects the configuration; nothing was stopped")
+
+
+def target_processes(target, proc=Path("/proc")):
+    """(pid, is_daemon) for every process whose live executable IS `target`.
+
+    Identity comes from `/proc/<pid>/exe` at the moment of the scan, never from
+    a pid file or a command-line pattern, so another checkout's or another
+    profile's thegn is never selected.
+    """
+    want_path, want_identity = str(target), identity(target)
+    found = []
+    with os.scandir(proc) as processes:
+        for entry in processes:
+            if not entry.name.isdigit() or int(entry.name) == os.getpid():
+                continue
+            base = Path(entry.path)
+            try:
+                link = os.readlink(base / "exe")
+            except OSError:
+                continue
+            if link.removesuffix(" (deleted)") != want_path:
+                continue
+            try:
+                if identity(base / "exe") != want_identity:
+                    continue
+                argv = (base / "cmdline").read_bytes().split(b"\0")
+            except OSError:
+                continue
+            found.append((int(entry.name), len(argv) > 1 and argv[1] == b"daemon"))
+    return found
+
+
+def wait_quiet(paths, seconds, sleep=time.sleep, now=time.monotonic):
+    """None once nothing observable uses the install/DB, else the last refusal."""
+    deadline = now() + seconds
+    while True:
+        try:
+            quiescent(paths)
+            return None
+        except Refusal as error:
+            if now() >= deadline:
+                return error
+            sleep(0.25)
+
+
+def _signal_all(pids, sig, kill):
+    for pid in pids:
+        with contextlib.suppress(ProcessLookupError):
+            kill(pid, sig)
+
+
+def stop_running(paths, env, proc=Path("/proc"), sleep=time.sleep, now=time.monotonic,
+                 run=subprocess.run, kill=os.kill):
+    """Stop this installation's controllers, then its daemon; escalate only on them.
+
+    Order matters: controllers are asked first (SIGTERM is their graceful-quit
+    path, which persists the session layout) while the daemon still serves
+    them; then the daemon gets its own shutdown request.
+    """
+    target = paths["target"]
+    controllers = [pid for pid, daemon in target_processes(target, proc) if not daemon]
+    if controllers:
+        print(f"  asking {len(controllers)} thegn controller(s) to quit: {' '.join(map(str, controllers))}")
+        _signal_all(controllers, signal.SIGTERM, kill)
+        deadline = now() + CONTROLLER_GRACE
+        while now() < deadline and any(not d for _, d in target_processes(target, proc)):
+            sleep(0.25)
+    if any(d for _, d in target_processes(target, proc)):
+        print("  stopping the pane daemon (thegn daemon stop)")
+        try:
+            result = run([str(target), "daemon", "stop"], env=env, stdout=subprocess.PIPE,
+                         stderr=subprocess.STDOUT, timeout=DAEMON_STOP_SECONDS)
+            if result.returncode != 0:
+                print(f"  daemon stop exited {result.returncode}; falling back to signals")
+        except (OSError, subprocess.SubprocessError) as error:
+            print(f"  daemon stop failed ({error}); falling back to signals")
+    if wait_quiet(paths, DAEMON_GRACE, sleep, now) is None:
+        return
+    for sig, grace in ((signal.SIGTERM, DAEMON_GRACE), (signal.SIGKILL, KILL_GRACE)):
+        leftovers = [pid for pid, _ in target_processes(target, proc)]
+        if leftovers:
+            print(f"  sending {sig.name} to {' '.join(map(str, leftovers))}")
+            _signal_all(leftovers, sig, kill)
+        error = wait_quiet(paths, grace, sleep, now)
+        if error is None:
+            return
+    raise Refusal(f"{error}. Only processes running this installation's binary are stopped "
+                  "automatically; stop the named one yourself and rerun (the staged build is kept)")
+
+
+def countdown(seconds, sleep=time.sleep):
+    for remaining in range(seconds, 0, -1):
+        print(f"\r  stopping thegn in {remaining}s; Ctrl-C aborts and keeps the staged build ", end="", flush=True)
+        sleep(1)
+    print(flush=True)
+
+
+def doctor_later(target, env, output, delay=DOCTOR_DELAY, run=subprocess.run, sleep=time.sleep):
+    """Capture `thegn doctor` once the new controller has had time to start."""
+    def work():
+        sleep(delay)
+        try:
+            result = run([str(target), "doctor"], env=env, stdout=subprocess.PIPE,
+                         stderr=subprocess.STDOUT, timeout=120)
+            text = result.stdout
+        except (OSError, subprocess.SubprocessError) as error:
+            text = f"doctor did not run: {error}\n".encode()
+        with contextlib.suppress(OSError):  # best-effort: diagnostics only
+            fd = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(text)
+
+    thread = threading.Thread(target=work, name="thegn-live-doctor", daemon=True)
+    thread.start()
+    return thread
 
 
 @contextlib.contextmanager
@@ -540,6 +734,17 @@ def source_revision(repo, env, require_clean=True):
     return revision
 
 
+def live_cache(paths):
+    """The persistent private Cargo target dir reused by every `just live`."""
+    cache = paths["repo"] / "target" / LIVE_CACHE
+    try:
+        cache.mkdir(mode=0o700)
+    except FileExistsError:
+        pass
+    directories(cache, private=True)
+    return cache
+
+
 def build_stage(paths, env):
     revision = source_revision(paths["repo"], env)
     source = read_small(paths["repo"] / "crates/thegn-core/src/db.rs")
@@ -548,15 +753,30 @@ def build_stage(paths, env):
         raise Refusal("Cannot determine this source's database schema version")
     schema = int(versions[0])
     retain_live_stages(paths)
+    cache = live_cache(paths)
     stage = Path(tempfile.mkdtemp(prefix=".thegn-live-build-", dir=paths["repo"] / "target"))
     print(f"Retaining staged build at {stage}", flush=True)
-    build_env = dict(env, RUSTC_WRAPPER="", CARGO_TARGET_DIR=str(stage / "output"), CARGO_BUILD_BUILD_DIR=str(stage / "intermediate"))
+    # One persistent, private build cache for `just live` only: a rebuild after a
+    # few commits recompiles just what changed instead of all ~600 crates. It is
+    # still isolated from every other worktree's and profile's Cargo output, and
+    # from target/release (the installed binary). Serialized by the launcher
+    # locks and Cargo's own build-dir lock. All cores: the build is the wait.
+    build_env = dict(env, RUSTC_WRAPPER="", CARGO_TARGET_DIR=str(cache), CARGO_BUILD_BUILD_DIR=str(cache / "intermediate"),
+                     CARGO_BUILD_JOBS=str(os.cpu_count() or 1))
     with _stage_build_lock(stage):
         _mark_stage(stage)
+        started = time.monotonic()
         subprocess.run(BUILD, cwd=paths["repo"], env=build_env, check=True)
+        print(f"  built in {time.monotonic() - started:.0f}s", flush=True)
         if source_revision(paths["repo"], env) != revision:
             raise Refusal("Source changed during build; artifact retained but not admitted")
+        built = cache / "release/thegn"
+        regular(built, executable=True)
+        # The stage holds the admitted artifact; the cache's copy is overwritten
+        # by the next build, so the checksum binds this copy, not that one.
         binary = stage / "output/release/thegn"
+        binary.parent.mkdir(parents=True, mode=0o700)
+        copy_file(built, binary, time.monotonic() + BACKUP_SECONDS, 0o755)
         regular(binary, executable=True)
         # Observed Git metadata, not exact commit materialization/content proof.
         record = {"repo": str(paths["repo"]), "stage": str(stage), "observed_revision": revision,
@@ -660,7 +880,9 @@ def main(argv=None):
     parser.add_argument("--level", default="debug", choices=("trace", "debug", "info", "warn", "error"))
     parser.add_argument("--size-mb", type=int, default=20)
     parser.add_argument("--files", type=int, default=5)
-    args = parser.parse_args(argv)
+    parser.add_argument("--yes", action="store_true", help="Skip the Ctrl-C window before thegn is stopped")
+    raw_argv = sys.argv[1:] if argv is None else list(argv)
+    args = parser.parse_args(raw_argv)
     if not 1 <= args.size_mb <= 1024 or not 1 <= args.files <= 100:
         raise Refusal("Log limits must be 1..1024 MiB and 1..100 rotations")
     env = dict(os.environ)
@@ -674,25 +896,38 @@ def main(argv=None):
     print("Brand moves disabled with THEGN_NO_MIGRATE=1; database migration policy is not overridden.")
     if args.plan:
         return 0
+    if thegn_ancestor() is not None:
+        relaunch_outside(raw_argv, env, repo)
+        return 0
     if not sys.stdin.isatty() or not sys.stdout.isatty():
-        raise Refusal("A real terminal and explicit install confirmation are required")
+        raise Refusal("A real terminal is required: the new controller launches in the foreground")
     with locked(paths["target"].parent / ".thegn-live-install.lock"), locked(paths["state"] / "live-upgrade.lock"):
-        prebuild_preflight(paths, env)
-        print("Preflight passed: source is clean, observed processes are quiescent, and the schema lease was available.")
+        step(1, "Preflight: clean source and supported paths")
+        source_revision(repo, env)
+        step(2, "Build (the running instance keeps working meanwhile)")
         _stage, binary, record = build_stage(paths, env)
-        print("Save work. Manually stop ALL thegn controllers/daemons and disable automatic restarts.")
-        if input("Type INSTALL AND LAUNCH to confirm backups, replacement and normal startup: ") != "INSTALL AND LAUNCH":
-            raise Refusal("Not confirmed; staged build retained, installed executable unchanged")
+        step(3, "Validate the configuration with the NEW build")
+        validate_config(binary, env)
+        step(4, "Stop the running thegn (controllers, then the pane daemon)")
+        if not args.yes:
+            countdown(STOP_COUNTDOWN)
+        stop_running(paths, env)
         # Re-read policy and path constraints after the potentially long build.
         if settings(repo, env) != paths:
             raise Refusal("Upgrade paths changed while building")
         if source_revision(repo, env) != record["observed_revision"]:
             raise Refusal("Source changed after build; installation refused")
+        step(5, "Back up the database and old binary, then install")
         logs = paths["state"] / "logs"
         if logs.exists() or logs.is_symlink():
             directories(logs)  # Existing normal 0755 logs are under private state.
         with locked(Path(str(paths["database"]) + ".schema.lock"), schema=True):
             recovery = install(paths, binary, record, env)
+        print(f"  recovery (database backup + previous binary): {recovery}")
+        step(6, "Launch (the database migrates on this first start)")
+        doctor_report = recovery / "doctor.txt"
+        print(f"  `thegn doctor` will be captured to {doctor_report} about {DOCTOR_DELAY}s after launch")
+        doctor_later(paths["target"], env, doctor_report)
         child_env = dict(env, THEGN_NO_MIGRATE="1", RUST_BACKTRACE="full", THEGN_LOG=f"{args.level},log=error",
                          THEGN_LOG_ROTATION_SIZE_MB=str(args.size_mb), THEGN_LOG_MAX_FILES=str(args.files), THEGN_PERF="1")
         # Retain the launcher lock in this supervisor for the entire foreground

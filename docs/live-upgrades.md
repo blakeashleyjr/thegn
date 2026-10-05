@@ -23,29 +23,54 @@ artifact that is copied into the installation.
 
 ## Upgrade sequence
 
-1. Check the supported paths and migration policy. The helper then holds both
-   launcher locks, rechecks the clean checkout and observable same-user process
-   state, and briefly acquires and releases the database schema lock. This
-   preflight lease is released before the build and is not a promise that a
-   process cannot start later.
-2. Build the release host with profiling in fresh, isolated Cargo output and
-   intermediate directories. The existing installed executable remains untouched
-   during the build. Every stage is marked as owned before Cargo starts, so a
-   failed build remains available for inspection.
-3. Close the old controllers and daemons yourself, including any automatic
-   restart service. Save pane work first. Confirm the displayed installation
-   before proceeding. The helper never signals existing controllers or daemons
-   and never trusts a stale PID file.
-4. Check again for observable same-user processes using the destination
-   executable or database files, acquire the database schema lock, and create a
-   private recovery directory containing an online SQLite backup and a copy of
-   the old executable. Failures before installation leave the installed
-   executable unchanged.
-5. Atomically replace the executable and launch it in the foreground with
-   profiling and rotating logs enabled. Database migration is performed by the
-   normal controller startup under the existing migration authority. The helper
-   does not override `THEGN_DATABASE_MIGRATION_EXECUTABLE` or grant itself migration
-   permission. Keep the terminal open while this supervised launch is running.
+`just live` runs six steps without a typed confirmation, printing
+`==> [n/6]` as it goes:
+
+1. **Preflight.** Check the supported paths and migration policy, take both
+   launcher locks, and recheck the clean checkout.
+2. **Build** the release host with profiling, on every core, in one persistent
+   private build cache (`target/live-cache`). Each upgrade therefore recompiles
+   only what changed since the last one. Only the first `just live` builds
+   everything. The cache is used by `just live` alone, so it stays isolated from
+   other worktrees' Cargo output and from `target/release`, which is the
+   installation. The running instance keeps working and the installed executable
+   is untouched. The finished binary is copied into a fresh stage, which is the
+   checksummed artifact that gets installed. Every stage is marked as owned
+   before Cargo starts, so a failed build remains available for inspection.
+3. **Validate** the configuration with the _new_ build (`thegn config validate`).
+   A rejection stops here, before anything running is touched.
+4. **Stop** the running instance after a 5-second window in which Ctrl-C aborts
+   (`--yes` skips it). Controllers are sent SIGTERM first, which is their
+   graceful-quit path, so the session layout is persisted while the daemon still
+   serves them. Then the pane daemon gets `thegn daemon stop`. Pane processes end
+   with the daemon. Anything of this installation still running after the grace
+   periods gets SIGTERM, then SIGKILL.
+   Only processes whose live `/proc/<pid>/exe` _is_ the installation target are
+   ever signalled; identity never comes from a pid file or a command-line
+   pattern. Any other visible same-user `thegn`/`tg`, such as another checkout,
+   another profile or a test fixture, blocks the upgrade with its pid and is
+   left alone. The staged build is kept, so a rerun after you stop it is quick.
+5. **Back up and install.** Check again for observable same-user processes using
+   the destination executable or database files, then acquire the database
+   schema lock. Create a private recovery directory holding an online SQLite
+   backup and a copy of the old executable, then atomically replace the
+   executable. Failures before the replacement leave the installed executable
+   unchanged.
+6. **Launch** in the foreground with profiling and rotating logs enabled.
+   Database migration is performed by the normal controller startup under the
+   existing migration authority. The helper does not override
+   `THEGN_DATABASE_MIGRATION_EXECUTABLE` or grant itself migration permission.
+   About 20 seconds after launch, `thegn doctor` output is captured to
+   `doctor.txt` in the recovery directory. Keep the terminal open while this
+   supervised launch is running.
+
+**Running it from inside thegn.** A shell in a thegn pane would die with the
+daemon at step 4, taking the upgrade with it. When the helper finds a
+`thegn`/`tg` among its ancestors, it reopens itself in a fresh ghostty window and
+exits. That window runs in its own session and, when `systemd-run` is available,
+in its own user scope, so it survives the stop. The window stays open after the
+command ends, so a refusal can be read. Without ghostty the helper refuses and
+asks you to run it from an outside terminal.
 
 The default rotating application log allowance is 120 MB: 20 MB active plus five
 rotations. `just live trace` changes verbosity; `just live debug 5 2` requests
@@ -62,8 +87,9 @@ Recovery descriptors omit transient staged-build paths, so completed upgrades do
 not pin every successful stage; explicit legacy or external recovery references
 remain protected.
 Each recovery directory retains its own `thegn-stderr.log`; the previous shared
-stderr file is not truncated. Fresh isolated builds trade incremental build speed
-and disk use for separation from other worktrees' Cargo outputs.
+stderr file is not truncated. `target/live-cache` is never pruned
+automatically; `rm -rf target/live-cache` only costs the next upgrade a full
+build.
 
 ## Support boundary
 
@@ -76,8 +102,8 @@ Use the normal application configuration workflow for other profiles or pins.
 Hard-linked databases are unsupported because another alias can use a different
 schema lock. Hard-linked installed binaries can be replaced without changing
 their other links. The conservative process scan also refuses other visible
-same-user `thegn`/`tg` executables; it does not infer that another instance is safe
-merely from a different state root or socket name.
+same-user `thegn`/`tg` executables. It does not infer that another instance is safe
+merely from a different state root or socket name, and it never signals one.
 The helper suppresses the legacy brand-directory rename during launch; it does
 not suppress or bypass database schema migration.
 
@@ -107,7 +133,8 @@ decision and can discard changes made after that backup.
 
 `just test-live` (also included in `just test`) runs private regression tests
 without a real build, live controller shutdown, live database migration or
-installed-binary replacement.
+installed-binary replacement. Process selection, stop ordering and escalation
+are tested against a fake `/proc` and injected signal and subprocess functions.
 Real controller startup and migration remain a separate operator-controlled
 verification step. THE-613 tracks this bounded upgrade helper; THE-436 retains
 generation-bound automatic shutdown and the other developer launcher recipes.
