@@ -3,6 +3,7 @@
 
 use super::{GitBackend, gpg_args, run_stdin, run_w};
 use anyhow::Result;
+use thegn_core::git_operand as op;
 use thegn_core::remote::GitLoc;
 
 /// `git reset` flavor for reset-to-commit.
@@ -74,6 +75,7 @@ pub trait CommitOps: GitBackend {
     /// (`-m N`, 1-based). A conflict surfaces as REVERT_HEAD via
     /// `merge_state`.
     fn revert(&self, loc: &GitLoc, sha: &str, mainline: Option<u32>) -> Result<()> {
+        let sha = op::revision(sha)?;
         let m;
         let mut args = vec!["revert", "--no-edit"];
         if let Some(n) = mainline {
@@ -95,6 +97,7 @@ pub trait CommitOps: GitBackend {
     /// Tag `sha` — lightweight, or annotated when `annotate` carries a
     /// message.
     fn tag(&self, loc: &GitLoc, name: &str, sha: &str, annotate: Option<&str>) -> Result<()> {
+        let (name, sha) = (op::tag_name(name)?, op::revision(sha)?);
         match annotate {
             Some(msg) => run_w(loc, &[], &["tag", "-a", "-m", msg, name, sha]).map(|_| ()),
             None => run_w(loc, &[], &["tag", name, sha]).map(|_| ()),
@@ -102,16 +105,19 @@ pub trait CommitOps: GitBackend {
     }
 
     fn delete_tag(&self, loc: &GitLoc, name: &str) -> Result<()> {
+        let name = op::tag_name(name)?;
         run_w(loc, &[], &["tag", "-d", name]).map(|_| ())
     }
 
     fn push_tag(&self, loc: &GitLoc, remote: &str, name: &str) -> Result<()> {
+        let (remote, name) = (op::remote_name(remote)?, op::tag_name(name)?);
         run_w(loc, &[], &["push", remote, name]).map(|_| ())
     }
 
     /// `git reset --soft|--mixed|--hard <sha>`. Hard is destructive —
     /// confirm at the call site.
     fn reset_to(&self, loc: &GitLoc, sha: &str, mode: ResetMode) -> Result<()> {
+        let sha = op::revision(sha)?;
         run_w(loc, &[], &["reset", mode.flag(), sha]).map(|_| ())
     }
 }
