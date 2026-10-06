@@ -664,6 +664,10 @@ mod tests {
     /// highest-pid heuristic returns a background `sleep`.
     #[test]
     #[cfg(target_os = "linux")]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test-only probe for a bash binary; not on any runtime path"
+    )]
     fn foreground_child_ignores_newer_background_jobs_on_a_real_pty() {
         use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
         use std::os::unix::process::CommandExt;
