@@ -285,7 +285,8 @@ fn tree_to_tree(old: &gix::Tree<'_>, new: &gix::Tree<'_>) -> Result<Vec<DiffEntr
 }
 
 /// First-occurrence-order dedup in expected O(N) (hash set, byte-exact keys).
-#[cfg(test)]
+/// The set holds a clone of each key (duplicate storage is accepted: hashing
+/// the bytes to a `u64` would need a collision fallback, which is overkill).
 fn dedup_in_order<K: std::hash::Hash + Eq + Clone>(items: impl IntoIterator<Item = K>) -> Vec<K> {
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
@@ -335,25 +336,23 @@ fn tree_to_worktree(repo: &gix::Repository, rev: &str) -> Result<Vec<DiffEntry>>
 
     // Enumerate the paths that differ from HEAD — staged and unstaged both,
     // which together are exactly what `git diff HEAD` reports.
-    // Order-preserving O(1)-per-item dedup: a path appears once per staged and
-    // once per unstaged change, and a linear `contains` scan was O(N^2).
-    let mut paths: Vec<gix::bstr::BString> = Vec::new();
-    let mut seen: std::collections::HashSet<gix::bstr::BString> = std::collections::HashSet::new();
+    // A path appears once per staged and once per unstaged change; dedup is
+    // order-preserving and O(1) per item (a linear `contains` was O(N^2)).
     let iter = repo
         .status(gix::progress::Discard)
         .context("gix status")?
         .untracked_files(gix::status::UntrackedFiles::None)
         .into_iter(None)
         .context("gix status iter")?;
+    let mut status_paths: Vec<gix::bstr::BString> = Vec::new();
     for item in iter {
         let item = item.context("gix status item")?;
         if let Some(p) = item.location().to_owned().into() {
             let p: gix::bstr::BString = p;
-            if seen.insert(p.clone()) {
-                paths.push(p);
-            }
+            status_paths.push(p);
         }
     }
+    let paths = dedup_in_order(status_paths);
 
     let mut out: Vec<DiffEntry> = Vec::new();
     for rela in paths {
