@@ -72,29 +72,58 @@ async fn reap_loop(svc: Arc<DaemonService>) {
         // so this needs no control round-trip to ourselves.
         let live_ids: Vec<String> = { svc.sessions.lock().await.keys().cloned().collect() };
         let db = svc.db.clone();
+        let fresh = svc.clone();
         // best-effort: a failed pass is retried on the next tick; a reap that
         // cannot read git must never take the daemon down.
-        let _ = tokio::task::spawn_blocking(move || reap_pass(&db, &live_ids)).await;
+        let _ = tokio::task::spawn_blocking(move || {
+            // THE-267: re-read liveness immediately before each mutation. The
+            // plan's slow git/fs probes widen the window in which a worker can
+            // open; `blocking_lock` is legal here (blocking pool, not async).
+            let fresh_live = move || -> Option<Vec<String>> {
+                Some(fresh.sessions.blocking_lock().keys().cloned().collect())
+            };
+            reap_pass(&db, &live_ids, &fresh_live)
+        })
+        .await;
     }
 }
 
 /// One reconciliation pass. Separated from the timer so the policy is readable
 /// (and so a future caller — `thegn doctor`, say — can run it directly).
-fn reap_pass(db: &super::service::SharedDb, live_ids: &[String]) {
+///
+/// `fresh_live` re-reads the daemon's live session ids right before a mutation
+/// (`None` = liveness unavailable). Every transition is also fenced on the
+/// (session, `run_gen`) captured with the row snapshot, so a plan built from a
+/// stale observation is a no-op, never a worker-gone verdict (THE-267).
+fn reap_pass(
+    db: &super::service::SharedDb,
+    live_ids: &[String],
+    fresh_live: &dyn Fn() -> Option<Vec<String>>,
+) {
     // Snapshot under the shared mutex, then release it before any filesystem
     // or git work. A large stale roster must not stop unrelated daemon DB
     // operations for the duration of hundreds of subprocesses.
-    let rows = match db.lock() {
+    let (rows, runs) = match db.lock() {
         Ok(db) => match db.list_dispatches() {
-            Ok(rows) => rows
-                .into_iter()
-                .filter(|r| {
-                    matches!(
-                        r.status,
-                        AgentDispatchStatus::Spawning | AgentDispatchStatus::Running
-                    )
-                })
-                .collect::<Vec<_>>(),
+            Ok(rows) => {
+                let rows = rows
+                    .into_iter()
+                    .filter(|r| {
+                        matches!(
+                            r.status,
+                            // Never `Spawning`: a retry reserves the row that way
+                            // mid-relaunch without bumping `run_gen`, so its old
+                            // session and exit stamp are not evidence about the
+                            // worker being opened. Fail closed.
+                            AgentDispatchStatus::Running
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                // Same lock as the roster snapshot: the generation each plan
+                // entry is fenced on. A row we cannot fence is not planned.
+                let runs = db.running_dispatch_run_refs().unwrap_or_default();
+                (rows, runs)
+            }
             Err(e) => {
                 tracing::debug!(target: "thegn::pipeline", error = %e, "reap pass could not snapshot");
                 return;
@@ -103,7 +132,31 @@ fn reap_pass(db: &super::service::SharedDb, live_ids: &[String]) {
         Err(_) => return,
     };
     let plan = crate::cmd::dispatch::reap_plan_rows(&rows, Some(live_ids));
+    // One fresh liveness read for the whole apply phase.
+    let fresh: Option<std::collections::HashSet<String>> =
+        fresh_live().map(|v| v.into_iter().collect());
     for r in &plan {
+        if !matches!(
+            r.verdict,
+            ReapVerdict::CloseDone | ReapVerdict::MarkFailed { .. }
+        ) {
+            continue;
+        }
+        let Some(run) = runs.iter().find(|x| x.id == r.id) else {
+            continue;
+        };
+        // Exact-session liveness, fresh: a session that is live now (opened
+        // after the snapshot) or an unreadable daemon is a no-op.
+        match &fresh {
+            Some(now) if !now.contains(&run.session_id) => {}
+            _ => {
+                tracing::debug!(
+                    target: "thegn::pipeline", row = r.id,
+                    "reap skipped: session live or liveness unavailable at apply"
+                );
+                continue;
+            }
+        }
         let db = match db.lock() {
             Ok(db) => db,
             Err(_) => return,
@@ -111,8 +164,8 @@ fn reap_pass(db: &super::service::SharedDb, live_ids: &[String]) {
         match &r.verdict {
             ReapVerdict::CloseDone => {
                 if matches!(
-                    db.compare_and_set_dispatch_status(
-                        r.id,
+                    db.compare_and_set_dispatch_status_run(
+                        run,
                         r.observed_status,
                         AgentDispatchStatus::Done,
                         None,
@@ -130,8 +183,8 @@ fn reap_pass(db: &super::service::SharedDb, live_ids: &[String]) {
                 // Park, do not fail. Status and reason are one atomic,
                 // compare-and-set transition: a concurrent human decision wins.
                 if matches!(
-                    db.compare_and_set_dispatch_status(
-                        r.id,
+                    db.compare_and_set_dispatch_status_run(
+                        run,
                         r.observed_status,
                         AgentDispatchStatus::WaitingHuman,
                         Some(&format!("reaped (daemon): {why}")),
@@ -232,7 +285,7 @@ mod tests {
         let id = row(&db, &wt, ".thegn/pipeline/THE-1/code/1.md");
         let shared = Arc::new(Mutex::new(db));
 
-        reap_pass(&shared, &[]);
+        reap_pass(&shared, &[], &|| Some(Vec::new()));
         {
             let db = shared.lock().unwrap();
             assert_eq!(
@@ -241,7 +294,7 @@ mod tests {
             );
             assert_eq!(db.dispatch_notes(id, None, 0).unwrap().len(), 1);
         }
-        reap_pass(&shared, &[]);
+        reap_pass(&shared, &[], &|| Some(Vec::new()));
         assert_eq!(
             shared
                 .lock()
@@ -273,7 +326,7 @@ mod tests {
             .unwrap();
         let shared = Arc::new(Mutex::new(db));
 
-        reap_pass(&shared, &[]);
+        reap_pass(&shared, &[], &|| Some(Vec::new()));
         assert_eq!(
             shared
                 .lock()
@@ -310,7 +363,7 @@ mod tests {
 
         // After restart, the session map can be empty while this row has no
         // durable exit stamp. The daemon and CLI both leave that ambiguous row.
-        reap_pass(&shared, &[]);
+        reap_pass(&shared, &[], &|| Some(Vec::new()));
         let db = shared.lock().unwrap();
         let row = db.get_dispatch(id).unwrap().unwrap();
         assert_eq!(row.status, AgentDispatchStatus::Running);
@@ -339,7 +392,9 @@ mod tests {
             .unwrap();
         let shared = Arc::new(Mutex::new(db));
 
-        reap_pass(&shared, &["live-session".to_string()]);
+        reap_pass(&shared, &["live-session".to_string()], &|| {
+            Some(vec!["live-session".to_string()])
+        });
         assert_eq!(
             shared
                 .lock()
@@ -350,5 +405,77 @@ mod tests {
                 .status,
             AgentDispatchStatus::Running
         );
+    }
+
+    #[test]
+    fn session_opened_after_the_live_snapshot_is_not_parked() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = Db::open_at(&dir.path().join("thegn.db")).unwrap();
+        let wt = dir.path().join("wt");
+        std::fs::create_dir(&wt).unwrap();
+        let id = row(&db, &wt, ".thegn/pipeline/THE-1/code/1.md");
+        let shared = Arc::new(Mutex::new(db));
+        // Stale snapshot lacks the session; the apply-time re-read has it.
+        reap_pass(&shared, &[], &|| Some(vec!["dead-session".to_string()]));
+        assert_eq!(status_of(&shared, id), AgentDispatchStatus::Running);
+    }
+
+    #[test]
+    fn unavailable_liveness_at_apply_is_a_noop() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = Db::open_at(&dir.path().join("thegn.db")).unwrap();
+        let wt = dir.path().join("wt");
+        std::fs::create_dir(&wt).unwrap();
+        let id = row(&db, &wt, ".thegn/pipeline/THE-1/code/1.md");
+        let shared = Arc::new(Mutex::new(db));
+        reap_pass(&shared, &[], &|| None);
+        assert_eq!(status_of(&shared, id), AgentDispatchStatus::Running);
+    }
+
+    #[test]
+    fn relaunch_between_plan_and_apply_is_not_parked() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = Db::open_at(&dir.path().join("thegn.db")).unwrap();
+        let wt = dir.path().join("wt");
+        std::fs::create_dir(&wt).unwrap();
+        let id = row(&db, &wt, ".thegn/pipeline/THE-1/code/1.md");
+        let shared = Arc::new(Mutex::new(db));
+        // The retry publishes the SAME session id (bumping run_gen) after the
+        // plan was built and after the fresh liveness read said "absent".
+        let relaunch = || {
+            shared
+                .lock()
+                .unwrap()
+                .stamp_dispatch_run(id, "dead-session", ".thegn/pipeline/THE-1/code/1.md")
+                .unwrap();
+            Some(Vec::new())
+        };
+        reap_pass(&shared, &[], &relaunch);
+        assert_eq!(status_of(&shared, id), AgentDispatchStatus::Running);
+    }
+
+    #[test]
+    fn spawning_row_with_old_exit_stamp_and_dead_session_is_not_parked() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = Db::open_at(&dir.path().join("thegn.db")).unwrap();
+        let wt = dir.path().join("wt");
+        std::fs::create_dir(&wt).unwrap();
+        let id = row(&db, &wt, ".thegn/pipeline/THE-1/code/1.md");
+        // A retry reserving the row mid-relaunch: Spawning, old exit stamp kept.
+        db.update_dispatch_status(id, AgentDispatchStatus::Spawning)
+            .unwrap();
+        let shared = Arc::new(Mutex::new(db));
+        reap_pass(&shared, &[], &|| Some(Vec::new()));
+        assert_eq!(status_of(&shared, id), AgentDispatchStatus::Spawning);
+    }
+
+    fn status_of(shared: &Arc<Mutex<Db>>, id: i64) -> AgentDispatchStatus {
+        shared
+            .lock()
+            .unwrap()
+            .get_dispatch(id)
+            .unwrap()
+            .unwrap()
+            .status
     }
 }
