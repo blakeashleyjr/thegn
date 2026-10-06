@@ -82,6 +82,7 @@ pub fn remote_target_guard(db: &Db, repo_root: &Path) -> Result<Option<String>> 
 /// convergence step after a sprite drains its own clone. Surfaces git's stderr
 /// on failure so a rejected push is a visible error, never a false success.
 pub fn push_target(repo_root: &Path, target: &str) -> Result<()> {
+    let target = thegn_core::git_operand::branch_name(target)?;
     #[expect(clippy::disallowed_methods)] // one-shot CLI push, not a loop read
     let out = util::git_cmd(repo_root)
         .args(["push", "origin", target])
@@ -646,5 +647,14 @@ mod tests {
             registered_remote_worktree(&db, "/local/alias").unwrap(),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod operand_tests {
+    #[test]
+    fn push_target_refuses_dash_branch_before_spawn() {
+        let e = super::push_target(std::path::Path::new("/nonexistent"), "--mirror").unwrap_err();
+        assert!(e.to_string().contains("begins with '-'"), "{e}");
     }
 }
