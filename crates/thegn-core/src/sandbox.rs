@@ -1772,6 +1772,19 @@ fn oci_emits_mount(m: &Mount) -> bool {
     !matches!(m.dest.as_str(), "/etc/resolv.conf" | "/etc/hosts")
 }
 
+/// Whether `oci_create_opts` adds the devenv `/nix:/nix:ro` bind for this spec.
+/// Shared with the sealed-reuse check so the `/nix` tolerance there is exactly
+/// the bind the CURRENT spec would itself create, never a leftover.
+fn emits_nix_bind(spec: &SandboxSpec) -> bool {
+    spec.devenv
+        && spec
+            .devenv_path
+            .as_deref()
+            .is_some_and(|p| p.starts_with("/nix"))
+        && std::path::Path::new("/nix").exists()
+        && guest_shares_host_abi(spec.backend, crate::sandbox_backend::host_os())
+}
+
 /// Label stamped at create recording whether the container was built for a
 /// sealed (`$HOME`-hiding) spec. The container name is per worktree, NOT per
 /// profile, so reuse must compare it or a `hardened` container (ro `$HOME`,
@@ -1781,16 +1794,22 @@ const SEAL_LABEL: &str = "thegn.seal_home";
 /// Whether a running container's bind sources satisfy the spec. Non-sealed: the
 /// required set must be a subset (historic behaviour). Sealed: the live set must
 /// EQUAL the required one — an extra bind could be `~/.ssh` — apart from the
-/// `/nix` bind `oci_create_opts` adds itself for devenv.
+/// `/nix` bind `oci_create_opts` adds itself for devenv, and only when the
+/// current spec would still add it (`nix_expected`): a container created with
+/// devenv on is recreated once devenv is off.
 fn mounts_match(
     required: &std::collections::HashSet<&str>,
     active: &std::collections::HashSet<&str>,
     sealed: bool,
+    nix_expected: bool,
 ) -> bool {
     if !required.iter().all(|r| active.contains(r)) {
         return false;
     }
-    !sealed || active.iter().all(|a| required.contains(a) || *a == "/nix")
+    !sealed
+        || active
+            .iter()
+            .all(|a| required.contains(a) || (nix_expected && *a == "/nix"))
 }
 
 /// Judge `inspect` output in thegn's probe format: line 1 `RUNNING` (or empty),
@@ -1802,6 +1821,7 @@ fn judge_inspect(
     stdout: &str,
     required: &std::collections::HashSet<&str>,
     sealed: bool,
+    nix_expected: bool,
 ) -> (bool, bool) {
     let mut lines = stdout.lines();
     if lines.next() != Some("RUNNING") {
@@ -1810,7 +1830,10 @@ fn judge_inspect(
     let label = lines.next().unwrap_or("").trim();
     let label_ok = if sealed { label == "1" } else { label != "1" };
     let active: std::collections::HashSet<&str> = lines.filter(|l| !l.is_empty()).collect();
-    (true, label_ok && mounts_match(required, &active, sealed))
+    (
+        true,
+        label_ok && mounts_match(required, &active, sealed, nix_expected),
+    )
 }
 
 /// `(running, mounts_ok)` parsed from Apple `container inspect`'s JSON.
@@ -1829,12 +1852,20 @@ fn judge_inspect(
 /// `[{ "status": { "state": "running" }, "configuration": { "mounts": [ { "source": … } ] } }]`
 #[cfg(test)]
 pub(crate) fn parse_apple_inspect(stdout: &str, required: &[&str]) -> (bool, bool) {
-    parse_apple_inspect_sealed(stdout, required, false)
+    parse_apple_inspect_sealed(stdout, required, false, false)
 }
 
 /// Apple has no verified `--label`, so a sealed spec is judged on mounts alone
 /// (and, because it never receives host mounts, equality is cheap and strict).
-fn parse_apple_inspect_sealed(stdout: &str, required: &[&str], sealed: bool) -> (bool, bool) {
+/// A sealed spec also refuses reuse when `configuration.mounts` is absent (as
+/// distinct from present and empty): with no label to lean on, an unreadable
+/// mount list must not pass as "nothing extra bound".
+fn parse_apple_inspect_sealed(
+    stdout: &str,
+    required: &[&str],
+    sealed: bool,
+    nix_expected: bool,
+) -> (bool, bool) {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(stdout) else {
         return (false, false);
     };
@@ -1849,10 +1880,14 @@ fn parse_apple_inspect_sealed(stdout: &str, required: &[&str], sealed: bool) -> 
     if !running {
         return (false, false);
     }
-    let active: std::collections::HashSet<&str> = first
+    let mounts = first
         .get("configuration")
         .and_then(|c| c.get("mounts"))
-        .and_then(|m| m.as_array())
+        .and_then(|m| m.as_array());
+    if sealed && mounts.is_none() {
+        return (true, false);
+    }
+    let active: std::collections::HashSet<&str> = mounts
         .map(|arr| {
             arr.iter()
                 .filter_map(|m| m.get("source")?.as_str())
@@ -1860,7 +1895,7 @@ fn parse_apple_inspect_sealed(stdout: &str, required: &[&str], sealed: bool) -> 
         })
         .unwrap_or_default();
     let req: std::collections::HashSet<&str> = required.iter().copied().collect();
-    (true, mounts_match(&req, &active, sealed))
+    (true, mounts_match(&req, &active, sealed, nix_expected))
 }
 
 /// Force-remove this spec's container on the SAME daemon `run -d` creates it on.
@@ -1883,6 +1918,7 @@ pub(crate) fn remove_container(spec: &SandboxSpec) {
 
 fn container_status(spec: &SandboxSpec) -> (bool, bool) {
     let sealed = spec.seal_home.is_some();
+    let nix_expected = emits_nix_bind(spec);
     let required: std::collections::HashSet<&str> = spec
         .mounts
         .iter()
@@ -1911,7 +1947,7 @@ fn container_status(spec: &SandboxSpec) -> (bool, bool) {
                 return (false, false); // container doesn't exist
             }
             let req: Vec<&str> = required.iter().copied().collect();
-            return parse_apple_inspect_sealed(&stdout, &req, sealed);
+            return parse_apple_inspect_sealed(&stdout, &req, sealed, nix_expected);
         }
         argv.extend([
             "container".into(),
@@ -1928,7 +1964,7 @@ fn container_status(spec: &SandboxSpec) -> (bool, bool) {
             return (false, false); // container doesn't exist
         }
         // First line must be "RUNNING" — "CREATED" / "EXITED" / missing → not usable.
-        judge_inspect(&stdout, &required, sealed)
+        judge_inspect(&stdout, &required, sealed, nix_expected)
     } else {
         // Remote: run the same inspect command over SSH to verify mounts.
         let mut remote_argv = oci_prefix(spec);
@@ -1942,7 +1978,7 @@ fn container_status(spec: &SandboxSpec) -> (bool, bool) {
         let Some((_, stdout)) = output_control_owned(spec, &remote_argv, PROBE_TIMEOUT) else {
             return (false, false);
         };
-        judge_inspect(&stdout, &required, sealed)
+        judge_inspect(&stdout, &required, sealed, nix_expected)
     }
 }
 
@@ -2736,12 +2772,7 @@ fn oci_create_opts(spec: &SandboxSpec) -> Result<Vec<String>, VolumeAdmissionErr
     // store holds Mach-O, so the "resolved absolute path" the guest would exec is
     // unrunnable there — and `/nix` is outside the VM's shared set, so the bind
     // fails the create before that ever matters.
-    if spec.devenv
-        && let Some(p) = &spec.devenv_path
-        && p.starts_with("/nix")
-        && std::path::Path::new("/nix").exists()
-        && guest_shares_host_abi(spec.backend, crate::sandbox_backend::host_os())
-    {
+    if emits_nix_bind(spec) {
         v.extend(["-v".into(), "/nix:/nix:ro".into()]);
     }
     // Host-sourced secrets (tokens, API keys) go to a 0600 `--env-file` so they

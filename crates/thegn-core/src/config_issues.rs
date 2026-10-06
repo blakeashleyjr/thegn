@@ -330,9 +330,9 @@ impl Default for KaneoConfig {
 /// The overlay is restrict-only: a repo may narrow an UNPINNED global scope
 /// (including choosing the default destination for user-initiated creates) but
 /// never widen it — providers are intersected with the globally enabled set and
-/// a non-empty global pin is a ceiling. Pins are applied to the legacy
-/// single-provider sub-tables only; in accounts mode (`[[issue_accounts]]`)
-/// each account carries its own scope and repo pins are not applied to it.
+/// a non-empty global pin is a ceiling. Pins apply to the legacy
+/// single-provider sub-tables and, in accounts mode (`[[issue_accounts]]`), to
+/// each matching account with the account's own pin as the ceiling.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct IssuesOverlay {
@@ -380,6 +380,37 @@ fn narrow_pin(field: &str, global: &mut String, repo: String, refused: &mut Vec<
         *global = repo;
     } else {
         refused.push(format!("{field} pin is outside the global scope"));
+    }
+}
+
+/// Kaneo workspace + project are ONE nested ceiling: a project may live in
+/// another workspace and the config layer cannot verify membership.
+fn narrow_kaneo(
+    g_ws: &mut String,
+    g_proj: &mut String,
+    ws_pin: Option<String>,
+    proj_pin: Option<String>,
+    refused: &mut Vec<String>,
+    who: &str,
+) {
+    let (orig_ws, orig_proj) = (g_ws.clone(), g_proj.clone());
+    if let Some(w) = ws_pin {
+        if orig_ws.is_empty() && !orig_proj.is_empty() && w != orig_ws {
+            refused.push(format!(
+                "{who}kaneo.workspace_id pin is outside the global scope"
+            ));
+        } else {
+            narrow_pin(&format!("{who}kaneo.workspace_id"), g_ws, w, refused);
+        }
+    }
+    if let Some(p) = proj_pin {
+        if orig_proj.is_empty() && !orig_ws.is_empty() && !p.is_empty() {
+            refused.push(format!(
+                "{who}kaneo.project_id pin is outside the global scope"
+            ));
+        } else {
+            narrow_pin(&format!("{who}kaneo.project_id"), g_proj, p, refused);
+        }
     }
 }
 
@@ -469,48 +500,68 @@ impl IssuesOverlay {
             // synthesis fallback (an empty/typo'd restriction ⇒ zero accounts).
             base.accounts_restricted = true;
         }
-        if let Some(t) = self.linear.team_id {
-            narrow_pin("linear.team_id", &mut base.linear.team_id, t, &mut refused);
+        let accounts_mode = !base.issue_accounts.is_empty();
+        // Legacy sub-table pins. In accounts mode those tables are not read
+        // (each account carries its own scope), so their diagnostics are moot.
+        let mut legacy_refused = Vec::new();
+        {
+            let sink = if accounts_mode {
+                &mut legacy_refused
+            } else {
+                &mut refused
+            };
+            if let Some(t) = self.linear.team_id.clone() {
+                narrow_pin("linear.team_id", &mut base.linear.team_id, t, sink);
+            }
+            if let Some(k) = self.jira.project_key.clone() {
+                narrow_pin("jira.project_key", &mut base.jira.project_key, k, sink);
+            }
+            narrow_kaneo(
+                &mut base.kaneo.workspace_id,
+                &mut base.kaneo.project_id,
+                self.kaneo.workspace_id.clone(),
+                self.kaneo.project_id.clone(),
+                sink,
+                "",
+            );
         }
         if let Some(w) = self.linear.workspace_slug {
             base.linear.workspace_slug = w;
         }
-        if let Some(k) = self.jira.project_key {
-            narrow_pin(
-                "jira.project_key",
-                &mut base.jira.project_key,
-                k,
-                &mut refused,
-            );
-        }
-        // Kaneo workspace + project are ONE nested ceiling: a project may live in
-        // another workspace and the config layer cannot verify membership.
-        let (g_ws, g_proj) = (
-            base.kaneo.workspace_id.clone(),
-            base.kaneo.project_id.clone(),
-        );
-        if let Some(w) = self.kaneo.workspace_id {
-            if g_ws.is_empty() && !g_proj.is_empty() && w != g_ws {
-                refused.push("kaneo.workspace_id pin is outside the global scope".into());
-            } else {
-                narrow_pin(
-                    "kaneo.workspace_id",
-                    &mut base.kaneo.workspace_id,
-                    w,
+        // Accounts mode: the same restrict-only rule per matching account, the
+        // account's own pin being the ceiling.
+        for a in &mut base.issue_accounts {
+            let who = format!("account {}: ", a.name);
+            match a.provider {
+                IssueProviderKind::Linear => {
+                    if let Some(t) = self.linear.team_id.clone() {
+                        narrow_pin(
+                            &format!("{who}linear.team_id"),
+                            &mut a.team_id,
+                            t,
+                            &mut refused,
+                        );
+                    }
+                }
+                IssueProviderKind::Jira => {
+                    if let Some(k) = self.jira.project_key.clone() {
+                        narrow_pin(
+                            &format!("{who}jira.project_key"),
+                            &mut a.project_key,
+                            k,
+                            &mut refused,
+                        );
+                    }
+                }
+                IssueProviderKind::Kaneo => narrow_kaneo(
+                    &mut a.workspace_id,
+                    &mut a.project_id,
+                    self.kaneo.workspace_id.clone(),
+                    self.kaneo.project_id.clone(),
                     &mut refused,
-                );
-            }
-        }
-        if let Some(p) = self.kaneo.project_id {
-            if g_proj.is_empty() && !g_ws.is_empty() && !p.is_empty() {
-                refused.push("kaneo.project_id pin is outside the global scope".into());
-            } else {
-                narrow_pin(
-                    "kaneo.project_id",
-                    &mut base.kaneo.project_id,
-                    p,
-                    &mut refused,
-                );
+                    &who,
+                ),
+                _ => {}
             }
         }
         refused
@@ -823,6 +874,102 @@ mod tests {
             base.active_accounts().is_empty(),
             "a typo'd account restriction must yield zero accounts, not legacy"
         );
+    }
+
+    fn acct(name: &str, provider: IssueProviderKind) -> IssueAccount {
+        IssueAccount {
+            name: name.into(),
+            provider,
+            token: "canary-token".into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn overlay_pins_narrow_each_matching_account() {
+        let mut lin = acct("l", IssueProviderKind::Linear);
+        let mut lin_pinned = acct("lp", IssueProviderKind::Linear);
+        lin_pinned.team_id = "T0".into();
+        let jira = acct("j", IssueProviderKind::Jira);
+        let kan = acct("k", IssueProviderKind::Kaneo);
+        lin.team_id = String::new();
+        let mut base = IssuesConfig {
+            issue_accounts: vec![lin, lin_pinned, jira, kan],
+            ..Default::default()
+        };
+        let refused = IssuesOverlay {
+            linear: LinearOverlay {
+                team_id: Some("T1".into()),
+                workspace_slug: None,
+            },
+            jira: JiraOverlay {
+                project_key: Some("PK".into()),
+            },
+            kaneo: KaneoOverlay {
+                workspace_id: Some("w".into()),
+                project_id: Some("p".into()),
+            },
+            ..Default::default()
+        }
+        .apply(&mut base);
+        let by = |n: &str| {
+            base.issue_accounts
+                .iter()
+                .find(|a| a.name == n)
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(by("l").team_id, "T1");
+        // The account's own pin is a ceiling: widening/replacing is refused.
+        assert_eq!(by("lp").team_id, "T0");
+        assert_eq!(by("j").project_key, "PK");
+        assert_eq!(
+            (by("k").workspace_id, by("k").project_id),
+            ("w".into(), "p".into())
+        );
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert!(refused[0].contains("account lp"), "{refused:?}");
+    }
+
+    #[test]
+    fn overlay_kaneo_account_joint_ceiling_and_no_widening() {
+        let mut k = acct("k", IssueProviderKind::Kaneo);
+        k.workspace_id = "w".into();
+        let mut base = IssuesConfig {
+            issue_accounts: vec![k],
+            ..Default::default()
+        };
+        // Account pinned to a workspace only: a project pin is a joint-ceiling
+        // violation, a different workspace is refused.
+        let refused = IssuesOverlay {
+            kaneo: KaneoOverlay {
+                workspace_id: Some("w2".into()),
+                project_id: Some("p".into()),
+            },
+            ..Default::default()
+        }
+        .apply(&mut base);
+        assert_eq!(refused.len(), 2, "{refused:?}");
+        assert_eq!(base.issue_accounts[0].workspace_id, "w");
+        assert_eq!(base.issue_accounts[0].project_id, "");
+    }
+
+    #[test]
+    fn overlay_pin_does_not_touch_other_provider_accounts() {
+        let mut base = IssuesConfig {
+            issue_accounts: vec![acct("j", IssueProviderKind::Jira)],
+            ..Default::default()
+        };
+        let refused = IssuesOverlay {
+            linear: LinearOverlay {
+                team_id: Some("T".into()),
+                workspace_slug: None,
+            },
+            ..Default::default()
+        }
+        .apply(&mut base);
+        assert!(refused.is_empty());
+        assert_eq!(base.issue_accounts[0].team_id, "");
     }
 
     #[test]

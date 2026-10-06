@@ -984,6 +984,9 @@ pub struct CreatedWorktree {
     /// The host env the worktree was created on (`""` = the ambient local
     /// default) — what `[env.<name>] notify_ready` is looked up by.
     pub env: String,
+    /// The `agent_dispatches` row recorded for this launch (tracker dispatch);
+    /// `None` for wizard creations (THE-733).
+    pub dispatch_id: Option<i64>,
 }
 
 /// Commands from the loop (wizard decisions) to the worker.
@@ -1607,6 +1610,7 @@ pub fn run_worker(
             agent: choices.agent,
             spec,
             env: choices.env,
+            dispatch_id: None,
         }),
     });
 }

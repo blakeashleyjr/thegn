@@ -425,11 +425,10 @@ impl CalendarBackend for CommandBackend {
     }
 
     fn caps(&self) -> CalendarCaps {
-        CalendarCaps {
-            // A plugin decides for itself whether to honour the sync token.
-            incremental: true,
-            ..Default::default()
-        }
+        // No write support yet. Sync-token handling is not a capability: a
+        // plugin decides for itself whether to honour the token, and the host
+        // interprets the page it gets back.
+        CalendarCaps::default()
     }
 
     fn list_events<'a>(

@@ -785,7 +785,7 @@ fmt-check:
 # `cargo test`. This recipe is the single source of truth shared by the CI
 # `test` job and the pre-push hook. Doctests are `test-doc` (CI-only) — see
 # the note there.
-test: contract-ratchets test-live test-build-metadata test-the429 test-action-pins
+test: contract-ratchets test-live test-heredoc-guard test-build-metadata test-the429 test-action-pins
     cargo nextest run --workspace
 
 # Doctest pass. Split out of `test` (and therefore off pre-push) because it is
@@ -1157,6 +1157,11 @@ live-plan level="debug" size_mb="20" files="5":
 # Private launcher regression tests; no Cargo or live-state mutation.
 test-live:
     python3 -B test/live_test.py
+
+# The agent PreToolUse guard that refuses an unquoted heredoc whose body would
+# execute `$(...)`/backticks (.claude/settings.json). Pure; no Cargo.
+test-heredoc-guard:
+    python3 -B test/heredoc_guard_test.py
 
 # Real tiny Cargo fixtures exercise Git-only invalidation and linked-worktree
 # freshness without rebuilding the application.

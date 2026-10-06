@@ -33,7 +33,7 @@ pub use cherry::CherryOps;
 pub use commit::{CommitOps, ResetMode};
 pub use custom::CustomOps;
 pub use patch::PatchOps;
-pub use plumbing::{MergeTreeOutcome, PlumbingOps};
+pub use plumbing::{CasOutcome, MergeTreeOutcome, PlumbingOps};
 pub use rebase::{PauseReason, RebaseOps, RebaseOpts, RebaseOutcome, RebaseStatus};
 pub use stage::StageOps;
 pub use stash::StashOps;
@@ -824,22 +824,61 @@ fn parse_status_porcelain(out: &str) -> Vec<FileStatus> {
     v
 }
 
-/// Sum a `git diff --numstat` output into `(added, deleted)` line totals.
-/// Binary files emit `-\t-\t<path>` (non-numeric) and contribute nothing. Shared
-/// by the batched [`GitBackend::glyph_reads`] sidebar diff-stat reads.
-pub(crate) fn sum_numstat(out: &str) -> (u32, u32) {
-    let mut add = 0u32;
-    let mut del = 0u32;
+/// Strictly parse `git diff --numstat` output into per-file counts.
+///
+/// Each record is `<added>\t<deleted>\t<path>`. Only git's explicit binary
+/// marker (`-\t-`) means non-text, and such rows are omitted — the same as the
+/// native gix backend, which has no line counts for binary files. Anything else
+/// malformed (missing path, non-decimal or oversized number, a lone `-`) is an
+/// error rather than a plausible zero. Counts beyond `u32::MAX` are rejected
+/// (a single file cannot sensibly exceed it) without allocating for them.
+pub(crate) fn parse_numstat(out: &str) -> Result<Vec<DiffEntry>> {
+    fn count(s: &str) -> Option<u32> {
+        // Bound the digits before parsing; `u32` needs at most 10.
+        if s.is_empty() || s.len() > 10 || !s.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        s.parse().ok()
+    }
+    let mut v = Vec::new();
     for line in out.lines() {
         let mut it = line.splitn(3, '\t');
-        let a = it.next().and_then(|s| s.parse::<u32>().ok());
-        let d = it.next().and_then(|s| s.parse::<u32>().ok());
-        if let (Some(a), Some(d)) = (a, d) {
-            add += a;
-            del += d;
+        let (a, d, p) = (it.next(), it.next(), it.next());
+        let (Some(a), Some(d), Some(p)) = (a, d, p) else {
+            anyhow::bail!("malformed numstat record: missing fields");
+        };
+        if p.is_empty() {
+            anyhow::bail!("malformed numstat record: empty path");
         }
+        if a == "-" && d == "-" {
+            continue;
+        }
+        let (Some(added), Some(deleted)) = (count(a), count(d)) else {
+            anyhow::bail!("malformed numstat record: bad line counts");
+        };
+        v.push(DiffEntry {
+            added,
+            deleted,
+            path: p.to_string(),
+        });
     }
-    (add, del)
+    Ok(v)
+}
+
+/// Sum a `git diff --numstat` output into `(added, deleted)` line totals.
+/// Binary files contribute nothing; malformed output is an error. Totals
+/// saturate at `u32::MAX`, exactly like the native backend, so the result never
+/// depends on the build profile or backend. Shared by the batched
+/// [`GitBackend::glyph_reads`] sidebar diff-stat reads.
+pub(crate) fn sum_numstat(out: &str) -> Result<(u32, u32)> {
+    Ok(sum_entries(&parse_numstat(out)?))
+}
+
+/// Saturating `(added, deleted)` totals of per-file rows (shared by both backends).
+pub(crate) fn sum_entries(entries: &[DiffEntry]) -> (u32, u32) {
+    entries.iter().fold((0u32, 0u32), |(a, d), e| {
+        (a.saturating_add(e.added), d.saturating_add(e.deleted))
+    })
 }
 
 /// Parse `git rev-list --left-right --count @{u}...HEAD` output
@@ -1064,14 +1103,16 @@ fn bridged_glyph_reads(loc: &GitLoc, include_submodules: bool) -> Option<GlyphRe
                     ))
                 };
                 let uncommitted = if r[3].exit == 0 {
-                    Ok(sum_numstat(&r[3].stdout))
+                    sum_numstat(&r[3].stdout)
                 } else {
                     Err(anyhow::anyhow!("git diff failed: {}", r[3].stderr.trim()))
                 };
                 // Absent when no base resolved (the 5th command wasn't sent).
                 let branch_diff = if let Some(idx) = branch_diff_idx {
-                    Ok(r.get(idx)
-                        .and_then(|res| (res.exit == 0).then(|| sum_numstat(&res.stdout))))
+                    r.get(idx)
+                        .filter(|res| res.exit == 0)
+                        .map(|res| sum_numstat(&res.stdout))
+                        .transpose()
                 } else {
                     Ok(None)
                 };
@@ -1133,11 +1174,13 @@ fn local_glyph_reads(
         dirty: git.is_dirty(loc),
         ahead_behind: git.ahead_behind(loc),
         branch: git.current_branch(loc),
-        uncommitted: run_status(loc, &["diff", "--numstat", "HEAD"])
-            .map(|(exit, out)| if exit == 0 { sum_numstat(&out) } else { (0, 0) }),
+        uncommitted: run_status(loc, &["diff", "--numstat", "HEAD"]).and_then(|(exit, out)| {
+            anyhow::ensure!(exit == 0, "git diff --numstat HEAD failed");
+            sum_numstat(&out)
+        }),
         branch_diff: match &base {
             Some(b) => run_status(loc, &["diff", "--numstat", &format!("{b}...HEAD")])
-                .map(|(exit, out)| (exit == 0).then(|| sum_numstat(&out))),
+                .and_then(|(exit, out)| (exit == 0).then(|| sum_numstat(&out)).transpose()),
             // No base resolvable — "no badge", not an error.
             None => Ok(None),
         },
@@ -1162,8 +1205,9 @@ fn numstat_totals(loc: &GitLoc, spec: &str) -> Result<(u32, u32)> {
     {
         return Ok(t);
     }
-    run_status(loc, &["diff", "--numstat", spec])
-        .map(|(exit, out)| if exit == 0 { sum_numstat(&out) } else { (0, 0) })
+    let (exit, out) = run_status(loc, &["diff", "--numstat", spec])?;
+    anyhow::ensure!(exit == 0, "git diff --numstat {spec} failed");
+    sum_numstat(&out)
 }
 
 /// The gix backend's glyph reads: [`local_glyph_reads`]'s shape, but with the
@@ -1320,19 +1364,7 @@ impl GitBackend for CliGit {
             loc,
             &["-c", "core.quotePath=false", "diff", "--numstat", base],
         )?;
-        let mut v = Vec::new();
-        for line in out.lines() {
-            let mut it = line.splitn(3, '\t');
-            let (a, d, p) = (it.next(), it.next(), it.next());
-            if let (Some(a), Some(d), Some(p)) = (a, d, p) {
-                v.push(DiffEntry {
-                    added: a.parse().unwrap_or(0),
-                    deleted: d.parse().unwrap_or(0),
-                    path: p.to_string(),
-                });
-            }
-        }
-        Ok(v)
+        parse_numstat(&out)
     }
 
     fn branches(&self, loc: &GitLoc) -> Result<Vec<Branch>> {
@@ -1898,15 +1930,50 @@ mod tests {
 
     #[test]
     fn sum_numstat_totals_added_and_deleted() {
-        assert_eq!(sum_numstat(""), (0, 0));
+        assert_eq!(sum_numstat("").unwrap(), (0, 0));
         // `--numstat` is "<added>\t<deleted>\t<path>" per line.
         let out = "5\t2\tsrc/a.rs\n10\t0\tsrc/b.rs\n";
-        assert_eq!(sum_numstat(out), (15, 2));
+        assert_eq!(sum_numstat(out).unwrap(), (15, 2));
         // Binary files emit "-\t-\t<path>" and contribute nothing.
         let out = "3\t1\tsrc/a.rs\n-\t-\tlogo.png\n";
-        assert_eq!(sum_numstat(out), (3, 1));
+        assert_eq!(sum_numstat(out).unwrap(), (3, 1));
         // A path with spaces/tabs still parses (splitn(3) keeps the path intact).
-        assert_eq!(sum_numstat("4\t4\tdir/a b.rs\n"), (4, 4));
+        assert_eq!(sum_numstat("4\t4\tdir/a b.rs\n").unwrap(), (4, 4));
+    }
+
+    #[test]
+    fn numstat_binary_rows_are_omitted_like_native() {
+        let rows = parse_numstat("1\t2\ta\n-\t-\tb.png\n").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].path, "a");
+    }
+
+    #[test]
+    fn numstat_malformed_records_are_errors() {
+        for bad in [
+            "1\t2\n",             // missing path
+            "1\t2\t\n",           // empty path
+            "1\n",                // truncated
+            "x\t2\tp\n",          // non-numeric
+            "-\t2\tp\n",          // half binary marker
+            "+1\t2\tp\n",         // not plain decimal
+            "4294967296\t0\tp\n", // above u32::MAX
+            "99999999999999999999999999\t0\tp\n",
+        ] {
+            assert!(parse_numstat(bad).is_err(), "{bad:?} must be an error");
+        }
+    }
+
+    #[test]
+    fn numstat_boundaries_and_aggregate_overflow_saturate() {
+        let max = u32::MAX;
+        assert_eq!(
+            sum_numstat(&format!("{}\t{}\tp\n", max - 1, max)).unwrap(),
+            (max - 1, max)
+        );
+        // Two max-sized files overflow the aggregate: saturate, never panic or wrap.
+        let out = format!("{max}\t{max}\ta\n1\t1\tb\n");
+        assert_eq!(sum_numstat(&out).unwrap(), (max, max));
     }
 
     #[test]

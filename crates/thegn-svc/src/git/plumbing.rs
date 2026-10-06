@@ -27,6 +27,42 @@ pub enum MergeTreeOutcome {
     Conflict { tree: String, paths: Vec<String> },
 }
 
+/// Result of a CAS `update-ref` that exited non-zero, after re-reading the ref.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CasOutcome {
+    Advanced,
+    /// The ref exists but no longer points at the expected old oid.
+    Moved {
+        actual: String,
+    },
+    /// The ref does not exist.
+    Missing,
+    /// Unclassifiable (lock error, unreadable ref, still at `old`, ...). Callers
+    /// must fail closed.
+    Other(String),
+}
+
+/// What re-reading the ref after a failed CAS showed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RefRead {
+    At(String),
+    Missing,
+    Unknown,
+}
+
+/// Pure classification of a failed CAS from the ref re-read. Only a ref that
+/// provably points somewhere other than `old` is `Moved`; if it still points at
+/// `old` the failure was something else (lock, permissions) and is `Other`.
+fn classify_cas_failure(reread: &RefRead, old: &str, stderr: &str) -> CasOutcome {
+    match reread {
+        RefRead::At(actual) if is_object_id(actual) && actual != old => CasOutcome::Moved {
+            actual: actual.clone(),
+        },
+        RefRead::Missing => CasOutcome::Missing,
+        _ => CasOutcome::Other(stderr.to_string()),
+    }
+}
+
 /// Run git capturing the raw exit code plus both streams. `merge-tree` exits 1
 /// on conflicts and `update-ref` exits 1 on a CAS mismatch — both are normal
 /// outcomes, not errors, so the shared [`run`]/[`run_w`] helpers (which bail on
@@ -275,18 +311,41 @@ pub trait PlumbingOps: GitBackend {
     /// Atomically advance a (fully-qualified) ref only if it still points at
     /// `old` — `git update-ref <ref> <new> <old>`. A mismatch means `main` moved
     /// under the fold; that's a normal "re-fold" signal returned as `Ok(false)`,
-    /// distinct from a genuine lock/ref error which is `Err`.
+    /// distinct from a genuine lock/ref error which is `Err`. Failure is
+    /// classified by re-reading the ref ([`PlumbingOps::update_ref_cas_outcome`]),
+    /// never by matching git's locale/version-dependent stderr; anything that is
+    /// not provably "moved" fails closed as `Err`.
     fn update_ref_cas(&self, loc: &GitLoc, name: &str, new: &str, old: &str) -> Result<bool> {
+        match self.update_ref_cas_outcome(loc, name, new, old)? {
+            CasOutcome::Advanced => Ok(true),
+            CasOutcome::Moved { .. } => Ok(false),
+            CasOutcome::Missing => {
+                anyhow::bail!("git update-ref {name} failed: ref no longer exists")
+            }
+            CasOutcome::Other(msg) => anyhow::bail!("git update-ref {name} failed: {msg}"),
+        }
+    }
+
+    /// Typed form of [`PlumbingOps::update_ref_cas`]. On a non-zero exit the ref
+    /// is re-read (`rev-parse --verify --quiet`, exit-code based) to tell a lost
+    /// race from a missing ref or an unrelated failure.
+    fn update_ref_cas_outcome(
+        &self,
+        loc: &GitLoc,
+        name: &str,
+        new: &str,
+        old: &str,
+    ) -> Result<CasOutcome> {
         let (code, _out, stderr) = run_status(loc, &["update-ref", name, new, old])?;
         if code == 0 {
-            return Ok(true);
+            return Ok(CasOutcome::Advanced);
         }
-        // `update-ref` reports the CAS mismatch as e.g.
-        //   "fatal: cannot lock ref 'refs/heads/main': is at X but expected Y"
-        if stderr.contains("but expected") {
-            return Ok(false);
-        }
-        anyhow::bail!("git update-ref {name} failed: {}", stderr.trim());
+        let reread = match run_status(loc, &["rev-parse", "--verify", "--quiet", name]) {
+            Ok((0, out, _)) => RefRead::At(out.trim().to_string()),
+            Ok((1, _, _)) => RefRead::Missing,
+            _ => RefRead::Unknown,
+        };
+        Ok(classify_cas_failure(&reread, old, stderr.trim()))
     }
 
     /// Snapshot uncommitted worktree work into a commit so `merge-tree` (which
@@ -324,7 +383,9 @@ impl<T: GitBackend + ?Sized> PlumbingOps for T {}
 mod tests {
     use super::super::testutil::{TestRepo, git_in};
     use super::super::{CliGit, GitBackend};
-    use super::{MergeTreeOutcome, PlumbingOps, is_object_id};
+    use super::{
+        CasOutcome, MergeTreeOutcome, PlumbingOps, RefRead, classify_cas_failure, is_object_id,
+    };
     use std::path::Path;
 
     #[test]
@@ -444,6 +505,66 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(repo.out(&["rev-parse", "refs/heads/main"]), main0);
+    }
+
+    #[test]
+    fn classify_cas_failure_is_typed_and_fails_closed() {
+        let a = "a".repeat(40);
+        let b = "b".repeat(40);
+        // Moved only when the ref is provably elsewhere, regardless of stderr text.
+        assert_eq!(
+            classify_cas_failure(&RefRead::At(b.clone()), &a, "localized garbage"),
+            CasOutcome::Moved { actual: b.clone() }
+        );
+        assert_eq!(
+            classify_cas_failure(&RefRead::Missing, &a, ""),
+            CasOutcome::Missing
+        );
+        // Still at old, unreadable, or garbled reread: Other (fail closed), even
+        // if stderr happens to contain the old magic phrase.
+        for r in [
+            RefRead::At(a.clone()),
+            RefRead::At("garbled".into()),
+            RefRead::Unknown,
+        ] {
+            assert!(matches!(
+                classify_cas_failure(&r, &a, "but expected"),
+                CasOutcome::Other(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn update_ref_cas_missing_ref_is_error_not_moved() {
+        let repo = TestRepo::new("plumb-cas-missing");
+        ident(&repo.dir);
+        repo.commit_file("f.txt", "one\n", "c0");
+        let loc = repo.loc();
+        let main0 = repo.head();
+        let out = CliGit
+            .update_ref_cas_outcome(&loc, "refs/heads/nope", &main0, &main0)
+            .unwrap();
+        assert_eq!(out, CasOutcome::Missing);
+        assert!(
+            CliGit
+                .update_ref_cas(&loc, "refs/heads/nope", &main0, &main0)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn update_ref_cas_stale_is_moved_with_actual() {
+        let repo = TestRepo::new("plumb-cas-moved");
+        ident(&repo.dir);
+        repo.commit_file("f.txt", "one\n", "c0");
+        let loc = repo.loc();
+        let main0 = repo.head();
+        repo.commit_file("g.txt", "two\n", "c1");
+        let main1 = repo.head();
+        let out = CliGit
+            .update_ref_cas_outcome(&loc, "refs/heads/main", &main0, &main0)
+            .unwrap();
+        assert_eq!(out, CasOutcome::Moved { actual: main1 });
     }
 
     #[test]

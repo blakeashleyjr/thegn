@@ -638,3 +638,44 @@ fn max_events_is_a_nonzero_bounded_admission_budget() {
         MAX_MAX_EVENTS
     );
 }
+
+#[test]
+fn horizons_are_bounded_at_admission_and_never_collapse() {
+    let max = crate::time_policy::MAX_DURATION_DAYS as u32;
+    let today = chrono::NaiveDate::from_ymd_opt(2026, 8, 21).unwrap();
+    let defaults = CalendarConfig::default();
+    assert!(validate_calendar(&defaults).is_empty());
+    assert_eq!(
+        defaults.sync_horizon(today).unwrap(),
+        (
+            today - chrono::Days::new(90),
+            today + chrono::Days::new(365)
+        )
+    );
+    let at_max = CalendarConfig {
+        horizon_past_days: max,
+        horizon_future_days: max,
+        ..CalendarConfig::default()
+    };
+    assert!(validate_calendar(&at_max).is_empty());
+    assert!(at_max.sync_horizon(today).is_ok());
+    for (past, future, key) in [
+        (max + 1, 1, "horizon_past_days"),
+        (1, max + 1, "horizon_future_days"),
+        (u32::MAX, 1, "horizon_past_days"),
+        (1, u32::MAX, "horizon_future_days"),
+    ] {
+        let cfg = CalendarConfig {
+            horizon_past_days: past,
+            horizon_future_days: future,
+            ..CalendarConfig::default()
+        };
+        let errors = validate_calendar(&cfg);
+        assert!(errors.iter().any(|e| e.contains(key)), "{errors:?}");
+        assert!(cfg.sync_horizon(today).is_err());
+    }
+    // Chrono's own bounds are the backstop when the day count is in range.
+    let ok = CalendarConfig::default();
+    assert!(ok.sync_horizon(chrono::NaiveDate::MIN).is_err());
+    assert!(ok.sync_horizon(chrono::NaiveDate::MAX).is_err());
+}
