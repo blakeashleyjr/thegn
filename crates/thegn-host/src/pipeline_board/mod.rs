@@ -104,6 +104,9 @@ pub struct PipelineBoard {
     /// Frozen "now", so a frozen board's ages and stall cues don't creep.
     frozen_now_ms: Option<i64>,
     last_now_ms: i64,
+    /// Set when the roster shown is the last known-good one because the latest
+    /// sample failed (THE-271). Surfaced in the footer with its age.
+    stale: Option<crate::monitor_pipeline::RosterStale>,
     /// Hide rows whose status is terminal.
     ///
     /// Neither this nor `frozen` is persisted, and neither writes to the DB.
@@ -141,6 +144,7 @@ impl PipelineBoard {
             scroll: 0,
             frozen: false,
             frozen_now_ms: None,
+            stale: None,
             last_now_ms: ctx.now_ms,
             hide_finished: false,
             notice: None,
@@ -229,6 +233,7 @@ impl PipelineBoard {
     fn rebuild(&mut self, roster: &DispatchRoster, stages: &[PipelineStage], ctx: &StatusCtx) {
         self.resize(ctx.screen);
         self.last_now_ms = ctx.now_ms;
+        self.stale = roster.stale.clone();
         let now = self.frozen_now_ms.unwrap_or(ctx.now_ms);
         // The configured stages are the single source for BOTH the row fold's
         // grouping order and the board's columns, so a stale sampled order can
@@ -563,6 +568,18 @@ impl PipelineBoard {
         );
     }
 
+    /// `stale 12s` / `stale` for the footer, `None` when the roster is fresh.
+    fn stale_label(&self) -> Option<String> {
+        let st = self.stale.as_ref()?;
+        Some(match st.last_good_ms {
+            Some(t) => format!(
+                "stale {}",
+                crate::monitor_pipeline::fmt_age_ms((self.last_now_ms - t).max(0))
+            ),
+            None => "stale".to_string(),
+        })
+    }
+
     /// The key-hint legend — or a transient notice while one is set.
     fn footer(&self) -> Line {
         match &self.notice {
@@ -573,7 +590,11 @@ impl PipelineBoard {
                     "esc close".to_string(),
                 )],
             ),
-            None => view::legend(self.frozen, self.hide_finished),
+            None => view::legend(
+                self.frozen,
+                self.hide_finished,
+                self.stale_label().as_deref(),
+            ),
         }
     }
 }

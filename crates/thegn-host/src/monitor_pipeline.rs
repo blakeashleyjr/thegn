@@ -84,6 +84,116 @@ pub(crate) struct DispatchRoster {
     /// Stage names in configured order. Empty ⇒ [`ordered_rows`] falls back to
     /// alphabetical stage names.
     pub stage_order: Vec<String>,
+    /// `Some` when the latest sample FAILED and `rows` is the last known-good
+    /// roster rather than a fresh read (THE-271). `None` = fresh.
+    pub stale: Option<RosterStale>,
+}
+
+/// Why a roster is being shown stale: the last sample failed to read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RosterStale {
+    /// Unix ms of the last successful sample; `None` if none ever succeeded.
+    pub last_good_ms: Option<i64>,
+    pub error: String,
+}
+
+/// One off-loop roster read, tagged with the request generation that issued
+/// it. A failure is a distinct arm, never an empty-success roster.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RosterSample {
+    pub generation: u64,
+    /// Unix ms the read finished (display only; never used for ordering).
+    pub at_ms: i64,
+    pub result: Result<DispatchRoster, String>,
+}
+
+/// What [`RosterFence::accept`] decided.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct Accepted {
+    /// The model roster changed: repaint and refresh the board.
+    pub changed: bool,
+    /// A dirty signal arrived while the read was in flight: sample once more.
+    pub follow_up: bool,
+    /// `Some(n)` when this failure (the n-th in a row) should be logged.
+    /// Rate-limited to powers of two so a stuck DB cannot flood the log.
+    pub log_failure: Option<u32>,
+}
+
+/// Generation fence for roster samples (THE-260/271). Pure state, no I/O.
+///
+/// At most one read is in flight; dirty signals during a read coalesce into
+/// one follow-up; a completion older than the newest applied one is dropped.
+#[derive(Debug, Default)]
+pub(crate) struct RosterFence {
+    issued: u64,
+    applied: u64,
+    in_flight: bool,
+    pending: bool,
+    fails: u32,
+    last_good_ms: Option<i64>,
+}
+
+impl RosterFence {
+    /// Ask to start a read. `Some(generation)` = spawn it now. `None` = one is
+    /// already in flight; `dirty` is remembered so a follow-up is guaranteed.
+    pub fn request(&mut self, dirty: bool) -> Option<u64> {
+        if self.in_flight {
+            self.pending |= dirty;
+            return None;
+        }
+        self.in_flight = true;
+        self.issued += 1;
+        Some(self.issued)
+    }
+
+    /// Consecutive failed samples; drives the retry backoff.
+    pub fn failures(&self) -> u32 {
+        self.fails
+    }
+
+    /// Cadence between samples after `failures` consecutive failures:
+    /// doubling, capped at 32x. A pure function of the count, no timer.
+    pub fn backoff(base: std::time::Duration, failures: u32) -> std::time::Duration {
+        base * (1u32 << failures.min(5))
+    }
+
+    /// Fold a completed sample into `current`.
+    pub fn accept(&mut self, current: &mut DispatchRoster, sample: RosterSample) -> Accepted {
+        let mut out = Accepted::default();
+        if sample.generation == self.issued {
+            self.in_flight = false;
+            out.follow_up = std::mem::take(&mut self.pending);
+        }
+        if sample.generation <= self.applied {
+            return out;
+        }
+        self.applied = sample.generation;
+        match sample.result {
+            Ok(fresh) => {
+                self.fails = 0;
+                self.last_good_ms = Some(sample.at_ms);
+                if *current != fresh {
+                    *current = fresh;
+                    out.changed = true;
+                }
+            }
+            Err(error) => {
+                self.fails = self.fails.saturating_add(1);
+                if self.fails.is_power_of_two() {
+                    out.log_failure = Some(self.fails);
+                }
+                let stale = Some(RosterStale {
+                    last_good_ms: self.last_good_ms,
+                    error,
+                });
+                if current.stale != stale {
+                    current.stale = stale;
+                    out.changed = true;
+                }
+            }
+        }
+        out
+    }
 }
 
 impl DispatchRoster {
@@ -695,6 +805,7 @@ mod tests {
             DispatchRoster {
                 rows: vec![],
                 stage_order: vec!["code".into()],
+                stale: None,
             }
             .is_present(),
             "a configured but never-run pipeline still earns the tab"
@@ -703,9 +814,132 @@ mod tests {
             DispatchRoster {
                 rows: vec![d(1, None, None, 0)],
                 stage_order: vec![],
+                stale: None,
             }
             .is_present()
         );
+    }
+
+    fn roster_of(ids: &[i64]) -> DispatchRoster {
+        DispatchRoster {
+            rows: ids.iter().map(|&i| d(i, Some("code"), None, 0)).collect(),
+            ..Default::default()
+        }
+    }
+
+    fn ok(generation: u64, ids: &[i64]) -> RosterSample {
+        RosterSample {
+            generation,
+            at_ms: generation as i64 * 1000,
+            result: Ok(roster_of(ids)),
+        }
+    }
+
+    fn err(generation: u64) -> RosterSample {
+        RosterSample {
+            generation,
+            at_ms: generation as i64 * 1000,
+            result: Err("database is locked".into()),
+        }
+    }
+
+    #[test]
+    fn one_read_in_flight_and_dirty_requests_coalesce_into_one_follow_up() {
+        let mut f = RosterFence::default();
+        let mut cur = DispatchRoster::default();
+        let g1 = f.request(false).expect("first request starts a read");
+        assert_eq!(f.request(true), None);
+        assert_eq!(f.request(true), None);
+        let a = f.accept(&mut cur, ok(g1, &[1]));
+        assert!(a.changed && a.follow_up);
+        let g2 = f.request(false).expect("follow-up read");
+        assert!(g2 > g1);
+        assert!(!f.accept(&mut cur, ok(g2, &[1])).follow_up);
+    }
+
+    #[test]
+    fn a_cadence_request_during_a_read_does_not_queue_a_follow_up() {
+        let mut f = RosterFence::default();
+        let mut cur = DispatchRoster::default();
+        let g = f.request(false).unwrap();
+        assert_eq!(f.request(false), None);
+        assert!(!f.accept(&mut cur, ok(g, &[])).follow_up);
+    }
+
+    #[test]
+    fn an_older_sample_never_overwrites_a_newer_one() {
+        let mut f = RosterFence::default();
+        let mut cur = DispatchRoster::default();
+        let _g1 = f.request(false).unwrap();
+        // Force a newer generation to be applied first, as if the first read
+        // stalled and a later one finished ahead of it.
+        f.in_flight = false;
+        let g2 = f.request(false).unwrap();
+        assert!(f.accept(&mut cur, ok(g2, &[1, 2])).changed);
+        let late = f.accept(&mut cur, ok(1, &[9]));
+        assert!(!late.changed);
+        assert_eq!(cur, roster_of(&[1, 2]));
+        // An older FAILURE must not mark the newer roster stale either.
+        assert!(!f.accept(&mut cur, err(1)).changed);
+        assert_eq!(cur.stale, None);
+        assert_eq!(f.failures(), 0);
+    }
+
+    #[test]
+    fn failure_keeps_last_good_rows_marked_stale_and_recovery_clears_it() {
+        let mut f = RosterFence::default();
+        let mut cur = DispatchRoster::default();
+        let g = f.request(false).unwrap();
+        f.accept(&mut cur, ok(g, &[1, 2]));
+        let g = f.request(false).unwrap();
+        let a = f.accept(&mut cur, err(g));
+        assert!(a.changed);
+        assert_eq!(cur.rows.len(), 2, "never an empty board on failure");
+        let st = cur.stale.clone().expect("marked stale");
+        assert_eq!(st.last_good_ms, Some(1000));
+        assert_eq!(st.error, "database is locked");
+        let g = f.request(false).unwrap();
+        assert!(f.accept(&mut cur, ok(g, &[1, 2])).changed);
+        assert_eq!(cur.stale, None);
+        assert_eq!(f.failures(), 0);
+    }
+
+    #[test]
+    fn a_failure_before_any_success_is_stale_with_no_age_and_empty_success_clears() {
+        let mut f = RosterFence::default();
+        let mut cur = DispatchRoster::default();
+        let g = f.request(false).unwrap();
+        f.accept(&mut cur, err(g));
+        assert_eq!(cur.stale.as_ref().unwrap().last_good_ms, None);
+        let g = f.request(false).unwrap();
+        f.accept(&mut cur, ok(g, &[1]));
+        let g = f.request(false).unwrap();
+        f.accept(&mut cur, ok(g, &[]));
+        assert!(
+            cur.rows.is_empty(),
+            "a confirmed empty read clears the roster"
+        );
+        assert_eq!(cur.stale, None);
+    }
+
+    #[test]
+    fn repeated_failures_log_on_powers_of_two_and_back_off_to_a_cap() {
+        let mut f = RosterFence::default();
+        let mut cur = roster_of(&[1]);
+        let mut logged = Vec::new();
+        let mut changed = 0;
+        for _ in 0..9 {
+            let g = f.request(false).unwrap();
+            let a = f.accept(&mut cur, err(g));
+            changed += a.changed as u32;
+            logged.extend(a.log_failure);
+        }
+        assert_eq!(logged, vec![1, 2, 4, 8]);
+        assert_eq!(changed, 1, "an unchanged stale marker does not repaint");
+        let base = std::time::Duration::from_secs(2);
+        assert_eq!(RosterFence::backoff(base, 0), base);
+        assert_eq!(RosterFence::backoff(base, 3), base * 8);
+        assert_eq!(RosterFence::backoff(base, 99), base * 32);
     }
 
     /// The two tests below share the process-global staleness flag and
