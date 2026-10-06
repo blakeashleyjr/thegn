@@ -180,7 +180,8 @@ pub struct BridgeClient {
     /// deadline. (Prior bug: a call that registered *after* the reader had
     /// already torn down blocked the full RPC timeout.)
     closed: Arc<AtomicBool>,
-    _reader: std::thread::JoinHandle<()>,
+    /// The reader thread, owned so [`BridgeClient::close`] can prove it ended.
+    reader: Mutex<Option<std::thread::JoinHandle<()>>>,
     subs: Subs,
     next_watch: AtomicU64,
     procs: Procs,
@@ -209,26 +210,36 @@ impl BridgeClient {
     pub fn new(
         reader: impl Read + Send + 'static,
         writer: impl Write + Send + 'static,
-    ) -> BridgeClient {
-        Self::build(reader, writer, None)
+    ) -> std::result::Result<BridgeClient, BridgeError> {
+        Self::build(reader, writer, None, spawn_reader_thread)
     }
 
     /// Spawn `cmd` (e.g. `ssh host thegn --bridge`, `sprite exec … thegn
     /// --bridge`, or `thegn --bridge` locally) and talk to it over its stdio.
-    /// The child is owned and killed on drop.
-    pub fn spawn(mut cmd: Command) -> Result<BridgeClient> {
-        cmd.stdin(Stdio::piped()).stdout(Stdio::piped());
-        let mut child = cmd.spawn().context("spawn bridge agent")?;
-        let stdout = child.stdout.take().context("bridge agent: no stdout")?;
-        let stdin = child.stdin.take().context("bridge agent: no stdin")?;
-        Ok(Self::build(stdout, stdin, Some(child)))
+    /// The child is owned and killed on drop / [`close`](Self::close).
+    pub fn spawn(cmd: Command) -> Result<BridgeClient> {
+        Ok(Self::spawn_typed(cmd)?)
     }
 
+    fn spawn_typed(mut cmd: Command) -> std::result::Result<BridgeClient, BridgeError> {
+        cmd.stdin(Stdio::piped()).stdout(Stdio::piped());
+        let mut child = cmd.spawn().map_err(BridgeError::Spawn)?;
+        let (Some(stdout), Some(stdin)) = (child.stdout.take(), child.stdin.take()) else {
+            reap_child(child, Duration::from_millis(500));
+            return Err(BridgeError::MissingStdio);
+        };
+        Self::build(stdout, stdin, Some(child), spawn_reader_thread)
+    }
+
+    /// `spawner` creates the reader thread (a seam so thread-creation failure is
+    /// testable). On failure any owned child is killed and reaped (bounded)
+    /// before the typed error is returned.
     fn build(
         reader: impl Read + Send + 'static,
         writer: impl Write + Send + 'static,
         child: Option<Child>,
-    ) -> BridgeClient {
+        spawner: ReaderSpawner,
+    ) -> std::result::Result<BridgeClient, BridgeError> {
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
         let subs: Subs = Arc::new(Mutex::new(HashMap::new()));
         let procs: Procs = Arc::new(Mutex::new(HashMap::new()));
@@ -237,31 +248,82 @@ impl BridgeClient {
         let reader_subs = subs.clone();
         let reader_procs = procs.clone();
         let reader_closed = closed.clone();
-        let handle = std::thread::Builder::new()
-            .name("bridge-reader".into())
-            .spawn(move || {
-                reader_loop(
-                    reader,
-                    reader_pending,
-                    reader_subs,
-                    reader_procs,
-                    reader_closed,
-                )
-            })
-            .expect("spawn bridge reader");
-        BridgeClient {
+        let handle = match spawner(Box::new(move || {
+            reader_loop(
+                reader,
+                reader_pending,
+                reader_subs,
+                reader_procs,
+                reader_closed,
+            )
+        })) {
+            Ok(h) => h,
+            Err(e) => {
+                if let Some(c) = child {
+                    reap_child(c, CLOSE_DEADLINE);
+                }
+                return Err(BridgeError::ReaderThread(e));
+            }
+        };
+        Ok(BridgeClient {
             writer: Arc::new(Mutex::new(Box::new(writer))),
             next_id: AtomicU64::new(1),
             pending,
             timeout: env_timeout("THEGN_BRIDGE_TIMEOUT_SECS", 120),
             read_timeout: env_timeout("THEGN_BRIDGE_READ_TIMEOUT_SECS", 20),
             closed,
-            _reader: handle,
+            reader: Mutex::new(Some(handle)),
             subs,
             next_watch: AtomicU64::new(1),
             procs,
             next_chan: AtomicU64::new(1),
             child: Mutex::new(child),
+        })
+    }
+
+    /// Idempotent, bounded explicit close. Fails every pending call, closes
+    /// every subscription, closes the transport's write half (EOF for the
+    /// agent), kills the owned child and waits for it and the reader thread up
+    /// to `deadline` in total. Never blocks past `deadline` (plus one poll
+    /// tick); a repeat call after completion returns immediately.
+    pub fn close(&self, deadline: Duration) -> CloseReport {
+        let end = Instant::now() + deadline;
+        fail_all(&self.pending, &self.subs, &self.procs, &self.closed);
+        self.shut_writer();
+        let child_reaped = match self.child.lock().ok().and_then(|mut g| g.take()) {
+            Some(c) => reap_child(c, end.saturating_duration_since(Instant::now())),
+            None => true,
+        };
+        let handle = self.reader.lock().ok().and_then(|mut g| g.take());
+        let reader_finished = match handle {
+            None => true,
+            Some(h) => {
+                while !h.is_finished() && Instant::now() < end {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                if h.is_finished() {
+                    let _ = h.join(); // best-effort: a panicked reader has nothing more to report
+                    true
+                } else {
+                    // Still blocked in a read: keep ownership so a later close
+                    // (or the lifecycle owner) can observe completion.
+                    if let Ok(mut g) = self.reader.lock() {
+                        *g = Some(h);
+                    }
+                    false
+                }
+            }
+        };
+        CloseReport {
+            reader_finished,
+            child_reaped,
+        }
+    }
+
+    /// Drop the transport's write half without ever blocking on a wedged writer.
+    fn shut_writer(&self) {
+        if let Ok(mut w) = self.writer.try_lock() {
+            *w = Box::new(std::io::sink());
         }
     }
 
@@ -458,14 +520,117 @@ impl BridgeClient {
 }
 
 impl Drop for BridgeClient {
+    /// Never blocks: fails waiters, closes the write half, kills the child and
+    /// reaps it with a single non-blocking check (a bounded background reaper
+    /// finishes the job if it has not exited yet). The reader thread ends on
+    /// the resulting EOF; use [`BridgeClient::close`] to wait for it.
     fn drop(&mut self) {
+        fail_all(&self.pending, &self.subs, &self.procs, &self.closed);
+        self.shut_writer();
         if let Ok(mut guard) = self.child.lock()
-            && let Some(mut c) = guard.take()
+            && let Some(c) = guard.take()
         {
-            let _ = c.kill(); // best-effort: child may already have exited
-            let _ = c.wait(); // best-effort: reap-or-not is terminal here
+            reap_child(c, Duration::ZERO);
+        }
+        if let Ok(mut g) = self.reader.lock()
+            && let Some(h) = g.take()
+            && h.is_finished()
+        {
+            let _ = h.join(); // best-effort: finished reader, nothing to report
         }
     }
+}
+
+/// Default bound for teardown on construction failure.
+const CLOSE_DEADLINE: Duration = Duration::from_secs(2);
+
+/// Typed failure to construct a [`BridgeClient`].
+#[derive(Debug)]
+pub enum BridgeError {
+    /// The transport child could not be spawned.
+    Spawn(std::io::Error),
+    /// The spawned child did not expose piped stdin/stdout.
+    MissingStdio,
+    /// The reader thread could not be created (resource pressure).
+    ReaderThread(std::io::Error),
+}
+
+impl std::fmt::Display for BridgeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Spawn(e) => write!(f, "spawn bridge agent: {e}"),
+            Self::MissingStdio => write!(f, "bridge agent: stdio not piped"),
+            Self::ReaderThread(e) => write!(f, "spawn bridge reader thread: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for BridgeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Spawn(e) | Self::ReaderThread(e) => Some(e),
+            Self::MissingStdio => None,
+        }
+    }
+}
+
+/// What [`BridgeClient::close`] proved within its deadline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CloseReport {
+    pub reader_finished: bool,
+    pub child_reaped: bool,
+}
+
+type ReaderSpawner = fn(Box<dyn FnOnce() + Send>) -> std::io::Result<std::thread::JoinHandle<()>>;
+
+fn spawn_reader_thread(
+    f: Box<dyn FnOnce() + Send>,
+) -> std::io::Result<std::thread::JoinHandle<()>> {
+    std::thread::Builder::new()
+        .name("bridge-reader".into())
+        .spawn(f)
+}
+
+/// Kill `child` and reap it, waiting up to `deadline`. If it has not exited by
+/// then, a short-lived reaper thread finishes the `wait` so no zombie remains
+/// (the kill is already sent, so the wait is bounded by the kernel). Returns
+/// whether it was reaped inline.
+fn reap_child(mut child: Child, deadline: Duration) -> bool {
+    let _ = child.kill(); // best-effort: child may already have exited
+    let end = Instant::now() + deadline;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return true,
+            Ok(None) if Instant::now() < end => std::thread::sleep(Duration::from_millis(2)),
+            Ok(None) | Err(_) => break,
+        }
+    }
+    let spawned = std::thread::Builder::new()
+        .name("bridge-reaper".into())
+        .spawn(move || {
+            let _ = child.wait(); // best-effort: reap only
+        });
+    if let Err(e) = spawned {
+        tracing::warn!(target: "thegn::bridge", error = %e, "reaper thread unavailable; child may linger");
+    }
+    false
+}
+
+/// Fail every pending call, signal subscribers, and mark the client closed
+/// (inside the `pending` lock, serializing with `call_within`).
+fn fail_all(pending: &Pending, subs: &Subs, procs: &Procs, closed: &AtomicBool) {
+    {
+        let mut p = pending.lock().unwrap();
+        closed.store(true, Ordering::SeqCst);
+        for (_, tx) in p.drain() {
+            let _ = tx.send(Err("bridge connection closed".into())); // best-effort: nobody may be listening
+        }
+    }
+    for (_, tx) in procs.lock().unwrap().drain() {
+        let _ = tx.send(ProcEvent::Exit { code: -1 }); // best-effort: shutdown, receivers may be gone
+    }
+    // Dropping the Senders disconnects each fs.watch receiver's `recv()`.
+    subs.lock().unwrap().clear();
 }
 
 // ---------------------------------------------------------------------------
@@ -651,18 +816,7 @@ fn reader_loop(
     // concurrent `call_within` is serialized: it either inserted before us (and
     // is drained here) or observes `closed` after us and errors immediately —
     // no waiter is left to time out.
-    {
-        let mut p = pending.lock().unwrap();
-        closed.store(true, Ordering::SeqCst);
-        for (_, tx) in p.drain() {
-            let _ = tx.send(Err("bridge connection closed".into())); // best-effort: nobody may be listening
-        }
-    }
-    for (_, tx) in procs.lock().unwrap().drain() {
-        let _ = tx.send(ProcEvent::Exit { code: -1 }); // best-effort: shutdown, receivers may be gone
-    }
-    // Dropping the Senders disconnects each fs.watch receiver's `recv()`.
-    subs.lock().unwrap().clear();
+    fail_all(&pending, &subs, &procs, &closed);
 }
 
 /// The agent side (`thegn --bridge`): read framed requests off `reader`, run
@@ -1263,7 +1417,7 @@ mod tests {
             }
         });
         let sock = TcpStream::connect(addr).unwrap();
-        BridgeClient::new(sock.try_clone().unwrap(), sock)
+        BridgeClient::new(sock.try_clone().unwrap(), sock).unwrap()
     }
 
     #[test]
@@ -1523,7 +1677,7 @@ mod tests {
             sock // keep the connection open until the client has read both frames
         });
         let sock = TcpStream::connect(addr).unwrap();
-        let c = BridgeClient::new(sock.try_clone().unwrap(), sock);
+        let c = BridgeClient::new(sock.try_clone().unwrap(), sock).unwrap();
         let (tx, rx) = channel();
         c.procs.lock().unwrap().insert(1, tx);
         go_tx.send(()).unwrap();
@@ -1567,7 +1721,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(500));
         });
         let sock = TcpStream::connect(addr).unwrap();
-        let c = BridgeClient::new(sock.try_clone().unwrap(), sock);
+        let c = BridgeClient::new(sock.try_clone().unwrap(), sock).unwrap();
         let (tx, rx) = channel();
         c.procs.lock().unwrap().insert(1, tx);
         go_tx.send(()).unwrap();
@@ -1633,7 +1787,7 @@ mod tests {
             drop(sock);
         });
         let sock = TcpStream::connect(addr).unwrap();
-        let c = BridgeClient::new(sock.try_clone().unwrap(), sock);
+        let c = BridgeClient::new(sock.try_clone().unwrap(), sock).unwrap();
         // Register a proc subscriber directly (no real proc.spawn round-trip; the
         // server here never answers).
         let (tx, rx) = channel();
@@ -1658,7 +1812,7 @@ mod tests {
             drop(sock);
         });
         let sock = TcpStream::connect(addr).unwrap();
-        let c = BridgeClient::new(sock.try_clone().unwrap(), sock);
+        let c = BridgeClient::new(sock.try_clone().unwrap(), sock).unwrap();
         let (tx, rx) = channel::<FsEvent>();
         c.subs.lock().unwrap().insert(3, tx);
         // recv must err (sender dropped by reader_loop close), not time out.
@@ -1734,7 +1888,7 @@ mod tests {
             drop(sock);
         });
         let sock = TcpStream::connect(addr).unwrap();
-        let c = BridgeClient::new(sock.try_clone().unwrap(), sock);
+        let c = BridgeClient::new(sock.try_clone().unwrap(), sock).unwrap();
         let start = Instant::now();
         let r = c.exec(&["echo", "hi"], None, &[]);
         assert!(r.is_err(), "closed transport ⇒ the call errors");
@@ -1743,5 +1897,115 @@ mod tests {
             "call woke fast, not at the 120s deadline: {:?}",
             start.elapsed()
         );
+    }
+
+    // ---- THE-313: fallible construction + bounded close/drop ----
+
+    #[test]
+    fn construction_reports_reader_thread_failure_and_reaps_child() {
+        fn failing(_f: Box<dyn FnOnce() + Send>) -> std::io::Result<std::thread::JoinHandle<()>> {
+            Err(std::io::Error::other("no threads"))
+        }
+        let (r, w) = (std::io::empty(), std::io::sink());
+        let err = BridgeClient::build(r, w, None, failing).err().unwrap();
+        assert!(matches!(err, BridgeError::ReaderThread(_)), "{err}");
+        // With an owned child it must be killed + reaped, not leaked.
+        let child = Command::new("sleep").arg("60").spawn().unwrap();
+        let pid = child.id();
+        let err = BridgeClient::build(std::io::empty(), std::io::sink(), Some(child), failing)
+            .err()
+            .unwrap();
+        assert!(matches!(err, BridgeError::ReaderThread(_)));
+        assert!(
+            !Path::new(&format!("/proc/{pid}")).exists(),
+            "child must be reaped on construction failure"
+        );
+    }
+
+    #[test]
+    fn spawn_failure_is_typed() {
+        let err = BridgeClient::spawn_typed(Command::new("/nonexistent/thegn-bridge-xyz"))
+            .err()
+            .unwrap();
+        assert!(matches!(err, BridgeError::Spawn(_)));
+    }
+
+    #[test]
+    fn close_is_bounded_idempotent_and_reaps_child_and_reader() {
+        // `sleep` ignores stdin; the reader ends once the kill closes stdout.
+        let mut cmd = Command::new("sleep");
+        cmd.arg("60");
+        let c = BridgeClient::spawn_typed(cmd).unwrap();
+        let t = Instant::now();
+        let r = c.close(Duration::from_secs(5));
+        assert!(t.elapsed() < Duration::from_secs(5));
+        assert_eq!(
+            r,
+            CloseReport {
+                reader_finished: true,
+                child_reaped: true
+            }
+        );
+        let t = Instant::now();
+        let r2 = c.close(Duration::from_secs(5));
+        assert!(r2.reader_finished && r2.child_reaped);
+        assert!(
+            t.elapsed() < Duration::from_millis(500),
+            "repeat close is immediate"
+        );
+        assert!(
+            c.exec(&["true"], None, &[]).is_err(),
+            "calls fail after close"
+        );
+    }
+
+    #[test]
+    fn close_with_blocked_reader_returns_at_deadline() {
+        // A reader that never yields data nor EOF: close must not hang.
+        struct Stuck(std::sync::mpsc::Receiver<()>);
+        impl Read for Stuck {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                let _ = self.0.recv(); // best-effort: blocks until the test drops tx
+                Ok(0)
+            }
+        }
+        let (tx, rx) = channel();
+        let c = BridgeClient::new(Stuck(rx), std::io::sink()).unwrap();
+        let t = Instant::now();
+        let r = c.close(Duration::from_millis(100));
+        assert!(t.elapsed() < Duration::from_secs(2));
+        assert!(!r.reader_finished);
+        drop(tx); // unblock the reader; a later close observes completion
+        let r = c.close(Duration::from_secs(2));
+        assert!(r.reader_finished);
+    }
+
+    #[test]
+    fn pending_calls_fail_on_close_and_drop_does_not_block() {
+        struct Stuck(std::sync::mpsc::Receiver<()>);
+        impl Read for Stuck {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                let _ = self.0.recv(); // best-effort: blocks until the test drops tx
+                Ok(0)
+            }
+        }
+        let (tx, rx) = channel::<()>();
+        let c = Arc::new(BridgeClient::new(Stuck(rx), std::io::sink()).unwrap());
+        let c2 = c.clone();
+        let waiter = std::thread::spawn(move || c2.exec(&["true"], None, &[]));
+        std::thread::sleep(Duration::from_millis(100));
+        let t = Instant::now();
+        c.close(Duration::from_millis(100));
+        let res = waiter.join().unwrap();
+        assert!(res.is_err());
+        assert!(
+            t.elapsed() < Duration::from_secs(5),
+            "waiter woken by close, not RPC timeout"
+        );
+        // Drop with a stuck reader must return promptly.
+        let t = Instant::now();
+        drop(c);
+        assert!(t.elapsed() < Duration::from_millis(500));
+        drop(tx);
     }
 }

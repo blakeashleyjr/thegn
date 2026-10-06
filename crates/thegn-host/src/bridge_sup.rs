@@ -276,7 +276,7 @@ fn open_bridge_native(
     Ok(BridgeClient::new(
         FramesReader::new(frames),
         ControlWriter { tx: control },
-    ))
+    )?)
 }
 
 /// Adapts an [`ExecSession`]'s stdout frames into a blocking [`Read`] for the
@@ -388,7 +388,7 @@ mod tests {
             }
         });
         let sock = TcpStream::connect(addr).unwrap();
-        Arc::new(BridgeClient::new(sock.try_clone().unwrap(), sock))
+        Arc::new(BridgeClient::new(sock.try_clone().unwrap(), sock).unwrap())
     }
 
     #[test]
