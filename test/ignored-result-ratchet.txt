@@ -464,3 +464,5 @@ crates/thegn-svc/src/git/submodule.rs
 # to end. Next burn-down candidate; needs the failure surfaced and the status
 # rolled back.
 crates/thegn-host/src/ci_autofix.rs
+# git_config_heal.rs (THE-371): best-effort lock-file cleanup on failure paths and a post-rename directory fsync; the original config is intact either way.
+crates/thegn-core/src/git_config_heal.rs
