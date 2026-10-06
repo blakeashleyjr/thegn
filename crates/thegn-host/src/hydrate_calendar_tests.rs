@@ -308,7 +308,7 @@ fn the_sync_horizon_follows_config() {
         horizon_future_days: 90,
         ..CalendarConfig::default()
     };
-    let (from, to) = horizon(&cfg, d(2026, 8, 21));
+    let (from, to) = horizon(&cfg, d(2026, 8, 21)).unwrap();
     assert_eq!(from, d(2026, 7, 22));
     assert_eq!(to, d(2026, 11, 19));
 }
@@ -715,4 +715,21 @@ fn a_contention_refusal_leaves_the_accounts_record_untouched() {
     assert!(toasts.is_empty(), "contention is not the user's problem");
     // …but the account is backed off, so the popup won't re-fetch it.
     assert!(contention_backoff(&account, thegn_core::util::now()));
+}
+
+#[test]
+fn an_invalid_horizon_is_refused_and_never_collapses_to_today() {
+    let today = d(2026, 8, 21);
+    for (past, future) in [(u32::MAX, 365), (90, u32::MAX), (u32::MAX, u32::MAX)] {
+        let cfg = CalendarConfig {
+            horizon_past_days: past,
+            horizon_future_days: future,
+            ..CalendarConfig::default()
+        };
+        assert!(horizon(&cfg, today).is_err(), "{past}/{future}");
+    }
+    let mut seen = Vec::new();
+    refuse_horizon("calendar.horizon_past_days: bad", &mut |m| seen.push(m));
+    assert_eq!(seen.len(), 1);
+    assert!(seen[0].contains("horizon_past_days"));
 }

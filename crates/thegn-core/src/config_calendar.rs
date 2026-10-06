@@ -112,6 +112,46 @@ impl Default for CalendarConfig {
 }
 
 impl CalendarConfig {
+    /// The sync horizon `[today - horizon_past_days, today + horizon_future_days]`.
+    ///
+    /// Fallible on purpose: an unrepresentable or over-limit endpoint must
+    /// never be replaced by `today`, because the result is the coverage a full
+    /// fetch is treated as authoritative for. Callers refuse the sync (and so
+    /// leave the cache untouched) on `Err`.
+    pub fn sync_horizon(
+        &self,
+        today: chrono::NaiveDate,
+    ) -> Result<(chrono::NaiveDate, chrono::NaiveDate), String> {
+        let max = crate::time_policy::MAX_DURATION_DAYS;
+        for (key, days) in [
+            ("horizon_past_days", self.horizon_past_days),
+            ("horizon_future_days", self.horizon_future_days),
+        ] {
+            if u64::from(days) > max {
+                return Err(format!(
+                    "calendar.{key}: {days} is over the maximum of {max} days"
+                ));
+            }
+        }
+        let from = today
+            .checked_sub_days(chrono::Days::new(u64::from(self.horizon_past_days)))
+            .ok_or_else(|| {
+                format!(
+                    "calendar.horizon_past_days: {} days before {today} is not a representable date",
+                    self.horizon_past_days
+                )
+            })?;
+        let to = today
+            .checked_add_days(chrono::Days::new(u64::from(self.horizon_future_days)))
+            .ok_or_else(|| {
+                format!(
+                    "calendar.horizon_future_days: {} days after {today} is not a representable date",
+                    self.horizon_future_days
+                )
+            })?;
+        Ok((from, to))
+    }
+
     /// Enabled accounts with a real provider.
     pub fn active_accounts(&self) -> Vec<CalendarAccount> {
         if !self.enabled {
@@ -489,6 +529,12 @@ pub fn validate_calendar(cfg: &CalendarConfig) -> Vec<String> {
     let mut out = Vec::new();
     if let Err(problem) = crate::calendar::AdmissionBudget::new(cfg.max_events) {
         out.push(format!("calendar.max_events: {problem}"));
+    }
+    // Probe at a fixed date so validation is deterministic; the days ceiling
+    // bounds it, the date arithmetic is the backstop.
+    let probe = chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap_or_default();
+    if let Err(problem) = cfg.sync_horizon(probe) {
+        out.push(problem);
     }
     if !cfg.home_zone.trim().is_empty() && resolve_zone(&cfg.home_zone).is_none() {
         out.push(format!(
