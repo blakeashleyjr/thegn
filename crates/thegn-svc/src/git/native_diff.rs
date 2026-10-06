@@ -206,7 +206,7 @@ fn open(path: impl AsRef<std::path::Path>) -> Result<gix::Repository> {
 ///
 /// Binary files contribute no line counts (gix returns `None` for them, and
 /// `--numstat` prints `-`/`-`), so they are skipped — matching
-/// [`super::sum_numstat`], which parses those as `0`.
+/// [`super::sum_numstat`], which omits those rows.
 pub(crate) fn diff_entries(
     path: impl AsRef<std::path::Path>,
     spec: &str,
@@ -239,9 +239,7 @@ pub(crate) fn diff_entries(
 /// [`diff_entries`], without materialising the rows.
 pub(crate) fn totals(path: impl AsRef<std::path::Path>, spec: &str) -> Result<(u32, u32)> {
     let entries = diff_entries(path, spec)?;
-    Ok(entries.iter().fold((0u32, 0u32), |(a, d), e| {
-        (a.saturating_add(e.added), d.saturating_add(e.deleted))
-    }))
+    Ok(super::sum_entries(&entries))
 }
 
 /// The tree-to-tree case: one gix walk, line-counting each changed blob.
@@ -284,6 +282,20 @@ fn tree_to_tree(old: &gix::Tree<'_>, new: &gix::Tree<'_>) -> Result<Vec<DiffEntr
     Ok(out)
 }
 
+/// First-occurrence-order dedup in expected O(N) (hash set, byte-exact keys).
+/// The set holds a clone of each key (duplicate storage is accepted: hashing
+/// the bytes to a `u64` would need a collision fallback, which is overkill).
+fn dedup_in_order<K: std::hash::Hash + Eq + Clone>(items: impl IntoIterator<Item = K>) -> Vec<K> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for k in items {
+        if seen.insert(k.clone()) {
+            out.push(k);
+        }
+    }
+    out
+}
+
 /// The bare-rev case: tree(rev) vs the worktree.
 ///
 /// Only handled natively when `rev` resolves to the same commit as `HEAD` —
@@ -322,22 +334,23 @@ fn tree_to_worktree(repo: &gix::Repository, rev: &str) -> Result<Vec<DiffEntry>>
 
     // Enumerate the paths that differ from HEAD — staged and unstaged both,
     // which together are exactly what `git diff HEAD` reports.
-    let mut paths: Vec<gix::bstr::BString> = Vec::new();
+    // A path appears once per staged and once per unstaged change; dedup is
+    // order-preserving and O(1) per item (a linear `contains` was O(N^2)).
     let iter = repo
         .status(gix::progress::Discard)
         .context("gix status")?
         .untracked_files(gix::status::UntrackedFiles::None)
         .into_iter(None)
         .context("gix status iter")?;
+    let mut status_paths: Vec<gix::bstr::BString> = Vec::new();
     for item in iter {
         let item = item.context("gix status item")?;
         if let Some(p) = item.location().to_owned().into() {
             let p: gix::bstr::BString = p;
-            if !paths.contains(&p) {
-                paths.push(p);
-            }
+            status_paths.push(p);
         }
     }
+    let paths = dedup_in_order(status_paths);
 
     let mut out: Vec<DiffEntry> = Vec::new();
     for rela in paths {
@@ -402,6 +415,45 @@ fn tree_to_worktree(repo: &gix::Repository, rev: &str) -> Result<Vec<DiffEntry>>
 
 #[cfg(test)]
 mod tests {
+    #[derive(Clone)]
+    struct Counted(Vec<u8>);
+    thread_local!(static EQS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) });
+    // Hash agrees with the counting `PartialEq` below: both use the bytes.
+    impl std::hash::Hash for Counted {
+        fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+            self.0.hash(state);
+        }
+    }
+    impl PartialEq for Counted {
+        fn eq(&self, o: &Self) -> bool {
+            EQS.with(|c| c.set(c.get() + 1));
+            self.0 == o.0
+        }
+    }
+    impl Eq for Counted {}
+
+    #[test]
+    fn dedup_is_linear_and_order_preserving() {
+        let n = 40_000usize;
+        let mut items: Vec<Counted> = Vec::new();
+        for i in 0..n {
+            // Raw non-UTF-8 bytes, long shared prefix.
+            let mut b = vec![b'd'; 200];
+            b.extend_from_slice(&(i as u32).to_be_bytes());
+            b.push(0xff);
+            items.push(Counted(b));
+        }
+        let mut input = items.clone();
+        input.extend(items.iter().rev().cloned()); // every path twice
+        EQS.with(|c| c.set(0));
+        let out = dedup_in_order(input);
+        let eqs = EQS.with(|c| c.get());
+        assert_eq!(out.len(), n);
+        assert!(out.iter().zip(&items).all(|(a, b)| a.0 == b.0));
+        // Quadratic would be ~n^2/2 = 800M comparisons.
+        assert!(eqs < 4 * n, "too many comparisons: {eqs}");
+    }
+
     use super::*;
     use crate::git::testutil::TestRepo;
 
@@ -553,7 +605,7 @@ mod tests {
     /// output the native path must reproduce.
     fn cli_totals(repo: &TestRepo, spec: &str) -> (u32, u32) {
         let out = repo.out(&["-c", "core.quotePath=false", "diff", "--numstat", spec]);
-        super::super::sum_numstat(&out)
+        super::super::sum_numstat(&out).expect("numstat parses")
     }
 
     /// Every native read must agree with the CLI it replaced. A performance
@@ -661,11 +713,37 @@ mod tests {
         repo.commit_file("a.txt", "x\n", "base");
         repo.out(&["checkout", "-q", "-b", "feat"]);
         // NUL bytes make git call it binary; `--numstat` then prints `-`/`-`,
-        // which `sum_numstat` parses as 0.
+        // which `parse_numstat` omits.
         std::fs::write(repo.dir.join("blob.bin"), [0u8, 1, 2, 0, 3]).unwrap();
         repo.out(&["add", "blob.bin"]);
         repo.out(&["commit", "-q", "-m", "add binary"]);
         assert_parity(&repo, "main...HEAD");
+    }
+
+    #[test]
+    fn typed_rows_match_strict_cli_parser_including_binary() {
+        let repo = TestRepo::new("nd-typed");
+        repo.commit_file("a.txt", "x\n", "base");
+        repo.out(&["checkout", "-q", "-b", "feat"]);
+        repo.commit_file("a.txt", "x\ny\n", "edit");
+        std::fs::write(repo.dir.join("blob.bin"), [0u8, 1, 0, 2]).unwrap();
+        repo.out(&["add", "blob.bin"]);
+        repo.out(&["commit", "-q", "-m", "bin"]);
+        let cli = repo.out(&[
+            "-c",
+            "core.quotePath=false",
+            "diff",
+            "--numstat",
+            "main...HEAD",
+        ]);
+        let mut want = super::super::parse_numstat(&cli).unwrap();
+        let mut got = diff_entries(&repo.dir, "main...HEAD").unwrap();
+        want.sort_by(|x, y| x.path.cmp(&y.path));
+        got.sort_by(|x, y| x.path.cmp(&y.path));
+        assert_eq!(want.len(), got.len());
+        for (w, g) in want.iter().zip(&got) {
+            assert_eq!((&w.path, w.added, w.deleted), (&g.path, g.added, g.deleted));
+        }
     }
 
     #[test]

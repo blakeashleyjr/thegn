@@ -24,7 +24,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -426,6 +426,95 @@ fn no_tracked_ignored(cwd: &Path) -> bool {
 pub(crate) struct RefreshSink {
     pub(crate) tx: tokio_mpsc::UnboundedSender<RefreshKind>,
     pub(crate) wake: Arc<dyn Fn() + Send + Sync>,
+    /// How a withdrawn claim is re-established (THE-726); `None` = never.
+    pub(crate) revive: Option<Reviver>,
+}
+
+/// Most re-registrations one binding of the watcher to a path will make after
+/// withdrawals. Reset by a retarget (fresh [`Reviver`]), so a tab switch still
+/// restores the budget; an overflow storm or unwatchable filesystem is bounded.
+const MAX_REVIVES: u32 = 4;
+/// Backoff before revive `n` (0-based) builds: `BASE << n`. Lets an editor's
+/// write burst settle (and a `.gitignore` be rewritten fully) before the plan
+/// is re-walked. A sleeping off-loop worker: no timer on the loop, no wake.
+const REVIVE_BACKOFF_BASE: Duration = Duration::from_millis(500);
+
+/// Bumped by every retarget: an in-flight revive for an older binding aborts.
+static REVIVE_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+/// Invalidate every pending revive (call when the watcher is rebound).
+pub(crate) fn cancel_revives() {
+    REVIVE_EPOCH.fetch_add(1, Ordering::SeqCst);
+}
+
+/// Re-establishes a withdrawn claim by building a fresh watcher for the same
+/// path and handing it to the loop over the existing adoption channel. Driven
+/// by the withdrawal EVENT itself (never a timer or a poll), once per withdrawn
+/// watcher, within a per-binding attempt budget.
+#[derive(Clone)]
+pub(crate) struct Reviver {
+    attempts: Arc<AtomicU32>,
+    epoch: u64,
+    wtx: tokio_mpsc::UnboundedSender<(PathBuf, RecommendedWatcher)>,
+}
+
+impl Reviver {
+    pub(crate) fn new(wtx: tokio_mpsc::UnboundedSender<(PathBuf, RecommendedWatcher)>) -> Self {
+        Self {
+            attempts: Arc::new(AtomicU32::new(0)),
+            epoch: REVIVE_EPOCH.load(Ordering::SeqCst),
+            wtx,
+        }
+    }
+
+    /// Take one attempt from the budget: the backoff to wait before building,
+    /// or `None` when exhausted.
+    fn take_attempt(&self) -> Option<Duration> {
+        let n = self
+            .attempts
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                (n < MAX_REVIVES).then_some(n + 1)
+            })
+            .ok()?;
+        Some(REVIVE_BACKOFF_BASE * (1u32 << n))
+    }
+
+    /// Schedule ONE off-loop rebuild of `cwd`'s watcher.
+    fn fire(
+        &self,
+        cwd: &Path,
+        tx: &tokio_mpsc::UnboundedSender<RefreshKind>,
+        wake: &Arc<dyn Fn() + Send + Sync>,
+    ) {
+        let Some(backoff) = self.take_attempt() else {
+            tracing::debug!(target: "thegn::watch", worktree = %cwd.display(), "revive budget exhausted");
+            return;
+        };
+        let this = self.clone();
+        let (cwd, tx, wake) = (cwd.to_path_buf(), tx.clone(), wake.clone());
+        // best-effort: a failed spawn just leaves the claim withdrawn, which is
+        // today's fall-back-to-periodic-reads behaviour.
+        let _ = std::thread::Builder::new()
+            .name("diff-watch-revive".into())
+            .spawn(move || {
+                crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
+                std::thread::sleep(backoff);
+                if REVIVE_EPOCH.load(Ordering::SeqCst) != this.epoch {
+                    return; // retargeted meanwhile: the new binding builds its own
+                }
+                let sink = RefreshSink {
+                    tx,
+                    wake: wake.clone(),
+                    revive: Some(this.clone()),
+                };
+                if let Some(nw) = build_diff_watcher(&cwd, sink)
+                    && REVIVE_EPOCH.load(Ordering::SeqCst) == this.epoch
+                    && this.wtx.send((cwd, nw)).is_ok()
+                {
+                    wake();
+                }
+            });
+    }
 }
 
 /// Build + register the diff fs-watcher for `cwd` (blocking: registration walks
@@ -433,7 +522,7 @@ pub(crate) struct RefreshSink {
 /// when no usable watcher could be attached.
 pub(crate) fn build_diff_watcher(cwd: &Path, sink: RefreshSink) -> Option<RecommendedWatcher> {
     let cwd = cwd.to_path_buf();
-    let RefreshSink { tx, wake } = sink;
+    let RefreshSink { tx, wake, revive } = sink;
     // Resolve this worktree's gitdir + common dir. For a *linked* worktree
     // `<cwd>/.git` is a file pointer, so the HEAD / reflog / refs that
     // signal a commit live OUTSIDE the watched tree (in the main repo's
@@ -522,8 +611,19 @@ pub(crate) fn build_diff_watcher(cwd: &Path, sink: RefreshSink) -> Option<Recomm
         cov: cov.clone(),
         path: cwd.clone(),
     };
+    let revive_cwd = cwd.clone();
+    let revive_tx = tx.clone();
+    let revive_wake = wake.clone();
     let new_watcher = recommended_watcher(move |res: notify::Result<Event>| {
+        let vouched = guard.cov.vouches();
         guard.cov.observe(&res, &rules);
+        // The claim was live and this very event withdrew it: re-register once.
+        if vouched
+            && !guard.cov.vouches()
+            && let Some(r) = &revive
+        {
+            r.fire(&revive_cwd, &revive_tx, &revive_wake);
+        }
         if let Ok(ev) = res
             && matches!(
                 ev.kind,
@@ -826,6 +926,7 @@ mod tests {
             RefreshSink {
                 tx,
                 wake: Arc::new(|| {}),
+                revive: None,
             },
         )
         .expect("watcher registers")
@@ -1236,6 +1337,7 @@ mod tests {
                 wake: Arc::new(move || {
                     w2.fetch_add(1, Ordering::SeqCst);
                 }),
+                revive: None,
             },
         )
         .expect("registers");
@@ -1261,6 +1363,7 @@ mod tests {
                 wake: Arc::new(move || {
                     w3.fetch_add(1, Ordering::SeqCst);
                 }),
+                revive: None,
             },
         );
         assert!(print(&r2).is_none());
@@ -1555,8 +1658,49 @@ mod tests {
             RefreshSink {
                 tx,
                 wake: Arc::new(|| {}),
+                revive: None,
             },
         );
         assert!(w.is_none() || print(&base.join("nope")).is_none());
+    }
+
+    #[test]
+    fn revive_budget_is_bounded_and_backs_off() {
+        let (wtx, _rx) = tokio_mpsc::unbounded_channel();
+        let r = Reviver::new(wtx);
+        let waits: Vec<_> = std::iter::from_fn(|| r.take_attempt()).collect();
+        assert_eq!(waits.len(), MAX_REVIVES as usize, "bounded");
+        assert!(waits.windows(2).all(|w| w[1] > w[0]), "backoff grows");
+        assert!(r.take_attempt().is_none(), "stays exhausted");
+    }
+
+    #[test]
+    fn a_withdrawal_revives_the_claim_without_a_tab_switch() {
+        let base = scratch("revive");
+        let r = repo(&base, "r", true);
+        let (tx, _rx) = tokio_mpsc::unbounded_channel();
+        let (wtx, mut wrx) = tokio_mpsc::unbounded_channel();
+        let _w = build_diff_watcher(
+            &r,
+            RefreshSink {
+                tx,
+                wake: Arc::new(|| {}),
+                revive: Some(Reviver::new(wtx)),
+            },
+        )
+        .expect("registers");
+        assert!(print(&r).is_some());
+        std::fs::write(r.join(".gitignore"), "target/\nnode_modules/\n").unwrap();
+        // The replacement watcher arrives over the adoption channel and vouches.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let (path, _nw) = loop {
+            if let Ok(got) = wrx.try_recv() {
+                break got;
+            }
+            assert!(Instant::now() < deadline, "no revived watcher");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(path, r);
+        assert!(print(&r).is_some(), "claim re-established");
     }
 }

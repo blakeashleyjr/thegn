@@ -3,6 +3,7 @@
 
 use super::{GitBackend, run_w};
 use anyhow::Result;
+use thegn_core::git_operand as op;
 use thegn_core::remote::GitLoc;
 
 /// Push force level. Plain `--force` only after `--force-with-lease` was
@@ -17,31 +18,39 @@ pub enum ForceMode {
 
 pub trait BranchOps: GitBackend {
     fn checkout(&self, loc: &GitLoc, refname: &str) -> Result<()> {
+        // Fully qualify so a leading-dash short name can never be an option;
+        // `op` refuses those before spawn.
+        let refname = op::branch_name(refname)?;
         run_w(loc, &[], &["checkout", refname]).map(|_| ())
     }
 
     /// Check out a remote branch as a local tracking branch.
     fn checkout_remote(&self, loc: &GitLoc, remote: &str, branch: &str) -> Result<()> {
+        let (remote, branch) = (op::remote_name(remote)?, op::branch_name(branch)?);
         let track = format!("{remote}/{branch}");
         run_w(loc, &[], &["checkout", "-b", branch, "--track", &track]).map(|_| ())
     }
 
     fn create_branch(&self, loc: &GitLoc, name: &str, base: &str) -> Result<()> {
+        let (name, base) = (op::branch_name(name)?, op::revision(base)?);
         run_w(loc, &[], &["branch", name, base]).map(|_| ())
     }
 
     fn delete_branch(&self, loc: &GitLoc, name: &str, force: bool) -> Result<()> {
+        let name = op::branch_name(name)?;
         let flag = if force { "-D" } else { "-d" };
         run_w(loc, &[], &["branch", flag, name]).map(|_| ())
     }
 
     fn delete_remote_branch(&self, loc: &GitLoc, remote: &str, name: &str) -> Result<()> {
+        let (remote, name) = (op::remote_name(remote)?, op::branch_name(name)?);
         run_w(loc, &[], &["push", remote, "--delete", name]).map(|_| ())
     }
 
     /// Merge `branch` into the current branch (`--no-edit`); a conflict
     /// surfaces as MERGE_HEAD via `merge_state`.
     fn merge(&self, loc: &GitLoc, branch: &str) -> Result<()> {
+        let branch = op::revision(branch)?;
         run_w(loc, &[("GIT_EDITOR", ":")], &["merge", "--no-edit", branch]).map(|_| ())
     }
 
@@ -58,9 +67,11 @@ pub trait BranchOps: GitBackend {
     /// fetch-refspec trick (`git fetch <remote> <b>:<b>`) — no checkout
     /// needed, and git refuses non-ff updates by default.
     fn fast_forward(&self, loc: &GitLoc, branch: &str, current: bool, remote: &str) -> Result<()> {
+        let branch = op::branch_name(branch)?;
         if current {
             run_w(loc, &[], &["merge", "--ff-only", "@{u}"]).map(|_| ())
         } else {
+            let remote = op::remote_name(remote)?;
             let spec = format!("{branch}:{branch}");
             run_w(loc, &[], &["fetch", remote, &spec]).map(|_| ())
         }
@@ -77,6 +88,7 @@ pub trait BranchOps: GitBackend {
     }
 
     fn push_set_upstream(&self, loc: &GitLoc, remote: &str, branch: &str) -> Result<()> {
+        let (remote, branch) = (op::remote_name(remote)?, op::branch_name(branch)?);
         run_w(loc, &[], &["push", "-u", remote, branch]).map(|_| ())
     }
 
@@ -89,11 +101,13 @@ pub trait BranchOps: GitBackend {
     }
 
     fn set_upstream(&self, loc: &GitLoc, remote: &str, branch: &str) -> Result<()> {
+        let (remote, branch) = (op::remote_name(remote)?, op::branch_name(branch)?);
         let up = format!("--set-upstream-to={remote}/{branch}");
         run_w(loc, &[], &["branch", &up, branch]).map(|_| ())
     }
 
     fn rename_branch(&self, loc: &GitLoc, old: &str, new: &str) -> Result<()> {
+        let (old, new) = (op::branch_name(old)?, op::branch_name(new)?);
         run_w(loc, &[], &["branch", "-m", old, new]).map(|_| ())
     }
 
@@ -194,6 +208,38 @@ mod tests {
         git_in(&clone, &["config", "push.default", "simple"]);
         git_in(&clone, &["config", "pull.rebase", "false"]);
         clone
+    }
+
+    #[test]
+    fn dash_named_operands_refused_before_spawn() {
+        use super::super::CommitOps as _;
+        let repo = TestRepo::new("br-dash");
+        ident(&repo.dir);
+        repo.commit_file("f.txt", "base\n", "c0");
+        let loc = GitLoc::Local(repo.dir.clone());
+        let sha = out_in(&repo.dir, &["rev-parse", "HEAD"]);
+        // A real raw ref whose short name looks like an option.
+        git_in(&repo.dir, &["update-ref", "refs/heads/--help", "HEAD"]);
+        for n in ["--help", "--detach", "-f", "-D", "--abort"] {
+            assert!(CliGit.checkout(&loc, n).is_err(), "{n}");
+            assert!(CliGit.delete_branch(&loc, n, true).is_err(), "{n}");
+            assert!(CliGit.create_branch(&loc, n, "HEAD").is_err(), "{n}");
+            assert!(CliGit.merge(&loc, n).is_err(), "{n}");
+            assert!(CliGit.tag(&loc, n, &sha, Some("m")).is_err(), "{n}");
+            assert!(CliGit.delete_tag(&loc, n).is_err(), "{n}");
+            assert!(CliGit.push_tag(&loc, "origin", n).is_err(), "{n}");
+            assert!(CliGit.push_tag(&loc, n, "v1").is_err(), "{n}");
+            assert!(
+                CliGit
+                    .reset_to(&loc, n, super::super::ResetMode::Soft)
+                    .is_err()
+            );
+        }
+        // `tag -a -m m -f <sha>` used to force-create a tag named after the sha.
+        let tags = out_in(&repo.dir, &["tag", "--list"]);
+        assert!(tags.is_empty(), "no tag created: {tags:?}");
+        let heads = out_in(&repo.dir, &["for-each-ref", "refs/heads/"]);
+        assert!(heads.contains("refs/heads/--help"), "ref untouched");
     }
 
     #[test]

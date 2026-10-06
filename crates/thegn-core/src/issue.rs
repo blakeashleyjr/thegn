@@ -449,6 +449,11 @@ pub enum DispatchRunPublishOutcome {
     },
 }
 
+/// Spawn-env key a UI tracker dispatch sets on its agent pane so the daemon can
+/// bind the new session to the already-recorded `agent_dispatches` row at
+/// session start (THE-733). The value is the row id.
+pub const DISPATCH_ROW_ENV: &str = "THEGN_DISPATCH_ROW";
+
 /// The exact run a worker exit belongs to: roster row, the session that
 /// launched it, and the row's launch generation (`run_gen`, v71). An exit stamp
 /// is a CAS on all three, so an event from a replaced run matches nothing.

@@ -1691,44 +1691,73 @@ fn collect_sidebar_status(
     // keys the repo-wide `pr_branch_cache` (item 28). `clean` is false when any
     // read errored (and reused its prior value) — those rows must not overwrite
     // the cache. See `merge_glyph_scan`.
-    let prior_for_scan = &prior_for_scan;
-    let scanned: Vec<(String, GlyphRow, bool)> = std::thread::scope(|s| {
-        let handles: Vec<_> = to_scan
-            .iter()
-            .map(|p| {
-                s.spawn(move || {
-                    let wt = std::path::Path::new(p);
-                    let loc = GitLoc::for_worktree(wt);
-                    let repo_root =
-                        thegn_core::repo::main_worktree(wt).unwrap_or_else(|| wt.to_path_buf());
-                    let include_submodules = app_cfg.repo_git(&repo_root).submodules
-                        != thegn_core::config::SubmoduleMode::Off;
-                    // One batched round-trip for a bridged loc (status + ahead/
-                    // behind + branch), gix/CLI reads for a local one.
-                    let reads = crate::git_handle::get()
-                        .glyph_reads_with_submodules(&loc, include_submodules);
-                    let dirty = reads.dirty.map_err(|_| ());
-                    let ahead_behind = reads.ahead_behind.map_err(|_| ());
-                    let branch = reads.branch.map(Some).map_err(|_| ());
-                    let uncommitted = reads.uncommitted.map_err(|_| ());
-                    let branch_diff = reads.branch_diff.map_err(|_| ());
-                    let submodule_dirty = reads.submodule_dirty.map_err(|_| ());
-                    let (row, clean) = merge_glyph_scan(
-                        prior_for_scan.get(p),
-                        dirty,
-                        ahead_behind,
-                        branch,
-                        repo_root.to_string_lossy().into_owned(),
-                        uncommitted,
-                        branch_diff,
-                        submodule_dirty,
-                    );
-                    (p.clone(), row, clean)
-                })
-            })
-            .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
-    });
+    // Bounded: every scan runs on the shared `scan_pool` (THE-652), never one
+    // native thread per worktree. Job inputs are resolved here (cheap) so the
+    // jobs are `'static`; the active worktree is admitted first.
+    // Repo-root / submodule-mode resolution (a `git rev-parse` on a cold memo)
+    // happens inside each job, off the hydration thread; the config is cloned
+    // once per hydration.
+    let cfg = std::sync::Arc::new(app_cfg.clone());
+    let jobs: Vec<(bool, crate::scan_pool::ScanJob<(GlyphRow, bool)>)> = to_scan
+        .iter()
+        .map(|p| {
+            let prior = prior_for_scan.get(p).cloned();
+            let urgent = active_path.as_deref() == Some(p.as_str());
+            let path = p.clone();
+            let cfg = std::sync::Arc::clone(&cfg);
+            let job: crate::scan_pool::ScanJob<(GlyphRow, bool)> = Box::new(move || {
+                let wt = std::path::Path::new(&path);
+                let repo_root =
+                    thegn_core::repo::main_worktree(wt).unwrap_or_else(|| wt.to_path_buf());
+                let include_submodules =
+                    cfg.repo_git(&repo_root).submodules != thegn_core::config::SubmoduleMode::Off;
+                let loc = GitLoc::for_worktree(wt);
+                // One batched round-trip for a bridged loc (status + ahead/
+                // behind + branch), gix/CLI reads for a local one.
+                let reads =
+                    crate::git_handle::get().glyph_reads_with_submodules(&loc, include_submodules);
+                merge_glyph_scan(
+                    prior.as_ref(),
+                    reads.dirty.map_err(|_| ()),
+                    reads.ahead_behind.map_err(|_| ()),
+                    reads.branch.map(Some).map_err(|_| ()),
+                    repo_root.to_string_lossy().into_owned(),
+                    reads.uncommitted.map_err(|_| ()),
+                    reads.branch_diff.map_err(|_| ()),
+                    reads.submodule_dirty.map_err(|_| ()),
+                )
+            });
+            (urgent, job)
+        })
+        .collect();
+    // (path, GlyphRow, clean) — git only, no DB access. `clean` is false when
+    // any read errored (and reused its prior value) — those rows must not
+    // overwrite the cache. A scan that panicked or got no worker is an explicit
+    // degraded outcome: every read errored, so it keeps the last-known row (or
+    // stays absent), never a fabricated clean one.
+    let outcomes = crate::scan_pool::ScanPool::global().run(jobs);
+    let scanned: Vec<(String, GlyphRow, bool)> = to_scan
+        .iter()
+        .zip(outcomes)
+        .map(|(p, out)| {
+            let (row, clean) = out.unwrap_or_else(|| {
+                let wt = std::path::Path::new(p);
+                let repo_root =
+                    thegn_core::repo::main_worktree(wt).unwrap_or_else(|| wt.to_path_buf());
+                merge_glyph_scan(
+                    prior_for_scan.get(p),
+                    Err(()),
+                    Err(()),
+                    Err(()),
+                    repo_root.to_string_lossy().into_owned(),
+                    Err(()),
+                    Err(()),
+                    Err(()),
+                )
+            });
+            (p.clone(), row, clean)
+        })
+        .collect();
 
     // Refresh the cache with the fresh rows and drop entries for worktrees that
     // are no longer present (bounds growth across the process lifetime). A
@@ -4815,6 +4844,8 @@ pub(crate) fn retarget_diff_watcher(
         return; // already watching this worktree
     }
     *watched = Some(cwd.clone());
+    // Pending revives belong to the previous binding (THE-726).
+    crate::diff_watch::cancel_revives();
 
     // Build + register the watcher off-thread. On LINUX the dominant cost is
     // inotify: recursive registration walks every directory (~1s on this repo)
@@ -4835,6 +4866,7 @@ pub(crate) fn retarget_diff_watcher(
     let old = watcher.take();
     let tx = refresh_tx.clone();
     let wtx = watcher_tx.clone();
+    let revive = crate::diff_watch::Reviver::new(wtx.clone());
     let w = waker.clone();
     std::thread::spawn(move || {
         // Watcher (re)registration + two `git rev-parse` calls. Off the render
@@ -4850,9 +4882,14 @@ pub(crate) fn retarget_diff_watcher(
         };
         // Registration, event filtering and the change generation live in
         // `diff_watch` (moved out of this file, THE-718).
-        if let Some(nw) =
-            crate::diff_watch::build_diff_watcher(&cwd, crate::diff_watch::RefreshSink { tx, wake })
-            && wtx.send((cwd, nw)).is_ok()
+        if let Some(nw) = crate::diff_watch::build_diff_watcher(
+            &cwd,
+            crate::diff_watch::RefreshSink {
+                tx,
+                wake,
+                revive: Some(revive),
+            },
+        ) && wtx.send((cwd, nw)).is_ok()
         {
             let _ = w.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }

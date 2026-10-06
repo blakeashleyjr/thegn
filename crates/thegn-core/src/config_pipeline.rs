@@ -63,9 +63,12 @@ pub struct PipelineStage {
     /// (a stage that can never run is a typo, not a way to disable one).
     pub concurrency: u32,
     /// How long the Lead should wait on this stage's session before treating it
-    /// as blocked, in seconds. **Advisory — thegn never fires this timer**; the
-    /// Lead passes it to `thegn session wait --timeout` (milliseconds), which is
-    /// the only watchdog that exists.
+    /// as blocked, in seconds. Must be between 1 and
+    /// [`crate::time_policy::MAX_DURATION_SECS`] (`config validate` refuses `0`:
+    /// the monitor always passes a bounded wait). **Advisory — thegn never fires
+    /// this timer**; the monitor passes [`PipelineStage::wait_timeout_millis`]
+    /// to `thegn dispatch wait --timeout` (milliseconds), which is the only
+    /// watchdog that exists.
     #[schemars(range(max = "crate::time_policy::MAX_DURATION_SECS"))]
     pub timeout_secs: u64,
     /// The stage the Lead advances to when this one finishes. Unset = terminal.
@@ -217,6 +220,17 @@ impl PipelineStage {
             .iter()
             .filter_map(|r| Requirement::parse(r))
             .collect()
+    }
+
+    /// `timeout_secs` as the positive millisecond argument of `thegn dispatch
+    /// wait --timeout` (a signed `i64`). `None` for a value outside
+    /// `1..=MAX_DURATION_SECS` — exactly what [`validate_pipeline`] refuses, so
+    /// every accepted stage yields `Some`.
+    pub fn wait_timeout_millis(&self) -> Option<i64> {
+        if self.timeout_secs == 0 || self.timeout_secs > crate::time_policy::MAX_DURATION_SECS {
+            return None;
+        }
+        i64::try_from(self.timeout_secs.checked_mul(1000)?).ok()
     }
 
     /// The `[[tasks]]` names this stage validates with, trimmed and non-empty.
@@ -612,9 +626,15 @@ pub fn validate_pipeline(cfg: &Config) -> Vec<String> {
                  roster rows record it and `next` points at it)"
             )),
             Some(n) => {
-                if seen.contains(&n) {
+                if let Some(why) = stage_name_problem(&s.name) {
+                    out.push(format!("pipeline.stages[{i}].name: {why}"));
+                }
+                // Case-insensitive: the name is also an artifact directory, and
+                // `Code`/`code` are one directory on a case-folding filesystem.
+                if seen.iter().any(|o| o.eq_ignore_ascii_case(n)) {
                     out.push(format!(
-                        "{label}: duplicate stage name — every stage name must be unique"
+                        "{label}: duplicate stage name — every stage name must be unique \
+                         (compared case-insensitively)"
                     ));
                 } else {
                     seen.push(n);
@@ -636,6 +656,13 @@ pub fn validate_pipeline(cfg: &Config) -> Vec<String> {
             out.push(format!(
                 "{label}.concurrency: must be at least 1 (a stage that can never run is a \
                  typo — delete the stage to remove it)"
+            ));
+        }
+        if s.wait_timeout_millis().is_none() {
+            out.push(format!(
+                "{label}.timeout_secs: must be between 1 and {} seconds (the monitor \
+                 passes it as a bounded `thegn dispatch wait --timeout` in milliseconds)",
+                crate::time_policy::MAX_DURATION_SECS
             ));
         }
         if let Some(nx) = s.next_name()
@@ -667,6 +694,60 @@ pub fn validate_pipeline(cfg: &Config) -> Vec<String> {
     out.extend(validate_transport_retry(&cfg.pipeline.transport_retry));
     out.extend(validate_supervisor(cfg));
     out
+}
+
+/// Longest accepted stage name, in bytes (ASCII only, so also characters).
+pub const MAX_STAGE_NAME_LEN: usize = 64;
+
+/// Stage names that mean something else on a protocol or display surface. The
+/// dispatch board files a row with no stage under `unstaged`, so a configured
+/// stage of that name would be conflated with non-pipeline dispatches.
+pub const RESERVED_STAGE_NAMES: &[&str] = &["unstaged"];
+
+/// Why `raw` is not a canonical stage identifier, or `None` when it is.
+///
+/// The grammar is `[A-Za-z0-9][A-Za-z0-9._-]*`, at most
+/// [`MAX_STAGE_NAME_LEN`] bytes, not ending in `.`. It is exactly the alphabet
+/// `pipeline_run::artifact_path` keeps, so distinct accepted names never
+/// collapse to the same directory component (case aside, which uniqueness
+/// checks case-insensitively). Surrounding whitespace and control characters
+/// are refused rather than trimmed, so the stored name and the looked-up name
+/// cannot differ.
+pub fn stage_name_problem(raw: &str) -> Option<String> {
+    if raw.len() > MAX_STAGE_NAME_LEN {
+        return Some(format!(
+            "longer than {MAX_STAGE_NAME_LEN} bytes ({} given)",
+            raw.len()
+        ));
+    }
+    if raw.trim() != raw {
+        return Some("has leading or trailing whitespace".to_string());
+    }
+    if raw.chars().any(char::is_control) {
+        return Some("contains a control character".to_string());
+    }
+    let mut chars = raw.chars();
+    if !chars.next().is_some_and(|c| c.is_ascii_alphanumeric()) {
+        return Some("must start with an ASCII letter or digit".to_string());
+    }
+    if let Some(c) = raw
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')))
+    {
+        return Some(format!(
+            "contains {c:?}; use only ASCII letters, digits, `.`, `_` and `-`"
+        ));
+    }
+    if raw.ends_with('.') {
+        return Some("must not end with `.`".to_string());
+    }
+    if RESERVED_STAGE_NAMES
+        .iter()
+        .any(|r| r.eq_ignore_ascii_case(raw))
+    {
+        return Some(format!("{raw:?} is a reserved name"));
+    }
+    None
 }
 
 /// `[pipeline.supervisor]` + the per-stage `validate`/`requires` it acts on.
@@ -1010,6 +1091,88 @@ mod tests {
         assert_eq!(s.stage_name(), None);
         assert!(Pipeline::default().stages.is_empty());
         assert!(Pipeline::default().entry().is_none());
+    }
+
+    #[test]
+    fn stage_names_are_canonical_bounded_and_unreserved() {
+        let errs = |names: &[&str]| {
+            validate_pipeline(&cfg_with(names.iter().map(|n| stage(n, None)).collect()))
+                .into_iter()
+                .filter(|e| e.contains(".name:") || e.contains("duplicate"))
+                .collect::<Vec<_>>()
+        };
+        for ok in [
+            "code",
+            "maintenance-investigate",
+            "maintenance-plan-revision",
+            "maintenance-code",
+            "maintenance-adversarial",
+            "v1.2_x",
+            "7",
+            &"a".repeat(MAX_STAGE_NAME_LEN),
+        ] {
+            assert!(errs(&[ok]).is_empty(), "{ok:?} should be accepted");
+        }
+        for bad in [
+            "unstaged",
+            "Unstaged",
+            " code",
+            "code ",
+            "co de",
+            "co\u{1b}de",
+            "co\nde",
+            "-code",
+            ".hidden",
+            "code.",
+            "caf\u{e9}",
+            "a/b",
+            "..",
+            &"a".repeat(MAX_STAGE_NAME_LEN + 1),
+        ] {
+            assert!(
+                errs(&[bad]).iter().any(|e| e.contains(".name:")),
+                "{bad:?} should be rejected"
+            );
+        }
+        // Names that sanitize to one directory are not both accepted.
+        assert!(!errs(&["Code", "code"]).is_empty());
+        assert!(stage_name_problem("x y").is_some());
+        assert!(stage_name_problem("").is_some());
+        // `next` must name a configured (hence canonical) stage.
+        let cfg = cfg_with(vec![stage("a", Some("unstaged"))]);
+        assert!(validate_pipeline(&cfg).iter().any(|e| e.contains(".next:")));
+    }
+
+    #[test]
+    fn timeout_secs_contract_matches_dispatch_wait() {
+        use crate::time_policy::MAX_DURATION_SECS as MAX;
+        let with = |t: u64| {
+            let mut st = stage("a", None);
+            st.timeout_secs = t;
+            st
+        };
+        let errs = |t: u64| validate_pipeline(&cfg_with(vec![with(t)]));
+        // Default round-trips and is accepted.
+        assert_eq!(
+            PipelineStage::default().wait_timeout_millis(),
+            Some(3_600_000)
+        );
+        assert!(errs(3600).is_empty());
+        assert!(errs(1).is_empty());
+        assert_eq!(with(1).wait_timeout_millis(), Some(1000));
+        // Largest accepted value converts without overflow or sign change.
+        assert!(errs(MAX).is_empty());
+        assert_eq!(with(MAX).wait_timeout_millis(), Some(MAX as i64 * 1000));
+        // Zero and the first overflow-side value are rejected.
+        for bad in [0, MAX + 1, u64::MAX] {
+            let e = errs(bad);
+            assert!(e.iter().any(|m| m.contains("timeout_secs")), "{bad}: {e:?}");
+            assert_eq!(with(bad).wait_timeout_millis(), None);
+        }
+        // Serialization round trip preserves the value.
+        let json = serde_json::to_string(&with(MAX)).unwrap();
+        let back: PipelineStage = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.timeout_secs, MAX);
     }
 
     // --- [pipeline.transport_retry] (THE-86) ----------------------------------

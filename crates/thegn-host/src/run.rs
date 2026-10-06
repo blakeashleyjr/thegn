@@ -5991,10 +5991,8 @@ fn attach_agent_pane(
     tab_name: &str,
     spec: &crate::agent::LaunchSpec,
     center: Rect,
-) -> bool {
-    let Some(gi) = session.worktrees.iter().position(|g| g.name == tab_name) else {
-        return false;
-    };
+) -> Option<u32> {
+    let gi = session.worktrees.iter().position(|g| g.name == tab_name)?;
     let cwd = spec.cwd.clone();
     let env = spec.env.clone();
     let argv = spec.argv.clone();
@@ -6004,19 +6002,17 @@ fn attach_agent_pane(
             // with the agent pane.
             let g = &mut session.worktrees[gi];
             let ti = g.active_tab.min(g.tabs.len().saturating_sub(1));
-            let Some(tab) = g.tabs.get_mut(ti) else {
-                return false;
-            };
+            let tab = g.tabs.get_mut(ti)?;
             for old in tab.center.pane_ids() {
                 panes.table.remove(&old);
             }
             tab.center = crate::center::CenterTree::Leaf(id);
             tab.focused_pane = id;
-            true
+            Some(id)
         }
         Err(e) => {
             thegn_core::msg::warn(&format!("agent launch failed: {e}"));
-            false
+            None
         }
     }
 }
@@ -7053,6 +7049,10 @@ async fn event_loop<T: Terminal>(
     // drops the image and sends the pane + path to paste (or a status message).
     let (paste_img_tx, mut paste_img_rx) =
         tokio_mpsc::unbounded_channel::<crate::handlers::paste_image::PasteImageOutcome>();
+    // Font picker discovery (THE-433): one bounded off-loop worker, results
+    // generation-tagged so a stale run never opens a palette.
+    let (font_tx, mut font_rx) = tokio_mpsc::unbounded_channel::<crate::font::DiscoveryResult>();
+    let mut font_discovery = crate::font::DiscoveryOwner::default();
     // The docked Media section's async up-next queue and cover-art feeds.
     let (media_queue_tx, mut media_queue_rx) =
         tokio_mpsc::unbounded_channel::<crate::panel::media::MediaQueueDelivery>();
@@ -11174,14 +11174,23 @@ async fn event_loop<T: Terminal>(
                     // tab with the agent over the native exec.
                     let native_provider =
                         crate::agent::native_shell_exec(keymap.config(), &payload.path).is_some();
-                    let attached = !native_provider
-                        && attach_agent_pane(
+                    let agent_pane = if native_provider {
+                        None
+                    } else {
+                        attach_agent_pane(
                             &mut session,
                             &mut panes,
                             &payload.tab,
                             &payload.spec,
                             chrome.center,
-                        );
+                        )
+                    };
+                    // THE-733: remember which row this pane runs, so its exit
+                    // binds the daemon session to it instead of guessing.
+                    if let (Some(pane_id), Some(dispatch_id)) = (agent_pane, payload.dispatch_id) {
+                        panes.dispatch_panes.insert(pane_id, dispatch_id);
+                    }
+                    let attached = agent_pane.is_some();
                     if attached || native_provider {
                         // Only pull focus to the new pane when its tab is active
                         // (jump-to-create default, user not since navigated away).
@@ -11603,6 +11612,35 @@ async fn event_loop<T: Terminal>(
             }
             if !msg.is_empty() {
                 model.status = msg;
+            }
+            dirty = true;
+        }
+
+        while let Ok(res) = font_rx.try_recv() {
+            loop_perf.tick(crate::perf::WakeSource::Refresh);
+            if !font_discovery.accept(res.generation) {
+                continue;
+            }
+            let notice = res.discovery.notice().unwrap_or_default();
+            // Never replace a palette or modal the user opened meanwhile.
+            let modal_up = palette.is_some()
+                || active_menu.is_some()
+                || git_input.is_some()
+                || host_input.is_some()
+                || search_replace.is_some()
+                || help_overlay.is_some()
+                || theme_builder.is_some()
+                || monitor.is_some()
+                || board.is_some();
+            if res.discovery.usable() && modal_up {
+                model.status = "Fonts ready - press again".into();
+            } else if res.discovery.usable() {
+                palette = Some(crate::search_everywhere::PaletteSession::new(
+                    res.discovery.items(),
+                ));
+                model.status = notice;
+            } else {
+                model.status = notice;
             }
             dirty = true;
         }
@@ -21024,18 +21062,20 @@ async fn event_loop<T: Terminal>(
                                 );
                                 return Ok(());
                             }
-                            Action::SwitchFont => match crate::font::font_palette_items() {
-                                Ok(items) if items.is_empty() => {
-                                    model.status = "No fonts found via fc-list".into();
+                            Action::SwitchFont => {
+                                // Discovery runs on one supervised worker; a repeat
+                                // press while it runs coalesces into it.
+                                match font_discovery.request(font_tx.clone(), waker.clone()) {
+                                    crate::font::Request::Started => {
+                                        model.status = "Loading fonts...".into();
+                                    }
+                                    crate::font::Request::Coalesced => {}
+                                    crate::font::Request::Failed => {
+                                        model.status =
+                                            "Font list failed: worker spawn failed".into();
+                                    }
                                 }
-                                Ok(items) => {
-                                    palette =
-                                        Some(crate::search_everywhere::PaletteSession::new(items));
-                                }
-                                Err(e) => {
-                                    model.status = format!("Font list failed: {e}");
-                                }
-                            },
+                            }
                             Action::Help => {
                                 help_overlay = crate::help::open(
                                     &help_registry,
