@@ -294,6 +294,7 @@ mod workspace_create;
 mod workspace_identity;
 mod workspace_picker;
 mod workspace_pool;
+mod worktree_admission;
 mod worktree_lifecycle;
 mod worktree_snapshot;
 

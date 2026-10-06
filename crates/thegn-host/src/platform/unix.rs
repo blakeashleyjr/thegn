@@ -522,6 +522,18 @@ pub fn create_private_file(path: &std::path::Path) -> std::io::Result<std::fs::F
         .open(path)
 }
 
+/// Open (creating, mode `0600`, never truncating) an advisory-lock file.
+pub fn open_lock_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(path)
+}
+
 /// Open a log for owner-only append. Hook output can contain credentials even
 /// when the hook itself was configured by a trusted user, so do not rely on
 /// the process umask for this file.

@@ -521,6 +521,10 @@ impl Panes {
         env: &[(String, String)],
         center: Rect,
     ) -> Result<u32> {
+        // Cross-process cleanup admission (THE-728): non-blocking, held only
+        // for the open itself.
+        let _admission =
+            crate::worktree_admission::admit_pane_open(cwd).map_err(|why| anyhow::anyhow!(why))?;
         if self.daemon_cfg.is_some() {
             match self.spawn_daemon_backed(argv, cwd, env, center, None, None) {
                 Ok(id) => return Ok(id),
@@ -547,6 +551,8 @@ impl Panes {
         env: &[(String, String)],
         center: Rect,
     ) -> Result<u32> {
+        let _admission =
+            crate::worktree_admission::admit_pane_open(cwd).map_err(|why| anyhow::anyhow!(why))?;
         self.spawn_in_process(argv, cwd, env, center)
     }
 
