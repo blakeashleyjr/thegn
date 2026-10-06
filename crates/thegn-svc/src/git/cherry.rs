@@ -4,6 +4,7 @@
 
 use super::{GitBackend, gpg_args, run_w};
 use anyhow::{Result, bail};
+use thegn_core::git_operand as op;
 use thegn_core::remote::GitLoc;
 
 pub trait CherryOps: GitBackend {
@@ -18,6 +19,9 @@ pub trait CherryOps: GitBackend {
     ) -> Result<()> {
         if shas.is_empty() {
             bail!("nothing to cherry-pick");
+        }
+        for sha in shas {
+            op::revision(sha)?;
         }
         let m;
         let mut args = gpg_args(override_gpg).to_vec();
@@ -58,6 +62,18 @@ mod tests {
         git_in(dir, &["config", "user.name", "t"]);
         git_in(dir, &["config", "user.email", "t@e"]);
         git_in(dir, &["config", "commit.gpgsign", "false"]);
+    }
+
+    #[test]
+    fn cherry_pick_refuses_option_shaped_operand() {
+        let repo = TestRepo::new("ch-dash");
+        ident(&repo.dir);
+        repo.commit_file("f.txt", "base\n", "c0");
+        let loc = repo.loc();
+        let e = CliGit
+            .cherry_pick(&loc, &["--abort"], None, false)
+            .unwrap_err();
+        assert!(e.to_string().contains("begins with '-'"), "{e}");
     }
 
     #[test]
