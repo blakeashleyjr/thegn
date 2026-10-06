@@ -343,6 +343,9 @@ fn has_custom_driver(repo_root: &Path, paths: &[String]) -> bool {
 // off-loop: the fold runs from the CLI / spawn_blocking (see the module doc).
 #[expect(clippy::disallowed_methods)]
 fn driver_merge(repo_root: &Path, ours: &str, theirs: &str, rerere: bool) -> Option<String> {
+    // Operands sit in option-parsing positions; refuse dash-led ones before spawn.
+    thegn_core::git_operand::revision(ours).ok()?;
+    thegn_core::git_operand::revision(theirs).ok()?;
     let tmp = tmp_path("tg-drivermerge");
     let tmp_s = tmp.to_string_lossy().to_string();
     if !util::git_ok(
@@ -405,6 +408,8 @@ fn regenerate_merge(
     regenerate_paths: &[String],
     regenerate_command: &str,
 ) -> Option<String> {
+    thegn_core::git_operand::revision(ours).ok()?;
+    thegn_core::git_operand::revision(theirs).ok()?;
     let tmp = tmp_path("tg-foldregen");
     let tmp_s = tmp.to_string_lossy().to_string();
     if !util::git_ok(
