@@ -1623,9 +1623,14 @@ async fn media_encoding_and_shared_pool_policies_apply_to_real_backends() {
         },
         adm(),
     );
-    dav.list_events(window().0, window().1, "dav-sync-secret")
-        .await
-        .unwrap();
+    // A stored cursor is scope-bound (THE-738); a raw token reads as stale.
+    dav.list_events(
+        window().0,
+        window().1,
+        &caldav::scope_token(&[], "dav-sync-secret"),
+    )
+    .await
+    .unwrap();
 
     for path in [
         "/feed",
