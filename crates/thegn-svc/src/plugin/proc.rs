@@ -313,6 +313,56 @@ pub(crate) fn leader_exited_nowait(_pid: u32) -> std::io::Result<bool> {
     ))
 }
 
+/// Block until the leader has exited, WITHOUT reaping it (`WNOWAIT`): the
+/// zombie pins the pid/pgid, so group signals sent before the reap cannot hit a
+/// recycled, unrelated group. Retries on `EINTR`.
+#[cfg(unix)]
+pub(crate) fn wait_leader_exit_nowait(pid: u32) -> std::io::Result<()> {
+    loop {
+        let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+        // SAFETY: waitid initializes siginfo on success; WNOWAIT leaves the
+        // child waitable.
+        let rc = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                info.as_mut_ptr(),
+                libc::WEXITED | libc::WNOWAIT,
+            )
+        };
+        if rc == 0 {
+            return Ok(());
+        }
+        let err = std::io::Error::last_os_error();
+        if err.kind() != std::io::ErrorKind::Interrupted {
+            return Err(err);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn wait_leader_exit_nowait(_pid: u32) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "no-wait child observation needs Unix",
+    ))
+}
+
+/// Ask the whole group to terminate (`SIGTERM`). Only call while the leader is
+/// still unreaped.
+#[cfg(unix)]
+pub(crate) fn term_group(pid: u32) {
+    // SAFETY: plain signal syscall; negative pid targets the group.
+    unsafe {
+        libc::kill(-(pid as i32), libc::SIGTERM);
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn term_group(pid: u32) {
+    kill_group(pid);
+}
+
 #[cfg(unix)]
 pub(crate) fn kill_group(pid: u32) {
     // Negative pid targets the whole group.
