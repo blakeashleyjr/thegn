@@ -1,6 +1,6 @@
 //! Cross-process admission between pane opens and worktree destroys (THE-728).
 //!
-//! One advisory lock file per canonical worktree path under
+//! One advisory lock file per worktree root under
 //! `$XDG_STATE_HOME/thegn/locks/`. A destroy takes it exclusive (non-blocking)
 //! for the whole physical removal; a pane open takes it shared (non-blocking)
 //! for the open itself. Neither side ever blocks: a destroy that cannot get the
@@ -15,18 +15,33 @@ use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
-/// How many ancestors of a pane cwd are probed for a destroy lock. A pane cwd
-/// is the worktree root or a shallow subdirectory of it.
-const MAX_ANCESTORS: usize = 8;
-
 pub(crate) const REMOVING_MESSAGE: &str = "worktree is being removed";
 
 fn lock_dir() -> PathBuf {
     #[cfg(test)]
-    let base = std::env::temp_dir();
+    {
+        // Per-thread (hence per-test) directory; never the shared /tmp.
+        thread_local! {
+            static DIR: tempfile::TempDir = tempfile::tempdir().expect("test lock dir");
+        }
+        DIR.with(|d| d.path().join("locks"))
+    }
     #[cfg(not(test))]
-    let base = thegn_core::util::xdg_state_home();
-    base.join("thegn").join("locks")
+    {
+        thegn_core::util::xdg_state_home()
+            .join("thegn")
+            .join("locks")
+    }
+}
+
+/// Create the lock directory owner-only (idempotent, cheap when it exists).
+fn ensure_dir(dir: &Path) -> std::io::Result<()> {
+    if dir.is_dir() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(dir)?;
+    crate::platform::restrict_dir_owner_only(dir);
+    Ok(())
 }
 
 fn lock_path_in(dir: &Path, key: &Path) -> PathBuf {
@@ -35,51 +50,43 @@ fn lock_path_in(dir: &Path, key: &Path) -> PathBuf {
     dir.join(hex)
 }
 
-/// Exclusive hold on one worktree path for the duration of its removal.
+/// Exclusive hold on a worktree (its lexical and canonical spellings) for the
+/// duration of its removal. Dropping it releases every lock; lock files are
+/// deliberately never unlinked (that would race flock against a re-open).
 pub(crate) struct DestroyLock {
-    file: Option<File>,
-    path: PathBuf,
+    _files: Vec<File>,
 }
 
 impl DestroyLock {
-    /// Try to take the destroy lock for `key` (a canonical worktree key).
-    /// `Err` means refuse the destroy: either a pane open holds the lock or
-    /// the lock could not be established (fail closed).
-    pub(crate) fn try_acquire(key: &Path) -> Result<Self, String> {
-        Self::try_acquire_in(&lock_dir(), key)
+    /// Try to take the destroy lock for each spelling in `keys`. `Err` means
+    /// refuse the destroy: a pane open holds a lock, or a lock could not be
+    /// established (fail closed). Nothing is deleted before this succeeds.
+    pub(crate) fn try_acquire(keys: &[&Path]) -> Result<Self, String> {
+        Self::try_acquire_in(&lock_dir(), keys)
     }
 
-    fn try_acquire_in(dir: &Path, key: &Path) -> Result<Self, String> {
-        std::fs::create_dir_all(dir)
-            .map_err(|e| format!("cannot establish cleanup admission lock: {e}"))?;
-        let path = lock_path_in(dir, key);
-        let file = crate::platform::open_lock_file(&path)
-            .map_err(|e| format!("cannot establish cleanup admission lock: {e}"))?;
-        match file.try_lock() {
-            Ok(()) => Ok(Self {
-                file: Some(file),
-                path,
-            }),
-            Err(std::fs::TryLockError::WouldBlock) => {
-                Err("a pane is opening in this worktree; cleanup deferred".into())
+    fn try_acquire_in(dir: &Path, keys: &[&Path]) -> Result<Self, String> {
+        let fail = |e: std::io::Error| format!("cannot establish cleanup admission lock: {e}");
+        ensure_dir(dir).map_err(fail)?;
+        let mut files = Vec::new();
+        let mut seen: Vec<PathBuf> = Vec::new();
+        for key in keys {
+            let path = lock_path_in(dir, key);
+            if seen.contains(&path) {
+                continue;
             }
-            Err(std::fs::TryLockError::Error(e)) => {
-                Err(format!("cannot establish cleanup admission lock: {e}"))
+            let file = crate::platform::open_lock_file(&path).map_err(fail)?;
+            match file.try_lock() {
+                Ok(()) => {}
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    return Err("a pane is opening in this worktree; cleanup deferred".into());
+                }
+                Err(std::fs::TryLockError::Error(e)) => return Err(fail(e)),
             }
+            seen.push(path);
+            files.push(file);
         }
-    }
-
-    /// The worktree is gone: drop the (now meaningless) lock file too.
-    pub(crate) fn forget_file(&mut self) {
-        // best-effort: a leftover empty lock file is harmless.
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
-
-impl Drop for DestroyLock {
-    fn drop(&mut self) {
-        // Closing the fd releases the flock; dropping explicitly keeps intent clear.
-        self.file.take();
+        Ok(Self { _files: files })
     }
 }
 
@@ -88,42 +95,36 @@ pub(crate) struct PaneAdmission {
     _file: Option<File>,
 }
 
-/// Admit a pane open in `cwd`. Only a cwd that is, or sits under, a worktree
-/// with a destroy lock file is affected; everything else is admitted with no
-/// lock taken. Non-blocking: safe on the event loop (a handful of stats).
-pub(crate) fn admit_pane_open(cwd: Option<&Path>) -> Result<PaneAdmission, String> {
-    admit_pane_open_in(&lock_dir(), cwd)
+/// Admit a pane open in the worktree rooted at `root` (the caller's lexical
+/// worktree path; never canonicalized here, so safe on the event loop). The
+/// lock file is opened-or-created and locked shared, non-blocking, and held
+/// by the returned guard for the duration of the open. A destroy holding it
+/// exclusively refuses the open. `None` (no cwd) is exempt.
+pub(crate) fn admit_pane_open(root: Option<&Path>) -> Result<PaneAdmission, String> {
+    admit_pane_open_in(&lock_dir(), root)
 }
 
-fn admit_pane_open_in(dir: &Path, cwd: Option<&Path>) -> Result<PaneAdmission, String> {
-    let free = Ok(PaneAdmission { _file: None });
-    let Some(cwd) = cwd else {
-        return free;
+fn admit_pane_open_in(dir: &Path, root: Option<&Path>) -> Result<PaneAdmission, String> {
+    let Some(root) = root else {
+        return Ok(PaneAdmission { _file: None });
     };
-    // In-process claim (no lock file needed).
-    if crate::worktree_lifecycle::destroy_in_progress_for(cwd) {
+    // In-process claim (no filesystem work unless a destroy is running).
+    if crate::worktree_lifecycle::destroy_in_progress_for(root) {
         return Err(REMOVING_MESSAGE.into());
     }
-    if !dir.is_dir() {
-        return free;
+    // Lock infrastructure trouble never blocks a pane open: the destroy side
+    // fails closed on the same trouble, so it cannot be racing us.
+    if ensure_dir(dir).is_err() {
+        return Ok(PaneAdmission { _file: None });
     }
-    let canonical = crate::worktree_lifecycle::destroy_key_pub(cwd);
-    for ancestor in canonical.ancestors().take(MAX_ANCESTORS) {
-        let path = lock_path_in(dir, ancestor);
-        if !path.exists() {
-            continue;
-        }
-        let Ok(file) = crate::platform::open_lock_file(&path) else {
-            // A lock file that exists but cannot be opened: never block the open.
-            continue;
-        };
-        match file.try_lock_shared() {
-            Ok(()) => return Ok(PaneAdmission { _file: Some(file) }),
-            Err(std::fs::TryLockError::WouldBlock) => return Err(REMOVING_MESSAGE.into()),
-            Err(std::fs::TryLockError::Error(_)) => continue,
-        }
+    let Ok(file) = crate::platform::open_lock_file(&lock_path_in(dir, root)) else {
+        return Ok(PaneAdmission { _file: None });
+    };
+    match file.try_lock_shared() {
+        Ok(()) => Ok(PaneAdmission { _file: Some(file) }),
+        Err(std::fs::TryLockError::WouldBlock) => Err(REMOVING_MESSAGE.into()),
+        Err(std::fs::TryLockError::Error(_)) => Ok(PaneAdmission { _file: None }),
     }
-    free
 }
 
 #[cfg(test)]
@@ -131,54 +132,47 @@ mod tests {
     use super::*;
 
     #[test]
-    fn destroy_lock_refuses_pane_open_at_and_under_the_worktree() {
+    fn destroy_lock_refuses_pane_open_with_no_prior_lock_file() {
         let state = tempfile::tempdir().unwrap();
         let wt = tempfile::tempdir().unwrap();
-        let sub = wt.path().join("src");
-        std::fs::create_dir(&sub).unwrap();
-        let key = crate::worktree_lifecycle::destroy_key_pub(wt.path());
-        let lock = DestroyLock::try_acquire_in(state.path(), &key).unwrap();
-        for cwd in [wt.path(), sub.as_path()] {
-            let err = admit_pane_open_in(state.path(), Some(cwd)).err().unwrap();
-            assert_eq!(err, REMOVING_MESSAGE);
-        }
+        let lock = DestroyLock::try_acquire_in(state.path(), &[wt.path()]).unwrap();
+        let err = admit_pane_open_in(state.path(), Some(wt.path()))
+            .err()
+            .unwrap();
+        assert_eq!(err, REMOVING_MESSAGE);
         drop(lock);
         assert!(admit_pane_open_in(state.path(), Some(wt.path())).is_ok());
     }
 
     #[test]
-    fn cwd_outside_a_locked_worktree_and_no_cwd_are_exempt() {
+    fn pane_open_creates_the_lock_so_a_concurrent_destroy_is_refused() {
+        // No destroy has ever run: the pane side must still create the file.
+        let state = tempfile::tempdir().unwrap();
+        let wt = tempfile::tempdir().unwrap();
+        let held = admit_pane_open_in(state.path(), Some(wt.path())).unwrap();
+        assert!(DestroyLock::try_acquire_in(state.path(), &[wt.path()]).is_err());
+        drop(held);
+        assert!(DestroyLock::try_acquire_in(state.path(), &[wt.path()]).is_ok());
+    }
+
+    #[test]
+    fn other_roots_and_no_root_are_exempt() {
         let state = tempfile::tempdir().unwrap();
         let wt = tempfile::tempdir().unwrap();
         let other = tempfile::tempdir().unwrap();
-        let key = crate::worktree_lifecycle::destroy_key_pub(wt.path());
-        let _lock = DestroyLock::try_acquire_in(state.path(), &key).unwrap();
+        let _lock = DestroyLock::try_acquire_in(state.path(), &[wt.path()]).unwrap();
         assert!(admit_pane_open_in(state.path(), Some(other.path())).is_ok());
         assert!(admit_pane_open_in(state.path(), None).is_ok());
     }
 
     #[test]
-    fn destroy_is_refused_while_a_pane_open_holds_the_shared_lock() {
-        let state = tempfile::tempdir().unwrap();
-        let wt = tempfile::tempdir().unwrap();
-        let key = crate::worktree_lifecycle::destroy_key_pub(wt.path());
-        // A destroy that has come and gone leaves/creates the lock file.
-        drop(DestroyLock::try_acquire_in(state.path(), &key).unwrap());
-        let held = admit_pane_open_in(state.path(), Some(wt.path())).unwrap();
-        assert!(DestroyLock::try_acquire_in(state.path(), &key).is_err());
-        drop(held);
-        assert!(DestroyLock::try_acquire_in(state.path(), &key).is_ok());
-    }
-
-    #[test]
-    fn second_destroyer_is_refused_and_forget_removes_the_file() {
+    fn second_destroyer_is_refused_and_lock_file_persists() {
         let state = tempfile::tempdir().unwrap();
         let key = PathBuf::from("/nonexistent/worktree");
-        let mut first = DestroyLock::try_acquire_in(state.path(), &key).unwrap();
-        assert!(DestroyLock::try_acquire_in(state.path(), &key).is_err());
-        let path = lock_path_in(state.path(), &key);
-        assert!(path.exists());
-        first.forget_file();
-        assert!(!path.exists());
+        let first = DestroyLock::try_acquire_in(state.path(), &[&key]).unwrap();
+        assert!(DestroyLock::try_acquire_in(state.path(), &[&key]).is_err());
+        drop(first);
+        assert!(lock_path_in(state.path(), &key).exists());
+        assert!(DestroyLock::try_acquire_in(state.path(), &[&key]).is_ok());
     }
 }
