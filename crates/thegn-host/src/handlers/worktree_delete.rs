@@ -509,7 +509,10 @@ fn landing_for_slug(session: &crate::session::Session, slug: Option<&str>) -> Op
 
 #[cfg(test)]
 mod tests {
-    use super::{group_names_for, landing_for_slug, next_or_prev, resolve_group_indices};
+    use super::{
+        TargetState, group_names_for, landing_for_slug, next_or_prev, resolve_group_indices,
+        target_state,
+    };
     use crate::session::{GroupKind, Session, WorktreeGroup};
     use std::collections::HashSet;
 
