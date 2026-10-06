@@ -4587,32 +4587,55 @@ fn a_replaced_sessions_exit_is_stale_even_when_the_worktree_has_a_live_row() {
 }
 
 #[test]
-fn daemon_sid_exit_falls_back_to_the_one_active_sessionless_row() {
+fn daemon_sid_exit_never_falls_back_to_a_sessionless_row() {
+    use crate::issue::{AgentDispatchStatus as S, ExitAttribution, NewDispatch};
+    let db = Db::open_memory().unwrap();
+    let id = db
+        .put_agent_dispatch(NewDispatch::new("linear:G-1", "/wt/g", "claude"))
+        .unwrap();
+    db.update_dispatch_status(id, S::Running).unwrap();
+    // THE-733: a second plain shell in the worktree reports its own daemon
+    // session id; it must not be attributed to the agent's session-less row.
+    assert_eq!(
+        db.dispatch_for_exit("/wt/g", Some("plain-shell")).unwrap(),
+        ExitAttribution::Stale
+    );
+}
+
+#[test]
+fn bound_session_makes_the_agent_exit_exact_and_a_plain_shell_stale() {
     use crate::issue::{AgentDispatchStatus as S, ExitAttribution, ExitStamp, NewDispatch};
     let db = Db::open_memory().unwrap();
     let id = db
         .put_agent_dispatch(NewDispatch::new("linear:G-1", "/wt/g", "claude"))
         .unwrap();
     db.update_dispatch_status(id, S::Running).unwrap();
-    let ExitAttribution::Legacy(run) = db.dispatch_for_exit("/wt/g", Some("daemon-1")).unwrap()
+    let before = db.dispatch_run_ref(id).unwrap().unwrap().run_gen;
+    assert!(db.bind_dispatch_session(id, "agent-sess").unwrap());
+    // Already bound: a second bind (or an empty id) changes nothing.
+    assert!(!db.bind_dispatch_session(id, "other").unwrap());
+    assert!(!db.bind_dispatch_session(id, "").unwrap());
+    assert!(!db.bind_dispatch_session(99_999, "x").unwrap());
+    // A plain shell exiting first does not stamp the agent row.
+    assert_eq!(
+        db.dispatch_for_exit("/wt/g", Some("plain-shell")).unwrap(),
+        ExitAttribution::Stale
+    );
+    let ExitAttribution::Exact(run) = db.dispatch_for_exit("/wt/g", Some("agent-sess")).unwrap()
     else {
-        panic!("a sid miss with one session-less active row must be Legacy");
+        panic!("the bound session must attribute exactly");
     };
-    assert_eq!((run.id, run.session_id.as_str()), (id, ""));
+    assert_eq!((run.id, run.run_gen), (id, before + 1));
     assert_eq!(
         db.stamp_dispatch_exit(&run, Some(0)).unwrap(),
         ExitStamp::Stamped
     );
-    // Two session-less active rows: Ambiguous.
-    let id2 = db
-        .put_agent_dispatch(NewDispatch::new("linear:G-2", "/wt/g", "claude"))
+    // A terminal row is never bound.
+    let done = db
+        .put_agent_dispatch(NewDispatch::new("linear:G-2", "/wt/g2", "claude"))
         .unwrap();
-    db.update_dispatch_status(id2, S::Running).unwrap();
-    db.update_dispatch_status(id, S::Running).unwrap();
-    assert_eq!(
-        db.dispatch_for_exit("/wt/g", Some("daemon-1")).unwrap(),
-        ExitAttribution::Ambiguous
-    );
+    db.update_dispatch_status(done, S::Done).unwrap();
+    assert!(!db.bind_dispatch_session(done, "late").unwrap());
 }
 
 #[test]

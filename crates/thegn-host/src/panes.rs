@@ -362,6 +362,12 @@ pub(crate) struct Panes {
     /// pane exits within the threshold it's counted as a crash even if it wrote
     /// output (bwrap prints an error message before dying).
     spawn_times: std::collections::HashMap<u32, std::time::Instant>,
+    /// Pane id -> `agent_dispatches` row id for a pane the UI launched as a
+    /// tracker dispatch's agent (THE-733). The daemon session id is announced
+    /// asynchronously, so the row cannot be stamped at spawn; the pane's exit
+    /// binds the session to this row before attribution, so a plain shell
+    /// exiting in the same worktree can never be mistaken for the agent.
+    pub(crate) dispatch_panes: std::collections::HashMap<u32, i64>,
     /// The host tokio runtime handle, used to drive native-exec (`Stream`) panes'
     /// relay tasks. Captured at construction (present at runtime); `None` in unit
     /// tests that build `Panes` outside a runtime.
@@ -390,6 +396,7 @@ impl Panes {
             tx,
             waker: None,
             spawn_times: std::collections::HashMap::new(),
+            dispatch_panes: std::collections::HashMap::new(),
             rt: tokio::runtime::Handle::try_current().ok(),
             replay_cfg: None,
             daemon_cfg: None,
@@ -425,6 +432,7 @@ impl Panes {
             tx,
             waker: Some(waker),
             spawn_times: std::collections::HashMap::new(),
+            dispatch_panes: std::collections::HashMap::new(),
             rt: tokio::runtime::Handle::try_current().ok(),
             replay_cfg: None,
             daemon_cfg: None,
