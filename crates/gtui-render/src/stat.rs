@@ -12,9 +12,9 @@ impl StatRenderer {
             let y_field = frame.fields.iter().find(|f| f.ty == FieldType::Float64);
             if let Some(y) = y_field
                 // For MVP, just take the last value.
-                && let Some(val) = y.floats().into_iter().next_back()
+                && let Some(val) = y.floats().last()
             {
-                text = format!("{:.2}", val);
+                text = format!("{val:.2}");
             }
         }
 
