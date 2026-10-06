@@ -21,13 +21,13 @@ pub(crate) fn prepare_group(_cmd: &mut tokio::process::Command) {}
 /// leader that has NOT been reaped yet: after `wait` the pgid may be recycled.
 #[cfg(unix)]
 pub(crate) fn kill_group(leader: u32) {
-    if let Ok(pid) = i32::try_from(leader) {
-        if pid > 1 {
-            // SAFETY: killpg on a pgid we created via process_group(0); the
-            // leader is unreaped so the group id cannot have been recycled.
-            unsafe {
-                libc::killpg(pid, libc::SIGKILL);
-            }
+    if let Ok(pid) = i32::try_from(leader)
+        && pid > 1
+    {
+        // SAFETY: killpg on a pgid we created via process_group(0); the
+        // leader is unreaped so the group id cannot have been recycled.
+        unsafe {
+            libc::killpg(pid, libc::SIGKILL);
         }
     }
 }
