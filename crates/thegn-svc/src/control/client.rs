@@ -252,6 +252,8 @@ pub const DEFAULT_LONG_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 /// Extra time added to a caller-supplied `wait` timeout so the daemon's own
 /// timed-out answer arrives before the client gives up.
 pub const WAIT_GRACE: Duration = Duration::from_secs(30);
+/// Cap for routes with legitimately large payloads (CI job logs, previews).
+pub const DEFAULT_MAX_LARGE_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 /// Largest JSON response body the client will buffer.
 pub const DEFAULT_MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 
@@ -262,6 +264,8 @@ pub struct ControlLimits {
     pub request_timeout: Duration,
     pub long_request_timeout: Duration,
     pub max_response_bytes: usize,
+    /// Cap for routes whose payload is legitimately large (CI logs, previews).
+    pub max_large_response_bytes: usize,
 }
 
 impl Default for ControlLimits {
@@ -271,6 +275,7 @@ impl Default for ControlLimits {
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             long_request_timeout: DEFAULT_LONG_REQUEST_TIMEOUT,
             max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
+            max_large_response_bytes: DEFAULT_MAX_LARGE_RESPONSE_BYTES,
         }
     }
 }
@@ -481,6 +486,12 @@ impl ControlClient {
         self.request_with(method, path, body, Deadline::Long).await
     }
 
+    /// Long deadline and the large-body cap, for CI logs and previews.
+    async fn request_large(&self, method: &str, path: &str, body: Option<Value>) -> Result<Value> {
+        self.request_sized(method, path, body, Deadline::Long, true)
+            .await
+    }
+
     async fn request_with(
         &self,
         method: &str,
@@ -488,13 +499,25 @@ impl ControlClient {
         body: Option<Value>,
         deadline: Deadline,
     ) -> Result<Value> {
+        self.request_sized(method, path, body, deadline, false)
+            .await
+    }
+
+    async fn request_sized(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+        deadline: Deadline,
+        large: bool,
+    ) -> Result<Value> {
         let total = match deadline {
             Deadline::Default => Some(self.limits.request_timeout),
             Deadline::Long => Some(self.limits.long_request_timeout),
             Deadline::After(d) => Some(d),
             Deadline::Unbounded => None,
         };
-        let exchange = self.exchange(method, path, body);
+        let exchange = self.exchange(method, path, body, self.body_cap(large));
         let (status, value) = match total {
             Some(total) => bounded(total, ControlBoundError::RequestTimeout, exchange).await?,
             None => exchange.await?,
@@ -515,15 +538,23 @@ impl ControlClient {
         }
     }
 
+    fn body_cap(&self, large: bool) -> usize {
+        if large {
+            self.limits.max_large_response_bytes
+        } else {
+            self.limits.max_response_bytes
+        }
+    }
+
     /// Connect, send one request and read the capped response.
     async fn exchange(
         &self,
         method: &str,
         path: &str,
         body: Option<Value>,
+        max: usize,
     ) -> Result<(u16, Value)> {
         let connect = self.limits.connect_timeout;
-        let max = self.limits.max_response_bytes;
         match &self.addr {
             ControlAddr::Unix(sock) => {
                 let ep = crate::ipc::IpcEndpoint::for_socket_path(sock);
@@ -585,7 +616,7 @@ impl ControlClient {
 
     /// `GET /v1/worktrees` — the worktrees registered with the instance.
     pub async fn worktrees(&self) -> Result<Vec<super::WorktreeInfo>> {
-        let v = self.request("GET", "/v1/worktrees", None).await?;
+        let v = self.request_long("GET", "/v1/worktrees", None).await?;
         Ok(serde_json::from_value(
             required_array(&v, "worktrees")?.clone(),
         )?)
@@ -612,7 +643,7 @@ impl ControlClient {
     /// One-shot snapshot: `(seq, rows, cols, ansi_bytes)`.
     pub async fn snapshot(&self, session: &str) -> Result<(u64, u16, u16, Vec<u8>)> {
         let v = self
-            .request("GET", &format!("/v1/sessions/{session}/snapshot"), None)
+            .request_long("GET", &format!("/v1/sessions/{session}/snapshot"), None)
             .await?;
         let returned_session = required_field(&v, "session")?
             .as_str()
@@ -726,7 +757,7 @@ impl ControlClient {
     }
 
     pub async fn kill(&self, session: &str) -> Result<()> {
-        self.request("DELETE", &format!("/v1/sessions/{session}"), None)
+        self.request_long("DELETE", &format!("/v1/sessions/{session}"), None)
             .await
             .map(|_| ())
     }
@@ -740,7 +771,7 @@ impl ControlClient {
     /// path the host resolves (the sprite's `$THEGN_WORKTREE`), not the sprite's
     /// local mount. Returns the server's `{ "queued": … }` envelope.
     pub async fn merge_add(&self, worktree: &str) -> Result<Value> {
-        self.request(
+        self.request_long(
             "POST",
             "/v1/merge/add",
             Some(json!({ "worktree": worktree })),
@@ -751,7 +782,7 @@ impl ControlClient {
     /// `GET /v1/pr/status` — cached PR status, one row per worktree with a
     /// `pr_cache` entry.
     pub async fn pr_status(&self) -> Result<Vec<super::PrStatusRow>> {
-        let v = self.request("GET", "/v1/pr/status", None).await?;
+        let v = self.request_long("GET", "/v1/pr/status", None).await?;
         Ok(serde_json::from_value(required_array(&v, "prs")?.clone())?)
     }
 
@@ -782,7 +813,7 @@ impl ControlClient {
         if let Some(tail_lines) = tail_lines {
             path.push_str(&format!("&tail_lines={tail_lines}"));
         }
-        let value = self.request_long("GET", &path, None).await?;
+        let value = self.request_large("GET", &path, None).await?;
         Ok(serde_json::from_value(value)?)
     }
 
@@ -809,7 +840,7 @@ impl ControlClient {
         request: &super::AutomationTestRequest,
     ) -> Result<super::AutomationTestReply> {
         let value = self
-            .request(
+            .request_long(
                 "POST",
                 "/v1/automations/test",
                 Some(serde_json::to_value(request)?),
@@ -837,12 +868,14 @@ impl ControlClient {
 
     /// `POST /v1/mcp_proxy/reload` — re-read config and reconcile the hub.
     pub async fn mcp_proxy_reload(&self) -> Result<super::McpProxyReloadReport> {
-        let v = self.request("POST", "/v1/mcp_proxy/reload", None).await?;
+        let v = self
+            .request_long("POST", "/v1/mcp_proxy/reload", None)
+            .await?;
         Ok(serde_json::from_value(v)?)
     }
 
     pub async fn open_worktree(&self, repo: &str, branch: Option<&str>) -> Result<()> {
-        self.request(
+        self.request_long(
             "POST",
             "/v1/worktrees/open",
             Some(json!({ "repo": repo, "branch": branch })),
@@ -855,7 +888,7 @@ impl ControlClient {
     pub async fn open_editor(&self, request: &EditorOpenRequest) -> Result<()> {
         request.target()?;
         let value = self
-            .request(
+            .request_long(
                 "POST",
                 "/v1/editor/open",
                 Some(serde_json::to_value(request)?),
@@ -874,7 +907,7 @@ impl ControlClient {
         req: &super::PreviewFetchRequest,
     ) -> Result<super::PreviewFetchReply> {
         let v = self
-            .request_long(
+            .request_large(
                 "POST",
                 "/v1/preview/fetch",
                 Some(serde_json::to_value(req)?),
@@ -934,7 +967,7 @@ impl ControlClient {
             path.push('?');
             path.push_str(&params.join("&"));
         }
-        let v = self.request("GET", &path, None).await?;
+        let v = self.request_long("GET", &path, None).await?;
         Ok(serde_json::from_value(
             required_array(&v, "issues")?.clone(),
         )?)
@@ -947,7 +980,7 @@ impl ControlClient {
         repo: Option<&str>,
     ) -> Result<thegn_core::issue::IssueDetail> {
         let path = with_repo_query(encoded_issue_path(id, "")?, repo);
-        let v = self.request("GET", &path, None).await?;
+        let v = self.request_long("GET", &path, None).await?;
         Ok(serde_json::from_value(v)?)
     }
 
@@ -960,7 +993,7 @@ impl ControlClient {
     ) -> Result<thegn_core::issue::Issue> {
         let path = with_repo_query(encoded_issue_path(id, "")?, repo);
         let v = self
-            .request("POST", &path, Some(serde_json::to_value(patch)?))
+            .request_long("POST", &path, Some(serde_json::to_value(patch)?))
             .await?;
         Ok(serde_json::from_value(v)?)
     }
@@ -968,7 +1001,7 @@ impl ControlClient {
     /// `POST /v1/issues/{id}/comment` — add a comment.
     pub async fn issue_comment(&self, id: &str, body: &str, repo: Option<&str>) -> Result<()> {
         let path = with_repo_query(encoded_issue_path(id, "/comment")?, repo);
-        self.request("POST", &path, Some(json!({ "body": body })))
+        self.request_long("POST", &path, Some(json!({ "body": body })))
             .await
             .map(|_| ())
     }
@@ -2633,6 +2666,7 @@ mod tests {
             request_timeout: Duration::from_millis(300),
             long_request_timeout: Duration::from_millis(300),
             max_response_bytes: 1024,
+            max_large_response_bytes: 1024 * 1024,
         }
     }
 
@@ -2796,5 +2830,42 @@ mod tests {
         let big = http_body_util::Full::new(hyper::body::Bytes::from(vec![b'x'; 11]));
         let err = collect_capped(big, 10).await.unwrap_err();
         assert_eq!(bound_of(&err), Some(ControlBoundError::ResponseTooLarge));
+    }
+
+    #[tokio::test]
+    async fn large_routes_use_the_larger_body_cap() {
+        use tokio::io::AsyncWriteExt;
+        for large in [false, true] {
+            let addr = raw_server(|mut stream| async move {
+                let body = format!("{{\"pad\":\"{}\"}}", "a".repeat(4000));
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                stream.write_all(head.as_bytes()).await.unwrap();
+                stream.write_all(body.as_bytes()).await.unwrap();
+            })
+            .await;
+            let client = clients(addr)[0].clone().with_limits(tiny_limits());
+            let result = if large {
+                client.request_large("GET", "/x", None).await
+            } else {
+                client.request_long("GET", "/x", None).await
+            };
+            if large {
+                assert!(
+                    result.is_ok(),
+                    "large route must accept 4 KB over a 1 KB cap"
+                );
+            } else {
+                let err = result.unwrap_err();
+                assert_eq!(bound_of(&err), Some(ControlBoundError::ResponseTooLarge));
+            }
+        }
+        assert_eq!(
+            ControlLimits::default().max_large_response_bytes,
+            64 * 1024 * 1024
+        );
+        assert_eq!(ControlLimits::default().max_response_bytes, 8 * 1024 * 1024);
     }
 }
