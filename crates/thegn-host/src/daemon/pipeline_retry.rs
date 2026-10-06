@@ -39,13 +39,17 @@
 //!
 //! # Retry semantics: exact resume, cold restart, never continue-latest
 //!
-//! A retry relaunches COLD (stage prompt re-rendered plus a fixed recovery
-//! note). The roster stores only thegn's daemon session id, not the harness's
-//! native conversation id, so no exact native resume can be proven to belong
-//! to the failed run. The id-free `continue` form ("latest session in the
-//! worktree") is unsafe for an autonomous retry — it can resume an unrelated
-//! newer session — and is never used here (THE-265). An exact native resume
-//! needs the native id persisted and fenced by `run_gen`, a schema change.
+//! - **Exact resume**: the row's CURRENT-generation `native_session_id`
+//!   (v72, recorded by a CAS on row + session + `run_gen`, cleared on every
+//!   run publication) names the harness conversation that belonged to this
+//!   run. If the harness can resume by id, the retry resumes exactly it.
+//!   Today only claude can be told its id at launch (`--session-id`).
+//! - **Cold restart**: no recorded id (other harnesses, pre-v72 rows, a
+//!   replaced run, a refused id shape): the stage prompt is re-rendered plus a
+//!   fixed recovery note.
+//! - **Continue-latest is unsafe and never used.** The id-free `continue` form
+//!   picks the newest history in the worktree, which may be another run's
+//!   (THE-265).
 //!
 //! # Event-driven, zero timers while idle
 //!
@@ -164,6 +168,12 @@ fn observe_exit(obs: &Arc<Observer>, session: String, code: Option<i32>) {
     });
 
     let Some(code) = code.filter(|c| *c != 0) else {
+        // A clean exit is never retried: drop its assigned native id.
+        obs.svc
+            .native_ids
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&session);
         return;
     };
     {
@@ -293,6 +303,14 @@ pub(crate) async fn handle_exit(
     _code: i32,
     attempts: &Attempts,
 ) -> anyhow::Result<()> {
+    // Consume the launch-assigned native id up front, so no early return below
+    // can leave an entry behind.
+    let assigned = svc
+        .native_ids
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(session);
+
     // 1. The corpse: final screen + who was attached at death. One lock-scope
     //    read; the actor buries the tombstone BEFORE the exit reaches the feed,
     //    so an observer woken by the event always finds it.
@@ -315,6 +333,35 @@ pub(crate) async fn handle_exit(
         // The pane path or the Lead already wrote the verdict.
         return Ok(());
     }
+
+    // 2b. The exact run this exit belongs to, and its harness-native session
+    //     id. The id assigned at launch lives in daemon memory; it is made
+    //     durable here by a CAS on (row, session, run_gen), so only the run
+    //     that really owned this session can carry it. Whatever the row holds
+    //     for its CURRENT generation is what a retry may resume.
+    let (run, native) = svc
+        .with_db({
+            let id = row.id;
+            let session = session.to_string();
+            move |db| {
+                let Some(run) = db.dispatch_run_ref(id)? else {
+                    return Ok((None, None));
+                };
+                if run.session_id != session {
+                    // The row already belongs to another run: nothing of this
+                    // session's identity may be recorded or resumed.
+                    return Ok((Some(run), None));
+                }
+                if let Some(native) = &assigned {
+                    // A refused CAS (already has an id) is fine: the read below
+                    // reports what is durable for exactly this run.
+                    db.set_dispatch_native_session(&run, native)?;
+                }
+                let native = db.dispatch_native_session(&run)?;
+                Ok((Some(run), native))
+            }
+        })
+        .await?;
 
     // 3. Classify the flattened final screen. `failed = true` here — the
     //    nonzero-exit gate already ran in the caller.
@@ -340,15 +387,8 @@ pub(crate) async fn handle_exit(
         *a += 1;
         *a
     };
-    // The run this exit belongs to. The backoff below can last a minute; a
-    // re-drive in that window publishes a newer run (new session, bumped
-    // generation) and this retry must not touch it.
-    let run = svc
-        .with_db({
-            let id = row.id;
-            move |db| db.dispatch_run_ref(id)
-        })
-        .await?;
+    // `run` (read in step 2b) fences the backoff below: a re-drive in that
+    // window publishes a newer run and this retry must not touch it.
     let decision = pipeline_exit::decide(&class, attempt, tr.max_attempts, tr.backoff_ms);
 
     match decision {
@@ -402,7 +442,7 @@ pub(crate) async fn handle_exit(
                 );
                 return Ok(());
             }
-            match relaunch(svc, &row).await {
+            match relaunch(svc, &row, native.as_deref()).await {
                 Ok(info) => {
                     let artifact = row.artifact_path.clone().unwrap_or_default();
                     let id = row.id;
@@ -489,13 +529,11 @@ const RECOVERY_CONTEXT: &str = "\n\nNOTE: an earlier attempt at this task was in
 transport error. Its conversation is not available to you. Inspect the worktree (git status, \
 git log) and the artifact path before redoing any work, and continue from what is already there.";
 
-/// The launch spec of a transport retry (THE-265). Always a COLD start: the
-/// roster persists only thegn's daemon session id, never the harness-native
-/// conversation id, so no exact native session can be proven to belong to this
-/// row. `--continue`/"latest" (`continue_last`) picks the newest history in the
-/// worktree, which may be another run's, so it is never used for an autonomous
-/// retry; `resume` stays `None` for the same reason.
-fn retry_open_spec(row: &AgentDispatch, prompt: String) -> OpenSpec {
+/// The launch spec of a transport retry (THE-265): an EXACT resume of
+/// `resume` (a native session id proven to belong to this run), else a COLD
+/// start. `continue_last` is never set: "latest session in the worktree" can be
+/// another run's history.
+fn retry_open_spec(row: &AgentDispatch, prompt: String, resume: Option<String>) -> OpenSpec {
     OpenSpec {
         automation_origin: None,
         argv: Vec::new(),
@@ -510,7 +548,7 @@ fn retry_open_spec(row: &AgentDispatch, prompt: String) -> OpenSpec {
             // A retry is always headless — same as the dispatch it retries.
             headless: Some(true),
             bind_worktree: false,
-            resume: None,
+            resume,
             continue_last: false,
             stage: row.stage.clone(),
             fork: false,
@@ -521,16 +559,39 @@ fn retry_open_spec(row: &AgentDispatch, prompt: String) -> OpenSpec {
     }
 }
 
-/// Relaunch a failed row cold, through [`DaemonService::open`], so the
+/// The native session id a retry may resume exactly: present, shape-valid, and
+/// resumable by id on this agent's harness. Anything else is `None` (cold).
+fn exact_resume_id(
+    cfg: &thegn_core::config::Config,
+    agent: &str,
+    native: Option<&str>,
+) -> Option<String> {
+    let id = native.filter(|id| thegn_core::harness::session_id_ok(id))?;
+    let harness = crate::daemon::agent_open::harness_for_agent(cfg, agent)?;
+    harness.resume_command(id)?;
+    Some(id.to_string())
+}
+
+/// Relaunch a failed row (exact resume or cold), through [`DaemonService::open`], so the
 /// relaunch takes the same sandbox/credential/cap/seeder path every launch
 /// takes. The stage prompt is re-rendered through the shared helpers — the CLI
 /// dispatch path and this path render identically by construction — plus a
 /// bounded recovery note.
-async fn relaunch(svc: &DaemonService, row: &AgentDispatch) -> anyhow::Result<SessionInfo> {
+async fn relaunch(
+    svc: &DaemonService,
+    row: &AgentDispatch,
+    native: Option<&str>,
+) -> anyhow::Result<SessionInfo> {
     crate::daemon::agent_open::harness_for_agent(&svc.config, &row.agent_name)
         .with_context(|| format!("unknown agent `{}` — cannot relaunch", row.agent_name))?;
-    let prompt = format!("{}{RECOVERY_CONTEXT}", cold_stage_prompt(svc, row).await?);
-    svc.open(retry_open_spec(row, prompt))
+    let spec = match exact_resume_id(&svc.config, &row.agent_name, native) {
+        Some(id) => retry_open_spec(row, pipeline_exit::RETRY_NUDGE.to_string(), Some(id)),
+        None => {
+            let prompt = format!("{}{RECOVERY_CONTEXT}", cold_stage_prompt(svc, row).await?);
+            retry_open_spec(row, prompt, None)
+        }
+    };
+    svc.open(spec)
         .await
         .map_err(|e| anyhow::anyhow!("open: {e}"))
 }
@@ -650,21 +711,52 @@ mod tests {
     use super::*;
     use thegn_core::issue::NewDispatch;
 
-    /// THE-265: a retry never selects "latest" native history or an unproven
-    /// native id; it is a cold launch.
-    #[test]
-    fn retry_launch_is_cold_never_continue_latest() {
+    fn claude_row() -> AgentDispatch {
         let db = thegn_core::db::Db::open_memory().expect("db");
         let id = db
             .put_agent_dispatch(NewDispatch::new("linear:THE-265", "/wt/265", "claude"))
             .expect("row");
-        let row = db.get_dispatch(id).expect("get").expect("row");
-        let spec = retry_open_spec(&row, "task".into());
-        let launch = spec.agent.expect("agent launch");
+        db.get_dispatch(id).expect("get").expect("row")
+    }
+
+    /// THE-265: with no proven native id the retry is a cold start; it never
+    /// selects "latest" native history.
+    #[test]
+    fn retry_without_a_native_id_is_cold_never_continue_latest() {
+        let launch = retry_open_spec(&claude_row(), "task".into(), None)
+            .agent
+            .expect("agent launch");
         assert!(!launch.continue_last, "continue-latest is unsafe");
         assert!(launch.resume.is_none());
         assert!(launch.native_session_id.is_none());
         assert!(!launch.fork);
         assert_eq!(launch.headless, Some(true));
+    }
+
+    /// THE-265: a proven native id resumes exactly that session — still never
+    /// continue-latest.
+    #[test]
+    fn retry_with_a_native_id_resumes_exactly_that_session() {
+        let launch = retry_open_spec(&claude_row(), "nudge".into(), Some("abc-123".into()))
+            .agent
+            .expect("agent launch");
+        assert_eq!(launch.resume.as_deref(), Some("abc-123"));
+        assert!(!launch.continue_last);
+        assert!(!launch.fork);
+    }
+
+    #[test]
+    fn only_a_resumable_valid_native_id_is_used() {
+        let cfg = thegn_core::config::Config::default();
+        assert_eq!(
+            exact_resume_id(&cfg, "claude", Some("0c1f-uuid")).as_deref(),
+            Some("0c1f-uuid")
+        );
+        assert_eq!(exact_resume_id(&cfg, "claude", None), None);
+        assert_eq!(exact_resume_id(&cfg, "claude", Some("a b; rm -rf /")), None);
+        assert_eq!(exact_resume_id(&cfg, "claude", Some("")), None);
+        // aider has no resume-by-id: cold, never continue.
+        assert_eq!(exact_resume_id(&cfg, "aider", Some("abc")), None);
+        assert_eq!(exact_resume_id(&cfg, "no-such-agent", Some("abc")), None);
     }
 }
