@@ -47,7 +47,7 @@ impl Drop for LockGuard {
     fn drop(&mut self) {
         if self.armed {
             // best-effort: failure path cleanup; the original config is intact.
-            std::fs::remove_file(&self.path).unwrap_or(());
+            let _ = std::fs::remove_file(&self.path);
         }
     }
 }
@@ -103,6 +103,11 @@ pub fn strip_stray_core_worktree(root: &Path) -> StripOutcome {
         Ok(v) => v,
         Err(e) => return refuse(e),
     };
+    // Cheap gate: without the token there is nothing to repair, and unrelated
+    // syntax elsewhere in the file must never turn into a refusal.
+    if !contains_worktree_token(&bytes) {
+        return StripOutcome::Unchanged;
+    }
     match strip_core_worktree_bytes(&bytes) {
         Ok(None) => return StripOutcome::Unchanged,
         Ok(Some(_)) => {}
@@ -158,9 +163,15 @@ pub fn strip_stray_core_worktree(root: &Path) -> StripOutcome {
     guard.armed = false;
     // best-effort: durability of the rename; the replace itself is atomic.
     if let Ok(dir) = std::fs::File::open(&gitdir) {
-        dir.sync_all().unwrap_or(());
+        let _ = dir.sync_all(); // best-effort: durability of the rename only
     }
     StripOutcome::Stripped
+}
+
+fn contains_worktree_token(bytes: &[u8]) -> bool {
+    bytes
+        .windows(8)
+        .any(|w| w.eq_ignore_ascii_case(b"worktree"))
 }
 
 fn is_ws(b: u8) -> bool {
@@ -193,6 +204,7 @@ pub(crate) fn strip_core_worktree_bytes(src: &[u8]) -> Result<Option<Vec<u8>>, S
     let mut dropping_continuation = false;
     let mut in_continuation = false;
     let mut first = true;
+    let mut ambiguous = false;
     for raw in src.split_inclusive(|b| *b == b'\n') {
         let content = content_of(raw);
         let scan = if first {
@@ -206,7 +218,8 @@ pub(crate) fn strip_core_worktree_bytes(src: &[u8]) -> Result<Option<Vec<u8>>, S
         let has_comment_char = t.iter().any(|b| matches!(b, b'#' | b';'));
         let continues = !is_comment && ends_with_odd_backslash(content);
         if continues && has_comment_char {
-            return Err("ambiguous comment/continuation syntax in config".into());
+            // Only fatal if we end up editing this file (see below).
+            ambiguous = true;
         }
         if in_continuation {
             // Body of a multi-line value: never a header or key.
@@ -221,9 +234,13 @@ pub(crate) fn strip_core_worktree_bytes(src: &[u8]) -> Result<Option<Vec<u8>>, S
         if t.first() == Some(&b'[') {
             let close = t.iter().position(|b| *b == b']');
             let Some(close) = close else {
-                return Err("unterminated section header".into());
+                ambiguous = true;
+                in_core = false;
+                in_continuation = continues;
+                out.extend_from_slice(raw);
+                continue;
             };
-            let head = &t[1..close];
+            let head = t[1..close].trim_ascii();
             let rest = trim_start(&t[close + 1..]);
             in_core = head.eq_ignore_ascii_case(b"core");
             if in_core && !rest.is_empty() && !matches!(rest.first(), Some(b'#' | b';')) {
@@ -259,6 +276,9 @@ pub(crate) fn strip_core_worktree_bytes(src: &[u8]) -> Result<Option<Vec<u8>>, S
         in_continuation = continues;
         dropping_continuation = false;
         out.extend_from_slice(raw);
+    }
+    if removed && ambiguous {
+        return Err("ambiguous syntax alongside core.worktree".into());
     }
     Ok(removed.then_some(out))
 }
@@ -321,8 +341,18 @@ mod tests {
     #[test]
     fn same_line_header_assignment_is_refused() {
         assert!(strip_core_worktree_bytes(b"[core] worktree = /x\n").is_err());
-        assert!(strip_core_worktree_bytes(b"[core").is_err());
-        assert!(strip_core_worktree_bytes(b"[core]\nk = v # c \\\n").is_err());
+        // Ambiguity is only fatal when a core.worktree edit is involved.
+        assert!(strip_core_worktree_bytes(b"[core\n").unwrap().is_none());
+        assert!(
+            strip_core_worktree_bytes(b"[core]\nk = v # c \\\n")
+                .unwrap()
+                .is_none()
+        );
+        assert!(strip_core_worktree_bytes(b"[core]\nk = v # c \\\n\nworktree = /x\n").is_err());
+        assert_eq!(
+            strip(b"[ core ]\nworktree = /x\n").unwrap(),
+            b"[ core ]\n".to_vec()
+        );
     }
 
     #[test]
@@ -421,6 +451,14 @@ mod tests {
                 strip_stray_core_worktree(d.path()),
                 StripOutcome::Refused(_)
             ));
+            assert_eq!(std::fs::read(d.path().join(".git/config")).unwrap(), body);
+        }
+
+        #[test]
+        fn unrelated_ambiguous_syntax_is_unchanged_not_refused() {
+            let body = b"[alias]\n\tx = !a ; b \\\n\t c\n[core]\n\tbare = false\n";
+            let d = repo(body);
+            assert_eq!(strip_stray_core_worktree(d.path()), StripOutcome::Unchanged);
             assert_eq!(std::fs::read(d.path().join(".git/config")).unwrap(), body);
         }
 
