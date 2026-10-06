@@ -7055,8 +7055,7 @@ async fn event_loop<T: Terminal>(
         tokio_mpsc::unbounded_channel::<crate::handlers::paste_image::PasteImageOutcome>();
     // Font picker discovery (THE-433): one bounded off-loop worker, results
     // generation-tagged so a stale run never opens a palette.
-    let (font_tx, mut font_rx) =
-        tokio_mpsc::unbounded_channel::<crate::font::DiscoveryResult>();
+    let (font_tx, mut font_rx) = tokio_mpsc::unbounded_channel::<crate::font::DiscoveryResult>();
     let mut font_discovery = crate::font::DiscoveryOwner::default();
     // The docked Media section's async up-next queue and cover-art feeds.
     let (media_queue_tx, mut media_queue_rx) =
@@ -11617,13 +11616,26 @@ async fn event_loop<T: Terminal>(
             if !font_discovery.accept(res.generation) {
                 continue;
             }
-            if res.discovery.usable() {
+            let notice = res.discovery.notice().unwrap_or_default();
+            // Never replace a palette or modal the user opened meanwhile.
+            let modal_up = palette.is_some()
+                || active_menu.is_some()
+                || git_input.is_some()
+                || host_input.is_some()
+                || search_replace.is_some()
+                || help_overlay.is_some()
+                || theme_builder.is_some()
+                || monitor.is_some()
+                || board.is_some();
+            if res.discovery.usable() && modal_up {
+                model.status = "Fonts ready - press again".into();
+            } else if res.discovery.usable() {
                 palette = Some(crate::search_everywhere::PaletteSession::new(
                     res.discovery.items(),
                 ));
-                model.status = res.discovery.notice().unwrap_or_default();
+                model.status = notice;
             } else {
-                model.status = res.discovery.notice().unwrap_or_default();
+                model.status = notice;
             }
             dirty = true;
         }
@@ -21048,8 +21060,15 @@ async fn event_loop<T: Terminal>(
                             Action::SwitchFont => {
                                 // Discovery runs on one supervised worker; a repeat
                                 // press while it runs coalesces into it.
-                                if font_discovery.request(font_tx.clone(), waker.clone()) {
-                                    model.status = "Loading fonts...".into();
+                                match font_discovery.request(font_tx.clone(), waker.clone()) {
+                                    crate::font::Request::Started => {
+                                        model.status = "Loading fonts...".into();
+                                    }
+                                    crate::font::Request::Coalesced => {}
+                                    crate::font::Request::Failed => {
+                                        model.status =
+                                            "Font list failed: worker spawn failed".into();
+                                    }
                                 }
                             }
                             Action::Help => {
