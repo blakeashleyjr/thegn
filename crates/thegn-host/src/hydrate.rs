@@ -4815,6 +4815,8 @@ pub(crate) fn retarget_diff_watcher(
         return; // already watching this worktree
     }
     *watched = Some(cwd.clone());
+    // Pending revives belong to the previous binding (THE-726).
+    crate::diff_watch::cancel_revives();
 
     // Build + register the watcher off-thread. On LINUX the dominant cost is
     // inotify: recursive registration walks every directory (~1s on this repo)
@@ -4835,6 +4837,7 @@ pub(crate) fn retarget_diff_watcher(
     let old = watcher.take();
     let tx = refresh_tx.clone();
     let wtx = watcher_tx.clone();
+    let revive = crate::diff_watch::Reviver::new(wtx.clone());
     let w = waker.clone();
     std::thread::spawn(move || {
         // Watcher (re)registration + two `git rev-parse` calls. Off the render
@@ -4850,9 +4853,14 @@ pub(crate) fn retarget_diff_watcher(
         };
         // Registration, event filtering and the change generation live in
         // `diff_watch` (moved out of this file, THE-718).
-        if let Some(nw) =
-            crate::diff_watch::build_diff_watcher(&cwd, crate::diff_watch::RefreshSink { tx, wake })
-            && wtx.send((cwd, nw)).is_ok()
+        if let Some(nw) = crate::diff_watch::build_diff_watcher(
+            &cwd,
+            crate::diff_watch::RefreshSink {
+                tx,
+                wake,
+                revive: Some(revive),
+            },
+        ) && wtx.send((cwd, nw)).is_ok()
         {
             let _ = w.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
