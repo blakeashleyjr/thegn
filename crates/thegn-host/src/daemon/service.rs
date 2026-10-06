@@ -714,7 +714,8 @@ impl ControlApi for DaemonService {
                             .map_err(|error| anyhow::anyhow!("configuration refused: {error}"))?;
                         let cfg = fresh.as_ref().unwrap_or(&snapshot);
                         super::agent_open::ensure_configured_agent(cfg, &launch.agent)?;
-                        let recipe = super::fork::agent_recipe(cfg, &launch, &spec2);
+                        // Assign BEFORE the recipe so it records the minted id,
+                        // never the untrusted caller value.
                         let assigned =
                             super::agent_open::assign_native_session_id(cfg, &mut launch, || {
                                 let mut b = [0u8; 16];
@@ -722,6 +723,7 @@ impl ControlApi for DaemonService {
                                 // cold-restartable, never given a guessable one.
                                 getrandom::fill(&mut b).ok().map(|()| b)
                             });
+                        let recipe = super::fork::agent_recipe(cfg, &launch, &spec2);
                         let resolved =
                             super::agent_open::resolve(cfg, db, &spec2, &launch, branch)?;
                         Ok((recipe, Some(resolved), assigned))
@@ -830,6 +832,10 @@ impl ControlApi for DaemonService {
             .await
             .inspect_err(|_| {
                 crate::automation_runtime::clear_session_origin(&id);
+                self.native_ids
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .remove(&id);
             })?;
 
             // THE-733: a tracker dispatch names the row it recorded before the
@@ -4549,10 +4555,10 @@ mod tests {
 
         // Drive both synthetic exits through the observer's real path.
         let attempts = std::sync::Mutex::new(std::collections::HashMap::new());
-        pipeline_retry::handle_exit(&svc, "s-retry", 1, &attempts)
+        pipeline_retry::handle_exit(&svc, "s-retry", 1, &attempts, None)
             .await
             .expect("transport exit handled");
-        pipeline_retry::handle_exit(&svc, "s-limit", 1, &attempts)
+        pipeline_retry::handle_exit(&svc, "s-limit", 1, &attempts, None)
             .await
             .expect("limit exit handled");
 
@@ -4644,7 +4650,7 @@ mod tests {
         };
 
         let attempts = std::sync::Mutex::new(std::collections::HashMap::new());
-        pipeline_retry::handle_exit(&svc, "s-race", 1, &attempts)
+        pipeline_retry::handle_exit(&svc, "s-race", 1, &attempts, None)
             .await
             .expect("transport exit handled");
         flipper.await.unwrap();
@@ -4743,12 +4749,12 @@ mod tests {
             svc.tombs.lock().await.insert(sid.into(), t, now_ms());
         }
         let attempts = std::sync::Mutex::new(std::collections::HashMap::new());
-        pipeline_retry::handle_exit(&svc, "s-cur", 1, &attempts)
+        pipeline_retry::handle_exit(&svc, "s-cur", 1, &attempts, None)
             .await
             .unwrap();
         // The row `other` has moved on to "s-new-run"; "s-old-run" is stale.
         // (No row carries it, so there is nothing to record against.)
-        pipeline_retry::handle_exit(&svc, "s-old-run", 1, &attempts)
+        pipeline_retry::handle_exit(&svc, "s-old-run", 1, &attempts, None)
             .await
             .unwrap();
         let db = svc.db.lock().unwrap();
@@ -4822,16 +4828,19 @@ mod tests {
         let mut cfg = thegn_core::config::Config::default();
         cfg.pipeline.transport_retry.backoff_ms = 60_000;
         let (svc, rx) = service_with_config(0, cfg);
-        let id = svc
-            .db
-            .lock()
-            .unwrap()
-            .put_agent_dispatch(NewDispatch {
-                session_id: Some("s-lag"),
-                stage: Some("code"),
-                ..NewDispatch::new("linear:THE-266", "/wt/lag", "claude")
-            })
-            .unwrap();
+        let id = {
+            let db = svc.db.lock().unwrap();
+            let id = db
+                .put_agent_dispatch(NewDispatch {
+                    session_id: Some("s-lag"),
+                    stage: Some("code"),
+                    ..NewDispatch::new("linear:THE-266", "/wt/lag", "claude")
+                })
+                .unwrap();
+            db.update_dispatch_status(id, thegn_core::issue::AgentDispatchStatus::Running)
+                .unwrap();
+            id
+        };
         svc.tombs
             .lock()
             .await

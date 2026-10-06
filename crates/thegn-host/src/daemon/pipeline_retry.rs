@@ -106,6 +106,8 @@ struct Observer {
     pending: Mutex<HashSet<String>>,
     permits: tokio::sync::Semaphore,
     overflowed: AtomicBool,
+    /// Set while a reconcile runs, so concurrent triggers coalesce.
+    reconciling: AtomicBool,
 }
 
 type BoxFut = Pin<Box<dyn Future<Output = ()> + Send>>;
@@ -125,6 +127,7 @@ pub(crate) fn spawn(
         pending: Mutex::new(HashSet::new()),
         permits: tokio::sync::Semaphore::new(MAX_CONCURRENT_RETRIES),
         overflowed: AtomicBool::new(false),
+        reconciling: AtomicBool::new(false),
     });
     tokio::spawn(async move {
         loop {
@@ -195,11 +198,12 @@ fn observe_exit(obs: &Arc<Observer>, session: String, code: Option<i32>) {
     }
     let obs = obs.clone();
     tokio::spawn(async move {
-        // best-effort: the semaphore is never closed.
-        // `Result::ok(..)` form: the permit is used, not ignored (the ratchet
-        // matches a trailing `.ok();` textually).
-        let permit = Result::ok(obs.permits.acquire().await);
-        if let Err(e) = handle_exit(&obs.svc, &session, code, &obs.attempts).await {
+        // The permit is taken inside `handle_exit`, only around backoff and
+        // relaunch: classification, parking and persisting the native id never
+        // wait behind other rows' retries.
+        if let Err(e) =
+            handle_exit(&obs.svc, &session, code, &obs.attempts, Some(&obs.permits)).await
+        {
             // best-effort: a failed retry cycle must not kill the observer —
             // the note column records what it could.
             tracing::warn!(
@@ -209,7 +213,6 @@ fn observe_exit(obs: &Arc<Observer>, session: String, code: Option<i32>) {
                 "transport retry: {e:#}"
             );
         }
-        drop(permit);
         obs.pending
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -227,6 +230,16 @@ fn observe_exit(obs: &Arc<Observer>, session: String, code: Option<i32>) {
 /// was in fact already handled a harmless no-op.
 fn reconcile_missed_exits(obs: Arc<Observer>) -> BoxFut {
     Box::pin(async move {
+        if obs.reconciling.swap(true, Ordering::SeqCst) {
+            return; // one already running: it reads the same durable state
+        }
+        reconcile_pass(&obs).await;
+        obs.reconciling.store(false, Ordering::SeqCst);
+    })
+}
+
+async fn reconcile_pass(obs: &Arc<Observer>) {
+    {
         let rows = match obs.svc.with_db(|db| db.list_dispatches()).await {
             Ok(rows) => rows,
             Err(e) => {
@@ -235,17 +248,19 @@ fn reconcile_missed_exits(obs: Arc<Observer>) -> BoxFut {
             }
         };
         for row in rows {
-            if row.status.is_terminal() || row.exited_at_ms.is_some() {
+            // Only a row still `running` can hold a missed exit: a parked or
+            // spawning row was already handled by a retry cycle.
+            if row.status != AgentDispatchStatus::Running || row.exited_at_ms.is_some() {
                 continue;
             }
             let Some(session) = row.session_id.filter(|s| !s.is_empty()) else {
                 continue;
             };
             if let Some(tomb) = obs.svc.tombstone(&session).await {
-                observe_exit(&obs, session, tomb.exit_code);
+                observe_exit(obs, session, tomb.exit_code);
             }
         }
-    })
+    }
 }
 
 /// Persist a daemon session exit on its dispatch row. The association normally
@@ -304,6 +319,7 @@ pub(crate) async fn handle_exit(
     session: &str,
     _code: i32,
     attempts: &Attempts,
+    permits: Option<&tokio::sync::Semaphore>,
 ) -> anyhow::Result<()> {
     // Consume the launch-assigned native id up front, so no early return below
     // can leave an entry behind.
@@ -364,6 +380,12 @@ pub(crate) async fn handle_exit(
             }
         })
         .await?;
+    // The row was republished to a newer session (or vanished) since the
+    // lookup: this exit belongs to a replaced run, and the live worker that
+    // replaced it must not be parked or relaunched over.
+    let Some(run) = run.filter(|r| r.session_id == session) else {
+        return Ok(());
+    };
 
     // 3. Classify the flattened final screen. `failed = true` here — the
     //    nonzero-exit gate already ran in the caller.
@@ -375,7 +397,12 @@ pub(crate) async fn handle_exit(
         return Ok(());
     }
     let sig = ExitSignatures::from(tr);
-    let Some(class) = pipeline_exit::classify(true, &screen, &sig) else {
+    let mut native = native;
+    let Some(class) = retry_class(
+        pipeline_exit::classify(true, &screen, &sig),
+        &screen,
+        &mut native,
+    ) else {
         // A plain nonzero exit that matches nothing: the supervisor's call.
         return Ok(());
     };
@@ -396,16 +423,17 @@ pub(crate) async fn handle_exit(
     match decision {
         pipeline_exit::RetryDecision::Park { note } => {
             forget(attempts, row.id);
-            park(svc, row.id, row.status, &note).await?;
+            park(svc, &run, row.status, &note).await?;
         }
         pipeline_exit::RetryDecision::Exhausted { note } => {
             forget(attempts, row.id);
-            park(svc, row.id, row.status, &note).await?;
+            park(svc, &run, row.status, &note).await?;
         }
         pipeline_exit::RetryDecision::Retry { attempt, delay_ms } => {
             let note = pipeline_exit::retry_note(signature_of(&class), attempt, tr.max_attempts);
-            if !park(svc, row.id, row.status, &note).await? {
-                forget(attempts, row.id);
+            if !park(svc, &run, row.status, &note).await? {
+                // The row moved (verdict or a newer run): leave its budget be.
+                forget_if_current(svc, attempts, &run).await;
                 return Ok(());
             }
             tracing::info!(
@@ -415,28 +443,31 @@ pub(crate) async fn handle_exit(
                 delay_ms,
                 "transport failure on a headless dispatch; relaunching"
             );
+            // Bound concurrent backoff + relaunch work (held to function end).
+            // `Result::ok(..)`: the permit is used, not ignored.
+            let _permit = match permits {
+                Some(p) => Result::ok(p.acquire().await),
+                None => None,
+            };
             tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-            // Reserve the row before opening the replacement. The old
-            // read-then-open sequence still let a supervisor close the row
-            // after the read and before `open` returned.
-            let id_for_check = row.id;
-            let still_ours = svc
-                .with_db(move |db| db.dispatch_run_ref(id_for_check))
+            // Reserve the row before opening the replacement, fenced on the
+            // exact run that was parked: a re-drive during the backoff replaced
+            // the session and bumped `run_gen`, so this matches nothing and the
+            // newer run is never relaunched over.
+            let reserved = {
+                let run = run.clone();
+                svc.with_db(move |db| {
+                    db.compare_and_set_dispatch_status_run(
+                        &run,
+                        AgentDispatchStatus::WaitingHuman,
+                        AgentDispatchStatus::Spawning,
+                        None,
+                    )
+                })
                 .await?
-                == run;
-            let reserved = still_ours
-                && svc
-                    .with_db(move |db| {
-                        db.compare_and_set_dispatch_status(
-                            id_for_check,
-                            AgentDispatchStatus::WaitingHuman,
-                            AgentDispatchStatus::Spawning,
-                            None,
-                        )
-                    })
-                    .await?;
+            };
             if !reserved {
-                forget(attempts, row.id);
+                forget_if_current(svc, attempts, &run).await;
                 tracing::info!(
                     target: "thegn::daemon",
                     row = row.id,
@@ -484,7 +515,7 @@ pub(crate) async fn handle_exit(
                         .chars()
                         .take(thegn_core::pipeline_report::NOTE_MAX_CHARS)
                         .collect();
-                    park(svc, row.id, AgentDispatchStatus::Spawning, &failed_note).await?;
+                    park(svc, &run, AgentDispatchStatus::Spawning, &failed_note).await?;
                 }
             }
         }
@@ -496,12 +527,13 @@ pub(crate) async fn handle_exit(
 /// status write. The daemon can park a row but never finish one.
 async fn park(
     svc: &DaemonService,
-    id: i64,
+    run: &thegn_core::issue::DispatchRunRef,
     expected: AgentDispatchStatus,
     note: &str,
 ) -> anyhow::Result<bool> {
     let note = note.to_string();
-    svc.with_db(move |db| db.compare_and_set_dispatch_retry_park(id, expected, &note))
+    let run = run.clone();
+    svc.with_db(move |db| db.compare_and_set_dispatch_retry_park_run(&run, expected, &note))
         .await
         .map_err(Into::into)
 }
@@ -596,6 +628,40 @@ async fn relaunch(
     svc.open(spec)
         .await
         .map_err(|e| anyhow::anyhow!("open: {e}"))
+}
+
+/// Output of a resumed claude whose transcript no longer exists.
+const NO_CONVERSATION: &str = "No conversation found";
+
+/// The class a retry acts on. A resumed run that died because its conversation
+/// is gone (provider pruning) is a recoverable transport-like failure that must
+/// be retried COLD, so the stale id is dropped; it never parks the row.
+fn retry_class(
+    class: Option<pipeline_exit::ExitClass>,
+    screen: &str,
+    native: &mut Option<String>,
+) -> Option<pipeline_exit::ExitClass> {
+    if native.is_some() && screen.contains(NO_CONVERSATION) {
+        *native = None;
+        return class.or(Some(pipeline_exit::ExitClass::Transport {
+            signature: NO_CONVERSATION.to_string(),
+        }));
+    }
+    class
+}
+
+/// Drop a row's retry budget only when the row still carries the run this
+/// task handled, so a stale task can never reset a newer run's budget.
+async fn forget_if_current(
+    svc: &DaemonService,
+    attempts: &Attempts,
+    run: &thegn_core::issue::DispatchRunRef,
+) {
+    let id = run.id;
+    let current = svc.with_db(move |db| db.dispatch_run_ref(id)).await;
+    if matches!(current, Ok(Some(ref c)) if c == run) {
+        forget(attempts, run.id);
+    }
 }
 
 /// Drop a row's retry budget.
@@ -760,5 +826,27 @@ mod tests {
         // aider has no resume-by-id: cold, never continue.
         assert_eq!(exact_resume_id(&cfg, "aider", Some("abc")), None);
         assert_eq!(exact_resume_id(&cfg, "no-such-agent", Some("abc")), None);
+    }
+
+    #[test]
+    fn a_vanished_conversation_forces_a_cold_retry() {
+        let mut native = Some("gone".to_string());
+        let class = retry_class(
+            None,
+            "Error: No conversation found with session ID",
+            &mut native,
+        );
+        assert!(matches!(
+            class,
+            Some(pipeline_exit::ExitClass::Transport { .. })
+        ));
+        assert_eq!(native, None, "the stale id is dropped");
+        // Without a resumed id the text is not special.
+        let mut none = None;
+        assert!(retry_class(None, "No conversation found", &mut none).is_none());
+        // Unrelated failures leave the id and the classification alone.
+        let mut keep = Some("id".to_string());
+        assert!(retry_class(None, "segfault", &mut keep).is_none());
+        assert_eq!(keep.as_deref(), Some("id"));
     }
 }
