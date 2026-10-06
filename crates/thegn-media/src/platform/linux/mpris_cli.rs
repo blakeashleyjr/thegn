@@ -8,6 +8,7 @@ use std::time::Duration;
 use futures::future::BoxFuture;
 use tokio::process::Command;
 
+use crate::helper::{self, Limits};
 use crate::model::{LoopMode, MediaKind, MediaState, PlaybackState, Playlist};
 use crate::{MediaBackend, MediaCaps, MediaError};
 
@@ -25,13 +26,12 @@ impl MprisCli {
         Self { priority }
     }
 
-    /// Is the `playerctl` binary on `PATH`? Cheap one-shot probe.
-    pub fn available() -> bool {
-        std::process::Command::new("playerctl")
-            .arg("--version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
+    /// Is the `playerctl` binary on `PATH`? One-shot probe, async and bounded so
+    /// a wedged binary can neither block a worker thread nor stall resolution.
+    pub async fn available() -> bool {
+        let mut cmd = Command::new("playerctl");
+        cmd.arg("--version");
+        matches!(helper::output(cmd, Limits::PROBE).await, Ok(o) if o.status.success())
     }
 
     /// `--player=a,b,c` priority list, when configured.
@@ -51,10 +51,9 @@ impl MprisCli {
             cmd.arg(p);
         }
         cmd.args(args);
-        let out = cmd
-            .output()
+        let out = helper::output(cmd, Limits::OP)
             .await
-            .map_err(|e| MediaError::Unavailable(e.to_string()))?;
+            .map_err(|e| e.into_media("playerctl"))?;
         if out.status.success() {
             Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
         } else {
@@ -64,11 +63,11 @@ impl MprisCli {
 
     pub async fn list_players(&self) -> Result<Vec<String>, MediaError> {
         // `--list-all` ignores the --player filter, so call playerctl directly.
-        let out = Command::new("playerctl")
-            .arg("--list-all")
-            .output()
+        let mut cmd = Command::new("playerctl");
+        cmd.arg("--list-all");
+        let out = helper::output(cmd, Limits::OP)
             .await
-            .map_err(|e| MediaError::Unavailable(e.to_string()))?;
+            .map_err(|e| e.into_media("playerctl"))?;
         if !out.status.success() {
             return Ok(Vec::new());
         }
