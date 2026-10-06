@@ -1211,3 +1211,52 @@ mod sandbox_floor_preflight_tests;
 #[cfg(test)]
 #[path = "capability_identity_tests.rs"]
 mod capability_identity_tests;
+
+static INTERRUPT_SEEN: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn note_interrupt(_sig: libc::c_int) {
+    INTERRUPT_SEEN.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// While alive, SIGINT/SIGTERM are recorded instead of terminating the
+/// process, so a CLI run that moved its child into a separate process group
+/// (which the terminal's Ctrl-C no longer reaches) can forward the stop to
+/// that group and exit cleanly. Previous dispositions are restored on drop.
+pub struct InterruptGuard {
+    prev: Vec<(nix::sys::signal::Signal, nix::sys::signal::SigAction)>,
+}
+
+impl InterruptGuard {
+    pub fn install() -> Self {
+        use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, sigaction};
+        INTERRUPT_SEEN.store(false, std::sync::atomic::Ordering::SeqCst);
+        let action = SigAction::new(
+            SigHandler::Handler(note_interrupt),
+            SaFlags::empty(),
+            SigSet::empty(),
+        );
+        let mut prev = Vec::new();
+        for sig in [Signal::SIGINT, Signal::SIGTERM] {
+            // SAFETY: the handler only stores to an atomic (async-signal-safe).
+            if let Ok(old) = unsafe { sigaction(sig, &action) } {
+                prev.push((sig, old));
+            }
+        }
+        Self { prev }
+    }
+
+    /// Whether SIGINT/SIGTERM arrived since [`InterruptGuard::install`].
+    pub fn fired(&self) -> bool {
+        INTERRUPT_SEEN.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl Drop for InterruptGuard {
+    fn drop(&mut self) {
+        use nix::sys::signal::sigaction;
+        for (sig, old) in self.prev.drain(..) {
+            // SAFETY: restoring the disposition captured at install.
+            let _ = unsafe { sigaction(sig, &old) }; // best-effort: restore on teardown
+        }
+    }
+}
