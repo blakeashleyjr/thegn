@@ -57,6 +57,13 @@ impl MprisCli {
         if out.status.success() {
             Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
         } else {
+            // playerctl reports "No players found" etc. on stderr; keep it
+            // in the debug log so a NoPlayer is diagnosable.
+            tracing::debug!(
+                target: "thegn::media",
+                stderr = %String::from_utf8_lossy(&out.stderr).trim(),
+                "playerctl {args:?} failed"
+            );
             Err(MediaError::NoPlayer)
         }
     }
