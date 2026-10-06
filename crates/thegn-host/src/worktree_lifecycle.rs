@@ -461,6 +461,37 @@ pub fn schedule_post_create_with_approvals(
     approvals: Approvals,
     waker: Option<termwiz::terminal::TerminalWaker>,
 ) -> Result<(), LifecycleReport> {
+    if post_create_blocking_phase(cfg, repo_root, worktree, branch, workspace, approvals)? {
+        return Ok(());
+    }
+    spawn_event(
+        cfg.clone(),
+        repo_root.to_path_buf(),
+        worktree.to_path_buf(),
+        branch.to_string(),
+        workspace.to_string(),
+        HookEvent::PostCreate,
+        HookExecutionMode::User,
+        waker,
+    )
+    .map_err(|error| spawn_failure_report(HookEvent::PostCreate, error))
+}
+
+/// The part of post-create that must finish before a worktree is registered:
+/// the event runs synchronously only when an entry explicitly requests
+/// `wait=true` (a blocking failure is returned as `Err`). Returns `Ok(true)`
+/// when it ran, `Ok(false)` when nothing waits and the caller should
+/// [`spawn_event`] the event after registering the worktree, so a background
+/// hook never starts before its row exists.
+#[allow(clippy::too_many_arguments)]
+pub fn post_create_blocking_phase(
+    cfg: &Config,
+    repo_root: &Path,
+    worktree: &Path,
+    branch: &str,
+    workspace: &str,
+    approvals: Approvals,
+) -> Result<bool, LifecycleReport> {
     // A freshly created/registered worktree may reuse a once-removed path.
     forget_removed_worktree(worktree);
     let policy = resolve_with_approvals(cfg, repo_root, approvals.clone());
@@ -468,34 +499,23 @@ pub fn schedule_post_create_with_approvals(
         .entries(HookEvent::PostCreate)
         .iter()
         .any(|spec| spec.wait);
-    if waits_for_pane {
-        let report = run_event_with_approvals(
-            cfg,
-            repo_root,
-            worktree,
-            branch,
-            workspace,
-            HookEvent::PostCreate,
-            HookExecutionMode::User,
-            approvals,
-        );
-        if report.blocked() {
-            Err(report)
-        } else {
-            Ok(())
-        }
+    if !waits_for_pane {
+        return Ok(false);
+    }
+    let report = run_event_with_approvals(
+        cfg,
+        repo_root,
+        worktree,
+        branch,
+        workspace,
+        HookEvent::PostCreate,
+        HookExecutionMode::User,
+        approvals,
+    );
+    if report.blocked() {
+        Err(report)
     } else {
-        spawn_event(
-            cfg.clone(),
-            repo_root.to_path_buf(),
-            worktree.to_path_buf(),
-            branch.to_string(),
-            workspace.to_string(),
-            HookEvent::PostCreate,
-            HookExecutionMode::User,
-            waker,
-        )
-        .map_err(|error| spawn_failure_report(HookEvent::PostCreate, error))
+        Ok(true)
     }
 }
 

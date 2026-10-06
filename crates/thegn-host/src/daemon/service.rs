@@ -169,9 +169,9 @@ where
 /// claim and dedupes to `-1`. Anything that slips past (a create from another
 /// process) still fails cleanly in `git worktree add`, which refuses an
 /// existing branch or destination without rolling back someone else's path.
-static CREATES_IN_FLIGHT: std::sync::Mutex<
-    std::collections::HashSet<(std::path::PathBuf, String)>,
-> = std::sync::Mutex::new(std::collections::HashSet::new());
+static CREATES_IN_FLIGHT: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<(std::path::PathBuf, String)>>,
+> = std::sync::LazyLock::new(Default::default);
 
 /// RAII claim on a `(repo, branch)` pair; released on drop, so every error
 /// path and a cancelled request frees it.
@@ -185,9 +185,16 @@ impl CreateReservation {
     ) -> (String, Self) {
         // best-effort: a poisoned set only holds names, so keep using it
         let mut held = CREATES_IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+        // Same nesting rule as `BranchSet::taken` (`a` vs `a/x` conflict), applied
+        // to this repo's in-flight claims.
+        let in_flight = thegn_core::worktree::BranchSet::from_names(
+            held.iter()
+                .filter(|(r, _)| r == root)
+                .map(|(_, b)| b.clone()),
+        );
         let mut branch = seed.to_string();
         let mut n = 0;
-        while taken.taken(&branch) || held.contains(&(root.to_path_buf(), branch.clone())) {
+        while taken.taken(&branch) || in_flight.taken(&branch) {
             n += 1;
             branch = format!("{seed}-{n}");
         }
@@ -2137,44 +2144,54 @@ impl ControlApi for DaemonService {
             let root2 = root.clone();
             let (slug, approvals) = self
                 .with_db(move |db| {
-                    let slug = thegn_core::repo::repo_slug_with_checked(db, &root2).map_err(|e| {
-                        anyhow::anyhow!("worktrees.create: workspace identity unavailable: {e}")
-                    })?;
-                    let approvals =
-                        crate::worktree_lifecycle::approvals_from_db(&root2, Some(db));
+                    let slug =
+                        thegn_core::repo::repo_slug_with_checked(db, &root2).map_err(|e| {
+                            anyhow::anyhow!("worktrees.create: workspace identity unavailable: {e}")
+                        })?;
+                    let approvals = crate::worktree_lifecycle::approvals_from_db(&root2, Some(db));
                     Ok((slug, approvals))
                 })
                 .await?;
 
+            // Phases 3 and 4 are ONE `spawn_blocking` unit, so they complete even
+            // if the caller drops this request (Ctrl-C, client timeout) halfway
+            // through a long hook: a worktree that was added is always
+            // registered, never orphaned. The reservation lives inside it too.
+            //
             // Phase 3 (no DB lock): PreCreate hooks, `git worktree add`, submodule
-            // init and a blocking PostCreate hook. Nothing is registered yet, so a
-            // failure here rolls the worktree back and leaves no DB row to undo.
-            let (cfg3, root3, base3, path3, branch3, slug3) = (
-                cfg.clone(),
-                root.clone(),
-                base,
-                path.clone(),
-                branch.clone(),
-                slug.clone(),
-            );
-            let approvals3 = approvals.clone();
+            // init and a blocking (`wait`) PostCreate hook. Nothing is registered
+            // yet, so a failure rolls the worktree back and leaves no DB row to
+            // undo. Blocking hooks therefore run BEFORE registration; background
+            // PostCreate hooks are started only after it.
+            //
+            // Phase 4 (short DB lock): the registry writes only, filed last so a
+            // rolled-back create never leaves a worktree, folder or workspace row
+            // behind (THE-723).
+            let (cfg3, root3, path3, branch3) =
+                (cfg.clone(), root.clone(), path.clone(), branch.clone());
+            let db = self.db.clone();
+            let wt_str = path.to_string_lossy().into_owned();
+            let root_s = root.to_string_lossy().into_owned();
+            let (wt_w, root_w) = (wt_str.clone(), root_s.clone());
             tokio::task::spawn_blocking(move || {
+                use thegn_core::store::{WorkspaceStore, WorktreeAuxStore};
                 use thegn_core::worktree as wt;
+                let _reservation = _reservation;
                 let (cfg, root, path, branch) = (&cfg3, &root3, &path3, &branch3);
                 let pre = crate::worktree_lifecycle::run_event_with_approvals(
                     cfg,
                     root,
                     path,
                     branch,
-                    &slug3,
+                    &slug,
                     thegn_core::hooks::HookEvent::PreCreate,
                     thegn_core::hooks::HookExecutionMode::User,
-                    approvals3.clone(),
+                    approvals,
                 );
                 if pre.blocked() {
                     anyhow::bail!("worktrees.create: {}", pre.message());
                 }
-                wt::add_checked_with_state(root, branch, &base3, path, cfg).map_err(|e| {
+                wt::add_checked_with_state(root, branch, &base, path, cfg).map_err(|e| {
                     anyhow::anyhow!(crate::worktree_lifecycle::create_failure_after_add(
                         e.message.clone(),
                         cfg,
@@ -2187,54 +2204,63 @@ impl ControlApi for DaemonService {
                 if let Err(e) = crate::git_worktree::initialize(cfg, root, path, None) {
                     tracing::warn!(target: "thegn::worktree_create", error = %e, "submodule initialization failed");
                 }
-                if let Err(report) = crate::worktree_lifecycle::schedule_post_create_with_approvals(
-                    cfg, root, path, branch, &slug3, approvals3, None,
-                ) {
-                    let message = crate::worktree_lifecycle::create_failure_with_rollback(
-                        format!("post_create: {}", report.message()),
-                        cfg,
-                        root,
-                        path,
-                        branch,
-                    );
-                    anyhow::bail!("worktrees.create: {message}");
+                // Re-read the trust approvals after the slow add: one revoked in the
+                // meantime must not still run PostCreate. Deny-all on any failure.
+                let approvals = match db.lock() {
+                    Ok(db) => crate::worktree_lifecycle::approvals_from_db(root, Some(&db)),
+                    Err(_) => thegn_core::config_resolve::Approvals::deny_all(),
+                };
+                let background_post_create =
+                    match crate::worktree_lifecycle::post_create_blocking_phase(
+                        cfg, root, path, branch, &slug, approvals,
+                    ) {
+                        Ok(ran) => !ran,
+                        Err(report) => {
+                            let message = crate::worktree_lifecycle::create_failure_with_rollback(
+                                format!("post_create: {}", report.message()),
+                                cfg,
+                                root,
+                                path,
+                                branch,
+                            );
+                            anyhow::bail!("worktrees.create: {message}");
+                        }
+                    };
+                {
+                    let db = db.lock().expect("daemon db lock");
+                    let tab = thegn_core::repo::branch_tab(&slug, branch);
+                    let _ = db.put_worktree(&tab, &root_w, &wt_w, branch, None, None); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+                    if let Some(id) = &issue {
+                        let _ = db.link_issue(&wt_w, id); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+                    }
+                    if let Some(warning) = crate::cmd::wt::file_configured_default(
+                        &db,
+                        cfg.default_folder.as_deref(),
+                        &root_w,
+                        &wt_w,
+                    ) {
+                        tracing::warn!(target: "thegn::worktree_create", "{warning}");
+                    }
+                }
+                if background_post_create
+                    && let Err(e) = crate::worktree_lifecycle::spawn_event(
+                        (**cfg).clone(),
+                        root.clone(),
+                        path.clone(),
+                        branch.clone(),
+                        slug,
+                        thegn_core::hooks::HookEvent::PostCreate,
+                        thegn_core::hooks::HookExecutionMode::User,
+                        None,
+                    )
+                {
+                    tracing::warn!(target: "thegn::worktree_create", error = %e, "post_create hook not scheduled");
                 }
                 Ok(())
             })
             .await
             .map_err(join)?
             .map_err(ControlError::Internal)?;
-
-            // Phase 4 (short DB lock): the registry writes only. Filed last, after
-            // post_create, so a rolled-back create never leaves a worktree, folder
-            // or workspace row behind (THE-723).
-            let wt_str = path.to_string_lossy().into_owned();
-            let root_s = root.to_string_lossy().into_owned();
-            let (wt_w, root_w, branch_w, default_folder) = (
-                wt_str.clone(),
-                root_s.clone(),
-                branch.clone(),
-                cfg.default_folder.clone(),
-            );
-            self.with_db(move |db| {
-                use thegn_core::store::WorktreeAuxStore;
-                use thegn_core::store::WorkspaceStore;
-                let tab = thegn_core::repo::branch_tab(&slug, &branch_w);
-                let _ = db.put_worktree(&tab, &root_w, &wt_w, &branch_w, None, None); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
-                if let Some(id) = &issue {
-                    let _ = db.link_issue(&wt_w, id); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
-                }
-                if let Some(warning) = crate::cmd::wt::file_configured_default(
-                    db,
-                    default_folder.as_deref(),
-                    &root_w,
-                    &wt_w,
-                ) {
-                    tracing::warn!(target: "thegn::worktree_create", "{warning}");
-                }
-                Ok(())
-            })
-            .await?;
             Ok(thegn_svc::control::WorktreeInfo {
                 path: wt_str,
                 branch,
