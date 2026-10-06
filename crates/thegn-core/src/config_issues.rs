@@ -396,14 +396,18 @@ fn narrow_kaneo(
     let (orig_ws, orig_proj) = (g_ws.clone(), g_proj.clone());
     if let Some(w) = ws_pin {
         if orig_ws.is_empty() && !orig_proj.is_empty() && w != orig_ws {
-            refused.push(format!("{who}kaneo.workspace_id pin is outside the global scope"));
+            refused.push(format!(
+                "{who}kaneo.workspace_id pin is outside the global scope"
+            ));
         } else {
             narrow_pin(&format!("{who}kaneo.workspace_id"), g_ws, w, refused);
         }
     }
     if let Some(p) = proj_pin {
         if orig_proj.is_empty() && !orig_ws.is_empty() && !p.is_empty() {
-            refused.push(format!("{who}kaneo.project_id pin is outside the global scope"));
+            refused.push(format!(
+                "{who}kaneo.project_id pin is outside the global scope"
+            ));
         } else {
             narrow_pin(&format!("{who}kaneo.project_id"), g_proj, p, refused);
         }
@@ -919,7 +923,10 @@ mod tests {
         // The account's own pin is a ceiling: widening/replacing is refused.
         assert_eq!(by("lp").team_id, "T0");
         assert_eq!(by("j").project_key, "PK");
-        assert_eq!((by("k").workspace_id, by("k").project_id), ("w".into(), "p".into()));
+        assert_eq!(
+            (by("k").workspace_id, by("k").project_id),
+            ("w".into(), "p".into())
+        );
         assert_eq!(refused.len(), 1, "{refused:?}");
         assert!(refused[0].contains("account lp"), "{refused:?}");
     }

@@ -72,8 +72,14 @@ fn ref_format(kind: &'static str, s: &str) -> Result<(), OperandError> {
     if s.starts_with('/') || s.ends_with('/') || s.ends_with('.') {
         return Err(err(kind, s, "bad leading or trailing character"));
     }
-    if s.split('/').any(|c| c.starts_with('.') || c.ends_with(".lock")) {
-        return Err(err(kind, s, "component begins with '.' or ends with '.lock'"));
+    if s.split('/')
+        .any(|c| c.starts_with('.') || c.ends_with(".lock"))
+    {
+        return Err(err(
+            kind,
+            s,
+            "component begins with '.' or ends with '.lock'",
+        ));
     }
     Ok(())
 }
@@ -107,8 +113,21 @@ pub fn revision(s: &str) -> Result<&str, OperandError> {
 pub fn bisect_term(s: &str) -> Result<&str, OperandError> {
     common("bisect term", s)?;
     const RESERVED: &[&str] = &[
-        "start", "bad", "good", "new", "old", "terms", "skip", "next", "reset", "replay", "log",
-        "run", "visualize", "view", "help",
+        "start",
+        "bad",
+        "good",
+        "new",
+        "old",
+        "terms",
+        "skip",
+        "next",
+        "reset",
+        "replay",
+        "log",
+        "run",
+        "visualize",
+        "view",
+        "help",
     ];
     // The built-in marks `good`/`bad`/`new`/`old` are legitimate terms.
     if RESERVED.contains(&s) && !matches!(s, "good" | "bad" | "new" | "old") {
@@ -129,7 +148,14 @@ mod tests {
 
     #[test]
     fn dash_names_refused_everywhere() {
-        for n in ["--help", "--detach", "--abort", "-f", "-D", "--set-upstream-to=x"] {
+        for n in [
+            "--help",
+            "--detach",
+            "--abort",
+            "-f",
+            "-D",
+            "--set-upstream-to=x",
+        ] {
             assert!(branch_name(n).is_err(), "{n}");
             assert!(tag_name(n).is_err(), "{n}");
             assert!(remote_name(n).is_err(), "{n}");

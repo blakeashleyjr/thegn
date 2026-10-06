@@ -1153,7 +1153,10 @@ mod tests {
         };
         let errs = |t: u64| validate_pipeline(&cfg_with(vec![with(t)]));
         // Default round-trips and is accepted.
-        assert_eq!(PipelineStage::default().wait_timeout_millis(), Some(3_600_000));
+        assert_eq!(
+            PipelineStage::default().wait_timeout_millis(),
+            Some(3_600_000)
+        );
         assert!(errs(3600).is_empty());
         assert!(errs(1).is_empty());
         assert_eq!(with(1).wait_timeout_millis(), Some(1000));

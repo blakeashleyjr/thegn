@@ -1,4 +1,5 @@
 # THE-443 plan
+
 Scope: crates/thegn-host/src/profile.rs, docs/help/debugging.md.
 Approach: poll() only forwards a coalesced request over a bounded channel to a Background-QoS worker thread
 that owns a Machine (Idle/Starting/Running/Publishing, generation, no mutex/poison). Reports published via
