@@ -868,6 +868,14 @@ pub(crate) fn destroy_one_checked(
             "physical worktree cleanup is already in progress".into(),
         );
     };
+    // Cross-process admission (THE-728): non-blocking exclusive lock held for
+    // the whole removal. A pane open elsewhere holding it, or an unusable lock,
+    // refuses the destroy; nothing has been touched yet.
+    let mut _admission =
+        match crate::worktree_admission::DestroyLock::try_acquire(&destroy_key(worktree)) {
+            Ok(lock) => lock,
+            Err(error) => return (false, error),
+        };
     // Remote/provider worktrees are never tombstoned: their local path is not
     // authoritative, and a later worktree at that path must not be dropped.
     let is_remote = db
@@ -963,6 +971,7 @@ pub(crate) fn destroy_one_checked(
     if !is_remote {
         note_worktree_removed(worktree);
     }
+    _admission.forget_file();
 
     let post = run_event_with_db(
         cfg,
@@ -1460,6 +1469,21 @@ fn destroy_key(path: &Path) -> PathBuf {
         (Some(parent), Some(name)) => parent.join(name),
         _ => path.to_path_buf(),
     }
+}
+
+/// Canonical identity of a worktree path (shared with cross-process admission).
+pub(crate) fn destroy_key_pub(path: &Path) -> PathBuf {
+    destroy_key(path)
+}
+
+/// True when this process is physically destroying `cwd`'s worktree or a
+/// parent of it. Filesystem work happens only when a destroy claim exists.
+pub(crate) fn destroy_in_progress_for(cwd: &Path) -> bool {
+    if !physical_destroy_claims_exist() {
+        return false;
+    }
+    let key = destroy_key(cwd);
+    key.ancestors().any(physical_destroy_in_progress)
 }
 
 fn release_destroy_path(path: &Path) {
