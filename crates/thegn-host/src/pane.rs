@@ -310,7 +310,7 @@ pub(crate) fn is_runtime_wrapper(program: &str) -> bool {
     )
 }
 
-// The process-introspection primitives (`newest_child`, `cwd_of`, `cmdline`)
+// The process-introspection primitives (`foreground_child`, `cwd_of`, `cmdline`)
 // used to be `/proc` reads inlined here, which silently returned `None` on every
 // non-Linux platform. They now live behind `platform::proc`, which implements
 // them per-OS (`/proc` on Linux, libproc/sysctl on macOS).
@@ -525,7 +525,7 @@ impl PtyPane {
     /// relaunched from the host at all, so offering either would be a lie.
     pub fn foreground_command(&self) -> Option<crate::session::PaneCmd> {
         let shell = self.live_pid()?;
-        let child = proc::newest_child(shell)?;
+        let child = proc::foreground_child(shell)?;
         let argv = proc::cmdline(child)?;
         let name = program_stem(&argv)?;
         if is_interactive_shell(&name) || is_runtime_wrapper(&name) {
@@ -554,7 +554,7 @@ impl PtyPane {
 
         let mut pid = self.live_pid()?;
         for _ in 0..MAX_DEPTH {
-            let child = proc::newest_child(pid)?;
+            let child = proc::foreground_child(pid)?;
             let name = program_stem(&proc::cmdline(child)?)?;
             // Keep descending past a nested shell or a runtime shim: neither is
             // the program the user is actually running.
