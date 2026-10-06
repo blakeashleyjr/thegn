@@ -4528,11 +4528,11 @@ mod tests {
             .insert("s-limit".into(), tomb, now_ms());
 
         // Drive both synthetic exits through the observer's real path.
-        let mut attempts = std::collections::HashMap::new();
-        pipeline_retry::handle_exit(&svc, "s-retry", 1, &mut attempts)
+        let attempts = std::sync::Mutex::new(std::collections::HashMap::new());
+        pipeline_retry::handle_exit(&svc, "s-retry", 1, &attempts)
             .await
             .expect("transport exit handled");
-        pipeline_retry::handle_exit(&svc, "s-limit", 1, &mut attempts)
+        pipeline_retry::handle_exit(&svc, "s-limit", 1, &attempts)
             .await
             .expect("limit exit handled");
 
@@ -4623,8 +4623,8 @@ mod tests {
             })
         };
 
-        let mut attempts = std::collections::HashMap::new();
-        pipeline_retry::handle_exit(&svc, "s-race", 1, &mut attempts)
+        let attempts = std::sync::Mutex::new(std::collections::HashMap::new());
+        pipeline_retry::handle_exit(&svc, "s-race", 1, &attempts)
             .await
             .expect("transport exit handled");
         flipper.await.unwrap();
@@ -4635,12 +4635,135 @@ mod tests {
         };
         assert_eq!(row.status, St::Done, "the Lead's verdict must survive");
         assert!(
-            attempts.is_empty(),
+            attempts.lock().unwrap().is_empty(),
             "a skipped relaunch holds no retry budget"
         );
         let note = row.note.unwrap_or_default();
         assert!(note.starts_with("transport: "), "{note}");
         assert!(!note.contains("relaunch failed"), "{note}");
+    }
+
+    fn transport_tomb(session: &str) -> super::super::tombstone::Tombstone {
+        use thegn_core::control_wire::EventFrame;
+        super::super::tombstone::Tombstone {
+            attached: 0,
+            final_screen: EventFrame::PaneSnapshot {
+                session: session.into(),
+                seq: 0,
+                cols: 80,
+                rows: 24,
+                bytes: b"Connection error. SDK retry budget exhausted".to_vec(),
+            },
+            ..super::super::tombstone::tests::tomb(session, Some(1))
+        }
+    }
+
+    async fn wait_parked(svc: &DaemonService, ids: &[i64]) {
+        use thegn_core::issue::AgentDispatchStatus as St;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            let all = {
+                let db = svc.db.lock().unwrap();
+                ids.iter()
+                    .all(|id| db.get_dispatch(*id).unwrap().unwrap().status == St::WaitingHuman)
+            };
+            if all {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "rows were not parked"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    /// THE-266: row A sitting in a long backoff must not delay row B's
+    /// classification. Pre-fix the receive loop awaited A's whole retry cycle
+    /// inline, so B was never parked inside the window.
+    #[tokio::test]
+    async fn transport_backoff_of_one_row_does_not_block_another() {
+        use crate::daemon::pipeline_retry;
+        use thegn_core::issue::NewDispatch;
+        use thegn_core::store::NotificationStore;
+
+        let mut cfg = thegn_core::config::Config::default();
+        cfg.pipeline.transport_retry.backoff_ms = 60_000;
+        let (svc, rx) = service_with_config(0, cfg);
+        let ids: Vec<i64> = ["a", "b"]
+            .iter()
+            .map(|n| {
+                svc.db
+                    .lock()
+                    .unwrap()
+                    .put_agent_dispatch(NewDispatch {
+                        session_id: Some(&format!("s-{n}")),
+                        stage: Some("code"),
+                        ..NewDispatch::new("linear:THE-266", &format!("/wt/{n}"), "claude")
+                    })
+                    .unwrap()
+            })
+            .collect();
+        for n in ["a", "b"] {
+            let sid = format!("s-{n}");
+            svc.tombs
+                .lock()
+                .await
+                .insert(sid.clone(), transport_tomb(&sid), now_ms());
+        }
+        let svc = Arc::new(svc);
+        pipeline_retry::spawn(svc.clone(), rx);
+        svc.emit(EventFrame::SessionExit {
+            session: "s-a".into(),
+            code: Some(1),
+        });
+        svc.emit(EventFrame::SessionExit {
+            session: "s-b".into(),
+            code: Some(1),
+        });
+        wait_parked(&svc, &ids).await;
+    }
+
+    /// THE-266: an exit the bounded broadcast dropped is recovered from the
+    /// durable roster + tombstone instead of being lost.
+    #[tokio::test]
+    async fn lagged_receiver_reconciles_missed_exits_from_durable_state() {
+        use crate::daemon::pipeline_retry;
+        use thegn_core::issue::NewDispatch;
+        use thegn_core::store::NotificationStore;
+
+        let mut cfg = thegn_core::config::Config::default();
+        cfg.pipeline.transport_retry.backoff_ms = 60_000;
+        let (svc, rx) = service_with_config(0, cfg);
+        let id = svc
+            .db
+            .lock()
+            .unwrap()
+            .put_agent_dispatch(NewDispatch {
+                session_id: Some("s-lag"),
+                stage: Some("code"),
+                ..NewDispatch::new("linear:THE-266", "/wt/lag", "claude")
+            })
+            .unwrap();
+        svc.tombs
+            .lock()
+            .await
+            .insert("s-lag".into(), transport_tomb("s-lag"), now_ms());
+        let svc = Arc::new(svc);
+        // The frame for s-lag is followed by more than the channel capacity
+        // (64) before the observer first polls, so it is overwritten.
+        svc.emit(EventFrame::SessionExit {
+            session: "s-lag".into(),
+            code: Some(1),
+        });
+        for i in 0..80 {
+            svc.emit(EventFrame::SessionExit {
+                session: format!("filler-{i}"),
+                code: Some(0),
+            });
+        }
+        pipeline_retry::spawn(svc.clone(), rx);
+        wait_parked(&svc, &[id]).await;
     }
 }
 

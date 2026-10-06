@@ -51,14 +51,18 @@
 //!
 //! The task blocks on the event broadcast feed; no polling, no tickers. The
 //! only sleep is the backoff between a transport failure and its relaunch.
-//! Attempt counters live in this task's memory (keyed by roster row id,
+//! Retry work runs in bounded per-session tasks, never inline in the receive
+//! loop (THE-266). Attempt counters live in daemon memory (keyed by roster row id,
 //! surviving session-id changes): a daemon restart kills the sessions it
 //! supervised, so there is nothing to retry across a restart — the durable
 //! note column records what happened either way.
 
 use anyhow::Context as _;
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use thegn_core::control_wire::EventFrame;
@@ -71,69 +75,165 @@ use thegn_svc::control::{AgentLaunch, ControlApi, OpenSpec, SessionInfo};
 
 use super::service::DaemonService;
 
-/// The task's db-read budget is one row lookup per nonzero exit — never a
-/// scan; `dispatch_by_session` is an indexed-equivalent single-column match on
-/// a small roster.
+/// Hard cap on retry cycles (backoff sleep + relaunch) in flight at once. A
+/// provider outage hitting many rows backs them all off concurrently, but never
+/// fans out past this (THE-266).
+const MAX_CONCURRENT_RETRIES: usize = 8;
+/// Hard cap on exits queued or running in the retry stage. An exit past it is
+/// dropped with a warning and the `overflowed` flag, which triggers a durable
+/// reconcile once the stage drains — nothing is silently lost.
+const MAX_PENDING_EXITS: usize = 64;
+/// Attempt-counter entries above which terminal rows are garbage-collected.
+const ATTEMPTS_GC_THRESHOLD: usize = 128;
+
+/// Attempt counters, keyed by roster ROW id (a relaunch re-stamps the session
+/// id, so the row id is the stable key). Cleared when the row parks or
+/// exhausts: a human re-drive starts a fresh budget. Locked only for short
+/// map operations, never across an await.
+pub(crate) type Attempts = Mutex<HashMap<i64, u32>>;
+
+/// What the observer shares between its constant-time receive path and the
+/// per-exit retry tasks.
+struct Observer {
+    svc: Arc<DaemonService>,
+    attempts: Attempts,
+    /// Sessions whose exit is queued or being handled: a duplicate frame for
+    /// one of them coalesces instead of launching a second retry.
+    pending: Mutex<HashSet<String>>,
+    permits: tokio::sync::Semaphore,
+    overflowed: AtomicBool,
+}
+
+type BoxFut = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+/// The receive loop stays constant-time (THE-266): each exit is stamped and
+/// handed to a bounded per-session task, then the loop returns to `recv`
+/// immediately. A 60 s backoff on one row can no longer delay another row's
+/// stamp or classification, and a lagged receiver reconciles from durable
+/// state instead of only logging.
 pub(crate) fn spawn(
     svc: Arc<DaemonService>,
     mut rx: tokio::sync::broadcast::Receiver<Arc<EventFrame>>,
 ) {
+    let obs = Arc::new(Observer {
+        svc,
+        attempts: Mutex::new(HashMap::new()),
+        pending: Mutex::new(HashSet::new()),
+        permits: tokio::sync::Semaphore::new(MAX_CONCURRENT_RETRIES),
+        overflowed: AtomicBool::new(false),
+    });
     tokio::spawn(async move {
-        // Attempt counters, keyed by roster ROW id (a relaunch re-stamps the
-        // session id, so the row id is the stable key). Cleared when the row
-        // parks or exhausts: a human re-drive starts a fresh budget.
-        let mut attempts: HashMap<i64, u32> = HashMap::new();
         loop {
             match rx.recv().await {
                 Ok(frame) => {
                     if let EventFrame::SessionExit { session, code } = &*frame {
-                        // The CLI learns the server-generated session id only
-                        // after `sessions.open` returns, so a very short-lived
-                        // worker can emit this event just before open_stage
-                        // stamps the row. Retry the association off this
-                        // observer task; raw sessions simply age out of the
-                        // bounded lookup without blocking later exit events.
-                        let stamp_svc = svc.clone();
-                        let stamp_session = session.clone();
-                        let stamp_code = *code;
-                        tokio::spawn(async move {
-                            if let Err(e) =
-                                stamp_dispatch_exit(stamp_svc, stamp_session.clone(), stamp_code)
-                                    .await
-                            {
-                                tracing::warn!(
-                                    target: "thegn::daemon",
-                                    session = %stamp_session,
-                                    "dispatch exit stamp: {e:#}"
-                                );
-                            }
-                        });
-
-                        if let Some(code) = *code
-                            && code != 0
-                            && let Err(e) = handle_exit(&svc, session, code, &mut attempts).await
-                        {
-                            // best-effort: a failed retry cycle must not kill the
-                            // observer — the note column records what it could.
-                            tracing::warn!(
-                                target: "thegn::daemon",
-                                session = %session,
-                                code,
-                                "transport retry: {e:#}"
-                            );
-                        }
+                        observe_exit(&obs, session.clone(), *code);
                     }
                 }
-                // A lagging receiver skipped exits; the row keeps its state and
-                // the Lead still sees it on the roster. The feed is bounded
-                // generously, so this is a burst, not a design assumption.
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    tracing::warn!(target: "thegn::daemon", skipped = n, "transport retry observer lagged");
+                    tracing::warn!(
+                        target: "thegn::daemon",
+                        skipped = n,
+                        "transport retry observer lagged; reconciling from durable state"
+                    );
+                    tokio::spawn(reconcile_missed_exits(obs.clone()));
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
             }
         }
     });
+}
+
+/// Constant-time handling of one exit: spawn the durable stamp and, for a
+/// nonzero code, enqueue bounded retry work. Never awaits.
+fn observe_exit(obs: &Arc<Observer>, session: String, code: Option<i32>) {
+    // The CLI learns the server-generated session id only after
+    // `sessions.open` returns, so a very short-lived worker can emit this
+    // event just before open_stage stamps the row. Retry the association off
+    // this task; raw sessions simply age out of the bounded lookup.
+    let stamp_svc = obs.svc.clone();
+    let stamp_session = session.clone();
+    tokio::spawn(async move {
+        if let Err(e) = stamp_dispatch_exit(stamp_svc, stamp_session.clone(), code).await {
+            tracing::warn!(
+                target: "thegn::daemon",
+                session = %stamp_session,
+                "dispatch exit stamp: {e:#}"
+            );
+        }
+    });
+
+    let Some(code) = code.filter(|c| *c != 0) else {
+        return;
+    };
+    {
+        let mut pending = obs.pending.lock().unwrap_or_else(|p| p.into_inner());
+        if pending.contains(&session) {
+            return; // duplicate frame: already queued or running
+        }
+        if pending.len() >= MAX_PENDING_EXITS {
+            obs.overflowed.store(true, Ordering::SeqCst);
+            tracing::warn!(
+                target: "thegn::daemon",
+                session = %session,
+                cap = MAX_PENDING_EXITS,
+                "transport retry queue full; exit deferred to durable reconcile"
+            );
+            return;
+        }
+        pending.insert(session.clone());
+    }
+    let obs = obs.clone();
+    tokio::spawn(async move {
+        // best-effort: the semaphore is never closed.
+        let permit = obs.permits.acquire().await.ok();
+        if let Err(e) = handle_exit(&obs.svc, &session, code, &obs.attempts).await {
+            // best-effort: a failed retry cycle must not kill the observer —
+            // the note column records what it could.
+            tracing::warn!(
+                target: "thegn::daemon",
+                session = %session,
+                code,
+                "transport retry: {e:#}"
+            );
+        }
+        drop(permit);
+        obs.pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&session);
+        if obs.overflowed.swap(false, Ordering::SeqCst) {
+            tokio::spawn(reconcile_missed_exits(obs.clone()));
+        }
+    });
+}
+
+/// Recover exits the broadcast dropped (receiver lag, or overflow of the
+/// retry queue) from durable state: any in-flight roster row whose session is
+/// dead (a tombstone exists) but whose exit was never stamped is re-fed through
+/// the normal exit path. The stamp and the park/relaunch CAS make a row that
+/// was in fact already handled a harmless no-op.
+fn reconcile_missed_exits(obs: Arc<Observer>) -> BoxFut {
+    Box::pin(async move {
+        let rows = match obs.svc.with_db(|db| db.list_dispatches()).await {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::warn!(target: "thegn::daemon", "exit reconcile: {e:#}");
+                return;
+            }
+        };
+        for row in rows {
+            if row.status.is_terminal() || row.exited_at_ms.is_some() {
+                continue;
+            }
+            let Some(session) = row.session_id.filter(|s| !s.is_empty()) else {
+                continue;
+            };
+            if let Some(tomb) = obs.svc.tombstone(&session).await {
+                observe_exit(&obs, session, tomb.exit_code);
+            }
+        }
+    })
 }
 
 /// Persist a daemon session exit on its dispatch row. The association normally
@@ -191,7 +291,7 @@ pub(crate) async fn handle_exit(
     svc: &DaemonService,
     session: &str,
     _code: i32,
-    attempts: &mut HashMap<i64, u32>,
+    attempts: &Attempts,
 ) -> anyhow::Result<()> {
     // 1. The corpse: final screen + who was attached at death. One lock-scope
     //    read; the actor buries the tombstone BEFORE the exit reaches the feed,
@@ -233,31 +333,37 @@ pub(crate) async fn handle_exit(
 
     // 4. Decide. Attempts are 1-based per row, incremented per observed
     //    transport failure.
-    let attempt = match attempts.get_mut(&row.id) {
-        Some(a) => {
-            *a += 1;
-            *a
-        }
-        None => {
-            attempts.insert(row.id, 1);
-            1
-        }
+    gc_attempts(svc, attempts).await;
+    let attempt = {
+        let mut map = attempts.lock().unwrap_or_else(|p| p.into_inner());
+        let a = map.entry(row.id).or_insert(0);
+        *a += 1;
+        *a
     };
+    // The run this exit belongs to. The backoff below can last a minute; a
+    // re-drive in that window publishes a newer run (new session, bumped
+    // generation) and this retry must not touch it.
+    let run = svc
+        .with_db({
+            let id = row.id;
+            move |db| db.dispatch_run_ref(id)
+        })
+        .await?;
     let decision = pipeline_exit::decide(&class, attempt, tr.max_attempts, tr.backoff_ms);
 
     match decision {
         pipeline_exit::RetryDecision::Park { note } => {
-            attempts.remove(&row.id);
+            forget(attempts, row.id);
             park(svc, row.id, row.status, &note).await?;
         }
         pipeline_exit::RetryDecision::Exhausted { note } => {
-            attempts.remove(&row.id);
+            forget(attempts, row.id);
             park(svc, row.id, row.status, &note).await?;
         }
         pipeline_exit::RetryDecision::Retry { attempt, delay_ms } => {
             let note = pipeline_exit::retry_note(signature_of(&class), attempt, tr.max_attempts);
             if !park(svc, row.id, row.status, &note).await? {
-                attempts.remove(&row.id);
+                forget(attempts, row.id);
                 return Ok(());
             }
             tracing::info!(
@@ -272,18 +378,23 @@ pub(crate) async fn handle_exit(
             // read-then-open sequence still let a supervisor close the row
             // after the read and before `open` returned.
             let id_for_check = row.id;
-            let reserved = svc
-                .with_db(move |db| {
-                    db.compare_and_set_dispatch_status(
-                        id_for_check,
-                        AgentDispatchStatus::WaitingHuman,
-                        AgentDispatchStatus::Spawning,
-                        None,
-                    )
-                })
-                .await?;
+            let still_ours = svc
+                .with_db(move |db| db.dispatch_run_ref(id_for_check))
+                .await?
+                == run;
+            let reserved = still_ours
+                && svc
+                    .with_db(move |db| {
+                        db.compare_and_set_dispatch_status(
+                            id_for_check,
+                            AgentDispatchStatus::WaitingHuman,
+                            AgentDispatchStatus::Spawning,
+                            None,
+                        )
+                    })
+                    .await?;
             if !reserved {
-                attempts.remove(&row.id);
+                forget(attempts, row.id);
                 tracing::info!(
                     target: "thegn::daemon",
                     row = row.id,
@@ -307,7 +418,7 @@ pub(crate) async fn handle_exit(
                         })
                         .await;
                     if !matches!(published, Ok(true)) {
-                        attempts.remove(&row.id);
+                        forget(attempts, row.id);
                         let publish_error = published.err();
                         // best-effort: either the supervisor won after `open`
                         // or the publish itself failed. In both cases this
@@ -323,7 +434,7 @@ pub(crate) async fn handle_exit(
                     tracing::info!(target: "thegn::daemon", row = row.id, session = %info.id, "relaunched");
                 }
                 Err(e) => {
-                    attempts.remove(&row.id);
+                    forget(attempts, row.id);
                     // Provider errors may include arbitrarily long stderr.
                     // The roster ledger is bounded; the artifact/log is where
                     // full diagnostics belong.
@@ -422,6 +533,40 @@ async fn relaunch(svc: &DaemonService, row: &AgentDispatch) -> anyhow::Result<Se
     svc.open(retry_open_spec(row, prompt))
         .await
         .map_err(|e| anyhow::anyhow!("open: {e}"))
+}
+
+/// Drop a row's retry budget.
+fn forget(attempts: &Attempts, id: i64) {
+    attempts
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(&id);
+}
+
+/// Garbage-collect counters of rows that reached a terminal state (or no
+/// longer exist), so the map is bounded by the live roster, not daemon uptime.
+async fn gc_attempts(svc: &DaemonService, attempts: &Attempts) {
+    let ids: Vec<i64> = {
+        let map = attempts.lock().unwrap_or_else(|p| p.into_inner());
+        if map.len() < ATTEMPTS_GC_THRESHOLD {
+            return;
+        }
+        map.keys().copied().collect()
+    };
+    let Ok(rows) = svc.with_db(|db| db.list_dispatches()).await else {
+        return;
+    };
+    let live: HashSet<i64> = rows
+        .iter()
+        .filter(|r| !r.status.is_terminal())
+        .map(|r| r.id)
+        .collect();
+    let mut map = attempts.lock().unwrap_or_else(|p| p.into_inner());
+    for id in ids {
+        if !live.contains(&id) {
+            map.remove(&id);
+        }
+    }
 }
 
 /// Re-render the row's stage prompt cold — the no-continue-form relaunch.
