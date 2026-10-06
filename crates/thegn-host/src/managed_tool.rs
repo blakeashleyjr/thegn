@@ -82,6 +82,10 @@ enum RunError {
     PipeHeld {
         tail: String,
     },
+    /// SIGINT/SIGTERM arrived (CLI): the group was stopped and reaped.
+    Interrupted {
+        tail: String,
+    },
 }
 
 impl std::fmt::Display for RunError {
@@ -94,6 +98,7 @@ impl std::fmt::Display for RunError {
             Self::Nonzero { status, tail } => write!(f, "exited with {status}{tail}"),
             Self::Wait(e) => write!(f, "wait/kill failed: {e}"),
             Self::Read(e) => write!(f, "output reader failed: {e}"),
+            Self::Interrupted { tail } => write!(f, "interrupted (process tree killed){tail}"),
             Self::PipeHeld { tail } => write!(
                 f,
                 "an escaped process kept the output pipe open; output truncated{tail}"
@@ -134,18 +139,36 @@ impl Capture {
     fn render(&self) -> String {
         let tail: Vec<u8> = self.tail.iter().copied().collect();
         let kept = self.retained() as u64;
-        let mut s = String::from_utf8_lossy(&self.head).into_owned();
-        if self.total > kept {
-            s.push_str(&format!("\n[... {} bytes elided ...]\n", self.total - kept));
+        let mut head = String::from_utf8_lossy(&self.head).into_owned();
+        let mut tail = String::from_utf8_lossy(&tail).into_owned();
+        if self.total <= kept {
+            head.push_str(&tail);
+            return thegn_core::ci_log::redact(head.trim());
         }
-        s.push_str(&String::from_utf8_lossy(&tail));
-        thegn_core::ci_log::redact(s.trim())
+        // Cut both halves to line boundaries and redact them separately, so a
+        // secret straddling the elision can never leave a readable fragment.
+        if let Some(i) = head.rfind('\n') {
+            head.truncate(i);
+        }
+        if let Some(i) = tail.find('\n') {
+            tail.drain(..=i);
+        }
+        format!(
+            "{}\n[... {} bytes elided ...]\n{}",
+            thegn_core::ci_log::redact(head.trim()),
+            self.total - kept,
+            thegn_core::ci_log::redact(tail.trim())
+        )
     }
 }
 
 struct Captured {
     stdout: Capture,
     stderr: Capture,
+    /// A process that escaped the owned group (own session) still held an
+    /// output pipe after a clean exit; the tree was killed but output may be
+    /// truncated.
+    pipe_held: bool,
 }
 
 fn tail_text(out: &Capture, err: &Capture) -> String {
@@ -164,18 +187,19 @@ fn tail_text(out: &Capture, err: &Capture) -> String {
 type ReaderRx = mpsc::Receiver<std::io::Result<Capture>>;
 
 /// Read `pipe` to EOF on its own thread, retaining only a bounded head/tail.
-/// `tee` forwards the bytes live to this process's stderr (`Some(true)`) or
-/// stdout (`Some(false)`) for CLI presentation — capture is identical either
-/// way, so output ownership never depends on the mode.
+/// `tee` forwards the bytes live to this process's stderr for CLI presentation
+/// (never stdout, which carries machine data such as `--json`) — capture is
+/// identical either way, so output ownership never depends on the mode.
 fn spawn_reader(
     name: &str,
     mut pipe: impl Read + Send + 'static,
-    tee: Option<bool>,
+    tee: bool,
 ) -> std::io::Result<ReaderRx> {
     let (tx, rx) = mpsc::sync_channel(1);
     std::thread::Builder::new()
         .name(name.to_string())
         .spawn(move || {
+            crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
             let mut cap = Capture::default();
             let mut buf = [0u8; 8192];
             let result = loop {
@@ -183,14 +207,8 @@ fn spawn_reader(
                     Ok(0) => break Ok(()),
                     Ok(n) => {
                         cap.push(&buf[..n]);
-                        match tee {
-                            Some(true) => {
-                                let _ = std::io::stderr().write_all(&buf[..n]); // best-effort: live echo; capture is authoritative
-                            }
-                            Some(false) => {
-                                let _ = std::io::stdout().write_all(&buf[..n]); // best-effort: live echo; capture is authoritative
-                            }
-                            None => {}
+                        if tee {
+                            let _ = std::io::stderr().write_all(&buf[..n]); // best-effort: live echo; capture is authoritative
                         }
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
@@ -219,14 +237,15 @@ fn run_bounded(cmd: &mut Command, limits: Limits, tee: bool) -> Result<Captured,
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // CLI: the child lives in its own group, which the terminal's Ctrl-C no
+    // longer reaches, so record SIGINT/SIGTERM and stop the group ourselves.
+    let interrupt = tee.then(crate::platform::InterruptGuard::install);
     let (mut child, group) = crate::platform::spawn_grouped(cmd).map_err(RunError::Spawn)?;
     let deadline = Instant::now() + limits.timeout;
     let out_pipe = child.stdout.take().expect("stdout was piped");
     let err_pipe = child.stderr.take().expect("stderr was piped");
-    let readers =
-        spawn_reader("thegn-setup-stdout", out_pipe, tee.then_some(false)).and_then(|out| {
-            spawn_reader("thegn-setup-stderr", err_pipe, tee.then_some(true)).map(|err| (out, err))
-        });
+    let readers = spawn_reader("thegn-setup-stdout", out_pipe, tee)
+        .and_then(|out| spawn_reader("thegn-setup-stderr", err_pipe, tee).map(|err| (out, err)));
     let (out_rx, err_rx) = match readers {
         Ok(pair) => pair,
         Err(e) => {
@@ -238,8 +257,13 @@ fn run_bounded(cmd: &mut Command, limits: Limits, tee: bool) -> Result<Captured,
     };
 
     let mut timed_out = false;
+    let mut interrupted = false;
     let mut wait_err = None;
     loop {
+        if interrupt.as_ref().is_some_and(|g| g.fired()) {
+            interrupted = true;
+            break;
+        }
         match crate::platform::gate_child_exited(&mut child) {
             Ok(true) => break,
             Ok(false) => {}
@@ -254,19 +278,35 @@ fn run_bounded(cmd: &mut Command, limits: Limits, tee: bool) -> Result<Captured,
         }
         std::thread::sleep(POLL);
     }
-    if timed_out || wait_err.is_some() {
+    // If observing the leader failed (e.g. ECHILD) its pid may be reused, so
+    // the group identity is no longer ours: never signal it. Kill the direct
+    // child handle only.
+    let mut owned = wait_err.is_none();
+    if owned && (timed_out || interrupted) {
         group.terminate();
         let grace_end = Instant::now() + limits.term_grace;
-        while Instant::now() < grace_end
-            && !matches!(crate::platform::gate_child_exited(&mut child), Ok(true))
-        {
-            std::thread::sleep(POLL);
+        loop {
+            match crate::platform::gate_child_exited(&mut child) {
+                Ok(true) => break,
+                Ok(false) if Instant::now() < grace_end => std::thread::sleep(POLL),
+                Ok(false) => break,
+                Err(e) => {
+                    wait_err = Some(e);
+                    owned = false;
+                    break;
+                }
+            }
         }
     }
-    // The leader is still unreaped here, so the group identity is ours: kill
-    // every remaining member (compilers, package scripts, pipe holders).
-    group.kill();
+    if owned {
+        // The leader is still unreaped here, so the group identity is ours:
+        // kill every remaining member (compilers, package scripts, pipe holders).
+        group.kill();
+    } else {
+        let _ = child.kill(); // best-effort: group ownership uncertain; the leader may be gone
+    }
     let status = child.wait();
+    drop(interrupt);
 
     let join = |rx: ReaderRx| match rx.recv_timeout(limits.read_grace) {
         Ok(Ok(cap)) => Ok(cap),
@@ -282,6 +322,9 @@ fn run_bounded(cmd: &mut Command, limits: Limits, tee: bool) -> Result<Captured,
         (o, e) => (o.unwrap_or_default(), e.unwrap_or_default(), true),
     };
     let tail = tail_text(&stdout, &stderr);
+    if interrupted {
+        return Err(RunError::Interrupted { tail });
+    }
     if timed_out {
         return Err(RunError::Timeout {
             secs: limits.timeout.as_secs(),
@@ -292,16 +335,26 @@ fn run_bounded(cmd: &mut Command, limits: Limits, tee: bool) -> Result<Captured,
         return Err(RunError::Wait(e));
     }
     let status = status.map_err(RunError::Wait)?;
-    if held {
-        return Err(RunError::PipeHeld { tail });
-    }
     if !status.success() {
-        return Err(RunError::Nonzero { status, tail });
+        return Err(if held {
+            RunError::PipeHeld { tail }
+        } else {
+            RunError::Nonzero { status, tail }
+        });
     }
-    Ok(Captured { stdout, stderr })
+    Ok(Captured {
+        stdout,
+        stderr,
+        pipe_held: held,
+    })
 }
 
-/// Run a setup subprocess. Output is always captured (bounded, redacted) and
+/// Run a setup subprocess. Setup commands are **non-interactive**: stdin is
+/// `/dev/null` and git/ssh credential prompts are disabled, because the child
+/// runs in its own process group (a background group that opens `/dev/tty`
+/// would be stopped by SIGTTIN until the deadline). On the CLI, SIGINT/SIGTERM
+/// are forwarded to that group. Because output is piped, tools that draw
+/// progress bars on a TTY (npm, cargo) fall back to plain line output. Output is always captured (bounded, redacted) and
 /// the whole process tree is owned and killed on deadline; on the CLI the
 /// output is additionally echoed live, while under the TUI it is only logged so
 /// npm progress never paints over the alt-screen frame. Shared by the pi setup
@@ -311,8 +364,19 @@ fn run_bounded(cmd: &mut Command, limits: Limits, tee: bool) -> Result<Captured,
 // blocking wait never happens on the event loop.
 pub fn run_setup_cmd(mut cmd: Command, ctx: &str, fail: &str) -> Result<()> {
     let tui = msg::tui_active();
+    cmd.env("GIT_TERMINAL_PROMPT", "0")
+        .env("SSH_ASKPASS_REQUIRE", "never")
+        .env("GIT_ASKPASS", "true")
+        .env("npm_config_progress", "false");
     match run_bounded(&mut cmd, Limits::setup(), !tui) {
         Ok(c) => {
+            if c.pipe_held {
+                tracing::warn!(
+                    target: "thegn::provision",
+                    cmd = ctx,
+                    "setup succeeded but a process outside the owned group held an output pipe; captured output may be truncated"
+                );
+            }
             if tui && (c.stdout.total > 0 || c.stderr.total > 0) {
                 tracing::debug!(
                     target: "thegn::provision",
@@ -631,6 +695,21 @@ mod tests {
         };
         assert!(tail.contains("boom"));
         assert!(!tail.contains(&canary));
+    }
+
+    #[test]
+    fn render_cuts_to_lines_at_the_elision() {
+        let mut c = Capture::default();
+        let line = "0123456789abcdef0123456789abcdef\n";
+        for _ in 0..1000 {
+            c.push(line.as_bytes());
+        }
+        let r = c.render();
+        assert!(r.contains("bytes elided"));
+        let (a, b) = r.split_once("\n[... ").unwrap();
+        assert!(a.lines().all(|l| l.len() == 32));
+        let b = b.split_once("...]\n").unwrap().1;
+        assert!(b.lines().all(|l| l.len() == 32));
     }
 
     #[test]
