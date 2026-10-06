@@ -14056,11 +14056,9 @@ async fn event_loop<T: Terminal>(
                     }
                     corner_gfx.clear();
                 } else if !corner_gfx.is_empty() {
-                    let mut blob = Vec::new();
-                    for g in corner_gfx.drain(..) {
-                        blob.extend_from_slice(&g);
-                    }
-                    writer.submit_oob(blob);
+                    writer.submit_oob(crate::kitty_relay::coalesce_gfx(std::mem::take(
+                        &mut corner_gfx,
+                    )));
                 }
                 corner_occluded = occluded_now;
             } else {
