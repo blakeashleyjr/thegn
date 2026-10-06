@@ -166,7 +166,7 @@ async fn cancelling_the_future_kills_the_tree() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         task.abort();
-        let _ = task.await; // best-effort: JoinError::Cancelled expected
+        let _joined = task.await; // JoinError::Cancelled is expected
         assert!(wait_gone(&f).await, "leader survived abort {i}");
         assert!(wait_gone(&g).await, "grandchild survived abort {i}");
     }

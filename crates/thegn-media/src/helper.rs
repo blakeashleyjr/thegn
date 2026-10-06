@@ -91,8 +91,9 @@ impl Guard {
         if let Some(pid) = self.0.id() {
             crate::platform::kill_group(pid);
         }
-        // best-effort: the child may already have exited
-        let _ = self.0.start_kill();
+        if self.0.start_kill().is_err() {
+            // The child already exited; the group kill above covered the rest.
+        }
     }
 
     async fn terminate(&mut self) -> Result<(), HelperError> {
