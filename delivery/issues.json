@@ -624,9 +624,8 @@
     {
       "issue": "THE-703",
       "project": "Alpha Reliability & State Compatibility",
-      "changes": [
-        "add-pipeline-supervisor-policy"
-      ]
+      "changes": [],
+      "no_spec_rationale": "Phase 1 (classify, approve, plan) archived as add-pipeline-supervisor-policy. Phases 2-4 of the supervisor policy layer are still open and have no proposal yet."
     }
   ]
 }
