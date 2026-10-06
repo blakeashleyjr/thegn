@@ -21,7 +21,7 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
@@ -180,7 +180,8 @@ pub struct BridgeClient {
     /// deadline. (Prior bug: a call that registered *after* the reader had
     /// already torn down blocked the full RPC timeout.)
     closed: Arc<AtomicBool>,
-    _reader: std::thread::JoinHandle<()>,
+    /// The reader thread, owned so [`BridgeClient::close`] can prove it ended.
+    reader: Mutex<Option<std::thread::JoinHandle<()>>>,
     subs: Subs,
     next_watch: AtomicU64,
     procs: Procs,
@@ -188,6 +189,9 @@ pub struct BridgeClient {
     /// The spawned agent process, owned so it's killed when the client drops
     /// (subprocess transports). `None` for a caller-provided stream (tests).
     child: Mutex<Option<Child>>,
+    /// Whether the child was reaped inline by the first `close` (`None` until
+    /// a child has been handled), so a repeat `close` reports the truth.
+    child_reaped: Mutex<Option<bool>>,
 }
 
 /// Resolve a bridge RPC deadline from `var` (seconds), falling back to
@@ -209,26 +213,36 @@ impl BridgeClient {
     pub fn new(
         reader: impl Read + Send + 'static,
         writer: impl Write + Send + 'static,
-    ) -> BridgeClient {
-        Self::build(reader, writer, None)
+    ) -> std::result::Result<BridgeClient, BridgeError> {
+        Self::build(reader, writer, None, spawn_reader_thread)
     }
 
     /// Spawn `cmd` (e.g. `ssh host thegn --bridge`, `sprite exec … thegn
     /// --bridge`, or `thegn --bridge` locally) and talk to it over its stdio.
-    /// The child is owned and killed on drop.
-    pub fn spawn(mut cmd: Command) -> Result<BridgeClient> {
-        cmd.stdin(Stdio::piped()).stdout(Stdio::piped());
-        let mut child = cmd.spawn().context("spawn bridge agent")?;
-        let stdout = child.stdout.take().context("bridge agent: no stdout")?;
-        let stdin = child.stdin.take().context("bridge agent: no stdin")?;
-        Ok(Self::build(stdout, stdin, Some(child)))
+    /// The child is owned and killed on drop / [`close`](Self::close).
+    pub fn spawn(cmd: Command) -> Result<BridgeClient> {
+        Ok(Self::spawn_typed(cmd)?)
     }
 
+    fn spawn_typed(mut cmd: Command) -> std::result::Result<BridgeClient, BridgeError> {
+        cmd.stdin(Stdio::piped()).stdout(Stdio::piped());
+        let mut child = cmd.spawn().map_err(BridgeError::Spawn)?;
+        let (Some(stdout), Some(stdin)) = (child.stdout.take(), child.stdin.take()) else {
+            reap_child(child, Duration::from_millis(500));
+            return Err(BridgeError::MissingStdio);
+        };
+        Self::build(stdout, stdin, Some(child), spawn_reader_thread)
+    }
+
+    /// `spawner` creates the reader thread (a seam so thread-creation failure is
+    /// testable). On failure any owned child is killed and reaped (bounded)
+    /// before the typed error is returned.
     fn build(
         reader: impl Read + Send + 'static,
         writer: impl Write + Send + 'static,
         child: Option<Child>,
-    ) -> BridgeClient {
+        spawner: ReaderSpawner,
+    ) -> std::result::Result<BridgeClient, BridgeError> {
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
         let subs: Subs = Arc::new(Mutex::new(HashMap::new()));
         let procs: Procs = Arc::new(Mutex::new(HashMap::new()));
@@ -237,31 +251,92 @@ impl BridgeClient {
         let reader_subs = subs.clone();
         let reader_procs = procs.clone();
         let reader_closed = closed.clone();
-        let handle = std::thread::Builder::new()
-            .name("bridge-reader".into())
-            .spawn(move || {
-                reader_loop(
-                    reader,
-                    reader_pending,
-                    reader_subs,
-                    reader_procs,
-                    reader_closed,
-                )
-            })
-            .expect("spawn bridge reader");
-        BridgeClient {
+        let handle = match spawner(Box::new(move || {
+            reader_loop(
+                reader,
+                reader_pending,
+                reader_subs,
+                reader_procs,
+                reader_closed,
+            )
+        })) {
+            Ok(h) => h,
+            Err(e) => {
+                if let Some(c) = child {
+                    reap_child(c, CLOSE_DEADLINE);
+                }
+                return Err(BridgeError::ReaderThread(e));
+            }
+        };
+        Ok(BridgeClient {
             writer: Arc::new(Mutex::new(Box::new(writer))),
             next_id: AtomicU64::new(1),
             pending,
             timeout: env_timeout("THEGN_BRIDGE_TIMEOUT_SECS", 120),
             read_timeout: env_timeout("THEGN_BRIDGE_READ_TIMEOUT_SECS", 20),
             closed,
-            _reader: handle,
+            reader: Mutex::new(Some(handle)),
             subs,
             next_watch: AtomicU64::new(1),
             procs,
             next_chan: AtomicU64::new(1),
             child: Mutex::new(child),
+            child_reaped: Mutex::new(None),
+        })
+    }
+
+    /// Idempotent, bounded explicit close. Fails every pending call, closes
+    /// every subscription, drops the client's write half (which sends EOF
+    /// only if that half is the last handle on the transport — not for a
+    /// duplicated socket), kills the owned child and waits for it and the reader thread up
+    /// to `deadline` in total. Never blocks past `deadline` (plus one poll
+    /// tick); a repeat call after completion returns immediately.
+    pub fn close(&self, deadline: Duration) -> CloseReport {
+        let end = Instant::now() + deadline;
+        fail_all(&self.pending, &self.subs, &self.procs, &self.closed);
+        self.shut_writer();
+        let taken = self.child.lock().ok().and_then(|mut g| g.take());
+        let child_reaped = {
+            let mut outcome = self
+                .child_reaped
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if let Some(c) = taken {
+                *outcome = Some(reap_child(c, end.saturating_duration_since(Instant::now())));
+            }
+            // No child ever owned => nothing to reap; otherwise the first outcome.
+            outcome.unwrap_or(true)
+        };
+        let handle = self.reader.lock().ok().and_then(|mut g| g.take());
+        let reader_finished = match handle {
+            None => true,
+            Some(h) => {
+                while !h.is_finished() && Instant::now() < end {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                if h.is_finished() {
+                    let _ = h.join(); // best-effort: a panicked reader has nothing more to report
+                    true
+                } else {
+                    // Still blocked in a read: keep ownership so a later close
+                    // (or the lifecycle owner) can observe completion.
+                    if let Ok(mut g) = self.reader.lock() {
+                        *g = Some(h);
+                    }
+                    false
+                }
+            }
+        };
+        CloseReport {
+            reader_finished,
+            child_reaped,
+        }
+    }
+
+    /// Drop the transport's write half without ever blocking on a wedged writer.
+    fn shut_writer(&self) {
+        if let Ok(mut w) = self.writer.try_lock() {
+            *w = Box::new(std::io::sink());
         }
     }
 
@@ -448,24 +523,134 @@ impl BridgeClient {
         Ok(())
     }
 
-    /// Kill a streaming process (and stop its stream).
-    pub fn proc_kill(&self, chan: u64) -> Result<()> {
+    /// Terminate a streaming process tree and report how it ended. The server
+    /// writes the channel's terminal `proc.exit` before this response, so the
+    /// subscriber is dropped only after the exit event was delivered (or when
+    /// the request itself failed to confirm).
+    pub fn proc_kill(&self, chan: u64) -> Result<ProcKillOutcome> {
         let params = serde_json::to_value(ChanRef { chan })?;
-        self.call("proc.kill", params)?;
-        self.procs.lock().unwrap().remove(&chan);
-        Ok(())
+        let result = self.call("proc.kill", params)?;
+        let outcome: ProcKillOutcome =
+            serde_json::from_value(result).context("decode proc.kill outcome")?;
+        if outcome != ProcKillOutcome::Timeout {
+            self.procs.lock().unwrap().remove(&chan);
+        }
+        Ok(outcome)
     }
 }
 
 impl Drop for BridgeClient {
+    /// Never blocks: fails waiters, closes the write half, kills the child and
+    /// reaps it with a single non-blocking check (a bounded background reaper
+    /// finishes the job if it has not exited yet). The reader thread ends on
+    /// the resulting EOF; use [`BridgeClient::close`] to wait for it.
     fn drop(&mut self) {
+        fail_all(&self.pending, &self.subs, &self.procs, &self.closed);
+        self.shut_writer();
         if let Ok(mut guard) = self.child.lock()
-            && let Some(mut c) = guard.take()
+            && let Some(c) = guard.take()
         {
-            let _ = c.kill(); // best-effort: child may already have exited
-            let _ = c.wait(); // best-effort: reap-or-not is terminal here
+            reap_child(c, Duration::ZERO);
+        }
+        if let Ok(mut g) = self.reader.lock()
+            && let Some(h) = g.take()
+            && h.is_finished()
+        {
+            let _ = h.join(); // best-effort: finished reader, nothing to report
         }
     }
+}
+
+/// Default bound for teardown on construction failure.
+const CLOSE_DEADLINE: Duration = Duration::from_secs(2);
+
+/// Typed failure to construct a [`BridgeClient`].
+#[derive(Debug)]
+pub enum BridgeError {
+    /// The transport child could not be spawned.
+    Spawn(std::io::Error),
+    /// The spawned child did not expose piped stdin/stdout.
+    MissingStdio,
+    /// The reader thread could not be created (resource pressure).
+    ReaderThread(std::io::Error),
+}
+
+impl std::fmt::Display for BridgeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Spawn(e) => write!(f, "spawn bridge agent: {e}"),
+            Self::MissingStdio => write!(f, "bridge agent: stdio not piped"),
+            Self::ReaderThread(e) => write!(f, "spawn bridge reader thread: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for BridgeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Spawn(e) | Self::ReaderThread(e) => Some(e),
+            Self::MissingStdio => None,
+        }
+    }
+}
+
+/// What [`BridgeClient::close`] proved within its deadline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CloseReport {
+    pub reader_finished: bool,
+    pub child_reaped: bool,
+}
+
+type ReaderSpawner = fn(Box<dyn FnOnce() + Send>) -> std::io::Result<std::thread::JoinHandle<()>>;
+
+fn spawn_reader_thread(
+    f: Box<dyn FnOnce() + Send>,
+) -> std::io::Result<std::thread::JoinHandle<()>> {
+    std::thread::Builder::new()
+        .name("bridge-reader".into())
+        .spawn(f)
+}
+
+/// Kill `child` and reap it, waiting up to `deadline`. If it has not exited by
+/// then, a short-lived reaper thread finishes the `wait` so no zombie remains
+/// (the kill is already sent, so the wait is bounded by the kernel). Returns
+/// whether it was reaped inline.
+fn reap_child(mut child: Child, deadline: Duration) -> bool {
+    let _ = child.kill(); // best-effort: child may already have exited
+    let end = Instant::now() + deadline;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return true,
+            Ok(None) if Instant::now() < end => std::thread::sleep(Duration::from_millis(2)),
+            Ok(None) | Err(_) => break,
+        }
+    }
+    let spawned = std::thread::Builder::new()
+        .name("bridge-reaper".into())
+        .spawn(move || {
+            let _ = child.wait(); // best-effort: reap only
+        });
+    if let Err(e) = spawned {
+        tracing::warn!(target: "thegn::bridge", error = %e, "reaper thread unavailable; child may linger");
+    }
+    false
+}
+
+/// Fail every pending call, signal subscribers, and mark the client closed
+/// (inside the `pending` lock, serializing with `call_within`).
+fn fail_all(pending: &Pending, subs: &Subs, procs: &Procs, closed: &AtomicBool) {
+    {
+        let mut p = pending.lock().unwrap_or_else(PoisonError::into_inner);
+        closed.store(true, Ordering::SeqCst);
+        for (_, tx) in p.drain() {
+            let _ = tx.send(Err("bridge connection closed".into())); // best-effort: nobody may be listening
+        }
+    }
+    for (_, tx) in procs.lock().unwrap_or_else(PoisonError::into_inner).drain() {
+        let _ = tx.send(ProcEvent::Exit { code: -1 }); // best-effort: shutdown, receivers may be gone
+    }
+    // Dropping the Senders disconnects each fs.watch receiver's `recv()`.
+    subs.lock().unwrap_or_else(PoisonError::into_inner).clear();
 }
 
 // ---------------------------------------------------------------------------
@@ -651,18 +836,7 @@ fn reader_loop(
     // concurrent `call_within` is serialized: it either inserted before us (and
     // is drained here) or observes `closed` after us and errors immediately —
     // no waiter is left to time out.
-    {
-        let mut p = pending.lock().unwrap();
-        closed.store(true, Ordering::SeqCst);
-        for (_, tx) in p.drain() {
-            let _ = tx.send(Err("bridge connection closed".into())); // best-effort: nobody may be listening
-        }
-    }
-    for (_, tx) in procs.lock().unwrap().drain() {
-        let _ = tx.send(ProcEvent::Exit { code: -1 }); // best-effort: shutdown, receivers may be gone
-    }
-    // Dropping the Senders disconnects each fs.watch receiver's `recv()`.
-    subs.lock().unwrap().clear();
+    fail_all(&pending, &subs, &procs, &closed);
 }
 
 /// The agent side (`thegn --bridge`): read framed requests off `reader`, run
@@ -681,17 +855,114 @@ type SharedWriter = Arc<Mutex<Box<dyn Write + Send>>>;
 /// so the blocking pipe write never runs on the serve read loop (a child that
 /// stops draining stdin must not wedge the whole agent — every other request,
 /// including the `proc.kill` that would free the pipe, would sit unread otherwise).
-/// Dropping the `ProcState` drops the sender → the writer thread's `recv` errs →
-/// it drops stdin → the child sees EOF → exits → its waiter thread fires
-/// `proc.exit`. So `proc.kill` and connection-close remain just a map removal —
-/// no shared `Child` mutex, no libc signal, no deadlock between reader/kill paths.
+///
+/// Every child leads its own process group and each channel retains an
+/// [`Arc<ProcCtl>`] holding the termination authority for that tree. The waiter
+/// thread keeps the leader **unreaped** (`waitid(WNOWAIT)`) until the group has
+/// been SIGKILLed, so a group signal can never reach a recycled pid; `proc.kill`
+/// and connection teardown signal only while the phase is `Running`, under the
+/// same lock the waiter takes to reap.
 struct ProcState {
     /// Bounded so a wedged child's backlog can't grow without limit; a full queue
     /// makes `proc.stdin` fail fast rather than block the read loop.
     stdin_tx: std::sync::mpsc::SyncSender<Vec<u8>>,
+    ctl: Arc<ProcCtl>,
 }
 /// Backlog depth for a channel's stdin writer thread before `proc.stdin` errors.
 const STDIN_QUEUE_DEPTH: usize = 64;
+/// How long `proc.kill` waits after SIGTERM before escalating to SIGKILL.
+const KILL_TERM_GRACE: Duration = Duration::from_millis(1000);
+/// How long `proc.kill` waits after SIGKILL for the reap + `proc.exit` before
+/// reporting `timeout` (an uninterruptible child cannot be bounded further).
+const KILL_FORCE_WAIT: Duration = Duration::from_millis(3000);
+/// Total bound for connection-close teardown of every channel.
+const TEARDOWN_BOUND: Duration = Duration::from_millis(3000);
+/// How long the waiter lets relay threads drain after the group is dead before
+/// announcing `proc.exit` (a descendant that escaped the group via setsid can
+/// hold a pipe open indefinitely).
+const RELAY_DRAIN_BOUND: Duration = Duration::from_millis(1000);
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ProcPhase {
+    /// Leader not yet reaped: the pgid is pinned and safe to signal.
+    Running,
+    /// Leader reaped with this exit code; `proc.exit` not yet written.
+    Reaped(i32),
+    /// `proc.exit` has been written for this channel generation.
+    Announced(i32),
+}
+
+/// Termination authority + completion signal for one channel generation.
+struct ProcCtl {
+    pid: u32,
+    phase: Mutex<ProcPhase>,
+    changed: std::sync::Condvar,
+    /// Serializes `proc.kill` and remembers its settled outcome.
+    kill_gate: Mutex<Option<ProcKillOutcome>>,
+}
+
+impl ProcCtl {
+    fn new(pid: u32) -> Arc<Self> {
+        Arc::new(Self {
+            pid,
+            phase: Mutex::new(ProcPhase::Running),
+            changed: std::sync::Condvar::new(),
+            kill_gate: Mutex::new(None),
+        })
+    }
+
+    /// Signal the group while the leader is still unreaped. Returns whether a
+    /// signal was sent.
+    fn signal(&self, force: bool) -> bool {
+        let phase = self.phase.lock().unwrap();
+        if *phase != ProcPhase::Running {
+            return false;
+        }
+        if force {
+            crate::plugin::proc::kill_group(self.pid);
+        } else {
+            crate::plugin::proc::term_group(self.pid);
+        }
+        true
+    }
+
+    /// Wait until `proc.exit` was written or `deadline` passes.
+    fn wait_announced(&self, deadline: Instant) -> Option<i32> {
+        let mut phase = self.phase.lock().unwrap();
+        loop {
+            if let ProcPhase::Announced(code) = *phase {
+                return Some(code);
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return None;
+            }
+            phase = self.changed.wait_timeout(phase, left).unwrap().0;
+        }
+    }
+
+    fn set(&self, next: ProcPhase) {
+        *self.phase.lock().unwrap() = next;
+        self.changed.notify_all();
+    }
+}
+
+/// Typed `proc.kill` result: how the channel's process tree ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum ProcKillOutcome {
+    /// Ended after SIGTERM; reaped, `proc.exit` delivered.
+    Terminated { code: i32 },
+    /// Needed SIGKILL; reaped, `proc.exit` delivered.
+    Killed { code: i32 },
+    /// The process had already exited on its own when the kill arrived.
+    Exited { code: i32 },
+    /// No live channel (already exited, or never existed): nothing to kill.
+    Gone,
+    /// Termination was requested but not confirmed within the bound.
+    Timeout,
+}
+
 type ProcRegistry = Arc<Mutex<HashMap<u64, ProcState>>>;
 
 pub fn serve(reader: impl Read, writer: impl Write + Send + 'static) {
@@ -719,6 +990,21 @@ pub fn serve(reader: impl Read, writer: impl Write + Send + 'static) {
                 // host requests parallelize (restores the pre-bridge parallel-
                 // subprocess behavior instead of serializing every git read
                 // through one connection).
+                "proc.kill" => {
+                    // Bounded waits (TERM grace + escalation) must not stall the
+                    // read loop, so the kill runs off it like the exec ops.
+                    let (w, procs) = (writer.clone(), procs.clone());
+                    let req_id = req.id;
+                    if let Err(e) = std::thread::Builder::new()
+                        .name("bridge-proc-kill".into())
+                        .spawn(move || write_frame(&w, &proc_kill_response(&req, &procs)))
+                    {
+                        write_frame(
+                            &writer,
+                            &resp_err(req_id, format!("spawn kill worker: {e}")),
+                        );
+                    }
+                }
                 "exec" | "exec.batch" | "proc.list" => {
                     let w = writer.clone();
                     let req_id = req.id;
@@ -747,7 +1033,6 @@ pub fn serve(reader: impl Read, writer: impl Write + Send + 'static) {
                         "fs.watch" => watch_response(&req, &writer, &mut watchers),
                         "proc.spawn" => proc_spawn_response(&req, &writer, &procs),
                         "proc.stdin" => proc_stdin_response(&req, &procs),
-                        "proc.kill" => proc_kill_response(&req, &procs),
                         other => resp_err(req.id, format!("unknown method: {other}")),
                     };
                     write_frame(&writer, &resp);
@@ -755,8 +1040,23 @@ pub fn serve(reader: impl Read, writer: impl Write + Send + 'static) {
             }
         }
     }
-    // Connection closed: drop every child's stdin → EOF → the children exit.
-    procs.lock().unwrap().clear();
+    // Connection closed: terminate and reap every owned process tree, bounded.
+    teardown_procs(&procs);
+}
+
+/// SIGKILL every live channel's group and wait (bounded) for each to be reaped.
+/// Dropping the drained `ProcState`s also closes every stdin writer thread.
+fn teardown_procs(procs: &ProcRegistry) {
+    let states: Vec<ProcState> = procs.lock().unwrap().drain().map(|(_, s)| s).collect();
+    let deadline = Instant::now() + TEARDOWN_BOUND;
+    for st in &states {
+        st.ctl.signal(true);
+    }
+    for st in &states {
+        if st.ctl.wait_announced(deadline).is_none() {
+            tracing::warn!(target: "thegn::bridge", pid = st.ctl.pid, "process tree not reaped within teardown bound");
+        }
+    }
 }
 
 fn proc_spawn_response(req: &Request, writer: &SharedWriter, procs: &ProcRegistry) -> Response {
@@ -770,10 +1070,18 @@ fn proc_spawn_response(req: &Request, writer: &SharedWriter, procs: &ProcRegistr
     }
 }
 
+/// Spawn a streaming child in its own process group. Note the whole group is
+/// SIGKILLed once the leader exits, so background jobs a command leaves in its
+/// group (`foo &`) do not outlive it.
 fn do_spawn(p: SpawnParams, writer: SharedWriter, procs: ProcRegistry) -> Result<()> {
     let Some((cmd, args)) = p.argv.split_first() else {
         bail!("empty argv");
     };
+    // A live channel id must not be re-registered: the old generation's
+    // authority would be lost and its exit would tear down the new one.
+    if procs.lock().unwrap().contains_key(&p.chan) {
+        bail!("channel {} already in use", p.chan);
+    }
     let mut c = Command::new(cmd);
     c.args(args)
         .stdin(Stdio::piped())
@@ -786,27 +1094,40 @@ fn do_spawn(p: SpawnParams, writer: SharedWriter, procs: ProcRegistry) -> Result
     for (k, v) in &p.env {
         c.env(k, v);
     }
+    // Lead a fresh process group so termination reaches the whole tree.
+    crate::plugin::proc::set_process_group(&mut c);
     let mut child = c
         .spawn()
         .with_context(|| format!("spawn {}", p.argv.join(" ")))?;
-    let stdout = child.stdout.take().context("child stdout")?;
-    let stderr = child.stderr.take().context("child stderr")?;
-    let stdin = child.stdin.take().context("child stdin")?;
+    let pid = child.id();
+    let (Some(stdout), Some(stderr), Some(stdin)) =
+        (child.stdout.take(), child.stderr.take(), child.stdin.take())
+    else {
+        kill_and_reap(&mut child);
+        bail!("child stdio pipes missing");
+    };
     let chan = p.chan;
     // Stream stdout + stderr as proc.out notifications. A relay thread that
     // fails to start would leave a channel that silently drops output, so reap
     // the child and fail the spawn instead of registering a dead channel.
-    let relays = spawn_stream_relay(stdout, chan, "stdout", writer.clone())
-        .and_then(|()| spawn_stream_relay(stderr, chan, "stderr", writer.clone()));
-    if let Err(e) = relays {
-        let _ = child.kill(); // best-effort: child may already have exited
-        let _ = child.wait(); // best-effort: reap-or-not is terminal here
-        return Err(e).context("spawn bridge proc relay thread");
-    }
+    let out_relay = match spawn_stream_relay(stdout, chan, "stdout", writer.clone()) {
+        Ok(h) => h,
+        Err(e) => {
+            kill_and_reap(&mut child);
+            return Err(e).context("spawn bridge proc relay thread");
+        }
+    };
+    let err_relay = match spawn_stream_relay(stderr, chan, "stderr", writer.clone()) {
+        Ok(h) => h,
+        Err(e) => {
+            kill_and_reap(&mut child);
+            return Err(e).context("spawn bridge proc relay thread");
+        }
+    };
     // A dedicated writer thread owns stdin: proc.stdin bytes arrive over a bounded
     // channel, so the blocking pipe write happens here, never on the serve read
-    // loop. The thread ends when the sender drops (ProcState removed by proc.kill /
-    // connection-close) or the pipe errors — either way stdin drops → EOF.
+    // loop. The thread ends when the sender drops (ProcState removed) or the pipe
+    // errors — either way stdin drops → EOF.
     let (stdin_tx, stdin_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(STDIN_QUEUE_DEPTH);
     let writer_thread = std::thread::Builder::new()
         .name("bridge-proc-stdin".into())
@@ -824,34 +1145,106 @@ fn do_spawn(p: SpawnParams, writer: SharedWriter, procs: ProcRegistry) -> Result
             // Drop stdin → child sees EOF.
         });
     if let Err(e) = writer_thread {
-        let _ = child.kill(); // best-effort: child may already have exited
-        let _ = child.wait(); // best-effort: reap-or-not is terminal here
+        kill_and_reap(&mut child);
         return Err(e).context("spawn bridge-proc-stdin thread");
     }
-    procs.lock().unwrap().insert(chan, ProcState { stdin_tx });
-    // Waiter: owns the Child, blocks on exit (no lock held), then reports exit and
-    // drops the channel. The child exits when it finishes or when proc.kill /
-    // connection-close drops its stdin (EOF).
-    let procs2 = procs.clone();
+    let ctl = ProcCtl::new(pid);
+    procs.lock().unwrap().insert(
+        chan,
+        ProcState {
+            stdin_tx,
+            ctl: ctl.clone(),
+        },
+    );
+    // Waiter: owns the Child. It observes the leader's exit WITHOUT reaping,
+    // SIGKILLs whatever is left of the group (descendants holding the pipes),
+    // reaps the leader, lets the relays drain (bounded), then announces
+    // proc.exit and deregisters exactly this generation.
+    let slot = Arc::new(Mutex::new(Some(child)));
+    let (slot2, ctl2, procs2) = (slot.clone(), ctl.clone(), procs.clone());
     let waiter = std::thread::Builder::new()
         .name("bridge-proc-wait".into())
         .spawn(move || {
-            let code = child.wait().ok().and_then(|s| s.code()).unwrap_or(-1);
-            procs2.lock().unwrap().remove(&chan);
+            let relays = [out_relay, err_relay];
+            // Err = no WNOWAIT support: fall through to a plain reap.
+            let observed = crate::plugin::proc::wait_leader_exit_nowait(pid).is_ok();
+            let mut child = slot2.lock().unwrap().take();
+            let reap = |c: &mut Option<Child>| {
+                c.as_mut()
+                    .and_then(|c| c.wait().ok())
+                    .and_then(|s| s.code())
+                    .unwrap_or(-1)
+            };
+            let code = if observed {
+                // Hold the phase lock across kill + reap so a concurrent
+                // proc.kill can never signal after the pid is released.
+                let mut phase = ctl2.phase.lock().unwrap();
+                crate::plugin::proc::kill_group(pid);
+                let code = reap(&mut child);
+                *phase = ProcPhase::Reaped(code);
+                code
+            } else {
+                // No WNOWAIT: poll try_wait, reaping only under the phase lock so
+                // a concurrent signal() never sees Running for a released pid.
+                loop {
+                    let mut phase = ctl2.phase.lock().unwrap();
+                    let done = match child.as_mut().map(Child::try_wait) {
+                        Some(Ok(None)) => None,
+                        Some(Ok(Some(st))) => Some(st.code().unwrap_or(-1)),
+                        Some(Err(_)) | None => Some(-1),
+                    };
+                    if let Some(code) = done {
+                        *phase = ProcPhase::Reaped(code);
+                        break code;
+                    }
+                    drop(phase);
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            };
+            let drain_deadline = Instant::now() + RELAY_DRAIN_BOUND;
+            while relays.iter().any(|h| !h.is_finished()) && Instant::now() < drain_deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            for h in relays {
+                if h.is_finished() {
+                    let _ = h.join(); // best-effort: relay panic must not block exit report
+                }
+            }
+            {
+                let mut map = procs2.lock().unwrap();
+                if map.get(&chan).is_some_and(|s| Arc::ptr_eq(&s.ctl, &ctl2)) {
+                    map.remove(&chan);
+                }
+            }
             let note = serde_json::json!({
                 "method": "proc.exit",
                 "params": ProcExitNote { chan, code },
             });
             write_frame(&writer, &note);
+            ctl2.set(ProcPhase::Announced(code));
         });
     if let Err(e) = waiter {
-        // Without a waiter the client would never see proc.exit. The failed
-        // spawn dropped its closure (and the Child with it, un-reaped);
-        // deregistering drops stdin → EOF → the child exits on its own.
-        procs.lock().unwrap().remove(&chan);
+        // The closure (and its relay handles) was dropped; the Child is still in
+        // the shared slot, so kill and reap it here.
+        let mut map = procs.lock().unwrap();
+        if map.get(&chan).is_some_and(|s| Arc::ptr_eq(&s.ctl, &ctl)) {
+            map.remove(&chan);
+        }
+        drop(map);
+        if let Some(mut c) = slot.lock().unwrap().take() {
+            let mut phase = ctl.phase.lock().unwrap();
+            kill_and_reap(&mut c);
+            *phase = ProcPhase::Reaped(-1);
+        }
         return Err(e).context("spawn bridge-proc-wait thread");
     }
     Ok(())
+}
+
+/// Kill a not-yet-registered child's whole group and reap it.
+fn kill_and_reap(child: &mut Child) {
+    crate::plugin::proc::kill_group(child.id());
+    let _ = child.wait(); // best-effort: reap-or-not is terminal here
 }
 
 /// Relay a child stream to the client as `proc.out` notifications until EOF.
@@ -860,7 +1253,7 @@ fn spawn_stream_relay(
     chan: u64,
     stream: &'static str,
     writer: SharedWriter,
-) -> std::io::Result<()> {
+) -> std::io::Result<std::thread::JoinHandle<()>> {
     std::thread::Builder::new()
         .name(format!("bridge-proc-{stream}"))
         .spawn(move || {
@@ -882,7 +1275,6 @@ fn spawn_stream_relay(
                 }
             }
         })
-        .map(|_| ())
 }
 
 fn proc_stdin_response(req: &Request, procs: &ProcRegistry) -> Response {
@@ -922,10 +1314,45 @@ fn proc_kill_response(req: &Request, procs: &ProcRegistry) -> Response {
         Ok(p) => p,
         Err(e) => return resp_err(req.id, format!("bad proc.kill params: {e}")),
     };
-    // Drop the ProcState → close stdin → EOF → the child exits; the waiter fires
-    // proc.exit. (A child that ignores stdin EOF is reaped on env teardown.)
-    procs.lock().unwrap().remove(&p.chan);
-    resp_ok(req.id, serde_json::json!({}))
+    let ctl = procs.lock().unwrap().get(&p.chan).map(|s| s.ctl.clone());
+    resp_ok(req.id, kill_channel(ctl))
+}
+
+/// Request termination of one channel's tree: SIGTERM the group, wait a grace
+/// for the reap + `proc.exit`, escalate to SIGKILL, wait again, and report which.
+fn kill_channel(ctl: Option<Arc<ProcCtl>>) -> ProcKillOutcome {
+    let Some(ctl) = ctl else {
+        return ProcKillOutcome::Gone;
+    };
+    // One kill in flight per channel: duplicates queue here and then return the
+    // first kill's outcome instead of re-signalling.
+    let mut gate = ctl.kill_gate.lock().unwrap();
+    if let Some(done) = *gate {
+        return done;
+    }
+    let outcome = kill_channel_inner(&ctl);
+    if outcome != ProcKillOutcome::Timeout {
+        *gate = Some(outcome);
+    }
+    outcome
+}
+
+fn kill_channel_inner(ctl: &ProcCtl) -> ProcKillOutcome {
+    if !ctl.signal(false) {
+        // Already reaped: just wait for the announcement.
+        return match ctl.wait_announced(Instant::now() + KILL_FORCE_WAIT) {
+            Some(code) => ProcKillOutcome::Exited { code },
+            None => ProcKillOutcome::Timeout,
+        };
+    }
+    if let Some(code) = ctl.wait_announced(Instant::now() + KILL_TERM_GRACE) {
+        return ProcKillOutcome::Terminated { code };
+    }
+    ctl.signal(true);
+    match ctl.wait_announced(Instant::now() + KILL_FORCE_WAIT) {
+        Some(code) => ProcKillOutcome::Killed { code },
+        None => ProcKillOutcome::Timeout,
+    }
 }
 
 fn resp_ok(id: u64, v: impl Serialize) -> Response {
@@ -1263,7 +1690,156 @@ mod tests {
             }
         });
         let sock = TcpStream::connect(addr).unwrap();
-        BridgeClient::new(sock.try_clone().unwrap(), sock)
+        BridgeClient::new(sock.try_clone().unwrap(), sock).unwrap()
+    }
+
+    #[cfg(unix)]
+    fn pid_alive(pid: i32) -> bool {
+        // SAFETY: signal 0 only probes existence.
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    /// Read events until the first stdout line parses as a pid.
+    #[cfg(unix)]
+    fn first_pid(rx: &Receiver<ProcEvent>) -> i32 {
+        let mut text = String::new();
+        loop {
+            match rx.recv_timeout(Duration::from_secs(5)).expect("pid line") {
+                ProcEvent::Out { stream, data } if stream == "stdout" => {
+                    text.push_str(&String::from_utf8_lossy(&data));
+                    if let Some(l) = text.lines().next().filter(|_| text.contains('\n')) {
+                        return l.trim().parse().expect("pid");
+                    }
+                }
+                ProcEvent::Out { .. } => {}
+                ProcEvent::Exit { .. } => panic!("exited before pid"),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn proc_kill_terminates_a_child_that_ignores_stdin_eof() {
+        let c = connect();
+        let (chan, rx) = c
+            .spawn_proc(&["sh", "-c", "echo $$; exec sleep 60"], None, &[])
+            .unwrap();
+        let pid = first_pid(&rx);
+        let t = Instant::now();
+        let out = c.proc_kill(chan).unwrap();
+        assert!(matches!(out, ProcKillOutcome::Terminated { .. }), "{out:?}");
+        assert!(t.elapsed() < Duration::from_secs(5));
+        assert!(!pid_alive(pid), "sleep must be dead and reaped");
+        // The terminal event was delivered before the kill ack.
+        let mut saw_exit = false;
+        while let Ok(ev) = rx.try_recv() {
+            saw_exit |= matches!(ev, ProcEvent::Exit { .. });
+        }
+        assert!(saw_exit, "Exit must precede the proc.kill response");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn proc_kill_escalates_to_sigkill_for_a_term_ignoring_tree() {
+        let c = connect();
+        let (chan, rx) = c
+            .spawn_proc(
+                &[
+                    "sh",
+                    "-c",
+                    "trap '' TERM; sleep 60 & echo $$; while :; do sleep 1; done",
+                ],
+                None,
+                &[],
+            )
+            .unwrap();
+        let pid = first_pid(&rx);
+        let out = c.proc_kill(chan).unwrap();
+        assert!(matches!(out, ProcKillOutcome::Killed { .. }), "{out:?}");
+        assert!(!pid_alive(pid));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn natural_exit_reaps_a_pipe_holding_grandchild_and_reports_exit() {
+        let c = connect();
+        // The leader exits at once; the backgrounded sleep inherits the pipes.
+        let (chan, rx) = c
+            .spawn_proc(&["sh", "-c", "sleep 60 & echo $!"], None, &[])
+            .unwrap();
+        let grandchild = first_pid(&rx);
+        let mut exited = false;
+        while let Ok(ev) = rx.recv_timeout(Duration::from_secs(5)) {
+            if matches!(ev, ProcEvent::Exit { .. }) {
+                exited = true;
+                break;
+            }
+        }
+        assert!(exited, "Exit must not wait on the grandchild's pipes");
+        let t = Instant::now();
+        while pid_alive(grandchild) && t.elapsed() < Duration::from_secs(3) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!pid_alive(grandchild), "descendant must be killed");
+        assert_eq!(c.proc_kill(chan).unwrap(), ProcKillOutcome::Gone);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn proc_kill_on_an_unknown_channel_is_gone() {
+        let c = connect();
+        assert_eq!(c.proc_kill(987_654).unwrap(), ProcKillOutcome::Gone);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_live_channel_id_cannot_be_respawned() {
+        let c = connect();
+        let (chan, rx) = c.spawn_proc(&["cat"], None, &[]).unwrap();
+        let params = serde_json::to_value(SpawnParams {
+            chan,
+            argv: vec!["cat".into()],
+            cwd: None,
+            env: vec![],
+        })
+        .unwrap();
+        assert!(c.call("proc.spawn", params).is_err());
+        // The original generation is intact and still killable.
+        assert!(matches!(
+            c.proc_kill(chan).unwrap(),
+            ProcKillOutcome::Terminated { .. }
+        ));
+        drop(rx);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn connection_close_kills_and_reaps_every_process_tree() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (sock, _) = listener.accept().unwrap();
+            serve(sock.try_clone().unwrap(), sock);
+        });
+        let sock = TcpStream::connect(addr).unwrap();
+        let c = BridgeClient::new(sock.try_clone().unwrap(), sock.try_clone().unwrap()).unwrap();
+        let (_chan, rx) = c
+            .spawn_proc(
+                &[
+                    "sh",
+                    "-c",
+                    "trap '' TERM; echo $$; while :; do sleep 1; done",
+                ],
+                None,
+                &[],
+            )
+            .unwrap();
+        let pid = first_pid(&rx);
+        sock.shutdown(std::net::Shutdown::Both).unwrap();
+        let t = Instant::now();
+        server.join().unwrap(); // serve returns only after the bounded teardown
+        assert!(t.elapsed() < Duration::from_secs(6));
+        assert!(!pid_alive(pid), "teardown must kill and reap the tree");
     }
 
     #[test]
@@ -1523,7 +2099,7 @@ mod tests {
             sock // keep the connection open until the client has read both frames
         });
         let sock = TcpStream::connect(addr).unwrap();
-        let c = BridgeClient::new(sock.try_clone().unwrap(), sock);
+        let c = BridgeClient::new(sock.try_clone().unwrap(), sock).unwrap();
         let (tx, rx) = channel();
         c.procs.lock().unwrap().insert(1, tx);
         go_tx.send(()).unwrap();
@@ -1567,7 +2143,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(500));
         });
         let sock = TcpStream::connect(addr).unwrap();
-        let c = BridgeClient::new(sock.try_clone().unwrap(), sock);
+        let c = BridgeClient::new(sock.try_clone().unwrap(), sock).unwrap();
         let (tx, rx) = channel();
         c.procs.lock().unwrap().insert(1, tx);
         go_tx.send(()).unwrap();
@@ -1633,7 +2209,7 @@ mod tests {
             drop(sock);
         });
         let sock = TcpStream::connect(addr).unwrap();
-        let c = BridgeClient::new(sock.try_clone().unwrap(), sock);
+        let c = BridgeClient::new(sock.try_clone().unwrap(), sock).unwrap();
         // Register a proc subscriber directly (no real proc.spawn round-trip; the
         // server here never answers).
         let (tx, rx) = channel();
@@ -1658,7 +2234,7 @@ mod tests {
             drop(sock);
         });
         let sock = TcpStream::connect(addr).unwrap();
-        let c = BridgeClient::new(sock.try_clone().unwrap(), sock);
+        let c = BridgeClient::new(sock.try_clone().unwrap(), sock).unwrap();
         let (tx, rx) = channel::<FsEvent>();
         c.subs.lock().unwrap().insert(3, tx);
         // recv must err (sender dropped by reader_loop close), not time out.
@@ -1734,7 +2310,7 @@ mod tests {
             drop(sock);
         });
         let sock = TcpStream::connect(addr).unwrap();
-        let c = BridgeClient::new(sock.try_clone().unwrap(), sock);
+        let c = BridgeClient::new(sock.try_clone().unwrap(), sock).unwrap();
         let start = Instant::now();
         let r = c.exec(&["echo", "hi"], None, &[]);
         assert!(r.is_err(), "closed transport ⇒ the call errors");
@@ -1743,5 +2319,115 @@ mod tests {
             "call woke fast, not at the 120s deadline: {:?}",
             start.elapsed()
         );
+    }
+
+    // ---- THE-313: fallible construction + bounded close/drop ----
+
+    #[test]
+    fn construction_reports_reader_thread_failure_and_reaps_child() {
+        fn failing(_f: Box<dyn FnOnce() + Send>) -> std::io::Result<std::thread::JoinHandle<()>> {
+            Err(std::io::Error::other("no threads"))
+        }
+        let (r, w) = (std::io::empty(), std::io::sink());
+        let err = BridgeClient::build(r, w, None, failing).err().unwrap();
+        assert!(matches!(err, BridgeError::ReaderThread(_)), "{err}");
+        // With an owned child it must be killed + reaped, not leaked.
+        let child = Command::new("sleep").arg("60").spawn().unwrap();
+        let pid = child.id();
+        let err = BridgeClient::build(std::io::empty(), std::io::sink(), Some(child), failing)
+            .err()
+            .unwrap();
+        assert!(matches!(err, BridgeError::ReaderThread(_)));
+        assert!(
+            !Path::new(&format!("/proc/{pid}")).exists(),
+            "child must be reaped on construction failure"
+        );
+    }
+
+    #[test]
+    fn spawn_failure_is_typed() {
+        let err = BridgeClient::spawn_typed(Command::new("/nonexistent/thegn-bridge-xyz"))
+            .err()
+            .unwrap();
+        assert!(matches!(err, BridgeError::Spawn(_)));
+    }
+
+    #[test]
+    fn close_is_bounded_idempotent_and_reaps_child_and_reader() {
+        // `sleep` ignores stdin; the reader ends once the kill closes stdout.
+        let mut cmd = Command::new("sleep");
+        cmd.arg("60");
+        let c = BridgeClient::spawn_typed(cmd).unwrap();
+        let t = Instant::now();
+        let r = c.close(Duration::from_secs(5));
+        assert!(t.elapsed() < Duration::from_secs(5));
+        assert_eq!(
+            r,
+            CloseReport {
+                reader_finished: true,
+                child_reaped: true
+            }
+        );
+        let t = Instant::now();
+        let r2 = c.close(Duration::from_secs(5));
+        assert!(r2.reader_finished && r2.child_reaped);
+        assert!(
+            t.elapsed() < Duration::from_millis(500),
+            "repeat close is immediate"
+        );
+        assert!(
+            c.exec(&["true"], None, &[]).is_err(),
+            "calls fail after close"
+        );
+    }
+
+    #[test]
+    fn close_with_blocked_reader_returns_at_deadline() {
+        // A reader that never yields data nor EOF: close must not hang.
+        struct Stuck(std::sync::mpsc::Receiver<()>);
+        impl Read for Stuck {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                let _ = self.0.recv(); // best-effort: blocks until the test drops tx
+                Ok(0)
+            }
+        }
+        let (tx, rx) = channel();
+        let c = BridgeClient::new(Stuck(rx), std::io::sink()).unwrap();
+        let t = Instant::now();
+        let r = c.close(Duration::from_millis(100));
+        assert!(t.elapsed() < Duration::from_secs(2));
+        assert!(!r.reader_finished);
+        drop(tx); // unblock the reader; a later close observes completion
+        let r = c.close(Duration::from_secs(2));
+        assert!(r.reader_finished);
+    }
+
+    #[test]
+    fn pending_calls_fail_on_close_and_drop_does_not_block() {
+        struct Stuck(std::sync::mpsc::Receiver<()>);
+        impl Read for Stuck {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                let _ = self.0.recv(); // best-effort: blocks until the test drops tx
+                Ok(0)
+            }
+        }
+        let (tx, rx) = channel::<()>();
+        let c = Arc::new(BridgeClient::new(Stuck(rx), std::io::sink()).unwrap());
+        let c2 = c.clone();
+        let waiter = std::thread::spawn(move || c2.exec(&["true"], None, &[]));
+        std::thread::sleep(Duration::from_millis(100));
+        let t = Instant::now();
+        c.close(Duration::from_millis(100));
+        let res = waiter.join().unwrap();
+        assert!(res.is_err());
+        assert!(
+            t.elapsed() < Duration::from_secs(5),
+            "waiter woken by close, not RPC timeout"
+        );
+        // Drop with a stuck reader must return promptly.
+        let t = Instant::now();
+        drop(c);
+        assert!(t.elapsed() < Duration::from_millis(500));
+        drop(tx);
     }
 }

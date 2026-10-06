@@ -31,37 +31,87 @@ pub(crate) fn cwd_of(pid: u32) -> Option<PathBuf> {
     std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
 }
 
-/// The most-recently-started direct child of `pid` (a shell's foreground job),
-/// if any. Ties break to the highest pid (newest).
+/// The direct child of `pid` that belongs to the terminal's FOREGROUND process
+/// group, if any (a shell's foreground job).
 ///
-/// Fast path: `/proc/<pid>/task/<pid>/children` — one O(children) file read
-/// (CONFIG_PROC_CHILDREN, on everywhere that matters since Linux 3.5). The
-/// full `/proc/*/stat` walk below remains as the fallback: it is
-/// O(all processes on the box) — with 10 panes and 400 processes that was
-/// ~4,000 file reads per session persist, which used to land ON the event
-/// loop at workspace-switch time.
+/// The foreground group is asked of the terminal, not guessed from pid order:
+/// `tpgid` (field 8 of `/proc/<pid>/stat`) is `tcgetpgrp` of `pid`'s
+/// controlling tty. Background jobs, `&` helpers and daemons live in other
+/// process groups and are never returned; an idle prompt (the shell itself is
+/// the foreground group) has no such child and yields `None`. Fails closed:
+/// no controlling tty or an unreadable stat is `None`, never a guess.
+///
+/// Cost: one stat read for `pid`, the O(children) children-file read, and one
+/// stat read per child — the same order as the pid-order heuristic it replaced.
 #[cfg(target_os = "linux")]
-pub(crate) fn newest_child(pid: u32) -> Option<u32> {
-    if let Some(kids) = children_of(pid) {
-        return kids.into_iter().filter(|&c| c != pid).max();
-    }
-    newest_child_scan(pid)
+pub(crate) fn foreground_child(pid: u32) -> Option<u32> {
+    let (_, tpgid) = stat_pgrps(pid)?;
+    let kids = children_of(pid).unwrap_or_else(|| children_scan(pid));
+    let with_pgrp: Vec<(u32, u32)> = kids
+        .into_iter()
+        .filter(|&c| c != pid)
+        .filter_map(|c| Some((c, stat_pgrps(c)?.0)))
+        .collect();
+    select_foreground(tpgid, &with_pgrp)
 }
 
-/// The fallback `/proc/*/stat` walk (the original implementation): O(all
-/// processes on the box). Kept for kernels without CONFIG_PROC_CHILDREN.
+/// The fallback `/proc/*/stat` walk: every direct child of `pid`. O(all
+/// processes on the box); kept for kernels without CONFIG_PROC_CHILDREN.
 #[cfg(target_os = "linux")]
-fn newest_child_scan(pid: u32) -> Option<u32> {
-    let mut best: Option<u32> = None;
-    for ent in std::fs::read_dir("/proc").ok()?.flatten() {
+fn children_scan(pid: u32) -> Vec<u32> {
+    let mut out = Vec::new();
+    let Ok(rd) = std::fs::read_dir("/proc") else {
+        return out;
+    };
+    for ent in rd.flatten() {
         let Some(child) = ent.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else {
             continue;
         };
         if child != pid && stat_ppid(child) == Some(pid) {
-            best = Some(best.map_or(child, |b| b.max(child)));
+            out.push(child);
         }
     }
-    best
+    out
+}
+
+/// `(pgrp, tpgid)` from `/proc/<pid>/stat`.
+#[cfg(target_os = "linux")]
+fn stat_pgrps(pid: u32) -> Option<(u32, i64)> {
+    parse_stat_pgrps(&std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
+}
+
+/// Parse `(pgrp, tpgid)` out of a `/proc/<pid>/stat` line. Fields after the
+/// final `)` (comm may contain anything): state ppid pgrp session tty_nr tpgid.
+#[cfg(any(target_os = "linux", test))]
+fn parse_stat_pgrps(stat: &str) -> Option<(u32, i64)> {
+    let rest = &stat[stat.rfind(')')? + 1..];
+    let mut it = rest.split_whitespace();
+    let pgrp = it.nth(2)?.parse().ok()?;
+    let tpgid = it.nth(2)?.parse().ok()?;
+    Some((pgrp, tpgid))
+}
+
+/// The foreground-selection rule, pure so every platform shares it. `kids` are
+/// `(pid, pgrp)` of a process's direct children; `tpgid` is the terminal's
+/// foreground group. Only children IN that group qualify. Within it the group
+/// leader (`pid == tpgid`, a pipeline's first stage) wins, else the lowest pid
+/// (oldest member) so the answer is deterministic. `tpgid <= 0` (no controlling
+/// terminal) selects nothing.
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+fn select_foreground(tpgid: i64, kids: &[(u32, u32)]) -> Option<u32> {
+    if tpgid <= 0 {
+        return None;
+    }
+    let mut group = kids.iter().filter(|&&(_, g)| i64::from(g) == tpgid);
+    let first = group.next()?;
+    let mut best = first.0;
+    for &(pid, _) in std::iter::once(first).chain(group) {
+        if i64::from(pid) == tpgid {
+            return Some(pid);
+        }
+        best = best.min(pid);
+    }
+    Some(best)
 }
 
 /// Direct children of `pid` from `/proc/<pid>/task/<tid>/children` — a
@@ -160,15 +210,40 @@ pub(crate) fn cwd_of(pid: u32) -> Option<PathBuf> {
     Some(PathBuf::from(std::ffi::OsStr::from_bytes(&raw[..end])))
 }
 
-/// The most-recently-started direct child of `pid`, via `proc_listchildpids`.
-///
-/// Selection matches the Linux arm exactly — highest pid wins — so the two
-/// platforms pick the same job in the same situations. (macOS could sort on
-/// `proc_bsdinfo::pbi_start_tvsec` instead, which would be strictly more correct
-/// across pid wraparound, but a gratuitous behaviour split between platforms is
-/// worse than a rare mis-pick that both platforms share.)
+/// The direct child of `pid` in the terminal's foreground process group, via
+/// `proc_pidinfo(PROC_PIDTBSDINFO)` (`e_tpgid` of `pid`, `pbi_pgid` per child)
+/// and `proc_listchildpids`. Same selection rule as the Linux arm.
 #[cfg(target_os = "macos")]
-pub(crate) fn newest_child(pid: u32) -> Option<u32> {
+pub(crate) fn foreground_child(pid: u32) -> Option<u32> {
+    let tpgid = i64::from(bsd_pgrps(pid)?.1);
+    let with_pgrp: Vec<(u32, u32)> = child_pids(pid)?
+        .into_iter()
+        .filter_map(|c| Some((c, bsd_pgrps(c)?.0)))
+        .collect();
+    select_foreground(tpgid, &with_pgrp)
+}
+
+/// `(pgrp, tpgid)` for `pid` from `proc_bsdinfo`.
+#[cfg(target_os = "macos")]
+fn bsd_pgrps(pid: u32) -> Option<(u32, u32)> {
+    // SAFETY: zeroed POD out-param; the kernel is told its exact size.
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let want = size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    let got = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            std::ptr::from_mut(&mut info).cast(),
+            want,
+        )
+    };
+    (got == want).then_some((info.pbi_pgid, info.e_tpgid))
+}
+
+/// Direct children of `pid`, via `proc_listchildpids`.
+#[cfg(target_os = "macos")]
+fn child_pids(pid: u32) -> Option<Vec<u32>> {
     // Ask for the size first, then read. The count can change between the two
     // calls, so the buffer gets headroom and a short read is fine.
     // SAFETY: a null buffer with size 0 is the documented "how big?" query.
@@ -199,11 +274,13 @@ pub(crate) fn newest_child(pid: u32) -> Option<u32> {
     // reported "no foreground job" and the relaunch hint never captured
     // anything on macOS. Verified against the real syscall: 3 children ⇒ 3.
     let got = (n as usize).min(cap);
-    pids[..got]
-        .iter()
-        .filter(|&&c| c > 0 && c as u32 != pid)
-        .map(|&c| c as u32)
-        .max()
+    Some(
+        pids[..got]
+            .iter()
+            .filter(|&&c| c > 0 && c as u32 != pid)
+            .map(|&c| c as u32)
+            .collect(),
+    )
 }
 
 /// The process's argv, via `sysctl(KERN_PROCARGS2)` — the
@@ -301,7 +378,7 @@ pub(crate) fn cwd_of(_pid: u32) -> Option<PathBuf> {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-pub(crate) fn newest_child(_pid: u32) -> Option<u32> {
+pub(crate) fn foreground_child(_pid: u32) -> Option<u32> {
     None
 }
 
@@ -426,12 +503,17 @@ mod tests {
             kids.contains(&child.0.id()),
             "children file lists the spawned child"
         );
-        assert_eq!(
-            newest_child_scan(me),
-            newest_child(me),
-            "fast path and stat-walk fallback pick the same child"
+        let mut fast = kids;
+        let mut walk = children_scan(me);
+        fast.sort_unstable();
+        walk.sort_unstable();
+        // The walk may see children other tests spawned meanwhile; the fast
+        // path must agree on ours.
+        assert!(
+            walk.contains(&child.0.id()),
+            "stat-walk fallback lists the spawned child"
         );
-        assert_eq!(newest_child(me), Some(child.0.id()));
+        assert!(fast.contains(&child.0.id()));
     }
 
     /// The syscall seam answers for a CHILD, not just for self.
@@ -440,7 +522,7 @@ mod tests {
     /// compositor, so pane restore (its cwd) and the relaunch hint (its argv)
     /// both read another process. `cwd_of`/`cmdline` were only ever tested
     /// against self — the one pid every OS lets you introspect — and
-    /// `newest_child` was tested under `cfg(target_os = "linux")` only, leaving
+    /// `foreground_child` was tested under `cfg(target_os = "linux")` only, leaving
     /// the macOS libproc arm with no coverage at all.
     ///
     /// One test for both arms, so `/proc` and libproc are held to the same
@@ -473,7 +555,6 @@ mod tests {
 
         let got_cwd = cwd_of(pid).and_then(|p| std::fs::canonicalize(p).ok());
         let got_argv = cmdline(pid);
-        let newest = newest_child(std::process::id());
 
         drop(child); // kills + reaps
         let _ = std::fs::remove_dir_all(&dir); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
@@ -488,21 +569,6 @@ mod tests {
         assert!(
             argv.first().is_some_and(|a| a.contains("sleep")),
             "argv[0] should name the running program, got {argv:?}"
-        );
-        // `Some(_)`, not `Some(pid)`: `newest_child` answers for the whole
-        // process, and on macOS `proc_listchildpids` returns EVERY child of the
-        // test binary — including ones other tests spawned concurrently, which
-        // can out-pid ours. (The Linux arm reads `/proc/<pid>/task/<tid>/children`,
-        // which is per-thread, so it never saw this race — a real platform
-        // difference, in the very function under test.) The regression this
-        // guards is `newest_child` finding NOTHING (the count-vs-bytes bug that
-        // made the relaunch hint capture nothing on macOS); the exact
-        // highest-pid tie-break is pinned by
-        // `newest_child_picks_the_highest_pid_of_several`, which owns every
-        // child in its scope.
-        assert!(
-            newest.is_some(),
-            "newest_child must see the freshly spawned child (the foreground-pane probe)"
         );
     }
 
@@ -536,7 +602,7 @@ mod tests {
 
         assert_eq!(cwd_of(dead), None, "cwd_of(dead pid)");
         assert_eq!(cmdline(dead), None, "cmdline(dead pid)");
-        assert_eq!(newest_child(dead), None, "newest_child(dead pid)");
+        assert_eq!(foreground_child(dead), None, "foreground_child(dead pid)");
     }
 
     /// A live process with no children reports no foreground job.
@@ -547,7 +613,7 @@ mod tests {
     /// completely broken implementation.
     #[test]
     #[cfg(unix)]
-    fn a_childless_process_has_no_newest_child() {
+    fn a_childless_process_has_no_foreground_child() {
         let child = KillOnDrop(
             std::process::Command::new("sleep")
                 .arg("30")
@@ -556,50 +622,120 @@ mod tests {
                 .expect("spawn fixture child"),
         );
         std::thread::sleep(std::time::Duration::from_millis(150));
-        let got = newest_child(child.0.id());
+        let got = foreground_child(child.0.id());
         drop(child); // kills + reaps
         assert_eq!(got, None, "`sleep` spawns nothing, so it has no children");
     }
 
-    /// With several children, the newest (highest pid) wins — the documented
-    /// tie-break, and the same rule on both platform arms.
-    ///
-    /// Exercises the multi-entry path through the caller-owned buffer, which the
-    /// single-child test cannot: the count-vs-bytes bug only surfaced its
-    /// truncation once more than one pid came back.
+    /// The selection rule is terminal-semantic, never pid order: only a child in
+    /// the foreground group qualifies, the group leader wins, else the oldest
+    /// member; no controlling terminal selects nothing.
     #[test]
-    #[cfg(unix)]
-    fn newest_child_picks_the_highest_pid_of_several() {
-        // The three children hang off an intermediate `sh` rather than off the
-        // test binary itself. Asking about our OWN pid is unsound here: on macOS
-        // `proc_listchildpids` reports every child of the process, so a `sleep`
-        // spawned by any concurrently-running test lands in the answer and can
-        // out-pid all three fixtures. (Linux's per-thread `children` file hid
-        // that, so the test was Linux-green and macOS-flaky.) Owning the parent
-        // makes the set exactly ours — and matches the real call, which asks for
-        // the newest child of a *pane's shell*, never of the compositor.
-        let sh = KillOnDrop(
-            std::process::Command::new("sh")
-                .arg("-c")
-                .arg("sleep 30 & sleep 30 & sleep 30 & wait")
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-                .expect("spawn fixture parent"),
+    fn select_foreground_uses_the_group_not_pid_order() {
+        // fg group 100 (a pipeline: leader 100, member 105), newer bg job 200.
+        let kids = [(100, 100), (105, 100), (200, 200), (300, 300)];
+        assert_eq!(select_foreground(100, &kids), Some(100));
+        // Leader gone: lowest member, not highest.
+        assert_eq!(
+            select_foreground(100, &[(107, 100), (105, 100), (300, 300)]),
+            Some(105)
         );
-        std::thread::sleep(std::time::Duration::from_millis(300));
+        // A newer background job is never chosen over an older foreground one.
+        assert_eq!(select_foreground(50, &[(50, 50), (900, 900)]), Some(50));
+        // Idle prompt: the shell itself is foreground, no child is in the group.
+        assert_eq!(select_foreground(10, &[(200, 200), (300, 300)]), None);
+        // No controlling terminal / unknown.
+        assert_eq!(select_foreground(-1, &[(200, 200)]), None);
+        assert_eq!(select_foreground(0, &[(200, 0)]), None);
+        assert_eq!(select_foreground(5, &[]), None);
+    }
 
-        let got = newest_child(sh.0.id());
+    #[test]
+    fn stat_pgrps_parse_survives_hostile_comm() {
+        let line = "42 ((a) b c) S 1 77 77 34816 77 4194304 0 0";
+        assert_eq!(parse_stat_pgrps(line), Some((77, 77)));
+        assert_eq!(parse_stat_pgrps("1 (x) S 1 5 5 0 -1 0"), Some((5, -1)));
+        assert_eq!(parse_stat_pgrps("garbage"), None);
+        assert_eq!(parse_stat_pgrps("1 (x) S 1 5"), None);
+    }
+
+    /// Real PTY: a bash with job control runs an OLD foreground job beside
+    /// NEWER background jobs. The probe must return the foreground one — the
+    /// highest-pid heuristic returns a background `sleep`.
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test-only probe for a bash binary; not on any runtime path"
+    )]
+    fn foreground_child_ignores_newer_background_jobs_on_a_real_pty() {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        use std::os::unix::process::CommandExt;
+        if std::process::Command::new("bash")
+            .arg("-c")
+            .arg("true")
+            .status()
+            .is_err()
+        {
+            return; // no bash in this environment
+        }
+        let (mut m, mut sl) = (0, 0);
+        // SAFETY: out-params are valid; null name/termios/winsize are allowed.
+        let rc = unsafe {
+            libc::openpty(
+                &mut m,
+                &mut sl,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        };
+        assert_eq!(rc, 0, "openpty");
+        // SAFETY: fresh fds we own.
+        let (master, slave) = unsafe { (OwnedFd::from_raw_fd(m), OwnedFd::from_raw_fd(sl)) };
+        let mk = || slave.try_clone().expect("dup slave");
+        let mut cmd = std::process::Command::new("bash");
+        // fg job is STARTED first (lowest pid) then foregrounded; two newer
+        // background jobs follow it.
+        cmd.arg("-c")
+            .arg("set -m; sleep 41 & sleep 42 & sleep 43 & fg %1")
+            .stdin(mk())
+            .stdout(mk())
+            .stderr(mk());
+        // SAFETY: only async-signal-safe libc calls between fork and exec.
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::ioctl(0, libc::TIOCSCTTY, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let sh = KillOnDrop(cmd.spawn().expect("spawn bash on a pty"));
         let sh_pid = sh.0.id();
+        let _keep = (master.as_raw_fd(), &slave);
 
-        drop(sh); // kills + reaps
-
-        // The pids are the shell's to hand out, so assert the SHAPE rather than
-        // a value we can't know: a child was found, and it is not the shell.
-        // Finding nothing is the count-vs-bytes regression; the multi-entry path
-        // (three children, not one) is what this test uniquely exercises.
-        let got = got.expect("all three children must be visible through the buffer");
-        assert_ne!(got, sh_pid, "a child, not the parent");
+        // Wait (bounded) for all three jobs to exist.
+        let mut got = None;
+        for _ in 0..50 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            if children_of(sh_pid).is_some_and(|k| k.len() >= 3) {
+                got = foreground_child(sh_pid);
+                if got.is_some() {
+                    break;
+                }
+            }
+        }
+        let kids = children_of(sh_pid).unwrap_or_default();
+        let oldest = kids.iter().copied().min();
+        let newest = kids.iter().copied().max();
+        drop(sh); // kills + reaps the shell
+        let got = got.expect("a foreground child must be found");
+        assert_eq!(Some(got), oldest, "the foreground job, not pid order");
+        assert_ne!(Some(got), newest, "never the newest background job");
     }
 
     #[test]

@@ -68,6 +68,7 @@ fn roster(rows: Vec<AgentDispatch>) -> DispatchRoster {
     DispatchRoster {
         rows,
         stage_order: stages().iter().map(|s| s.name.clone()).collect(),
+        stale: None,
     }
 }
 
@@ -386,4 +387,19 @@ fn a_stacked_click_resolves_the_row_on_the_line_and_its_column() {
     // …and a second click on the selected row activates it.
     assert_eq!(b.handle_click(inner.x + 1, y), BoardOutcome::Action);
     assert!(matches!(b.take_action(), Some(BoardAction::Jump(_))));
+}
+
+#[test]
+fn a_stale_roster_keeps_its_rows_and_says_how_old_they_are() {
+    let (mut b, h) = open_board();
+    assert!(!render_text(&b, 140, 40).contains("stale"));
+    let mut r = full_roster();
+    r.stale = Some(crate::monitor_pipeline::RosterStale {
+        last_good_ms: Some(NOW_MS - 12_000),
+        error: "database is locked".into(),
+    });
+    assert!(b.refresh(&r, &stages(), &ctx_at(&h, Rect::full(140, 40))));
+    let t = render_text(&b, 140, 40);
+    assert!(t.contains("stale 12s"), "{t}");
+    assert!(t.contains("architect"), "rows survive a failed sample");
 }

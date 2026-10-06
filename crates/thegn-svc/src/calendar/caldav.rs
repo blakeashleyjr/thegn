@@ -69,7 +69,11 @@ impl CalDavBackend {
             calendar_ids: a
                 .calendar_ids
                 .iter()
-                .map(|id| id.trim().trim_matches('/').to_string())
+                .map(|id| {
+                    percent_decode(id.trim().trim_matches('/'))
+                        .trim_matches('/')
+                        .to_string()
+                })
                 .filter(|id| !id.is_empty())
                 .collect(),
             timeout: Duration::from_secs(a.timeout_secs.clamp(5, 120)),
@@ -359,7 +363,75 @@ fn page_from_multistatus(
         meter.release_transient(copy);
         parsed.map_err(CalendarError::from)
     })?;
+    let token = scope_token(calendar_ids, &token);
     EventPage::from_meter(meter, events, deleted, token)
+}
+
+const SCOPE_PREFIX: &str = "tgf1:";
+
+/// A stable (FNV-1a) digest of the effective collection filter, independent of
+/// order and duplicates. `DefaultHasher` is not stable across releases, and the
+/// digest is persisted inside the cursor.
+fn filter_digest(ids: &[String]) -> u64 {
+    let mut sorted: Vec<&str> = ids.iter().map(String::as_str).collect();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for id in sorted {
+        for b in id.bytes().chain(std::iter::once(0)) {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+    h
+}
+
+/// Bind a server sync token to the filter it was collected under. An empty
+/// token stays empty (it means "no cursor").
+pub(crate) fn scope_token(ids: &[String], token: &str) -> String {
+    if token.is_empty() {
+        return String::new();
+    }
+    format!("{SCOPE_PREFIX}{:016x}:{token}", filter_digest(ids))
+}
+
+/// The server token inside a stored cursor, or empty (forcing a full fetch)
+/// when the cursor was minted under a different filter or predates scoping.
+fn unscope_token<'a>(ids: &[String], stored: &'a str) -> &'a str {
+    let Some(rest) = stored.strip_prefix(SCOPE_PREFIX) else {
+        return "";
+    };
+    match rest.split_once(':') {
+        Some((digest, token)) if digest == format!("{:016x}", filter_digest(ids)) => token,
+        _ => "",
+    }
+}
+
+/// Decode `%XX` escapes (lossy on invalid UTF-8); malformed escapes pass
+/// through literally.
+fn percent_decode(s: &str) -> Cow<'_, str> {
+    if !s.contains('%') {
+        return Cow::Borrowed(s);
+    }
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%'
+            && i + 2 < b.len()
+            && let (Some(h), Some(l)) = (
+                (b[i + 1] as char).to_digit(16),
+                (b[i + 2] as char).to_digit(16),
+            )
+        {
+            out.push((h * 16 + l) as u8);
+            i += 3;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    Cow::Owned(String::from_utf8_lossy(&out).into_owned())
 }
 
 fn first_element<'a>(xml: &'a str, name: &str) -> Option<&'a str> {
@@ -456,6 +528,9 @@ impl CalDavBackend {
             let mut meter = self.admission.meter();
             meter.reserve_transient(MAX_BODY_BYTES)?;
 
+            // A cursor minted under a different `calendar_ids` filter must not
+            // resume: the server's delta would omit collections newly selected.
+            let sync_token = unscope_token(&self.calendar_ids, sync_token);
             let incremental = !sync_token.is_empty();
             let body = if incremental {
                 sync_collection_body(sync_token)?
@@ -641,6 +716,8 @@ pub(crate) fn href_in_collections(href: &str, ids: &[String]) -> bool {
         None => href,
     };
     let path = path.split(['?', '#']).next().unwrap_or(path);
+    // Compare decoded: servers percent-encode hrefs while users type plain ids.
+    let path = percent_decode(path);
     let Some((parent, _)) = path.trim_end_matches('/').rsplit_once('/') else {
         return false;
     };
@@ -649,9 +726,11 @@ pub(crate) fn href_in_collections(href: &str, ids: &[String]) -> bool {
         return false;
     }
     ids.iter().any(|id| {
+        let id = percent_decode(id);
+        let id = id.as_ref();
         parent == id
             || parent
-                .strip_suffix(id.as_str())
+                .strip_suffix(id)
                 .is_some_and(|rest| rest.ends_with('/'))
     })
 }
@@ -755,5 +834,50 @@ mod tests {
         ));
         assert!(!href_in_collections("e.ics", &ids(&["work"])));
         assert!(!href_in_collections("/e.ics", &ids(&["work"])));
+    }
+
+    #[test]
+    fn cursor_is_bound_to_the_calendar_filter() {
+        let ids = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let work = ids(&["work"]);
+        let stored = scope_token(&work, "srv-1");
+        assert_eq!(unscope_token(&work, &stored), "srv-1");
+        // Order and duplicates do not matter.
+        assert_eq!(
+            unscope_token(&ids(&["b", "a"]), &scope_token(&ids(&["a", "b", "a"]), "t")),
+            "t"
+        );
+        // A changed filter, an unscoped legacy token, and garbage all force a
+        // full fetch.
+        assert_eq!(unscope_token(&ids(&["work", "personal"]), &stored), "");
+        assert_eq!(unscope_token(&[], &stored), "");
+        assert_eq!(unscope_token(&work, "srv-1"), "");
+        assert_eq!(unscope_token(&work, "tgf1:zz"), "");
+        assert_eq!(scope_token(&work, ""), "");
+    }
+
+    #[test]
+    fn page_token_carries_the_filter_scope() {
+        let ids = vec!["work".to_string()];
+        let meter = AccountAdmission::isolated(Default::default()).meter();
+        let p = page_from_multistatus(&multistatus(), "UTC", &ids, meter).unwrap();
+        assert_eq!(unscope_token(&ids, p.sync_token()), "t1");
+        assert_eq!(unscope_token(&["personal".to_string()], p.sync_token()), "");
+    }
+
+    #[test]
+    fn collection_matching_compares_percent_decoded() {
+        let ids = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(href_in_collections(
+            "/dav/My%20Cal/e.ics",
+            &ids(&["My Cal"])
+        ));
+        assert!(href_in_collections(
+            "/dav/My Cal/e.ics",
+            &ids(&["My%20Cal"])
+        ));
+        assert!(!href_in_collections("/dav/My%20Cal/e.ics", &ids(&["My"])));
+        assert_eq!(percent_decode("100%"), "100%");
+        assert_eq!(percent_decode("%zz%4"), "%zz%4");
     }
 }

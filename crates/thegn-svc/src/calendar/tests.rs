@@ -708,7 +708,11 @@ async fn caldav_redirect_never_replays_a_sync_token_body_for_any_status() {
             adm(),
         );
         let error = backend
-            .list_events(window().0, window().1, "sync-secret")
+            .list_events(
+                window().0,
+                window().1,
+                &caldav::scope_token(&[], "sync-secret"),
+            )
             .await
             .unwrap_err();
         assert!(matches!(
@@ -938,10 +942,14 @@ async fn caldav_token_recovery_is_one_bounded_retry_with_shared_deadline() {
             adm(),
         );
         let page = backend
-            .list_events(window().0, window().1, "expired-token")
+            .list_events(
+                window().0,
+                window().1,
+                &caldav::scope_token(&[], "expired-token"),
+            )
             .await
             .unwrap();
-        assert_eq!(page.sync_token(), "new-token");
+        assert_eq!(page.sync_token(), caldav::scope_token(&[], "new-token"));
         assert_eq!(requests.load(Ordering::SeqCst), 2);
         {
             let bodies = bodies.lock().unwrap();
@@ -993,7 +1001,11 @@ async fn caldav_token_recovery_is_one_bounded_retry_with_shared_deadline() {
         )
         .with_timeout_for_test(std::time::Duration::from_millis(250));
         let error = backend
-            .list_events(window().0, window().1, "expired-token")
+            .list_events(
+                window().0,
+                window().1,
+                &caldav::scope_token(&[], "expired-token"),
+            )
             .await
             .unwrap_err();
         assert!(matches!(error, CalendarError::Timeout(_)), "got {error:?}");
@@ -1210,7 +1222,11 @@ async fn declared_oversized_error_body_is_refused_without_waiting_for_payload() 
                     }
                     _ => {
                         caldav::CalDavBackend::new(&cfg, adm())
-                            .list_events(window().0, window().1, "prior-token")
+                            .list_events(
+                                window().0,
+                                window().1,
+                                &caldav::scope_token(&[], "prior-token"),
+                            )
                             .await
                     }
                 }
@@ -1607,9 +1623,14 @@ async fn media_encoding_and_shared_pool_policies_apply_to_real_backends() {
         },
         adm(),
     );
-    dav.list_events(window().0, window().1, "dav-sync-secret")
-        .await
-        .unwrap();
+    // A stored cursor is scope-bound (THE-738); a raw token reads as stale.
+    dav.list_events(
+        window().0,
+        window().1,
+        &caldav::scope_token(&[], "dav-sync-secret"),
+    )
+    .await
+    .unwrap();
 
     for path in [
         "/feed",
@@ -2490,7 +2511,7 @@ async fn caldav_events_and_deletions_share_the_budget() {
     };
     let (from, to) = window();
     let err = caldav::CalDavBackend::new(&acct, budget_of(4))
-        .list_events(from, to, "tok-prev")
+        .list_events(from, to, &caldav::scope_token(&[], "tok-prev"))
         .await
         .unwrap_err();
     assert!(
@@ -2498,12 +2519,12 @@ async fn caldav_events_and_deletions_share_the_budget() {
         "{err:?}"
     );
     let page = caldav::CalDavBackend::new(&acct, budget_of(5))
-        .list_events(from, to, "tok-prev")
+        .list_events(from, to, &caldav::scope_token(&[], "tok-prev"))
         .await
         .unwrap();
     assert_eq!(page.events().len(), 2);
     assert_eq!(page.deleted().len(), 3);
-    assert_eq!(page.sync_token(), "tok-next");
+    assert_eq!(page.sync_token(), caldav::scope_token(&[], "tok-next"));
     server.abort();
 }
 
@@ -2523,7 +2544,7 @@ async fn caldav_many_deletions_are_refused_at_the_cap() {
     };
     let (from, to) = window();
     let err = caldav::CalDavBackend::new(&acct, budget_of(100))
-        .list_events(from, to, "tok-prev")
+        .list_events(from, to, &caldav::scope_token(&[], "tok-prev"))
         .await
         .unwrap_err();
     assert!(
@@ -2714,7 +2735,10 @@ async fn an_over_budget_caldav_delta_falls_back_to_a_full_fetch() {
         AccountAdmission::new(AdmissionBudget::new(10).unwrap(), pool.clone()),
     );
     let (from, to) = window();
-    let page = backend.list_events(from, to, "tok-prev").await.unwrap();
+    let page = backend
+        .list_events(from, to, &caldav::scope_token(&[], "tok-prev"))
+        .await
+        .unwrap();
     assert_eq!(
         hits.load(Ordering::SeqCst),
         2,
@@ -2770,7 +2794,10 @@ async fn caldav_token_recovery_releases_every_reservation() {
         AccountAdmission::new(AdmissionBudget::default(), pool.clone()),
     );
     let (from, to) = window();
-    let page = backend.list_events(from, to, "expired").await.unwrap();
+    let page = backend
+        .list_events(from, to, &caldav::scope_token(&[], "expired"))
+        .await
+        .unwrap();
     assert_eq!(page.events().len(), 3);
     assert_eq!(pool.in_use(), page.reserved());
     drop(page);

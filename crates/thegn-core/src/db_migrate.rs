@@ -1091,6 +1091,29 @@ pub(crate) fn verify_v71_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// v72: `agent_dispatches.native_session_id`, the harness-native conversation id
+/// of the row's CURRENT run (claude's `--session-id`). Written only by a CAS on
+/// `(id, session_id, run_gen)` and cleared in every UPDATE that bumps
+/// `run_gen`, so a stale run can never leave or write an id a retry would
+/// resume. Additive and idempotent: existing rows read NULL (cold restart).
+pub(crate) fn migrate_v72(conn: &Connection) -> Result<()> {
+    if !has_column(conn, "agent_dispatches", "native_session_id") {
+        conn.execute(
+            "ALTER TABLE agent_dispatches ADD COLUMN native_session_id TEXT",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+/// Verify the v72 column before the version stamp.
+pub(crate) fn verify_v72_schema(conn: &Connection) -> Result<()> {
+    if !has_column(conn, "agent_dispatches", "native_session_id") {
+        bail!("schema v72 migration did not add agent_dispatches.native_session_id");
+    }
+    Ok(())
+}
+
 /// Verify the v69 identity ledger before the schema version is stamped. A
 /// missing column/table must never look like a completed migration.
 pub(crate) fn verify_v69_schema(conn: &Connection) -> Result<()> {
@@ -1567,6 +1590,35 @@ mod tests {
         assert_eq!(status, "running");
         assert_eq!(run_gen, 0);
         assert_eq!(exited, None, "no exit fact is manufactured");
+    }
+
+    #[test]
+    fn v72_adds_native_session_id_idempotently_and_preserves_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE agent_dispatches (
+                 id INTEGER PRIMARY KEY, issue_id TEXT NOT NULL, status TEXT NOT NULL,
+                 session_id TEXT, run_gen INTEGER NOT NULL DEFAULT 0);
+             INSERT INTO agent_dispatches (issue_id, status, session_id, run_gen)
+                 VALUES ('linear:H-1', 'running', 'sess-h', 3);",
+        )
+        .unwrap();
+        assert!(super::verify_v72_schema(&conn).is_err());
+        super::migrate_v72(&conn).unwrap();
+        super::migrate_v72(&conn).unwrap();
+        super::verify_v72_schema(&conn).unwrap();
+        let (status, sid, gen_, native): (String, String, i64, Option<String>) = conn
+            .query_row(
+                "SELECT status, session_id, run_gen, native_session_id FROM agent_dispatches",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (status.as_str(), sid.as_str(), gen_),
+            ("running", "sess-h", 3)
+        );
+        assert_eq!(native, None, "no native id is manufactured");
     }
 
     #[test]

@@ -89,7 +89,7 @@ impl Db {
             return Ok(false);
         }
         let changed = self.conn().execute(
-            "UPDATE agent_dispatches SET session_id=?1, run_gen=run_gen+1 \
+            "UPDATE agent_dispatches SET session_id=?1, run_gen=run_gen+1, native_session_id=NULL \
              WHERE id=?2 AND status=?3 AND COALESCE(session_id,'')=''",
             rusqlite::params![session_id, id, status],
         )?;
@@ -111,7 +111,8 @@ impl Db {
         let tx = conn.unchecked_transaction()?;
         let changed = tx.execute(
             "UPDATE agent_dispatches SET session_id=?1, artifact_path=?2, status=?3, \
-             run_gen=run_gen+1, exit_code=NULL, exited_at_ms=NULL WHERE id=?4 AND status IN (?5, ?6)",
+             run_gen=run_gen+1, exit_code=NULL, exited_at_ms=NULL, native_session_id=NULL \
+             WHERE id=?4 AND status IN (?5, ?6)",
             rusqlite::params![
                 session_id,
                 artifact_path,
@@ -178,16 +179,56 @@ impl Db {
         status: AgentDispatchStatus,
         note: Option<&str>,
     ) -> Result<bool> {
+        self.cas_dispatch_status(id, None, expected, status, note)
+    }
+
+    /// [`Self::compare_and_set_dispatch_status`] fenced on the exact run the
+    /// planner observed: the row's session id and launch generation
+    /// (`run_gen`, v71) must still match too. A relaunch or retry publication
+    /// replaces the session and bumps `run_gen`, so a plan built from a stale
+    /// liveness observation of the old run matches nothing and cannot park or
+    /// close the new worker (THE-267).
+    pub fn compare_and_set_dispatch_status_run(
+        &self,
+        run: &crate::issue::DispatchRunRef,
+        expected: AgentDispatchStatus,
+        status: AgentDispatchStatus,
+        note: Option<&str>,
+    ) -> Result<bool> {
+        self.cas_dispatch_status(run.id, Some(run), expected, status, note)
+    }
+
+    fn cas_dispatch_status(
+        &self,
+        id: i64,
+        fence: Option<&crate::issue::DispatchRunRef>,
+        expected: AgentDispatchStatus,
+        status: AgentDispatchStatus,
+        note: Option<&str>,
+    ) -> Result<bool> {
         let note = note
             .map(crate::pipeline_report::note_text)
             .transpose()
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         let conn = self.conn();
         let tx = conn.unchecked_transaction()?;
-        let changed = tx.execute(
-            "UPDATE agent_dispatches SET status=?1 WHERE id=?2 AND status=?3",
-            rusqlite::params![status.as_str(), id, expected.as_str()],
-        )?;
+        let changed = match fence {
+            None => tx.execute(
+                "UPDATE agent_dispatches SET status=?1 WHERE id=?2 AND status=?3",
+                rusqlite::params![status.as_str(), id, expected.as_str()],
+            )?,
+            Some(run) => tx.execute(
+                "UPDATE agent_dispatches SET status=?1 WHERE id=?2 AND status=?3 \
+                 AND COALESCE(session_id,'')=?4 AND run_gen=?5",
+                rusqlite::params![
+                    status.as_str(),
+                    id,
+                    expected.as_str(),
+                    run.session_id,
+                    run.run_gen
+                ],
+            )?,
+        };
         if changed == 0 {
             tx.rollback()?;
             return Ok(false);
@@ -223,6 +264,31 @@ impl Db {
         )? != 0)
     }
 
+    /// [`Self::compare_and_set_dispatch_retry_park`] fenced on the exact run
+    /// (row, session, `run_gen`) the exit handler classified: a row republished
+    /// to a newer run since matches nothing, so a stale exit can never park the
+    /// live replacement.
+    pub fn compare_and_set_dispatch_retry_park_run(
+        &self,
+        run: &crate::issue::DispatchRunRef,
+        expected: AgentDispatchStatus,
+        note: &str,
+    ) -> Result<bool> {
+        let note = crate::pipeline_report::note_text(note).map_err(|e| anyhow::anyhow!("{e}"))?;
+        Ok(self.conn().execute(
+            "UPDATE agent_dispatches SET status=?1, note=?2 WHERE id=?3 AND status=?4 \
+             AND COALESCE(session_id,'')=?5 AND run_gen=?6",
+            rusqlite::params![
+                AgentDispatchStatus::WaitingHuman.as_str(),
+                note,
+                run.id,
+                expected.as_str(),
+                run.session_id,
+                run.run_gen
+            ],
+        )? != 0)
+    }
+
     /// Publish a relaunched worker only while the retry reservation is still
     /// ours. A supervisor may close the `spawning` row while `open` awaits;
     /// in that case this returns false and the caller kills the orphan launch.
@@ -235,7 +301,7 @@ impl Db {
     ) -> Result<bool> {
         Ok(self.conn().execute(
             "UPDATE agent_dispatches SET status=?1, session_id=?2, artifact_path=?3, \
-             exit_code=NULL, exited_at_ms=NULL, run_gen=run_gen+1 \
+             exit_code=NULL, exited_at_ms=NULL, run_gen=run_gen+1, native_session_id=NULL \
              WHERE id=?4 AND status=?5",
             rusqlite::params![
                 AgentDispatchStatus::Running.as_str(),
@@ -645,6 +711,63 @@ impl Db {
                 },
             )
             .optional()?)
+    }
+
+    /// Run identity of every `running` row in one read, for a batch caller
+    /// (the daemon reaper) that would otherwise issue one query per row.
+    pub fn running_dispatch_run_refs(&self) -> Result<Vec<crate::issue::DispatchRunRef>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, issue_id, COALESCE(session_id,''), run_gen \
+             FROM agent_dispatches WHERE status=?1",
+        )?;
+        let rows = stmt.query_map([AgentDispatchStatus::Running.as_str()], |r| {
+            Ok(crate::issue::DispatchRunRef {
+                id: r.get(0)?,
+                issue_id: r.get(1)?,
+                session_id: r.get(2)?,
+                run_gen: r.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Record the harness-native conversation id of the run `run` identifies.
+    /// One CAS on `(id, session_id, run_gen)`: a replaced run matches nothing,
+    /// so a stale writer can never attach an id to a newer generation. An id
+    /// is written once per run; a second, different write is refused.
+    pub fn set_dispatch_native_session(
+        &self,
+        run: &crate::issue::DispatchRunRef,
+        native_session_id: &str,
+    ) -> Result<bool> {
+        if native_session_id.is_empty() {
+            return Ok(false);
+        }
+        Ok(self.conn().execute(
+            "UPDATE agent_dispatches SET native_session_id=?1 \
+             WHERE id=?2 AND COALESCE(session_id,'')=?3 AND run_gen=?4 \
+               AND native_session_id IS NULL",
+            rusqlite::params![native_session_id, run.id, run.session_id, run.run_gen],
+        )? != 0)
+    }
+
+    /// The native session id of exactly the run `run` identifies, or `None`
+    /// when unrecorded or the row has since moved to another run.
+    pub fn dispatch_native_session(
+        &self,
+        run: &crate::issue::DispatchRunRef,
+    ) -> Result<Option<String>> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT native_session_id FROM agent_dispatches \
+                 WHERE id=?1 AND COALESCE(session_id,'')=?2 AND run_gen=?3",
+                rusqlite::params![run.id, run.session_id, run.run_gen],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
     }
 
     /// Stamp a run's worker exit (v63, fenced by v71): the exit code, if it was
@@ -1213,6 +1336,120 @@ mod tests {
     }
 
     #[test]
+    fn retry_park_run_refuses_a_republished_run() {
+        let (db, _dir) = temp_db();
+        let id = put_row(&db, "linear:P-1", "/wt/p");
+        db.update_dispatch_status(id, AgentDispatchStatus::Running)
+            .unwrap();
+        db.stamp_dispatch_run(id, "old", "a.md").unwrap();
+        let old = db.dispatch_run_ref(id).unwrap().unwrap();
+        // The row is republished to a newer run after the exit was classified.
+        db.stamp_dispatch_run(id, "new", "a.md").unwrap();
+        assert!(
+            !db.compare_and_set_dispatch_retry_park_run(&old, AgentDispatchStatus::Running, "n")
+                .unwrap()
+        );
+        let row = db.get_dispatch(id).unwrap().unwrap();
+        assert_eq!(
+            row.status,
+            AgentDispatchStatus::Running,
+            "new run untouched"
+        );
+        assert_eq!(row.note, None);
+        let new = db.dispatch_run_ref(id).unwrap().unwrap();
+        assert!(
+            db.compare_and_set_dispatch_retry_park_run(&new, AgentDispatchStatus::Running, "n")
+                .unwrap()
+        );
+        assert_eq!(
+            db.get_dispatch(id).unwrap().unwrap().status,
+            AgentDispatchStatus::WaitingHuman
+        );
+    }
+
+    #[test]
+    fn native_session_id_is_fenced_by_run_generation_and_cleared_on_republish() {
+        let (db, _dir) = temp_db();
+        let id = put_row(&db, "linear:N-1", "/wt/n");
+        db.update_dispatch_status(id, AgentDispatchStatus::Running)
+            .unwrap();
+        db.stamp_dispatch_run(id, "sess-1", "a.md").unwrap();
+        let first = db.dispatch_run_ref(id).unwrap().unwrap();
+        assert_eq!(db.dispatch_native_session(&first).unwrap(), None);
+        assert!(!db.set_dispatch_native_session(&first, "").unwrap());
+        assert!(db.set_dispatch_native_session(&first, "native-1").unwrap());
+        // Written once per run: a second id never replaces the first.
+        assert!(!db.set_dispatch_native_session(&first, "native-x").unwrap());
+        assert_eq!(
+            db.dispatch_native_session(&first).unwrap().as_deref(),
+            Some("native-1")
+        );
+
+        // A republication bumps the generation and clears the id in the same
+        // UPDATE; the replaced run can neither read nor write.
+        db.stamp_dispatch_run(id, "sess-1", "a.md").unwrap();
+        let second = db.dispatch_run_ref(id).unwrap().unwrap();
+        assert!(second.run_gen > first.run_gen);
+        assert_eq!(db.dispatch_native_session(&second).unwrap(), None);
+        assert_eq!(db.dispatch_native_session(&first).unwrap(), None);
+        assert!(!db.set_dispatch_native_session(&first, "stale").unwrap());
+        assert!(db.set_dispatch_native_session(&second, "native-2").unwrap());
+
+        // The retry publication clears it too.
+        assert!(
+            db.compare_and_set_dispatch_retry_park(id, AgentDispatchStatus::Running, "t")
+                .unwrap()
+        );
+        assert!(
+            db.compare_and_set_dispatch_status(
+                id,
+                AgentDispatchStatus::WaitingHuman,
+                AgentDispatchStatus::Spawning,
+                None,
+            )
+            .unwrap()
+        );
+        assert!(
+            db.compare_and_set_dispatch_retry_run(
+                id,
+                AgentDispatchStatus::Spawning,
+                "sess-2",
+                "a.md"
+            )
+            .unwrap()
+        );
+        let third = db.dispatch_run_ref(id).unwrap().unwrap();
+        assert_eq!(db.dispatch_native_session(&third).unwrap(), None);
+        assert_eq!(db.dispatch_native_session(&second).unwrap(), None);
+    }
+
+    #[test]
+    fn native_session_id_is_cleared_when_a_session_is_bound_and_on_publish() {
+        let (db, _dir) = temp_db();
+        let id = put_row(&db, "linear:N-2", "/wt/n2");
+        let run = db.dispatch_run_ref(id).unwrap().unwrap();
+        db.conn()
+            .execute(
+                "UPDATE agent_dispatches SET native_session_id='leftover' WHERE id=?1",
+                [id],
+            )
+            .unwrap();
+        assert!(db.bind_dispatch_session(id, "sess-b").unwrap());
+        let bound = db.dispatch_run_ref(id).unwrap().unwrap();
+        assert_eq!(db.dispatch_native_session(&bound).unwrap(), None);
+        assert_eq!(db.dispatch_native_session(&run).unwrap(), None);
+        db.conn()
+            .execute(
+                "UPDATE agent_dispatches SET native_session_id='leftover' WHERE id=?1",
+                [id],
+            )
+            .unwrap();
+        db.publish_dispatch_run(id, "sess-c", "c.md").unwrap();
+        let published = db.dispatch_run_ref(id).unwrap().unwrap();
+        assert_eq!(db.dispatch_native_session(&published).unwrap(), None);
+    }
+
+    #[test]
     fn a_retried_run_clears_only_the_previous_runs_exit_stamp() {
         let (db, _dir) = temp_db();
         let id = put_row(&db, "linear:X-9", "/wt/x");
@@ -1280,6 +1517,41 @@ mod tests {
         let after = db.get_dispatch(id).unwrap().unwrap();
         assert_eq!(after.exit_code, Some(0));
         assert_eq!(after.exited_at_ms, stamped_at);
+    }
+
+    #[test]
+    fn status_cas_run_fence_rejects_a_relaunched_run() {
+        // THE-267: a plan built against run N must not park run N+1, even when
+        // the relaunch reuses the session id and the status is unchanged.
+        let (db, _dir) = temp_db();
+        let id = put_row(&db, "linear:X-11", "/wt/x");
+        db.stamp_dispatch_run(id, "sess-a", "a.md").unwrap();
+        db.update_dispatch_status(id, AgentDispatchStatus::Running)
+            .unwrap();
+        let observed = db.dispatch_run_ref(id).unwrap().unwrap();
+        db.stamp_dispatch_run(id, "sess-a", "a.md").unwrap();
+        assert!(
+            !db.compare_and_set_dispatch_status_run(
+                &observed,
+                AgentDispatchStatus::Running,
+                AgentDispatchStatus::WaitingHuman,
+                Some("reaped"),
+            )
+            .unwrap()
+        );
+        let row = db.get_dispatch(id).unwrap().unwrap();
+        assert_eq!(row.status, AgentDispatchStatus::Running);
+        assert!(db.dispatch_notes(id, None, 0).unwrap().is_empty());
+        let current = db.dispatch_run_ref(id).unwrap().unwrap();
+        assert!(
+            db.compare_and_set_dispatch_status_run(
+                &current,
+                AgentDispatchStatus::Running,
+                AgentDispatchStatus::WaitingHuman,
+                Some("reaped"),
+            )
+            .unwrap()
+        );
     }
 
     #[test]

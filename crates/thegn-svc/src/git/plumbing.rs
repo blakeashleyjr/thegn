@@ -10,6 +10,7 @@
 use super::{GitBackend, gpg_args, run, run_background_commit_stdin, run_w};
 use anyhow::{Context, Result};
 use thegn_core::fold::{Author, CommitMeta};
+use thegn_core::git_operand as op;
 use thegn_core::remote::GitLoc;
 
 /// Record/field separators for the `commits` log format — ASCII RS/US, which
@@ -139,6 +140,7 @@ fn parse_merge_tree(code: i32, stdout: &str, stderr: &str) -> Result<MergeTreeOu
 pub trait PlumbingOps: GitBackend {
     /// Resolve a rev to a full object id (`git rev-parse <rev>`).
     fn rev_parse(&self, loc: &GitLoc, rev: &str) -> Result<String> {
+        let rev = op::revision(rev)?;
         Ok(run(loc, &["rev-parse", rev])?.trim().to_string())
     }
 
@@ -148,6 +150,7 @@ pub trait PlumbingOps: GitBackend {
     /// conflicted-file section a NUL-delimited path list (robust to spaces).
     /// Exit 0 = clean, 1 = conflicts, >1 = genuine failure.
     fn merge_tree(&self, loc: &GitLoc, ours: &str, theirs: &str) -> Result<MergeTreeOutcome> {
+        let (ours, theirs) = (op::revision(ours)?, op::revision(theirs)?);
         let (code, stdout, stderr) = run_status(
             loc,
             &[
@@ -204,8 +207,10 @@ pub trait PlumbingOps: GitBackend {
         sign: bool,
         author: Option<&Author>,
     ) -> Result<String> {
+        let tree = op::revision(tree)?;
         let mut args: Vec<&str> = vec!["commit-tree", tree];
         for p in parents {
+            op::revision(p)?;
             args.push("-p");
             args.push(p);
         }
@@ -241,6 +246,11 @@ pub trait PlumbingOps: GitBackend {
         ours: &str,
         theirs: &str,
     ) -> Result<MergeTreeOutcome> {
+        let (base, ours, theirs) = (
+            op::revision(base)?,
+            op::revision(ours)?,
+            op::revision(theirs)?,
+        );
         let (code, stdout, stderr) = run_status(
             loc,
             &[
@@ -260,6 +270,7 @@ pub trait PlumbingOps: GitBackend {
     /// Merge base of two commits (`git merge-base`). `Ok(None)` when they are
     /// unrelated (exit 1 with no output), distinct from a genuine failure.
     fn merge_base(&self, loc: &GitLoc, a: &str, b: &str) -> Result<Option<String>> {
+        let (a, b) = (op::revision(a)?, op::revision(b)?);
         let (code, stdout, stderr) = run_status(loc, &["merge-base", a, b])?;
         match code {
             0 => {
@@ -275,6 +286,7 @@ pub trait PlumbingOps: GitBackend {
     /// with its first parent, full message, and author — the replay list for a
     /// `rebase` land and the `{subjects}` source for a `land_message`.
     fn commits(&self, loc: &GitLoc, base_excl: &str, tip: &str) -> Result<Vec<CommitMeta>> {
+        let (base_excl, tip) = (op::revision(base_excl)?, op::revision(tip)?);
         let fmt = format!("{RS}%H{US}%P{US}%an{US}%ae{US}%aI{US}%B");
         let range = format!("{base_excl}..{tip}");
         let out = run(
@@ -336,6 +348,7 @@ pub trait PlumbingOps: GitBackend {
         new: &str,
         old: &str,
     ) -> Result<CasOutcome> {
+        let (name, new, old) = (op::revision(name)?, op::revision(new)?, op::revision(old)?);
         let (code, _out, stderr) = run_status(loc, &["update-ref", name, new, old])?;
         if code == 0 {
             return Ok(CasOutcome::Advanced);
@@ -387,6 +400,22 @@ mod tests {
         CasOutcome, MergeTreeOutcome, PlumbingOps, RefRead, classify_cas_failure, is_object_id,
     };
     use std::path::Path;
+
+    #[test]
+    fn plumbing_refuses_option_shaped_operands_before_spawn() {
+        let repo = TestRepo::new("pl-dash");
+        let loc = repo.loc();
+        let bad = "--output=/tmp/thegn-injected";
+        assert!(CliGit.rev_parse(&loc, bad).is_err());
+        assert!(CliGit.merge_base(&loc, bad, "HEAD").is_err());
+        assert!(CliGit.merge_tree(&loc, "HEAD", bad).is_err());
+        assert!(CliGit.merge_tree_base(&loc, bad, "HEAD", "HEAD").is_err());
+        assert!(CliGit.commits(&loc, "HEAD", bad).is_err());
+        assert!(CliGit.update_ref_cas(&loc, bad, "HEAD", "HEAD").is_err());
+        assert!(CliGit.commit_tree(&loc, bad, &[], "m").is_err());
+        assert!(CliGit.commit_tree(&loc, "HEAD", &[bad], "m").is_err());
+        assert!(!std::path::Path::new("/tmp/thegn-injected").exists());
+    }
 
     #[test]
     fn is_object_id_accepts_sha1_and_sha256_only() {

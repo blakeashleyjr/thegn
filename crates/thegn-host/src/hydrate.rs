@@ -309,7 +309,7 @@ pub(crate) enum RefreshKind {
     /// nothing at all, and no timer or thread is added to the loop.
     /// Boxed: the payload is a whole table, and every other `RefreshKind`
     /// variant stays one word.
-    Dispatches(Box<crate::monitor_pipeline::DispatchRoster>),
+    Dispatches(Box<crate::monitor_pipeline::RosterSample>),
     /// A background reconciliation found local worktree paths that vanished
     /// outside the host. The loop only prunes the already-identified groups;
     /// probing and cache/session persistence stay off-loop.

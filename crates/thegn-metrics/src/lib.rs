@@ -20,6 +20,17 @@ mod procs;
 mod sample;
 mod thermal;
 
+/// Run a helper under the shared bounded runner (deadline, stdout cap, process
+/// group kill, guaranteed reap). Errors are human-readable.
+pub fn run_command_bounded(
+    program: &std::ffi::OsStr,
+    args: &[&std::ffi::OsStr],
+    deadline: std::time::Duration,
+    cap: usize,
+) -> Result<Vec<u8>, String> {
+    gpu_exec::run_bounded(program, args, deadline, cap).map_err(|e| e.to_string())
+}
+
 pub use battery::{read_battery, read_battery_power};
 pub use coverage::{AbsentReason, Coverage, FamilyReport, MetricFamily, coverage};
 pub use procs::{

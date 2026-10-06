@@ -56,6 +56,21 @@ pub enum Piece {
     GfxAnswer(Vec<u8>),
 }
 
+/// Merge the frame's queued graphics sequences into one OOB blob. A single
+/// sequence (the common video case, up to several MiB) is moved through with
+/// no copy; several are concatenated into one exactly-sized allocation.
+pub(crate) fn coalesce_gfx(mut seqs: Vec<Vec<u8>>) -> Vec<u8> {
+    if seqs.len() == 1 {
+        return seqs.pop().unwrap_or_default();
+    }
+    let total = seqs.iter().map(Vec::len).sum();
+    let mut blob = Vec::with_capacity(total);
+    for g in &seqs {
+        blob.extend_from_slice(g);
+    }
+    blob
+}
+
 /// Hard limit on a complete APC, including introducer and ST. Oversize APCs
 /// are discarded through their terminator; their tail is never ordinary text.
 const MAX_APC_BYTES: usize = 4 * 1024 * 1024;
@@ -284,6 +299,18 @@ pub fn outer_supports_kitty_graphics() -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn coalesce_gfx_moves_single_and_sizes_multi_exactly() {
+        let one = vec![1u8, 2, 3];
+        let ptr = one.as_ptr();
+        let out = super::coalesce_gfx(vec![one]);
+        assert_eq!(out.as_ptr(), ptr, "single sequence must not be copied");
+        let out = super::coalesce_gfx(vec![vec![1, 2], vec![3], vec![4, 5]]);
+        assert_eq!(out, [1, 2, 3, 4, 5]);
+        assert_eq!(out.capacity(), 5, "one exactly-sized allocation");
+        assert!(super::coalesce_gfx(Vec::new()).is_empty());
+    }
+
     use super::*;
 
     fn apc(body: &str) -> Vec<u8> {

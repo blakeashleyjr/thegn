@@ -28,6 +28,8 @@
 //! router. The single-method push watcher ([`MediaWatch`]) is likewise a
 //! boxed trait object.
 
+#[cfg_attr(windows, allow(dead_code))]
+pub(crate) mod helper;
 pub mod model;
 
 pub mod aggregate;
@@ -414,7 +416,7 @@ async fn mpris_client(opts: &ResolveOpts) -> Option<MediaClient> {
                 }
                 probe => {
                     let players = m.list_players().await.unwrap_or_default();
-                    if !players.is_empty() && MprisCli::available() {
+                    if !players.is_empty() && MprisCli::available().await {
                         tracing::debug!(
                             target: "thegn::media",
                             ?probe, players = ?players,
@@ -432,7 +434,7 @@ async fn mpris_client(opts: &ResolveOpts) -> Option<MediaClient> {
         }
         Err(e) => {
             tracing::debug!(target: "thegn::media", error = %e, "MPRIS zbus connect failed; trying playerctl");
-            if MprisCli::available() {
+            if MprisCli::available().await {
                 Some(Box::new(MprisCli::new(opts.players_priority.clone())))
             } else {
                 tracing::debug!(target: "thegn::media", "playerctl not found; media inert");

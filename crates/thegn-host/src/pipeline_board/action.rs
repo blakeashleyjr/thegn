@@ -21,21 +21,32 @@ pub fn spawn_dispatch_sample(
     refresh_tx: &tokio::sync::mpsc::UnboundedSender<crate::hydrate::RefreshKind>,
     waker: &TerminalWaker,
     stage_order: Vec<String>,
+    generation: u64,
 ) {
     let tx = refresh_tx.clone();
     let waker = waker.clone();
     tokio::task::spawn_blocking(move || {
         crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
         use thegn_core::store::NotificationStore;
-        // best-effort: the roster is a cache-side ledger and the board is a
-        // view of it — an unavailable DB means "no update", never a crash.
+        // A failed open/read is a typed failure, never an empty roster: the
+        // loop keeps the last known-good rows and marks them stale.
         let rows = thegn_core::db::Db::open()
-            .ok()
-            .and_then(|db| db.list_dispatches().ok())
-            .unwrap_or_default();
-        let roster = crate::monitor_pipeline::DispatchRoster { rows, stage_order };
+            .map_err(|e| format!("open: {e}"))
+            .and_then(|db| db.list_dispatches().map_err(|e| format!("read: {e}")));
+        let at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
+        let sample = crate::monitor_pipeline::RosterSample {
+            generation,
+            at_ms,
+            result: rows.map(|rows| crate::monitor_pipeline::DispatchRoster {
+                rows,
+                stage_order,
+                stale: None,
+            }),
+        };
         if tx
-            .send(crate::hydrate::RefreshKind::Dispatches(Box::new(roster)))
+            .send(crate::hydrate::RefreshKind::Dispatches(Box::new(sample)))
             .is_ok()
             && let Err(e) = waker.wake()
         {

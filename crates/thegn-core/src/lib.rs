@@ -145,6 +145,7 @@ pub mod forward;
 pub mod frecency;
 pub mod fsperm;
 pub mod gate;
+pub mod git_config_heal;
 pub mod git_memo;
 pub mod git_operand;
 pub mod github;

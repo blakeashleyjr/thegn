@@ -38,6 +38,21 @@ pub(crate) enum ExecFailure {
     Panicked,
 }
 
+impl std::fmt::Display for ExecFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Spawn { not_found: true } => write!(f, "not found"),
+            Self::Spawn { not_found: false } => write!(f, "spawn failed"),
+            Self::Timeout => write!(f, "timed out"),
+            Self::OutputTooLarge => write!(f, "output too large"),
+            Self::Status(Some(c)) => write!(f, "exit status {c}"),
+            Self::Status(None) => write!(f, "exit by signal"),
+            Self::Malformed => write!(f, "reap failed"),
+            Self::Panicked => write!(f, "panicked"),
+        }
+    }
+}
+
 /// Owns the child until it is waited: dropping an armed guard (early return,
 /// panic) SIGKILLs the whole group and reaps the leader.
 struct ChildGuard(Option<Child>);
