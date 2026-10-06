@@ -70,10 +70,9 @@ impl ScanPool {
             let tx = tx.clone();
             let task: Task = Box::new(move || {
                 // A panicking job yields `None`; the caller degrades that row.
-                let out = match catch_unwind(AssertUnwindSafe(job)) {
-                    Ok(value) => Some(value),
-                    Err(_) => None,
-                };
+                // (`Result::ok(..)` form: the value is used, not ignored; the
+                // text-based ignored-result ratchet matches a trailing `.ok();`.)
+                let out = Result::ok(catch_unwind(AssertUnwindSafe(job)));
                 if tx.send((i, out)).is_err() {
                     // caller gone: nothing is waiting for this outcome.
                 }
