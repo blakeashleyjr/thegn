@@ -278,10 +278,6 @@ fn priority_to_int(p: IssuePriority) -> i64 {
     }
 }
 
-/// Escape a string for embedding inside a GraphQL double-quoted literal.
-/// A bare `"`, a trailing `\`, or a raw newline would terminate/break the
-/// literal (GraphQL string literals cannot contain raw line terminators);
-/// backslash must be escaped first so we don't double-escape our own output.
 // ---- team workflow-state resolution ----------------------------------------
 
 const TEAM_STATES_QUERY: &str = "query($id: String!) { issue(id: $id) { team { id states { nodes { id name type position } } } } }";
@@ -356,6 +352,10 @@ fn pick_team_state(data: &TeamStatesData, type_str: &str) -> Result<String, Issu
         })
 }
 
+/// Escape a string for embedding inside a GraphQL double-quoted literal.
+/// A bare `"`, a trailing `\`, or a raw newline would terminate/break the
+/// literal (GraphQL string literals cannot contain raw line terminators);
+/// backslash must be escaped first so we don't double-escape our own output.
 fn escape_graphql_str(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     for c in s.chars() {
