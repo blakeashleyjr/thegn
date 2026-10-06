@@ -206,7 +206,7 @@ fn open(path: impl AsRef<std::path::Path>) -> Result<gix::Repository> {
 ///
 /// Binary files contribute no line counts (gix returns `None` for them, and
 /// `--numstat` prints `-`/`-`), so they are skipped — matching
-/// [`super::sum_numstat`], which parses those as `0`.
+/// [`super::sum_numstat`], which omits those rows.
 pub(crate) fn diff_entries(
     path: impl AsRef<std::path::Path>,
     spec: &str,
@@ -239,9 +239,7 @@ pub(crate) fn diff_entries(
 /// [`diff_entries`], without materialising the rows.
 pub(crate) fn totals(path: impl AsRef<std::path::Path>, spec: &str) -> Result<(u32, u32)> {
     let entries = diff_entries(path, spec)?;
-    Ok(entries.iter().fold((0u32, 0u32), |(a, d), e| {
-        (a.saturating_add(e.added), d.saturating_add(e.deleted))
-    }))
+    Ok(super::sum_entries(&entries))
 }
 
 /// The tree-to-tree case: one gix walk, line-counting each changed blob.
@@ -553,7 +551,7 @@ mod tests {
     /// output the native path must reproduce.
     fn cli_totals(repo: &TestRepo, spec: &str) -> (u32, u32) {
         let out = repo.out(&["-c", "core.quotePath=false", "diff", "--numstat", spec]);
-        super::super::sum_numstat(&out)
+        super::super::sum_numstat(&out).expect("numstat parses")
     }
 
     /// Every native read must agree with the CLI it replaced. A performance
@@ -661,11 +659,37 @@ mod tests {
         repo.commit_file("a.txt", "x\n", "base");
         repo.out(&["checkout", "-q", "-b", "feat"]);
         // NUL bytes make git call it binary; `--numstat` then prints `-`/`-`,
-        // which `sum_numstat` parses as 0.
+        // which `parse_numstat` omits.
         std::fs::write(repo.dir.join("blob.bin"), [0u8, 1, 2, 0, 3]).unwrap();
         repo.out(&["add", "blob.bin"]);
         repo.out(&["commit", "-q", "-m", "add binary"]);
         assert_parity(&repo, "main...HEAD");
+    }
+
+    #[test]
+    fn typed_rows_match_strict_cli_parser_including_binary() {
+        let repo = TestRepo::new("nd-typed");
+        repo.commit_file("a.txt", "x\n", "base");
+        repo.out(&["checkout", "-q", "-b", "feat"]);
+        repo.commit_file("a.txt", "x\ny\n", "edit");
+        std::fs::write(repo.dir.join("blob.bin"), [0u8, 1, 0, 2]).unwrap();
+        repo.out(&["add", "blob.bin"]);
+        repo.out(&["commit", "-q", "-m", "bin"]);
+        let cli = repo.out(&[
+            "-c",
+            "core.quotePath=false",
+            "diff",
+            "--numstat",
+            "main...HEAD",
+        ]);
+        let mut want = super::super::parse_numstat(&cli).unwrap();
+        let mut got = diff_entries(&repo.dir, "main...HEAD").unwrap();
+        want.sort_by(|x, y| x.path.cmp(&y.path));
+        got.sort_by(|x, y| x.path.cmp(&y.path));
+        assert_eq!(want.len(), got.len());
+        for (w, g) in want.iter().zip(&got) {
+            assert_eq!((&w.path, w.added, w.deleted), (&g.path, g.added, g.deleted));
+        }
     }
 
     #[test]
