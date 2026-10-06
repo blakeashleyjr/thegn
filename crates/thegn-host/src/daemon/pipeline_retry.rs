@@ -37,6 +37,16 @@
 //! recorded facts rather than inference, which is precisely what separates it
 //! from this module. Everything else there is still parked, never failed.
 //!
+//! # Retry semantics: exact resume, cold restart, never continue-latest
+//!
+//! A retry relaunches COLD (stage prompt re-rendered plus a fixed recovery
+//! note). The roster stores only thegn's daemon session id, not the harness's
+//! native conversation id, so no exact native resume can be proven to belong
+//! to the failed run. The id-free `continue` form ("latest session in the
+//! worktree") is unsafe for an autonomous retry — it can resume an unrelated
+//! newer session — and is never used here (THE-265). An exact native resume
+//! needs the native id persisted and fenced by `run_gen`, a schema change.
+//!
 //! # Event-driven, zero timers while idle
 //!
 //! The task blocks on the event broadcast feed; no polling, no tickers. The
@@ -52,7 +62,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use thegn_core::control_wire::EventFrame;
-use thegn_core::harness::HarnessCaps;
 use thegn_core::issue::AgentDispatch;
 use thegn_core::issue::AgentDispatchStatus;
 use thegn_core::pipeline_exit::{self, ExitSignatures};
@@ -363,24 +372,20 @@ fn signature_of(class: &pipeline_exit::ExitClass) -> &str {
     }
 }
 
-/// Relaunch a failed row: through [`DaemonService::open`], so the relaunch
-/// takes the same sandbox/credential/cap/seeder path every launch takes.
-///
-/// - A harness with a `CONTINUE` cap relaunches with its id-free continue
-///   form, seeded with the nudge as the opening message.
-/// - Anything else relaunches COLD with the stage prompt re-rendered through
-///   the shared helpers — the CLI dispatch path and this path render
-///   identically by construction.
-async fn relaunch(svc: &DaemonService, row: &AgentDispatch) -> anyhow::Result<SessionInfo> {
-    let cfg = svc.config.clone();
-    let harness = crate::daemon::agent_open::harness_for_agent(&cfg, &row.agent_name)
-        .with_context(|| format!("unknown agent `{}` — cannot relaunch", row.agent_name))?;
-    let (prompt, continue_last) = if harness.caps().contains(HarnessCaps::CONTINUE) {
-        (pipeline_exit::RETRY_NUDGE.to_string(), true)
-    } else {
-        (cold_stage_prompt(svc, row).await?, false)
-    };
-    let spec = OpenSpec {
+/// Recovery context appended to the cold stage prompt of a retried row. Fixed
+/// text, so the context a retry carries is bounded by construction.
+const RECOVERY_CONTEXT: &str = "\n\nNOTE: an earlier attempt at this task was interrupted by a \
+transport error. Its conversation is not available to you. Inspect the worktree (git status, \
+git log) and the artifact path before redoing any work, and continue from what is already there.";
+
+/// The launch spec of a transport retry (THE-265). Always a COLD start: the
+/// roster persists only thegn's daemon session id, never the harness-native
+/// conversation id, so no exact native session can be proven to belong to this
+/// row. `--continue`/"latest" (`continue_last`) picks the newest history in the
+/// worktree, which may be another run's, so it is never used for an autonomous
+/// retry; `resume` stays `None` for the same reason.
+fn retry_open_spec(row: &AgentDispatch, prompt: String) -> OpenSpec {
+    OpenSpec {
         automation_origin: None,
         argv: Vec::new(),
         cwd: None,
@@ -395,15 +400,26 @@ async fn relaunch(svc: &DaemonService, row: &AgentDispatch) -> anyhow::Result<Se
             headless: Some(true),
             bind_worktree: false,
             resume: None,
-            continue_last,
+            continue_last: false,
             stage: row.stage.clone(),
             fork: false,
             native_session_id: None,
         }),
         adopt: false,
         already_capped: false,
-    };
-    svc.open(spec)
+    }
+}
+
+/// Relaunch a failed row cold, through [`DaemonService::open`], so the
+/// relaunch takes the same sandbox/credential/cap/seeder path every launch
+/// takes. The stage prompt is re-rendered through the shared helpers — the CLI
+/// dispatch path and this path render identically by construction — plus a
+/// bounded recovery note.
+async fn relaunch(svc: &DaemonService, row: &AgentDispatch) -> anyhow::Result<SessionInfo> {
+    crate::daemon::agent_open::harness_for_agent(&svc.config, &row.agent_name)
+        .with_context(|| format!("unknown agent `{}` — cannot relaunch", row.agent_name))?;
+    let prompt = format!("{}{RECOVERY_CONTEXT}", cold_stage_prompt(svc, row).await?);
+    svc.open(retry_open_spec(row, prompt))
         .await
         .map_err(|e| anyhow::anyhow!("open: {e}"))
 }
@@ -482,4 +498,28 @@ async fn cold_stage_prompt(svc: &DaemonService, row: &AgentDispatch) -> anyhow::
         row.id,
     );
     crate::stage_prompt::render_stage(&stage_name, &stage.prompt, &vars)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use thegn_core::issue::NewDispatch;
+
+    /// THE-265: a retry never selects "latest" native history or an unproven
+    /// native id; it is a cold launch.
+    #[test]
+    fn retry_launch_is_cold_never_continue_latest() {
+        let db = thegn_core::db::Db::open_memory().expect("db");
+        let id = db
+            .put_agent_dispatch(NewDispatch::new("linear:THE-265", "/wt/265", "claude"))
+            .expect("row");
+        let row = db.get_dispatch(id).expect("get").expect("row");
+        let spec = retry_open_spec(&row, "task".into());
+        let launch = spec.agent.expect("agent launch");
+        assert!(!launch.continue_last, "continue-latest is unsafe");
+        assert!(launch.resume.is_none());
+        assert!(launch.native_session_id.is_none());
+        assert!(!launch.fork);
+        assert_eq!(launch.headless, Some(true));
+    }
 }
