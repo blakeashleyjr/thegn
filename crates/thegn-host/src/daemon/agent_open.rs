@@ -168,6 +168,8 @@ fn resolve_inner(
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty());
+    let fresh =
+        !launch.fork && launch.resume.as_deref().is_none_or(str::is_empty) && !launch.continue_last;
     let cmd = if launch.fork {
         let native_id = launch
             .native_session_id
@@ -192,6 +194,18 @@ fn resolve_inner(
             launch.continue_last,
             stage,
         )?
+    };
+
+    // A fresh launch whose native session id the daemon assigned
+    // ([`assign_native_session_id`]) carries the harness's flag for it.
+    let cmd = match launch
+        .native_session_id
+        .as_deref()
+        .filter(|id| fresh && thegn_core::harness::session_id_ok(id))
+        .and_then(|id| harness_for_agent(cfg, agent)?.assign_session_args(id))
+    {
+        Some(args) => format!("{cmd} {args}"),
+        None => cmd,
     };
 
     // Agent context follows live Git HEAD (read by the caller); an unavailable
@@ -226,6 +240,62 @@ fn resolve_inner(
     }
 
     Ok(spec)
+}
+
+/// Format 16 random bytes as an RFC 4122 version-4 UUID.
+pub(crate) fn uuid_v4(mut b: [u8; 16]) -> String {
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    let h: String = b.iter().map(|x| format!("{x:02x}")).collect();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &h[0..8],
+        &h[8..12],
+        &h[12..16],
+        &h[16..20],
+        &h[20..32]
+    )
+}
+
+/// Decide the harness-native session identity of an agent launch and write it
+/// into `launch.native_session_id`, returning it.
+///
+/// - Exact resume (`resume = id`): the run continues that very conversation, so
+///   the id is carried forward.
+/// - A fresh headless launch of a harness that can be told its session id
+///   ([`thegn_core::harness::Harness::assign_session_args`]): a new UUID is
+///   generated here (any caller-supplied value is discarded — the id must be
+///   one thegn minted).
+/// - Anything else (fork, continue-latest, other harnesses): `None`, and the
+///   field is left clear — a launch must never carry an id it cannot vouch for.
+pub(crate) fn assign_native_session_id(
+    cfg: &Config,
+    launch: &mut thegn_svc::control::AgentLaunch,
+    random: impl FnOnce() -> Option<[u8; 16]>,
+) -> Option<String> {
+    if launch.fork {
+        return None; // `native_session_id` names the fork SOURCE; leave it
+    }
+    launch.native_session_id = None;
+    if launch.continue_last {
+        return None;
+    }
+    let harness = harness_for_agent(cfg, launch.agent.trim())?;
+    if let Some(id) = launch.resume.as_deref().filter(|s| !s.is_empty()) {
+        if !thegn_core::harness::session_id_ok(id) || harness.resume_command(id).is_none() {
+            return None;
+        }
+        launch.native_session_id = Some(id.to_string());
+        return launch.native_session_id.clone();
+    }
+    let headless = launch.headless.unwrap_or(!launch.prompt.trim().is_empty());
+    if !headless {
+        return None;
+    }
+    let id = uuid_v4(random()?);
+    harness.assign_session_args(&id)?;
+    launch.native_session_id = Some(id.clone());
+    Some(id)
 }
 
 /// The shell command for this agent, with the task substituted in.
@@ -725,6 +795,73 @@ mod tests {
                 .any(|(key, value)| key == "THEGN_TEST_FORK_AGENT_ENV" && value == "fresh-context"),
             "configured launch context must still be composed: {:?}",
             resolved.env
+        );
+    }
+
+    fn launch(agent: &str, prompt: &str) -> thegn_svc::control::AgentLaunch {
+        thegn_svc::control::AgentLaunch {
+            agent: agent.into(),
+            prompt: prompt.into(),
+            headless: None,
+            bind_worktree: false,
+            resume: None,
+            continue_last: false,
+            stage: None,
+            fork: false,
+            native_session_id: Some("caller-supplied".into()),
+        }
+    }
+
+    #[test]
+    fn uuid_v4_has_the_version_and_variant_bits() {
+        assert_eq!(uuid_v4([0xff; 16]), "ffffffff-ffff-4fff-bfff-ffffffffffff");
+    }
+
+    #[test]
+    fn a_fresh_headless_claude_launch_gets_a_minted_native_id() {
+        let mut l = launch("claude", "do it");
+        let id = assign_native_session_id(&cfg(), &mut l, || Some([7; 16])).expect("assigned");
+        assert_eq!(l.native_session_id.as_deref(), Some(id.as_str()));
+        assert_ne!(id, "caller-supplied", "a caller value is never trusted");
+        // No entropy: no id, and the field is cleared.
+        let mut l = launch("claude", "do it");
+        assert_eq!(assign_native_session_id(&cfg(), &mut l, || None), None);
+        assert_eq!(l.native_session_id, None);
+    }
+
+    #[test]
+    fn launches_that_cannot_vouch_for_an_id_carry_none() {
+        // Non-assignable harness, interactive launch, continue-latest.
+        let mut l = launch("aider", "do it");
+        assert_eq!(
+            assign_native_session_id(&cfg(), &mut l, || Some([1; 16])),
+            None
+        );
+        let mut l = launch("claude", "");
+        assert_eq!(
+            assign_native_session_id(&cfg(), &mut l, || Some([1; 16])),
+            None
+        );
+        let mut l = launch("claude", "x");
+        l.continue_last = true;
+        assert_eq!(
+            assign_native_session_id(&cfg(), &mut l, || Some([1; 16])),
+            None
+        );
+        // A fork's field names its source and is left alone.
+        let mut l = launch("claude", "x");
+        l.fork = true;
+        assert_eq!(
+            assign_native_session_id(&cfg(), &mut l, || Some([1; 16])),
+            None
+        );
+        assert_eq!(l.native_session_id.as_deref(), Some("caller-supplied"));
+        // Exact resume carries the resumed id forward.
+        let mut l = launch("claude", "nudge");
+        l.resume = Some("sess-9".into());
+        assert_eq!(
+            assign_native_session_id(&cfg(), &mut l, || Some([1; 16])).as_deref(),
+            Some("sess-9")
         );
     }
 }

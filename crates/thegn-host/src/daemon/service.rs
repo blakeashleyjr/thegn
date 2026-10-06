@@ -71,6 +71,11 @@ pub(crate) struct DaemonService {
     /// alive forever; the lease reaper looks sessions up to send `Kill`, and a
     /// corpse has nothing to kill.
     pub tombs: Arc<tokio::sync::Mutex<Graveyard<Tombstone>>>,
+    /// Harness-native session ids assigned at launch, keyed by daemon session
+    /// id. In-memory only: the durable, generation-fenced copy is
+    /// `agent_dispatches.native_session_id`, written by the retry observer once
+    /// the row's run identity is known. Entries are removed at session exit.
+    pub native_ids: Mutex<HashMap<String, String>>,
     pub events: broadcast::Sender<Arc<EventFrame>>,
     pub db: SharedDb,
     /// `[daemon] lease_grace_secs`, in ms.
@@ -690,10 +695,10 @@ impl ControlApi for DaemonService {
             // agent, derive the recipe and launch from one effective config:
             // deriving the recipe from self.config can retain a provider that
             // was not the one actually launched.
-            let (recipe, resolved) = match &spec.agent {
+            let (recipe, resolved, assigned) = match &spec.agent {
                 Some(launch) => {
                     let snapshot = (*self.config).clone();
-                    let launch = launch.clone();
+                    let mut launch = launch.clone();
                     let spec2 = spec.clone();
                     // Live branch read happens before the DB lock is taken.
                     let branch =
@@ -710,9 +715,16 @@ impl ControlApi for DaemonService {
                         let cfg = fresh.as_ref().unwrap_or(&snapshot);
                         super::agent_open::ensure_configured_agent(cfg, &launch.agent)?;
                         let recipe = super::fork::agent_recipe(cfg, &launch, &spec2);
+                        let assigned =
+                            super::agent_open::assign_native_session_id(cfg, &mut launch, || {
+                                let mut b = [0u8; 16];
+                                // No entropy means no assigned id: the launch is
+                                // cold-restartable, never given a guessable one.
+                                getrandom::fill(&mut b).ok().map(|()| b)
+                            });
                         let resolved =
                             super::agent_open::resolve(cfg, db, &spec2, &launch, branch)?;
-                        Ok((recipe, Some(resolved)))
+                        Ok((recipe, Some(resolved), assigned))
                     })
                     .await
                     .map_err(|e| ControlError::Conflict(e.to_string()))?
@@ -726,6 +738,7 @@ impl ControlApi for DaemonService {
                             worktree: spec.worktree.clone(),
                         },
                     )),
+                    None,
                     None,
                 ),
             };
@@ -755,6 +768,12 @@ impl ControlApi for DaemonService {
             }
 
             let id = fresh_id();
+            if let Some(native) = assigned {
+                self.native_ids
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .insert(id.clone(), native);
+            }
             // Redaction chokepoint: a pane argv can carry a token on the command
             // line (`--token …`, `FOO_TOKEN=…`). At DEBUG log only the program
             // name + argument count (never a value); the full argv is TRACE-only
@@ -2740,6 +2759,7 @@ mod tests {
                 super::super::tombstone::MAX_TOMBSTONES,
                 super::super::tombstone::TOMBSTONE_TTL_MS,
             ))),
+            native_ids: Mutex::new(HashMap::new()),
             events,
             db: Arc::new(Mutex::new(Db::open_memory().expect("in-memory db"))),
             grace_ms,
@@ -4660,6 +4680,7 @@ mod tests {
 
     async fn wait_parked(svc: &DaemonService, ids: &[i64]) {
         use thegn_core::issue::AgentDispatchStatus as St;
+        use thegn_core::store::NotificationStore;
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
         loop {
             let all = {
@@ -4676,6 +4697,72 @@ mod tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
+    }
+
+    /// THE-265: the native id assigned at launch is made durable by the exit
+    /// observer, fenced to the run that owned the session; an id for a session
+    /// the row no longer carries is never recorded.
+    #[tokio::test]
+    async fn exit_observer_records_the_native_id_fenced_to_its_run() {
+        use crate::daemon::pipeline_retry;
+        use thegn_core::issue::NewDispatch;
+        use thegn_core::store::NotificationStore;
+
+        let (svc, _rx) = service(0);
+        let (cur, other) = {
+            let db = svc.db.lock().unwrap();
+            let cur = db
+                .put_agent_dispatch(NewDispatch {
+                    session_id: Some("s-cur"),
+                    stage: Some("code"),
+                    ..NewDispatch::new("linear:THE-265", "/wt/n1", "aider")
+                })
+                .unwrap();
+            let other = db
+                .put_agent_dispatch(NewDispatch {
+                    session_id: Some("s-new-run"),
+                    stage: Some("code"),
+                    ..NewDispatch::new("linear:THE-265", "/wt/n2", "aider")
+                })
+                .unwrap();
+            (cur, other)
+        };
+        for (sid, native) in [("s-cur", "native-cur"), ("s-old-run", "native-old")] {
+            svc.native_ids
+                .lock()
+                .unwrap()
+                .insert(sid.into(), native.into());
+            let mut t = transport_tomb(sid);
+            t.final_screen = EventFrame::PaneSnapshot {
+                session: sid.into(),
+                seq: 0,
+                cols: 80,
+                rows: 24,
+                bytes: b"plain failure".to_vec(),
+            };
+            svc.tombs.lock().await.insert(sid.into(), t, now_ms());
+        }
+        let attempts = std::sync::Mutex::new(std::collections::HashMap::new());
+        pipeline_retry::handle_exit(&svc, "s-cur", 1, &attempts)
+            .await
+            .unwrap();
+        // The row `other` has moved on to "s-new-run"; "s-old-run" is stale.
+        // (No row carries it, so there is nothing to record against.)
+        pipeline_retry::handle_exit(&svc, "s-old-run", 1, &attempts)
+            .await
+            .unwrap();
+        let db = svc.db.lock().unwrap();
+        let run = db.dispatch_run_ref(cur).unwrap().unwrap();
+        assert_eq!(
+            db.dispatch_native_session(&run).unwrap().as_deref(),
+            Some("native-cur")
+        );
+        let run = db.dispatch_run_ref(other).unwrap().unwrap();
+        assert_eq!(db.dispatch_native_session(&run).unwrap(), None);
+        assert!(
+            svc.native_ids.lock().unwrap().is_empty(),
+            "entries consumed"
+        );
     }
 
     /// THE-266: row A sitting in a long backoff must not delay row B's
