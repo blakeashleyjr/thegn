@@ -299,6 +299,16 @@ pub trait Harness: Send + Sync {
     fn assign_session_args(&self, _native_session_id: &str) -> Option<String> {
         None
     }
+    /// The NON-interactive form of resuming native session `session_id`, as a
+    /// command template whose `{prompt}` placeholder is still to be filled
+    /// (the id is already shell-quoted). The headless counterpart of
+    /// [`Harness::resume_command`]: an autonomous retry must exit when done and
+    /// must not block on a permission prompt, exactly like the headless cold
+    /// launch. `None` when the harness has no such form. Callers MUST validate
+    /// the id shape ([`session_id_ok`]) first.
+    fn headless_resume_template(&self, _session_id: &str) -> Option<String> {
+        None
+    }
     /// The command that creates a new native session from `native_session_id`
     /// (`FORK`). Callers MUST validate the id shape ([`session_id_ok`]) first.
     /// The command is vendor-owned and may use a native fork or resume form;
@@ -499,6 +509,12 @@ impl Harness for Claude {
         Some(format!(
             "claude --resume {} --fork-session",
             util::sh_quote(native_session_id)
+        ))
+    }
+    fn headless_resume_template(&self, session_id: &str) -> Option<String> {
+        Some(format!(
+            "claude -p {{prompt}} --resume {} --permission-mode acceptEdits",
+            util::sh_quote(session_id)
         ))
     }
     fn assign_session_args(&self, native_session_id: &str) -> Option<String> {
@@ -954,6 +970,27 @@ mod tests {
 
     /// Only claude can be told its native session id at launch; every other
     /// harness stays unassignable and so relaunches cold.
+    #[test]
+    fn headless_resume_is_claude_only_and_matches_the_cold_headless_shape() {
+        let t = harness("claude")
+            .unwrap()
+            .headless_resume_template("abc-1")
+            .expect("claude resumes headless");
+        assert_eq!(
+            t,
+            "claude -p {prompt} --resume abc-1 --permission-mode acceptEdits"
+        );
+        assert!(
+            crate::agent_task::substitute_command(&t, "go", &crate::agent_task::TaskVars::new())
+                .is_ok()
+        );
+        for h in HARNESSES {
+            if h.id() != "claude" {
+                assert!(h.headless_resume_template("x").is_none(), "{}", h.id());
+            }
+        }
+    }
+
     #[test]
     fn only_claude_assigns_a_native_session_id() {
         assert_eq!(

@@ -246,15 +246,15 @@ fn resolve_inner(
 pub(crate) fn uuid_v4(mut b: [u8; 16]) -> String {
     b[6] = (b[6] & 0x0f) | 0x40;
     b[8] = (b[8] & 0x3f) | 0x80;
-    let h: String = b.iter().map(|x| format!("{x:02x}")).collect();
-    format!(
-        "{}-{}-{}-{}-{}",
-        &h[0..8],
-        &h[8..12],
-        &h[12..16],
-        &h[16..20],
-        &h[20..32]
-    )
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(36);
+    for (i, x) in b.iter().enumerate() {
+        if matches!(i, 4 | 6 | 8 | 10) {
+            out.push('-');
+        }
+        write!(out, "{x:02x}").expect("formatting into a String is infallible");
+    }
+    out
 }
 
 /// Decide the harness-native session identity of an agent launch and write it
@@ -328,6 +328,21 @@ pub(crate) fn command_for(
         }
         let harness = harness_for_agent(cfg, agent)
             .with_context(|| format!("unknown agent `{agent}` — cannot resume"))?;
+        // A headless resume (an autonomous retry) uses the harness's
+        // non-interactive form so the worker exits when done and never waits on
+        // a permission prompt; the prompt rides inside the template.
+        if headless
+            && let Some(template) = harness.headless_resume_template(id)
+            && !prompt.trim().is_empty()
+        {
+            let cmd = thegn_core::agent_task::substitute_command(
+                &template,
+                prompt,
+                &thegn_core::agent_task::TaskVars::new(),
+            )
+            .map_err(|e| anyhow::anyhow!("agent resume template is invalid: {e}"))?;
+            return Ok(format!("{cmd}{}", session_grant(cfg, agent, stage)?));
+        }
         let cmd = harness
             .resume_command(id)
             .with_context(|| format!("agent `{agent}` does not support resume"))?;
@@ -405,12 +420,9 @@ pub(crate) fn harness_for_agent(
         .chain(cfg.tools.iter())
         .find(|a| a.name == agent)
     {
-        let id = entry.provider.clone().unwrap_or_else(|| {
-            let prog = entry.command.split_whitespace().next().unwrap_or_default();
-            let base = thegn_core::util::basename(prog);
-            base.strip_suffix(".exe").unwrap_or(base).to_string()
-        });
-        return thegn_core::harness::harness(&id);
+        // The same resolution the command builder (`effective_agent`) uses, so a
+        // harness-specific flag can never land on another harness's command.
+        return thegn_core::harness::harness(&thegn_core::agent_task::provider_id(entry));
     }
     thegn_core::harness::harness(agent)
 }
@@ -862,6 +874,40 @@ mod tests {
         assert_eq!(
             assign_native_session_id(&cfg(), &mut l, || Some([1; 16])).as_deref(),
             Some("sess-9")
+        );
+    }
+
+    /// A headless resume (the autonomous retry) is the non-interactive form
+    /// with the cold launch's permission mode; an interactive resume is not.
+    #[test]
+    fn headless_resume_is_noninteractive_with_the_prompt_inside() {
+        let cmd = command_for(
+            &cfg(),
+            "claude",
+            "carry on",
+            true,
+            Some("sess-1"),
+            false,
+            None,
+        )
+        .expect("resolves");
+        assert!(cmd.starts_with("claude -p "), "got {cmd}");
+        assert!(cmd.contains("--resume sess-1"), "got {cmd}");
+        assert!(cmd.contains("--permission-mode acceptEdits"), "got {cmd}");
+        assert!(cmd.contains("carry on"), "got {cmd}");
+        let interactive = command_for(
+            &cfg(),
+            "claude",
+            "carry on",
+            false,
+            Some("sess-1"),
+            false,
+            None,
+        )
+        .expect("resolves");
+        assert!(
+            interactive.starts_with("claude --resume "),
+            "got {interactive}"
         );
     }
 }
