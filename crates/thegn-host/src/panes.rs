@@ -521,10 +521,23 @@ impl Panes {
         env: &[(String, String)],
         center: Rect,
     ) -> Result<u32> {
-        // Cross-process cleanup admission (THE-728): non-blocking, held only
-        // for the open itself.
+        self.spawn_argv_env_in(argv, cwd, cwd, env, center)
+    }
+
+    /// As [`Panes::spawn_argv_env`] with the owning worktree ROOT given
+    /// explicitly. Cross-process cleanup admission (THE-728) is keyed on the
+    /// root: non-blocking, held only for the open itself. A bare cwd is only
+    /// treated as its own root.
+    pub(crate) fn spawn_argv_env_in(
+        &mut self,
+        argv: &[String],
+        cwd: Option<&std::path::Path>,
+        root: Option<&std::path::Path>,
+        env: &[(String, String)],
+        center: Rect,
+    ) -> Result<u32> {
         let _admission =
-            crate::worktree_admission::admit_pane_open(cwd).map_err(|why| anyhow::anyhow!(why))?;
+            crate::worktree_admission::admit_pane_open(root).map_err(|why| anyhow::anyhow!(why))?;
         if self.daemon_cfg.is_some() {
             match self.spawn_daemon_backed(argv, cwd, env, center, None, None) {
                 Ok(id) => return Ok(id),
