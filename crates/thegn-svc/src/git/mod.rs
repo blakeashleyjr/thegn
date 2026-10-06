@@ -33,7 +33,7 @@ pub use cherry::CherryOps;
 pub use commit::{CommitOps, ResetMode};
 pub use custom::CustomOps;
 pub use patch::PatchOps;
-pub use plumbing::{MergeTreeOutcome, PlumbingOps};
+pub use plumbing::{CasOutcome, MergeTreeOutcome, PlumbingOps};
 pub use rebase::{PauseReason, RebaseOps, RebaseOpts, RebaseOutcome, RebaseStatus};
 pub use stage::StageOps;
 pub use stash::StashOps;
