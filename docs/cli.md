@@ -40,7 +40,10 @@ overlaps and unmet `after:` dependencies refuse without leaving a row. Active
 siblings whose scope cannot be read or parsed also refuse with the row and path
 named. `dispatch claim --allow-scope-overlap <reason>` and
 `dispatch put --force --force-reason <reason>` are explicit, audited overrides;
-`session open` has no override. Scope display:
+`session open` has no override. A `dispatch put` row recorded without
+`--session` names no worker, so a pane exit never stamps it (a daemon session id
+that matches no row is stale); close it with `dispatch set-status`. Pass
+`--session <id>` to give the row an identity. Scope display:
 `dispatch list` carries a `chunk` column (the file's basename), and JSON rows
 carry `chunk_path` plus `chunk_files_from_file_at_display_time` (the parsed
 `files:` list read at display time, not a claim of admitted ownership).
