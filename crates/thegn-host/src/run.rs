@@ -5436,9 +5436,10 @@ pub(crate) fn spawn_worktree_shell_pane(
                     ..Default::default()
                 },
             )?;
-            panes.spawn_argv_env(
+            panes.spawn_argv_env_in(
                 &spec.argv,
                 spec.cwd.as_deref().or(Some(dir)),
+                Some(dir),
                 &spec.env,
                 center,
             )
@@ -5484,9 +5485,10 @@ pub(crate) fn spawn_clean_shell_pane(
         // Daemon-routed like the shell it replaces — same `--die-with-parent`
         // gate (see `launch_spec_center`).
         let spec = crate::agent::launch_spec_center(cfg, &wt, None, "clean-shell")?;
-        return panes.spawn_argv_env(
+        return panes.spawn_argv_env_in(
             &spec.argv,
             spec.cwd.as_deref().or(Some(dir)),
+            Some(dir),
             &spec.env,
             center,
         );
@@ -5996,7 +5998,8 @@ fn attach_agent_pane(
     let cwd = spec.cwd.clone();
     let env = spec.env.clone();
     let argv = spec.argv.clone();
-    match panes.spawn_argv_env(&argv, cwd.as_deref(), &env, center) {
+    let root = std::path::PathBuf::from(&session.worktrees[gi].path);
+    match panes.spawn_argv_env_in(&argv, cwd.as_deref(), Some(&root), &env, center) {
         Ok(id) => {
             // Reap any panes the group's active tab already had, then back it
             // with the agent pane.
@@ -20975,9 +20978,14 @@ async fn event_loop<T: Terminal>(
                                                         &thegn_core::util::shell(),
                                                         cmdline,
                                                     );
-                                                    panes.spawn_argv(
+                                                    let root = session
+                                                        .active_group()
+                                                        .map(|g| std::path::PathBuf::from(&g.path));
+                                                    panes.spawn_argv_env_in(
                                                         &argv,
                                                         pane_cwd.as_deref(),
+                                                        root.as_deref(),
+                                                        &[],
                                                         chrome.center,
                                                     )
                                                 }
