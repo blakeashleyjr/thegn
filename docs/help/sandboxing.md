@@ -67,7 +67,11 @@ itself, a `~` mount) refuses the launch. A compose-backed spec is refused
 too ("sealed profile cannot verify compose volumes"), since compose-file
 volumes never appear in the mount list. A kept container is reused only
 if it carries the matching `thegn.seal_home` label and, when sealed, binds
-exactly the required mounts; otherwise it is recreated. Dropped `[sandbox] mounts` are
+exactly the required mounts; otherwise it is recreated. The one tolerated extra
+is the devenv `/nix` bind, and only while devenv is still on: turn devenv off and
+the container is recreated. Apple containers carry no seal label, so reuse there
+is judged on mounts alone, and a sealed Apple container whose inspect output has
+no mounts list at all is recreated rather than trusted. Dropped `[sandbox] mounts` are
 listed by `thegn doctor`; a user-authored one also warns once per path.
 The ssh identity-key mounts and the `~/.local/{state,share}` write
 carve-outs are not applied. Extend the allowlist with `[sandbox] mounts`
