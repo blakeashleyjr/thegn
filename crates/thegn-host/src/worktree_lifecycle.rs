@@ -279,10 +279,24 @@ impl LifecycleReport {
 /// absent while pending; the caller can surface `pending` through its normal
 /// trust/notification UI.
 pub fn resolve(cfg: &Config, repo_root: &Path, db: Option<&Db>) -> ResolvedHooks {
-    let approvals = db
-        .and_then(|db| db.repo_trust_approved(&repo_root.to_string_lossy()).ok())
+    resolve_with_approvals(cfg, repo_root, approvals_from_db(repo_root, db))
+}
+
+/// The persisted repo-trust approvals, or deny-all when there is no DB or the
+/// read fails (fail closed). Lets a caller snapshot approvals under a short DB
+/// lock and then run hooks without holding it.
+pub fn approvals_from_db(repo_root: &Path, db: Option<&Db>) -> Approvals {
+    db.and_then(|db| db.repo_trust_approved(&repo_root.to_string_lossy()).ok())
         .map(Approvals::from_canonical)
-        .unwrap_or_else(Approvals::deny_all);
+        .unwrap_or_else(Approvals::deny_all)
+}
+
+/// [`resolve`] against an already-fetched approval snapshot.
+pub fn resolve_with_approvals(
+    cfg: &Config,
+    repo_root: &Path,
+    approvals: Approvals,
+) -> ResolvedHooks {
     let (repo_hooks, repo_prepare) = thegn_core::config::load_repo_hooks(repo_root)
         .unwrap_or_else(|| (thegn_core::config::HooksConfig::default(), Vec::new()));
     // THE-515: the one refusing selector — an ambiguous trusted overlay
@@ -342,7 +356,32 @@ pub fn run_event_with_db(
     mode: HookExecutionMode,
     db: Option<&Db>,
 ) -> LifecycleReport {
-    let policy = resolve(cfg, repo_root, db);
+    run_event_with_approvals(
+        cfg,
+        repo_root,
+        worktree,
+        branch,
+        workspace,
+        event,
+        mode,
+        approvals_from_db(repo_root, db),
+    )
+}
+
+/// [`run_event_with_db`] against a pre-fetched approval snapshot, so no DB
+/// handle (or lock) is needed while the hooks run.
+#[allow(clippy::too_many_arguments)]
+pub fn run_event_with_approvals(
+    cfg: &Config,
+    repo_root: &Path,
+    worktree: &Path,
+    branch: &str,
+    workspace: &str,
+    event: HookEvent,
+    mode: HookExecutionMode,
+    approvals: Approvals,
+) -> LifecycleReport {
+    let policy = resolve_with_approvals(cfg, repo_root, approvals);
     let specs = policy.entries(event).to_vec();
     let context = context(event, repo_root, worktree, branch, workspace);
     let cwd = cwd(event, repo_root, worktree);
@@ -400,41 +439,83 @@ pub fn schedule_post_create(
     db: Option<&Db>,
     waker: Option<termwiz::terminal::TerminalWaker>,
 ) -> Result<(), LifecycleReport> {
+    schedule_post_create_with_approvals(
+        cfg,
+        repo_root,
+        worktree,
+        branch,
+        workspace,
+        approvals_from_db(repo_root, db),
+        waker,
+    )
+}
+
+/// [`schedule_post_create`] against a pre-fetched approval snapshot.
+#[allow(clippy::too_many_arguments)]
+pub fn schedule_post_create_with_approvals(
+    cfg: &Config,
+    repo_root: &Path,
+    worktree: &Path,
+    branch: &str,
+    workspace: &str,
+    approvals: Approvals,
+    waker: Option<termwiz::terminal::TerminalWaker>,
+) -> Result<(), LifecycleReport> {
+    if post_create_blocking_phase(cfg, repo_root, worktree, branch, workspace, approvals)? {
+        return Ok(());
+    }
+    spawn_event(
+        cfg.clone(),
+        repo_root.to_path_buf(),
+        worktree.to_path_buf(),
+        branch.to_string(),
+        workspace.to_string(),
+        HookEvent::PostCreate,
+        HookExecutionMode::User,
+        waker,
+    )
+    .map_err(|error| spawn_failure_report(HookEvent::PostCreate, error))
+}
+
+/// The part of post-create that must finish before a worktree is registered:
+/// the event runs synchronously only when an entry explicitly requests
+/// `wait=true` (a blocking failure is returned as `Err`). Returns `Ok(true)`
+/// when it ran, `Ok(false)` when nothing waits and the caller should
+/// [`spawn_event`] the event after registering the worktree, so a background
+/// hook never starts before its row exists.
+#[allow(clippy::too_many_arguments)]
+pub fn post_create_blocking_phase(
+    cfg: &Config,
+    repo_root: &Path,
+    worktree: &Path,
+    branch: &str,
+    workspace: &str,
+    approvals: Approvals,
+) -> Result<bool, LifecycleReport> {
     // A freshly created/registered worktree may reuse a once-removed path.
     forget_removed_worktree(worktree);
-    let policy = resolve(cfg, repo_root, db);
+    let policy = resolve_with_approvals(cfg, repo_root, approvals.clone());
     let waits_for_pane = policy
         .entries(HookEvent::PostCreate)
         .iter()
         .any(|spec| spec.wait);
-    if waits_for_pane {
-        let report = run_event_with_db(
-            cfg,
-            repo_root,
-            worktree,
-            branch,
-            workspace,
-            HookEvent::PostCreate,
-            HookExecutionMode::User,
-            db,
-        );
-        if report.blocked() {
-            Err(report)
-        } else {
-            Ok(())
-        }
+    if !waits_for_pane {
+        return Ok(false);
+    }
+    let report = run_event_with_approvals(
+        cfg,
+        repo_root,
+        worktree,
+        branch,
+        workspace,
+        HookEvent::PostCreate,
+        HookExecutionMode::User,
+        approvals,
+    );
+    if report.blocked() {
+        Err(report)
     } else {
-        spawn_event(
-            cfg.clone(),
-            repo_root.to_path_buf(),
-            worktree.to_path_buf(),
-            branch.to_string(),
-            workspace.to_string(),
-            HookEvent::PostCreate,
-            HookExecutionMode::User,
-            waker,
-        )
-        .map_err(|error| spawn_failure_report(HookEvent::PostCreate, error))
+        Ok(true)
     }
 }
 
