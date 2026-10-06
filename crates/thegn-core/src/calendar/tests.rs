@@ -608,8 +608,8 @@ fn nonexistent_local_times_follow_the_gap_policy() {
     let back = tz::resolve_local(local, z, GapPolicy::Earliest).unwrap();
     assert_eq!(
         back,
-        utc(2026, 3, 8, 6, 59),
-        "01:59 EST, just before the gap"
+        utc(2026, 3, 8, 6, 59) + chrono::Duration::seconds(59),
+        "01:59:59 EST, just before the gap"
     );
 
     // Distinct times inside the gap must stay distinct. Scanning for the first
@@ -2069,5 +2069,54 @@ fn expansion_errors_render_fixed_labels() {
         ExpansionLimit::EventChildren,
     ] {
         assert!(!limit.to_string().is_empty());
+    }
+}
+
+#[test]
+fn gap_resolution_uses_real_transitions_in_every_hemisphere() {
+    let at = |_z: Tz, y, m, dd, h, mi| d(y, m, dd).and_hms_opt(h, mi, 0).unwrap();
+    // Europe/Berlin 2026-03-29 02:30 -> 03:30 CEST = 01:30Z (not 00:30Z).
+    let b = tz::resolve_local(
+        at(Tz::Europe__Berlin, 2026, 3, 29, 2, 30),
+        Tz::Europe__Berlin,
+        GapPolicy::ShiftForward,
+    )
+    .unwrap();
+    assert_eq!(b, utc(2026, 3, 29, 1, 30));
+    // Lord Howe: 02:00 -> 02:30 (+10:30 -> +11); 02:10 shifts by 30 minutes.
+    let z = Tz::Australia__Lord_Howe;
+    let l = at(z, 2026, 10, 4, 2, 10);
+    let got = tz::resolve_local(l, z, GapPolicy::ShiftForward).unwrap();
+    assert_eq!(got, utc(2026, 10, 3, 15, 40), "02:40 +11");
+    let back = tz::resolve_local(l, z, GapPolicy::Earliest).unwrap();
+    assert_eq!(
+        back,
+        utc(2026, 10, 3, 15, 29) + chrono::Duration::seconds(59)
+    );
+    // Pacific/Apia skipped 2011-12-30 entirely.
+    let z = Tz::Pacific__Apia;
+    let l = at(z, 2011, 12, 30, 12, 0);
+    let got = tz::resolve_local(l, z, GapPolicy::ShiftForward).unwrap();
+    assert!(got.with_timezone(&z).naive_local() >= l);
+    assert_eq!(
+        got.with_timezone(&z).naive_local(),
+        at(z, 2011, 12, 31, 12, 0)
+    );
+    let back = tz::resolve_local(l, z, GapPolicy::Earliest).unwrap();
+    assert!(back.with_timezone(&z).naive_local() < l);
+    // Southern-hemisphere and edge dates never panic.
+    for z in [
+        Tz::America__New_York,
+        Tz::Australia__Sydney,
+        Tz::Pacific__Apia,
+    ] {
+        for p in [
+            GapPolicy::Skip,
+            GapPolicy::ShiftForward,
+            GapPolicy::Earliest,
+        ] {
+            let _ = tz::resolve_local(chrono::NaiveDateTime::MIN, z, p);
+            let _ = tz::resolve_local(chrono::NaiveDateTime::MAX, z, p);
+        }
     }
 }
