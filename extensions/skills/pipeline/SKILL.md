@@ -253,8 +253,9 @@ The monitor makes mechanism decisions per the chart and escalates judgment
 calls (retry vs park) by writing `thegn dispatch note <row> --text …` and
 surfacing them in its final paragraph. It has no conversation with the Lead
 while it runs. It never uses `--force`; a refused `done` is a note — escalate.
-`timeout_secs` is seconds and `--timeout` is milliseconds; the monitor always
-passes a timeout. A timeout or blocked result follows the stage's `on_blocked`.
+`timeout_secs` is seconds (validated to be at least 1 and at most 10 years) and
+`dispatch wait --timeout` is milliseconds, so pass `timeout_secs * 1000`; the
+monitor always passes a timeout. A timeout or blocked result follows the stage's `on_blocked`.
 
 ## 5. Verdict — exit 0 is not done
 

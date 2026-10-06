@@ -89,6 +89,8 @@ pub fn parse_frontmatter(md: &str) -> Result<ChunkScope, ParseError> {
         After,
     }
     let mut scope = ChunkScope::default();
+    // Which known keys have been declared, independent of their values.
+    let mut seen = [false; 3];
     // The key the current `- item` lines belong to (`None` = none yet, or the
     // last key was unknown/ignored).
     let mut current: Option<Key> = None;
@@ -134,13 +136,15 @@ pub fn parse_frontmatter(md: &str) -> Result<ChunkScope, ParseError> {
                 continue;
             }
         };
-        let already = match current {
-            Some(Key::Files) => !scope.files.is_empty(),
-            Some(Key::Overlaps) => !scope.overlaps.is_empty(),
-            Some(Key::After) => !scope.after.is_empty(),
+        // Key presence is tracked apart from the accumulated values: an empty
+        // first declaration (`files: []`, bare `files:`) must still count.
+        let slot = match current {
+            Some(Key::Files) => 0,
+            Some(Key::Overlaps) => 1,
+            Some(Key::After) => 2,
             None => unreachable!(),
         };
-        if already {
+        if std::mem::replace(&mut seen[slot], true) {
             return Err(ParseError {
                 line: lineno,
                 message: format!("duplicate `{key}:` key — a scope is declared once"),
@@ -361,6 +365,50 @@ pub fn verdict(new: &ChunkScope, active: &[ActiveScope], done: &HashSet<String>)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn duplicate_known_keys_are_rejected_whatever_the_value_shape() {
+        // Every first/second declaration shape, for every known key.
+        let shapes = [
+            ("{k}: []", "inline-empty"),
+            ("{k}:", "bare-empty"),
+            ("{k}: [ , ]", "blank-items"),
+            ("{k}:\n  -\n  - # c", "empty-block"),
+            ("{k}: a", "scalar"),
+            ("{k}: [a, b]", "inline"),
+            ("{k}:\n  - a", "block"),
+        ];
+        for key in ["files", "overlaps", "after"] {
+            for (first, f_name) in shapes {
+                for (second, s_name) in shapes {
+                    let a = first.replace("{k}", key);
+                    let b = second.replace("{k}", key);
+                    let md = format!("---\n{a}\n{b}\n---\n");
+                    let err = parse_frontmatter(&md)
+                        .expect_err(&format!("{key} {f_name} then {s_name} must fail"));
+                    let line = 2 + a.lines().count();
+                    assert_eq!(err.line, line, "{key} {f_name} then {s_name}");
+                    assert!(err.message.contains(&format!("duplicate `{key}:`")));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn single_empty_declaration_and_repeated_unknown_keys_stay_legal() {
+        for key in ["files", "overlaps", "after"] {
+            assert_eq!(
+                parse_frontmatter(&format!("---\n{key}: []\n---\n")),
+                Ok(ChunkScope::default())
+            );
+            assert_eq!(
+                parse_frontmatter(&format!("---\n{key}:\n---\n")),
+                Ok(ChunkScope::default())
+            );
+        }
+        let md = "---\nnote: a\nnote: b\nfiles: [x]\nother:\nother:\n---\n";
+        assert_eq!(parse_frontmatter(md).unwrap().files, s(&["x"]));
+    }
 
     fn s(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| s.to_string()).collect()
