@@ -286,42 +286,97 @@ struct TreeEntry {
     sha: String,
 }
 
-/// Parse one `git ls-tree -z` record. A missing record is a valid tree lookup
-/// result (for example, an added path has no base entry); malformed output is
-/// an I/O/protocol error and must not be mistaken for a non-gitlink.
-fn parse_tree_entry(output: &str, expected_path: &str) -> Result<Option<TreeEntry>> {
-    let mut found = None;
+/// Budgets for conflict enrichment. Exceeding any of them is an error, never a
+/// silently truncated (partially trusted) conflict set.
+const MAX_CONFLICT_PATHS: usize = 20_000;
+const MAX_CONFLICT_PATH_BYTES: usize = 4 * 1024 * 1024;
+/// Path bytes per `ls-tree` invocation, so argv length never depends on the
+/// size of the conflict set (well under the platform ARG_MAX floor).
+const CHUNK_PATH_BYTES: usize = 48 * 1024;
+const CHUNK_MAX_PATHS: usize = 1024;
+const ENRICH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+
+fn valid_oid(s: &str) -> bool {
+    matches!(s.len(), 40 | 64) && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn valid_mode(s: &str) -> bool {
+    s.len() == 6 && s.bytes().all(|b| (b'0'..=b'7').contains(&b))
+}
+
+/// Parse `git ls-tree -z` output for a set of requested paths, all-or-error:
+/// every record must be well formed (valid mode and object id), name a
+/// requested path, and appear at most once. Requested paths with no record are
+/// simply absent from the result (a valid tree lookup outcome).
+fn parse_tree_entries(
+    output: &str,
+    requested: &std::collections::HashSet<&str>,
+) -> Result<HashMap<String, TreeEntry>> {
+    let mut found: HashMap<String, TreeEntry> = HashMap::new();
     for record in output.split('\0').filter(|record| !record.is_empty()) {
         let (meta, path) = record
             .split_once('\t')
             .ok_or_else(|| anyhow::anyhow!("git ls-tree returned a malformed record"))?;
-        if path != expected_path {
-            continue;
+        let mut fields = meta.split(' ');
+        let (mode, _kind, sha) = match (fields.next(), fields.next(), fields.next(), fields.next())
+        {
+            (Some(m), Some(k), Some(s), None) => (m, k, s),
+            _ => anyhow::bail!("git ls-tree record has the wrong field count"),
+        };
+        if !valid_mode(mode) || !valid_oid(sha) {
+            anyhow::bail!("git ls-tree record has an invalid mode or object id");
         }
-        let mut fields = meta.split_whitespace();
-        let mode = fields
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("git ls-tree record has no mode"))?;
-        let _kind = fields
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("git ls-tree record has no object kind"))?;
-        let sha = fields
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("git ls-tree record has no object id"))?;
-        if found.is_some() {
-            anyhow::bail!("git ls-tree returned duplicate records for {expected_path:?}");
+        if !requested.contains(path) {
+            anyhow::bail!("git ls-tree returned an unrequested entry {path:?}");
         }
-        found = Some(TreeEntry {
+        let entry = TreeEntry {
             mode: mode.to_string(),
             sha: sha.to_string(),
-        });
+        };
+        if found.insert(path.to_string(), entry).is_some() {
+            anyhow::bail!("git ls-tree returned duplicate records for {path:?}");
+        }
     }
     Ok(found)
 }
 
-fn tree_entry(loc: &GitLoc, tree: &str, path: &str) -> Result<Option<TreeEntry>> {
-    let output = run(loc, &["ls-tree", "-z", tree, "--", path])?;
-    parse_tree_entry(&output, path)
+/// Resolve every path in `paths` against `tree` with chunked `ls-tree` calls
+/// (a number of processes proportional to total path bytes / chunk size, not
+/// to the path count).
+fn tree_entries(
+    loc: &GitLoc,
+    tree: &str,
+    paths: &[&str],
+    deadline: std::time::Instant,
+) -> Result<HashMap<String, TreeEntry>> {
+    let mut all = HashMap::new();
+    let mut start = 0;
+    while start < paths.len() {
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!("submodule conflict enrichment exceeded its time budget");
+        }
+        let mut end = start;
+        let mut bytes = 0usize;
+        while end < paths.len()
+            && end - start < CHUNK_MAX_PATHS
+            && (end == start || bytes + paths[end].len() <= CHUNK_PATH_BYTES)
+        {
+            bytes += paths[end].len();
+            end += 1;
+        }
+        let chunk = &paths[start..end];
+        let mut args: Vec<&str> = vec!["ls-tree", "-z", tree, "--"];
+        args.extend_from_slice(chunk);
+        let output = run(loc, &args)?;
+        let requested: std::collections::HashSet<&str> = chunk.iter().copied().collect();
+        for (path, entry) in parse_tree_entries(&output, &requested)? {
+            if all.insert(path.clone(), entry).is_some() {
+                anyhow::bail!("git ls-tree returned duplicate records for {path:?}");
+            }
+        }
+        start = end;
+    }
+    Ok(all)
 }
 
 /// Resolve mode-160000 conflict tips from the merge input trees, not the
@@ -329,6 +384,9 @@ fn tree_entry(loc: &GitLoc, tree: &str, path: &str) -> Result<Option<TreeEntry>>
 /// database and therefore does not create the unmerged index records that
 /// `git ls-files -u` would require. `base` is read when supplied so an
 /// unavailable explicit merge input fails closed just like ours/theirs.
+///
+/// Lookups are batched per tree and bounded by path-count, path-byte and
+/// wall-time budgets; exceeding any budget is an error (fail closed).
 pub(crate) fn conflicts(
     loc: &GitLoc,
     paths: &[String],
@@ -336,30 +394,48 @@ pub(crate) fn conflicts(
     ours: &str,
     theirs: &str,
 ) -> Result<Vec<SubmoduleConflict>> {
+    if paths.len() > MAX_CONFLICT_PATHS {
+        anyhow::bail!(
+            "too many conflict paths for submodule enrichment: {} > {MAX_CONFLICT_PATHS}",
+            paths.len()
+        );
+    }
+    let total_bytes: usize = paths.iter().map(String::len).sum();
+    if total_bytes > MAX_CONFLICT_PATH_BYTES {
+        anyhow::bail!(
+            "conflict paths too large for submodule enrichment: {total_bytes} > {MAX_CONFLICT_PATH_BYTES} bytes"
+        );
+    }
+    let deadline = std::time::Instant::now() + ENRICH_DEADLINE;
+    let mut unique: Vec<&str> = Vec::with_capacity(paths.len());
+    let mut seen = std::collections::HashSet::new();
+    for path in paths {
+        if seen.insert(path.as_str()) {
+            unique.push(path.as_str());
+        }
+    }
+    // The base lookup only validates availability of an explicit merge input.
+    if let Some(tree) = base {
+        tree_entries(loc, tree, &unique, deadline)?;
+    }
+    let ours_entries = tree_entries(loc, ours, &unique, deadline)?;
+    let theirs_entries = tree_entries(loc, theirs, &unique, deadline)?;
+
     let mut conflicts = Vec::new();
     for path in paths {
-        let base_entry = base.map(|tree| tree_entry(loc, tree, path)).transpose()?;
-        let ours_entry = tree_entry(loc, ours, path)?;
-        let theirs_entry = tree_entry(loc, theirs, path)?;
-
+        let ours_entry = ours_entries.get(path);
+        let theirs_entry = theirs_entries.get(path);
         // A path is a gitlink conflict when either merge side carries the
-        // atomic gitlink mode. The base lookup above is intentionally retained
-        // for explicit merge-base validation, but is not required to be a
-        // gitlink (a gitlink may have been added or removed).
-        let _ = base_entry;
-        if ours_entry
-            .as_ref()
-            .is_none_or(|entry| entry.mode != "160000")
-            && theirs_entry
-                .as_ref()
-                .is_none_or(|entry| entry.mode != "160000")
+        // atomic gitlink mode.
+        if ours_entry.is_none_or(|entry| entry.mode != "160000")
+            && theirs_entry.is_none_or(|entry| entry.mode != "160000")
         {
             continue;
         }
         conflicts.push(SubmoduleConflict {
             path: path.clone(),
-            ours_sha: ours_entry.map(|entry| entry.sha).unwrap_or_default(),
-            theirs_sha: theirs_entry.map(|entry| entry.sha).unwrap_or_default(),
+            ours_sha: ours_entry.map(|e| e.sha.clone()).unwrap_or_default(),
+            theirs_sha: theirs_entry.map(|e| e.sha.clone()).unwrap_or_default(),
         });
     }
     Ok(conflicts)
@@ -392,14 +468,30 @@ mod tests {
     }
 
     #[test]
-    fn tree_parser_distinguishes_missing_and_malformed_records() {
-        let got = parse_tree_entry("160000 commit aaaaaaa\tvendor/lib\0", "vendor/lib")
-            .unwrap()
-            .unwrap();
-        assert_eq!(got.mode, "160000");
-        assert_eq!(got.sha, "aaaaaaa");
-        assert!(parse_tree_entry("", "vendor/lib").unwrap().is_none());
-        assert!(parse_tree_entry("not-a-tree-record\0", "vendor/lib").is_err());
+    fn tree_parser_is_all_or_error() {
+        let sha = "a".repeat(40);
+        let req: std::collections::HashSet<&str> = ["vendor/lib", "b"].into_iter().collect();
+        let ok = format!("160000 commit {sha}\tvendor/lib\0");
+        let got = parse_tree_entries(&ok, &req).unwrap();
+        assert_eq!(got["vendor/lib"].mode, "160000");
+        assert_eq!(got["vendor/lib"].sha, sha);
+        assert!(parse_tree_entries("", &req).unwrap().is_empty());
+        assert!(parse_tree_entries("not-a-tree-record\0", &req).is_err());
+        // unrequested, duplicate, bad mode, bad oid, bad field count
+        assert!(parse_tree_entries(&format!("160000 commit {sha}\tother\0"), &req).is_err());
+        assert!(parse_tree_entries(&format!("{ok}{ok}"), &req).is_err());
+        assert!(parse_tree_entries(&format!("16x000 commit {sha}\tb\0"), &req).is_err());
+        assert!(parse_tree_entries("160000 commit aaaaaaa\tb\0", &req).is_err());
+        assert!(parse_tree_entries(&format!("160000 commit {sha} x\tb\0"), &req).is_err());
+    }
+
+    #[test]
+    fn conflicts_refuse_over_budget_path_sets() {
+        let repo = TestRepo::new("submodule-conflict-budget");
+        let many: Vec<String> = (0..=MAX_CONFLICT_PATHS).map(|i| format!("p{i}")).collect();
+        assert!(conflicts(&repo.loc(), &many, None, "HEAD", "HEAD").is_err());
+        let huge = vec!["x".repeat(MAX_CONFLICT_PATH_BYTES + 1)];
+        assert!(conflicts(&repo.loc(), &huge, None, "HEAD", "HEAD").is_err());
     }
 
     #[test]
