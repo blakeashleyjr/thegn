@@ -730,6 +730,8 @@ struct ProcCtl {
     pid: u32,
     phase: Mutex<ProcPhase>,
     changed: std::sync::Condvar,
+    /// Serializes `proc.kill` and remembers its settled outcome.
+    kill_gate: Mutex<Option<ProcKillOutcome>>,
 }
 
 impl ProcCtl {
@@ -738,6 +740,7 @@ impl ProcCtl {
             pid,
             phase: Mutex::new(ProcPhase::Running),
             changed: std::sync::Condvar::new(),
+            kill_gate: Mutex::new(None),
         })
     }
 
@@ -785,6 +788,8 @@ pub enum ProcKillOutcome {
     Terminated { code: i32 },
     /// Needed SIGKILL; reaped, `proc.exit` delivered.
     Killed { code: i32 },
+    /// The process had already exited on its own when the kill arrived.
+    Exited { code: i32 },
     /// No live channel (already exited, or never existed): nothing to kill.
     Gone,
     /// Termination was requested but not confirmed within the bound.
@@ -898,6 +903,9 @@ fn proc_spawn_response(req: &Request, writer: &SharedWriter, procs: &ProcRegistr
     }
 }
 
+/// Spawn a streaming child in its own process group. Note the whole group is
+/// SIGKILLed once the leader exits, so background jobs a command leaves in its
+/// group (`foo &`) do not outlive it.
 fn do_spawn(p: SpawnParams, writer: SharedWriter, procs: ProcRegistry) -> Result<()> {
     let Some((cmd, args)) = p.argv.split_first() else {
         bail!("empty argv");
@@ -994,10 +1002,6 @@ fn do_spawn(p: SpawnParams, writer: SharedWriter, procs: ProcRegistry) -> Result
             // Err = no WNOWAIT support: fall through to a plain reap.
             let observed = crate::plugin::proc::wait_leader_exit_nowait(pid).is_ok();
             let mut child = slot2.lock().unwrap().take();
-            #[expect(
-                clippy::disallowed_methods,
-                reason = "leader already exited (waitid) or no WNOWAIT support; this reaps it"
-            )]
             let reap = |c: &mut Option<Child>| {
                 c.as_mut()
                     .and_then(|c| c.wait().ok())
@@ -1013,9 +1017,22 @@ fn do_spawn(p: SpawnParams, writer: SharedWriter, procs: ProcRegistry) -> Result
                 *phase = ProcPhase::Reaped(code);
                 code
             } else {
-                let code = reap(&mut child);
-                *ctl2.phase.lock().unwrap() = ProcPhase::Reaped(code);
-                code
+                // No WNOWAIT: poll try_wait, reaping only under the phase lock so
+                // a concurrent signal() never sees Running for a released pid.
+                loop {
+                    let mut phase = ctl2.phase.lock().unwrap();
+                    let done = match child.as_mut().map(Child::try_wait) {
+                        Some(Ok(None)) => None,
+                        Some(Ok(Some(st))) => Some(st.code().unwrap_or(-1)),
+                        Some(Err(_)) | None => Some(-1),
+                    };
+                    if let Some(code) = done {
+                        *phase = ProcPhase::Reaped(code);
+                        break code;
+                    }
+                    drop(phase);
+                    std::thread::sleep(Duration::from_millis(20));
+                }
             };
             let drain_deadline = Instant::now() + RELAY_DRAIN_BOUND;
             while relays.iter().any(|h| !h.is_finished()) && Instant::now() < drain_deadline {
@@ -1048,7 +1065,9 @@ fn do_spawn(p: SpawnParams, writer: SharedWriter, procs: ProcRegistry) -> Result
         }
         drop(map);
         if let Some(mut c) = slot.lock().unwrap().take() {
+            let mut phase = ctl.phase.lock().unwrap();
             kill_and_reap(&mut c);
+            *phase = ProcPhase::Reaped(-1);
         }
         return Err(e).context("spawn bridge-proc-wait thread");
     }
@@ -1056,10 +1075,6 @@ fn do_spawn(p: SpawnParams, writer: SharedWriter, procs: ProcRegistry) -> Result
 }
 
 /// Kill a not-yet-registered child's whole group and reap it.
-#[expect(
-    clippy::disallowed_methods,
-    reason = "the group was just SIGKILLed; this wait only reaps"
-)]
 fn kill_and_reap(child: &mut Child) {
     crate::plugin::proc::kill_group(child.id());
     let _ = child.wait(); // best-effort: reap-or-not is terminal here
@@ -1142,10 +1157,24 @@ fn kill_channel(ctl: Option<Arc<ProcCtl>>) -> ProcKillOutcome {
     let Some(ctl) = ctl else {
         return ProcKillOutcome::Gone;
     };
+    // One kill in flight per channel: duplicates queue here and then return the
+    // first kill's outcome instead of re-signalling.
+    let mut gate = ctl.kill_gate.lock().unwrap();
+    if let Some(done) = *gate {
+        return done;
+    }
+    let outcome = kill_channel_inner(&ctl);
+    if outcome != ProcKillOutcome::Timeout {
+        *gate = Some(outcome);
+    }
+    outcome
+}
+
+fn kill_channel_inner(ctl: &ProcCtl) -> ProcKillOutcome {
     if !ctl.signal(false) {
         // Already reaped: just wait for the announcement.
         return match ctl.wait_announced(Instant::now() + KILL_FORCE_WAIT) {
-            Some(code) => ProcKillOutcome::Terminated { code },
+            Some(code) => ProcKillOutcome::Exited { code },
             None => ProcKillOutcome::Timeout,
         };
     }
