@@ -77,8 +77,15 @@ snapshot that `doctor` or a bundle can reconstruct later.
 
 For a flame graph, use the feature-gated in-process profiler: build with the
 `profiling` feature, send `SIGUSR2` to the live process to start sampling, and
-send it again to write an SVG under the state `profiles` directory. The
-external profiler path is separate and requires profiling thegn as a child.
+send it again to stop. Stopping is asynchronous: a background worker builds and
+writes the SVG, so the UI never stalls, and the result (success or failure) is
+logged on the `thegn::perf` target. Signals sent while a start or dump is in
+flight are coalesced (dropped), never queued. Reports go to the state
+`profiles` directory (mode 0700) as `flamegraph-<time>-p<pid>-g<generation>.svg`
+(mode 0600), written via an exclusive temp file and never overwriting an
+existing report. A failed start leaves the profiler idle, so the next signal
+retries. The external profiler path is separate and requires profiling thegn as
+a child.
 
 ## Debugging users' programs
 
