@@ -511,13 +511,15 @@ impl NotificationStore for Db {
                 return Ok(ExitAttribution::Exact(run));
             }
         }
-        // A non-empty session id that matches no row is Stale UNLESS the
-        // worktree has an ACTIVE session-less row: rows dispatched without a
-        // session (UI tracker dispatch, `dispatch put` without --session) run
-        // in daemon panes that still report a daemon session id on exit. A
-        // replaced run's row always carries a non-null session, so that case
-        // still falls through to Stale and the THE-238 fence holds.
-        let sid_missed = session_id.is_some_and(|s| !s.is_empty());
+        // A non-empty session id that matches no row is Stale, full stop
+        // (THE-733): in daemon mode EVERY pane has a session id, so letting a
+        // miss fall back to "the worktree's one session-less active row" let
+        // a plain shell's exit stamp the agent's row. UI tracker dispatches
+        // bind their pane's session to the row before attributing instead
+        // (`bind_dispatch_session`).
+        if session_id.is_some_and(|s| !s.is_empty()) {
+            return Ok(ExitAttribution::Stale);
+        }
         // Rule 2 — identity-less: exactly one ACTIVE row for the worktree. The
         // active test runs through the typed status (never a SQL string list),
         // so `Unknown` is neither active nor terminal and a corrupt row can't
@@ -536,9 +538,6 @@ impl NotificationStore for Db {
                 continue;
             }
             let row_sid: String = r.get(3)?;
-            if sid_missed && !row_sid.is_empty() {
-                continue;
-            }
             if found.is_some() {
                 return Ok(ExitAttribution::Ambiguous);
             }
@@ -551,7 +550,6 @@ impl NotificationStore for Db {
         }
         Ok(match found {
             Some(run) => ExitAttribution::Legacy(run),
-            None if sid_missed => ExitAttribution::Stale,
             None => ExitAttribution::NoRow,
         })
     }

@@ -416,13 +416,16 @@ fn dispatch_agent(ctx: &mut TrackerCtx) {
                 thegn_core::msg::warn(&message);
                 return;
             }
+            let dispatch_id: Option<i64>;
             {
                 // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
-                let _ = db.put_agent_dispatch(thegn_core::issue::NewDispatch::new(
-                    &issue_id,
-                    &wt_str,
-                    &agent_name,
-                ));
+                dispatch_id = db
+                    .put_agent_dispatch(thegn_core::issue::NewDispatch::new(
+                        &issue_id,
+                        &wt_str,
+                        &agent_name,
+                    ))
+                    .ok();
                 let _ = db.link_issue(&wt_str, &issue_id); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                 if let Err(report) = crate::worktree_lifecycle::schedule_post_create(
                     &cfg2,
@@ -445,6 +448,12 @@ fn dispatch_agent(ctx: &mut TrackerCtx) {
                     return;
                 }
             }
+            // THE-733: tell the daemon which row this launch is, so it binds the
+            // session id at session start (see `DISPATCH_ROW_ENV`).
+            if let Some(row) = dispatch_id {
+                spec.env
+                    .push((thegn_core::issue::DISPATCH_ROW_ENV.into(), row.to_string()));
+            }
             // The dispatch lands on the repo's ambient env (no wizard pick).
             let env = crate::wizard::ambient_env_name_live(&cfg2, &root);
             let payload = crate::wizard::CreatedWorktree {
@@ -454,6 +463,7 @@ fn dispatch_agent(ctx: &mut TrackerCtx) {
                 agent: agent_name.clone(),
                 spec,
                 env,
+                dispatch_id,
             };
             // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
             let _ = tx2.send(crate::wizard::CreateEvent::Done {
