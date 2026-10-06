@@ -284,8 +284,7 @@ fn priority_to_int(p: IssuePriority) -> i64 {
 /// backslash must be escaped first so we don't double-escape our own output.
 // ---- team workflow-state resolution ----------------------------------------
 
-const TEAM_STATES_QUERY: &str =
-    "query($id: String!) { issue(id: $id) { team { id states { nodes { id name type } } } } }";
+const TEAM_STATES_QUERY: &str = "query($id: String!) { issue(id: $id) { team { id states { nodes { id name type position } } } } }";
 
 #[derive(Serialize)]
 struct TeamStatesVars<'a> {
@@ -319,10 +318,12 @@ struct TeamStateNode {
     name: String,
     #[serde(rename = "type")]
     state_type: String,
+    #[serde(default)]
+    position: f64,
 }
 
-/// The one state of `type_str` in the issue's own team. No match or more than
-/// one is an explicit error: never another team's state, never API order.
+/// The state of `type_str` in the issue's own team, lowest position first. No
+/// match is an explicit error: never another team's state.
 fn pick_team_state(data: &TeamStatesData, type_str: &str) -> Result<String, IssueError> {
     let team = data
         .issue
@@ -337,20 +338,22 @@ fn pick_team_state(data: &TeamStatesData, type_str: &str) -> Result<String, Issu
         .iter()
         .filter(|n| n.state_type == type_str)
         .collect();
-    match matches.as_slice() {
-        [one] => Ok(one.id.clone()),
-        [] => Err(IssueError::Api(format!(
-            "the issue's team has no workflow state of type {type_str}"
-        ))),
-        many => {
-            let names: Vec<&str> = many.iter().map(|n| n.name.as_str()).collect();
-            Err(IssueError::Api(format!(
-                "the issue's team has {} workflow states of type {type_str} ({}); status is ambiguous",
-                many.len(),
-                names.join(", ")
-            )))
-        }
-    }
+    // Several states may share a type; the lowest workflow `position` (column
+    // order) wins, ties broken by name then id. Never API order.
+    matches
+        .into_iter()
+        .min_by(|a, b| {
+            a.position
+                .total_cmp(&b.position)
+                .then_with(|| a.name.cmp(&b.name))
+                .then_with(|| a.id.cmp(&b.id))
+        })
+        .map(|n| n.id.clone())
+        .ok_or_else(|| {
+            IssueError::Api(format!(
+                "the issue's team has no workflow state of type {type_str}"
+            ))
+        })
 }
 
 fn escape_graphql_str(s: &str) -> String {
@@ -917,7 +920,8 @@ mod tests {
     fn team_states(states: &[(&str, &str, &str)]) -> serde_json::Value {
         let nodes: Vec<_> = states
             .iter()
-            .map(|(id, name, ty)| json!({"id": id, "name": name, "type": ty}))
+            .enumerate()
+            .map(|(i, (id, name, ty))| json!({"id": id, "name": name, "type": ty, "position": i}))
             .collect();
         json!({"data": {"issue": {"team": {"id": "team-a", "states": {"nodes": nodes}}}}})
     }
@@ -944,20 +948,29 @@ mod tests {
         assert!(err.contains("no workflow state of type completed"), "{err}");
     }
 
+    fn positioned(states: &[(&str, &str, f64)]) -> TeamStatesData {
+        let nodes: Vec<_> = states
+            .iter()
+            .map(|(id, name, pos)| json!({"id": id, "name": name, "type": "started", "position": pos}))
+            .collect();
+        parse_states(json!({"data": {"issue": {"team": {"id": "t", "states": {"nodes": nodes}}}}}))
+    }
+
     #[test]
-    fn pick_team_state_multiple_same_type_is_ambiguous_in_either_order() {
-        let fwd = parse_states(team_states(&[
-            ("s1", "Done", "completed"),
-            ("s2", "Shipped", "completed"),
-        ]));
-        let rev = parse_states(team_states(&[
-            ("s2", "Shipped", "completed"),
-            ("s1", "Done", "completed"),
-        ]));
-        for d in [fwd, rev] {
-            let err = pick_team_state(&d, "completed").unwrap_err().to_string();
-            assert!(err.contains("ambiguous") && err.contains("Done") && err.contains("Shipped"));
+    fn pick_team_state_lowest_position_wins_in_either_order() {
+        let ip = ("ip", "In Progress", 1.0);
+        let ir = ("ir", "In Review", 2.0);
+        for d in [positioned(&[ip, ir]), positioned(&[ir, ip])] {
+            assert_eq!(pick_team_state(&d, "started").unwrap(), "ip");
         }
+    }
+
+    #[test]
+    fn pick_team_state_position_ties_break_by_name_then_id() {
+        let d = positioned(&[("z", "B", 1.0), ("y", "A", 1.0)]);
+        assert_eq!(pick_team_state(&d, "started").unwrap(), "y");
+        let d = positioned(&[("z", "A", 1.0), ("y", "A", 1.0)]);
+        assert_eq!(pick_team_state(&d, "started").unwrap(), "y");
     }
 
     #[test]
