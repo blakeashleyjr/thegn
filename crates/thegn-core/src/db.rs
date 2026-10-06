@@ -185,7 +185,10 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 /// v70: the supervisor's validation and approval ledgers.
 /// v71: `agent_dispatches.run_gen`, the launch fencing generation that binds a
 /// worker exit stamp to the exact session and run (additive column).
-pub const SCHEMA_VERSION: i64 = 71;
+/// v72: `agent_dispatches.native_session_id`, the harness-native conversation id
+/// of the current run, fenced by `(id, session_id, run_gen)` and cleared on
+/// every run publication (additive nullable column).
+pub const SCHEMA_VERSION: i64 = 72;
 
 /// Escape hatch for [`schema_refusal`] — set to `1`/`true` to run a build older
 /// than the on-disk schema anyway (read-only, as before). Deliberately awkward:
@@ -2073,6 +2076,7 @@ impl Db {
         crate::db_migrate::migrate_v69(&conn)?;
         crate::db_migrate::migrate_v70(&conn)?;
         crate::db_migrate::migrate_v71(&conn)?;
+        crate::db_migrate::migrate_v72(&conn)?;
         if ver < SCHEMA_VERSION {
             crate::db_migrate::verify_v62_schema(&conn)?;
             crate::db_migrate::verify_v63_schema(&conn)?;
@@ -2082,6 +2086,7 @@ impl Db {
             crate::db_migrate::verify_v67_schema(&conn)?;
             crate::db_control::verify_v68_schema(&conn)?;
             crate::db_migrate::verify_v71_schema(&conn)?;
+            crate::db_migrate::verify_v72_schema(&conn)?;
         }
         // v69 is an authority ledger, not an optional cache. Verify its full
         // shape even on the fast/current-version path so a malformed table can
