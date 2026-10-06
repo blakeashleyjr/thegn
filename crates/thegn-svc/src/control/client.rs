@@ -1858,6 +1858,7 @@ mod tests {
                 token: "must-not-be-sent".into(),
             },
             http_client: Some(Err(ControlTransportError)),
+            limits: ControlLimits::default(),
         };
 
         let error = client
