@@ -1057,9 +1057,7 @@ pub fn heal_main_checkout_worktree(root: &Path) -> bool {
     if !std::fs::symlink_metadata(root.join(".git")).is_ok_and(|m| m.file_type().is_dir()) {
         return false;
     }
-    let Ok(stripped) = strip_stray_core_worktree(root) else {
-        return false;
-    };
+    let stripped = strip_stray_core_worktree(root);
     let resynced = resync_stale_main_checkout(root);
     stripped || resynced
 }
@@ -1068,27 +1066,29 @@ pub fn heal_main_checkout_worktree(root: &Path) -> bool {
 /// the no-follow, lock-serialised transaction in [`crate::git_config_heal`].
 /// `Err` means the repair is uncertain and the caller must not go on to
 /// resync a repository whose identity it could not verify.
-fn strip_stray_core_worktree(root: &Path) -> Result<bool, ()> {
+fn strip_stray_core_worktree(root: &Path) -> bool {
     use crate::git_config_heal::{StripOutcome, strip_stray_core_worktree as txn};
     match txn(root) {
-        StripOutcome::Unchanged => Ok(false),
+        StripOutcome::Unchanged => false,
         StripOutcome::Stripped => {
             tracing::warn!(
                 target: "thegn::startup",
                 root = %root.display(),
                 "stripped stray core.worktree from main checkout config (was retargeting git at another worktree)"
             );
-            Ok(true)
+            true
         }
         StripOutcome::Refused(why) => {
+            // Surfaced, never fatal: the stale-tree resync is independent of
+            // this repair and must still run.
             let why: String = why.chars().take(200).collect();
             tracing::warn!(
                 target: "thegn::startup",
                 root = %root.display(),
                 %why,
-                "refused to repair main checkout git config; skipping checkout resync"
+                "refused to repair main checkout git config"
             );
-            Err(())
+            false
         }
     }
 }
@@ -2473,6 +2473,24 @@ bare
         assert_eq!(git_out(&dir, &["status", "--porcelain"]), None);
         // Idempotent once coherent.
         assert!(!heal_main_checkout_worktree(&dir));
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: test cleanup: scratch removal must never fail the test
+    }
+
+    #[test]
+    fn refused_config_repair_does_not_skip_the_resync() {
+        let (dir, _c0, _c1) = drifted_repo("refused");
+        // A valid, harmless core.worktree (the checkout itself) plus a held
+        // config.lock makes the repair refuse.
+        let g = |args: &[&str]| {
+            assert!(git_cmd(&dir).args(args).output().unwrap().status.success());
+        };
+        g(&["config", "core.worktree", dir.to_str().unwrap()]);
+        std::fs::write(dir.join(".git/config.lock"), "held").unwrap();
+        assert!(
+            heal_main_checkout_worktree(&dir),
+            "resync still runs after a refused repair"
+        );
+        assert!(dir.join("a.txt").exists());
         let _ = std::fs::remove_dir_all(&dir); // best-effort: test cleanup: scratch removal must never fail the test
     }
 
