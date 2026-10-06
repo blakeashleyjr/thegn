@@ -70,10 +70,15 @@ pub(crate) fn spawn_month_fetch(
         // fetching into it.
         if let Some(db) = db.as_ref() {
             let today = chrono::Utc::now().with_timezone(&home).date_naive();
-            let (h_from, h_to) = horizon(&cfg, today);
-            sync_accounts(db, &cfg, h_from, h_to, false, &mut |m| {
-                toast(&tx, &waker, m, None)
-            });
+            match horizon(&cfg, today) {
+                Ok((h_from, h_to)) => {
+                    sync_accounts(db, &cfg, h_from, h_to, false, &mut |m| {
+                        toast(&tx, &waker, m, None)
+                    });
+                }
+                // No provider call and no cache write: the cache stays as it was.
+                Err(problem) => refuse_horizon(&problem, &mut |m| toast(&tx, &waker, m, None)),
+            }
         }
 
         // No cache is NOT an empty month: without the DB there is nothing to
@@ -151,7 +156,13 @@ pub(crate) fn spawn_periodic_sync_with_generation(
         let today = chrono::Utc::now()
             .with_timezone(&home_zone(&cfg))
             .date_naive();
-        let (from, to) = horizon(&cfg, today);
+        let (from, to) = match horizon(&cfg, today) {
+            Ok(h) => h,
+            Err(problem) => {
+                refuse_horizon(&problem, &mut |m| toast(&tx, &waker, m, generation.clone()));
+                return;
+            }
+        };
         let changed = sync_accounts_with_generation(
             &db,
             &cfg,
@@ -861,16 +872,21 @@ fn widen(from: NaiveDate, to: NaiveDate) -> (NaiveDate, NaiveDate) {
     )
 }
 
-/// The configured sync horizon around `today`.
-fn horizon(cfg: &CalendarConfig, today: NaiveDate) -> (NaiveDate, NaiveDate) {
-    (
-        today
-            .checked_sub_days(chrono::Days::new(cfg.horizon_past_days as u64))
-            .unwrap_or(today),
-        today
-            .checked_add_days(chrono::Days::new(cfg.horizon_future_days as u64))
-            .unwrap_or(today),
-    )
+/// The configured sync horizon around `today`, or why it is unusable. Never a
+/// substitute interval: the result is the coverage a full fetch is authoritative
+/// for, so a bad config must stop the sync instead.
+fn horizon(cfg: &CalendarConfig, today: NaiveDate) -> Result<(NaiveDate, NaiveDate), String> {
+    cfg.sync_horizon(today)
+}
+
+/// Surface an unusable horizon: logged and toasted, with the cache untouched.
+fn refuse_horizon(problem: &str, notify: &mut dyn FnMut(String)) {
+    tracing::warn!(
+        target: "thegn::calendar",
+        error = %problem,
+        "invalid calendar horizon; sync refused, keeping the cached events"
+    );
+    notify(format!("Calendar sync skipped: {problem}"));
 }
 
 fn home_zone(cfg: &CalendarConfig) -> chrono_tz::Tz {
