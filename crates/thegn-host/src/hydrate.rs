@@ -1694,18 +1694,24 @@ fn collect_sidebar_status(
     // Bounded: every scan runs on the shared `scan_pool` (THE-652), never one
     // native thread per worktree. Job inputs are resolved here (cheap) so the
     // jobs are `'static`; the active worktree is admitted first.
-    let jobs: Vec<(bool, Box<dyn FnOnce() -> (GlyphRow, bool) + Send + 'static>)> = to_scan
+    // Repo-root / submodule-mode resolution (a `git rev-parse` on a cold memo)
+    // happens inside each job, off the hydration thread; the config is cloned
+    // once per hydration.
+    let cfg = std::sync::Arc::new(app_cfg.clone());
+    let jobs: Vec<(bool, crate::scan_pool::ScanJob<(GlyphRow, bool)>)> = to_scan
         .iter()
         .map(|p| {
-            let wt = std::path::Path::new(p);
-            let repo_root = thegn_core::repo::main_worktree(wt).unwrap_or_else(|| wt.to_path_buf());
-            let include_submodules = app_cfg.repo_git(&repo_root).submodules
-                != thegn_core::config::SubmoduleMode::Off;
             let prior = prior_for_scan.get(p).cloned();
             let urgent = active_path.as_deref() == Some(p.as_str());
             let path = p.clone();
-            let job: Box<dyn FnOnce() -> (GlyphRow, bool) + Send + 'static> = Box::new(move || {
-                let loc = GitLoc::for_worktree(std::path::Path::new(&path));
+            let cfg = std::sync::Arc::clone(&cfg);
+            let job: crate::scan_pool::ScanJob<(GlyphRow, bool)> = Box::new(move || {
+                let wt = std::path::Path::new(&path);
+                let repo_root =
+                    thegn_core::repo::main_worktree(wt).unwrap_or_else(|| wt.to_path_buf());
+                let include_submodules =
+                    cfg.repo_git(&repo_root).submodules != thegn_core::config::SubmoduleMode::Off;
+                let loc = GitLoc::for_worktree(wt);
                 // One batched round-trip for a bridged loc (status + ahead/
                 // behind + branch), gix/CLI reads for a local one.
                 let reads =
@@ -1736,7 +1742,8 @@ fn collect_sidebar_status(
         .map(|(p, out)| {
             let (row, clean) = out.unwrap_or_else(|| {
                 let wt = std::path::Path::new(p);
-                let repo_root = thegn_core::repo::main_worktree(wt).unwrap_or_else(|| wt.to_path_buf());
+                let repo_root =
+                    thegn_core::repo::main_worktree(wt).unwrap_or_else(|| wt.to_path_buf());
                 merge_glyph_scan(
                     prior_for_scan.get(p),
                     Err(()),

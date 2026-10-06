@@ -24,9 +24,14 @@ use std::sync::{Arc, Mutex, mpsc};
 
 type Task = Box<dyn FnOnce() + Send + 'static>;
 
+/// A scan job returning `R`.
+pub(crate) type ScanJob<R> = Box<dyn FnOnce() -> R + Send + 'static>;
+
 struct State {
     queue: VecDeque<Task>,
     workers: usize,
+    /// Workers currently executing a task (a subset of `workers`).
+    busy: usize,
 }
 
 pub(crate) struct ScanPool {
@@ -41,6 +46,7 @@ impl ScanPool {
             state: Mutex::new(State {
                 queue: VecDeque::new(),
                 workers: 0,
+                busy: 0,
             }),
         })
     }
@@ -56,7 +62,7 @@ impl ScanPool {
     /// until all outcomes are in.
     pub(crate) fn run<R: Send + 'static>(
         self: &Arc<Self>,
-        jobs: Vec<(bool, Box<dyn FnOnce() -> R + Send + 'static>)>,
+        jobs: Vec<(bool, ScanJob<R>)>,
     ) -> Vec<Option<R>> {
         let n = jobs.len();
         let (tx, rx) = mpsc::channel::<(usize, Option<R>)>();
@@ -64,8 +70,9 @@ impl ScanPool {
             let tx = tx.clone();
             let task: Task = Box::new(move || {
                 let out = catch_unwind(AssertUnwindSafe(job)).ok();
-                // best-effort: the caller may have gone away; nothing to do.
-                let _ = tx.send((i, out));
+                if tx.send((i, out)).is_err() {
+                    // caller gone: nothing is waiting for this outcome.
+                }
             });
             self.submit(task, urgent);
         }
@@ -87,8 +94,9 @@ impl ScanPool {
             } else {
                 st.queue.push_back(task);
             }
-            // Spawn only while there is more queued work than workers.
-            if st.workers < self.cap && st.queue.len() > st.workers {
+            // Spawn only while queued work exceeds the IDLE workers; busy
+            // workers are not available to take it.
+            if st.workers < self.cap && st.queue.len() > st.workers - st.busy {
                 st.workers += 1;
                 true
             } else {
@@ -131,7 +139,10 @@ impl ScanPool {
             let task = {
                 let mut st = self.state.lock().unwrap();
                 match st.queue.pop_front() {
-                    Some(t) => t,
+                    Some(t) => {
+                        st.busy += 1;
+                        t
+                    }
                     None => {
                         st.workers -= 1;
                         return;
@@ -139,6 +150,7 @@ impl ScanPool {
                 }
             };
             task();
+            self.state.lock().unwrap().busy -= 1;
         }
     }
 
@@ -214,6 +226,34 @@ mod tests {
     }
 
     #[test]
+    fn new_job_gets_a_worker_while_another_is_blocked() {
+        let pool = ScanPool::new(2);
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let g = Arc::clone(&gate);
+        let p2 = Arc::clone(&pool);
+        let blocker = std::thread::spawn(move || {
+            let job: ScanJob<()> = Box::new(move || {
+                let (m, c) = &*g;
+                let mut open = m.lock().unwrap();
+                while !*open {
+                    open = c.wait(open).unwrap();
+                }
+            });
+            p2.run(vec![(false, job)])
+        });
+        // Wait until the blocker is actually running on a worker.
+        while pool.state.lock().unwrap().busy == 0 {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        // Must complete on a second worker even though the first is blocked.
+        let job: ScanJob<u8> = Box::new(|| 7);
+        assert_eq!(pool.run(vec![(true, job)]), vec![Some(7)]);
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
+        assert_eq!(blocker.join().unwrap(), vec![Some(())]);
+    }
+
+    #[test]
     fn panicking_job_yields_none_and_others_complete() {
         let pool = ScanPool::new(2);
         let mut js: Vec<(bool, Box<dyn FnOnce() -> u8 + Send>)> = Vec::new();
@@ -230,7 +270,7 @@ mod tests {
         let pool = ScanPool::new(1);
         let order = Arc::new(Mutex::new(Vec::new()));
         let gate = Arc::new((Mutex::new(false), Condvar::new()));
-        let mut js: Vec<(bool, Box<dyn FnOnce() -> () + Send>)> = Vec::new();
+        let mut js: Vec<(bool, Box<dyn FnOnce() + Send>)> = Vec::new();
         {
             let g = Arc::clone(&gate);
             js.push((
