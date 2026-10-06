@@ -173,24 +173,37 @@ pub(crate) fn perform_close(cx: &mut DeleteCtx<'_>, targets: Vec<usize>) {
     }
 }
 
-/// Names for the menu body + the dirty subset, from the cached sidebar status
-/// (keyed by worktree path). A missing entry (not yet hydrated) is best-effort
-/// treated as clean.
+/// What the cached sidebar status says about a delete target's working tree.
+/// `Unknown` (no entry: not yet hydrated, or the first-ever scan failed) is
+/// NEVER clean — it takes the same always-confirm path as `Dirty`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TargetState {
+    Clean,
+    Dirty,
+    Unknown,
+}
+
+fn target_state(glyphs: Option<&crate::sidebar::GitGlyphs>) -> TargetState {
+    match glyphs {
+        None => TargetState::Unknown,
+        Some(gl) if gl.dirty || gl.submodule_dirty => TargetState::Dirty,
+        Some(_) => TargetState::Clean,
+    }
+}
+
+/// Names for the menu body + the subset needing the warning menu (dirty or
+/// unverified), from the cached sidebar status (keyed by worktree path). A
+/// missing entry fails closed: it is listed as "status unknown".
 fn target_names(cx: &mut DeleteCtx<'_>, targets: &[usize]) -> (Vec<String>, Vec<String>) {
     let mut names = Vec::with_capacity(targets.len());
     let mut dirty_names = Vec::new();
     for &gi in targets {
         if let Some(g) = cx.session.worktrees.get(gi) {
             names.push(g.name.clone());
-            let is_dirty = cx
-                .model
-                .sidebar_status
-                .git
-                .get(&g.path)
-                .map(|gl| gl.dirty)
-                .unwrap_or(false);
-            if is_dirty {
-                dirty_names.push(g.name.clone());
+            match target_state(cx.model.sidebar_status.git.get(&g.path)) {
+                TargetState::Clean => {}
+                TargetState::Dirty => dirty_names.push(g.name.clone()),
+                TargetState::Unknown => dirty_names.push(format!("{} (status unknown)", g.name)),
             }
         }
     }
@@ -199,8 +212,8 @@ fn target_names(cx: &mut DeleteCtx<'_>, targets: &[usize]) -> (Vec<String>, Vec<
 
 /// Resolve a delete request into either a confirm menu (stashing the pending
 /// targets for the menu's Pick handler) or an immediate disk-removal + UI
-/// refresh. A target is "dirty" when its cached `GitGlyphs.dirty` is set; ANY
-/// dirty target forces the warning menu regardless of `confirm_delete`. Sets
+/// refresh. A target needs the warning menu when its cached `GitGlyphs.dirty` is set or
+/// its status is unknown (unhydrated); ANY such target forces the warning menu regardless of `confirm_delete`. Sets
 /// `model.status` on every path.
 pub(crate) fn request_group_delete(mut cx: DeleteCtx<'_>, raw_targets: Vec<usize>) {
     // A standalone terminal isn't a git worktree: the delete path below only
@@ -496,7 +509,10 @@ fn landing_for_slug(session: &crate::session::Session, slug: Option<&str>) -> Op
 
 #[cfg(test)]
 mod tests {
-    use super::{group_names_for, landing_for_slug, next_or_prev, resolve_group_indices};
+    use super::{
+        TargetState, group_names_for, landing_for_slug, next_or_prev, resolve_group_indices,
+        target_state,
+    };
     use crate::session::{GroupKind, Session, WorktreeGroup};
     use std::collections::HashSet;
 
@@ -575,6 +591,26 @@ mod tests {
 
         // A name that vanished entirely resolves to nothing (never the wrong row).
         assert!(resolve_group_indices(&shifted, &["gone".to_string()]).is_empty());
+    }
+
+    #[test]
+    fn unknown_status_is_never_clean() {
+        use crate::sidebar::GitGlyphs;
+        assert_eq!(target_state(None), TargetState::Unknown);
+        assert_eq!(
+            target_state(Some(&GitGlyphs::default())),
+            TargetState::Clean
+        );
+        let dirty = GitGlyphs {
+            dirty: true,
+            ..GitGlyphs::default()
+        };
+        assert_eq!(target_state(Some(&dirty)), TargetState::Dirty);
+        let sub = GitGlyphs {
+            submodule_dirty: true,
+            ..GitGlyphs::default()
+        };
+        assert_eq!(target_state(Some(&sub)), TargetState::Dirty);
     }
 
     #[test]
