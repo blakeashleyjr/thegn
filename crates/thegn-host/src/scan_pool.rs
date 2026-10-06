@@ -175,6 +175,17 @@ mod tests {
     use std::sync::Condvar;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    /// Workers exit just after sending their last result, so poll briefly.
+    fn drained(pool: &ScanPool) -> bool {
+        for _ in 0..200 {
+            if pool.workers() == 0 {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        false
+    }
+
     fn jobs(
         n: usize,
         cur: &Arc<AtomicUsize>,
@@ -204,7 +215,7 @@ mod tests {
             assert_eq!(out.len(), n);
             assert!(out.iter().enumerate().all(|(i, r)| *r == Some(i)));
             assert!(peak.load(Ordering::SeqCst) <= 3, "n={n}");
-            assert_eq!(pool.workers(), 0, "workers exit when drained (n={n})");
+            assert!(drained(&pool), "workers exit when drained (n={n})");
         }
     }
 
@@ -262,7 +273,7 @@ mod tests {
         js.push((false, Box::new(|| 3)));
         let out = pool.run(js);
         assert_eq!(out, vec![Some(1), None, Some(3)]);
-        assert_eq!(pool.workers(), 0);
+        assert!(drained(&pool));
     }
 
     #[test]
