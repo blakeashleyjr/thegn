@@ -178,16 +178,56 @@ impl Db {
         status: AgentDispatchStatus,
         note: Option<&str>,
     ) -> Result<bool> {
+        self.cas_dispatch_status(id, None, expected, status, note)
+    }
+
+    /// [`Self::compare_and_set_dispatch_status`] fenced on the exact run the
+    /// planner observed: the row's session id and launch generation
+    /// (`run_gen`, v71) must still match too. A relaunch or retry publication
+    /// replaces the session and bumps `run_gen`, so a plan built from a stale
+    /// liveness observation of the old run matches nothing and cannot park or
+    /// close the new worker (THE-267).
+    pub fn compare_and_set_dispatch_status_run(
+        &self,
+        run: &crate::issue::DispatchRunRef,
+        expected: AgentDispatchStatus,
+        status: AgentDispatchStatus,
+        note: Option<&str>,
+    ) -> Result<bool> {
+        self.cas_dispatch_status(run.id, Some(run), expected, status, note)
+    }
+
+    fn cas_dispatch_status(
+        &self,
+        id: i64,
+        fence: Option<&crate::issue::DispatchRunRef>,
+        expected: AgentDispatchStatus,
+        status: AgentDispatchStatus,
+        note: Option<&str>,
+    ) -> Result<bool> {
         let note = note
             .map(crate::pipeline_report::note_text)
             .transpose()
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         let conn = self.conn();
         let tx = conn.unchecked_transaction()?;
-        let changed = tx.execute(
-            "UPDATE agent_dispatches SET status=?1 WHERE id=?2 AND status=?3",
-            rusqlite::params![status.as_str(), id, expected.as_str()],
-        )?;
+        let changed = match fence {
+            None => tx.execute(
+                "UPDATE agent_dispatches SET status=?1 WHERE id=?2 AND status=?3",
+                rusqlite::params![status.as_str(), id, expected.as_str()],
+            )?,
+            Some(run) => tx.execute(
+                "UPDATE agent_dispatches SET status=?1 WHERE id=?2 AND status=?3 \
+                 AND COALESCE(session_id,'')=?4 AND run_gen=?5",
+                rusqlite::params![
+                    status.as_str(),
+                    id,
+                    expected.as_str(),
+                    run.session_id,
+                    run.run_gen
+                ],
+            )?,
+        };
         if changed == 0 {
             tx.rollback()?;
             return Ok(false);
@@ -1280,6 +1320,41 @@ mod tests {
         let after = db.get_dispatch(id).unwrap().unwrap();
         assert_eq!(after.exit_code, Some(0));
         assert_eq!(after.exited_at_ms, stamped_at);
+    }
+
+    #[test]
+    fn status_cas_run_fence_rejects_a_relaunched_run() {
+        // THE-267: a plan built against run N must not park run N+1, even when
+        // the relaunch reuses the session id and the status is unchanged.
+        let (db, _dir) = temp_db();
+        let id = put_row(&db, "linear:X-11", "/wt/x");
+        db.stamp_dispatch_run(id, "sess-a", "a.md").unwrap();
+        db.update_dispatch_status(id, AgentDispatchStatus::Running)
+            .unwrap();
+        let observed = db.dispatch_run_ref(id).unwrap().unwrap();
+        db.stamp_dispatch_run(id, "sess-a", "a.md").unwrap();
+        assert!(
+            !db.compare_and_set_dispatch_status_run(
+                &observed,
+                AgentDispatchStatus::Running,
+                AgentDispatchStatus::WaitingHuman,
+                Some("reaped"),
+            )
+            .unwrap()
+        );
+        let row = db.get_dispatch(id).unwrap().unwrap();
+        assert_eq!(row.status, AgentDispatchStatus::Running);
+        assert!(db.dispatch_notes(id, None, 0).unwrap().is_empty());
+        let current = db.dispatch_run_ref(id).unwrap().unwrap();
+        assert!(
+            db.compare_and_set_dispatch_status_run(
+                &current,
+                AgentDispatchStatus::Running,
+                AgentDispatchStatus::WaitingHuman,
+                Some("reaped"),
+            )
+            .unwrap()
+        );
     }
 
     #[test]
