@@ -238,7 +238,7 @@
     },
     {
       "change": "add-pipeline-supervisor-policy",
-      "lifecycle": "delivered-awaiting-archive",
+      "lifecycle": "archived",
       "disposition": "alpha-delivery",
       "owners": [
         {
@@ -247,7 +247,7 @@
         }
       ],
       "summary": "Give the pipeline a policy layer that classifies, approves and plans without hard-coding judgement.",
-      "delivered_at": "2026-09-28"
+      "archive_path": "openspec/changes/archive/2026-10-06-add-pipeline-supervisor-policy/"
     },
     {
       "change": "add-pr-review-viewed-stacked",
