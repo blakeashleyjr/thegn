@@ -871,8 +871,11 @@ pub(crate) fn destroy_one_checked(
     // Cross-process admission (THE-728): non-blocking exclusive lock held for
     // the whole removal. A pane open elsewhere holding it, or an unusable lock,
     // refuses the destroy; nothing has been touched yet.
-    let mut _admission =
-        match crate::worktree_admission::DestroyLock::try_acquire(&destroy_key(worktree)) {
+    // Both spellings are locked: the pane side keys on its lexical root and
+    // never canonicalizes on the loop.
+    let canonical = destroy_key(worktree);
+    let admission =
+        match crate::worktree_admission::DestroyLock::try_acquire(&[worktree, &canonical]) {
             Ok(lock) => lock,
             Err(error) => return (false, error),
         };
@@ -971,7 +974,8 @@ pub(crate) fn destroy_one_checked(
     if !is_remote {
         note_worktree_removed(worktree);
     }
-    _admission.forget_file();
+    // Removal is finished; hooks after this no longer need the admission hold.
+    drop(admission);
 
     let post = run_event_with_db(
         cfg,
@@ -1469,11 +1473,6 @@ fn destroy_key(path: &Path) -> PathBuf {
         (Some(parent), Some(name)) => parent.join(name),
         _ => path.to_path_buf(),
     }
-}
-
-/// Canonical identity of a worktree path (shared with cross-process admission).
-pub(crate) fn destroy_key_pub(path: &Path) -> PathBuf {
-    destroy_key(path)
 }
 
 /// True when this process is physically destroying `cwd`'s worktree or a
