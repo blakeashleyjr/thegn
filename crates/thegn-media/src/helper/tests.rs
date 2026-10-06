@@ -38,10 +38,10 @@ fn gone(pid: u32) -> bool {
 
 async fn wait_gone(file: &Path) -> bool {
     let pid: u32 = loop {
-        if let Ok(s) = std::fs::read_to_string(file) {
-            if let Ok(p) = s.trim().parse() {
-                break p;
-            }
+        if let Ok(s) = std::fs::read_to_string(file)
+            && let Ok(p) = s.trim().parse()
+        {
+            break p;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     };
