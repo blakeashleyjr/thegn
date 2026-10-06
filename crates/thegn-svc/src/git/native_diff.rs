@@ -282,6 +282,20 @@ fn tree_to_tree(old: &gix::Tree<'_>, new: &gix::Tree<'_>) -> Result<Vec<DiffEntr
     Ok(out)
 }
 
+/// First-occurrence-order dedup in expected O(N) (hash set, byte-exact keys).
+/// The set holds a clone of each key (duplicate storage is accepted: hashing
+/// the bytes to a `u64` would need a collision fallback, which is overkill).
+fn dedup_in_order<K: std::hash::Hash + Eq + Clone>(items: impl IntoIterator<Item = K>) -> Vec<K> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for k in items {
+        if seen.insert(k.clone()) {
+            out.push(k);
+        }
+    }
+    out
+}
+
 /// The bare-rev case: tree(rev) vs the worktree.
 ///
 /// Only handled natively when `rev` resolves to the same commit as `HEAD` —
@@ -320,22 +334,23 @@ fn tree_to_worktree(repo: &gix::Repository, rev: &str) -> Result<Vec<DiffEntry>>
 
     // Enumerate the paths that differ from HEAD — staged and unstaged both,
     // which together are exactly what `git diff HEAD` reports.
-    let mut paths: Vec<gix::bstr::BString> = Vec::new();
+    // A path appears once per staged and once per unstaged change; dedup is
+    // order-preserving and O(1) per item (a linear `contains` was O(N^2)).
     let iter = repo
         .status(gix::progress::Discard)
         .context("gix status")?
         .untracked_files(gix::status::UntrackedFiles::None)
         .into_iter(None)
         .context("gix status iter")?;
+    let mut status_paths: Vec<gix::bstr::BString> = Vec::new();
     for item in iter {
         let item = item.context("gix status item")?;
         if let Some(p) = item.location().to_owned().into() {
             let p: gix::bstr::BString = p;
-            if !paths.contains(&p) {
-                paths.push(p);
-            }
+            status_paths.push(p);
         }
     }
+    let paths = dedup_in_order(status_paths);
 
     let mut out: Vec<DiffEntry> = Vec::new();
     for rela in paths {
@@ -400,6 +415,39 @@ fn tree_to_worktree(repo: &gix::Repository, rev: &str) -> Result<Vec<DiffEntry>>
 
 #[cfg(test)]
 mod tests {
+    #[derive(Clone, Hash)]
+    struct Counted(Vec<u8>);
+    thread_local!(static EQS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) });
+    impl PartialEq for Counted {
+        fn eq(&self, o: &Self) -> bool {
+            EQS.with(|c| c.set(c.get() + 1));
+            self.0 == o.0
+        }
+    }
+    impl Eq for Counted {}
+
+    #[test]
+    fn dedup_is_linear_and_order_preserving() {
+        let n = 40_000usize;
+        let mut items: Vec<Counted> = Vec::new();
+        for i in 0..n {
+            // Raw non-UTF-8 bytes, long shared prefix.
+            let mut b = vec![b'd'; 200];
+            b.extend_from_slice(&(i as u32).to_be_bytes());
+            b.push(0xff);
+            items.push(Counted(b));
+        }
+        let mut input = items.clone();
+        input.extend(items.iter().rev().cloned()); // every path twice
+        EQS.with(|c| c.set(0));
+        let out = dedup_in_order(input);
+        let eqs = EQS.with(|c| c.get());
+        assert_eq!(out.len(), n);
+        assert!(out.iter().zip(&items).all(|(a, b)| a.0 == b.0));
+        // Quadratic would be ~n^2/2 = 800M comparisons.
+        assert!(eqs < 4 * n, "too many comparisons: {eqs}");
+    }
+
     use super::*;
     use crate::git::testutil::TestRepo;
 
