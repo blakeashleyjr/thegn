@@ -849,10 +849,12 @@ mod tests {
         let id = assign_native_session_id(&cfg(), &mut l, || Some([7; 16])).expect("assigned");
         assert_eq!(l.native_session_id.as_deref(), Some(id.as_str()));
         assert_ne!(id, "caller-supplied", "a caller value is never trusted");
-        // No entropy: no id, and the field is cleared.
+        // No entropy: nothing is vouched for (so nothing persists for a
+        // retry); the caller's own value stays on the launch for the fork
+        // recipe, exactly as before thegn minted ids.
         let mut l = launch("claude", "do it");
         assert_eq!(assign_native_session_id(&cfg(), &mut l, || None), None);
-        assert_eq!(l.native_session_id, None);
+        assert_eq!(l.native_session_id.as_deref(), Some("caller-supplied"));
     }
 
     #[test]
