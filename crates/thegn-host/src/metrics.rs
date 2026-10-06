@@ -116,6 +116,9 @@ fn run_supervisor(
     loop {
         let now = Instant::now();
         for (i, target_cfg) in config.targets.iter().enumerate() {
+            if tx.is_closed() {
+                return; // receiver gone (session ended): stop promptly
+            }
             let result = {
                 let _g = crate::perf::measure(crate::perf::Subsys::Metrics);
                 match target_cfg.command_argv() {
@@ -156,9 +159,10 @@ fn run_supervisor(
             }
         }
 
-        if tx.send(state.clone()).is_ok() {
-            let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
+        if tx.send(state.clone()).is_err() {
+            return; // receiver gone (session ended): stop the supervisor
         }
+        let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         std::thread::sleep(interval);
     }
 }
@@ -199,69 +203,20 @@ fn target_display(t: &thegn_core::config::MetricsTarget) -> String {
     }
 }
 
-/// Run a command collector: spawn `argv` (never a shell), read its stdout up to
-/// `max_bytes`, and enforce `timeout`. A wedged or slow collector is killed and
-/// reported as an error, exactly like a failed scrape — it never blocks the
-/// supervisor thread past the timeout, nor the event loop (this runs off it).
-///
-/// The stdout is read on a helper thread so a child that never writes and never
-/// exits can't block the read past the deadline: on timeout the child is killed,
-/// which closes its stdout and releases the reader.
-// The `child.wait()` calls below reap a child that has ALREADY exited (its
-// stdout closed) or that we just killed — a bounded reap, not a blocking wait
-// on live work — and this runs on the metrics supervisor thread, never the
-// event loop. That is the sanctioned case the crate lint asks us to justify.
-#[expect(clippy::disallowed_methods)]
+/// Run a command collector: spawn `argv` (never a shell) through the shared
+/// bounded runner (`thegn_metrics::run_command_bounded`): one total deadline
+/// across spawn, read, exit and reap, a stdout cap, its own process group
+/// SIGKILLed as a unit on any non-clean exit, and no reader thread. EOF on
+/// stdout is not treated as exit: success needs a zero exit inside the same
+/// deadline, so a collector that closes stdout and sleeps times out instead of
+/// wedging the supervisor.
 fn collect_command(argv: &[String], timeout: Duration, max_bytes: usize) -> Result<String, String> {
-    use std::process::{Command, Stdio};
-
+    use std::ffi::OsStr;
     let (prog, args) = argv.split_first().ok_or_else(|| "empty argv".to_string())?;
-    let mut child = Command::new(prog)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| format!("spawn {prog}: {e}"))?;
-
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "no stdout pipe".to_string())?;
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::Builder::new()
-        .name("thegn-metrics-collect".into())
-        .spawn(move || {
-            let mut buf = Vec::new();
-            // Cap the read at the same body limit as a scrape; +1 so we can tell
-            // "exactly at the cap" from "over it".
-            let res = stdout.take(max_bytes as u64 + 1).read_to_end(&mut buf);
-            let _ = tx.send(res.map(|_| buf)); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
-            // best-effort: spawn failure surfaces as a disconnected receiver in the recv_timeout below
-        })
-        .ok();
-
-    match rx.recv_timeout(timeout) {
-        Ok(Ok(buf)) => {
-            let _ = child.wait(); // best-effort: teardown: the child may already have exited or been reaped
-            if buf.len() > max_bytes {
-                return Err(format!("output too large: > {max_bytes} bytes"));
-            }
-            String::from_utf8(buf).map_err(|e| e.to_string())
-        }
-        Ok(Err(e)) => {
-            let _ = child.kill(); // best-effort: teardown: the child may already have exited or been reaped
-            let _ = child.wait(); // best-effort: teardown: the child may already have exited or been reaped
-            Err(format!("read: {e}"))
-        }
-        Err(_) => {
-            // Timeout (or the reader is still blocked): kill the child; its
-            // stdout close releases the detached reader thread.
-            let _ = child.kill(); // best-effort: teardown: the child may already have exited or been reaped
-            let _ = child.wait(); // best-effort: teardown: the child may already have exited or been reaped
-            Err(format!("timed out after {}ms", timeout.as_millis()))
-        }
-    }
+    let args: Vec<&OsStr> = args.iter().map(OsStr::new).collect();
+    let buf = thegn_metrics::run_command_bounded(OsStr::new(prog), &args, timeout, max_bytes)
+        .map_err(|e| format!("{prog}: {e}"))?;
+    String::from_utf8(buf).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -364,5 +319,47 @@ mod tests {
     fn collect_command_reports_a_missing_program() {
         let argv = vec!["thegn-no-such-collector-xyz".to_string()];
         assert!(collect_command(&argv, Duration::from_secs(1), 4096).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn collect_command_times_out_when_stdout_closes_but_process_lives() {
+        // Closes stdout immediately, then sleeps: EOF is not exit.
+        let argv = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "exec >&-; sleep 30".to_string(),
+        ];
+        let t = Instant::now();
+        let err = collect_command(&argv, Duration::from_millis(300), 4096).unwrap_err();
+        assert!(err.contains("timed out"), "{err}");
+        assert!(t.elapsed() < Duration::from_secs(5));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn collect_command_does_not_hang_on_descendant_held_stdout() {
+        // A backgrounded descendant inherits stdout and outlives the leader.
+        let argv = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "sleep 30 & sleep 30".to_string(),
+        ];
+        let t = Instant::now();
+        let err = collect_command(&argv, Duration::from_millis(300), 4096).unwrap_err();
+        assert!(err.contains("timed out"), "{err}");
+        assert!(t.elapsed() < Duration::from_secs(5));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn collect_command_rejects_nonzero_exit() {
+        let argv = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "printf 'x 1\\n'; exit 3".to_string(),
+        ];
+        let err = collect_command(&argv, Duration::from_secs(5), 4096).unwrap_err();
+        assert!(err.contains("exit"), "{err}");
     }
 }
