@@ -415,9 +415,15 @@ fn tree_to_worktree(repo: &gix::Repository, rev: &str) -> Result<Vec<DiffEntry>>
 
 #[cfg(test)]
 mod tests {
-    #[derive(Clone, Hash)]
+    #[derive(Clone)]
     struct Counted(Vec<u8>);
     thread_local!(static EQS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) });
+    // Hash agrees with the counting `PartialEq` below: both use the bytes.
+    impl std::hash::Hash for Counted {
+        fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+            self.0.hash(state);
+        }
+    }
     impl PartialEq for Counted {
         fn eq(&self, o: &Self) -> bool {
             EQS.with(|c| c.set(c.get() + 1));
