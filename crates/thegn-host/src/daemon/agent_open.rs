@@ -266,8 +266,11 @@ pub(crate) fn uuid_v4(mut b: [u8; 16]) -> String {
 ///   ([`thegn_core::harness::Harness::assign_session_args`]): a new UUID is
 ///   generated here (any caller-supplied value is discarded — the id must be
 ///   one thegn minted).
-/// - Anything else (fork, continue-latest, other harnesses): `None`, and the
-///   field is left clear — a launch must never carry an id it cannot vouch for.
+/// - Anything else (fork, continue-latest, interactive, harnesses thegn cannot
+///   assign an id to): `None` — no id is VOUCHED for, so nothing is persisted
+///   for exact-resume retries. The caller's own `native_session_id` (e.g. a
+///   codex id the UI learned) is kept on the launch as before, because the fork
+///   recipe relies on it; it is never returned, so a retry never resumes it.
 pub(crate) fn assign_native_session_id(
     cfg: &Config,
     launch: &mut thegn_svc::control::AgentLaunch,
@@ -276,7 +279,20 @@ pub(crate) fn assign_native_session_id(
     if launch.fork {
         return None; // `native_session_id` names the fork SOURCE; leave it
     }
-    launch.native_session_id = None;
+    let caller = launch
+        .native_session_id
+        .take()
+        .filter(|s| thegn_core::harness::session_id_ok(s));
+    let vouched = vouched_native_session_id(cfg, launch, random);
+    launch.native_session_id = vouched.clone().or(caller);
+    vouched
+}
+
+fn vouched_native_session_id(
+    cfg: &Config,
+    launch: &thegn_svc::control::AgentLaunch,
+    random: impl FnOnce() -> Option<[u8; 16]>,
+) -> Option<String> {
     if launch.continue_last {
         return None;
     }
@@ -285,8 +301,7 @@ pub(crate) fn assign_native_session_id(
         if !thegn_core::harness::session_id_ok(id) || harness.resume_command(id).is_none() {
             return None;
         }
-        launch.native_session_id = Some(id.to_string());
-        return launch.native_session_id.clone();
+        return Some(id.to_string());
     }
     let headless = launch.headless.unwrap_or(!launch.prompt.trim().is_empty());
     if !headless {
@@ -294,7 +309,6 @@ pub(crate) fn assign_native_session_id(
     }
     let id = uuid_v4(random()?);
     harness.assign_session_args(&id)?;
-    launch.native_session_id = Some(id.clone());
     Some(id)
 }
 
