@@ -127,12 +127,13 @@ impl Discovery {
 
 /// Run one bounded discovery. Blocking: call only from a worker thread.
 pub fn discover(cancel: &AtomicBool) -> Discovery {
-    let exe = resolve_fc_list(&fc_list_search_dirs());
+    let exe = resolve_fc_list(&fc_list_search_dirs(), std::env::var_os("PATH").as_deref());
     discover_with(exe.as_deref(), cancel, &macos_font_dirs())
 }
 
 fn discover_with(fc_list: Option<&Path>, cancel: &AtomicBool, dirs: &[PathBuf]) -> Discovery {
     let mut errors = Vec::new();
+    let mut timed_out = false;
     match fc_list {
         Some(exe) => {
             let mut cmd = Command::new(exe);
@@ -147,6 +148,7 @@ fn discover_with(fc_list: Option<&Path>, cancel: &AtomicBool, dirs: &[PathBuf]) 
                     return Discovery::bare(DiscoveryStatus::Canceled, errors);
                 }
                 Err(crate::preview_jobs::CaptureError::Timeout) => {
+                    timed_out = true;
                     errors.push("fc-list exceeded its deadline".into());
                 }
                 Err(crate::preview_jobs::CaptureError::Spawn(e)) => {
@@ -175,12 +177,15 @@ fn discover_with(fc_list: Option<&Path>, cancel: &AtomicBool, dirs: &[PathBuf]) 
                         errors,
                     )
                 } else {
-                    cap_results(scan.rows, truncated.then_some(Truncation::ScanBudget), errors)
+                    cap_results(
+                        scan.rows,
+                        truncated.then_some(Truncation::ScanBudget),
+                        errors,
+                    )
                 }
             }
         };
     }
-    let timed_out = errors.iter().any(|e| e.contains("deadline"));
     if timed_out {
         return Discovery::bare(DiscoveryStatus::TimedOut, errors);
     }
@@ -198,7 +203,11 @@ fn finish_rows(stdout: &[u8], output_capped: bool, errors: Vec<String>) -> Disco
         }
     }
     let rows = font_rows_from_fc_list(&text);
-    cap_results(rows, output_capped.then_some(Truncation::HelperOutput), errors)
+    cap_results(
+        rows,
+        output_capped.then_some(Truncation::HelperOutput),
+        errors,
+    )
 }
 
 fn cap_results(
@@ -218,19 +227,34 @@ fn cap_results(
     }
 }
 
-/// Fixed system directories `fc-list` may be resolved from. The ambient `PATH`
-/// is deliberately not consulted: a writable directory early on it would let any
-/// file named `fc-list` run as the user on a keypress.
+/// Well-known system and package-manager directories `fc-list` is resolved from
+/// first, in order. Ambient `PATH` is only a filtered last resort
+/// ([`resolve_fc_list`]).
 fn fc_list_search_dirs() -> Vec<PathBuf> {
     let mut dirs = vec![PathBuf::from("/run/current-system/sw/bin")];
+    if let Some(user) = std::env::var_os("USER") {
+        dirs.push(
+            PathBuf::from("/etc/profiles/per-user")
+                .join(user)
+                .join("bin"),
+        );
+    }
     if let Some(home) = std::env::var_os("HOME") {
-        dirs.push(PathBuf::from(home).join(".nix-profile/bin"));
+        let home = PathBuf::from(home);
+        dirs.push(home.join(".nix-profile/bin"));
+        let state = std::env::var_os("XDG_STATE_HOME")
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+            .unwrap_or_else(|| home.join(".local/state"));
+        dirs.push(state.join("nix/profile/bin"));
     }
     for d in [
+        "/nix/var/nix/profiles/default/bin",
         "/usr/bin",
         "/usr/local/bin",
         "/opt/homebrew/bin",
         "/opt/local/bin",
+        "/home/linuxbrew/.linuxbrew/bin",
         "/bin",
     ] {
         dirs.push(PathBuf::from(d));
@@ -238,15 +262,26 @@ fn fc_list_search_dirs() -> Vec<PathBuf> {
     dirs
 }
 
-/// First `fc-list` in `dirs` that passes the executable-identity admission.
-fn resolve_fc_list(dirs: &[PathBuf]) -> Option<PathBuf> {
-    dirs.iter()
-        .map(|d| d.join("fc-list"))
-        .find(|p| crate::platform::exe_admitted(p))
+/// First `fc-list` in `dirs` that passes the executable-identity admission; when
+/// none does, the first absolute `path_var` entry holding an admitted one. PATH
+/// entries get the same admission (regular, executable, not group/world-writable)
+/// and relative entries are ignored.
+fn resolve_fc_list(dirs: &[PathBuf], path_var: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+    let admitted = |d: &PathBuf| {
+        let p = d.join("fc-list");
+        crate::platform::exe_admitted(&p).then_some(p)
+    };
+    dirs.iter().find_map(admitted).or_else(|| {
+        let path_var = path_var?;
+        std::env::split_paths(path_var)
+            .filter(|d| d.is_absolute())
+            .find_map(|d| admitted(&d))
+    })
 }
 
 /// Single-flight owner of font discovery. One worker at a time; a request made
 /// while one is running coalesces into it. Dropping the owner cancels the run.
+#[derive(Default)]
 pub struct DiscoveryOwner {
     generation: u64,
     in_flight: bool,
@@ -259,26 +294,25 @@ pub struct DiscoveryResult {
     pub discovery: Discovery,
 }
 
-impl Default for DiscoveryOwner {
-    fn default() -> Self {
-        Self {
-            generation: 0,
-            in_flight: false,
-            cancel: Arc::new(AtomicBool::new(false)),
-        }
-    }
+/// What [`DiscoveryOwner::request`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Request {
+    Started,
+    /// A run is already in flight; this request joined it.
+    Coalesced,
+    /// The worker thread could not be spawned.
+    Failed,
 }
 
 impl DiscoveryOwner {
-    /// Start a run unless one is already in flight. Returns whether a new worker
-    /// was started (`false` means the request coalesced).
+    /// Start a run unless one is already in flight.
     pub fn request(
         &mut self,
         tx: tokio::sync::mpsc::UnboundedSender<DiscoveryResult>,
         waker: termwiz::terminal::TerminalWaker,
-    ) -> bool {
+    ) -> Request {
         if !self.begin() {
-            return false;
+            return Request::Coalesced;
         }
         let generation = self.generation;
         let cancel = Arc::clone(&self.cancel);
@@ -286,7 +320,16 @@ impl DiscoveryOwner {
             .name("thegn-font-discovery".into())
             .spawn(move || {
                 crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
-                let discovery = discover(&cancel);
+                // A panic must still deliver a result, or `in_flight` would stay
+                // set and every later request would coalesce into nothing.
+                let discovery =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| discover(&cancel)))
+                        .unwrap_or_else(|_| {
+                            Discovery::bare(
+                                DiscoveryStatus::Unavailable("discovery panicked".into()),
+                                Vec::new(),
+                            )
+                        });
                 if tx
                     .send(DiscoveryResult {
                         generation,
@@ -299,8 +342,9 @@ impl DiscoveryOwner {
             });
         if spawned.is_err() {
             self.in_flight = false;
+            return Request::Failed;
         }
-        spawned.is_ok()
+        Request::Started
     }
 
     fn begin(&mut self) -> bool {
@@ -323,7 +367,8 @@ impl DiscoveryOwner {
         }
     }
 
-    pub fn in_flight(&self) -> bool {
+    #[cfg(test)]
+    fn in_flight(&self) -> bool {
         self.in_flight
     }
 }
@@ -1036,7 +1081,10 @@ mod tests {
             Duration::from_secs(10),
             64 * 1024,
         );
-        assert_eq!(d.status, DiscoveryStatus::Truncated(Truncation::HelperOutput));
+        assert_eq!(
+            d.status,
+            DiscoveryStatus::Truncated(Truncation::HelperOutput)
+        );
         assert!(d.notice().unwrap().contains("truncated"));
     }
 
@@ -1075,7 +1123,11 @@ mod tests {
             max_entries: 5,
             stop: ScanStop::Done,
         };
-        let scan = font_rows_from_dirs_in(&[tmp.path().to_path_buf()], &AtomicBool::new(false), &mut st);
+        let scan = font_rows_from_dirs_in(
+            &[tmp.path().to_path_buf()],
+            &AtomicBool::new(false),
+            &mut st,
+        );
         assert_eq!(scan.stop, ScanStop::Budget);
         assert!(scan.rows.len() <= 5);
     }
@@ -1097,7 +1149,11 @@ mod tests {
         let dirs = [tmp.path().to_path_buf()];
         let s = font_rows_from_dirs_in(&dirs, &AtomicBool::new(false), &mut mk(Duration::ZERO));
         assert_eq!(s.stop, ScanStop::Deadline);
-        let s = font_rows_from_dirs_in(&dirs, &AtomicBool::new(true), &mut mk(Duration::from_secs(5)));
+        let s = font_rows_from_dirs_in(
+            &dirs,
+            &AtomicBool::new(true),
+            &mut mk(Duration::from_secs(5)),
+        );
         assert_eq!(s.stop, ScanStop::Canceled);
     }
 
@@ -1115,11 +1171,52 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         // A non-executable file named fc-list is not an admitted identity.
         std::fs::write(tmp.path().join("fc-list"), b"#!/bin/sh\n").unwrap();
-        assert_eq!(resolve_fc_list(&[tmp.path().to_path_buf()]), None);
+        assert_eq!(resolve_fc_list(&[tmp.path().to_path_buf()], None), None);
+        // Nor is it picked up through PATH.
+        assert_eq!(resolve_fc_list(&[], Some(tmp.path().as_os_str())), None);
         // The search list is fixed system directories, never `$PATH` entries.
         let dirs = fc_list_search_dirs();
         assert!(dirs.iter().all(|d| d.is_absolute()));
         assert!(!dirs.contains(&tmp.path().to_path_buf()));
+    }
+
+    #[test]
+    fn resolver_prefers_known_dirs_then_falls_back_to_admitted_path_entries() {
+        use std::os::unix::fs::PermissionsExt;
+        let mk = |dir: &Path, mode: u32| {
+            let f = dir.join("fc-list");
+            std::fs::write(&f, b"#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(&f, std::fs::Permissions::from_mode(mode)).unwrap();
+            f
+        };
+        let known = tempfile::tempdir().unwrap();
+        let on_path = tempfile::tempdir().unwrap();
+        let writable = tempfile::tempdir().unwrap();
+        let k = mk(known.path(), 0o755);
+        let p = mk(on_path.path(), 0o755);
+        mk(writable.path(), 0o777);
+        let path = std::env::join_paths([writable.path(), on_path.path()]).unwrap();
+        // Known dirs win over PATH.
+        assert_eq!(
+            resolve_fc_list(&[known.path().to_path_buf()], Some(&path)),
+            Some(k)
+        );
+        // No known match: PATH is scanned, the writable entry is rejected.
+        assert_eq!(resolve_fc_list(&[], Some(&path)), Some(p));
+        // Relative PATH entries are ignored.
+        assert_eq!(resolve_fc_list(&[], Some(std::ffi::OsStr::new("."))), None);
+    }
+
+    #[test]
+    fn search_dirs_cover_home_manager_and_nix_profiles() {
+        let dirs = fc_list_search_dirs();
+        for want in [
+            "/nix/var/nix/profiles/default/bin",
+            "/home/linuxbrew/.linuxbrew/bin",
+            "/run/current-system/sw/bin",
+        ] {
+            assert!(dirs.contains(&PathBuf::from(want)), "{want}");
+        }
     }
 
     #[test]
@@ -1147,11 +1244,28 @@ mod tests {
     #[test]
     fn notices_distinguish_every_outcome() {
         let mk = |status| Discovery::bare(status, vec!["src: boom".into()]);
-        assert!(mk(DiscoveryStatus::TimedOut).notice().unwrap().contains("timed out"));
-        assert!(mk(DiscoveryStatus::Canceled).notice().unwrap().contains("canceled"));
-        let n = mk(DiscoveryStatus::Unavailable("x".into())).notice().unwrap();
+        assert!(
+            mk(DiscoveryStatus::TimedOut)
+                .notice()
+                .unwrap()
+                .contains("timed out")
+        );
+        assert!(
+            mk(DiscoveryStatus::Canceled)
+                .notice()
+                .unwrap()
+                .contains("canceled")
+        );
+        let n = mk(DiscoveryStatus::Unavailable("x".into()))
+            .notice()
+            .unwrap();
         assert!(n.contains("x") && n.contains("src: boom"));
-        assert!(mk(DiscoveryStatus::Complete).notice().unwrap().contains("No fonts"));
+        assert!(
+            mk(DiscoveryStatus::Complete)
+                .notice()
+                .unwrap()
+                .contains("No fonts")
+        );
     }
 
     #[test]
@@ -1189,11 +1303,12 @@ mod tests {
         std::fs::create_dir_all(&deep).unwrap();
         std::fs::write(deep.join("Unreachable-Regular.ttf"), b"").unwrap();
 
-        let families: Vec<String> = font_rows_from_dirs(&[root.to_path_buf()], &AtomicBool::new(false))
-            .rows
-            .into_iter()
-            .map(|r| r.family)
-            .collect();
+        let families: Vec<String> =
+            font_rows_from_dirs(&[root.to_path_buf()], &AtomicBool::new(false))
+                .rows
+                .into_iter()
+                .map(|r| r.family)
+                .collect();
         assert!(families.contains(&"Menlo".to_string()), "{families:?}");
         assert!(
             families.contains(&"Courier New".to_string()),
@@ -1235,7 +1350,8 @@ mod tests {
         assert!(families.contains(&"JetBrainsMonoNerdFont"));
         let _ = std::fs::remove_dir_all(&dir); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
         // A missing directory is skipped, not an error.
-        let missing = font_rows_from_dirs(&[PathBuf::from("/no/such/dir")], &AtomicBool::new(false));
+        let missing =
+            font_rows_from_dirs(&[PathBuf::from("/no/such/dir")], &AtomicBool::new(false));
         assert!(missing.rows.is_empty());
         assert!(missing.errors.is_empty(), "absence is not an error");
     }
