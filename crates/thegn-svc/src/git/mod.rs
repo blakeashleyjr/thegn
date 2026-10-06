@@ -695,6 +695,53 @@ fn bridged_rebase_in_progress(loc: &GitLoc) -> bool {
     }
 }
 
+/// Run an in-process (gix) read under the same budget as the CLI reads
+/// ([`git_read_timeout`]). `f` gets a cooperative interrupt flag that a parked
+/// watchdog thread raises when the deadline passes; the watchdog wakes with no
+/// polling (it blocks on a channel and exits as soon as `f` returns). A read
+/// that honours the flag returns promptly so the shared scan-pool slot is
+/// released and the row degrades to last-known. `None` disables the deadline.
+fn with_read_deadline<T>(
+    timeout: Option<std::time::Duration>,
+    f: impl FnOnce(&std::sync::Arc<std::sync::atomic::AtomicBool>) -> T,
+) -> T {
+    let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let Some(timeout) = timeout else {
+        return f(&flag);
+    };
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    let watch = flag.clone();
+    let spawned = std::thread::Builder::new()
+        .name("git-read-deadline".into())
+        .spawn(move || {
+            // Only a genuine timeout raises the flag; the sender dropping
+            // (read finished) is `Disconnected`.
+            if matches!(
+                done_rx.recv_timeout(timeout),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ) {
+                watch.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+    let out = f(&flag);
+    drop(done_tx);
+    // best-effort: the watchdog exits on its own once the sender is gone
+    drop(spawned);
+    out
+}
+
+/// Map an interruptible status probe's result: an expired deadline is an error
+/// (the caller keeps last-known), never a clean `false`.
+fn dirty_or_expired(found: bool, expired: bool) -> Result<bool> {
+    if found {
+        Ok(true)
+    } else if expired {
+        anyhow::bail!("gix status exceeded the git read timeout")
+    } else {
+        Ok(false)
+    }
+}
+
 /// Upper bound (seconds) on a subprocess git *read* before the child is killed,
 /// so a wedged git — a lock held by a crashed process, a hung NFS/SSH mount, a
 /// stalled pack negotiation on a remote loc — can't pin a background hydration
@@ -1550,16 +1597,22 @@ impl GitBackend for GixGit {
         // `Repository::is_dirty()`: that disables the dirwalk and would miss
         // untracked-only worktrees that the CLI fallback (`git status
         // --porcelain`) reports — a silent sidebar-glyph semantics change.
-        let mut iter = repo
-            .status(gix::progress::Discard)
-            .context("gix status")?
-            .into_iter(Vec::<gix::bstr::BString>::new())
-            .context("gix status iter")?;
-        Ok(iter
-            .next()
-            .transpose()
-            .context("gix status item")?
-            .is_some())
+        let status = repo.status(gix::progress::Discard).context("gix status")?;
+        with_read_deadline(git_read_timeout(), |interrupt| {
+            let mut iter = status
+                .should_interrupt_owned(interrupt.clone())
+                .into_iter(Vec::<gix::bstr::BString>::new())
+                .context("gix status iter")?;
+            let found = iter
+                .next()
+                .transpose()
+                .context("gix status item")?
+                .is_some();
+            // An interrupted iterator ends with `None`, which is
+            // indistinguishable from "clean" — so an expired deadline must
+            // be an error, never a silent `false`.
+            dirty_or_expired(found, interrupt.load(std::sync::atomic::Ordering::SeqCst))
+        })
     }
 
     fn current_branch(&self, loc: &GitLoc) -> Result<String> {
@@ -1800,6 +1853,37 @@ pub(crate) mod testutil {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn read_deadline_raises_flag_for_a_blocked_read() {
+        use std::sync::atomic::Ordering;
+        let raised = super::with_read_deadline(Some(std::time::Duration::from_millis(30)), |f| {
+            let start = std::time::Instant::now();
+            while !f.load(Ordering::SeqCst) && start.elapsed() < std::time::Duration::from_secs(5) {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            f.load(Ordering::SeqCst)
+        });
+        assert!(raised, "deadline must interrupt a read that never finishes");
+    }
+
+    #[test]
+    fn read_deadline_stays_down_for_a_fast_read_or_no_budget() {
+        use std::sync::atomic::Ordering;
+        let fast = super::with_read_deadline(Some(std::time::Duration::from_secs(30)), |f| {
+            f.load(Ordering::SeqCst)
+        });
+        assert!(!fast);
+        let off = super::with_read_deadline(None, |f| f.load(Ordering::SeqCst));
+        assert!(!off);
+    }
+
+    #[test]
+    fn expired_dirty_probe_is_an_error_not_clean() {
+        assert!(super::dirty_or_expired(true, true).unwrap());
+        assert!(super::dirty_or_expired(false, true).is_err());
+        assert!(!super::dirty_or_expired(false, false).unwrap());
+    }
+
     use super::*;
 
     /// Guard (SCM workflow customization, task 7.5): every stageable diff MUST
