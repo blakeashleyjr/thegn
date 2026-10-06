@@ -4,6 +4,7 @@
 
 use super::{GitBackend, run_w};
 use anyhow::Result;
+use thegn_core::git_operand as op;
 use thegn_core::gitrefs::{BisectState, find_culprit, parse_bisect};
 use thegn_core::remote::GitLoc;
 
@@ -45,6 +46,10 @@ pub trait BisectOps: GitBackend {
     ) -> Result<Option<String>> {
         let mut args = vec!["bisect", "start"];
         if let Some(b) = bad {
+            op::revision(b)?;
+            if let Some(g) = good {
+                op::revision(g)?;
+            }
             args.push(b);
             if let Some(g) = good {
                 args.push(g);
@@ -57,8 +62,10 @@ pub trait BisectOps: GitBackend {
     /// Mark a commit with a bisect term (`good`/`bad` or custom). Empty
     /// `sha` marks the current candidate. Returns the culprit when found.
     fn bisect_mark(&self, loc: &GitLoc, term: &str, sha: Option<&str>) -> Result<Option<String>> {
+        op::bisect_term(term)?;
         let mut args = vec!["bisect", term];
         if let Some(s) = sha {
+            op::revision(s)?;
             args.push(s);
         }
         let out = run_w(loc, &[], &args)?;

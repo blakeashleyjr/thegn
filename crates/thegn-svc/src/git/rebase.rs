@@ -14,6 +14,7 @@
 
 use super::{GitBackend, gpg_args, run_w};
 use anyhow::{Context, Result, anyhow, bail};
+use thegn_core::git_operand as op;
 use thegn_core::rebase_todo::{
     TodoAction, TodoEntry, parse_todo, place_fixup, retag, serialize_todo, todo_from_log,
 };
@@ -193,6 +194,7 @@ pub trait RebaseOps: GitBackend {
     /// The pick-everything todo for `<sha>^..HEAD` — the seed the
     /// interactive-rebase view edits before `rebase_interactive`.
     fn rebase_todo_for(&self, loc: &GitLoc, oldest_sha: &str) -> Result<Vec<TodoEntry>> {
+        op::revision(oldest_sha)?;
         todo_for(loc, &base_for(loc, oldest_sha)?)
     }
 
@@ -251,6 +253,7 @@ pub trait RebaseOps: GitBackend {
     /// parked in a staged-only stash for the duration and restored — still
     /// staged — via `stash pop --index`.
     fn reword(&self, loc: &GitLoc, sha: &str, message: &str, opts: &RebaseOpts) -> Result<()> {
+        op::revision(sha)?;
         let head = loc
             .git_out(&["rev-parse", "HEAD"])
             .ok_or_else(|| anyhow!("no HEAD"))?;
