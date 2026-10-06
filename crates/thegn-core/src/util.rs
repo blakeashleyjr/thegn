@@ -1053,40 +1053,44 @@ pub fn git_cmd(dir: &Path) -> Command {
 pub fn heal_main_checkout_worktree(root: &Path) -> bool {
     // Only a main checkout has `.git` as a directory; linked worktrees have a
     // `.git` FILE and their per-worktree config rightly sets core.worktree.
-    if !root.join(".git").is_dir() {
+    // `symlink_metadata`: a `.git` link is never followed (THE-371).
+    if !std::fs::symlink_metadata(root.join(".git")).is_ok_and(|m| m.file_type().is_dir()) {
         return false;
     }
-    let stripped = strip_stray_core_worktree(root);
+    let Ok(stripped) = strip_stray_core_worktree(root) else {
+        return false;
+    };
     let resynced = resync_stale_main_checkout(root);
     stripped || resynced
 }
 
-/// Repair (1): drop a stray `core.worktree` from `<root>/.git/config`.
-fn strip_stray_core_worktree(root: &Path) -> bool {
-    let cfg_path = root.join(".git/config");
-    if !cfg_path.is_file() {
-        return false;
+/// Repair (1): drop a stray `core.worktree` from `<root>/.git/config` through
+/// the no-follow, lock-serialised transaction in [`crate::git_config_heal`].
+/// `Err` means the repair is uncertain and the caller must not go on to
+/// resync a repository whose identity it could not verify.
+fn strip_stray_core_worktree(root: &Path) -> Result<bool, ()> {
+    use crate::git_config_heal::{StripOutcome, strip_stray_core_worktree as txn};
+    match txn(root) {
+        StripOutcome::Unchanged => Ok(false),
+        StripOutcome::Stripped => {
+            tracing::warn!(
+                target: "thegn::startup",
+                root = %root.display(),
+                "stripped stray core.worktree from main checkout config (was retargeting git at another worktree)"
+            );
+            Ok(true)
+        }
+        StripOutcome::Refused(why) => {
+            let why: String = why.chars().take(200).collect();
+            tracing::warn!(
+                target: "thegn::startup",
+                root = %root.display(),
+                %why,
+                "refused to repair main checkout git config; skipping checkout resync"
+            );
+            Err(())
+        }
     }
-    let Ok(text) = std::fs::read_to_string(&cfg_path) else {
-        return false;
-    };
-    let Some(cleaned) = strip_core_worktree(&text) else {
-        return false; // nothing to do
-    };
-    // git itself can't be used to fix this: it canonicalizes the core.worktree
-    // VALUE on every config read, so a stray entry pointing at a now-missing
-    // path makes `git config --get/--unset/--list` all abort with "Invalid
-    // path". A surgical text edit (drop the `worktree` line inside `[core]`,
-    // everything else byte-for-byte) is the only reliable repair.
-    if std::fs::write(&cfg_path, cleaned).is_ok() {
-        tracing::warn!(
-            target: "thegn::startup",
-            root = %root.display(),
-            "stripped stray core.worktree from main checkout config (was retargeting git at another worktree)"
-        );
-        return true;
-    }
-    false
 }
 
 /// What [`resync_ff_checkout`] decided about a stale main checkout.
@@ -1464,37 +1468,6 @@ impl Drop for GitLock {
         note_git_write();
         // Just closing the file releases the share mode lock on Windows.
     }
-}
-
-/// Drop the `worktree = …` entry from the `[core]` section of a git config
-/// file's text, returning the rewritten text — or `None` if there is no such
-/// entry (so the caller can skip the write). Only the `[core]` section is
-/// touched; subsections like `[core "x"]` and every other line are preserved
-/// verbatim. core.worktree is the only key that retargets a checkout's tree.
-fn strip_core_worktree(text: &str) -> Option<String> {
-    let mut out = String::with_capacity(text.len());
-    let mut in_core = false;
-    let mut removed = false;
-    for line in text.lines() {
-        let t = line.trim_start();
-        if let Some(rest) = t.strip_prefix('[') {
-            // Section header: `[core]` enters the section; `[core "sub"]` or any
-            // other header leaves it.
-            let head = rest.split(']').next().unwrap_or("").trim();
-            in_core = head.eq_ignore_ascii_case("core");
-        } else if in_core {
-            // A key line `worktree = …` (git keys are case-insensitive, '=' or
-            // whitespace separated).
-            let key = t.split(['=', ' ', '\t']).next().unwrap_or("").trim();
-            if key.eq_ignore_ascii_case("worktree") {
-                removed = true;
-                continue; // drop this line
-            }
-        }
-        out.push_str(line);
-        out.push('\n');
-    }
-    removed.then_some(out)
 }
 
 /// Run `git -C <dir> <args...>`, returning trimmed stdout on success (None on
@@ -2256,31 +2229,6 @@ mod tests {
             Some(std::ffi::OsStr::new("0")),
             "git_cmd must set GIT_OPTIONAL_LOCKS=0 so read housekeeping never locks the index"
         );
-    }
-
-    #[test]
-    fn strip_core_worktree_removes_only_the_core_section_key() {
-        // Pollution under [core] is removed; the [core "sub"] subsection and a
-        // legitimate worktree key in another section are preserved.
-        let src = "\
-[core]
-\trepositoryformatversion = 0
-\tbare = false
-\tworktree = /no/such/tree
-[remote \"origin\"]
-\turl = https://example/r.git
-[core \"sub\"]
-\tworktree = keep-me
-";
-        let out = strip_core_worktree(src).expect("a [core].worktree was present");
-        assert!(!out.contains("worktree = /no/such/tree"));
-        assert!(out.contains("worktree = keep-me"), "subsection untouched");
-        assert!(out.contains("bare = false"));
-        assert!(out.contains("url = https://example/r.git"));
-        // No [core].worktree left, and no spurious changes (line count -1).
-        assert_eq!(out.lines().count(), src.lines().count() - 1);
-        // A clean config returns None (caller skips the write).
-        assert!(strip_core_worktree("[core]\n\tbare = false\n").is_none());
     }
 
     #[test]
