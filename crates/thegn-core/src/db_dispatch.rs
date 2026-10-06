@@ -264,6 +264,31 @@ impl Db {
         )? != 0)
     }
 
+    /// [`Self::compare_and_set_dispatch_retry_park`] fenced on the exact run
+    /// (row, session, `run_gen`) the exit handler classified: a row republished
+    /// to a newer run since matches nothing, so a stale exit can never park the
+    /// live replacement.
+    pub fn compare_and_set_dispatch_retry_park_run(
+        &self,
+        run: &crate::issue::DispatchRunRef,
+        expected: AgentDispatchStatus,
+        note: &str,
+    ) -> Result<bool> {
+        let note = crate::pipeline_report::note_text(note).map_err(|e| anyhow::anyhow!("{e}"))?;
+        Ok(self.conn().execute(
+            "UPDATE agent_dispatches SET status=?1, note=?2 WHERE id=?3 AND status=?4 \
+             AND COALESCE(session_id,'')=?5 AND run_gen=?6",
+            rusqlite::params![
+                AgentDispatchStatus::WaitingHuman.as_str(),
+                note,
+                run.id,
+                expected.as_str(),
+                run.session_id,
+                run.run_gen
+            ],
+        )? != 0)
+    }
+
     /// Publish a relaunched worker only while the retry reservation is still
     /// ours. A supervisor may close the `spawning` row while `open` awaits;
     /// in that case this returns false and the caller kills the orphan launch.
@@ -1308,6 +1333,38 @@ mod tests {
         assert!(missing.downcast_ref::<ResumeDispatchConflict>().is_none());
         assert!(missing.to_string().contains("dispatch 99999 disappeared"));
         assert_eq!(db.list_dispatches().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn retry_park_run_refuses_a_republished_run() {
+        let (db, _dir) = temp_db();
+        let id = put_row(&db, "linear:P-1", "/wt/p");
+        db.update_dispatch_status(id, AgentDispatchStatus::Running)
+            .unwrap();
+        db.stamp_dispatch_run(id, "old", "a.md").unwrap();
+        let old = db.dispatch_run_ref(id).unwrap().unwrap();
+        // The row is republished to a newer run after the exit was classified.
+        db.stamp_dispatch_run(id, "new", "a.md").unwrap();
+        assert!(
+            !db.compare_and_set_dispatch_retry_park_run(&old, AgentDispatchStatus::Running, "n")
+                .unwrap()
+        );
+        let row = db.get_dispatch(id).unwrap().unwrap();
+        assert_eq!(
+            row.status,
+            AgentDispatchStatus::Running,
+            "new run untouched"
+        );
+        assert_eq!(row.note, None);
+        let new = db.dispatch_run_ref(id).unwrap().unwrap();
+        assert!(
+            db.compare_and_set_dispatch_retry_park_run(&new, AgentDispatchStatus::Running, "n")
+                .unwrap()
+        );
+        assert_eq!(
+            db.get_dispatch(id).unwrap().unwrap().status,
+            AgentDispatchStatus::WaitingHuman
+        );
     }
 
     #[test]
