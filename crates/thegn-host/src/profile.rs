@@ -18,7 +18,7 @@ mod machine {
     use std::io::Write;
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
     use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU8, Ordering};
 
     /// Observable profiler state. `Idle -> Starting -> Running -> Publishing
     /// -> Idle`; a transition lands only after its operation succeeded (a
@@ -32,7 +32,6 @@ mod machine {
     }
 
     static STATE: AtomicU8 = AtomicU8::new(0);
-    static GENERATION: AtomicU64 = AtomicU64::new(0);
 
     fn publish_state(s: State) {
         STATE.store(s as u8, Ordering::SeqCst);
@@ -46,11 +45,6 @@ mod machine {
             3 => State::Publishing,
             _ => State::Idle,
         }
-    }
-
-    /// Generation of the latest capture started (monotonic, 0 = none yet).
-    pub fn current_generation() -> u64 {
-        GENERATION.load(Ordering::SeqCst)
     }
 
     /// The profiler/report/render seam (pprof in production, a fake in tests).
@@ -91,7 +85,6 @@ mod machine {
             match self.session.take() {
                 None => {
                     self.generation += 1;
-                    GENERATION.store(self.generation, Ordering::SeqCst);
                     publish_state(State::Starting);
                     match self.backend.start() {
                         Ok(s) => {
@@ -140,10 +133,7 @@ mod machine {
             return Err(format!("{} is not owned by this user", dir.display()));
         }
         // best-effort: tighten a pre-existing directory; ownership was verified above
-        let _ = std::fs::set_permissions(
-            dir,
-            std::os::unix::fs::PermissionsExt::from_mode(0o700),
-        );
+        let _ = std::fs::set_permissions(dir, std::os::unix::fs::PermissionsExt::from_mode(0o700));
         Ok(())
     }
 
@@ -222,7 +212,10 @@ mod machine {
             assert!(matches!(m.toggle(), Outcome::StartFailed { .. }));
             assert_eq!(current_state(), State::Idle);
             // not out of phase: the very next toggle tries to start again
-            assert!(matches!(m.toggle(), Outcome::StartFailed { generation: 2, .. }));
+            assert!(matches!(
+                m.toggle(),
+                Outcome::StartFailed { generation: 2, .. }
+            ));
         }
 
         #[test]
@@ -234,7 +227,11 @@ mod machine {
                 panic!()
             };
             assert_eq!(current_state(), State::Running);
-            let Outcome::Published { path, generation: g } = m.toggle() else {
+            let Outcome::Published {
+                path,
+                generation: g,
+            } = m.toggle()
+            else {
                 panic!()
             };
             assert_eq!(generation, g);
@@ -443,6 +440,7 @@ mod imp {
     }
 
     fn log_outcome(o: &Outcome) {
+        tracing::debug!(target: "thegn::perf", state = ?super::machine::current_state(), "profiler state");
         match o {
             Outcome::Started { generation } => tracing::info!(
                 target: "thegn::perf", generation, "profiler started (SIGUSR2 again to dump)"
