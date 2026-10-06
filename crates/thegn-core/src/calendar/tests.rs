@@ -2115,8 +2115,8 @@ fn gap_resolution_uses_real_transitions_in_every_hemisphere() {
             GapPolicy::ShiftForward,
             GapPolicy::Earliest,
         ] {
-            let _ = tz::resolve_local(chrono::NaiveDateTime::MIN, z, p);
-            let _ = tz::resolve_local(chrono::NaiveDateTime::MAX, z, p);
+            let _resolved = tz::resolve_local(chrono::NaiveDateTime::MIN, z, p);
+            let _resolved = tz::resolve_local(chrono::NaiveDateTime::MAX, z, p);
         }
     }
 }
