@@ -545,12 +545,21 @@ class LiveTests(unittest.TestCase):
             self.assertEqual(self.target.read_bytes(), b"old executable")
 
     def test_inside_thegn_relaunches_instead_of_stopping_itself(self):
-        with patch.object(live, "settings", return_value=self.paths), patch.object(live, "source_revision", return_value="a" * 40), patch.object(live, "thegn_ancestor", return_value=1234), patch.object(live, "relaunch_outside") as relaunch, patch.object(live, "build_stage") as build, patch.object(live, "stop_running") as stop, contextlib.redirect_stdout(io.StringIO()):
+        with contextlib.redirect_stdout(io.StringIO()), patch.object(live.sys.stdin, "isatty", return_value=True), patch.object(live.sys.stdout, "isatty", return_value=True), patch.object(live, "settings", return_value=self.paths), patch.object(live, "source_revision", return_value="a" * 40), patch.object(live, "thegn_ancestor", return_value=1234), patch.object(live, "relaunch_outside") as relaunch, patch.object(live, "build_stage") as build, patch.object(live, "stop_running") as stop:
             self.assertEqual(live.main(["--repo", str(self.repo), "--level", "info"]), 0)
         relaunch.assert_called_once()
         self.assertEqual(relaunch.call_args[0][0], ["--repo", str(self.repo), "--level", "info"])
         build.assert_not_called()
         stop.assert_not_called()
+
+    def test_a_non_interactive_caller_never_relaunches_an_upgrade(self):
+        # The 2026-10-05 incident: an agent's shell (no tty) ran `just live`
+        # from inside thegn and it reopened itself in a fresh, unwatched window.
+        with contextlib.redirect_stdout(io.StringIO()), patch.object(live.sys.stdin, "isatty", return_value=False), patch.object(live, "settings", return_value=self.paths), patch.object(live, "source_revision", return_value="a" * 40), patch.object(live, "thegn_ancestor", return_value=1234), patch.object(live, "relaunch_outside") as relaunch, patch.object(live, "build_stage") as build:
+            with self.assertRaisesRegex(live.Refusal, "terminal"):
+                live.main(["--repo", str(self.repo)])
+        relaunch.assert_not_called()
+        build.assert_not_called()
 
     def _fake_proc(self, processes):
         """processes: {pid: (name, ppid, exe or None, argv)}"""

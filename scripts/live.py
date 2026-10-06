@@ -896,11 +896,14 @@ def main(argv=None):
     print("Brand moves disabled with THEGN_NO_MIGRATE=1; database migration policy is not overridden.")
     if args.plan:
         return 0
+    # The terminal check comes FIRST, before the relaunch below: a script or an
+    # agent (no tty) must never be able to start an upgrade, including by
+    # having it reopen itself in a fresh window that nobody is watching.
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        raise Refusal("A real terminal is required: the new controller launches in the foreground")
     if thegn_ancestor() is not None:
         relaunch_outside(raw_argv, env, repo)
         return 0
-    if not sys.stdin.isatty() or not sys.stdout.isatty():
-        raise Refusal("A real terminal is required: the new controller launches in the foreground")
     with locked(paths["target"].parent / ".thegn-live-install.lock"), locked(paths["state"] / "live-upgrade.lock"):
         step(1, "Preflight: clean source and supported paths")
         source_revision(repo, env)
