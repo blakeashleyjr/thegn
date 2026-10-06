@@ -416,7 +416,7 @@ fn dispatch_agent(ctx: &mut TrackerCtx) {
                 thegn_core::msg::warn(&message);
                 return;
             }
-            let mut dispatch_id: Option<i64> = None;
+            let dispatch_id: Option<i64>;
             {
                 // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                 dispatch_id = db
@@ -451,10 +451,8 @@ fn dispatch_agent(ctx: &mut TrackerCtx) {
             // THE-733: tell the daemon which row this launch is, so it binds the
             // session id at session start (see `DISPATCH_ROW_ENV`).
             if let Some(row) = dispatch_id {
-                spec.env.push((
-                    thegn_core::issue::DISPATCH_ROW_ENV.into(),
-                    row.to_string(),
-                ));
+                spec.env
+                    .push((thegn_core::issue::DISPATCH_ROW_ENV.into(), row.to_string()));
             }
             // The dispatch lands on the repo's ambient env (no wizard pick).
             let env = crate::wizard::ambient_env_name_live(&cfg2, &root);
