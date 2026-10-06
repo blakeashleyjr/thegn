@@ -6791,6 +6791,8 @@ async fn event_loop<T: Terminal>(
     // one-shot seed, which is what lets the (otherwise hidden) Pipeline tab
     // discover it has rows to show. See the sampler beside the stats drain.
     let mut dispatch_sampled_at: Option<std::time::Instant> = None;
+    // Generation fence + single-flight guard for those samples (THE-260/271).
+    let mut roster_fence = crate::monitor_pipeline::RosterFence::default();
     // Threshold-alert latches (`[stats.alerts]`). Evaluated on the stats drain
     // rather than inside the monitor: an alert you only get when you happen to
     // be looking at a modal is not an alert.
@@ -10849,19 +10851,28 @@ async fn event_loop<T: Terminal>(
         {
             let board_live = board.as_ref().is_some_and(|b| b.wants_dispatches());
             let roster_stale = crate::monitor_pipeline::take_roster_dirty();
-            let due = dispatch_sampled_at
-                .is_none_or(|t: std::time::Instant| t.elapsed() >= DISPATCH_SAMPLE_EVERY);
+            // Consecutive failures stretch the cadence (bounded backoff).
+            let every = crate::monitor_pipeline::RosterFence::backoff(
+                DISPATCH_SAMPLE_EVERY,
+                roster_fence.failures(),
+            );
+            let due = dispatch_sampled_at.is_none_or(|t: std::time::Instant| t.elapsed() >= every);
             // Seed once (so the tab can *become* visible at all — it is hidden
             // until a roster row exists, which nothing would ever discover
             // otherwise), then on every roster change, then on cadence while
             // the board is being watched.
             if roster_stale || dispatch_sampled_at.is_none() || (board_live && due) {
-                dispatch_sampled_at = Some(std::time::Instant::now());
-                crate::pipeline_board::spawn_dispatch_sample(
-                    &refresh_tx,
-                    &waker,
-                    crate::monitor_pipeline::stage_order(&current_config),
-                );
+                // At most one read in flight; a dirty signal during one is
+                // remembered and re-issued when it lands.
+                if let Some(generation) = roster_fence.request(roster_stale) {
+                    dispatch_sampled_at = Some(std::time::Instant::now());
+                    crate::pipeline_board::spawn_dispatch_sample(
+                        &refresh_tx,
+                        &waker,
+                        crate::monitor_pipeline::stage_order(&current_config),
+                        generation,
+                    );
+                }
             }
         }
 
@@ -12030,9 +12041,25 @@ async fn event_loop<T: Terminal>(
                 // A fresh roster sample for the board. Model-only: it dirties
                 // the frame ONLY when the rows actually moved, so a sample that
                 // finds nothing new costs one comparison and no repaint.
-                RefreshKind::Dispatches(roster) => {
-                    if model.dispatches != *roster {
-                        model.dispatches = *roster;
+                RefreshKind::Dispatches(sample) => {
+                    let accepted = roster_fence.accept(&mut model.dispatches, *sample);
+                    if let Some(n) = accepted.log_failure {
+                        tracing::warn!(
+                            target: "thegn::pipeline",
+                            "pipeline roster sample failed ({n} in a row); showing last known-good: {}",
+                            model.dispatches.stale.as_ref().map_or("", |s| s.error.as_str())
+                        );
+                    }
+                    if accepted.follow_up {
+                        // A change landed mid-read: re-sample once. The flag
+                        // is read by the sampler above on the next pass; the
+                        // pulse guarantees that pass happens.
+                        crate::monitor_pipeline::mark_roster_dirty();
+                        if let Err(e) = waker.wake() {
+                            tracing::debug!(target: "thegn::pipeline", "roster follow-up waker pulse failed: {e}");
+                        }
+                    }
+                    if accepted.changed {
                         dirty = true;
                         // The board caches its folded rows (and its row-identity
                         // cursor) at rebuild, so a moved roster has to be pushed
