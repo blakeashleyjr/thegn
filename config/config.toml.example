@@ -409,7 +409,7 @@ reminder_default_mins = [10]
 # username = ""             # caldav: Basic-auth user
 # allow_private_network = false # trusted LAN opt-in; ambient proxies are never used
 # read_only = true
-# calendar_ids = []         # caldav: restrict to these collections; [] = all
+# calendar_ids = []         # caldav: only events in these collections (name or path tail, e.g. "work"); [] = all
 #
 # A local file, or a DIRECTORY of .ics files — the vdir layout vdirsyncer and
 # khal already write, so an existing setup needs no extra configuration.
