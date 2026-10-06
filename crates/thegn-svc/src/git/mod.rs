@@ -6,6 +6,7 @@
 
 use anyhow::{Context, Result};
 use std::path::Path;
+use thegn_core::git_operand as op;
 use thegn_core::gitrefs::{BranchInfo, Commit, StashEntry};
 use thegn_core::reflog::ReflogEntry;
 use thegn_core::remote::GitLoc;
@@ -469,6 +470,7 @@ pub trait GitBackend: thegn_core::seam::Probe + Send + Sync {
     /// selected-branch log (same record shape as [`Self::log_commits`], which
     /// is HEAD's).
     fn log_commits_ref(&self, loc: &GitLoc, refname: &str, n: usize) -> Result<Vec<Commit>> {
+        let refname = op::revision(refname)?;
         let n = n.to_string();
         let out = run(
             loc,
@@ -1407,6 +1409,7 @@ impl GitBackend for CliGit {
         // non-ASCII / special-char paths OCTAL-QUOTED (`"docs/caf\303\251.md"`)
         // while `status -z` (the join partner in the panel) emits them raw, so
         // the exact-string join missed and the row rendered `+0 −0`.
+        let base = op::revision(base)?;
         let out = run(
             loc,
             &["-c", "core.quotePath=false", "diff", "--numstat", base],
@@ -1488,6 +1491,7 @@ impl GitBackend for CliGit {
     }
 
     fn add_worktree(&self, root: &Path, branch: &str, base: &str, path: &Path) -> Result<()> {
+        let (branch, base) = (op::branch_name(branch)?, op::revision(base)?);
         let p = path.to_string_lossy();
         run_root(root, &["worktree", "add", "-b", branch, &p, base])
     }
@@ -1518,7 +1522,10 @@ impl GitBackend for CliGit {
         run_root(root, &["worktree", "remove", "--force", &p])?;
         if let Some(branch) = branch {
             // Best-effort: the branch may still be checked out elsewhere.
-            let _ = run_root(root, &["branch", "-D", &branch]); // best-effort: delete failure leaves the branch for later cleanup
+            // A dash-named branch is refused by the validator, not reinterpreted.
+            if let Ok(b) = op::branch_name(&branch) {
+                let _ = run_root(root, &["branch", "-D", b]); // best-effort: delete failure leaves the branch for later cleanup
+            }
         }
         Ok(())
     }

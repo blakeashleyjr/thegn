@@ -5,6 +5,7 @@
 
 use super::{GitBackend, run_w};
 use anyhow::{Context, Result, bail};
+use thegn_core::git_operand as op;
 use thegn_core::reflog::{OurMarks, UndoPlan, plan_redo, plan_undo};
 use thegn_core::remote::GitLoc;
 
@@ -27,10 +28,13 @@ pub trait UndoOps: GitBackend {
         match plan {
             UndoPlan::Nothing => bail!("nothing to undo"),
             UndoPlan::Checkout { branch, .. } => {
+                let branch = op::branch_name(branch)?;
                 run_w(loc, &[], &["checkout", branch])?;
                 Ok(None)
             }
             UndoPlan::HardResetTo { sha, .. } => {
+                // Validate before the autostash so a refusal changes nothing.
+                let target = op::revision(sha)?;
                 let unknown = || {
                     format!(
                         "worktree state unknown \u{2014} nothing was changed; run `git status` in {} to diagnose",
@@ -58,7 +62,7 @@ pub trait UndoOps: GitBackend {
                     self.is_dirty(loc).with_context(unknown)?;
                     None
                 };
-                let reset = run_w(loc, &[], &["reset", "--hard", sha]);
+                let reset = run_w(loc, &[], &["reset", "--hard", target]);
                 if let Some(entry) = pushed {
                     // Pop even when the reset failed; a pop conflict surfaces
                     // through the normal conflict UX. Pop exactly our entry.
@@ -124,6 +128,22 @@ mod tests {
         git_in(dir, &["config", "user.name", "t"]);
         git_in(dir, &["config", "user.email", "t@e"]);
         git_in(dir, &["config", "commit.gpgsign", "false"]);
+    }
+
+    #[test]
+    fn undo_apply_refuses_option_shaped_targets() {
+        let repo = TestRepo::new("undo-dash");
+        let loc = repo.loc();
+        let reset = UndoPlan::HardResetTo {
+            sha: "--hard".into(),
+            undoing: String::new(),
+        };
+        assert!(CliGit.undo_apply(&loc, &reset, true).is_err());
+        let co = UndoPlan::Checkout {
+            branch: "--orphan".into(),
+            undoing: String::new(),
+        };
+        assert!(CliGit.undo_apply(&loc, &co, false).is_err());
     }
 
     #[test]
