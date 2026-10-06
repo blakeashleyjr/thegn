@@ -1822,7 +1822,7 @@ mod tests {
             serve(sock.try_clone().unwrap(), sock);
         });
         let sock = TcpStream::connect(addr).unwrap();
-        let c = BridgeClient::new(sock.try_clone().unwrap(), sock.try_clone().unwrap());
+        let c = BridgeClient::new(sock.try_clone().unwrap(), sock.try_clone().unwrap()).unwrap();
         let (_chan, rx) = c
             .spawn_proc(
                 &[
