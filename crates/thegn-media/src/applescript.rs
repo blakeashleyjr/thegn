@@ -191,12 +191,11 @@ impl MediaBackend for AppleScript {
 
 /// Run an AppleScript via `osascript -e`, returning trimmed stdout.
 async fn osascript(script: &str) -> Result<String, MediaError> {
-    let out = tokio::process::Command::new("osascript")
-        .arg("-e")
-        .arg(script)
-        .output()
+    let mut cmd = tokio::process::Command::new("osascript");
+    cmd.arg("-e").arg(script);
+    let out = crate::helper::output(cmd, crate::helper::Limits::OP)
         .await
-        .map_err(|e| MediaError::Unavailable(e.to_string()))?;
+        .map_err(|e| e.into_media("osascript"))?;
     if out.status.success() {
         Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
     } else {
