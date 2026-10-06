@@ -282,6 +282,80 @@ fn priority_to_int(p: IssuePriority) -> i64 {
 /// A bare `"`, a trailing `\`, or a raw newline would terminate/break the
 /// literal (GraphQL string literals cannot contain raw line terminators);
 /// backslash must be escaped first so we don't double-escape our own output.
+// ---- team workflow-state resolution ----------------------------------------
+
+const TEAM_STATES_QUERY: &str = "query($id: String!) { issue(id: $id) { team { id states { nodes { id name type position } } } } }";
+
+#[derive(Serialize)]
+struct TeamStatesVars<'a> {
+    id: &'a str,
+}
+
+#[derive(Deserialize)]
+struct TeamStatesData {
+    issue: Option<TeamStatesIssue>,
+}
+
+#[derive(Deserialize)]
+struct TeamStatesIssue {
+    team: Option<TeamStates>,
+}
+
+#[derive(Deserialize)]
+struct TeamStates {
+    states: TeamStateNodes,
+}
+
+#[derive(Deserialize)]
+struct TeamStateNodes {
+    nodes: Vec<TeamStateNode>,
+}
+
+#[derive(Deserialize)]
+struct TeamStateNode {
+    id: String,
+    #[serde(default)]
+    name: String,
+    #[serde(rename = "type")]
+    state_type: String,
+    #[serde(default)]
+    position: f64,
+}
+
+/// The state of `type_str` in the issue's own team, lowest position first. No
+/// match is an explicit error: never another team's state.
+fn pick_team_state(data: &TeamStatesData, type_str: &str) -> Result<String, IssueError> {
+    let team = data
+        .issue
+        .as_ref()
+        .ok_or_else(|| IssueError::Api("Linear issue not found".into()))?
+        .team
+        .as_ref()
+        .ok_or_else(|| IssueError::Api("Linear issue has no team".into()))?;
+    let matches: Vec<&TeamStateNode> = team
+        .states
+        .nodes
+        .iter()
+        .filter(|n| n.state_type == type_str)
+        .collect();
+    // Several states may share a type; the lowest workflow `position` (column
+    // order) wins, ties broken by name then id. Never API order.
+    matches
+        .into_iter()
+        .min_by(|a, b| {
+            a.position
+                .total_cmp(&b.position)
+                .then_with(|| a.name.cmp(&b.name))
+                .then_with(|| a.id.cmp(&b.id))
+        })
+        .map(|n| n.id.clone())
+        .ok_or_else(|| {
+            IssueError::Api(format!(
+                "the issue's team has no workflow state of type {type_str}"
+            ))
+        })
+}
+
 fn escape_graphql_str(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     for c in s.chars() {
@@ -592,37 +666,25 @@ impl IssueBackend for LinearBackend {
             if let Some(t) = &patch.title {
                 fields.push(format!(r#"title: "{}""#, escape_graphql_str(t)));
             }
-            // Status update requires knowing the stateId for the target state+team.
-            // For simplicity we pass the status type as a string; callers that need
-            // the exact stateId should use the raw Linear API directly.
+            // Resolve the target issue's OWN team workflow states, then pick the
+            // single state of the requested type. Never a workspace-wide lookup.
+            let mut wanted_state_type: Option<&'static str> = None;
             if let Some(s) = patch.status {
                 let type_str = status_to_write_state_type(s);
-                // We query for the first state of the correct type in the issue's team.
-                // This is a best-effort approach; a full implementation would cache
-                // the state list per team and resolve the exact stateId.
-                let state_query = format!(
-                    r#"query {{ workflowStates(filter: {{ type: {{ eq: "{type_str}" }} }}, first: 1) {{
-                    nodes {{ id }}
-                }} }}"#
-                );
-                #[derive(Deserialize)]
-                struct StatesData {
-                    #[serde(rename = "workflowStates")]
-                    workflow_states: StatesConnection,
-                }
-                #[derive(Deserialize)]
-                struct StatesConnection {
-                    nodes: Vec<StateNode>,
-                }
-                #[derive(Deserialize)]
-                struct StateNode {
-                    id: String,
-                }
-                let states: StatesData = Self::gql(&mut op, &state_query, Vars {}).await?;
-                if let Some(state_node) = states.workflow_states.nodes.first() {
-                    let state_id = checked_workflow_state_id(&state_node.id)?;
-                    fields.push(format!(r#"stateId: "{state_id}""#));
-                }
+                let states: TeamStatesData = Self::gql(
+                    &mut op,
+                    TEAM_STATES_QUERY,
+                    TeamStatesVars {
+                        id: id.strip_prefix("linear:").unwrap_or(id),
+                    },
+                )
+                .await?;
+                let state_id = pick_team_state(&states, type_str)?;
+                fields.push(format!(
+                    r#"stateId: "{}""#,
+                    checked_workflow_state_id(&state_id)?
+                ));
+                wanted_state_type = Some(type_str);
             }
 
             if fields.is_empty() {
@@ -641,11 +703,19 @@ impl IssueBackend for LinearBackend {
             }}"#
             );
             let data: IssueUpdateData = Self::gql(&mut op, &query, Vars {}).await?;
-            data.issue_update
+            let updated = data
+                .issue_update
                 .issue
-                .map(linear_issue_to_domain)
-                .transpose()?
-                .ok_or_else(|| IssueError::Api("issueUpdate returned no issue".into()))
+                .ok_or_else(|| IssueError::Api("issueUpdate returned no issue".into()))?;
+            if let Some(want) = wanted_state_type {
+                let got = updated.state.as_ref().map(|st| st.state_type.as_str());
+                if got != Some(want) {
+                    return Err(IssueError::Api(format!(
+                        "Linear applied state type {got:?}, expected {want:?}"
+                    )));
+                }
+            }
+            linear_issue_to_domain(updated)
         })
     }
 
@@ -847,6 +917,76 @@ mod tests {
         assert!(backend.http().is_ok());
     }
 
+    fn team_states(states: &[(&str, &str, &str)]) -> serde_json::Value {
+        let nodes: Vec<_> = states
+            .iter()
+            .enumerate()
+            .map(|(i, (id, name, ty))| json!({"id": id, "name": name, "type": ty, "position": i}))
+            .collect();
+        json!({"data": {"issue": {"team": {"id": "team-a", "states": {"nodes": nodes}}}}})
+    }
+
+    fn parse_states(v: serde_json::Value) -> TeamStatesData {
+        serde_json::from_value(v["data"].clone()).unwrap()
+    }
+
+    #[test]
+    fn pick_team_state_ignores_other_teams_and_api_order() {
+        // The catalog is the issue's own team; a same-type state elsewhere is
+        // never in it, so the single own-team match wins.
+        let d = parse_states(team_states(&[
+            ("a-todo", "Todo", "unstarted"),
+            ("a-done", "Done", "completed"),
+        ]));
+        assert_eq!(pick_team_state(&d, "completed").unwrap(), "a-done");
+    }
+
+    #[test]
+    fn pick_team_state_missing_type_is_a_clear_error_not_a_fallback() {
+        let d = parse_states(team_states(&[("a-todo", "Todo", "unstarted")]));
+        let err = pick_team_state(&d, "completed").unwrap_err().to_string();
+        assert!(err.contains("no workflow state of type completed"), "{err}");
+    }
+
+    fn positioned(states: &[(&str, &str, f64)]) -> TeamStatesData {
+        let nodes: Vec<_> = states
+            .iter()
+            .map(|(id, name, pos)| json!({"id": id, "name": name, "type": "started", "position": pos}))
+            .collect();
+        parse_states(json!({"data": {"issue": {"team": {"id": "t", "states": {"nodes": nodes}}}}}))
+    }
+
+    #[test]
+    fn pick_team_state_lowest_position_wins_in_either_order() {
+        let ip = ("ip", "In Progress", 1.0);
+        let ir = ("ir", "In Review", 2.0);
+        for d in [positioned(&[ip, ir]), positioned(&[ir, ip])] {
+            assert_eq!(pick_team_state(&d, "started").unwrap(), "ip");
+        }
+    }
+
+    #[test]
+    fn pick_team_state_position_ties_break_by_name_then_id() {
+        let d = positioned(&[("z", "B", 1.0), ("y", "A", 1.0)]);
+        assert_eq!(pick_team_state(&d, "started").unwrap(), "y");
+        let d = positioned(&[("z", "A", 1.0), ("y", "A", 1.0)]);
+        assert_eq!(pick_team_state(&d, "started").unwrap(), "y");
+    }
+
+    #[test]
+    fn pick_team_state_missing_issue_or_team_fails() {
+        let d: TeamStatesData = serde_json::from_value(json!({"issue": null})).unwrap();
+        assert!(pick_team_state(&d, "completed").is_err());
+        let d: TeamStatesData = serde_json::from_value(json!({"issue": {"team": null}})).unwrap();
+        assert!(pick_team_state(&d, "completed").is_err());
+    }
+
+    #[test]
+    fn team_states_query_uses_variables_not_interpolation() {
+        assert!(TEAM_STATES_QUERY.contains("$id"));
+        assert!(!TEAM_STATES_QUERY.contains("workflowStates"));
+    }
+
     #[tokio::test]
     async fn update_status_escapes_provider_state_id_before_write() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -875,13 +1015,7 @@ mod tests {
                             .push(payload["query"].as_str().unwrap().to_owned());
                     }
                     let body = if call == 0 {
-                        json!({
-                            "data": {
-                                "workflowStates": {
-                                    "nodes": [{"id": "state\";title:\"injected"}]
-                                }
-                            }
-                        })
+                        team_states(&[("state\";title:\"injected", "Done", "completed")])
                     } else {
                         json!({"data": {"issueUpdate": {"issue": null}}})
                     };
@@ -934,7 +1068,7 @@ mod tests {
                 async move {
                     let call = route_calls.fetch_add(1, Ordering::SeqCst);
                     let body = if call == 0 {
-                        json!({"data": {"workflowStates": {"nodes": [{"id": "state-1"}]}}})
+                        team_states(&[("state-1", "Done", "completed")])
                     } else {
                         json!({"data": {"issueUpdate": {"issue": null}}})
                     };
