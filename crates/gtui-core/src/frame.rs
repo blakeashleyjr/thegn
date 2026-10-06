@@ -57,29 +57,39 @@ impl Field {
         }
     }
 
-    /// The field's numeric values as `f64`. Empty when the column is text-backed
-    /// (`Time`/`Float64` fields are both f64-backed).
-    pub fn floats(&self) -> Vec<f64> {
+    /// The field's numeric values, borrowed. Empty when the column is text-backed
+    /// (`Time`/`Float64` fields are both f64-backed). Never copies.
+    pub fn floats(&self) -> &[f64] {
         match &self.data {
-            Column::F64(v) => v.clone(),
-            Column::Str(_) => Vec::new(),
+            Column::F64(v) => v,
+            Column::Str(_) => &[],
         }
     }
 
-    /// The field's values as owned `String`s. Empty when the column is numeric.
-    pub fn strings(&self) -> Vec<String> {
+    /// The field's values, borrowed. Empty when the column is numeric.
+    pub fn strings(&self) -> &[String] {
         match &self.data {
-            Column::Str(v) => v.clone(),
-            Column::F64(_) => Vec::new(),
+            Column::Str(v) => v,
+            Column::F64(_) => &[],
         }
     }
 
     /// The value at row `i` formatted for display (empty string when out of
-    /// range). Used for naive table-cell rendering.
+    /// range).
     pub fn cell(&self, i: usize) -> String {
+        self.cell_str(i).into_owned()
+    }
+
+    /// Like [`Field::cell`] but borrows text cells instead of cloning them;
+    /// only numeric cells allocate (they must be formatted).
+    pub fn cell_str(&self, i: usize) -> std::borrow::Cow<'_, str> {
+        use std::borrow::Cow;
         match &self.data {
-            Column::F64(v) => v.get(i).map(|x| x.to_string()).unwrap_or_default(),
-            Column::Str(v) => v.get(i).cloned().unwrap_or_default(),
+            Column::F64(v) => v
+                .get(i)
+                .map(|x| Cow::Owned(x.to_string()))
+                .unwrap_or(Cow::Borrowed("")),
+            Column::Str(v) => v.get(i).map_or(Cow::Borrowed(""), |s| Cow::Borrowed(s)),
         }
     }
 
@@ -119,7 +129,7 @@ mod tests {
     #[test]
     fn numeric_and_string_columns() {
         let nums = Field::new("v", FieldType::Float64, vec![1.0, 2.5]);
-        assert_eq!(nums.floats(), vec![1.0, 2.5]);
+        assert_eq!(nums.floats(), &[1.0, 2.5][..]);
         assert!(nums.strings().is_empty());
         assert_eq!(nums.len(), 2);
         assert!(!nums.is_empty());
@@ -127,7 +137,9 @@ mod tests {
         assert_eq!(nums.cell(9), "");
 
         let txt = Field::new_str("line", vec!["a".into(), "b".into()]);
-        assert_eq!(txt.strings(), vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(txt.strings(), &["a".to_string(), "b".to_string()][..]);
+        assert!(matches!(txt.cell_str(0), std::borrow::Cow::Borrowed("a")));
+        assert_eq!(txt.cell_str(7), "");
         assert!(txt.floats().is_empty());
         assert_eq!(txt.cell(0), "a");
     }
