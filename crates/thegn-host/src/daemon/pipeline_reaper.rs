@@ -111,16 +111,17 @@ fn reap_pass(
                     .filter(|r| {
                         matches!(
                             r.status,
-                            AgentDispatchStatus::Spawning | AgentDispatchStatus::Running
+                            // Never `Spawning`: a retry reserves the row that way
+                            // mid-relaunch without bumping `run_gen`, so its old
+                            // session and exit stamp are not evidence about the
+                            // worker being opened. Fail closed.
+                            AgentDispatchStatus::Running
                         )
                     })
                     .collect::<Vec<_>>();
                 // Same lock as the roster snapshot: the generation each plan
                 // entry is fenced on. A row we cannot fence is not planned.
-                let runs = rows
-                    .iter()
-                    .filter_map(|r| db.dispatch_run_ref(r.id).ok().flatten())
-                    .collect::<Vec<_>>();
+                let runs = db.running_dispatch_run_refs().unwrap_or_default();
                 (rows, runs)
             }
             Err(e) => {
@@ -131,6 +132,9 @@ fn reap_pass(
         Err(_) => return,
     };
     let plan = crate::cmd::dispatch::reap_plan_rows(&rows, Some(live_ids));
+    // One fresh liveness read for the whole apply phase.
+    let fresh: Option<std::collections::HashSet<String>> =
+        fresh_live().map(|v| v.into_iter().collect());
     for r in &plan {
         if !matches!(
             r.verdict,
@@ -143,8 +147,8 @@ fn reap_pass(
         };
         // Exact-session liveness, fresh: a session that is live now (opened
         // after the snapshot) or an unreadable daemon is a no-op.
-        match fresh_live() {
-            Some(now) if !now.iter().any(|s| s == &run.session_id) => {}
+        match &fresh {
+            Some(now) if !now.contains(&run.session_id) => {}
             _ => {
                 tracing::debug!(
                     target: "thegn::pipeline", row = r.id,
@@ -448,6 +452,21 @@ mod tests {
         };
         reap_pass(&shared, &[], &relaunch);
         assert_eq!(status_of(&shared, id), AgentDispatchStatus::Running);
+    }
+
+    #[test]
+    fn spawning_row_with_old_exit_stamp_and_dead_session_is_not_parked() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = Db::open_at(&dir.path().join("thegn.db")).unwrap();
+        let wt = dir.path().join("wt");
+        std::fs::create_dir(&wt).unwrap();
+        let id = row(&db, &wt, ".thegn/pipeline/THE-1/code/1.md");
+        // A retry reserving the row mid-relaunch: Spawning, old exit stamp kept.
+        db.update_dispatch_status(id, AgentDispatchStatus::Spawning)
+            .unwrap();
+        let shared = Arc::new(Mutex::new(db));
+        reap_pass(&shared, &[], &|| Some(Vec::new()));
+        assert_eq!(status_of(&shared, id), AgentDispatchStatus::Spawning);
     }
 
     fn status_of(shared: &Arc<Mutex<Db>>, id: i64) -> AgentDispatchStatus {
