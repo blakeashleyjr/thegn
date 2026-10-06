@@ -21,7 +21,7 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
@@ -189,6 +189,9 @@ pub struct BridgeClient {
     /// The spawned agent process, owned so it's killed when the client drops
     /// (subprocess transports). `None` for a caller-provided stream (tests).
     child: Mutex<Option<Child>>,
+    /// Whether the child was reaped inline by the first `close` (`None` until
+    /// a child has been handled), so a repeat `close` reports the truth.
+    child_reaped: Mutex<Option<bool>>,
 }
 
 /// Resolve a bridge RPC deadline from `var` (seconds), falling back to
@@ -278,21 +281,31 @@ impl BridgeClient {
             procs,
             next_chan: AtomicU64::new(1),
             child: Mutex::new(child),
+            child_reaped: Mutex::new(None),
         })
     }
 
     /// Idempotent, bounded explicit close. Fails every pending call, closes
-    /// every subscription, closes the transport's write half (EOF for the
-    /// agent), kills the owned child and waits for it and the reader thread up
+    /// every subscription, drops the client's write half (which sends EOF
+    /// only if that half is the last handle on the transport — not for a
+    /// duplicated socket), kills the owned child and waits for it and the reader thread up
     /// to `deadline` in total. Never blocks past `deadline` (plus one poll
     /// tick); a repeat call after completion returns immediately.
     pub fn close(&self, deadline: Duration) -> CloseReport {
         let end = Instant::now() + deadline;
         fail_all(&self.pending, &self.subs, &self.procs, &self.closed);
         self.shut_writer();
-        let child_reaped = match self.child.lock().ok().and_then(|mut g| g.take()) {
-            Some(c) => reap_child(c, end.saturating_duration_since(Instant::now())),
-            None => true,
+        let taken = self.child.lock().ok().and_then(|mut g| g.take());
+        let child_reaped = {
+            let mut outcome = self
+                .child_reaped
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if let Some(c) = taken {
+                *outcome = Some(reap_child(c, end.saturating_duration_since(Instant::now())));
+            }
+            // No child ever owned => nothing to reap; otherwise the first outcome.
+            outcome.unwrap_or(true)
         };
         let handle = self.reader.lock().ok().and_then(|mut g| g.take());
         let reader_finished = match handle {
@@ -620,17 +633,17 @@ fn reap_child(mut child: Child, deadline: Duration) -> bool {
 /// (inside the `pending` lock, serializing with `call_within`).
 fn fail_all(pending: &Pending, subs: &Subs, procs: &Procs, closed: &AtomicBool) {
     {
-        let mut p = pending.lock().unwrap();
+        let mut p = pending.lock().unwrap_or_else(PoisonError::into_inner);
         closed.store(true, Ordering::SeqCst);
         for (_, tx) in p.drain() {
             let _ = tx.send(Err("bridge connection closed".into())); // best-effort: nobody may be listening
         }
     }
-    for (_, tx) in procs.lock().unwrap().drain() {
+    for (_, tx) in procs.lock().unwrap_or_else(PoisonError::into_inner).drain() {
         let _ = tx.send(ProcEvent::Exit { code: -1 }); // best-effort: shutdown, receivers may be gone
     }
     // Dropping the Senders disconnects each fs.watch receiver's `recv()`.
-    subs.lock().unwrap().clear();
+    subs.lock().unwrap_or_else(PoisonError::into_inner).clear();
 }
 
 // ---------------------------------------------------------------------------
