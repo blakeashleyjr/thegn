@@ -196,7 +196,9 @@ fn observe_exit(obs: &Arc<Observer>, session: String, code: Option<i32>) {
     let obs = obs.clone();
     tokio::spawn(async move {
         // best-effort: the semaphore is never closed.
-        let permit = obs.permits.acquire().await.ok();
+        // `Result::ok(..)` form: the permit is used, not ignored (the ratchet
+        // matches a trailing `.ok();` textually).
+        let permit = Result::ok(obs.permits.acquire().await);
         if let Err(e) = handle_exit(&obs.svc, &session, code, &obs.attempts).await {
             // best-effort: a failed retry cycle must not kill the observer —
             // the note column records what it could.
