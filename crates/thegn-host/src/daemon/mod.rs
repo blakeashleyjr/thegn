@@ -332,6 +332,7 @@ async fn run(
                 tombstone::TOMBSTONE_TTL_MS,
             ),
         )),
+        native_ids: std::sync::Mutex::new(std::collections::HashMap::new()),
         events: events.clone(),
         db: db.clone(),
         grace_ms: thegn_core::time_policy::duration_millis(cfg.daemon.lease_grace_secs),

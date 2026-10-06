@@ -373,7 +373,7 @@ impl NotificationStore for Db {
     fn stamp_dispatch_run(&self, id: i64, session_id: &str, artifact_path: &str) -> Result<()> {
         self.conn().execute(
             "UPDATE agent_dispatches SET session_id=?1, artifact_path=?2, \
-             run_gen=run_gen+1, exit_code=NULL, exited_at_ms=NULL WHERE id=?3",
+             run_gen=run_gen+1, exit_code=NULL, exited_at_ms=NULL, native_session_id=NULL WHERE id=?3",
             params![session_id, artifact_path, id],
         )?;
         Ok(())
