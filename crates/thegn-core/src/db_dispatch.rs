@@ -687,6 +687,25 @@ impl Db {
             .optional()?)
     }
 
+    /// Run identity of every `running` row in one read, for a batch caller
+    /// (the daemon reaper) that would otherwise issue one query per row.
+    pub fn running_dispatch_run_refs(&self) -> Result<Vec<crate::issue::DispatchRunRef>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, issue_id, COALESCE(session_id,''), run_gen \
+             FROM agent_dispatches WHERE status=?1",
+        )?;
+        let rows = stmt.query_map([AgentDispatchStatus::Running.as_str()], |r| {
+            Ok(crate::issue::DispatchRunRef {
+                id: r.get(0)?,
+                issue_id: r.get(1)?,
+                session_id: r.get(2)?,
+                run_gen: r.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     /// Stamp a run's worker exit (v63, fenced by v71): the exit code, if it was
     /// reaped, and when.
     ///
