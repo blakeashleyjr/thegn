@@ -21,6 +21,11 @@
 # `#[cfg(all(test, unix))] mod …;` that gates the fake-`gh`/`sh` test modules
 # (they need `sh`, executable bits and process groups). No production logic
 # is cfg'd; the runner itself calls plugin/proc.rs for the per-OS parts.
+# bridge/mod.rs: only `#[cfg(unix)]` on tests inside its `#[cfg(test)]` module
+# (THE-311/313 process-group kill, reap and close tests need `sh`, `sleep` and
+# /proc). No production bridge logic is cfg'd; per-OS kill/reap lives in
+# plugin/proc.rs.
+bridge/mod.rs
 calendar/tests.rs
 git/background_commit.rs
 git/commit.rs
