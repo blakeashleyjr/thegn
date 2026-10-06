@@ -69,7 +69,11 @@ impl ScanPool {
         for (i, (urgent, job)) in jobs.into_iter().enumerate() {
             let tx = tx.clone();
             let task: Task = Box::new(move || {
-                let out = catch_unwind(AssertUnwindSafe(job)).ok();
+                // A panicking job yields `None`; the caller degrades that row.
+                let out = match catch_unwind(AssertUnwindSafe(job)) {
+                    Ok(value) => Some(value),
+                    Err(_) => None,
+                };
                 if tx.send((i, out)).is_err() {
                     // caller gone: nothing is waiting for this outcome.
                 }
