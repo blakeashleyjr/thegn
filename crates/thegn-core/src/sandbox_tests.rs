@@ -1835,7 +1835,10 @@ fn sealed_container_reuse_requires_exact_mounts_and_a_matching_seal_label() {
     // (a) a superset (a hardened container that also binds ~/.gnupg) is refused
     // for a sealed spec, though it is fine for a non-sealed one.
     let superset = "RUNNING\n1\n/wt\n/nix/store\n/home/u/.gnupg\n";
-    assert_eq!(judge_inspect(superset, &required, true, false), (true, false));
+    assert_eq!(
+        judge_inspect(superset, &required, true, false),
+        (true, false)
+    );
     assert_eq!(
         judge_inspect(
             "RUNNING\n\n/wt\n/nix/store\n/home/u/.gnupg\n",
@@ -1848,10 +1851,7 @@ fn sealed_container_reuse_requires_exact_mounts_and_a_matching_seal_label() {
     // devenv's own `/nix` bind is not an extra, but only while the current spec
     // would still emit it: with devenv off the leftover bind forces a recreate.
     let with_nix = "RUNNING\n1\n/wt\n/nix/store\n/nix\n";
-    assert_eq!(
-        judge_inspect(with_nix, &required, true, true),
-        (true, true)
-    );
+    assert_eq!(judge_inspect(with_nix, &required, true, true), (true, true));
     assert_eq!(
         judge_inspect(with_nix, &required, true, false),
         (true, false)
@@ -1880,7 +1880,12 @@ fn sealed_container_reuse_requires_exact_mounts_and_a_matching_seal_label() {
     );
     // Non-sealed reuse never cared about extras, nix included.
     assert_eq!(
-        judge_inspect("RUNNING\n\n/wt\n/nix/store\n/nix\n", &required, false, false),
+        judge_inspect(
+            "RUNNING\n\n/wt\n/nix/store\n/nix\n",
+            &required,
+            false,
+            false
+        ),
         (true, true)
     );
 }
@@ -1890,14 +1895,29 @@ fn sealed_apple_reuse_refuses_a_missing_mounts_array() {
     let missing = r#"[{"status":{"state":"running"},"configuration":{}}]"#;
     let empty = r#"[{"status":{"state":"running"},"configuration":{"mounts":[]}}]"#;
     // Sealed, nothing required: present-and-empty is verified, missing is not.
-    assert_eq!(parse_apple_inspect_sealed(empty, &[], true, false), (true, true));
-    assert_eq!(parse_apple_inspect_sealed(missing, &[], true, false), (true, false));
+    assert_eq!(
+        parse_apple_inspect_sealed(empty, &[], true, false),
+        (true, true)
+    );
+    assert_eq!(
+        parse_apple_inspect_sealed(missing, &[], true, false),
+        (true, false)
+    );
     // Non-sealed behaviour is unchanged.
-    assert_eq!(parse_apple_inspect_sealed(missing, &[], false, false), (true, true));
+    assert_eq!(
+        parse_apple_inspect_sealed(missing, &[], false, false),
+        (true, true)
+    );
     // An extra bind on a sealed spec is still refused; `/nix` only if expected.
     let nix = r#"[{"status":{"state":"running"},"configuration":{"mounts":[{"source":"/nix"}]}}]"#;
-    assert_eq!(parse_apple_inspect_sealed(nix, &[], true, false), (true, false));
-    assert_eq!(parse_apple_inspect_sealed(nix, &[], true, true), (true, true));
+    assert_eq!(
+        parse_apple_inspect_sealed(nix, &[], true, false),
+        (true, false)
+    );
+    assert_eq!(
+        parse_apple_inspect_sealed(nix, &[], true, true),
+        (true, true)
+    );
 }
 
 #[test]

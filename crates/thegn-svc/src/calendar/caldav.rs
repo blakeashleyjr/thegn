@@ -741,9 +741,18 @@ mod tests {
     fn collection_matching_is_segment_aligned_and_fails_closed() {
         let ids = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         assert!(href_in_collections("/dav/cals/work/e.ics", &ids(&["work"])));
-        assert!(href_in_collections("/dav/cals/work/e.ics", &ids(&["cals/work"])));
-        assert!(href_in_collections("/dav/cals/work/e.ics", &ids(&["dav/cals/work"])));
-        assert!(!href_in_collections("/dav/cals/homework/e.ics", &ids(&["work"])));
+        assert!(href_in_collections(
+            "/dav/cals/work/e.ics",
+            &ids(&["cals/work"])
+        ));
+        assert!(href_in_collections(
+            "/dav/cals/work/e.ics",
+            &ids(&["dav/cals/work"])
+        ));
+        assert!(!href_in_collections(
+            "/dav/cals/homework/e.ics",
+            &ids(&["work"])
+        ));
         assert!(!href_in_collections("e.ics", &ids(&["work"])));
         assert!(!href_in_collections("/e.ics", &ids(&["work"])));
     }

@@ -229,7 +229,11 @@ mod tests {
             assert!(CliGit.delete_tag(&loc, n).is_err(), "{n}");
             assert!(CliGit.push_tag(&loc, "origin", n).is_err(), "{n}");
             assert!(CliGit.push_tag(&loc, n, "v1").is_err(), "{n}");
-            assert!(CliGit.reset_to(&loc, n, super::super::ResetMode::Soft).is_err());
+            assert!(
+                CliGit
+                    .reset_to(&loc, n, super::super::ResetMode::Soft)
+                    .is_err()
+            );
         }
         // `tag -a -m m -f <sha>` used to force-create a tag named after the sha.
         let tags = out_in(&repo.dir, &["tag", "--list"]);

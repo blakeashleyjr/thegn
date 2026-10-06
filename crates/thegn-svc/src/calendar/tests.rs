@@ -371,11 +371,7 @@ fn read_only_policy_does_not_block_event_fetches() {
         read_only: true,
         ..account("readable", CalendarProviderKind::Command)
     };
-    let (provider, calls) = MutationSpy::new(
-        CalendarCaps::default(),
-        false,
-        "read-spy",
-    );
+    let (provider, calls) = MutationSpy::new(CalendarCaps::default(), false, "read-spy");
     let backend = AccountPolicyBackend::new(&account, Box::new(provider));
     let (from, to) = window();
     assert!(block_on(backend.list_events(from, to, "")).is_ok());

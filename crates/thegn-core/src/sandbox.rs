@@ -1830,7 +1830,10 @@ fn judge_inspect(
     let label = lines.next().unwrap_or("").trim();
     let label_ok = if sealed { label == "1" } else { label != "1" };
     let active: std::collections::HashSet<&str> = lines.filter(|l| !l.is_empty()).collect();
-    (true, label_ok && mounts_match(required, &active, sealed, nix_expected))
+    (
+        true,
+        label_ok && mounts_match(required, &active, sealed, nix_expected),
+    )
 }
 
 /// `(running, mounts_ok)` parsed from Apple `container inspect`'s JSON.
