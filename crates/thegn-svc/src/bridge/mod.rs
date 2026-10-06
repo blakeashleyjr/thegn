@@ -998,7 +998,7 @@ fn do_spawn(p: SpawnParams, writer: SharedWriter, procs: ProcRegistry) -> Result
                 clippy::disallowed_methods,
                 reason = "leader already exited (waitid) or no WNOWAIT support; this reaps it"
             )]
-            let mut reap = |c: &mut Option<Child>| {
+            let reap = |c: &mut Option<Child>| {
                 c.as_mut()
                     .and_then(|c| c.wait().ok())
                     .and_then(|s| s.code())
