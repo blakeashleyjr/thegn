@@ -218,6 +218,27 @@ pub(crate) fn test_assert_owner_only_permissions(
     }
 }
 
+/// Whether `path` is an executable identity safe to run on a keypress: a regular
+/// file (symlinks resolved) that is executable and not group/world-writable.
+pub(crate) fn exe_admitted(path: &std::path::Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = meta.permissions().mode();
+        mode & 0o111 != 0 && mode & 0o022 == 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
 /// Persist a small recoverable cache value without following an attacker-created
 /// state-file symlink. Unix publishes a same-directory temp file atomically;
 /// other platforms reject non-regular existing targets before using their
