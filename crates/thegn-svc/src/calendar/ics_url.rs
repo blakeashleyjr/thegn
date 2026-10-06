@@ -81,11 +81,9 @@ impl CalendarBackend for IcsUrlBackend {
     }
 
     fn caps(&self) -> CalendarCaps {
-        CalendarCaps {
-            // The ETag round trip is the delta protocol.
-            incremental: true,
-            ..Default::default()
-        }
+        // No write support. The ETag round trip is the delta protocol and is
+        // carried by the returned page, not by a capability bit.
+        CalendarCaps::default()
     }
 
     fn list_events<'a>(

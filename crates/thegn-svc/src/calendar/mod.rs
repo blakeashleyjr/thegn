@@ -113,15 +113,16 @@ impl CalendarError {
 }
 
 /// What a backend can do beyond listing.
+///
+/// Only the mutation bits exist: they are masked by account `read_only` policy
+/// and published through [`CalendarRouter::caps`]. `server_expand` and
+/// `incremental` were removed because nothing consulted them (THE-466) — add a
+/// field back only together with the production code that branches on it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CalendarCaps {
     pub create: bool,
     pub update: bool,
     pub delete: bool,
-    /// The provider expands recurrence itself, so the host must not.
-    pub server_expand: bool,
-    /// The provider supports conditional/delta fetches via `sync_token`.
-    pub incremental: bool,
 }
 
 /// Which instances of a recurring event an edit applies to.
@@ -323,8 +324,7 @@ pub trait CalendarBackend: Send + Sync {
     /// passes the canonical resolved range through `list_events_window`.
     ///
     /// A provider that cannot expand recurrence returns the masters with their
-    /// `recurrence` intact and the host expands; one that can sets
-    /// `caps().server_expand`.
+    /// `recurrence` intact and the host expands.
     fn list_events<'a>(
         &'a self,
         from: NaiveDate,

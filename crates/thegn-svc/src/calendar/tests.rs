@@ -186,8 +186,6 @@ fn all_write_caps() -> CalendarCaps {
         create: true,
         update: true,
         delete: true,
-        server_expand: true,
-        incremental: true,
     }
 }
 
@@ -298,8 +296,6 @@ fn read_only_policy_clamps_contradictory_provider_caps_and_denies_all_mutations(
             create: false,
             update: false,
             delete: false,
-            server_expand: true,
-            incremental: true,
         }
     );
     let event = mutation_event();
@@ -376,10 +372,7 @@ fn read_only_policy_does_not_block_event_fetches() {
         ..account("readable", CalendarProviderKind::Command)
     };
     let (provider, calls) = MutationSpy::new(
-        CalendarCaps {
-            incremental: true,
-            ..CalendarCaps::default()
-        },
+        CalendarCaps::default(),
         false,
         "read-spy",
     );
@@ -1870,7 +1863,7 @@ fn caldav_reports_real_delta_support() {
     assert_eq!(b.provider_id(), "caldav");
     // `sync-collection` gives tombstones, not just a conditional refetch — the
     // only provider here that populates `EventPage::deleted`.
-    assert!(b.caps().incremental);
+    assert_eq!(b.caps(), CalendarCaps::default());
 
     // A missing url is a config problem, not a network one.
     let bare = caldav::CalDavBackend::new(&account("dav", CalendarProviderKind::CalDav), adm());
@@ -2165,7 +2158,7 @@ fn an_ics_url_account_with_no_url_is_not_configured() {
     .unwrap_err();
     assert!(matches!(err, CalendarError::NotConfigured));
     // ETag conditional fetching is the incremental story for subscribed URLs.
-    assert!(b.caps().incremental);
+    assert_eq!(b.caps(), CalendarCaps::default());
 }
 
 #[test]
