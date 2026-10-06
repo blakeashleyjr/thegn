@@ -15,6 +15,7 @@ use futures_util::{SinkExt, StreamExt};
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use std::path::PathBuf;
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc as tokio_mpsc;
 
@@ -87,6 +88,7 @@ pub struct ControlClient {
     /// request is made; it must never degrade to reqwest's policy-free
     /// default client.
     http_client: Option<std::result::Result<reqwest::Client, ControlTransportError>>,
+    limits: ControlLimits,
 }
 
 /// A policy-configured control transport could not be initialized.
@@ -239,6 +241,128 @@ fn parse_response_body(status: u16, content_type: Option<&str>, bytes: &[u8]) ->
     serde_json::from_slice(bytes).map_err(|_| ControlProtocolError::InvalidJson.into())
 }
 
+/// Default time allowed to establish a control connection (socket connect,
+/// and for streams the WebSocket upgrade).
+pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Default total deadline for an ordinary finite control request.
+pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+/// Total deadline for requests that legitimately run longer (session launch,
+/// worktree creation, tool runs, CI logs, previews).
+pub const DEFAULT_LONG_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+/// Extra time added to a caller-supplied `wait` timeout so the daemon's own
+/// timed-out answer arrives before the client gives up.
+pub const WAIT_GRACE: Duration = Duration::from_secs(30);
+/// Cap for routes with legitimately large payloads (CI job logs, previews).
+pub const DEFAULT_MAX_LARGE_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+/// Largest JSON response body the client will buffer.
+pub const DEFAULT_MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+
+/// The bounds applied to every control request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ControlLimits {
+    pub connect_timeout: Duration,
+    pub request_timeout: Duration,
+    pub long_request_timeout: Duration,
+    pub max_response_bytes: usize,
+    /// Cap for routes whose payload is legitimately large (CI logs, previews).
+    pub max_large_response_bytes: usize,
+}
+
+impl Default for ControlLimits {
+    fn default() -> Self {
+        Self {
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            long_request_timeout: DEFAULT_LONG_REQUEST_TIMEOUT,
+            max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
+            max_large_response_bytes: DEFAULT_MAX_LARGE_RESPONSE_BYTES,
+        }
+    }
+}
+
+/// Which deadline a request runs under.
+#[derive(Debug, Clone, Copy)]
+enum Deadline {
+    Default,
+    Long,
+    After(Duration),
+    /// Explicitly unbounded long-poll (a `wait` with no caller timeout).
+    /// Connect and body-size bounds still apply.
+    Unbounded,
+}
+
+/// A transport-level bound was hit. Fixed messages: nothing from the peer is
+/// ever included.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlBoundError {
+    ConnectTimeout,
+    RequestTimeout,
+    ResponseTooLarge,
+}
+
+impl std::fmt::Display for ControlBoundError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::ConnectTimeout => "control connection timed out",
+            Self::RequestTimeout => "control request timed out",
+            Self::ResponseTooLarge => "control response exceeded the size limit",
+        })
+    }
+}
+
+impl std::error::Error for ControlBoundError {}
+
+fn wait_deadline(timeout_ms: Option<i64>) -> Deadline {
+    match timeout_ms {
+        Some(ms) if ms >= 0 => Deadline::After(Duration::from_millis(ms as u64) + WAIT_GRACE),
+        _ => Deadline::Unbounded,
+    }
+}
+
+/// Aborts the spawned connection driver when dropped, so a timeout or size
+/// failure never leaves detached connection work behind.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Run `fut` under `limit`, mapping expiry to `err`.
+async fn bounded<T>(
+    limit: Duration,
+    err: ControlBoundError,
+    fut: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    match tokio::time::timeout(limit, fut).await {
+        Ok(out) => out,
+        Err(_) => Err(anyhow::Error::new(err)),
+    }
+}
+
+/// Collect a hyper body, rejecting a declared or streamed size over `max`.
+async fn collect_capped<B>(mut body: B, max: usize) -> Result<Vec<u8>>
+where
+    B: hyper::body::Body<Data = hyper::body::Bytes> + Unpin,
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
+    if body.size_hint().lower() > max as u64 {
+        return Err(ControlBoundError::ResponseTooLarge.into());
+    }
+    let mut out = Vec::new();
+    while let Some(frame) = body.frame().await {
+        let frame = frame.context("control response body")?;
+        if let Ok(data) = frame.into_data() {
+            if out.len().saturating_add(data.len()) > max {
+                return Err(ControlBoundError::ResponseTooLarge.into());
+            }
+            out.extend_from_slice(&data);
+        }
+    }
+    Ok(out)
+}
+
 /// Control messages for an attached session stream.
 pub enum AttachControl {
     Input(Vec<u8>),
@@ -327,7 +451,17 @@ fn parse_session_roster(v: Value) -> Result<Vec<SessionInfo>> {
 impl ControlClient {
     pub fn new(addr: ControlAddr) -> Self {
         let http_client = matches!(&addr, ControlAddr::HttpOrigin { .. }).then(build_http_client);
-        Self { addr, http_client }
+        Self {
+            addr,
+            http_client,
+            limits: ControlLimits::default(),
+        }
+    }
+
+    /// Override the request bounds (tests, or callers with a tighter budget).
+    pub fn with_limits(mut self, limits: ControlLimits) -> Self {
+        self.limits = limits;
+        self
     }
 
     pub fn addr(&self) -> &ControlAddr {
@@ -344,30 +478,49 @@ impl ControlClient {
     /// One HTTP request → parsed JSON body. Non-2xx returns the error message
     /// from the server's `{"error": …}` envelope.
     async fn request(&self, method: &str, path: &str, body: Option<Value>) -> Result<Value> {
-        let (status, value) = match &self.addr {
-            ControlAddr::Unix(sock) => {
-                let ep = crate::ipc::IpcEndpoint::for_socket_path(sock);
-                let stream = crate::ipc::connect(&ep)
-                    .await
-                    .with_context(|| format!("connect control endpoint {}", ep.display()))?;
-                send_request(stream, method, path, self.token(), body).await?
-            }
-            ControlAddr::Tcp { addr, .. } => {
-                let stream = tokio::net::TcpStream::connect(addr)
-                    .await
-                    .with_context(|| format!("connect control addr {addr}"))?;
-                send_request(stream, method, path, self.token(), body).await?
-            }
-            ControlAddr::HttpOrigin { origin, token } => {
-                let client = self
-                    .http_client
-                    .as_ref()
-                    .ok_or_else(|| anyhow!("HTTP-origin client has no configured transport"))?;
-                let client = client
-                    .as_ref()
-                    .map_err(|error| anyhow::Error::new(*error))?;
-                send_origin_request(client, origin, token, method, path, body).await?
-            }
+        self.request_with(method, path, body, Deadline::Default)
+            .await
+    }
+
+    async fn request_long(&self, method: &str, path: &str, body: Option<Value>) -> Result<Value> {
+        self.request_with(method, path, body, Deadline::Long).await
+    }
+
+    /// Long deadline and the large-body cap, for CI logs and previews.
+    async fn request_large(&self, method: &str, path: &str, body: Option<Value>) -> Result<Value> {
+        self.request_sized(method, path, body, Deadline::Long, true)
+            .await
+    }
+
+    async fn request_with(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+        deadline: Deadline,
+    ) -> Result<Value> {
+        self.request_sized(method, path, body, deadline, false)
+            .await
+    }
+
+    async fn request_sized(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+        deadline: Deadline,
+        large: bool,
+    ) -> Result<Value> {
+        let total = match deadline {
+            Deadline::Default => Some(self.limits.request_timeout),
+            Deadline::Long => Some(self.limits.long_request_timeout),
+            Deadline::After(d) => Some(d),
+            Deadline::Unbounded => None,
+        };
+        let exchange = self.exchange(method, path, body, self.body_cap(large));
+        let (status, value) = match total {
+            Some(total) => bounded(total, ControlBoundError::RequestTimeout, exchange).await?,
+            None => exchange.await?,
         };
         if (200..300).contains(&status) {
             Ok(value)
@@ -385,11 +538,67 @@ impl ControlClient {
         }
     }
 
+    fn body_cap(&self, large: bool) -> usize {
+        if large {
+            self.limits.max_large_response_bytes
+        } else {
+            self.limits.max_response_bytes
+        }
+    }
+
+    /// Connect, send one request and read the capped response.
+    async fn exchange(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+        max: usize,
+    ) -> Result<(u16, Value)> {
+        let connect = self.limits.connect_timeout;
+        match &self.addr {
+            ControlAddr::Unix(sock) => {
+                let ep = crate::ipc::IpcEndpoint::for_socket_path(sock);
+                let stream = bounded(connect, ControlBoundError::ConnectTimeout, async {
+                    crate::ipc::connect(&ep)
+                        .await
+                        .with_context(|| format!("connect control endpoint {}", ep.display()))
+                })
+                .await?;
+                send_request(stream, method, path, self.token(), body, connect, max).await
+            }
+            ControlAddr::Tcp { addr, .. } => {
+                let stream = bounded(connect, ControlBoundError::ConnectTimeout, async {
+                    tokio::net::TcpStream::connect(addr)
+                        .await
+                        .with_context(|| format!("connect control addr {addr}"))
+                })
+                .await?;
+                send_request(stream, method, path, self.token(), body, connect, max).await
+            }
+            ControlAddr::HttpOrigin { origin, token } => {
+                let client = self
+                    .http_client
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("HTTP-origin client has no configured transport"))?;
+                let client = client
+                    .as_ref()
+                    .map_err(|error| anyhow::Error::new(*error))?;
+                send_origin_request(client, origin, token, method, path, body, max).await
+            }
+        }
+    }
+
     /// Generic request for the catalog-driven client (`thegn api call`):
     /// verb → route resolution happens in `routes::api_call_for`; this just
     /// performs it. Method is `GET`/`POST`/`DELETE`.
     pub async fn call_raw(&self, method: &str, path: &str, body: Option<Value>) -> Result<Value> {
-        self.request(method, path, body).await
+        // A `/wait` route is a long-poll; derive its budget from the body.
+        let deadline = if path.ends_with("/wait") {
+            wait_deadline(body.as_ref().and_then(|b| b.get("timeout_ms")?.as_i64()))
+        } else {
+            Deadline::Long
+        };
+        self.request_with(method, path, body, deadline).await
     }
 
     pub async fn health(&self) -> Result<()> {
@@ -407,7 +616,7 @@ impl ControlClient {
 
     /// `GET /v1/worktrees` — the worktrees registered with the instance.
     pub async fn worktrees(&self) -> Result<Vec<super::WorktreeInfo>> {
-        let v = self.request("GET", "/v1/worktrees", None).await?;
+        let v = self.request_long("GET", "/v1/worktrees", None).await?;
         Ok(serde_json::from_value(
             required_array(&v, "worktrees")?.clone(),
         )?)
@@ -415,14 +624,14 @@ impl ControlClient {
 
     pub async fn open(&self, spec: &OpenSpec) -> Result<SessionInfo> {
         let v = self
-            .request("POST", "/v1/sessions", Some(serde_json::to_value(spec)?))
+            .request_long("POST", "/v1/sessions", Some(serde_json::to_value(spec)?))
             .await?;
         Ok(serde_json::from_value(v)?)
     }
 
     pub async fn fork(&self, spec: &ForkSpec) -> Result<SessionInfo> {
         let v = self
-            .request(
+            .request_long(
                 "POST",
                 "/v1/sessions/fork",
                 Some(serde_json::to_value(spec)?),
@@ -434,7 +643,7 @@ impl ControlClient {
     /// One-shot snapshot: `(seq, rows, cols, ansi_bytes)`.
     pub async fn snapshot(&self, session: &str) -> Result<(u64, u16, u16, Vec<u8>)> {
         let v = self
-            .request("GET", &format!("/v1/sessions/{session}/snapshot"), None)
+            .request_long("GET", &format!("/v1/sessions/{session}/snapshot"), None)
             .await?;
         let returned_session = required_field(&v, "session")?
             .as_str()
@@ -498,10 +707,14 @@ impl ControlClient {
         condition: Value,
         timeout_ms: Option<i64>,
     ) -> Result<Value> {
-        self.request(
+        // The daemon treats an absent/negative timeout as "wait forever", so
+        // that case is the one explicitly unbounded request; otherwise the
+        // client allows the caller's timeout plus a grace period.
+        self.request_with(
             "POST",
             &format!("/v1/sessions/{session}/wait"),
             Some(json!({ "condition": condition, "timeout_ms": timeout_ms })),
+            wait_deadline(timeout_ms),
         )
         .await
     }
@@ -510,7 +723,7 @@ impl ControlClient {
     /// direction `dir` (`right`/`down`). Returns the new [`SessionInfo`].
     pub async fn split(&self, session: &str, dir: &str, argv: &[String]) -> Result<SessionInfo> {
         let v = self
-            .request(
+            .request_long(
                 "POST",
                 &format!("/v1/sessions/{session}/split"),
                 Some(json!({ "dir": dir, "argv": argv })),
@@ -544,7 +757,7 @@ impl ControlClient {
     }
 
     pub async fn kill(&self, session: &str) -> Result<()> {
-        self.request("DELETE", &format!("/v1/sessions/{session}"), None)
+        self.request_long("DELETE", &format!("/v1/sessions/{session}"), None)
             .await
             .map(|_| ())
     }
@@ -558,7 +771,7 @@ impl ControlClient {
     /// path the host resolves (the sprite's `$THEGN_WORKTREE`), not the sprite's
     /// local mount. Returns the server's `{ "queued": … }` envelope.
     pub async fn merge_add(&self, worktree: &str) -> Result<Value> {
-        self.request(
+        self.request_long(
             "POST",
             "/v1/merge/add",
             Some(json!({ "worktree": worktree })),
@@ -569,7 +782,7 @@ impl ControlClient {
     /// `GET /v1/pr/status` — cached PR status, one row per worktree with a
     /// `pr_cache` entry.
     pub async fn pr_status(&self) -> Result<Vec<super::PrStatusRow>> {
-        let v = self.request("GET", "/v1/pr/status", None).await?;
+        let v = self.request_long("GET", "/v1/pr/status", None).await?;
         Ok(serde_json::from_value(required_array(&v, "prs")?.clone())?)
     }
 
@@ -579,7 +792,7 @@ impl ControlClient {
         if let Some(limit) = limit {
             path.push_str(&format!("&limit={limit}"));
         }
-        let value = self.request("GET", &path, None).await?;
+        let value = self.request_long("GET", &path, None).await?;
         Ok(serde_json::from_value(value)?)
     }
 
@@ -600,7 +813,7 @@ impl ControlClient {
         if let Some(tail_lines) = tail_lines {
             path.push_str(&format!("&tail_lines={tail_lines}"));
         }
-        let value = self.request("GET", &path, None).await?;
+        let value = self.request_large("GET", &path, None).await?;
         Ok(serde_json::from_value(value)?)
     }
 
@@ -627,7 +840,7 @@ impl ControlClient {
         request: &super::AutomationTestRequest,
     ) -> Result<super::AutomationTestReply> {
         let value = self
-            .request(
+            .request_long(
                 "POST",
                 "/v1/automations/test",
                 Some(serde_json::to_value(request)?),
@@ -638,7 +851,7 @@ impl ControlClient {
 
     pub async fn tools_run(&self, request: &super::ToolRunRequest) -> Result<SessionInfo> {
         let value = self
-            .request(
+            .request_long(
                 "POST",
                 "/v1/tools/run",
                 Some(serde_json::to_value(request)?),
@@ -655,12 +868,14 @@ impl ControlClient {
 
     /// `POST /v1/mcp_proxy/reload` — re-read config and reconcile the hub.
     pub async fn mcp_proxy_reload(&self) -> Result<super::McpProxyReloadReport> {
-        let v = self.request("POST", "/v1/mcp_proxy/reload", None).await?;
+        let v = self
+            .request_long("POST", "/v1/mcp_proxy/reload", None)
+            .await?;
         Ok(serde_json::from_value(v)?)
     }
 
     pub async fn open_worktree(&self, repo: &str, branch: Option<&str>) -> Result<()> {
-        self.request(
+        self.request_long(
             "POST",
             "/v1/worktrees/open",
             Some(json!({ "repo": repo, "branch": branch })),
@@ -673,7 +888,7 @@ impl ControlClient {
     pub async fn open_editor(&self, request: &EditorOpenRequest) -> Result<()> {
         request.target()?;
         let value = self
-            .request(
+            .request_long(
                 "POST",
                 "/v1/editor/open",
                 Some(serde_json::to_value(request)?),
@@ -692,7 +907,7 @@ impl ControlClient {
         req: &super::PreviewFetchRequest,
     ) -> Result<super::PreviewFetchReply> {
         let v = self
-            .request(
+            .request_large(
                 "POST",
                 "/v1/preview/fetch",
                 Some(serde_json::to_value(req)?),
@@ -709,7 +924,7 @@ impl ControlClient {
         req: &super::WorktreeCreateReq,
     ) -> Result<super::WorktreeInfo> {
         let v = self
-            .request("POST", "/v1/worktrees", Some(serde_json::to_value(req)?))
+            .request_long("POST", "/v1/worktrees", Some(serde_json::to_value(req)?))
             .await?;
         Ok(serde_json::from_value(v)?)
     }
@@ -752,7 +967,7 @@ impl ControlClient {
             path.push('?');
             path.push_str(&params.join("&"));
         }
-        let v = self.request("GET", &path, None).await?;
+        let v = self.request_long("GET", &path, None).await?;
         Ok(serde_json::from_value(
             required_array(&v, "issues")?.clone(),
         )?)
@@ -765,7 +980,7 @@ impl ControlClient {
         repo: Option<&str>,
     ) -> Result<thegn_core::issue::IssueDetail> {
         let path = with_repo_query(encoded_issue_path(id, "")?, repo);
-        let v = self.request("GET", &path, None).await?;
+        let v = self.request_long("GET", &path, None).await?;
         Ok(serde_json::from_value(v)?)
     }
 
@@ -778,7 +993,7 @@ impl ControlClient {
     ) -> Result<thegn_core::issue::Issue> {
         let path = with_repo_query(encoded_issue_path(id, "")?, repo);
         let v = self
-            .request("POST", &path, Some(serde_json::to_value(patch)?))
+            .request_long("POST", &path, Some(serde_json::to_value(patch)?))
             .await?;
         Ok(serde_json::from_value(v)?)
     }
@@ -786,7 +1001,7 @@ impl ControlClient {
     /// `POST /v1/issues/{id}/comment` — add a comment.
     pub async fn issue_comment(&self, id: &str, body: &str, repo: Option<&str>) -> Result<()> {
         let path = with_repo_query(encoded_issue_path(id, "/comment")?, repo);
-        self.request("POST", &path, Some(json!({ "body": body })))
+        self.request_long("POST", &path, Some(json!({ "body": body })))
             .await
             .map(|_| ())
     }
@@ -882,44 +1097,57 @@ impl ControlClient {
             req = req.header("Authorization", format!("Bearer {t}"));
         }
         let req = req.body(()).context("build events request")?;
+        let connect = self.limits.connect_timeout;
         let (frame_tx, frame_rx) = tokio_mpsc::channel::<EventFrame>(256);
         let (ctrl_tx, ctrl_rx) = tokio_mpsc::channel::<AttachControl>(1);
         match &self.addr {
             ControlAddr::Unix(sock) => {
                 let ep = crate::ipc::IpcEndpoint::for_socket_path(sock);
-                let stream = crate::ipc::connect(&ep)
+                let ws = bounded(connect, ControlBoundError::ConnectTimeout, async {
+                    let stream = crate::ipc::connect(&ep)
+                        .await
+                        .with_context(|| format!("connect control endpoint {}", ep.display()))?;
+                    let (ws, _) = tokio_tungstenite::client_async_with_config(
+                        req,
+                        stream,
+                        Some(control_ws_config()),
+                    )
                     .await
-                    .with_context(|| format!("connect control endpoint {}", ep.display()))?;
-                let (ws, _) = tokio_tungstenite::client_async_with_config(
-                    req,
-                    stream,
-                    Some(control_ws_config()),
-                )
-                .await
-                .context("events websocket handshake")?;
+                    .context("events websocket handshake")?;
+                    Ok(ws)
+                })
+                .await?;
                 start_attach(ws, frame_tx, ctrl_rx).await?;
             }
             ControlAddr::Tcp { addr, .. } => {
-                let stream = tokio::net::TcpStream::connect(addr)
+                let ws = bounded(connect, ControlBoundError::ConnectTimeout, async {
+                    let stream = tokio::net::TcpStream::connect(addr)
+                        .await
+                        .with_context(|| format!("connect control addr {addr}"))?;
+                    let (ws, _) = tokio_tungstenite::client_async_with_config(
+                        req,
+                        stream,
+                        Some(control_ws_config()),
+                    )
                     .await
-                    .with_context(|| format!("connect control addr {addr}"))?;
-                let (ws, _) = tokio_tungstenite::client_async_with_config(
-                    req,
-                    stream,
-                    Some(control_ws_config()),
-                )
-                .await
-                .context("events websocket handshake")?;
+                    .context("events websocket handshake")?;
+                    Ok(ws)
+                })
+                .await?;
                 start_attach(ws, frame_tx, ctrl_rx).await?;
             }
             ControlAddr::HttpOrigin { .. } => {
-                let (ws, _) = tokio_tungstenite::connect_async_with_config(
-                    req,
-                    Some(control_ws_config()),
-                    false,
-                )
-                .await
-                .context("events websocket handshake")?;
+                let ws = bounded(connect, ControlBoundError::ConnectTimeout, async {
+                    let (ws, _) = tokio_tungstenite::connect_async_with_config(
+                        req,
+                        Some(control_ws_config()),
+                        false,
+                    )
+                    .await
+                    .context("events websocket handshake")?;
+                    Ok(ws)
+                })
+                .await?;
                 start_attach(ws, frame_tx, ctrl_rx).await?;
             }
         }
@@ -1001,44 +1229,57 @@ impl ControlClient {
         }
         let req = req.body(()).context("build attach request")?;
 
+        let connect = self.limits.connect_timeout;
         let (frame_tx, frame_rx) = tokio_mpsc::channel::<EventFrame>(256);
         let (ctrl_tx, ctrl_rx) = tokio_mpsc::channel::<AttachControl>(64);
         match &self.addr {
             ControlAddr::Unix(sock) => {
                 let ep = crate::ipc::IpcEndpoint::for_socket_path(sock);
-                let stream = crate::ipc::connect(&ep)
+                let ws = bounded(connect, ControlBoundError::ConnectTimeout, async {
+                    let stream = crate::ipc::connect(&ep)
+                        .await
+                        .with_context(|| format!("connect control endpoint {}", ep.display()))?;
+                    let (ws, _) = tokio_tungstenite::client_async_with_config(
+                        req,
+                        stream,
+                        Some(control_ws_config()),
+                    )
                     .await
-                    .with_context(|| format!("connect control endpoint {}", ep.display()))?;
-                let (ws, _) = tokio_tungstenite::client_async_with_config(
-                    req,
-                    stream,
-                    Some(control_ws_config()),
-                )
-                .await
-                .context("attach websocket handshake")?;
+                    .context("attach websocket handshake")?;
+                    Ok(ws)
+                })
+                .await?;
                 start_attach(ws, frame_tx, ctrl_rx).await?;
             }
             ControlAddr::Tcp { addr, .. } => {
-                let stream = tokio::net::TcpStream::connect(addr)
+                let ws = bounded(connect, ControlBoundError::ConnectTimeout, async {
+                    let stream = tokio::net::TcpStream::connect(addr)
+                        .await
+                        .with_context(|| format!("connect control addr {addr}"))?;
+                    let (ws, _) = tokio_tungstenite::client_async_with_config(
+                        req,
+                        stream,
+                        Some(control_ws_config()),
+                    )
                     .await
-                    .with_context(|| format!("connect control addr {addr}"))?;
-                let (ws, _) = tokio_tungstenite::client_async_with_config(
-                    req,
-                    stream,
-                    Some(control_ws_config()),
-                )
-                .await
-                .context("attach websocket handshake")?;
+                    .context("attach websocket handshake")?;
+                    Ok(ws)
+                })
+                .await?;
                 start_attach(ws, frame_tx, ctrl_rx).await?;
             }
             ControlAddr::HttpOrigin { .. } => {
-                let (ws, _) = tokio_tungstenite::connect_async_with_config(
-                    req,
-                    Some(control_ws_config()),
-                    false,
-                )
-                .await
-                .context("attach websocket handshake")?;
+                let ws = bounded(connect, ControlBoundError::ConnectTimeout, async {
+                    let (ws, _) = tokio_tungstenite::connect_async_with_config(
+                        req,
+                        Some(control_ws_config()),
+                        false,
+                    )
+                    .await
+                    .context("attach websocket handshake")?;
+                    Ok(ws)
+                })
+                .await?;
                 start_attach(ws, frame_tx, ctrl_rx).await?;
             }
         }
@@ -1302,9 +1543,9 @@ fn websocket_url(origin: &str, path: &str) -> Result<String> {
 /// Build the one unary HTTP transport for an HTTP-origin client.
 ///
 /// Keep every reqwest transport policy here. The current contract is exactly
-/// the historical one: redirects are disabled, and no timeout or response
-/// body cap is added here. THE-273 owns those policies; when that contract is
-/// ready, this is the single construction point where it belongs.
+/// redirects are disabled and connects are time-bounded. The total request
+/// deadline and response-size cap are enforced by the caller
+/// (`ControlClient::request_with` and `send_origin_request`).
 ///
 /// `ControlClient::new` remains infallible for existing command paths, but a
 /// builder failure is retained as a typed error and surfaced by the first
@@ -1314,6 +1555,7 @@ fn websocket_url(origin: &str, path: &str) -> Result<String> {
 fn build_http_client() -> std::result::Result<reqwest::Client, ControlTransportError> {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(DEFAULT_CONNECT_TIMEOUT)
         .build()
         .map_err(|error| {
             tracing::warn!(
@@ -1337,6 +1579,7 @@ async fn send_origin_request(
     method: &str,
     path: &str,
     body: Option<Value>,
+    max_body: usize,
 ) -> Result<(u16, Value)> {
     let method = reqwest::Method::from_bytes(method.as_bytes())
         .with_context(|| format!("invalid control HTTP method {method:?}"))?;
@@ -1345,7 +1588,19 @@ async fn send_origin_request(
     if let Some(body) = body {
         request = request.json(&body);
     }
-    let response = request.send().await.context("control HTTP request")?;
+    let response = request.send().await.map_err(|error| {
+        if error.is_connect() && error.is_timeout() {
+            anyhow::Error::new(ControlBoundError::ConnectTimeout)
+        } else {
+            anyhow::Error::new(error).context("control HTTP request")
+        }
+    })?;
+    if response
+        .content_length()
+        .is_some_and(|len| len > max_body as u64)
+    {
+        return Err(ControlBoundError::ResponseTooLarge.into());
+    }
     let status = response.status().as_u16();
     let content_type = response
         .headers()
@@ -1357,10 +1612,18 @@ async fn send_origin_request(
         // error, and dropping the response is sufficient to release it.
         return Ok((status, Value::Null));
     }
-    let bytes = response
-        .bytes()
+    let mut response = response;
+    let mut bytes: Vec<u8> = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
         .await
-        .context("control HTTP response body")?;
+        .context("control HTTP response body")?
+    {
+        if bytes.len().saturating_add(chunk.len()) > max_body {
+            return Err(ControlBoundError::ResponseTooLarge.into());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
     let value = parse_response_body(status, content_type.as_deref(), &bytes)?;
     Ok((status, value))
 }
@@ -1372,18 +1635,28 @@ async fn send_request<S>(
     path: &str,
     token: Option<&str>,
     body: Option<Value>,
+    handshake_timeout: Duration,
+    max_body: usize,
 ) -> Result<(u16, Value)>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let io = hyper_util::rt::TokioIo::new(stream);
-    let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
-        .await
-        .context("control http handshake")?;
-    // The connection task ends when the request completes (no pool).
-    tokio::spawn(async move {
+    let (mut sender, conn) = bounded(
+        handshake_timeout,
+        ControlBoundError::ConnectTimeout,
+        async {
+            hyper::client::conn::http1::handshake(io)
+                .await
+                .context("control http handshake")
+        },
+    )
+    .await?;
+    // The connection task ends when the request completes (no pool); the
+    // guard aborts it on every early exit (timeout, size cap, error).
+    let _conn_task = AbortOnDrop(tokio::spawn(async move {
         let _ = conn.await; // best-effort: conn error surfaces via the request path
-    });
+    }));
 
     let mut req = hyper::Request::builder()
         .method(method)
@@ -1413,12 +1686,7 @@ where
         .get(hyper::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok());
     let content_type = content_type.map(str::to_owned);
-    let bytes = res
-        .into_body()
-        .collect()
-        .await
-        .context("control response body")?
-        .to_bytes();
+    let bytes = collect_capped(res.into_body(), max_body).await?;
     let value = parse_response_body(status, content_type.as_deref(), &bytes)?;
     Ok((status, value))
 }
@@ -1590,6 +1858,7 @@ mod tests {
                 token: "must-not-be-sent".into(),
             },
             http_client: Some(Err(ControlTransportError)),
+            limits: ControlLimits::default(),
         };
 
         let error = client
@@ -2388,5 +2657,216 @@ mod tests {
     fn issue_path_rejects_malformed_identity_before_encoding() {
         assert!(encoded_issue_path("linear:bad key", "").is_err());
         assert!(encoded_issue_path(&format!("plugin:demo:{}", "x".repeat(500)), "").is_err());
+    }
+
+    // ---- THE-273: deadlines and response-size bounds ----
+
+    fn tiny_limits() -> ControlLimits {
+        ControlLimits {
+            connect_timeout: Duration::from_millis(200),
+            request_timeout: Duration::from_millis(300),
+            long_request_timeout: Duration::from_millis(300),
+            max_response_bytes: 1024,
+            max_large_response_bytes: 1024 * 1024,
+        }
+    }
+
+    fn bound_of(err: &anyhow::Error) -> Option<ControlBoundError> {
+        err.downcast_ref::<ControlBoundError>().copied()
+    }
+
+    /// Serve one connection: read the request head, then run `respond`.
+    async fn raw_server<F, Fut>(respond: F) -> std::net::SocketAddr
+    where
+        F: FnOnce(tokio::net::TcpStream) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 512];
+            while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = stream.read(&mut chunk).await.unwrap_or(0);
+                if n == 0 {
+                    return;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            respond(stream).await;
+        });
+        addr
+    }
+
+    fn clients(addr: std::net::SocketAddr) -> [ControlClient; 2] {
+        [
+            ControlClient::new(ControlAddr::Tcp {
+                addr: addr.to_string(),
+                token: "t".into(),
+            }),
+            ControlClient::new(ControlAddr::HttpOrigin {
+                origin: format!("http://{addr}"),
+                token: "t".into(),
+            }),
+        ]
+    }
+
+    #[tokio::test]
+    async fn stalled_peer_hits_request_deadline_on_both_http_transports() {
+        for origin in [false, true] {
+            let addr = raw_server(|stream| async move {
+                let _stream = stream;
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            })
+            .await;
+            let client = clients(addr)[usize::from(origin)]
+                .clone()
+                .with_limits(tiny_limits());
+            let err = client.health().await.unwrap_err();
+            assert_eq!(bound_of(&err), Some(ControlBoundError::RequestTimeout));
+        }
+    }
+
+    #[tokio::test]
+    async fn slow_body_hits_request_deadline() {
+        use tokio::io::AsyncWriteExt;
+        for origin in [false, true] {
+            let addr = raw_server(|mut stream| async move {
+                let head = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{";
+                stream.write_all(head.as_bytes()).await.unwrap();
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            })
+            .await;
+            let client = clients(addr)[usize::from(origin)]
+                .clone()
+                .with_limits(tiny_limits());
+            let err = client.health().await.unwrap_err();
+            assert_eq!(bound_of(&err), Some(ControlBoundError::RequestTimeout));
+        }
+    }
+
+    #[tokio::test]
+    async fn declared_oversize_body_is_rejected_early() {
+        use tokio::io::AsyncWriteExt;
+        for origin in [false, true] {
+            let addr = raw_server(|mut stream| async move {
+                // Promise far more than the cap but send almost nothing and
+                // stall: only an early Content-Length check can pass this.
+                let head = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 99999999\r\n\r\n{";
+                stream.write_all(head.as_bytes()).await.unwrap();
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            })
+            .await;
+            let mut limits = tiny_limits();
+            limits.request_timeout = Duration::from_secs(20);
+            let client = clients(addr)[usize::from(origin)]
+                .clone()
+                .with_limits(limits);
+            let err = client.health().await.unwrap_err();
+            assert_eq!(bound_of(&err), Some(ControlBoundError::ResponseTooLarge));
+        }
+    }
+
+    #[tokio::test]
+    async fn chunked_oversize_body_is_aborted_mid_stream() {
+        use tokio::io::AsyncWriteExt;
+        for origin in [false, true] {
+            let addr = raw_server(|mut stream| async move {
+                let head = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n";
+                stream.write_all(head.as_bytes()).await.unwrap();
+                let payload = "a".repeat(512);
+                for _ in 0..64 {
+                    let chunk = format!("{:x}\r\n{payload}\r\n", payload.len());
+                    if stream.write_all(chunk.as_bytes()).await.is_err() {
+                        return;
+                    }
+                }
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            })
+            .await;
+            let mut limits = tiny_limits();
+            limits.request_timeout = Duration::from_secs(20);
+            let client = clients(addr)[usize::from(origin)]
+                .clone()
+                .with_limits(limits);
+            let err = client.health().await.unwrap_err();
+            assert_eq!(bound_of(&err), Some(ControlBoundError::ResponseTooLarge));
+        }
+    }
+
+    #[tokio::test]
+    async fn stalled_websocket_upgrade_hits_connect_deadline() {
+        let addr = raw_server(|stream| async move {
+            let _stream = stream;
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        })
+        .await;
+        let client = ControlClient::new(ControlAddr::Tcp {
+            addr: addr.to_string(),
+            token: "t".into(),
+        })
+        .with_limits(tiny_limits());
+        let Err(err) = client.subscribe_events().await else {
+            panic!("stalled upgrade must fail");
+        };
+        assert_eq!(bound_of(&err), Some(ControlBoundError::ConnectTimeout));
+    }
+
+    #[test]
+    fn wait_budget_is_unbounded_only_without_a_caller_timeout() {
+        assert!(matches!(wait_deadline(None), Deadline::Unbounded));
+        assert!(matches!(wait_deadline(Some(-1)), Deadline::Unbounded));
+        match wait_deadline(Some(5_000)) {
+            Deadline::After(d) => assert_eq!(d, Duration::from_secs(5) + WAIT_GRACE),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn collect_capped_rejects_stream_over_cap_and_accepts_under() {
+        let ok = http_body_util::Full::new(hyper::body::Bytes::from(vec![b'x'; 10]));
+        assert_eq!(collect_capped(ok, 10).await.unwrap().len(), 10);
+        let big = http_body_util::Full::new(hyper::body::Bytes::from(vec![b'x'; 11]));
+        let err = collect_capped(big, 10).await.unwrap_err();
+        assert_eq!(bound_of(&err), Some(ControlBoundError::ResponseTooLarge));
+    }
+
+    #[tokio::test]
+    async fn large_routes_use_the_larger_body_cap() {
+        use tokio::io::AsyncWriteExt;
+        for large in [false, true] {
+            let addr = raw_server(|mut stream| async move {
+                let body = format!("{{\"pad\":\"{}\"}}", "a".repeat(4000));
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                stream.write_all(head.as_bytes()).await.unwrap();
+                stream.write_all(body.as_bytes()).await.unwrap();
+            })
+            .await;
+            let client = clients(addr)[0].clone().with_limits(tiny_limits());
+            let result = if large {
+                client.request_large("GET", "/x", None).await
+            } else {
+                client.request_long("GET", "/x", None).await
+            };
+            if large {
+                assert!(
+                    result.is_ok(),
+                    "large route must accept 4 KB over a 1 KB cap"
+                );
+            } else {
+                let err = result.unwrap_err();
+                assert_eq!(bound_of(&err), Some(ControlBoundError::ResponseTooLarge));
+            }
+        }
+        assert_eq!(
+            ControlLimits::default().max_large_response_bytes,
+            64 * 1024 * 1024
+        );
+        assert_eq!(ControlLimits::default().max_response_bytes, 8 * 1024 * 1024);
     }
 }

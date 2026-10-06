@@ -214,33 +214,61 @@ pub fn resolve_local(local: NaiveDateTime, zone: Tz, gap: GapPolicy) -> Option<D
         LocalResult::Ambiguous(earlier, _later) => Some(earlier.with_timezone(&Utc)),
         LocalResult::None => match gap {
             GapPolicy::Skip => None,
-            // Shift forward by the WIDTH of the gap, so 02:30 becomes 03:30.
+            // Both policies derive the offsets from the real transition around
+            // `local` (see `gap_transition`), never by reading `local`'s
+            // numeric fields as UTC.
             //
-            // Deliberately not a scan for the first valid instant: that would
-            // collapse 02:15, 02:30 and 02:45 all onto 03:00, firing three
-            // separate events simultaneously. Interpreting the wall time
-            // against the pre-transition offset preserves each one's position
-            // within the hour, and it derives the shift from tzdb rather than
-            // assuming 60 minutes (Lord Howe's is 30).
+            // ShiftForward interprets the wall time against the pre-transition
+            // offset, so 02:15, 02:30 and 02:45 keep their position within the
+            // gap (a scan for the first valid instant would collapse them onto
+            // one moment) and the shift is the zone's real width: 30 minutes
+            // at Lord Howe, a whole date at Apia.
             GapPolicy::ShiftForward => {
-                let before = zone.offset_from_utc_datetime(&local);
-                let shifted = local - (before.base_utc_offset() + before.dst_offset());
-                Some(DateTime::from_naive_utc_and_offset(shifted, Utc))
+                let (_, before) = gap_transition(local, zone)?;
+                Some(DateTime::from_naive_utc_and_offset(local - before, Utc))
             }
+            // Earliest clamps to the last whole second before the transition.
             GapPolicy::Earliest => {
-                let mut probe = local;
-                for _ in 0..(4 * 60) {
-                    probe -= chrono::Duration::minutes(1);
-                    match zone.from_local_datetime(&probe) {
-                        LocalResult::Single(dt) => return Some(dt.with_timezone(&Utc)),
-                        LocalResult::Ambiguous(_, l) => return Some(l.with_timezone(&Utc)),
-                        LocalResult::None => continue,
-                    }
-                }
-                None
+                let (at, _) = gap_transition(local, zone)?;
+                Some(DateTime::from_naive_utc_and_offset(
+                    at - chrono::Duration::seconds(1),
+                    Utc,
+                ))
             }
         },
     }
+}
+
+/// For a nonexistent `local`, the UTC instant of the transition that skips it
+/// and the total offset in force just before it.
+///
+/// Every real offset lies within -12h..+14h of UTC, so the transition that
+/// swallows `local` lies within `local - 14h .. local + 12h` read as UTC. We
+/// only use that as a *search window*: the offsets are sampled at its far ends
+/// and the transition is bisected to the second, so no result is derived from
+/// reinterpreting local fields as UTC. `None` if the window shows no change.
+fn gap_transition(local: NaiveDateTime, zone: Tz) -> Option<(NaiveDateTime, chrono::Duration)> {
+    let total = |utc: NaiveDateTime| {
+        let o = zone.offset_from_utc_datetime(&utc);
+        o.base_utc_offset() + o.dst_offset()
+    };
+    let mut lo = local.checked_sub_signed(chrono::Duration::hours(15))?;
+    let mut hi = local.checked_add_signed(chrono::Duration::hours(15))?;
+    let before = total(lo);
+    if total(hi) == before {
+        return None;
+    }
+    // Invariant: offset(lo) == before, offset(hi) != before.
+    while (hi - lo) > chrono::Duration::seconds(1) {
+        // Whole seconds only: halving an odd span would add sub-second noise.
+        let mid = lo + chrono::Duration::seconds((hi - lo).num_seconds() / 2);
+        if total(mid) == before {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    Some((hi, before))
 }
 
 /// The system's IANA zone.

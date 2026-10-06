@@ -360,7 +360,7 @@ fn row_cell(r: &BoardRow, selected: bool, w: usize) -> Vec<Seg> {
 /// Deliberately 7-bit. `↑`/`↓`/`←`/`→` are bound as aliases of `k`/`j`/`h`/`l`
 /// and the arrow glyph set has no left arrow to spell them with, so the legend
 /// names the letters and `docs/help/pipeline-board.md` documents the arrows.
-pub(crate) fn legend(frozen: bool, hide_finished: bool) -> Line {
+pub(crate) fn legend(frozen: bool, hide_finished: bool, stale: Option<&str>) -> Line {
     let hint = |s: &str| seg(Tok::Slot(S::Ghost), format!(" {s}  "));
     let left = vec![
         Seg::key("kj"),
@@ -381,7 +381,10 @@ pub(crate) fn legend(frozen: bool, hide_finished: bool) -> Line {
             },
         ),
     ];
-    let right = if frozen {
+    let right = if let Some(st) = stale {
+        // A failed read is the more urgent fact: the rows are not current.
+        vec![seg(Tok::Slot(S::Accent), st.to_string())]
+    } else if frozen {
         vec![seg(Tok::Slot(S::Accent), "frozen".to_string())]
     } else {
         vec![seg(Tok::Slot(S::Ghost), "esc close".to_string())]
@@ -496,7 +499,7 @@ mod tests {
             text(&ascii_lines),
             line_text(&ascii_rail[0]),
             line_text(&ascii_rail[1]),
-            line_text(&legend(false, false)),
+            line_text(&legend(false, false, None)),
         );
         assert!(
             ascii.is_ascii(),
@@ -510,13 +513,13 @@ mod tests {
 
     #[test]
     fn the_footer_legend_names_every_bound_key() {
-        let l = line_text(&legend(false, false));
+        let l = line_text(&legend(false, false, None));
         for key in ["kj", "hl", "enter", "spc", "x", "esc"] {
             assert!(l.contains(key), "legend is missing `{key}`: {l}");
         }
         // The two toggles say what they will DO next, not what they are.
         assert!(l.contains("freeze") && l.contains("hide finished"));
-        let l = line_text(&legend(true, true));
+        let l = line_text(&legend(true, true, None));
         assert!(l.contains("live") && l.contains("show finished") && l.contains("frozen"));
     }
 

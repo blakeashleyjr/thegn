@@ -22,6 +22,9 @@ startup.rs
 util.rs
 # config_repo.rs: two symlink-only tests (#[cfg(unix)] on std::os::unix::fs::symlink); no runtime cfg.
 config_repo.rs
+# git_config_heal.rs: TEST-ONLY cfg(unix) module (THE-371) creating symlink fixtures via
+# std::os::unix::fs::symlink; the production transaction is platform-neutral (fsperm seam).
+git_config_heal.rs
 # toolchain_activation.rs: one symlink-only test (#[cfg(unix)]); detection is
 # runtime-platform-neutral and rejects symlinks through file metadata.
 toolchain_activation.rs

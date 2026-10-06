@@ -289,11 +289,22 @@ fn render_panel(kind: &str, title: &str, state: &PanelState, rect: Rect, buf: &m
 fn dispatch_renderer(kind: &str, title: &str, frame: &Frame, rect: Rect, buf: &mut Buffer) {
     use gtui_render::{logs, stat, table, timeseries};
     match kind {
-        "timeseries" => timeseries::TimeseriesRenderer::render(frame, title, bounds_for(frame))
-            .render(rect, buf),
+        "timeseries" => timeseries::TimeseriesRenderer::render(
+            frame,
+            title,
+            bounds_for(frame),
+            rect.width as usize,
+        )
+        .render(rect, buf),
         "stat" => stat::StatRenderer::render(frame, title).render(rect, buf),
-        "table" => table::TableRenderer::render(frame, title).render(rect, buf),
-        "logs" => logs::LogsRenderer::render(frame, title).render(rect, buf),
+        "table" => {
+            table::TableRenderer::render(frame, title, rect.height as usize, rect.width as usize)
+                .render(rect, buf)
+        }
+        "logs" => {
+            logs::LogsRenderer::render(frame, title, rect.height as usize, rect.width as usize)
+                .render(rect, buf)
+        }
         other => block_msg(
             rect,
             buf,
@@ -308,15 +319,14 @@ fn dispatch_renderer(kind: &str, title: &str, frame: &Frame, rect: Rect, buf: &m
 /// sample index, Y is the value field's range with 10% padding. Falls back to a
 /// unit box for empty/flat data so the canvas never divides by zero.
 fn bounds_for(frame: &Frame) -> [f64; 4] {
-    let values: Vec<f64> = frame
+    let values: &[f64] = frame
         .fields
         .iter()
         .find(|f| f.ty == gtui_core::frame::FieldType::Float64)
-        .map(|f| f.floats())
-        .unwrap_or_default();
+        .map_or(&[][..], |f| f.floats());
     let x_max = (values.len().saturating_sub(1)).max(1) as f64;
     let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
-    for &v in &values {
+    for &v in values {
         lo = lo.min(v);
         hi = hi.max(v);
     }

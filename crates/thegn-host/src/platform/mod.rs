@@ -495,3 +495,17 @@ pub fn restrict_file_owner_only(path: &std::path::Path) {
         let _ = path;
     }
 }
+
+/// Non-Unix stub: the console delivers Ctrl-C to the child's console already.
+#[cfg(not(unix))]
+pub struct InterruptGuard;
+
+#[cfg(not(unix))]
+impl InterruptGuard {
+    pub fn install() -> Self {
+        Self
+    }
+    pub fn fired(&self) -> bool {
+        false
+    }
+}

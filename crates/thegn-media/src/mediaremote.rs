@@ -15,9 +15,10 @@
 
 use futures::future::BoxFuture;
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::{Child, Command};
 
+use crate::helper::{self, Limits};
 use crate::mediaremote_parse;
 use crate::model::MediaState;
 use crate::{MediaBackend, MediaCaps, MediaError, MediaWatch};
@@ -48,12 +49,11 @@ impl MediaRemote {
             .argv
             .split_first()
             .ok_or_else(|| MediaError::Unavailable("no mediaremote adapter".into()))?;
-        let out = Command::new(prog)
-            .args(base)
-            .args(args)
-            .output()
+        let mut cmd = Command::new(prog);
+        cmd.args(base).args(args);
+        let out = helper::output(cmd, Limits::OP)
             .await
-            .map_err(|e| MediaError::Unavailable(format!("mediaremote adapter: {e}")))?;
+            .map_err(|e| e.into_media("mediaremote adapter"))?;
         if out.status.success() {
             Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
         } else {
@@ -76,11 +76,16 @@ impl MediaRemote {
             .argv
             .split_first()
             .ok_or_else(|| MediaError::Unavailable("no mediaremote adapter".into()))?;
-        let mut child = Command::new(prog)
-            .args(base)
+        let mut cmd = Command::new(prog);
+        cmd.args(base)
             .arg("stream")
+            .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
+        // Own process group so Drop can take down adapter descendants too.
+        crate::platform::prepare_group(&mut cmd);
+        let mut child = cmd
             .spawn()
             .map_err(|e| MediaError::Unavailable(format!("mediaremote stream: {e}")))?;
         let stdout = child
@@ -89,7 +94,8 @@ impl MediaRemote {
             .ok_or_else(|| MediaError::Backend("mediaremote stream: no stdout".into()))?;
         Ok(MediaRemoteWatch {
             child,
-            lines: BufReader::new(stdout).lines(),
+            lines: BufReader::new(stdout),
+            rec: Vec::new(),
         })
     }
 }
@@ -175,23 +181,45 @@ impl MediaBackend for MediaRemote {
 /// The streaming watcher: each `stream` line is one now-playing change.
 pub struct MediaRemoteWatch {
     child: Child,
-    lines: tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+    lines: BufReader<tokio::process::ChildStdout>,
+    /// Partial record carried across a cancelled `changed()` call.
+    rec: Vec<u8>,
 }
+
+/// Longest stream record accepted; a longer line is treated as a broken stream.
+const MAX_RECORD: u64 = 64 * 1024;
 
 impl MediaWatch for MediaRemoteWatch {
     fn changed(
         &mut self,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>> {
         Box::pin(async move {
-            // A line ⇒ a change; EOF/error ⇒ stream ended.
-            matches!(self.lines.next_line().await, Ok(Some(_)))
+            // A newline-terminated record ⇒ a change; EOF, error, or an
+            // oversize record ⇒ stream ended (Drop then kills the tree). There
+            // is deliberately no read-idle deadline: a push stream is silent
+            // between changes, and a timer would break the 0%-idle contract.
+            let room = MAX_RECORD.saturating_sub(self.rec.len() as u64);
+            let n = (&mut self.lines)
+                .take(room)
+                .read_until(b'\n', &mut self.rec)
+                .await;
+            let whole = matches!(n, Ok(n) if n > 0) && self.rec.last() == Some(&b'\n');
+            if whole {
+                self.rec.clear();
+            }
+            whole
         })
     }
 }
 
 impl Drop for MediaRemoteWatch {
     fn drop(&mut self) {
-        // Best-effort: don't leave the streaming adapter process behind.
+        // Kill the whole adapter tree while the leader is unreaped (`id()` is
+        // None once reaped, so we never killpg a recycled pgid); `kill_on_drop`
+        // then reaps the leader in the background.
+        if let Some(pid) = self.child.id() {
+            crate::platform::kill_group(pid);
+        }
         let _ = self.child.start_kill(); // best-effort: child may already have exited
     }
 }

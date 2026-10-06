@@ -128,19 +128,7 @@ pub fn make_executable_for_test(path: &Path) -> std::io::Result<()> {
 /// Keeping this platform distinction here lets security-sensitive callers stay
 /// substrate-agnostic.
 pub fn write_owner_only_new(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options.open(path)?;
-    if let Err(error) = restrict_to_owner(path) {
-        drop(file);
-        let _ = std::fs::remove_file(path);
-        return Err(error);
-    }
+    let mut file = create_owner_only_exclusive(path)?;
     let result = file.write_all(bytes).and_then(|()| file.sync_all());
     if let Err(error) = result {
         drop(file);
@@ -148,6 +136,54 @@ pub fn write_owner_only_new(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         return Err(error);
     }
     Ok(())
+}
+
+/// Exclusively create (never replacing, never following a final-component
+/// link) an owner-only file and return the open handle. The primitive behind a
+/// git-style `*.lock` file: creation IS the lock acquisition.
+pub fn create_owner_only_exclusive(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(path)?;
+    if let Err(error) = restrict_to_owner(path) {
+        drop(file);
+        let _ = std::fs::remove_file(path);
+        return Err(error);
+    }
+    Ok(file)
+}
+
+/// Whether `meta` describes a file owned by the current user (always true on
+/// platforms without a numeric owner, where the ACL seam applies instead).
+pub fn owned_by_current_user(meta: &std::fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        meta.uid() == nix::unistd::geteuid().as_raw()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        true
+    }
+}
+
+/// Atomically rename `from` over `to` (replacing it, never following a
+/// final-component link in `to`). Windows needs `MoveFileExW`.
+pub fn rename_replace(from: &Path, to: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        replace_file(from, to)
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::rename(from, to)
+    }
 }
 
 /// Make `path` a private (owner-only) real directory, creating it if absent.
