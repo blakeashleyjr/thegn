@@ -766,6 +766,25 @@ impl ControlApi for DaemonService {
                 crate::automation_runtime::clear_session_origin(&id);
             })?;
 
+            // THE-733: a tracker dispatch names the row it recorded before the
+            // session existed; bind the fresh session id to it NOW, in the
+            // daemon, so the row has an identity even when no UI is attached
+            // at exit. One write per launch, off the runtime threads.
+            if let Some(row) = spec
+                .env
+                .iter()
+                .find(|(k, _)| k == thegn_core::issue::DISPATCH_ROW_ENV)
+                .and_then(|(_, v)| v.parse::<i64>().ok())
+            {
+                let sid = id.clone();
+                if let Err(e) = self
+                    .with_db(move |db| db.bind_dispatch_session(row, &sid))
+                    .await
+                {
+                    tracing::warn!(target: "thegn::dispatch", "bind dispatch row {row}: {e}");
+                }
+            }
+
             // Ask a running compositor to graft this session into a real pane.
             // Best-effort by design: with no instance up, the session is simply
             // headless until someone attaches, which is a fine outcome — the
