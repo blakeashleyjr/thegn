@@ -552,7 +552,7 @@ impl IssueBackend for JiraBackend {
             if let Some(total) = comment_section.total
                 && total > embedded_count
             {
-                let mut start_at = comment_section.start_at + embedded_count;
+                let mut start_at = comment_section.start_at.saturating_add(embedded_count);
                 for page in 0..MAX_LIST_PAGES {
                     let path = format!(
                         "{}?startAt={start_at}&maxResults=100&orderBy=created",
@@ -566,7 +566,7 @@ impl IssueBackend for JiraBackend {
                         ));
                     }
                     append_jira_comments(&mut comment_section.comments, page_result.comments);
-                    start_at += received;
+                    start_at = start_at.saturating_add(received);
                     if start_at >= total {
                         break;
                     }
@@ -576,6 +576,14 @@ impl IssueBackend for JiraBackend {
                         ));
                     }
                 }
+            }
+            if let Some(total) = comment_section.total
+                && comment_section.comments.len() < total
+            {
+                return Err(IssueError::Parse(format!(
+                    "Jira comment pagination incomplete: duplicate or missing comments (received {}, expected {total})",
+                    comment_section.comments.len()
+                )));
             }
             let comments = comment_section
                 .comments
@@ -1481,6 +1489,63 @@ mod tests {
             matches!(result, Err(IssueError::Parse(message)) if message.contains("comment pagination incomplete"))
         );
         assert_eq!(requests.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn get_issue_fails_closed_when_duplicate_pages_leave_comments_missing() {
+        let embedded = jira_detail_with_comments(3, 0, 2);
+        let duplicate_page = FixtureResponse::new(
+            StatusCode::OK,
+            json!({
+                "startAt": 2,
+                "maxResults": 100,
+                "total": 3,
+                "comments": [jira_comment(1), jira_comment(1)]
+            })
+            .to_string(),
+        );
+        let (result, requests) = run_get(vec![embedded, duplicate_page]).await;
+        assert!(
+            matches!(result, Err(IssueError::Parse(message)) if message.contains("duplicate or missing comments"))
+        );
+        assert_eq!(requests.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn get_issue_saturates_hostile_comment_offsets() {
+        let embedded = FixtureResponse::new(
+            StatusCode::OK,
+            json!({
+                "id": "10001",
+                "key": "PROJ-1",
+                "self": "http://jira.example/rest/api/3/issue/10001",
+                "fields": {
+                    "summary": "Issue",
+                    "comment": {
+                        "startAt": usize::MAX,
+                        "maxResults": 100,
+                        "total": 2,
+                        "comments": [jira_comment(0)]
+                    }
+                }
+            })
+            .to_string(),
+        );
+        let page = FixtureResponse::new(
+            StatusCode::OK,
+            json!({
+                "startAt": usize::MAX,
+                "maxResults": 100,
+                "total": 2,
+                "comments": [jira_comment(1)]
+            })
+            .to_string(),
+        );
+        let (result, requests) = run_get(vec![embedded, page]).await;
+        assert!(result.is_ok());
+        assert_eq!(requests.len(), 2);
+        let expected_start_at = format!("startAt={}", usize::MAX);
+        assert!(requests[1].contains(expected_start_at.as_str()));
     }
 
     #[tokio::test]
