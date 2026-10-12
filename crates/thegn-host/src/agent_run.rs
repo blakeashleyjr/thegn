@@ -55,8 +55,34 @@ pub(crate) fn force_headless_unsupported() -> impl Drop {
 
 const MAX_RENDERED_COMMAND_BYTES: usize = 100 * 1024;
 
+#[cfg(any(unix, test))]
 fn rendered_command_exceeds_limit(command: &str) -> bool {
     command.len() > MAX_RENDERED_COMMAND_BYTES
+}
+
+#[cfg(any(unix, test))]
+fn fit_command(
+    template: &str,
+    prompt: &str,
+    vars: &TaskVars,
+) -> Result<Option<(String, usize)>, thegn_core::agent_task::TemplateError> {
+    let command = thegn_core::agent_task::substitute_command(template, prompt, vars)?;
+    if !rendered_command_exceeds_limit(&command) {
+        return Ok(Some((command, prompt.len())));
+    }
+
+    let mut prompt_bytes = prompt.len() / 2;
+    loop {
+        let bounded_prompt = thegn_core::agent_task::bound_text(prompt, prompt_bytes);
+        let command = thegn_core::agent_task::substitute_command(template, &bounded_prompt, vars)?;
+        if !rendered_command_exceeds_limit(&command) {
+            return Ok(Some((command, bounded_prompt.len())));
+        }
+        if prompt_bytes == 0 {
+            return Ok(None);
+        }
+        prompt_bytes /= 2;
+    }
 }
 
 /// One dispatch: where to run, what to say, and how long to allow.
@@ -100,13 +126,13 @@ pub(crate) enum AgentDispatch {
     InfraHold(String),
 }
 
-/// Give queue agents a thegn-owned OCI name that cannot collide with an
-/// interactive pane container or an unrelated user container.
+/// Give each queue agent a thegn-owned OCI name derived from its full worktree
+/// path, so same-basename worktrees cannot collide.
 fn scope_agent_spec(
     mut spec: thegn_core::sandbox::SandboxSpec,
-    basename: &str,
+    worktree: &str,
 ) -> thegn_core::sandbox::SandboxSpec {
-    spec.name = thegn_core::sandbox::container_name(&format!("agent-{basename}"));
+    spec.name = thegn_core::sandbox::container_name(&format!("agent-{worktree}"));
     spec
 }
 
@@ -171,7 +197,7 @@ pub(crate) fn agent_floor_gate(
     // `None` ⇒ the sandbox couldn't be established (disabled, or the chain
     // resolved to the host) — a broken boundary under a demanded floor.
     let spec = thegn_core::sandbox::resolve(&full.sandbox, &loc, name)
-        .map(|spec| scope_agent_spec(spec, name));
+        .map(|spec| scope_agent_spec(spec, worktree));
     // THE-215: a sealed profile whose sandbox could not be established must not
     // run the agent on the host — no spec skips the home gate below, so refuse.
     if spec.is_none() && full.sandbox.profile.hides_home() {
@@ -209,33 +235,40 @@ pub(crate) fn run(task: &AgentTaskRun<'_>) -> bool {
     use std::process::{Command, Stdio};
     use thegn_core::util;
 
-    let command = match thegn_core::agent_task::substitute_command(
-        task.command_template,
-        task.prompt,
-        task.vars,
-    ) {
-        Ok(c) => c,
-        Err(e) => {
-            // Validation runs at config time; reaching here means a template
-            // slipped through, so say so rather than spawning nonsense.
-            tracing::warn!(
-                target: "thegn::agent",
-                kind = %task.kind,
-                error = %e,
-                "agent command template is invalid; not dispatching"
-            );
-            return false;
-        }
-    };
-    if rendered_command_exceeds_limit(&command) {
+    let (command, kept_prompt_bytes) =
+        match fit_command(task.command_template, task.prompt, task.vars) {
+            Ok(Some(fit)) => fit,
+            Ok(None) => {
+                tracing::warn!(
+                    target: "thegn::agent",
+                    kind = %task.kind,
+                    prompt_bytes = task.prompt.len(),
+                    max_command_bytes = MAX_RENDERED_COMMAND_BYTES,
+                    "agent command remains oversized with an empty prompt; not dispatching"
+                );
+                return false;
+            }
+            Err(e) => {
+                // Validation runs at config time; reaching here means a template
+                // slipped through, so say so rather than spawning nonsense.
+                tracing::warn!(
+                    target: "thegn::agent",
+                    kind = %task.kind,
+                    error = %e,
+                    "agent command template is invalid; not dispatching"
+                );
+                return false;
+            }
+        };
+    if kept_prompt_bytes < task.prompt.len() {
         tracing::warn!(
             target: "thegn::agent",
             kind = %task.kind,
-            command_bytes = command.len(),
-            max_command_bytes = MAX_RENDERED_COMMAND_BYTES,
-            "rendered agent command exceeds the safe argument limit; not dispatching"
+            original_prompt_bytes = task.prompt.len(),
+            kept_prompt_bytes,
+            rendered_command_bytes = command.len(),
+            "agent prompt was bounded to fit the rendered command; task data omitted"
         );
-        return false;
     }
 
     // Join the shared aggregate slice, like the fold gate and every interactive
@@ -1053,9 +1086,20 @@ mod tests {
 
     #[test]
     fn queue_agent_spec_uses_thegn_owned_container_name() {
-        let spec = scope_agent_spec(sandbox_spec(), "api");
+        let spec = scope_agent_spec(sandbox_spec(), "/wt/api");
         assert!(spec.name.starts_with(thegn_core::sandbox::CONTAINER_PREFIX));
-        assert_eq!(spec.name, "thegn-agent-api");
+        assert_eq!(
+            spec.name,
+            thegn_core::sandbox::container_name("agent-/wt/api")
+        );
+    }
+
+    #[test]
+    fn queue_agent_specs_keep_same_basename_worktrees_distinct_and_live() {
+        let a = scope_agent_spec(sandbox_spec(), "/wt/a/api");
+        let b = scope_agent_spec(sandbox_spec(), "/wt/b/api");
+        assert_ne!(a.name, b.name);
+        assert!(thegn_core::sandbox::identify_orphans(&["/wt/a/api".into()], &[a.name]).is_empty());
     }
 
     #[test]
@@ -1173,15 +1217,42 @@ mod tests {
     }
 
     #[test]
-    fn quote_heavy_prompt_is_refused_when_rendered_command_exceeds_arg_limit() {
+    fn quote_heavy_prompt_is_bounded_to_fit_rendered_command_limit() {
         let prompt = "'".repeat(40 * 1024);
-        let command = thegn_core::agent_task::substitute_command(
-            "agent -p {prompt}",
-            &prompt,
-            &TaskVars::new(),
-        )
-        .unwrap();
-        assert!(rendered_command_exceeds_limit(&command));
+        let (command, kept_prompt_bytes) =
+            fit_command("agent -p {prompt}", &prompt, &TaskVars::new())
+                .unwrap()
+                .unwrap();
+        assert!(command.len() <= MAX_RENDERED_COMMAND_BYTES);
+        assert!(command.contains("task data omitted"));
+        assert!(kept_prompt_bytes < prompt.len());
+    }
+
+    #[test]
+    fn fitting_short_prompt_preserves_exact_substitution() {
+        let prompt = "short prompt";
+        assert_eq!(
+            fit_command("agent -p {prompt}", prompt, &TaskVars::new()).unwrap(),
+            Some((
+                thegn_core::agent_task::substitute_command(
+                    "agent -p {prompt}",
+                    prompt,
+                    &TaskVars::new()
+                )
+                .unwrap(),
+                prompt.len()
+            ))
+        );
+    }
+
+    #[test]
+    fn oversized_non_prompt_variable_cannot_be_fitted() {
+        let vars = TaskVars::new().set("branch", &"a".repeat(200 * 1024));
+        assert!(
+            fit_command("agent --branch {branch} -p {prompt}", "small", &vars)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
