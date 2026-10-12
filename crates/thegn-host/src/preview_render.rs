@@ -75,10 +75,8 @@ pub fn notebook_lines(nb: &Notebook) -> Vec<String> {
     }
     let mut out = Vec::new();
     for (i, cell) in nb.cells.iter().enumerate() {
-        if i > 0 {
-            if !push_notebook_line(&mut out, "") {
-                break;
-            }
+        if i > 0 && !push_notebook_line(&mut out, "") {
+            break;
         }
         let banner = match cell.kind {
             CellKind::Code => format!("── In [{}] ──────── code", i + 1),
