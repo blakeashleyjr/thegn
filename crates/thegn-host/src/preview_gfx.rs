@@ -190,8 +190,9 @@ mod tests {
             [graphics::PREVIEW_IMAGE_ID, graphics::PREVIEW_IMAGE_ID]
         );
         assert!(ids.iter().all(|id| {
-            *id < crate::kitty_relay::CORNER_ID_BASE
-                || *id >= crate::kitty_relay::CORNER_ID_BASE + crate::kitty_relay::CORNER_IDS as u32
+            !(crate::kitty_relay::CORNER_ID_BASE
+                ..crate::kitty_relay::CORNER_ID_BASE + crate::kitty_relay::CORNER_IDS as u32)
+                .contains(id)
         }));
         assert!(
             !bytes
