@@ -31,9 +31,10 @@ pub(crate) fn completion_contract(row: i64, artifact: &str) -> String {
     format!(
         "--- thegn completion contract v{COMPLETION_CONTRACT_VERSION} (runtime policy, not task text) ---\n\
          You are dispatch row {row}. Commit the handoff artifact at `{artifact}`.\n\
-         Then file your report for this row with `thegn dispatch report {row} --text 'PASS: summarize the result\n\
-         gate: <successful validation command and result>'`.\n\
-         After the report is recorded, close this row with `thegn dispatch set-status {row} done`.\n\
+         Then file your report for this row with `thegn dispatch report {row} --text '<VERDICT>: <summary>'`.\n\
+         Lead with one verdict: PASS, REVISE, FAIL, or BLOCKED. For PASS, add a `gate:` line\n\
+         citing the successful validation command. Do not change this row's status; the supervisor\n\
+         verifies the artifact and report and closes the row.\n\
          --- end thegn completion contract v{COMPLETION_CONTRACT_VERSION} ---"
     )
 }
@@ -193,9 +194,13 @@ mod tests {
         let contract = completion_contract(7, ".thegn/pipeline/task.md");
         assert!(rendered.ends_with(&contract));
         assert!(rendered.contains("thegn dispatch report 7"));
+        assert!(contract.contains("--text '<VERDICT>: <summary>'"));
+        assert!(contract.contains("PASS, REVISE, FAIL, or BLOCKED"));
+        assert!(contract.contains("For PASS, add a `gate:` line"));
         assert!(contract.contains(
-            "PASS: summarize the result\ngate: <successful validation command and result>"
+            "Do not change this row's status; the supervisor verifies the artifact and report and closes the row."
         ));
+        assert!(!contract.contains("dispatch set-status"));
     }
 
     #[test]
