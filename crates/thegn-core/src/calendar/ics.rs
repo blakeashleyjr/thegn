@@ -11,14 +11,14 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use chrono::NaiveDate;
+use chrono::{Datelike, NaiveDate};
 
 use super::admission::{
     AdmissionBudget, AdmissionError, AdmissionLimit, AdmissionMeter, ENTRY_OVERHEAD,
     MAX_COMPONENT_DEPTH, MAX_LINE_BYTES,
 };
 use super::recur::{RRule, Recurrence, parse_ics_datetime};
-use super::tz::resolve_tzid;
+use super::tz::{VtzRules, resolve_tzid, resolve_zone};
 use super::validate::validate_event;
 use super::{CalEvent, EventStatus, EventTime, Reminder, TzRef};
 
@@ -566,6 +566,7 @@ pub fn parse_ics_window_reported(
     report.overflow = 0;
     report.document_failure = false;
     let timezone_bindings = prescan_timezones(input, &mut check, report)?;
+    let mut timezone_matches = BTreeMap::new();
     let mut cur: Option<Builder> = None;
     let mut components: Vec<ComponentName> = Vec::new();
     let mut event_depth: Option<usize> = None;
@@ -740,7 +741,14 @@ pub fn parse_ics_window_reported(
             }
             continue;
         }
-        b.property(&line, meter, report, &timezone_bindings)?;
+        b.property(
+            &line,
+            meter,
+            report,
+            &timezone_bindings,
+            &mut timezone_matches,
+            default_zone,
+        )?;
     }
     if cur.is_some() || !components.is_empty() {
         report.record(IcsDiagnostic::Truncated);
@@ -762,6 +770,23 @@ pub fn parse_ics_window_reported(
 
 const MAX_TIMEZONE_BINDINGS: usize = 64;
 const MAX_TZID_BYTES: usize = 128;
+const MAX_TIMEZONE_MATCHES: usize = 128;
+
+#[derive(Debug, Clone)]
+enum TimezoneBinding {
+    Iana(String),
+    Rules(VtzRules),
+    Unmapped,
+}
+
+#[derive(Default)]
+struct RawObservance {
+    dtstart: Option<String>,
+    offset_from: Option<String>,
+    offset_to: Option<String>,
+    rrule: Option<String>,
+    has_rdate: bool,
+}
 
 /// Bind at most 64 VTIMEZONE definitions. Definitions beyond the cap, names
 /// over 128 bytes, and oversized lines inside a definition are skipped and
@@ -770,16 +795,22 @@ fn prescan_timezones(
     input: &str,
     check: &mut impl FnMut() -> Result<(), AdmissionError>,
     report: &mut IcsReport,
-) -> Result<BTreeMap<String, Option<String>>, AdmissionError> {
+) -> Result<BTreeMap<String, TimezoneBinding>, AdmissionError> {
     let mut bindings = BTreeMap::new();
     let mut stack = Vec::new();
     let mut timezone_depth = None;
-    let mut definition: Option<(String, Option<String>)> = None;
+    let mut definition: Option<(String, Option<String>, Vec<super::tz::VtzObservance>, bool)> =
+        None;
+    let mut observance_depth = None;
+    let mut observance: Option<RawObservance> = None;
     for raw in LogicalLines::new(input) {
         check()?;
         if raw.len() > MAX_LINE_BYTES {
             if timezone_depth.is_some() {
                 report.record(IcsDiagnostic::UnmappedTimeZone);
+                if let Some((_, _, _, invalid)) = definition.as_mut() {
+                    *invalid = true;
+                }
             }
             continue;
         }
@@ -796,22 +827,39 @@ fn prescan_timezones(
                 }
                 if pushed && matches!(component, ComponentName::Timezone) {
                     timezone_depth = Some(stack.len());
-                    definition = Some((String::new(), None));
+                    definition = Some((String::new(), None, Vec::new(), false));
+                } else if timezone_depth.is_some()
+                    && pushed
+                    && stack.len() == timezone_depth.unwrap_or_default() + 1
+                    && matches!(
+                        line.value.to_ascii_uppercase().as_str(),
+                        "STANDARD" | "DAYLIGHT"
+                    )
+                {
+                    observance_depth = Some(stack.len());
+                    observance = Some(RawObservance::default());
                 }
             }
             "END" => {
                 let ending_timezone = line.value.eq_ignore_ascii_case("VTIMEZONE");
                 if ending_timezone {
-                    if let (Some((tzid, location)), Some(_)) = (definition.take(), timezone_depth) {
+                    if let (Some((tzid, location, rules, invalid)), Some(_)) =
+                        (definition.take(), timezone_depth)
+                    {
                         if !tzid.is_empty() && tzid.len() <= MAX_TZID_BYTES {
                             if bindings.len() < MAX_TIMEZONE_BINDINGS {
                                 let canonical = resolve_tzid(&tzid)
                                     .or_else(|| location.as_deref().and_then(resolve_tzid))
                                     .map(|zone| zone.name().to_string());
-                                if canonical.is_none() {
+                                let binding = if let Some(name) = canonical {
+                                    TimezoneBinding::Iana(name)
+                                } else if !invalid && let Some(rules) = VtzRules::new(rules) {
+                                    TimezoneBinding::Rules(rules)
+                                } else {
                                     report.record(IcsDiagnostic::UnmappedTimeZone);
-                                }
-                                bindings.entry(tzid).or_insert(canonical);
+                                    TimezoneBinding::Unmapped
+                                };
+                                bindings.entry(tzid).or_insert(binding);
                             } else {
                                 report.record(IcsDiagnostic::UnmappedTimeZone);
                             }
@@ -820,6 +868,32 @@ fn prescan_timezones(
                         }
                     }
                     timezone_depth = None;
+                } else if observance_depth == Some(stack.len()) {
+                    if let (Some(raw), Some((_, _, rules, invalid))) =
+                        (observance.take(), definition.as_mut())
+                    {
+                        match (raw.dtstart, raw.offset_from, raw.offset_to) {
+                            (Some(start), Some(from), Some(to)) => {
+                                if let Some(rule) = VtzRules::observance(
+                                    &start,
+                                    &from,
+                                    &to,
+                                    raw.rrule.as_deref(),
+                                    raw.has_rdate,
+                                ) {
+                                    if rules.len() < 8 {
+                                        rules.push(rule);
+                                    } else {
+                                        *invalid = true;
+                                    }
+                                } else {
+                                    *invalid = true;
+                                }
+                            }
+                            _ => *invalid = true,
+                        }
+                    }
+                    observance_depth = None;
                 }
                 if let Some(depth) = stack.iter().rposition(|part| part.matches(&line.value)) {
                     stack.truncate(depth);
@@ -827,7 +901,7 @@ fn prescan_timezones(
             }
             "TZID" | "X-LIC-LOCATION" => {
                 if timezone_depth == Some(stack.len())
-                    && let Some((tzid, location)) = &mut definition
+                    && let Some((tzid, location, _, _)) = &mut definition
                 {
                     if line.value.len() > MAX_TZID_BYTES {
                         report.record(IcsDiagnostic::UnmappedTimeZone);
@@ -837,6 +911,22 @@ fn prescan_timezones(
                         }
                     } else if location.is_none() {
                         *location = Some(line.value);
+                    }
+                }
+            }
+            "DTSTART" | "TZOFFSETFROM" | "TZOFFSETTO" | "RRULE" | "RDATE" => {
+                if observance_depth == Some(stack.len())
+                    && let Some(raw) = observance.as_mut()
+                {
+                    match line.name.as_str() {
+                        "DTSTART" if raw.dtstart.is_none() => raw.dtstart = Some(line.value),
+                        "TZOFFSETFROM" if raw.offset_from.is_none() => {
+                            raw.offset_from = Some(line.value)
+                        }
+                        "TZOFFSETTO" if raw.offset_to.is_none() => raw.offset_to = Some(line.value),
+                        "RRULE" if raw.rrule.is_none() => raw.rrule = Some(line.value),
+                        "RDATE" => raw.has_rdate = true,
+                        _ => {}
                     }
                 }
             }
@@ -1003,7 +1093,9 @@ impl Builder {
         line: &ContentLine,
         meter: &mut AdmissionMeter,
         report: &mut IcsReport,
-        timezone_bindings: &BTreeMap<String, Option<String>>,
+        timezone_bindings: &BTreeMap<String, TimezoneBinding>,
+        timezone_matches: &mut BTreeMap<(String, i32), Option<chrono_tz::Tz>>,
+        default_zone: &str,
     ) -> Result<(), AdmissionError> {
         let mut normalized;
         let line = if matches!(line.name.as_str(), "DTSTART" | "DTEND" | "RDATE" | "EXDATE")
@@ -1011,12 +1103,47 @@ impl Builder {
             && !tzid.is_empty()
         {
             match timezone_bindings.get(tzid) {
-                Some(Some(name)) => {
+                Some(TimezoneBinding::Iana(name)) => {
                     normalized = line.clone();
                     normalized.params.insert("TZID".to_string(), name.clone());
                     &normalized
                 }
-                Some(None) => line,
+                Some(TimezoneBinding::Rules(rules)) => {
+                    let year = line
+                        .value
+                        .split(',')
+                        .next()
+                        .and_then(parse_ics_datetime)
+                        .map(|d| d.year());
+                    let matched = year.and_then(|year| {
+                        let key = (tzid.to_string(), year);
+                        if let Some(zone) = timezone_matches.get(&key) {
+                            return *zone;
+                        }
+                        if timezone_matches.len() >= MAX_TIMEZONE_MATCHES {
+                            return None;
+                        }
+                        let zone = rules.match_zone(year, resolve_zone(default_zone));
+                        timezone_matches.insert(key, zone);
+                        zone
+                    });
+                    if let Some(zone) = matched {
+                        normalized = line.clone();
+                        normalized
+                            .params
+                            .insert("TZID".to_string(), zone.name().to_string());
+                        &normalized
+                    } else {
+                        self.quarantined = true;
+                        report.record(IcsDiagnostic::UnknownTimeZone);
+                        line
+                    }
+                }
+                Some(TimezoneBinding::Unmapped) => {
+                    self.quarantined = true;
+                    report.record(IcsDiagnostic::UnknownTimeZone);
+                    line
+                }
                 None => match resolve_tzid(tzid) {
                     Some(zone) => {
                         normalized = line.clone();
