@@ -1330,10 +1330,13 @@ mod spec {
             .unwrap();
         let filter = IssueFilter::default();
         let list_router = barrier_router(Arc::new(tokio::sync::Barrier::new(2)));
-        let listed = runtime.block_on(tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            list_router.list_issues(&filter),
-        ));
+        let listed = runtime.block_on(async {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                list_router.list_issues(&filter),
+            )
+            .await
+        });
         assert!(
             listed.is_ok(),
             "list calls must overlap to release the barrier"
@@ -1341,10 +1344,13 @@ mod spec {
         assert_eq!(listed.unwrap().unwrap().len(), 2);
 
         let provider_router = barrier_router(Arc::new(tokio::sync::Barrier::new(2)));
-        let providers = runtime.block_on(tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            provider_router.list_per_provider(&filter),
-        ));
+        let providers = runtime.block_on(async {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                provider_router.list_per_provider(&filter),
+            )
+            .await
+        });
         assert!(
             providers.is_ok(),
             "per-provider calls must overlap to release the barrier"
@@ -1359,10 +1365,13 @@ mod spec {
             .build()
             .unwrap();
         let router = ordering_router();
-        let providers = runtime.block_on(tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            router.list_per_provider(&IssueFilter::default()),
-        ));
+        let providers = runtime.block_on(async {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                router.list_per_provider(&IssueFilter::default()),
+            )
+            .await
+        });
         assert!(
             providers.is_ok(),
             "the later account must run to release the first account"
@@ -1379,10 +1388,13 @@ mod spec {
             .build()
             .unwrap();
         let router = barrier_router(Arc::new(tokio::sync::Barrier::new(2)));
-        let searched = runtime.block_on(tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            router.search("query", 10),
-        ));
+        let searched = runtime.block_on(async {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                router.search("query", 10),
+            )
+            .await
+        });
         assert!(
             searched.is_ok(),
             "search calls must overlap to release the barrier"
