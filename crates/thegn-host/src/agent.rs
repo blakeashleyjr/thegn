@@ -2919,6 +2919,7 @@ where
 
 /// In-process registry of worktrees with a live provider file-sync (path →
 /// env name), so the close thread can pull changes back without re-resolving.
+#[derive(Clone)]
 struct ProviderSyncRecord {
     env_name: String,
     in_flight: bool,
