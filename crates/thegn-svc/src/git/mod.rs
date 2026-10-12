@@ -69,6 +69,7 @@ pub struct DiffEntry {
     pub path: String,
     pub added: u32,
     pub deleted: u32,
+    pub binary: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -325,7 +326,10 @@ pub trait GitBackend: thegn_core::seam::Probe + Send + Sync {
     fn add_worktree(&self, root: &Path, branch: &str, base: &str, path: &Path) -> Result<()>;
     fn remove_worktree(&self, root: &Path, path: &Path, delete_branch: bool) -> Result<()>;
 
-    /// A merge/rebase/cherry-pick in progress, or `None`. Merge/cherry-pick/
+    /// A merge/rebase/cherry-pick in progress, or `None` when every required
+    /// probe successfully observed absence. Probe failures are `Err`, preserving
+    /// the caller's last-known state, except the non-bridged remote rebase probe;
+    /// see `remote.rs` for its absence/unreadable ambiguity. Merge/cherry-pick/
     /// revert are probed via `rev-parse --verify` of their `*_HEAD` pseudo-refs
     /// (git clears those on commit/abort); rebase is probed via the on-disk
     /// state dir, since `REBASE_HEAD` survives a completed rebase. Both work for
@@ -339,13 +343,12 @@ pub trait GitBackend: thegn_core::seam::Probe + Send + Sync {
         // forks per hydration, run twice). Anything else keeps the CLI probes
         // below (see [`stat_gitdir`]).
         let local_gitdir = stat_gitdir(loc);
-        let exists = |what: &str| -> bool {
+        let exists = |what: &str| -> Result<bool> {
             if let Some(gd) = &local_gitdir {
-                return gd.join(what).is_file();
+                return probe_file(&gd.join(what));
             }
-            run_status(loc, &["rev-parse", "-q", "--verify", what])
-                .map(|(exit, _)| exit == 0)
-                .unwrap_or(false)
+            let (exit, _) = run_status(loc, &["rev-parse", "-q", "--verify", what])?;
+            classify_presence_exit(exit, what)
         };
         let name_of = |what: &str| -> String {
             run_status(loc, &["name-rev", "--name-only", "--always", what])
@@ -368,20 +371,25 @@ pub trait GitBackend: thegn_core::seam::Probe + Send + Sync {
         // exists to kill, and unbounded so a stalled connection pins hydration).
         // On a local loc keep the cheap `std::fs` read.
         let rebasing = if let Some(gd) = &local_gitdir {
-            gd.join("rebase-merge/onto").is_file() || gd.join("rebase-apply/onto").is_file()
+            let merge = probe_file(&gd.join("rebase-merge/onto"))?;
+            if merge {
+                true
+            } else {
+                probe_file(&gd.join("rebase-apply/onto"))?
+            }
         } else if crate::bridge::for_loc(loc).is_some() {
-            bridged_rebase_in_progress(loc)
+            bridged_rebase_in_progress(loc)?
         } else {
             loc.read_git_path("rebase-merge/onto").is_some()
                 || loc.read_git_path("rebase-apply/onto").is_some()
         };
-        let kind = if exists("MERGE_HEAD") {
+        let kind = if exists("MERGE_HEAD")? {
             Some((MergeKind::Merge, "MERGE_HEAD"))
         } else if rebasing {
             Some((MergeKind::Rebase, "REBASE_HEAD"))
-        } else if exists("CHERRY_PICK_HEAD") {
+        } else if exists("CHERRY_PICK_HEAD")? {
             Some((MergeKind::CherryPick, "CHERRY_PICK_HEAD"))
-        } else if exists("REVERT_HEAD") {
+        } else if exists("REVERT_HEAD")? {
             Some((MergeKind::Revert, "REVERT_HEAD"))
         } else {
             None
@@ -664,36 +672,58 @@ fn run_status(loc: &GitLoc, args: &[&str]) -> Result<(i32, String)> {
 /// (`rev-parse --git-path` to resolve, then read) over the bridge — rather than
 /// letting `read_git_path` spawn a fresh `rev-parse`+`cat` per file on a
 /// remote/provider loc (up to 4 unbounded spawns per refresh). Resolves the
-/// gitdir once, then one bounded `test -e` over the live connection. Any bridge
-/// error degrades to `false` (no banner) — the same fail-quiet stance the local
-/// `read_git_path().is_some()` path has.
+/// gitdir once, then one bounded `test -e` over the live connection. Probe
+/// failures are returned so callers can preserve last-known state.
 ///
 /// Caller guarantees a bridge is connected for `loc` (checked at the call site).
-fn bridged_rebase_in_progress(loc: &GitLoc) -> bool {
-    let Some(b) = crate::bridge::for_loc(loc) else {
-        return false;
-    };
+fn bridged_rebase_in_progress(loc: &GitLoc) -> Result<bool> {
+    let b = crate::bridge::for_loc(loc).context("bridge disappeared during rebase-state probe")?;
     // Resolve the private gitdir (a linked worktree's `.git` is a redirect file,
     // so never assume `<path>/.git`).
     let path = loc.path();
-    let gitdir = match b.exec_read(
-        &["git", "-C", &path, "rev-parse", "--absolute-git-dir"],
-        None,
-        &[],
-    ) {
-        Ok(r) if r.exit == 0 => r.stdout.trim().to_string(),
-        _ => return false,
-    };
+    let gitdir_result = b
+        .exec_read(
+            &["git", "-C", &path, "rev-parse", "--absolute-git-dir"],
+            None,
+            &[],
+        )
+        .context("resolve gitdir for bridged rebase-state probe")?;
+    let gitdir = gitdir_result.stdout.trim().to_string();
+    if gitdir_result.exit != 0 {
+        anyhow::bail!(
+            "git rev-parse --absolute-git-dir failed with exit {}",
+            gitdir_result.exit
+        );
+    }
     if gitdir.is_empty() {
-        return false;
+        anyhow::bail!("git rev-parse --absolute-git-dir returned an empty path");
     }
     // One bounded existence probe for either rebase state file. `test` exits 0
-    // when the file exists, non-zero (data, not error) otherwise.
+    // when the file exists, 1 when neither exists, and another code on failure.
     let merge = format!("{gitdir}/rebase-merge/onto");
     let apply = format!("{gitdir}/rebase-apply/onto");
-    match b.exec_read(&["test", "-e", &merge, "-o", "-e", &apply], None, &[]) {
-        Ok(r) => r.exit == 0,
-        Err(_) => false,
+    let result = b
+        .exec_read(&["test", "-e", &merge, "-o", "-e", &apply], None, &[])
+        .context("probe bridged rebase state files")?;
+    classify_presence_exit(result.exit, "rebase state files")
+}
+
+/// Classify Git's expected absence exit (1) separately from transport,
+/// execution, and repository errors.
+fn classify_presence_exit(exit: i32, probe: &str) -> Result<bool> {
+    match exit {
+        0 => Ok(true),
+        1 => Ok(false),
+        other => anyhow::bail!("{probe} probe failed with exit {other}"),
+    }
+}
+
+/// Test for a state file while preserving filesystem errors other than absence.
+fn probe_file(path: &Path) -> Result<bool> {
+    match std::fs::metadata(path) {
+        Ok(metadata) => Ok(metadata.is_file()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).with_context(|| format!("stat git state file {}", path.display())),
     }
 }
 
@@ -926,8 +956,8 @@ fn parse_status_porcelain(out: &str) -> Vec<FileStatus> {
 /// Strictly parse `git diff --numstat` output into per-file counts.
 ///
 /// Each record is `<added>\t<deleted>\t<path>`. Only git's explicit binary
-/// marker (`-\t-`) means non-text, and such rows are omitted — the same as the
-/// native gix backend, which has no line counts for binary files. Anything else
+/// marker (`-\t-`) means non-text; those rows are kept with zero numeric counts
+/// so callers retain the changed path. Anything else
 /// malformed (missing path, non-decimal or oversized number, a lone `-`) is an
 /// error rather than a plausible zero. Counts beyond `u32::MAX` are rejected
 /// (a single file cannot sensibly exceed it) without allocating for them.
@@ -950,6 +980,12 @@ pub(crate) fn parse_numstat(out: &str) -> Result<Vec<DiffEntry>> {
             anyhow::bail!("malformed numstat record: empty path");
         }
         if a == "-" && d == "-" {
+            v.push(DiffEntry {
+                added: 0,
+                deleted: 0,
+                path: p.to_string(),
+                binary: true,
+            });
             continue;
         }
         let (Some(added), Some(deleted)) = (count(a), count(d)) else {
@@ -959,9 +995,69 @@ pub(crate) fn parse_numstat(out: &str) -> Result<Vec<DiffEntry>> {
             added,
             deleted,
             path: p.to_string(),
+            binary: false,
         });
     }
     Ok(v)
+}
+
+/// A typed line-count observation for a diff total.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiffCount {
+    Exact(u32),
+    Binary,
+    Capped,
+    Unavailable,
+}
+
+/// Convert per-file rows into typed added/deleted totals. Mixed text/binary
+/// diffs retain their exact text-line sums; binary-only diffs report `Binary`.
+pub fn typed_totals(entries: Result<&[DiffEntry]>) -> (DiffCount, DiffCount) {
+    let Ok(entries) = entries else {
+        return (DiffCount::Unavailable, DiffCount::Unavailable);
+    };
+    let mut added = 0u32;
+    let mut deleted = 0u32;
+    let mut added_capped = false;
+    let mut deleted_capped = false;
+    let mut text_rows = 0usize;
+    let mut binary_rows = 0usize;
+    for entry in entries {
+        if entry.binary {
+            binary_rows += 1;
+            continue;
+        }
+        text_rows += 1;
+        match added.checked_add(entry.added) {
+            Some(total) => added = total,
+            None => {
+                added = u32::MAX;
+                added_capped = true;
+            }
+        }
+        match deleted.checked_add(entry.deleted) {
+            Some(total) => deleted = total,
+            None => {
+                deleted = u32::MAX;
+                deleted_capped = true;
+            }
+        }
+    }
+    let added = if added_capped {
+        DiffCount::Capped
+    } else if text_rows == 0 && binary_rows > 0 {
+        DiffCount::Binary
+    } else {
+        DiffCount::Exact(added)
+    };
+    let deleted = if deleted_capped {
+        DiffCount::Capped
+    } else if text_rows == 0 && binary_rows > 0 {
+        DiffCount::Binary
+    } else {
+        DiffCount::Exact(deleted)
+    };
+    (added, deleted)
 }
 
 /// Sum a `git diff --numstat` output into `(added, deleted)` line totals.
@@ -970,7 +1066,15 @@ pub(crate) fn parse_numstat(out: &str) -> Result<Vec<DiffEntry>> {
 /// depends on the build profile or backend. Shared by the batched
 /// [`GitBackend::glyph_reads`] sidebar diff-stat reads.
 pub(crate) fn sum_numstat(out: &str) -> Result<(u32, u32)> {
-    Ok(sum_entries(&parse_numstat(out)?))
+    let entries = parse_numstat(out)?;
+    let (added, deleted) = typed_totals(Ok(&entries));
+    let numeric = |count| match count {
+        DiffCount::Exact(n) => n,
+        DiffCount::Binary => 0,
+        DiffCount::Capped => u32::MAX,
+        DiffCount::Unavailable => 0,
+    };
+    Ok((numeric(added), numeric(deleted)))
 }
 
 /// Saturating `(added, deleted)` totals of per-file rows (shared by both backends).
@@ -2242,10 +2346,88 @@ mod tests {
     }
 
     #[test]
-    fn numstat_binary_rows_are_omitted_like_native() {
+    fn numstat_binary_rows_are_kept_like_native() {
         let rows = parse_numstat("1\t2\ta\n-\t-\tb.png\n").unwrap();
-        assert_eq!(rows.len(), 1);
+        assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].path, "a");
+        assert_eq!(rows[1].path, "b.png");
+        assert_eq!((rows[1].added, rows[1].deleted), (0, 0));
+        assert!(rows[1].binary);
+    }
+
+    #[test]
+    fn typed_totals_marks_saturation_binary_and_unavailable() {
+        let max = u32::MAX;
+        let saturated = [
+            DiffEntry {
+                path: "a".into(),
+                added: max,
+                deleted: 0,
+                binary: false,
+            },
+            DiffEntry {
+                path: "b".into(),
+                added: 1,
+                deleted: 0,
+                binary: false,
+            },
+        ];
+        assert_eq!(
+            typed_totals(Ok(&saturated)),
+            (DiffCount::Capped, DiffCount::Exact(0))
+        );
+
+        let binary = [DiffEntry {
+            path: "image.png".into(),
+            added: 0,
+            deleted: 0,
+            binary: true,
+        }];
+        assert_eq!(
+            typed_totals(Ok(&binary)),
+            (DiffCount::Binary, DiffCount::Binary)
+        );
+        assert_eq!(
+            typed_totals(Err(anyhow::anyhow!("numstat failed"))),
+            (DiffCount::Unavailable, DiffCount::Unavailable)
+        );
+        let mixed = [
+            DiffEntry {
+                path: "code.rs".into(),
+                added: 40,
+                deleted: 0,
+                binary: false,
+            },
+            DiffEntry {
+                path: "image.png".into(),
+                added: 0,
+                deleted: 0,
+                binary: true,
+            },
+        ];
+        assert_eq!(
+            typed_totals(Ok(&mixed)),
+            (DiffCount::Exact(40), DiffCount::Exact(0))
+        );
+    }
+
+    #[test]
+    fn merge_probe_exit_classifier_distinguishes_absence_from_failure() {
+        assert!(classify_presence_exit(0, "probe").unwrap());
+        assert!(!classify_presence_exit(1, "probe").unwrap());
+        assert!(classify_presence_exit(128, "probe").is_err());
+    }
+
+    #[test]
+    fn merge_state_reports_non_repository_probe_failure() {
+        let fixture = tempfile::tempdir().unwrap();
+        std::fs::write(fixture.path().join(".git"), "").unwrap();
+        let loc = GitLoc::Local(fixture.path().to_path_buf());
+        let error = CliGit.merge_state(&loc).unwrap_err().to_string();
+        assert!(
+            error.contains("probe failed") || error.contains("not a git repository"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
