@@ -256,12 +256,24 @@ fn decode_param_value(value: &str) -> Option<String> {
     Some(out)
 }
 
-/// Properties whose RFC 5545 value type is TEXT. URI, CAL-ADDRESS, date/time,
-/// recurrence, status, and extension values are retained byte-for-byte.
+/// Known RFC 5545 TEXT properties, plus the common calendar name/description
+/// extensions, whose values receive TEXT unescaping. URI, CAL-ADDRESS,
+/// date/time, recurrence, status, and other extension values are retained
+/// byte-for-byte.
 fn is_text_property(name: &str) -> bool {
     matches!(
         name,
-        "UID" | "SUMMARY" | "DESCRIPTION" | "LOCATION" | "CATEGORIES"
+        "UID"
+            | "SUMMARY"
+            | "DESCRIPTION"
+            | "LOCATION"
+            | "CATEGORIES"
+            | "COMMENT"
+            | "CONTACT"
+            | "RESOURCES"
+            | "TZNAME"
+            | "X-WR-CALNAME"
+            | "X-WR-CALDESC"
     )
 }
 

@@ -123,7 +123,23 @@ fn parameter_values_decode_rfc_6868_and_reject_unterminated_quotes() {
         line.params.get("CN").map(String::as_str),
         Some("Doe\"s ^ name\nSecond line")
     );
-    assert!(parse_line(r#"ATTENDEE;CN="unfinished:mailto:a@example.com"#).is_none());
+
+    let unknown_escape = parse_line("ATTENDEE;CN=a^xb:mailto:x").unwrap();
+    assert_eq!(
+        unknown_escape.params.get("CN").map(String::as_str),
+        Some("a^xb")
+    );
+
+    let trailing_caret = parse_line("ATTENDEE;CN=a^:mailto:x").unwrap();
+    assert_eq!(
+        trailing_caret.params.get("CN").map(String::as_str),
+        Some("a^")
+    );
+
+    assert!(parse_line(r#"ATTENDEE;CN="a"b:mailto:x"#).is_none());
+    assert!(parse_line(r#"ATTENDEE;CN=a"b":mailto:x"#).is_none());
+    assert!(parse_line("ATTENDEE;CN:mailto:x").is_none());
+    assert!(parse_line("ATTENDEE;=x:mailto:x").is_none());
 }
 
 #[test]
@@ -136,6 +152,9 @@ fn only_text_property_values_are_unescaped() {
 
     let recurrence = parse_line(r"RRULE:FREQ=DAILY\;INTERVAL=2").unwrap();
     assert_eq!(recurrence.value, r"FREQ=DAILY\;INTERVAL=2");
+
+    let calendar_name = parse_line(r"X-WR-CALNAME:Team\, Ops").unwrap();
+    assert_eq!(calendar_name.value, "Team, Ops");
 }
 
 #[test]
