@@ -329,7 +329,6 @@ crates/thegn-host/src/search.rs
 crates/thegn-host/src/search_worker.rs
 crates/thegn-host/src/secret.rs
 crates/thegn-host/src/session.rs
-crates/thegn-host/src/share.rs
 crates/thegn-host/src/sidebar.rs
 crates/thegn-host/src/sprite_bridge.rs
 crates/thegn-host/src/structural_diff.rs
