@@ -6378,6 +6378,7 @@ async fn event_loop<T: Terminal>(
     let (preview_img_tx, mut preview_img_rx) =
         tokio_mpsc::channel::<crate::preview_pane::ImageMsg>(crate::preview_pane::RESULT_CAP);
     let mut preview_gfx = crate::preview_gfx::PreviewGfx::new();
+    let mut pending_preview_oob = crate::preview_retry::PendingPreviewOob::default();
     // The git mutation runner + the line-cursor document fetches (staging
     // diff, drilled-commit files, patch doc). Results are tagged with
     // `panel_ui.git.op_gen` so a worktree switch kills strays on arrival.
@@ -8474,6 +8475,9 @@ async fn event_loop<T: Terminal>(
                 return Err(anyhow::anyhow!("terminal writer failed: {e}"));
             }
         }
+        // OOB capacity releases pulse the existing terminal waker; retrying
+        // here keeps this path independent of cell composition and timers.
+        pending_preview_oob.retry(|bytes| writer.try_submit_oob(bytes));
         // Keep the drawer geometry that `compute_chrome` reserves in sync with
         // the live drawer state. When the reservation changes (any open/close
         // path — toggle, direct yazi, Esc, or a worktree switch restoring a
@@ -14291,9 +14295,7 @@ async fn event_loop<T: Terminal>(
                 let open_preview = panel_ui.file_preview.as_ref().map(|fp| fp.path.as_str());
                 let blob =
                     preview_gfx.frame(chrome.panel, open_preview, overlays.any(), corner_kitty);
-                if !blob.is_empty() {
-                    writer.submit_oob(blob);
-                }
+                pending_preview_oob.offer(blob, |bytes| writer.try_submit_oob(bytes));
             }
             dirty = false;
             last_flush_at = std::time::Instant::now();
@@ -15714,11 +15716,20 @@ async fn event_loop<T: Terminal>(
                 mouse_left_down = left;
             }
             Ok(Some(InputEvent::Key(k))) => {
-                // Split mouse-report fragments masquerade as keys; drop them
-                // before they reach any dispatch or pane.
-                if residue.swallow(&k.key, k.modifiers) {
-                    continue;
-                }
+                // Recover xterm's split modified tilde keys before termwiz's
+                // keymap can turn their suffix into pane text; mouse residue
+                // continues to be discarded here as before.
+                let k = match residue.feed(&k.key, k.modifiers) {
+                    crate::mousefilter::Verdict::Swallow => continue,
+                    crate::mousefilter::Verdict::Pass => k,
+                    crate::mousefilter::Verdict::Emit(key) => key,
+                    crate::mousefilter::Verdict::Replay(keys) => {
+                        for key in keys.into_iter().rev() {
+                            pending_input.push_front(InputEvent::Key(key));
+                        }
+                        continue;
+                    }
+                };
                 crate::perf_timing::observe_input(&mut input_at, std::time::Instant::now());
                 loop_perf.input_event();
                 let k = normalize_key(k);

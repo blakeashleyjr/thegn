@@ -196,6 +196,7 @@ mod preview_gfx;
 mod preview_jobs;
 mod preview_pane;
 mod preview_render;
+mod preview_retry;
 mod preview_watch;
 mod probe;
 mod proc_worker;
