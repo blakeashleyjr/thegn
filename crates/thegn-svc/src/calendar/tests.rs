@@ -2487,6 +2487,60 @@ async fn serve_fixed(
     (address, hits, server)
 }
 
+async fn serve_caldav_delta_then_snapshot(
+    delta: String,
+    snapshot: String,
+) -> (
+    std::net::SocketAddr,
+    std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    tokio::task::JoinHandle<()>,
+) {
+    use axum::body::to_bytes;
+    use axum::extract::Request;
+    use axum::response::IntoResponse;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen_requests = requests.clone();
+    let count = std::sync::Arc::new(AtomicUsize::new(0));
+    let seen_count = count.clone();
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            axum::Router::new().fallback(axum::routing::any(move |request: Request| {
+                let requests = seen_requests.clone();
+                let count = seen_count.clone();
+                let delta = delta.clone();
+                let snapshot = snapshot.clone();
+                async move {
+                    let method = request.method().to_string();
+                    let body = to_bytes(request.into_body(), 1 << 20).await.unwrap();
+                    requests
+                        .lock()
+                        .unwrap()
+                        .push((method, String::from_utf8(body.to_vec()).unwrap()));
+                    let response_body = if count.fetch_add(1, Ordering::SeqCst) == 0 {
+                        delta
+                    } else {
+                        snapshot
+                    };
+                    (
+                        axum::http::StatusCode::MULTI_STATUS,
+                        [("content-type", "application/xml")],
+                        response_body,
+                    )
+                        .into_response()
+                }
+            })),
+        )
+        .await
+        .unwrap();
+    });
+    (address, requests, server)
+}
+
 #[tokio::test]
 async fn a_remote_feed_over_the_budget_never_advances_its_etag() {
     use thegn_core::calendar::AdmissionLimit;
@@ -2584,13 +2638,14 @@ fn multistatus(events: usize, deletions: usize) -> String {
 }
 
 #[tokio::test]
-async fn caldav_events_and_deletions_share_the_budget() {
-    use thegn_core::calendar::AdmissionLimit;
+async fn caldav_over_budget_delta_falls_back_to_one_snapshot_query() {
     let zone = thegn_core::calendar::Tz::UTC;
-    let (address, _hits, server) = serve_fixed(
-        axum::http::StatusCode::MULTI_STATUS,
-        "application/xml",
+    // A real calendar-query contains current resources, never delta tombstones.
+    // The first response proves deletions make the sync delta exceed its budget;
+    // the fallback snapshot is the authoritative current state.
+    let (address, requests, server) = serve_caldav_delta_then_snapshot(
         multistatus(2, 3),
+        multistatus(2, 0).replace("<d:sync-token>tok-next</d:sync-token>", ""),
     )
     .await;
     let acct = CalendarAccount {
@@ -2604,34 +2659,32 @@ async fn caldav_events_and_deletions_share_the_budget() {
         AccountAdmission::isolated(AdmissionBudget::new(4).unwrap(), zone),
     );
     let cursor = backend.stored_cursor_for_test("tok-prev");
-    let err = backend.list_events(from, to, &cursor).await.unwrap_err();
-    assert!(
-        is_admission(&err, AdmissionLimit::AccountRecords),
-        "{err:?}"
-    );
-    let backend = caldav::CalDavBackend::new(
-        &acct,
-        AccountAdmission::isolated(AdmissionBudget::new(5).unwrap(), zone),
-    );
-    let cursor = backend.stored_cursor_for_test("tok-prev");
     let page = backend.list_events(from, to, &cursor).await.unwrap();
-    assert_eq!(page.events().len(), 2);
-    assert_eq!(page.deleted().len(), 3);
-    assert_eq!(
-        page.sync_token(),
-        caldav::scope_token(&acct.calendar_ids, zone_name, "tok-next")
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].0, "REPORT");
+    assert!(requests[0].1.contains("<d:sync-collection"));
+    assert!(
+        requests[0]
+            .1
+            .contains("<d:sync-token>tok-prev</d:sync-token>")
     );
+    assert_eq!(requests[1].0, "REPORT");
+    assert!(requests[1].1.contains("<c:calendar-query"));
+    assert_eq!(page.mode(), PageMode::Snapshot);
+    assert_eq!(page.events().len(), 2);
+    assert!(page.deleted().is_empty());
+    assert!(page.sync_token().is_empty());
+    drop(requests);
     server.abort();
 }
 
 #[tokio::test]
-async fn caldav_many_deletions_are_refused_at_the_cap() {
-    use thegn_core::calendar::AdmissionLimit;
+async fn caldav_many_deletions_trigger_snapshot_fallback() {
     let zone = thegn_core::calendar::Tz::UTC;
-    let (address, _hits, server) = serve_fixed(
-        axum::http::StatusCode::MULTI_STATUS,
-        "application/xml",
+    let (address, requests, server) = serve_caldav_delta_then_snapshot(
         multistatus(0, 5_000),
+        multistatus(0, 0).replace("<d:sync-token>tok-next</d:sync-token>", ""),
     )
     .await;
     let acct = CalendarAccount {
@@ -2645,11 +2698,21 @@ async fn caldav_many_deletions_are_refused_at_the_cap() {
         AccountAdmission::isolated(AdmissionBudget::new(100).unwrap(), zone),
     );
     let cursor = backend.stored_cursor_for_test("tok-prev");
-    let err = backend.list_events(from, to, &cursor).await.unwrap_err();
+    let page = backend.list_events(from, to, &cursor).await.unwrap();
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].0, "REPORT");
+    assert!(requests[0].1.contains("<d:sync-collection"));
     assert!(
-        is_admission(&err, AdmissionLimit::AccountRecords),
-        "{err:?}"
+        requests[0]
+            .1
+            .contains("<d:sync-token>tok-prev</d:sync-token>")
     );
+    assert_eq!(requests[1].0, "REPORT");
+    assert!(requests[1].1.contains("<c:calendar-query"));
+    assert_eq!(page.mode(), PageMode::Snapshot);
+    assert!(page.deleted().is_empty());
+    drop(requests);
     server.abort();
 }
 
