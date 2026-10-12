@@ -295,7 +295,7 @@ pub fn synth_dir_script(packages: &[String]) -> String {
         "{prelude}[ -r \"$HOME/.nix-profile/etc/profile.d/nix.sh\" ] && . \"$HOME/.nix-profile/etc/profile.d/nix.sh\" 2>/dev/null || true; \
          [ -r /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh ] && . /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh 2>/dev/null || true; \
          export PATH=\"$HOME/.nix-profile/bin:/nix/var/nix/profiles/default/bin:$PATH\"; \
-         fail() {{ echo "$1"; echo "$1" >&2; exit 1; }}; \
+         fail() {{ echo \"$1\"; echo \"$1\" >&2; exit 1; }}; \
          d=\"{dir}\"; digest=\"{digest}\"; \
          [ ! -L \"$HOME/.thegn\" ] && [ ! -L \"$HOME/.thegn/synth\" ] && [ ! -L \"$d\" ] || fail 'thegn-synth: symlinked cache path'; \
          mkdir -p \"$d\" || fail 'thegn-synth: mkdir failed'; \
