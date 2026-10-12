@@ -609,18 +609,21 @@ mod tests {
         assert_eq!(kit_theme(&Palette::default()), Theme::prism());
     }
 
-    /// THE-501: every catalog preset must resolve in tg-kit's standalone
-    /// loader to exactly the host's palette (Light's paper-safe hues
-    /// included), and a newly added preset is covered automatically because
-    /// the table is `PRESETS` itself.
+    /// THE-501: compare tg-kit's loader against the real host Config path for
+    /// every built-in, including override combinations that affect derived
+    /// palette tokens and accent/focus handling.
     #[test]
     fn standalone_loader_matches_host_for_every_preset() {
         use tg_kit::theme::ThemeOutcome;
         for name in thegn_core::theme::PRESETS {
-            let mut p = thegn_core::theme::preset(name).expect("catalog preset");
-            thegn_core::theme::extend_palette(&mut p);
-            let load = Theme::from_config_str(&format!("[theme]\npreset = \"{name}\"\n"));
-            assert_eq!(load.theme, kit_theme(&p), "preset {name} drifted");
+            let plain = format!("[theme]\npreset = \"{name}\"\n");
+            let host: thegn_core::config::Config = toml::from_str(&plain).unwrap();
+            let load = Theme::from_config_str(&plain);
+            assert_eq!(
+                load.theme,
+                kit_theme(&host.palette()),
+                "preset {name} drifted"
+            );
             assert!(load.is_faithful(), "preset {name}: {:?}", load);
             let want = if *name == "prism" {
                 ThemeOutcome::Prism
@@ -628,6 +631,21 @@ mod tests {
                 ThemeOutcome::Preset((*name).to_string())
             };
             assert_eq!(load.outcome, want);
+
+            let overridden = format!(
+                "[theme]\npreset = \"{name}\"\naccent = \"#ff0000\"\n[theme.colors]\nbg0 = \"#010203\"\n"
+            );
+            let host: thegn_core::config::Config = toml::from_str(&overridden).unwrap();
+            let load = Theme::from_config_str(&overridden);
+            assert_eq!(
+                load.theme,
+                kit_theme(&host.palette()),
+                "preset {name} with bg0/accent overrides drifted"
+            );
+            assert_eq!(load.theme.bg0, (1, 2, 3), "bg0 override for {name}");
+            assert_eq!(load.theme.accent, (255, 0, 0), "accent override for {name}");
+            assert_eq!(load.theme.focus, kit_theme(&host.palette()).focus);
+            assert!(load.is_faithful(), "overridden preset {name}: {:?}", load);
         }
         let light = Theme::from_config_str("[theme]\npreset = \"light\"\n").theme;
         assert_ne!(

@@ -193,8 +193,9 @@ impl Theme {
     }
 
     /// Load a theme from an explicit config file. The read is bounded
-    /// ([`MAX_CONFIG_BYTES`]) and only regular files are read (a FIFO or
-    /// device is refused without being opened, so this cannot block).
+    /// ([`MAX_CONFIG_BYTES`]) and only regular files are read. A FIFO or
+    /// device present at the initial metadata check is refused; a path swapped
+    /// to a FIFO between that check and `open` can still block.
     pub fn load_from_path(path: &std::path::Path) -> ThemeLoad {
         match read_bounded(path) {
             Ok(text) => Self::from_config_str(&text),
@@ -215,14 +216,20 @@ impl Theme {
             }
         };
         let mut issues = Vec::new();
-        let preset = doc.theme.preset.as_deref().map(str::trim).unwrap_or("");
+        let preset = doc.theme.preset.as_deref().unwrap_or("");
         let (mut theme, outcome) = if preset.is_empty() || preset == "prism" {
-            (Theme::prism(), ThemeOutcome::Prism)
-        } else if let Some(t) = resolve_preset(preset) {
+            (
+                resolve_preset_with_overrides("prism", &doc.theme).unwrap_or_else(Theme::prism),
+                ThemeOutcome::Prism,
+            )
+        } else if let Some(t) = resolve_preset_with_overrides(preset, &doc.theme) {
             (t, ThemeOutcome::Preset(preset.to_string()))
         } else {
             issues.push(ThemeIssue::UnresolvedPreset(preset.to_string()));
-            (Theme::prism(), ThemeOutcome::Prism)
+            (
+                unresolved_preset_fallback(preset, &doc.theme),
+                ThemeOutcome::Prism,
+            )
         };
         theme.apply(&doc.theme, &mut issues);
         ThemeLoad {
@@ -251,14 +258,12 @@ impl Theme {
                 }
             }
         }
-        // accent recolors both the accent and (by thegn default) the focus.
         // The host never lets the default accent/focus clobber a preset's own.
         if let Some(raw) = t.accent.as_deref() {
             match parse_hex(raw) {
                 Some(rgb) => {
                     if !DEFAULTISH_ACCENTS.contains(&raw) {
                         self.accent = rgb;
-                        self.focus = rgb;
                     }
                 }
                 None => issues.push(ThemeIssue::InvalidColor {
@@ -354,7 +359,7 @@ pub enum ThemeLoadError {
     Absent,
     /// Exists but could not be opened/read.
     Unreadable(String),
-    /// Not a regular file (directory, FIFO, device, ...); never opened.
+    /// Not a regular file (directory, FIFO, device, ...).
     NotRegular,
     /// Larger than [`MAX_CONFIG_BYTES`].
     Oversize,
@@ -379,8 +384,8 @@ pub enum ThemeIssue {
 fn read_bounded(path: &std::path::Path) -> Result<String, ThemeLoadError> {
     use std::io::Read;
     let unreadable = |e: std::io::Error| ThemeLoadError::Unreadable(e.to_string());
-    // `metadata` follows symlinks; a FIFO is rejected here, before `open`
-    // could block on it.
+    // `metadata` follows symlinks; an existing FIFO is rejected before `open`
+    // could block. A concurrent path swap remains possible.
     let meta = match std::fs::metadata(path) {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(ThemeLoadError::Absent),
@@ -393,6 +398,9 @@ fn read_bounded(path: &std::path::Path) -> Result<String, ThemeLoadError> {
         return Err(ThemeLoadError::Oversize);
     }
     let file = std::fs::File::open(path).map_err(unreadable)?;
+    if !file.metadata().map_err(unreadable)?.is_file() {
+        return Err(ThemeLoadError::NotRegular);
+    }
     let mut bytes = Vec::new();
     // The file may grow after the stat: cap the read itself, one byte over.
     file.take(MAX_CONFIG_BYTES + 1)
@@ -404,13 +412,52 @@ fn read_bounded(path: &std::path::Path) -> Result<String, ThemeLoadError> {
     String::from_utf8(bytes).map_err(|_| ThemeLoadError::InvalidUtf8)
 }
 
-/// Resolve a non-prism preset name through the host's catalog. Without the
-/// `host-presets` feature the catalog is not linked and this is `None`.
+/// Resolve a built-in preset through the host's catalog and resolver. Without
+/// `host-presets` the catalog is not linked, so this returns `None`.
 #[cfg(feature = "host-presets")]
-fn resolve_preset(name: &str) -> Option<Theme> {
-    let mut p = thegn_core::theme::preset(name)?;
-    thegn_core::theme::extend_palette(&mut p);
-    Some(Theme::from_fragments(|f| match f {
+fn resolve_preset_with_overrides(name: &str, section: &ThemeSection) -> Option<Theme> {
+    let name = if name.is_empty() { "prism" } else { name };
+    thegn_core::theme::preset(name)?;
+    Some(theme_with_host_overrides(name, section))
+}
+
+#[cfg(feature = "host-presets")]
+fn unresolved_preset_fallback(name: &str, section: &ThemeSection) -> Theme {
+    theme_with_host_overrides(name, section)
+}
+
+#[cfg(feature = "host-presets")]
+fn theme_with_host_overrides(name: &str, section: &ThemeSection) -> Theme {
+    let colors = thegn_core::config::ThemeColors {
+        bg0: section.colors.bg0.clone(),
+        bg1: section.colors.bg1.clone(),
+        panel: section.colors.panel.clone(),
+        panel2: section.colors.panel2.clone(),
+        raise: section.colors.raise.clone(),
+        border: section.colors.border.clone(),
+        text: section.colors.text.clone(),
+        dim: section.colors.dim.clone(),
+        faint: section.colors.faint.clone(),
+        ghost: section.colors.ghost.clone(),
+        ghost2: section.colors.ghost2.clone(),
+        ghost3: section.colors.ghost3.clone(),
+        chip_fg: section.colors.chip_fg.clone(),
+        ..Default::default()
+    };
+    let hues = thegn_core::config::ThemeHues {
+        teal: section.hues.teal.clone(),
+        magenta: section.hues.magenta.clone(),
+        purple: section.hues.purple.clone(),
+        green: section.hues.green.clone(),
+        amber: section.hues.amber.clone(),
+        red: section.hues.red.clone(),
+        blue: section.hues.blue.clone(),
+        orange: section.hues.orange.clone(),
+    };
+    let accent = section.accent.as_deref().unwrap_or("#6ee7d8");
+    let focus = section.focus_border.as_deref().unwrap_or("#6ee7d8");
+    let p = thegn_core::theme_resolve::palette_with_config(name, &colors, &hues, accent, focus);
+    Theme::from_fragments(|f| match f {
         Frag::Bg0 => &p.bg0,
         Frag::Bg1 => &p.bg1,
         Frag::Panel => &p.panel,
@@ -434,12 +481,17 @@ fn resolve_preset(name: &str) -> Option<Theme> {
         Frag::Red => &p.hues.red,
         Frag::Blue => &p.hues.blue,
         Frag::Orange => &p.hues.orange,
-    }))
+    })
 }
 
 #[cfg(not(feature = "host-presets"))]
-fn resolve_preset(_name: &str) -> Option<Theme> {
+fn resolve_preset_with_overrides(_name: &str, _section: &ThemeSection) -> Option<Theme> {
     None
+}
+
+#[cfg(not(feature = "host-presets"))]
+fn unresolved_preset_fallback(_name: &str, _section: &ThemeSection) -> Theme {
+    Theme::prism()
 }
 
 #[cfg(feature = "host-presets")]
@@ -523,16 +575,27 @@ fn config_path() -> Option<std::path::PathBuf> {
     Some(base.join("thegn").join("config.toml"))
 }
 
-/// Parse `#rrggbb` (case-insensitive). `None` if malformed.
+/// Parse the host's `#rgb` / `#rrggbb` rules (case-insensitive, whitespace
+/// trimmed, and a leading `#` required). `None` if malformed.
 fn parse_hex(s: &str) -> Option<Rgb> {
-    let h = s.strip_prefix('#').unwrap_or(s);
-    if h.len() != 6 || !h.is_ascii() {
-        return None;
+    let h = s.trim().strip_prefix('#')?;
+    match h.len() {
+        3 if h.is_ascii() => {
+            let mut chars = h.chars();
+            let channel = |c: char| u8::from_str_radix(&format!("{c}{c}"), 16).ok();
+            Some((
+                channel(chars.next()?)?,
+                channel(chars.next()?)?,
+                channel(chars.next()?)?,
+            ))
+        }
+        6 if h.is_ascii() => Some((
+            u8::from_str_radix(&h[0..2], 16).ok()?,
+            u8::from_str_radix(&h[2..4], 16).ok()?,
+            u8::from_str_radix(&h[4..6], 16).ok()?,
+        )),
+        _ => None,
     }
-    let r = u8::from_str_radix(&h[0..2], 16).ok()?;
-    let g = u8::from_str_radix(&h[2..4], 16).ok()?;
-    let b = u8::from_str_radix(&h[4..6], 16).ok()?;
-    Some((r, g, b))
 }
 
 /// Lerp `hue` toward `base`: `t` is how much of the hue survives.
@@ -596,8 +659,10 @@ mod tests {
     #[test]
     fn parse_hex_round_trips_and_rejects_garbage() {
         assert_eq!(parse_hex("#6ee7d8"), Some((110, 231, 216)));
-        assert_eq!(parse_hex("6EE7D8"), Some((110, 231, 216)));
-        assert_eq!(parse_hex("#fff"), None);
+        assert_eq!(parse_hex("#6EE7D8"), Some((110, 231, 216)));
+        assert_eq!(parse_hex("#fff"), Some((255, 255, 255)));
+        assert_eq!(parse_hex("  #abc  "), Some((170, 187, 204)));
+        assert_eq!(parse_hex("6ee7d8"), None);
         assert_eq!(parse_hex("#zzzzzz"), None);
     }
 
@@ -624,7 +689,7 @@ mod tests {
         };
         t.apply(&section, &mut Vec::new());
         assert_eq!(t.accent, (255, 0, 0));
-        assert_eq!(t.focus, (255, 0, 0)); // accent recolors focus too
+        assert_eq!(t.focus, Theme::prism().focus); // accent does not change focus
         assert_eq!(t.bg0, (1, 2, 3));
     }
 
@@ -635,15 +700,33 @@ mod tests {
         assert_eq!(blend((100, 200, 0), (0, 100, 200), 0.5), (50, 150, 100));
     }
 
-    fn tmp(name: &str) -> std::path::PathBuf {
-        let d = std::env::temp_dir().join(format!("tg-kit-theme-{}-{name}", std::process::id()));
-        std::fs::create_dir_all(&d).unwrap();
-        d
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let d = std::env::temp_dir()
+                .join(format!("tg-kit-theme-{}-{id}-{name}", std::process::id()));
+            std::fs::create_dir_all(&d).unwrap();
+            Self(d)
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 
     #[test]
     fn absent_is_no_config_not_prism_selection() {
-        let l = Theme::load_from_path(&tmp("absent").join("nope.toml"));
+        let dir = TempDir::new("absent");
+        let l = Theme::load_from_path(&dir.path().join("nope.toml"));
         assert_eq!(l.outcome, ThemeOutcome::NoConfig);
         assert!(!l.is_faithful());
         assert_eq!(l.theme, Theme::prism());
@@ -716,14 +799,23 @@ mod tests {
     }
 
     #[test]
+    fn preset_name_is_not_trimmed() {
+        let l = Theme::from_config_str("[theme]\npreset = \" light \"\n");
+        assert_eq!(
+            l.issues,
+            vec![ThemeIssue::UnresolvedPreset(" light ".into())]
+        );
+    }
+
+    #[test]
     fn size_cap_is_exact() {
-        let dir = tmp("cap");
+        let dir = TempDir::new("cap");
         let pad = |n: usize| format!("#{}", "x".repeat(n - 1));
-        let ok = dir.join("ok.toml");
+        let ok = dir.path().join("ok.toml");
         std::fs::write(&ok, pad(MAX_CONFIG_BYTES as usize)).unwrap();
         // exactly at the cap is read (and is valid TOML: a comment)
         assert_eq!(Theme::load_from_path(&ok).outcome, ThemeOutcome::Prism);
-        let big = dir.join("big.toml");
+        let big = dir.path().join("big.toml");
         std::fs::write(&big, pad(MAX_CONFIG_BYTES as usize + 1)).unwrap();
         assert_eq!(
             Theme::load_from_path(&big).outcome,
@@ -733,8 +825,8 @@ mod tests {
 
     #[test]
     fn invalid_utf8_and_non_regular_are_typed() {
-        let dir = tmp("kinds");
-        let bad = dir.join("bad.toml");
+        let dir = TempDir::new("kinds");
+        let bad = dir.path().join("bad.toml");
         std::fs::write(&bad, [0xff, 0xfe, 0x00]).unwrap();
         assert_eq!(
             Theme::load_from_path(&bad).outcome,
@@ -742,7 +834,7 @@ mod tests {
         );
         // a directory is not a regular file
         assert_eq!(
-            Theme::load_from_path(&dir).outcome,
+            Theme::load_from_path(dir.path()).outcome,
             ThemeOutcome::Failed(ThemeLoadError::NotRegular)
         );
     }
