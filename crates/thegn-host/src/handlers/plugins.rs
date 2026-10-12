@@ -709,39 +709,8 @@ fn apply_message(state: &mut PluginsState, plugin: &str, msg: RpcMessage) -> Plu
                 .map(serde_json::from_value)
                 .unwrap_or_else(|| Ok(Vec::new()));
             match kinds {
-                Ok(kinds) => {
-                    if kinds.len() > MAX_SUBSCRIPTIONS_PER_PLUGIN {
-                        Err(RpcError::new(
-                            RpcErrorCode::RateLimited,
-                            format!(
-                                "subscription list exceeds {MAX_SUBSCRIPTIONS_PER_PLUGIN} events"
-                            ),
-                        ))
-                    } else {
-                        let mut r = Ok(serde_json::Value::Null);
-                        for k in kinds {
-                            if !entry
-                                .runtime
-                                .subscriptions()
-                                .contains(&(pid.clone(), k.clone()))
-                                && entry.runtime.subscriptions().len()
-                                    >= MAX_SUBSCRIPTIONS_PER_PLUGIN
-                            {
-                                r = Err(RpcError::new(
-                                    RpcErrorCode::RateLimited,
-                                    format!(
-                                        "plugin subscription limit is {MAX_SUBSCRIPTIONS_PER_PLUGIN}"
-                                    ),
-                                ));
-                                break;
-                            }
-                            if let Err(e) = entry.runtime.subscribe(pid.clone(), k) {
-                                r = Err(rpc_error_of(e));
-                            }
-                        }
-                        r
-                    }
-                }
+                Ok(kinds) => subscribe_kinds(&mut entry.runtime, pid, kinds)
+                    .map(|()| serde_json::Value::Null),
                 Err(e) => Err(RpcError::new(
                     RpcErrorCode::Invalid,
                     format!("bad events list: {e}"),
@@ -843,6 +812,35 @@ fn apply_message(state: &mut PluginsState, plugin: &str, msg: RpcMessage) -> Plu
         tracing::debug!(target: "thegn::plugin", plugin = %plugin, verb = verb.method_name(), error = %e.message, "verb failed");
     }
     damage
+}
+
+fn subscribe_kinds(
+    runtime: &mut PluginRuntime,
+    plugin: PluginId,
+    kinds: Vec<EventKind>,
+) -> Result<(), RpcError> {
+    if kinds.len() > MAX_SUBSCRIPTIONS_PER_PLUGIN {
+        return Err(RpcError::new(
+            RpcErrorCode::RateLimited,
+            format!("subscription list exceeds {MAX_SUBSCRIPTIONS_PER_PLUGIN} events"),
+        ));
+    }
+    for kind in kinds {
+        if !runtime
+            .subscriptions()
+            .contains(&(plugin.clone(), kind.clone()))
+            && runtime.subscriptions().len() >= MAX_SUBSCRIPTIONS_PER_PLUGIN
+        {
+            return Err(RpcError::new(
+                RpcErrorCode::RateLimited,
+                format!("plugin subscription limit is {MAX_SUBSCRIPTIONS_PER_PLUGIN}"),
+            ));
+        }
+        runtime
+            .subscribe(plugin.clone(), kind)
+            .map_err(rpc_error_of)?;
+    }
+    Ok(())
 }
 
 /// `host.call`: scope-check on the loop, dispatch on the dispatcher thread,
@@ -1304,21 +1302,33 @@ mod tests {
     fn subscribe_verb_caps_custom_kinds_per_plugin() {
         let mut state = state_with(vec![seg_spec("p")]);
         let mut model = FrameModel::default();
-        let events = (0..100)
-            .map(|i| serde_json::to_value(EventKind::Custom(format!("custom-{i}"))).unwrap())
-            .collect::<Vec<_>>();
-        drain_one(
-            &mut state,
-            &mut model,
-            PluginMsg::Event {
-                plugin: "p".into(),
-                event: SessionEvent::Message(msg(
-                    "subscribe",
-                    serde_json::json!({ "events": events }),
-                )),
-            },
+        for start in [0, 40] {
+            let events = (start..start + 40)
+                .map(|i| serde_json::to_value(EventKind::Custom(format!("custom-{i}"))).unwrap())
+                .collect::<Vec<_>>();
+            drain_one(
+                &mut state,
+                &mut model,
+                PluginMsg::Event {
+                    plugin: "p".into(),
+                    event: SessionEvent::Message(msg(
+                        "subscribe",
+                        serde_json::json!({ "events": events }),
+                    )),
+                },
+            );
+        }
+        assert_eq!(
+            state.plugins["p"].runtime.subscriptions().len(),
+            MAX_SUBSCRIPTIONS_PER_PLUGIN
         );
-        assert!(state.plugins["p"].runtime.subscriptions().len() <= MAX_SUBSCRIPTIONS_PER_PLUGIN);
+
+        subscribe_kinds(
+            &mut state.plugins.get_mut("p").unwrap().runtime,
+            PluginId::new("p"),
+            vec![EventKind::Custom("custom-0".into())],
+        )
+        .expect("an existing subscription is accepted at the cap");
     }
 
     fn msg(method: &str, params: serde_json::Value) -> RpcMessage {
