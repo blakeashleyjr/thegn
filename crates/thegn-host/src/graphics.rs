@@ -16,6 +16,17 @@ const ST: &[u8] = b"\x1b\\";
 /// Max base64 payload per kitty chunk (protocol limit is 4096).
 const CHUNK: usize = 4096;
 
+/// Reserved outer-terminal image ID for first-party preview graphics.
+/// The corner relay owns the immediately following bounded ID block.
+pub const PREVIEW_IMAGE_ID: u32 = crate::kitty_relay::CORNER_ID_BASE - 1;
+
+const _: () = assert!(
+    PREVIEW_IMAGE_ID != 0
+        && (PREVIEW_IMAGE_ID < crate::kitty_relay::CORNER_ID_BASE
+            || PREVIEW_IMAGE_ID
+                >= crate::kitty_relay::CORNER_ID_BASE + crate::kitty_relay::CORNER_IDS as u32)
+);
+
 /// A placed image: where (0-based screen cell origin) and how big (in cells) to
 /// draw the raster, so kitty scales the pixels to the preview rect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,7 +78,7 @@ pub fn kitty_image(
         if i == 0 {
             // First chunk carries the full control set.
             let ctrl = format!(
-                "a=T,f=32,s={px_w},v={px_h},c={},r={},C=1,q=2,m={}",
+                "a=T,f=32,s={px_w},v={px_h},c={},r={},i={PREVIEW_IMAGE_ID},C=1,q=2,m={}",
                 place.cols,
                 place.rows,
                 u8::from(!last)
@@ -94,10 +105,10 @@ pub enum RasterError {
     LengthMismatch { expected: usize, actual: usize },
 }
 
-/// Delete all first-party images from the outer terminal (on dismiss / switch /
-/// occlusion), mirroring [`crate::kitty_relay::delete_all`].
-pub fn delete_all() -> &'static [u8] {
-    b"\x1b_Ga=d\x1b\\"
+/// Delete only the first-party preview image from the outer terminal (on
+/// dismiss / switch / occlusion), leaving corner-relay images intact.
+pub fn delete_preview() -> Vec<u8> {
+    format!("\x1b_Ga=d,d=I,i={PREVIEW_IMAGE_ID},q=2;\x1b\\").into_bytes()
 }
 
 /// Standard base64 (padded). Small local encoder — the same reason
@@ -185,7 +196,9 @@ mod tests {
         // Leading CUP to (origin_row+1, origin_col+1) = 4;11H
         assert!(out.starts_with(b"\x1b[4;11H"), "leads with CUP to origin");
         let s = String::from_utf8_lossy(&out);
-        assert!(s.contains("a=T,f=32,s=1,v=1,c=20,r=8,C=1,q=2,m=0"));
+        assert!(s.contains(&format!(
+            "a=T,f=32,s=1,v=1,c=20,r=8,i={PREVIEW_IMAGE_ID},C=1,q=2,m=0"
+        )));
         assert!(out.ends_with(ST), "APC is ST-terminated");
         // exactly one APC (m=0 only, no continuation)
         assert_eq!(s.matches("\x1b_G").count(), 1);
@@ -212,7 +225,13 @@ mod tests {
     }
 
     #[test]
-    fn delete_all_is_the_kitty_delete_apc() {
-        assert_eq!(delete_all(), b"\x1b_Ga=d\x1b\\");
+    fn preview_delete_is_scoped_and_quiet() {
+        assert_eq!(
+            delete_preview(),
+            format!("\x1b_Ga=d,d=I,i={PREVIEW_IMAGE_ID},q=2;\x1b\\").into_bytes()
+        );
+        assert!(!delete_preview().windows(5).any(|w| w == b"a=d\x1b\\"));
+        assert_ne!(delete_preview(), b"\x1b_Ga=d\x1b\\");
+        assert_ne!(PREVIEW_IMAGE_ID, 0);
     }
 }
