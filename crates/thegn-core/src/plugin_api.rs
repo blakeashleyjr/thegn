@@ -2749,6 +2749,11 @@ timeout_secs = 5
                 .notify(plugin.clone(), Alert::new("", "message"))
                 .is_err()
         );
+        assert!(
+            runtime
+                .notify(plugin.clone(), Alert::new("src", "message"))
+                .is_err()
+        );
         for req in [
             IoRequest::network("GET", "https://example.com"),
             IoRequest::run("git", ["status"]),
@@ -2773,6 +2778,7 @@ timeout_secs = 5
                 AuditTargetClass::Surface,
                 AuditTargetClass::State,
                 AuditTargetClass::Unknown,
+                AuditTargetClass::Notify,
                 AuditTargetClass::Network,
                 AuditTargetClass::Run,
                 AuditTargetClass::Io,
