@@ -14,15 +14,33 @@ spawn:
     # The DEFAULT pane route — daemon-backed panes — which every other spec
     # turns off (THEGN_NO_DAEMON=1 in _e2e_env). Per-case runtime dir so the
     # socket is private; the daemon is told to exit 2s after it has nothing
-    # left to do. After thegn exits, any daemon that still carries this
-    # case's runtime dir in its environment is stopped (a real leak otherwise:
-    # detached sessions are kept forever by design), scoped by env so a
-    # developer's own daemon is never touched.
+    # left to do. Stop through the production endpoint resolver on every exit,
+    # including assertion failures and signals.
     set -e
     unset THEGN_NO_DAEMON
     export XDG_RUNTIME_DIR="$XDG_STATE_HOME/run" XDG_CONFIG_HOME="$XDG_STATE_HOME/cfg"
     mkdir -p "$XDG_RUNTIME_DIR" "$XDG_CONFIG_HOME/thegn"
     chmod 700 "$XDG_RUNTIME_DIR"
+    cleanup_daemon() {
+      trap - EXIT HUP INT TERM
+      if [[ -z ${DAEMON_ENDPOINT:-} ]]; then
+        echo "daemon cleanup cannot poll: doctor returned no endpoint" >&2
+        exit 97
+      fi
+      for _ in $(seq 1 50); do
+        stop_output="$(thegn daemon stop 2>&1 || true)"
+        if printf '%s\n' "$stop_output" | grep -q 'no thegn pane daemon is running'; then
+          if [[ ! -S $DAEMON_ENDPOINT ]]; then
+            return 0
+          fi
+        fi
+        sleep 0.1
+      done
+      echo "daemon cleanup timed out or left endpoint $DAEMON_ENDPOINT" >&2
+      exit 97
+    }
+    trap cleanup_daemon EXIT
+    trap 'exit 128' HUP INT TERM
     cfg="$XDG_CONFIG_HOME/thegn/config.toml"
     printf '[sandbox]\nbackend = "none"\n[media]\nenabled = false\n' > "$cfg"
     printf '[daemon]\nidle_exit_secs = 2\n' >> "$cfg"
@@ -33,12 +51,10 @@ spawn:
     export GIT_AUTHOR_DATE=2020-01-01T00:00:00Z GIT_COMMITTER_DATE=2020-01-01T00:00:00Z
     printf 'hello\n' > README.md
     git add -A; git commit -q -m init
-    thegn; code=$?
-    for pid in $(pgrep -f 'thegn daemon' 2>/dev/null); do
-      if tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | grep -qx "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR"; then
-        kill "$pid" 2>/dev/null || true
-      fi
-    done
+    DAEMON_ENDPOINT="$(thegn doctor --json | \
+      sed -n 's/.*"endpoint"[[:space:]]*:[[:space:]]*"\([^\"]*\)".*/\1/p' | head -n 1)"
+    code=0
+    thegn || code=$?
     exit $code
 env:
   XDG_STATE_HOME: "{case_tmp}"
@@ -64,7 +80,7 @@ steps:
   - expect_visible: {regex: "\"worktree\"", timeout_ms: 10000}
   - write: "clear; echo id=$THEGN_SESSION_ID; echo sock=$THEGN_CONTROL_SOCKET\n"
   - expect_visible: {regex: "│id=[0-9a-f]{16}", timeout_ms: 8000}
-  - expect_visible: {regex: "│sock=/.*daemon", timeout_ms: 8000}
+  - expect_visible: {regex: "│sock=/\\S*\\.sock", timeout_ms: 8000}
   - write: "thegn session snapshot --session $THEGN_SESSION_ID --text | grep -q id= && echo SNAP-TEXT-OK\n"
   - expect_visible: {regex: "│SNAP-TEXT-OK", timeout_ms: 15000}
   - key: {key: "q", mods: [ctrl]}
