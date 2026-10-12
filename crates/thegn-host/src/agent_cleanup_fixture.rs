@@ -1,12 +1,12 @@
 //! Private custody of entries in the real cleanup registries. No resource is
 //! created, mounted, synchronized, or torn down by this fixture.
-use super::{projection_registry, provider_sync_registry};
+use super::{ProviderSyncRecord, projection_registry, provider_sync_registry};
 use thegn_core::projection::ProjectionSpec;
 
 pub(crate) struct RegistryCustody {
     path: String,
     projection: Option<ProjectionSpec>,
-    sync: Option<String>,
+    sync: Option<ProviderSyncRecord>,
 }
 impl RegistryCustody {
     pub(crate) fn install(
@@ -27,7 +27,13 @@ impl RegistryCustody {
             projections.insert(path.clone(), projection);
         }
         if let Some(sync) = sync {
-            syncs.insert(path.clone(), sync);
+            syncs.insert(
+                path.clone(),
+                ProviderSyncRecord {
+                    env_name: sync,
+                    in_flight: false,
+                },
+            );
         }
         Self {
             path,
@@ -44,7 +50,11 @@ impl RegistryCustody {
                 .unwrap()
                 .get(path)
                 .map(|spec| format!("{spec:?}")),
-            provider_sync_registry().lock().unwrap().get(path).cloned(),
+            provider_sync_registry()
+                .lock()
+                .unwrap()
+                .get(path)
+                .map(|record| record.env_name.clone()),
         )
     }
 }
