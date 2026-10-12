@@ -18,10 +18,13 @@ pub mod linear;
 pub mod secret;
 
 use futures_util::future::BoxFuture;
+use futures_util::stream::{self, StreamExt};
 use std::sync::Arc;
 use thegn_core::config::{IssueAccount, IssueProviderKind, IssuesConfig, expand_env_ref};
 use thegn_core::issue::{Issue, IssueDetail, IssueDraft, IssueFilter, IssuePatch};
 use thegn_core::seam::{ErrorClass, SeamError};
+
+const MAX_CONCURRENT_ACCOUNTS: usize = 4;
 
 pub use capabilities::IssueCaps;
 
@@ -637,8 +640,9 @@ impl IssueRouter {
         ))
     }
 
-    /// List issues across all accounts, concatenated. A failing account logs
-    /// and contributes nothing rather than failing the whole call.
+    /// List issues across all accounts with bounded concurrent reads, merged
+    /// in configuration order. A failing account logs and contributes nothing
+    /// rather than failing the whole call.
     ///
     /// **Best-effort by design, and deliberately so** — this is the background
     /// fan-out's entry point, where one bad account must not blank the three
@@ -649,16 +653,17 @@ impl IssueRouter {
     /// and report the per-account `Err`s (see `cmd::issue::list_tracker_issues`).
     pub async fn list_issues(&self, filter: &IssueFilter) -> Result<Vec<Issue>, IssueError> {
         let mut all = Vec::new();
-        for b in &self.inner {
-            match b.inner.list_issues(filter).await {
-                Ok(issues) => match issues
-                    .into_iter()
-                    .map(|issue| {
-                        validate_issue_identity(&issue)?;
-                        Ok(issue)
-                    })
-                    .collect::<Result<Vec<_>, IssueError>>()
-                {
+        let results = stream::iter(
+            self.inner
+                .iter()
+                .map(|b| async move { (b, b.inner.list_issues(filter).await) }),
+        )
+        .buffered(MAX_CONCURRENT_ACCOUNTS)
+        .collect::<Vec<_>>()
+        .await;
+        for (b, result) in results {
+            match result {
+                Ok(issues) => match validate_issues(issues) {
                     Ok(mut valid) => all.append(&mut valid),
                     Err(e) => {
                         tracing::warn!(provider = b.inner.provider_id(), error = %e, "issue identity rejected")
@@ -697,27 +702,21 @@ impl IssueRouter {
         Ok(all)
     }
 
-    /// Per-account results, so callers (the cache refresh) can store and diff
-    /// each account under its own `(repo_root, provider, account)` key.
+    /// Per-account results in configuration order, so callers (the cache
+    /// refresh) can store and diff each account under its own
+    /// `(repo_root, provider, account)` key.
     pub async fn list_per_provider(
         &self,
         filter: &IssueFilter,
     ) -> Vec<(String, &str, Result<Vec<Issue>, IssueError>)> {
-        let mut out = Vec::with_capacity(self.inner.len());
-        for b in &self.inner {
+        stream::iter(self.inner.iter().map(|b| async move {
             // Keep PartialList as an error so cache refreshes never persist it as complete.
-            let result = b.inner.list_issues(filter).await.and_then(|issues| {
-                issues
-                    .into_iter()
-                    .map(|issue| {
-                        validate_issue_identity(&issue)?;
-                        Ok(issue)
-                    })
-                    .collect()
-            });
-            out.push((b.account.clone(), b.inner.provider_id(), result));
-        }
-        out
+            let result = b.inner.list_issues(filter).await.and_then(validate_issues);
+            (b.account.clone(), b.inner.provider_id(), result)
+        }))
+        .buffered(MAX_CONCURRENT_ACCOUNTS)
+        .collect::<Vec<_>>()
+        .await
     }
 
     pub async fn get_issue(&self, id: &str) -> Result<IssueDetail, IssueError> {
@@ -788,19 +787,21 @@ impl IssueRouter {
         self.inner.iter().find_map(|b| b.inner.as_kaneo())
     }
 
-    /// Search across all accounts, concatenated.
+    /// Search across all accounts concurrently with bounded reads, merging in
+    /// configuration order.
     pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<Issue>, IssueError> {
         let mut all = Vec::new();
-        for b in &self.inner {
-            match b.inner.search(query, limit).await {
-                Ok(issues) => match issues
-                    .into_iter()
-                    .map(|issue| {
-                        validate_issue_identity(&issue)?;
-                        Ok(issue)
-                    })
-                    .collect::<Result<Vec<_>, IssueError>>()
-                {
+        let results = stream::iter(
+            self.inner
+                .iter()
+                .map(|b| async move { (b, b.inner.search(query, limit).await) }),
+        )
+        .buffered(MAX_CONCURRENT_ACCOUNTS)
+        .collect::<Vec<_>>()
+        .await;
+        for (b, result) in results {
+            match result {
+                Ok(issues) => match validate_issues(issues) {
                     Ok(mut valid) => all.append(&mut valid),
                     Err(e) => {
                         tracing::warn!(provider = b.inner.provider_id(), error = %e, "issue identity rejected")
@@ -813,6 +814,16 @@ impl IssueRouter {
         }
         Ok(all)
     }
+}
+
+fn validate_issues(issues: Vec<Issue>) -> Result<Vec<Issue>, IssueError> {
+    issues
+        .into_iter()
+        .map(|issue| {
+            validate_issue_identity(&issue)?;
+            Ok(issue)
+        })
+        .collect()
 }
 
 fn validate_patch_capabilities(caps: IssueCaps, patch: &IssuePatch) -> Result<(), IssueError> {
@@ -1163,6 +1174,215 @@ mod spec {
         ) -> BoxFuture<'a, Result<Vec<Issue>, IssueError>> {
             Box::pin(async { Err(IssueError::Api("not used".into())) })
         }
+    }
+
+    struct BarrierBackend {
+        barrier: Arc<tokio::sync::Barrier>,
+        notify: Option<Arc<tokio::sync::Notify>>,
+        notify_signal: bool,
+        issue: Issue,
+        delay: std::time::Duration,
+    }
+
+    impl IssueBackend for BarrierBackend {
+        fn provider_id(&self) -> &str {
+            "linear"
+        }
+
+        fn caps(&self) -> IssueCaps {
+            IssueCaps::default()
+        }
+
+        fn list_issues<'a>(
+            &'a self,
+            _filter: &'a IssueFilter,
+        ) -> BoxFuture<'a, Result<Vec<Issue>, IssueError>> {
+            Box::pin(async move {
+                tokio::time::sleep(self.delay).await;
+                if let Some(notify) = &self.notify {
+                    if self.notify_signal {
+                        notify.notify_one();
+                    } else {
+                        notify.notified().await;
+                    }
+                } else {
+                    self.barrier.wait().await;
+                }
+                Ok(vec![self.issue.clone()])
+            })
+        }
+
+        fn get_issue<'a>(&'a self, _id: &'a str) -> BoxFuture<'a, Result<IssueDetail, IssueError>> {
+            Box::pin(async { Err(IssueError::Api("not used".into())) })
+        }
+
+        fn create_issue<'a>(
+            &'a self,
+            _draft: &'a IssueDraft,
+        ) -> BoxFuture<'a, Result<Issue, IssueError>> {
+            Box::pin(async { Err(IssueError::Api("not used".into())) })
+        }
+
+        fn update_issue<'a>(
+            &'a self,
+            _id: &'a str,
+            _patch: &'a IssuePatch,
+        ) -> BoxFuture<'a, Result<Issue, IssueError>> {
+            Box::pin(async { Err(IssueError::Api("not used".into())) })
+        }
+
+        fn search<'a>(
+            &'a self,
+            _query: &'a str,
+            _limit: usize,
+        ) -> BoxFuture<'a, Result<Vec<Issue>, IssueError>> {
+            Box::pin(async move {
+                self.barrier.wait().await;
+                Ok(vec![self.issue.clone()])
+            })
+        }
+    }
+
+    fn barrier_router(
+        barrier: Arc<tokio::sync::Barrier>,
+        delay_first: std::time::Duration,
+    ) -> IssueRouter {
+        let mut router = IssueRouter::from_config(&IssuesConfig::default());
+        for (account, suffix, delay) in [
+            ("A", "1", delay_first),
+            ("B", "2", std::time::Duration::ZERO),
+        ] {
+            let issue = Issue {
+                id: format!("linear:ABC-{suffix}"),
+                number: suffix.into(),
+                provider: "linear".into(),
+                title: account.into(),
+                status: thegn_core::issue::IssueStatus::Todo,
+                priority: thegn_core::issue::IssuePriority::Low,
+                url: format!("https://linear.app/acme/issue/ABC-{suffix}"),
+                ..Default::default()
+            };
+            router
+                .push_backend(
+                    account.into(),
+                    Box::new(BarrierBackend {
+                        barrier: barrier.clone(),
+                        notify: None,
+                        notify_signal: false,
+                        issue,
+                        delay,
+                    }),
+                )
+                .unwrap();
+        }
+        router
+    }
+
+    fn ordering_router() -> IssueRouter {
+        let mut router = IssueRouter::from_config(&IssuesConfig::default());
+        let notify = Arc::new(tokio::sync::Notify::new());
+        for (account, suffix, notify_signal) in [("A", "1", false), ("B", "2", true)] {
+            let issue = Issue {
+                id: format!("linear:ABC-{suffix}"),
+                number: suffix.into(),
+                provider: "linear".into(),
+                title: account.into(),
+                status: thegn_core::issue::IssueStatus::Todo,
+                priority: thegn_core::issue::IssuePriority::Low,
+                url: format!("https://linear.app/acme/issue/ABC-{suffix}"),
+                ..Default::default()
+            };
+            router
+                .push_backend(
+                    account.into(),
+                    Box::new(BarrierBackend {
+                        barrier: Arc::new(tokio::sync::Barrier::new(1)),
+                        notify: Some(notify.clone()),
+                        notify_signal,
+                        issue,
+                        delay: std::time::Duration::ZERO,
+                    }),
+                )
+                .unwrap();
+        }
+        router
+    }
+
+    #[test]
+    fn list_fanout_runs_concurrently_and_per_provider_keeps_config_order() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let filter = IssueFilter::default();
+        let list_router = barrier_router(
+            Arc::new(tokio::sync::Barrier::new(2)),
+            std::time::Duration::ZERO,
+        );
+        let listed = runtime.block_on(tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            list_router.list_issues(&filter),
+        ));
+        assert!(
+            listed.is_ok(),
+            "list calls must overlap to release the barrier"
+        );
+        assert_eq!(listed.unwrap().unwrap().len(), 2);
+
+        let provider_router = barrier_router(
+            Arc::new(tokio::sync::Barrier::new(2)),
+            std::time::Duration::ZERO,
+        );
+        let providers = runtime.block_on(tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            provider_router.list_per_provider(&filter),
+        ));
+        assert!(
+            providers.is_ok(),
+            "per-provider calls must overlap to release the barrier"
+        );
+        assert_eq!(providers.unwrap().len(), 2);
+    }
+
+    #[test]
+    fn per_provider_results_keep_config_order_when_a_later_account_finishes_first() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let router = ordering_router();
+        let providers = runtime.block_on(tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            router.list_per_provider(&IssueFilter::default()),
+        ));
+        assert!(
+            providers.is_ok(),
+            "the later account must run to release the first account"
+        );
+        let providers = providers.unwrap();
+        assert_eq!(providers[0].0, "A");
+        assert_eq!(providers[1].0, "B");
+    }
+
+    #[test]
+    fn search_fanout_runs_concurrently() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let router = barrier_router(
+            Arc::new(tokio::sync::Barrier::new(2)),
+            std::time::Duration::ZERO,
+        );
+        let searched = runtime.block_on(tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            router.search("query", 10),
+        ));
+        assert!(
+            searched.is_ok(),
+            "search calls must overlap to release the barrier"
+        );
+        assert_eq!(searched.unwrap().unwrap().len(), 2);
     }
 
     #[test]
