@@ -2587,7 +2587,6 @@ fn multistatus(events: usize, deletions: usize) -> String {
 async fn caldav_events_and_deletions_share_the_budget() {
     use thegn_core::calendar::AdmissionLimit;
     let zone = thegn_core::calendar::Tz::UTC;
-    let zone_name = zone.name();
     let (address, _hits, server) = serve_fixed(
         axum::http::StatusCode::MULTI_STATUS,
         "application/xml",
@@ -2600,32 +2599,22 @@ async fn caldav_events_and_deletions_share_the_budget() {
         ..account("dav", CalendarProviderKind::CalDav)
     };
     let (from, to) = window();
-    let err = caldav::CalDavBackend::new(
+    let backend = caldav::CalDavBackend::new(
         &acct,
         AccountAdmission::isolated(AdmissionBudget::new(4).unwrap(), zone),
-    )
-    .list_events(
-        from,
-        to,
-        &caldav::scope_token(&acct.calendar_ids, zone_name, "tok-prev"),
-    )
-    .await
-    .unwrap_err();
+    );
+    let cursor = backend.stored_cursor_for_test("tok-prev");
+    let err = backend.list_events(from, to, &cursor).await.unwrap_err();
     assert!(
         is_admission(&err, AdmissionLimit::AccountRecords),
         "{err:?}"
     );
-    let page = caldav::CalDavBackend::new(
+    let backend = caldav::CalDavBackend::new(
         &acct,
         AccountAdmission::isolated(AdmissionBudget::new(5).unwrap(), zone),
-    )
-    .list_events(
-        from,
-        to,
-        &caldav::scope_token(&acct.calendar_ids, zone_name, "tok-prev"),
-    )
-    .await
-    .unwrap();
+    );
+    let cursor = backend.stored_cursor_for_test("tok-prev");
+    let page = backend.list_events(from, to, &cursor).await.unwrap();
     assert_eq!(page.events().len(), 2);
     assert_eq!(page.deleted().len(), 3);
     assert_eq!(
@@ -2639,7 +2628,6 @@ async fn caldav_events_and_deletions_share_the_budget() {
 async fn caldav_many_deletions_are_refused_at_the_cap() {
     use thegn_core::calendar::AdmissionLimit;
     let zone = thegn_core::calendar::Tz::UTC;
-    let zone_name = zone.name();
     let (address, _hits, server) = serve_fixed(
         axum::http::StatusCode::MULTI_STATUS,
         "application/xml",
@@ -2652,17 +2640,12 @@ async fn caldav_many_deletions_are_refused_at_the_cap() {
         ..account("dav", CalendarProviderKind::CalDav)
     };
     let (from, to) = window();
-    let err = caldav::CalDavBackend::new(
+    let backend = caldav::CalDavBackend::new(
         &acct,
         AccountAdmission::isolated(AdmissionBudget::new(100).unwrap(), zone),
-    )
-    .list_events(
-        from,
-        to,
-        &caldav::scope_token(&acct.calendar_ids, zone_name, "tok-prev"),
-    )
-    .await
-    .unwrap_err();
+    );
+    let cursor = backend.stored_cursor_for_test("tok-prev");
+    let err = backend.list_events(from, to, &cursor).await.unwrap_err();
     assert!(
         is_admission(&err, AdmissionLimit::AccountRecords),
         "{err:?}"
