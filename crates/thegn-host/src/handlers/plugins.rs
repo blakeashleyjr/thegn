@@ -531,6 +531,11 @@ fn rpc_error_of(e: PluginApiError) -> RpcError {
         PluginApiError::UnsupportedExtensionPoint(_) | PluginApiError::UnknownExtensionPoint(_) => {
             RpcErrorCode::Invalid
         }
+        PluginApiError::UndeclaredContribution(_)
+        | PluginApiError::ContributionTypeMismatch { .. }
+        | PluginApiError::ContributionChanged(_)
+        | PluginApiError::DuplicateRegistration(_) => RpcErrorCode::Invalid,
+        PluginApiError::UnsupportedIo(_) => RpcErrorCode::Unsupported,
         PluginApiError::IncompatibleApi { .. } => RpcErrorCode::Other,
     };
     RpcError::new(code, e.to_string())
@@ -611,10 +616,16 @@ fn apply_message(state: &mut PluginsState, plugin: &str, msg: RpcMessage) -> Plu
     let mut damage = PluginDamage::None;
     let outcome: Result<serde_json::Value, RpcError> = match verb {
         HostVerb::Register => parse_register_contribution(params).and_then(|c| {
-            entry
-                .runtime
-                .register(pid.clone(), c.clone())
-                .map_err(rpc_error_of)?;
+            if let Err(error) = entry.runtime.register(pid.clone(), c.clone()) {
+                tracing::warn!(
+                    target: "thegn::plugin",
+                    plugin = %plugin,
+                    contribution = %c.id.as_str(),
+                    error = %error,
+                    "plugin contribution registration rejected"
+                );
+                return Err(rpc_error_of(error));
+            }
             if !entry.contributions.iter().any(|x| x.id == c.id) {
                 if c.extension_point == ExtensionPoint::StatusBarSegment {
                     damage.merge(PluginDamage::Structural);
@@ -1280,15 +1291,10 @@ mod tests {
     }
 
     #[test]
-    fn register_adds_a_contribution_once() {
+    fn register_accepts_the_negotiated_contribution_and_rejects_a_duplicate() {
         let mut state = state_with(vec![seg_spec("p")]);
         let mut model = FrameModel::default();
-        let c = contribution(
-            "extra",
-            ExtensionPoint::StatusBarSegment,
-            "p/extra",
-            "Extra",
-        );
+        let c = state.plugins["p"].contributions[0].clone();
         for _ in 0..2 {
             drain_one(
                 &mut state,
@@ -1302,7 +1308,15 @@ mod tests {
                 },
             );
         }
-        assert_eq!(state.plugins["p"].contributions.len(), 2);
+        assert_eq!(state.plugins["p"].contributions.len(), 1);
+        assert_eq!(state.plugins["p"].runtime.audit_log().len(), 1);
+    }
+
+    #[test]
+    fn unsupported_io_uses_the_wire_unsupported_error_code() {
+        let error = rpc_error_of(PluginApiError::UnsupportedIo("network".into()));
+        assert_eq!(error.code, RpcErrorCode::Unsupported);
+        assert!(error.message.contains("network"));
     }
 
     #[test]
