@@ -15,12 +15,12 @@
 use anyhow::{Context, Result, anyhow, bail};
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::mpsc::{Receiver, Sender, TryRecvError, TrySendError, channel, sync_channel};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -227,6 +227,118 @@ struct FsEventNote {
     watch_id: u64,
     paths: Vec<String>,
     kind: String,
+}
+
+const FS_EVENT_WINDOW: Duration = Duration::from_millis(500);
+const MAX_FS_EVENT_PATHS: usize = 256;
+const MAX_FS_EVENT_PATH_BYTES: usize = 64 * 1024;
+
+#[derive(Default)]
+struct PendingFsEvent {
+    paths: BTreeSet<String>,
+    path_bytes: usize,
+    kind: String,
+    mixed_kinds: bool,
+}
+
+/// Leading + trailing edge coalescer for one filesystem watcher.
+///
+/// The first event is emitted immediately. Events within its 500 ms window are
+/// merged into one trailing note, with bounded path storage.
+#[derive(Default)]
+struct FsCoalescer {
+    last_emit: Option<Instant>,
+    pending: Option<PendingFsEvent>,
+}
+
+impl FsCoalescer {
+    fn observe(&mut self, now: Instant, kind: &str, paths: &[String]) -> Option<FsEventNote> {
+        if self
+            .last_emit
+            .is_none_or(|last| now.saturating_duration_since(last) >= FS_EVENT_WINDOW)
+        {
+            if self.pending.is_some() {
+                self.merge_pending(kind, paths);
+                return self.flush_due(now);
+            }
+            self.last_emit = Some(now);
+            return Some(FsEventNote {
+                watch_id: 0,
+                paths: bounded_unique_paths(paths),
+                kind: kind.to_owned(),
+            });
+        }
+
+        self.merge_pending(kind, paths);
+        None
+    }
+
+    fn merge_pending(&mut self, kind: &str, paths: &[String]) {
+        let pending = self.pending.get_or_insert_with(|| PendingFsEvent {
+            kind: kind.to_owned(),
+            ..PendingFsEvent::default()
+        });
+        if pending.kind != kind {
+            pending.mixed_kinds = true;
+            pending.kind = "modify".to_owned();
+        }
+        for path in paths {
+            if pending.paths.contains(path) {
+                continue;
+            }
+            let added_bytes = path.len();
+            if pending.paths.len() >= MAX_FS_EVENT_PATHS
+                || pending.path_bytes.saturating_add(added_bytes) > MAX_FS_EVENT_PATH_BYTES
+            {
+                continue;
+            }
+            pending.path_bytes += added_bytes;
+            pending.paths.insert(path.clone());
+        }
+    }
+
+    fn flush_due(&mut self, now: Instant) -> Option<FsEventNote> {
+        let deadline = self.next_deadline()?;
+        if now < deadline {
+            return None;
+        }
+        let pending = self.pending.take()?;
+        self.last_emit = Some(now);
+        Some(FsEventNote {
+            watch_id: 0,
+            paths: pending.paths.into_iter().collect(),
+            kind: if pending.mixed_kinds {
+                "modify".to_owned()
+            } else {
+                pending.kind
+            },
+        })
+    }
+
+    fn next_deadline(&self) -> Option<Instant> {
+        self.pending
+            .as_ref()
+            .and(self.last_emit)
+            .and_then(|last| last.checked_add(FS_EVENT_WINDOW))
+    }
+}
+
+fn bounded_unique_paths(paths: &[String]) -> Vec<String> {
+    let mut unique = BTreeSet::new();
+    let mut bytes: usize = 0;
+    for path in paths {
+        if unique.contains(path) {
+            continue;
+        }
+        if unique.len() >= MAX_FS_EVENT_PATHS
+            || bytes.saturating_add(path.len()) > MAX_FS_EVENT_PATH_BYTES
+        {
+            continue;
+        }
+        bytes += path.len();
+        unique.insert(path.clone());
+    }
+    unique.into_iter().collect()
 }
 
 // --- streaming process channel (proc.spawn) -------------------------------
@@ -1641,9 +1753,15 @@ fn start_watch(
     watch_id: u64,
     writer: SharedWriter,
 ) -> notify::Result<RecommendedWatcher> {
-    let mut last = Instant::now()
-        .checked_sub(Duration::from_secs(1))
-        .unwrap_or_else(Instant::now);
+    let coalescer = Arc::new(Mutex::new(FsCoalescer::default()));
+    let (nudge_tx, nudge_rx) = sync_channel(1);
+    let flush_coalescer = coalescer.clone();
+    let flush_writer = writer.clone();
+    std::thread::Builder::new()
+        .name("bridge-fs-flush".into())
+        .spawn(move || flush_watch_events(flush_coalescer, flush_writer, nudge_rx, watch_id))
+        .map_err(notify::Error::io)?;
+
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
         let Ok(ev) = res else {
             return;
@@ -1660,18 +1778,78 @@ fn start_watch(
             .filter(|p| relevant_fs_path(p))
             .map(|p| p.to_string_lossy().into_owned())
             .collect();
-        if paths.is_empty() || last.elapsed() < Duration::from_millis(500) {
+        if paths.is_empty() {
             return;
         }
-        last = Instant::now();
-        let note = serde_json::json!({
-            "method": "fs.event",
-            "params": FsEventNote { watch_id, paths, kind: kind.to_string() },
-        });
-        write_frame(&writer, &note);
+        let now = Instant::now();
+        let (emit, pending) = {
+            let mut coalescer = coalescer.lock().unwrap_or_else(PoisonError::into_inner);
+            let emit = coalescer.flush_due(now);
+            let pending = coalescer.observe(now, kind, &paths);
+            (emit, pending)
+        };
+        if let Some(note) = emit {
+            write_fs_event(&writer, watch_id, note);
+        }
+        if let Some(note) = pending {
+            write_fs_event(&writer, watch_id, note);
+        } else {
+            match nudge_tx.try_send(()) {
+                Ok(()) | Err(TrySendError::Full(())) => {}
+                Err(TrySendError::Disconnected(())) => {
+                    tracing::debug!(target: "thegn::bridge", "filesystem event flusher has exited");
+                }
+            }
+        }
     })?;
     watcher.watch(Path::new(path), RecursiveMode::Recursive)?;
     Ok(watcher)
+}
+
+fn flush_watch_events(
+    coalescer: Arc<Mutex<FsCoalescer>>,
+    writer: SharedWriter,
+    nudge_rx: Receiver<()>,
+    watch_id: u64,
+) {
+    loop {
+        let deadline = coalescer
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .next_deadline();
+        let received = match deadline {
+            Some(deadline) => {
+                nudge_rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            }
+            None => nudge_rx
+                .recv()
+                .map_err(|_| std::sync::mpsc::RecvTimeoutError::Disconnected),
+        };
+        match received {
+            Ok(()) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                match nudge_rx.try_recv() {
+                    Ok(()) => continue,
+                    Err(TryRecvError::Disconnected) => return,
+                    Err(TryRecvError::Empty) => {}
+                }
+                let note = coalescer
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .flush_due(Instant::now());
+                if let Some(note) = note {
+                    write_fs_event(&writer, watch_id, note);
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+        }
+    }
+}
+
+fn write_fs_event(writer: &SharedWriter, watch_id: u64, mut note: FsEventNote) {
+    note.watch_id = watch_id;
+    let frame = serde_json::json!({ "method": "fs.event", "params": note });
+    write_frame(writer, &frame);
 }
 
 /// Whether a changed path should refresh the chrome — real worktree edits, plus
@@ -1916,6 +2094,93 @@ fn drain_capture(mut reader: impl Read, captured: Arc<Mutex<CapturedOutput>>) {
 mod tests {
     use super::*;
     use std::net::{TcpListener, TcpStream};
+
+    #[test]
+    fn fs_coalescer_emits_leading_and_trailing_notes_with_bounded_paths() {
+        let t0 = Instant::now();
+        let mut coalescer = FsCoalescer::default();
+        let first = coalescer.observe(t0, "create", &["a".into()]).unwrap();
+        assert_eq!(first.paths, vec!["a"]);
+        assert_eq!(first.kind, "create");
+        assert!(
+            coalescer
+                .observe(t0 + Duration::from_millis(100), "create", &["b".into()])
+                .is_none()
+        );
+        assert!(
+            coalescer
+                .flush_due(t0 + Duration::from_millis(200))
+                .is_none()
+        );
+        let trailing = coalescer.flush_due(t0 + FS_EVENT_WINDOW).unwrap();
+        assert_eq!(trailing.paths, vec!["b"]);
+        assert_eq!(trailing.kind, "create");
+        assert!(coalescer.flush_due(t0 + FS_EVENT_WINDOW).is_none());
+
+        let mut coalescer = FsCoalescer::default();
+        assert!(coalescer.observe(t0, "create", &["start".into()]).is_some());
+        let many_paths: Vec<String> = (0..MAX_FS_EVENT_PATHS + 10)
+            .map(|index| format!("path-{index}"))
+            .collect();
+        assert!(
+            coalescer
+                .observe(t0 + Duration::from_millis(10), "modify", &many_paths)
+                .is_none()
+        );
+        assert!(
+            coalescer
+                .observe(
+                    t0 + Duration::from_millis(20),
+                    "modify",
+                    &["path-0".into(), "path-0".into()],
+                )
+                .is_none()
+        );
+        assert!(
+            coalescer
+                .observe(t0 + Duration::from_millis(30), "remove", &["path-1".into()])
+                .is_none()
+        );
+        let trailing = coalescer.flush_due(t0 + FS_EVENT_WINDOW).unwrap();
+        assert!(trailing.paths.len() <= MAX_FS_EVENT_PATHS);
+        assert_eq!(
+            trailing.paths.iter().collect::<BTreeSet<_>>().len(),
+            trailing.paths.len()
+        );
+        assert!(trailing.paths.iter().map(String::len).sum::<usize>() <= MAX_FS_EVENT_PATH_BYTES);
+        assert_eq!(trailing.kind, "modify");
+
+        let mut coalescer = FsCoalescer::default();
+        assert!(coalescer.observe(t0, "modify", &["start".into()]).is_some());
+        let long_paths: Vec<String> = (0..MAX_FS_EVENT_PATHS)
+            .map(|index| format!("{index}-{}", "x".repeat(300)))
+            .collect();
+        assert!(
+            coalescer
+                .observe(t0 + Duration::from_millis(10), "modify", &long_paths)
+                .is_none()
+        );
+        let trailing = coalescer.flush_due(t0 + FS_EVENT_WINDOW).unwrap();
+        assert!(trailing.paths.iter().map(String::len).sum::<usize>() <= MAX_FS_EVENT_PATH_BYTES);
+    }
+
+    #[test]
+    fn fs_event_flusher_exits_when_its_watcher_sender_drops() {
+        let coalescer = Arc::new(Mutex::new(FsCoalescer::default()));
+        let (nudge_tx, nudge_rx) = sync_channel(1);
+        let output: Box<dyn Write + Send> = Box::new(Vec::<u8>::new());
+        let writer: SharedWriter = Arc::new(Mutex::new(output));
+        let coalescer_for_thread = coalescer.clone();
+        let writer_for_thread = writer.clone();
+        let flusher = std::thread::Builder::new()
+            .name("bridge-fs-flush-test".into())
+            .spawn(move || flush_watch_events(coalescer_for_thread, writer_for_thread, nudge_rx, 1))
+            .unwrap();
+        drop(nudge_tx);
+        flusher
+            .join()
+            .expect("flusher exits after sender disconnects");
+    }
 
     #[test]
     fn invalid_framing_closes_bridge_and_releases_all_subscribers() {
@@ -2528,8 +2793,8 @@ mod tests {
     #[test]
     fn fs_watch_streams_create_events_and_filters_git_churn() {
         let c = connect();
-        let dir = std::env::temp_dir().join(format!("tg-bridge-watch-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir); // best-effort: test tmp cleanup
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path();
         std::fs::create_dir_all(dir.join(".git")).unwrap();
         let rx = c.watch(&dir.to_string_lossy()).unwrap();
         // Let the fs-watch initialize before mutating.
@@ -2544,7 +2809,35 @@ mod tests {
             "event paths: {:?}",
             ev.paths
         );
-        let _ = std::fs::remove_dir_all(&dir); // best-effort: test tmp cleanup
+    }
+
+    #[test]
+    fn fs_watch_delivers_trailing_change_from_a_burst() {
+        let c = connect();
+        let temp = tempfile::tempdir().unwrap();
+        let rx = c.watch(&temp.path().to_string_lossy()).unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+
+        std::fs::write(temp.path().join("a.rs"), b"a").unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        std::fs::write(temp.path().join("b.rs"), b"b").unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut saw_trailing = false;
+        while Instant::now() < deadline {
+            match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                Ok(event) if event.paths.iter().any(|path| path.ends_with("b.rs")) => {
+                    saw_trailing = true;
+                    break;
+                }
+                Ok(_) => {}
+                Err(error) => panic!("expected trailing fs.event before timeout: {error}"),
+            }
+        }
+        assert!(
+            saw_trailing,
+            "the final burst change b.rs must be delivered"
+        );
     }
 
     #[test]
