@@ -947,7 +947,7 @@ fn running_share_reports_endpoint_mutation_after_startup_window() {
             scheme: "https".into(),
         },
     };
-    let mut running = start(&plan, state.path(), Duration::from_secs(2)).expect("start share");
+    let running = start(&plan, state.path(), Duration::from_secs(2)).expect("start share");
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
     while !running.endpoint_conflict() && std::time::Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(10));
@@ -974,7 +974,7 @@ fn running_share_accepts_post_startup_identical_announcements() {
             scheme: "https".into(),
         },
     };
-    let mut running = start(&plan, state.path(), Duration::from_secs(2)).expect("start share");
+    let running = start(&plan, state.path(), Duration::from_secs(2)).expect("start share");
     std::thread::sleep(Duration::from_millis(700));
     assert!(
         !running.endpoint_conflict(),
