@@ -3,6 +3,7 @@
 //! `hydrate::spawn_disk_scan`.
 
 use std::sync::atomic::AtomicBool;
+use std::sync::{Mutex, OnceLock};
 
 use termwiz::terminal::TerminalWaker;
 use thegn_core::db::Db;
@@ -12,6 +13,64 @@ use thegn_core::store::{WorkspaceStore, WorktreeAuxStore};
 use super::LOG;
 
 static INFLIGHT: AtomicBool = AtomicBool::new(false);
+
+type GenerationMemo = std::collections::HashMap<std::path::PathBuf, (u128, Option<u64>)>;
+static GENERATION_MEMO: OnceLock<Mutex<GenerationMemo>> = OnceLock::new();
+
+#[cfg(test)]
+thread_local! {
+    static GENERATION_INVENTORY_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn fingerprint_mtime(profile_dir: &std::path::Path) -> Option<u128> {
+    let fingerprint = profile_dir.join(".fingerprint");
+    let metadata = match std::fs::symlink_metadata(fingerprint) {
+        Ok(metadata) => metadata,
+        Err(_) => return None,
+    };
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return None;
+    }
+    let modified = match metadata.modified() {
+        Ok(modified) => modified,
+        Err(_) => return None,
+    };
+    let since_epoch = match modified.duration_since(std::time::UNIX_EPOCH) {
+        Ok(duration) => duration,
+        Err(_) => return None,
+    };
+    Some(since_epoch.as_nanos())
+}
+
+fn generation_memoized(profile_dir: &std::path::Path, now_secs: u64) -> bool {
+    let Some(mtime) = fingerprint_mtime(profile_dir) else {
+        return false;
+    };
+    let memo = GENERATION_MEMO
+        .get_or_init(|| Mutex::new(GenerationMemo::new()))
+        .lock()
+        .expect("generation prune memo mutex poisoned");
+    memo.get(profile_dir)
+        .is_some_and(|(recorded_mtime, recheck)| {
+            *recorded_mtime == mtime && recheck.is_none_or(|at| now_secs < at)
+        })
+}
+
+fn remember_generation_noop(
+    profile_dir: &std::path::Path,
+    inventory: &[thegn_core::disk_reclaim::Generation],
+    policy: thegn_core::disk_reclaim::GenerationPolicy,
+) {
+    let Some(mtime) = fingerprint_mtime(profile_dir) else {
+        return;
+    };
+    let recheck = thegn_core::disk_reclaim::generation_recheck_after(inventory, policy);
+    GENERATION_MEMO
+        .get_or_init(|| Mutex::new(GenerationMemo::new()))
+        .lock()
+        .expect("generation prune memo mutex poisoned")
+        .insert(profile_dir.to_path_buf(), (mtime, recheck));
+}
 
 /// Walk a worktree unconditionally once this long has passed since its last
 /// real measurement, however quiet its change sentinels look.
@@ -57,6 +116,7 @@ pub(crate) fn spawn_scan(
         // otherwise inflate the statusbar total forever — and turning badges off
         // is not a reason to stop reclaiming them.
         let reaped = sweep_orphans(&db);
+        crate::hook_run::prune_logs(&crate::hook_run::log_root(), thegn_core::util::now());
 
         // `show_sizes` hides the badges; it is not a reason to stop reclaiming
         // disk. The round still runs when a reclaim rule is on, because the
@@ -377,6 +437,14 @@ fn reap_generation_footprints(
     let mut all_removed = 0u64;
     for (worktree, _) in fresh {
         let worktree_path = std::path::Path::new(worktree);
+        let target = worktree_path.join("target");
+        let profiles = [target.join("debug"), target.join("release")];
+        if profiles
+            .iter()
+            .all(|profile| generation_memoized(profile, now_secs))
+        {
+            continue;
+        }
         // `git_out` collapses EMPTY stdout to `None`, and an empty
         // `status --porcelain` is precisely "clean" — the only state we may
         // prune in. Using it here made this guard skip every clean worktree, so
@@ -391,13 +459,14 @@ fn reap_generation_footprints(
         {
             continue;
         }
-        let target = worktree_path.join("target");
-        for profile in ["debug", "release"] {
-            let profile_dir = target.join(profile);
+        for profile_dir in profiles {
             let lock_path = profile_dir.join(".cargo-lock");
             // Do not create a missing Cargo lock file. No existing lock means
             // this profile is not a Cargo profile we can safely synchronize.
             if !safe_regular_file(&lock_path) || !safe_directory(&profile_dir) {
+                continue;
+            }
+            if generation_memoized(&profile_dir, now_secs) {
                 continue;
             }
             let Ok(lock) = OpenOptions::new().read(true).write(true).open(&lock_path) else {
@@ -442,13 +511,11 @@ fn reap_generation_footprints(
                 })
                 .collect();
             let before_bytes = inventory.iter().map(|entry| entry.bytes).sum::<u64>();
-            let plan = thegn_core::disk_reclaim::plan_generations(
-                &inventory,
-                GenerationPolicy {
-                    min_age_secs: u64::from(min_age_days).saturating_mul(86_400),
-                },
-                now_secs,
-            );
+            let generation_policy = GenerationPolicy {
+                min_age_secs: u64::from(min_age_days).saturating_mul(86_400),
+            };
+            let plan =
+                thegn_core::disk_reclaim::plan_generations(&inventory, generation_policy, now_secs);
             let mut planned_bytes = 0u64;
             let mut removed_bytes = 0u64;
             let mut failures = 0usize;
@@ -490,6 +557,15 @@ fn reap_generation_footprints(
                 failures,
                 "Cargo generation prune"
             );
+            if planned_bytes == 0 {
+                remember_generation_noop(&profile_dir, &inventory, generation_policy);
+            } else {
+                GENERATION_MEMO
+                    .get_or_init(|| Mutex::new(GenerationMemo::new()))
+                    .lock()
+                    .expect("generation prune memo mutex poisoned")
+                    .remove(&profile_dir);
+            }
             all_removed = all_removed.saturating_add(removed_bytes);
             drop(lock);
         }
@@ -505,6 +581,9 @@ fn reap_generation_footprints(
 /// than guessing.
 fn generation_inventory(profile: &std::path::Path) -> std::io::Result<Vec<GenerationFootprint>> {
     use std::fs;
+
+    #[cfg(test)]
+    GENERATION_INVENTORY_CALLS.with(|calls| calls.set(calls.get() + 1));
 
     fn dirs(path: &std::path::Path) -> std::io::Result<Vec<std::path::PathBuf>> {
         let mut out = Vec::new();
@@ -770,6 +849,38 @@ mod generation_tests {
         assert!(status.success(), "git init failed: {status}");
         fs::write(root.join(".git/info/exclude"), "target/\n").unwrap();
         (root, profile)
+    }
+
+    #[test]
+    fn unchanged_noop_profiles_skip_inventory_until_fingerprint_mtime_changes() {
+        let (root, debug_profile) = profile_tree();
+        let release = root.join("target/release");
+        fs::create_dir_all(release.join(".fingerprint/only-one")).unwrap();
+        fs::write(release.join(".cargo-lock"), []).unwrap();
+        fs::write(release.join(".fingerprint/only-one/marker"), b"one").unwrap();
+        GENERATION_INVENTORY_CALLS.with(|calls| calls.set(0));
+        let fresh = [(
+            root.to_string_lossy().into_owned(),
+            thegn_core::disk::DiskUsage::default(),
+        )];
+        assert_eq!(
+            reap_generation_footprints(&fresh, None, &[], 14, u64::MAX - 1),
+            0
+        );
+        GENERATION_INVENTORY_CALLS.with(|calls| assert_eq!(calls.get(), 2));
+        assert_eq!(
+            reap_generation_footprints(&fresh, None, &[], 14, u64::MAX - 1),
+            0
+        );
+        GENERATION_INVENTORY_CALLS.with(|calls| assert_eq!(calls.get(), 2));
+
+        fs::write(debug_profile.join(".fingerprint/touched"), b"mtime change").unwrap();
+        assert_eq!(
+            reap_generation_footprints(&fresh, None, &[], 14, u64::MAX - 1),
+            0
+        );
+        GENERATION_INVENTORY_CALLS.with(|calls| assert_eq!(calls.get(), 3));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
