@@ -5,7 +5,7 @@
 
 use anyhow::{Context, Result};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use thegn_core::store::WorkspaceStore;
@@ -43,9 +43,56 @@ struct CloneSupervisorState {
 }
 
 static CLONE_SUPERVISOR: OnceLock<Mutex<CloneSupervisorState>> = OnceLock::new();
+static CLONE_SUPERVISOR_CHANGED: OnceLock<Condvar> = OnceLock::new();
+#[cfg(test)]
+static CLONE_GENERATION_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 fn clone_supervisor_state() -> &'static Mutex<CloneSupervisorState> {
     CLONE_SUPERVISOR.get_or_init(|| Mutex::new(CloneSupervisorState::default()))
+}
+
+fn clone_supervisor_changed() -> &'static Condvar {
+    CLONE_SUPERVISOR_CHANGED.get_or_init(Condvar::new)
+}
+
+fn wait_for_clone_supervisor(
+    state: &Mutex<CloneSupervisorState>,
+    changed: &Condvar,
+    timeout: Duration,
+) -> bool {
+    let deadline = Instant::now() + timeout;
+    let mut state = state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    while state.running {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        let (next, result) = changed
+            .wait_timeout(state, remaining)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state = next;
+        if result.timed_out() && state.running {
+            return false;
+        }
+    }
+    true
+}
+
+pub(crate) fn shutdown_clones(timeout: Duration) -> bool {
+    CLONE_GENERATION.fetch_add(1, Ordering::SeqCst);
+    {
+        let mut state = clone_supervisor_state()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.pending = None;
+    }
+    wait_for_clone_supervisor(
+        clone_supervisor_state(),
+        clone_supervisor_changed(),
+        timeout,
+    )
 }
 
 fn next_clone_generation() -> u64 {
@@ -781,6 +828,7 @@ fn run_clone_supervisor() {
                 Some(job) => job,
                 None => {
                     state.running = false;
+                    clone_supervisor_changed().notify_all();
                     return;
                 }
             }
@@ -1301,11 +1349,50 @@ Receiving objects: 100% (10/10)\rdone.\n";
 
     #[test]
     fn clone_generation_fences_old_events_and_each_begin_is_unique() {
+        let _guard = CLONE_GENERATION_TEST_LOCK.lock().unwrap();
         let first = next_clone_generation();
         let second = next_clone_generation();
         assert_ne!(first, second);
         assert!(!clone_event_is_current(first, second));
         assert!(clone_event_is_current(second, second));
+    }
+
+    #[test]
+    fn clone_shutdown_wait_returns_immediately_when_idle_and_is_bounded_when_running() {
+        let idle = Mutex::new(CloneSupervisorState::default());
+        let changed = Condvar::new();
+        assert!(wait_for_clone_supervisor(
+            &idle,
+            &changed,
+            Duration::from_secs(1)
+        ));
+
+        let running = Mutex::new(CloneSupervisorState {
+            running: true,
+            pending: None,
+        });
+        let started = Instant::now();
+        assert!(!wait_for_clone_supervisor(
+            &running,
+            &changed,
+            Duration::from_millis(20)
+        ));
+        assert!(started.elapsed() < Duration::from_millis(250));
+    }
+
+    #[test]
+    fn shutdown_clones_invalidates_the_current_generation() {
+        let _guard = CLONE_GENERATION_TEST_LOCK.lock().unwrap();
+        let old_generation = CLONE_GENERATION.load(Ordering::SeqCst);
+        assert!(clone_event_is_current(
+            old_generation,
+            CLONE_GENERATION.load(Ordering::SeqCst)
+        ));
+        assert!(shutdown_clones(Duration::from_millis(20)));
+        assert!(!clone_event_is_current(
+            old_generation,
+            CLONE_GENERATION.load(Ordering::SeqCst)
+        ));
     }
 
     #[test]
