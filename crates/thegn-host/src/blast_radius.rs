@@ -534,13 +534,11 @@ mod tests {
 
     #[test]
     fn head_diff_only_treats_an_unborn_head_as_an_empty_pass() {
-        use std::process::Command;
-
         fn git(root: &Path, args: &[&str]) {
-            let output = Command::new("git")
-                .arg("-C")
-                .arg(root)
+            let output = thegn_core::util::git_cmd(root)
                 .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
                 .output()
                 .unwrap();
             assert!(
