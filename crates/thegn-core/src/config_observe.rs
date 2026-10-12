@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 pub struct ObserveConfig {
     /// Show the "Observe" tab in the top-level app-tab strip. Off by default.
     pub enabled: bool,
-    /// Panel auto-refresh cadence, in seconds.
+    /// Panel auto-refresh cadence, in seconds. Clamped at runtime to 1..=3600 seconds.
     #[schemars(range(max = "crate::time_policy::MAX_CADENCE_SECS"))]
     pub refresh_interval_secs: u64,
     /// Dashboard source: empty ⇒ the built-in host-metrics dashboard; otherwise a
