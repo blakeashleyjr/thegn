@@ -72,6 +72,7 @@ impl MouseResidueFilter {
             },
             State::InMouse => match key {
                 KeyCode::Char(c) if mods.is_empty() && (c.is_ascii_digit() || *c == ';') => {
+                    self.state = State::InMouse;
                     Verdict::Swallow
                 }
                 KeyCode::Char('M' | 'm') if mods.is_empty() => {
