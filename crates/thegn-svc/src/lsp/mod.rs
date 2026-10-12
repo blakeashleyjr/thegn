@@ -2260,6 +2260,8 @@ fn terminate_tree(child: &mut Child, deadline: Option<std::time::Instant>) {
     terminate_tree_with(child, deadline, crate::plugin::proc::leader_exited_nowait);
 }
 
+/// Avoid signaling a potentially recycled pid when group pinning failed because
+/// the observer could not verify that this child is still waitable.
 fn terminate_tree_with(
     child: &mut Child,
     deadline: Option<std::time::Instant>,
@@ -2309,10 +2311,22 @@ fn terminate_tree_with(
 
     if pinned {
         crate::plugin::proc::kill_group(pid);
-    } else if let Err(error) = child.kill()
-        && error.kind() != std::io::ErrorKind::InvalidInput
-    {
-        tracing::debug!(target: "thegn::lsp", %error, "LSP child kill failed after group pinning failed");
+    } else {
+        match child.try_wait() {
+            Ok(None) => {
+                // Still our unreaped child: its pid is pinned, so the kill cannot hit a recycled pid.
+                if let Err(error) = child.kill()
+                    && error.kind() != std::io::ErrorKind::InvalidInput
+                {
+                    tracing::debug!(target: "thegn::lsp", %error, "LSP child kill failed after group pinning failed");
+                }
+            }
+            Ok(Some(_)) => {}
+            Err(error) => {
+                tracing::debug!(target: "thegn::lsp", %error, "LSP child is not waitable; skipping kill");
+                return; // wait() would fail the same way
+            }
+        }
     }
     if let Err(error) = child.wait() {
         tracing::debug!(target: "thegn::lsp", %error, "LSP child wait failed");
@@ -3124,7 +3138,7 @@ mod tests {
             done_tx.send(child).unwrap();
         });
 
-        let child = done_rx
+        let mut child = done_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("unpinned termination waited on a live direct child");
         assert!(child.try_wait().unwrap().is_some());
