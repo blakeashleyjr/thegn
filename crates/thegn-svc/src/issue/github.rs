@@ -618,7 +618,8 @@ impl IssueBackend for GitHubIssuesBackend {
                 }
             }
             if let Some(title) = patch.title.as_deref() {
-                if issue.title == title {
+                // GitHub strips surrounding whitespace from issue titles.
+                if issue.title.trim() == title.trim() {
                     applied.push("title");
                 } else {
                     unverified.push("title");
