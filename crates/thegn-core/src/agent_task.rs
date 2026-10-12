@@ -6,9 +6,10 @@
 //! things have to be composed to do that, and conflating them is a footgun:
 //!
 //! 1. **The prompt** — prose describing the blocker, rendered from a
-//!    user-configurable template and bounded to [`MAX_RENDERED_PROMPT_BYTES`].
-//!    It is never shell-quoted in the prompt itself; the command renderer quotes
-//!    substitutions, and the runner sends the prompt through one channel.
+//!    user-configurable template. Agent task prompts use the bounded
+//!    [`render_task_prompt`] entry point. Prompt prose is never shell-quoted;
+//!    the command renderer quotes substitutions, and the runner routes the
+//!    prompt through one configured channel.
 //! 2. **The command line** — how the agent is invoked, rendered from a second
 //!    template in which every substituted value **is** shell-quoted. Command
 //!    templates therefore take *bare* placeholders (`claude -p {prompt}`);
@@ -289,11 +290,16 @@ fn parse(template: &str) -> Result<Vec<Piece>, TemplateError> {
     Ok(out)
 }
 
-/// Render a **prompt** template: `{var}` substitution with no shell quoting,
-/// then cap the aggregate output while preserving head/tail context.
+/// Render a **prompt** template: `{var}` substitution with no shell quoting.
 pub fn render_prompt(template: &str, vars: &TaskVars) -> Result<String, TemplateError> {
+    render(template, vars, false)
+}
+
+/// Render an agent task prompt and cap aggregate output while preserving
+/// head/tail context.
+pub fn render_task_prompt(template: &str, vars: &TaskVars) -> Result<String, TemplateError> {
     Ok(bound_text(
-        &render(template, vars, false)?,
+        &render_prompt(template, vars)?,
         MAX_RENDERED_PROMPT_BYTES,
     ))
 }
@@ -1826,7 +1832,10 @@ mod tests {
         assert!(rendered.len() <= MAX_PATH_BYTES);
         assert!(rendered.contains("1 more path(s) omitted"));
 
-        let near_limit = vec!["p".repeat(MAX_PATH_BYTES - 10)];
+        let near_limit = vec![
+            "p".repeat(MAX_PATH_BYTES - 14),
+            "overflowing-second-path".to_string(),
+        ];
         let rendered = format_paths(&near_limit);
         assert!(rendered.len() <= MAX_PATH_BYTES);
         assert!(rendered.contains("1 more path(s) omitted"));
@@ -1835,24 +1844,31 @@ mod tests {
     #[test]
     fn bound_text_keeps_utf8_boundaries_and_never_exceeds_byte_cap() {
         let value = format!("{}{}{}", "前".repeat(20), "middle", "後".repeat(20));
-        let bounded = bound_text(&value, 31);
-        assert!(bounded.len() <= 31);
+        let bounded = bound_text(&value, TEXT_OMISSION_MARKER.len() + 12);
+        assert!(bounded.len() <= TEXT_OMISSION_MARKER.len() + 12);
         assert!(bounded.is_char_boundary(bounded.len()));
         assert!(bounded.starts_with("前"));
         assert!(bounded.ends_with("後"));
         assert!(bounded.contains("omitted"));
-        assert_eq!(bound_text("large", 2), "la");
+        assert_eq!(bound_text("large", 2), "le");
         assert!(bound_text("large", 0).is_empty());
     }
 
     #[test]
     fn render_prompt_caps_aggregate_output_and_reports_omissions() {
         let vars = TaskVars::new().set("issue_body", "界".repeat(MAX_RENDERED_PROMPT_BYTES * 2));
-        let rendered = render_prompt("{issue_body}", &vars).unwrap();
+        let rendered = render_task_prompt("{issue_body}", &vars).unwrap();
         assert!(rendered.len() <= MAX_RENDERED_PROMPT_BYTES);
         assert!(rendered.contains("task data omitted"));
         assert!(rendered.starts_with("界"));
         assert!(rendered.ends_with("界"));
+    }
+
+    #[test]
+    fn generic_prompt_rendering_does_not_apply_agent_task_cap() {
+        let value = "x".repeat(MAX_RENDERED_PROMPT_BYTES + 1);
+        let vars = TaskVars::new().set("issue_body", &value);
+        assert_eq!(render_prompt("{issue_body}", &vars).unwrap(), value);
     }
 
     #[test]

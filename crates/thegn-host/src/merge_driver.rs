@@ -644,7 +644,7 @@ fn compose(
     thegn_core::agent_task::TaskVars,
     String,
 )> {
-    use thegn_core::agent_task::{TaskKind, TaskVars, format_paths, render_prompt};
+    use thegn_core::agent_task::{TaskKind, TaskVars, format_paths, render_task_prompt};
 
     let (kind, vars) = match failure {
         Failure::Conflict {
@@ -667,7 +667,7 @@ fn compose(
         .set("target", target)
         .set("worktree", worktree);
 
-    match render_prompt(cfg.prompts.resolve(kind), &vars) {
+    match render_task_prompt(cfg.prompts.resolve(kind), &vars) {
         Ok(prompt) => Some((kind, vars, prompt)),
         Err(e) => {
             // `config validate` catches this ahead of time; if a bad template
@@ -689,18 +689,19 @@ fn compose(
 /// string "breaks build", so neither `merge list` nor the panel could ever say
 /// what actually went wrong. Bounded so a runaway gate can't bloat the row.
 fn detail_with_log(headline: &str, log: &str) -> String {
-    const MAX_LOG: usize = 2000;
     let log = log.trim();
     if log.is_empty() {
         return headline.to_string();
     }
-    let mut cut = log.len().saturating_sub(MAX_LOG);
+    let mut cut = log.len().saturating_sub(MAX_LOG_LINE_BYTES);
     while cut < log.len() && !log.is_char_boundary(cut) {
         cut += 1;
     }
     let body = if cut > 0 { &log[cut..] } else { log };
     format!("{headline}\n{body}")
 }
+
+const MAX_LOG_LINE_BYTES: usize = 2000;
 
 /// The last non-empty line of a log (for a one-line status detail), falling back
 /// to a headline when the command produced no output at all — a bare `exit 1`
@@ -711,7 +712,7 @@ fn tail_line(log: &str) -> String {
         .rev()
         .find(|l| !l.trim().is_empty())
         .unwrap_or("breaks build (gate exited non-zero, no output)");
-    thegn_core::agent_task::bound_text(line, 2000)
+    thegn_core::agent_task::bound_text(line, MAX_LOG_LINE_BYTES)
 }
 
 #[cfg(test)]
