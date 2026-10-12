@@ -17,7 +17,7 @@ use chrono::Utc;
 use gtui_app::app::{ObserveApp, PanelState};
 use gtui_core::dashboard::{Dashboard, builtin_host_dashboard};
 use gtui_core::datasource::{DataSource, TimeRange};
-use gtui_core::frame::Frame;
+use gtui_core::frame::{Coverage, Frame};
 use gtui_query::host::HostSource;
 use gtui_query::loki::LokiSource;
 use gtui_query::prometheus::PrometheusSource;
@@ -529,12 +529,24 @@ fn render_targets(
             )),
             Ok(frames) => {
                 for (index, frame) in frames.iter().enumerate().take(32) {
-                    let label = if frames.len() == 1 {
+                    let mut label = if frames.len() == 1 {
                         format!("{title} · {}", target.ref_id)
                     } else {
                         format!("{title} · {} · {}", target.ref_id, index + 1)
                     };
-                    entries.push((label, Some(frame), None));
+                    if let Coverage::Partial { .. } = frame.coverage {
+                        label.push_str(" · partial");
+                    }
+                    if matches!(
+                        frame.coverage,
+                        Coverage::Partial {
+                            retained_from: None
+                        }
+                    ) {
+                        entries.push((label, None, Some("no samples retained yet")));
+                    } else {
+                        entries.push((label, Some(frame), None));
+                    }
                 }
                 if frames.len() > 32 {
                     entries.push((
@@ -646,7 +658,7 @@ fn block_msg(rect: Rect, buf: &mut Buffer, title: &str, msg: &str, token: Tok, t
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gtui_core::frame::{Field, FieldType};
+    use gtui_core::frame::{Coverage, Field, FieldType};
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -958,6 +970,56 @@ mod tests {
                 "{kind} omitted target error"
             );
         }
+    }
+
+    #[test]
+    fn render_targets_marks_partial_frames_and_explains_empty_retention() {
+        let partial = Frame::new(vec![Field::new("v", FieldType::Float64, vec![42.0])])
+            .with_coverage(Coverage::Partial {
+                retained_from: Some(1000.0),
+            });
+        let complete = Frame::new(vec![Field::new("v", FieldType::Float64, vec![7.0])]);
+        let empty_partial = Frame::new(vec![
+            Field::new("time", FieldType::Time, Vec::new()),
+            Field::new("v", FieldType::Float64, Vec::new()),
+        ])
+        .with_coverage(Coverage::Partial {
+            retained_from: None,
+        });
+        let targets = vec![
+            gtui_app::engine::TargetUpdate {
+                ref_id: "A".into(),
+                result: Ok(vec![partial]),
+            },
+            gtui_app::engine::TargetUpdate {
+                ref_id: "B".into(),
+                result: Ok(vec![complete]),
+            },
+            gtui_app::engine::TargetUpdate {
+                ref_id: "C".into(),
+                result: Ok(vec![empty_partial]),
+            },
+        ];
+        let mut buf = Buffer::empty(Rect::new(0, 0, 48, 18));
+        render_targets(
+            "timeseries",
+            "Panel",
+            &targets,
+            buf.area,
+            &mut buf,
+            &Theme::prism(),
+        );
+        let mut rendered = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                rendered.push_str(buf.cell((x, y)).unwrap().symbol());
+            }
+        }
+        assert!(rendered.contains("A · partial"));
+        assert!(rendered.contains("B"));
+        assert!(!rendered.contains("B · partial"));
+        assert!(rendered.contains("C · partial"));
+        assert!(rendered.contains("no samples retained yet"));
     }
 
     #[test]
