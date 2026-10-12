@@ -249,6 +249,7 @@ fn parse_line(line: &str) -> Result<MediaState, MediaError> {
         volume: get(9)
             .parse::<f64>()
             .ok()
+            .filter(|v| v.is_finite())
             .map(|v| (v * 100.0).round().clamp(0.0, 100.0) as u8),
         can_go_next: true,
         can_go_previous: true,
@@ -294,6 +295,13 @@ mod tests {
         assert_eq!(s.shuffle, Some(true));
         assert_eq!(s.loop_mode, Some(LoopMode::Playlist));
         assert_eq!(s.volume, Some(80));
+    }
+
+    #[test]
+    fn nan_volume_is_unknown() {
+        let line = "spotify\u{1f}Playing\u{1f}Title\u{1f}Artist\u{1f}Album\u{1f}1000000\u{1f}0\u{1f}true\u{1f}None\u{1f}nan\u{1f}art\u{1f}url\u{1f}track-id";
+        let state = parse_line(line).unwrap();
+        assert_eq!(state.volume, None);
     }
 
     #[test]
