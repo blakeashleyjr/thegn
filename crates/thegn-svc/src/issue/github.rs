@@ -354,6 +354,17 @@ fn gh_issue_to_domain_with_host(
 
 const GH_LIST_FIELDS: &str = "number,title,state,body,assignees,labels,url,updatedAt";
 
+fn requested_github_fields(patch: &IssuePatch) -> Vec<&'static str> {
+    let mut fields = Vec::new();
+    if patch.status.is_some() {
+        fields.push("status");
+    }
+    if patch.title.is_some() {
+        fields.push("title");
+    }
+    fields
+}
+
 impl IssueBackend for GitHubIssuesBackend {
     fn provider_id(&self) -> &str {
         "github"
@@ -512,6 +523,13 @@ impl IssueBackend for GitHubIssuesBackend {
             let scoped = self.resolve_scope(id_repo, true)?;
             let repo = scoped.as_deref();
             let expected_host = self.host_for_repo(repo)?;
+            if let Some(title) = patch.title.as_deref()
+                && (title.trim().is_empty() || title.chars().any(char::is_control))
+            {
+                return Err(IssueError::Policy(
+                    "issue title must be non-empty single-line text",
+                ));
+            }
             // Scope every mutation to the issue's own repo — without `--repo`, `gh`
             // resolves against the process cwd and can close/edit the wrong repo's
             // issue #N.
@@ -521,6 +539,7 @@ impl IssueBackend for GitHubIssuesBackend {
             };
 
             // Handle status (open / close).
+            let mut status_applied = false;
             if let Some(status) = patch.status {
                 let sub = match status {
                     IssueStatus::Done | IssueStatus::Cancelled => "close",
@@ -529,22 +548,94 @@ impl IssueBackend for GitHubIssuesBackend {
                 let mut args = vec!["issue", sub, number];
                 args.extend_from_slice(&repo_flag);
                 self.gh(&args).await?;
+                status_applied = true;
             }
 
             // Handle title update.
             if let Some(title) = &patch.title {
                 let mut args = vec!["issue", "edit", number, "--title", title];
                 args.extend_from_slice(&repo_flag);
-                self.gh(&args).await?;
+                if let Err(source) = self.gh(&args).await {
+                    if status_applied {
+                        return Err(IssueError::PartialUpdate {
+                            applied: vec!["status"],
+                            unapplied: vec!["title"],
+                            unverified: Vec::new(),
+                            source: Box::new(source),
+                        });
+                    }
+                    return Err(source);
+                }
             }
 
             // Re-fetch the updated issue.
             let mut args = vec!["issue", "view", number, "--json", GH_LIST_FIELDS];
             args.extend_from_slice(&repo_flag);
-            let json = self.gh(&args).await?;
-            let gi: GhIssue =
-                serde_json::from_str(&json).map_err(|e| IssueError::Parse(e.to_string()))?;
-            gh_issue_to_domain_with_host(gi, expected_host.as_deref())
+            let json = match self.gh(&args).await {
+                Ok(json) => json,
+                Err(source) if status_applied || patch.title.is_some() => {
+                    return Err(IssueError::PartialUpdate {
+                        applied: Vec::new(),
+                        unapplied: Vec::new(),
+                        unverified: requested_github_fields(patch),
+                        source: Box::new(source),
+                    });
+                }
+                Err(source) => return Err(source),
+            };
+            let gi: GhIssue = match serde_json::from_str(&json) {
+                Ok(gi) => gi,
+                Err(error) if status_applied || patch.title.is_some() => {
+                    return Err(IssueError::PartialUpdate {
+                        applied: Vec::new(),
+                        unapplied: Vec::new(),
+                        unverified: requested_github_fields(patch),
+                        source: Box::new(IssueError::Parse(error.to_string())),
+                    });
+                }
+                Err(error) => return Err(IssueError::Parse(error.to_string())),
+            };
+            let issue = match gh_issue_to_domain_with_host(gi, expected_host.as_deref()) {
+                Ok(issue) => issue,
+                Err(source) if status_applied || patch.title.is_some() => {
+                    return Err(IssueError::PartialUpdate {
+                        applied: Vec::new(),
+                        unapplied: Vec::new(),
+                        unverified: requested_github_fields(patch),
+                        source: Box::new(source),
+                    });
+                }
+                Err(source) => return Err(source),
+            };
+            let mut applied = Vec::new();
+            let mut unverified = Vec::new();
+            if let Some(status) = patch.status {
+                let expected_closed = matches!(status, IssueStatus::Done | IssueStatus::Cancelled);
+                if matches!(issue.status, IssueStatus::Done) == expected_closed {
+                    applied.push("status");
+                } else {
+                    unverified.push("status");
+                }
+            }
+            if let Some(title) = patch.title.as_deref() {
+                // GitHub strips surrounding whitespace from issue titles.
+                if issue.title.trim() == title.trim() {
+                    applied.push("title");
+                } else {
+                    unverified.push("title");
+                }
+            }
+            if !unverified.is_empty() {
+                return Err(IssueError::PartialUpdate {
+                    applied,
+                    unapplied: Vec::new(),
+                    unverified,
+                    source: Box::new(IssueError::Api(
+                        "GitHub did not apply the requested fields".into(),
+                    )),
+                });
+            }
+            Ok(issue)
         })
     }
 
@@ -779,6 +870,29 @@ mod tests {
         assert!(issue.assignees.is_empty());
         assert!(issue.labels.is_empty());
         assert_eq!(issue.updated_at_ms, 0, "missing updatedAt ⇒ 0");
+    }
+
+    #[tokio::test]
+    async fn invalid_title_is_rejected_before_spawning_gh() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut backend = GitHubIssuesBackend::new(vec!["--repo".into(), "o/r".into()]);
+        backend.program = Some(dir.path().join("missing-gh").into_os_string());
+        for title in ["", " \t ", "two\nlines"] {
+            let error = backend
+                .update_issue(
+                    "github:o/r#7",
+                    &IssuePatch {
+                        title: Some(title.into()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                IssueError::Policy("issue title must be non-empty single-line text")
+            ));
+        }
     }
 }
 

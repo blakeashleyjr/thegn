@@ -795,13 +795,40 @@ impl IssueBackend for LinearBackend {
                 .issue_update
                 .issue
                 .ok_or_else(|| IssueError::Api("issueUpdate returned no issue".into()))?;
+            let mut applied = Vec::new();
+            let mut unverified = Vec::new();
             if let Some(want) = wanted_state_type {
                 let got = updated.state.as_ref().map(|st| st.state_type.as_str());
-                if got != Some(want) {
-                    return Err(IssueError::Api(format!(
-                        "Linear applied state type {got:?}, expected {want:?}"
-                    )));
+                if got == Some(want) {
+                    applied.push("status");
+                } else {
+                    unverified.push("status");
                 }
+            }
+            if let Some(want) = patch.title.as_deref() {
+                // Linear may normalize surrounding whitespace in issue titles.
+                if updated.title.trim() == want.trim() {
+                    applied.push("title");
+                } else {
+                    unverified.push("title");
+                }
+            }
+            if let Some(want) = patch.priority {
+                if map_priority(updated.priority) == want {
+                    applied.push("priority");
+                } else {
+                    unverified.push("priority");
+                }
+            }
+            if !unverified.is_empty() {
+                return Err(IssueError::PartialUpdate {
+                    applied,
+                    unapplied: Vec::new(),
+                    unverified,
+                    source: Box::new(IssueError::Api(
+                        "Linear did not apply the requested fields".into(),
+                    )),
+                });
             }
             linear_issue_to_domain(updated)
         })
@@ -861,6 +888,74 @@ mod tests {
             "url": format!("https://linear.app/acme/issue/ABC-{n}"),
             "updatedAt": "2026-09-01T00:00:00Z"
         })
+    }
+
+    async fn update_with_echoed_issue(issue: serde_json::Value) -> Result<Issue, IssueError> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let response = json!({"data": {"issueUpdate": {"issue": issue}}});
+        let server = tokio::spawn(async move {
+            let app = Router::new().fallback(any(move |_: Request| {
+                let response = response.clone();
+                async move {
+                    let mut result =
+                        (StatusCode::OK, Body::from(response.to_string())).into_response();
+                    result.headers_mut().insert(
+                        reqwest::header::CONTENT_TYPE,
+                        HeaderValue::from_static("application/json"),
+                    );
+                    result
+                }
+            }));
+            axum::serve(listener, app).await.unwrap();
+        });
+        let backend = LinearBackend::new_for_test(
+            "linear-secret".into(),
+            Some("team-1".into()),
+            Arc::new(TrackerHttpBudget::with_permits(1)),
+            &format!("http://{address}"),
+        );
+        let result = backend
+            .update_issue(
+                "linear:ABC-1",
+                &IssuePatch {
+                    title: Some("Renamed".into()),
+                    priority: Some(IssuePriority::Urgent),
+                    ..Default::default()
+                },
+            )
+            .await;
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+        result
+    }
+
+    #[tokio::test]
+    async fn update_reports_fields_linear_did_not_apply() {
+        let result = update_with_echoed_issue(list_item(1)).await;
+        assert!(matches!(
+            result,
+            Err(IssueError::PartialUpdate {
+                applied,
+                unapplied,
+                unverified,
+                source,
+            }) if applied.is_empty()
+                && unapplied.is_empty()
+                && unverified == ["title", "priority"]
+                && matches!(*source, IssueError::Api(ref message)
+                    if message == "Linear did not apply the requested fields")
+        ));
+    }
+
+    #[tokio::test]
+    async fn update_accepts_matching_linear_postconditions() {
+        let mut issue = list_item(1);
+        issue["title"] = json!("Renamed");
+        issue["priority"] = json!(1);
+        let result = update_with_echoed_issue(issue).await.unwrap();
+        assert_eq!(result.title, "Renamed");
+        assert_eq!(result.priority, IssuePriority::Urgent);
     }
 
     #[tokio::test]
