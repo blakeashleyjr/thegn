@@ -1794,15 +1794,17 @@ v1_ok=1
 [[ $v1_rc -eq 0 ]] && grep -q 'ok=yes' <<<"$v1_out" || v1_ok=0
 check "dispatch verify on a row with no artifact reports ok and exits 0" \
   "[[ $v1_ok -eq 1 ]]"
+artifact_row_json="$("$SZ" dispatch put linear:SMOKE-3 "$R" claude --stage code --artifact .thegn/pipeline/SMOKE-7/missing/2.md --json)"
+artifact_row="$(printf '%s' "$artifact_row_json" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')"
 check "dispatch put records an artifact pointer" \
-  "'$SZ' dispatch put linear:SMOKE-3 '$R' claude --stage code --artifact .thegn/pipeline/SMOKE-7/missing/2.md --json | grep -q '\"artifact_path\":\".thegn/pipeline/SMOKE-7/missing/2.md\"'"
+  "[[ -n '$artifact_row' ]] && printf '%s' '$artifact_row_json' | grep -q '\"artifact_path\":\".thegn/pipeline/SMOKE-7/missing/2.md\"'"
 # A missing artifact is a retryable not-yet (exit 2, the `session wait`
 # convention) naming the artifact; `set-status done` is refused for the same
 # reason unless `--force` records it as forced — never invisibly.
 set +e
-v2_out="$("$SZ" dispatch verify 2 2>&1)"
+v2_out="$("$SZ" dispatch verify "$artifact_row" 2>&1)"
 v2_rc=$?
-gate_out="$("$SZ" dispatch set-status 2 "done" 2>&1)"
+gate_out="$("$SZ" dispatch set-status "$artifact_row" "done" 2>&1)"
 gate_rc=$?
 set -e
 v2_ok=1
@@ -1815,16 +1817,17 @@ gate_ok=1
 check "set-status done is refused for a row with a missing artifact" \
   "[[ $gate_ok -eq 1 ]]"
 check "set-status done --force overrides and says so" \
-  "'$SZ' dispatch set-status 2 done --force | grep -q forced"
+  "'$SZ' dispatch set-status '$artifact_row' done --force | grep -q forced"
 # Untracked: the artifact exists but git does not track it — the exact pilot
 # failure ("session exit ≠ done") the gate exists to catch. Committing it
 # flips the gate open; a forced completion stays visible in the output.
+untracked_row="$("$SZ" dispatch put linear:SMOKE-4 "$R" claude --stage review --artifact .thegn/pipeline/SMOKE-7/untracked/3.md | sed -n 's/^dispatch \([0-9]*\) .*/\1/p')"
 check "dispatch put records an untracked artifact row" \
-  "'$SZ' dispatch put linear:SMOKE-4 '$R' claude --stage review --artifact .thegn/pipeline/SMOKE-7/untracked/3.md >/dev/null"
+  "[[ -n '$untracked_row' ]]"
 mkdir -p "$R/.thegn/pipeline/SMOKE-7/untracked"
 echo handoff >"$R/.thegn/pipeline/SMOKE-7/untracked/3.md"
 set +e
-utr_out="$("$SZ" dispatch set-status 3 "done" 2>&1)"
+utr_out="$("$SZ" dispatch set-status "$untracked_row" "done" 2>&1)"
 utr_rc=$?
 set -e
 utr_ok=1
@@ -1836,12 +1839,12 @@ git -C "$R" commit -q -m 'smoke: commit the artifact'
 # THE-88: a tracked artifact is not enough — `done` also needs the worker's
 # structured report on the row, so the Lead never has to re-read the artifact.
 check "set-status done is refused while the report is missing" \
-  "! '$SZ' dispatch set-status 3 done 2>&1 | grep -q '→ done'"
+  "! '$SZ' dispatch set-status '$untracked_row' done 2>&1 | grep -q '→ done'"
 check "dispatch report files the handoff report" \
-  "'$SZ' dispatch report 3 --text 'verdict: DONE; commits: 1
+  "'$SZ' dispatch report '$untracked_row' --text 'verdict: DONE; commits: 1
 gate: just smoke -- exit 0' --json | grep -q '\"bytes\"'"
 check "set-status done passes once the artifact is tracked and reported" \
-  "'$SZ' dispatch set-status 3 done | grep -q 'done'"
+  "'$SZ' dispatch set-status '$untracked_row' done | grep -q 'done'"
 # `session open` shares the control-client connect path, so it degrades with
 # the same clear no-daemon message rather than crashing.
 set +e
@@ -1939,7 +1942,7 @@ sdone_row="$($SZ dispatch put linear:SMOKE-5 "$R" claude --stage code 2>/dev/nul
 # `done` is passed via a variable: a literal `done` inside $() reads as a
 # shell keyword to shellcheck (SC1010).
 sdone_status="done"
-sresumedone_out="$($SZ dispatch set-status "$sdone_row" "$sdone_status" >/dev/null 2>&1 && $SZ session open --resume-work "$sdone_row" 2>&1)"
+sresumedone_out="$($SZ dispatch set-status "$sdone_row" "$sdone_status" --force >/dev/null 2>&1 && $SZ session open --resume-work "$sdone_row" 2>&1)"
 sresumedone_rc=$?
 set -e
 sresumedone_ok=1
@@ -2014,9 +2017,10 @@ cafter_ok=1
 check "an after: chunk whose prerequisite is not done is refused" \
   "[[ $cafter_ok -eq 1 ]]"
 # Finishing chunk-1 (done) flips the after-gate open — the normal pipeline
-# order. Its row has no artifact pointer, so the done gate passes by construction.
+# order. The forced completion preserves this fixture's intended prerequisite
+# state while pipeline rows without published artifacts remain gated by default.
 check "a done prerequisite satisfies the after gate" \
-  "'$SZ' dispatch set-status '$CA_ROW' done >/dev/null && '$SZ' dispatch put linear:SMOKE-6 '$CWT' claude --stage smoke-chunk --chunk .thegn/pipeline/SMOKE-7/code/chunk-3.md | grep -q 'queued'"
+  "'$SZ' dispatch set-status '$CA_ROW' done --force >/dev/null && '$SZ' dispatch put linear:SMOKE-6 '$CWT' claude --stage smoke-chunk --chunk .thegn/pipeline/SMOKE-7/code/chunk-3.md | grep -q 'queued'"
 
 # Daemon lifecycle: spawn on an isolated socket, open a marker session over
 # the unix socket, see it in `session list` and its output in `snapshot`,
