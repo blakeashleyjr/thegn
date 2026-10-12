@@ -416,7 +416,7 @@ pub(crate) async fn handle_exit(
     let sig = ExitSignatures::from(tr);
     let mut native = native;
     let Some(class) = retry_class(
-        pipeline_exit::classify(true, &screen, &sig),
+        pipeline_exit::classify_tail(true, &screen, &sig, pipeline_exit::CLASSIFY_TAIL_LINES),
         &screen,
         &mut native,
     ) else {
