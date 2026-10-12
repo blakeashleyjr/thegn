@@ -269,6 +269,25 @@ mod tests {
         let file = dir.path().join("large.txt");
         std::fs::write(&file, vec![b'x'; 2 * 1024 * 1024 + 1]).unwrap();
         let error = read_bytes(&file).unwrap_err();
-        assert!(error.contains("size cap"), "unexpected diagnostic: {error}");
+        assert!(
+            error.contains("2097152 byte preview cap") && error.contains("2097153 bytes"),
+            "unexpected diagnostic: {error}"
+        );
+        // The direct opened-handle cap check, including a file larger than
+        // its cap, is covered by rasterize::tests::read_regular_capped_enforces_cap_and_kind.
+    }
+
+    #[test]
+    fn read_bytes_previews_a_final_symlink_to_a_regular_file() {
+        if !crate::platform::test_symlink_supported() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("AGENTS.md");
+        let link = dir.path().join("CLAUDE.md");
+        std::fs::write(&target, b"workspace instructions").unwrap();
+        crate::platform::test_symlink(&target, &link).unwrap();
+
+        assert_eq!(read_bytes(&link).unwrap(), b"workspace instructions");
     }
 }

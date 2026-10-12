@@ -239,25 +239,6 @@ pub(crate) fn exe_admitted(path: &std::path::Path) -> bool {
     }
 }
 
-/// Open `path` read-only without ever blocking in `open(2)`: on Unix the
-/// descriptor is `O_NONBLOCK`, so a FIFO swapped in after a stat check opens
-/// immediately instead of parking the caller until a writer appears. The
-/// caller must still verify the OPENED handle is a regular file.
-pub(crate) fn open_read_nonblocking(path: &std::path::Path) -> std::io::Result<std::fs::File> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
-            .open(path)
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::File::open(path)
-    }
-}
-
 /// Open read-only without blocking on a FIFO or following a final symlink.
 /// Callers still verify that the opened handle is a regular file.
 pub(crate) fn open_read_nonblocking_nofollow(
