@@ -67,6 +67,7 @@ struct WorkerState {
     capped: AtomicBool,
     bytes_written: AtomicU64,
     failure: Mutex<Option<String>>,
+    completion_wake: Arc<tokio::sync::Notify>,
 }
 
 impl WorkerState {
@@ -76,6 +77,7 @@ impl WorkerState {
             capped: AtomicBool::new(false),
             bytes_written: AtomicU64::new(0),
             failure: Mutex::new(None),
+            completion_wake: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -159,6 +161,7 @@ impl Recorder {
                 if let Err(error) = result_tx.send(finished) {
                     tracing::debug!(target: "thegn::daemon", "recording completion receiver dropped: {error}");
                 }
+                worker_state.completion_wake.notify_one();
             })?;
         Ok(Self {
             tx: Some(tx),
@@ -233,6 +236,10 @@ impl Recorder {
 
     pub(crate) fn done(&self) -> bool {
         self.state.done()
+    }
+
+    pub(crate) fn completion_wake(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.state.completion_wake)
     }
 
     pub(crate) fn capped(&self) -> bool {
@@ -375,6 +382,7 @@ fn start_with_writer_budget<W: Write + Send + 'static>(
         if let Err(error) = result_tx.send(finished) {
             tracing::debug!(target: "thegn::daemon", "recording completion receiver dropped: {error}");
         }
+        worker_state.completion_wake.notify_one();
     });
     Recorder {
         tx: Some(tx),
@@ -759,6 +767,35 @@ mod tests {
             "sink failure must not report a clean save"
         );
         assert_eq!(budget.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn worker_completion_pulses_the_wake() {
+        struct FailingWriter;
+        impl Write for FailingWriter {
+            fn write(&mut self, _bytes: &[u8]) -> io::Result<usize> {
+                Err(io::Error::other("injected sink failure"))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Err(io::Error::other("injected sink failure"))
+            }
+        }
+        let mut header = Header::new(80, 24);
+        header.timestamp = Some(0);
+        let writer =
+            CastWriter::new(BufWriter::new(FailingWriter), &header).expect("header is buffered");
+        let mut rec = start_with_writer(writer);
+        let wake = rec.completion_wake();
+        rec.feed(b"fail");
+        rec.close_admission();
+
+        tokio::time::timeout(Duration::from_secs(1), wake.notified())
+            .await
+            .expect("worker completion wakes its observer");
+        assert!(
+            rec.finish().truncated.is_some(),
+            "the failing sink must finish with a reported error"
+        );
     }
 
     #[test]
