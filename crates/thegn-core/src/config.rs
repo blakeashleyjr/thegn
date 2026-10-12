@@ -3034,7 +3034,9 @@ pub struct StatsConfig {
     pub cpu_icon: String,
     /// Icon for memory stat.
     pub mem_icon: String,
-    /// Icon for network stat.
+    /// Icon for network stat. The shipped default auto-selects Ethernet, Wi-Fi,
+    /// or a generic network glyph from the default route; any other value is a
+    /// fixed icon override.
     pub net_icon: String,
     /// Icon for GPU stat.
     pub gpu_icon: String,
@@ -4068,6 +4070,13 @@ pub struct ForwardConfig {
     /// Host-port allocation range (`"lo-hi"`, inclusive) used when a detected
     /// port's own number is already taken on the host. Malformed ⇒ `8000-8999`.
     pub range: String,
+    /// Maximum concurrent connections per reverse tunnel run. `0` rejects all
+    /// connections; values above Tokio's permit limit are clamped.
+    pub reverse_max_connections: usize,
+    /// Process-wide maximum concurrent reverse-tunnel host connections. `0`
+    /// rejects all connections; values above Tokio's permit limit are clamped.
+    /// Read when the first reverse tunnel starts; restart the process to change.
+    pub reverse_max_connections_total: usize,
     /// Container ports never to forward (e.g. an in-sandbox database or sshd).
     pub ignore: Vec<u16>,
     /// If non-empty, an allowlist: ONLY these container ports are forwarded.
@@ -4093,6 +4102,8 @@ impl Default for ForwardConfig {
         ForwardConfig {
             auto: true,
             range: "8000-8999".into(),
+            reverse_max_connections: 256,
+            reverse_max_connections_total: 1024,
             ignore: Vec::new(),
             only: Vec::new(),
             bind: "127.0.0.1".into(),

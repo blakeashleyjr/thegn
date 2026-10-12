@@ -30,6 +30,12 @@ inside the container are forwarded to the host's loopback automatically
 for local browser preview. The **system → forward** section lists the
 active forwards: `↵` copies the preview URL, `o` opens it.
 
+Reverse tunnels have a per-run connection cap (`forward.reverse_max_connections`,
+default 256) and a process-wide host cap
+(`forward.reverse_max_connections_total`, default 1024). Zero rejects all
+connections. The process-wide value is read when the first reverse tunnel
+starts, so restart thegn to change it.
+
 ## Frontend preview discovery (`[preview]`)
 
 When `[preview] enabled = true`, thegn discovers a target from explicit
