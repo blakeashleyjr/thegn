@@ -35,7 +35,15 @@ fn decode_worktree_record(r: &rusqlite::Row<'_>) -> rusqlite::Result<WorktreeRow
 }
 
 pub(crate) fn delete_worktree_cache_rows(db: &Db, wt: &str) -> Result<()> {
-    let conn = db.conn();
+    let base_conn = db.conn();
+    // Keep standalone cascades atomic, while joining a caller's transaction
+    // when this helper is used during transactional cleanup.
+    let tx = if base_conn.is_autocommit() {
+        Some(base_conn.unchecked_transaction()?)
+    } else {
+        None
+    };
+    let conn = tx.as_deref().unwrap_or(base_conn);
     let prefix = if wt.ends_with('/') {
         wt.to_string()
     } else {
@@ -45,7 +53,6 @@ pub(crate) fn delete_worktree_cache_rows(db: &Db, wt: &str) -> Result<()> {
     // while excluding sibling prefixes such as `/wt/a2`.
     let prefix_end = format!("{wt}0");
     let has_glyph_cache = table_exists(conn, "glyph_cache")?;
-    let tx = conn.unchecked_transaction()?;
     for table in [
         "worktree_disk",
         "loc_cache",
@@ -65,15 +72,15 @@ pub(crate) fn delete_worktree_cache_rows(db: &Db, wt: &str) -> Result<()> {
         } else {
             "worktree"
         };
-        tx.execute(
+        conn.execute(
             &format!("DELETE FROM {table} WHERE {column}=?1"),
             params![wt],
         )?;
     }
     // Resolve matching entity IDs once through idx_sem_entity_file. Reuse that
-    // set for edge cleanup and entity deletion inside this same transaction.
+    // set for edge cleanup and entity deletion in this cascade.
     let entity_ids = {
-        let mut stmt = tx.prepare(
+        let mut stmt = conn.prepare(
             "SELECT id FROM sem_entity
              WHERE file=?1 OR (file>=?2 AND file<?3)",
         )?;
@@ -83,15 +90,17 @@ pub(crate) fn delete_worktree_cache_rows(db: &Db, wt: &str) -> Result<()> {
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     };
     for id in entity_ids {
-        tx.execute("DELETE FROM sem_edge WHERE src_id=?1", params![id])?;
-        tx.execute("DELETE FROM sem_edge WHERE dst_id=?1", params![id])?;
-        tx.execute("DELETE FROM sem_entity WHERE id=?1", params![id])?;
+        conn.execute("DELETE FROM sem_edge WHERE src_id=?1", params![id])?;
+        conn.execute("DELETE FROM sem_edge WHERE dst_id=?1", params![id])?;
+        conn.execute("DELETE FROM sem_entity WHERE id=?1", params![id])?;
     }
     // glyph_cache is lazy-created and may not exist on a fresh database.
     if has_glyph_cache {
-        tx.execute("DELETE FROM glyph_cache WHERE worktree=?1", params![wt])?;
+        conn.execute("DELETE FROM glyph_cache WHERE worktree=?1", params![wt])?;
     }
-    tx.commit()?;
+    if let Some(tx) = tx {
+        tx.commit()?;
+    }
     Ok(())
 }
 
@@ -1841,6 +1850,17 @@ mod tests {
         }
         assert_eq!(db.all_glyph_cache().len(), 1);
         assert_eq!(db.all_glyph_cache()[0].0, "/wt/a2");
+    }
+
+    #[test]
+    fn del_worktree_works_inside_an_existing_transaction() {
+        let db = Db::open_memory().unwrap();
+        db.put_worktree("tab", "/repo", "/wt/a", "feat", None, None)
+            .unwrap();
+
+        db.transaction(|db| db.del_worktree("/wt/a")).unwrap();
+
+        assert!(db.worktree_record("/wt/a").unwrap().is_none());
     }
 
     /// The LOC cache had no cascade at all, which is how a live DB came to hold
