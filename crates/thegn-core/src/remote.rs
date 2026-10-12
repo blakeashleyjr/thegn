@@ -691,13 +691,23 @@ impl GitLoc {
             .resolve_git_path(rel)
             .ok_or_else(|| std::io::Error::other(format!("cannot resolve git path {rel:?}")))?;
         match self {
-            GitLoc::Local(_) => match std::fs::read(p) {
+            GitLoc::Local(_) => match std::fs::read(&p) {
                 Ok(bytes) => Ok(Some(bytes)),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    match std::fs::symlink_metadata(&p) {
+                        Ok(_) => Err(error),
+                        Err(metadata_error)
+                            if metadata_error.kind() == std::io::ErrorKind::NotFound =>
+                        {
+                            Ok(None)
+                        }
+                        Err(metadata_error) => Err(metadata_error),
+                    }
+                }
                 Err(error) => Err(error),
             },
             GitLoc::Remote { ssh, .. } => {
-                let script = tagged_git_path_read_script(&p);
+                let script = tagged_git_path_read_ssh_command(&p);
                 let out = self.ssh_command(ssh, script).output()?;
                 tagged_git_path_read_result(rel, out)
             }
@@ -832,6 +842,11 @@ fn tagged_git_path_read_script(path: &str) -> String {
     )
 }
 
+fn tagged_git_path_read_ssh_command(path: &str) -> String {
+    let script = tagged_git_path_read_script(path);
+    format!("sh -c {}", util::sh_quote(&script))
+}
+
 fn tagged_git_path_read_result(
     rel: &str,
     output: std::process::Output,
@@ -897,6 +912,29 @@ mod tests {
         let loc = GitLoc::from_db("/wt/x", None);
         assert!(!loc.is_remote());
         assert_eq!(loc.path(), "/wt/x");
+    }
+
+    #[test]
+    fn checked_local_read_treats_dangling_symlink_as_unreadable() {
+        let dir = tempfile::tempdir().unwrap();
+        let init = Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
+        assert!(init.success());
+        let link = dir.path().join(".git/dangling-marker");
+        std::os::unix::fs::symlink("missing-target", &link).unwrap();
+
+        let loc = GitLoc::Local(dir.path().to_path_buf());
+        assert!(loc.read_git_path_checked("dangling-marker").is_err());
+    }
+
+    #[test]
+    fn ssh_tagged_read_script_is_explicitly_run_by_posix_shell() {
+        let command = tagged_git_path_read_ssh_command("/work tree/marker");
+        assert!(command.starts_with("sh -c "), "{command}");
+        assert!(command.contains("[ -e '/work tree/marker' ]"), "{command}");
     }
 
     #[test]
