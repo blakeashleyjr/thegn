@@ -297,7 +297,10 @@ fn join_pipe(pipe: Option<PipeReader>, deadline: Instant) -> String {
 const HOOK_LOG_KEEP_NEWEST: usize = 20;
 const HOOK_LOG_MAX_AGE_SECS: u64 = 14 * 86_400;
 const HOOK_LOG_PRUNE_INTERVAL_SECS: i64 = 60 * 60;
+const HOOK_LOG_ALLOCATION_ATTEMPTS: usize = 1000;
 static LAST_LOG_PRUNE: OnceLock<Mutex<std::collections::HashMap<PathBuf, i64>>> = OnceLock::new();
+static LAST_LOG_INDEX: OnceLock<Mutex<std::collections::HashMap<(PathBuf, String), u64>>> =
+    OnceLock::new();
 
 pub(crate) fn log_root() -> PathBuf {
     let state_home = thegn_core::util::xdg_state_home();
@@ -404,9 +407,39 @@ fn log_path(
     std::fs::create_dir_all(&dir)?;
     crate::platform::restrict_dir_owner_only_checked(&dir)?;
 
-    let event_name = event.as_str();
-    let mut index = 1u64;
-    loop {
+    let event_name = event.as_str().to_string();
+    let key = (dir.clone(), event_name.clone());
+    let mut indices = LAST_LOG_INDEX
+        .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut index = match indices.get(&key).copied() {
+        Some(last) => last.checked_add(1),
+        None => {
+            let mut max_index = 0u64;
+            for entry in std::fs::read_dir(&dir)? {
+                let entry = entry?;
+                if let Some(found) = entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|name| name.strip_prefix(&format!("{event_name}-")))
+                    .and_then(|name| name.strip_suffix(".log"))
+                    .and_then(|name| name.parse::<u64>().ok())
+                {
+                    max_index = max_index.max(found);
+                }
+            }
+            max_index.checked_add(1)
+        }
+    }
+    .ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "hook log index space exhausted",
+        )
+    })?;
+
+    for _ in 0..HOOK_LOG_ALLOCATION_ATTEMPTS {
         let path = dir.join(format!("{event_name}-{index}.log"));
         match std::fs::OpenOptions::new()
             .write(true)
@@ -414,7 +447,10 @@ fn log_path(
             .open(&path)
         {
             Ok(file) => {
+                // Keep this reservation even if append_log later fails: reusing a path
+                // already returned in a HookRunResult could identify a different run.
                 drop(file);
+                indices.insert(key, index);
                 return Ok(path);
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -428,6 +464,10 @@ fn log_path(
             Err(error) => return Err(error),
         }
     }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        format!("could not allocate hook log after {HOOK_LOG_ALLOCATION_ATTEMPTS} attempts"),
+    ))
 }
 
 const FAILURE_TAIL_BYTES: usize = 4096;
@@ -635,6 +675,18 @@ mod tests {
         let next = log_path(dir.path(), &worktree, HookEvent::PostCreate).unwrap();
         assert_ne!(next, second_process_path);
         assert!(next.ends_with("post_create-3.log"));
+    }
+
+    #[test]
+    fn hook_log_allocation_does_not_reuse_pruned_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let worktree = format!("/isolated-hook-log-prune-{}", std::process::id());
+        let first = log_path(dir.path(), &worktree, HookEvent::PostCreate).unwrap();
+        std::fs::remove_file(&first).unwrap();
+
+        let next = log_path(dir.path(), &worktree, HookEvent::PostCreate).unwrap();
+        assert_ne!(next, first);
+        assert!(next.ends_with("post_create-2.log"));
     }
 
     #[test]
