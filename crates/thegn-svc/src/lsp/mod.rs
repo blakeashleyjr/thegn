@@ -38,6 +38,61 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
+/// Variables available to local language servers after clearing the inherited
+/// process environment. Keep this list limited to process basics and common
+/// language toolchain discovery. Credentials, Git targeting, loader injection,
+/// runtime injection, and THEGN control variables are deliberately excluded.
+const SERVER_ENV_ALLOWLIST: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "LANG",
+    "LANGUAGE",
+    "TZ",
+    "TERM",
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+    "XDG_RUNTIME_DIR",
+    "XDG_CONFIG_HOME",
+    "XDG_CACHE_HOME",
+    "XDG_DATA_HOME",
+    "DBUS_SESSION_BUS_ADDRESS",
+    "NIX_PROFILES",
+    "NIX_SSL_CERT_FILE",
+    "SSL_CERT_FILE",
+    "CARGO_HOME",
+    "RUSTUP_HOME",
+    "RUSTUP_TOOLCHAIN",
+    "GOPATH",
+    "GOROOT",
+    "GOMODCACHE",
+    "GOCACHE",
+    "NODE_PATH",
+    "VIRTUAL_ENV",
+    "PYTHONHOME",
+    "JAVA_HOME",
+    "SystemRoot",
+    "PATHEXT",
+    "USERPROFILE",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "COMSPEC",
+];
+
+fn server_env<I>(vars: I) -> Vec<(String, String)>
+where
+    I: IntoIterator<Item = (String, String)>,
+{
+    vars.into_iter()
+        .filter(|(name, _)| {
+            SERVER_ENV_ALLOWLIST.contains(&name.as_str()) || name.starts_with("LC_")
+        })
+        .collect()
+}
+
 /// The LSP resource contract.  These are protocol safety limits, not user
 /// configuration: every edge is inclusive and the first byte/item over an
 /// edge is rejected or dropped with health recorded.
@@ -1492,6 +1547,8 @@ impl LspClient {
         let spawned = Command::new(cmd)
             .args(rest)
             .current_dir(root)
+            .env_clear()
+            .envs(server_env(std::env::vars()))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -2118,6 +2175,62 @@ fn dispatch(msg: &Value, ctx: &ReaderContext) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn server_environment_keeps_process_and_toolchain_basics() {
+        let env = server_env([
+            ("PATH".to_string(), "/bin".to_string()),
+            ("HOME".to_string(), "/home/test".to_string()),
+            ("XDG_RUNTIME_DIR".to_string(), "/run/user/1".to_string()),
+            ("LC_CTYPE".to_string(), "C.UTF-8".to_string()),
+            ("CARGO_HOME".to_string(), "/home/test/.cargo".to_string()),
+        ]);
+
+        assert_eq!(
+            env.iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>(),
+            ["PATH", "HOME", "XDG_RUNTIME_DIR", "LC_CTYPE", "CARGO_HOME"]
+        );
+    }
+
+    #[test]
+    fn server_environment_drops_credentials_targeting_and_injection() {
+        let env = server_env([
+            ("GH_TOKEN".to_string(), "secret".to_string()),
+            ("ANTHROPIC_API_KEY".to_string(), "secret".to_string()),
+            ("AWS_SECRET_ACCESS_KEY".to_string(), "secret".to_string()),
+            ("SSH_AUTH_SOCK".to_string(), "/agent.sock".to_string()),
+            ("GIT_DIR".to_string(), "/private/repo".to_string()),
+            ("GIT_INDEX_FILE".to_string(), "/private/index".to_string()),
+            ("LD_PRELOAD".to_string(), "/tmp/inject.so".to_string()),
+            (
+                "DYLD_INSERT_LIBRARIES".to_string(),
+                "/tmp/inject.dylib".to_string(),
+            ),
+            (
+                "NODE_OPTIONS".to_string(),
+                "--require=/tmp/hook.js".to_string(),
+            ),
+            ("THEGN_CONTROL_TOKEN".to_string(), "secret".to_string()),
+        ]);
+
+        assert!(env.is_empty());
+    }
+
+    #[test]
+    fn server_environment_requires_exact_names_except_lc_prefix() {
+        let env = server_env([
+            ("PATHX".to_string(), "/tmp/shadow".to_string()),
+            (
+                "HOMEBREW_GITHUB_API_TOKEN".to_string(),
+                "secret".to_string(),
+            ),
+            ("LC_CTYPE".to_string(), "C.UTF-8".to_string()),
+        ]);
+
+        assert_eq!(env, vec![("LC_CTYPE".to_string(), "C.UTF-8".to_string())]);
+    }
 
     struct BlockingWriter {
         entered: Option<Sender<()>>,
