@@ -864,7 +864,7 @@ mod tests {
             let _env = crate::testenv::EnvGuard::unset(&["THEGN_LOG", "THEGN_LOG_LEVEL"]);
             let filter = level_filter(LogLevel::Info).to_string();
             assert!(filter.contains("info"), "{filter}");
-            assert!(filter.contains(BRIDGED_LOG_DIRECTIVE), "{filter}");
+            assert!(filter.contains("log=error"), "{filter}");
             assert!(filter.contains("tokei=error"), "{filter}");
             assert!(!env_level_is_set());
         }
