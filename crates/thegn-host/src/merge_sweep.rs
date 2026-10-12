@@ -68,10 +68,11 @@ impl SweepReport {
     }
 }
 
-/// The landed rows for `repo_root`'s target, projected for the expiry check.
+/// Landed rows for a target, projected for the expiry check.
 ///
-/// Only `landed` rows are candidates. Anything still queued, deferred or
-/// mid-flight is someone's open work by definition.
+/// This query is global: repository scoping happens per row in
+/// `sweep_with_db`. Only `landed` rows are candidates. Anything still queued,
+/// deferred or mid-flight is someone's open work by definition.
 fn landed_entries(db: &Db, target: &str) -> anyhow::Result<Vec<MergeQueueRow>> {
     Ok(db
         .list_merge_queue()?
@@ -234,6 +235,20 @@ fn sweep_with_db(cfg: &Config, repo_root: &Path, force: bool, db: &Db) -> SweepR
         };
         if candidate != identity {
             continue;
+        }
+        match std::fs::canonicalize(&row.worktree) {
+            Ok(canonical) if canonical == Path::new(&row.worktree) => {}
+            Ok(_) | Err(_) => {
+                if force {
+                    report.kept.push((
+                        row.branch.clone(),
+                        "noncanonical or aliased worktree path; row left untouched".into(),
+                    ));
+                } else {
+                    tracing::debug!(branch = %row.branch, worktree = %row.worktree, "landed row has noncanonical or aliased worktree path; leaving it untouched");
+                }
+                continue;
+            }
         }
         entries.push(MergedEntry {
             worktree: row.worktree.clone(),
@@ -781,6 +796,90 @@ mod tests {
             "unknown row must remain unchanged and must not be backfilled"
         );
         assert!(wt.exists());
+    }
+
+    #[test]
+    #[expect(clippy::disallowed_methods)]
+    fn aliased_worktree_is_kept_before_landed_identity_backfill() {
+        let isolation = crate::merge_lifecycle::TestIsolation::new();
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().canonicalize().unwrap();
+        let db_path = parent.join("private.db");
+        let db = Db::open_at(&db_path).unwrap();
+        let (root, wt) = fixture(&parent, "alias", &db, &isolation);
+        std::fs::write(wt.join("landed.txt"), "landed\n").unwrap();
+        let output = isolation
+            .git(&wt)
+            .args(["-c", "core.hooksPath=/dev/null", "add", "landed.txt"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let output = isolation
+            .git(&wt)
+            .args([
+                "-c",
+                "core.hooksPath=/dev/null",
+                "commit",
+                "-q",
+                "-m",
+                "landed",
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let output = isolation
+            .git(&root)
+            .args([
+                "-c",
+                "core.hooksPath=/dev/null",
+                "merge",
+                "--no-ff",
+                "-q",
+                "-m",
+                "plain merge",
+                "feature",
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let alias = parent
+            .join("alias-feature")
+            .join("..")
+            .join("alias-feature");
+        assert_ne!(alias, wt);
+        assert_eq!(std::fs::canonicalize(&alias).unwrap(), wt);
+        rusqlite::Connection::open(&db_path)
+            .unwrap()
+            .execute(
+                "UPDATE merge_queue SET worktree=?1, result_oid=NULL, queued_at=1, updated_at=1 WHERE worktree=?2",
+                rusqlite::params![
+                    alias.to_string_lossy().into_owned(),
+                    wt.to_string_lossy().into_owned()
+                ],
+            )
+            .unwrap();
+
+        let mut cfg = local_config();
+        cfg.merge_queue.on_landed = OnLanded::Expire;
+        cfg.merge_queue.merged_ttl_secs = 1;
+        cfg.merge_queue.target_branch = "main".into();
+        let ordinary = sweep_with_db(&cfg, &root, false, &db);
+        assert!(ordinary.collected.is_empty());
+        let report = sweep_with_db(&cfg, &root, true, &db);
+        assert!(report.collected.is_empty());
+        assert!(
+            report
+                .kept
+                .iter()
+                .any(|(branch, reason)| { branch == "feature" && reason.contains("aliased") })
+        );
+        assert!(wt.exists());
+        assert!(
+            db.list_merge_queue()
+                .unwrap()
+                .iter()
+                .any(|row| { row.worktree == alias.to_string_lossy() && row.result_oid.is_none() })
+        );
     }
 
     #[test]
