@@ -949,7 +949,14 @@ mod tests {
             cols: 80,
             recording: None,
         };
-        svc.tombs.lock().await.insert(session.into(), tomb, 1);
+        let buried_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock is after the Unix epoch")
+            .as_millis() as i64;
+        svc.tombs
+            .lock()
+            .await
+            .insert(session.into(), tomb, buried_at_ms);
 
         let attempts = Mutex::new(HashMap::new());
         let task_svc = svc.clone();
