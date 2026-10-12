@@ -149,7 +149,7 @@ pub(crate) fn rows_for_repo(
     let rows = db.list_merge_queue()?;
     rows.into_iter()
         .filter_map(
-            |r| match row_belongs_to_repo(db, &r.worktree, &root_s, root) {
+            |r| match row_belongs_to_repo(db, &r.worktree, &r.location, &root_s, root) {
                 Ok(true) => Some(Ok(r)),
                 Ok(false) => None,
                 Err(e) => Some(Err(e)),
@@ -159,12 +159,27 @@ pub(crate) fn rows_for_repo(
 }
 
 /// One membership test (see [`rows_for_repo`]): DB repo_path when known, else a
-/// local `git worktree list` fallback for an unregistered worktree.
-fn row_belongs_to_repo(db: &Db, worktree: &str, root_s: &str, root: &Path) -> anyhow::Result<bool> {
+/// local `git worktree list` fallback only for an unregistered local worktree.
+fn row_belongs_to_repo(
+    db: &Db,
+    worktree: &str,
+    location: &str,
+    root_s: &str,
+    root: &Path,
+) -> anyhow::Result<bool> {
     if let Some(rp) = db.repo_root_for(worktree)?
         && !rp.is_empty()
     {
         return Ok(rp == root_s);
+    }
+    if !location.trim().is_empty() && location.trim() != "local" {
+        tracing::debug!(
+            target: "thegn::merge",
+            worktree,
+            location,
+            "cannot attribute remote merge-queue row without a registered repo"
+        );
+        return Ok(false);
     }
     Ok(integrate::main_checkout(Path::new(worktree)).as_deref() == Some(root))
 }
@@ -448,7 +463,7 @@ fn drive_queue_with(
                             error,
                         });
                         out.landed.push(item.branch.clone());
-                        break;
+                        break 'items;
                     }
                     crate::merge_lifecycle::apply_landed(
                         cfg,
