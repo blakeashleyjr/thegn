@@ -335,7 +335,9 @@ impl MediaState {
         self.title = bounded_field(self.title);
         self.artist = bounded_field(self.artist);
         self.album = bounded_field(self.album);
-        self.art_url = self.art_url.map(bounded_field);
+        self.art_url = self
+            .art_url
+            .filter(|url| url.len() <= MAX_FIELD_BYTES && !url.chars().any(char::is_control));
         self.track_id = self.track_id.filter(|id| is_valid_opaque_id(id));
         self
     }
@@ -679,6 +681,13 @@ mod tests {
         }
         .admitted();
         assert_eq!(large.title.len(), MAX_FIELD_BYTES);
+
+        let oversized_art_url = MediaState {
+            art_url: Some("u".repeat(MAX_FIELD_BYTES + 1)),
+            ..Default::default()
+        }
+        .admitted();
+        assert!(oversized_art_url.art_url.is_none());
     }
 
     #[test]
