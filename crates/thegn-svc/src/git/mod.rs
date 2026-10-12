@@ -69,6 +69,7 @@ pub struct DiffEntry {
     pub path: String,
     pub added: u32,
     pub deleted: u32,
+    pub binary: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -327,7 +328,8 @@ pub trait GitBackend: thegn_core::seam::Probe + Send + Sync {
 
     /// A merge/rebase/cherry-pick in progress, or `None` when every required
     /// probe successfully observed absence. Probe failures are `Err`, preserving
-    /// the caller's last-known state. Merge/cherry-pick/
+    /// the caller's last-known state, except the non-bridged remote rebase probe;
+    /// see `remote.rs` for its absence/unreadable ambiguity. Merge/cherry-pick/
     /// revert are probed via `rev-parse --verify` of their `*_HEAD` pseudo-refs
     /// (git clears those on commit/abort); rebase is probed via the on-disk
     /// state dir, since `REBASE_HEAD` survives a completed rebase. Both work for
@@ -982,6 +984,7 @@ pub(crate) fn parse_numstat(out: &str) -> Result<Vec<DiffEntry>> {
                 added: 0,
                 deleted: 0,
                 path: p.to_string(),
+                binary: true,
             });
             continue;
         }
@@ -992,6 +995,7 @@ pub(crate) fn parse_numstat(out: &str) -> Result<Vec<DiffEntry>> {
             added,
             deleted,
             path: p.to_string(),
+            binary: false,
         });
     }
     Ok(v)
@@ -1006,13 +1010,9 @@ pub enum DiffCount {
     Unavailable,
 }
 
-/// Convert per-file rows into typed added/deleted totals. `binary_paths` is the
-/// number of rows whose numstat line counts were the binary marker. A total
-/// containing binary paths cannot be represented as an exact line count.
-pub(crate) fn typed_totals(
-    entries: Result<&[DiffEntry]>,
-    binary_paths: usize,
-) -> (DiffCount, DiffCount) {
+/// Convert per-file rows into typed added/deleted totals. Mixed text/binary
+/// diffs retain their exact text-line sums; binary-only diffs report `Binary`.
+pub fn typed_totals(entries: Result<&[DiffEntry]>) -> (DiffCount, DiffCount) {
     let Ok(entries) = entries else {
         return (DiffCount::Unavailable, DiffCount::Unavailable);
     };
@@ -1020,7 +1020,14 @@ pub(crate) fn typed_totals(
     let mut deleted = 0u32;
     let mut added_capped = false;
     let mut deleted_capped = false;
+    let mut text_rows = 0usize;
+    let mut binary_rows = 0usize;
     for entry in entries {
+        if entry.binary {
+            binary_rows += 1;
+            continue;
+        }
+        text_rows += 1;
         match added.checked_add(entry.added) {
             Some(total) => added = total,
             None => {
@@ -1038,14 +1045,14 @@ pub(crate) fn typed_totals(
     }
     let added = if added_capped {
         DiffCount::Capped
-    } else if binary_paths > 0 {
+    } else if text_rows == 0 && binary_rows > 0 {
         DiffCount::Binary
     } else {
         DiffCount::Exact(added)
     };
     let deleted = if deleted_capped {
         DiffCount::Capped
-    } else if binary_paths > 0 {
+    } else if text_rows == 0 && binary_rows > 0 {
         DiffCount::Binary
     } else {
         DiffCount::Exact(deleted)
@@ -1059,7 +1066,15 @@ pub(crate) fn typed_totals(
 /// depends on the build profile or backend. Shared by the batched
 /// [`GitBackend::glyph_reads`] sidebar diff-stat reads.
 pub(crate) fn sum_numstat(out: &str) -> Result<(u32, u32)> {
-    Ok(sum_entries(&parse_numstat(out)?))
+    let entries = parse_numstat(out)?;
+    let (added, deleted) = typed_totals(Ok(&entries));
+    let numeric = |count| match count {
+        DiffCount::Exact(n) => n,
+        DiffCount::Binary => 0,
+        DiffCount::Capped => u32::MAX,
+        DiffCount::Unavailable => 0,
+    };
+    Ok((numeric(added), numeric(deleted)))
 }
 
 /// Saturating `(added, deleted)` totals of per-file rows (shared by both backends).
@@ -2337,6 +2352,7 @@ mod tests {
         assert_eq!(rows[0].path, "a");
         assert_eq!(rows[1].path, "b.png");
         assert_eq!((rows[1].added, rows[1].deleted), (0, 0));
+        assert!(rows[1].binary);
     }
 
     #[test]
@@ -2347,15 +2363,17 @@ mod tests {
                 path: "a".into(),
                 added: max,
                 deleted: 0,
+                binary: false,
             },
             DiffEntry {
                 path: "b".into(),
                 added: 1,
                 deleted: 0,
+                binary: false,
             },
         ];
         assert_eq!(
-            typed_totals(Ok(&saturated), 0),
+            typed_totals(Ok(&saturated)),
             (DiffCount::Capped, DiffCount::Exact(0))
         );
 
@@ -2363,14 +2381,33 @@ mod tests {
             path: "image.png".into(),
             added: 0,
             deleted: 0,
+            binary: true,
         }];
         assert_eq!(
-            typed_totals(Ok(&binary), 1),
+            typed_totals(Ok(&binary)),
             (DiffCount::Binary, DiffCount::Binary)
         );
         assert_eq!(
-            typed_totals(Err(anyhow::anyhow!("numstat failed")), 0),
+            typed_totals(Err(anyhow::anyhow!("numstat failed"))),
             (DiffCount::Unavailable, DiffCount::Unavailable)
+        );
+        let mixed = [
+            DiffEntry {
+                path: "code.rs".into(),
+                added: 40,
+                deleted: 0,
+                binary: false,
+            },
+            DiffEntry {
+                path: "image.png".into(),
+                added: 0,
+                deleted: 0,
+                binary: true,
+            },
+        ];
+        assert_eq!(
+            typed_totals(Ok(&mixed)),
+            (DiffCount::Exact(40), DiffCount::Exact(0))
         );
     }
 
@@ -2384,8 +2421,13 @@ mod tests {
     #[test]
     fn merge_state_reports_non_repository_probe_failure() {
         let fixture = tempfile::tempdir().unwrap();
+        std::fs::write(fixture.path().join(".git"), "").unwrap();
         let loc = GitLoc::Local(fixture.path().to_path_buf());
-        assert!(CliGit.merge_state(&loc).is_err());
+        let error = CliGit.merge_state(&loc).unwrap_err().to_string();
+        assert!(
+            error.contains("probe failed") || error.contains("not a git repository"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

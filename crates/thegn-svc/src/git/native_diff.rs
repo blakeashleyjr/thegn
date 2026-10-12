@@ -313,6 +313,7 @@ fn tree_to_tree(old: &gix::Tree<'_>, new: &gix::Tree<'_>) -> Result<Vec<DiffEntr
                     path,
                     added: 1,
                     deleted: 1,
+                    binary: false,
                 });
                 cache.clear_resource_cache_keep_allocation();
                 return Ok(std::ops::ControlFlow::Continue(()));
@@ -333,11 +334,13 @@ fn tree_to_tree(old: &gix::Tree<'_>, new: &gix::Tree<'_>) -> Result<Vec<DiffEntr
                     return Ok(std::ops::ControlFlow::Break(()));
                 }
             };
+            let binary = counts.is_none();
             let (added, deleted) = counts.map(|c| (c.insertions, c.removals)).unwrap_or((0, 0));
             out.push(DiffEntry {
                 path,
                 added,
                 deleted,
+                binary,
             });
             cache.clear_resource_cache_keep_allocation();
             Ok::<_, anyhow::Error>(std::ops::ControlFlow::Continue(()))
@@ -471,6 +474,7 @@ fn tree_to_worktree(repo: &gix::Repository, rev: &str) -> Result<Vec<DiffEntry>>
                     path,
                     added: d.count_additions(),
                     deleted: d.count_removals(),
+                    binary: false,
                 });
             }
             gix::diff::blob::platform::prepare_diff::Operation::SourceOrDestinationIsBinary => {
@@ -478,6 +482,7 @@ fn tree_to_worktree(repo: &gix::Repository, rev: &str) -> Result<Vec<DiffEntry>>
                     path,
                     added: 0,
                     deleted: 0,
+                    binary: true,
                 });
             }
             gix::diff::blob::platform::prepare_diff::Operation::ExternalCommand { .. } => {
@@ -870,8 +875,8 @@ mod tests {
         let repo = TestRepo::new("nd-bin");
         repo.commit_file("a.txt", "x\n", "base");
         repo.out(&["checkout", "-q", "-b", "feat"]);
-        // NUL bytes make git call it binary; `--numstat` then prints `-`/`-`,
-        // which `parse_numstat` omits.
+        // NUL bytes make git call it binary; `--numstat` prints `-`/`-` and
+        // the shared parser keeps that path with a binary marker.
         std::fs::write(repo.dir.join("blob.bin"), [0u8, 1, 2, 0, 3]).unwrap();
         repo.out(&["add", "blob.bin"]);
         repo.out(&["commit", "-q", "-m", "add binary"]);
@@ -897,18 +902,16 @@ mod tests {
         let want = super::super::parse_numstat(&cli).unwrap();
         let mut got = diff_entries(&repo.dir, "main...HEAD").unwrap();
         got.sort_by(|x, y| x.path.cmp(&y.path));
-        for w in &want {
-            let g = got
-                .iter()
-                .find(|g| g.path == w.path)
-                .expect("text row remains represented");
-            assert_eq!((w.added, w.deleted), (g.added, g.deleted));
+        let mut want = want;
+        want.sort_by(|x, y| x.path.cmp(&y.path));
+        assert_eq!(want.len(), got.len());
+        for (w, g) in want.iter().zip(&got) {
+            assert_eq!(w.path, g.path);
+            assert_eq!(
+                (w.added, w.deleted, w.binary),
+                (g.added, g.deleted, g.binary)
+            );
         }
-        let binary = got
-            .iter()
-            .find(|entry| entry.path == "blob.bin")
-            .expect("binary path remains visible");
-        assert_eq!((binary.added, binary.deleted), (0, 0));
     }
 
     #[test]
