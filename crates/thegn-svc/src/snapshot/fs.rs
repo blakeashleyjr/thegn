@@ -1,10 +1,10 @@
 //! Host-local filesystem snapshot store — the zero-config default. Layout:
 //! `<root>/<repo>/<worktree>/<env>/<snapshot-id>/{manifest.json,bundle,patch,tar}`
 //! with `<root>` = `[lifecycle.snapshot] dir` or
-//! `$XDG_STATE_HOME/thegn/snapshots`. Writes are atomic (`.tmp` + rename)
-//! and the manifest lands last, so a torn snapshot is invisible to `list`.
+//! `$XDG_STATE_HOME/thegn/snapshots`.
 
-use std::fs;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -12,6 +12,8 @@ use thegn_core::config_env_tables::SnapshotStoreConfig;
 use thegn_core::snapshot_meta::{SnapshotKey, SnapshotManifest};
 
 use super::SnapshotStore;
+
+const MAX_SNAPSHOT_FILE_BYTES: u64 = 1024 * 1024 * 1024;
 
 pub struct FsSnapshotStore {
     root: PathBuf,
@@ -37,14 +39,191 @@ impl FsSnapshotStore {
         Ok(self.root.join(key.prefix()).join(id))
     }
 
-    fn write_atomic(dir: &Path, name: &str, data: &[u8]) -> Result<()> {
-        fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
-        let tmp = dir.join(format!(".tmp-{name}"));
-        fs::write(&tmp, data).with_context(|| format!("write {}", tmp.display()))?;
-        let dst = dir.join(name);
-        fs::rename(&tmp, &dst).with_context(|| format!("publish {}", dst.display()))?;
+    fn prepare_dir(&self, dir: &Path) -> Result<()> {
+        // Do not chmod ancestors such as /tmp or /home. Validate the configured
+        // root, then each store-owned component below it independently.
+        thegn_core::fsperm::ensure_private_dir(&self.root)
+            .with_context(|| format!("prepare private snapshot root {}", self.root.display()))?;
+        let relative = dir
+            .strip_prefix(&self.root)
+            .context("snapshot path escaped store root")?;
+        let mut current = self.root.clone();
+        for component in relative.components() {
+            current.push(component.as_os_str());
+            match fs::symlink_metadata(&current) {
+                Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => {
+                    anyhow::bail!(
+                        "refusing non-directory snapshot component {}",
+                        current.display()
+                    );
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    match fs::create_dir(&current) {
+                        Ok(()) => sync_directory(current.parent().unwrap_or(&self.root))?,
+                        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                        Err(error) => {
+                            return Err(error)
+                                .with_context(|| format!("create {}", current.display()));
+                        }
+                    }
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| format!("stat {}", current.display()));
+                }
+            }
+            thegn_core::fsperm::ensure_private_dir(&current).with_context(|| {
+                format!("prepare private snapshot directory {}", current.display())
+            })?;
+        }
         Ok(())
     }
+
+    fn check_existing_dir(&self, dir: &Path) -> Result<()> {
+        let relative = dir
+            .strip_prefix(&self.root)
+            .context("snapshot path escaped store root")?;
+        let mut current = self.root.clone();
+        let mut components = relative.components();
+        let meta = fs::symlink_metadata(&current)
+            .with_context(|| format!("stat snapshot directory {}", current.display()))?;
+        check_private_directory(&current, &meta)?;
+        for component in &mut components {
+            current.push(component.as_os_str());
+            let meta = fs::symlink_metadata(&current)
+                .with_context(|| format!("stat snapshot directory {}", current.display()))?;
+            check_private_directory(&current, &meta)?;
+        }
+        Ok(())
+    }
+
+    fn write_atomic(&self, dir: &Path, name: &str, data: &[u8]) -> Result<()> {
+        check_component(name)?;
+        self.prepare_dir(dir)?;
+        let dst = dir.join(name);
+        match fs::symlink_metadata(&dst) {
+            Ok(meta) if meta.file_type().is_symlink() || !meta.file_type().is_file() => {
+                anyhow::bail!(
+                    "refusing non-regular snapshot destination {}",
+                    dst.display()
+                );
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).with_context(|| format!("stat {}", dst.display())),
+        }
+
+        let (tmp, mut file) = create_staging_file(dir, name)?;
+        let result = file
+            .write_all(data)
+            .and_then(|()| file.sync_all())
+            .and_then(|()| fs::rename(&tmp, &dst))
+            .and_then(|()| sync_directory(dir));
+        if let Err(error) = result {
+            drop(file);
+            if tmp.exists() {
+                fs::remove_file(&tmp)
+                    .with_context(|| format!("remove staging file {}", tmp.display()))?;
+            }
+            return Err(error).with_context(|| format!("publish {}", dst.display()));
+        }
+        Ok(())
+    }
+
+    fn read_file(path: &Path) -> Result<Vec<u8>> {
+        let mut file = thegn_core::fsperm::open_regular_file_nofollow(path)
+            .with_context(|| format!("open snapshot file {}", path.display()))?;
+        let mut bytes = Vec::new();
+        Read::by_ref(&mut file)
+            .take(MAX_SNAPSHOT_FILE_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .with_context(|| format!("read snapshot file {}", path.display()))?;
+        if bytes.len() as u64 > MAX_SNAPSHOT_FILE_BYTES {
+            anyhow::bail!(
+                "snapshot file {} exceeds the {} byte limit",
+                path.display(),
+                MAX_SNAPSHOT_FILE_BYTES
+            );
+        }
+        Ok(bytes)
+    }
+}
+
+fn create_staging_file(dir: &Path, name: &str) -> Result<(PathBuf, File)> {
+    for _ in 0..16 {
+        let mut random = [0_u8; 16];
+        getrandom::fill(&mut random).context("generate snapshot staging name")?;
+        let suffix = random
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let path = dir.join(format!(".tmp-{name}-{suffix}"));
+        match open_staging_file(&path) {
+            Ok(file) => {
+                let meta = file.metadata().context("stat open snapshot staging file")?;
+                if !meta.file_type().is_file() {
+                    anyhow::bail!("snapshot staging file is not a private regular file");
+                }
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    if meta.nlink() != 1 {
+                        anyhow::bail!("snapshot staging file has unexpected hard links");
+                    }
+                    if !thegn_core::fsperm::owned_by_current_user(&meta) {
+                        anyhow::bail!("snapshot staging file is owned by another user");
+                    }
+                }
+                return Ok((path, file));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("create staging file {}", path.display()));
+            }
+        }
+    }
+    anyhow::bail!("could not allocate a unique snapshot staging file for {name:?}")
+}
+
+fn open_staging_file(path: &Path) -> std::io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(path)?;
+    if let Err(error) = thegn_core::fsperm::restrict_to_owner(path) {
+        drop(file);
+        fs::remove_file(path)?;
+        return Err(error);
+    }
+    Ok(file)
+}
+
+fn sync_directory(path: &Path) -> std::io::Result<()> {
+    File::open(path)?.sync_all()
+}
+
+fn check_private_directory(path: &Path, meta: &fs::Metadata) -> Result<()> {
+    if meta.file_type().is_symlink() || !meta.is_dir() {
+        anyhow::bail!(
+            "refusing non-directory snapshot component {}",
+            path.display()
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if !thegn_core::fsperm::owned_by_current_user(meta)
+            || meta.permissions().mode() & 0o777 != 0o700
+        {
+            anyhow::bail!("snapshot directory {} is not owner-private", path.display());
+        }
+    }
+    Ok(())
 }
 
 /// Reject ids/names that could escape the snapshot directory.
@@ -58,43 +237,73 @@ fn check_component(s: &str) -> Result<()> {
 impl SnapshotStore for FsSnapshotStore {
     fn put(&self, key: &SnapshotKey, id: &str, name: &str, data: &[u8]) -> Result<()> {
         check_component(name)?;
-        Self::write_atomic(&self.snap_dir(key, id)?, name, data)
+        self.write_atomic(&self.snap_dir(key, id)?, name, data)
     }
 
     fn get(&self, key: &SnapshotKey, id: &str, name: &str) -> Result<Vec<u8>> {
         check_component(name)?;
-        let p = self.snap_dir(key, id)?.join(name);
-        fs::read(&p).with_context(|| format!("read {}", p.display()))
+        let dir = self.snap_dir(key, id)?;
+        self.check_existing_dir(&dir)?;
+        let p = dir.join(name);
+        Self::read_file(&p)
     }
 
     fn put_manifest(&self, key: &SnapshotKey, manifest: &SnapshotManifest) -> Result<()> {
         let data = serde_json::to_vec_pretty(manifest)?;
-        Self::write_atomic(&self.snap_dir(key, &manifest.id)?, "manifest.json", &data)
+        self.write_atomic(&self.snap_dir(key, &manifest.id)?, "manifest.json", &data)
     }
 
     fn get_manifest(&self, key: &SnapshotKey, id: &str) -> Result<SnapshotManifest> {
-        let p = self.snap_dir(key, id)?.join("manifest.json");
-        let data = fs::read(&p).with_context(|| format!("read {}", p.display()))?;
-        Ok(serde_json::from_slice(&data)?)
+        let dir = self.snap_dir(key, id)?;
+        self.check_existing_dir(&dir)?;
+        let p = dir.join("manifest.json");
+        let data = Self::read_file(&p)?;
+        let manifest: SnapshotManifest = serde_json::from_slice(&data)?;
+        if manifest.id != id {
+            anyhow::bail!(
+                "snapshot manifest id {:?} does not match directory id {id:?}",
+                manifest.id
+            );
+        }
+        Ok(manifest)
     }
 
     fn list(&self, key: &SnapshotKey) -> Result<Vec<SnapshotManifest>> {
         let dir = self.root.join(key.prefix());
         let mut out = Vec::new();
+        match self.check_existing_dir(&dir) {
+            Ok(()) => {}
+            Err(error)
+                if error
+                    .root_cause()
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|io_error| io_error.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                return Ok(out);
+            }
+            Err(error) => return Err(error),
+        }
         let entries = match fs::read_dir(&dir) {
             Ok(e) => e,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
             Err(e) => return Err(e).with_context(|| format!("list {}", dir.display())),
         };
-        for entry in entries.flatten() {
-            // Only manifest-bearing dirs are real snapshots; a torn capture
-            // (artifacts without a manifest) is invisible garbage here.
-            let Ok(data) = fs::read(entry.path().join("manifest.json")) else {
-                continue;
-            };
-            if let Ok(m) = serde_json::from_slice::<SnapshotManifest>(&data) {
-                out.push(m);
+        for entry in entries {
+            let entry = entry.with_context(|| format!("read entry in {}", dir.display()))?;
+            let id = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| anyhow::anyhow!("non-UTF-8 snapshot directory name"))?;
+            check_component(&id)?;
+            let meta = fs::symlink_metadata(entry.path())?;
+            if meta.file_type().is_symlink() || !meta.is_dir() {
+                anyhow::bail!(
+                    "refusing non-directory snapshot entry {}",
+                    entry.path().display()
+                );
             }
+            let manifest = self.get_manifest(key, &id)?;
+            out.push(manifest);
         }
         out.sort_by(|a, b| a.id.cmp(&b.id));
         Ok(out)
@@ -102,11 +311,27 @@ impl SnapshotStore for FsSnapshotStore {
 
     fn delete(&self, key: &SnapshotKey, id: &str) -> Result<()> {
         let dir = self.snap_dir(key, id)?;
-        match fs::remove_dir_all(&dir) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e).with_context(|| format!("delete {}", dir.display())),
+        if let Err(error) = self.check_existing_dir(dir.parent().unwrap_or(&self.root)) {
+            if error
+                .root_cause()
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io_error| io_error.kind() == std::io::ErrorKind::NotFound)
+            {
+                return Ok(());
+            }
+            return Err(error);
         }
+        match fs::symlink_metadata(&dir) {
+            Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => {
+                anyhow::bail!("refusing non-directory snapshot path {}", dir.display());
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e).with_context(|| format!("stat {}", dir.display())),
+        }
+        fs::remove_dir_all(&dir).with_context(|| format!("delete {}", dir.display()))?;
+        sync_directory(dir.parent().unwrap_or(&self.root))
+            .context("sync snapshot directory after delete")
     }
 }
 
@@ -165,7 +390,6 @@ mod tests {
         s.put(&k, "00000000000000000005-dead", "bundle", b"x")
             .unwrap();
         assert!(s.list(&k).unwrap().is_empty());
-        // No tmp droppings either — writes publish or vanish.
         let m = manifest(6);
         s.put_manifest(&k, &m).unwrap();
         let dir = tmp.path().join(k.prefix()).join(&m.id);
@@ -188,9 +412,8 @@ mod tests {
         let ids: Vec<String> = s.list(&k).unwrap().into_iter().map(|m| m.id).collect();
         assert_eq!(ids, vec![b.id.clone(), a.id.clone()]);
         s.delete(&k, &b.id).unwrap();
-        s.delete(&k, &b.id).unwrap(); // second delete: no error
+        s.delete(&k, &b.id).unwrap();
         assert_eq!(s.list(&k).unwrap().len(), 1);
-        // Missing keys list as empty, not as an error.
         let other = SnapshotKey {
             repo_slug: "nope".into(),
             worktree_slug: "x".into(),
@@ -207,5 +430,56 @@ mod tests {
         assert!(s.put(&k, "../escape", "bundle", b"x").is_err());
         assert!(s.put(&k, "ok-id", "a/b", b"x").is_err());
         assert!(s.get(&k, "..", "bundle").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refuses_symlink_destinations_and_reads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(tmp.path());
+        let k = key();
+        let id = "snapshot";
+        let dir = s.snap_dir(&k, id).unwrap();
+        s.prepare_dir(&dir).unwrap();
+        let target = tmp.path().join("canary");
+        fs::write(&target, b"safe").unwrap();
+        std::os::unix::fs::symlink(&target, dir.join("bundle")).unwrap();
+        assert!(s.put(&k, id, "bundle", b"clobber").is_err());
+        assert!(s.get(&k, id, "bundle").is_err());
+        assert_eq!(fs::read(target).unwrap(), b"safe");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refuses_symlinked_staging_candidate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(tmp.path());
+        let k = key();
+        let id = "snapshot";
+        let dir = s.snap_dir(&k, id).unwrap();
+        s.prepare_dir(&dir).unwrap();
+        let target = tmp.path().join("canary");
+        fs::write(&target, b"safe").unwrap();
+        // This was the old predictable staging name. The new publication
+        // chooses a random sibling and must never write through this link.
+        std::os::unix::fs::symlink(&target, dir.join(".tmp-bundle")).unwrap();
+        s.put(&k, id, "bundle", b"data").unwrap();
+        assert_eq!(fs::read(target).unwrap(), b"safe");
+    }
+
+    #[test]
+    fn rejects_manifest_whose_id_does_not_match_its_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(tmp.path());
+        let k = key();
+        let dir = s.snap_dir(&k, "directory-id").unwrap();
+        s.prepare_dir(&dir).unwrap();
+        fs::write(
+            dir.join("manifest.json"),
+            serde_json::to_vec(&manifest(10)).unwrap(),
+        )
+        .unwrap();
+        assert!(s.get_manifest(&k, "directory-id").is_err());
+        assert!(s.list(&k).is_err());
     }
 }
