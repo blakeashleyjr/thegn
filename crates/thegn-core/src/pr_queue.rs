@@ -356,6 +356,78 @@ pub fn decide(blocker: &Blocker, facts: &PrQueueFacts, cfg: &PrQueueConfig) -> Q
     }
 }
 
+/// Apply the shared safety policy required before dispatching a PR agent.
+///
+/// Callers still establish facts that require I/O (such as authorship proof and
+/// current checkout state); this function makes the policy decision from those
+/// facts and the persisted queue row.
+pub fn admit_agent_dispatch(
+    row_status: &str,
+    blocker: &Blocker,
+    facts: &PrQueueFacts,
+    new_head: &str,
+    cfg: &PrQueueConfig,
+) -> Result<TaskKind, String> {
+    let status = PrqStatus::parse(row_status)
+        .ok_or_else(|| format!("unknown PR queue status `{row_status}`; agent dispatch refused"))?;
+    if status.is_settled() || matches!(status, PrqStatus::AgentRunning | PrqStatus::Merging) {
+        return Err(format!(
+            "PR queue row is `{}`; agent dispatch refused",
+            status.as_str()
+        ));
+    }
+    if !cfg.enabled {
+        return Err("PR queue is disabled; agent dispatch refused".into());
+    }
+    if let Some(kind) = blocker.watch_kind().filter(|kind| !cfg.watches(*kind)) {
+        let class = match kind {
+            PrWatchKind::Ci => "CI",
+            PrWatchKind::Conflict => "conflict",
+            PrWatchKind::Review => "review",
+        };
+        return Err(format!(
+            "{class} is not in [pr_queue] watch; agent dispatch refused"
+        ));
+    }
+    match decide(blocker, facts, cfg) {
+        QueueAction::DispatchAgent(kind) => {
+            if foreign_push(facts.last_head_oid.as_deref(), new_head) && cfg.pause_on_foreign_push {
+                Err(
+                    "someone else pushed to this branch — not running an agent over their work"
+                        .into(),
+                )
+            } else {
+                Ok(kind)
+            }
+        }
+        QueueAction::Wait if !facts.agent_available => {
+            Err("no PR-queue agent is configured; agent dispatch refused".into())
+        }
+        QueueAction::Wait if cfg.own_prs_only && !facts.is_own => {
+            Err("PR is not authored by this user; agent dispatch refused".into())
+        }
+        QueueAction::Wait => Err("PR queue policy does not permit agent dispatch".into()),
+        QueueAction::NeedsHuman(reason) => Err(reason),
+        QueueAction::Drop => Err("PR is closed; agent dispatch refused".into()),
+        _ => Err("PR blocker does not permit agent dispatch".into()),
+    }
+}
+
+/// Convert an agent dispatch into the shared foreign-push hold when configured.
+pub fn pause_for_foreign_push(
+    action: QueueAction,
+    moved: bool,
+    cfg: &PrQueueConfig,
+) -> QueueAction {
+    if moved && cfg.pause_on_foreign_push && matches!(action, QueueAction::DispatchAgent(_)) {
+        QueueAction::NeedsHuman(
+            "someone else pushed to this branch — not running an agent over their work".into(),
+        )
+    } else {
+        action
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -710,6 +782,163 @@ mod tests {
         assert!(
             !foreign_push(Some("abc"), ""),
             "an unknown new head is a fetch failure, not a teammate"
+        );
+    }
+
+    #[test]
+    fn shared_agent_admission_combines_status_watch_and_foreign_push_policy() {
+        let statuses = [
+            PrqStatus::Watching,
+            PrqStatus::BlockedCi,
+            PrqStatus::BlockedConflict,
+            PrqStatus::BlockedReview,
+            PrqStatus::AgentRunning,
+            PrqStatus::Ready,
+            PrqStatus::Merging,
+            PrqStatus::Merged,
+            PrqStatus::NeedsHuman,
+            PrqStatus::Closed,
+        ];
+        let blocker = Blocker::Ci(vec!["build".into()]);
+        for status in statuses {
+            for watched in [true, false] {
+                for (previous, pause, moved) in [
+                    (Some("abc"), true, true),
+                    (Some("abc"), false, true),
+                    (None, true, false),
+                    (Some("abc"), true, false),
+                ] {
+                    let mut config = cfg();
+                    if !watched {
+                        config.watch = vec![PrWatchKind::Conflict];
+                    }
+                    config.pause_on_foreign_push = pause;
+                    let facts = PrQueueFacts {
+                        last_head_oid: previous.map(str::to_string),
+                        ..facts()
+                    };
+                    let head = if moved { "def" } else { "abc" };
+                    let got =
+                        admit_agent_dispatch(status.as_str(), &blocker, &facts, head, &config);
+                    let status_allows = !status.is_settled()
+                        && !matches!(status, PrqStatus::AgentRunning | PrqStatus::Merging);
+                    let expected = watched && status_allows && (!moved || !pause);
+                    assert_eq!(
+                        got == Ok(TaskKind::PrCiFailure),
+                        expected,
+                        "status={}, watched={watched}, moved={moved}, pause={pause}: {got:?}",
+                        status.as_str()
+                    );
+                    if !status_allows {
+                        assert!(got.as_ref().unwrap_err().contains(status.as_str()));
+                    } else if !watched {
+                        assert!(
+                            got.as_ref()
+                                .unwrap_err()
+                                .contains("CI is not in [pr_queue] watch")
+                        );
+                    }
+                    if moved && pause && watched && status_allows {
+                        assert!(got.as_ref().unwrap_err().contains("someone else pushed"));
+                    }
+                }
+            }
+        }
+        assert!(admit_agent_dispatch("unknown", &blocker, &facts(), "abc", &cfg()).is_err());
+        let mut disabled = cfg();
+        disabled.enabled = false;
+        assert!(
+            admit_agent_dispatch("blocked_ci", &blocker, &facts(), "abc", &disabled)
+                .unwrap_err()
+                .contains("disabled")
+        );
+
+        let mut unavailable = facts();
+        unavailable.agent_available = false;
+        assert!(
+            admit_agent_dispatch("blocked_ci", &blocker, &unavailable, "abc", &cfg())
+                .unwrap_err()
+                .contains("agent is configured")
+        );
+        let mut not_own = facts();
+        not_own.is_own = false;
+        assert!(
+            admit_agent_dispatch("blocked_ci", &blocker, &not_own, "abc", &cfg())
+                .unwrap_err()
+                .contains("not authored")
+        );
+        let mut no_checkout = facts();
+        no_checkout.worktree = None;
+        assert!(
+            admit_agent_dispatch("blocked_ci", &blocker, &no_checkout, "abc", &cfg())
+                .unwrap_err()
+                .contains("worktree")
+        );
+        let mut over_budget = facts();
+        over_budget.agent_attempts = cfg().agent_max_attempts;
+        assert!(
+            admit_agent_dispatch("blocked_ci", &blocker, &over_budget, "abc", &cfg())
+                .unwrap_err()
+                .contains("attempt")
+        );
+        assert!(
+            admit_agent_dispatch("watching", &Blocker::Draft, &facts(), "abc", &cfg())
+                .unwrap_err()
+                .contains("does not permit")
+        );
+        assert!(
+            admit_agent_dispatch("watching", &Blocker::Closed, &facts(), "abc", &cfg())
+                .unwrap_err()
+                .contains("closed")
+        );
+        assert!(admit_agent_dispatch("ready", &Blocker::None, &facts(), "abc", &cfg()).is_err());
+
+        let mut ci_only = cfg();
+        ci_only.watch = vec![PrWatchKind::Ci];
+        assert!(
+            admit_agent_dispatch(
+                "blocked_conflict",
+                &Blocker::Conflict,
+                &facts(),
+                "abc",
+                &ci_only
+            )
+            .unwrap_err()
+            .contains("conflict is not in [pr_queue] watch")
+        );
+        assert!(
+            admit_agent_dispatch(
+                "blocked_review",
+                &Blocker::ChangesRequested,
+                &facts(),
+                "abc",
+                &ci_only
+            )
+            .unwrap_err()
+            .contains("review is not in [pr_queue] watch")
+        );
+    }
+
+    #[test]
+    fn shared_foreign_push_pause_only_holds_agent_dispatches_when_enabled() {
+        let dispatch = QueueAction::DispatchAgent(TaskKind::PrCiFailure);
+        let held = pause_for_foreign_push(dispatch.clone(), true, &cfg());
+        assert!(
+            matches!(held, QueueAction::NeedsHuman(reason) if reason.contains("someone else pushed"))
+        );
+        assert_eq!(
+            pause_for_foreign_push(dispatch.clone(), false, &cfg()),
+            dispatch
+        );
+        let mut config = cfg();
+        config.pause_on_foreign_push = false;
+        assert_eq!(
+            pause_for_foreign_push(dispatch.clone(), true, &config),
+            dispatch
+        );
+        assert_eq!(
+            pause_for_foreign_push(QueueAction::Wait, true, &cfg()),
+            QueueAction::Wait
         );
     }
 
