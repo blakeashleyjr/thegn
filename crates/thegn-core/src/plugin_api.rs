@@ -391,7 +391,6 @@ pub enum PluginApiError {
         registered: String,
     },
     ContributionChanged(String),
-    DuplicateRegistration(String),
     UnsupportedIo(String),
 }
 
@@ -431,9 +430,6 @@ impl Display for PluginApiError {
                     f,
                     "registered contribution differs from negotiated declaration: {id}"
                 )
-            }
-            Self::DuplicateRegistration(id) => {
-                write!(f, "duplicate contribution registration: {id}")
             }
             Self::UnsupportedIo(scheme) => write!(f, "I/O scheme is unsupported: {scheme}"),
         }
@@ -600,8 +596,9 @@ impl HostContract {
     /// cannot be decided from a manifest alone.
     pub fn negotiate_spec(&self, spec: &PluginSpec) -> Result<NegotiatedManifest, PluginApiError> {
         let mut neg = self.negotiate(&spec.manifest)?;
-        // Runtime `register` may repeat or add a contribution after startup.
-        // Keep that path on the same mode boundary as manifest negotiation.
+        // Runtime `register` must match an accepted declaration. Repeating an
+        // identical registration is idempotent; registrations cannot add new
+        // contributions after startup.
         neg.supported_extension_points.retain(|point| {
             self.support_for(point).is_some_and(|row| {
                 row.state == SupportState::Wired && row.modes.contains(&spec.mode)
@@ -811,9 +808,7 @@ impl PluginRuntime {
             ));
         }
         if self.registered_contributions.contains(&contribution.id) {
-            return Err(PluginApiError::DuplicateRegistration(
-                contribution.id.as_str().to_string(),
-            ));
+            return Ok(());
         }
         if let Some(cap) = surface_capability_for(&contribution.extension_point) {
             self.audit(plugin, cap, "register")?;
@@ -1848,6 +1843,26 @@ mod wire_tests {
                 PluginApiError::UnknownExtensionPoint("FutureSurface".into()),
                 "unknown extension point: FutureSurface",
             ),
+            (
+                PluginApiError::UndeclaredContribution("extra".into()),
+                "contribution was not negotiated: extra",
+            ),
+            (
+                PluginApiError::ContributionTypeMismatch {
+                    id: "seg".into(),
+                    declared: "StatusBarSegment".into(),
+                    registered: "PaletteAction".into(),
+                },
+                "contribution seg registered as PaletteAction, negotiated as StatusBarSegment",
+            ),
+            (
+                PluginApiError::ContributionChanged("seg".into()),
+                "registered contribution differs from negotiated declaration: seg",
+            ),
+            (
+                PluginApiError::UnsupportedIo("network".into()),
+                "I/O scheme is unsupported: network",
+            ),
         ];
         for (error, expected) in cases {
             assert_eq!(error.to_string(), expected);
@@ -2299,10 +2314,11 @@ timeout_secs = 5
         };
         let mut runtime = PluginRuntime::new(manifest);
         assert_eq!(runtime.register(plugin.clone(), declared.clone()), Ok(()));
-        assert_eq!(
-            runtime.register(plugin.clone(), declared),
-            Err(PluginApiError::DuplicateRegistration("primary".into()))
-        );
+        let registered = runtime.registered_contributions.clone();
+        let audit_len = runtime.audit_log().len();
+        assert_eq!(runtime.register(plugin.clone(), declared), Ok(()));
+        assert_eq!(runtime.registered_contributions, registered);
+        assert_eq!(runtime.audit_log().len(), audit_len);
         assert_eq!(
             runtime.register(
                 plugin.clone(),
@@ -2337,6 +2353,7 @@ timeout_secs = 5
             Err(PluginApiError::ContributionChanged("primary".into()))
         );
         assert_eq!(runtime.audit_log().len(), 1);
+        assert_eq!(runtime.audit_log()[0].decision, AuditDecision::Granted);
 
         let missing_grant = NegotiatedManifest {
             api: API_VERSION,
@@ -2407,10 +2424,7 @@ timeout_secs = 5
             Some("runtime-test.primary"),
         );
         runtime.register(plugin.clone(), primary.clone()).unwrap();
-        assert_eq!(
-            runtime.register(plugin.clone(), primary),
-            Err(PluginApiError::DuplicateRegistration("primary".into()))
-        );
+        assert_eq!(runtime.register(plugin.clone(), primary), Ok(()));
 
         assert!(runtime.is_dirty(&primary_surface));
         let first = View::line([Span::styled("ready", StyleRole::Accent)]);
