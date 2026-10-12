@@ -192,12 +192,18 @@ pub(crate) fn run_up_checked(
             return Err(ComposeError::Spawn);
         }
     };
-    let (_, up_stderr) = up_outcome.into_stderr().ok_or(ComposeError::OutputLimit)?;
     if !up_success {
+        let stderr = up_outcome
+            .into_stderr()
+            .map(|(_, stderr)| stderr)
+            .unwrap_or_else(|| "<stderr truncated>".into());
         return Err(ComposeError::Exit {
             code: up_code,
-            stderr: up_stderr,
+            stderr,
         });
+    }
+    if up_outcome.into_stderr().is_none() {
+        return Err(ComposeError::OutputLimit);
     }
 
     let ps_outcome = run_bounded(
@@ -205,23 +211,24 @@ pub(crate) fn run_up_checked(
         ps_timeout,
         Capture {
             stdout: Some(4096),
-            stderr: None,
+            stderr: Some(4096),
         },
     );
-    let ps_success = match &ps_outcome {
-        ProcOutcome::Exited { status, .. } => status.success(),
+    let (ps_success, ps_code) = match &ps_outcome {
+        ProcOutcome::Exited { status, .. } => (status.success(), status.code()),
         ProcOutcome::Timeout => return Err(ComposeError::Timeout),
         ProcOutcome::Spawn | ProcOutcome::Wait | ProcOutcome::Read => {
             return Err(ComposeError::Spawn);
         }
     };
     if !ps_success {
+        let stderr = ps_outcome
+            .into_stderr()
+            .map(|(_, stderr)| stderr)
+            .unwrap_or_else(|| "<stderr truncated>".into());
         return Err(ComposeError::Exit {
-            code: match &ps_outcome {
-                ProcOutcome::Exited { status, .. } => status.code(),
-                _ => None,
-            },
-            stderr: String::new(),
+            code: ps_code,
+            stderr,
         });
     }
     let (_, running) = ps_outcome.into_stdout().ok_or(ComposeError::OutputLimit)?;
@@ -269,6 +276,34 @@ pub fn exec_argv(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compose_error_display_covers_every_variant() {
+        assert_eq!(
+            ComposeError::Spawn.to_string(),
+            "unable to run Docker Compose command"
+        );
+        assert_eq!(
+            ComposeError::Timeout.to_string(),
+            "Docker Compose command timed out"
+        );
+        assert_eq!(
+            ComposeError::Exit {
+                code: Some(2),
+                stderr: "  boom  ".into(),
+            }
+            .to_string(),
+            "Docker Compose exited with status Some(2): \"boom\""
+        );
+        assert_eq!(
+            ComposeError::OutputLimit.to_string(),
+            "Docker Compose output exceeded its size limit"
+        );
+        assert_eq!(
+            ComposeError::NotRunning.to_string(),
+            "Docker Compose started no running service"
+        );
+    }
 
     #[test]
     fn legacy_single_file_roundtrips_as_bare_path() {
@@ -382,6 +417,68 @@ mod tests {
             Err(ComposeError::Exit {
                 code: Some(3),
                 stderr: "boom\n".into(),
+            })
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compose_up_spawn_failure_is_reported() {
+        assert_eq!(
+            run_up_checked(
+                &["/nonexistent/thegn-compose-test".into()],
+                &shell("echo x"),
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+            ),
+            Err(ComposeError::Spawn)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compose_ps_spawn_failure_is_reported() {
+        assert_eq!(
+            run_up_checked(
+                &shell("true"),
+                &["/nonexistent/thegn-compose-test".into()],
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+            ),
+            Err(ComposeError::Spawn)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compose_ps_reports_exit_status_and_stderr() {
+        assert_eq!(
+            run_up_checked(
+                &shell("true"),
+                &shell("echo ps-failed >&2; exit 2"),
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+            ),
+            Err(ComposeError::Exit {
+                code: Some(2),
+                stderr: "ps-failed\n".into(),
+            })
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compose_up_truncated_stderr_preserves_failure_status() {
+        assert_eq!(
+            run_up_checked(
+                &shell("head -c 70000 /dev/zero >&2; exit 7"),
+                &shell("echo unused"),
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+            ),
+            Err(ComposeError::Exit {
+                code: Some(7),
+                stderr: "<stderr truncated>".into(),
             })
         );
     }
