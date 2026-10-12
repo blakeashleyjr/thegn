@@ -572,14 +572,29 @@ fn apply_page_with_generation(
         return false;
     }
 
-    let rows: Vec<CalendarRow> = page.events().iter().map(row_of).collect();
+    let rows: Vec<CalendarRow> = page
+        .events()
+        .iter()
+        .enumerate()
+        .map(|(index, event)| row_of(event, page.event_hrefs().get(index).map(String::as_str)))
+        .collect();
     if !crate::hydrate_schedule::generation_is_current(generation) {
         return false;
     }
     let wrote = if incremental {
         let put = db.put_calendar_events(account, &rows);
         let del = if crate::hydrate_schedule::generation_is_current(generation) {
-            db.delete_calendar_events(account, page.deleted())
+            if page.deleted_hrefs().is_empty() {
+                db.delete_calendar_events(account, page.deleted())
+            } else {
+                let resources: Vec<_> = page
+                    .deleted_hrefs()
+                    .iter()
+                    .zip(page.deleted())
+                    .map(|(href, uid)| (href.clone(), uid.clone()))
+                    .collect();
+                db.delete_calendar_events_by_href(account, &resources)
+            }
         } else {
             return false;
         };
@@ -598,7 +613,7 @@ fn apply_page_with_generation(
 }
 
 /// Turn an event into its cache row.
-fn row_of(e: &CalEvent) -> CalendarRow {
+fn row_of(e: &CalEvent, href: Option<&str>) -> CalendarRow {
     // A master's own span is irrelevant to the range query (it is loaded
     // unconditionally), but store it anyway so the row is self-describing.
     let home = chrono_tz::Tz::UTC;
@@ -614,6 +629,7 @@ fn row_of(e: &CalEvent) -> CalendarRow {
         end_ms: ms(&e.end),
         recurring: e.recurrence.as_ref().is_some_and(|r| !r.is_empty()),
         json: serde_json::to_string(e).unwrap_or_else(|_| "{}".into()),
+        href: href.map(str::to_string),
     }
 }
 

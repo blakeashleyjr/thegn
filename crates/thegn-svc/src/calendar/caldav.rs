@@ -336,6 +336,8 @@ fn page_from_multistatus(
     debug_assert!(matches!(mode, PageMode::Snapshot | PageMode::Delta));
     let mut events = Vec::new();
     let mut deleted = Vec::new();
+    let mut event_hrefs = Vec::new();
+    let mut deleted_hrefs = Vec::new();
     let token = walk_multistatus(text, |r| {
         // `calendar_ids` restricts to named collections; a resource outside
         // them is skipped before it is admitted or parsed. Tombstones are
@@ -349,11 +351,11 @@ fn page_from_multistatus(
             if mode != PageMode::Delta {
                 return Ok(());
             }
-            // The href is all a tombstone carries, so it has to be the id.
-            // `uid_from_href` mirrors what the fetch path stores.
+            // Keep a legacy UID fallback for rows cached before href storage.
             let id = uid_from_href(&r.href);
             meter.admit_deletion(id.len())?;
             deleted.push(id);
+            deleted_hrefs.push(r.href);
             return Ok(());
         }
         // An entity-escaped resource needs an unescaped copy; reserve it as
@@ -365,13 +367,23 @@ fn page_from_multistatus(
         };
         meter.reserve_transient(copy)?;
         let ics = xml_unescape(r.ics_raw);
+        let before = events.len();
         let parsed = thegn_core::calendar::parse_ics_admitted(&ics, zone, &mut meter, &mut events);
+        event_hrefs.extend(std::iter::repeat_n(r.href, events.len() - before));
         drop(ics);
         meter.release_transient(copy);
         parsed.map_err(CalendarError::from)
     })?;
     let token = scope_token(calendar_ids, zone, &token);
-    EventPage::from_meter(meter, mode, events, deleted, token)
+    EventPage::from_meter_with_hrefs(
+        meter,
+        mode,
+        events,
+        deleted,
+        event_hrefs,
+        deleted_hrefs,
+        token,
+    )
 }
 
 const SCOPE_PREFIX: &str = "tgf2:";
@@ -828,6 +840,13 @@ mod tests {
         let p = page(&[]);
         assert_eq!(p.events.len(), 2);
         assert_eq!(p.deleted, vec!["gone".to_string()]);
+        assert_eq!(
+            p.event_hrefs,
+            vec!["/dav/work/a.ics", "https://x.example/dav/personal/b.ics"]
+        );
+        assert_eq!(p.events[0].uid, "work-a");
+        assert_ne!(uid_from_href(&p.event_hrefs[0]), p.events[0].uid);
+        assert_eq!(p.deleted_hrefs, vec!["/dav/personal/gone.ics"]);
     }
 
     #[test]
@@ -840,6 +859,38 @@ mod tests {
         assert_eq!(p.events.len(), 1);
         assert_eq!(p.deleted, vec!["gone".to_string()]);
         assert_eq!(page(&["nope"]).events.len(), 0);
+    }
+
+    #[test]
+    fn one_resource_preserves_href_for_every_vevent_component() {
+        let xml = r#"<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+          <d:response><d:href>/cal/random-server-key.ics</d:href><d:propstat><d:prop><c:calendar-data>BEGIN:VCALENDAR
+BEGIN:VEVENT
+UID:meeting-a@example
+DTSTART:20300101T100000Z
+DTEND:20300101T110000Z
+END:VEVENT
+BEGIN:VEVENT
+UID:meeting-b@example
+DTSTART:20300102T100000Z
+DTEND:20300102T110000Z
+END:VEVENT
+END:VCALENDAR</c:calendar-data></d:prop></d:propstat></d:response>
+        </d:multistatus>"#;
+        let meter =
+            AccountAdmission::isolated(Default::default(), thegn_core::calendar::Tz::UTC).meter();
+        let page = page_from_multistatus(xml, "UTC", &[], PageMode::Snapshot, meter).unwrap();
+        assert_eq!(
+            page.events
+                .iter()
+                .map(|event| event.uid.as_str())
+                .collect::<Vec<_>>(),
+            ["meeting-a@example", "meeting-b@example"]
+        );
+        assert_eq!(
+            page.event_hrefs,
+            ["/cal/random-server-key.ics", "/cal/random-server-key.ics"]
+        );
     }
 
     #[test]

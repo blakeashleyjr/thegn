@@ -226,6 +226,7 @@ mod tests {
             end_ms: ms(&e.end),
             recurring: false,
             json: serde_json::to_string(e).unwrap(),
+            href: None,
         }
     }
 

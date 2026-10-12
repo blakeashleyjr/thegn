@@ -104,11 +104,11 @@ impl CalendarStore for Db {
             let now = util::now();
             let mut stmt = conn.prepare_cached(
                 r#"INSERT INTO calendar_events
-                     (account, uid, calendar, start_ms, end_ms, recurring, json, fetched_at)
-                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                     (account, uid, calendar, start_ms, end_ms, recurring, json, fetched_at, href)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
                    ON CONFLICT(account, uid) DO UPDATE SET
                      calendar = ?3, start_ms = ?4, end_ms = ?5,
-                     recurring = ?6, json = ?7, fetched_at = ?8"#,
+                     recurring = ?6, json = ?7, fetched_at = ?8, href = ?9"#,
             )?;
             for r in rows {
                 stmt.execute(params![
@@ -119,7 +119,8 @@ impl CalendarStore for Db {
                     r.end_ms,
                     r.recurring as i64,
                     r.json,
-                    now
+                    now,
+                    r.href
                 ])?;
             }
             Ok(())
@@ -154,6 +155,33 @@ impl CalendarStore for Db {
         res
     }
 
+    fn delete_calendar_events_by_href(
+        &self,
+        account: &str,
+        resources: &[(String, String)],
+    ) -> Result<()> {
+        if resources.is_empty() {
+            return Ok(());
+        }
+        let conn = self.conn();
+        conn.execute_batch("BEGIN")?;
+        let res = (|| -> Result<()> {
+            let mut stmt = conn.prepare_cached(
+                "DELETE FROM calendar_events WHERE account = ?1 AND (href = ?2 OR (href IS NULL AND uid = ?3))",
+            )?;
+            for (href, legacy_uid) in resources {
+                stmt.execute(params![account, href, legacy_uid])?;
+            }
+            Ok(())
+        })();
+        if res.is_ok() {
+            conn.execute_batch("COMMIT")?;
+        } else {
+            let _ = conn.execute_batch("ROLLBACK"); // best-effort: rollback after a failed statement; the original error is returned as `res`
+        }
+        res
+    }
+
     fn replace_calendar_account(&self, account: &str, rows: &[CalendarRow]) -> Result<()> {
         let conn = self.conn();
         // Delete-then-insert inside ONE transaction: a crash between the two
@@ -167,8 +195,8 @@ impl CalendarStore for Db {
             let now = util::now();
             let mut stmt = conn.prepare_cached(
                 r#"INSERT OR REPLACE INTO calendar_events
-                     (account, uid, calendar, start_ms, end_ms, recurring, json, fetched_at)
-                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"#,
+                     (account, uid, calendar, start_ms, end_ms, recurring, json, fetched_at, href)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"#,
             )?;
             for r in rows {
                 stmt.execute(params![
@@ -179,7 +207,8 @@ impl CalendarStore for Db {
                     r.end_ms,
                     r.recurring as i64,
                     r.json,
-                    now
+                    now,
+                    r.href
                 ])?;
             }
             Ok(())
