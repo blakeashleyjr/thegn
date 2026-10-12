@@ -21,6 +21,12 @@
 
 use thegn_core::agent_task::{TaskKind, TaskVars};
 
+const MAX_RENDERED_COMMAND_BYTES: usize = 100 * 1024;
+
+fn rendered_command_exceeds_limit(command: &str) -> bool {
+    command.len() > MAX_RENDERED_COMMAND_BYTES
+}
+
 /// One dispatch: where to run, what to say, and how long to allow.
 pub(crate) struct AgentTaskRun<'a> {
     pub kind: TaskKind,
@@ -135,6 +141,16 @@ pub(crate) fn run(task: &AgentTaskRun<'_>) -> bool {
             return false;
         }
     };
+    if rendered_command_exceeds_limit(&command) {
+        tracing::warn!(
+            target: "thegn::agent",
+            kind = %task.kind,
+            command_bytes = command.len(),
+            max_command_bytes = MAX_RENDERED_COMMAND_BYTES,
+            "rendered agent command exceeds the safe argument limit; not dispatching"
+        );
+        return false;
+    }
 
     // Join the shared aggregate slice, like the fold gate and every interactive
     // pane. A queue handoff runs a coding agent unattended — it must not be the
@@ -810,9 +826,8 @@ pub(crate) mod bounded {
     }
 }
 
-/// Back-compat metadata env for merge kinds. `THEGN_MERGE_TARGET` and
-/// `THEGN_BRANCH` predate the generalized task contract and remain available;
-/// prompt text is routed separately so it is never duplicated in the environment.
+/// Back-compat env for merge kinds. The legacy prompt alias is emitted only
+/// when the command template does not consume `{prompt}`.
 #[cfg(any(unix, test))]
 fn legacy_env(task: &AgentTaskRun<'_>) -> Vec<(&'static str, String)> {
     let mut out = Vec::new();
@@ -820,6 +835,9 @@ fn legacy_env(task: &AgentTaskRun<'_>) -> Vec<(&'static str, String)> {
         out.push(("THEGN_BRANCH", b.to_string()));
     }
     if matches!(task.kind, TaskKind::MergeConflict | TaskKind::GateFailure) {
+        if prompt_env(task).is_some() {
+            out.push(("THEGN_MERGE_PROMPT", task.prompt.to_string()));
+        }
         if let Some(t) = task.vars.get("target") {
             out.push(("THEGN_MERGE_TARGET", t.to_string()));
         }
@@ -939,7 +957,7 @@ mod tests {
     }
 
     #[test]
-    fn prompt_is_sent_once_and_not_in_environment_when_command_uses_it() {
+    fn prompt_uses_command_or_environment_and_keeps_legacy_merge_alias() {
         let v = vars();
         let command_task = task(TaskKind::MergeConflict, &v);
         assert_eq!(prompt_env(&command_task), None);
@@ -952,11 +970,25 @@ mod tests {
         let mut env_task = task(TaskKind::MergeConflict, &v);
         env_task.command_template = "agent --noninteractive";
         assert_eq!(prompt_env(&env_task), Some(("THEGN_TASK_PROMPT", "fix it")));
-        assert!(
+        assert_eq!(
             legacy_env(&env_task)
                 .iter()
-                .all(|(key, _)| *key != "THEGN_MERGE_PROMPT")
+                .find(|(key, _)| *key == "THEGN_MERGE_PROMPT")
+                .map(|(_, value)| value.as_str()),
+            Some("fix it")
         );
+    }
+
+    #[test]
+    fn quote_heavy_prompt_is_refused_when_rendered_command_exceeds_arg_limit() {
+        let prompt = "'".repeat(40 * 1024);
+        let command = thegn_core::agent_task::substitute_command(
+            "agent -p {prompt}",
+            &prompt,
+            &TaskVars::new(),
+        )
+        .unwrap();
+        assert!(rendered_command_exceeds_limit(&command));
     }
 
     #[test]

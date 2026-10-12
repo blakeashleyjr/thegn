@@ -5,7 +5,7 @@
 //! this module performs no database, forge, process, terminal, or async work.
 
 use crate::agent_task::{
-    TaskKind, TaskVars, TemplateError, default_prompt, render_prompt, validate_template,
+    TaskKind, TaskVars, TemplateError, default_prompt, render_task_prompt, validate_template,
 };
 use crate::forge::model::{PrComment, PrReview, ReviewThread};
 use crate::issue::{AgentDispatchStatus, ReviewTaskRecord};
@@ -263,7 +263,7 @@ fn build_upsert(
         .set("pr_title", clean(context.pr_title))
         .set("threads", derived.feedback);
     let prompt = clean_bounded(
-        &render_prompt(template, &vars)?,
+        &render_task_prompt(template, &vars)?,
         MAX_REVIEW_TASK_PROMPT_CHARS,
     );
     let status = derived
