@@ -22,7 +22,7 @@ use std::io::{Read, Write};
 use std::net::IpAddr;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock, mpsc};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::time::{Duration, Instant};
 use thegn_core::config::{
     BoreConfig, FrpConfig, FrpProxyType, IrohShareConfig, TailscaleShareConfig, expand_env_ref,
@@ -30,6 +30,8 @@ use thegn_core::config::{
 use thegn_core::share::{ShareParams, ShareSpec};
 
 use crate::vpn::{OciRuntime, exec_in};
+
+pub type ConflictHook = Box<dyn FnOnce() + Send>;
 
 #[cfg(test)]
 mod tests;
@@ -920,6 +922,19 @@ impl RunningShare {
         self.endpoint_tracker.conflict.load(Ordering::Acquire)
     }
 
+    /// Run `hook` once when a changed endpoint announcement is observed.
+    /// Installing after the conflict was observed still runs it immediately.
+    pub fn on_endpoint_conflict(&self, hook: ConflictHook) {
+        let mut hook_slot = self.endpoint_tracker.conflict_hook.lock().unwrap();
+        *hook_slot = Some(hook);
+        if self.endpoint_tracker.conflict.load(Ordering::Acquire)
+            && let Some(hook) = hook_slot.take()
+        {
+            drop(hook_slot);
+            hook();
+        }
+    }
+
     /// Best-effort terminate the child.
     pub fn stop(mut self) {
         let _ = self.child.kill(); // best-effort: child may already have exited
@@ -945,6 +960,7 @@ impl RunningShare {
 struct EndpointTracker {
     accepted: Arc<OnceLock<String>>,
     conflict: Arc<AtomicBool>,
+    conflict_hook: Arc<Mutex<Option<ConflictHook>>>,
 }
 
 impl EndpointTracker {
@@ -952,7 +968,7 @@ impl EndpointTracker {
         let canonical = endpoint.canonical();
         if let Some(accepted) = self.accepted.get() {
             if accepted != &canonical {
-                self.conflict.store(true, Ordering::Release);
+                self.signal_conflict();
             }
         } else if self.accepted.set(canonical.clone()).is_err()
             && self
@@ -960,7 +976,20 @@ impl EndpointTracker {
                 .get()
                 .is_some_and(|accepted| accepted != &canonical)
         {
-            self.conflict.store(true, Ordering::Release);
+            self.signal_conflict();
+        }
+    }
+
+    fn signal_conflict(&self) {
+        if !self.conflict.swap(true, Ordering::AcqRel) {
+            self.run_conflict_hook();
+        }
+    }
+
+    fn run_conflict_hook(&self) {
+        let hook = self.conflict_hook.lock().unwrap().take();
+        if let Some(hook) = hook {
+            hook();
         }
     }
 }
@@ -1479,7 +1508,7 @@ fn validate_dest(dest: &str) -> Result<()> {
 /// signal (policy) and may race harmlessly.
 ///
 /// Out of scope (THE-327 / share-generation ownership): ancestors of
-/// `statedir`, hardlink policy, collisions between starts, cleanup on stop.
+/// `statedir`, collisions between starts, cleanup on stop.
 fn materialize_files(plan: &SharePlan, statedir: &std::path::Path) -> Result<()> {
     if plan.files.is_empty() {
         return Ok(());
@@ -1494,7 +1523,10 @@ fn materialize_files(plan: &SharePlan, statedir: &std::path::Path) -> Result<()>
     for f in &plan.files {
         let path = statedir.join(&f.dest);
         match std::fs::symlink_metadata(&path) {
-            Ok(m) if m.file_type().is_file() => {}
+            Ok(m) if m.file_type().is_file() => {
+                thegn_core::fsperm::ensure_single_link_regular_file(&m)
+                    .with_context(|| format!("share: inspect hardlinks for {}", path.display()))?;
+            }
             Ok(_) => anyhow::bail!(
                 "share: refusing {}: existing entry is a symlink or not a regular file",
                 path.display()

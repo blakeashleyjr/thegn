@@ -127,7 +127,7 @@ fn bar_segs(frac: f32, w: usize, fg: Tok) -> Vec<Seg> {
 
 /// The mockup's tiny add/delete split bar (`w` cells, green then red).
 fn split_bar(added: u32, deleted: u32, w: usize) -> Vec<Seg> {
-    let total = (added + deleted).max(1) as f32;
+    let total = (u64::from(added) + u64::from(deleted)).max(1) as f32;
     let green = ((added as f32 / total) * w as f32).round() as usize;
     let green = green.min(w);
     vec![
@@ -147,6 +147,17 @@ fn diffstat(added: u32, deleted: u32) -> Vec<Seg> {
         ]
     } else {
         vec![plus]
+    }
+}
+
+/// A compact visible label for non-exact file counts. Exact counts continue to
+/// use the familiar added/deleted diffstat.
+pub(super) fn diff_count_label(count: thegn_svc::git::DiffCount) -> Option<&'static str> {
+    match count {
+        thegn_svc::git::DiffCount::Exact(_) => None,
+        thegn_svc::git::DiffCount::Binary => Some("bin"),
+        thegn_svc::git::DiffCount::Capped => Some("capped"),
+        thegn_svc::git::DiffCount::Unavailable => Some("unavailable"),
     }
 }
 
@@ -291,23 +302,72 @@ pub fn summary(section: Section, model: &crate::chrome::FrameModel) -> Vec<Seg> 
             // Sum only the user's OWN edits — a live merge's incoming block is
             // collapsed in the body, and counting it made the closed chip read
             // "+4102 −1180" over a body showing three local files.
-            let (a, del): (u32, u32) = data
-                .changes
-                .iter()
-                .filter(|c| !c.incoming)
-                .fold((0, 0), |(a, d), c| (a + c.added, d + c.deleted));
+            let add = |total, amount| match total {
+                thegn_svc::git::DiffCount::Exact(value) => value
+                    .checked_add(amount)
+                    .map(thegn_svc::git::DiffCount::Exact)
+                    .unwrap_or(thegn_svc::git::DiffCount::Capped),
+                state => state,
+            };
+            let (a, del) = data.changes.iter().filter(|c| !c.incoming).fold(
+                (
+                    thegn_svc::git::DiffCount::Exact(0),
+                    thegn_svc::git::DiffCount::Exact(0),
+                ),
+                |(a, d), c| {
+                    if c.count == thegn_svc::git::DiffCount::Binary {
+                        (a, d)
+                    } else if c.count == thegn_svc::git::DiffCount::Unavailable {
+                        let unavailable = |total| match total {
+                            thegn_svc::git::DiffCount::Capped => total,
+                            _ => thegn_svc::git::DiffCount::Unavailable,
+                        };
+                        (unavailable(a), unavailable(d))
+                    } else {
+                        (add(a, c.added), add(d, c.deleted))
+                    }
+                },
+            );
             if data.changes.is_empty() {
                 vec![seg(g(), "clean")]
-            } else if a == 0 && del == 0 {
+            } else if matches!(a, thegn_svc::git::DiffCount::Capped)
+                || matches!(del, thegn_svc::git::DiffCount::Capped)
+            {
+                vec![seg(hue(Hue::Amber), "capped")]
+            } else if matches!(a, thegn_svc::git::DiffCount::Unavailable)
+                || matches!(del, thegn_svc::git::DiffCount::Unavailable)
+            {
+                vec![seg(hue(Hue::Amber), "unavailable")]
+            } else if matches!(a, thegn_svc::git::DiffCount::Exact(0))
+                && matches!(del, thegn_svc::git::DiffCount::Exact(0))
+            {
                 // All-untracked (numstat never counts new files) or incoming-
                 // only: a count reads better than a meaningless "+0 −0".
                 let n = data.changes.iter().filter(|c| !c.incoming).count();
                 vec![seg(g(), format!("{n} file(s)"))]
             } else {
                 vec![
-                    seg(hue(Hue::Green), format!("+{a}")),
+                    seg(
+                        hue(Hue::Green),
+                        format!(
+                            "+{}",
+                            match a {
+                                thegn_svc::git::DiffCount::Exact(value) => value,
+                                _ => 0,
+                            }
+                        ),
+                    ),
                     seg(g(), " "),
-                    seg(hue(Hue::Red), format!("−{del}")),
+                    seg(
+                        hue(Hue::Red),
+                        format!(
+                            "−{}",
+                            match del {
+                                thegn_svc::git::DiffCount::Exact(value) => value,
+                                _ => 0,
+                            }
+                        ),
+                    ),
                 ]
             }
         }
@@ -908,6 +968,7 @@ mod spec {
             path: "src/lib.rs".into(),
             added: 10,
             deleted: 2,
+            count: thegn_svc::git::DiffCount::Exact(12),
             submodule: None,
             incoming: false,
         }];
@@ -1233,6 +1294,53 @@ mod spec {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn split_bar_handles_combined_counts_above_u32_without_wrapping() {
+        let bars = split_bar(u32::MAX, 1, 8);
+        assert_eq!(bars[0].text, "████████");
+        assert_eq!(bars[1].text, "");
+    }
+
+    #[test]
+    fn changes_summary_reports_capped_when_file_totals_overflow() {
+        let mut model = model();
+        model.panel.changes = vec![
+            ChangeRow {
+                added: u32::MAX,
+                count: thegn_svc::git::DiffCount::Exact(u32::MAX),
+                ..Default::default()
+            },
+            ChangeRow {
+                added: 1,
+                count: thegn_svc::git::DiffCount::Exact(1),
+                ..Default::default()
+            },
+        ];
+
+        let rendered = text(&[PanelRow::plain(Line::segs(summary(
+            Section::Changes,
+            &model,
+        )))]);
+
+        assert!(rendered.contains("capped"), "summary: {rendered}");
+    }
+
+    #[test]
+    fn changes_summary_propagates_unavailable_file_counts() {
+        let mut model = model();
+        model.panel.changes = vec![ChangeRow {
+            count: thegn_svc::git::DiffCount::Unavailable,
+            ..Default::default()
+        }];
+
+        let rendered = text(&[PanelRow::plain(Line::segs(summary(
+            Section::Changes,
+            &model,
+        )))]);
+
+        assert!(rendered.contains("unavailable"), "summary: {rendered}");
     }
 
     fn render(section: Section, width: PanelWidth) -> String {

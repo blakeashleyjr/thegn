@@ -651,16 +651,39 @@ impl MediaBackend for Mpd {
                 LoopMode::Track => (1, 1),
             };
             let mut c = self.conn().await?;
+            let status = c.command("status").await?;
+            let previous_repeat = match mpd_parse::field(&status, "repeat") {
+                Some("0") => 0,
+                Some("1") => 1,
+                other => {
+                    return Err(MediaError::Backend(format!(
+                        "mpd status has an unknown repeat flag {:?}",
+                        other.map(sanitize_diag)
+                    )));
+                }
+            };
             c.command(&format!("repeat {repeat}")).await?;
-            // A failure here leaves `repeat` already applied; say so.
-            c.command(&format!("single {single}"))
-                .await
-                .map(|_| ())
-                .map_err(|e| {
-                    MediaError::Backend(format!(
-                        "mpd loop mode partially applied (repeat set, single failed): {e}"
-                    ))
-                })
+            match c.command(&format!("single {single}")).await {
+                Ok(_) => Ok(()),
+                Err(single_error) => {
+                    let rollback = match self.conn().await {
+                        Ok(mut rollback_conn) => {
+                            rollback_conn
+                                .command(&format!("repeat {previous_repeat}"))
+                                .await
+                        }
+                        Err(rollback_error) => Err(rollback_error),
+                    };
+                    match rollback {
+                        Ok(_) => Err(MediaError::Backend(format!(
+                            "mpd single update failed; repeat was rolled back: {single_error}"
+                        ))),
+                        Err(rollback_error) => Err(MediaError::Backend(format!(
+                            "mpd single update failed and repeat rollback failed: {single_error}; {rollback_error}"
+                        ))),
+                    }
+                }
+            }
         })
     }
     fn volume_step(&self, delta: f64) -> BoxFuture<'_, Result<(), MediaError>> {
@@ -696,7 +719,7 @@ impl MediaBackend for Mpd {
             let sign = if forward { '+' } else { '-' };
             self.conn()
                 .await?
-                .command(&format!("seekcur {sign}{}", offset.as_secs()))
+                .command(&format!("seekcur {sign}{:.3}", offset.as_secs_f64()))
                 .await
                 .map(|_| ())
         })
@@ -709,7 +732,7 @@ impl MediaBackend for Mpd {
         Box::pin(async move {
             self.conn()
                 .await?
-                .command(&format!("seekcur {}", pos.as_secs()))
+                .command(&format!("seekcur {:.3}", pos.as_secs_f64()))
                 .await
                 .map(|_| ())
         })
@@ -1126,6 +1149,102 @@ mod tests {
         )
     }
 
+    /// Fake server that gives each received command its corresponding reply.
+    async fn scripted_server(
+        replies: Vec<&'static str>,
+    ) -> (MpdEndpoint, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = seen.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let index = std::sync::Arc::new(std::sync::Mutex::new(0));
+            while let Ok((sock, _)) = listener.accept().await {
+                let (r, mut w) = tokio::io::split(sock);
+                if w.write_all(b"OK MPD 0.23.0\n").await.is_err() {
+                    continue;
+                }
+                let mut r = BufReader::new(r);
+                let log = log.clone();
+                let replies = replies.clone();
+                let index = index.clone();
+                tokio::spawn(async move {
+                    while let Ok(Some(line)) = read_bounded_line(&mut r, 1024).await {
+                        log.lock().unwrap().push(line);
+                        let reply = {
+                            let mut next = index.lock().unwrap();
+                            let reply = replies.get(*next).copied().unwrap_or("OK\n");
+                            *next += 1;
+                            reply
+                        };
+                        if w.write_all(reply.as_bytes()).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (
+            MpdEndpoint::resolve(&format!("127.0.0.1:{port}"), None).unwrap(),
+            seen,
+        )
+    }
+
+    /// Fake server that leaves `single` unanswered on the first connection,
+    /// then answers the rollback only on a newly accepted connection.
+    async fn single_timeout_server() -> (MpdEndpoint, std::sync::Arc<std::sync::Mutex<Vec<String>>>)
+    {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = seen.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let Ok((sock, _)) = listener.accept().await else {
+                return;
+            };
+            let (r, mut w) = tokio::io::split(sock);
+            if w.write_all(b"OK MPD 0.23.0\n").await.is_err() {
+                return;
+            }
+            let first_log = log.clone();
+            tokio::spawn(async move {
+                let mut r = BufReader::new(r);
+                while let Ok(Some(line)) = read_bounded_line(&mut r, 1024).await {
+                    first_log.lock().unwrap().push(line.clone());
+                    match line.as_str() {
+                        "status" => {
+                            if w.write_all(b"repeat: 0\nsingle: 0\nOK\n").await.is_err() {
+                                return;
+                            }
+                        }
+                        "repeat 1" if w.write_all(b"OK\n").await.is_err() => return,
+                        "repeat 1" => {}
+                        _ => {}
+                    }
+                }
+            });
+
+            let Ok((sock, _)) = listener.accept().await else {
+                return;
+            };
+            let (r, mut w) = tokio::io::split(sock);
+            if w.write_all(b"OK MPD 0.23.0\n").await.is_err() {
+                return;
+            }
+            let mut r = BufReader::new(r);
+            if let Ok(Some(line)) = read_bounded_line(&mut r, 1024).await {
+                log.lock().unwrap().push(line);
+                if let Err(error) = w.write_all(b"OK\n").await {
+                    tracing::debug!(target: "thegn::media", %error, "fake MPD rollback response failed");
+                }
+            }
+        });
+        (
+            MpdEndpoint::resolve(&format!("127.0.0.1:{port}"), None).unwrap(),
+            seen,
+        )
+    }
+
     #[tokio::test]
     async fn volume_step_without_observed_volume_writes_nothing() {
         let (ep, seen) = recording_server("volume: -1\nstate: play\nOK\n").await;
@@ -1218,5 +1337,87 @@ mod tests {
             m.snapshot().await,
             Err(MediaError::Unavailable(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn set_loop_rolls_back_repeat_when_single_fails() {
+        let (ep, seen) = scripted_server(vec![
+            "repeat: 0\nsingle: 0\nOK\n",
+            "OK\n",
+            "ACK [4@0] {single} denied\n",
+            "OK\n",
+        ])
+        .await;
+        let m = Mpd {
+            ep,
+            caps: MediaCaps::default(),
+            commands: vec![],
+        };
+        let error = m.set_loop(LoopMode::Track).await.unwrap_err();
+        assert!(error.to_string().contains("rolled back"), "{error}");
+        assert_eq!(
+            seen.lock().unwrap().clone(),
+            vec![
+                "status".to_string(),
+                "repeat 1".to_string(),
+                "single 1".to_string(),
+                "repeat 0".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn set_loop_rolls_back_on_a_fresh_connection_after_single_timeout() {
+        // COMMAND_TIMEOUT is fixed at ten seconds, so exercising the timeout
+        // path costs ten seconds rather than shortening the production budget.
+        let (ep, seen) = single_timeout_server().await;
+        let m = Mpd {
+            ep,
+            caps: MediaCaps::default(),
+            commands: vec![],
+        };
+        let error = m.set_loop(LoopMode::Track).await.unwrap_err();
+        assert!(error.to_string().contains("timed out"), "{error}");
+        assert!(error.to_string().contains("rolled back"), "{error}");
+        assert!(!error.to_string().contains("rollback failed"), "{error}");
+        assert_eq!(
+            seen.lock().unwrap().clone(),
+            vec![
+                "status".to_string(),
+                "repeat 1".to_string(),
+                "single 1".to_string(),
+                "repeat 0".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn set_loop_with_unknown_repeat_does_not_mutate() {
+        let (ep, seen) = scripted_server(vec!["single: 0\nOK\n"]).await;
+        let m = Mpd {
+            ep,
+            caps: MediaCaps::default(),
+            commands: vec![],
+        };
+        assert!(matches!(
+            m.set_loop(LoopMode::Track).await,
+            Err(MediaError::Backend(_))
+        ));
+        assert_eq!(seen.lock().unwrap().clone(), vec!["status".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn seek_preserves_subsecond_precision() {
+        let (ep, seen) = recording_server("OK\n").await;
+        let m = Mpd {
+            ep,
+            caps: MediaCaps::default(),
+            commands: vec![],
+        };
+        m.seek(Duration::from_millis(1500), true).await.unwrap();
+        assert_eq!(
+            seen.lock().unwrap().clone(),
+            vec!["seekcur +1.500".to_string()]
+        );
     }
 }

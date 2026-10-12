@@ -120,24 +120,61 @@ pub(super) fn header_rows(model: &FrameModel, focused: bool, cols: usize) -> Vec
             }
         }
         None if !data.changes.is_empty() => {
-            let (a, d): (u32, u32) = data
-                .changes
-                .iter()
-                .fold((0, 0), |(a, d), c| (a + c.added, d + c.deleted));
-            rows.push(PanelRow::plain(Line::segs(vec![
-                sp(1),
-                seg(hue(Hue::Green), format!("+{a}")),
-                seg(Tok::Slot(S::Ghost), " "),
-                seg(hue(Hue::Red), format!("−{d}")),
-                seg(
-                    Tok::Slot(S::Ghost),
-                    format!(
-                        " · {} file{}",
-                        data.changes.len(),
-                        if data.changes.len() == 1 { "" } else { "s" }
-                    ),
+            let add = |total, amount| match total {
+                thegn_svc::git::DiffCount::Exact(value) => value
+                    .checked_add(amount)
+                    .map(thegn_svc::git::DiffCount::Exact)
+                    .unwrap_or(thegn_svc::git::DiffCount::Capped),
+                state => state,
+            };
+            let (added, deleted) = data.changes.iter().fold(
+                (
+                    thegn_svc::git::DiffCount::Exact(0),
+                    thegn_svc::git::DiffCount::Exact(0),
                 ),
-            ])));
+                |(added, deleted), c| {
+                    if c.count == thegn_svc::git::DiffCount::Binary {
+                        (added, deleted)
+                    } else if c.count == thegn_svc::git::DiffCount::Unavailable {
+                        let unavailable = |total| match total {
+                            thegn_svc::git::DiffCount::Capped => total,
+                            _ => thegn_svc::git::DiffCount::Unavailable,
+                        };
+                        (unavailable(added), unavailable(deleted))
+                    } else {
+                        (add(added, c.added), add(deleted, c.deleted))
+                    }
+                },
+            );
+            let right = match (added, deleted) {
+                (thegn_svc::git::DiffCount::Capped, _) | (_, thegn_svc::git::DiffCount::Capped) => {
+                    vec![seg(hue(Hue::Amber), "capped")]
+                }
+                (thegn_svc::git::DiffCount::Unavailable, _)
+                | (_, thegn_svc::git::DiffCount::Unavailable) => {
+                    vec![seg(hue(Hue::Amber), "unavailable")]
+                }
+                (
+                    thegn_svc::git::DiffCount::Exact(added),
+                    thegn_svc::git::DiffCount::Exact(deleted),
+                ) => vec![
+                    seg(hue(Hue::Green), format!("+{added}")),
+                    seg(Tok::Slot(S::Ghost), " "),
+                    seg(hue(Hue::Red), format!("−{deleted}")),
+                ],
+                _ => vec![seg(hue(Hue::Amber), "bin")],
+            };
+            let mut line = vec![sp(1)];
+            line.extend(right);
+            line.push(seg(
+                Tok::Slot(S::Ghost),
+                format!(
+                    " · {} file{}",
+                    data.changes.len(),
+                    if data.changes.len() == 1 { "" } else { "s" }
+                ),
+            ));
+            rows.push(PanelRow::plain(Line::segs(line)));
         }
         None => {}
     }
@@ -712,6 +749,7 @@ mod tests {
             path: path.into(),
             added: 10,
             deleted: 2,
+            count: thegn_svc::git::DiffCount::Exact(12),
             submodule: None,
             incoming: false,
         }
@@ -772,6 +810,36 @@ mod tests {
             git_secs.len()
         );
         assert!(frame.rows.len() <= 50);
+    }
+
+    #[test]
+    fn frame_header_caps_overflowing_change_totals_without_panicking() {
+        let first = ChangeRow {
+            added: u32::MAX,
+            count: thegn_svc::git::DiffCount::Exact(u32::MAX),
+            incoming: true,
+            ..change("src/large.rs", Stage::Unstaged)
+        };
+        let second = ChangeRow {
+            added: 1,
+            count: thegn_svc::git::DiffCount::Exact(1),
+            incoming: true,
+            ..change("src/extra.rs", Stage::Unstaged)
+        };
+        let model = model_with(PanelData {
+            changes: vec![first, second],
+            ..Default::default()
+        });
+
+        let frame = build_panel(&model, &PanelUi::default(), 44, 50, true);
+        let all = frame
+            .rows
+            .iter()
+            .map(|row| text_of(&row.line))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(all.contains("capped"), "overflow label in frame: {all}");
     }
 
     #[test]
