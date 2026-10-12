@@ -12,6 +12,7 @@
 //! - Tokens are never written here: [`EnvSpec::api_key_env`] holds a *SecretRef*
 //!   (`keyring:` / `file:` / `env:`), produced by the host's secret backend.
 
+use std::io::{Read, Write};
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -41,45 +42,155 @@ pub struct EnvSpec {
     pub sandbox_backend: Option<String>,
 }
 
-fn read_doc(path: &Path) -> Result<DocumentMut> {
+fn read_doc(path: &Path) -> Result<(DocumentMut, Option<Vec<u8>>)> {
     // Only a genuinely-absent file is an empty document. Any OTHER read error
     // (EACCES, EIO, a symlink loop, a file that exists but can't be read) must
     // NOT be swallowed as "empty": the caller mutates and writes the doc back, so
     // treating an unreadable-but-present config as empty would clobber the user's
     // entire config.toml with just the one key being set.
-    let text = match std::fs::read_to_string(path) {
-        Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
+    let bytes = match crate::fsperm::open_regular_file_nofollow(path) {
+        Ok(mut file) => {
+            let metadata = file.metadata().context("inspect config file")?;
+            anyhow::ensure!(
+                crate::fsperm::owned_by_current_user(&metadata),
+                "config file is not owned by the current user"
+            );
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)
+                .with_context(|| format!("read {}", path.display()))?;
+            Some(bytes)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(config_path_error(path, error)),
     };
+    let text = bytes
+        .as_deref()
+        .map(std::str::from_utf8)
+        .transpose()
+        .context("config is not UTF-8")?
+        .unwrap_or("");
     text.parse::<DocumentMut>()
         .with_context(|| format!("parse {}", path.display()))
+        .map(|doc| (doc, bytes))
 }
 
-fn write_doc(path: &Path, doc: &DocumentMut) -> Result<()> {
-    let prior = match std::fs::read_to_string(path) {
-        Ok(body) => body,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("read {} before validation", path.display()));
-        }
-    };
+fn write_doc(path: &Path, doc: &DocumentMut, expected: Option<&[u8]>) -> Result<()> {
+    write_document_fenced(path, doc, expected)
+}
+
+/// Publish an edited config document only if its source generation is unchanged.
+/// `expected` is `None` only when the destination was absent at read time.
+pub fn write_document_fenced(
+    path: &Path,
+    doc: &DocumentMut,
+    expected: Option<&[u8]>,
+) -> Result<()> {
+    let prior = expected
+        .map(std::str::from_utf8)
+        .transpose()
+        .context("config is not UTF-8")?
+        .unwrap_or("");
     let next = doc.to_string();
     crate::config_duration::introduced(
-        &crate::config_duration::errors_for_str(&prior),
+        &crate::config_duration::errors_for_str(prior),
         crate::config_duration::errors_for_str(&next),
     )
     .map_err(anyhow::Error::msg)?;
-    crate::custom_cmd::validate_write(&prior, &next).map_err(anyhow::Error::msg)?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
+    crate::custom_cmd::validate_write(prior, &next).map_err(anyhow::Error::msg)?;
+    write_doc_fenced(path, doc, expected)
+}
+
+fn write_doc_fenced(path: &Path, doc: &DocumentMut, expected: Option<&[u8]>) -> Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
+    let current = match crate::fsperm::open_regular_file_nofollow(path) {
+        Ok(mut file) => {
+            let metadata = file.metadata().context("inspect config destination")?;
+            anyhow::ensure!(
+                crate::fsperm::owned_by_current_user(&metadata),
+                "config destination is not owned by the current user"
+            );
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)
+                .context("read config generation")?;
+            Some(bytes)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(config_path_error(path, error)),
+    };
+    anyhow::ensure!(
+        current.as_deref() == expected,
+        "config changed during edit; retry the operation"
+    );
+
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let tmp = parent.join(format!(
+        ".config-write-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let mut file = crate::fsperm::create_owner_only_exclusive(&tmp)
+        .context("create private config temporary")?;
+    let mut pending = ConfigTemp(Some(tmp.clone()));
+    file.write_all(doc.to_string().as_bytes())
+        .context("write config temporary")?;
+    file.sync_all().context("sync config temporary")?;
+    drop(file);
+    // Recheck directly before replacement; a conflict preserves the old file.
+    let (current, existing_metadata) = match crate::fsperm::open_regular_file_nofollow(path) {
+        Ok(mut file) => {
+            let metadata = file
+                .metadata()
+                .context("inspect config during generation check")?;
+            anyhow::ensure!(
+                crate::fsperm::owned_by_current_user(&metadata),
+                "config destination is not owned by the current user"
+            );
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)
+                .context("recheck config generation")?;
+            (Some(bytes), Some(metadata))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (None, None),
+        Err(error) => return Err(config_path_error(path, error)),
+    };
+    anyhow::ensure!(
+        current.as_deref() == expected,
+        "config changed during edit; retry the operation"
+    );
+    if let Some(metadata) = existing_metadata {
+        crate::fsperm::preserve_owner_only_permissions(&metadata, &tmp)
+            .context("preserve owner-only config permissions")?;
     }
-    // Write atomically (tmp + rename) so a crash/full-disk mid-write can't leave a
-    // truncated, unparseable config that load_layered then discards.
-    let tmp = path.with_extension("toml.tmp");
-    std::fs::write(&tmp, next).with_context(|| format!("write {}", tmp.display()))?;
-    std::fs::rename(&tmp, path).with_context(|| format!("rename into {}", path.display()))
+    crate::fsperm::rename_replace(&tmp, path).context("replace config")?;
+    pending.0 = None;
+    if let Err(error) = crate::fsperm::sync_parent_dir(parent) {
+        tracing::warn!(error = %error, path = %parent.display(), "config was written but its directory could not be synced");
+    }
+    Ok(())
+}
+
+fn config_path_error(path: &Path, error: std::io::Error) -> anyhow::Error {
+    if error.kind() == std::io::ErrorKind::InvalidInput {
+        anyhow::anyhow!(
+            "config path {} is a symlink or not a regular file; refusing to replace it - edit the link target directly",
+            path.display()
+        )
+    } else {
+        anyhow::Error::from(error).context(format!("access config {}", path.display()))
+    }
+}
+
+struct ConfigTemp(Option<std::path::PathBuf>);
+impl Drop for ConfigTemp {
+    fn drop(&mut self) {
+        if let Some(path) = &self.0
+            && let Err(error) = std::fs::remove_file(path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(error = %error, "could not remove config temporary");
+        }
+    }
 }
 
 /// Get-or-create a child table named `key` under `parent`, marking it implicit
@@ -98,7 +209,7 @@ fn subtable<'a>(parent: &'a mut Table, key: &str) -> &'a mut Table {
 /// in the global config at `config_path`, preserving all other content + comments.
 pub fn upsert_env(config_path: &Path, spec: &EnvSpec) -> Result<()> {
     anyhow::ensure!(!spec.name.trim().is_empty(), "env name is empty");
-    let mut doc = read_doc(config_path)?;
+    let (mut doc, expected) = read_doc(config_path)?;
     let root = doc.as_table_mut();
     let env = subtable(root, "env");
     env.set_implicit(true);
@@ -137,7 +248,7 @@ pub fn upsert_env(config_path: &Path, spec: &EnvSpec) -> Result<()> {
         }
         other => anyhow::bail!("unknown placement {other:?} (expected local|ssh|provider)"),
     }
-    write_doc(config_path, &doc)
+    write_doc(config_path, &doc, expected.as_deref())
 }
 
 fn put_str(tbl: &mut Table, key: &str, v: &Option<String>) {
@@ -148,11 +259,11 @@ fn put_str(tbl: &mut Table, key: &str, v: &Option<String>) {
 
 /// Remove `[env.<name>]` from the global config. Ok if it wasn't there.
 pub fn remove_env(config_path: &Path, name: &str) -> Result<()> {
-    let mut doc = read_doc(config_path)?;
+    let (mut doc, expected) = read_doc(config_path)?;
     if let Some(env) = doc.get_mut("env").and_then(Item::as_table_mut) {
         env.remove(name);
     }
-    write_doc(config_path, &doc)
+    write_doc(config_path, &doc, expected.as_deref())
 }
 
 /// Infer the TOML scalar type of a raw CLI string so `config set foo.enabled
@@ -203,13 +314,13 @@ pub fn set_key(config_path: &Path, dotted: &str, val: &str) -> Result<()> {
     let dotted = crate::config_compat::canonical_key(dotted);
     let parts: Vec<&str> = dotted.split('.').filter(|s| !s.is_empty()).collect();
     anyhow::ensure!(!parts.is_empty(), "empty key");
-    let mut doc = read_doc(config_path)?;
+    let (mut doc, expected) = read_doc(config_path)?;
     let mut tbl = doc.as_table_mut();
     for seg in &parts[..parts.len() - 1] {
         tbl = subtable(tbl, seg);
     }
     tbl.insert(parts[parts.len() - 1], typed_value(val));
-    write_doc(config_path, &doc)
+    write_doc(config_path, &doc, expected.as_deref())
 }
 
 /// Set one dotted key to a string **array** (`repo_roots = ["a", "b"]`),
@@ -218,7 +329,7 @@ pub fn set_string_array(config_path: &Path, dotted: &str, items: &[String]) -> R
     let dotted = crate::config_compat::canonical_key(dotted);
     let parts: Vec<&str> = dotted.split('.').filter(|s| !s.is_empty()).collect();
     anyhow::ensure!(!parts.is_empty(), "empty key");
-    let mut doc = read_doc(config_path)?;
+    let (mut doc, expected) = read_doc(config_path)?;
     let mut tbl = doc.as_table_mut();
     for seg in &parts[..parts.len() - 1] {
         tbl = subtable(tbl, seg);
@@ -228,7 +339,7 @@ pub fn set_string_array(config_path: &Path, dotted: &str, items: &[String]) -> R
         arr.push(it.as_str());
     }
     tbl.insert(parts[parts.len() - 1], value(arr));
-    write_doc(config_path, &doc)
+    write_doc(config_path, &doc, expected.as_deref())
 }
 
 /// Create or update a `[host.<name>]` ssh host (+ its `.ssh` subtable) in the
@@ -237,7 +348,7 @@ pub fn set_string_array(config_path: &Path, dotted: &str, items: &[String]) -> R
 pub fn upsert_host(config_path: &Path, name: &str, ssh: &str) -> Result<()> {
     anyhow::ensure!(!name.trim().is_empty(), "host name is empty");
     anyhow::ensure!(!ssh.trim().is_empty(), "ssh target is empty");
-    let mut doc = read_doc(config_path)?;
+    let (mut doc, expected) = read_doc(config_path)?;
     let root = doc.as_table_mut();
     let hosts = subtable(root, "host");
     hosts.set_implicit(true);
@@ -245,7 +356,7 @@ pub fn upsert_host(config_path: &Path, name: &str, ssh: &str) -> Result<()> {
     ht.insert("reach", value("ssh"));
     let st = subtable(ht, "ssh");
     st.insert("host", value(ssh.trim()));
-    write_doc(config_path, &doc)
+    write_doc(config_path, &doc, expected.as_deref())
 }
 
 /// Insert `key = "<v>"` only when `v` is non-blank (trimmed).
@@ -270,7 +381,7 @@ fn upsert_named_array_entry(
     anyhow::ensure!(!name.is_empty(), "{array} entry name is empty");
     let parts: Vec<&str> = array.split('.').filter(|s| !s.is_empty()).collect();
     anyhow::ensure!(!parts.is_empty(), "empty array path");
-    let mut doc = read_doc(config_path)?;
+    let (mut doc, expected) = read_doc(config_path)?;
     let mut parent = doc.as_table_mut();
     for seg in &parts[..parts.len() - 1] {
         parent.set_implicit(true);
@@ -295,7 +406,7 @@ fn upsert_named_array_entry(
     };
     tbl.insert("name", value(name));
     fill(tbl);
-    write_doc(config_path, &doc)
+    write_doc(config_path, &doc, expected.as_deref())
 }
 
 /// Remove the entry named `name` from the array-of-tables at the dotted `array`
@@ -303,12 +414,12 @@ fn upsert_named_array_entry(
 pub fn remove_array_entry(config_path: &Path, array: &str, name: &str) -> Result<()> {
     let parts: Vec<&str> = array.split('.').filter(|s| !s.is_empty()).collect();
     anyhow::ensure!(!parts.is_empty(), "empty array path");
-    let mut doc = read_doc(config_path)?;
+    let (mut doc, expected) = read_doc(config_path)?;
     let mut node: &mut Table = doc.as_table_mut();
     for seg in &parts[..parts.len() - 1] {
         match node.get_mut(seg).and_then(Item::as_table_mut) {
             Some(t) => node = t,
-            None => return write_doc(config_path, &doc), // path absent → nothing to remove
+            None => return write_doc(config_path, &doc, expected.as_deref()), // path absent → nothing to remove
         }
     }
     if let Some(aot) = node
@@ -322,7 +433,7 @@ pub fn remove_array_entry(config_path: &Path, array: &str, name: &str) -> Result
             aot.remove(i);
         }
     }
-    write_doc(config_path, &doc)
+    write_doc(config_path, &doc, expected.as_deref())
 }
 
 /// Create or update a `[[issue_accounts]]` entry (keyed by `name`), preserving
@@ -380,9 +491,9 @@ pub fn upsert_forge(
 /// In a **repo** `.thegn.toml`, select an env with a top-level `env = "<name>"`
 /// (repos select, never define — this refuses to write any `[env.*]` table).
 pub fn select_env_in_repo(repo_toml: &Path, name: &str) -> Result<()> {
-    let mut doc = read_doc(repo_toml)?;
+    let (mut doc, expected) = read_doc(repo_toml)?;
     doc.as_table_mut().insert("env", value(name));
-    write_doc(repo_toml, &doc)
+    write_doc(repo_toml, &doc, expected.as_deref())
 }
 
 #[cfg(test)]
@@ -391,6 +502,15 @@ mod tests {
 
     fn tmp(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!("tg-cfgwrite-{}-{name}", std::process::id()))
+    }
+
+    #[test]
+    fn no_follow_config_errors_explain_symlink_refusal() {
+        let error = config_path_error(
+            Path::new("config.toml"),
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "is a symlink"),
+        );
+        assert!(error.to_string().contains("edit the link target directly"));
     }
 
     #[cfg(unix)]
@@ -430,6 +550,25 @@ mod tests {
         assert!(!p.with_extension("toml.tmp").exists(), "tmp file leaked");
         // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn fenced_write_rejects_changed_generation_and_preserves_bytes() {
+        let p = tmp("generation-conflict.toml");
+        let original = b"[theme]\npreset = \"prism\"\n";
+        std::fs::write(&p, original).unwrap();
+        let edited = "[theme]\npreset = \"storm\"\n"
+            .parse::<DocumentMut>()
+            .unwrap();
+        std::fs::write(&p, b"[theme]\npreset = \"user-edit\"\n").unwrap();
+
+        let result = write_document_fenced(&p, &edited, Some(original));
+        assert!(result.is_err(), "a stale config generation must conflict");
+        assert_eq!(
+            std::fs::read(&p).unwrap(),
+            b"[theme]\npreset = \"user-edit\"\n"
+        );
+        std::fs::remove_file(&p).unwrap();
     }
 
     #[test]
