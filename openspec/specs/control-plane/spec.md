@@ -74,6 +74,21 @@ When an initial reattach fails because the session is gone (expired, reaped, or 
 - **WHEN** session state is persisted while daemon-backed panes are running
 - **THEN** their cwd, foreground command, and scrollback tail are captured just like in-process panes
 
+### Requirement: Attach streams begin with a protocol greeting
+
+A WebSocket attach stream SHALL expose a `Hello` frame as its first
+client-visible frame. The client MUST validate its protocol version before
+accepting pane frames, and the attach pump MUST NOT publish a snapshot or delta
+ahead of the greeting. After `Hello`, a warm attach SHALL provide its initial
+`PaneSnapshot` before live `PaneDelta` frames.
+
+#### Scenario: Greeting precedes an immediately available snapshot
+
+- **WHEN** the daemon has already produced a warm snapshot by the time the
+  client finishes validating `Hello`
+- **THEN** the client-visible stream still yields `Hello` first, followed by
+  the snapshot
+
 ### Requirement: Control API drives a running instance
 
 The daemon SHALL expose a control API (HTTP/gRPC plus an SSE/WebSocket event
