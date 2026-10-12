@@ -418,21 +418,22 @@ pub fn ensure_private_dir_beneath(anchor: &Path, rel: &Path) -> std::io::Result<
         )
         .map_err(nix_io_error)?;
         for (index, name) in components.iter().enumerate() {
+            let name_path = Path::new(name);
             let opened = match openat(
                 &current,
-                name,
+                name_path,
                 OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
                 Mode::empty(),
             ) {
                 Ok(fd) => fd,
                 Err(nix::errno::Errno::ENOENT) => {
-                    match mkdirat(&current, name, Mode::from_bits_truncate(0o700)) {
+                    match mkdirat(&current, name_path, Mode::from_bits_truncate(0o700)) {
                         Ok(()) | Err(nix::errno::Errno::EEXIST) => {}
                         Err(error) => return Err(nix_io_error(error)),
                     }
                     openat(
                         &current,
-                        name,
+                        name_path,
                         OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
                         Mode::empty(),
                     )
