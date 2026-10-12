@@ -49,32 +49,6 @@ fn request_etag_over_limit(zone: &str, stored: &str) -> bool {
     request_etag(zone, stored).len() > MAX_REQUEST_BYTES
 }
 
-#[cfg(test)]
-mod cursor_tests {
-    use super::{MAX_REQUEST_BYTES, request_etag, request_etag_over_limit, stored_cursor};
-
-    #[test]
-    fn ics_cursor_requires_the_current_zone_and_rejects_legacy_etags() {
-        let stored = stored_cursor("Europe/Berlin", "\"rev-1\"");
-        assert_eq!(request_etag("Europe/Berlin", &stored), "\"rev-1\"");
-        assert_eq!(request_etag("Asia/Kolkata", &stored), "");
-        assert_eq!(request_etag("Europe/Berlin", "\"legacy-etag\""), "");
-        assert_eq!(stored_cursor("Europe/Berlin", ""), "");
-    }
-
-    #[test]
-    fn wrapped_cursor_prefix_does_not_push_an_in_limit_etag_over_request_limit() {
-        let etag = "x".repeat(MAX_REQUEST_BYTES);
-        let stored = stored_cursor("Europe/Berlin", &etag);
-        assert!(stored.len() > MAX_REQUEST_BYTES);
-        assert!(!request_etag_over_limit("Europe/Berlin", &stored));
-        assert!(request_etag_over_limit(
-            "Europe/Berlin",
-            &stored_cursor("Europe/Berlin", &("x".repeat(MAX_REQUEST_BYTES + 1)))
-        ));
-    }
-}
-
 pub(super) fn map_transport_error(error: CalendarHttpError) -> CalendarError {
     match error {
         CalendarHttpError::Timeout => CalendarError::Timeout(map_error(error)),
@@ -248,5 +222,31 @@ impl CalendarBackend for IcsUrlBackend {
                 stored_cursor(self.zone.name(), &etag),
             )
         })
+    }
+}
+
+#[cfg(test)]
+mod cursor_tests {
+    use super::{MAX_REQUEST_BYTES, request_etag, request_etag_over_limit, stored_cursor};
+
+    #[test]
+    fn ics_cursor_requires_the_current_zone_and_rejects_legacy_etags() {
+        let stored = stored_cursor("Europe/Berlin", "\"rev-1\"");
+        assert_eq!(request_etag("Europe/Berlin", &stored), "\"rev-1\"");
+        assert_eq!(request_etag("Asia/Kolkata", &stored), "");
+        assert_eq!(request_etag("Europe/Berlin", "\"legacy-etag\""), "");
+        assert_eq!(stored_cursor("Europe/Berlin", ""), "");
+    }
+
+    #[test]
+    fn wrapped_cursor_prefix_does_not_push_an_in_limit_etag_over_request_limit() {
+        let etag = "x".repeat(MAX_REQUEST_BYTES);
+        let stored = stored_cursor("Europe/Berlin", &etag);
+        assert!(stored.len() > MAX_REQUEST_BYTES);
+        assert!(!request_etag_over_limit("Europe/Berlin", &stored));
+        assert!(request_etag_over_limit(
+            "Europe/Berlin",
+            &stored_cursor("Europe/Berlin", &("x".repeat(MAX_REQUEST_BYTES + 1)))
+        ));
     }
 }
