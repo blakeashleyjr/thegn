@@ -1,3 +1,5 @@
+> Retired (THE-144): superseded by openspec/changes/extend-localization-surfaces/; not implemented.
+
 # Add localization
 
 ## Summary
