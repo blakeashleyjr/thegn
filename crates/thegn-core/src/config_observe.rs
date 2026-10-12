@@ -23,7 +23,7 @@ pub struct ObserveConfig {
     pub refresh_interval_secs: u64,
     /// Dashboard source: empty ⇒ the built-in host-metrics dashboard; otherwise a
     /// path to a dashboard TOML (tilde-expanded), loaded via `gtui_core::dashboard`.
-    /// A parse/read error falls back to the built-in dashboard (never fails the tab).
+    /// Load errors fail the Observe tab visibly; they do not select the built-in dashboard.
     pub dashboard_path: String,
     pub prometheus: PrometheusSourceConfig,
     pub loki: LokiSourceConfig,
