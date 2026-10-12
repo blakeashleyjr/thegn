@@ -421,17 +421,15 @@ impl QueryEngine {
         TimeRange { from, to }
     }
 
-    /// Resolve a panel's datasource by name, falling back to the sole registered
-    /// source when the panel leaves it unset (the built-in host dashboard case).
+    /// Resolve an exact datasource name, or the sole source for an unnamed panel.
     fn resolve_source(&self, name: &str) -> Option<Arc<dyn DataSource>> {
-        if !name.is_empty()
-            && let Some(s) = self.sources.get(name)
-        {
-            return Some(s.clone());
+        if name.is_empty() {
+            if self.sources.len() == 1 {
+                return self.sources.values().next().cloned();
+            }
+            return None;
         }
-        // Deterministic only with a single source (Phase 1); explicit `datasource`
-        // is required once multiple are registered.
-        self.sources.values().next().cloned()
+        self.sources.get(name).cloned()
     }
 }
 
@@ -987,5 +985,88 @@ mod tests {
         receive_updates(&mut frames_rx, 5).await;
         assert_eq!(wakes.load(Ordering::SeqCst), 2);
         drop(cmd_tx);
+    }
+
+    #[tokio::test]
+    async fn unknown_named_datasource_errors_with_multiple_registered_sources() {
+        let queries = Arc::new(Mutex::new(Vec::new()));
+        let mut panel_dashboard = dashboard(1);
+        panel_dashboard.panels[0].datasource = "typo".into();
+        let sources = HashMap::from([
+            (
+                "alpha".into(),
+                Arc::new(RecordingSource {
+                    queries: queries.clone(),
+                }) as Arc<dyn DataSource>,
+            ),
+            (
+                "beta".into(),
+                Arc::new(RecordingSource {
+                    queries: queries.clone(),
+                }) as Arc<dyn DataSource>,
+            ),
+        ]);
+        let (cmd, mut updates) = QueryEngine::spawn_with_window(
+            Handle::current(),
+            panel_dashboard,
+            sources,
+            RelativeWindow::new(std::time::Duration::from_secs(60)),
+            Duration::from_secs(3600),
+            Arc::new(Utc::now),
+            Arc::new(|| {}),
+            WakeGate::new(true),
+        );
+        let update = tokio::time::timeout(Duration::from_secs(1), updates.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(&update.targets[0].result, Err(message) if message == "no datasource 'typo'")
+        );
+        assert!(
+            queries.lock().unwrap().is_empty(),
+            "unknown source must not route to a configured backend"
+        );
+        drop(cmd);
+    }
+
+    #[tokio::test]
+    async fn unnamed_datasource_errors_with_two_sources_in_either_insertion_order() {
+        for names in [["alpha", "beta"], ["beta", "alpha"]] {
+            let queries = Arc::new(Mutex::new(Vec::new()));
+            let mut panel_dashboard = dashboard(1);
+            panel_dashboard.panels[0].datasource.clear();
+            let mut sources: HashMap<String, Arc<dyn DataSource>> = HashMap::new();
+            for name in names {
+                sources.insert(
+                    name.into(),
+                    Arc::new(RecordingSource {
+                        queries: queries.clone(),
+                    }),
+                );
+            }
+            let (cmd, mut updates) = QueryEngine::spawn_with_window(
+                Handle::current(),
+                panel_dashboard,
+                sources,
+                RelativeWindow::new(std::time::Duration::from_secs(60)),
+                Duration::from_secs(3600),
+                Arc::new(Utc::now),
+                Arc::new(|| {}),
+                WakeGate::new(true),
+            );
+            let update = tokio::time::timeout(Duration::from_secs(1), updates.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                matches!(&update.targets[0].result, Err(message) if message == "no datasource ''")
+            );
+            assert!(
+                queries.lock().unwrap().is_empty(),
+                "unnamed source must not route based on map order"
+            );
+            drop(cmd);
+        }
     }
 }

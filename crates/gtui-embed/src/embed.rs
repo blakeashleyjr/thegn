@@ -6,7 +6,9 @@
 //! renderer. A panic in app code is caught and shown in-panel — the host stays
 //! healthy.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::fmt;
+use std::io::{ErrorKind, Read};
 use std::panic;
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,13 +24,15 @@ use gtui_query::prometheus::PrometheusSource;
 use tg_kit::input::{InputEvent, InputResult, Key};
 use tg_kit::ratatui::buffer::Buffer;
 use tg_kit::ratatui::layout::Rect;
-use tg_kit::ratatui::style::{Color, Style};
+use tg_kit::ratatui::style::Style;
 use tg_kit::ratatui::widgets::{Block, Borders, Paragraph, Widget};
+use tg_kit::theme::{Theme, Tok};
 use tg_kit::tile::{AppTile, ChangeHook};
 use thegn_core::config_observe::ObserveConfig;
 
 pub struct ObserveTile {
     app: ObserveApp,
+    theme: Theme,
     is_panicked: bool,
     needs_redraw: bool,
 }
@@ -41,10 +45,17 @@ impl ObserveTile {
         hook: ChangeHook,
         cfg: &ObserveConfig,
         rt: tokio::runtime::Handle,
+        theme: Theme,
         sampler_thread_start: impl FnOnce() + Send + 'static,
-    ) -> Result<Self, gtui_query::host::HostSourceSpawnError> {
-        let dashboard = load_dashboard(cfg);
-
+    ) -> Result<Self, ObserveTileError> {
+        let mut source_ids = HashSet::from(["host".to_string()]);
+        if !cfg.prometheus.base_url.trim().is_empty() {
+            source_ids.insert("prometheus".to_string());
+        }
+        if !cfg.loki.base_url.trim().is_empty() {
+            source_ids.insert("loki".to_string());
+        }
+        let dashboard = load_dashboard(cfg, &source_ids)?;
         // The built-in host datasource is always present (local metrics, zero
         // config). Prometheus/Loki register only when an endpoint is configured;
         // tokens resolve through thegn's `env:`/`file:` indirection.
@@ -82,6 +93,7 @@ impl ObserveTile {
         let app = ObserveApp::new(rt, dashboard, sources, time_range, refresh, hook);
         Ok(Self {
             app,
+            theme,
             is_panicked: false,
             needs_redraw: true,
         })
@@ -197,14 +209,15 @@ impl AppTile for ObserveTile {
                 buf,
                 "Observe (Panic)",
                 "The Observe panel crashed. Host remains healthy.",
-                Color::Red,
+                Tok::Red,
+                &self.theme,
             );
             return;
         }
 
         let app = &self.app;
         let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-            render_dashboard(app, area, buf);
+            render_dashboard(app, area, buf, &self.theme);
         }));
         if result.is_err() {
             self.is_panicked = true;
@@ -212,22 +225,158 @@ impl AppTile for ObserveTile {
     }
 }
 
-/// Load the dashboard named by `cfg`: the built-in host dashboard when no path
-/// is set, else a TOML file — falling back to the built-in on any read/parse
-/// error so the tab never fails to open.
-fn load_dashboard(cfg: &ObserveConfig) -> Dashboard {
+/// Maximum custom dashboard size accepted at the load boundary (1 MiB).
+pub const MAX_DASHBOARD_BYTES: u64 = 1024 * 1024;
+const MAX_DASHBOARD_PANELS: usize = 64;
+const MAX_DASHBOARD_ROWS: u32 = 10_000;
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum DashboardLoadError {
+    Missing(String),
+    Denied(String),
+    TooLarge(String),
+    InvalidToml(String),
+    Invalid(String),
+    UnknownSource(String),
+    AmbiguousSource,
+}
+
+impl fmt::Display for DashboardLoadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Missing(path) => write!(f, "dashboard missing: {path}"),
+            Self::Denied(path) => write!(f, "dashboard denied: {path}"),
+            Self::TooLarge(path) => write!(
+                f,
+                "dashboard too large (limit {MAX_DASHBOARD_BYTES} bytes): {path}"
+            ),
+            Self::InvalidToml(path) => write!(f, "dashboard invalid TOML: {path}"),
+            Self::Invalid(reason) => write!(f, "dashboard invalid: {reason}"),
+            Self::UnknownSource(id) => write!(f, "dashboard references unknown datasource: {id}"),
+            Self::AmbiguousSource => write!(
+                f,
+                "dashboard datasource required when multiple sources are configured"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DashboardLoadError {}
+
+#[derive(Debug)]
+pub enum ObserveTileError {
+    Dashboard(DashboardLoadError),
+    Source(gtui_query::host::HostSourceSpawnError),
+}
+
+impl fmt::Display for ObserveTileError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Dashboard(error) => fmt::Display::fmt(error, f),
+            Self::Source(error) => fmt::Display::fmt(error, f),
+        }
+    }
+}
+
+impl std::error::Error for ObserveTileError {}
+
+impl From<gtui_query::host::HostSourceSpawnError> for ObserveTileError {
+    fn from(error: gtui_query::host::HostSourceSpawnError) -> Self {
+        Self::Source(error)
+    }
+}
+
+impl From<DashboardLoadError> for ObserveTileError {
+    fn from(error: DashboardLoadError) -> Self {
+        Self::Dashboard(error)
+    }
+}
+
+/// Load and validate the exact snapshot that will be handed to the query engine.
+fn load_dashboard(
+    cfg: &ObserveConfig,
+    source_ids: &HashSet<String>,
+) -> Result<Dashboard, DashboardLoadError> {
     let path = cfg.dashboard_path.trim();
     if path.is_empty() {
-        return builtin_host_dashboard();
+        return Ok(builtin_host_dashboard());
     }
     let expanded = expand_tilde(path);
-    match std::fs::read_to_string(&expanded)
-        .ok()
-        .and_then(|s| toml::from_str::<Dashboard>(&s).ok())
-    {
-        Some(d) => d,
-        None => builtin_host_dashboard(),
+    let file = std::fs::File::open(&expanded)
+        .map_err(|error| classify_open_error(&expanded, error.kind()))?;
+    let mut bytes = Vec::new();
+    file.take(MAX_DASHBOARD_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| classify_open_error(&expanded, error.kind()))?;
+    if bytes.len() as u64 > MAX_DASHBOARD_BYTES {
+        return Err(DashboardLoadError::TooLarge(expanded));
     }
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|_| DashboardLoadError::InvalidToml(expanded.clone()))?;
+    let parsed: toml::Value =
+        toml::from_str(text).map_err(|_| DashboardLoadError::InvalidToml(expanded.clone()))?;
+    let dashboard: Dashboard = parsed
+        .try_into()
+        .map_err(|_| DashboardLoadError::Invalid("schema".into()))?;
+    validate_dashboard(&dashboard, source_ids)?;
+    Ok(dashboard)
+}
+
+fn classify_open_error(path: &str, kind: ErrorKind) -> DashboardLoadError {
+    match kind {
+        ErrorKind::NotFound => DashboardLoadError::Missing(path.to_string()),
+        ErrorKind::PermissionDenied => DashboardLoadError::Denied(path.to_string()),
+        _ => DashboardLoadError::Invalid(format!("cannot read {path}")),
+    }
+}
+
+fn validate_dashboard(
+    dashboard: &Dashboard,
+    source_ids: &HashSet<String>,
+) -> Result<(), DashboardLoadError> {
+    if dashboard.panels.len() > MAX_DASHBOARD_PANELS {
+        return Err(DashboardLoadError::Invalid(format!(
+            "panel count exceeds {MAX_DASHBOARD_PANELS}"
+        )));
+    }
+    let mut ids = HashSet::new();
+    for panel in &dashboard.panels {
+        if !ids.insert(panel.id) {
+            return Err(DashboardLoadError::Invalid(format!(
+                "duplicate panel id {}",
+                panel.id
+            )));
+        }
+        let right = panel.grid_pos.x.checked_add(panel.grid_pos.w);
+        let bottom = panel.grid_pos.y.checked_add(panel.grid_pos.h);
+        if right.is_none_or(|right| right > 24)
+            || bottom.is_none_or(|bottom| bottom > MAX_DASHBOARD_ROWS)
+            || panel.grid_pos.w == 0
+            || panel.grid_pos.h == 0
+        {
+            return Err(DashboardLoadError::Invalid(format!(
+                "panel {} has invalid grid bounds",
+                panel.id
+            )));
+        }
+        if !matches!(
+            panel.panel_type.as_str(),
+            "timeseries" | "stat" | "table" | "logs"
+        ) {
+            return Err(DashboardLoadError::Invalid(format!(
+                "panel {} has unsupported renderer",
+                panel.id
+            )));
+        }
+        if panel.datasource.is_empty() {
+            if source_ids.len() != 1 {
+                return Err(DashboardLoadError::AmbiguousSource);
+            }
+        } else if !source_ids.contains(&panel.datasource) {
+            return Err(DashboardLoadError::UnknownSource(panel.datasource.clone()));
+        }
+    }
+    Ok(())
 }
 
 fn expand_tilde(path: &str) -> String {
@@ -240,10 +389,17 @@ fn expand_tilde(path: &str) -> String {
 }
 
 /// Lay the dashboard onto `area` and dispatch each panel to its renderer.
-fn render_dashboard(app: &ObserveApp, area: Rect, buf: &mut Buffer) {
+fn render_dashboard(app: &ObserveApp, area: Rect, buf: &mut Buffer, theme: &Theme) {
     let panels = &app.dashboard.panels;
     if panels.is_empty() {
-        block_msg(area, buf, "Observe", "No panels in dashboard", Color::Gray);
+        block_msg(
+            area,
+            buf,
+            "Observe",
+            "No panels in dashboard",
+            Tok::Dim,
+            theme,
+        );
         return;
     }
     let rows = gtui_render::layout::grid_rows(panels);
@@ -258,22 +414,30 @@ fn render_dashboard(app: &ObserveApp, area: Rect, buf: &mut Buffer) {
             app.panel_state(panel.id),
             rect,
             buf,
+            theme,
         );
     }
 }
 
 /// Draw one panel: its renderer when data is `Ready`, else a loading/error/empty
 /// placeholder titled with the panel name.
-fn render_panel(kind: &str, title: &str, state: &PanelState, rect: Rect, buf: &mut Buffer) {
+fn render_panel(
+    kind: &str,
+    title: &str,
+    state: &PanelState,
+    rect: Rect,
+    buf: &mut Buffer,
+    theme: &Theme,
+) {
     match state {
         PanelState::Loading => {
-            block_msg(rect, buf, title, "loading…", Color::DarkGray);
+            block_msg(rect, buf, title, "loading…", Tok::Faint, theme);
         }
         PanelState::Error(e) => {
-            block_msg(rect, buf, title, e, Color::Red);
+            block_msg(rect, buf, title, e, Tok::Red, theme);
         }
         PanelState::Ready(targets) => {
-            render_targets(kind, title, targets, rect, buf);
+            render_targets(kind, title, targets, rect, buf, theme);
         }
     }
 }
@@ -285,6 +449,7 @@ fn render_targets(
     targets: &[gtui_app::engine::TargetUpdate],
     rect: Rect,
     buf: &mut Buffer,
+    theme: &Theme,
 ) {
     let mut entries = Vec::new();
     for target in targets {
@@ -319,7 +484,7 @@ fn render_targets(
         }
     }
     if entries.is_empty() {
-        block_msg(rect, buf, title, "no data", Color::DarkGray);
+        block_msg(rect, buf, title, "no data", Tok::Faint, theme);
         return;
     }
     for (index, (label, frame, message)) in entries.iter().enumerate() {
@@ -332,15 +497,22 @@ fn render_targets(
         }
         let item_rect = Rect::new(rect.x, y0, rect.width, height);
         if let Some(message) = message {
-            block_msg(item_rect, buf, label, message, Color::DarkGray);
+            block_msg(item_rect, buf, label, message, Tok::Faint, theme);
         } else if let Some(frame) = frame {
-            dispatch_renderer(kind, label, frame, item_rect, buf);
+            dispatch_renderer(kind, label, frame, item_rect, buf, theme);
         }
     }
 }
 
 /// Panel-type → `gtui_render` widget dispatch. Unknown types draw a hint.
-fn dispatch_renderer(kind: &str, title: &str, frame: &Frame, rect: Rect, buf: &mut Buffer) {
+fn dispatch_renderer(
+    kind: &str,
+    title: &str,
+    frame: &Frame,
+    rect: Rect,
+    buf: &mut Buffer,
+    theme: &Theme,
+) {
     use gtui_render::{logs, stat, table, timeseries};
     match kind {
         "timeseries" => timeseries::TimeseriesRenderer::render(
@@ -364,7 +536,8 @@ fn dispatch_renderer(kind: &str, title: &str, frame: &Frame, rect: Rect, buf: &m
             buf,
             title,
             &format!("unknown panel type '{other}'"),
-            Color::Yellow,
+            Tok::Amber,
+            theme,
         ),
     }
 }
@@ -395,7 +568,8 @@ fn bounds_for(frame: &Frame) -> [f64; 4] {
 }
 
 /// A bordered block with a centered message — the loading/error/empty state.
-fn block_msg(rect: Rect, buf: &mut Buffer, title: &str, msg: &str, color: Color) {
+fn block_msg(rect: Rect, buf: &mut Buffer, title: &str, msg: &str, token: Tok, theme: &Theme) {
+    let color = theme.color(token);
     let w = Paragraph::new(msg.to_string())
         .style(Style::default().fg(color))
         .block(
@@ -410,6 +584,120 @@ fn block_msg(rect: Rect, buf: &mut Buffer, title: &str, msg: &str, color: Color)
 mod tests {
     use super::*;
     use gtui_core::frame::{Field, FieldType};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static NEXT_FILE: AtomicUsize = AtomicUsize::new(0);
+
+    fn dashboard_file(contents: &[u8]) -> String {
+        let path = std::env::temp_dir().join(format!(
+            "gtui-dashboard-{}-{}.toml",
+            std::process::id(),
+            NEXT_FILE.fetch_add(1, Ordering::Relaxed),
+        ));
+        std::fs::write(&path, contents).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    fn config_for(path: String) -> ObserveConfig {
+        ObserveConfig {
+            dashboard_path: path,
+            ..ObserveConfig::default()
+        }
+    }
+
+    fn valid_toml(id: u32, datasource: &str) -> String {
+        format!(
+            "title = \"test\"\n[[panels]]\nid = {id}\ntitle = \"p\"\ntype = \"stat\"\ndatasource = \"{datasource}\"\n[panels.grid_pos]\nx = 0\ny = 0\nw = 24\nh = 8\n[[panels.targets]]\nexpr = \"x\"\nref_id = \"A\"\n"
+        )
+    }
+
+    fn make_source_ids(names: &[&str]) -> HashSet<String> {
+        names.iter().map(|name| (*name).to_string()).collect()
+    }
+
+    #[test]
+    fn custom_dashboard_load_failures_are_distinct_and_never_fall_back() {
+        let source_ids = make_source_ids(&["host"]);
+        let missing =
+            std::env::temp_dir().join(format!("missing-dashboard-{}.toml", std::process::id()));
+        let mut cfg = config_for(missing.to_string_lossy().into_owned());
+        assert!(matches!(
+            load_dashboard(&cfg, &source_ids),
+            Err(DashboardLoadError::Missing(_))
+        ));
+        assert!(matches!(
+            classify_open_error("private/path", ErrorKind::PermissionDenied),
+            DashboardLoadError::Denied(_)
+        ));
+
+        let oversized_path = dashboard_file(&vec![b' '; MAX_DASHBOARD_BYTES as usize + 1]);
+        cfg.dashboard_path = oversized_path.clone();
+        assert!(matches!(
+            load_dashboard(&cfg, &source_ids),
+            Err(DashboardLoadError::TooLarge(_))
+        ));
+        std::fs::remove_file(oversized_path).unwrap();
+
+        let invalid_path = dashboard_file(b"not = [toml");
+        cfg.dashboard_path = invalid_path.clone();
+        assert!(matches!(
+            load_dashboard(&cfg, &source_ids),
+            Err(DashboardLoadError::InvalidToml(_))
+        ));
+        std::fs::remove_file(invalid_path).unwrap();
+
+        let schema_path = dashboard_file(b"title = \"missing panels\"");
+        cfg.dashboard_path = schema_path.clone();
+        assert!(matches!(
+            load_dashboard(&cfg, &source_ids),
+            Err(DashboardLoadError::Invalid(reason)) if reason == "schema"
+        ));
+        std::fs::remove_file(schema_path).unwrap();
+
+        let duplicate_path = dashboard_file(
+            format!("{}{}", valid_toml(1, "host"), valid_toml(1, "host")).as_bytes(),
+        );
+        cfg.dashboard_path = duplicate_path.clone();
+        assert!(
+            matches!(load_dashboard(&cfg, &source_ids), Err(DashboardLoadError::Invalid(message)) if message.contains("duplicate panel id"))
+        );
+        std::fs::remove_file(duplicate_path).unwrap();
+
+        let unknown_path = dashboard_file(valid_toml(1, "typo").as_bytes());
+        cfg.dashboard_path = unknown_path.clone();
+        assert!(
+            matches!(load_dashboard(&cfg, &source_ids), Err(DashboardLoadError::UnknownSource(id)) if id == "typo")
+        );
+        std::fs::remove_file(unknown_path).unwrap();
+
+        let ambiguous_path = dashboard_file(valid_toml(1, "").as_bytes());
+        cfg.dashboard_path = ambiguous_path.clone();
+        assert!(matches!(
+            load_dashboard(&cfg, &make_source_ids(&["host", "prometheus"])),
+            Err(DashboardLoadError::AmbiguousSource)
+        ));
+        std::fs::remove_file(ambiguous_path).unwrap();
+    }
+
+    #[test]
+    fn error_placeholder_uses_the_supplied_semantic_red() {
+        let mut theme = Theme::prism();
+        theme.red = (1, 2, 3);
+        let mut buf = Buffer::empty(Rect::new(0, 0, 20, 5));
+        render_panel(
+            "stat",
+            "CPU",
+            &PanelState::Error("failed".into()),
+            buf.area,
+            &mut buf,
+            &theme,
+        );
+        assert!(
+            buf.content
+                .iter()
+                .any(|cell| cell.fg == theme.color(Tok::Red))
+        );
+    }
 
     #[test]
     fn bounds_for_pads_a_normal_series() {
@@ -437,7 +725,7 @@ mod tests {
     fn dispatch_unknown_type_does_not_panic() {
         let f = Frame::new(vec![Field::new("v", FieldType::Float64, vec![1.0])]);
         let mut buf = Buffer::empty(Rect::new(0, 0, 20, 5));
-        dispatch_renderer("nope", "P", &f, buf.area, &mut buf);
+        dispatch_renderer("nope", "P", &f, buf.area, &mut buf, &Theme::prism());
         // A hint was drawn (top-left border of the block).
         assert_eq!(buf.cell((0, 0)).unwrap().symbol(), "┌");
     }
@@ -445,7 +733,14 @@ mod tests {
     #[test]
     fn render_panel_shows_loading_then_data() {
         let mut buf = Buffer::empty(Rect::new(0, 0, 20, 5));
-        render_panel("stat", "CPU", &PanelState::Loading, buf.area, &mut buf);
+        render_panel(
+            "stat",
+            "CPU",
+            &PanelState::Loading,
+            buf.area,
+            &mut buf,
+            &Theme::prism(),
+        );
         assert_eq!(buf.cell((0, 0)).unwrap().symbol(), "┌");
 
         let f = Frame::new(vec![Field::new("v", FieldType::Float64, vec![42.0])]);
@@ -459,6 +754,7 @@ mod tests {
             }]),
             buf2.area,
             &mut buf2,
+            &Theme::prism(),
         );
         // StatRenderer drew the value "42.00".
         assert_eq!(buf2.cell((1, 1)).unwrap().symbol(), "4");
@@ -483,7 +779,7 @@ mod tests {
         ];
         for kind in ["timeseries", "stat", "table", "logs"] {
             let mut buf = Buffer::empty(Rect::new(0, 0, 40, 18));
-            render_targets(kind, "Panel", &targets, buf.area, &mut buf);
+            render_targets(kind, "Panel", &targets, buf.area, &mut buf, &Theme::prism());
             let mut rendered = String::new();
             for y in 0..buf.area.height {
                 for x in 0..buf.area.width {

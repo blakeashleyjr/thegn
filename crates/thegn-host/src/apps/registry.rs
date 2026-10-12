@@ -36,9 +36,15 @@ pub static APP_BUILDERS: &[AppBuilder] = &[AppBuilder {
     label: "Observe",
     enabled: |cfg| cfg.observe.enabled,
     build: |hook, cfg, rt| {
-        super::build_observe_tile(hook, &cfg.observe, rt, || {
-            crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
-        })
+        super::build_observe_tile(
+            hook,
+            &cfg.observe,
+            rt,
+            super::kit_theme(&cfg.palette()),
+            || {
+                crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
+            },
+        )
     },
 }];
 
