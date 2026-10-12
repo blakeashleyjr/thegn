@@ -3,9 +3,9 @@
 //! `pending_issue_link` resolution that runs when a branched-from-issue
 //! worktree finishes creating. Extracted from the ratchet-pinned `run.rs`.
 //!
-//! Threading contract: every tracker mutation (issue router calls, worktree
-//! creation, DB writes) runs on `spawn_blocking`; the functions here execute
-//! ON the loop and only clone what the off-thread closure needs.
+//! Threading contract: provider calls and worktree creation run on
+//! `spawn_blocking`; DB mutations use `db_task`. Functions here execute ON the
+//! loop and only clone what the off-thread work needs.
 
 use std::path::Path;
 
@@ -42,15 +42,13 @@ pub(crate) struct TrackerCtx<'a> {
     /// The live reloadable config — issue-router calls read this.
     pub live_cfg: &'a thegn_core::config::Config,
     pub waker: &'a TerminalWaker,
+    pub refresh_tx: &'a tokio_mpsc::UnboundedSender<crate::hydrate::RefreshKind>,
     // Worktree-creation plumbing (branch-from-issue / agent dispatch).
     pub create_gen: &'a mut u64,
     pub create_tx: &'a tokio_mpsc::UnboundedSender<crate::wizard::CreateEvent>,
     pub inflight: &'a mut crate::handlers::creating::InFlight,
     pub wizard_ui: &'a mut Option<crate::wizard::NewWorktreeWizard>,
     pub pending_issue_link: &'a mut Option<(u64, String)>,
-    // Model re-hydration after a link toggle.
-    pub model_tx: &'a tokio_mpsc::UnboundedSender<(u64, FrameModel)>,
-    pub hydration_gen: &'a mut u64,
 }
 
 /// The issue under the Issues-section cursor, selected from the SAME
@@ -77,29 +75,33 @@ pub(crate) fn toggle_link(ctx: &mut TrackerCtx) {
     if let Some(issue) = cursor_issue(ctx) {
         let id = issue.id.clone();
         let already_linked = ctx.model.panel.tracker_links.contains(&id);
-        if let Ok(db) = thegn_core::db::Db::open() {
-            if already_linked {
-                let _ = db.unlink_issue(&wt_str, &id); // best-effort: cache write: the link row is bookkeeping; the tracker is the source of truth
-                ctx.model.status = format!("Unlinked {id}");
+        let refresh_tx = ctx.refresh_tx.clone();
+        let waker = ctx.waker.clone();
+        let wt_for_write = wt_str.clone();
+        let id_for_write = id.clone();
+        crate::db_task::persist(move |db| {
+            let result = if already_linked {
+                db.unlink_issue(&wt_for_write, &id_for_write)
             } else {
-                let _ = db.link_issue(&wt_str, &id); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
-                ctx.model.status = format!("Linked {id}");
+                db.link_issue(&wt_for_write, &id_for_write)
+            };
+            if let Err(error) = result {
+                tracing::debug!(target: "thegn::db", %error, "issue link update failed");
+                send_tracker_toast(
+                    &refresh_tx,
+                    &waker,
+                    format!("Issue link update failed: {error}"),
+                    thegn_core::notification::Priority::Alert,
+                );
+                return;
             }
-        }
-        // Refresh model so the badge updates.
-        *ctx.hydration_gen += 1;
-        crate::hydrate::spawn_model_hydration(
-            ctx.model_tx.clone(),
-            *ctx.hydration_gen,
-            ctx.session.clone(),
-            Some(ctx.waker.clone()),
-            crate::hydrate::HydrateHints {
-                open: ctx.panel_ui.open,
-                expanded: ctx.panel_ui.width.is_expanded(),
-                ..Default::default()
-            },
-            None,
-        );
+            pulse_model_refresh(refresh_tx, waker);
+        });
+        ctx.model.status = if already_linked {
+            format!("Unlinking {id}…")
+        } else {
+            format!("Linking {id}…")
+        };
     }
 }
 
@@ -180,6 +182,10 @@ pub(crate) fn issues_key(key: char, ctx: &mut TrackerCtx) -> bool {
                 active_tab_path(ctx.session),
                 ctx.live_cfg.clone(),
                 Some(ctx.waker.clone()),
+                Some(crate::hydrate_tracker::RefreshReportTarget {
+                    tx: ctx.refresh_tx.clone(),
+                    waker: ctx.waker.clone(),
+                }),
             ) {
                 crate::hydrate_tracker::RefreshStart::Started => "Refreshing issues…".into(),
                 crate::hydrate_tracker::RefreshStart::Coalesced => {
@@ -196,6 +202,7 @@ pub(crate) fn issues_key(key: char, ctx: &mut TrackerCtx) -> bool {
             if let Some(issue) = cursor_issue(ctx) {
                 let full_cfg = ctx.live_cfg.clone();
                 let waker2 = ctx.waker.clone();
+                let refresh_tx2 = ctx.refresh_tx.clone();
                 let cwd2 = active_tab_path(ctx.session);
                 tokio::task::spawn_blocking(move || {
                     use thegn_core::issue::IssuePatch;
@@ -220,20 +227,32 @@ pub(crate) fn issues_key(key: char, ctx: &mut TrackerCtx) -> bool {
                     // so surface the error (matches dispatch_agent's off-thread
                     // reporting) instead of silently claiming success.
                     if let Err(e) = rt.block_on(router.update_issue(&issue.id, &patch)) {
-                        thegn_core::msg::warn(&format!("assign failed: {e}"));
-                        let _ = waker2.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
+                        crate::hydrate_tracker::send_tracker_toast(
+                            &refresh_tx2,
+                            &waker2,
+                            format!("Issue assignment failed: {e}"),
+                            thegn_core::notification::Priority::Alert,
+                        );
                         return;
                     }
                     let wake_on_busy = waker2.clone();
-                    if crate::hydrate_tracker::request_issue_refresh(cwd2, full_cfg, Some(waker2))
-                        == crate::hydrate_tracker::RefreshStart::Busy
+                    let report = crate::hydrate_tracker::RefreshReportTarget {
+                        tx: refresh_tx2,
+                        waker: waker2.clone(),
+                    };
+                    if crate::hydrate_tracker::request_issue_refresh(
+                        cwd2,
+                        full_cfg,
+                        Some(waker2),
+                        Some(report.clone()),
+                    ) == crate::hydrate_tracker::RefreshStart::Busy
                     {
-                        thegn_core::msg::warn(
-                            "Issue refresh busy after assignment; try again shortly",
+                        crate::hydrate_tracker::send_tracker_toast(
+                            &report.tx,
+                            &wake_on_busy,
+                            "Issue refresh busy after assignment; try again shortly".into(),
+                            thegn_core::notification::Priority::Alert,
                         );
-                        if let Err(error) = wake_on_busy.wake() {
-                            tracing::debug!(%error, "failed to wake after busy issue refresh");
-                        }
                     }
                 });
                 ctx.model.status = format!("Assigning {} to you…", issue.number);
@@ -562,16 +581,34 @@ pub(crate) fn on_worktree_created(
     pending_issue_link: &mut Option<(u64, String)>,
     generation: u64,
     path: &str,
+    refresh_tx: tokio_mpsc::UnboundedSender<crate::hydrate::RefreshKind>,
+    waker: TerminalWaker,
 ) {
     if let Some((g, issue_id)) = pending_issue_link.take() {
         if g == generation {
-            if let Ok(db) = thegn_core::db::Db::open() {
-                let _ = db.link_issue(path, &issue_id); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
-            }
+            let path = path.to_owned();
+            crate::db_task::persist(move |db| {
+                if let Err(error) = db.link_issue(&path, &issue_id) {
+                    tracing::debug!(target: "thegn::db", %error, "created-worktree issue link failed");
+                }
+                pulse_model_refresh(refresh_tx, waker);
+            });
         } else {
             // Not ours — put it back for the matching Done event.
             *pending_issue_link = Some((g, issue_id));
         }
+    }
+}
+
+fn pulse_model_refresh(
+    refresh_tx: tokio_mpsc::UnboundedSender<crate::hydrate::RefreshKind>,
+    waker: TerminalWaker,
+) {
+    if let Err(error) = refresh_tx.send(crate::hydrate::RefreshKind::Model) {
+        tracing::debug!(%error, "failed to request model refresh after issue link update");
+    }
+    if let Err(error) = waker.wake() {
+        tracing::debug!(%error, "failed to wake after issue link update");
     }
 }
 

@@ -149,7 +149,7 @@ pub(crate) fn remove_workspace(
     let session_id = session.id.clone();
     let repo_path_owned = repo_path.to_string();
     let slug_owned = slug.to_string();
-    crate::db_task::persist(move |db| {
+    crate::db_task::persist_critical(move |db| {
         forget_workspace_in_db(db, &session_id, &repo_path_owned, &slug_owned);
     });
 
