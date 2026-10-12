@@ -4,7 +4,8 @@ use serde::{Deserialize, Serialize};
 pub struct Dashboard {
     pub title: String,
     pub description: Option<String>,
-    pub refresh: Option<String>, // e.g. "5s", "1m"
+    /// Parsed for schema compatibility; the host's `[observe]` cadence is used.
+    pub refresh: Option<String>,
     pub panels: Vec<Panel>,
 }
 
@@ -15,7 +16,7 @@ pub struct Panel {
     #[serde(rename = "type")]
     pub panel_type: String, // "timeseries", "stat", "table", "logs"
     /// Which datasource this panel queries ("host", "prometheus", "loki"). Empty
-    /// ⇒ the engine's default (first registered) source.
+    /// is accepted only when exactly one datasource is configured.
     #[serde(default)]
     pub datasource: String,
     pub grid_pos: GridPos,
@@ -37,9 +38,9 @@ pub struct Target {
 }
 
 /// The zero-config dashboard: live host CPU / memory / load, sampled locally by
-/// the `host` datasource. Shown when `[observe] dashboard_path` is empty (or a
-/// custom dashboard fails to load), so the Observe tab is useful with no external
-/// Prometheus/Loki. Uses the standard 24-column Grafana-style grid.
+/// the `host` datasource. Shown when `[observe] dashboard_path` is empty, so the
+/// Observe tab is useful with no external Prometheus/Loki. Uses the standard
+/// 24-column Grafana-style grid.
 pub fn builtin_host_dashboard() -> Dashboard {
     let panel = |id, title: &str, kind: &str, expr: &str, (x, y, w, h)| Panel {
         id,
