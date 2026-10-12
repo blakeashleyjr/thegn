@@ -15,7 +15,7 @@ use thegn_core::calendar::admission::{AdmissionLimit, MAX_SOURCE_DOCUMENT_BYTES}
 use thegn_core::calendar::{AdmissionError, AdmissionMeter, CalEvent};
 use thegn_core::config_calendar::CalendarAccount;
 
-use super::{AccountAdmission, CalendarBackend, CalendarCaps, CalendarError, EventPage};
+use super::{AccountAdmission, CalendarBackend, CalendarCaps, CalendarError, EventPage, PageMode};
 
 /// Maximum eligible `.ics` files in one vdir.
 pub const MAX_FILES: usize = 20_000;
@@ -151,7 +151,13 @@ impl IcsBackend {
                 }
                 Err(ReadFailure::Admission(e)) => return Err(e.into()),
             }
-            return EventPage::from_meter(meter, out, Vec::new(), String::new());
+            return EventPage::from_meter(
+                meter,
+                PageMode::Snapshot,
+                out,
+                Vec::new(),
+                String::new(),
+            );
         }
         if !metadata.file_type().is_dir() {
             return Err(CalendarError::Io(format!(
@@ -217,7 +223,7 @@ impl IcsBackend {
                 Err(ReadFailure::Admission(e)) => return Err(e.into()),
             }
         }
-        EventPage::from_meter(meter, out, Vec::new(), String::new())
+        EventPage::from_meter(meter, PageMode::Snapshot, out, Vec::new(), String::new())
     }
 }
 

@@ -120,7 +120,7 @@ impl CalendarBackend for MutationSpy {
         self.calls
             .list
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Box::pin(async { EventPage::try_new(vec![], vec![], "", &adm()) })
+        Box::pin(async { EventPage::try_new(PageMode::Snapshot, vec![], vec![], "", &adm()) })
     }
 
     fn create_event<'a>(
@@ -950,6 +950,9 @@ async fn caldav_token_recovery_is_one_bounded_retry_with_shared_deadline() {
             .await
             .unwrap();
         assert_eq!(page.sync_token(), caldav::scope_token(&[], "new-token"));
+        // Expired-token recovery is an authoritative snapshot even though the
+        // server handed back a fresh token (THE-452).
+        assert_eq!(page.mode(), PageMode::Snapshot);
         assert_eq!(requests.load(Ordering::SeqCst), 2);
         {
             let bodies = bodies.lock().unwrap();
@@ -2708,6 +2711,7 @@ fn an_over_budget_plugin_delta_falls_back_to_a_full_fetch() {
     assert_eq!(page.events().len(), 1);
     assert!(page.deleted().is_empty());
     assert_eq!(page.sync_token(), "full");
+    assert_eq!(page.mode(), PageMode::Snapshot);
 }
 
 #[tokio::test]
@@ -2948,4 +2952,144 @@ fn every_backend_is_built_with_the_zone_it_was_given() {
     let (from, to) = window();
     let env = b.query_env(from, to, "");
     assert_eq!(env["THEGN_CAL_HOME_ZONE"], "Asia/Kolkata");
+}
+
+// --- page mode is independent of the returned cursor (THE-452) --------------
+
+fn caldav_acct(address: std::net::SocketAddr) -> CalendarAccount {
+    CalendarAccount {
+        url: format!("http://{address}/cal/"),
+        allow_private_network: true,
+        ..account("dav", CalendarProviderKind::CalDav)
+    }
+}
+
+#[tokio::test]
+async fn a_full_caldav_snapshot_that_returns_a_token_is_still_a_snapshot() {
+    let (address, _hits, server) = serve_fixed(
+        axum::http::StatusCode::MULTI_STATUS,
+        "application/xml",
+        multistatus(2, 1),
+    )
+    .await;
+    let (from, to) = window();
+    let page = caldav::CalDavBackend::new(&caldav_acct(address), adm())
+        .list_events(from, to, "")
+        .await
+        .unwrap();
+    assert_eq!(page.mode(), PageMode::Snapshot);
+    assert_eq!(page.sync_token(), caldav::scope_token(&[], "tok-next"));
+    assert!(
+        page.deleted().is_empty(),
+        "a snapshot carries no tombstones"
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn a_caldav_delta_without_a_next_token_stays_a_delta() {
+    let body = multistatus(1, 2).replace("<d:sync-token>tok-next</d:sync-token>", "");
+    let (address, _hits, server) = serve_fixed(
+        axum::http::StatusCode::MULTI_STATUS,
+        "application/xml",
+        body,
+    )
+    .await;
+    let (from, to) = window();
+    let page = caldav::CalDavBackend::new(&caldav_acct(address), adm())
+        .list_events(from, to, &caldav::scope_token(&[], "tok-prev"))
+        .await
+        .unwrap();
+    assert_eq!(page.mode(), PageMode::Delta);
+    assert!(page.sync_token().is_empty());
+    assert_eq!(page.deleted().len(), 2);
+    server.abort();
+}
+
+#[test]
+fn page_construction_rejects_contradictory_modes() {
+    let ev = |mode, deleted: Vec<String>| EventPage::try_new(mode, vec![], deleted, "t", &adm());
+    assert!(ev(PageMode::Delta, vec!["a".into()]).is_ok());
+    assert!(ev(PageMode::Snapshot, vec!["a".into()]).is_err());
+    assert!(ev(PageMode::Reset, vec!["a".into()]).is_err());
+    assert!(ev(PageMode::Unchanged, vec![]).is_err());
+    assert!(EventPage::unchanged("t").is_unchanged());
+}
+
+#[test]
+fn a_plugin_declares_its_page_mode() {
+    // A snapshot may carry a cursor; the request had one, and the mode still wins.
+    let run = |script: &str, token: &str| {
+        let b = command::CommandBackend::new(&command_account(script), adm());
+        let (from, to) = window();
+        block_on(b.list_events(from, to, token))
+    };
+    let snap = run(
+        r#"echo '{"method":"events","params":{"mode":"snapshot","sync_token":"c2"}}'"#,
+        "c1",
+    )
+    .unwrap();
+    assert_eq!((snap.mode(), snap.sync_token()), (PageMode::Snapshot, "c2"));
+    let delta = run(
+        r#"echo '{"method":"events","params":{"mode":"delta"}}'"#,
+        "c1",
+    )
+    .unwrap();
+    assert_eq!(delta.mode(), PageMode::Delta);
+    assert!(delta.sync_token().is_empty());
+    let reset = run(
+        r#"echo '{"method":"events","params":{"mode":"reset"}}'"#,
+        "c1",
+    )
+    .unwrap();
+    assert_eq!(reset.mode(), PageMode::Reset);
+    let same = run(
+        r#"echo '{"method":"events","params":{"mode":"unchanged"}}'"#,
+        "c1",
+    )
+    .unwrap();
+    assert!(same.is_unchanged());
+    assert_eq!(same.sync_token(), "c1", "the request cursor is kept");
+    // Contradictions fail closed instead of guessing.
+    assert!(
+        run(
+            r#"echo '{"method":"events","params":{"mode":"delta"}}'"#,
+            ""
+        )
+        .is_err()
+    );
+    assert!(
+        run(
+            r#"echo '{"method":"events","params":{"mode":"unchanged"}}'"#,
+            ""
+        )
+        .is_err()
+    );
+    assert!(
+        run(
+            r#"echo '{"method":"events","params":{"mode":"bogus"}}'"#,
+            "c1"
+        )
+        .is_err()
+    );
+    assert!(
+        run(
+            r#"echo '{"method":"events","params":{"mode":"snapshot","deleted":["a"]}}'"#,
+            "c1"
+        )
+        .is_err()
+    );
+    // A plugin that predates `mode` keeps the old reading.
+    let legacy = run(
+        r#"echo '{"method":"events","params":{"sync_token":"t"}}'"#,
+        "",
+    )
+    .unwrap();
+    assert_eq!(legacy.mode(), PageMode::Snapshot);
+    let legacy = run(
+        r#"echo '{"method":"events","params":{"sync_token":"t"}}'"#,
+        "c1",
+    )
+    .unwrap();
+    assert_eq!(legacy.mode(), PageMode::Delta);
 }

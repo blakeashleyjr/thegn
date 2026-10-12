@@ -14,7 +14,7 @@ use chrono::NaiveDate;
 use futures_util::future::BoxFuture;
 use thegn_core::config_calendar::CalendarAccount;
 
-use super::{AccountAdmission, CalendarBackend, CalendarCaps, CalendarError, EventPage};
+use super::{AccountAdmission, CalendarBackend, CalendarCaps, CalendarError, EventPage, PageMode};
 use crate::http::{
     CalendarHttpClient, CalendarHttpError, ExpectedMedia, MAX_BODY_BYTES, MAX_REQUEST_BYTES,
     bounded_header_value, discard_body, map_error, read_body, validate_encoding, validate_media,
@@ -184,7 +184,7 @@ impl CalendarBackend for IcsUrlBackend {
                 &mut events,
             )?;
             drop(body);
-            EventPage::from_meter(meter, events, Vec::new(), etag)
+            EventPage::from_meter(meter, PageMode::Snapshot, events, Vec::new(), etag)
         })
     }
 }

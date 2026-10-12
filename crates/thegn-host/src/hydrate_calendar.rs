@@ -26,7 +26,7 @@ use thegn_core::calendar::{CalEvent, CalendarWindow, ExpansionError};
 use thegn_core::config_calendar::CalendarConfig;
 use thegn_core::db::Db;
 use thegn_core::store::{CalendarRow, CalendarStore};
-use thegn_svc::calendar::{CalendarError, CalendarRouter, EventPage};
+use thegn_svc::calendar::{CalendarError, CalendarRouter, EventPage, PageMode};
 use tokio::sync::mpsc as tokio_mpsc;
 
 use crate::calendar_docs::CalendarViewError;
@@ -474,19 +474,26 @@ fn apply_page_with_generation(
 
     // A conditional fetch that came back 304: nothing to write, but the sync
     // stamp must still advance or we would re-hit the provider every tick.
-    if page.is_unchanged() {
+    // The cache strategy branches on what the fetch completed, never on the
+    // cursor it returned (THE-452): a snapshot may return a token and a delta
+    // may return none.
+    let mode = page.mode();
+    if mode == PageMode::Unchanged {
         if crate::hydrate_schedule::generation_is_current(generation) {
             let _ = db.put_calendar_sync(account, provider, page.sync_token(), from_ms, to_ms); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
         }
         return false;
     }
 
-    let incremental = !page.sync_token().is_empty();
+    let incremental = !mode.replaces_cache();
     // Rule 2: an EMPTY FULL fetch is only believed when there was nothing
     // cached. Otherwise a 200-with-empty-body from a flaky proxy silently
     // erases a month of meetings — and unlike an error, nothing would warn.
     // (A page is always complete: an over-budget source never produces one.)
-    if !incremental && page.events().is_empty() && db.has_calendar_events(account).unwrap_or(false)
+    // A provider-requested reset is believed even when empty.
+    if mode == PageMode::Snapshot
+        && page.events().is_empty()
+        && db.has_calendar_events(account).unwrap_or(false)
     {
         tracing::warn!(
             target: "thegn::calendar",
