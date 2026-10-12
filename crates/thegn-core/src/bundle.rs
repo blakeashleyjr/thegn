@@ -49,6 +49,9 @@ pub struct ResolvedEnv {
     /// credential sub-vault firewall). Each entry is `(bundle_name, owner_zone)`.
     /// The launch continues without them; the caller surfaces the denial.
     pub denied: Vec<(String, String)>,
+    /// Bundle names that passed zone visibility and were folded, in fold order.
+    /// Launch-time bundle effects must use this authorization result.
+    pub authorized: Vec<String>,
 }
 
 impl ResolvedEnv {
@@ -303,6 +306,38 @@ pub fn managed_home(bundle_name: &str) -> std::path::PathBuf {
         .join("home")
 }
 
+/// Resolve a managed home only when the configured bundle name has an
+/// unambiguous non-empty legacy slug. The readable legacy layout remains in use
+/// for names that have exactly one claimant.
+pub fn managed_home_checked(cfg: &Config, bundle_name: &str) -> Option<std::path::PathBuf> {
+    let slug = util::slugify(bundle_name);
+    if slug.is_empty()
+        || cfg
+            .bundle
+            .keys()
+            .any(|other| other != bundle_name && util::slugify(other) == slug)
+    {
+        return None;
+    }
+    Some(managed_home(bundle_name))
+}
+
+/// Dotfile effects for exactly the bundles authorized by composition.
+pub fn dotfile_targets(
+    cfg: &Config,
+    resolved: &ResolvedEnv,
+) -> Vec<(crate::config::DotfilesSpec, std::path::PathBuf)> {
+    resolved
+        .authorized
+        .iter()
+        .filter_map(|name| {
+            let spec = cfg.bundle.get(name)?.dotfiles.as_ref()?;
+            let home = managed_home_checked(cfg, name)?;
+            Some((spec.clone(), home))
+        })
+        .collect()
+}
+
 /// Compose the active bundle(s) for a pane into a [`ResolvedEnv`], resolving
 /// secret refs via subprocess. Call at launch (off the event loop). `choice` is
 /// the agent name, or `None` for a plain shell pane.
@@ -371,6 +406,7 @@ fn compose_inner(
     let mut mounts: Vec<Mount> = Vec::new();
     let mut ensure_dirs: Vec<String> = Vec::new();
     let mut denied: Vec<(String, String)> = Vec::new();
+    let mut authorized: Vec<String> = Vec::new();
 
     // The worktree's zone (DB-tracked). A zone-owned bundle is a credential
     // sub-vault: only worktrees in that zone may compose it. Checked at fold
@@ -416,6 +452,7 @@ fn compose_inner(
             denied.push((name.clone(), b.zone.clone()));
             continue;
         }
+        authorized.push(name.clone());
         fold_bundle(
             cfg,
             db,
@@ -492,6 +529,7 @@ fn compose_inner(
         mounts,
         ensure_dirs,
         denied,
+        authorized,
     }
 }
 
@@ -541,11 +579,21 @@ fn fold_bundle(
     // HOME (materialized separately); `"<path>"` at an explicit dir.
     if !b.home.is_empty() {
         let home = if b.home == "managed" {
-            managed_home(name).to_string_lossy().into_owned()
+            match managed_home_checked(cfg, name) {
+                Some(home) => home.to_string_lossy().into_owned(),
+                None => {
+                    crate::msg::warn(&format!(
+                        "bundle: managed HOME for {name:?} is ambiguous or invalid; skipped"
+                    ));
+                    String::new()
+                }
+            }
         } else {
             util::expand_tilde(&b.home)
         };
-        fold_cred_dir("HOME", &home, overrides, mounts, ensure_dirs);
+        if !home.is_empty() {
+            fold_cred_dir("HOME", &home, overrides, mounts, ensure_dirs);
+        }
     }
 }
 
@@ -1158,6 +1206,65 @@ mod tests {
     }
 
     #[test]
+    fn ambiguous_managed_home_aliases_are_not_folded() {
+        let db = Db::open_memory().unwrap();
+        let mut cfg = Config::default();
+        let spec = crate::config::DotfilesSpec {
+            source: "/templates".into(),
+            ..Default::default()
+        };
+        for name in ["work/a", "work-a"] {
+            cfg.bundle.insert(
+                name.into(),
+                Bundle {
+                    home: "managed".into(),
+                    dotfiles: Some(spec.clone()),
+                    ..Bundle::default()
+                },
+            );
+        }
+        set_active(&db, Bind::Global, "/wt", None, "work/a").unwrap();
+        let resolved = compose(&cfg, &db, "/wt", None, None);
+        assert_eq!(get(&resolved.overrides, "HOME"), None);
+        assert!(resolved.ensure_dirs.is_empty());
+        assert!(managed_home_checked(&cfg, "work/a").is_none());
+        assert!(dotfile_targets(&cfg, &resolved).is_empty());
+
+        let mut punctuation = Config::default();
+        punctuation.bundle.insert("!!!".into(), Bundle::default());
+        assert!(managed_home_checked(&punctuation, "!!!").is_none());
+        assert!(managed_home_checked(&Config::default(), "work").is_some());
+    }
+
+    #[test]
+    fn dotfile_targets_only_authorized_bundles_and_rejects_ambiguous_homes() {
+        use crate::config::DotfilesSpec;
+        let mut foreign = zoned_bundle("clientA", "A_KEY", "secret");
+        foreign.dotfiles = Some(DotfilesSpec {
+            source: "/foreign".into(),
+            ..Default::default()
+        });
+        let mut shared = bundle_with_env(&[("EDITOR", "vim")]);
+        shared.dotfiles = Some(DotfilesSpec {
+            source: "/shared".into(),
+            ..Default::default()
+        });
+        let (db, cfg) = zoned_setup(
+            &[("foreign", foreign), ("shared", shared)],
+            "/repo",
+            "/repo/wt",
+            Some("clientB"),
+        );
+        set_active(&db, Bind::Worktree, "/repo/wt", Some("repo"), "foreign").unwrap();
+        set_active(&db, Bind::Global, "/repo/wt", Some("repo"), "shared").unwrap();
+        let resolved = compose(&cfg, &db, "/repo/wt", Some("repo"), None);
+        let targets = dotfile_targets(&cfg, &resolved);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].0.source, "/shared");
+        assert_eq!(resolved.authorized, vec!["shared"]);
+    }
+
+    #[test]
     fn materialize_dotfiles_symlinks_and_is_idempotent() {
         use crate::config::{DotfileMode, DotfilesSpec};
         let root = std::env::temp_dir().join(format!("tg-dotfiles-{}", util::now()));
@@ -1359,11 +1466,13 @@ mod tests {
         // denied at fold time (extends expands the chain, deny catches it).
         let mut child = bundle_with_env(&[("CHILD", "1")]);
         child.extends = vec!["a-secrets".into()];
+        let mut parent = zoned_bundle("clientA", "A_KEY", "secret");
+        parent.dotfiles = Some(crate::config::DotfilesSpec {
+            source: "/foreign-parent".into(),
+            ..Default::default()
+        });
         let (db, cfg) = zoned_setup(
-            &[
-                ("a-secrets", zoned_bundle("clientA", "A_KEY", "secret")),
-                ("child", child),
-            ],
+            &[("a-secrets", parent), ("child", child)],
             "/repo",
             "/repo/wt",
             Some("clientB"),
@@ -1376,6 +1485,8 @@ mod tests {
             "foreign parent denied"
         );
         assert!(r.denied.iter().any(|(n, _)| n == "a-secrets"));
+        assert!(!r.authorized.iter().any(|n| n == "a-secrets"));
+        assert!(dotfile_targets(&cfg, &r).is_empty());
     }
 
     // --- decoupled identities: per-tool credential resolution ----------------
