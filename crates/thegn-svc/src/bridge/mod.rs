@@ -36,6 +36,17 @@ const MAX_CAPTURE_BYTES: usize = 1024 * 1024;
 /// Worst-case JSON escaping expands captured control bytes sixfold. Five
 /// commands × two streams × the capture limit stays below the 64 MiB frame cap.
 const MAX_BATCH_CMDS: usize = 5;
+/// Per-command limits keep OS argument/environment blocks comfortably below ARG_MAX.
+const MAX_ARGV_ITEMS: usize = 256;
+const MAX_ARGV_BYTES: usize = 256 * 1024;
+const MAX_ENV_PAIRS: usize = 128;
+const MAX_ENV_BYTES: usize = 64 * 1024;
+/// Stateful notification producers are bounded per connection.
+#[cfg(not(test))]
+const MAX_WATCHERS_PER_CONNECTION: usize = 16;
+#[cfg(test)]
+const MAX_WATCHERS_PER_CONNECTION: usize = 3;
+const MAX_PROCS_PER_CONNECTION: usize = 16;
 
 #[derive(Default)]
 struct AdmissionLimiter {
@@ -1023,6 +1034,7 @@ pub fn serve(reader: impl Read, writer: impl Write + Send + 'static) {
     let mut watchers: Vec<RecommendedWatcher> = Vec::new();
     // Live streaming processes (proc.spawn), keyed by channel id.
     let procs: ProcRegistry = Arc::new(Mutex::new(HashMap::new()));
+    let cancel = Arc::new(AtomicBool::new(false));
     let mut reader = FramedReader::new(reader);
     loop {
         let body = match reader.read_message() {
@@ -1065,15 +1077,15 @@ pub fn serve(reader: impl Read, writer: impl Write + Send + 'static) {
                         );
                         continue;
                     };
-                    let w = writer.clone();
+                    let (w, worker_cancel) = (writer.clone(), cancel.clone());
                     let req_id = req.id;
                     if let Err(e) = std::thread::Builder::new()
                         .name("bridge-exec".into())
                         .spawn(move || {
                             let _permit = permit;
                             let resp = match req.method.as_str() {
-                                "exec" => exec_response(&req),
-                                "exec.batch" => exec_batch_response(&req),
+                                "exec" => exec_response(&req, &worker_cancel),
+                                "exec.batch" => exec_batch_response(&req, &worker_cancel),
                                 _ => proc_response(&req),
                             };
                             write_frame(&w, &resp);
@@ -1100,6 +1112,7 @@ pub fn serve(reader: impl Read, writer: impl Write + Send + 'static) {
             }
         }
     }
+    cancel.store(true, Ordering::Release);
     // Connection closed: terminate and reap every owned process tree, bounded.
     teardown_procs(&procs);
 }
@@ -1134,6 +1147,7 @@ fn proc_spawn_response(req: &Request, writer: &SharedWriter, procs: &ProcRegistr
 /// SIGKILLed once the leader exits, so background jobs a command leaves in its
 /// group (`foo &`) do not outlive it.
 fn do_spawn(p: SpawnParams, writer: SharedWriter, procs: ProcRegistry) -> Result<()> {
+    check_command_shape(&p.argv, &p.env)?;
     let Some((cmd, args)) = p.argv.split_first() else {
         bail!("empty argv");
     };
@@ -1141,6 +1155,9 @@ fn do_spawn(p: SpawnParams, writer: SharedWriter, procs: ProcRegistry) -> Result
     // authority would be lost and its exit would tear down the new one.
     if procs.lock().unwrap().contains_key(&p.chan) {
         bail!("channel {} already in use", p.chan);
+    }
+    if procs.lock().unwrap().len() >= MAX_PROCS_PER_CONNECTION {
+        bail!("proc.spawn capacity exhausted for this connection");
     }
     let mut c = Command::new(cmd);
     c.args(args)
@@ -1444,9 +1461,9 @@ fn write_frame(w: &SharedWriter, msg: &impl Serialize) {
     }
 }
 
-fn exec_response(req: &Request) -> Response {
+fn exec_response(req: &Request, cancel: &Arc<AtomicBool>) -> Response {
     match serde_json::from_value::<ExecParams>(req.params.clone()) {
-        Ok(p) => match do_exec(&p) {
+        Ok(p) => match do_exec(&p, cancel) {
             Ok(r) => resp_ok(req.id, r),
             Err(e) => resp_err(req.id, e.to_string()),
         },
@@ -1454,7 +1471,7 @@ fn exec_response(req: &Request) -> Response {
     }
 }
 
-fn exec_batch_response(req: &Request) -> Response {
+fn exec_batch_response(req: &Request, cancel: &Arc<AtomicBool>) -> Response {
     let p: BatchParams = match serde_json::from_value(req.params.clone()) {
         Ok(p) => p,
         Err(e) => return resp_err(req.id, format!("bad exec.batch params: {e}")),
@@ -1462,27 +1479,39 @@ fn exec_batch_response(req: &Request) -> Response {
     if p.cmds.len() > MAX_BATCH_CMDS {
         return resp_err(req.id, "bad exec.batch params: too many commands".into());
     }
+    if let Some(error) = p
+        .cmds
+        .iter()
+        .find_map(|argv| check_command_shape(argv, &p.env).err())
+    {
+        return resp_err(req.id, format!("bad exec.batch params: {error}"));
+    }
     // Each command runs independently; a spawn failure becomes a synthetic
     // exit=-1 result rather than failing the whole batch, so one bad subcommand
     // never masks its siblings' output.
-    let results: Vec<ExecResult> = p
-        .cmds
-        .into_iter()
-        .map(|argv| {
-            do_exec(&ExecParams {
-                argv,
-                cwd: None,
-                env: p.env.clone(),
-            })
+    let mut results = Vec::with_capacity(p.cmds.len());
+    for argv in p.cmds {
+        if cancel.load(Ordering::Acquire) {
+            break;
+        }
+        results.push(
+            do_exec(
+                &ExecParams {
+                    argv,
+                    cwd: None,
+                    env: p.env.clone(),
+                },
+                cancel,
+            )
             .unwrap_or_else(|_error| ExecResult {
                 stdout: String::new(),
                 stderr: "bridge exec failed".into(),
                 exit: -1,
                 stdout_truncated: false,
                 stderr_truncated: false,
-            })
-        })
-        .collect();
+            }),
+        );
+    }
     resp_ok(req.id, results)
 }
 
@@ -1507,6 +1536,12 @@ fn watch_response(
         Ok(p) => p,
         Err(e) => return resp_err(req.id, format!("bad fs.watch params: {e}")),
     };
+    if watchers.len() >= MAX_WATCHERS_PER_CONNECTION {
+        return resp_err(
+            req.id,
+            "fs.watch capacity exhausted for this connection".into(),
+        );
+    }
     match start_watch(&p.path, p.watch_id, writer.clone()) {
         Ok(w) => {
             watchers.push(w);
@@ -1592,7 +1627,8 @@ fn scrub_git_env(c: &mut Command) {
     }
 }
 
-fn do_exec(p: &ExecParams) -> Result<ExecResult> {
+fn do_exec(p: &ExecParams, cancel: &Arc<AtomicBool>) -> Result<ExecResult> {
+    check_command_shape(&p.argv, &p.env)?;
     let Some((cmd, args)) = p.argv.split_first() else {
         bail!("empty argv");
     };
@@ -1616,13 +1652,36 @@ fn do_exec(p: &ExecParams) -> Result<ExecResult> {
     // timeout without cancelling us, so cap it here — deadline defaults above the
     // client's read timeout so a legitimately-slow-but-live command still finishes.
     let deadline = env_timeout("THEGN_BRIDGE_EXEC_DEADLINE_SECS", 90);
-    output_bounded(c, deadline).context("bridge exec failed")
+    output_bounded(c, deadline, cancel).context("bridge exec failed")
+}
+
+/// Reject oversized command shapes before passing them to the operating system.
+/// The diagnostic is intentionally generic and never includes argv or env data.
+fn check_command_shape(argv: &[String], env: &[(String, String)]) -> Result<()> {
+    let argv_bytes = argv.iter().try_fold(0usize, |total, item| {
+        total.checked_add(item.len().saturating_add(1))
+    });
+    let env_bytes = env.iter().try_fold(0usize, |total, (key, value)| {
+        total.checked_add(key.len().saturating_add(value.len()).saturating_add(2))
+    });
+    if argv.len() > MAX_ARGV_ITEMS
+        || argv_bytes.is_none_or(|bytes| bytes > MAX_ARGV_BYTES)
+        || env.len() > MAX_ENV_PAIRS
+        || env_bytes.is_none_or(|bytes| bytes > MAX_ENV_BYTES)
+    {
+        bail!("command shape exceeds bridge limits");
+    }
+    Ok(())
 }
 
 /// Run `c` to completion, draining stdout/stderr on threads (so a full pipe never
 /// deadlocks) and killing the child if it outlives `deadline`. Mirrors the host's
 /// `git::output_bounded`. A killed child yields `exit = -1`.
-fn output_bounded(mut c: Command, deadline: Duration) -> Result<ExecResult> {
+fn output_bounded(
+    mut c: Command,
+    deadline: Duration,
+    cancel: &Arc<AtomicBool>,
+) -> Result<ExecResult> {
     crate::plugin::proc::set_process_group(&mut c);
     c.stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1685,10 +1744,10 @@ fn output_bounded(mut c: Command, deadline: Duration) -> Result<ExecResult> {
     let status = loop {
         match child.try_wait().context("wait")? {
             Some(s) => break Some(s),
-            None if start.elapsed() >= deadline => {
+            None if cancel.load(Ordering::Acquire) || start.elapsed() >= deadline => {
                 crate::plugin::proc::kill_group(child.id());
                 if let Err(error) = child.wait() {
-                    tracing::debug!(%error, "could not reap bridge child after deadline");
+                    tracing::debug!(%error, "could not reap bridge child after cancellation or deadline");
                 }
                 break None;
             }
@@ -2015,6 +2074,81 @@ mod tests {
         assert!(!pid_alive(pid), "teardown must kill and reap the tree");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn connection_close_cancels_exec_and_releases_admission() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (sock, _) = listener.accept().unwrap();
+            serve(sock.try_clone().unwrap(), sock);
+        });
+        let mut sock = TcpStream::connect(addr).unwrap();
+        let marker =
+            std::env::temp_dir().join(format!("tg-bridge-exec-pid-{}", std::process::id()));
+        match std::fs::remove_file(&marker) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("could not clear exec pid marker: {error}"),
+        }
+        let command = format!("echo $$ > {}; exec sleep 30", marker.display());
+        let req = Request {
+            id: 1,
+            method: "exec".into(),
+            params: serde_json::json!({
+                "argv": ["sh", "-c", command],
+                "cwd": null,
+                "env": []
+            }),
+        };
+        let baseline = bridge_admission().active.load(Ordering::Acquire);
+        let body = serde_json::to_string(&req).unwrap();
+        sock.write_all(&framing::encode(&body)).unwrap();
+        sock.flush().unwrap();
+        let start = Instant::now();
+        let mut pid = None;
+        while pid.is_none() && start.elapsed() < Duration::from_secs(3) {
+            pid = match std::fs::read_to_string(&marker) {
+                Ok(contents) => contents.trim().parse::<i32>().ok(),
+                Err(_) => None,
+            };
+            if pid.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            pid.is_some(),
+            "exec worker must write a parseable pid before disconnect"
+        );
+        let pid = pid.unwrap();
+        sock.shutdown(std::net::Shutdown::Both).unwrap();
+        server.join().unwrap();
+        let reap_start = Instant::now();
+        while pid_alive(pid) && reap_start.elapsed() < Duration::from_secs(3) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !pid_alive(pid),
+            "connection close must kill and reap exec process"
+        );
+        let permit_start = Instant::now();
+        while bridge_admission().active.load(Ordering::Acquire) > baseline
+            && permit_start.elapsed() < Duration::from_secs(3)
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            bridge_admission().active.load(Ordering::Acquire) <= baseline,
+            "cancelled exec must release its admission permit"
+        );
+        match std::fs::remove_file(&marker) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("could not remove exec pid marker: {error}"),
+        }
+    }
+
     #[test]
     fn exec_roundtrip_success_and_failure() {
         let c = connect();
@@ -2031,6 +2165,136 @@ mod tests {
                 .unwrap();
             assert_eq!(r.stdout.trim(), i.to_string());
         }
+    }
+
+    #[test]
+    fn exec_rejects_oversized_argv_before_spawning() {
+        let marker = std::env::temp_dir().join(format!("tg-bridge-shape-{}", std::process::id()));
+        match std::fs::remove_file(&marker) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("could not clear argv marker: {error}"),
+        }
+        let touch = format!("touch {}", marker.display());
+        let padding = "x".repeat(90 * 1024);
+        let argv = vec![
+            "sh",
+            "-c",
+            touch.as_str(),
+            padding.as_str(),
+            padding.as_str(),
+            padding.as_str(),
+        ];
+        let client = connect();
+        let error = client
+            .exec(&argv, None, &[])
+            .expect_err("oversized argv must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("command shape exceeds bridge limits")
+        );
+        assert!(
+            !marker.exists(),
+            "rejected argv must never spawn the command"
+        );
+        match std::fs::remove_file(&marker) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("could not remove argv marker: {error}"),
+        }
+    }
+
+    #[test]
+    fn exec_batch_rejects_one_oversized_command_as_a_whole() {
+        let marker =
+            std::env::temp_dir().join(format!("tg-bridge-batch-shape-{}", std::process::id()));
+        match std::fs::remove_file(&marker) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("could not clear batch marker: {error}"),
+        }
+        let touch = format!("touch {}", marker.display());
+        let padding = "x".repeat(90 * 1024);
+        let client = connect();
+        let error = client
+            .exec_batch(
+                &[
+                    vec!["sh".into(), "-c".into(), touch],
+                    vec!["true".into(), padding.clone(), padding.clone(), padding],
+                ],
+                &[],
+            )
+            .expect_err("the complete batch must be rejected before its first command");
+        assert!(
+            error
+                .to_string()
+                .contains("command shape exceeds bridge limits")
+        );
+        assert!(!marker.exists(), "no command in a rejected batch may run");
+        match std::fs::remove_file(&marker) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("could not remove batch marker: {error}"),
+        }
+    }
+
+    #[test]
+    fn proc_spawn_rejects_oversized_environment() {
+        let client = connect();
+        let error = client
+            .spawn_proc(
+                &["cat"],
+                None,
+                &[("BRIDGE_TEST".into(), "x".repeat(MAX_ENV_BYTES))],
+            )
+            .expect_err("oversized env must be rejected before spawning");
+        assert!(
+            error
+                .to_string()
+                .contains("command shape exceeds bridge limits")
+        );
+    }
+
+    #[test]
+    fn per_connection_proc_spawn_limit_rejects_overflow_and_keeps_existing_channels_live() {
+        let client = connect();
+        let mut channels = Vec::new();
+        for _ in 0..MAX_PROCS_PER_CONNECTION {
+            channels.push(client.spawn_proc(&["cat"], None, &[]).unwrap());
+        }
+        let error = client
+            .spawn_proc(&["cat"], None, &[])
+            .expect_err("the first channel beyond the cap must fail");
+        assert!(error.to_string().contains("proc.spawn capacity exhausted"));
+        for (chan, rx) in &channels {
+            client.proc_stdin(*chan, b"still-live").unwrap();
+            let event = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert!(matches!(event, ProcEvent::Out { data, .. } if data == b"still-live"));
+        }
+        for (chan, _) in channels {
+            client.proc_kill(chan).unwrap();
+        }
+    }
+
+    #[test]
+    fn per_connection_watch_limit_rejects_overflow_and_keeps_existing_watchers_live() {
+        let dir = std::env::temp_dir().join(format!("tg-bridge-watch-cap-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let client = connect();
+        let mut watchers = Vec::new();
+        for _ in 0..MAX_WATCHERS_PER_CONNECTION {
+            watchers.push(client.watch(dir.to_str().unwrap()).unwrap());
+        }
+        let error = client
+            .watch(dir.to_str().unwrap())
+            .expect_err("the first watcher beyond the cap must fail");
+        assert!(error.to_string().contains("fs.watch capacity exhausted"));
+        std::fs::write(dir.join("observed"), b"change").unwrap();
+        for watcher in &watchers {
+            assert!(watcher.recv_timeout(Duration::from_secs(3)).is_ok());
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -2091,6 +2355,25 @@ mod tests {
     }
 
     #[test]
+    fn exec_batch_keeps_empty_argv_as_a_per_command_failure() {
+        let c = connect();
+        let results = c
+            .exec_batch(
+                &[
+                    vec!["echo".into(), "first".into()],
+                    Vec::new(),
+                    vec!["echo".into(), "third".into()],
+                ],
+                &[],
+            )
+            .unwrap();
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].stdout.trim(), "first");
+        assert_eq!(results[1].exit, -1);
+        assert_eq!(results[2].stdout.trim(), "third");
+    }
+
+    #[test]
     fn exec_batch_rejects_more_than_the_frame_safe_command_count() {
         let req = Request {
             id: 1,
@@ -2100,7 +2383,7 @@ mod tests {
                 "env": []
             }),
         };
-        let response = exec_batch_response(&req);
+        let response = exec_batch_response(&req, &Arc::new(AtomicBool::new(false)));
         assert_eq!(
             response.err.as_deref(),
             Some("bad exec.batch params: too many commands")
@@ -2468,12 +2751,31 @@ mod tests {
         let mut c = Command::new("sh");
         c.args(["-c", "sleep 30"]);
         let start = Instant::now();
-        let r = output_bounded(c, Duration::from_millis(300)).unwrap();
+        let r = output_bounded(
+            c,
+            Duration::from_millis(300),
+            &Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
         assert_eq!(r.exit, -1, "killed child reports -1");
         assert!(
             start.elapsed() < Duration::from_secs(5),
             "killed at the deadline, not after the full sleep: {:?}",
             start.elapsed()
+        );
+    }
+
+    #[test]
+    fn output_bounded_kills_a_command_when_cancel_is_already_set() {
+        let mut c = Command::new("sh");
+        c.args(["-c", "sleep 30"]);
+        let cancel = Arc::new(AtomicBool::new(true));
+        let start = Instant::now();
+        let result = output_bounded(c, Duration::from_secs(30), &cancel).unwrap();
+        assert_eq!(result.exit, -1, "cancelled child reports exit -1");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "cancel is observed promptly"
         );
     }
 
@@ -2486,7 +2788,7 @@ mod tests {
         let start = Instant::now();
         let work = std::thread::spawn(move || {
             let _permit = permit;
-            output_bounded(c, Duration::from_secs(1)).unwrap()
+            output_bounded(c, Duration::from_secs(1), &Arc::new(AtomicBool::new(false))).unwrap()
         });
         let result = work.join().unwrap();
         assert_eq!(result.stdout, "hi\n");
@@ -2507,7 +2809,12 @@ mod tests {
         // well within the deadline.
         let mut c = Command::new("sh");
         c.args(["-c", "printf hi; exit 4"]);
-        let r = output_bounded(c, Duration::from_secs(10)).unwrap();
+        let r = output_bounded(
+            c,
+            Duration::from_secs(10),
+            &Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
         assert_eq!(r.stdout, "hi");
         assert_eq!(r.exit, 4);
     }
@@ -2535,7 +2842,12 @@ mod tests {
             "-c",
             "head -c 1048577 /dev/zero; head -c 1048577 /dev/zero >&2",
         ]);
-        let result = output_bounded(c, Duration::from_secs(10)).unwrap();
+        let result = output_bounded(
+            c,
+            Duration::from_secs(10),
+            &Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
         assert_eq!(result.stdout.len(), MAX_CAPTURE_BYTES);
         assert_eq!(result.stderr.len(), MAX_CAPTURE_BYTES);
         assert!(result.stdout_truncated);
