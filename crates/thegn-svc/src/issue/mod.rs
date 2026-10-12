@@ -1123,7 +1123,8 @@ mod spec {
                 "number": "1",
                 "provider": "linear",
                 "title": "partial row",
-                "status": "todo"
+                "status": "todo",
+                "priority": "low"
             }))
             .unwrap();
             Box::pin(async move {
@@ -1294,12 +1295,14 @@ mod spec {
                 .block_on(router.update_issue("linear:ABC-9", &patch))
                 .is_err()
         );
-        assert_eq!(updates.load(std::sync::atomic::Ordering::SeqCst), 0);
+        // Status is supported by this backend, so its rejected API response
+        // still means the provider was called once.
+        assert_eq!(updates.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert!(matches!(
             runtime.block_on(router.update_issue("linear:ABC-9", &IssuePatch::default())),
             Err(IssueError::EmptyPatch)
         ));
-        assert_eq!(updates.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(updates.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert!(matches!(
             runtime.block_on(router.update_issue(
                 "linear:ABC-9",
@@ -1310,12 +1313,12 @@ mod spec {
             )),
             Err(IssueError::UnsupportedPatchFields(fields)) if fields == vec!["priority"]
         ));
-        assert_eq!(updates.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(updates.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert!(matches!(
             runtime.block_on(router.update_issue("linear:ABC-9", &patch)),
             Err(IssueError::Api(_))
         ));
-        assert_eq!(updates.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(updates.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     #[test]
