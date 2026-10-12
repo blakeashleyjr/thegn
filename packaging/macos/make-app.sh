@@ -95,6 +95,21 @@ while (($#)); do
   shift
 done
 
+# These values are embedded in bundle filenames, plist XML, and generated shell.
+# The restricted grammars make those interpolations literal and prevent a key
+# from introducing shell syntax into the generated `export KEY=...` command.
+if [[ ! $name =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ || $name == . || $name == .. ]]; then
+  echo "make-app.sh: --name must be 1-64 ASCII letters, digits, dots, underscores, or hyphens and start with a letter or digit" >&2
+  exit 2
+fi
+for kv in ${envs+"${envs[@]}"}; do
+  env_key="${kv%%=*}"
+  if [[ ! $env_key =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+    echo "make-app.sh: invalid --env key: $env_key" >&2
+    exit 2
+  fi
+done
+
 if [[ "$(uname -s)" != "Darwin" ]]; then
   echo "make-app.sh: macOS only (on Linux/BSD install.sh writes a .desktop entry)" >&2
   exit 1
@@ -117,8 +132,15 @@ if [[ ! -x $bin ]]; then
 fi
 
 app="$dest/$name.app"
-version="$("$bin" --version 2>/dev/null | awk '{print $2}')"
-version="${version:-0.0.0}"
+version_output="$("$bin" --version 2>/dev/null)" || {
+  echo "make-app.sh: could not read version from $bin" >&2
+  exit 1
+}
+if [[ ! $version_output =~ ^thegn\ ([0-9]+(\.[0-9]+){0,2}(-[0-9A-Za-z.]+)?)$ ]]; then
+  echo "make-app.sh: unsupported version output from $bin" >&2
+  exit 1
+fi
+version="${BASH_REMATCH[1]}"
 # CFBundleVersion must be numeric-dotted; a pre-release suffix (0.1.0-alpha.2)
 # is only legal in CFBundleShortVersionString.
 short_version="$version"
