@@ -1044,19 +1044,14 @@ impl Builder {
                     }
                 }
                 EventTime::Zoned { local, zone } => {
-                    let Some(local) = local.checked_add_signed(self.duration.unwrap_or_default())
-                    else {
-                        return None;
-                    };
+                    let local = local.checked_add_signed(self.duration.unwrap_or_default())?;
                     EventTime::Zoned {
                         local,
                         zone: zone.clone(),
                     }
                 }
                 EventTime::Instant { at } => {
-                    let Some(at) = at.checked_add_signed(self.duration.unwrap_or_default()) else {
-                        return None;
-                    };
+                    let at = at.checked_add_signed(self.duration.unwrap_or_default())?;
                     EventTime::Instant { at }
                 }
             }
