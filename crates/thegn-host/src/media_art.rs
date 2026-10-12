@@ -8,6 +8,17 @@
 //! for (graphics protocols stay gated / best-effort elsewhere). When the
 //! terminal can't do truecolor the seg color layer quantizes it down like every
 //! other frame.
+//!
+//! The art URL is attacker-influenced (a player publishes it), so every fetch is
+//! bounded: http(s) only, resolved addresses vetted and the connection pinned to
+//! them, redirects re-validated per hop, body streamed under a byte cap and a
+//! total deadline, local files must be bounded regular files, and only the
+//! latest request may own the (tracked) task.
+
+use std::net::{IpAddr, SocketAddr};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use termwiz::terminal::TerminalWaker;
 
@@ -53,9 +64,228 @@ pub(crate) fn mosaic(raster: &crate::rasterize::Raster, cols: usize, rows: usize
         .collect()
 }
 
+/// Longest art URL admitted; longer is refused outright.
+const MAX_URL_LEN: usize = 2048;
+/// Encoded-body cap for both HTTP bodies and local files.
+const MAX_ART_BYTES: usize = 8 * 1024 * 1024;
+/// Wall-clock budget for a whole fetch (DNS, every redirect hop, body).
+const FETCH_TOTAL_TIMEOUT: Duration = Duration::from_secs(20);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const DNS_TIMEOUT: Duration = Duration::from_secs(5);
+/// Redirect hops followed (each re-validated and re-resolved).
+const MAX_REDIRECTS: usize = 3;
+
+/// Why a locator was refused. Carries no URL or path, so a diagnostic never
+/// reflects attacker-controlled text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reject {
+    TooLong,
+    Scheme,
+    Credentials,
+    NoHost,
+    ForbiddenAddress,
+    Resolve,
+    Status,
+    TooLarge,
+    Redirects,
+    Network,
+    Decode,
+}
+
+/// The host of an admitted URL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Host {
+    Ip(IpAddr),
+    Name(String),
+}
+
+/// Whether `ip` is a destination cover art must never be fetched from:
+/// loopback, private, link-local, unspecified, multicast, CGNAT, broadcast,
+/// and IPv6 forms that embed an IPv4 address (mapped, compat, NAT64, 6to4).
+fn forbidden_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_multicast()
+                || v4.is_broadcast()
+                || o[0] == 0
+                || (o[0] == 100 && (o[1] & 0xC0) == 64) // 100.64.0.0/10 CGNAT
+                || o[0] >= 240 // reserved
+        }
+        IpAddr::V6(v6) => {
+            if v6.is_loopback() || v6.is_unspecified() || v6.is_multicast() {
+                return true;
+            }
+            let seg = v6.segments();
+            if (seg[0] & 0xFE00) == 0xFC00 || (seg[0] & 0xFFC0) == 0xFE80 {
+                return true; // unique-local / link-local
+            }
+            if let Some(v4) = v6.to_ipv4() {
+                // ::ffff:a.b.c.d and ::a.b.c.d
+                return forbidden_ip(IpAddr::V4(v4));
+            }
+            // 64:ff9b::/96 NAT64 embeds an IPv4 in the low 32 bits.
+            if seg[0] == 0x64 && seg[1] == 0xFF9B && seg[2..6].iter().all(|s| *s == 0) {
+                let o = v6.octets();
+                let v4 = std::net::Ipv4Addr::new(o[12], o[13], o[14], o[15]);
+                return forbidden_ip(IpAddr::V4(v4));
+            }
+            seg[0] == 0x2002 // 6to4 can tunnel to arbitrary v4
+        }
+    }
+}
+
+/// Admission for a URL BEFORE resolution: http(s) only, no credentials, a host,
+/// and — for an IP-literal host — an allowed address. Pure.
+fn admit_url(url: &reqwest::Url) -> Result<Host, Reject> {
+    if url.as_str().len() > MAX_URL_LEN {
+        return Err(Reject::TooLong);
+    }
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(Reject::Scheme);
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(Reject::Credentials);
+    }
+    let host = url.host_str().ok_or(Reject::NoHost)?;
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    if bare.is_empty() {
+        return Err(Reject::NoHost);
+    }
+    match bare.parse::<IpAddr>() {
+        Ok(ip) if forbidden_ip(ip) => Err(Reject::ForbiddenAddress),
+        Ok(ip) => Ok(Host::Ip(ip)),
+        Err(_) => Ok(Host::Name(bare.to_string())),
+    }
+}
+
+/// Admission for the RESOLVED address set of a hostname: non-empty and every
+/// address allowed (one bad record rejects the lot, so a mixed answer cannot
+/// be used to reach an internal address). The returned set is what the
+/// connection is pinned to. Pure.
+fn admit_resolved(addrs: &[SocketAddr]) -> Result<Vec<SocketAddr>, Reject> {
+    if addrs.is_empty() {
+        return Err(Reject::Resolve);
+    }
+    if addrs.iter().any(|a| forbidden_ip(a.ip())) {
+        return Err(Reject::ForbiddenAddress);
+    }
+    Ok(addrs.to_vec())
+}
+
+/// Latest-wins sequencing: only the most recently begun request may deliver.
+#[derive(Debug, Default)]
+struct Latest(AtomicU64);
+
+impl Latest {
+    /// Start a request; every earlier one becomes stale.
+    fn begin(&self) -> u64 {
+        self.0.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    fn is_current(&self, generation: u64) -> bool {
+        self.0.load(Ordering::SeqCst) == generation
+    }
+}
+
+static LATEST: Latest = Latest(AtomicU64::new(0));
+/// The one tracked in-flight art task; replaced (and the old one aborted) on
+/// every new request, so at most one network job is ever live.
+static IN_FLIGHT: Mutex<Option<tokio::task::JoinHandle<()>>> = Mutex::new(None);
+
+/// Fetch one http(s) body: redirects followed manually (each hop re-admitted,
+/// re-resolved and the connection pinned to the vetted addresses), streamed
+/// under [`MAX_ART_BYTES`]. Proxies are disabled so pinning cannot be bypassed.
+async fn fetch_http(start: &str) -> Result<Vec<u8>, Reject> {
+    let mut url = reqwest::Url::parse(start).map_err(|_| Reject::Scheme)?;
+    for _ in 0..=MAX_REDIRECTS {
+        let host = admit_url(&url)?;
+        let port = url.port_or_known_default().ok_or(Reject::Scheme)?;
+        let mut builder = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(FETCH_TOTAL_TIMEOUT);
+        if let Host::Name(name) = &host {
+            let lookup = tokio::net::lookup_host((name.as_str(), port));
+            let resolved: Vec<SocketAddr> = tokio::time::timeout(DNS_TIMEOUT, lookup)
+                .await
+                .map_err(|_| Reject::Resolve)?
+                .map_err(|_| Reject::Resolve)?
+                .collect();
+            let pinned = admit_resolved(&resolved)?;
+            builder = builder.resolve_to_addrs(name, &pinned);
+        }
+        let client = builder.build().map_err(|_| Reject::Network)?;
+        let mut resp = client
+            .get(url.clone())
+            .send()
+            .await
+            .map_err(|_| Reject::Network)?;
+        if resp.status().is_redirection() {
+            let loc = resp
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .ok_or(Reject::Redirects)?;
+            url = url.join(loc).map_err(|_| Reject::Redirects)?;
+            continue;
+        }
+        if !resp.status().is_success() {
+            return Err(Reject::Status);
+        }
+        if resp
+            .content_length()
+            .is_some_and(|n| n > MAX_ART_BYTES as u64)
+        {
+            return Err(Reject::TooLarge);
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = resp.chunk().await.map_err(|_| Reject::Network)? {
+            if body.len() + chunk.len() > MAX_ART_BYTES {
+                return Err(Reject::TooLarge);
+            }
+            body.extend_from_slice(&chunk);
+        }
+        return Ok(body);
+    }
+    Err(Reject::Redirects)
+}
+
+/// Fetch + decode one art locator to a raster, enforcing every bound.
+async fn load_raster(art_url: &str) -> Result<crate::rasterize::Raster, Reject> {
+    if art_url.len() > MAX_URL_LEN {
+        return Err(Reject::TooLong);
+    }
+    if let Some(path) = local_path(art_url) {
+        return tokio::task::spawn_blocking(move || {
+            crate::rasterize::image_file_capped(&path, MAX_ART_BYTES as u64)
+        })
+        .await
+        .map_err(|_| Reject::Decode)?
+        .map_err(|_| Reject::Decode);
+    }
+    if !(art_url.starts_with("http://") || art_url.starts_with("https://")) {
+        return Err(Reject::Scheme);
+    }
+    let bytes = tokio::time::timeout(FETCH_TOTAL_TIMEOUT, fetch_http(art_url))
+        .await
+        .map_err(|_| Reject::Network)??;
+    tokio::task::spawn_blocking(move || crate::rasterize::image_bytes(&bytes))
+        .await
+        .map_err(|_| Reject::Decode)?
+        .map_err(|_| Reject::Decode)
+}
+
 /// Fetch + decode `art_url` into an [`ArtMosaic`] off-thread, then deliver it and
 /// pulse the waker. Supports `file://`/bare paths and `http(s)://`. Silent on
-/// any failure (the overlay just shows its placeholder).
+/// any failure (the overlay just shows its placeholder; the typed reason goes to
+/// `tracing` without the URL). Latest-wins: a newer call aborts the previous
+/// in-flight task and a stale completion never delivers.
 pub(crate) fn spawn_fetch(
     art_url: String,
     cols: usize,
@@ -63,26 +293,18 @@ pub(crate) fn spawn_fetch(
     tx: tokio::sync::mpsc::UnboundedSender<ArtMosaic>,
     waker: TerminalWaker,
 ) {
-    tokio::spawn(async move {
-        let raster = if let Some(path) = local_path(&art_url) {
-            match tokio::task::spawn_blocking(move || crate::rasterize::image_file(&path)).await {
-                Ok(Ok(r)) => r,
-                _ => return,
-            }
-        } else if art_url.starts_with("http://") || art_url.starts_with("https://") {
-            let Ok(resp) = reqwest::get(&art_url).await else {
+    let generation = LATEST.begin();
+    let handle = tokio::spawn(async move {
+        let raster = match load_raster(&art_url).await {
+            Ok(r) => r,
+            Err(reason) => {
+                tracing::debug!(target: "thegn::media_art", ?reason, "cover art refused or failed");
                 return;
-            };
-            let Ok(bytes) = resp.bytes().await else {
-                return;
-            };
-            match tokio::task::spawn_blocking(move || crate::rasterize::image_bytes(&bytes)).await {
-                Ok(Ok(r)) => r,
-                _ => return,
             }
-        } else {
-            return;
         };
+        if !LATEST.is_current(generation) {
+            return;
+        }
         let lines = mosaic(&raster, cols, rows);
         // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
         let _ = tx.send(ArtMosaic {
@@ -91,15 +313,26 @@ pub(crate) fn spawn_fetch(
         });
         let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
     });
+    let mut slot = IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(prev) = slot.replace(handle) {
+        prev.abort();
+    }
 }
 
-/// A local filesystem path for a `file://` URL or a bare absolute path; `None`
-/// for remote schemes.
+/// A local filesystem path for a `file:` URL (structurally parsed: local host
+/// only, percent-decoded) or a bare absolute path; `None` for remote schemes
+/// and for `file:` URLs naming another host.
 fn local_path(url: &str) -> Option<std::path::PathBuf> {
-    if let Some(rest) = url.strip_prefix("file://") {
-        // `file:///home/…` → strip the (empty) host component.
-        let path = rest.strip_prefix("localhost").unwrap_or(rest);
-        return Some(std::path::PathBuf::from(path));
+    if url
+        .get(..5)
+        .is_some_and(|p| p.eq_ignore_ascii_case("file:"))
+    {
+        let parsed = reqwest::Url::parse(url).ok()?;
+        match parsed.host_str() {
+            None | Some("") | Some("localhost") => {}
+            Some(_) => return None,
+        }
+        return parsed.to_file_path().ok();
     }
     if url.starts_with('/') {
         return Some(std::path::PathBuf::from(url));
@@ -110,6 +343,14 @@ fn local_path(url: &str) -> Option<std::path::PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    fn admit(s: &str) -> Result<Host, Reject> {
+        admit_url(&reqwest::Url::parse(s).unwrap())
+    }
 
     #[test]
     fn local_path_parses_file_urls() {
@@ -123,6 +364,94 @@ mod tests {
         );
         assert_eq!(local_path("https://i.scdn.co/x"), None);
         assert_eq!(local_path("data:image/png;base64,AAAA"), None);
+    }
+
+    #[test]
+    fn file_urls_are_parsed_structurally() {
+        assert_eq!(
+            local_path("file:///home/u/my%20art.png"),
+            Some(std::path::PathBuf::from("/home/u/my art.png"))
+        );
+        assert_eq!(
+            local_path("file://localhost/tmp/a.png"),
+            Some(std::path::PathBuf::from("/tmp/a.png"))
+        );
+        assert_eq!(local_path("file://evil.example/share/a.png"), None);
+    }
+
+    #[test]
+    fn forbidden_ip_covers_internal_ranges() {
+        for bad in [
+            "127.0.0.1",
+            "10.1.2.3",
+            "172.16.0.1",
+            "192.168.1.1",
+            "169.254.169.254",
+            "0.0.0.0",
+            "224.0.0.1",
+            "255.255.255.255",
+            "100.64.0.1",
+            "::1",
+            "::",
+            "fe80::1",
+            "fc00::1",
+            "fd12::1",
+            "ff02::1",
+            "::ffff:127.0.0.1",
+            "::ffff:10.0.0.1",
+            "64:ff9b::7f00:1",
+            "2002::1",
+        ] {
+            assert!(forbidden_ip(ip(bad)), "{bad} must be forbidden");
+        }
+        for good in ["8.8.8.8", "93.184.216.34", "2606:4700:4700::1111"] {
+            assert!(!forbidden_ip(ip(good)), "{good} must be allowed");
+        }
+    }
+
+    #[test]
+    fn admit_url_enforces_scheme_credentials_and_literals() {
+        assert_eq!(
+            admit("https://i.scdn.co/a.jpg"),
+            Ok(Host::Name("i.scdn.co".into()))
+        );
+        assert_eq!(admit("http://8.8.8.8/x"), Ok(Host::Ip(ip("8.8.8.8"))));
+        assert_eq!(admit("ftp://example.com/x"), Err(Reject::Scheme));
+        assert_eq!(admit("file:///etc/passwd"), Err(Reject::Scheme));
+        assert_eq!(
+            admit("https://user:pw@example.com/"),
+            Err(Reject::Credentials)
+        );
+        assert_eq!(
+            admit("http://127.0.0.1:8080/"),
+            Err(Reject::ForbiddenAddress)
+        );
+        assert_eq!(admit("http://[::1]/"), Err(Reject::ForbiddenAddress));
+        // WHATWG normalises exotic IPv4 spellings to the dotted form.
+        assert_eq!(admit("http://0x7f.1/"), Err(Reject::ForbiddenAddress));
+        assert_eq!(admit("http://2130706433/"), Err(Reject::ForbiddenAddress));
+        let long = format!("https://example.com/{}", "a".repeat(MAX_URL_LEN));
+        assert_eq!(admit(&long), Err(Reject::TooLong));
+    }
+
+    #[test]
+    fn admit_resolved_rejects_any_internal_record() {
+        let ok = SocketAddr::new(ip("8.8.8.8"), 443);
+        let bad = SocketAddr::new(ip("169.254.169.254"), 443);
+        assert_eq!(admit_resolved(&[]), Err(Reject::Resolve));
+        assert_eq!(admit_resolved(&[ok]), Ok(vec![ok]));
+        // A mixed (rebinding-style) answer is rejected whole.
+        assert_eq!(admit_resolved(&[ok, bad]), Err(Reject::ForbiddenAddress));
+    }
+
+    #[test]
+    fn latest_wins_sequencing() {
+        let l = Latest::default();
+        let first = l.begin();
+        assert!(l.is_current(first));
+        let second = l.begin();
+        assert!(!l.is_current(first), "older request is superseded");
+        assert!(l.is_current(second));
     }
 
     #[test]
