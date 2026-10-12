@@ -12,8 +12,14 @@ fn dropped_month_completion_sends_cache_unavailable_payload() {
     let completion = MonthFetchCompletion {
         tx,
         waker: None,
-        year: 2026,
-        month: 10,
+        coverage: MonthCoverage {
+            year: 2026,
+            month: 10,
+            covered: widen(
+                NaiveDate::from_ymd_opt(2026, 10, 1).unwrap(),
+                NaiveDate::from_ymd_opt(2026, 10, 31).unwrap(),
+            ),
+        },
         request: 0,
         sent: false,
     };
@@ -34,8 +40,14 @@ fn refused_month_fetch_sends_cache_unavailable_payload() {
         crate::sched::Admission::Saturated,
         &tx,
         None,
-        2026,
-        10,
+        MonthCoverage {
+            year: 2026,
+            month: 10,
+            covered: widen(
+                NaiveDate::from_ymd_opt(2026, 10, 1).unwrap(),
+                NaiveDate::from_ymd_opt(2026, 10, 31).unwrap(),
+            ),
+        },
         None,
     );
 
@@ -53,8 +65,14 @@ fn delivered_month_payload_carries_its_widened_coverage() {
     deliver(
         &tx,
         None,
-        2026,
-        8,
+        MonthCoverage {
+            year: 2026,
+            month: 8,
+            covered: widen(
+                NaiveDate::from_ymd_opt(2026, 8, 1).unwrap(),
+                NaiveDate::from_ymd_opt(2026, 8, 31).unwrap(),
+            ),
+        },
         MonthView {
             events: Some(Vec::new()),
             error: None,
@@ -77,10 +95,10 @@ fn calendar_connectivity_evidence_uses_transport_and_retryability_separately() {
         "calendar command exceeded its deadline",
     ));
     let remote_timeout = Err(CalendarError::Timeout("remote request timed out"));
-    let local_success = Some(true);
+    let remote_success = Some(true);
     assert_eq!(connectivity_evidence(false, &success), None);
     assert_eq!(connectivity_evidence(false, &command_timeout), None);
-    assert_eq!(connectivity_evidence(true, &success), local_success);
+    assert_eq!(connectivity_evidence(true, &success), remote_success);
     assert_eq!(connectivity_evidence(true, &remote_timeout), Some(false));
     assert_eq!(
         connectivity_evidence(true, &Err(CalendarError::Auth("401".into()))),
@@ -89,12 +107,45 @@ fn calendar_connectivity_evidence_uses_transport_and_retryability_separately() {
 }
 
 #[test]
+fn connectivity_lookup_uses_each_configured_account_transport() {
+    use thegn_core::config_calendar::{CalendarAccount, CalendarProviderKind};
+
+    let accounts = vec![
+        CalendarAccount {
+            name: "local-command".into(),
+            provider: CalendarProviderKind::Command,
+            ..CalendarAccount::default()
+        },
+        CalendarAccount {
+            name: "subscription".into(),
+            provider: CalendarProviderKind::IcsUrl,
+            ..CalendarAccount::default()
+        },
+    ];
+    let network_accounts = network_account_names(&accounts);
+
+    assert!(!network_accounts.contains("local-command"));
+    assert!(network_accounts.contains("subscription"));
+    assert_eq!(
+        connectivity_evidence(
+            network_accounts.contains("local-command"),
+            &Ok(EventPage::default()),
+        ),
+        None
+    );
+    assert_eq!(
+        connectivity_evidence(
+            network_accounts.contains("subscription"),
+            &Ok(EventPage::default()),
+        ),
+        Some(true)
+    );
+}
+
+#[test]
 fn local_timeouts_and_local_successes_cannot_change_connectivity_state() {
     let mut state = thegn_core::connectivity::ConnState::with_thresholds(3, 1);
-    for _ in 0..3 {
-        state.report_failure(1);
-    }
-    let failures_before = state.consecutive_failures();
+    state.report_success(0);
     let mut batch = ConnectivityEvidenceBatch::default();
     for _ in 0..3 {
         batch.observe(connectivity_evidence(
@@ -102,15 +153,46 @@ fn local_timeouts_and_local_successes_cannot_change_connectivity_state() {
             &Err(CalendarError::Timeout("command")),
         ));
     }
+    match batch.outcome() {
+        Some(ConnEvidence::Reachable) => {
+            state.report_success(1);
+        }
+        Some(ConnEvidence::Unreachable(failures)) => {
+            for _ in 0..failures {
+                state.report_failure(1);
+            }
+        }
+        None => {}
+    }
+    assert_eq!(
+        state.state(),
+        thegn_core::connectivity::Connectivity::Online
+    );
+    assert_eq!(state.consecutive_failures(), 0);
+
+    let mut state = thegn_core::connectivity::ConnState::with_thresholds(3, 1);
+    for _ in 0..3 {
+        state.report_failure(1);
+    }
+    let mut batch = ConnectivityEvidenceBatch::default();
     for _ in 0..3 {
         batch.observe(connectivity_evidence(false, &Ok(EventPage::default())));
     }
-    batch.publish(|| {}, || {});
+    match batch.outcome() {
+        Some(ConnEvidence::Reachable) => {
+            state.report_success(2);
+        }
+        Some(ConnEvidence::Unreachable(failures)) => {
+            for _ in 0..failures {
+                state.report_failure(2);
+            }
+        }
+        None => {}
+    }
     assert_eq!(
         state.state(),
         thegn_core::connectivity::Connectivity::Offline
     );
-    assert_eq!(state.consecutive_failures(), failures_before);
 }
 
 #[test]
@@ -123,14 +205,17 @@ fn mixed_remote_and_local_outcomes_are_order_independent_at_threshold() {
         for outcome in outcomes {
             batch.observe(outcome);
         }
-        batch.publish(
-            || {
+        match batch.outcome() {
+            Some(ConnEvidence::Reachable) => {
                 state.report_success(1);
-            },
-            || {
-                state.report_failure(1);
-            },
-        );
+            }
+            Some(ConnEvidence::Unreachable(failures)) => {
+                for _ in 0..failures {
+                    state.report_failure(1);
+                }
+            }
+            None => {}
+        }
         state
     }
     let local_timeout = connectivity_evidence(false, &Err(CalendarError::Timeout("command")));
@@ -176,14 +261,17 @@ fn three_remote_failures_reach_offline_but_local_results_do_not_count() {
     ] {
         batch.observe(evidence);
     }
-    batch.publish(
-        || {
+    match batch.outcome() {
+        Some(ConnEvidence::Reachable) => {
             state.report_success(1);
-        },
-        || {
-            state.report_failure(1);
-        },
-    );
+        }
+        Some(ConnEvidence::Unreachable(failures)) => {
+            for _ in 0..failures {
+                state.report_failure(1);
+            }
+        }
+        None => {}
+    }
     assert_eq!(
         state.state(),
         thegn_core::connectivity::Connectivity::Offline
