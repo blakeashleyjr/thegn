@@ -1838,7 +1838,7 @@ mod tests {
             diagnostics,
             key.to_string(),
             generation,
-        )))
+        )?))
     }
 
     fn live_fake_client(
@@ -1858,7 +1858,7 @@ mod tests {
             diagnostics,
             key.to_string(),
             generation,
-        )))
+        )?))
     }
 
     fn enabled_inner() -> (Arc<LspInner>, DiagnosticsReceiver) {
@@ -1891,7 +1891,7 @@ mod tests {
                         diagnostics,
                         key.to_string(),
                         generation,
-                    )))
+                    )?))
                 },
             )
             .unwrap();

@@ -2,6 +2,7 @@ use super::command::*;
 use super::*;
 use crate::config::{GitCmdOutput, GitCommand};
 use crate::remote::{GitLoc, SshTarget};
+use std::time::Duration;
 
 fn config(command: &str) -> GitCommand {
     GitCommand {
@@ -12,8 +13,32 @@ fn config(command: &str) -> GitCommand {
         template_policy: Some("safe".into()),
         description: None,
         output: GitCmdOutput::Popup,
+        timeout_secs: DEFAULT_TIMEOUT_SECS,
         prompts: vec![],
     }
+}
+
+#[test]
+fn compiled_command_keeps_configured_timeout_and_validates_its_range() {
+    let mut cmd = config("echo safe");
+    cmd.timeout_secs = 7;
+    assert_eq!(
+        compile(&cmd, &TemplateCtx::default()).unwrap().timeout(),
+        Duration::from_secs(7)
+    );
+
+    cmd.timeout_secs = 0;
+    let errors = validate_commands(std::slice::from_ref(&cmd));
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].contains("timeout_secs must be between 1 and 86400"));
+    assert!(!errors[0].contains("echo safe"));
+
+    cmd.timeout_secs = MAX_TIMEOUT_SECS;
+    assert!(validate_commands(std::slice::from_ref(&cmd)).is_empty());
+    cmd.timeout_secs = MAX_TIMEOUT_SECS + 1;
+    let errors = validate_commands(&[cmd]);
+    assert_eq!(errors.len(), 1);
+    assert!(!errors[0].contains("echo safe"));
 }
 
 fn context(value: &str) -> TemplateCtx {

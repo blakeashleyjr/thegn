@@ -11,6 +11,7 @@ pub enum EventDefect {
     MixedShape,
     Reversed,
     RecurrenceShape,
+    UnknownZone,
 }
 
 impl fmt::Display for EventDefect {
@@ -20,6 +21,7 @@ impl fmt::Display for EventDefect {
             Self::MixedShape => "mixed all-day and timed endpoints",
             Self::Reversed => "end precedes start",
             Self::RecurrenceShape => "incompatible recurrence values",
+            Self::UnknownZone => "unknown time zone",
         })
     }
 }
@@ -41,6 +43,13 @@ pub fn validate_event(event: &CalEvent) -> Result<(), EventDefect> {
         )
     ) {
         return Err(EventDefect::MixedShape);
+    }
+
+    if [&event.start, &event.end].into_iter().any(|time| {
+        matches!(time, EventTime::Zoned { zone, .. }
+            if !zone.as_str().trim().is_empty() && zone.resolve().is_none())
+    }) {
+        return Err(EventDefect::UnknownZone);
     }
 
     super::span_dates(&event.start, &event.end, chrono_tz::UTC)

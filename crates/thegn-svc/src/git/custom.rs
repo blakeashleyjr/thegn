@@ -11,7 +11,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use thegn_core::remote::GitLoc;
 
-pub const CUSTOM_COMMAND_TIMEOUT_SECS: u64 = 300;
+pub const CUSTOM_COMMAND_TIMEOUT_SECS: u64 = thegn_core::custom_cmd::DEFAULT_TIMEOUT_SECS;
 const CUSTOM_COMMAND_TIMEOUT: Duration = Duration::from_secs(CUSTOM_COMMAND_TIMEOUT_SECS);
 const STDOUT_LIMIT: usize = 1024 * 1024;
 const STDERR_LIMIT: usize = 64 * 1024;
@@ -122,16 +122,10 @@ pub trait CustomOps: GitBackend {
         command: &thegn_core::custom_cmd::ExpandedCommand,
         capture: bool,
     ) -> (&'static str, Option<ExitStatus>, String, bool, String) {
+        let timeout = command.timeout();
         let mut command = command.command(loc);
         command.stdin(Stdio::null()).env("GIT_TERMINAL_PROMPT", "0");
-        run_bounded(
-            command,
-            capture,
-            CUSTOM_COMMAND_TIMEOUT,
-            STDOUT_LIMIT,
-            STDERR_LIMIT,
-        )
-        .into_parts()
+        run_bounded(command, capture, timeout, STDOUT_LIMIT, STDERR_LIMIT).into_parts()
     }
 }
 
