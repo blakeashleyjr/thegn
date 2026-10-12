@@ -42,7 +42,10 @@ const MAX_ARGV_BYTES: usize = 256 * 1024;
 const MAX_ENV_PAIRS: usize = 128;
 const MAX_ENV_BYTES: usize = 64 * 1024;
 /// Stateful notification producers are bounded per connection.
+#[cfg(not(test))]
 const MAX_WATCHERS_PER_CONNECTION: usize = 16;
+#[cfg(test)]
+const MAX_WATCHERS_PER_CONNECTION: usize = 3;
 const MAX_PROCS_PER_CONNECTION: usize = 16;
 
 #[derive(Default)]
@@ -1476,14 +1479,12 @@ fn exec_batch_response(req: &Request, cancel: &Arc<AtomicBool>) -> Response {
     if p.cmds.len() > MAX_BATCH_CMDS {
         return resp_err(req.id, "bad exec.batch params: too many commands".into());
     }
-    if p.cmds
+    if let Some(error) = p
+        .cmds
         .iter()
-        .any(|argv| check_command_shape(argv, &p.env).is_err())
+        .find_map(|argv| check_command_shape(argv, &p.env).err())
     {
-        return resp_err(
-            req.id,
-            "bad exec.batch params: command shape exceeds limits".into(),
-        );
+        return resp_err(req.id, format!("bad exec.batch params: {error}"));
     }
     // Each command runs independently; a spawn failure becomes a synthetic
     // exit=-1 result rather than failing the whole batch, so one bad subcommand
@@ -1663,8 +1664,7 @@ fn check_command_shape(argv: &[String], env: &[(String, String)]) -> Result<()> 
     let env_bytes = env.iter().try_fold(0usize, |total, (key, value)| {
         total.checked_add(key.len().saturating_add(value.len()).saturating_add(2))
     });
-    if argv.is_empty()
-        || argv.len() > MAX_ARGV_ITEMS
+    if argv.len() > MAX_ARGV_ITEMS
         || argv_bytes.is_none_or(|bytes| bytes > MAX_ARGV_BYTES)
         || env.len() > MAX_ENV_PAIRS
         || env_bytes.is_none_or(|bytes| bytes > MAX_ENV_BYTES)
@@ -2086,6 +2086,11 @@ mod tests {
         let mut sock = TcpStream::connect(addr).unwrap();
         let marker =
             std::env::temp_dir().join(format!("tg-bridge-exec-pid-{}", std::process::id()));
+        match std::fs::remove_file(&marker) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("could not clear exec pid marker: {error}"),
+        }
         let command = format!("echo $$ > {}; exec sleep 30", marker.display());
         let req = Request {
             id: 1,
@@ -2101,18 +2106,25 @@ mod tests {
         sock.write_all(&framing::encode(&body)).unwrap();
         sock.flush().unwrap();
         let start = Instant::now();
-        while !marker.exists() && start.elapsed() < Duration::from_secs(3) {
+        let mut pid = None;
+        while pid.is_none() && start.elapsed() < Duration::from_secs(3) {
+            pid = match std::fs::read_to_string(&marker) {
+                Ok(contents) => match contents.trim().parse::<i32>() {
+                    Ok(pid) => Some(pid),
+                    Err(_) => None,
+                },
+                Err(_) => None,
+            };
+            if pid.is_some() {
+                break;
+            }
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(
-            marker.exists(),
-            "exec worker must have started before disconnect"
+            pid.is_some(),
+            "exec worker must write a parseable pid before disconnect"
         );
-        let pid: i32 = std::fs::read_to_string(&marker)
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
+        let pid = pid.unwrap();
         sock.shutdown(std::net::Shutdown::Both).unwrap();
         server.join().unwrap();
         let reap_start = Instant::now();
@@ -2133,6 +2145,11 @@ mod tests {
             bridge_admission().active.load(Ordering::Acquire) <= baseline,
             "cancelled exec must release its admission permit"
         );
+        match std::fs::remove_file(&marker) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("could not remove exec pid marker: {error}"),
+        }
     }
 
     #[test]
@@ -2156,11 +2173,24 @@ mod tests {
     #[test]
     fn exec_rejects_oversized_argv_before_spawning() {
         let marker = std::env::temp_dir().join(format!("tg-bridge-shape-{}", std::process::id()));
+        match std::fs::remove_file(&marker) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("could not clear argv marker: {error}"),
+        }
         let touch = format!("touch {}", marker.display());
-        let padding = "x".repeat(MAX_ARGV_BYTES);
+        let padding = "x".repeat(90 * 1024);
+        let argv = vec![
+            "sh",
+            "-c",
+            touch.as_str(),
+            padding.as_str(),
+            padding.as_str(),
+            padding.as_str(),
+        ];
         let client = connect();
         let error = client
-            .exec(&["sh", "-c", &touch, &padding], None, &[])
+            .exec(&argv, None, &[])
             .expect_err("oversized argv must be rejected");
         assert!(
             error
@@ -2171,20 +2201,30 @@ mod tests {
             !marker.exists(),
             "rejected argv must never spawn the command"
         );
+        match std::fs::remove_file(&marker) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("could not remove argv marker: {error}"),
+        }
     }
 
     #[test]
     fn exec_batch_rejects_one_oversized_command_as_a_whole() {
         let marker =
             std::env::temp_dir().join(format!("tg-bridge-batch-shape-{}", std::process::id()));
+        match std::fs::remove_file(&marker) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("could not clear batch marker: {error}"),
+        }
         let touch = format!("touch {}", marker.display());
-        let padding = "x".repeat(MAX_ARGV_BYTES);
+        let padding = "x".repeat(90 * 1024);
         let client = connect();
         let error = client
             .exec_batch(
                 &[
                     vec!["sh".into(), "-c".into(), touch],
-                    vec!["true".into(), padding],
+                    vec!["true".into(), padding.clone(), padding.clone(), padding],
                 ],
                 &[],
             )
@@ -2195,6 +2235,11 @@ mod tests {
                 .contains("command shape exceeds bridge limits")
         );
         assert!(!marker.exists(), "no command in a rejected batch may run");
+        match std::fs::remove_file(&marker) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("could not remove batch marker: {error}"),
+        }
     }
 
     #[test]
@@ -2310,6 +2355,25 @@ mod tests {
         // A non-zero exit is data, not an error — the batch still returns it.
         assert_eq!(r[1].exit, 7);
         assert_eq!(r[2].stdout.trim(), "third");
+    }
+
+    #[test]
+    fn exec_batch_keeps_empty_argv_as_a_per_command_failure() {
+        let c = connect();
+        let results = c
+            .exec_batch(
+                &[
+                    vec!["echo".into(), "first".into()],
+                    Vec::new(),
+                    vec!["echo".into(), "third".into()],
+                ],
+                &[],
+            )
+            .unwrap();
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].stdout.trim(), "first");
+        assert_eq!(results[1].exit, -1);
+        assert_eq!(results[2].stdout.trim(), "third");
     }
 
     #[test]
