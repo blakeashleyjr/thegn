@@ -2177,10 +2177,8 @@ mod tests {
 
     #[tokio::test]
     async fn byte_budget_admits_a_maximum_wire_frame_when_empty() {
-        let frame = EventFrame::PaneDelta {
-            session: "s1".into(),
-            seq: 0,
-            bytes: vec![b'x'; MAX_WIRE_PAYLOAD],
+        let frame = EventFrame::Activity {
+            json: "x".repeat(MAX_WIRE_PAYLOAD),
         };
         let charge = frame.encode().len();
         assert_eq!(charge, MAX_WIRE_FRAME);
@@ -2270,15 +2268,18 @@ mod tests {
             .unwrap();
         let (frames, mut rx) = tokio_mpsc::channel(256);
         let (_ctrl_tx, ctrl_rx) = tokio_mpsc::channel(1);
-        let pump = tokio::spawn(pump_attach_inner(
-            ws,
-            &frames,
-            ctrl_rx,
-            StreamMode::Attach {
-                session: "s1".into(),
-            },
-            None,
-        ));
+        let pump = tokio::spawn(async move {
+            pump_attach_inner(
+                ws,
+                &frames,
+                ctrl_rx,
+                StreamMode::Attach {
+                    session: "s1".into(),
+                },
+                None,
+            )
+            .await
+        });
         let encoded_len = EventFrame::PaneSnapshot {
             session: "s1".into(),
             seq: 0,
