@@ -2233,6 +2233,7 @@ mod fail_reserved_row_tests {
     use super::fail_reserved_row;
     use thegn_core::db::Db;
     use thegn_core::issue::{AgentDispatchStatus, NewDispatch};
+    use thegn_core::store::NotificationStore;
 
     fn staged_row(db: &Db) -> i64 {
         db.put_agent_dispatch(NewDispatch {
