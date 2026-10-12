@@ -961,11 +961,11 @@ mod tests {
             .map(|row| ActiveScope {
                 row,
                 name: format!("chunk-{row}"),
-                files: vec![long_path.clone()],
+                files: vec![format!("sibling-{row}/{long_path}")],
             })
             .collect();
         let scope = ChunkScope {
-            files: vec![long_path],
+            files: vec![format!("incoming/{long_path}")],
             ..ChunkScope::default()
         };
         assert_eq!(verdict(&scope, &siblings, &done(&[])), ScopeVerdict::Ok);
@@ -980,7 +980,9 @@ mod tests {
             .map(|row| ActiveScope {
                 row,
                 name: format!("chunk-{row}"),
-                files: files.clone(),
+                files: (0..20)
+                    .map(|n| format!("crates/thegn-host/src/other_{row}_{n}.rs"))
+                    .collect(),
             })
             .collect();
         let scope = ChunkScope {
