@@ -738,7 +738,7 @@ fn parse_state(player: &str, props: &HashMap<String, OwnedValue>) -> MediaState 
         position,
         length,
         shuffle: bool_of(props, "Shuffle"),
-        loop_mode: str_of(props, "LoopStatus").map(|s| LoopMode::from_mpris(&s)),
+        loop_mode: str_of(props, "LoopStatus").and_then(|s| LoopMode::parse_mpris(&s)),
         volume: f64_of(props, "Volume").map(|v| (v * 100.0).round().clamp(0.0, 100.0) as u8),
         can_go_next: bool_of(props, "CanGoNext").unwrap_or(false),
         can_go_previous: bool_of(props, "CanGoPrevious").unwrap_or(false),
