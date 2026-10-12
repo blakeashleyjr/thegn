@@ -2366,9 +2366,12 @@ mod tests {
             ))
             .await
             .unwrap();
-            ws.send(Message::Binary(vec![0u8; MAX_WIRE_FRAME + 1].into()))
+            if let Err(error) = ws
+                .send(Message::Binary(vec![0u8; MAX_WIRE_FRAME + 1].into()))
                 .await
-                .unwrap();
+            {
+                tracing::debug!(%error, "client closed on oversize frame, as expected");
+            }
         });
         let (ws, _) = tokio_tungstenite::connect_async_with_config(
             format!("ws://{addr}"),
