@@ -9,12 +9,14 @@
 //! on the loop — and surfaces failures rather than degrading silently.
 
 use anyhow::{Context, Result};
+use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
+use tempfile::NamedTempFile;
 use thegn_core::managed_tool::{Arch, ManagedTool, Os, Source};
 use thegn_core::{msg, util};
 
@@ -25,8 +27,17 @@ use thegn_core::{msg, util};
 /// provisioning step) the sandbox-creation loading screen forever.
 const SETUP_CMD_TIMEOUT: Duration = Duration::from_secs(600); // 10 min
 
-/// Ceiling for the archive helper (`tar`) that unpacks a release asset.
-const EXTRACT_TIMEOUT: Duration = Duration::from_secs(120);
+/// Release downloads are deliberately unavailable until maintainers review
+/// and ship a digest for each `(tool, version, asset)` tuple. Never fetch a
+/// checksum beside the executable: it would have the same trust as the asset.
+/// TODO(THE-182): add reviewed SHA-256 values for every managed release asset.
+const TRUSTED_RELEASE_DIGESTS: &[(&str, &str, &str, &str)] = &[];
+
+const DOWNLOAD_LIMIT: u64 = 128 * 1024 * 1024;
+const EXTRACTED_FILE_LIMIT: u64 = 64 * 1024 * 1024;
+const DOWNLOAD_TOTAL_TIMEOUT: Duration = Duration::from_secs(120);
+const DOWNLOAD_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const DOWNLOAD_READ_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Output retained per stream for diagnostics: the first and last bytes only.
 /// Everything in between is read (so the child never blocks on a full pipe)
@@ -34,8 +45,8 @@ const EXTRACT_TIMEOUT: Duration = Duration::from_secs(120);
 const KEEP_HEAD: usize = 4096;
 const KEEP_TAIL: usize = 4096;
 
-/// Limits for one bounded subprocess run. Production uses [`Limits::setup`] /
-/// [`Limits::extract`]; tests shrink the durations.
+/// Limits for one bounded subprocess run. Production uses [`Limits::setup`];
+/// tests shrink the durations.
 #[derive(Clone, Copy)]
 struct Limits {
     /// One total deadline from spawn to the direct child's exit.
@@ -53,12 +64,6 @@ impl Limits {
             timeout: SETUP_CMD_TIMEOUT,
             term_grace: Duration::from_secs(2),
             read_grace: Duration::from_secs(2),
-        }
-    }
-    fn extract() -> Self {
-        Self {
-            timeout: EXTRACT_TIMEOUT,
-            ..Self::setup()
         }
     }
 }
@@ -459,22 +464,32 @@ pub fn acquire(tool: &ManagedTool) -> Result<()> {
                 tool.version
             );
             let bin = tool.bin_path();
-            if let Some(parent) = bin.parent() {
-                std::fs::create_dir_all(parent)
-                    .with_context(|| format!("create {}", parent.display()))?;
-            }
+            let parent = bin.parent().context("managed binary path has no parent")?;
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create {}", parent.display()))?;
+            let expected_digest =
+                trusted_digest(&tool.name, &tool.version, asset).with_context(|| {
+                    format!(
+                        "no trusted SHA-256 pin for {} {} asset {asset}; refusing download",
+                        tool.name, tool.version
+                    )
+                })?;
+            let download = download_to(&url, parent, expected_digest)?;
             if is_archive(asset) {
-                // Tarball/zip release (e.g. difftastic): download to a temp file,
-                // extract, and lift the wanted binary out to `bin`.
-                let tmp = bin.with_file_name(format!(".{}.dl", tool.name));
-                download_to(&url, &tmp)?;
-                let r = extract_binary(&tmp, asset, &tool.name, &bin);
-                let _ = std::fs::remove_file(&tmp); // best-effort: temp cleanup
-                r?;
+                let mut extracted = extract_binary(download.path(), asset, &tool.name, parent)?;
+                make_executable(extracted.path())?;
+                extracted
+                    .persist(&bin)
+                    .map_err(|e| e.error)
+                    .with_context(|| format!("atomically install {}", bin.display()))?;
             } else {
-                download_to(&url, &bin)?;
+                let mut download = download;
+                make_executable(download.path())?;
+                download
+                    .persist(&bin)
+                    .map_err(|e| e.error)
+                    .with_context(|| format!("atomically install {}", bin.display()))?;
             }
-            make_executable(&bin)?;
             Ok(())
         }
     }
@@ -514,67 +529,266 @@ fn is_archive(asset: &str) -> bool {
     a.ends_with(".tar.gz") || a.ends_with(".tgz") || a.ends_with(".zip")
 }
 
-/// Extract the binary named `want` (basename) out of a downloaded archive at
-/// `archive` and place it at `dest`. Uses the OS `tar`/`unzip` — no archive
-/// crate — into a scratch dir, then locates `want` (with a `.exe` tolerance on
-/// Windows) and moves it. Off-loop (CLI / `spawn_blocking`), like the rest of
-/// acquisition.
-fn extract_binary(archive: &Path, asset: &str, want: &str, dest: &Path) -> Result<()> {
-    let scratch = dest.with_file_name(format!(".{want}.x"));
-    let _ = std::fs::remove_dir_all(&scratch); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
-    std::fs::create_dir_all(&scratch).with_context(|| format!("create {}", scratch.display()))?;
-    let a = asset.to_ascii_lowercase();
-    // `tar` on Windows 10+/macOS/Linux reads zips too; prefer it for one path.
-    let flags = if a.ends_with(".zip") { "-xf" } else { "-xzf" };
-    let mut cmd = Command::new("tar");
-    cmd.arg(flags).arg(archive).arg("-C").arg(&scratch);
-    // Owned process group + deadline + bounded output, like every setup child.
-    let extracted = run_bounded(&mut cmd, Limits::extract(), false);
-    let result = (|| -> Result<()> {
-        extracted
-            .map_err(|e| anyhow::anyhow!("extracting {asset} failed (is `tar` installed?): {e}"))?;
-        let found = find_binary(&scratch, want)
-            .with_context(|| format!("`{want}` not found inside {asset}"))?;
-        // `rename` fails across filesystems; copy then remove is portable.
-        std::fs::copy(&found, dest)
-            .with_context(|| format!("install {} to {}", found.display(), dest.display()))?;
-        Ok(())
-    })();
-    let _ = std::fs::remove_dir_all(&scratch); // best-effort: scratch cleanup
-    result
+/// Extract the binary named `want` (basename) from a gzip tar archive without
+/// writing archive paths to disk. ZIP assets are refused until a reviewed ZIP
+/// parser is available. Acquisition runs off-loop (CLI / `spawn_blocking`).
+fn trusted_digest(tool: &str, version: &str, asset: &str) -> Option<&'static str> {
+    TRUSTED_RELEASE_DIGESTS
+        .iter()
+        .find(|(name, pinned_version, pinned_asset, _)| {
+            *name == tool && *pinned_version == version && *pinned_asset == asset
+        })
+        .map(|(_, _, _, digest)| *digest)
 }
 
-/// Recursively find a file named `want` (or `want.exe`) under `dir`.
-fn find_binary(dir: &Path, want: &str) -> Option<std::path::PathBuf> {
-    let want_exe = format!("{want}.exe");
-    let entries = std::fs::read_dir(dir).ok()?;
-    for e in entries.flatten() {
-        let p = e.path();
-        if p.is_dir() {
-            if let Some(hit) = find_binary(&p, want) {
-                return Some(hit);
+/// Stream an asset into an owner-only temporary file, enforcing response and
+/// body deadlines, a hard byte cap, and the shipped digest before returning it.
+fn download_to(url: &str, dir: &Path, expected_digest: &str) -> Result<NamedTempFile> {
+    let client = reqwest::blocking::Client::builder()
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            let url = attempt.url();
+            let trusted_host = matches!(
+                url.host_str(),
+                Some(
+                    "github.com"
+                        | "objects.githubusercontent.com"
+                        | "release-assets.githubusercontent.com"
+                )
+            );
+            if attempt.previous().len() < 5 && url.scheme() == "https" && trusted_host {
+                attempt.follow()
+            } else {
+                attempt.stop()
             }
-        } else if let Some(name) = p.file_name().and_then(|n| n.to_str())
-            && (name == want || name == want_exe)
-        {
-            return Some(p);
+        }))
+        .connect_timeout(DOWNLOAD_CONNECT_TIMEOUT)
+        .read_timeout(DOWNLOAD_READ_TIMEOUT)
+        .timeout(DOWNLOAD_TOTAL_TIMEOUT)
+        .build()
+        .context("build bounded release HTTP client")?;
+    let mut response = client
+        .get(url)
+        .send()
+        .with_context(|| format!("GET {url}"))?;
+    anyhow::ensure!(
+        response.status().is_success(),
+        "download {url} failed: HTTP {} (redirect policy permits only HTTPS GitHub release hosts)",
+        response.status()
+    );
+    if let Some(length) = response.content_length() {
+        anyhow::ensure!(
+            length <= DOWNLOAD_LIMIT,
+            "download exceeds {DOWNLOAD_LIMIT} byte limit"
+        );
+    }
+    let mut file = NamedTempFile::new_in(dir)
+        .with_context(|| format!("create download in {}", dir.display()))?;
+    let mut hasher = Sha256::new();
+    let mut total = 0_u64;
+    let mut buffer = [0_u8; 32 * 1024];
+    loop {
+        let count = response
+            .read(&mut buffer)
+            .context("read release response")?;
+        if count == 0 {
+            break;
+        }
+        total = total
+            .checked_add(count as u64)
+            .context("download byte count overflow")?;
+        anyhow::ensure!(
+            total <= DOWNLOAD_LIMIT,
+            "download exceeds {DOWNLOAD_LIMIT} byte limit"
+        );
+        hasher.update(&buffer[..count]);
+        file.write_all(&buffer[..count])
+            .context("write release temporary file")?;
+    }
+    let actual = format!("{:x}", hasher.finalize());
+    anyhow::ensure!(actual == expected_digest, "SHA-256 mismatch for {url}");
+    file.as_file_mut()
+        .sync_all()
+        .context("sync release temporary file")?;
+    Ok(file)
+}
+
+/// Read a gzip tar archive without extracting paths to the filesystem. Only a
+/// single regular member with the requested basename is materialized.
+fn extract_binary(archive: &Path, asset: &str, want: &str, dir: &Path) -> Result<NamedTempFile> {
+    anyhow::ensure!(
+        asset.to_ascii_lowercase().ends_with(".tar.gz")
+            || asset.to_ascii_lowercase().ends_with(".tgz"),
+        "ZIP release extraction is disabled until a reviewed ZIP parser is available"
+    );
+    let input =
+        std::fs::File::open(archive).with_context(|| format!("open {}", archive.display()))?;
+    let mut tar = flate2::read::GzDecoder::new(input);
+    let mut target = None;
+    let mut seen = std::collections::HashSet::new();
+    let mut entries = 0_usize;
+    let mut expanded = 0_u64;
+    let mut terminated = false;
+    loop {
+        let mut header = [0_u8; 512];
+        match tar.read(&mut header[..1])? {
+            0 => break,
+            1 => tar.read_exact(&mut header[1..])?,
+            _ => unreachable!(),
+        }
+        if header.iter().all(|byte| *byte == 0) {
+            terminated = true;
+            break;
+        }
+        entries += 1;
+        anyhow::ensure!(entries <= 4096, "archive has too many members");
+        let stored_checksum = tar_octal(&header[148..156])?;
+        let checksum: u64 = header
+            .iter()
+            .enumerate()
+            .map(|(index, byte)| {
+                if (148..156).contains(&index) {
+                    b' ' as u64
+                } else {
+                    *byte as u64
+                }
+            })
+            .sum();
+        anyhow::ensure!(stored_checksum == checksum, "invalid tar header checksum");
+        let kind = header[156];
+        let regular = kind == 0 || kind == b'0';
+        let directory = kind == b'5';
+        let path = tar_path(&header)?;
+        anyhow::ensure!(safe_archive_path(&path), "unsafe archive path: {path}");
+        let path_key = path.strip_suffix('/').unwrap_or(&path);
+        anyhow::ensure!(
+            seen.insert(path_key.to_string()),
+            "duplicate archive member: {path}"
+        );
+        let size = tar_octal(&header[124..136])?;
+        expanded = expanded
+            .checked_add(size)
+            .context("archive size overflow")?;
+        anyhow::ensure!(
+            expanded <= DOWNLOAD_LIMIT,
+            "expanded archive exceeds {DOWNLOAD_LIMIT} byte limit"
+        );
+        anyhow::ensure!(
+            regular || (directory && size == 0),
+            "archive contains a link or special file: {path}"
+        );
+        anyhow::ensure!(
+            size <= EXTRACTED_FILE_LIMIT,
+            "archive member exceeds {EXTRACTED_FILE_LIMIT} byte limit"
+        );
+        let basename = Path::new(&path).file_name().and_then(|name| name.to_str());
+        let is_wanted =
+            regular && basename.is_some_and(|name| name == want || name == format!("{want}.exe"));
+        if is_wanted {
+            anyhow::ensure!(target.is_none(), "archive has duplicate executable targets");
+            let mut output =
+                NamedTempFile::new_in(dir).context("create extracted binary temporary file")?;
+            copy_tar_payload(&mut tar, &mut output, size)?;
+            target = Some(output);
+        } else {
+            skip_tar_payload(&mut tar, size)?;
         }
     }
-    None
+    anyhow::ensure!(terminated, "tar archive has no end marker");
+    let mut trailing = [0_u8; 32 * 1024];
+    loop {
+        let count = tar.read(&mut trailing).context("finish gzip tar stream")?;
+        if count == 0 {
+            break;
+        }
+        expanded = expanded
+            .checked_add(count as u64)
+            .context("archive size overflow")?;
+        anyhow::ensure!(
+            expanded <= DOWNLOAD_LIMIT,
+            "expanded archive exceeds {DOWNLOAD_LIMIT} byte limit"
+        );
+        anyhow::ensure!(
+            trailing[..count].iter().all(|byte| *byte == 0),
+            "unexpected data after tar end marker"
+        );
+    }
+    target.context(format!(
+        "`{want}` not found as a regular member inside {asset}"
+    ))
 }
 
-fn download_to(url: &str, dest: &Path) -> Result<()> {
-    let resp = reqwest::blocking::get(url).with_context(|| format!("GET {url}"))?;
+fn tar_octal(bytes: &[u8]) -> Result<u64> {
+    let text = std::str::from_utf8(bytes).context("non-ASCII tar number")?;
+    let text = text.trim_matches(|ch: char| ch == '\0' || ch == ' ');
     anyhow::ensure!(
-        resp.status().is_success(),
-        "download {url} failed: HTTP {}",
-        resp.status()
+        !text.is_empty() && text.bytes().all(|byte| (b'0'..=b'7').contains(&byte)),
+        "invalid tar number"
     );
-    let bytes = resp
-        .bytes()
-        .with_context(|| format!("read body of {url}"))?;
-    std::fs::write(dest, &bytes).with_context(|| format!("write {}", dest.display()))?;
-    Ok(())
+    u64::from_str_radix(text, 8).context("tar number overflow")
+}
+
+fn tar_field(bytes: &[u8]) -> Result<&str> {
+    let end = bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(bytes.len());
+    std::str::from_utf8(&bytes[..end]).context("non-UTF-8 tar path")
+}
+
+fn tar_path(header: &[u8; 512]) -> Result<String> {
+    let name = tar_field(&header[..100])?;
+    let prefix = tar_field(&header[345..500])?;
+    Ok(if prefix.is_empty() {
+        name.to_string()
+    } else {
+        format!("{prefix}/{name}")
+    })
+}
+
+fn safe_archive_path(path: &str) -> bool {
+    let normalized = path.strip_suffix('/').unwrap_or(path);
+    !normalized.is_empty()
+        && !normalized.starts_with('/')
+        && !normalized.contains('\\')
+        && !normalized.contains(':')
+        && normalized
+            .split('/')
+            .all(|part| !part.is_empty() && part != "." && part != "..")
+}
+
+fn copy_tar_payload(reader: &mut impl Read, output: &mut NamedTempFile, size: u64) -> Result<()> {
+    let mut remaining = size;
+    let mut buffer = [0_u8; 32 * 1024];
+    while remaining > 0 {
+        let chunk_len = remaining.min(buffer.len() as u64) as usize;
+        let count = reader.read(&mut buffer[..chunk_len])?;
+        anyhow::ensure!(count > 0, "truncated tar member");
+        output
+            .write_all(&buffer[..count])
+            .context("write extracted binary")?;
+        remaining -= count as u64;
+    }
+    skip_tar_padding(reader, size)
+}
+
+fn skip_tar_payload(reader: &mut impl Read, size: u64) -> Result<()> {
+    let mut remaining = size;
+    let mut buffer = [0_u8; 32 * 1024];
+    while remaining > 0 {
+        let chunk_len = remaining.min(buffer.len() as u64) as usize;
+        let count = reader.read(&mut buffer[..chunk_len])?;
+        anyhow::ensure!(count > 0, "truncated tar member");
+        remaining -= count as u64;
+    }
+    skip_tar_padding(reader, size)
+}
+
+fn skip_tar_padding(reader: &mut impl Read, size: u64) -> Result<()> {
+    let padding = (512 - size % 512) % 512;
+    let mut bytes = [0_u8; 511];
+    reader
+        .read_exact(&mut bytes[..padding as usize])
+        .context("truncated tar padding")
 }
 
 #[cfg(unix)]
@@ -593,6 +807,149 @@ pub(crate) fn make_executable(_path: &Path) -> Result<()> {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use flate2::Compression;
+    use std::net::TcpListener;
+
+    fn tar_header(path: &str, size: usize, kind: u8) -> [u8; 512] {
+        let mut header = [0_u8; 512];
+        header[..path.len()].copy_from_slice(path.as_bytes());
+        let size_octal = format!("{size:011o}\0");
+        header[124..136].copy_from_slice(size_octal.as_bytes());
+        header[156] = kind;
+        header[257..263].copy_from_slice(b"ustar\0");
+        header[148..156].fill(b' ');
+        let checksum: u64 = header.iter().map(|byte| *byte as u64).sum();
+        let checksum_octal = format!("{checksum:06o}\0 ");
+        header[148..156].copy_from_slice(checksum_octal.as_bytes());
+        header
+    }
+
+    fn tar_gz(entries: &[(&str, u8, &[u8])]) -> NamedTempFile {
+        let mut archive = NamedTempFile::new().unwrap();
+        {
+            let mut gzip =
+                flate2::write::GzEncoder::new(archive.as_file_mut(), Compression::fast());
+            for (path, kind, payload) in entries {
+                gzip.write_all(&tar_header(path, payload.len(), *kind))
+                    .unwrap();
+                gzip.write_all(payload).unwrap();
+                let padding = (512 - payload.len() % 512) % 512;
+                gzip.write_all(&[0; 512][..padding]).unwrap();
+            }
+            gzip.write_all(&[0; 1024]).unwrap();
+            gzip.finish().unwrap();
+        }
+        archive
+    }
+
+    fn oversized_tar_gz() -> NamedTempFile {
+        let mut archive = NamedTempFile::new().unwrap();
+        {
+            let mut gzip =
+                flate2::write::GzEncoder::new(archive.as_file_mut(), Compression::fast());
+            gzip.write_all(&tar_header(
+                "difft",
+                (EXTRACTED_FILE_LIMIT + 1) as usize,
+                b'0',
+            ))
+            .unwrap();
+            gzip.write_all(&[0; 1024]).unwrap();
+            gzip.finish().unwrap();
+        }
+        archive
+    }
+
+    #[test]
+    fn missing_release_pin_refuses_asset_before_network_access() {
+        assert!(trusted_digest("difft", "0.63.0", "difft-linux.tar.gz").is_none());
+    }
+
+    #[test]
+    fn tar_extraction_accepts_only_one_expected_regular_member() {
+        let archive = tar_gz(&[("difft-0.63.0/difft", b'0', b"binary")]);
+        let dir = tempfile::tempdir().unwrap();
+        let output = extract_binary(archive.path(), "difft.tar.gz", "difft", dir.path()).unwrap();
+        assert_eq!(std::fs::read(output.path()).unwrap(), b"binary");
+    }
+
+    #[test]
+    fn tar_extraction_rejects_traversal_links_duplicates_oversize_and_truncation() {
+        let dir = tempfile::tempdir().unwrap();
+        let traversal = tar_gz(&[("../difft", b'0', b"binary")]);
+        assert!(extract_binary(traversal.path(), "a.tar.gz", "difft", dir.path()).is_err());
+        let absolute = tar_gz(&[("/difft", b'0', b"binary")]);
+        assert!(extract_binary(absolute.path(), "a.tar.gz", "difft", dir.path()).is_err());
+        for kind in [b'1', b'2', b'3', b'4', b'6'] {
+            let special = tar_gz(&[("difft", kind, b"target")]);
+            assert!(extract_binary(special.path(), "a.tar.gz", "difft", dir.path()).is_err());
+        }
+        let duplicate = tar_gz(&[("a/difft", b'0', b"one"), ("b/difft", b'0', b"two")]);
+        assert!(extract_binary(duplicate.path(), "a.tar.gz", "difft", dir.path()).is_err());
+        let oversized = oversized_tar_gz();
+        assert!(extract_binary(oversized.path(), "a.tar.gz", "difft", dir.path()).is_err());
+        let truncated = tar_gz(&[("difft", b'0', b"binary")]);
+        let mut bytes = std::fs::read(truncated.path()).unwrap();
+        bytes.truncate(bytes.len() - 8);
+        std::fs::write(truncated.path(), bytes).unwrap();
+        assert!(extract_binary(truncated.path(), "a.tar.gz", "difft", dir.path()).is_err());
+    }
+
+    #[test]
+    fn download_refuses_redirects_and_wrong_digest() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for _ in 0..4 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0_u8; 1024];
+                assert!(stream.read(&mut request).unwrap() > 0);
+                if String::from_utf8_lossy(&request).contains("/redirect ") {
+                    stream.write_all(b"HTTP/1.1 302 Found\r\nLocation: /body\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                } else if String::from_utf8_lossy(&request).contains("/interrupt ") {
+                    stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\nConnection: close\r\n\r\nshort").unwrap();
+                } else if String::from_utf8_lossy(&request).contains("/large ") {
+                    stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 134217729\r\nConnection: close\r\n\r\n").unwrap();
+                } else {
+                    stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\ntest").unwrap();
+                }
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            download_to(
+                &format!("http://{address}/redirect"),
+                dir.path(),
+                "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+            )
+            .is_err()
+        );
+        assert!(
+            download_to(
+                &format!("http://{address}/body"),
+                dir.path(),
+                "0000000000000000000000000000000000000000000000000000000000000000"
+            )
+            .is_err()
+        );
+        assert!(
+            download_to(
+                &format!("http://{address}/interrupt"),
+                dir.path(),
+                "0000000000000000000000000000000000000000000000000000000000000000"
+            )
+            .is_err()
+        );
+        assert!(
+            download_to(
+                &format!("http://{address}/large"),
+                dir.path(),
+                "0000000000000000000000000000000000000000000000000000000000000000"
+            )
+            .is_err()
+        );
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        server.join().unwrap();
+    }
 
     fn fast() -> Limits {
         Limits {
