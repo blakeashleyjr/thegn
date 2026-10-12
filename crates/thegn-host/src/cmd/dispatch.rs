@@ -31,7 +31,7 @@ use thegn_core::pipeline_reap;
 use thegn_core::pipeline_report;
 use thegn_core::pipeline_run::{self, WaitTarget};
 use thegn_core::store::NotificationStore;
-use thegn_core::util::{git_ok, git_out};
+use thegn_core::util::{git_ok, git_out_allow_empty};
 
 #[derive(clap::Subcommand, Clone)]
 pub enum Action {
@@ -1187,6 +1187,7 @@ pub(crate) fn verify_facts(row: &AgentDispatch) -> pipeline_run::VerifyFacts {
             exists: false,
             tracked: false,
             dirty: false,
+            worktree_state: None,
             // A plain (non-pipeline) row is never gated; the report fact is
             // still returned so verify reflects the row faithfully.
             report_present,
@@ -1211,14 +1212,19 @@ pub(crate) fn verify_facts(row: &AgentDispatch) -> pipeline_run::VerifyFacts {
         wt,
         &["ls-files", "--error-unmatch", "--", artifact.as_str()],
     );
+    let worktree_binding_valid = git_out_allow_empty(wt, &["rev-parse", "--show-toplevel"])
+        .and_then(|root| std::path::PathBuf::from(root).canonicalize().ok())
+        .zip(wt.canonicalize().ok())
+        .is_some_and(|(git_root, row_root)| git_root == row_root);
     // The artifact must be present in HEAD and byte-for-byte clean relative to
     // it. `ls-files` alone blesses a newly staged file, which is not a durable
     // handoff and disappears if the worktree is cleaned.
-    let tracked =
-        tracked_in_index && git_ok(wt, &["diff", "--quiet", "HEAD", "--", artifact.as_str()]);
-    // `git_out` returns `None` for empty output, so `Some` ⇔ the worktree
-    // has uncommitted changes.
-    let dirty = git_out(wt, &["status", "--porcelain"]).is_some();
+    let tracked = worktree_binding_valid
+        && tracked_in_index
+        && git_ok(wt, &["diff", "--quiet", "HEAD", "--", artifact.as_str()]);
+    let status = git_out_allow_empty(wt, &["status", "--porcelain"]);
+    let worktree_state = worktree_state_from_status(status.as_deref());
+    let dirty = worktree_state == pipeline_run::WorktreeState::Dirty;
     // THE-88: a row carrying an artifact must also file a report —
     // `verify_report` turns the missing case into an `ok=false` reason that
     // names the `dispatch report` command as the fix.
@@ -1227,11 +1233,20 @@ pub(crate) fn verify_facts(row: &AgentDispatch) -> pipeline_run::VerifyFacts {
         exists,
         tracked,
         dirty,
+        worktree_state: Some(worktree_state),
         report_present,
         report_gate_valid: row
             .report
             .as_deref()
             .is_none_or(|report| !pipeline_report::pass_without_gate_evidence(report)),
+    }
+}
+
+fn worktree_state_from_status(status: Option<&str>) -> pipeline_run::WorktreeState {
+    match status {
+        Some("") => pipeline_run::WorktreeState::Clean,
+        Some(_) => pipeline_run::WorktreeState::Dirty,
+        None => pipeline_run::WorktreeState::Unknown,
     }
 }
 
@@ -1465,13 +1480,17 @@ fn verify(id: i64, json: bool) -> Result<()> {
     } else {
         let a = report.artifact.as_deref().unwrap_or("-");
         outln!(
-            "dispatch {id}  artifact {a}  exists={} tracked={} dirty={} report={}  ok={}",
+            "dispatch {id}  artifact {a}  exists={} tracked={} dirty={} worktree={} report={}  ok={}",
             yes_no(report.exists),
             yes_no(report.tracked),
             yes_no(report.dirty),
+            worktree_state_name(report.worktree_state.as_ref()),
             yes_no(report.report_present),
             yes_no(report.ok)
         );
+        for warning in &report.warnings {
+            outln!("  warning: {warning}");
+        }
         for r in &report.reasons {
             outln!("  - {r}");
         }
@@ -1482,6 +1501,15 @@ fn verify(id: i64, json: bool) -> Result<()> {
         std::process::exit(crate::cmd::EXIT_RETRYABLE);
     }
     Ok(())
+}
+
+fn worktree_state_name(state: Option<&pipeline_run::WorktreeState>) -> &'static str {
+    match state {
+        Some(pipeline_run::WorktreeState::Clean) => "clean",
+        Some(pipeline_run::WorktreeState::Dirty) => "dirty",
+        Some(pipeline_run::WorktreeState::Unknown) => "unknown",
+        None => "not_observed",
+    }
 }
 
 /// `dispatch report <id> --text <text>` — write/overwrite the worker's
@@ -1689,6 +1717,21 @@ fn wait(cfg: &Config, row: Option<i64>, any: bool, timeout: Option<i64>, json: b
     let db = Db::open()?;
     let rows = db.list_dispatches()?;
     let targets = pipeline_run::wait_candidates(&rows, row).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let targets = targets
+        .into_iter()
+        .map(|target| {
+            let run = db
+                .dispatch_run_ref(target.id)?
+                .ok_or_else(|| anyhow::anyhow!("dispatch {} disappeared before wait", target.id))?;
+            if run.session_id != target.session_id {
+                anyhow::bail!("dispatch {} changed session before wait; retry", target.id);
+            }
+            Ok(FencedWaitTarget {
+                target,
+                run_gen: run.run_gen,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(wait_wake(cfg, targets, timeout, json))
 }
@@ -1768,22 +1811,81 @@ fn is_reaped_wait_error(error: &anyhow::Error) -> bool {
 
 /// Does a wake carry a handoff, whatever happened to the session?
 ///
-/// A `gone` wake reads as loss — the tombstone expired, the daemon restarted,
-/// the worker vanished — and a supervisor's reflex is to re-dispatch. Very
-/// often the stage had in fact finished: it committed its artifact and filed
-/// its report, then died in the gap before anyone looked. Across the 469-row
-/// run the exit was unobserved for 424 rows, and 99 of those had filed a report
-/// regardless, so "the session is gone" says nothing about whether the work is.
-///
-/// Pure: the two row facts the wake already fetches, and nothing else.
-fn wake_has_handoff(report: Option<&str>, artifact: Option<&str>) -> bool {
-    let present = |s: Option<&str>| s.map(str::trim).is_some_and(|s| !s.is_empty());
-    present(report) || present(artifact)
+/// A gone session is not evidence of a handoff. Verify the exact current row
+/// using the same completion facts as `dispatch verify`, then fence the result
+/// against the selected session and generation.
+#[derive(Debug, Clone)]
+struct FencedWaitTarget {
+    target: WaitTarget,
+    run_gen: i64,
+}
+
+/// Artifactless rows retain plain-dispatch semantics: a non-empty report is
+/// their complete row handoff. This does not validate pipeline report evidence
+/// or bypass THE-241, which owns that contract.
+fn wake_handoff(
+    db: Result<Db>,
+    target: &FencedWaitTarget,
+) -> (pipeline_run::HandoffOutcome, Option<String>, Option<String>) {
+    let unknown = || {
+        (
+            pipeline_run::HandoffOutcome::InfrastructureUnknown,
+            None,
+            None,
+        )
+    };
+    let Ok(db) = db else { return unknown() };
+    let row = match db.get_dispatch(target.target.id) {
+        Ok(Some(row)) => row,
+        Ok(None) | Err(_) => return unknown(),
+    };
+    let same_run = |row: &AgentDispatch| {
+        row.session_id.as_deref() == Some(target.target.session_id.as_str())
+            && db.dispatch_run_ref(target.target.id).is_ok_and(|current| {
+                current.is_some_and(|run| {
+                    run.session_id == target.target.session_id && run.run_gen == target.run_gen
+                })
+            })
+    };
+    if !same_run(&row) {
+        return unknown();
+    }
+    let report = row.report.clone();
+    let artifact = row.artifact_path.clone();
+    let facts = verify_facts(&row);
+    let verdict = pipeline_run::verify_report(&facts);
+    let outcome = if facts.worktree_state == Some(pipeline_run::WorktreeState::Unknown) {
+        pipeline_run::HandoffOutcome::InfrastructureUnknown
+    } else if facts.artifact.is_none() {
+        if facts.report_present {
+            pipeline_run::HandoffOutcome::VerifiedHandoff
+        } else {
+            pipeline_run::HandoffOutcome::Absent
+        }
+    } else if verdict.ok {
+        pipeline_run::HandoffOutcome::VerifiedHandoff
+    } else if !facts.exists && !facts.report_present {
+        pipeline_run::HandoffOutcome::Absent
+    } else {
+        pipeline_run::HandoffOutcome::UnverifiedCandidate
+    };
+    let current = match db.get_dispatch(target.target.id) {
+        Ok(Some(row)) => row,
+        Ok(None) | Err(_) => return unknown(),
+    };
+    if !same_run(&current)
+        || current.worktree_path != row.worktree_path
+        || current.artifact_path != row.artifact_path
+        || current.report != row.report
+    {
+        return unknown();
+    }
+    (outcome, report, artifact)
 }
 
 async fn wait_wake(
     cfg: &Config,
-    targets: Vec<WaitTarget>,
+    targets: Vec<FencedWaitTarget>,
     timeout: Option<i64>,
     json: bool,
 ) -> Result<()> {
@@ -1806,7 +1908,7 @@ async fn wait_wake(
                 Some(ms) => match tokio::time::timeout(
                     std::time::Duration::from_millis(ms as u64),
                     client.wait(
-                        &t.session_id,
+                        &t.target.session_id,
                         serde_json::json!({ "kind": "exited" }),
                         Some(ms),
                     ),
@@ -1820,7 +1922,11 @@ async fn wait_wake(
                 },
                 None => {
                     client
-                        .wait(&t.session_id, serde_json::json!({ "kind": "exited" }), None)
+                        .wait(
+                            &t.target.session_id,
+                            serde_json::json!({ "kind": "exited" }),
+                            None,
+                        )
                         .await
                 }
             };
@@ -1841,17 +1947,21 @@ async fn wait_wake(
         if !matched {
             continue;
         }
-        // THE-88: read the row's report/artifact AT WAKE TIME (not at candidate
-        // selection — the worker files the report seconds before exit). Only a
-        // missing row is an empty fact; DB open/query failures are retryable.
-        let (report, artifact) =
-            row_report_artifact(t.id).map_err(|e| anyhow::Error::new(crate::cmd::Retryable(e)))?;
+        // Read and verify the current row at wake time, then fence the result
+        // against the exact session/run generation selected before waiting.
+        let (handoff, report, artifact) = if gone {
+            wake_handoff(Db::open(), &t)
+        } else {
+            let (report, artifact) = row_report_artifact(t.target.id)
+                .map_err(|e| anyhow::Error::new(crate::cmd::Retryable(e)))?;
+            (pipeline_run::HandoffOutcome::Absent, report, artifact)
+        };
         if json {
             let mut v = serde_json::json!({
-                "row": t.id,
-                "session": t.session_id,
-                "stage": t.stage,
-                "issue": t.issue_id,
+                "row": t.target.id,
+                "session": t.target.session_id,
+                "stage": t.target.stage,
+                "issue": t.target.issue_id,
                 "exit_code": exit_code,
                 "matched": true,
                 "report": report,
@@ -1859,27 +1969,22 @@ async fn wait_wake(
             });
             if gone {
                 v["gone"] = serde_json::json!(true);
-                // A gone session says nothing about whether the stage handed
-                // off; this is the fact that decides re-dispatch.
-                v["handoff_present"] =
-                    serde_json::json!(wake_has_handoff(report.as_deref(), artifact.as_deref()));
+                v["handoff_outcome"] = serde_json::json!(handoff);
+                v["handoff_present"] = serde_json::json!(handoff.handoff_present());
             }
             return super::emit_json(&v);
         }
-        let stage = t.stage.as_deref().unwrap_or("-");
+        let stage = t.target.stage.as_deref().unwrap_or("-");
         match (gone, exit_code) {
-            (true, _) if wake_has_handoff(report.as_deref(), artifact.as_deref()) => outln!(
-                "dispatch {} ({}) session is gone — but the row carries a handoff. \
-                 Run `thegn dispatch verify {}` before re-dispatching: the stage most \
-                 likely finished and died in the gap.",
-                t.id,
+            (true, _) => outln!(
+                "dispatch {} ({}) session is gone: {}",
+                t.target.id,
                 stage,
-                t.id
+                handoff_message(handoff)
             ),
-            (true, _) => outln!("dispatch {} ({}) session is gone", t.id, stage),
-            (false, Some(code)) => outln!("dispatch {} ({}) exited {code}", t.id, stage),
+            (false, Some(code)) => outln!("dispatch {} ({}) exited {code}", t.target.id, stage),
             // Matched but unreapable — the same `?` `session list` prints.
-            (false, None) => outln!("dispatch {} ({}) exited ?", t.id, stage),
+            (false, None) => outln!("dispatch {} ({}) exited ?", t.target.id, stage),
         }
         // Print the report under the exited line — the Lead reads it and
         // nothing else. A missing/blank report prints nothing: the empty
@@ -1887,6 +1992,9 @@ async fn wait_wake(
         if let Some(text) = report.as_deref().filter(|t| !t.trim().is_empty()) {
             outln!("report:");
             outln!("{text}");
+        }
+        if gone && handoff == pipeline_run::HandoffOutcome::InfrastructureUnknown {
+            std::process::exit(crate::cmd::EXIT_RETRYABLE);
         }
         return Ok(());
     }
@@ -1897,6 +2005,21 @@ async fn wait_wake(
         outln!("timeout waiting on the dispatch wake");
     }
     std::process::exit(crate::cmd::EXIT_RETRYABLE);
+}
+
+fn handoff_message(outcome: pipeline_run::HandoffOutcome) -> &'static str {
+    match outcome {
+        pipeline_run::HandoffOutcome::VerifiedHandoff => {
+            "verified handoff; run dispatch verify before advancing"
+        }
+        pipeline_run::HandoffOutcome::UnverifiedCandidate => {
+            "unverified handoff candidate; verify before retry or reconciliation"
+        }
+        pipeline_run::HandoffOutcome::Absent => "no verified handoff; safe to retry or reconcile",
+        pipeline_run::HandoffOutcome::InfrastructureUnknown => {
+            "handoff verification unavailable; retry verification before deciding"
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1911,18 +2034,88 @@ mod tests {
     }
 
     #[test]
-    fn a_gone_wake_still_reports_a_handoff_when_the_row_has_one() {
-        // The re-dispatch trap: 424 of 469 rows had an unobserved exit, and 99
-        // of those had filed a report anyway. "Session gone" is not "work lost".
-        assert!(wake_has_handoff(Some("PASS; ready for the queue"), None));
-        assert!(wake_has_handoff(
-            None,
-            Some(".thegn/pipeline/THE-60/review/464.md")
-        ));
-        assert!(wake_has_handoff(Some("done"), Some("a.md")));
-        // Genuinely nothing to show for it.
-        assert!(!wake_has_handoff(None, None));
-        assert!(!wake_has_handoff(Some("  "), Some("")));
+    fn assigned_but_missing_artifact_is_not_a_gone_wake_handoff() {
+        let (_dir, db) = db("wake-missing-artifact");
+        let (_worktree_dir, worktree) = git_repo("wake-worktree");
+        let id = db
+            .put_agent_dispatch(thegn_core::issue::NewDispatch {
+                stage: Some("code"),
+                artifact_path: Some("handoff.md"),
+                ..thegn_core::issue::NewDispatch::new(
+                    "linear:THE-253",
+                    worktree.to_str().unwrap(),
+                    "coder",
+                )
+            })
+            .unwrap();
+        db.bind_dispatch_session(id, "session-253").unwrap();
+        let run = db.dispatch_run_ref(id).unwrap().unwrap();
+        let target = FencedWaitTarget {
+            target: WaitTarget {
+                id,
+                session_id: run.session_id,
+                stage: Some("code".into()),
+                issue_id: "linear:THE-253".into(),
+            },
+            run_gen: run.run_gen,
+        };
+        let (outcome, _, artifact) = wake_handoff(Ok(db), &target);
+        assert_eq!(artifact.as_deref(), Some("handoff.md"));
+        assert_eq!(outcome, pipeline_run::HandoffOutcome::Absent);
+        assert!(!outcome.handoff_present(), "assigned path is not a handoff");
+    }
+
+    #[test]
+    fn committed_artifact_and_report_are_verified_for_the_selected_run() {
+        let (_dir, db) = db("wake-verified-artifact");
+        let (_worktree_dir, worktree) = git_repo("wake-verified-worktree");
+        std::fs::write(worktree.join("handoff.md"), "# finished\n").unwrap();
+        assert!(git_ok(&worktree, &["add", "--", "handoff.md"]));
+        assert!(git_ok(&worktree, &["commit", "-q", "-m", "handoff"]));
+        let id = db
+            .put_agent_dispatch(thegn_core::issue::NewDispatch {
+                stage: Some("code"),
+                artifact_path: Some("handoff.md"),
+                ..thegn_core::issue::NewDispatch::new(
+                    "linear:THE-253",
+                    worktree.to_str().unwrap(),
+                    "coder",
+                )
+            })
+            .unwrap();
+        db.bind_dispatch_session(id, "session-253").unwrap();
+        db.set_dispatch_report(id, "finished").unwrap();
+        let run = db.dispatch_run_ref(id).unwrap().unwrap();
+        let mut target = FencedWaitTarget {
+            target: WaitTarget {
+                id,
+                session_id: run.session_id,
+                stage: Some("code".into()),
+                issue_id: "linear:THE-253".into(),
+            },
+            run_gen: run.run_gen,
+        };
+        let (outcome, _, _) = wake_handoff(Ok(db), &target);
+        assert_eq!(outcome, pipeline_run::HandoffOutcome::VerifiedHandoff);
+        assert!(outcome.handoff_present());
+        target.run_gen += 1;
+        let (stale, _, _) = wake_handoff(
+            Db::open_at(&_dir.path().join("wake-verified-artifact.db")),
+            &target,
+        );
+        assert_eq!(stale, pipeline_run::HandoffOutcome::InfrastructureUnknown);
+    }
+
+    #[test]
+    fn failed_status_observation_is_unknown_not_clean() {
+        assert_eq!(
+            worktree_state_from_status(None),
+            pipeline_run::WorktreeState::Unknown
+        );
+        assert_eq!(
+            worktree_state_from_status(Some("")),
+            pipeline_run::WorktreeState::Clean
+        );
     }
 
     #[test]
@@ -2419,6 +2612,19 @@ mod tests {
         commit_artifact(&root);
         let f = verify_facts(&row_in(&root, Some(ARTIFACT)));
         assert!(f.exists && f.tracked && !f.dirty);
+    }
+
+    #[test]
+    fn facts_refuse_a_row_bound_to_a_subdirectory_instead_of_the_worktree_root() {
+        let (_d, root) = git_repo("wrong-worktree-binding");
+        let nested = root.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("handoff.md"), "# handoff").unwrap();
+        assert!(git_ok(&root, &["add", "--", "nested/handoff.md"]));
+        assert!(git_ok(&root, &["commit", "-q", "-m", "handoff"]));
+        let f = verify_facts(&row_in(&nested, Some("handoff.md")));
+        assert!(f.exists, "the file exists under the supplied path");
+        assert!(!f.tracked, "a nested path is not the row's worktree root");
     }
 
     // Symlink-at-the-artifact-path is a POSIX shape (creating one on Windows
