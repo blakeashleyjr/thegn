@@ -6551,6 +6551,7 @@ async fn event_loop<T: Terminal>(
         tokio_mpsc::channel::<crate::preview_pane::ImageMsg>(crate::preview_pane::RESULT_CAP);
     let mut preview_gfx = crate::preview_gfx::PreviewGfx::new();
     let mut pending_preview_oob = crate::preview_retry::PendingPreviewOob::default();
+    let mut pending_corner_oob = crate::preview_retry::PendingCornerOob::default();
     // The git mutation runner + the line-cursor document fetches (staging
     // diff, drilled-commit files, patch doc). Results are tagged with
     // `panel_ui.git.op_gen` so a worktree switch kills strays on arrival.
@@ -8649,6 +8650,14 @@ async fn event_loop<T: Terminal>(
         // OOB capacity releases pulse the existing terminal waker; retrying
         // here keeps this path independent of cell composition and timers.
         pending_preview_oob.retry(|bytes| writer.try_submit_oob(bytes));
+        let corner_visible = corner.is_some()
+            && corner_kitty
+            && !corner_occluded
+            && crate::caret::no_covers()
+            && app_host.active_tile_mut().is_none()
+            && mouse_sel.is_none()
+            && replay.is_none();
+        pending_corner_oob.retry(corner_visible, |bytes| writer.try_submit_oob(bytes));
         // Keep the drawer geometry that `compute_chrome` reserves in sync with
         // the live drawer state. When the reservation changes (any open/close
         // path — toggle, direct yazi, Esc, or a worktree switch restoring a
@@ -9389,9 +9398,11 @@ async fn event_loop<T: Terminal>(
                 // Clear any kitty image at the old geometry; the child re-transmits
                 // at the new size on its next frame.
                 if corner_kitty {
-                    writer.submit_oob(crate::kitty_relay::delete_all().to_vec());
+                    pending_corner_oob.require_delete();
+                    pending_corner_oob.retry(false, |bytes| writer.try_submit_oob(bytes));
                     corner_gfx.clear();
                 }
+                corner_relay.reset();
             }
             // Keep the tabbar chips in sync with the live pin set/health.
             let ws = (!session.id.is_empty()).then_some(session.id.as_str());
@@ -9452,6 +9463,7 @@ async fn event_loop<T: Terminal>(
                 corner_kitty,
                 corner_relay: &mut corner_relay,
                 corner_gfx: &mut corner_gfx,
+                pending_corner_oob: &mut pending_corner_oob,
                 corner_occluded: &mut corner_occluded,
                 supervisor: &mut supervisor,
                 loading_state: &mut loading_state,
@@ -14052,19 +14064,17 @@ async fn event_loop<T: Terminal>(
                         cols,
                         rows: chrome.statusbar.y.saturating_sub(top),
                     };
-                    if let Some(tile) = app_host.active_tile_mut()
-                        && band.cols > 0
+                    if band.cols > 0
                         && band.rows > 0
+                        && let Some(tbuf) =
+                            app_host.render_active(tg_kit::ratatui::layout::Rect::new(
+                                0,
+                                0,
+                                band.cols as u16,
+                                band.rows as u16,
+                            ))
                     {
-                        let area = tg_kit::ratatui::layout::Rect::new(
-                            0,
-                            0,
-                            band.cols as u16,
-                            band.rows as u16,
-                        );
-                        let mut tbuf = tg_kit::ratatui::buffer::Buffer::empty(area);
-                        tile.render(area, &mut tbuf);
-                        crate::apps::bridge::blit(&mut scratch, &tbuf, band);
+                        crate::apps::bridge::blit(&mut scratch, tbuf, band);
                     }
                 } else {
                     render_tab(
@@ -14518,22 +14528,27 @@ async fn event_loop<T: Terminal>(
             // repositioned graphics AFTER the diff — the writer FIFO orders them
             // behind this frame's cells. Images aren't cells — they bypass the
             // diff entirely (fine; it's video). While a modal overlay is up,
-            // blank the video (delete once on the transition, drop new frames)
-            // so it can't bleed through the modal; it resumes on the child's
-            // next frame once the overlay clears.
+            // blank the video on occlusion, retaining only the latest complete
+            // child update for replay after the overlay clears.
             if corner.is_some() && corner_kitty {
                 let occluded_now = overlays.any();
                 if occluded_now {
                     if !corner_occluded {
-                        writer.submit_oob(crate::kitty_relay::delete_all().to_vec());
+                        pending_corner_oob.require_delete();
                     }
-                    corner_gfx.clear();
-                } else if !corner_gfx.is_empty() {
-                    writer.submit_oob(crate::kitty_relay::coalesce_gfx(std::mem::take(
-                        &mut corner_gfx,
-                    )));
                 }
+                let draw = if corner_gfx.is_empty() {
+                    Vec::new()
+                } else {
+                    crate::kitty_relay::coalesce_gfx(std::mem::take(&mut corner_gfx))
+                };
                 corner_occluded = occluded_now;
+                if draw.is_empty() {
+                    pending_corner_oob.retry(!occluded_now, |bytes| writer.try_submit_oob(bytes));
+                } else {
+                    pending_corner_oob
+                        .offer_draw(draw, !occluded_now, |bytes| writer.try_submit_oob(bytes));
+                }
             } else {
                 corner_gfx.clear();
             }
@@ -16640,18 +16655,15 @@ async fn event_loop<T: Terminal>(
                         )
                         .await
                         {
-                            app_host.active = target;
+                            app_host.set_active(target);
                             dirty = true;
                         }
                         continue;
                     }
                     // A focused tile owns all remaining input.
-                    if let crate::apps::ActiveApp::Tile(i) = app_host.active {
-                        if let Some(ev) = crate::apps::input::to_kit(&k.key, k.modifiers)
-                            && let Some(tile) = app_host.slots[i].state.tile_mut()
-                            && tile.handle_input(ev) == tg_kit::InputResult::Exit
-                        {
-                            app_host.active = crate::apps::ActiveApp::Work;
+                    if let crate::apps::ActiveApp::Tile(_) = app_host.active {
+                        if let Some(ev) = crate::apps::input::to_kit(&k.key, k.modifiers) {
+                            app_host.handle_active_input(ev);
                         }
                         dirty = true;
                         continue;
@@ -21797,8 +21809,9 @@ async fn event_loop<T: Terminal>(
                                     // Clear the kitty image off the outer terminal
                                     // and reset the relay.
                                     if corner_kitty {
-                                        writer
-                                            .submit_oob(crate::kitty_relay::delete_all().to_vec());
+                                        pending_corner_oob.require_delete();
+                                        pending_corner_oob
+                                            .retry(false, |bytes| writer.try_submit_oob(bytes));
                                     }
                                     corner_relay.reset();
                                     corner_gfx.clear();

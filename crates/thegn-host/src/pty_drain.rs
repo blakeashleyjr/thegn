@@ -337,6 +337,7 @@ pub(crate) struct DrainCtx<'a> {
     pub corner_kitty: bool,
     pub corner_relay: &'a mut crate::kitty_relay::KittyRelay,
     pub corner_gfx: &'a mut Vec<Vec<u8>>,
+    pub pending_corner_oob: &'a mut crate::preview_retry::PendingCornerOob,
     pub corner_occluded: &'a mut bool,
     pub supervisor: &'a mut crate::pins::PinSupervisor,
     pub loading_state: &'a mut crate::loading::track::LoadingTracker,
@@ -982,8 +983,9 @@ fn handle_exit(ctx: &mut DrainCtx<'_>, id: u32, exit_code: Option<i32>) -> bool 
         // The child is gone; clear its last image off the outer terminal and
         // reset the relay state.
         if ctx.corner_kitty {
-            ctx.writer
-                .submit_oob(crate::kitty_relay::delete_all().to_vec());
+            ctx.pending_corner_oob.require_delete();
+            ctx.pending_corner_oob
+                .retry(false, |bytes| ctx.writer.try_submit_oob(bytes));
         }
         ctx.corner_relay.reset();
         ctx.corner_gfx.clear();
