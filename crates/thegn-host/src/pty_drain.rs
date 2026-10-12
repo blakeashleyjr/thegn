@@ -698,28 +698,28 @@ fn handle_output(ctx: &mut DrainCtx<'_>, id: u32, b: &[u8], admit_generation: bo
             // image escapes are pulled out, repositioned to the corner rect,
             // and queued for the outer terminal (emitted after the frame
             // flush). See `kitty_relay`.
-            let origin = ctx
+            let (origin, content_size) = ctx
                 .current_config
                 .pins
                 .iter()
                 .find(|pp| Some(pp.name.as_str()) == ctx.corner_name.as_deref())
                 .map(|pp| {
                     let c = crate::pins::inset1(prospective_corner_rect(pp, ctx.cols, ctx.rows));
-                    (c.y as u16, c.x as u16)
+                    ((c.y as u16, c.x as u16), (c.cols, c.rows))
                 })
-                .unwrap_or((0, 0));
+                .unwrap_or(((0, 0), (0, 0)));
             let mut emu_text: Vec<u8> = Vec::new();
-            ctx.corner_relay.feed_with(b, |piece| {
+            ctx.corner_relay.feed_with_rect(b, content_size, |piece| {
                 match piece {
                     crate::kitty_relay::Piece::Emulator(t) => {
                         p.feed(&t);
                         emu_text.extend_from_slice(&t);
                     }
                     crate::kitty_relay::Piece::GfxDisplay(seq) => {
-                        // Cursor reflects the text fed so far (the child homes
-                        // right before the image); place there + origin.
-                        let cur = p.emulator().cursor();
-                        let mut bytes = crate::kitty_relay::cup(origin, cur);
+                        // Fix placement at the content origin. The relay fixes
+                        // c/r to fit the content rect, so a child cursor cannot
+                        // shift the image outside its assigned card.
+                        let mut bytes = crate::kitty_relay::cup(origin, (0, 0));
                         bytes.extend_from_slice(&seq);
                         ctx.corner_gfx.push(bytes);
                     }
@@ -736,6 +736,7 @@ fn handle_output(ctx: &mut DrainCtx<'_>, id: u32, b: &[u8], admit_generation: bo
                             );
                         }
                     }
+                    crate::kitty_relay::Piece::Rejected => {}
                 }
             });
             // DA/DSR/OSC replies + OSC52 passthrough on the graphics-stripped
