@@ -466,6 +466,10 @@ fn run_driver_merge(
 
     let mut child = util::git_cmd(dir)
         .args(args)
+        // `git -C` changes Git's repository context but leaves the process
+        // working directory unchanged. Merge drivers inherit that directory,
+        // so pin it to the scratch worktree to contain relative side effects.
+        .current_dir(dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
