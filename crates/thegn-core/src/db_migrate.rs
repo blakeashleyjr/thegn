@@ -1114,6 +1114,50 @@ pub(crate) fn verify_v72_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// v73: `agent_dispatches.status_changed_at_ms`, the wall-clock ms of the last
+/// `status` write. A trigger stamps it on EVERY `UPDATE OF status` (the CAS
+/// helpers, `update_dispatch_status`, the retry reservation, raw SQL), so no
+/// call site can forget. An explicit write of the column in the same UPDATE
+/// wins (the trigger only fires while it is unchanged). Existing and freshly
+/// inserted rows read NULL; readers fall back to `dispatched_at_ms`.
+pub(crate) fn migrate_v73(conn: &Connection) -> Result<()> {
+    if !has_column(conn, "agent_dispatches", "status_changed_at_ms") {
+        conn.execute(
+            "ALTER TABLE agent_dispatches ADD COLUMN status_changed_at_ms INTEGER",
+            [],
+        )?;
+    }
+    conn.execute_batch(
+        "CREATE TRIGGER IF NOT EXISTS agent_dispatches_status_stamp
+         AFTER UPDATE OF status ON agent_dispatches
+         WHEN NEW.status_changed_at_ms IS OLD.status_changed_at_ms
+         BEGIN
+             UPDATE agent_dispatches
+                SET status_changed_at_ms =
+                    CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)
+              WHERE id = NEW.id;
+         END;",
+    )?;
+    Ok(())
+}
+
+/// Verify the v73 column and trigger before the version stamp.
+pub(crate) fn verify_v73_schema(conn: &Connection) -> Result<()> {
+    if !has_column(conn, "agent_dispatches", "status_changed_at_ms") {
+        bail!("schema v73 migration did not add agent_dispatches.status_changed_at_ms");
+    }
+    let trigger: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' \
+         AND name='agent_dispatches_status_stamp'",
+        [],
+        |r| r.get(0),
+    )?;
+    if trigger == 0 {
+        bail!("schema v73 migration did not create the status stamp trigger");
+    }
+    Ok(())
+}
+
 /// Verify the v69 identity ledger before the schema version is stamped. A
 /// missing column/table must never look like a completed migration.
 pub(crate) fn verify_v69_schema(conn: &Connection) -> Result<()> {
@@ -1619,6 +1663,39 @@ mod tests {
             ("running", "sess-h", 3)
         );
         assert_eq!(native, None, "no native id is manufactured");
+    }
+
+    #[test]
+    fn v73_stamps_every_status_write_and_honours_explicit_stamp() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE agent_dispatches (
+                 id INTEGER PRIMARY KEY, issue_id TEXT NOT NULL, status TEXT NOT NULL);
+             INSERT INTO agent_dispatches (issue_id, status) VALUES ('linear:H-1', 'running');",
+        )
+        .unwrap();
+        assert!(super::verify_v73_schema(&conn).is_err());
+        super::migrate_v73(&conn).unwrap();
+        super::migrate_v73(&conn).unwrap();
+        super::verify_v73_schema(&conn).unwrap();
+        let stamp = |c: &Connection| -> Option<i64> {
+            c.query_row(
+                "SELECT status_changed_at_ms FROM agent_dispatches",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(stamp(&conn), None, "no stamp is manufactured for old rows");
+        conn.execute("UPDATE agent_dispatches SET status='spawning'", [])
+            .unwrap();
+        assert!(stamp(&conn).unwrap() > 1_600_000_000_000);
+        conn.execute(
+            "UPDATE agent_dispatches SET status='running', status_changed_at_ms=5",
+            [],
+        )
+        .unwrap();
+        assert_eq!(stamp(&conn), Some(5), "an explicit stamp wins");
     }
 
     #[test]
