@@ -32,8 +32,8 @@ pub(crate) struct PluginEntry {
     /// `Some` while a resident session is alive; `None` for one-shot plugins
     /// and dead residents.
     pub writer: Option<SessionWriter>,
-    /// Contributions currently in effect: the negotiated set plus any the
-    /// plugin `register`ed at runtime.
+    /// Contributions currently in effect, selected during manifest negotiation.
+    /// Runtime `register` messages confirm these declarations but cannot add to them.
     pub contributions: Vec<Contribution>,
     /// How many restarts have been *attempted* (drives the backoff schedule).
     pub restarts: u32,
@@ -533,8 +533,7 @@ fn rpc_error_of(e: PluginApiError) -> RpcError {
         }
         PluginApiError::UndeclaredContribution(_)
         | PluginApiError::ContributionTypeMismatch { .. }
-        | PluginApiError::ContributionChanged(_)
-        | PluginApiError::DuplicateRegistration(_) => RpcErrorCode::Invalid,
+        | PluginApiError::ContributionChanged(_) => RpcErrorCode::Invalid,
         PluginApiError::UnsupportedIo(_) => RpcErrorCode::Unsupported,
         PluginApiError::IncompatibleApi { .. } => RpcErrorCode::Other,
     };
@@ -617,7 +616,7 @@ fn apply_message(state: &mut PluginsState, plugin: &str, msg: RpcMessage) -> Plu
     let outcome: Result<serde_json::Value, RpcError> = match verb {
         HostVerb::Register => parse_register_contribution(params).and_then(|c| {
             if let Err(error) = entry.runtime.register(pid.clone(), c.clone()) {
-                tracing::warn!(
+                tracing::debug!(
                     target: "thegn::plugin",
                     plugin = %plugin,
                     contribution = %c.id.as_str(),
@@ -625,12 +624,6 @@ fn apply_message(state: &mut PluginsState, plugin: &str, msg: RpcMessage) -> Plu
                     "plugin contribution registration rejected"
                 );
                 return Err(rpc_error_of(error));
-            }
-            if !entry.contributions.iter().any(|x| x.id == c.id) {
-                if c.extension_point == ExtensionPoint::StatusBarSegment {
-                    damage.merge(PluginDamage::Structural);
-                }
-                entry.contributions.push(c);
             }
             Ok(serde_json::Value::Null)
         }),
@@ -1291,7 +1284,7 @@ mod tests {
     }
 
     #[test]
-    fn register_accepts_the_negotiated_contribution_and_rejects_a_duplicate() {
+    fn register_accepts_the_negotiated_contribution_idempotently() {
         let mut state = state_with(vec![seg_spec("p")]);
         let mut model = FrameModel::default();
         let c = state.plugins["p"].contributions[0].clone();
@@ -1309,7 +1302,9 @@ mod tests {
             );
         }
         assert_eq!(state.plugins["p"].contributions.len(), 1);
-        assert_eq!(state.plugins["p"].runtime.audit_log().len(), 1);
+        let audit = state.plugins["p"].runtime.audit_log();
+        assert_eq!(audit.len(), 1);
+        assert_eq!(audit[0].decision, AuditDecision::Granted);
     }
 
     #[test]
