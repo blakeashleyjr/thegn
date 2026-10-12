@@ -393,12 +393,10 @@ fn refresh_ci_cache_for(
                     runs: runs.clone(),
                     discarded_rows: result.discarded_rows,
                 }) && crate::hydrate_schedule::generation_is_current(generation.as_ref())
-                {
-                    if let Err(error) =
+                    && let Err(error) =
                         db.put_ci_cache(&key, branch.as_deref().unwrap_or(""), &json)
-                    {
-                        tracing::debug!(target: "thegn::ci", %error, "could not update cached CI runs");
-                    }
+                {
+                    tracing::debug!(target: "thegn::ci", %error, "could not update cached CI runs");
                 }
                 let mut ingest_budget = CallBudget {
                     remaining: MAX_LOG_INGEST_CALLS,
@@ -438,10 +436,9 @@ fn refresh_ci_cache_for(
     }
     if crate::hydrate_schedule::generation_is_current(generation.as_ref())
         && let Some(w) = waker
+        && let Err(error) = w.wake()
     {
-        if let Err(error) = w.wake() {
-            tracing::debug!(target: "thegn::ci", %error, "could not wake after CI refresh");
-        }
+        tracing::debug!(target: "thegn::ci", %error, "could not wake after CI refresh");
     }
     true
 }
@@ -505,7 +502,13 @@ fn ingest_failed_logs_with(args: IngestArgs<'_>) {
             started_at: run.started_at.clone(),
             finished_at: run.finished_at.clone(),
         };
-        let memo = ingest_memo().lock().ok();
+        let memo = match ingest_memo().lock() {
+            Ok(memo) => Some(memo),
+            Err(error) => {
+                tracing::debug!(target: "thegn::ci", %error, "could not inspect CI ingestion memo");
+                None
+            }
+        };
         if memo.as_ref().is_some_and(|m| m.complete(&run_key)) {
             (2_u8, 0_i64)
         } else if memo.as_ref().is_some_and(|m| {
@@ -667,10 +670,10 @@ fn ingest_failed_logs_with(args: IngestArgs<'_>) {
     if let Err(error) = db.retain_ci_logs(&key, &keep) {
         tracing::debug!(target: "thegn::ci", %error, "could not prune cached CI logs");
     }
-    if let Some(w) = waker {
-        if let Err(error) = w.wake() {
-            tracing::debug!(target: "thegn::ci", %error, "could not wake after CI log ingestion");
-        }
+    if let Some(w) = waker
+        && let Err(error) = w.wake()
+    {
+        tracing::debug!(target: "thegn::ci", %error, "could not wake after CI log ingestion");
     }
 }
 
