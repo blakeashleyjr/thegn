@@ -155,12 +155,15 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
 
+    type QueuedJob = Box<dyn FnOnce() + Send>;
+    type QueuedJobs = Arc<std::sync::Mutex<Vec<QueuedJob>>>;
+    type QueuedJobSlot = Arc<std::sync::Mutex<Option<QueuedJob>>>;
+
     #[test]
     fn admission_bound_includes_queued_work_and_refuses_submission_at_capacity() {
         let sem = Arc::new(Semaphore::new(BG_PERMITS));
         let submitted = Arc::new(AtomicUsize::new(0));
-        let queued: Arc<std::sync::Mutex<Vec<Box<dyn FnOnce() + Send>>>> =
-            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let queued: QueuedJobs = Arc::new(std::sync::Mutex::new(Vec::new()));
         for _ in 0..BG_PERMITS {
             let queued_submit = queued.clone();
             let submitted_count = submitted.clone();
@@ -198,8 +201,7 @@ mod tests {
     #[test]
     fn permit_covers_queued_and_running_work_and_releases_after_panic() {
         let sem = Arc::new(Semaphore::new(1));
-        let queued: Arc<std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>> =
-            Arc::new(std::sync::Mutex::new(None));
+        let queued: QueuedJobSlot = Arc::new(std::sync::Mutex::new(None));
         let queued_submit = queued.clone();
         let result = admit_and_submit(
             || panic!("worker panic"),
@@ -220,8 +222,7 @@ mod tests {
     fn reserved_permit_is_transferred_without_second_acquisition() {
         let sem = Arc::new(Semaphore::new(1));
         let permit = sem.clone().try_acquire_owned().unwrap();
-        let queued: Arc<std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>> =
-            Arc::new(std::sync::Mutex::new(None));
+        let queued: QueuedJobSlot = Arc::new(std::sync::Mutex::new(None));
         let queued_submit = queued.clone();
         let result = submit_reserved(
             permit,
