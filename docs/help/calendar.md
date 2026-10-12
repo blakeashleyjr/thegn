@@ -92,7 +92,8 @@ Each row shows the weekday, the time, the DST-aware abbreviation (`EST` vs
 `EDT`), how far ahead or behind your zone it is, and a `+1d` / `-1d` marker when
 it's a different date there. Set `format` on a row for a minute-safe strftime
 override; an empty value inherits `[calendar] time_format` (including its
-locale-driven `auto` choice). Set `show_date = true` to replace that row's
+locale-driven `auto` choice, based on the territory tables from CLDR 48 / ICU
+78.3). Set `show_date = true` to replace that row's
 weekday and relative marker with its local date as `YYYY-MM-DD`.
 
 Formats are validated before drawing and pass through the bounded calendar
