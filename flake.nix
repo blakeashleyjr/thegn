@@ -129,6 +129,9 @@
       # those repos and broke `nix profile install github:…/thegn`. Nothing in
       # the workspace depends on them; the submodules are gone. Keep it that way.
       thegnSrc = rootSrc;
+      # Cargo.toml is the authoritative Thegn release identity.
+      cargoVersion = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
+      cargoLicense = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.license;
       # crane, pinned to the same toolchain everything else uses.
       craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
       # The dependency tree, compiled ONCE into its own store path. Both channels
@@ -139,7 +142,7 @@
       cargoCommonArgs = {
         src = thegnSrc;
         pname = "thegn";
-        version = "0.1.0";
+        version = cargoVersion;
         nativeBuildInputs = [pkgs.pkg-config];
         buildInputs = [pkgs.zlib];
         cargoExtraArgs = "-p thegn-host --bin thegn";
@@ -150,6 +153,7 @@
         src = thegnSrc;
         yazi = yaziPinned;
         inherit yaziDeps craneLib cargoArtifacts;
+        version = cargoVersion;
       };
 
       # The dev release channel (`nix build .#dev`): same source, built with the
@@ -161,6 +165,7 @@
         src = thegnSrc;
         yazi = yaziPinned;
         inherit yaziDeps craneLib cargoArtifacts;
+        version = cargoVersion;
         channel = "dev";
       };
 
@@ -240,7 +245,7 @@
       muslCc = "${muslCross.stdenv.cc}/bin/${muslCross.stdenv.cc.targetPrefix}cc";
       thegnMusl = muslRustPlatform.buildRustPackage {
         pname = "thegn-musl";
-        version = "0.1.0";
+        version = cargoVersion;
         src = thegnSrc;
         cargoLock.lockFile = ./Cargo.lock;
         # Force the musl target explicitly (env-only CARGO_BUILD_TARGET was being
@@ -257,8 +262,11 @@
           runHook preInstall
           mkdir -p $out/bin
           cp target/${muslTarget}/release/thegn $out/bin/thegn
+          install -Dm644 ${thegnSrc}/LICENSE-MIT $out/share/licenses/thegn-musl/LICENSE-MIT
+          install -Dm644 ${thegnSrc}/LICENSE-APACHE $out/share/licenses/thegn-musl/LICENSE-APACHE
           runHook postInstall
         '';
+        meta.license = with pkgs.lib.licenses; [mit asl20];
       };
 
       # `nix build .#default` / `nix profile install .#default` ships the host
@@ -636,6 +644,36 @@
       checks = {
         # `nix flake check` gates on a clean build, formatting, and clippy.
         build = thegn;
+        version-metadata = assert cargoLicense == "MIT OR Apache-2.0";
+        assert thegn.version == cargoVersion;
+        assert thegnDev.version == cargoVersion;
+        assert (system != "x86_64-linux" || thegnMusl.version == cargoVersion);
+        assert cargoArtifacts.version == cargoVersion;
+        assert thegn.meta.license == (with pkgs.lib.licenses; [mit asl20]);
+        assert thegnDev.meta.license == (with pkgs.lib.licenses; [mit asl20]);
+        assert (system != "x86_64-linux" || thegnMusl.meta.license == (with pkgs.lib.licenses; [mit asl20]));
+          pkgs.runCommand "thegn-version-metadata" {nativeBuildInputs = [pkgs.gnugrep];} ''
+            set -euo pipefail
+            ${thegn}/bin/thegn --version | grep -F ${cargoVersion}
+            ${thegnDev}/bin/thegn-dev --version | grep -F ${cargoVersion}
+            test -f ${thegn}/share/licenses/thegn/LICENSE-MIT
+            test -f ${thegn}/share/licenses/thegn/LICENSE-APACHE
+            test -f ${thegnDev}/share/licenses/thegn-dev/LICENSE-MIT
+            test -f ${thegnDev}/share/licenses/thegn-dev/LICENSE-APACHE
+            ${pkgs.lib.optionalString (system == "x86_64-linux") ''
+              ${thegnMusl}/bin/thegn --version | grep -F ${cargoVersion}
+              test -f ${thegnMusl}/share/licenses/thegn-musl/LICENSE-MIT
+              test -f ${thegnMusl}/share/licenses/thegn-musl/LICENSE-APACHE
+            ''}
+            touch $out
+          '';
+        dev-docker-shim =
+          pkgs.runCommand "dev-docker-shim-test" {
+            nativeBuildInputs = [pkgs.bash pkgs.coreutils pkgs.gnugrep pkgs.python3];
+          } ''
+            bash ${./nix/dev-docker-shim-test.sh} ${./nix/dev-docker-shim.sh}
+            touch $out
+          '';
         formatting =
           pkgs.runCommand "treefmt-check" {
             buildInputs = fmtPackages ++ [pkgs.treefmt pkgs.git];
