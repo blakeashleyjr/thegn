@@ -18,6 +18,7 @@ use super::GIT_SPAWNS;
 const MAX_CAPTURE_BYTES: u64 = 1024 * 1024;
 const MAX_STREAM_CAPTURE_BYTES: usize = (MAX_CAPTURE_BYTES / 2) as usize;
 const MAX_BACKGROUND_COMMIT_TIMEOUT: Duration = Duration::from_secs(3600);
+const CAPTURE_JOIN_GRACE: Duration = Duration::from_millis(500);
 
 /// A background commit exceeded its dedicated non-interactive deadline.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -105,8 +106,8 @@ pub(crate) fn run_with_timeout(
     let pid = child.id();
     let stdout = child.stdout.take().expect("piped stdout");
     let stderr = child.stderr.take().expect("piped stderr");
-    let stdout_h = std::thread::spawn(move || read_capped(stdout, MAX_STREAM_CAPTURE_BYTES));
-    let stderr_h = std::thread::spawn(move || read_capped(stderr, MAX_STREAM_CAPTURE_BYTES));
+    let stdout_rx = spawn_capture_reader(stdout, "stdout");
+    let stderr_rx = spawn_capture_reader(stderr, "stderr");
     let mut input = child.stdin.take().expect("piped stdin");
     let bytes = stdin.to_vec();
     let (input_tx, input_rx) = std::sync::mpsc::sync_channel(1);
@@ -125,16 +126,14 @@ pub(crate) fn run_with_timeout(
                 kill_process_tree(pid);
                 kill_and_reap(&mut child);
                 join_worker(input_h, "stdin writer");
-                join_capture_best_effort(stdout_h, "stdout");
-                join_capture_best_effort(stderr_h, "stderr");
+                collect_captures_best_effort(stdout_rx, stderr_rx);
                 return Err(timeout_error(args, timeout));
             }
         };
     if input_h.join().is_err() {
         kill_process_tree(pid);
         kill_and_reap(&mut child);
-        join_capture_best_effort(stdout_h, "stdout");
-        join_capture_best_effort(stderr_h, "stderr");
+        collect_captures_best_effort(stdout_rx, stderr_rx);
         anyhow::bail!("background git stdin writer panicked");
     }
     let mut backoff = Duration::from_millis(1);
@@ -148,16 +147,14 @@ pub(crate) fn run_with_timeout(
                 Err(error) => {
                     kill_process_tree(pid);
                     kill_and_reap(&mut child);
-                    join_capture_best_effort(stdout_h, "stdout");
-                    join_capture_best_effort(stderr_h, "stderr");
+                    collect_captures_best_effort(stdout_rx, stderr_rx);
                     return Err(error).context("wait for background git commit");
                 }
             },
             Err(error) => {
                 kill_process_tree(pid);
                 kill_and_reap(&mut child);
-                join_capture_best_effort(stdout_h, "stdout");
-                join_capture_best_effort(stderr_h, "stderr");
+                collect_captures_best_effort(stdout_rx, stderr_rx);
                 return Err(error).context("observe background git commit exit");
             }
         };
@@ -168,8 +165,7 @@ pub(crate) fn run_with_timeout(
         if remaining.is_zero() {
             kill_process_tree(pid);
             kill_and_reap(&mut child);
-            join_capture_best_effort(stdout_h, "stdout");
-            join_capture_best_effort(stderr_h, "stderr");
+            collect_captures_best_effort(stdout_rx, stderr_rx);
             return Err(timeout_error(args, timeout));
         }
         std::thread::sleep(backoff.min(remaining));
@@ -180,8 +176,11 @@ pub(crate) fn run_with_timeout(
     // even after a successful commit, so they cannot retain the pipe handles.
     kill_process_tree(pid);
     let status = child.wait();
-    let stdout_result = join_capture(stdout_h, "stdout");
-    let stderr_result = join_capture(stderr_h, "stderr");
+    let capture_deadline = Instant::now()
+        .checked_add(CAPTURE_JOIN_GRACE)
+        .unwrap_or_else(Instant::now);
+    let stdout_result = collect_capture(stdout_rx, "stdout", capture_deadline);
+    let stderr_result = collect_capture(stderr_rx, "stderr", capture_deadline);
     let status = status.context("reap background git commit")?;
     let (stdout, stdout_truncated) = stdout_result?;
     let (stderr, stderr_truncated) = stderr_result?;
@@ -251,13 +250,34 @@ fn read_capped(mut reader: impl Read, limit: usize) -> (Vec<u8>, bool) {
     (output, truncated)
 }
 
-fn join_capture(
-    handle: std::thread::JoinHandle<(Vec<u8>, bool)>,
+fn spawn_capture_reader(
+    reader: impl Read + Send + 'static,
+    name: &'static str,
+) -> std::sync::mpsc::Receiver<(Vec<u8>, bool)> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    drop(std::thread::spawn(move || {
+        let capture = read_capped(reader, MAX_STREAM_CAPTURE_BYTES);
+        if let Err(error) = sender.send(capture) {
+            tracing::debug!(target: "thegn::git", worker = name, %error, "background git output receiver was dropped");
+        }
+    }));
+    receiver
+}
+
+fn collect_capture(
+    receiver: std::sync::mpsc::Receiver<(Vec<u8>, bool)>,
     name: &str,
+    deadline: Instant,
 ) -> Result<(Vec<u8>, bool)> {
-    handle
-        .join()
-        .map_err(|_| anyhow::anyhow!("background git {name} reader panicked"))
+    match receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+        Ok(capture) => Ok(capture),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            anyhow::bail!("background git {name} reader exceeded its cleanup grace")
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            anyhow::bail!("background git {name} reader stopped without a capture")
+        }
+    }
 }
 
 fn join_worker<T>(handle: std::thread::JoinHandle<T>, name: &str) {
@@ -266,9 +286,17 @@ fn join_worker<T>(handle: std::thread::JoinHandle<T>, name: &str) {
     }
 }
 
-fn join_capture_best_effort(handle: std::thread::JoinHandle<(Vec<u8>, bool)>, name: &str) {
-    if let Err(error) = join_capture(handle, name) {
-        tracing::debug!(target: "thegn::git", %error, "background git output cleanup failed");
+fn collect_captures_best_effort(
+    stdout_rx: std::sync::mpsc::Receiver<(Vec<u8>, bool)>,
+    stderr_rx: std::sync::mpsc::Receiver<(Vec<u8>, bool)>,
+) {
+    let deadline = Instant::now()
+        .checked_add(CAPTURE_JOIN_GRACE)
+        .unwrap_or_else(Instant::now);
+    for (receiver, name) in [(stdout_rx, "stdout"), (stderr_rx, "stderr")] {
+        if let Err(error) = collect_capture(receiver, name, deadline) {
+            tracing::debug!(target: "thegn::git", %error, "background git output cleanup failed");
+        }
     }
 }
 
@@ -324,8 +352,8 @@ fn kill_process_tree(_pid: u32) {}
 #[cfg(all(test, unix))]
 mod unix_tests {
     use super::{
-        BackgroundCommitTimeout, MAX_BACKGROUND_COMMIT_TIMEOUT, parse_background_commit_timeout,
-        run_with_timeout,
+        BackgroundCommitTimeout, MAX_BACKGROUND_COMMIT_TIMEOUT, collect_capture,
+        parse_background_commit_timeout, run_with_timeout,
     };
     use crate::git::testutil::{TestRepo, git_in};
     use std::os::unix::fs::PermissionsExt;
@@ -351,6 +379,22 @@ mod unix_tests {
             parse_background_commit_timeout(Some("nope")),
             std::time::Duration::from_secs(120)
         );
+    }
+
+    #[test]
+    fn capture_collection_returns_when_a_writer_keeps_the_pipe_open() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let started = std::time::Instant::now();
+        let deadline = started + std::time::Duration::from_millis(25);
+        let error = collect_capture(receiver, "stdout", deadline)
+            .expect_err("an open pipe must not block capture collection indefinitely");
+
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(250),
+            "capture collection exceeded its deadline: {error:#}"
+        );
+        assert!(error.to_string().contains("cleanup grace"), "{error:#}");
+        drop(sender);
     }
 
     #[test]
@@ -500,7 +544,7 @@ mod unix_tests {
         std::fs::write(
             &signer,
             format!(
-                "#!/bin/sh\nsleep 30 &\nprintf '%s' \"$!\" > '{}'\ncat <<'SIG'\n-----BEGIN PGP SIGNATURE-----\nfake\n-----END PGP SIGNATURE-----\nSIG\n",
+                "#!/bin/sh\nsleep 30 </dev/null >/dev/null 2>&1 &\nprintf '%s' \"$!\" > '{}'\ncat >/dev/null\nprintf '\\n[GNUPG:] SIG_CREATED D 1 8 00 0 FAKE\\n' >&2\nprintf '%s\\n' '-----BEGIN PGP SIGNATURE-----' 'fake' '-----END PGP SIGNATURE-----'\n",
                 pid_file.display()
             ),
         )
