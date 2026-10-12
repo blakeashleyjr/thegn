@@ -250,7 +250,7 @@ fn base_for(loc: &GitLoc, sha: &str) -> Result<String> {
     // `run_read` returns stdout verbatim, including rev-parse's trailing
     // newline. Pass the object id as one clean argument to rev-list.
     let commit = commit.trim();
-    let parents = run_read(loc, &["rev-list", "--parents", "-n", "1", &commit])
+    let parents = run_read(loc, &["rev-list", "--parents", "-n", "1", commit])
         .with_context(|| format!("read parents of rebase target {sha}"))?;
     let mut ids = parents.split_whitespace();
     let _verified_commit = ids
