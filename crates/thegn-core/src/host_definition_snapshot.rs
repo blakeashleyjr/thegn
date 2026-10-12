@@ -103,7 +103,16 @@ impl HostDefinitionsSnapshot {
         &self.definitions
     }
 
-    pub(crate) fn from_raw(
+    /// Build a source-valid snapshot from rows captured by a backend.
+    ///
+    /// The rows are fully checked for bounds, duplicate names and JSON keys,
+    /// malformed JSON, unknown schema fields and invalid enum values before
+    /// the legacy decoder is used. `observed_schema` is backend metadata; for
+    /// SQLite it is the observed database schema version, while other
+    /// backends may use their own version or `0` when they have none. It is
+    /// not an ownership, isolation, freshness, or source-attestation token.
+    /// This constructor performs no database read and makes no such claims.
+    pub fn from_captured_rows(
         observed_schema: i64,
         rows: Vec<(String, String)>,
     ) -> Result<Self, HostDefinitionReadError> {
@@ -402,7 +411,7 @@ mod tests {
             ("z".into(), "{}".into()),
             ("a".into(), r#"{"reach":"local"}"#.into()),
         ];
-        let snapshot = HostDefinitionsSnapshot::from_raw(68, rows).unwrap();
+        let snapshot = HostDefinitionsSnapshot::from_captured_rows(68, rows).unwrap();
         assert_eq!(snapshot.observed_schema(), 68);
         assert_eq!(snapshot.definitions()[0].0, "a");
         for name in ["", "bad\nname", "\u{7f}"] {
@@ -417,7 +426,8 @@ mod tests {
             Err(HostDefinitionReadError::InvalidName)
         );
         assert_eq!(
-            HostDefinitionsSnapshot::from_raw(68, vec![("a".into(), "{}".into()); 2]).unwrap_err(),
+            HostDefinitionsSnapshot::from_captured_rows(68, vec![("a".into(), "{}".into()); 2])
+                .unwrap_err(),
             HostDefinitionReadError::DuplicateName
         );
     }
@@ -430,7 +440,7 @@ mod tests {
             "host snapshot contains an invalid definition"
         );
         assert!(!format!("{error:?}").contains("secret"));
-        let snapshot = HostDefinitionsSnapshot::from_raw(
+        let snapshot = HostDefinitionsSnapshot::from_captured_rows(
             68,
             vec![(
                 "private-name".into(),

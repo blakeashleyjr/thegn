@@ -70,10 +70,12 @@ pub trait HostStore {
     /// All user-added host definitions (rows carrying a `config_json`).
     fn host_defs(&self) -> Result<Vec<(String, HostConfig)>>;
 
-    /// Strict, bounded host definitions from one schema-checked read snapshot.
-    /// Requires an already-authorized connection with no active transaction.
-    /// Unlike the display reader, malformed source is an error, never omitted.
-    /// This is captured data, not launch authority or a freshness lease.
+    /// Strict, bounded host definitions from a backend-consistent captured
+    /// snapshot. SQLite verifies its schema and rows in one read transaction;
+    /// other backends construct the same source-validity value from their
+    /// bounded captured rows. Malformed source is an error, never omitted.
+    /// This is captured data, not launch authority, ownership proof, or a
+    /// freshness lease.
     fn host_defs_checked(&self) -> Result<HostDefinitionsSnapshot, HostDefinitionReadError>;
 
     /// The inventory entries recorded for a host.
