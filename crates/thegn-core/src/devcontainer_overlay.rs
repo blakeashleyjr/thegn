@@ -323,7 +323,12 @@ fn fold_compose(
             "devcontainer: `dockerComposeFile` needs a resolved config dir (skipped)".into(),
         ];
     };
-    let files: Vec<String> = match c.files.iter().map(|f| resolve_under(dir, f)).collect() {
+    let files: Vec<String> = match c
+        .files
+        .iter()
+        .map(|f| resolve_under(dir, f))
+        .collect::<Result<Vec<String>, _>>()
+    {
         Ok(files) => files,
         Err(error) => {
             return vec![format!(
@@ -405,7 +410,7 @@ fn resolve_under(dir: &Path, p: &str) -> Result<String, &'static str> {
     let root = repository_root(dir);
     let mut depth = dir
         .strip_prefix(&root)
-        .map_err(|_| "has no contained repository root")?
+        .expect("repository root is a prefix of config dir")
         .components()
         .count();
     for component in pp.components() {
@@ -425,16 +430,18 @@ fn resolve_under(dir: &Path, p: &str) -> Result<String, &'static str> {
     } else {
         dir.join(pp)
     };
-    let canonical_root = root.canonicalize().ok();
-    let check_path = if resolved.is_dir() {
+    let check_path = if resolved.exists() {
         resolved.as_path()
     } else {
         resolved.parent().unwrap_or(dir)
     };
-    if let (Some(root), Ok(parent)) = (canonical_root, check_path.canonicalize())
-        && !parent.starts_with(root)
-    {
-        return Err("escapes the repository through a symlink");
+    if let Ok(canonical_path) = check_path.canonicalize() {
+        let canonical_root = root
+            .canonicalize()
+            .map_err(|_| "cannot verify repository containment")?;
+        if !canonical_path.starts_with(canonical_root) {
+            return Err("escapes the repository through a symlink");
+        }
     }
     Ok(resolved.to_string_lossy().into_owned())
 }
@@ -891,6 +898,15 @@ mod tests {
     use super::*;
     use crate::devcontainer::parse;
 
+    fn temp_root(tag: &str) -> PathBuf {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        std::env::temp_dir().join(format!(
+            "tg-dc-overlay-{tag}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ))
+    }
+
     fn ctx() -> SubstCtx<'static> {
         SubstCtx {
             local_workspace_folder: "/home/u/proj".into(),
@@ -1275,6 +1291,52 @@ mod tests {
         assert!(warns.iter().any(|warning| warning.contains("escapes")));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_dockerfile_leaf_is_refused() {
+        use std::os::unix::fs::symlink;
+        let root = temp_root("link");
+        let outside = root.with_extension("outside");
+        std::fs::create_dir_all(root.join(".devcontainer")).unwrap();
+        std::fs::write(&outside, "FROM scratch").unwrap();
+        symlink(&outside, root.join(".devcontainer/Dockerfile")).unwrap();
+        let config_dir = root.join(".devcontainer").to_string_lossy();
+        let dc = parse_with_dir(
+            r#"{ "build": { "dockerfile": "Dockerfile", "context": "." } }"#,
+            config_dir.as_ref(),
+        );
+        let mut sb = SandboxConfig::default();
+        let warns = apply_to_sandbox(&dc, &mut sb, &ctx());
+        assert!(sb.build.is_none());
+        assert!(warns.iter().any(|warning| warning.contains("symlink")));
+        std::fs::remove_file(root.join(".devcontainer/Dockerfile")).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_file(outside).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dockerfile_below_symlinked_directory_is_refused() {
+        use std::os::unix::fs::symlink;
+        let root = temp_root("parent-link");
+        let outside = root.with_extension("outside-dir");
+        std::fs::create_dir_all(root.join(".devcontainer")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, root.join(".devcontainer/sub")).unwrap();
+        let config_dir = root.join(".devcontainer").to_string_lossy();
+        let dc = parse_with_dir(
+            r#"{ "build": { "dockerfile": "sub/Dockerfile", "context": "." } }"#,
+            config_dir.as_ref(),
+        );
+        let mut sb = SandboxConfig::default();
+        let warns = apply_to_sandbox(&dc, &mut sb, &ctx());
+        assert!(sb.build.is_none());
+        assert!(warns.iter().any(|warning| warning.contains("symlink")));
+        std::fs::remove_file(root.join(".devcontainer/sub")).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(outside).unwrap();
+    }
+
     #[test]
     fn build_yields_to_user_pinned_image() {
         let dc = parse_with_dir(
@@ -1366,6 +1428,18 @@ mod tests {
         let mut sb = SandboxConfig::default();
         let warns = apply_to_sandbox(&dc, &mut sb, &ctx());
         assert!(warns.iter().any(|w| w.contains("compose file")));
+    }
+
+    #[test]
+    fn compose_absolute_path_is_refused() {
+        let dc = parse_with_dir(
+            r#"{ "dockerComposeFile": "/abs.yml", "service": "app" }"#,
+            "/home/u/proj/.devcontainer",
+        );
+        let mut sb = SandboxConfig::default();
+        let warns = apply_to_sandbox(&dc, &mut sb, &ctx());
+        assert!(sb.compose.is_none());
+        assert!(warns.iter().any(|warning| warning.contains("absolute")));
     }
 
     #[test]

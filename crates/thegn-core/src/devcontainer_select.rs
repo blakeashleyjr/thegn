@@ -9,6 +9,7 @@ use std::path::{Component, Path, PathBuf};
 use crate::devcontainer::{self, DevContainer, ParseError};
 
 const MAX_CANDIDATES: usize = 64;
+const MAX_DIRECTORY_ENTRIES: usize = 4096;
 const MAX_PATH_BYTES: usize = 4096;
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 
@@ -17,56 +18,77 @@ pub fn candidates(worktree: &Path) -> Vec<PathBuf> {
     candidates_bounded(worktree).unwrap_or_default()
 }
 
-fn candidates_bounded(worktree: &Path) -> Result<Vec<PathBuf>, String> {
+fn candidates_bounded(worktree: &Path) -> Result<Vec<PathBuf>, (PathBuf, String)> {
     let devcontainer_dir = worktree.join(".devcontainer");
     if std::fs::symlink_metadata(&devcontainer_dir).is_ok_and(|meta| meta.file_type().is_symlink())
     {
-        return Err(".devcontainer is a symlink".into());
+        return Err((devcontainer_dir, ".devcontainer is a symlink".into()));
     }
     let primary = worktree.join(".devcontainer/devcontainer.json");
     if std::fs::symlink_metadata(&primary).is_ok_and(|meta| meta.file_type().is_symlink()) {
-        return Err("primary devcontainer config is a symlink".into());
+        return Err((primary, "primary devcontainer config is a symlink".into()));
     }
     if safe_candidate(worktree, &primary) {
+        if path_bytes(&primary) > MAX_PATH_BYTES {
+            return Err((primary, "devcontainer candidate path exceeds limit".into()));
+        }
         return Ok(vec![primary]);
     }
     let dotfile = worktree.join(".devcontainer.json");
     if std::fs::symlink_metadata(&dotfile).is_ok_and(|meta| meta.file_type().is_symlink()) {
-        return Err(".devcontainer.json is a symlink".into());
+        return Err((dotfile, ".devcontainer.json is a symlink".into()));
     }
     if safe_candidate(worktree, &dotfile) {
+        if path_bytes(&dotfile) > MAX_PATH_BYTES {
+            return Err((dotfile, "devcontainer candidate path exceeds limit".into()));
+        }
         return Ok(vec![dotfile]);
     }
 
     let dir = worktree.join(".devcontainer");
-    if !real_directory(worktree) || !real_directory(&dir) {
+    if !real_worktree_directory(worktree) || !real_directory(&dir) {
         return Ok(Vec::new());
     }
-    let entries =
-        std::fs::read_dir(&dir).map_err(|_| "cannot inspect devcontainer directory".to_string())?;
+    let entries = std::fs::read_dir(&dir).map_err(|_| {
+        (
+            dir.clone(),
+            "cannot inspect devcontainer directory".to_string(),
+        )
+    })?;
     let mut variants = Vec::new();
-    for (index, entry) in entries.take(MAX_CANDIDATES + 1).enumerate() {
-        if index == MAX_CANDIDATES {
-            return Err("too many devcontainer directory entries".into());
+    for (index, entry) in entries.take(MAX_DIRECTORY_ENTRIES + 1).enumerate() {
+        if index == MAX_DIRECTORY_ENTRIES {
+            return Err((
+                dir.clone(),
+                "too many devcontainer directory entries".into(),
+            ));
         }
-        let entry = entry.map_err(|_| "cannot inspect devcontainer entry".to_string())?;
+        let entry =
+            entry.map_err(|_| (dir.clone(), "cannot inspect devcontainer entry".to_string()))?;
         let path = entry.path();
-        if path_bytes(&path) > MAX_PATH_BYTES {
-            return Err("devcontainer candidate path exceeds limit".into());
-        }
         let config = path.join("devcontainer.json");
-        if entry.file_type().is_ok_and(|kind| kind.is_symlink())
-            && path
-                .file_name()
-                .is_some_and(|name| name != "devcontainer.json")
-        {
-            return Err("devcontainer variant directory is a symlink".into());
+        if entry.file_type().is_ok_and(|kind| kind.is_symlink()) {
+            if std::fs::symlink_metadata(&config)
+                .is_ok_and(|meta| meta.is_file() || meta.file_type().is_symlink())
+            {
+                return Err((config, "devcontainer variant directory is a symlink".into()));
+            }
+            continue;
         }
         if std::fs::symlink_metadata(&config).is_ok_and(|meta| meta.file_type().is_symlink()) {
-            return Err("variant devcontainer config is a symlink".into());
+            return Err((config, "variant devcontainer config is a symlink".into()));
         }
         if safe_candidate(worktree, &config) {
+            if path_bytes(&config) > MAX_PATH_BYTES {
+                return Err((config, "devcontainer candidate path exceeds limit".into()));
+            }
             variants.push(config);
+            if variants.len() > MAX_CANDIDATES {
+                return Err((
+                    variants[MAX_CANDIDATES].clone(),
+                    "too many devcontainer candidates".into(),
+                ));
+            }
         }
     }
     variants.sort();
@@ -74,7 +96,7 @@ fn candidates_bounded(worktree: &Path) -> Result<Vec<PathBuf>, String> {
 }
 
 fn path_bytes(path: &Path) -> usize {
-    path.to_string_lossy().len()
+    path.as_os_str().as_encoded_bytes().len()
 }
 
 fn real_directory(path: &Path) -> bool {
@@ -82,18 +104,21 @@ fn real_directory(path: &Path) -> bool {
         .is_ok_and(|meta| meta.is_dir() && !meta.file_type().is_symlink())
 }
 
+fn real_worktree_directory(path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|meta| meta.is_dir()) && path.canonicalize().is_ok()
+}
+
 fn safe_candidate(worktree: &Path, path: &Path) -> bool {
     let Ok(relative) = path.strip_prefix(worktree) else {
         return false;
     };
-    if path_bytes(relative) > MAX_PATH_BYTES
-        || relative
-            .components()
-            .any(|c| !matches!(c, Component::Normal(_)))
+    if relative
+        .components()
+        .any(|c| !matches!(c, Component::Normal(_)))
     {
         return false;
     }
-    if !real_directory(worktree) {
+    if !real_worktree_directory(worktree) {
         return false;
     }
     let parent = path.parent().unwrap_or(worktree);
@@ -171,9 +196,9 @@ impl std::error::Error for SelectionError {}
 pub fn select_and_parse(worktree: &Path, selector: Option<&str>) -> SelectionResult {
     let found = match candidates_bounded(worktree) {
         Ok(found) => found,
-        Err(error) => {
+        Err((path, error)) => {
             return SelectionResult {
-                candidates: Vec::new(),
+                candidates: vec![path],
                 selected: None,
                 config: None,
                 error: Some(SelectionError::Discovery { error }),
@@ -268,7 +293,9 @@ fn read_config(worktree: &Path, path: &Path) -> std::io::Result<String> {
     }
     let mut file = crate::fsperm::open_regular_file_nofollow(path)?;
     let before = file.metadata()?;
-    let parent_before = std::fs::metadata(path.parent().unwrap_or(worktree))?;
+    let opened_handle = same_file::Handle::from_file(file.try_clone()?)?;
+    let parent = path.parent().unwrap_or(worktree);
+    let parent_before = same_file::Handle::from_path(parent)?;
     if before.len() > MAX_CONFIG_BYTES {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -281,14 +308,15 @@ fn read_config(worktree: &Path, path: &Path) -> std::io::Result<String> {
         .read_to_end(&mut bytes)?;
     let after = file.metadata()?;
     let current = std::fs::symlink_metadata(path)?;
-    let parent_after = std::fs::metadata(path.parent().unwrap_or(worktree))?;
+    let current_handle = same_file::Handle::from_path(path)?;
+    let parent_after = same_file::Handle::from_path(parent)?;
     if bytes.len() as u64 > MAX_CONFIG_BYTES
         || !current.is_file()
         || current.file_type().is_symlink()
         || before.len() != after.len()
         || after.len() != bytes.len() as u64
-        || !same_file(&after, &current)
-        || !same_file(&parent_before, &parent_after)
+        || opened_handle != current_handle
+        || parent_before != parent_after
         || !contained_parent(worktree, path)
     {
         return Err(std::io::Error::new(
@@ -311,26 +339,6 @@ fn contained_parent(worktree: &Path, path: &Path) -> bool {
     parent
         .canonicalize()
         .is_ok_and(|resolved| resolved.starts_with(root))
-}
-
-#[cfg(unix)]
-fn same_file(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    a.dev() == b.dev() && a.ino() == b.ino()
-}
-
-#[cfg(windows)]
-fn same_file(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt;
-    a.volume_serial_number().is_some()
-        && a.volume_serial_number() == b.volume_serial_number()
-        && a.file_index().is_some()
-        && a.file_index() == b.file_index()
-}
-
-#[cfg(not(any(unix, windows)))]
-fn same_file(_: &std::fs::Metadata, _: &std::fs::Metadata) -> bool {
-    false
 }
 
 /// Return a config path relative to the repo root, using `/` separators.
@@ -418,6 +426,14 @@ mod tests {
             result.error,
             Some(SelectionError::Discovery { .. })
         ));
+        assert_eq!(
+            result.candidates,
+            vec![root.join(".devcontainer/devcontainer.json")]
+        );
+        assert!(matches!(
+            devcontainer::detect_and_parse(&root),
+            Some(Err(_))
+        ));
         std::fs::remove_file(root.join(".devcontainer/devcontainer.json")).unwrap();
         std::fs::remove_dir_all(root).unwrap();
         std::fs::remove_file(outside).unwrap();
@@ -450,8 +466,119 @@ mod tests {
         let result = select_and_parse(&root, None);
         assert!(result.config.is_none());
         assert!(result.raw_content.is_none());
-        assert!(result.candidates.is_empty());
+        assert_eq!(
+            result.candidates,
+            vec![root.join(".devcontainer/variant/devcontainer.json")]
+        );
         std::fs::remove_dir_all(root).unwrap();
         std::fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_variant_config_is_refused() {
+        use std::os::unix::fs::symlink;
+        let root = temp();
+        let outside = root.with_extension("outside-config");
+        std::fs::write(&outside, r#"{"image":"outside"}"#).unwrap();
+        let variant = root.join(".devcontainer/variant");
+        std::fs::create_dir_all(&variant).unwrap();
+        symlink(&outside, variant.join("devcontainer.json")).unwrap();
+
+        let result = select_and_parse(&root, None);
+        assert!(matches!(
+            result.error,
+            Some(SelectionError::Discovery { .. })
+        ));
+        assert_eq!(result.candidates, vec![variant.join("devcontainer.json")]);
+
+        std::fs::remove_file(variant.join("devcontainer.json")).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_file(outside).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_non_variant_file_does_not_hide_real_variant() {
+        use std::os::unix::fs::symlink;
+        let root = temp();
+        let outside = root.with_extension("outside-file");
+        std::fs::write(&outside, "not a variant").unwrap();
+        std::fs::create_dir_all(root.join(".devcontainer/real")).unwrap();
+        std::fs::write(
+            root.join(".devcontainer/real/devcontainer.json"),
+            r#"{"image":"real"}"#,
+        )
+        .unwrap();
+        symlink(&outside, root.join(".devcontainer/README")).unwrap();
+
+        let result = select_and_parse(&root, None);
+        assert_eq!(
+            result.config.unwrap().source,
+            devcontainer::ImageSource::Image("real".into())
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_file(outside).unwrap();
+    }
+
+    #[test]
+    fn too_many_variants_are_refused_with_a_candidate() {
+        let root = temp();
+        for index in 0..=MAX_CANDIDATES {
+            let dir = root.join(format!(".devcontainer/variant-{index}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("devcontainer.json"), "{}").unwrap();
+        }
+        let result = select_and_parse(&root, None);
+        assert!(matches!(
+            result.error,
+            Some(SelectionError::Discovery { .. })
+        ));
+        assert_eq!(result.candidates.len(), 1);
+        assert!(result.candidates[0].ends_with("devcontainer.json"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn discovery_error_has_user_visible_display() {
+        let error = SelectionError::Discovery {
+            error: "test refusal".into(),
+        };
+        assert_eq!(
+            error.to_string(),
+            "devcontainer discovery refused: test refusal"
+        );
+    }
+
+    #[test]
+    fn non_utf8_selected_config_is_refused() {
+        let root = temp();
+        std::fs::create_dir_all(root.join(".devcontainer")).unwrap();
+        std::fs::write(root.join(".devcontainer/devcontainer.json"), [0xff, 0xfe]).unwrap();
+        let result = select_and_parse(&root, None);
+        assert!(matches!(result.error, Some(SelectionError::Read { .. })));
+        assert!(result.raw_content.is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_worktree_root_is_discovered_by_canonical_location() {
+        use std::os::unix::fs::symlink;
+        let real = temp();
+        let alias = real.with_extension("alias");
+        std::fs::create_dir_all(real.join(".devcontainer")).unwrap();
+        std::fs::write(
+            real.join(".devcontainer/devcontainer.json"),
+            r#"{"image":"ok"}"#,
+        )
+        .unwrap();
+        symlink(&real, &alias).unwrap();
+
+        assert!(select_and_parse(&alias, None).config.is_some());
+
+        std::fs::remove_file(&alias).unwrap();
+        std::fs::remove_dir_all(real).unwrap();
     }
 }
