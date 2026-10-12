@@ -111,7 +111,7 @@ fn compose_policy_miss_halts_before_auto_chain_host_entry() {
     let tmp = std::env::temp_dir().join(format!("tg-compose-halt-{}", std::process::id()));
     let fake_bin = tmp.join("bin");
     std::fs::create_dir_all(&fake_bin).unwrap();
-    let fake_smol = fake_bin.join("smol");
+    let fake_smol = fake_bin.join("smolmachines");
     std::fs::write(&fake_smol, "#!/bin/sh\nexit 0\n").unwrap();
     #[cfg(unix)]
     {

@@ -725,7 +725,11 @@ fn sealed_launch_refuses_compose_backed_specs() {
     let mut s = spec(Backend::Podman, h, vec![], true);
     s.compose = Some("docker-compose.yml".to_string());
     let err = enter_argv(&s, "true").unwrap_err();
-    assert!(err.to_string().contains("compose volumes"), "{err}");
+    assert!(
+        err.to_string().contains("Compose cannot enforce")
+            && err.to_string().contains("sealed home"),
+        "{err}"
+    );
     // Non-sealed compose is unaffected by this gate.
     s.seal_home = None;
     assert!(enter_argv(&s, "true").is_ok());
