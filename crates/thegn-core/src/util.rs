@@ -1415,6 +1415,13 @@ pub struct GitLock(
 #[allow(deprecated)]
 #[cfg(not(windows))]
 pub fn try_lock_git_mutations(worktree: &Path) -> std::io::Result<GitLock> {
+    let (_, file) = open_git_mutation_lock_file(worktree)?;
+    file.lock()?;
+    Ok(GitLock(file))
+}
+
+#[cfg(not(windows))]
+fn open_git_mutation_lock_file(worktree: &Path) -> std::io::Result<(PathBuf, std::fs::File)> {
     let path = git_common_dir(worktree).join("thegn-git.lock");
     let file = match crate::fsperm::open_regular_file_nofollow(&path) {
         Ok(file) => file,
@@ -1429,8 +1436,7 @@ pub fn try_lock_git_mutations(worktree: &Path) -> std::io::Result<GitLock> {
         }
         Err(error) => return Err(error),
     };
-    file.lock()?;
-    Ok(GitLock(file))
+    Ok((path, file))
 }
 
 #[cfg(windows)]
@@ -1453,6 +1459,85 @@ pub fn try_lock_git_mutations(worktree: &Path) -> std::io::Result<GitLock> {
         .share_mode(0) // 0 = exclusive lock
         .open(&path)?;
     Ok(GitLock(file))
+}
+
+/// Acquire the git-mutation lock, waiting at most `wait` for another thegn
+/// holder. Required write paths should use this bounded API so contention can
+/// never block a worker indefinitely.
+#[allow(deprecated)]
+#[cfg(not(windows))]
+pub fn try_lock_git_mutations_within(worktree: &Path, wait: Duration) -> std::io::Result<GitLock> {
+    let (path, file) = open_git_mutation_lock_file(worktree)?;
+    let deadline = Instant::now().checked_add(wait).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("git-mutation lock wait is too large for {}", path.display()),
+        )
+    })?;
+    let mut backoff = Duration::from_millis(5);
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(GitLock(file)),
+            Err(std::fs::TryLockError::Error(error)) => return Err(error),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!(
+                            "timed out waiting {:?} for git-mutation lock {}",
+                            wait,
+                            path.display()
+                        ),
+                    ));
+                }
+                std::thread::sleep(backoff.min(deadline.saturating_duration_since(now)));
+                backoff = (backoff * 2).min(Duration::from_millis(50));
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+pub fn try_lock_git_mutations_within(worktree: &Path, wait: Duration) -> std::io::Result<GitLock> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let path = git_common_dir(worktree).join("thegn-git.lock");
+    let deadline = Instant::now().checked_add(wait).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("git-mutation lock wait is too large for {}", path.display()),
+        )
+    })?;
+    let mut backoff = Duration::from_millis(5);
+    loop {
+        let result = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .share_mode(0)
+            .open(&path);
+        match result {
+            Ok(file) => return Ok(GitLock(file)),
+            Err(error) if error.raw_os_error() == Some(32) => {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!(
+                            "timed out waiting {:?} for git-mutation lock {}",
+                            wait,
+                            path.display()
+                        ),
+                    ));
+                }
+                std::thread::sleep(backoff.min(deadline.saturating_duration_since(now)));
+                backoff = (backoff * 2).min(Duration::from_millis(50));
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 /// Legacy best-effort wrapper. New required mutations should use
@@ -2190,6 +2275,63 @@ mod tests {
             receiver.recv_timeout(Duration::from_secs(1)),
             Ok(true),
             "second holder must acquire after release"
+        );
+        worker.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn typed_git_lock_within_times_out_while_held() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let worktree = temp.path().join("repo");
+        std::fs::create_dir_all(worktree.join(".git")).unwrap();
+        let held = try_lock_git_mutations(&worktree).unwrap();
+        let worker_worktree = worktree.clone();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let result =
+                try_lock_git_mutations_within(&worker_worktree, Duration::from_millis(100))
+                    .map(|_| ())
+                    .map_err(|error| error.kind());
+            sender.send(result).unwrap();
+        });
+
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_secs(5)).unwrap(),
+            Err(std::io::ErrorKind::TimedOut),
+            "bounded acquisition must time out instead of waiting forever"
+        );
+        drop(held);
+        worker.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn typed_git_lock_within_acquires_when_released_mid_wait() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let worktree = temp.path().join("repo");
+        std::fs::create_dir_all(worktree.join(".git")).unwrap();
+        let held = try_lock_git_mutations(&worktree).unwrap();
+        let worker_worktree = worktree.clone();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let acquired =
+                try_lock_git_mutations_within(&worker_worktree, Duration::from_secs(5)).is_ok();
+            sender.send(acquired).unwrap();
+        });
+
+        std::thread::sleep(Duration::from_millis(50));
+        drop(held);
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_secs(5)),
+            Ok(true),
+            "bounded acquisition must succeed when the lock is released in time"
         );
         worker.join().unwrap();
     }
