@@ -50,35 +50,29 @@ pub(crate) enum ProcOutcome {
 impl ProcOutcome {
     pub(crate) fn into_stdout(self) -> Option<(bool, String)> {
         match self {
-            Self::Exited { status, stdout, .. } => {
-                let _was_truncated = stdout.truncated;
-                Some((
-                    status.success(),
-                    String::from_utf8_lossy(&stdout.bytes).into_owned(),
-                ))
-            }
-            Self::Spawn(error) | Self::Wait(error) | Self::Read(error) => {
-                let _kind = error.kind();
-                None
-            }
-            Self::Timeout => None,
+            Self::Exited { status, stdout, .. } if !stdout.truncated => Some((
+                status.success(),
+                String::from_utf8_lossy(&stdout.bytes).into_owned(),
+            )),
+            Self::Exited { .. }
+            | Self::Spawn(_)
+            | Self::Wait(_)
+            | Self::Read(_)
+            | Self::Timeout => None,
         }
     }
 
     pub(crate) fn into_stderr(self) -> Option<(bool, String)> {
         match self {
-            Self::Exited { status, stderr, .. } => {
-                let _was_truncated = stderr.truncated;
-                Some((
-                    status.success(),
-                    String::from_utf8_lossy(&stderr.bytes).into_owned(),
-                ))
-            }
-            Self::Spawn(error) | Self::Wait(error) | Self::Read(error) => {
-                let _kind = error.kind();
-                None
-            }
-            Self::Timeout => None,
+            Self::Exited { status, stderr, .. } if !stderr.truncated => Some((
+                status.success(),
+                String::from_utf8_lossy(&stderr.bytes).into_owned(),
+            )),
+            Self::Exited { .. }
+            | Self::Spawn(_)
+            | Self::Wait(_)
+            | Self::Read(_)
+            | Self::Timeout => None,
         }
     }
 }
@@ -242,22 +236,21 @@ fn terminate_tree(child: &mut Child) {
     Result::ok(child.kill());
 }
 
-fn terminate_group_after_exit(child: &Child) {
+fn terminate_group_after_exit(_child: &Child) {
     #[cfg(unix)]
     {
         use nix::sys::signal::{Signal, killpg};
         use nix::unistd::Pid;
-        Result::ok(killpg(Pid::from_raw(child.id() as i32), Signal::SIGKILL));
+        Result::ok(killpg(Pid::from_raw(_child.id() as i32), Signal::SIGKILL));
     }
-    #[cfg(not(unix))]
-    std::mem::drop(child);
 }
 
 fn reap_bounded(mut child: Child) {
     let deadline = Instant::now() + KILL_REAP_BUDGET;
     loop {
         match child.try_wait() {
-            Ok(Some(_)) | Err(_) => return,
+            Ok(Some(_)) => return,
+            Err(_) => break,
             Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
             Ok(None) => break,
         }
@@ -271,7 +264,9 @@ fn reap_bounded(mut child: Child) {
                 Result::ok(child.wait());
             }
         },
-        None => Result::ok(child.wait()),
+        None => {
+            Result::ok(child.wait());
+        }
     }
 }
 
@@ -419,6 +414,29 @@ mod tests {
             }
             other => panic!("expected completed bounded capture, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn truncated_capture_is_not_reported_as_complete_output() {
+        let stdout = run_bounded(
+            &sh("printf 12345"),
+            Duration::from_secs(1),
+            Capture {
+                stdout: Some(4),
+                stderr: None,
+            },
+        );
+        assert!(stdout.into_stdout().is_none());
+
+        let stderr = run_bounded(
+            &sh("printf 12345 >&2"),
+            Duration::from_secs(1),
+            Capture {
+                stdout: None,
+                stderr: Some(4),
+            },
+        );
+        assert!(stderr.into_stderr().is_none());
     }
 
     #[cfg(unix)]
