@@ -179,7 +179,7 @@ fn oversized_resident_line_is_discarded_through_newline() {
 }
 
 #[test]
-fn invalid_utf8_cleanup_drain_preserves_final_valid_frame() {
+fn invalid_utf8_line_before_exit_preserves_final_valid_frame() {
     let (tx, rx) = mpsc::channel();
     let fixture = FixtureSupervisor::new();
     let _session = fixture

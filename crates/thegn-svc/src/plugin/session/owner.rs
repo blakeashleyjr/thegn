@@ -55,19 +55,18 @@ impl Lines {
         Ok(())
     }
     fn finish(&mut self, callback: &impl Fn(SessionEvent)) -> Result<(), CloseReason> {
-        let text = match std::str::from_utf8(&self.partial) {
-            Ok(text) => text.trim().to_owned(),
-            Err(_) => {
-                self.emit_junk(LineReject::InvalidUtf8, callback)?;
-                return Ok(());
+        match std::str::from_utf8(&self.partial) {
+            Ok(text) => {
+                let text = text.trim();
+                if !text.is_empty() {
+                    catch_unwind(AssertUnwindSafe(|| callback(super::parse_line(text))))
+                        .map_err(|_| CloseReason::CallbackPanic)?;
+                }
+                self.partial.clear();
+                Ok(())
             }
-        };
-        self.partial.clear();
-        if !text.is_empty() {
-            catch_unwind(AssertUnwindSafe(|| callback(super::parse_line(&text))))
-                .map_err(|_| CloseReason::CallbackPanic)?;
+            Err(_) => self.emit_junk(LineReject::InvalidUtf8, callback),
         }
-        Ok(())
     }
     fn emit_junk(
         &mut self,
