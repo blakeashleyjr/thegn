@@ -144,8 +144,11 @@ impl MediaKind {
 /// commonly supply relative filenames rather than URLs.
 fn url_extension(value: &str) -> Option<&str> {
     let path = if let Some((_, after_scheme)) = value.split_once("://") {
-        let slash = after_scheme.find('/')?;
-        &after_scheme[slash..]
+        let boundary = after_scheme.find(|ch| matches!(ch, '/' | '?' | '#'))?;
+        if after_scheme.as_bytes()[boundary] != b'/' {
+            return None;
+        }
+        &after_scheme[boundary..]
     } else {
         value
     };
@@ -419,6 +422,14 @@ mod tests {
         );
         assert_eq!(
             MediaKind::from_hints("x", None, Some("https://h/watch?v=abc")),
+            MediaKind::Unknown
+        );
+        assert_eq!(
+            MediaKind::from_hints("x", None, Some("https://h?x=/a.mp4")),
+            MediaKind::Unknown
+        );
+        assert_eq!(
+            MediaKind::from_hints("x", None, Some("https://h#/a.mkv")),
             MediaKind::Unknown
         );
         // player-name heuristic last.
