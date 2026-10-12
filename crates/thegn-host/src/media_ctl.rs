@@ -20,6 +20,29 @@ async fn snapshot_or_log(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MediaPreflightError {
+    StateUnknown(&'static str),
+}
+
+fn shuffle_target(
+    snapshot: Option<&thegn_core::media::MediaSnapshot>,
+) -> Result<bool, MediaPreflightError> {
+    snapshot
+        .and_then(|snapshot| snapshot.state.shuffle)
+        .map(|on| !on)
+        .ok_or(MediaPreflightError::StateUnknown("shuffle"))
+}
+
+fn loop_target(
+    snapshot: Option<&thegn_core::media::MediaSnapshot>,
+) -> Result<thegn_core::media::LoopMode, MediaPreflightError> {
+    snapshot
+        .and_then(|snapshot| snapshot.state.loop_mode)
+        .map(thegn_core::media::LoopMode::cycle)
+        .ok_or(MediaPreflightError::StateUnknown("loop"))
+}
+
 /// Identifies one live media watcher/config/player selection. Snapshot
 /// producers capture the value before doing any async work so a result from an
 /// operation that began before a restart can never replace the new selection.
@@ -137,7 +160,6 @@ pub(crate) fn spawn_media_op(
     tx: tokio_mpsc::UnboundedSender<crate::media_watch::MediaSnapshotDelivery>,
     waker: TerminalWaker,
 ) {
-    use thegn_core::media::LoopMode;
     let generation = generation.current();
     tokio::spawn(async move {
         let Some(client) = crate::media_secret::client_for(&cfg).await else {
@@ -146,33 +168,36 @@ pub(crate) fn spawn_media_op(
         let cur = snapshot_or_log(&client, "preflight").await;
         let cur_state = cur.as_ref().map(|snapshot| &snapshot.state);
         let res = match op {
-            MediaOp::PlayPause => client.play_pause().await,
-            MediaOp::Next => client.next().await,
-            MediaOp::Previous => client.previous().await,
-            MediaOp::ShuffleToggle => {
-                let on = cur_state.and_then(|s| s.shuffle).unwrap_or(false);
-                client.set_shuffle(!on).await
-            }
-            MediaOp::LoopCycle => {
-                let next = cur_state
-                    .and_then(|s| s.loop_mode)
-                    .unwrap_or(LoopMode::None)
-                    .cycle();
-                client.set_loop(next).await
-            }
-            MediaOp::VolumeUp => client.volume_step(cfg.volume_step).await,
-            MediaOp::VolumeDown => client.volume_step(-cfg.volume_step).await,
+            MediaOp::PlayPause => Some(client.play_pause().await),
+            MediaOp::Next => Some(client.next().await),
+            MediaOp::Previous => Some(client.previous().await),
+            MediaOp::ShuffleToggle => match shuffle_target(cur.as_ref()) {
+                Ok(on) => Some(client.set_shuffle(on).await),
+                Err(error) => {
+                    tracing::warn!(target: "thegn::media", outcome = ?error, "media shuffle toggle preflight failed");
+                    None
+                }
+            },
+            MediaOp::LoopCycle => match loop_target(cur.as_ref()) {
+                Ok(next) => Some(client.set_loop(next).await),
+                Err(error) => {
+                    tracing::warn!(target: "thegn::media", outcome = ?error, "media loop cycle preflight failed");
+                    None
+                }
+            },
+            MediaOp::VolumeUp => Some(client.volume_step(cfg.volume_step).await),
+            MediaOp::VolumeDown => Some(client.volume_step(-cfg.volume_step).await),
             MediaOp::SeekForward | MediaOp::SeekBack => {
                 let kind = cur_state.map(|s| s.kind).unwrap_or_default();
                 let step = cfg.seek_step(kind);
-                client.seek(step, matches!(op, MediaOp::SeekForward)).await
+                Some(client.seek(step, matches!(op, MediaOp::SeekForward)).await)
             }
-            MediaOp::PlayQueueItem(ref id) => client.play_queue_item(id).await,
-            MediaOp::ChapterNext => client.chapter_next().await,
-            MediaOp::ChapterPrev => client.chapter_prev().await,
-            MediaOp::FullscreenToggle => client.toggle_fullscreen().await,
+            MediaOp::PlayQueueItem(ref id) => Some(client.play_queue_item(id).await),
+            MediaOp::ChapterNext => Some(client.chapter_next().await),
+            MediaOp::ChapterPrev => Some(client.chapter_prev().await),
+            MediaOp::FullscreenToggle => Some(client.toggle_fullscreen().await),
         };
-        if let Err(e) = res {
+        if let Some(Err(e)) = res {
             tracing::warn!(target: "thegn::media", error = %e, "media op {op:?} failed");
         }
         let _ = tx.send(crate::media_watch::MediaSnapshotDelivery {
@@ -294,4 +319,64 @@ pub(crate) fn spawn_media_sources(
         let _ = tx.send(MediaSourcesDelivery { request, sources });
         let _ = waker.wake();
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MediaPreflightError, loop_target, shuffle_target};
+    use thegn_core::media::{LoopMode, MediaSnapshot, MediaState};
+
+    #[test]
+    fn shuffle_toggle_fails_closed_when_state_is_unknown() {
+        assert_eq!(
+            shuffle_target(None),
+            Err(MediaPreflightError::StateUnknown("shuffle"))
+        );
+        assert_eq!(
+            shuffle_target(Some(&MediaSnapshot {
+                state: MediaState::default(),
+                caps: Default::default(),
+            })),
+            Err(MediaPreflightError::StateUnknown("shuffle"))
+        );
+    }
+
+    #[test]
+    fn loop_cycle_fails_closed_when_state_is_unknown() {
+        assert_eq!(
+            loop_target(None),
+            Err(MediaPreflightError::StateUnknown("loop"))
+        );
+        assert_eq!(
+            loop_target(Some(&MediaSnapshot {
+                state: MediaState::default(),
+                caps: Default::default(),
+            })),
+            Err(MediaPreflightError::StateUnknown("loop"))
+        );
+    }
+
+    #[test]
+    fn known_toggle_states_produce_their_next_values() {
+        let mut state = MediaState {
+            shuffle: Some(true),
+            loop_mode: Some(LoopMode::Playlist),
+            ..MediaState::default()
+        };
+        let snapshot = MediaSnapshot {
+            state: state.clone(),
+            caps: Default::default(),
+        };
+        assert_eq!(shuffle_target(Some(&snapshot)), Ok(false));
+        assert_eq!(loop_target(Some(&snapshot)), Ok(LoopMode::Track));
+
+        state.shuffle = Some(false);
+        state.loop_mode = Some(LoopMode::None);
+        let snapshot = MediaSnapshot {
+            state,
+            caps: Default::default(),
+        };
+        assert_eq!(shuffle_target(Some(&snapshot)), Ok(true));
+        assert_eq!(loop_target(Some(&snapshot)), Ok(LoopMode::Playlist));
+    }
 }
