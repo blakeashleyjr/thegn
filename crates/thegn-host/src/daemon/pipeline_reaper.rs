@@ -53,6 +53,10 @@ use super::service::DaemonService;
 /// attention, not a user's frame.
 const REAP_INTERVAL_SECS: u64 = 300;
 
+/// Stage concurrency bounds live rows; this cap only defers excess reaping to
+/// the next slow pass and does not release or ignore any active row.
+const REAP_ROW_LIMIT: usize = 512;
+
 /// Wait this long after daemon start before the first pass, so a restart that
 /// is about to re-adopt live sessions does not read them as absent and park
 /// rows that are seconds away from checking back in.
@@ -97,7 +101,7 @@ fn reap_pass_with_in_flight(
     in_flight: &std::collections::HashSet<i64>,
     fresh_live: &dyn Fn() -> Option<Vec<String>>,
 ) {
-    reap_running(db, live_ids, fresh_live);
+    reap_running(db, live_ids, REAP_ROW_LIMIT, fresh_live);
     reap_stale_spawning(
         db,
         thegn_core::util::now_ms(),
@@ -169,37 +173,37 @@ fn reap_stale_spawning(
 fn reap_running(
     db: &super::service::SharedDb,
     live_ids: &[String],
+    limit: usize,
     fresh_live: &dyn Fn() -> Option<Vec<String>>,
 ) {
     // Snapshot under the shared mutex, then release it before any filesystem
     // or git work. A large stale roster must not stop unrelated daemon DB
     // operations for the duration of hundreds of subprocesses.
     let (rows, runs) = match db.lock() {
-        Ok(db) => match db.list_dispatches() {
-            Ok(rows) => {
-                let rows = rows
-                    .into_iter()
-                    .filter(|r| {
-                        matches!(
-                            r.status,
-                            // Never `Spawning`: a retry reserves the row that way
-                            // mid-relaunch without bumping `run_gen`, so its old
-                            // session and exit stamp are not evidence about the
-                            // worker being opened. Fail closed.
-                            AgentDispatchStatus::Running
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                // Same lock as the roster snapshot: the generation each plan
-                // entry is fenced on. A row we cannot fence is not planned.
-                let runs = db.running_dispatch_run_refs().unwrap_or_default();
-                (rows, runs)
+        Ok(db) => {
+            // Never include `Spawning`: a retry reserves the row that way
+            // mid-relaunch without bumping `run_gen`, so its old session and
+            // exit stamp are not evidence about the worker being opened.
+            match db.list_dispatches_with_status(&[AgentDispatchStatus::Running], limit) {
+                Ok((rows, truncated)) => {
+                    if truncated {
+                        tracing::warn!(
+                            target: "thegn::pipeline",
+                            limit,
+                            "reap pass truncated; remaining running rows deferred to the next pass"
+                        );
+                    }
+                    // Same lock as the roster snapshot: the generation each plan
+                    // entry is fenced on. A row we cannot fence is not planned.
+                    let runs = db.running_dispatch_run_refs().unwrap_or_default();
+                    (rows, runs)
+                }
+                Err(e) => {
+                    tracing::debug!(target: "thegn::pipeline", error = %e, "reap pass could not snapshot");
+                    return;
+                }
             }
-            Err(e) => {
-                tracing::debug!(target: "thegn::pipeline", error = %e, "reap pass could not snapshot");
-                return;
-            }
-        },
+        }
         Err(_) => return,
     };
     let plan = crate::cmd::dispatch::reap_plan_rows(&rows, Some(live_ids));
@@ -345,6 +349,24 @@ mod tests {
         let run = db.dispatch_run_ref(id).unwrap().unwrap();
         db.stamp_dispatch_exit(&run, Some(0)).unwrap();
         id
+    }
+
+    #[test]
+    fn bounded_pass_defers_newer_running_rows_to_the_next_pass() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = Db::open_at(&dir.path().join("thegn.db")).unwrap();
+        let wt = dir.path().join("wt");
+        std::fs::create_dir(&wt).unwrap();
+        let older = row(&db, &wt, "older.md");
+        let newer = row(&db, &wt, "newer.md");
+        let shared = Arc::new(Mutex::new(db));
+
+        reap_running(&shared, &[], 1, &|| Some(Vec::new()));
+        assert_eq!(status_of(&shared, older), AgentDispatchStatus::WaitingHuman);
+        assert_eq!(status_of(&shared, newer), AgentDispatchStatus::Running);
+
+        reap_running(&shared, &[], 1, &|| Some(Vec::new()));
+        assert_eq!(status_of(&shared, newer), AgentDispatchStatus::WaitingHuman);
     }
 
     #[test]
