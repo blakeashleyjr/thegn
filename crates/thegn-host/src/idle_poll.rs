@@ -54,6 +54,11 @@ mod tests {
     }
 
     #[test]
+    fn log_backlog_keeps_an_otherwise_idle_loop_working() {
+        assert_eq!(poll_timeout(None, false, false, true), Some(BATCH_POLL));
+    }
+
+    #[test]
     fn deferred_remainder_wins_over_batch() {
         let d = Duration::from_millis(3);
         assert_eq!(poll_timeout(Some(d), true, true, true), Some(d));

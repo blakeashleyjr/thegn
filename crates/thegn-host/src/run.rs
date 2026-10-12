@@ -8290,7 +8290,16 @@ async fn event_loop<T: Terminal>(
                 }
                 let boundary = std::time::Instant::now();
                 loop_perf.add_busy(active_clock.checkpoint(boundary));
-                let snap = loop_perf.rollup(boundary);
+                let log_stats = logs_ingress.stats();
+                let log_oldest_ms = log_stats
+                    .oldest_age
+                    .map_or(0, |age| age.as_millis().min(u64::MAX as u128) as u64);
+                let snap = loop_perf.rollup(
+                    boundary,
+                    log_stats.pending,
+                    log_stats.dropped_total,
+                    log_oldest_ms,
+                );
                 panel_ui.docs.loop_perf.push(&snap);
             }
         }
@@ -12813,16 +12822,12 @@ async fn event_loop<T: Terminal>(
             ));
             if !slice.is_empty() {
                 loop_perf.tick(crate::perf::WakeSource::Other);
-                model.panel.log_lines_structured.extend(slice);
-                let retain = crate::loop_policy::LOG_RETAIN;
-                if model.panel.log_lines_structured.len() > retain {
-                    let overflow = model.panel.log_lines_structured.len() - retain;
-                    model.panel.log_lines_structured.drain(0..overflow);
-                }
                 // Avoid the render -> own-log -> tail -> render feedback loop.
-                if want_panel && panel_ui.open == crate::panel::Section::Logs {
-                    dirty = true;
-                }
+                dirty |= crate::loop_policy::apply_log_slice(
+                    &mut model.panel.log_lines_structured,
+                    slice,
+                    want_panel && panel_ui.open == crate::panel::Section::Logs,
+                );
             }
             logs_ingress.has_pending()
         };

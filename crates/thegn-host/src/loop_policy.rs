@@ -10,6 +10,7 @@
 //! drain immediately instead of waiting out the whole backlog.
 
 use std::time::Duration;
+use thegn_core::log::parser::ParsedLog;
 
 /// Per-iteration PTY parse budget. `max_bytes` bounds the vt100 feed volume;
 /// `deadline` is the wall-clock backstop for pathological escape-heavy input
@@ -47,6 +48,20 @@ pub const LOG_RETAIN: usize = 1000;
 /// Log records applied per host iteration; input pending gets a smaller slice.
 pub fn log_apply_budget(input_pending: bool) -> usize {
     if input_pending { 32 } else { 256 }
+}
+
+/// Apply one bounded log slice to display storage, retaining the newest rows.
+/// Returns whether visible Logs content changed and should be repainted.
+pub fn apply_log_slice(rows: &mut Vec<ParsedLog>, slice: Vec<ParsedLog>, visible: bool) -> bool {
+    if slice.is_empty() {
+        return false;
+    }
+    rows.extend(slice);
+    if rows.len() > LOG_RETAIN {
+        let overflow = rows.len() - LOG_RETAIN;
+        rows.drain(0..overflow);
+    }
+    visible
 }
 
 /// Stash high-water: stop receiving from the PTY channel once this many bytes
@@ -147,6 +162,38 @@ mod tests {
         assert!(log_apply_budget(true) < log_apply_budget(false));
         assert!(log_apply_budget(false) <= LOG_RETAIN);
         assert!(log_apply_budget(true) > 0);
+    }
+
+    #[test]
+    fn log_slice_visibility_controls_dirty_result() {
+        let slice = vec![thegn_core::log::parser::parse_log("one")];
+        let mut hidden = Vec::new();
+        assert!(!apply_log_slice(&mut hidden, slice, false));
+        assert_eq!(hidden.len(), 1);
+
+        let mut visible = Vec::new();
+        assert!(apply_log_slice(
+            &mut visible,
+            vec![thegn_core::log::parser::parse_log("one")],
+            true,
+        ));
+    }
+
+    #[test]
+    fn log_slice_retains_newest_rows_and_gap_position() {
+        let mut slice: Vec<_> = (0..LOG_RETAIN + 2)
+            .map(|index| thegn_core::log::parser::parse_log(&format!("line-{index}")))
+            .collect();
+        slice[500] = thegn_core::log::parser::parse_log("[3 log lines dropped under overload]");
+        let mut rows = Vec::new();
+
+        assert!(apply_log_slice(&mut rows, slice, true));
+        assert_eq!(rows.len(), LOG_RETAIN);
+        assert_eq!(rows[0].message, "line-2");
+        assert_eq!(rows[497].message, "line-499");
+        assert!(rows[498].message.contains("3 log lines dropped"));
+        assert_eq!(rows[499].message, "line-501");
+        assert_eq!(rows[LOG_RETAIN - 1].message, "line-1001");
     }
 
     #[test]
