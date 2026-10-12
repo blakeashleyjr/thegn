@@ -247,6 +247,9 @@ fn base_for(loc: &GitLoc, sha: &str) -> Result<String> {
     let commit_expr = format!("{sha}^{{commit}}");
     let commit = run_read(loc, &["rev-parse", "--verify", "-q", &commit_expr])
         .with_context(|| format!("verify rebase target {sha}"))?;
+    // `run_read` returns stdout verbatim, including rev-parse's trailing
+    // newline. Pass the object id as one clean argument to rev-list.
+    let commit = commit.trim();
     let parents = run_read(loc, &["rev-list", "--parents", "-n", "1", &commit])
         .with_context(|| format!("read parents of rebase target {sha}"))?;
     let mut ids = parents.split_whitespace();
@@ -685,6 +688,9 @@ mod tests {
         r.commit_file("root.txt", "root\n", "root");
         let root = r.sha_of("root");
         assert_eq!(base_for(&r.loc(), &root).unwrap(), "--root");
+        r.commit_file("child.txt", "child\n", "child");
+        let child = r.sha_of("child");
+        assert_eq!(base_for(&r.loc(), &child).unwrap(), root);
         assert!(base_for(&r.loc(), "deadbeef-deadbeef").is_err());
     }
 
