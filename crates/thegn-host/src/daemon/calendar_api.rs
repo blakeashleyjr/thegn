@@ -13,7 +13,6 @@ use thegn_core::calendar::{
     ResolvedClock, expand_calendar, tz,
 };
 use thegn_core::config_calendar::CalendarConfig;
-use thegn_core::store::CalendarStore;
 use thegn_svc::control::{CalendarEventsReply, ControlError, ControlResult};
 
 /// Maximum inclusive date span accepted by `calendar.events`.
@@ -93,11 +92,13 @@ pub(crate) fn events_from_rows(
 
 #[cfg(test)]
 fn events_in_window(
-    db: &impl CalendarStore,
+    db: &impl thegn_core::store::CalendarStore,
     from: NaiveDate,
     to: NaiveDate,
     home: Tz,
 ) -> ControlResult<CalendarEventsReply> {
+    use thegn_core::store::CalendarStore;
+
     let window = CalendarWindow::new(from, to, home).ok_or_else(|| {
         ControlError::InvalidArgument("the requested calendar window is not representable".into())
     })?;
