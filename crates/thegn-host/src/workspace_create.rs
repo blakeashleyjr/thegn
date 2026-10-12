@@ -91,7 +91,7 @@ fn parse_workspace_url(input: &str) -> Result<ParsedWorkspaceUrl> {
                 host.to_lowercase(),
                 path.trim_end_matches('/')
             ),
-            path.rsplit('/').next().unwrap_or(""),
+            path.rsplit('/').next().unwrap_or("").to_owned(),
         )
     } else {
         let parsed = url::Url::parse(input).context("unsupported git URL")?;
@@ -121,7 +121,7 @@ fn parse_workspace_url(input: &str) -> Result<ParsedWorkspaceUrl> {
                     .any(|part| encoded.contains(part)),
             "ambiguous git URL path"
         );
-        let tail = path.rsplit('/').next().unwrap_or("");
+        let tail = path.rsplit('/').next().unwrap_or("").to_owned();
         let clone_url = parsed.to_string();
         let mut canonical = parsed.clone();
         canonical

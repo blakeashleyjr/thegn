@@ -241,7 +241,7 @@ fn entry(path: String) -> RepoEntry {
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.clone());
-    let haystack = format!("{} {}", name, path);
+    let haystack = format!("{} {}", name, path).to_lowercase();
     RepoEntry {
         path,
         name,
@@ -1073,7 +1073,7 @@ mod tests {
     fn query_uses_precomputed_haystack() {
         let mut p = picker(&["/code/Alpha"]);
         let haystack = p.items[0].haystack.clone();
-        assert_eq!(haystack, "Alpha /code/Alpha");
+        assert_eq!(haystack, "alpha /code/alpha");
         type_str(&mut p, "alpha");
         assert_eq!(p.items[0].haystack, haystack);
         assert_eq!(p.matches().len(), 1);

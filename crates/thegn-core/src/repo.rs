@@ -479,8 +479,10 @@ mod tests {
         std::fs::create_dir_all(root.join(".hidden/hidden-repo/.git")).unwrap();
         std::fs::create_dir_all(root.join("node_modules/vendor/.git")).unwrap();
         std::fs::create_dir_all(root.join("target/build/.git")).unwrap();
-        let mut cfg = Config::default();
-        cfg.repo_roots = vec![root.to_string_lossy().into_owned()];
+        let cfg = Config {
+            repo_roots: vec![root.to_string_lossy().into_owned()],
+            ..Config::default()
+        };
         let mut batches = Vec::new();
         let report = discover_repos_bounded(
             &cfg,
