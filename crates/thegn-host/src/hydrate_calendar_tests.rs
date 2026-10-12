@@ -14,6 +14,7 @@ fn dropped_month_completion_sends_cache_unavailable_payload() {
         waker: None,
         year: 2026,
         month: 10,
+        request: 0,
         sent: false,
     };
     drop(completion);
@@ -29,7 +30,14 @@ fn dropped_month_completion_sends_cache_unavailable_payload() {
 #[test]
 fn refused_month_fetch_sends_cache_unavailable_payload() {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    deliver_unavailable_if_refused(crate::sched::Admission::Saturated, &tx, None, 2026, 10);
+    deliver_unavailable_if_refused(
+        crate::sched::Admission::Saturated,
+        &tx,
+        None,
+        2026,
+        10,
+        None,
+    );
 
     let result = rx.try_recv().unwrap();
     let RefreshKind::CalendarMonth(payload) = result else {
@@ -37,6 +45,193 @@ fn refused_month_fetch_sends_cache_unavailable_payload() {
     };
     assert_eq!(payload.month, (2026, 10));
     assert_eq!(payload.error, Some(CalendarViewError::CacheUnavailable));
+}
+
+#[test]
+fn delivered_month_payload_carries_its_widened_coverage() {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    deliver(
+        &tx,
+        None,
+        2026,
+        8,
+        MonthView {
+            events: Some(Vec::new()),
+            error: None,
+        },
+        None,
+        None,
+    );
+    let RefreshKind::CalendarMonth(payload) = rx.try_recv().unwrap() else {
+        panic!("delivery should contain a calendar month payload");
+    };
+    let (from, to) = thegn_core::calendar::month_bounds(2026, 8).unwrap();
+    assert_eq!(payload.covered, widen(from, to));
+    assert_eq!(payload.request, None);
+}
+
+#[test]
+fn calendar_connectivity_evidence_uses_transport_and_retryability_separately() {
+    let success = Ok(EventPage::default());
+    let command_timeout = Err(CalendarError::Timeout(
+        "calendar command exceeded its deadline",
+    ));
+    let remote_timeout = Err(CalendarError::Timeout("remote request timed out"));
+    let local_success = Some(true);
+    assert_eq!(connectivity_evidence(false, &success), None);
+    assert_eq!(connectivity_evidence(false, &command_timeout), None);
+    assert_eq!(connectivity_evidence(true, &success), local_success);
+    assert_eq!(connectivity_evidence(true, &remote_timeout), Some(false));
+    assert_eq!(
+        connectivity_evidence(true, &Err(CalendarError::Auth("401".into()))),
+        None
+    );
+}
+
+#[test]
+fn local_timeouts_and_local_successes_cannot_change_connectivity_state() {
+    let mut state = thegn_core::connectivity::ConnState::with_thresholds(3, 1);
+    for _ in 0..3 {
+        state.report_failure(1);
+    }
+    let failures_before = state.consecutive_failures();
+    let mut batch = ConnectivityEvidenceBatch::default();
+    for _ in 0..3 {
+        batch.observe(connectivity_evidence(
+            false,
+            &Err(CalendarError::Timeout("command")),
+        ));
+    }
+    for _ in 0..3 {
+        batch.observe(connectivity_evidence(false, &Ok(EventPage::default())));
+    }
+    batch.publish(|| {}, || {});
+    assert_eq!(
+        state.state(),
+        thegn_core::connectivity::Connectivity::Offline
+    );
+    assert_eq!(state.consecutive_failures(), failures_before);
+}
+
+#[test]
+fn mixed_remote_and_local_outcomes_are_order_independent_at_threshold() {
+    fn apply_batch(
+        outcomes: impl IntoIterator<Item = Option<bool>>,
+    ) -> thegn_core::connectivity::ConnState {
+        let mut state = thegn_core::connectivity::ConnState::with_thresholds(3, 1);
+        let mut batch = ConnectivityEvidenceBatch::default();
+        for outcome in outcomes {
+            batch.observe(outcome);
+        }
+        batch.publish(
+            || {
+                state.report_success(1);
+            },
+            || {
+                state.report_failure(1);
+            },
+        );
+        state
+    }
+    let local_timeout = connectivity_evidence(false, &Err(CalendarError::Timeout("command")));
+    let local_success = connectivity_evidence(false, &Ok(EventPage::default()));
+    let remote_failure =
+        connectivity_evidence(true, &Err(CalendarError::Network("offline".into())));
+    let remote_success = connectivity_evidence(true, &Ok(EventPage::default()));
+    let first = apply_batch([
+        local_timeout,
+        remote_failure,
+        local_success,
+        remote_failure,
+        remote_success,
+        remote_failure,
+    ]);
+    let second = apply_batch([
+        remote_success,
+        remote_failure,
+        remote_failure,
+        local_success,
+        remote_failure,
+        local_timeout,
+    ]);
+    assert_eq!(
+        first.state(),
+        thegn_core::connectivity::Connectivity::Online
+    );
+    assert_eq!(second.state(), first.state());
+    assert_eq!(first.consecutive_failures(), 0);
+    assert_eq!(second.consecutive_failures(), 0);
+}
+
+#[test]
+fn three_remote_failures_reach_offline_but_local_results_do_not_count() {
+    let mut state = thegn_core::connectivity::ConnState::with_thresholds(3, 1);
+    let mut batch = ConnectivityEvidenceBatch::default();
+    for evidence in [
+        connectivity_evidence(true, &Err(CalendarError::Network("one".into()))),
+        connectivity_evidence(false, &Err(CalendarError::Timeout("command"))),
+        connectivity_evidence(true, &Err(CalendarError::Timeout("two"))),
+        connectivity_evidence(false, &Ok(EventPage::default())),
+        connectivity_evidence(true, &Err(CalendarError::Network("three".into()))),
+    ] {
+        batch.observe(evidence);
+    }
+    batch.publish(
+        || {
+            state.report_success(1);
+        },
+        || {
+            state.report_failure(1);
+        },
+    );
+    assert_eq!(
+        state.state(),
+        thegn_core::connectivity::Connectivity::Offline
+    );
+}
+
+#[test]
+fn same_month_payloads_are_fenced_in_both_completion_orders() {
+    fn payload(month: (i32, u32), request: u64) -> crate::detail::CalendarPayload {
+        let (from, to) = thegn_core::calendar::month_bounds(month.0, month.1).unwrap();
+        let covered = widen(from, to);
+        crate::detail::CalendarPayload {
+            month,
+            covered,
+            request: Some(request),
+            events: Some(Vec::new()),
+            error: None,
+        }
+    }
+
+    for month in [(2050, 1), (2051, 2)] {
+        let older = register_month_request(month);
+        let newer = register_month_request(month);
+        assert!(request_is_latest(
+            &BTreeMap::from([(month, newer)]),
+            month,
+            newer
+        ));
+        assert!(!request_is_latest(
+            &BTreeMap::from([(month, newer)]),
+            month,
+            older
+        ));
+        let old_payload = payload(month, older);
+        let new_payload = payload(month, newer);
+
+        let mut old_first = crate::calendar_docs::CalendarDocs::default();
+        old_first.merge(&old_payload);
+        assert!(!old_first.loaded.contains(&month));
+        old_first.merge(&new_payload);
+        assert!(old_first.loaded.contains(&month));
+
+        let mut new_first = crate::calendar_docs::CalendarDocs::default();
+        new_first.merge(&new_payload);
+        new_first.merge(&old_payload);
+        assert!(new_first.loaded.contains(&month));
+        assert_eq!(new_first.events.len(), 0);
+    }
 }
 
 /// An isolated DB. `Db::open` reads `XDG_STATE_HOME`, and this shell often runs
