@@ -29,9 +29,7 @@ pub struct TokenBucket {
 impl TokenBucket {
     /// Creates a bucket starting full (`burst` tokens), anchored at `now`.
     pub fn new(rps: f64, burst: f64, now: Instant) -> Option<Self> {
-        if !rps.is_finite()
-            || rps < MIN_RPM / 60.0
-            || rps > MAX_RATE
+        if !(MIN_RPM / 60.0..=MAX_RATE).contains(&rps)
             || !burst.is_finite()
             || !(1.0..=MAX_RATE).contains(&burst)
         {
