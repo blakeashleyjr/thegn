@@ -459,7 +459,7 @@ pub(crate) fn create_workspace_from_input_with_config(
     let input = input.trim();
     anyhow::ensure!(!input.is_empty(), "no project path or URL given");
 
-    let root = if let Some(parsed) = parse_workspace_url(input).ok() {
+    let root = if let Ok(parsed) = parse_workspace_url(input) {
         let workspaces_dir =
             std::path::PathBuf::from(thegn_core::util::expand_tilde(&cfg.workspaces_dir));
         let dest = workspace_clone_dest(input, cfg).expect("parsed URL has a clone destination");
