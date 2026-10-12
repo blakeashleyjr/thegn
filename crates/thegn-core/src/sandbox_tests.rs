@@ -809,9 +809,200 @@ fn named_volume_admission_precedes_oci_ensure_without_side_effects() {
 }
 
 #[test]
-fn test_sandbox_compose_executes() {
-    // We cannot mock easily without a trait. Since `ensure` executes `docker-compose`,
-    // we'll leave Compose verification to the Integration/E2E layer.
+fn compose_refusal_tracks_only_unenforced_restrictions() {
+    let mut base = spec(Backend::Docker);
+    base.compose = Some("compose.yml".into());
+    base.ports.clear();
+    base.limits = SandboxLimits::default();
+    assert!(compose_policy_refusal(&base).is_none());
+    for (field, set) in [
+        (
+            "read_only_root",
+            Box::new(|s: &mut SandboxSpec| s.read_only_root = true)
+                as Box<dyn Fn(&mut SandboxSpec)>,
+        ),
+        (
+            "no_new_privileges",
+            Box::new(|s| s.no_new_privileges = true),
+        ),
+        ("pids_limit", Box::new(|s| s.pids_limit = Some(100))),
+        (
+            "drop_capabilities",
+            Box::new(|s| s.drop_capabilities.push("ALL".into())),
+        ),
+        (
+            "seal_home",
+            Box::new(|s| s.seal_home = Some("/home/test".into())),
+        ),
+        ("network_none", Box::new(|s| s.network = Network::None)),
+        (
+            "network_allow",
+            Box::new(|s| s.network_allow.push("example.com".into())),
+        ),
+        (
+            "network_block",
+            Box::new(|s| s.network_block.push("example.com".into())),
+        ),
+        (
+            "oci_runtime",
+            Box::new(|s| s.oci_runtime = Some("runsc".into())),
+        ),
+        ("cpu", Box::new(|s| s.limits.cpu = Some("1".into()))),
+        ("memory", Box::new(|s| s.limits.memory = Some("1g".into()))),
+    ] {
+        let mut candidate = base.clone();
+        set(&mut candidate);
+        assert!(
+            compose_policy_refusal(&candidate).is_some(),
+            "{field} must refuse"
+        );
+    }
+    let mut vpn = base.clone();
+    vpn.vpn = build_vpn_spec(
+        &vpn_cfg(VpnProviderKind::Tailscale),
+        "test",
+        SandboxProfile::Hardened,
+    );
+    assert!(
+        compose_policy_refusal(&vpn).is_some(),
+        "VPN must refuse Compose"
+    );
+    for (field, set) in [
+        (
+            "ports",
+            Box::new(|s: &mut SandboxSpec| s.ports.push("8080:80".into()))
+                as Box<dyn Fn(&mut SandboxSpec)>,
+        ),
+        ("gpu", Box::new(|s| s.gpu = Some("all".into()))),
+        (
+            "volumes",
+            Box::new(|s| s.volumes.push(("data".into(), "/data".into()))),
+        ),
+        (
+            "add_capabilities",
+            Box::new(|s| s.add_capabilities.push("NET_ADMIN".into())),
+        ),
+        ("host_network", Box::new(|s| s.network = Network::Host)),
+        (
+            "cpu_total_off",
+            Box::new(|s| s.limits.cpu_total = Some("off".into())),
+        ),
+        (
+            "memory_total",
+            Box::new(|s| s.limits.memory_total = Some("2g".into())),
+        ),
+    ] {
+        let mut candidate = base.clone();
+        set(&mut candidate);
+        assert!(
+            compose_policy_refusal(&candidate).is_none(),
+            "{field} is not a refusal"
+        );
+    }
+    let compose_worker = crate::sandbox_compose::ComposeSpec {
+        files: vec!["compose.yml".into()],
+        service: Some("worker".into()),
+        run_services: vec![],
+    }
+    .encode();
+    let mut bwrap = base;
+    bwrap.compose = Some(compose_worker.clone());
+    bwrap.backend = Backend::Bwrap;
+    bwrap.read_only_root = true;
+    let argv = enter_argv(&bwrap, "true").unwrap();
+    assert!(argv.iter().any(|arg| arg == "bwrap"), "{argv:?}");
+    assert!(!argv.iter().any(|arg| arg == "compose" || arg == "exec"));
+    let mut isolated = spec(Backend::Bwrap);
+    isolated.read_only_root = true;
+    let bwrap_argv = backend_enter_argv(&isolated, "true");
+    assert!(
+        bwrap_argv
+            .windows(2)
+            .any(|pair| pair[0] == "--tmpfs" && pair[1] == "/tmp")
+    );
+    assert!(
+        !bwrap_argv
+            .iter()
+            .any(|arg| { arg == "/run/user" || arg.starts_with("/run/user/") })
+    );
+    let mut systemd = bwrap;
+    systemd.backend = Backend::Systemd;
+    let argv = enter_argv(&systemd, "true").unwrap();
+    assert_eq!(argv.first().map(String::as_str), Some("systemd-run"));
+    assert!(!argv.iter().any(|arg| arg == "compose" || arg == "exec"));
+    let mut runtime_spec = spec(Backend::Systemd);
+    runtime_spec.read_only_root = true;
+    let runtime_argv = backend_enter_argv_with_env(
+        &runtime_spec,
+        "true",
+        SandboxArgvEnv {
+            resolver_dir: None,
+            runtime_dir: Some("/run/user/42".into()),
+        },
+    );
+    assert!(
+        runtime_argv
+            .windows(2)
+            .any(|pair| { pair[0] == "-p" && pair[1] == "InaccessiblePaths=-/run/user/42/thegn" })
+    );
+}
+
+#[test]
+fn empty_xdg_runtime_dir_uses_run_user_for_systemd_hardening() {
+    assert_eq!(
+        systemd_runtime_dir(Some(std::ffi::OsString::new())),
+        Some(std::path::PathBuf::from("/run/user"))
+    );
+}
+
+#[test]
+fn canonical_mount_sources_preserve_visible_destinations_for_every_backend_family() {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+        let td = tempfile::tempdir().unwrap();
+        let target = td.path().join("real-provider-cache");
+        let alias = td.path().join("provider-cache-alias");
+        std::fs::create_dir(&target).unwrap();
+        symlink(&target, &alias).unwrap();
+        for backend in [Backend::Bwrap, Backend::Systemd, Backend::Docker] {
+            let mut candidate = spec(backend);
+            candidate.mounts.push(Mount {
+                host: alias.to_string_lossy().into_owned(),
+                dest: "/work/cache-through-alias".into(),
+                ro: false,
+                cache: false,
+            });
+            let planned = launchable(&candidate).unwrap();
+            let mount = planned
+                .mounts
+                .iter()
+                .find(|mount| mount.dest == "/work/cache-through-alias")
+                .unwrap();
+            assert_eq!(mount.host, target.to_string_lossy().as_ref());
+            assert_eq!(mount.dest, "/work/cache-through-alias");
+        }
+        let mut remote = spec(Backend::Bwrap);
+        remote.placement = crate::placement::Placement::Ssh(crate::placement::SshPlacement::plain(
+            "example.test".into(),
+            22,
+            false,
+            crate::placement::TransportKind::Ssh,
+        ));
+        remote.mounts.push(Mount {
+            host: alias.to_string_lossy().into_owned(),
+            dest: "/remote/cache".into(),
+            ro: false,
+            cache: false,
+        });
+        let planned = launchable(&remote).unwrap();
+        let mount = planned
+            .mounts
+            .iter()
+            .find(|mount| mount.dest == "/remote/cache")
+            .unwrap();
+        assert_eq!(mount.host, alias.to_string_lossy().as_ref());
+    }
 }
 
 pub fn pull_image(img: &str) -> anyhow::Result<()> {
@@ -2117,4 +2308,37 @@ fn systemd_launch_refuses_mount_paths_systemd_would_misparse() {
             .contains("user name")
     );
     assert!(launchable(&spec(Backend::Systemd)).is_ok());
+    let mut protected = spec(Backend::Systemd);
+    protected.read_only_root = true;
+    let protected_argv = backend_enter_argv_with_env(
+        &protected,
+        "true",
+        SandboxArgvEnv {
+            resolver_dir: None,
+            runtime_dir: Some("/run/user/9".into()),
+        },
+    );
+    assert!(
+        protected_argv
+            .windows(2)
+            .any(|pair| { pair[0] == "-p" && pair[1] == "PrivateTmp=yes" })
+    );
+    assert!(
+        protected_argv
+            .windows(2)
+            .any(|pair| { pair[0] == "-p" && pair[1] == "InaccessiblePaths=-/run/user/9/thegn" })
+    );
+    let open_argv = backend_enter_argv_with_env(
+        &spec(Backend::Systemd),
+        "true",
+        SandboxArgvEnv {
+            resolver_dir: None,
+            runtime_dir: Some("/run/user/9".into()),
+        },
+    );
+    assert!(
+        !open_argv
+            .iter()
+            .any(|arg| arg.starts_with("InaccessiblePaths="))
+    );
 }

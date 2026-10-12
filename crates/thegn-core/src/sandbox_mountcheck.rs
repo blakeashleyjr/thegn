@@ -61,21 +61,11 @@ pub const MOUNT_MISSING_MARKER: &str = "thegn-mount-missing:";
 ///     be a false positive;
 ///   * a non-local placement — the files live on a machine whose filesystem we
 ///     never inspected, and we do not invent facts about it;
-///   * a compose spec with a service — the pane enters via
-///     `compose exec <service>`, which is a different container than the probe
-///     targets (a pre-existing mismatch this module deliberately does not widen);
 ///   * any path the host does not have.
 pub fn mount_sentinels(spec: &SandboxSpec, host_exists: &dyn Fn(&str) -> bool) -> Vec<String> {
     if spec.file_access == FileAccess::None || !spec.placement.is_local() {
         return Vec::new();
     }
-    if spec
-        .compose_spec()
-        .is_some_and(|c: crate::sandbox_compose::ComposeSpec| c.has_service())
-    {
-        return Vec::new();
-    }
-
     let mut out = Vec::new();
     let wt = spec.worktree.to_string_lossy();
 

@@ -63,18 +63,21 @@ deny list, whoever added it: `[sandbox] mounts` (the default `~/.gnupg:rw`
 included), a bound identity's git ssh key / `GH_CONFIG_DIR` / `GNUPGHOME`,
 the profile credential mounts, or an agent provider home. A mount whose
 host path is, or contains, a protected path (the worktree being `$HOME`
-itself, a `~` mount) refuses the launch. A compose-backed spec is refused
-too ("sealed profile cannot verify compose volumes"), since compose-file
-volumes never appear in the mount list. A kept container is reused only
-if it carries the matching `thegn.seal_home` label and, when sealed, binds
+itself, a `~` mount) refuses the launch. Compose on OCI backends is refused
+whenever the resolved spec requests `read_only_root`, `no_new_privileges`, a
+PID limit, dropped capabilities, sealed home, network-none or network filters,
+an OCI runtime, per-pane CPU/memory limits, or a VPN; Compose cannot enforce
+those restrictions. This applies under every profile, including `open`.
+Compose remains available when none of those restrictions is requested. A kept
+container is reused only if it carries the matching `thegn.seal_home` label and, when sealed, binds
 exactly the required mounts; otherwise it is recreated. The one tolerated extra
 is the devenv `/nix` bind, and only while devenv is still on: turn devenv off and
 the container is recreated. Apple containers carry no seal label, so reuse there
 is judged on mounts alone, and a sealed Apple container whose inspect output has
 no mounts list at all is recreated rather than trusted. Dropped `[sandbox] mounts` are
 listed by `thegn doctor`; a user-authored one also warns once per path.
-The ssh identity-key mounts and the `~/.local/{state,share}` write
-carve-outs are not applied. Extend the allowlist with `[sandbox] mounts`
+The ssh identity-key mounts and shell-state XDG write carve-outs are not
+applied to sealed profiles. Extend the allowlist with `[sandbox] mounts`
 (paths outside the deny list only).
 
 **Sealed agent panes need a managed account.** The only exception to the
@@ -103,16 +106,27 @@ enforced, and `thegn doctor` says so. `thegn doctor` prints
 `home  hidden | read-only | writable` for the configured profile.
 
 Writable carve-outs (non-sealed): the worktree and its git dir, build
-caches, `/tmp`, and a narrow set of `$HOME` paths for shell state
-(`~/tmp`, `~/.local/state`, `~/.local/share`, `~/.zsh_history`,
-`~/.bash_history`). Agent config dirs (`CLAUDE_CONFIG_DIR` /
-`CODEX_HOME`, or the `~/.claude` / `~/.codex` defaults) are writable for
+caches, `/tmp`, and a narrow set of shell-state paths (`~/tmp`,
+`$XDG_STATE_HOME/{bash,zsh}`, `$XDG_DATA_HOME/{fish,zoxide,atuin}`,
+`~/.zsh_history`, `~/.bash_history`). The XDG roots default to
+`~/.local/state` and `~/.local/share`; configured absolute roots outside
+`$HOME` work too. Only those application leaves are mounted. Missing,
+relative, symlinked, non-UTF-8, or overlapping roots are omitted. Agent config
+dirs (`CLAUDE_CONFIG_DIR` / `CODEX_HOME`, or the `~/.claude` / `~/.codex` defaults) are writable for
 every non-sealed pane, so an agent CLI you run by hand can persist its
 state instead of dying on a read-only filesystem.
 
 > `~/.keychain` is carved writable for `hardened` panes but **not** for
 > `sealed` ones: it holds scripts your host login shells later _source_,
 > so a writable copy from a sealed sandbox would be a persistence vector.
+
+The daemon socket normally lives under `$XDG_RUNTIME_DIR/thegn`. With that
+variable unset, it uses a vetted private runtime directory, then a private
+`/tmp/thegn-<uid>-<state-hash>/` directory if needed. If neither can be secured,
+panes run in-process. It does not place a new control socket under sandbox state.
+A custom `[daemon] socket` path is the operator's responsibility. On bwrap,
+`file_access = "all"` or `"host"` exposes the host filesystem by design,
+including runtime paths; those modes do not hide the control socket.
 
 ## Backends
 

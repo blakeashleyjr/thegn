@@ -745,11 +745,32 @@ fn exposure_report(cfg: &Config) {
 /// One-line control-surface coverage summary (cells implemented / declared,
 /// gap count). The full per-surface ledger is `thegn api coverage`.
 fn local_control_security_json(cfg: &Config) -> serde_json::Value {
+    local_control_security_json_with_legacy_state(cfg, None)
+}
+
+fn local_control_security_json_with_legacy_state(
+    cfg: &Config,
+    legacy_state_override: Option<&str>,
+) -> serde_json::Value {
     let socket = crate::daemon::socket_path(&cfg.daemon);
     let endpoint = thegn_svc::ipc::IpcEndpoint::for_socket_path(&socket);
+    let legacy_path = thegn_core::config_daemon::legacy_socket_path(
+        &thegn_core::util::xdg_state_home().join("thegn"),
+    );
+    let legacy_state =
+        legacy_state_override.unwrap_or_else(|| match crate::daemon::legacy_socket_state() {
+            crate::daemon::LegacySocketState::Live => "live",
+            crate::daemon::LegacySocketState::Stale => "stale",
+            crate::daemon::LegacySocketState::Absent => "absent",
+        });
+    let legacy_socket = serde_json::json!({
+        "path": legacy_path.display().to_string(),
+        "state": legacy_state,
+    });
     if !cfg.serve.local_admin {
         return serde_json::json!({
             "endpoint": endpoint.display(),
+            "legacy_socket": legacy_socket,
             "auth": "token-required",
             "peer_identity": "not-used",
             "hardening": "not-required",
@@ -758,6 +779,7 @@ fn local_control_security_json(cfg: &Config) -> serde_json::Value {
     let security = crate::platform::local_control_security(&socket);
     serde_json::json!({
         "endpoint": endpoint.display(),
+        "legacy_socket": legacy_socket,
         "auth": security.auth,
         "peer_identity": security.peer_identity,
         "hardening": security.hardening,
@@ -1537,7 +1559,7 @@ fn identification_json(cfg: &Config) -> serde_json::Value {
 pub(crate) fn doctor_json(cfg: &Config) -> serde_json::Value {
     let path = thegn_core::config::Config::path();
     let health = super::config_health::collect(&path, None);
-    doctor_json_with_health(cfg, &health)
+    doctor_json_with_health_and_overrides_and_legacy(cfg, &health, &[], Some("absent"))
 }
 
 pub(crate) fn doctor_json_with_health(cfg: &Config, health: &ConfigHealth) -> serde_json::Value {
@@ -1548,6 +1570,15 @@ fn doctor_json_with_health_and_overrides(
     cfg: &Config,
     health: &ConfigHealth,
     cli_overrides: &[String],
+) -> serde_json::Value {
+    doctor_json_with_health_and_overrides_and_legacy(cfg, health, cli_overrides, None)
+}
+
+fn doctor_json_with_health_and_overrides_and_legacy(
+    cfg: &Config,
+    health: &ConfigHealth,
+    cli_overrides: &[String],
+    legacy_state_override: Option<&str>,
 ) -> serde_json::Value {
     let env = TermEnv::from_env();
     let detected = thegn_core::termcaps::detect(&env);
@@ -1623,7 +1654,7 @@ fn doctor_json_with_health_and_overrides(
         "skills": super::skills_doctor::inspect(cfg, &super::resolve_worktree(None)),
         "mcp_serve": mcp_serve_scopes_json(cfg),
         "model_proxy": model_proxy_json(cfg),
-        "local_control": local_control_security_json(cfg),
+        "local_control": local_control_security_json_with_legacy_state(cfg, legacy_state_override),
         "remote_control": remote_control_transport_json(cfg),
         "lifecycle_hooks": lifecycle_hooks_json(cfg),
         "worktree_identity": worktree_identity_json(),
@@ -2826,6 +2857,16 @@ fn pane_daemon_report(cfg: &Config) {
 
     outln!("  enabled       {}", yn(cfg.daemon.enabled));
     outln!("  socket        {}", sock.display());
+    let legacy = thegn_core::config_daemon::legacy_socket_path(
+        &thegn_core::util::xdg_state_home().join("thegn"),
+    );
+    let legacy_state = crate::daemon::legacy_socket_state();
+    let legacy_label = match legacy_state {
+        crate::daemon::LegacySocketState::Live => "live",
+        crate::daemon::LegacySocketState::Stale => "stale",
+        crate::daemon::LegacySocketState::Absent => "absent",
+    };
+    outln!("  legacy socket {} {legacy_label}", legacy.display());
     if cfg!(windows) {
         // The endpoint is a fixed-length hash of the path, so length is moot.
         outln!("  endpoint      named pipe (path length not a constraint)");
@@ -3936,6 +3977,11 @@ mod tests {
     fn doctor_json_exposes_local_control_identity_and_hardening() {
         let local = doctor_json(&Config::default())["local_control"].clone();
         assert!(local["endpoint"].is_string());
+        assert!(local["legacy_socket"]["path"].is_string());
+        assert!(matches!(
+            local["legacy_socket"]["state"].as_str(),
+            Some("live" | "stale" | "absent")
+        ));
         assert!(matches!(
             (local["auth"].as_str(), local["peer_identity"].as_str()),
             (Some("same-euid-or-token"), Some("native-effective-uid"))

@@ -189,9 +189,29 @@ pub async fn connect(ep: &IpcEndpoint) -> io::Result<IpcStream> {
         IpcEndpoint::Unix(path) => {
             #[cfg(unix)]
             {
-                Ok(IpcStream::Unix(
-                    tokio::net::UnixStream::connect(path).await?,
-                ))
+                let parent = path.parent().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::PermissionDenied, "unix socket has no parent")
+                })?;
+                let metadata = std::fs::symlink_metadata(parent)?;
+                if metadata.file_type().is_symlink() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        format!("{} is a symlink", parent.display()),
+                    ));
+                }
+                verify_unix_bind_parent(parent, &metadata)?;
+                let stream = tokio::net::UnixStream::connect(path).await?;
+                let peer_uid = stream.peer_cred()?.uid();
+                server_peer_allowed(
+                    Some(peer_uid),
+                    effective_uid().ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "cannot determine effective uid",
+                        )
+                    })?,
+                )?;
+                Ok(IpcStream::Unix(stream))
             }
             #[cfg(not(unix))]
             {
@@ -226,6 +246,21 @@ pub async fn connect(ep: &IpcEndpoint) -> io::Result<IpcStream> {
                 Err(unsupported("named-pipe IPC on a non-Windows host"))
             }
         }
+    }
+}
+
+#[cfg(unix)]
+fn server_peer_allowed(peer_uid: Option<u32>, euid: u32) -> io::Result<()> {
+    if peer_uid == Some(euid) {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "unix control server uid {:?} does not match client uid {euid}",
+                peer_uid
+            ),
+        ))
     }
 }
 
@@ -789,6 +824,46 @@ fn verify_unix_owner_mode(path: &Path, expected_mode: u32, directory: bool) -> i
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn server_peer_identity_requires_same_uid() {
+        let uid = effective_uid().unwrap();
+        assert!(server_peer_allowed(Some(uid), uid).is_ok());
+        assert_eq!(
+            server_peer_allowed(Some(uid.wrapping_add(1)), uid)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            server_peer_allowed(None, uid).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_connect_rejects_symlinked_and_shared_parents_before_connecting() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+        let td = tempfile::tempdir().unwrap();
+        let real = td.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let alias = td.path().join("alias");
+        symlink(&real, &alias).unwrap();
+        let symlink_error = match connect(&IpcEndpoint::Unix(alias.join("missing.sock"))).await {
+            Err(error) => error,
+            Ok(_) => panic!("symlinked socket parent connected"),
+        };
+        assert_eq!(symlink_error.kind(), io::ErrorKind::PermissionDenied);
+
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let broad_error = match connect(&IpcEndpoint::Unix(real.join("missing.sock"))).await {
+            Err(error) => error,
+            Ok(_) => panic!("world-writable socket parent connected"),
+        };
+        assert_eq!(broad_error.kind(), io::ErrorKind::PermissionDenied);
+    }
 
     #[test]
     fn pipe_name_is_deterministic_prefixed_and_short() {

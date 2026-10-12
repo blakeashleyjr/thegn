@@ -106,6 +106,60 @@ fn auto_chain_without_host_halts_instead_of_opening_a_host_shell() {
 }
 
 #[test]
+#[cfg(unix)]
+fn compose_policy_miss_halts_before_auto_chain_host_entry() {
+    let tmp = std::env::temp_dir().join(format!("tg-compose-halt-{}", std::process::id()));
+    let fake_bin = tmp.join("bin");
+    std::fs::create_dir_all(&fake_bin).unwrap();
+    let fake_smol = fake_bin.join("smolmachines");
+    std::fs::write(&fake_smol, "#!/bin/sh\nexit 0\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&fake_smol, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let state = tmp.join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    let path = format!("{}:/usr/bin:/bin", fake_bin.display());
+    let _env = crate::testenv::EnvVarGuard::set(&[
+        ("XDG_STATE_HOME", state.to_str().unwrap()),
+        ("PATH", &path),
+    ]);
+    let mut cfg = Config::default();
+    cfg.sandbox.backend = thegn_core::config::SandboxBackend::Auto;
+    cfg.sandbox.backend_chain = vec!["smol".into(), "none".into()];
+    cfg.sandbox.profile = thegn_core::config::SandboxProfile::Hardened;
+    cfg.sandbox.compose = Some(
+        thegn_core::sandbox_compose::ComposeSpec {
+            files: vec!["compose.yml".into()],
+            service: Some("worker".into()),
+            run_services: Vec::new(),
+        }
+        .encode(),
+    );
+    let loc = GitLoc::from_db("/wt/compose-halt", None);
+    let error = prepare_sandbox_env(
+        &cfg,
+        Path::new("/repo"),
+        "/wt/compose-halt",
+        &loc,
+        None,
+        false,
+        None,
+    )
+    .expect_err("refused Compose must not reach the local host entry");
+    let halt = error
+        .downcast_ref::<crate::agent::SandboxHalt>()
+        .expect("compose policy refusal must downcast to SandboxHalt");
+    assert!(
+        halt.reason.contains("Compose cannot enforce"),
+        "{}",
+        halt.reason
+    );
+    std::fs::remove_dir_all(&tmp).unwrap();
+}
+
+#[test]
 fn remote_native_resolution_never_uses_the_local_none_host_fallback() {
     with_temp_state("remote-none-resolution", || {
         let cfg: Config = toml::from_str(
