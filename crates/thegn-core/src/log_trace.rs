@@ -165,16 +165,21 @@ impl Role {
 /// land in the always-on in-memory ring that backs crash reports and the debug
 /// bundle — a ring that is supposed to cost nothing while idle.
 ///
-/// This is deliberately blunt: `tracing-log` gives every `log`-crate record the
-/// target `log`, so there is no way to silence tokei specifically without
-/// silencing other dependencies' records too. That is the right trade for a
-/// diagnostics buffer about *thegn* — third-party ERRORs still pass, and
-/// `THEGN_LOG` can put it back (`THEGN_LOG=log=warn`), since a user-supplied
-/// filter replaces this default outright rather than merging with it.
-const BRIDGED_LOG_DIRECTIVE: &str = "log=error";
+/// `tracing-log` preserves each record's original target (`tokei::…`, for
+/// example); it does not normalize bridged records to `log`. Tokei emits a
+/// warning for every unrecognized file extension during LOC scans, so those
+/// records must be filtered by their real target in both the configured sink
+/// and the always-on ring. Keep `log=error` for records explicitly targeted at
+/// `log`, and `tokei=error` for tokei's bridged records. `THEGN_LOG` replaces
+/// this baseline outright, allowing users to request those warnings.
+const BRIDGED_LOG_DIRECTIVE: &str = "log=error,tokei=error";
+
+fn bridged_filter(base: &str) -> EnvFilter {
+    EnvFilter::new(format!("{base},{BRIDGED_LOG_DIRECTIVE}"))
+}
 
 fn default_level_filter(level: LogLevel) -> EnvFilter {
-    EnvFilter::new(format!("{},{BRIDGED_LOG_DIRECTIVE}", level.as_str()))
+    bridged_filter(level.as_str())
 }
 
 fn level_filter(default: LogLevel) -> EnvFilter {
@@ -236,7 +241,7 @@ pub fn install(role: Role, cfg: &LogConfig) {
     // present every sub-WARN callsite still resolves to a cached "never" — the
     // same order of cost as having no subscriber at all, and zero I/O. The extra
     // per-event target match is paid only at WARN and above.
-    let ring = RingLayer.with_filter(EnvFilter::new(format!("warn,{BRIDGED_LOG_DIRECTIVE}")));
+    let ring = RingLayer.with_filter(bridged_filter("warn"));
 
     // At most one sink per process (see `Role`): a file for host/daemon/watch,
     // stderr for a CLI verb (and then only when the env asked for logs).
@@ -860,6 +865,7 @@ mod tests {
             let filter = level_filter(LogLevel::Info).to_string();
             assert!(filter.contains("info"), "{filter}");
             assert!(filter.contains(BRIDGED_LOG_DIRECTIVE), "{filter}");
+            assert!(filter.contains("tokei=error"), "{filter}");
             assert!(!env_level_is_set());
         }
         {
@@ -1242,15 +1248,33 @@ mod tests {
                 };
                 install(Role::Host, &cfg);
                 tracing::warn!(target: "log", "dependency before reload");
+                tracing::warn!(target: "tokei::language::language_type", "tokei before reload");
                 tracing::warn!(target: "thegn::install-test", "application before reload");
+                let tokei_ring_before = diagnostics::ring_snapshot()
+                    .iter()
+                    .any(|line| line.contains("tokei before reload"));
                 reload_level(LogLevel::Trace);
                 tracing::warn!(target: "log", "dependency after reload");
+                tracing::warn!(target: "tokei::language::language_type", "tokei after reload");
                 tracing::warn!(target: "thegn::install-test", "application after reload");
                 tracing::trace!(target: "thegn::install-test", "application trace after reload");
                 let log = std::fs::read_to_string(dir.join("thegn.log")).unwrap();
                 let explicit = case == "host-filter-override";
                 assert_eq!(log.contains("dependency before reload"), explicit);
                 assert_eq!(log.contains("dependency after reload"), explicit);
+                assert_eq!(log.contains("tokei before reload"), explicit);
+                assert_eq!(log.contains("tokei after reload"), explicit);
+                assert!(!tokei_ring_before);
+                assert!(
+                    !diagnostics::ring_snapshot()
+                        .iter()
+                        .any(|line| line.contains("tokei after reload"))
+                );
+                assert!(
+                    diagnostics::ring_snapshot()
+                        .iter()
+                        .any(|line| line.contains("application before reload"))
+                );
                 assert!(log.contains("application before reload"));
                 assert!(log.contains("application after reload"));
                 assert_eq!(log.contains("application trace after reload"), !explicit);
