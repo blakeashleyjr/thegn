@@ -55,12 +55,13 @@ struct WorktreeDiffMemoKey {
     path: Vec<u8>,
     old_id: String,
     file: FileStatSignature,
+    attributes: Vec<Option<FileStatSignature>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct WorktreeDiffEnvironment {
     attributes: Option<FileStatSignature>,
-    config: Option<FileStatSignature>,
+    config_and_attributes: Vec<(std::path::PathBuf, Option<FileStatSignature>)>,
 }
 
 #[derive(Default)]
@@ -69,9 +70,10 @@ struct WorktreeDiffMemo {
     environments: std::collections::HashMap<std::path::PathBuf, WorktreeDiffEnvironment>,
 }
 
-// Nested .gitattributes, .git/info/attributes, core.attributesFile, and global
-// or system git config are not included, so changing one can leave a cached
-// entry stale until the target file changes or the memo clears.
+// This signs repository and standard global/system config and attribute files,
+// plus nested .gitattributes per memo key. Included config files and unusual
+// Git config locations remain unsigned, so edits to those can leave an entry
+// stale until its worktree file changes or the memo clears.
 static WORKTREE_DIFF_MEMO: LazyLock<Mutex<WorktreeDiffMemo>> =
     LazyLock::new(|| Mutex::new(WorktreeDiffMemo::default()));
 
@@ -85,12 +87,31 @@ fn worktree_diff_memo_key(
         Err(_) => return None,
     };
     let file_path = workdir.join(rela);
+    let mut attributes = Vec::new();
+    let mut parent = std::path::Path::new(rela).parent();
+    while let Some(directory) = parent {
+        if directory.as_os_str().is_empty() {
+            break;
+        }
+        attributes.push(file_stat_signature(
+            &workdir.join(directory).join(".gitattributes"),
+        ));
+        parent = directory.parent();
+    }
     Some(WorktreeDiffMemoKey {
         workdir: workdir.to_owned(),
         path: path.to_vec(),
         old_id: old_id.to_string(),
         file: file_stat_signature(&file_path)?,
+        attributes,
     })
+}
+
+fn expanded_attributes_file(repo: &gix::Repository) -> Option<std::path::PathBuf> {
+    match repo.config_snapshot().trusted_path("core.attributesFile") {
+        Some(Ok(path)) => Some(path.into_owned()),
+        Some(Err(_)) | None => None,
+    }
 }
 
 fn worktree_diff_environment(
@@ -99,7 +120,35 @@ fn worktree_diff_environment(
 ) -> WorktreeDiffEnvironment {
     WorktreeDiffEnvironment {
         attributes: file_stat_signature(&workdir.join(".gitattributes")),
-        config: file_stat_signature(&repo.git_dir().join("config")),
+        config_and_attributes: {
+            let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+            let xdg = std::env::var_os("XDG_CONFIG_HOME")
+                .map(std::path::PathBuf::from)
+                .or_else(|| home.as_ref().map(|home| home.join(".config")));
+            let mut paths = vec![
+                repo.common_dir().join("config"),
+                repo.git_dir().join("config.worktree"),
+                repo.common_dir().join("info/attributes"),
+            ];
+            if let Some(path) = expanded_attributes_file(repo) {
+                paths.push(path);
+            }
+            if let Some(xdg) = xdg {
+                paths.push(xdg.join("git/config"));
+                paths.push(xdg.join("git/attributes"));
+            }
+            if let Some(home) = home {
+                paths.push(home.join(".gitconfig"));
+            }
+            paths.push(std::path::PathBuf::from("/etc/gitconfig"));
+            paths
+                .into_iter()
+                .map(|path| {
+                    let signature = file_stat_signature(&path);
+                    (path, signature)
+                })
+                .collect()
+        },
     }
 }
 
@@ -696,6 +745,22 @@ mod tests {
             .unwrap();
     }
 
+    #[test]
+    fn core_attributes_file_uses_gix_path_interpolation() {
+        let repo = TestRepo::new("memo-attributes-path-interpolation");
+        let configured = "%(prefix)/etc/gitattributes";
+        repo.out(&["config", "core.attributesFile", configured]);
+        let gr = gix::discover(&repo.dir).unwrap();
+
+        let expected = match gr.config_snapshot().trusted_path("core.attributesFile") {
+            Some(Ok(path)) => Some(path.into_owned()),
+            Some(Err(_)) | None => None,
+        };
+        assert!(expected.is_some(), "gix should resolve %(prefix) here");
+        assert_eq!(expanded_attributes_file(&gr), expected);
+        assert_ne!(expected, Some(std::path::PathBuf::from(configured)));
+    }
+
     fn clean_runs(repo: &TestRepo) -> usize {
         std::fs::read_to_string(repo.dir.join("clean-ran"))
             .unwrap()
@@ -750,6 +815,110 @@ mod tests {
         let native = totals(&repo.dir, "HEAD").unwrap();
         assert_eq!(native, cli_totals_with_nonrequired_filter(&repo, "HEAD"));
         assert_eq!(clean_runs(&repo), 8);
+    }
+
+    #[test]
+    fn info_attributes_change_invalidates_a_backdated_entry() {
+        let repo = filtered_dirty_repo("memo-info-attributes");
+        backdate(&repo.dir.join("tracked.txt"), 10);
+        for _ in 0..2 {
+            assert!(
+                diff_entries(&repo.dir, "HEAD")
+                    .unwrap()
+                    .iter()
+                    .any(|entry| { entry.path == "tracked.txt" && !entry.binary })
+            );
+        }
+
+        let info = repo.dir.join(".git/info");
+        std::fs::create_dir_all(&info).unwrap();
+        std::fs::write(info.join("attributes"), "tracked.txt -diff\n").unwrap();
+        let changed = diff_entries(&repo.dir, "HEAD").unwrap();
+        assert!(
+            changed
+                .iter()
+                .any(|entry| { entry.path == "tracked.txt" && entry.binary }),
+            "info/attributes edit must invalidate the cached text row: {changed:?}"
+        );
+    }
+
+    #[test]
+    fn nested_attributes_change_invalidates_a_backdated_entry() {
+        let repo = TestRepo::new("memo-nested-attributes");
+        commit_nested(&repo, "sub/tracked.txt", "one\ntwo\n", "seed");
+        repo.out(&["config", "filter.tgtest.clean", "cat"]);
+        repo.out(&["config", "filter.tgtest.smudge", "cat"]);
+        repo.out(&["config", "filter.tgtest.required", "true"]);
+        std::fs::write(repo.dir.join(".gitattributes"), "*.txt filter=tgtest\n").unwrap();
+        std::fs::write(repo.dir.join("sub/tracked.txt"), "one\ntwo\nthree\n").unwrap();
+        backdate(&repo.dir.join("sub/tracked.txt"), 10);
+        for _ in 0..2 {
+            assert!(
+                diff_entries(&repo.dir, "HEAD")
+                    .unwrap()
+                    .iter()
+                    .any(|entry| { entry.path == "sub/tracked.txt" && !entry.binary })
+            );
+        }
+
+        std::fs::write(repo.dir.join("sub/.gitattributes"), "tracked.txt -diff\n").unwrap();
+        let changed = diff_entries(&repo.dir, "HEAD").unwrap();
+        assert!(
+            changed
+                .iter()
+                .any(|entry| { entry.path == "sub/tracked.txt" && entry.binary }),
+            "nested .gitattributes edit must invalidate the cached text row: {changed:?}"
+        );
+    }
+
+    #[test]
+    fn linked_worktree_common_config_change_invalidates_the_memo() {
+        let repo = TestRepo::new("memo-linked-config");
+        repo.commit_file(
+            ".gitattributes",
+            "tracked.txt filter=tgtest\n",
+            "attributes",
+        );
+        repo.commit_file("tracked.txt", "one\ntwo\n", "seed");
+        let first_marker = repo.dir.join("clean-first");
+        let second_marker = repo.dir.join("clean-second");
+        repo.out(&[
+            "config",
+            "filter.tgtest.clean",
+            &format!("tee -a {}", first_marker.display()),
+        ]);
+        repo.out(&["config", "filter.tgtest.smudge", "cat"]);
+        repo.out(&["config", "filter.tgtest.required", "true"]);
+        let linked_parent = tempfile::tempdir().unwrap();
+        let linked = linked_parent.path().join("wt");
+        repo.out(&["worktree", "add", linked.to_str().unwrap(), "-b", "linked"]);
+        std::fs::write(linked.join("tracked.txt"), "one\ntwo\nthree\n").unwrap();
+        backdate(&linked.join("tracked.txt"), 10);
+        for _ in 0..2 {
+            assert!(
+                diff_entries(&linked, "HEAD")
+                    .unwrap()
+                    .iter()
+                    .any(|entry| { entry.path == "tracked.txt" })
+            );
+        }
+        assert!(first_marker.is_file(), "initial clean filter should run");
+
+        repo.out(&[
+            "config",
+            "filter.tgtest.clean",
+            &format!("tee -a {}", second_marker.display()),
+        ]);
+        assert!(
+            diff_entries(&linked, "HEAD")
+                .unwrap()
+                .iter()
+                .any(|entry| { entry.path == "tracked.txt" })
+        );
+        assert!(
+            std::fs::metadata(&second_marker).is_ok_and(|metadata| metadata.len() > 0),
+            "common config edit must invalidate linked-worktree memo and run the new filter"
+        );
     }
 
     /// Our own child processes as `(state, comm)` — naming them, because
