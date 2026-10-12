@@ -466,8 +466,6 @@ impl GhCircuit {
         if let Ok(mut g) = self.open_error.lock() {
             *g = None;
         }
-        // A GitHub round trip succeeded — the app is online.
-        thegn_core::connectivity::report_success();
     }
 
     fn record_failure(&self) {
@@ -495,7 +493,6 @@ impl GhCircuit {
         self.failures
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.open_for(delay, error);
-        thegn_core::connectivity::report_success();
     }
 
     fn record_http_failure(&self, error: ForgeError) {
@@ -506,8 +503,6 @@ impl GhCircuit {
         if failures >= CIRCUIT_OPEN_AFTER {
             self.open_for(std::time::Duration::from_secs(CIRCUIT_OPEN_SECS), error);
         }
-        // An HTTP error is still evidence that GitHub is reachable.
-        thegn_core::connectivity::report_success();
     }
 }
 
@@ -718,6 +713,9 @@ async fn graphql_request(
             return Err(classified);
         }
     };
+    // Receiving any HTTP response proves the host is reachable, even when
+    // its status indicates an API, auth, or rate-limit error.
+    thegn_core::connectivity::report_success();
     let code = envelope.status.as_u16();
     if !envelope.status.is_success() {
         let body_message = serde_json::from_slice::<Value>(&envelope.body)
