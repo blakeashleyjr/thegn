@@ -54,6 +54,9 @@ use thegn_core::store::{
     AccountStore, CacheStore, NotificationStore, PoolStore, WorkspaceStore, WorktreeAuxStore,
 };
 
+#[path = "run_test_cache.rs"]
+mod run_test_cache;
+
 /// Bounded PTY event queue depth. Reader threads use `blocking_send`, so this
 /// is the backpressure valve for chatty panes: large enough for bursts, small
 /// enough that a frozen compositor cannot buffer unbounded output.
@@ -2950,15 +2953,81 @@ enum GitDoc {
     Stage(gitui::StageDocState),
     CommitFiles(Vec<(String, u32, u32)>),
     Patch(gitui::StageDocState),
-    /// A paused rebase's live state (`None` when the pause vanished before
-    /// the read landed).
-    Rebase(Option<thegn_svc::git::RebaseStatus>),
+    /// A paused rebase's live state, preserving read errors; `Ok(None)` means
+    /// the pause vanished before the read landed.
+    Rebase(std::result::Result<Option<thegn_svc::git::RebaseStatus>, String>),
     /// `git blame --porcelain` output parsed into per-line rows.
     Blame(Vec<crate::panel::BlameRow>),
     /// The selected stash's patch (`stash show -p -u`), keyed by index.
     StashDiff(usize, String),
     /// The selected branch's log, keyed by branch name.
     BranchLog(String, Vec<crate::panel::CommitRow>),
+}
+
+fn apply_rebase_doc(
+    flow: &mut GitFlow,
+    doc: std::result::Result<Option<thegn_svc::git::RebaseStatus>, String>,
+) -> Option<String> {
+    let GitFlow::Rebase(rebase) = flow else {
+        return None;
+    };
+    match doc {
+        Err(error) => {
+            rebase.todos_synced = false;
+            Some(error)
+        }
+        Ok(Some(status)) if rebase.running => {
+            rebase.todos = status.remaining.clone();
+            rebase.baseline = status.remaining;
+            rebase.todos_synced = true;
+            rebase.done = status.done.len();
+            rebase.stopped_sha = status.stopped_sha;
+            rebase.conflict = status.paused == thegn_svc::git::PauseReason::Conflict;
+            rebase.cursor = rebase.cursor.min(rebase.todos.len().saturating_sub(1));
+            None
+        }
+        // The pause vanished before the read landed (for example, a fast
+        // --continue elsewhere); hydration's banner sync clears the flow.
+        Ok(_) => None,
+    }
+}
+
+fn spawn_env_remove_with(
+    name: String,
+    refresh_tx: tokio_mpsc::UnboundedSender<RefreshKind>,
+    wake: impl FnOnce() + Send + 'static,
+    remove: impl FnOnce(&str) -> String + Send + 'static,
+) {
+    tokio::task::spawn_blocking(move || {
+        let message = remove(&name);
+        let priority = if message.starts_with("remove failed") {
+            thegn_core::notification::Priority::Alert
+        } else {
+            thegn_core::notification::Priority::Info
+        };
+        if let Err(error) = refresh_tx.send(RefreshKind::Toast { message, priority }) {
+            tracing::debug!(target: "thegn::env", %error, "env removal toast receiver is gone");
+        }
+        wake();
+    });
+}
+
+fn load_loop_startup_prefs(
+    db: Option<&thegn_core::db::Db>,
+    cfg: &thegn_core::config::Config,
+) -> (
+    thegn_core::registers::Registers,
+    crate::monitor::MonitorPrefs,
+) {
+    let registers = db
+        .and_then(|db| db.all_registers().ok())
+        .map(thegn_core::registers::Registers::from_pairs)
+        .unwrap_or_default();
+    let monitor = match db {
+        Some(db) => crate::monitor::state::load(db, &cfg.monitor),
+        None => crate::monitor::MonitorPrefs::from_config(&cfg.monitor),
+    };
+    (registers, monitor)
 }
 
 /// Fetch the selected stash's patch off the loop (the stash main region).
@@ -3071,7 +3140,9 @@ fn spawn_rebase_status_fetch(
     tokio::task::spawn_blocking(move || {
         use thegn_svc::git::RebaseOps;
         let loc = thegn_core::remote::GitLoc::for_worktree(&wt);
-        let status = thegn_svc::git::CliGit.rebase_status(&loc).ok().flatten();
+        let status = thegn_svc::git::CliGit
+            .rebase_status(&loc)
+            .map_err(|error| error.to_string());
         if tx.send((generation, GitDoc::Rebase(status))).is_ok() {
             let _ = wk.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
@@ -5227,14 +5298,16 @@ fn sync_tests_for_worktree(
     worktree: &std::path::Path,
     cfg: &thegn_core::config::Config,
     detect: bool,
+    cache_load: &mut run_test_cache::TestCacheLoad,
 ) {
     let key = worktree.to_string_lossy();
-    if let Some(cache) = thegn_core::db::Db::open()
-        .ok()
-        .and_then(|db| db.get_test_cache(&key).ok().flatten())
-        .and_then(|(json, _)| serde_json::from_str::<crate::panel::TestCache>(&json).ok())
-    {
-        ui.tests.apply_cache(cache);
+    if cache_load.begin_sync(&key) {
+        if let Ok(db) = thegn_core::db::Db::open() {
+            if let Some(cache) = run_test_cache::load_test_cache(&db, &key) {
+                ui.tests.apply_cache(cache);
+            }
+            cache_load.finish_sync(&key);
+        }
     }
     if detect && ui.tests.task.is_none() {
         ui.tests.task = crate::task::detect_test_task(worktree, cfg);
@@ -5504,7 +5577,6 @@ fn maybe_discover_tests(
     sem: std::sync::Arc<tokio::sync::Semaphore>,
 ) {
     let wt = active_tab_path(session);
-    sync_tests_for_worktree(ui, &wt, cfg, true); // entering Tests → detect now
     // Skip discovery when a prior run/discovery already covered this manifest
     // state: a fresh fingerprint match means nothing relevant changed, so reuse
     // the cache and spawn no subprocess at all.
@@ -6701,6 +6773,8 @@ async fn event_loop<T: Terminal>(
         tokio_mpsc::unbounded_channel::<crate::task::TaskOutcome>();
     let (test_discovery_tx, mut test_discovery_rx) =
         tokio_mpsc::unbounded_channel::<crate::task::DiscoveryOutcome>();
+    let (test_cache_tx, mut test_cache_rx) =
+        tokio_mpsc::unbounded_channel::<(String, u64, Option<crate::panel::TestCache>)>();
     // Test-explorer open-by-name results (Tests `o`/`b`): locating a test with
     // ripgrep/grep runs off the loop and completes over this channel.
     let (test_open_tx, mut test_open_rx) = tokio_mpsc::unbounded_channel::<TestOpenOutcome>();
@@ -6716,6 +6790,7 @@ async fn event_loop<T: Terminal>(
     // Stop ('s') silently no-ops.
     let mut named_task_generation: u64 = 0;
     let mut loaded_tests_worktree = String::new();
+    let mut test_cache_load = run_test_cache::TestCacheLoad::default();
     // Bounds concurrent test/discovery jobs across worktrees so explicit runs
     // can't collectively pin the machine. thegn never auto-runs tests.
     let test_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(
@@ -6735,7 +6810,8 @@ async fn event_loop<T: Terminal>(
     // The drag-set Normal width, restored below; takes precedence over the
     // `[panel] width` config value.
     let mut panel_cols_pref: Option<usize> = None;
-    if let Ok(db) = thegn_core::db::Db::open() {
+    let startup_db = thegn_core::db::Db::open().ok();
+    if let Some(db) = startup_db.as_ref() {
         sb.load(&db, SIDEBAR_SCOPE);
         // The persisted sidebar mode (full/rail/hidden) survives restart.
         want_sidebar = sb.mode != crate::layout::SidebarMode::Hidden;
@@ -6833,7 +6909,7 @@ async fn event_loop<T: Terminal>(
     // Resurrect shares that were live last session (best-effort; a disabled
     // config or a missing `bore` just leaves the row to be cleaned on next event).
     if keymap.config().share.is_enabled()
-        && let Ok(db) = thegn_core::db::Db::open()
+        && let Some(db) = startup_db.as_ref()
     {
         for row in db.list_shares().unwrap_or_default() {
             if row.state == "up" {
@@ -6882,11 +6958,13 @@ async fn event_loop<T: Terminal>(
     if keymap.config().forward.auto {
         // Forwards aren't resurrected blindly (the dev server may be gone): wipe
         // stale rows and let the detector re-discover live ports.
-        if let Ok(db) = thegn_core::db::Db::open() {
+        crate::db_task::persist(|db| {
             for row in db.list_forwards().unwrap_or_default() {
-                let _ = db.delete_forward(&row.worktree, row.container_port); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+                if let Err(error) = db.delete_forward(&row.worktree, row.container_port) {
+                    tracing::debug!(target: "thegn::db", %error, "stale forward cache delete failed");
+                }
             }
-        }
+        });
         crate::forward::spawn_detector(
             forward_target.clone(),
             std::time::Duration::from_secs(keymap.config().forward.poll_secs.max(1)),
@@ -7279,11 +7357,8 @@ async fn event_loop<T: Terminal>(
     // Persisted vim-style registers (`"a`–`"z`/`"0`–`"9`, `"` default, `"+`
     // clipboard). Loaded from the DB; a yank persists back. `PasteRegister` arms
     // `pending_paste_register` so the next key names the register to paste.
-    let mut registers = thegn_core::db::Db::open()
-        .ok()
-        .and_then(|db| db.all_registers().ok())
-        .map(thegn_core::registers::Registers::from_pairs)
-        .unwrap_or_default();
+    let (mut registers, mut monitor_prefs) =
+        load_loop_startup_prefs(startup_db.as_ref(), keymap.config());
     let mut pending_paste_register = false;
     let (tx, mut rx) = tokio_mpsc::channel::<PaneEvent>(PANE_EVENT_CHANNEL_CAPACITY);
     let mut panes = Panes::with_waker(tx, waker.clone());
@@ -7423,13 +7498,6 @@ async fn event_loop<T: Terminal>(
     let (plugin_tx, mut plugin_rx) = tokio_mpsc::unbounded_channel::<crate::plugins::PluginMsg>();
     let mut plugins_state = crate::handlers::plugins::PluginsState::new(current_config.clone());
     let mut plugins_host: Option<crate::plugins::PluginsHost> = None;
-    // Monitor preferences: `[monitor]` defaults with the user's saved per-tab
-    // toggles layered on top. Best-effort — a DB that won't open just means the
-    // config defaults stand.
-    monitor_prefs = match thegn_core::db::Db::open() {
-        Ok(db) => crate::monitor::state::load(&db, &current_config.monitor),
-        Err(_) => crate::monitor::MonitorPrefs::from_config(&current_config.monitor),
-    };
     // The embedded help registry (authored pages + the generated keybindings
     // and config-reference pages); rebuilt on config reload so rebinds show.
     let mut help_registry =
@@ -8296,7 +8364,7 @@ async fn event_loop<T: Terminal>(
                 .into_iter()
                 .cloned()
                 .collect();
-        if let Ok(db) = thegn_core::db::Db::open()
+        if let Some(db) = startup_db.as_ref()
             && let Ok(Some(json)) = db.pin_state(&session.id)
         {
             for pp in crate::pins::PinSupervisor::parse_persisted(&json, &current_config) {
@@ -8462,6 +8530,7 @@ async fn event_loop<T: Terminal>(
     let mut reminder_cursor =
         crate::hydrate_calendar::ReminderCursor::new(chrono::Utc::now().timestamp_millis());
 
+    drop(startup_db);
     loop_perf.take(); // loop metrics start here; startup has its own waterfall
     let mut active_clock = crate::perf_timing::ActiveClock::default();
     loop {
@@ -8712,8 +8781,20 @@ async fn event_loop<T: Terminal>(
             // Load this worktree's cached test state (most-recent status) so the
             // Tests tab shows it instantly; discovery stays lazy (on tab open).
             panel_ui.tests = crate::panel::TestPanelState::default();
-            sync_tests_for_worktree(&mut panel_ui, &current_worktree, keymap.config(), false); // D2: no scan on switch
             loaded_tests_worktree = current_worktree.to_string_lossy().into_owned();
+            let cache_seq = test_cache_load.begin_switch(&loaded_tests_worktree);
+            let cache_worktree = loaded_tests_worktree.clone();
+            let cache_tx = test_cache_tx.clone();
+            let cache_waker = waker.clone();
+            crate::db_task::persist(move |db| {
+                let cache = run_test_cache::load_test_cache(db, &cache_worktree);
+                if let Err(error) = cache_tx.send((cache_worktree, cache_seq, cache)) {
+                    tracing::debug!(target: "thegn::db", %error, "test cache load receiver is gone");
+                }
+                if let Err(error) = cache_waker.wake() {
+                    tracing::debug!(target: "thegn::db", %error, "test cache load wake failed");
+                }
+            });
             // Immediate hydrate for the newly-focused worktree. Paint this
             // worktree's last-known slice (panel + tab-bar chips + timeline)
             // from the cache (seeded by prior visits and neighbor prefetch) so
@@ -9511,6 +9592,13 @@ async fn event_loop<T: Terminal>(
                 dirty = true;
             }
         }
+        while let Ok((worktree, seq, cache)) = test_cache_rx.try_recv() {
+            loop_perf.tick(crate::perf::WakeSource::Other);
+            if test_cache_load.accept(&worktree, seq, &loaded_tests_worktree, &mut panel_ui, cache)
+            {
+                dirty = true;
+            }
+        }
         // Background test-locate results (Tests `o`/`b`): complete the open
         // action unless the worktree/generation moved on during the search.
         while let Ok(o) = test_open_rx.try_recv() {
@@ -10132,22 +10220,8 @@ async fn event_loop<T: Terminal>(
                 }
                 GitDoc::Rebase(status) => {
                     rebase_sync_inflight = false;
-                    if let GitFlow::Rebase(r) = &mut panel_ui.git.flow {
-                        match status {
-                            Some(st) if r.running => {
-                                r.todos = st.remaining.clone();
-                                r.baseline = st.remaining;
-                                r.todos_synced = true;
-                                r.done = st.done.len();
-                                r.stopped_sha = st.stopped_sha;
-                                r.conflict = st.paused == thegn_svc::git::PauseReason::Conflict;
-                                r.cursor = r.cursor.min(r.todos.len().saturating_sub(1));
-                            }
-                            // The pause vanished before the read landed (a
-                            // fast --continue elsewhere); hydration's banner
-                            // sync clears the flow — just drop the read.
-                            _ => {}
-                        }
+                    if let Some(error) = apply_rebase_doc(&mut panel_ui.git.flow, status) {
+                        model.status = format!("Rebase status unavailable: {error}");
                     }
                 }
                 GitDoc::Blame(rows) => {
@@ -11653,9 +11727,15 @@ async fn event_loop<T: Terminal>(
                                                 keymap.config(),
                                                 &preset,
                                             )
-                                        && let Ok(db) = thegn_core::db::Db::open()
                                     {
-                                        let _ = db.set_worktree_agent(&payload.path, &agent); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+                                        let worktree = payload.path.clone();
+                                        crate::db_task::persist(move |db| {
+                                            if let Err(error) =
+                                                db.set_worktree_agent(&worktree, &agent)
+                                            {
+                                                tracing::debug!(target: "thegn::db", %error, "worktree agent cache persist failed");
+                                            }
+                                        });
                                     }
                                     (preset.layout.clone(), preset.commands.clone())
                                 }
@@ -15484,6 +15564,14 @@ async fn event_loop<T: Terminal>(
                                     },
                                 );
                                 if s == crate::panel::Section::Tests {
+                                    let wt = active_tab_path(&session);
+                                    sync_tests_for_worktree(
+                                        &mut panel_ui,
+                                        &wt,
+                                        keymap.config(),
+                                        true,
+                                        &mut test_cache_load,
+                                    );
                                     maybe_discover_tests(
                                         &mut panel_ui,
                                         &session,
@@ -16858,14 +16946,40 @@ async fn event_loop<T: Terminal>(
                                         } else if let Some(spec) =
                                             active_tab_layout_spec(&session, &panes)
                                         {
-                                            match (spec.to_json(), thegn_core::db::Db::open()) {
-                                                (Ok(json), Ok(db)) => {
-                                                    let _ = db.put_layout(&name, &json); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+                                            match spec.to_json() {
+                                                Ok(json) => {
+                                                    let saved_name = name.clone();
+                                                    let toast_tx = refresh_tx.clone();
+                                                    let save_waker = waker.clone();
+                                                    crate::db_task::persist(move |db| {
+                                                        let toast = match db
+                                                            .put_layout(&saved_name, &json)
+                                                        {
+                                                            Ok(()) => RefreshKind::Toast {
+                                                                message: format!("Saved layout \"{saved_name}\""),
+                                                                priority: thegn_core::notification::Priority::Info,
+                                                            },
+                                                            Err(error) => {
+                                                                tracing::debug!(target: "thegn::db", %error, "layout persist failed");
+                                                                RefreshKind::Toast {
+                                                                    message: format!("Save layout failed: {error}"),
+                                                                    priority: thegn_core::notification::Priority::Alert,
+                                                                }
+                                                            }
+                                                        };
+                                                        if let Err(error) = toast_tx.send(toast) {
+                                                            tracing::debug!(target: "thegn::db", %error, "layout result toast receiver is gone");
+                                                        }
+                                                        if let Err(error) = save_waker.wake() {
+                                                            tracing::debug!(target: "thegn::db", %error, "layout result toast wake failed");
+                                                        }
+                                                    });
                                                     model.status =
-                                                        format!("Saved layout \"{name}\"");
+                                                        format!("Saving layout \"{name}\"…");
                                                 }
-                                                _ => {
-                                                    model.status = "Save layout failed".into();
+                                                Err(error) => {
+                                                    model.status =
+                                                        format!("Save layout failed: {error}");
                                                 }
                                             }
                                         }
@@ -17244,8 +17358,27 @@ async fn event_loop<T: Terminal>(
                                 arg,
                             } = &choice
                             {
-                                model.status =
-                                    crate::env_ui::remove_env_confirmed(arg, &refresh_tx);
+                                let name = arg.clone();
+                                let remove_refresh_tx = refresh_tx.clone();
+                                model.status = format!("Removing env '{name}'…");
+                                spawn_env_remove_with(
+                                    name,
+                                    refresh_tx.clone(),
+                                    {
+                                        let remove_waker = waker.clone();
+                                        move || {
+                                            if let Err(error) = remove_waker.wake() {
+                                                tracing::debug!(target: "thegn::env", %error, "env removal wake failed");
+                                            }
+                                        }
+                                    },
+                                    move |name| {
+                                        crate::env_ui::remove_env_confirmed(
+                                            name,
+                                            &remove_refresh_tx,
+                                        )
+                                    },
+                                );
                                 dirty = true;
                                 continue;
                             }
@@ -19108,6 +19241,14 @@ async fn event_loop<T: Terminal>(
                             // Opening tests kicks the lazy (capped) discovery,
                             // exactly as entering the old Tests tab did.
                             if s == Section::Tests {
+                                let wt = active_tab_path(&session);
+                                sync_tests_for_worktree(
+                                    &mut panel_ui,
+                                    &wt,
+                                    keymap.config(),
+                                    true,
+                                    &mut test_cache_load,
+                                );
                                 maybe_discover_tests(
                                     &mut panel_ui,
                                     &session,
@@ -19823,7 +19964,13 @@ async fn event_loop<T: Terminal>(
                                 _ => TestRun::Failed,
                             };
                             let wt = active_tab_path(&session);
-                            sync_tests_for_worktree(&mut panel_ui, &wt, keymap.config(), true);
+                            sync_tests_for_worktree(
+                                &mut panel_ui,
+                                &wt,
+                                keymap.config(),
+                                true,
+                                &mut test_cache_load,
+                            );
                             if let Some(base) = panel_ui.tests.task.clone() {
                                 if !panel_ui.tests.running {
                                     let task_spec = test_task_for_run(&panel_ui.tests, kind, base);
@@ -19849,7 +19996,13 @@ async fn event_loop<T: Terminal>(
                         }
                         (Section::Tests, KeyCode::Char('u')) => {
                             let wt = active_tab_path(&session);
-                            sync_tests_for_worktree(&mut panel_ui, &wt, keymap.config(), true);
+                            sync_tests_for_worktree(
+                                &mut panel_ui,
+                                &wt,
+                                keymap.config(),
+                                true,
+                                &mut test_cache_load,
+                            );
                             if let Some(task) = panel_ui.tests.task.clone() {
                                 test_generation += 1;
                                 panel_ui.tests.discovering = true;
@@ -20322,14 +20475,17 @@ async fn event_loop<T: Terminal>(
                             match target {
                                 Some((wt, port)) => {
                                     let stopped = share_supervisor.stop(&wt, Some(port));
-                                    if let Ok(db) = thegn_core::db::Db::open() {
-                                        use thegn_core::store::WorktreeAuxStore as _;
-                                        for p in &stopped {
-                                            let _ = db.delete_share(&wt, *p); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+                                    let did_stop = !stopped.is_empty();
+                                    let stopped_ports = stopped;
+                                    crate::db_task::persist(move |db| {
+                                        for port in stopped_ports {
+                                            if let Err(error) = db.delete_share(&wt, port) {
+                                                tracing::debug!(target: "thegn::db", %error, "stopped share cache delete failed");
+                                            }
                                         }
-                                    }
+                                    });
                                     model.shares = current_share_views(&share_supervisor, &session);
-                                    model.status = if stopped.is_empty() {
+                                    model.status = if !did_stop {
                                         format!("Share :{port} was already down")
                                     } else {
                                         format!("Stopped share :{port}")
