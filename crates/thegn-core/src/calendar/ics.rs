@@ -786,6 +786,7 @@ struct RawObservance {
     offset_to: Option<String>,
     rrule: Option<String>,
     has_rdate: bool,
+    duplicate: bool,
 }
 
 /// Bind at most 64 VTIMEZONE definitions. Definitions beyond the cap, names
@@ -843,6 +844,12 @@ fn prescan_timezones(
             "END" => {
                 let ending_timezone = line.value.eq_ignore_ascii_case("VTIMEZONE");
                 if ending_timezone {
+                    if observance.take().is_some()
+                        && let Some((_, _, _, invalid)) = definition.as_mut()
+                    {
+                        *invalid = true;
+                    }
+                    observance_depth = None;
                     if let (Some((tzid, location, rules, invalid)), Some(_)) =
                         (definition.take(), timezone_depth)
                     {
@@ -874,13 +881,15 @@ fn prescan_timezones(
                     {
                         match (raw.dtstart, raw.offset_from, raw.offset_to) {
                             (Some(start), Some(from), Some(to)) => {
-                                if let Some(rule) = VtzRules::observance(
-                                    &start,
-                                    &from,
-                                    &to,
-                                    raw.rrule.as_deref(),
-                                    raw.has_rdate,
-                                ) {
+                                if !raw.duplicate
+                                    && let Some(rule) = VtzRules::observance(
+                                        &start,
+                                        &from,
+                                        &to,
+                                        raw.rrule.as_deref(),
+                                        raw.has_rdate,
+                                    )
+                                {
                                     if rules.len() < 8 {
                                         rules.push(rule);
                                     } else {
@@ -920,11 +929,15 @@ fn prescan_timezones(
                 {
                     match line.name.as_str() {
                         "DTSTART" if raw.dtstart.is_none() => raw.dtstart = Some(line.value),
+                        "DTSTART" => raw.duplicate = true,
                         "TZOFFSETFROM" if raw.offset_from.is_none() => {
                             raw.offset_from = Some(line.value)
                         }
+                        "TZOFFSETFROM" => raw.duplicate = true,
                         "TZOFFSETTO" if raw.offset_to.is_none() => raw.offset_to = Some(line.value),
+                        "TZOFFSETTO" => raw.duplicate = true,
                         "RRULE" if raw.rrule.is_none() => raw.rrule = Some(line.value),
+                        "RRULE" => raw.duplicate = true,
                         "RDATE" => raw.has_rdate = true,
                         _ => {}
                     }

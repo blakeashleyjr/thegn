@@ -545,10 +545,11 @@ impl VtzRules {
             }
         }
         for onset in self.onsets_for_year(year)? {
-            let instant =
-                (onset.local - chrono::Duration::seconds(i64::from(onset.offset_from))).and_utc();
-            instants.push(instant - chrono::Duration::seconds(1));
-            instants.push(instant);
+            let instant = onset.instant();
+            if instant.year() == year {
+                instants.push(instant - chrono::Duration::seconds(1));
+                instants.push(instant);
+            }
         }
         instants.sort();
         instants.dedup();
