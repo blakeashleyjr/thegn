@@ -32,7 +32,7 @@ use thegn_core::issue::AgentDispatch;
 use thegn_core::outln;
 use thegn_core::pipeline_approval::{ApprovalState, state_for};
 use thegn_core::pipeline_run::{self, RowLiveness};
-use thegn_core::pipeline_supervise::{self, LaneFacts, SuperviseAction};
+use thegn_core::pipeline_supervise::{self, LaneFacts, SuperviseAction, ValidationRecord};
 use thegn_core::store::{NotificationStore as _, WorktreeAuxStore as _};
 use thegn_core::util::{git_ok, git_out};
 
@@ -283,16 +283,20 @@ fn plan(cfg: &Config, issue: Option<&str>, all: bool, json: bool) -> Result<()> 
         return Ok(());
     }
     for (lane, action) in lanes.iter().zip(&actions) {
-        outln!(
-            "row {:<5} {:<16} {:<12} {:<9} {}",
-            lane.row.id,
-            lane.row.issue_id,
-            lane.facts.stage,
-            action.token(),
-            describe(lane, action)
-        );
+        outln!("{}", plan_line(lane, action));
     }
     Ok(())
+}
+
+fn plan_line(lane: &Lane, action: &SuperviseAction) -> String {
+    format!(
+        "row {:<5} {:<16} {:<12} {:<9} {}",
+        lane.row.id,
+        thegn_core::pipeline_report::display_cell(&lane.row.issue_id),
+        thegn_core::pipeline_report::display_cell(&lane.facts.stage),
+        action.token(),
+        describe(lane, action)
+    )
 }
 
 /// The human-readable tail of a plan line: what the action would do, and what
@@ -433,14 +437,18 @@ fn section(title: &str, rows: &[(&Lane, &SuperviseAction)]) {
     outln!("");
     outln!("{title}");
     for (lane, action) in rows {
-        outln!(
-            "  row {:<5} {:<16} {:<12} {}",
-            lane.row.id,
-            lane.row.issue_id,
-            lane.facts.stage,
-            describe(lane, action)
-        );
+        outln!("{}", section_line(lane, action));
     }
+}
+
+fn section_line(lane: &Lane, action: &SuperviseAction) -> String {
+    format!(
+        "  row {:<5} {:<16} {:<12} {}",
+        lane.row.id,
+        thegn_core::pipeline_report::display_cell(&lane.row.issue_id),
+        thegn_core::pipeline_report::display_cell(&lane.facts.stage),
+        describe(lane, action)
+    )
 }
 
 // --- validations ------------------------------------------------------------
@@ -480,16 +488,9 @@ fn validations(row: Option<i64>, want_digest: bool, json: bool) -> Result<()> {
                     "digest": digest,
                 }));
             } else {
-                outln!(
-                    "row {:<5} {:<12} {:<18} @ {}  (attempt {})",
-                    id,
-                    v.task,
-                    v.class.as_str(),
-                    short(&v.commit_sha),
-                    v.attempts
-                );
+                outln!("{}", validation_line(id, &v));
                 if want_digest && !digest.is_empty() {
-                    for line in digest.lines() {
+                    for line in validation_digest_lines(&digest) {
                         outln!("      {line}");
                     }
                 }
@@ -503,6 +504,26 @@ fn validations(row: Option<i64>, want_digest: bool, json: bool) -> Result<()> {
         outln!("no validation runs recorded.");
     }
     Ok(())
+}
+
+fn validation_line(id: i64, validation: &ValidationRecord) -> String {
+    format!(
+        "row {:<5} {:<12} {:<18} @ {}  (attempt {})",
+        id,
+        thegn_core::pipeline_report::display_cell(&validation.task),
+        validation.class.as_str(),
+        short(&thegn_core::pipeline_report::display_cell(
+            &validation.commit_sha,
+        )),
+        validation.attempts
+    )
+}
+
+fn validation_digest_lines(digest: &str) -> Vec<String> {
+    digest
+        .lines()
+        .map(thegn_core::pipeline_report::display_cell)
+        .collect()
 }
 
 /// Abbreviate a commit for display. Never used for comparison — matching is
@@ -558,6 +579,42 @@ mod tests {
             row,
             facts,
             approval: ApprovalState::Absent,
+        }
+    }
+
+    #[test]
+    fn human_plan_and_section_lines_replace_hostile_identity_cells() {
+        let mut lane = lane("code");
+        lane.row.issue_id = "linear:X\x1b]52;c;ZXZpbA==\x07".into();
+        lane.facts.issue_id = lane.row.issue_id.clone();
+        lane.facts.stage = "code\u{202e}".into();
+        let action = SuperviseAction::Hold {
+            row: lane.row.id,
+            why: "waiting",
+        };
+
+        for line in [plan_line(&lane, &action), section_line(&lane, &action)] {
+            assert!(!line.contains('\x1b'), "{line:?}");
+            assert!(!line.contains('\x07'), "{line:?}");
+            assert!(!line.contains('\u{202e}'), "{line:?}");
+            assert!(line.contains('\u{fffd}'), "{line:?}");
+        }
+    }
+
+    #[test]
+    fn validation_human_lines_replace_hostile_fields_and_digest_text() {
+        let validation = ValidationRecord {
+            task: "tests\x1b]52;c;ZXZpbA==\x07\u{202e}".into(),
+            class: thegn_core::pipeline_validate::ValidationClass::Green,
+            commit_sha: format!("{HEAD}\u{202e}"),
+            attempts: 1,
+        };
+        let line = validation_line(677, &validation);
+        let digest = validation_digest_lines("safe\x1b]52;c;ZXZpbA==\x07\u{202e}\nsecond");
+        for text in std::iter::once(line).chain(digest) {
+            assert!(!text.contains('\x1b'), "{text:?}");
+            assert!(!text.contains('\x07'), "{text:?}");
+            assert!(!text.contains('\u{202e}'), "{text:?}");
         }
     }
 

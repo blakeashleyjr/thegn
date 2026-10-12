@@ -15,6 +15,31 @@ pub const REPORT_MAX_CHARS: usize = 16_384;
 /// The hard cap on a single progress note.
 pub const NOTE_MAX_CHARS: usize = 4_096;
 
+/// Unicode format characters that can change the apparent order or shape of
+/// text without changing its stored logical order.
+pub fn is_format_control(c: char) -> bool {
+    matches!(c as u32,
+        0x00AD | 0x0600..=0x0605 | 0x061C | 0x06DD | 0x070F | 0x0890..=0x0891 |
+        0x08E2 | 0x180E | 0x200B..=0x200F | 0x2028..=0x202E | 0x2060..=0x2064 |
+        0x2066..=0x206F | 0xFEFF | 0xFFF9..=0xFFFB | 0x110BD | 0x110CD |
+        0x13430..=0x1343F | 0x1BCA0..=0x1BCA3 | 0x1D173..=0x1D17A | 0xE0001 |
+        0xE0020..=0xE007F)
+}
+
+/// Render untrusted text as a single terminal-safe cell while preserving its
+/// scalar positions for diagnostics.
+pub fn display_cell(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_control() || is_format_control(c) {
+                '\u{fffd}'
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
 /// A report that cannot be stored.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReportError {
@@ -56,11 +81,11 @@ impl fmt::Display for NoteError {
 pub fn report_text(text: &str) -> Result<String, ReportError> {
     // Reports are printed by the CLI and may be copied into a supervisor
     // prompt. Preserve LF because the handoff format is intentionally
-    // multiline, but remove every other control character (including ESC,
-    // BEL, CR, and C1 controls) before storing it.
+    // multiline, but remove other controls and display-shaping format
+    // characters before storing it.
     let t: String = text
         .chars()
-        .filter(|c| !c.is_control() || *c == '\n')
+        .filter(|c| (!c.is_control() || *c == '\n') && !is_format_control(*c))
         .collect();
     let t = t.trim();
     if t.is_empty() {
@@ -78,8 +103,11 @@ pub fn report_text(text: &str) -> Result<String, ReportError> {
 pub fn note_text(text: &str) -> Result<String, NoteError> {
     // Notes are rendered as one roster line / bullet. Remove all control
     // characters rather than allowing a worker note to emit terminal escape
-    // sequences or forge additional output lines.
-    let t: String = text.chars().filter(|c| !c.is_control()).collect();
+    // sequences, reorder text, or forge additional output lines.
+    let t: String = text
+        .chars()
+        .filter(|c| !c.is_control() && !is_format_control(*c))
+        .collect();
     let t = t.trim();
     if t.is_empty() {
         return Err(NoteError::Empty);
@@ -436,6 +464,14 @@ mod tests {
     }
 
     #[test]
+    fn report_text_removes_unicode_format_controls() {
+        assert_eq!(
+            report_text("PASS\u{202e}LIAF\u{2028}x").unwrap(),
+            "PASSLIAFx"
+        );
+    }
+
+    #[test]
     fn report_text_rejects_over_cap() {
         let big = "x".repeat(16_385);
         assert_eq!(report_text(&big), Err(ReportError::TooLong { len: 16_385 }));
@@ -453,6 +489,28 @@ mod tests {
             note_text("first\nsecond\x1b[2J"),
             Ok("firstsecond[2J".into())
         );
+    }
+
+    #[test]
+    fn note_text_removes_format_controls_and_rejects_format_only_input() {
+        assert_eq!(note_text("ok\u{2066}\u{200b}").unwrap(), "ok");
+        assert_eq!(note_text("\u{202e}\u{2066}\u{200b}"), Err(NoteError::Empty));
+    }
+
+    #[test]
+    fn display_cell_replaces_controls_and_format_characters() {
+        let shown = display_cell("a\x1b]52;c;ZQ==\x07b\u{202e}\nc");
+        assert_eq!(shown, "a�]52;c;ZQ==�b��c");
+        assert!(!shown.contains('\x1b'));
+        assert!(!shown.contains('\x07'));
+        assert!(!shown.contains('\u{202e}'));
+        assert!(!shown.contains('\n'));
+    }
+
+    #[test]
+    fn format_control_policy_covers_both_branches() {
+        assert!(is_format_control('\u{202e}'));
+        assert!(!is_format_control('x'));
     }
 
     #[test]
