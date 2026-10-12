@@ -73,7 +73,8 @@ pub(crate) fn cross_workspace_targets(
 /// early-returned without sending a result (vanished dir, DB open failure)
 /// can't wedge its path out of warming forever.
 pub(crate) struct PrefetchInflight {
-    inflight: HashMap<PathBuf, Instant>,
+    inflight: HashMap<PathBuf, (Instant, u64)>,
+    next_generation: u64,
 }
 
 impl PrefetchInflight {
@@ -83,23 +84,49 @@ impl PrefetchInflight {
     pub(crate) fn new() -> Self {
         PrefetchInflight {
             inflight: HashMap::new(),
+            next_generation: 0,
         }
     }
 
     /// Whether a prefetch for `path` should spawn; records it when yes.
     pub(crate) fn try_begin(&mut self, path: &Path) -> bool {
         match self.inflight.get(path) {
-            Some(t) if t.elapsed() < Self::STALE => false,
+            Some((t, _)) if t.elapsed() < Self::STALE => false,
             _ => {
-                self.inflight.insert(path.to_path_buf(), Instant::now());
+                self.next_generation = self.next_generation.wrapping_add(1);
+                self.inflight
+                    .insert(path.to_path_buf(), (Instant::now(), self.next_generation));
                 true
             }
         }
     }
 
-    /// A result for `path` arrived (or its worker is otherwise done).
-    pub(crate) fn finish(&mut self, path: &Path) {
-        self.inflight.remove(path);
+    /// Generation captured by the just-admitted worker.
+    pub(crate) fn generation(&self, path: &Path) -> Option<u64> {
+        self.inflight.get(path).map(|(_, generation)| *generation)
+    }
+
+    /// A result for the matching request arrived. An old completion cannot
+    /// release a newer request that replaced a stale entry.
+    pub(crate) fn finish(&mut self, path: &Path, generation: u64) -> bool {
+        if self.generation(path) == Some(generation) {
+            self.inflight.remove(path);
+            return true;
+        }
+        false
+    }
+
+    /// Roll back the path latch when background admission refused the request.
+    pub(crate) fn finish_if_refused(
+        &mut self,
+        path: &Path,
+        generation: u64,
+        admission: crate::sched::Admission,
+    ) {
+        if admission == crate::sched::Admission::Admitted {
+            return;
+        }
+        self.finish(path, generation);
     }
 }
 
@@ -128,6 +155,36 @@ mod tests {
             env_name: None,
             env_degraded: false,
         }
+    }
+
+    #[test]
+    fn admission_refusal_releases_latch_for_later_retry() {
+        let path = PathBuf::from("/repo/wt");
+        let mut inflight = PrefetchInflight::new();
+        assert!(inflight.try_begin(&path));
+        let generation = inflight.generation(&path).unwrap();
+        inflight.finish_if_refused(&path, generation, crate::sched::Admission::Saturated);
+        assert!(
+            inflight.try_begin(&path),
+            "the next trigger can retry immediately"
+        );
+    }
+
+    #[test]
+    fn stale_completion_cannot_clear_replacement_generation() {
+        let path = PathBuf::from("/repo/wt");
+        let mut inflight = PrefetchInflight::new();
+        assert!(inflight.try_begin(&path));
+        let old = inflight.generation(&path).unwrap();
+        inflight.inflight.insert(
+            path.clone(),
+            (Instant::now() - PrefetchInflight::STALE, old),
+        );
+        assert!(inflight.try_begin(&path));
+        let current = inflight.generation(&path).unwrap();
+        assert_ne!(old, current);
+        inflight.finish(&path, old);
+        assert_eq!(inflight.generation(&path), Some(current));
     }
 
     #[test]
@@ -188,8 +245,9 @@ mod tests {
         let mut g = PrefetchInflight::new();
         let p = Path::new("/wt/a");
         assert!(g.try_begin(p), "first spawn proceeds");
+        let generation = g.generation(p).unwrap();
         assert!(!g.try_begin(p), "duplicate while in flight is suppressed");
-        g.finish(p);
+        g.finish(p, generation);
         assert!(g.try_begin(p), "re-arms after the result lands");
     }
 }

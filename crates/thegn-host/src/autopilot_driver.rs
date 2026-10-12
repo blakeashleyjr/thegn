@@ -41,10 +41,8 @@ pub(crate) fn pickup(
         ) {
             continue;
         }
-        // Reserve a background slot before claiming. `spawn_bg` deliberately
-        // drops work when the lane is full; doing that after this claim would
-        // strand the run in `claimed` forever because later refreshes see the
-        // unique issue claim and never retry it.
+        // Reserve a background slot before claiming; refusal here leaves the
+        // issue unclaimed for a later refresh to retry.
         let Some(permit) = crate::sched::bg_permit() else {
             continue;
         };
@@ -56,7 +54,7 @@ pub(crate) fn pickup(
         let account = account.to_owned();
         let issue = issue.clone();
         let repo_root_s = repo_root.to_string_lossy().into_owned();
-        crate::sched::spawn_bg_reserved(permit, move || {
+        crate::sched::report_reserved(crate::sched::spawn_bg_reserved(permit, move || {
             let db = match Db::open() {
                 Ok(db) => db,
                 Err(e) => {
@@ -89,7 +87,7 @@ pub(crate) fn pickup(
             drive_claim(
                 &db, &cfg, &policy, &repo_root, &cwd, &account, &issue, claim.id,
             );
-        });
+        }));
     }
 }
 
