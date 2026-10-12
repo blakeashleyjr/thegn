@@ -610,6 +610,7 @@ impl IssueBackend for KaneoBackend {
             labels: true,
             patch_status: true,
             patch_title: true,
+            patch_assignee_me: false,
             patch_priority: true,
         }
     }

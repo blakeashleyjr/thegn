@@ -398,6 +398,8 @@ while read -r line; do
       printf '{"id":%s,"result":[{"id":"plugin:demo:1","number":"1","provider":"plugin:demo","title":"from plugin","status":"todo","priority":"low","url":"","updated_at_ms":0}]}\n' "$id" ;;
     *'"op":"add_comment"'*)
       printf '{"id":%s,"error":{"code":"unsupported","message":"no comments"}}\n' "$id" ;;
+    *'"op":"update_issue"'*)
+      printf '{"id":%s,"result":{"id":"plugin:demo:1","number":"1","provider":"plugin:demo","title":"updated by plugin","status":"todo","priority":"low","url":"","updated_at_ms":0}}\n' "$id" ;;
     *)
       printf '{"id":%s,"result":null}\n' "$id" ;;
   esac
@@ -480,6 +482,35 @@ done
         assert_eq!(
             bridge.next_id.load(std::sync::atomic::Ordering::Relaxed),
             before
+        );
+    }
+
+    #[test]
+    fn plugin_without_declared_patch_caps_can_update_required_operation() {
+        let (_fixture, _session, bridge) = live_bridge();
+        let caps = IssueCaps::from_json(&serde_json::Value::Null).unwrap();
+        let backend = PluginIssueBackend::new(bridge.clone(), "demo", caps).unwrap();
+        let mut router = IssueRouter::from_config(&IssuesConfig::default());
+        router
+            .push_backend("demo".into(), Box::new(backend))
+            .unwrap();
+        let before = bridge.next_id.load(std::sync::atomic::Ordering::Relaxed);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let updated = rt
+            .block_on(router.update_issue(
+                "plugin:demo:1",
+                &IssuePatch {
+                    status: Some(thegn_core::issue::IssueStatus::Todo),
+                    ..Default::default()
+                },
+            ))
+            .unwrap();
+        assert_eq!(updated.title, "updated by plugin");
+        assert_eq!(
+            bridge.next_id.load(std::sync::atomic::Ordering::Relaxed),
+            before + 1
         );
     }
 

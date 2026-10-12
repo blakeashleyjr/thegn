@@ -119,7 +119,7 @@ struct IssueNodes {
 #[derive(Deserialize)]
 struct IssueConnection {
     nodes: Vec<LinearIssue>,
-    #[serde(default)]
+    #[serde(default, rename = "pageInfo")]
     page_info: Option<LinearPageInfo>,
 }
 
@@ -597,7 +597,16 @@ impl IssueBackend for LinearBackend {
                 }
                 let query =
                     build_list_page_query(filter, self.team_id.as_deref(), after.as_deref(), first);
-                let data: IssueNodes = Self::gql(&mut op, &query, Vars {}).await?;
+                let data: IssueNodes = match Self::gql(&mut op, &query, Vars {}).await {
+                    Ok(data) => data,
+                    Err(IssueError::Timeout(_)) if !all.is_empty() => {
+                        return Err(IssueError::PartialList {
+                            issues: all,
+                            reason: "Linear listing deadline reached",
+                        });
+                    }
+                    Err(error) => return Err(error),
+                };
                 let page_info = data.issues.page_info;
                 all.extend(
                     data.issues
@@ -964,6 +973,51 @@ mod tests {
             calls.load(std::sync::atomic::Ordering::SeqCst),
             MAX_LIST_PAGES
         );
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn listing_deadline_after_first_page_returns_partial_rows() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let route_calls = Arc::clone(&calls);
+        let server = tokio::spawn(async move {
+            let app = Router::new().fallback(any(move |_: Request| {
+                let route_calls = Arc::clone(&route_calls);
+                async move {
+                    route_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let payload = json!({"data": {"issues": {
+                        "nodes": [list_item(1)],
+                        "pageInfo": {"hasNextPage": true, "endCursor": "cursor-1"}
+                    }}});
+                    let mut response =
+                        (StatusCode::OK, Body::from(payload.to_string())).into_response();
+                    response.headers_mut().insert(
+                        reqwest::header::CONTENT_TYPE,
+                        HeaderValue::from_static("application/json"),
+                    );
+                    response
+                }
+            }));
+            axum::serve(listener, app).await.unwrap();
+        });
+        let budget = Arc::new(TrackerHttpBudget::with_permits(1));
+        budget.expire_after_responses_for_test(1);
+        let backend = LinearBackend::new_for_test(
+            "linear-secret".into(),
+            None,
+            budget,
+            &format!("http://{address}"),
+        );
+        let result = backend.list_issues(&IssueFilter::default()).await;
+        assert!(matches!(
+            result,
+            Err(IssueError::PartialList { issues, reason })
+                if issues.len() == 1 && reason == "Linear listing deadline reached"
+        ));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         server.abort();
         assert!(server.await.unwrap_err().is_cancelled());
     }

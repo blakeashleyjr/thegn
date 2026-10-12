@@ -137,22 +137,50 @@ mod tests {
             (
                 "linear",
                 "lin",
-                serde_json::json!({ "comments": false, "labels": false }),
+                serde_json::json!({
+                    "patch_status": true,
+                    "patch_title": true,
+                    "patch_assignee_me": false,
+                    "patch_priority": true,
+                    "comments": false,
+                    "labels": false
+                }),
             ),
             (
                 "github",
                 "gh",
-                serde_json::json!({ "comments": false, "labels": false }),
+                serde_json::json!({
+                    "patch_status": true,
+                    "patch_title": true,
+                    "patch_assignee_me": false,
+                    "patch_priority": false,
+                    "comments": false,
+                    "labels": false
+                }),
             ),
             (
                 "jira",
                 "jira",
-                serde_json::json!({ "comments": false, "labels": false }),
+                serde_json::json!({
+                    "patch_status": true,
+                    "patch_title": true,
+                    "patch_assignee_me": false,
+                    "patch_priority": false,
+                    "comments": false,
+                    "labels": false
+                }),
             ),
             (
                 "kaneo",
                 "kaneo",
-                serde_json::json!({ "comments": true, "labels": true }),
+                serde_json::json!({
+                    "patch_status": true,
+                    "patch_title": true,
+                    "patch_assignee_me": false,
+                    "patch_priority": true,
+                    "comments": true,
+                    "labels": true
+                }),
             ),
         ] {
             let report = reports
