@@ -676,24 +676,35 @@ impl GitLoc {
     }
 
     /// Read a file inside the gitdir (e.g. `rebase-merge/git-rebase-todo`,
-    /// `BISECT_LOG`). `None` when absent or unreadable.
+    /// `BISECT_LOG`). Best-effort compatibility wrapper: `None` when absent
+    /// or unreadable.
     pub fn read_git_path(&self, rel: &str) -> Option<Vec<u8>> {
-        let p = self.resolve_git_path(rel)?;
+        // best-effort: legacy callers intentionally treat unavailable metadata as absent.
+        self.read_git_path_checked(rel).ok().flatten()
+    }
+
+    /// Read a gitdir file while distinguishing absence from errors. Remote
+    /// reads prefix the payload with a one-byte presence tag so transport or
+    /// command failures cannot be mistaken for a missing file.
+    pub fn read_git_path_checked(&self, rel: &str) -> std::io::Result<Option<Vec<u8>>> {
+        let p = self
+            .resolve_git_path(rel)
+            .ok_or_else(|| std::io::Error::other(format!("cannot resolve git path {rel:?}")))?;
         match self {
-            GitLoc::Local(_) => std::fs::read(p).ok(),
+            GitLoc::Local(_) => match std::fs::read(p) {
+                Ok(bytes) => Ok(Some(bytes)),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(error) => Err(error),
+            },
             GitLoc::Remote { ssh, .. } => {
-                let out = self
-                    .ssh_command(ssh, format!("cat {}", util::sh_quote(&p)))
-                    .output()
-                    .ok()?;
-                out.status.success().then_some(out.stdout)
+                let script = tagged_git_path_read_script(&p);
+                let out = self.ssh_command(ssh, script).output()?;
+                tagged_git_path_read_result(rel, out)
             }
             GitLoc::Provider { control_prefix, .. } => {
-                let out = self
-                    .provider_command(control_prefix, format!("cat {}", util::sh_quote(&p)))
-                    .output()
-                    .ok()?;
-                out.status.success().then_some(out.stdout)
+                let script = tagged_git_path_read_script(&p);
+                let out = self.provider_command(control_prefix, script).output()?;
+                tagged_git_path_read_result(rel, out)
             }
         }
     }
@@ -786,14 +797,15 @@ pub fn provision_repo_script(origin: &str, branch: Option<&str>) -> String {
     provision_repo_script_with_submodules(origin, branch, false)
 }
 
-/// As provision_repo_script, optionally initialize the repo's declared
-/// submodules after the clone/branch checkout. The command is only emitted
-/// when the host has already applied the effective policy and trust decision;
-/// this function remains pure and only produces shell-quoted text.
+/// As provision_repo_script, optionally initialize direct submodules after
+/// the clone/branch checkout. Nested initialization stays disabled until
+/// THE-385's closure approval exists. The command is only emitted when the
+/// host has already applied the effective policy and trust decision; this
+/// function remains pure and only produces shell-quoted text.
 pub fn provision_repo_script_with_submodules(
     origin: &str,
     branch: Option<&str>,
-    recursive_submodules: bool,
+    direct_submodules: bool,
 ) -> String {
     let oq = util::sh_quote(origin);
     // Already a repo → done. Else clone into the cwd, then settle the branch.
@@ -807,10 +819,36 @@ pub fn provision_repo_script_with_submodules(
             " && (git checkout {bq} 2>/dev/null || git checkout -b {bq})"
         ));
     }
-    if recursive_submodules {
-        s.push_str(" && git submodule update --init --recursive");
+    if direct_submodules {
+        s.push_str(" && git -c submodule.recurse=false submodule update --init");
     }
     s
+}
+
+fn tagged_git_path_read_script(path: &str) -> String {
+    let quoted = util::sh_quote(path);
+    format!(
+        "if [ -e {quoted} ] || [ -L {quoted} ]; then printf P; exec cat -- {quoted}; else printf A; fi"
+    )
+}
+
+fn tagged_git_path_read_result(
+    rel: &str,
+    output: std::process::Output,
+) -> std::io::Result<Option<Vec<u8>>> {
+    if !output.status.success() {
+        return Err(std::io::Error::other(format!(
+            "read git path {rel:?} failed with exit status {}",
+            output.status
+        )));
+    }
+    match output.stdout.split_first() {
+        Some((&b'A', [])) => Ok(None),
+        Some((&b'P', bytes)) => Ok(Some(bytes.to_vec())),
+        _ => Err(std::io::Error::other(format!(
+            "read git path {rel:?} returned an invalid presence tag"
+        ))),
+    }
 }
 
 #[cfg(test)]
@@ -983,9 +1021,10 @@ mod tests {
     }
 
     #[test]
-    fn provision_script_can_initialize_recursive_submodules() {
+    fn provision_script_initializes_only_direct_submodules() {
         let s = provision_repo_script_with_submodules("https://x/r.git", Some("main"), true);
-        assert!(s.ends_with("git submodule update --init --recursive"));
+        assert!(s.contains("submodule update --init"));
+        assert!(!s.contains("--recursive"));
         let off = provision_repo_script_with_submodules("https://x/r.git", Some("main"), false);
         assert!(!off.contains("submodule update"));
     }
