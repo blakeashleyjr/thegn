@@ -127,6 +127,10 @@ impl SurfaceId {
     pub fn new(id: impl Into<String>) -> Self {
         Self(id.into())
     }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 /// A capability grant or request (`kind:target`).
@@ -1767,6 +1771,11 @@ pub fn plugin_host_call_caps() -> Vec<&'static str> {
 #[cfg(test)]
 mod wire_tests {
     use super::*;
+
+    #[test]
+    fn surface_id_exposes_its_string() {
+        assert_eq!(SurfaceId::new("statusbar").as_str(), "statusbar");
+    }
 
     #[test]
     fn v0_3_version_and_panel_section_capability() {
