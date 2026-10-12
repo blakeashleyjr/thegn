@@ -8,6 +8,7 @@
 
 use anyhow::Result;
 use rusqlite::{OptionalExtension, params};
+use std::path::Path;
 
 use crate::db::Db;
 use crate::semantic::EntityKind;
@@ -196,6 +197,70 @@ impl SemanticStore for Db {
     }
 }
 
+impl Db {
+    /// Sweep one bounded slice of semantic entities whose source files are gone.
+    /// Registered roots are retained even when they are not present locally:
+    /// remote worktrees legitimately have no local filesystem path.
+    pub(crate) fn prune_missing_semantic_files(
+        &self,
+        after_rowid: i64,
+        limit: usize,
+    ) -> Result<(usize, i64)> {
+        let roots = {
+            let mut stmt = self
+                .conn()
+                .prepare("SELECT worktree FROM worktrees WHERE worktree != ''")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let candidates = {
+            let mut stmt = self.conn().prepare(
+                "SELECT rowid, id, file FROM sem_entity WHERE rowid>?1 ORDER BY rowid LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(params![after_rowid, limit as i64], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let scanned = candidates.len();
+        let next_rowid = candidates
+            .last()
+            .map_or(after_rowid, |(rowid, _, _)| *rowid);
+        let candidate_files: std::collections::BTreeSet<&str> = candidates
+            .iter()
+            .map(|(_, _, file)| file.as_str())
+            .collect();
+        let stale_files: Vec<&str> = candidate_files
+            .into_iter()
+            .filter(|file| {
+                let path = Path::new(file);
+                !roots.iter().any(|root| path.starts_with(Path::new(root))) && !path.exists()
+            })
+            .collect();
+        if !stale_files.is_empty() {
+            let stale_file_set: std::collections::BTreeSet<&str> =
+                stale_files.into_iter().collect();
+            let tx = self.conn().unchecked_transaction()?;
+            for (_, id, file) in &candidates {
+                if !stale_file_set.contains(file.as_str()) {
+                    continue;
+                }
+                tx.execute(
+                    "DELETE FROM sem_edge WHERE src_id=?1 OR dst_id=?1",
+                    params![id],
+                )?;
+                tx.execute("DELETE FROM sem_entity WHERE id=?1", params![id])?;
+            }
+            tx.commit()?;
+        }
+        Ok((scanned, next_rowid))
+    }
+}
+
 /// Escape SQL-LIKE metacharacters (`%`, `_`, and the escape char `\`) so a path
 /// used as a `LIKE` prefix matches literally. Paired with `ESCAPE '\'`.
 fn like_escape(s: &str) -> String {
@@ -346,6 +411,63 @@ mod tests {
             "h3",
         ))
         .unwrap();
+    }
+
+    #[test]
+    fn missing_file_sweep_removes_dead_rows_and_keeps_registered_roots() {
+        use crate::store::WorkspaceStore;
+
+        let db = Db::open_memory().unwrap();
+        db.put_worktree("live", "/repo", "/live", "main", None, None)
+            .unwrap();
+        db.put_worktree(
+            "remote",
+            "/repo",
+            "/remote/wt",
+            "remote-branch",
+            Some(r#"{"path":"/remote/wt","host":"builder"}"#),
+            None,
+        )
+        .unwrap();
+        db.upsert_entity(&row(
+            "dead",
+            "/gone/src/lib.rs",
+            "dead",
+            EntityKind::Function,
+            "h1",
+        ))
+        .unwrap();
+        db.upsert_entity(&row(
+            "live",
+            "/live/src/lib.rs",
+            "live",
+            EntityKind::Function,
+            "h2",
+        ))
+        .unwrap();
+        db.upsert_entity(&row(
+            "remote",
+            "/remote/wt/src/lib.rs",
+            "remote",
+            EntityKind::Function,
+            "h3",
+        ))
+        .unwrap();
+
+        let (scanned, _) = db.prune_missing_semantic_files(0, 512).unwrap();
+
+        assert_eq!(scanned, 3);
+        assert!(db.file_source_hash("/gone/src/lib.rs").unwrap().is_none());
+        assert_eq!(
+            db.file_source_hash("/live/src/lib.rs").unwrap().as_deref(),
+            Some("h2")
+        );
+        assert_eq!(
+            db.file_source_hash("/remote/wt/src/lib.rs")
+                .unwrap()
+                .as_deref(),
+            Some("h3")
+        );
     }
 
     #[test]

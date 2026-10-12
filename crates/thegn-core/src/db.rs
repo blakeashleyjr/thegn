@@ -1163,7 +1163,39 @@ impl Db {
         // open after a migration is an idempotent no-op.)
         static PRUNE_ONCE: std::sync::Once = std::sync::Once::new();
         if db.schema_mismatch.is_none() {
-            PRUNE_ONCE.call_once(|| db.startup_prune());
+            PRUNE_ONCE.call_once(|| {
+                db.startup_prune();
+                // Semantic-file checks perform filesystem metadata I/O. Run
+                // the bounded-delete sweep on its own worker so opening the
+                // DB from the event loop never waits for that walk.
+                let sweep_path = path.clone();
+                if let Err(error) = std::thread::Builder::new().spawn(move || {
+                    let Ok(conn) = Db::open_connection(&sweep_path) else {
+                        return;
+                    };
+                    if conn
+                        .busy_timeout(std::time::Duration::from_millis(5000))
+                        .is_err()
+                    {
+                        return;
+                    }
+                    let sweep_db = Db {
+                        conn,
+                        schema_mismatch: None,
+                    };
+                    let mut after_rowid = 0;
+                    loop {
+                        match sweep_db.prune_missing_semantic_files(after_rowid, 512) {
+                            Ok((scanned, next_rowid)) if scanned > 0 => {
+                                after_rowid = next_rowid;
+                            }
+                            Ok(_) | Err(_) => break,
+                        }
+                    }
+                }) {
+                    tracing::debug!(%error, "could not start semantic entity prune worker");
+                }
+            });
         }
         Ok(db)
     }
