@@ -54,7 +54,7 @@ impl TzRef {
     }
     /// Resolve to a real zone, or `None` if this build doesn't know the name.
     pub fn resolve(&self) -> Option<Tz> {
-        resolve_zone(&self.0)
+        resolve_tzid(&self.0)
     }
 }
 
@@ -81,6 +81,42 @@ pub fn resolve_zone(name: &str) -> Option<Tz> {
         .iter()
         .find(|tz| tz.name().eq_ignore_ascii_case(n))
         .copied()
+}
+
+const WINDOWS_TZ_ALIASES: &[(&str, &str)] = &[
+    ("Eastern Standard Time", "America/New_York"),
+    ("Central Standard Time", "America/Chicago"),
+    ("Mountain Standard Time", "America/Denver"),
+    ("Pacific Standard Time", "America/Los_Angeles"),
+    ("W. Europe Standard Time", "Europe/Berlin"),
+    ("GMT Standard Time", "Europe/London"),
+    ("Tokyo Standard Time", "Asia/Tokyo"),
+    ("China Standard Time", "Asia/Shanghai"),
+];
+
+/// Resolve an iCalendar TZID, including a small set of CLDR Windows aliases
+/// and vendor paths that suffix an IANA zone with a provider namespace.
+pub fn resolve_tzid(name: &str) -> Option<Tz> {
+    let name = name.trim();
+    if let Some(zone) = resolve_zone(name) {
+        return Some(zone);
+    }
+    if let Some((_, target)) = WINDOWS_TZ_ALIASES
+        .iter()
+        .find(|(alias, _)| alias.eq_ignore_ascii_case(name))
+    {
+        return resolve_zone(target);
+    }
+    if name.starts_with('/') {
+        let parts: Vec<&str> = name.trim_start_matches('/').split('/').collect();
+        for start in 0..parts.len().saturating_sub(1) {
+            let candidate = parts[start..].join("/");
+            if let Some(zone) = resolve_zone(&candidate) {
+                return Some(zone);
+            }
+        }
+    }
+    None
 }
 
 /// Suggest zone names close to a typo, best first.
@@ -450,3 +486,7 @@ pub fn fmt_delta(mins: i32) -> String {
         format!("{sign}{h}h{m:02}")
     }
 }
+
+#[cfg(test)]
+#[path = "tz_tests.rs"]
+mod tests;
