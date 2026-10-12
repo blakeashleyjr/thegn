@@ -25,6 +25,40 @@ use tokio::time::Instant;
 // the admission layer's document ceiling must cover it.
 const _: () = assert!(MAX_BODY_BYTES <= thegn_core::calendar::admission::MAX_SOURCE_DOCUMENT_BYTES);
 
+const ZONE_CURSOR_PREFIX: &str = "tgz1:";
+
+fn request_etag<'a>(zone: &str, stored: &'a str) -> &'a str {
+    let Some(rest) = stored.strip_prefix(ZONE_CURSOR_PREFIX) else {
+        return "";
+    };
+    let Some((cursor_zone, etag)) = rest.split_once(':') else {
+        return "";
+    };
+    if cursor_zone == zone { etag } else { "" }
+}
+
+fn stored_cursor(zone: &str, etag: &str) -> String {
+    if etag.is_empty() {
+        String::new()
+    } else {
+        format!("{ZONE_CURSOR_PREFIX}{zone}:{etag}")
+    }
+}
+
+#[cfg(test)]
+mod cursor_tests {
+    use super::{request_etag, stored_cursor};
+
+    #[test]
+    fn ics_cursor_requires_the_current_zone_and_rejects_legacy_etags() {
+        let stored = stored_cursor("Europe/Berlin", "\"rev-1\"");
+        assert_eq!(request_etag("Europe/Berlin", &stored), "\"rev-1\"");
+        assert_eq!(request_etag("Asia/Kolkata", &stored), "");
+        assert_eq!(request_etag("Europe/Berlin", "\"legacy-etag\""), "");
+        assert_eq!(stored_cursor("Europe/Berlin", ""), "");
+    }
+}
+
 pub(super) fn map_transport_error(error: CalendarHttpError) -> CalendarError {
     match error {
         CalendarHttpError::Timeout => CalendarError::Timeout(map_error(error)),
@@ -103,9 +137,10 @@ impl CalendarBackend for IcsUrlBackend {
             // budget. Refusal is immediate and typed; nothing is sent.
             let mut meter = self.admission.meter();
             meter.reserve_transient(MAX_BODY_BYTES)?;
+            let cursor_etag = request_etag(self.zone.name(), sync_token);
             let mut req = http.request(reqwest::Method::GET);
-            if !sync_token.is_empty() {
-                req = req.header(reqwest::header::IF_NONE_MATCH, sync_token);
+            if !cursor_etag.is_empty() {
+                req = req.header(reqwest::header::IF_NONE_MATCH, cursor_etag);
             }
             if !self.token.is_empty() {
                 if self.username.is_empty() {
@@ -132,6 +167,11 @@ impl CalendarBackend for IcsUrlBackend {
             validate_encoding(&resp).map_err(|error| CalendarError::Policy(map_error(error)))?;
 
             if resp.status() == reqwest::StatusCode::NOT_MODIFIED {
+                if cursor_etag.is_empty() {
+                    return Err(CalendarError::Api(
+                        "server returned 304 without a matching calendar cursor".into(),
+                    ));
+                }
                 // Nothing changed. Return the SAME token and `unchanged`, so the
                 // caller leaves the cache exactly as it is rather than reading an
                 // empty page as "the calendar was emptied".
@@ -184,7 +224,13 @@ impl CalendarBackend for IcsUrlBackend {
                 &mut events,
             )?;
             drop(body);
-            EventPage::from_meter(meter, PageMode::Snapshot, events, Vec::new(), etag)
+            EventPage::from_meter(
+                meter,
+                PageMode::Snapshot,
+                events,
+                Vec::new(),
+                stored_cursor(self.zone.name(), &etag),
+            )
         })
     }
 }
