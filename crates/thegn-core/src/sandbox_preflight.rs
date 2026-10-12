@@ -379,9 +379,10 @@ mod tests {
         };
         let mut spec = base_spec(Backend::Apple);
         spec.compose = Some(compose.encode());
-        let called = std::cell::Cell::new(false);
-        let result = preflight_exec_with(&spec, &|_| {
-            called.set(true);
+        let called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let runner_called = std::sync::Arc::clone(&called);
+        let result = preflight_exec_with(&spec, &move |_| {
+            runner_called.store(true, std::sync::atomic::Ordering::Relaxed);
             Some((true, String::new()))
         });
         assert!(
@@ -389,7 +390,7 @@ mod tests {
                 .unwrap_err()
                 .contains("unsupported for backend 'apple'")
         );
-        assert!(!called.get());
+        assert!(!called.load(std::sync::atomic::Ordering::Relaxed));
     }
 
     #[test]
