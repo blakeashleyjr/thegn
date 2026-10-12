@@ -1217,11 +1217,8 @@ mod tests {
                                 return;
                             }
                         }
-                        "repeat 1" => {
-                            if w.write_all(b"OK\n").await.is_err() {
-                                return;
-                            }
-                        }
+                        "repeat 1" if w.write_all(b"OK\n").await.is_err() => return,
+                        "repeat 1" => {}
                         _ => {}
                     }
                 }
@@ -1237,8 +1234,8 @@ mod tests {
             let mut r = BufReader::new(r);
             if let Ok(Some(line)) = read_bounded_line(&mut r, 1024).await {
                 log.lock().unwrap().push(line);
-                if w.write_all(b"OK\n").await.is_err() {
-                    return;
+                if let Err(error) = w.write_all(b"OK\n").await {
+                    tracing::debug!(target: "thegn::media", %error, "fake MPD rollback response failed");
                 }
             }
         });
