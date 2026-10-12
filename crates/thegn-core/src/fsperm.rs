@@ -186,6 +186,19 @@ pub fn rename_replace(from: &Path, to: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Sync the directory entry after an atomic replacement. Windows replacement
+/// uses `MOVEFILE_WRITE_THROUGH`; Unix explicitly fsyncs the containing dir.
+pub fn sync_parent_dir(_parent: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::fs::File::open(_parent)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(())
+    }
+}
+
 /// Make `path` a private (owner-only) real directory, creating it if absent.
 ///
 /// Refuses a symlink or non-directory at `path` (checked with

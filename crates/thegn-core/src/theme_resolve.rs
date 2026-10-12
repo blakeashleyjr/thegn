@@ -31,10 +31,14 @@ pub fn palette_with_catalog(
 ) -> Palette {
     let mut palette = preset(preset_name)
         .or_else(|| {
-            user_themes
+            let mut matches = user_themes
                 .iter()
-                .find(|theme| theme.meta.name == preset_name)
-                .and_then(|theme| palette_from_user_theme(theme).ok())
+                .filter(|theme| theme.meta.name == preset_name);
+            let theme = matches.next()?;
+            if matches.next().is_some() {
+                return None;
+            }
+            palette_from_user_theme(theme).ok()
         })
         .unwrap_or_default();
     apply_config_overrides(&mut palette, colors, hues, accent, focus);
@@ -273,6 +277,32 @@ mod tests {
             .bg0,
             "18;52;86"
         );
+    }
+
+    #[test]
+    fn duplicate_user_theme_names_never_select_the_first_entry() {
+        let mut first_palette = Palette::default();
+        first_palette.bg0 = "1;2;3".into();
+        let first = UserTheme::from_palette("duplicate", &first_palette);
+        let mut second_palette = Palette::default();
+        second_palette.bg0 = "9;8;7".into();
+        let second = UserTheme::from_palette("duplicate", &second_palette);
+        let fallback = palette_with_config(
+            "duplicate",
+            &ThemeColors::default(),
+            &ThemeHues::default(),
+            "#6ee7d8",
+            "#6ee7d8",
+        );
+        let resolved = palette_with_catalog(
+            "duplicate",
+            &[first, second],
+            &ThemeColors::default(),
+            &ThemeHues::default(),
+            "#6ee7d8",
+            "#6ee7d8",
+        );
+        assert_eq!(resolved, fallback);
     }
 
     #[test]

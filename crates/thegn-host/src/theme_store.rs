@@ -1,6 +1,6 @@
 //! Off-loop provider for user themes.
 
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, HashMap};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -461,25 +461,75 @@ pub(crate) fn scan_dir(dir: &Path) -> (Vec<UserTheme>, Vec<String>) {
         return (themes, warnings);
     }
     let paths = bounded_theme_paths(dir, &mut warnings);
+    let mut exact = HashMap::<String, usize>::new();
+    let mut normalized = HashMap::<String, usize>::new();
     for path in paths {
         match read_bounded(&path).and_then(|bytes| {
             let text = std::str::from_utf8(&bytes).map_err(|_| "not UTF-8".to_string())?;
             UserTheme::from_toml(text).map_err(|e| e.to_string())
         }) {
             Ok(theme) => {
-                if thegn_core::theme::PRESETS.contains(&theme.meta.name.as_str()) {
+                *exact.entry(theme.meta.name.clone()).or_default() += 1;
+                let identity = thegn_core::util::slugify(&theme.meta.name);
+                *normalized.entry(identity.clone()).or_default() += 1;
+                if identity.is_empty() || identity.len() > 80 {
                     warnings.push(format!(
-                        "{}: user theme `{}` is shadowed by built-in preset",
+                        "{}: theme name has an empty or overlong storage identity",
+                        path.display()
+                    ));
+                    continue;
+                }
+                if thegn_core::theme::PRESETS
+                    .iter()
+                    .any(|preset| thegn_core::util::slugify(preset) == identity)
+                {
+                    warnings.push(format!(
+                        "{}: user theme `{}` conflicts with a built-in preset identity",
                         path.display(),
                         theme.meta.name
                     ));
+                    continue;
+                }
+                let expected = format!("{identity}.toml");
+                if path.file_name().and_then(|name| name.to_str()) != Some(expected.as_str()) {
+                    warnings.push(format!(
+                        "{}: filename does not match theme name `{}` (expected `{expected}`)",
+                        path.display(),
+                        theme.meta.name
+                    ));
+                    continue;
                 }
                 themes.push(theme);
             }
             Err(e) => warnings.push(format!("{}: {e}", path.display())),
         }
     }
+    for (name, count) in &exact {
+        if *count > 1 {
+            warnings.push(format!(
+                "ambiguous user theme identity `{name}`; duplicate exact name"
+            ));
+        }
+    }
+    for (name, count) in &normalized {
+        if *count > 1 {
+            warnings.push(format!("ambiguous normalized user theme identity `{name}`"));
+        }
+    }
+    themes.retain(|theme| {
+        let exact_count = exact.get(&theme.meta.name).copied().unwrap_or(0);
+        let normalized_count = normalized
+            .get(&thegn_core::util::slugify(&theme.meta.name))
+            .copied()
+            .unwrap_or(0);
+        if exact_count > 1 || normalized_count > 1 {
+            false
+        } else {
+            true
+        }
+    });
     themes.sort_by(|a, b| a.meta.name.cmp(&b.meta.name));
+    warnings.sort();
     (themes, warnings)
 }
 
@@ -572,9 +622,44 @@ fn valid_slug(name: &str) -> Result<String, String> {
 
 pub(crate) fn write_theme(dir: &Path, theme: &UserTheme) -> Result<(), String> {
     theme.validate().map_err(|e| e.to_string())?;
+    if thegn_core::theme::PRESETS.iter().any(|preset| {
+        thegn_core::util::slugify(preset) == thegn_core::util::slugify(&theme.meta.name)
+    }) {
+        return Err(format!(
+            "theme name `{}` is reserved by a built-in preset",
+            theme.meta.name
+        ));
+    }
     let slug = valid_slug(&theme.meta.name)?;
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     let destination = dir.join(format!("{slug}.toml"));
+    match read_bounded(&destination) {
+        Ok(bytes) => {
+            let existing = UserTheme::from_toml(
+                std::str::from_utf8(&bytes).map_err(|_| "existing theme is not UTF-8")?,
+            )
+            .map_err(|error| format!("existing theme identity is ambiguous: {error}"))?;
+            if existing.meta.name != theme.meta.name {
+                return Err(format!(
+                    "theme filename collision: `{}` already belongs to `{}`",
+                    destination.display(),
+                    existing.meta.name
+                ));
+            }
+            let expected_filename =
+                format!("{}.toml", thegn_core::util::slugify(&existing.meta.name));
+            if destination.file_name().and_then(|name| name.to_str())
+                != Some(expected_filename.as_str())
+            {
+                return Err(format!(
+                    "existing theme filename does not match `{}`",
+                    existing.meta.name
+                ));
+            }
+        }
+        Err(_) if !destination.exists() => {}
+        Err(error) => return Err(format!("cannot verify existing theme identity: {error}")),
+    }
     let text = theme.to_toml().map_err(|e| e.to_string())?;
     atomic_write(&destination, text.as_bytes(), None)
 }
@@ -585,11 +670,28 @@ pub(crate) fn write_theme_selection(
     overrides: Option<&ThemeOverrides>,
 ) -> Result<(), String> {
     use toml_edit::{DocumentMut, Item, Table, value};
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+    let expected = match thegn_core::fsperm::open_regular_file_nofollow(path) {
+        Ok(mut file) => {
+            let metadata = file
+                .metadata()
+                .map_err(|e| format!("inspect {}: {e}", path.display()))?;
+            if !thegn_core::fsperm::owned_by_current_user(&metadata) {
+                return Err("config file is not owned by the current user".into());
+            }
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)
+                .map_err(|e| format!("read {}: {e}", path.display()))?;
+            Some(bytes)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => return Err(format!("read {}: {e}", path.display())),
     };
+    let text = expected
+        .as_deref()
+        .map(std::str::from_utf8)
+        .transpose()
+        .map_err(|e| format!("config is not UTF-8: {e}"))?
+        .unwrap_or("");
     let mut doc = text
         .parse::<DocumentMut>()
         .map_err(|e| format!("parse {}: {e}", path.display()))?;
@@ -601,7 +703,8 @@ pub(crate) fn write_theme_selection(
         .ok_or_else(|| "[theme] is not a table".to_string())?;
     theme_table.insert("preset", value(preset));
     let Some(overrides) = overrides else {
-        return write_config_document(path, &doc);
+        return thegn_core::config_write::write_document_fenced(path, &doc, expected.as_deref())
+            .map_err(|e| e.to_string());
     };
     if let Some(accent) = &overrides.accent {
         theme_table.insert("accent", value(accent));
@@ -667,14 +770,8 @@ pub(crate) fn write_theme_selection(
             }
         }
     }
-    write_config_document(path, &doc)
-}
-
-fn write_config_document(path: &Path, doc: &toml_edit::DocumentMut) -> Result<(), String> {
-    let permissions = std::fs::metadata(path)
-        .ok()
-        .map(|metadata| metadata.permissions());
-    atomic_write(path, doc.to_string().as_bytes(), permissions)
+    thegn_core::config_write::write_document_fenced(path, &doc, expected.as_deref())
+        .map_err(|e| e.to_string())
 }
 
 struct PendingTemp(Option<PathBuf>);
@@ -866,13 +963,100 @@ mod tests {
     }
 
     #[test]
+    fn save_slug_collision_preserves_the_existing_theme() {
+        let dir = temp_dir("save-collision");
+        let first = theme("Night/Sky");
+        write_theme(&dir, &first).unwrap();
+        let path = dir.join(format!(
+            "{}.toml",
+            thegn_core::util::slugify(&first.meta.name)
+        ));
+        let before = std::fs::read(&path).unwrap();
+        let error = write_theme(&dir, &theme("Night-Sky")).unwrap_err();
+        assert!(error.contains("filename collision"), "{error}");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn scan_rejects_filename_mismatch_and_duplicate_exact_identity() {
+        let dir = temp_dir("identity-scan");
+        let duplicate = theme("shared").to_toml().unwrap();
+        std::fs::write(dir.join("shared.toml"), &duplicate).unwrap();
+        std::fs::write(dir.join("other.toml"), &duplicate).unwrap();
+        let (themes, warnings) = scan_dir(&dir);
+        assert!(themes.is_empty(), "ambiguous theme must not enter catalog");
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("filename does not match"))
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("ambiguous user theme identity"))
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn scan_rejects_normalized_name_collisions() {
+        let dir = temp_dir("normalized-scan");
+        for (filename, name) in [("one.toml", "Night-Sky"), ("two.toml", "night_sky")] {
+            let candidate = theme(name);
+            let path = dir.join(filename);
+            std::fs::write(path, candidate.to_toml().unwrap()).unwrap();
+        }
+        let (themes, warnings) = scan_dir(&dir);
+        assert!(themes.is_empty(), "normalized duplicates must not resolve");
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("ambiguous normalized user theme identity"))
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn save_refuses_reserved_builtin_name() {
+        let dir = temp_dir("reserved-name");
+        let error = write_theme(&dir, &theme(thegn_core::theme::PRESETS[0])).unwrap_err();
+        assert!(error.contains("reserved by a built-in"), "{error}");
+        assert!(std::fs::read_dir(&dir).unwrap().next().is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn unicode_slug_collision_preserves_the_first_theme() {
+        let dir = temp_dir("unicode-collision");
+        let first = theme("Café");
+        write_theme(&dir, &first).unwrap();
+        let before = std::fs::read(dir.join("caf.toml")).unwrap();
+        let error = write_theme(&dir, &theme("Cafè")).unwrap_err();
+        assert!(error.contains("filename collision"), "{error}");
+        assert_eq!(std::fs::read(dir.join("caf.toml")).unwrap(), before);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn save_rejects_empty_and_overlong_storage_names() {
+        let dir = temp_dir("invalid-name");
+        let empty = write_theme(&dir, &theme(" ")).unwrap_err();
+        assert!(empty.contains("must not be empty"), "{empty}");
+        let overlong = write_theme(&dir, &theme(&"x".repeat(81))).unwrap_err();
+        assert!(overlong.contains("80 characters"), "{overlong}");
+        assert!(std::fs::read_dir(&dir).unwrap().next().is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn catalog_filters_junk_before_applying_the_theme_file_cap() {
         let dir = temp_dir("bounded-catalog");
         for index in 0..300 {
             std::fs::write(dir.join(format!("{index:03}-junk.txt")), b"junk").unwrap();
         }
         std::fs::write(
-            dir.join("zzz-theme.toml"),
+            dir.join("still-visible.toml"),
             theme("still-visible").to_toml().unwrap(),
         )
         .unwrap();
@@ -925,7 +1109,7 @@ mod tests {
                 .file_type()
                 .is_symlink()
         );
-        assert!(std::fs::metadata(&config).unwrap().permissions().readonly());
+        assert!(std::fs::metadata(&config).unwrap().is_file());
         assert!(
             std::fs::read_to_string(&config)
                 .unwrap()
