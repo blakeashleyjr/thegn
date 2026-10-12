@@ -1183,6 +1183,9 @@ mod tests {
                     .is_empty()
             );
         }
+        for (index, status) in MqStatus::ALL.into_iter().enumerate() {
+            assert_eq!(mq_status_all_index(status), index);
+        }
         assert_eq!(
             MqStatus::AgentBlocked
                 .glyph(crate::termcaps::glyphs(crate::termcaps::UnicodeLevel::Full))
@@ -1210,6 +1213,22 @@ mod tests {
             (blocked.tier, blocked.reason),
             (T::Blocked, R::AgentBlocked)
         );
+    }
+
+    fn mq_status_all_index(status: MqStatus) -> usize {
+        match status {
+            MqStatus::Queued => 0,
+            MqStatus::Folding => 1,
+            MqStatus::Verifying => 2,
+            MqStatus::Landed => 3,
+            MqStatus::Ready => 4,
+            MqStatus::Deferred => 5,
+            MqStatus::GateFailed => 6,
+            MqStatus::GateError => 7,
+            MqStatus::AgentRunning => 8,
+            MqStatus::NeedsHuman => 9,
+            MqStatus::AgentBlocked => 10,
+        }
     }
 
     fn sc(tier: AttentionTier, since: Option<i64>) -> AttentionScore {

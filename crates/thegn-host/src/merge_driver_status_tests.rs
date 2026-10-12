@@ -169,6 +169,76 @@ fn failed_attempt_reservation_prevents_agent_dispatch() {
     );
     assert!(!dispatched);
     assert_eq!(out.persistence_errors.len(), 1);
+    let saved = db
+        .list_merge_queue()
+        .unwrap()
+        .into_iter()
+        .find(|row| row.branch == "feature")
+        .unwrap();
+    assert_eq!(saved.status, "gate_error");
+    assert!(
+        saved
+            .error_detail
+            .as_deref()
+            .unwrap()
+            .contains("could not reserve agent attempt: injected attempt write failure")
+    );
+}
+
+#[test]
+fn failed_conflict_write_falls_back_to_gate_error_and_stops_drain() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("queue.sqlite");
+    let db = Db::open_at(&path).unwrap();
+    let item = queued(&db, 0);
+    db.enqueue_merge("/later/worktree", "later", "main")
+        .unwrap();
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute_batch("CREATE TRIGGER fail_deferred BEFORE UPDATE OF status ON merge_queue WHEN NEW.status = 'deferred' BEGIN SELECT RAISE(FAIL, 'injected conflict write failure'); END;")
+        .unwrap();
+    let out = drive_queue_with(
+        &config(),
+        &Config::default(),
+        Path::new(WORKTREE),
+        &db,
+        vec![
+            item,
+            QueueItem {
+                worktree: "/later/worktree".into(),
+                branch: "later".into(),
+                location: String::new(),
+                agent_attempts: 0,
+            },
+        ],
+        |_| {},
+        DriveActions {
+            attempt: |branch, _| {
+                assert_eq!(branch, "feature", "persistence failure aborts later rows");
+                Ok(AttemptOutcome::Conflict {
+                    paths: vec!["src/a.rs".into()],
+                    submodule_conflicts: Vec::new(),
+                })
+            },
+            floor: |_| panic!("notify-only"),
+            runner: unexpected_runner,
+        },
+    );
+    assert_eq!(out.persistence_errors.len(), 1);
+    let saved = db
+        .list_merge_queue()
+        .unwrap()
+        .into_iter()
+        .find(|row| row.branch == "feature")
+        .unwrap();
+    assert_eq!(saved.status, "gate_error");
+    assert!(
+        saved
+            .error_detail
+            .as_deref()
+            .unwrap()
+            .contains("could not persist conflict outcome")
+    );
 }
 
 fn queued(db: &Db, attempts: u32) -> QueueItem {
@@ -748,7 +818,8 @@ fn hold_then_recover(failure: RetryFailure) {
         },
     );
     assert_eq!((held_attempts, next_attempts, floors), (1, 1, 1));
-    assert_only(&out, &["next"], &["held"], &[], &[]);
+    assert_only(&out, &["next"], &[], &[], &[]);
+    assert_eq!(out.agent_blocked, ["held"]);
     fixture.assert_audit(
         &before,
         &observed,
