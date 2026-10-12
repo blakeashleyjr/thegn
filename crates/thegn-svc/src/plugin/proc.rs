@@ -356,7 +356,7 @@ pub fn spawn_ndjson_stream<S: NdjsonSink>(
 /// Preserve the bounded caller deadline while ensuring every live child is
 /// eventually waited on. `try_wait` also handles the case where another owner
 /// already reaped the child.
-fn hand_off_unreaped_child(mut child: std::process::Child) {
+pub(super) fn hand_off_unreaped_child(mut child: std::process::Child) {
     match child.try_wait() {
         Ok(Some(_)) => {}
         Ok(None) | Err(_) => {

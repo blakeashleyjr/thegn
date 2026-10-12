@@ -351,6 +351,32 @@ mod tests {
     use std::time::Duration;
 
     #[test]
+    fn a_child_handed_to_the_reaper_is_eventually_reaped() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 30"]);
+        crate::plugin::proc::set_process_group(&mut command);
+        let child = command.spawn().unwrap();
+        let pid = child.id() as i32;
+        crate::plugin::proc::kill_group(child.id());
+        crate::plugin::proc::hand_off_unreaped_child(child);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            // A zombie still answers kill(pid, 0); ESRCH proves the detached
+            // waiter reaped the child rather than merely dropping its handle.
+            let result = unsafe { libc::kill(pid, 0) };
+            if result != 0 && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "detached reaper left child {pid} unreaped"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
     fn resident_unix_consuming_wait_identity_loss_forbids_later_signals() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
