@@ -1786,35 +1786,172 @@ fn systemd_local_secrets_go_to_environment_file_not_argv() {
 }
 
 #[test]
-fn remote_oci_keeps_all_env_inline_as_carrier() {
-    // Over ssh the argv is the ONLY env carrier — a remote spec must keep
-    // every pair inline (never divert a host-matching value to a local
-    // env-file the remote daemon can't read).
-    // Also clear ambient THEGN_SANDBOX (a live thegn shell sets it) — these
-    // tests use it as a SYNTHETIC inline pair, so its ambient presence would
-    // divert it to the env-file and break the assertion. Hermetic under nextest
-    // AND in-process `cargo test`.
+fn remote_oci_sends_host_secrets_on_stdin_and_keeps_synthetic_env_inline() {
+    let state = tempfile::tempdir().unwrap();
+    let state_home = state.path().to_string_lossy().into_owned();
     let _env = crate::testenv::EnvGuard::mutate_pairs(&[
         ("GH_TOKEN", Some("ghp_secret")),
         ("THEGN_SANDBOX", None),
+        ("XDG_STATE_HOME", Some(&state_home)),
     ]);
     let mut s = spec(Backend::Podman);
-    s.env = vec![("GH_TOKEN".into(), "ghp_secret".into())];
+    s.env = vec![
+        ("GH_TOKEN".into(), "ghp_secret".into()),
+        ("THEGN_SANDBOX".into(), "1".into()),
+    ];
     s.placement = Placement::Ssh(SshPlacement::plain(
         "box".into(),
         22,
         false,
         TransportKind::Ssh,
     ));
-    let j = oci_create_opts(&s).expect("valid volume names").join(" ");
-    assert!(
-        j.contains("-e GH_TOKEN=ghp_secret"),
-        "remote keeps env inline: {j}"
+    let secret_env = ssh_oci_secret_env(&s);
+    let opts = oci_create_opts_with_ssh_secrets(&s, &secret_env).unwrap();
+    let (argv, input) = oci_create_argv_and_stdin(&s, opts, &secret_env);
+    let j = argv.join(" ");
+    assert!(!j.contains("ghp_secret"), "remote argv leaked secret: {j}");
+    assert!(j.contains("--env-file /dev/stdin"), "stdin env-file: {j}");
+    assert_eq!(
+        j.matches("--env-file").count(),
+        1,
+        "one remote env-file: {j}"
     );
     assert!(
-        !j.contains("--env-file"),
-        "remote must not use env-file: {j}"
+        j.contains("-e THEGN_SANDBOX=1"),
+        "synthetic env inline: {j}"
     );
+    let input = String::from_utf8(input.expect("SSH host secret stdin")).unwrap();
+    assert_eq!(input, "GH_TOKEN=ghp_secret\n");
+    let env_dir = state.path().join("thegn/sandbox-env");
+    if env_dir.exists() {
+        assert!(
+            std::fs::read_dir(env_dir).unwrap().all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".env")),
+            "remote secrets must not create a local env-file"
+        );
+    }
+    assert!(
+        !redact_stderr("remote rejected ghp_secret".into(), &["ghp_secret".into()])
+            .contains("ghp_secret")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn stderr_with_timeout_stdin_redacts_payload_and_reports_child_failure() {
+    let argv = vec!["sh".into(), "-c".into(), "cat >&2; exit 3".into()];
+    let result = stderr_with_timeout_stdin(&argv, Duration::from_secs(2), b"K=canary\n".to_vec());
+    let (success, stderr) = result.expect("child exits and stderr is retained");
+    assert!(!success, "exit status 3 must be reported as failure");
+    assert!(stderr.contains("[REDACTED]"), "redacted stderr: {stderr}");
+    assert!(
+        !stderr.contains("canary"),
+        "secret leaked in stderr: {stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn stderr_with_timeout_stdin_keeps_stderr_when_feeder_hits_epipe() {
+    let argv = vec![
+        "sh".into(),
+        "-c".into(),
+        "printf 'remote diagnostic' >&2; exit 3".into(),
+    ];
+    let input = vec![b'x'; 1024 * 1024];
+    let (success, stderr) = stderr_with_timeout_stdin(&argv, Duration::from_secs(2), input)
+        .expect("child exit diagnostics survive a broken stdin pipe");
+    assert!(!success, "a child that rejects input reports failure");
+    assert!(
+        stderr.contains("remote diagnostic"),
+        "stderr was lost: {stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn stderr_with_timeout_stdin_kills_and_reaps_on_timeout() {
+    let argv = vec!["sh".into(), "-c".into(), "sleep 5".into()];
+    assert!(
+        stderr_with_timeout_stdin(&argv, Duration::from_millis(100), b"K=canary\n".to_vec())
+            .is_none(),
+        "a command exceeding its deadline returns None"
+    );
+}
+
+#[test]
+fn stderr_redaction_skips_short_common_values() {
+    let stderr = redact_stderr(
+        "CI=1 TERM=xterm token=long-secret-value".into(),
+        &["1".into(), "xterm".into(), "long-secret-value".into()],
+    );
+    assert_eq!(stderr, "CI=1 TERM=xterm token=[REDACTED]");
+}
+
+#[cfg(unix)]
+#[test]
+fn secret_env_file_replaces_a_planted_symlink_without_touching_its_target() {
+    let parent = tempfile::tempdir().unwrap();
+    let dir = parent.path().join("sandbox-env");
+    std::fs::create_dir(&dir).unwrap();
+    let victim = parent.path().join("victim");
+    std::fs::write(&victim, b"sentinel bytes").unwrap();
+    std::os::unix::fs::symlink(&victim, dir.join("launch.env")).unwrap();
+    let key = String::from("GH_TOKEN");
+    let value = String::from("canary-secret");
+
+    let path =
+        write_secret_env_file_in(&dir, "launch", &[(&key, &value)]).expect("atomic env-file write");
+    assert_eq!(std::fs::read(&victim).unwrap(), b"sentinel bytes");
+    assert!(
+        std::fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_file()
+    );
+    assert_eq!(
+        std::fs::read_to_string(path).unwrap(),
+        "GH_TOKEN=canary-secret\n"
+    );
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(
+        std::fs::metadata(dir.join("launch.env"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn secret_env_file_rejects_a_symlinked_directory() {
+    let parent = tempfile::tempdir().unwrap();
+    let target = parent.path().join("target");
+    std::fs::create_dir(&target).unwrap();
+    let dir = parent.path().join("sandbox-env");
+    std::os::unix::fs::symlink(&target, &dir).unwrap();
+    let key = String::from("GH_TOKEN");
+    let value = String::from("canary-secret");
+
+    assert!(write_secret_env_file_in(&dir, "launch", &[(&key, &value)]).is_none());
+    assert!(!target.join("launch.env").exists());
+}
+
+#[test]
+fn secret_env_file_rejects_a_regular_file_in_place_of_directory() {
+    let parent = tempfile::tempdir().unwrap();
+    let dir = parent.path().join("sandbox-env");
+    std::fs::write(&dir, b"not a directory").unwrap();
+    let key = String::from("GH_TOKEN");
+    let value = String::from("canary-secret");
+
+    assert!(write_secret_env_file_in(&dir, "launch", &[(&key, &value)]).is_none());
+    assert_eq!(std::fs::read(&dir).unwrap(), b"not a directory");
 }
 
 #[test]
