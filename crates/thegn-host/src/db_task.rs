@@ -59,10 +59,6 @@ fn writer() -> &'static Writer {
 
 /// Spawn the writer thread with a connection opener and return its send handle.
 /// Split from [`writer`] so tests can drive [`run`] with an isolated DB.
-fn spawn(open: impl Fn() -> anyhow::Result<Db> + Send + 'static) -> Sender<Msg> {
-    spawn_with_generations(open, Arc::new(Mutex::new(HashMap::new())))
-}
-
 fn spawn_with_generations(
     open: impl Fn() -> anyhow::Result<Db> + Send + 'static,
     generations: Arc<Mutex<HashMap<String, u64>>>,
@@ -160,6 +156,7 @@ fn enqueue_latest(
     key: String,
     job: Job,
 ) {
+    // Keys must come from a small fixed set so this generation map stays bounded.
     let mut generations = generations
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -193,7 +190,11 @@ mod tests {
     /// (pid + counter), not just per process — the module's tests run as
     /// parallel threads of one process, and a shared dir would let one test's
     /// `remove_dir_all` delete another's live DB mid-test.
-    fn temp_writer() -> (Sender<Msg>, std::path::PathBuf) {
+    fn temp_writer() -> (
+        Sender<Msg>,
+        std::path::PathBuf,
+        Arc<Mutex<HashMap<String, u64>>>,
+    ) {
         static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!("tg-dbtask-{}-{seq}", std::process::id()));
@@ -201,8 +202,9 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("t.db");
         let p = path.clone();
-        let tx = spawn(move || Db::open_at(&p));
-        (tx, path)
+        let generations = Arc::new(Mutex::new(HashMap::new()));
+        let tx = spawn_with_generations(move || Db::open_at(&p), Arc::clone(&generations));
+        (tx, path, generations)
     }
 
     fn barrier(tx: &Sender<Msg>) {
@@ -213,7 +215,7 @@ mod tests {
 
     #[test]
     fn writes_run_in_fifo_order_last_wins() {
-        let (tx, path) = temp_writer();
+        let (tx, path, _) = temp_writer();
         for v in ["first", "second", "third"] {
             let v = v.to_string();
             tx.send(Msg::Run(Box::new(move |db| {
@@ -229,7 +231,7 @@ mod tests {
 
     #[test]
     fn flush_barrier_waits_for_queued_work() {
-        let (tx, path) = temp_writer();
+        let (tx, path, _) = temp_writer();
         tx.send(Msg::Run(Box::new(|db| {
             let _ = db.set_ui_state("t", "flushed", "yes"); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
         })))
@@ -244,7 +246,7 @@ mod tests {
 
     #[test]
     fn persist_latest_coalesces_queued_values_by_key() {
-        let (tx, path) = temp_writer();
+        let (tx, path, generations) = temp_writer();
         let (started_tx, started_rx) = channel();
         let (release_tx, release_rx) = channel();
         tx.send(Msg::Run(Box::new(move |_db| {
@@ -254,7 +256,6 @@ mod tests {
         .unwrap();
         started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
 
-        let generations = Mutex::new(HashMap::new());
         let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         for value in ["first", "second", "third"] {
             let value = value.to_string();
@@ -265,7 +266,7 @@ mod tests {
                 "replaceable".to_string(),
                 Box::new(move |db| {
                     ran.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    drop(Result::ok(db.set_ui_state("t", "latest", &value)));
+                    db.set_ui_state("t", "latest", &value).unwrap();
                 }),
             );
         }
@@ -282,9 +283,9 @@ mod tests {
 
     #[test]
     fn lock_contention_does_not_block_enqueue_and_recovers_after_commit() {
-        let (tx, path) = temp_writer();
+        let (tx, path, _) = temp_writer();
         tx.send(Msg::Run(Box::new(|db| {
-            drop(Result::ok(db.set_ui_state("t", "ready", "yes")));
+            db.set_ui_state("t", "ready", "yes").unwrap();
         })))
         .unwrap();
         barrier(&tx);
@@ -293,7 +294,7 @@ mod tests {
 
         let started = std::time::Instant::now();
         tx.send(Msg::Run(Box::new(|db| {
-            drop(Result::ok(db.set_ui_state("t", "locked", "written")));
+            db.set_ui_state("t", "locked", "written").unwrap();
         })))
         .unwrap();
         assert!(started.elapsed() < Duration::from_millis(50));
@@ -303,7 +304,7 @@ mod tests {
         assert!(ack_rx.recv_timeout(Duration::from_millis(100)).is_err());
 
         lock.execute_batch("COMMIT").unwrap();
-        barrier(&tx);
+        ack_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         let db = Db::open_at(&path).unwrap();
         assert_eq!(
             db.get_ui_state("t", "locked").unwrap().as_deref(),
@@ -315,7 +316,10 @@ mod tests {
     fn open_failure_is_survived_without_panic() {
         // An opener that always fails: jobs are dropped, the thread stays alive,
         // and the flush barrier still acks.
-        let tx = spawn(|| anyhow::bail!("no db for you"));
+        let tx = spawn_with_generations(
+            || anyhow::bail!("no db for you"),
+            Arc::new(Mutex::new(HashMap::new())),
+        );
         tx.send(Msg::Run(Box::new(|_db| {
             unreachable!("open never succeeds")
         })))
