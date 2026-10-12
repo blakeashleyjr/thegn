@@ -214,8 +214,13 @@ fn startup_accepts_byte_identical_endpoint_announcements() {
     let (tx, rx) = std::sync::mpsc::sync_channel(2);
     let first = PublicEndpoint::parse_url("https://first.test").expect("valid URL");
     tx.send(first.clone()).expect("repeat announcement");
+    tx.send(first.clone())
+        .expect("byte-identical repeated announcement");
     drop(tx);
-    assert!(reject_duplicate_announcement(&rx, &first).is_ok());
+    assert!(
+        reject_duplicate_announcement(&rx, &first).is_ok(),
+        "a byte-identical repeated announcement must not fail startup"
+    );
 }
 
 #[test]

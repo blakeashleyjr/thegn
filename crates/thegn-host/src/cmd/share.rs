@@ -97,8 +97,8 @@ fn start(cfg: &Config, port: u16, worktree: Option<String>, reach: Option<String
                 Ok(r) => r,
                 Err(e) => return on_error_exit(spec.on_error, e),
             };
-            let display_endpoint =
-                thegn_svc::lsp::sanitize_for_terminal(&running.public_url.canonical());
+            let endpoint = display_endpoint(&running.public_url, &kind);
+            let display_endpoint = thegn_svc::lsp::sanitize_for_terminal(&endpoint);
             outln!("share: 127.0.0.1:{port} → {}", display_endpoint);
             outln!("share: press Ctrl-C to stop");
             if let Some(db) = &db {
@@ -136,6 +136,14 @@ fn start(cfg: &Config, port: u16, worktree: Option<String>, reach: Option<String
         }
     }
     Ok(())
+}
+
+fn display_endpoint(endpoint: &thegn_svc::share::PublicEndpoint, provider: &str) -> String {
+    if provider == "iroh" && endpoint.kind() == thegn_svc::share::PublicEndpointKind::Ticket {
+        format!("dumbpipe connect-tcp {}", endpoint.canonical())
+    } else {
+        endpoint.canonical()
+    }
 }
 
 fn cli_generation() -> Result<u64> {
@@ -199,4 +207,20 @@ fn stop(port: u16, worktree: Option<String>) -> Result<()> {
     outln!("share: removed record for port {port}");
     outln!("share: a foreground `share start` keeps running — interrupt it directly");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn iroh_ticket_displays_as_consumer_command() {
+        let ticket =
+            thegn_svc::share::PublicEndpoint::parse_ticket("TICKET123").expect("valid ticket");
+        assert_eq!(
+            display_endpoint(&ticket, "iroh"),
+            "dumbpipe connect-tcp TICKET123"
+        );
+        assert_eq!(ticket.canonical(), "TICKET123");
+    }
 }
