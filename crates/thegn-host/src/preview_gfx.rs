@@ -20,8 +20,12 @@ use crate::rasterize::Raster;
 pub struct PreviewGfx {
     /// The rasterized image and the preview path it belongs to.
     img: Option<(String, Raster)>,
-    /// The placement it is currently drawn at, or `None` when nothing is drawn.
-    drawn: Option<Placement>,
+    /// Content revision of `img`, bumped by every [`set`](PreviewGfx::set) so a
+    /// replacement at the same path and placement still redraws.
+    rev: u64,
+    /// The placement and content revision currently drawn, or `None` when
+    /// nothing is drawn.
+    drawn: Option<(Placement, u64)>,
 }
 
 impl PreviewGfx {
@@ -35,6 +39,7 @@ impl PreviewGfx {
     /// `open_path` is `None`), [`frame`](Self::frame) deletes the stale image.
     pub fn set(&mut self, rel: String, raster: Raster) {
         self.img = Some((rel, raster));
+        self.rev = self.rev.wrapping_add(1);
     }
 
     /// Bytes to write to the outer terminal this frame: draw the image once at
@@ -59,7 +64,7 @@ impl PreviewGfx {
             }
         };
         match want {
-            Some((place, raster)) if self.drawn != Some(place) => {
+            Some((place, raster)) if self.drawn != Some((place, self.rev)) => {
                 // (Re)draw: encode first, and commit `drawn` only once there are
                 // real bytes to emit. An invalid raster draws nothing.
                 match graphics::kitty_image(&raster.rgba, raster.w, raster.h, place) {
@@ -70,7 +75,7 @@ impl PreviewGfx {
                             out.extend_from_slice(graphics::delete_all());
                         }
                         out.extend_from_slice(&image);
-                        self.drawn = Some(place);
+                        self.drawn = Some((place, self.rev));
                         out
                     }
                     Err(_) => {
@@ -84,7 +89,7 @@ impl PreviewGfx {
                     }
                 }
             }
-            Some(_) => Vec::new(), // already drawn at this placement
+            Some(_) => Vec::new(), // already drawn at this placement and revision
             None if self.drawn.is_some() => {
                 self.drawn = None;
                 graphics::delete_all().to_vec()
@@ -172,6 +177,55 @@ mod tests {
         g.set("a.png".to_string(), raster());
         assert!(
             !g.frame(Some(panel()), Some("a.png"), false, true)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn invalid_replacement_clears_the_stale_drawn_image() {
+        let mut g = PreviewGfx::new();
+        g.set("a.png".to_string(), raster());
+        let _ = g.frame(Some(panel()), Some("a.png"), false, true); // best-effort: test: the frame's effect is the point; the assert below checks it
+        g.set(
+            "a.png".to_string(),
+            Raster {
+                rgba: Vec::new(),
+                w: 0,
+                h: 0,
+            },
+        );
+        assert_eq!(
+            g.frame(Some(panel()), Some("a.png"), false, true),
+            graphics::delete_all().to_vec()
+        );
+        assert!(g.drawn.is_none());
+    }
+
+    #[test]
+    fn same_path_same_placement_replacement_redraws() {
+        let mut g = PreviewGfx::new();
+        g.set("a.png".to_string(), raster());
+        let first = g.frame(Some(panel()), Some("a.png"), false, true);
+        assert!(!first.is_empty());
+        // Re-rasterized (file changed on disk) at the same path and placement.
+        g.set(
+            "a.png".to_string(),
+            Raster {
+                rgba: vec![9, 9, 9, 9],
+                w: 1,
+                h: 1,
+            },
+        );
+        let second = g.frame(Some(panel()), Some("a.png"), false, true);
+        assert!(
+            second.starts_with(graphics::delete_all()),
+            "stale image deleted"
+        );
+        assert!(second.len() > graphics::delete_all().len());
+        assert_ne!(first, second[graphics::delete_all().len()..].to_vec());
+        // And steady state is quiet again.
+        assert!(
+            g.frame(Some(panel()), Some("a.png"), false, true)
                 .is_empty()
         );
     }
