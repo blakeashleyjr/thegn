@@ -18,6 +18,11 @@ pub(crate) fn default_git_context() -> String {
     "global".into()
 }
 
+/// Default wall-clock limit for captured git custom commands: five minutes.
+pub(crate) fn default_custom_command_timeout_secs() -> u64 {
+    crate::custom_cmd::DEFAULT_TIMEOUT_SECS
+}
+
 /// Default `[sandbox] backend_chain` probe order. One chain serves every
 /// platform, because each OS-native entry probes Absent off its own OS:
 /// `"jobobject"` is the win-native kill-on-close Job Object scoping (the OCI
