@@ -133,7 +133,7 @@ pub(crate) fn watch_canonical(p: &std::path::Path) -> std::path::PathBuf {
     std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
 }
 
-/// How deep [`plan_watches`] will descend to prune before giving up and taking
+/// How deep the watch planner will descend to prune before giving up and taking
 /// one recursive watch on the remainder.
 ///
 /// Shallow on purpose. Descending costs correctness, not just time: a directory
@@ -199,6 +199,7 @@ pub(crate) fn prune_dir(p: &std::path::Path, ignore: &crate::diff_watch::IgnoreR
 ///
 /// Reads the filesystem (so not pure), but deterministic given a tree — the
 /// pruning precedence is unit-tested against real temp dirs.
+#[cfg(test)]
 pub(crate) fn plan_watches(
     root: &std::path::Path,
     ignore: &crate::diff_watch::IgnoreRules,
@@ -208,8 +209,8 @@ pub(crate) fn plan_watches(
     out
 }
 
-/// Like [`plan_watches`], but refuses plans whose recursive entries would
-/// exceed `cap` actual directory watches. `None` means use ticker/polling.
+/// Refuses plans whose recursive entries would exceed `cap` actual directory
+/// watches. `None` means use ticker/polling.
 pub(crate) fn plan_watches_with_cap(
     root: &std::path::Path,
     ignore: &crate::diff_watch::IgnoreRules,
@@ -260,6 +261,7 @@ pub(crate) fn count_recursive_watches(dir: &std::path::Path, remaining: usize) -
     Some(count)
 }
 
+#[cfg(test)]
 fn plan_descend(
     dir: &std::path::Path,
     ignore: &crate::diff_watch::IgnoreRules,
