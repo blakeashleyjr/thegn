@@ -1602,7 +1602,6 @@ where
                 Some(Ok(Message::Binary(bytes))) => {
                     match EventDecoder::decode_message(&bytes) {
                         Ok(frame) => {
-                            idle_deadline = liveness.map(|l| tokio::time::Instant::now() + l.read_idle);
                             if let Err(end) = guard.admit(&frame) { return end; }
                             match send_frame_while_servicing_control(
                                 frames,
