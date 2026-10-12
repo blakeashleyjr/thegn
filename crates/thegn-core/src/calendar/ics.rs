@@ -1317,7 +1317,7 @@ impl Builder {
         Ok(())
     }
 
-    fn finish(self, default_zone: &str, report: &mut IcsReport) -> Option<CalEvent> {
+    fn finish(mut self, default_zone: &str, report: &mut IcsReport) -> Option<CalEvent> {
         if self.quarantined {
             return None;
         }
