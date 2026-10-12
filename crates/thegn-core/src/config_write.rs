@@ -18,6 +18,32 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use toml_edit::{DocumentMut, Item, Table, value};
 
+fn shared_hard_link(metadata: &std::fs::Metadata) -> bool {
+    link_count(metadata) > 1
+}
+
+#[cfg(unix)]
+fn link_count(metadata: &std::fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    metadata.nlink()
+}
+
+#[cfg(not(unix))]
+fn link_count(_metadata: &std::fs::Metadata) -> u64 {
+    // std does not expose a stable Windows link count. Reparse/link handling is
+    // deferred until a platform-specific metadata seam is available.
+    1
+}
+
+fn reject_shared_hard_link(metadata: &std::fs::Metadata) -> Result<()> {
+    anyhow::ensure!(
+        !shared_hard_link(metadata),
+        "config file has {} hard links; refusing to replace it — edit it directly or remove the extra link",
+        link_count(metadata)
+    );
+    Ok(())
+}
+
 /// A typed environment to author into the global config. Optional fields are
 /// only written when `Some`, so `edit` upserts without dropping untouched keys.
 #[derive(Debug, Clone, Default)]
@@ -55,6 +81,7 @@ fn read_doc(path: &Path) -> Result<(DocumentMut, Option<Vec<u8>>)> {
                 crate::fsperm::owned_by_current_user(&metadata),
                 "config file is not owned by the current user"
             );
+            reject_shared_hard_link(&metadata)?;
             let mut bytes = Vec::new();
             file.read_to_end(&mut bytes)
                 .with_context(|| format!("read {}", path.display()))?;
@@ -153,6 +180,41 @@ fn lock_config_writer(path: &Path) -> Result<std::fs::File> {
     }
 }
 
+/// Create an exact-byte config seed under the same writer lock as edits.
+/// Existing destinations are left untouched; only a missing parent is created
+/// private, matching the fenced writer's parent policy.
+pub fn seed_if_absent(path: &Path, bytes: &[u8]) -> Result<bool> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    match std::fs::symlink_metadata(parent) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            crate::fsperm::ensure_private_dir(parent)
+                .with_context(|| format!("create private config directory {}", parent.display()))?;
+        }
+        Err(error) => return Err(error).with_context(|| format!("inspect {}", parent.display())),
+    }
+
+    let _writer_lock = lock_config_writer(path)?;
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => return Ok(false),
+        Ok(_) => anyhow::bail!("config path exists but is not a regular file"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).with_context(|| format!("inspect {}", path.display())),
+    }
+    crate::fsperm::write_owner_only_new(path, bytes)
+        .with_context(|| format!("create private config seed {}", path.display()))?;
+    if let Err(error) = crate::fsperm::sync_parent_dir(parent) {
+        crate::msg::warn(&format!(
+            "config seed was written, but its directory could not be synced; the change may not survive a crash: {error} ({})",
+            parent.display()
+        ));
+    }
+    Ok(true)
+}
+
 fn write_doc_fenced(
     path: &Path,
     doc: &DocumentMut,
@@ -179,6 +241,7 @@ fn write_doc_fenced(
                 crate::fsperm::owned_by_current_user(&metadata),
                 "config destination is not owned by the current user"
             );
+            reject_shared_hard_link(&metadata)?;
             let mut bytes = Vec::new();
             file.read_to_end(&mut bytes)
                 .context("read config generation")?;
@@ -223,6 +286,7 @@ fn write_doc_fenced(
                 crate::fsperm::owned_by_current_user(&metadata),
                 "config destination is not owned by the current user"
             );
+            reject_shared_hard_link(&metadata)?;
             let mut bytes = Vec::new();
             file.read_to_end(&mut bytes)
                 .context("recheck config generation")?;
@@ -675,6 +739,83 @@ mod tests {
 
         set_key(&p, "picker", "auto").unwrap();
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "picker = \"auto\"\n");
+    }
+
+    #[test]
+    fn seed_rejects_a_held_writer_lock_without_creating_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.toml");
+        let lock_path = config_lock_path(&p).unwrap();
+        let held = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+            .unwrap();
+        held.try_lock().unwrap();
+
+        assert!(seed_if_absent(&p, b"picker = \"list\"\n").is_err());
+        assert!(!p.exists(), "a rejected seed must leave config absent");
+    }
+
+    #[test]
+    fn seed_creates_missing_parent_privately_and_leaves_existing_bytes_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("new");
+        let path = parent.join("config.toml");
+        let bytes = b"# exact seed bytes\npicker = \"list\"\n";
+
+        assert!(seed_if_absent(&path, bytes).unwrap());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert!(matches!(
+            crate::fsperm::mode_bits(&path).unwrap(),
+            None | Some(0o600)
+        ));
+        assert!(matches!(
+            crate::fsperm::mode_bits(&parent).unwrap(),
+            None | Some(0o700)
+        ));
+
+        std::fs::write(&path, b"existing bytes\n").unwrap();
+        assert!(!seed_if_absent(&path, bytes).unwrap());
+        assert_eq!(std::fs::read(&path).unwrap(), b"existing bytes\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn seed_rejects_a_dangling_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let target = dir.path().join("missing-target.toml");
+        symlink(&target, &path).unwrap();
+
+        let error = seed_if_absent(&path, b"picker = \"list\"\n").unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("config path exists but is not a regular file")
+        );
+        assert!(!target.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn set_key_refuses_hard_linked_config_without_changing_either_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let alias = dir.path().join("alias.toml");
+        let original = b"picker = \"list\"\n";
+        std::fs::write(&path, original).unwrap();
+        std::fs::hard_link(&path, &alias).unwrap();
+
+        let result = set_key(&path, "picker", "auto");
+
+        let error = result.expect_err("a shared inode must not be replaced");
+        assert!(error.to_string().contains("2 hard links"), "{error}");
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert_eq!(std::fs::read(&alias).unwrap(), original);
     }
 
     #[test]
