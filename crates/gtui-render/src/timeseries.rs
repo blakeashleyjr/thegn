@@ -139,8 +139,9 @@ fn segments(points: &[(f64, f64)]) -> impl Iterator<Item = [(f64, f64); 2]> + '_
 /// Estimate a line-break threshold from the finite timestamp domain. The
 /// threshold is three times the mean interval (`span / (finite_count - 1)`);
 /// for width-reduced series it is at least two timestamp bucket widths so
-/// bucket reduction does not create artificial gaps. Segment checks use the
-/// absolute timestamp delta, so out-of-order samples follow the same rule.
+/// bucket reduction does not create artificial gaps. Consequently, holes
+/// narrower than two buckets are invisible at that width. Segment checks use
+/// the absolute timestamp delta, so out-of-order samples follow the same rule.
 fn gap_threshold(times: &[f64], domain: [f64; 2], width: usize) -> Option<f64> {
     let finite_count = times.iter().filter(|time| time.is_finite()).count();
     if finite_count < 2 {
@@ -369,7 +370,7 @@ mod tests {
                 if index < 50_000 {
                     index as f64
                 } else {
-                    index as f64 + 100.0
+                    index as f64 + 10_000.0
                 }
             })
             .collect();
@@ -386,7 +387,7 @@ mod tests {
         assert!(
             lines
                 .iter()
-                .all(|line| line[0].0 >= 50_000.0 || line[1].0 < 50_100.0)
+                .all(|line| line[0].0 >= 50_000.0 || line[1].0 < 60_000.0)
         );
     }
 
