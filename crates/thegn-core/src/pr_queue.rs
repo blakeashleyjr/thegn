@@ -34,6 +34,11 @@ pub fn attest_pr_identity(
             "queued PR identity {bound_url} is invalid; fetched identity is {fetched_url} (#{fetched_number}); {readd}"
         ));
     };
+    if !pr_url_number_matches(bound_url, number) {
+        return Err(format!(
+            "queued PR identity {bound_url} does not identify pull request #{number}; {readd}"
+        ));
+    }
     if fetched_number != number {
         return Err(format!(
             "queued PR identity {bound_url} (#{number}) differs from fetched identity {fetched_url} (#{fetched_number}); {readd}"
@@ -44,6 +49,11 @@ pub fn attest_pr_identity(
             "queued PR identity {bound_url} (#{number}) differs from invalid fetched identity {fetched_url}; {readd}"
         ));
     };
+    if !pr_url_number_matches(fetched_url, fetched_number) {
+        return Err(format!(
+            "fetched PR identity {fetched_url} does not identify pull request #{fetched_number}; {readd}"
+        ));
+    }
     if !bound.matches(&fetched) {
         return Err(format!(
             "queued PR identity {}:{} (#{number}) differs from fetched identity {}:{} (#{fetched_number}); {readd}",
@@ -51,6 +61,25 @@ pub fn attest_pr_identity(
         ));
     }
     Ok(())
+}
+
+fn pr_url_number_matches(url: &str, expected: u64) -> bool {
+    let Some((_, path)) = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .and_then(|rest| rest.split_once('/'))
+    else {
+        return false;
+    };
+    let mut parts = path.trim_end_matches('/').split('/');
+    let Some(last) = parts.next_back() else {
+        return false;
+    };
+    let Some(route) = parts.next_back() else {
+        return false;
+    };
+    matches!(route, "pull" | "pulls" | "merge_requests")
+        && last.parse::<u64>().is_ok_and(|number| number == expected)
 }
 
 /// What is keeping a queued pull request from merging.
@@ -1079,7 +1108,31 @@ mod tests {
         for (binding, url, number, expected) in [
             (None, actual, 7, "unbound"),
             (Some("not a URL"), actual, 7, "invalid"),
+            (
+                Some("https://github.com/acme/repo/pull/8"),
+                actual,
+                7,
+                "pull request #7",
+            ),
+            (
+                Some("https://github.com/acme/repo/issues/7"),
+                actual,
+                7,
+                "pull request #7",
+            ),
             (Some(bound), actual, 8, "differs"),
+            (
+                Some(bound),
+                "https://github.com/acme/repo/pull/8",
+                7,
+                "pull request #7",
+            ),
+            (
+                Some(bound),
+                "https://github.com/acme/repo/issues/7",
+                7,
+                "pull request #7",
+            ),
             (Some(bound), "bad URL", 7, "invalid fetched"),
             (
                 Some(bound),

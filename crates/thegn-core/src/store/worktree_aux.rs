@@ -236,6 +236,7 @@ pub trait WorktreeAuxStore {
 
     /// Queue a PR with the canonical URL fetched from the forge. Re-adding a
     /// bound PR replaces both its identity and checkout binding.
+    #[allow(clippy::too_many_arguments)] // mirrors enqueue_pr plus the bound URL
     fn enqueue_bound_pr(
         &self,
         repo_root: &str,
