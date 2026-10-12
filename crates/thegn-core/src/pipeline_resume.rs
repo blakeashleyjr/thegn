@@ -338,8 +338,7 @@ mod tests {
 You are dispatch row 8. Commit the handoff artifact at `.thegn/pipeline/THE-86/code/8.md`.\n\
 Then file your report for this row with `thegn dispatch report 8 --text '<VERDICT>: <summary>'`.\n\
 Lead with one verdict: PASS, REVISE, FAIL, or BLOCKED. For PASS, add a `gate:` line\n\
-citing the successful validation command. Do not change this row's status; the supervisor\n\
-verifies the artifact and report and closes the row.\n\
+citing the successful validation command. Do not change this row's status; the supervisor verifies the artifact and report and closes the row.\n\
 --- end thegn completion contract v1 ---";
 
     fn rendered_with_contract(task: &str) -> String {
@@ -793,10 +792,15 @@ verifies the artifact and report and closes the row.\n\
         assert!(contract.is_none());
         assert!(!finisher_prompt(&input()).contains(COMPLETION_CONTRACT_OPEN_PREFIX));
 
-        let oversized = format!(
-            "task\n\n{COMPLETION_CONTRACT}\n{}",
+        let oversized_contract = format!(
+            "--- thegn completion contract v1 ---\n{}\n--- end thegn completion contract v1 ---",
             "x".repeat(CONTRACT_MAX_BYTES)
         );
+        assert!(oversized_contract.starts_with(COMPLETION_CONTRACT_OPEN_PREFIX));
+        assert!(oversized_contract.contains(&format!("\n{COMPLETION_CONTRACT_CLOSE_PREFIX}")));
+        assert!(oversized_contract.trim_end().ends_with(" ---"));
+        assert!(oversized_contract.len() > CONTRACT_MAX_BYTES);
+        let oversized = format!("task\n\n{oversized_contract}");
         let (task, contract) = split_completion_contract(&oversized);
         assert_eq!(task, oversized);
         assert!(contract.is_none());
