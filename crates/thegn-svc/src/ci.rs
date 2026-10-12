@@ -31,7 +31,7 @@ use std::process::{Command, Stdio};
 /// are applied again by the cache-facing read paths).
 const PROVIDER_LOG_MAX_LINES: usize = 2_000;
 const PROVIDER_LOG_MAX_BYTES: usize = 1024 * 1024;
-const GITLAB_JOBS_PAGE_SIZE: usize = 20;
+const GITLAB_JOBS_PAGE_SIZE: usize = 100;
 const GITLAB_JOBS_MAX_PAGES: usize = 50;
 const GITLAB_JOBS_MAX_ROWS: usize = GITLAB_JOBS_PAGE_SIZE * GITLAB_JOBS_MAX_PAGES;
 const GITLAB_JOBS_MAX_BYTES: usize = 4 * 1024 * 1024;
@@ -683,12 +683,23 @@ impl CiProvider for GithubCi {
             .get("databaseId")
             .cloned()
             .unwrap_or(serde_json::Value::Null);
-        let run = parse_gh_run_detail(&json)
+        let run = gh_run_from_value(&value)
             .ok_or_else(|| CiError::Other(format!("invalid provider run identifier {observed}")))?;
-        let discarded_jobs = gh_jobs_with_discarded(value.get("jobs")).1;
+        let jobs = value
+            .get("jobs")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| {
+                CiError::Other(format!("malformed GitHub job rows in run {}", run.id))
+            })?;
+        let (parsed_jobs, discarded_jobs) = parse_provider_row(jobs, gh_job_from_value);
         if discarded_jobs > 0 {
-            tracing::warn!(target: "thegn::ci", discarded_rows = discarded_jobs, "discarded malformed GitHub job rows");
+            return Err(CiError::Other(format!(
+                "malformed GitHub job/step rows in run {} ({discarded_jobs} row(s))",
+                run.id
+            )));
         }
+        let mut run = run;
+        run.jobs = parsed_jobs;
         validate_ci_id(&run.id)?;
         if run.id != run_id {
             return Err(CiError::Other(format!(
@@ -780,26 +791,7 @@ fn gh_run_from_value(v: &serde_json::Value) -> Option<CiRun> {
     let id = json_id(v, "databaseId")?;
     let status = nonempty(v, "status")?;
     let conclusion = nonempty(v, "conclusion");
-    if !matches!(
-        status.to_ascii_lowercase().as_str(),
-        "queued" | "waiting" | "requested" | "pending" | "in_progress" | "completed"
-    ) || conclusion.as_deref().is_some_and(|value| {
-        !matches!(
-            value.to_ascii_lowercase().as_str(),
-            "success"
-                | "failure"
-                | "timed_out"
-                | "cancelled"
-                | "canceled"
-                | "skipped"
-                | "neutral"
-                | "action_required"
-                | "stale"
-                | "startup_failure"
-        )
-    }) {
-        return None;
-    }
+    warn_unknown_github_state("run", &status, conclusion.as_deref());
     let completed = status.eq_ignore_ascii_case("completed");
     Some(CiRun {
         id,
@@ -830,26 +822,7 @@ fn gh_job_from_value(v: &serde_json::Value) -> Option<CiJob> {
     let id = json_id(v, "databaseId")?;
     let status = nonempty(v, "status")?;
     let conclusion = nonempty(v, "conclusion");
-    if !matches!(
-        status.to_ascii_lowercase().as_str(),
-        "queued" | "waiting" | "requested" | "pending" | "in_progress" | "completed"
-    ) || conclusion.as_deref().is_some_and(|value| {
-        !matches!(
-            value.to_ascii_lowercase().as_str(),
-            "success"
-                | "failure"
-                | "timed_out"
-                | "cancelled"
-                | "canceled"
-                | "skipped"
-                | "neutral"
-                | "action_required"
-                | "stale"
-                | "startup_failure"
-        )
-    }) {
-        return None;
-    }
+    warn_unknown_github_state("job", &status, conclusion.as_deref());
     Some(CiJob {
         id,
         name: nonempty(v, "name").unwrap_or_default(),
@@ -869,11 +842,29 @@ fn gh_job_from_value(v: &serde_json::Value) -> Option<CiJob> {
 fn gh_step_from_value(v: &serde_json::Value) -> Option<CiStep> {
     let status = nonempty(v, "status")?;
     let conclusion = nonempty(v, "conclusion");
-    if !matches!(
-        status.to_ascii_lowercase().as_str(),
-        "queued" | "in_progress" | "completed"
-    ) || conclusion.as_deref().is_some_and(|value| {
-        !matches!(
+    warn_unknown_github_state("step", &status, conclusion.as_deref());
+    Some(CiStep {
+        name: nonempty(v, "name")?,
+        number: v.get("number").and_then(serde_json::Value::as_u64),
+        state: CiState::from_github(&status, conclusion.as_deref()),
+        started_at: nonempty(v, "startedAt"),
+        finished_at: nonempty(v, "completedAt"),
+    })
+}
+
+fn warn_unknown_github_state(kind: &str, status: &str, conclusion: Option<&str>) {
+    let known_status = match kind {
+        "step" => matches!(
+            status.to_ascii_lowercase().as_str(),
+            "queued" | "in_progress" | "completed"
+        ),
+        _ => matches!(
+            status.to_ascii_lowercase().as_str(),
+            "queued" | "waiting" | "requested" | "pending" | "in_progress" | "completed"
+        ),
+    };
+    let known_conclusion = conclusion.is_none_or(|value| {
+        matches!(
             value.to_ascii_lowercase().as_str(),
             "success"
                 | "failure"
@@ -886,16 +877,10 @@ fn gh_step_from_value(v: &serde_json::Value) -> Option<CiStep> {
                 | "stale"
                 | "startup_failure"
         )
-    }) {
-        return None;
+    });
+    if !known_status || !known_conclusion {
+        tracing::warn!(target: "thegn::ci", unknown_states = 1, kind, status, ?conclusion, "unknown GitHub CI state; using fallback mapping");
     }
-    Some(CiStep {
-        name: nonempty(v, "name")?,
-        number: v.get("number").and_then(serde_json::Value::as_u64),
-        state: CiState::from_github(&status, conclusion.as_deref()),
-        started_at: nonempty(v, "startedAt"),
-        finished_at: nonempty(v, "completedAt"),
-    })
 }
 
 /// Parse `gh workflow list --json id,name,path,state`.
@@ -1045,20 +1030,10 @@ impl CiProvider for GitlabCi {
                 serde_json::from_str::<Vec<serde_json::Value>>(&jobs_json).map_err(|error| {
                     CiError::Other(format!("invalid GitLab jobs response: {error}"))
                 })?;
-            let row_count = page_rows.len();
-            let (parsed, discarded) = parse_provider_row(&page_rows, |v| {
-                let id = json_id(v, "id")?;
-                let status = nonempty(v, "status")?;
-                Some(CiJob {
-                    id,
-                    name: nonempty(v, "name").unwrap_or_default(),
-                    state: CiState::from_gitlab(&status),
-                    url: nonempty(v, "web_url"),
-                    started_at: nonempty(v, "started_at"),
-                    finished_at: nonempty(v, "finished_at"),
-                    steps: Vec::new(),
-                })
-            });
+            let page_length = page_rows.len();
+            let (parsed, discarded) =
+                parse_gitlab_jobs_with_discarded(&jobs_json).map_err(CiError::Other)?;
+            let row_count = parsed.len() + discarded;
             for job in parsed {
                 if !ids.insert(job.id.clone()) {
                     return Err(CiError::Other(format!(
@@ -1074,7 +1049,7 @@ impl CiProvider for GitlabCi {
                     "GitLab jobs pagination row budget exhausted".into(),
                 ));
             }
-            if row_count < GITLAB_JOBS_PAGE_SIZE {
+            if page_length < GITLAB_JOBS_PAGE_SIZE {
                 complete = true;
                 break;
             }
@@ -1345,9 +1320,7 @@ pub fn parse_gitlab_pipeline_detail(json: &str) -> Option<CiRun> {
 fn gitlab_pipeline_from_value(v: &serde_json::Value) -> Option<CiRun> {
     let id = json_id(v, "id")?;
     let status = nonempty(v, "status")?;
-    if !valid_gitlab_status(&status) {
-        return None;
-    }
+    warn_unknown_gitlab_state(&status);
     let terminal = CiState::from_gitlab(&status).is_terminal();
     Some(CiRun {
         id: id.clone(),
@@ -1378,9 +1351,7 @@ pub fn parse_gitlab_jobs_with_discarded(json: &str) -> Result<(Vec<CiJob>, usize
     Ok(parse_provider_row(&arr, |v| {
         let id = json_id(v, "id")?;
         let status = nonempty(v, "status")?;
-        if !valid_gitlab_status(&status) {
-            return None;
-        }
+        warn_unknown_gitlab_state(&status);
         Some(CiJob {
             id,
             name: nonempty(v, "name").unwrap_or_default(),
@@ -1393,8 +1364,8 @@ pub fn parse_gitlab_jobs_with_discarded(json: &str) -> Result<(Vec<CiJob>, usize
     }))
 }
 
-fn valid_gitlab_status(status: &str) -> bool {
-    matches!(
+fn warn_unknown_gitlab_state(status: &str) {
+    if !matches!(
         status.to_ascii_lowercase().as_str(),
         "created"
             | "waiting_for_resource"
@@ -1408,7 +1379,11 @@ fn valid_gitlab_status(status: &str) -> bool {
             | "skipped"
             | "manual"
             | "scheduled"
-    )
+            | "canceling"
+            | "waiting_for_callback"
+    ) {
+        tracing::warn!(target: "thegn::ci", unknown_states = 1, status, "unknown GitLab CI state; using fallback mapping");
+    }
 }
 
 #[cfg(test)]
@@ -1573,7 +1548,7 @@ mod tests {
     #[test]
     fn provider_json_ids_are_numeric_and_bad_list_rows_are_counted() {
         let payload = r#"[
-          {"databaseId":1,"status":"completed"},
+          {"databaseId":1,"status":"completed","workflowName":"CI"},
           {"databaseId":"2","status":"completed"},
           {"databaseId":1.0,"status":"completed"},
           {"databaseId":-1,"status":"completed"},
@@ -1586,7 +1561,7 @@ mod tests {
         );
         assert_eq!(discarded, 4);
 
-        let jobs = r#"[{"id":7},{"id":"8"},{"id":1e5}]"#;
+        let jobs = r#"[{"id":7,"status":"success"},{"id":"8"},{"id":1e5}]"#;
         let (jobs, discarded) = parse_gitlab_jobs_with_discarded(jobs).unwrap();
         assert_eq!(
             jobs.iter().map(|job| job.id.as_str()).collect::<Vec<_>>(),
@@ -1594,11 +1569,133 @@ mod tests {
         );
         assert_eq!(discarded, 2);
         let rows: serde_json::Value =
-            serde_json::from_str(r#"[{"databaseId":7},{"databaseId":"8"},{"databaseId":1e5}]"#)
+            serde_json::from_str(r#"[{"databaseId":7,"status":"completed","steps":[]},{"databaseId":"8"},{"databaseId":1e5}]"#)
                 .unwrap();
         let (parsed, discarded) = gh_jobs_with_discarded(Some(&rows));
         assert_eq!(parsed.len(), 1);
         assert_eq!(discarded, 2);
+    }
+
+    #[test]
+    fn unknown_gitlab_status_is_kept_and_mapped_to_unknown() {
+        let (runs, discarded) =
+            parse_gitlab_pipelines_with_discarded(r#"[{"id":9,"status":"canceling"}]"#).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].state, CiState::Pending);
+        assert_eq!(discarded, 0);
+    }
+
+    #[test]
+    fn unknown_github_run_and_job_states_are_kept() {
+        let (runs, discarded) = parse_gh_runs_with_discarded(
+            r#"[{"databaseId":9,"workflowName":"CI","status":"future_state","conclusion":"future_result"}]"#,
+        )
+        .unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].state, CiState::Fail);
+        assert_eq!(discarded, 0);
+        let (jobs, discarded) = gh_jobs_with_discarded(Some(&serde_json::json!([
+            {"databaseId": 10, "name": "job", "status": "future_state", "steps": []}
+        ])));
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].state, CiState::Pending);
+        assert_eq!(discarded, 0);
+    }
+
+    #[test]
+    fn gitlab_detail_paginates_and_rejects_incomplete_or_duplicate_pages() {
+        let temp = tempfile::tempdir().unwrap();
+        let bin = temp.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let glab = bin.join("glab");
+        std::fs::write(
+            &glab,
+            r##"#!/bin/sh
+endpoint=
+for arg in "$@"; do endpoint=$arg; done
+case "$endpoint" in
+  *"/pipelines/123/jobs?"*|*"/pipelines/124/jobs?"*|*"/pipelines/125/jobs?"*|*"/pipelines/126/jobs?"*)
+    case "$endpoint" in *pipelines/123/jobs?*) run=123 ;; *pipelines/124/jobs?*) run=124 ;; *pipelines/125/jobs?*) run=125 ;; *) run=126 ;; esac
+    page=${endpoint##*page=}
+    if [ "$run" = 126 ]; then printf '{}\n'; exit 0; fi
+    if [ "$page" = 1 ] || [ "$run" = 125 ]; then
+      printf '['
+      i=1
+      base=$(( (page - 1) * 100 ))
+      while [ "$i" -le 100 ]; do
+        [ "$i" -gt 1 ] && printf ','
+        id=$((base + i))
+        printf '{"id":%s,"name":"job-%s","status":"success"}' "$id" "$id"
+        i=$((i + 1))
+      done
+      printf ']\n'
+    elif [ "$run" = 123 ]; then
+      printf '[{"id":101,"name":"last","status":"failed"}]\n'
+    elif [ "$run" = 124 ]; then
+      printf '[{"id":1,"name":"duplicate","status":"success"}]\n'
+    else
+      printf '[]\n'
+    fi ;;
+  *"/pipelines/"*)
+    run=${endpoint##*/}
+    printf '{"id":%s,"status":"success"}\n' "$run" ;;
+  *) printf '[]\n' ;;
+esac
+"##,
+        )
+        .unwrap();
+        if thegn_core::fsperm::make_executable_for_test(&glab).is_err() {
+            return;
+        }
+        let loc = GitLoc::Local(temp.path().to_path_buf());
+        for args in [
+            vec!["init", "-q"],
+            vec![
+                "remote",
+                "add",
+                "origin",
+                "https://gitlab.com/group/repo.git",
+            ],
+        ] {
+            assert!(
+                thegn_core::util::git_cmd(temp.path())
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let _env = thegn_core::testenv::EnvGuard::mutate_pairs(&[("PATH", Some(&path))]);
+        let client = GitlabCi::default();
+        let detail = client.run_detail(&loc, "123").unwrap();
+        assert_eq!(detail.run.jobs.len(), 101);
+        assert_eq!(detail.run.jobs[100].state, CiState::Fail);
+        assert!(
+            client
+                .run_detail(&loc, "124")
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate GitLab job id")
+        );
+        assert!(
+            client
+                .run_detail(&loc, "125")
+                .unwrap_err()
+                .to_string()
+                .contains("page budget exhausted")
+        );
+        assert!(
+            client
+                .run_detail(&loc, "126")
+                .unwrap_err()
+                .to_string()
+                .contains("invalid GitLab jobs response")
+        );
     }
 
     #[test]
@@ -1713,7 +1810,8 @@ printf '%s\t' "$@" >> "$CI_CAPTURE"
 printf 'GH_REPO=%s\tGH_HOST=%s\n' "$GH_REPO" "$GH_HOST" >> "$CI_CAPTURE"
 case " $* " in
   *" --job "*) printf 'log output\n' ;;
-  *" view "*) printf '%s\n' '{"databaseId":123,"status":"completed","jobs":[]}' ;;
+  *" view "*" 124 "*) printf '%s\n' '{"databaseId":124,"workflowName":"CI","status":"completed","jobs":[{"databaseId":456,"status":"completed","steps":[{}]}]}' ;;
+  *" view "*) printf '%s\n' '{"databaseId":123,"workflowName":"CI","status":"completed","jobs":[]}' ;;
   *) printf '[]\n' ;;
 esac
 "##,
@@ -1782,6 +1880,13 @@ esac
             .runs(&loc, Some("feature&status=success"), 7)
             .unwrap();
         client.run_detail(&loc, "123").unwrap();
+        assert!(
+            client
+                .run_detail(&loc, "124")
+                .unwrap_err()
+                .to_string()
+                .contains("malformed GitHub job/step rows")
+        );
         client.logs(&loc, "123", "456").unwrap();
         client.workflows(&loc).unwrap();
         client.trigger(&loc, "release/manual.yml", &[]).unwrap();
