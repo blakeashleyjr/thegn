@@ -4468,10 +4468,22 @@ fn simultaneous_overlapping_chunk_admissions_grant_exactly_one_and_refuse_the_ot
             .iter()
             .filter(|r| matches!(
                 r,
-                Err(crate::db_dispatch::DispatchAdmissionDecision::RetryScopeSnapshot { .. })
+                Err(crate::db_dispatch::DispatchAdmissionDecision::ScopeRefused(reason))
+                    if reason.contains("admitted scope snapshot")
             ))
             .count(),
         1,
+        "{results:?}"
+    );
+    assert_eq!(
+        results
+            .iter()
+            .filter(|r| matches!(
+                r,
+                Err(crate::db_dispatch::DispatchAdmissionDecision::RetryScopeSnapshot { .. })
+            ))
+            .count(),
+        0,
         "{results:?}"
     );
 }

@@ -964,10 +964,19 @@ fn list(active: bool, json: bool) -> Result<()> {
             v["verdict_disagrees"] = serde_json::json!(
                 pipeline_report::verdict_disagrees_with_status(d.status, verdict)
             );
-            let admitted = db.dispatch_chunk_scope(d.id)?;
-            v["chunk_files_admitted"] = admitted
-                .as_ref()
-                .map_or(serde_json::Value::Null, |files| serde_json::json!(files));
+            let admitted = match db.dispatch_chunk_scope(d.id) {
+                Ok(admitted) => {
+                    v["chunk_files_admitted"] = admitted
+                        .as_ref()
+                        .map_or(serde_json::Value::Null, |files| serde_json::json!(files));
+                    admitted
+                }
+                Err(error) => {
+                    v["chunk_files_admitted"] = serde_json::Value::Null;
+                    v["chunk_scope_error"] = serde_json::json!(error.to_string());
+                    None
+                }
+            };
             let live_files = d
                 .chunk_path
                 .as_deref()
@@ -979,11 +988,11 @@ fn list(active: bool, json: bool) -> Result<()> {
             if let Some(files) = &live_files {
                 v["chunk_files_from_file_at_display_time"] = serde_json::json!(files);
             }
-            v["chunk_scope_drift"] = serde_json::json!(
-                admitted
-                    .as_ref()
-                    .is_some_and(|files| live_files.as_ref() != Some(files))
-            );
+            v["chunk_scope_drift"] = match admitted.as_ref() {
+                Some(files) => serde_json::json!(live_files.as_ref() != Some(files)),
+                None if d.chunk_path.is_some() => serde_json::Value::Null,
+                None => serde_json::json!(false),
+            };
             vals.push(v);
         }
         return super::emit_json(&vals);
@@ -2849,6 +2858,12 @@ mod tests {
             db.dispatch_chunk_scope(first).unwrap(),
             Some(vec!["src/**".into()])
         );
+
+        std::fs::write(
+            std::path::Path::new(&wt).join("chunk-1.md"),
+            "---\nfiles: [docs/x.md]\n---\n",
+        )
+        .unwrap();
 
         let claim_second = || {
             claim_admitted_with_refresh(
