@@ -195,7 +195,7 @@ mod tests {
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{")
                 .await
                 .unwrap();
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
         });
         let source = PrometheusSource::with_timeouts(
             format!("http://{address}"),
@@ -205,6 +205,7 @@ mod tests {
             std::time::Duration::from_secs(10),
         );
         let now = Utc::now();
+        let started = tokio::time::Instant::now();
         let error = tokio::time::timeout(
             std::time::Duration::from_secs(2),
             source.query(vec![Query {
@@ -216,7 +217,13 @@ mod tests {
         .await
         .expect("read timeout did not bound the stalled body")
         .unwrap_err();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "read timeout took {:?}",
+            started.elapsed()
+        );
         assert!(matches!(error, QueryError::Network(_)));
-        server.await.unwrap();
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
     }
 }
