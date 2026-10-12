@@ -22,7 +22,7 @@
 pub mod graphql;
 pub mod machines;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::sync::Mutex;
 
@@ -220,7 +220,7 @@ impl FlySpec {
 pub struct FlyProvider {
     spec: FlySpec,
     client: reqwest::Client,
-    ip: Mutex<Option<String>>,
+    ips: Mutex<HashMap<String, String>>,
 }
 
 impl FlyProvider {
@@ -228,7 +228,7 @@ impl FlyProvider {
         FlyProvider {
             spec,
             client: crate::provider::provider_http_client(),
-            ip: Mutex::new(None),
+            ips: Mutex::new(HashMap::new()),
         }
     }
 
@@ -337,17 +337,32 @@ impl FlyProvider {
     /// Resolve the sandbox's public IPv4: cache → ledger → the app's IP via API.
     pub async fn resolve_ip(&self, name: &str) -> Result<String> {
         registry::checked_name(name)?;
-        if let Some(ip) = self.ip.lock().unwrap().clone().filter(|i| !i.is_empty()) {
+        if let Some(ip) = self
+            .ips
+            .lock()
+            .unwrap()
+            .get(name)
+            .filter(|ip| !ip.is_empty())
+            .cloned()
+        {
             return Ok(ip);
         }
-        if let Some(rec) = registry::read(name).filter(|r| r.state == "ready" && !r.ip.is_empty()) {
-            *self.ip.lock().unwrap() = Some(rec.ip.clone());
+        if let Some(rec) = registry::read(name)
+            .filter(|r| r.provider == LEDGER_PROVIDER && r.state == "ready" && !r.ip.is_empty())
+        {
+            self.ips
+                .lock()
+                .unwrap()
+                .insert(name.to_string(), rec.ip.clone());
             return Ok(rec.ip);
         }
         let app = app_name(name);
         let ip = graphql::parse_app_ipv4(&self.graphql(&graphql::app_ips_query(&app)).await?)
             .ok_or_else(|| anyhow!("fly: sandbox {name} has no dedicated IPv4 yet"))?;
-        *self.ip.lock().unwrap() = Some(ip.clone());
+        self.ips
+            .lock()
+            .unwrap()
+            .insert(name.to_string(), ip.clone());
         Ok(ip)
     }
 
@@ -587,6 +602,7 @@ impl FlyProvider {
                 })?;
             let status = resp.status();
             if status.is_success() || status == reqwest::StatusCode::NOT_FOUND {
+                self.ips.lock().unwrap().remove(id);
                 return Ok(());
             }
             last_status = Some(status);
@@ -612,6 +628,7 @@ impl FlyProvider {
         let custody_account = thegn_core::managed_ssh::account_label(&self.spec.key_path);
         thegn_core::managed_ssh::record_revoked("fly", &custody_account, id)
             .context("fly: retire managed SSH custody")?;
+        self.ips.lock().unwrap().remove(id);
         registry::remove(id);
         Ok(())
     }
@@ -713,7 +730,7 @@ impl RemoteProvider for FlyProvider {
                 ip: ip.clone(),
                 created_at: thegn_core::util::now(),
             })?;
-            *self.ip.lock().unwrap() = Some(ip.clone());
+            self.ips.lock().unwrap().insert(name.clone(), ip.clone());
             thegn_core::managed_ssh::record_authorized(
                 "fly",
                 &thegn_core::managed_ssh::account_label(&self.spec.key_path),
@@ -786,7 +803,11 @@ mod tests {
             graphql_url: format!("{base}/"),
             ..spec()
         });
-        *provider.ip.lock().unwrap() = Some("192.0.2.1".into());
+        provider
+            .ips
+            .lock()
+            .unwrap()
+            .insert("tg-fly-valid".into(), "192.0.2.1".into());
 
         for result in [
             provider.resolve_ip("../x").await,
@@ -804,6 +825,108 @@ mod tests {
                 "invalid name must not reach the Fly API"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn ip_cache_is_keyed_by_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _env =
+            thegn_core::testenv::EnvGuard::set(&[("THEGN_DIR", &tmp.path().to_string_lossy())]);
+        let provider = FlyProvider::new(spec());
+        provider
+            .ips
+            .lock()
+            .unwrap()
+            .insert("tg-fly-a".into(), "192.0.2.1".into());
+        registry::write(&registry::VpsRecord {
+            name: "tg-fly-b".into(),
+            provider: LEDGER_PROVIDER.into(),
+            state: "ready".into(),
+            instance_id: "machine-b".into(),
+            ip: "198.51.100.2".into(),
+            created_at: 1,
+        })
+        .unwrap();
+
+        assert_eq!(
+            provider.resolve_ip("tg-fly-b").await.unwrap(),
+            "198.51.100.2"
+        );
+    }
+
+    #[tokio::test]
+    async fn foreign_provider_registry_record_is_not_a_fly_address() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _env =
+            thegn_core::testenv::EnvGuard::set(&[("THEGN_DIR", &tmp.path().to_string_lossy())]);
+        registry::write(&registry::VpsRecord {
+            name: "tg-fly-x".into(),
+            provider: "hetzner".into(),
+            state: "ready".into(),
+            instance_id: "foreign-machine".into(),
+            ip: "203.0.113.9".into(),
+            created_at: 1,
+        })
+        .unwrap();
+        let hits = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let (base, _srv) = fake_fly_server(hits.clone()).await;
+        let provider = FlyProvider::new(FlySpec {
+            api_base: base.clone(),
+            graphql_url: format!("{base}/"),
+            ..spec()
+        });
+
+        let error = provider.resolve_ip("tg-fly-x").await.unwrap_err();
+        assert!(error.to_string().contains("no dedicated IPv4"), "{error:#}");
+        assert!(
+            hits.lock()
+                .unwrap()
+                .iter()
+                .any(|hit| hit.starts_with("POST / ")),
+            "foreign-provider record must fall through to GraphQL"
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_remote_destroy_evicts_the_name_ip_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _env =
+            thegn_core::testenv::EnvGuard::set(&[("THEGN_DIR", &tmp.path().to_string_lossy())]);
+        let hits = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let (base, _srv) = fake_fly_server(hits.clone()).await;
+        let provider = FlyProvider::new(FlySpec {
+            api_base: base.clone(),
+            graphql_url: format!("{base}/"),
+            name: "tg-fly-destroy".into(),
+            ..spec()
+        });
+        let account = thegn_core::managed_ssh::account_label(&provider.spec.key_path);
+        thegn_core::managed_ssh::record_authorized(
+            "fly",
+            &account,
+            "tg-fly-destroy",
+            &provider.spec.key_path,
+            TEST_PUBKEY,
+        )
+        .unwrap();
+        provider
+            .ips
+            .lock()
+            .unwrap()
+            .insert("tg-fly-destroy".into(), "192.0.2.80".into());
+
+        provider
+            .destroy_remote_only("tg-fly-destroy")
+            .await
+            .unwrap();
+        let error = provider.resolve_ip("tg-fly-destroy").await.unwrap_err();
+        assert!(error.to_string().contains("no dedicated IPv4"), "{error:#}");
+        let seen = hits.lock().unwrap().clone();
+        assert!(seen.iter().any(|hit| hit.starts_with("DELETE ")));
+        assert!(
+            seen.iter().any(|hit| hit.starts_with("POST / ")),
+            "resolution after destroy must query Fly instead of reusing the old IP"
+        );
     }
 
     #[tokio::test]
