@@ -205,8 +205,8 @@ fn drain_retained(
     }
     if let Some(d) = db {
         while let Some(job) = retained.pop_front() {
-            job(d);
             dequeue(state);
+            job(d);
         }
     }
 }
