@@ -1,6 +1,6 @@
 use super::*;
 use crate::calendar::{GapPolicy, TzRef};
-use chrono::NaiveDate;
+use chrono::{NaiveDate, Timelike};
 
 fn d(y: i32, m: u32, day: u32) -> NaiveDate {
     NaiveDate::from_ymd_opt(y, m, day).unwrap()
@@ -1537,6 +1537,251 @@ fn until_keeps_its_value_type_through_a_round_trip() {
         assert_eq!(r.to_rrule(), src);
         assert_eq!(RRule::parse(&r.to_rrule()).unwrap(), r);
     }
+}
+
+#[test]
+fn floating_recurrence_values_are_accepted_and_unknown_zones_are_diagnosed() {
+    let start = EventTime::Zoned {
+        local: dt(2030, 1, 1, 10, 0),
+        zone: TzRef::new("Europe/Berlin"),
+    };
+    for recurrence in [
+        Recurrence {
+            exdates: vec![EventTime::Zoned {
+                local: dt(2030, 1, 2, 10, 0),
+                zone: TzRef::new(""),
+            }],
+            ..Default::default()
+        },
+        Recurrence {
+            rdates: vec![EventTime::Zoned {
+                local: dt(2030, 1, 2, 10, 0),
+                zone: TzRef::new("  "),
+            }],
+            ..Default::default()
+        },
+    ] {
+        assert_eq!(diagnose_values(&recurrence, &start), Ok(()));
+        assert_eq!(check_values(&recurrence, &start), Ok(()));
+    }
+    let instant_start = utc(2030, 1, 1, 10, 0);
+    let floating_rdate = Recurrence {
+        rdates: vec![EventTime::Zoned {
+            local: dt(2030, 1, 2, 10, 0),
+            zone: TzRef::new(""),
+        }],
+        ..Default::default()
+    };
+    assert_eq!(diagnose_values(&floating_rdate, &instant_start), Ok(()));
+
+    let all_day_start = EventTime::Date {
+        date: d(2030, 1, 1),
+    };
+    let timed_exdate = Recurrence {
+        exdates: vec![EventTime::Zoned {
+            local: dt(2030, 1, 2, 10, 0),
+            zone: TzRef::new(""),
+        }],
+        ..Default::default()
+    };
+    let error = diagnose_values(&timed_exdate, &all_day_start).unwrap_err();
+    assert_eq!(error.property, RecurProperty::Exdate);
+    assert_eq!(error.defect, RecurValueDefect::ShapeMismatch);
+
+    let bad = Recurrence {
+        rdates: vec![
+            EventTime::Zoned {
+                local: dt(2030, 1, 2, 10, 0),
+                zone: TzRef::new("Europe/Berlin"),
+            },
+            EventTime::Zoned {
+                local: dt(2030, 1, 3, 10, 0),
+                zone: TzRef::new("Secret/Unknown"),
+            },
+        ],
+        ..Default::default()
+    };
+    let error = diagnose_values(&bad, &start).unwrap_err();
+    assert_eq!(error.property, RecurProperty::Rdate);
+    assert_eq!(error.index, 1);
+    assert_eq!(error.defect, RecurValueDefect::UnknownZone);
+    let display = error.to_string();
+    assert!(display.contains("RDATE"));
+    assert!(display.contains('2'));
+    assert!(!display.contains("Secret"));
+    assert!(!display.contains("2030"));
+}
+
+#[test]
+fn recurrence_value_diagnostics_report_shape_mismatch_and_exdate_index() {
+    let timed_start = EventTime::Instant {
+        at: chrono::DateTime::from_naive_utc_and_offset(dt(2030, 1, 1, 10, 0), Utc),
+    };
+    let rdates = Recurrence {
+        rdates: vec![
+            utc(2030, 1, 2, 10, 0),
+            EventTime::Date {
+                date: d(2030, 1, 3),
+            },
+        ],
+        ..Default::default()
+    };
+    let error = diagnose_values(&rdates, &timed_start).unwrap_err();
+    assert_eq!(error.property, RecurProperty::Rdate);
+    assert_eq!(error.index, 1);
+    assert_eq!(error.defect, RecurValueDefect::ShapeMismatch);
+
+    let exdates = Recurrence {
+        exdates: vec![
+            EventTime::Zoned {
+                local: dt(2030, 1, 2, 10, 0),
+                zone: TzRef::new("UTC"),
+            },
+            EventTime::Zoned {
+                local: dt(2030, 1, 3, 10, 0),
+                zone: TzRef::new("Secret/Unknown"),
+            },
+        ],
+        ..Default::default()
+    };
+    let error = diagnose_values(&exdates, &timed_start).unwrap_err();
+    assert_eq!(error.property, RecurProperty::Exdate);
+    assert_eq!(error.index, 1);
+    assert_eq!(error.defect, RecurValueDefect::UnknownZone);
+    assert!(!error.to_string().contains("Secret"));
+}
+
+#[test]
+fn recurrence_ics_properties_round_trip_timed_and_date_sets() {
+    fn parse_recurrence(start: &str, end: &str, recurrence: &Recurrence) -> Recurrence {
+        let properties = recurrence.to_ics_properties().unwrap().join("\n");
+        let document = format!(
+            "BEGIN:VCALENDAR\nVERSION:2.0\nBEGIN:VEVENT\nUID:roundtrip\n{start}\n{end}\n{properties}\nEND:VEVENT\nEND:VCALENDAR"
+        );
+        crate::calendar::parse_ics(&document, "UTC")[0]
+            .recurrence
+            .clone()
+            .unwrap()
+    }
+
+    let timed = Recurrence {
+        rules: vec![RRule::parse("FREQ=DAILY;UNTIL=20300105T100000").unwrap()],
+        rdates: vec![
+            EventTime::Zoned {
+                local: dt(2030, 1, 6, 10, 0),
+                zone: TzRef::new("America/New_York"),
+            },
+            EventTime::Zoned {
+                local: dt(2030, 1, 7, 10, 0),
+                zone: TzRef::new("Europe/London"),
+            },
+            utc(2030, 1, 8, 15, 0),
+            EventTime::Zoned {
+                local: dt(2030, 1, 9, 10, 0),
+                zone: TzRef::new(""),
+            },
+        ],
+        exdates: vec![
+            EventTime::Zoned {
+                local: dt(2030, 1, 2, 10, 0),
+                zone: TzRef::new("America/New_York"),
+            },
+            EventTime::Zoned {
+                local: dt(2030, 1, 3, 10, 0),
+                zone: TzRef::new("Europe/London"),
+            },
+            utc(2030, 1, 4, 15, 0),
+            EventTime::Zoned {
+                local: dt(2030, 1, 5, 10, 0),
+                zone: TzRef::new(""),
+            },
+        ],
+    };
+    let actual = parse_recurrence(
+        "DTSTART;TZID=America/New_York:20300101T100000",
+        "DTEND;TZID=America/New_York:20300101T110000",
+        &timed,
+    );
+    assert_eq!(actual, timed);
+
+    let all_day = Recurrence {
+        rules: vec![RRule::parse("FREQ=DAILY;COUNT=3").unwrap()],
+        rdates: vec![EventTime::Date {
+            date: d(2030, 1, 5),
+        }],
+        exdates: vec![EventTime::Date {
+            date: d(2030, 1, 2),
+        }],
+    };
+    let actual = parse_recurrence(
+        "DTSTART;VALUE=DATE:20300101",
+        "DTEND;VALUE=DATE:20300102",
+        &all_day,
+    );
+    assert_eq!(actual, all_day);
+}
+
+#[test]
+fn floating_ics_values_keep_timed_events_and_expand_as_series_local() {
+    let berlin = "BEGIN:VCALENDAR\nVERSION:2.0\nBEGIN:VEVENT\nUID:berlin\nDTSTART;TZID=Europe/Berlin:20300101T100000\nDTEND;TZID=Europe/Berlin:20300101T110000\nRRULE:FREQ=DAILY;COUNT=3\nEXDATE:20300102T100000\nEND:VEVENT\nEND:VCALENDAR";
+    let events = crate::calendar::parse_ics(berlin, "UTC");
+    assert_eq!(events.len(), 1);
+    let dates = events[0]
+        .occurrences(d(2030, 1, 1), d(2030, 1, 5), chrono_tz::UTC)
+        .into_iter()
+        .filter_map(|occurrence| match occurrence.start {
+            EventTime::Zoned { local, .. } => Some(local.date()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(dates, vec![d(2030, 1, 1), d(2030, 1, 3)]);
+
+    let floating = "BEGIN:VCALENDAR\nVERSION:2.0\nBEGIN:VEVENT\nUID:floating\nDTSTART:20300101T100000\nDTEND:20300101T110000\nRRULE:FREQ=DAILY;COUNT=1\nRDATE:20300103T100000\nEND:VEVENT\nEND:VCALENDAR";
+    let events = crate::calendar::parse_ics(floating, "UTC");
+    assert_eq!(events.len(), 1);
+    let dates = events[0]
+        .occurrences(d(2030, 1, 1), d(2030, 1, 5), chrono_tz::UTC)
+        .into_iter()
+        .filter_map(|occurrence| match occurrence.start {
+            EventTime::Zoned { local, .. } => Some(local.date()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(dates, vec![d(2030, 1, 1), d(2030, 1, 3)]);
+}
+
+#[test]
+fn recurrence_writer_quotes_parameters_and_refuses_lossy_values() {
+    let recurrence = Recurrence {
+        rdates: vec![EventTime::Zoned {
+            local: dt(2030, 1, 1, 10, 0),
+            zone: TzRef::new("Area;Zone,Part:Name"),
+        }],
+        ..Default::default()
+    };
+    assert_eq!(
+        recurrence.to_ics_properties().unwrap(),
+        vec!["RDATE;TZID=\"Area;Zone,Part:Name\":20300101T100000"]
+    );
+
+    for zone in ["Area\"Zone", "Area\nZone"] {
+        let recurrence = Recurrence {
+            rdates: vec![EventTime::Zoned {
+                local: dt(2030, 1, 1, 10, 0),
+                zone: TzRef::new(zone),
+            }],
+            ..Default::default()
+        };
+        assert_eq!(recurrence.to_ics_properties(), None);
+    }
+    let recurrence = Recurrence {
+        exdates: vec![EventTime::Zoned {
+            local: dt(2030, 1, 1, 10, 0).with_nanosecond(1).unwrap(),
+            zone: TzRef::new("UTC"),
+        }],
+        ..Default::default()
+    };
+    assert_eq!(recurrence.to_ics_properties(), None);
 }
 
 #[test]
