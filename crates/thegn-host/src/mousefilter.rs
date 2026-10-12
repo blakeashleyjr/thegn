@@ -5,14 +5,15 @@
 //! flood produces. This filter watches the key stream and swallows such
 //! fragments.
 //!
-//! False-positive risk is negligible: a human typing `Alt+[` immediately
-//! followed by `<` then digits/`;` ending in `M`/`m` is not a real input
-//! pattern, and an unfinished match replays nothing the pane needed (the
-//! sequence was terminal chatter, not typing).
+//! The same `Alt+[` residue can introduce a split xterm `CSI n[;m]~` key.
+//! Those bodies are buffered only up to a fixed bound, then decoded or replayed
+//! as ordinary keys when malformed or unknown.
 
-use termwiz::input::{KeyCode, Modifiers};
+use termwiz::input::{KeyCode, KeyEvent, Modifiers};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+const CSI_KEY_BUFFER_LIMIT: usize = 8;
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 enum State {
     /// Passing keys through.
     #[default]
@@ -21,6 +22,16 @@ enum State {
     SawCsi,
     /// Inside `< digits ; digits ; digits` — swallowing until `M`/`m`.
     InMouse,
+    /// Buffering the body of a possible xterm `CSI n[;m]~` key.
+    InKeyCsi(Vec<KeyEvent>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Verdict {
+    Pass,
+    Swallow,
+    Emit(KeyEvent),
+    Replay(Vec<KeyEvent>),
 }
 
 /// Stateful filter; feed every key event destined for dispatch. `swallow`
@@ -31,46 +42,154 @@ pub struct MouseResidueFilter {
 }
 
 impl MouseResidueFilter {
-    pub fn swallow(&mut self, key: &KeyCode, mods: Modifiers) -> bool {
-        match (self.state, key) {
-            // `ESC [` arrives as Alt+[ once termwiz merges the pair.
-            (State::Idle, KeyCode::Char('[')) if mods == Modifiers::ALT => {
-                self.state = State::SawCsi;
-                true
+    /// Reassemble xterm modified tilde keys as well as discarding split SGR
+    /// mouse reports. The swallowed `Alt+[` remains swallowed on malformed
+    /// sequences, matching the historical Alt+[ policy.
+    pub fn feed(&mut self, key: &KeyCode, mods: Modifiers) -> Verdict {
+        let state = std::mem::replace(&mut self.state, State::Idle);
+        match state {
+            State::Idle => {
+                if *key == KeyCode::Char('[') && mods == Modifiers::ALT {
+                    self.state = State::SawCsi;
+                    Verdict::Swallow
+                } else {
+                    Verdict::Pass
+                }
             }
-            (State::SawCsi, KeyCode::Char('<')) if mods.is_empty() => {
-                self.state = State::InMouse;
-                true
-            }
-            // Anything else after the introducer wasn't a mouse report after
-            // all; resume passing (the swallowed `Alt+[` was still residue —
-            // real Alt+[ chords are not bound and panes rarely want them).
-            (State::SawCsi, _) => {
-                self.state = State::Idle;
-                false
-            }
-            (State::InMouse, KeyCode::Char(c))
-                if mods.is_empty() && (c.is_ascii_digit() || *c == ';') =>
-            {
-                true
-            }
-            (State::InMouse, KeyCode::Char('M' | 'm')) if mods.is_empty() => {
-                self.state = State::Idle;
-                true
-            }
-            // Malformed fragment: stop swallowing.
-            (State::InMouse, _) => {
-                self.state = State::Idle;
-                false
-            }
-            _ => false,
+            State::SawCsi => match key {
+                KeyCode::Char('<') if mods.is_empty() => {
+                    self.state = State::InMouse;
+                    Verdict::Swallow
+                }
+                KeyCode::Char(c) if mods.is_empty() && c.is_ascii_digit() => {
+                    self.state = State::InKeyCsi(vec![key_event(key, mods)]);
+                    Verdict::Swallow
+                }
+                _ => {
+                    self.state = State::Idle;
+                    Verdict::Pass
+                }
+            },
+            State::InMouse => match key {
+                KeyCode::Char(c) if mods.is_empty() && (c.is_ascii_digit() || *c == ';') => {
+                    Verdict::Swallow
+                }
+                KeyCode::Char('M' | 'm') if mods.is_empty() => {
+                    self.state = State::Idle;
+                    Verdict::Swallow
+                }
+                _ => {
+                    self.state = State::Idle;
+                    Verdict::Pass
+                }
+            },
+            State::InKeyCsi(buffer) => self.feed_key_csi(buffer, key, mods),
         }
     }
+
+    fn feed_key_csi(
+        &mut self,
+        mut buffer: Vec<KeyEvent>,
+        key: &KeyCode,
+        mods: Modifiers,
+    ) -> Verdict {
+        if mods.is_empty() && matches!(key, KeyCode::Char(c) if c.is_ascii_digit() || *c == ';') {
+            if buffer.len() < CSI_KEY_BUFFER_LIMIT {
+                buffer.push(key_event(key, mods));
+                self.state = State::InKeyCsi(buffer);
+                return Verdict::Swallow;
+            }
+            let mut replay = buffer;
+            replay.push(key_event(key, mods));
+            return Verdict::Replay(replay);
+        }
+        if mods.is_empty() && *key == KeyCode::Char('~') {
+            let event = parse_tilde_key(&buffer);
+            if let Some(event) = event {
+                return Verdict::Emit(event);
+            }
+        }
+        let mut replay = buffer;
+        replay.push(key_event(key, mods));
+        Verdict::Replay(replay)
+    }
+
+    /// Compatibility wrapper for the existing mouse-filter call sites/tests.
+    pub fn swallow(&mut self, key: &KeyCode, mods: Modifiers) -> bool {
+        matches!(self.feed(key, mods), Verdict::Swallow | Verdict::Emit(_))
+    }
+}
+
+fn key_event(key: &KeyCode, modifiers: Modifiers) -> KeyEvent {
+    KeyEvent {
+        key: *key,
+        modifiers,
+    }
+}
+
+fn parse_tilde_key(buffer: &[KeyEvent]) -> Option<KeyEvent> {
+    let text: String = buffer
+        .iter()
+        .map(|event| match event.key {
+            KeyCode::Char(c) if event.modifiers.is_empty() => Some(c),
+            _ => None,
+        })
+        .collect::<Option<String>>()?;
+    let mut parts = text.split(';');
+    let number = parts.next()?.parse::<u8>().ok()?;
+    let modifier_param = parts.next().map(str::parse::<u8>).transpose().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let code = match number {
+        1 | 7 => KeyCode::Home,
+        2 => KeyCode::Insert,
+        3 => KeyCode::Delete,
+        4 | 8 => KeyCode::End,
+        5 => KeyCode::PageUp,
+        6 => KeyCode::PageDown,
+        _ => return None,
+    };
+    let modifier = modifier_param.unwrap_or(1);
+    if !(1..=16).contains(&modifier) {
+        return None;
+    }
+    let bits = modifier - 1;
+    let mut modifiers = Modifiers::NONE;
+    if bits & 1 != 0 {
+        modifiers |= Modifiers::SHIFT;
+    }
+    if bits & 2 != 0 {
+        modifiers |= Modifiers::ALT;
+    }
+    if bits & 4 != 0 {
+        modifiers |= Modifiers::CTRL;
+    }
+    if bits & 8 != 0 {
+        modifiers |= Modifiers::SUPER;
+    }
+    Some(KeyEvent {
+        key: code,
+        modifiers,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn key_sequence(body: &str) -> Verdict {
+        let mut filter = MouseResidueFilter::default();
+        assert_eq!(
+            filter.feed(&KeyCode::Char('['), Modifiers::ALT),
+            Verdict::Swallow
+        );
+        let mut verdict = Verdict::Pass;
+        for c in body.chars() {
+            verdict = filter.feed(&KeyCode::Char(c), Modifiers::NONE);
+        }
+        verdict
+    }
 
     fn feed(f: &mut MouseResidueFilter, s: &str, alt_first: bool) -> Vec<bool> {
         s.chars()
@@ -122,5 +241,71 @@ mod tests {
         let mut f = MouseResidueFilter::default();
         let out = feed(&mut f, "[<0;12;5m", true);
         assert!(out.iter().all(|&s| s), "{out:?}");
+    }
+
+    #[test]
+    fn xterm_modified_tilde_keys_are_reassembled() {
+        for (sequence, key, modifiers) in [
+            ("5;5~", KeyCode::PageUp, Modifiers::CTRL),
+            ("3;2~", KeyCode::Delete, Modifiers::SHIFT),
+            ("6;3~", KeyCode::PageDown, Modifiers::ALT),
+            ("2;6~", KeyCode::Insert, Modifiers::CTRL | Modifiers::SHIFT),
+            ("5~", KeyCode::PageUp, Modifiers::NONE),
+        ] {
+            assert_eq!(
+                key_sequence(sequence),
+                Verdict::Emit(KeyEvent { key, modifiers }),
+                "CSI {sequence}"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_and_unknown_tilde_keys_replay_buffered_text() {
+        assert_eq!(
+            key_sequence("5;x"),
+            Verdict::Replay(vec![
+                key_event(&KeyCode::Char('5'), Modifiers::NONE),
+                key_event(&KeyCode::Char(';'), Modifiers::NONE),
+                key_event(&KeyCode::Char('x'), Modifiers::NONE),
+            ])
+        );
+        assert_eq!(
+            key_sequence("9;5~"),
+            Verdict::Replay(
+                "9;5~"
+                    .chars()
+                    .map(|c| key_event(&KeyCode::Char(c), Modifiers::NONE))
+                    .collect()
+            )
+        );
+    }
+
+    #[test]
+    fn overlong_key_sequence_replays_at_the_fixed_buffer_bound() {
+        let mut filter = MouseResidueFilter::default();
+        assert_eq!(
+            filter.feed(&KeyCode::Char('['), Modifiers::ALT),
+            Verdict::Swallow
+        );
+        for c in "12345678".chars() {
+            assert_eq!(
+                filter.feed(&KeyCode::Char(c), Modifiers::NONE),
+                Verdict::Swallow
+            );
+        }
+        assert_eq!(
+            filter.feed(&KeyCode::Char('9'), Modifiers::NONE),
+            Verdict::Replay(
+                "123456789"
+                    .chars()
+                    .map(|c| key_event(&KeyCode::Char(c), Modifiers::NONE))
+                    .collect()
+            )
+        );
+        assert_eq!(
+            filter.feed(&KeyCode::Char('x'), Modifiers::NONE),
+            Verdict::Pass
+        );
     }
 }
