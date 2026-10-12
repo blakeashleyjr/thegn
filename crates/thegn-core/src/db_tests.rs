@@ -4077,6 +4077,52 @@ fn chunk_claim_fails_closed_for_unreadable_active_scope_and_leaves_no_row() {
 }
 
 #[test]
+fn chunk_claim_fails_closed_when_scope_overlap_cannot_be_proven() {
+    let db = Db::open_memory().unwrap();
+    let sibling = db
+        .put_agent_dispatch(crate::issue::NewDispatch {
+            chunk_path: Some("sibling.md"),
+            ..crate::issue::NewDispatch::new("linear:A-1", "/wt/shared", "code")
+        })
+        .unwrap();
+    let prepared = crate::pipeline_chunk::PreparedChunkAdmission {
+        path: "incoming.md".into(),
+        scope: crate::pipeline_chunk::ChunkScope {
+            files: vec!["src/new.rs".into()],
+            ..Default::default()
+        },
+        siblings: vec![crate::pipeline_chunk::PreparedSiblingScope {
+            row: sibling,
+            path: "sibling.md".into(),
+            scope: Some(Ok(crate::pipeline_chunk::ChunkScope {
+                files: vec!["src/../unknown.rs".into()],
+                ..Default::default()
+            })),
+        }],
+    };
+    let refusal = db
+        .claim_dispatch_admitted(
+            crate::issue::NewDispatch {
+                chunk_path: Some("incoming.md"),
+                ..claim_new("linear:A-1", "/wt/shared", "code", "incoming.md")
+            },
+            3,
+            None,
+            Some(&prepared),
+            None,
+        )
+        .unwrap()
+        .unwrap_err();
+    assert!(matches!(
+        refusal,
+        crate::db_dispatch::DispatchAdmissionDecision::ScopeRefused(_)
+    ));
+    let reason = format!("{refusal:?}");
+    assert!(reason.contains("could not be proven"), "{reason}");
+    assert_eq!(db.list_dispatches().unwrap().len(), 1);
+}
+
+#[test]
 fn forced_chunk_overlap_requires_and_records_a_reason() {
     let db = Db::open_memory().unwrap();
     db.put_agent_dispatch(crate::issue::NewDispatch {

@@ -583,33 +583,15 @@ fn read_chunk_file(worktree: &str, chunk_path: &str) -> std::io::Result<String> 
             "chunk path must be a canonical repository-relative path",
         )
     };
-    let path = std::path::Path::new(chunk_path);
-    if chunk_path.len() > 1024
-        || path.is_absolute()
-        || chunk_path.contains('\\')
-        || chunk_path.contains(':')
-        || chunk_path.bytes().any(|b| b < 0x20 || b == 0x7f)
-    {
+    let Some(normalized) = thegn_core::pipeline_chunk::canonical_repo_relative_path(chunk_path)
+    else {
         return Err(invalid());
-    }
-    let normalized = chunk_path.strip_prefix("./").unwrap_or(chunk_path);
-    if normalized.is_empty()
-        || normalized.split('/').count() > 64
-        || normalized.split('/').any(|s| {
-            s.is_empty()
-                || s == "."
-                || s == ".."
-                || s.ends_with('.')
-                || s.ends_with(' ')
-                || s.bytes()
-                    .any(|b| matches!(b, b'?' | b'<' | b'>' | b'"' | b'|' | b'*'))
-                || windows_reserved_chunk_component(s)
-        })
-    {
+    };
+    if normalized.contains('*') {
         return Err(invalid());
     }
     let root = std::fs::canonicalize(worktree)?;
-    let candidate = root.join(normalized);
+    let candidate = root.join(&normalized);
     let resolved = std::fs::canonicalize(&candidate)?;
     if !resolved.starts_with(&root) {
         return Err(invalid());
@@ -638,16 +620,6 @@ fn read_chunk_file(worktree: &str, chunk_path: &str) -> std::io::Result<String> 
         ));
     }
     String::from_utf8(bytes).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
-}
-
-fn windows_reserved_chunk_component(segment: &str) -> bool {
-    let base = segment.split('.').next().unwrap_or(segment);
-    ["CON", "PRN", "AUX", "NUL"]
-        .iter()
-        .any(|name| base.eq_ignore_ascii_case(name))
-        || ["COM", "LPT"].iter().any(|prefix| {
-            (1..=9).any(|digit| base.eq_ignore_ascii_case(&format!("{prefix}{digit}")))
-        })
 }
 
 /// The chunk NAME a `files:`/`overlaps:`/`after:` reference resolves to: the
@@ -2148,7 +2120,13 @@ mod tests {
 
     #[test]
     fn chunk_file_reads_reject_traversal_and_absolute_paths_and_cap_bytes() {
-        let (_dir, wt) = chunk_wt(&[("scope.md", "---\nfiles: [src/*.rs]\n---\n")]);
+        let (dir, wt) = chunk_wt(&[
+            ("scope.md", "---\nfiles: [src/*.rs]\n---\n"),
+            ("dir/scope.md", "---\n---\n"),
+            ("dir\\scope.md", "---\n---\n"),
+        ]);
+        let outside = dir.path().join("outside.md");
+        std::fs::write(&outside, "---\n---\n").unwrap();
         assert!(
             read_chunk_file(&wt, "./scope.md")
                 .unwrap()
@@ -2164,6 +2142,17 @@ mod tests {
             "CON.md",
         ] {
             assert!(read_chunk_file(&wt, alias).is_err(), "accepted {alias}");
+        }
+        if crate::platform::test_symlink_supported() {
+            crate::platform::test_symlink(
+                std::path::Path::new("../outside.md"),
+                &dir.path().join("link.md"),
+            )
+            .unwrap();
+            crate::platform::test_symlink(std::path::Path::new(".."), &dir.path().join("subdir"))
+                .unwrap();
+            assert!(read_chunk_file(&wt, "link.md").is_err());
+            assert!(read_chunk_file(&wt, "subdir/outside.md").is_err());
         }
 
         let large = std::path::Path::new(&wt).join("large.md");
