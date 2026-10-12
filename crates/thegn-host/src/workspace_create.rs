@@ -419,7 +419,6 @@ fn clone_workspace_repo_with_deadline(
             // owned group so the progress reader reaches EOF as well.
             if !group.is_empty() {
                 group.terminate();
-                term_sent_at = Some(Instant::now());
             }
             break;
         }
