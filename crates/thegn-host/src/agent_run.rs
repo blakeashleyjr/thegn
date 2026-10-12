@@ -100,6 +100,16 @@ pub(crate) enum AgentDispatch {
     InfraHold(String),
 }
 
+/// Give queue agents a thegn-owned OCI name that cannot collide with an
+/// interactive pane container or an unrelated user container.
+fn scope_agent_spec(
+    mut spec: thegn_core::sandbox::SandboxSpec,
+    basename: &str,
+) -> thegn_core::sandbox::SandboxSpec {
+    spec.name = thegn_core::sandbox::container_name(&format!("agent-{basename}"));
+    spec
+}
+
 /// Provision a resolved dispatch target before a queue can claim its work.
 /// VPN attachment is not yet supported for queued agents, so a requested VPN
 /// fails closed instead of entering a sandbox without its required network.
@@ -160,7 +170,8 @@ pub(crate) fn agent_floor_gate(
         .unwrap_or("agent-task");
     // `None` ⇒ the sandbox couldn't be established (disabled, or the chain
     // resolved to the host) — a broken boundary under a demanded floor.
-    let spec = thegn_core::sandbox::resolve(&full.sandbox, &loc, name);
+    let spec = thegn_core::sandbox::resolve(&full.sandbox, &loc, name)
+        .map(|spec| scope_agent_spec(spec, name));
     // THE-215: a sealed profile whose sandbox could not be established must not
     // run the agent on the host — no spec skips the home gate below, so refuse.
     if spec.is_none() && full.sandbox.profile.hides_home() {
@@ -1038,6 +1049,13 @@ mod tests {
             daemon_persistent: false,
             seal_home: None,
         }
+    }
+
+    #[test]
+    fn queue_agent_spec_uses_thegn_owned_container_name() {
+        let spec = scope_agent_spec(sandbox_spec(), "api");
+        assert!(spec.name.starts_with(thegn_core::sandbox::CONTAINER_PREFIX));
+        assert_eq!(spec.name, "thegn-agent-api");
     }
 
     #[test]
