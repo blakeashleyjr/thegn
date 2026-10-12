@@ -317,7 +317,7 @@ async fn load_raster(art_url: &str) -> Result<crate::rasterize::Raster, Reject> 
     if let Some(path) = local_path(art_url) {
         return admitted_blocking(&DECODE_SLOT, move || {
             let path = admit_local_art(&path, &local_art_roots())?;
-            crate::rasterize::image_file_with_limits(
+            crate::rasterize::image_file_exact_with_limits(
                 &path,
                 MAX_ART_BYTES as u64,
                 crate::rasterize::MEDIA_ART_LIMITS,
@@ -515,6 +515,20 @@ mod tests {
         assert_eq!(
             admit_local_art(&root.path().join("missing.png"), &roots),
             Err(Reject::LocalPath)
+        );
+    }
+
+    #[test]
+    fn admitted_fifo_is_refused_by_exact_nonblocking_read() {
+        if !crate::platform::test_fifo_supported() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let fifo = root.path().join("cover.fifo");
+        crate::platform::test_fifo(&fifo).unwrap();
+        let admitted = admit_local_art(&fifo, &[root.path().to_path_buf()]).unwrap();
+        assert!(
+            crate::rasterize::read_regular_capped_exact(&admitted, MAX_ART_BYTES as u64).is_err()
         );
     }
 

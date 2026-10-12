@@ -108,9 +108,23 @@ fn decode_and_fit(bytes: &[u8], limits: DecodeLimits) -> Result<Raster, String> 
 /// without following a symlink, the open cannot block on a FIFO, and `take`
 /// bounds a file that grows mid-read.
 pub(crate) fn read_regular_capped(path: &Path, cap: u64) -> Result<Vec<u8>, String> {
-    use std::io::Read;
     let file = open_regular_nonblocking(path)?;
+    read_open_regular_capped(file, cap)
+}
+
+/// Read a caller-admitted path exactly as supplied, without resolving it
+/// again. The final path component is opened without following a symlink.
+pub(crate) fn read_regular_capped_exact(path: &Path, cap: u64) -> Result<Vec<u8>, String> {
+    let file = open_regular_nonblocking_exact(path)?;
+    read_open_regular_capped(file, cap)
+}
+
+fn read_open_regular_capped(file: std::fs::File, cap: u64) -> Result<Vec<u8>, String> {
+    use std::io::Read;
     let meta = file.metadata().map_err(|e| format!("read failed: {e}"))?;
+    if !meta.is_file() {
+        return Err("not a regular file".to_string());
+    }
     if meta.len() > cap {
         return Err(format!(
             "file exceeds the {cap} byte preview cap ({} bytes)",
@@ -153,6 +167,21 @@ fn open_regular_nonblocking(path: &Path) -> Result<std::fs::File, String> {
     Ok(file)
 }
 
+/// Open the exact path without following a final-component symlink. Callers
+/// that enforce a path policy must pass the admitted path directly here.
+fn open_regular_nonblocking_exact(path: &Path) -> Result<std::fs::File, String> {
+    let file = crate::platform::open_read_nonblocking_nofollow(path)
+        .map_err(|e| format!("read failed: {e}"))?;
+    if !file
+        .metadata()
+        .map_err(|e| format!("read failed: {e}"))?
+        .is_file()
+    {
+        return Err("not a regular file".to_string());
+    }
+    Ok(file)
+}
+
 /// Read a small prefix from the opened regular file. Used only for
 /// extension-less content sniffing.
 pub(crate) fn read_regular_prefix(path: &Path, cap: usize) -> Result<Vec<u8>, String> {
@@ -177,6 +206,16 @@ pub(crate) fn image_file_with_limits(
     limits: DecodeLimits,
 ) -> Result<Raster, String> {
     let bytes = read_regular_capped(path, cap)?;
+    decode_and_fit(&bytes, limits)
+}
+
+/// Rasterize an already-admitted image path without resolving it again.
+pub(crate) fn image_file_exact_with_limits(
+    path: &Path,
+    cap: u64,
+    limits: DecodeLimits,
+) -> Result<Raster, String> {
+    let bytes = read_regular_capped_exact(path, cap)?;
     decode_and_fit(&bytes, limits)
 }
 
@@ -356,6 +395,35 @@ mod tests {
             assert!(read_regular_capped(&fifo, 100).is_err());
         }
         let _ = std::fs::remove_dir_all(&dir); // best-effort: temp cleanup
+    }
+
+    #[test]
+    fn exact_read_refuses_a_final_symlink_while_preview_read_resolves_it() {
+        if !crate::platform::test_symlink_supported() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside.png");
+        let inside = dir.path().join("inside.png");
+        std::fs::write(&outside, b"bounded fixture").unwrap();
+        crate::platform::test_symlink(&outside, &inside).unwrap();
+
+        assert!(read_regular_capped_exact(&inside, 100).is_err());
+        assert_eq!(
+            read_regular_capped(&inside, 100).unwrap(),
+            b"bounded fixture"
+        );
+    }
+
+    #[test]
+    fn exact_read_refuses_fifo_without_blocking() {
+        if !crate::platform::test_fifo_supported() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("cover.fifo");
+        crate::platform::test_fifo(&fifo).unwrap();
+        assert!(read_regular_capped_exact(&fifo, 100).is_err());
     }
 
     #[test]
