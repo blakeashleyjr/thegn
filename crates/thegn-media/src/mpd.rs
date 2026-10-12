@@ -51,7 +51,7 @@ fn sanitize_diag(s: &str) -> String {
 
 /// Read one `\n`-terminated line of at most `max` bytes (terminator excluded)
 /// without ever buffering more than `max` bytes. `Ok(None)` is a clean EOF.
-async fn read_bounded_line<R: tokio::io::AsyncBufRead + Unpin>(
+pub(crate) async fn read_bounded_line<R: tokio::io::AsyncBufRead + Unpin>(
     io: &mut R,
     max: usize,
 ) -> Result<Option<String>, String> {
@@ -550,7 +550,7 @@ fn caps_from_commands(commands: &[Pair]) -> MediaCaps {
             .iter()
             .any(|(key, value)| key == "command" && value == name)
     };
-    let repeat_single = has("repeat") && has("single");
+    let repeat_single = has("status") && has("repeat") && has("single");
     MediaCaps {
         shuffle: has("random"),
         loop_mode: repeat_single,
@@ -607,7 +607,7 @@ impl MediaBackend for Mpd {
             let mut state = mpd_parse::to_state(&status, &song);
             state.can_go_next &= self.caps_from_command("next");
             state.can_go_previous &= self.caps_from_command("previous");
-            state.can_seek &= self.caps.seek;
+            state.can_seek &= self.caps.seek && state.state.is_active();
             Ok(Some(state))
         })
     }
@@ -1117,6 +1117,8 @@ mod tests {
         assert!(!caps.volume && !caps.abs_volume);
         assert!(!caps.loop_mode && !caps.shuffle && !caps.signals);
         assert!(caps.seek);
+        let caps = caps_from_commands(&pairs(&["repeat", "single"]));
+        assert!(!caps.loop_mode);
     }
 
     /// Fake server that answers every command with `reply` and records them.
@@ -1282,6 +1284,22 @@ mod tests {
         };
         assert!(m.play_pause().await.is_err());
         assert_eq!(seen.lock().unwrap().clone(), vec!["status".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn stopped_snapshot_does_not_advertise_seek() {
+        let (ep, _) = recording_server("state: stop\nOK\n").await;
+        let m = Mpd {
+            ep,
+            caps: MediaCaps {
+                seek: true,
+                ..MediaCaps::default()
+            },
+            commands: vec![("command".into(), "seekcur".into())],
+        };
+
+        let snapshot = m.snapshot().await.unwrap().unwrap();
+        assert!(!snapshot.can_seek);
     }
 
     #[tokio::test]
