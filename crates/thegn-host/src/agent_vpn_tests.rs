@@ -15,6 +15,7 @@ struct Calls {
 struct FakeProvider {
     calls: Calls,
     ready_fails: bool,
+    up_fails: bool,
 }
 
 impl VpnProvider for FakeProvider {
@@ -36,6 +37,9 @@ impl VpnProvider for FakeProvider {
 
     fn up(&self, _rt: &OciRuntime, container: &str) -> anyhow::Result<Attachment> {
         self.calls.ups.lock().unwrap().push(container.to_string());
+        if self.up_fails {
+            anyhow::bail!("partial bring-up failure")
+        }
         Ok(Attachment::default())
     }
 
@@ -58,10 +62,12 @@ impl VpnProvider for FakeProvider {
 }
 
 fn vpn_spec(on_error: VpnOnError) -> thegn_core::sandbox::SandboxSpec {
-    let mut vpn_config = thegn_core::config::VpnConfig::default();
-    vpn_config.provider = VpnProviderKind::Tailscale;
-    vpn_config.mode = VpnMode::Sidecar;
-    vpn_config.on_error = on_error;
+    let vpn_config = thegn_core::config::VpnConfig {
+        provider: VpnProviderKind::Tailscale,
+        mode: VpnMode::Sidecar,
+        on_error,
+        ..Default::default()
+    };
     let vpn = thegn_core::sandbox::build_vpn_spec(
         &vpn_config,
         "tg-test-wt",
@@ -108,7 +114,57 @@ fn fake(ready_fails: bool) -> FakeProvider {
     FakeProvider {
         calls: Calls::default(),
         ready_fails,
+        up_fails: false,
     }
+}
+
+#[test]
+fn in_container_warn_keeps_vpn_capability_request() {
+    let mut spec = vpn_spec(VpnOnError::Warn);
+    spec.vpn.as_mut().unwrap().mode = VpnMode::InContainer;
+
+    attach_vpn(&mut spec).unwrap();
+
+    assert!(spec.vpn.is_some());
+}
+
+#[test]
+fn in_container_launch_failure_does_not_roll_back_sidecar() {
+    let mut spec = vpn_spec(VpnOnError::Warn);
+    spec.vpn.as_mut().unwrap().mode = VpnMode::InContainer;
+    let provider = fake(false);
+    let calls = provider.calls.clone();
+    let rt = OciRuntime::new(vec!["fake-runtime".into()]);
+
+    let result = run_with_vpn_rollback_using(
+        &mut spec,
+        &provider,
+        &rt,
+        |_spec| anyhow::bail!("ensure failed"),
+        record_removal(&calls),
+    );
+
+    assert!(result.is_err());
+    assert!(calls.downs.lock().unwrap().is_empty());
+    assert!(calls.removals.lock().unwrap().is_empty());
+}
+
+#[test]
+fn bring_up_failure_rolls_back_partial_sidecar() {
+    let mut spec = vpn_spec(VpnOnError::Warn);
+    let mut provider = fake(false);
+    provider.up_fails = true;
+    let calls = provider.calls.clone();
+    let sidecar = thegn_core::sandbox::vpn_sidecar_name(&spec.name);
+    let rt = OciRuntime::new(vec!["fake-runtime".into()]);
+
+    attach_vpn_with(&mut spec, &provider, &rt, record_removal(&calls)).unwrap();
+
+    assert!(spec.vpn.is_none());
+    assert_eq!(*calls.ups.lock().unwrap(), vec![sidecar.clone()]);
+    assert!(calls.readies.lock().unwrap().is_empty());
+    assert_eq!(*calls.downs.lock().unwrap(), vec![sidecar.clone()]);
+    assert_eq!(*calls.removals.lock().unwrap(), vec![sidecar]);
 }
 
 fn record_removal(calls: &Calls) -> impl FnOnce(&OciRuntime, &str) -> anyhow::Result<()> + '_ {
