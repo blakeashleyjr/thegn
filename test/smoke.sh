@@ -27,6 +27,10 @@ TMP="$(mktemp -d)"
 # the job. Never let cleanup decide the verdict.
 cleanup() {
   local rc=$?
+  if [[ -f "$XDG_RUNTIME_DIR/libpod/tmp/pause.pid" ]]; then
+    kill "$(cat "$XDG_RUNTIME_DIR/libpod/tmp/pause.pid" 2>/dev/null)" 2>/dev/null || true
+  fi
+  podman unshare rm -rf "$TMP/.local/share/containers" >/dev/null 2>&1 || true
   rm -rf "$TMP" 2>/dev/null || true
   exit "$rc"
 }
@@ -2136,6 +2140,9 @@ fi
 # above ran daemon-less; no socket may exist on either default path.
 check "CLI verbs never spawn a daemon" \
   "[[ ! -S \"$XDG_RUNTIME_DIR/thegn/daemon.sock\" && ! -S \"$XDG_STATE_HOME/thegn/run/daemon.sock\" ]]"
+FALLBACK_ENDPOINT="$(env -u XDG_RUNTIME_DIR "$SZ" doctor --json | sed -n 's/.*"endpoint"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
+check "doctor resolves an absent fallback socket without creating it" \
+  "[[ -n \"$FALLBACK_ENDPOINT\" && ! -S \"$FALLBACK_ENDPOINT\" ]]"
 
 # Explicit close kills: DELETE on a session ends its child (the close-a-pane
 # contract at the API level). The row itself lingers briefly — `daemon/

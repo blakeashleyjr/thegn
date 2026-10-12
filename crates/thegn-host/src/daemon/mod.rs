@@ -82,6 +82,17 @@ pub(crate) fn socket_path(dcfg: &thegn_core::config::DaemonConfig) -> PathBuf {
     if !dcfg.socket.is_empty() {
         return natural;
     }
+    let natural = if runtime_dir.as_deref().is_none_or(str::is_empty) {
+        let legacy = thegn_core::config_daemon::legacy_socket_path(
+            &thegn_core::util::xdg_state_home().join("thegn"),
+        );
+        match short_runtime_dir() {
+            Some(private) => thegn_core::config_daemon::short_socket_path(&private, &legacy),
+            None => legacy,
+        }
+    } else {
+        natural
+    };
     let max = thegn_core::config_daemon::max_socket_path_len(cfg!(target_os = "linux"));
     thegn_core::config_daemon::resolve_socket_path(
         natural,
@@ -89,6 +100,72 @@ pub(crate) fn socket_path(dcfg: &thegn_core::config::DaemonConfig) -> PathBuf {
         max,
         cfg!(windows),
     )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LegacySocketState {
+    Absent,
+    Stale,
+    Live,
+}
+
+pub(crate) fn legacy_socket_decision(exists: bool, responds: bool) -> LegacySocketState {
+    if !exists {
+        LegacySocketState::Absent
+    } else if responds {
+        LegacySocketState::Live
+    } else {
+        LegacySocketState::Stale
+    }
+}
+
+pub(crate) fn legacy_socket_state() -> LegacySocketState {
+    let legacy = thegn_core::config_daemon::legacy_socket_path(
+        &thegn_core::util::xdg_state_home().join("thegn"),
+    );
+    let exists = std::fs::symlink_metadata(&legacy).is_ok();
+    #[cfg(unix)]
+    let responds = std::os::unix::net::UnixStream::connect(&legacy).is_ok();
+    #[cfg(not(unix))]
+    let responds = false;
+    let state = legacy_socket_decision(exists, responds);
+    if state == LegacySocketState::Live {
+        static WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        WARNED.get_or_init(|| thegn_core::msg::warn(&format!(
+            "legacy daemon socket {} is live; detach its panes, then run `thegn daemon stop` (the stop verb reaches this daemon through registry discovery)",
+            legacy.display()
+        )));
+    }
+    state
+}
+
+pub(crate) fn reconcile_legacy_socket(_dcfg: &thegn_core::config::DaemonConfig) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt as _;
+        let legacy = thegn_core::config_daemon::legacy_socket_path(
+            &thegn_core::util::xdg_state_home().join("thegn"),
+        );
+        if (!_dcfg.socket.is_empty() && socket_path(_dcfg) == legacy)
+            || legacy_socket_state() != LegacySocketState::Stale
+        {
+            return;
+        }
+        match std::fs::symlink_metadata(&legacy) {
+            Ok(md) if md.file_type().is_socket() => {
+                if let Err(error) = std::fs::remove_file(&legacy) {
+                    tracing::warn!(path = %legacy.display(), %error, "could not remove stale legacy daemon socket");
+                }
+            }
+            Ok(_) => {
+                tracing::warn!(path = %legacy.display(), "legacy daemon endpoint is not a socket; leaving it untouched")
+            }
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                tracing::warn!(path = %legacy.display(), %error, "could not inspect legacy daemon endpoint");
+            }
+            Err(_) => {}
+        }
+    }
 }
 
 /// A short, private directory to host the control socket when the natural path
@@ -112,11 +189,22 @@ fn short_runtime_dir() -> Option<PathBuf> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        let dir = PathBuf::from(std::env::var_os("TMPDIR")?);
-        let md = std::fs::metadata(&dir).ok()?;
-        let ours = md.uid() == unsafe { libc::geteuid() };
-        let private = md.permissions().mode() & 0o077 == 0;
-        (md.is_dir() && ours && private).then_some(dir)
+        let mut candidates = Vec::new();
+        let uid = unsafe { libc::geteuid() };
+        if cfg!(target_os = "linux") {
+            candidates.push(PathBuf::from(format!("/run/user/{uid}")));
+        } else if let Some(tmpdir) = std::env::var_os("TMPDIR") {
+            candidates.push(PathBuf::from(tmpdir));
+        }
+        candidates.into_iter().find(|dir| {
+            let Ok(md) = std::fs::symlink_metadata(dir) else {
+                return false;
+            };
+            md.is_dir()
+                && !md.file_type().is_symlink()
+                && md.uid() == uid
+                && md.permissions().mode() & 0o077 == 0
+        })
     }
     #[cfg(not(unix))]
     {
@@ -208,7 +296,34 @@ async fn run(
         .transpose()
         .map_err(anyhow::Error::msg)
         .context("invalid remote control transport")?;
+    let has_socket_override = socket_override.is_some();
     let sock = socket_override.unwrap_or_else(|| socket_path(&cfg.daemon));
+    if !has_socket_override && cfg.daemon.socket.is_empty() {
+        reconcile_legacy_socket(&cfg.daemon);
+        if legacy_socket_state() == LegacySocketState::Live {
+            let legacy = thegn_core::config_daemon::legacy_socket_path(
+                &thegn_core::util::xdg_state_home().join("thegn"),
+            );
+            anyhow::bail!(
+                "legacy daemon is still live at {}; detach its panes, then run `thegn daemon stop` before starting a new daemon",
+                legacy.display()
+            );
+        }
+    }
+    let legacy = thegn_core::config_daemon::legacy_socket_path(
+        &thegn_core::util::xdg_state_home().join("thegn"),
+    );
+    if !has_socket_override
+        && cfg.daemon.socket.is_empty()
+        && std::env::var("XDG_RUNTIME_DIR")
+            .map(|value| value.is_empty())
+            .unwrap_or(true)
+        && sock == legacy
+    {
+        anyhow::bail!(
+            "no secure private runtime directory is available for the control socket; set XDG_RUNTIME_DIR or an explicit [daemon] socket"
+        );
+    }
     if let Some(parent) = sock.parent() {
         thegn_svc::ipc::prepare_control_directory(parent, cfg.serve.local_admin)
             .with_context(|| format!("harden control directory {}", parent.display()))?;
@@ -689,6 +804,19 @@ async fn idle_exit_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_socket_decision_covers_absent_stale_and_live() {
+        assert_eq!(
+            legacy_socket_decision(true, false),
+            LegacySocketState::Stale
+        );
+        assert_eq!(legacy_socket_decision(true, true), LegacySocketState::Live);
+        assert_eq!(
+            legacy_socket_decision(false, false),
+            LegacySocketState::Absent
+        );
+    }
 
     fn row(id: &str, scope: &str, pid: i64) -> DaemonRow {
         DaemonRow {
