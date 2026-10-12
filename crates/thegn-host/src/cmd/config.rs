@@ -526,7 +526,7 @@ fn clamp_notice(key: &str, clamped: &[thegn_core::channel::Feature]) -> Option<S
     })
 }
 
-fn edit(cfg: &Config, path: &PathBuf) -> Result<()> {
+fn edit(cfg: &Config, path: &Path) -> Result<()> {
     if !path.exists() {
         seed_example(path)?;
         msg::info(&format!("seeded {} from the example", path.display()));
