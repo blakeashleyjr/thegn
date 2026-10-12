@@ -1031,6 +1031,16 @@ fn db_path() -> PathBuf {
     util::xdg_state_home().join("thegn/thegn.db")
 }
 
+#[cfg(test)]
+fn refuse_real_state_write(path: &Path) {
+    let real_state = util::home().join(".local/state");
+    assert!(
+        !path.starts_with(&real_state),
+        "THE-744: refusing test write to real state path {}",
+        path.display()
+    );
+}
+
 /// Return the normalized shared path when `candidate` names, or might name,
 /// the canonical state DB. `None` means the candidate is proven distinct.
 ///
@@ -1156,6 +1166,8 @@ impl Db {
 
     fn open_timed() -> Result<Db> {
         let path = db_path();
+        #[cfg(test)]
+        refuse_real_state_write(&path);
         // NOT memoized. Skipping this after the first open would save about four
         // syscalls and cost correctness twice over: one process opens many state
         // dirs (every test that isolates `XDG_STATE_HOME`), and a state dir
@@ -1234,6 +1246,8 @@ impl Db {
     /// process-global `XDG_STATE_HOME`. Used by tests and by host integration
     /// tests across the workspace, hence `pub`.
     pub fn open_at(path: &std::path::Path) -> Result<Db> {
+        #[cfg(test)]
+        refuse_real_state_write(path);
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
             let _ = crate::fsperm::restrict_dir_to_owner(dir);
@@ -1267,6 +1281,10 @@ impl Db {
         path: &std::path::Path,
         operation: SchemaOperation,
     ) -> Result<Option<CompatibleDb>> {
+        #[cfg(test)]
+        if operation.access() == SchemaRequirementAccess::ReadWrite {
+            refuse_real_state_write(path);
+        }
         if !path.is_file() {
             return Ok(None);
         }
@@ -1400,6 +1418,8 @@ impl Db {
     /// [`ALLOW_OLD_BUILD_ENV`] escape hatch, so the tolerant branch is
     /// reachable (and testable) without mutating process-global environment.
     pub fn open_at_allowing_older_build(path: &std::path::Path) -> Result<Db> {
+        #[cfg(test)]
+        refuse_real_state_write(path);
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
@@ -2436,3 +2456,7 @@ pub(crate) use crate::db_migrate::split_page_suffix;
 #[cfg(test)]
 #[path = "db_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "db_state_guard_tests.rs"]
+mod state_guard_tests;
