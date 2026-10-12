@@ -1324,7 +1324,6 @@ mod tests {
     use super::*;
     use crate::layout;
     use crate::session::{GroupKind, Session, WorktreeGroup};
-    use anyhow::Context;
 
     fn one_tab_session() -> Session {
         Session {
