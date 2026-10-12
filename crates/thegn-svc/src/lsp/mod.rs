@@ -30,8 +30,8 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Sender};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -57,8 +57,11 @@ pub mod limits {
     /// expand to a 3-byte `%XX` escape.
     pub const MAX_URI_BYTES: usize = 3 * MAX_IDENTITY_BYTES + 16;
     /// Outbound bodies are our own payloads (e.g. a whole file in `didOpen`),
-    /// not untrusted input: only the framing ceiling applies.
+    /// so the framing ceiling applies; the queued-byte budget is separate.
     pub const MAX_OUTBOUND_BODY_BYTES: usize = super::framing::MAX_FRAME_LEN;
+    pub const MAX_OUTBOUND_QUEUED_BYTES: usize = 64 * 1024 * 1024;
+    pub const MAX_PENDING_REQUESTS: usize = 64;
+    pub const MAX_OUTBOUND_MESSAGES: usize = 64;
     pub const MAX_CODE_SOURCE_BYTES: usize = 4 * 1024;
     pub const MAX_PROJECTED_RESPONSE_BYTES: usize = 1024 * 1024;
     pub const MAX_HOVER_MARKDOWN_BYTES: usize = 256 * 1024;
@@ -753,38 +756,64 @@ pub fn top_level_id(input: &[u8]) -> Option<i64> {
     scan_envelope(input).id
 }
 
-/// Encode an absolute filesystem path as a `file://` URI.
+/// Encode an absolute Unix filesystem path as a `file://` URI.
+///
+/// Windows drive and UNC paths are currently unsupported; workspace roots on
+/// those platforms fail closed instead of producing an invalid `rootUri`.
 pub fn path_to_uri(path: &str) -> String {
-    if path.len() > limits::MAX_IDENTITY_BYTES {
+    if path.len() > limits::MAX_IDENTITY_BYTES
+        || !path.starts_with('/')
+        || path.chars().any(char::is_control)
+    {
         return String::new();
     }
     format!("file://{}", percent_encode_path(path))
 }
 
-/// Decode a `file://` URI back to a filesystem path (best-effort).
+/// Decode a canonical local `file:` URI. Remote authorities and ambiguous URI
+/// components are rejected instead of being interpreted as filesystem text.
 pub fn uri_to_path(uri: &str) -> String {
-    let body = uri.strip_prefix("file://").unwrap_or(uri);
-    percent_decode(body)
+    bounded_uri_to_path(uri).unwrap_or_default()
 }
 
 fn bounded_uri_to_path(uri: &str) -> Option<String> {
-    if uri.len() > limits::MAX_URI_BYTES {
+    if uri.len() > limits::MAX_URI_BYTES || uri.contains('?') || uri.contains('#') {
         return None;
     }
-    let body = uri.strip_prefix("file://")?;
-    let bytes = body.as_bytes();
-    for (index, byte) in bytes.iter().enumerate() {
-        if *byte == b'%'
-            && (index + 2 >= bytes.len()
-                || !bytes[index + 1].is_ascii_hexdigit()
-                || !bytes[index + 2].is_ascii_hexdigit())
-        {
-            return None;
+    let remainder = uri.strip_prefix("file://")?;
+    let path_part = if let Some(after_authority) = remainder.strip_prefix("localhost/") {
+        format!("/{after_authority}")
+    } else if remainder.starts_with('/') {
+        remainder.to_string()
+    } else {
+        return None;
+    };
+    let bytes = path_part.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            if index + 2 >= bytes.len() {
+                return None;
+            }
+            let hi = (bytes[index + 1] as char).to_digit(16)?;
+            let lo = (bytes[index + 2] as char).to_digit(16)?;
+            let byte = ((hi * 16) + lo) as u8;
+            // Encoded delimiters are rejected because servers and URI parsers
+            // disagree about whether they are path separators/components.
+            if matches!(byte, b'/' | b'\\' | 0) {
+                return None;
+            }
+            decoded.push(byte);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
         }
     }
-    let path = percent_decode(body);
-    (path.len() <= limits::MAX_IDENTITY_BYTES
-        && !path.is_empty()
+    let path = String::from_utf8(decoded).ok()?;
+    (path.starts_with('/')
+        && path.len() <= limits::MAX_IDENTITY_BYTES
         && !path.chars().any(char::is_control))
     .then_some(path)
 }
@@ -792,7 +821,7 @@ fn bounded_uri_to_path(uri: &str) -> Option<String> {
 fn ensure_identity_uri(uri: &str) -> Result<(), LspError> {
     bounded_uri_to_path(uri)
         .map(|_| ())
-        .ok_or_else(|| LspError::Bounded("LSP identity URI limit".into()))
+        .ok_or_else(|| LspError::Bounded("LSP identity URI limit or unsupported URI".into()))
 }
 
 /// Percent-encode everything outside the unreserved set, keeping `/` literal.
@@ -809,41 +838,23 @@ fn percent_encode_path(path: &str) -> String {
     out
 }
 
-/// Reverse [`percent_encode_path`] (also decodes `%`-escapes other encoders emit).
-fn percent_decode(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            let hi = (bytes[i + 1] as char).to_digit(16);
-            let lo = (bytes[i + 2] as char).to_digit(16);
-            if let (Some(hi), Some(lo)) = (hi, lo) {
-                out.push((hi * 16 + lo) as u8);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
 // ─── response mapping (pure, defensive) ──────────────────────────────────────
 
-fn position_from_json(v: &Value) -> Position {
-    Position {
-        line: v.get("line").and_then(Value::as_u64).unwrap_or(0) as u32,
-        character: v.get("character").and_then(Value::as_u64).unwrap_or(0) as u32,
-    }
+fn position_from_json(v: &Value) -> Option<Position> {
+    Some(Position {
+        line: u32::try_from(v.get("line")?.as_u64()?).ok()?,
+        character: u32::try_from(v.get("character")?.as_u64()?).ok()?,
+    })
 }
 
-fn range_from_json(v: &Value) -> Range {
-    Range {
-        start: v.get("start").map(position_from_json).unwrap_or_default(),
-        end: v.get("end").map(position_from_json).unwrap_or_default(),
-    }
+fn range_from_json(v: &Value) -> Option<Range> {
+    let range = Range {
+        start: position_from_json(v.get("start")?)?,
+        end: position_from_json(v.get("end")?)?,
+    };
+    (range.start.line < range.end.line
+        || (range.start.line == range.end.line && range.start.character <= range.end.character))
+        .then_some(range)
 }
 
 fn location_from_json(v: &Value) -> Option<Location> {
@@ -851,16 +862,15 @@ fn location_from_json(v: &Value) -> Option<Location> {
     if let (Some(uri), Some(range)) = (v.get("uri"), v.get("range")) {
         return Some(Location {
             path: bounded_uri_to_path(uri.as_str()?)?,
-            range: range_from_json(range),
+            range: range_from_json(range)?,
         });
     }
     // `LocationLink { targetUri, targetSelectionRange | targetRange }`.
     if let Some(uri) = v.get("targetUri").and_then(Value::as_str) {
-        let range = v
-            .get("targetSelectionRange")
-            .or_else(|| v.get("targetRange"))
-            .map(range_from_json)
-            .unwrap_or_default();
+        let range = range_from_json(
+            v.get("targetSelectionRange")
+                .or_else(|| v.get("targetRange"))?,
+        )?;
         return Some(Location {
             path: bounded_uri_to_path(uri)?,
             range,
@@ -953,8 +963,11 @@ fn project_symbols(
             let range = item
                 .get("selectionRange")
                 .or_else(|| item.get("range"))
-                .map(range_from_json)
-                .unwrap_or_default();
+                .and_then(range_from_json);
+            let Some(range) = range else {
+                health.invalid = true;
+                continue;
+            };
             Location {
                 path: fallback_path.to_string(),
                 range,
@@ -1015,7 +1028,7 @@ fn parse_hover_limited(result: &Value, health: &mut ProjectionHealth) -> Option<
     }
     Some(HoverInfo {
         markdown,
-        range: result.get("range").map(range_from_json),
+        range: result.get("range").and_then(range_from_json),
     })
 }
 
@@ -1275,7 +1288,8 @@ fn diagnostic_value_bytes(value: &Value) -> usize {
 }
 
 fn parse_one_diagnostic(v: &Value, health: &mut ProjectionHealth) -> Option<LspDiagnostic> {
-    let start = v.get("range")?.get("start").map(position_from_json)?;
+    let range = range_from_json(v.get("range")?)?;
+    let start = range.start;
     let severity = LspSeverity::from_lsp(v.get("severity").and_then(Value::as_i64).unwrap_or(1));
     let code = v.get("code").and_then(|c| match c {
         Value::String(s) => bounded_string(s, limits::MAX_CODE_SOURCE_BYTES, health),
@@ -1314,15 +1328,11 @@ fn bounded_error_text(error: &Value) -> String {
 
 type Pending = Arc<Mutex<HashMap<i64, Sender<Result<Value, LspError>>>>>;
 
-/// Shared write half of the LSP transport — a local child's stdin, or a
-/// remote/bridge stream's writer.
-type SharedWriter = Arc<Mutex<Box<dyn Write + Send>>>;
-
 /// A live connection to one language server. The transport is abstracted over
 /// `Read`/`Write` so the server may run locally (a child process) OR inside a
 /// sandbox/remote, driven over the resident bridge's stdio (see `from_io`).
 pub struct LspClient {
-    stdin: SharedWriter,
+    writer: SyncSender<WriterCommand>,
     /// The local child, if any. `None` for a bridge/remote server (its lifecycle
     /// is owned by the bridge/exec channel, which closes when this drops).
     child: Mutex<Option<Child>>,
@@ -1339,6 +1349,7 @@ pub struct LspClient {
     next_id: AtomicI64,
     pending: Pending,
     closed: Arc<AtomicBool>,
+    queued_bytes: Arc<AtomicUsize>,
     root: PathBuf,
     diagnostics: DiagnosticsSender,
     /// The authority stream this connection publishes under; retired on drop
@@ -1354,6 +1365,74 @@ pub struct LspClient {
     caps: OnceLock<ServerCapabilities>,
     timeout: Duration,
     _reader: JoinHandle<()>,
+}
+
+enum WriterCommand {
+    Message(Vec<u8>, usize, Option<Sender<Result<(), LspError>>>),
+}
+
+fn enqueue_body(
+    writer: &SyncSender<WriterCommand>,
+    queued_bytes: &AtomicUsize,
+    body: &str,
+    done: Option<Sender<Result<(), LspError>>>,
+) -> Result<(), LspError> {
+    if body.len() > limits::MAX_OUTBOUND_BODY_BYTES {
+        return Err(LspError::Bounded("outbound LSP body limit".into()));
+    }
+    let byte_len = format!("Content-Length: {}\r\n\r\n", body.len()).len() + body.len();
+    if queued_bytes
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |queued| {
+            queued
+                .checked_add(byte_len)
+                .filter(|total| *total <= limits::MAX_OUTBOUND_QUEUED_BYTES)
+        })
+        .is_err()
+    {
+        return Err(LspError::Bounded("LSP outbound queue byte limit".into()));
+    }
+    match writer.try_send(WriterCommand::Message(
+        framing::encode(body),
+        byte_len,
+        done,
+    )) {
+        Ok(()) => Ok(()),
+        Err(TrySendError::Full(_)) => {
+            queued_bytes.fetch_sub(byte_len, Ordering::SeqCst);
+            Err(LspError::Bounded("LSP outbound queue full".into()))
+        }
+        Err(TrySendError::Disconnected(_)) => {
+            queued_bytes.fetch_sub(byte_len, Ordering::SeqCst);
+            Err(LspError::Protocol("LSP writer closed".into()))
+        }
+    }
+}
+
+fn writer_loop(
+    mut writer: Box<dyn Write + Send>,
+    rx: Receiver<WriterCommand>,
+    queued_bytes: Arc<AtomicUsize>,
+    closed: Arc<AtomicBool>,
+) {
+    for command in rx {
+        match command {
+            WriterCommand::Message(bytes, byte_len, done) => {
+                let result = writer
+                    .write_all(&bytes)
+                    .and_then(|()| writer.flush())
+                    .map_err(|error| LspError::Protocol(error.to_string()));
+                queued_bytes.fetch_sub(byte_len, Ordering::SeqCst);
+                if result.is_err() {
+                    closed.store(true, Ordering::SeqCst);
+                }
+                if let Some(done) = done
+                    && done.send(result).is_err()
+                {
+                    // The caller timed out or closed before write completion.
+                }
+            }
+        }
+    }
 }
 
 impl LspClient {
@@ -1527,14 +1606,24 @@ impl LspClient {
             server_identity,
             generation,
         } = authority;
-        let stdin: SharedWriter = Arc::new(Mutex::new(writer));
-        let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+        let (writer_tx, writer_rx) = mpsc::sync_channel(limits::MAX_OUTBOUND_MESSAGES);
+        let queued_bytes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let closed = Arc::new(AtomicBool::new(false));
+        let _writer_thread = thread::Builder::new()
+            .name("thegn-lsp-writer".into())
+            .spawn({
+                let writer_queued_bytes = queued_bytes.clone();
+                let writer_closed = closed.clone();
+                move || writer_loop(writer, writer_rx, writer_queued_bytes, writer_closed)
+            })
+            .expect("LSP writer thread spawn");
+        let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
         let reader_thread = {
             let ctx = ReaderContext {
                 pending: pending.clone(),
                 diag_tx: diag_tx.clone(),
-                stdin: stdin.clone(),
+                writer: writer_tx.clone(),
+                queued_bytes: queued_bytes.clone(),
                 root: root.to_path_buf(),
                 closed: closed.clone(),
                 server_identity: server_identity.clone(),
@@ -1545,11 +1634,12 @@ impl LspClient {
         };
 
         LspClient {
-            stdin,
+            writer: writer_tx,
             child: Mutex::new(child),
             next_id: AtomicI64::new(1),
             pending,
             closed,
+            queued_bytes,
             root: root.to_path_buf(),
             language_id,
             diagnostics: diag_tx,
@@ -1746,27 +1836,40 @@ impl LspClient {
 
     /// Send a request and block (up to `timeout`) for its correlated response.
     fn request(&self, method: &str, params: Value) -> Result<Value, LspError> {
+        let deadline = std::time::Instant::now() + self.timeout;
         self.ensure_open()?;
-        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let id = self
+            .next_id
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |id| {
+                (id > 0 && id < i64::MAX).then_some(id + 1)
+            })
+            .map_err(|_| LspError::Bounded("LSP request id space exhausted".into()))?;
         let (tx, rx) = mpsc::channel();
         {
             let mut pending = self.pending.lock().unwrap();
             // Reader closure uses this same lock to latch closed and drain.
             // A late requester cannot insert after the terminal drain.
             self.ensure_open()?;
+            if pending.len() >= limits::MAX_PENDING_REQUESTS {
+                return Err(LspError::Bounded("too many pending LSP requests".into()));
+            }
             pending.insert(id, tx);
         }
 
         let body = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
-        if let Err(e) = self.write(&body.to_string()) {
+        if let Err(e) = self.write_until(&body.to_string(), Some(deadline)) {
             self.pending.lock().unwrap().remove(&id);
+            if matches!(e, LspError::Timeout) {
+                self.send_cancel(id);
+            }
             return Err(e);
         }
 
-        match rx.recv_timeout(self.timeout) {
+        match rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())) {
             Ok(res) => res,
             Err(_) => {
                 self.pending.lock().unwrap().remove(&id);
+                self.send_cancel(id);
                 Err(LspError::Timeout)
             }
         }
@@ -1788,21 +1891,38 @@ impl LspClient {
 
     fn write(&self, body: &str) -> Result<(), LspError> {
         self.ensure_open()?;
-        // Our own serialized payload: no inbound (untrusted) JSON limits —
-        // a didOpen carries a whole file as one string.
-        if body.len() > limits::MAX_OUTBOUND_BODY_BYTES {
-            return Err(LspError::Bounded("outbound LSP body limit".into()));
-        }
-        let framed = framing::encode(body);
-        let mut stdin = self
-            .stdin
-            .lock()
-            .map_err(|_| LspError::Protocol("stdin poisoned".into()))?;
+        enqueue_body(&self.writer, &self.queued_bytes, body, None)
+    }
+
+    fn write_until(
+        &self,
+        body: &str,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<(), LspError> {
         self.ensure_open()?;
-        stdin
-            .write_all(&framed)
-            .and_then(|_| stdin.flush())
-            .map_err(|e| LspError::Protocol(e.to_string()))
+        if deadline.is_some_and(|at| std::time::Instant::now() >= at) {
+            return Err(LspError::Timeout);
+        }
+        let (done_tx, done_rx) = mpsc::channel();
+        enqueue_body(&self.writer, &self.queued_bytes, body, Some(done_tx))?;
+        let wait = deadline.map_or(Duration::from_secs(365 * 24 * 60 * 60), |at| {
+            at.saturating_duration_since(std::time::Instant::now())
+        });
+        match done_rx.recv_timeout(wait) {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(LspError::Timeout),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                Err(LspError::Protocol("LSP writer closed".into()))
+            }
+        }
+    }
+
+    fn send_cancel(&self, id: i64) {
+        let body =
+            json!({"jsonrpc":"2.0", "method":"$/cancelRequest", "params":{"id":id}}).to_string();
+        if let Err(error) = enqueue_body(&self.writer, &self.queued_bytes, &body, None) {
+            tracing::debug!(target: "thegn::lsp", %error, "dropping cancel notification because outbound queue is full");
+        }
     }
 }
 
@@ -1836,7 +1956,8 @@ struct Authority {
 struct ReaderContext {
     pending: Pending,
     diag_tx: DiagnosticsSender,
-    stdin: SharedWriter,
+    writer: SyncSender<WriterCommand>,
+    queued_bytes: Arc<AtomicUsize>,
     root: PathBuf,
     closed: Arc<AtomicBool>,
     server_identity: String,
@@ -1916,7 +2037,7 @@ fn reject_unparsed(ctx: &ReaderContext, body: &[u8], reason: &str) {
 }
 
 fn dispatch(msg: &Value, ctx: &ReaderContext) {
-    let (pending, diag_tx, stdin, root) = (&ctx.pending, &ctx.diag_tx, &ctx.stdin, &ctx.root);
+    let (pending, diag_tx, writer, root) = (&ctx.pending, &ctx.diag_tx, &ctx.writer, &ctx.root);
     let (server_identity, generation, sequence) =
         (ctx.server_identity.as_str(), ctx.generation, &ctx.sequence);
     let id = msg.get("id").and_then(Value::as_i64);
@@ -1960,9 +2081,8 @@ fn dispatch(msg: &Value, ctx: &ReaderContext) {
                 _ => Value::Null,
             };
             let body = json!({ "jsonrpc": "2.0", "id": id, "result": result }).to_string();
-            if let Ok(mut s) = stdin.lock() {
-                let _ = s.write_all(&framing::encode(&body)); // best-effort: test fake server stdin; server may be gone
-                let _ = s.flush(); // best-effort: same
+            if let Err(error) = enqueue_body(writer, &ctx.queued_bytes, &body, None) {
+                tracing::debug!(target: "thegn::lsp", %error, "dropping server request reply because outbound queue is full");
             }
         }
         // Notification.
@@ -1999,17 +2119,227 @@ fn dispatch(msg: &Value, ctx: &ReaderContext) {
 mod tests {
     use super::*;
 
+    struct BlockingWriter {
+        entered: Option<Sender<()>>,
+        release: Receiver<()>,
+    }
+
+    impl Write for BlockingWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if let Some(entered) = self.entered.take() {
+                entered.send(()).unwrap();
+                self.release.recv().unwrap();
+            }
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn blocked_client(
+        timeout: Duration,
+    ) -> (LspClient, Sender<()>, Receiver<()>, std::io::PipeWriter) {
+        let (reader, server_writer) = std::io::pipe().unwrap();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let writer = BlockingWriter {
+            entered: Some(entered_tx),
+            release: release_rx,
+        };
+        let (diag_tx, _) = diagnostics_channel();
+        let mut client = LspClient::from_io(
+            Box::new(reader),
+            Box::new(writer),
+            "fixture",
+            Path::new("/fixture"),
+            diag_tx,
+        )
+        .unwrap();
+        client.timeout = timeout;
+        (client, release_tx, entered_rx, server_writer)
+    }
+
+    fn start_blocked_request(client: &Arc<LspClient>) -> Receiver<Result<Value, LspError>> {
+        let client = client.clone();
+        let (result_tx, result_rx) = mpsc::channel();
+        let _request_thread = thread::spawn(move || {
+            result_tx
+                .send(client.request("blocked", Value::Null))
+                .unwrap();
+        });
+        result_rx
+    }
+
+    #[test]
+    fn request_deadline_includes_a_blocked_write() {
+        let timeout = Duration::from_millis(60);
+        let (client, release, entered, _server_writer) = blocked_client(timeout);
+        let client = Arc::new(client);
+        let started = std::time::Instant::now();
+        let result = start_blocked_request(&client)
+            .recv_timeout(Duration::from_millis(500))
+            .expect("request deadline includes blocked write");
+        assert!(entered.recv_timeout(Duration::from_secs(1)).is_ok());
+        assert!(matches!(result, Err(LspError::Timeout)));
+        assert!(started.elapsed() < Duration::from_millis(500));
+        release.send(()).unwrap();
+    }
+
+    #[test]
+    fn timed_out_request_enqueues_cancel_behind_blocked_write() {
+        let (client, release, entered, _server_writer) = blocked_client(Duration::from_millis(60));
+        let client = Arc::new(client);
+        let result = start_blocked_request(&client)
+            .recv_timeout(Duration::from_millis(500))
+            .expect("timed out request returns while writer is blocked");
+        assert!(entered.recv_timeout(Duration::from_secs(1)).is_ok());
+        assert!(matches!(result, Err(LspError::Timeout)));
+        let request =
+            json!({"jsonrpc":"2.0", "id":1, "method":"blocked", "params":null}).to_string();
+        let in_flight = framing::encode(&request).len();
+        assert!(
+            client.queued_bytes.load(Ordering::SeqCst) > in_flight,
+            "timeout enqueued the cancellation frame behind the blocked request"
+        );
+        release.send(()).unwrap();
+    }
+
+    #[test]
+    fn pending_request_limit_rejects_the_sixty_fifth_request() {
+        let (client, release, _entered, _server_writer) = blocked_client(Duration::from_secs(5));
+        let client = Arc::new(client);
+        let mut pending = client.pending.lock().unwrap();
+        for id in 1..=limits::MAX_PENDING_REQUESTS as i64 {
+            let (tx, _rx) = mpsc::channel();
+            pending.insert(id, tx);
+        }
+        drop(pending);
+        assert!(matches!(
+            start_blocked_request(&client)
+                .recv_timeout(Duration::from_millis(500))
+                .expect("pending admission rejects before writing"),
+            Err(LspError::Bounded(message)) if message == "too many pending LSP requests"
+        ));
+        release.send(()).unwrap();
+    }
+
+    #[test]
+    fn dropping_client_does_not_wait_for_a_blocked_writer() {
+        let (client, release, entered, _server_writer) = blocked_client(Duration::from_secs(5));
+        let client = Arc::new(client);
+        let notify_client = client.clone();
+        let (notify_tx, notify_rx) = mpsc::channel();
+        let notify_thread = thread::spawn(move || {
+            notify_tx
+                .send(notify_client.notify("blocked", Value::Null))
+                .unwrap();
+        });
+        assert!(
+            notify_rx
+                .recv_timeout(Duration::from_millis(500))
+                .expect("notification enqueue does not wait for blocked writer")
+                .is_ok()
+        );
+        notify_thread.join().unwrap();
+        assert!(entered.recv_timeout(Duration::from_secs(1)).is_ok());
+        let started = std::time::Instant::now();
+        drop(client);
+        assert!(started.elapsed() < Duration::from_millis(300));
+        release.send(()).unwrap();
+    }
+
+    #[test]
+    fn late_response_after_timeout_is_dropped() {
+        let (client, release, entered, mut server_writer) =
+            blocked_client(Duration::from_millis(60));
+        let client = Arc::new(client);
+        let result = start_blocked_request(&client)
+            .recv_timeout(Duration::from_millis(500))
+            .expect("timed out request returns while writer is blocked");
+        assert!(entered.recv_timeout(Duration::from_secs(1)).is_ok());
+        assert!(matches!(result, Err(LspError::Timeout)));
+        let (sentinel_tx, sentinel_rx) = mpsc::channel();
+        client.pending.lock().unwrap().insert(99, sentinel_tx);
+        let mut responses = framing::encode(r#"{"jsonrpc":"2.0","id":1,"result":"late"}"#);
+        responses.extend(framing::encode(
+            r#"{"jsonrpc":"2.0","id":99,"result":"sentinel"}"#,
+        ));
+        server_writer.write_all(&responses).unwrap();
+        assert_eq!(
+            sentinel_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            Ok(json!("sentinel"))
+        );
+        assert!(client.pending.lock().unwrap().is_empty());
+        release.send(()).unwrap();
+    }
+
+    #[test]
+    fn outbound_byte_cap_is_checked_before_framing_enqueue() {
+        let (writer, rx) = mpsc::sync_channel(2);
+        let queued = AtomicUsize::new(limits::MAX_OUTBOUND_QUEUED_BYTES);
+        assert!(matches!(
+            enqueue_body(&writer, &queued, "{}", None),
+            Err(LspError::Bounded(message)) if message == "LSP outbound queue byte limit"
+        ));
+        assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn writer_io_error_latches_client_closed() {
+        struct BrokenPipe;
+        impl Write for BrokenPipe {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let (reader, _server_writer) = std::io::pipe().unwrap();
+        let (diag_tx, _) = diagnostics_channel();
+        let client = LspClient::from_io(
+            Box::new(reader),
+            Box::new(BrokenPipe),
+            "fixture",
+            Path::new("/fixture"),
+            diag_tx,
+        )
+        .unwrap();
+        client.notify("break", Value::Null).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while !client.closed.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+            thread::yield_now();
+        }
+        assert!(client.closed.load(Ordering::SeqCst));
+        assert!(matches!(client.ensure_open(), Err(LspError::Protocol(_))));
+    }
+
     fn fixture_ctx(
         pending: Pending,
         diag_tx: DiagnosticsSender,
-        stdin: SharedWriter,
+        stdin: Arc<Mutex<Box<dyn Write + Send>>>,
     ) -> ReaderContext {
+        let (writer, reader) = mpsc::sync_channel(4);
+        let queued_bytes = Arc::new(AtomicUsize::new(0));
+        let closed = Arc::new(AtomicBool::new(false));
+        let writer_obj = match Arc::try_unwrap(stdin) {
+            Ok(writer) => writer.into_inner().unwrap(),
+            Err(_) => panic!("fixture writer is unique"),
+        };
+        let _writer = thread::spawn({
+            let writer_queued_bytes = queued_bytes.clone();
+            let writer_closed = closed.clone();
+            move || writer_loop(writer_obj, reader, writer_queued_bytes, writer_closed)
+        });
         ReaderContext {
             pending,
             diag_tx,
-            stdin,
+            writer,
+            queued_bytes,
             root: PathBuf::from("/fixture"),
-            closed: Arc::new(AtomicBool::new(false)),
+            closed,
             server_identity: "fixture".into(),
             generation: 1,
             sequence: AtomicU64::new(0),
@@ -2069,7 +2399,8 @@ mod tests {
         let (diag_tx, diag_rx) = diagnostics_channel();
         let generation = diag_tx.register(Path::new("/fixture"), "fixture").unwrap();
         assert_eq!(generation, 1);
-        let stdin: SharedWriter = Arc::new(Mutex::new(Box::new(std::io::sink())));
+        let stdin: Arc<Mutex<Box<dyn Write + Send>>> =
+            Arc::new(Mutex::new(Box::new(std::io::sink())));
         let mut wire = b"Content-Length: 1\r\nContent-Length: 1\r\n\r\nX".to_vec();
         wire.extend(framing::encode(r#"{"id":7,"result":"must not dispatch"}"#));
         reader_loop(
@@ -2100,6 +2431,47 @@ mod tests {
         let uri = path_to_uri(p);
         assert!(uri.contains("%20"), "space should be encoded: {uri}");
         assert_eq!(uri_to_path(&uri), p);
+    }
+
+    #[test]
+    fn file_uri_rejects_remote_authorities_components_and_encoded_separators() {
+        for uri in [
+            "https://example.test/a.rs",
+            "file://server/share/a.rs",
+            "file:///a.rs?query",
+            "file:///a.rs#fragment",
+            "file:///a%2Fb.rs",
+            "file:///a%00b.rs",
+            "file:///bad%escape",
+        ] {
+            assert_eq!(bounded_uri_to_path(uri), None, "accepted {uri}");
+        }
+        assert_eq!(
+            bounded_uri_to_path("file://localhost/tmp/a%20b.rs"),
+            Some("/tmp/a b.rs".into())
+        );
+    }
+
+    #[test]
+    fn malformed_positions_and_ranges_are_rejected_without_truncation() {
+        assert_eq!(
+            position_from_json(&json!({"line": 4, "character": 2})),
+            Some(Position {
+                line: 4,
+                character: 2
+            })
+        );
+        assert_eq!(
+            position_from_json(&json!({"line": u64::MAX, "character": 2})),
+            None
+        );
+        assert_eq!(position_from_json(&json!({"line": 4})), None);
+        assert_eq!(
+            range_from_json(
+                &json!({"start":{"line":2,"character":0},"end":{"line":1,"character":0}})
+            ),
+            None
+        );
     }
 
     #[test]
@@ -2324,14 +2696,13 @@ mod tests {
 
     #[test]
     fn iterative_symbol_projection_has_stable_total_cap() {
-        // Keep the chain within the 64-level JSON preflight, including the
-        // outer result array and each symbol's children array, then add enough
-        // breadth to cross the total projection cap by one.
+        // Exercise the total projection cap with a chain that fits the
+        // 64-level JSON preflight, including each symbol's range and children.
         let symbol = |name: String, line: usize, children: Vec<Value>| {
             json!({
                 "name": name,
                 "kind": 12,
-                "range": { "start": { "line": line, "character": 0 } },
+                "range": { "start": { "line": line, "character": 0 }, "end": { "line": line, "character": 0 } },
                 "children": children
             })
         };
@@ -2341,14 +2712,21 @@ mod tests {
             chain = symbol(format!("d{depth}"), depth, vec![chain]);
         }
         let chain_len = levels + 1;
-        let wide: Vec<Value> = (0..=limits::MAX_RESULT_ITEMS - chain_len)
-            .map(|index| symbol(format!("w{index}"), index, vec![]))
+        // Empty `children` arrays on these leaves add nodes without exercising
+        // projection, so omit them from the broad tail.
+        let wide: Vec<Value> = (0..limits::MAX_RESULT_ITEMS - chain_len)
+            .map(|index| {
+                json!({
+                    "name": format!("w{index}"),
+                    "kind": 12,
+                    "range": {
+                        "start": { "line": index, "character": 0 },
+                        "end": { "line": index, "character": 0 }
+                    }
+                })
+            })
             .collect();
         let tree = json!([chain, symbol("wide".into(), 0, wide)]);
-        assert!(
-            preflight_json(tree.to_string().as_bytes()).is_ok(),
-            "admissible input"
-        );
         let mut health = ProjectionHealth::default();
         let symbols = project_symbols(&tree, "/safe.rs", &mut health);
         assert_eq!(symbols.len(), limits::MAX_RESULT_ITEMS, "exact total cap");
@@ -2368,6 +2746,27 @@ mod tests {
         let symbols = project_symbols(&Value::Array(exact), "/safe.rs", &mut health);
         assert_eq!(symbols.len(), limits::MAX_RESULT_ITEMS);
         assert!(!health.truncated);
+    }
+
+    #[test]
+    fn malformed_symbol_range_records_invalid_projection_health() {
+        let tree = json!([{
+            "name": "malformed",
+            "kind": 12,
+            "range": { "start": { "line": 1, "character": 0 } },
+            "children": [{
+                "name": "child",
+                "kind": 12,
+                "range": { "start": { "line": 1, "character": 0 }, "end": { "line": 1, "character": 0 } }
+            }]
+        }]);
+        let mut health = ProjectionHealth::default();
+        let symbols = project_symbols(&tree, "/safe.rs", &mut health);
+        assert!(symbols.is_empty());
+        assert!(
+            health.invalid,
+            "malformed parent range records projection loss"
+        );
     }
 
     #[test]
@@ -2399,7 +2798,7 @@ mod tests {
                 "jsonrpc": "2.0",
                 "method": "textDocument/publishDiagnostics",
                 "params": { "uri": uri, "diagnostics": [{
-                    "range": { "start": { "line": 0, "character": 0 } },
+                    "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 0 } },
                     "message": message
                 }]}
             })
@@ -2538,11 +2937,24 @@ mod tests {
         // before the child count cap. Emission is byte-accounted.
         let parent_name_bytes = limits::MAX_SCALAR_STRING_BYTES / 4;
         let children: Vec<Value> = (0..limits::MAX_CONTAINER_ITEMS)
-            .map(|index| json!({ "name": format!("c{index}"), "kind": 12 }))
+            .map(|index| {
+                json!({
+                    "name": format!("c{index}"),
+                    "kind": 12,
+                    "range": {
+                        "start": { "line": index, "character": 0 },
+                        "end": { "line": index, "character": 0 }
+                    }
+                })
+            })
             .collect();
         let parent = json!([{
             "name": "p".repeat(parent_name_bytes),
             "kind": 5,
+            "range": {
+                "start": { "line": 0, "character": 0 },
+                "end": { "line": 0, "character": 0 }
+            },
             "children": children
         }]);
         let symbols = parse_symbols(&parent, "/f.rs");
@@ -2568,7 +2980,7 @@ mod tests {
 
     #[test]
     fn exact_diagnostic_limits_are_inclusive() {
-        let one = |message: &str| json!({ "range": { "start": { "line": 0, "character": 0 } }, "message": message });
+        let one = |message: &str| json!({ "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 0 } }, "message": message });
         let at_cap = json!({ "uri": "file:///a.rs", "diagnostics": (0..limits::MAX_DIAGNOSTICS).map(|_| one("m")).collect::<Vec<_>>() });
         let (pd, health) =
             parse_published_diagnostics_with_context(&at_cap, Path::new("/"), "s".into(), 1, 1);
@@ -2637,7 +3049,7 @@ mod tests {
         let body = format!(
             r#"{{"jsonrpc":"2.0","method":"textDocument/publishDiagnostics","params":{{"uri":"file:///fixture/a.rs","diagnostics":[{}]}}}}"#,
             (0..=limits::MAX_CONTAINER_ITEMS)
-                .map(|_| r#"{"range":{"start":{"line":0,"character":0}},"message":"m"}"#)
+                .map(|_| r#"{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":0}},"message":"m"}"#)
                 .collect::<Vec<_>>()
                 .join(",")
         );
