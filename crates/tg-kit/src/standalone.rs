@@ -48,6 +48,16 @@ pub fn run(
 
     let mut ops = CrosstermTerminalOps;
     run_lifecycle(&mut ops, tile, |tile| {
+        // Keep standalone panic output visible on the main screen. Hook
+        // generation ownership remains process-global, as it was before the
+        // terminal lifecycle guard was introduced.
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let _ = disable_raw_mode(); // best-effort: panic hook: restore what we can, never mask the panic
+            let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableBracketedPaste); // best-effort: panic hook: restore what we can, never mask the panic
+            prev(info);
+        }));
+
         // Start blocking input only after terminal setup succeeded. The reader
         // remains detached because crossterm's blocking read has no cancel API.
         let in_tx = tx;
@@ -246,7 +256,7 @@ struct LifecycleError {
 impl std::fmt::Display for LifecycleError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if let Some(primary) = &self.primary {
-            write!(f, "{primary}")?;
+            write!(f, "{primary:#}")?;
         } else {
             write!(f, "standalone teardown failed")?;
         }
@@ -259,9 +269,7 @@ impl std::fmt::Display for LifecycleError {
 
 impl std::error::Error for LifecycleError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        self.primary
-            .as_ref()
-            .map(|error| error.as_ref() as &(dyn std::error::Error + 'static))
+        self.primary.as_ref().map(|primary| &**primary)
     }
 }
 
@@ -405,6 +413,19 @@ mod tests {
                 "raw+", "alt+", "paste+", "paste-", "alt-", "raw-", "cursor+"
             ]
         );
+    }
+
+    #[test]
+    fn lifecycle_error_displays_primary_context_once() {
+        let primary = anyhow::anyhow!("root cause").context("body failed");
+        let error = LifecycleError {
+            primary: Some(primary),
+            teardown: Vec::new(),
+        };
+
+        let displayed = error.to_string();
+        assert!(displayed.contains("body failed: root cause"));
+        assert!(std::error::Error::source(&error).is_none());
     }
 
     #[test]
