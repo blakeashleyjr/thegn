@@ -1155,6 +1155,7 @@ fn do_spawn(p: SpawnParams, writer: SharedWriter, procs: ProcRegistry) -> Result
         c.env(k, v);
     }
     // Lead a fresh process group so termination reaches the whole tree.
+    crate::plugin::proc::set_process_group(&mut c);
     let mut child = c
         .spawn()
         .with_context(|| format!("spawn {}", p.argv.join(" ")))?;
