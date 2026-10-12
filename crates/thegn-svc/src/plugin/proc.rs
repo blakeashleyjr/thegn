@@ -158,7 +158,7 @@ pub fn spawn_ndjson_stream<S: NdjsonSink>(
     }
     set_process_group(&mut cmd);
 
-    let child = cmd.spawn().map_err(|e| PluginError::Spawn(e.to_string()))?;
+    let mut child = cmd.spawn().map_err(|e| PluginError::Spawn(e.to_string()))?;
     let pid = child.id();
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
