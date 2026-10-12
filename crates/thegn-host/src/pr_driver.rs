@@ -1547,7 +1547,11 @@ mod tests {
                 vec![PrItem::from(&row)],
                 |_| {},
             );
-            assert!(out.blocked.is_empty());
+            assert_eq!(
+                out.blocked,
+                vec![7],
+                "in-flight CI remains blocked while the rerun is pending"
+            );
             assert!(out.needs_human.is_empty());
             assert_eq!(db.list_pr_queue().unwrap()[0].agent_attempts, 0);
             assert_eq!(
