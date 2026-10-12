@@ -31,7 +31,7 @@ use crate::sandbox_mounts::{
 use crate::{msg, util};
 use std::path::PathBuf;
 use std::process::Command;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 #[path = "sandbox_proc.rs"]
 pub(crate) mod proc;
@@ -109,101 +109,26 @@ fn stderr_with_timeout_stdin(
     timeout: Duration,
     input: Vec<u8>,
 ) -> Option<(bool, String)> {
-    use std::io::Write;
-    use std::process::Stdio;
-
-    let mut child = Command::new(&argv[0])
-        .args(&argv[1..])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .ok()?;
-    let Some(mut stdin) = child.stdin.take() else {
-        terminate_and_reap(&mut child);
-        return None;
-    };
     let redactions: Vec<String> = String::from_utf8_lossy(&input)
         .lines()
         .filter_map(|line| line.split_once('=').map(|(_, value)| value.to_string()))
         .filter(|value| !value.is_empty())
         .collect();
-    let feeder = std::thread::spawn(move || stdin.write_all(&input));
-    let deadline = Instant::now() + timeout;
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let feeder_result = feeder.join();
-                let waited = child.wait().ok()?;
-                let feeder_succeeded = matches!(feeder_result, Ok(Ok(())));
-                let err = child
-                    .stderr
-                    .take()
-                    .and_then(read_stderr)
-                    .unwrap_or_default();
-                return Some((
-                    feeder_succeeded && status.success() && waited.success(),
-                    redact_payload_stderr(err, &redactions),
-                ));
-            }
-            Ok(None) if Instant::now() >= deadline => {
-                terminate_and_reap(&mut child);
-                drop(feeder.join());
-                return None;
-            }
-            Ok(None) => {
-                if feeder.is_finished() {
-                    match feeder.join() {
-                        Ok(Ok(())) => {}
-                        Ok(Err(_)) | Err(_) => {
-                            terminate_and_reap(&mut child);
-                            return None;
-                        }
-                    }
-                    // The input has been written and stdin dropped with the
-                    // feeder's owned handle; continue waiting for the command.
-                    return stderr_wait_after_input(child, deadline, redactions);
-                }
-                std::thread::sleep(Duration::from_millis(25));
-            }
-            Err(_) => {
-                terminate_and_reap(&mut child);
-                drop(feeder.join());
-                return None;
-            }
-        }
-    }
-}
-
-fn stderr_wait_after_input(
-    mut child: std::process::Child,
-    deadline: Instant,
-    redactions: Vec<String>,
-) -> Option<(bool, String)> {
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let waited = child.wait().ok()?;
-                let err = child
-                    .stderr
-                    .take()
-                    .and_then(read_stderr)
-                    .unwrap_or_default();
-                return Some((
-                    status.success() && waited.success(),
-                    redact_payload_stderr(err, &redactions),
-                ));
-            }
-            Ok(None) if Instant::now() >= deadline => {
-                terminate_and_reap(&mut child);
-                return None;
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(25)),
-            Err(_) => {
-                terminate_and_reap(&mut child);
-                return None;
-            }
-        }
+    let (outcome, delivery) = proc::run_bounded_with_input(
+        argv,
+        timeout,
+        proc::Capture {
+            stdout: None,
+            stderr: Some(256 * 1024),
+        },
+        input,
+    );
+    match outcome.into_stderr() {
+        Some((success, stderr)) => Some((
+            success && delivery == proc::InputDelivery::Complete,
+            redact_payload_stderr(stderr, &redactions),
+        )),
+        None => None,
     }
 }
 
@@ -224,20 +149,6 @@ fn redact_payload_stderr(mut stderr: String, secrets: &[String]) -> String {
         stderr = stderr.replace(secret.as_str(), "[REDACTED]");
     }
     stderr
-}
-
-fn terminate_and_reap(child: &mut std::process::Child) {
-    match child.kill() {
-        Ok(()) | Err(_) => {}
-    }
-    match child.wait() {
-        Ok(_) | Err(_) => {}
-    }
-}
-
-fn read_stderr(mut stderr: impl std::io::Read) -> Option<String> {
-    let mut output = String::new();
-    stderr.read_to_string(&mut output).ok().map(|_| output)
 }
 
 /// Runtime backend (resolved from the config-facing [`SandboxBackend`]; this set
@@ -2824,11 +2735,19 @@ fn backend_enter_argv_with_env(
             // stay inline as `--setenv K=V`. (Remote specs keep everything
             // inline — see `partition_secret_env`.)
             let (inline_env, secret_env) = partition_secret_env(spec);
-            if let Some(envfile) = write_secret_env_file(&spec.name, &secret_env, false) {
+            if let Some(envfile) = write_secret_env_file(&spec.name, &secret_env, true) {
                 v.extend([
                     "-p".into(),
                     format!("EnvironmentFile={}", envfile.display()),
                 ]);
+                match util::which_path("rm").and_then(|rm| systemd_env_cleanup_prop(&rm, &envfile))
+                {
+                    Some(property) => v.extend(["-p".into(), property]),
+                    None => tracing::debug!(
+                        target: "thegn::sandbox",
+                        "skipping systemd secret env-file cleanup property; path is unavailable or requires systemd escaping"
+                    ),
+                }
             } else if !secret_env.is_empty() {
                 // Never put host-sourced secrets back on argv if the protected
                 // file cannot be created. A failed tool is safer than a
@@ -2970,6 +2889,89 @@ fn write_secret_env_file_in(
     let body: String = secret.iter().map(|(k, v)| format!("{k}={v}\n")).collect();
     crate::fsperm::write_owner_only_atomic(&path, body.as_bytes()).ok()?;
     Some(path)
+}
+
+fn systemd_env_cleanup_prop(rm: &str, path: &std::path::Path) -> Option<String> {
+    let path = path.to_str()?;
+    let unsafe_char = |value: &str| {
+        value
+            .chars()
+            .any(|ch| ch.is_whitespace() || matches!(ch, '"' | '\'' | '\\' | '$' | '%' | ';'))
+    };
+    if unsafe_char(rm) || unsafe_char(path) {
+        return None;
+    }
+    Some(format!("ExecStopPost=-+{rm} -f -- {path}"))
+}
+
+/// Remove secret env-file residue older than this bound. A crash can therefore
+/// leave plaintext credentials for at most one hour before the next startup GC.
+const SECRET_ENV_FILE_MAX_AGE: Duration = Duration::from_secs(60 * 60);
+
+fn sweep_stale_env_files_in(dir: &std::path::Path, now: SystemTime, max_age: Duration) -> usize {
+    match std::fs::symlink_metadata(dir) {
+        Ok(metadata) if metadata.file_type().is_dir() => {}
+        Ok(_) => return 0,
+        Err(error) => {
+            tracing::debug!(target: "thegn::sandbox", %error, "unable to inspect sandbox env-file directory");
+            return 0;
+        }
+    }
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) => {
+            tracing::debug!(target: "thegn::sandbox", %error, "unable to read sandbox env-file directory");
+            return 0;
+        }
+    };
+    let mut removed = 0;
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                tracing::debug!(target: "thegn::sandbox", %error, "unable to inspect sandbox env-file entry");
+                continue;
+            }
+        };
+        if entry.path().extension().and_then(std::ffi::OsStr::to_str) != Some("env") {
+            continue;
+        }
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(error) => {
+                tracing::debug!(target: "thegn::sandbox", %error, "unable to inspect sandbox env-file type");
+                continue;
+            }
+        };
+        let stale = if file_type.is_symlink() {
+            true
+        } else if file_type.is_dir() {
+            false
+        } else {
+            match std::fs::symlink_metadata(entry.path()) {
+                Ok(metadata) => match metadata.modified() {
+                    Ok(modified) => now.duration_since(modified).is_ok_and(|age| age >= max_age),
+                    Err(error) => {
+                        tracing::debug!(target: "thegn::sandbox", %error, "unable to read sandbox env-file modification time");
+                        false
+                    }
+                },
+                Err(error) => {
+                    tracing::debug!(target: "thegn::sandbox", %error, "unable to inspect sandbox env-file metadata");
+                    false
+                }
+            }
+        };
+        if stale {
+            match std::fs::remove_file(entry.path()) {
+                Ok(()) => removed += 1,
+                Err(error) => {
+                    tracing::debug!(target: "thegn::sandbox", %error, "unable to remove stale sandbox env-file")
+                }
+            }
+        }
+    }
+    removed
 }
 
 fn oci_env_file_arg(argv: &[String]) -> Option<PathBuf> {
@@ -3667,6 +3669,8 @@ pub fn run_gc(db_worktrees: &[String]) -> Vec<String> {
 /// `thegn sandbox gc` report ("removed N on `<backend>`"). The startup sweep
 /// uses the flattened [`run_gc`]; both share this loop.
 pub fn run_gc_detailed(db_worktrees: &[String]) -> Vec<(&'static str, Vec<String>)> {
+    let env_dir = util::xdg_state_home().join("thegn/sandbox-env");
+    sweep_stale_env_files_in(&env_dir, SystemTime::now(), SECRET_ENV_FILE_MAX_AGE);
     let mut out = Vec::new();
     for backend in Backend::all_oci() {
         let Some(list) = gc_list_argv(backend) else {
