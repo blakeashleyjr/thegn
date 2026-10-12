@@ -41,7 +41,7 @@ impl EnvSource for FlippingEnv {
 }
 
 fn hosts() -> HostDefinitionsSnapshot {
-    HostDefinitionsSnapshot::from_raw(68, Vec::new()).expect("empty host snapshot")
+    HostDefinitionsSnapshot::from_captured_rows(68, Vec::new()).expect("empty host snapshot")
 }
 
 fn path_context() -> PathExpansionContext {
@@ -412,6 +412,102 @@ fn captured_path_context_is_part_of_deterministic_admission_revision() {
 }
 
 #[test]
+fn path_expansion_budget_refuses_aggregate_roots_and_pin_cwds_before_normalizing() {
+    let mut cfg = Config::default();
+    cfg.repo_roots = vec!["~".into(); crate::host_config_checked::MAX_CONTAINER];
+    cfg.pins.push(crate::config::Pin {
+        name: "pin".into(),
+        command: "echo".into(),
+        scope: crate::config::PinScope::Global,
+        workspace: None,
+        cwd: Some("~/private".into()),
+        start: crate::config::PinStart::Lazy,
+        restart: crate::config::PinRestart::Never,
+        singleton: false,
+        location: crate::config::PinLocation::Tab,
+        args: Vec::new(),
+        env: std::collections::BTreeMap::new(),
+        label: None,
+        ratio: None,
+        corner: crate::config::PinCorner::BottomRight,
+        corner_width: None,
+        corner_height: None,
+    });
+    let paths = PathExpansionContext::from_home(std::path::PathBuf::from(format!(
+        "/{}",
+        "h".repeat(crate::config_budget::MAX_CONTEXT_BYTES - 1)
+    )));
+
+    assert!(matches!(
+        check_path_expansion_budget(&cfg, &paths),
+        Err(ConfigAdmissionError::Oversized)
+    ));
+}
+
+#[test]
+fn path_expansion_budget_allows_small_paths_and_counts_implicit_repo_root() {
+    let mut cfg = Config::default();
+    cfg.workspaces_dir = "~/workspaces".into();
+    cfg.repo_roots.clear();
+    cfg.pins.push(crate::config::Pin {
+        name: "pin".into(),
+        command: "echo".into(),
+        scope: crate::config::PinScope::Global,
+        workspace: None,
+        cwd: Some("~/project".into()),
+        start: crate::config::PinStart::Lazy,
+        restart: crate::config::PinRestart::Never,
+        singleton: false,
+        location: crate::config::PinLocation::Tab,
+        args: Vec::new(),
+        env: std::collections::BTreeMap::new(),
+        label: None,
+        ratio: None,
+        corner: crate::config::PinCorner::BottomRight,
+        corner_width: None,
+        corner_height: None,
+    });
+    let paths = path_context();
+    let before = bounded_serialized_config(&cfg).unwrap().len();
+    assert!(check_path_expansion_budget(&cfg, &paths).is_ok());
+
+    let old_workspace_bytes = json_string_content_len("~/workspaces").unwrap();
+    let new_workspace_bytes = json_string_content_len("/captured/home/workspaces").unwrap();
+    let actual = projected_serialized_size(
+        before,
+        old_workspace_bytes + json_string_content_len("~/project").unwrap(),
+        new_workspace_bytes
+            + json_string_content_len("/captured/home/project").unwrap()
+            + new_workspace_bytes
+            + 2,
+    )
+    .unwrap();
+    assert!(actual <= config_budget::MAX_NORMALIZED_BYTES);
+    // The implicit root adds a second expanded workspaces path to the final
+    // representation. Its JSON array spelling contributes its content plus 2.
+    assert_eq!(
+        before - old_workspace_bytes - json_string_content_len("~/project").unwrap()
+            + new_workspace_bytes
+            + json_string_content_len("/captured/home/project").unwrap()
+            + new_workspace_bytes
+            + 2,
+        actual
+    );
+}
+
+#[test]
+fn path_expansion_budget_checks_size_arithmetic() {
+    assert_eq!(
+        projected_serialized_size(usize::MAX, 0, 1),
+        Err(ConfigAdmissionError::Oversized)
+    );
+    assert_eq!(
+        projected_serialized_size(1, 2, 0),
+        Err(ConfigAdmissionError::Oversized)
+    );
+}
+
+#[test]
 fn blank_default_folder_override_is_semantically_invalid() {
     let env = TestEnv::default();
     let host_snapshot = hosts();
@@ -736,7 +832,7 @@ fn revision_changes_for_sources_and_host_snapshot_without_exposing_secret_values
     assert!(!input_debug.contains("supersecret"));
     assert!(!input_debug.contains("/private/"));
 
-    let second_hosts = HostDefinitionsSnapshot::from_raw(
+    let second_hosts = HostDefinitionsSnapshot::from_captured_rows(
         68,
         vec![("workstation".into(), r#"{"reach":"local"}"#.into())],
     )
