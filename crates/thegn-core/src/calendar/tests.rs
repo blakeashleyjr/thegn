@@ -1077,6 +1077,143 @@ fn instant_daily_recurrence_stays_on_utc_across_dst_and_home_zones() {
 }
 
 #[test]
+fn recurrence_rejects_rdates_that_change_the_dtstart_value_type() {
+    let mut timed = recurring(
+        zoned(2026, 8, 1, 9, 0, "America/New_York"),
+        zoned(2026, 8, 1, 10, 0, "America/New_York"),
+        "FREQ=DAILY;COUNT=3",
+    );
+    timed.recurrence.as_mut().unwrap().rdates = vec![EventTime::Date {
+        date: d(2026, 8, 5),
+    }];
+    assert_eq!(
+        timed.occurrences_bounded(
+            d(2026, 8, 1),
+            d(2026, 8, 6),
+            Tz::UTC,
+            &mut ExpansionBudget::default(),
+        ),
+        Err(ExpansionError::InvalidSpan),
+        "a DATE RDATE must not become midnight in a timed series"
+    );
+
+    let mut all_day = recurring(
+        EventTime::Date {
+            date: d(2026, 8, 1),
+        },
+        EventTime::Date {
+            date: d(2026, 8, 2),
+        },
+        "FREQ=DAILY;COUNT=3",
+    );
+    all_day.recurrence.as_mut().unwrap().rdates = vec![EventTime::Instant {
+        at: utc(2026, 8, 5, 9, 0),
+    }];
+    assert_eq!(
+        all_day.occurrences_bounded(
+            d(2026, 8, 1),
+            d(2026, 8, 6),
+            Tz::UTC,
+            &mut ExpansionBudget::default(),
+        ),
+        Err(ExpansionError::InvalidSpan),
+        "an absolute RDATE must not be truncated into an all-day date"
+    );
+}
+
+#[test]
+fn recurrence_rejects_an_unknown_rdate_zone_unless_it_matches_dtstart() {
+    let mut mismatched = recurring(
+        zoned(2026, 8, 1, 9, 0, "America/New_York"),
+        zoned(2026, 8, 1, 10, 0, "America/New_York"),
+        "FREQ=DAILY;COUNT=2",
+    );
+    mismatched.recurrence.as_mut().unwrap().rdates = vec![EventTime::Zoned {
+        local: d(2026, 8, 5).and_hms_opt(9, 0, 0).unwrap(),
+        zone: TzRef::new("Nowhere/Land"),
+    }];
+    assert_eq!(
+        mismatched.occurrences_bounded(
+            d(2026, 8, 1),
+            d(2026, 8, 6),
+            Tz::UTC,
+            &mut ExpansionBudget::default(),
+        ),
+        Err(ExpansionError::InvalidSpan)
+    );
+
+    let mut mismatched_exdate = recurring(
+        zoned(2026, 8, 1, 9, 0, "America/New_York"),
+        zoned(2026, 8, 1, 10, 0, "America/New_York"),
+        "FREQ=DAILY;COUNT=2",
+    );
+    mismatched_exdate.recurrence.as_mut().unwrap().exdates = vec![EventTime::Zoned {
+        local: d(2026, 8, 2).and_hms_opt(9, 0, 0).unwrap(),
+        zone: TzRef::new("Nowhere/Land"),
+    }];
+    assert_eq!(
+        mismatched_exdate.occurrences_bounded(
+            d(2026, 8, 1),
+            d(2026, 8, 6),
+            Tz::UTC,
+            &mut ExpansionBudget::default(),
+        ),
+        Err(ExpansionError::InvalidSpan)
+    );
+
+    let unknown = TzRef::new("Nowhere/Land");
+    let mut same_unknown = recurring(
+        EventTime::Zoned {
+            local: d(2026, 8, 1).and_hms_opt(9, 0, 0).unwrap(),
+            zone: unknown.clone(),
+        },
+        EventTime::Zoned {
+            local: d(2026, 8, 1).and_hms_opt(10, 0, 0).unwrap(),
+            zone: unknown.clone(),
+        },
+        "FREQ=DAILY;COUNT=2",
+    );
+    same_unknown.recurrence.as_mut().unwrap().rdates = vec![EventTime::Zoned {
+        local: d(2026, 8, 5).and_hms_opt(9, 0, 0).unwrap(),
+        zone: unknown,
+    }];
+    let occurrences = same_unknown
+        .occurrences_bounded(
+            d(2026, 8, 1),
+            d(2026, 8, 6),
+            Tz::UTC,
+            &mut ExpansionBudget::default(),
+        )
+        .unwrap();
+    assert_eq!(occurrences.len(), 3);
+    assert_eq!(
+        occurrences[2].start,
+        zoned(2026, 8, 5, 9, 0, "Nowhere/Land")
+    );
+}
+
+#[test]
+fn zoned_series_with_utc_exdate_is_home_zone_invariant() {
+    let mut event = recurring(
+        zoned(2026, 3, 7, 9, 0, "America/New_York"),
+        zoned(2026, 3, 7, 10, 0, "America/New_York"),
+        "FREQ=DAILY;COUNT=5",
+    );
+    event.recurrence.as_mut().unwrap().exdates = vec![EventTime::Instant {
+        at: utc(2026, 3, 9, 13, 0),
+    }];
+    let utc_home = event.occurrences(d(2026, 3, 6), d(2026, 3, 13), Tz::UTC);
+    let tokyo_home = event.occurrences(d(2026, 3, 6), d(2026, 3, 13), Tz::Asia__Tokyo);
+    assert_eq!(utc_home, tokyo_home);
+    assert_eq!(utc_home.len(), 4);
+    assert!(
+        utc_home
+            .iter()
+            .all(|o| o.start != zoned(2026, 3, 9, 9, 0, "America/New_York"))
+    );
+}
+
+#[test]
 fn instant_duration_remains_elapsed_time_across_spring_and_fall_transitions() {
     for (start, end, date) in [
         (
@@ -2269,7 +2406,7 @@ fn expansion_errors_render_fixed_labels() {
         (ExpansionError::InvalidWindow, "calendar window is invalid"),
         (
             ExpansionError::InvalidSpan,
-            "calendar event span is invalid",
+            "calendar event span or recurrence value is invalid",
         ),
         (
             ExpansionError::Arithmetic,
