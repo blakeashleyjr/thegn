@@ -19,15 +19,14 @@ fn make_exec(path: &std::path::Path, body: &str) {
 fn fake_gh(dir: &std::path::Path, create_url: &str) -> std::path::PathBuf {
     let script = dir.join("gh");
     let log = dir.join("argv.log");
-    let body = format!(
-        r#"#!/bin/sh
-echo "$*" >> {log}
-state_file={state}
-title_file={title}
-fail_edit={fail_edit}
-lie_view={lie_view}
+    let body = r#"#!/bin/sh
+echo "$*" >> @log@
+state_file=@state@
+title_file=@title@
+fail_edit=@fail_edit@
+lie_view=@lie_view@
 case "$2" in
-  create) echo {create_url} ;;
+  create) echo @create_url@ ;;
   close) printf CLOSED > "$state_file" ;;
   reopen) printf OPEN > "$state_file" ;;
   edit)
@@ -44,16 +43,16 @@ state=OPEN; title=t
 [ ! -f "$state_file" ] || state=$(cat "$state_file")
 [ ! -f "$title_file" ] || title=$(cat "$title_file")
 [ ! -f "$lie_view" ] || { state=OPEN; title=unexpected; }
-echo '{{"number":'"$num"',"title":"'"$title"'","state":"'"$state"'","url":"https://github.com/'"$repo"'/issues/'"$num"'"}}' ;;
+echo '{"number":'"$num"',"title":"'"$title"'","state":"'"$state"'","url":"https://github.com/'"$repo"'/issues/'"$num"'"}' ;;
   *) echo '[]' ;;
 esac
-"#,
-        log = log.display(),
-        state = dir.join("state").display(),
-        title = dir.join("title").display(),
-        fail_edit = dir.join("fail-edit").display(),
-        lie_view = dir.join("lie-view").display()
-    );
+"#
+    .replace("@log@", &log.display().to_string())
+    .replace("@state@", &dir.join("state").display().to_string())
+    .replace("@title@", &dir.join("title").display().to_string())
+    .replace("@fail_edit@", &dir.join("fail-edit").display().to_string())
+    .replace("@lie_view@", &dir.join("lie-view").display().to_string())
+    .replace("@create_url@", create_url);
     make_exec(&script, &body);
     script
 }
