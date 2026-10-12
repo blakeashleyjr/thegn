@@ -50,6 +50,8 @@ pub(crate) const CONTROL_PER_AUTHORITY_CONCURRENCY: usize = 4;
 /// File contents use a separate, longer policy than metadata/control calls.
 const FILE_TRANSFER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 const FILE_TRANSFER_BODY_LIMIT: usize = 256 * 1024 * 1024;
+const TRANSFER_GLOBAL_CONCURRENCY: usize = 16;
+const TRANSFER_PER_AUTHORITY_CONCURRENCY: usize = 4;
 
 /// Read a control response in chunks so unknown-length responses cannot grow
 /// an unbounded in-memory JSON value. reqwest exposes decoded chunks here, so
@@ -128,7 +130,7 @@ pub(crate) fn redacted_transport_error(
 mod sessions;
 
 /// Per-request deadline for the small JSON **control-plane** calls (create,
-/// list, destroy, fs read/list, network policy, checkpoint metadata). The shared
+/// list, destroy, fs list, network policy, checkpoint metadata). The shared
 /// client applies this deadline by default; long file transfers override it
 /// with their separate policy. Capping control calls turns an infinite stall
 /// into a fast, retryable error.
@@ -185,6 +187,7 @@ impl ControlGate {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn try_acquire(&self, authority: &str) -> Result<ControlPermit> {
         let authority = self.authority_gate(authority);
         let authority_permit = Arc::clone(&authority)
@@ -204,6 +207,14 @@ pub(crate) static CONTROL_GATE: LazyLock<ControlGate> = LazyLock::new(|| {
     ControlGate::new(
         CONTROL_GLOBAL_CONCURRENCY,
         CONTROL_PER_AUTHORITY_CONCURRENCY,
+    )
+});
+
+/// Bounds simultaneous long-running file transfers independently of control calls.
+static TRANSFER_GATE: LazyLock<ControlGate> = LazyLock::new(|| {
+    ControlGate::new(
+        TRANSFER_GLOBAL_CONCURRENCY,
+        TRANSFER_PER_AUTHORITY_CONCURRENCY,
     )
 });
 
@@ -1382,7 +1393,7 @@ impl SpritesProvider {
     /// PUT `/fs/write` with an explicit unix `mode` (octal string). `write`
     /// uses `0644`; `write_exec` uses `0755` so a pushed binary is runnable.
     async fn write_with_mode(&self, id: &str, path: &str, data: &[u8], mode: &str) -> Result<()> {
-        let _permit = CONTROL_GATE.acquire(&self.authority()?).await?;
+        let _permit = TRANSFER_GATE.acquire(&self.authority()?).await?;
         anyhow::ensure!(
             data.len() <= FILE_TRANSFER_BODY_LIMIT,
             "sprites file write exceeded the {FILE_TRANSFER_BODY_LIMIT}-byte limit"
@@ -1427,7 +1438,7 @@ impl SpritesProvider {
 impl ProviderFiles for SpritesProvider {
     fn read<'a>(&'a self, id: &'a str, path: &'a str) -> BoxFuture<'a, Result<Vec<u8>>> {
         Box::pin(async move {
-            let _permit = CONTROL_GATE.acquire(&self.authority()?).await?;
+            let _permit = TRANSFER_GATE.acquire(&self.authority()?).await?;
             let resp = self
                 .client
                 .get(self.fs_op_url(id, "read")?)
@@ -2486,6 +2497,8 @@ mod tests {
     fn configured_api_base_requires_safe_authority() {
         for rejected in [
             "http://user:secret@example.com/api",
+            "https://user:pw@provider.example/api",
+            "https://user@provider.example/api",
             "http://provider.example/api",
             "https://provider.example/api?token=x",
             "https://provider.example/api#fragment",
@@ -2497,11 +2510,12 @@ mod tests {
                 "accepted {rejected:?}"
             );
         }
-        let credential_error = validate_api_base("http://u:p@127.0.0.1:1234")
+        let credential_error = validate_api_base("http://user:s3cr3t-pw@127.0.0.1:1234")
             .unwrap_err()
             .to_string();
         assert!(credential_error.contains("embedded credentials"));
-        assert!(!credential_error.contains("secret"));
+        assert!(!credential_error.contains("s3cr3t-pw"));
+        assert!(!credential_error.contains("user:"));
         assert_eq!(
             validate_api_base("https://app.daytona.io/api/").unwrap(),
             "https://app.daytona.io/api"
@@ -2540,6 +2554,14 @@ mod tests {
         drop(first);
         let same_authority_again = gate.try_acquire("a").unwrap();
         drop((second, same_authority_again));
+    }
+
+    #[test]
+    fn held_transfer_permit_does_not_block_control_gate() {
+        let authority = "transfer-isolation-test.invalid:443";
+        let _transfer = TRANSFER_GATE.try_acquire(authority).unwrap();
+
+        assert!(CONTROL_GATE.try_acquire(authority).is_ok());
     }
 
     #[test]
