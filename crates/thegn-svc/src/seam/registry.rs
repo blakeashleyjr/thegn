@@ -235,8 +235,13 @@ fn issue_probes(cfg: &Config) -> Vec<ProbeReport> {
                 IssueProviderKind::None => ProbeReport::new("issues", id, Availability::Ready)
                     .with_caps(&IssueCaps::default()),
                 IssueProviderKind::Github => {
-                    ProbeReport::new("issues", id, binary_availability("gh"))
-                        .with_caps(&IssueCaps::default())
+                    ProbeReport::new("issues", id, binary_availability("gh")).with_caps(
+                        &IssueCaps {
+                            patch_status: true,
+                            patch_title: true,
+                            ..Default::default()
+                        },
+                    )
                 }
                 IssueProviderKind::Linear | IssueProviderKind::Jira | IssueProviderKind::Kaneo => {
                     let avail =
@@ -245,13 +250,27 @@ fn issue_probes(cfg: &Config) -> Vec<ProbeReport> {
                         } else {
                             Availability::Ready
                         };
-                    let caps = if a.provider == IssueProviderKind::Kaneo {
-                        IssueCaps {
+                    let caps = match a.provider {
+                        IssueProviderKind::Kaneo => IssueCaps {
                             comments: true,
                             labels: true,
-                        }
-                    } else {
-                        IssueCaps::default()
+                            patch_status: true,
+                            patch_title: true,
+                            patch_priority: true,
+                            ..Default::default()
+                        },
+                        IssueProviderKind::Linear => IssueCaps {
+                            patch_status: true,
+                            patch_title: true,
+                            patch_priority: true,
+                            ..Default::default()
+                        },
+                        IssueProviderKind::Jira => IssueCaps {
+                            patch_status: true,
+                            patch_title: true,
+                            ..Default::default()
+                        },
+                        _ => IssueCaps::default(),
                     };
                     ProbeReport::new("issues", id, avail)
                         .with_caps(&caps)

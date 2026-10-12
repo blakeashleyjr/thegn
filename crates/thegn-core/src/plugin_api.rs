@@ -384,6 +384,14 @@ pub enum PluginApiError {
     },
     UnsupportedExtensionPoint(String),
     UnknownExtensionPoint(String),
+    UndeclaredContribution(String),
+    ContributionTypeMismatch {
+        id: String,
+        declared: String,
+        registered: String,
+    },
+    ContributionChanged(String),
+    UnsupportedIo(String),
 }
 
 impl Display for PluginApiError {
@@ -406,6 +414,24 @@ impl Display for PluginApiError {
                 write!(f, "unsupported extension point: {s}")
             }
             Self::UnknownExtensionPoint(s) => write!(f, "unknown extension point: {s}"),
+            Self::UndeclaredContribution(id) => {
+                write!(f, "contribution was not negotiated: {id}")
+            }
+            Self::ContributionTypeMismatch {
+                id,
+                declared,
+                registered,
+            } => write!(
+                f,
+                "contribution {id} registered as {registered}, negotiated as {declared}"
+            ),
+            Self::ContributionChanged(id) => {
+                write!(
+                    f,
+                    "registered contribution differs from negotiated declaration: {id}"
+                )
+            }
+            Self::UnsupportedIo(scheme) => write!(f, "I/O scheme is unsupported: {scheme}"),
         }
     }
 }
@@ -570,8 +596,9 @@ impl HostContract {
     /// cannot be decided from a manifest alone.
     pub fn negotiate_spec(&self, spec: &PluginSpec) -> Result<NegotiatedManifest, PluginApiError> {
         let mut neg = self.negotiate(&spec.manifest)?;
-        // Runtime `register` may repeat or add a contribution after startup.
-        // Keep that path on the same mode boundary as manifest negotiation.
+        // Runtime `register` must match an accepted declaration. Repeating an
+        // identical registration is idempotent; registrations cannot add new
+        // contributions after startup.
         neg.supported_extension_points.retain(|point| {
             self.support_for(point).is_some_and(|row| {
                 row.state == SupportState::Wired && row.modes.contains(&spec.mode)
@@ -709,6 +736,7 @@ pub struct PluginRuntime {
     state: BTreeMap<String, serde_json::Value>,
     host_values: BTreeMap<String, serde_json::Value>,
     subscriptions: std::collections::HashSet<(PluginId, EventKind)>,
+    registered_contributions: std::collections::HashSet<ContributionId>,
     events: Vec<Event>,
     surface_caps: BTreeMap<SurfaceId, Capability>,
     views: SurfaceCache,
@@ -731,6 +759,7 @@ impl PluginRuntime {
             state: Default::default(),
             host_values: Default::default(),
             subscriptions: Default::default(),
+            registered_contributions: Default::default(),
             events: Default::default(),
             surface_caps,
             views: SurfaceCache::default(),
@@ -756,14 +785,35 @@ impl PluginRuntime {
                 contribution.extension_point.wire_name().to_string(),
             ));
         }
+        let Some(declared) = self
+            .manifest
+            .accepted_contributions
+            .iter()
+            .find(|declared| declared.id == contribution.id)
+        else {
+            return Err(PluginApiError::UndeclaredContribution(
+                contribution.id.as_str().to_string(),
+            ));
+        };
+        if declared.extension_point != contribution.extension_point {
+            return Err(PluginApiError::ContributionTypeMismatch {
+                id: contribution.id.as_str().to_string(),
+                declared: declared.extension_point.wire_name().to_string(),
+                registered: contribution.extension_point.wire_name().to_string(),
+            });
+        }
+        if declared != &contribution {
+            return Err(PluginApiError::ContributionChanged(
+                contribution.id.as_str().to_string(),
+            ));
+        }
+        if self.registered_contributions.contains(&contribution.id) {
+            return Ok(());
+        }
         if let Some(cap) = surface_capability_for(&contribution.extension_point) {
             self.audit(plugin, cap, "register")?;
         }
-        if let Some(surface) = contribution.surface
-            && let Some(cap) = surface_capability_for(&contribution.extension_point)
-        {
-            self.surface_caps.insert(surface, cap);
-        }
+        self.registered_contributions.insert(contribution.id);
         Ok(())
     }
 
@@ -864,10 +914,7 @@ impl PluginRuntime {
     pub fn io(&mut self, plugin: PluginId, req: IoRequest) -> Result<IoResult, PluginApiError> {
         let cap = req.required_capability();
         self.audit(plugin, cap, &format!("io.{}", req.scheme))?;
-        Ok(IoResult {
-            status: IoStatus::Accepted,
-            body: None,
-        })
+        Err(PluginApiError::UnsupportedIo(req.scheme))
     }
 
     pub fn notify(&mut self, plugin: PluginId, alert: Alert) -> Result<(), PluginApiError> {
@@ -1796,6 +1843,26 @@ mod wire_tests {
                 PluginApiError::UnknownExtensionPoint("FutureSurface".into()),
                 "unknown extension point: FutureSurface",
             ),
+            (
+                PluginApiError::UndeclaredContribution("extra".into()),
+                "contribution was not negotiated: extra",
+            ),
+            (
+                PluginApiError::ContributionTypeMismatch {
+                    id: "seg".into(),
+                    declared: "StatusBarSegment".into(),
+                    registered: "PaletteAction".into(),
+                },
+                "contribution seg registered as PaletteAction, negotiated as StatusBarSegment",
+            ),
+            (
+                PluginApiError::ContributionChanged("seg".into()),
+                "registered contribution differs from negotiated declaration: seg",
+            ),
+            (
+                PluginApiError::UnsupportedIo("network".into()),
+                "I/O scheme is unsupported: network",
+            ),
         ];
         for (error, expected) in cases {
             assert_eq!(error.to_string(), expected);
@@ -2224,6 +2291,102 @@ timeout_secs = 5
     }
 
     #[test]
+    fn runtime_registration_is_bound_to_the_negotiated_contribution_and_grant() {
+        let plugin = PluginId::new("runtime-test");
+        let declared = runtime_contribution(
+            "primary",
+            ExtensionPoint::StatusBarSegment,
+            Some("runtime-test.primary"),
+        );
+        let manifest = NegotiatedManifest {
+            api: API_VERSION,
+            granted: [Capability::new("surface", "statusbar")]
+                .into_iter()
+                .collect(),
+            accepted_contributions: vec![declared.clone()],
+            supported_extension_points: [
+                ExtensionPoint::StatusBarSegment,
+                ExtensionPoint::PaletteAction,
+            ]
+            .into_iter()
+            .collect(),
+            ..NegotiatedManifest::default()
+        };
+        let mut runtime = PluginRuntime::new(manifest);
+        assert_eq!(runtime.register(plugin.clone(), declared.clone()), Ok(()));
+        let registered = runtime.registered_contributions.clone();
+        let audit_len = runtime.audit_log().len();
+        assert_eq!(runtime.register(plugin.clone(), declared), Ok(()));
+        assert_eq!(runtime.registered_contributions, registered);
+        assert_eq!(runtime.audit_log().len(), audit_len);
+        assert_eq!(
+            runtime.register(
+                plugin.clone(),
+                runtime_contribution(
+                    "undeclared",
+                    ExtensionPoint::StatusBarSegment,
+                    Some("runtime-test.undeclared"),
+                ),
+            ),
+            Err(PluginApiError::UndeclaredContribution("undeclared".into()))
+        );
+        assert!(matches!(
+            runtime.register(
+                plugin.clone(),
+                runtime_contribution(
+                    "primary",
+                    ExtensionPoint::PaletteAction,
+                    Some("runtime-test.primary"),
+                ),
+            ),
+            Err(PluginApiError::ContributionTypeMismatch { .. })
+        ));
+        assert_eq!(
+            runtime.register(
+                plugin.clone(),
+                runtime_contribution(
+                    "primary",
+                    ExtensionPoint::StatusBarSegment,
+                    Some("runtime-test.expanded"),
+                ),
+            ),
+            Err(PluginApiError::ContributionChanged("primary".into()))
+        );
+        assert_eq!(runtime.audit_log().len(), 1);
+        assert_eq!(runtime.audit_log()[0].decision, AuditDecision::Granted);
+
+        let missing_grant = NegotiatedManifest {
+            api: API_VERSION,
+            accepted_contributions: vec![runtime_contribution(
+                "denied",
+                ExtensionPoint::StatusBarSegment,
+                Some("runtime-test.denied"),
+            )],
+            supported_extension_points: [ExtensionPoint::StatusBarSegment].into_iter().collect(),
+            ..NegotiatedManifest::default()
+        };
+        let mut denied_runtime = PluginRuntime::new(missing_grant);
+        assert!(matches!(
+            denied_runtime.register(
+                plugin,
+                runtime_contribution(
+                    "denied",
+                    ExtensionPoint::StatusBarSegment,
+                    Some("runtime-test.denied"),
+                ),
+            ),
+            Err(PluginApiError::CapabilityDenied { .. })
+        ));
+        assert_eq!(
+            denied_runtime
+                .audit_log()
+                .last()
+                .map(|entry| entry.decision),
+            Some(AuditDecision::Denied)
+        );
+    }
+
+    #[test]
     fn runtime_enforces_capabilities_and_records_all_plugin_interactions() {
         let plugin = PluginId::new("runtime-test");
         let primary_surface = SurfaceId::new("runtime-test.primary");
@@ -2255,6 +2418,14 @@ timeout_secs = 5
         );
         assert_eq!(runtime.host_value(plugin.clone(), "missing").unwrap(), None);
 
+        let primary = runtime_contribution(
+            "primary",
+            ExtensionPoint::StatusBarSegment,
+            Some("runtime-test.primary"),
+        );
+        runtime.register(plugin.clone(), primary.clone()).unwrap();
+        assert_eq!(runtime.register(plugin.clone(), primary), Ok(()));
+
         assert!(runtime.is_dirty(&primary_surface));
         let first = View::line([Span::styled("ready", StyleRole::Accent)]);
         assert!(
@@ -2277,25 +2448,25 @@ timeout_secs = 5
         assert!(runtime.is_dirty(&primary_surface));
 
         let secondary_surface = SurfaceId::new("runtime-test.secondary");
-        runtime
-            .register(
+        assert_eq!(
+            runtime.register(
                 plugin.clone(),
                 runtime_contribution(
                     "secondary",
                     ExtensionPoint::StatusBarSegment,
                     Some("runtime-test.secondary"),
                 ),
-            )
-            .unwrap();
+            ),
+            Err(PluginApiError::UndeclaredContribution("secondary".into()))
+        );
         assert!(
             runtime
                 .update(
                     plugin.clone(),
-                    secondary_surface.clone(),
+                    secondary_surface,
                     View::line([Span::styled("secondary", StyleRole::Default)]),
                 )
-                .unwrap()
-                .changed
+                .is_err()
         );
 
         let unsupported = runtime
@@ -2349,11 +2520,8 @@ timeout_secs = 5
             Capability::new("network", "api.example.com")
         );
         assert_eq!(
-            runtime.io(plugin.clone(), network).unwrap(),
-            IoResult {
-                status: IoStatus::Accepted,
-                body: None,
-            }
+            runtime.io(plugin.clone(), network),
+            Err(PluginApiError::UnsupportedIo("network".into()))
         );
 
         let run = IoRequest::run("git", ["status", "--short"]);
@@ -2363,8 +2531,8 @@ timeout_secs = 5
         );
         assert_eq!(run.required_capability(), Capability::new("run", "git"));
         assert_eq!(
-            runtime.io(plugin.clone(), run).unwrap().status,
-            IoStatus::Accepted
+            runtime.io(plugin.clone(), run),
+            Err(PluginApiError::UnsupportedIo("run".into()))
         );
 
         let denied_io = runtime

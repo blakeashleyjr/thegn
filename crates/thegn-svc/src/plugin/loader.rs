@@ -65,9 +65,12 @@ impl std::fmt::Display for SpecProblem {
 
 /// Discover every plugin: config `[[plugins]]` first (order preserved), then
 /// `<config_dir>/plugins/*/plugin.toml` sorted by directory name. Disabled
-/// specs are kept (the CLI lists them); duplicates by id keep the first and
-/// report the clash via [`check_specs`].
-pub fn discover(cfg: &Config, config_dir: &Path) -> Vec<LoadedPlugin> {
+/// specs are kept (the CLI lists them), and duplicate ids remain in the
+/// result so [`check_loaded`] can reject the complete set.
+///
+/// Parse failures are returned from the same directory pass as the loaded
+/// plugins, so callers can validate the exact snapshot they discovered.
+pub fn discover(cfg: &Config, config_dir: &Path) -> (Vec<LoadedPlugin>, Vec<SpecProblem>) {
     let mut out: Vec<LoadedPlugin> = cfg
         .plugins
         .iter()
@@ -83,6 +86,7 @@ pub fn discover(cfg: &Config, config_dir: &Path) -> Vec<LoadedPlugin> {
         .filter(|p| p.join("plugin.toml").is_file())
         .collect();
     dirs.sort();
+    let mut problems = Vec::new();
     for dir in dirs {
         let manifest_path = dir.join("plugin.toml");
         match std::fs::read_to_string(&manifest_path)
@@ -94,44 +98,18 @@ pub fn discover(cfg: &Config, config_dir: &Path) -> Vec<LoadedPlugin> {
                 dir: Some(dir),
             }),
             Err(e) => {
-                // A broken manifest must be visible in `plugin check`, so it
-                // is surfaced there (check_specs re-parses); at discovery it
-                // is logged and skipped rather than taking the set down.
                 tracing::warn!(target: "thegn::plugin", path = %manifest_path.display(), error = %e, "unparseable plugin.toml");
+                problems.push(SpecProblem {
+                    plugin: dir
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| manifest_path.display().to_string()),
+                    problem: format!("plugin.toml does not parse: {e}"),
+                });
             }
         }
     }
-    out
-}
-
-/// Manifest files that exist but do not parse (for `plugin check`).
-pub fn broken_manifests(config_dir: &Path) -> Vec<SpecProblem> {
-    let plugins_dir = config_dir.join("plugins");
-    let mut out = Vec::new();
-    let mut dirs: Vec<PathBuf> = std::fs::read_dir(&plugins_dir)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.join("plugin.toml").is_file())
-        .collect();
-    dirs.sort();
-    for dir in dirs {
-        let path = dir.join("plugin.toml");
-        if let Err(e) = std::fs::read_to_string(&path)
-            .map_err(|e| e.to_string())
-            .and_then(|s| toml::from_str::<PluginSpec>(&s).map_err(|e| e.to_string()))
-        {
-            out.push(SpecProblem {
-                plugin: dir
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| path.display().to_string()),
-                problem: format!("plugin.toml does not parse: {e}"),
-            });
-        }
-    }
-    out
+    (out, problems)
 }
 
 /// Negotiate one spec against the host contract.
@@ -195,10 +173,15 @@ pub fn check_spec(p: &LoadedPlugin) -> Vec<SpecProblem> {
 /// clashes, then per-spec problems for **enabled** plugins — a disabled
 /// plugin's problems are informational, not check failures.
 pub fn check_specs(cfg: &Config, config_dir: &Path) -> Vec<SpecProblem> {
-    let loaded = discover(cfg, config_dir);
-    let mut out = broken_manifests(config_dir);
+    let (loaded, broken) = discover(cfg, config_dir);
+    check_loaded(&loaded, broken)
+}
+
+/// Validate one discovered snapshot (including parse failures from discovery).
+pub fn check_loaded(loaded: &[LoadedPlugin], broken: Vec<SpecProblem>) -> Vec<SpecProblem> {
+    let mut out = broken;
     let mut seen: HashSet<String> = HashSet::new();
-    for p in &loaded {
+    for p in loaded {
         let id = p.spec.manifest.id.as_str().to_string();
         if !seen.insert(id.clone()) {
             out.push(SpecProblem {
@@ -247,7 +230,8 @@ mod tests {
         std::fs::write(dir.join("plugin.toml"), toml::to_string(&s).unwrap()).unwrap();
         let mut cfg = Config::default();
         cfg.plugins.push(spec("cfg-first", vec!["true".into()]));
-        let loaded = discover(&cfg, tmp.path());
+        let (loaded, problems) = discover(&cfg, tmp.path());
+        assert!(problems.is_empty());
         let ids: Vec<_> = loaded
             .iter()
             .map(|p| p.spec.manifest.id.as_str().to_string())
@@ -286,7 +270,7 @@ mod tests {
         let mut s = spec("off", vec!["thegn-no-such-plugin-binary".into()]);
         s.enabled = false;
         cfg.plugins.push(s);
-        assert_eq!(discover(&cfg, tmp.path()).len(), 1);
+        assert_eq!(discover(&cfg, tmp.path()).0.len(), 1);
         assert!(check_specs(&cfg, tmp.path()).is_empty());
     }
 
@@ -322,7 +306,9 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("plugin.toml"), "not = [valid").unwrap();
         let cfg = Config::default();
-        assert!(discover(&cfg, tmp.path()).is_empty());
+        let (loaded, problems) = discover(&cfg, tmp.path());
+        assert!(loaded.is_empty());
+        assert_eq!(problems.len(), 1);
         let problems = check_specs(&cfg, tmp.path());
         assert!(
             problems

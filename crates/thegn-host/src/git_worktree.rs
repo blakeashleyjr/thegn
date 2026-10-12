@@ -56,9 +56,10 @@ pub(crate) fn remove(root: &Path, path: &Path, delete_branch: bool) -> bool {
     removed
 }
 
-/// Initialize submodules after a checkout exists. Ok(false) means policy
-/// disabled or there was no root-level .gitmodules; failures are non-fatal to
-/// worktree creation and are reported by the caller.
+/// Initialize approved direct submodules after a checkout exists. Nested
+/// submodules are left untouched until their metadata closure can be approved.
+/// Ok(false) means policy disabled or there was no root-level .gitmodules;
+/// failures are non-fatal to worktree creation and are reported by the caller.
 pub(crate) fn initialize(
     cfg: &Config,
     repo_root: &Path,
@@ -92,7 +93,7 @@ pub(crate) fn initialize(
                 .map(|spec| serde_json::json!({"path": spec.path.trim(), "url": spec.url.trim()}))
                 .collect::<Vec<_>>()
         ),
-        summary: format!("initialize {} recursive submodule(s)", specs.len()),
+        summary: format!("initialize {} direct submodule(s)", specs.len()),
     };
     let root_s = repo_root.to_string_lossy();
     let approved = thegn_core::db::Db::open()
@@ -109,14 +110,15 @@ pub(crate) fn initialize(
         .cloned()
         .unwrap_or_else(|| GitLoc::for_worktree(worktree));
     crate::git_handle::get()
-        .init_submodules(&location, true)
+        .init_submodules(&location, false)
         .map(|_| true)
         .map_err(|e| format!("submodules not initialized: {e}"))
 }
 
-/// Whether a remote clone may run the recursive update command. This is kept
-/// host-side because the remote script must not make an independent trust
-/// decision or enable a git transport override.
+/// Whether a remote clone may initialize the approved direct submodules. This is
+/// kept host-side because the remote script must not make an independent trust
+/// decision or enable a git transport override. Nested initialization remains
+/// disabled until its metadata closure can be pinned and approved.
 pub(crate) fn recursive_submodules_allowed(cfg: &Config, repo_root: &Path) -> bool {
     if cfg.repo_git(repo_root).submodules == SubmoduleMode::Off {
         return false;
@@ -138,7 +140,7 @@ pub(crate) fn recursive_submodules_allowed(cfg: &Config, repo_root: &Path) -> bo
                 .map(|spec| serde_json::json!({"path": spec.path.trim(), "url": spec.url.trim()}))
                 .collect::<Vec<_>>()
         ),
-        summary: format!("initialize {} recursive submodule(s)", specs.len()),
+        summary: format!("initialize {} direct submodule(s)", specs.len()),
     };
     let root_s = repo_root.to_string_lossy();
     thegn_core::db::Db::open()

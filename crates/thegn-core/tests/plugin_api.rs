@@ -166,13 +166,13 @@ fn every_side_effect_is_capability_checked_and_audited() {
     let negotiated = host.negotiate(&manifest).unwrap();
     let mut runtime = PluginRuntime::new(negotiated);
 
-    let ok = runtime
+    let unsupported = runtime
         .io(
             PluginId::new("todoist"),
             IoRequest::network("GET", "https://api.todoist.com/rest/v2/tasks"),
         )
-        .expect("granted network call is accepted");
-    assert_eq!(ok.status, IoStatus::Accepted);
+        .expect_err("grants authorize access but no bounded I/O implementation exists");
+    assert_eq!(unsupported, PluginApiError::UnsupportedIo("network".into()));
 
     let denied = runtime
         .io(

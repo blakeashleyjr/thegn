@@ -8,7 +8,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
 pub(crate) struct Directory {
     path: PathBuf,
@@ -22,6 +22,70 @@ pub(crate) struct Regular {
 }
 
 pub(crate) struct Lock(Regular);
+
+/// An exclusively-created private scratch directory whose filesystem identity
+/// is retained and rechecked for its whole lifetime. Unsupported platforms
+/// fail closed until they have a no-follow directory-handle implementation.
+pub(crate) struct ScratchDirectory(Directory);
+
+impl ScratchDirectory {
+    pub(crate) fn create(prefix: &str) -> io::Result<Self> {
+        let result = (|| {
+            if !verified_workspace_supported() {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "verified scratch directories are unsupported on this platform",
+                ));
+            }
+            let parent = std::fs::canonicalize(std::env::temp_dir())?;
+            let temporary = tempfile::Builder::new().prefix(prefix).tempdir_in(parent)?;
+            #[cfg(unix)]
+            std::fs::set_permissions(temporary.path(), std::fs::Permissions::from_mode(0o700))?;
+            let directory = Directory::open(temporary.path(), Some(temporary.path()))?;
+            let scratch = Self(directory);
+            scratch.verify()?;
+            // Keep only after the no-follow descriptor and identity checks succeed.
+            drop(temporary.keep());
+            Ok(scratch)
+        })();
+        if result
+            .as_ref()
+            .is_err_and(|error| error.kind() == io::ErrorKind::Unsupported)
+        {
+            static WARNED_UNSUPPORTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+            WARNED_UNSUPPORTED.get_or_init(|| {
+                tracing::warn!(
+                    target: "thegn::integrate",
+                    "secure scratch worktrees are unsupported on this platform; merge-driver and lockfile-regeneration resolution are disabled"
+                );
+            });
+        }
+        result
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        self.0.path()
+    }
+
+    pub(crate) fn verify(&self) -> io::Result<()> {
+        self.0.verify()?;
+        #[cfg(unix)]
+        {
+            let metadata = self.0.pins.last().unwrap().1.metadata()?;
+            if metadata.mode() & 0o777 != 0o700 {
+                return Err(refused("scratch directory permissions are not owner-only"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Remove an empty scratch directory by identity. A populated worktree is
+    /// retained for Git registration repair instead of recursively deleted.
+    pub(crate) fn remove_empty(self) -> io::Result<()> {
+        self.verify()?;
+        std::fs::remove_dir(self.path())
+    }
+}
 
 /// Whether the descriptor-relative verified gate workspace is available.
 ///
@@ -513,6 +577,25 @@ mod tests {
         assert!(start.elapsed() < std::time::Duration::from_secs(1));
         drop(lock);
         assert!(Lock::acquire(&path).is_ok());
+    }
+
+    #[test]
+    fn scratch_directory_is_private_and_detects_path_replacement() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let scratch = ScratchDirectory::create("thegn-scratch-test-").unwrap();
+        let path = scratch.path().to_path_buf();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+        scratch.verify().unwrap();
+
+        let displaced = path.with_extension("owned");
+        std::fs::rename(&path, &displaced).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(scratch.verify().is_err());
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::rename(&displaced, &path).unwrap();
+        scratch.remove_empty().unwrap();
     }
 
     #[test]
