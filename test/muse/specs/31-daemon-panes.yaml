@@ -23,13 +23,16 @@ spawn:
     chmod 700 "$XDG_RUNTIME_DIR"
     cleanup_daemon() {
       trap - EXIT HUP INT TERM
-      for attempt in $(seq 1 50); do
+      if [[ -z ${DAEMON_ENDPOINT:-} ]]; then
+        echo "daemon cleanup cannot poll: doctor returned no endpoint" >&2
+        exit 97
+      fi
+      for _ in $(seq 1 50); do
         stop_output="$(thegn daemon stop 2>&1 || true)"
         if printf '%s\n' "$stop_output" | grep -q 'no thegn pane daemon is running'; then
-          if [[ -n $DAEMON_ENDPOINT && ! -S $DAEMON_ENDPOINT ]]; then
+          if [[ ! -S $DAEMON_ENDPOINT ]]; then
             return 0
           fi
-          break
         fi
         sleep 0.1
       done
