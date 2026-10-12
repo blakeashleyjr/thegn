@@ -1,6 +1,20 @@
 use super::*;
 
 #[test]
+fn forward_reverse_tunnel_caps_default_to_shipped_limits_and_parse() {
+    let defaults = ForwardConfig::default();
+    assert_eq!(defaults.reverse_max_connections, 256);
+    assert_eq!(defaults.reverse_max_connections_total, 1024);
+
+    let cfg: Config = toml::from_str(
+        "[forward]\nreverse_max_connections = 17\nreverse_max_connections_total = 29\n",
+    )
+    .unwrap();
+    assert_eq!(cfg.forward.reverse_max_connections, 17);
+    assert_eq!(cfg.forward.reverse_max_connections_total, 29);
+}
+
+#[test]
 fn semantic_defaults_and_round_trip() {
     let s = SemanticConfig::default();
     assert!(s.worktree_index, "index on by default");
