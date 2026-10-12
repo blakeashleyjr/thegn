@@ -1377,7 +1377,7 @@ mod tests {
     #[test]
     fn queue_status_keeps_conflict_paths_out_of_error_detail() {
         let dir = tempfile::tempdir().unwrap();
-        let db = Db::open_at(dir.path().join("queue.sqlite")).unwrap();
+        let db = Db::open_at(&dir.path().join("queue.sqlite")).unwrap();
         db.enqueue_merge("/wt/feature", "feature", "main").unwrap();
 
         record_queue_status(
@@ -1398,7 +1398,7 @@ mod tests {
     #[test]
     fn queue_status_keeps_gate_failure_in_error_detail() {
         let dir = tempfile::tempdir().unwrap();
-        let db = Db::open_at(dir.path().join("queue.sqlite")).unwrap();
+        let db = Db::open_at(&dir.path().join("queue.sqlite")).unwrap();
         db.enqueue_merge("/wt/feature", "feature", "main").unwrap();
 
         record_queue_status(
