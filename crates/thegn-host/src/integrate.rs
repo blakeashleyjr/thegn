@@ -13,10 +13,10 @@
 //! callers must run it off the interactive event loop.
 
 use crate::canonical_history::CanonicalHistory;
+use crate::platform::gate_path::ScratchDirectory;
 use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use thegn_core::config::MergeQueueConfig;
 use thegn_core::db::Db;
 use thegn_core::fold::{
@@ -26,7 +26,7 @@ use thegn_core::outln;
 use thegn_core::remote::GitLoc;
 use thegn_core::store::WorktreeAuxStore;
 use thegn_core::util;
-use thegn_svc::git::{CliGit, GitBackend, MergeTreeOutcome, PlumbingOps};
+use thegn_svc::git::{CasOutcome, CliGit, GitBackend, MergeTreeOutcome, PlumbingOps};
 
 #[path = "integrate_candidates.rs"]
 mod candidates;
@@ -38,17 +38,15 @@ pub(crate) use persistence::run_selected_fold;
 #[cfg(test)]
 use persistence::{observe_outcomes, persist};
 
-/// A unique throwaway path under the temp dir. `util::now()` is seconds-resolution,
-/// so a process-wide sequence keeps two near-simultaneous throwaway worktrees (two
-/// gate runs, or parallel tests) from colliding on the same path.
-fn tmp_path(prefix: &str) -> PathBuf {
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let n = SEQ.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!(
-        "{prefix}-{}-{}-{n}",
-        std::process::id(),
-        util::now()
-    ))
+fn remove_scratch_worktree(repo_root: &Path, scratch: ScratchDirectory) {
+    if scratch.verify().is_err() {
+        tracing::warn!(target: "thegn::integrate", path = %scratch.path().display(), "scratch worktree identity changed; preserving it");
+        return;
+    }
+    let path = scratch.path().to_string_lossy().to_string();
+    if !util::git_ok(repo_root, &["worktree", "remove", "--force", &path]) {
+        tracing::warn!(target: "thegn::integrate", path, "scratch worktree cleanup failed; preserving it for repair");
+    }
 }
 
 /// A fold commit failed to be created while `sign_commits` was on. Carried as a
@@ -346,20 +344,29 @@ fn driver_merge(repo_root: &Path, ours: &str, theirs: &str, rerere: bool) -> Opt
     // Operands sit in option-parsing positions; refuse dash-led ones before spawn.
     thegn_core::git_operand::revision(ours).ok()?;
     thegn_core::git_operand::revision(theirs).ok()?;
-    let tmp = tmp_path("tg-drivermerge");
+    let scratch = ScratchDirectory::create("tg-drivermerge-").ok()?;
+    let tmp = scratch.path().to_path_buf();
     let tmp_s = tmp.to_string_lossy().to_string();
-    if !util::git_ok(
-        repo_root,
-        &["worktree", "add", "--detach", "--force", &tmp_s, ours],
-    ) {
+    if scratch.verify().is_err()
+        || !util::git_ok(repo_root, &["worktree", "add", "--detach", &tmp_s, ours])
+    {
+        if scratch.verify().is_ok()
+            && std::fs::read_dir(&tmp).is_ok_and(|mut entries| entries.next().is_none())
+        {
+            if let Err(error) = scratch.remove_empty() {
+                tracing::warn!(target: "thegn::integrate", path = %tmp.display(), %error, "empty scratch cleanup failed");
+            }
+        }
         return None;
     }
     let tree = (|| -> Option<String> {
+        scratch.verify().ok()?;
         // rerere on: apply recorded resolutions and stage them (autoUpdate).
         let mut args: Vec<&str> = Vec::new();
         if rerere {
             args.extend_from_slice(&["-c", "rerere.enabled=true", "-c", "rerere.autoUpdate=true"]);
         }
+        scratch.verify().ok()?;
         // A background merge must never sign or prompt.
         args.extend_from_slice(&[
             "-c",
@@ -373,18 +380,21 @@ fn driver_merge(repo_root: &Path, ours: &str, theirs: &str, rerere: bool) -> Opt
         // the exit status and inspect the index next.
         util::git_cmd(&tmp).args(&args).output().ok()?;
         // Stage whatever the driver / rerere resolved.
+        scratch.verify().ok()?;
         let _ = util::git_cmd(&tmp).args(["add", "-A"]).output(); // best-effort: stage: the unmerged-path check below catches a failed stage
         // Any remaining unmerged path means we couldn't resolve it here → defer.
+        scratch.verify().ok()?;
         let unmerged =
             util::git_out(&tmp, &["diff", "--name-only", "--diff-filter=U"]).unwrap_or_default();
         if !unmerged.trim().is_empty() {
             return None;
         }
+        scratch.verify().ok()?;
         let tree = util::git_out(&tmp, &["write-tree"])?;
         let tree = tree.trim().to_string();
         (!tree.is_empty()).then_some(tree)
     })();
-    let _ = util::git_ok(repo_root, &["worktree", "remove", "--force", &tmp_s]); // best-effort: cleanup: a leaked tmp worktree is reaped by `worktree prune`; it must not fail the fold
+    remove_scratch_worktree(repo_root, scratch);
     if tree.is_some() {
         thegn_core::msg::info(
             "merge queue: resolved a conflict via a merge-driver/rerere worktree",
@@ -410,17 +420,26 @@ fn regenerate_merge(
 ) -> Option<String> {
     thegn_core::git_operand::revision(ours).ok()?;
     thegn_core::git_operand::revision(theirs).ok()?;
-    let tmp = tmp_path("tg-foldregen");
+    let scratch = ScratchDirectory::create("tg-foldregen-").ok()?;
+    let tmp = scratch.path().to_path_buf();
     let tmp_s = tmp.to_string_lossy().to_string();
-    if !util::git_ok(
-        repo_root,
-        &["worktree", "add", "--detach", "--force", &tmp_s, ours],
-    ) {
+    if scratch.verify().is_err()
+        || !util::git_ok(repo_root, &["worktree", "add", "--detach", &tmp_s, ours])
+    {
+        if scratch.verify().is_ok()
+            && std::fs::read_dir(&tmp).is_ok_and(|mut entries| entries.next().is_none())
+        {
+            if let Err(error) = scratch.remove_empty() {
+                tracing::warn!(target: "thegn::integrate", path = %tmp.display(), %error, "empty scratch cleanup failed");
+            }
+        }
         return None;
     }
     let tree = (|| -> Option<String> {
+        scratch.verify().ok()?;
         // Merge theirs in (conflicts on the lockfiles are expected → ignore the
         // exit status; we resolve them next).
+        scratch.verify().ok()?;
         util::git_cmd(&tmp)
             .args(["merge", "--no-commit", "--no-ff", theirs])
             .output()
@@ -428,11 +447,13 @@ fn regenerate_merge(
         // Take the incoming version of each regenerate path so it's a valid file
         // (not conflict-marked), then the regen command reconciles it.
         for p in regenerate_paths {
+            scratch.verify().ok()?;
             let _ = util::git_cmd(&tmp) // best-effort: regenerate paths are rewritten below; the unmerged check catches the rest
                 .args(["checkout", "--theirs", "--", p])
                 .output();
         }
         // Rebuild the regenerate artifacts from the merged manifests.
+        scratch.verify().ok()?;
         let ok = std::process::Command::new("sh")
             .arg("-c")
             .arg(regenerate_command)
@@ -443,18 +464,21 @@ fn regenerate_merge(
         if !ok {
             return None;
         }
+        scratch.verify().ok()?;
         let _ = util::git_cmd(&tmp).args(["add", "-A"]).output(); // best-effort: stage: the unmerged-path check below catches a failed stage
         // Bail if any path is still unmerged — we only handle regenerable cases.
+        scratch.verify().ok()?;
         let unmerged =
             util::git_out(&tmp, &["diff", "--name-only", "--diff-filter=U"]).unwrap_or_default();
         if !unmerged.trim().is_empty() {
             return None;
         }
+        scratch.verify().ok()?;
         let tree = util::git_out(&tmp, &["write-tree"])?;
         let tree = tree.trim().to_string();
         (!tree.is_empty()).then_some(tree)
     })();
-    let _ = util::git_ok(repo_root, &["worktree", "remove", "--force", &tmp_s]); // best-effort: cleanup: a leaked tmp worktree is reaped by `worktree prune`; it must not fail the fold
+    remove_scratch_worktree(repo_root, scratch);
     if tree.is_some() {
         thegn_core::msg::info(&format!(
             "merge queue: regenerated {} for a lockfile-only merge",
@@ -1107,9 +1131,39 @@ pub fn run_fold(
     repo_root: &Path,
     candidates: Vec<Branch>,
 ) -> Result<FoldReport> {
-    run_fold_with_cas(cfg, repo_root, candidates, |loc, target, tip, base| {
-        CliGit.update_ref_cas(loc, target, tip, base)
-    })
+    run_fold_with_cas(
+        cfg,
+        repo_root,
+        candidates,
+        |loc, target, tip, base, sources| {
+            advance_with_source_fence(loc, target, tip, base, sources)
+        },
+    )
+}
+
+fn advance_with_source_fence(
+    loc: &GitLoc,
+    target: &str,
+    tip: &str,
+    base: &str,
+    sources: &[Branch],
+) -> Result<bool> {
+    let source_refs: Vec<(String, String)> = sources
+        .iter()
+        .map(|branch| (format!("refs/heads/{}", branch.name), branch.tip.clone()))
+        .collect();
+    match CliGit.update_ref_cas_with_sources(loc, target, tip, base, &source_refs)? {
+        CasOutcome::Advanced => Ok(true),
+        CasOutcome::Moved { .. } => Ok(false),
+        CasOutcome::SourceMoved { name, actual } => {
+            anyhow::bail!("source ref {name} moved to {actual} after gate; fold must be retried")
+        }
+        CasOutcome::SourceMissing { name } => {
+            anyhow::bail!("source ref {name} disappeared after gate; fold must be retried")
+        }
+        CasOutcome::Missing => anyhow::bail!("target ref disappeared during fold"),
+        CasOutcome::Other(message) => anyhow::bail!("fenced ref transaction failed: {message}"),
+    }
 }
 
 /// The mutation seam is injectable only through this private function, so
@@ -1119,7 +1173,7 @@ fn run_fold_with_cas(
     cfg: &MergeQueueConfig,
     repo_root: &Path,
     candidates: Vec<Branch>,
-    advance: impl FnMut(&GitLoc, &str, &str, &str) -> Result<bool>,
+    advance: impl FnMut(&GitLoc, &str, &str, &str, &[Branch]) -> Result<bool>,
 ) -> Result<FoldReport> {
     let (loc, history) = CanonicalHistory::worktree_loc(repo_root)?;
     run_fold_admitted(cfg, repo_root, candidates, loc, history, advance)
@@ -1141,7 +1195,9 @@ fn run_fold_observed(
         candidates,
         GitLoc::Local(repo_root.to_path_buf()),
         history,
-        |loc, target, tip, base| CliGit.update_ref_cas(loc, target, tip, base),
+        |loc, target, tip, base, sources| {
+            advance_with_source_fence(loc, target, tip, base, sources)
+        },
     )
 }
 
@@ -1151,7 +1207,7 @@ fn run_fold_admitted(
     candidates: Vec<Branch>,
     loc: GitLoc,
     history: CanonicalHistory,
-    mut advance: impl FnMut(&GitLoc, &str, &str, &str) -> Result<bool>,
+    mut advance: impl FnMut(&GitLoc, &str, &str, &str, &[Branch]) -> Result<bool>,
 ) -> Result<FoldReport> {
     history.revalidate()?;
     let adapter = PlumbingAdapter {
@@ -1365,7 +1421,7 @@ fn run_fold_admitted(
             ));
         }
         cas_attempts += 1;
-        let advanced = match advance(&loc, &target_ref, &plan.final_tip, &base) {
+        let advanced = match advance(&loc, &target_ref, &plan.final_tip, &base, &candidates) {
             Ok(advanced) => advanced,
             Err(error) => {
                 let reason = "target CAS operation failed".to_string();
@@ -2804,7 +2860,7 @@ mod tests {
             return;
         }
         let mut calls = 0;
-        let report = run_fold_with_cas(&config, &repo.dir, repo.branch_set(), |_, _, _, _| {
+        let report = run_fold_with_cas(&config, &repo.dir, repo.branch_set(), |_, _, _, _, _| {
             calls += 1;
             Ok(false)
         })
@@ -2836,7 +2892,7 @@ mod tests {
         if !repo.gate_supported_or_refused(&config) {
             return;
         }
-        let report = run_fold_with_cas(&config, &repo.dir, repo.branch_set(), |_, _, _, _| {
+        let report = run_fold_with_cas(&config, &repo.dir, repo.branch_set(), |_, _, _, _, _| {
             anyhow::bail!("private-cas-error-proof")
         })
         .unwrap();

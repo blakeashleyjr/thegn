@@ -23,6 +23,43 @@ pub(crate) struct Regular {
 
 pub(crate) struct Lock(Regular);
 
+/// An exclusively-created private scratch directory whose filesystem identity
+/// is retained and rechecked for its whole lifetime. Unsupported platforms
+/// fail closed until they have a no-follow directory-handle implementation.
+pub(crate) struct ScratchDirectory(Directory);
+
+impl ScratchDirectory {
+    pub(crate) fn create(prefix: &str) -> io::Result<Self> {
+        if !verified_workspace_supported() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "verified scratch directories are unsupported on this platform",
+            ));
+        }
+        let parent = std::fs::canonicalize(std::env::temp_dir())?;
+        let temporary = tempfile::Builder::new().prefix(prefix).tempdir_in(parent)?;
+        let directory = Directory::open(temporary.path(), Some(temporary.path()))?;
+        // Keep only after the no-follow descriptor and identity checks succeed.
+        drop(temporary.keep());
+        Ok(Self(directory))
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        self.0.path()
+    }
+
+    pub(crate) fn verify(&self) -> io::Result<()> {
+        self.0.verify()
+    }
+
+    /// Remove an empty scratch directory by identity. A populated worktree is
+    /// retained for Git registration repair instead of recursively deleted.
+    pub(crate) fn remove_empty(self) -> io::Result<()> {
+        self.verify()?;
+        std::fs::remove_dir(self.path())
+    }
+}
+
 /// Whether the descriptor-relative verified gate workspace is available.
 ///
 /// The current admission implementation is intentionally Unix-only. Callers
@@ -513,6 +550,25 @@ mod tests {
         assert!(start.elapsed() < std::time::Duration::from_secs(1));
         drop(lock);
         assert!(Lock::acquire(&path).is_ok());
+    }
+
+    #[test]
+    fn scratch_directory_is_private_and_detects_path_replacement() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let scratch = ScratchDirectory::create("thegn-scratch-test-").unwrap();
+        let path = scratch.path().to_path_buf();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+        scratch.verify().unwrap();
+
+        let displaced = path.with_extension("owned");
+        std::fs::rename(&path, &displaced).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(scratch.verify().is_err());
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::rename(&displaced, &path).unwrap();
+        scratch.remove_empty().unwrap();
     }
 
     #[test]
