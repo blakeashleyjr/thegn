@@ -251,7 +251,7 @@ impl Db {
                     .iter()
                     .filter(|root| path.starts_with(Path::new(root.as_str())))
                     .max_by_key(|root| root.len());
-                matching_root.map_or(true, |root| {
+                matching_root.is_none_or(|root| {
                     *root_liveness.entry(root.as_str()).or_insert_with(|| {
                         let root_path = Path::new(root);
                         root_path.is_dir() && root_path.join(".git").exists()
