@@ -692,6 +692,18 @@ fn launchable(spec: &SandboxSpec) -> Result<std::borrow::Cow<'_, SandboxSpec>, E
             m.dest
         )));
     }
+    if view.backend.profile().family == BackendFamily::Systemd {
+        for m in &view.mounts {
+            for p in [m.host.as_str(), m.dest.as_str()] {
+                if let Some(why) = crate::sandbox_mounts::systemd_path_refusal(p) {
+                    return Err(EnterError::Refused(format!(
+                        "systemd mount path `{p}` {why}; refusing to build a BindPaths/\
+                         ReadWritePaths property that systemd would parse differently"
+                    )));
+                }
+            }
+        }
+    }
     Ok(view)
 }
 
@@ -2350,6 +2362,14 @@ fn resolver_bind_filter(
     Some(dir.to_string_lossy().into_owned())
 }
 
+/// Unwrap an encoded systemd property. [`launchable`] already refused every
+/// unrepresentable mount, so `Err` is unreachable through `enter_argv`; if a
+/// caller reaches the builder directly the property is an unknown one, which
+/// makes `systemd-run` fail rather than run with a mangled mount plan.
+fn systemd_prop_or_refuse(r: Result<String, String>) -> String {
+    r.unwrap_or_else(|_| "ThegnRefusedUnsafeMountPath=yes".to_string())
+}
+
 /// The backend-specific argv that runs `/bin/sh -lc <script>` in the sandbox.
 fn backend_enter_argv(spec: &SandboxSpec, script: &str) -> Vec<String> {
     let wt = spec.worktree.to_string_lossy().into_owned();
@@ -2542,9 +2562,20 @@ fn backend_enter_argv(spec: &SandboxSpec, script: &str) -> Vec<String> {
                         } else {
                             "BindPaths"
                         };
-                        v.extend(["-p".into(), format!("{flag}={}:{}", m.host, m.dest)]);
+                        v.extend([
+                            "-p".into(),
+                            systemd_prop_or_refuse(crate::sandbox_mounts::systemd_bind_property(
+                                flag, &m.host, &m.dest,
+                            )),
+                        ]);
                     } else if !m.ro {
-                        v.extend(["-p".into(), format!("ReadWritePaths={}", m.dest)]);
+                        v.extend([
+                            "-p".into(),
+                            systemd_prop_or_refuse(crate::sandbox_mounts::systemd_path_property(
+                                "ReadWritePaths",
+                                &m.dest,
+                            )),
+                        ]);
                     }
                 }
                 // $HOME is otherwise read-only; carve the same narrow writable

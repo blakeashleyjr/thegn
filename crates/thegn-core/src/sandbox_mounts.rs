@@ -686,6 +686,55 @@ pub fn mount_path_unsafe(p: &str) -> bool {
         .any(|c| c.is_whitespace() || c.is_control() || matches!(c, ':' | '"' | '\'' | '\\'))
 }
 
+/// Why `p` cannot be placed verbatim in a systemd path property
+/// (`BindPaths=`, `BindReadOnlyPaths=`, `ReadWritePaths=`), or `None` if it is
+/// safe. systemd splits these values on whitespace, treats `:` as the
+/// source/destination/options delimiter, honours quotes and backslash escapes,
+/// expands `%` specifiers, and gives a leading `-`/`+` special meaning. Rather
+/// than encode (and trust our reading of) each rule, anything that is not a
+/// plain absolute, lexically-normalised path is refused.
+pub fn systemd_path_refusal(p: &str) -> Option<&'static str> {
+    if p.is_empty() {
+        return Some("is empty");
+    }
+    if !p.starts_with('/') {
+        return Some("is not absolute (a leading `-`/`+` or a relative path changes meaning)");
+    }
+    if mount_path_unsafe(p) {
+        return Some("contains whitespace, a control character, a quote, a backslash or ':'");
+    }
+    if p.contains('%') {
+        return Some("contains '%', which systemd expands as a specifier");
+    }
+    let body = p.strip_suffix('/').unwrap_or(p);
+    if body.is_empty() {
+        return None; // "/"
+    }
+    if body[1..].split('/').any(|c| matches!(c, "" | "." | "..")) {
+        return Some("is not normalised (empty, `.` or `..` component)");
+    }
+    None
+}
+
+/// `FLAG=host:dest` for a systemd bind property, or the reason the pair cannot
+/// be represented. The single encoder every systemd mount goes through.
+pub fn systemd_bind_property(flag: &str, host: &str, dest: &str) -> Result<String, String> {
+    for p in [host, dest] {
+        if let Some(why) = systemd_path_refusal(p) {
+            return Err(format!("mount path `{p}` {why}"));
+        }
+    }
+    Ok(format!("{flag}={host}:{dest}"))
+}
+
+/// `PROP=path` for a single-path systemd property (`ReadWritePaths=`).
+pub fn systemd_path_property(prop: &str, path: &str) -> Result<String, String> {
+    match systemd_path_refusal(path) {
+        Some(why) => Err(format!("mount path `{path}` {why}")),
+        None => Ok(format!("{prop}={path}")),
+    }
+}
+
 /// The directory that must be bound read-only for `link` (normally
 /// `/etc/resolv.conf`) to resolve inside a bwrap sandbox whose `/etc` is bound
 /// but whose `/run` is not (THE-730). On a systemd-resolved host the chain is
@@ -835,6 +884,35 @@ pub fn sealed_home_allowlist(home: &Path) -> Vec<Mount> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn systemd_paths_are_refused_unless_plain_absolute_and_normalised() {
+        for ok in ["/", "/wt/feat", "/wt/feat/", "/nix/store/x-a.b_c+d"] {
+            assert_eq!(systemd_path_refusal(ok), None, "{ok}");
+        }
+        for bad in [
+            "", "rel/path", "-/wt", "+/wt", "/a:b", "/a b", "/a\tb", "/a\nb", "/a\\b", "/a\"b",
+            "/a'b", "/a%hb", "/a//b", "/a/./b", "/a/../b", "/a/..",
+        ] {
+            assert!(systemd_path_refusal(bad).is_some(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn systemd_bind_property_encodes_plain_pairs_and_refuses_others() {
+        assert_eq!(
+            systemd_bind_property("BindPaths", "/a", "/b").as_deref(),
+            Ok("BindPaths=/a:/b")
+        );
+        let err = systemd_bind_property("BindReadOnlyPaths", "/a:evil", "/b").unwrap_err();
+        assert!(err.contains("/a:evil"), "{err}");
+        assert!(systemd_bind_property("BindPaths", "/a", "/b c").is_err());
+        assert_eq!(
+            systemd_path_property("ReadWritePaths", "/w").as_deref(),
+            Ok("ReadWritePaths=/w")
+        );
+        assert!(systemd_path_property("ReadWritePaths", "-/w").is_err());
+    }
 
     #[cfg(unix)]
     #[test]

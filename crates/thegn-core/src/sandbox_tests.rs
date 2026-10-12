@@ -1963,3 +1963,36 @@ fn bwrap_resolver_bind_is_skipped_for_no_network_and_covered_dirs() {
     let s2 = spec(Backend::Bwrap);
     assert_eq!(resolver_bind_filter(&s2, &["/run/systemd"], dir), None);
 }
+
+#[test]
+fn systemd_launch_refuses_mount_paths_systemd_would_misparse() {
+    for bad in [
+        "/wt/a:b", "/wt/a b", "/wt/a\\b", "/wt/../x", "-/wt", "/wt/%h",
+    ] {
+        let mut s = spec(Backend::Systemd);
+        s.mounts.push(Mount {
+            host: bad.into(),
+            dest: "/wt/ok".into(),
+            ro: false,
+            cache: false,
+        });
+        assert!(
+            matches!(enter_argv(&s, "true"), Err(EnterError::Refused(_))),
+            "{bad}"
+        );
+        // Destination side too.
+        let mut s = spec(Backend::Systemd);
+        s.mounts.push(Mount {
+            host: "/wt/ok".into(),
+            dest: bad.into(),
+            ro: false,
+            cache: false,
+        });
+        assert!(
+            matches!(enter_argv(&s, "true"), Err(EnterError::Refused(_))),
+            "{bad}"
+        );
+    }
+    // Ordinary paths pass the gate (argv shape is covered by the sealed test).
+    assert!(launchable(&spec(Backend::Systemd)).is_ok());
+}
