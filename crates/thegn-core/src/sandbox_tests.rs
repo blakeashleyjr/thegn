@@ -1824,6 +1824,8 @@ fn systemd_cleanup_property_rejects_systemd_expansion_and_quoting_chars() {
     ] {
         assert!(systemd_env_cleanup_prop(unsafe_value, path).is_none());
     }
+    assert!(systemd_env_cleanup_prop("bin/rm", path).is_none());
+    assert!(systemd_env_cleanup_prop("/bin/rm", std::path::Path::new("state/name.env")).is_none());
     assert!(systemd_env_cleanup_prop("/bin/rm", std::path::Path::new("/state/a b.env")).is_none());
 }
 
@@ -2042,6 +2044,42 @@ fn stderr_with_timeout_stdin_kills_and_reaps_on_timeout() {
             .is_none(),
         "a command exceeding its deadline returns None"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn stderr_with_timeout_stdin_deadline_kills_descendant_holding_stdin() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::Instant;
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let pid_file = dir.path().join("stdin-descendant-pid");
+    let script = format!(
+        "exec 3<&0; sleep 30 & echo $! > '{}'; exit 0",
+        pid_file.display()
+    );
+    let argv = vec!["sh".into(), "-c".into(), script];
+    let started = Instant::now();
+    let (success, _) =
+        stderr_with_timeout_stdin(&argv, Duration::from_millis(300), vec![b'x'; 1024 * 1024])
+            .expect("leader exit and captured stderr are returned after bounded feeder wait");
+
+    assert!(!success, "stdin left in a descendant makes delivery fail");
+    assert!(started.elapsed() < Duration::from_secs(2));
+    let pid: i32 = std::fs::read_to_string(pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_millis(500);
+    while nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok() {
+        assert!(
+            Instant::now() < deadline,
+            "stdin-holding descendant {pid} survived"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 #[test]

@@ -31,7 +31,7 @@ use crate::sandbox_mounts::{
 use crate::{msg, util};
 use std::path::PathBuf;
 use std::process::Command;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
 
 #[path = "sandbox_proc.rs"]
 pub(crate) mod proc;
@@ -123,13 +123,12 @@ fn stderr_with_timeout_stdin(
         },
         input,
     );
-    match outcome.into_stderr() {
-        Some((success, stderr)) => Some((
+    outcome.into_stderr().map(|(success, stderr)| {
+        (
             success && delivery == proc::InputDelivery::Complete,
             redact_payload_stderr(stderr, &redactions),
-        )),
-        None => None,
-    }
+        )
+    })
 }
 
 #[cfg(test)]
@@ -2892,6 +2891,9 @@ fn write_secret_env_file_in(
 }
 
 fn systemd_env_cleanup_prop(rm: &str, path: &std::path::Path) -> Option<String> {
+    if !std::path::Path::new(rm).is_absolute() || !path.is_absolute() {
+        return None;
+    }
     let path = path.to_str()?;
     let unsafe_char = |value: &str| {
         value
@@ -2917,6 +2919,9 @@ fn sweep_stale_env_files_in(dir: &std::path::Path, now: SystemTime, max_age: Dur
             return 0;
         }
     }
+    // Residual race: read_dir and remove_file re-resolve `dir`, so a parent
+    // replacement after this check can redirect the sweep. Ancestor custody is
+    // handled by fsperm; this path-based sweep does not pin the directory.
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(error) => {
