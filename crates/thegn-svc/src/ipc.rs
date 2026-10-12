@@ -189,29 +189,16 @@ pub async fn connect(ep: &IpcEndpoint) -> io::Result<IpcStream> {
         IpcEndpoint::Unix(path) => {
             #[cfg(unix)]
             {
-                let parent = path.parent().ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::PermissionDenied, "unix socket has no parent")
-                })?;
-                let metadata = std::fs::symlink_metadata(parent)?;
-                if metadata.file_type().is_symlink() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::PermissionDenied,
-                        format!("{} is a symlink", parent.display()),
-                    ));
-                }
-                verify_unix_bind_parent(parent, &metadata)?;
-                let stream = tokio::net::UnixStream::connect(path).await?;
-                let peer_uid = stream.peer_cred()?.uid();
-                server_peer_allowed(
-                    Some(peer_uid),
+                connect_unix_as(
+                    path,
                     effective_uid().ok_or_else(|| {
                         io::Error::new(
                             io::ErrorKind::PermissionDenied,
                             "cannot determine effective uid",
                         )
                     })?,
-                )?;
-                Ok(IpcStream::Unix(stream))
+                )
+                .await
             }
             #[cfg(not(unix))]
             {
@@ -247,6 +234,35 @@ pub async fn connect(ep: &IpcEndpoint) -> io::Result<IpcStream> {
             }
         }
     }
+}
+
+#[cfg(unix)]
+async fn connect_unix_as(path: &Path, expected_euid: u32) -> io::Result<IpcStream> {
+    verify_unix_client_parent(path)?;
+    connect_unix_after_parent_check(path, expected_euid).await
+}
+
+#[cfg(unix)]
+fn verify_unix_client_parent(path: &Path) -> io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::PermissionDenied, "unix socket has no parent")
+    })?;
+    let metadata = std::fs::symlink_metadata(parent)?;
+    if metadata.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{} is a symlink", parent.display()),
+        ));
+    }
+    verify_unix_bind_parent(parent, &metadata)
+}
+
+#[cfg(unix)]
+async fn connect_unix_after_parent_check(path: &Path, expected_euid: u32) -> io::Result<IpcStream> {
+    let stream = tokio::net::UnixStream::connect(path).await?;
+    let peer_uid = stream.peer_cred()?.uid();
+    server_peer_allowed(Some(peer_uid), expected_euid)?;
+    Ok(IpcStream::Unix(stream))
 }
 
 #[cfg(unix)]
@@ -797,7 +813,7 @@ fn verify_unix_bind_parent(path: &Path, metadata: &std::fs::Metadata) -> io::Res
 #[cfg(unix)]
 fn verify_unix_owner_mode(path: &Path, expected_mode: u32, directory: bool) -> io::Result<()> {
     use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _};
-    let metadata = std::fs::metadata(path)?;
+    let metadata = std::fs::symlink_metadata(path)?;
     let correct_kind = if directory {
         metadata.is_dir()
     } else {
@@ -824,6 +840,28 @@ fn verify_unix_owner_mode(path: &Path, expected_mode: u32, directory: bool) -> i
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    fn private_tempdir() -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        dir
+    }
+
+    #[cfg(unix)]
+    fn assert_socket_path_fits(path: &Path) {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        // Keep a NUL terminator available in sockaddr_un::sun_path on every
+        // Unix target supported by libc.
+        let sockaddr = unsafe { std::mem::zeroed::<libc::sockaddr_un>() };
+        assert!(
+            path.as_os_str().as_bytes().len() < sockaddr.sun_path.len(),
+            "socket path exceeds sockaddr_un::sun_path"
+        );
+    }
 
     #[cfg(unix)]
     #[test]
@@ -865,6 +903,70 @@ mod tests {
         assert_eq!(broad_error.kind(), io::ErrorKind::PermissionDenied);
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_connect_rejects_a_server_before_the_server_can_read_anything() {
+        use tokio::io::AsyncReadExt as _;
+
+        let dir = private_tempdir();
+        let sock = dir.path().join("fake.sock");
+        assert_socket_path_fits(&sock);
+        prepare_control_directory(dir.path(), false).unwrap();
+        let ep = IpcEndpoint::for_socket_path(&sock);
+        let listener = match IpcListener::bind_exclusive(&ep).await.unwrap() {
+            BindOutcome::Bound(listener) => listener,
+            BindOutcome::AlreadyRunning => panic!("fresh path must bind"),
+        };
+
+        verify_unix_client_parent(&sock).unwrap();
+        drop(listener);
+        let mut replacement = match IpcListener::bind_exclusive(&ep).await.unwrap() {
+            BindOutcome::Bound(listener) => listener,
+            BindOutcome::AlreadyRunning => panic!("dropped listener must be stale"),
+        };
+        let expected_euid = effective_uid().unwrap().wrapping_add(1);
+        let error = match connect_unix_after_parent_check(&sock, expected_euid).await {
+            Err(error) => error,
+            Ok(_) => panic!("server with a different uid was accepted"),
+        };
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+
+        let (mut server_side, _) = replacement.accept_stream_with_info().await.unwrap();
+        let mut received = Vec::new();
+        server_side.read_to_end(&mut received).await.unwrap();
+        assert!(received.is_empty(), "rejected server received client bytes");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_connect_handles_leaf_replacement_before_connect() {
+        let dir = private_tempdir();
+        let sock = dir.path().join("replace.sock");
+        assert_socket_path_fits(&sock);
+        prepare_control_directory(dir.path(), false).unwrap();
+        let ep = IpcEndpoint::for_socket_path(&sock);
+
+        let first = match IpcListener::bind_exclusive(&ep).await.unwrap() {
+            BindOutcome::Bound(listener) => listener,
+            BindOutcome::AlreadyRunning => panic!("fresh path must bind"),
+        };
+        drop(first);
+        let mut replacement = match IpcListener::bind_exclusive(&ep).await.unwrap() {
+            BindOutcome::Bound(listener) => listener,
+            BindOutcome::AlreadyRunning => panic!("dropped listener must be stale"),
+        };
+        let client = connect(&ep)
+            .await
+            .expect("connect must authenticate the listener bound at the replaced leaf");
+        drop(client);
+        let (accepted, _) = replacement.accept_stream_with_info().await.unwrap();
+        drop(accepted);
+
+        std::fs::remove_file(&sock).unwrap();
+        std::fs::write(&sock, b"replacement leaf").unwrap();
+        assert!(connect(&ep).await.is_err());
+    }
+
     #[test]
     fn pipe_name_is_deterministic_prefixed_and_short() {
         let a = pipe_name_for_path(Path::new("/home/u/.local/state/thegn/daemon.sock"));
@@ -904,10 +1006,11 @@ mod tests {
     #[tokio::test]
     async fn unix_bind_is_the_lock_and_round_trips() {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-        let dir = std::env::temp_dir().join(format!("thegn-ipc-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir); // best-effort: test tmp cleanup
-        prepare_control_directory(&dir, false).unwrap();
-        let ep = IpcEndpoint::for_socket_path(&dir.join("d.sock"));
+        let dir = private_tempdir();
+        prepare_control_directory(dir.path(), false).unwrap();
+        let sock = dir.path().join("d.sock");
+        assert_socket_path_fits(&sock);
+        let ep = IpcEndpoint::for_socket_path(&sock);
 
         // First bind wins…
         let mut listener = match IpcListener::bind_exclusive(&ep).await.unwrap() {
@@ -957,21 +1060,19 @@ mod tests {
             IpcListener::bind_exclusive(&ep).await.unwrap(),
             BindOutcome::Bound(_)
         ));
-        let _ = std::fs::remove_dir_all(&dir); // best-effort: test tmp cleanup
     }
 
     #[cfg(unix)]
     #[tokio::test]
     #[allow(
         clippy::permissions_set_readonly_false,
-        reason = "restores a private temp dir only so the test can delete it"
+        reason = "restores a private temp dir after exercising stale-socket removal"
     )]
     async fn failed_stale_socket_removal_is_a_contextual_startup_error() {
-        let dir =
-            std::env::temp_dir().join(format!("thegn-ipc-unremovable-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir); // best-effort: test tmp cleanup
-        prepare_control_directory(&dir, false).unwrap();
-        let sock = dir.join("d.sock");
+        let dir = private_tempdir();
+        prepare_control_directory(dir.path(), false).unwrap();
+        let sock = dir.path().join("d.sock");
+        assert_socket_path_fits(&sock);
         let ep = IpcEndpoint::for_socket_path(&sock);
         let listener = match IpcListener::bind_exclusive(&ep).await.unwrap() {
             BindOutcome::Bound(listener) => listener,
@@ -979,18 +1080,17 @@ mod tests {
         };
         drop(listener); // leave a genuine stale socket at the endpoint
 
-        let mut permissions = std::fs::metadata(&dir).unwrap().permissions();
+        let mut permissions = std::fs::metadata(dir.path()).unwrap().permissions();
         permissions.set_readonly(true);
-        std::fs::set_permissions(&dir, permissions).unwrap();
+        std::fs::set_permissions(dir.path(), permissions).unwrap();
         // Root and some unusual filesystems can still unlink from a read-only
         // directory. Skip there; the check ensures this test really exercises
         // an undeletable stale socket wherever it runs.
         match std::fs::remove_file(&sock) {
             Ok(()) => {
-                let mut permissions = std::fs::metadata(&dir).unwrap().permissions();
+                let mut permissions = std::fs::metadata(dir.path()).unwrap().permissions();
                 permissions.set_readonly(false);
-                std::fs::set_permissions(&dir, permissions).unwrap();
-                let _ = std::fs::remove_dir_all(&dir); // best-effort: test tmp cleanup
+                std::fs::set_permissions(dir.path(), permissions).unwrap();
                 return;
             }
             Err(error) => assert_eq!(error.kind(), io::ErrorKind::PermissionDenied),
@@ -1012,19 +1112,15 @@ mod tests {
             .expect("context wrapper preserves the filesystem error as its source");
         assert_eq!(source.source.kind(), io::ErrorKind::PermissionDenied);
 
-        let mut permissions = std::fs::metadata(&dir).unwrap().permissions();
+        let mut permissions = std::fs::metadata(dir.path()).unwrap().permissions();
         permissions.set_readonly(false);
-        std::fs::set_permissions(&dir, permissions).unwrap();
-        let _ = std::fs::remove_dir_all(&dir); // best-effort: test tmp cleanup
+        std::fs::set_permissions(dir.path(), permissions).unwrap();
     }
 
     #[test]
     fn addr_in_use_without_a_connectable_listener_preserves_the_bind_error() {
-        let dir =
-            std::env::temp_dir().join(format!("thegn-ipc-no-listener-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir); // best-effort: test tmp cleanup
-        std::fs::create_dir_all(&dir).unwrap();
-        let sock = dir.join("d.sock");
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("d.sock");
 
         assert!(
             require_live_endpoint(
@@ -1050,19 +1146,16 @@ mod tests {
             .expect("context wrapper preserves the bind error as its source");
         assert_eq!(source.source.kind(), io::ErrorKind::AddrInUse);
         assert_eq!(source.source.to_string(), "original bind failure");
-
-        let _ = std::fs::remove_dir_all(&dir); // best-effort: test tmp cleanup
     }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn strict_hardening_is_verified_and_doctor_detects_regression() {
         use std::os::unix::fs::PermissionsExt as _;
-        let dir =
-            std::env::temp_dir().join(format!("thegn-ipc-hardening-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        prepare_control_directory(&dir, true).unwrap();
-        let sock = dir.join("d.sock");
+        let dir = private_tempdir();
+        prepare_control_directory(dir.path(), true).unwrap();
+        let sock = dir.path().join("d.sock");
+        assert_socket_path_fits(&sock);
         let ep = IpcEndpoint::for_socket_path(&sock);
         let listener = match IpcListener::bind_exclusive_with_hardening(&ep, true)
             .await
@@ -1073,6 +1166,11 @@ mod tests {
         };
         control_endpoint_hardening(&sock).expect("strict bind leaves a hardened endpoint");
 
+        let link = dir.path().join("link.sock");
+        std::os::unix::fs::symlink(&sock, &link).unwrap();
+        let symlink_error = control_endpoint_hardening(&link).unwrap_err();
+        assert_eq!(symlink_error.kind(), io::ErrorKind::PermissionDenied);
+
         std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o666)).unwrap();
         let error = control_endpoint_hardening(&sock).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
@@ -1080,7 +1178,7 @@ mod tests {
 
         // Token-only mode cannot use a shared parent or a replaceable lock
         // path as a source of server identity either.
-        let shared = dir.join("shared");
+        let shared = dir.path().join("shared");
         std::fs::create_dir(&shared).unwrap();
         std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o770)).unwrap();
         let shared_error = match IpcListener::bind_exclusive_with_hardening(
@@ -1094,7 +1192,7 @@ mod tests {
         };
         assert_eq!(shared_error.kind(), io::ErrorKind::PermissionDenied);
 
-        let not_a_directory = dir.join("not-a-directory");
+        let not_a_directory = dir.path().join("not-a-directory");
         std::fs::write(&not_a_directory, b"file").unwrap();
         let directory_error = prepare_control_directory(&not_a_directory, false).unwrap_err();
         assert!(
@@ -1103,9 +1201,9 @@ mod tests {
                 .contains("move [daemon] socket into a private directory")
         );
 
-        let lock_sock = dir.join("replace.sock");
-        let lock_link = dir.join("replace.sock.lock");
-        let lock_target = dir.join("lock-target");
+        let lock_sock = dir.path().join("replace.sock");
+        let lock_link = dir.path().join("replace.sock.lock");
+        let lock_target = dir.path().join("lock-target");
         std::fs::write(&lock_target, b"unrelated").unwrap();
         std::os::unix::fs::symlink(&lock_target, &lock_link).unwrap();
         let lock_ep = IpcEndpoint::for_socket_path(&lock_sock);
@@ -1124,7 +1222,7 @@ mod tests {
             "failed lock acquisition must not create the endpoint"
         );
 
-        let regular_sock = dir.join("regular.sock");
+        let regular_sock = dir.path().join("regular.sock");
         std::fs::write(&regular_sock, b"leave this file alone").unwrap();
         let regular_ep = IpcEndpoint::for_socket_path(&regular_sock);
         let regular_error = match IpcListener::bind_exclusive(&regular_ep).await {
@@ -1138,7 +1236,6 @@ mod tests {
         );
 
         drop(listener);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]
@@ -1146,12 +1243,11 @@ mod tests {
     async fn bind_restricts_an_existing_broad_control_lock() {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let dir =
-            std::env::temp_dir().join(format!("thegn-ipc-lock-upgrade-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        prepare_control_directory(&dir, false).unwrap();
-        let sock = dir.join("d.sock");
-        let lock = dir.join("d.sock.lock");
+        let dir = private_tempdir();
+        prepare_control_directory(dir.path(), false).unwrap();
+        let sock = dir.path().join("d.sock");
+        assert_socket_path_fits(&sock);
+        let lock = dir.path().join("d.sock.lock");
         std::fs::write(&lock, b"").unwrap();
         std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o644)).unwrap();
 
@@ -1169,7 +1265,28 @@ mod tests {
         );
 
         drop(listener);
-        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bind_fails_closed_when_control_lock_cannot_be_opened() {
+        let dir = private_tempdir();
+        prepare_control_directory(dir.path(), false).unwrap();
+        let sock = dir.path().join("blocked.sock");
+        assert_socket_path_fits(&sock);
+        std::fs::create_dir(sock.with_extension("sock.lock")).unwrap();
+
+        let error = match IpcListener::bind_exclusive_with_hardening(
+            &IpcEndpoint::for_socket_path(&sock),
+            false,
+        )
+        .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("bind must fail when lock acquisition fails"),
+        };
+        assert!(error.to_string().contains("open control socket lock"));
+        assert!(!sock.exists(), "failed lock acquisition created a socket");
     }
 
     /// The stale-socket TOCTOU: N binders racing one stale socket file must
@@ -1180,10 +1297,10 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn racing_binders_on_a_stale_socket_elect_exactly_one_daemon() {
-        let dir = std::env::temp_dir().join(format!("thegn-ipc-race-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir); // best-effort: test tmp cleanup
-        prepare_control_directory(&dir, false).unwrap();
-        let path = dir.join("d.sock");
+        let dir = private_tempdir();
+        prepare_control_directory(dir.path(), false).unwrap();
+        let path = dir.path().join("d.sock");
+        assert_socket_path_fits(&path);
         // A dead daemon's leftover: a socket file nothing is listening on.
         drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
         let ep = IpcEndpoint::for_socket_path(&path);
@@ -1210,7 +1327,6 @@ mod tests {
             .await
             .expect("the surviving socket accepts connections");
         drop(bound);
-        let _ = std::fs::remove_dir_all(&dir); // best-effort: test tmp cleanup
     }
 
     #[cfg(windows)]
