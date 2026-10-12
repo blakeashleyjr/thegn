@@ -495,6 +495,95 @@ fn infrastructure_hold_stops_after_one_attempt_and_admission_without_spending_bu
     );
 }
 
+#[test]
+fn remote_and_unparseable_locations_hold_before_local_fixer_dispatch() {
+    let mut cfg = config();
+    cfg.conflict_handoff = ConflictHandoff::Agent;
+    cfg.agent_max_attempts = 3;
+    cfg.agent_command = "private-test-agent-must-never-execute".into();
+    for location in [
+        r#"{"control_prefix":["provider","exec"],"path":"/repo"}"#,
+        "not a registered host descriptor",
+    ] {
+        let db = Db::open_memory().unwrap();
+        let mut item = queued(&db, 0);
+        item.location = location.into();
+        let mut attempts = 0;
+        let out = drive_queue_with(
+            &cfg,
+            &Config::default(),
+            Path::new(WORKTREE),
+            &db,
+            vec![item],
+            |_| {},
+            DriveActions {
+                attempt: |_branch: &str, _location: &thegn_core::remote::GitLoc| {
+                    attempts += 1;
+                    Ok(AttemptOutcome::Conflict {
+                        paths: vec!["conflict.rs".into()],
+                        submodule_conflicts: vec![],
+                    })
+                },
+                floor: |worktree: &str| panic!("remote identifier reached local floor: {worktree}"),
+                runner: unexpected_runner,
+            },
+        );
+        assert_eq!(attempts, 1);
+        assert_eq!(out.agent_blocked, ["feature"]);
+        let saved = db.list_merge_queue().unwrap().remove(0);
+        assert_eq!(saved.status, "agent_blocked");
+        assert_eq!(saved.agent_attempts, 0);
+        assert!(
+            saved
+                .error_detail
+                .as_deref()
+                .unwrap()
+                .contains("cross-host fixer unsupported")
+        );
+    }
+}
+
+#[test]
+fn remote_identifier_collision_leaves_local_directory_untouched() {
+    let dir = tempfile::tempdir().unwrap();
+    let collision = dir.path().join("opaque-remote-worktree");
+    std::fs::create_dir(&collision).unwrap();
+    let sentinel = collision.join("sentinel");
+    std::fs::write(&sentinel, "untouched").unwrap();
+    let worktree = collision.to_string_lossy().into_owned();
+    let db = Db::open_memory().unwrap();
+    db.enqueue_merge(&worktree, "feature", "main").unwrap();
+    let item = QueueItem {
+        worktree: worktree.clone(),
+        branch: "feature".into(),
+        location: r#"{"control_prefix":["provider","exec"],"path":"/repo"}"#.into(),
+        agent_attempts: 0,
+    };
+    let mut cfg = config();
+    cfg.conflict_handoff = ConflictHandoff::Agent;
+    cfg.agent_max_attempts = 1;
+    cfg.agent_command = "private-test-agent-must-never-execute".into();
+    drive_queue_with(
+        &cfg,
+        &Config::default(),
+        dir.path(),
+        &db,
+        vec![item],
+        |_| {},
+        DriveActions {
+            attempt: |_branch: &str, _location: &thegn_core::remote::GitLoc| {
+                Ok(AttemptOutcome::Conflict {
+                    paths: vec!["conflict.rs".into()],
+                    submodule_conflicts: vec![],
+                })
+            },
+            floor: |path: &str| panic!("remote identifier reached local floor: {path}"),
+            runner: unexpected_runner,
+        },
+    );
+    assert_eq!(std::fs::read_to_string(sentinel).unwrap(), "untouched");
+}
+
 fn unexpected_runner(
     _: &str,
     _: &str,
