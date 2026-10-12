@@ -170,8 +170,10 @@ impl MediaBackend for Aggregate {
                     .map(|c| bounded_watch(c.watch(), SNAPSHOT_BUDGET)),
             )
             .await;
-            let children: Vec<_> = watches.into_iter().collect();
-            (!children.iter().all(Option::is_none))
+            let children = watches;
+            children
+                .iter()
+                .any(Option::is_some)
                 .then(|| Box::new(AggregateWatch { children }) as Box<dyn MediaWatch + Send>)
         })
     }
@@ -418,9 +420,10 @@ mod tests {
             Vec::new(),
         );
         let mut watch = aggregate.watch().await.unwrap();
-        // A wake carries no per-child payload: the caller performs one
-        // aggregate refresh regardless of how many children are ready.
+        // Both ready children produce their own wake, then the stream ends.
         assert!(watch.changed().await);
+        assert!(watch.changed().await);
+        assert!(!watch.changed().await);
     }
 
     #[tokio::test]
