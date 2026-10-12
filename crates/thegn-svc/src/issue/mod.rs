@@ -664,6 +664,31 @@ impl IssueRouter {
                         tracing::warn!(provider = b.inner.provider_id(), error = %e, "issue identity rejected")
                     }
                 },
+                Err(IssueError::PartialList { issues, reason }) => {
+                    let valid = issues
+                        .into_iter()
+                        .filter_map(|issue| match validate_issue_identity(&issue) {
+                            Ok(()) => Some(issue),
+                            Err(error) => {
+                                tracing::warn!(
+                                    account = %b.account,
+                                    provider = b.inner.provider_id(),
+                                    error = %error,
+                                    "partial issue identity rejected"
+                                );
+                                None
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    tracing::warn!(
+                        account = %b.account,
+                        provider = b.inner.provider_id(),
+                        partial_count = valid.len(),
+                        reason,
+                        "issue list is partial; retaining rows without caching it as complete"
+                    );
+                    all.extend(valid);
+                }
                 Err(e) => {
                     tracing::warn!(account = %b.account, provider = b.inner.provider_id(), error = %e, "issue list failed")
                 }
@@ -680,6 +705,7 @@ impl IssueRouter {
     ) -> Vec<(String, &str, Result<Vec<Issue>, IssueError>)> {
         let mut out = Vec::with_capacity(self.inner.len());
         for b in &self.inner {
+            // Keep PartialList as an error so cache refreshes never persist it as complete.
             let result = b.inner.list_issues(filter).await.and_then(|issues| {
                 issues
                     .into_iter()
@@ -1077,6 +1103,87 @@ mod spec {
         }
     }
 
+    struct PartialListBackend;
+
+    impl IssueBackend for PartialListBackend {
+        fn provider_id(&self) -> &str {
+            "linear"
+        }
+
+        fn caps(&self) -> IssueCaps {
+            IssueCaps::default()
+        }
+
+        fn list_issues<'a>(
+            &'a self,
+            _filter: &'a IssueFilter,
+        ) -> BoxFuture<'a, Result<Vec<Issue>, IssueError>> {
+            let issue = serde_json::from_value(serde_json::json!({
+                "id": "linear:ABC-1",
+                "number": "1",
+                "provider": "linear",
+                "title": "partial row",
+                "status": "todo"
+            }))
+            .unwrap();
+            Box::pin(async move {
+                Err(IssueError::PartialList {
+                    issues: vec![issue],
+                    reason: "test partial page",
+                })
+            })
+        }
+
+        fn get_issue<'a>(&'a self, _id: &'a str) -> BoxFuture<'a, Result<IssueDetail, IssueError>> {
+            Box::pin(async { Err(IssueError::Api("not used".into())) })
+        }
+
+        fn create_issue<'a>(
+            &'a self,
+            _draft: &'a IssueDraft,
+        ) -> BoxFuture<'a, Result<Issue, IssueError>> {
+            Box::pin(async { Err(IssueError::Api("not used".into())) })
+        }
+
+        fn update_issue<'a>(
+            &'a self,
+            _id: &'a str,
+            _patch: &'a IssuePatch,
+        ) -> BoxFuture<'a, Result<Issue, IssueError>> {
+            Box::pin(async { Err(IssueError::Api("not used".into())) })
+        }
+
+        fn search<'a>(
+            &'a self,
+            _query: &'a str,
+            _limit: usize,
+        ) -> BoxFuture<'a, Result<Vec<Issue>, IssueError>> {
+            Box::pin(async { Err(IssueError::Api("not used".into())) })
+        }
+    }
+
+    #[test]
+    fn best_effort_listing_retains_partial_rows_while_per_provider_keeps_error() {
+        let mut router = IssueRouter::from_config(&IssuesConfig::default());
+        router
+            .push_backend("partial".into(), Box::new(PartialListBackend))
+            .unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let issues = runtime
+            .block_on(router.list_issues(&IssueFilter::default()))
+            .unwrap();
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].title, "partial row");
+        let per_provider = runtime.block_on(router.list_per_provider(&IssueFilter::default()));
+        assert!(matches!(
+            &per_provider[0].2,
+            Err(IssueError::PartialList { issues, .. }) if issues.len() == 1
+        ));
+    }
+
     struct PluginMarker {
         id: String,
     }
@@ -1236,7 +1343,11 @@ mod spec {
             .enable_all()
             .build()
             .unwrap();
-        let result = runtime.block_on(router.update_issue("linear:ABC-9", &IssuePatch::default()));
+        let patch = IssuePatch {
+            status: Some(thegn_core::issue::IssueStatus::Todo),
+            ..Default::default()
+        };
+        let result = runtime.block_on(router.update_issue("linear:ABC-9", &patch));
         assert!(result.is_err());
         assert_eq!(first.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(second.load(std::sync::atomic::Ordering::SeqCst), 0);
