@@ -322,8 +322,10 @@ mod tests {
     fn capped_collection_rows_show_truncation_without_hit_targets() {
         let mut model = crate::chrome::FrameModel::default();
         model.panel.media = Some(state());
-        let mut ui = crate::panel::PanelUi::default();
-        ui.width = crate::layout::PanelWidth::Full;
+        let mut ui = crate::panel::PanelUi {
+            width: crate::layout::PanelWidth::Full,
+            ..Default::default()
+        };
         ui.media.sync_snapshot(
             model.panel.media.as_ref(),
             Some(MediaCaps {
