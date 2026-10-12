@@ -2895,6 +2895,7 @@ fn write_secret_env_file_in(
         return None;
     }
     std::fs::create_dir_all(anchor).ok()?;
+    tighten_owned_state_dir(&anchor.join("thegn"));
     let dir = crate::fsperm::ensure_private_dir_beneath(anchor, rel).ok()?;
     let file_name = if generation {
         static NEXT_ENV_FILE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -2906,6 +2907,49 @@ fn write_secret_env_file_in(
     let body: String = secret.iter().map(|(k, v)| format!("{k}={v}\n")).collect();
     dir.write_owner_only_atomic(&file_name, body.as_bytes())
         .ok()
+}
+
+/// State directories created under a user-private-group umask can be 0775.
+/// Tighten thegn's own directory before the secure walk, while leaving the
+/// trusted state anchor and any foreign or symlinked directory untouched.
+fn tighten_owned_state_dir(_path: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        if let Ok(metadata) = std::fs::symlink_metadata(_path)
+            && metadata.file_type().is_dir()
+            && metadata.uid() == nix::unistd::geteuid().as_raw()
+            && metadata.mode() & 0o022 != 0
+        {
+            use nix::fcntl::{OFlag, open};
+            use nix::sys::stat::{Mode, SFlag, fchmod, fstat};
+
+            let tightened = (|| {
+                let directory = open(
+                    _path,
+                    OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+                    Mode::empty(),
+                )
+                .map_err(std::io::Error::other)?;
+                let metadata = fstat(&directory).map_err(std::io::Error::other)?;
+                if !SFlag::from_bits_truncate(metadata.st_mode).contains(SFlag::S_IFDIR)
+                    || metadata.st_uid != nix::unistd::geteuid().as_raw()
+                    || metadata.st_mode & 0o022 == 0
+                {
+                    return Ok(());
+                }
+                fchmod(
+                    &directory,
+                    Mode::from_bits_truncate(metadata.st_mode & !0o022),
+                )
+                .map_err(std::io::Error::other)
+            })();
+            if let Err(error) = tightened {
+                tracing::debug!(path = %_path.display(), %error, "could not tighten sandbox state directory permissions");
+            }
+        }
+    }
 }
 
 fn systemd_env_cleanup_prop(rm: &str, path: &std::path::Path) -> Option<String> {

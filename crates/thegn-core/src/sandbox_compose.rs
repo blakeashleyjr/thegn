@@ -173,7 +173,7 @@ fn project_prefix(target: &ComposeTarget, project: &str, c: &ComposeSpec) -> Vec
 }
 
 /// `docker compose … up -d [service runServices…]`. Pure.
-pub fn up_argv(target: &ComposeTarget, project: &str, c: &ComposeSpec) -> Vec<String> {
+pub(crate) fn up_argv(target: &ComposeTarget, project: &str, c: &ComposeSpec) -> Vec<String> {
     let mut v = project_prefix(target, project, c);
     v.push("up".into());
     v.push("-d".into());
@@ -185,7 +185,7 @@ pub fn up_argv(target: &ComposeTarget, project: &str, c: &ComposeSpec) -> Vec<St
 }
 
 /// `docker compose … ps --status running --quiet [service]`. Pure.
-pub fn ps_argv(target: &ComposeTarget, project: &str, c: &ComposeSpec) -> Vec<String> {
+pub(crate) fn ps_argv(target: &ComposeTarget, project: &str, c: &ComposeSpec) -> Vec<String> {
     let mut v = project_prefix(target, project, c);
     v.extend([
         "ps".into(),
@@ -280,7 +280,7 @@ pub(crate) fn up_and_verify(spec: &SandboxSpec, compose: &ComposeSpec) -> anyhow
 
 /// `docker compose … exec [-it] [--workdir wd] <service> /bin/sh -lc <script>`.
 /// Pure. `interactive` toggles `-it` (a pane) vs a one-shot exec.
-pub fn exec_argv(
+pub(crate) fn exec_argv(
     target: &ComposeTarget,
     project: &str,
     c: &ComposeSpec,
