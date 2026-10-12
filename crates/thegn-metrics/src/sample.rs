@@ -14,7 +14,8 @@ use sysinfo::{
 use crate::gpu_monitor::GpuMonitor;
 use crate::thermal::ThermalProbe;
 use crate::{
-    ChildGroup, DiskInfo, DiskKind, StatsSnapshot, disk_space, read_battery, read_battery_power,
+    ChildGroup, DiskInfo, DiskKind, IfaceFact, NetMedium, StatsSnapshot, disk_space, read_battery,
+    read_battery_power, select_medium,
 };
 
 /// Refresh the slow tier (frequency / temperatures / disks) once every N
@@ -82,6 +83,7 @@ pub struct StatsSampler {
     /// Cached slow-tier results, reused between refreshes.
     last_disks: Vec<DiskInfo>,
     last_temps: Vec<(String, f32)>,
+    last_net_medium: NetMedium,
 }
 
 /// `pgsteal_direct` from `/proc/vmstat` — pages reclaimed synchronously since
@@ -94,6 +96,83 @@ fn read_pgsteal_direct() -> Option<u64> {
     s.lines()
         .find_map(|l| l.strip_prefix("pgsteal_direct "))
         .and_then(|v| v.trim().parse().ok())
+}
+
+/// Parse Linux `/proc/net/route`, returning every interface tied for the
+/// lowest-metric usable IPv4 default route. Ties remain ambiguous downstream.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn parse_default_route(contents: &str) -> Vec<String> {
+    let mut candidates: Vec<(u64, String)> = contents
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let iface = fields.next()?;
+            let destination = fields.next()?;
+            let _gateway = fields.next()?;
+            let flags = u32::from_str_radix(fields.next()?, 16).ok()?;
+            let _refcnt = fields.next()?;
+            let _use = fields.next()?;
+            let metric = fields.next()?.parse::<u64>().ok()?;
+            (destination == "00000000" && flags & 1 != 0).then(|| (metric, iface.to_string()))
+        })
+        .collect();
+    let Some(min_metric) = candidates.iter().map(|(metric, _)| *metric).min() else {
+        return Vec::new();
+    };
+    candidates.retain(|(metric, _)| *metric == min_metric);
+    candidates.sort_by(|a, b| a.1.cmp(&b.1));
+    candidates.dedup_by(|a, b| a.1 == b.1);
+    candidates.into_iter().map(|(_, iface)| iface).collect()
+}
+
+#[cfg(target_os = "linux")]
+fn read_net_medium() -> NetMedium {
+    use std::collections::BTreeSet;
+    use std::path::Path;
+
+    let routes = match std::fs::read_to_string("/proc/net/route") {
+        Ok(text) => parse_default_route(&text),
+        Err(_) => return NetMedium::Unknown,
+    };
+    let mut names = BTreeSet::new();
+    if let Ok(entries) = std::fs::read_dir("/sys/class/net") {
+        for entry in entries.flatten() {
+            names.insert(entry.file_name().to_string_lossy().into_owned());
+        }
+    }
+    names.extend(routes.iter().cloned());
+
+    let facts = names
+        .into_iter()
+        .map(|name| {
+            let root = Path::new("/sys/class/net").join(&name);
+            let medium = if root.join("wireless").exists() || root.join("phy80211").exists() {
+                NetMedium::Wifi
+            } else if std::fs::read_to_string(root.join("type"))
+                .is_ok_and(|kind| kind.trim() == "1")
+                && root.join("device").exists()
+            {
+                NetMedium::Ethernet
+            } else {
+                NetMedium::Unknown
+            };
+            let up = std::fs::read_to_string(root.join("operstate"))
+                .is_ok_and(|state| state.trim() == "up");
+            IfaceFact {
+                default_route: routes.iter().any(|route| route == &name),
+                name,
+                medium,
+                up,
+            }
+        })
+        .collect::<Vec<_>>();
+    select_medium(&facts)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_net_medium() -> NetMedium {
+    NetMedium::Unknown
 }
 
 /// No `/proc/vmstat` here; the metric is reported as unobserved.
@@ -132,6 +211,7 @@ impl StatsSampler {
             prev_reclaim: None,
             last_disks: Vec::new(),
             last_temps: Vec::new(),
+            last_net_medium: NetMedium::Unknown,
         }
     }
 
@@ -266,6 +346,7 @@ impl StatsSampler {
 
         // --- Slow tier (every SLOW_EVERY-th tick): frequency, temps, disks ---
         if slow {
+            self.last_net_medium = read_net_medium();
             // Apple silicon publishes no SMC components, so `Components` comes
             // back empty there and the temperature row silently vanished. Ask
             // whichever backend the probe selected; `Components` stays the
@@ -315,6 +396,7 @@ impl StatsSampler {
                 .collect();
         }
         snap.disks = self.last_disks.clone();
+        snap.net_medium = self.last_net_medium;
         snap.temps = self.last_temps.clone();
         snap.cpu_temp_c = cpu_temp(&snap.temps);
 
@@ -519,6 +601,23 @@ mod tests {
             pid,
             group: group.to_string(),
         }
+    }
+
+    #[test]
+    fn default_route_parser_selects_lowest_up_route_and_keeps_metric_ties() {
+        let routes = "Iface Destination Gateway Flags RefCnt Use Metric Mask MTU Window IRTT\n\
+                      wlan0 00000000 0102A8C0 0003 0 0 50 00000000 0 0 0\n\
+                      enp0s1 00000000 0102A8C0 0001 0 0 10 00000000 0 0 0\n\
+                      tun0 00000000 0102A8C0 0000 0 0 1 00000000 0 0 0\n\
+                      enp2s0 00000000 0102A8C0 0001 0 0 10 00000000 0 0 0\n\
+                      lo 00000001 00000000 0003 0 0 0 00000000 0 0 0";
+        assert_eq!(
+            parse_default_route(routes),
+            vec!["enp0s1".to_string(), "enp2s0".to_string()]
+        );
+        assert!(
+            parse_default_route("Iface Destination Gateway Flags RefCnt Use Metric\n").is_empty()
+        );
     }
 
     #[test]

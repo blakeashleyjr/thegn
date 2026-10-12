@@ -1535,13 +1535,23 @@ pub(crate) fn masthead_widget(id: &str, model: &FrameModel) -> Option<MastheadWi
             )
         }),
         "net" => s.net_bps.map(|(rx, tx)| {
+            let glyphs = crate::caps::active_glyphs();
+            let shipped_default = thegn_core::config::StatsConfig::default().net_icon;
+            let icon = if ic.net_icon == shipped_default {
+                match s.net_medium {
+                    thegn_metrics::NetMedium::Wifi => ic.net_icon.as_str(),
+                    thegn_metrics::NetMedium::Ethernet => glyphs.net_wired,
+                    thegn_metrics::NetMedium::Unknown => glyphs.net_generic,
+                }
+            } else {
+                ic.net_icon.as_str()
+            };
             w(
                 format!(
-                    "{} {}{} {}{}",
-                    ic.net_icon,
-                    crate::caps::active_glyphs().arrow_down,
+                    "{icon} {}{} {}{}",
+                    glyphs.arrow_down,
                     thegn_metrics::fmt_rate(rx),
-                    crate::caps::active_glyphs().arrow_up,
+                    glyphs.arrow_up,
                     thegn_metrics::fmt_rate(tx)
                 ),
                 col(S::Dim),
