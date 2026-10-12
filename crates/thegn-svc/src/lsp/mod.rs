@@ -13,7 +13,7 @@
 //! LocationLink and DocumentSymbol vs SymbolInformation unions, and assorted
 //! server quirks) instead of failing on strict typed deserialization.
 //!
-//! Lifecycle (lazy start, warm reuse, shutdown-on-drop) is owned a layer up by
+//! Lifecycle (lazy start, warm reuse, host-initiated graceful shutdown) is owned a layer up by
 //! the host's `LspSupervisor`; this module is just one connection.
 
 pub mod diagnostics_queue;
@@ -112,11 +112,16 @@ where
 }
 
 /// Resolve a bare language-server name only through absolute PATH entries.
-/// Commands containing a path separator preserve their configured spelling;
-/// the process working directory continues to determine relative explicit paths.
+/// Commands containing a path separator must be absolute. Bare names resolve
+/// only through absolute PATH entries.
 pub fn resolve_server_command(cmd: &str, path: Option<&OsStr>) -> Result<PathBuf, LspError> {
     let configured = Path::new(cmd);
     if cmd.contains('/') || cmd.contains('\\') {
+        if !configured.is_absolute() {
+            return Err(LspError::Spawn(format!(
+                "language server command must be an absolute path or a bare name: {cmd}"
+            )));
+        }
         return Ok(configured.to_path_buf());
     }
     let Some(path) = path else {
@@ -1521,6 +1526,47 @@ fn enqueue_body(
     }
 }
 
+struct BoundedJsonWriter {
+    bytes: Vec<u8>,
+    limit: usize,
+    exceeded: bool,
+}
+
+impl Write for BoundedJsonWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let remaining = self
+            .limit
+            .saturating_add(1)
+            .saturating_sub(self.bytes.len());
+        let retained = bytes.len().min(remaining);
+        self.bytes.extend_from_slice(&bytes[..retained]);
+        if retained != bytes.len() || self.bytes.len() > self.limit {
+            self.exceeded = true;
+            return Err(std::io::Error::other("outbound LSP body limit"));
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn serialize_bounded(value: &Value, limit: usize) -> Result<String, LspError> {
+    let mut writer = BoundedJsonWriter {
+        bytes: Vec::new(),
+        limit,
+        exceeded: false,
+    };
+    if let Err(error) = serde_json::to_writer(&mut writer, value) {
+        if writer.exceeded {
+            return Err(LspError::Bounded("outbound LSP body limit".into()));
+        }
+        return Err(LspError::Protocol(error.to_string()));
+    }
+    String::from_utf8(writer.bytes).map_err(|error| LspError::Protocol(error.to_string()))
+}
+
 fn writer_loop(
     mut writer: Box<dyn Write + Send>,
     rx: Receiver<WriterCommand>,
@@ -1999,6 +2045,15 @@ impl LspClient {
     /// Send a request and block (up to `timeout`) for its correlated response.
     fn request(&self, method: &str, params: Value) -> Result<Value, LspError> {
         let deadline = std::time::Instant::now() + self.timeout;
+        self.request_until(method, params, deadline)
+    }
+
+    fn request_until(
+        &self,
+        method: &str,
+        params: Value,
+        deadline: std::time::Instant,
+    ) -> Result<Value, LspError> {
         self.ensure_open()?;
         let id = self
             .next_id
@@ -2019,7 +2074,14 @@ impl LspClient {
         }
 
         let body = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
-        if let Err(e) = self.write_until(&body.to_string(), Some(deadline)) {
+        let body = match serialize_bounded(&body, limits::MAX_OUTBOUND_BODY_BYTES) {
+            Ok(body) => body,
+            Err(error) => {
+                self.pending.lock().unwrap().remove(&id);
+                return Err(error);
+            }
+        };
+        if let Err(e) = self.write_until(&body, Some(deadline)) {
             self.pending.lock().unwrap().remove(&id);
             if matches!(e, LspError::Timeout) {
                 self.send_cancel(id);
@@ -2048,7 +2110,7 @@ impl LspClient {
     fn notify(&self, method: &str, params: Value) -> Result<(), LspError> {
         self.ensure_open()?;
         let body = json!({ "jsonrpc": "2.0", "method": method, "params": params });
-        self.write(&body.to_string())
+        self.write(&serialize_bounded(&body, limits::MAX_OUTBOUND_BODY_BYTES)?)
     }
 
     fn write(&self, body: &str) -> Result<(), LspError> {
@@ -2086,13 +2148,56 @@ impl LspClient {
             tracing::debug!(target: "thegn::lsp", %error, "dropping cancel notification because outbound queue is full");
         }
     }
+
+    /// Ask the server to shut down, send `exit`, then reap a local child.
+    /// The protocol wait and process wait are each bounded by `grace`.
+    pub fn shutdown(&self, grace: Duration) {
+        if self.is_closed() {
+            return;
+        }
+        let deadline = std::time::Instant::now() + grace;
+        if let Err(error) = self.request_until("shutdown", Value::Null, deadline) {
+            tracing::debug!(target: "thegn::lsp", %error, "LSP shutdown request did not complete");
+        }
+        if let Err(error) = self.notify("exit", Value::Null) {
+            tracing::debug!(target: "thegn::lsp", %error, "LSP exit notification was not sent");
+        }
+        self.closed.store(true, Ordering::SeqCst);
+
+        let process_deadline = std::time::Instant::now() + grace;
+        if let Ok(mut child) = self.child.lock()
+            && let Some(child) = child.as_mut()
+        {
+            loop {
+                match child.try_wait() {
+                    Ok(Some(_)) => break,
+                    Ok(None) if std::time::Instant::now() < process_deadline => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Ok(None) | Err(_) => {
+                        if let Err(error) = child.kill() {
+                            tracing::debug!(target: "thegn::lsp", %error, "LSP child kill failed");
+                        }
+                        if let Err(error) = child.wait() {
+                            tracing::debug!(target: "thegn::lsp", %error, "LSP child wait failed");
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    }
 }
 
 impl Drop for LspClient {
     fn drop(&mut self) {
         // Best-effort graceful exit, then make sure a local child is gone (a
         // bridge/remote server has no local child to reap).
-        let _ = self.notify("exit", Value::Null); // best-effort: graceful exit; server may already be gone
+        if !self.is_closed()
+            && let Err(error) = self.notify("exit", Value::Null)
+        {
+            tracing::debug!(target: "thegn::lsp", %error, "LSP exit notification was not sent during drop");
+        }
         if let Ok(mut child) = self.child.lock()
             && let Some(c) = child.as_mut()
         {
@@ -2321,6 +2426,110 @@ mod tests {
             resolve_server_command("missing-lsp-server", Some(&path)),
             Err(LspError::Spawn(message))
                 if message == "missing-lsp-server not found on absolute PATH entries"
+        ));
+    }
+
+    #[test]
+    fn explicit_server_paths_must_be_absolute() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            resolve_server_command("./srv", None),
+            Err(LspError::Spawn(_))
+        ));
+        assert!(matches!(
+            resolve_server_command("bin/srv", None),
+            Err(LspError::Spawn(_))
+        ));
+
+        let executable = dir.path().join("srv");
+        std::fs::write(&executable, "fixture executable").unwrap();
+        if let Err(error) = thegn_core::fsperm::make_executable_for_test(&executable) {
+            if error.kind() == std::io::ErrorKind::Unsupported {
+                return;
+            }
+            panic!("make server fixture executable: {error}");
+        }
+        assert_eq!(
+            resolve_server_command(executable.to_str().unwrap(), None).unwrap(),
+            executable
+        );
+    }
+
+    struct CapturingWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for CapturingWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn capturing_client() -> (LspClient, Arc<Mutex<Vec<u8>>>, std::io::PipeWriter) {
+        let (reader, server_writer) = std::io::pipe().unwrap();
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let (diag_tx, _) = diagnostics_channel();
+        let client = LspClient::from_io(
+            Box::new(reader),
+            Box::new(CapturingWriter(captured.clone())),
+            "fixture",
+            Path::new("/fixture"),
+            diag_tx,
+        )
+        .unwrap();
+        (client, captured, server_writer)
+    }
+
+    #[test]
+    fn shutdown_is_bounded_and_writes_shutdown_before_exit() {
+        let (client, captured, _server_writer) = capturing_client();
+        let started = std::time::Instant::now();
+        client.shutdown(Duration::from_millis(100));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while !String::from_utf8(captured.lock().unwrap().clone())
+            .unwrap()
+            .contains("\"method\":\"exit\"")
+            && std::time::Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(5));
+        }
+        let bytes = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        let shutdown = bytes.find("\"method\":\"shutdown\"").unwrap();
+        let exit = bytes.find("\"method\":\"exit\"").unwrap();
+        assert!(shutdown < exit, "shutdown request must precede exit");
+    }
+
+    #[test]
+    fn shutdown_after_eof_writes_nothing() {
+        let (client, captured, server_writer) = capturing_client();
+        drop(server_writer);
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while !client.is_closed() && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(client.is_closed(), "reader observes EOF");
+        client.shutdown(Duration::from_millis(100));
+        assert!(captured.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn bounded_json_serialization_retains_at_most_one_byte_over_limit() {
+        let value = json!({"payload": "x".repeat(4096)});
+        let mut writer = BoundedJsonWriter {
+            bytes: Vec::new(),
+            limit: 32,
+            exceeded: false,
+        };
+        assert!(serde_json::to_writer(&mut writer, &value).is_err());
+        assert!(writer.exceeded);
+        assert!(writer.bytes.len() <= 33);
+        assert!(matches!(
+            serialize_bounded(&value, 32),
+            Err(LspError::Bounded(message)) if message == "outbound LSP body limit"
         ));
     }
 
