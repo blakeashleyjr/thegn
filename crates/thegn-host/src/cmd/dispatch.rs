@@ -71,14 +71,15 @@ pub enum Action {
         artifact: Option<String>,
         /// The chunk file this row dispatches under (`.thegn/pipeline/<ISSUE>/
         /// code/chunk-N.md`), whose `files:` frontmatter is the row's scope.
-        /// The gate reads it (and every active sibling's, from each sibling's
-        /// own worktree) and refuses a scope collision with an active sibling
-        /// or an unmet `after:` — the refusal names the paths and row ids.
+        /// The gate prepares its scope before admission and compares it with
+        /// active siblings' admitted snapshots. A legacy sibling without a
+        /// snapshot blocks admission until finished, abandoned, or overridden.
         #[arg(long)]
         chunk: Option<String>,
         /// Dispatch even though the chunk-scope gate refused (a scope
         /// collision or an unmet `after:`). Chunk overrides also require
-        /// `--force-reason`; non-chunk put keeps its historical behavior.
+        /// `--force-reason`; the incoming scope still must be prepared and is
+        /// recorded. Non-chunk put keeps its historical behavior.
         #[arg(long)]
         force: bool,
         #[arg(long, value_name = "REASON")]
@@ -2692,6 +2693,25 @@ mod tests {
         .id
     }
 
+    /// Queue a chunk through the same prepared-scope admission path as the CLI.
+    fn admitted_chunk_row(db: &Db, wt: &str, chunk: &str) -> i64 {
+        claim_admitted_with_refresh(
+            db,
+            NewDispatch {
+                chunk_path: Some(chunk),
+                ..NewDispatch::new("linear:A-1", wt, "coder")
+            },
+            3,
+            None,
+            wt,
+            "linear:A-1",
+            Some(chunk),
+            None,
+        )
+        .unwrap()
+        .unwrap()
+    }
+
     #[test]
     fn the_gate_refuses_an_overlapping_active_sibling_naming_paths_rows_and_force() {
         let (_d, wt) = chunk_wt(&[
@@ -2983,7 +3003,7 @@ mod tests {
             ("chunk-2.md", "---\nfiles: [src/shared.rs]\n---\n"),
         ]);
         let db = db("put-chunk-scope").1;
-        chunk_row(&db, &wt, "chunk-1.md");
+        admitted_chunk_row(&db, &wt, "chunk-1.md");
         let result = claim_chunk_put(
             &db,
             NewDispatch {
