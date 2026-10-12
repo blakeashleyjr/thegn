@@ -9,6 +9,7 @@
 use anyhow::{Context, Result};
 use rusqlite::ErrorCode;
 use std::path::{Path, PathBuf};
+use thegn_core::attention::MqStatus;
 use thegn_core::config::Config;
 use thegn_core::db::Db;
 use thegn_core::outln;
@@ -760,30 +761,13 @@ fn drain(cfg: &Config, all: bool, json: bool) -> Result<()> {
         }
         // Only the settled transitions are worth a CLI line; folding/agent_running
         // are transient and would just be noise before the outcome.
-        match step.status {
-            "landed" => outln!("  ✓ landed {} ({})", step.branch, step.detail),
-            "ready" => outln!("  ◆ ready  {} ({})", step.branch, step.detail),
-            "deferred" | "gate_failed" => {
-                outln!("  ✗ {} deferred — {}", step.branch, first_line(step.detail))
+        match MqStatus::parse(step.status) {
+            Some(status) => {
+                if let Some(line) = progress_line(status, step.branch, step.detail) {
+                    outln!("{line}");
+                }
             }
-            // Not a verdict about the branch — worded so it can't be misread.
-            "gate_error" => outln!(
-                "  ! {} was NOT gated — {}",
-                step.branch,
-                first_line(step.detail)
-            ),
-            "agent_blocked" => outln!(
-                "  ! {} agent dispatch blocked by environment/isolation policy — {}",
-                step.branch,
-                first_line(step.detail)
-            ),
-            "needs_human" => outln!(
-                "  ⚑ {} needs a human — {}",
-                step.branch,
-                first_line(step.detail)
-            ),
-            "agent_running" => outln!("  … {} — {}", step.branch, step.detail),
-            _ => {}
+            None => outln!("  ? {} unknown queue status '{}'", step.branch, step.status),
         }
     });
 
@@ -915,6 +899,29 @@ fn drain_json(target: &str, out: &merge_driver::DriveOutcome) -> serde_json::Val
 /// First line of a multi-line status detail (the rest is the retained gate log).
 fn first_line(detail: &str) -> &str {
     detail.lines().next().unwrap_or(detail)
+}
+
+fn progress_line(status: MqStatus, branch: &str, detail: &str) -> Option<String> {
+    Some(match status {
+        MqStatus::Landed => format!("  ✓ landed {branch} ({detail})"),
+        MqStatus::Ready => format!("  ◆ ready  {branch} ({detail})"),
+        MqStatus::Deferred | MqStatus::GateFailed => {
+            format!("  ✗ {branch} deferred — {}", first_line(detail))
+        }
+        // Not a verdict about the branch — worded so it can't be misread.
+        MqStatus::GateError => {
+            format!("  ! {branch} was NOT gated — {}", first_line(detail))
+        }
+        MqStatus::AgentBlocked => format!(
+            "  ! {branch} agent dispatch blocked by environment/isolation policy — {}",
+            first_line(detail)
+        ),
+        MqStatus::NeedsHuman => {
+            format!("  ⚑ {branch} needs a human — {}", first_line(detail))
+        }
+        MqStatus::AgentRunning => format!("  … {branch} — {detail}"),
+        MqStatus::Queued | MqStatus::Folding | MqStatus::Verifying => return None,
+    })
 }
 
 fn land(cfg: &Config, worktree: Option<String>) -> Result<()> {
@@ -1174,5 +1181,41 @@ mod queue_error_tests {
     fn unknown_database_failures_remain_unavailable() {
         let error = anyhow::anyhow!("unspecified queue failure");
         assert_eq!(queue_error_kind(&error), ("queue_unavailable", false));
+    }
+}
+
+#[cfg(test)]
+mod progress_tests {
+    use super::progress_line;
+    use thegn_core::attention::MqStatus;
+
+    #[test]
+    fn progress_is_defined_for_every_persisted_status() {
+        for status in MqStatus::ALL {
+            let line = progress_line(status, "feature", "detail\nmore");
+            let expected = status.is_held()
+                || matches!(
+                    status,
+                    MqStatus::Landed | MqStatus::Ready | MqStatus::AgentRunning
+                );
+            assert_eq!(line.is_some(), expected, "{status:?}");
+        }
+        assert!(
+            progress_line(MqStatus::GateError, "feature", "reason")
+                .unwrap()
+                .contains("NOT gated")
+        );
+        assert!(
+            progress_line(MqStatus::AgentBlocked, "feature", "reason")
+                .unwrap()
+                .contains("environment/isolation policy")
+        );
+        for status in [MqStatus::Deferred, MqStatus::GateFailed] {
+            assert!(
+                progress_line(status, "feature", "reason")
+                    .unwrap()
+                    .contains("deferred")
+            );
+        }
     }
 }
