@@ -10,6 +10,13 @@ use std::time::Duration;
 /// Maximum normalized display-label characters retained for media metadata.
 /// Host-panel collection row limits are defined alongside this display cap.
 pub const MAX_LABEL_CHARS: usize = 256;
+/// Maximum UTF-8 bytes retained for each provider supplied display field.
+/// Fields are cut only at character boundaries by the canonical ingress
+/// admission step.
+pub const MAX_FIELD_BYTES: usize = 4096;
+/// Maximum UTF-8 bytes accepted for an opaque provider identifier.
+/// Identifiers are rejected above this limit and are never truncated.
+pub const MAX_ID_BYTES: usize = 1024;
 /// Maximum queue rows retained by the host media panel.
 pub const MAX_QUEUE_ITEMS: usize = 500;
 /// Maximum source rows retained by the host media panel.
@@ -320,6 +327,19 @@ pub struct MediaState {
 }
 
 impl MediaState {
+    /// Apply the shared provider-ingress bounds while preserving exact opaque
+    /// identifiers. Invalid identifiers and oversized art references are
+    /// omitted rather than truncated.
+    pub fn admitted(mut self) -> MediaState {
+        self.player = bounded_field(self.player);
+        self.title = bounded_field(self.title);
+        self.artist = bounded_field(self.artist);
+        self.album = bounded_field(self.album);
+        self.art_url = self.art_url.map(bounded_field);
+        self.track_id = self.track_id.filter(|id| is_valid_opaque_id(id));
+        self
+    }
+
     /// `"Artist — Title"`, falling back gracefully when fields are missing.
     /// Used by both the statusbar badge and the panel header.
     pub fn now_playing(&self) -> String {
@@ -352,6 +372,24 @@ impl MediaState {
     }
 }
 
+/// Whether an opaque provider identifier is safe to retain and round-trip.
+/// Accepted IDs remain byte-exact; callers must reject invalid values rather
+/// than truncating them into a potentially colliding identifier.
+pub fn is_valid_opaque_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= MAX_ID_BYTES && !id.chars().any(char::is_control)
+}
+
+fn bounded_field(mut value: String) -> String {
+    if value.len() > MAX_FIELD_BYTES {
+        let mut boundary = MAX_FIELD_BYTES;
+        while !value.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        value.truncate(boundary);
+    }
+    value
+}
+
 /// A playable list exposed via the MPRIS `Playlists` interface (drives the
 /// "select playlist" picker). `id` is the opaque object path the backend hands
 /// back to `MediaBackend::activate_playlist`; `name` is the human label.
@@ -359,6 +397,17 @@ impl MediaState {
 pub struct Playlist {
     pub id: String,
     pub name: String,
+}
+
+impl Playlist {
+    /// Admit a playlist with a bounded display name and an exact valid ID.
+    pub fn admitted(mut self) -> Option<Playlist> {
+        if !is_valid_opaque_id(&self.id) {
+            return None;
+        }
+        self.name = bounded_field(self.name);
+        Some(self)
+    }
 }
 
 /// One entry in the play queue / up-next list (MPRIS `TrackList`, mpv
@@ -376,6 +425,16 @@ pub struct QueueItem {
 }
 
 impl QueueItem {
+    /// Admit a queue row with bounded display fields and an exact valid ID.
+    pub fn admitted(mut self) -> Option<QueueItem> {
+        if !is_valid_opaque_id(&self.id) {
+            return None;
+        }
+        self.title = bounded_field(self.title);
+        self.artist = bounded_field(self.artist);
+        Some(self)
+    }
+
     /// `"Artist — Title"`, falling back to the title/id when fields are missing.
     pub fn label(&self) -> String {
         match (self.artist.trim(), self.title.trim()) {
@@ -601,5 +660,45 @@ mod tests {
         s.position = Some(Duration::from_secs(3661));
         s.length = Some(Duration::from_secs(7200));
         assert_eq!(s.position_stamp().as_deref(), Some("1:01:01 / 2:00:00"));
+    }
+
+    #[test]
+    fn admitted_metadata_is_byte_bounded_at_utf8_boundaries() {
+        let state = MediaState {
+            title: format!("{}é", "a".repeat(MAX_FIELD_BYTES - 1)),
+            ..Default::default()
+        }
+        .admitted();
+        assert!(state.title.len() <= MAX_FIELD_BYTES);
+        assert!(state.title.is_char_boundary(state.title.len()));
+        assert_eq!(state.title, "a".repeat(MAX_FIELD_BYTES - 1));
+
+        let large = MediaState {
+            title: "x".repeat(1024 * 1024),
+            ..Default::default()
+        }
+        .admitted();
+        assert_eq!(large.title.len(), MAX_FIELD_BYTES);
+    }
+
+    #[test]
+    fn opaque_ids_are_exact_or_rejected() {
+        let valid = "i".repeat(MAX_ID_BYTES);
+        let state = MediaState {
+            track_id: Some(valid.clone()),
+            ..Default::default()
+        }
+        .admitted();
+        assert_eq!(state.track_id.as_deref(), Some(valid.as_str()));
+
+        let oversized = MediaState {
+            track_id: Some("i".repeat(MAX_ID_BYTES + 1)),
+            ..Default::default()
+        }
+        .admitted();
+        assert!(oversized.track_id.is_none());
+        assert!(!is_valid_opaque_id(""));
+        assert!(!is_valid_opaque_id("a\nb"));
+        assert!(!is_valid_opaque_id("a\u{1b}b"));
     }
 }
