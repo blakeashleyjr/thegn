@@ -670,8 +670,28 @@ fn run_clone_supervisor() {
                 }
             }
         };
-        run_clone_job(job);
+        let generation = job.generation;
+        let url = job.url.clone();
+        let dest = job.dest.clone();
+        let tx = job.tx.clone();
+        let waker = job.waker.clone();
+        if catch_clone_job(|| run_clone_job(job)).is_err() {
+            send_clone_event_best_effort(
+                &tx,
+                CloneEvent::Done(WorkspaceCloneOutcome {
+                    generation,
+                    url,
+                    dest,
+                    result: Err(anyhow::anyhow!("workspace clone job panicked")),
+                }),
+            );
+            wake_clone_loop_best_effort(&waker);
+        }
     }
+}
+
+fn catch_clone_job(run: impl FnOnce()) -> std::thread::Result<()> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(run))
 }
 
 fn run_clone_job(job: CloneJob) {
@@ -691,6 +711,8 @@ fn run_clone_job(job: CloneJob) {
         Duration::from_millis(100),
     )));
     let reader_throttle = throttle.clone();
+    let reader_tx = progress_tx.clone();
+    let reader_waker = progress_waker.clone();
     let result = clone_workspace_repo_with_deadline(
         &url,
         &dest,
@@ -703,14 +725,14 @@ fn run_clone_job(job: CloneJob) {
                 .offer(line, Instant::now());
             if let Some(line) = pending {
                 send_clone_event_best_effort(
-                    &progress_tx,
+                    &reader_tx,
                     CloneEvent::Progress {
                         generation,
                         url: reader_url.clone(),
                         line,
                     },
                 );
-                wake_clone_loop_best_effort(&progress_waker);
+                wake_clone_loop_best_effort(&reader_waker);
             }
         },
     );
@@ -1157,6 +1179,11 @@ Receiving objects: 100% (10/10)\rdone.\n";
     }
 
     #[test]
+    fn clone_supervisor_catches_job_panics() {
+        assert!(catch_clone_job(|| panic!("injected clone job panic")).is_err());
+    }
+
+    #[test]
     fn clone_step_terminates_then_escalates_after_grace() {
         let started = Instant::now();
         let deadline = started + Duration::from_secs(5);
@@ -1205,6 +1232,7 @@ Receiving objects: 100% (10/10)\rdone.\n";
         let dest = temp.path().join("clone");
         let url = format!("http://{address}/x.git");
         let (tx, rx) = std::sync::mpsc::channel();
+        let started = Instant::now();
         let worker = std::thread::spawn(move || {
             let result = clone_workspace_repo_with_deadline(
                 &url,
@@ -1216,8 +1244,21 @@ Receiving objects: 100% (10/10)\rdone.\n";
             tx.send(result.map_err(|error| error.to_string())).unwrap();
         });
         let result = rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        assert!(result.is_err(), "a nonresponsive HTTP peer must time out");
+        let elapsed = started.elapsed();
         worker.join().unwrap();
+        let error = result.expect_err("a nonresponsive HTTP peer must time out");
+        assert!(
+            error.contains("git clone failed") || error.contains("cancelled or timed out"),
+            "expected timeout or clone failure, got: {error}"
+        );
+        assert!(
+            !error.contains("did not exit"),
+            "the clone process group must be reaped, got: {error}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "clone process group took {elapsed:?} to reap"
+        );
         assert!(
             accept_thread.join().unwrap().is_some(),
             "git contacted local peer"
