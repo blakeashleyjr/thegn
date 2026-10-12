@@ -1687,6 +1687,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn xdg_state_home_resolves_without_panicking() {
+        let _env = crate::testenv::EnvGuard::unset(&["XDG_STATE_HOME"]);
+        let expected = if cfg!(windows) {
+            std::env::var_os("LOCALAPPDATA")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| home().join("AppData").join("Local"))
+        } else {
+            home().join(".local/state")
+        };
+        assert_eq!(xdg_state_home(), expected);
+    }
+
+    #[test]
+    fn nextest_ambient_state_home_is_isolated() {
+        let _lock = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if std::env::var_os("NEXTEST").is_some() {
+            assert_ne!(
+                xdg_state_home(),
+                home().join(".local/state"),
+                "THE-744: nextest did not isolate XDG_STATE_HOME"
+            );
+        }
+    }
+
+    #[test]
     fn git_write_epoch_advances_on_scope_drop_and_lock_release() {
         let before = git_write_epoch();
         {
