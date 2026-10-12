@@ -2702,6 +2702,12 @@ mod tests {
             if let Ok(bytes) = std::fs::read(path)
                 && !bytes.is_empty()
             {
+                let initial_len = bytes.len() as u64;
+                thread::sleep(Duration::from_millis(150));
+                assert!(
+                    std::fs::metadata(path).unwrap().len() > initial_len,
+                    "heartbeat descendant did not continue writing"
+                );
                 return;
             }
             assert!(
