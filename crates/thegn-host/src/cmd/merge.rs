@@ -711,7 +711,7 @@ fn drain(cfg: &Config, all: bool, json: bool) -> Result<()> {
                     }
                 }))?;
             }
-            return Err(error.into());
+            return Err(error);
         }
     }
     let out = merge_driver::drive_queue(mq, cfg, &root, &db, items, |step: &DriveStep| {
