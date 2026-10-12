@@ -1693,16 +1693,17 @@ impl LspClient {
             diag_tx.retire(root, &server_identity, generation);
             return Err(LspError::Spawn("empty server argv".into()));
         };
-        let spawned = Command::new(cmd)
+        let mut command = Command::new(cmd);
+        command
             .args(rest)
             .current_dir(root)
             .env_clear()
             .envs(server_env(std::env::vars_os()))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|e| LspError::Spawn(e.to_string()));
+            .stderr(Stdio::null());
+        crate::plugin::proc::set_process_group(&mut command);
+        let spawned = command.spawn().map_err(|e| LspError::Spawn(e.to_string()));
         let mut child = match spawned {
             Ok(child) => child,
             Err(error) => {
@@ -1712,8 +1713,7 @@ impl LspClient {
         };
 
         let (Some(stdout), Some(stdin)) = (child.stdout.take(), child.stdin.take()) else {
-            let _ = child.kill(); // best-effort: a child without pipes is unusable
-            let _ = child.wait(); // best-effort: reap it
+            terminate_tree(&mut child, None);
             diag_tx.retire(root, &server_identity, generation);
             return Err(LspError::Spawn("no stdio pipes".into()));
         };
@@ -2179,28 +2179,53 @@ impl LspClient {
         }
         self.closed.store(true, Ordering::SeqCst);
 
-        let process_deadline = std::time::Instant::now() + grace;
         if let Ok(mut child) = self.child.lock()
             && let Some(child) = child.as_mut()
         {
-            loop {
-                match child.try_wait() {
-                    Ok(Some(_)) => break,
-                    Ok(None) if std::time::Instant::now() < process_deadline => {
-                        thread::sleep(Duration::from_millis(10));
-                    }
-                    Ok(None) | Err(_) => {
-                        if let Err(error) = child.kill() {
-                            tracing::debug!(target: "thegn::lsp", %error, "LSP child kill failed");
-                        }
-                        if let Err(error) = child.wait() {
-                            tracing::debug!(target: "thegn::lsp", %error, "LSP child wait failed");
-                        }
-                        break;
-                    }
+            terminate_tree(child, Some(std::time::Instant::now() + grace));
+        }
+    }
+}
+
+fn terminate_tree(child: &mut Child, deadline: Option<std::time::Instant>) {
+    if !crate::plugin::proc::bounded_group_termination_supported() {
+        if let Err(error) = child.kill() {
+            tracing::debug!(target: "thegn::lsp", %error, "LSP child kill failed");
+        }
+        if let Err(error) = child.wait() {
+            tracing::debug!(target: "thegn::lsp", %error, "LSP child wait failed");
+        }
+        return;
+    }
+
+    let pid = child.id();
+    let mut pinned = true;
+    if let Some(deadline) = deadline {
+        loop {
+            match crate::plugin::proc::leader_exited_nowait(pid) {
+                Ok(true) => break,
+                Ok(false) if std::time::Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Ok(false) => break,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => {
+                    tracing::debug!(target: "thegn::lsp", %error, "could not observe LSP child before group termination");
+                    pinned = false;
+                    break;
                 }
             }
         }
+    } else if let Err(error) = crate::plugin::proc::leader_exited_nowait(pid) {
+        tracing::debug!(target: "thegn::lsp", %error, "could not observe LSP child before group termination");
+        pinned = false;
+    }
+
+    if pinned {
+        crate::plugin::proc::kill_group(pid);
+    }
+    if let Err(error) = child.wait() {
+        tracing::debug!(target: "thegn::lsp", %error, "LSP child wait failed");
     }
 }
 
@@ -2216,8 +2241,7 @@ impl Drop for LspClient {
         if let Ok(mut child) = self.child.lock()
             && let Some(c) = child.as_mut()
         {
-            let _ = c.kill(); // best-effort: child may already have exited
-            let _ = c.wait(); // best-effort: reap-or-not is terminal here
+            terminate_tree(c, None);
         }
         // Idempotent: only retires this exact generation, never a successor.
         let _ = self
@@ -2647,6 +2671,84 @@ mod tests {
                 .lines()
                 .any(|entry| entry.starts_with("CARGO_MANIFEST_DIR="))
         );
+    }
+
+    fn spawned_server_with_heartbeat(root: &Path) -> (LspClient, PathBuf) {
+        let shell = Path::new("/bin/sh");
+        let heartbeat = root.join("heartbeat.txt");
+        let (diagnostics, _receiver) = diagnostics_channel();
+        let generation = diagnostics.register(root, "heartbeat").unwrap();
+        let client = LspClient::start_argv_with_identity(
+            &[
+                shell.display().to_string(),
+                "-c".into(),
+                "( i=0; while [ $i -lt 200 ]; do echo x >> \"$1\"; i=$((i+1)); sleep 0.05; done ) & exec cat >/dev/null".into(),
+                "lsp-heartbeat".into(),
+                heartbeat.display().to_string(),
+            ],
+            "fixture",
+            root,
+            diagnostics,
+            "heartbeat".into(),
+            generation,
+        )
+        .unwrap();
+        (client, heartbeat)
+    }
+
+    fn wait_for_heartbeat(path: &Path) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Ok(bytes) = std::fs::read(path)
+                && !bytes.is_empty()
+            {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "heartbeat descendant did not start"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn assert_heartbeat_stopped(path: &Path) {
+        thread::sleep(Duration::from_millis(100));
+        let settled = std::fs::metadata(path).unwrap().len();
+        thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            std::fs::metadata(path).unwrap().len(),
+            settled,
+            "server descendant continued writing after client termination"
+        );
+    }
+
+    #[test]
+    fn shutdown_kills_server_descendants() {
+        if !Path::new("/bin/sh").is_file() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let (client, heartbeat) = spawned_server_with_heartbeat(root.path());
+        wait_for_heartbeat(&heartbeat);
+
+        client.shutdown(Duration::from_millis(200));
+
+        assert_heartbeat_stopped(&heartbeat);
+    }
+
+    #[test]
+    fn drop_kills_server_descendants() {
+        if !Path::new("/bin/sh").is_file() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let (client, heartbeat) = spawned_server_with_heartbeat(root.path());
+        wait_for_heartbeat(&heartbeat);
+
+        drop(client);
+
+        assert_heartbeat_stopped(&heartbeat);
     }
 
     #[test]
