@@ -444,9 +444,7 @@ fn run_driver_merge(
         // working directory unchanged. Merge drivers inherit that directory,
         // so pin it to the scratch worktree to contain relative side effects.
         .current_dir(dir)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stdin(Stdio::null());
     run_bounded_output(&mut command)
 }
 
@@ -460,6 +458,7 @@ fn run_bounded_output(
     command: &mut std::process::Command,
 ) -> std::io::Result<(std::process::ExitStatus, String, String)> {
     use std::io::Read;
+    use std::process::Stdio;
 
     fn reader<R: Read + Send + 'static>(
         mut pipe: R,
@@ -483,15 +482,13 @@ fn run_bounded_output(
         })
     }
 
+    // This helper owns both output pipes. Set them here, beside the takes,
+    // so no caller can spawn a child whose missing stream would return early
+    // without reaping it.
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = command.spawn()?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| std::io::Error::other("child stdout was not piped"))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| std::io::Error::other("child stderr was not piped"))?;
+    let stdout = child.stdout.take().expect("piped child stdout");
+    let stderr = child.stderr.take().expect("piped child stderr");
     let stdout = reader(stdout);
     let stderr = reader(stderr);
     let status = child.wait()?;
@@ -613,9 +610,7 @@ fn regenerate_merge(
             .arg("-c")
             .arg(regenerate_command)
             .current_dir(&tmp)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stdin(Stdio::null());
         let (status, stdout, stderr) = match run_bounded_output(&mut command) {
             Ok(output) => output,
             Err(error) => {
@@ -3621,6 +3616,25 @@ mod tests {
         git(&repo.dir, &["checkout", "-q", "main"]);
         repo.commit("Cargo.lock", "mainline\n", "main lock"); // diverge the lockfile
         repo
+    }
+
+    #[test]
+    fn bounded_output_owns_and_captures_both_pipes() {
+        use std::process::Stdio;
+
+        let mut command = std::process::Command::new("sh");
+        command
+            .args(["-c", "printf stdout-marker; printf stderr-marker >&2"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+
+        let result = run_bounded_output(&mut command);
+        assert!(result.is_ok(), "bounded output must establish both pipes");
+        let (status, stdout, stderr) = result.unwrap();
+        assert!(status.success());
+        assert_eq!(stdout, "stdout-marker");
+        assert_eq!(stderr, "stderr-marker");
     }
 
     #[test]
