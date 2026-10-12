@@ -1228,7 +1228,7 @@ pub fn run_worker(
     // slug (the tab key) is resolved later from the worker's own DB handle:
     // opening a second connection here would make an unrelated busy/locked
     // state abandon a checkout that is otherwise fine (THE-516 review).
-    let hook_workspace = repo::repo_slug(root);
+    let hook_workspace = hook_workspace_slug(root, ctx.db_path.as_deref());
     let pre = crate::worktree_lifecycle::run_event(
         cfg,
         root,
@@ -1615,6 +1615,13 @@ pub fn run_worker(
     });
 }
 
+fn hook_workspace_slug(root: &Path, db_path: Option<&Path>) -> String {
+    match db_path {
+        Some(db_path) => repo::repo_slug_at(root, db_path),
+        None => repo::repo_slug(root),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1630,6 +1637,36 @@ mod tests {
         cfg.sandbox.backend = thegn_core::config::SandboxBackend::None;
         cfg.worktree_mode = WorktreeMode::InRepo;
         cfg
+    }
+
+    #[test]
+    fn hook_workspace_slug_uses_worker_database_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("same-name");
+        std::fs::create_dir_all(&root).unwrap();
+        let db_path = dir.path().join("isolated/thegn.db");
+        let db = Db::open_at(&db_path).unwrap();
+        db.slug_for_repo("/another/same-name", "same-name").unwrap();
+
+        assert_eq!(hook_workspace_slug(&root, Some(&db_path)), "same-name-2");
+        assert_eq!(
+            db.slug_for_repo(&root.to_string_lossy(), "same-name")
+                .unwrap(),
+            "same-name-2"
+        );
+    }
+
+    #[test]
+    fn hook_workspace_slug_without_worker_path_uses_isolated_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let _env = crate::testenv::EnvVarGuard::set(&[("XDG_STATE_HOME", state.to_str().unwrap())]);
+        let root = dir.path().join("same-name");
+        std::fs::create_dir_all(&root).unwrap();
+        let db = Db::open().unwrap();
+        db.slug_for_repo("/another/same-name", "same-name").unwrap();
+
+        assert_eq!(hook_workspace_slug(&root, None), "same-name-2");
     }
 
     #[test]
