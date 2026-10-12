@@ -41,7 +41,7 @@ fn source_hash(src: &str) -> String {
 /// The result of one crawl pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct CrawlOutcome {
-    /// Any file's entity rows were (re)written this pass (⇒ pulse the waker).
+    /// Entity rows were written or pruned this pass (⇒ pulse the waker).
     pub changed: bool,
     /// Tree-sitter-served files present in the git listing (before the cap).
     pub ts_files: usize,
@@ -58,24 +58,33 @@ pub struct CrawlOutcome {
 /// it. Tracked files only (`git ls-files`), so `.gitignore`d / vendored trees
 /// are excluded by construction — the "walk the git listing, never readdir"
 /// contract. NUL-separated so paths with spaces need no unquoting. `None` only
-/// when git could not be run at all; an empty or failed listing is `Some(empty)`
-/// (a deterministic answer for the current index).
-fn git_ts_files(root: &Path) -> Option<Vec<PathBuf>> {
+/// when git could not be run at all; a nonzero command result is returned with
+/// `succeeded: false` so callers can distinguish it from a valid empty listing.
+struct GitTsFiles {
+    files: Vec<PathBuf>,
+    succeeded: bool,
+}
+
+fn git_ts_files(root: &Path) -> Option<GitTsFiles> {
     let loc = GitLoc::for_worktree(root);
     // off-loop: callers are the crawl's blocking task and CLI/MCP processes.
     #[expect(clippy::disallowed_methods)]
     let out = loc.git_command(&["ls-files", "-z"]).output().ok()?;
     if !out.status.success() {
-        return Some(Vec::new());
+        return Some(GitTsFiles {
+            files: Vec::new(),
+            succeeded: false,
+        });
     }
-    Some(
-        String::from_utf8_lossy(&out.stdout)
+    Some(GitTsFiles {
+        files: String::from_utf8_lossy(&out.stdout)
             .split('\0')
             .filter(|s| !s.is_empty())
             .filter(|rel| Lang::from_path(rel).is_some())
             .map(PathBuf::from)
             .collect(),
-    )
+        succeeded: true,
+    })
 }
 
 /// Crawl `root`'s git-listed tree-sitter files into the entity index, capped at
@@ -87,9 +96,14 @@ pub fn crawl_worktree(root: &Path, cap: usize, db: &Db) -> CrawlOutcome {
     let root_s = root.to_string_lossy().into_owned();
     let listing = git_ts_files(root);
     let listed = listing.is_some();
-    let files = listing.unwrap_or_default();
+    let succeeded = listing.as_ref().is_some_and(|listing| listing.succeeded);
+    let files = listing.map_or_else(Vec::new, |listing| listing.files);
     let ts_files = files.len();
     let partial = ts_files > cap;
+    let whole_listing: HashSet<String> = files
+        .iter()
+        .map(|rel| root.join(rel).to_string_lossy().into_owned())
+        .collect();
 
     let mut outcome = CrawlOutcome {
         changed: false,
@@ -133,6 +147,17 @@ pub fn crawl_worktree(root: &Path, cap: usize, db: &Db) -> CrawlOutcome {
             outcome.changed = true;
         }
     }
+    if succeeded {
+        match db.prune_unlisted_semantic_files(&root_s, &whole_listing) {
+            Ok(pruned) if pruned > 0 => outcome.changed = true,
+            Ok(_) => {}
+            Err(error) => tracing::debug!(
+                target: "thegn::semantic",
+                %error,
+                "failed to prune unlisted semantic files"
+            ),
+        }
+    }
     outcome
 }
 
@@ -155,7 +180,7 @@ pub fn load_repo_map(root: &Path, cap: usize, db: &Db, file_filter: Option<&str>
 
     // Inline first-use crawl when the index is empty for this worktree.
     let mut rows = db.entities_under(&root_s).unwrap_or_default();
-    let mut ts_files = git_ts_files(root).map_or(0, |f| f.len());
+    let mut ts_files = git_ts_files(root).map_or(0, |listing| listing.files.len());
     if rows.is_empty() && ts_files > 0 {
         let outcome = crawl_worktree(root, cap, db);
         ts_files = outcome.ts_files;
@@ -333,4 +358,68 @@ pub fn index_symbol_matches(
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::process::Output;
+
+    fn git(root: &Path, args: &[&str]) -> Output {
+        thegn_core::util::git_cmd(root)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .args(["-c", "commit.gpgsign=false"])
+            .args(args)
+            .output()
+            .unwrap()
+    }
+
+    #[test]
+    fn crawl_prunes_git_removed_file_and_keeps_other_entities() {
+        let temp = tempfile::tempdir().unwrap();
+        assert!(git(temp.path(), &["init", "-q"]).status.success());
+        let root = fs::canonicalize(temp.path()).unwrap();
+        assert!(
+            git(&root, &["config", "user.name", "Semantic Test"])
+                .status
+                .success()
+        );
+        assert!(
+            git(&root, &["config", "user.email", "semantic@example.invalid"])
+                .status
+                .success()
+        );
+        fs::write(root.join("a.rs"), "pub fn alpha() {}\n").unwrap();
+        fs::write(root.join("b.rs"), "pub fn beta() {}\n").unwrap();
+        assert!(git(&root, &["add", "a.rs", "b.rs"]).status.success());
+        assert!(git(&root, &["commit", "-qm", "seed"]).status.success());
+
+        let db = Db::open_memory().unwrap();
+        let first = crawl_worktree(&root, 100, &db);
+        assert!(first.listed);
+        assert_eq!(first.indexed, 2);
+        let initial = db.entities_under(&root.to_string_lossy()).unwrap();
+        assert!(initial.iter().any(|entity| entity.file.ends_with("/a.rs")));
+        assert!(initial.iter().any(|entity| entity.file.ends_with("/b.rs")));
+
+        assert!(git(&root, &["rm", "-q", "b.rs"]).status.success());
+        assert!(git(&root, &["commit", "-qm", "remove b"]).status.success());
+        let second = crawl_worktree(&root, 100, &db);
+        assert!(
+            second.changed,
+            "pruning must pulse the crawl's change outcome"
+        );
+        let remaining = db.entities_under(&root.to_string_lossy()).unwrap();
+        assert!(
+            !remaining
+                .iter()
+                .any(|entity| entity.file.ends_with("/b.rs"))
+        );
+        assert!(
+            remaining
+                .iter()
+                .any(|entity| entity.file.ends_with("/a.rs"))
+        );
+    }
 }
