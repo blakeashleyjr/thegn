@@ -180,11 +180,8 @@ fn caption(abs: &std::path::Path, w: u32, h: u32) -> String {
 /// Detect a file's [`PreviewRoute`] from its extension, sniffing a small head
 /// only for the extension-less / unknown fallback.
 fn route(abs: &std::path::Path) -> PreviewRoute {
-    let mut head = [0u8; 1024];
-    let n = std::fs::File::open(abs)
-        .and_then(|mut f| std::io::Read::read(&mut f, &mut head))
-        .unwrap_or(0);
-    preview::route_for(abs, &head[..n])
+    let head = crate::rasterize::read_regular_prefix(abs, 1024).unwrap_or_default();
+    preview::route_for(abs, &head)
 }
 
 /// Read + decode a file for the plain-text route, rejecting oversized/binary
@@ -201,12 +198,8 @@ fn read_capped(abs: &std::path::Path) -> Result<String, String> {
 /// Read a file, rejecting ones larger than the preview cap before reading.
 fn read_bytes(abs: &std::path::Path) -> Result<Vec<u8>, String> {
     const MAX_BYTES: u64 = 2 * 1024 * 1024; // 2 MiB
-    if let Ok(meta) = std::fs::metadata(abs)
-        && meta.len() > MAX_BYTES
-    {
-        return Err(format!("file too large ({} KiB)", meta.len() / 1024));
-    }
-    std::fs::read(abs).map_err(|e| format!("cannot read: {e}"))
+    crate::rasterize::read_regular_capped(abs, MAX_BYTES)
+        .map_err(|e| format!("cannot preview file: {e}"))
 }
 
 /// Decode bytes into preview lines: reject binary content (a NUL byte), expand
@@ -268,5 +261,33 @@ mod tests {
             caption(std::path::Path::new("a/b/pic.png"), 640, 480),
             "🖼 pic.png — 640×480"
         );
+    }
+
+    #[test]
+    fn read_bytes_refuses_oversized_input_with_a_limit_diagnostic() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("large.txt");
+        std::fs::write(&file, vec![b'x'; 2 * 1024 * 1024 + 1]).unwrap();
+        let error = read_bytes(&file).unwrap_err();
+        assert!(
+            error.contains("2097152 byte preview cap") && error.contains("2097153 bytes"),
+            "unexpected diagnostic: {error}"
+        );
+        // The direct opened-handle cap check, including a file larger than
+        // its cap, is covered by rasterize::tests::read_regular_capped_enforces_cap_and_kind.
+    }
+
+    #[test]
+    fn read_bytes_previews_a_final_symlink_to_a_regular_file() {
+        if !crate::platform::test_symlink_supported() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("AGENTS.md");
+        let link = dir.path().join("CLAUDE.md");
+        std::fs::write(&target, b"workspace instructions").unwrap();
+        crate::platform::test_symlink(&target, &link).unwrap();
+
+        assert_eq!(read_bytes(&link).unwrap(), b"workspace instructions");
     }
 }

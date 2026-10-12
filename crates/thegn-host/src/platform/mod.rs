@@ -253,22 +253,50 @@ pub(crate) fn exe_admitted(path: &std::path::Path) -> bool {
     }
 }
 
-/// Open `path` read-only without ever blocking in `open(2)`: on Unix the
-/// descriptor is `O_NONBLOCK`, so a FIFO swapped in after a stat check opens
-/// immediately instead of parking the caller until a writer appears. The
-/// caller must still verify the OPENED handle is a regular file.
-pub(crate) fn open_read_nonblocking(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+/// Open read-only without blocking on a FIFO or following a final symlink.
+/// Callers still verify that the opened handle is a regular file.
+pub(crate) fn open_read_nonblocking_nofollow(
+    path: &std::path::Path,
+) -> std::io::Result<std::fs::File> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         std::fs::OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
+            .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_NOFOLLOW)
             .open(path)
     }
     #[cfg(not(unix))]
     {
-        std::fs::File::open(path)
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+            // FILE_FLAG_OPEN_REPARSE_POINT asks CreateFile to open the link
+            // itself. Reject reparse points from that same handle's metadata.
+            const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+                .open(path)?;
+            if file.metadata()?.file_attributes() & 0x0400 != 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "refusing final reparse point",
+                ));
+            }
+            Ok(file)
+        }
+        #[cfg(not(windows))]
+        {
+            let meta = std::fs::symlink_metadata(path)?;
+            if meta.file_type().is_symlink() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "refusing final symlink",
+                ));
+            }
+            std::fs::File::open(path)
+        }
     }
 }
 
