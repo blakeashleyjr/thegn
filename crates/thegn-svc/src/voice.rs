@@ -472,7 +472,7 @@ mod tests {
         let command = [
             "sh",
             "-c",
-            "sleep 30 </dev/null >/dev/null 2>&1 & echo $! >\"$1\"; cat >/dev/null; printf hi",
+            "sleep 30 </dev/null >/dev/null 2>&1 & echo $! >\"$1\"; cat >/dev/null; printf hi; exec >&- 2>&-; sleep 0.05",
             "sh",
         ];
         let mut command = command.to_vec();
@@ -492,8 +492,7 @@ mod tests {
             let state = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
                 Ok(stat) => stat
                     .rsplit_once(')')
-                    .map(|(_, tail)| tail.trim_start().chars().next())
-                    .flatten(),
+                    .and_then(|(_, tail)| tail.trim_start().chars().next()),
                 Err(_) => None,
             };
             if state.is_none() || state == Some('Z') {

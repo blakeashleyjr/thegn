@@ -950,7 +950,7 @@ mod tests {
             capture_command: vec![
                 "sh".into(),
                 "-c".into(),
-                "sleep 30 </dev/null >/dev/null 2>&1 & echo $! >\"$1\"; printf RIFF0000WAVE".into(),
+                "sleep 30 </dev/null >/dev/null 2>&1 & echo $! >\"$1\"; printf RIFF0000WAVE; exec >&- 2>&-; sleep 0.05".into(),
                 "sh".into(),
                 pid_file.display().to_string(),
             ],
@@ -960,8 +960,21 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let (_stop_tx, stop_rx) = mpsc::channel();
         let worker = spawn_capture(config, 1, 1, stop_rx, tx, waker).unwrap();
-        let message = rx.recv_timeout(Duration::from_secs(2)).unwrap();
-        assert!(matches!(message, VoiceMessage::CaptureComplete { .. }));
+        let mut saw_reaped = false;
+        let terminal = loop {
+            match rx.recv_timeout(Duration::from_secs(2)).unwrap() {
+                VoiceMessage::CaptureReaped { generation } => {
+                    assert_eq!(generation, 1);
+                    saw_reaped = true;
+                }
+                message @ (VoiceMessage::CaptureComplete { .. }
+                | VoiceMessage::CaptureFailed { .. }
+                | VoiceMessage::CaptureUnresolved { .. }) => break message,
+                other => panic!("expected a capture terminal message, got {other:?}"),
+            }
+        };
+        assert!(saw_reaped);
+        assert!(matches!(terminal, VoiceMessage::CaptureComplete { .. }));
         worker.join().unwrap();
         let pid = std::fs::read_to_string(pid_file)
             .unwrap()
