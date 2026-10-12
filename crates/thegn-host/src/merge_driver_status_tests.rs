@@ -38,6 +38,147 @@ fn repo_membership_query_failure_is_not_local_git_fallback() {
 }
 
 #[test]
+fn remote_unregistered_row_does_not_use_local_git_membership_fallback() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    let status = util::git_cmd(&repo)
+        .args(["init", "-q"])
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    let path = dir.path().join("queue.sqlite");
+    let db = Db::open_at(&path).unwrap();
+    let repo_s = repo.to_string_lossy().into_owned();
+    db.enqueue_merge(&repo_s, "feature", "main").unwrap();
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute(
+            "UPDATE merge_queue SET location=?1 WHERE worktree=?2",
+            [
+                r#"{"control_prefix":["provider","exec"],"path":"/repo"}"#,
+                &repo_s,
+            ],
+        )
+        .unwrap();
+
+    assert!(super::rows_for_repo(&db, &repo).unwrap().is_empty());
+}
+
+#[test]
+fn busy_status_write_before_attempt_stops_without_git_attempt() {
+    // The production busy timeout is five seconds, so this real lock test takes
+    // about five seconds while the driver's folding write waits and fails.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("queue.sqlite");
+    let db = Db::open_at(&path).unwrap();
+    let item = queued(&db, 0);
+    let lock = rusqlite::Connection::open(&path).unwrap();
+    lock.execute_batch("BEGIN EXCLUSIVE; UPDATE merge_queue SET updated_at=updated_at;")
+        .unwrap();
+    let mut called = false;
+    let out = drive_queue_with(
+        &config(),
+        &Config::default(),
+        Path::new(WORKTREE),
+        &db,
+        vec![item],
+        |_| {},
+        DriveActions {
+            attempt: |_: &str, _: &thegn_core::remote::GitLoc| {
+                called = true;
+                Ok(AttemptOutcome::Ready { tip: "tip".into() })
+            },
+            floor: |_: &str| panic!("notify-only"),
+            runner: unexpected_runner,
+        },
+    );
+    assert!(!called);
+    assert_eq!(out.persistence_errors.len(), 1);
+    assert!(
+        out.persistence_errors[0].contains("locked") || out.persistence_errors[0].contains("busy")
+    );
+}
+
+#[test]
+fn busy_landed_write_reports_oids_and_stops_later_rows() {
+    // The production busy timeout is five seconds, so this real lock test takes
+    // about five seconds while the landed status write waits and fails.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("queue.sqlite");
+    let db = Db::open_at(&path).unwrap();
+    let first = queued(&db, 0);
+    let second_worktree = "/later/worktree";
+    db.enqueue_merge(second_worktree, "later", "main").unwrap();
+    let second_status = db
+        .list_merge_queue()
+        .unwrap()
+        .into_iter()
+        .find(|row| row.worktree == second_worktree)
+        .unwrap()
+        .status;
+    let mut lock = None;
+    let attempts = std::cell::Cell::new(0);
+    let new_oid = "1234567890123456789012345678901234567890";
+    let old_oid = "old-base-oid";
+    let out = drive_queue_with(
+        &config(),
+        &Config::default(),
+        Path::new(WORKTREE),
+        &db,
+        vec![
+            first,
+            QueueItem {
+                worktree: second_worktree.into(),
+                branch: "later".into(),
+                location: String::new(),
+                agent_attempts: 0,
+            },
+        ],
+        |_| {},
+        DriveActions {
+            attempt: |_: &str, _: &thegn_core::remote::GitLoc| {
+                attempts.set(attempts.get() + 1);
+                let connection = rusqlite::Connection::open(&path).unwrap();
+                connection
+                    .execute_batch("BEGIN EXCLUSIVE; UPDATE merge_queue SET updated_at=updated_at;")
+                    .unwrap();
+                lock = Some(connection);
+                Ok(AttemptOutcome::Landed {
+                    commit: new_oid.into(),
+                    old_oid: old_oid.into(),
+                    resyncs: Vec::new(),
+                })
+            },
+            floor: |_: &str| panic!("notify-only"),
+            runner: unexpected_runner,
+        },
+    );
+    assert_eq!(
+        attempts.get(),
+        1,
+        "the landed write failure halts later rows"
+    );
+    assert_eq!(out.bookkeeping_failed.len(), 1);
+    assert_eq!(out.bookkeeping_failed[0].old_oid, old_oid);
+    assert_eq!(out.bookkeeping_failed[0].new_oid, new_oid);
+    assert!(
+        out.bookkeeping_failed[0].error.contains("locked")
+            || out.bookkeeping_failed[0].error.contains("busy")
+    );
+    lock.take().unwrap().execute_batch("ROLLBACK;").unwrap();
+    let later = db
+        .list_merge_queue()
+        .unwrap()
+        .into_iter()
+        .find(|row| row.worktree == second_worktree)
+        .unwrap();
+    assert_eq!(later.status, second_status);
+}
+
+#[test]
 fn agent_blocked_status_survives_db_reopen_and_decodes() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("queue.sqlite");
@@ -131,6 +272,66 @@ fn landed_ref_with_terminal_write_failure_is_reported_as_degraded() {
     assert_eq!(out.bookkeeping_failed.len(), 1);
     assert_eq!(out.bookkeeping_failed[0].old_oid, old_oid);
     assert_eq!(out.bookkeeping_failed[0].new_oid, new_oid);
+}
+
+#[test]
+fn landed_bookkeeping_failure_stops_the_remaining_items() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("queue.sqlite");
+    let db = Db::open_at(&path).unwrap();
+    let first = queued(&db, 0);
+    let second_worktree = "/later/worktree";
+    db.enqueue_merge(second_worktree, "later", "main").unwrap();
+    let second_status = db
+        .list_merge_queue()
+        .unwrap()
+        .into_iter()
+        .find(|row| row.worktree == second_worktree)
+        .unwrap()
+        .status;
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute_batch("CREATE TRIGGER fail_landed BEFORE UPDATE OF status ON merge_queue WHEN NEW.status = 'landed' BEGIN SELECT RAISE(FAIL, 'injected landed write failure'); END;")
+        .unwrap();
+    let attempts = std::cell::Cell::new(0);
+    let out = drive_queue_with(
+        &config(),
+        &Config::default(),
+        Path::new(WORKTREE),
+        &db,
+        vec![
+            first,
+            QueueItem {
+                worktree: second_worktree.into(),
+                branch: "later".into(),
+                location: String::new(),
+                agent_attempts: 0,
+            },
+        ],
+        |_| {},
+        DriveActions {
+            attempt: |_: &str, _: &thegn_core::remote::GitLoc| {
+                attempts.set(attempts.get() + 1);
+                Ok(AttemptOutcome::Landed {
+                    commit: "1234567890123456789012345678901234567890".into(),
+                    old_oid: "old-base-oid".into(),
+                    resyncs: Vec::new(),
+                })
+            },
+            floor: |_: &str| panic!("notify-only"),
+            runner: unexpected_runner,
+        },
+    );
+    assert_eq!(attempts.get(), 1, "bookkeeping failure halts the drain");
+    assert_eq!(out.bookkeeping_failed.len(), 1);
+    assert_eq!(out.landed, ["feature"]);
+    let later = db
+        .list_merge_queue()
+        .unwrap()
+        .into_iter()
+        .find(|row| row.worktree == second_worktree)
+        .unwrap();
+    assert_eq!(later.status, second_status);
 }
 
 #[test]
