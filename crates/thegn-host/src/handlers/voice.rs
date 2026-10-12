@@ -20,6 +20,9 @@ pub(crate) fn toggle(
     now_ms: u64,
     waker: &TerminalWaker,
 ) -> String {
+    if matches!(voice.state, VoiceState::Idle) && voice.shutdown_pending() {
+        return "Voice shutdown pending".into();
+    }
     if !voice.config().enabled {
         return "Voice is off ([voice] enabled = false)".into();
     }
@@ -96,27 +99,37 @@ pub(crate) fn drain(
             continue;
         }
         if let VoiceMessage::CaptureComplete { generation, .. }
-        | VoiceMessage::CaptureFailed { generation, .. } = &message
+        | VoiceMessage::CaptureFailed { generation, .. }
+        | VoiceMessage::CaptureUnresolved { generation, .. } = &message
             && *generation != voice.capture_generation()
         {
             continue;
         }
         if matches!(
             &message,
-            VoiceMessage::CaptureComplete { .. } | VoiceMessage::CaptureFailed { .. }
+            VoiceMessage::CaptureComplete { .. }
+                | VoiceMessage::CaptureFailed { .. }
+                | VoiceMessage::CaptureUnresolved { .. }
         ) {
-            voice.capture_finished();
+            voice.capture_finished(matches!(&message, VoiceMessage::CaptureUnresolved { .. }));
         }
         if let VoiceMessage::TranscriptSucceeded { request_id, .. }
-        | VoiceMessage::TranscriptFailed { request_id, .. } = &message
+        | VoiceMessage::TranscriptFailed { request_id, .. }
+        | VoiceMessage::TranscriptUnresolved { request_id, .. } = &message
         {
-            voice.transcription_finished(*request_id);
+            voice.transcription_finished(
+                *request_id,
+                matches!(&message, VoiceMessage::TranscriptUnresolved { .. }),
+            );
         }
         let event = match message {
             VoiceMessage::CaptureComplete { pane_id, wav, .. } => {
                 VoiceEvent::CaptureComplete { pane_id, wav }
             }
             VoiceMessage::CaptureFailed {
+                pane_id, reason, ..
+            } => VoiceEvent::CaptureFailed { pane_id, reason },
+            VoiceMessage::CaptureUnresolved {
                 pane_id, reason, ..
             } => VoiceEvent::CaptureFailed { pane_id, reason },
             VoiceMessage::TranscriptSucceeded {
@@ -129,6 +142,15 @@ pub(crate) fn drain(
                 transcript,
             },
             VoiceMessage::TranscriptFailed {
+                pane_id,
+                request_id,
+                reason,
+            } => VoiceEvent::TranscriptFailed {
+                pane_id,
+                request_id,
+                reason,
+            },
+            VoiceMessage::TranscriptUnresolved {
                 pane_id,
                 request_id,
                 reason,
