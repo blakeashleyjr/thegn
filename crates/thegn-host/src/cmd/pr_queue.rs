@@ -372,12 +372,29 @@ mod bind_checkout_tests {
 
     #[test]
     fn binding_requires_repo_ownership_and_matches_branch_or_is_number_only() {
-        let root = Path::new("/repo");
-        let wt = Path::new("/repo/worktrees/feat");
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo);
+        let root = integrate::main_checkout(&repo).unwrap();
+        let wt = repo.canonicalize().unwrap();
+        let wt_main = integrate::main_checkout(&wt).unwrap();
         let cases = [
-            ("matching", Some(root), Some("feat"), false, true),
-            ("explicit mismatch", Some(root), Some("other"), true, false),
-            ("implicit mismatch", Some(root), Some("other"), false, true),
+            ("matching", Some(root.as_path()), Some("feat"), false, true),
+            (
+                "explicit mismatch",
+                Some(wt_main.as_path()),
+                Some("other"),
+                true,
+                false,
+            ),
+            (
+                "implicit mismatch",
+                Some(wt_main.as_path()),
+                Some("other"),
+                false,
+                true,
+            ),
             (
                 "different repository",
                 Some(Path::new("/other")),
@@ -387,9 +404,9 @@ mod bind_checkout_tests {
             ),
         ];
         for (name, wt_main, branch, explicit, succeeds) in cases {
-            let result = bind_checkout(root, wt, explicit, wt_main, branch, "feat");
+            let result = bind_checkout(&root, &wt, explicit, wt_main, branch, "feat");
             if succeeds && branch == Some("feat") {
-                assert_eq!(result.unwrap().as_deref(), Some(wt), "{name}");
+                assert_eq!(result.unwrap().as_deref(), Some(wt.as_path()), "{name}");
             } else if succeeds {
                 assert_eq!(
                     result.unwrap(),
@@ -398,7 +415,7 @@ mod bind_checkout_tests {
                 );
             } else {
                 let error = result.unwrap_err().to_string();
-                assert!(error.contains("/repo/worktrees/feat"), "{name}: {error}");
+                assert!(error.contains(&wt.display().to_string()), "{name}: {error}");
                 match name {
                     "explicit mismatch" => {
                         assert!(error.contains("other") && error.contains("feat"), "{error}");
@@ -410,18 +427,19 @@ mod bind_checkout_tests {
         }
     }
 
+    #[expect(clippy::disallowed_methods)]
+    fn init_repo(path: &Path) {
+        thegn_core::fsperm::restrict_dir_to_owner(path).unwrap();
+        let status = thegn_core::util::git_cmd(path)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .args(["init"])
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
     #[test]
     fn worktree_from_another_repository_is_refused() {
-        fn init_repo(path: &Path) {
-            thegn_core::fsperm::restrict_dir_to_owner(path).unwrap();
-            let status = thegn_core::util::git_cmd(path)
-                .env("GIT_CONFIG_GLOBAL", "/dev/null")
-                .args(["init"])
-                .status()
-                .unwrap();
-            assert!(status.success());
-        }
-
         let dir = tempfile::tempdir().unwrap();
         let repo_a = dir.path().join("a");
         let repo_b = dir.path().join("b");
