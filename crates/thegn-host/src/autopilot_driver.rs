@@ -590,13 +590,16 @@ fn tracker_config_for_account(
     account: &str,
 ) -> thegn_core::config::IssuesConfig {
     let mut tracker_cfg = cfg.repo_issues(Some(repo_root));
-    if !tracker_cfg.issue_accounts.is_empty() {
-        tracker_cfg
-            .issue_accounts
-            .retain(|entry| entry.name == account);
-        if tracker_cfg.issue_accounts.is_empty() {
-            tracker_cfg.accounts_restricted = true;
-        }
+    let matched = tracker_cfg
+        .active_accounts()
+        .iter()
+        .any(|entry| entry.name == account);
+    tracker_cfg
+        .issue_accounts
+        .retain(|entry| entry.name == account);
+    if !matched {
+        tracker_cfg.issue_accounts.clear();
+        tracker_cfg.accounts_restricted = true;
     }
     tracker_cfg
 }
@@ -861,8 +864,9 @@ mod tests {
         autopilot_backend_is_isolated, autopilot_issue_router, issue_prompt,
         tracker_config_for_account, worker_failure,
     };
+    use thegn_core::issue::IssueFilter;
     use thegn_core::sandbox::Backend;
-    use thegn_svc::issue::{IssueBackend, IssueCaps, IssueError, IssueFilter};
+    use thegn_svc::issue::{IssueBackend, IssueCaps, IssueError};
 
     #[test]
     fn worker_validation_reason_is_bounded_and_actionable() {
@@ -917,6 +921,24 @@ mod tests {
     }
 
     #[test]
+    fn plugin_account_does_not_resurrect_legacy_only_tracker_account() {
+        let cfg: thegn_core::config::Config = toml::from_str(
+            "[issues]\nprovider = \"linear\"\n\
+             [issues.linear]\napi_key = \"legacy-secret\"\n",
+        )
+        .expect("valid legacy issue config");
+        let repo_root = tempfile::tempdir().expect("temporary repo root");
+
+        let plugin_cfg = tracker_config_for_account(&cfg, repo_root.path(), "work");
+        assert!(plugin_cfg.active_accounts().is_empty());
+
+        let legacy_cfg = tracker_config_for_account(&cfg, repo_root.path(), "linear");
+        let legacy_accounts = legacy_cfg.active_accounts();
+        assert_eq!(legacy_accounts.len(), 1);
+        assert_eq!(legacy_accounts[0].name, "linear");
+    }
+
+    #[test]
     fn autopilot_router_includes_only_the_plugin_account_that_supplied_issue() {
         let cfg = thegn_core::config::IssuesConfig::default();
         let repo_root = tempfile::tempdir().expect("temporary repo root");
@@ -926,12 +948,12 @@ mod tests {
             "demo",
             vec![
                 (
-                    "demo".into(),
-                    Box::new(PluginIssueBackend { account: "demo" }) as Box<dyn IssueBackend>,
-                ),
-                (
                     "other".into(),
                     Box::new(PluginIssueBackend { account: "other" }) as Box<dyn IssueBackend>,
+                ),
+                (
+                    "demo".into(),
+                    Box::new(PluginIssueBackend { account: "demo" }) as Box<dyn IssueBackend>,
                 ),
             ],
         );
