@@ -609,6 +609,34 @@ mod tests {
         assert_eq!(kit_theme(&Palette::default()), Theme::prism());
     }
 
+    /// THE-501: every catalog preset must resolve in tg-kit's standalone
+    /// loader to exactly the host's palette (Light's paper-safe hues
+    /// included), and a newly added preset is covered automatically because
+    /// the table is `PRESETS` itself.
+    #[test]
+    fn standalone_loader_matches_host_for_every_preset() {
+        use tg_kit::theme::ThemeOutcome;
+        for name in thegn_core::theme::PRESETS {
+            let mut p = thegn_core::theme::preset(name).expect("catalog preset");
+            thegn_core::theme::extend_palette(&mut p);
+            let load = Theme::from_config_str(&format!("[theme]\npreset = \"{name}\"\n"));
+            assert_eq!(load.theme, kit_theme(&p), "preset {name} drifted");
+            assert!(load.is_faithful(), "preset {name}: {:?}", load);
+            let want = if *name == "prism" {
+                ThemeOutcome::Prism
+            } else {
+                ThemeOutcome::Preset((*name).to_string())
+            };
+            assert_eq!(load.outcome, want);
+        }
+        let light = Theme::from_config_str("[theme]\npreset = \"light\"\n").theme;
+        assert_ne!(
+            light.green,
+            Theme::prism().green,
+            "light hues are paper-safe"
+        );
+    }
+
     #[test]
     fn user_palette_overrides_flow_through() {
         let p = Palette {

@@ -22,9 +22,16 @@ ratatui = { version = "0.30", default-features = false, features = [
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 anyhow = { version = "1", optional = true }
+# Exact named-preset resolution. OFF by default so a standalone app links
+# neither the host catalog nor its dependency stack (thegn-core does not
+# depend on tg-kit, so there is no cycle).
+thegn-core = { path = "../thegn-core", optional = true }
 
 [features]
 default = []
 # The standalone crossterm event-loop harness (each app's `main.rs`). Pulls in
 # ratatui's bundled crossterm backend; thegn-host never enables this.
 standalone = ["dep:anyhow", "ratatui/crossterm"]
+# Resolve every `[theme] preset` through `thegn_core::theme::preset` so the
+# standalone palette is byte-identical to the host's.
+host-presets = ["dep:thegn-core"]
