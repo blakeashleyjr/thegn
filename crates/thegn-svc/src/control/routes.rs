@@ -387,7 +387,7 @@ mod tests {
             .filter(|line| line.trim_start().starts_with('|'))
         {
             let cells: Vec<_> = line.split('|').map(str::trim).collect();
-            if cells.len() < 6 || cells[1].starts_with("---") {
+            if cells.len() < 6 || !cells[1].starts_with('`') {
                 continue;
             }
             let route = cells[1].trim_matches('`');
