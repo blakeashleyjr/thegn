@@ -662,6 +662,36 @@ impl DaemonService {
     }
 }
 
+/// Plugin bridges live in the TUI process; the daemon cannot service these
+/// namespaced ids. Keep the refusal bounded like issue-router diagnostics.
+fn refuse_plugin_issue_id(id: &str) -> ControlResult<()> {
+    if id.starts_with("plugin:") {
+        let shown_id: String = id.chars().take(256).collect();
+        return Err(ControlError::FailedPrecondition(format!(
+            "plugin issue providers are served only by the TUI process hosting the plugin: {shown_id}"
+        )));
+    }
+    Ok(())
+}
+
+/// Preserve typed client errors for router failures while keeping the
+/// existing diagnostic text for internal failures.
+fn issue_router_control_error(
+    operation: &str,
+    shown_id: &str,
+    error: thegn_svc::issue::IssueError,
+) -> ControlError {
+    let message = format!("issues.{operation} {shown_id}: {error}");
+    match error {
+        thegn_svc::issue::IssueError::Unsupported(_)
+        | thegn_svc::issue::IssueError::UnsupportedPatchFields(_)
+        | thegn_svc::issue::IssueError::EmptyPatch
+        | thegn_svc::issue::IssueError::Parse(_) => ControlError::InvalidArgument(message),
+        thegn_svc::issue::IssueError::Policy(_) => ControlError::FailedPrecondition(message),
+        _ => ControlError::Internal(anyhow::anyhow!(message)),
+    }
+}
+
 impl ControlApi for DaemonService {
     fn list_sessions(&self) -> BoxFuture<'_, ControlResult<Vec<SessionInfo>>> {
         Box::pin(async move {
@@ -2112,11 +2142,12 @@ impl ControlApi for DaemonService {
         Box::pin(async move {
             let shown_id: String = id.chars().take(256).collect();
             let issues_cfg = self.issue_config_for_repo(repo).await?;
+            refuse_plugin_issue_id(id)?;
             let router = thegn_svc::issue::IssueRouter::from_config(&issues_cfg);
             router
                 .get_issue(id)
                 .await
-                .map_err(|e| ControlError::Internal(anyhow::anyhow!("issues.get {shown_id}: {e}")))
+                .map_err(|e| issue_router_control_error("get", &shown_id, e))
         })
     }
 
@@ -2129,10 +2160,12 @@ impl ControlApi for DaemonService {
         Box::pin(async move {
             let shown_id: String = id.chars().take(256).collect();
             let issues_cfg = self.issue_config_for_repo(repo).await?;
+            refuse_plugin_issue_id(id)?;
             let router = thegn_svc::issue::IssueRouter::from_config(&issues_cfg);
-            router.update_issue(id, patch).await.map_err(|e| {
-                ControlError::Internal(anyhow::anyhow!("issues.update {shown_id}: {e}"))
-            })
+            router
+                .update_issue(id, patch)
+                .await
+                .map_err(|e| issue_router_control_error("update", &shown_id, e))
         })
     }
 
@@ -2145,10 +2178,12 @@ impl ControlApi for DaemonService {
         Box::pin(async move {
             let shown_id: String = id.chars().take(256).collect();
             let issues_cfg = self.issue_config_for_repo(repo).await?;
+            refuse_plugin_issue_id(id)?;
             let router = thegn_svc::issue::IssueRouter::from_config(&issues_cfg);
-            router.add_comment(id, body).await.map_err(|e| {
-                ControlError::Internal(anyhow::anyhow!("issues.comment {shown_id}: {e}"))
-            })
+            router
+                .add_comment(id, body)
+                .await
+                .map_err(|e| issue_router_control_error("comment", &shown_id, e))
         })
     }
 
@@ -2239,6 +2274,7 @@ impl ControlApi for DaemonService {
                     .map_err(|e| {
                         ControlError::Internal(anyhow::anyhow!("worktrees.create: {e}"))
                     })?;
+                    refuse_plugin_issue_id(id)?;
                     let router = thegn_svc::issue::IssueRouter::from_config(&issues_cfg);
                     let detail = router.get_issue(id).await.map_err(|e| {
                         ControlError::Internal(anyhow::anyhow!("worktrees.create {id}: {e}"))
@@ -2795,6 +2831,78 @@ mod tests {
         for r in results {
             assert_uniform_miss(&r.unwrap_err(), "/not/registered");
         }
+    }
+
+    #[tokio::test]
+    async fn daemon_refuses_plugin_issue_ids_with_failed_precondition() {
+        let (svc, _rx) = service(0);
+        let patch = thegn_core::issue::IssuePatch::default();
+        for result in [
+            svc.issues_get("plugin:demo:1", None).await.map(|_| ()),
+            svc.issues_update("plugin:demo:1", &patch, None)
+                .await
+                .map(|_| ()),
+            svc.issues_comment("plugin:demo:1", "hello", None).await,
+        ] {
+            match result.unwrap_err() {
+                ControlError::FailedPrecondition(message) => {
+                    assert!(message.contains("TUI process hosting the plugin"));
+                    assert!(message.contains("plugin:demo:1"));
+                }
+                error => panic!("expected plugin issue refusal, got {error:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn worktree_create_refuses_plugin_issue_ids_with_failed_precondition() {
+        let (svc, _rx) = service(0);
+        let req = thegn_svc::control::WorktreeCreateReq {
+            issue: Some("plugin:demo:1".into()),
+            ..Default::default()
+        };
+
+        match svc.worktree_create(req).await.unwrap_err() {
+            ControlError::FailedPrecondition(message) => {
+                assert!(message.contains("TUI process hosting the plugin"));
+                assert!(message.contains("plugin:demo:1"));
+            }
+            error => panic!("expected plugin issue refusal, got {error:?}"),
+        }
+    }
+
+    #[test]
+    fn issue_router_errors_keep_typed_control_statuses() {
+        use thegn_svc::issue::IssueError;
+
+        assert!(matches!(
+            issue_router_control_error("get", "linear:T-1", IssueError::Unsupported("get")),
+            ControlError::InvalidArgument(_)
+        ));
+        assert!(matches!(
+            issue_router_control_error(
+                "update",
+                "linear:T-1",
+                IssueError::UnsupportedPatchFields(vec!["priority"])
+            ),
+            ControlError::InvalidArgument(_)
+        ));
+        assert!(matches!(
+            issue_router_control_error("update", "linear:T-1", IssueError::EmptyPatch),
+            ControlError::InvalidArgument(_)
+        ));
+        assert!(matches!(
+            issue_router_control_error("get", "linear:T-1", IssueError::Parse("bad id".into())),
+            ControlError::InvalidArgument(_)
+        ));
+        assert!(matches!(
+            issue_router_control_error("get", "linear:T-1", IssueError::Policy("blocked")),
+            ControlError::FailedPrecondition(_)
+        ));
+        assert!(matches!(
+            issue_router_control_error("get", "linear:T-1", IssueError::NotConfigured),
+            ControlError::Internal(_)
+        ));
     }
 
     /// With a registered repo whose overlay yields NO tracker, every method
