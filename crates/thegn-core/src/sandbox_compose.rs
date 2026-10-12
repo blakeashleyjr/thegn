@@ -15,6 +15,8 @@
 //! with `up -d <service> <runServices…>`. The argv builders are pure + tested;
 //! only the callers run subprocesses.
 
+use crate::placement::Placement;
+use crate::sandbox::{Backend, SandboxSpec, oci_prefix};
 use std::fmt;
 use std::time::Duration;
 
@@ -26,6 +28,7 @@ pub(crate) const COMPOSE_PS_TIMEOUT: Duration = Duration::from_secs(5);
 /// A bounded Compose startup or verification failure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ComposeError {
+    Unsupported { backend: &'static str },
     Spawn,
     Timeout,
     Exit { code: Option<i32>, stderr: String },
@@ -36,15 +39,18 @@ pub(crate) enum ComposeError {
 impl fmt::Display for ComposeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Spawn => write!(f, "unable to run Docker Compose command"),
-            Self::Timeout => write!(f, "Docker Compose command timed out"),
+            Self::Unsupported { backend } => {
+                write!(f, "Compose is unsupported for backend '{backend}'")
+            }
+            Self::Spawn => write!(f, "unable to run Compose command"),
+            Self::Timeout => write!(f, "Compose command timed out"),
             Self::Exit { code, stderr } => write!(
                 f,
-                "Docker Compose exited with status {code:?}: {:?}",
+                "Compose exited with status {code:?}: {:?}",
                 stderr.trim()
             ),
-            Self::OutputLimit => write!(f, "Docker Compose output exceeded its size limit"),
-            Self::NotRunning => write!(f, "Docker Compose started no running service"),
+            Self::OutputLimit => write!(f, "Compose output exceeded its size limit"),
+            Self::NotRunning => write!(f, "Compose started no running service"),
         }
     }
 }
@@ -123,15 +129,40 @@ impl ComposeSpec {
     }
 }
 
-/// The `docker compose` binary tokens. Compose v2 (the `docker compose`
-/// subcommand) is the current standard; kept as one place to change.
-fn compose_bin() -> Vec<String> {
-    vec!["docker".into(), "compose".into()]
+/// Resolved Compose engine and transport. Exec argv stays unwrapped; pane entry
+/// owns interactive wrapping and preflight owns control wrapping.
+#[derive(Debug, Clone)]
+pub(crate) struct ComposeTarget {
+    engine: Vec<String>,
+    placement: Placement,
 }
 
-/// `docker compose -f … -p <project> …<rest>` prefix shared by up/exec.
-fn project_prefix(project: &str, c: &ComposeSpec) -> Vec<String> {
-    let mut v = compose_bin();
+impl ComposeTarget {
+    pub(crate) fn for_spec(spec: &SandboxSpec) -> Result<Self, ComposeError> {
+        if !matches!(
+            spec.backend,
+            Backend::Docker | Backend::Podman | Backend::PodmanRootful
+        ) {
+            return Err(ComposeError::Unsupported {
+                backend: spec.backend.label(),
+            });
+        }
+        let mut engine = oci_prefix(spec);
+        engine.push("compose".into());
+        Ok(Self {
+            engine,
+            placement: spec.placement.clone(),
+        })
+    }
+
+    pub(crate) fn control_argv(&self, argv: &[String]) -> Vec<String> {
+        self.placement.control_argv(argv)
+    }
+}
+
+/// `<engine> compose -f … -p <project> …<rest>` prefix shared by up/exec.
+fn project_prefix(target: &ComposeTarget, project: &str, c: &ComposeSpec) -> Vec<String> {
+    let mut v = target.engine.clone();
     for f in &c.files {
         v.push("-f".into());
         v.push(f.clone());
@@ -142,8 +173,8 @@ fn project_prefix(project: &str, c: &ComposeSpec) -> Vec<String> {
 }
 
 /// `docker compose … up -d [service runServices…]`. Pure.
-pub fn up_argv(project: &str, c: &ComposeSpec) -> Vec<String> {
-    let mut v = project_prefix(project, c);
+pub(crate) fn up_argv(target: &ComposeTarget, project: &str, c: &ComposeSpec) -> Vec<String> {
+    let mut v = project_prefix(target, project, c);
     v.push("up".into());
     v.push("-d".into());
     if let Some(svc) = &c.service {
@@ -154,8 +185,8 @@ pub fn up_argv(project: &str, c: &ComposeSpec) -> Vec<String> {
 }
 
 /// `docker compose … ps --status running --quiet [service]`. Pure.
-pub fn ps_argv(project: &str, c: &ComposeSpec) -> Vec<String> {
-    let mut v = project_prefix(project, c);
+pub(crate) fn ps_argv(target: &ComposeTarget, project: &str, c: &ComposeSpec) -> Vec<String> {
+    let mut v = project_prefix(target, project, c);
     v.extend([
         "ps".into(),
         "--status".into(),
@@ -239,19 +270,18 @@ pub(crate) fn run_up_checked(
 }
 
 /// Start the declared project and verify its requested service is running.
-pub(crate) fn up_and_verify(project: &str, compose: &ComposeSpec) -> anyhow::Result<()> {
-    run_up_checked(
-        &up_argv(project, compose),
-        &ps_argv(project, compose),
-        COMPOSE_UP_TIMEOUT,
-        COMPOSE_PS_TIMEOUT,
-    )?;
+pub(crate) fn up_and_verify(spec: &SandboxSpec, compose: &ComposeSpec) -> anyhow::Result<()> {
+    let target = ComposeTarget::for_spec(spec)?;
+    let up = target.control_argv(&up_argv(&target, &spec.name, compose));
+    let ps = target.control_argv(&ps_argv(&target, &spec.name, compose));
+    run_up_checked(&up, &ps, COMPOSE_UP_TIMEOUT, COMPOSE_PS_TIMEOUT)?;
     Ok(())
 }
 
 /// `docker compose … exec [-it] [--workdir wd] <service> /bin/sh -lc <script>`.
 /// Pure. `interactive` toggles `-it` (a pane) vs a one-shot exec.
-pub fn exec_argv(
+pub(crate) fn exec_argv(
+    target: &ComposeTarget,
     project: &str,
     c: &ComposeSpec,
     workdir: Option<&str>,
@@ -259,7 +289,7 @@ pub fn exec_argv(
     interactive: bool,
 ) -> Option<Vec<String>> {
     let service = c.service.as_ref()?;
-    let mut v = project_prefix(project, c);
+    let mut v = project_prefix(target, project, c);
     v.push("exec".into());
     if interactive {
         v.push("-it".into());
@@ -280,12 +310,16 @@ mod tests {
     #[test]
     fn compose_error_display_covers_every_variant() {
         assert_eq!(
+            ComposeError::Unsupported { backend: "apple" }.to_string(),
+            "Compose is unsupported for backend 'apple'"
+        );
+        assert_eq!(
             ComposeError::Spawn.to_string(),
-            "unable to run Docker Compose command"
+            "unable to run Compose command"
         );
         assert_eq!(
             ComposeError::Timeout.to_string(),
-            "Docker Compose command timed out"
+            "Compose command timed out"
         );
         assert_eq!(
             ComposeError::Exit {
@@ -293,15 +327,15 @@ mod tests {
                 stderr: "  boom  ".into(),
             }
             .to_string(),
-            "Docker Compose exited with status Some(2): \"boom\""
+            "Compose exited with status Some(2): \"boom\""
         );
         assert_eq!(
             ComposeError::OutputLimit.to_string(),
-            "Docker Compose output exceeded its size limit"
+            "Compose output exceeded its size limit"
         );
         assert_eq!(
             ComposeError::NotRunning.to_string(),
-            "Docker Compose started no running service"
+            "Compose started no running service"
         );
     }
 
@@ -340,13 +374,17 @@ mod tests {
 
     #[test]
     fn up_argv_includes_files_project_and_services() {
+        let target = ComposeTarget {
+            engine: vec!["docker".into(), "compose".into()],
+            placement: Placement::Local,
+        };
         let c = ComposeSpec {
             files: vec!["/a/c.yml".into(), "/a/o.yml".into()],
             service: Some("app".into()),
             run_services: vec!["db".into()],
         };
         assert_eq!(
-            up_argv("proj", &c),
+            up_argv(&target, "proj", &c),
             vec![
                 "docker", "compose", "-f", "/a/c.yml", "-f", "/a/o.yml", "-p", "proj", "up", "-d",
                 "app", "db",
@@ -356,13 +394,17 @@ mod tests {
 
     #[test]
     fn ps_argv_includes_files_project_and_service() {
+        let target = ComposeTarget {
+            engine: vec!["docker".into(), "compose".into()],
+            placement: Placement::Local,
+        };
         let c = ComposeSpec {
             files: vec!["/a/c.yml".into(), "/a/o.yml".into()],
             service: Some("app".into()),
             run_services: vec!["db".into()],
         };
         assert_eq!(
-            ps_argv("proj", &c),
+            ps_argv(&target, "proj", &c),
             vec![
                 "docker", "compose", "-f", "/a/c.yml", "-f", "/a/o.yml", "-p", "proj", "ps",
                 "--status", "running", "--quiet", "app",
@@ -517,12 +559,16 @@ mod tests {
 
     #[test]
     fn exec_argv_interactive_with_workdir() {
+        let target = ComposeTarget {
+            engine: vec!["docker".into(), "compose".into()],
+            placement: Placement::Local,
+        };
         let c = ComposeSpec {
             files: vec!["/a/c.yml".into()],
             service: Some("app".into()),
             run_services: vec![],
         };
-        let argv = exec_argv("proj", &c, Some("/work"), "exec sh", true).unwrap();
+        let argv = exec_argv(&target, "proj", &c, Some("/work"), "exec sh", true).unwrap();
         assert_eq!(
             argv,
             vec![
@@ -546,10 +592,14 @@ mod tests {
 
     #[test]
     fn exec_argv_none_without_service() {
+        let target = ComposeTarget {
+            engine: vec!["docker".into(), "compose".into()],
+            placement: Placement::Local,
+        };
         let c = ComposeSpec {
             files: vec!["c.yml".into()],
             ..Default::default()
         };
-        assert!(exec_argv("proj", &c, None, "s", true).is_none());
+        assert!(exec_argv(&target, "proj", &c, None, "s", true).is_none());
     }
 }

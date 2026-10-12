@@ -25,6 +25,75 @@ static MEDIA_OP_PENDING: LazyLock<Arc<AtomicUsize>> =
 static MEDIA_PICK_IN_FLIGHT: Mutex<Option<tokio::task::JoinHandle<()>>> = Mutex::new(None);
 static MEDIA_QUEUE_IN_FLIGHT: Mutex<Option<tokio::task::JoinHandle<()>>> = Mutex::new(None);
 static MEDIA_SOURCES_IN_FLIGHT: Mutex<Option<tokio::task::JoinHandle<()>>> = Mutex::new(None);
+static MEDIA_OP_OUTCOME: Mutex<Option<MediaOpOutcome>> = Mutex::new(None);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MediaOpOutcome {
+    Stale,
+    Refused(&'static str),
+    Failed,
+    TimedOut,
+    Busy,
+}
+
+impl MediaOpOutcome {
+    pub(crate) fn status_text(self) -> &'static str {
+        match self {
+            Self::Stale => "Media operation skipped because the player changed",
+            Self::Refused("shuffle") => "Media operation needs known shuffle state",
+            Self::Refused("loop") => "Media operation needs known loop state",
+            Self::Refused(_) => "Media operation was refused",
+            Self::Failed => "Media operation failed",
+            Self::TimedOut => "Media operation timed out",
+            Self::Busy => "Media controls are busy",
+        }
+    }
+}
+
+fn record_outcome(slot: &Mutex<Option<MediaOpOutcome>>, outcome: MediaOpOutcome) {
+    *slot.lock().unwrap_or_else(|error| error.into_inner()) = Some(outcome);
+}
+
+fn record_refusal(slot: &Mutex<Option<MediaOpOutcome>>, field: &'static str) {
+    let outcome = MediaOpOutcome::Refused(field);
+    record_outcome(slot, outcome);
+}
+
+fn take_outcome(slot: &Mutex<Option<MediaOpOutcome>>) -> Option<MediaOpOutcome> {
+    slot.lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .take()
+}
+
+fn publish_outcome(outcome: MediaOpOutcome, waker: &TerminalWaker) {
+    record_outcome(&MEDIA_OP_OUTCOME, outcome);
+    if let Err(error) = waker.wake() {
+        tracing::debug!(target: "thegn::media", %error, "media operation outcome wake failed");
+    }
+}
+
+fn pulse(waker: &TerminalWaker) {
+    if let Err(error) = waker.wake() {
+        tracing::debug!(target: "thegn::media", %error, "media operation outcome wake failed");
+    }
+}
+
+fn generation_is_current(
+    captured: u64,
+    generation: &MediaGeneration,
+    slot: &Mutex<Option<MediaOpOutcome>>,
+) -> bool {
+    if generation.current() == captured {
+        true
+    } else {
+        record_outcome(slot, MediaOpOutcome::Stale);
+        false
+    }
+}
+
+pub(crate) fn take_op_outcome() -> Option<MediaOpOutcome> {
+    take_outcome(&MEDIA_OP_OUTCOME)
+}
 
 fn replace_in_flight(
     slot: &Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -62,7 +131,56 @@ impl Drop for PendingOp {
 
 /// Queue one operation behind the current tail. The reservation bounds both
 /// running and queued work, and the tail lock defines the operation order.
+#[cfg(test)]
 fn chain_op<F>(tail: &MediaOpTail, pending: &Arc<AtomicUsize>, cap: usize, future: F) -> bool
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    chain_op_inner(tail, pending, cap, None, None, future)
+}
+
+fn chain_op_with_waker<F>(
+    tail: &MediaOpTail,
+    pending: &Arc<AtomicUsize>,
+    cap: usize,
+    waker: TerminalWaker,
+    future: F,
+) -> bool
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    chain_op_inner(
+        tail,
+        pending,
+        cap,
+        Some(waker),
+        Some(&MEDIA_OP_OUTCOME),
+        future,
+    )
+}
+
+#[cfg(test)]
+fn chain_op_with_outcome<F>(
+    tail: &MediaOpTail,
+    pending: &Arc<AtomicUsize>,
+    cap: usize,
+    outcome: &Mutex<Option<MediaOpOutcome>>,
+    future: F,
+) -> bool
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    chain_op_inner(tail, pending, cap, None, Some(outcome), future)
+}
+
+fn chain_op_inner<F>(
+    tail: &MediaOpTail,
+    pending: &Arc<AtomicUsize>,
+    cap: usize,
+    timeout_waker: Option<TerminalWaker>,
+    busy_outcome: Option<&Mutex<Option<MediaOpOutcome>>>,
+    future: F,
+) -> bool
 where
     F: Future<Output = ()> + Send + 'static,
 {
@@ -72,6 +190,9 @@ where
         })
         .is_err()
     {
+        if let Some(slot) = busy_outcome {
+            record_outcome(slot, MediaOpOutcome::Busy);
+        }
         return false;
     }
 
@@ -87,6 +208,10 @@ where
         }
         if tokio::time::timeout(MEDIA_OP_BUDGET, future).await.is_err() {
             tracing::warn!(target: "thegn::media", budget_secs = MEDIA_OP_BUDGET.as_secs(), "media operation exceeded its time budget");
+            record_outcome(&MEDIA_OP_OUTCOME, MediaOpOutcome::TimedOut);
+            if let Some(waker) = timeout_waker {
+                pulse(&waker);
+            }
         }
     }));
     true
@@ -117,14 +242,19 @@ fn delivery_from_read(
 }
 
 fn send_delivery(
-    tx: &tokio_mpsc::UnboundedSender<crate::media_watch::MediaSnapshotDelivery>,
+    tx: &crate::media_watch::SnapshotSender,
     delivery: crate::media_watch::MediaSnapshotDelivery,
 ) -> bool {
-    if tx.send(delivery).is_ok() {
-        MEDIA_DELIVERY_EPOCH.fetch_add(1, Ordering::AcqRel);
-        true
-    } else {
-        false
+    match crate::media_watch::offer(tx, delivery) {
+        Ok(true) => {
+            MEDIA_DELIVERY_EPOCH.fetch_add(1, Ordering::AcqRel);
+            true
+        }
+        Ok(false) => false,
+        Err(()) => {
+            tracing::debug!(target: "thegn::media", "media snapshot receiver closed");
+            false
+        }
     }
 }
 
@@ -219,7 +349,7 @@ pub(crate) fn media_effective_cfg(
 fn spawn_media_watch(
     cfg: thegn_core::config::MediaConfig,
     generation: u64,
-    tx: tokio_mpsc::UnboundedSender<crate::media_watch::MediaSnapshotDelivery>,
+    tx: crate::media_watch::SnapshotSender,
     waker: TerminalWaker,
     previous: Option<tokio::task::JoinHandle<()>>,
 ) -> Option<tokio::task::JoinHandle<()>> {
@@ -234,7 +364,7 @@ pub(crate) fn restart_media_watch(
     handle: &mut Option<tokio::task::JoinHandle<()>>,
     cfg: thegn_core::config::MediaConfig,
     generation: &MediaGeneration,
-    tx: &tokio_mpsc::UnboundedSender<crate::media_watch::MediaSnapshotDelivery>,
+    tx: &crate::media_watch::SnapshotSender,
     waker: &TerminalWaker,
 ) {
     let generation_value = generation.advance();
@@ -255,8 +385,9 @@ pub(crate) fn restart_media_watch(
                 generation: generation_value,
                 snapshot: None,
             },
-        ) {
-            let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
+        ) && let Err(error) = waker.wake()
+        {
+            tracing::debug!(target: "thegn::media", %error, "media clear wake failed");
         }
         return;
     }
@@ -269,20 +400,33 @@ pub(crate) fn spawn_media_op(
     cfg: thegn_core::config::MediaConfig,
     op: MediaOp,
     generation: &MediaGeneration,
-    tx: tokio_mpsc::UnboundedSender<crate::media_watch::MediaSnapshotDelivery>,
+    tx: crate::media_watch::SnapshotSender,
     waker: TerminalWaker,
 ) {
-    let generation = generation.current();
-    let accepted = chain_op(
+    let captured_generation = generation.current();
+    let generation_guard = generation.clone();
+    let outcome_waker = waker.clone();
+    let overload_waker = waker.clone();
+    let accepted = chain_op_with_waker(
         &MEDIA_OP_TAIL,
         &MEDIA_OP_PENDING,
         MAX_PENDING_MEDIA_OPS,
+        waker.clone(),
         async move {
+            if !generation_is_current(captured_generation, &generation_guard, &MEDIA_OP_OUTCOME) {
+                pulse(&outcome_waker);
+                return;
+            }
             let Some(client) = crate::media_secret::client_for(&cfg).await else {
+                publish_outcome(MediaOpOutcome::Failed, &outcome_waker);
                 return;
             };
             let cur = snapshot_or_log(&client, "preflight").await.unwrap_or(None);
             let cur_state = cur.as_ref().map(|snapshot| &snapshot.state);
+            if !generation_is_current(captured_generation, &generation_guard, &MEDIA_OP_OUTCOME) {
+                pulse(&outcome_waker);
+                return;
+            }
             let res = match op {
                 MediaOp::PlayPause => Some(client.play_pause().await),
                 MediaOp::Next => Some(client.next().await),
@@ -291,6 +435,8 @@ pub(crate) fn spawn_media_op(
                     Ok(on) => Some(client.set_shuffle(on).await),
                     Err(error) => {
                         tracing::warn!(target: "thegn::media", outcome = ?error, "media shuffle toggle preflight failed");
+                        record_refusal(&MEDIA_OP_OUTCOME, "shuffle");
+                        pulse(&outcome_waker);
                         None
                     }
                 },
@@ -298,6 +444,8 @@ pub(crate) fn spawn_media_op(
                     Ok(next) => Some(client.set_loop(next).await),
                     Err(error) => {
                         tracing::warn!(target: "thegn::media", outcome = ?error, "media loop cycle preflight failed");
+                        record_refusal(&MEDIA_OP_OUTCOME, "loop");
+                        pulse(&outcome_waker);
                         None
                     }
                 },
@@ -315,10 +463,12 @@ pub(crate) fn spawn_media_op(
             };
             if let Some(Err(e)) = res {
                 tracing::warn!(target: "thegn::media", error = %e, "media op {op:?} failed");
+                publish_outcome(MediaOpOutcome::Failed, &outcome_waker);
             }
-            if let Some(delivery) =
-                delivery_from_read(generation, snapshot_or_log(&client, "transport").await)
-                && send_delivery(&tx, delivery)
+            if let Some(delivery) = delivery_from_read(
+                captured_generation,
+                snapshot_or_log(&client, "transport").await,
+            ) && send_delivery(&tx, delivery)
                 && let Err(error) = waker.wake()
             {
                 tracing::debug!(target: "thegn::media", %error, "media transport wake failed");
@@ -327,6 +477,7 @@ pub(crate) fn spawn_media_op(
     );
     if !accepted {
         tracing::debug!(target: "thegn::media", "media operation dropped because the pending limit was reached");
+        pulse(&overload_waker);
     }
 }
 
@@ -336,7 +487,7 @@ pub(crate) fn spawn_media_action(
     cfg: thegn_core::config::MediaConfig,
     action: crate::panel::MediaAction,
     generation: &MediaGeneration,
-    tx: tokio_mpsc::UnboundedSender<crate::media_watch::MediaSnapshotDelivery>,
+    tx: crate::media_watch::SnapshotSender,
     waker: TerminalWaker,
 ) {
     let op = match action {
@@ -362,31 +513,49 @@ pub(crate) fn spawn_media_playlist(
     cfg: thegn_core::config::MediaConfig,
     id: String,
     generation: &MediaGeneration,
-    tx: tokio_mpsc::UnboundedSender<crate::media_watch::MediaSnapshotDelivery>,
+    tx: crate::media_watch::SnapshotSender,
     waker: TerminalWaker,
 ) {
-    let generation = generation.current();
-    let accepted = chain_op(
+    let captured_generation = generation.current();
+    let generation_guard = generation.clone();
+    let outcome_waker = waker.clone();
+    let overload_waker = waker.clone();
+    let accepted = chain_op_with_waker(
         &MEDIA_OP_TAIL,
         &MEDIA_OP_PENDING,
         MAX_PENDING_MEDIA_OPS,
+        waker.clone(),
         async move {
+            if !generation_is_current(captured_generation, &generation_guard, &MEDIA_OP_OUTCOME) {
+                pulse(&outcome_waker);
+                return;
+            }
             if let Some(client) = crate::media_secret::client_for(&cfg).await {
+                if !generation_is_current(captured_generation, &generation_guard, &MEDIA_OP_OUTCOME)
+                {
+                    pulse(&outcome_waker);
+                    return;
+                }
                 if let Err(e) = client.activate_playlist(&id).await {
                     tracing::warn!(target: "thegn::media", error = %e, "playlist {id} activation failed");
+                    publish_outcome(MediaOpOutcome::Failed, &outcome_waker);
                 }
-                if let Some(delivery) =
-                    delivery_from_read(generation, snapshot_or_log(&client, "playlist").await)
-                    && send_delivery(&tx, delivery)
+                if let Some(delivery) = delivery_from_read(
+                    captured_generation,
+                    snapshot_or_log(&client, "playlist").await,
+                ) && send_delivery(&tx, delivery)
                     && let Err(error) = waker.wake()
                 {
                     tracing::debug!(target: "thegn::media", %error, "media playlist wake failed");
                 }
+            } else {
+                publish_outcome(MediaOpOutcome::Failed, &outcome_waker);
             }
         },
     );
     if !accepted {
         tracing::debug!(target: "thegn::media", "playlist activation dropped because the pending limit was reached");
+        pulse(&overload_waker);
     }
 }
 
@@ -469,8 +638,9 @@ pub(crate) fn spawn_media_sources(
 #[cfg(test)]
 mod tests {
     use super::{
-        MediaPreflightError, chain_op, delivery_from_read, loop_target, replace_in_flight,
-        shuffle_target, within_media_budget,
+        MediaGeneration, MediaOpOutcome, MediaPreflightError, chain_op, chain_op_with_outcome,
+        delivery_from_read, generation_is_current, loop_target, record_refusal, replace_in_flight,
+        shuffle_target, take_outcome, within_media_budget,
     };
     use std::sync::atomic::AtomicUsize;
     use std::sync::{Arc, Mutex};
@@ -579,6 +749,58 @@ mod tests {
         let last = tail.lock().unwrap().take().unwrap();
         last.await.unwrap();
         assert_eq!(pending.load(std::sync::atomic::Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn stale_generation_is_reported_before_the_effect_can_run() {
+        let generation = MediaGeneration::new();
+        let captured = generation.current();
+        generation.advance();
+        let outcome = Mutex::new(None);
+        let mut effect_ran = false;
+        if generation_is_current(captured, &generation, &outcome) {
+            effect_ran = true;
+        }
+        assert!(!effect_ran);
+        assert_eq!(take_outcome(&outcome), Some(MediaOpOutcome::Stale));
+    }
+
+    #[test]
+    fn refused_preflight_is_available_as_a_user_outcome() {
+        let outcome = Mutex::new(None);
+        record_refusal(&outcome, "shuffle");
+        assert_eq!(
+            take_outcome(&outcome),
+            Some(MediaOpOutcome::Refused("shuffle"))
+        );
+    }
+
+    #[tokio::test]
+    async fn full_queue_records_busy_outcome() {
+        let tail = Arc::new(Mutex::new(None));
+        let pending = Arc::new(AtomicUsize::new(0));
+        let outcome = Mutex::new(None);
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        assert!(chain_op_with_outcome(
+            &tail,
+            &pending,
+            1,
+            &outcome,
+            async move {
+                release_rx.await.unwrap();
+            }
+        ));
+        assert!(!chain_op_with_outcome(
+            &tail,
+            &pending,
+            1,
+            &outcome,
+            async {}
+        ));
+        assert_eq!(take_outcome(&outcome), Some(MediaOpOutcome::Busy));
+        release_tx.send(()).unwrap();
+        let last = tail.lock().unwrap().take().unwrap();
+        last.await.unwrap();
     }
 
     #[tokio::test(start_paused = true)]

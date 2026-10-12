@@ -78,6 +78,11 @@ pub fn rejection_total() -> u64 {
     REJECTIONS_TOTAL.load(Ordering::Relaxed)
 }
 
+/// Clamp a configured connection count to Tokio's maximum semaphore capacity.
+pub fn clamp_permits(n: usize) -> usize {
+    n.min(Semaphore::MAX_PERMITS)
+}
+
 async fn reap_finished(tasks: &ConnectionTasks) {
     let mut tasks = tasks.lock().await;
     while tasks.try_join_next().is_some() {}
@@ -390,6 +395,27 @@ where
     .await
 }
 
+/// Run the host endpoint with configured per-tunnel and shared process-wide caps.
+pub async fn run_host_with_caps<S, D>(
+    stream: S,
+    dialer: D,
+    max_connections: usize,
+    global_permits: Arc<Semaphore>,
+) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    D: Dialer,
+{
+    run_host_with_admission(
+        stream,
+        dialer,
+        max_connections,
+        global_permits,
+        DIAL_TIMEOUT,
+    )
+    .await
+}
+
 async fn run_host_with_admission<S, D>(
     stream: S,
     dialer: D,
@@ -404,7 +430,7 @@ where
     let (rd, wr) = tokio::io::split(stream);
     let (sink, sink_task) = spawn_sink(wr);
     let conns: Conns = Arc::new(Mutex::new(HashMap::new()));
-    let permits = Arc::new(Semaphore::new(max_connections));
+    let permits = Arc::new(Semaphore::new(clamp_permits(max_connections)));
     let rejections = Arc::new(AtomicUsize::new(0));
     let tasks: ConnectionTasks = Arc::new(Mutex::new(JoinSet::new()));
     let conns2 = conns.clone();
@@ -977,6 +1003,49 @@ mod tests {
                 .unwrap()
                 .unwrap();
         }
+    }
+
+    #[test]
+    fn permit_counts_clamp_to_tokio_limit() {
+        assert_eq!(clamp_permits(usize::MAX), Semaphore::MAX_PERMITS);
+    }
+
+    #[tokio::test]
+    async fn configured_host_cap_rejects_excess_open_and_recovers() {
+        let (host, mut peer) = tokio::io::duplex(16 * 1024);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (far_tx, mut far_rx) = tokio::sync::mpsc::unbounded_channel();
+        let task = tokio::spawn(run_host_with_caps(
+            host,
+            HoldingDialer {
+                calls: calls.clone(),
+                far_ends: far_tx,
+            },
+            2,
+            Arc::new(Semaphore::new(2)),
+        ));
+
+        send_opens(&mut peer, &[1, 2, 3]).await;
+        let far_one = tokio::time::timeout(std::time::Duration::from_secs(2), far_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let far_two = tokio::time::timeout(std::time::Duration::from_secs(2), far_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut decoder = FrameDecoder::new();
+        assert_eq!(next_frame(&mut peer, &mut decoder).await, Frame::Close(3));
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+
+        drop(far_one);
+        drop(far_two);
+        drop(peer);
+        tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .expect("host did not stop after peer disconnect")
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]

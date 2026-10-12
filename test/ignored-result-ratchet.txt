@@ -274,7 +274,6 @@ crates/thegn-host/src/mcp_proxy/upstream.rs
 crates/thegn-host/src/measure/disk.rs
 crates/thegn-host/src/measure/loc.rs
 crates/thegn-host/src/measure/mod.rs
-crates/thegn-host/src/media_art.rs
 crates/thegn-host/src/media_ctl.rs
 crates/thegn-host/src/menu.rs
 crates/thegn-host/src/merge_cleanup.rs
@@ -312,7 +311,6 @@ crates/thegn-host/src/provision_gate.rs
 crates/thegn-host/src/pty_drain.rs
 crates/thegn-host/src/push_notify.rs
 crates/thegn-host/src/queries.rs
-crates/thegn-host/src/rasterize.rs
 crates/thegn-host/src/remote_poll.rs
 crates/thegn-host/src/replay_overlay.rs
 crates/thegn-host/src/repo_index.rs

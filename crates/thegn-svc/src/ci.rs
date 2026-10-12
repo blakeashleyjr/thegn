@@ -38,6 +38,7 @@ const GITLAB_JOBS_MAX_PAGES: usize = 50;
 const GITLAB_JOBS_MAX_ROWS: usize = GITLAB_JOBS_PAGE_SIZE * GITLAB_JOBS_MAX_PAGES;
 const GITLAB_JOBS_MAX_BYTES: usize = 4 * 1024 * 1024;
 const CI_CLI_TIMEOUT: Duration = Duration::from_secs(30);
+const CI_LOG_TIMEOUT: Duration = Duration::from_secs(60);
 const CI_CLI_MAX_STDOUT: usize = 8 * 1024 * 1024;
 const CI_CLI_MAX_STDERR: usize = 64 * 1024;
 
@@ -289,7 +290,7 @@ fn run_cli_within(
     mut cmd: Command,
     limits: crate::issue::gh_run::Limits,
 ) -> Result<String, CiError> {
-    use crate::issue::gh_run::{RunError, run_blocking};
+    use crate::issue::gh_run::run_blocking;
     use crate::plugin::proc::bounded_group_termination_supported;
 
     if !bounded_group_termination_supported() {
@@ -307,14 +308,19 @@ fn run_cli_within(
     }
 
     let cancel = AtomicBool::new(false);
-    run_blocking(cmd, limits, &cancel).map_err(|error| match error {
+    run_blocking(cmd, limits, &cancel).map_err(ci_run_error)
+}
+
+fn ci_run_error(error: crate::issue::gh_run::RunError) -> CiError {
+    use crate::issue::gh_run::RunError;
+    match error {
         RunError::NotInstalled => CiError::NotInstalled,
         RunError::Exit { stderr, .. } => classify_stderr(&stderr),
         RunError::Timeout => CiError::Other("CI provider command timed out".into()),
         RunError::Truncated => CiError::Other("provider output byte budget exhausted".into()),
         RunError::Io(message) => CiError::Other(format!("CI provider command failed: {message}")),
         RunError::Cancelled => CiError::Other("CI provider command cancelled".into()),
-    })
+    }
 }
 
 /// Read no more than `max` bytes, probing one additional byte only to detect
@@ -410,7 +416,38 @@ fn run_cli_capped(cmd: Command, max: usize) -> Result<String, CiError> {
 /// reader instead and keep a bounded deque; stderr is drained concurrently so
 /// a noisy failed provider cannot deadlock the child.  The status and error
 /// classification remain identical to [`run_cli`].
-fn run_bounded_log(cmd: &mut Command) -> Result<CiLog, CiError> {
+fn run_bounded_log(cmd: Command) -> Result<CiLog, CiError> {
+    run_bounded_log_within(
+        cmd,
+        crate::issue::gh_run::Limits {
+            timeout: CI_LOG_TIMEOUT,
+            // Streaming consumers own stdout retention; the streaming runner
+            // does not use this stdout limit, but Limits keeps it explicit.
+            max_stdout: PROVIDER_LOG_MAX_BYTES,
+            max_stderr: CI_CLI_MAX_STDERR,
+        },
+    )
+}
+
+fn run_bounded_log_within(
+    cmd: Command,
+    limits: crate::issue::gh_run::Limits,
+) -> Result<CiLog, CiError> {
+    use crate::issue::gh_run::run_blocking_streaming;
+    use crate::plugin::proc::bounded_group_termination_supported;
+
+    if bounded_group_termination_supported() {
+        let cancel = AtomicBool::new(false);
+        let (log_result, _status) =
+            run_blocking_streaming(cmd, limits, &cancel, |reader: &mut dyn Read| {
+                collect_log(reader)
+            })
+            .map_err(ci_run_error)?;
+        let (text, truncated) = log_result?;
+        return Ok(CiLog { text, truncated });
+    }
+
+    let mut cmd = cmd;
     let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -868,7 +905,7 @@ impl CiProvider for GithubCi {
         // `gh run view --job <id> --log` (job ids are globally addressable).
         validate_ci_id(_run_id)?;
         validate_ci_id(job_id)?;
-        run_bounded_log(&mut self.command(loc, &["run", "view", "--job", job_id, "--log"])?)
+        run_bounded_log(self.command(loc, &["run", "view", "--job", job_id, "--log"])?)
     }
 
     fn workflows(&self, loc: &GitLoc) -> Result<Vec<CiWorkflow>, CiError> {
@@ -1290,7 +1327,7 @@ impl CiProvider for GitlabCi {
         let remote = self.remote(loc)?;
         let proj = Self::project_seg(&remote);
         let endpoint = gitlab_job_trace_endpoint(&proj, job_id)?;
-        run_bounded_log(&mut self.command(loc, &remote, &["api", &endpoint])?)
+        run_bounded_log(self.command(loc, &remote, &["api", &endpoint])?)
     }
 
     fn workflows(&self, _loc: &GitLoc) -> Result<Vec<CiWorkflow>, CiError> {
@@ -1654,6 +1691,62 @@ mod tests {
         );
         assert!(result.is_ok());
         assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn bounded_log_times_out_a_hung_provider() {
+        if !bounded_shell_available() {
+            return;
+        }
+        let start = std::time::Instant::now();
+        let result = run_bounded_log_within(
+            {
+                let mut cmd = Command::new("sh");
+                cmd.args(["-c", "sleep 30"]);
+                cmd
+            },
+            test_limits(Duration::from_millis(200), 1024),
+        );
+        assert!(
+            matches!(result, Err(CiError::Other(message)) if message == "CI provider command timed out")
+        );
+        assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn bounded_log_reaps_pipe_holding_descendants() {
+        if !bounded_shell_available() {
+            return;
+        }
+        let start = std::time::Instant::now();
+        let result = run_bounded_log_within(
+            {
+                let mut cmd = Command::new("sh");
+                cmd.args(["-c", "sleep 30 & printf 'a\\nb\\n'"]);
+                cmd
+            },
+            test_limits(Duration::from_secs(2), 1024),
+        );
+        let log = result.expect("bounded log should finish after killing the descendant");
+        assert_eq!(log.text, "a\nb\n");
+        assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn bounded_log_classifies_nonzero_exit_like_bounded_cli() {
+        if !bounded_shell_available() {
+            return;
+        }
+        let script = "printf 'fatal: authentication required\\n' >&2; exit 1";
+        let mut cli = Command::new("sh");
+        cli.args(["-c", script]);
+        let cli_error = run_cli_within(cli, test_limits(Duration::from_secs(2), 1024))
+            .expect_err("provider command should fail");
+        let mut log = Command::new("sh");
+        log.args(["-c", script]);
+        let log_error = run_bounded_log_within(log, test_limits(Duration::from_secs(2), 1024))
+            .expect_err("provider log command should fail");
+        assert_eq!(log_error, cli_error);
     }
 
     #[test]

@@ -6683,6 +6683,7 @@ async fn event_loop<T: Terminal>(
     // media section would otherwise full-recompose the chrome per tick → flicker.
     // Repaint it at most ~1/s; the snapshot data is updated every tick regardless.
     let mut last_media_full: Option<std::time::Instant> = None;
+    let mut media_art_was_visible = false;
     // Throttle the main-checkout self-heal: a `MainRefMoved` can arrive from the
     // ref fs-watcher and the coarse ticker back-to-back; only kick the off-loop
     // heal at most ~every 2s so rapid ref churn can't spawn a `git` probe storm.
@@ -7319,7 +7320,7 @@ async fn event_loop<T: Terminal>(
     // reload and player-override changes. `media_player_override` is the runtime
     // "Select player" choice.
     let (media_tx, mut media_rx) =
-        tokio_mpsc::unbounded_channel::<crate::media_watch::MediaSnapshotDelivery>();
+        tokio::sync::watch::channel::<Option<crate::media_watch::MediaSnapshotDelivery>>(None);
     let (media_pick_tx, mut media_pick_rx) = tokio_mpsc::unbounded_channel::<MediaPick>();
     // Explicit clipboard-image paste (THE-24): the off-loop worker reads/gates/
     // drops the image and sends the pane + path to paste (or a status message).
@@ -7336,7 +7337,7 @@ async fn event_loop<T: Terminal>(
         tokio_mpsc::unbounded_channel::<crate::panel::media::MediaSourcesDelivery>();
     let mut media_caps: Option<thegn_core::media::MediaCaps> = None;
     let (media_art_tx, mut media_art_rx) =
-        tokio_mpsc::unbounded_channel::<crate::media_art::ArtMosaic>();
+        tokio::sync::watch::channel::<Option<crate::media_art::ArtMosaic>>(None);
     let mut media_player_override: Option<String> = None;
     let media_generation = MediaGeneration::new();
     let mut media_watch: Option<tokio::task::JoinHandle<()>> = None;
@@ -11906,6 +11907,11 @@ async fn event_loop<T: Terminal>(
         // ticks don't storm the chrome) is documented on `drain_snapshots`.
         let media_position_visible =
             chrome.panel.is_some() && panel_ui.open == crate::panel::Section::Media;
+        if media_art_was_visible && !media_position_visible {
+            crate::media_art::cancel_in_flight();
+            panel_ui.media.cancel_art_request();
+        }
+        media_art_was_visible = media_position_visible;
         let (media_full, media_bars) = crate::media_watch::drain_snapshots(
             &mut media_rx,
             &mut loop_perf,
@@ -11916,6 +11922,10 @@ async fn event_loop<T: Terminal>(
             media_position_visible,
             &mut last_media_full,
         );
+        if let Some(outcome) = crate::media_ctl::take_op_outcome() {
+            model.status = outcome.status_text().into();
+            dirty = true;
+        }
         panel_ui.media.sync_snapshot(
             model.panel.media.as_ref(),
             media_caps,
@@ -11941,10 +11951,12 @@ async fn event_loop<T: Terminal>(
                 spawn_media_sources(cfg, request, media_sources_tx.clone(), waker.clone());
             }
         }
-        if let Some(url) = panel_ui
-            .media
-            .wants_art(model.panel.media.as_ref(), current_config.media.show_art)
-        {
+        if let Some(url) = crate::handlers::media_panel::art_request(
+            &mut panel_ui.media,
+            model.panel.media.as_ref(),
+            current_config.media.show_art,
+            media_position_visible,
+        ) {
             crate::media_art::spawn_fetch(url, 18, 8, media_art_tx.clone(), waker.clone());
         }
         dirty |= media_full;
@@ -11997,7 +12009,12 @@ async fn event_loop<T: Terminal>(
             );
             dirty = true;
         }
-        while let Ok(art) = media_art_rx.try_recv() {
+        let art = if matches!(media_art_rx.has_changed(), Ok(true)) {
+            media_art_rx.borrow_and_update().clone()
+        } else {
+            None
+        };
+        if let Some(art) = art {
             loop_perf.tick(crate::perf::WakeSource::Refresh);
             panel_ui.media.set_art(model.panel.media.as_ref(), art);
             dirty = true;
@@ -12220,6 +12237,8 @@ async fn event_loop<T: Terminal>(
                         &media_tx,
                         &waker,
                     );
+                    crate::media_art::cancel_in_flight();
+                    panel_ui.media.cancel_art_request();
                     // Live `[[plugins]]` reload: tear the running set down
                     // (deactivate + kill) and start fresh from the reloaded
                     // specs — the documented way to deliberately restart a
