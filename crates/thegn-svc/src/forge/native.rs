@@ -423,6 +423,7 @@ static HTTP_RUNTIME: OnceLock<Result<tokio::runtime::Runtime, String>> = OnceLoc
 struct GhCircuit {
     failures: std::sync::atomic::AtomicU32,
     open_until: std::sync::Mutex<Option<std::time::Instant>>,
+    open_error: std::sync::Mutex<Option<ForgeError>>,
 }
 
 impl GhCircuit {
@@ -430,18 +431,39 @@ impl GhCircuit {
         Self {
             failures: std::sync::atomic::AtomicU32::new(0),
             open_until: std::sync::Mutex::new(None),
+            open_error: std::sync::Mutex::new(None),
         }
     }
 
-    /// Returns `true` if the circuit is open (skip native HTTP this call).
-    fn is_open(&self) -> bool {
+    fn active_error(&self) -> Option<ForgeError> {
         let guard = self.open_until.lock().unwrap_or_else(|e| e.into_inner());
-        guard.is_some_and(|until| std::time::Instant::now() < until)
+        let is_open = guard.is_some_and(|until| std::time::Instant::now() < until);
+        drop(guard);
+        if is_open {
+            self.open_error
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        } else {
+            None
+        }
+    }
+
+    fn open_for(&self, delay: std::time::Duration, error: ForgeError) {
+        if let Ok(mut guard) = self.open_error.lock() {
+            *guard = Some(error);
+        }
+        if let Ok(mut guard) = self.open_until.lock() {
+            *guard = Some(std::time::Instant::now() + delay);
+        }
     }
 
     fn record_success(&self) {
         self.failures.store(0, std::sync::atomic::Ordering::Relaxed);
         if let Ok(mut g) = self.open_until.lock() {
+            *g = None;
+        }
+        if let Ok(mut g) = self.open_error.lock() {
             *g = None;
         }
         // A GitHub round trip succeeded — the app is online.
@@ -456,11 +478,10 @@ impl GhCircuit {
             .failures
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if prev + 1 >= CIRCUIT_OPEN_AFTER {
-            if let Ok(mut g) = self.open_until.lock() {
-                *g = Some(
-                    std::time::Instant::now() + std::time::Duration::from_secs(CIRCUIT_OPEN_SECS),
-                );
-            }
+            self.open_for(
+                std::time::Duration::from_secs(CIRCUIT_OPEN_SECS),
+                ForgeError::NotConfigured("GitHub backoff active after transport failures".into()),
+            );
             tracing::warn!(
                 target: "thegn::forge",
                 consecutive_failures = prev + 1,
@@ -470,26 +491,20 @@ impl GhCircuit {
         }
     }
 
-    fn record_backoff(&self, delay: std::time::Duration) {
+    fn record_backoff(&self, delay: std::time::Duration, error: ForgeError) {
         self.failures
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if let Ok(mut guard) = self.open_until.lock() {
-            *guard = Some(std::time::Instant::now() + delay);
-        }
+        self.open_for(delay, error);
         thegn_core::connectivity::report_success();
     }
 
-    fn record_http_failure(&self) {
+    fn record_http_failure(&self, error: ForgeError) {
         let failures = self
             .failures
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             + 1;
         if failures >= CIRCUIT_OPEN_AFTER {
-            if let Ok(mut guard) = self.open_until.lock() {
-                *guard = Some(
-                    std::time::Instant::now() + std::time::Duration::from_secs(CIRCUIT_OPEN_SECS),
-                );
-            }
+            self.open_for(std::time::Duration::from_secs(CIRCUIT_OPEN_SECS), error);
         }
         // An HTTP error is still evidence that GitHub is reachable.
         thegn_core::connectivity::report_success();
@@ -506,14 +521,20 @@ fn circuit_for(token: &str) -> Arc<GhCircuit> {
     if let Some(circuit) = circuits.get(&key) {
         return Arc::clone(circuit);
     }
-    if circuits.len() >= MAX_CIRCUITS {
-        if let Some(evicted) = circuits.keys().next().copied() {
-            circuits.remove(&evicted);
-        }
+    if circuits.len() >= MAX_CIRCUITS
+        && let Some(evicted) = circuits.keys().next().copied()
+    {
+        circuits.remove(&evicted);
     }
     let circuit = Arc::new(GhCircuit::new());
     circuits.insert(key, Arc::clone(&circuit));
     circuit
+}
+
+fn any_open_circuit_error() -> Option<ForgeError> {
+    let circuits = CIRCUITS.get()?;
+    let circuits = circuits.lock().unwrap_or_else(|error| error.into_inner());
+    circuits.values().find_map(|circuit| circuit.active_error())
 }
 
 fn shared_http_client() -> Result<&'static reqwest::Client, ForgeError> {
@@ -583,6 +604,9 @@ impl GithubNative {
                 "native layer is local-only".into(),
             ));
         }
+        if let Some(error) = any_open_circuit_error() {
+            return Err(error);
+        }
         let Some((owner, repo)) = self.owner_repo(loc) else {
             return Err(ForgeError::NotConfigured(
                 "origin is not a public GitHub remote".into(),
@@ -591,8 +615,8 @@ impl GithubNative {
         let Some(token) = token() else {
             return Err(ForgeError::NotConfigured("no GitHub token".into()));
         };
-        if circuit_for(&token).is_open() {
-            return Err(ForgeError::NotConfigured("GitHub backoff active".into()));
+        if let Some(error) = circuit_for(&token).active_error() {
+            return Err(error);
         }
         Ok((token, owner, repo))
     }
@@ -607,6 +631,9 @@ impl GithubNative {
                 "native layer is local-only".into(),
             ));
         }
+        if let Some(error) = any_open_circuit_error() {
+            return Err(error);
+        }
         let Some((origin_owner, origin_repo)) = self.owner_repo(loc) else {
             return Err(ForgeError::NotConfigured(
                 "origin is not a public GitHub remote".into(),
@@ -615,8 +642,8 @@ impl GithubNative {
         let Some(token) = token() else {
             return Err(ForgeError::NotConfigured("no GitHub token".into()));
         };
-        if circuit_for(&token).is_open() {
-            return Err(ForgeError::NotConfigured("GitHub backoff active".into()));
+        if let Some(error) = circuit_for(&token).active_error() {
+            return Err(error);
         }
         let scope = checkout_scope(loc)?;
         let Some((scope_origin_owner, scope_origin_repo)) = github_parts(&scope.origin) else {
@@ -673,8 +700,8 @@ async fn graphql_request(
     use crate::issue::IssueError;
     use reqwest::Method;
 
-    if health.is_open() {
-        return Err(ForgeError::RateLimited);
+    if let Some(error) = health.active_error() {
+        return Err(error);
     }
     let mut operation = client.operation();
     let envelope = match operation.json_envelope(Method::POST, "graphql", body).await {
@@ -703,9 +730,10 @@ async fn graphql_request(
             });
         let rate_limited = code == 429
             || (code == 403
-                && (body_message
-                    .as_deref()
-                    .is_some_and(|message| message.to_ascii_lowercase().contains("rate limit"))
+                && (envelope.headers.contains_key(reqwest::header::RETRY_AFTER)
+                    || body_message.as_deref().is_some_and(|message| {
+                        message.to_ascii_lowercase().contains("rate limit")
+                    })
                     || envelope
                         .headers
                         .get("x-ratelimit-remaining")
@@ -721,10 +749,12 @@ async fn graphql_request(
             }
         };
         if matches!(code, 401 | 403 | 429) {
-            if let Some(delay) = retry_delay(&envelope.headers) {
-                health.record_backoff(delay);
+            if let Some(delay) =
+                retry_delay(&envelope.headers, matches!(&error, ForgeError::RateLimited))
+            {
+                health.record_backoff(delay, error.clone());
             } else {
-                health.record_http_failure();
+                health.record_http_failure(error.clone());
             }
         }
         tracing::warn!(target: "thegn::forge", op = what, error = %error,
@@ -759,7 +789,10 @@ async fn graphql_request(
     Ok(response)
 }
 
-fn retry_delay(headers: &reqwest::header::HeaderMap) -> Option<std::time::Duration> {
+fn retry_delay(
+    headers: &reqwest::header::HeaderMap,
+    rate_limited: bool,
+) -> Option<std::time::Duration> {
     let retry_after = headers.get(reqwest::header::RETRY_AFTER).and_then(|value| {
         let value = value.to_str().ok()?.trim();
         if let Ok(seconds) = value.parse::<u64>() {
@@ -780,6 +813,12 @@ fn retry_delay(headers: &reqwest::header::HeaderMap) -> Option<std::time::Durati
         .get("x-ratelimit-reset")
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<u64>().ok())
+        .filter(|_| {
+            rate_limited
+                || headers
+                    .get("x-ratelimit-remaining")
+                    .is_some_and(|value| value.as_bytes() == b"0")
+        })
         .and_then(|epoch| {
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
