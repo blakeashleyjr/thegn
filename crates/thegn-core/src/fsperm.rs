@@ -6,7 +6,7 @@
 //! inheritance-protected DACL so pre-existing explicit grants cannot survive.
 
 use std::io::Write;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Create a file or directory symlink using the platform's native API.
@@ -271,9 +271,9 @@ pub fn sync_parent_dir(_parent: &Path) -> std::io::Result<()> {
 /// `symlink_metadata` after creation, so a symlink that `create_dir_all`
 /// followed is still caught) and, on Unix, a directory owned by another user.
 /// A directory we own is tightened to 0700 (Windows: owner-only DACL). Only
-/// `path` itself is vetted: ancestors, hardlinks and later replacement of the
-/// directory are out of scope (the caller's threat model is a hostile entry
-/// inside the directory, not a hostile parent).
+/// `path` itself is vetted: ancestors and later replacement of the directory
+/// are out of scope. Use [`ensure_private_dir_beneath`] when the ancestor path
+/// can be hostile or replaced concurrently.
 pub fn ensure_private_dir(path: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(path)?;
     let meta = std::fs::symlink_metadata(path)?;
@@ -300,6 +300,221 @@ pub fn ensure_private_dir(path: &Path) -> std::io::Result<()> {
         }
     }
     restrict_dir_to_owner(path)
+}
+
+/// A private directory held open so later operations stay anchored to the
+/// directory inode even if one of its ancestors is renamed or replaced.
+#[derive(Debug)]
+pub struct PrivateDir {
+    path: PathBuf,
+    #[cfg(unix)]
+    fd: std::os::fd::OwnedFd,
+}
+
+impl PrivateDir {
+    /// Atomically publish owner-only bytes under one filename in this
+    /// directory. Publication uses the held directory descriptor and never
+    /// resolves an ancestor again.
+    pub fn write_owner_only_atomic(&self, name: &str, bytes: &[u8]) -> std::io::Result<PathBuf> {
+        #[cfg(unix)]
+        {
+            use nix::fcntl::{OFlag, openat};
+            use nix::sys::stat::{Mode, fchmod};
+            use nix::unistd::{UnlinkatFlags, renameat, unlinkat};
+            let name_path = Path::new(name);
+            let mut components = name_path.components();
+            let Some(Component::Normal(component)) = components.next() else {
+                return Err(invalid_private_name());
+            };
+            if components.next().is_some() {
+                return Err(invalid_private_name());
+            }
+            let name = Path::new(component);
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let nonce = NEXT.fetch_add(1, Ordering::Relaxed);
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0);
+            let temporary = format!(".secret.tmp-{}-{nanos}-{nonce}", std::process::id());
+            let fd = openat(
+                &self.fd,
+                temporary.as_str(),
+                OFlag::O_CREAT
+                    | OFlag::O_EXCL
+                    | OFlag::O_NOFOLLOW
+                    | OFlag::O_WRONLY
+                    | OFlag::O_CLOEXEC,
+                Mode::from_bits_truncate(0o600),
+            )
+            .map_err(nix_io_error)?;
+            if let Err(error) = fchmod(&fd, Mode::from_bits_truncate(0o600)) {
+                if let Err(cleanup_error) =
+                    unlinkat(&self.fd, temporary.as_str(), UnlinkatFlags::NoRemoveDir)
+                {
+                    tracing::debug!(%cleanup_error, "failed to remove unprotected private file");
+                }
+                return Err(nix_io_error(error));
+            }
+            let mut file = std::fs::File::from(fd);
+            let write_result = file.write_all(bytes).and_then(|()| file.sync_all());
+            if let Err(error) = write_result {
+                if let Err(cleanup_error) =
+                    unlinkat(&self.fd, temporary.as_str(), UnlinkatFlags::NoRemoveDir)
+                {
+                    tracing::debug!(%cleanup_error, "failed to remove incomplete private file");
+                }
+                return Err(error);
+            }
+            if let Err(error) = renameat(&self.fd, temporary.as_str(), &self.fd, name) {
+                if let Err(cleanup_error) =
+                    unlinkat(&self.fd, temporary.as_str(), UnlinkatFlags::NoRemoveDir)
+                {
+                    tracing::debug!(%cleanup_error, "failed to remove unpublished private file");
+                }
+                return Err(nix_io_error(error));
+            }
+            Ok(self.path.join(name))
+        }
+        #[cfg(not(unix))]
+        {
+            let name_path = Path::new(name);
+            if !matches!(
+                name_path.components().collect::<Vec<_>>().as_slice(),
+                [Component::Normal(_)]
+            ) {
+                return Err(invalid_private_name());
+            }
+            let path = self.path.join(name_path);
+            write_owner_only_atomic(&path, bytes)?;
+            Ok(path)
+        }
+    }
+}
+
+/// Create and open a private directory by walking `rel` beneath `anchor`.
+/// The anchor is trusted and may itself resolve through a symlink; each
+/// component below it is opened without following links and remains pinned.
+pub fn ensure_private_dir_beneath(anchor: &Path, rel: &Path) -> std::io::Result<PrivateDir> {
+    validate_relative_directory(rel)?;
+    #[cfg(unix)]
+    {
+        use nix::fcntl::{OFlag, open, openat};
+        use nix::sys::stat::{Mode, SFlag, fchmod, fstat};
+        use nix::unistd::{geteuid, mkdirat};
+        use std::os::fd::OwnedFd;
+
+        let components = rel.components().collect::<Vec<_>>();
+        let mut current: OwnedFd = open(
+            anchor,
+            OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(nix_io_error)?;
+        for (index, component) in components.iter().enumerate() {
+            let Component::Normal(name) = component else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "relative directory must contain only normal path components",
+                ));
+            };
+            let name = *name;
+            let opened = match openat(
+                &current,
+                name,
+                OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+                Mode::empty(),
+            ) {
+                Ok(fd) => fd,
+                Err(nix::errno::Errno::ENOENT) => {
+                    match mkdirat(&current, name, Mode::from_bits_truncate(0o700)) {
+                        Ok(()) | Err(nix::errno::Errno::EEXIST) => {}
+                        Err(error) => return Err(nix_io_error(error)),
+                    }
+                    openat(
+                        &current,
+                        name,
+                        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+                        Mode::empty(),
+                    )
+                    .map_err(map_directory_open_error)?
+                }
+                Err(error) => return Err(map_directory_open_error(error)),
+            };
+            let stat = fstat(&opened).map_err(nix_io_error)?;
+            if !SFlag::from_bits_truncate(stat.st_mode).contains(SFlag::S_IFDIR) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("{} is not a directory", name.to_string_lossy()),
+                ));
+            }
+            if stat.st_uid != geteuid().as_raw() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!("{} is owned by another user", name.to_string_lossy()),
+                ));
+            }
+            if index + 1 < components.len() && stat.st_mode & 0o022 != 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!("{} is group/other writable", name.to_string_lossy()),
+                ));
+            }
+            if index + 1 == components.len() {
+                fchmod(&opened, Mode::from_bits_truncate(0o700)).map_err(nix_io_error)?;
+            }
+            current = opened;
+        }
+        Ok(PrivateDir {
+            path: anchor.join(rel),
+            fd: current,
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let path = anchor.join(rel);
+        ensure_private_dir(&path)?;
+        Ok(PrivateDir { path })
+    }
+}
+
+fn invalid_private_name() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        "name must be a single normal path component",
+    )
+}
+
+fn validate_relative_directory(rel: &Path) -> std::io::Result<()> {
+    let components = rel.components().collect::<Vec<_>>();
+    if components.is_empty()
+        || components
+            .iter()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "relative directory must contain only normal path components",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn nix_io_error(error: nix::errno::Errno) -> std::io::Error {
+    std::io::Error::from_raw_os_error(error as i32)
+}
+
+#[cfg(unix)]
+fn map_directory_open_error(error: nix::errno::Errno) -> std::io::Error {
+    if matches!(error, nix::errno::Errno::ELOOP | nix::errno::Errno::ENOTDIR) {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "path component is a symlink or not a directory",
+        )
+    } else {
+        nix_io_error(error)
+    }
 }
 
 /// Atomically replace `path` with owner-only contents.
@@ -472,6 +687,171 @@ Set-Acl -LiteralPath $path -AclObject $acl"#
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn private_dir_beneath_creates_owner_only_components() {
+        let anchor = tempfile::tempdir().unwrap();
+        let dir = ensure_private_dir_beneath(anchor.path(), Path::new("a/b")).unwrap();
+        assert_eq!(mode_bits(&anchor.path().join("a/b")).unwrap(), Some(0o700));
+        assert_eq!(mode_bits(&dir.path).unwrap(), Some(0o700));
+    }
+
+    #[test]
+    fn private_dir_beneath_allows_a_trusted_symlinked_anchor() {
+        let anchor = tempfile::tempdir().unwrap();
+        let link_parent = tempfile::tempdir().unwrap();
+        let link = link_parent.path().join("anchor");
+        std::os::unix::fs::symlink(anchor.path(), &link).unwrap();
+        ensure_private_dir_beneath(&link, Path::new("secrets")).unwrap();
+        assert_eq!(
+            mode_bits(&anchor.path().join("secrets")).unwrap(),
+            Some(0o700)
+        );
+    }
+
+    #[test]
+    fn private_dir_beneath_refuses_writable_intermediate_directory() {
+        let anchor = tempfile::tempdir().unwrap();
+        let intermediate = anchor.path().join("a");
+        std::fs::create_dir(&intermediate).unwrap();
+        std::fs::set_permissions(&intermediate, std::fs::Permissions::from_mode(0o770)).unwrap();
+        assert_eq!(
+            ensure_private_dir_beneath(anchor.path(), Path::new("a/b"))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert!(!intermediate.join("b").exists());
+    }
+
+    #[test]
+    fn private_dir_beneath_refuses_symlinked_components_and_files() {
+        let anchor = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), anchor.path().join("a")).unwrap();
+        assert_eq!(
+            ensure_private_dir_beneath(anchor.path(), Path::new("a/b"))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+
+        std::fs::remove_file(anchor.path().join("a")).unwrap();
+        std::fs::create_dir(anchor.path().join("a")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), anchor.path().join("a/b")).unwrap();
+        assert_eq!(
+            ensure_private_dir_beneath(anchor.path(), Path::new("a/b"))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+
+        std::fs::remove_file(anchor.path().join("a/b")).unwrap();
+        std::fs::remove_dir(anchor.path().join("a")).unwrap();
+        std::fs::write(anchor.path().join("a"), b"file").unwrap();
+        assert_eq!(
+            ensure_private_dir_beneath(anchor.path(), Path::new("a/b"))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
+    fn private_dir_beneath_rejects_non_normal_relative_paths() {
+        let anchor = tempfile::tempdir().unwrap();
+        for rel in [Path::new(""), Path::new(".."), Path::new("/absolute")] {
+            assert_eq!(
+                ensure_private_dir_beneath(anchor.path(), rel)
+                    .unwrap_err()
+                    .kind(),
+                std::io::ErrorKind::InvalidInput
+            );
+        }
+    }
+
+    #[test]
+    fn private_dir_write_stays_anchored_after_parent_replacement() {
+        let anchor = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let dir = ensure_private_dir_beneath(anchor.path(), Path::new("a/b")).unwrap();
+        std::fs::rename(anchor.path().join("a"), anchor.path().join("a_moved")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), anchor.path().join("a")).unwrap();
+
+        // A path-based write_owner_only_atomic at anchor/a/b would follow the replacement symlink.
+        let published = dir
+            .write_owner_only_atomic("secret.env", b"CANARY")
+            .unwrap();
+        let pinned = anchor.path().join("a_moved/b/secret.env");
+        assert_eq!(published, anchor.path().join("a/b/secret.env"));
+        assert_eq!(std::fs::read(pinned).unwrap(), b"CANARY");
+        assert_eq!(
+            mode_bits(&anchor.path().join("a_moved/b/secret.env")).unwrap(),
+            Some(0o600)
+        );
+        assert!(!outside.path().join("secret.env").exists());
+    }
+
+    #[test]
+    fn private_dir_write_replaces_leaf_symlink_without_touching_victim() {
+        let anchor = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let victim = outside.path().join("victim");
+        std::fs::write(&victim, b"untouched").unwrap();
+        let dir = ensure_private_dir_beneath(anchor.path(), Path::new("secrets")).unwrap();
+        std::os::unix::fs::symlink(&victim, anchor.path().join("secrets/secret.env")).unwrap();
+        dir.write_owner_only_atomic("secret.env", b"CANARY")
+            .unwrap();
+        assert_eq!(std::fs::read(&victim).unwrap(), b"untouched");
+        assert_eq!(
+            std::fs::read(anchor.path().join("secrets/secret.env")).unwrap(),
+            b"CANARY"
+        );
+    }
+
+    #[test]
+    fn private_dir_write_replaces_fifo_without_opening_it() {
+        let anchor = tempfile::tempdir().unwrap();
+        let dir = ensure_private_dir_beneath(anchor.path(), Path::new("secrets")).unwrap();
+        let fifo = anchor.path().join("secrets/secret.env");
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::from_bits_truncate(0o600)).unwrap();
+        dir.write_owner_only_atomic("secret.env", b"CANARY")
+            .unwrap();
+        assert_eq!(std::fs::read(&fifo).unwrap(), b"CANARY");
+        assert!(std::fs::metadata(&fifo).unwrap().is_file());
+    }
+
+    #[test]
+    fn private_dir_write_cleans_temporary_file_when_destination_is_directory() {
+        let anchor = tempfile::tempdir().unwrap();
+        let dir = ensure_private_dir_beneath(anchor.path(), Path::new("secrets")).unwrap();
+        std::fs::create_dir(anchor.path().join("secrets/secret.env")).unwrap();
+        assert!(
+            dir.write_owner_only_atomic("secret.env", b"CANARY")
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::read_dir(anchor.path().join("secrets"))
+                .unwrap()
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn private_dir_write_rejects_non_component_names() {
+        let anchor = tempfile::tempdir().unwrap();
+        let dir = ensure_private_dir_beneath(anchor.path(), Path::new("secrets")).unwrap();
+        for name in ["", "../secret", "nested/name", "/absolute"] {
+            assert_eq!(
+                dir.write_owner_only_atomic(name, b"CANARY")
+                    .unwrap_err()
+                    .kind(),
+                std::io::ErrorKind::InvalidInput
+            );
+        }
+    }
 
     #[test]
     fn single_link_regular_file_policy_accepts_one_link_and_rejects_hardlinks() {
