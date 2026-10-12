@@ -7835,6 +7835,7 @@ dependencies = [
  "chrono-tz",
  "clap",
  "clap_complete",
+ "crc32fast",
  "fff-search",
  "finl_unicode",
  "flate2",
