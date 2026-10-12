@@ -1791,6 +1791,8 @@ impl ControlApi for DaemonService {
                 })?;
             let rows = self
                 .with_db(move |db| {
+                    use thegn_core::store::CalendarStore;
+
                     db.get_calendar_events(window.start_ms, window.end_exclusive_ms, &account_names)
                         .map_err(|e| e.context("read calendar cache"))
                 })
@@ -3860,7 +3862,7 @@ mod tests {
         let (svc, _rx) = service_with_config(0, config);
         {
             let db = svc.db.lock().unwrap();
-            let row_for = |uid| CalendarRow {
+            let row_for = |uid: &str| CalendarRow {
                 uid: uid.into(),
                 calendar: String::new(),
                 start_ms: at.timestamp_millis(),
