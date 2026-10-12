@@ -38,7 +38,7 @@ is `thegn_core::control::required_scope` — the single tested policy source.
 | Scope       | Grants                                                                                              |
 | ----------- | --------------------------------------------------------------------------------------------------- |
 | `read`      | list sessions/leases, snapshots, `/v1/me`, event feed, git status, bounded preview fetch            |
-| `write`     | open/attach/detach/kill sessions, terminal input, resize, open-worktree                             |
+| `write`     | open/attach/detach/kill sessions, terminal input, resize, open-worktree (implies read)              |
 | `git`       | stage + commit through the GitBackend seam (implies read, **not** write); also allows merge enqueue |
 | `exec`      | run a trusted configured tool or launch preset (implies read, not write or git)                     |
 | `merge_add` | enqueue a worktree for merge (no read surface; independent of write and git)                        |

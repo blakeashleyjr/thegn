@@ -523,7 +523,10 @@ mod tests {
     #[test]
     fn control_api_doc_error_codes_match_taxonomy() {
         let doc = control_api_doc();
-        let errors = doc_section(&doc, "## Error responses");
+        let errors = doc_section(&doc, "## Error responses")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
         let vocabulary = errors
             .split_once("closed vocabulary")
             .expect("error response docs describe the closed vocabulary")
@@ -587,7 +590,10 @@ mod tests {
     #[test]
     fn control_api_doc_event_kinds_match_parser() {
         let doc = control_api_doc();
-        let event_wire = doc_section(&doc, "## The event wire");
+        let event_wire = doc_section(&doc, "## The event wire")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
         let accepted = event_wire
             .split_once("accepts only the bounded `kinds` vocabulary")
             .expect("event docs describe accepted subscription kinds")
