@@ -1099,6 +1099,108 @@ mod tests {
     use super::*;
 
     #[cfg(unix)]
+    fn connect_test_app(scope: Option<String>, legacy: bool) -> axum::Router {
+        let app = axum::Router::new().route(
+            "/health",
+            axum::routing::get(|| async { axum::Json(serde_json::json!({ "ok": true })) }),
+        );
+        let app = match scope {
+            Some(scope) => app.merge(scope_router(scope)),
+            None => app,
+        };
+        if legacy {
+            app.merge(tonic::service::Routes::default().into_axum_router())
+        } else {
+            app
+        }
+    }
+
+    #[cfg(unix)]
+    fn start_connect_test_daemon(
+        socket: std::path::PathBuf,
+        app: axum::Router,
+    ) -> tokio::task::JoinHandle<()> {
+        let listener =
+            thegn_svc::ipc::IpcListener::Unix(tokio::net::UnixListener::bind(&socket).unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<thegn_svc::ipc::IpcConnectInfo>(),
+            )
+            .await
+            .unwrap();
+        });
+        server
+    }
+
+    #[cfg(unix)]
+    async fn stop_connect_test_daemon(server: tokio::task::JoinHandle<()>) {
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cli_connect_rejects_foreign_scope_and_accepts_matching_and_legacy_daemons() {
+        use std::os::unix::fs::PermissionsExt as _;
+        use thegn_core::config::{Config, DaemonConfig};
+
+        let temp = tempfile::Builder::new()
+            .prefix("thegn-cli-connect-scope-")
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap();
+        let _env = crate::testenv::EnvVarGuard::set(&[
+            ("XDG_STATE_HOME", temp.path().to_str().unwrap()),
+            ("XDG_RUNTIME_DIR", temp.path().to_str().unwrap()),
+        ]);
+        let foreign_socket = temp.path().join("foreign.sock");
+        let foreign_cfg = Config {
+            daemon: DaemonConfig {
+                socket: foreign_socket.display().to_string(),
+                ..DaemonConfig::default()
+            },
+            ..Config::default()
+        };
+
+        let server = start_connect_test_daemon(
+            foreign_socket,
+            connect_test_app(Some("v1-foreign".into()), false),
+        );
+        let error = match crate::cmd::session::connect(&foreign_cfg).await {
+            Ok(_) => panic!("CLI connect must refuse a foreign daemon scope"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("different state directory"));
+        stop_connect_test_daemon(server).await;
+
+        let local_socket = temp.path().join("local.sock");
+        let local_cfg = Config {
+            daemon: DaemonConfig {
+                socket: local_socket.display().to_string(),
+                ..DaemonConfig::default()
+            },
+            ..Config::default()
+        };
+        let server =
+            start_connect_test_daemon(local_socket, connect_test_app(Some(scope_key()), false));
+        assert!(crate::cmd::session::connect(&local_cfg).await.is_ok());
+        stop_connect_test_daemon(server).await;
+
+        let legacy_socket = temp.path().join("legacy.sock");
+        let legacy_cfg = Config {
+            daemon: DaemonConfig {
+                socket: legacy_socket.display().to_string(),
+                ..DaemonConfig::default()
+            },
+            ..Config::default()
+        };
+        let server = start_connect_test_daemon(legacy_socket, connect_test_app(None, true));
+        assert!(crate::cmd::session::connect(&legacy_cfg).await.is_ok());
+        stop_connect_test_daemon(server).await;
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn unix_scope_endpoint_matches_and_refuses_foreign_state_directory() {
         use std::os::unix::fs::PermissionsExt as _;
