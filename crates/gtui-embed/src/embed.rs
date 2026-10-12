@@ -21,6 +21,7 @@ use gtui_core::frame::Frame;
 use gtui_query::host::HostSource;
 use gtui_query::loki::LokiSource;
 use gtui_query::prometheus::PrometheusSource;
+use gtui_render::layout::GRID_COLS;
 use tg_kit::input::{InputEvent, InputResult, Key};
 use tg_kit::ratatui::buffer::Buffer;
 use tg_kit::ratatui::layout::Rect;
@@ -302,6 +303,11 @@ fn load_dashboard(
         return Ok(builtin_host_dashboard());
     }
     let expanded = expand_tilde(path);
+    let metadata = std::fs::metadata(&expanded)
+        .map_err(|error| classify_open_error(&expanded, error.kind()))?;
+    if !metadata.is_file() {
+        return Err(DashboardLoadError::Invalid("not a regular file".into()));
+    }
     let file = std::fs::File::open(&expanded)
         .map_err(|error| classify_open_error(&expanded, error.kind()))?;
     let mut bytes = Vec::new();
@@ -349,7 +355,7 @@ fn validate_dashboard(
         }
         let right = panel.grid_pos.x.checked_add(panel.grid_pos.w);
         let bottom = panel.grid_pos.y.checked_add(panel.grid_pos.h);
-        if right.is_none_or(|right| right > 24)
+        if right.is_none_or(|right| right > GRID_COLS)
             || bottom.is_none_or(|bottom| bottom > MAX_DASHBOARD_ROWS)
             || panel.grid_pos.w == 0
             || panel.grid_pos.h == 0
@@ -625,6 +631,9 @@ mod tests {
             load_dashboard(&cfg, &source_ids),
             Err(DashboardLoadError::Missing(_))
         ));
+        // This is a classifier-only check: load_dashboard exercises the same
+        // classification through filesystem errors, but chmod-000 is unreliable
+        // under root and across platforms.
         assert!(matches!(
             classify_open_error("private/path", ErrorKind::PermissionDenied),
             DashboardLoadError::Denied(_)
@@ -677,6 +686,15 @@ mod tests {
             Err(DashboardLoadError::AmbiguousSource)
         ));
         std::fs::remove_file(ambiguous_path).unwrap();
+    }
+
+    #[test]
+    fn custom_dashboard_rejects_non_regular_files_before_open() {
+        let cfg = config_for(std::env::temp_dir().to_string_lossy().into_owned());
+        assert!(matches!(
+            load_dashboard(&cfg, &make_source_ids(&["host"])),
+            Err(DashboardLoadError::Invalid(reason)) if reason == "not a regular file"
+        ));
     }
 
     #[test]

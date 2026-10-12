@@ -40,7 +40,7 @@ pub static APP_BUILDERS: &[AppBuilder] = &[AppBuilder {
             hook,
             &cfg.observe,
             rt,
-            super::kit_theme(&cfg.palette()),
+            super::kit_theme(&crate::chrome::palette_snapshot()),
             || {
                 crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
             },
