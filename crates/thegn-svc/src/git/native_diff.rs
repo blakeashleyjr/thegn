@@ -20,8 +20,94 @@
 //! behavior rather than to a wrong number on screen.
 
 use anyhow::{Context, Result, bail};
+use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, SystemTime};
 
 use super::DiffEntry;
+
+const WORKTREE_DIFF_MEMO_CAP: usize = 4096;
+const WORKTREE_DIFF_RACY_MARGIN: Duration = Duration::from_secs(2);
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct FileStatSignature {
+    len: u64,
+    modified: SystemTime,
+}
+
+fn file_stat_signature(path: &std::path::Path) -> Option<FileStatSignature> {
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(_) => return None,
+    };
+    let modified = match metadata.modified() {
+        Ok(modified) => modified,
+        Err(_) => return None,
+    };
+    Some(FileStatSignature {
+        len: metadata.len(),
+        modified,
+    })
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct WorktreeDiffMemoKey {
+    workdir: std::path::PathBuf,
+    path: Vec<u8>,
+    old_id: String,
+    file: FileStatSignature,
+    attributes: Option<FileStatSignature>,
+    config: Option<FileStatSignature>,
+}
+
+// Nested .gitattributes are not included, so changing one can leave a cached
+// entry stale until the target file changes or the memo clears.
+static WORKTREE_DIFF_MEMO: LazyLock<
+    Mutex<std::collections::HashMap<WorktreeDiffMemoKey, DiffEntry>>,
+> = LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+fn worktree_diff_memo_key(
+    repo: &gix::Repository,
+    workdir: &std::path::Path,
+    path: &[u8],
+    old_id: gix::ObjectId,
+) -> Option<WorktreeDiffMemoKey> {
+    let rela = match std::str::from_utf8(path) {
+        Ok(rela) => rela,
+        Err(_) => return None,
+    };
+    let file_path = workdir.join(rela);
+    Some(WorktreeDiffMemoKey {
+        workdir: workdir.to_owned(),
+        path: path.to_vec(),
+        old_id: old_id.to_string(),
+        file: file_stat_signature(&file_path)?,
+        attributes: file_stat_signature(&workdir.join(".gitattributes")),
+        config: file_stat_signature(&repo.git_dir().join("config")),
+    })
+}
+
+fn memoized_worktree_entry(key: &WorktreeDiffMemoKey) -> Option<DiffEntry> {
+    let mut memo = match WORKTREE_DIFF_MEMO.lock() {
+        Ok(memo) => memo,
+        Err(_) => return None,
+    };
+    // Root attributes/config changes invalidate all entries for this worktree.
+    memo.retain(|existing, _| {
+        existing.workdir != key.workdir
+            || (existing.attributes == key.attributes && existing.config == key.config)
+    });
+    memo.get(key).cloned()
+}
+
+fn remember_worktree_entry(key: WorktreeDiffMemoKey, entry: DiffEntry) {
+    let Ok(mut memo) = WORKTREE_DIFF_MEMO.lock() else {
+        return;
+    };
+    if memo.len() >= WORKTREE_DIFF_MEMO_CAP {
+        memo.clear();
+    }
+    memo.insert(key, entry);
+}
 
 #[derive(Debug)]
 pub(crate) struct UnsupportedPath(String);
@@ -378,6 +464,7 @@ fn dedup_in_order<K: std::hash::Hash + Eq + Clone>(items: impl IntoIterator<Item
 /// never counts them, but gix's status finds them via its dirwalk, so leaving
 /// the dirwalk on would inflate every count in a worktree with new files.
 fn tree_to_worktree(repo: &gix::Repository, rev: &str) -> Result<Vec<DiffEntry>> {
+    let diff_started = SystemTime::now();
     let head = repo.head_id().context("gix head id")?;
     let want = repo
         .rev_parse_single(rev)
@@ -439,6 +526,16 @@ fn tree_to_worktree(repo: &gix::Repository, rev: &str) -> Result<Vec<DiffEntry>>
                 gix::object::tree::EntryKind::Blob,
             ),
         };
+        let memo_key = worktree_diff_memo_key(repo, &workdir, rela.as_ref(), old_id);
+        if let Some(key) = memo_key.as_ref() {
+            let entry = memoized_worktree_entry(key);
+            if key.file.modified < diff_started - WORKTREE_DIFF_RACY_MARGIN
+                && let Some(entry) = entry
+            {
+                out.push(entry);
+                continue;
+            }
+        }
         path_operation(rela.as_ref(), "load old resource", || {
             cache
                 .set_resource(
@@ -488,6 +585,12 @@ fn tree_to_worktree(repo: &gix::Repository, rev: &str) -> Result<Vec<DiffEntry>>
             gix::diff::blob::platform::prepare_diff::Operation::ExternalCommand { .. } => {
                 bail!("gix external diff/filter disposition requires CLI fallback for {path:?}")
             }
+        }
+        if let Some(key) = memo_key
+            && key.file.modified < diff_started - WORKTREE_DIFF_RACY_MARGIN
+            && let Some(entry) = out.last()
+        {
+            remember_worktree_entry(key, entry.clone());
         }
         cache.clear_resource_cache_keep_allocation();
     }
@@ -556,6 +659,70 @@ mod tests {
 
     use super::*;
     use crate::git::testutil::TestRepo;
+
+    fn backdate(path: &std::path::Path, seconds: u64) {
+        let modified = SystemTime::now() - Duration::from_secs(seconds);
+        std::fs::File::open(path)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+    }
+
+    fn clean_runs(repo: &TestRepo) -> usize {
+        std::fs::read_to_string(repo.dir.join("clean-ran"))
+            .unwrap()
+            .lines()
+            .count()
+    }
+
+    #[test]
+    fn stable_backdated_filtered_worktree_is_memoized_across_diffs() {
+        let repo = filtered_dirty_repo("memo-filtered-worktree");
+        let tracked = repo.dir.join("tracked.txt");
+        backdate(&tracked, 10);
+
+        for _ in 0..5 {
+            assert!(
+                diff_entries(&repo.dir, "HEAD")
+                    .unwrap()
+                    .iter()
+                    .any(|entry| { entry.path == "tracked.txt" })
+            );
+        }
+        assert_eq!(clean_runs(&repo), 3, "only the first diff should run clean");
+
+        std::fs::write(&tracked, "new\ncontent\nwith\nfour\nlines\n").unwrap();
+        backdate(&tracked, 11);
+        let native = totals(&repo.dir, "HEAD").unwrap();
+        assert_eq!(native, cli_totals(&repo, "HEAD"));
+        assert_eq!(
+            clean_runs(&repo),
+            13,
+            "new content must run clean in native and CLI diffs"
+        );
+    }
+
+    #[test]
+    fn fresh_filtered_worktree_files_are_never_memoized() {
+        let repo = filtered_dirty_repo("memo-fresh-filtered-worktree");
+        let tracked = repo.dir.join("tracked.txt");
+        for _ in 0..2 {
+            let native = totals(&repo.dir, "HEAD").unwrap();
+            assert_eq!(native, cli_totals(&repo, "HEAD"));
+        }
+        assert_eq!(
+            clean_runs(&repo),
+            12,
+            "fresh files should run once in each native/CLI diff"
+        );
+
+        // Same byte length and a fresh timestamp: the stat signature changes,
+        // while the racy window independently prevents lookup and insertion.
+        std::fs::write(&tracked, "onelong\nthree\n").unwrap();
+        let native = totals(&repo.dir, "HEAD").unwrap();
+        assert_eq!(native, cli_totals(&repo, "HEAD"));
+        assert_eq!(clean_runs(&repo), 16);
+    }
 
     /// Our own child processes as `(state, comm)` — naming them, because
     /// "5 children leaked" does not say which spawn site to fix.
