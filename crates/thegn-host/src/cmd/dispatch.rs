@@ -872,7 +872,8 @@ fn lease(action: &str, owner: Option<&str>, ttl: i64, name: &str, json: bool) ->
             let row = db.pipeline_lease_row(name)?;
             let now = thegn_core::util::now_ms();
             let outcome = lease_show_outcome(row.as_ref(), now);
-            let owner = row.as_ref().map(|(owner, _)| owner);
+            let holder = row.as_ref().map(|(owner, _)| owner);
+            let (owner, last_owner) = lease_show_owners(row.as_ref(), now);
             let remaining = row
                 .as_ref()
                 .filter(|(_, expires_at)| *expires_at > now)
@@ -882,10 +883,11 @@ fn lease(action: &str, owner: Option<&str>, ttl: i64, name: &str, json: bool) ->
                     "name": name,
                     "outcome": outcome,
                     "owner": owner,
+                    "last_owner": last_owner,
                     "expires_in_ms": remaining,
                 }));
             }
-            match (outcome, owner, remaining) {
+            match (outcome, holder, remaining) {
                 ("live", Some(owner), Some(ms)) => {
                     outln!(
                         "lease {}: held by {} ({}s left)",
@@ -992,6 +994,14 @@ fn lease_show_outcome(row: Option<&(String, i64)>, now_ms: i64) -> &'static str 
         None => "free",
         Some((_, expires_at)) if *expires_at <= now_ms => "expired",
         Some(_) => "live",
+    }
+}
+
+fn lease_show_owners(row: Option<&(String, i64)>, now_ms: i64) -> (Option<&str>, Option<&str>) {
+    match (lease_show_outcome(row, now_ms), row) {
+        ("live", Some((owner, _))) => (Some(owner), None),
+        ("expired", Some((owner, _))) => (None, Some(owner)),
+        _ => (None, None),
     }
 }
 
@@ -1541,7 +1551,7 @@ pub(crate) fn reap_plan(
             rows.iter().any(|row| {
                 row.id == run.id
                     && row.status == AgentDispatchStatus::Running
-                    && row.session_id.as_deref() == Some(run.session_id.as_str())
+                    && row.session_id.as_deref().unwrap_or("") == run.session_id
             })
         })
         .map(|run| (run.id, run))
@@ -2720,6 +2730,14 @@ mod tests {
             lease_show_outcome(Some(&("owner".into(), now + 1)), now),
             "live"
         );
+        assert_eq!(
+            lease_show_owners(Some(&("owner".into(), now + 1)), now),
+            (Some("owner"), None)
+        );
+        assert_eq!(
+            lease_show_owners(Some(&("owner".into(), now)), now),
+            (None, Some("owner"))
+        );
         assert_eq!(lease_release_outcome("owner", None, now), "missing");
         assert_eq!(
             lease_release_outcome("owner", Some(&("other".into(), now + 1)), now),
@@ -3807,6 +3825,36 @@ mod tests {
         assert_eq!(after.status, AgentDispatchStatus::Running);
         assert_eq!(after.session_id.as_deref(), Some("new-session"));
         assert_eq!(new_run.run_gen, old_run.run_gen + 1);
+    }
+
+    #[test]
+    fn reap_plan_applies_exit_stamp_for_running_row_without_session() {
+        let (_dir, db) = db("reap-sessionless-running");
+        let row = put(
+            &db,
+            NewDispatch {
+                session_id: None,
+                ..NewDispatch::new("linear:THE-242", "/unused", "worker")
+            },
+        )
+        .unwrap();
+        db.update_dispatch_status(row.id, AgentDispatchStatus::Running)
+            .unwrap();
+        let run = db.dispatch_run_ref(row.id).unwrap().unwrap();
+        assert_eq!(run.session_id, "");
+        db.stamp_dispatch_exit(&run, Some(1)).unwrap();
+
+        let (plan, run_refs) = reap_plan(&db, Some(&[])).unwrap();
+        assert!(matches!(
+            &plan[0].verdict,
+            pipeline_reap::ReapVerdict::MarkFailed { .. }
+        ));
+        assert!(run_refs.contains_key(&row.id));
+        apply_reap_plan(&db, &plan, &run_refs).unwrap();
+        assert_eq!(
+            db.get_dispatch(row.id).unwrap().unwrap().status,
+            AgentDispatchStatus::Failed
+        );
     }
 
     #[test]
