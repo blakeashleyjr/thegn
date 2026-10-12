@@ -3,6 +3,81 @@ use crate::hydrate_tuning::DEFAULT_MODEL_REFRESH_MS;
 use crate::session::{GroupKind, Session, WorktreeGroup};
 
 #[test]
+fn diff_read_failure_marks_change_rows_unavailable() {
+    let status = [thegn_svc::git::FileStatus {
+        path: "src/a.rs".into(),
+        staged: ' ',
+        unstaged: 'M',
+    }];
+    let incoming = std::collections::HashSet::new();
+
+    let unavailable = change_rows(&status, None, &incoming);
+    assert_eq!(unavailable.len(), 1);
+    assert_eq!(unavailable[0].count, thegn_svc::git::DiffCount::Unavailable);
+    assert_eq!((unavailable[0].added, unavailable[0].deleted), (0, 0));
+
+    let available = change_rows(
+        &status,
+        Some(&[thegn_svc::git::DiffEntry {
+            path: "src/a.rs".into(),
+            added: 3,
+            deleted: 1,
+            binary: false,
+        }]),
+        &incoming,
+    );
+    assert_eq!(available[0].count, thegn_svc::git::DiffCount::Exact(4));
+}
+
+#[test]
+fn panel_diff_files_take_status_from_porcelain_not_the_path() {
+    let entries = [
+        thegn_svc::git::DiffEntry {
+            path: "src/staged.rs".into(),
+            added: 1,
+            deleted: 0,
+            binary: false,
+        },
+        thegn_svc::git::DiffEntry {
+            path: "src/unstaged.rs".into(),
+            added: 0,
+            deleted: 1,
+            binary: false,
+        },
+        thegn_svc::git::DiffEntry {
+            path: "assets/image.png".into(),
+            added: 0,
+            deleted: 0,
+            binary: true,
+        },
+        thegn_svc::git::DiffEntry {
+            path: "src/unknown.rs".into(),
+            added: 2,
+            deleted: 0,
+            binary: false,
+        },
+    ];
+    let status = [
+        thegn_svc::git::FileStatus {
+            path: "src/staged.rs".into(),
+            staged: 'A',
+            unstaged: ' ',
+        },
+        thegn_svc::git::FileStatus {
+            path: "src/unstaged.rs".into(),
+            staged: ' ',
+            unstaged: 'D',
+        },
+    ];
+
+    let files = panel_diff_files(&entries, &status);
+    assert_eq!(
+        files.iter().map(|file| file.status).collect::<Vec<_>>(),
+        vec!['A', 'D', 'B', 'M']
+    );
+}
+
+#[test]
 fn stash_error_still_caches_watched_status_and_diff_snapshot() {
     let cwd = tempfile::tempdir().unwrap();
     let key = (crate::diff_watch::WatchPrint::for_test(41, 9), 3);

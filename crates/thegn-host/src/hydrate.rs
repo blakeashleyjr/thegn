@@ -2762,6 +2762,53 @@ fn cache_panel_git_snapshot(
 /// path-keyed core of model hydration: it touches only `cwd`/`db`/`hints`,
 /// never the session, so a background task can warm a not-yet-focused
 /// worktree's panel into the switch cache before the user lands on it.
+fn change_rows(
+    status: &[thegn_svc::git::FileStatus],
+    diff: Option<&[thegn_svc::git::DiffEntry]>,
+    incoming: &std::collections::HashSet<String>,
+) -> Vec<crate::panel::ChangeRow> {
+    let Some(diff) = diff else {
+        let mut rows = crate::panel::build_change_rows(status, &[], incoming);
+        for row in &mut rows {
+            if row.submodule.is_none() {
+                row.count = thegn_svc::git::DiffCount::Unavailable;
+            }
+        }
+        return rows;
+    };
+    crate::panel::build_change_rows(status, diff, incoming)
+}
+
+fn panel_diff_files(
+    entries: &[thegn_svc::git::DiffEntry],
+    status: &[thegn_svc::git::FileStatus],
+) -> Vec<crate::panel::DiffFile> {
+    entries
+        .iter()
+        .map(|entry| {
+            let status = if entry.binary {
+                'B'
+            } else if let Some(file) = status.iter().find(|file| file.path == entry.path) {
+                if file.staged != ' ' && file.staged != '?' {
+                    file.staged
+                } else if file.unstaged != ' ' {
+                    file.unstaged
+                } else {
+                    'M'
+                }
+            } else {
+                'M'
+            };
+            crate::panel::DiffFile {
+                status,
+                path: entry.path.clone(),
+                added: entry.added,
+                deleted: entry.deleted,
+            }
+        })
+        .collect()
+}
+
 pub(crate) fn build_panel(
     cwd: &std::path::Path,
     db: &thegn_core::db::Db,
@@ -2840,6 +2887,7 @@ pub(crate) fn build_panel(
     let (
         branch,
         diff_entries,
+        diff_ok,
         entities,
         status,
         ahead_behind,
@@ -2862,16 +2910,17 @@ pub(crate) fn build_panel(
         // `loc`, so they ride one thread (entity parsing is CPU, kept off the rest).
         let h_diff = s.spawn(|| {
             if let Some(c) = &cached_reads {
-                return (c.diff_entries.clone(), c.entities.clone());
+                return (c.diff_entries.clone(), c.entities.clone(), true);
             }
             let _cpu = crate::perf::measure(crate::perf::Subsys::HydrateChild);
             let diff = crate::git_handle::get().diff_files(&loc, "HEAD");
             if diff.is_err() {
                 reads_ok.store(false, std::sync::atomic::Ordering::Relaxed);
             }
+            let diff_ok = diff.is_ok();
             let entries = diff.unwrap_or_default();
             let entities = crate::hydrate_semantic::compute_entity_summary(&loc, &entries);
-            (entries, entities)
+            (entries, entities, diff_ok)
         });
         let h_status = s.spawn(|| {
             if let Some(c) = &cached_reads {
@@ -2972,11 +3021,12 @@ pub(crate) fn build_panel(
             })
         });
 
-        let (diff_entries, entities) = h_diff.join().unwrap();
+        let (diff_entries, entities, diff_ok) = h_diff.join().unwrap();
         let (merge_res, incoming_set) = h_merge.join().unwrap();
         (
             h_branch.join().unwrap(),
             diff_entries,
+            diff_ok,
             entities,
             h_status.join().unwrap(),
             h_ahead.join().unwrap(),
@@ -3169,23 +3219,15 @@ pub(crate) fn build_panel(
         Some(db),
     ));
 
-    panel.files = diff_entries
-        .iter()
-        .map(|f| crate::panel::DiffFile {
-            status: if f.binary {
-                'B'
-            } else {
-                f.path.chars().next().unwrap_or('M')
-            },
-            path: f.path.clone(),
-            added: f.added,
-            deleted: f.deleted,
-        })
-        .collect();
+    panel.files = panel_diff_files(&diff_entries, &status);
 
     // Changes section: porcelain status joined with the diffstat, with
     // merge-incoming files tagged for the "incoming from <onto>" grouping.
-    panel.changes = crate::panel::build_change_rows(&status, &diff_entries, &incoming);
+    panel.changes = change_rows(
+        &status,
+        diff_ok.then_some(diff_entries.as_slice()),
+        &incoming,
+    );
     // Semantic git layer (items 311/313/317): entity-level view of the changes.
     // Blast-radius (313/316): enrich with the persisted caller→callee graph when
     // it has data (else `None` → the footer keeps its intra-diff summary).
