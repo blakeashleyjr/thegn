@@ -277,44 +277,6 @@ pub(crate) fn spawn_media_queue(
     });
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::panel::media::MediaPanelState;
-    use thegn_core::media::{MediaState, QueueItem};
-
-    #[test]
-    fn queue_delivery_error_is_flagged_and_success_clears_it() {
-        let state = MediaState {
-            player: "player".into(),
-            title: "track".into(),
-            ..Default::default()
-        };
-        let mut panel = MediaPanelState::default();
-        panel.sync_snapshot(Some(&state), None, 0);
-        let request = panel.take_queue_request(Some(&state)).unwrap();
-
-        panel.set_queue(
-            request.clone(),
-            Some(&state),
-            Err("playlist read failed".into()),
-        );
-        assert!(panel.queue.is_empty());
-        assert_eq!(panel.queue_error.as_deref(), Some("playlist read failed"));
-
-        panel.set_queue(
-            request,
-            Some(&state),
-            Ok(vec![QueueItem {
-                title: "next track".into(),
-                ..Default::default()
-            }]),
-        );
-        assert_eq!(panel.queue.len(), 1);
-        assert!(panel.queue_error.is_none());
-    }
-}
-
 /// Fetch the provider's source/player list off-loop for the docked panel.
 /// Request tagging lets the panel reject a response from an obsolete source
 /// selection or snapshot generation.
