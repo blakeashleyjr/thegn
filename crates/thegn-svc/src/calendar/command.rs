@@ -493,8 +493,8 @@ impl CommandBackend {
         // remainder, never a fresh timeout.
         let timeout = deadline.saturating_duration_since(std::time::Instant::now());
         if timeout.is_zero() {
-            return Err(CalendarError::Network(
-                PluginError::Timeout(self.timeout.as_secs()).to_string(),
+            return Err(CalendarError::Timeout(
+                "calendar command exceeded its deadline",
             ));
         }
         let argv = self.argv.clone();
@@ -523,7 +523,9 @@ impl CommandBackend {
         .map_err(|e| CalendarError::Subprocess(e.to_string()))?;
 
         let run = run.map_err(|e| match e {
-            PluginError::Timeout(_) => CalendarError::Network(e.to_string()),
+            PluginError::Timeout(_) => {
+                CalendarError::Timeout("calendar command exceeded its deadline")
+            }
             other => CalendarError::Subprocess(other.to_string()),
         })?;
 
