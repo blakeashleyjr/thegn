@@ -27,6 +27,9 @@ const RETENTION_SECS: f64 = 86_400.0;
 /// Sampling cadence plus margin: retention eviction may trim a full window's
 /// first sample by one second without making the window meaningfully partial.
 const COVERAGE_SLACK_SECS: f64 = 2.0;
+/// One nominal sampling interval plus the same tolerance used for leading
+/// coverage. Larger intervals between retained samples indicate a hole.
+const MAX_SAMPLE_GAP_SECS: f64 = 1.0 + COVERAGE_SLACK_SECS;
 
 #[derive(Clone, Copy)]
 struct HostSample {
@@ -168,7 +171,11 @@ impl HostSource {
     /// Build a `(time, value)` frame for `expr` from the ring, keeping only
     /// samples where the metric is present. Both UTC range endpoints are
     /// inclusive. Coverage uses Unix seconds and marks a leading gap when the
-    /// earliest retained sample is more than two seconds after `from`.
+    /// earliest retained sample is more than two seconds after `from`. For
+    /// recognized metrics, a gap in the retained timestamps clipped to the
+    /// requested window is partial when consecutive points are more than one
+    /// sampling interval plus the coverage slack apart. Trailing gaps without
+    /// a retained successor are not inferred.
     fn frame_for(&self, expr: &str, range: &gtui_core::datasource::TimeRange) -> Frame {
         let (extract, recognized): (fn(&HostSample) -> Option<f64>, bool) = match expr {
             "host_cpu_pct" => (|s| s.cpu_pct.map(|v| v as f64), true),
@@ -185,11 +192,28 @@ impl HostSource {
         let coverage = if recognized {
             match self.ring.lock() {
                 Ok(r) => {
-                    let coverage = coverage_for(r.front().map(|(ts, _)| *ts), from);
+                    let mut coverage = coverage_for(r.front().map(|(ts, _)| *ts), from);
                     // Samples are sorted; both UTC endpoints are inclusive.
                     let start = r.partition_point(|(ts, _)| *ts < from);
                     let end = r.partition_point(|(ts, _)| *ts <= to);
-                    for index in start.min(end)..end {
+                    let sample_start = start.min(end);
+                    let has_gap = has_interior_gap(
+                        std::iter::once(from)
+                            .filter(|_| sample_start > 0)
+                            .chain(
+                                r.iter()
+                                    .skip(sample_start)
+                                    .take(end - sample_start)
+                                    .map(|(ts, _)| *ts),
+                            )
+                            .chain(std::iter::once(to).filter(|_| end < r.len())),
+                    );
+                    if has_gap && matches!(coverage, Coverage::Complete) {
+                        coverage = Coverage::Partial {
+                            retained_from: r.front().map(|(ts, _)| *ts),
+                        };
+                    }
+                    for index in sample_start..end {
                         let (ts, sample) = &r[index];
                         if let Some(v) = extract(sample) {
                             times.push(*ts);
@@ -312,11 +336,49 @@ fn coverage_for(front: Option<f64>, from: f64) -> Coverage {
     }
 }
 
+fn has_interior_gap(points: impl IntoIterator<Item = f64>) -> bool {
+    let mut previous = None;
+    for point in points {
+        if let Some(previous) = previous
+            && point - previous > MAX_SAMPLE_GAP_SECS
+        {
+            return true;
+        }
+        previous = Some(point);
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use chrono::Utc;
     use gtui_core::datasource::TimeRange;
+
+    fn range(from: i64, to: i64) -> TimeRange {
+        TimeRange {
+            from: chrono::DateTime::from_timestamp(from, 0).unwrap(),
+            to: chrono::DateTime::from_timestamp(to, 0).unwrap(),
+        }
+    }
+
+    fn admit_cpu_range(source: &HostSource, ranges: &[std::ops::RangeInclusive<i64>]) {
+        source.set_active(false);
+        wait_for("worker parked", || source.in_park.load(Ordering::Acquire));
+        let mut ring = source.ring.lock().unwrap();
+        for range in ranges {
+            for ts in range.clone() {
+                admit(
+                    &mut ring,
+                    ts as f64,
+                    StatsSnapshot {
+                        cpu_pct: Some(ts as u8),
+                        ..Default::default()
+                    },
+                );
+            }
+        }
+    }
 
     fn q(expr: &str) -> Query {
         Query {
@@ -413,6 +475,63 @@ mod tests {
                 .coverage,
             Coverage::Complete
         );
+    }
+
+    #[test]
+    fn query_marks_interior_and_straddling_ring_gaps_as_partial() {
+        let source = HostSource::try_new().unwrap();
+        admit_cpu_range(&source, &[100..=105, 200..=205]);
+
+        assert_eq!(
+            source.frame_for("host_cpu_pct", &range(100, 205)).coverage,
+            Coverage::Partial {
+                retained_from: Some(100.0)
+            }
+        );
+        assert_eq!(
+            source.frame_for("host_cpu_pct", &range(200, 205)).coverage,
+            Coverage::Complete
+        );
+        assert_eq!(
+            source.frame_for("host_cpu_pct", &range(120, 180)).coverage,
+            Coverage::Partial {
+                retained_from: Some(100.0)
+            }
+        );
+    }
+
+    #[test]
+    fn query_marks_a_gap_straddling_the_window_start_as_partial() {
+        let source = HostSource::try_new().unwrap();
+        admit_cpu_range(&source, &[100..=105, 300..=305]);
+
+        assert_eq!(
+            source.frame_for("host_cpu_pct", &range(150, 305)).coverage,
+            Coverage::Partial {
+                retained_from: Some(100.0)
+            }
+        );
+    }
+
+    #[test]
+    fn query_keeps_a_contiguous_window_complete() {
+        let source = HostSource::try_new().unwrap();
+        admit_cpu_range(&source, &[100..=110]);
+
+        assert_eq!(
+            source.frame_for("host_cpu_pct", &range(100, 110)).coverage,
+            Coverage::Complete
+        );
+    }
+
+    #[test]
+    fn interior_gap_boundary_is_strict() {
+        for (points, expected) in [
+            (vec![10.0, 10.0 + MAX_SAMPLE_GAP_SECS], false),
+            (vec![10.0, 10.0 + MAX_SAMPLE_GAP_SECS + 0.000_001], true),
+        ] {
+            assert_eq!(has_interior_gap(points), expected);
+        }
     }
 
     #[test]
