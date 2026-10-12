@@ -50,13 +50,21 @@ pub fn parse_loop(repeat: bool, single: bool) -> LoopMode {
 
 /// Parse an MPD boolean flag (`"0"`/`"1"`).
 fn flag(pairs: &[Pair], key: &str) -> Option<bool> {
-    field(pairs, key).map(|v| v.trim() == "1")
+    match field(pairs, key)?.trim() {
+        "1" => Some(true),
+        "0" => Some(false),
+        _ => None,
+    }
 }
 
 /// Parse a float-seconds field (`elapsed`, `duration`) into a `Duration`.
 fn secs(pairs: &[Pair], key: &str) -> Option<Duration> {
     let s: f64 = field(pairs, key)?.trim().parse().ok()?;
-    (s.is_finite() && s >= 0.0).then(|| Duration::from_secs_f64(s))
+    if s.is_finite() && s >= 0.0 {
+        Duration::try_from_secs_f64(s).ok()
+    } else {
+        None
+    }
 }
 
 /// Fold an MPD `status` + `currentsong` response into a [`MediaState`]. Pure so
@@ -90,10 +98,10 @@ pub fn to_state(status: &[Pair], song: &[Pair]) -> MediaState {
         .map(|v| v.clamp(0, 100) as u8);
 
     let shuffle = flag(status, "random");
-    let loop_mode = Some(parse_loop(
-        flag(status, "repeat").unwrap_or(false),
-        flag(status, "single").unwrap_or(false),
-    ));
+    let loop_mode = match (flag(status, "repeat"), flag(status, "single")) {
+        (Some(repeat), Some(single)) => Some(parse_loop(repeat, single)),
+        _ => None,
+    };
 
     // MPD is audio in practice; classify off the file extension, defaulting audio.
     let kind = match MediaKind::from_hints("mpd", None, file) {
@@ -197,5 +205,25 @@ mod tests {
         let s = to_state(&status, &song);
         assert_eq!(s.length, Some(Duration::from_secs(200)));
         assert_eq!(s.state, PlaybackState::Paused);
+    }
+
+    #[test]
+    fn oversized_finite_times_are_unknown_without_panicking() {
+        let status = pairs(&["elapsed: 1e30", "duration: 1e300"]);
+        let s = to_state(&status, &[]);
+        assert_eq!(s.position, None);
+        assert_eq!(s.length, None);
+    }
+
+    #[test]
+    fn malformed_or_missing_flags_remain_unknown() {
+        let missing = to_state(&pairs(&["state: play"]), &[]);
+        assert_eq!(missing.loop_mode, None);
+
+        let oneshot = to_state(&pairs(&["repeat: 1", "single: oneshot"]), &[]);
+        assert_eq!(oneshot.loop_mode, None);
+
+        let random = to_state(&pairs(&["random: x"]), &[]);
+        assert_eq!(random.shuffle, None);
     }
 }
