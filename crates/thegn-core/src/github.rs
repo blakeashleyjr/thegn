@@ -788,6 +788,100 @@ pub fn rerun_failed_checks(loc: &GitLoc) -> Result<u32, GhError> {
     Ok(count)
 }
 
+fn run_list_args(branch: &str) -> Vec<String> {
+    vec![
+        "run".into(),
+        "list".into(),
+        "--branch".into(),
+        branch.into(),
+        "--json".into(),
+        "databaseId,conclusion,headSha".into(),
+        "--limit".into(),
+        "20".into(),
+    ]
+}
+
+fn failed_run_ids(json: &str, expected_head: &str) -> Result<Vec<u64>, GhError> {
+    #[derive(Deserialize)]
+    struct Run {
+        #[serde(rename = "databaseId")]
+        database_id: u64,
+        conclusion: Option<String>,
+        #[serde(rename = "headSha")]
+        head_sha: Option<String>,
+    }
+
+    let runs: Vec<Run> = serde_json::from_str(json)
+        .map_err(|error| GhError::Other(format!("could not parse workflow runs: {error}")))?;
+    Ok(runs
+        .into_iter()
+        .filter(|run| {
+            run.head_sha.as_deref() == Some(expected_head)
+                && matches!(
+                    run.conclusion
+                        .as_deref()
+                        .map(|value| value.to_uppercase())
+                        .as_deref(),
+                    Some("FAILURE")
+                        | Some("TIMED_OUT")
+                        | Some("CANCELLED")
+                        | Some("STARTUP_FAILURE")
+                )
+        })
+        .map(|run| run.database_id)
+        .collect())
+}
+
+fn rerun_args(id: u64) -> Vec<String> {
+    vec![
+        "run".into(),
+        "rerun".into(),
+        id.to_string(),
+        "--failed".into(),
+    ]
+}
+
+fn rerun_failed_for_number<F, R>(number: u64, mut output: F, mut rerun: R) -> Result<u32, GhError>
+where
+    F: FnMut(&[&str]) -> Result<String, GhError>,
+    R: FnMut(&[&str]) -> Result<(), GhError>,
+{
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct PrHead {
+        head_ref_name: String,
+        head_ref_oid: String,
+    }
+
+    let number_arg = number.to_string();
+    let pr_json = output(&[
+        "pr",
+        "view",
+        &number_arg,
+        "--json",
+        "headRefName,headRefOid",
+    ])?;
+    let pr_head: PrHead = serde_json::from_str(&pr_json)
+        .map_err(|error| GhError::Other(format!("could not parse PR head: {error}")))?;
+    if pr_head.head_ref_name.trim().is_empty() || pr_head.head_ref_oid.trim().is_empty() {
+        return Err(GhError::Other("PR has an empty head branch or SHA".into()));
+    }
+
+    let list_args = run_list_args(&pr_head.head_ref_name);
+    let list_refs: Vec<&str> = list_args.iter().map(String::as_str).collect();
+    let run_json = output(&list_refs)?;
+    let ids = failed_run_ids(&run_json, &pr_head.head_ref_oid)?;
+    let mut count = 0;
+    for id in ids {
+        let args = rerun_args(id);
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        if rerun(&refs).is_ok() {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
 // ---------------------------------------------------------------------------
 // The `gh` CLI as a Forge
 // ---------------------------------------------------------------------------
@@ -1012,8 +1106,13 @@ impl Forge for GithubCli {
             c.body,
         )
     }
-    fn rerun_failed(&self, loc: &GitLoc, _pr: PrRef) -> Result<u32, GhError> {
-        rerun_failed_checks(loc)
+    fn rerun_failed(&self, loc: &GitLoc, pr: PrRef) -> Result<u32, GhError> {
+        match pr {
+            PrRef::Current => rerun_failed_checks(loc),
+            PrRef::Number(number) => {
+                rerun_failed_for_number(number, |args| gh_out(loc, args), |args| gh_run(loc, args))
+            }
+        }
     }
     fn issue_rows(&self, loc: &GitLoc, limit: usize) -> Result<Vec<IssueRow>, GhError> {
         issue_list(loc, limit)
@@ -1083,5 +1182,71 @@ impl Forge for GithubCli {
         number: u64,
     ) -> Result<crate::forge::authorship::PrAuthorship, GhError> {
         authorship_transport::fetch(loc, self.id(), number)
+    }
+}
+#[cfg(test)]
+mod numbered_rerun_tests {
+    use super::GhError;
+    use super::{failed_run_ids, rerun_args, rerun_failed_for_number, run_list_args};
+
+    #[test]
+    fn numbered_rerun_uses_pr_branch_and_only_matching_head_runs() {
+        let mut commands = Vec::<Vec<String>>::new();
+        let mut reruns = Vec::<Vec<String>>::new();
+        let count = rerun_failed_for_number(
+            42,
+            |args| {
+                commands.push(args.iter().map(|arg| (*arg).to_owned()).collect());
+                if args.first() == Some(&"pr") {
+                    Ok(r#"{"headRefName":"feature/pr-42","headRefOid":"abc123"}"#.into())
+                } else {
+                    Ok(r#"[
+                        {"databaseId":1,"conclusion":"FAILURE","headSha":"abc123"},
+                        {"databaseId":2,"conclusion":"TIMED_OUT","headSha":"other"},
+                        {"databaseId":3,"conclusion":"SUCCESS","headSha":"abc123"}
+                    ]"#
+                    .into())
+                }
+            },
+            |args| {
+                reruns.push(args.iter().map(|arg| (*arg).to_owned()).collect());
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(count, 1);
+        assert_eq!(
+            commands,
+            vec![
+                ["pr", "view", "42", "--json", "headRefName,headRefOid"]
+                    .map(str::to_owned)
+                    .to_vec(),
+                run_list_args("feature/pr-42"),
+            ]
+        );
+        assert_eq!(reruns, vec![rerun_args(1)]);
+        assert!(!commands.iter().flatten().any(|arg| arg == "rev-parse"));
+    }
+
+    #[test]
+    fn numbered_rerun_rejects_missing_head_proof_and_malformed_runs() {
+        let error = rerun_failed_for_number(
+            42,
+            |_| Ok(r#"{"headRefName":"","headRefOid":"abc123"}"#.into()),
+            |_| panic!("must not rerun without a proven PR head"),
+        );
+        assert!(error.is_err());
+        assert!(failed_run_ids("not-json", "abc123").is_err());
+    }
+
+    #[test]
+    fn numbered_rerun_propagates_pr_lookup_failure_without_listing_runs() {
+        let error = rerun_failed_for_number(
+            42,
+            |_| Err(GhError::Other("lookup failed".into())),
+            |_| panic!("must not rerun after lookup failure"),
+        );
+        assert!(error.is_err());
     }
 }
