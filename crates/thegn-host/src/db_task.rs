@@ -10,24 +10,26 @@
 //! the loop non-blocking: [`persist`] queues a closure and returns immediately.
 //!
 //! **Scope: best-effort cache writes only.** Git is the source of truth and the
-//! DB is a cache (see CLAUDE.md), so a write dropped on a hard exit is
-//! acceptable here. The session-layout persist is also routed through this
-//! thread (`run::persist_session_layout` captures rows on the loop and queues
-//! the transaction): main.rs flushes the queue on every clean exit, and the
-//! cold workspace-switch path calls [`flush`] before resurrecting a session
-//! whose rows may still be queued. The bounded-queue overflow policy can also
-//! drop a newly submitted layout write; critical-write failure surfacing is a
-//! separate follow-up.
+//! DB is a cache (see CLAUDE.md). A write remains queued across a failed DB
+//! open and is retried when another run or flush message arrives. The
+//! session-layout persist is also routed through this thread
+//! (`run::persist_session_layout` captures rows on the loop and queues the
+//! transaction): main.rs performs a bounded shutdown flush, and the cold
+//! workspace-switch path calls [`flush`] before resurrecting a session whose
+//! rows may still be queued. Queue overflow and shutdown failures are counted
+//! and reported; in-session UI surfacing and a never-dropped critical-write
+//! class are separate follow-ups.
 //!
 //! The thread blocks on `recv()` (no polling, no timer, no `TerminalWaker`
 //! pulse), so it adds zero idle wakes — the 0%-idle contract is untouched.
 //!
 //! The FIFO is bounded. Overflow drops new best-effort writes and preserves
-//! the order of writes already queued; [`dropped_writes`] exposes the count
-//! for a later UI surfacing slice. Replaceable writes retain one pending job
-//! per key, regardless of how often a caller updates that key.
+//! the order of writes already queued; [`shutdown_flush`] exposes the total
+//! drop count for shutdown reporting and a later UI surfacing slice.
+//! Replaceable writes retain one pending job per key, regardless of how often
+//! a caller updates that key.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, SyncSender, channel, sync_channel};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -49,7 +51,7 @@ enum Msg {
     RunLatest {
         key: String,
     },
-    /// A barrier: the writer acks once every earlier `Run` has completed.
+    /// A barrier: the writer acks once every earlier job has run or been retained.
     Flush(SyncSender<()>),
 }
 
@@ -84,17 +86,18 @@ fn spawn_writer(open: impl Fn() -> anyhow::Result<Db> + Send + 'static) -> Write
     Writer { tx, state }
 }
 
-/// Drain jobs in FIFO order against a lazily-opened connection. A failed open is
-/// logged once and its job dropped (best-effort semantics); the next job retries
-/// the open, so a transient failure self-heals. Returns when the channel closes.
+/// Drain jobs in FIFO order against a lazily-opened connection. Failed opens
+/// retain their jobs and retry only when another message arrives. Returns when
+/// the channel closes.
 fn run(rx: Receiver<Msg>, open: impl Fn() -> anyhow::Result<Db>, state: Arc<QueueState>) {
     let mut db: Option<Db> = None;
     let mut warned = false;
+    let mut retained = VecDeque::new();
     while let Ok(msg) = rx.recv() {
         match msg {
             Msg::Run(job) => {
-                dequeue(&state);
-                run_job(&mut db, &mut warned, &open, job);
+                retain_job(&mut retained, job, &state);
+                drain_retained(&mut db, &mut warned, &open, &mut retained, &state);
             }
             Msg::RunLatest { key } => {
                 let job = {
@@ -103,15 +106,18 @@ fn run(rx: Receiver<Msg>, open: impl Fn() -> anyhow::Result<Db>, state: Arc<Queu
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                     let job = latest.remove(&key);
-                    dequeue(&state);
                     job
                 };
                 if let Some(job) = job {
-                    run_job(&mut db, &mut warned, &open, job);
+                    retain_job(&mut retained, job, &state);
+                    drain_retained(&mut db, &mut warned, &open, &mut retained, &state);
+                } else {
+                    dequeue(&state);
                 }
             }
-            // FIFO: acking here means every prior Run has already run.
+            // FIFO: acking means every prior job has run or remains retained.
             Msg::Flush(ack) => {
+                drain_retained(&mut db, &mut warned, &open, &mut retained, &state);
                 let _ = ack.send(()); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
             }
         }
@@ -144,12 +150,22 @@ fn dequeue(state: &QueueState) {
     }
 }
 
+fn retain_job(retained: &mut VecDeque<Job>, job: Job, state: &QueueState) {
+    retained.push_back(job);
+    if retained.len() >= MAX_QUEUED_JOBS
+        && let Some(_oldest) = retained.pop_front()
+    {
+        dequeue(state);
+        note_drop(state);
+    }
+}
+
 fn note_drop(state: &QueueState) {
     state.dropped.fetch_add(1, Ordering::Relaxed);
     if !state.overflow_warned.swap(true, Ordering::AcqRel) {
         tracing::warn!(
             dropped = state.dropped.load(Ordering::Relaxed),
-            "db-writer queue full; dropping new best-effort write"
+            "db-writer dropped a best-effort write"
         );
     }
 }
@@ -161,19 +177,21 @@ fn enqueue(writer: &Writer, job: impl FnOnce(&Db) + Send + 'static) -> bool {
     }
     if let Err(error) = writer.tx.send(Msg::Run(Box::new(job))) {
         dequeue(&writer.state);
+        note_drop(&writer.state);
         tracing::debug!(%error, "db-writer stopped before write could be queued");
         return false;
     }
     true
 }
 
-fn run_job(
+fn drain_retained(
     db: &mut Option<Db>,
     warned: &mut bool,
     open: &impl Fn() -> anyhow::Result<Db>,
-    job: Job,
+    retained: &mut VecDeque<Job>,
+    state: &QueueState,
 ) {
-    if db.is_none() {
+    if db.is_none() && !retained.is_empty() {
         match open() {
             Ok(d) => {
                 *db = Some(d);
@@ -181,7 +199,7 @@ fn run_job(
             }
             Err(e) => {
                 if !*warned {
-                    tracing::warn!("db-writer: open failed, dropping write: {e}");
+                    tracing::warn!("db-writer: open failed, retaining writes for retry: {e}");
                     *warned = true;
                 }
                 return;
@@ -189,7 +207,10 @@ fn run_job(
         }
     }
     if let Some(d) = db {
-        job(d);
+        while let Some(job) = retained.pop_front() {
+            job(d);
+            dequeue(state);
+        }
     }
 }
 
@@ -229,27 +250,63 @@ fn enqueue_latest(writer: &Writer, key: String, job: impl FnOnce(&Db) + Send + '
     if let Err(error) = writer.tx.send(Msg::RunLatest { key: key.clone() }) {
         latest.remove(&key);
         dequeue(&writer.state);
+        note_drop(&writer.state);
         tracing::debug!(%error, "db-writer stopped before replaceable write could be queued");
         return false;
     }
     true
 }
 
-/// Number of best-effort writes rejected because the bounded queue was full.
-#[allow(dead_code)] // Exposed for the follow-up UI surfacing slice.
-pub(crate) fn dropped_writes() -> u64 {
-    writer().state.dropped.load(Ordering::Relaxed)
-}
-
-/// Block until every previously-queued write has run, or `timeout` elapses
-/// (returns whether it drained in time). Called on the clean quit path so
-/// best-effort persists aren't lost at process exit.
+/// Wait until every earlier channel message has been handled, or `timeout`
+/// elapses. A retained job whose DB open still fails remains pending even when
+/// this barrier acks. Used on workspace switches before resurrecting rows.
 pub(crate) fn flush(timeout: Duration) -> bool {
     let (ack_tx, ack_rx) = sync_channel(0);
     if writer().tx.send(Msg::Flush(ack_tx)).is_err() {
         return false;
     }
     ack_rx.recv_timeout(timeout).is_ok()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ShutdownFlush {
+    pub(crate) drained: bool,
+    pub(crate) pending: usize,
+    pub(crate) dropped: u64,
+}
+
+/// Bounded shutdown barrier with enough detail to report writes still queued or lost.
+pub(crate) fn shutdown_flush(timeout: Duration) -> ShutdownFlush {
+    shutdown_flush_for(writer(), timeout)
+}
+
+fn shutdown_flush_for(writer: &Writer, timeout: Duration) -> ShutdownFlush {
+    let (ack_tx, ack_rx) = sync_channel(0);
+    let drained = writer.tx.send(Msg::Flush(ack_tx)).is_ok()
+        && ack_rx.recv_timeout(timeout).is_ok()
+        && writer.state.depth.load(Ordering::Acquire) == 0;
+    ShutdownFlush {
+        drained,
+        pending: writer.state.depth.load(Ordering::Acquire),
+        dropped: writer.state.dropped.load(Ordering::Relaxed),
+    }
+}
+
+pub(crate) fn shutdown_notice(flush: &ShutdownFlush) -> Option<String> {
+    if flush.drained && flush.dropped == 0 {
+        return None;
+    }
+    let mut details = Vec::new();
+    if !flush.drained {
+        details.push(format!("{} write(s) still pending", flush.pending));
+    }
+    if flush.dropped > 0 {
+        details.push(format!("{} write(s) dropped", flush.dropped));
+    }
+    Some(format!(
+        "thegn: database shutdown flush incomplete ({})",
+        details.join(", ")
+    ))
 }
 
 #[cfg(test)]
@@ -368,8 +425,8 @@ mod tests {
 
     #[test]
     fn open_failure_is_survived_without_panic() {
-        // An opener that always fails: jobs are dropped, the thread stays alive,
-        // and the flush barrier still acks.
+        // An opener that always fails: jobs remain retained, the thread stays
+        // alive, and the flush barrier still acks.
         let writer = spawn_writer(|| anyhow::bail!("no db for you"));
         assert!(enqueue(&writer, |_db| {
             unreachable!("open never succeeds")
@@ -377,6 +434,126 @@ mod tests {
         let (ack_tx, ack_rx) = sync_channel(0);
         writer.tx.send(Msg::Flush(ack_tx)).unwrap();
         assert!(ack_rx.recv_timeout(Duration::from_secs(5)).is_ok());
+        assert_eq!(writer.state.dropped.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn open_failure_retains_writes_until_open_recovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("recovery.db");
+        let opener_path = path.clone();
+        let opens = Arc::new(AtomicUsize::new(0));
+        let opener_count = Arc::clone(&opens);
+        let writer = spawn_writer(move || {
+            if opener_count.fetch_add(1, Ordering::SeqCst) == 0 {
+                anyhow::bail!("transient open failure")
+            }
+            Db::open_at(&opener_path)
+        });
+        let order = Arc::new(Mutex::new(Vec::new()));
+        for value in ["a", "b"] {
+            let order = Arc::clone(&order);
+            let value = value.to_string();
+            assert!(enqueue(&writer, move |db| {
+                order.lock().unwrap().push(value.clone());
+                db.set_ui_state("t", "k", &value).unwrap();
+            }));
+        }
+        barrier(&writer);
+
+        assert_eq!(
+            *order.lock().unwrap(),
+            vec!["a".to_string(), "b".to_string()]
+        );
+        let db = Db::open_at(&path).unwrap();
+        assert_eq!(db.get_ui_state("t", "k").unwrap().as_deref(), Some("b"));
+        assert_eq!(writer.state.dropped.load(Ordering::Relaxed), 0);
+        assert!(opens.load(Ordering::SeqCst) >= 2);
+    }
+
+    #[test]
+    fn persistently_failing_open_counts_overflow_and_retained_evictions() {
+        let writer = spawn_writer(|| anyhow::bail!("database stays unavailable"));
+        let mut accepted = 0usize;
+        let mut overflows = 0usize;
+        for _ in 0..(MAX_QUEUED_JOBS + 3) {
+            if enqueue(&writer, |_db| {}) {
+                accepted += 1;
+            } else {
+                overflows += 1;
+            }
+        }
+        barrier(&writer);
+
+        let retained = MAX_QUEUED_JOBS - 1;
+        let evictions = accepted - retained;
+        assert_eq!(
+            writer.state.dropped.load(Ordering::Relaxed),
+            (overflows + evictions) as u64
+        );
+        assert_eq!(writer.state.depth.load(Ordering::Relaxed), retained);
+        let (ack_tx, ack_rx) = sync_channel(0);
+        writer.tx.send(Msg::Flush(ack_tx)).unwrap();
+        assert!(ack_rx.recv_timeout(Duration::from_secs(5)).is_ok());
+    }
+
+    #[test]
+    fn send_to_stopped_writer_counts_as_a_drop() {
+        let (tx, rx) = channel();
+        drop(rx);
+        let writer = Writer {
+            tx,
+            state: Arc::new(QueueState::default()),
+        };
+
+        assert!(!enqueue(&writer, |_db| {}));
+        assert_eq!(writer.state.dropped.load(Ordering::Relaxed), 1);
+        assert_eq!(writer.state.depth.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn shutdown_notice_reports_pending_and_dropped_writes() {
+        assert_eq!(
+            shutdown_notice(&ShutdownFlush {
+                drained: true,
+                pending: 0,
+                dropped: 0
+            }),
+            None
+        );
+        let timed_out = shutdown_notice(&ShutdownFlush {
+            drained: false,
+            pending: 3,
+            dropped: 0,
+        })
+        .unwrap();
+        assert!(timed_out.contains("3 write(s) still pending"));
+        let dropped = shutdown_notice(&ShutdownFlush {
+            drained: true,
+            pending: 0,
+            dropped: 2,
+        })
+        .unwrap();
+        assert!(dropped.contains("2 write(s) dropped"));
+    }
+
+    #[test]
+    fn shutdown_flush_reports_a_blocked_job_as_pending() {
+        let (writer, _path, _dir) = temp_writer();
+        let (started_tx, started_rx) = channel();
+        let (release_tx, release_rx) = channel();
+        assert!(enqueue(&writer, move |_db| {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        }));
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        let result = shutdown_flush_for(&writer, Duration::from_millis(10));
+        assert!(!result.drained);
+        assert!(result.pending >= 1);
+
+        release_tx.send(()).unwrap();
+        barrier(&writer);
     }
 
     #[test]

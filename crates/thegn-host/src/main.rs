@@ -861,6 +861,13 @@ fn report_kept_sessions(kept: usize) {
     }
 }
 
+/// Report DB writes still pending or dropped at shutdown after the compositor
+/// has restored the terminal.
+#[allow(clippy::disallowed_macros)]
+fn report_db_shutdown(notice: &str) {
+    eprintln!("{notice}");
+}
+
 /// Report the one-time brand migration. Runs before any tracing subscriber
 /// exists (and before the compositor takes the terminal), so stderr is the
 /// only sink that reaches the user — hence the local allow.
@@ -1099,7 +1106,11 @@ fn run_main() -> anyhow::Result<()> {
     // Drain queued best-effort DB writes (yank registers, panel ui_state) before
     // exit. The writer is its own std thread, so it outlives the runtime and this
     // catches every quit path with one call.
-    db_task::flush(std::time::Duration::from_secs(2));
+    let db_flush = db_task::shutdown_flush(std::time::Duration::from_secs(2));
+    if let Some(notice) = db_task::shutdown_notice(&db_flush) {
+        tracing::warn!(%notice, "database writes did not all flush at shutdown");
+        report_db_shutdown(&notice);
+    }
     // A daemon-disabled resurrect fire-and-forgets kills for the daemon
     // sessions it claimed; their pane_sessions records are already consumed,
     // so letting shutdown_background() abort an in-flight kill would silently
