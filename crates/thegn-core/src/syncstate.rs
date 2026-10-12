@@ -300,11 +300,11 @@ mod tests {
 
         let repo = tempfile::tempdir().unwrap();
         let run_git = |args: &[&str]| {
-            Command::new("git")
+            crate::util::git_cmd(repo.path())
                 .arg("-c")
                 .arg("commit.gpgsign=false")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
                 .args(args)
-                .current_dir(repo.path())
                 .output()
                 .unwrap()
         };
