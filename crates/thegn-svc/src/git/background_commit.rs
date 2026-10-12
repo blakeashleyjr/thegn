@@ -165,18 +165,19 @@ pub(crate) fn run_with_timeout(
         }
         .into());
     }
+    let timeout = timeout.min(MAX_BACKGROUND_COMMIT_TIMEOUT);
     let _lock = if loc.is_remote() {
         None
     } else {
         let worktree = std::path::Path::new(&loc.path()).to_path_buf();
         let lock_path = thegn_core::util::git_common_dir(&worktree).join("thegn-git.lock");
         Some(
-            thegn_core::util::try_lock_git_mutations(&worktree).map_err(|error| {
-                BackgroundCommitFailure::LockUnavailable {
+            thegn_core::util::try_lock_git_mutations_within(&worktree, timeout).map_err(
+                |error| BackgroundCommitFailure::LockUnavailable {
                     lock_path: lock_path.display().to_string(),
                     error: error.to_string(),
-                }
-            })?,
+                },
+            )?,
         )
     };
     let mut env: Vec<(&str, &str)> = vec![
@@ -188,7 +189,6 @@ pub(crate) fn run_with_timeout(
         ("WAYLAND_DISPLAY", ""),
     ];
     env.extend_from_slice(envs);
-    let timeout = timeout.min(MAX_BACKGROUND_COMMIT_TIMEOUT);
     // Compute before spawning anything. `checked_add` avoids overflowing even
     // if this function is called with `Duration::MAX`.
     let now = Instant::now();
@@ -628,6 +628,48 @@ mod unix_tests {
             ),
             "lock failure must be typed: {error:#}"
         );
+        assert_eq!(repo.head(), head);
+        assert_eq!(repo.out(&["diff", "--cached", "--name-only"]), "staged.txt");
+    }
+
+    #[test]
+    fn held_lock_bounds_background_commit_by_its_timeout() {
+        let repo = TestRepo::new("plumb-lock-timeout");
+        ident(&repo.dir);
+        repo.commit_file("f.txt", "one\n", "c0");
+        let loc = repo.loc();
+        let head = repo.head();
+        std::fs::write(repo.dir.join("staged.txt"), "staged\n").unwrap();
+        git_in(&repo.dir, &["add", "staged.txt"]);
+        let held = thegn_core::util::try_lock_git_mutations(&repo.dir).unwrap();
+        let worker_loc = loc.clone();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            sender
+                .send(run_with_timeout(
+                    &worker_loc,
+                    &[],
+                    &["commit", "-F", "-"],
+                    b"must remain staged\n",
+                    std::time::Duration::from_millis(200),
+                ))
+                .unwrap();
+        });
+
+        let received = receiver.recv_timeout(std::time::Duration::from_secs(10));
+        drop(held);
+        worker.join().unwrap();
+        let error = received
+            .expect("background commit must return while the lock remains held")
+            .unwrap_err();
+        assert!(
+            matches!(
+                error.downcast_ref::<BackgroundCommitFailure>(),
+                Some(BackgroundCommitFailure::LockUnavailable { .. })
+            ),
+            "lock wait must be a typed failure: {error:#}"
+        );
+        assert!(error.to_string().contains("timed out"), "{error}");
         assert_eq!(repo.head(), head);
         assert_eq!(repo.out(&["diff", "--cached", "--name-only"]), "staged.txt");
     }
