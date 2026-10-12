@@ -21,8 +21,30 @@ use thegn_core::rebase_todo::{
 use thegn_core::remote::GitLoc;
 use thegn_core::util::sh_quote;
 
-/// Scratch file (inside the private gitdir) holding the prepared todo.
-const TODO_SCRATCH: &str = "thegn-todo";
+/// Per-process sequence for unique scratch names; the PID separates concurrent
+/// Thegn processes and the counter separates concurrent operations in one.
+static TODO_SCRATCH_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Read sequencer markers without conflating local read failures with absence.
+/// Remote `GitLoc` reads expose only `Option`, so they retain that API's limit.
+fn read_rebase_marker(loc: &GitLoc, rel: &str) -> Result<Option<Vec<u8>>> {
+    if let GitLoc::Local(path) = loc {
+        let resolved = loc
+            .git_out(&["rev-parse", "--git-path", rel])
+            .ok_or_else(|| anyhow!("cannot resolve sequencer marker {rel}"))?;
+        let resolved = if resolved.starts_with('/') {
+            std::path::PathBuf::from(resolved)
+        } else {
+            path.join(resolved)
+        };
+        return match std::fs::read(&resolved) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error).with_context(|| format!("read sequencer marker {rel}")),
+        };
+    }
+    Ok(loc.read_git_path(rel))
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct RebaseOpts {
@@ -86,47 +108,72 @@ fn rebase_with_todo(
         } else {
             format!("{base}..HEAD")
         };
-        if let Ok(revs) = run_w(loc, &[], &["rev-list", &range]) {
-            let todo_shas: Vec<&str> = todo.iter().map(|e| e.sha.as_str()).collect();
-            for rev in revs.split_whitespace() {
-                let covered = todo_shas
-                    .iter()
-                    .any(|s| rev.starts_with(*s) || s.starts_with(rev));
-                if !covered {
-                    bail!(
-                        "branch advanced during rebase (commit {} is not in the planned todo) — retry",
-                        &rev[..rev.len().min(8)]
-                    );
-                }
-            }
+        let revs = run_w(loc, &[], &["rev-list", "--reverse", &range])
+            .context("verify rebase range before starting")?;
+        let expected: Vec<&str> = revs.split_whitespace().collect();
+        // Keep explicit `drop` entries in this equality check: they are the
+        // user's deliberate decision for an in-range commit, not an omission.
+        let planned: Vec<&str> = todo.iter().map(|entry| entry.sha.as_str()).collect();
+        let expected_set: std::collections::HashSet<_> = expected.iter().copied().collect();
+        let planned_set: std::collections::HashSet<_> = planned.iter().copied().collect();
+        if expected_set != planned_set
+            || expected_set.len() != expected.len()
+            || planned_set.len() != planned.len()
+        {
+            bail!("branch advanced or todo does not exactly cover the range — reload and retry");
         }
     }
-    loc.write_git_path(TODO_SCRATCH, serialize_todo(todo).as_bytes())
+    let scratch_name = format!(
+        "thegn-todo-{}-{}",
+        std::process::id(),
+        TODO_SCRATCH_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    loc.write_git_path(&scratch_name, serialize_todo(todo).as_bytes())
         .context("write prepared rebase todo")?;
-    let scratch = loc
-        .git_out(&["rev-parse", "--git-path", TODO_SCRATCH])
-        .ok_or_else(|| anyhow!("cannot resolve todo scratch path"))?;
-    let scratch = if scratch.starts_with('/') {
-        scratch
-    } else {
-        format!("{}/{scratch}", loc.path())
-    };
-    let editor = format!("cp {}", sh_quote(&scratch));
-    let mut args = gpg_args(opts.override_gpg).to_vec();
-    args.extend([
-        "rebase",
-        "-i",
-        "--no-autosquash",
-        "--empty=keep", // default --empty=stop would pause on empty commits
-        base,
-    ]);
-    let envs = [
-        ("GIT_SEQUENCE_EDITOR", editor.as_str()),
-        // Squash-message and reword stops open $GIT_EDITOR; `:` accepts the
-        // default message so the rebase never blocks on a terminal.
-        ("GIT_EDITOR", ":"),
-    ];
-    classify(loc, run_w(loc, &envs, &args))
+    let mut cleanup_path = None;
+    let result = (|| {
+        let scratch = loc
+            .git_out(&["rev-parse", "--git-path", &scratch_name])
+            .ok_or_else(|| anyhow!("cannot resolve todo scratch path"))?;
+        let scratch = if scratch.starts_with('/') {
+            scratch
+        } else {
+            format!("{}/{scratch}", loc.path())
+        };
+        cleanup_path = Some(scratch.clone());
+        let editor = format!("cp {}", sh_quote(&scratch));
+        let mut args = gpg_args(opts.override_gpg).to_vec();
+        args.extend([
+            "rebase",
+            "-i",
+            "--no-autosquash",
+            "--empty=keep", // default --empty=stop would pause on empty commits
+            base,
+        ]);
+        let envs = [
+            ("GIT_SEQUENCE_EDITOR", editor.as_str()),
+            ("GIT_EDITOR", ":"),
+        ];
+        classify(loc, run_w(loc, &envs, &args))
+    })();
+    match cleanup_path {
+        Some(path) => match loc
+            .sh_command(&format!("rm -f -- {}", sh_quote(&path)))
+            .status()
+        {
+            Ok(status) if status.success() => {}
+            Ok(_) => {
+                tracing::warn!(target: "thegn::git", "could not remove prepared rebase todo scratch file")
+            }
+            Err(error) => {
+                tracing::warn!(target: "thegn::git", %error, "could not remove prepared rebase todo scratch file")
+            }
+        },
+        None => {
+            tracing::warn!(target: "thegn::git", "could not resolve prepared rebase todo scratch file for cleanup")
+        }
+    }
+    result
 }
 
 /// Map a rebase invocation result onto Done/Conflict/Paused by probing the
@@ -135,8 +182,8 @@ fn rebase_with_todo(
 /// completion), while conflicts exit non-zero; a non-zero exit with no
 /// rebase in progress is a real error.
 fn classify(loc: &GitLoc, res: Result<String>) -> Result<RebaseOutcome> {
-    let rebasing = loc.read_git_path("rebase-merge/onto").is_some()
-        || loc.read_git_path("rebase-apply/onto").is_some();
+    let rebasing = read_rebase_marker(loc, "rebase-merge/onto")?.is_some()
+        || read_rebase_marker(loc, "rebase-apply/onto")?.is_some();
     match res {
         Ok(_) if !rebasing => Ok(RebaseOutcome::Done),
         Ok(_) => Ok(RebaseOutcome::Paused),
@@ -144,10 +191,9 @@ fn classify(loc: &GitLoc, res: Result<String>) -> Result<RebaseOutcome> {
             if !rebasing {
                 return Err(e);
             }
-            let conflicted = loc
-                .git_out(&["diff", "--name-only", "--diff-filter=U"])
-                .is_some();
-            if conflicted {
+            let conflicts = run_w(loc, &[], &["diff", "--name-only", "--diff-filter=U"])
+                .context("probe unmerged paths while classifying rebase")?;
+            if !conflicts.trim().is_empty() {
                 Ok(RebaseOutcome::Conflict)
             } else {
                 Ok(RebaseOutcome::Paused)
@@ -159,9 +205,19 @@ fn classify(loc: &GitLoc, res: Result<String>) -> Result<RebaseOutcome> {
 /// The base argument for rewriting history that includes `sha`: its parent,
 /// or `--root` for a root commit.
 fn base_for(loc: &GitLoc, sha: &str) -> Result<String> {
-    match loc.git_out(&["rev-parse", "--verify", "-q", &format!("{sha}^")]) {
-        Some(parent) => Ok(parent),
-        None => Ok("--root".to_string()),
+    let commit_expr = format!("{sha}^{{commit}}");
+    let commit = run_w(loc, &[], &["rev-parse", "--verify", "-q", &commit_expr])
+        .with_context(|| format!("verify rebase target {sha}"))?;
+    let parents = run_w(loc, &[], &["rev-list", "--parents", "-n", "1", &commit])
+        .with_context(|| format!("read parents of rebase target {sha}"))?;
+    let mut ids = parents.split_whitespace();
+    let _verified_commit = ids
+        .next()
+        .ok_or_else(|| anyhow!("git returned no commit for {sha}"))?;
+    match (ids.next(), ids.next()) {
+        (Some(parent), None) => Ok(parent.to_owned()),
+        (None, None) => Ok("--root".to_string()),
+        _ => bail!("git returned an invalid parent list for rebase target {sha}"),
     }
 }
 
@@ -392,27 +448,33 @@ pub trait RebaseOps: GitBackend {
     /// The paused rebase's live state, or `None` when no interactive rebase
     /// is in progress.
     fn rebase_status(&self, loc: &GitLoc) -> Result<Option<RebaseStatus>> {
-        let Some(onto) = loc.read_git_path("rebase-merge/onto") else {
+        let Some(onto) = read_rebase_marker(loc, "rebase-merge/onto")? else {
             return Ok(None);
         };
+        let head_name = read_rebase_marker(loc, "rebase-merge/head-name")?
+            .ok_or_else(|| anyhow!("rebase state is unreadable: missing head-name"))?;
+        let done = read_rebase_marker(loc, "rebase-merge/done")?
+            .ok_or_else(|| anyhow!("rebase state is unreadable: missing done todo"))?;
+        let remaining = read_rebase_marker(loc, "rebase-merge/git-rebase-todo")?
+            .ok_or_else(|| anyhow!("rebase state is unreadable: missing pending todo"))?;
         let text = |b: Option<Vec<u8>>| {
             b.map(|b| String::from_utf8_lossy(&b).trim().to_string())
                 .unwrap_or_default()
         };
-        let conflicted = loc
-            .git_out(&["diff", "--name-only", "--diff-filter=U"])
-            .is_some();
+        let conflicts = run_w(loc, &[], &["diff", "--name-only", "--diff-filter=U"])
+            .context("probe unmerged paths in rebase status")?;
+        let conflicted = !conflicts.trim().is_empty();
         Ok(Some(RebaseStatus {
             onto: text(Some(onto)),
-            head_name: text(loc.read_git_path("rebase-merge/head-name"))
+            head_name: text(Some(head_name))
                 .trim_start_matches("refs/heads/")
                 .to_string(),
             stopped_sha: {
                 let s = text(loc.read_git_path("rebase-merge/stopped-sha"));
                 (!s.is_empty()).then_some(s)
             },
-            done: parse_todo(&text(loc.read_git_path("rebase-merge/done"))),
-            remaining: parse_todo(&text(loc.read_git_path("rebase-merge/git-rebase-todo"))),
+            done: parse_todo(&text(Some(done))),
+            remaining: parse_todo(&text(Some(remaining))),
             paused: if conflicted {
                 PauseReason::Conflict
             } else {
@@ -547,6 +609,39 @@ mod tests {
         // The branch is untouched — c5 is still there.
         assert_eq!(r.out(&["rev-parse", "HEAD"]), head_before);
         assert_eq!(r.subjects(), ["c5", "c4", "c3", "c2", "c1"]);
+    }
+
+    #[test]
+    fn rebase_bails_when_todo_duplicates_a_commit() {
+        let r = linear("todo-range-mismatch");
+        let c2 = r.sha_of("c2");
+        let base = base_for(&r.loc(), &c2).unwrap();
+        let mut todo = CliGit.rebase_todo_for(&r.loc(), &c2).unwrap();
+        todo.push(todo[0].clone());
+        let before = r.out(&["rev-parse", "HEAD"]);
+        let error = CliGit
+            .rebase_interactive(&r.loc(), &base, &todo, &opts())
+            .unwrap_err();
+        assert!(error.to_string().contains("exactly cover"));
+        assert_eq!(r.out(&["rev-parse", "HEAD"]), before);
+    }
+
+    #[test]
+    fn base_for_uses_root_only_for_a_verified_root_commit() {
+        let r = repo("base-for-root");
+        r.commit_file("root.txt", "root\n", "root");
+        let root = r.sha_of("root");
+        assert_eq!(base_for(&r.loc(), &root).unwrap(), "--root");
+        assert!(base_for(&r.loc(), "deadbeef-deadbeef").is_err());
+    }
+
+    #[test]
+    fn unreadable_local_rebase_marker_is_an_error_not_absence() {
+        let r = repo("unreadable-rebase-marker");
+        std::fs::create_dir_all(r.dir.join(".git/rebase-merge/onto")).unwrap();
+        let error = read_rebase_marker(&r.loc(), "rebase-merge/onto")
+            .expect_err("a directory at the marker path is unreadable, not absent");
+        assert!(error.to_string().contains("read sequencer marker"));
     }
 
     #[test]
