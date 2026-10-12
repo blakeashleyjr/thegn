@@ -1589,7 +1589,7 @@ mod tests {
         };
         assert!(
             bytes.starts_with(
-                format!("\x1b_Ga=T,f=24,s=1,v=1,i={},", CORNER_ID_BASE + 1).as_bytes()
+                format!("\x1b_Ga=T,i={},f=24,s=1,v=1,", CORNER_ID_BASE + 1).as_bytes()
             )
         );
 
