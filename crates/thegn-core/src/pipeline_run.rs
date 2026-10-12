@@ -89,6 +89,9 @@ pub struct VerifyFacts {
     pub tracked: bool,
     /// The worktree has uncommitted changes.
     pub dirty: bool,
+    /// Typed observation of the complete worktree status probe. `None` means
+    /// no status probe was needed (plain dispatch without an artifact).
+    pub worktree_state: Option<WorktreeState>,
     /// The row's `report` column is Some and non-empty after trimming.
     /// A dispatch with an `artifact_path` set must also file a report;
     /// the gated rule in [`verify_report`] names `dispatch report` as the
@@ -97,6 +100,31 @@ pub struct VerifyFacts {
     /// The report does not make an unsupported PASS claim. Non-PASS reports
     /// satisfy this automatically; PASS requires meaningful gate evidence.
     pub report_gate_valid: bool,
+}
+
+/// Result of observing `git status --porcelain` for an artifact-bearing row.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorktreeState {
+    Clean,
+    Dirty,
+    Unknown,
+}
+
+/// Wake-time interpretation of a vanished worker's row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HandoffOutcome {
+    VerifiedHandoff,
+    UnverifiedCandidate,
+    Absent,
+    InfrastructureUnknown,
+}
+
+impl HandoffOutcome {
+    pub const fn handoff_present(self) -> bool {
+        matches!(self, Self::VerifiedHandoff)
+    }
 }
 
 /// The verdict for one run-completion claim, plus the reasons a caller can
@@ -109,11 +137,15 @@ pub struct VerifyReport {
     pub exists: bool,
     pub tracked: bool,
     pub dirty: bool,
+    /// Typed status result; absent only when a plain dispatch skipped Git.
+    pub worktree_state: Option<WorktreeState>,
     pub report_present: bool,
     pub report_gate_valid: bool,
     /// Only the things that make `ok` false — a caller prints this verbatim
     /// on refusal. `dirty` is deliberately *not* here: it never blocks.
     pub reasons: Vec<String>,
+    /// Non-blocking diagnostics about facts that could not be observed.
+    pub warnings: Vec<String>,
 }
 
 /// The run-completion verdict for one roster row.
@@ -140,12 +172,21 @@ pub fn verify_report(f: &VerifyFacts) -> VerifyReport {
             exists: f.exists,
             tracked: f.tracked,
             dirty: f.dirty,
+            worktree_state: f.worktree_state.clone(),
             report_present: f.report_present,
             report_gate_valid: f.report_gate_valid,
             reasons: Vec::new(),
+            warnings: Vec::new(),
         };
     };
     let mut reasons = Vec::new();
+    let mut warnings = Vec::new();
+    if f.worktree_state == Some(WorktreeState::Unknown) {
+        warnings.push(
+            "could not observe worktree status (`git status --porcelain`); retry verification"
+                .into(),
+        );
+    }
     if !f.exists {
         reasons.push(format!("artifact {a:?} does not exist under the worktree"));
     } else if !f.tracked {
@@ -170,9 +211,11 @@ pub fn verify_report(f: &VerifyFacts) -> VerifyReport {
         exists: f.exists,
         tracked: f.tracked,
         dirty: f.dirty,
+        worktree_state: f.worktree_state.clone(),
         report_present: f.report_present,
         report_gate_valid: f.report_gate_valid,
         reasons,
+        warnings,
     }
 }
 
@@ -483,6 +526,13 @@ mod tests {
             exists,
             tracked,
             dirty,
+            worktree_state: artifact.map(|_| {
+                if dirty {
+                    WorktreeState::Dirty
+                } else {
+                    WorktreeState::Clean
+                }
+            }),
             report_present,
             report_gate_valid: true,
         }
@@ -534,6 +584,20 @@ mod tests {
         // …and a refusal's dirty flag is still just a report.
         let both = verify_report(&facts(Some("a.md"), true, false, true));
         assert!(!both.ok && both.dirty && both.reasons.len() == 1);
+    }
+
+    #[test]
+    fn an_unknown_worktree_status_is_reported_without_changing_the_gate() {
+        let mut f = facts_report(Some("a.md"), true, true, false, true);
+        f.worktree_state = Some(WorktreeState::Unknown);
+        let r = verify_report(&f);
+        assert!(
+            r.ok,
+            "unknown status remains a warning under today's contract"
+        );
+        assert!(!r.dirty, "legacy boolean remains backward compatible");
+        assert_eq!(r.worktree_state, Some(WorktreeState::Unknown));
+        assert!(r.warnings.iter().any(|w| w.contains("retry verification")));
     }
 
     #[test]
