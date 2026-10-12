@@ -190,6 +190,9 @@ pub(crate) mod state_db_capture;
 /// Physical identity and nonblocking ownership checks for local gate state.
 pub(crate) mod gate_path;
 
+/// Descriptor-relative no-symlink open for a regular file beneath a root.
+pub(crate) mod open_beneath;
+
 /// Private custody of the merge queue's temp bundle (per-OS exclusive creation
 /// and identity-verified cleanup); `merge_remote.rs` stays platform-free.
 pub(crate) mod bundle_custody;

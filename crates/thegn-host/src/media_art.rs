@@ -316,13 +316,13 @@ async fn load_raster(art_url: &str) -> Result<crate::rasterize::Raster, Reject> 
     }
     if let Some(path) = local_path(art_url) {
         return admitted_blocking(&DECODE_SLOT, move || {
-            let path = admit_local_art(&path, &local_art_roots())?;
-            crate::rasterize::image_file_exact_with_limits(
-                &path,
-                MAX_ART_BYTES as u64,
-                crate::rasterize::MEDIA_ART_LIMITS,
-            )
-            .map_err(|_| Reject::Decode)
+            let (root, rel) = admit_local_art(&path, &local_art_roots())?;
+            let file = crate::platform::open_beneath::open_regular_beneath(&root, &rel)
+                .map_err(|_| Reject::LocalPath)?;
+            let bytes = crate::rasterize::read_open_regular_capped(file, MAX_ART_BYTES as u64)
+                .map_err(|_| Reject::Decode)?;
+            crate::rasterize::image_bytes_with_limits(&bytes, crate::rasterize::MEDIA_ART_LIMITS)
+                .map_err(|_| Reject::Decode)
         })
         .await?;
     }
@@ -426,21 +426,22 @@ fn local_art_roots() -> Vec<std::path::PathBuf> {
 }
 
 /// Admit a local art file only when its canonical location is under one of the
-/// canonical allowlist roots. Returning the canonical path also prevents a
-/// later path-based read from following a symlink that escaped the root.
+/// canonical allowlist roots. Return the root plus relative path so the later
+/// open can walk every component without following a symlink.
 fn admit_local_art(
     path: &std::path::Path,
     roots: &[std::path::PathBuf],
-) -> Result<std::path::PathBuf, Reject> {
+) -> Result<(std::path::PathBuf, std::path::PathBuf), Reject> {
     let canonical_path = path.canonicalize().map_err(|_| Reject::LocalPath)?;
-    if roots.iter().any(|root| {
-        root.canonicalize()
-            .is_ok_and(|canonical_root| canonical_path.starts_with(canonical_root))
-    }) {
-        Ok(canonical_path)
-    } else {
-        Err(Reject::LocalPath)
+    for root in roots {
+        let Ok(canonical_root) = root.canonicalize() else {
+            continue;
+        };
+        if let Ok(rel) = canonical_path.strip_prefix(&canonical_root) {
+            return Ok((canonical_root, rel.to_path_buf()));
+        }
     }
+    Err(Reject::LocalPath)
 }
 
 #[cfg(test)]
@@ -494,9 +495,15 @@ mod tests {
         std::fs::write(&outside_file, b"bounded test fixture").unwrap();
         let roots = vec![root.path().to_path_buf()];
 
+        let (admitted_root, admitted_rel) = admit_local_art(&allowed_file, &roots).unwrap();
+        assert_eq!(admitted_root, root.path().canonicalize().unwrap());
+        assert_eq!(admitted_rel, std::path::Path::new("sub/cover.png"));
+        let opened =
+            crate::platform::open_beneath::open_regular_beneath(&admitted_root, &admitted_rel)
+                .unwrap();
         assert_eq!(
-            admit_local_art(&allowed_file, &roots).unwrap(),
-            allowed_file.canonicalize().unwrap()
+            crate::rasterize::read_open_regular_capped(opened, 100).unwrap(),
+            b"bounded test fixture"
         );
         assert_eq!(
             admit_local_art(&outside_file, &roots),
@@ -519,16 +526,41 @@ mod tests {
     }
 
     #[test]
-    fn admitted_fifo_is_refused_by_exact_nonblocking_read() {
+    fn admitted_fifo_is_refused_by_nonblocking_beneath_open() {
         if !crate::platform::test_fifo_supported() {
             return;
         }
         let root = tempfile::tempdir().unwrap();
         let fifo = root.path().join("cover.fifo");
         crate::platform::test_fifo(&fifo).unwrap();
-        let admitted = admit_local_art(&fifo, &[root.path().to_path_buf()]).unwrap();
+        let (admitted_root, admitted_rel) =
+            admit_local_art(&fifo, &[root.path().to_path_buf()]).unwrap();
         assert!(
-            crate::rasterize::read_regular_capped_exact(&admitted, MAX_ART_BYTES as u64).is_err()
+            crate::platform::open_beneath::open_regular_beneath(&admitted_root, &admitted_rel)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn admitted_directory_swap_to_symlink_is_refused() {
+        if !crate::platform::test_symlink_supported() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let sub = root.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join("cover.png"), b"inside bytes").unwrap();
+        std::fs::write(outside.path().join("cover.png"), b"outside bytes").unwrap();
+        let (admitted_root, admitted_rel) =
+            admit_local_art(&sub.join("cover.png"), &[root.path().to_path_buf()]).unwrap();
+
+        std::fs::rename(&sub, root.path().join("sub-saved")).unwrap();
+        crate::platform::test_symlink(outside.path(), &sub).unwrap();
+
+        assert!(
+            crate::platform::open_beneath::open_regular_beneath(&admitted_root, &admitted_rel)
+                .is_err()
         );
     }
 
