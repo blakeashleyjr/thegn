@@ -447,17 +447,10 @@ fn log(
             "redacted": entry.redacted,
         }));
     }
-    if entry.truncated {
-        outln!("… (showing last {} lines)", cfg.ci.log_tail_lines);
-    }
-    let log = thegn_core::ci::CiLog {
-        text: entry.text.clone(),
-        truncated: entry.truncated,
-    };
-    if let Some(n) = log.first_failure_line() {
-        outln!(">> first failure at line {}", n + 1);
-    }
-    outln!("{}", thegn_svc::lsp::sanitize_for_terminal(&entry.text));
+    outln!(
+        "{}",
+        render_log_output(&entry.text, entry.truncated, cfg.ci.log_tail_lines)
+    );
     Ok(())
 }
 
@@ -542,8 +535,8 @@ fn detect(cfg: &Config, worktree: Option<String>) -> Result<()> {
         outln!("no CI config files detected in this worktree");
     } else {
         outln!("detected CI configs:");
-        for c in &detected {
-            outln!("  {:<16} {}", c.system.label(), c.files.join(", "));
+        for line in detect_lines(&detected) {
+            outln!("{line}");
         }
     }
     match thegn_svc::ci::resolve_system(&loc, &cfg.ci) {
@@ -551,6 +544,36 @@ fn detect(cfg: &Config, worktree: Option<String>) -> Result<()> {
         None => outln!("active provider: none"),
     }
     Ok(())
+}
+
+fn detect_lines(detected: &[ci::CiConfig]) -> Vec<String> {
+    detected
+        .iter()
+        .map(|c| {
+            thegn_svc::lsp::sanitize_for_terminal(&format!(
+                "  {:<16} {}",
+                c.system.label(),
+                c.files.join(", ")
+            ))
+        })
+        .collect()
+}
+
+fn render_log_output(text: &str, truncated: bool, tail_lines: usize) -> String {
+    let sanitized = thegn_svc::lsp::sanitize_for_terminal(text);
+    let mut output = String::new();
+    if truncated {
+        output.push_str(&format!("… (showing last {tail_lines} lines)\n"));
+    }
+    let log = thegn_core::ci::CiLog {
+        text: text.to_string(),
+        truncated,
+    };
+    if let Some(line) = log.first_failure_line() {
+        output.push_str(&format!(">> first failure at line {}\n", line + 1));
+    }
+    output.push_str(&sanitized);
+    output
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -565,6 +588,44 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detected_repository_names_are_inert_in_human_output() {
+        let detected = [ci::CiConfig {
+            system: thegn_core::ci::CiSystem::GithubActions,
+            files: vec![
+                ".github/workflows/\u{1b}]52;c;SGVsbG8=\u{7}".into(),
+                "\u{1b}[2Jworkflow.yml\u{009d}title".into(),
+            ],
+        }];
+        let output = detect_lines(&detected).join("\n");
+        assert!(!output.contains('\u{1b}'));
+        assert!(!output.contains('\u{009d}'));
+        assert!(output.contains("workflow.yml"));
+    }
+
+    #[test]
+    fn human_log_output_bytes_make_terminal_controls_inert() {
+        let hostile = concat!(
+            "ordinary failure\n",
+            "\u{1b}]52;c;SGVsbG8=\u{7}\n",
+            "\u{1b}[2J\n",
+            "\u{1b}_APC payload\u{1b}\\\n",
+            "\u{1b}P DCS payload\u{1b}\\\n",
+            "\u{009d}C1 OSC\u{009c}\n",
+            "split control starts\u{1b}\n[2J remains text\n",
+        );
+        let bytes = render_log_output(hostile, true, 20).into_bytes();
+        assert!(!bytes.contains(&0x1b));
+        let rendered = String::from_utf8(bytes).unwrap();
+        assert!(
+            !rendered
+                .chars()
+                .any(|c| ('\u{0080}'..='\u{009f}').contains(&c))
+        );
+        assert!(rendered.contains("ordinary failure\n"));
+        assert!(rendered.contains("split control starts\n[2J remains text"));
+    }
 
     #[test]
     fn cli_rejects_bad_ci_targets_before_cache_or_provider_access() {
