@@ -283,16 +283,7 @@ pub(crate) fn drive_queue(
         // The foreign-push guard applies only where it means something: we are
         // about to *write*. Merging a PR someone else advanced is fine (it is
         // still green); pushing over them is not.
-        let action = if moved
-            && cfg.pause_on_foreign_push
-            && matches!(action, QueueAction::DispatchAgent(_))
-        {
-            QueueAction::NeedsHuman(
-                "someone else pushed to this branch — not running an agent over their work".into(),
-            )
-        } else {
-            action
-        };
+        let action = pr_queue::pause_for_foreign_push(action, moved, cfg);
 
         match action {
             QueueAction::Drop => {
