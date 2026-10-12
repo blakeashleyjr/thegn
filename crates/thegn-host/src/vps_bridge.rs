@@ -13,6 +13,7 @@ use thegn_svc::vps::{registry, ssh_shim};
 /// Resolve the instance IP: registry fast path, then any configured VPS env's
 /// API (which re-persists the record — the stale-IP self-heal).
 fn resolve_ip(cfg: &Config, name: &str) -> Result<String> {
+    registry::checked_name(name).context("vps-ssh: invalid instance name")?;
     if let Some(rec) = registry::read(name)
         && rec.state == "ready"
         && !rec.ip.is_empty()
@@ -47,6 +48,7 @@ fn resolve_ip(cfg: &Config, name: &str) -> Result<String> {
 pub fn run(cfg: &Config, name: &str, cmd: &[String]) -> Result<()> {
     use std::io::IsTerminal;
 
+    let name = registry::checked_name(name).context("vps-ssh: invalid instance name")?;
     let ip = resolve_ip(cfg, name)?;
     let provider_name = registry::read(name)
         .map(|record| record.provider)
@@ -88,5 +90,17 @@ pub fn run(cfg: &Config, name: &str, cmd: &[String]) -> Result<()> {
             .status()
             .with_context(|| format!("vps-ssh: run {}", argv.join(" ")))?;
         std::process::exit(status.code().unwrap_or(1));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_ip_rejects_unsafe_name_before_provider_discovery() {
+        let error = resolve_ip(&Config::default(), "../x").unwrap_err();
+        assert!(error.to_string().contains("invalid instance name"));
+        assert!(format!("{error:#}").contains("invalid provider name"));
     }
 }

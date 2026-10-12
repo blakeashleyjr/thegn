@@ -336,6 +336,7 @@ impl FlyProvider {
 
     /// Resolve the sandbox's public IPv4: cache → ledger → the app's IP via API.
     pub async fn resolve_ip(&self, name: &str) -> Result<String> {
+        registry::checked_name(name)?;
         if let Some(ip) = self.ip.lock().unwrap().clone().filter(|i| !i.is_empty()) {
             return Ok(ip);
         }
@@ -447,6 +448,7 @@ impl FlyProvider {
         body: serde_json::Value,
         want: &str,
     ) -> Result<()> {
+        registry::checked_name(name)?;
         let app = app_name(name);
         let m = self
             .first_machine(&app)
@@ -508,6 +510,7 @@ impl FlyProvider {
     /// Read-only age reconciliation for the exact persisted managed machine.
     /// A failed read keeps the ledger intact so the next pass can retry.
     pub async fn reaper_creation_time(&self, name: &str, machine_id: &str) -> Result<i64> {
+        registry::checked_name(name)?;
         anyhow::ensure!(
             !machine_id.is_empty(),
             "fly: pending create has no authoritative machine identity"
@@ -563,6 +566,7 @@ impl FlyProvider {
     /// this boundary so a later route-token revocation failure leaves enough
     /// durable state to retry the complete lifecycle safely.
     pub async fn destroy_remote_only(&self, id: &str) -> Result<()> {
+        registry::checked_name(id)?;
         let custody_account = thegn_core::managed_ssh::account_label(&self.spec.key_path);
         thegn_core::managed_ssh::read("fly", &custody_account, id)
             .context("fly: validate managed SSH custody before destroy")?;
@@ -604,6 +608,7 @@ impl FlyProvider {
     /// Retire local key custody and lifecycle registry only after every remote
     /// cleanup step owned by the caller succeeded.
     pub fn retire_destroyed(&self, id: &str) -> Result<()> {
+        registry::checked_name(id)?;
         let custody_account = thegn_core::managed_ssh::account_label(&self.spec.key_path);
         thegn_core::managed_ssh::record_revoked("fly", &custody_account, id)
             .context("fly: retire managed SSH custody")?;
@@ -771,6 +776,62 @@ impl ProviderFiles for FlyProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn invalid_names_are_rejected_before_fly_http_or_cached_ip() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let provider = FlyProvider::new(FlySpec {
+            api_base: base.clone(),
+            graphql_url: format!("{base}/"),
+            ..spec()
+        });
+        *provider.ip.lock().unwrap() = Some("192.0.2.1".into());
+
+        for result in [
+            provider.resolve_ip("../x").await,
+            provider.stop("../x").await.map(|()| String::new()),
+        ] {
+            let error = result.unwrap_err();
+            assert!(
+                error.to_string().contains("invalid provider name"),
+                "{error:#}"
+            );
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(300), listener.accept())
+                    .await
+                    .is_err(),
+                "invalid name must not reach the Fly API"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_names_are_rejected_before_fly_custody_or_registry_access() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _env =
+            thegn_core::testenv::EnvGuard::set(&[("THEGN_DIR", &tmp.path().to_string_lossy())]);
+        let provider = FlyProvider::new(spec());
+
+        for result in [
+            provider.reaper_creation_time("../x", "machine-id").await,
+            provider.destroy_remote_only("../x").await.map(|()| 0),
+        ] {
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("invalid provider name")
+            );
+        }
+        assert!(
+            provider
+                .retire_destroyed("../x")
+                .unwrap_err()
+                .to_string()
+                .contains("invalid provider name")
+        );
+    }
 
     #[tokio::test]
     async fn absent_or_mismatched_reaper_custody_never_reads_inventory_or_admits_cleanup() {
