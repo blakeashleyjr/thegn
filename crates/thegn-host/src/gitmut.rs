@@ -16,7 +16,9 @@ use thegn_core::rebase_todo::{TodoAction, TodoEntry};
 use thegn_core::remote::GitLoc;
 use thegn_core::store::WorktreeAuxStore;
 use thegn_svc::git::{
-    BisectOps, BranchOps, CherryOps, CliGit, CommitOps, CustomOps, ForceMode, GitBackend, PatchOps,
+    BisectOps, BranchOps, CUSTOM_COMMAND_TIMEOUT_SECS, CUSTOM_OUTCOME_CLEANUP,
+    CUSTOM_OUTCOME_EXITED, CUSTOM_OUTCOME_READ, CUSTOM_OUTCOME_SPAWN, CUSTOM_OUTCOME_TIMEOUT,
+    CUSTOM_OUTCOME_WAIT, CherryOps, CliGit, CommitOps, CustomOps, ForceMode, GitBackend, PatchOps,
     RebaseOps, RebaseOpts, RebaseOutcome, ResetMode, StageOps, StashOps, UndoOps,
 };
 
@@ -640,16 +642,62 @@ pub fn execute(op: GitOp, loc: &GitLoc, override_gpg: bool) -> GitOpResult {
             }
             Err(e) => GitOpResult::Err(first_line(&e)),
         },
-        GitOp::Custom { command, capture } => match g.run_custom(loc, &command) {
-            Ok(out) if capture => GitOpResult::Output(out),
-            Ok(_) => GitOpResult::Ok(None),
-            Err(e) => GitOpResult::Err(first_line(&e)),
-        },
-        GitOp::CustomTemplate { command, capture } => match g.run_custom_template(loc, &command) {
-            Ok(out) if capture => GitOpResult::Output(out),
-            Ok(_) => GitOpResult::Ok(None),
-            Err(e) => GitOpResult::Err(first_line(&e)),
-        },
+        GitOp::Custom { command, capture } => {
+            custom_command_result(g.run_custom(loc, &command, capture), capture, false)
+        }
+        GitOp::CustomTemplate { command, capture } => {
+            custom_command_result(g.run_custom_template(loc, &command, capture), capture, true)
+        }
+    }
+}
+
+fn custom_command_result(
+    outcome: (
+        &'static str,
+        Option<std::process::ExitStatus>,
+        String,
+        bool,
+        String,
+    ),
+    capture: bool,
+    redact_failure: bool,
+) -> GitOpResult {
+    let (kind, status, mut stdout, stdout_truncated, stderr) = outcome;
+    match kind {
+        CUSTOM_OUTCOME_EXITED if status.as_ref().is_some_and(|status| status.success()) => {
+            if capture && stdout_truncated {
+                stdout.push_str("\n… output truncated at 1 MiB");
+            }
+            if capture {
+                GitOpResult::Output(stdout)
+            } else {
+                GitOpResult::Ok(None)
+            }
+        }
+        CUSTOM_OUTCOME_EXITED => {
+            let status = status.map_or_else(|| "unknown status".to_string(), |s| s.to_string());
+            if redact_failure {
+                GitOpResult::Err(format!("custom command failed ({status})"))
+            } else {
+                let tail: Vec<&str> = stderr.trim().lines().rev().take(4).collect();
+                let tail: Vec<&str> = tail.into_iter().rev().collect();
+                GitOpResult::Err(if tail.is_empty() {
+                    format!("command failed ({status})")
+                } else {
+                    format!("command failed: {}", tail.join(" · "))
+                })
+            }
+        }
+        CUSTOM_OUTCOME_TIMEOUT => GitOpResult::Err(format!(
+            "custom command timed out after {CUSTOM_COMMAND_TIMEOUT_SECS}s and was killed"
+        )),
+        CUSTOM_OUTCOME_SPAWN => GitOpResult::Err("could not start custom command".into()),
+        CUSTOM_OUTCOME_WAIT => GitOpResult::Err("custom command could not be reaped".into()),
+        CUSTOM_OUTCOME_READ => GitOpResult::Err("could not read custom command output".into()),
+        CUSTOM_OUTCOME_CLEANUP => {
+            GitOpResult::Err("custom command cleanup did not complete".into())
+        }
+        _ => GitOpResult::Err("custom command returned an unknown outcome".into()),
     }
 }
 
@@ -840,5 +888,52 @@ mod tests {
             other => panic!("expected Ok, got {other:?}"),
         }
         let _ = std::fs::remove_dir_all(&dir); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn custom_popup_marks_truncated_output() {
+        let dir = tmp_repo("custom-popup-cap");
+        let loc = GitLoc::Local(dir.clone());
+        match execute(
+            GitOp::Custom {
+                command: "head -c 5000000 /dev/zero".into(),
+                capture: true,
+            },
+            &loc,
+            false,
+        ) {
+            GitOpResult::Output(output) => {
+                assert!(output.len() <= 1024 * 1024 + 40);
+                assert!(output.ends_with("… output truncated at 1 MiB"));
+            }
+            other => panic!("expected truncated popup output, got {other:?}"),
+        }
+        if let Err(error) = std::fs::remove_dir_all(&dir) {
+            tracing::debug!(%error, "custom popup test repo cleanup failed");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn custom_none_mode_discards_output_body() {
+        // Behaviour guard for the host mapping; the svc-level test also
+        // asserts that the bounded runner retains no stdout body.
+        let dir = tmp_repo("custom-none");
+        let loc = GitLoc::Local(dir.clone());
+        assert!(matches!(
+            execute(
+                GitOp::Custom {
+                    command: "printf 'output that must be discarded'".into(),
+                    capture: false,
+                },
+                &loc,
+                false,
+            ),
+            GitOpResult::Ok(None)
+        ));
+        if let Err(error) = std::fs::remove_dir_all(&dir) {
+            tracing::debug!(%error, "custom none test repo cleanup failed");
+        }
     }
 }
