@@ -63,10 +63,11 @@ use thegn_core::util::hostname;
 
 /// The daemon's scope key: the canonical state dir it serves.
 pub(crate) fn scope_key() -> String {
-    thegn_core::util::xdg_state_home()
-        .join("thegn")
-        .to_string_lossy()
-        .into_owned()
+    scope_key_for(&thegn_core::util::xdg_state_home().join("thegn"))
+}
+
+fn scope_key_for(state_dir: &std::path::Path) -> String {
+    thegn_core::config_daemon::state_scope_identity(state_dir)
 }
 
 /// Resolve the control-socket path from config + env (the pure helper lives in
@@ -189,11 +190,10 @@ fn effective_uid() -> u32 {
 }
 
 fn private_tmp_socket_path(state_dir: &std::path::Path, euid: u32) -> PathBuf {
-    let legacy = thegn_core::config_daemon::legacy_socket_path(state_dir);
     std::path::Path::new("/tmp")
         .join(format!(
             "thegn-{euid}-{}",
-            thegn_core::util::short_hash(&legacy.to_string_lossy(), 12)
+            thegn_core::config_daemon::state_endpoint_key(state_dir)
         ))
         .join("daemon.sock")
 }
@@ -212,9 +212,8 @@ fn socket_path_for(
         return natural;
     }
     let natural = if runtime_dir.is_none_or(str::is_empty) {
-        let legacy = thegn_core::config_daemon::legacy_socket_path(state_dir);
         match private_runtime_dir {
-            Some(private) => thegn_core::config_daemon::short_socket_path(&private, &legacy),
+            Some(private) => thegn_core::config_daemon::short_socket_path(&private, state_dir),
             None => private_tmp_socket_path(state_dir, euid),
         }
     } else {
@@ -539,7 +538,9 @@ async fn run(
     };
 
     let db: service::SharedDb = Arc::new(Mutex::new(Db::open()?));
-    let scope = scope_key();
+    let state_dir = thegn_core::util::xdg_state_home().join("thegn");
+    let scope = scope_key_for(&state_dir);
+    let legacy_scope = state_dir.to_str();
     let daemon_id = {
         let mut b = [0u8; 8];
         getrandom::fill(&mut b).expect("csprng for daemon id");
@@ -583,7 +584,12 @@ async fn run(
     };
     {
         let db = db.lock().expect("daemon db lock");
-        for stale in boot_sweep_targets(&db.daemons().unwrap_or_default(), &scope, pid_alive) {
+        for stale in boot_sweep_targets(
+            &db.daemons().unwrap_or_default(),
+            &scope,
+            legacy_scope,
+            pid_alive,
+        ) {
             let _ = db.clear_daemon_leases(&stale); // best-effort: cache write: the daemon row is bookkeeping; the sweep below derives from live state
             let _ = db.del_daemon(&stale); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
         }
@@ -836,10 +842,13 @@ fn pid_alive(pid: i64) -> bool {
 fn boot_sweep_targets(
     rows: &[DaemonRow],
     scope: &str,
+    legacy_scope: Option<&str>,
     pid_alive: impl Fn(i64) -> bool,
 ) -> Vec<String> {
     rows.iter()
-        .filter(|r| r.scope == scope && !pid_alive(r.pid))
+        .filter(|r| {
+            (r.scope == scope || Some(r.scope.as_str()) == legacy_scope) && !pid_alive(r.pid)
+        })
         .map(|r| r.daemon_id.clone())
         .collect()
 }
@@ -967,6 +976,26 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn raw_unix_state_paths_keep_endpoint_and_scope_identity_distinct() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let first = std::path::Path::new(std::ffi::OsStr::from_bytes(b"/s/\xff"));
+        let second = std::path::Path::new(std::ffi::OsStr::from_bytes(b"/s/\xfe"));
+        assert_eq!(first.to_string_lossy(), second.to_string_lossy());
+        assert_ne!(scope_key_for(first), scope_key_for(second));
+        assert_ne!(
+            private_tmp_socket_path(first, 1000),
+            private_tmp_socket_path(second, 1000)
+        );
+        let short_dir = std::path::Path::new("/tmp");
+        assert_ne!(
+            thegn_core::config_daemon::short_socket_path(short_dir, first),
+            thegn_core::config_daemon::short_socket_path(short_dir, second)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn private_tmp_socket_names_include_uid_and_state_hash_without_state_dir() {
         let a = private_tmp_socket_path(std::path::Path::new("/state/one"), 1000);
         let b = private_tmp_socket_path(std::path::Path::new("/state/two"), 1000);
@@ -1047,7 +1076,8 @@ mod tests {
             .and_then(std::ffi::OsStr::to_str)
             .and_then(|name| name.rsplit_once('-').map(|(_, hash)| hash))
             .unwrap();
-        assert!(hash.bytes().any(|byte| (b'g'..=b'z').contains(&byte)));
+        assert_eq!(hash.len(), 32);
+        assert!(hash.bytes().all(|byte| byte.is_ascii_hexdigit()));
         let runtime_socket = std::path::Path::new("/run/user/1000/thegn/daemon.sock");
         let absent = |_: &std::path::Path| None;
         assert!(!socket_usable_decision(
@@ -1172,17 +1202,20 @@ mod tests {
     #[test]
     fn boot_sweep_removes_only_same_scope_dead_daemons() {
         let rows = vec![
-            row("dead-same", "/scope/a", 11),
-            row("alive-same", "/scope/a", 22),
+            row("dead-same", "v1-scope-a", 11),
+            row("alive-same", "v1-scope-a", 22),
+            row("dead-legacy", "/scope/a", 44),
             row("dead-other", "/scope/b", 33),
         ];
         let alive = |pid: i64| pid == 22;
         assert_eq!(
-            boot_sweep_targets(&rows, "/scope/a", alive),
-            vec!["dead-same".to_string()]
+            boot_sweep_targets(&rows, "v1-scope-a", Some("/scope/a"), alive),
+            vec!["dead-same".to_string(), "dead-legacy".to_string()]
         );
         // Nothing dead in-scope ⇒ nothing swept.
-        assert!(boot_sweep_targets(&rows, "/scope/c", alive).is_empty());
+        assert!(boot_sweep_targets(&rows, "v1-scope-c", Some("/scope/c"), alive).is_empty());
+        // Invalid UTF-8 state paths cannot match rows from the lossy legacy scheme.
+        assert!(boot_sweep_targets(&rows, "v1-scope-c", None, alive).is_empty());
     }
 
     /// The idle-exit janitor arms only for a plain pane daemon: `0` = never,
