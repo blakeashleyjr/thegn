@@ -1652,7 +1652,7 @@ mod tests {
                 "fixture",
                 "main",
                 "github",
-                "https://github.com/me/repo/pull/7",
+                "https://github.com/organization/project/pull/7",
             )
             .unwrap();
             let sentinel = fixture.dir.path().join("agent-must-not-run");
@@ -1691,10 +1691,13 @@ mod tests {
                 items,
                 |_| {},
             );
+            let expected_warning = if mismatched_number {
+                "identity"
+            } else {
+                "own-PR automation held"
+            };
             assert!(
-                out.warnings
-                    .iter()
-                    .any(|s| s.contains("own-PR automation held")),
+                out.warnings.iter().any(|s| s.contains(expected_warning)),
                 "{out:?}"
             );
             assert_eq!(
