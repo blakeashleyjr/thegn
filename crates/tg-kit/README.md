@@ -4,8 +4,11 @@ The **thegn embedding contract**. Sibling TUIs implement [`AppTile`] so
 thegn can host them as top-level **app tabs**, while each still ships as a
 standalone binary via the [`standalone::run`] harness.
 
-It depends on neither tokio, termwiz, nor `thegn-core`, so a standalone app
-links it without pulling in thegn's stack.
+By default it depends on neither tokio, termwiz, nor `thegn-core`, so a
+standalone app links it without pulling in thegn's stack. The opt-in
+`host-presets` feature links `thegn-core` so every named `[theme] preset`
+resolves to the host's exact palette. Without `host-presets`, any non-Prism
+named preset resolves to Prism and reports `UnresolvedPreset`.
 
 ## What it provides
 
@@ -14,7 +17,12 @@ links it without pulling in thegn's stack.
 - `InputEvent` / `Key` / `Modifiers` — backend-agnostic input. The host
   translates termwiz; the standalone harness translates crossterm.
 - `Theme` — semantic tokens → sRGB with prism defaults that mirror thegn's
-  chrome palette, plus `Theme::load_thegn_config()` for standalone runs.
+  chrome palette, plus `Theme::load_thegn_config_checked()` for standalone runs: it reads only
+  `$XDG_CONFIG_HOME/thegn/config.toml` (<= 256 KiB, regular files only) and
+  returns a typed `ThemeLoad` that separates a genuine Prism selection from
+  absent/oversize/unreadable/malformed fallbacks and per-field issues.
+  `--config`, `THEGN_*`, `THEGN_PROFILE` and local user themes are NOT read;
+  use `Theme::load_from_path` for an explicit file.
 - `standalone::run` (feature `standalone`) — a ~0%-idle crossterm event loop;
   each app's `main` becomes a few lines.
 

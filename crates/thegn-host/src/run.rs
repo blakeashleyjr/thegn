@@ -23977,7 +23977,13 @@ async fn event_loop<T: Terminal>(
                                     }
                                     any
                                 }
-                                KeyCode::Backspace => p.predict_backspace(),
+                                KeyCode::Backspace
+                                    if !k
+                                        .modifiers
+                                        .intersects(Modifiers::ALT | Modifiers::CTRL) =>
+                                {
+                                    p.predict_backspace()
+                                }
                                 // Enter + any non-printable key retire the overlay (the
                                 // server redraws the line / screen).
                                 _ => p.predict_flush(),

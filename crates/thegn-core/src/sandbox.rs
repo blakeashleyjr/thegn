@@ -647,7 +647,11 @@ pub fn sealed_view(spec: &SandboxSpec) -> std::borrow::Cow<'_, SandboxSpec> {
     let ok = |m: &Mount| {
         let keep = crate::sandbox_mounts::sealed_mount_still_ok(m, home);
         if !keep && !crate::sandbox_mounts::is_builtin_agent_carve(&m.host) {
-            warn_dropped_mount_once(&m.host, &m.host);
+            warn_dropped_mount_once(
+                &m.host,
+                &m.host,
+                "sealed profile mount reaches a protected $HOME path",
+            );
         }
         keep
     };
@@ -691,6 +695,9 @@ fn launchable(spec: &SandboxSpec) -> Result<std::borrow::Cow<'_, SandboxSpec>, E
              spec cannot express safely",
             m.dest
         )));
+    }
+    if view.backend.profile().family == BackendFamily::Systemd {
+        systemd_mount_props(&view).map_err(EnterError::Refused)?;
     }
     Ok(view)
 }
@@ -899,10 +906,9 @@ pub fn resolve_placed_exact(
     resolve_placed_with(cfg, loc, name, profile, placement, Fallthrough::Exact)
 }
 
-/// Warn (once per path per process) about a USER-authored `[sandbox] mounts` entry
-/// a sealed launch drops. The built-in defaults (`~/.gnupg:rw` …) are always
-/// dropped and would warn on every resolve; `thegn doctor` lists those.
-fn warn_dropped_mount_once(raw: &str, host: &str) {
+/// Warn once per path when a USER-authored `[sandbox] mounts` entry is dropped.
+/// Built-in defaults (`~/.gnupg:rw` …) are listed by `thegn doctor` instead.
+fn warn_dropped_mount_once(raw: &str, host: &str, reason: &str) {
     use std::sync::{Mutex, OnceLock};
     if SandboxConfig::default().mounts.iter().any(|d| d == raw) {
         return;
@@ -917,7 +923,8 @@ fn warn_dropped_mount_once(raw: &str, host: &str) {
         tracing::warn!(
             target: "thegn::sandbox",
             path = %host,
-            "sealed profile: dropping [sandbox] mounts entry that reaches a protected $HOME path"
+            reason = %reason,
+            "dropping [sandbox] mounts entry"
         );
     }
 }
@@ -1118,7 +1125,11 @@ fn resolve_placed_with(
             && !home.is_empty()
             && crate::sandbox_mounts::sealed_denies_mount(&parsed, std::path::Path::new(home))
         {
-            warn_dropped_mount_once(m, &parsed.host);
+            warn_dropped_mount_once(
+                m,
+                &parsed.host,
+                "sealed profile mount reaches a protected $HOME path",
+            );
             continue;
         }
         // Skip mounts whose source doesn't exist — silently, since config
@@ -2320,8 +2331,124 @@ fn wrap_script(spec: &SandboxSpec, inner: &str) -> String {
     s
 }
 
+/// The extra read-only bind a bwrap sandbox needs so `/etc/resolv.conf`
+/// resolves (THE-730), or `None`. `None` for `network = none`, when the target
+/// is already reachable, or when a configured mount already covers the
+/// directory (e.g. a `/run/systemd/resolve:ro` workaround): no duplicate bind.
+fn bwrap_resolver_bind(spec: &SandboxSpec, hardcoded_parents: &[&str]) -> Option<String> {
+    let dir = crate::sandbox_mounts::resolver_bind_dir(
+        std::path::Path::new("/etc/resolv.conf"),
+        std::path::Path::new("/run"),
+        BWRAP_SUBSTRATE,
+    )?;
+    resolver_bind_filter(spec, hardcoded_parents, &dir)
+}
+
+/// Pure policy half of [`bwrap_resolver_bind`], with the resolved dir injected.
+fn resolver_bind_filter(
+    spec: &SandboxSpec,
+    hardcoded_parents: &[&str],
+    dir: &std::path::Path,
+) -> Option<String> {
+    if spec.network == Network::None {
+        return None;
+    }
+    let covered = |p: &str| dir.starts_with(p);
+    if hardcoded_parents.iter().any(|p| covered(p)) || spec.mounts.iter().any(|m| covered(&m.dest))
+    {
+        return None;
+    }
+    Some(dir.to_string_lossy().into_owned())
+}
+
+/// Build the complete list of systemd path properties emitted for this spec.
+/// Keeping selection and encoding together ensures launch admission checks
+/// exactly the paths that systemd-run will receive.
+fn systemd_mount_props(spec: &SandboxSpec) -> Result<Vec<String>, String> {
+    let sealed = spec
+        .drop_capabilities
+        .iter()
+        .any(|c| c.eq_ignore_ascii_case("ALL"));
+    let carveouts = if spec.read_only_root && spec.seal_home.is_none() {
+        default_writable_carveouts(if sealed {
+            SandboxProfile::Sealed
+        } else {
+            SandboxProfile::Hardened
+        })
+    } else {
+        Vec::new()
+    };
+    systemd_mount_props_with_carveouts(spec, &carveouts)
+}
+
+fn systemd_mount_props_with_carveouts(
+    spec: &SandboxSpec,
+    carveouts: &[Mount],
+) -> Result<Vec<String>, String> {
+    let mut props = Vec::new();
+    if spec.read_only_root {
+        let under_home = |dest: &str| {
+            spec.seal_home
+                .as_deref()
+                .is_some_and(|h| std::path::Path::new(dest).starts_with(h))
+        };
+        for m in &spec.mounts {
+            if under_home(&m.dest) {
+                let flag = if m.ro {
+                    "BindReadOnlyPaths"
+                } else {
+                    "BindPaths"
+                };
+                props.push(crate::sandbox_mounts::systemd_bind_property(
+                    flag, &m.host, &m.dest,
+                )?);
+            } else if !m.ro {
+                props.push(crate::sandbox_mounts::systemd_path_property(
+                    "ReadWritePaths",
+                    &m.dest,
+                )?);
+            }
+        }
+        // $HOME is otherwise read-only; carve the same narrow writable state
+        // dirs as bwrap. Sealed profiles omit these because HOME is a tmpfs.
+        for cv in carveouts {
+            props.push(crate::sandbox_mounts::systemd_path_property(
+                "ReadWritePaths",
+                &cv.dest,
+            )?);
+        }
+    }
+    // systemd does not consume read-only mounts generally; preserve the
+    // special shared .git/config protection used by this backend.
+    for m in &spec.mounts {
+        if m.ro && m.dest.ends_with("/config") {
+            props.push(crate::sandbox_mounts::systemd_path_property(
+                "ReadOnlyPaths",
+                &m.dest,
+            )?);
+        }
+    }
+    Ok(props)
+}
+
+fn bwrap_mount_covered(mount: &Mount, hardcoded_parents: &[&str]) -> bool {
+    hardcoded_parents
+        .iter()
+        .any(|p| std::path::Path::new(&mount.dest).starts_with(p) && mount.dest != *p)
+}
+
 /// The backend-specific argv that runs `/bin/sh -lc <script>` in the sandbox.
 fn backend_enter_argv(spec: &SandboxSpec, script: &str) -> Vec<String> {
+    backend_enter_argv_with_resolver_dir(spec, script, None)
+}
+
+/// Build backend argv with an optional injected resolver directory for tests.
+/// Production callers leave it unset and use the host resolver probe.
+fn backend_enter_argv_with_resolver_dir(
+    spec: &SandboxSpec,
+    script: &str,
+    resolved_resolver_dir: Option<&std::path::Path>,
+) -> Vec<String> {
     let wt = spec.worktree.to_string_lossy().into_owned();
     // Keyed on the backend *family* (one arm per way of driving a sandbox),
     // so a new OCI runtime is a profile row, not a new arm here.
@@ -2394,13 +2521,42 @@ fn backend_enter_argv(spec: &SandboxSpec, script: &str) -> Vec<String> {
             {
                 v.extend(["--tmpfs".into(), home.clone()]);
             }
+            // THE-730: `/etc` is bound but `/run` is not, so a resolv.conf that
+            // symlinks into `/run/systemd/resolve` dangles and the sandbox has no
+            // DNS. Bind the resolved target's directory read-only. Never for
+            // `network = none` (no resolver reachable by design), nor for a
+            // remote placement (the probe would read the wrong host).
+            let resolver_dir = if spec.placement.is_local()
+                && !matches!(spec.file_access, FileAccess::All | FileAccess::Host)
+            {
+                match resolved_resolver_dir {
+                    Some(dir) => resolver_bind_filter(spec, &hardcoded_parents, dir),
+                    None => bwrap_resolver_bind(spec, &hardcoded_parents),
+                }
+            } else {
+                None
+            };
+            if let Some(dir) = &resolver_dir {
+                v.extend(["--ro-bind".into(), dir.clone(), dir.clone()]);
+                // Nested user mounts cannot be created beneath this read-only
+                // bind, so let the normal covered-mount skip handle them.
+                hardcoded_parents.push(dir);
+            }
             for m in &spec.mounts {
                 // Skip mounts already covered by a hardcoded parent — bwrap
                 // cannot create a mount-point inside a read-only bind.
-                let covered = hardcoded_parents
-                    .iter()
-                    .any(|p| std::path::Path::new(&m.dest).starts_with(p) && m.dest != *p);
+                let covered = bwrap_mount_covered(m, &hardcoded_parents);
                 if covered {
+                    if resolver_dir
+                        .as_deref()
+                        .is_some_and(|dir| std::path::Path::new(&m.dest).starts_with(dir))
+                    {
+                        warn_dropped_mount_once(
+                            &m.host,
+                            &m.dest,
+                            "bwrap resolver bind covers the mount destination",
+                        );
+                    }
                     continue;
                 }
                 // Also skip exact duplicates of already-hardcoded paths.
@@ -2485,45 +2641,15 @@ fn backend_enter_argv(spec: &SandboxSpec, script: &str) -> Vec<String> {
             if spec.read_only_root {
                 v.extend(["-p".into(), "ProtectSystem=yes".into()]);
                 let sealed_home = spec.seal_home.is_some();
-                let under_home = |dest: &str| {
-                    spec.seal_home
-                        .as_deref()
-                        .is_some_and(|h| std::path::Path::new(dest).starts_with(h))
-                };
                 // Sealed: `ProtectHome=tmpfs` leaves an empty `$HOME`; the
                 // allowlist, worktree and caches are bound back in below.
                 let protect_home = if sealed_home { "tmpfs" } else { "read-only" };
                 v.extend(["-p".into(), format!("ProtectHome={protect_home}")]);
-                for m in &spec.mounts {
-                    if under_home(&m.dest) {
-                        let flag = if m.ro {
-                            "BindReadOnlyPaths"
-                        } else {
-                            "BindPaths"
-                        };
-                        v.extend(["-p".into(), format!("{flag}={}:{}", m.host, m.dest)]);
-                    } else if !m.ro {
-                        v.extend(["-p".into(), format!("ReadWritePaths={}", m.dest)]);
-                    }
-                }
-                // $HOME is otherwise read-only; carve the same narrow writable
-                // state dirs as bwrap so shell history/zoxide keep working. The
-                // sealed agent drops ALL caps — mirror bwrap's keychain gating so
-                // the sealed profile doesn't get a writable ~/.keychain.
-                let sealed = spec
-                    .drop_capabilities
-                    .iter()
-                    .any(|c| c.eq_ignore_ascii_case("ALL"));
-                let carve_profile = if sealed {
-                    SandboxProfile::Sealed
-                } else {
-                    SandboxProfile::Hardened
-                };
-                if !sealed_home {
-                    for cv in default_writable_carveouts(carve_profile) {
-                        v.extend(["-p".into(), format!("ReadWritePaths={}", cv.dest)]);
-                    }
-                }
+            }
+            for property in systemd_mount_props(spec)
+                .unwrap_or_else(|_| vec!["ThegnRefusedUnsafeMountPath=yes".into()])
+            {
+                v.extend(["-p".into(), property]);
             }
             if spec.no_new_privileges {
                 v.extend(["-p".into(), "NoNewPrivileges=yes".into()]);
@@ -2537,15 +2663,6 @@ fn backend_enter_argv(spec: &SandboxSpec, script: &str) -> Vec<String> {
             }
             if let Some(p) = spec.pids_limit {
                 v.extend(["-p".into(), format!("TasksMax={p}")]);
-            }
-            // systemd doesn't consume `spec.mounts`; translate the read-only
-            // shared `.git/config` mount to a ReadOnlyPaths so it can't be
-            // polluted here either. Match `/config` specifically — host-toolchain
-            // and cache mounts never end in `/config`, so $HOME stays writable.
-            for m in &spec.mounts {
-                if m.ro && m.dest.ends_with("/config") {
-                    v.extend(["-p".into(), format!("ReadOnlyPaths={}", m.dest)]);
-                }
             }
             // Host-sourced secrets go to a 0600 `EnvironmentFile=` property so
             // they stay off systemd-run's argv, which persists for the pane's

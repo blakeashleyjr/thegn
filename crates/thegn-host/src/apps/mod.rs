@@ -609,6 +609,52 @@ mod tests {
         assert_eq!(kit_theme(&Palette::default()), Theme::prism());
     }
 
+    /// THE-501: compare tg-kit's loader against the real host Config path for
+    /// every built-in, including override combinations that affect derived
+    /// palette tokens and accent/focus handling.
+    #[test]
+    fn standalone_loader_matches_host_for_every_preset() {
+        use tg_kit::theme::ThemeOutcome;
+        for name in thegn_core::theme::PRESETS {
+            let plain = format!("[theme]\npreset = \"{name}\"\n");
+            let host: thegn_core::config::Config = toml::from_str(&plain).unwrap();
+            let load = Theme::from_config_str(&plain);
+            assert_eq!(
+                load.theme,
+                kit_theme(&host.palette()),
+                "preset {name} drifted"
+            );
+            assert!(load.is_faithful(), "preset {name}: {:?}", load);
+            let want = if *name == "prism" {
+                ThemeOutcome::Prism
+            } else {
+                ThemeOutcome::Preset((*name).to_string())
+            };
+            assert_eq!(load.outcome, want);
+
+            let overridden = format!(
+                "[theme]\npreset = \"{name}\"\naccent = \"#ff0000\"\n[theme.colors]\nbg0 = \"#010203\"\n"
+            );
+            let host: thegn_core::config::Config = toml::from_str(&overridden).unwrap();
+            let load = Theme::from_config_str(&overridden);
+            assert_eq!(
+                load.theme,
+                kit_theme(&host.palette()),
+                "preset {name} with bg0/accent overrides drifted"
+            );
+            assert_eq!(load.theme.bg0, (1, 2, 3), "bg0 override for {name}");
+            assert_eq!(load.theme.accent, (255, 0, 0), "accent override for {name}");
+            assert_eq!(load.theme.focus, kit_theme(&host.palette()).focus);
+            assert!(load.is_faithful(), "overridden preset {name}: {:?}", load);
+        }
+        let light = Theme::from_config_str("[theme]\npreset = \"light\"\n").theme;
+        assert_ne!(
+            light.green,
+            Theme::prism().green,
+            "light hues are paper-safe"
+        );
+    }
+
     #[test]
     fn user_palette_overrides_flow_through() {
         let p = Palette {

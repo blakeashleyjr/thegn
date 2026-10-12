@@ -318,6 +318,19 @@ fn an_unknown_home_zone_falls_back_to_local() {
 }
 
 #[test]
+fn the_effective_home_zone_is_the_configured_one_else_the_system_zone() {
+    let ok = CalendarConfig {
+        home_zone: "Europe/Berlin".into(),
+        ..CalendarConfig::default()
+    };
+    assert_eq!(ok.effective_home_zone(), chrono_tz::Tz::Europe__Berlin);
+    assert_eq!(
+        CalendarConfig::default().effective_home_zone(),
+        crate::calendar::tz::system_zone()
+    );
+}
+
+#[test]
 fn a_miscased_zone_is_accepted_rather_than_reported() {
     // Case is not a mistake worth failing over — the lookup normalizes it.
     let cfg = CalendarConfig {
@@ -678,4 +691,21 @@ fn horizons_are_bounded_at_admission_and_never_collapse() {
     let ok = CalendarConfig::default();
     assert!(ok.sync_horizon(chrono::NaiveDate::MIN).is_err());
     assert!(ok.sync_horizon(chrono::NaiveDate::MAX).is_err());
+}
+
+#[test]
+fn a_default_reminder_lead_beyond_the_horizon_is_a_validation_error() {
+    use crate::calendar::reminders::MAX_LEAD_MINS;
+    let ok = CalendarConfig {
+        reminder_default_mins: vec![10, MAX_LEAD_MINS],
+        ..CalendarConfig::default()
+    };
+    assert!(validate_calendar(&ok).is_empty());
+    let bad = CalendarConfig {
+        reminder_default_mins: vec![10, MAX_LEAD_MINS + 1],
+        ..CalendarConfig::default()
+    };
+    let errors = validate_calendar(&bad);
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].contains("reminder_default_mins[1]"), "{errors:?}");
 }

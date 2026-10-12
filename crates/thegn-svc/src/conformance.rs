@@ -235,6 +235,7 @@ mod tests {
                 &a,
                 crate::calendar::AccountAdmission::isolated(
                     thegn_core::calendar::AdmissionBudget::default(),
+                    thegn_core::calendar::Tz::UTC,
                 ),
             )
             .is_some();

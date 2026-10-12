@@ -262,17 +262,17 @@ pub(crate) fn spawn_media_queue(
     waker: TerminalWaker,
 ) {
     tokio::spawn(async move {
-        let Some(client) = crate::media_secret::client_for(&cfg).await else {
-            return;
+        let queue = match crate::media_secret::client_for(&cfg).await {
+            Some(client) => match client.queue().await {
+                Ok(queue) => Ok(queue),
+                Err(e) => {
+                    tracing::debug!(target: "thegn::media", error = %e, "media queue fetch failed");
+                    Err(e.to_string())
+                }
+            },
+            None => Err("media provider unavailable".to_string()),
         };
-        let q = match client.queue().await {
-            Ok(queue) => queue,
-            Err(e) => {
-                tracing::debug!(target: "thegn::media", error = %e, "media queue fetch failed");
-                Vec::new()
-            }
-        };
-        let _ = tx.send(MediaQueueDelivery { request, queue: q }); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
+        let _ = tx.send(MediaQueueDelivery { request, queue }); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
         let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
     });
 }

@@ -129,6 +129,23 @@ pub(crate) fn key_bytes_mode(key: &KeyCode, mods: Modifiers, app_cursor: bool) -
             _ => {}
         }
     }
+    let modified_csi = |final_byte: u8| {
+        format!("\x1b[1;{}{}", csi_u_modifier(mods), final_byte as char).into_bytes()
+    };
+    let tilde_key = |number: u8| {
+        if mods.is_empty() {
+            format!("\x1b[{number}~").into_bytes()
+        } else {
+            format!("\x1b[{number};{}~", csi_u_modifier(mods)).into_bytes()
+        }
+    };
+    let meta = |byte: u8| {
+        if mods.contains(Modifiers::ALT) {
+            vec![0x1b, byte]
+        } else {
+            vec![byte]
+        }
+    };
     match key {
         KeyCode::Char(c) => {
             // ALT is the legacy meta prefix: ESC followed by the un-ALTed
@@ -160,8 +177,16 @@ pub(crate) fn key_bytes_mode(key: &KeyCode, mods: Modifiers, app_cursor: bool) -
                 Some(meta(c.encode_utf8(&mut buf).as_bytes().to_vec()))
             }
         }
-        KeyCode::Enter => Some(vec![b'\r']),
-        KeyCode::Backspace => Some(vec![0x7f]),
+        // Enter has no xterm modified-key encoding. Preserve the traditional
+        // CR for Shift/Ctrl and use the legacy meta prefix for Alt.
+        KeyCode::Enter => Some(meta(b'\r')),
+        // xterm's common Backspace conventions are DEL, Ctrl-H, and ESC+DEL
+        // for Alt. Other modifiers do not change the byte.
+        KeyCode::Backspace => Some(meta(if mods.contains(Modifiers::CTRL) {
+            0x08
+        } else {
+            0x7f
+        })),
         // Shift+Tab keeps its legacy back-tab encoding (vim/readline expect it).
         KeyCode::Tab if mods == Modifiers::SHIFT => Some(b"\x1b[Z".to_vec()),
         // Ctrl/Alt/Super+Tab have no legacy byte (Tab and Ctrl-I collide), so
@@ -176,13 +201,35 @@ pub(crate) fn key_bytes_mode(key: &KeyCode, mods: Modifiers, app_cursor: bool) -
         }
         KeyCode::Tab => Some(vec![b'\t']),
         KeyCode::Escape => Some(vec![0x1b]),
-        KeyCode::LeftArrow => Some(b"\x1b[D".to_vec()),
-        KeyCode::RightArrow => Some(b"\x1b[C".to_vec()),
-        KeyCode::UpArrow => Some(b"\x1b[A".to_vec()),
-        KeyCode::DownArrow => Some(b"\x1b[B".to_vec()),
-        KeyCode::Delete => Some(b"\x1b[3~".to_vec()),
-        KeyCode::Home => Some(b"\x1b[H".to_vec()),
-        KeyCode::End => Some(b"\x1b[F".to_vec()),
+        KeyCode::LeftArrow if mods.is_empty() => Some(b"\x1b[D".to_vec()),
+        KeyCode::LeftArrow => Some(modified_csi(b'D')),
+        KeyCode::RightArrow if mods.is_empty() => Some(b"\x1b[C".to_vec()),
+        KeyCode::RightArrow => Some(modified_csi(b'C')),
+        KeyCode::UpArrow if mods.is_empty() => Some(b"\x1b[A".to_vec()),
+        KeyCode::UpArrow => Some(modified_csi(b'A')),
+        KeyCode::DownArrow if mods.is_empty() => Some(b"\x1b[B".to_vec()),
+        KeyCode::DownArrow => Some(modified_csi(b'B')),
+        KeyCode::Home if mods.is_empty() => Some(b"\x1b[H".to_vec()),
+        KeyCode::Home => Some(modified_csi(b'H')),
+        KeyCode::End if mods.is_empty() => Some(b"\x1b[F".to_vec()),
+        KeyCode::End => Some(modified_csi(b'F')),
+        KeyCode::Delete => Some(tilde_key(3)),
+        KeyCode::Insert => Some(tilde_key(2)),
+        KeyCode::PageUp => Some(tilde_key(5)),
+        KeyCode::PageDown => Some(tilde_key(6)),
+        KeyCode::Function(n @ 1..=4) if mods.is_empty() => Some(vec![0x1b, b'O', b'P' + (*n - 1)]),
+        KeyCode::Function(n @ 1..=4) => Some(modified_csi(b'P' + (*n - 1))),
+        KeyCode::Function(n) => match n {
+            5 => Some(tilde_key(15)),
+            6 => Some(tilde_key(17)),
+            7 => Some(tilde_key(18)),
+            8 => Some(tilde_key(19)),
+            9 => Some(tilde_key(20)),
+            10 => Some(tilde_key(21)),
+            11 => Some(tilde_key(23)),
+            12 => Some(tilde_key(24)),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -347,20 +394,17 @@ mod tests {
         );
     }
 
-    /// THE-70 rewrote the `KeyCode::Char` arm (legacy control bytes, CSI-u
-    /// fallback, the ESC meta prefix). Every OTHER arm feeds vim, readline and
-    /// every full-screen program in a pane, and none of them may have moved a
-    /// byte. The functional arms deliberately ignore modifiers, so the
-    /// modified rows are part of the contract, not an oversight.
+    /// Lock down the legacy bytes for unmodified functional keys, alongside
+    /// the intentional Enter/Backspace conventions and special Tab handling.
     #[test]
     fn functional_keys_are_byte_identical() {
         let cases: &[(KeyCode, Modifiers, &[u8])] = &[
             (KeyCode::Enter, Modifiers::NONE, b"\r"),
-            (KeyCode::Enter, Modifiers::ALT, b"\r"),
+            (KeyCode::Enter, Modifiers::ALT, b"\x1b\r"),
             (KeyCode::Enter, Modifiers::CTRL, b"\r"),
             (KeyCode::Backspace, Modifiers::NONE, b"\x7f"),
-            (KeyCode::Backspace, Modifiers::ALT, b"\x7f"),
-            (KeyCode::Backspace, Modifiers::CTRL, b"\x7f"),
+            (KeyCode::Backspace, Modifiers::ALT, b"\x1b\x7f"),
+            (KeyCode::Backspace, Modifiers::CTRL, b"\x08"),
             (KeyCode::Tab, Modifiers::NONE, b"\t"),
             (KeyCode::Escape, Modifiers::NONE, b"\x1b"),
             (KeyCode::Escape, Modifiers::ALT, b"\x1b"),
@@ -368,7 +412,7 @@ mod tests {
             (KeyCode::RightArrow, Modifiers::NONE, b"\x1b[C"),
             (KeyCode::UpArrow, Modifiers::NONE, b"\x1b[A"),
             (KeyCode::DownArrow, Modifiers::NONE, b"\x1b[B"),
-            (KeyCode::UpArrow, Modifiers::ALT, b"\x1b[A"),
+            (KeyCode::UpArrow, Modifiers::ALT, b"\x1b[1;3A"),
             (KeyCode::Delete, Modifiers::NONE, b"\x1b[3~"),
             (KeyCode::Home, Modifiers::NONE, b"\x1b[H"),
             (KeyCode::End, Modifiers::NONE, b"\x1b[F"),
@@ -378,6 +422,374 @@ mod tests {
                 key_bytes(key, *mods).as_deref(),
                 Some(*want),
                 "{key:?} + {mods:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn functional_keys_encode_shift_alt_ctrl_and_ctrl_shift() {
+        let mods = [
+            Modifiers::NONE,
+            Modifiers::SHIFT,
+            Modifiers::ALT,
+            Modifiers::CTRL,
+            Modifiers::CTRL | Modifiers::SHIFT,
+        ];
+        let cases: &[(KeyCode, [&[u8]; 5])] = &[
+            (KeyCode::Enter, [b"\r", b"\r", b"\x1b\r", b"\r", b"\r"]),
+            (
+                KeyCode::Backspace,
+                [b"\x7f", b"\x7f", b"\x1b\x7f", b"\x08", b"\x08"],
+            ),
+            (
+                KeyCode::Escape,
+                [b"\x1b", b"\x1b", b"\x1b", b"\x1b", b"\x1b"],
+            ),
+            (
+                KeyCode::Tab,
+                [b"\t", b"\x1b[Z", b"\x1b[9;3u", b"\x1b[9;5u", b"\x1b[9;6u"],
+            ),
+            (
+                KeyCode::LeftArrow,
+                [
+                    b"\x1b[D",
+                    b"\x1b[1;2D",
+                    b"\x1b[1;3D",
+                    b"\x1b[1;5D",
+                    b"\x1b[1;6D",
+                ],
+            ),
+            (
+                KeyCode::RightArrow,
+                [
+                    b"\x1b[C",
+                    b"\x1b[1;2C",
+                    b"\x1b[1;3C",
+                    b"\x1b[1;5C",
+                    b"\x1b[1;6C",
+                ],
+            ),
+            (
+                KeyCode::UpArrow,
+                [
+                    b"\x1b[A",
+                    b"\x1b[1;2A",
+                    b"\x1b[1;3A",
+                    b"\x1b[1;5A",
+                    b"\x1b[1;6A",
+                ],
+            ),
+            (
+                KeyCode::DownArrow,
+                [
+                    b"\x1b[B",
+                    b"\x1b[1;2B",
+                    b"\x1b[1;3B",
+                    b"\x1b[1;5B",
+                    b"\x1b[1;6B",
+                ],
+            ),
+            (
+                KeyCode::Home,
+                [
+                    b"\x1b[H",
+                    b"\x1b[1;2H",
+                    b"\x1b[1;3H",
+                    b"\x1b[1;5H",
+                    b"\x1b[1;6H",
+                ],
+            ),
+            (
+                KeyCode::End,
+                [
+                    b"\x1b[F",
+                    b"\x1b[1;2F",
+                    b"\x1b[1;3F",
+                    b"\x1b[1;5F",
+                    b"\x1b[1;6F",
+                ],
+            ),
+            (
+                KeyCode::Delete,
+                [
+                    b"\x1b[3~",
+                    b"\x1b[3;2~",
+                    b"\x1b[3;3~",
+                    b"\x1b[3;5~",
+                    b"\x1b[3;6~",
+                ],
+            ),
+            (
+                KeyCode::Insert,
+                [
+                    b"\x1b[2~",
+                    b"\x1b[2;2~",
+                    b"\x1b[2;3~",
+                    b"\x1b[2;5~",
+                    b"\x1b[2;6~",
+                ],
+            ),
+            (
+                KeyCode::PageUp,
+                [
+                    b"\x1b[5~",
+                    b"\x1b[5;2~",
+                    b"\x1b[5;3~",
+                    b"\x1b[5;5~",
+                    b"\x1b[5;6~",
+                ],
+            ),
+            (
+                KeyCode::PageDown,
+                [
+                    b"\x1b[6~",
+                    b"\x1b[6;2~",
+                    b"\x1b[6;3~",
+                    b"\x1b[6;5~",
+                    b"\x1b[6;6~",
+                ],
+            ),
+            (
+                KeyCode::Function(1),
+                [
+                    b"\x1bOP",
+                    b"\x1b[1;2P",
+                    b"\x1b[1;3P",
+                    b"\x1b[1;5P",
+                    b"\x1b[1;6P",
+                ],
+            ),
+            (
+                KeyCode::Function(2),
+                [
+                    b"\x1bOQ",
+                    b"\x1b[1;2Q",
+                    b"\x1b[1;3Q",
+                    b"\x1b[1;5Q",
+                    b"\x1b[1;6Q",
+                ],
+            ),
+            (
+                KeyCode::Function(3),
+                [
+                    b"\x1bOR",
+                    b"\x1b[1;2R",
+                    b"\x1b[1;3R",
+                    b"\x1b[1;5R",
+                    b"\x1b[1;6R",
+                ],
+            ),
+            (
+                KeyCode::Function(4),
+                [
+                    b"\x1bOS",
+                    b"\x1b[1;2S",
+                    b"\x1b[1;3S",
+                    b"\x1b[1;5S",
+                    b"\x1b[1;6S",
+                ],
+            ),
+            (
+                KeyCode::Function(5),
+                [
+                    b"\x1b[15~",
+                    b"\x1b[15;2~",
+                    b"\x1b[15;3~",
+                    b"\x1b[15;5~",
+                    b"\x1b[15;6~",
+                ],
+            ),
+            (
+                KeyCode::Function(6),
+                [
+                    b"\x1b[17~",
+                    b"\x1b[17;2~",
+                    b"\x1b[17;3~",
+                    b"\x1b[17;5~",
+                    b"\x1b[17;6~",
+                ],
+            ),
+            (
+                KeyCode::Function(7),
+                [
+                    b"\x1b[18~",
+                    b"\x1b[18;2~",
+                    b"\x1b[18;3~",
+                    b"\x1b[18;5~",
+                    b"\x1b[18;6~",
+                ],
+            ),
+            (
+                KeyCode::Function(8),
+                [
+                    b"\x1b[19~",
+                    b"\x1b[19;2~",
+                    b"\x1b[19;3~",
+                    b"\x1b[19;5~",
+                    b"\x1b[19;6~",
+                ],
+            ),
+            (
+                KeyCode::Function(9),
+                [
+                    b"\x1b[20~",
+                    b"\x1b[20;2~",
+                    b"\x1b[20;3~",
+                    b"\x1b[20;5~",
+                    b"\x1b[20;6~",
+                ],
+            ),
+            (
+                KeyCode::Function(10),
+                [
+                    b"\x1b[21~",
+                    b"\x1b[21;2~",
+                    b"\x1b[21;3~",
+                    b"\x1b[21;5~",
+                    b"\x1b[21;6~",
+                ],
+            ),
+            (
+                KeyCode::Function(11),
+                [
+                    b"\x1b[23~",
+                    b"\x1b[23;2~",
+                    b"\x1b[23;3~",
+                    b"\x1b[23;5~",
+                    b"\x1b[23;6~",
+                ],
+            ),
+            (
+                KeyCode::Function(12),
+                [
+                    b"\x1b[24~",
+                    b"\x1b[24;2~",
+                    b"\x1b[24;3~",
+                    b"\x1b[24;5~",
+                    b"\x1b[24;6~",
+                ],
+            ),
+        ];
+        for (key, expected) in cases {
+            for (mods, want) in mods.into_iter().zip(expected) {
+                assert_eq!(
+                    key_bytes(key, mods).as_deref(),
+                    Some(*want),
+                    "{key:?} + {mods:?}"
+                );
+            }
+        }
+        for mods in mods {
+            assert_eq!(key_bytes(&KeyCode::Function(13), mods), None);
+        }
+    }
+
+    #[test]
+    fn functional_keys_encode_super_alt_shift_and_ctrl_alt() {
+        let mods = [
+            Modifiers::SUPER,
+            Modifiers::ALT | Modifiers::SHIFT,
+            Modifiers::CTRL | Modifiers::ALT,
+        ];
+        let cases: &[(KeyCode, [&[u8]; 3])] = &[
+            (KeyCode::Enter, [b"\r", b"\x1b\r", b"\x1b\r"]),
+            (KeyCode::Backspace, [b"\x7f", b"\x1b\x7f", b"\x1b\x08"]),
+            (KeyCode::Escape, [b"\x1b", b"\x1b", b"\x1b"]),
+            (KeyCode::Tab, [b"\x1b[9;9u", b"\x1b[9;4u", b"\x1b[9;7u"]),
+            (
+                KeyCode::LeftArrow,
+                [b"\x1b[1;9D", b"\x1b[1;4D", b"\x1b[1;7D"],
+            ),
+            (
+                KeyCode::RightArrow,
+                [b"\x1b[1;9C", b"\x1b[1;4C", b"\x1b[1;7C"],
+            ),
+            (KeyCode::UpArrow, [b"\x1b[1;9A", b"\x1b[1;4A", b"\x1b[1;7A"]),
+            (
+                KeyCode::DownArrow,
+                [b"\x1b[1;9B", b"\x1b[1;4B", b"\x1b[1;7B"],
+            ),
+            (KeyCode::Home, [b"\x1b[1;9H", b"\x1b[1;4H", b"\x1b[1;7H"]),
+            (KeyCode::End, [b"\x1b[1;9F", b"\x1b[1;4F", b"\x1b[1;7F"]),
+            (KeyCode::Delete, [b"\x1b[3;9~", b"\x1b[3;4~", b"\x1b[3;7~"]),
+            (KeyCode::Insert, [b"\x1b[2;9~", b"\x1b[2;4~", b"\x1b[2;7~"]),
+            (KeyCode::PageUp, [b"\x1b[5;9~", b"\x1b[5;4~", b"\x1b[5;7~"]),
+            (
+                KeyCode::PageDown,
+                [b"\x1b[6;9~", b"\x1b[6;4~", b"\x1b[6;7~"],
+            ),
+            (
+                KeyCode::Function(1),
+                [b"\x1b[1;9P", b"\x1b[1;4P", b"\x1b[1;7P"],
+            ),
+            (
+                KeyCode::Function(2),
+                [b"\x1b[1;9Q", b"\x1b[1;4Q", b"\x1b[1;7Q"],
+            ),
+            (
+                KeyCode::Function(3),
+                [b"\x1b[1;9R", b"\x1b[1;4R", b"\x1b[1;7R"],
+            ),
+            (
+                KeyCode::Function(4),
+                [b"\x1b[1;9S", b"\x1b[1;4S", b"\x1b[1;7S"],
+            ),
+            (
+                KeyCode::Function(5),
+                [b"\x1b[15;9~", b"\x1b[15;4~", b"\x1b[15;7~"],
+            ),
+            (
+                KeyCode::Function(6),
+                [b"\x1b[17;9~", b"\x1b[17;4~", b"\x1b[17;7~"],
+            ),
+            (
+                KeyCode::Function(7),
+                [b"\x1b[18;9~", b"\x1b[18;4~", b"\x1b[18;7~"],
+            ),
+            (
+                KeyCode::Function(8),
+                [b"\x1b[19;9~", b"\x1b[19;4~", b"\x1b[19;7~"],
+            ),
+            (
+                KeyCode::Function(9),
+                [b"\x1b[20;9~", b"\x1b[20;4~", b"\x1b[20;7~"],
+            ),
+            (
+                KeyCode::Function(10),
+                [b"\x1b[21;9~", b"\x1b[21;4~", b"\x1b[21;7~"],
+            ),
+            (
+                KeyCode::Function(11),
+                [b"\x1b[23;9~", b"\x1b[23;4~", b"\x1b[23;7~"],
+            ),
+            (
+                KeyCode::Function(12),
+                [b"\x1b[24;9~", b"\x1b[24;4~", b"\x1b[24;7~"],
+            ),
+        ];
+        for (key, expected) in cases {
+            for (mods, want) in mods.into_iter().zip(expected) {
+                assert_eq!(
+                    key_bytes(key, mods).as_deref(),
+                    Some(*want),
+                    "{key:?} + {mods:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn f1_through_f4_are_ss3_with_or_without_decckm() {
+        for (n, final_byte) in (1..=4).zip(b"PQRS") {
+            let key = KeyCode::Function(n);
+            let want = [0x1b, b'O', *final_byte];
+            assert_eq!(
+                key_bytes_mode(&key, Modifiers::NONE, false).as_deref(),
+                Some(&want[..])
+            );
+            assert_eq!(
+                key_bytes_mode(&key, Modifiers::NONE, true).as_deref(),
+                Some(&want[..])
             );
         }
     }
@@ -425,6 +837,10 @@ mod tests {
         assert_eq!(
             key_bytes_mode(&KeyCode::UpArrow, Modifiers::CTRL, true),
             key_bytes(&KeyCode::UpArrow, Modifiers::CTRL)
+        );
+        assert_eq!(
+            key_bytes_mode(&KeyCode::UpArrow, Modifiers::SHIFT, true).unwrap(),
+            b"\x1b[1;2A"
         );
         assert_eq!(
             key_bytes_mode(&KeyCode::Home, Modifiers::NONE, true).unwrap(),

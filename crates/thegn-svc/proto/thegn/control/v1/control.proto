@@ -189,7 +189,11 @@ message CalendarEventsRequest {
   string from = 1;            // inclusive ISO date
   string to = 2;
 }
-message CalendarEventsReply { string events_json = 1; }  // JSON array of CalEvent
+message CalendarEventsReply {
+  string events_json = 1;  // JSON array of CalEvent
+  uint32 skipped_rows = 2;
+  bool incomplete = 3;
+}
 message CalendarClocksRequest {}
 message CalendarClocksReply { string clocks_json = 1; }  // JSON value
 message CalendarIngestRequest {

@@ -713,14 +713,18 @@ impl Control for GrpcControl {
     ) -> Result<Response<proto::CalendarEventsReply>, Status> {
         self.authed(&req, Verb::CalendarEvents)?;
         let r = req.into_inner();
-        let events = self
+        let reply = self
             .api
             .calendar_events(&r.from, &r.to)
             .await
             .map_err(Status::from)?;
         let events_json =
-            serde_json::to_string(&events).map_err(|e| Status::internal(e.to_string()))?;
-        Ok(Response::new(proto::CalendarEventsReply { events_json }))
+            serde_json::to_string(&reply.events).map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(proto::CalendarEventsReply {
+            events_json,
+            skipped_rows: reply.skipped_rows,
+            incomplete: reply.incomplete,
+        }))
     }
 
     async fn calendar_clocks(

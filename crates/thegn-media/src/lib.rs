@@ -458,11 +458,25 @@ async fn mpd_client(opts: &mut ResolveOpts) -> Option<MediaClient> {
     if opts.mpd_socket.is_empty() {
         return None;
     }
-    let endpoint = mpd::MpdEndpoint::resolve(&opts.mpd_socket, opts.mpd_password.take());
+    let endpoint = match mpd::MpdEndpoint::resolve(&opts.mpd_socket, opts.mpd_password.take()) {
+        Ok(ep) => ep,
+        Err(e) => {
+            // Configuration error: surface it, never dial a guessed endpoint.
+            tracing::warn!(target: "thegn::media", error = %e, "invalid [media.mpd] socket; MPD disabled");
+            return None;
+        }
+    };
     match mpd::Mpd::connect(endpoint).await {
         Ok(m) => {
             tracing::debug!(target: "thegn::media", "media backend: native MPD");
             Some(Box::new(m))
+        }
+        Err(MediaError::Backend(message))
+            if message == "mpd argument contains a forbidden control character" =>
+        {
+            // A rejected password is local configuration, not a failed dial.
+            tracing::warn!(target: "thegn::media", error = %message, "invalid [media.mpd] password; MPD disabled");
+            None
         }
         Err(e) => {
             tracing::debug!(target: "thegn::media", error = %e, "MPD unreachable; skipping");

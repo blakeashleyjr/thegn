@@ -136,34 +136,48 @@ pub enum EditScope {
     AllInstances,
 }
 
-/// The admission budget and shared pool one account's fetches are metered
-/// against. Required by every backend constructor.
+/// The immutable per-account context every backend is built from: the
+/// admission budget and shared pool one account's fetches are metered against,
+/// and the resolved home zone floating date-times are anchored to (THE-464).
+/// Required by every backend constructor, so a production path cannot forget
+/// the zone the way an optional builder setter could be forgotten.
 #[derive(Debug, Clone)]
 pub struct AccountAdmission {
     budget: AdmissionBudget,
     pool: Arc<AdmissionPool>,
+    zone: thegn_core::calendar::Tz,
 }
 
 impl AccountAdmission {
-    pub fn new(budget: AdmissionBudget, pool: Arc<AdmissionPool>) -> Self {
-        AccountAdmission { budget, pool }
+    pub fn new(
+        budget: AdmissionBudget,
+        pool: Arc<AdmissionPool>,
+        zone: thegn_core::calendar::Tz,
+    ) -> Self {
+        AccountAdmission { budget, pool, zone }
     }
 
     /// `budget` against the process-wide pool every router shares.
-    pub fn global(budget: AdmissionBudget) -> Self {
-        Self::new(budget, AdmissionPool::global())
+    pub fn global(budget: AdmissionBudget, zone: thegn_core::calendar::Tz) -> Self {
+        Self::new(budget, AdmissionPool::global(), zone)
     }
 
     /// `budget` against a private pool at the global ceilings — for tests and
     /// callers that must not contend with live syncs.
-    pub fn isolated(budget: AdmissionBudget) -> Self {
+    pub fn isolated(budget: AdmissionBudget, zone: thegn_core::calendar::Tz) -> Self {
         Self::new(
             budget,
             AdmissionPool::new(
                 thegn_core::calendar::admission::GLOBAL_MAX_RECORDS,
                 thegn_core::calendar::admission::GLOBAL_MAX_BYTES,
             ),
+            zone,
         )
+    }
+
+    /// The home zone floating date-times are anchored to.
+    pub fn zone(&self) -> thegn_core::calendar::Tz {
+        self.zone
     }
 
     pub fn budget(&self) -> AdmissionBudget {
@@ -180,12 +194,52 @@ impl AccountAdmission {
     }
 }
 
+/// What the fetch that produced an [`EventPage`] actually completed, and so how
+/// the cache may apply it. This is the *only* thing the host branches on: the
+/// returned cursor says where to resume, never what the page means (THE-452).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PageMode {
+    /// An authoritative, complete picture of the window: anything cached for
+    /// the account and absent from the page is gone. It may still return a
+    /// next cursor (a full CalDAV `calendar-query` does).
+    #[default]
+    Snapshot,
+    /// Only what changed since the request cursor: upserts plus tombstones,
+    /// merged into the cache. Never destructive, whatever cursor comes back.
+    Delta,
+    /// Nothing changed since the request cursor; the cache is left alone.
+    Unchanged,
+    /// The provider asked for the account's cache to be discarded and replaced
+    /// by this page, even when the page is empty (a snapshot that is believed
+    /// unconditionally).
+    Reset,
+}
+
+impl PageMode {
+    /// Parse the plugin wire spelling.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "snapshot" => Some(PageMode::Snapshot),
+            "delta" => Some(PageMode::Delta),
+            "unchanged" => Some(PageMode::Unchanged),
+            "reset" => Some(PageMode::Reset),
+            _ => None,
+        }
+    }
+
+    /// Whether the page replaces the account's cached events wholesale.
+    pub fn replaces_cache(self) -> bool {
+        matches!(self, PageMode::Snapshot | PageMode::Reset)
+    }
+}
+
 /// One fetch's worth of events — always complete.
 ///
 /// A page is only ever built from a fetch that stayed within its admission
 /// budget; an overflow is [`CalendarError::Admission`], never a truncated page.
-/// So an empty `sync_token` really does mean "replace the cache wholesale" and
-/// a cursor is only ever advanced past data that was fully admitted.
+/// There is deliberately no "partial" [`PageMode`]: a truncated page cannot be
+/// represented, so it can never be mistaken for an authoritative replacement.
+/// A cursor is only ever advanced past data that was fully admitted.
 ///
 /// The page owns the [`AdmissionLease`] for what it holds: the global
 /// reservation is released when the page is dropped, not when the fetch
@@ -193,16 +247,15 @@ impl AccountAdmission {
 /// outlive or escape its accounting.
 #[derive(Debug, Default)]
 pub struct EventPage {
+    mode: PageMode,
     events: Vec<CalEvent>,
-    /// Ids removed since `sync_token` — only ever non-empty for an incremental
-    /// fetch.
+    /// Ids removed since the request cursor — only ever non-empty for a
+    /// [`PageMode::Delta`].
     deleted: Vec<String>,
-    /// Opaque provider cursor (an ETag, a CalDAV sync-token). Empty means this
-    /// was a full fetch and the cache should be replaced wholesale.
+    /// Opaque provider cursor to resume from next time (an ETag, a CalDAV
+    /// sync-token). Empty means "no cursor": the next fetch is a full one.
+    /// Independent of `mode`.
     sync_token: String,
-    /// True when nothing changed since `sync_token` (an HTTP 304), so `events`
-    /// is empty *and* the cache must be left alone.
-    unchanged: bool,
     lease: AdmissionLease,
 }
 
@@ -210,8 +263,8 @@ impl EventPage {
     /// Nothing changed since `sync_token`: keep the cache, keep the cursor.
     pub fn unchanged(sync_token: impl Into<String>) -> Self {
         EventPage {
+            mode: PageMode::Unchanged,
             sync_token: sync_token.into(),
-            unchanged: true,
             ..Default::default()
         }
     }
@@ -219,8 +272,13 @@ impl EventPage {
     /// Seal a fetch whose events and deletions were admitted through `meter`
     /// while they were parsed. Charges the cursor, then hands the meter's
     /// retained reservation to the page.
+    ///
+    /// `mode` is what the fetch completed. Contradictions fail closed: an
+    /// unchanged page carries no data (use [`Self::unchanged`]), and only a
+    /// delta can carry tombstones.
     pub fn from_meter(
         mut meter: AdmissionMeter,
+        mode: PageMode,
         events: Vec<CalEvent>,
         deleted: Vec<String>,
         sync_token: String,
@@ -231,12 +289,22 @@ impl EventPage {
             meter.records() >= events.len() + deleted.len(),
             "EventPage::from_meter given unadmitted data"
         );
+        if mode == PageMode::Unchanged {
+            return Err(CalendarError::Parse(
+                "an unchanged page cannot carry data".into(),
+            ));
+        }
+        if mode != PageMode::Delta && !deleted.is_empty() {
+            return Err(CalendarError::Parse(
+                "only a delta page can carry deletions".into(),
+            ));
+        }
         meter.charge_retained(sync_token.len())?;
         Ok(EventPage {
+            mode,
             events,
             deleted,
             sync_token,
-            unchanged: false,
             lease: meter.into_lease(),
         })
     }
@@ -244,6 +312,7 @@ impl EventPage {
     /// Admit already-materialized values (tests, in-memory sources). Refused
     /// whole when they exceed the budget.
     pub fn try_new(
+        mode: PageMode,
         events: Vec<CalEvent>,
         deleted: Vec<String>,
         sync_token: impl Into<String>,
@@ -256,7 +325,7 @@ impl EventPage {
         for d in &deleted {
             meter.admit_deletion(d.len())?;
         }
-        Self::from_meter(meter, events, deleted, sync_token.into())
+        Self::from_meter(meter, mode, events, deleted, sync_token.into())
     }
 
     pub fn events(&self) -> &[CalEvent] {
@@ -271,8 +340,13 @@ impl EventPage {
         &self.sync_token
     }
 
+    /// What the producing fetch completed — see [`PageMode`].
+    pub fn mode(&self) -> PageMode {
+        self.mode
+    }
+
     pub fn is_unchanged(&self) -> bool {
-        self.unchanged
+        self.mode == PageMode::Unchanged
     }
 
     /// `(records, bytes)` this page holds reserved in its pool.
@@ -520,12 +594,25 @@ pub struct AccountResult {
 impl CalendarRouter {
     /// Every active account, metered against the process-wide pool.
     pub fn from_config(cfg: &CalendarConfig) -> Self {
-        Self::from_config_with_pool(cfg, AdmissionPool::global())
+        Self::from_config_with_zone(cfg, cfg.effective_home_zone())
+    }
+
+    /// Every active account using the already-resolved home zone for this sync.
+    pub fn from_config_with_zone(cfg: &CalendarConfig, zone: thegn_core::calendar::Tz) -> Self {
+        Self::from_config_with_pool_and_zone(cfg, AdmissionPool::global(), zone)
     }
 
     /// Every active account, metered against `pool`.
     pub fn from_config_with_pool(cfg: &CalendarConfig, pool: Arc<AdmissionPool>) -> Self {
-        let admission = AccountAdmission::new(cfg.admission_budget(), pool);
+        Self::from_config_with_pool_and_zone(cfg, pool, cfg.effective_home_zone())
+    }
+
+    fn from_config_with_pool_and_zone(
+        cfg: &CalendarConfig,
+        pool: Arc<AdmissionPool>,
+        zone: thegn_core::calendar::Tz,
+    ) -> Self {
+        let admission = AccountAdmission::new(cfg.admission_budget(), pool, zone);
         let accounts = cfg
             .active_accounts()
             .into_iter()
