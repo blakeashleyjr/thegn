@@ -33,7 +33,9 @@ use thegn_core::config::Config;
 use thegn_core::config_env_tables::SnapshotStoreConfig;
 use thegn_core::lifecycle::{HibernateCandidate, decide_hibernate};
 use thegn_core::remote::GitLoc;
-use thegn_core::snapshot_meta::{ArtifactMeta, SnapshotKey, SnapshotManifest, retention_prune};
+use thegn_core::snapshot_meta::{
+    ArtifactMeta, SnapshotKey, SnapshotManifest, retention_prune_keeping,
+};
 use thegn_core::store::{HibernationRow, HibernationStore, PoolStore};
 use thegn_core::syncstate;
 use thegn_svc::snapshot::SnapshotStore;
@@ -468,11 +470,15 @@ fn restore_into_sandbox(
     let legacy_key = key.legacy();
     let (restore_key, manifest) = match store.get_manifest(&key, snapshot_id) {
         Ok(manifest) => (&key, manifest),
-        Err(_) if legacy_key != key => {
-            let manifest = store.get_manifest(&legacy_key, snapshot_id)?;
-            (&legacy_key, manifest)
-        }
-        Err(error) => return Err(error.into()),
+        Err(primary) if legacy_key != key => match store.get_manifest(&legacy_key, snapshot_id) {
+            Ok(manifest) => (&legacy_key, manifest),
+            Err(legacy) => {
+                return Err(anyhow::anyhow!(
+                    "snapshot manifest lookup failed: {primary:#}; legacy key: {legacy:#}"
+                ));
+            }
+        },
+        Err(error) => return Err(error),
     };
 
     let mut bundle_data: Option<Vec<u8>> = None;
@@ -664,7 +670,10 @@ fn capture_to_store(
 
     // Retention: prune older snapshots now that this one is published.
     if let Ok(all) = store.list(key) {
-        for stale in retention_prune(&all, snap_cfg.keep_clamped()) {
+        for stale in retention_prune_keeping(&all, snap_cfg.keep_clamped(), &manifest.id) {
+            if stale == manifest.id {
+                continue;
+            }
             let _ = store.delete(key, &stale); // best-effort: GC only
         }
     }
@@ -766,6 +775,12 @@ mod tests {
         let mut victim = tempfile::NamedTempFile::new().unwrap();
         victim.write_all(b"keep this content").unwrap();
         victim.flush().unwrap();
+
+        match std::fs::remove_file(&link) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("could not clear stale test link: {error}"),
+        }
 
         match thegn_core::fsperm::create_symlink(victim.path(), &link, false) {
             Ok(()) => {}
