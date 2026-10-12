@@ -391,7 +391,7 @@ pub fn parse_ics_window_checked(
             }
             "END" if line.value.eq_ignore_ascii_case("VEVENT") => {
                 match cur.take() {
-                    Some(b) if window.is_some_and(|w| !b.may_occur_in(w)) => {
+                    Some(b) if window.is_some_and(|w| !b.may_occur_in(w, default_zone)) => {
                         // Parsed within the per-event ceilings, but outside
                         // the sync window: released, never admitted.
                         meter.abandon_event();
@@ -535,7 +535,7 @@ fn day_of(t: &EventTime) -> NaiveDate {
 impl Builder {
     /// Whether any occurrence of this event can touch `[from, to]`. Errs on
     /// the side of "yes": only provably-outside events are excluded.
-    fn may_occur_in(&self, (from, to): (NaiveDate, NaiveDate)) -> bool {
+    fn may_occur_in(&self, (from, to): (NaiveDate, NaiveDate), default_zone: &str) -> bool {
         let Some(start) = self.start.as_ref().map(day_of) else {
             return false;
         };
@@ -564,9 +564,16 @@ impl Builder {
             return false;
         }
         // A rule only ends provably before the window through UNTIL.
-        self.rrules.iter().any(|r| match r.until {
-            None => true,
-            Some(u) => u.date().checked_add_signed(span).unwrap_or(NaiveDate::MAX) >= lo,
+        let home = default_zone
+            .parse::<chrono_tz::Tz>()
+            .unwrap_or(chrono_tz::UTC);
+        let zone = self
+            .start
+            .as_ref()
+            .map(|start| super::recur::series_zone(start, home));
+        self.rrules.iter().any(|r| {
+            super::recur::until_bound(r, zone)
+                .is_none_or(|u| u.date().checked_add_signed(span).unwrap_or(NaiveDate::MAX) >= lo)
         })
     }
 
