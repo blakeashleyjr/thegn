@@ -90,6 +90,7 @@ chmod 0755 "$fakebin/alacritty"
 # revision symlinked instead, so a missing binary silently produced a dangling
 # link and the test still passed.)
 staged_release=""
+release_backup=""
 if [[ ! -f $repo/target/release/thegn ]]; then
   mkdir -p "$repo/target/release"
   printf '#!/usr/bin/env sh\nexit 0\n' >"$repo/target/release/thegn"
@@ -97,6 +98,7 @@ if [[ ! -f $repo/target/release/thegn ]]; then
   staged_release="$repo/target/release/thegn"
 fi
 cleanup() {
+  [[ -n $release_backup ]] && cp "$release_backup" "$repo/target/release/thegn"
   rm -rf "$tmp"
   [[ -n $staged_release ]] && rm -f "$staged_release"
   return 0
@@ -340,6 +342,22 @@ PATH="$fakebin:$PATH" HOME="$tmp/home" XDG_CONFIG_HOME="$tmp/config" XDG_DATA_HO
   exit 1
 }
 
+# Existing installation identity comes from its wrapper, not a possibly stale
+# staged release binary (which may differ after a build or target reclaim).
+release_backup="$tmp/release-before-reinstall"
+cp "$repo/target/release/thegn" "$release_backup"
+printf 'changed staged release bytes\n' >"$repo/target/release/thegn"
+if ! PATH="$fakebin:$PATH" HOME="$tmp/home" XDG_CONFIG_HOME="$tmp/config" XDG_DATA_HOME="$tmp/data" \
+  "$repo/install.sh" "$tmp/bin" >"$tmp/changed-release-reinstall.out" 2>&1; then
+  echo "reinstall refused changed staged release bytes" >&2
+  cat "$tmp/changed-release-reinstall.out" >&2
+  exit 1
+fi
+[[ $(<"$tmp/bin/thegn") == 'changed staged release bytes' ]] || {
+  echo "reinstall did not update the installed binary from changed staged bytes" >&2
+  exit 1
+}
+
 # Exercise make-app input checks on Linux with a temporary Darwin platform shim.
 mac_test_bin="$tmp/mac-bin"
 mkdir -p "$mac_test_bin"
@@ -354,27 +372,48 @@ printf 'thegn 1.2.3\n'
 EOF
 chmod 0755 "$mac_test_bin/thegn"
 make_app="$repo/packaging/macos/make-app.sh"
-if PATH="$mac_test_bin:$PATH" HOME="$tmp/home" "$make_app" --bin "$mac_test_bin/thegn" --dest "$tmp/mac-apps" --name ../escaped --dry-run >"$tmp/name.out" 2>&1; then
+name_status=0
+PATH="$mac_test_bin:$PATH" HOME="$tmp/home" "$make_app" --bin "$mac_test_bin/thegn" --dest "$tmp/mac-apps" --name ../escaped --dry-run >"$tmp/name.out" 2>&1 || name_status=$?
+if ((name_status != 2)); then
   echo "make-app accepted a traversing name" >&2
   exit 1
 fi
+[[ $(<"$tmp/name.out") == *"--name must be"* ]] || {
+  echo "make-app did not report the invalid --name" >&2
+  cat "$tmp/name.out" >&2
+  exit 1
+}
 [[ ! -e $tmp/escaped.app && ! -e $tmp/mac-apps ]] || {
   echo "invalid make-app name created a path" >&2
   exit 1
 }
-if PATH="$mac_test_bin:$PATH" HOME="$tmp/home" "$make_app" --bin "$mac_test_bin/thegn" --dest "$tmp/mac-apps" --env 'SAFE;touch PWNED=x' --dry-run >"$tmp/env.out" 2>&1; then
+env_status=0
+PATH="$mac_test_bin:$PATH" HOME="$tmp/home" "$make_app" --bin "$mac_test_bin/thegn" --dest "$tmp/mac-apps" --env 'SAFE;touch PWNED=x' --dry-run >"$tmp/env.out" 2>&1 || env_status=$?
+if ((env_status != 2)); then
   echo "make-app accepted a shell syntax environment key" >&2
   exit 1
 fi
+[[ $(<"$tmp/env.out") == *"invalid --env key"* ]] || {
+  echo "make-app did not report the invalid --env key" >&2
+  cat "$tmp/env.out" >&2
+  exit 1
+}
 cat >"$mac_test_bin/thegn" <<'EOF'
 #!/usr/bin/env sh
 printf 'thegn 1.2.3</string><key>X</key>\n'
 EOF
 chmod 0755 "$mac_test_bin/thegn"
-if PATH="$mac_test_bin:$PATH" HOME="$tmp/home" "$make_app" --bin "$mac_test_bin/thegn" --dest "$tmp/mac-apps" --dry-run >"$tmp/version.out" 2>&1; then
+version_status=0
+PATH="$mac_test_bin:$PATH" HOME="$tmp/home" "$make_app" --bin "$mac_test_bin/thegn" --dest "$tmp/mac-apps" --dry-run >"$tmp/version.out" 2>&1 || version_status=$?
+if ((version_status != 1)); then
   echo "make-app accepted injected version output" >&2
   exit 1
 fi
+[[ $(<"$tmp/version.out") == *"unsupported version output"* ]] || {
+  echo "make-app did not report unsupported version output" >&2
+  cat "$tmp/version.out" >&2
+  exit 1
+}
 cat >"$mac_test_bin/thegn" <<'EOF'
 #!/usr/bin/env sh
 printf 'thegn 1.2.3\n'
