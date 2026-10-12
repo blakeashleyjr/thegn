@@ -20,6 +20,8 @@
 use crate::config::FileAccess;
 use crate::sandbox::{PROBE_TIMEOUT, SandboxSpec, oci_prefix};
 
+pub(crate) type PreflightRunner = dyn Fn(&[String]) -> Option<(bool, String)>;
+
 /// The exec argv the preflight probe runs. It mirrors the OCI arm of
 /// `backend_enter_argv` exactly — same `oci_prefix` (so it targets the right
 /// local/remote daemon), same `--workdir <worktree>` gated on file access, same
@@ -83,10 +85,7 @@ pub fn preflight_exec(spec: &SandboxSpec) -> Result<(), String> {
 
 /// [`preflight_exec`] with an injected executor, allowing route and failure
 /// behavior to be tested without a live container engine.
-pub(crate) fn preflight_exec_with(
-    spec: &SandboxSpec,
-    run: &dyn Fn(&[String]) -> Option<(bool, String)>,
-) -> Result<(), String> {
+pub(crate) fn preflight_exec_with(spec: &SandboxSpec, run: &PreflightRunner) -> Result<(), String> {
     if !spec.backend.is_oci() {
         return Ok(());
     }

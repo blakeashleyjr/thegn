@@ -30,16 +30,16 @@ pub(crate) struct Captured {
 #[derive(Debug)]
 enum ReadOutcome {
     Captured(Captured),
-    Failed(io::Error),
+    Failed,
 }
 
 /// The complete set of outcomes from a bounded command.
 #[derive(Debug)]
 pub(crate) enum ProcOutcome {
-    Spawn(io::Error),
+    Spawn,
     Timeout,
-    Wait(io::Error),
-    Read(io::Error),
+    Wait,
+    Read,
     Exited {
         status: ExitStatus,
         stdout: Captured,
@@ -54,11 +54,7 @@ impl ProcOutcome {
                 status.success(),
                 String::from_utf8_lossy(&stdout.bytes).into_owned(),
             )),
-            Self::Exited { .. }
-            | Self::Spawn(_)
-            | Self::Wait(_)
-            | Self::Read(_)
-            | Self::Timeout => None,
+            Self::Exited { .. } | Self::Spawn | Self::Wait | Self::Read | Self::Timeout => None,
         }
     }
 
@@ -68,18 +64,14 @@ impl ProcOutcome {
                 status.success(),
                 String::from_utf8_lossy(&stderr.bytes).into_owned(),
             )),
-            Self::Exited { .. }
-            | Self::Spawn(_)
-            | Self::Wait(_)
-            | Self::Read(_)
-            | Self::Timeout => None,
+            Self::Exited { .. } | Self::Spawn | Self::Wait | Self::Read | Self::Timeout => None,
         }
     }
 }
 
 pub(crate) fn run_bounded(argv: &[String], timeout: Duration, capture: Capture) -> ProcOutcome {
     let Some(program) = argv.first() else {
-        return ProcOutcome::Spawn(io::Error::new(io::ErrorKind::InvalidInput, "empty argv"));
+        return ProcOutcome::Spawn;
     };
     let mut command = Command::new(program);
     command
@@ -99,7 +91,7 @@ pub(crate) fn run_bounded(argv: &[String], timeout: Duration, capture: Capture) 
     std::os::unix::process::CommandExt::process_group(&mut command, 0);
     let mut child = match command.spawn() {
         Ok(child) => child,
-        Err(error) => return ProcOutcome::Spawn(error),
+        Err(_) => return ProcOutcome::Spawn,
     };
 
     let stdout = match child.stdout.take() {
@@ -126,10 +118,10 @@ pub(crate) fn run_bounded(argv: &[String], timeout: Duration, capture: Capture) 
             Ok(None) => thread::sleep(
                 Duration::from_millis(10).min(deadline.saturating_duration_since(Instant::now())),
             ),
-            Err(error) => {
+            Err(_) => {
                 terminate_tree(&mut child);
                 reap_bounded(child);
-                return ProcOutcome::Wait(error);
+                return ProcOutcome::Wait;
             }
         }
     };
@@ -196,8 +188,8 @@ fn spawn_reader<R: Read + Send + 'static>(mut reader: R, cap: usize) -> Receiver
                     captured.truncated |= keep < count;
                 }
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                Err(error) => {
-                    Result::ok(sender.send(ReadOutcome::Failed(error)));
+                Err(_) => {
+                    Result::ok(sender.send(ReadOutcome::Failed));
                     return;
                 }
             }
@@ -216,12 +208,9 @@ fn receive_reader(
     };
     match receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
         Ok(ReadOutcome::Captured(captured)) => Ok(captured),
-        Ok(ReadOutcome::Failed(error)) => Err(ProcOutcome::Read(error)),
+        Ok(ReadOutcome::Failed) => Err(ProcOutcome::Read),
         Err(mpsc::RecvTimeoutError::Timeout) => Err(ProcOutcome::Timeout),
-        Err(mpsc::RecvTimeoutError::Disconnected) => Err(ProcOutcome::Read(io::Error::new(
-            io::ErrorKind::BrokenPipe,
-            "capture reader stopped",
-        ))),
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(ProcOutcome::Read),
     }
 }
 
@@ -306,7 +295,7 @@ mod tests {
                     stderr: None
                 }
             ),
-            ProcOutcome::Spawn(_)
+            ProcOutcome::Spawn
         ));
         assert!(matches!(
             run_bounded(
@@ -317,7 +306,7 @@ mod tests {
                     stderr: None
                 }
             ),
-            ProcOutcome::Spawn(_)
+            ProcOutcome::Spawn
         ));
         let outcome = run_bounded(
             &sh("printf out; printf err >&2; exit 7"),
@@ -358,21 +347,9 @@ mod tests {
         );
         assert_eq!(success.into_stderr().unwrap(), (true, "diagnostic".into()));
         assert!(ProcOutcome::Timeout.into_stdout().is_none());
-        assert!(
-            ProcOutcome::Spawn(io::Error::other("spawn"))
-                .into_stderr()
-                .is_none()
-        );
-        assert!(
-            ProcOutcome::Wait(io::Error::other("wait"))
-                .into_stdout()
-                .is_none()
-        );
-        assert!(
-            ProcOutcome::Read(io::Error::other("read"))
-                .into_stderr()
-                .is_none()
-        );
+        assert!(ProcOutcome::Spawn.into_stderr().is_none());
+        assert!(ProcOutcome::Wait.into_stdout().is_none());
+        assert!(ProcOutcome::Read.into_stderr().is_none());
     }
 
     #[cfg(unix)]
