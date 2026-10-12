@@ -467,38 +467,24 @@ pub fn agent_proxy_env(cfg: &Config, choice: &str, worktree: &str) -> ProxyEnvDe
             return ProxyEnvDecision::Skipped(format!("proxy secret unavailable: {error}"));
         }
     };
-    let (workspace, zone) = Db::open()
-        .map(|db| {
-            let workspace = db
-                .repo_root_for(worktree)
-                .ok()
-                .flatten()
-                .map(|repo| format!("workspace:{repo}"));
-            let zone = db
-                .zone_of_worktree(worktree)
-                .ok()
-                .flatten()
-                .map(|zone| format!("zone:{}", zone.name));
-            (workspace, zone)
-        })
-        .unwrap_or((None, None));
-    agent_proxy_env_with_secret(
-        cfg,
-        choice,
-        worktree,
-        workspace.as_deref(),
-        zone.as_deref(),
-        &secret,
-    )
+    agent_proxy_env_with_secret(cfg, choice, worktree, &secret)
 }
 
 fn agent_proxy_env_with_secret(
     cfg: &Config,
     choice: &str,
     worktree: &str,
-    workspace: Option<&str>,
-    zone: Option<&str>,
     secret: &[u8],
+) -> ProxyEnvDecision {
+    agent_proxy_env_with_secret_scopes(cfg, choice, worktree, secret, attribution_scopes)
+}
+
+fn agent_proxy_env_with_secret_scopes(
+    cfg: &Config,
+    choice: &str,
+    worktree: &str,
+    secret: &[u8],
+    scopes: impl FnOnce(&str) -> (Option<String>, Option<String>),
 ) -> ProxyEnvDecision {
     let mp = &cfg.model_proxy;
     match probe_with(listen_addr(mp), secret) {
@@ -522,7 +508,14 @@ fn agent_proxy_env_with_secret(
             return ProxyEnvDecision::Skipped(format!("proxy secret unavailable: {reason}"));
         }
     }
-    let key = mint_attribution_key(worktree, choice, workspace, zone, secret);
+    let (workspace, zone) = scopes(worktree);
+    let key = mint_attribution_key(
+        worktree,
+        choice,
+        workspace.as_deref(),
+        zone.as_deref(),
+        secret,
+    );
     let base = format!("http://{}", listen_addr(mp));
     ProxyEnvDecision::Inject(vec![
         ("ANTHROPIC_BASE_URL".to_string(), base.clone()),
@@ -530,6 +523,33 @@ fn agent_proxy_env_with_secret(
         ("OPENAI_BASE_URL".to_string(), format!("{base}/v1")),
         ("OPENAI_API_KEY".to_string(), key),
     ])
+}
+
+fn attribution_scopes(worktree: &str) -> (Option<String>, Option<String>) {
+    let db = match Db::open() {
+        Ok(db) => db,
+        Err(error) => {
+            tracing::warn!(%error, "could not open database for proxy attribution scopes");
+            return (None, None);
+        }
+    };
+    let workspace = match db.repo_root_for(worktree) {
+        Ok(Some(repo)) => Some(format!("workspace:{repo}")),
+        Ok(None) => None,
+        Err(error) => {
+            tracing::warn!(%error, "could not resolve workspace proxy attribution scope");
+            None
+        }
+    };
+    let zone = match db.zone_of_worktree(worktree) {
+        Ok(Some(zone)) => Some(format!("zone:{}", zone.name)),
+        Ok(None) => None,
+        Err(error) => {
+            tracing::warn!(%error, "could not resolve zone proxy attribution scope");
+            None
+        }
+    };
+    (workspace, zone)
 }
 
 /// Mints a per-worktree signed attribution key. HMAC authenticates its claims;
@@ -694,10 +714,15 @@ mod tests {
             drawer_scope: None,
             drawer_cwd: None,
         });
+        let mut scopes_looked_up = false;
         assert!(matches!(
-            agent_proxy_env_with_secret(&app_cfg, "test-agent", "/tmp/wt", None, None, secret),
+            agent_proxy_env_with_secret_scopes(&app_cfg, "test-agent", "/tmp/wt", secret, |_| {
+                scopes_looked_up = true;
+                (None, None)
+            }),
             ProxyEnvDecision::Skipped(_)
         ));
+        assert!(!scopes_looked_up);
         server.join().unwrap();
     }
 

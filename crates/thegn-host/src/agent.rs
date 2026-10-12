@@ -797,7 +797,7 @@ pub fn prepare_sandbox_env(
                 }
                 // `ensure` proves the container RUNNING, but not that OCI `exec` works
                 // (broken keep-id/crun); probe so the real error surfaces, not a vanish.
-                run_with_vpn_rollback(spec, |spec| {
+                Ok(run_with_vpn_rollback(spec, |spec| {
                     sandbox::ensure(spec).and_then(|()| {
                         thegn_core::sandbox_preflight::preflight_exec(spec)
                             // No prefix here: `preflight_exec` now owns its own error
@@ -807,7 +807,7 @@ pub fn prepare_sandbox_env(
                             // width-fitted status line.
                             .map_err(|e| anyhow::anyhow!("{e}"))
                     })
-                })
+                }))
             })?;
             match launch {
                 Ok(()) => {
@@ -1076,18 +1076,16 @@ fn admit_final_sandbox_spec_then<T>(
 /// forces the sandbox offline (`offline`). Tunnel bring-up itself runs here on
 /// the (already off-event-loop) sandbox-prepare path.
 fn attach_vpn(spec: &mut sandbox::SandboxSpec) -> anyhow::Result<()> {
-    use thegn_core::config::VpnMode;
     let Some(vpn) = spec.vpn.clone() else {
         return Ok(());
     };
-    let local = spec.placement.is_local();
-    let sidecar_capable =
-        spec.backend.is_oci() && local && matches!(vpn.mode, VpnMode::Sidecar | VpnMode::Proxy);
+    let sidecar_capable = sidecar_capable(spec, vpn.mode);
 
     if !sidecar_capable {
         return apply_vpn_error(
             spec,
             vpn.on_error,
+            false,
             format!(
                 "vpn: provider '{}' in mode '{}' needs a local OCI backend (got '{}')",
                 vpn.provider,
@@ -1101,6 +1099,7 @@ fn attach_vpn(spec: &mut sandbox::SandboxSpec) -> anyhow::Result<()> {
         return apply_vpn_error(
             spec,
             vpn.on_error,
+            false,
             "vpn: no OCI runtime for backend".to_string(),
         );
     };
@@ -1124,11 +1123,14 @@ fn attach_vpn_with<P: VpnProvider>(
     let on_error = vpn.on_error;
     let attach = match provider.up(rt, &sidecar) {
         Ok(attach) => attach,
-        Err(e) => return apply_vpn_error(spec, on_error, format!("vpn: bring-up failed: {e}")),
+        Err(e) => {
+            rollback_vpn(provider, rt, &sidecar, remove_sidecar);
+            return apply_vpn_error(spec, on_error, true, format!("vpn: bring-up failed: {e}"));
+        }
     };
     if let Err(e) = provider.ready(rt, &sidecar, vpn.ready_timeout) {
         rollback_vpn(provider, rt, &sidecar, remove_sidecar);
-        return apply_vpn_error(spec, on_error, format!("vpn: {e}"));
+        return apply_vpn_error(spec, on_error, true, format!("vpn: {e}"));
     }
     // Userspace tunnels: point the inner process at the SOCKS/HTTP proxy.
     if let Some(proxy) = &attach.proxy {
@@ -1142,6 +1144,7 @@ fn attach_vpn_with<P: VpnProvider>(
 fn apply_vpn_error(
     spec: &mut sandbox::SandboxSpec,
     on_error: thegn_core::config::VpnOnError,
+    clear_vpn_on_warn: bool,
     message: String,
 ) -> anyhow::Result<()> {
     use thegn_core::config::VpnOnError;
@@ -1149,7 +1152,9 @@ fn apply_vpn_error(
         VpnOnError::Fail => Err(anyhow::anyhow!(message)),
         VpnOnError::Warn => {
             thegn_core::msg::warn(&format!("{message}; continuing (on_error=warn)"));
-            spec.vpn = None;
+            if clear_vpn_on_warn {
+                spec.vpn = None;
+            }
             Ok(())
         }
         VpnOnError::Offline => {
@@ -1161,6 +1166,15 @@ fn apply_vpn_error(
             Ok(())
         }
     }
+}
+
+fn sidecar_capable(spec: &sandbox::SandboxSpec, mode: thegn_core::config::VpnMode) -> bool {
+    spec.backend.is_oci()
+        && spec.placement.is_local()
+        && matches!(
+            mode,
+            thegn_core::config::VpnMode::Sidecar | thegn_core::config::VpnMode::Proxy
+        )
 }
 
 fn rollback_vpn<P: VpnProvider>(
@@ -1198,7 +1212,7 @@ fn run_with_vpn_rollback<T>(
     let Some(vpn) = spec.vpn.clone() else {
         return effects(spec);
     };
-    if !spec.backend.is_oci() || !spec.placement.is_local() {
+    if !sidecar_capable(spec, vpn.mode) {
         return effects(spec);
     }
     let Some(prefix) = sandbox::oci_runtime_prefix(spec.backend) else {
@@ -1216,8 +1230,12 @@ fn run_with_vpn_rollback_using<T, P: VpnProvider>(
     effects: impl FnOnce(&mut sandbox::SandboxSpec) -> anyhow::Result<T>,
     remove_sidecar: impl FnOnce(&thegn_svc::vpn::OciRuntime, &str) -> anyhow::Result<()>,
 ) -> anyhow::Result<T> {
+    let sidecar_enabled = spec
+        .vpn
+        .as_ref()
+        .is_some_and(|vpn| sidecar_capable(spec, vpn.mode));
     let result = effects(spec);
-    if result.is_err() {
+    if result.is_err() && sidecar_enabled {
         let sidecar = sandbox::vpn_sidecar_name(&spec.name);
         rollback_vpn(provider, rt, &sidecar, remove_sidecar);
     }
