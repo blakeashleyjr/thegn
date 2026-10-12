@@ -16,7 +16,7 @@ use std::sync::Mutex;
 use futures::future::{BoxFuture, join_all, select_all};
 
 use crate::model::{MediaState, PlaybackState};
-use crate::{MediaBackend, MediaCaps, MediaClient, MediaError, MediaWatch};
+use crate::{MediaBackend, MediaCaps, MediaClient, MediaError, MediaSnapshot, MediaWatch};
 
 /// A child that does not answer a snapshot cannot hold the aggregate hostage.
 /// Child futures are polled concurrently, while results are consumed in child
@@ -49,34 +49,14 @@ impl Aggregate {
 impl MediaBackend for Aggregate {
     fn snapshot(&self) -> BoxFuture<'_, Result<Option<MediaState>, MediaError>> {
         Box::pin(async move {
-            // Gather independently under the same deadline. `join_all` retains
-            // child order even when completions arrive out of order.
-            let snapshots = join_all(self.children.iter().enumerate().map(|(i, c)| async move {
-                let result = tokio::time::timeout(SNAPSHOT_BUDGET, c.snapshot()).await;
-                (i, result)
-            }))
-            .await;
-            let mut cands: Vec<(usize, MediaState)> = Vec::new();
-            for (i, result) in snapshots {
-                if let Ok(Ok(Some(s))) = result {
-                    cands.push((i, s));
-                }
-            }
-            if cands.is_empty() {
-                *self.active.lock().unwrap() = None;
-                return Ok(None);
-            }
-            let sticky = self.sticky.lock().unwrap().clone();
-            let view: Vec<(&str, PlaybackState)> = cands
-                .iter()
-                .map(|(_, s)| (s.player.as_str(), s.state))
-                .collect();
-            let pick = choose_state(&view, &self.priority, sticky.as_deref()).unwrap_or(0);
-            let (child_idx, chosen) = cands.swap_remove(pick);
-            *self.active.lock().unwrap() = Some(child_idx);
-            *self.sticky.lock().unwrap() = Some(chosen.player.clone());
-            Ok(Some(chosen))
+            self.snapshot_with_caps_inner()
+                .await
+                .map(|snapshot| snapshot.map(|snapshot| snapshot.state))
         })
+    }
+
+    fn snapshot_with_caps(&self) -> BoxFuture<'_, Result<Option<MediaSnapshot>, MediaError>> {
+        Box::pin(async move { self.snapshot_with_caps_inner().await })
     }
 
     // Every control op delegates to the active child.
@@ -185,6 +165,53 @@ impl MediaBackend for Aggregate {
         idx.and_then(|i| self.children.get(i))
             .map(|c| c.caps())
             .unwrap_or(NO_CAPS)
+    }
+}
+
+impl Aggregate {
+    // Gather both state and caps from each child under one deadline. Keeping
+    // them together preserves per-snapshot capabilities through aggregation.
+    async fn snapshot_with_caps_inner(&self) -> Result<Option<MediaSnapshot>, MediaError> {
+        // Gather independently under the same deadline. `join_all` retains
+        // child order even when completions arrive out of order.
+        let snapshots = join_all(self.children.iter().enumerate().map(|(i, c)| async move {
+            let result = tokio::time::timeout(SNAPSHOT_BUDGET, c.snapshot_with_caps()).await;
+            (i, result)
+        }))
+        .await;
+        let mut cands: Vec<(usize, MediaSnapshot)> = Vec::new();
+        let mut failures: Vec<(usize, MediaError)> = Vec::new();
+        for (i, result) in snapshots {
+            match result {
+                Ok(Ok(Some(snapshot))) => cands.push((i, snapshot)),
+                Ok(Ok(None)) | Ok(Err(MediaError::NoPlayer)) => {}
+                Ok(Err(error)) => failures.push((i, error)),
+                Err(_) => {
+                    failures.push((i, MediaError::Unavailable("media source timed out".into())))
+                }
+            }
+        }
+        if cands.is_empty() {
+            if !failures.is_empty() {
+                let active = *self.active.lock().unwrap();
+                let chosen = active
+                    .and_then(|active| failures.iter().position(|(idx, _)| *idx == active))
+                    .unwrap_or(0);
+                return Err(failures.swap_remove(chosen).1);
+            }
+            *self.active.lock().unwrap() = None;
+            return Ok(None);
+        }
+        let sticky = self.sticky.lock().unwrap().clone();
+        let view: Vec<(&str, PlaybackState)> = cands
+            .iter()
+            .map(|(_, snapshot)| (snapshot.state.player.as_str(), snapshot.state.state))
+            .collect();
+        let pick = choose_state(&view, &self.priority, sticky.as_deref()).unwrap_or(0);
+        let (child_idx, chosen) = cands.swap_remove(pick);
+        *self.active.lock().unwrap() = Some(child_idx);
+        *self.sticky.lock().unwrap() = Some(chosen.state.player.clone());
+        Ok(Some(chosen))
     }
 }
 
@@ -438,6 +465,146 @@ mod tests {
 
         assert!(watches[0].is_none(), "a stalled watcher should time out");
         assert!(watches[1].is_some(), "a healthy watcher should be retained");
+    }
+
+    #[tokio::test]
+    async fn snapshot_error_is_not_reported_as_empty() {
+        let aggregate = Aggregate::new(
+            vec![
+                snapshot_backend(
+                    Err(MediaError::Backend("first failed".into())),
+                    NO_CAPS,
+                    None,
+                ),
+                snapshot_backend(
+                    Err(MediaError::Backend("active failed".into())),
+                    NO_CAPS,
+                    None,
+                ),
+                snapshot_backend(Ok(None), NO_CAPS, None),
+            ],
+            Vec::new(),
+        );
+        *aggregate.active.lock().unwrap() = Some(1);
+        *aggregate.sticky.lock().unwrap() = Some("sticky".into());
+
+        assert_eq!(
+            aggregate.snapshot().await,
+            Err(MediaError::Backend("active failed".into()))
+        );
+        assert_eq!(*aggregate.active.lock().unwrap(), Some(1));
+        assert_eq!(*aggregate.sticky.lock().unwrap(), Some("sticky".into()));
+    }
+
+    #[tokio::test]
+    async fn no_player_and_empty_children_are_healthy_empty_results() {
+        let aggregate = Aggregate::new(
+            vec![
+                snapshot_backend(Ok(None), NO_CAPS, None),
+                snapshot_backend(Err(MediaError::NoPlayer), NO_CAPS, None),
+            ],
+            Vec::new(),
+        );
+
+        assert_eq!(aggregate.snapshot().await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn snapshot_with_caps_preserves_the_chosen_child_caps() {
+        let state = MediaState {
+            player: "preferred".into(),
+            state: PLAYING,
+            ..MediaState::default()
+        };
+        let advertised = MediaCaps {
+            volume: true,
+            ..NO_CAPS
+        };
+        let aggregate = Aggregate::new(
+            vec![
+                snapshot_backend(
+                    Ok(Some(MediaState {
+                        player: "other".into(),
+                        state: PLAYING,
+                        ..MediaState::default()
+                    })),
+                    NO_CAPS,
+                    None,
+                ),
+                snapshot_backend(Ok(Some(state.clone())), NO_CAPS, Some(advertised)),
+            ],
+            vec!["preferred".into()],
+        );
+
+        let snapshot = aggregate.snapshot_with_caps().await.unwrap().unwrap();
+        assert_eq!(snapshot.state, state);
+        assert_eq!(snapshot.caps, advertised);
+    }
+
+    struct SnapshotBackend {
+        result: Result<Option<MediaState>, MediaError>,
+        caps: MediaCaps,
+        snapshot_caps: Option<MediaCaps>,
+    }
+
+    fn snapshot_backend(
+        result: Result<Option<MediaState>, MediaError>,
+        caps: MediaCaps,
+        snapshot_caps: Option<MediaCaps>,
+    ) -> MediaClient {
+        Box::new(SnapshotBackend {
+            result,
+            caps,
+            snapshot_caps,
+        })
+    }
+
+    impl MediaBackend for SnapshotBackend {
+        fn snapshot(&self) -> BoxFuture<'_, Result<Option<MediaState>, MediaError>> {
+            Box::pin(async move { self.result.clone() })
+        }
+
+        fn snapshot_with_caps(&self) -> BoxFuture<'_, Result<Option<MediaSnapshot>, MediaError>> {
+            Box::pin(async move {
+                self.result.clone().map(|state| {
+                    state.map(|state| MediaSnapshot {
+                        state,
+                        caps: self.snapshot_caps.unwrap_or(self.caps),
+                    })
+                })
+            })
+        }
+
+        fn play_pause(&self) -> BoxFuture<'_, Result<(), MediaError>> {
+            no_player()
+        }
+        fn next(&self) -> BoxFuture<'_, Result<(), MediaError>> {
+            no_player()
+        }
+        fn previous(&self) -> BoxFuture<'_, Result<(), MediaError>> {
+            no_player()
+        }
+        fn set_shuffle(&self, _on: bool) -> BoxFuture<'_, Result<(), MediaError>> {
+            no_player()
+        }
+        fn set_loop(&self, _mode: crate::model::LoopMode) -> BoxFuture<'_, Result<(), MediaError>> {
+            no_player()
+        }
+        fn volume_step(&self, _delta: f64) -> BoxFuture<'_, Result<(), MediaError>> {
+            no_player()
+        }
+        fn playlists(&self) -> BoxFuture<'_, Result<Vec<crate::model::Playlist>, MediaError>> {
+            no_player()
+        }
+        fn activate_playlist<'a>(&'a self, _id: &'a str) -> BoxFuture<'a, Result<(), MediaError>> {
+            no_player()
+        }
+        fn caps(&self) -> MediaCaps {
+            self.caps
+        }
+        fn players(&self) -> BoxFuture<'_, Vec<String>> {
+            Box::pin(async { Vec::new() })
+        }
     }
 
     struct TestWatch;
