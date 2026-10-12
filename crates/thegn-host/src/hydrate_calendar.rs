@@ -52,8 +52,17 @@ pub(crate) fn spawn_month_fetch(
     to: NaiveDate,
     tx: tokio_mpsc::UnboundedSender<RefreshKind>,
     waker: TerminalWaker,
-) {
-    crate::sched::spawn_bg(move || {
+) -> crate::sched::Admission {
+    let worker_tx = tx.clone();
+    let worker_waker = waker.clone();
+    let admission = crate::sched::spawn_bg(move || {
+        let mut completion = MonthFetchCompletion {
+            tx: worker_tx.clone(),
+            waker: worker_waker.clone(),
+            year,
+            month,
+            sent: false,
+        };
         let (wide_from, wide_to) = widen(from, to);
         let home = home_zone(&cfg);
         let db = Db::open().ok(); // best-effort: cache: the popup falls back to the provider fetch when the DB is out
@@ -73,11 +82,13 @@ pub(crate) fn spawn_month_fetch(
             match horizon(&cfg, today) {
                 Ok((h_from, h_to)) => {
                     sync_accounts(db, &cfg, h_from, h_to, false, &mut |m| {
-                        toast(&tx, &waker, m, None)
+                        toast(&worker_tx, &worker_waker, m, None)
                     });
                 }
                 // No provider call and no cache write: the cache stays as it was.
-                Err(problem) => refuse_horizon(&problem, &mut |m| toast(&tx, &waker, m, None)),
+                Err(problem) => {
+                    refuse_horizon(&problem, &mut |m| toast(&worker_tx, &worker_waker, m, None))
+                }
             }
         }
 
@@ -87,8 +98,45 @@ pub(crate) fn spawn_month_fetch(
             Some(db) => expand_month(db, wide_from, wide_to, home),
             None => MonthView::failed(CalendarViewError::CacheUnavailable),
         };
-        deliver(&tx, &waker, year, month, month_view, None);
+        deliver(&worker_tx, &worker_waker, year, month, month_view, None);
+        completion.sent = true;
     });
+    if admission != crate::sched::Admission::Admitted {
+        deliver(
+            &tx,
+            &waker,
+            year,
+            month,
+            MonthView::failed(CalendarViewError::CacheUnavailable),
+            None,
+        );
+    }
+    admission
+}
+
+/// Ensures the calendar popup receives a terminal result if the month worker
+/// panics before its normal delivery.
+struct MonthFetchCompletion {
+    tx: tokio_mpsc::UnboundedSender<RefreshKind>,
+    waker: TerminalWaker,
+    year: i32,
+    month: u32,
+    sent: bool,
+}
+
+impl Drop for MonthFetchCompletion {
+    fn drop(&mut self) {
+        if !self.sent {
+            deliver(
+                &self.tx,
+                &self.waker,
+                self.year,
+                self.month,
+                MonthView::failed(CalendarViewError::CacheUnavailable),
+                None,
+            );
+        }
+    }
 }
 
 /// One month's expansion outcome, before it becomes a payload.
@@ -151,7 +199,7 @@ pub(crate) fn spawn_periodic_sync_with_generation(
     waker: TerminalWaker,
     generation: Option<crate::hydrate_schedule::ScheduleFence>,
 ) {
-    crate::sched::spawn_bg(move || {
+    crate::sched::spawn_bg_replaceable(move || {
         let Ok(db) = Db::open() else { return };
         let today = chrono::Utc::now()
             .with_timezone(&home_zone(&cfg))
@@ -751,7 +799,7 @@ pub(crate) fn spawn_reminder_check_with_generation(
         cursor.abandon(window); // lane full: the next ticker slot retries
         return;
     };
-    crate::sched::spawn_bg_reserved(permit, move || {
+    let admission = crate::sched::spawn_bg_reserved(permit, move || {
         // Acknowledge even if evaluation panics, or the window would stay in
         // flight for the life of the process.
         let mut ack = ReminderAck {
@@ -790,6 +838,10 @@ pub(crate) fn spawn_reminder_check_with_generation(
         };
         ack.outcome = outcome;
     });
+    crate::sched::report_reserved(admission);
+    if admission != crate::sched::Admission::Admitted {
+        cursor.abandon(window);
+    }
 }
 
 /// Sends the worker's acknowledgment on drop, so every exit path reports.

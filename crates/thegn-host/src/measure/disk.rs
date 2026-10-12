@@ -44,11 +44,8 @@ pub(crate) fn spawn_scan(
     active: Option<std::path::PathBuf>,
     waker: Option<TerminalWaker>,
 ) {
-    tokio::task::spawn_blocking(move || {
+    crate::sched::spawn_bg_replaceable(move || {
         let Some(_round) = super::begin(&INFLIGHT, "disk") else {
-            return;
-        };
-        let Some(_permit) = super::permit("disk") else {
             return;
         };
         let Ok(db) = Db::open() else {
