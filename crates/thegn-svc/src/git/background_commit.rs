@@ -72,7 +72,7 @@ pub enum BackgroundCommitFailure {
         operation: &'static str,
         error: String,
     },
-    SigningFailure {
+    Exited {
         command: String,
         detail: String,
         truncated: bool,
@@ -88,22 +88,6 @@ impl std::fmt::Display for BackgroundCommitFailure {
             ),
             Self::OutputTruncated {
                 command,
-                stream: "stdout",
-                limit,
-            } => write!(
-                f,
-                "git {command} stdout exceeded its {limit} byte capture limit"
-            ),
-            Self::OutputTruncated {
-                command,
-                stream: "stderr",
-                limit,
-            } => write!(
-                f,
-                "git {command} stderr exceeded its {limit} byte capture limit"
-            ),
-            Self::OutputTruncated {
-                command,
                 stream,
                 limit,
             } => write!(
@@ -114,13 +98,15 @@ impl std::fmt::Display for BackgroundCommitFailure {
                 write!(f, "git mutation lock `{lock_path}` is unavailable: {error}")
             }
             Self::StdinWriterPanicked => f.write_str("background git stdin writer panicked"),
-            Self::StdinWrite { .. } => f.write_str("write background git commit message"),
+            Self::StdinWrite { error } => {
+                write!(f, "write background git commit message: {error}")
+            }
             Self::CaptureCleanup { stream, detail } => {
                 write!(f, "background git {stream} reader {detail}")
             }
-            Self::Spawn { command, .. } => write!(f, "git {command}"),
-            Self::Wait { operation, .. } => f.write_str(operation),
-            Self::SigningFailure {
+            Self::Spawn { command, error } => write!(f, "git {command}: {error}"),
+            Self::Wait { operation, error } => write!(f, "{operation}: {error}"),
+            Self::Exited {
                 command,
                 detail,
                 truncated,
@@ -332,7 +318,7 @@ pub(crate) fn run_with_timeout(
             (error, output) => format!("{error}\n{output}"),
         };
         let truncated = stdout_truncated || stderr_truncated;
-        return Err(BackgroundCommitFailure::SigningFailure {
+        return Err(BackgroundCommitFailure::Exited {
             command: args.join(" "),
             detail,
             truncated,
@@ -501,6 +487,36 @@ mod unix_tests {
         git_in(dir, &["config", "user.name", "t"]);
         git_in(dir, &["config", "user.email", "t@e"]);
         git_in(dir, &["config", "commit.gpgsign", "false"]);
+    }
+
+    #[test]
+    fn io_failures_include_the_underlying_cause_in_display() {
+        let failures = [
+            (
+                BackgroundCommitFailure::Spawn {
+                    command: "commit-tree".to_string(),
+                    error: "No such file or directory (os error 2)".to_string(),
+                },
+                "git commit-tree: No such file or directory (os error 2)",
+            ),
+            (
+                BackgroundCommitFailure::Wait {
+                    operation: "wait for background git commit",
+                    error: "wait failed".to_string(),
+                },
+                "wait for background git commit: wait failed",
+            ),
+            (
+                BackgroundCommitFailure::StdinWrite {
+                    error: "Broken pipe (os error 32)".to_string(),
+                },
+                "write background git commit message: Broken pipe (os error 32)",
+            ),
+        ];
+
+        for (failure, expected) in failures {
+            assert_eq!(failure.to_string(), expected);
+        }
     }
 
     #[test]
@@ -804,7 +820,7 @@ mod unix_tests {
         assert!(
             matches!(
                 error.downcast_ref::<BackgroundCommitFailure>(),
-                Some(BackgroundCommitFailure::SigningFailure {
+                Some(BackgroundCommitFailure::Exited {
                     truncated: true,
                     ..
                 })
