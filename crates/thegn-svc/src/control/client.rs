@@ -20,7 +20,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc as tokio_mpsc;
 
 use thegn_core::control_wire::{
-    EventDecoder, EventFrame, FeedFilter, MAX_WIRE_FRAME, PROTO_VERSION,
+    EventDecoder, EventFrame, FeedFilter, Hello, MAX_WIRE_FRAME, PROTO_VERSION,
 };
 use thegn_core::store::{ControlStore, DaemonRow};
 
@@ -1421,11 +1421,27 @@ where
             hello.proto,
         ));
     }
-    // Publish the receiver and start draining before forwarding the validated
-    // greeting. This ordering cannot deadlock on a prefilled bootstrap queue.
-    tokio::spawn(pump_attach_inner(ws, frames.clone(), ctrl));
-    let _ = frames.send(EventFrame::Hello(hello)).await;
+    // Queue the greeting before starting the data pump: Hello is the first
+    // client-visible attach frame, even if the daemon has already sent a
+    // snapshot while we were validating its greeting.
+    queue_hello_before_pump(&frames, hello, || {
+        tokio::spawn(pump_attach_inner(ws, frames.clone(), ctrl));
+    })
+    .await;
     Ok(())
+}
+
+/// Put the validated greeting into the stream before allowing the socket pump
+/// to publish frames. Kept separate so the single-slot ordering invariant can
+/// be tested deterministically without relying on scheduler timing.
+async fn queue_hello_before_pump(
+    frames: &tokio_mpsc::Sender<EventFrame>,
+    hello: Hello,
+    start_pump: impl FnOnce(),
+) {
+    if frames.send(EventFrame::Hello(hello)).await.is_ok() {
+        start_pump();
+    }
 }
 
 async fn pump_attach_inner<S>(
@@ -1442,7 +1458,7 @@ async fn pump_attach_inner<S>(
                 Some(Ok(Message::Binary(bytes))) => {
                     match EventDecoder::decode_message(&bytes) {
                         Ok(frame) => {
-                            if frames.send(frame).await.is_err() {
+                            if !send_frame_while_servicing_control(&frames, frame, &mut ws, &mut ctrl).await {
                                 return; // consumer gone
                             }
                         }
@@ -1459,23 +1475,61 @@ async fn pump_attach_inner<S>(
                     return;
                 }
             },
-            c = ctrl.recv() => match c {
-                Some(AttachControl::Input(bytes)) => {
-                    if ws.send(Message::Binary(bytes.into())).await.is_err() {
-                        return;
-                    }
-                }
-                Some(AttachControl::Resize { rows, cols }) => {
-                    let text = json!({ "type": "resize", "rows": rows, "cols": cols });
-                    if ws.send(Message::Text(text.to_string().into())).await.is_err() {
-                        return;
-                    }
-                }
-                Some(AttachControl::Close) | None => {
-                    let _ = ws.send(Message::Close(None)).await; // best-effort: peer may be gone
+            c = ctrl.recv() => {
+                if !send_attach_control(&mut ws, c).await {
                     return;
                 }
+            }
+        }
+    }
+}
+
+/// Deliver an already-decoded frame without blocking the pump's ability to
+/// service local control. `reserve` leaves ownership of the frame here while
+/// Close (and other controls) remain selectable under downstream backpressure.
+async fn send_frame_while_servicing_control<S>(
+    frames: &tokio_mpsc::Sender<EventFrame>,
+    frame: EventFrame,
+    ws: &mut Ws<S>,
+    ctrl: &mut tokio_mpsc::Receiver<AttachControl>,
+) -> bool
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    loop {
+        tokio::select! {
+            permit = frames.reserve() => match permit {
+                Ok(permit) => {
+                    permit.send(frame);
+                    return true;
+                }
+                Err(_) => return false,
             },
+            control = ctrl.recv() => {
+                if !send_attach_control(ws, control).await {
+                    return false;
+                }
+            }
+        }
+    }
+}
+
+async fn send_attach_control<S>(ws: &mut Ws<S>, control: Option<AttachControl>) -> bool
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    use tokio_tungstenite::tungstenite::Message;
+    match control {
+        Some(AttachControl::Input(bytes)) => ws.send(Message::Binary(bytes.into())).await.is_ok(),
+        Some(AttachControl::Resize { rows, cols }) => {
+            let text = json!({ "type": "resize", "rows": rows, "cols": cols });
+            ws.send(Message::Text(text.to_string().into()))
+                .await
+                .is_ok()
+        }
+        Some(AttachControl::Close) | None => {
+            let _ = ws.send(Message::Close(None)).await; // best-effort: peer may be gone
+            false
         }
     }
 }
@@ -1695,6 +1749,70 @@ where
 mod tests {
     use super::*;
     use thegn_core::db::Db;
+
+    #[tokio::test]
+    async fn attach_greeting_occupies_single_slot_before_publisher_starts() {
+        let (frames, mut receiver) = tokio_mpsc::channel(1);
+        let hello = Hello {
+            proto: PROTO_VERSION,
+            server: "test daemon".into(),
+            scopes: vec![],
+        };
+        let publisher_tx = frames.clone();
+        let mut publisher_observed_full = false;
+
+        queue_hello_before_pump(&frames, hello, || {
+            let snapshot = EventFrame::PaneSnapshot {
+                session: "session-1".into(),
+                seq: 0,
+                cols: 80,
+                rows: 24,
+                bytes: Vec::new(),
+            };
+            publisher_observed_full = matches!(
+                publisher_tx.try_send(snapshot),
+                Err(tokio_mpsc::error::TrySendError::Full(_))
+            );
+        })
+        .await;
+
+        assert!(publisher_observed_full, "publisher must start behind Hello");
+        assert!(matches!(receiver.recv().await, Some(EventFrame::Hello(_))));
+    }
+
+    #[tokio::test]
+    async fn attach_close_is_sent_while_downstream_frame_queue_is_full() {
+        use tokio_tungstenite::tungstenite::Message;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            matches!(ws.next().await, Some(Ok(Message::Close(_))))
+        });
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
+            .await
+            .unwrap();
+        let (frames, _receiver) = tokio_mpsc::channel(1);
+        frames.send(EventFrame::Sessions).await.unwrap();
+        let (ctrl_tx, mut ctrl_rx) = tokio_mpsc::channel(1);
+        ctrl_tx.send(AttachControl::Close).await.unwrap();
+
+        let delivered = send_frame_while_servicing_control(
+            &frames,
+            EventFrame::Sessions,
+            &mut ws,
+            &mut ctrl_rx,
+        )
+        .await;
+
+        assert!(
+            !delivered,
+            "Close ends the pump without waiting for capacity"
+        );
+        assert!(server.await.unwrap(), "the peer must receive Close");
+    }
 
     #[test]
     fn issue_repo_context_is_encoded_as_a_distinct_query_parameter() {

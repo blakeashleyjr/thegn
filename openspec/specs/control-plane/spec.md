@@ -59,6 +59,21 @@ When an initial reattach fails because the session is gone (expired, reaped, or 
 - **WHEN** a client reattaches to a session whose agent has been running while detached
 - **THEN** the client first renders the daemon's current emulator snapshot and then applies subsequent live deltas
 
+### Requirement: Attach streams begin with a protocol greeting
+
+A WebSocket attach stream SHALL expose a `Hello` frame as its first
+client-visible frame. The client MUST validate its protocol version before
+accepting pane frames, and the attach pump MUST NOT publish a snapshot or delta
+ahead of the greeting. After `Hello`, a warm attach SHALL provide its initial
+`PaneSnapshot` before live `PaneDelta` frames.
+
+#### Scenario: Greeting precedes an immediately available snapshot
+
+- **WHEN** the daemon has already produced a warm snapshot by the time the
+  client finishes validating `Hello`
+- **THEN** the client-visible stream still yields `Hello` first, followed by
+  the snapshot
+
 #### Scenario: Streaming output is a pane-only frame
 
 - **WHEN** a pane delta arrives from the daemon with no chrome/geometry change
