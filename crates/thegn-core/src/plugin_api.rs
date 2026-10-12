@@ -657,6 +657,18 @@ pub enum AuditDecision {
     Denied,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuditTargetClass {
+    Surface,
+    State,
+    Notify,
+    Network,
+    Run,
+    Io,
+    Host,
+    Unknown,
+}
+
 pub const MAX_AUDIT_ENTRIES: usize = 1024;
 pub const MAX_AUDIT_STRING_BYTES: usize = 256;
 
@@ -668,6 +680,9 @@ pub struct AuditLogEntry {
     pub decision: AuditDecision,
     pub timestamp_ms: u64,
     pub seq: u64,
+    pub generation: u64,
+    pub target_class: AuditTargetClass,
+    pub target: Option<String>,
 }
 
 fn bound_audit_string(value: &str) -> String {
@@ -763,6 +778,7 @@ pub struct PluginRuntime {
     audit: Vec<AuditLogEntry>,
     next_audit_seq: u64,
     audit_evicted: u64,
+    generation: u64,
     state: BTreeMap<String, serde_json::Value>,
     host_values: BTreeMap<String, serde_json::Value>,
     subscriptions: std::collections::HashSet<(PluginId, EventKind)>,
@@ -788,6 +804,7 @@ impl PluginRuntime {
             audit: Vec::new(),
             next_audit_seq: 0,
             audit_evicted: 0,
+            generation: 0,
             state: Default::default(),
             host_values: Default::default(),
             subscriptions: Default::default(),
@@ -920,10 +937,16 @@ impl PluginRuntime {
         operation: &str,
     ) -> Result<(), PluginApiError> {
         if self.manifest.granted.contains(&capability) {
-            self.push_audit(plugin, capability, operation, AuditDecision::Granted);
+            self.push_audit(plugin, capability, operation, AuditDecision::Granted, None);
             Ok(())
         } else {
-            self.push_audit(plugin, capability.clone(), operation, AuditDecision::Denied);
+            self.push_audit(
+                plugin,
+                capability.clone(),
+                operation,
+                AuditDecision::Denied,
+                None,
+            );
             Err(PluginApiError::CapabilityDenied {
                 capability,
                 operation: operation.to_string(),
@@ -976,12 +999,22 @@ impl PluginRuntime {
         self.audit_evicted
     }
 
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub fn begin_generation(&mut self) -> u64 {
+        self.generation = self.generation.saturating_add(1);
+        self.generation
+    }
+
     fn push_audit(
         &mut self,
         plugin: PluginId,
         capability: Capability,
         operation: &str,
         decision: AuditDecision,
+        target: Option<&str>,
     ) {
         if self.audit.len() == MAX_AUDIT_ENTRIES {
             let evict_count = (MAX_AUDIT_ENTRIES / 4).max(1);
@@ -995,11 +1028,23 @@ impl PluginRuntime {
             .expect("plugin audit sequence exhausted");
         self.audit.push(AuditLogEntry {
             plugin,
+            target_class: match capability.kind() {
+                "surface" => AuditTargetClass::Surface,
+                "state" => AuditTargetClass::State,
+                "notify" => AuditTargetClass::Notify,
+                "network" => AuditTargetClass::Network,
+                "run" => AuditTargetClass::Run,
+                "host" => AuditTargetClass::Host,
+                "" => AuditTargetClass::Unknown,
+                _ => AuditTargetClass::Io,
+            },
             capability: Capability(bound_audit_string(capability.as_str())),
             operation: bound_audit_string(operation),
             decision,
             timestamp_ms: u64::try_from(crate::util::now_ms()).unwrap_or(0),
             seq: self.next_audit_seq,
+            generation: self.generation,
+            target: target.map(bound_audit_string),
         });
     }
 
@@ -1013,12 +1058,14 @@ impl PluginRuntime {
         plugin: PluginId,
         capability_id: &str,
         decision: AuditDecision,
+        target: Option<&str>,
     ) {
         self.push_audit(
             plugin,
             Capability::new("host", capability_id),
             "host.call",
             decision,
+            target,
         );
     }
 }
@@ -2629,8 +2676,18 @@ timeout_secs = 5
                 .is_err()
         );
 
-        runtime.record_host_call_decision(plugin.clone(), "sessions.list", AuditDecision::Granted);
-        runtime.record_host_call_decision(plugin.clone(), "sessions.kill", AuditDecision::Denied);
+        runtime.record_host_call_decision(
+            plugin.clone(),
+            "sessions.list",
+            AuditDecision::Granted,
+            None,
+        );
+        runtime.record_host_call_decision(
+            plugin.clone(),
+            "sessions.kill",
+            AuditDecision::Denied,
+            None,
+        );
 
         let audit = runtime.audit_log();
         assert!(audit.iter().any(|entry| {
@@ -2661,7 +2718,7 @@ timeout_secs = 5
         runtime
             .state_set(plugin.clone(), "key", serde_json::Value::Null)
             .unwrap();
-        runtime.record_host_call_decision(plugin, "sessions.list", AuditDecision::Granted);
+        runtime.record_host_call_decision(plugin, "sessions.list", AuditDecision::Granted, None);
         let after = crate::util::now_ms();
 
         let audit = runtime.audit_log();
@@ -2674,6 +2731,100 @@ timeout_secs = 5
     }
 
     #[test]
+    fn audit_records_target_classes_from_real_runtime_operations() {
+        let plugin = PluginId::new("target-class-test");
+        let mut runtime = PluginRuntime::new(NegotiatedManifest::default());
+        assert!(
+            runtime
+                .update(plugin.clone(), SurfaceId::new("surface"), View::line([]),)
+                .is_err()
+        );
+        assert!(
+            runtime
+                .state_set(plugin.clone(), "key", serde_json::Value::Null)
+                .is_err()
+        );
+        assert!(
+            runtime
+                .notify(plugin.clone(), Alert::new("", "message"))
+                .is_err()
+        );
+        for req in [
+            IoRequest::network("GET", "https://example.com"),
+            IoRequest::run("git", ["status"]),
+            IoRequest {
+                scheme: "file".into(),
+                target: "/tmp/example".into(),
+                payload: serde_json::Value::Null,
+            },
+        ] {
+            assert!(runtime.io(plugin.clone(), req).is_err());
+        }
+        runtime.record_host_call_decision(plugin, "sessions.list", AuditDecision::Granted, None);
+
+        let classes: Vec<_> = runtime
+            .audit_log()
+            .iter()
+            .map(|entry| entry.target_class)
+            .collect();
+        assert_eq!(
+            classes,
+            vec![
+                AuditTargetClass::Surface,
+                AuditTargetClass::State,
+                AuditTargetClass::Unknown,
+                AuditTargetClass::Network,
+                AuditTargetClass::Run,
+                AuditTargetClass::Io,
+                AuditTargetClass::Host,
+            ]
+        );
+        assert!(
+            runtime
+                .audit_log()
+                .iter()
+                .all(|entry| entry.target.is_none())
+        );
+    }
+
+    #[test]
+    fn audit_entries_capture_runtime_generation_and_bound_host_targets() {
+        let mut runtime = PluginRuntime::new(NegotiatedManifest::default());
+        let plugin = PluginId::new("generation-test");
+        runtime.record_host_call_decision(
+            plugin.clone(),
+            "merge.add",
+            AuditDecision::Granted,
+            Some("wt-a"),
+        );
+        assert_eq!(runtime.begin_generation(), 1);
+        runtime.record_host_call_decision(plugin, "sessions.list", AuditDecision::Granted, None);
+
+        let audit = runtime.audit_log();
+        assert_eq!(runtime.generation(), 1);
+        assert_eq!(audit[0].generation, 0);
+        assert_eq!(audit[0].target.as_deref(), Some("wt-a"));
+        assert_eq!(audit[1].generation, 1);
+        assert_eq!(audit[1].target, None);
+
+        let mut capped = PluginRuntime::new(NegotiatedManifest::default());
+        let long_target = "w".repeat(10_240);
+        capped.record_host_call_decision(
+            PluginId::new("bounded-target"),
+            "merge.add",
+            AuditDecision::Denied,
+            Some(&long_target),
+        );
+        let target = capped.audit_log()[0].target.as_ref().unwrap();
+        assert!(target.len() <= MAX_AUDIT_STRING_BYTES);
+        assert!(target.ends_with('…'));
+
+        capped.generation = u64::MAX;
+        assert_eq!(capped.begin_generation(), u64::MAX);
+        assert_eq!(capped.generation(), u64::MAX);
+    }
+
+    #[test]
     fn audit_retention_evicts_oldest_entries_in_batches_and_counts_them() {
         let mut runtime = PluginRuntime::new(NegotiatedManifest::default());
         let total = MAX_AUDIT_ENTRIES + 10;
@@ -2682,6 +2833,7 @@ timeout_secs = 5
                 PluginId::new("retention-test"),
                 "sessions.list",
                 AuditDecision::Granted,
+                None,
             );
         }
 
@@ -2700,6 +2852,7 @@ timeout_secs = 5
             PluginId::new("bounded-test"),
             &long_capability_id,
             AuditDecision::Denied,
+            None,
         );
         let request = IoRequest {
             scheme: "x".repeat(10_000),
