@@ -1,5 +1,7 @@
 //! Loop-owned state for the docked Media section.
 
+use std::collections::HashSet;
+use thegn_core::media::{MAX_QUEUE_ITEMS, MAX_SOURCES};
 use thegn_core::media::{MediaCaps, MediaState, QueueItem};
 
 use crate::media_art::ArtMosaic;
@@ -33,7 +35,9 @@ pub(crate) struct MediaSourcesDelivery {
 #[derive(Debug, Default)]
 pub(crate) struct MediaPanelState {
     pub(crate) sources: Vec<String>,
+    pub(crate) sources_truncated: bool,
     pub(crate) queue: Vec<QueueItem>,
+    pub(crate) queue_truncated: usize,
     pub(crate) queue_error: Option<String>,
     pub(crate) art: Option<ArtMosaic>,
     caps: Option<MediaCaps>,
@@ -77,6 +81,7 @@ impl MediaPanelState {
         }
         let Some(state) = state else {
             self.sources.clear();
+            self.sources_truncated = false;
             self.clear_queue();
             self.caps = None;
             if self.snapshot_identity.is_some() {
@@ -176,12 +181,15 @@ impl MediaPanelState {
         {
             self.queue_identity = Some(Self::identity(state));
             match queue {
-                Ok(queue) => {
+                Ok(mut queue) => {
+                    self.queue_truncated = queue.len().saturating_sub(MAX_QUEUE_ITEMS);
+                    queue.truncate(MAX_QUEUE_ITEMS);
                     self.queue = queue;
                     self.queue_error = None;
                 }
                 Err(error) => {
                     self.queue.clear();
+                    self.queue_truncated = 0;
                     self.queue_error = Some(error);
                 }
             }
@@ -190,6 +198,7 @@ impl MediaPanelState {
 
     fn clear_queue(&mut self) {
         self.queue.clear();
+        self.queue_truncated = 0;
         self.queue_error = None;
     }
 
@@ -205,10 +214,16 @@ impl MediaPanelState {
         {
             return;
         }
-        let mut unique = Vec::with_capacity(sources.len());
-        for source in sources {
-            if !source.is_empty() && !unique.contains(&source) {
-                unique.push(source);
+        let mut unique = Vec::with_capacity(sources.len().min(MAX_SOURCES));
+        let mut seen = HashSet::with_capacity(sources.len().min(MAX_SOURCES));
+        self.sources_truncated = false;
+        for source in &sources {
+            if !source.is_empty() && seen.insert(source.as_str()) {
+                if unique.len() == MAX_SOURCES {
+                    self.sources_truncated = true;
+                    break;
+                }
+                unique.push(source.clone());
             }
         }
         self.sources = unique;
@@ -362,6 +377,44 @@ mod tests {
         assert_eq!(panel.sources, ["one", "two"]);
         panel.set_sources(current, Some(&returned), vec!["new".into(), "new".into()]);
         assert_eq!(panel.sources, ["new"]);
+    }
+
+    #[test]
+    fn source_delivery_caps_unique_rows_in_first_seen_order() {
+        let mut panel = MediaPanelState::default();
+        let current = state();
+        panel.sync_snapshot(Some(&current), Some(MediaCaps::default()), 0);
+        let request = panel.take_sources_request(Some(&current)).unwrap();
+        let sources = (0..MAX_SOURCES + 10)
+            .map(|index| format!("source-{index}"))
+            .collect();
+        panel.set_sources(request, Some(&current), sources);
+
+        assert_eq!(panel.sources.len(), MAX_SOURCES);
+        assert!(panel.sources_truncated);
+        assert_eq!(panel.sources.first().map(String::as_str), Some("source-0"));
+        assert_eq!(
+            panel.sources[MAX_SOURCES - 1],
+            format!("source-{}", MAX_SOURCES - 1)
+        );
+    }
+
+    #[test]
+    fn queue_delivery_caps_rows_and_records_dropped_count() {
+        let mut panel = MediaPanelState::default();
+        let current = state();
+        panel.begin_request(Some(&current));
+        let request = panel.take_queue_request(Some(&current)).unwrap();
+        let queue = (0..MAX_QUEUE_ITEMS * 2)
+            .map(|index| QueueItem {
+                id: index.to_string(),
+                ..Default::default()
+            })
+            .collect();
+        panel.set_queue(request, Some(&current), Ok(queue));
+
+        assert_eq!(panel.queue.len(), MAX_QUEUE_ITEMS);
+        assert_eq!(panel.queue_truncated, MAX_QUEUE_ITEMS);
     }
 
     #[test]
