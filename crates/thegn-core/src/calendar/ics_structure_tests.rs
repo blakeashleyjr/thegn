@@ -185,10 +185,10 @@ fn duplicate_singleton_property_is_reported() {
 #[test]
 fn singleton_property_set_is_recognized() {
     let input = "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:x\nSUMMARY:s\nDESCRIPTION:d\nLOCATION:l\nURL:https://example.test\nSTATUS:CONFIRMED\nDTSTART;VALUE=DATE:20261012\nDTEND;VALUE=DATE:20261013\nORGANIZER:mailto:a@example.test\nLAST-MODIFIED:20261012T000000Z\nDTSTAMP:20261012T000000Z\nEND:VEVENT\nBEGIN:VEVENT\nUID:y\nDTSTART;VALUE=DATE:20261013\nDURATION:P1D\nEND:VEVENT\nEND:VCALENDAR";
-    let (events, report) = parse_report(&input);
+    let (events, report) = parse_report(input);
     assert!(report.diagnostics().is_empty());
     assert_eq!(events.len(), 2);
-    assert_legacy_matches(&input, &events);
+    assert_legacy_matches(input, &events);
 }
 
 #[test]
