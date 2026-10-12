@@ -295,27 +295,28 @@ pub fn synth_dir_script(packages: &[String]) -> String {
         "{prelude}[ -r \"$HOME/.nix-profile/etc/profile.d/nix.sh\" ] && . \"$HOME/.nix-profile/etc/profile.d/nix.sh\" 2>/dev/null || true; \
          [ -r /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh ] && . /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh 2>/dev/null || true; \
          export PATH=\"$HOME/.nix-profile/bin:/nix/var/nix/profiles/default/bin:$PATH\"; \
+         fail() {{ echo "$1"; echo "$1" >&2; exit 1; }}; \
          d=\"{dir}\"; digest=\"{digest}\"; \
-         [ ! -L \"$HOME/.thegn\" ] && [ ! -L \"$HOME/.thegn/synth\" ] && [ ! -L \"$d\" ] || {{ echo 'thegn-synth: symlinked cache path' >&2; exit 1; }}; \
-         mkdir -p \"$d\" || {{ echo 'thegn-synth: mkdir failed' >&2; exit 1; }}; \
-         [ ! -L \"$HOME/.thegn\" ] && [ ! -L \"$HOME/.thegn/synth\" ] && [ ! -L \"$d\" ] || {{ echo 'thegn-synth: cache path changed' >&2; exit 1; }}; \
+         [ ! -L \"$HOME/.thegn\" ] && [ ! -L \"$HOME/.thegn/synth\" ] && [ ! -L \"$d\" ] || fail 'thegn-synth: symlinked cache path'; \
+         mkdir -p \"$d\" || fail 'thegn-synth: mkdir failed'; \
+         [ ! -L \"$HOME/.thegn\" ] && [ ! -L \"$HOME/.thegn/synth\" ] && [ ! -L \"$d\" ] || fail 'thegn-synth: cache path changed'; \
          manifest=\"$d/thegn-synth.digest\"; \
          if [ -e \"$manifest\" ] || [ -L \"$manifest\" ]; then \
-           [ ! -L \"$manifest\" ] && [ -f \"$manifest\" ] && [ \"$(cat \"$manifest\")\" = \"$digest\" ] || {{ echo 'thegn-synth: manifest mismatch' >&2; exit 1; }}; \
+           [ ! -L \"$manifest\" ] && [ -f \"$manifest\" ] && [ \"$(cat \"$manifest\")\" = \"$digest\" ] || fail 'thegn-synth: manifest mismatch'; \
          fi; \
-         tmp=$(mktemp \"$d/.flake.nix.XXXXXX\") || {{ echo 'thegn-synth: staging failed' >&2; exit 1; }}; \
-         cat > \"$tmp\" <<'THEGN_SYNTH_FLAKE' || {{ echo 'thegn-synth: flake write failed' >&2; exit 1; }}\n{flake}THEGN_SYNTH_FLAKE\n\
+         tmp=$(mktemp \"$d/.flake.nix.XXXXXX\") || fail 'thegn-synth: staging failed'; \
+         cat > \"$tmp\" <<'THEGN_SYNTH_FLAKE' || fail 'thegn-synth: flake write failed'\n{flake}THEGN_SYNTH_FLAKE\n\
          if [ -f \"$d/flake.nix\" ] && cmp -s \"$tmp\" \"$d/flake.nix\"; then \
-           rm -f \"$tmp\" || {{ echo 'thegn-synth: staging cleanup failed' >&2; exit 1; }}; \
+           rm -f \"$tmp\" || fail 'thegn-synth: staging cleanup failed'; \
          else \
-           mv \"$tmp\" \"$d/flake.nix\" || {{ echo 'thegn-synth: flake publish failed' >&2; exit 1; }}; \
-           rm -f \"$d/flake.lock\" || {{ echo 'thegn-synth: stale lock removal failed' >&2; exit 1; }}; \
+           mv \"$tmp\" \"$d/flake.nix\" || fail 'thegn-synth: flake publish failed'; \
+           rm -f \"$d/flake.lock\" || fail 'thegn-synth: stale lock removal failed'; \
          fi; \
-         [ -f \"$d/flake.lock\" ] || nix flake lock \"$d\" 2>/dev/null || {{ echo 'thegn-synth: lock failed' >&2; exit 1; }}; \
-         manifest_tmp=$(mktemp \"$d/.thegn-synth.digest.XXXXXX\") || {{ echo 'thegn-synth: manifest staging failed' >&2; exit 1; }}; \
-         printf '%s' \"$digest\" > \"$manifest_tmp\" || {{ echo 'thegn-synth: manifest write failed' >&2; exit 1; }}; \
-         mv \"$manifest_tmp\" \"$manifest\" || {{ echo 'thegn-synth: manifest publish failed' >&2; exit 1; }}; \
-         nix develop \"path:$d\" --command true 2>/dev/null || {{ echo 'thegn-synth: warm failed' >&2; exit 1; }}",
+         [ -f \"$d/flake.lock\" ] || nix flake lock \"$d\" 2>/dev/null || fail 'thegn-synth: lock failed'; \
+         manifest_tmp=$(mktemp \"$d/.thegn-synth.digest.XXXXXX\") || fail 'thegn-synth: manifest staging failed'; \
+         printf '%s' \"$digest\" > \"$manifest_tmp\" || fail 'thegn-synth: manifest write failed'; \
+         mv \"$manifest_tmp\" \"$manifest\" || fail 'thegn-synth: manifest publish failed'; \
+         nix develop \"path:$d\" --command true 2>/dev/null || fail 'thegn-synth: warm failed'",
         digest = digest,
         prelude = crate::envplan::nix_runtime_prelude(),
     )
@@ -640,6 +641,7 @@ mod tests {
         assert!(s.contains("nix develop \"path:$d\" --command true"), "{s}");
         assert!(s.contains("mktemp \"$d/.flake.nix.XXXXXX\""), "{s}");
         assert!(s.contains("thegn-synth.digest"), "{s}");
+        assert!(s.contains("echo \"$1\"; echo \"$1\" >&2"), "{s}");
         assert!(s.contains("[ ! -L \"$HOME/.thegn\" ]"), "{s}");
         assert!(s.contains("[ ! -L \"$HOME/.thegn/synth\" ]"), "{s}");
         assert!(s.contains("[ ! -L \"$d\" ]"), "{s}");
@@ -649,6 +651,12 @@ mod tests {
         );
         assert!(
             s.contains("thegn-synth: lock failed") && s.contains("exit 1"),
+            "{s}"
+        );
+        assert!(s.contains("thegn-synth: manifest mismatch"), "{s}");
+        assert!(
+            s.find("nix flake lock").unwrap()
+                < s.find("mv \"$manifest_tmp\" \"$manifest\"").unwrap(),
             "{s}"
         );
         assert!(
