@@ -18,6 +18,7 @@ pub const MIN_PLUGIN_TIMEOUT_SECS: u64 = 1;
 pub const MAX_PLUGIN_TIMEOUT_SECS: u64 = 3600;
 pub const MIN_PLUGIN_INTERVAL_MILLIS: u64 = 100;
 pub const MAX_PLUGIN_INTERVAL_MILLIS: u64 = 86_400_000;
+/// Maximum discovered plugin directories that contain a `plugin.toml`.
 pub const MAX_PLUGIN_DIRS: usize = 256;
 pub const MAX_MANIFEST_BYTES: usize = 64 * 1024;
 pub const MIN_PLUGIN_ROUTING_ID_BYTES: usize = 1;
@@ -91,14 +92,7 @@ pub fn discover(cfg: &Config, config_dir: &Path) -> (Vec<LoadedPlugin>, Vec<Spec
         .collect();
     let plugins_dir = config_dir.join("plugins");
     let mut problems = Vec::new();
-    match std::fs::symlink_metadata(&plugins_dir) {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            problems.push(discovery_problem(
-                &plugins_dir,
-                "plugins directory must not be a symlink".into(),
-            ));
-            return (out, problems);
-        }
+    match std::fs::metadata(&plugins_dir) {
         Ok(metadata) if !metadata.is_dir() => {
             problems.push(discovery_problem(
                 &plugins_dir,
@@ -134,16 +128,6 @@ pub fn discover(cfg: &Config, config_dir: &Path) -> (Vec<LoadedPlugin>, Vec<Spec
                     )),
                     Ok(file_type) if file_type.is_dir() => {
                         dirs.push(path);
-                        if dirs.len() > MAX_PLUGIN_DIRS {
-                            problems.push(discovery_problem(
-                                &plugins_dir,
-                                format!("plugin directory count exceeds {MAX_PLUGIN_DIRS}"),
-                            ));
-                            problems.sort_by(|left, right| {
-                                (&left.plugin, &left.problem).cmp(&(&right.plugin, &right.problem))
-                            });
-                            return (out, problems);
-                        }
                     }
                     Ok(_) => {} // Files such as README are not plugin directories.
                     Err(error) => problems.push(discovery_problem(&path, error.to_string())),
@@ -153,29 +137,44 @@ pub fn discover(cfg: &Config, config_dir: &Path) -> (Vec<LoadedPlugin>, Vec<Spec
         }
     }
     dirs.sort();
+    let mut plugin_dir_count = 0;
     for dir in dirs {
         let manifest_path = dir.join("plugin.toml");
-        match std::fs::symlink_metadata(&manifest_path) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
+        let metadata = match std::fs::symlink_metadata(&manifest_path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                problems.push(discovery_problem(&dir, error.to_string()));
+                continue;
+            }
+        };
+        plugin_dir_count += 1;
+        if plugin_dir_count > MAX_PLUGIN_DIRS {
+            problems.push(discovery_problem(
+                &plugins_dir,
+                format!("plugin directory count exceeds {MAX_PLUGIN_DIRS}"),
+            ));
+            problems.sort_by(|left, right| {
+                (&left.plugin, &left.problem).cmp(&(&right.plugin, &right.problem))
+            });
+            return (out, problems);
+        }
+        match metadata {
+            metadata if metadata.file_type().is_symlink() => {
                 problems.push(discovery_problem(
                     &dir,
                     "plugin.toml must not be a symlink".into(),
                 ));
                 continue;
             }
-            Ok(metadata) if !metadata.is_file() => {
+            metadata if !metadata.is_file() => {
                 problems.push(discovery_problem(
                     &dir,
                     "plugin.toml must be a regular file".into(),
                 ));
                 continue;
             }
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => {
-                problems.push(discovery_problem(&dir, error.to_string()));
-                continue;
-            }
+            _ => {}
         }
         let parsed = std::fs::File::open(&manifest_path)
             .map_err(|error| error.to_string())
@@ -223,9 +222,9 @@ fn discovery_problem(path: &Path, problem: String) -> SpecProblem {
 
 fn valid_routing_id(id: &str) -> bool {
     (MIN_PLUGIN_ROUTING_ID_BYTES..=MAX_PLUGIN_ROUTING_ID_BYTES).contains(&id.len())
-        && id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+        && !id
+            .chars()
+            .any(|character| character.is_control() || character == ':')
 }
 
 /// Negotiate one spec against the host contract.
@@ -640,12 +639,27 @@ mod tests {
         let plugins_dir = tmp.path().join("plugins");
         std::fs::create_dir_all(&plugins_dir).unwrap();
         for index in 0..=MAX_PLUGIN_DIRS {
-            std::fs::create_dir(plugins_dir.join(format!("plugin-{index}"))).unwrap();
+            let plugin_dir = plugins_dir.join(format!("plugin-{index}"));
+            std::fs::create_dir(&plugin_dir).unwrap();
+            std::fs::write(plugin_dir.join("plugin.toml"), "").unwrap();
         }
         let (loaded, problems) = discover(&Config::default(), tmp.path());
         assert!(loaded.is_empty());
         assert_eq!(problems.len(), 1);
         assert!(problems[0].problem.contains("directory count exceeds"));
+    }
+
+    #[test]
+    fn plugin_directory_count_ignores_directories_without_manifests() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plugins_dir = tmp.path().join("plugins");
+        std::fs::create_dir_all(&plugins_dir).unwrap();
+        for index in 0..=MAX_PLUGIN_DIRS {
+            std::fs::create_dir(plugins_dir.join(format!("empty-{index}"))).unwrap();
+        }
+        let (loaded, problems) = discover(&Config::default(), tmp.path());
+        assert!(loaded.is_empty());
+        assert!(problems.is_empty());
     }
 
     #[test]
@@ -661,7 +675,7 @@ mod tests {
             chord: None,
         };
         let long_id = "x".repeat(MAX_PLUGIN_ROUTING_ID_BYTES + 1);
-        for id in ["", "a:b", "a\u{7}", "é", long_id.as_str()] {
+        for id in ["", "a:b", "a\u{7}", long_id.as_str()] {
             let mut plugin = spec("routing", vec!["true".into()]);
             plugin
                 .manifest
@@ -679,7 +693,7 @@ mod tests {
             );
         }
         let long_surface = "x".repeat(MAX_PLUGIN_ROUTING_ID_BYTES + 1);
-        for surface in ["", "a:b", "a\u{7}", "é", long_surface.as_str()] {
+        for surface in ["", "a:b", "a\u{7}", long_surface.as_str()] {
             let mut plugin = spec("routing", vec!["true".into()]);
             plugin
                 .manifest
@@ -704,7 +718,7 @@ mod tests {
         plugin
             .manifest
             .contributions
-            .push(make_contribution("seg", "seg"));
+            .push(make_contribution("é", "n/alerts"));
         assert!(
             check_spec(&LoadedPlugin {
                 spec: plugin,
