@@ -704,6 +704,7 @@ pub async fn main(
     // the ticker still receives its clone at its spawn site below.
     let (refresh_tx, refresh_rx) = tokio_mpsc::unbounded_channel::<RefreshKind>();
     crate::daemon::agent_error_cache::install_refresh(refresh_tx.clone(), waker.clone());
+    crate::db_task::install_drop_notice(refresh_tx.clone(), waker.clone());
     crate::mise_provider::install_refresh(refresh_tx.clone(), waker.clone());
     // Defensive self-heal: strip any stray `core.worktree` that leaked into a
     // main checkout's shared `.git/config` (which silently retargets every git
@@ -1201,6 +1202,9 @@ pub async fn main(
     // Renderers run in their own process group, so nothing would signal them
     // when we exit: kill and reap the preview tree before the process goes.
     crate::preview_jobs::shutdown_global(std::time::Duration::from_millis(200));
+    if !crate::workspace_create::shutdown_clones(std::time::Duration::from_secs(1)) {
+        tracing::error!(target: "thegn::workspace", "workspace clone supervisor did not settle during shutdown");
+    }
     for (plugin, outcome) in &resident_report.outcomes {
         tracing::debug!(target: "thegn::plugin", plugin = %plugin, ?outcome, "resident lifecycle receipt; descendant containment remains unproven");
     }
@@ -2350,7 +2354,7 @@ pub(crate) fn switch_workspace(
     // pane ids are the remapped (live) ones — the old inline persist inside
     // `switch_to_workspace` recorded the pre-remap ids.
     let snap = session.layout_snapshot(&session.id, now_secs());
-    crate::db_task::persist(move |db| {
+    crate::db_task::persist_critical(move |db| {
         let _ = crate::session::Session::write_layout(db, &snap); // best-effort: cache write: the DB is a cache; the layout rows are resurrection state
         // Record the workspace we just entered as the global "last active" so
         // the next cold start reopens it.
@@ -6185,11 +6189,11 @@ pub(crate) fn persist_session_layout(session: &mut crate::session::Session, pane
     // populated session and the single biggest cost of a workspace switch.
     // Capture the rows as plain data and enqueue the transaction on the
     // db_task writer instead (FIFO, so interleaved persists land in order).
-    // Durability is unchanged for every clean exit: main.rs flushes the queue
-    // before the process ends; only a SIGKILL can drop a write, and the DB is
-    // a cache — git is the source of truth.
+    // Required resurrection state is accepted beyond the best-effort queue
+    // cap and remains retained across database-open failures. main.rs performs
+    // a bounded shutdown flush and reports if any required write is still pending.
     let snap = session.layout_snapshot(&session.id, now_secs());
-    crate::db_task::persist(move |db| {
+    crate::db_task::persist_critical(move |db| {
         let _ = crate::session::Session::write_layout(db, &snap); // best-effort: cache write: the DB is a cache; the layout rows are resurrection state
     });
 }
@@ -6199,7 +6203,7 @@ pub(crate) fn persist_session_layout(session: &mut crate::session::Session, pane
 /// cached pane hints are sufficient for this best-effort cache write.
 pub(crate) fn persist_session_layout_cached(session: &crate::session::Session) {
     let snap = session.layout_snapshot(&session.id, now_secs());
-    crate::db_task::persist(move |db| {
+    crate::db_task::persist_critical(move |db| {
         let _ = crate::session::Session::write_layout(db, &snap);
     });
 }
@@ -11575,6 +11579,8 @@ async fn event_loop<T: Terminal>(
                         &mut pending_issue_link,
                         generation,
                         &payload.path,
+                        refresh_tx.clone(),
+                        waker.clone(),
                     );
                     refresh_tab_model(&mut model, &session, &mut sb);
                     need_relayout = true;
@@ -19604,13 +19610,12 @@ async fn event_loop<T: Terminal>(
                                                     cfg: keymap.config(),
                                                     live_cfg: &current_config,
                                                     waker: &waker,
+                                                    refresh_tx: &refresh_tx,
                                                     create_gen: &mut create_gen,
                                                     create_tx: &create_tx,
                                                     inflight: &mut inflight,
                                                     wizard_ui: &mut wizard_ui,
                                                     pending_issue_link: &mut pending_issue_link,
-                                                    model_tx: &model_tx,
-                                                    hydration_gen: &mut hydration_gen,
                                                 },
                                             );
                                         }
@@ -20584,13 +20589,12 @@ async fn event_loop<T: Terminal>(
                                     cfg: keymap.config(),
                                     live_cfg: &current_config,
                                     waker: &waker,
+                                    refresh_tx: &refresh_tx,
                                     create_gen: &mut create_gen,
                                     create_tx: &create_tx,
                                     inflight: &mut inflight,
                                     wizard_ui: &mut wizard_ui,
                                     pending_issue_link: &mut pending_issue_link,
-                                    model_tx: &model_tx,
-                                    hydration_gen: &mut hydration_gen,
                                 },
                             );
                             true
@@ -20606,13 +20610,12 @@ async fn event_loop<T: Terminal>(
                                     cfg: keymap.config(),
                                     live_cfg: &current_config,
                                     waker: &waker,
+                                    refresh_tx: &refresh_tx,
                                     create_gen: &mut create_gen,
                                     create_tx: &create_tx,
                                     inflight: &mut inflight,
                                     wizard_ui: &mut wizard_ui,
                                     pending_issue_link: &mut pending_issue_link,
-                                    model_tx: &model_tx,
-                                    hydration_gen: &mut hydration_gen,
                                 },
                             )
                         }
