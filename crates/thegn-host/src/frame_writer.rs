@@ -59,7 +59,7 @@ pub(crate) enum WriterStatus {
 
 enum Msg {
     /// A composed frame (wire bytes + trailing graphics/bell).
-    Frame(Vec<u8>, Option<FrameStamp>),
+    Frame(Vec<u8>, Option<FrameStamp>, u64),
     /// Order-preserving passthrough (kitty deletes, muse marker…).
     Oob(Vec<u8>),
     Clipboard(Vec<u8>),
@@ -67,6 +67,9 @@ enum Msg {
 
 struct Q {
     msgs: VecDeque<Msg>,
+    /// Failed OOB/clipboard writes remain charged until replay or abandonment.
+    deferred: VecDeque<DeferredWrite>,
+    frame_submitted: bool,
     /// How many `Msg::Frame`s are queued (the 2-deep bound).
     frames_queued: usize,
     clipboard_queued: usize,
@@ -82,6 +85,11 @@ struct Q {
     submitted_seq: u64,
     completed_seq: u64,
     metrics: WriterMetrics,
+}
+
+struct DeferredWrite {
+    msg: Msg,
+    defer_after: u64,
 }
 
 struct Inner {
@@ -141,6 +149,8 @@ impl FrameWriter {
         let inner = Arc::new(Inner {
             q: Mutex::new(Q {
                 msgs: VecDeque::new(),
+                deferred: VecDeque::new(),
+                frame_submitted: false,
                 frames_queued: 0,
                 clipboard_queued: 0,
                 clipboard_bytes: 0,
@@ -208,8 +218,9 @@ impl FrameWriter {
         }
         q.submitted_seq = q.submitted_seq.saturating_add(1);
         let target = q.submitted_seq;
+        q.frame_submitted = true;
         q.frames_queued += 1;
-        q.msgs.push_back(Msg::Frame(bytes, stamp));
+        q.msgs.push_back(Msg::Frame(bytes, stamp, target));
         drop(q);
         self.inner.cv.notify_one();
         if self.sync {
@@ -270,9 +281,10 @@ impl FrameWriter {
         Ok(())
     }
 
-    /// Only validated pane clipboard sets enter this bounded queue. One
-    /// in-flight write plus four queued sets bound writer-owned clipboard data;
-    /// refused ownership stays with the pane for latest-wins retry.
+    /// Only validated pane clipboard sets enter this bounded queue. Four
+    /// admitted sets, including in-flight and deferred writes, bound
+    /// writer-owned clipboard data; refused ownership stays with the pane for
+    /// latest-wins retry.
     pub(crate) fn try_submit_clipboard(
         &self,
         bytes: Vec<u8>,
@@ -435,24 +447,63 @@ fn abandon_queued_messages(q: &mut Q) {
         Msg::Oob(bytes) => total.saturating_add(bytes.len()),
         Msg::Frame(..) | Msg::Clipboard(_) => total,
     });
+    let deferred_oob_count = q
+        .deferred
+        .iter()
+        .filter(|deferred| matches!(&deferred.msg, Msg::Oob(_)))
+        .count();
+    let deferred_oob_bytes =
+        q.deferred
+            .iter()
+            .fold(0usize, |total, deferred| match &deferred.msg {
+                Msg::Oob(bytes) => total.saturating_add(bytes.len()),
+                Msg::Frame(..) | Msg::Clipboard(_) => total,
+            });
     q.msgs.clear();
+    q.deferred.clear();
     q.frames_queued = 0;
-    q.clipboard_queued = 0;
-    q.clipboard_bytes = 0;
     // Keep accounting for an in-flight write; write_message releases it when
     // that write returns. Everything still in msgs has been abandoned.
-    q.oob_in_flight = q.oob_in_flight.saturating_sub(queued_oob_count);
-    q.oob_bytes = q.oob_bytes.saturating_sub(queued_oob_bytes);
+    q.oob_in_flight = q
+        .oob_in_flight
+        .saturating_sub(queued_oob_count + deferred_oob_count);
+    q.oob_bytes = q
+        .oob_bytes
+        .saturating_sub(queued_oob_bytes.saturating_add(deferred_oob_bytes));
+    q.clipboard_queued = 0;
+    q.clipboard_bytes = 0;
+}
+
+fn abandon_deferred_writes(q: &mut Q) {
+    let (oob_count, oob_bytes, clipboard_count, clipboard_bytes) = q.deferred.iter().fold(
+        (0usize, 0usize, 0usize, 0usize),
+        |(oob_count, oob_bytes, clipboard_count, clipboard_bytes), deferred| match &deferred.msg {
+            Msg::Oob(bytes) => (
+                oob_count + 1,
+                oob_bytes.saturating_add(bytes.len()),
+                clipboard_count,
+                clipboard_bytes,
+            ),
+            Msg::Clipboard(bytes) => (
+                oob_count,
+                oob_bytes,
+                clipboard_count + 1,
+                clipboard_bytes.saturating_add(bytes.len()),
+            ),
+            Msg::Frame(..) => (oob_count, oob_bytes, clipboard_count, clipboard_bytes),
+        },
+    );
+    q.deferred.clear();
+    q.oob_in_flight = q.oob_in_flight.saturating_sub(oob_count);
+    q.oob_bytes = q.oob_bytes.saturating_sub(oob_bytes);
+    q.clipboard_queued = q.clipboard_queued.saturating_sub(clipboard_count);
+    q.clipboard_bytes = q.clipboard_bytes.saturating_sub(clipboard_bytes);
 }
 
 fn pop_message(q: &mut Q) -> Option<Msg> {
     let message = q.msgs.pop_front()?;
     if matches!(message, Msg::Frame(..)) {
         q.frames_queued = q.frames_queued.saturating_sub(1);
-    }
-    if let Msg::Clipboard(bytes) = &message {
-        q.clipboard_queued -= 1;
-        q.clipboard_bytes -= bytes.len();
     }
     Some(message)
 }
@@ -476,15 +527,16 @@ fn writer_main(
             }
         };
         let Some(msg) = msg else { break };
-        if inner.clipboard_retry.swap(false, Ordering::SeqCst) {
+        let (errored, released_oob, released_clipboard) = write_message(inner, msg, &mut sink);
+        if released_clipboard && inner.clipboard_retry.swap(false, Ordering::SeqCst) {
             wake("clipboard capacity released");
         }
-        let (errored, released_oob) = write_message(inner, msg, &mut sink);
         if errored || oob_capacity_wake_requested(inner, released_oob) {
             wake("writer state changed");
         }
     }
     let mut q = inner.q.lock().unwrap_or_else(|e| e.into_inner());
+    abandon_deferred_writes(&mut q);
     q.worker_done = true;
     inner.cv.notify_all();
     inner.done_cv.notify_all();
@@ -506,9 +558,9 @@ fn write_message(
     inner: &Inner,
     msg: Msg,
     mut write: impl FnMut(&[u8]) -> std::io::Result<()>,
-) -> (bool, bool) {
+) -> (bool, bool, bool) {
     let bytes = match &msg {
-        Msg::Frame(b, _) | Msg::Oob(b) | Msg::Clipboard(b) => b,
+        Msg::Frame(b, ..) | Msg::Oob(b) | Msg::Clipboard(b) => b,
     };
     // After a Fatal, drop writes (the loop is tearing down); keep draining
     // so shutdown never deadlocks.
@@ -516,7 +568,7 @@ fn write_message(
         let mut q = inner.q.lock().unwrap_or_else(|e| e.into_inner());
         let fatal = matches!(q.status, WriterStatus::Fatal(_));
         let released = if fatal {
-            release_oob_capacity(&mut q, &msg);
+            release_message_capacity(&mut q, &msg);
             matches!(&msg, Msg::Oob(_))
         } else {
             false
@@ -528,10 +580,10 @@ fn write_message(
         q.completed_seq = q.completed_seq.saturating_add(1);
         drop(q);
         inner.done_cv.notify_all();
-        return (false, fatal.1);
+        return (false, fatal.1, matches!(&msg, Msg::Clipboard(_)));
     }
     let stamp = match &msg {
-        Msg::Frame(_, stamp) => *stamp,
+        Msg::Frame(_, stamp, _) => *stamp,
         Msg::Oob(_) | Msg::Clipboard(_) => None,
     };
     let started = stamp.map(|_| Instant::now());
@@ -543,12 +595,11 @@ fn write_message(
     let result = if reset_pending {
         match write(PARSER_RESET) {
             Ok(()) => {
-                inner
-                    .q
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .parser_reset_pending = false;
-                write(bytes)
+                let mut q = inner.q.lock().unwrap_or_else(|e| e.into_inner());
+                q.parser_reset_pending = false;
+                let fatal = matches!(q.status, WriterStatus::Fatal(_));
+                drop(q);
+                if fatal { Ok(()) } else { write(bytes) }
             }
             Err(error) => Err(error),
         }
@@ -557,24 +608,106 @@ fn write_message(
     };
     let finished = started.map(|_| Instant::now());
     let errored = result.is_err();
-    let released_oob = matches!(&msg, Msg::Oob(_));
+    let mut released_oob = false;
+    let mut released_clipboard = false;
+    let mut replay = VecDeque::new();
+    let successful_frame_seq = match &msg {
+        Msg::Frame(_, _, seq) if result.is_ok() => Some(*seq),
+        _ => None,
+    };
     {
         let mut q = inner.q.lock().unwrap_or_else(|e| e.into_inner());
-        release_oob_capacity(&mut q, &msg);
+        if result.is_err() && q.frame_submitted && matches!(&msg, Msg::Oob(_) | Msg::Clipboard(_)) {
+            let defer_after = q.submitted_seq;
+            q.deferred.push_back(DeferredWrite { msg, defer_after });
+        } else {
+            released_oob = matches!(&msg, Msg::Oob(_));
+            released_clipboard = matches!(&msg, Msg::Clipboard(_));
+            release_message_capacity(&mut q, &msg);
+        }
         if let (Some(stamp), Some(started), Some(finished)) = (stamp, started, finished) {
             q.metrics.record(stamp, started, finished, !errored);
         }
-        apply_write_result(&mut q, result);
+        let deferred_ready = successful_frame_seq.is_some_and(|frame_seq| {
+            q.deferred
+                .front()
+                .is_some_and(|deferred| deferred.defer_after < frame_seq)
+        });
+        // Keep replay failures consecutive across their successful resync
+        // frames, so repeated delivery failure still reaches Fatal.
+        if !(result.is_ok() && deferred_ready) {
+            apply_write_result(&mut q, result);
+        }
+        if matches!(q.status, WriterStatus::Fatal(_)) {
+            abandon_queued_messages(&mut q);
+        }
+        if let Some(frame_seq) = successful_frame_seq {
+            while q
+                .deferred
+                .front()
+                .is_some_and(|deferred| deferred.defer_after < frame_seq)
+            {
+                if let Some(deferred) = q.deferred.pop_front() {
+                    replay.push_back(deferred.msg);
+                }
+            }
+        }
         q.completed_seq = q.completed_seq.saturating_add(1);
     }
     inner.done_cv.notify_all();
-    (errored, released_oob)
+    let mut replay_errored = false;
+    while let Some(replay_msg) = replay.pop_front() {
+        let replay_bytes = match &replay_msg {
+            Msg::Oob(bytes) | Msg::Clipboard(bytes) => bytes,
+            Msg::Frame(..) => unreachable!("only OOB and clipboard messages are deferred"),
+        };
+        let replay_result = write(replay_bytes);
+        let replay_failed = replay_result.is_err();
+        let mut q = inner.q.lock().unwrap_or_else(|e| e.into_inner());
+        if replay_failed {
+            let defer_after = q.submitted_seq;
+            let mut retry = VecDeque::new();
+            retry.push_back(replay_msg);
+            retry.append(&mut replay);
+            while let Some(remaining) = retry.pop_back() {
+                q.deferred.push_front(DeferredWrite {
+                    msg: remaining,
+                    defer_after,
+                });
+            }
+            replay_errored = true;
+        } else {
+            released_oob |= matches!(&replay_msg, Msg::Oob(_));
+            released_clipboard |= matches!(&replay_msg, Msg::Clipboard(_));
+            release_message_capacity(&mut q, &replay_msg);
+        }
+        apply_write_result(&mut q, replay_result);
+        if matches!(q.status, WriterStatus::Fatal(_)) {
+            abandon_queued_messages(&mut q);
+        }
+        drop(q);
+        if replay_failed {
+            break;
+        }
+    }
+    if released_oob || replay_errored {
+        inner.done_cv.notify_all();
+    }
+    (errored || replay_errored, released_oob, released_clipboard)
 }
 
 fn release_oob_capacity(q: &mut Q, msg: &Msg) {
     if let Msg::Oob(bytes) = msg {
         q.oob_in_flight = q.oob_in_flight.saturating_sub(1);
         q.oob_bytes = q.oob_bytes.saturating_sub(bytes.len());
+    }
+}
+
+fn release_message_capacity(q: &mut Q, msg: &Msg) {
+    release_oob_capacity(q, msg);
+    if let Msg::Clipboard(bytes) = msg {
+        q.clipboard_queued = q.clipboard_queued.saturating_sub(1);
+        q.clipboard_bytes = q.clipboard_bytes.saturating_sub(bytes.len());
     }
 }
 
@@ -622,6 +755,8 @@ mod tests {
     fn q() -> Q {
         Q {
             msgs: VecDeque::new(),
+            deferred: VecDeque::new(),
+            frame_submitted: false,
             frames_queued: 0,
             clipboard_queued: 0,
             clipboard_bytes: 0,
@@ -763,7 +898,7 @@ mod tests {
     }
 
     #[test]
-    fn clipboard_admission_is_bounded_fifo_and_capacity_is_returned_on_pop() {
+    fn clipboard_admission_is_bounded_fifo_and_capacity_is_returned_after_write() {
         let writer = test_writer();
         writer.submit_oob(vec![0]);
         for byte in 1..=4 {
@@ -780,9 +915,13 @@ mod tests {
         for byte in 1..=4 {
             assert!(matches!(pop_message(&mut q), Some(Msg::Clipboard(ref b)) if b == &[byte]));
         }
-        assert_eq!(q.clipboard_queued, 0);
-        assert_eq!(q.clipboard_bytes, 0);
+        assert_eq!(q.clipboard_queued, 4);
+        assert_eq!(q.clipboard_bytes, 4);
         drop(q);
+        assert!(writer.try_submit_clipboard(vec![5], || panic!()).is_err());
+        for byte in 1..=4 {
+            assert!(!write_message(&writer.inner, Msg::Clipboard(vec![byte]), |_| Ok(())).0);
+        }
         assert!(writer.try_submit_clipboard(vec![5], || panic!()).is_ok());
         assert!(writer.inner.clipboard_retry.load(Ordering::SeqCst));
         assert!(
@@ -828,16 +967,21 @@ mod tests {
             input_at: Some(Instant::now()),
         };
         assert!(
-            !write_message(&writer.inner, Msg::Frame(vec![1], Some(stamp)), |bytes| {
-                assert_eq!(bytes, [1]);
-                // A blocked sink must not hold the UI's queue/metrics mutex.
-                assert_eq!(writer.take_metrics().unwrap().completion_us.count(), 0);
-                Ok(())
-            })
+            !write_message(
+                &writer.inner,
+                Msg::Frame(vec![1], Some(stamp), 1),
+                |bytes| {
+                    assert_eq!(bytes, [1]);
+                    // A blocked sink must not hold the UI's queue/metrics mutex.
+                    assert_eq!(writer.take_metrics().unwrap().completion_us.count(), 0);
+                    Ok(())
+                }
+            )
             .0
         );
         assert_eq!(writer.take_metrics().unwrap().completion_us.count(), 1);
-        let (errored, released_oob) = write_message(&writer.inner, Msg::Oob(vec![2]), |_| Ok(()));
+        let (errored, released_oob, _) =
+            write_message(&writer.inner, Msg::Oob(vec![2]), |_| Ok(()));
         assert!(!errored);
         assert!(released_oob, "completed OOB write must release capacity");
         assert!(
@@ -857,7 +1001,7 @@ mod tests {
             input_at: None,
         };
         assert!(
-            write_message(&writer.inner, Msg::Frame(vec![], Some(stamp)), |_| {
+            write_message(&writer.inner, Msg::Frame(vec![], Some(stamp), 1), |_| {
                 Err(std::io::ErrorKind::Interrupted.into())
             })
             .0
@@ -878,14 +1022,14 @@ mod tests {
         assert!(writer.inner.q.lock().unwrap().parser_reset_pending);
 
         let mut calls = Vec::new();
-        let (errored, _) = write_message(&writer.inner, Msg::Frame(vec![7], None), |bytes| {
+        let (errored, _, _) = write_message(&writer.inner, Msg::Frame(vec![7], None, 1), |bytes| {
             calls.push(bytes.to_vec());
             Ok(())
         });
         assert!(!errored);
         assert_eq!(calls, vec![PARSER_RESET.to_vec(), vec![7]]);
         assert!(!writer.inner.q.lock().unwrap().parser_reset_pending);
-        let (errored, _) = write_message(&writer.inner, Msg::Frame(vec![8], None), |bytes| {
+        let (errored, _, _) = write_message(&writer.inner, Msg::Frame(vec![8], None, 2), |bytes| {
             calls.push(bytes.to_vec());
             Ok(())
         });
@@ -897,7 +1041,7 @@ mod tests {
     fn initial_success_does_not_emit_parser_reset() {
         let writer = test_writer();
         let mut calls = Vec::new();
-        let (errored, _) = write_message(&writer.inner, Msg::Frame(vec![8], None), |bytes| {
+        let (errored, _, _) = write_message(&writer.inner, Msg::Frame(vec![8], None, 1), |bytes| {
             calls.push(bytes.to_vec());
             Ok(())
         });
@@ -913,13 +1057,270 @@ mod tests {
             Err(std::io::ErrorKind::Interrupted.into()),
         );
         let mut calls = Vec::new();
-        let (errored, _) = write_message(&writer.inner, Msg::Frame(vec![9], None), |bytes| {
+        let (errored, _, _) = write_message(&writer.inner, Msg::Frame(vec![9], None, 1), |bytes| {
             calls.push(bytes.to_vec());
             Err(std::io::ErrorKind::Interrupted.into())
         });
         assert!(errored);
         assert_eq!(calls, vec![PARSER_RESET.to_vec()]);
         assert!(writer.inner.q.lock().unwrap().parser_reset_pending);
+    }
+
+    #[test]
+    fn failed_oob_is_replayed_after_the_first_later_successful_frame() {
+        let writer = test_writer();
+        assert!(writer.try_submit_oob(vec![b'A']).is_ok());
+        let failed = pop_message(&mut writer.inner.q.lock().unwrap()).unwrap();
+        let mut calls = Vec::new();
+        let (errored, released, _) = write_message(&writer.inner, failed, |bytes| {
+            calls.push(bytes.to_vec());
+            Err(std::io::ErrorKind::Interrupted.into())
+        });
+        assert!(errored);
+        assert!(!released);
+        {
+            let q = writer.inner.q.lock().unwrap();
+            assert_eq!(q.oob_in_flight, 1);
+            assert_eq!(q.oob_bytes, 1);
+            assert_eq!(q.deferred.len(), 1);
+        }
+        assert!(writer.submit_frame(vec![b'F'], None));
+        let frame = pop_message(&mut writer.inner.q.lock().unwrap()).unwrap();
+        let (errored, _, _) = write_message(&writer.inner, frame, |bytes| {
+            calls.push(bytes.to_vec());
+            Ok(())
+        });
+        assert!(!errored);
+        assert_eq!(
+            calls,
+            vec![vec![b'A'], PARSER_RESET.to_vec(), vec![b'F'], vec![b'A']]
+        );
+        let q = writer.inner.q.lock().unwrap();
+        assert_eq!(q.oob_in_flight, 0);
+        assert_eq!(q.oob_bytes, 0);
+        assert_eq!(q.completed_seq, 2, "replay is not a submitted completion");
+        assert!(q.deferred.is_empty());
+    }
+
+    #[test]
+    fn deferred_oob_waits_past_pre_failure_frames_and_later_oob() {
+        let writer = test_writer();
+        assert!(writer.submit_frame(vec![b'P'], None));
+        assert!(writer.try_submit_oob(vec![b'A']).is_ok());
+        let mut q = writer.inner.q.lock().unwrap();
+        let prior_frame = pop_message(&mut q).unwrap();
+        let failed_oob = pop_message(&mut q).unwrap();
+        drop(q);
+
+        assert!(
+            write_message(&writer.inner, failed_oob, |_| {
+                Err(std::io::ErrorKind::Interrupted.into())
+            })
+            .0
+        );
+        let mut calls = Vec::new();
+        assert!(
+            !write_message(&writer.inner, prior_frame, |bytes| {
+                calls.push(bytes.to_vec());
+                Ok(())
+            })
+            .0
+        );
+        assert!(writer.try_submit_oob(vec![b'B']).is_ok());
+        let later_oob = pop_message(&mut writer.inner.q.lock().unwrap()).unwrap();
+        assert!(
+            !write_message(&writer.inner, later_oob, |bytes| {
+                calls.push(bytes.to_vec());
+                Ok(())
+            })
+            .0
+        );
+        assert_eq!(calls, vec![PARSER_RESET.to_vec(), vec![b'P'], vec![b'B']]);
+        assert_eq!(writer.inner.q.lock().unwrap().deferred.len(), 1);
+
+        assert!(writer.submit_frame(vec![b'F'], None));
+        let frame = pop_message(&mut writer.inner.q.lock().unwrap()).unwrap();
+        assert!(
+            !write_message(&writer.inner, frame, |bytes| {
+                calls.push(bytes.to_vec());
+                Ok(())
+            })
+            .0
+        );
+        assert_eq!(calls.last(), Some(&vec![b'A']));
+    }
+
+    #[test]
+    fn failed_clipboard_write_keeps_its_admission_until_frame_replay() {
+        let writer = test_writer();
+        writer
+            .try_submit_clipboard(vec![b'C'], || panic!())
+            .unwrap();
+        let clipboard = pop_message(&mut writer.inner.q.lock().unwrap()).unwrap();
+        assert!(
+            write_message(&writer.inner, clipboard, |_| {
+                Err(std::io::ErrorKind::Interrupted.into())
+            })
+            .0
+        );
+        {
+            let q = writer.inner.q.lock().unwrap();
+            assert_eq!(q.clipboard_queued, 1);
+            assert_eq!(q.clipboard_bytes, 1);
+        }
+        assert!(writer.submit_frame(vec![b'F'], None));
+        let frame = pop_message(&mut writer.inner.q.lock().unwrap()).unwrap();
+        let mut calls = Vec::new();
+        assert!(
+            !write_message(&writer.inner, frame, |bytes| {
+                calls.push(bytes.to_vec());
+                Ok(())
+            })
+            .0
+        );
+        assert_eq!(calls, vec![PARSER_RESET.to_vec(), vec![b'F'], vec![b'C']]);
+        let q = writer.inner.q.lock().unwrap();
+        assert_eq!(q.clipboard_queued, 0);
+        assert_eq!(q.clipboard_bytes, 0);
+    }
+
+    #[test]
+    fn repeated_deferred_replay_failure_becomes_fatal_and_abandon_releases_capacity() {
+        let writer = test_writer();
+        writer.inner.q.lock().unwrap().frame_submitted = true;
+        assert!(writer.try_submit_oob(vec![b'A']).is_ok());
+        let oob = pop_message(&mut writer.inner.q.lock().unwrap()).unwrap();
+        assert!(
+            write_message(&writer.inner, oob, |_| {
+                Err(std::io::ErrorKind::Interrupted.into())
+            })
+            .0
+        );
+        writer
+            .try_submit_clipboard(vec![b'C'], || panic!())
+            .unwrap();
+        let clipboard = pop_message(&mut writer.inner.q.lock().unwrap()).unwrap();
+        assert!(
+            write_message(&writer.inner, clipboard, |_| {
+                Err(std::io::ErrorKind::Interrupted.into())
+            })
+            .0
+        );
+
+        for _ in 0..=crate::frame_write::RETRY_MAX {
+            assert!(writer.submit_frame(vec![b'F'], None));
+            let frame = pop_message(&mut writer.inner.q.lock().unwrap()).unwrap();
+            let (errored, _, _) = write_message(&writer.inner, frame, |bytes| {
+                if bytes == [b'A'] || bytes == [b'C'] {
+                    Err(std::io::ErrorKind::Interrupted.into())
+                } else {
+                    Ok(())
+                }
+            });
+            assert!(errored);
+            if matches!(writer.take_status(), WriterStatus::Fatal(_)) {
+                break;
+            }
+        }
+        assert!(matches!(writer.take_status(), WriterStatus::Fatal(_)));
+        let mut q = writer.inner.q.lock().unwrap();
+        abandon_queued_messages(&mut q);
+        assert!(q.deferred.is_empty());
+        assert_eq!(q.oob_in_flight, 0);
+        assert_eq!(q.oob_bytes, 0);
+        assert_eq!(q.clipboard_queued, 0);
+        assert_eq!(q.clipboard_bytes, 0);
+    }
+
+    #[test]
+    fn termwiz_parity_drops_failed_oob_without_a_worker_frame() {
+        let writer = test_writer();
+        assert!(writer.try_submit_oob(vec![b'A']).is_ok());
+        let oob = pop_message(&mut writer.inner.q.lock().unwrap()).unwrap();
+        assert!(
+            write_message(&writer.inner, oob, |_| {
+                Err(std::io::ErrorKind::Interrupted.into())
+            })
+            .0
+        );
+        let q = writer.inner.q.lock().unwrap();
+        assert!(q.deferred.is_empty());
+        assert_eq!(q.oob_in_flight, 0);
+        assert_eq!(q.oob_bytes, 0);
+    }
+
+    #[test]
+    fn normal_shutdown_releases_deferred_write_reservations() {
+        let writer = FrameWriter::spawn_with(
+            false,
+            |_| {},
+            |_| Err(std::io::ErrorKind::Interrupted.into()),
+        );
+        let inner = Arc::clone(&writer.inner);
+        assert!(writer.submit_frame(vec![b'F'], None));
+        assert!(writer.try_submit_oob(vec![b'A']).is_ok());
+        {
+            let mut q = inner.q.lock().unwrap();
+            let deadline = Instant::now() + std::time::Duration::from_secs(1);
+            while q.deferred.is_empty() {
+                let now = Instant::now();
+                assert!(now < deadline, "writer did not defer failed OOB");
+                let (next, _) = inner
+                    .done_cv
+                    .wait_timeout(q, deadline.saturating_duration_since(now))
+                    .unwrap();
+                q = next;
+            }
+            assert_eq!(q.oob_in_flight, 1);
+            assert_eq!(q.oob_bytes, 1);
+        }
+        drop(writer);
+        let q = inner.q.lock().unwrap();
+        assert!(q.worker_done);
+        assert!(q.deferred.is_empty());
+        assert_eq!(q.oob_in_flight, 0);
+        assert_eq!(q.oob_bytes, 0);
+        assert_eq!(q.clipboard_queued, 0);
+        assert_eq!(q.clipboard_bytes, 0);
+    }
+
+    #[test]
+    fn fatal_during_parser_reset_suppresses_the_payload_write() {
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let sink_log = Arc::clone(&log);
+        let writer = Arc::new(FrameWriter::spawn_with(
+            true,
+            |_| {},
+            move |bytes| {
+                if bytes == PARSER_RESET {
+                    started_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                }
+                sink_log.lock().unwrap().push(bytes.to_vec());
+                Ok(())
+            },
+        ));
+        writer.inner.q.lock().unwrap().parser_reset_pending = true;
+        let submitting = Arc::clone(&writer);
+        let submit = std::thread::spawn(move || submitting.submit_frame(vec![b'P'], None));
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        assert!(submit.join().unwrap());
+        assert!(matches!(writer.take_status(), WriterStatus::Fatal(_)));
+        release_tx.send(()).unwrap();
+        let deadline = Instant::now() + std::time::Duration::from_secs(1);
+        while !writer.inner.q.lock().unwrap().worker_done {
+            assert!(
+                Instant::now() < deadline,
+                "writer did not finish after reset gate"
+            );
+            std::thread::yield_now();
+        }
+        drop(writer);
+        assert_eq!(*log.lock().unwrap(), vec![PARSER_RESET.to_vec()]);
     }
 
     #[test]
@@ -931,7 +1332,7 @@ mod tests {
             q.parser_reset_pending = true;
         }
         let mut calls = 0;
-        let (errored, _) = write_message(&writer.inner, Msg::Frame(vec![1], None), |_| {
+        let (errored, _, _) = write_message(&writer.inner, Msg::Frame(vec![1], None, 1), |_| {
             calls += 1;
             Ok(())
         });
@@ -996,7 +1397,7 @@ mod tests {
         let release_writer = test_writer();
         assert!(release_writer.try_submit_oob(vec![9]).is_ok());
         let active = pop_message(&mut release_writer.inner.q.lock().unwrap()).unwrap();
-        let (errored, released) = write_message(&release_writer.inner, active, |_| Ok(()));
+        let (errored, released, _) = write_message(&release_writer.inner, active, |_| Ok(()));
         assert!(!errored);
         assert!(released, "completed OOB write must release capacity");
         assert!(!oob_capacity_wake_requested(
@@ -1021,7 +1422,7 @@ mod tests {
         assert!(writer.inner.oob_pressure_logged.load(Ordering::SeqCst));
 
         let active = pop_message(&mut writer.inner.q.lock().unwrap()).unwrap();
-        let (errored, released) = write_message(&writer.inner, active, |_| Ok(()));
+        let (errored, released, _) = write_message(&writer.inner, active, |_| Ok(()));
         assert!(!errored);
         assert!(released);
         assert!(oob_capacity_wake_requested(&writer.inner, released));
@@ -1043,7 +1444,7 @@ mod tests {
         {
             let mut q = inner.q.lock().unwrap();
             q.msgs.push_back(Msg::Oob(vec![2]));
-            q.msgs.push_back(Msg::Frame(vec![3], None));
+            q.msgs.push_back(Msg::Frame(vec![3], None, 2));
             q.oob_in_flight = 1;
             q.oob_bytes = 1;
             q.frames_queued = 1;
@@ -1051,8 +1452,8 @@ mod tests {
         let written_by_worker = Arc::clone(&written);
         let inner_for_worker = Arc::clone(&inner);
         let handle = std::thread::spawn(move || {
-            let (errored, _) =
-                write_message(&inner_for_worker, Msg::Frame(vec![1], None), |bytes| {
+            let (errored, _, _) =
+                write_message(&inner_for_worker, Msg::Frame(vec![1], None, 1), |bytes| {
                     started_tx.send(()).unwrap();
                     release_rx.recv().unwrap();
                     written_by_worker.lock().unwrap().push(bytes.to_vec());
@@ -1062,7 +1463,7 @@ mod tests {
             let mut q = inner_for_worker.q.lock().unwrap();
             while let Some(msg) = pop_message(&mut q) {
                 drop(q);
-                let (errored, _) = write_message(&inner_for_worker, msg, |bytes| {
+                let (errored, _, _) = write_message(&inner_for_worker, msg, |bytes| {
                     written_by_worker.lock().unwrap().push(bytes.to_vec());
                     Ok(())
                 });
