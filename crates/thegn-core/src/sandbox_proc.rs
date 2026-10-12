@@ -4,8 +4,8 @@
 //! its own process group, so a deadline also closes inherited pipes held by
 //! descendants.
 
-use std::io::{self, Read};
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::io::{self, Read, Write};
+use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 use std::sync::OnceLock;
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::thread;
@@ -69,14 +69,42 @@ impl ProcOutcome {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InputDelivery {
+    Complete,
+    Failed,
+}
+
 pub(crate) fn run_bounded(argv: &[String], timeout: Duration, capture: Capture) -> ProcOutcome {
+    run_inner(argv, timeout, capture, None).0
+}
+
+pub(crate) fn run_bounded_with_input(
+    argv: &[String],
+    timeout: Duration,
+    capture: Capture,
+    input: Vec<u8>,
+) -> (ProcOutcome, InputDelivery) {
+    run_inner(argv, timeout, capture, Some(input))
+}
+
+fn run_inner(
+    argv: &[String],
+    timeout: Duration,
+    capture: Capture,
+    input: Option<Vec<u8>>,
+) -> (ProcOutcome, InputDelivery) {
     let Some(program) = argv.first() else {
-        return ProcOutcome::Spawn;
+        return (ProcOutcome::Spawn, InputDelivery::Failed);
     };
     let mut command = Command::new(program);
     command
         .args(&argv[1..])
-        .stdin(Stdio::null())
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(if capture.stdout.is_some() {
             Stdio::piped()
         } else {
@@ -91,8 +119,10 @@ pub(crate) fn run_bounded(argv: &[String], timeout: Duration, capture: Capture) 
     std::os::unix::process::CommandExt::process_group(&mut command, 0);
     let mut child = match command.spawn() {
         Ok(child) => child,
-        Err(_) => return ProcOutcome::Spawn,
+        Err(_) => return (ProcOutcome::Spawn, InputDelivery::Failed),
     };
+
+    let feeder = input.and_then(|input| child.stdin.take().map(|stdin| spawn_feeder(stdin, input)));
 
     let stdout = match child.stdout.take() {
         Some(pipe) if capture.stdout.is_some() => {
@@ -113,7 +143,7 @@ pub(crate) fn run_bounded(argv: &[String], timeout: Duration, capture: Capture) 
             Ok(None) if Instant::now() >= deadline => {
                 terminate_tree(&mut child);
                 reap_bounded(child);
-                return ProcOutcome::Timeout;
+                return (ProcOutcome::Timeout, InputDelivery::Failed);
             }
             Ok(None) => thread::sleep(
                 Duration::from_millis(10).min(deadline.saturating_duration_since(Instant::now())),
@@ -121,9 +151,25 @@ pub(crate) fn run_bounded(argv: &[String], timeout: Duration, capture: Capture) 
             Err(_) => {
                 terminate_tree(&mut child);
                 reap_bounded(child);
-                return ProcOutcome::Wait;
+                return (ProcOutcome::Wait, InputDelivery::Failed);
             }
         }
+    };
+
+    // Do not join the feeder: a descendant can retain stdin forever. Its result
+    // is observed only until this invocation's original deadline.
+    let input_delivery = match &feeder {
+        Some(receiver) => {
+            match receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                Ok(Ok(())) => InputDelivery::Complete,
+                Ok(Err(_)) | Err(mpsc::RecvTimeoutError::Disconnected) => InputDelivery::Failed,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    terminate_group_after_exit(&child);
+                    InputDelivery::Failed
+                }
+            }
+        }
+        None => InputDelivery::Complete,
     };
 
     // Keep the deadline active after the leader exits: an inherited pipe may
@@ -133,41 +179,61 @@ pub(crate) fn run_bounded(argv: &[String], timeout: Duration, capture: Capture) 
         terminate_group_after_exit(&child);
         let stdout = receive_reader(&stdout, Instant::now() + READER_REAP_BUDGET);
         let stderr = receive_reader(&stderr, Instant::now() + READER_REAP_BUDGET);
-        return match (stdout, stderr) {
-            (Ok(stdout), Ok(stderr)) => ProcOutcome::Exited {
-                status,
-                stdout,
-                stderr,
+        return (
+            match (stdout, stderr) {
+                (Ok(stdout), Ok(stderr)) => ProcOutcome::Exited {
+                    status,
+                    stdout,
+                    stderr,
+                },
+                (Err(error), _) | (_, Err(error)) => error,
             },
-            (Err(error), _) | (_, Err(error)) => error,
-        };
+            input_delivery,
+        );
     }
     let stdout = match stdout_result {
         Ok(result) => result,
-        Err(error) => return error,
+        Err(error) => return (error, input_delivery),
     };
     let stderr_result = receive_reader(&stderr, deadline);
     if stderr_result.is_err() {
         terminate_group_after_exit(&child);
         let stderr = receive_reader(&stderr, Instant::now() + READER_REAP_BUDGET);
-        return match stderr {
-            Ok(stderr) => ProcOutcome::Exited {
-                status,
-                stdout,
-                stderr,
+        return (
+            match stderr {
+                Ok(stderr) => ProcOutcome::Exited {
+                    status,
+                    stdout,
+                    stderr,
+                },
+                Err(error) => error,
             },
-            Err(error) => error,
-        };
+            input_delivery,
+        );
     }
     let stderr = match stderr_result {
         Ok(result) => result,
-        Err(error) => return error,
+        Err(error) => return (error, input_delivery),
     };
-    ProcOutcome::Exited {
-        status,
-        stdout,
-        stderr,
-    }
+    (
+        ProcOutcome::Exited {
+            status,
+            stdout,
+            stderr,
+        },
+        input_delivery,
+    )
+}
+
+fn spawn_feeder(mut stdin: ChildStdin, input: Vec<u8>) -> Receiver<io::Result<()>> {
+    let (sender, receiver) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let result = stdin.write_all(&input);
+        if let Err(error) = sender.send(result) {
+            tracing::debug!(target: "thegn::sandbox", %error, "stdin feeder result receiver closed");
+        }
+    });
+    receiver
 }
 
 fn spawn_reader<R: Read + Send + 'static>(mut reader: R, cap: usize) -> Receiver<ReadOutcome> {
@@ -350,6 +416,134 @@ mod tests {
         assert!(ProcOutcome::Spawn.into_stderr().is_none());
         assert!(ProcOutcome::Wait.into_stdout().is_none());
         assert!(ProcOutcome::Read.into_stderr().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_input_is_delivered_and_epipe_keeps_child_diagnostics() {
+        let (outcome, delivery) = run_bounded_with_input(
+            &sh("cat >&2"),
+            Duration::from_secs(1),
+            Capture {
+                stdout: None,
+                stderr: Some(64),
+            },
+            b"K=v\n".to_vec(),
+        );
+        assert_eq!(delivery, InputDelivery::Complete);
+        match outcome {
+            ProcOutcome::Exited { stderr, .. } => assert_eq!(stderr.bytes, b"K=v\n"),
+            other => panic!("expected captured input, got {other:?}"),
+        }
+
+        let input = vec![b'x'; 1024 * 1024];
+        let (outcome, delivery) = run_bounded_with_input(
+            &sh("printf diag >&2; exit 3"),
+            Duration::from_secs(1),
+            Capture {
+                stdout: None,
+                stderr: Some(64),
+            },
+            input,
+        );
+        assert_eq!(delivery, InputDelivery::Failed);
+        match outcome {
+            ProcOutcome::Exited { status, stderr, .. } => {
+                assert_eq!(status.code(), Some(3));
+                assert_eq!(stderr.bytes, b"diag");
+            }
+            other => panic!("child diagnostics must survive stdin EPIPE: {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_input_deadline_kills_descendant_holding_stdin() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let pid_file = dir.path().join("stdin-descendant-pid");
+        let script = format!(
+            "exec 3<&0; sleep 30 & echo $! > '{}'; exit 0",
+            pid_file.display()
+        );
+        let started = Instant::now();
+        let (outcome, delivery) = run_bounded_with_input(
+            &sh(&script),
+            Duration::from_millis(300),
+            Capture {
+                stdout: None,
+                stderr: None,
+            },
+            vec![b'x'; 1024 * 1024],
+        );
+        assert!(matches!(outcome, ProcOutcome::Exited { .. }));
+        assert_eq!(delivery, InputDelivery::Failed);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let pid: i32 = std::fs::read_to_string(pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_millis(500);
+        loop {
+            if nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_err() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "stdin-holding descendant {pid} survived"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_input_times_out_and_repeated_timeouts_reap_leaders() {
+        use std::os::unix::fs::PermissionsExt;
+        let (outcome, delivery) = run_bounded_with_input(
+            &sh("sleep 5"),
+            Duration::from_millis(100),
+            Capture {
+                stdout: None,
+                stderr: None,
+            },
+            b"secret".to_vec(),
+        );
+        assert!(matches!(outcome, ProcOutcome::Timeout));
+        assert_eq!(delivery, InputDelivery::Failed);
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        for index in 0..5 {
+            let pid_file = dir.path().join(format!("leader-{index}"));
+            let script = format!("echo $$ > '{}'; sleep 30", pid_file.display());
+            assert!(matches!(
+                run_bounded(
+                    &sh(&script),
+                    Duration::from_millis(100),
+                    Capture {
+                        stdout: None,
+                        stderr: None
+                    }
+                ),
+                ProcOutcome::Timeout
+            ));
+            let pid: i32 = std::fs::read_to_string(pid_file)
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok() {
+                assert!(
+                    Instant::now() < deadline,
+                    "timed-out leader {pid} was not reaped"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
     }
 
     #[cfg(unix)]
