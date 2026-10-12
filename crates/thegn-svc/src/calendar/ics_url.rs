@@ -27,7 +27,7 @@ const _: () = assert!(MAX_BODY_BYTES <= thegn_core::calendar::admission::MAX_SOU
 
 const ZONE_CURSOR_PREFIX: &str = "tgz1:";
 
-fn request_etag<'a>(zone: &str, stored: &'a str) -> &'a str {
+pub(super) fn request_etag<'a>(zone: &str, stored: &'a str) -> &'a str {
     let Some(rest) = stored.strip_prefix(ZONE_CURSOR_PREFIX) else {
         return "";
     };
@@ -37,7 +37,7 @@ fn request_etag<'a>(zone: &str, stored: &'a str) -> &'a str {
     if cursor_zone == zone { etag } else { "" }
 }
 
-fn stored_cursor(zone: &str, etag: &str) -> String {
+pub(super) fn stored_cursor(zone: &str, etag: &str) -> String {
     if etag.is_empty() {
         String::new()
     } else {
@@ -45,9 +45,13 @@ fn stored_cursor(zone: &str, etag: &str) -> String {
     }
 }
 
+fn request_etag_over_limit(zone: &str, stored: &str) -> bool {
+    request_etag(zone, stored).len() > MAX_REQUEST_BYTES
+}
+
 #[cfg(test)]
 mod cursor_tests {
-    use super::{request_etag, stored_cursor};
+    use super::{request_etag, request_etag_over_limit, stored_cursor};
 
     #[test]
     fn ics_cursor_requires_the_current_zone_and_rejects_legacy_etags() {
@@ -56,6 +60,18 @@ mod cursor_tests {
         assert_eq!(request_etag("Asia/Kolkata", &stored), "");
         assert_eq!(request_etag("Europe/Berlin", "\"legacy-etag\""), "");
         assert_eq!(stored_cursor("Europe/Berlin", ""), "");
+    }
+
+    #[test]
+    fn wrapped_cursor_prefix_does_not_push_an_in_limit_etag_over_request_limit() {
+        let etag = "x".repeat(MAX_REQUEST_BYTES);
+        let stored = stored_cursor("Europe/Berlin", &etag);
+        assert!(stored.len() > MAX_REQUEST_BYTES);
+        assert!(!request_etag_over_limit("Europe/Berlin", &stored));
+        assert!(request_etag_over_limit(
+            "Europe/Berlin",
+            &stored_cursor("Europe/Berlin", &("x".repeat(MAX_REQUEST_BYTES + 1)))
+        ));
     }
 }
 
@@ -128,9 +144,6 @@ impl CalendarBackend for IcsUrlBackend {
             if let Some(error) = self.init_error {
                 return Err(CalendarError::Policy(map_error(error)));
             }
-            if sync_token.len() > MAX_REQUEST_BYTES {
-                return Err(CalendarError::BodyLimit("calendar validator exceeds limit"));
-            }
             let http = self.http.as_ref().expect("checked above");
             // Reserve the largest body the transport will accept before asking
             // for it, so concurrent fetches can't jointly exceed the shared
@@ -138,6 +151,9 @@ impl CalendarBackend for IcsUrlBackend {
             let mut meter = self.admission.meter();
             meter.reserve_transient(MAX_BODY_BYTES)?;
             let cursor_etag = request_etag(self.zone.name(), sync_token);
+            if request_etag_over_limit(self.zone.name(), sync_token) {
+                return Err(CalendarError::BodyLimit("calendar validator exceeds limit"));
+            }
             let mut req = http.request(reqwest::Method::GET);
             if !cursor_etag.is_empty() {
                 req = req.header(reqwest::header::IF_NONE_MATCH, cursor_etag);
