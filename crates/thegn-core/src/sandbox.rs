@@ -163,6 +163,135 @@ pub(crate) fn stderr_with_timeout(argv: &[String], timeout: Duration) -> Option<
     }
 }
 
+/// Run a control command while delivering a bounded secret payload on stdin.
+/// The feeder owns only the pipe; this function retains ownership of the child
+/// and kills and waits for it on write failure or timeout.
+fn stderr_with_timeout_stdin(
+    argv: &[String],
+    timeout: Duration,
+    input: Vec<u8>,
+) -> Option<(bool, String)> {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let mut child = Command::new(&argv[0])
+        .args(&argv[1..])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .ok()?;
+    let Some(mut stdin) = child.stdin.take() else {
+        terminate_and_reap(&mut child);
+        return None;
+    };
+    let redactions: Vec<String> = String::from_utf8_lossy(&input)
+        .lines()
+        .filter_map(|line| line.split_once('=').map(|(_, value)| value.to_string()))
+        .filter(|value| !value.is_empty())
+        .collect();
+    let feeder = std::thread::spawn(move || stdin.write_all(&input));
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let feeder_result = feeder.join();
+                let waited = child.wait().ok()?;
+                if !matches!(feeder_result, Ok(Ok(()))) {
+                    return None;
+                }
+                let err = child
+                    .stderr
+                    .take()
+                    .and_then(read_stderr)
+                    .unwrap_or_default();
+                return Some((
+                    status.success() && waited.success(),
+                    redact_stderr(err, &redactions),
+                ));
+            }
+            Ok(None) if Instant::now() >= deadline => {
+                terminate_and_reap(&mut child);
+                drop(feeder.join());
+                return None;
+            }
+            Ok(None) => {
+                if feeder.is_finished() {
+                    match feeder.join() {
+                        Ok(Ok(())) => {}
+                        Ok(Err(_)) | Err(_) => {
+                            terminate_and_reap(&mut child);
+                            return None;
+                        }
+                    }
+                    // The input has been written and stdin dropped with the
+                    // feeder's owned handle; continue waiting for the command.
+                    return stderr_wait_after_input(child, deadline, redactions);
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(_) => {
+                terminate_and_reap(&mut child);
+                drop(feeder.join());
+                return None;
+            }
+        }
+    }
+}
+
+fn stderr_wait_after_input(
+    mut child: std::process::Child,
+    deadline: Instant,
+    redactions: Vec<String>,
+) -> Option<(bool, String)> {
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let waited = child.wait().ok()?;
+                let err = child
+                    .stderr
+                    .take()
+                    .and_then(read_stderr)
+                    .unwrap_or_default();
+                return Some((
+                    status.success() && waited.success(),
+                    redact_stderr(err, &redactions),
+                ));
+            }
+            Ok(None) if Instant::now() >= deadline => {
+                terminate_and_reap(&mut child);
+                return None;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(25)),
+            Err(_) => {
+                terminate_and_reap(&mut child);
+                return None;
+            }
+        }
+    }
+}
+
+fn redact_stderr(mut stderr: String, secrets: &[String]) -> String {
+    for secret in secrets {
+        stderr = stderr.replace(secret, "[REDACTED]");
+    }
+    stderr
+}
+
+fn terminate_and_reap(child: &mut std::process::Child) {
+    match child.kill() {
+        Ok(()) | Err(_) => {}
+    }
+    match child.wait() {
+        Ok(_) | Err(_) => {}
+    }
+}
+
+fn read_stderr(mut stderr: impl std::io::Read) -> Option<String> {
+    let mut output = String::new();
+    stderr.read_to_string(&mut output).ok().map(|()| output)
+}
+
 /// Runtime backend (resolved from the config-facing [`SandboxBackend`]; this set
 /// has no `Auto` — auto resolution is what produces a concrete `Backend`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -2086,25 +2215,16 @@ pub fn ensure(spec: &SandboxSpec) -> anyhow::Result<()> {
     emit(SandboxPhase::ContainerCreate {
         backend: spec.backend.label(),
     });
-    let mut argv: Vec<String> = oci_prefix(spec);
-    argv.extend([
-        "run".into(),
-        "-d".into(),
-        "--name".into(),
-        spec.name.clone(),
-    ]);
-    argv.extend(oci_create_opts(spec)?);
-    // Before the image: the image's own ENTRYPOINT would otherwise wrap the
-    // command below and decide what actually runs inside the sandbox.
-    argv.extend(entrypoint_override());
-    argv.push(effective_image(spec));
-    argv.push("infinity".into());
+    let ssh_secret_env = ssh_oci_secret_env(spec);
+    let (argv, stdin) = oci_create_argv_and_stdin(spec, oci_create_opts(spec)?, &ssh_secret_env);
     // Keep the create's stderr: it is the only place the runtime says WHY, and
     // for the commonest macOS failure (a bind the VM cannot resolve) it names the
     // exact path. `run_control_owned` would drop it.
-    let create_err = stderr_with_timeout(&spec.placement.control_argv(&argv), RUN_TIMEOUT)
-        .map(|(_, e)| e)
-        .unwrap_or_default();
+    let create_result = match stdin {
+        Some(input) => stderr_with_timeout_stdin(&argv, RUN_TIMEOUT, input),
+        None => stderr_with_timeout(&argv, RUN_TIMEOUT),
+    };
+    let create_err = create_result.map(|(_, e)| e).unwrap_or_default();
     // Don't trust the exit code of `podman run -d`: on NixOS with broken
     // --userns keep-id, crun exits 0 but leaves the container in "created"
     // state. Verify it is actually running before declaring success.
@@ -2140,20 +2260,16 @@ pub fn ensure(spec: &SandboxSpec) -> anyhow::Result<()> {
     // selection still produces a real container instead of forcing host use.
     if spec.backend == Backend::Podman {
         remove_container(spec);
-        let mut retry: Vec<String> = oci_prefix(spec);
-        retry.extend([
-            "run".into(),
-            "-d".into(),
-            "--name".into(),
-            spec.name.clone(),
-        ]);
-        retry.extend(oci_create_opts_with_keep_id(spec, false)?);
-        // The keep-id retry is the same containment boundary; it gets the same
-        // entrypoint neutralization, not a weaker one.
-        retry.extend(entrypoint_override());
-        retry.push(effective_image(spec));
-        retry.push("infinity".into());
-        run_control_owned(spec, &retry, RUN_TIMEOUT);
+        let ssh_secret_env = ssh_oci_secret_env(spec);
+        let (retry, stdin) = oci_create_argv_and_stdin(
+            spec,
+            oci_create_opts_with_keep_id(spec, false)?,
+            &ssh_secret_env,
+        );
+        match stdin {
+            Some(input) => drop(stderr_with_timeout_stdin(&retry, RUN_TIMEOUT, input)),
+            None => drop(stderr_with_timeout(&retry, RUN_TIMEOUT)),
+        }
         if container_status(spec).0 {
             msg::warn(
                 "podman --userns keep-id failed; continuing with rootless podman default user namespace",
@@ -2804,18 +2920,18 @@ fn backend_enter_argv_with_env(
     }
 }
 
-/// Split `spec.env` into (non-secret inline pairs, secret pairs) for a *local*
 /// Borrowed `(key, value)` env pairs from a spec's `env` map.
 type EnvPairs<'a> = Vec<(&'a String, &'a String)>;
 
-/// spec. A pair whose value matches the launcher's own process env is a
+/// Split `spec.env` into (non-secret inline pairs, secret pairs) for local
+/// Borrowed `(key, value)` env pairs from a spec's `env` map.
+/// A pair whose value matches the launcher's own process env is a
 /// host-sourced passthrough secret (GH_TOKEN, API keys — see `resolve`'s
 /// env_passthrough) and MUST NOT ride the world-readable argv (`-e K=V` /
 /// `--setenv K=V` are visible in `/proc/*/cmdline`); it goes to a 0600
 /// env-file instead. Synthetic pairs (THEGN_SANDBOX, NIX_REMOTE — values absent
-/// from the host env) are not secrets and stay inline. A REMOTE spec returns all
-/// pairs inline: the argv is the only env carrier through ssh (mirrors the bwrap
-/// branch), so nothing is diverted.
+/// from the host env) are not secrets and stay inline. Remote placements other
+/// than SSH retain inline delivery.
 fn partition_secret_env(spec: &SandboxSpec) -> (EnvPairs<'_>, EnvPairs<'_>) {
     let mut inline: EnvPairs = Vec::new();
     let mut secret: EnvPairs = Vec::new();
@@ -2830,26 +2946,66 @@ fn partition_secret_env(spec: &SandboxSpec) -> (EnvPairs<'_>, EnvPairs<'_>) {
     (inline, secret)
 }
 
-/// Write host-sourced secret env pairs to a stable, 0600 per-sandbox env-file
-/// (`$XDG_STATE_HOME/thegn/sandbox-env/<name>.env`) and return its path, so the
-/// OCI `--env-file` / systemd `EnvironmentFile=` flags can carry tokens off the
-/// world-readable argv. Returns `None` when there are no secrets to write or the
-/// file can't be created (caller then keeps the pairs inline — availability over
-/// a hard failure). The 0600 mode is set BEFORE the secret bytes are written.
+fn ssh_oci_secret_env(spec: &SandboxSpec) -> EnvPairs<'_> {
+    if !matches!(spec.placement, Placement::Ssh(_)) {
+        return Vec::new();
+    }
+    spec.env
+        .iter()
+        .filter(|(key, value)| std::env::var(key).ok().as_deref() == Some(value.as_str()))
+        .collect()
+}
+
+/// Add the final run command and wrap it for its placement. The returned stdin
+/// is present only for SSH OCI host-sourced secrets, and is consumed by the
+/// same control call that carries the command.
+fn oci_create_argv_and_stdin(
+    spec: &SandboxSpec,
+    opts: Vec<String>,
+    secret_env: &[(&String, &String)],
+) -> (Vec<String>, Option<Vec<u8>>) {
+    let mut argv = oci_prefix(spec);
+    argv.extend([
+        "run".into(),
+        "-d".into(),
+        "--name".into(),
+        spec.name.clone(),
+    ]);
+    argv.extend(opts);
+    argv.extend(entrypoint_override());
+    argv.push(effective_image(spec));
+    argv.push("infinity".into());
+    let input = secret_env
+        .iter()
+        .map(|(key, value)| format!("{key}={value}\n"))
+        .collect::<String>()
+        .into_bytes();
+    let input = (!input.is_empty()).then_some(input);
+    (spec.placement.control_argv(&argv), input)
+}
+
+/// Write host-sourced secret env pairs to a 0600 per-sandbox env-file and return
+/// its path. On failure, callers omit secrets instead of leaking them to argv.
 fn write_secret_env_file(name: &str, secret: &[(&String, &String)]) -> Option<PathBuf> {
     if secret.is_empty() {
         return None;
     }
     let dir = util::xdg_state_home().join("thegn/sandbox-env");
-    std::fs::create_dir_all(&dir).ok()?;
-    let _ = crate::fsperm::restrict_dir_to_owner(&dir); // best-effort: hardening: a failed chmod must not block the env write
+    write_secret_env_file_in(&dir, name, secret)
+}
+
+fn write_secret_env_file_in(
+    dir: &std::path::Path,
+    name: &str,
+    secret: &[(&String, &String)],
+) -> Option<PathBuf> {
+    if secret.is_empty() {
+        return None;
+    }
+    crate::fsperm::ensure_private_dir(dir).ok()?;
     let path = dir.join(format!("{name}.env"));
-    // Create empty + lock down to 0600 before writing any secret bytes, so the
-    // token never lands in a world-readable file even momentarily.
-    std::fs::File::create(&path).ok()?;
-    crate::fsperm::restrict_to_owner(&path).ok()?;
     let body: String = secret.iter().map(|(k, v)| format!("{k}={v}\n")).collect();
-    std::fs::write(&path, body).ok()?;
+    crate::fsperm::write_owner_only_atomic(&path, body.as_bytes()).ok()?;
     Some(path)
 }
 
@@ -2980,12 +3136,22 @@ fn oci_create_opts(spec: &SandboxSpec) -> Result<Vec<String>, VolumeAdmissionErr
     if emits_nix_bind(spec) {
         v.extend(["-v".into(), "/nix:/nix:ro".into()]);
     }
-    // Host-sourced secrets (tokens, API keys) go to a 0600 `--env-file` so they
-    // never land on the world-readable process argv; only synthetic/non-secret
-    // pairs stay inline as `-e K=V`. (Remote specs keep everything inline — the
-    // argv is the only env carrier through ssh; see `partition_secret_env`.)
+    // Host-sourced secrets stay off argv. Local creates use a protected file;
+    // SSH creates feed the env-file body over the control process stdin. Other
+    // remote placement kinds keep their existing inline delivery.
     let (inline_env, secret_env) = partition_secret_env(spec);
-    if let Some(envfile) = write_secret_env_file(&spec.name, &secret_env) {
+    let ssh_secret_env = ssh_oci_secret_env(spec);
+    let inline_env: EnvPairs<'_> = if ssh_secret_env.is_empty() {
+        inline_env
+    } else {
+        inline_env
+            .into_iter()
+            .filter(|pair| !ssh_secret_env.contains(pair))
+            .collect()
+    };
+    if matches!(spec.placement, Placement::Ssh(_)) && !ssh_secret_env.is_empty() {
+        v.extend(["--env-file".into(), "/dev/stdin".into()]);
+    } else if let Some(envfile) = write_secret_env_file(&spec.name, &secret_env) {
         v.extend(["--env-file".into(), envfile.to_string_lossy().into_owned()]);
     } else if !secret_env.is_empty() {
         // Never put host-sourced secrets back on argv if the protected file
