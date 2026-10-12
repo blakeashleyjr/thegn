@@ -125,8 +125,8 @@ pub(crate) fn install_pane_services(
     }
 }
 
-/// Reap pre-digest SSHFS projections once per process, but avoid starting a
-/// housekeeping thread when the mounts directory contains no legacy directory.
+/// Reap pre-digest SSHFS projections once per process. Inspect candidate names
+/// here, but leave all filesystem metadata checks to the housekeeping thread.
 fn reap_legacy_projection_mounts() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
@@ -139,7 +139,7 @@ fn reap_legacy_projection_mounts() {
                 return;
             }
         };
-        let mut has_legacy_dir = false;
+        let mut has_legacy_name = false;
         for entry in entries {
             let entry = match entry {
                 Ok(entry) => entry,
@@ -154,18 +154,10 @@ fn reap_legacy_projection_mounts() {
             if !thegn_core::projection::is_legacy_mount_component(&name) {
                 continue;
             }
-            match std::fs::symlink_metadata(entry.path()) {
-                Ok(metadata) if metadata.is_dir() => {
-                    has_legacy_dir = true;
-                    break;
-                }
-                Ok(_) => {}
-                Err(error) => {
-                    tracing::debug!(%error, path = %entry.path().display(), "could not inspect projection mount entry at startup")
-                }
-            }
+            has_legacy_name = true;
+            break;
         }
-        if !has_legacy_dir {
+        if !has_legacy_name {
             return;
         }
 
