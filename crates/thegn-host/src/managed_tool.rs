@@ -37,7 +37,6 @@ const DOWNLOAD_LIMIT: u64 = 128 * 1024 * 1024;
 const EXTRACTED_FILE_LIMIT: u64 = 64 * 1024 * 1024;
 const DOWNLOAD_TOTAL_TIMEOUT: Duration = Duration::from_secs(120);
 const DOWNLOAD_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const DOWNLOAD_READ_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Output retained per stream for diagnostics: the first and last bytes only.
 /// Everything in between is read (so the child never blocks on a full pipe)
@@ -463,36 +462,37 @@ pub fn acquire(tool: &ManagedTool) -> Result<()> {
                 "https://github.com/{repo}/releases/download/{}/{asset}",
                 tool.version
             );
-            let bin = tool.bin_path();
-            let parent = bin.parent().context("managed binary path has no parent")?;
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("create {}", parent.display()))?;
-            let expected_digest =
-                trusted_digest(&tool.name, &tool.version, asset).with_context(|| {
-                    format!(
-                        "no trusted SHA-256 pin for {} {} asset {asset}; refusing download",
-                        tool.name, tool.version
-                    )
-                })?;
-            let download = download_to(&url, parent, expected_digest)?;
-            if is_archive(asset) {
-                let mut extracted = extract_binary(download.path(), asset, &tool.name, parent)?;
-                make_executable(extracted.path())?;
-                extracted
-                    .persist(&bin)
-                    .map_err(|e| e.error)
-                    .with_context(|| format!("atomically install {}", bin.display()))?;
-            } else {
-                let mut download = download;
-                make_executable(download.path())?;
-                download
-                    .persist(&bin)
-                    .map_err(|e| e.error)
-                    .with_context(|| format!("atomically install {}", bin.display()))?;
-            }
-            Ok(())
+            acquire_github_release(tool, asset, &url)
         }
     }
+}
+
+fn acquire_github_release(tool: &ManagedTool, asset: &str, url: &str) -> Result<()> {
+    let bin = tool.bin_path();
+    let parent = bin.parent().context("managed binary path has no parent")?;
+    std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    let expected_digest = trusted_digest(&tool.name, &tool.version, asset).with_context(|| {
+        format!(
+            "no trusted SHA-256 pin for {} {} asset {asset}; refusing download",
+            tool.name, tool.version
+        )
+    })?;
+    let download = download_to(url, parent, expected_digest)?;
+    if is_archive(asset) {
+        let extracted = extract_binary(download.path(), asset, &tool.name, parent)?;
+        make_executable(extracted.path())?;
+        extracted
+            .persist(&bin)
+            .map_err(|e| e.error)
+            .with_context(|| format!("atomically install {}", bin.display()))?;
+    } else {
+        make_executable(download.path())?;
+        download
+            .persist(&bin)
+            .map_err(|e| e.error)
+            .with_context(|| format!("atomically install {}", bin.display()))?;
+    }
+    Ok(())
 }
 
 /// Ensure a tool is installed and its version marker recorded: gate on
@@ -529,9 +529,7 @@ fn is_archive(asset: &str) -> bool {
     a.ends_with(".tar.gz") || a.ends_with(".tgz") || a.ends_with(".zip")
 }
 
-/// Extract the binary named `want` (basename) from a gzip tar archive without
-/// writing archive paths to disk. ZIP assets are refused until a reviewed ZIP
-/// parser is available. Acquisition runs off-loop (CLI / `spawn_blocking`).
+/// Look up a shipped SHA-256 pin; a missing pin means the download is refused.
 fn trusted_digest(tool: &str, version: &str, asset: &str) -> Option<&'static str> {
     TRUSTED_RELEASE_DIGESTS
         .iter()
@@ -562,7 +560,6 @@ fn download_to(url: &str, dir: &Path, expected_digest: &str) -> Result<NamedTemp
             }
         }))
         .connect_timeout(DOWNLOAD_CONNECT_TIMEOUT)
-        .read_timeout(DOWNLOAD_READ_TIMEOUT)
         .timeout(DOWNLOAD_TOTAL_TIMEOUT)
         .build()
         .context("build bounded release HTTP client")?;
@@ -613,7 +610,9 @@ fn download_to(url: &str, dir: &Path, expected_digest: &str) -> Result<NamedTemp
 }
 
 /// Read a gzip tar archive without extracting paths to the filesystem. Only a
-/// single regular member with the requested basename is materialized.
+/// single regular member with the requested basename is materialized. Pax and
+/// GNU long-name headers are rejected as special files; check this limitation
+/// before adding pins for macOS-built tarballs.
 fn extract_binary(archive: &Path, asset: &str, want: &str, dir: &Path) -> Result<NamedTempFile> {
     anyhow::ensure!(
         asset.to_ascii_lowercase().ends_with(".tar.gz")
@@ -737,7 +736,11 @@ fn tar_field(bytes: &[u8]) -> Result<&str> {
 
 fn tar_path(header: &[u8; 512]) -> Result<String> {
     let name = tar_field(&header[..100])?;
-    let prefix = tar_field(&header[345..500])?;
+    let prefix = if &header[257..263] == b"ustar\0" {
+        tar_field(&header[345..500])?
+    } else {
+        ""
+    };
     Ok(if prefix.is_empty() {
         name.to_string()
     } else {
@@ -859,9 +862,40 @@ mod tests {
         archive
     }
 
+    fn short_payload_tar_gz() -> NamedTempFile {
+        let mut archive = NamedTempFile::new().unwrap();
+        {
+            let mut gzip =
+                flate2::write::GzEncoder::new(archive.as_file_mut(), Compression::fast());
+            gzip.write_all(&tar_header("difft", 6, b'0')).unwrap();
+            gzip.write_all(b"bin").unwrap();
+            gzip.finish().unwrap();
+        }
+        archive
+    }
+
     #[test]
     fn missing_release_pin_refuses_asset_before_network_access() {
-        assert!(trusted_digest("difft", "0.63.0", "difft-linux.tar.gz").is_none());
+        let dir = tempfile::tempdir().unwrap();
+        let tool = ManagedTool::github(
+            "unreviewed-tool",
+            "example/unreachable",
+            "0.1.0",
+            vec![thegn_core::managed_tool::AssetRule {
+                os: Os::current().unwrap(),
+                arch: Arch::current().unwrap(),
+                asset: "unreviewed-tool.tar.gz".to_string(),
+            }],
+        )
+        .with_layout(dir.path().to_path_buf(), "bin/unreviewed-tool", ".version");
+        let error = acquire_github_release(
+            &tool,
+            "unreviewed-tool.tar.gz",
+            "https://127.0.0.1:1/unreachable",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("no trusted SHA-256 pin"));
+        assert!(!tool.bin_path().exists());
     }
 
     #[test]
@@ -870,6 +904,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let output = extract_binary(archive.path(), "difft.tar.gz", "difft", dir.path()).unwrap();
         assert_eq!(std::fs::read(output.path()).unwrap(), b"binary");
+    }
+
+    #[test]
+    fn gnu_tar_atime_fields_are_not_treated_as_a_path_prefix() {
+        let mut header = tar_header("difft", 0, b'0');
+        header[257..265].copy_from_slice(b"ustar  \0");
+        header[345..357].copy_from_slice(b"1780000000\0\0");
+        assert_eq!(tar_path(&header).unwrap(), "difft");
     }
 
     #[test]
@@ -892,6 +934,10 @@ mod tests {
         bytes.truncate(bytes.len() - 8);
         std::fs::write(truncated.path(), bytes).unwrap();
         assert!(extract_binary(truncated.path(), "a.tar.gz", "difft", dir.path()).is_err());
+        let short_payload = short_payload_tar_gz();
+        let error =
+            extract_binary(short_payload.path(), "a.tar.gz", "difft", dir.path()).unwrap_err();
+        assert!(error.to_string().contains("truncated tar member"));
     }
 
     #[test]
