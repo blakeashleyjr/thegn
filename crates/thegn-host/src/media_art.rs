@@ -21,6 +21,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use termwiz::terminal::TerminalWaker;
+use tokio::sync::Semaphore;
 
 use crate::seg::{Line, Tok, seg};
 
@@ -65,7 +66,7 @@ pub(crate) fn mosaic(raster: &crate::rasterize::Raster, cols: usize, rows: usize
 }
 
 /// Longest art URL admitted; longer is refused outright.
-const MAX_URL_LEN: usize = 2048;
+pub(crate) const MAX_URL_LEN: usize = 2048;
 /// Encoded-body cap for both HTTP bodies and local files.
 const MAX_ART_BYTES: usize = 8 * 1024 * 1024;
 /// Wall-clock budget for a whole fetch (DNS, every redirect hop, body).
@@ -74,6 +75,10 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const DNS_TIMEOUT: Duration = Duration::from_secs(5);
 /// Redirect hops followed (each re-validated and re-resolved).
 const MAX_REDIRECTS: usize = 3;
+/// A blocking image decoder may continue after its async owner is aborted.
+/// Keep its admission permit in the blocking closure so churn cannot queue an
+/// unbounded number of decoder workers.
+static DECODE_SLOT: Semaphore = Semaphore::const_new(1);
 
 /// Why a locator was refused. Carries no URL or path, so a diagnostic never
 /// reflects attacker-controlled text.
@@ -86,6 +91,7 @@ enum Reject {
     ForbiddenAddress,
     Resolve,
     Status,
+    ContentType,
     TooLarge,
     Redirects,
     Network,
@@ -238,6 +244,7 @@ async fn fetch_http(start: &str) -> Result<Vec<u8>, Reject> {
         if !resp.status().is_success() {
             return Err(Reject::Status);
         }
+        admit_content_type(resp.headers().get(reqwest::header::CONTENT_TYPE))?;
         if resp
             .content_length()
             .is_some_and(|n| n > MAX_ART_BYTES as u64)
@@ -256,21 +263,62 @@ async fn fetch_http(start: &str) -> Result<Vec<u8>, Reject> {
     Err(Reject::Redirects)
 }
 
+/// Accept image media types and generic binary bodies. Missing Content-Type is
+/// allowed because the bounded image decoder sniffs the format itself.
+fn admit_content_type(value: Option<&reqwest::header::HeaderValue>) -> Result<(), Reject> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    let Ok(value) = value.to_str() else {
+        return Err(Reject::ContentType);
+    };
+    let media_type = value.split(';').next().unwrap_or_default().trim();
+    let mut parts = media_type.split('/');
+    let top_level = parts.next().unwrap_or_default();
+    let subtype = parts.next().unwrap_or_default();
+    let image_type = top_level.eq_ignore_ascii_case("image")
+        && !subtype.is_empty()
+        && parts.next().is_none()
+        && subtype
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte));
+    if image_type || media_type.eq_ignore_ascii_case("application/octet-stream") {
+        Ok(())
+    } else {
+        Err(Reject::ContentType)
+    }
+}
+
+/// Run a blocking decode only while holding a slot. Moving the permit into the
+/// closure keeps it held until the decoder exits, even if this future is aborted.
+async fn admitted_blocking<T, F>(slot: &'static Semaphore, f: F) -> Result<T, Reject>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let permit = slot.acquire().await.map_err(|_| Reject::Decode)?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        f()
+    })
+    .await
+    .map_err(|_| Reject::Decode)
+}
+
 /// Fetch + decode one art locator to a raster, enforcing every bound.
 async fn load_raster(art_url: &str) -> Result<crate::rasterize::Raster, Reject> {
     if art_url.len() > MAX_URL_LEN {
         return Err(Reject::TooLong);
     }
     if let Some(path) = local_path(art_url) {
-        return tokio::task::spawn_blocking(move || {
+        return admitted_blocking(&DECODE_SLOT, move || {
             crate::rasterize::image_file_with_limits(
                 &path,
                 MAX_ART_BYTES as u64,
                 crate::rasterize::MEDIA_ART_LIMITS,
             )
         })
-        .await
-        .map_err(|_| Reject::Decode)?
+        .await?
         .map_err(|_| Reject::Decode);
     }
     if !(art_url.starts_with("http://") || art_url.starts_with("https://")) {
@@ -279,11 +327,10 @@ async fn load_raster(art_url: &str) -> Result<crate::rasterize::Raster, Reject> 
     let bytes = tokio::time::timeout(FETCH_TOTAL_TIMEOUT, fetch_http(art_url))
         .await
         .map_err(|_| Reject::Network)??;
-    tokio::task::spawn_blocking(move || {
+    admitted_blocking(&DECODE_SLOT, move || {
         crate::rasterize::image_bytes_with_limits(&bytes, crate::rasterize::MEDIA_ART_LIMITS)
     })
-    .await
-    .map_err(|_| Reject::Decode)?
+    .await?
     .map_err(|_| Reject::Decode)
 }
 
@@ -319,9 +366,16 @@ pub(crate) fn spawn_fetch(
         });
         let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
     });
-    let mut slot = IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(prev) = slot.replace(handle) {
-        prev.abort();
+    replace_in_flight(&IN_FLIGHT, handle);
+}
+
+fn replace_in_flight(
+    slot: &Mutex<Option<tokio::task::JoinHandle<()>>>,
+    handle: tokio::task::JoinHandle<()>,
+) {
+    let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(previous) = slot.replace(handle) {
+        previous.abort();
     }
 }
 
@@ -448,6 +502,84 @@ mod tests {
         assert_eq!(admit_resolved(&[ok]), Ok(vec![ok]));
         // A mixed (rebinding-style) answer is rejected whole.
         assert_eq!(admit_resolved(&[ok, bad]), Err(Reject::ForbiddenAddress));
+    }
+
+    #[test]
+    fn content_type_admission_accepts_images_and_rejects_other_media() {
+        let header = |value: &str| reqwest::header::HeaderValue::from_str(value).unwrap();
+        assert_eq!(admit_content_type(None), Ok(()));
+        assert_eq!(
+            admit_content_type(Some(&header("image/jpeg; charset=x"))),
+            Ok(())
+        );
+        assert_eq!(admit_content_type(Some(&header("IMAGE/PNG"))), Ok(()));
+        assert_eq!(
+            admit_content_type(Some(&header("application/octet-stream"))),
+            Ok(())
+        );
+        for rejected in ["text/html", "application/json", "image/", "garbage"] {
+            assert_eq!(
+                admit_content_type(Some(&header(rejected))),
+                Err(Reject::ContentType),
+                "{rejected} must be refused"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn decode_slot_lives_until_blocking_closure_returns_after_owner_abort() {
+        static TEST_SLOT: Semaphore = Semaphore::const_new(1);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let first = tokio::spawn(admitted_blocking(&TEST_SLOT, move || {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        }));
+        tokio::task::spawn_blocking(move || started_rx.recv().unwrap())
+            .await
+            .unwrap();
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        assert_eq!(TEST_SLOT.available_permits(), 0);
+
+        let second_started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let second_started_in_job = second_started.clone();
+        let mut second = tokio::spawn(admitted_blocking(&TEST_SLOT, move || {
+            second_started_in_job.store(true, Ordering::SeqCst);
+        }));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut second)
+                .await
+                .is_err()
+        );
+        release_tx.send(()).unwrap();
+        second.await.unwrap().unwrap();
+        assert!(second_started.load(Ordering::SeqCst));
+        assert_eq!(TEST_SLOT.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn replacing_in_flight_aborts_every_previous_task() {
+        let slot = Mutex::new(None);
+        let mut previous = Vec::new();
+        for _ in 0..4 {
+            let handle = tokio::spawn(std::future::pending());
+            previous.push(handle.abort_handle());
+            replace_in_flight(&slot, handle);
+        }
+        tokio::task::yield_now().await;
+        assert!(
+            previous[..previous.len() - 1]
+                .iter()
+                .all(tokio::task::AbortHandle::is_finished)
+        );
+        assert!(!previous.last().unwrap().is_finished());
+        assert!(
+            slot.lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|handle| !handle.is_finished())
+        );
     }
 
     #[test]
