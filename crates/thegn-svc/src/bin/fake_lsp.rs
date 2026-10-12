@@ -35,13 +35,13 @@ fn deep_symbol_result() -> Value {
     let mut symbol = json!({
         "name": "leaf",
         "kind": 12,
-        "range": { "start": { "line": 0, "character": 0 } }
+        "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 0 } }
     });
     for index in 0..=64 {
         symbol = json!({
             "name": format!("deep{index}"),
             "kind": 12,
-            "range": { "start": { "line": index, "character": 0 } },
+            "range": { "start": { "line": index, "character": 0 }, "end": { "line": index, "character": 0 } },
             "children": [symbol]
         });
     }
@@ -122,7 +122,7 @@ fn main() {
                                 "params": {
                                     "uri": format!("file:///proj/flood/{index}.rs"),
                                     "diagnostics": [{
-                                        "range": { "start": { "line": 0, "character": 0 } },
+                                        "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 0 } },
                                         "severity": 2,
                                         "message": format!("flood {index}")
                                     }]
@@ -230,7 +230,7 @@ fn main() {
                             "jsonrpc": "2.0",
                             "method": "textDocument/publishDiagnostics",
                             "params": { "uri": uri, "diagnostics": [{
-                                "range": { "start": { "line": 0, "character": 0 } },
+                                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 0 } },
                                 "message": format!("opened {len}")
                             }]}
                         }),
