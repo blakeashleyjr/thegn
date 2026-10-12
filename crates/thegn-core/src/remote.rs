@@ -249,6 +249,13 @@ impl GitLoc {
         location: Result<Option<String>, String>,
     ) -> Result<GitLoc, String> {
         match location {
+            Ok(Some(location)) if !location.trim().is_empty() && location.trim() != "local" => {
+                let parsed = Self::from_db(path, Some(location.as_str()));
+                if matches!(&parsed, GitLoc::Local(_)) {
+                    return Err("unrecognised worktree location; refusing terminal launch".into());
+                }
+                Ok(parsed)
+            }
             Ok(location) => Ok(Self::from_db(path, location.as_deref())),
             Err(error) => Err(error),
         }
@@ -916,6 +923,11 @@ mod tests {
         ));
         assert!(
             GitLoc::from_checked_lookup("/wt/local", Err("database unavailable".into())).is_err()
+        );
+        assert!(
+            GitLoc::from_checked_lookup("/wt/local", Ok(Some("garbage".into())))
+                .unwrap_err()
+                .contains("unrecognised worktree location")
         );
         assert!(matches!(
             GitLoc::from_db("/wt/local", None),
