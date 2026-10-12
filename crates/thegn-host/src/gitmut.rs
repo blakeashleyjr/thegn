@@ -679,10 +679,10 @@ fn custom_command_result(
             if redact_failure {
                 GitOpResult::Err(format!("custom command failed ({status})"))
             } else {
-                let redacted = thegn_core::ci_log::redact(&stderr);
+                let sanitized = thegn_svc::lsp::sanitize_for_terminal(&stderr);
+                let redacted = thegn_core::ci_log::redact(&sanitized);
                 let tail: Vec<String> = redacted
                     .lines()
-                    .map(thegn_svc::lsp::sanitize_for_terminal)
                     .filter(|line| !line.trim().is_empty())
                     .map(|line| line.chars().take(200).collect())
                     .collect();
@@ -951,7 +951,7 @@ mod tests {
         let loc = GitLoc::Local(dir.clone());
         match execute(
             GitOp::Custom {
-                command: "printf 'fatal: https://user:hunter2@example.invalid/r.git\\n\\033]0;owned\\007bad\\033[31mred\\n' >&2; exit 3".into(),
+                command: "printf 'fatal: https://user:hunter2@example.invalid/r.git\\nghp_1234567890\\033]0;a b\\007ABCDEFGHIJ1234567890\\n\\033]0;owned\\007bad\\033[31mred\\n' >&2; exit 3".into(),
                 capture: false,
             },
             &loc,
@@ -960,6 +960,7 @@ mod tests {
             GitOpResult::Err(msg) => {
                 assert!(msg.starts_with("command failed"));
                 assert!(!msg.contains("hunter2"));
+                assert!(!msg.contains("ghp_1234567890"));
                 assert!(msg.contains(thegn_core::ci_log::REDACTION_MARKER));
                 assert!(!msg.contains('\u{1b}'));
                 assert!(!msg.contains('\u{7}'));
