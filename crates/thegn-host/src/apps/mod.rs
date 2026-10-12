@@ -410,15 +410,15 @@ pub fn build_observe_tile(
     hook: tg_kit::ChangeHook,
     cfg: &thegn_core::config_observe::ObserveConfig,
     rt: tokio::runtime::Handle,
+    theme: Theme,
     sampler_thread_start: impl FnOnce() + Send + 'static,
 ) -> Result<Box<dyn AppTile>, String> {
-    let tile = gtui_embed::embed::ObserveTile::new(hook, cfg, rt, sampler_thread_start)
+    let tile = gtui_embed::embed::ObserveTile::new(hook, cfg, rt, theme, sampler_thread_start)
         .map_err(|error| error.to_string())?;
     Ok(Box::new(tile))
 }
 
 /// Parse a `Palette` `"R;G;B"` fragment to an sRGB triple (missing channels → 0).
-#[allow(dead_code)] // exercised by the kit_theme tests below; see kit_theme
 fn rgb(frag: &str) -> tg_kit::Rgb {
     let mut it = frag.split(';').map(|n| n.trim().parse::<u8>().unwrap_or(0));
     (
@@ -433,11 +433,6 @@ fn rgb(frag: &str) -> tg_kit::Rgb {
 /// `[theme.colors]` overrides included). The field mapping mirrors
 /// [`tg_kit::Theme::prism`]; a parity test pins the two together.
 ///
-/// NOTE: no render-path caller yet — `build_observe_tile` does not pass a
-/// theme, so the Observe tile currently draws in gtui's own default colors
-/// rather than the user's palette. The converter and its parity tests are
-/// ready for whoever threads it through.
-#[allow(dead_code)]
 pub fn kit_theme(p: &Palette) -> Theme {
     Theme {
         bg0: rgb(&p.bg0),
