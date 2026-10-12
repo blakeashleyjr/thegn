@@ -64,8 +64,30 @@ struct Writer {
 struct QueueState {
     latest: Mutex<HashMap<String, Job>>,
     depth: AtomicUsize,
+    in_flight: AtomicUsize,
     dropped: AtomicU64,
     overflow_warned: AtomicBool,
+}
+
+struct InFlightGuard<'a> {
+    state: &'a QueueState,
+}
+
+impl<'a> InFlightGuard<'a> {
+    fn new(state: &'a QueueState) -> Self {
+        state.in_flight.fetch_add(1, Ordering::AcqRel);
+        Self { state }
+    }
+}
+
+impl Drop for InFlightGuard<'_> {
+    fn drop(&mut self) {
+        let previous = self.state.in_flight.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(
+            previous > 0,
+            "finished a job without an in-flight reservation"
+        );
+    }
 }
 
 fn writer() -> &'static Writer {
@@ -205,6 +227,7 @@ fn drain_retained(
     }
     if let Some(d) = db {
         while let Some(job) = retained.pop_front() {
+            let _in_flight = InFlightGuard::new(state);
             dequeue(state);
             job(d);
         }
@@ -279,12 +302,12 @@ pub(crate) fn shutdown_flush(timeout: Duration) -> ShutdownFlush {
 
 fn shutdown_flush_for(writer: &Writer, timeout: Duration) -> ShutdownFlush {
     let (ack_tx, ack_rx) = sync_channel(0);
-    let drained = writer.tx.send(Msg::Flush(ack_tx)).is_ok()
-        && ack_rx.recv_timeout(timeout).is_ok()
-        && writer.state.depth.load(Ordering::Acquire) == 0;
+    let acked = writer.tx.send(Msg::Flush(ack_tx)).is_ok() && ack_rx.recv_timeout(timeout).is_ok();
+    let pending =
+        writer.state.depth.load(Ordering::Acquire) + writer.state.in_flight.load(Ordering::Acquire);
     ShutdownFlush {
-        drained,
-        pending: writer.state.depth.load(Ordering::Acquire),
+        drained: acked && pending == 0,
+        pending,
         dropped: writer.state.dropped.load(Ordering::Relaxed),
     }
 }
@@ -558,6 +581,18 @@ mod tests {
 
         release_tx.send(()).unwrap();
         barrier(&writer);
+    }
+
+    #[test]
+    fn in_flight_guard_releases_count_during_unwind() {
+        let state = QueueState::default();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _in_flight = InFlightGuard::new(&state);
+            panic!("job panic");
+        }));
+
+        assert!(result.is_err());
+        assert_eq!(state.in_flight.load(Ordering::Acquire), 0);
     }
 
     #[test]
