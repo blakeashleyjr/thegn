@@ -28,12 +28,12 @@ pub fn decode_get(out: &str) -> Result<Option<MediaState>, MediaError> {
         ));
     };
     for key in ["payload", "info"] {
-        if let Some(wrapper) = object.get(key) {
-            if !wrapper.is_object() {
-                return Err(MediaError::Backend(format!(
-                    "mediaremote {key} wrapper must be an object"
-                )));
-            }
+        if let Some(wrapper) = object.get(key)
+            && !wrapper.is_object()
+        {
+            return Err(MediaError::Backend(format!(
+                "mediaremote {key} wrapper must be an object"
+            )));
         }
     }
     Ok(to_state(&value))
