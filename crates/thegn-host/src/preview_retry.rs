@@ -65,7 +65,7 @@ impl PendingCornerOob {
         if bytes.is_empty() {
             return;
         }
-        if self.draw.is_some() {
+        if visible && self.draw.is_some() {
             self.delete_pending = true;
         }
         self.draw = Some(bytes);
@@ -138,8 +138,8 @@ mod tests {
         let mut slot = PendingCornerOob::default();
         slot.require_delete();
         slot.retry(false, Err);
-        slot.offer_draw(vec![1], false, |_| Ok(()));
-        slot.offer_draw(vec![2], false, |_| Ok(()));
+        slot.offer_draw(vec![1], false, Err);
+        slot.offer_draw(vec![2], false, Err);
         assert_eq!(slot.state(), (true, Some([2].as_slice())));
 
         let submitted = RefCell::new(Vec::new());
@@ -175,10 +175,7 @@ mod tests {
             submitted.borrow_mut().push(bytes);
             Ok(())
         });
-        assert_eq!(
-            *submitted.borrow(),
-            vec![kitty_relay::delete_all().to_vec(), vec![2]]
-        );
+        assert_eq!(*submitted.borrow(), vec![vec![2]]);
     }
 
     #[test]
