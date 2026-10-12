@@ -142,10 +142,14 @@ fn list(json: bool) -> Result<()> {
 }
 
 fn add(cfg: &Config, pr: Option<u64>, worktree: Option<String>) -> Result<()> {
-    let root = repo_root()?;
-    let wt = super::resolve_worktree(worktree)
-        .to_string_lossy()
-        .into_owned();
+    let root = repo_root()?
+        .canonicalize()
+        .context("canonicalize repo root")?;
+    let explicit = worktree.is_some();
+    let wt_path = super::resolve_worktree(worktree)
+        .canonicalize()
+        .context("canonicalize PR worktree")?;
+    let wt = wt_path.to_string_lossy().into_owned();
     let loc = thegn_core::remote::GitLoc::from_db(&wt, None);
 
     // Resolve the PR: an explicit number, else whatever is open for this
@@ -157,23 +161,80 @@ fn add(cfg: &Config, pr: Option<u64>, worktree: Option<String>) -> Result<()> {
         Err(e) => anyhow::bail!("could not resolve a pull request: {}", e.describe()),
     };
 
+    let wt_main = integrate::main_checkout(&wt_path);
+    let wt_branch = loc
+        .git_out(&["rev-parse", "--abbrev-ref", "HEAD"])
+        .filter(|branch| !branch.is_empty());
+    let bound_worktree = bind_checkout(
+        &root,
+        &wt_path,
+        explicit,
+        wt_main.as_deref(),
+        wt_branch.as_deref(),
+        &status.head_ref_name,
+    )?;
+
     let db = Db::open()?;
+    let bound_worktree = bound_worktree
+        .as_ref()
+        .map(|path| path.to_string_lossy().into_owned());
     db.enqueue_pr(
         &root.to_string_lossy(),
         status.number,
-        Some(&wt),
+        bound_worktree.as_deref(),
         &status.head_ref_name,
         &status.base_ref_name,
         forge.id(),
     )?;
     let _ = cfg;
     outln!(
-        "Queued PR #{} ({} → {}).",
+        "Queued PR #{} ({} → {}){}.",
         status.number,
         status.head_ref_name,
-        status.base_ref_name
+        status.base_ref_name,
+        if bound_worktree.is_some() {
+            String::new()
+        } else {
+            " (number-only; no matching checkout bound)".to_string()
+        }
     );
     Ok(())
+}
+
+fn bind_checkout(
+    root: &Path,
+    wt: &Path,
+    explicit: bool,
+    wt_main: Option<&Path>,
+    wt_branch: Option<&str>,
+    pr_head: &str,
+) -> Result<Option<PathBuf>> {
+    let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let canonical_wt_main =
+        wt_main.map(|path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf()));
+    if canonical_wt_main.as_deref() != Some(canonical_root.as_path()) {
+        let worktree_repository = wt_main
+            .map(|path| format!("repository {}", path.display()))
+            .unwrap_or_else(|| "an unknown repository".to_string());
+        anyhow::bail!(
+            "worktree {} belongs to {}, not {}",
+            wt.display(),
+            worktree_repository,
+            root.display()
+        );
+    }
+    if wt_branch == Some(pr_head) {
+        return Ok(Some(wt.to_path_buf()));
+    }
+    if explicit {
+        anyhow::bail!(
+            "worktree {} is on branch {}, but PR head is {}",
+            wt.display(),
+            wt_branch.unwrap_or("unknown"),
+            pr_head
+        );
+    }
+    Ok(None)
 }
 
 fn rm(number: u64) -> Result<()> {
@@ -310,6 +371,131 @@ fn drain_json(out: &pr_driver::PrOutcome) -> serde_json::Value {
         // scripted drain can tell "nothing to do" from "couldn't look".
         "warnings": out.warnings,
     })
+}
+
+#[cfg(test)]
+mod bind_checkout_tests {
+    use super::*;
+
+    #[test]
+    fn binding_requires_repo_ownership_and_matches_branch_or_is_number_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo);
+        let root = integrate::main_checkout(&repo).unwrap();
+        let wt = repo.canonicalize().unwrap();
+        let wt_main = integrate::main_checkout(&wt).unwrap();
+        let cases = [
+            ("matching", Some(root.as_path()), Some("feat"), false, true),
+            (
+                "explicit mismatch",
+                Some(wt_main.as_path()),
+                Some("other"),
+                true,
+                false,
+            ),
+            (
+                "implicit mismatch",
+                Some(wt_main.as_path()),
+                Some("other"),
+                false,
+                true,
+            ),
+            (
+                "different repository",
+                Some(Path::new("/other")),
+                Some("feat"),
+                false,
+                false,
+            ),
+        ];
+        for (name, wt_main, branch, explicit, succeeds) in cases {
+            let result = bind_checkout(&root, &wt, explicit, wt_main, branch, "feat");
+            if succeeds && branch == Some("feat") {
+                assert_eq!(result.unwrap().as_deref(), Some(wt.as_path()), "{name}");
+            } else if succeeds {
+                assert_eq!(
+                    result.unwrap(),
+                    None,
+                    "{name}: implicit mismatch is number-only"
+                );
+            } else {
+                let error = result.unwrap_err().to_string();
+                assert!(error.contains(&wt.display().to_string()), "{name}: {error}");
+                match name {
+                    "explicit mismatch" => {
+                        assert!(error.contains("other") && error.contains("feat"), "{error}");
+                    }
+                    "different repository" => assert!(error.contains("/other"), "{error}"),
+                    _ => unreachable!("unexpected refusing case: {name}"),
+                }
+            }
+        }
+    }
+
+    #[expect(clippy::disallowed_methods)]
+    fn init_repo(path: &Path) {
+        thegn_core::fsperm::restrict_dir_to_owner(path).unwrap();
+        let status = thegn_core::util::git_cmd(path)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .args(["init"])
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    #[test]
+    fn worktree_from_another_repository_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_a = dir.path().join("a");
+        let repo_b = dir.path().join("b");
+        std::fs::create_dir(&repo_a).unwrap();
+        std::fs::create_dir(&repo_b).unwrap();
+        init_repo(&repo_a);
+        init_repo(&repo_b);
+        let root = integrate::main_checkout(&repo_a).unwrap();
+        let wt = repo_b.canonicalize().unwrap();
+        let wt_main = integrate::main_checkout(&wt).unwrap();
+        assert!(
+            bind_checkout(&root, &wt, true, Some(&wt_main), Some("feat"), "feat").is_err(),
+            "a worktree from repo B cannot be stored under repo A's queue"
+        );
+    }
+
+    #[test]
+    fn equivalent_path_spellings_bind_to_the_same_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo);
+        let root = integrate::main_checkout(&repo).unwrap();
+        let wt = repo.canonicalize().unwrap();
+        let wt_main = integrate::main_checkout(&wt).unwrap();
+        let alias_dir = root.parent().unwrap().join("alias");
+        std::fs::create_dir(&alias_dir).unwrap();
+        let alternate_root = alias_dir.join("..").join(root.file_name().unwrap());
+        assert_ne!(root, alternate_root, "fixture uses distinct path spellings");
+        assert_eq!(
+            alternate_root.canonicalize().unwrap(),
+            wt_main.canonicalize().unwrap()
+        );
+
+        assert_eq!(
+            bind_checkout(
+                &alternate_root,
+                &wt,
+                false,
+                Some(&wt_main),
+                Some("feat"),
+                "feat"
+            )
+            .unwrap()
+            .as_deref(),
+            Some(wt.as_path()),
+            "equivalent repository path spellings must remain bound"
+        );
+    }
 }
 
 #[cfg(test)]
