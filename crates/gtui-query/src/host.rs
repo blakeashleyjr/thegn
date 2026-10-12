@@ -292,6 +292,8 @@ mod tests {
     #[test]
     fn query_uses_inclusive_requested_range_and_preserves_sample_order() {
         let source = HostSource::try_new().unwrap();
+        source.set_active(false);
+        wait_for("worker parked", || source.in_park.load(Ordering::Acquire));
         let mut ring = source.ring.lock().unwrap();
         for (ts, cpu) in [(10.0, 10), (20.0, 20), (20.0, 21), (30.0, 30)] {
             ring.push_back((
