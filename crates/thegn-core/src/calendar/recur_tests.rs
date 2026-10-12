@@ -1100,8 +1100,8 @@ fn the_gap_policy_can_drop_an_occurrence_that_does_not_exist() {
 }
 
 #[test]
-fn an_instant_seeded_recurrence_expands_in_the_home_zone() {
-    // A provider that hands back absolute timestamps still recurs sensibly.
+fn an_instant_seeded_recurrence_expands_in_utc() {
+    // Absolute DTSTART recurrence candidates stay UTC-shaped and UTC-timed.
     let rec = Recurrence {
         rules: vec![RRule::parse("FREQ=DAILY;COUNT=3").unwrap()],
         ..Default::default()
@@ -1118,7 +1118,7 @@ fn an_instant_seeded_recurrence_expands_in_the_home_zone() {
         GapPolicy::ShiftForward,
     );
     assert_eq!(occ.len(), 3);
-    assert!(matches!(occ[0], EventTime::Zoned { .. }));
+    assert!(matches!(occ[0], EventTime::Instant { .. }));
 }
 
 #[test]
@@ -1482,9 +1482,9 @@ fn until_keeps_its_value_type_through_a_round_trip() {
 }
 
 #[test]
-fn an_instant_or_all_day_series_resolves_instants_in_the_home_zone() {
+fn an_instant_series_uses_utc_while_a_date_series_uses_the_home_zone() {
     let home = chrono_tz::America::Chicago;
-    assert_eq!(series_zone(&utc(2026, 8, 3, 14, 0), home), home);
+    assert_eq!(series_zone(&utc(2026, 8, 3, 14, 0), home), chrono_tz::UTC);
     assert_eq!(
         series_zone(
             &EventTime::Date {
