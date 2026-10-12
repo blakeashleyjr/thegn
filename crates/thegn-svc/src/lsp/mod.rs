@@ -2324,9 +2324,9 @@ mod tests {
 
     #[test]
     fn iterative_symbol_projection_has_stable_total_cap() {
-        // Anything a server can deliver passed the 64-level JSON preflight, so
-        // build the deepest admissible chain (object → children array per
-        // level) plus enough breadth to cross the total cap by one.
+        // Keep the chain within the 64-level JSON preflight, including the
+        // outer result array and each symbol's children array, then add enough
+        // breadth to cross the total projection cap by one.
         let symbol = |name: String, line: usize, children: Vec<Value>| {
             json!({
                 "name": name,
@@ -2335,7 +2335,7 @@ mod tests {
                 "children": children
             })
         };
-        let levels = limits::MAX_JSON_DEPTH / 2 - 2;
+        let levels = limits::MAX_JSON_DEPTH / 2 - 3;
         let mut chain = symbol("leaf".into(), 0, vec![]);
         for depth in 0..levels {
             chain = symbol(format!("d{depth}"), depth, vec![chain]);
@@ -2378,6 +2378,19 @@ mod tests {
         );
         assert_eq!(bounded_uri_to_path("file:///a%01b"), None);
         assert_eq!(bounded_uri_to_path("file:///a%20b"), Some("/a b".into()));
+    }
+
+    #[test]
+    fn terminal_projection_neutralizes_control_families_in_combined_text() {
+        let input = "before\u{1b}]52;c;secret\u{7}x\u{1b}[31mred\u{1b}_apc\u{1b}Pdcs\u{90}c1\u{9b}31m\nnext";
+        let output = sanitize_for_terminal(input);
+        assert!(output.starts_with("beforex[31mred_apcPdcs"));
+        assert!(output.contains("\nnext"));
+        assert!(
+            !output
+                .chars()
+                .any(|ch| ch.is_control() && !matches!(ch, '\n' | '\t'))
+        );
     }
 
     fn publish_frame(uri: &str, message: &str) -> Vec<u8> {
@@ -2520,13 +2533,15 @@ mod tests {
 
     #[test]
     fn wide_symbol_children_do_not_clone_parent_name_per_child() {
-        // 4096 children under a 64 KiB parent name: cloning the name per push
-        // would retain 256 MiB before any cap. Emission is byte-accounted.
+        // 4096 children under a parent name that fits comfortably within the
+        // response budget: cloning it per push would exceed that budget long
+        // before the child count cap. Emission is byte-accounted.
+        let parent_name_bytes = limits::MAX_SCALAR_STRING_BYTES / 4;
         let children: Vec<Value> = (0..limits::MAX_CONTAINER_ITEMS)
             .map(|index| json!({ "name": format!("c{index}"), "kind": 12 }))
             .collect();
         let parent = json!([{
-            "name": "p".repeat(limits::MAX_SCALAR_STRING_BYTES),
+            "name": "p".repeat(parent_name_bytes),
             "kind": 5,
             "children": children
         }]);
@@ -2547,7 +2562,7 @@ mod tests {
         );
         assert_eq!(
             symbols[1].container.as_deref().map(str::len),
-            Some(limits::MAX_SCALAR_STRING_BYTES)
+            Some(parent_name_bytes)
         );
     }
 
