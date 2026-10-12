@@ -13,7 +13,9 @@
 //! default (the strict check lives in `thegn config validate`). The
 //! home-manager module renders the file; keys match the serde field names.
 
-use crate::config_defaults::{default_git_context, default_prompt_kind, default_true};
+use crate::config_defaults::{
+    default_custom_command_timeout_secs, default_git_context, default_prompt_kind, default_true,
+};
 use crate::env::Environment;
 use crate::remote::GitLoc;
 use crate::resource_alert;
@@ -2221,6 +2223,11 @@ pub struct GitCommand {
     pub description: Option<String>,
     #[serde(default)]
     pub output: GitCmdOutput,
+    /// Wall-clock limit in seconds for `none` and `popup` output modes. These
+    /// captured modes accept 1..=86400; terminal-mode commands run in a pane
+    /// and are not timed by this setting.
+    #[serde(default = "default_custom_command_timeout_secs")]
+    pub timeout_secs: u64,
     #[serde(default)]
     pub prompts: Vec<GitPrompt>,
 }
