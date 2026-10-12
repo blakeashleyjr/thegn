@@ -81,9 +81,17 @@ fn run_with_log_root(
         Err(error) => {
             let stderr = format!("failed to start hook: {error}");
             let log_error = allocation_error.or_else(|| {
-                write_log(&log_path, context, HookRunState::Failed, "", &stderr)
-                    .err()
-                    .map(|error| error.to_string())
+                write_log(
+                    &log_path,
+                    context,
+                    HookRunState::Failed,
+                    None,
+                    Duration::ZERO,
+                    "",
+                    &stderr,
+                )
+                .err()
+                .map(|error| error.to_string())
             });
             return HookRunResult {
                 command: spec.command.clone(),
@@ -145,15 +153,17 @@ fn run_with_log_root(
     } else {
         HookRunState::Failed
     };
+    let code = status.as_ref().and_then(|status| status.code());
+    let elapsed = started.elapsed();
     let log_error = allocation_error.or_else(|| {
-        write_log(&log_path, context, state, &stdout, &stderr)
+        write_log(&log_path, context, state, code, elapsed, &stdout, &stderr)
             .err()
             .map(|error| error.to_string())
     });
     HookRunResult {
         command: spec.command.clone(),
         state,
-        code: status.and_then(|s| s.code()),
+        code,
         stdout,
         stderr,
         log_path,
@@ -529,21 +539,9 @@ fn log_path(
     worktree: &str,
     event: thegn_core::hooks::HookEvent,
 ) -> std::io::Result<PathBuf> {
-    let label: String = thegn_core::util::slugify(worktree)
-        .chars()
-        .take(48)
-        .collect();
-    let label = if label.is_empty() { "worktree" } else { &label };
-    let digest = thegn_core::identity::digest_parts(
-        b"thegn/hook-log-worktree",
-        &[thegn_core::identity::BytePart::new(worktree.as_bytes())],
-    )
-    .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string()))?;
-    let suffix: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
-    let slug = format!("{label}-{suffix}");
+    let slug = log_dir_name(worktree)?;
     let dir = log_root.join(slug);
-    std::fs::create_dir_all(&dir)?;
-    crate::platform::restrict_dir_owner_only_checked(&dir)?;
+    thegn_core::fsperm::ensure_private_dir(&dir)?;
 
     let event_name = event.as_str().to_string();
     let key = (dir.clone(), event_name.clone());
@@ -608,6 +606,24 @@ fn log_path(
     ))
 }
 
+fn worktree_digest(worktree: &str) -> std::io::Result<String> {
+    let digest = thegn_core::identity::digest_parts(
+        b"thegn/hook-log-worktree",
+        &[thegn_core::identity::BytePart::new(worktree.as_bytes())],
+    )
+    .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string()))?;
+    Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+fn log_dir_name(worktree: &str) -> std::io::Result<String> {
+    let label: String = thegn_core::util::slugify(worktree)
+        .chars()
+        .take(48)
+        .collect();
+    let label = if label.is_empty() { "worktree" } else { &label };
+    Ok(format!("{label}-{}", worktree_digest(worktree)?))
+}
+
 const FAILURE_TAIL_BYTES: usize = 4096;
 
 fn failure_tail(output: &str) -> String {
@@ -652,16 +668,20 @@ fn write_log(
     path: &Path,
     context: &HookContext,
     state: HookRunState,
+    code: Option<i32>,
+    elapsed: Duration,
     stdout: &str,
     stderr: &str,
 ) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-        crate::platform::restrict_dir_owner_only_checked(parent)?;
+        thegn_core::fsperm::ensure_private_dir(parent)?;
     }
     let line = format!(
-        "event={} state={state:?} command=[redacted]\nstdout:\n{}\nstderr:\n{}\n",
+        "event={} state={state:?} code={} elapsed_ms={} worktree_digest={} command=[redacted]\nstdout:\n{}\nstderr:\n{}\n",
         context.event.as_str(),
+        code.map_or_else(|| "none".to_string(), |code| code.to_string()),
+        elapsed.as_millis(),
+        worktree_digest(&context.worktree)?,
         redact_output(stdout),
         redact_output(stderr),
     );
@@ -796,6 +816,85 @@ mod tests {
         assert!(result.log_path.starts_with(dir.path()));
         let contents = std::fs::read_to_string(&result.log_path).unwrap();
         assert!(contents.contains("stdout:\nlogged"));
+    }
+
+    #[test]
+    fn hook_log_symlink_directory_is_rejected_without_touching_victim() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let victim = root.path().join("victim");
+        std::fs::create_dir(&victim).unwrap();
+        let worktree = format!("/isolated-hook-symlink-{}", std::process::id());
+        let link = root.path().join(log_dir_name(&worktree).unwrap());
+        if let Err(error) = thegn_core::fsperm::create_symlink(&victim, &link, true) {
+            tracing::debug!(%error, "skipping hook log symlink test");
+            return;
+        }
+
+        let initial_mode = thegn_core::fsperm::mode_bits(&victim).unwrap();
+        if let Some(mode) = initial_mode {
+            assert_eq!(mode, 0o755, "temporary victim directory should be 0755");
+        }
+        let result = run_with_log_root(
+            &spec("true", 2),
+            &context_with_worktree(worktree),
+            cwd.path(),
+            root.path(),
+        );
+
+        assert!(result.succeeded());
+        assert!(result.log_error.is_some());
+        assert_eq!(std::fs::read_dir(&victim).unwrap().count(), 0);
+        if initial_mode.is_some() {
+            assert_eq!(
+                thegn_core::fsperm::mode_bits(&victim).unwrap(),
+                initial_mode
+            );
+        }
+    }
+
+    #[test]
+    fn hook_log_path_rejects_symlink_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let victim = tempfile::tempdir().unwrap();
+        let worktree = format!("/isolated-hook-path-symlink-{}", std::process::id());
+        let link = root.path().join(log_dir_name(&worktree).unwrap());
+        if let Err(error) = thegn_core::fsperm::create_symlink(victim.path(), &link, true) {
+            tracing::debug!(%error, "skipping hook log path symlink test");
+            return;
+        }
+
+        assert!(log_path(root.path(), &worktree, HookEvent::PostCreate).is_err());
+    }
+
+    #[test]
+    fn hook_log_header_records_exit_code_and_spawn_failure_without_code() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let result = run_with_log_root(&spec("exit 3", 2), &context(), cwd.path(), root.path());
+        assert_eq!(result.code, Some(3));
+        let contents = std::fs::read_to_string(&result.log_path).unwrap();
+        assert!(contents.contains("code=3"));
+        assert!(contents.contains("elapsed_ms="));
+        assert!(contents.contains(&format!(
+            "worktree_digest={}",
+            worktree_digest("/worktree").unwrap()
+        )));
+
+        let failed_cwd = root.path().join("missing-cwd");
+        let spawn_failure =
+            run_with_log_root(&spec("true", 2), &context(), &failed_cwd, root.path());
+        assert_eq!(spawn_failure.code, None);
+        let contents = std::fs::read_to_string(&spawn_failure.log_path).unwrap();
+        assert!(contents.contains("code=none"));
+        assert!(contents.contains("elapsed_ms=0"));
+    }
+
+    fn context_with_worktree(worktree: String) -> HookContext {
+        HookContext {
+            worktree,
+            ..context()
+        }
     }
 
     #[test]
@@ -1047,6 +1146,8 @@ mod tests {
             &path,
             &context(),
             HookRunState::Failed,
+            Some(3),
+            Duration::from_millis(12),
             "ACCESS_KEY=do-not-write",
             "Bearer do-not-write",
         )
@@ -1062,8 +1163,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("not-a-file");
         std::fs::create_dir(&path).unwrap();
-        let error = write_log(&path, &context(), HookRunState::Failed, "output", "error")
-            .expect_err("a directory cannot be opened as an append log");
+        let error = write_log(
+            &path,
+            &context(),
+            HookRunState::Failed,
+            Some(1),
+            Duration::ZERO,
+            "output",
+            "error",
+        )
+        .expect_err("a directory cannot be atomically replaced as a hook log");
         assert!(!error.to_string().is_empty());
 
         let result = HookRunResult {
@@ -1086,7 +1195,16 @@ mod tests {
         let path = log_path(dir.path(), "/repo/worktree", HookEvent::PostCreate).unwrap();
         std::fs::write(&path, b"stale").unwrap();
 
-        write_log(&path, &context(), HookRunState::Succeeded, "fresh", "").unwrap();
+        write_log(
+            &path,
+            &context(),
+            HookRunState::Succeeded,
+            Some(0),
+            Duration::from_millis(1),
+            "fresh",
+            "",
+        )
+        .unwrap();
 
         let contents = std::fs::read_to_string(path).unwrap();
         assert!(!contents.contains("stale"));
@@ -1100,7 +1218,16 @@ mod tests {
         let other = path.with_file_name("other.log");
         std::fs::hard_link(&path, &other).unwrap();
 
-        write_log(&path, &context(), HookRunState::Succeeded, "fresh", "").unwrap();
+        write_log(
+            &path,
+            &context(),
+            HookRunState::Succeeded,
+            Some(0),
+            Duration::from_millis(1),
+            "fresh",
+            "",
+        )
+        .unwrap();
 
         assert!(
             std::fs::read_to_string(&path)
