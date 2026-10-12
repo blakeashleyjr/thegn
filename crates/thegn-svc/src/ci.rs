@@ -24,7 +24,7 @@ use thegn_core::secretref::BareAs;
 use std::collections::VecDeque;
 use std::io::Read;
 use std::process::{Command, Stdio};
-use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, atomic::AtomicBool};
 use std::time::Duration;
 
 /// Provider-side bounds are deliberately finite even before the host applies
@@ -108,6 +108,15 @@ pub struct CiRunDetail {
 /// list here: `kind_coverage` below pins that every non-reserved kind
 /// constructs a client.
 pub fn provider_for(loc: &GitLoc, cfg: &CiConfig) -> Option<CiClient> {
+    provider_for_cancellable(loc, cfg, Arc::new(AtomicBool::new(false)))
+}
+
+/// Pick a CI provider whose subprocesses observe the caller-owned cancellation flag.
+pub fn provider_for_cancellable(
+    loc: &GitLoc,
+    cfg: &CiConfig,
+    cancel: Arc<AtomicBool>,
+) -> Option<CiClient> {
     if cfg.provider == CiProviderKind::None {
         return None;
     }
@@ -119,9 +128,10 @@ pub fn provider_for(loc: &GitLoc, cfg: &CiConfig) -> Option<CiClient> {
         let remote = origin.as_deref().and_then(parse_github_remote)?;
         return Some(Box::new(GithubCi {
             remote: Some(remote),
+            cancel,
         }));
     }
-    client_for_system_with_config(system, cfg)
+    client_for_system_with_config_and_cancel(system, cfg, cancel)
 }
 
 /// The system → client factory (pure; `provider_for` adds remote/file sniffing).
@@ -133,9 +143,20 @@ pub fn client_for_system(system: CiSystem) -> Option<CiClient> {
 /// configured token once, at construction. The value is injected into the
 /// child environment (never argv) for every `glab` call.
 fn client_for_system_with_config(system: CiSystem, cfg: &CiConfig) -> Option<CiClient> {
+    client_for_system_with_config_and_cancel(system, cfg, Arc::new(AtomicBool::new(false)))
+}
+
+fn client_for_system_with_config_and_cancel(
+    system: CiSystem,
+    cfg: &CiConfig,
+    cancel: Arc<AtomicBool>,
+) -> Option<CiClient> {
     match system {
-        CiSystem::GithubActions => Some(Box::new(GithubCi { remote: None })),
-        CiSystem::GitlabCi => Some(Box::new(GitlabCi::from_config(cfg))),
+        CiSystem::GithubActions => Some(Box::new(GithubCi {
+            remote: None,
+            cancel,
+        })),
+        CiSystem::GitlabCi => Some(Box::new(GitlabCi::from_config(cfg, cancel))),
         CiSystem::Drone | CiSystem::Woodpecker | CiSystem::Jenkins | CiSystem::Argo => None,
     }
 }
@@ -275,7 +296,7 @@ pub type CiClient = Box<dyn CiProvider>;
 
 // === helpers ===============================================================
 
-fn run_cli(cmd: Command) -> Result<String, CiError> {
+fn run_cli(cmd: Command, cancel: &AtomicBool) -> Result<String, CiError> {
     run_cli_within(
         cmd,
         crate::issue::gh_run::Limits {
@@ -283,17 +304,22 @@ fn run_cli(cmd: Command) -> Result<String, CiError> {
             max_stdout: CI_CLI_MAX_STDOUT,
             max_stderr: CI_CLI_MAX_STDERR,
         },
+        cancel,
     )
 }
 
 fn run_cli_within(
     mut cmd: Command,
     limits: crate::issue::gh_run::Limits,
+    cancel: &AtomicBool,
 ) -> Result<String, CiError> {
     use crate::issue::gh_run::run_blocking;
     use crate::plugin::proc::bounded_group_termination_supported;
 
     if !bounded_group_termination_supported() {
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(CiError::Other("CI provider command cancelled".into()));
+        }
         // Preserve the established platform behavior where process-group
         // termination is unavailable; bounded tree ownership is supported on
         // platforms accepted by the shared runner.
@@ -307,8 +333,7 @@ fn run_cli_within(
         };
     }
 
-    let cancel = AtomicBool::new(false);
-    run_blocking(cmd, limits, &cancel).map_err(ci_run_error)
+    run_blocking(cmd, limits, cancel).map_err(ci_run_error)
 }
 
 fn ci_run_error(error: crate::issue::gh_run::RunError) -> CiError {
@@ -347,7 +372,7 @@ fn read_capped<R: Read>(mut reader: R, max: usize) -> Result<Vec<u8>, CiError> {
 }
 
 /// Run a command while bounding stdout before it is buffered in memory.
-fn run_cli_capped(cmd: Command, max: usize) -> Result<String, CiError> {
+fn run_cli_capped(cmd: Command, max: usize, cancel: &AtomicBool) -> Result<String, CiError> {
     use crate::plugin::proc::bounded_group_termination_supported;
     if bounded_group_termination_supported() {
         return run_cli_within(
@@ -357,7 +382,11 @@ fn run_cli_capped(cmd: Command, max: usize) -> Result<String, CiError> {
                 max_stdout: max,
                 max_stderr: CI_CLI_MAX_STDERR,
             },
+            cancel,
         );
+    }
+    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err(CiError::Other("CI provider command cancelled".into()));
     }
     let mut cmd = cmd;
     let mut child = cmd
@@ -416,7 +445,7 @@ fn run_cli_capped(cmd: Command, max: usize) -> Result<String, CiError> {
 /// reader instead and keep a bounded deque; stderr is drained concurrently so
 /// a noisy failed provider cannot deadlock the child.  The status and error
 /// classification remain identical to [`run_cli`].
-fn run_bounded_log(cmd: Command) -> Result<CiLog, CiError> {
+fn run_bounded_log(cmd: Command, cancel: &AtomicBool) -> Result<CiLog, CiError> {
     run_bounded_log_within(
         cmd,
         crate::issue::gh_run::Limits {
@@ -426,25 +455,30 @@ fn run_bounded_log(cmd: Command) -> Result<CiLog, CiError> {
             max_stdout: PROVIDER_LOG_MAX_BYTES,
             max_stderr: CI_CLI_MAX_STDERR,
         },
+        cancel,
     )
 }
 
 fn run_bounded_log_within(
     cmd: Command,
     limits: crate::issue::gh_run::Limits,
+    cancel: &AtomicBool,
 ) -> Result<CiLog, CiError> {
     use crate::issue::gh_run::run_blocking_streaming;
     use crate::plugin::proc::bounded_group_termination_supported;
 
     if bounded_group_termination_supported() {
-        let cancel = AtomicBool::new(false);
         let (log_result, _status) =
-            run_blocking_streaming(cmd, limits, &cancel, |reader: &mut dyn Read| {
+            run_blocking_streaming(cmd, limits, cancel, |reader: &mut dyn Read| {
                 collect_log(reader)
             })
             .map_err(ci_run_error)?;
         let (text, truncated) = log_result?;
         return Ok(CiLog { text, truncated });
+    }
+
+    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err(CiError::Other("CI provider command cancelled".into()));
     }
 
     let mut cmd = cmd;
@@ -800,6 +834,7 @@ pub struct GithubCi {
     // unbound form is retained for the public system factory and resolves once
     // when the operation starts.
     remote: Option<GithubRemote>,
+    cancel: Arc<AtomicBool>,
 }
 
 impl GithubCi {
@@ -850,7 +885,7 @@ impl CiProvider for GithubCi {
             args.push("--branch");
             args.push(b);
         }
-        let json = run_cli(self.command(loc, &args)?)?;
+        let json = run_cli(self.command(loc, &args)?, &self.cancel)?;
         let (runs, discarded_rows) = parse_gh_runs_with_discarded(&json).map_err(CiError::Other)?;
         if discarded_rows > 0 {
             tracing::warn!(target: "thegn::ci", discarded_rows, "discarded malformed GitHub run rows");
@@ -864,7 +899,7 @@ impl CiProvider for GithubCi {
     fn run_detail(&self, loc: &GitLoc, run_id: &str) -> Result<CiRunDetail, CiError> {
         let args = github_run_detail_argv(run_id)?;
         let argv: Vec<_> = args.iter().map(String::as_str).collect();
-        let json = run_cli(self.command(loc, &argv)?)?;
+        let json = run_cli(self.command(loc, &argv)?, &self.cancel)?;
         let value: serde_json::Value = serde_json::from_str(&json)
             .map_err(|error| CiError::Other(format!("invalid provider run response: {error}")))?;
         let observed = value
@@ -905,12 +940,17 @@ impl CiProvider for GithubCi {
         // `gh run view --job <id> --log` (job ids are globally addressable).
         validate_ci_id(_run_id)?;
         validate_ci_id(job_id)?;
-        run_bounded_log(self.command(loc, &["run", "view", "--job", job_id, "--log"])?)
+        run_bounded_log(
+            self.command(loc, &["run", "view", "--job", job_id, "--log"])?,
+            &self.cancel,
+        )
     }
 
     fn workflows(&self, loc: &GitLoc) -> Result<Vec<CiWorkflow>, CiError> {
-        let json =
-            run_cli(self.command(loc, &["workflow", "list", "--json", "id,name,path,state"])?)?;
+        let json = run_cli(
+            self.command(loc, &["workflow", "list", "--json", "id,name,path,state"])?,
+            &self.cancel,
+        )?;
         parse_gh_workflows(&json).map_err(CiError::Other)
     }
 
@@ -922,19 +962,19 @@ impl CiProvider for GithubCi {
     ) -> Result<(), CiError> {
         let args = github_workflow_argv(workflow, inputs)?;
         let argv: Vec<&str> = args.iter().map(String::as_str).collect();
-        run_cli(self.command(loc, &argv)?).map(|_| ())
+        run_cli(self.command(loc, &argv)?, &self.cancel).map(|_| ())
     }
 
     fn rerun(&self, loc: &GitLoc, run_id: &str, scope: RerunScope) -> Result<(), CiError> {
         let args = github_rerun_argv(run_id, scope)?;
         let argv: Vec<_> = args.iter().map(String::as_str).collect();
-        run_cli(self.command(loc, &argv)?).map(|_| ())
+        run_cli(self.command(loc, &argv)?, &self.cancel).map(|_| ())
     }
 
     fn cancel(&self, loc: &GitLoc, run_id: &str) -> Result<(), CiError> {
         let args = github_cancel_argv(run_id)?;
         let argv: Vec<_> = args.iter().map(String::as_str).collect();
-        run_cli(self.command(loc, &argv)?).map(|_| ())
+        run_cli(self.command(loc, &argv)?, &self.cancel).map(|_| ())
     }
 
     fn caps(&self) -> CiCaps {
@@ -1149,6 +1189,7 @@ impl GitlabCredential {
 pub struct GitlabCi {
     credential: GitlabCredential,
     host: Option<String>,
+    cancel: Arc<AtomicBool>,
 }
 
 impl thegn_core::seam::Probe for GitlabCi {
@@ -1164,13 +1205,14 @@ impl thegn_core::seam::Probe for GitlabCi {
 }
 
 impl GitlabCi {
-    fn from_config(cfg: &CiConfig) -> Self {
+    fn from_config(cfg: &CiConfig, cancel: Arc<AtomicBool>) -> Self {
         Self {
             credential: GitlabCredential::from_resolution(
                 &cfg.gitlab.token,
                 crate::secret::resolve_outcome(&cfg.gitlab.token, BareAs::Literal, "ci:gitlab"),
             ),
             host: (!cfg.gitlab.host.trim().is_empty()).then(|| cfg.gitlab.host.trim().to_string()),
+            cancel,
         }
     }
 
@@ -1234,7 +1276,10 @@ impl CiProvider for GitlabCi {
         let remote = self.remote(loc)?;
         let project_segment = Self::project_seg(&remote);
         let endpoint = gitlab_pipelines_endpoint(&project_segment, branch, limit)?;
-        let json = run_cli(self.command(loc, &remote, &["api", &endpoint])?)?;
+        let json = run_cli(
+            self.command(loc, &remote, &["api", &endpoint])?,
+            &self.cancel,
+        )?;
         let (runs, discarded) =
             parse_gitlab_pipelines_with_discarded(&json).map_err(CiError::Other)?;
         if discarded > 0 {
@@ -1253,7 +1298,10 @@ impl CiProvider for GitlabCi {
         // Pipeline header + its jobs (two calls; the jobs carry the states).
         let run_endpoint = gitlab_run_endpoint(&proj, run_id, "")?;
         let jobs_endpoint = gitlab_run_endpoint(&proj, run_id, "jobs")?;
-        let pipe_json = run_cli(self.command(loc, &remote, &["api", &run_endpoint])?)?;
+        let pipe_json = run_cli(
+            self.command(loc, &remote, &["api", &run_endpoint])?,
+            &self.cancel,
+        )?;
         let value: serde_json::Value = serde_json::from_str(&pipe_json).map_err(|error| {
             CiError::Other(format!("invalid provider pipeline response: {error}"))
         })?;
@@ -1276,8 +1324,11 @@ impl CiProvider for GitlabCi {
         for page in 1..=GITLAB_JOBS_MAX_PAGES {
             let endpoint = format!("{jobs_endpoint}?per_page={GITLAB_JOBS_PAGE_SIZE}&page={page}");
             let remaining = GITLAB_JOBS_MAX_BYTES.saturating_sub(bytes);
-            let jobs_json =
-                run_cli_capped(self.command(loc, &remote, &["api", &endpoint])?, remaining)?;
+            let jobs_json = run_cli_capped(
+                self.command(loc, &remote, &["api", &endpoint])?,
+                remaining,
+                &self.cancel,
+            )?;
             bytes = bytes.saturating_add(jobs_json.len());
             let page_rows =
                 serde_json::from_str::<Vec<serde_json::Value>>(&jobs_json).map_err(|error| {
@@ -1327,7 +1378,10 @@ impl CiProvider for GitlabCi {
         let remote = self.remote(loc)?;
         let proj = Self::project_seg(&remote);
         let endpoint = gitlab_job_trace_endpoint(&proj, job_id)?;
-        run_bounded_log(self.command(loc, &remote, &["api", &endpoint])?)
+        run_bounded_log(
+            self.command(loc, &remote, &["api", &endpoint])?,
+            &self.cancel,
+        )
     }
 
     fn workflows(&self, _loc: &GitLoc) -> Result<Vec<CiWorkflow>, CiError> {
@@ -1352,7 +1406,7 @@ impl CiProvider for GitlabCi {
             args.push(format!("{k}={v}"));
         }
         let argv: Vec<&str> = args.iter().map(String::as_str).collect();
-        run_cli(self.command(loc, &remote, &argv)?).map(|_| ())
+        run_cli(self.command(loc, &remote, &argv)?, &self.cancel).map(|_| ())
     }
 
     fn rerun(&self, loc: &GitLoc, run_id: &str, _scope: RerunScope) -> Result<(), CiError> {
@@ -1362,7 +1416,11 @@ impl CiProvider for GitlabCi {
         // GitLab: `retry` re-runs failed jobs; a fresh full run isn't a single
         // call, so both scopes map to retry (it's the closest primitive).
         let endpoint = gitlab_run_endpoint(&proj, run_id, "retry")?;
-        run_cli(self.command(loc, &remote, &["api", "-X", "POST", &endpoint])?).map(|_| ())
+        run_cli(
+            self.command(loc, &remote, &["api", "-X", "POST", &endpoint])?,
+            &self.cancel,
+        )
+        .map(|_| ())
     }
 
     fn cancel(&self, loc: &GitLoc, run_id: &str) -> Result<(), CiError> {
@@ -1370,7 +1428,11 @@ impl CiProvider for GitlabCi {
         let remote = self.remote(loc)?;
         let proj = Self::project_seg(&remote);
         let endpoint = gitlab_run_endpoint(&proj, run_id, "cancel")?;
-        run_cli(self.command(loc, &remote, &["api", "-X", "POST", &endpoint])?).map(|_| ())
+        run_cli(
+            self.command(loc, &remote, &["api", "-X", "POST", &endpoint])?,
+            &self.cancel,
+        )
+        .map(|_| ())
     }
 
     fn caps(&self) -> CiCaps {
@@ -1655,6 +1717,10 @@ mod tests {
         }
     }
 
+    fn test_cancel() -> AtomicBool {
+        AtomicBool::new(false)
+    }
+
     #[test]
     fn bounded_cli_times_out_a_hung_provider() {
         if !bounded_shell_available() {
@@ -1668,10 +1734,34 @@ mod tests {
                 cmd
             },
             test_limits(Duration::from_millis(200), 1024),
+            &test_cancel(),
         );
         assert!(
             matches!(result, Err(CiError::Other(message)) if message == "CI provider command timed out")
         );
+        assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn bounded_cli_observes_external_cancellation() {
+        if !bounded_shell_available() {
+            return;
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        let signal = Arc::clone(&cancel);
+        let start = std::time::Instant::now();
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                std::thread::sleep(Duration::from_millis(100));
+                signal.store(true, std::sync::atomic::Ordering::Relaxed);
+            });
+            let mut cmd = Command::new("sh");
+            cmd.args(["-c", "sleep 30"]);
+            let result = run_cli_within(cmd, test_limits(Duration::from_secs(10), 1024), &cancel);
+            assert!(
+                matches!(result, Err(CiError::Other(message)) if message == "CI provider command cancelled")
+            );
+        });
         assert!(start.elapsed() < Duration::from_secs(5));
     }
 
@@ -1688,6 +1778,7 @@ mod tests {
                 cmd
             },
             test_limits(Duration::from_secs(2), 1024),
+            &test_cancel(),
         );
         assert!(result.is_ok());
         assert!(start.elapsed() < Duration::from_secs(5));
@@ -1706,10 +1797,35 @@ mod tests {
                 cmd
             },
             test_limits(Duration::from_millis(200), 1024),
+            &test_cancel(),
         );
         assert!(
             matches!(result, Err(CiError::Other(message)) if message == "CI provider command timed out")
         );
+        assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn bounded_log_observes_external_cancellation() {
+        if !bounded_shell_available() {
+            return;
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        let signal = Arc::clone(&cancel);
+        let start = std::time::Instant::now();
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                std::thread::sleep(Duration::from_millis(100));
+                signal.store(true, std::sync::atomic::Ordering::Relaxed);
+            });
+            let mut cmd = Command::new("sh");
+            cmd.args(["-c", "sleep 30"]);
+            let result =
+                run_bounded_log_within(cmd, test_limits(Duration::from_secs(10), 1024), &cancel);
+            assert!(
+                matches!(result, Err(CiError::Other(message)) if message == "CI provider command cancelled")
+            );
+        });
         assert!(start.elapsed() < Duration::from_secs(5));
     }
 
@@ -1726,6 +1842,7 @@ mod tests {
                 cmd
             },
             test_limits(Duration::from_secs(2), 1024),
+            &test_cancel(),
         );
         let log = result.expect("bounded log should finish after killing the descendant");
         assert_eq!(log.text, "a\nb\n");
@@ -1740,12 +1857,20 @@ mod tests {
         let script = "printf 'fatal: authentication required\\n' >&2; exit 1";
         let mut cli = Command::new("sh");
         cli.args(["-c", script]);
-        let cli_error = run_cli_within(cli, test_limits(Duration::from_secs(2), 1024))
-            .expect_err("provider command should fail");
+        let cli_error = run_cli_within(
+            cli,
+            test_limits(Duration::from_secs(2), 1024),
+            &test_cancel(),
+        )
+        .expect_err("provider command should fail");
         let mut log = Command::new("sh");
         log.args(["-c", script]);
-        let log_error = run_bounded_log_within(log, test_limits(Duration::from_secs(2), 1024))
-            .expect_err("provider log command should fail");
+        let log_error = run_bounded_log_within(
+            log,
+            test_limits(Duration::from_secs(2), 1024),
+            &test_cancel(),
+        )
+        .expect_err("provider log command should fail");
         assert_eq!(log_error, cli_error);
     }
 
@@ -1761,6 +1886,7 @@ mod tests {
                 cmd
             },
             test_limits(Duration::from_secs(5), 1024),
+            &test_cancel(),
         );
         assert!(
             matches!(result, Err(CiError::Other(message)) if message == "provider output byte budget exhausted")
@@ -1776,6 +1902,7 @@ mod tests {
         let result = run_cli_within(
             Command::new(temp.path()),
             test_limits(Duration::from_secs(1), 1024),
+            &test_cancel(),
         );
         assert!(matches!(result, Err(CiError::Other(message)) if message
                 .strip_prefix("CI provider command failed: ")
@@ -1930,6 +2057,7 @@ mod tests {
                 explicit: true,
             },
             host: None,
+            ..GitlabCi::default()
         };
         let loc = GitLoc::for_worktree(std::path::Path::new("."));
         let command = client.command(&loc, &remote, &["api", &endpoint]).unwrap();
@@ -2313,6 +2441,7 @@ esac
         let remote = parse_github_remote("https://github.com/owner/repo.git").unwrap();
         let client = GithubCi {
             remote: Some(remote),
+            cancel: Arc::new(AtomicBool::new(false)),
         };
         client
             .runs(&loc, Some("feature&status=success"), 7)
@@ -2418,7 +2547,10 @@ esac
     #[test]
     fn provider_entry_points_reject_bad_identifiers_before_subprocesses() {
         let loc = GitLoc::for_worktree(std::path::Path::new("/does/not/exist"));
-        let github = GithubCi { remote: None };
+        let github = GithubCi {
+            remote: None,
+            cancel: Arc::new(AtomicBool::new(false)),
+        };
         let gitlab = GitlabCi::default();
 
         for error in [
@@ -2458,7 +2590,7 @@ esac
         let mut cfg = CiConfig::default();
         cfg.gitlab.token = "fixture-secret-token".into();
         cfg.gitlab.host = "gitlab.example.test".into();
-        let client = GitlabCi::from_config(&cfg);
+        let client = GitlabCi::from_config(&cfg, Arc::new(AtomicBool::new(false)));
         let loc = GitLoc::for_worktree(std::path::Path::new("."));
         let remote = GitlabRemote {
             host: "gitlab.example.test".into(),
@@ -2495,7 +2627,7 @@ esac
     fn gitlab_configured_token_refuses_remote_and_provider_transports() {
         let mut cfg = CiConfig::default();
         cfg.gitlab.token = "fixture-secret-token".into();
-        let configured = GitlabCi::from_config(&cfg);
+        let configured = GitlabCi::from_config(&cfg, Arc::new(AtomicBool::new(false)));
         let remote = GitlabRemote {
             host: "gitlab.example.test".into(),
             project: "g/r".into(),
@@ -2520,6 +2652,7 @@ esac
         let cli_managed = GitlabCi {
             credential: GitlabCredential::CliManaged,
             host: None,
+            ..GitlabCi::default()
         };
         assert!(
             cli_managed
@@ -2538,6 +2671,7 @@ esac
         let client = GitlabCi {
             credential,
             host: None,
+            ..GitlabCi::default()
         };
         let provider_loc = GitLoc::Provider {
             control_prefix: vec![
@@ -2584,7 +2718,7 @@ esac
         ] {
             let mut cfg = CiConfig::default();
             cfg.gitlab.token = reference;
-            let client = GitlabCi::from_config(&cfg);
+            let client = GitlabCi::from_config(&cfg, Arc::new(AtomicBool::new(false)));
             assert!(matches!(
                 client.command(&loc, &remote, &["api", "projects/g%2Fr/pipelines"]),
                 Err(CiError::Other(message))
@@ -2615,7 +2749,7 @@ esac
         );
         let mut cfg = CiConfig::default();
         cfg.gitlab.token.clear();
-        let client = GitlabCi::from_config(&cfg);
+        let client = GitlabCi::from_config(&cfg, Arc::new(AtomicBool::new(false)));
         let loc = GitLoc::for_worktree(std::path::Path::new("."));
         let remote = GitlabRemote {
             host: "gitlab.example.test".into(),
@@ -2799,13 +2933,34 @@ esac
 
     #[test]
     fn caps_are_set() {
-        assert!(GithubCi { remote: None }.caps().steps);
+        assert!(
+            GithubCi {
+                remote: None,
+                cancel: Arc::new(AtomicBool::new(false))
+            }
+            .caps()
+            .steps
+        );
         assert!(!GitlabCi::default().caps().steps);
-        assert!(GithubCi { remote: None }.caps().trigger);
+        assert!(
+            GithubCi {
+                remote: None,
+                cancel: Arc::new(AtomicBool::new(false))
+            }
+            .caps()
+            .trigger
+        );
         assert!(GitlabCi::default().caps().cancel);
         // GitLab's pipeline `retry` can't scope to failed jobs; offering the
         // distinction anyway would silently retry everything.
-        assert!(GithubCi { remote: None }.caps().rerun_failed);
+        assert!(
+            GithubCi {
+                remote: None,
+                cancel: Arc::new(AtomicBool::new(false))
+            }
+            .caps()
+            .rerun_failed
+        );
         assert!(!GitlabCi::default().caps().rerun_failed);
     }
 }
