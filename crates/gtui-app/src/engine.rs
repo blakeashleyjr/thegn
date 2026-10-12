@@ -162,6 +162,12 @@ const MAX_CONCURRENT_PANELS: usize = 4;
 const MAX_TARGETS_PER_PANEL: usize = 32;
 /// A panel that does not finish cannot hold the next refresh forever.
 const PANEL_DEADLINE: Duration = Duration::from_secs(15);
+type PanelQueryJob = (
+    u32,
+    String,
+    Option<Arc<dyn DataSource>>,
+    Vec<(String, Query)>,
+);
 
 impl QueryEngine {
     /// Spawn the engine on `rt` and return the command sender + result receiver.
@@ -324,12 +330,8 @@ impl QueryEngine {
         let mut jobs = jobs.into_iter();
         let spawn_job = |pending: &mut JoinSet<(u32, Vec<TargetUpdate>)>,
                          job_ids: &mut HashMap<tokio::task::Id, (u32, Vec<String>)>,
-                         (panel_id, datasource, source, targets): (
-            u32,
-            String,
-            Option<Arc<dyn DataSource>>,
-            Vec<(String, Query)>,
-        )| {
+                         job: PanelQueryJob| {
+            let (panel_id, datasource, source, targets) = job;
             let has_more_targets = targets.len() > MAX_TARGETS_PER_PANEL;
             let target_ids = targets
                 .iter()
@@ -664,7 +666,6 @@ mod tests {
             );
         }
         assert!(!arrived.contains(&0));
-        let mut arrived = arrived;
         arrived.sort_unstable();
         assert_eq!(
             arrived,
