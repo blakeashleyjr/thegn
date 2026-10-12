@@ -183,12 +183,6 @@ pub(crate) fn drive_queue(
 
     let now = thegn_core::util::now();
     for item in items {
-        // Still inside a failure window — skip without touching the row, so a
-        // forge outage degrades to "stale" rather than to a queue full of
-        // "unreachable" notes.
-        if backoff_active(&item.key, now) {
-            continue;
-        }
         let step = |status: &str, detail: &str, progress: &mut dyn FnMut(&PrStep)| {
             progress(&PrStep {
                 key: &item.key,
@@ -211,16 +205,32 @@ pub(crate) fn drive_queue(
         );
 
         if item.forge != forge.id() {
-            // The row was queued under another forge id (a repo whose origin
-            // moved, or a hand-edited row). The resolved forge still serves
-            // it — `fetch` will say `NoPr` if it really isn't there.
-            tracing::warn!(
-                target: "thegn::prq",
-                row_forge = %item.forge,
-                resolved = forge.id(),
-                number = item.number,
-                "queue row forge id differs from the resolved forge"
+            let detail = format!(
+                "queued forge {} differs from resolved forge {}; re-add (rebind) PR #{} to authorize it",
+                item.forge,
+                forge.id(),
+                item.number
             );
+            if let Err(error) = db.update_pr_status(
+                &item.key,
+                PrqStatus::NeedsHuman.as_str(),
+                None,
+                Some(&detail),
+                None,
+            ) {
+                tracing::debug!(target: "thegn::prq", %error, "could not persist forge mismatch hold");
+            }
+            tracing::warn!(target: "thegn::prq", "PR #{}: {detail}", item.number);
+            out.warnings.push(format!("PR #{}: {detail}", item.number));
+            out.needs_human.push(item.number);
+            step(PrqStatus::NeedsHuman.as_str(), &detail, &mut progress);
+            continue;
+        }
+        // Still inside a failure window — skip without touching the row, so a
+        // forge outage degrades to "stale" rather than to a queue full of
+        // "unreachable" notes. Forge mismatches are held before this skip.
+        if backoff_active(&item.key, now) {
+            continue;
         }
         let fetched = match forge.fetch_pr(&loc, item.number) {
             Ok(f) => f,
@@ -568,6 +578,29 @@ pub(crate) fn drive_queue(
                     out.needs_human.push(item.number);
                     continue;
                 }
+                let actual_branch =
+                    GitLoc::from_db(wt, None).git_out(&["rev-parse", "--abbrev-ref", "HEAD"]);
+                if !checkout_matches(actual_branch.as_deref(), &fetched.pr.head_ref_name) {
+                    let actual = actual_branch.as_deref().unwrap_or("unknown");
+                    let reason = format!(
+                        "worktree {wt} is on branch {actual}, but PR #{} head is {}; agent dispatch held",
+                        item.number, fetched.pr.head_ref_name
+                    );
+                    if let Err(error) = db.update_pr_status(
+                        &item.key,
+                        PrqStatus::NeedsHuman.as_str(),
+                        None,
+                        Some(&reason),
+                        Some(&head),
+                    ) {
+                        tracing::debug!(target: "thegn::prq", %error, "could not persist checkout branch hold");
+                    }
+                    tracing::warn!(target: "thegn::prq", "PR #{}: {reason}", item.number);
+                    out.warnings.push(format!("PR #{}: {reason}", item.number));
+                    out.needs_human.push(item.number);
+                    step(PrqStatus::NeedsHuman.as_str(), &reason, &mut progress);
+                    continue;
+                }
                 let next = attempts + 1;
                 let _ = db.set_pr_agent_attempts(&item.key, next); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                 let note = format!("agent fixing ({next}/{})", cfg.agent_max_attempts);
@@ -599,6 +632,10 @@ pub(crate) fn drive_queue(
         }
     }
     out
+}
+
+fn checkout_matches(actual: Option<&str>, expected: &str) -> bool {
+    actual.is_some_and(|branch| branch == expected)
 }
 
 /// Reconcile the complete THE-27 review snapshot for one explicitly watched
@@ -964,6 +1001,71 @@ mod tests {
             enabled: true,
             ..PrQueueConfig::default()
         }
+    }
+
+    #[test]
+    fn checkout_matches_requires_a_known_exact_branch() {
+        assert!(checkout_matches(Some("feat"), "feat"));
+        assert!(!checkout_matches(Some("other"), "feat"));
+        assert!(!checkout_matches(None, "feat"));
+    }
+
+    fn git_repo_on_branch(dir: &Path, branch: &str) {
+        thegn_core::fsperm::restrict_dir_to_owner(dir).unwrap();
+        let git = |args: &[&str]| {
+            let status = thegn_core::util::git_cmd(dir)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed in {}", dir.display());
+        };
+        git(&["-c", "commit.gpgsign=false", "init"]);
+        git(&["config", "user.email", "queue-test@example.invalid"]);
+        git(&["config", "user.name", "Queue Test"]);
+        std::fs::write(dir.join("tracked"), "fixture\n").unwrap();
+        git(&["add", "tracked"]);
+        git(&["-c", "commit.gpgsign=false", "commit", "-m", "fixture"]);
+        git(&["checkout", "-b", branch]);
+    }
+
+    #[test]
+    fn checkout_branch_mismatch_holds_before_spending_attempt_or_running_agent() {
+        let (dir, db) = temp_db("prq-wrong-checkout");
+        let checkout = dir.path().join("checkout");
+        std::fs::create_dir(&checkout).unwrap();
+        git_repo_on_branch(&checkout, "other");
+        let checkout = checkout.canonicalize().unwrap();
+        let checkout_s = checkout.to_string_lossy().into_owned();
+        db.enqueue_pr("/repo", 7, Some(&checkout_s), "feat", "main", "github")
+            .unwrap();
+        let sentinel = dir.path().join("agent-must-not-run");
+        let mut config = cfg();
+        config.watch = vec![PrWatchKind::Ci];
+        config.own_prs_only = false;
+        config.pause_on_foreign_push = false;
+        config.agent_command = format!("touch {}", sentinel.display());
+        let forge = FakeForge::new(Some(failing_ci_pr("abc")));
+        let row = db.list_pr_queue().unwrap().remove(0);
+        let out = drive_queue(
+            &config,
+            &Config::default(),
+            &forge,
+            Path::new("/repo"),
+            &db,
+            vec![PrItem::from(&row)],
+            |_| {},
+        );
+        let row = db.list_pr_queue().unwrap().remove(0);
+        assert_eq!(out.needs_human, vec![7]);
+        assert!(!sentinel.exists());
+        assert_eq!(row.agent_attempts, 0);
+        assert_eq!(row.status, PrqStatus::NeedsHuman.as_str());
+        let detail = row.detail.unwrap();
+        assert!(
+            detail.contains("other") && detail.contains("feat"),
+            "{detail}"
+        );
     }
 
     fn item() -> PrItem {
@@ -1566,8 +1668,46 @@ mod tests {
     }
 
     #[test]
+    fn forge_mismatch_is_held_before_any_forge_call() {
+        let (_dir, db) = temp_db("prq-forge-mismatch");
+        db.enqueue_pr("/repo", 7, Some("/w/feat"), "feat", "main", "gitlab")
+            .unwrap();
+        let row = db.list_pr_queue().unwrap().remove(0);
+        let forge = FakeForge::new(Some(green_pr()));
+        let mut cfg = cfg();
+        cfg.merge_mode = thegn_core::config::PrMergeMode::Thegn;
+        let mut steps = Vec::new();
+        let out = drive_queue(
+            &cfg,
+            &Config::default(),
+            &forge,
+            Path::new("/repo"),
+            &db,
+            vec![PrItem::from(&row)],
+            |step| steps.push(step.status.to_string()),
+        );
+        let row = db.list_pr_queue().unwrap().remove(0);
+        assert!(forge.calls().is_empty());
+        assert_eq!(out.needs_human, vec![7]);
+        assert!(steps.contains(&PrqStatus::NeedsHuman.as_str().to_string()));
+        assert_eq!(row.status, PrqStatus::NeedsHuman.as_str());
+        assert_eq!(row.agent_attempts, 0);
+        let detail = row.detail.unwrap();
+        assert!(
+            detail.contains("gitlab") && detail.contains("github"),
+            "{detail}"
+        );
+        assert!(detail.contains("re-add"), "{detail}");
+    }
+
+    #[test]
     fn successful_ci_rerun_is_bounded_across_database_reopen_then_dispatches() {
         let dir = tempfile::tempdir().unwrap();
+        let checkout = dir.path().join("checkout");
+        std::fs::create_dir(&checkout).unwrap();
+        git_repo_on_branch(&checkout, "feat");
+        let checkout = checkout.canonicalize().unwrap();
+        let checkout_s = checkout.to_string_lossy().into_owned();
         let path = dir.path().join("pr-rerun.db");
         let mut cfg = cfg();
         cfg.watch = vec![PrWatchKind::Ci];
@@ -1576,7 +1716,7 @@ mod tests {
         let forge = FakeForge::new(Some(failing_ci_pr("abc"))).with_rerun_count(1);
         {
             let db = Db::open_at(&path).unwrap();
-            db.enqueue_pr("/repo", 7, Some("/w/feat"), "feat", "main", "github")
+            db.enqueue_pr("/repo", 7, Some(&checkout_s), "feat", "main", "github")
                 .unwrap();
             let out = drive_queue(
                 &cfg,
