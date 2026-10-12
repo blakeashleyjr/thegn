@@ -130,7 +130,7 @@ fn parse_workspace_url(input: &str) -> Result<ParsedWorkspaceUrl> {
         canonical.set_path(path);
         (clone_url, canonical.to_string(), tail)
     };
-    let repo = tail.strip_suffix(".git").unwrap_or(tail);
+    let repo = tail.strip_suffix(".git").unwrap_or(tail.as_str());
     anyhow::ensure!(
         !repo.is_empty()
             && repo != "."
