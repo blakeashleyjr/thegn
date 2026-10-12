@@ -385,10 +385,9 @@ pub(crate) fn restart_media_watch(
                 generation: generation_value,
                 snapshot: None,
             },
-        ) {
-            if let Err(error) = waker.wake() {
-                tracing::debug!(target: "thegn::media", %error, "media clear wake failed");
-            }
+        ) && let Err(error) = waker.wake()
+        {
+            tracing::debug!(target: "thegn::media", %error, "media clear wake failed");
         }
         return;
     }
