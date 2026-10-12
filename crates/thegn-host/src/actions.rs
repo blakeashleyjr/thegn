@@ -56,6 +56,35 @@ pub(crate) fn open_argv_tab(
     false
 }
 
+/// Spawn a custom Git command while removing inherited repository selectors
+/// from local pane environments. Remote commands scrub those variables in the
+/// remote shell built by `GitLoc::interactive_argv`.
+pub(crate) fn open_custom_git_argv_tab(
+    session: &mut Session,
+    panes: &mut Panes,
+    argv: &[String],
+    cwd: Option<&std::path::Path>,
+    center: Rect,
+) -> bool {
+    let wrapped;
+    let argv = if cwd.is_some() {
+        wrapped = {
+            let mut command = vec!["env".to_string()];
+            for variable in thegn_core::util::GIT_ENV_VARS {
+                command.push("-u".into());
+                command.push(variable.to_string());
+            }
+            command.push("--".into());
+            command.extend(argv.iter().cloned());
+            command
+        };
+        wrapped.as_slice()
+    } else {
+        argv
+    };
+    open_argv_tab(session, panes, argv, cwd, center)
+}
+
 /// [`open_command_tab`], returning the spawned pane's id (the onboarding
 /// wizard watches its login/agent tab for exit).
 pub(crate) fn open_command_tab_id(
