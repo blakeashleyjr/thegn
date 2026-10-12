@@ -14,14 +14,14 @@
 //! it goes so the panel reflects live state, and reports each transition through a
 //! `progress` callback the caller uses to print (CLI) or repaint (host).
 
-use std::path::Path;
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use thegn_core::attention::MqStatus;
 use thegn_core::config::{Config, ConflictHandoff, MergeQueueConfig};
 use thegn_core::db::Db;
 use thegn_core::store::{MergeStatusFields, WorkspaceStore, WorktreeAuxStore};
-// The real-git driver fixtures shell out to git and stamp queue rows.
-#[cfg(test)]
 use thegn_core::util;
 
 use crate::integrate::{self, AttemptOutcome};
@@ -179,6 +179,11 @@ pub(crate) fn drive_queue(
     items: Vec<QueueItem>,
     progress: impl FnMut(&DriveStep),
 ) -> DriveOutcome {
+    let worktree_branches: HashMap<String, String> = items
+        .iter()
+        .map(|item| (item.worktree.clone(), item.branch.clone()))
+        .collect();
+    let expected_oids = RefCell::new(HashMap::<String, String>::new());
     drive_queue_with(
         cfg,
         full,
@@ -188,9 +193,32 @@ pub(crate) fn drive_queue(
         progress,
         DriveActions {
             attempt: |branch: &str, location: &thegn_core::remote::GitLoc| {
+                if let thegn_core::remote::GitLoc::Local(worktree) = location {
+                    let ref_name = format!("refs/heads/{branch}");
+                    let oid =
+                        util::git_out(worktree, &["rev-parse", &ref_name]).ok_or_else(|| {
+                            anyhow::anyhow!("could not resolve queued branch {ref_name}")
+                        })?;
+                    expected_oids
+                        .borrow_mut()
+                        .insert(worktree.to_string_lossy().into_owned(), oid);
+                }
                 integrate::attempt_land(cfg, repo_root, branch, location)
             },
             floor: |worktree: &str| {
+                let Some(branch) = worktree_branches.get(worktree) else {
+                    return crate::agent_run::AgentDispatch::InfraHold(
+                        "worktree identity drift: queue item identity is unavailable".into(),
+                    );
+                };
+                let expected = expected_oids.borrow().get(worktree).cloned();
+                if let Err(reason) =
+                    verify_fixer_checkout(repo_root, worktree, branch, expected.as_deref())
+                {
+                    return crate::agent_run::AgentDispatch::InfraHold(format!(
+                        "worktree identity drift: {reason}"
+                    ));
+                }
                 crate::agent_run::agent_floor_gate(
                     full,
                     worktree,
@@ -209,6 +237,72 @@ pub(crate) fn drive_queue(
             },
         },
     )
+}
+
+/// Confirm the queued local checkout still names the same registered Git
+/// repository, branch, and candidate commit before dispatching a fixer.
+fn verify_fixer_checkout(
+    repo_root: &Path,
+    worktree: &str,
+    branch: &str,
+    expected_oid: Option<&str>,
+) -> Result<(), String> {
+    let path = Path::new(worktree);
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| format!("cannot inspect worktree path: {error}"))?;
+    if metadata.file_type().is_symlink() {
+        return Err("worktree path is a symlink".into());
+    }
+    let canonical_worktree = path
+        .canonicalize()
+        .map_err(|error| format!("cannot resolve worktree path: {error}"))?;
+    if path != canonical_worktree {
+        return Err("worktree path uses a non-canonical alias".into());
+    }
+    let top_level = util::git_out(path, &["rev-parse", "--show-toplevel"])
+        .ok_or_else(|| "path is not a Git worktree".to_string())?;
+    let canonical_top_level = PathBuf::from(top_level)
+        .canonicalize()
+        .map_err(|error| format!("cannot resolve Git worktree root: {error}"))?;
+    if canonical_worktree != canonical_top_level {
+        return Err("path does not identify the Git worktree root".into());
+    }
+    let expected_common = repo_root
+        .canonicalize()
+        .map_err(|error| format!("cannot resolve repository root: {error}"))?;
+    let expected_common = util::git_common_dir(&expected_common)
+        .canonicalize()
+        .map_err(|error| format!("cannot resolve queued repository identity: {error}"))?;
+    let actual_common = util::git_common_dir(&canonical_worktree)
+        .canonicalize()
+        .map_err(|error| format!("cannot resolve worktree repository identity: {error}"))?;
+    if actual_common != expected_common {
+        return Err("worktree belongs to a different Git repository".into());
+    }
+    let registered =
+        util::git_out(repo_root, &["worktree", "list", "--porcelain"]).is_some_and(|list| {
+            list.lines().any(|line| {
+                line.strip_prefix("worktree ")
+                    == Some(canonical_worktree.to_string_lossy().as_ref())
+            })
+        });
+    if !registered {
+        return Err("path is not a registered worktree of the queued repository".into());
+    }
+    let actual_ref = util::git_out(&canonical_worktree, &["symbolic-ref", "-q", "HEAD"])
+        .ok_or_else(|| "worktree HEAD is detached or unavailable".to_string())?;
+    let expected_ref = format!("refs/heads/{branch}");
+    if actual_ref != expected_ref {
+        return Err(format!("expected {expected_ref}, found {actual_ref}"));
+    }
+    if let Some(expected_oid) = expected_oid {
+        let actual_oid = util::git_out(&canonical_worktree, &["rev-parse", "HEAD"])
+            .ok_or_else(|| "worktree HEAD is unavailable".to_string())?;
+        if actual_oid != expected_oid {
+            return Err("worktree HEAD moved since the queued candidate was folded".into());
+        }
+    }
+    Ok(())
 }
 
 /// Private injection points exercise the actual loop without launching Git or
@@ -1025,6 +1119,55 @@ mod tests {
             git(&root, &["add", "-A"]);
             git(&root, &["commit", "-q", "-m", "main edits base"]);
             (fixture, root, feat_wt)
+        }
+
+        #[test]
+        fn fixer_checkout_verification_rejects_identity_drift() {
+            let (_fixture, root, feat_wt) = conflicting_repo("identity-check");
+            let feat_oid = out(&feat_wt, &["rev-parse", "HEAD"]);
+            verify_fixer_checkout(&root, feat_wt.to_str().unwrap(), "feat", Some(&feat_oid))
+                .unwrap();
+
+            let main_oid = out(&root, &["rev-parse", "HEAD"]);
+            assert!(
+                verify_fixer_checkout(&root, feat_wt.to_str().unwrap(), "feat", Some(&main_oid))
+                    .is_err()
+            );
+
+            git(&feat_wt, &["switch", "-q", "-c", "other"]);
+            assert!(verify_fixer_checkout(&root, feat_wt.to_str().unwrap(), "feat", None).is_err());
+            git(&feat_wt, &["switch", "-q", "feat"]);
+            git(&feat_wt, &["checkout", "-q", "--detach"]);
+            assert!(verify_fixer_checkout(&root, feat_wt.to_str().unwrap(), "feat", None).is_err());
+
+            let alias = feat_wt.with_file_name("feature-alias");
+            std::os::unix::fs::symlink(&feat_wt, &alias).unwrap();
+            assert!(verify_fixer_checkout(&root, alias.to_str().unwrap(), "feat", None).is_err());
+        }
+
+        #[test]
+        fn switched_queued_worktree_holds_without_dispatch_or_attempt_spend() {
+            let (_fixture, root, feat_wt) = conflicting_repo("identity-hold");
+            let sentinel = root.join("wrong-checkout-was-written");
+            let db = Db::open_memory().unwrap();
+            let queued = item(&db, &feat_wt);
+            git(&feat_wt, &["switch", "-q", "-c", "other"]);
+
+            let outcome = drive_queue(
+                &cfg(&format!("touch {} && {FIXER}", sentinel.display()), 2),
+                &Config::default(),
+                &root,
+                &db,
+                vec![queued],
+                |_| {},
+            );
+
+            assert_eq!(outcome.agent_blocked, ["feat"]);
+            assert!(
+                !sentinel.exists(),
+                "identity drift must not launch the fixer"
+            );
+            assert_eq!(db.list_merge_queue().unwrap()[0].agent_attempts, 0);
         }
 
         /// A cleanly foldable linked branch, used to reach commit signing
