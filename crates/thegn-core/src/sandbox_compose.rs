@@ -16,7 +16,7 @@
 //! only the callers run subprocesses.
 
 use crate::placement::Placement;
-use crate::sandbox::{Backend, SandboxSpec, oci_prefix};
+use crate::sandbox::{Backend, SandboxSpec, oci_prefix, oci_prefix_for};
 use std::fmt;
 use std::time::Duration;
 
@@ -24,6 +24,31 @@ use std::time::Duration;
 pub(crate) const COMPOSE_UP_TIMEOUT: Duration = Duration::from_secs(150);
 /// Maximum time allowed to verify that Compose reports a running service.
 pub(crate) const COMPOSE_PS_TIMEOUT: Duration = Duration::from_secs(5);
+/// Compose's default stop grace exceeds the ordinary five-second control probe.
+pub(crate) const COMPOSE_DOWN_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Build `compose -p <project> down --remove-orphans` for supported engines.
+pub(crate) fn down_argv_for(
+    backend: Backend,
+    oci_host: Option<&str>,
+    project: &str,
+) -> Option<Vec<String>> {
+    if !matches!(
+        backend,
+        Backend::Docker | Backend::Podman | Backend::PodmanRootful
+    ) {
+        return None;
+    }
+    let mut argv = oci_prefix_for(backend, oci_host);
+    argv.extend([
+        "compose".into(),
+        "-p".into(),
+        project.into(),
+        "down".into(),
+        "--remove-orphans".into(),
+    ]);
+    Some(argv)
+}
 
 /// A bounded Compose startup or verification failure.
 #[derive(Debug, Clone, PartialEq, Eq)]
