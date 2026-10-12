@@ -1498,7 +1498,7 @@ mod tests {
         let [Piece::GfxOther(bytes)] = emitted.as_slice() else {
             panic!("scoped deletes expected")
         };
-        assert_eq!(bytes, apc("Ga=d,d=I,i=2147418113,q=2;"));
+        assert_eq!(*bytes, apc("Ga=d,d=I,i=2147418113,q=2;"));
         assert!(!bytes.windows(4).any(|part| part == b"a=d;"));
     }
 
