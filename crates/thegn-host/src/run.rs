@@ -1874,10 +1874,12 @@ fn request_preview_scan(
     );
 }
 
+type SharePersistJob = Box<dyn FnOnce(&thegn_core::db::Db) + Send>;
+
 /// Persist a share lifecycle event to the `shares` table (resurrection layer).
 fn persist_share_event(ev: &crate::share::ShareEvent) {
     use crate::share::ShareEvent;
-    let write: Option<Box<dyn FnOnce(&thegn_core::db::Db) + Send>> = match ev {
+    let write: Option<SharePersistJob> = match ev {
         ShareEvent::Up {
             worktree,
             port,
