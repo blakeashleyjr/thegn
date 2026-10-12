@@ -432,18 +432,18 @@ async fn source_daemon(
     db: &Db,
     referenced: &BTreeSet<String>,
 ) -> Result<(Option<Box<dyn MigrationControl>>, Vec<SessionInfo>)> {
-    let scope = crate::daemon::scope_key();
+    let scopes = crate::daemon::scope_aliases();
     let now = now_ms();
-    let registered = db
-        .daemons()?
-        .into_iter()
-        .filter(|daemon| daemon.scope == scope)
-        .collect::<Vec<_>>();
-    let live_registered = db.live_daemons(
-        &scope,
-        now,
-        thegn_svc::control::client::DAEMON_HEARTBEAT_TTL_MS,
-    )?;
+    let rows = db.daemons()?;
+    let registered = scoped_daemons(&rows, &scopes);
+    let mut live_registered = Vec::new();
+    for scope in &scopes {
+        live_registered.extend(db.live_daemons(
+            scope,
+            now,
+            thegn_svc::control::client::DAEMON_HEARTBEAT_TTL_MS,
+        )?);
+    }
     let live_daemon = migration_fenced_daemon(&live_registered)?;
     if live_daemon.is_none() {
         if !referenced.is_empty()
@@ -470,6 +470,13 @@ async fn source_daemon(
         .await
         .context("source daemon is registered but unreachable; refusing migration")?;
     Ok((Some(client), sessions))
+}
+
+fn scoped_daemons(rows: &[DaemonRow], scopes: &[String]) -> Vec<DaemonRow> {
+    rows.iter()
+        .filter(|daemon| scopes.contains(&daemon.scope))
+        .cloned()
+        .collect()
 }
 
 /// Select the one daemon whose session roster migration can trust. An older
@@ -926,6 +933,30 @@ mod tests {
         assert!(error.to_string().contains("predates"));
         let error = migration_fenced_daemon(&[current.clone(), current]).unwrap_err();
         assert!(error.to_string().contains("multiple source daemons"));
+    }
+
+    #[test]
+    fn legacy_scope_row_reaches_migration_fence() {
+        let legacy = DaemonRow {
+            daemon_id: "pre-upgrade".into(),
+            pid: 1,
+            scope: "/state/a".into(),
+            endpoint: "/run/thegn/daemon.sock".into(),
+            tcp_addr: None,
+            control_origin: None,
+            hostname: "host".into(),
+            version: "0.1.0".into(),
+            started_at: 1,
+            heartbeat_at: 1,
+        };
+        let aliases = vec!["v1-current-identity".into(), "/state/a".into()];
+        let matching = scoped_daemons(&[legacy], &aliases);
+        let error = migration_fenced_daemon(&matching).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("predates session migration fencing")
+        );
     }
 
     #[test]

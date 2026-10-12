@@ -212,11 +212,12 @@ fn state_path_digest(path: &Path) -> String {
         .join("")
 }
 
-/// A short control-socket path under `short_dir`, standing in for a `natural`
-/// path that does not fit `sun_path`. Its 128-bit key is derived from the
-/// lossless encoded path bytes, so invalid Unix path bytes remain distinct.
-pub fn short_socket_path(short_dir: &Path, natural: &Path) -> PathBuf {
-    let key = state_endpoint_key(natural);
+/// A short control-socket path under `short_dir`, standing in for a path that
+/// does not fit `sun_path`. `path` may be either a state directory or the
+/// natural socket path, depending on the caller. Its 128-bit key is derived
+/// from lossless encoded path bytes, so invalid Unix path bytes remain distinct.
+pub fn short_socket_path(short_dir: &Path, path: &Path) -> PathBuf {
+    let key = state_endpoint_key(path);
     short_dir.join(format!("thegn-{key}.sock"))
 }
 
