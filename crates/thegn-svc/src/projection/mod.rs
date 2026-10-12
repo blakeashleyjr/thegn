@@ -105,19 +105,33 @@ fn mount_sshfs(spec: &ProjectionSpec) -> Result<Mounted> {
 }
 
 fn unmount_sshfs(spec: &ProjectionSpec) -> Result<()> {
-    let legacy_paths: Vec<_> = spec
-        .legacy_mountpoints()
+    let candidates = spec.legacy_mountpoints();
+    let slug_legacy_path = match &spec.placement {
+        Placement::Ssh(ssh) => {
+            thegn_core::projection::legacy_mountpoint(&ssh.host, &spec.remote_dir)
+        }
+        _ => None,
+    };
+    let legacy_paths: Vec<_> = candidates
         .into_iter()
         .filter(|path| std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir()))
         .collect();
     let plan = sshfs_unmount_plan(spec, &legacy_paths);
     let primary_result = run(&plan[0]);
 
-    let mut legacy_succeeded = false;
+    let mut slug_legacy_succeeded = false;
+    let mut v1_legacy_succeeded = false;
     for (legacy_path, legacy_argv) in legacy_paths.iter().zip(plan.iter().skip(1)) {
         match run(legacy_argv) {
             Ok(()) => {
-                legacy_succeeded = true;
+                if slug_legacy_path
+                    .as_ref()
+                    .is_some_and(|slug_path| slug_path == legacy_path)
+                {
+                    slug_legacy_succeeded = true;
+                } else {
+                    v1_legacy_succeeded = true;
+                }
                 if let Err(error) = std::fs::remove_dir(legacy_path) {
                     tracing::debug!(%error, path = %legacy_path, "could not remove empty legacy sshfs mountpoint");
                 }
@@ -128,23 +142,36 @@ fn unmount_sshfs(spec: &ProjectionSpec) -> Result<()> {
         }
     }
 
-    finish_sshfs_unmount(spec, primary_result, legacy_succeeded)
+    finish_sshfs_unmount(
+        spec,
+        primary_result,
+        slug_legacy_succeeded,
+        v1_legacy_succeeded,
+    )
 }
 
 fn finish_sshfs_unmount(
     spec: &ProjectionSpec,
     primary_result: Result<()>,
-    legacy_succeeded: bool,
+    slug_legacy_succeeded: bool,
+    v1_legacy_succeeded: bool,
 ) -> Result<()> {
     match primary_result {
         Ok(()) => Ok(()),
-        Err(error) if legacy_succeeded => {
+        Err(error) if slug_legacy_succeeded => {
             tracing::warn!(
                 %error,
                 mountpoint = %spec.mountpoint,
                 "primary sshfs unmount failed but legacy unmount succeeded"
             );
             Ok(())
+        }
+        Err(error) if v1_legacy_succeeded => {
+            tracing::debug!(
+                mountpoint = %spec.mountpoint,
+                "v1 legacy sshfs unmount succeeded but does not replace primary unmount"
+            );
+            Err(error)
         }
         Err(error) => Err(error),
     }
@@ -163,7 +190,7 @@ fn sshfs_unmount_plan(spec: &ProjectionSpec, legacy_paths: &[String]) -> Vec<Vec
 /// Reap old slug-only SSHFS projection directories once at startup. Unmount is
 /// non-lazy and removal only succeeds for an empty directory.
 pub fn reap_legacy_mounts(mounts_dir: &std::path::Path) -> usize {
-    reap_legacy_mounts_with(mounts_dir, |argv| run(argv))
+    reap_legacy_mounts_with(mounts_dir, run)
 }
 
 fn reap_legacy_mounts_with(
@@ -468,7 +495,12 @@ mod tests {
         let s = spec(DataMode::Sshfs, ssh());
         let captured = CapturedWarnings::default();
         let result = tracing::subscriber::with_default(captured.clone(), || {
-            finish_sshfs_unmount(&s, Err(anyhow::anyhow!("primary mount is busy")), true)
+            finish_sshfs_unmount(
+                &s,
+                Err(anyhow::anyhow!("primary mount is busy")),
+                true,
+                false,
+            )
         });
 
         assert!(result.is_ok());
@@ -480,6 +512,30 @@ mod tests {
                 .is_some_and(|value| value.contains("busy"))
         );
         assert_eq!(records[0].get("mountpoint"), Some(&s.mountpoint));
+    }
+
+    #[test]
+    fn v1_legacy_unmount_success_does_not_mask_primary_failure() {
+        let mut placement = match ssh() {
+            Placement::Ssh(placement) => placement,
+            _ => unreachable!(),
+        };
+        placement.port = 2222;
+        let s = spec(DataMode::Sshfs, Placement::Ssh(placement));
+        let default_placement = match ssh() {
+            Placement::Ssh(placement) => placement,
+            _ => unreachable!(),
+        };
+        let v1_mountpoint = thegn_core::projection::mountpoint(&default_placement, "/srv/work");
+        assert!(s.legacy_mountpoints().contains(&v1_mountpoint));
+        let result = finish_sshfs_unmount(
+            &s,
+            Err(anyhow::anyhow!("primary mount is busy")),
+            false,
+            true,
+        );
+
+        assert!(result.is_err());
     }
 
     #[test]
@@ -508,7 +564,9 @@ mod tests {
     #[test]
     fn reaper_does_not_follow_legacy_named_symlink() {
         let mounts = tempfile::tempdir().unwrap();
-        let target = mounts.path().join("target");
+        let target = mounts
+            .path()
+            .join("target--0123456789abcdef0123456789abcdef");
         let link = mounts.path().join("legacy-name");
         std::fs::create_dir(&target).unwrap();
         std::os::unix::fs::symlink(&target, &link).unwrap();

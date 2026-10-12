@@ -38,10 +38,12 @@ impl ProjectionSpec {
     /// Pre-identity mountpoint candidates for ssh placements that are safe to target.
     ///
     /// The legacy slug collapses distinct `(host, path)` pairs, which is why
-    /// current mountpoints include a digest. Teardown may therefore target a
-    /// The result contains the old slug path and, for a non-default SSH
-    /// placement, its former v1 digest path. A non-lazy `fusermount3 -u`
-    /// refuses a busy mount; do not make it lazy (`-uz`).
+    /// current mountpoints include a digest. The result contains the old slug
+    /// path and, for a non-default SSH placement, its former v1 digest path.
+    /// That v1 path can coincide with another environment's live default-
+    /// placement mount; a non-lazy `fusermount3 -u` may still unmount it when
+    /// idle, so callers must not treat its success as proof that this
+    /// placement's mount was removed. Do not make unmount lazy (`-uz`).
     pub fn legacy_mountpoints(&self) -> Vec<String> {
         let Placement::Ssh(ssh) = &self.placement else {
             return Vec::new();
