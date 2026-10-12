@@ -5,7 +5,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 const RECOMMENDED_FONTS: &[&str] = &[
@@ -667,21 +667,37 @@ fn rank_families(families: BTreeSet<String>) -> Vec<FontRow> {
 /// (set by the `.app` launcher, but only when Alacritty is the terminal that
 /// actually runs), else Alacritty's own XDG location.
 ///
-/// `None` when neither exists — the caller must decline rather than guess. The
-/// previous default was the **relative** path `config/alacritty.toml`, resolved
-/// against the process CWD: in a compositor whose CWD is whichever worktree tab
-/// is focused, that either failed to open or silently edited a file in some
-/// unrelated checkout (the thegn repo itself, most often).
+/// `None` when neither a usable override nor an existing XDG config exists —
+/// the caller must decline rather than guess. An absolute override is returned
+/// even when its file is missing so a typo is reported against that path. Empty
+/// and relative overrides are ignored; a relative path must never resolve
+/// against the process CWD, which may be whichever worktree tab is focused.
 pub fn alacritty_config_path() -> Option<PathBuf> {
-    let candidate = alacritty_config_path_from(
+    alacritty_config_path_with(
         std::env::var_os("THEGN_ALACRITTY_CONFIG"),
         &thegn_core::util::xdg_config_home(),
-    )?;
-    candidate.is_file().then_some(candidate)
+        |path| path.is_file(),
+    )
 }
 
-/// Ignore empty and relative overrides so the process CWD can never select the
-/// config. In those cases fall through to Alacritty's XDG location.
+fn alacritty_config_path_with(
+    env: Option<OsString>,
+    xdg_config_home: &Path,
+    is_file: impl FnOnce(&Path) -> bool,
+) -> Option<PathBuf> {
+    let is_override = env
+        .as_ref()
+        .is_some_and(|value| PathBuf::from(value).is_absolute());
+    let candidate = alacritty_config_path_from(env, xdg_config_home)?;
+    if is_override {
+        Some(candidate)
+    } else {
+        is_file(&candidate).then_some(candidate)
+    }
+}
+
+/// Use only absolute overrides. Ignore empty and relative values, falling back
+/// to Alacritty's XDG location so the process CWD can never select the config.
 fn alacritty_config_path_from(env: Option<OsString>, xdg_config_home: &Path) -> Option<PathBuf> {
     if let Some(p) = env.map(PathBuf::from).filter(|p| p.is_absolute()) {
         return Some(p);
@@ -922,16 +938,49 @@ fn replace_config(
     if current != observed || metadata.is_some() != observed_exists {
         return Err(format!("{} changed while editing; retry", path.display()));
     }
-    thegn_core::fsperm::write_owner_only_atomic(path, new)
-        .map_err(|e| format!("stage or replace {} failed: {e}", path.display()))?;
+    if metadata
+        .as_ref()
+        .is_some_and(|metadata| metadata.permissions().readonly())
+    {
+        return Err(format!("{} is read-only; not modified", path.display()));
+    }
+
+    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("{} has no parent directory", path.display()))?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| format!("{} has no file name", path.display()))?
+        .to_string_lossy();
+    let counter = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let temporary = parent.join(format!(
+        ".{name}.tmp-{}-{nanos}-{counter}",
+        std::process::id()
+    ));
+    thegn_core::fsperm::write_owner_only_new(&temporary, new)
+        .map_err(|e| format!("stage {} failed: {e}", path.display()))?;
+    if let Err(error) = thegn_core::fsperm::rename_replace(&temporary, path) {
+        let cleanup = std::fs::remove_file(&temporary);
+        return match cleanup {
+            Ok(()) => Err(format!("replace {} failed: {error}", path.display())),
+            Err(cleanup_error) => Err(format!(
+                "replace {} failed: {error}; remove staging file {} failed: {cleanup_error}",
+                path.display(),
+                temporary.display()
+            )),
+        };
+    }
     if let Some(metadata) = metadata {
-        thegn_core::fsperm::preserve_owner_only_permissions(&metadata, path)
+        std::fs::set_permissions(path, metadata.permissions())
             .map_err(|e| format!("preserve permissions for {} failed: {e}", path.display()))?;
     }
-    if let Some(parent) = path.parent() {
-        thegn_core::fsperm::sync_parent_dir(parent)
-            .map_err(|e| format!("sync {} failed: {e}", parent.display()))?;
-    }
+    thegn_core::fsperm::sync_parent_dir(parent)
+        .map_err(|e| format!("sync {} failed: {e}", parent.display()))?;
     Ok(())
 }
 
@@ -1166,6 +1215,20 @@ mod tests {
             alacritty_config_path_from(Some(xdg.join("override.toml").into_os_string()), xdg),
             Some(xdg.join("override.toml"))
         );
+        let missing_override = xdg.join("missing-override.toml");
+        assert_eq!(
+            alacritty_config_path_with(
+                Some(missing_override.clone().into_os_string()),
+                xdg,
+                |_| false,
+            ),
+            Some(missing_override)
+        );
+        assert_eq!(
+            alacritty_config_path_with(None, xdg, |_| false),
+            None,
+            "a missing XDG default should still be ignored"
+        );
     }
 
     #[test]
@@ -1234,7 +1297,7 @@ mod tests {
     }
 
     #[test]
-    fn config_replacement_preserves_readonly_permissions() {
+    fn config_replacement_refuses_readonly_permissions() {
         let tmp = tempfile::tempdir().unwrap();
         let config = tmp.path().join("kitty.conf");
         let observed = b"font_family Menlo\n";
@@ -1242,15 +1305,33 @@ mod tests {
         let mut permissions = std::fs::metadata(&config).unwrap().permissions();
         permissions.set_readonly(true);
         std::fs::set_permissions(&config, permissions).unwrap();
+        let expected_permissions = std::fs::metadata(&config).unwrap().permissions();
 
-        let result = replace_config(&config, observed, true, b"font_family Hack\n");
-        let permissions = std::fs::metadata(&config).unwrap().permissions();
-        assert!(permissions.readonly());
-        if result.is_ok() {
-            assert_eq!(std::fs::read(&config).unwrap(), b"font_family Hack\n");
-        } else {
-            assert_eq!(std::fs::read(&config).unwrap(), observed);
-        }
+        let error = replace_config(&config, observed, true, b"font_family Hack\n").unwrap_err();
+        assert!(error.contains("is read-only; not modified"), "{error}");
+        assert_eq!(std::fs::read(&config).unwrap(), observed);
+        assert_eq!(
+            std::fs::metadata(&config).unwrap().permissions(),
+            expected_permissions
+        );
+    }
+
+    #[test]
+    fn config_replacement_preserves_writable_permissions_exactly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("kitty.conf");
+        let observed = b"font_family Menlo\n";
+        std::fs::write(&config, observed).unwrap();
+        let expected_permissions = std::fs::metadata(&config).unwrap().permissions();
+        assert!(!expected_permissions.readonly());
+
+        replace_config(&config, observed, true, b"font_family Hack\n").unwrap();
+
+        assert_eq!(std::fs::read(&config).unwrap(), b"font_family Hack\n");
+        assert_eq!(
+            std::fs::metadata(&config).unwrap().permissions(),
+            expected_permissions
+        );
     }
 
     #[test]
