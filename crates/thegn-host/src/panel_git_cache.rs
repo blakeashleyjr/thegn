@@ -5,8 +5,9 @@
 //! Before this, every 5 s model tick re-ran those three reads per hydration
 //! (36 forks/min on an idle one-repo session) for an answer that only changes
 //! when something under the worktree or its git dir changes. A snapshot is
-//! stored only when a live watcher vouched for the path, only when every read
-//! succeeded, and is returned only for the exact print it was taken at. A path
+//! stored only when a live watcher vouched for the path and the status/diff
+//! reads succeeded; stash count can be unknown after a stash read failure. It
+//! is returned only for the exact print it was taken at. A path
 //! without a live watcher (background/warming worktrees, remote locs, failed or
 //! incomplete registration) never gets a print, so it never touches the cache
 //! and behaves exactly as before.
@@ -31,7 +32,7 @@ pub(crate) struct GitReads {
     pub(crate) diff_entries: Vec<DiffEntry>,
     pub(crate) entities: Option<EntitySummary>,
     pub(crate) status: Vec<FileStatus>,
-    pub(crate) stash_count: usize,
+    pub(crate) stash_count: Option<usize>,
 }
 
 /// Snapshots are only ever stored for watched paths (one active worktree, a few
@@ -69,7 +70,7 @@ mod tests {
 
     fn reads(n: usize) -> GitReads {
         GitReads {
-            stash_count: n,
+            stash_count: Some(n),
             ..Default::default()
         }
     }
@@ -80,7 +81,7 @@ mod tests {
         let print = (WatchPrint::for_test(1, 1), 7);
         assert!(get(p, print).is_none());
         put(p, print, reads(3));
-        assert_eq!(get(p, print).map(|r| r.stash_count), Some(3));
+        assert_eq!(get(p, print).map(|r| r.stash_count), Some(Some(3)));
         assert!(
             get(p, (WatchPrint::for_test(2, 1), 7)).is_none(),
             "generation moved"

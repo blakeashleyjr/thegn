@@ -2,10 +2,10 @@
 //! commits, rich branches, stashes, tags, bisect state, git version.
 //!
 //! Pure parsing; the svc layer runs the commands and hands the stdout here.
-//! Commit records use NUL-delimited fields, which cannot collide with Git
-//! identity or message data. Ref records use unit separators because Git ref
-//! names cannot contain control bytes. Parsers reject malformed rows as a
-//! whole rather than silently returning partial repository state.
+//! Commit and stash records use NUL-delimited fields, which cannot collide
+//! with Git identity or message data. Ref records use unit separators because
+//! Git ref names cannot contain control bytes. Parsers reject malformed rows
+//! as a whole rather than silently returning partial repository state.
 
 /// One commit from `git log` (see [`parse_commits`] for the format).
 #[derive(Debug, Clone, PartialEq, Eq)]

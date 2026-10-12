@@ -1380,20 +1380,6 @@ fn glyph_base(loc: &GitLoc) -> Option<String> {
     }
     let mut cache = base_cache().lock().unwrap_or_else(|e| e.into_inner());
     let current_generation = GLYPH_BASE_GENERATION.load(std::sync::atomic::Ordering::Acquire);
-    if observed_generation != current_generation {
-        return base;
-    }
-    if cache.len() >= GLYPH_BASE_CACHE_CAPACITY
-        && !cache.contains_key(&key)
-        && let Some(evict) = cache
-            .iter()
-            .filter(|(_, (_, at, _))| at.elapsed() >= GLYPH_BASE_TTL)
-            .min_by_key(|(_, (_, at, _))| *at)
-            .or_else(|| cache.iter().min_by_key(|(_, (_, at, _))| *at))
-            .map(|(key, _)| key.clone())
-    {
-        cache.remove(&evict);
-    }
     let stored = store_glyph_base(
         &mut cache,
         key.clone(),
@@ -1497,6 +1483,17 @@ fn store_glyph_base(
 ) -> bool {
     if observed_generation != current_generation {
         return false;
+    }
+    if cache.len() >= GLYPH_BASE_CACHE_CAPACITY
+        && !cache.contains_key(&key)
+        && let Some(evict) = cache
+            .iter()
+            .filter(|(_, (_, at, _))| at.elapsed() >= GLYPH_BASE_TTL)
+            .min_by_key(|(_, (_, at, _))| *at)
+            .or_else(|| cache.iter().min_by_key(|(_, (_, at, _))| *at))
+            .map(|(key, _)| key.clone())
+    {
+        cache.remove(&evict);
     }
     cache.insert(key, entry);
     true
