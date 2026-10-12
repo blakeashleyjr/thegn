@@ -889,7 +889,7 @@ mod tests {
 
     #[test]
     fn failed_slot_does_not_shutdown_and_shutdown_panic_is_contained() {
-        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let mut failed = AppSlot::new("observe", "Observe");
         failed.state = SlotState::Failed("injected construction failure".into());
         drop(failed);
