@@ -555,17 +555,7 @@ fn edit(cfg: &Config, path: &Path) -> Result<()> {
 }
 
 fn seed_example(path: &Path) -> Result<()> {
-    if let Some(dir) = path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
-        match std::fs::symlink_metadata(dir) {
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                thegn_core::fsperm::ensure_private_dir(dir)?;
-            }
-            Err(error) => return Err(error.into()),
-        }
-    }
-    thegn_core::fsperm::write_owner_only_new(path, EXAMPLE.as_bytes())?;
-    Ok(())
+    thegn_core::config_write::seed_if_absent(path, EXAMPLE.as_bytes())
 }
 
 fn validate(path: &Path, repo_context: Option<PathBuf>) -> Result<()> {
@@ -693,6 +683,22 @@ mod tests {
         seed_example(&parent.join("config.toml")).unwrap();
 
         assert_eq!(thegn_core::fsperm::mode_bits(&parent).unwrap(), before);
+    }
+
+    #[test]
+    fn config_edit_seed_rejects_a_held_writer_lock_without_creating_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let lock_path = dir.path().join(".config.toml.lock");
+        let held = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(lock_path)
+            .unwrap();
+        held.try_lock().unwrap();
+
+        assert!(seed_example(&path).is_err());
+        assert!(!path.exists(), "a rejected seed must leave config absent");
     }
 
     #[test]
