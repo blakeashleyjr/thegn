@@ -2696,9 +2696,8 @@ mod tests {
 
     #[test]
     fn iterative_symbol_projection_has_stable_total_cap() {
-        // Anything a server can deliver passed the 64-level JSON preflight, so
-        // build the deepest admissible chain (object → children array per
-        // level) plus enough breadth to cross the total cap by one.
+        // Exercise the projection's total cap directly. The wire preflight's
+        // lower node budget rejects this many fully ranged symbols first.
         let symbol = |name: String, line: usize, children: Vec<Value>| {
             json!({
                 "name": name,
@@ -2713,14 +2712,21 @@ mod tests {
             chain = symbol(format!("d{depth}"), depth, vec![chain]);
         }
         let chain_len = levels + 1;
-        let wide: Vec<Value> = (0..=limits::MAX_RESULT_ITEMS - chain_len)
-            .map(|index| symbol(format!("w{index}"), index, vec![]))
+        // Empty `children` arrays on these leaves add nodes without exercising
+        // projection, so omit them from the broad tail.
+        let wide: Vec<Value> = (0..limits::MAX_RESULT_ITEMS - chain_len)
+            .map(|index| {
+                json!({
+                    "name": format!("w{index}"),
+                    "kind": 12,
+                    "range": {
+                        "start": { "line": index, "character": 0 },
+                        "end": { "line": index, "character": 0 }
+                    }
+                })
+            })
             .collect();
         let tree = json!([chain, symbol("wide".into(), 0, wide)]);
-        assert!(
-            preflight_json(tree.to_string().as_bytes()).is_ok(),
-            "admissible input"
-        );
         let mut health = ProjectionHealth::default();
         let symbols = project_symbols(&tree, "/safe.rs", &mut health);
         assert_eq!(symbols.len(), limits::MAX_RESULT_ITEMS, "exact total cap");
@@ -2916,11 +2922,24 @@ mod tests {
         // 4096 children under a 64 KiB parent name: cloning the name per push
         // would retain 256 MiB before any cap. Emission is byte-accounted.
         let children: Vec<Value> = (0..limits::MAX_CONTAINER_ITEMS)
-            .map(|index| json!({ "name": format!("c{index}"), "kind": 12 }))
+            .map(|index| {
+                json!({
+                    "name": format!("c{index}"),
+                    "kind": 12,
+                    "range": {
+                        "start": { "line": index, "character": 0 },
+                        "end": { "line": index, "character": 0 }
+                    }
+                })
+            })
             .collect();
         let parent = json!([{
             "name": "p".repeat(limits::MAX_SCALAR_STRING_BYTES),
             "kind": 5,
+            "range": {
+                "start": { "line": 0, "character": 0 },
+                "end": { "line": 0, "character": 0 }
+            },
             "children": children
         }]);
         let symbols = parse_symbols(&parent, "/f.rs");
