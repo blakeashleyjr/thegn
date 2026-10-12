@@ -353,7 +353,6 @@ fn dispatch_agent(ctx: &mut TrackerCtx) {
             // its task rather than only the `THEGN_ISSUE_*` env below. Rendering
             // (not shell-quoting) is correct here: the value rides an env var,
             // where the shell never re-parses it.
-            use thegn_core::agent_task::{TaskKind, bound_text, input_max_bytes};
             let rendered_prompt = issue_dispatch_prompt(
                 &issue_number,
                 &issue_title,

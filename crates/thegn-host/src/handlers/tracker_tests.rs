@@ -47,7 +47,9 @@ fn panel_router_applies_repo_issue_restrictions() {
         ..Config::default()
     };
 
-    let router = panel_issue_router(&cfg, dir.path(), dir.path());
+    let repo_issues = cfg.repo_issues(Some(dir.path()));
+    assert!(repo_issues.active_providers().is_empty());
+    let router = thegn_svc::issue::IssueRouter::from_config_at(&repo_issues, Some(dir.path()));
     let old_global_only_router =
         thegn_svc::issue::IssueRouter::from_config_at(&cfg.issues, Some(dir.path()));
     assert!(!router.is_configured());
